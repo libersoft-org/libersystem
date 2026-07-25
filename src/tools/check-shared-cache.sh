@@ -14,6 +14,10 @@ source_path() {
 	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
 }
 
+program_path() {
+	jq -er --arg program "$1" '.programs[$program].destination | sub("\\.lsexe$"; "")' <<<"$manifest_json"
+}
+
 command -v flock >/dev/null
 mkdir -p "$build_root"
 exec 8>"$build_root/image-build-x86_64-unknown-none.lock"
@@ -73,7 +77,7 @@ quick)
 		echo "shared-cache-check: unchanged graph did not use the warm image snapshot" >&2
 		exit 1
 	fi
-	rm -f "$build_root/system-image/x86_64-unknown-none/bin/echo"
+	rm -f "$build_root/system-image/x86_64-unknown-none/$(program_path echo)"
 	run_graph
 	expect_only_misses provider
 	expect_only_misses executable echo

@@ -33,6 +33,8 @@ use proto::system::log::{self, Service};
 use proto::system::{Entry, Error, OpenOpts, Query, Severity, config, volume};
 use rt::*;
 
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+
 // The bounded in-memory journal: at most this many records, newest dropping
 // oldest - deep enough to diagnose well past the last minute. The depth is the
 // operator's policy (the `log.capacity` config key); this is the default until the
@@ -52,6 +54,10 @@ const FLUSH_TICKS: u64 = 500;
 // derived default is capacity/1024, clamped to [64 kB, 1 MB].
 const BOOTS_KEPT_DEFAULT: u32 = 8;
 const DISK_CAP_FALLBACK: u64 = 256 * 1024;
+
+fn journal_root() -> &'static str {
+	runtime_path("system-journal").expect("manifest system-journal path")
+}
 
 // The durable side of the journal: this boot's records, encoded and batched for
 // `vol://system/log/boot-<n>`.
@@ -100,7 +106,7 @@ impl Disk {
 	fn attach(&mut self, volume: u64) {
 		self.volume = volume;
 		let mut client = volume::Client::new(ChannelTransport { chan: volume });
-		let _ = client.mkdir("vol://system/log");
+		let _ = client.mkdir(journal_root());
 		if self.cap == 0 {
 			self.cap = match client.capacity() {
 				Some(Ok(bytes)) => (bytes / 1024).clamp(64 * 1024, 1024 * 1024),
@@ -115,14 +121,14 @@ impl Disk {
 	// newest boot number seen (0 = none). Called at attach (keep = boots - 1, so
 	// this boot fits under the count) and again when config lowers the count.
 	fn prune(&mut self, client: &mut volume::Client<ChannelTransport>, keep: u32) -> u32 {
-		let mut boots: Vec<u32> = match client.list("vol://system/log") {
+		let mut boots: Vec<u32> = match client.list(journal_root()) {
 			Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.iter().filter_map(|e| e.name.strip_prefix("boot-").and_then(|n| n.parse::<u32>().ok())).collect(),
 			None => return 0,
 		};
 		boots.sort_unstable();
 		while boots.len() > keep as usize {
 			let oldest: u32 = boots.remove(0);
-			let _ = client.remove(&format!("vol://system/log/boot-{oldest}"));
+			let _ = client.remove(&format!("{}/boot-{oldest}", journal_root()));
 		}
 		boots.last().copied().unwrap_or(0)
 	}
@@ -145,7 +151,7 @@ impl Disk {
 			Some(b) => b,
 			None => return,
 		};
-		let path: String = format!("vol://system/log/boot-{}", self.boot);
+		let path: String = format!("{}/boot-{}", journal_root(), self.boot);
 		let mut client = volume::Client::new(ChannelTransport { chan: self.volume });
 		let _ = client.write(&path, &data);
 	}
@@ -158,7 +164,7 @@ impl Disk {
 			return None;
 		}
 		let mut client = volume::Client::new(ChannelTransport { chan: self.volume });
-		let opts: OpenOpts = OpenOpts { path: format!("vol://system/log/boot-{boot}"), write: false, create: false };
+		let opts: OpenOpts = OpenOpts { path: format!("{}/boot-{boot}", journal_root()), write: false, create: false };
 		let result = match client.open(&opts) {
 			Some(Ok(r)) if r.file != 0 => r,
 			_ => return None,

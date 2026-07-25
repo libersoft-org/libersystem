@@ -34,6 +34,8 @@ use proto::system::session::{self, Service};
 use proto::system::{EnvVar, Error, JobEntry, JobInfo};
 use rt::*;
 
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+
 // The default working directory a fresh session starts in: the root of the system
 // volume. A session keeps it until a client `chdir`s elsewhere. Matches the shell's
 // own DEFAULT_CWD, the one place a prompt starts.
@@ -43,7 +45,9 @@ const DEFAULT_CWD: &str = "vol://system";
 // on the system volume. A client `PATH=...` overwrites it. Command lookup by search path
 // arrives with the binaries-on-volume phase; today the value is stored, expanded (`$PATH`)
 // and inherited like any other variable.
-const DEFAULT_PATH: &str = "vol://system/bin";
+fn default_path() -> &'static str {
+	runtime_path("command-directory").expect("manifest command-directory path")
+}
 
 // One tracked background / stopped job in a session's job table: the live Process handle
 // (the shell transferred it here, held with WAIT so the session can poll it and MANAGE so
@@ -69,7 +73,7 @@ struct Session {
 
 impl Session {
 	fn new() -> Session {
-		Session { cwd: String::from(DEFAULT_CWD), vars: alloc::vec![(String::from("PATH"), String::from(DEFAULT_PATH))], jobs: Vec::new(), next_id: 1 }
+		Session { cwd: String::from(DEFAULT_CWD), vars: alloc::vec![(String::from("PATH"), String::from(default_path()))], jobs: Vec::new(), next_id: 1 }
 	}
 }
 

@@ -83,9 +83,5 @@ fn write_dec(n: u8, out: &mut [u8]) -> usize {
 }
 
 fn hex_digit(n: u8) -> u8 {
-	if n < 10 {
-		b'0' + n
-	} else {
-		b'a' + (n - 10)
-	}
+	if n < 10 { b'0' + n } else { b'a' + (n - 10) }
 }

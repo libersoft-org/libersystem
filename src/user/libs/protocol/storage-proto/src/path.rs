@@ -68,11 +68,7 @@ pub fn volume<'a>(cwd: &'a str, arg: &'a [u8]) -> Option<&'a [u8]> {
 	let arg: &[u8] = trim(arg);
 	let base: &[u8] = if arg.starts_with(b"vol://") { arg } else { cwd.as_bytes() };
 	let (volume, _) = split_vol(base)?;
-	if volume.is_empty() {
-		None
-	} else {
-		Some(volume)
-	}
+	if volume.is_empty() { None } else { Some(volume) }
 }
 
 pub fn volume_client(cwd: &str, arg: &[u8], system: u64, media: u64, iso: u64, udf: u64, usb: u64) -> u64 {

@@ -23,6 +23,8 @@ use proto::system::{config, network, process};
 use services::executable;
 use surface::{Client as DisplayClient, Mapping, Rect};
 
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+
 // The shell's command vocabulary, shared with the shell itself: the line discipline
 // completes the command word on Tab, and the shell prints the matches on a double Tab.
 mod commands;
@@ -731,7 +733,7 @@ unsafe fn command_vocab(console: &mut Console) -> Vec<Vec<u8>> {
 			let mut names: Vec<Vec<u8>> = Vec::new();
 			if let Some(storage) = service_connect(console.facs.storage) {
 				let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
-				if let Some(consumer) = client.list("vol://system/bin") {
+				if let Some(consumer) = client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
 					names = drain_stream(consumer, proto::system::volume::list_read).into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect();
 				}
 				close(storage);

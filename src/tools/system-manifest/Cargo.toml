@@ -4,6 +4,7 @@ edition = "2024"
 description = "Typed LiberSystem source, deployment, service, and dynamic-image manifest"
 
 [dependencies]
+abi = { path = "../../abi" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "0.9.12"

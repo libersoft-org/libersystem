@@ -17,6 +17,10 @@ struct RawManifest {
 	#[serde(default)]
 	programs: Vec<RawProgram>,
 	#[serde(default)]
+	factory_files: Vec<RawFactoryFile>,
+	#[serde(default)]
+	runtime_paths: Vec<RawRuntimePath>,
+	#[serde(default)]
 	services: Vec<RawService>,
 	#[serde(default)]
 	libraries: Vec<RawLibrary>,
@@ -40,6 +44,24 @@ struct RawProgram {
 	destination: String,
 	#[serde(default)]
 	providers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawFactoryFile {
+	name: String,
+	kind: FactoryFileKind,
+	#[serde(default)]
+	source: Option<String>,
+	destination: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawRuntimePath {
+	name: String,
+	owner: String,
+	destination: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,6 +109,13 @@ pub enum Linkage {
 pub enum Stage {
 	Pinned,
 	Volume,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FactoryFileKind {
+	Source,
+	SdkComponent,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -157,10 +186,27 @@ pub struct Library {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct FactoryFile {
+	pub name: Name,
+	pub kind: FactoryFileKind,
+	pub source: Option<RelativePath>,
+	pub destination: RelativePath,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimePath {
+	pub name: Name,
+	pub owner: Name,
+	pub destination: RelativePath,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct Manifest {
 	pub schema: u32,
 	pub sources: BTreeMap<Name, Source>,
 	pub programs: BTreeMap<Name, Program>,
+	pub factory_files: BTreeMap<Name, FactoryFile>,
+	pub runtime_paths: BTreeMap<Name, RuntimePath>,
 	pub services: BTreeMap<Name, Service>,
 	pub libraries: BTreeMap<Name, Library>,
 }
@@ -289,6 +335,64 @@ impl Manifest {
 			}
 		}
 
+		let mut factory_files = BTreeMap::new();
+		let mut factory_sources = BTreeSet::new();
+		for raw_factory_file in raw.factory_files {
+			let location = format!("factory_files.{}", raw_factory_file.name);
+			let Some(name) = validate_name(&raw_factory_file.name, &format!("{location}.name"), &mut errors) else { continue };
+			let Some(destination) = validate_relative_path(&raw_factory_file.destination, &format!("{location}.destination"), &mut errors) else { continue };
+			let source = match raw_factory_file.kind {
+				FactoryFileKind::Source => {
+					let Some(raw_source) = raw_factory_file.source else {
+						push_error(&mut errors, format!("{location}.source"), "source factory files require a source path");
+						continue;
+					};
+					let Some(source) = validate_relative_path(&raw_source, &format!("{location}.source"), &mut errors) else { continue };
+					if !source.as_str().starts_with("volume/") {
+						push_error(&mut errors, format!("{location}.source"), "source factory files must live below volume/");
+					}
+					if !workspace_root.join(source.as_str()).is_file() {
+						push_error(&mut errors, format!("{location}.source"), format!("no factory file at {}", source.as_str()));
+					}
+					if !factory_sources.insert(source.clone()) {
+						push_error(&mut errors, format!("{location}.source"), format!("duplicate factory source {}", source.as_str()));
+					}
+					Some(source)
+				}
+				FactoryFileKind::SdkComponent => {
+					if raw_factory_file.source.is_some() {
+						push_error(&mut errors, format!("{location}.source"), "SDK component payloads do not accept a source path");
+					}
+					None
+				}
+			};
+			validate_factory_file_shape(raw_factory_file.kind, source.as_ref(), &destination, &location, &mut errors);
+			if !destinations.insert(destination.clone()) {
+				push_error(&mut errors, format!("{location}.destination"), "duplicate staged destination");
+			}
+			if factory_files.insert(name.clone(), FactoryFile { name, kind: raw_factory_file.kind, source, destination }).is_some() {
+				push_error(&mut errors, format!("{location}.name"), "duplicate factory file name");
+			}
+		}
+
+		let mut runtime_paths = BTreeMap::new();
+		for raw_runtime_path in raw.runtime_paths {
+			let location = format!("runtime_paths.{}", raw_runtime_path.name);
+			let Some(name) = validate_name(&raw_runtime_path.name, &format!("{location}.name"), &mut errors) else { continue };
+			let Some(owner) = validate_name(&raw_runtime_path.owner, &format!("{location}.owner"), &mut errors) else { continue };
+			let Some(destination) = validate_relative_path(&raw_runtime_path.destination, &format!("{location}.destination"), &mut errors) else { continue };
+			if !programs.contains_key(&owner) {
+				push_error(&mut errors, format!("{location}.owner"), format!("unknown program owner {owner}"));
+			}
+			validate_runtime_path_shape(&name, &owner, &destination, &location, &mut errors);
+			if !destinations.insert(destination.clone()) {
+				push_error(&mut errors, format!("{location}.destination"), "duplicate staged or runtime destination");
+			}
+			if runtime_paths.insert(name.clone(), RuntimePath { name, owner, destination }).is_some() {
+				push_error(&mut errors, format!("{location}.name"), "duplicate runtime path name");
+			}
+		}
+
 		let mut services = BTreeMap::new();
 		for raw_service in raw.services {
 			let location = format!("services.{}", raw_service.name);
@@ -305,6 +409,10 @@ impl Manifest {
 		validate_graph("services", &services, |service| &service.dependencies, usize::MAX, usize::MAX, &mut errors);
 		validate_program_closures(&programs, &libraries, &mut errors);
 		validate_user_source_coverage(workspace_root, &sources, &mut errors);
+		validate_factory_source_coverage(workspace_root, &factory_files, &mut errors);
+		if !factory_files.values().any(|file| file.kind == FactoryFileKind::SdkComponent) {
+			push_error(&mut errors, "factory_files", "no SDK component payload is declared");
+		}
 		validate_executable_aliases(&programs, &mut errors);
 
 		errors.sort();
@@ -312,7 +420,7 @@ impl Manifest {
 		if !errors.is_empty() {
 			return Err(LoadError::Validation(errors));
 		}
-		Ok(Self { schema: raw.schema, sources, programs, services, libraries })
+		Ok(Self { schema: raw.schema, sources, programs, factory_files, runtime_paths, services, libraries })
 	}
 
 	pub fn source_path(&self, owner: &str) -> Option<&str> {
@@ -324,6 +432,10 @@ impl Manifest {
 			json.push('\n');
 			json
 		})
+	}
+
+	pub fn volume_destinations(&self) -> BTreeSet<String> {
+		self.libraries.values().map(|library| library.destination.as_str().to_string()).chain(self.programs.values().filter(|program| program.stage == Stage::Volume).map(|program| program.destination.as_str().to_string())).chain(self.factory_files.values().map(|file| file.destination.as_str().to_string())).collect()
 	}
 }
 
@@ -385,13 +497,58 @@ fn validate_program_shape(raw: &RawProgram, name: &Name, destination: &RelativeP
 	if matches!(raw.role, ProgramRole::Tool | ProgramRole::Helper) && raw.stage != Stage::Volume {
 		push_error(errors, format!("{location}.stage"), "tools and helpers must be volume staged");
 	}
-	let expected = match (raw.stage, raw.role) {
-		(Stage::Pinned, _) => format!("{name}.lsexe"),
-		(Stage::Volume, ProgramRole::Driver) => format!("drivers/{name}.lsexe"),
-		(Stage::Volume, _) => format!("bin/{name}.lsexe"),
+	let expected_name = format!("{name}.lsexe");
+	if raw.stage == Stage::Pinned {
+		if destination.as_str() != expected_name {
+			push_error(errors, format!("{location}.destination"), format!("expected {expected_name}"));
+		}
+		return;
+	}
+	let expected = match raw.role {
+		ProgramRole::Tool => format!("bin/{expected_name}"),
+		ProgramRole::Driver => format!("drivers/{expected_name}"),
+		ProgramRole::Service | ProgramRole::Probe | ProgramRole::Helper if name.as_str() == "config_service" => format!("libexec/config_service/{expected_name}"),
+		ProgramRole::Service | ProgramRole::Probe | ProgramRole::Helper => format!("libexec/{expected_name}"),
+		ProgramRole::Launcher => unreachable!("launchers are pinned"),
 	};
 	if destination.as_str() != expected {
 		push_error(errors, format!("{location}.destination"), format!("expected {expected}"));
+	}
+}
+
+fn validate_factory_file_shape(kind: FactoryFileKind, source: Option<&RelativePath>, destination: &RelativePath, location: &str, errors: &mut Vec<ValidationError>) {
+	match kind {
+		FactoryFileKind::Source => {
+			let Some(source) = source else { return };
+			let Some(source_destination) = source.as_str().strip_prefix("volume/") else { return };
+			if source_destination != destination.as_str() {
+				push_error(errors, format!("{location}.destination"), format!("expected {source_destination}"));
+			}
+			let valid = matches!(destination.as_str(), "hello.txt" | "motd.txt" | "audio/test.mp3") || destination.as_str().strip_prefix("wallpapers/").is_some_and(|name| !name.is_empty() && !name.contains('/') && name.ends_with(".webp"));
+			if !valid {
+				push_error(errors, format!("{location}.destination"), "factory source files must be hello.txt, motd.txt, audio/test.mp3, or a wallpapers/*.webp file");
+			}
+		}
+		FactoryFileKind::SdkComponent => {
+			if destination.as_str() != "components/liber_component/app.wasm" {
+				push_error(errors, format!("{location}.destination"), "SDK component payloads must stage at components/liber_component/app.wasm");
+			}
+		}
+	}
+}
+
+fn validate_runtime_path_shape(name: &Name, owner: &Name, destination: &RelativePath, location: &str, errors: &mut Vec<ValidationError>) {
+	let expected = match (name.as_str(), owner.as_str()) {
+		("command-directory", "shell") => Some("bin"),
+		("config-tree", "config_service") => Some("libexec/config_service/config.tree"),
+		("liber-component-output", "component_host") => Some("components/liber_component/out.txt"),
+		("system-journal", "log_service") => Some("log"),
+		_ => None,
+	};
+	match expected {
+		Some(expected) if destination.as_str() == expected => {}
+		Some(expected) => push_error(errors, format!("{location}.destination"), format!("expected {expected}")),
+		None => push_error(errors, format!("{location}.name"), format!("unsupported runtime path {} for {}", name.as_str(), owner.as_str())),
 	}
 }
 
@@ -509,6 +666,31 @@ fn validate_user_source_coverage(workspace_root: &Path, sources: &BTreeMap<Name,
 	}
 	for missing in declared.difference(&physical) {
 		push_error(errors, "sources", format!("declared userspace crate {missing} is not physical"));
+	}
+}
+
+fn validate_factory_source_coverage(workspace_root: &Path, factory_files: &BTreeMap<Name, FactoryFile>, errors: &mut Vec<ValidationError>) {
+	fn collect(directory: &Path, workspace_root: &Path, output: &mut BTreeSet<String>) {
+		let Ok(entries) = fs::read_dir(directory) else { return };
+		for entry in entries.flatten() {
+			let path = entry.path();
+			if path.is_dir() {
+				collect(&path, workspace_root, output);
+			} else if path.is_file()
+				&& let Ok(relative) = path.strip_prefix(workspace_root)
+			{
+				output.insert(relative.to_string_lossy().replace('\\', "/"));
+			}
+		}
+	}
+	let mut physical = BTreeSet::new();
+	collect(&workspace_root.join("volume"), workspace_root, &mut physical);
+	let declared = factory_files.values().filter_map(|file| file.source.as_ref().map(|source| source.as_str().to_string())).collect::<BTreeSet<_>>();
+	for missing in physical.difference(&declared) {
+		push_error(errors, "factory_files", format!("physical factory file {missing} is not declared"));
+	}
+	for missing in declared.difference(&physical) {
+		push_error(errors, "factory_files", format!("declared factory file {missing} is not physical"));
 	}
 }
 

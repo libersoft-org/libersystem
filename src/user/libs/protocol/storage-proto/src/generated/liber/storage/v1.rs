@@ -1529,6 +1529,132 @@ pub mod volume {
 	}
 }
 
+/// Privileged StorageService boundary that mints a client restricted to one directory
+/// below a system volume. The returned channel preserves normal `volume` operations,
+/// but rejects paths outside the granted directory and cannot mint a broader client.
+// interface `volume-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod volume_admin {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_OPEN_DIRECTORY: u16 = 1;
+
+	pub trait Service {
+		fn open_directory(&mut self, path: String) -> Result<u64, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
+		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		match op {
+			OP_OPEN_DIRECTORY => {
+				let path = r.string_lp()?;
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.open_directory(path);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v36) => {
+							w.u8(1)?;
+							w.set_handle(*v36)?;
+							w.u32(0)?;
+						}
+						Err(v37) => {
+							w.u8(0)?;
+							v37.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		*reply_handle = writer.handle();
+		Some(writer.pos())
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0 }
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn open_directory(&mut self, path: &str) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_DIRECTORY)?;
+			w.u32(corr)?;
+			w.bytes_lp(path.as_bytes())?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				})
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_admin_open_directory")]
+	fn channel_invoke_open_directory(chan: u64, path: &str) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_directory(path)
+	}
+}
+
 impl OpenOpts {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1899,13 +2025,13 @@ impl FsckReport {
 		out.push(',');
 		out.push_str("\"damaged\":");
 		out.push('[');
-		let mut v37 = true;
-		for v36 in self.damaged.iter() {
-			if !v37 {
+		let mut v39 = true;
+		for v38 in self.damaged.iter() {
+			if !v39 {
 				out.push(',');
 			}
-			v37 = false;
-			crate::codec::json_escape(v36, out);
+			v39 = false;
+			crate::codec::json_escape(v38, out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1917,13 +2043,13 @@ impl FsckReport {
 		out.push_str(", ");
 		out.push_str("damaged=");
 		out.push('[');
-		let mut v39 = true;
-		for v38 in self.damaged.iter() {
-			if !v39 {
+		let mut v41 = true;
+		for v40 in self.damaged.iter() {
+			if !v41 {
 				out.push_str(", ");
 			}
-			v39 = false;
-			out.push_str(v38);
+			v41 = false;
+			out.push_str(v40);
 		}
 		out.push(']');
 		out.push('}');
@@ -1934,8 +2060,8 @@ impl FsckReport {
 		crate::codec::cbor::uint(out, self.checksum_failures as u64);
 		crate::codec::cbor::text(out, "damaged");
 		crate::codec::cbor::array(out, self.damaged.len());
-		for v40 in self.damaged.iter() {
-			crate::codec::cbor::text(out, v40);
+		for v42 in self.damaged.iter() {
+			crate::codec::cbor::text(out, v42);
 		}
 	}
 }

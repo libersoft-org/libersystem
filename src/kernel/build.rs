@@ -2,6 +2,7 @@
 // metadata from product.conf (the single source of truth) to the kernel as
 // compile-time environment variables.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -153,13 +154,28 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 	rows
 }
 
-fn generate_test_library_paths(rows: &[ManifestRow]) {
-	let mut arms = String::new();
-	for row in rows.iter().filter(|row| row.kind == "library" && row.stage == "volume") {
-		let destination = row.destination.as_deref().expect("library destination");
-		arms.push_str(&format!("\t\"{}.lslib\" => Some(\"{}\"),\n", row.name, destination));
+fn generate_test_volume_paths(manifest: &system_manifest::Manifest) {
+	let mut library_arms = String::new();
+	for library in manifest.libraries.values() {
+		library_arms.push_str(&format!("\t\"{}.lslib\" => Some(\"{}\"),\n", library.name, library.destination.as_str()));
 	}
-	let source = format!("// @generated from user/services/manifest.toml by build.rs - do not edit.\nfn test_library_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n");
+	let mut program_arms = String::new();
+	for program in manifest.programs.values().filter(|program| program.stage == system_manifest::Stage::Volume) {
+		program_arms.push_str(&format!("\t\"{}\" => Some(\"{}\"),\n", program.name, program.destination.as_str()));
+	}
+	let mut factory_arms = String::new();
+	for factory_file in manifest.factory_files.values() {
+		factory_arms.push_str(&format!("\t\"{}\" => Some(\"{}\"),\n", factory_file.name, factory_file.destination.as_str()));
+	}
+	let mut runtime_arms = String::new();
+	for runtime_path in manifest.runtime_paths.values() {
+		runtime_arms.push_str(&format!("\t\"{}\" => Some(\"{}\"),\n", runtime_path.name, runtime_path.destination.as_str()));
+	}
+	let mut declared_arms = String::new();
+	for destination in manifest.libraries.values().map(|library| library.destination.as_str()).chain(manifest.programs.values().filter(|program| program.stage == system_manifest::Stage::Volume).map(|program| program.destination.as_str())).chain(manifest.factory_files.values().map(|file| file.destination.as_str())) {
+		declared_arms.push_str(&format!("\t\"{destination}\" => true,\n"));
+	}
+	let source = format!("// @generated from user/services/manifest.toml by build.rs - do not edit.\nfn test_library_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{library_arms}\t\t_ => None,\n\t}}\n}}\n\nfn test_program_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{program_arms}\t\t_ => None,\n\t}}\n}}\n\nfn test_factory_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{factory_arms}\t\t_ => None,\n\t}}\n}}\n\nfn test_runtime_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{runtime_arms}\t\t_ => None,\n\t}}\n}}\n\nfn test_volume_path_is_declared(path: &str) -> bool {{\n\tmatch path {{\n{declared_arms}\t\t_ => false,\n\t}}\n}}\n");
 	let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
 	fs::write(out_dir.join("library_paths.rs"), source).expect("write test library paths");
 }
@@ -260,8 +276,9 @@ fn user_shared_path(manifest: &Path, destination: &str) -> PathBuf {
 	manifest.join(format!("../../.build/system-image/{}/{}", user_target(), destination))
 }
 
-fn user_dynamic_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
-	manifest.join(format!("../../.build/system-image/{}/bin/{name}", user_target()))
+fn user_dynamic_path(manifest: &Path, destination: &str) -> PathBuf {
+	let path = destination.strip_suffix(abi::EXECUTABLE_SUFFIX).unwrap_or_else(|| panic!("dynamic destination has no executable suffix: {destination}"));
+	manifest.join(format!("../../.build/system-image/{}/{}", user_target(), path))
 }
 
 fn identity_record(artifact: &Path) -> Vec<u8> {
@@ -419,65 +436,34 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	fs::write(&out_pkg, &package).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", out_pkg.display()));
 }
 
-fn collect_volume_files(root: &Path, directory: &Path, files: &mut Vec<(String, Vec<u8>)>) {
-	let read_dir = fs::read_dir(directory).unwrap_or_else(|error| panic!("cannot read {}: {error}", directory.display()));
-	for entry in read_dir {
-		let entry = entry.unwrap_or_else(|error| panic!("cannot read entry under {}: {error}", directory.display()));
-		let path = entry.path();
-		let file_type = entry.file_type().unwrap_or_else(|error| panic!("cannot inspect {}: {error}", path.display()));
-		if file_type.is_dir() {
-			collect_volume_files(root, &path, files);
-			continue;
-		}
-		if !file_type.is_file() {
-			continue;
-		}
-		let relative = path.strip_prefix(root).unwrap_or_else(|_| panic!("{} escaped {}", path.display(), root.display()));
-		let mut components: Vec<&str> = Vec::new();
-		for component in relative.components() {
-			match component {
-				std::path::Component::Normal(name) => components.push(name.to_str().unwrap_or_else(|| panic!("non-UTF-8 volume path: {}", path.display()))),
-				_ => panic!("invalid volume path: {}", path.display()),
-			}
-		}
-		assert!(!components.is_empty(), "empty volume path");
-		let name = components.join("/");
-		let bytes = fs::read(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
-		println!("cargo:rerun-if-changed={}", path.display());
-		files.push((name, bytes));
-	}
-}
-
 // Assemble the ramdisk volume package: every regular file under src/volume is
 // packed into .build/boot/volume.pkg using its relative path. The kernel loads it
 // as a second boot module and serves its files through StorageService over vol://.
 fn assemble_volume_package(conf: &[(String, String)]) {
 	let manifest_dir: String = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
 	let manifest: PathBuf = PathBuf::from(&manifest_dir);
-	let vol_dir: PathBuf = manifest.join("../volume");
 	let out_dir: PathBuf = package_out_dir(&manifest);
 	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "VOLUME_PACKAGE"));
 
-	println!("cargo:rerun-if-changed={}", vol_dir.display());
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
 
-	// Collect (relative path, bytes) for every regular file. Sorting below makes
-	// archive layout independent of filesystem enumeration order.
+	let workspace = manifest.join("..");
+	let factory_manifest = system_manifest::Manifest::load_workspace(&workspace).unwrap_or_else(|error| panic!("{error}"));
+	// Collect every manifest-declared factory record. Sorting below makes archive
+	// layout independent of declaration and filesystem enumeration order.
 	let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-	if vol_dir.is_dir() {
-		collect_volume_files(&vol_dir, &vol_dir, &mut files);
-	} else {
-		println!("cargo:warning=volume directory not found at {} - writing an empty volume package", vol_dir.display());
-	}
-	let component: PathBuf = manifest.join("../../.build/cargo/sdk/wasm32-unknown-unknown/release/liber_component.wasm");
-	println!("cargo:rerun-if-changed={}", component.display());
-	match fs::read(&component) {
-		Ok(bytes) => files.push(("app.wasm".to_string(), bytes)),
-		Err(error) => println!("cargo:warning=SDK component not found at {} ({error}) - omitting app.wasm from volume package", component.display()),
+	for file in factory_manifest.factory_files.values() {
+		let path = match file.kind {
+			system_manifest::FactoryFileKind::Source => manifest.join("..").join(file.source.as_ref().expect("validated factory source").as_str()),
+			system_manifest::FactoryFileKind::SdkComponent => manifest.join("../../.build/cargo/sdk/wasm32-unknown-unknown/release/liber_component.wasm"),
+		};
+		println!("cargo:rerun-if-changed={}", path.display());
+		let bytes = fs::read(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+		files.push((file.destination.as_str().to_string(), bytes));
 	}
 
 	let rows = read_manifest(&manifest);
-	generate_test_library_paths(&rows);
+	generate_test_volume_paths(&factory_manifest);
 	let library_rows: Vec<ManifestRow> = rows.iter().filter(|row| row.kind == "library" && row.stage == "volume").cloned().collect();
 	let lsrt_row = library_rows.iter().find(|row| row.name == "lsrt").expect("lsrt library row");
 	let lsrt_artifact = user_shared_path(&manifest, lsrt_row.destination.as_deref().expect("lsrt destination"));
@@ -488,12 +474,10 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	libraries.sort();
 	assert!(!libraries.windows(2).any(|pair| pair[0] == pair[1]), "duplicate staged library identity");
 
-	// Also stage the tool and non-bootstrap driver ELFs onto the system volume
-	// under bin/ and drivers/, so they can later be loaded from there. They are stripped
-	// of symbol/debug sections (the on-disk copies are executed by the loader, which needs
-	// only the program image), keeping the seed archive to a few megabytes. A missing or
-	// unstrippable ELF is skipped.
-	for row in rows {
+	// Stage every manifest-declared volume ELF at its exact destination. The copies are
+	// stripped of symbol/debug sections because the loader needs only the program image,
+	// keeping the seed archive to a few megabytes. A missing or unstrippable ELF is skipped.
+	for row in &rows {
 		if row.kind == "library" {
 			let features = row.features.as_deref().expect("library feature set");
 			assert!(features == "-" || features.split(',').all(valid_library_name), "library {} has invalid feature set {features:?}", row.name);
@@ -506,7 +490,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		};
 		let path: PathBuf = match row.kind.as_str() {
 			"library" => user_shared_path(&manifest, row.destination.as_deref().expect("library destination")),
-			"dynamic" | "dynamic-service" => user_dynamic_path(&manifest, &row.crate_path, &row.name),
+			"dynamic" | "dynamic-service" => user_dynamic_path(&manifest, row.destination.as_deref().expect("program destination")),
 			_ => user_elf_path(&manifest, &row.crate_path, &row.name),
 		};
 		println!("cargo:rerun-if-changed={}", path.display());
@@ -532,8 +516,12 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		}
 	}
 	files.sort_by(|a, b| a.0.cmp(&b.0));
+	assert!(!files.windows(2).any(|pair| pair[0].0 == pair[1].0), "duplicate volume package destination");
+	let expected_entries = factory_manifest.volume_destinations();
+	let actual_entries = files.iter().map(|(name, _)| name.clone()).collect::<BTreeSet<_>>();
+	assert_eq!(actual_entries, expected_entries, "system volume entries differ from the manifest");
 	for (name, bytes) in &files {
-		if name.starts_with("bin/") && name.ends_with(abi::EXECUTABLE_SUFFIX) {
+		if rows.iter().any(|row| matches!(row.kind.as_str(), "dynamic" | "dynamic-service") && row.stage == "volume" && row.destination.as_deref() == Some(name.as_str())) {
 			let image = bootproto::elf::Elf::parse_for_machine(bytes, user_elf_machine()).unwrap_or_else(|| panic!("staged /{name} is not a valid target ELF"));
 			assert_eq!(image.image_type, bootproto::elf::ET_DYN, "staged /{name} is static ET_EXEC");
 		}

@@ -14,6 +14,7 @@ fn main() {
 	let manifest = Manifest::load_workspace(&workspace).unwrap_or_else(|error| panic!("{error}"));
 	generate_services(&manifest);
 	generate_library_paths(&manifest);
+	generate_program_paths(&manifest);
 }
 
 fn generate_services(manifest: &Manifest) {
@@ -38,6 +39,23 @@ fn generate_library_paths(manifest: &Manifest) {
 	}
 	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nfn library_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n");
 	write_generated("library_paths.rs", &generated);
+}
+
+fn generate_program_paths(manifest: &Manifest) {
+	let mut arms = String::new();
+	for program in manifest.programs.values().filter(|program| program.stage == Stage::Volume) {
+		arms.push_str(&format!("\t\"{}\" => Some(\"vol://system/{}\"),\n", program.name, program.destination.as_str()));
+	}
+	let mut factory_arms = String::new();
+	for factory_file in manifest.factory_files.values() {
+		factory_arms.push_str(&format!("\t\"{}\" => Some(\"vol://system/{}\"),\n", factory_file.name, factory_file.destination.as_str()));
+	}
+	let mut runtime_arms = String::new();
+	for runtime_path in manifest.runtime_paths.values() {
+		runtime_arms.push_str(&format!("\t\"{}\" => Some(\"vol://system/{}\"),\n", runtime_path.name, runtime_path.destination.as_str()));
+	}
+	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\n#[allow(dead_code)]\nfn program_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n\n#[allow(dead_code)]\nfn factory_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{factory_arms}\t\t_ => None,\n\t}}\n}}\n\n#[allow(dead_code)]\nfn runtime_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{runtime_arms}\t\t_ => None,\n\t}}\n}}\n");
+	write_generated("program_paths.rs", &generated);
 }
 
 fn write_generated(name: &str, contents: &str) {

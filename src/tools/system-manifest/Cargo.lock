@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.0.0"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -121,6 +125,7 @@ dependencies = [
 name = "system-manifest"
 version = "0.0.0"
 dependencies = [
+ "abi",
  "serde",
  "serde_json",
  "toml",

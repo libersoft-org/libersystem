@@ -110,3 +110,10 @@ interface volume {
 	/// and closes it to mark the end; the reply comes once the whole file is written.
 	@op(16) write-stream:    func(path: string, data: handle<channel>) -> result<unit, error>;
 }
+
+/// Privileged StorageService boundary that mints a client restricted to one directory
+/// below a system volume. The returned channel preserves normal `volume` operations,
+/// but rejects paths outside the granted directory and cannot mint a broader client.
+interface volume-admin {
+	@op(1) open-directory: func(path: string) -> result<handle<channel>, error>;
+}

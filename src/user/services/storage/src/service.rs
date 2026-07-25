@@ -43,7 +43,8 @@ use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
 use proto::codec::Buffer;
-use proto::system::{Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume};
+use proto::codec::{Sink, SliceWriter};
+use proto::system::{Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume, volume_admin};
 use rt::*;
 use udf::Udf;
 
@@ -124,9 +125,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume { fs: alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None }) },
 		_ => exit(),
 	};
-	// 2. service endpoint: clients reach the service here.
-	let service: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => handle,
+	// 2. an optional privileged admin endpoint precedes the public service endpoint.
+	// Ordinary boots and focused scenarios that do not need scoped clients still send
+	// SERVE directly and retain the existing bootstrap contract.
+	let (admin, service): (u64, u64) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle: admin_handle } if admin_handle != 0 && len >= 5 && &buf[..5] == b"ADMIN" => match unsafe { recv_blocking(bootstrap, &mut buf) } {
+			Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => (admin_handle, handle),
+			_ => exit(),
+		},
+		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"SERVE" => (0, handle),
 		_ => exit(),
 	};
 	// 3. report in over the bootstrap channel (the supervisor that started us is
@@ -135,26 +142,177 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		send_blocking(bootstrap, b"StorageService: online", 0);
 	}
-	let mut reply: [u8; 4096] = [0u8; 4096];
-	unsafe {
-		serve_multi(service, &mut buf, &mut reply, |chan: u64, req: &[u8], handle: &mut u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> {
-			// stamp the wall clock onto the filesystem before each request, so a
-			// mutation's inode timestamps carry real time (the RTC's Unix seconds; the
-			// NTP-disciplined policy clock lives in TimeService). A no-op on the backends
-			// that do not track it.
-			vol.fs.set_clock(clock_rtc());
-			// OP_LIST opens a stream (the log-tail model): the entries are framed one
-			// by one onto a fresh sub-channel, so a big directory never has to fit one
-			// reply. Everything else dispatches to a single reply.
-			let op: u16 = if req.len() >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
-			if op == volume::OP_LIST {
-				stream_list(&mut vol, chan, req, handle);
-				return None;
-			}
-			volume::dispatch(&mut vol, req, handle, out, reply_handle)
-		});
+	serve_volume(&mut vol, service, admin);
+}
+
+#[derive(Clone)]
+enum Scope {
+	Full,
+	Directory(String),
+}
+
+struct Client {
+	chan: u64,
+	scope: Scope,
+}
+
+struct AdminCall<'a> {
+	volume: &'a Volume,
+	clients: &'a mut Vec<Client>,
+}
+
+impl volume_admin::Service for AdminCall<'_> {
+	fn open_directory(&mut self, path: String) -> Result<u64, Error> {
+		let scope: Scope = Scope::directory(self.volume, &path)?;
+		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		self.clients.push(Client { chan: server, scope });
+		Ok(client)
 	}
-	exit();
+}
+
+impl Scope {
+	fn directory(volume: &Volume, path: &str) -> Result<Scope, Error> {
+		if volume.name() != SYSTEM_VOLUME {
+			return Err(Error::Denied);
+		}
+		let target: VolumePath = VolumePath::parse(path.as_bytes()).ok_or(Error::Invalid)?;
+		if target.volume != volume.name() {
+			return Err(Error::NotFound);
+		}
+		let directory: &str = core::str::from_utf8(target.path.as_bytes()).map_err(|_| Error::Invalid)?;
+		Ok(Scope::Directory(String::from(directory)))
+	}
+
+	fn allows_path(&self, volume: &[u8], path: &str) -> bool {
+		match self {
+			Self::Full => true,
+			Self::Directory(directory) => {
+				let Some(target) = VolumePath::parse(path.as_bytes()) else { return false };
+				target.volume == volume && (target.path.as_bytes() == directory.as_bytes() || target.path.as_bytes().strip_prefix(directory.as_bytes()).is_some_and(|rest| rest.starts_with(b"/")))
+			}
+		}
+	}
+
+	fn allows_request(&self, volume: &[u8], request: &[u8]) -> bool {
+		if matches!(self, Self::Full) {
+			return true;
+		}
+		let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+		match op {
+			volume::OP_OPEN | volume::OP_LIST | volume::OP_WRITE | volume::OP_REMOVE | volume::OP_MKDIR | volume::OP_RMDIR | volume::OP_WRITE_STREAM => request_path(request).is_some_and(|path| self.allows_path(volume, path)),
+			_ => false,
+		}
+	}
+}
+
+fn request_path(request: &[u8]) -> Option<&str> {
+	if request.len() < 8 {
+		return None;
+	}
+	let len: usize = u16::from_le_bytes([request[6], request[7]]) as usize;
+	let end: usize = 8usize.checked_add(len)?;
+	core::str::from_utf8(request.get(8..end)?).ok()
+}
+
+fn denied_reply(request: &[u8], reply: &mut [u8]) -> Option<usize> {
+	if request.len() < 6 {
+		return None;
+	}
+	let corr: u32 = u32::from_le_bytes([request[2], request[3], request[4], request[5]]);
+	let mut writer = SliceWriter::new(reply);
+	writer.u32(corr)?;
+	writer.u8(0)?;
+	Error::Denied.write(&mut writer)?;
+	Some(writer.pos())
+}
+
+fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
+	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full }];
+	let mut request: [u8; 1024] = [0u8; 1024];
+	let mut reply: [u8; 4096] = [0u8; 4096];
+	loop {
+		let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + usize::from(admin != 0));
+		if admin != 0 {
+			waits.push(admin);
+		}
+		waits.extend(clients.iter().map(|client| client.chan));
+		let ready: i64 = unsafe { wait_any(&waits, 0) };
+		if ready < 0 {
+			continue;
+		}
+		let chan: u64 = waits[ready as usize];
+		if chan == admin {
+			match unsafe { recv_blocking(admin, &mut request) } {
+				Received::Message { len, mut handle } => {
+					let mut reply_handle: u64 = 0;
+					let mut call = AdminCall { volume: vol, clients: &mut clients };
+					if let Some(reply_len) = volume_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
+						if !unsafe { send_blocking(admin, &reply[..reply_len], reply_handle) } && reply_handle != 0 {
+							unsafe { close(reply_handle) };
+						}
+					} else if reply_handle != 0 {
+						unsafe { close(reply_handle) };
+					}
+					if handle != 0 {
+						unsafe { close(handle) };
+					}
+				}
+				Received::Closed => admin = 0,
+			}
+			continue;
+		}
+		let Some(index) = clients.iter().position(|client| client.chan == chan) else { continue };
+		let scope: Scope = clients[index].scope.clone();
+		match unsafe { recv_blocking(chan, &mut request) } {
+			Received::Message { len, .. } if len == 0 => {
+				if index == 0 {
+					exit();
+				}
+				unsafe { close(chan) };
+				clients.swap_remove(index);
+			}
+			Received::Message { len, mut handle } => {
+				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+				if op == HEARTBEAT_OP {
+					unsafe { send_blocking(chan, b"PONG", 0) };
+				} else if op == CONNECT_OP {
+					if let Some((server, client)) = unsafe { channel() } {
+						clients.push(Client { chan: server, scope });
+						unsafe { send_blocking(chan, &[], client) };
+					} else {
+						unsafe { send_blocking(chan, &[], 0) };
+					}
+				} else {
+					// Stamp mutations before authorization and dispatch. The clock is a no-op on
+					// read-only backends, while denied requests never reach their filesystem.
+					vol.fs.set_clock(unsafe { clock_rtc() });
+					if op == volume::OP_LIST {
+						stream_list(vol, chan, &scope, &request[..len], &mut handle);
+					} else {
+						let mut reply_handle: u64 = 0;
+						let reply_len: Option<usize> = if scope.allows_request(vol.name(), &request[..len]) { volume::dispatch(vol, &request[..len], &mut handle, &mut reply, &mut reply_handle) } else { denied_reply(&request[..len], &mut reply) };
+						if let Some(reply_len) = reply_len {
+							if !unsafe { send_blocking(chan, &reply[..reply_len], reply_handle) } && reply_handle != 0 {
+								unsafe { close(reply_handle) };
+							}
+						} else if reply_handle != 0 {
+							unsafe { close(reply_handle) };
+						}
+					}
+				}
+				if handle != 0 {
+					unsafe { close(handle) };
+				}
+			}
+			Received::Closed => {
+				if index == 0 {
+					exit();
+				}
+				unsafe { close(chan) };
+				clients.swap_remove(index);
+			}
+		}
+	}
 }
 
 // Serve one OP_LIST request: decode it, gather the listing, then stream the entries
@@ -163,7 +321,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // bad path replies the correlation id with NO consumer handle - the generated
 // client reads that as "no stream" - so an error stays distinguishable from an
 // empty directory (`cd` validates paths this way).
-fn stream_list(vol: &mut Volume, service: u64, request: &[u8], request_handle: &mut u64) {
+fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], request_handle: &mut u64) {
 	let mut reader = if *request_handle == 0 { proto::codec::Reader::new(request) } else { proto::codec::Reader::with_handle(request, *request_handle) };
 	let r = &mut reader;
 	let (corr, path): (u32, String) = match (|| Some((r.u16()?, r.u32()?, r.string_lp()?)))() {
@@ -175,6 +333,12 @@ fn stream_list(vol: &mut Volume, service: u64, request: &[u8], request_handle: &
 	}
 	*request_handle = 0;
 	let corr_bytes: [u8; 4] = corr.to_le_bytes();
+	if !scope.allows_path(vol.name(), &path) {
+		unsafe {
+			send_blocking(service, &corr_bytes, 0);
+		}
+		return;
+	}
 	let items: Vec<FileInfo> = match vol.list_entries(&path) {
 		Ok(items) => items,
 		Err(_) => {

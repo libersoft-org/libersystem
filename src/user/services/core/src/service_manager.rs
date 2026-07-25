@@ -44,7 +44,7 @@ mod bootstrap;
 #[path = "service_manager/lifecycle.rs"]
 mod lifecycle;
 
-use bootstrap::{bootstrap_serve, console_report, drive_runtime_drivers, emit_event, launch_from_volume, send_factory, start_service, stop_service};
+use bootstrap::{bootstrap_serve, console_report, drive_runtime_drivers, emit_event, launch_from_volume, open_storage_directory, start_service, stop_service};
 use lifecycle::{depends_on_scoped, has_running_dependent, serve_stats_once, shutdown_all, shutdown_order, verify_shutdown_order};
 
 // A service in the boot manifest: its package entry name, the supervisor's crash
@@ -225,6 +225,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// and the supervisor status view, so a failure is explained rather than silent.
 	let mut failure_reason: [String; N] = core::array::from_fn(|_| String::new());
 	let mut storage_client: u64 = 0;
+	let mut storage_admin: u64 = 0;
 	let mut block_client: u64 = 0;
 	let mut block2_client: u64 = 0;
 	let mut block3_client: u64 = 0;
@@ -308,10 +309,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// the root is transferred to the shell at its bootstrap (a transferred handle is gone
 	// from our table, so a late mint would find nothing to mint from).
 	let mut broker_process: u64 = 0;
-	// The supervisor's OWN system-volume connection - a restarted ConfigService's
-	// persistence backing is re-minted from it. Minted like the process connection
-	// above (the storage root is transferred to the shell at its bootstrap).
-	let mut broker_storage: u64 = 0;
+	// The supervisor's private StorageService admin endpoint. A restarted ConfigService
+	// receives a new client confined to its own persistence directory through this endpoint.
+	let mut broker_storage_admin: u64 = 0;
 	// A drill-only PermissionManager connection (test boots drive the `run` op through it
 	// to prove a governed tool's grant survives a service restart), minted like the
 	// process connection above, before the root transfers to the shell.
@@ -322,7 +322,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, bootstrap, pkg_handle, pkg_len, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -330,7 +330,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					broker_process = unsafe { service_connect(process_client) }.unwrap_or(0);
 				}
 				if MANIFEST[i].name == b"storage_service" && started == State::Running {
-					broker_storage = unsafe { service_connect(storage_client) }.unwrap_or(0);
+					broker_storage_admin = storage_admin;
 				}
 				if MANIFEST[i].name == b"permission_manager" && started == State::Running && selftest {
 					drill_perm = unsafe { service_connect(perm_client) }.unwrap_or(0);
@@ -348,8 +348,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// from the freshly mounted system volume and sent on LogService's
 					// control channel.
 					if let Some(lg) = index_of(b"log_service") {
-						if let Some(vol) = unsafe { service_connect(storage_client) } {
-							unsafe { send_blocking(channels[lg], b"STORAGE", vol) };
+						let journal: u64 = unsafe { open_storage_directory(storage_admin, "vol://system/log") };
+						if journal != 0 {
+							unsafe { send_blocking(channels[lg], b"STORAGE", journal) };
 						}
 					}
 				}
@@ -449,7 +450,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     system volume, which stopping DeviceManager makes unavailable. The broker
 	//     stands for the life of the system (the supervise loop serves resolves and
 	//     restarts config on a runtime crash the same way).
-	let mut broker: Broker = Broker { config: config_client, device: device_client, process: broker_process, storage: broker_storage };
+	let mut broker: Broker = Broker { config: config_client, device: device_client, process: broker_process, storage_admin: broker_storage_admin };
 	if selftest && canary_ctrl != 0 {
 		if let Some(cfg) = index_of(b"config_service") {
 			if state[cfg] == State::Running && procs[cfg] != 0 {
@@ -698,15 +699,15 @@ unsafe fn drain_closed(channel: u64, buf: &mut [u8]) {
 
 // The live serve roots the broker mints resolved connections from, updated when a
 // restart replaces an instance (the old root died with it). `process` is the
-// supervisor's OWN ProcessService connection (minted at bring-up, before the root is
-// transferred to the shell), which volume-staged replacements are launched through;
-// `storage` is the system-volume root a restarted ConfigService's persistence
-// backing is re-minted from.
+// supervisor's OWN ProcessService connection (minted at bring-up, before the root
+// is transferred to the shell), which volume-staged replacements are launched through;
+// `storage_admin` mints the restarted ConfigService's directory-scoped persistence
+// backing without exposing a full-volume client.
 struct Broker {
 	config: u64,
 	device: u64,
 	process: u64,
-	storage: u64,
+	storage_admin: u64,
 }
 
 // The grant set of each resolving component: which capability names its resolves may
@@ -830,12 +831,15 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 		if proc < 0 {
 			return false;
 		}
-		// A restarted ConfigService gets a fresh persistence backing (the old volume
-		// connection died with the crashed instance), so the replacement reloads the
-		// persisted tree - a `config set` survives the restart.
-		if MANIFEST[idx].name == b"config_service" && broker.storage != 0 && !send_factory(manager_side, b"STORAGE", broker.storage) {
-			close(proc as u64);
-			return false;
+		// A restarted ConfigService gets a fresh client confined to its persistence
+		// directory, so the replacement reloads the persisted tree without receiving
+		// authority over the rest of the system volume.
+		if MANIFEST[idx].name == b"config_service" && broker.storage_admin != 0 {
+			let storage: u64 = open_storage_directory(broker.storage_admin, "vol://system/libexec/config_service");
+			if storage == 0 || !send_blocking(manager_side, b"STORAGE", storage) {
+				close(proc as u64);
+				return false;
+			}
 		}
 		if !bootstrap_serve(manager_side, root) {
 			close(proc as u64);

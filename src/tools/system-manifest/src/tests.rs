@@ -37,6 +37,11 @@ stage = "volume"
 destination = "bin/tool.lsexe"
 providers = ["pcm"]
 
+[[factory_files]]
+name = "liber-component"
+kind = "sdk-component"
+destination = "components/liber_component/app.wasm"
+
 [[services]]
 name = "tool_service"
 program = "tool"
@@ -80,5 +85,47 @@ fn unknown_fields_fail_during_deserialization() {
 	let root = fixture_workspace();
 	let error = Manifest::parse(&valid_fixture().replace("schema = 1", "schema = 1\nextra = true"), &root).unwrap_err().to_string();
 	assert!(error.contains("unknown field"));
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn factory_files_cover_the_source_tree_and_enforce_the_layout() {
+	let root = fixture_workspace();
+	fs::create_dir_all(root.join("volume/audio")).unwrap();
+	fs::write(root.join("volume/hello.txt"), "hello").unwrap();
+	fs::write(root.join("volume/audio/test.mp3"), "mp3").unwrap();
+	let fixture = format!("{}\n[[factory_files]]\nname = \"hello\"\nkind = \"source\"\nsource = \"volume/hello.txt\"\ndestination = \"hello.txt\"\n\n[[factory_files]]\nname = \"audio-demo\"\nkind = \"source\"\nsource = \"volume/audio/test.mp3\"\ndestination = \"audio/test.mp3\"\n", valid_fixture());
+	let manifest = Manifest::parse(&fixture, &root).unwrap();
+	assert_eq!(manifest.factory_files.len(), 3);
+	let invalid = fixture.replace("destination = \"audio/test.mp3\"", "destination = \"share/test.mp3\"");
+	let error = Manifest::parse(&invalid, &root).unwrap_err().to_string();
+	assert!(error.contains("expected audio/test.mp3"));
+	let without_component = fixture.replace("\n[[factory_files]]\nname = \"liber-component\"\nkind = \"sdk-component\"\ndestination = \"components/liber_component/app.wasm\"\n", "");
+	let error = Manifest::parse(&without_component, &root).unwrap_err().to_string();
+	assert!(error.contains("no SDK component payload is declared"));
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn volume_program_roles_have_exact_destinations() {
+	let root = fixture_workspace();
+	let helper = valid_fixture().replace("role = \"tool\"", "role = \"helper\"").replace("destination = \"bin/tool.lsexe\"", "destination = \"libexec/tool.lsexe\"");
+	Manifest::parse(&helper, &root).unwrap();
+	let nested = helper.replace("destination = \"libexec/tool.lsexe\"", "destination = \"libexec/tool/private/tool.lsexe\"");
+	let error = Manifest::parse(&nested, &root).unwrap_err().to_string();
+	assert!(error.contains("expected libexec/tool.lsexe"));
+	fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn runtime_paths_require_their_declared_owner_and_destination() {
+	let root = fixture_workspace();
+	fs::create_dir_all(root.join("user/services/core")).unwrap();
+	fs::write(root.join("user/services/core/Cargo.toml"), "[package]\nname='services'\nversion='0.0.0'\n").unwrap();
+	let fixture = format!("{}\n[[sources]]\nowner = \"services\"\npath = \"user/services/core\"\n\n[[programs]]\nname = \"config_service\"\nowner = \"services\"\nrole = \"service\"\nlinkage = \"dynamic\"\nstage = \"volume\"\ndestination = \"libexec/config_service/config_service.lsexe\"\n\n[[runtime_paths]]\nname = \"config-tree\"\nowner = \"config_service\"\ndestination = \"libexec/config_service/config.tree\"\n", valid_fixture());
+	Manifest::parse(&fixture, &root).unwrap();
+	let invalid = fixture.replace("destination = \"libexec/config_service/config.tree\"", "destination = \"config.tree\"");
+	let error = Manifest::parse(&invalid, &root).unwrap_err().to_string();
+	assert!(error.contains("expected libexec/config_service/config.tree"));
 	fs::remove_dir_all(root).unwrap();
 }

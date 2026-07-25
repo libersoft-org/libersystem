@@ -500,6 +500,10 @@ qemu_run_aarch64() {
 	local test_args=()
 	if [[ "${TEST:-0}" == "1" ]]; then
 		test_args+=(-semihosting)
+		# The boot-chain test includes DisplayService and its Console/Shell dependents.
+		# Unlike x86, the virt machine has no default VGA device, so test mode supplies
+		# the same discoverable GPU path without enabling the interactive peripherals.
+		qemu_args+=(-device virtio-gpu-pci,disable-legacy=on)
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -aarch64 "disable-legacy=on"
@@ -603,6 +607,9 @@ qemu_run_riscv64() {
 	local test_args=()
 	if [[ "${TEST:-0}" == "1" ]]; then
 		test_args+=(-semihosting)
+		# The RISC-V virt machine has no default VGA device, while the boot-chain test
+		# requires DisplayService and its Console/Shell dependents.
+		qemu_args+=(-device virtio-gpu-pci)
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -riscv64 ""

@@ -1,6 +1,7 @@
 # Bugs / changes
 
-- init.pkg is not on vol://system/ ... find out why?
+- measure the time it takes for tests, compilations, etc. to run and suggest how it could be optimized so that everything doesn't take so long while maintaining full functionality... for example just shared-cache-check quick is extremely slow
+- init.pkg is not in vol://system/ ... find out why?
 - tests are taking too long after every small task - optimization needed
 - make boot faster (multicore + other optimizations)
 - "exit" command gracefully stops everything and then halts, but poweroff doesn't... do the same gracefullness for poweroff

@@ -8,7 +8,7 @@
 // A supervisor hands this program a bootstrap channel and, over it, exactly two
 // capabilities: a StorageService client and a LogService client. The host then:
 //
-//   1. loads the component from storage (vol://system/app.wasm), rather than
+//   1. loads the component from storage (vol://system/components/liber_component/app.wasm), rather than
 //      embedding it in the kernel image - StorageService serves it from the ramdisk
 //      volume that `just sdk` stages it into;
 //   2. resolves each of the component's imports by its (module, field) name into a
@@ -36,18 +36,7 @@ use proto::system::{Entry, Field, OpenOpts, Severity, log, volume};
 use rt::*;
 use wasm::{Host, Instance, Module, Trap, Value};
 
-// The component is loaded from storage, not embedded: StorageService serves it over
-// vol:// from the ramdisk volume that `just sdk` builds it into.
-const COMPONENT_URI: &[u8] = b"vol://system/app.wasm";
-
-// The one input file the component's `read` import is wired to. The component never
-// names it - it only calls `read`, and the host reads exactly this file.
-const INPUT_URI: &[u8] = b"vol://system/hello.txt";
-
-// Where the component's `write` import persists its output. On the read-only ramdisk
-// volume this write is denied (and reported as zero bytes written); on a writable
-// disk it lands here. Either way the component cannot choose the path.
-const OUTPUT_URI: &[u8] = b"vol://system/out.txt";
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
 
 // The `liber` world: the imports the host recognizes, resolved by name. Anything
 // else is `Unknown` and traps when the component calls it - the component reaches
@@ -93,7 +82,8 @@ impl Host for ComponentHost {
 			// StorageService into the component's memory, return the byte count.
 			WorldFn::Read => {
 				let (ptr, end): (usize, usize) = window(args, memory.len())?;
-				let n: usize = unsafe { read_file(self.storage, INPUT_URI, &mut memory[ptr..end]) }.ok_or(Trap("granted read failed"))?;
+				let input_path = factory_path("hello").ok_or(Trap("missing manifest input path"))?;
+				let n: usize = unsafe { read_file(self.storage, input_path.as_bytes(), &mut memory[ptr..end]) }.ok_or(Trap("granted read failed"))?;
 				Ok(alloc::vec![Value::I32(n as i32)])
 			}
 			// liber.write(ptr, len) -> n: persist the component's bytes to the one
@@ -104,7 +94,8 @@ impl Host for ComponentHost {
 			WorldFn::Write => {
 				let (ptr, end): (usize, usize) = window(args, memory.len())?;
 				self.output = memory[ptr..end].to_vec();
-				let n: usize = unsafe { write_file(self.storage, OUTPUT_URI, &memory[ptr..end]) };
+				let output_path = runtime_path("liber-component-output").ok_or(Trap("missing manifest output path"))?;
+				let n: usize = unsafe { write_file(self.storage, output_path.as_bytes(), &memory[ptr..end]) };
 				Ok(alloc::vec![Value::I32(n as i32)])
 			}
 			// liber.log(ptr, len): emit the component's bytes as one structured entry
@@ -238,7 +229,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 2. load the component from storage and parse it. It is an ordinary toolchain
 	//    artifact, not embedded in the kernel image.
-	let bytes: Vec<u8> = unsafe { load_component(storage, COMPONENT_URI) }.unwrap_or_else(|| exit());
+	let component_path = factory_path("liber-component").unwrap_or_else(|| exit());
+	let bytes: Vec<u8> = unsafe { load_component(storage, component_path.as_bytes()) }.unwrap_or_else(|| exit());
 	let module: Module = match wasm::parse(&bytes) {
 		Ok(m) => m,
 		Err(_) => exit(),

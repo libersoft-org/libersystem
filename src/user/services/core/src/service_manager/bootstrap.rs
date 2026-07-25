@@ -1,7 +1,8 @@
 use super::*;
 use ipc_client::ChannelTransport;
+use proto::system::volume_admin;
 
-// Load a non-pinned service from the system volume's `bin/` through ProcessService,
+// Load a non-pinned service from its manifest-declared system-volume path through ProcessService,
 // handing the new process `bootstrap` as its bootstrap channel. Mints a dedicated
 // launcher connection to the `process` factory (so the client end kept for the shell
 // stays pristine). Returns the new process handle, or a negative value on failure.
@@ -83,7 +84,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -91,7 +92,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		};
 		// The pinned bootstrap set is raw-spawned from the init package (it is on the path
 		// to mounting the system volume, so it cannot load from it); every other service is
-		// loaded from the volume's `bin/` through ProcessService. media / iso /
+		// loaded from their manifest-declared volume paths through ProcessService. media / iso /
 		// udf storage are extra instances of the pinned storage_service binary.
 		let proc: i64 = if pinned {
 			let mut artifact: Vec<u8> = program.to_vec();
@@ -115,7 +116,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"device_manager" && !bootstrap_package(manager_side, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
-		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, storage_client) {
+		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, storage_client, storage_admin) {
 			return State::Failed;
 		}
 		if name == b"media_storage" && !bootstrap_media_storage(manager_side, *block2_client, media_client) {
@@ -136,7 +137,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, *storage_client, process_client, buf) {
 			return State::Failed;
 		}
-		if name == b"config_service" && !bootstrap_config_service(manager_side, *storage_client, config_client) {
+		if name == b"config_service" && !bootstrap_config_service(manager_side, *storage_client, *storage_admin, config_client) {
 			return State::Failed;
 		}
 		if name == b"network_service" && !bootstrap_network_service(manager_side, *net_frames, *config_client, net_client) {
@@ -766,16 +767,18 @@ pub(super) unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> boo
 	}
 }
 
-// Hand ConfigService its persistence backing - a fresh system-volume connection
-// ("STORAGE", minted from the storage root; ConfigService depends on
-// process_service and thus storage_service, so the volume is mounted by now) -
-// then the channel its clients reach it on. The tree then loads from and
-// write-through-persists to `vol://system/config.tree`, so a `config set`
+// Hand ConfigService its directory-scoped persistence backing - a fresh
+// `libexec/config_service` client minted by the supervisor-held StorageService admin
+// endpoint - then the channel its clients reach it on. The tree then loads from and
+// write-through-persists to `vol://system/libexec/config_service/config.tree`, so a `config set`
 // survives a restart and a reboot.
-unsafe fn bootstrap_config_service(manager_side: u64, storage_client: u64, config_client: &mut u64) -> bool {
+unsafe fn bootstrap_config_service(manager_side: u64, storage_client: u64, storage_admin: u64, config_client: &mut u64) -> bool {
 	unsafe {
-		if storage_client != 0 && !send_factory(manager_side, b"STORAGE", storage_client) {
-			return false;
+		if storage_client != 0 {
+			let storage: u64 = open_storage_directory(storage_admin, "vol://system/libexec/config_service");
+			if storage == 0 || !send_blocking(manager_side, b"STORAGE", storage) {
+				return false;
+			}
 		}
 		bootstrap_serve(manager_side, config_client)
 	}
@@ -852,16 +855,42 @@ unsafe fn bootstrap_process_service(manager_side: u64, pkg_handle: u64, pkg_len:
 	unsafe { bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_factory(manager_side, b"STORAGE", storage_client) && bootstrap_serve(manager_side, process_client) }
 }
 
-// Hand StorageService its disk-backed volume and a service channel over
-// `manager_side`: "BLOCK" transferring the block-read service channel (routed up
-// from the virtio-blk driver via DeviceManager), then "SERVE" transferring one end
-// of a fresh service channel. The other end is stored in `*storage_client`.
-unsafe fn bootstrap_storage(manager_side: u64, block_client: u64, storage_client: &mut u64) -> bool {
+// Hand StorageService its disk-backed volume, private directory-scope admin endpoint,
+// and a public service channel over `manager_side`: "BLOCK" transfers the block-read
+// service channel routed up from DeviceManager, "ADMIN" is retained only by this
+// supervisor, then "SERVE" transfers one end of a fresh public service channel.
+unsafe fn bootstrap_storage(manager_side: u64, block_client: u64, storage_client: &mut u64, storage_admin: &mut u64) -> bool {
 	unsafe {
 		if !send_blocking(manager_side, b"BLOCK", block_client) {
 			return false;
 		}
-		bootstrap_serve(manager_side, storage_client)
+		let (service_admin, manager_admin): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		if !send_blocking(manager_side, b"ADMIN", service_admin) {
+			close(manager_admin);
+			return false;
+		}
+		if !bootstrap_serve(manager_side, storage_client) {
+			close(manager_admin);
+			return false;
+		}
+		*storage_admin = manager_admin;
+		true
+	}
+}
+
+// Mint a client confined to one declared system-volume directory. The caller keeps the
+// private admin endpoint; ordinary volume clients never receive it and can only mint
+// another client with their existing scope.
+pub(super) unsafe fn open_storage_directory(storage_admin: u64, path: &str) -> u64 {
+	if storage_admin == 0 {
+		return 0;
+	}
+	match volume_admin::Client::new(ChannelTransport { chan: storage_admin }).open_directory(path) {
+		Some(Ok(client)) => client,
+		_ => 0,
 	}
 }
 

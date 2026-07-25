@@ -498,7 +498,7 @@ shell's waiter in interrupt context.
 ## Contiguous DMA and full-size I/O (2026-07-05)
 
 Measured live in QEMU/KVM with the shell's `time` over serial: a whole-file read
-of a 5.2 MB file from the LiberFS system volume (`time cat /bin/console_service`,
+of a 5.2 MB file from the LiberFS system volume (`time cat /libexec/console_service.lsexe`,
 virtio-blk), and a 4 MB HTTP fetch from a host-side server printed to the console
 (`time tcp 10.0.2.2 8888`, virtio-net + the TCP stack). Before = the tree at
 HEAD (per-page DMA, 16-descriptor rings, one-sector block requests, MSS-less

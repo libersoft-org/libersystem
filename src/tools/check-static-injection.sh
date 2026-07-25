@@ -293,10 +293,11 @@ check_target() {
 	local volume="$build_root/boot/$volume_name"
 	local artifact_hash before after_failure after_restore
 	if [[ "$kind" == duplicate-edge || "$kind" == malformed-dynamic || "$kind" == malformed-symbol-relocation ]]; then
-		artifact="$build_root/system-image/$target/bin/dyn_probe"
+		destination="$(jq -er '.programs.dyn_probe.destination | sub("\\.lsexe$"; "")' <<<"$manifest_json")"
 	else
-		artifact="$build_root/system-image/$target/bin/echo"
+		destination="$(jq -er '.programs.echo.destination | sub("\\.lsexe$"; "")' <<<"$manifest_json")"
 	fi
+	artifact="$build_root/system-image/$target/$destination"
 	[[ -f "$artifact" ]] || {
 		echo "image-injection-check: missing staged $label artifact for $kind" >&2
 		return 1

@@ -121,10 +121,75 @@ name:
   `virtio_blk` driver, and `SystemManager` / `ServiceManager` themselves. These
   cannot be loaded from the volume because they are what makes the volume
   mountable, so they ride in the init package.
-- **`volume.pkg`** - the system-volume seed: every other service, driver, tool
-  and component (staged under `bin/`, `drivers/`, ...), plus the plain seed files
-  under `src/volume/` (`hello.txt`, `motd.txt`). StorageService formats a fresh
-  LiberFS from this archive on first boot and serves its files over `vol://system`.
+- **`volume.pkg`** - the system-volume seed: every non-pinned command under `bin/`,
+  internal native executable under `libexec/`, driver under `drivers/`, shared library
+  under `lib/` and component payload under `components/`, each at its manifest-declared
+  path. It also contains only the declared factory data: `hello.txt`, `motd.txt`,
+  `audio/test.mp3` and `wallpapers/logo.webp`. StorageService formats a fresh LiberFS
+  from this archive on first boot and serves its files over `vol://system`.
+
+### Source and system-volume ownership layout
+
+The hand-edited service manifest is the sole mapping between source owners and staged
+destinations. Cargo roots below `src/user/` live only in the role directories
+`runtime/`, `services/`, `drivers/`, `apps/` and `libs/`; shared linker/toolchain files
+remain infrastructure rather than a sixth crate role. A direct Cargo root at the user
+directory or a source artifact below it is invalid.
+
+The completed layout migration is recorded as follows:
+
+```text
+before source layout                 after source layout
+src/user/                            src/user/
+  rt/                                  runtime/rt/
+  services/                            services/{core,storage,system_manager}/
+  storage/                             drivers/core/
+  system_manager/                      apps/{tools,dyn_probe}/
+  drivers/                             libs/{audio,image,compression,protocol,
+  tools/                                     clients,display,input,ipc}/...
+  dyn_probe/                           .cargo/, build.rs, linker scripts, toolchain files
+  <reusable leaf crates>/
+```
+
+The corresponding mounted system volume has this ownership layout:
+
+```text
+vol://system/
+  hello.txt
+  motd.txt
+  audio/test.mp3
+  wallpapers/logo.webp
+  bin/                         user-invoked native commands
+  components/<owner>/          non-native component payloads and private output
+  drivers/                     volume-loaded native drivers
+  lib/<category>/              shared providers
+  libexec/<owner>/             internal services/helpers and private state
+  log/                         system-wide structured journal
+```
+
+```text
+before volume layout                 after volume layout
+vol://system/                        vol://system/
+  app.wasm                             hello.txt, motd.txt
+  config.tree                          audio/test.mp3, wallpapers/logo.webp
+  bin/<commands,services,helpers>/     bin/<commands>/
+  drivers/                             libexec/<internal owner>/
+  lib/                                 drivers/, lib/<category>/
+  <factory fixture corpus>/            components/<owner>/, log/
+```
+
+No compatibility copy exists at the volume root. In particular, native helpers do not
+share `bin/` with commands, component payloads do not share the root with factory data,
+and ConfigService persists its tree at
+`libexec/config_service/config.tree`. StorageService's private `volume-admin` endpoint
+is held by the service supervisor and mints directory-scoped clients; ConfigService and
+LogService receive only their `libexec/config_service` and `log` directories. A scoped
+client may create another client with the same scope, never a broader one.
+
+A valid existing LiberFS is mounted unchanged even when the factory archive at LBA 0
+changes. Development QEMU runners deliberately recreate their system disk when the
+current `volume.pkg` is newer, so rebuilding a pre-release image receives a fresh seed
+without turning a normal on-disk mount into an implicit migration.
 
 Both are staged (by `boot/mkimage.sh`) onto the FAT boot filesystem next to the
 loader, under their `product.conf` names (`INIT_PACKAGE` / `VOLUME_PACKAGE`), and

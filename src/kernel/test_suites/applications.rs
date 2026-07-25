@@ -143,7 +143,7 @@ fn imgconv_governed_working_set_is_measured() {
 	serial_println!("imgconv governed memory: 1920x1080={} bytes, 3840x2160={} bytes, animation={} bytes", full_hd_peak, ultra_hd_peak, animation_peak);
 }
 
-tagged_test!(wasi_host_runs_a_component, [Service]);
+tagged_test!(wasi_host_runs_a_component, [Component, Service]);
 fn wasi_host_runs_a_component() {
 	// The wasi_host (a ring-3 process) loads an embedded Wasm component and runs it
 	// on the `wasm` runtime. The component's only import, `liber.read`, is wired by
@@ -158,7 +158,7 @@ fn wasi_host_runs_a_component() {
 	assert_eq!(actual, expected, "the component read the granted file's bytes through the host import");
 }
 
-tagged_test!(powerbox_grants_a_picked_file_to_a_component, [Service]);
+tagged_test!(powerbox_grants_a_picked_file_to_a_component, [Component, Service]);
 fn powerbox_grants_a_picked_file_to_a_component() {
 	// A Wasm component with NO filesystem access of its own runs under wasi_host,
 	// which holds only a FilePicker client. The component's read import goes through
@@ -206,10 +206,10 @@ fn permission_manager_mints_scoped_application_grants() {
 	assert!(result.graphics_start_ns != 0, "the governed app cold-start path is measured");
 }
 
-tagged_test!(component_host_runs_an_sdk_component, [Service, Slow]);
+tagged_test!(component_host_runs_an_sdk_component, [Component, Service, Slow]);
 fn component_host_runs_an_sdk_component() {
 	// component_host (a ring-3 process) loads a real Wasm component - built by the Rust
-	// SDK and served from storage as vol://system/app.wasm, not embedded in the kernel
+	// SDK and served from storage as vol://system/components/liber_component/app.wasm, not embedded in the kernel
 	// image - and runs it. Its three imports are resolved by name and wired to two
 	// typed services with no ambient authority: `read` / `write` to StorageService,
 	// `log` to LogService. The component reads its one granted file, upper-cases it,

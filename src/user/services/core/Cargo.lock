@@ -341,6 +341,7 @@ dependencies = [
 name = "system-manifest"
 version = "0.0.0"
 dependencies = [
+ "abi",
  "serde",
  "serde_json",
  "toml",

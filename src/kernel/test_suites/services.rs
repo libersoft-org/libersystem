@@ -797,7 +797,7 @@ fn process_service_resolves_one_final_executable_suffix() {
 	}
 }
 
-tagged_test!(config_service_serves_the_tree, [Service]);
+tagged_test!(config_service_serves_the_tree, [Config, Service]);
 fn config_service_serves_the_tree() {
 	use object::channel::Message;
 
@@ -872,14 +872,14 @@ fn config_service_serves_the_tree() {
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
 }
 
-tagged_test!(config_set_survives_a_service_reboot, [Service, Storage]);
+tagged_test!(config_set_survives_a_service_reboot, [Config, Service, Storage]);
 fn config_set_survives_a_service_reboot() {
 	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
 	// Persistence: a `config set` survives the service's whole lifetime ending.
-	// ConfigService write-throughs its tree to `vol://system/config.tree`, so a NEW
+	// ConfigService write-throughs its tree to `vol://system/libexec/config_service/config.tree`, so a NEW
 	// instance over the SAME volume loads it back - the reboot property (and what
 	// makes the transparent ConfigService restart stateless). Stand up a
 	// StorageService over a fresh writable disk (the sparse block stand-in formats
@@ -937,7 +937,7 @@ fn config_set_survives_a_service_reboot() {
 	send_cap(&cfg1_boot, b"SERVE", cfg1_server, Rights::ALL).expect("SERVE bootstrap 1");
 
 	// SET persist.key = survives ([op = 3 u16][corr u32][key + value strings]); the
-	// write-through to vol://system/config.tree completes before the reply.
+	// write-through to vol://system/libexec/config_service/config.tree completes before the reply.
 	let (k, v): (&[u8], &[u8]) = (b"persist.key", b"survives");
 	let mut set = alloc::vec::Vec::new();
 	set.extend_from_slice(&3u16.to_le_bytes());

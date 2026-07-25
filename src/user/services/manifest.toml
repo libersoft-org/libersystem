@@ -326,7 +326,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/audio_service.lsexe"
+destination = "libexec/audio_service.lsexe"
 providers = ["pcm", "wire", "lsrt"]
 
 [[programs]]
@@ -353,7 +353,7 @@ owner = "services"
 role = "helper"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/component_host.lsexe"
+destination = "libexec/component_host.lsexe"
 providers = ["wasm", "base-proto", "storage-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -371,7 +371,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/config_service.lsexe"
+destination = "libexec/config_service/config_service.lsexe"
 providers = ["config-proto", "base-proto", "storage-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -380,7 +380,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/console_service.lsexe"
+destination = "libexec/console_service.lsexe"
 providers = [
 	"service-util",
 	"term",
@@ -417,7 +417,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/device_service.lsexe"
+destination = "libexec/device_service.lsexe"
 providers = ["device-proto", "wire", "lsrt"]
 
 [[programs]]
@@ -426,7 +426,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/display_service.lsexe"
+destination = "libexec/display_service.lsexe"
 providers = ["pix", "display-proto", "wire", "lsrt"]
 
 [[programs]]
@@ -453,7 +453,7 @@ owner = "dyn_probe"
 role = "probe"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/dyn_probe.lsexe"
+destination = "libexec/dyn_probe.lsexe"
 providers = ["pix", "lsrt"]
 
 [[programs]]
@@ -471,7 +471,7 @@ owner = "services"
 role = "helper"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/file_picker.lsexe"
+destination = "libexec/file_picker.lsexe"
 providers = ["base-proto", "storage-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -525,7 +525,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/input_service.lsexe"
+destination = "libexec/input_service.lsexe"
 providers = ["keys", "input-proto", "wire", "lsrt"]
 
 [[programs]]
@@ -669,7 +669,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/network_service.lsexe"
+destination = "libexec/network_service.lsexe"
 providers = ["network-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -696,7 +696,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/permission_manager.lsexe"
+destination = "libexec/permission_manager.lsexe"
 providers = [
 	"service-util",
 	"base-proto",
@@ -785,7 +785,7 @@ owner = "services"
 role = "probe"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/request_probe.lsexe"
+destination = "libexec/request_probe.lsexe"
 providers = ["base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -794,7 +794,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/resource_manager.lsexe"
+destination = "libexec/resource_manager.lsexe"
 providers = ["resources-proto", "wire", "lsrt"]
 
 [[programs]]
@@ -839,7 +839,7 @@ owner = "services"
 role = "probe"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/sandbox_probe.lsexe"
+destination = "libexec/sandbox_probe.lsexe"
 providers = ["base-proto", "storage-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -866,7 +866,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/session_service.lsexe"
+destination = "libexec/session_service.lsexe"
 providers = ["session-proto", "wire", "lsrt"]
 
 [[programs]]
@@ -884,7 +884,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/shell.lsexe"
+destination = "libexec/shell.lsexe"
 providers = [
 	"service-util",
 	"base-proto",
@@ -931,7 +931,7 @@ owner = "storage"
 role = "helper"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/storage_client.lsexe"
+destination = "libexec/storage_client.lsexe"
 providers = ["base-proto", "storage-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -949,7 +949,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/system_graph_service.lsexe"
+destination = "libexec/system_graph_service.lsexe"
 providers = ["observability-proto", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -976,7 +976,7 @@ owner = "services"
 role = "service"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/time_service.lsexe"
+destination = "libexec/time_service.lsexe"
 providers = ["network-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -1075,7 +1075,7 @@ owner = "services"
 role = "helper"
 linkage = "dynamic"
 stage = "volume"
-destination = "bin/wasi_host.lsexe"
+destination = "libexec/wasi_host.lsexe"
 providers = ["wasm", "base-proto", "config-proto", "storage-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
@@ -1104,6 +1104,55 @@ linkage = "static"
 stage = "volume"
 destination = "drivers/xhci.lsexe"
 providers = []
+
+[[factory_files]]
+name = "audio-demo"
+kind = "source"
+source = "volume/audio/test.mp3"
+destination = "audio/test.mp3"
+
+[[factory_files]]
+name = "hello"
+kind = "source"
+source = "volume/hello.txt"
+destination = "hello.txt"
+
+[[factory_files]]
+name = "liber-component"
+kind = "sdk-component"
+destination = "components/liber_component/app.wasm"
+
+[[factory_files]]
+name = "motd"
+kind = "source"
+source = "volume/motd.txt"
+destination = "motd.txt"
+
+[[factory_files]]
+name = "wallpaper-logo"
+kind = "source"
+source = "volume/wallpapers/logo.webp"
+destination = "wallpapers/logo.webp"
+
+[[runtime_paths]]
+name = "command-directory"
+owner = "shell"
+destination = "bin"
+
+[[runtime_paths]]
+name = "config-tree"
+owner = "config_service"
+destination = "libexec/config_service/config.tree"
+
+[[runtime_paths]]
+name = "liber-component-output"
+owner = "component_host"
+destination = "components/liber_component/out.txt"
+
+[[runtime_paths]]
+name = "system-journal"
+owner = "log_service"
+destination = "log"
 
 [[services]]
 name = "audio_service"

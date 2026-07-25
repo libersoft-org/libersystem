@@ -307,7 +307,8 @@ generate_report() {
 			for tool in $(for candidate in "${!waves[@]}"; do if [[ "${waves[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
 				row="$(jq -er --arg tool "$tool" '.programs[$tool] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | "dynamic \(.name) \(.owner) \(.stage) \(.providers | join(" "))"' <<<"$manifest_json")"
 				providers="$(cut -d' ' -f5- <<<"$row")"
-				artifact="$build_root/system-image/$target/bin/$tool"
+				destination="$(jq -er --arg tool "$tool" '.programs[$tool].destination | sub("\\.lsexe$"; "")' <<<"$manifest_json")"
+				artifact="$build_root/system-image/$target/$destination"
 				[[ -f "$artifact" ]] || {
 					echo "dynamic-report: missing $target artifact for $tool" >&2
 					return 1

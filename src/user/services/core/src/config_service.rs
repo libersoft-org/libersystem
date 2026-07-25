@@ -11,7 +11,7 @@
 // tree, never parsed from text; a textual form would only ever be a representation
 // of these nodes.
 //
-// The tree is durable: it loads from `vol://system/config.tree` at start - the
+// The tree is durable: it loads from `vol://system/libexec/config_service/config.tree` at start - the
 // persisted nodes overriding (and extending) the seeded defaults, so a new default
 // key in a later build still appears while an operator's `set` values win - and
 // every successful SET writes the whole tree back through the volume client. A
@@ -32,11 +32,15 @@ use proto::system::config::{self, Service};
 use proto::system::{ConfigEntry, Error, OpenOpts, volume};
 use rt::*;
 
-// The persisted tree's location on the system volume, and its format magic (a
-// structured, versioned binary - never parsed text): the magic, a count, then per
-// entry a length-prefixed key and value.
-const TREE_PATH: &str = "vol://system/config.tree";
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+
+// The persisted tree's format magic (a structured, versioned binary - never parsed
+// text): the magic, a count, then per entry a length-prefixed key and value.
 const TREE_MAGIC: &[u8; 8] = b"LSCFGTR1";
+
+fn tree_path() -> &'static str {
+	runtime_path("config-tree").expect("manifest config-tree path")
+}
 
 // The configuration tree, behind the generated Config contract. Keys are dotted
 // paths (the tree path); the value is the node. `volume` is the persistence
@@ -74,7 +78,7 @@ impl Config {
 	}
 
 	// The durable tree: the seeded defaults overlaid with whatever
-	// `vol://system/config.tree` persisted - a set value wins over its default, a
+	// `vol://system/libexec/config_service/config.tree` persisted - a set value wins over its default, a
 	// persisted key with no default is appended, and a NEW default in a later build
 	// still appears (it has no persisted override yet). With no volume, or no file
 	// (first boot), the seeded defaults stand alone.
@@ -114,17 +118,22 @@ impl Config {
 			None => return,
 		};
 		let mut client = volume::Client::new(ChannelTransport { chan: self.volume });
-		let _ = client.write(TREE_PATH, &data);
+		let tree_path = tree_path();
+		let owner_directory = tree_path.rsplit_once('/').map(|(directory, _)| directory).expect("manifest config-tree parent");
+		let artifact_directory = owner_directory.rsplit_once('/').map(|(directory, _)| directory).expect("manifest config-tree artifact parent");
+		let _ = client.mkdir(artifact_directory);
+		let _ = client.mkdir(owner_directory);
+		let _ = client.write(tree_path, &data);
 	}
 }
 
-// Read the persisted tree back: open + map `vol://system/config.tree` and decode
+// Read the persisted tree back: open + map `vol://system/libexec/config_service/config.tree` and decode
 // its entries. Empty when the file does not exist (first boot), the magic is wrong
 // (a future format bumps it), or a record is truncated (the rest is dropped - the
 // seeded defaults cover the loss).
 fn read_tree(volume: u64) -> Vec<(String, String)> {
 	let mut client = volume::Client::new(ChannelTransport { chan: volume });
-	let opts: OpenOpts = OpenOpts { path: String::from(TREE_PATH), write: false, create: false };
+	let opts: OpenOpts = OpenOpts { path: String::from(tree_path()), write: false, create: false };
 	let result = match client.open(&opts) {
 		Some(Ok(r)) if r.file != 0 => r,
 		_ => return Vec::new(),

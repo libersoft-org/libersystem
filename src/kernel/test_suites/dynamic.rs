@@ -207,17 +207,17 @@ fn dynamic_process_service_loads_probe() {
 	sched::run_until_idle();
 }
 
-tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [Service, Process, Storage]);
+tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [Service, Process, ProcessService, Storage]);
 fn dynamic_process_service_loads_programs_from_system_bin() {
 	use object::channel::{Channel, Message};
 	use object::process::Process;
 	use object::rights::Rights;
 
 	// ProcessService loads a named program's ELF from the system volume's
-	// `bin/` through a StorageService client, not the init package. Stand up a
+	// manifest-declared path through a StorageService client, not the init package. Stand up a
 	// StorageService over the factory volume archive (which stages the tools under
 	// `bin/`) and a ProcessService wired to its client, then START a staged tool by name:
-	// ProcessService resolves it to `vol://system/bin/<name>.lsexe` and loads it off the volume,
+	// ProcessService resolves it through the manifest and loads it off the volume,
 	// proving the on-disk load path the shell's `run` and ConsoleService's shell spawn now
 	// take.
 	let (volume, package) = scenario_packages().expect("scenario packages");
@@ -240,18 +240,19 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(&online.bytes[..], b"ProcessService: online", "ProcessService reports in");
 
 	// the start reply is [corr u32 = 1][ok u8 = 1][koid u64][name]: success proves the
-	// binary was found and loaded from the system volume's bin/ (a missing binary would
+	// binary was found and loaded from the system volume (a missing binary would
 	// reply with an error, since a wired storage client does not fall back to the package).
 	let reply = process_client.recv().expect("start reply");
 	let b = &reply.bytes;
 	assert_eq!(le_u32(b, 0), 1, "start reply echoes the correlation id");
-	assert_eq!(b[4], 1, "the staged tool loaded from vol://system/bin");
+	assert_eq!(b[4], 1, "the staged tool loaded from its manifest path");
 	let koid = le_u64(b, 5);
 	assert!(koid >= 1, "the started process has a koid");
 	let name_len = le_u16(b, 13) as usize;
 	assert_eq!(&b[15..15 + name_len], b"ptyecho.lsexe", "the reply reports the canonical artifact name");
 
-	for (corr, path, succeeds) in [(10u32, &b"vol://system/bin/ptyecho.lsexe"[..], true), (11, &b"vol://system/bin/ptyecho"[..], false)] {
+	let explicit_ptyecho = alloc::format!("vol://system/{}", test_program_path("ptyecho").expect("ptyecho destination"));
+	for (corr, path, succeeds) in [(10u32, explicit_ptyecho.as_bytes(), true), (11, &b"vol://system/bin/ptyecho"[..], false), (12, &b"vol://system/bin/wasi_host.lsexe"[..], false)] {
 		let mut request = alloc::vec::Vec::new();
 		request.extend_from_slice(&1u16.to_le_bytes());
 		request.extend_from_slice(&corr.to_le_bytes());
@@ -261,7 +262,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		sched::run_until_idle();
 		let reply = process_client.recv().expect("explicit-path start reply");
 		assert_eq!(le_u32(&reply.bytes, 0), corr);
-		assert_eq!(reply.bytes[4] == 1, succeeds, "only a real path ending in .lsexe is executable");
+		assert_eq!(reply.bytes[4] == 1, succeeds, "only a manifest-declared executable path is accepted");
 		if succeeds {
 			let name_len = le_u16(&reply.bytes, 13) as usize;
 			assert_eq!(&reply.bytes[15..15 + name_len], b"ptyecho.lsexe", "an explicit path records only the canonical basename");
@@ -827,7 +828,7 @@ tagged_test!(dynamic_process_service_rejects_missing_provider, [Dynamic, Dynamic
 fn dynamic_process_service_rejects_missing_provider() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
-	replace_dynamic_needed(&mut mutated_volume, b"bin/echo.lsexe", "lsrt.lslib", "none.lslib");
+	replace_dynamic_needed(&mut mutated_volume, test_program_path("echo").expect("echo destination").as_bytes(), "lsrt.lslib", "none.lslib");
 	let reply = launch_from_volume(&mutated_volume, b"echo", 78);
 	assert_eq!(le_u32(&reply.bytes, 0), 78);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects an absent direct provider");
@@ -838,7 +839,7 @@ tagged_test!(dynamic_process_service_rejects_undeclared_provider_edge, [Dynamic,
 fn dynamic_process_service_rejects_undeclared_provider_edge() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
-	replace_dynamic_needed(&mut mutated_volume, b"bin/echo.lsexe", "lsrt.lslib", "wire.lslib");
+	replace_dynamic_needed(&mut mutated_volume, test_program_path("echo").expect("echo destination").as_bytes(), "lsrt.lslib", "wire.lslib");
 	let reply = launch_from_volume(&mutated_volume, b"echo", 79);
 	assert_eq!(le_u32(&reply.bytes, 0), 79);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects an undeclared provider edge");
@@ -849,7 +850,7 @@ tagged_test!(dynamic_process_service_rejects_duplicate_provider_edge, [Dynamic, 
 fn dynamic_process_service_rejects_duplicate_provider_edge() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
-	duplicate_dynamic_needed(&mut mutated_volume, b"bin/dyn_probe.lsexe");
+	duplicate_dynamic_needed(&mut mutated_volume, test_program_path("dyn_probe").expect("dyn_probe destination").as_bytes());
 	let reply = launch_from_volume(&mutated_volume, b"dyn_probe", 80);
 	assert_eq!(le_u32(&reply.bytes, 0), 80);
 	assert_eq!(reply.bytes[4], 0, "ProcessService rejects a duplicate provider edge");
@@ -865,7 +866,7 @@ fn dynamic_process_service_rejects_malformed_dynamic_metadata() {
 		(85, duplicate_dynamic_singleton as fn(&mut [u8], &[u8])),
 	] {
 		let mut mutated_volume = volume.to_vec();
-		mutate(&mut mutated_volume, b"bin/dyn_probe.lsexe");
+		mutate(&mut mutated_volume, test_program_path("dyn_probe").expect("dyn_probe destination").as_bytes());
 		let reply = launch_from_volume(&mutated_volume, b"dyn_probe", correlation);
 		assert_eq!(le_u32(&reply.bytes, 0), correlation);
 		assert_eq!(reply.bytes[4], 0, "ProcessService rejects malformed dynamic metadata");
@@ -882,7 +883,7 @@ fn dynamic_process_service_rejects_malformed_symbol_and_relocation_metadata() {
 		(88, invalidate_plt_relocation_size as fn(&mut [u8], &[u8])),
 	] {
 		let mut mutated_volume = volume.to_vec();
-		mutate(&mut mutated_volume, b"bin/dyn_probe.lsexe");
+		mutate(&mut mutated_volume, test_program_path("dyn_probe").expect("dyn_probe destination").as_bytes());
 		let reply = launch_from_volume(&mutated_volume, b"dyn_probe", correlation);
 		assert_eq!(le_u32(&reply.bytes, 0), correlation);
 		assert_eq!(reply.bytes[4], 0, "ProcessService rejects malformed symbol or relocation metadata");
@@ -940,7 +941,7 @@ fn dynamic_process_service_derives_provider_slots_independently_of_needed_order(
 	let baseline = baseline_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("baseline dynamic launch returns a Process");
 
 	let mut reordered_volume = volume.to_vec();
-	swap_dynamic_needed_order(&mut reordered_volume, b"bin/dyn_probe.lsexe");
+	swap_dynamic_needed_order(&mut reordered_volume, test_program_path("dyn_probe").expect("dyn_probe destination").as_bytes());
 	let reordered_reply = launch_from_volume(&reordered_volume, b"dyn_probe", 91);
 	assert_eq!(reordered_reply.bytes[4], 1, "reordered DT_NEEDED graph loads");
 	let reordered = reordered_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("reordered dynamic launch returns a Process");

@@ -1,6 +1,6 @@
 use super::*;
 
-tagged_test!(system_packages_use_canonical_executable_names, [Boot, Storage]);
+tagged_test!(system_packages_use_canonical_executable_names, [Boot, Storage, VolumeLayout]);
 fn system_packages_use_canonical_executable_names() {
 	let init = pkg::Package::parse(init_package_bytes().expect("init package present")).expect("init package parses");
 	let volume = pkg::Package::parse(volume_package_bytes().expect("volume package present")).expect("volume package parses");
@@ -10,9 +10,14 @@ fn system_packages_use_canonical_executable_names() {
 	}
 	for index in 0..volume.len() {
 		let name = volume.name(index).expect("volume entry name");
-		if name.starts_with(b"bin/") || name.starts_with(b"drivers/") {
-			assert!(name.ends_with(b".lsexe"), "system volume contains an extensionless native artifact");
+		let name = core::str::from_utf8(name).expect("volume entry name is UTF-8");
+		assert!(test_volume_path_is_declared(name), "system volume contains an undeclared entry {name}");
+		if name.starts_with("bin/") || name.starts_with("libexec/") || name.starts_with("drivers/") {
+			assert!(name.ends_with(abi::EXECUTABLE_SUFFIX), "system volume contains an extensionless native artifact");
 		}
+	}
+	for stale in [b"app.wasm" as &[u8], b"config.tree", b"bin/wasi_host.lsexe", b"bin/config_service.lsexe"] {
+		assert!(volume.lookup(stale).is_none(), "system volume retains stale path {}", core::str::from_utf8(stale).unwrap());
 	}
 	for package in [&init, &volume] {
 		for index in 0..package.len() {
@@ -34,7 +39,7 @@ fn system_packages_use_canonical_executable_names() {
 // failed to report in there - which turned out to be the riscv trap-frame register clobber
 // (a trap could corrupt the interrupted thread's t0/x5), not an interrupt-timing issue;
 // with that fixed the chain settles deterministically on riscv64 too.
-tagged_test!(init_package_starts_system_manager, [Boot, Service]);
+tagged_test!(init_package_starts_system_manager, [Boot, Service, VolumeLayout]);
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
@@ -51,7 +56,7 @@ fn init_package_starts_system_manager() {
 	// UDF vol://udf - so four StorageService reports arrive),
 	// NetworkService (handed the net driver's frame channel the same way), then
 	// ProcessService (which depends on StorageService, since it loads the on-disk program
-	// binaries from the system volume's `bin/`, so it comes up once storage is running),
+	// binaries from their manifest-declared system-volume paths, so it comes up once storage is running),
 	// PermissionManager (which needs storage and network to grant onward, so it comes up
 	// once they are running, and in turn launches its sandboxed component before reporting
 	// in), and finally - after every component it observes - SystemGraphService, then the
@@ -94,15 +99,6 @@ fn init_package_starts_system_manager() {
 		b"SystemGraphService: online",
 		b"Shell: online",
 	];
-	let mut actual_online_reports = alloc::vec::Vec::new();
-	for _ in 0..online_reports.len() {
-		actual_online_reports.push(kernel_ep.recv().expect("a service online report should arrive").bytes);
-	}
-	actual_online_reports.sort();
-	let mut expected_online_reports = online_reports.iter().map(|report| report.to_vec()).collect::<alloc::vec::Vec<_>>();
-	expected_online_reports.sort();
-	assert_eq!(actual_online_reports, expected_online_reports, "every manifest service reports online; independent ready services may use any deterministic tie order");
-
 	let lifecycle_reports: [&[u8]; 10] = [
 		b"WatchdogProbe: online",
 		b"WatchdogProbe: restarted",
@@ -115,10 +111,32 @@ fn init_package_starts_system_manager() {
 		b"ServiceManager: online",
 		b"SystemManager: online",
 	];
-	for expected in lifecycle_reports {
-		let message = kernel_ep.recv().expect("a boot-chain report should arrive");
-		assert_eq!(&message.bytes[..], expected, "lifecycle drill reports must preserve their causal order");
+	let mut actual_online_reports = alloc::vec::Vec::new();
+	let mut actual_lifecycle_reports = alloc::vec::Vec::new();
+	let give_up = arch::apic::ticks() + 500;
+	while arch::apic::ticks() < give_up {
+		sched::run_until_idle();
+		while let Ok(message) = kernel_ep.recv() {
+			if online_reports.iter().any(|expected| message.bytes.as_slice() == *expected) {
+				actual_online_reports.push(message.bytes);
+			} else {
+				actual_lifecycle_reports.push(message.bytes);
+			}
+		}
+		if actual_online_reports.len() >= online_reports.len() && actual_lifecycle_reports.len() >= lifecycle_reports.len() {
+			break;
+		}
+		arch::idle_halt();
 	}
+	let missing_reports = online_reports.iter().filter(|expected| !actual_online_reports.iter().any(|actual| actual.as_slice() == **expected)).collect::<alloc::vec::Vec<_>>();
+	assert_eq!(actual_online_reports.len(), online_reports.len(), "every manifest service must report online; missing={missing_reports:?}");
+	actual_online_reports.sort();
+	let mut expected_online_reports = online_reports.iter().map(|report| report.to_vec()).collect::<alloc::vec::Vec<_>>();
+	expected_online_reports.sort();
+	assert_eq!(actual_online_reports, expected_online_reports, "every manifest service reports online; independent ready services may use any deterministic tie order");
+	assert_eq!(actual_lifecycle_reports.len(), lifecycle_reports.len(), "every lifecycle report must arrive");
+	let expected_lifecycle_reports = lifecycle_reports.iter().map(|report| report.to_vec()).collect::<alloc::vec::Vec<_>>();
+	assert_eq!(actual_lifecycle_reports, expected_lifecycle_reports, "lifecycle drill reports must preserve their causal order");
 }
 
 tagged_test!(system_volume_formats_to_the_disks_capacity, [Service, Storage, Filesystem, Slow]);

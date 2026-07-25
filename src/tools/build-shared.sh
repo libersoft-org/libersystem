@@ -15,7 +15,6 @@ manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 manifest_digest="$(sha256sum <<<"$manifest_json" | awk '{print $1}')"
 artifact_output_root="$build_root/system-image/$target"
 provider_output_dir="$artifact_output_root"
-executable_output_dir="$artifact_output_root/bin"
 artifact_log_dir="$artifact_output_root/logs"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
 force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
@@ -63,7 +62,7 @@ if [[ "$force_rebuild" != 0 && "$force_rebuild" != 1 ]]; then
 fi
 
 command -v flock >/dev/null
-mkdir -p "$build_root" "$provider_output_dir" "$executable_output_dir" "$artifact_log_dir"
+mkdir -p "$build_root" "$provider_output_dir" "$artifact_log_dir"
 if [[ "${LIBER_IMAGE_LOCK_HELD:-0}" != 1 ]]; then
 	exec 9>"$build_root/image-build-$target.lock"
 	flock 9
@@ -104,6 +103,23 @@ command -v jq >/dev/null
 command -v sha256sum >/dev/null
 command -v stat >/dev/null
 command -v xxd >/dev/null
+
+prune_stale_program_outputs() {
+	local file relative
+	declare -A expected=()
+	while IFS= read -r relative; do
+		expected["$relative"]=1
+	done < <(jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | .destination | sub("\\.lsexe$"; "")' <<<"$manifest_json")
+	while IFS= read -r -d '' file; do
+		relative="${file#"$artifact_output_root/"}"
+		if [[ -z "${expected[$relative]:-}" ]]; then
+			rm -f "$file"
+		fi
+	done < <(find "$artifact_output_root" -type f \( -path "$artifact_output_root/bin/*" -o -path "$artifact_output_root/libexec/*" \) -print0 2>/dev/null)
+	find "$artifact_output_root/bin" "$artifact_output_root/libexec" -depth -type d -empty -delete 2>/dev/null || true
+}
+
+prune_stale_program_outputs
 
 warm_snapshot_file="$build_root/image-warm-$target.state"
 warm_input_inventory_file="$warm_snapshot_file.inputs"
@@ -288,6 +304,14 @@ library_file() {
 	local destination
 	destination="$(jq -er --arg artifact "$artifact" '.libraries[$artifact].destination' <<<"$manifest_json")" || return 1
 	printf '%s/%s' "$provider_output_dir" "$destination"
+}
+
+program_file() {
+	local artifact="$1"
+	local destination
+	destination="$(jq -er --arg artifact "$artifact" '.programs[$artifact].destination' <<<"$manifest_json")" || return 1
+	[[ "$destination" == *.lsexe ]] || return 1
+	printf '%s/%s' "$artifact_output_root" "${destination%.lsexe}"
 }
 
 declare -A crate_source_digests=()
@@ -652,6 +676,17 @@ audit_library_destinations() {
 	fi
 }
 
+audit_program_destinations() {
+	local expected actual
+	expected="$(jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | .destination | sub("\\.lsexe$"; "")' <<<"$manifest_json" | sort)"
+	actual="$(find "$artifact_output_root" -type f \( -path "$artifact_output_root/bin/*" -o -path "$artifact_output_root/libexec/*" \) -printf '%P\n' 2>/dev/null | sort)"
+	if [[ "$actual" != "$expected" ]]; then
+		echo "build-shared: staged program paths differ from the manifest" >&2
+		diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+		exit 1
+	fi
+}
+
 manifest_specs="$(jq -r '.libraries[] | "\(.name)=\(.owner)"' <<<"$manifest_json" | sort)"
 requested_specs="$(for spec in "$@"; do if [[ "$spec" == *=* ]]; then printf '%s\n' "$spec"; else printf '%s=%s\n' "$spec" "$spec"; fi; done | sort)"
 if [[ "$requested_specs" != "$manifest_specs" ]]; then
@@ -660,7 +695,7 @@ if [[ "$requested_specs" != "$manifest_specs" ]]; then
 	exit 1
 fi
 dynamic_rows() {
-	jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .name != "dyn_probe") | ["dynamic", .name, .owner, "volume", (.providers | join(" "))] | @tsv' <<<"$manifest_json" | sort -k2,2
+	jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .name != "dyn_probe") | ["dynamic", .name, .owner, "volume", .destination, (.providers | join(" "))] | @tsv' <<<"$manifest_json" | sort -k2,2
 }
 
 build_file_hash_inventory() {
@@ -669,11 +704,11 @@ build_file_hash_inventory() {
 		file="$(library_file "$artifact")"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	done < <(jq -r '.libraries[].name' <<<"$manifest_json")
-	while read -r kind consumer crate stage providers; do
-		file="$executable_output_dir/$consumer"
+	while read -r kind consumer crate stage destination providers; do
+		file="$artifact_output_root/${destination%.lsexe}"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	done < <(dynamic_rows)
-	file="$executable_output_dir/dyn_probe"
+	file="$(program_file dyn_probe)"
 	if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name 'object-*.o' -print0 2>/dev/null || true
 }
@@ -1301,7 +1336,7 @@ if [[ -n "$image_graph" ]]; then
 		echo "build-shared: duplicate dynamic executable $duplicate_consumer" >&2
 		exit 1
 	fi
-	while read -r kind consumer crate stage providers; do
+	while read -r kind consumer crate stage destination providers; do
 		if [[ "$kind" != dynamic || "$stage" != volume ]]; then
 			continue
 		fi
@@ -1317,15 +1352,15 @@ if [[ -n "$image_graph" ]]; then
 		fi
 		audit_provider_export_ownership "$providers"
 		consumer_dir="$root/$(source_path "$crate")"
-		out_dir="$executable_output_dir"
+		out_dir="$(dirname "$artifact_output_root/${destination%.lsexe}")"
 		consumer_errors="$artifact_log_dir/$consumer.stderr"
-		out="$out_dir/$consumer"
+		out="$artifact_output_root/${destination%.lsexe}"
 		mkdir -p "$out_dir"
 		consumer_source_sha="$(executable_source_digest "$consumer_dir" "$crate" "$consumer")"
 		consumer_expected_identity="$(mktemp "$build_root/identity-record.XXXXXX")"
 		write_identity_record executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$consumer_expected_identity"
 		consumer_expected_needed="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
-		consumer_cache_key="$(artifact_cache_key executable "$kind $consumer $crate $stage $providers" "$consumer_expected_identity" "cargo=$image_target_config_value start=$(sha256sum "$start_obj" | awk '{print $1}')")"
+		consumer_cache_key="$(artifact_cache_key executable "$kind $consumer $crate $stage $destination $providers" "$consumer_expected_identity" "cargo=$image_target_config_value start=$(sha256sum "$start_obj" | awk '{print $1}')")"
 		consumer_cache_prefix="$artifact_cache_dir/executable-$consumer"
 		object_key="$(object_cache_key "$consumer" "$crate" "$consumer_source_sha" "$providers")"
 		object_cache_prefix="$artifact_cache_dir/object-$consumer-$object_key"
@@ -1632,21 +1667,22 @@ fi
 
 if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe="$(source_path dyn_probe)"
-	probe_dir="$executable_output_dir"
-	probe_out="$probe_dir/dyn_probe"
+	probe_out="$(program_file dyn_probe)"
+	probe_dir="$(dirname "$probe_out")"
 	mkdir -p "$probe_dir"
 	probe_source_sha="$(source_digest "$probe")"
 	probe_expected_identity="$(mktemp "$build_root/identity-record.XXXXXX")"
 	write_identity_record executable dyn_probe dyn_probe "$probe_source_sha" - "pix lsrt" "$probe_expected_identity"
 	probe_expected_needed="$(printf '%s\n' pix.lslib lsrt.lslib | sort -u)"
 	audit_provider_export_ownership "pix lsrt"
-	probe_cache_key="$(artifact_cache_key executable "dynamic dyn_probe dyn_probe volume pix lsrt" "$probe_expected_identity" "cargo=$image_target_config_value")"
+	probe_cache_key="$(artifact_cache_key executable "dynamic dyn_probe dyn_probe volume libexec/dyn_probe.lsexe pix lsrt" "$probe_expected_identity" "cargo=$image_target_config_value")"
 	probe_cache_prefix="$artifact_cache_dir/executable-dyn_probe"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$probe_out" "$probe_cache_prefix" "$probe_cache_key" "$probe_expected_identity" "$probe_expected_needed"; then
 		canonical_provider_order "pix lsrt" >/dev/null
 		echo "build-shared: executable cache hit dyn_probe"
 		rm -f "$probe_expected_identity"
 		audit_library_destinations
+		audit_program_destinations
 		exit 0
 	fi
 	echo "build-shared: executable cache miss dyn_probe"
@@ -1665,3 +1701,4 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 fi
 
 audit_library_destinations
+audit_program_destinations

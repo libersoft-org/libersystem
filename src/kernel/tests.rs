@@ -20,6 +20,8 @@ mod hardware;
 mod kernel;
 #[path = "test_suites/services.rs"]
 mod services;
+#[path = "test_suites/volume_layout.rs"]
+mod volume_layout;
 
 // Userspace (ring 3) page layout for the test: one USER page for the program,
 // one for its stack, mapped into the low half of the shared address space
@@ -66,8 +68,8 @@ fn volume_file(volume: &[u8], name: &[u8]) -> Result<alloc::vec::Vec<u8>, &'stat
 }
 
 // Resolve a program's ELF for a test. The pinned bootstrap programs live in the init
-// package; every other service, manager and demo component is staged on the system volume
-// under `bin/`, so fall back to the volume there. The returned slice borrows
+// package; every other program resolves through the manifest-declared system-volume path.
+// The returned slice borrows
 // the 'static module data, so it outlives the temporary volume Package.
 fn program_elf(package: &pkg::Package<'static>, volume: &'static [u8], name: &[u8]) -> Option<&'static [u8]> {
 	let mut artifact: alloc::vec::Vec<u8> = name.to_vec();
@@ -75,10 +77,9 @@ fn program_elf(package: &pkg::Package<'static>, volume: &'static [u8], name: &[u
 	if let Some(elf) = package.lookup(&artifact) {
 		return Some(elf);
 	}
-	let mut path: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-	path.extend_from_slice(b"bin/");
-	path.extend_from_slice(&artifact);
-	pkg::Package::parse(volume).and_then(|p| p.lookup(&path))
+	let name = core::str::from_utf8(name).ok()?;
+	let path = test_program_path(name)?;
+	pkg::Package::parse(volume).and_then(|p| p.lookup(path.as_bytes()))
 }
 
 // Send a tagged capability over a bootstrap channel: wrap `object` in a Capability
@@ -676,7 +677,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 // the ramdisk volume and a LogService holds the journal; the component_host is given
 // exactly two capabilities - a StorageService client and a LogService client - and
 // nothing else. It loads a real Wasm component (built by the Rust SDK, served from
-// storage as vol://system/app.wasm rather than embedded in the kernel image) and runs
+// storage as vol://system/components/liber_component/app.wasm rather than embedded in the kernel image) and runs
 // it: the component's three imports are wired by name to the two services - `read` /
 // `write` to StorageService, `log` to LogService - with no ambient authority. The
 // component reads its one granted file, upper-cases it, logs the result through
@@ -1063,7 +1064,9 @@ define_test_tags! {
 	AudioService => "audio-service",
 	Boot => "boot",
 	Channel => "channel",
+	Component => "component",
 	Console => "console",
+	Config => "config",
 	Dma => "dma",
 	Display => "display",
 	Domain => "domain",
@@ -1099,6 +1102,8 @@ define_test_tags! {
 	Stress => "stress",
 	Syscall => "syscall",
 	Usb => "usb",
+	VolumeLayout => "volume-layout",
+	VolumeScope => "volume-scope",
 }
 
 pub(crate) struct TaggedTest {
@@ -1991,28 +1996,35 @@ struct StorageHarness {
 	boot: alloc::sync::Arc<object::channel::Channel>,
 	block: alloc::sync::Arc<object::channel::Channel>,
 	client: alloc::sync::Arc<object::channel::Channel>,
+	admin: alloc::sync::Arc<object::channel::Channel>,
 	disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>,
 	capacity: u64,
 }
 
 impl StorageHarness {
 	fn start(storage_elf: &[u8], tag: &[u8], image: &[u8], capacity: u64) -> Self {
-		use object::channel::Channel;
-		use object::rights::Rights;
 		const SECTOR: usize = 512;
-		let (boot, boot_user) = Channel::create();
-		let (block, block_child) = Channel::create();
-		let (server, client) = Channel::create();
-		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
-		send_cap(&boot, tag, block_child, Rights::ALL).expect("storage block bootstrap");
-		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
 		let mut disk = alloc::collections::BTreeMap::new();
 		for (lba, chunk) in image.chunks(SECTOR).enumerate() {
 			let mut sector = alloc::vec![0u8; SECTOR];
 			sector[..chunk.len()].copy_from_slice(chunk);
 			disk.insert(lba as u64, sector);
 		}
-		let mut harness = Self { boot, block, client, disk, capacity };
+		Self::start_disk(storage_elf, tag, disk, capacity)
+	}
+
+	fn start_disk(storage_elf: &[u8], tag: &[u8], disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) -> Self {
+		use object::channel::Channel;
+		use object::rights::Rights;
+		let (boot, boot_user) = Channel::create();
+		let (block, block_child) = Channel::create();
+		let (server, client) = Channel::create();
+		let (admin, admin_child) = Channel::create();
+		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		send_cap(&boot, tag, block_child, Rights::ALL).expect("storage block bootstrap");
+		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
+		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
+		let mut harness = Self { boot, block, client, admin, disk, capacity };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -2023,12 +2035,75 @@ impl StorageHarness {
 		panic!("StorageService harness did not report online");
 	}
 
+	fn restart(mut self, storage_elf: &[u8]) -> Self {
+		use object::channel::Message;
+		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("storage shutdown request");
+		for _ in 0..100_000 {
+			self.pump();
+			if self.client.is_peer_closed() {
+				let disk = core::mem::take(&mut self.disk);
+				let capacity = self.capacity;
+				drop(self);
+				return Self::start_disk(storage_elf, b"BLOCK", disk, capacity);
+			}
+		}
+		panic!("StorageService harness did not shut down");
+	}
+
+	fn invalidate_seed_archive(&mut self) {
+		self.disk.insert(0, alloc::vec![0u8; 512]);
+	}
+
 	fn pump(&mut self) {
 		sched::run_until_idle();
 		pump_block_stand_in(&self.block, &mut self.disk, self.capacity);
 	}
 
+	fn connect(&mut self) -> alloc::sync::Arc<object::channel::Channel> {
+		let client = self.client.clone();
+		self.connect_from(&client)
+	}
+
+	fn connect_from(&mut self, client: &alloc::sync::Arc<object::channel::Channel>) -> alloc::sync::Arc<object::channel::Channel> {
+		use object::channel::{Channel, Message};
+		client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("storage connect request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = client.recv() {
+				let cap = reply.caps.first().expect("storage connection capability");
+				return cap.object().into_any_arc().downcast::<Channel>().expect("storage connection is a channel");
+			}
+		}
+		panic!("StorageService did not mint a connection");
+	}
+
+	fn open_directory(&mut self, path: &[u8]) -> alloc::sync::Arc<object::channel::Channel> {
+		use object::channel::{Channel, Message};
+		let corr: u32 = 0xd1ec_7000;
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&1u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		self.admin.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage directory request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.admin.recv() {
+				assert_eq!(le_u32(&reply.bytes, 0), corr, "storage directory reply echoes the correlation id");
+				assert_eq!(reply.bytes.get(4), Some(&1), "storage directory scope succeeds");
+				let cap = reply.caps.first().expect("storage directory capability");
+				return cap.object().into_any_arc().downcast::<Channel>().expect("storage directory scope is a channel");
+			}
+		}
+		panic!("StorageService did not mint a directory scope");
+	}
+
 	fn open(&mut self, path: &[u8], corr: u32) -> Option<alloc::vec::Vec<u8>> {
+		let client = self.client.clone();
+		self.open_from(&client, path, corr)
+	}
+
+	fn open_from(&mut self, client: &alloc::sync::Arc<object::channel::Channel>, path: &[u8], corr: u32) -> Option<alloc::vec::Vec<u8>> {
 		use object::channel::Message;
 		use object::memory_object::MemoryObject;
 		let mut request = alloc::vec::Vec::new();
@@ -2037,10 +2112,10 @@ impl StorageHarness {
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
 		request.extend_from_slice(&[0, 0]);
-		self.client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage open request");
+		client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage open request");
 		for _ in 0..100_000 {
 			self.pump();
-			if let Ok(reply) = self.client.recv() {
+			if let Ok(reply) = client.recv() {
 				if le_u32(&reply.bytes, 0) != corr || reply.bytes.get(4) != Some(&1) {
 					return None;
 				}
@@ -2050,6 +2125,27 @@ impl StorageHarness {
 			}
 		}
 		None
+	}
+
+	fn write(&mut self, path: &[u8], data: &[u8], corr: u32) -> bool {
+		use object::memory_object::MemoryObject;
+		use object::rights::Rights;
+		let buffer = MemoryObject::create(data.len().max(1)).expect("storage write buffer");
+		copy_into_object(&buffer, data);
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&3u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&(data.len() as u64).to_le_bytes());
+		send_cap(&self.client, &request, buffer, Rights::READ | Rights::MAP | Rights::TRANSFER).expect("storage write request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&1);
+			}
+		}
+		false
 	}
 }
 

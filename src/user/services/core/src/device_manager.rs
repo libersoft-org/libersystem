@@ -19,9 +19,7 @@ use ipc_client::ChannelTransport;
 use proto::system::{OpenOpts, volume};
 use rt::*;
 
-// Where the non-bootstrap driver binaries live on the system volume: a
-// named driver is loaded from `<DRIVER_DIR><name>`.
-const DRIVER_DIR: &str = "vol://system/drivers/";
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
 
 // The state DeviceManager tracks per discovered device.
 const STATE_UNKNOWN: u8 = 0;
@@ -249,15 +247,13 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 	}
 }
 
-// Open vol://system/drivers/<name>.lsexe through the StorageService client and map its bytes,
+// Open a manifest-declared driver path through the StorageService client and map its bytes,
 // returning (file handle, mapped address, size) so the caller can spawn from the image and
 // then release the mapping. None if the driver cannot be read.
 unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 	unsafe {
-		let mut path: alloc::string::String = alloc::string::String::from(DRIVER_DIR);
-		path.push_str(&alloc::string::String::from_utf8_lossy(name));
-		path.push_str(services::executable::SUFFIX);
-		let opts: OpenOpts = OpenOpts { path, write: false, create: false };
+		let name = core::str::from_utf8(name).ok()?;
+		let opts: OpenOpts = OpenOpts { path: alloc::string::String::from(program_path(name)?), write: false, create: false };
 		let result = match volume::Client::new(ChannelTransport { chan: storage }).open(&opts) {
 			Some(Ok(r)) => r,
 			_ => return None,

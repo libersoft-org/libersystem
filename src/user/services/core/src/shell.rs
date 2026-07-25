@@ -22,6 +22,8 @@ use services::executable;
 use services::shell_language::{parse_and_expand, parse_assignment, trim};
 use storage_proto::path;
 
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
 // command word over the builtins plus the live bin/ listing, and the shell prints the
 // matches on a double Tab - the way bash completes its builtins plus $PATH.
@@ -1474,7 +1476,7 @@ unsafe fn print_hex(bytes: &[u8]) {
 // offers alongside the builtins (the $PATH analogue). Empty when storage is unreachable.
 fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 	let mut client = volume::Client::new(ChannelTransport { chan: storage });
-	match client.list("vol://system/bin") {
+	match client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
 		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
 		None => Vec::new(),
 	}

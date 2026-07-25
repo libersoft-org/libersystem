@@ -13,9 +13,9 @@ intrinsics may change in the next image without compatibility shims.
 - Rust-mangled symbols are valid inside that image because all producers and consumers
   use the same compiler revision and build graph. Exported C ABI wrappers are reserved
   for a future third-party package boundary.
-- System libraries live under `vol://system/lib/`. Per-application third-party
-  libraries remain part of the phase-3 package format rather than entering the global
-  namespace.
+- System libraries live at manifest-declared category paths below
+  `vol://system/lib/`. Per-application third-party libraries remain part of the
+  phase-3 package format rather than entering the global namespace.
 - System-library filenames follow the central [artifact filename
   conventions](PACKAGE_FORMAT.md#artifact-filename-conventions): they use the
   LiberSystem-specific `.lslib` suffix and no Unix `lib` prefix, for example
@@ -24,16 +24,17 @@ intrinsics may change in the next image without compatibility shims.
   leaf lives under `src/user/libs/<name>/`; runtime, service-utility and generated
   protocol providers use their declared role or peer-root paths. Cargo and linker outputs
   belong only below the repository-root `.build/`, including
-  `.build/system-image/<target>/lib/`. The system image still installs all providers into
-  the flat, resolver-owned `vol://system/lib/` namespace.
+  `.build/system-image/<target>/lib/`. The system image installs every provider at its
+  manifest-declared category path below `vol://system/lib/`.
 - Resolution is eager and deterministic. Lazy PLT binding, `LD_PRELOAD`, environment
   search paths, runtime library replacement, symbol interposition, and unload are not
   supported.
-- Every native executable staged under `vol://system/bin/` is a PIE `ET_DYN` consumer
-  of system libraries. A static `/bin` executable is an image-construction error. Pinned
-  boot-critical programs in `init.pkg` may remain self-contained until their providers
-  are available before StorageService, but this exception never creates a static copy on
-  the mounted system volume.
+- Every manifest-declared dynamic executable under `vol://system/bin/` or
+  `vol://system/libexec/` is a PIE `ET_DYN` consumer of system libraries. A static
+  command or internal helper is an image-construction error. Static device drivers are
+  confined to `vol://system/drivers/`; pinned boot-critical programs in `init.pkg` may
+  remain self-contained until their providers are available before StorageService, but
+  this exception never creates a duplicate on the mounted system volume.
 
 ## Build model
 
@@ -124,7 +125,7 @@ could not be assumed to resolve. Transport ownership is now split as follows:
 - generated LSIDL domain-client libraries depend on those roots, remain separate by
   contract domain and export concrete channel/resolver clients. The generic
   `Client<T: Transport>` remains available for tests/special transports but is not
-  monomorphized into production `/bin` executables;
+  monomorphized into production command executables;
 - a generated architecture entry object supplies `_start` and calls the executable's
   `__user_main` without statically linking another runtime.
 
@@ -135,7 +136,7 @@ compiler-runtime ownership.
 ## Ownership split
 
 ProcessService owns dependency policy because it already holds the StorageService
-capability used to read `vol://system/bin/*`. For a launch it:
+capability used to read each program's manifest-declared system-volume path. For a launch it:
 
 1. reads the main ELF and parses its one bounded identity record directly from
   `.note.liber.identity`;

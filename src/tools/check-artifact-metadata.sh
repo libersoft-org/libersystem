@@ -48,7 +48,7 @@ while IFS= read -r artifact; do
 		exit 1
 	fi
 done < <(
-	jq -r --arg root "$image_root" '(.libraries[].destination | "\($root)/\(.)"), (.programs[] | select(.linkage == "dynamic" and .stage == "volume") | "\($root)/bin/\(.name)")' <<<"$manifest_json" | sort
+	jq -r --arg root "$image_root" '(.libraries[].destination | "\($root)/\(.)"), (.programs[] | select(.linkage == "dynamic" and .stage == "volume") | "\($root)/\(.destination | sub("\\.lsexe$"; ""))")' <<<"$manifest_json" | sort
 )
 
 echo "artifact-metadata: clean"

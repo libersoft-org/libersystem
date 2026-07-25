@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use system_manifest::Manifest;
@@ -57,6 +59,32 @@ fn run() -> Result<(), String> {
 			for destination in manifest.libraries.values().map(|library| library.destination.as_str()).chain(manifest.programs.values().map(|program| program.destination.as_str())) {
 				println!("{destination}");
 			}
+			for destination in manifest.factory_files.values().map(|file| file.destination.as_str()) {
+				println!("{destination}");
+			}
+		}
+		"check-volume-package" => {
+			let path = arguments.next().ok_or_else(|| String::from("usage: system-manifest check-volume-package <volume.pkg>"))?;
+			if arguments.next().is_some() {
+				return Err(String::from("usage: system-manifest check-volume-package <volume.pkg>"));
+			}
+			let bytes = fs::read(&path).map_err(|error| format!("system-manifest: cannot read {path}: {error}"))?;
+			let package = abi::Package::parse(&bytes).ok_or_else(|| format!("system-manifest: {path} is not a valid PKGARCH1 archive"))?;
+			let mut actual = BTreeSet::new();
+			for index in 0..package.len() {
+				let name = package.name(index).ok_or_else(|| format!("system-manifest: {path} has an unreadable entry {index}"))?;
+				let name = core::str::from_utf8(name).map_err(|_| format!("system-manifest: {path} entry {index} is not UTF-8"))?;
+				if !actual.insert(String::from(name)) {
+					return Err(format!("system-manifest: {path} has duplicate entry {name}"));
+				}
+			}
+			let expected = manifest.volume_destinations();
+			if actual != expected {
+				let missing = expected.difference(&actual).cloned().collect::<Vec<_>>().join(", ");
+				let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>().join(", ");
+				return Err(format!("system-manifest: {path} volume entries differ from manifest; missing=[{missing}] unexpected=[{unexpected}]"));
+			}
+			println!("system-manifest: volume package entries match manifest");
 		}
 		_ => return Err(format!("system-manifest: unknown command {command:?}")),
 	}

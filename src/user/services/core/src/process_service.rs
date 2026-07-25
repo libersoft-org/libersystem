@@ -2,7 +2,7 @@
 //
 // ServiceManager starts this program from the init package and hands it a
 // bootstrap channel, over which it receives a StorageService client (the system
-// volume, from which it loads the on-disk program binaries under `system/bin`), a
+// volume, from which it loads on-disk programs through their manifest paths), a
 // read-only view of the init package (the bring-up fallback when no storage client is
 // wired) and a "SERVE" channel its clients reach it on. Over that channel clients speak
 // the generated `liber:system` Process bindings: they START a named program unattended,
@@ -35,9 +35,6 @@ use rt::*;
 use services::executable;
 use services::graph_limits;
 
-// Where the on-disk program binaries live on the system volume (staged there by the
-// factory-seed pipeline). A named program is loaded from `<PROGRAM_DIR><name>`.
-const PROGRAM_DIR: &str = "vol://system/bin/";
 const LIBRARY_BASE: u64 = 0x2000_0000;
 const LIBRARY_SLOT_SIZE: u64 = 0x0100_0000;
 const IDENTITY_FORMAT: &[u8] = b"format=liber-image-identity-v1";
@@ -49,6 +46,7 @@ const IMAGE_TARGET: &str = "aarch64-unknown-none";
 const IMAGE_TARGET: &str = "riscv64gc-unknown-none-elf";
 
 include!(concat!(env!("OUT_DIR"), "/library_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
 
 struct MappedFile {
 	handle: u64,
@@ -311,7 +309,7 @@ impl<'a> Processes<'a> {
 
 	// Load program `name` and create a process from it, handing the child `bootstrap` as
 	// its bootstrap capability. With a storage client wired, the binary is read from the
-	// system volume's `bin/`; with none, it comes from the built-in package. Returns the
+	// system volume's manifest-declared path; with none, it comes from the built-in package. Returns the
 	// new process handle plus its canonical physical basename, or None if the command
 	// is malformed, absent or cannot be spawned.
 	unsafe fn spawn_program(&self, name: &str, bootstrap: u64, domain: u64) -> Option<(i64, String)> {
@@ -325,7 +323,9 @@ impl<'a> Processes<'a> {
 			}
 			for artifact in executable::launch_candidates(name)? {
 				let handle = if self.storage != 0 {
-					match spawn_from_path(self.storage, &alloc::format!("{PROGRAM_DIR}{artifact}"), &artifact, bootstrap, domain) {
+					let logical_name = executable::logical_name(&artifact)?;
+					let path = program_path(logical_name)?;
+					match spawn_from_path(self.storage, path, &artifact, bootstrap, domain) {
 						Some(handle) => handle,
 						None => continue,
 					}
