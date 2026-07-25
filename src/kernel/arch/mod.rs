@@ -66,3 +66,6 @@ pub const NAME: &str = "x86_64";
 pub const NAME: &str = "aarch64";
 #[cfg(target_arch = "riscv64")]
 pub const NAME: &str = "riscv64";
+
+#[cfg(test)]
+mod tests;
