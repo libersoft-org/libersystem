@@ -24,51 +24,9 @@ bun i -g prettier
 git config user.name "$NAME"
 git config user.email "$EMAIL"
 
-format_changed_files() {
-	local -a changed_files=()
-	local -a rust_files=()
-	local -a shell_files=()
-	local -a toml_files=()
-	local file
-	local format_justfile=0
-
-	mapfile -d '' -t changed_files < <(
-		{
-			git diff --name-only -z --diff-filter=ACMR
-			git diff --cached --name-only -z --diff-filter=ACMR
-			git ls-files --others --exclude-standard -z
-		} | LC_ALL=C sort -zu
-	)
-
-	for file in "${changed_files[@]}"; do
-		[[ -f "$file" ]] || continue
-		case "$file" in
-		*.rs) rust_files+=("$file") ;;
-		*.sh) shell_files+=("$file") ;;
-		*.toml) toml_files+=("$file") ;;
-		src/Justfile) format_justfile=1 ;;
-		esac
-	done
-
-	if ((${#rust_files[@]} > 0)); then
-		rustfmt +nightly --edition 2024 --config-path "$ROOT/rustfmt.toml" "${rust_files[@]}" || return 1
-	fi
-	if ((${#shell_files[@]} > 0)); then
-		shfmt -w "${shell_files[@]}" || return 1
-	fi
-	if ((${#toml_files[@]} > 0)); then
-		taplo fmt "${toml_files[@]}" || return 1
-	fi
-	if ((format_justfile)); then
-		(cd "$ROOT/src" && just --fmt) || return 1
-	fi
-}
-
-if ! format_changed_files; then
+if ! "$ROOT/format.sh" --changed; then
 	echo "commit.sh: formatting changed files failed - committing without a fresh format pass"
 fi
-
-src/tools/check-source-hygiene.sh --current
 
 git status
 git add .
