@@ -358,3 +358,6 @@ impl Domain {
 }
 
 impl_kernel_object!(Domain, Domain);
+
+#[cfg(test)]
+mod tests;

@@ -48,6 +48,9 @@ pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, 
 #[cfg(test)]
 pub use abi::sys_is_err;
 
+#[cfg(test)]
+mod tests;
+
 // Introspection record filled by object_info_get: the identity and type of the
 // object behind a handle, and the access the handle confers. Defined in `abi` (the
 // SSOT shared with userspace) and re-exported here next to its syscall.

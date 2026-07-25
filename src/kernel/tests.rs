@@ -1053,6 +1053,7 @@ define_test_tags! {
 	Console => "console",
 	Dma => "dma",
 	Display => "display",
+	Domain => "domain",
 	Drivers => "drivers",
 	Dynamic => "dynamic",
 	DynamicReject => "dynamic-reject",
@@ -1526,41 +1527,6 @@ fn process_isolation_and_per_process_tables() {
 	assert_eq!(p2.address_space().unmap(VA), Some(f2));
 	frame::deallocate(f1);
 	frame::deallocate(f2);
-}
-
-tagged_test!(syscall_roundtrip_stateless, [Syscall, Smoke]);
-fn syscall_roundtrip_stateless() {
-	// Stateless syscalls round-trip from the test (idle) context: there is no
-	// current thread, but these calls do not need one.
-	unsafe {
-		// A call returns there and back, carrying a value across the boundary.
-		assert_eq!(arch::syscall::invoke(syscall::SYS_DEBUG_NOOP, 0x1234, 0, 0, 0), 0x1234);
-		// An unknown syscall number is rejected with the error sentinel.
-		let bad = arch::syscall::invoke(9999, 0, 0, 0, 0);
-		assert_eq!(bad as i64, syscall::ERR_BAD_SYSCALL);
-		assert!(syscall::sys_is_err(bad));
-		// The kernel clock is monotonic across two reads.
-		let first = arch::syscall::invoke(syscall::SYS_CLOCK_GET, 0, 0, 0, 0);
-		let second = arch::syscall::invoke(syscall::SYS_CLOCK_GET, 0, 0, 0, 0);
-		assert!(second >= first);
-		assert!(!syscall::sys_is_err(first));
-	}
-}
-
-tagged_test!(abi_check_accepts_the_matching_revision_and_refuses_a_mismatch, [Syscall]);
-fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
-	// SYS_ABI_CHECK is the runtime's first syscall: a starting binary reports the ABI
-	// revision it was built against, and the kernel refuses a mismatch so it never runs
-	// against a renumbered call or a grown struct. Stateless, so it round-trips from the
-	// idle context.
-	unsafe {
-		let ok = arch::syscall::invoke(syscall::SYS_ABI_CHECK, syscall::ABI_VERSION as u64, 0, 0, 0);
-		assert_eq!(ok, 0, "the kernel's own ABI revision is accepted");
-		assert!(!syscall::sys_is_err(ok));
-		let mismatch = arch::syscall::invoke(syscall::SYS_ABI_CHECK, syscall::ABI_VERSION as u64 + 1, 0, 0, 0);
-		assert_eq!(mismatch as i64, syscall::ERR_ABI_MISMATCH, "a different ABI revision is refused");
-		assert!(syscall::sys_is_err(mismatch));
-	}
 }
 
 tagged_test!(syscall_object_and_handle_ops, [Syscall]);
@@ -6838,35 +6804,16 @@ fn ipc_queue_bytes_accounting_enforced() {
 	assert_eq!(domain.account().ipc_queue().used(), 0);
 }
 
-tagged_test!(domain_hierarchy_limits_aggregate, [Kernel]);
-fn domain_hierarchy_limits_aggregate() {
+tagged_test!(domain_hierarchy_limit_is_enforced_through_memory_create, [Domain, Kernel]);
+fn domain_hierarchy_limit_is_enforced_through_memory_create() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 	use object::domain::{Domain, UNLIMITED};
 	static DONE: AtomicBool = AtomicBool::new(false);
 	static THIRD: AtomicI64 = AtomicI64::new(0);
-	// A child Domain's charges also count against its parent, and the parent's
-	// aggregate limit binds even when the child itself is unbounded. The parent
-	// caps memory at two pages; the unbounded child may charge two pages but not a
-	// third. Part one checks the Domain API directly (deterministic, no thread).
+	// The parent caps memory at two pages; the unbounded child may create two
+	// objects but the third is refused through the actual syscall path.
 	let parent = Domain::new(8192, UNLIMITED, UNLIMITED);
 	let child = Domain::new_child(&parent, UNLIMITED, UNLIMITED, UNLIMITED);
-	assert!(child.try_charge_memory(4096));
-	assert_eq!(parent.account().memory().used(), 4096, "charge propagates to the parent");
-	assert!(child.try_charge_memory(4096)); // parent now full at two pages
-	assert!(!child.try_charge_memory(4096), "parent aggregate binds though the child is unbounded");
-	assert_eq!(child.account().memory().used(), 8192, "the refused charge was rolled back at the child");
-	assert_eq!(parent.account().memory().used(), 8192, "and left the parent unchanged");
-	assert_eq!(child.account().memory().peak(), 8192, "a refused aggregate charge does not raise the child high-water mark");
-	assert_eq!(parent.account().memory().peak(), 8192, "the parent records its successful aggregate high-water mark");
-	child.uncharge_memory(8192);
-	assert_eq!(parent.account().memory().used(), 0, "uncharge propagates to the parent");
-	assert_eq!(parent.account().memory().peak(), 8192, "the high-water mark survives refunds");
-	let stats = syscall::domain_stats_snapshot(&parent);
-	assert_eq!(stats.memory_used, 0, "Domain stats reports the refunded live usage");
-	assert_eq!(stats.memory_peak, 8192, "Domain stats preserves the observed memory high-water mark");
-	// Part two checks the same limit through the create syscall: a process in the
-	// unbounded child is refused the third page because the parent caps memory at
-	// two. It records the third result and exits; teardown refunds the rest.
 	extern "C" fn body(_arg: u64) {
 		unsafe {
 			assert!(!syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0)));
@@ -6882,6 +6829,9 @@ fn domain_hierarchy_limits_aggregate() {
 	// The body exited without closing its objects; teardown refunds them.
 	assert_eq!(child.account().memory().used(), 0, "child memory refunded");
 	assert_eq!(parent.account().memory().used(), 0, "parent aggregate memory refunded");
+	let stats = syscall::domain_stats_snapshot(&parent);
+	assert_eq!(stats.memory_used, 0, "Domain stats reports the refunded live usage");
+	assert_eq!(stats.memory_peak, 8192, "Domain stats preserves the observed memory high-water mark");
 }
 
 tagged_test!(domain_kill_frees_subtree, [Kernel, Process]);
