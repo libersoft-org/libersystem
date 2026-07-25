@@ -297,3 +297,6 @@ fn disable_pic() {
 		outb(PIC2_DATA, 0xff);
 	}
 }
+
+#[cfg(test)]
+mod tests;

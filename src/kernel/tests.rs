@@ -1043,6 +1043,7 @@ macro_rules! define_test_tags {
 }
 
 define_test_tags! {
+	Apic => "apic",
 	ArchAarch64 => "arch-aarch64",
 	ArchRiscv64 => "arch-riscv64",
 	ArchX86_64 => "arch-x86_64",
@@ -1418,17 +1419,6 @@ const fn relative_relocation_type() -> u32 {
 const fn import_relocation_type() -> u32 {
 	TEST_IMPORT_RELOCATION
 }
-tagged_test!(timer_ticks_advance, [Kernel]);
-fn timer_ticks_advance() {
-	// Interrupts are enabled by kmain before the tests run, so the periodic
-	// LAPIC timer must keep incrementing the tick counter.
-	let start = arch::apic::ticks();
-	while arch::apic::ticks() == start {
-		core::hint::spin_loop();
-	}
-	assert!(arch::apic::ticks() > start);
-}
-
 tagged_test!(smp_all_cores_online, [Kernel, Smoke]);
 fn smp_all_cores_online() {
 	// init_smp ran before the tests and waited for every core to report in, so
