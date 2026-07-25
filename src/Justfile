@@ -303,34 +303,131 @@ debug: sdk user
 gdb:
     gdb -x boot/gdb-init {{ kernel_elf }}
 
+# Build the x86_64 userspace graph and validate its artifacts before kernel test
+# runs. The resulting stamp lets the focused fast recipes reuse those artifacts
+# only while every non-kernel input remains unchanged.
+test-preflight: sdk user test-tags-check
+    boot/test-preflight.sh write x86_64
+
 # Run every x86_64 test in QEMU (isa-debug-exit). TEST_TIMEOUT overrides the
 # 15-minute full-suite watchdog.
-test: sdk user test-tags-check
+test: test-preflight
     boot/test-kernel.sh x86_64
 
 # Run the union of the requested x86_64 tags plus the smoke set.
-test-tags tags: sdk user test-tags-check
+test-tags tags: test-preflight
     boot/test-kernel.sh x86_64 "{{ tags }}"
+
+# Compile the x86_64 test kernel and selected descriptors without booting QEMU.
+# This preserves the normal target, build-std and package-assembly path for quick
+# validation between small mechanical test ownership moves.
+test-build: test-preflight
+    boot/test-kernel.sh x86_64 --build-only
+
+test-tags-build tags: test-preflight
+    boot/test-kernel.sh x86_64 "{{ tags }}" --build-only
+
+# Reuse a content-verified x86_64 userspace preflight while Cargo rebuilds the
+# current kernel test image and QEMU executes it.
+test-fast:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check x86_64
+    boot/test-kernel.sh x86_64
+
+test-tags-fast tags:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check x86_64
+    boot/test-kernel.sh x86_64 "{{ tags }}"
+
+test-build-fast:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check x86_64
+    boot/test-kernel.sh x86_64 --build-only
+
+test-tags-build-fast tags:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check x86_64
+    boot/test-kernel.sh x86_64 "{{ tags }}" --build-only
 
 # run the kernel test suite in QEMU on aarch64 (Arm semihosting exit maps pass/fail).
 # SMP=4 exercises the multi-core paths (secondary bring-up, the cross-core wake IPI).
-test-aarch64: sdk user-aarch64 test-tags-check
+test-preflight-aarch64: sdk user-aarch64 test-tags-check
+    boot/test-preflight.sh write aarch64
+
+test-aarch64: test-preflight-aarch64
     boot/test-kernel.sh aarch64
 
 # Run the union of the requested aarch64 tags plus the smoke set.
-test-tags-aarch64 tags: sdk user-aarch64 test-tags-check
+test-tags-aarch64 tags: test-preflight-aarch64
     SMP="${SMP:-4}" boot/test-kernel.sh aarch64 "{{ tags }}"
+
+# Compile the aarch64 test kernel and selected descriptors without booting QEMU.
+test-build-aarch64: test-preflight-aarch64
+    boot/test-kernel.sh aarch64 --build-only
+
+test-tags-build-aarch64 tags: test-preflight-aarch64
+    boot/test-kernel.sh aarch64 "{{ tags }}" --build-only
+
+test-fast-aarch64:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check aarch64
+    SMP="${SMP:-4}" boot/test-kernel.sh aarch64
+
+test-tags-fast-aarch64 tags:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check aarch64
+    SMP="${SMP:-4}" boot/test-kernel.sh aarch64 "{{ tags }}"
+
+test-build-fast-aarch64:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check aarch64
+    boot/test-kernel.sh aarch64 --build-only
+
+test-tags-build-fast-aarch64 tags:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check aarch64
+    boot/test-kernel.sh aarch64 "{{ tags }}" --build-only
 
 # run the kernel test suite in QEMU on riscv64 over OpenSBI (RISC-V semihosting exit
 # maps pass/fail). Defaults to `nproc` harts (like the x86 `test` recipe), exercising the
 # multi-hart paths (SBI HSM hart_start bring-up, the SBI IPI cross-hart wake); override
 # with `SMP=<n>` (a smaller count is faster under TCG on a many-core host).
-test-riscv64: sdk user-riscv64 test-tags-check
+test-preflight-riscv64: sdk user-riscv64 test-tags-check
+    boot/test-preflight.sh write riscv64
+
+test-riscv64: test-preflight-riscv64
     boot/test-kernel.sh riscv64
 
 # Run the union of the requested riscv64 tags plus the smoke set.
-test-tags-riscv64 tags: sdk user-riscv64 test-tags-check
+test-tags-riscv64 tags: test-preflight-riscv64
     SMP="${SMP:-4}" boot/test-kernel.sh riscv64 "{{ tags }}"
+
+# Compile the riscv64 test kernel and selected descriptors without booting QEMU.
+test-build-riscv64: test-preflight-riscv64
+    boot/test-kernel.sh riscv64 --build-only
+
+test-tags-build-riscv64 tags: test-preflight-riscv64
+    boot/test-kernel.sh riscv64 "{{ tags }}" --build-only
+
+test-fast-riscv64:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check riscv64
+    SMP="${SMP:-4}" boot/test-kernel.sh riscv64
+
+test-tags-fast-riscv64 tags:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check riscv64
+    SMP="${SMP:-4}" boot/test-kernel.sh riscv64 "{{ tags }}"
+
+test-build-fast-riscv64:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check riscv64
+    boot/test-kernel.sh riscv64 --build-only
+
+test-tags-build-fast-riscv64 tags:
+    boot/check-test-tags.sh
+    boot/test-preflight.sh check riscv64
+    boot/test-kernel.sh riscv64 "{{ tags }}" --build-only
 
 # Run all tests on all architectures. TCG guests are intentionally serial to avoid
 # host contention; this is the periodic integration check, not the per-task path.
@@ -590,7 +687,7 @@ fmt:
     cd {{ fat_dir }} && cargo fmt
     cd {{ iso9660_dir }} && cargo fmt
     cd {{ udf_dir }} && cargo fmt
-    shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/source-path.sh
+    shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/source-path.sh
     cd .. && taplo fmt
 
 # check formatting without writing changes (CI-friendly)
@@ -660,7 +757,7 @@ fmt-check:
     cd {{ fat_dir }} && cargo fmt --check
     cd {{ iso9660_dir }} && cargo fmt --check
     cd {{ udf_dir }} && cargo fmt --check
-    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/source-path.sh
+    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/source-path.sh
     cd .. && taplo fmt --check
 
 # clean build artifacts
