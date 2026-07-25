@@ -189,3 +189,6 @@ pub fn init() {
 	BASE_SPI.store(base, Ordering::Relaxed);
 	MSI_LEN.store(count.min(MAX_MSI), Ordering::Relaxed);
 }
+
+#[cfg(test)]
+mod tests;
