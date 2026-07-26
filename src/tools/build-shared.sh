@@ -48,8 +48,22 @@ source_inventory_seconds=0
 image_graph_seconds=0
 provider_seconds=0
 consumer_seconds=0
+report_seconds=0
 warm_snapshot_file=""
 warm_snapshot_hit=0
+
+check_dynamic_report_inventory() {
+	local report_started=$SECONDS
+	local diagnostics
+	if diagnostics="$("$root/tools/check-dynamic-report.sh" --check-inventory 2>&1)"; then
+		verbose_log "build-shared: $diagnostics"
+	else
+		echo "build-shared: checked dynamic reports need refresh after all target graphs are current" >&2
+		echo "build-shared: refresh with: cd $root && just dynamic-report-update" >&2
+		if [[ "$verbose" == 1 ]]; then printf '%s\n' "$diagnostics" >&2; fi
+	fi
+	report_seconds=$((SECONDS - report_started))
+}
 
 report_build_summary() {
 	local status=$?
@@ -64,7 +78,8 @@ report_build_summary() {
 	elif [[ $status != 0 && -n "$warm_snapshot_file" ]]; then
 		rm -f "$warm_snapshot_file"
 	fi
-	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
+	if [[ $status == 0 ]]; then check_dynamic_report_inventory; fi
+	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds,reports:$report_seconds providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
 }
 
 trap report_build_summary EXIT

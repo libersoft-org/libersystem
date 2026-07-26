@@ -1,5 +1,7 @@
 # Bugs / changes
 
+- Build workflow change - minimal system + drivers + basic services + system libraries, other libraries and tools -> will be added into minimal system if necessary
+- why /bin/lico / licoview / licoedit claims it is not a command?
 - implement the measured persistent incremental build, publish and QEMU application-test loop before continuing feature work
 - init.pkg is not in vol://system/ ... find out why?
 - tests are taking too long after every small task - optimization needed

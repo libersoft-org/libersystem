@@ -10,9 +10,9 @@ image_report="$root/../docs/DYNAMIC_IMAGE.tsv"
 mode="${1:---check}"
 
 case "$mode" in
---check | --write) ;;
+--check | --check-inventory | --write) ;;
 *)
-	echo "usage: $0 [--check|--write]" >&2
+	echo "usage: $0 [--check|--check-inventory|--write]" >&2
 	exit 2
 	;;
 esac
@@ -54,7 +54,7 @@ for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln 
 for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do waves[$tool]=2; done
 for tool in date log config set lsdev lsusb lssvc usage ps run perm stop beep; do waves[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss; do waves[$tool]=4; done
-for tool in imgview imgconv play graphics_probe; do waves[$tool]=5; done
+for tool in imgview imgconv play graphics_probe lico licoedit licoview; do waves[$tool]=5; done
 tests[1]='just test-tags service,process,storage'
 tests[2]='just test-tags service,process,storage'
 tests[3]='just test-tags service,process,storage'
@@ -67,6 +67,21 @@ if [[ "$manifest_tools" != "$wave_tools" ]]; then
 	echo "dynamic-report: wave inventory differs from the manifest tools" >&2
 	diff -u <(printf '%s\n' "$manifest_tools") <(printf '%s\n' "$wave_tools") >&2 || true
 	exit 1
+fi
+if [[ "$mode" == --check-inventory ]]; then
+	[[ -f "$report" ]] || {
+		echo "dynamic-report: missing checked report" >&2
+		exit 1
+	}
+	checked_tools="$(awk -F '\t' '$1 ~ /^[0-9]+$/ && $2 == "x86_64-unknown-none" {print $3}' "$report" | sort)"
+	if [[ "$manifest_tools" != "$checked_tools" ]]; then
+		echo "dynamic-report: checked tool inventory differs from the manifest" >&2
+		diff -u <(printf '%s\n' "$checked_tools") <(printf '%s\n' "$manifest_tools") >&2 || true
+		exit 1
+	fi
+	checked_tool_count="$(wc -l <<<"$manifest_tools")"
+	echo "dynamic-report: $checked_tool_count checked tools match the manifest"
+	exit 0
 fi
 
 library_file() {
@@ -404,8 +419,11 @@ preload_metrics
 generate_report >"$temporary"
 generate_wave_report >"$wave_temporary"
 generate_image_report >"$image_temporary"
-if [[ "$(wc -l <"$temporary")" != 146 ]]; then
-	echo "dynamic-report: expected format, header and 144 target/tool rows" >&2
+tool_count="$(wc -l <<<"$manifest_tools")"
+target_count=3
+expected_report_lines=$((2 + tool_count * target_count))
+if [[ "$(wc -l <"$temporary")" != "$expected_report_lines" ]]; then
+	echo "dynamic-report: expected format, header and $((tool_count * target_count)) target/tool rows" >&2
 	exit 1
 fi
 if [[ "$(wc -l <"$wave_temporary")" != 17 ]]; then
@@ -443,5 +461,5 @@ else
 		diff -u "$image_report" "$image_temporary" >&2 || true
 		exit 1
 	fi
-	echo "dynamic-report: 48 tools x 3 targets, 15 waves and three whole images match"
+	echo "dynamic-report: $tool_count tools x $target_count targets, 15 waves and three whole images match"
 fi
