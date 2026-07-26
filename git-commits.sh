@@ -2,7 +2,8 @@
 # List every commit with its subject and line changes, then print total changes.
 set -euo pipefail
 
-MAX_MESSAGE_LENGTH=50
+MESSAGE_WIDTH=50
+COUNT_WIDTH=8
 
 usage() {
 	echo "usage: git-commits.sh [commit-count]" >&2
@@ -33,95 +34,79 @@ fi
 if [[ -t 1 ]]; then
 	RED=$'\033[31m'
 	GREEN=$'\033[32m'
+	NET_PLUS=$'\033[93m'
+	NET_MINUS=$'\033[38;5;130m'
 	RESET=$'\033[0m'
 else
 	RED=""
 	GREEN=""
+	NET_PLUS=""
+	NET_MINUS=""
 	RESET=""
-fi
-
-truncate_message() {
-	local message="$1"
-	if ((${#message} <= MAX_MESSAGE_LENGTH)); then
-		printf '%s' "$message"
-	else
-		printf '%s...' "${message:0:MAX_MESSAGE_LENGTH-3}"
-	fi
-}
-
-commit_stats() {
-	local commit="$1"
-	git show --format= --numstat "$commit" |
-		awk '
-			$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
-				added += $1
-				removed += $2
-			}
-			END { printf "%d %d\n", added, removed }
-		'
-}
-
-total_added=0
-total_removed=0
-listed_commits=0
-removed_width=7
-added_width=5
-net_width=3
-commit_ids=()
-commit_messages=()
-commit_removed=()
-commit_added=()
-commit_net=()
-commit_args=(--reverse)
-if [[ -n "$commit_count" ]]; then
-	commit_args+=(--max-count="$commit_count")
 fi
 
 separator() {
 	printf '%*s' "$1" '' | tr ' ' '-'
 }
 
-while IFS= read -r commit; do
-	read -r added removed < <(commit_stats "$commit")
-	commit_id="$(git show -s --format=%h "$commit")"
-	message="$(truncate_message "$(git show -s --format=%s "$commit")")"
-	net=$((added - removed))
-	removed_text="-$removed"
-	added_text="+$added"
-	printf -v net_text '%+d' "$net"
-	total_added=$((total_added + added))
-	total_removed=$((total_removed + removed))
-	listed_commits=$((listed_commits + 1))
-	commit_ids+=("$commit_id")
-	commit_messages+=("$message")
-	commit_removed+=("$removed_text")
-	commit_added+=("$added_text")
-	commit_net+=("$net_text")
+log_args=(--reverse)
+if [[ -n "$commit_count" ]]; then
+	log_args+=(--max-count="$commit_count")
+fi
 
-	if ((${#removed_text} > removed_width)); then
-		removed_width=${#removed_text}
-	fi
-	if ((${#added_text} > added_width)); then
-		added_width=${#added_text}
-	fi
-	if ((${#net_text} > net_width)); then
-		net_width=${#net_text}
-	fi
-done < <(git rev-list "${commit_args[@]}" HEAD)
+printf '%-7s %-*s %*s %*s %*s\n' "Commit" "$MESSAGE_WIDTH" "Message" \
+	"$COUNT_WIDTH" "Removed" "$COUNT_WIDTH" "Added" "$COUNT_WIDTH" "Net"
+printf '%-7s %-*s %s %s %s\n' "-------" "$MESSAGE_WIDTH" "$(separator "$MESSAGE_WIDTH")" \
+	"$(separator "$COUNT_WIDTH")" "$(separator "$COUNT_WIDTH")" "$(separator "$COUNT_WIDTH")"
 
-printf '%-7s %-50s %*s %*s %*s\n' "Commit" "Message" "$removed_width" "Removed" "$added_width" "Added" "$net_width" "Net"
-printf '%-7s %-50s %s %s %s\n' "-------" "--------------------------------------------------" "$(separator "$removed_width")" "$(separator "$added_width")" "$(separator "$net_width")"
-
-for index in "${!commit_ids[@]}"; do
-	printf '%-7s %-50s ' "${commit_ids[index]}" "${commit_messages[index]}"
-	printf '%s%*s%s ' "$RED" "$removed_width" "${commit_removed[index]}" "$RESET"
-	printf '%s%*s%s ' "$GREEN" "$added_width" "${commit_added[index]}" "$RESET"
-	printf '%*s\n' "$net_width" "${commit_net[index]}"
-done
-
-total_net=$((total_added - total_removed))
-
-printf '\nSummary (%d commits)\n' "$listed_commits"
-printf 'Removed: %s%8s%s\n' "$RED" "-$total_removed" "$RESET"
-printf 'Added:   %s%8s%s\n' "$GREEN" "+$total_added" "$RESET"
-printf 'Net:     %+8d\n' "$total_net"
+# One traversal carries identity, subject and diff totals together. Asking git per commit
+# costs four processes each, and columns sized from the widest row cannot print until the
+# whole walk ends; fixed widths let every row leave as soon as it is read.
+git log "${log_args[@]}" --numstat --format=$'\x01%h\x02%s' HEAD |
+	awk -v message_width="$MESSAGE_WIDTH" -v count_width="$COUNT_WIDTH" \
+		-v red="$RED" -v green="$GREEN" -v net_plus="$NET_PLUS" \
+		-v net_minus="$NET_MINUS" -v reset="$RESET" '
+		function emit(net, subject, net_colour) {
+			if (!pending) return
+			listed += 1
+			total_added += added
+			total_removed += removed
+			net = added - removed
+			subject = message
+			if (length(subject) > message_width) {
+				subject = substr(subject, 1, message_width - 3) "..."
+			}
+			net_colour = net < 0 ? net_minus : net_plus
+			printf "%-7s %-*s %s%*s%s %s%*s%s %s%*s%s\n", \
+				hash, message_width, subject, \
+				red, count_width, "-" removed, reset, \
+				green, count_width, "+" added, reset, \
+				net_colour, count_width, sprintf("%+d", net), reset
+			pending = 0
+		}
+		substr($0, 1, 1) == "\001" {
+			emit()
+			record = substr($0, 2)
+			split(record, field, "\002")
+			hash = field[1]
+			message = substr(record, length(field[1]) + 2)
+			added = 0
+			removed = 0
+			pending = 1
+			next
+		}
+		# Binary files report "-" for both counts and contribute no line total.
+		$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+			added += $1
+			removed += $2
+		}
+		END {
+			emit()
+			total_net = total_added - total_removed
+			printf "\nSummary (%d commits)\n", listed
+			printf "Removed: %s%*s%s\n", red, count_width, "-" total_removed, reset
+			printf "Added:   %s%*s%s\n", green, count_width, "+" total_added, reset
+			printf "Net:     %s%*s%s\n", total_net < 0 ? net_minus : net_plus, \
+				count_width, sprintf("%+d", total_net), reset
+		}
+	'
