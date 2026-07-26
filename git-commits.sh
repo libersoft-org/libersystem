@@ -2,6 +2,7 @@
 # List every commit with its subject and line changes, then print total changes.
 set -euo pipefail
 
+NUMBER_WIDTH=5
 MESSAGE_WIDTH=50
 COUNT_WIDTH=8
 
@@ -50,20 +51,29 @@ separator() {
 }
 
 log_args=(--reverse)
+number_offset=0
 if [[ -n "$commit_count" ]]; then
 	log_args+=(--max-count="$commit_count")
+	# A count selects the newest commits, so the first row listed is not the first commit.
+	# Number rows by their real position in the whole history rather than within the window.
+	total_commits="$(git rev-list --count HEAD)"
+	if ((commit_count < total_commits)); then
+		number_offset=$((total_commits - commit_count))
+	fi
 fi
 
-printf '%-7s %-*s %*s %*s %*s\n' "Commit" "$MESSAGE_WIDTH" "Message" \
+printf '%*s %-7s %-*s %*s %*s %*s\n' "$NUMBER_WIDTH" "#" "Commit" "$MESSAGE_WIDTH" "Message" \
 	"$COUNT_WIDTH" "Removed" "$COUNT_WIDTH" "Added" "$COUNT_WIDTH" "Net"
-printf '%-7s %-*s %s %s %s\n' "-------" "$MESSAGE_WIDTH" "$(separator "$MESSAGE_WIDTH")" \
+printf '%s %-7s %-*s %s %s %s\n' "$(separator "$NUMBER_WIDTH")" "-------" \
+	"$MESSAGE_WIDTH" "$(separator "$MESSAGE_WIDTH")" \
 	"$(separator "$COUNT_WIDTH")" "$(separator "$COUNT_WIDTH")" "$(separator "$COUNT_WIDTH")"
 
 # One traversal carries identity, subject and diff totals together. Asking git per commit
 # costs four processes each, and columns sized from the widest row cannot print until the
 # whole walk ends; fixed widths let every row leave as soon as it is read.
 git log "${log_args[@]}" --numstat --format=$'\x01%h\x02%s' HEAD |
-	awk -v message_width="$MESSAGE_WIDTH" -v count_width="$COUNT_WIDTH" \
+	awk -v number_width="$NUMBER_WIDTH" -v number_offset="$number_offset" \
+		-v message_width="$MESSAGE_WIDTH" -v count_width="$COUNT_WIDTH" \
 		-v red="$RED" -v green="$GREEN" -v net_plus="$NET_PLUS" \
 		-v net_minus="$NET_MINUS" -v reset="$RESET" '
 		function emit(net, subject, net_colour) {
@@ -77,8 +87,8 @@ git log "${log_args[@]}" --numstat --format=$'\x01%h\x02%s' HEAD |
 				subject = substr(subject, 1, message_width - 3) "..."
 			}
 			net_colour = net < 0 ? net_minus : net_plus
-			printf "%-7s %-*s %s%*s%s %s%*s%s %s%*s%s\n", \
-				hash, message_width, subject, \
+			printf "%*d %-7s %-*s %s%*s%s %s%*s%s %s%*s%s\n", \
+				number_width, number_offset + listed, hash, message_width, subject, \
 				red, count_width, "-" removed, reset, \
 				green, count_width, "+" added, reset, \
 				net_colour, count_width, sprintf("%+d", net), reset
