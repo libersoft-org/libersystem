@@ -70,12 +70,12 @@ if [ "$#" -eq 0 ]; then
 	# Previous generator (GitHub Copilot CLI), kept for reference:
 	# } | copilot -s --no-ask-user 2>/dev/null)
 	if [ -z "$COMMIT_MSG" ] || [ "$COMMIT_MSG" = "No changes" ]; then
-		echo "\033[31mERROR:\033[0m Failed to generate commit message. Please provide one manually:"
+		printf '\033[31mERROR:\033[0m Failed to generate commit message. Please provide one manually:\n'
 		echo "Usage: $0 \"[COMMIT MESSAGE]\""
 		exit 1
 	fi
 	COMMIT_MSG=$(echo "$COMMIT_MSG" | sed 's/"//g' | sed "s/'//g")
-	echo "\033[33mGENERATED COMMIT MESSAGE:\033[0m $COMMIT_MSG"
+	printf '\033[33mGENERATED COMMIT MESSAGE:\033[0m %s\n' "$COMMIT_MSG"
 	COMMIT_MESSAGE="$COMMIT_MSG"
 else
 	COMMIT_MESSAGE=$(echo "$1" | sed 's/"//g' | sed "s/'//g")
