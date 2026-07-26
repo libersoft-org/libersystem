@@ -6,8 +6,28 @@ if [[ "${1:-}" == "--verbose" ]]; then
 	verbose=1
 	shift
 fi
-if [[ $# -lt 2 ]]; then
-	echo "usage: $0 [--verbose] <target> <crate>..." >&2
+selected_artifact=""
+selected_kind=""
+if [[ "${1:-}" == "--artifact" ]]; then
+	selected_artifact="${2:-}"
+	if [[ -z "$selected_artifact" ]]; then
+		echo "usage: $0 [--verbose] [--artifact <artifact>] <target> <crate>..." >&2
+		exit 2
+	fi
+	shift 2
+	case "$selected_artifact" in
+	*.lsexe)
+		selected_artifact="${selected_artifact%.lsexe}"
+		selected_kind="program"
+		;;
+	*.lslib)
+		selected_artifact="${selected_artifact%.lslib}"
+		selected_kind="library"
+		;;
+	esac
+fi
+if [[ -z "$selected_artifact" && $# -lt 2 ]] || [[ -n "$selected_artifact" && $# -lt 1 ]]; then
+	echo "usage: $0 [--verbose] [--artifact <artifact>] <target> <crate>..." >&2
 	exit 2
 fi
 if [[ "$verbose" != 0 && "$verbose" != 1 ]]; then
@@ -21,11 +41,54 @@ verbose_log() {
 
 target="$1"
 shift
-requested_arguments=("$@")
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
 manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 manifest_digest="$(sha256sum <<<"$manifest_json" | awk '{print $1}')"
+if [[ -n "$selected_artifact" ]]; then
+	if [[ -z "$selected_kind" ]]; then
+		selected_kind="$(jq -r --arg artifact "$selected_artifact" '
+			if (.programs[$artifact] | select(.linkage == "dynamic" and .stage == "volume")) then "program"
+			elif .libraries[$artifact] then "library"
+			else empty
+			end
+		' <<<"$manifest_json")"
+	elif ! jq -e --arg artifact "$selected_artifact" --arg kind "$selected_kind" '
+		if $kind == "program" then
+			.programs[$artifact] | select(.linkage == "dynamic" and .stage == "volume")
+		else
+			.libraries[$artifact]
+		end
+	' <<<"$manifest_json" >/dev/null; then
+		selected_kind=""
+	fi
+	if [[ -z "$selected_kind" ]]; then
+		echo "build-shared: unknown dynamic volume artifact '$selected_artifact'" >&2
+		exit 2
+	fi
+	mapfile -t selected_specs < <(jq -r --arg artifact "$selected_artifact" --arg kind "$selected_kind" '
+		def dependencies($root; $name):
+			($root.libraries[$name].providers[]? | dependencies($root; .)), $name;
+		def depends_on($root; $name; $wanted):
+			any($root.libraries[$name].providers[]?;
+				. == $wanted or depends_on($root; .; $wanted));
+		. as $root |
+		(if $kind == "program" then
+			($root.programs[$artifact].providers[] | dependencies($root; .))
+		else
+			(($root.libraries | keys[] as $name |
+				select($name == $artifact or depends_on($root; $name; $artifact)) |
+				dependencies($root; $name)),
+			($root.programs[] |
+				select(.linkage == "dynamic" and .stage == "volume") |
+				select(any(.providers[]?; depends_on($root; .; $artifact))) |
+				.providers[] | dependencies($root; .)))
+		end) as $name |
+		"\($name)=\($root.libraries[$name].owner)"
+	' <<<"$manifest_json" | awk '!seen[$0]++')
+	set -- "${selected_specs[@]}"
+fi
+requested_arguments=("$@")
 artifact_output_root="$build_root/system-image/$target"
 provider_output_dir="$artifact_output_root"
 artifact_log_dir="$artifact_output_root/logs"
@@ -78,7 +141,7 @@ report_build_summary() {
 	elif [[ $status != 0 && -n "$warm_snapshot_file" ]]; then
 		rm -f "$warm_snapshot_file"
 	fi
-	if [[ $status == 0 ]]; then check_dynamic_report_inventory; fi
+	if [[ $status == 0 && -z "$selected_artifact" ]]; then check_dynamic_report_inventory; fi
 	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds,reports:$report_seconds providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
 }
 
@@ -95,8 +158,10 @@ if [[ "${LIBER_IMAGE_LOCK_HELD:-0}" != 1 ]]; then
 	exec 9>"$build_root/image-build-$target.lock"
 	flock 9
 fi
-find "$artifact_output_root" -type f \( -name '*.identity' -o -name '*.order' \) -delete 2>/dev/null || true
-find "$artifact_cache_dir" -maxdepth 1 -type f -name '*.order.sha256' -delete 2>/dev/null || true
+if [[ -z "$selected_artifact" ]]; then
+	find "$artifact_output_root" -type f \( -name '*.identity' -o -name '*.order' \) -delete 2>/dev/null || true
+	find "$artifact_cache_dir" -maxdepth 1 -type f -name '*.order.sha256' -delete 2>/dev/null || true
+fi
 
 case "$target" in
 x86_64-unknown-none)
@@ -147,10 +212,13 @@ prune_stale_program_outputs() {
 	find "$artifact_output_root/bin" "$artifact_output_root/libexec" -depth -type d -empty -delete 2>/dev/null || true
 }
 
-prune_stale_program_outputs
+if [[ -z "$selected_artifact" ]]; then prune_stale_program_outputs; fi
 
-warm_snapshot_file="$build_root/image-warm-$target.state"
-warm_input_inventory_file="$warm_snapshot_file.inputs"
+warm_input_inventory_file=""
+if [[ -z "$selected_artifact" ]]; then
+	warm_snapshot_file="$build_root/image-warm-$target.state"
+	warm_input_inventory_file="$warm_snapshot_file.inputs"
+fi
 
 warm_input_inventory() {
 	{
@@ -206,7 +274,7 @@ write_warm_snapshot() {
 
 find "$artifact_output_root" -type f -name '*.expected' -delete 2>/dev/null || true
 find "$artifact_cache_dir" -maxdepth 1 -type f -name '*.tmp.*' -delete 2>/dev/null || true
-if [[ "$force_rebuild" == 0 && -f "$warm_snapshot_file" ]]; then
+if [[ -z "$selected_artifact" && "$force_rebuild" == 0 && -f "$warm_snapshot_file" ]]; then
 	warm_expected_input="$(sed -n 's/^input=//p' "$warm_snapshot_file")"
 	warm_expected_output="$(sed -n 's/^output=//p' "$warm_snapshot_file")"
 	warm_actual_inputs="$warm_input_inventory_file.current.$$"
@@ -717,13 +785,23 @@ audit_program_destinations() {
 
 manifest_specs="$(jq -r '.libraries[] | "\(.name)=\(.owner)"' <<<"$manifest_json" | sort)"
 requested_specs="$(for spec in "$@"; do if [[ "$spec" == *=* ]]; then printf '%s\n' "$spec"; else printf '%s=%s\n' "$spec" "$spec"; fi; done | sort)"
-if [[ "$requested_specs" != "$manifest_specs" ]]; then
+if [[ -z "$selected_artifact" && "$requested_specs" != "$manifest_specs" ]]; then
 	echo "build-shared: requested libraries differ from the manifest" >&2
 	diff -u <(printf '%s\n' "$manifest_specs") <(printf '%s\n' "$requested_specs") >&2 || true
 	exit 1
 fi
 dynamic_rows() {
-	jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .name != "dyn_probe") | ["dynamic", .name, .owner, "volume", .destination, (.providers | join(" "))] | @tsv' <<<"$manifest_json" | sort -k2,2
+	jq -r --arg artifact "$selected_artifact" --arg kind "$selected_kind" '
+		def depends_on($root; $name; $wanted):
+			$name == $wanted or any($root.libraries[$name].providers[]?;
+				depends_on($root; .; $wanted));
+		. as $root | .programs[] |
+		select(.linkage == "dynamic" and .stage == "volume" and .name != "dyn_probe") |
+		select($artifact == "" or
+			($kind == "program" and .name == $artifact) or
+			($kind == "library" and any(.providers[]?; depends_on($root; .; $artifact)))) |
+		["dynamic", .name, .owner, "volume", .destination, (.providers | join(" "))] | @tsv
+	' <<<"$manifest_json" | sort -k2,2
 }
 
 build_file_hash_inventory() {
@@ -1354,7 +1432,7 @@ if [[ -n "$image_graph" ]]; then
 	done < <(awk '{print $3}' <<<"$dynamic_rows" | sort -u)
 	manifest_tools="$(awk '$3 == "tools" {print $2}' <<<"$dynamic_rows")"
 	cargo_tools="$(cd "$root/$(source_path tools)" && cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tools") | .targets[] | select(.kind == ["bin"]) | .name' | sort)"
-	if [[ "$manifest_tools" != "$cargo_tools" ]]; then
+	if [[ -z "$selected_artifact" && "$manifest_tools" != "$cargo_tools" ]]; then
 		echo "build-shared: tools-package bins differ from dynamic volume manifest rows" >&2
 		diff -u <(printf '%s\n' "$cargo_tools") <(printf '%s\n' "$manifest_tools") >&2 || true
 		exit 1
@@ -1709,8 +1787,10 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 		canonical_provider_order "pix lsrt" >/dev/null
 		verbose_log "build-shared: executable cache hit dyn_probe"
 		rm -f "$probe_expected_identity"
-		audit_library_destinations
-		audit_program_destinations
+		if [[ -z "$selected_artifact" ]]; then
+			audit_library_destinations
+			audit_program_destinations
+		fi
 		exit 0
 	fi
 	verbose_log "build-shared: executable cache miss dyn_probe"
@@ -1728,5 +1808,7 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	echo "build-shared: $probe_out ($(stat -c %s "$probe_out") bytes)"
 fi
 
-audit_library_destinations
-audit_program_destinations
+if [[ -z "$selected_artifact" ]]; then
+	audit_library_destinations
+	audit_program_destinations
+fi

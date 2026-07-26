@@ -108,6 +108,10 @@ shared-cache-check mode="quick":
 dev-baseline scenario tags="smoke":
     @tools/measure-dev-baseline.sh "{{ scenario }}" "{{ tags }}"
 
+# Build and audit one manifest-owned dynamic artifact and its affected closure.
+dev-build artifact target="x86_64":
+    @tools/dev-build.sh "{{ artifact }}" "{{ target }}"
+
 # Reject an ET_EXEC mutation before it can rewrite any target's staged system volume.
 static-image-check: sdk user user-aarch64 user-riscv64
     tools/check-static-injection.sh static

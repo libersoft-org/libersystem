@@ -1,6 +1,8 @@
 # Bugs / changes
 
+- testing CD image should be different from release CD image (release should not have testing volumes like UDF, ISO etc.)
 - cd bin -> lico.lsexe - says command not found, but this lsexe is present in this directory
+- static builds are completely forbidden? - if so, allow it, just don't use it for system tools
 - Build workflow change - minimal system + drivers + basic services + system libraries, other libraries and tools -> will be added into minimal system if necessary
 - why /bin/lico / licoview / licoedit claims it is not a command?
 - implement the measured persistent incremental build, publish and QEMU application-test loop before continuing feature work
@@ -52,6 +54,8 @@
 # New features
 
 - Add video player and video codecs
+- locale settings (keyboard layout, timezone etc.)
+- Live CD with options - live boot + hard drive installer 
 - Add commands for listing hw resources - lsblk, lspci etc.
 - find out what other ls* should be added (lsof etc.)
 - df, du
