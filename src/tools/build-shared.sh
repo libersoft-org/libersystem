@@ -784,7 +784,10 @@ verify_identity_note() {
 	note="$(mktemp "$build_root/identity-note.XXXXXX")"
 	dumped_note="$(mktemp "$build_root/identity-note.XXXXXX")"
 	rm -f "$dumped_note"
-	if ! write_identity_note "$identity" "$note" || ! llvm-objcopy --dump-section .note.liber.identity="$dumped_note" "$elf" 2>/dev/null || ! cmp -s "$note" "$dumped_note"; then
+	# Name an explicit output. Given one file, llvm-objcopy edits it in place, so verifying a
+	# staged artifact would republish identical bytes under a new inode and mtime and defeat
+	# every stat-keyed cache downstream of it.
+	if ! write_identity_note "$identity" "$note" || ! llvm-objcopy --dump-section .note.liber.identity="$dumped_note" "$elf" /dev/null 2>/dev/null || ! cmp -s "$note" "$dumped_note"; then
 		rm -f "$note" "$dumped_note"
 		return 1
 	fi
@@ -972,6 +975,88 @@ record_object_reference() {
 		printf 'bytes=%s\n' "$(stat -c %s "$object")"
 	} >"$reference.tmp.$$"
 	mv "$reference.tmp.$$" "$reference"
+}
+
+# Per-artifact fast state for the full graph. Proving a warm graph from scratch dumps the
+# identity note out of every staged ELF, re-derives every cache key and re-audits the whole
+# provider export graph, so concluding that nothing moved costs tens of seconds of process
+# spawns. A state records the plan edges that decide one artifact next to a stat signature
+# for each file feeding it, so an unchanged artifact is settled by string comparison against
+# a single batched stat of the entire graph. The targeted path keeps its own state; this one
+# only serves the full build, where the whole-image snapshot is all-or-nothing and any single
+# edit drops every artifact back onto the slow proof.
+declare -A artifact_state_header=()
+declare -A artifact_state_entries=()
+declare -A artifact_state_result=()
+declare -A artifact_state_stat=()
+declare -A artifact_state_hit=()
+artifact_state_plan=""
+artifact_state_enabled=0
+artifact_state_misses=0
+
+load_artifact_states() {
+	local key rest
+	local -a paths=()
+	artifact_state_enabled=1
+	# Split on the first tab by hand. Manifest rows carry tabs and can end in one, and `read`
+	# with a tab IFS would trim the trailing field away and never match the row it recorded.
+	while IFS= read -r rest; do
+		key="${rest%%$'\t'*}"
+		rest="${rest#*$'\t'}"
+		case "$rest" in
+		entry$'\t'*) artifact_state_entries[$key]+="${rest#entry$'\t'}"$'\n' ;;
+		result$'\t'*) artifact_state_result[$key]="${rest#result$'\t'}" ;;
+		*) artifact_state_header[$key]+="$rest"$'\n' ;;
+		esac
+	done < <(awk 'FNR == 1 { key = FILENAME; sub(/^.*\/state-/, "", key) } { print key "\t" $0 }' "$artifact_cache_dir"/state-* 2>/dev/null)
+	if ((${#artifact_state_entries[@]} == 0)); then return 0; fi
+	mapfile -t paths < <(printf '%s' "${artifact_state_entries[@]}" | cut -f1 | sort -u)
+	while IFS= read -r rest; do
+		artifact_state_stat[${rest%%$'\t'*}]="$rest"
+	done < <(stat -Lc $'%n\t%F\t%s\t%i\t%y\t%z' -- "${paths[@]}" 2>/dev/null)
+	return 0
+}
+
+# A provider that did not prove itself invalidates its consumers: a relinked provider changes
+# the identity digest its consumers embed, and this comparison never reads the staged bytes.
+artifact_state_valid() {
+	local key="$1"
+	local header="$2"
+	local providers="$3"
+	local line provider
+	((artifact_state_enabled == 1)) || return 1
+	# A forced rebuild still records fresh state, so the run after it is fast again; it just
+	# refuses to trust any of it.
+	[[ "$force_rebuild" == 0 ]] || return 1
+	[[ -n "${artifact_state_entries[$key]:-}" ]] || return 1
+	[[ "${artifact_state_header[$key]:-}" == "$header" ]] || return 1
+	for provider in $providers; do
+		[[ -n "${artifact_state_hit[$provider]:-}" ]] || return 1
+	done
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		[[ "${artifact_state_stat[${line%%$'\t'*}]:-}" == "$line" ]] || return 1
+	done <<<"${artifact_state_entries[$key]}"
+	return 0
+}
+
+write_artifact_state() {
+	local key="$1"
+	local header="$2"
+	local result="$3"
+	shift 3
+	local file temporary path
+	((artifact_state_enabled == 1)) || return 0
+	file="$artifact_cache_dir/state-$key"
+	temporary="$file.tmp.$$"
+	{
+		printf '%s' "$header"
+		if [[ -n "$result" ]]; then printf 'result\t%s\n' "$result"; fi
+		for path in "$@"; do
+			if [[ -n "$path" && -e "$path" ]]; then printf '%s\n' "$path"; fi
+		done | sort -u | xargs -r -d '\n' stat -Lc $'entry\t%n\t%F\t%s\t%i\t%y\t%z' --
+	} >"$temporary"
+	mv "$temporary" "$file"
 }
 
 manifest_library_row() {
@@ -1165,6 +1250,21 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 fi
 image_graph_seconds=$((SECONDS - image_graph_started))
 
+if [[ -z "$selected_artifact" ]]; then
+	artifact_state_plan="$({
+		printf 'format=liber-artifact-state-v1\n'
+		printf 'target=%s\n' "$target"
+		printf 'rustflags=%s\n' "$rustflags"
+		printf 'cargo-target=%s\n' "$cargo_target"
+		printf 'manifest=%s\n' "$manifest_digest"
+		printf 'build-tools=%s\n' "$build_tool_digest"
+		printf 'object-tool=%s\n' "$object_tool_digest"
+		printf 'rustc-commit=%s\n' "$rustc_commit"
+		printf 'cargo-config=%s\n' "${image_target_config_value:-standalone}"
+	} | sha256sum | awk '{print $1}')"
+	load_artifact_states
+fi
+
 graph_archive() {
 	local crate_dir="$1"
 	local package_prefix="path+file://$root/$crate_dir#"
@@ -1312,6 +1412,11 @@ audit_provider_export_ownership() {
 	cache_key="$(tr ' ' '\n' <<<"$roots" | sort -u | xargs)"
 	if [[ -n "${provider_export_audit_cache[$cache_key]:-}" ]]; then return; fi
 	order="$(canonical_provider_order "$roots")" || return 1
+	# Index the closure this audit walks, not just its roots. Providers reached through NEEDED
+	# entries export symbols too, and the graph is no longer indexed in full up front.
+	local -a closure=()
+	mapfile -t closure < <(sed 's/\.lslib$//' <<<"$order")
+	build_provider_index "${closure[*]}"
 	local -A owners=()
 	while IFS= read -r provider; do
 		provider="${provider%.lslib}"
@@ -1379,6 +1484,32 @@ for spec in "$@"; do
 		fi
 		features=(--no-default-features --features "$row_features")
 	fi
+	provider_source_sha="${crate_source_digests[$crate_dir]:-$(source_digest "$crate_dir")}"
+	if [[ "$row_crate" == *-client-provider ]]; then
+		provider_api_dir="$(source_path "${row_crate%-provider}")"
+		provider_compile_source="${crate_source_digests[$provider_api_dir]:-$(source_digest "$provider_api_dir")}"
+	else
+		provider_compile_source="$provider_source_sha"
+	fi
+	provider_state_key="library-$artifact"
+	provider_state_header="plan=$artifact_state_plan"$'\n'"row=$row"$'\n'"source=$provider_source_sha"$'\n'"compile-source=$provider_compile_source"$'\n'
+	for provider in $row_providers; do
+		provider_state_header+="provider=$provider:${provider_identity_digests[$provider]:-}:${provider_compile_digests[$provider]:-}"$'\n'
+	done
+	provider_state_identity=""
+	provider_state_compile=""
+	IFS=$'\t' read -r provider_state_identity provider_state_compile <<<"${artifact_state_result[$provider_state_key]:-}"
+	if [[ -n "$provider_state_identity" && -n "$provider_state_compile" ]] && artifact_state_valid "$provider_state_key" "$provider_state_header" "$row_providers"; then
+		provider_identity_digests[$artifact]="$provider_state_identity"
+		provider_compile_digests[$artifact]="$provider_state_compile"
+		artifact_state_hit[$artifact]=1
+		((provider_cache_hits += 1))
+		verbose_log "build-shared: provider cache hit $artifact"
+		artifacts+=("$artifact")
+		artifact_available[$artifact]=1
+		continue
+	fi
+	((artifact_state_misses += 1))
 	if [[ -n "$image_graph" ]]; then
 		deps="$image_target/$target/release/deps"
 		rlib="$(graph_archive "$crate_dir")"
@@ -1390,12 +1521,6 @@ for spec in "$@"; do
 	if [[ -z "$rlib" ]]; then
 		echo "build-shared: no rlib produced for $crate" >&2
 		exit 1
-	fi
-	provider_source_sha="$(source_digest "$crate_dir")"
-	if [[ "$row_crate" == *-client-provider ]]; then
-		provider_compile_source="$(source_digest "$(source_path "${row_crate%-provider}")")"
-	else
-		provider_compile_source="$provider_source_sha"
 	fi
 	provider_compile_digests[$artifact]="$({
 		printf 'format=liber-provider-compile-identity-v1\n'
@@ -1421,6 +1546,10 @@ for spec in "$@"; do
 		((provider_cache_hits += 1))
 		provider_identity_digests[$artifact]="$(build_file_digest "$provider_expected_identity")"
 		rm -f "$provider_expected_identity" "$provider_cache_inputs"
+		write_artifact_state "$provider_state_key" "$provider_state_header" \
+			"${provider_identity_digests[$artifact]}"$'\t'"${provider_compile_digests[$artifact]}" \
+			"$out" "$provider_cache_prefix.build-key" "$provider_cache_prefix.sha256" \
+			"$provider_cache_prefix.audit" "$rlib" "$image_graph"
 		artifacts+=("$artifact")
 		artifact_available[$artifact]=1
 		continue
@@ -1653,14 +1782,22 @@ for spec in "$@"; do
 	provider_identity_digests[$artifact]="$(build_file_digest "$provider_expected_identity")"
 	record_artifact_cache "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_cache_inputs"
 	rm -f "$provider_expected_identity"
+	write_artifact_state "$provider_state_key" "$provider_state_header" \
+		"${provider_identity_digests[$artifact]}"$'\t'"${provider_compile_digests[$artifact]}" \
+		"$out" "$provider_cache_prefix.build-key" "$provider_cache_prefix.sha256" \
+		"$provider_cache_prefix.audit" "$rlib" "$image_graph"
 	echo "build-shared: $out ($(stat -c %s "$out") bytes)"
 	artifacts+=("$artifact")
 	artifact_available[$artifact]=1
 done
-build_provider_index "${artifacts[*]}"
-for artifact in "${artifacts[@]}"; do
-	audit_provider_export_ownership "$artifact"
-done
+# The export index and the ownership audit read only the staged provider ELFs. When every
+# provider proved its bytes unchanged, the previous run already audited these exact files.
+if ((artifact_state_misses > 0)); then
+	build_provider_index "${artifacts[*]}"
+	for artifact in "${artifacts[@]}"; do
+		audit_provider_export_ownership "$artifact"
+	done
+fi
 provider_seconds=$((SECONDS - provider_started))
 
 if [[ -n "$image_graph" ]]; then
@@ -1701,13 +1838,26 @@ if [[ -n "$image_graph" ]]; then
 			echo "build-shared: dynamic $consumer repeats a direct provider" >&2
 			exit 1
 		fi
-		audit_provider_export_ownership "$providers"
 		consumer_dir="$root/$(source_path "$crate")"
 		out_dir="$(dirname "$artifact_output_root/${destination%.lsexe}")"
 		consumer_errors="$artifact_log_dir/$consumer.stderr"
 		out="$artifact_output_root/${destination%.lsexe}"
 		mkdir -p "$out_dir"
 		consumer_source_sha="$(executable_source_digest "$consumer_dir" "$crate" "$consumer")"
+		consumer_state_key="executable-$consumer"
+		consumer_state_header="plan=$artifact_state_plan"$'\n'"row=$kind $consumer $crate $stage $destination $providers"$'\n'"source=$consumer_source_sha"$'\n'
+		for provider in $providers; do
+			consumer_state_header+="provider=$provider:${provider_identity_digests[$provider]:-}:${provider_compile_digests[$provider]:-}"$'\n'
+		done
+		if artifact_state_valid "$consumer_state_key" "$consumer_state_header" "$providers"; then
+			artifact_state_hit[$consumer]=1
+			((executable_cache_hits += 1))
+			verbose_log "build-shared: executable cache hit $consumer"
+			continue
+		fi
+		((artifact_state_misses += 1))
+		build_provider_index "$providers"
+		audit_provider_export_ownership "$providers"
 		consumer_expected_identity="$(mktemp "$build_root/identity-record.XXXXXX")"
 		write_identity_record executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$consumer_expected_identity"
 		consumer_expected_needed="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
@@ -1733,6 +1883,10 @@ if [[ -n "$image_graph" ]]; then
 			verbose_log "build-shared: executable cache hit $consumer"
 			((executable_cache_hits += 1))
 			rm -f "$consumer_expected_identity" "$consumer_cache_inputs" "$object_inputs"
+			write_artifact_state "$consumer_state_key" "$consumer_state_header" "" \
+				"$out" "$consumer_cache_prefix.build-key" "$consumer_cache_prefix.sha256" \
+				"$consumer_cache_prefix.audit" "$object_reference" "$consumer_obj" \
+				"$object_cache_prefix.build-key" "$object_cache_prefix.sha256" "$start_obj"
 			continue
 		fi
 		verbose_log "build-shared: executable cache miss $consumer"
@@ -2022,6 +2176,10 @@ if [[ -n "$image_graph" ]]; then
 		record_artifact_cache "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_cache_inputs"
 		if [[ -n "$object_inputs" ]]; then rm -f "$object_inputs"; fi
 		rm -f "$consumer_expected_identity"
+		write_artifact_state "$consumer_state_key" "$consumer_state_header" "" \
+			"$out" "$consumer_cache_prefix.build-key" "$consumer_cache_prefix.sha256" \
+			"$consumer_cache_prefix.audit" "$object_reference" "$consumer_obj" \
+			"$object_cache_prefix.build-key" "$object_cache_prefix.sha256" "$start_obj"
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"
 	consumer_seconds=$((SECONDS - consumer_started))
