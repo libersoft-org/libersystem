@@ -49,6 +49,17 @@ fn terminal_session_attempts_cleanup_after_a_failed_enter() {
 }
 
 #[test]
+fn terminal_guard_restores_modes_when_the_application_leaves_scope() {
+	let mut writer = Writer::new();
+	{
+		let mut terminal = TerminalGuard::enter(&mut writer, TerminalOptions::tui()).expect("terminal modes enter");
+		assert!(terminal.is_active());
+		assert!(terminal.writer().write(b"frame"));
+	}
+	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?9001h\x1b[?9002l\x1b[?1002h\x1b[?1006h\x1b[?2004hframe\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?9001l\x1b[?9002h\x1b[?25h\x1b[?1049l");
+}
+
+#[test]
 fn control_messages_require_exact_known_shapes() {
 	assert_eq!(decode_control(b"WINSIZE\x18\x00\x50\x00"), Some(TerminalControl::InitialSize(TerminalSize::new(24, 80))));
 	assert_eq!(decode_control(b"RESIZE\x32\x00\x78\x00"), Some(TerminalControl::Resized(TerminalSize::new(50, 120))));
@@ -104,6 +115,14 @@ fn text_decoder_preserves_chunk_boundaries_and_recovers_from_malformed_utf8() {
 }
 
 #[test]
+fn display_line_uses_shared_tab_control_and_utf8_rules() {
+	let mut output = Vec::new();
+	let cells = append_display_line(b"a\tb\x01\xe2\x82", 8, 4, &mut output).expect("display buffer reserves");
+	assert_eq!(cells, 7);
+	assert_eq!(output, b"a   b.\xef\xbf\xbd");
+}
+
+#[test]
 fn key_bindings_and_widget_state_stay_bounded_and_deterministic() {
 	#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 	enum Action {
@@ -147,6 +166,34 @@ fn file_type_detection_prefers_magic_and_keeps_unknown_binary_safe() {
 	assert_eq!(detect_file_type(b"sound.bin", b"OggS\0", false), FileType::Audio);
 	assert_eq!(detect_file_type(b"blob", b"\0\x01\x02", false), FileType::Binary);
 	assert_eq!(detect_file_type(b"any", b"", true), FileType::Directory);
+}
+
+#[test]
+fn text_buffer_edits_and_moves_without_exceeding_its_bound() {
+	let mut text = TextBuffer::from_bytes(b"one\ntwo\n", 12).expect("initial text fits");
+	assert_eq!(text.line_at(0), b"one");
+	assert_eq!(text.line_at(4), b"two");
+	assert!(!text.is_dirty());
+	assert!(text.move_end());
+	assert_eq!(text.cursor(), 3);
+	assert!(text.move_down());
+	assert_eq!(text.cursor(), 7);
+	assert!(text.move_home());
+	assert_eq!(text.cursor(), 4);
+	assert!(!text.is_dirty());
+	text.insert(b'T').expect("insert fits");
+	assert_eq!(text.bytes(), b"one\nTtwo\n");
+	assert!(text.delete_before());
+	assert_eq!(text.bytes(), b"one\ntwo\n");
+	assert!(text.delete_at());
+	assert_eq!(text.bytes(), b"one\nwo\n");
+	assert!(text.is_dirty());
+	assert_eq!(text.insert(b'x'), Ok(()));
+	assert_eq!(text.insert(b'y'), Ok(()));
+	assert_eq!(text.insert(b'z'), Ok(()));
+	assert_eq!(text.insert(b'1'), Ok(()));
+	assert_eq!(text.insert(b'2'), Ok(()));
+	assert_eq!(text.insert(b'3'), Err(TextBufferError::TooLarge));
 }
 
 const RUST_SYNTAX: &[u8] = br#"lico-syntax 1

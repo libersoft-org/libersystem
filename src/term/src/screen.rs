@@ -57,7 +57,7 @@ pub enum Color {
 // The caret shape selected by DECSCUSR (CSI Ps SP q): a steady underline by default, a
 // block, or a vertical bar. The blink flag is recorded but the caret is drawn solid (a
 // self-driven blink timer would keep the cooperative boot driver from settling - the
-// same reason the M35c blink was dropped).
+// same reason blinking is not rendered).
 #[derive(Clone, Copy, PartialEq)]
 pub enum CursorShape {
 	Block,
@@ -787,7 +787,7 @@ impl Screen {
 		}
 		match byte {
 			0x1b => self.esc_state = 1,
-			// No tty/line-discipline yet (M35i), so NL still implies a carriage return.
+			// There is no tty/line discipline yet, so NL still implies a carriage return.
 			b'\n' => {
 				self.col = 0;
 				self.line_feed();

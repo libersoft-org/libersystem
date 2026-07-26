@@ -1008,9 +1008,9 @@ fn pty_hosts_a_program() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
-	// The M35i PTY abstraction: a program hosts a terminal it is not the hardware console
-	// for. ConsoleService opens a pseudo-terminal on request, spawns a slave program on it,
-	// and hands back the master channel; the host drives the slave through the line
+	// The PTY abstraction: a program hosts a terminal it is not the hardware console for.
+	// ConsoleService opens a pseudo-terminal on request, spawns a slave program on it, and
+	// hands back the master channel; the host drives the slave through the line
 	// discipline over that master, exactly as the `script` tool (and a future ssh) does.
 	// Here we stand in for the host (and for VT 1's idle shell) and drive a `ptyecho` slave:
 	// a line written to the master is cooked by the line discipline, delivered to the slave,

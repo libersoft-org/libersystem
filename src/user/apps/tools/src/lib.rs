@@ -13,8 +13,158 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::vec::Vec;
+use lico::TerminalWriter;
 use proto::codec::JsonMode;
-use rt::{Received, exit, recv_blocking};
+use proto::system::{FileInfo, OpenOpts, volume};
+use rt::{Received, ReceivedVec, close, exit, map_object, recv_blocking, recv_tagged, recv_vec_blocking, send_blocking, unmap_object};
+use storage_proto::path;
+use volume_client::VolumeClient;
+
+/// The shared adapter from a governed tool's full-duplex console capability to the
+/// `lico` terminal lifecycle. The individual LiberCommander executables never hand-roll
+/// mode writes or their failure behavior.
+pub struct ConsoleWriter {
+	channel: u64,
+}
+
+impl ConsoleWriter {
+	#[inline(always)]
+	pub const fn new(channel: u64) -> ConsoleWriter {
+		ConsoleWriter { channel }
+	}
+}
+
+impl TerminalWriter for ConsoleWriter {
+	#[inline(always)]
+	fn write(&mut self, bytes: &[u8]) -> bool {
+		self.channel != 0 && unsafe { send_blocking(self.channel, bytes, 0) }
+	}
+}
+
+/// The five volume clients carried by the governed `Volumes` capability bundle.
+pub struct VolumeSet {
+	pub system: u64,
+	pub media: u64,
+	pub iso: u64,
+	pub udf: u64,
+	pub usb: u64,
+}
+
+impl VolumeSet {
+	/// Receive the fixed-order volume bundle after a tool's argument message.
+	#[inline(always)]
+	pub unsafe fn receive(bootstrap: u64, buffer: &mut [u8]) -> VolumeSet {
+		unsafe { VolumeSet { system: recv_tagged(bootstrap, buffer, b"SYSTEM").unwrap_or(0), media: recv_tagged(bootstrap, buffer, b"MEDIA").unwrap_or(0), iso: recv_tagged(bootstrap, buffer, b"ISO").unwrap_or(0), udf: recv_tagged(bootstrap, buffer, b"UDF").unwrap_or(0), usb: recv_tagged(bootstrap, buffer, b"USB").unwrap_or(0) } }
+	}
+
+	/// Route one path argument to its already-granted volume client.
+	#[inline(always)]
+	pub fn client_for(&self, cwd: &str, argument: &[u8]) -> u64 {
+		path::volume_client(cwd, argument, self.system, self.media, self.iso, self.udf, self.usb)
+	}
+}
+
+/// Why a read-only volume file could not be copied into an application's bounded buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadFileError {
+	Unavailable,
+	NotFound,
+	TooLarge,
+	OutOfMemory,
+	MapFailed,
+}
+
+/// Open a file through an already-granted volume client and copy no more than `limit` bytes.
+/// The handed file capability is closed on every return path.
+#[inline(always)]
+pub unsafe fn read_volume_file(storage: u64, path: &str, limit: usize) -> Result<Vec<u8>, ReadFileError> {
+	unsafe {
+		if storage == 0 {
+			return Err(ReadFileError::Unavailable);
+		}
+		let mut client = VolumeClient::new(storage);
+		let opened = match client.open(&OpenOpts { path: String::from(path), write: false, create: false }) {
+			Some(Ok(opened)) if opened.file != 0 => opened,
+			_ => return Err(ReadFileError::NotFound),
+		};
+		let length = match usize::try_from(opened.size) {
+			Ok(length) if length <= limit => length,
+			_ => {
+				close(opened.file);
+				return Err(ReadFileError::TooLarge);
+			}
+		};
+		if length == 0 {
+			close(opened.file);
+			return Ok(Vec::new());
+		}
+		let address = match map_object(opened.file) {
+			Some(address) => address,
+			None => {
+				close(opened.file);
+				return Err(ReadFileError::MapFailed);
+			}
+		};
+		let mut bytes = Vec::new();
+		if bytes.try_reserve_exact(length).is_err() {
+			unmap_object(opened.file);
+			close(opened.file);
+			return Err(ReadFileError::OutOfMemory);
+		}
+		bytes.extend_from_slice(core::slice::from_raw_parts(address as *const u8, length));
+		unmap_object(opened.file);
+		close(opened.file);
+		Ok(bytes)
+	}
+}
+
+/// Why a directory stream could not become a bounded panel listing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ListDirectoryError {
+	Unavailable,
+	TooManyEntries,
+	OutOfMemory,
+}
+
+/// Collect at most `limit` typed directory entries from a granted volume client.
+/// The stream consumer and any unexpected transferred frame handle are closed on every path.
+#[inline(always)]
+pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> Result<Vec<FileInfo>, ListDirectoryError> {
+	unsafe {
+		if storage == 0 {
+			return Err(ListDirectoryError::Unavailable);
+		}
+		let mut client = VolumeClient::new(storage);
+		let consumer = client.list(path).ok_or(ListDirectoryError::Unavailable)?;
+		let mut entries = Vec::new();
+		loop {
+			match recv_vec_blocking(consumer) {
+				ReceivedVec::Message { bytes, mut handle } => {
+					let entry = volume::list_read(&bytes, &mut handle);
+					if handle != 0 {
+						close(handle);
+					}
+					if let Some(entry) = entry {
+						if entries.len() == limit {
+							close(consumer);
+							return Err(ListDirectoryError::TooManyEntries);
+						}
+						if entries.try_reserve(1).is_err() {
+							close(consumer);
+							return Err(ListDirectoryError::OutOfMemory);
+						}
+						entries.push(entry);
+					}
+				}
+				ReceivedVec::Closed => {
+					close(consumer);
+					return Ok(entries);
+				}
+			}
+		}
+	}
+}
 
 // Drop leading and trailing ASCII whitespace from a byte slice.
 pub fn trim(s: &[u8]) -> &[u8] {

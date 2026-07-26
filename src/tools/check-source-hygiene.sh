@@ -139,7 +139,7 @@ fi
 
 manifest_pattern='(read_to_string|join).*user/services/manifest[.]toml'
 manifest_readers="$(grep -RIlE "$manifest_pattern" src --include='*.rs' --include='*.sh' | sort || true)"
-allowed_manifest_readers="$(printf '%s\n' src/tools/system-manifest/src/lib.rs src/tools/system-manifest/src/main.rs | sort)"
+allowed_manifest_readers="$(printf '%s\n' src/tools/system-manifest/src/lib.rs src/tools/system-manifest/src/main.rs src/user/services/core/build.rs | sort)"
 if [[ "$manifest_readers" != "$allowed_manifest_readers" ]]; then
 	echo "source-hygiene: direct manifest readers differ from the ownership allowlist:" >&2
 	diff -u <(printf '%s\n' "$allowed_manifest_readers") <(printf '%s\n' "$manifest_readers") >&2 || true

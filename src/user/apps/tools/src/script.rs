@@ -7,7 +7,7 @@ use rt::*;
 // (the console opened it on the shell's behalf and handed us the master), drive the shell
 // with the command line we were given, then read and print the whole session - the prompt,
 // the echoed command, its output, and the goodbye - until the shell exits and the pty
-// closes. This is the host side of the M35i PTY abstraction: a program hosting a terminal
+// closes. This is the host side of the PTY abstraction: a program hosting a terminal
 // it is not the hardware console for, exactly as a future ssh would.
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {

@@ -412,8 +412,8 @@ fn device_manager_reacts_to_a_driver_crash() {
 	use object::KernelObject;
 	use object::domain::Domain;
 	// DeviceManager's reaction to a driver crash: the kernel reports the crash on the
-	// crash-notify channel (M20h), and the supervisor finds the device that driver
-	// was bound to and marks it offline. Here device 0 is driven by a process that
+	// crash-notify channel, and the supervisor finds the device that driver was bound to
+	// and marks it offline. Here device 0 is driven by a process that
 	// then crashes; consuming the crash event, the supervisor marks it offline.
 	#[derive(PartialEq, Debug)]
 	enum DeviceState {

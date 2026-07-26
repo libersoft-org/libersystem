@@ -7,7 +7,7 @@ use rt::*;
 // cooked line from its console (delivered through the line discipline, exactly as a shell
 // reads keystrokes), echoes it back prefixed with "pty:", and loops until the console
 // closes (the host released the pty) or an empty line (the tty's EOF) arrives. It is the
-// slave side of the M35i PTY abstraction - a program reading and writing a terminal it is
+// slave side of the PTY abstraction - a program reading and writing a terminal it is
 // handed, with no hardware console of its own - and the deterministic slave the
 // `pty_hosts_a_program` kernel test drives.
 #[unsafe(no_mangle)]

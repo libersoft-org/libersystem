@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- do not compile / rebuild the whole system over and over again when adding a new tool, let it run somewhere permanently, rebuild only the parts we're working on and send it to an already running system
 - measure the time it takes for tests, compilations, etc. to run and suggest how it could be optimized so that everything doesn't take so long while maintaining full functionality... for example just shared-cache-check quick is extremely slow
 - init.pkg is not in vol://system/ ... find out why?
 - tests are taking too long after every small task - optimization needed

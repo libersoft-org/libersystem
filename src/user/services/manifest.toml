@@ -650,6 +650,33 @@ destination = "bin/lsvol.lsexe"
 providers = ["volume-client", "storage-proto", "wire", "lsrt"]
 
 [[programs]]
+name = "licoview"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/licoview.lsexe"
+providers = ["lico", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "licoedit"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/licoedit.lsexe"
+providers = ["lico", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "lico"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/lico.lsexe"
+providers = ["lico", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
 name = "mkdir"
 owner = "tools"
 role = "tool"

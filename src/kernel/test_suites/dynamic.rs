@@ -207,7 +207,31 @@ fn dynamic_process_service_loads_probe() {
 	sched::run_until_idle();
 }
 
-tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [Service, Process, ProcessService, Storage]);
+tagged_test!(lico_provider_loads_with_lsrt, [Lico, Dynamic, Process, Storage]);
+fn lico_provider_loads_with_lsrt() {
+	use object::address_space::AddressSpace;
+	use object::process::Process;
+
+	let (volume, _) = scenario_packages().expect("scenario packages");
+	let lsrt = volume_file(volume, b"lib/runtime/lsrt.lslib").expect("staged lsrt provider");
+	let ipc_client = volume_file(volume, b"lib/ipc/ipc-client.lslib").expect("staged ipc client provider");
+	let wire = volume_file(volume, b"lib/ipc/wire.lslib").expect("staged wire provider");
+	let base_proto = volume_file(volume, b"lib/protocol/base-proto.lslib").expect("staged base protocol provider");
+	let lico = volume_file(volume, b"lib/terminal/lico.lslib").expect("staged lico provider");
+	let storage_proto = volume_file(volume, b"lib/protocol/storage-proto.lslib").expect("staged storage protocol provider");
+	let volume_client = volume_file(volume, b"lib/clients/volume-client.lslib").expect("staged volume client provider");
+	let process = Process::new(AddressSpace::create().expect("lico provider address space"), sched::root_domain());
+	crate::loader::load_module_into(&process, &lsrt, 0x2000_0000).expect("staged lsrt loads as the first dynamic provider");
+	crate::loader::load_module_into(&process, &ipc_client, 0x2100_0000).expect("staged ipc client resolves its lsrt imports");
+	crate::loader::load_module_into(&process, &wire, 0x2200_0000).expect("staged wire resolves its lsrt imports");
+	crate::loader::load_module_into(&process, &base_proto, 0x2300_0000).expect("staged base protocol resolves its provider imports");
+	crate::loader::load_module_into(&process, &lico, 0x2400_0000).expect("staged lico resolves its lsrt imports and registers its exports");
+	crate::loader::load_module_into(&process, &storage_proto, 0x2500_0000).expect("staged storage protocol resolves its provider imports");
+	crate::loader::load_module_into(&process, &volume_client, 0x2600_0000).expect("staged volume client resolves its provider imports");
+	assert!(process.resolve_dynamic_symbol("_RNvNtCs5EbkmrkEgCH_4lico6detect16detect_file_type").is_some(), "lico registers its file-type detector for dynamic consumers");
+}
+
+tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [LicoLoad, Service, Process, ProcessService, Storage]);
 fn dynamic_process_service_loads_programs_from_system_bin() {
 	use object::channel::{Channel, Message};
 	use object::process::Process;
@@ -325,6 +349,9 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		b"graphics_probe" as &[u8],
 		b"imgview" as &[u8],
 		b"imgconv" as &[u8],
+		b"lico" as &[u8],
+		b"licoview" as &[u8],
+		b"licoedit" as &[u8],
 		b"config" as &[u8],
 		b"set" as &[u8],
 		b"log" as &[u8],

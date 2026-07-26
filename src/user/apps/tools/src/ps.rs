@@ -17,18 +17,15 @@
 extern crate alloc;
 
 use alloc::string::String;
+use lico::{MouseTracking, TerminalGuard, TerminalOptions};
 use process_client::ProcessClient;
 use proto::codec::JsonMode;
 use resources_client::ResourcesClient;
 use rt::*;
+use tools::ConsoleWriter;
 
 // The refresh period of the live view, in clock ticks (~100 Hz, so ~1 s).
 const REFRESH_TICKS: u64 = 100;
-
-// Enter the live view: alternate screen, hidden cursor, raw tty, no echo.
-const TTY_ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?9001h\x1b[?9002l";
-// Leave the live view: cooked tty, echo, cursor, main screen - the defaults back.
-const TTY_LEAVE: &[u8] = b"\x1b[?9001l\x1b[?9002h\x1b[?25h\x1b[?1049l";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -105,7 +102,12 @@ unsafe fn live_view(procsvc: u64, ressvc: u64) {
 		}
 		// Ctrl+C must not kill us mid-alternate-screen: catch it and exit cleanly below.
 		catch_interrupt();
-		print(TTY_ENTER);
+		let mut output = ConsoleWriter::new(stdout());
+		let options = TerminalOptions { alternate_screen: true, raw_input: true, disable_echo: true, hide_cursor: true, mouse: MouseTracking::Off, bracketed_paste: false };
+		let Some(_terminal) = TerminalGuard::enter(&mut output, options) else {
+			query_processes(procsvc, None);
+			return;
+		};
 		loop {
 			render_frame(procsvc, ressvc);
 			// sleep until a key arrives or the refresh deadline passes.
@@ -137,7 +139,6 @@ unsafe fn live_view(procsvc: u64, ressvc: u64) {
 				}
 			}
 		}
-		print(TTY_LEAVE);
 	}
 }
 

@@ -11,6 +11,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod buffer;
 mod control;
 mod detect;
 mod input;
@@ -19,12 +20,13 @@ mod syntax;
 mod text;
 mod ui;
 
+pub use buffer::{TextBuffer, TextBufferError};
 pub use control::{RESIZE_EVENT, TerminalControl, TerminalSize, WINSIZE_REPLY, WINSIZE_REQUEST, decode_control};
 pub use detect::{FileType, detect_file_type};
 pub use input::{InputDecoder, InputEvent, Key, PointerEvent};
-pub use session::{MouseTracking, TerminalOptions, TerminalSession, TerminalWriter};
+pub use session::{MouseTracking, TerminalGuard, TerminalOptions, TerminalSession, TerminalWriter};
 pub use syntax::{HighlightResult, LineState, MAX_CONTEXTS, MAX_DESCRIPTOR_BYTES, MAX_NESTING, MAX_RULES, MAX_STYLES, MAX_TOKEN_BYTES, StyleId, SyntaxDescriptor, SyntaxError, SyntaxMatchKind, SyntaxSelection, TokenSpan, parse_descriptor, select_descriptor};
-pub use text::{DecodedText, REPLACEMENT_CHARACTER, TextDecoder};
+pub use text::{DecodedText, REPLACEMENT_CHARACTER, TextDecoder, TextRenderError, append_display_line};
 pub use ui::{Binding, DialogKind, DialogState, Focus, MenuState, OperationState, Progress, dispatch_key};
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ fn main() {
 	common::configure();
 	let crate_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
 	let workspace = crate_root.join("../../..");
+	println!("cargo:rerun-if-changed={}", workspace.join("user/services/manifest.toml").display());
 	let manifest = Manifest::load_workspace(&workspace).unwrap_or_else(|error| panic!("{error}"));
 	generate_services(&manifest);
 	generate_library_paths(&manifest);

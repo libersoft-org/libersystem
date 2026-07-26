@@ -38,6 +38,45 @@ pub trait TerminalWriter {
 	fn write(&mut self, bytes: &[u8]) -> bool;
 }
 
+/// An entered terminal session that restores every owned mode when it leaves scope.
+///
+/// Applications create this immediately after acquiring their full-duplex terminal. A
+/// normal return, caught signal, service-disconnect branch, or early error return drops
+/// the guard and restores raw/cooked mode, cursor visibility, mouse reporting, paste
+/// handling and the alternate screen in one shared implementation.
+pub struct TerminalGuard<'a, W: TerminalWriter> {
+	session: TerminalSession,
+	writer: &'a mut W,
+}
+
+impl<'a, W: TerminalWriter> TerminalGuard<'a, W> {
+	/// Enter `options` and return a guard that owns their restoration.
+	pub fn enter(writer: &'a mut W, options: TerminalOptions) -> Option<TerminalGuard<'a, W>> {
+		let mut session = TerminalSession::new(options);
+		if session.enter(writer) { Some(TerminalGuard { session, writer }) } else { None }
+	}
+
+	/// The writer used for rendering while the terminal modes are owned.
+	pub fn writer(&mut self) -> &mut W {
+		self.writer
+	}
+
+	pub const fn is_active(&self) -> bool {
+		self.session.is_active()
+	}
+
+	/// Restore modes before the end of this scope. Drop remains idempotent afterwards.
+	pub fn restore(&mut self) -> bool {
+		self.session.restore(self.writer)
+	}
+}
+
+impl<W: TerminalWriter> Drop for TerminalGuard<'_, W> {
+	fn drop(&mut self) {
+		let _ = self.session.restore(self.writer);
+	}
+}
+
 /// Tracks whether a program currently owns non-default terminal modes.
 pub struct TerminalSession {
 	options: TerminalOptions,

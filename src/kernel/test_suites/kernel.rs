@@ -256,8 +256,8 @@ fn a_periodic_wait_ticks_but_never_holds_the_scheduler() {
 	static TICKS: AtomicU64 = AtomicU64::new(0);
 	// A service thread waits with WAIT_PERIODIC on an event nothing signals,
 	// re-arming a short deadline forever - the virtio-gpu poll pattern. Without the
-	// flag this loop would keep run_until_idle from ever returning (the M35c blink
-	// hang); with it, the scheduler settles while the wait is parked, and each later
+	// flag this loop would keep run_until_idle from ever returning. With it, the
+	// scheduler settles while the wait is parked, and each later
 	// run_until_idle entry wakes the tick that came due - the wait still TICKS.
 	extern "C" fn service(_arg: u64) {
 		unsafe {

@@ -1,5 +1,9 @@
 //! Incremental bounded UTF-8 decoding.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
+
 /// Unicode replacement character emitted for malformed UTF-8.
 pub const REPLACEMENT_CHARACTER: u32 = 0xfffd;
 
@@ -8,6 +12,58 @@ pub const REPLACEMENT_CHARACTER: u32 = 0xfffd;
 pub struct DecodedText {
 	pub consumed: usize,
 	pub produced: usize,
+}
+
+/// Why a display-line append could not reserve its bounded output space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextRenderError {
+	OutOfMemory,
+}
+
+/// Append a bounded, terminal-safe rendering of one logical text line.
+///
+/// Tab expands to the next `tab_width` stop, ASCII controls become `.`, malformed UTF-8
+/// becomes U+FFFD, and output stops at `columns` logical cells. No newline is appended.
+pub fn append_display_line(input: &[u8], columns: usize, tab_width: usize, output: &mut Vec<u8>) -> Result<usize, TextRenderError> {
+	let reserve = columns.checked_mul(4).ok_or(TextRenderError::OutOfMemory)?;
+	output.try_reserve(reserve).map_err(|_| TextRenderError::OutOfMemory)?;
+	let tab_width = tab_width.max(1);
+	let mut decoder = TextDecoder::new();
+	let mut pending = input;
+	let mut scalars = [0u32; 32];
+	let mut rendered = 0;
+	while !pending.is_empty() && rendered < columns {
+		let decoded = decoder.decode(pending, &mut scalars);
+		pending = &pending[decoded.consumed..];
+		for &scalar in &scalars[..decoded.produced] {
+			if rendered >= columns {
+				break;
+			}
+			if scalar == b'\t' as u32 {
+				let spaces = (tab_width - rendered % tab_width).min(columns - rendered);
+				for _ in 0..spaces {
+					output.push(b' ');
+				}
+				rendered += spaces;
+			} else if scalar < 0x20 || scalar == 0x7f {
+				output.push(b'.');
+				rendered += 1;
+			} else {
+				append_scalar(output, scalar);
+				rendered += 1;
+			}
+		}
+		if decoded.consumed == 0 && decoded.produced == 0 {
+			break;
+		}
+	}
+	if rendered < columns {
+		if let Some(scalar) = decoder.finish() {
+			append_scalar(output, scalar);
+			rendered += 1;
+		}
+	}
+	Ok(rendered)
 }
 
 enum Step {
@@ -119,5 +175,24 @@ impl TextDecoder {
 		self.value = 0;
 		self.minimum = 0;
 		self.remaining = 0;
+	}
+}
+
+fn append_scalar(output: &mut Vec<u8>, scalar: u32) {
+	let scalar = if scalar > 0x10ffff || (0xd800..=0xdfff).contains(&scalar) { REPLACEMENT_CHARACTER } else { scalar };
+	if scalar <= 0x7f {
+		output.push(scalar as u8);
+	} else if scalar <= 0x7ff {
+		output.push(0xc0 | (scalar >> 6) as u8);
+		output.push(0x80 | (scalar & 0x3f) as u8);
+	} else if scalar <= 0xffff {
+		output.push(0xe0 | (scalar >> 12) as u8);
+		output.push(0x80 | ((scalar >> 6) & 0x3f) as u8);
+		output.push(0x80 | (scalar & 0x3f) as u8);
+	} else {
+		output.push(0xf0 | (scalar >> 18) as u8);
+		output.push(0x80 | ((scalar >> 12) & 0x3f) as u8);
+		output.push(0x80 | ((scalar >> 6) & 0x3f) as u8);
+		output.push(0x80 | (scalar & 0x3f) as u8);
 	}
 }

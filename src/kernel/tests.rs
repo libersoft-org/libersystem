@@ -1083,6 +1083,8 @@ define_test_tags! {
 	Interrupt => "interrupt",
 	Ipc => "ipc",
 	Kernel => "kernel",
+	Lico => "lico",
+	LicoLoad => "lico-load",
 	Memory => "memory",
 	Mouse => "mouse",
 	Network => "network",
@@ -2510,6 +2512,182 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 		}
 	}
 	panic!("imgview harness did not exit");
+}
+
+fn run_licoview_harness(licoview_elf: &[u8], path: &[u8], system: &mut StorageHarness) {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (bootstrap, child) = Channel::create();
+	let (terminal, terminal_child) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), licoview_elf, child);
+	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("licoview terminal bootstrap");
+	bootstrap.send(Message::new(path.to_vec(), alloc::vec::Vec::new(), 0)).expect("licoview path argument");
+	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("licoview system volume");
+	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("licoview absent volume");
+	}
+	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("licoview cwd");
+
+	let mut output = alloc::vec::Vec::new();
+	let mut rendered = false;
+	for _ in 0..100_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			rendered |= message.bytes.starts_with(b"\x1b[H\x1b[2J\x1b[1mlicoview");
+			output.push(message.bytes);
+		}
+		if rendered {
+			break;
+		}
+	}
+	assert!(rendered, "licoview renders its text viewport before waiting for input");
+	assert_eq!(output.get(0).map(Vec::as_slice), Some(b"\x1b[?1049h".as_slice()), "licoview enters the alternate screen first");
+	assert_eq!(output.get(1).map(Vec::as_slice), Some(b"\x1b[?25l".as_slice()), "licoview hides the cursor");
+	assert_eq!(output.get(2).map(Vec::as_slice), Some(b"\x1b[?9001h".as_slice()), "licoview enters raw input mode");
+	assert_eq!(output.get(3).map(Vec::as_slice), Some(b"\x1b[?9002l".as_slice()), "licoview disables tty echo");
+	assert_eq!(output.get(4).map(Vec::as_slice), Some(b"\x1b[?1000h".as_slice()), "licoview requests pointer press reports");
+	assert_eq!(output.get(5).map(Vec::as_slice), Some(b"\x1b[?1006h".as_slice()), "licoview requests SGR pointer encoding");
+	let rendered: alloc::vec::Vec<u8> = output.iter().flat_map(|line| line.iter().copied()).collect();
+	assert!(rendered.windows(b"Hello from the OS ramdisk!".len()).any(|window| window == b"Hello from the OS ramdisk!"), "licoview displays text read through its only granted system volume");
+
+	terminal.send(Message::new(b"q".to_vec(), alloc::vec::Vec::new(), 0)).expect("licoview q input");
+	for _ in 0..100_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			output.push(message.bytes);
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	assert!(process.is_terminated(), "licoview exits after q");
+	let restore = [b"\x1b[?1006l".as_slice(), b"\x1b[?1000l".as_slice(), b"\x1b[?9001l".as_slice(), b"\x1b[?9002h".as_slice(), b"\x1b[?25h".as_slice(), b"\x1b[?1049l".as_slice()];
+	let mut cursor = 0;
+	for expected in restore {
+		let position = output[cursor..].iter().position(|line| line == expected).expect("licoview restores every terminal mode in order");
+		cursor += position + 1;
+	}
+}
+
+fn run_licoedit_harness(licoedit_elf: &[u8], path: &[u8], system: &mut StorageHarness) {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (bootstrap, child) = Channel::create();
+	let (terminal, terminal_child) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), licoedit_elf, child);
+	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("licoedit terminal bootstrap");
+	bootstrap.send(Message::new(path.to_vec(), alloc::vec::Vec::new(), 0)).expect("licoedit path argument");
+	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("licoedit system volume");
+	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("licoedit absent volume");
+	}
+	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("licoedit cwd");
+
+	let mut output = alloc::vec::Vec::new();
+	let mut rendered = false;
+	for _ in 0..100_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			rendered |= message.bytes.starts_with(b"\x1b[H\x1b[2J\x1b[1mlicoedit");
+			output.push(message.bytes);
+		}
+		if rendered {
+			break;
+		}
+	}
+	assert!(rendered, "licoedit renders its text buffer before waiting for input");
+	assert_eq!(output.get(0).map(Vec::as_slice), Some(b"\x1b[?1049h".as_slice()), "licoedit enters the alternate screen first");
+	assert_eq!(output.get(1).map(Vec::as_slice), Some(b"\x1b[?25l".as_slice()), "licoedit hides the cursor");
+	assert_eq!(output.get(2).map(Vec::as_slice), Some(b"\x1b[?9001h".as_slice()), "licoedit enters raw input mode");
+	assert_eq!(output.get(3).map(Vec::as_slice), Some(b"\x1b[?9002l".as_slice()), "licoedit disables tty echo");
+	let rendered: alloc::vec::Vec<u8> = output.iter().flat_map(|line| line.iter().copied()).collect();
+	assert!(rendered.windows(b"Hello from the OS ramdisk!".len()).any(|window| window == b"Hello from the OS ramdisk!"), "licoedit displays text read through its only granted system volume");
+
+	terminal.send(Message::new(b"\x1b[21~".to_vec(), alloc::vec::Vec::new(), 0)).expect("licoedit F10 input");
+	for _ in 0..100_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			output.push(message.bytes);
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	assert!(process.is_terminated(), "licoedit exits after F10");
+	let restore = [b"\x1b[?9001l".as_slice(), b"\x1b[?9002h".as_slice(), b"\x1b[?25h".as_slice(), b"\x1b[?1049l".as_slice()];
+	let mut cursor = 0;
+	for expected in restore {
+		let position = output[cursor..].iter().position(|line| line == expected).expect("licoedit restores every terminal mode in order");
+		cursor += position + 1;
+	}
+}
+
+fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (bootstrap, child) = Channel::create();
+	let (terminal, terminal_child) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), lico_elf, child);
+	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("lico terminal bootstrap");
+	bootstrap.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("lico empty arguments");
+	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("lico system volume");
+	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent volume");
+	}
+	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico cwd");
+
+	let mut output = alloc::vec::Vec::new();
+	let mut rendered = false;
+	for _ in 0..100_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			rendered |= message.bytes.starts_with(b"\x1b[H\x1b[2J\x1b[1mlico\x1b[0m");
+			output.push(message.bytes);
+		}
+		if rendered {
+			break;
+		}
+	}
+	assert!(rendered, "lico renders both panels before waiting for input");
+	assert_eq!(output.get(0).map(Vec::as_slice), Some(b"\x1b[?1049h".as_slice()), "lico enters the alternate screen first");
+	assert_eq!(output.get(4).map(Vec::as_slice), Some(b"\x1b[?1000h".as_slice()), "lico requests pointer press reports");
+	let initial: alloc::vec::Vec<u8> = output.iter().flat_map(|line| line.iter().copied()).collect();
+	assert!(initial.windows(b">vol://system".len()).any(|window| window == b">vol://system"), "left panel begins active");
+
+	terminal.send(Message::new(b"\t".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico tab focus input");
+	let mut switched = false;
+	for _ in 0..100_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			switched |= message.bytes.windows(b" | >vol://system".len()).any(|window| window == b" | >vol://system");
+			output.push(message.bytes);
+		}
+		if switched {
+			break;
+		}
+	}
+	assert!(switched, "Tab moves the active panel to the right side");
+
+	terminal.send(Message::new(b"\x1b[21~".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico F10 input");
+	for _ in 0..100_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			output.push(message.bytes);
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	assert!(process.is_terminated(), "lico exits after F10");
+	let restore = [b"\x1b[?1006l".as_slice(), b"\x1b[?1000l".as_slice(), b"\x1b[?9001l".as_slice(), b"\x1b[?9002h".as_slice(), b"\x1b[?25h".as_slice(), b"\x1b[?1049l".as_slice()];
+	let mut cursor = 0;
+	for expected in restore {
+		let position = output[cursor..].iter().position(|line| line == expected).expect("lico restores every terminal mode in order");
+		cursor += position + 1;
+	}
 }
 
 // Kernel-thread body that drops to ring 3 running the embedded cooperative-yield

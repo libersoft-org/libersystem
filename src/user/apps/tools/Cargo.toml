@@ -100,6 +100,18 @@ name = "imgview"
 path = "src/imgview.rs"
 
 [[bin]]
+name = "licoview"
+path = "src/licoview.rs"
+
+[[bin]]
+name = "licoedit"
+path = "src/licoedit.rs"
+
+[[bin]]
+name = "lico"
+path = "src/lico.rs"
+
+[[bin]]
 name = "imgconv"
 path = "src/imgconv.rs"
 
@@ -244,6 +256,7 @@ shared-image = [
 	"proto/shared-image",
 	"rt/shared-image",
 	"storage-proto/shared-image",
+	"lico/shared-image",
 ]
 
 [dependencies]
@@ -255,7 +268,7 @@ rt = { path = "../../runtime/rt" }
 # Generated LSIDL bindings: the net tools speak the NetworkService contracts
 # (`network` / `socket`) via the proto codec + generated clients.
 proto = { path = "../../../proto" }
-storage-proto = { path = "../../libs/protocol/storage-proto" }
+storage-proto = { path = "../../libs/protocol/storage-proto", features = ["channel-client-impl"] }
 audio-client = { path = "../../libs/clients/audio-client", optional = true }
 audio-client-provider = { path = "../../libs/clients/audio-client-provider", optional = true }
 network-client = { path = "../../libs/clients/network-client", optional = true }
@@ -276,8 +289,8 @@ security-client = { path = "../../libs/clients/security-client", optional = true
 security-client-provider = { path = "../../libs/clients/security-client-provider", optional = true }
 time-client = { path = "../../libs/clients/time-client", optional = true }
 time-client-provider = { path = "../../libs/clients/time-client-provider", optional = true }
-volume-client = { path = "../../libs/clients/volume-client", optional = true }
-volume-client-provider = { path = "../../libs/clients/volume-client-provider", optional = true }
+volume-client = { path = "../../libs/clients/volume-client" }
+volume-client-provider = { path = "../../libs/clients/volume-client-provider" }
 
 bmp = { path = "../../libs/image/bmp" }
 keys = { path = "../../libs/input/keys" }
