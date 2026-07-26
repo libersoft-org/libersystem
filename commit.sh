@@ -36,7 +36,8 @@ src/tools/check-source-hygiene.sh --added
 git status
 
 if [ "$#" -eq 0 ]; then
-	echo "Generating commit message using GitHub Copilot..."
+	echo "Generating commit message using Claude Code..."
+	# echo "Generating commit message using GitHub Copilot..."
 	COMMIT_MSG=$({
 		echo "Write exactly one Git commit subject."
 		echo "Max 250 characters."
@@ -62,7 +63,12 @@ if [ "$#" -eq 0 ]; then
 		echo
 		echo "UNSTAGED DIFF:"
 		git diff --unified=0
-	} | copilot -s --no-ask-user 2>/dev/null)
+	} | claude -p --model haiku --output-format text --no-session-persistence \
+		--system-prompt "You output exactly one line of plain text and nothing else. Never use markdown, code fences, backticks, bullets, headings or commentary." \
+		--disallowedTools Bash Read Glob Grep Edit Write WebFetch WebSearch Task TodoWrite 2>/dev/null |
+		sed -e 's/`//g' -e '/^[[:space:]]*$/d' | head -n 1)
+	# Previous generator (GitHub Copilot CLI), kept for reference:
+	# } | copilot -s --no-ask-user 2>/dev/null)
 	if [ -z "$COMMIT_MSG" ] || [ "$COMMIT_MSG" = "No changes" ]; then
 		echo "\033[31mERROR:\033[0m Failed to generate commit message. Please provide one manually:"
 		echo "Usage: $0 \"[COMMIT MESSAGE]\""

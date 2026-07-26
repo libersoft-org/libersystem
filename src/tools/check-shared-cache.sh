@@ -30,8 +30,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Every cache decision this guard asserts on is a verbose diagnostic: ordinary builds
+# print one summary line instead. Ask for the detail explicitly rather than reading a
+# quiet log for markers that are not in it.
 run_graph() {
-	(cd "$root" && LIBER_IMAGE_LOCK_HELD=1 just shared-libs) >"$output" 2>&1
+	(cd "$root" && LIBER_IMAGE_LOCK_HELD=1 LIBER_VERBOSE=1 just shared-libs) >"$output" 2>&1
 }
 
 summary_value() {
