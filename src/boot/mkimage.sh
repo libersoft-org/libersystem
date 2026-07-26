@@ -37,6 +37,12 @@ source "$REPO_ROOT/product.conf"
 BUILD="$REPO_ROOT/.build/boot"
 SLUG="$(echo "$PRODUCT_NAME" | tr '[:upper:]' '[:lower:]')"
 
+cleanup() {
+	rm -f "$BUILD/$SLUG.iso.$$.candidate" "$BUILD/$SLUG.img.$$.candidate"
+	rm -f "$BUILD/$SLUG.iso.build-key.tmp.$$" "$BUILD/$SLUG.img.build-key.tmp.$$"
+}
+trap cleanup EXIT
+
 # operate on raw partition offsets without tripping mtools' geometry checks
 export MTOOLS_SKIP_CHECK=1
 
@@ -68,8 +74,9 @@ stage_kernel() {
 # build a hybrid ISO (BIOS El Torito + UEFI), bootable as a CD or off a USB stick
 # build a UEFI-only ISO, bootable as a CD or off a USB stick
 make_iso() {
-	local kernel="$1" out="$BUILD/$SLUG.iso"
+	local kernel="$1" final="$BUILD/$SLUG.iso" out="$BUILD/$SLUG.iso.$$.candidate"
 	local iso_root="$BUILD/iso_root"
+	rm -f "$out"
 
 	local staged
 	staged="$(stage_kernel "$kernel")"
@@ -107,14 +114,15 @@ make_iso() {
 		-efi-boot-part --efi-boot-image \
 		--protective-msdos-label \
 		"$iso_root" -o "$out" 2>/dev/null
+	mv "$out" "$final"
 
-	info "wrote $out"
-	echo "$out"
+	info "wrote $final"
+	echo "$final"
 }
 
 # build a raw GPT disk image for a USB stick / SD card / hard disk
 make_img() {
-	local kernel="$1" size="${2:-64M}" out="$BUILD/$SLUG.img"
+	local kernel="$1" size="${2:-64M}" final="$BUILD/$SLUG.img" out="$BUILD/$SLUG.img.$$.candidate"
 
 	mkdir -p "$BUILD"
 	rm -f "$out"
@@ -150,9 +158,10 @@ make_img() {
 	# splice the populated FAT filesystem into the ESP region of the disk
 	dd if="$esp" of="$out" bs=512 seek="$esp_start" conv=notrunc status=none
 	rm -f "$esp"
+	mv "$out" "$final"
 
-	info "wrote $out ($size, GPT: ESP)"
-	echo "$out"
+	info "wrote $final ($size, GPT: ESP)"
+	echo "$final"
 }
 
 cmd="${1:-}"
@@ -161,8 +170,44 @@ kernel="$2"
 [[ -f "$kernel" ]] || die "kernel ELF not found: $kernel"
 kernel="$(realpath -m "$kernel")"
 
+mkdir -p "$BUILD"
+command -v flock >/dev/null
+command -v sha256sum >/dev/null
+exec 9>"$BUILD/$SLUG.image.lock"
+flock 9
+
+case "$cmd" in
+iso)
+	output="$BUILD/$SLUG.iso"
+	mode_input="iso"
+	;;
+img)
+	output="$BUILD/$SLUG.img"
+	mode_input="img:${3:-64M}"
+	;;
+*) die "unknown subcommand '$cmd' (expected 'iso' or 'img')" ;;
+esac
+
+[[ -f "$LOADER_EFI" ]] || die "loader EFI not found: $LOADER_EFI (build the loader first)"
+[[ -f "$BUILD/$INIT_PACKAGE" ]] || die "init package not found: $BUILD/$INIT_PACKAGE (build the kernel first)"
+[[ -f "$BUILD/$VOLUME_PACKAGE" ]] || die "volume package not found: $BUILD/$VOLUME_PACKAGE (build the kernel first)"
+key_file="$output.build-key"
+key="$({
+	printf 'format=liber-boot-image-input-v1\n'
+	printf 'mode=%s\n' "$mode_input"
+	printf 'strip=%s\n' "$STRIP"
+	sha256sum "$0" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/$INIT_PACKAGE" "$BUILD/$VOLUME_PACKAGE"
+} | sha256sum | awk '{print $1}')"
+if [[ -f "$output" && -f "$key_file" && "$(<"$key_file")" == "$key" ]]; then
+	info "cache hit $output"
+	echo "$output"
+	exit 0
+fi
+info "cache miss $output; rebuilding"
+
 case "$cmd" in
 iso) make_iso "$kernel" ;;
 img) make_img "$kernel" "${3:-64M}" ;;
-*) die "unknown subcommand '$cmd' (expected 'iso' or 'img')" ;;
 esac
+printf '%s\n' "$key" >"$key_file.tmp.$$"
+mv "$key_file.tmp.$$" "$key_file"

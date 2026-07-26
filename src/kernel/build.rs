@@ -56,9 +56,20 @@ fn export_cross_arch_volume() {
 		let _ = fs::create_dir_all(&build_dir);
 		let vol_src: PathBuf = out_dir.join("volume.pkg");
 		if vol_src.exists() {
-			let _ = fs::copy(&vol_src, build_dir.join(format!("volume-{arch}.pkg")));
+			let bytes: Vec<u8> = fs::read(&vol_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", vol_src.display()));
+			write_if_changed(&build_dir.join(format!("volume-{arch}.pkg")), &bytes);
 		}
 	}
+}
+
+fn write_if_changed(path: &Path, bytes: &[u8]) {
+	if fs::read(path).is_ok_and(|existing| existing == bytes) {
+		return;
+	}
+	let file_name = path.file_name().and_then(|name| name.to_str()).expect("output file name");
+	let temporary = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
+	fs::write(&temporary, bytes).unwrap_or_else(|error| panic!("cannot write {}: {error}", temporary.display()));
+	fs::rename(&temporary, path).unwrap_or_else(|error| panic!("cannot publish {}: {error}", path.display()));
 }
 
 // Parse ../../product.conf (shell-style KEY="value") into key/value pairs (the
@@ -356,11 +367,11 @@ fn user_elf_machine() -> u16 {
 	}
 }
 
-// Where the assembled packages are written. On aarch64 and riscv64 there is no
-// bootloader module hand-off (the kernel is booted directly via `-kernel`), so the
-// packages go to OUT_DIR and are embedded into the kernel image; on x86_64 they go to
-// the repository build root for mkimage.sh to place as boot modules (the loader loads them alongside
-// the kernel and hands their addresses to it in the BootInfo).
+// Where the assembled packages are written. On AArch64 and RISC-V there is no
+// bootloader module hand-off, so the packages go to OUT_DIR and are embedded into the
+// kernel image. On x86_64 they go to the repository build root for mkimage.sh to place as
+// separate boot modules. Content-aware writes below preserve timestamps when package
+// bytes are unchanged, avoiding an embedded kernel relink or x86_64 image restaging.
 fn package_out_dir(manifest: &Path) -> PathBuf {
 	match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
 		Ok("aarch64") | Ok("riscv64") => PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set")),
@@ -447,7 +458,7 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	}
 
 	let package: Vec<u8> = build_package(&entries);
-	fs::write(&out_pkg, &package).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", out_pkg.display()));
+	write_if_changed(&out_pkg, &package);
 }
 
 // Assemble the ramdisk volume package: every regular file under src/volume is
@@ -543,7 +554,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 
 	let entries: Vec<(&str, Vec<u8>)> = files.iter().map(|(name, data): &(String, Vec<u8>)| (name.as_str(), data.clone())).collect();
 	let package: Vec<u8> = build_package(&entries);
-	fs::write(&out_pkg, &package).unwrap_or_else(|e: std::io::Error| panic!("cannot write {}: {e}", out_pkg.display()));
+	write_if_changed(&out_pkg, &package);
 }
 
 // Serialize a boot package: an 8-byte magic, a u32 entry count and a reserved
