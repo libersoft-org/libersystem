@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Record one development-loop timing sample without mutating source files.
+set -euo pipefail
+
+scenario="${1:?usage: measure-dev-baseline.sh <cold|warm|leaf|provider> [test-tags]}"
+tags="${2:-smoke}"
+case "$scenario" in
+cold | warm | leaf | provider) ;;
+*)
+	echo "dev-baseline: unknown scenario '$scenario'" >&2
+	exit 2
+	;;
+esac
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+repo_root="$(cd "$root/.." && pwd)"
+baseline_root="$repo_root/.build/dev-baseline"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+sample_dir="$baseline_root/$stamp-$scenario"
+events="$sample_dir/events.tsv"
+build_log="$sample_dir/shared-build.log"
+test_log="$sample_dir/kernel-test.log"
+samples="$baseline_root/samples.tsv"
+mkdir -p "$sample_dir"
+: >"$events"
+
+run_started_ns="$(date +%s%N)"
+set +e
+if [[ "$scenario" == cold ]]; then
+	(cd "$root" && LIBER_IMAGE_REBUILD=1 just shared-libs) >"$build_log" 2>&1
+else
+	(cd "$root" && just shared-libs) >"$build_log" 2>&1
+fi
+build_status=$?
+set -e
+if [[ "$build_status" != 0 ]]; then
+	cat "$build_log" >&2
+	echo "dev-baseline: shared build failed; logs: $sample_dir" >&2
+	exit "$build_status"
+fi
+
+set +e
+(cd "$root" && LIBER_TIMING_LOG="$events" boot/test-kernel.sh x86_64 "$tags") >"$test_log" 2>&1
+test_status=$?
+set -e
+run_ended_ns="$(date +%s%N)"
+if [[ "$test_status" != 0 ]]; then
+	cat "$test_log" >&2
+	echo "dev-baseline: kernel test failed; logs: $sample_dir" >&2
+	exit "$test_status"
+fi
+
+first_event() {
+	local phase="$1" event="$2"
+	awk -F '\t' -v phase="$phase" -v event="$event" '$2 == phase && $3 == event { print $1; exit }' "$events"
+}
+
+last_event() {
+	local phase="$1" event="$2"
+	awk -F '\t' -v phase="$phase" -v event="$event" '$2 == phase && $3 == event { value = $1 } END { print value }' "$events"
+}
+
+duration_ms() {
+	local start="$1" end="$2"
+	if [[ -z "$start" || -z "$end" ]]; then printf '%s' -; else awk -v start="$start" -v end="$end" 'BEGIN { printf "%.3f", (end - start) / 1000000 }'; fi
+}
+
+summary="$(grep '^build-shared: summary ' "$build_log" | tail -1)"
+field() {
+	local name="$1"
+	sed -n "s/.*${name}:\([0-9][0-9]*\).*/\1/p" <<<"$summary"
+}
+
+source_seconds="$(field source)"
+graph_seconds="$(field graph)"
+provider_seconds="$(field providers)"
+consumer_seconds="$(field consumers)"
+report_seconds="$(field reports)"
+test_start="$(first_event test_driver start)"
+runner_start="$(first_event runner start)"
+package_init_start="$(first_event package_init start)"
+package_init_end="$(last_event package_init end)"
+package_volume_start="$(first_event package_volume start)"
+package_volume_end="$(last_event package_volume end)"
+image_start="$(first_event image start)"
+image_end="$(last_event image end)"
+qemu_start="$(first_event qemu start)"
+kernel_start="$(first_event kernel start)"
+scenario_start="$(first_event scenario start)"
+scenario_end="$(last_event scenario end)"
+qemu_end="$(last_event qemu end)"
+package_init_ms="$(duration_ms "$package_init_start" "$package_init_end")"
+package_volume_ms="$(duration_ms "$package_volume_start" "$package_volume_end")"
+cargo_total_ms="$(duration_ms "$test_start" "$runner_start")"
+kernel_compile_link_ms="$(awk -v total="$cargo_total_ms" -v init="$package_init_ms" -v volume="$package_volume_ms" 'BEGIN { if (init == "-") init = 0; if (volume == "-") volume = 0; printf "%.3f", total - init - volume }')"
+image_ms="$(duration_ms "$image_start" "$image_end")"
+qemu_startup_ms="$(duration_ms "$qemu_start" "$kernel_start")"
+guest_boot_ms="$(duration_ms "$kernel_start" "$scenario_start")"
+scenario_ms="$(duration_ms "$scenario_start" "$scenario_end")"
+shutdown_ms="$(duration_ms "$scenario_end" "$qemu_end")"
+total_ms="$(duration_ms "$run_started_ns" "$run_ended_ns")"
+output_lines="$(($(wc -l <"$build_log") + $(wc -l <"$test_log")))"
+output_bytes="$(($(wc -c <"$build_log") + $(wc -c <"$test_log")))"
+
+header=$'timestamp\tscenario\ttags\tsource_s\tgraph_s\tprovider_link_audit_stage_s\tconsumer_link_audit_stage_s\treport_s\tcargo_total_ms\tinit_package_ms\tvolume_package_ms\timage_assembly_ms\tqemu_startup_ms\tguest_boot_ms\tscenario_ms\tshutdown_ms\ttotal_ms\toutput_lines\toutput_bytes\tsample_dir'
+if [[ ! -f "$samples" ]]; then printf '%s\n' "$header" >"$samples"; fi
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+	"$stamp" "$scenario" "$tags" "${source_seconds:--}" "${graph_seconds:--}" "${provider_seconds:--}" "${consumer_seconds:--}" "${report_seconds:--}" \
+	"$cargo_total_ms" "$package_init_ms" "$package_volume_ms" "$image_ms" "$qemu_startup_ms" "$guest_boot_ms" "$scenario_ms" "$shutdown_ms" "$total_ms" "$output_lines" "$output_bytes" "$sample_dir" >>"$samples"
+
+sample_header=$'scenario\ttags\tsource_s\tgraph_s\tprovider_link_audit_stage_s\tconsumer_link_audit_stage_s\treport_s\tkernel_compile_link_ms\tinit_package_ms\tvolume_package_ms\timage_assembly_ms\tqemu_startup_ms\tguest_boot_ms\tscenario_ms\tshutdown_ms\ttotal_ms\toutput_lines\toutput_bytes'
+printf '%s\n' "$sample_header" >"$sample_dir/summary.tsv"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+	"$scenario" "$tags" "${source_seconds:--}" "${graph_seconds:--}" "${provider_seconds:--}" "${consumer_seconds:--}" "${report_seconds:--}" \
+	"$kernel_compile_link_ms" "$package_init_ms" "$package_volume_ms" "$image_ms" "$qemu_startup_ms" "$guest_boot_ms" "$scenario_ms" "$shutdown_ms" "$total_ms" "$output_lines" "$output_bytes" >>"$sample_dir/summary.tsv"
+
+echo "dev-baseline: scenario=$scenario tags=$tags total=${total_ms}ms output=${output_lines}lines/${output_bytes}bytes"
+echo "dev-baseline: shared source=${source_seconds}s graph=${graph_seconds}s providers=${provider_seconds}s consumers=${consumer_seconds}s reports=${report_seconds}s"
+echo "dev-baseline: kernel=${kernel_compile_link_ms}ms init-pkg=${package_init_ms}ms volume-pkg=${package_volume_ms}ms image=${image_ms}ms qemu-start=${qemu_startup_ms}ms guest-boot=${guest_boot_ms}ms scenario=${scenario_ms}ms shutdown=${shutdown_ms}ms"
+echo "dev-baseline: sample recorded in $sample_dir"

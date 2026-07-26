@@ -85,6 +85,11 @@ fi
 LIMIT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
 echo "[test-$ARCH] $MODE (timeout $LIMIT)"
 START_SECONDS="$SECONDS"
+if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then
+	LIBER_TIMING_LOG="$(realpath -m "$LIBER_TIMING_LOG")"
+	export LIBER_TIMING_LOG
+	printf '%s\ttest_driver\tstart\n' "$(date +%s%N)" >>"$LIBER_TIMING_LOG"
+fi
 
 TEST_ARGS=(test "${TARGET_ARGS[@]}")
 if [[ "$BUILD_ONLY" == "1" ]]; then
@@ -98,6 +103,7 @@ set +e
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e
+if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\ttest_driver\tend\n' "$(date +%s%N)" >>"$LIBER_TIMING_LOG"; fi
 elapsed=$((SECONDS - START_SECONDS))
 if [[ "$VERBOSE" == "1" ]]; then print_full_logs; fi
 

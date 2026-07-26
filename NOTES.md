@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- cd bin -> lico.lsexe - says command not found, but this lsexe is present in this directory
 - Build workflow change - minimal system + drivers + basic services + system libraries, other libraries and tools -> will be added into minimal system if necessary
 - why /bin/lico / licoview / licoedit claims it is not a command?
 - implement the measured persistent incremental build, publish and QEMU application-test loop before continuing feature work
@@ -63,9 +64,9 @@
 - web camera viewer / recorder
 - shell scripts
 - Rust Doom?
-- M42 - app package format
-- M35k - console login and lock
-- M35f - non-US keyboard layout
+- M0042 - app package format
+- M0035k - console login and lock
+- M0035f - non-US keyboard layout
 - When phase 2 is done, check if all matches with CONCEPT_EN/CZ.md
 - Look for other FS compatibility (NTFS, ext4, xfs etc.)
 - check for necessary utilities - https://popcon.debian.org/by_inst

@@ -4,6 +4,39 @@ Measured numbers for the changes whose goal includes a before/after
 comparison. Methodology per entry; machine noise applies, so treat the times as
 orders, not precision instruments.
 
+## Development loop baseline (2026-07-26)
+
+`cd src && just dev-baseline <cold|warm|leaf|provider> [test-tags]` records one
+x86_64 sample under `.build/dev-baseline/<timestamp>-<scenario>/` and appends its
+machine-readable row to `.build/dev-baseline/samples.tsv`. Each sample retains the
+shared-image and kernel-test transcripts, raw host-nanosecond timing events and a
+self-contained `summary.tsv`. Kernel compile/link time is the Cargo interval after
+subtracting measured init and volume package assembly. The command
+does not mutate source files: `leaf` and `provider` label a sample after a real edit;
+`cold` forces all shared-image artifacts through compile, link and audit while retaining
+the global Cargo cache; `warm` measures the unchanged path.
+
+The host has 52 logical CPUs; routine QEMU tests use four vCPUs and KVM. The selected
+`smoke` union ran seven tests. The leaf sample used a semantic-neutral whitespace change
+to `uname.rs`; the provider sample used the same kind of change to `keys/src/lib.rs`.
+Both probes were restored immediately after measurement and left no source diff.
+
+| scenario | total | source | graph | provider link/audit/stage | consumer link/audit/stage | kernel compile/link | init package | volume package | image | QEMU start | guest boot | scenario | shutdown | output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cold shared image | 414.63 s | 1 s | 30 s | 265 s | 99 s | 1.23 s | 0.37 s | 3.04 s | 0.54 s | 3.92 s | 0.48 s | 24 ms | 71 ms | 136 lines / 16,641 B |
+| warm no change | 10.21 s | 0 s | 0 s | 0 s | 0 s | 0.23 s | - | - | 0.48 s | 3.86 s | 0.48 s | 39 ms | 57 ms | 3 lines / 432 B |
+| one leaf tool | 101.67 s | 1 s | 2 s | 39 s | 40 s | 1.25 s | 0.36 s | 3.01 s | 0.52 s | 3.95 s | 0.49 s | 40 ms | 58 ms | 5 lines / 648 B |
+| one provider | 94.73 s | 1 s | 3 s | 25 s | 46 s | 1.28 s | 0.33 s | 2.96 s | 0.52 s | 4.07 s | 0.51 s | 40 ms | 31 ms | 24 lines / 3,081 B |
+
+The provider sample rebuilt `keys.lslib` and 19 dependent executables. The leaf sample
+reported 61 provider cache hits and only one object/executable miss, yet still spent 39
+seconds in the provider phase. The current cache therefore avoids output replacement but
+does not avoid all expensive Cargo/provider graph work before proving those hits. Package
+assembly adds roughly 3.4 seconds whenever the kernel build script reruns. Even on the
+true warm path, boot-image assembly plus fresh QEMU startup and guest boot cost about 4.8
+seconds for a scenario whose guest execution is only 39 ms. These measurements establish
+the targets for proportional single-artifact builds and the persistent guest loop.
+
 ## Image conversion (2026-07-16)
 
 `just image-bench` builds the same no_std leaves used by `imgconv` in an optimized

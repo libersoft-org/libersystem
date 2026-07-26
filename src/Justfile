@@ -104,6 +104,10 @@ shared-libs-verify:
 shared-cache-check mode="quick":
     tools/check-shared-cache.sh {{ mode }}
 
+# Record one cold, warm, leaf-edit or provider-edit development-loop sample.
+dev-baseline scenario tags="smoke":
+    @tools/measure-dev-baseline.sh "{{ scenario }}" "{{ tags }}"
+
 # Reject an ET_EXEC mutation before it can rewrite any target's staged system volume.
 static-image-check: sdk user user-aarch64 user-riscv64
     tools/check-static-injection.sh static
@@ -697,7 +701,7 @@ fmt:
     cd {{ fat_dir }} && cargo fmt
     cd {{ iso9660_dir }} && cargo fmt
     cd {{ udf_dir }} && cargo fmt
-    shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/source-path.sh
+    shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
     cd .. && taplo fmt
 
 # check formatting without writing changes (CI-friendly)
@@ -772,7 +776,7 @@ _fmt-check:
     cd {{ fat_dir }} && cargo fmt --check
     cd {{ iso9660_dir }} && cargo fmt --check
     cd {{ udf_dir }} && cargo fmt --check
-    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/source-path.sh
+    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
     cd .. && taplo fmt --check
 
 # clean build artifacts

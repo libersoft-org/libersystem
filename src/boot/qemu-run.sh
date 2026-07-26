@@ -324,6 +324,33 @@ QEMU_BOOT_DIR="$HERE"
 QEMU_BUILD_DIR="$REPO_ROOT/.build/boot"
 mkdir -p "$QEMU_BUILD_DIR"
 
+timing_event() {
+	if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\t%s\t%s\n' "$(date +%s%N)" "$1" "$2" >>"$LIBER_TIMING_LOG"; fi
+}
+
+watch_test_timing() {
+	local qemu_pid="$1"
+	local serial_path="${SERIAL#file:}"
+	local kernel_seen=0 tests_seen=0 complete_seen=0
+	[[ "${SERIAL:-}" == file:* ]] || return 0
+	while kill -0 "$qemu_pid" 2>/dev/null || [[ "$complete_seen" == 0 ]]; do
+		if [[ "$kernel_seen" == 0 ]] && grep -q 'kernel is starting' "$serial_path" 2>/dev/null; then
+			timing_event kernel start
+			kernel_seen=1
+		fi
+		if [[ "$tests_seen" == 0 ]] && grep -q '^running [0-9].* tests' "$serial_path" 2>/dev/null; then
+			timing_event scenario start
+			tests_seen=1
+		fi
+		if [[ "$complete_seen" == 0 ]] && grep -q '^test suite complete:' "$serial_path" 2>/dev/null; then
+			timing_event scenario end
+			complete_seen=1
+		fi
+		if ! kill -0 "$qemu_pid" 2>/dev/null && [[ "$complete_seen" == 0 ]]; then break; fi
+		sleep 0.01
+	done
+}
+
 if [[ -z "$KERNEL_ELF" ]]; then
 	case "$TARGET_ARCH" in
 	x86_64) KERNEL_ELF="$REPO_ROOT/.build/cargo/kernel/x86_64-unknown-none/debug/kernel" ;;
@@ -341,6 +368,8 @@ qemu_run_x86_64() {
 	local kernel="$1"
 	local artifact_suffix=""
 	[[ "${TEST:-0}" == "1" ]] && artifact_suffix="-test"
+	timing_event runner start
+	timing_event image start
 	# Build the own UEFI loader (its EFI binary is staged into the boot image as
 	# BOOTX64.EFI); it lives in its own crate with its own UEFI target.
 	(cd "$HERE/../loader" && cargo build) >&2
@@ -426,13 +455,26 @@ qemu_run_x86_64() {
 	qemu_args+=("${cpu_args[@]}" -smp "$smp")
 
 	qemu_append_debug_args qemu_args
+	timing_event image end
 
 	if [[ "${TEST:-0}" == "1" ]]; then
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
+		timing_event qemu start
 		set +e
-		qemu-system-x86_64 "${qemu_args[@]}"
-		local code=$?
+		if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then
+			qemu-system-x86_64 "${qemu_args[@]}" &
+			local qemu_pid=$!
+			watch_test_timing "$qemu_pid" &
+			local watcher_pid=$!
+			wait "$qemu_pid"
+			local code=$?
+			wait "$watcher_pid" || true
+		else
+			qemu-system-x86_64 "${qemu_args[@]}"
+			local code=$?
+		fi
 		set -e
+		timing_event qemu end
 		[[ "$code" -eq 33 ]] && exit 0
 		exit "$code"
 	fi
