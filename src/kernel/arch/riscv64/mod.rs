@@ -122,6 +122,13 @@ fn sbi_system_reset(reset_type: u32, reset_reason: u32) {
 	}
 }
 
+// Name the boot profile the host selected, or `None` for an ordinary boot. The
+// persistent development instance is x86_64-only, so this backend never reports one;
+// the cold test configuration is what drives this architecture.
+pub fn boot_profile() -> Option<&'static str> {
+	None
+}
+
 // Write the CPU's model name into `out`, returning the byte count. The mvendorid /
 // marchid / mimpid identity registers are M-mode CSRs, unreadable from S-mode, so
 // query them through the SBI Base extension (EID 0x10, FIDs 4/5/6). QEMU's generic

@@ -10,6 +10,8 @@
 #   DEBUG=1   QEMU waits for GDB (-s -S) on port :1234
 #   NOKVM=1   disable KVM (more reliable single-stepping under TCG)
 #   TEST=1    test mode (isa-debug-exit or semihosting, maps exit code to pass/fail)
+#   DEV_PROFILE=1 persistent development instance (x86_64 interactive only); names the
+#             profile over fw_cfg so the guest reports it. Owned by `just dev-up`.
 #   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log or stdio)
 #   SMP=N     override core/hart count (default: nproc, with arch-specific caps)
 #   MEM=      override RAM (default varies by arch)
@@ -318,6 +320,20 @@ else
 	exit 1
 fi
 
+# Reject an unsupported development profile before any image work: the profile changes
+# which host workflow owns the instance, so a request it cannot honour must fail loudly
+# rather than boot an ordinary guest that merely looks like a development one.
+if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
+	if [[ "$TARGET_ARCH" != "x86_64" ]]; then
+		echo "qemu-run: DEV_PROFILE is x86_64-only (requested $TARGET_ARCH)" >&2
+		exit 1
+	fi
+	if [[ "${TEST:-0}" == "1" ]]; then
+		echo "qemu-run: DEV_PROFILE and TEST are mutually exclusive" >&2
+		exit 1
+	fi
+fi
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 QEMU_BOOT_DIR="$HERE"
@@ -489,6 +505,14 @@ qemu_run_x86_64() {
 	# USB passthrough: real USB device (interactive only).
 	if [[ -n "${USB_HOST:-}" ]]; then
 		qemu_args+=(-device "usb-host,bus=usb.0,vendorid=0x${USB_HOST%%:*},productid=0x${USB_HOST##*:}")
+	fi
+
+	# Development profile: name it over fw_cfg, which the guest reads at boot and prints.
+	# This sits below the test early-exit above, so test mode cannot reach it by
+	# construction, and it adds no device and rewrites no image, so the profile changes
+	# nothing a normal or production boot is built from.
+	if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
+		qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
 	fi
 
 	# Interactive control sockets used by screenshot.sh and lab.py.

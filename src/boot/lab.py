@@ -26,8 +26,16 @@
 #   boot/lab.py shot <path>          screenshot the framebuffer (screenshot.sh)
 #   boot/lab.py quit                 shut the instance down and clean up
 #
+# A second family keeps one guest alive across commands instead of booting per command:
+#   boot/lab.py dev-up [--fresh...]  boot once and keep the instance (takes the lock)
+#   boot/lab.py dev-status           report the instance state deterministically
+#   boot/lab.py dev-log [-f|<pat>]   show / follow / grep its serial log
+#   boot/lab.py dev-down             stop it gracefully and release the lock
+#
 # `sh` joins its arguments, so quoting is optional: `just lab sh time ls`.
 
+import fcntl
+import json
 import os
 import re
 import select
@@ -53,7 +61,13 @@ Usage (via `just lab ...` from src/, or boot/lab.py directly):
   pcap <on|off|dump>    capture guest network traffic and decode it
   test                  run the kernel test suite, summarize
   shot <path>           screenshot the framebuffer
-  quit                  shut the instance down and clean up"""
+  quit                  shut the instance down and clean up
+
+Persistent development instance (one owner at a time):
+  dev-up [--vnc] [--spice] [--timeout N]   boot once and keep it running
+  dev-status            report the instance state (exit 0 only when ready)
+  dev-log [-f | <pat>]  show / follow / grep its serial log
+  dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.dirname(HERE)
@@ -67,6 +81,15 @@ MON_SOCK = os.path.join(BUILD, 'qemu-monitor.sock')
 PCAP = os.path.join(BUILD, 'lab.pcap')
 VOLUME_IMG = os.path.join(BUILD, 'virtio-blk.img')
 USB_IMG = os.path.join(BUILD, 'usb-media.img')
+
+# The persistent development instance keeps its own serial socket, control socket and log
+# so an ad-hoc `lab boot` debugging session never steals its console. The monitor and QMP
+# sockets above stay shared, keeping their existing owners.
+DEV_LOCK = os.path.join(BUILD, 'dev-instance.lock')
+DEV_SERIAL_SOCK = os.path.join(BUILD, 'dev-serial.sock')
+DEV_CTL_SOCK = os.path.join(BUILD, 'dev-ctl.sock')
+DEV_SERIAL_LOG = os.path.join(BUILD, 'dev-serial.log')
+DEV_QEMU_LOG = os.path.join(BUILD, 'dev-qemu.log')
 
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
@@ -92,13 +115,13 @@ def die(message):
 # and collects output until the prompt returns, "WAIT <timeout>" just waits for
 # the prompt. It exits when the serial socket closes (QEMU is gone).
 
-def broker(serial):
-	if os.path.exists(CTL_SOCK):
-		os.unlink(CTL_SOCK)
+def broker(serial, ctl_path=CTL_SOCK, log_path=SERIAL_LOG):
+	if os.path.exists(ctl_path):
+		os.unlink(ctl_path)
 	ctl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-	ctl.bind(CTL_SOCK)
+	ctl.bind(ctl_path)
 	ctl.listen(1)
-	log = open(SERIAL_LOG, 'ab', buffering=0)
+	log = open(log_path, 'ab', buffering=0)
 	serial.setblocking(False)
 	while True:
 		ready, _, _ = select.select([serial, ctl], [], [], 0.5)
@@ -110,15 +133,25 @@ def broker(serial):
 		if ctl in ready:
 			conn, _ = ctl.accept()
 			try:
-				if not serve_request(serial, conn, log):
+				if not serve_request(serial, conn, log, log_path):
 					break
 			finally:
 				conn.close()
 	log.close()
-	os.unlink(CTL_SOCK)
+	os.unlink(ctl_path)
 
 
-def serve_request(serial, conn, log):
+def serial_tail(log_path, size=256):
+	try:
+		with open(log_path, 'rb') as handle:
+			handle.seek(0, os.SEEK_END)
+			handle.seek(max(0, handle.tell() - size))
+			return handle.read()
+	except OSError:
+		return b''
+
+
+def serve_request(serial, conn, log, log_path=SERIAL_LOG):
 	conn.settimeout(5)
 	try:
 		request = conn.makefile('rb').readline().decode(errors='replace').rstrip('\n')
@@ -127,6 +160,7 @@ def serve_request(serial, conn, log):
 	parts = request.split(' ', 2)
 	if not parts:
 		return True
+	collected = b''
 	if parts[0] == 'RUN' and len(parts) == 3:
 		timeout, command = float(parts[1]), parts[2]
 		serial.sendall(command.encode() + b'\n')
@@ -135,11 +169,14 @@ def serve_request(serial, conn, log):
 		serial.sendall(b'\x03')
 	elif parts[0] == 'WAIT' and len(parts) >= 2:
 		timeout = float(parts[1])
+		# A prompt that arrived before this request is still a prompt. Seeding from the
+		# log makes waiting on an already-idle guest return at once; without it the wait
+		# can only see bytes yet to come, and an idle guest sends none.
+		collected = serial_tail(log_path)
 	else:
 		return True
 	# Collect serial output (teeing to the log all the while) until the prompt
 	# returns or the timeout passes; the collected bytes are the reply.
-	collected = b''
 	deadline = time.time() + timeout
 	while time.time() < deadline:
 		ready, _, _ = select.select([serial], [], [], 0.2)
@@ -159,11 +196,22 @@ def serve_request(serial, conn, log):
 	return True
 
 
-def ctl_request(request, timeout):
-	if not os.path.exists(CTL_SOCK):
+# Which instance the ad-hoc commands talk to. An explicit `lab boot` session wins, so
+# debugging one never gets redirected; otherwise they reuse the persistent development
+# instance rather than demanding a boot of their own.
+def active_ctl_sock():
+	if os.path.exists(CTL_SOCK):
+		return CTL_SOCK
+	if os.path.exists(DEV_CTL_SOCK):
+		return DEV_CTL_SOCK
+	return CTL_SOCK
+
+
+def ctl_request(request, timeout, ctl_path=CTL_SOCK):
+	if not os.path.exists(ctl_path):
 		die('no live instance (run `just lab boot` first)')
 	conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-	conn.connect(CTL_SOCK)
+	conn.connect(ctl_path)
 	conn.settimeout(timeout + 10)
 	conn.sendall(request.encode() + b'\n')
 	reply = b''
@@ -177,6 +225,269 @@ def ctl_request(request, timeout):
 		reply += data
 	conn.close()
 	return reply
+
+
+# ---- persistent development instance ---------------------------------------
+# `dev-up` boots one guest and leaves it running so later commands reuse it instead of
+# paying for a boot each time. Exactly one instance may own the profile, because they
+# would otherwise race over one system volume, one monitor socket and one set of build
+# outputs. Ownership is an flock held by the broker for as long as the instance lives,
+# so it is released by the kernel when the broker dies: there is no stale lock to break
+# by hand, and "is it running" is answered by asking the lock rather than by guessing
+# from a socket file that may have outlived its process.
+
+def dev_identity_read():
+	try:
+		with open(DEV_LOCK) as handle:
+			return json.load(handle)
+	except (OSError, ValueError):
+		return {}
+
+
+def dev_identity_write(lock_fd, identity):
+	os.ftruncate(lock_fd, 0)
+	os.lseek(lock_fd, 0, os.SEEK_SET)
+	os.write(lock_fd, json.dumps(identity).encode() + b'\n')
+	os.fsync(lock_fd)
+
+
+# True when no broker holds the instance. The probe takes and immediately drops the lock,
+# which is safe precisely because an owner would have made the attempt fail.
+def dev_lock_free():
+	try:
+		fd = os.open(DEV_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+	except OSError:
+		return True
+	try:
+		fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+		fcntl.flock(fd, fcntl.LOCK_UN)
+		return True
+	except OSError:
+		return False
+	finally:
+		os.close(fd)
+
+
+def dev_ready(timeout=3):
+	if not os.path.exists(DEV_CTL_SOCK):
+		return False
+	try:
+		reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
+	except (SystemExit, OSError):
+		return False
+	return has_prompt(reply[-256:])
+
+
+# One of: down, starting, ready, stale, foreign. Every dev command branches on this, so
+# the same inputs always produce the same verdict and the same exit status.
+def dev_state():
+	identity = dev_identity_read()
+	if dev_lock_free():
+		leftovers = [p for p in (DEV_CTL_SOCK, DEV_SERIAL_SOCK) if os.path.exists(p)]
+		return ('stale' if leftovers else 'down'), identity
+	if identity.get('repo') != REPO:
+		return 'foreign', identity
+	return ('ready' if dev_ready() else 'starting'), identity
+
+
+def dev_describe(identity):
+	repo = identity.get('repo', 'unknown worktree')
+	host = identity.get('host', 'unknown host')
+	pid = identity.get('pgid', '?')
+	return f'{repo} on {host} (process group {pid})'
+
+
+def dev_uptime(identity):
+	started = identity.get('started')
+	return f'{time.time() - started:.1f} s' if started else 'unknown'
+
+
+# Refuse rather than race, and name both the owner and the exact command that frees it.
+def dev_owner_conflict(identity):
+	print(f'lab: development profile is owned by {dev_describe(identity)}', file=sys.stderr)
+	print(f'lab: release it with `just dev-down` in {identity.get("repo", "that worktree")}', file=sys.stderr)
+	sys.exit(1)
+
+
+def cmd_dev_up(args):
+	timeout = arg_value(args, '--timeout', 240)
+	displays = [d for d in ('vnc', 'spice') if f'--{d}' in args]
+	state, identity = dev_state()
+	if state == 'ready':
+		# Idempotent for the owner: booting once and reusing the instance is the point,
+		# so a repeated `dev-up` reports the running guest instead of disturbing it.
+		print(f'lab: development instance already up, ready (up {dev_uptime(identity)})')
+		return
+	if state in ('starting', 'foreign'):
+		dev_owner_conflict(identity)
+	if state == 'stale':
+		die('stale development instance state; run `just dev-down` to clear it')
+
+	lock_fd = os.open(DEV_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+	try:
+		fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except OSError:
+		os.close(lock_fd)
+		dev_owner_conflict(dev_identity_read())
+
+	for path in (DEV_SERIAL_SOCK, DEV_CTL_SOCK):
+		if os.path.exists(path):
+			os.unlink(path)
+	open(DEV_SERIAL_LOG, 'wb').close()
+	started = time.time()
+	# `server` without `nowait`: QEMU blocks until the broker connects, so no boot output
+	# is lost. `start_new_session` gives the instance its own process group, which is what
+	# `dev-down` stops - never a QEMU that this instance does not own.
+	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1')
+	qemu_log = open(DEV_QEMU_LOG, 'wb')
+	guest = subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
+	while True:
+		if time.time() - started > timeout:
+			os.close(lock_fd)
+			die(f'serial socket did not appear within {timeout} s (see {DEV_QEMU_LOG})')
+		# A fresh socket per attempt: a stream socket whose connect failed cannot be
+		# reliably reconnected, so retrying on the same one can fail for good.
+		serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		try:
+			serial.connect(DEV_SERIAL_SOCK)
+			break
+		except OSError:
+			serial.close()
+			if guest.poll() is not None:
+				os.close(lock_fd)
+				die(f'guest exited before the serial socket appeared (see {DEV_QEMU_LOG})')
+			time.sleep(0.5)
+	# The broker inherits the locked descriptor across the fork, so ownership outlives
+	# this command and ends exactly when the broker does.
+	broker_pid = os.fork()
+	if broker_pid == 0:
+		os.setsid()
+		# Drop the inherited standard streams. The broker outlives this command, so
+		# holding its caller's stdout open would keep any pipe or command substitution
+		# around `dev-up` waiting for an end-of-file that only arrives when the whole
+		# instance is stopped.
+		null = os.open(os.devnull, os.O_RDWR)
+		for stream in (0, 1, 2):
+			os.dup2(null, stream)
+		os.close(null)
+		try:
+			broker(serial, DEV_CTL_SOCK, DEV_SERIAL_LOG)
+		finally:
+			os._exit(0)
+	serial.close()
+	dev_identity_write(lock_fd, {
+		'profile': 'development',
+		'repo': REPO,
+		'host': socket.gethostname(),
+		'broker': broker_pid,
+		'pgid': guest.pid,
+		'started': started,
+	})
+	os.close(lock_fd)
+	time.sleep(0.2)
+	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
+	if not has_prompt(reply[-256:]):
+		die(f'no shell prompt within {timeout} s (see {DEV_SERIAL_LOG})')
+	profile = 'development' if b'boot profile: development' in strip_ansi(reply) or dev_profile_logged() else 'not reported'
+	print(f'lab: development instance ready in {time.time() - started:.1f} s (guest profile: {profile})')
+	print(f'lab: serial log {os.path.relpath(DEV_SERIAL_LOG, SRC)}; `just dev-status`, `just dev-down`')
+
+
+def dev_profile_logged():
+	try:
+		with open(DEV_SERIAL_LOG, 'rb') as handle:
+			return b'boot profile: development' in handle.read()
+	except OSError:
+		return False
+
+
+def cmd_dev_status(args):
+	state, identity = dev_state()
+	print(f'lab: development instance {state}')
+	if state == 'down':
+		print('     start it with `just dev-up`')
+		sys.exit(1)
+	if state == 'stale':
+		print('     the broker is gone but its sockets remain')
+		print('     clear it with `just dev-down`')
+		sys.exit(1)
+	print(f'     owner    {dev_describe(identity)}')
+	print(f'     broker   pid {identity.get("broker", "?")}')
+	print(f'     uptime   {dev_uptime(identity)}')
+	print(f'     profile  {"development" if dev_profile_logged() else "not reported by the guest"}')
+	print(f'     serial   {os.path.relpath(DEV_SERIAL_LOG, SRC)}')
+	if state == 'foreign':
+		print('     another worktree owns it; this one cannot use or stop it')
+		sys.exit(1)
+	if state == 'starting':
+		print('     no shell prompt yet; rerun `just dev-status` or watch `just dev-log -f`')
+		sys.exit(1)
+	sys.exit(0)
+
+
+def cmd_dev_log(args):
+	if not os.path.exists(DEV_SERIAL_LOG):
+		die('no development serial log yet (run `just dev-up` first)')
+	if '-f' in args:
+		os.execvp('tail', ['tail', '-f', DEV_SERIAL_LOG])
+	if args:
+		os.execvp('grep', ['grep', '-a', '--color=auto', ' '.join(args), DEV_SERIAL_LOG])
+	os.execvp('tail', ['tail', '-40', DEV_SERIAL_LOG])
+
+
+def dev_group_alive(pgid):
+	if not pgid:
+		return False
+	try:
+		os.killpg(pgid, 0)
+		return True
+	except OSError:
+		return False
+
+
+def dev_stopped(pgid):
+	return dev_lock_free() and not dev_group_alive(pgid)
+
+
+def cmd_dev_down(args):
+	timeout = arg_value(args, '--timeout', 30)
+	state, identity = dev_state()
+	if state == 'foreign':
+		dev_owner_conflict(identity)
+	if state == 'down':
+		print('lab: no development instance')
+		return
+	# Ask the guest to stop through the monitor first; the recorded process group is the
+	# fallback, so a wedged QEMU still goes away without touching an instance this one
+	# does not own. A stale instance takes the same path on purpose: its broker is gone,
+	# which says nothing about whether its guest is still running.
+	pgid = identity.get('pgid')
+	if os.path.exists(MON_SOCK):
+		try:
+			monitor_command('quit')
+		except (SystemExit, OSError):
+			pass
+	deadline = time.time() + timeout
+	while time.time() < deadline and not dev_stopped(pgid):
+		time.sleep(0.2)
+	if not dev_stopped(pgid) and pgid:
+		try:
+			os.killpg(pgid, signal.SIGKILL)
+		except OSError:
+			pass
+		deadline = time.time() + 5
+		while time.time() < deadline and not dev_stopped(pgid):
+			time.sleep(0.2)
+	# Settle the verdict before unlinking: probing the lock recreates its file, which
+	# would leave an empty one behind and make a stopped instance look half-cleaned.
+	stopped = dev_stopped(pgid)
+	for path in (DEV_SERIAL_SOCK, DEV_CTL_SOCK, DEV_LOCK):
+		if os.path.exists(path):
+			os.unlink(path)
+	if stopped:
+		print('lab: development instance down')
+	else:
+		die(f'development instance did not stop; inspect it with `ps -g {pgid}`')
 
 
 # ---- subcommands -----------------------------------------------------------
@@ -229,7 +540,7 @@ def cmd_sh(args):
 	command = ' '.join(rest)
 	if not command:
 		die('usage: lab sh <command...>')
-	reply = ctl_request(f'RUN {timeout} {command}', timeout)
+	reply = ctl_request(f'RUN {timeout} {command}', timeout, active_ctl_sock())
 	text = strip_ansi(reply).decode(errors='replace').replace('\r\n', '\n')
 	lines = text.split('\n')
 	# Drop the echoed command line and the trailing prompt; the rest is the output.
@@ -242,7 +553,7 @@ def cmd_sh(args):
 
 def cmd_wait(args):
 	timeout = arg_value(args, '--timeout', 60)
-	reply = ctl_request(f'WAIT {timeout}', timeout)
+	reply = ctl_request(f'WAIT {timeout}', timeout, active_ctl_sock())
 	sys.exit(0 if has_prompt(reply[-256:]) else 1)
 
 
@@ -250,7 +561,7 @@ def cmd_wait(args):
 # console's line discipline turns it into SIG_INT), then wait for the prompt.
 def cmd_int(args):
 	timeout = arg_value(args, '--timeout', 15)
-	reply = ctl_request(f'INT {timeout}', timeout)
+	reply = ctl_request(f'INT {timeout}', timeout, active_ctl_sock())
 	sys.exit(0 if has_prompt(reply[-256:]) else 1)
 
 
@@ -464,7 +775,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-log': cmd_dev_log, 'dev-down': cmd_dev_down}
 
 
 def main():

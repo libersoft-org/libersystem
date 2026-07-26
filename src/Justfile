@@ -535,6 +535,25 @@ screenshot path: build
 lab *args:
     boot/lab.py {{ args }}
 
+# boot one development guest and keep it alive so later commands reuse it instead of
+# paying for a boot each time. One instance owns the profile at a time; a second caller
+# is told who holds it and how to release it. e.g. `just dev-up`, `just dev-up --vnc`
+dev-up *args:
+    boot/lab.py dev-up {{ args }}
+
+# report the development instance state: down, starting, ready, stale or foreign.
+# Exits 0 only when it is ready, so scripts can gate on it.
+dev-status:
+    @boot/lab.py dev-status
+
+# show, follow or grep the development instance serial log. e.g. `just dev-log -f`
+dev-log *args:
+    @boot/lab.py dev-log {{ args }}
+
+# stop the development instance gracefully and release its lock
+dev-down *args:
+    @boot/lab.py dev-down {{ args }}
+
 # build a bootable hybrid ISO (BIOS + UEFI) -> .build/boot/<product>.iso; STRIP=debug|all
 iso strip="debug": build
     STRIP={{ strip }} boot/mkimage.sh iso {{ kernel_elf }}

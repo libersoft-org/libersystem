@@ -100,6 +100,13 @@ pub fn poweroff() -> ! {
 	halt_loop()
 }
 
+// Name the boot profile the host selected, or `None` for an ordinary boot. The
+// persistent development instance is x86_64-only, so this backend never reports one;
+// the cold test configuration is what drives this architecture.
+pub fn boot_profile() -> Option<&'static str> {
+	None
+}
+
 // Write the CPU's model name into `out`, returning the byte count. aarch64 exposes
 // no brand string; decode MIDR_EL1's implementer + part number to a name (a small
 // table of the parts we run on), falling back to the raw ids. Feeds `lscpu`.

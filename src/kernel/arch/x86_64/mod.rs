@@ -1,6 +1,7 @@
 pub mod apboot;
 pub mod apic;
 pub mod context;
+mod fwcfg;
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
@@ -152,6 +153,19 @@ pub fn poweroff() -> ! {
 		outw(0x600, 0x2000);
 	}
 	halt_loop()
+}
+
+// Name the boot profile the host selected, or `None` for an ordinary boot. The profile
+// is advisory: it only tells the guest which host-side workflow started it, so an
+// unrecognised name reads as no profile rather than as a boot failure. `development`
+// is the only name defined, and only the persistent development instance passes it.
+pub fn boot_profile() -> Option<&'static str> {
+	let mut name = [0u8; 32];
+	let len = fwcfg::read_file(b"opt/org.libersystem/profile", &mut name)?;
+	match &name[..len] {
+		b"development" => Some("development"),
+		_ => None,
+	}
 }
 
 // Write the CPU's model / brand string into `out`, returning the byte count. The

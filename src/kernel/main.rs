@@ -110,6 +110,11 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	assert!(bi.magic == bootproto::MAGIC, "boot protocol magic mismatch: the loader and kernel disagree");
 	assert!(bi.version == bootproto::VERSION, "boot protocol version mismatch: rebuild the loader and kernel together");
 	serial_println!("{} kernel is starting ...", product::NAME);
+	// An ordinary boot prints nothing here, so a development instance is never mistaken
+	// for one and no production boot carries the line.
+	if let Some(profile) = arch::boot_profile() {
+		serial_println!("{} boot profile: {}", product::NAME, profile);
+	}
 	arch::init();
 	init_memory();
 	init_framebuffer();
