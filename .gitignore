@@ -38,6 +38,7 @@ target/
 *~
 *.bak
 *.tmp
+/AI/
 
 # OS
 .DS_Store
