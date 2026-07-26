@@ -44,3 +44,5 @@ target/
 .DS_Store
 Thumbs.db
 desktop.ini
+# hunkwise
+.vscode/hunkwise/
