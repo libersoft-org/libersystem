@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+explain=0
+if [[ "${1:-}" == "--explain" ]]; then
+	explain=1
+	shift
+fi
+
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-	echo "usage: dev-build.sh <artifact> [x86_64|aarch64|riscv64]" >&2
+	echo "usage: dev-build.sh [--explain] <artifact> [x86_64|aarch64|riscv64]" >&2
 	exit 2
 fi
 
@@ -20,4 +26,6 @@ riscv64 | riscv64gc-unknown-none-elf) target="riscv64gc-unknown-none-elf" ;;
 	;;
 esac
 
-"$root/tools/build-shared.sh" --artifact "$artifact" "$target"
+arguments=(--artifact "$artifact")
+if [[ "$explain" == 1 ]]; then arguments=(--explain "${arguments[@]}"); fi
+"$root/tools/build-shared.sh" "${arguments[@]}" "$target"

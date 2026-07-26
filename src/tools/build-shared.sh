@@ -6,12 +6,17 @@ if [[ "${1:-}" == "--verbose" ]]; then
 	verbose=1
 	shift
 fi
+explain=0
+if [[ "${1:-}" == "--explain" ]]; then
+	explain=1
+	shift
+fi
 selected_artifact=""
 selected_kind=""
 if [[ "${1:-}" == "--artifact" ]]; then
 	selected_artifact="${2:-}"
 	if [[ -z "$selected_artifact" ]]; then
-		echo "usage: $0 [--verbose] [--artifact <artifact>] <target> <crate>..." >&2
+		echo "usage: $0 [--verbose] [--explain] [--artifact <artifact>] <target> <crate>..." >&2
 		exit 2
 	fi
 	shift 2
@@ -27,7 +32,7 @@ if [[ "${1:-}" == "--artifact" ]]; then
 	esac
 fi
 if [[ -z "$selected_artifact" && $# -lt 2 ]] || [[ -n "$selected_artifact" && $# -lt 1 ]]; then
-	echo "usage: $0 [--verbose] [--artifact <artifact>] <target> <crate>..." >&2
+	echo "usage: $0 [--verbose] [--explain] [--artifact <artifact>] <target> <crate>..." >&2
 	exit 2
 fi
 if [[ "$verbose" != 0 && "$verbose" != 1 ]]; then
@@ -155,6 +160,8 @@ warm_snapshot_file=""
 warm_snapshot_hit=0
 targeted_state_file=""
 targeted_state_hit=0
+targeted_state_reason=""
+object_inputs=""
 
 check_dynamic_report_inventory() {
 	local report_started=$SECONDS
@@ -172,7 +179,10 @@ check_dynamic_report_inventory() {
 report_build_summary() {
 	local status=$?
 	find "$artifact_output_root" -type f -name "*.$$.expected" -delete 2>/dev/null || true
+	find "$artifact_output_root" -type f -name "*.$$.candidate" -delete 2>/dev/null || true
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.tmp.$$" -delete 2>/dev/null || true
+	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.$$.expected" -delete 2>/dev/null || true
+	if [[ -n "$object_inputs" ]]; then rm -f "$object_inputs"; fi
 	rm -f "$build_root/image-warm-$target.state.inputs.current.$$" "$build_root/image-warm-$target.state.inputs.tmp.$$" "$build_root/image-warm-$target.state.tmp.$$"
 	rm -f "$build_root/package-dirs.$$.tmp"
 	if [[ $status == 0 && $targeted_state_hit == 0 && -n "$targeted_state_file" ]] && declare -F write_targeted_state >/dev/null; then
@@ -243,30 +253,31 @@ command -v sha256sum >/dev/null
 command -v stat >/dev/null
 command -v xxd >/dev/null
 
-targeted_plan_fingerprint() {
+targeted_plan_record() {
 	local library_names program_names
 	library_names="$(printf '%s\n' "${selected_specs[@]}" | sed 's/=.*//')"
 	program_names="$(printf '%s\n' "${selected_programs[@]}")"
-	{
-		printf 'format=liber-targeted-plan-v1\n'
-		printf 'target=%s\n' "$target"
-		printf 'artifact=%s\n' "$selected_artifact"
-		printf 'kind=%s\n' "$selected_kind"
-		printf 'rustflags=%s\n' "$rustflags"
-		printf 'cargo-target=%s\n' "$cargo_target"
-		printf 'spec=%s\n' "${requested_arguments[@]}"
-		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
-			printf 'env-%s=%s\n' "$variable" "${!variable-}"
-		done
-		jq -c --arg libraries "$library_names" --arg programs "$program_names" '
-			($libraries | split("\n") | map(select(. != ""))) as $library_names |
-			($programs | split("\n") | map(select(. != ""))) as $program_names |
-			{
-				libraries: [.libraries[] | select(.name as $name | $library_names | index($name))],
-				programs: [.programs[] | select(.name as $name | $program_names | index($name))]
-			}
-		' <<<"$manifest_json"
-	} | sha256sum | awk '{print $1}'
+	printf 'target\t%s\n' "$target"
+	printf 'artifact\t%s\n' "$selected_artifact"
+	printf 'kind\t%s\n' "$selected_kind"
+	printf 'rustflags\t%s\n' "$rustflags"
+	printf 'cargo-target\t%s\n' "$cargo_target"
+	printf 'spec\t%s\n' "${requested_arguments[*]}"
+	printf 'tool:rust-lld\t%s\n' "$lld"
+	for tool in cargo rustc llvm-ar llvm-objcopy llvm-readelf llvm-strip; do
+		printf 'tool:%s\t%s\n' "$tool" "$(command -v "$tool")"
+	done
+	for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
+		printf 'environment:%s\t%s\n' "$variable" "${!variable-}"
+	done
+	jq -r --arg libraries "$library_names" --arg programs "$program_names" '
+		($libraries | split("\n") | map(select(. != ""))) as $library_names |
+		($programs | split("\n") | map(select(. != ""))) as $program_names |
+		(.libraries[] | select(.name as $name | $library_names | index($name)) |
+			["manifest-library:" + .name, (tojson)] | @tsv),
+		(.programs[] | select(.name as $name | $program_names | index($name)) |
+			["manifest-program:" + .name, (tojson)] | @tsv)
+	' <<<"$manifest_json"
 }
 
 targeted_state_stat() {
@@ -275,17 +286,52 @@ targeted_state_stat() {
 }
 
 targeted_state_valid() {
-	local expected_plan expected current
+	local index key expected current path
+	local -a expected_plan=() current_plan=() expected_entries=() current_entries=()
 	local -a paths=()
-	[[ -f "$targeted_state_file" ]] || return 1
-	[[ "$(sed -n '1p' "$targeted_state_file")" == "format=liber-targeted-state-v1" ]] || return 1
-	expected_plan="$(sed -n 's/^plan=//p' "$targeted_state_file")"
-	[[ -n "$expected_plan" && "$expected_plan" == "$(targeted_plan_fingerprint)" ]] || return 1
+	targeted_state_reason=""
+	if [[ ! -f "$targeted_state_file" ]]; then
+		targeted_state_reason="state missing"
+		return 1
+	fi
+	if [[ "$(sed -n '1p' "$targeted_state_file")" != "format=liber-targeted-state-v2" ]]; then
+		targeted_state_reason="state format changed"
+		return 1
+	fi
+	mapfile -t expected_plan < <(sed -n 's/^plan-entry\t//p' "$targeted_state_file")
+	mapfile -t current_plan < <(targeted_plan_record)
+	for ((index = 0; index < ${#expected_plan[@]} || index < ${#current_plan[@]}; index += 1)); do
+		if [[ "${expected_plan[$index]:-}" != "${current_plan[$index]:-}" ]]; then
+			key="${current_plan[$index]%%$'\t'*}"
+			if [[ -z "$key" ]]; then key="${expected_plan[$index]%%$'\t'*}"; fi
+			targeted_state_reason="plan edge changed: $key"
+			return 1
+		fi
+	done
 	mapfile -t paths < <(sed -n 's/^entry\t\([^\t]*\)\t.*$/\1/p' "$targeted_state_file")
-	((${#paths[@]} != 0)) || return 1
-	expected="$(sed -n '/^entry\t/p' "$targeted_state_file")"
-	current="$(stat -Lc $'entry\t%n\t%F\t%s\t%i\t%y\t%z' "${paths[@]}")" || return 1
-	[[ "$current" == "$expected" ]]
+	if ((${#paths[@]} == 0)); then
+		targeted_state_reason="state has no input edges"
+		return 1
+	fi
+	mapfile -t expected_entries < <(sed -n '/^entry\t/p' "$targeted_state_file")
+	if ! mapfile -t current_entries < <(stat -Lc $'entry\t%n\t%F\t%s\t%i\t%y\t%z' "${paths[@]}" 2>/dev/null); then
+		for path in "${paths[@]}"; do
+			if [[ ! -e "$path" ]]; then
+				targeted_state_reason="input missing: $path"
+				return 1
+			fi
+		done
+		targeted_state_reason="input stat failed"
+		return 1
+	fi
+	for ((index = 0; index < ${#expected_entries[@]}; index += 1)); do
+		if [[ "${expected_entries[$index]}" != "${current_entries[$index]:-}" ]]; then
+			IFS=$'\t' read -r _ path _ <<<"${expected_entries[$index]}"
+			targeted_state_reason="input changed: $path"
+			return 1
+		fi
+	done
+	return 0
 }
 
 targeted_state_paths() {
@@ -307,7 +353,7 @@ targeted_state_paths() {
 				source_dir="$root/$(source_path "${owner%-provider}")"
 				find "$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
 			fi
-			library_file "$artifact"
+			printf '%s\n' "$(library_file "$artifact")"
 			find "$artifact_cache_dir" -maxdepth 1 -type f -name "library-$artifact.*" -print
 		done
 		for program in "${selected_programs[@]}"; do
@@ -321,12 +367,12 @@ targeted_state_paths() {
 					find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
 				done <"$source_metadata_dir/$package.dirs"
 			fi
-			program_file "$program"
+			printf '%s\n' "$(program_file "$program")"
 			find "$artifact_cache_dir" -maxdepth 1 -type f \( -name "executable-$program.*" -o -name "object-$program-*" \) -print
 		done
 		printf '%s\n' "$build_root/exe-start-$target.o" "$build_root/exe-start-$target.o.build-key"
 		if [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; then
-			program_file dyn_probe
+			printf '%s\n' "$(program_file dyn_probe)"
 			find "$artifact_cache_dir" -maxdepth 1 -type f -name 'executable-dyn_probe.*' -print
 		fi
 	} | while read -r path; do
@@ -338,8 +384,8 @@ write_targeted_state() {
 	local path temporary
 	temporary="$targeted_state_file.tmp.$$"
 	{
-		printf 'format=liber-targeted-state-v1\n'
-		printf 'plan=%s\n' "$(targeted_plan_fingerprint)"
+		printf 'format=liber-targeted-state-v2\n'
+		targeted_plan_record | sed 's/^/plan-entry\t/'
 		while read -r path; do targeted_state_stat "$path"; done < <(targeted_state_paths)
 	} >"$temporary"
 	mv "$temporary" "$targeted_state_file"
@@ -355,9 +401,11 @@ if [[ -n "$selected_artifact" ]]; then
 		fi
 		targeted_state_hit=1
 		verbose_log "build-shared: targeted state hit $selected_kind $selected_artifact"
+		if [[ "$explain" == 1 ]]; then echo "dev-build: explain decision=hit edge=none reason=unchanged"; fi
 		exit 0
 	fi
 	verbose_log "build-shared: targeted state miss $selected_kind $selected_artifact"
+	if [[ "$explain" == 1 ]]; then echo "dev-build: explain decision=miss reason=$targeted_state_reason"; fi
 fi
 
 prune_stale_program_outputs() {
@@ -756,19 +804,17 @@ emit_identity() {
 	rm -f "$note"
 }
 
-artifact_cache_key() {
+artifact_cache_record() {
 	local kind="$1"
 	local manifest_row="$2"
 	local identity="$3"
 	local extra="$4"
-	{
-		printf 'format=liber-image-artifact-cache-v1\n'
-		printf 'build-tools=%s\n' "$build_tool_digest"
-		printf 'kind=%s\n' "$kind"
-		printf 'manifest=%s\n' "$manifest_row"
-		printf 'extra=%s\n' "$extra"
-		cat "$identity"
-	} | sha256sum | awk '{print $1}'
+	printf 'format=liber-image-artifact-inputs-v1\n'
+	printf 'build-tools=%s\n' "$build_tool_digest"
+	printf 'kind=%s\n' "$kind"
+	printf 'manifest=%s\n' "$manifest_row"
+	printf 'extra=%s\n' "$extra"
+	cat "$identity"
 }
 
 artifact_audit_cache_valid() {
@@ -842,33 +888,33 @@ record_artifact_cache() {
 	local out="$1"
 	local cache_prefix="$2"
 	local key="$3"
+	local inputs="$4"
 	mkdir -p "$artifact_cache_dir"
 	printf '%s\n' "$key" >"$cache_prefix.build-key.tmp"
 	build_file_hashes[$out]="$(sha256sum "$out" | awk '{print $1}')"
 	printf '%s\n' "${build_file_hashes[$out]}" >"$cache_prefix.sha256.tmp"
 	mv "$cache_prefix.build-key.tmp" "$cache_prefix.build-key"
 	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
+	mv "$inputs" "$cache_prefix.inputs"
 	rm -f "$cache_prefix.audit-key" "$cache_prefix.audit"
 }
 
-object_cache_key() {
+object_cache_record() {
 	local consumer="$1"
 	local package="$2"
 	local source_sha="$3"
 	local providers="$4"
 	local provider
-	{
-		printf 'format=liber-image-object-cache-v1\n'
-		printf 'compile-tool=%s\n' "$object_tool_digest"
-		printf 'cargo-config=%s\n' "$image_target_config_value"
-		printf 'consumer=%s\n' "$consumer"
-		printf 'package=%s\n' "$package"
-		printf 'source=%s\n' "$source_sha"
-		printf 'features=shared-image\n'
-		for provider in $providers; do
-			printf 'provider-api=%s:%s\n' "$provider" "${provider_compile_digests[$provider]}"
-		done
-	} | sha256sum | awk '{print $1}'
+	printf 'format=liber-image-object-inputs-v1\n'
+	printf 'compile-tool=%s\n' "$object_tool_digest"
+	printf 'cargo-config=%s\n' "$image_target_config_value"
+	printf 'consumer=%s\n' "$consumer"
+	printf 'package=%s\n' "$package"
+	printf 'source=%s\n' "$source_sha"
+	printf 'features=shared-image\n'
+	for provider in $providers; do
+		printf 'provider-api=%s:%s\n' "$provider" "${provider_compile_digests[$provider]}"
+	done
 }
 
 object_cache_valid() {
@@ -889,11 +935,13 @@ record_object_cache() {
 	local object="$1"
 	local cache_prefix="$2"
 	local key="$3"
+	local inputs="$4"
 	printf '%s\n' "$key" >"$cache_prefix.build-key.tmp"
 	build_file_hashes[$object]="$(sha256sum "$object" | awk '{print $1}')"
 	printf '%s\n' "${build_file_hashes[$object]}" >"$cache_prefix.sha256.tmp"
 	mv "$cache_prefix.build-key.tmp" "$cache_prefix.build-key"
 	mv "$cache_prefix.sha256.tmp" "$cache_prefix.sha256"
+	mv "$inputs" "$cache_prefix.inputs"
 }
 
 object_reference_valid() {
@@ -1364,13 +1412,15 @@ for spec in "$@"; do
 	provider_expected_identity="$(mktemp "$build_root/identity-record.XXXXXX")"
 	write_identity_record library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$provider_expected_identity"
 	provider_expected_needed="$(for provider in $row_providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
-	provider_cache_key="$(artifact_cache_key library "$row" "$provider_expected_identity" "cargo=${image_target_config_value:-standalone} rlib=$(sha256sum "$rlib" | awk '{print $1}')")"
 	provider_cache_prefix="$artifact_cache_dir/library-$artifact"
+	provider_cache_inputs="$provider_cache_prefix.inputs.$$.expected"
+	artifact_cache_record library "$row" "$provider_expected_identity" "cargo=${image_target_config_value:-standalone} rlib=$(sha256sum "$rlib" | awk '{print $1}')" >"$provider_cache_inputs"
+	provider_cache_key="$(sha256sum "$provider_cache_inputs" | awk '{print $1}')"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_expected_identity" "$provider_expected_needed"; then
 		verbose_log "build-shared: provider cache hit $artifact"
 		((provider_cache_hits += 1))
 		provider_identity_digests[$artifact]="$(build_file_digest "$provider_expected_identity")"
-		rm -f "$provider_expected_identity"
+		rm -f "$provider_expected_identity" "$provider_cache_inputs"
 		artifacts+=("$artifact")
 		artifact_available[$artifact]=1
 		continue
@@ -1500,6 +1550,9 @@ for spec in "$@"; do
 		exit 1
 	fi
 	link_deps+=(--no-allow-shlib-undefined)
+	published_out="$out"
+	out="$published_out.$$.candidate"
+	rm -f "$out"
 	"$lld" -flavor gnu -m "$emulation" -shared --hash-style=sysv "${symbolic_flags[@]}" --gc-sections "${export_flags[@]}" "${link_inputs[@]}" "${link_deps[@]}" -soname "$artifact.lslib" -o "$out"
 	llvm-strip --strip-debug "$out"
 	actual_needed="$(llvm-readelf -d "$out" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort -u)"
@@ -1595,8 +1648,10 @@ for spec in "$@"; do
 		exit 1
 	fi
 	emit_identity "$out" "$provider_expected_identity"
+	mv "$out" "$published_out"
+	out="$published_out"
 	provider_identity_digests[$artifact]="$(build_file_digest "$provider_expected_identity")"
-	record_artifact_cache "$out" "$provider_cache_prefix" "$provider_cache_key"
+	record_artifact_cache "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_cache_inputs"
 	rm -f "$provider_expected_identity"
 	echo "build-shared: $out ($(stat -c %s "$out") bytes)"
 	artifacts+=("$artifact")
@@ -1656,9 +1711,13 @@ if [[ -n "$image_graph" ]]; then
 		consumer_expected_identity="$(mktemp "$build_root/identity-record.XXXXXX")"
 		write_identity_record executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$consumer_expected_identity"
 		consumer_expected_needed="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
-		consumer_cache_key="$(artifact_cache_key executable "$kind $consumer $crate $stage $destination $providers" "$consumer_expected_identity" "cargo=$image_target_config_value start=$(sha256sum "$start_obj" | awk '{print $1}')")"
 		consumer_cache_prefix="$artifact_cache_dir/executable-$consumer"
-		object_key="$(object_cache_key "$consumer" "$crate" "$consumer_source_sha" "$providers")"
+		consumer_cache_inputs="$consumer_cache_prefix.inputs.$$.expected"
+		artifact_cache_record executable "$kind $consumer $crate $stage $destination $providers" "$consumer_expected_identity" "cargo=$image_target_config_value start=$(sha256sum "$start_obj" | awk '{print $1}')" >"$consumer_cache_inputs"
+		consumer_cache_key="$(sha256sum "$consumer_cache_inputs" | awk '{print $1}')"
+		object_inputs="$(mktemp "$build_root/object-inputs.XXXXXX")"
+		object_cache_record "$consumer" "$crate" "$consumer_source_sha" "$providers" >"$object_inputs"
+		object_key="$(sha256sum "$object_inputs" | awk '{print $1}')"
 		object_cache_prefix="$artifact_cache_dir/object-$consumer-$object_key"
 		consumer_obj="$object_cache_prefix.o"
 		object_reference="$consumer_cache_prefix.object"
@@ -1673,7 +1732,7 @@ if [[ -n "$image_graph" ]]; then
 			fi
 			verbose_log "build-shared: executable cache hit $consumer"
 			((executable_cache_hits += 1))
-			rm -f "$consumer_expected_identity"
+			rm -f "$consumer_expected_identity" "$consumer_cache_inputs" "$object_inputs"
 			continue
 		fi
 		verbose_log "build-shared: executable cache miss $consumer"
@@ -1688,7 +1747,8 @@ if [[ -n "$image_graph" ]]; then
 			rm -f "$consumer_obj_tmp"
 			"$root/tools/build-consumer-object.sh" "$consumer_dir" "$image_target" "$rust_min_stack" "$rustflags" "$cargo_target" "$consumer" "$consumer_obj_tmp" "$consumer_errors" "${cargo_target_flags[@]}"
 			mv "$consumer_obj_tmp" "$consumer_obj"
-			record_object_cache "$consumer_obj" "$object_cache_prefix" "$object_key"
+			record_object_cache "$consumer_obj" "$object_cache_prefix" "$object_key" "$object_inputs"
+			object_inputs=""
 		fi
 		record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
 		provider_inputs=()
@@ -1928,6 +1988,9 @@ if [[ -n "$image_graph" ]]; then
 				exit 1
 			fi
 		done
+		published_out="$out"
+		out="$published_out.$$.candidate"
+		rm -f "$out"
 		"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv --gc-sections --build-id=none -e _start "$start_obj" "$consumer_obj" "${provider_inputs[@]}" --no-allow-shlib-undefined -o "$out"
 		if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
 			echo "build-shared: $out is not ET_DYN" >&2
@@ -1954,7 +2017,10 @@ if [[ -n "$image_graph" ]]; then
 		fi
 		llvm-strip --strip-debug "$out"
 		emit_identity "$out" "$consumer_expected_identity"
-		record_artifact_cache "$out" "$consumer_cache_prefix" "$consumer_cache_key"
+		mv "$out" "$published_out"
+		out="$published_out"
+		record_artifact_cache "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_cache_inputs"
+		if [[ -n "$object_inputs" ]]; then rm -f "$object_inputs"; fi
 		rm -f "$consumer_expected_identity"
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"
@@ -1971,12 +2037,14 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	write_identity_record executable dyn_probe dyn_probe "$probe_source_sha" - "pix lsrt" "$probe_expected_identity"
 	probe_expected_needed="$(printf '%s\n' pix.lslib lsrt.lslib | sort -u)"
 	audit_provider_export_ownership "pix lsrt"
-	probe_cache_key="$(artifact_cache_key executable "dynamic dyn_probe dyn_probe volume libexec/dyn_probe.lsexe pix lsrt" "$probe_expected_identity" "cargo=$image_target_config_value")"
 	probe_cache_prefix="$artifact_cache_dir/executable-dyn_probe"
+	probe_cache_inputs="$probe_cache_prefix.inputs.$$.expected"
+	artifact_cache_record executable "dynamic dyn_probe dyn_probe volume libexec/dyn_probe.lsexe pix lsrt" "$probe_expected_identity" "cargo=$image_target_config_value" >"$probe_cache_inputs"
+	probe_cache_key="$(sha256sum "$probe_cache_inputs" | awk '{print $1}')"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$probe_out" "$probe_cache_prefix" "$probe_cache_key" "$probe_expected_identity" "$probe_expected_needed"; then
 		canonical_provider_order "pix lsrt" >/dev/null
 		verbose_log "build-shared: executable cache hit dyn_probe"
-		rm -f "$probe_expected_identity"
+		rm -f "$probe_expected_identity" "$probe_cache_inputs"
 		if [[ -z "$selected_artifact" ]]; then
 			audit_library_destinations
 			audit_program_destinations
@@ -1986,14 +2054,17 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	verbose_log "build-shared: executable cache miss dyn_probe"
 	(cd "$probe" && CARGO_TARGET_DIR="$provider_cargo_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
 	probe_rlib="$(find "$provider_cargo_target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
-	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_out"
-	llvm-strip --strip-debug "$probe_out"
-	if ! llvm-readelf -h "$probe_out" | grep -q 'Type:.*DYN' || ! llvm-readelf -d "$probe_out" | grep -q 'NEEDED.*pix.lslib'; then
-		echo "build-shared: $probe_out is not a pix.lslib-linked ET_DYN" >&2
+	probe_candidate="$probe_out.$$.candidate"
+	rm -f "$probe_candidate"
+	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_candidate"
+	llvm-strip --strip-debug "$probe_candidate"
+	if ! llvm-readelf -h "$probe_candidate" | grep -q 'Type:.*DYN' || ! llvm-readelf -d "$probe_candidate" | grep -q 'NEEDED.*pix.lslib'; then
+		echo "build-shared: $probe_candidate is not a pix.lslib-linked ET_DYN" >&2
 		exit 1
 	fi
-	emit_identity "$probe_out" "$probe_expected_identity"
-	record_artifact_cache "$probe_out" "$probe_cache_prefix" "$probe_cache_key"
+	emit_identity "$probe_candidate" "$probe_expected_identity"
+	mv "$probe_candidate" "$probe_out"
+	record_artifact_cache "$probe_out" "$probe_cache_prefix" "$probe_cache_key" "$probe_cache_inputs"
 	rm -f "$probe_expected_identity"
 	echo "build-shared: $probe_out ($(stat -c %s "$probe_out") bytes)"
 fi
