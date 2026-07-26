@@ -220,6 +220,14 @@ board-specific real-hardware support remains later work.
 - [ ] [M132 - Capability-native pipes and redirection](M0132.md)
 - [ ] [M133 - Future-ready 3D graphics foundation + software-rendered scene](M0133.md)
 
+### Development-loop priority
+
+M134 is the next implementation priority before further application, utility or driver
+work. It removes whole-system rebuild and cold-boot repetition from ordinary leaf-tool
+development while preserving the existing full release gates.
+
+- [ ] [M134 - Incremental development and persistent QEMU test loop](M0134.md)
+
 ### Definition of done (phase 2)
 
 Done when the capability-scoped appliance provides networking, wall-clock time,
