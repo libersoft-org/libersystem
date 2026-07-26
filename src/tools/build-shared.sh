@@ -86,8 +86,47 @@ if [[ -n "$selected_artifact" ]]; then
 		end) as $name |
 		"\($name)=\($root.libraries[$name].owner)"
 	' <<<"$manifest_json" | awk '!seen[$0]++')
+	mapfile -t selected_programs < <(jq -r --arg artifact "$selected_artifact" --arg kind "$selected_kind" '
+		def depends_on($root; $name; $wanted):
+			$name == $wanted or any($root.libraries[$name].providers[]?;
+				depends_on($root; .; $wanted));
+		. as $root | .programs[] |
+		select(.linkage == "dynamic" and .stage == "volume" and .name != "dyn_probe") |
+		select(($kind == "program" and .name == $artifact) or
+			($kind == "library" and any(.providers[]?; depends_on($root; .; $artifact)))) |
+		.name
+	' <<<"$manifest_json" | sort -u)
 	set -- "${selected_specs[@]}"
 fi
+declare -A source_owners=()
+declare -A source_paths=()
+declare -A library_rows=()
+declare -A library_destinations=()
+declare -A program_destinations=()
+declare -A program_owners=()
+while IFS=$'\t' read -r record_kind name owner destination features providers; do
+	case "$record_kind" in
+	source)
+		source_owners[$name]="$owner"
+		source_paths[$owner]="$name"
+		;;
+	library)
+		library_rows[$name]="library"$'\t'"$name"$'\t'"$owner"$'\t'"volume"$'\t'"$destination"$'\t'"$features"$'\t'"$providers"
+		library_destinations[$name]="$destination"
+		;;
+	program)
+		program_owners[$name]="$owner"
+		program_destinations[$name]="$destination"
+		;;
+	esac
+done < <(jq -r '
+	(.sources[] | ["source", .owner, .path, "", "", ""]),
+	(.libraries[] | ["library", .name, .owner, .destination,
+		(if (.features | length) == 0 then "-" else (.features | join(",")) end),
+		(.providers | join(" "))]),
+	(.programs[] | ["program", .name, .owner, .destination, "", ""]) |
+	@tsv
+' <<<"$manifest_json")
 requested_arguments=("$@")
 artifact_output_root="$build_root/system-image/$target"
 provider_output_dir="$artifact_output_root"
@@ -114,6 +153,8 @@ consumer_seconds=0
 report_seconds=0
 warm_snapshot_file=""
 warm_snapshot_hit=0
+targeted_state_file=""
+targeted_state_hit=0
 
 check_dynamic_report_inventory() {
 	local report_started=$SECONDS
@@ -134,6 +175,11 @@ report_build_summary() {
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.tmp.$$" -delete 2>/dev/null || true
 	rm -f "$build_root/image-warm-$target.state.inputs.current.$$" "$build_root/image-warm-$target.state.inputs.tmp.$$" "$build_root/image-warm-$target.state.tmp.$$"
 	rm -f "$build_root/package-dirs.$$.tmp"
+	if [[ $status == 0 && $targeted_state_hit == 0 && -n "$targeted_state_file" ]] && declare -F write_targeted_state >/dev/null; then
+		write_targeted_state || rm -f "$targeted_state_file.tmp.$$"
+	elif [[ $status != 0 && -n "$targeted_state_file" ]]; then
+		rm -f "$targeted_state_file.tmp.$$"
+	fi
 	if [[ -n "$source_inventory_file" ]]; then rm -f "$source_inventory_file"; fi
 	if [[ -n "$source_metadata_dir" ]]; then rm -rf "$source_metadata_dir"; fi
 	if [[ $status == 0 && $warm_snapshot_hit == 0 && -n "$warm_snapshot_file" ]] && declare -F write_warm_snapshot >/dev/null; then
@@ -196,6 +242,123 @@ command -v jq >/dev/null
 command -v sha256sum >/dev/null
 command -v stat >/dev/null
 command -v xxd >/dev/null
+
+targeted_plan_fingerprint() {
+	local library_names program_names
+	library_names="$(printf '%s\n' "${selected_specs[@]}" | sed 's/=.*//')"
+	program_names="$(printf '%s\n' "${selected_programs[@]}")"
+	{
+		printf 'format=liber-targeted-plan-v1\n'
+		printf 'target=%s\n' "$target"
+		printf 'artifact=%s\n' "$selected_artifact"
+		printf 'kind=%s\n' "$selected_kind"
+		printf 'rustflags=%s\n' "$rustflags"
+		printf 'cargo-target=%s\n' "$cargo_target"
+		printf 'spec=%s\n' "${requested_arguments[@]}"
+		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
+			printf 'env-%s=%s\n' "$variable" "${!variable-}"
+		done
+		jq -c --arg libraries "$library_names" --arg programs "$program_names" '
+			($libraries | split("\n") | map(select(. != ""))) as $library_names |
+			($programs | split("\n") | map(select(. != ""))) as $program_names |
+			{
+				libraries: [.libraries[] | select(.name as $name | $library_names | index($name))],
+				programs: [.programs[] | select(.name as $name | $program_names | index($name))]
+			}
+		' <<<"$manifest_json"
+	} | sha256sum | awk '{print $1}'
+}
+
+targeted_state_stat() {
+	local path="$1"
+	stat -Lc $'entry\t%n\t%F\t%s\t%i\t%y\t%z' "$path"
+}
+
+targeted_state_valid() {
+	local expected_plan expected current
+	local -a paths=()
+	[[ -f "$targeted_state_file" ]] || return 1
+	[[ "$(sed -n '1p' "$targeted_state_file")" == "format=liber-targeted-state-v1" ]] || return 1
+	expected_plan="$(sed -n 's/^plan=//p' "$targeted_state_file")"
+	[[ -n "$expected_plan" && "$expected_plan" == "$(targeted_plan_fingerprint)" ]] || return 1
+	mapfile -t paths < <(sed -n 's/^entry\t\([^\t]*\)\t.*$/\1/p' "$targeted_state_file")
+	((${#paths[@]} != 0)) || return 1
+	expected="$(sed -n '/^entry\t/p' "$targeted_state_file")"
+	current="$(stat -Lc $'entry\t%n\t%F\t%s\t%i\t%y\t%z' "${paths[@]}")" || return 1
+	[[ "$current" == "$expected" ]]
+}
+
+targeted_state_paths() {
+	local artifact owner package package_dir source_dir
+	{
+		printf '%s\n' "$root/tools/build-shared.sh" "$root/tools/build-consumer-object.sh"
+		printf '%s\n' "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs"
+		printf '%s\n' "$root/tools/system-manifest.sh" "$root/../product.conf"
+		printf '%s\n' "$root/user/build.rs" "$root/user/user.ld"
+		printf '%s\n' "$root/user/user-aarch64.ld" "$root/user/user-riscv64.ld"
+		printf '%s\n' "$(command -v cargo)" "$(command -v rustc)" "$lld"
+		for tool in llvm-ar llvm-objcopy llvm-readelf llvm-strip; do command -v "$tool"; done
+		for spec in "${selected_specs[@]}"; do
+			artifact="${spec%%=*}"
+			owner="${spec#*=}"
+			source_dir="$root/$(source_path "$owner")"
+			find "$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+			if [[ "$owner" == *-client-provider ]]; then
+				source_dir="$root/$(source_path "${owner%-provider}")"
+				find "$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+			fi
+			library_file "$artifact"
+			find "$artifact_cache_dir" -maxdepth 1 -type f -name "library-$artifact.*" -print
+		done
+		for program in "${selected_programs[@]}"; do
+			package="$(jq -er --arg program "$program" '.programs[$program].owner' <<<"$manifest_json")"
+			if [[ "$package" == tools ]]; then
+				source_dir="$root/$(source_path tools)"
+				printf '%s\n' "$source_dir/Cargo.toml" "$source_dir/Cargo.lock"
+				printf '%s\n' "$source_dir/src/lib.rs" "$source_dir/src/$program.rs"
+			elif [[ -f "$source_metadata_dir/$package.dirs" ]]; then
+				while read -r package_dir; do
+					find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+				done <"$source_metadata_dir/$package.dirs"
+			fi
+			program_file "$program"
+			find "$artifact_cache_dir" -maxdepth 1 -type f \( -name "executable-$program.*" -o -name "object-$program-*" \) -print
+		done
+		printf '%s\n' "$build_root/exe-start-$target.o" "$build_root/exe-start-$target.o.build-key"
+		if [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; then
+			program_file dyn_probe
+			find "$artifact_cache_dir" -maxdepth 1 -type f -name 'executable-dyn_probe.*' -print
+		fi
+	} | while read -r path; do
+		[[ -e "$path" ]] && printf '%s\n' "$path"
+	done | sort -u
+}
+
+write_targeted_state() {
+	local path temporary
+	temporary="$targeted_state_file.tmp.$$"
+	{
+		printf 'format=liber-targeted-state-v1\n'
+		printf 'plan=%s\n' "$(targeted_plan_fingerprint)"
+		while read -r path; do targeted_state_stat "$path"; done < <(targeted_state_paths)
+	} >"$temporary"
+	mv "$temporary" "$targeted_state_file"
+}
+
+if [[ -n "$selected_artifact" ]]; then
+	targeted_state_file="$artifact_cache_dir/targeted-$selected_kind-$selected_artifact.state"
+	if [[ "$force_rebuild" == 0 ]] && targeted_state_valid; then
+		provider_cache_hits="${#selected_specs[@]}"
+		executable_cache_hits="${#selected_programs[@]}"
+		if [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; then
+			((executable_cache_hits += 1))
+		fi
+		targeted_state_hit=1
+		verbose_log "build-shared: targeted state hit $selected_kind $selected_artifact"
+		exit 0
+	fi
+	verbose_log "build-shared: targeted state miss $selected_kind $selected_artifact"
+fi
 
 prune_stale_program_outputs() {
 	local file relative
@@ -299,15 +462,9 @@ fi
 
 source_path() {
 	local owner="$1"
-	jq -er --arg owner "$owner" '.sources[$owner].path' <<<"$manifest_json"
+	[[ -n "${source_owners[$owner]:-}" ]] || return 1
+	printf '%s\n' "${source_owners[$owner]}"
 }
-
-declare -A source_owners=()
-declare -A source_paths=()
-while IFS=$'\t' read -r source_owner source_crate_path; do
-	source_owners[$source_owner]="$source_crate_path"
-	source_paths[$source_crate_path]="$source_owner"
-done < <(jq -r '.sources[] | [.owner, .path] | @tsv' <<<"$manifest_json")
 
 declare -A source_file_hashes=()
 declare -A build_file_hashes=()
@@ -318,16 +475,24 @@ source_roots_file="$source_metadata_dir/roots"
 mkdir -p "$(dirname "$source_inventory_file")"
 mkdir -p "$source_metadata_dir"
 
-while read -r crate; do
+if [[ -n "$selected_artifact" ]]; then
+	printf '%s\n' "${selected_specs[@]}" | sed 's/^[^=]*=//'
+else
+	jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u
+fi | while read -r crate; do
 	crate_dir="$(source_path "$crate")" || {
 		echo "build-shared: library owner $crate has no unique source path" >&2
 		exit 1
 	}
 	printf '%s\n' "$crate_dir" >>"$source_roots_file"
 	if [[ "$crate" == *-client-provider ]]; then printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_roots_file"; fi
-done < <(jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u)
+done
 
-while read -r package; do
+if [[ -n "$selected_artifact" ]]; then
+	for program in "${selected_programs[@]}"; do printf '%s\n' "${program_owners[$program]}"; done | sort -u
+else
+	jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | .owner' <<<"$manifest_json" | sort -u
+fi | while read -r package; do
 	[[ -n "$package" ]] || continue
 	package_dir="$(source_path "$package")" || {
 		echo "build-shared: executable owner $package has no unique source path" >&2
@@ -339,7 +504,7 @@ while read -r package; do
 		jq -r --arg root "$root" '.packages[] | select(.source == null) | .manifest_path | sub("/Cargo.toml$"; "") | sub("^" + $root + "/"; "")' |
 		sort -u >"$package_dirs"
 	cat "$package_dirs" >>"$source_roots_file"
-done < <(jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | .owner' <<<"$manifest_json" | sort -u)
+done
 sort -u -o "$source_roots_file" "$source_roots_file"
 
 while IFS= read -r -d '' record; do
@@ -397,15 +562,13 @@ object_tool_digest="$(sha256sum "$root/tools/build-consumer-object.sh" | awk '{p
 
 library_file() {
 	local artifact="$1"
-	local destination
-	destination="$(jq -er --arg artifact "$artifact" '.libraries[$artifact].destination' <<<"$manifest_json")" || return 1
-	printf '%s/%s' "$provider_output_dir" "$destination"
+	[[ -n "${library_destinations[$artifact]:-}" ]] || return 1
+	printf '%s/%s' "$provider_output_dir" "${library_destinations[$artifact]}"
 }
 
 program_file() {
 	local artifact="$1"
-	local destination
-	destination="$(jq -er --arg artifact "$artifact" '.programs[$artifact].destination' <<<"$manifest_json")" || return 1
+	local destination="${program_destinations[$artifact]:-}"
 	[[ "$destination" == *.lsexe ]] || return 1
 	printf '%s/%s' "$artifact_output_root" "${destination%.lsexe}"
 }
@@ -499,12 +662,18 @@ local_dependency_source_digest() {
 }
 
 source_digest_roots="$source_metadata_dir/digest-roots"
-while read -r crate; do
+if [[ -n "$selected_artifact" ]]; then
+	printf '%s\n' "${selected_specs[@]}" | sed 's/^[^=]*=//'
+else
+	jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u
+fi | while read -r crate; do
 	crate_dir="$(source_path "$crate")"
 	printf '%s\n' "$crate_dir" >>"$source_digest_roots"
 	if [[ "$crate" == *-client-provider ]]; then printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_digest_roots"; fi
-done < <(jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u)
-printf '%s\n' "$(source_path dyn_probe)" >>"$source_digest_roots"
+done
+if [[ -z "$selected_artifact" ]] || { [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; }; then
+	printf '%s\n' "$(source_path dyn_probe)" >>"$source_digest_roots"
+fi
 sort -u -o "$source_digest_roots" "$source_digest_roots"
 while IFS= read -r crate_dir; do
 	crate_source_digests[$crate_dir]="$(compute_source_digest "$crate_dir")"
@@ -758,7 +927,8 @@ record_object_reference() {
 }
 
 manifest_library_row() {
-	jq -er --arg artifact "$1" '.libraries[$artifact] | ["library", .name, .owner, "volume", .destination, (if (.features | length) == 0 then "-" else (.features | join(",")) end), (.providers | join(" "))] | @tsv' <<<"$manifest_json"
+	[[ -n "${library_rows[$1]:-}" ]] || return 1
+	printf '%s\n' "${library_rows[$1]}"
 }
 
 audit_library_destinations() {
@@ -806,17 +976,29 @@ dynamic_rows() {
 
 build_file_hash_inventory() {
 	local artifact file kind consumer crate stage providers record hash
-	while read -r artifact; do
+	if [[ -n "$selected_artifact" ]]; then
+		printf '%s\n' "${selected_specs[@]}" | sed 's/=.*//'
+	else
+		jq -r '.libraries[].name' <<<"$manifest_json"
+	fi | while read -r artifact; do
 		file="$(library_file "$artifact")"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
-	done < <(jq -r '.libraries[].name' <<<"$manifest_json")
+	done
 	while read -r kind consumer crate stage destination providers; do
 		file="$artifact_output_root/${destination%.lsexe}"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	done < <(dynamic_rows)
-	file="$(program_file dyn_probe)"
-	if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
-	find "$artifact_cache_dir" -maxdepth 1 -type f -name 'object-*.o' -print0 2>/dev/null || true
+	if [[ -z "$selected_artifact" ]] || { [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; }; then
+		file="$(program_file dyn_probe)"
+		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
+	fi
+	if [[ -n "$selected_artifact" ]]; then
+		for consumer in "${selected_programs[@]}"; do
+			find "$artifact_cache_dir" -maxdepth 1 -type f -name "object-$consumer-*.o" -print0 2>/dev/null || true
+		done
+	else
+		find "$artifact_cache_dir" -maxdepth 1 -type f -name 'object-*.o' -print0 2>/dev/null || true
+	fi
 }
 
 while IFS= read -r -d '' record; do
@@ -868,12 +1050,20 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	fi
 	service_seed="$build_root/image-services-seed-$target.o"
 	service_seed_errors="$build_root/image-services-seed-$target.stderr"
-	image_graph_key_file="$build_root/image-cargo-$target.graph-key"
+	if [[ -n "$selected_artifact" ]]; then
+		image_graph_key_file="$build_root/image-cargo-$target.graph-key-$selected_kind-$selected_artifact"
+	else
+		image_graph_key_file="$build_root/image-cargo-$target.graph-key"
+	fi
 	image_graph_source_digest="$({
-		while read -r crate; do
+		if [[ -n "$selected_artifact" ]]; then
+			printf '%s\n' "${selected_specs[@]}" | sed 's/^[^=]*=//'
+		else
+			jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u
+		fi | while read -r crate; do
 			crate_dir="$(source_path "$crate")"
 			printf '%s=%s\n' "$crate_dir" "$(source_digest "$crate_dir")"
-		done < <(jq -r '.libraries[].owner' <<<"$manifest_json" | sort -u)
+		done
 		for source in "$root/user/build.rs" "$root/../product.conf"; do
 			source_file_digest "$source"
 		done

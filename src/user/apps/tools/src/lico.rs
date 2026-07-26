@@ -1,4 +1,4 @@
-// lico - governed two-panel file manager.
+// Lico - governed two-panel file manager.
 //
 // This first manager slice owns a full-screen terminal, maintains independent bounded panel
 // listings, and navigates only the explicitly granted volume clients. File mutation, process
