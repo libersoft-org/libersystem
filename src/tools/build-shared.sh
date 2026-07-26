@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+verbose="${LIBER_VERBOSE:-0}"
+if [[ "${1:-}" == "--verbose" ]]; then
+	verbose=1
+	shift
+fi
 if [[ $# -lt 2 ]]; then
-	echo "usage: $0 <target> <crate>..." >&2
+	echo "usage: $0 [--verbose] <target> <crate>..." >&2
 	exit 2
 fi
+if [[ "$verbose" != 0 && "$verbose" != 1 ]]; then
+	echo "build-shared: LIBER_VERBOSE must be 0 or 1" >&2
+	exit 2
+fi
+
+verbose_log() {
+	if [[ "$verbose" == 1 ]]; then echo "$*"; fi
+}
 
 target="$1"
 shift
@@ -189,15 +202,15 @@ if [[ "$force_rebuild" == 0 && -f "$warm_snapshot_file" ]]; then
 		provider_cache_hits="$(jq '.libraries | length' <<<"$manifest_json")"
 		executable_cache_hits="$(jq '[.programs[] | select(.linkage == "dynamic" and .stage == "volume" and .name != "dyn_probe")] | length' <<<"$manifest_json")"
 		warm_snapshot_hit=1
-		echo "build-shared: warm image snapshot hit"
+		verbose_log "build-shared: warm image snapshot hit"
 		rm -f "$warm_actual_inputs"
 		exit 0
 	fi
 	if [[ "$warm_expected_input" != "$warm_actual_input" ]]; then
-		echo "build-shared: warm image snapshot miss (inputs)"
-		if [[ -f "$warm_input_inventory_file" ]]; then diff -u "$warm_input_inventory_file" "$warm_actual_inputs" || true; fi
+		verbose_log "build-shared: warm image snapshot miss (inputs)"
+		if [[ "$verbose" == 1 && -f "$warm_input_inventory_file" ]]; then diff -u "$warm_input_inventory_file" "$warm_actual_inputs" || true; fi
 	fi
-	if [[ "$warm_expected_output" != "$warm_actual_output" ]]; then echo "build-shared: warm image snapshot miss (outputs)"; fi
+	if [[ "$warm_expected_output" != "$warm_actual_output" ]]; then verbose_log "build-shared: warm image snapshot miss (outputs)"; fi
 	rm -f "$warm_actual_inputs"
 fi
 
@@ -752,13 +765,13 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 		done
 	} | sha256sum | awk '{print $1}')"
 	if [[ "$force_rebuild" == 1 || ! -f "$image_target_config" || "$(cat "$image_target_config")" != "$image_target_config_value" ]]; then
-		echo "build-shared: Cargo cache miss (global build configuration)"
+		verbose_log "build-shared: Cargo cache miss (global build configuration)"
 		rm -rf "$image_target"
 		mkdir -p "$(dirname "$image_target_config")"
 		printf '%s\n' "$image_target_config_value" >"$image_target_config.tmp"
 		mv "$image_target_config.tmp" "$image_target_config"
 	else
-		echo "build-shared: Cargo cache hit (global build configuration)"
+		verbose_log "build-shared: Cargo cache hit (global build configuration)"
 	fi
 	service_seed="$build_root/image-services-seed-$target.o"
 	service_seed_errors="$build_root/image-services-seed-$target.stderr"
@@ -781,9 +794,9 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 	image_graph_valid=0
 	if [[ "$force_rebuild" == 0 && -f "$image_graph_key_file" && "$(cat "$image_graph_key_file")" == "$image_graph_key" && -f "$image_graph" && -f "$image_graph_errors" && -f "$image_seed" && -f "$service_seed" && -f "$service_seed_errors" ]] && llvm-readelf -h "$image_seed" | grep -q 'Type:.*REL' && llvm-readelf -h "$service_seed" | grep -q 'Type:.*REL' && grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$image_graph_errors" && grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$image_graph_errors" && grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$service_seed_errors" && grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$service_seed_errors"; then
 		image_graph_valid=1
-		echo "build-shared: Cargo image graph cache hit"
+		verbose_log "build-shared: Cargo image graph cache hit"
 	else
-		echo "build-shared: Cargo image graph cache miss"
+		verbose_log "build-shared: Cargo image graph cache miss"
 		rm -f "$image_seed" "$service_seed"
 		set +e
 		(
@@ -1071,7 +1084,7 @@ for spec in "$@"; do
 	provider_cache_key="$(artifact_cache_key library "$row" "$provider_expected_identity" "cargo=${image_target_config_value:-standalone} rlib=$(sha256sum "$rlib" | awk '{print $1}')")"
 	provider_cache_prefix="$artifact_cache_dir/library-$artifact"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_expected_identity" "$provider_expected_needed"; then
-		echo "build-shared: provider cache hit $artifact"
+		verbose_log "build-shared: provider cache hit $artifact"
 		((provider_cache_hits += 1))
 		provider_identity_digests[$artifact]="$(build_file_digest "$provider_expected_identity")"
 		rm -f "$provider_expected_identity"
@@ -1079,7 +1092,7 @@ for spec in "$@"; do
 		artifact_available[$artifact]=1
 		continue
 	fi
-	echo "build-shared: provider cache miss $artifact"
+	verbose_log "build-shared: provider cache miss $artifact"
 	((provider_cache_misses += 1))
 	link_deps=()
 	export_flags=()
@@ -1375,18 +1388,18 @@ if [[ -n "$image_graph" ]]; then
 				}
 				record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
 			fi
-			echo "build-shared: executable cache hit $consumer"
+			verbose_log "build-shared: executable cache hit $consumer"
 			((executable_cache_hits += 1))
 			rm -f "$consumer_expected_identity"
 			continue
 		fi
-		echo "build-shared: executable cache miss $consumer"
+		verbose_log "build-shared: executable cache miss $consumer"
 		((executable_cache_misses += 1))
 		if [[ "$force_rebuild" == 0 ]] && object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key"; then
-			echo "build-shared: object cache hit $consumer"
+			verbose_log "build-shared: object cache hit $consumer"
 			((object_cache_hits += 1))
 		else
-			echo "build-shared: object cache miss $consumer"
+			verbose_log "build-shared: object cache miss $consumer"
 			((object_cache_misses += 1))
 			consumer_obj_tmp="$consumer_obj.tmp.$$"
 			rm -f "$consumer_obj_tmp"
@@ -1679,13 +1692,13 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	probe_cache_prefix="$artifact_cache_dir/executable-dyn_probe"
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$probe_out" "$probe_cache_prefix" "$probe_cache_key" "$probe_expected_identity" "$probe_expected_needed"; then
 		canonical_provider_order "pix lsrt" >/dev/null
-		echo "build-shared: executable cache hit dyn_probe"
+		verbose_log "build-shared: executable cache hit dyn_probe"
 		rm -f "$probe_expected_identity"
 		audit_library_destinations
 		audit_program_destinations
 		exit 0
 	fi
-	echo "build-shared: executable cache miss dyn_probe"
+	verbose_log "build-shared: executable cache miss dyn_probe"
 	(cd "$probe" && CARGO_TARGET_DIR="$provider_cargo_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
 	probe_rlib="$(find "$provider_cargo_target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
 	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_out"
