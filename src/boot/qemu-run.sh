@@ -419,7 +419,8 @@ qemu_run_x86_64() {
 	qemu_args+=("${DISPLAY_ARGS[@]}")
 
 	# CPU and SMP: KVM for a matching host, otherwise the emulated x86 model.
-	local smp="${SMP:-$(nproc)}"
+	local smp
+	if [[ "${TEST:-0}" == "1" ]]; then smp="${SMP:-4}"; else smp="${SMP:-$(nproc)}"; fi
 	local cpu_args=()
 	qemu_select_cpu cpu_args x86_64 qemu64,+rdrand,+smep,+smap
 	qemu_args+=("${cpu_args[@]}" -smp "$smp")

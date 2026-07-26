@@ -18,7 +18,6 @@ use bootproto::BootInfo;
 
 use crate::arch;
 use crate::mem;
-use crate::sync::SpinLock;
 
 // Total cores we manage (BSP + woken APs).
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
@@ -30,9 +29,6 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 // inspectable at runtime - SYS_CPU_INFO reads it for `lscpu`. Allocated by init,
 // sized by the machine's real core count.
 static LAPIC_IDS: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
-
-// Serializes report-in lines so concurrent cores do not interleave their output.
-static REPORT_LOCK: SpinLock<()> = SpinLock::new(());
 
 // The CPU id and LAPIC id the next application processor reads on entry. APs are
 // woken one at a time and each is waited on before the next, so a single slot
@@ -140,7 +136,7 @@ pub fn init(boot_info: &BootInfo) {
 	}
 
 	arch::init_bsp_percpu(bsp_lapic_id);
-	report(0, bsp_lapic_id, true);
+	report(0, bsp_lapic_id);
 
 	// Wake the application processors, one at a time, via the real-mode trampoline
 	// the loader reserved a low page for. Nothing to do (and nowhere to land the
@@ -188,10 +184,9 @@ extern "C" fn ap_entry() -> ! {
 	let cpu_id = AP_CPU_ID.load(Ordering::SeqCst);
 	let lapic_id = AP_LAPIC_ID.load(Ordering::SeqCst);
 	arch::init_ap(cpu_id, lapic_id);
-	// Report (under the lock) before counting online, so the BSP - which waits on
-	// the online count - does not resume and print until this core's report-in line
-	// has been emitted.
-	report(cpu_id, lapic_id, false);
+	// Publish the topology entry before counting the core online, so the BSP cannot
+	// observe a completed bring-up while the entry is still stale.
+	report(cpu_id, lapic_id);
 	ONLINE.fetch_add(1, Ordering::Release);
 	crate::sched::cpu_idle_loop()
 }
@@ -312,12 +307,9 @@ fn parse_madt(hhdm: u64, madt_phys: u64, out: &mut Vec<u32>) {
 	}
 }
 
-fn report(cpu_id: usize, lapic_id: u32, is_bsp: bool) {
+fn report(cpu_id: usize, lapic_id: u32) {
 	let base = LAPIC_IDS.load(Ordering::Acquire);
 	unsafe { (*base.add(cpu_id)).store(lapic_id, Ordering::Relaxed) };
-	let _guard = REPORT_LOCK.lock();
-	let role = if is_bsp { "BSP" } else { "AP" };
-	crate::serial_println!("cpu {} ({}) online, lapic_id {}", cpu_id, role, lapic_id);
 }
 
 #[cfg(test)]

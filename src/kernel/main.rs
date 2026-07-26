@@ -173,6 +173,8 @@ pub fn framebuffer_geometry() -> Option<(u64, abi::Framebuffer)> {
 // before the test/boot split so SMP is up for both paths.
 fn init_smp() {
 	smp::init(boot_info());
+	#[cfg(all(test, target_arch = "x86_64"))]
+	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
 }
 
 #[cfg(not(test))]

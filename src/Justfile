@@ -319,6 +319,10 @@ test: test-preflight
 test-tags tags: test-preflight
     boot/test-kernel.sh x86_64 "{{ tags }}"
 
+# Exercise x86_64 SMP bring-up at the host core count as a checkpoint gate.
+test-smp-checkpoint: test-preflight
+    SMP="$(nproc)" boot/test-kernel.sh x86_64 "smp"
+
 # Compile the x86_64 test kernel and selected descriptors without booting QEMU.
 # This preserves the normal target, build-std and package-assembly path for quick
 # validation between small mechanical test ownership moves.
