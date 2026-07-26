@@ -2,14 +2,18 @@
 # Build or run one kernel test suite with optional tags and a bounded wall-clock timeout.
 set -euo pipefail
 
-ARCH="${1:?usage: test-kernel.sh <x86_64|aarch64|riscv64> [tag,tag,...] [--build-only]}"
+ARCH="${1:?usage: test-kernel.sh <x86_64|aarch64|riscv64> [tag,tag,...] [--build-only] [--verbose]}"
 shift
 TAGS=""
 BUILD_ONLY=0
+VERBOSE=0
 for arg in "$@"; do
 	case "$arg" in
 	--build-only)
 		BUILD_ONLY=1
+		;;
+	--verbose)
+		VERBOSE=1
 		;;
 	--*)
 		echo "unknown option: $arg" >&2
@@ -25,9 +29,28 @@ for arg in "$@"; do
 	esac
 done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GUEST_LOG="$(mktemp "${TMPDIR:-/tmp}/libersystem-test-${ARCH}-guest.XXXXXX.log")"
-RUN_LOG="$(mktemp "${TMPDIR:-/tmp}/libersystem-test-${ARCH}-run.XXXXXX.log")"
-trap 'rm -f "$GUEST_LOG" "$RUN_LOG"' EXIT
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+LOG_DIR="$REPO_ROOT/.build/test-logs"
+mkdir -p "$LOG_DIR"
+LOG_STEM="${ARCH}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+GUEST_LOG="$LOG_DIR/$LOG_STEM-guest.log"
+RUN_LOG="$LOG_DIR/$LOG_STEM-run.log"
+
+print_full_logs() {
+	cat "$RUN_LOG"
+	if [[ "$BUILD_ONLY" != "1" ]]; then cat "$GUEST_LOG"; fi
+}
+
+print_failure_logs() {
+	local tail_lines="${TEST_FAILURE_TAIL:-80}"
+	echo "[test-$ARCH] logs: $RUN_LOG $GUEST_LOG" >&2
+	echo "[test-$ARCH] run log tail (last $tail_lines lines):" >&2
+	tail -n "$tail_lines" "$RUN_LOG" >&2
+	if [[ "$BUILD_ONLY" != "1" && -s "$GUEST_LOG" ]]; then
+		echo "[test-$ARCH] guest log tail (last $tail_lines lines):" >&2
+		tail -n "$tail_lines" "$GUEST_LOG" >&2
+	fi
+}
 
 case "$ARCH" in
 x86_64)
@@ -61,6 +84,7 @@ else
 fi
 LIMIT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
 echo "[test-$ARCH] $MODE (timeout $LIMIT)"
+START_SECONDS="$SECONDS"
 
 TEST_ARGS=(test "${TARGET_ARGS[@]}")
 if [[ "$BUILD_ONLY" == "1" ]]; then
@@ -74,12 +98,11 @@ set +e
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e
-cat "$RUN_LOG"
-if [[ "$BUILD_ONLY" != "1" ]]; then
-	cat "$GUEST_LOG"
-fi
+elapsed=$((SECONDS - START_SECONDS))
+if [[ "$VERBOSE" == "1" ]]; then print_full_logs; fi
 
 if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
+	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
 	if [[ "$BUILD_ONLY" == "1" ]]; then
 		echo "[test-$ARCH] BUILD TIMEOUT after $LIMIT" >&2
 		exit 124
@@ -90,10 +113,24 @@ if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	exit 124
 fi
 if [[ "$BUILD_ONLY" == "1" ]]; then
+	if [[ "$status" -eq 0 ]]; then
+		echo "[test-$ARCH] BUILD PASS (${elapsed}s); logs: $RUN_LOG"
+	else
+		if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
+		echo "[test-$ARCH] BUILD FAIL (exit $status, ${elapsed}s); logs: $RUN_LOG" >&2
+	fi
 	exit "$status"
 fi
 if [[ "$status" -eq 0 ]] && ! grep -hEq '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG"; then
+	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
 	echo "[test-$ARCH] INCOMPLETE: QEMU exited successfully without the test-suite completion marker" >&2
 	exit 1
+fi
+if [[ "$status" -eq 0 ]]; then
+	result="$(grep -hE '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG" | tail -1 | tr -d '\r')"
+	echo "[test-$ARCH] PASS: $result (${elapsed}s); logs: $RUN_LOG $GUEST_LOG"
+else
+	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
+	echo "[test-$ARCH] FAIL (exit $status, ${elapsed}s); logs: $RUN_LOG $GUEST_LOG" >&2
 fi
 exit "$status"
