@@ -379,6 +379,77 @@ def ctl_request(request, timeout, ctl_path=CTL_SOCK):
 # by hand, and "is it running" is answered by asking the lock rather than by guessing
 # from a socket file that may have outlived its process.
 
+# What the running guest was booted from, split into the classes whose invalidations differ.
+# Each entry is (name, source roots, files). Sources catch an edit that has not been built
+# yet; files catch a build that has not been booted yet. Both are cold invalidations, and
+# naming the class is what keeps one from being mistaken for a hot-publishable change.
+INSTANCE_INPUTS = (
+	('protocol', ['src/bootproto'], []),
+	('kernel', ['src/kernel'], ['.build/cargo/kernel/x86_64-unknown-none/debug/kernel']),
+	('loader', ['src/loader'], ['.build/cargo/loader/x86_64-unknown-uefi/debug/libersystem-loader.efi']),
+	('packages', [], ['.build/boot/init.pkg', '.build/boot/volume.pkg']),
+	('image', [], ['.build/boot/libersystem.iso', 'src/boot/mkimage.sh']),
+	('topology', [], ['src/boot/qemu-run.sh']),
+)
+
+INPUT_ACTIONS = {
+	'protocol': 'shared boot contract: rebuilds every binary that consumes it, kernel and loader alike',
+	'kernel': 'recompiles the kernel and reassembles the image; an unchanged loader is not recompiled',
+	'loader': 'recompiles the loader and reassembles the image; an unchanged kernel is not recompiled',
+	'packages': 'reassembles the boot image from unchanged binaries',
+	'image': 'reassembles the boot image from unchanged binaries',
+	'topology': 'restarts the VM; the boot image is not rebuilt',
+}
+
+SOURCE_SUFFIXES = ('.rs', '.toml', '.lock', '.ld')
+
+
+def digest_tree(root, digest):
+	for base, dirs, names in os.walk(root):
+		dirs[:] = sorted(d for d in dirs if d != 'target')
+		for name in sorted(names):
+			if not name.endswith(SOURCE_SUFFIXES):
+				continue
+			path = os.path.join(base, name)
+			digest.update(os.path.relpath(path, REPO).encode() + b'\0')
+			try:
+				with open(path, 'rb') as handle:
+					for chunk in iter(lambda: handle.read(1 << 20), b''):
+						digest.update(chunk)
+			except OSError:
+				digest.update(b'unreadable')
+
+
+# Content rather than timestamps: a rebuild that produces identical bytes must not read as
+# a change, or every status would claim the instance is stale.
+def instance_inputs():
+	import hashlib
+	fingerprint = {}
+	for name, roots, files in INSTANCE_INPUTS:
+		digest = hashlib.sha256()
+		for root in roots:
+			digest_tree(os.path.join(REPO, root), digest)
+		for relative in files:
+			path = os.path.join(REPO, relative)
+			digest.update(relative.encode() + b'\0')
+			try:
+				with open(path, 'rb') as handle:
+					for chunk in iter(lambda: handle.read(1 << 20), b''):
+						digest.update(chunk)
+			except OSError:
+				digest.update(b'missing')
+		fingerprint[name] = digest.hexdigest()
+	return fingerprint
+
+
+def instance_stale_inputs(identity):
+	recorded = identity.get('inputs') or {}
+	if not recorded:
+		return None
+	current = instance_inputs()
+	return [name for name, _, _ in INSTANCE_INPUTS if recorded.get(name) != current.get(name)]
+
+
 def dev_identity_read():
 	try:
 		with open(DEV_LOCK) as handle:
@@ -573,6 +644,9 @@ def cmd_dev_up(args):
 		'broker': broker_pid,
 		'pgid': guest.pid,
 		'started': started,
+		# Taken after the guest booted, so it describes what this instance is actually
+		# running. A reattach deliberately keeps it: the broker changed, the guest did not.
+		'inputs': instance_inputs(),
 	})
 	os.close(lock_fd)
 	time.sleep(0.2)
@@ -620,7 +694,22 @@ def cmd_dev_status(args):
 	if state == 'starting':
 		print('     no shell prompt yet; rerun `just dev-status` or watch `just dev-log -f`')
 		sys.exit(1)
-	sys.exit(0)
+	stale = instance_stale_inputs(identity)
+	if stale is None:
+		print('     inputs   not recorded by this instance; restart it to compare')
+		sys.exit(1)
+	if not stale:
+		print(f'     inputs   current ({", ".join(name for name, _, _ in INSTANCE_INPUTS)})')
+		sys.exit(0)
+	# Name the class, not the symptom. Each of these is a cold invalidation with its own
+	# scope, and saying which one changed is what stops it being read as an application
+	# edit that could have been published into the running guest.
+	print(f'     inputs   stale: {", ".join(stale)}')
+	for name in stale:
+		print(f'              {name:9}{INPUT_ACTIONS[name]}')
+	print('     action   cold restart: `just dev-down && just dev-up`')
+	print('              this is a cold invalidation, not a hot-publishable application change')
+	sys.exit(1)
 
 
 # Detach key: Ctrl-] , the telnet convention. It leaves the guest and the shell running,
