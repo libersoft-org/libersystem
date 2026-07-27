@@ -1277,6 +1277,14 @@ pub unsafe fn clock_ns() -> u64 {
 	unsafe { syscall(SYS_CLOCK_MONO_NS, 0, 0, 0, 0) }
 }
 
+// Read the boot profile's name into `name`, returning the bytes written, or 0 when this boot
+// named none. A development-only facility asks this rather than inferring the profile from
+// what happens to be attached.
+pub unsafe fn boot_profile(name: &mut [u8]) -> usize {
+	let written: i64 = unsafe { syscall(SYS_BOOT_PROFILE, name.as_mut_ptr() as u64, name.len() as u64, 0, 0) as i64 };
+	if written > 0 { written as usize } else { 0 }
+}
+
 // Read the online CPU set: fills `ids` with one LAPIC id per core (as many as fit)
 // and returns the core count. A free syscall feeding the `lscpu` inventory command.
 pub unsafe fn cpu_info(ids: &mut [u32]) -> i64 {

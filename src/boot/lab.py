@@ -966,6 +966,7 @@ PROTO_STATUS = {
 	18: 'a dependency the identity record does not declare',
 	19: 'unreadable dynamic metadata',
 	20: 'no earlier generation to return to',
+	21: 'this boot has no artifact registry (not the development profile)',
 }
 
 # How a committed generation compares with the one it succeeded, under the written provider
@@ -1054,10 +1055,10 @@ def proto_hello(sock, buffer, timeout):
 	opcode, _, status, payload = proto_await(sock, buffer, 1, deadline)
 	if opcode == OP_ERROR:
 		die(f'handshake refused: {proto_status(status)}')
-	if opcode != OP_HELLO_ACK or len(payload) < 24:
+	if opcode != OP_HELLO_ACK or len(payload) < 25:
 		die(f'handshake reply was opcode {opcode:#04x} with {len(payload)} B of payload')
-	fields = struct.unpack('<IIHHIHHI', payload[:24])
-	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5], 'max_term_input': fields[6], 'max_registry': fields[7]}
+	fields = struct.unpack('<IIHHIHHIB', payload[:25])
+	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5], 'max_term_input': fields[6], 'max_registry': fields[7], 'registry': bool(fields[8])}
 	if bounds['max_frame'] != PROTO_MAX_FRAME or bounds['max_payload'] != PROTO_MAX_PAYLOAD:
 		die(f'guest reports a {bounds["max_frame"]} B frame bound ({bounds["max_payload"]} B payload); this host is built for {PROTO_MAX_FRAME} B ({PROTO_MAX_PAYLOAD} B)')
 	return bounds
@@ -1086,7 +1087,8 @@ def proto_session(timeout):
 	sock = proto_connect(timeout)
 	buffer = bytearray()
 	bounds = proto_hello(sock, buffer, timeout)
-	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max artifact {bounds["max_artifact"] // (1024 * 1024)} MB, registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact, max terminal input {bounds["max_term_input"]} B)')
+	registry = f'registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact' if bounds['registry'] else 'no registry on this boot'
+	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max artifact {bounds["max_artifact"] // (1024 * 1024)} MB, {registry}, max terminal input {bounds["max_term_input"]} B)')
 	return sock, buffer, bounds
 
 
@@ -1136,6 +1138,8 @@ def cmd_dev_publish(args):
 	digest = hashlib.sha256(blob).digest()
 	sock, buffer, bounds = proto_session(timeout)
 	try:
+		if not bounds['registry']:
+			die('this boot has no artifact registry; publication needs the development profile')
 		if len(blob) > bounds['max_artifact']:
 			die(f'{path} is {len(blob)} B; the guest accepts at most {bounds["max_artifact"]} B')
 		encoded = name.encode()

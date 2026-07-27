@@ -20,6 +20,22 @@ fn syscall_roundtrip_stateless() {
 	}
 }
 
+crate::tagged_test!(boot_profile_reports_nothing_when_the_boot_named_none, [Syscall]);
+fn boot_profile_reports_nothing_when_the_boot_named_none() {
+	// The development-only artifact registry gates itself on this answer, so the answer for
+	// an ordinary boot has to be dependable. A test boot never carries a profile - the
+	// persistent development instance and the test configuration are mutually exclusive - so
+	// this asserts the negative side of that gate, the side no test guest can reach through
+	// the facility itself. It also proves the syscall is safe to call with no buffer at all,
+	// which is how a caller asks whether a profile exists before sizing one.
+	unsafe {
+		assert_eq!(arch::syscall::invoke(SYS_BOOT_PROFILE, 0, 0, 0, 0), 0, "a boot that named no profile reports none");
+		let mut name = [0xffu8; 32];
+		assert_eq!(arch::syscall::invoke(SYS_BOOT_PROFILE, name.as_mut_ptr() as u64, name.len() as u64, 0, 0), 0, "and writes nothing into the caller's buffer");
+		assert!(name.iter().all(|byte| *byte == 0xff), "the buffer is left untouched");
+	}
+}
+
 crate::tagged_test!(abi_check_accepts_the_matching_revision_and_refuses_a_mismatch, [Syscall]);
 fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
 	// SYS_ABI_CHECK is the runtime's first syscall: a starting binary reports the ABI

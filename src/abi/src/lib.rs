@@ -177,6 +177,11 @@ pub const SYS_DMA_BUFFER_UNMAP: u64 = 62;
 // explicit page-aligned load bias selected by ProcessService's dependency order.
 // The module receives no stack or thread; SYS_PROCESS_LOAD finalizes the main image.
 pub const SYS_PROCESS_LOAD_MODULE: u64 = 63;
+// Report the boot profile the firmware selected (a0 = buffer, a1 = length), returning the
+// bytes written, or 0 on an ordinary boot that named none. The kernel already reads it to
+// decide what to print; userspace needs the same answer to decide what a build is allowed
+// to do, and a development-only facility cannot gate itself on anything softer.
+pub const SYS_BOOT_PROFILE: u64 = 64;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

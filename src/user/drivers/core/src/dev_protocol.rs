@@ -74,6 +74,17 @@ pub const MAX_NAME: usize = 48;
 // declared provider closure.
 const LIBRARY_SUFFIX: &str = ".lslib";
 
+// The boot profile the artifact registry requires. Shadowing built artifacts with images a
+// host streamed in is a development facility and must not exist anywhere else, so it is
+// gated on the profile the firmware selected rather than on what happens to be attached.
+//
+// The gate is on the registry, not on the protocol. The same control channel is present in
+// the cold test configuration of all three targets, where a runner drives a boot that has no
+// business hot-publishing anything but very much needs to handshake, ping, type and reset.
+// Gating the whole protocol would take that away to protect something the protocol does not
+// do.
+const REGISTRY_PROFILE: &[u8] = b"development";
+
 // How a committed generation compares with the one it succeeded, under the written provider
 // compatibility rule. FIRST is not a weaker COMPATIBLE: nothing was replaced, so no claim
 // about hot replacement was made or could be.
@@ -141,6 +152,8 @@ pub const ST_BAD_PROVIDERS: u16 = 18;
 pub const ST_BAD_DYNAMIC: u16 = 19;
 // A rollback with no earlier generation to return to.
 pub const ST_NOTHING_TO_ROLL_BACK: u16 = 20;
+// A registry operation on a boot that has no registry.
+pub const ST_NO_REGISTRY: u16 = 21;
 
 // The deadline on an incomplete frame, in scheduler ticks (100 Hz). A host that stops
 // mid-frame - killed, disconnected, or writing a length it never delivers - must not leave
@@ -228,6 +241,9 @@ pub struct Session {
 	// The next generation to hand out. Monotonic for the guest's whole life, so a number is
 	// never reused and a stale reference is always recognisable as stale.
 	next_generation: u32,
+	// Whether this boot may hold a registry at all, read once from the kernel because the
+	// answer cannot change while the guest runs.
+	registry_allowed: bool,
 	candidate: Option<Candidate>,
 	artifacts: Vec<Artifact>,
 	// Live registry content in bytes, tracked rather than recomputed so the budget can be
@@ -237,7 +253,9 @@ pub struct Session {
 
 impl Session {
 	pub fn new() -> Session {
-		Session { handshake: false, high_request: 0, next_generation: 1, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
+		let mut profile: [u8; 32] = [0u8; 32];
+		let len: usize = unsafe { boot_profile(&mut profile) };
+		Session { handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
 	}
 
 	pub fn is_open(&self) -> bool {
@@ -345,6 +363,7 @@ impl Session {
 			reply[16..18].copy_from_slice(&(MAX_GENERATIONS_PER_ARTIFACT as u16).to_le_bytes());
 			reply[18..20].copy_from_slice(&(MAX_TERM_INPUT as u16).to_le_bytes());
 			reply[20..24].copy_from_slice(&(MAX_REGISTRY as u32).to_le_bytes());
+			reply[24] = u8::from(self.registry_allowed);
 			return sink.send(OP_HELLO_ACK, request, 0, ST_OK, &reply);
 		}
 		if !self.handshake {
@@ -360,6 +379,11 @@ impl Session {
 		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_ROLLBACK | OP_TERM_INPUT | OP_RESET);
 		if session_scoped && generation != 0 {
 			return sink.send(OP_ERROR, request, generation, ST_MALFORMED, &[]);
+		}
+		// Every registry operation is refused outright on a boot that has no registry, in one
+		// place rather than five, so no later operation can be added and quietly miss the gate.
+		if !self.registry_allowed && matches!(opcode, OP_PUB_BEGIN | OP_PUB_CHUNK | OP_PUB_COMMIT | OP_PUB_ABORT | OP_GEN_LIST | OP_ROLLBACK) {
+			return sink.send(OP_ERROR, request, generation, ST_NO_REGISTRY, &[]);
 		}
 		match opcode {
 			// Echo the payload, so a ping measures the round trip of a real payload rather
