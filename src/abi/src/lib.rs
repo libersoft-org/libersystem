@@ -79,8 +79,11 @@ pub const SYS_DMA_BUFFER_PHYS: u64 = 38;
 // Acknowledge and re-arm a serviced device interrupt (39 retired: device interrupts
 // are MSI-X now, see SYS_DEVICE_MSIX_ACQUIRE).
 pub const SYS_INTERRUPT_ACK: u64 = 40;
-// Inject one byte into the kernel console input (a userspace input driver feeds the
-// interactive shell the same way the kernel's serial loop does).
+// Inject one byte into the kernel console input (a0 = the byte; a1 = 0 for a keystroke,
+// non-zero for serial input, which the console service accepts even unfocused). Returns 0
+// when the console took it and ERR_WOULD_BLOCK when its queue is full or no console
+// service is attached. No ABI bump: a1 was an ignored zero and the return an ignored zero,
+// so a binary built before this reads neither and behaves exactly as it did.
 pub const SYS_CONSOLE_FEED: u64 = 41;
 // Block until ANY handle in a caller-supplied array is ready (or the deadline
 // passes), returning the ready handle's index - `wait` over a set, so a driver can

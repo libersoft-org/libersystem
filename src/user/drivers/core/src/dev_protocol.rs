@@ -62,6 +62,13 @@ pub const MAX_GENERATIONS: usize = 4;
 // An artifact name is a bounded identifier, not a path: it names a slot in the registry.
 pub const MAX_NAME: usize = 48;
 
+// The most terminal input one frame may carry. Far below the frame bound on purpose: each
+// byte is a separate syscall into a console queue that is itself bounded, so a frame the
+// size of the transport would mostly be refused after the queue filled. Sized to a
+// comfortable line-oriented burst and reported in the handshake, so a host paces itself
+// rather than discovering the limit halfway through a paste.
+pub const MAX_TERM_INPUT: usize = 4096;
+
 // Opcodes. Requests are host to guest, replies guest to host; a guest-to-host opcode
 // arriving from the host is an unknown opcode, not a request.
 pub const OP_HELLO: u8 = 0x01;
@@ -75,6 +82,10 @@ pub const OP_PUB_ABORT: u8 = 0x13;
 pub const OP_PUB_ACK: u8 = 0x14;
 pub const OP_GEN_LIST: u8 = 0x15;
 pub const OP_GEN_LIST_REPLY: u8 = 0x16;
+pub const OP_TERM_INPUT: u8 = 0x20;
+pub const OP_TERM_ACK: u8 = 0x21;
+pub const OP_RESET: u8 = 0x22;
+pub const OP_RESET_ACK: u8 = 0x23;
 pub const OP_ERROR: u8 = 0xff;
 
 // Statuses. Every rejection names one of these, so a failure is explained by the frame that
@@ -92,6 +103,7 @@ pub const ST_BAD_GENERATION: u16 = 9;
 pub const ST_INCOMPLETE: u16 = 10;
 pub const ST_DIGEST_MISMATCH: u16 = 11;
 pub const ST_NO_SPACE: u16 = 12;
+pub const ST_TERM_REFUSED: u16 = 13;
 
 // The deadline on an incomplete frame, in scheduler ticks (100 Hz). A host that stops
 // mid-frame - killed, disconnected, or writing a length it never delivers - must not leave
@@ -269,8 +281,6 @@ impl Session {
 			self.close();
 			self.handshake = true;
 			self.high_request = request;
-			// Eighteen bytes of bounds and two reserved, so the next bound to be added does not
-			// change the reply's size and every peer already tolerates the tail.
 			let mut reply: [u8; 20] = [0u8; 20];
 			reply[..4].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
 			reply[4..8].copy_from_slice(&(MAX_PAYLOAD as u32).to_le_bytes());
@@ -278,6 +288,7 @@ impl Session {
 			reply[10..12].copy_from_slice(&(MAX_NAME as u16).to_le_bytes());
 			reply[12..16].copy_from_slice(&MAX_ARTIFACT.to_le_bytes());
 			reply[16..18].copy_from_slice(&(MAX_GENERATIONS as u16).to_le_bytes());
+			reply[18..20].copy_from_slice(&(MAX_TERM_INPUT as u16).to_le_bytes());
 			return sink.send(OP_HELLO_ACK, request, 0, ST_OK, &reply);
 		}
 		if !self.handshake {
@@ -290,7 +301,7 @@ impl Session {
 		// The generation field names the candidate an operation applies to. The operations
 		// that are not about one candidate must leave it zero, so the field never acquires an
 		// accidental second meaning that a later version would have to preserve.
-		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST);
+		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_TERM_INPUT | OP_RESET);
 		if session_scoped && generation != 0 {
 			return sink.send(OP_ERROR, request, generation, ST_MALFORMED, &[]);
 		}
@@ -303,6 +314,8 @@ impl Session {
 			OP_PUB_COMMIT => self.publication_commit(request, generation, payload, sink),
 			OP_PUB_ABORT => self.publication_abort(request, generation, payload, sink),
 			OP_GEN_LIST => self.generation_list(request, sink),
+			OP_TERM_INPUT => terminal_input(request, payload, sink),
+			OP_RESET => self.reset(request, sink),
 			_ => sink.send(OP_ERROR, request, generation, ST_BAD_OPCODE, &[]),
 		}
 	}
@@ -422,6 +435,52 @@ impl Session {
 		}
 		sink.send(OP_GEN_LIST_REPLY, request, 0, ST_OK, &reply)
 	}
+
+	// Drop every piece of development state this protocol owns: the candidate being streamed
+	// and the generations already accepted. It is deliberately not a reboot and does not
+	// touch anything else in the guest - what a reset means will widen when the development
+	// agent owns installed artifacts and running scenarios, and the reply says exactly what
+	// was dropped so a caller never has to assume the scope.
+	//
+	// Reply payload: generations u16 | candidate u8.
+	fn reset(&mut self, request: u32, sink: &mut impl Sink) -> bool {
+		let dropped: u16 = self.generations.len() as u16;
+		let candidate: u8 = u8::from(self.candidate.is_some());
+		self.generations.clear();
+		self.candidate = None;
+		let mut reply: [u8; 3] = [0u8; 3];
+		reply[..2].copy_from_slice(&dropped.to_le_bytes());
+		reply[2] = candidate;
+		sink.send(OP_RESET_ACK, request, 0, ST_OK, &reply)
+	}
+}
+
+// Type into the guest's console. Bytes take the serial arrival path, which the console
+// service accepts whether or not its display is focused: a runner driving a guest has no
+// display to focus, and input that silently depended on focus would be the least
+// reproducible thing in the protocol.
+//
+// Feeding stops at the first byte the console refuses rather than pushing past it, and the
+// count that did land is reported either way, so a host resumes from what arrived instead
+// of replaying a line and doubling it.
+//
+// Reply payload: accepted u16.
+fn terminal_input(request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
+	if payload.is_empty() {
+		return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
+	}
+	if payload.len() > MAX_TERM_INPUT {
+		return sink.send(OP_ERROR, request, 0, ST_OVERSIZED, &[]);
+	}
+	let mut accepted: u16 = 0;
+	for &byte in payload {
+		if unsafe { console_feed_serial(byte) } != 0 {
+			break;
+		}
+		accepted += 1;
+	}
+	let count: [u8; 2] = accepted.to_le_bytes();
+	if accepted as usize == payload.len() { sink.send(OP_TERM_ACK, request, 0, ST_OK, &count) } else { sink.send(OP_ERROR, request, 0, ST_TERM_REFUSED, &count) }
 }
 
 impl Default for Session {

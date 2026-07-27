@@ -1401,12 +1401,18 @@ pub unsafe fn interrupt_ack(handle: u64) {
 	}
 }
 
-// Inject one byte into the kernel console input, feeding the interactive shell the
-// same way the kernel's serial loop does - used by the virtio-input keyboard driver.
-pub unsafe fn console_feed(byte: u8) {
-	unsafe {
-		syscall(SYS_CONSOLE_FEED, byte as u64, 0, 0, 0);
-	}
+// Inject one byte into the kernel console input as a keystroke - used by the
+// virtio-input keyboard driver. The console service drops keystrokes while its display is
+// not focused. Returns 0 when the byte was taken, ERR_WOULD_BLOCK when it was not.
+pub unsafe fn console_feed(byte: u8) -> i64 {
+	unsafe { syscall(SYS_CONSOLE_FEED, byte as u64, 0, 0, 0) as i64 }
+}
+
+// `console_feed` on the serial arrival path, which the console service accepts whether or
+// not its display is focused - what a driven guest needs, since a runner typing into it
+// has no display to focus.
+pub unsafe fn console_feed_serial(byte: u8) -> i64 {
+	unsafe { syscall(SYS_CONSOLE_FEED, byte as u64, 1, 0, 0) as i64 }
 }
 
 // Allocate a DmaBuffer of `size` bytes (pinned DMA memory charged to our Domain),

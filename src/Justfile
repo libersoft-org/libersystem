@@ -570,6 +570,16 @@ dev-publish *args:
 dev-generations *args:
     @boot/lab.py dev-generations {{ args }}
 
+# type into the development instance's terminal over the control channel, and get back the
+# byte count its console accepted. e.g. `just dev-type ls -l`
+dev-type *args:
+    @boot/lab.py dev-type {{ args }}
+
+# drop the development state the instance holds (registry and any open candidate); not a
+# reboot, and it reports exactly what it dropped
+dev-reset *args:
+    @boot/lab.py dev-reset {{ args }}
+
 # stop the development instance gracefully and release its lock
 dev-down *args:
     @boot/lab.py dev-down {{ args }}

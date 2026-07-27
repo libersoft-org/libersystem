@@ -73,6 +73,8 @@ Persistent development instance (one owner at a time):
   dev-ping [--count N] [--size N] [--timeout N]  exercise the control protocol
   dev-publish <name> <file>  stream a file into the guest artifact registry
   dev-generations       list the generations the guest holds
+  dev-type [--no-enter] <text...>  type into the guest terminal, with a byte count back
+  dev-reset             drop the guest development state (not a reboot)
   dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -898,6 +900,10 @@ OP_PUB_ABORT = 0x13
 OP_PUB_ACK = 0x14
 OP_GEN_LIST = 0x15
 OP_GEN_LIST_REPLY = 0x16
+OP_TERM_INPUT = 0x20
+OP_TERM_ACK = 0x21
+OP_RESET = 0x22
+OP_RESET_ACK = 0x23
 OP_ERROR = 0xff
 
 # Each rejection the guest can name. They exist so a failure is explained by the frame that
@@ -916,6 +922,7 @@ PROTO_STATUS = {
 	10: 'candidate shorter than it declared',
 	11: 'candidate does not match its declared digest',
 	12: 'no room in the registry',
+	13: 'the guest console refused the input',
 }
 
 
@@ -1002,9 +1009,8 @@ def proto_hello(sock, buffer, timeout):
 		die(f'handshake refused: {proto_status(status)}')
 	if opcode != OP_HELLO_ACK or len(payload) < 20:
 		die(f'handshake reply was opcode {opcode:#04x} with {len(payload)} B of payload')
-	# The guest sends 20 bytes: 18 of bounds and 2 reserved for the next one to be added.
-	fields = struct.unpack('<IIHHIH', payload[:18])
-	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5]}
+	fields = struct.unpack('<IIHHIHH', payload[:20])
+	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5], 'max_term_input': fields[6]}
 	if bounds['max_frame'] != PROTO_MAX_FRAME or bounds['max_payload'] != PROTO_MAX_PAYLOAD:
 		die(f'guest reports a {bounds["max_frame"]} B frame bound ({bounds["max_payload"]} B payload); this host is built for {PROTO_MAX_FRAME} B ({PROTO_MAX_PAYLOAD} B)')
 	return bounds
@@ -1012,10 +1018,10 @@ def proto_hello(sock, buffer, timeout):
 
 # Send one request and return its answer, turning a refusal into a named failure. Every
 # caller passes a deadline, because the peer is a live guest that can stop answering.
-def proto_request(sock, buffer, request, opcode, payload=b'', generation=0, timeout=5, what='request'):
+def proto_request(sock, buffer, request, opcode, payload=b'', generation=0, timeout=5, what='request', tolerate=()):
 	sock.sendall(proto_frame(opcode, request, payload, generation))
 	reply, replied_generation, status, body = proto_await(sock, buffer, request, time.monotonic() + timeout)
-	if reply == OP_ERROR:
+	if reply == OP_ERROR and status not in tolerate:
 		die(f'{what} refused: {proto_status(status)}')
 	return reply, replied_generation, body
 
@@ -1033,7 +1039,7 @@ def proto_session(timeout):
 	sock = proto_connect(timeout)
 	buffer = bytearray()
 	bounds = proto_hello(sock, buffer, timeout)
-	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max payload {bounds["max_payload"]} B, max outstanding {bounds["max_outstanding"]}, max artifact {bounds["max_artifact"]} B, {bounds["max_generations"]} generations)')
+	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max payload {bounds["max_payload"]} B, max outstanding {bounds["max_outstanding"]}, max artifact {bounds["max_artifact"]} B, {bounds["max_generations"]} generations, max terminal input {bounds["max_term_input"]} B)')
 	return sock, buffer, bounds
 
 
@@ -1114,6 +1120,62 @@ def cmd_dev_publish(args):
 			raise
 		elapsed = (time.monotonic() - started) * 1000
 		print(f'lab: generation {generation} committed in {elapsed:.1f} ms ({sent} B, digest verified by the guest)')
+	finally:
+		sock.close()
+
+
+# Type into the guest's terminal over the control channel rather than into its UART. The
+# difference that matters is accounting: the guest reports how many bytes its console
+# actually took, so a refusal is a number to resume from instead of output that never
+# appeared for reasons nobody can see.
+#
+# It has to resume, too. The console input queue is short - measured at a few dozen bytes -
+# so anything past a keystroke or two is refused partway and the rest has to follow once the
+# shell has drained. Looping here is what makes the operation carry a line rather than a
+# character, and the guest's count is what keeps the loop from replaying bytes that landed.
+def cmd_dev_type(args):
+	timeout = arg_value(args, '--timeout', 15)
+	enter = '--no-enter' not in args
+	text = ' '.join(a for a in args if not a.startswith('--'))
+	if not text:
+		die('usage: dev-type [--no-enter] <text...>')
+	payload = text.encode() + (b'\r' if enter else b'')
+	sock, buffer, bounds = proto_session(timeout)
+	try:
+		if len(payload) > bounds['max_term_input']:
+			die(f'{len(payload)} B of input; the guest accepts at most {bounds["max_term_input"]} B per frame')
+		deadline = time.monotonic() + timeout
+		request, sent = 2, 0
+		while sent < len(payload):
+			opcode, _, body = proto_request(sock, buffer, request, OP_TERM_INPUT, payload[sent:], timeout=max(deadline - time.monotonic(), 0.1), what='terminal input', tolerate=(13,))
+			accepted = struct.unpack('<H', body[:2])[0] if len(body) >= 2 else 0
+			sent += accepted
+			request += 1
+			if opcode == OP_TERM_ACK:
+				break
+			if time.monotonic() >= deadline:
+				die(f'the guest console took {sent} of {len(payload)} B before the deadline')
+			# Nothing was taken this round, so the queue is still full: let the shell drain
+			# before asking again, rather than spinning a refusal into a busy loop.
+			if accepted == 0:
+				time.sleep(0.05)
+		print(f'lab: typed {sent} B into the guest console')
+	finally:
+		sock.close()
+
+
+# Drop the development state the guest holds. It is not a reboot: it clears the artifact
+# registry and any half-streamed candidate, and the guest reports exactly what it dropped.
+def cmd_dev_reset(args):
+	timeout = arg_value(args, '--timeout', 5)
+	sock, buffer, _ = proto_session(timeout)
+	try:
+		opcode, _, body = proto_request(sock, buffer, 2, OP_RESET, timeout=timeout, what='reset')
+		if opcode != OP_RESET_ACK or len(body) < 3:
+			die(f'reset answered with opcode {opcode:#04x} and {len(body)} B')
+		dropped = struct.unpack('<H', body[:2])[0]
+		candidate = 'and one candidate being streamed' if body[2] else 'with no candidate open'
+		print(f'lab: dropped {dropped} generation(s) {candidate}')
 	finally:
 		sock.close()
 
@@ -1427,7 +1489,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-down': cmd_dev_down}
 
 
 def main():

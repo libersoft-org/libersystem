@@ -337,7 +337,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0),
 		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
 		SYS_SYSTEM_POWER => sys_system_power(a0),
-		SYS_CONSOLE_FEED => sys_console_feed(a0),
+		SYS_CONSOLE_FEED => sys_console_feed(a0, a1),
 		SYS_FRAMEBUFFER_MAP => sys_framebuffer_map(a0, a1),
 		SYS_CONSOLE_READLOG => sys_console_readlog(a0, a1),
 		SYS_OBJECT_PROPERTY_SET => sys_object_property_set(a0, a1, a2, a3),
@@ -826,13 +826,22 @@ fn sys_system_power(action: u64) -> i64 {
 	}
 }
 
-// Inject one byte into the kernel console input, as if it had arrived on the serial
-// line - the path a userspace input driver (the virtio-input keyboard) uses to feed
-// the interactive shell. (Gating this to the input driver is a PermissionManager
-// concern, deferred.) Returns 0.
-fn sys_console_feed(byte: u64) -> i64 {
-	crate::console_input::feed(byte as u8);
-	0
+// Inject one byte into the kernel console input - the path a userspace input driver
+// (the virtio-input keyboard) uses to feed the interactive shell. (Gating this to the
+// input driver is a PermissionManager concern, deferred.)
+//
+// `serial` chooses which of the two arrival paths the byte imitates. Zero is a
+// keystroke, which the console service drops when its display is not focused. Non-zero
+// is serial input, which it accepts regardless - the path a driven guest needs, because
+// a scenario runner has no display to focus and must still be able to type.
+//
+// Returns 0 when the console took the byte and ERR_WOULD_BLOCK when it did not, which is
+// either a full input queue or no console service attached at all. The answer was always
+// computed here and always discarded; a caller driving the guest has to know whether what
+// it sent arrived.
+fn sys_console_feed(byte: u64, serial: u64) -> i64 {
+	let accepted = if serial != 0 { crate::console_input::feed_serial(byte as u8) } else { crate::console_input::feed(byte as u8) };
+	if accepted { 0 } else { ERR_WOULD_BLOCK }
 }
 
 // Set a property on an object: a human-readable name (PROP_NAME; a2 = name
