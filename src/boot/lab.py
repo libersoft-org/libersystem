@@ -69,6 +69,7 @@ Persistent development instance (one owner at a time):
   dev-status            report the instance state (exit 0 only when ready)
   dev-console [--read-only]  attach an interactive terminal; Ctrl-] detaches
   dev-log [-f | <pat>]  show / follow / grep its serial log
+  dev-ping [--count N] [--size N] [--timeout N]  exercise the control protocol
   dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -93,6 +94,10 @@ DEV_CTL_SOCK = os.path.join(BUILD, 'dev-ctl.sock')
 DEV_SERIAL_LOG = os.path.join(BUILD, 'dev-serial.log')
 DEV_QEMU_LOG = os.path.join(BUILD, 'dev-qemu.log')
 DEV_CONSOLE_SOCK = os.path.join(BUILD, 'dev-console.sock')
+# The control channel is the second virtio-serial device, not the console. QEMU listens
+# here and the guest's dev-channel driver holds the other end; nothing tees or logs it,
+# because it carries framed requests rather than terminal output.
+DEV_CHANNEL_SOCK = os.path.join(BUILD, 'dev-channel.sock')
 
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
@@ -846,13 +851,180 @@ def cmd_dev_down(args):
 	# Settle the verdict before unlinking: probing the lock recreates its file, which
 	# would leave an empty one behind and make a stopped instance look half-cleaned.
 	stopped = dev_stopped(pgid)
-	for path in (DEV_SERIAL_SOCK, DEV_CTL_SOCK, DEV_CONSOLE_SOCK, DEV_LOCK):
+	for path in (DEV_SERIAL_SOCK, DEV_CTL_SOCK, DEV_CONSOLE_SOCK, DEV_CHANNEL_SOCK, DEV_LOCK):
 		if os.path.exists(path):
 			os.unlink(path)
 	if stopped:
 		print('lab: development instance down')
 	else:
 		die(f'development instance did not stop; inspect it with `ps -g {pgid}`')
+
+
+# ---- development-control protocol ------------------------------------------
+# The host half of the framing the guest's dev-channel driver speaks, over the second
+# virtio-serial device. One 16-byte little-endian header per frame:
+#
+#   magic u16 | version u8 | opcode u8 | request u32 | generation u32 | length u16 | status u16
+#
+# Every bound below is a constant on both sides and is reported by the guest in the
+# handshake, so a mismatch is a named handshake failure rather than a payload that silently
+# does not fit. Every exchange carries a deadline: the socket is a live guest that can stop
+# answering at any point, and a control tool that blocks forever on that is unusable.
+#
+# The protocol carries bytes and typed fields only. Nothing here encodes a host path, a
+# guest path, a shell command or a capability request, and no opcode is a passthrough.
+
+PROTO_MAGIC = 0x444c
+PROTO_MAGIC_BYTES = struct.pack('<H', PROTO_MAGIC)
+PROTO_VERSION = 1
+PROTO_HEADER = struct.Struct('<HBBIIHH')
+PROTO_MAX_FRAME = 65536
+PROTO_MAX_PAYLOAD = PROTO_MAX_FRAME - PROTO_HEADER.size
+
+OP_HELLO = 0x01
+OP_HELLO_ACK = 0x02
+OP_PING = 0x03
+OP_PONG = 0x04
+OP_ERROR = 0xff
+
+# Each rejection the guest can name. They exist so a failure is explained by the frame that
+# caused it, instead of surfacing as a host-side timeout with no cause.
+PROTO_STATUS = {
+	0: 'ok',
+	1: 'unsupported protocol version',
+	2: 'unknown opcode',
+	3: 'frame over the size bound',
+	4: 'malformed frame',
+	5: 'handshake required first',
+	6: 'duplicate or out-of-order request id',
+	7: 'frame still incomplete at its deadline',
+}
+
+
+def proto_status(status):
+	return PROTO_STATUS.get(status, f'unknown status {status}')
+
+
+def proto_frame(opcode, request, payload=b'', generation=0, status=0):
+	if len(payload) > PROTO_MAX_PAYLOAD:
+		die(f'payload of {len(payload)} B exceeds the {PROTO_MAX_PAYLOAD} B frame bound')
+	return PROTO_HEADER.pack(PROTO_MAGIC, PROTO_VERSION, opcode, request, generation, len(payload), status) + payload
+
+
+# Read one frame, hunting for the magic first. On x86_64 the channel carries a UEFI console
+# preamble before the guest owns the port - firmware writes its output to every
+# console-class device it enumerates - so the reader has to find a frame start rather than
+# assume the first byte it is handed is one. `buffer` is a bytearray the caller keeps across
+# calls, since one read can deliver several frames or half of one.
+def proto_read(sock, buffer, deadline):
+	while True:
+		at = buffer.find(PROTO_MAGIC_BYTES)
+		if at < 0:
+			# A magic can straddle two reads, so keep the last byte and discard the rest.
+			del buffer[:max(len(buffer) - 1, 0)]
+		else:
+			del buffer[:at]
+			if len(buffer) >= PROTO_HEADER.size:
+				_, version, opcode, request, generation, length, status = PROTO_HEADER.unpack(bytes(buffer[:PROTO_HEADER.size]))
+				if version != PROTO_VERSION:
+					die(f'guest speaks protocol version {version}, this host speaks {PROTO_VERSION}')
+				if len(buffer) >= PROTO_HEADER.size + length:
+					payload = bytes(buffer[PROTO_HEADER.size:PROTO_HEADER.size + length])
+					del buffer[:PROTO_HEADER.size + length]
+					return opcode, request, generation, status, payload
+		remaining = deadline - time.monotonic()
+		if remaining <= 0:
+			die('development channel gave no reply before its deadline')
+		sock.settimeout(remaining)
+		try:
+			chunk = sock.recv(4096)
+		except socket.timeout:
+			die('development channel gave no reply before its deadline')
+		if not chunk:
+			die('development channel closed while waiting for a reply')
+		buffer += chunk
+
+
+# Read frames until the one answering `request` arrives, discarding anything else. The
+# discards are real: the guest keeps whatever it was mid-way through writing when a previous
+# host walked away, and that reply is flushed the moment a new one connects and drains the
+# port. Matching on the request ID is what stops the new session reading the old one's mail.
+def proto_await(sock, buffer, request, deadline):
+	while True:
+		opcode, replied, _, status, payload = proto_read(sock, buffer, deadline)
+		if replied == request:
+			return opcode, status, payload
+
+
+# QEMU listens on the channel socket and serves one client at a time, so a second client is
+# a connection that sits in the backlog unanswered rather than one that is refused. The
+# deadline on the handshake is what turns that into a diagnosable failure.
+def proto_connect(timeout):
+	if not os.path.exists(DEV_CHANNEL_SOCK):
+		die('this instance has no development channel; restart it with `just dev-down && just dev-up`')
+	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	sock.settimeout(timeout)
+	try:
+		sock.connect(DEV_CHANNEL_SOCK)
+	except OSError as error:
+		die(f'development channel refused a connection: {error}')
+	return sock
+
+
+# Handshake, and check the guest's bounds against this host's. It is also the session reset
+# point: a virtio-serial port without MULTIPORT reports no open or close, so the guest is
+# never told that a host went away, and a HELLO is the only thing that tells it a new one
+# has taken over. Request IDs restart from here, which is what makes a reconnect
+# deterministic rather than a continuation of the previous host's numbering.
+def proto_hello(sock, buffer, timeout):
+	deadline = time.monotonic() + timeout
+	sock.sendall(proto_frame(OP_HELLO, 1))
+	opcode, status, payload = proto_await(sock, buffer, 1, deadline)
+	if opcode == OP_ERROR:
+		die(f'handshake refused: {proto_status(status)}')
+	if opcode != OP_HELLO_ACK or len(payload) < 10:
+		die(f'handshake reply was opcode {opcode:#04x} with {len(payload)} B of payload')
+	max_frame, max_payload, max_outstanding = struct.unpack('<IIH', payload[:10])
+	if max_frame != PROTO_MAX_FRAME or max_payload != PROTO_MAX_PAYLOAD:
+		die(f'guest reports a {max_frame} B frame bound ({max_payload} B payload); this host is built for {PROTO_MAX_FRAME} B ({PROTO_MAX_PAYLOAD} B)')
+	return max_frame, max_payload, max_outstanding
+
+
+def cmd_dev_ping(args):
+	count = arg_value(args, '--count', 1)
+	size = arg_value(args, '--size', 0)
+	timeout = arg_value(args, '--timeout', 5)
+	state, identity = dev_state()
+	if state == 'foreign':
+		dev_owner_conflict(identity)
+	if state in ('down', 'stale'):
+		die('no development instance (run `just dev-up` first)')
+	if state == 'detached':
+		die('the guest is running but no broker owns it; reattach with `just dev-up`')
+	if size > PROTO_MAX_PAYLOAD:
+		die(f'--size {size} exceeds the {PROTO_MAX_PAYLOAD} B payload bound')
+	sock = proto_connect(timeout)
+	buffer = bytearray()
+	try:
+		max_frame, max_payload, max_outstanding = proto_hello(sock, buffer, timeout)
+		print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {max_frame} B, max payload {max_payload} B, max outstanding {max_outstanding})')
+		# Request IDs must be non-zero and strictly increasing; the handshake took 1. A ping
+		# echoes its payload, so this measures the round trip of real bytes and proves the
+		# frame arrived intact rather than merely arrived.
+		payload = bytes(i & 0xff for i in range(size))
+		for i in range(count):
+			request = 2 + i
+			started = time.monotonic()
+			sock.sendall(proto_frame(OP_PING, request, payload))
+			opcode, status, echo = proto_await(sock, buffer, request, started + timeout)
+			elapsed = (time.monotonic() - started) * 1000
+			if opcode == OP_ERROR:
+				die(f'ping {request} refused: {proto_status(status)}')
+			if opcode != OP_PONG or echo != payload:
+				die(f'ping {request} answered with opcode {opcode:#04x}, {len(echo)} B echoed of {len(payload)} B sent')
+			print(f'lab: pong in {elapsed:.1f} ms (request {request}, {len(echo)} B echoed)')
+	finally:
+		sock.close()
 
 
 # ---- subcommands -----------------------------------------------------------
@@ -1140,7 +1312,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-down': cmd_dev_down}
 
 
 def main():

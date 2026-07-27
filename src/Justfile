@@ -556,6 +556,11 @@ dev-console *args:
 dev-log *args:
     @boot/lab.py dev-log {{ args }}
 
+# exercise the development-control protocol over the instance's control channel:
+# handshake, then round-trip echoed frames. e.g. `just dev-ping --count 5 --size 4096`
+dev-ping *args:
+    @boot/lab.py dev-ping {{ args }}
+
 # stop the development instance gracefully and release its lock
 dev-down *args:
     @boot/lab.py dev-down {{ args }}
