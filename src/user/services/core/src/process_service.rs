@@ -171,11 +171,35 @@ fn verify_identity(elf: &bootproto::elf::Elf<'_>, kind: &str, artifact: &str) ->
 	parse_identity(elf.liber_identity_note()?, kind, artifact)
 }
 
+// Where a loaded provider's bytes come from. The installed image is mapped from the volume
+// and read in place; a registry generation is held as bytes, because there is no file behind
+// it. Nothing below this type cares which it is: a generation only reaches here after it has
+// been proven to stand in for the installed image.
+enum Image {
+	Installed(MappedFile),
+	Registry(Vec<u8>),
+}
+
+impl Image {
+	unsafe fn bytes(&self) -> &[u8] {
+		match self {
+			Image::Installed(file) => unsafe { file.bytes() },
+			Image::Registry(bytes) => bytes,
+		}
+	}
+}
+
 struct Module {
 	name: String,
-	file: MappedFile,
+	image: Image,
 	dependencies: Vec<String>,
-	identity: Identity,
+	// The identity digest of the *installed* image at this name, which is what a consumer's
+	// record names whether or not a registry generation is standing in for it. For an installed
+	// module it is that module's own digest; for a shadowing generation it is the digest of the
+	// image the generation was proven interchangeable with. Keeping the installed digest is what
+	// lets the dependency check below stay a plain comparison: the compatibility argument was
+	// made once, where both images were in hand, rather than repeated per consumer.
+	baseline: [u8; 32],
 }
 
 fn identity_matches_dependencies(identity: &Identity, dependencies: &[String], modules: &[Module]) -> bool {
@@ -186,7 +210,7 @@ fn identity_matches_dependencies(identity: &Identity, dependencies: &[String], m
 		let Some(name) = dependency.strip_suffix(".lslib") else { return false };
 		let Some(module) = modules.iter().find(|module| module.name.as_str() == dependency.as_str()) else { return false };
 		let Some((_, digest)) = identity.providers.iter().find(|(provider, _)| provider.as_str() == name) else { return false };
-		if *digest != module.identity.digest {
+		if *digest != module.baseline {
 			return false;
 		}
 	}
@@ -195,6 +219,10 @@ fn identity_matches_dependencies(identity: &Identity, dependencies: &[String], m
 
 struct Resolver {
 	storage: u64,
+	// The development registry, or zero. Zeroed for the rest of this resolution as soon as a
+	// query goes unanswered: one launch must not pay the answer timeout once per provider
+	// because the agent is busy or gone.
+	registry: u64,
 	modules: Vec<Module>,
 	visiting: Vec<String>,
 }
@@ -210,13 +238,35 @@ impl Resolver {
 			}
 			self.visiting.push(String::from(name));
 			let module = (|| {
-				let file = MappedFile::open(self.storage, String::from(library_path(name)?))?;
-				let bytes = file.bytes();
+				let stem = name.strip_suffix(".lslib")?;
+				let installed = MappedFile::open(self.storage, String::from(library_path(name)?))?;
+				// The installed image is read first even when a generation will replace it, and
+				// that order is the whole of the rule: the digest a consumer's record names is
+				// this one, and compatibility is a statement about these two images.
+				let baseline = verify_identity(&bootproto::elf::Elf::parse(installed.bytes())?, "library", stem)?.digest;
+				let image = match registry_generation(&mut self.registry, stem) {
+					// A generation may stand in for the installed provider only when the written
+					// rule says a process that has already resolved against the installed one
+					// could not tell the difference. The publication reported the same verdict
+					// when it arrived, but the loader decides for itself: the registry holds
+					// incompatible generations too, and this is the point where they are refused.
+					// Refused, not skipped - loading the installed image instead would run
+					// something other than what was published while looking like success.
+					Some(shadow) => {
+						let compatible = bootproto::compat::decide(installed.bytes(), &shadow).is_compatible();
+						drop(installed);
+						if !compatible {
+							return None;
+						}
+						Image::Registry(shadow)
+					}
+					None => Image::Installed(installed),
+				};
+				let bytes = image.bytes();
 				let elf = bootproto::elf::Elf::parse(bytes)?;
 				if elf.image_type != bootproto::elf::ET_DYN {
 					return None;
 				}
-				let stem = name.strip_suffix(".lslib")?;
 				let identity = verify_identity(&elf, "library", stem)?;
 				let dynamic = elf.dynamic_info()??;
 				let dependencies = dependencies(&elf, &dynamic)?;
@@ -228,7 +278,7 @@ impl Resolver {
 				if !identity_matches_dependencies(&identity, &dependencies, &self.modules) {
 					return None;
 				}
-				Some(Module { name: String::from(name), file, dependencies, identity })
+				Some(Module { name: String::from(name), image, dependencies, baseline })
 			})();
 			self.visiting.pop();
 			if let Some(module) = module {
@@ -254,7 +304,7 @@ impl Resolver {
 			for (index, name) in order.iter().enumerate() {
 				let Some(module) = self.modules.iter().find(|module| &module.name == name) else { return false };
 				let Some(bias) = LIBRARY_BASE.checked_add((index as u64).checked_mul(LIBRARY_SLOT_SIZE).unwrap_or(u64::MAX)) else { return false };
-				if process_load_module(process, module.file.bytes(), bias) < 0 {
+				if process_load_module(process, module.image.bytes(), bias) < 0 {
 					return false;
 				}
 			}
@@ -361,7 +411,7 @@ impl<'a> Processes<'a> {
 					}
 				} else {
 					match self.package.lookup(artifact.as_bytes()) {
-						Some(elf) => spawn_program_bytes(self.storage, elf, None, bootstrap, domain),
+						Some(elf) => spawn_program_bytes(self.storage, 0, elf, None, bootstrap, domain),
 						None => continue,
 					}
 				};
@@ -376,7 +426,7 @@ impl<'a> Processes<'a> {
 // create a process from the mapped ELF image, then release the mapping. Returns the new
 // process handle. None means the named artifact was absent; a present but invalid
 // artifact returns a negative handle so resolution never falls through to another name.
-unsafe fn spawn_from_path(storage: u64, registry: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<i64> {
+unsafe fn spawn_from_path(storage: u64, mut registry: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<i64> {
 	unsafe {
 		let logical_name = executable::logical_name(artifact)?;
 		// Ask the development registry first. It answers with a generation of exactly this
@@ -385,23 +435,34 @@ unsafe fn spawn_from_path(storage: u64, registry: u64, path: &str, artifact: &st
 		// Everything after this point is identical either way: the image is verified against
 		// its own identity record and its providers are checked against what that record names,
 		// so a shadowing generation earns its launch by the same rules the installed one does.
-		if let Some(shadow) = registry_generation(registry, logical_name) {
-			return Some(spawn_program_bytes(storage, &shadow, Some(logical_name), bootstrap, domain));
+		//
+		// No compatibility rule applies to an executable, and none is missing: that rule exists
+		// because a running process has already resolved against a provider, and nothing has
+		// resolved against a program that has not started yet.
+		if let Some(shadow) = registry_generation(&mut registry, logical_name) {
+			return Some(spawn_program_bytes(storage, registry, &shadow, Some(logical_name), bootstrap, domain));
 		}
 		let main = MappedFile::open(storage, String::from(path))?;
-		Some(spawn_program_bytes(storage, main.bytes(), Some(logical_name), bootstrap, domain))
+		Some(spawn_program_bytes(storage, registry, main.bytes(), Some(logical_name), bootstrap, domain))
 	}
 }
 
 // Ask the development registry for a generation of `artifact`. None when there is no
 // registry, when it holds nothing for that name, or when it does not answer - all of which
 // mean the installed artifact is what gets loaded.
+//
+// The handle is taken by reference and zeroed when the registry does not answer, which ends
+// the questioning for the rest of this resolution. One launch reaches this once for the
+// program and once per provider in its closure, so an agent that has gone quiet would
+// otherwise cost the answer timeout on every one of them. Only this launch's copy is
+// zeroed - the silence may be nothing more than an agent busy inside another call.
 // How long a launch waits for the registry to answer, in scheduler ticks (100 Hz).
 const REGISTRY_ANSWER_TICKS: u64 = 100;
 
-unsafe fn registry_generation(registry: u64, artifact: &str) -> Option<Vec<u8>> {
+unsafe fn registry_generation(registry: &mut u64, artifact: &str) -> Option<Vec<u8>> {
 	unsafe {
-		if registry == 0 || artifact.len() > 64 {
+		let handle: u64 = *registry;
+		if handle == 0 || artifact.len() > 64 {
 			return None;
 		}
 		// Drop anything already queued before asking. A query whose deadline expired leaves its
@@ -409,12 +470,14 @@ unsafe fn registry_generation(registry: u64, artifact: &str) -> Option<Vec<u8>> 
 		// channel permanently one answer behind - every launch then loads what the registry
 		// held at the previous launch, which is worse than not resolving at all because it
 		// looks like it worked.
-		while channel_peek(registry) >= 0 {
-			if let ReceivedVec::Closed = recv_vec_blocking(registry) {
+		while channel_peek(handle) >= 0 {
+			if let ReceivedVec::Closed = recv_vec_blocking(handle) {
+				*registry = 0;
 				return None;
 			}
 		}
-		if !send_blocking(registry, artifact.as_bytes(), 0) {
+		if !send_blocking(handle, artifact.as_bytes(), 0) {
+			*registry = 0;
 			return None;
 		}
 		// Look before waiting. The agent can answer before this ever reaches the wait, and a
@@ -424,20 +487,25 @@ unsafe fn registry_generation(registry: u64, artifact: &str) -> Option<Vec<u8>> 
 		// every later launch down with it.
 		let limit: u64 = clock() + REGISTRY_ANSWER_TICKS;
 		loop {
-			if channel_peek(registry) >= 0 {
-				return match recv_vec_blocking(registry) {
+			if channel_peek(handle) >= 0 {
+				return match recv_vec_blocking(handle) {
 					ReceivedVec::Message { bytes, .. } if !bytes.is_empty() => Some(bytes),
-					_ => None,
+					ReceivedVec::Message { .. } => None,
+					ReceivedVec::Closed => {
+						*registry = 0;
+						None
+					}
 				};
 			}
-			if clock() >= limit || wait(registry, limit) < 0 {
+			if clock() >= limit || wait(handle, limit) < 0 {
+				*registry = 0;
 				return None;
 			}
 		}
 	}
 }
 
-unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_identity: Option<&str>, bootstrap: u64, domain: u64) -> i64 {
+unsafe fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_identity: Option<&str>, bootstrap: u64, domain: u64) -> i64 {
 	unsafe {
 		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return -1 };
 		let Some(dynamic) = elf.dynamic_info() else { return -1 };
@@ -459,7 +527,7 @@ unsafe fn spawn_program_bytes(storage: u64, bytes: &[u8], expected_identity: Opt
 		if storage == 0 {
 			return -1;
 		}
-		let mut resolver = Resolver { storage, modules: Vec::new(), visiting: Vec::new() };
+		let mut resolver = Resolver { storage, registry, modules: Vec::new(), visiting: Vec::new() };
 		for dependency in &dependencies {
 			if !resolver.collect(dependency, 0) {
 				return -1;

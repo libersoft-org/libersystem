@@ -1,0 +1,102 @@
+# A published provider generation is what the next launch resolves against, and only when the
+# compatibility rule allows it.
+#
+# The subject is `ps`, which is never published here: it is the installed executable
+# throughout. What changes is `process-proto`, the provider that renders the process records
+# `ps` prints - so a change in that output can only mean the provider under an unchanged
+# program was replaced.
+#
+# The compatible fixture alters the field name the provider writes and nothing else, which is
+# hot-publishable: no export moves, no identity field except the content digest differs, and
+# the declared closure is unchanged. That the content digest differs is the point - the
+# executable's identity record names the installed provider's digest, so this generation is
+# admitted by the rule rather than by an equality it would fail.
+#
+# The incompatible fixture alters the feature set the image was built with. It publishes
+# perfectly well, because the registry holds what it is given and records a verdict; it is the
+# launch that refuses it. The refusal is deliberate rather than a fallback: loading the
+# installed provider instead would run something other than what was published while looking
+# like success. The shell renders every failed launch the same way, so what appears is its
+# usual unknown-command line; the explanation of which field decided it is in the publication
+# verdict, where it was reported the moment the generation arrived.
+version = 1
+name = "registry provider"
+description = "A compatible provider generation resolves under an unchanged executable; an incompatible one is refused at launch."
+timeout = 240
+
+[[step]]
+do = "reset"
+
+# Clear the line editor before typing anything. The guest terminal is a real terminal: an
+# earlier scenario that typed without a newline leaves its characters in the buffer, and they
+# would prefix the first command here.
+[[step]]
+do = "input"
+text = "\u0003"
+enter = false
+
+[[step]]
+do = "prompt"
+
+# The installed provider, so the change below is measured against something rather than
+# asserted in isolation.
+[[step]]
+do = "input"
+text = "ps"
+
+[[step]]
+do = "expect"
+contains = "koid="
+timeout = 20
+
+[[step]]
+do = "publish"
+artifact = "process-proto"
+file = "../.build/scenario-fixtures/process-proto-shadow"
+timeout = 60
+
+[[step]]
+do = "input"
+text = "ps"
+
+[[step]]
+do = "expect"
+contains = "PKID="
+timeout = 20
+
+# The same provider, incompatible. The launch that would load it fails instead of quietly
+# loading the installed one.
+[[step]]
+do = "publish"
+artifact = "process-proto"
+file = "../.build/scenario-fixtures/process-proto-incompatible"
+timeout = 60
+
+[[step]]
+do = "input"
+text = "ps"
+
+# One assertion covers both ways this could go wrong, because the incompatible fixture leaves
+# the field name alone: whether the generation were wrongly accepted or quietly skipped in
+# favour of the installed provider, either way a process list headed by the installed field
+# name would appear. Nothing printed is the refusal. The shell says nothing itself - a launch
+# that fails is silent there - and the reason lives in the publication verdict, which named
+# the deciding field when the generation arrived. That the terminal is still working, rather
+# than the input having gone nowhere, is what the last two steps establish.
+[[step]]
+do = "absent"
+contains = "koid="
+timeout = 10
+
+# Rolling the generations away puts the installed provider back, with no restart.
+[[step]]
+do = "reset"
+
+[[step]]
+do = "input"
+text = "ps"
+
+[[step]]
+do = "expect"
+contains = "koid="
+timeout = 20

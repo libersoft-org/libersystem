@@ -1,5 +1,6 @@
 # Bugs / changes
 
+- some services in src/users/services/core/src/ have it's own folder (like graph_limits), but there is only tests.rs file while graph_limits.rs resides outside of this directory - fix it... move it to the proper directory
 - testing CD image should be different from release CD image (release should not have testing volumes like UDF, ISO etc.)
 - cd bin -> lico.lsexe - says command not found, but this lsexe is present in this directory
 - static builds are completely forbidden? - if so, allow it, just don't use it for system tools
