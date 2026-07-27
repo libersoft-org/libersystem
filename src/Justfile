@@ -580,6 +580,11 @@ dev-type *args:
 dev-reset *args:
     @boot/lab.py dev-reset {{ args }}
 
+# return an artifact in the development instance registry to the generation before its
+# newest. e.g. `just dev-rollback base-proto`
+dev-rollback *args:
+    @boot/lab.py dev-rollback {{ args }}
+
 # stop the development instance gracefully and release its lock
 dev-down *args:
     @boot/lab.py dev-down {{ args }}

@@ -72,7 +72,8 @@ Persistent development instance (one owner at a time):
   dev-log [-f | <pat>]  show / follow / grep its serial log
   dev-ping [--count N] [--size N] [--timeout N]  exercise the control protocol
   dev-publish <name> <file>  stream a file into the guest artifact registry
-  dev-generations       list the generations the guest holds
+  dev-generations       list what the guest registry shadows, and since when
+  dev-rollback <name>   return an artifact to the generation before its newest
   dev-type [--no-enter] <text...>  type into the guest terminal, with a byte count back
   dev-reset             drop the guest development state (not a reboot)
   dev-down              stop it gracefully and release the lock"""
@@ -707,6 +708,16 @@ def cmd_dev_status(args):
 	if state == 'starting':
 		print('     no shell prompt yet; rerun `just dev-status` or watch `just dev-log -f`')
 		sys.exit(1)
+	shadowed = dev_shadowed()
+	if shadowed is None:
+		print('     registry not reachable (the control channel is busy or absent)')
+	elif not shadowed:
+		print('     registry empty; nothing shadows the system volume')
+	else:
+		print(f'     registry {len(shadowed)} artifact(s) shadowing the system volume:')
+		for name, generation, when in shadowed:
+			print(f'              {name} generation {generation}, published {when}')
+		print('              these override the built image until `just dev-rollback` or a restart')
 	stale = instance_stale_inputs(identity)
 	if stale is None:
 		print('     inputs   not recorded by this instance; restart it to compare')
@@ -723,6 +734,29 @@ def cmd_dev_status(args):
 	print('     action   cold restart: `just dev-down && just dev-up`')
 	print('              this is a cold invalidation, not a hot-publishable application change')
 	sys.exit(1)
+
+
+# What the guest registry currently shadows, as (name, generation, age). None when the
+# control channel cannot be reached at all - a status command reports that rather than
+# failing, because a busy channel is not a broken instance.
+def dev_shadowed():
+	if not os.path.exists(DEV_CHANNEL_SOCK):
+		return None
+	try:
+		sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		sock.settimeout(2)
+		sock.connect(DEV_CHANNEL_SOCK)
+	except OSError:
+		return None
+	buffer = bytearray()
+	try:
+		proto_hello(sock, buffer, 2)
+		artifacts, _ = read_registry(sock, buffer, 2)
+		return [(a['name'], a['generations'][-1]['generation'], published_ago(a['generations'][-1]['published_at'])) for a in artifacts]
+	except (SystemExit, OSError, struct.error):
+		return None
+	finally:
+		sock.close()
 
 
 # Detach key: Ctrl-] , the telnet convention. It leaves the guest and the shell running,
@@ -900,6 +934,8 @@ OP_PUB_ABORT = 0x13
 OP_PUB_ACK = 0x14
 OP_GEN_LIST = 0x15
 OP_GEN_LIST_REPLY = 0x16
+OP_ROLLBACK = 0x17
+OP_ROLLBACK_ACK = 0x18
 OP_TERM_INPUT = 0x20
 OP_TERM_ACK = 0x21
 OP_RESET = 0x22
@@ -923,6 +959,13 @@ PROTO_STATUS = {
 	11: 'candidate does not match its declared digest',
 	12: 'no room in the registry',
 	13: 'the guest console refused the input',
+	14: 'not a readable image',
+	15: 'built for a different target than the guest',
+	16: 'no canonical image identity record',
+	17: 'the image is not the artifact it was published as',
+	18: 'a dependency the identity record does not declare',
+	19: 'unreadable dynamic metadata',
+	20: 'no earlier generation to return to',
 }
 
 # How a committed generation compares with the one it succeeded, under the written provider
@@ -1011,10 +1054,10 @@ def proto_hello(sock, buffer, timeout):
 	opcode, _, status, payload = proto_await(sock, buffer, 1, deadline)
 	if opcode == OP_ERROR:
 		die(f'handshake refused: {proto_status(status)}')
-	if opcode != OP_HELLO_ACK or len(payload) < 20:
+	if opcode != OP_HELLO_ACK or len(payload) < 24:
 		die(f'handshake reply was opcode {opcode:#04x} with {len(payload)} B of payload')
-	fields = struct.unpack('<IIHHIHH', payload[:20])
-	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5], 'max_term_input': fields[6]}
+	fields = struct.unpack('<IIHHIHHI', payload[:24])
+	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5], 'max_term_input': fields[6], 'max_registry': fields[7]}
 	if bounds['max_frame'] != PROTO_MAX_FRAME or bounds['max_payload'] != PROTO_MAX_PAYLOAD:
 		die(f'guest reports a {bounds["max_frame"]} B frame bound ({bounds["max_payload"]} B payload); this host is built for {PROTO_MAX_FRAME} B ({PROTO_MAX_PAYLOAD} B)')
 	return bounds
@@ -1043,7 +1086,7 @@ def proto_session(timeout):
 	sock = proto_connect(timeout)
 	buffer = bytearray()
 	bounds = proto_hello(sock, buffer, timeout)
-	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max payload {bounds["max_payload"]} B, max outstanding {bounds["max_outstanding"]}, max artifact {bounds["max_artifact"]} B, {bounds["max_generations"]} generations, max terminal input {bounds["max_term_input"]} B)')
+	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max artifact {bounds["max_artifact"] // (1024 * 1024)} MB, registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact, max terminal input {bounds["max_term_input"]} B)')
 	return sock, buffer, bounds
 
 
@@ -1190,31 +1233,83 @@ def cmd_dev_reset(args):
 		sock.close()
 
 
-def cmd_dev_generations(args):
-	timeout = arg_value(args, '--timeout', 5)
-	sock, buffer, _ = proto_session(timeout)
-	try:
-		opcode, _, body = proto_request(sock, buffer, 2, OP_GEN_LIST, timeout=timeout, what='generation list')
-		if opcode != OP_GEN_LIST_REPLY or len(body) < 2:
-			die(f'generation list answered with opcode {opcode:#04x} and {len(body)} B')
-		count = struct.unpack('<H', body[:2])[0]
-		if not count:
-			print('lab: the guest holds no published generations')
-			return
-		at = 2
-		print(f'lab: {count} generation(s), oldest first')
-		for _ in range(count):
+# Read the registry: every artifact, and the generations retained for it. The newest
+# generation of each is what currently shadows the system volume, which is the thing worth
+# seeing at a glance - a forgotten override is a fix that appears not to have worked.
+def read_registry(sock, buffer, timeout):
+	opcode, _, body = proto_request(sock, buffer, 2, OP_GEN_LIST, timeout=timeout, what='registry query')
+	if opcode != OP_GEN_LIST_REPLY or len(body) < 6:
+		die(f'registry query answered with opcode {opcode:#04x} and {len(body)} B')
+	count, registry_bytes = struct.unpack('<HI', body[:6])
+	at = 6
+	artifacts = []
+	for _ in range(count):
+		name_len = body[at]
+		name = body[at + 1:at + 1 + name_len].decode(errors='replace')
+		at += 1 + name_len
+		held = body[at]
+		at += 1
+		generations = []
+		for _ in range(held):
 			generation, length = struct.unpack('<II', body[at:at + 8])
 			digest = body[at + 8:at + 40]
-			name_len = body[at + 40]
-			name = body[at + 41:at + 41 + name_len].decode(errors='replace')
-			at += 41 + name_len
-			verdict, detail_len = body[at], body[at + 1]
-			detail = body[at + 2:at + 2 + detail_len].decode(errors='replace')
-			at += 2 + detail_len
-			print(f'     {generation:<4} {name:<20} {length:>9} B  sha256 {digest.hex()[:16]}...  {PROTO_VERDICT.get(verdict, verdict)}')
-			if detail:
-				print(f'          {detail}')
+			published_at = struct.unpack('<Q', body[at + 40:at + 48])[0]
+			verdict, detail_len = body[at + 48], body[at + 49]
+			detail = body[at + 50:at + 50 + detail_len].decode(errors='replace')
+			at += 50 + detail_len
+			generations.append({'generation': generation, 'length': length, 'digest': digest, 'published_at': published_at, 'verdict': verdict, 'detail': detail})
+		artifacts.append({'name': name, 'generations': generations})
+	return artifacts, registry_bytes
+
+
+def published_ago(published_at):
+	if not published_at:
+		return 'unknown time'
+	seconds = max(int(time.time()) - published_at, 0)
+	if seconds < 90:
+		return f'{seconds} s ago'
+	if seconds < 5400:
+		return f'{seconds // 60} min ago'
+	return f'{seconds // 3600} h ago'
+
+
+def cmd_dev_generations(args):
+	timeout = arg_value(args, '--timeout', 5)
+	sock, buffer, bounds = proto_session(timeout)
+	try:
+		artifacts, registry_bytes = read_registry(sock, buffer, timeout)
+		if not artifacts:
+			print('lab: the guest registry is empty; nothing shadows the system volume')
+			return
+		print(f'lab: {len(artifacts)} artifact(s), {registry_bytes} B of {bounds["max_registry"]} B registry')
+		for artifact in artifacts:
+			shadowing = artifact['generations'][-1]
+			print(f'     {artifact["name"]} - shadowed by generation {shadowing["generation"]}, published {published_ago(shadowing["published_at"])}')
+			for entry in artifact['generations']:
+				marker = '*' if entry is shadowing else ' '
+				print(f'     {marker}  {entry["generation"]:<4} {entry["length"]:>9} B  sha256 {entry["digest"].hex()[:16]}...  {PROTO_VERDICT.get(entry["verdict"], entry["verdict"])}')
+				if entry['detail']:
+					print(f'            {entry["detail"]}')
+	finally:
+		sock.close()
+
+
+# Return an artifact to the generation before its newest. Named on purpose: overshooting is
+# as common as failing in a development loop, and undoing it should not mean republishing an
+# image the host may no longer have.
+def cmd_dev_rollback(args):
+	timeout = arg_value(args, '--timeout', 5)
+	rest = [a for a in args if not a.startswith('--')]
+	if len(rest) != 1:
+		die('usage: dev-rollback <name>')
+	name = rest[0].encode()
+	sock, buffer, _ = proto_session(timeout)
+	try:
+		opcode, _, body = proto_request(sock, buffer, 2, OP_ROLLBACK, bytes([len(name)]) + name, timeout=timeout, what=f'rollback of {rest[0]}')
+		if opcode != OP_ROLLBACK_ACK or len(body) < 8:
+			die(f'rollback answered with opcode {opcode:#04x} and {len(body)} B')
+		now, dropped = struct.unpack('<II', body[:8])
+		print(f'lab: {rest[0]} rolled back to generation {now}; generation {dropped} discarded')
 	finally:
 		sock.close()
 
@@ -1504,7 +1599,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-down': cmd_dev_down}
 
 
 def main():

@@ -170,7 +170,9 @@ pub fn decide<'a>(installed: &'a [u8], candidate: &'a [u8]) -> Verdict<'a> {
 
 // The machine an image declares, read straight from the header so it can be compared before
 // either image is parsed. None when the bytes are not a 64-bit little-endian ELF at all.
-fn declared_machine(bytes: &[u8]) -> Option<u16> {
+// Public because a publication needs the same distinction this rule needs: an image for
+// another target is a wrong-target rejection, not an unreadable file.
+pub fn declared_machine(bytes: &[u8]) -> Option<u16> {
 	if bytes.len() < 20 || bytes[..4] != [0x7f, b'E', b'L', b'F'] || bytes[4] != 2 || bytes[5] != 1 {
 		return None;
 	}

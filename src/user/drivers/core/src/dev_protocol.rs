@@ -35,6 +35,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use bootproto::compat;
+use bootproto::elf::Elf;
 use rt::*;
 
 // The protocol's identifying prefix ("LD" on the wire) and the version this guest speaks. A
@@ -55,13 +56,23 @@ pub const MAX_PAYLOAD: usize = MAX_FRAME - HEADER_LEN;
 // bound exists for the peer to size itself by.
 pub const MAX_OUTSTANDING: u16 = 16;
 
-// The artifact registry's bounds. One candidate is open at a time and the retained
-// generations are a fixed ring, so the guest's development memory is capped at
-// MAX_ARTIFACT * (MAX_GENERATIONS + 1) whatever a host does.
-pub const MAX_ARTIFACT: u32 = 1024 * 1024;
-pub const MAX_GENERATIONS: usize = 4;
+// The artifact registry's bounds, stated as numbers rather than left to whatever the
+// allocator happens to tolerate. Every one of them is checked before a byte is reserved, so
+// exceeding one is a typed refusal a host can act on and never an allocation that fails
+// halfway through a publication.
+//
+// The registry is memory the driver holds and nothing else: candidates and generations never
+// touch the canonical system volume, so a publication cannot damage what a cold boot would
+// read, and a reboot returns the guest to exactly its built state.
+pub const MAX_ARTIFACT: u32 = 32 * 1024 * 1024;
+pub const MAX_REGISTRY: usize = 64 * 1024 * 1024;
+pub const MAX_GENERATIONS_PER_ARTIFACT: usize = 3;
 // An artifact name is a bounded identifier, not a path: it names a slot in the registry.
 pub const MAX_NAME: usize = 48;
+
+// What a DT_NEEDED entry appends to a provider's name, so a need can be matched against the
+// declared provider closure.
+const LIBRARY_SUFFIX: &str = ".lslib";
 
 // How a committed generation compares with the one it succeeded, under the written provider
 // compatibility rule. FIRST is not a weaker COMPATIBLE: nothing was replaced, so no claim
@@ -95,6 +106,8 @@ pub const OP_PUB_ABORT: u8 = 0x13;
 pub const OP_PUB_ACK: u8 = 0x14;
 pub const OP_GEN_LIST: u8 = 0x15;
 pub const OP_GEN_LIST_REPLY: u8 = 0x16;
+pub const OP_ROLLBACK: u8 = 0x17;
+pub const OP_ROLLBACK_ACK: u8 = 0x18;
 pub const OP_TERM_INPUT: u8 = 0x20;
 pub const OP_TERM_ACK: u8 = 0x21;
 pub const OP_RESET: u8 = 0x22;
@@ -117,6 +130,17 @@ pub const ST_INCOMPLETE: u16 = 10;
 pub const ST_DIGEST_MISMATCH: u16 = 11;
 pub const ST_NO_SPACE: u16 = 12;
 pub const ST_TERM_REFUSED: u16 = 13;
+// The publication verification statuses, in the order the checks run. Each names the check
+// that refused the candidate, so a rejection is a fact about the image rather than a generic
+// failure.
+pub const ST_NOT_AN_IMAGE: u16 = 14;
+pub const ST_WRONG_TARGET: u16 = 15;
+pub const ST_NO_IDENTITY: u16 = 16;
+pub const ST_NOT_OWNED: u16 = 17;
+pub const ST_BAD_PROVIDERS: u16 = 18;
+pub const ST_BAD_DYNAMIC: u16 = 19;
+// A rollback with no earlier generation to return to.
+pub const ST_NOTHING_TO_ROLL_BACK: u16 = 20;
 
 // The deadline on an incomplete frame, in scheduler ticks (100 Hz). A host that stops
 // mid-frame - killed, disconnected, or writing a length it never delivers - must not leave
@@ -156,19 +180,29 @@ struct Candidate {
 	deadline: u64,
 }
 
-// One artifact the guest has accepted. The bytes are retained because the registry that
-// installs them does not exist yet: this version proves a publication arrived whole and
-// matched its digest, and what happens to it afterwards is the development agent's.
+// One verified, immutable generation of an artifact. It becomes visible in one step at the
+// end of commit - every check has already passed by then, so there is no moment at which a
+// half-verified generation is queryable.
 struct Generation {
 	generation: u32,
-	name: Vec<u8>,
 	digest: [u8; 32],
 	bytes: Vec<u8>,
+	// When it was published, as a Unix timestamp, or 0 when the guest has no clock to ask.
+	// A forgotten override is easiest to recognise by being old.
+	published_at: u64,
 	// Whether this generation could have replaced the one it succeeded without a restart,
 	// and what decided that. Recorded at commit, when both images are in hand, because that
 	// is the only moment the comparison is cheap and the answer is what a caller asked for.
 	verdict: u8,
 	detail: Vec<u8>,
+}
+
+// One named artifact and the generations retained for it, newest last. Retention is per
+// artifact rather than across the registry, so publishing one thing repeatedly cannot evict
+// the history of everything else.
+struct Artifact {
+	name: Vec<u8>,
+	generations: Vec<Generation>,
 }
 
 // One protocol session and the registry it operates on. A HELLO opens the session and the
@@ -195,12 +229,15 @@ pub struct Session {
 	// never reused and a stale reference is always recognisable as stale.
 	next_generation: u32,
 	candidate: Option<Candidate>,
-	generations: Vec<Generation>,
+	artifacts: Vec<Artifact>,
+	// Live registry content in bytes, tracked rather than recomputed so the budget can be
+	// checked before a reservation instead of after an allocation.
+	registry_bytes: usize,
 }
 
 impl Session {
 	pub fn new() -> Session {
-		Session { handshake: false, high_request: 0, next_generation: 1, candidate: None, generations: Vec::new() }
+		Session { handshake: false, high_request: 0, next_generation: 1, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
 	}
 
 	pub fn is_open(&self) -> bool {
@@ -299,14 +336,15 @@ impl Session {
 			self.close();
 			self.handshake = true;
 			self.high_request = request;
-			let mut reply: [u8; 20] = [0u8; 20];
+			let mut reply: [u8; 28] = [0u8; 28];
 			reply[..4].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
 			reply[4..8].copy_from_slice(&(MAX_PAYLOAD as u32).to_le_bytes());
 			reply[8..10].copy_from_slice(&MAX_OUTSTANDING.to_le_bytes());
 			reply[10..12].copy_from_slice(&(MAX_NAME as u16).to_le_bytes());
 			reply[12..16].copy_from_slice(&MAX_ARTIFACT.to_le_bytes());
-			reply[16..18].copy_from_slice(&(MAX_GENERATIONS as u16).to_le_bytes());
+			reply[16..18].copy_from_slice(&(MAX_GENERATIONS_PER_ARTIFACT as u16).to_le_bytes());
 			reply[18..20].copy_from_slice(&(MAX_TERM_INPUT as u16).to_le_bytes());
+			reply[20..24].copy_from_slice(&(MAX_REGISTRY as u32).to_le_bytes());
 			return sink.send(OP_HELLO_ACK, request, 0, ST_OK, &reply);
 		}
 		if !self.handshake {
@@ -319,7 +357,7 @@ impl Session {
 		// The generation field names the candidate an operation applies to. The operations
 		// that are not about one candidate must leave it zero, so the field never acquires an
 		// accidental second meaning that a later version would have to preserve.
-		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_TERM_INPUT | OP_RESET);
+		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_ROLLBACK | OP_TERM_INPUT | OP_RESET);
 		if session_scoped && generation != 0 {
 			return sink.send(OP_ERROR, request, generation, ST_MALFORMED, &[]);
 		}
@@ -332,6 +370,7 @@ impl Session {
 			OP_PUB_COMMIT => self.publication_commit(request, generation, payload, sink),
 			OP_PUB_ABORT => self.publication_abort(request, generation, payload, sink),
 			OP_GEN_LIST => self.generation_list(request, sink),
+			OP_ROLLBACK => self.rollback(request, payload, sink),
 			OP_TERM_INPUT => terminal_input(request, payload, sink),
 			OP_RESET => self.reset(request, sink),
 			_ => sink.send(OP_ERROR, request, generation, ST_BAD_OPCODE, &[]),
@@ -359,6 +398,13 @@ impl Session {
 		// memory bound a fact rather than a hope.
 		if self.candidate.is_some() {
 			return sink.send(OP_ERROR, request, 0, ST_BUSY, &[]);
+		}
+		// The registry budget is checked here, against what this publication would add on top
+		// of what is already live, rather than at commit. Reserving 32 MB and discovering at
+		// the end that it does not fit would waste the whole transfer, and reserving it and
+		// failing to allocate would turn a stated limit into an allocator's opinion.
+		if self.registry_bytes + total as usize > MAX_REGISTRY {
+			return sink.send(OP_ERROR, request, 0, ST_NO_SPACE, &(self.registry_bytes as u32).to_le_bytes());
 		}
 		let mut digest: [u8; 32] = [0u8; 32];
 		digest.copy_from_slice(&payload[4..36]);
@@ -395,10 +441,14 @@ impl Session {
 		sink.send(OP_PUB_ACK, request, generation, ST_OK, &received.to_le_bytes())
 	}
 
-	// Accept the candidate, or refuse it. Both checks are made here rather than trusted from
-	// the chunks: the length proves nothing was lost, and the digest proves nothing was
-	// altered, and neither is worth checking incrementally when a mismatch means the whole
-	// artifact is discarded anyway.
+	// Accept the candidate, or refuse it. Nothing here is trusted from the chunks: the length
+	// proves nothing was lost, the digest proves nothing was altered, and the checks after
+	// them prove the bytes are an image this guest could actually use under the name it was
+	// published as. Every check runs before anything becomes visible, so the registry never
+	// holds a generation that only some of them passed.
+	//
+	// The checks are ordered cheapest and most fundamental first, and each has its own status,
+	// so a refusal says which one decided it rather than leaving a host to guess.
 	fn publication_commit(&mut self, request: u32, generation: u32, _payload: &[u8], sink: &mut impl Sink) -> bool {
 		let candidate = match &self.candidate {
 			Some(c) if c.generation == generation => c,
@@ -412,35 +462,84 @@ impl Session {
 			self.candidate = None;
 			return live;
 		}
+		if let Some(status) = verify_image(&candidate.bytes, &candidate.name) {
+			// A candidate that failed verification is dropped, not kept for a second opinion:
+			// the bytes are known bad and holding them would spend the registry budget on
+			// something no operation could ever use.
+			let live: bool = sink.send(OP_ERROR, request, generation, status, &[]);
+			self.candidate = None;
+			return live;
+		}
 		let candidate = self.candidate.take().expect("candidate was matched above");
 		// Decide, and record, whether this generation could have replaced the one it succeeds
-		// without a restart. It is a recorded fact, never a gate: the artifact arrived whole
-		// and matched its digest, so it belongs in the registry either way, and what the
-		// verdict decides is whether installing it is a hot swap or needs the cold path.
-		// Comparing against the newest generation of the same name is the same comparison the
-		// registry will make against the installed provider, with the same rule and the same
-		// two images.
-		let (verdict, detail): (u8, Vec<u8>) = match self.generations.iter().rev().find(|entry| entry.name == candidate.name) {
+		// without a restart. It is a recorded fact, never a gate: the artifact passed every
+		// check above, so it belongs in the registry either way, and what the verdict decides
+		// is whether installing it is a hot swap or needs the cold path.
+		let index: Option<usize> = self.artifacts.iter().position(|entry| entry.name == candidate.name);
+		let (verdict, detail): (u8, Vec<u8>) = match index.and_then(|at| self.artifacts[at].generations.last()) {
 			Some(previous) => match compat::decide(&previous.bytes, &candidate.bytes) {
 				compat::Verdict::Compatible => (VERDICT_COMPATIBLE, Vec::new()),
 				compat::Verdict::Incompatible(reason) => (VERDICT_INCOMPATIBLE, explain(&reason)),
 			},
 			None => (VERDICT_FIRST, Vec::new()),
 		};
-		// The registry is a bounded ring: the oldest generation makes way rather than the
-		// newest being refused, because a development loop publishes continuously and the
-		// useful end of that history is the recent one.
-		if self.generations.len() >= MAX_GENERATIONS {
-			self.generations.remove(0);
+		let entry = Generation { generation: candidate.generation, digest: candidate.digest, published_at: unsafe { clock_rtc() }, verdict, detail, bytes: candidate.bytes };
+		let added: usize = entry.bytes.len();
+		let at: usize = match index {
+			Some(at) => at,
+			None => {
+				self.artifacts.push(Artifact { name: candidate.name, generations: Vec::new() });
+				self.artifacts.len() - 1
+			}
+		};
+		// Retention is per artifact and by count: the oldest generation of THIS artifact makes
+		// way, so publishing one thing repeatedly never evicts another thing's history.
+		let artifact = &mut self.artifacts[at];
+		if artifact.generations.len() >= MAX_GENERATIONS_PER_ARTIFACT {
+			let dropped = artifact.generations.remove(0);
+			self.registry_bytes -= dropped.bytes.len();
 		}
-		self.generations.push(Generation { generation: candidate.generation, name: candidate.name, digest: candidate.digest, bytes: candidate.bytes, verdict, detail });
-		let entry = self.generations.last().expect("the generation was just pushed");
+		let artifact = &mut self.artifacts[at];
+		artifact.generations.push(entry);
+		self.registry_bytes += added;
+		let entry = self.artifacts[at].generations.last().expect("the generation was just pushed");
 		let mut reply: Vec<u8> = Vec::new();
-		reply.extend_from_slice(&(self.generations.len() as u16).to_le_bytes());
+		reply.extend_from_slice(&(self.artifacts.len() as u16).to_le_bytes());
 		reply.push(entry.verdict);
 		reply.push(entry.detail.len() as u8);
 		reply.extend_from_slice(&entry.detail);
 		sink.send(OP_PUB_ACK, request, generation, ST_OK, &reply)
+	}
+
+	// Return an artifact to the generation before its newest, as a named operation rather
+	// than as something that only happens when a publication fails. A development loop
+	// overshoots as often as it fails, and undoing that deliberately must not require
+	// republishing an older image the host may no longer have.
+	//
+	// Payload: name_len u8 | name. Reply: the generation now newest, or a refusal when there
+	// is nothing behind the current one.
+	fn rollback(&mut self, request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
+		if payload.is_empty() {
+			return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
+		}
+		let name_len: usize = payload[0] as usize;
+		if payload.len() != 1 + name_len || !name_is_valid(&payload[1..]) {
+			return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
+		}
+		let at: usize = match self.artifacts.iter().position(|entry| entry.name == payload[1..]) {
+			Some(at) => at,
+			None => return sink.send(OP_ERROR, request, 0, ST_NOTHING_TO_ROLL_BACK, &[]),
+		};
+		if self.artifacts[at].generations.len() < 2 {
+			return sink.send(OP_ERROR, request, 0, ST_NOTHING_TO_ROLL_BACK, &[]);
+		}
+		let dropped = self.artifacts[at].generations.pop().expect("length was checked above");
+		self.registry_bytes -= dropped.bytes.len();
+		let now = self.artifacts[at].generations.last().expect("length was checked above");
+		let mut reply: [u8; 8] = [0u8; 8];
+		reply[..4].copy_from_slice(&now.generation.to_le_bytes());
+		reply[4..8].copy_from_slice(&dropped.generation.to_le_bytes());
+		sink.send(OP_ROLLBACK_ACK, request, now.generation, ST_OK, &reply)
 	}
 
 	// Cancel the candidate. An abort of something already gone is a bad generation, not a
@@ -455,24 +554,36 @@ impl Session {
 		}
 	}
 
-	// List what the registry holds, newest last. The reply is bounded by construction:
-	// MAX_GENERATIONS entries of a bounded name and a fixed digest cannot approach the frame
-	// bound, so this never needs paging.
+	// List what the registry holds: every artifact, and for each the generations retained for
+	// it oldest first. This is the query that makes a forgotten override visible - the newest
+	// generation of every artifact here is one that shadows what the system volume carries,
+	// and its publication time is what marks it as something left behind rather than
+	// something just done.
 	//
-	// Reply payload: count u16 | per entry: generation u32 | length u32 | digest [u8; 32] |
-	// name_len u8 | name | verdict u8 | detail_len u8 | detail.
+	// The reply is bounded by construction: the retained generation count and the name length
+	// are both fixed, so the whole listing cannot approach the frame bound and never needs
+	// paging.
+	//
+	// Reply payload: artifacts u16 | registry_bytes u32 | per artifact: name_len u8 | name |
+	// generations u8 | per generation: generation u32 | length u32 | digest [u8; 32] |
+	// published_at u64 | verdict u8 | detail_len u8 | detail.
 	fn generation_list(&mut self, request: u32, sink: &mut impl Sink) -> bool {
 		let mut reply: Vec<u8> = Vec::new();
-		reply.extend_from_slice(&(self.generations.len() as u16).to_le_bytes());
-		for entry in &self.generations {
-			reply.extend_from_slice(&entry.generation.to_le_bytes());
-			reply.extend_from_slice(&(entry.bytes.len() as u32).to_le_bytes());
-			reply.extend_from_slice(&entry.digest);
-			reply.push(entry.name.len() as u8);
-			reply.extend_from_slice(&entry.name);
-			reply.push(entry.verdict);
-			reply.push(entry.detail.len() as u8);
-			reply.extend_from_slice(&entry.detail);
+		reply.extend_from_slice(&(self.artifacts.len() as u16).to_le_bytes());
+		reply.extend_from_slice(&(self.registry_bytes as u32).to_le_bytes());
+		for artifact in &self.artifacts {
+			reply.push(artifact.name.len() as u8);
+			reply.extend_from_slice(&artifact.name);
+			reply.push(artifact.generations.len() as u8);
+			for entry in &artifact.generations {
+				reply.extend_from_slice(&entry.generation.to_le_bytes());
+				reply.extend_from_slice(&(entry.bytes.len() as u32).to_le_bytes());
+				reply.extend_from_slice(&entry.digest);
+				reply.extend_from_slice(&entry.published_at.to_le_bytes());
+				reply.push(entry.verdict);
+				reply.push(entry.detail.len() as u8);
+				reply.extend_from_slice(&entry.detail);
+			}
 		}
 		sink.send(OP_GEN_LIST_REPLY, request, 0, ST_OK, &reply)
 	}
@@ -485,9 +596,10 @@ impl Session {
 	//
 	// Reply payload: generations u16 | candidate u8.
 	fn reset(&mut self, request: u32, sink: &mut impl Sink) -> bool {
-		let dropped: u16 = self.generations.len() as u16;
+		let dropped: u16 = self.artifacts.iter().map(|artifact| artifact.generations.len() as u16).sum();
 		let candidate: u8 = u8::from(self.candidate.is_some());
-		self.generations.clear();
+		self.artifacts.clear();
+		self.registry_bytes = 0;
 		self.candidate = None;
 		let mut reply: [u8; 3] = [0u8; 3];
 		reply[..2].copy_from_slice(&dropped.to_le_bytes());
@@ -652,4 +764,68 @@ fn push_number(out: &mut Vec<u8>, value: usize) {
 		push_number(out, value / 10);
 	}
 	out.push(b'0' + (value % 10) as u8);
+}
+
+// Verify that a candidate's bytes are an image this guest could use under the name it was
+// published as. Returns the status of the first check that refused it, or None when every
+// check passed.
+//
+// The order is deliberate: each check assumes what the ones before it established, so a
+// later check never has to defend itself against input an earlier one would have caught.
+fn verify_image(bytes: &[u8], name: &[u8]) -> Option<u16> {
+	// The declared machine is read from the header before parsing, so an image built for
+	// another target is refused as the wrong target rather than as an unreadable file - the
+	// two are very different things for someone who just published from the wrong tree.
+	let machine: u16 = match compat::declared_machine(bytes) {
+		Some(machine) => machine,
+		None => return Some(ST_NOT_AN_IMAGE),
+	};
+	let image = match Elf::parse_for_machine(bytes, machine) {
+		Some(image) => image,
+		None => return Some(ST_NOT_AN_IMAGE),
+	};
+	// `Elf::parse` accepts only this guest's own machine, which is exactly the question
+	// being asked here.
+	if Elf::parse(bytes).is_none() {
+		return Some(ST_WRONG_TARGET);
+	}
+	let identity = match compat::Identity::read(&image) {
+		Some(identity) => identity,
+		None => return Some(ST_NO_IDENTITY),
+	};
+	if identity.field("format") != Some(compat::IDENTITY_FORMAT) {
+		return Some(ST_NO_IDENTITY);
+	}
+	// Manifest ownership: the image has to be the artifact it is being published as. Without
+	// this a host could shadow any name with any image, and the registry would be a place to
+	// put bytes rather than a place to replace a specific one.
+	match identity.field("artifact") {
+		Some(artifact) if artifact.as_bytes() == name => {}
+		_ => return Some(ST_NOT_OWNED),
+	}
+	// The dynamic metadata has to be readable, because everything that would later resolve
+	// against this image reads it. An image whose dynamic table cannot be walked is not
+	// something to discover at load time.
+	let info = match image.dynamic_info() {
+		Some(Some(info)) => info,
+		_ => return Some(ST_BAD_DYNAMIC),
+	};
+	if image.symbols(&info).is_none() {
+		return Some(ST_BAD_DYNAMIC);
+	}
+	// The declared providers have to account for what the image actually needs. The record's
+	// provider list is the resolved closure, so every direct dependency must appear in it; a
+	// need the record does not declare means the record and the image disagree about what
+	// this artifact was linked against.
+	let needed = match image.needed_names(&info) {
+		Some(names) => names,
+		None => return Some(ST_BAD_DYNAMIC),
+	};
+	for need in needed {
+		let stem: &str = need.strip_suffix(LIBRARY_SUFFIX).unwrap_or(need);
+		if !identity.providers().any(|provider| provider == stem) {
+			return Some(ST_BAD_PROVIDERS);
+		}
+	}
+	None
 }
