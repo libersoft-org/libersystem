@@ -50,7 +50,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// which is honest, where assuming compatibility would not be.
 		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or(0);
 		send_blocking(bootstrap, b"agent.dev: online (registry)", 0);
-		serve(bytes, storage)
+		serve(bytes, bootstrap, storage)
 	}
 }
 
@@ -82,7 +82,7 @@ impl Sink for ChannelSink {
 
 // Serve the session: take whatever the driver forwarded, hand it to the protocol, and block
 // until either more arrives or one of the session's deadlines comes due.
-unsafe fn serve(channel: u64, storage: u64) -> ! {
+unsafe fn serve(channel: u64, bootstrap: u64, storage: u64) -> ! {
 	unsafe {
 		let mut session: Session = Session::new(storage);
 		let mut sink: ChannelSink = ChannelSink { channel, frame: Vec::with_capacity(HEADER_LEN + MAX_PAYLOAD) };
@@ -137,11 +137,31 @@ unsafe fn serve(channel: u64, storage: u64) -> ! {
 				session_at = if session.is_open() { now + SESSION_IDLE_TICKS } else { 0 };
 				continue;
 			}
+			// A launched program writes at its own pace, so its output channel is waited on
+			// alongside the wire rather than polled; draining before the wait keeps the loop
+			// from blocking with output already queued.
+			session.drain_launch();
 			// Wait on whichever deadline comes first, and on none at all when the channel is
 			// idle with no session open: nothing is then waiting to expire, so an idle
 			// development instance costs no wakeups.
 			let deadline: u64 = soonest(&[fragment_at, session_at, session.publication_deadline()]);
-			if wait(channel, deadline) == ERR_TIMED_OUT {
+			// Three things can wake this: the wire, a launched program's output, and the
+			// bootstrap - which carries the launcher, delivered long after this program
+			// started because PermissionManager comes up after the drivers do.
+			let launch: u64 = session.launch_channel();
+			let ready: i64 = if launch != 0 { wait_any(&[channel, bootstrap, launch], deadline) } else { wait_any(&[channel, bootstrap], deadline) };
+			if ready == 1 {
+				let mut buf: [u8; 16] = [0u8; 16];
+				match recv_blocking(bootstrap, &mut buf) {
+					Received::Message { len, handle } if handle != 0 && len >= 4 && &buf[..4] == b"PERM" => session.set_launcher(handle),
+					// The supervisor dropped this program's bootstrap, which is how it is told
+					// to shut down.
+					Received::Closed => exit(),
+					_ => {}
+				}
+				continue;
+			}
+			if ready == ERR_TIMED_OUT {
 				let now: u64 = clock();
 				if fragment_at != 0 && now >= fragment_at {
 					session.fail_partial(&mut pending, &mut sink);

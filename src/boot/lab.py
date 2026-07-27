@@ -77,6 +77,7 @@ Persistent development instance (one owner at a time):
   dev-type [--no-enter] <text...>  type into the guest terminal, with a byte count back
   dev-reset             drop the guest development state (not a reboot)
   dev-scenario [--verbose] <file.toml>...  run declarative application scenarios
+  dev-launch <program> [args...]  launch a program through PermissionManager, print output
   dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1008,6 +1009,10 @@ OP_GEN_LIST = 0x15
 OP_GEN_LIST_REPLY = 0x16
 OP_ROLLBACK = 0x17
 OP_ROLLBACK_ACK = 0x18
+OP_LAUNCH = 0x30
+OP_LAUNCH_ACK = 0x31
+OP_LAUNCH_OUTPUT = 0x32
+OP_LAUNCH_BYTES = 0x33
 OP_TERM_INPUT = 0x20
 OP_TERM_ACK = 0x21
 OP_RESET = 0x22
@@ -1040,6 +1045,9 @@ PROTO_STATUS = {
 	20: 'no earlier generation to return to',
 	21: 'this boot has no artifact registry (not the development profile)',
 	22: 'the installed manifest declares no such artifact',
+	23: 'no launcher is wired to the development agent',
+	24: 'the launcher refused the component',
+	25: 'no launch to read output from',
 }
 
 # How a committed generation compares with the one it succeeded, under the written provider
@@ -1383,6 +1391,44 @@ def published_ago(published_at):
 	return f'{seconds // 3600} h ago'
 
 
+# Launch a canonical program through PermissionManager and read what it prints. The name,
+# the arguments and the working directory are separate typed fields the whole way down; at no
+# point is a string handed to an interpreter.
+def launch_payload(name, args, cwd):
+	name, args, cwd = name.encode(), args.encode(), cwd.encode()
+	return bytes([len(name)]) + name + struct.pack('<H', len(args)) + args + struct.pack('<H', len(cwd)) + cwd
+
+
+def cmd_dev_launch(args):
+	timeout, rest = take_arg(args, '--timeout', 30)
+	rest = [a for a in rest if not a.startswith('--')]
+	if not rest:
+		die('usage: dev-launch [--timeout N] <program> [args...]')
+	name, program_args = rest[0], ' '.join(rest[1:])
+	sock, buffer, _ = proto_session(timeout)
+	try:
+		opcode, _, body = proto_request(sock, buffer, 2, OP_LAUNCH, launch_payload(name, program_args, 'vol://system'), timeout=timeout, what=f'launching {name}')
+		if opcode != OP_LAUNCH_ACK or len(body) < 8:
+			die(f'launch answered with opcode {opcode:#04x} and {len(body)} B')
+		print(f'lab: launched {name} as koid {struct.unpack("<Q", body[:8])[0]}')
+		request, deadline = 3, time.monotonic() + timeout
+		while time.monotonic() < deadline:
+			opcode, _, body = proto_request(sock, buffer, request, OP_LAUNCH_OUTPUT, timeout=timeout, what='reading output')
+			request += 1
+			if len(body) >= 2:
+				if body[1]:
+					print('lab: (output was truncated; the program printed faster than it was read)', file=sys.stderr)
+				sys.stdout.write(body[2:].decode(errors='replace'))
+				sys.stdout.flush()
+				if body[0]:
+					print(f'lab: {name} finished')
+					return
+			time.sleep(0.1)
+		die(f'{name} had not finished within {timeout} s')
+	finally:
+		sock.close()
+
+
 def cmd_dev_generations(args):
 	timeout = arg_value(args, '--timeout', 5)
 	sock, buffer, bounds = proto_session(timeout)
@@ -1474,6 +1520,28 @@ class LabGuest:
 					return False
 				time.sleep(0.05)
 			return True
+		finally:
+			sock.close()
+
+	# Launch through PermissionManager and return the koid, or None when it was refused.
+	def launch(self, name, args, cwd, timeout):
+		sock, buffer, _ = proto_session(timeout, announce=False)
+		try:
+			opcode, _, body = proto_request(sock, buffer, 2, OP_LAUNCH, launch_payload(name, args, cwd), timeout=timeout, what=f'launching {name}', tolerate=(23, 24))
+			if opcode != OP_LAUNCH_ACK or len(body) < 8:
+				return None
+			return struct.unpack('<Q', body[:8])[0]
+		finally:
+			sock.close()
+
+	# Everything the launched program has printed since the last read, and whether it ended.
+	def launch_output(self, timeout):
+		sock, buffer, _ = proto_session(timeout, announce=False)
+		try:
+			opcode, _, body = proto_request(sock, buffer, 2, OP_LAUNCH_OUTPUT, timeout=timeout, what='reading output', tolerate=(25,))
+			if opcode != OP_LAUNCH_BYTES or len(body) < 2:
+				return None, False
+			return body[2:].decode(errors='replace'), bool(body[0])
 		finally:
 			sock.close()
 
@@ -1804,7 +1872,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-scenario': cmd_dev_scenario, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-down': cmd_dev_down}
 
 
 def main():

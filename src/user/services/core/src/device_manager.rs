@@ -63,6 +63,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut usbq_client: u64 = 0;
 		let mut usb_pointer: u64 = 0;
 		let mut raw_keys: u64 = 0;
+		// The development agent's bootstrap, kept so the launcher can be handed to it once
+		// PermissionManager exists - which is after this program has finished starting drivers.
+		let mut dev_agent: u64 = 0;
 		launch_boot_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
@@ -82,7 +85,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		loop {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
-					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys);
+					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev_agent);
 					if handle != 0 {
 						close(handle);
 					}
@@ -96,6 +99,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// InputService folds it alongside the virtio pointer's).
 					send_blocking(bootstrap, b"INPUT2", usb_pointer);
 					send_blocking(bootstrap, b"KEYS", raw_keys);
+				}
+				// The development agent's launcher, delivered once PermissionManager is up.
+				// Forwarded rather than held: this program has no use for it, and the agent
+				// could not have been given one when it started.
+				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DEVPERM" => {
+					if dev_agent != 0 && handle != 0 {
+						send_blocking(dev_agent, b"PERM", handle);
+					} else if handle != 0 {
+						close(handle);
+					}
 				}
 				Received::Message { .. } => {
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
@@ -164,7 +177,8 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 // its pointer-event channel (a USB pointing device, folded by InputService), and the
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
-unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, dev_agent: &mut u64) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -227,8 +241,11 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 				// artifact registry out of the address space that holds a device capability -
 				// so it is started where that device is bound, and nowhere else.
 				#[cfg(feature = "development")]
-				if driver_name == b"dev_channel" && handle != 0 && !start_dev_agent(storage, handle) {
-					print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
+				if driver_name == b"dev_channel" && handle != 0 {
+					*dev_agent = start_dev_agent(storage, handle);
+					if *dev_agent == 0 {
+						print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
+					}
 				}
 				// The pointer flavour of virtio_input hands up an event channel (non-zero
 				// handle); the keyboard flavour hands up nothing (handle 0), so a non-zero
@@ -271,12 +288,12 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 // a failure to start is reported rather than retried - a development instance without its
 // agent is still a usable guest, just one whose control channel carries nothing.
 #[cfg(feature = "development")]
-unsafe fn start_dev_agent(storage: u64, bytes: u64) -> bool {
+unsafe fn start_dev_agent(storage: u64, bytes: u64) -> u64 {
 	unsafe {
 		let loaded: Option<(u64, u64, usize)> = read_driver(storage, b"dev_agent");
 		let (file, mapped, size): (u64, u64, usize) = match loaded {
 			Some(t) => t,
-			None => return false,
+			None => return 0,
 		};
 		let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
 		// The agent gets a bootstrap of its own and the byte channel transferred over it. The
@@ -288,14 +305,14 @@ unsafe fn start_dev_agent(storage: u64, bytes: u64) -> bool {
 			None => {
 				unmap_object(file);
 				close(file);
-				return false;
+				return 0;
 			}
 		};
 		let started: bool = spawn(elf, agent_side) >= 0;
 		unmap_object(file);
 		close(file);
 		if !started || !send_blocking(dm_side, b"BYTES", bytes) {
-			return false;
+			return 0;
 		}
 		// A volume connection of its own, so the agent can read the installed artifact a
 		// publication would shadow. A fresh connection rather than a duplicate of
@@ -303,10 +320,10 @@ unsafe fn start_dev_agent(storage: u64, bytes: u64) -> bool {
 		// readers on one endpoint would take each other's replies.
 		let connection: u64 = match service_connect(storage) {
 			Some(connection) => connection,
-			None => return false,
+			None => return 0,
 		};
 		if !send_blocking(dm_side, b"STORAGE", connection) {
-			return false;
+			return 0;
 		}
 		// The agent reports in before it serves, so a start that loaded but never ran is not
 		// mistaken for a working one. The bootstrap stays open afterwards: dropping it is how
@@ -316,9 +333,11 @@ unsafe fn start_dev_agent(storage: u64, bytes: u64) -> bool {
 			Received::Message { len, .. } if len >= 5 && &buf[..5] == b"agent" => {
 				print(&buf[..len]);
 				print(b"\n");
-				true
+				// Kept, not dropped: this is how the launcher reaches the agent later, and how
+				// the agent would learn to shut down.
+				dm_side
 			}
-			_ => false,
+			_ => 0,
 		}
 	}
 }

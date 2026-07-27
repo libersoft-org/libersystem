@@ -335,6 +335,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if MANIFEST[i].name == b"permission_manager" && started == State::Running && selftest {
 					drill_perm = unsafe { service_connect(perm_client) }.unwrap_or(0);
 				}
+				// The development agent launches through PermissionManager like anything else,
+				// so it needs a client of it - and cannot have been given one when it started,
+				// because it starts with the drivers and PermissionManager comes up later. It
+				// is delivered here on DeviceManager's control channel, the same late hand-off
+				// LogService's journal uses below, and DeviceManager passes it on to the agent.
+				// Ignored entirely by a boot that has no agent.
+				if MANIFEST[i].name == b"permission_manager" && started == State::Running {
+					if let Some(dm) = index_of(b"device_manager") {
+						let launcher: u64 = unsafe { service_connect(perm_client) }.unwrap_or(0);
+						if launcher != 0 {
+							unsafe { send_blocking(channels[dm], b"DEVPERM", launcher) };
+						}
+					}
+				}
 				// Once the system StorageService is up, drive DeviceManager's phase
 				// 2 - it now loads the non-bootstrap drivers from the volume, which is only
 				// mountable now. This runs before the driver-consuming services (which depend

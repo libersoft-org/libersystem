@@ -326,8 +326,20 @@ fn included(program: &system_manifest::Program) -> bool {
 // compilation and that macro does not see the crate's features there, so it silently reports
 // false and the development configuration stages the shipping set - which is exactly what it
 // did before this was written down.
+// Whether this build wants the development-only programs. Read from the plain environment
+// variable the build recipes set, and declared so cargo re-runs this script when it flips.
+//
+// Not from a cargo feature, and that took two attempts to get right. `cfg!(feature = ...)`
+// does not work here at all: a build script is a separate compilation and the macro silently
+// reports false. Reading `CARGO_FEATURE_DEVELOPMENT` does see the feature, but this script
+// emits `rerun-if-changed`, which switches cargo to re-running only for what was declared -
+// and `rerun-if-env-changed` does not apply to the `CARGO_FEATURE_*` variables cargo sets
+// itself, so the script kept its previous output and the development build went on staging
+// the shipping set. Both failures are silent, and both make every assertion inside the build
+// agree with itself while producing the wrong image. A plain variable has neither problem.
 fn development_configuration() -> bool {
-	env::var_os("CARGO_FEATURE_DEVELOPMENT").is_some()
+	println!("cargo:rerun-if-env-changed=LIBER_DEVELOPMENT");
+	env::var("LIBER_DEVELOPMENT").as_deref() == Ok("1")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

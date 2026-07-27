@@ -42,6 +42,11 @@ MAX_INPUT_BYTES = 4096
 MAX_PATTERN_BYTES = 512
 MAX_STEP_SECONDS = 300
 MAX_TOTAL_SECONDS = 1800
+MAX_ARGS_BYTES = 512
+
+# A component name, not a path and not a command line. The guest checks the same thing; this
+# is here so a scenario that meant to run a shell line is refused where it was written.
+PROGRAM_NAME = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,47}')
 
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 
@@ -69,6 +74,14 @@ STEP_FIELDS = {
 	'absent': {'required': ('contains',), 'optional': ('timeout',)},
 	# Drop the guest's development state: the artifact registry and any open candidate.
 	'reset': {'required': (), 'optional': ('timeout',)},
+	# Launch a canonical program through PermissionManager. `program` names it, `args` and
+	# `cwd` are separate typed fields - never concatenated into anything an interpreter would
+	# parse - and the component gets exactly its installed manifest's grants.
+	'launch': {'required': ('program',), 'optional': ('args', 'cwd', 'timeout')},
+	# Wait for the launched program's own output to contain `contains`.
+	'output': {'required': ('contains',), 'optional': ('timeout',)},
+	# Wait for the launched program to finish.
+	'finished': {'required': (), 'optional': ('timeout',)},
 }
 
 
@@ -128,7 +141,7 @@ def validate_step(step, index, path):
 	timeout = step.get('timeout', 30)
 	if not isinstance(timeout, int) or not 1 <= timeout <= MAX_STEP_SECONDS:
 		raise ScenarioError(f'{where} ({kind}): timeout must be 1..{MAX_STEP_SECONDS} seconds')
-	for field in ('artifact', 'file', 'text', 'contains'):
+	for field in ('artifact', 'file', 'text', 'contains', 'program', 'args', 'cwd'):
 		if field in step and not isinstance(step[field], str):
 			raise ScenarioError(f'{where} ({kind}): {field} must be a string')
 	if 'enter' in step and not isinstance(step['enter'], bool):
@@ -142,6 +155,10 @@ def validate_step(step, index, path):
 			raise ScenarioError(f'{where} ({kind}): contains is {len(step["contains"].encode())} B, at most {MAX_PATTERN_BYTES}')
 	if kind == 'publish' and not os.path.isfile(step['file']):
 		raise ScenarioError(f'{where} (publish): no such file {step["file"]}')
+	if 'args' in step and len(step['args'].encode()) > MAX_ARGS_BYTES:
+		raise ScenarioError(f'{where} ({kind}): args is {len(step["args"].encode())} B, at most {MAX_ARGS_BYTES}')
+	if kind == 'launch' and not PROGRAM_NAME.fullmatch(step['program']):
+		raise ScenarioError(f'{where} (launch): program {step["program"]!r} is not a plain component name')
 
 
 # The guest, as the runner sees it: terminal input and artifact publication over the control
@@ -151,6 +168,9 @@ class Guest:
 	def __init__(self, lab):
 		self.lab = lab
 		self.at = lab.serial_size()
+		# What the launched program has printed so far, accumulated across `output` steps so a
+		# later assertion can match something an earlier read already consumed.
+		self.launched = ''
 
 	# Everything the guest has printed since the last time this was called.
 	def output(self):
@@ -208,6 +228,35 @@ def run_step(step, guest, lab, limit, index):
 				return
 			time.sleep(0.2)
 		raise ScenarioError(f'{where}: {wanted!r} did not appear within {int(limit)} s')
+	elif kind == 'launch':
+		koid = lab.launch(step['program'], step.get('args', ''), step.get('cwd', 'vol://system'), int(limit))
+		if koid is None:
+			raise ScenarioError(f'{where}: the launcher refused {step["program"]}')
+		guest.launched = ''
+	elif kind == 'output':
+		end = time.monotonic() + limit
+		while time.monotonic() < end:
+			text, exited = lab.launch_output(int(limit))
+			if text is None:
+				raise ScenarioError(f'{where}: nothing has been launched')
+			guest.launched += text
+			if step['contains'] in guest.launched:
+				return
+			if exited:
+				raise ScenarioError(f'{where}: {step["contains"]!r} never appeared and the program finished')
+			time.sleep(0.1)
+		raise ScenarioError(f'{where}: {step["contains"]!r} did not appear within {int(limit)} s')
+	elif kind == 'finished':
+		end = time.monotonic() + limit
+		while time.monotonic() < end:
+			text, exited = lab.launch_output(int(limit))
+			if text is None:
+				raise ScenarioError(f'{where}: nothing has been launched')
+			guest.launched += text
+			if exited:
+				return
+			time.sleep(0.1)
+		raise ScenarioError(f'{where}: the program had not finished within {int(limit)} s')
 	elif kind == 'absent':
 		mark = guest.at
 		time.sleep(min(limit, 2))

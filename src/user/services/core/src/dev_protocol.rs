@@ -37,6 +37,7 @@ use alloc::vec::Vec;
 use bootproto::compat;
 use bootproto::elf::Elf;
 use ipc_client::ChannelTransport;
+use proto::generated::liber::security::v1 as security;
 use proto::system::{OpenOpts, volume};
 use rt::*;
 
@@ -117,6 +118,14 @@ pub const MAX_VERDICT_DETAIL: usize = 200;
 // rather than discovering the limit halfway through a paste.
 pub const MAX_TERM_INPUT: usize = 4096;
 
+// The bounds a launch is held to. A launched program is the one thing here that produces
+// output at its own pace, so what it may accumulate before anyone reads it has to be a
+// number: past this the oldest is dropped and the reader is told, which keeps a chatty
+// program from being a way to grow the agent without limit.
+pub const MAX_LAUNCH_NAME: usize = 64;
+pub const MAX_LAUNCH_ARGS: usize = 512;
+pub const MAX_LAUNCH_OUTPUT: usize = 65536;
+
 // Opcodes. Requests are host to guest, replies guest to host; a guest-to-host opcode
 // arriving from the host is an unknown opcode, not a request.
 pub const OP_HELLO: u8 = 0x01;
@@ -132,6 +141,10 @@ pub const OP_GEN_LIST: u8 = 0x15;
 pub const OP_GEN_LIST_REPLY: u8 = 0x16;
 pub const OP_ROLLBACK: u8 = 0x17;
 pub const OP_ROLLBACK_ACK: u8 = 0x18;
+pub const OP_LAUNCH: u8 = 0x30;
+pub const OP_LAUNCH_ACK: u8 = 0x31;
+pub const OP_LAUNCH_OUTPUT: u8 = 0x32;
+pub const OP_LAUNCH_BYTES: u8 = 0x33;
 pub const OP_TERM_INPUT: u8 = 0x20;
 pub const OP_TERM_ACK: u8 = 0x21;
 pub const OP_RESET: u8 = 0x22;
@@ -167,6 +180,12 @@ pub const ST_BAD_DYNAMIC: u16 = 19;
 pub const ST_NOTHING_TO_ROLL_BACK: u16 = 20;
 // A registry operation on a boot that has no registry.
 pub const ST_NO_REGISTRY: u16 = 21;
+// No launcher is wired, so nothing can be launched through the manifest.
+pub const ST_NO_LAUNCHER: u16 = 23;
+// The launcher refused: no such component, or its manifest does not permit it.
+pub const ST_LAUNCH_REFUSED: u16 = 24;
+// Output was asked for with no launch to read it from.
+pub const ST_NO_LAUNCH: u16 = 25;
 // A publication naming an artifact the installed manifest does not declare.
 pub const ST_UNDECLARED: u16 = 22;
 
@@ -225,6 +244,21 @@ struct Generation {
 	detail: Vec<u8>,
 }
 
+// One launched program: the channel its output arrives on, what has arrived and not yet been
+// read, and whether it has finished. A launch is deliberately singular - a scenario drives
+// one program at a time, and one is what can be reasoned about without correlating output to
+// a launch id on every frame.
+struct Launch {
+	output: u64,
+	buffered: Vec<u8>,
+	// Set when the buffer overran and the oldest output was dropped, so a reader is told
+	// rather than shown a gap it cannot see.
+	truncated: bool,
+	// The program's output channel closed, which is how a launched program reports it is
+	// finished: nothing else can write there once it is gone.
+	exited: bool,
+}
+
 // One named artifact and the generations retained for it, newest last. Retention is per
 // artifact rather than across the registry, so publishing one thing repeatedly cannot evict
 // the history of everything else.
@@ -269,6 +303,13 @@ pub struct Session {
 	// candidate may stand in for the one it shadows. Zero when none was wired, which leaves
 	// every verdict unknown rather than silently claiming compatibility.
 	storage: u64,
+	// The PermissionManager client a launch goes through. Zero until it is delivered, which
+	// happens after this session exists: PermissionManager starts later in the boot than the
+	// agent does. Launching through it rather than around it is the point - it remains the
+	// only ordinary launcher, and a scenario gets exactly the component's manifest grants.
+	launcher: u64,
+	// The one launch in flight, if any.
+	launch: Option<Launch>,
 	candidate: Option<Candidate>,
 	artifacts: Vec<Artifact>,
 	// Live registry content in bytes, tracked rather than recomputed so the budget can be
@@ -282,11 +323,66 @@ impl Session {
 		let len: usize = unsafe { boot_profile(&mut profile) };
 		let mut boot_nonce: [u8; 8] = [0u8; 8];
 		unsafe { random_get(&mut boot_nonce) };
-		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
+		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, launcher: 0, launch: None, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
 	}
 
 	pub fn is_open(&self) -> bool {
 		self.handshake
+	}
+
+	// Take the launcher, delivered after this session was created.
+	pub fn set_launcher(&mut self, launcher: u64) {
+		self.launcher = launcher;
+	}
+
+	// The channel a launched program's output arrives on, so the serve loop can wait on it
+	// alongside everything else rather than polling.
+	//
+	// Zero once the program has exited, even though the handle is still open and still holds
+	// its unread output. A closed channel is permanently ready, so waiting on one spins the
+	// loop as fast as the scheduler will allow - which under a cooperative scheduler starves
+	// every other thread in the guest. The output stays readable; only the wait stops.
+	pub fn launch_channel(&self) -> u64 {
+		match &self.launch {
+			Some(launch) if !launch.exited => launch.output,
+			_ => 0,
+		}
+	}
+
+	// Drain whatever the launched program has printed into its bounded buffer. Called by the
+	// serve loop when that channel wakes; the host reads it with OP_LAUNCH_OUTPUT.
+	pub fn drain_launch(&mut self) {
+		let Some(launch) = &mut self.launch else { return };
+		loop {
+			// Distinguish "nothing queued" from "nothing queued and the peer is gone". The
+			// second is how a launched program reports that it finished - its end of this
+			// channel goes with it - so treating both as "no work" would leave every launch
+			// looking like it never ended.
+			let pending: i64 = unsafe { channel_peek(launch.output) };
+			if pending == ERR_PEER_CLOSED {
+				launch.exited = true;
+				return;
+			}
+			if pending < 0 {
+				return;
+			}
+			match unsafe { recv_vec_blocking(launch.output) } {
+				ReceivedVec::Message { bytes, .. } => {
+					launch.buffered.extend_from_slice(&bytes);
+					// The newest output is what a scenario is waiting on, so an overrun drops
+					// the oldest and says so rather than refusing to record any more.
+					if launch.buffered.len() > MAX_LAUNCH_OUTPUT {
+						let excess: usize = launch.buffered.len() - MAX_LAUNCH_OUTPUT;
+						launch.buffered.drain(..excess);
+						launch.truncated = true;
+					}
+				}
+				ReceivedVec::Closed => {
+					launch.exited = true;
+					return;
+				}
+			}
+		}
 	}
 
 	// Close the session and cancel what only it owned. The registry survives; the candidate
@@ -404,7 +500,7 @@ impl Session {
 		// The generation field names the candidate an operation applies to. The operations
 		// that are not about one candidate must leave it zero, so the field never acquires an
 		// accidental second meaning that a later version would have to preserve.
-		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_ROLLBACK | OP_TERM_INPUT | OP_RESET);
+		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_ROLLBACK | OP_TERM_INPUT | OP_RESET | OP_LAUNCH | OP_LAUNCH_OUTPUT);
 		if session_scoped && generation != 0 {
 			return sink.send(OP_ERROR, request, generation, ST_MALFORMED, &[]);
 		}
@@ -423,6 +519,8 @@ impl Session {
 			OP_PUB_ABORT => self.publication_abort(request, generation, payload, sink),
 			OP_GEN_LIST => self.generation_list(request, sink),
 			OP_ROLLBACK => self.rollback(request, payload, sink),
+			OP_LAUNCH => self.launch(request, payload, sink),
+			OP_LAUNCH_OUTPUT => self.launch_output(request, sink),
 			OP_TERM_INPUT => terminal_input(request, payload, sink),
 			OP_RESET => self.reset(request, sink),
 			_ => sink.send(OP_ERROR, request, generation, ST_BAD_OPCODE, &[]),
@@ -928,4 +1026,91 @@ unsafe fn read_installed(storage: u64, path: &str) -> Option<Vec<u8>> {
 		close(result.file);
 		Some(bytes)
 	}
+}
+
+impl Session {
+	// Launch a canonical program through PermissionManager, with arguments and a working
+	// directory, and take the channel it writes its output to.
+	//
+	// Through the launcher, never around it: PermissionManager stays the only ordinary
+	// launcher and its installed manifest stays the authority for what a component is allowed
+	// to reach, so a scenario gets exactly the grants the manifest gives and cannot ask for
+	// more. Nothing here is a shell - the name and the arguments are separate typed fields,
+	// and the guest never concatenates them into something an interpreter would parse.
+	//
+	// Payload: name_len u8 | name | args_len u16 | args | cwd_len u16 | cwd.
+	fn launch(&mut self, request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
+		if self.launcher == 0 {
+			return sink.send(OP_ERROR, request, 0, ST_NO_LAUNCHER, &[]);
+		}
+		let Some((name, args, cwd)) = parse_launch(payload) else {
+			return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
+		};
+		// A previous launch is replaced, and its channel released with it: one at a time is
+		// the rule, and a scenario that starts another has finished with the first.
+		self.launch = None;
+		let (ours, theirs): (u64, u64) = match unsafe { channel() } {
+			Some(pair) => pair,
+			None => return sink.send(OP_ERROR, request, 0, ST_LAUNCH_REFUSED, &[]),
+		};
+		let started = unsafe { security::permission::Client::new(ChannelTransport { chan: self.launcher }).run(name, args, cwd, &theirs) };
+		let koid: u64 = match started {
+			Some(Ok(result)) => result.info.koid,
+			_ => {
+				unsafe { close(ours) };
+				return sink.send(OP_ERROR, request, 0, ST_LAUNCH_REFUSED, &[]);
+			}
+		};
+		self.launch = Some(Launch { output: ours, buffered: Vec::new(), truncated: false, exited: false });
+		sink.send(OP_LAUNCH_ACK, request, 0, ST_OK, &koid.to_le_bytes())
+	}
+
+	// Hand over what the launched program has printed since the last read, and say whether it
+	// has finished and whether anything was dropped. Reading consumes: a scenario asserts on a
+	// stream, and re-reading what it already matched would make every assertion after the
+	// first ambiguous.
+	//
+	// Reply payload: exited u8 | truncated u8 | bytes.
+	fn launch_output(&mut self, request: u32, sink: &mut impl Sink) -> bool {
+		let Some(launch) = &mut self.launch else {
+			return sink.send(OP_ERROR, request, 0, ST_NO_LAUNCH, &[]);
+		};
+		let take: usize = launch.buffered.len().min(MAX_PAYLOAD - 2);
+		let mut reply: Vec<u8> = Vec::with_capacity(take + 2);
+		reply.push(u8::from(launch.exited));
+		reply.push(u8::from(launch.truncated));
+		reply.extend_from_slice(&launch.buffered[..take]);
+		launch.buffered.drain(..take);
+		launch.truncated = false;
+		sink.send(OP_LAUNCH_BYTES, request, 0, ST_OK, &reply)
+	}
+}
+
+// Split a launch payload into its three typed fields. Every length is checked against its own
+// bound before the field is read, so a malformed payload is a refusal rather than a slice
+// that happens to land somewhere.
+fn parse_launch(payload: &[u8]) -> Option<(&str, &str, &str)> {
+	let name_len: usize = *payload.first()? as usize;
+	if name_len == 0 || name_len > MAX_LAUNCH_NAME {
+		return None;
+	}
+	let name: &str = core::str::from_utf8(payload.get(1..1 + name_len)?).ok()?;
+	let mut at: usize = 1 + name_len;
+	let args_len: usize = u16::from_le_bytes([*payload.get(at)?, *payload.get(at + 1)?]) as usize;
+	if args_len > MAX_LAUNCH_ARGS {
+		return None;
+	}
+	at += 2;
+	let args: &str = core::str::from_utf8(payload.get(at..at + args_len)?).ok()?;
+	at += args_len;
+	let cwd_len: usize = u16::from_le_bytes([*payload.get(at)?, *payload.get(at + 1)?]) as usize;
+	if cwd_len > MAX_LAUNCH_ARGS {
+		return None;
+	}
+	at += 2;
+	let cwd: &str = core::str::from_utf8(payload.get(at..at + cwd_len)?).ok()?;
+	if at + cwd_len != payload.len() || !name_is_valid(name.as_bytes()) {
+		return None;
+	}
+	Some((name, args, cwd))
 }

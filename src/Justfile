@@ -5,6 +5,8 @@ kernel_dir := "kernel"
 # The development configuration: the development agent, its artifact registry and the control
 # port's transport. Off unless LIBER_DEVELOPMENT=1, so an ordinary build - and every test and
 # shipping build - does not contain those units at all. `dev-up` sets it; nothing else does.
+# The kernel needs no flag: its build script reads the variable directly, which is also the
+# only way it reliably notices the configuration changing.
 dev_features := if env_var_or_default("LIBER_DEVELOPMENT", "0") == "1" { "--features development" } else { "" }
 user_dir := "$(tools/source-path.sh system_manager)"
 services_dir := "$(tools/source-path.sh services)"
@@ -182,7 +184,7 @@ sdk:
 # build the kernel (its build.rs assembles the init package from the userspace build)
 # and the own UEFI loader (staged into the boot image as BOOTX64.EFI)
 build: sdk user
-    cd {{ kernel_dir }} && cargo build {{ dev_features }}
+    cd {{ kernel_dir }} && cargo build
     cd {{ loader_dir }} && cargo build
 
 # generate the proto crate's bindings from the LSIDL interface definitions
@@ -309,7 +311,7 @@ run *args:
 # build + boot the x86_64 build in QEMU (native with KVM on an x86_64 host, emulated
 # elsewhere). Add live displays as arguments (combinable): `just run-x86_64 vnc spice`.
 run-x86_64 *displays: sdk user
-    cd {{ kernel_dir }} && cargo build {{ dev_features }}
+    cd {{ kernel_dir }} && cargo build
     DISPLAYS="{{ displays }}" boot/qemu-run.sh x86_64 {{ kernel_elf }}
 
 # build + boot, QEMU waits for GDB (port :1234)
@@ -599,6 +601,11 @@ dev-rollback *args:
 # e.g. `just dev-scenario boot/scenarios/*.toml`
 dev-scenario *args:
     @boot/lab.py dev-scenario {{ args }}
+
+# launch a canonical program in the development instance through PermissionManager and print
+# what it writes. e.g. `just dev-launch uname`
+dev-launch *args:
+    @boot/lab.py dev-launch {{ args }}
 
 # stop the development instance gracefully and release its lock
 dev-down *args:

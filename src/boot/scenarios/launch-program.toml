@@ -1,0 +1,44 @@
+# A canonical program runs under its installed permission manifest.
+#
+# The launch goes through PermissionManager, which stays the only ordinary launcher: the
+# component gets exactly the capabilities its installed manifest grants and can reach nothing
+# else. The program, its arguments and its working directory are three typed fields here and
+# three typed fields the whole way down - at no point does a string reach an interpreter.
+version = 1
+name = "launch a program"
+description = "PermissionManager launches a canonical program, and the runner reads its own output."
+timeout = 120
+
+[[step]]
+do = "launch"
+program = "uname"
+cwd = "vol://system"
+
+[[step]]
+do = "output"
+contains = "LiberSystem"
+timeout = 30
+
+[[step]]
+do = "finished"
+timeout = 30
+
+# A program with an argument, to show it arrives as an argument rather than as a command line
+# the guest had to parse.
+[[step]]
+do = "launch"
+program = "ls"
+args = "vol://system/lib/protocol"
+
+[[step]]
+do = "output"
+contains = "base-proto.lslib"
+timeout = 30
+
+[[step]]
+do = "finished"
+timeout = 30
+
+# A component the installed permission manifest does not cover is refused. The manifest stays
+# the authority for what may be launched, and a scenario cannot talk its way past it - which
+# is why there is no step here that could have run `echo` some other way.
