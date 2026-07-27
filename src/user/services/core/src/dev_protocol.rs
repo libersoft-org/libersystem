@@ -310,6 +310,11 @@ pub struct Session {
 	launcher: u64,
 	// The one launch in flight, if any.
 	launch: Option<Launch>,
+	// ProcessService's end of the resolution channel: a launch asks whether the registry holds
+	// a generation of an artifact before reading the installed one. Zero until it is
+	// delivered, and zero forever on a boot with no agent - in which case ProcessService simply
+	// never gets an answer and reads the volume, which is the shipping behaviour.
+	registry: u64,
 	candidate: Option<Candidate>,
 	artifacts: Vec<Artifact>,
 	// Live registry content in bytes, tracked rather than recomputed so the budget can be
@@ -323,7 +328,7 @@ impl Session {
 		let len: usize = unsafe { boot_profile(&mut profile) };
 		let mut boot_nonce: [u8; 8] = [0u8; 8];
 		unsafe { random_get(&mut boot_nonce) };
-		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, launcher: 0, launch: None, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
+		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, launcher: 0, launch: None, registry: 0, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
 	}
 
 	pub fn is_open(&self) -> bool {
@@ -333,6 +338,44 @@ impl Session {
 	// Take the launcher, delivered after this session was created.
 	pub fn set_launcher(&mut self, launcher: u64) {
 		self.launcher = launcher;
+	}
+
+	// Take the resolution channel, delivered the same way, and announce on it. The
+	// announcement is what tells ProcessService the channel has someone on it: it holds this
+	// end from boot, long before an agent exists, and must not ask questions of a peer that
+	// may never arrive.
+	pub fn set_registry(&mut self, registry: u64) {
+		self.registry = registry;
+		unsafe { send_blocking(registry, b"AGENT", 0) };
+	}
+
+	pub fn registry_channel(&self) -> u64 {
+		self.registry
+	}
+
+	// Answer one resolution query: a launch asks for an artifact by name, and gets the newest
+	// generation's bytes or an empty reply.
+	//
+	// The answer is only ever the newest generation of exactly that name. There is no way to
+	// ask for a different artifact than the one being loaded, and nothing here consults a path
+	// - the caller has already resolved the manifest, and this only says whether the registry
+	// is shadowing what it resolved.
+	pub fn answer_resolution(&mut self) {
+		let mut buf: [u8; 64] = [0u8; 64];
+		let (len, _) = match unsafe { recv_blocking(self.registry, &mut buf) } {
+			Received::Message { len, handle } => (len, handle),
+			Received::Closed => {
+				self.registry = 0;
+				return;
+			}
+		};
+		let name: &[u8] = &buf[..len.min(MAX_NAME)];
+		let found = self.artifacts.iter().find(|artifact| artifact.name.as_slice() == name).and_then(|artifact| artifact.generations.last());
+		let bytes: &[u8] = match found {
+			Some(generation) if self.registry_allowed => &generation.bytes,
+			_ => &[],
+		};
+		unsafe { send_blocking(self.registry, bytes, 0) };
 	}
 
 	// The channel a launched program's output arrives on, so the serve loop can wait on it

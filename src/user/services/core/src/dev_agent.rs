@@ -149,16 +149,31 @@ unsafe fn serve(channel: u64, bootstrap: u64, storage: u64) -> ! {
 			// bootstrap - which carries the launcher, delivered long after this program
 			// started because PermissionManager comes up after the drivers do.
 			let launch: u64 = session.launch_channel();
-			let ready: i64 = if launch != 0 { wait_any(&[channel, bootstrap, launch], deadline) } else { wait_any(&[channel, bootstrap], deadline) };
+			let registry: u64 = session.registry_channel();
+			let mut watched: Vec<u64> = alloc::vec![channel, bootstrap];
+			if launch != 0 {
+				watched.push(launch);
+			}
+			if registry != 0 {
+				watched.push(registry);
+			}
+			let ready: i64 = wait_any(&watched, deadline);
 			if ready == 1 {
 				let mut buf: [u8; 16] = [0u8; 16];
 				match recv_blocking(bootstrap, &mut buf) {
 					Received::Message { len, handle } if handle != 0 && len >= 4 && &buf[..4] == b"PERM" => session.set_launcher(handle),
+					// ProcessService's end of the resolution channel: a launch asks whether the
+					// registry has a generation of an artifact before it reads the volume.
+					Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"REG" => session.set_registry(handle),
 					// The supervisor dropped this program's bootstrap, which is how it is told
 					// to shut down.
 					Received::Closed => exit(),
 					_ => {}
 				}
+				continue;
+			}
+			if ready >= 2 && watched.get(ready as usize) == Some(&registry) && registry != 0 {
+				session.answer_resolution();
 				continue;
 			}
 			if ready == ERR_TIMED_OUT {

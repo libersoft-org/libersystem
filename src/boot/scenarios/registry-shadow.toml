@@ -1,0 +1,58 @@
+# A published generation is what the next launch loads.
+#
+# The fixture is the installed `uname` with its own version string altered, so the two are
+# distinguishable at a glance: the installed one says LiberSystem, the published one says
+# SHADOWEDsys. Nothing else about it changes, which is why the compatibility rule calls it
+# hot-publishable and the launch accepts it.
+#
+# The launch is typed at the terminal rather than driven by the `launch` step, and that is not
+# incidental. A launch the development agent itself starts cannot be shadowed: the agent is
+# synchronously inside the launcher call at that moment and so cannot answer the resolution
+# query that same launch triggers. Every other launch in the system - this one, the shell's,
+# anything a program starts - resolves normally.
+version = 1
+name = "registry shadow"
+description = "A published generation is loaded in place of the installed artifact on the next launch."
+timeout = 180
+
+[[step]]
+do = "reset"
+
+# Clear the line editor before typing anything. The guest terminal is a real terminal: an
+# earlier scenario that typed without a newline leaves its characters in the buffer, and they
+# would prefix the first command here.
+[[step]]
+do = "input"
+text = "\u0003"
+enter = false
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "publish"
+artifact = "uname"
+file = "../.build/scenario-fixtures/uname-shadow"
+timeout = 60
+
+[[step]]
+do = "input"
+text = "uname"
+
+[[step]]
+do = "expect"
+contains = "SHADOWEDsys"
+timeout = 20
+
+# Rolling the generation away puts the installed artifact back, with no restart.
+[[step]]
+do = "reset"
+
+[[step]]
+do = "input"
+text = "uname"
+
+[[step]]
+do = "expect"
+contains = "LiberSystem"
+timeout = 20

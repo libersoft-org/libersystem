@@ -289,6 +289,17 @@ fn dependencies(elf: &bootproto::elf::Elf<'_>, dynamic: &bootproto::elf::Dynamic
 struct Processes<'a> {
 	package: Package<'a>,
 	storage: u64,
+	// The development registry, when there is one. A launch asks it whether it holds a
+	// generation of the artifact about to be loaded, and uses those bytes instead.
+	//
+	// The handle is present on every boot, because it is handed over before anything could
+	// know whether an agent will exist. What decides is `registry_armed`: the agent announces
+	// itself on this channel when it is given the other end, and until that announcement
+	// arrives nothing is asked and every launch reads the volume. Querying an unarmed channel
+	// would block this service - the one every launch goes through - against a peer that may
+	// never exist, which is a boot that never finishes.
+	registry: u64,
+	registry_armed: bool,
 	started: Vec<ProcessInfo>,
 	bounded_domains: Vec<(u64, u64)>,
 }
@@ -312,20 +323,39 @@ impl<'a> Processes<'a> {
 	// system volume's manifest-declared path; with none, it comes from the built-in package. Returns the
 	// new process handle plus its canonical physical basename, or None if the command
 	// is malformed, absent or cannot be spawned.
-	unsafe fn spawn_program(&self, name: &str, bootstrap: u64, domain: u64) -> Option<(i64, String)> {
+	// Whether the development agent has announced itself on the registry channel. Checked
+	// without blocking, and only until it has: after that the channel is known live.
+	unsafe fn registry_ready(&mut self) -> bool {
+		unsafe {
+			if self.registry == 0 {
+				return false;
+			}
+			if !self.registry_armed && channel_peek(self.registry) >= 0 {
+				let mut buf: [u8; 16] = [0u8; 16];
+				if let Received::Message { .. } = recv_blocking(self.registry, &mut buf) {
+					self.registry_armed = true;
+				}
+			}
+			self.registry_armed
+		}
+	}
+
+	unsafe fn spawn_program(&mut self, name: &str, bootstrap: u64, domain: u64) -> Option<(i64, String)> {
 		unsafe {
 			if let Some((path, basename)) = executable::explicit_path(name) {
 				if self.storage == 0 {
 					return None;
 				}
-				let handle = spawn_from_path(self.storage, path, basename, bootstrap, domain)?;
+				let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
+				let handle = spawn_from_path(self.storage, registry, path, basename, bootstrap, domain)?;
 				return (handle >= 0).then(|| (handle, String::from(basename)));
 			}
+			let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
 			for artifact in executable::launch_candidates(name)? {
 				let handle = if self.storage != 0 {
 					let logical_name = executable::logical_name(&artifact)?;
 					let path = program_path(logical_name)?;
-					match spawn_from_path(self.storage, path, &artifact, bootstrap, domain) {
+					match spawn_from_path(self.storage, registry, path, &artifact, bootstrap, domain) {
 						Some(handle) => handle,
 						None => continue,
 					}
@@ -346,11 +376,64 @@ impl<'a> Processes<'a> {
 // create a process from the mapped ELF image, then release the mapping. Returns the new
 // process handle. None means the named artifact was absent; a present but invalid
 // artifact returns a negative handle so resolution never falls through to another name.
-unsafe fn spawn_from_path(storage: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<i64> {
+unsafe fn spawn_from_path(storage: u64, registry: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<i64> {
 	unsafe {
-		let main = MappedFile::open(storage, String::from(path))?;
 		let logical_name = executable::logical_name(artifact)?;
+		// Ask the development registry first. It answers with a generation of exactly this
+		// artifact or with nothing, and the name it is asked for is the manifest-resolved one -
+		// so a registry generation can shadow a declared artifact and can shadow nothing else.
+		// Everything after this point is identical either way: the image is verified against
+		// its own identity record and its providers are checked against what that record names,
+		// so a shadowing generation earns its launch by the same rules the installed one does.
+		if let Some(shadow) = registry_generation(registry, logical_name) {
+			return Some(spawn_program_bytes(storage, &shadow, Some(logical_name), bootstrap, domain));
+		}
+		let main = MappedFile::open(storage, String::from(path))?;
 		Some(spawn_program_bytes(storage, main.bytes(), Some(logical_name), bootstrap, domain))
+	}
+}
+
+// Ask the development registry for a generation of `artifact`. None when there is no
+// registry, when it holds nothing for that name, or when it does not answer - all of which
+// mean the installed artifact is what gets loaded.
+// How long a launch waits for the registry to answer, in scheduler ticks (100 Hz).
+const REGISTRY_ANSWER_TICKS: u64 = 100;
+
+unsafe fn registry_generation(registry: u64, artifact: &str) -> Option<Vec<u8>> {
+	unsafe {
+		if registry == 0 || artifact.len() > 64 {
+			return None;
+		}
+		// Drop anything already queued before asking. A query whose deadline expired leaves its
+		// reply to arrive later, and reading that as the answer to the NEXT query puts this
+		// channel permanently one answer behind - every launch then loads what the registry
+		// held at the previous launch, which is worse than not resolving at all because it
+		// looks like it worked.
+		while channel_peek(registry) >= 0 {
+			if let ReceivedVec::Closed = recv_vec_blocking(registry) {
+				return None;
+			}
+		}
+		if !send_blocking(registry, artifact.as_bytes(), 0) {
+			return None;
+		}
+		// Look before waiting. The agent can answer before this ever reaches the wait, and a
+		// wait that is asked to sleep until something arrives has nothing left to wake it when
+		// it already has - so a fast answer would time out while sitting in the queue. Bounded
+		// even so: an agent that died between announcing itself and this query must not take
+		// every later launch down with it.
+		let limit: u64 = clock() + REGISTRY_ANSWER_TICKS;
+		loop {
+			if channel_peek(registry) >= 0 {
+				return match recv_vec_blocking(registry) {
+					ReceivedVec::Message { bytes, .. } if !bytes.is_empty() => Some(bytes),
+					_ => None,
+				};
+			}
+			if clock() >= limit || wait(registry, limit) < 0 {
+				return None;
+			}
+		}
 	}
 }
 
@@ -459,6 +542,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    package instead.
 	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
 
+	// 2b. receive the development registry channel. Handed over even when nothing will ever
+	//     answer on it, so this service never has to learn about a capability arriving after
+	//     it started serving; an unanswered end simply means every launch reads the volume.
+	let registry: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"REGISTRY") }.unwrap_or(0);
+
 	// 3. wait for the serve channel clients reach us on.
 	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
 
@@ -468,7 +556,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 5. serve generated start/list requests until the client side closes.
-	let mut procs: Processes = Processes { package, storage, started: Vec::new(), bounded_domains: Vec::new() };
+	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new(), bounded_domains: Vec::new() };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {

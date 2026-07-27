@@ -84,7 +84,8 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // both client channels - the StorageService one so its `cat` round-trips, the
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, up: u64, pkg_handle: u64, pkg_len: usize, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -134,7 +135,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"device_service" && !bootstrap_serve(manager_side, device_client) {
 			return State::Failed;
 		}
-		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, *storage_client, process_client, buf) {
+		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, *storage_client, *registry_far, process_client, buf) {
 			return State::Failed;
 		}
 		if name == b"config_service" && !bootstrap_config_service(manager_side, *storage_client, *storage_admin, config_client) {
@@ -851,8 +852,13 @@ unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, usb_pointer: u64, r
 // (the bring-up fallback), and the channel its clients reach it on. The service-channel
 // client end is kept in `*process_client` and later transferred to the shell for
 // `ps`/`run`. The receive order matches ProcessService's: package, storage, serve.
-unsafe fn bootstrap_process_service(manager_side: u64, pkg_handle: u64, pkg_len: usize, storage_client: u64, process_client: &mut u64, buf: &mut [u8]) -> bool {
-	unsafe { bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_factory(manager_side, b"STORAGE", storage_client) && bootstrap_serve(manager_side, process_client) }
+unsafe fn bootstrap_process_service(manager_side: u64, pkg_handle: u64, pkg_len: usize, storage_client: u64, registry: u64, process_client: &mut u64, buf: &mut [u8]) -> bool {
+	// The registry channel is handed over here even though nothing is on the other end yet:
+	// the development agent is started later, by DeviceManager, and gets the far end then.
+	// Making the pair up front is what keeps ProcessService from needing to learn about a
+	// capability arriving after it started serving - it simply holds an end that stays silent
+	// on a boot that never has an agent.
+	unsafe { bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_factory(manager_side, b"STORAGE", storage_client) && send_blocking(manager_side, b"REGISTRY", registry) && bootstrap_serve(manager_side, process_client) }
 }
 
 // Hand StorageService its disk-backed volume, private directory-scope admin endpoint,

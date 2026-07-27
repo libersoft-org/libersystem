@@ -110,6 +110,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						close(handle);
 					}
 				}
+				// The other end of the channel ProcessService already holds, so a launch can
+				// ask the registry whether it has a generation of the artifact it is about to
+				// read off the volume.
+				Received::Message { len, handle } if len >= 6 && &buf[..6] == b"DEVREG" => {
+					if dev_agent != 0 && handle != 0 {
+						send_blocking(dev_agent, b"REG", handle);
+					} else if handle != 0 {
+						close(handle);
+					}
+				}
 				Received::Message { .. } => {
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
 					break;
