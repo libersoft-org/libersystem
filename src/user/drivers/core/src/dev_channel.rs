@@ -6,10 +6,12 @@
 // negotiation, no control-queue port discovery, and the console keeps its own device, so
 // either channel can fail without taking the other down.
 //
-// This program owns the transport only. The framing above it lives in `dev_protocol` and
-// knows nothing about how the port was discovered, so a later multiport driver can host the
-// same protocol on a named port without changing anything above this layer - and the
-// development agent that will own the artifact registry can host it on a channel instead.
+// This program is a transport and nothing else. It moves raw bytes between the port and one
+// channel it hands up to DeviceManager, which routes it to the development agent; the
+// framing, the session and the artifact registry all live there. A driver holds a device
+// capability and an MMIO mapping, and that is not where megabytes of unverified bytes a host
+// streamed in belong. Nothing here knows what a frame is, so a later multiport driver can
+// carry the same protocol on a named port without anything above it changing.
 //
 // Both queues are interrupt-driven. The receive side because a control channel is idle
 // almost all the time, and a driver that polled it would spend the guest's whole life
@@ -23,13 +25,11 @@
 extern crate alloc;
 
 mod common;
-mod dev_protocol;
 mod virtio;
 
 use alloc::vec::Vec;
 use rt::*;
 
-use crate::dev_protocol::{HEADER_LEN, MAGIC, MAX_PAYLOAD, PARTIAL_FRAME_TICKS, SESSION_IDLE_TICKS, Session, Sink, VERSION};
 use crate::virtio::{Queue, Virtio};
 
 // The receive pool: enough slots that a burst of host writes is absorbed without the device
@@ -38,10 +38,15 @@ use crate::virtio::{Queue, Virtio};
 const RX_SLOTS: u16 = 8;
 const RX_SLOT: u64 = 4096;
 
-// How long a reply may wait for the transmit buffer to come back, in scheduler ticks
+// The largest frame the protocol above defines, which is the largest message the agent can
+// hand down and therefore the transmit buffer this driver needs. The driver never inspects a
+// frame; it only has to be able to carry one.
+const MAX_FRAME: usize = 65536;
+
+// How long a write may wait for the transmit buffer to come back, in scheduler ticks
 // (100 Hz). The host end can stop reading at any moment, and QEMU then stops consuming the
 // transmit queue rather than discarding what it cannot deliver, so the buffer stays with the
-// device. This bounds how long the guest tolerates that before declaring the host gone.
+// device. This bounds how long the guest tolerates that before dropping the write.
 const TX_DRAIN_TICKS: u64 = 200;
 
 #[unsafe(no_mangle)]
@@ -68,9 +73,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(t) => t,
 			None => exit(),
 		};
-		// One transmit buffer sized to the frame bound, so the largest reply the protocol can
-		// produce is sent in one descriptor.
-		let (_txbuf, tx_virt, tx_phys): (u64, u64, u64) = match dma_buffer((HEADER_LEN + MAX_PAYLOAD) as u64) {
+		let (_txbuf, tx_virt, tx_phys): (u64, u64, u64) = match dma_buffer(MAX_FRAME as u64) {
 			Some(t) => t,
 			None => exit(),
 		};
@@ -85,9 +88,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		rx.notify();
 		device.driver_ok();
-		send_blocking(bootstrap, b"driver.dev-channel: online (protocol v1)", 0);
+		// Create the byte channel and hand its far end up with the online report, the way
+		// every driver with a service above it does. DeviceManager routes it to the agent.
+		let (bytes, bytes_far): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => exit(),
+		};
+		send_blocking(bootstrap, b"driver.dev-channel: online (transport)", bytes_far);
 		let mut port: Port = Port { device: &device, irq, tx: &mut tx, virt: tx_virt, phys: tx_phys, busy: false };
-		serve(&device, irq, &mut rx, &mut port, rx_virt, &rx_phys)
+		pump(&device, irq, bytes, &mut rx, &mut port, rx_virt, &rx_phys)
 	}
 }
 
@@ -108,7 +117,7 @@ unsafe fn recv_irq(bootstrap: u64) -> u64 {
 // that went away - and QEMU responds by ceasing to consume the transmit queue rather than
 // discarding what it cannot deliver. The device therefore keeps ownership of the buffer it
 // was handed. A polled write that gave up on such a buffer would leave the device holding a
-// descriptor that the next reply overwrites, which corrupts the ring permanently and takes
+// descriptor that the next write overwrites, which corrupts the ring permanently and takes
 // the channel down for the rest of the guest's life. So completions are reaped explicitly
 // and the buffer is never refilled until the device gives it back. Waiting for that is
 // bounded; the port recovers by itself once the host reads again, precisely because the
@@ -125,7 +134,7 @@ struct Port<'a> {
 
 impl Port<'_> {
 	// Reap every transmit completion the device has posted, which is what releases the
-	// buffer for the next frame.
+	// buffer for the next write.
 	unsafe fn reclaim(&mut self) {
 		unsafe {
 			while self.tx.take_used().is_some() {
@@ -133,15 +142,12 @@ impl Port<'_> {
 			}
 		}
 	}
-}
 
-impl Sink for Port<'_> {
-	// Write one frame to the port (virtio-serial buffers are raw bytes, no header), waiting
-	// - bounded - for the previous frame to be taken first. Returns false when the host has
-	// stopped consuming.
-	fn send(&mut self, opcode: u8, request: u32, generation: u32, status: u16, payload: &[u8]) -> bool {
+	// Write bytes to the port, waiting - bounded - for the previous write to be taken first.
+	// Returns false when the host has stopped consuming.
+	unsafe fn write(&mut self, payload: &[u8]) -> bool {
 		unsafe {
-			if payload.len() > MAX_PAYLOAD {
+			if payload.is_empty() || payload.len() > MAX_FRAME {
 				return false;
 			}
 			self.reclaim();
@@ -155,108 +161,64 @@ impl Sink for Port<'_> {
 				interrupt_ack(self.irq);
 				self.reclaim();
 			}
-			let mut header: [u8; HEADER_LEN] = [0u8; HEADER_LEN];
-			header[..2].copy_from_slice(&MAGIC.to_le_bytes());
-			header[2] = VERSION;
-			header[3] = opcode;
-			header[4..8].copy_from_slice(&request.to_le_bytes());
-			header[8..12].copy_from_slice(&generation.to_le_bytes());
-			header[12..14].copy_from_slice(&(payload.len() as u16).to_le_bytes());
-			header[14..16].copy_from_slice(&status.to_le_bytes());
-			core::ptr::copy_nonoverlapping(header.as_ptr(), self.virt as *mut u8, HEADER_LEN);
-			core::ptr::copy_nonoverlapping(payload.as_ptr(), (self.virt + HEADER_LEN as u64) as *mut u8, payload.len());
-			self.busy = self.tx.submit_async(&[(self.phys, (HEADER_LEN + payload.len()) as u32, false)]);
+			core::ptr::copy_nonoverlapping(payload.as_ptr(), self.virt as *mut u8, payload.len());
+			self.busy = self.tx.submit_async(&[(self.phys, payload.len() as u32, false)]);
 			self.busy
 		}
 	}
 }
 
-// Serve the channel: reap what the host wrote into the accumulator, hand it to the protocol,
-// and block on the device interrupt when there is nothing left to do.
+// Move bytes between the port and the agent's channel, in both directions, forever.
 //
-// Receive buffers are reaped before every wait rather than only after one. Both queues share
-// the device's single MSI-X vector, so the wait inside a transmit drain can consume the very
-// interrupt that announced newly arrived bytes; reaping first means the loop never blocks
-// while the used ring still holds work, whichever wait observed the interrupt.
-unsafe fn serve(device: &Virtio, irq: u64, rx: &mut Queue, port: &mut Port, rx_virt: u64, rx_phys: &[u64]) -> ! {
+// Receive buffers and channel messages are both drained before every wait rather than only
+// after one. Both queues share the device's single MSI-X vector, so the wait inside a
+// transmit drain can consume the very interrupt that announced newly arrived bytes; draining
+// first means the loop never blocks while work is already queued, whichever wait observed it.
+unsafe fn pump(device: &Virtio, irq: u64, bytes: u64, rx: &mut Queue, port: &mut Port, rx_virt: u64, rx_phys: &[u64]) -> ! {
 	unsafe {
-		let mut session: Session = Session::new();
-		let mut pending: Vec<u8> = Vec::with_capacity(HEADER_LEN + MAX_PAYLOAD + RX_SLOT as usize);
-		// Two of the three deadlines this loop carries; the third, the open publication's,
-		// belongs to the session and is read back from it. Zero means the deadline does not
-		// apply.
-		let mut fragment_at: u64 = 0;
-		let mut session_at: u64 = 0;
+		let mut outbound: Vec<u8> = alloc::vec![0u8; MAX_FRAME];
 		loop {
-			let mut arrived: bool = false;
+			let mut worked: bool = false;
+			// Port to agent.
 			while let Some((id, len)) = rx.take_used() {
 				if id < RX_SLOTS && len > 0 {
 					let n: usize = if len as u64 > RX_SLOT { RX_SLOT as usize } else { len as usize };
 					let chunk: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * RX_SLOT) as *const u8, n);
-					pending.extend_from_slice(chunk);
-					arrived = true;
+					// The agent going away leaves the port with nobody above it, which is not
+					// something this driver can serve around.
+					if !send_blocking(bytes, chunk, 0) {
+						exit();
+					}
+					worked = true;
 				}
 				rx.post_recv(id, rx_phys[id as usize], RX_SLOT as u32);
 			}
-			if arrived {
+			if worked {
 				rx.notify();
-				port.reclaim();
-				// A host that stopped reading its own replies is gone as far as this session is
-				// concerned. Drop what it left buffered rather than answer into a channel nobody
-				// is draining.
-				if !session.consume(&mut pending, port) {
-					session.close();
-					pending.clear();
+			}
+			// Agent to port.
+			while channel_peek(bytes) >= 0 {
+				match recv_blocking(bytes, &mut outbound) {
+					Received::Message { len, .. } => {
+						port.write(&outbound[..len]);
+						worked = true;
+					}
+					Received::Closed => exit(),
 				}
-				// Rearm the deadlines against what the parse left behind. The fragment deadline
-				// dates from when the fragment first appeared, not from the last byte of it, so a
-				// host trickling one byte at a time cannot hold a frame open indefinitely. The
-				// session deadline is refreshed by any traffic at all, because a host that is
-				// still writing has not gone away whatever it is writing.
-				let now: u64 = clock();
-				if pending.is_empty() {
-					fragment_at = 0;
-				} else if fragment_at == 0 {
-					fragment_at = now + PARTIAL_FRAME_TICKS;
-				}
-				session_at = if session.is_open() { now + SESSION_IDLE_TICKS } else { 0 };
+			}
+			if worked {
 				continue;
 			}
-			// Wait on whichever deadline comes first, and on none at all when the channel is
-			// idle with no session open: nothing is then waiting to expire, so the driver must
-			// not wake the scheduler even once.
-			let deadline: u64 = soonest(&[fragment_at, session_at, session.publication_deadline()]);
-			let ready: i64 = wait(irq, deadline);
-			// Read the ISR to deassert the device's level-triggered INTx line before acking
-			// (a harmless zero read on MSI-X, which is edge-triggered).
-			let _ = device.read_isr();
-			interrupt_ack(irq);
-			if ready == ERR_TIMED_OUT {
-				let now: u64 = clock();
-				if fragment_at != 0 && now >= fragment_at {
-					session.fail_partial(&mut pending, port);
-					fragment_at = 0;
-				}
-				let publication_at: u64 = session.publication_deadline();
-				if publication_at != 0 && now >= publication_at {
-					session.expire_publication();
-				}
-				if session_at != 0 && now >= session_at {
-					session.close();
-					session_at = 0;
-				}
+			// Nothing left either way: block on the device interrupt and the agent's channel
+			// at once, waking on whichever speaks first.
+			let ready: i64 = wait_any(&[irq, bytes], 0);
+			if ready == 0 {
+				// Read the ISR to deassert the device's level-triggered INTx line before
+				// acking (a harmless zero read on MSI-X, which is edge-triggered).
+				let _ = device.read_isr();
+				interrupt_ack(irq);
 			}
+			port.reclaim();
 		}
 	}
-}
-
-// The earliest deadline that applies, or zero when none does.
-fn soonest(deadlines: &[u64]) -> u64 {
-	let mut earliest: u64 = 0;
-	for &at in deadlines {
-		if at != 0 && (earliest == 0 || at < earliest) {
-			earliest = at;
-		}
-	}
-	earliest
 }

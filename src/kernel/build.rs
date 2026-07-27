@@ -508,7 +508,12 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 			assert!(features == "-" || features.split(',').all(valid_library_name), "library {} has invalid feature set {features:?}", row.name);
 		}
 		let dest: String = match row.kind.as_str() {
-			"driver" if row.stage == "volume" => row.destination.clone().expect("driver destination"),
+			// A static service staged to the volume, rather than pinned into the init package:
+			// the development agent is spawned by DeviceManager from the volume the way a
+			// driver is, so it must not be linked dynamically (that path needs ProcessService)
+			// and must not be pinned (it is development-only and has no business in the
+			// boot-critical bundle).
+			"driver" | "service" if row.stage == "volume" => row.destination.clone().expect("program destination"),
 			"library" if row.stage == "volume" => row.destination.clone().expect("library destination"),
 			"dynamic" | "dynamic-service" if row.stage == "volume" => row.destination.clone().expect("program destination"),
 			_ => continue,

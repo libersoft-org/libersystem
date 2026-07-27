@@ -1065,6 +1065,15 @@ destination = "drivers/dev_channel.lsexe"
 providers = []
 
 [[programs]]
+name = "dev_agent"
+owner = "services"
+role = "service"
+linkage = "static"
+stage = "volume"
+destination = "libexec/dev_agent.lsexe"
+providers = []
+
+[[programs]]
 name = "virtio_gpu"
 owner = "drivers"
 role = "driver"

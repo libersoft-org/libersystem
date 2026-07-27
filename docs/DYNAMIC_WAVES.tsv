@@ -5,7 +5,7 @@ x86_64-unknown-none	2	11	159176	135720	529872	524288	581632	just test-tags servi
 x86_64-unknown-none	3	13	89664	106992	712616	618496	778240	just test-tags service,process,storage
 x86_64-unknown-none	4	8	67928	67432	526760	364544	520192	just test-tags service,process
 x86_64-unknown-none	5	7	158320	128864	2172528	606208	2113536	just test-tags image,audio,service,process,storage
-aarch64-unknown-none	1	12	87784	88360	501872	278528	499712	just test-tags service,process,storage
+aarch64-unknown-none	1	12	87776	88360	501872	278528	499712	just test-tags service,process,storage
 aarch64-unknown-none	2	11	175488	146320	615080	757760	626688	just test-tags service,process,storage
 aarch64-unknown-none	3	13	99016	114480	829160	864256	856064	just test-tags service,process,storage
 aarch64-unknown-none	4	8	75192	72328	611040	528384	561152	just test-tags service,process

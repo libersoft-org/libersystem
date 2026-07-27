@@ -218,6 +218,15 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 				if driver_name == b"virtio_snd" {
 					*snd_client = handle;
 				}
+				// The development channel driver hands up a raw byte channel, and the agent
+				// that speaks the protocol over it is started here rather than by
+				// ServiceManager. It exists exactly when the device does, it has no other
+				// client, and its whole reason to be a separate process is to keep the
+				// artifact registry out of the address space that holds a device capability -
+				// so it is started where that device is bound, and nowhere else.
+				if driver_name == b"dev_channel" && handle != 0 && !start_dev_agent(storage, handle) {
+					print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
+				}
 				// The pointer flavour of virtio_input hands up an event channel (non-zero
 				// handle); the keyboard flavour hands up nothing (handle 0), so a non-zero
 				// virtio_input handle is the pointer's INPUT channel for InputService.
@@ -250,6 +259,52 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 		}
 		close(key_producer);
 		report_state(&state);
+	}
+}
+
+// Start the development agent on the byte channel the development channel driver handed up.
+// The channel becomes the agent's bootstrap: raw port bytes arrive on it and whole protocol
+// frames go back, so the driver never learns what a frame is. The agent reports in once, and
+// a failure to start is reported rather than retried - a development instance without its
+// agent is still a usable guest, just one whose control channel carries nothing.
+unsafe fn start_dev_agent(storage: u64, bytes: u64) -> bool {
+	unsafe {
+		let loaded: Option<(u64, u64, usize)> = read_driver(storage, b"dev_agent");
+		let (file, mapped, size): (u64, u64, usize) = match loaded {
+			Some(t) => t,
+			None => return false,
+		};
+		let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
+		// The agent gets a bootstrap of its own and the byte channel transferred over it. The
+		// byte channel is the wire: anything sent on it goes out of the port, so it is not a
+		// place to report in, and DeviceManager must never read from it either - every byte on
+		// it belongs to the agent.
+		let (dm_side, agent_side): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => {
+				unmap_object(file);
+				close(file);
+				return false;
+			}
+		};
+		let started: bool = spawn(elf, agent_side) >= 0;
+		unmap_object(file);
+		close(file);
+		if !started || !send_blocking(dm_side, b"BYTES", bytes) {
+			return false;
+		}
+		// The agent reports in before it serves, so a start that loaded but never ran is not
+		// mistaken for a working one. The bootstrap stays open afterwards: dropping it is how
+		// the agent would learn to shut down.
+		let mut buf: [u8; 64] = [0u8; 64];
+		match recv_blocking(dm_side, &mut buf) {
+			Received::Message { len, .. } if len >= 5 && &buf[..5] == b"agent" => {
+				print(&buf[..len]);
+				print(b"\n");
+				true
+			}
+			_ => false,
+		}
 	}
 }
 

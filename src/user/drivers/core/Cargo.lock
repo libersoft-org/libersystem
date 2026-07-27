@@ -22,10 +22,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bootproto"
-version = "0.0.0"
-
-[[package]]
 name = "config-proto"
 version = "0.0.0"
 dependencies = [
@@ -55,7 +51,6 @@ dependencies = [
 name = "drivers"
 version = "0.0.0"
 dependencies = [
- "bootproto",
  "proto",
  "rt",
 ]
