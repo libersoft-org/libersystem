@@ -44,6 +44,12 @@ struct RawProgram {
 	destination: String,
 	#[serde(default)]
 	providers: Vec<String>,
+	// A development-only program: built and staged only when the development feature is on,
+	// and absent from a shipped image rather than present and refusing to work. Declaring it
+	// here keeps the manifest the single place that says what the system is made of, in both
+	// configurations.
+	#[serde(default)]
+	development: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -166,6 +172,8 @@ pub struct Program {
 	pub stage: Stage,
 	pub destination: RelativePath,
 	pub providers: Vec<Name>,
+	// Built and staged only in the development configuration; see RawProgram.
+	pub development: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -330,7 +338,7 @@ impl Manifest {
 			if !destinations.insert(destination.clone()) {
 				push_error(&mut errors, format!("{location}.destination"), "duplicate staged destination");
 			}
-			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers }).is_some() {
+			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers, development: raw_program.development }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate program name");
 			}
 		}
@@ -434,8 +442,12 @@ impl Manifest {
 		})
 	}
 
-	pub fn volume_destinations(&self) -> BTreeSet<String> {
-		self.libraries.values().map(|library| library.destination.as_str().to_string()).chain(self.programs.values().filter(|program| program.stage == Stage::Volume).map(|program| program.destination.as_str().to_string())).chain(self.factory_files.values().map(|file| file.destination.as_str().to_string())).collect()
+	// Every destination the system volume is expected to carry. `development` selects the
+	// configuration: false is the shipping volume, which omits the development-only programs
+	// entirely, and the two answers must not be conflated - a build that stages one set and
+	// checks against the other is exactly the mistake this returns a parameter to prevent.
+	pub fn volume_destinations(&self, development: bool) -> BTreeSet<String> {
+		self.libraries.values().map(|library| library.destination.as_str().to_string()).chain(self.programs.values().filter(|program| program.stage == Stage::Volume && (development || !program.development)).map(|program| program.destination.as_str().to_string())).chain(self.factory_files.values().map(|file| file.destination.as_str().to_string())).collect()
 	}
 }
 

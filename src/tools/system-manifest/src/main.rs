@@ -78,13 +78,20 @@ fn run() -> Result<(), String> {
 					return Err(format!("system-manifest: {path} has duplicate entry {name}"));
 				}
 			}
-			let expected = manifest.volume_destinations();
-			if actual != expected {
+			// A volume package is a shipping one or a development one, and the difference is
+			// exactly the development-only programs. Accept whichever it is rather than
+			// demanding one, and say which was recognised, so this never becomes a reason to
+			// avoid checking the configuration that is actually being built.
+			let shipping = manifest.volume_destinations(false);
+			let development = manifest.volume_destinations(true);
+			if actual != shipping && actual != development {
+				let expected = if actual.len() > shipping.len() { &development } else { &shipping };
 				let missing = expected.difference(&actual).cloned().collect::<Vec<_>>().join(", ");
-				let unexpected = actual.difference(&expected).cloned().collect::<Vec<_>>().join(", ");
+				let unexpected = actual.difference(expected).cloned().collect::<Vec<_>>().join(", ");
 				return Err(format!("system-manifest: {path} volume entries differ from manifest; missing=[{missing}] unexpected=[{unexpected}]"));
 			}
-			println!("system-manifest: volume package entries match manifest");
+			let configuration = if actual == development && development != shipping { "development" } else { "shipping" };
+			println!("system-manifest: volume package entries match manifest ({configuration} configuration)");
 		}
 		_ => return Err(format!("system-manifest: unknown command {command:?}")),
 	}

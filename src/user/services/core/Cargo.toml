@@ -10,6 +10,9 @@ description = "Core userspace system services (ServiceManager, ...)"
 
 [features]
 default = []
+# The development agent, its artifact registry and the control port it is reached over.
+# Deliberately not in `default`: a shipping build must not contain them at all.
+development = []
 shared-image = [
 	"ipc-client/shared-image",
 	"proto/shared-image",
@@ -32,6 +35,9 @@ path = "src/device_manager.rs"
 [[bin]]
 name = "dev_agent"
 path = "src/dev_agent.rs"
+# Not built at all without the feature, so the development agent and the artifact registry
+# behind it are absent from a shipped image rather than present and refusing to work.
+required-features = ["development"]
 
 [[bin]]
 name = "device_service"

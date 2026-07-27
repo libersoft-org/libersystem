@@ -10,6 +10,14 @@ description = "OS kernel"
 name = "kernel"
 path = "main.rs"
 
+[features]
+default = []
+# Stage the development-only programs into the system volume. Off by default: a shipped
+# image must not carry the development agent, its artifact registry or the control port's
+# transport at all, and `build.rs` skips every manifest program marked `development` unless
+# this is on.
+development = []
+
 [dependencies]
 # The typed boot protocol the own UEFI loader hands the kernel (memory map, HHDM
 # offset, framebuffer, loaded packages, ACPI RSDP).

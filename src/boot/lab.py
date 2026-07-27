@@ -641,7 +641,11 @@ def cmd_dev_up(args):
 	# `server` without `nowait`: QEMU blocks until the broker connects, so no boot output
 	# is lost. `start_new_session` gives the instance its own process group, which is what
 	# `dev-down` stops - never a QEMU that this instance does not own.
-	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1')
+	# The development agent, its registry and the control port's transport are behind a
+	# compile-time feature that is off everywhere else, so the persistent instance is the one
+	# configuration that asks for them. An ordinary build, and every test build, contains no
+	# trace of them.
+	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1')
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
 	guest = subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
 	while True:

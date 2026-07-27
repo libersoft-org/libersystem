@@ -22,6 +22,9 @@ path = "src/virtio_console.rs"
 [[bin]]
 name = "dev_channel"
 path = "src/dev_channel.rs"
+# The control port's transport, absent from a shipped image for the same reason the agent
+# above it is.
+required-features = ["development"]
 
 [[bin]]
 name = "virtio_input"
@@ -38,6 +41,11 @@ path = "src/virtio_snd.rs"
 [[bin]]
 name = "xhci"
 path = "src/xhci.rs"
+
+[features]
+default = []
+# The development control port's transport. Deliberately not in `default`.
+development = []
 
 [dependencies]
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and

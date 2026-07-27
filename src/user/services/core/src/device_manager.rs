@@ -33,7 +33,9 @@ const MAX_DRIVER_RESTARTS: u32 = 3;
 // Where the host pins the development channel's virtio-serial device. It is a second
 // device of a type that already has a driver, so an address is what separates them; the
 // runner sets the same address on every target, and nothing above the port depends on it.
+#[cfg(feature = "development")]
 const DEV_CHANNEL_BUS: u8 = 0;
+#[cfg(feature = "development")]
 const DEV_CHANNEL_DEV: u8 = 0x1e;
 
 #[unsafe(no_mangle)]
@@ -224,6 +226,7 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 				// client, and its whole reason to be a separate process is to keep the
 				// artifact registry out of the address space that holds a device capability -
 				// so it is started where that device is bound, and nowhere else.
+				#[cfg(feature = "development")]
 				if driver_name == b"dev_channel" && handle != 0 && !start_dev_agent(storage, handle) {
 					print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
 				}
@@ -267,6 +270,7 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 // frames go back, so the driver never learns what a frame is. The agent reports in once, and
 // a failure to start is reported rather than retried - a development instance without its
 // agent is still a usable guest, just one whose control channel carries nothing.
+#[cfg(feature = "development")]
 unsafe fn start_dev_agent(storage: u64, bytes: u64) -> bool {
 	unsafe {
 		let loaded: Option<(u64, u64, usize)> = read_driver(storage, b"dev_agent");
@@ -464,6 +468,9 @@ fn driver_for(info: &DeviceInfo) -> &'static [u8] {
 	// address. Matching the address rather than the enumeration order keeps the real
 	// console bound to the console driver whatever order the bus is walked in, and keeps
 	// the two ports independent: either can fail without taking the other with it.
+	// Without the development feature there is no such driver in the image, so the device is
+	// left unbound rather than bound to something absent.
+	#[cfg(feature = "development")]
 	if info.device_type == VIRTIO_TYPE_CONSOLE && info.bus == DEV_CHANNEL_BUS && info.dev == DEV_CHANNEL_DEV && info.func == 0 {
 		return b"dev_channel";
 	}

@@ -2,6 +2,10 @@
 # Run from the src/ directory (where this Justfile lives).
 
 kernel_dir := "kernel"
+# The development configuration: the development agent, its artifact registry and the control
+# port's transport. Off unless LIBER_DEVELOPMENT=1, so an ordinary build - and every test and
+# shipping build - does not contain those units at all. `dev-up` sets it; nothing else does.
+dev_features := if env_var_or_default("LIBER_DEVELOPMENT", "0") == "1" { "--features development" } else { "" }
 user_dir := "$(tools/source-path.sh system_manager)"
 services_dir := "$(tools/source-path.sh services)"
 storage_dir := "$(tools/source-path.sh storage)"
@@ -112,6 +116,11 @@ dev-baseline scenario tags="smoke":
 dev-build *arguments:
     @tools/dev-build.sh {{ arguments }}
 
+# Verify the development agent, its artifact registry and the control port's transport are
+# absent from the shipping configuration rather than merely refusing to run in it.
+development-gate-check:
+    tools/check-development-gate.sh
+
 # Reject an ET_EXEC mutation before it can rewrite any target's staged system volume.
 static-image-check: sdk user user-aarch64 user-riscv64
     tools/check-static-injection.sh static
@@ -153,9 +162,9 @@ shared-libs-riscv64:
 # build the userspace programs that make up the init package
 user: shared-libs
     cd {{ user_dir }} && cargo build
-    cd {{ services_dir }} && cargo build
+    cd {{ services_dir }} && cargo build {{ dev_features }}
     cd {{ storage_dir }} && cargo build
-    cd {{ drivers_dir }} && cargo build
+    cd {{ drivers_dir }} && cargo build {{ dev_features }}
 
 # build the userspace programs for aarch64 (the aarch64 kernel build.rs reads them
 # from each crate's aarch64-unknown-none target dir)
@@ -173,7 +182,7 @@ sdk:
 # build the kernel (its build.rs assembles the init package from the userspace build)
 # and the own UEFI loader (staged into the boot image as BOOTX64.EFI)
 build: sdk user
-    cd {{ kernel_dir }} && cargo build
+    cd {{ kernel_dir }} && cargo build {{ dev_features }}
     cd {{ loader_dir }} && cargo build
 
 # generate the proto crate's bindings from the LSIDL interface definitions
@@ -300,7 +309,7 @@ run *args:
 # build + boot the x86_64 build in QEMU (native with KVM on an x86_64 host, emulated
 # elsewhere). Add live displays as arguments (combinable): `just run-x86_64 vnc spice`.
 run-x86_64 *displays: sdk user
-    cd {{ kernel_dir }} && cargo build
+    cd {{ kernel_dir }} && cargo build {{ dev_features }}
     DISPLAYS="{{ displays }}" boot/qemu-run.sh x86_64 {{ kernel_elf }}
 
 # build + boot, QEMU waits for GDB (port :1234)
@@ -765,7 +774,7 @@ fmt:
     cd {{ fat_dir }} && cargo fmt
     cd {{ iso9660_dir }} && cargo fmt
     cd {{ udf_dir }} && cargo fmt
-    shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
+    shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-development-gate.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
     cd .. && taplo fmt
 
 # check formatting without writing changes (CI-friendly)
@@ -840,7 +849,7 @@ _fmt-check:
     cd {{ fat_dir }} && cargo fmt --check
     cd {{ iso9660_dir }} && cargo fmt --check
     cd {{ udf_dir }} && cargo fmt --check
-    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
+    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-development-gate.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
     cd .. && taplo fmt --check
 
 # clean build artifacts

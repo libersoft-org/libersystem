@@ -150,7 +150,7 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 		let features = if library.features.is_empty() { String::from("-") } else { library.features.iter().map(|feature| feature.as_str()).collect::<Vec<_>>().join(",") };
 		rows.push(ManifestRow { kind: String::from("library"), name: library.name.as_str().to_string(), crate_dir: library.owner.as_str().to_string(), crate_path: source.path.as_str().to_string(), stage: String::from("volume"), destination: Some(library.destination.as_str().to_string()), features: Some(features), providers: library.providers.iter().map(|provider| provider.as_str().to_string()).collect() });
 	}
-	for program in model.programs.values() {
+	for program in model.programs.values().filter(|program| included(program)) {
 		let source = model.sources.get(&program.owner).expect("validated program owner");
 		let kind = match (program.role, program.linkage) {
 			(ProgramRole::Service, Linkage::Dynamic) => "dynamic-service",
@@ -185,7 +185,7 @@ fn generate_test_volume_paths(manifest: &system_manifest::Manifest) {
 		library_arms.push_str(&format!("\t\"{}.lslib\" => Some(\"{}\"),\n", library.name, library.destination.as_str()));
 	}
 	let mut program_arms = String::new();
-	for program in manifest.programs.values().filter(|program| program.stage == system_manifest::Stage::Volume) {
+	for program in manifest.programs.values().filter(|program| program.stage == system_manifest::Stage::Volume && included(program)) {
 		program_arms.push_str(&format!("\t\"{}\" => Some(\"{}\"),\n", program.name, program.destination.as_str()));
 	}
 	let mut factory_arms = String::new();
@@ -197,7 +197,7 @@ fn generate_test_volume_paths(manifest: &system_manifest::Manifest) {
 		runtime_arms.push_str(&format!("\t\"{}\" => Some(\"{}\"),\n", runtime_path.name, runtime_path.destination.as_str()));
 	}
 	let mut declared_arms = String::new();
-	for destination in manifest.libraries.values().map(|library| library.destination.as_str()).chain(manifest.programs.values().filter(|program| program.stage == system_manifest::Stage::Volume).map(|program| program.destination.as_str())).chain(manifest.factory_files.values().map(|file| file.destination.as_str())) {
+	for destination in manifest.libraries.values().map(|library| library.destination.as_str()).chain(manifest.programs.values().filter(|program| program.stage == system_manifest::Stage::Volume && included(program)).map(|program| program.destination.as_str())).chain(manifest.factory_files.values().map(|file| file.destination.as_str())) {
 		declared_arms.push_str(&format!("\t\"{destination}\" => true,\n"));
 	}
 	let source = format!("// @generated from user/services/manifest.toml by build.rs - do not edit.\nfn test_library_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{library_arms}\t\t_ => None,\n\t}}\n}}\n\nfn test_program_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{program_arms}\t\t_ => None,\n\t}}\n}}\n\nfn test_factory_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{factory_arms}\t\t_ => None,\n\t}}\n}}\n\nfn test_runtime_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{runtime_arms}\t\t_ => None,\n\t}}\n}}\n\nfn test_volume_path_is_declared(path: &str) -> bool {{\n\tmatch path {{\n{declared_arms}\t\t_ => false,\n\t}}\n}}\n");
@@ -310,6 +310,15 @@ fn identity_record(artifact: &Path) -> Vec<u8> {
 	let bytes = fs::read(artifact).unwrap_or_else(|error| panic!("cannot read {}: {error}", artifact.display()));
 	let image = bootproto::elf::Elf::parse_for_machine(&bytes, user_elf_machine()).unwrap_or_else(|| panic!("{} has no valid target ELF", artifact.display()));
 	image.liber_identity_note().unwrap_or_else(|| panic!("{} has no valid identity note", artifact.display())).to_vec()
+}
+
+// Whether a manifest program belongs in this build at all. A development-only program is
+// built and staged only when the `development` feature is on, so a shipped image does not
+// contain the development agent, its artifact registry or the control port's transport -
+// absent, rather than present and refusing to run, which is the difference between a
+// boundary and a policy.
+fn included(program: &system_manifest::Program) -> bool {
+	!program.development || cfg!(feature = "development")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -547,7 +556,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	}
 	files.sort_by(|a, b| a.0.cmp(&b.0));
 	assert!(!files.windows(2).any(|pair| pair[0].0 == pair[1].0), "duplicate volume package destination");
-	let expected_entries = factory_manifest.volume_destinations();
+	let expected_entries = factory_manifest.volume_destinations(cfg!(feature = "development"));
 	let actual_entries = files.iter().map(|(name, _)| name.clone()).collect::<BTreeSet<_>>();
 	assert_eq!(actual_entries, expected_entries, "system volume entries differ from the manifest");
 	for (name, bytes) in &files {
