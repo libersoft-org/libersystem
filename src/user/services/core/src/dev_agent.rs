@@ -39,13 +39,18 @@ use crate::dev_protocol::{HEADER_LEN, MAGIC, MAX_PAYLOAD, PARTIAL_FRAME_TICKS, S
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
-		let mut buf: [u8; 16] = [0u8; 16];
+		let mut buf: [u8; 32] = [0u8; 32];
 		let bytes: u64 = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => handle,
 			_ => exit(),
 		};
+		// The volume client the installed artifacts are read through, so a published
+		// generation can be judged against the image it would shadow rather than against
+		// whatever was published before it. Optional: without it every verdict is unknown,
+		// which is honest, where assuming compatibility would not be.
+		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or(0);
 		send_blocking(bootstrap, b"agent.dev: online (registry)", 0);
-		serve(bytes)
+		serve(bytes, storage)
 	}
 }
 
@@ -77,9 +82,9 @@ impl Sink for ChannelSink {
 
 // Serve the session: take whatever the driver forwarded, hand it to the protocol, and block
 // until either more arrives or one of the session's deadlines comes due.
-unsafe fn serve(channel: u64) -> ! {
+unsafe fn serve(channel: u64, storage: u64) -> ! {
 	unsafe {
-		let mut session: Session = Session::new();
+		let mut session: Session = Session::new(storage);
 		let mut sink: ChannelSink = ChannelSink { channel, frame: Vec::with_capacity(HEADER_LEN + MAX_PAYLOAD) };
 		let mut pending: Vec<u8> = Vec::with_capacity(HEADER_LEN + MAX_PAYLOAD);
 		// Two of the three deadlines; the third, the open publication's, belongs to the

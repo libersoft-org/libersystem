@@ -36,7 +36,12 @@ extern crate alloc;
 use alloc::vec::Vec;
 use bootproto::compat;
 use bootproto::elf::Elf;
+use ipc_client::ChannelTransport;
+use proto::system::{OpenOpts, volume};
 use rt::*;
+
+include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/library_paths.rs"));
 
 // The protocol's identifying prefix ("LD" on the wire) and the version this guest speaks. A
 // version this guest does not know is refused rather than guessed at: the header layout
@@ -85,12 +90,20 @@ const LIBRARY_SUFFIX: &str = ".lslib";
 // do.
 const REGISTRY_PROFILE: &[u8] = b"development";
 
-// How a committed generation compares with the one it succeeded, under the written provider
-// compatibility rule. FIRST is not a weaker COMPATIBLE: nothing was replaced, so no claim
-// about hot replacement was made or could be.
-pub const VERDICT_FIRST: u8 = 0;
+// How a committed generation compares with the artifact it shadows, under the written
+// provider compatibility rule.
+//
+// The comparison is against the INSTALLED artifact on the system volume, not against the
+// generation published before it. That is the comparison a launch will have to make: what a
+// process resolves today is the installed image, so whether a registry generation may stand
+// in for it is a question about those two and nothing else. Comparing against the previous
+// generation would answer a different question and would drift further from the real one
+// with every publication.
 pub const VERDICT_COMPATIBLE: u8 = 1;
 pub const VERDICT_INCOMPATIBLE: u8 = 2;
+// The installed artifact could not be read, so no claim about replacing it was made. Not a
+// weaker COMPATIBLE: nothing was compared.
+pub const VERDICT_UNKNOWN: u8 = 3;
 
 // The most explanation a verdict carries. A rejection names the deciding field and its two
 // values, which is a line, not a document; truncating past this keeps one publication from
@@ -154,6 +167,8 @@ pub const ST_BAD_DYNAMIC: u16 = 19;
 pub const ST_NOTHING_TO_ROLL_BACK: u16 = 20;
 // A registry operation on a boot that has no registry.
 pub const ST_NO_REGISTRY: u16 = 21;
+// A publication naming an artifact the installed manifest does not declare.
+pub const ST_UNDECLARED: u16 = 22;
 
 // The deadline on an incomplete frame, in scheduler ticks (100 Hz). A host that stops
 // mid-frame - killed, disconnected, or writing a length it never delivers - must not leave
@@ -244,6 +259,10 @@ pub struct Session {
 	// Whether this boot may hold a registry at all, read once from the kernel because the
 	// answer cannot change while the guest runs.
 	registry_allowed: bool,
+	// The volume client the installed artifacts are read through, to decide whether a
+	// candidate may stand in for the one it shadows. Zero when none was wired, which leaves
+	// every verdict unknown rather than silently claiming compatibility.
+	storage: u64,
 	candidate: Option<Candidate>,
 	artifacts: Vec<Artifact>,
 	// Live registry content in bytes, tracked rather than recomputed so the budget can be
@@ -252,10 +271,10 @@ pub struct Session {
 }
 
 impl Session {
-	pub fn new() -> Session {
+	pub fn new(storage: u64) -> Session {
 		let mut profile: [u8; 32] = [0u8; 32];
 		let len: usize = unsafe { boot_profile(&mut profile) };
-		Session { handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
+		Session { handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
 	}
 
 	pub fn is_open(&self) -> bool {
@@ -486,6 +505,15 @@ impl Session {
 			self.candidate = None;
 			return live;
 		}
+		let installed_path: Option<&'static str> = declared_path(&candidate.name);
+		if installed_path.is_none() {
+			// An artifact the installed manifest does not declare has nothing to shadow, and
+			// shadowing a name the system never had is how a registry stops being a
+			// development convenience and starts being a way to introduce programs.
+			let live: bool = sink.send(OP_ERROR, request, generation, ST_UNDECLARED, &[]);
+			self.candidate = None;
+			return live;
+		}
 		if let Some(status) = verify_image(&candidate.bytes, &candidate.name) {
 			// A candidate that failed verification is dropped, not kept for a second opinion:
 			// the bytes are known bad and holding them would spend the registry budget on
@@ -500,12 +528,12 @@ impl Session {
 		// check above, so it belongs in the registry either way, and what the verdict decides
 		// is whether installing it is a hot swap or needs the cold path.
 		let index: Option<usize> = self.artifacts.iter().position(|entry| entry.name == candidate.name);
-		let (verdict, detail): (u8, Vec<u8>) = match index.and_then(|at| self.artifacts[at].generations.last()) {
-			Some(previous) => match compat::decide(&previous.bytes, &candidate.bytes) {
+		let (verdict, detail): (u8, Vec<u8>) = match unsafe { read_installed(self.storage, installed_path.expect("the path was checked above")) } {
+			Some(installed) => match compat::decide(&installed, &candidate.bytes) {
 				compat::Verdict::Compatible => (VERDICT_COMPATIBLE, Vec::new()),
 				compat::Verdict::Incompatible(reason) => (VERDICT_INCOMPATIBLE, explain(&reason)),
 			},
-			None => (VERDICT_FIRST, Vec::new()),
+			None => (VERDICT_UNKNOWN, b"the installed artifact could not be read".to_vec()),
 		};
 		let entry = Generation { generation: candidate.generation, digest: candidate.digest, published_at: unsafe { clock_rtc() }, verdict, detail, bytes: candidate.bytes };
 		let added: usize = entry.bytes.len();
@@ -658,12 +686,6 @@ fn terminal_input(request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
 	}
 	let count: [u8; 2] = accepted.to_le_bytes();
 	if accepted as usize == payload.len() { sink.send(OP_TERM_ACK, request, 0, ST_OK, &count) } else { sink.send(OP_ERROR, request, 0, ST_TERM_REFUSED, &count) }
-}
-
-impl Default for Session {
-	fn default() -> Session {
-		Session::new()
-	}
 }
 
 // An artifact name identifies a registry slot. It is checked character by character rather
@@ -852,4 +874,49 @@ fn verify_image(bytes: &[u8], name: &[u8]) -> Option<u16> {
 		}
 	}
 	None
+}
+
+// Where the installed manifest says an artifact lives, or None when it declares no such
+// name. This is the manifest remaining the authority for artifact names: the registry can
+// shadow what the system already has and nothing else.
+//
+// A program and a library are looked up separately because the manifest keeps them apart,
+// and a name that is neither is not an artifact this system knows.
+fn declared_path(name: &[u8]) -> Option<&'static str> {
+	let name: &str = core::str::from_utf8(name).ok()?;
+	program_path(name).or_else(|| library_path(&alloc::format!("{name}.lslib")))
+}
+
+// Read an installed artifact off the system volume. Returns None when there is no storage
+// client, or the artifact cannot be opened or mapped - all of which leave the verdict
+// unknown rather than assumed.
+unsafe fn read_installed(storage: u64, path: &str) -> Option<Vec<u8>> {
+	unsafe {
+		if storage == 0 {
+			return None;
+		}
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		let result = match client.open(&OpenOpts { path: alloc::string::String::from(path), write: false, create: false })? {
+			Ok(result) if result.file != 0 && result.size != 0 => result,
+			_ => return None,
+		};
+		let len: usize = match usize::try_from(result.size) {
+			Ok(len) => len,
+			Err(_) => {
+				close(result.file);
+				return None;
+			}
+		};
+		let address: u64 = match map_object(result.file) {
+			Some(address) => address,
+			None => {
+				close(result.file);
+				return None;
+			}
+		};
+		let bytes: Vec<u8> = core::slice::from_raw_parts(address as *const u8, len).to_vec();
+		unmap_object(result.file);
+		close(result.file);
+		Some(bytes)
+	}
 }

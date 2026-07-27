@@ -293,6 +293,17 @@ unsafe fn start_dev_agent(storage: u64, bytes: u64) -> bool {
 		if !started || !send_blocking(dm_side, b"BYTES", bytes) {
 			return false;
 		}
+		// A volume connection of its own, so the agent can read the installed artifact a
+		// publication would shadow. A fresh connection rather than a duplicate of
+		// DeviceManager's handle: a volume client is a request and reply channel, and two
+		// readers on one endpoint would take each other's replies.
+		let connection: u64 = match service_connect(storage) {
+			Some(connection) => connection,
+			None => return false,
+		};
+		if !send_blocking(dm_side, b"STORAGE", connection) {
+			return false;
+		}
 		// The agent reports in before it serves, so a start that loaded but never ran is not
 		// mistaken for a working one. The bootstrap stays open afterwards: dropping it is how
 		// the agent would learn to shut down.

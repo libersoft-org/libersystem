@@ -967,11 +967,12 @@ PROTO_STATUS = {
 	19: 'unreadable dynamic metadata',
 	20: 'no earlier generation to return to',
 	21: 'this boot has no artifact registry (not the development profile)',
+	22: 'the installed manifest declares no such artifact',
 }
 
 # How a committed generation compares with the one it succeeded, under the written provider
 # compatibility rule. "first" is not a weaker "compatible": nothing was replaced.
-PROTO_VERDICT = {0: 'first of its name', 1: 'hot-publishable', 2: 'needs the cold path'}
+PROTO_VERDICT = {1: 'hot-publishable', 2: 'needs the cold path', 3: 'unknown (installed artifact unreadable)'}
 
 
 def proto_status(status):
