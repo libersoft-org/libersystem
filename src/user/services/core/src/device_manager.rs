@@ -30,6 +30,12 @@ const STATE_FAILED: u8 = 2;
 // before giving up on its device.
 const MAX_DRIVER_RESTARTS: u32 = 3;
 
+// Where the host pins the development channel's virtio-serial device. It is a second
+// device of a type that already has a driver, so an address is what separates them; the
+// runner sets the same address on every target, and nothing above the port depends on it.
+const DEV_CHANNEL_BUS: u8 = 0;
+const DEV_CHANNEL_DEV: u8 = 0x1e;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -115,7 +121,7 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 				i += 1;
 				continue;
 			}
-			let driver_name: &[u8] = driver_for(info.device_type);
+			let driver_name: &[u8] = driver_for(&info);
 			if driver_name != b"virtio_blk" {
 				i += 1;
 				continue;
@@ -175,7 +181,7 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 				i += 1;
 				continue;
 			}
-			let driver_name: &[u8] = driver_for(info.device_type);
+			let driver_name: &[u8] = driver_for(&info);
 			if driver_name.is_empty() {
 				// a device with no userspace driver yet (e.g. the xHCI controller until
 				// its driver lands): skip it, leaving it out of the online summary.
@@ -384,8 +390,15 @@ unsafe fn print_count(n: u32) {
 
 // The binary name of the driver for a device type; empty when no userspace driver
 // exists for it yet.
-fn driver_for(device_type: u32) -> &'static [u8] {
-	match device_type {
+fn driver_for(info: &DeviceInfo) -> &'static [u8] {
+	// The development channel is a second virtio-console device pinned to a fixed PCI
+	// address. Matching the address rather than the enumeration order keeps the real
+	// console bound to the console driver whatever order the bus is walked in, and keeps
+	// the two ports independent: either can fail without taking the other with it.
+	if info.device_type == VIRTIO_TYPE_CONSOLE && info.bus == DEV_CHANNEL_BUS && info.dev == DEV_CHANNEL_DEV && info.func == 0 {
+		return b"dev_channel";
+	}
+	match info.device_type {
 		VIRTIO_TYPE_NET => b"virtio_net",
 		VIRTIO_TYPE_BLOCK => b"virtio_blk",
 		VIRTIO_TYPE_CONSOLE => b"virtio_console",

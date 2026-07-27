@@ -298,6 +298,13 @@ pub struct DeviceInfo {
 	pub notify_multiplier: u32,
 	pub isr_offset: u32,
 	pub device_offset: u32,
+	// The device's PCI address. Two devices of one type are otherwise indistinguishable
+	// to userspace, so this is what lets a second instance of a device class be bound to
+	// a different program than the first without relying on enumeration order.
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+	pub _pad: u8,
 }
 
 // The framebuffer geometry framebuffer_map writes into the caller's buffer (the

@@ -212,6 +212,39 @@ qemu_attach_xhci() {
 	fi
 }
 
+# The development channel: a SECOND single-port virtio-serial device, not a second port on
+# the existing one. The guest driver already binds one console port per device and the
+# device manager already binds a driver per device, so this needs no MULTIPORT negotiation,
+# no control-queue port discovery and no change to the emergency console. Console traffic
+# keeps its own device and stays usable if this one fails.
+#
+# The address is pinned, and high enough that auto-assignment never lands there, so the
+# guest identifies the channel by PCI address rather than by enumeration order. Nothing
+# above the port depends on that: the framing is carried by the port itself, so a later
+# multiport driver can host the same protocol on a named port unchanged.
+DEV_CHANNEL_PCI_SLOT="0x1e"
+
+qemu_attach_dev_channel() {
+	local -n arr=$1
+	local socket_path="$2"
+	local legacy="${3:-}"
+	rm -f "$socket_path"
+	arr+=(-chardev "socket,id=devchan,path=$socket_path,server=on,wait=off")
+	if [[ -n "$legacy" ]]; then
+		arr+=(-device "virtio-serial-pci,id=devser,addr=$DEV_CHANNEL_PCI_SLOT,$legacy")
+	else
+		arr+=(-device "virtio-serial-pci,id=devser,addr=$DEV_CHANNEL_PCI_SLOT")
+	fi
+	# A console port, not a generic one. Without MULTIPORT there is no control queue to open
+	# a generic port with, so a `virtserialport` here never opens and the guest's writes go
+	# nowhere - measured, not assumed. The cost is that UEFI firmware writes its console
+	# output to every console-class device it enumerates, so on the x86_64 UEFI path the
+	# channel carries a firmware preamble before the guest owns the port. Guest console
+	# traffic never appears on it, and framing above the port begins at the guest's first
+	# byte, so the preamble is skipped rather than negotiated away with MULTIPORT.
+	arr+=(-device "virtconsole,chardev=devchan,bus=devser.0")
+}
+
 qemu_attach_virt_interactive() {
 	local -n arr=$1
 	local suffix="$2"
@@ -474,6 +507,10 @@ qemu_run_x86_64() {
 	timing_event image end
 
 	if [[ "${TEST:-0}" == "1" ]]; then
+		# The development channel is present in the cold test configuration too: the same
+		# second port on every target is what lets a scenario runner drive a boot over
+		# identical framing, including where the persistent profile does not exist.
+		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-x86_64-test.sock" "disable-legacy=on"
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
 		set +e
@@ -513,6 +550,7 @@ qemu_run_x86_64() {
 	# nothing a normal or production boot is built from.
 	if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
 		qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
+		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel.sock" "disable-legacy=on"
 	fi
 
 	# Interactive control sockets used by screenshot.sh and lab.py.
@@ -571,6 +609,7 @@ qemu_run_aarch64() {
 		# Unlike x86, the virt machine has no default VGA device, so test mode supplies
 		# the same discoverable GPU path without enabling the interactive peripherals.
 		qemu_args+=(-device virtio-gpu-pci,disable-legacy=on)
+		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-aarch64-test.sock" "disable-legacy=on"
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -aarch64 "disable-legacy=on"
@@ -677,6 +716,7 @@ qemu_run_riscv64() {
 		# The RISC-V virt machine has no default VGA device, while the boot-chain test
 		# requires DisplayService and its Console/Shell dependents.
 		qemu_args+=(-device virtio-gpu-pci)
+		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-riscv64-test.sock" ""
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -riscv64 ""

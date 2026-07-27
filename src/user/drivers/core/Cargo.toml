@@ -20,6 +20,10 @@ name = "virtio_console"
 path = "src/virtio_console.rs"
 
 [[bin]]
+name = "dev_channel"
+path = "src/dev_channel.rs"
+
+[[bin]]
 name = "virtio_input"
 path = "src/virtio_input.rs"
 
