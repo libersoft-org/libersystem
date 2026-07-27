@@ -105,6 +105,12 @@ DEV_CONSOLE_SOCK = os.path.join(BUILD, 'dev-console.sock')
 # because it carries framed requests rather than terminal output.
 DEV_CHANNEL_SOCK = os.path.join(BUILD, 'dev-channel.sock')
 
+# The development instance's sockets are its whole boundary: the control channel publishes
+# executable code into a running guest, and the console is a terminal on it. They are created
+# owner-only, and every connection checks before trusting one - a socket anyone on the machine
+# can reach is not a development channel, it is a way into this guest.
+DEV_SOCKET_MODE = 0o600
+
 # An artifact name identifies a registry slot in the guest, not a path. The guest checks the
 # same rule character by character; this one exists so a typo fails before a megabyte moves.
 NAME_OK = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,47}')
@@ -248,6 +254,9 @@ def broker(serial, ctl_path=CTL_SOCK, log_path=SERIAL_LOG, console_path=None):
 		os.unlink(ctl_path)
 	ctl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	ctl.bind(ctl_path)
+	# Narrow it where it is created rather than afterwards: the broker is forked, so anything
+	# the parent tried to chmod would race the bind that has not happened yet.
+	os.chmod(ctl_path, DEV_SOCKET_MODE)
 	ctl.listen(1)
 	console = None
 	if console_path:
@@ -255,6 +264,7 @@ def broker(serial, ctl_path=CTL_SOCK, log_path=SERIAL_LOG, console_path=None):
 			os.unlink(console_path)
 		console = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		console.bind(console_path)
+		os.chmod(console_path, DEV_SOCKET_MODE)
 		console.listen(4)
 	log = open(log_path, 'ab', buffering=0)
 	serial.setblocking(False)
@@ -651,6 +661,7 @@ def cmd_dev_up(args):
 				die(f'guest exited before the serial socket appeared (see {DEV_QEMU_LOG})')
 			time.sleep(0.5)
 	broker_pid = dev_fork_broker(serial)
+	dev_restrict_sockets()
 	dev_identity_write(lock_fd, {
 		'profile': 'development',
 		'repo': REPO,
@@ -667,6 +678,10 @@ def cmd_dev_up(args):
 	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
 	if not has_prompt(reply[-256:]):
 		die(f'no shell prompt within {timeout} s (see {DEV_SERIAL_LOG})')
+	# Record which boot this is, now that the guest is up and its agent can answer. Every
+	# later session compares against it, so a tool can never publish into, or read a registry
+	# from, a guest that restarted since this instance was recorded.
+	dev_record_boot()
 	profile = 'development' if b'boot profile: development' in strip_ansi(reply) or dev_profile_logged() else 'not reported'
 	print(f'lab: development instance ready in {time.time() - started:.1f} s (guest profile: {profile})')
 	print(f'lab: serial log {os.path.relpath(DEV_SERIAL_LOG, SRC)}; `just dev-status`, `just dev-down`')
@@ -734,6 +749,52 @@ def cmd_dev_status(args):
 	print('     action   cold restart: `just dev-down && just dev-up`')
 	print('              this is a cold invalidation, not a hot-publishable application change')
 	sys.exit(1)
+
+
+def dev_restrict_sockets():
+	for path in (DEV_SERIAL_SOCK, DEV_CTL_SOCK, DEV_CONSOLE_SOCK, DEV_CHANNEL_SOCK):
+		try:
+			os.chmod(path, DEV_SOCKET_MODE)
+		except OSError:
+			pass
+
+
+# Refuse a socket anyone but its owner can reach, rather than narrowing it silently: by the
+# time a tool is connecting, whoever else could reach it has already had the chance.
+def dev_check_socket(path):
+	try:
+		mode = os.stat(path).st_mode & 0o777
+	except OSError as error:
+		die(f'cannot check {os.path.relpath(path, SRC)}: {error}')
+	if mode & 0o077:
+		die(f'{os.path.relpath(path, SRC)} is mode {mode:03o}, reachable beyond its owner; stop the instance with `just dev-down`')
+
+
+# Ask the guest which boot it is and record it on the instance lock.
+def dev_record_boot():
+	try:
+		sock = proto_connect(5)
+	except SystemExit:
+		return
+	buffer = bytearray()
+	try:
+		bounds = proto_hello(sock, buffer, 5)
+	except (SystemExit, OSError):
+		return
+	finally:
+		sock.close()
+	identity = dev_identity_read()
+	identity['boot'] = bounds['boot']
+	try:
+		fd = os.open(DEV_LOCK, os.O_RDWR)
+	except OSError:
+		return
+	try:
+		os.ftruncate(fd, 0)
+		os.lseek(fd, 0, os.SEEK_SET)
+		os.write(fd, json.dumps(identity).encode() + b'\n')
+	finally:
+		os.close(fd)
 
 
 # What the guest registry currently shadows, as (name, generation, age). None when the
@@ -923,6 +984,11 @@ PROTO_HEADER = struct.Struct('<HBBIIHH')
 PROTO_MAX_FRAME = 65536
 PROTO_MAX_PAYLOAD = PROTO_MAX_FRAME - PROTO_HEADER.size
 
+# How long one handshake attempt waits before being sent again. Comfortably past the guest's
+# own deadline for discarding an abandoned fragment, so a retry lands on a resynchronised
+# stream rather than into the same swallowed payload.
+PROTO_HANDSHAKE_RETRY = 3
+
 OP_HELLO = 0x01
 OP_HELLO_ACK = 0x02
 OP_PING = 0x03
@@ -1036,6 +1102,7 @@ def proto_await(sock, buffer, request, deadline):
 def proto_connect(timeout):
 	if not os.path.exists(DEV_CHANNEL_SOCK):
 		die('this instance has no development channel; restart it with `just dev-down && just dev-up`')
+	dev_check_socket(DEV_CHANNEL_SOCK)
 	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	sock.settimeout(timeout)
 	try:
@@ -1053,13 +1120,27 @@ def proto_connect(timeout):
 def proto_hello(sock, buffer, timeout):
 	deadline = time.monotonic() + timeout
 	sock.sendall(proto_frame(OP_HELLO, 1))
-	opcode, _, status, payload = proto_await(sock, buffer, 1, deadline)
+	# A previous host that died mid-frame leaves the guest waiting for a payload it will never
+	# get, and this handshake is read as part of that payload rather than as a frame. The guest
+	# discards the fragment on its own deadline, so a second handshake after that is what
+	# recovers - and the alternative is a tool that fails once for what the guest already knows
+	# how to fix. Retry until the deadline the caller gave, rather than at a fixed count.
+	while True:
+		try:
+			opcode, _, status, payload = proto_await(sock, buffer, 1, min(time.monotonic() + PROTO_HANDSHAKE_RETRY, deadline))
+			break
+		except SystemExit:
+			if time.monotonic() >= deadline:
+				raise
+			sock.sendall(proto_frame(OP_HELLO, 1))
 	if opcode == OP_ERROR:
 		die(f'handshake refused: {proto_status(status)}')
-	if opcode != OP_HELLO_ACK or len(payload) < 25:
+	if opcode != OP_HELLO_ACK or len(payload) < 36:
 		die(f'handshake reply was opcode {opcode:#04x} with {len(payload)} B of payload')
+	if len(payload) < 36:
+		die(f'handshake reply is {len(payload)} B; this host expects at least 36')
 	fields = struct.unpack('<IIHHIHHIB', payload[:25])
-	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5], 'max_term_input': fields[6], 'max_registry': fields[7], 'registry': bool(fields[8])}
+	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5], 'max_term_input': fields[6], 'max_registry': fields[7], 'registry': bool(fields[8]), 'boot': payload[28:36].hex()}
 	if bounds['max_frame'] != PROTO_MAX_FRAME or bounds['max_payload'] != PROTO_MAX_PAYLOAD:
 		die(f'guest reports a {bounds["max_frame"]} B frame bound ({bounds["max_payload"]} B payload); this host is built for {PROTO_MAX_FRAME} B ({PROTO_MAX_PAYLOAD} B)')
 	return bounds
@@ -1088,6 +1169,13 @@ def proto_session(timeout):
 	sock = proto_connect(timeout)
 	buffer = bytearray()
 	bounds = proto_hello(sock, buffer, timeout)
+	# The guest draws a value once per boot and reports it in every handshake. An instance is
+	# meant to outlive the tools that drive it, so a tool can be talking to a guest that
+	# restarted under it; comparing against what `dev-up` recorded turns that into a refusal
+	# instead of a publication into the wrong boot.
+	recorded = identity.get('boot')
+	if recorded and recorded != bounds['boot']:
+		die(f'the guest has restarted since this instance was recorded (boot {recorded[:16]} -> {bounds["boot"][:16]}); rerun `just dev-up`')
 	registry = f'registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact' if bounds['registry'] else 'no registry on this boot'
 	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max artifact {bounds["max_artifact"] // (1024 * 1024)} MB, {registry}, max terminal input {bounds["max_term_input"]} B)')
 	return sock, buffer, bounds

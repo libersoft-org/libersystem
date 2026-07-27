@@ -229,6 +229,11 @@ qemu_attach_dev_channel() {
 	local socket_path="$2"
 	local legacy="${3:-}"
 	rm -f "$socket_path"
+	# QEMU creates the socket under the ordinary umask, and this one carries a protocol that
+	# publishes executable code into a running guest. Narrow every file QEMU creates from here
+	# on to its owner: on a shared machine the alternative is a control channel anyone logged
+	# in can speak to.
+	umask 0077
 	arr+=(-chardev "socket,id=devchan,path=$socket_path,server=on,wait=off")
 	if [[ -n "$legacy" ]]; then
 		arr+=(-device "virtio-serial-pci,id=devser,addr=$DEV_CHANNEL_PCI_SLOT,$legacy")

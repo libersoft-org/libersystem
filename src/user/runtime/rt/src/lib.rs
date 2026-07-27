@@ -1277,6 +1277,14 @@ pub unsafe fn clock_ns() -> u64 {
 	unsafe { syscall(SYS_CLOCK_MONO_NS, 0, 0, 0, 0) }
 }
 
+// Fill `bytes` with kernel-provided randomness, returning how many bytes were written. Used
+// where a value has to differ per boot and not be guessable - a handshake that proves which
+// boot answered it, rather than one any earlier transcript could replay.
+pub unsafe fn random_get(bytes: &mut [u8]) -> usize {
+	let written: i64 = unsafe { syscall(SYS_RANDOM_GET, bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0) as i64 };
+	if written > 0 { written as usize } else { 0 }
+}
+
 // Read the boot profile's name into `name`, returning the bytes written, or 0 when this boot
 // named none. A development-only facility asks this rather than inferring the profile from
 // what happens to be attached.

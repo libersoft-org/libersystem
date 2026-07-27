@@ -92,26 +92,37 @@ unsafe fn serve(channel: u64, storage: u64) -> ! {
 		let mut fragment_at: u64 = 0;
 		let mut session_at: u64 = 0;
 		loop {
-			// Drain everything queued before waiting, so the loop never blocks with messages
-			// already sitting on the channel.
+			// Take what is queued, but parse after every message rather than after draining
+			// the queue. Parsing last would let a host that pipelines requests grow the
+			// accumulator by the whole queue - the protocol's bound is on one frame, not on
+			// how many a host may send before this loop runs, and the channel queue is not
+			// itself capped. Parsing between messages keeps the accumulator at one incomplete
+			// frame plus the message that is being folded into it, whatever a host does.
 			let mut arrived: bool = false;
 			while channel_peek(channel) >= 0 {
 				match recv_vec_blocking(channel) {
-					ReceivedVec::Message { bytes, .. } => {
-						pending.extend_from_slice(&bytes);
-						arrived = true;
+					// An empty message is the driver reporting that the port would not take a
+					// frame: the host has stopped reading its own replies. Nothing more can be
+					// said to it, so the session ends here and everything it held is released,
+					// which is the same outcome as its silence would eventually produce - just
+					// arrived at when it is known rather than when a deadline expires.
+					ReceivedVec::Message { bytes, .. } if bytes.is_empty() => {
+						session.close();
+						pending.clear();
 					}
+					ReceivedVec::Message { bytes, .. } => pending.extend_from_slice(&bytes),
 					// The driver is gone, so there is no channel left to serve or answer on.
 					ReceivedVec::Closed => exit(),
 				}
-			}
-			if arrived {
+				arrived = true;
 				// A driver that stopped accepting replies is as good as gone for this session.
 				// Drop what it left buffered rather than answer into a channel nobody drains.
 				if !session.consume(&mut pending, &mut sink) {
 					session.close();
 					pending.clear();
 				}
+			}
+			if arrived {
 				// Rearm the deadlines against what the parse left behind. The fragment deadline
 				// dates from when the fragment first appeared, not from the last byte of it, so
 				// a host trickling one byte at a time cannot hold a frame open indefinitely.

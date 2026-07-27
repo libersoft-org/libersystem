@@ -259,6 +259,12 @@ pub struct Session {
 	// Whether this boot may hold a registry at all, read once from the kernel because the
 	// answer cannot change while the guest runs.
 	registry_allowed: bool,
+	// A value drawn once per boot and reported in every handshake, so a host can tell which
+	// boot answered it. A development instance is meant to outlive the tools that drive it,
+	// which is exactly the situation where a tool can be talking to a guest that restarted
+	// under it - and publishing into, or reading a registry from, a boot that is not the one
+	// you think you have is the kind of confusion this whole milestone exists to remove.
+	boot_nonce: [u8; 8],
 	// The volume client the installed artifacts are read through, to decide whether a
 	// candidate may stand in for the one it shadows. Zero when none was wired, which leaves
 	// every verdict unknown rather than silently claiming compatibility.
@@ -274,7 +280,9 @@ impl Session {
 	pub fn new(storage: u64) -> Session {
 		let mut profile: [u8; 32] = [0u8; 32];
 		let len: usize = unsafe { boot_profile(&mut profile) };
-		Session { handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
+		let mut boot_nonce: [u8; 8] = [0u8; 8];
+		unsafe { random_get(&mut boot_nonce) };
+		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
 	}
 
 	pub fn is_open(&self) -> bool {
@@ -373,7 +381,7 @@ impl Session {
 			self.close();
 			self.handshake = true;
 			self.high_request = request;
-			let mut reply: [u8; 28] = [0u8; 28];
+			let mut reply: [u8; 36] = [0u8; 36];
 			reply[..4].copy_from_slice(&(MAX_FRAME as u32).to_le_bytes());
 			reply[4..8].copy_from_slice(&(MAX_PAYLOAD as u32).to_le_bytes());
 			reply[8..10].copy_from_slice(&MAX_OUTSTANDING.to_le_bytes());
@@ -383,6 +391,7 @@ impl Session {
 			reply[18..20].copy_from_slice(&(MAX_TERM_INPUT as u16).to_le_bytes());
 			reply[20..24].copy_from_slice(&(MAX_REGISTRY as u32).to_le_bytes());
 			reply[24] = u8::from(self.registry_allowed);
+			reply[28..36].copy_from_slice(&self.boot_nonce);
 			return sink.send(OP_HELLO_ACK, request, 0, ST_OK, &reply);
 		}
 		if !self.handshake {

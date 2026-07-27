@@ -46,8 +46,16 @@ const MAX_FRAME: usize = 65536;
 // How long a write may wait for the transmit buffer to come back, in scheduler ticks
 // (100 Hz). The host end can stop reading at any moment, and QEMU then stops consuming the
 // transmit queue rather than discarding what it cannot deliver, so the buffer stays with the
-// device. This bounds how long the guest tolerates that before dropping the write.
-const TX_DRAIN_TICKS: u64 = 200;
+// device.
+//
+// This matches the session's own idle deadline rather than being an independent, shorter
+// guess. A shorter one drops replies from a host that is merely slow to read - a host
+// pipelining up to the advertised outstanding bound can easily have more reply bytes in
+// flight than a socket buffer holds, and losing its answers for reading a moment late is not
+// a bound, it is data loss. A host that has genuinely gone is caught by the same window the
+// session uses to decide the same thing, which is the only question this deadline is really
+// asking.
+const TX_DRAIN_TICKS: u64 = 3000;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
@@ -196,11 +204,17 @@ unsafe fn pump(device: &Virtio, irq: u64, bytes: u64, rx: &mut Queue, port: &mut
 			if worked {
 				rx.notify();
 			}
-			// Agent to port.
+			// Agent to port. A frame the port would not take within its deadline is not
+			// silently dropped: the agent is told, with an empty message, that the write
+			// failed. Empty is unambiguous because every frame is at least a header long, and
+			// telling the agent is what turns a host that stopped reading into a session that
+			// ends deterministically rather than into replies that quietly disappear.
 			while channel_peek(bytes) >= 0 {
 				match recv_blocking(bytes, &mut outbound) {
 					Received::Message { len, .. } => {
-						port.write(&outbound[..len]);
+						if !port.write(&outbound[..len]) && !send_blocking(bytes, &[], 0) {
+							exit();
+						}
 						worked = true;
 					}
 					Received::Closed => exit(),
