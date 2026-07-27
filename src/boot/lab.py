@@ -925,6 +925,10 @@ PROTO_STATUS = {
 	13: 'the guest console refused the input',
 }
 
+# How a committed generation compares with the one it succeeded, under the written provider
+# compatibility rule. "first" is not a weaker "compatible": nothing was replaced.
+PROTO_VERDICT = {0: 'first of its name', 1: 'hot-publishable', 2: 'needs the cold path'}
+
 
 def proto_status(status):
 	return PROTO_STATUS.get(status, f'unknown status {status}')
@@ -1096,7 +1100,7 @@ def cmd_dev_publish(args):
 			die(f'name is {len(encoded)} B; the guest accepts at most {bounds["max_name"]} B')
 		started = time.monotonic()
 		begin = struct.pack('<I', len(blob)) + digest + bytes([len(encoded)]) + encoded
-		_, generation, _ = proto_request(sock, buffer, 2, OP_PUB_BEGIN, begin, timeout=timeout, what='publication begin')
+		_, generation, body = proto_request(sock, buffer, 2, OP_PUB_BEGIN, begin, timeout=timeout, what='publication begin')
 		print(f'lab: publishing {name} as generation {generation} ({len(blob)} B, sha256 {digest.hex()[:16]}...)')
 		request = 3
 		sent = 0
@@ -1109,7 +1113,7 @@ def cmd_dev_publish(args):
 				if acked != sent:
 					die(f'guest acknowledged {acked} B after {sent} B were sent')
 				request += 1
-			proto_request(sock, buffer, request, OP_PUB_COMMIT, b'', generation, timeout, 'commit')
+			_, _, body = proto_request(sock, buffer, request, OP_PUB_COMMIT, b'', generation, timeout, 'commit')
 		except SystemExit:
 			# The guest would drop the candidate on its own deadline; aborting now returns the
 			# megabyte it is holding immediately instead.
@@ -1120,6 +1124,12 @@ def cmd_dev_publish(args):
 			raise
 		elapsed = (time.monotonic() - started) * 1000
 		print(f'lab: generation {generation} committed in {elapsed:.1f} ms ({sent} B, digest verified by the guest)')
+		# The verdict is recorded, never a gate: the artifact is in the registry either way,
+		# and what this decides is whether installing it could be a hot swap.
+		if len(body) >= 4:
+			verdict, detail_len = body[2], body[3]
+			detail = body[4:4 + detail_len].decode(errors='replace')
+			print(f'lab: compatibility {PROTO_VERDICT.get(verdict, verdict)}' + (f' - {detail}' if detail else ''))
 	finally:
 		sock.close()
 
@@ -1199,7 +1209,12 @@ def cmd_dev_generations(args):
 			name_len = body[at + 40]
 			name = body[at + 41:at + 41 + name_len].decode(errors='replace')
 			at += 41 + name_len
-			print(f'     {generation:<4} {name:<20} {length:>9} B  sha256 {digest.hex()[:16]}...')
+			verdict, detail_len = body[at], body[at + 1]
+			detail = body[at + 2:at + 2 + detail_len].decode(errors='replace')
+			at += 2 + detail_len
+			print(f'     {generation:<4} {name:<20} {length:>9} B  sha256 {digest.hex()[:16]}...  {PROTO_VERDICT.get(verdict, verdict)}')
+			if detail:
+				print(f'          {detail}')
 	finally:
 		sock.close()
 

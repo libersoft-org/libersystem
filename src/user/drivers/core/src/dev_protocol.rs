@@ -34,6 +34,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use bootproto::compat;
 use rt::*;
 
 // The protocol's identifying prefix ("LD" on the wire) and the version this guest speaks. A
@@ -61,6 +62,18 @@ pub const MAX_ARTIFACT: u32 = 1024 * 1024;
 pub const MAX_GENERATIONS: usize = 4;
 // An artifact name is a bounded identifier, not a path: it names a slot in the registry.
 pub const MAX_NAME: usize = 48;
+
+// How a committed generation compares with the one it succeeded, under the written provider
+// compatibility rule. FIRST is not a weaker COMPATIBLE: nothing was replaced, so no claim
+// about hot replacement was made or could be.
+pub const VERDICT_FIRST: u8 = 0;
+pub const VERDICT_COMPATIBLE: u8 = 1;
+pub const VERDICT_INCOMPATIBLE: u8 = 2;
+
+// The most explanation a verdict carries. A rejection names the deciding field and its two
+// values, which is a line, not a document; truncating past this keeps one publication from
+// putting an unbounded reply on a bounded channel.
+pub const MAX_VERDICT_DETAIL: usize = 200;
 
 // The most terminal input one frame may carry. Far below the frame bound on purpose: each
 // byte is a separate syscall into a console queue that is itself bounded, so a frame the
@@ -151,6 +164,11 @@ struct Generation {
 	name: Vec<u8>,
 	digest: [u8; 32],
 	bytes: Vec<u8>,
+	// Whether this generation could have replaced the one it succeeded without a restart,
+	// and what decided that. Recorded at commit, when both images are in hand, because that
+	// is the only moment the comparison is cheap and the answer is what a caller asked for.
+	verdict: u8,
+	detail: Vec<u8>,
 }
 
 // One protocol session and the registry it operates on. A HELLO opens the session and the
@@ -395,14 +413,34 @@ impl Session {
 			return live;
 		}
 		let candidate = self.candidate.take().expect("candidate was matched above");
+		// Decide, and record, whether this generation could have replaced the one it succeeds
+		// without a restart. It is a recorded fact, never a gate: the artifact arrived whole
+		// and matched its digest, so it belongs in the registry either way, and what the
+		// verdict decides is whether installing it is a hot swap or needs the cold path.
+		// Comparing against the newest generation of the same name is the same comparison the
+		// registry will make against the installed provider, with the same rule and the same
+		// two images.
+		let (verdict, detail): (u8, Vec<u8>) = match self.generations.iter().rev().find(|entry| entry.name == candidate.name) {
+			Some(previous) => match compat::decide(&previous.bytes, &candidate.bytes) {
+				compat::Verdict::Compatible => (VERDICT_COMPATIBLE, Vec::new()),
+				compat::Verdict::Incompatible(reason) => (VERDICT_INCOMPATIBLE, explain(&reason)),
+			},
+			None => (VERDICT_FIRST, Vec::new()),
+		};
 		// The registry is a bounded ring: the oldest generation makes way rather than the
 		// newest being refused, because a development loop publishes continuously and the
 		// useful end of that history is the recent one.
 		if self.generations.len() >= MAX_GENERATIONS {
 			self.generations.remove(0);
 		}
-		self.generations.push(Generation { generation: candidate.generation, name: candidate.name, digest: candidate.digest, bytes: candidate.bytes });
-		sink.send(OP_PUB_ACK, request, generation, ST_OK, &(self.generations.len() as u32).to_le_bytes())
+		self.generations.push(Generation { generation: candidate.generation, name: candidate.name, digest: candidate.digest, bytes: candidate.bytes, verdict, detail });
+		let entry = self.generations.last().expect("the generation was just pushed");
+		let mut reply: Vec<u8> = Vec::new();
+		reply.extend_from_slice(&(self.generations.len() as u16).to_le_bytes());
+		reply.push(entry.verdict);
+		reply.push(entry.detail.len() as u8);
+		reply.extend_from_slice(&entry.detail);
+		sink.send(OP_PUB_ACK, request, generation, ST_OK, &reply)
 	}
 
 	// Cancel the candidate. An abort of something already gone is a bad generation, not a
@@ -422,7 +460,7 @@ impl Session {
 	// bound, so this never needs paging.
 	//
 	// Reply payload: count u16 | per entry: generation u32 | length u32 | digest [u8; 32] |
-	// name_len u8 | name.
+	// name_len u8 | name | verdict u8 | detail_len u8 | detail.
 	fn generation_list(&mut self, request: u32, sink: &mut impl Sink) -> bool {
 		let mut reply: Vec<u8> = Vec::new();
 		reply.extend_from_slice(&(self.generations.len() as u16).to_le_bytes());
@@ -432,6 +470,9 @@ impl Session {
 			reply.extend_from_slice(&entry.digest);
 			reply.push(entry.name.len() as u8);
 			reply.extend_from_slice(&entry.name);
+			reply.push(entry.verdict);
+			reply.push(entry.detail.len() as u8);
+			reply.extend_from_slice(&entry.detail);
 		}
 		sink.send(OP_GEN_LIST_REPLY, request, 0, ST_OK, &reply)
 	}
@@ -519,4 +560,96 @@ fn resync(pending: &mut Vec<u8>) {
 	}
 	let keep: usize = if pending.is_empty() { 0 } else { 1 };
 	pending.drain(..pending.len() - keep);
+}
+
+// Render a rejection as the one line a caller needs: what decided it, and the two values
+// that differed. It is written by hand rather than formatted so the driver keeps no
+// formatting machinery, and truncated at the bound so a pathological name cannot stretch
+// the reply.
+fn explain(reason: &compat::Reason) -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::new();
+	match reason {
+		compat::Reason::NotAnElf { installed } => {
+			out.extend_from_slice(b"not a readable ELF: ");
+			out.extend_from_slice(side(*installed));
+		}
+		compat::Reason::MachineMismatch { installed, candidate } => {
+			out.extend_from_slice(b"built for a different machine: ");
+			push_number(&mut out, *installed as usize);
+			out.extend_from_slice(b" -> ");
+			push_number(&mut out, *candidate as usize);
+		}
+		compat::Reason::MissingIdentity { installed } => {
+			out.extend_from_slice(b"no identity record: ");
+			out.extend_from_slice(side(*installed));
+		}
+		compat::Reason::UnknownIdentityFormat { format } => {
+			out.extend_from_slice(b"unknown identity format ");
+			out.extend_from_slice(format.as_bytes());
+		}
+		compat::Reason::MissingField { field, installed } => {
+			out.extend_from_slice(b"identity field ");
+			out.extend_from_slice(field.as_bytes());
+			out.extend_from_slice(b" absent from ");
+			out.extend_from_slice(side(*installed));
+		}
+		compat::Reason::IdentityField { field, installed, candidate } => {
+			out.extend_from_slice(b"identity field ");
+			out.extend_from_slice(field.as_bytes());
+			out.extend_from_slice(b": ");
+			out.extend_from_slice(installed.as_bytes());
+			out.extend_from_slice(b" -> ");
+			out.extend_from_slice(candidate.as_bytes());
+		}
+		compat::Reason::ProviderList { position, installed, candidate } => {
+			out.extend_from_slice(b"provider closure at ");
+			push_number(&mut out, *position);
+			out.extend_from_slice(b": ");
+			out.extend_from_slice(entry_or_end(*installed));
+			out.extend_from_slice(b" -> ");
+			out.extend_from_slice(entry_or_end(*candidate));
+		}
+		compat::Reason::NeededList { position, installed, candidate } => {
+			out.extend_from_slice(b"dependency at ");
+			push_number(&mut out, *position);
+			out.extend_from_slice(b": ");
+			out.extend_from_slice(entry_or_end(*installed));
+			out.extend_from_slice(b" -> ");
+			out.extend_from_slice(entry_or_end(*candidate));
+		}
+		compat::Reason::UnreadableDynamic { installed } => {
+			out.extend_from_slice(b"unreadable dynamic table: ");
+			out.extend_from_slice(side(*installed));
+		}
+		compat::Reason::ExportRemoved { symbol } => {
+			out.extend_from_slice(b"export removed or narrowed: ");
+			out.extend_from_slice(symbol.as_bytes());
+		}
+		compat::Reason::ExportChanged { symbol, field } => {
+			out.extend_from_slice(b"export ");
+			out.extend_from_slice(symbol.as_bytes());
+			out.extend_from_slice(b" changed ");
+			out.extend_from_slice(field.as_bytes());
+		}
+	}
+	out.truncate(MAX_VERDICT_DETAIL);
+	out
+}
+
+fn side(installed: bool) -> &'static [u8] {
+	if installed { b"the installed provider" } else { b"the candidate" }
+}
+
+fn entry_or_end(entry: Option<&str>) -> &[u8] {
+	match entry {
+		Some(name) => name.as_bytes(),
+		None => b"(end of list)",
+	}
+}
+
+fn push_number(out: &mut Vec<u8>, value: usize) {
+	if value >= 10 {
+		push_number(out, value / 10);
+	}
+	out.push(b'0' + (value % 10) as u8);
 }

@@ -623,6 +623,12 @@ app-libs-test:
     cargo test --manifest-path {{ wav_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
     cargo test --manifest-path {{ wavpack_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
 
+# Host-test the shared boot contract: the ELF reader, SHA-256 and the provider
+# compatibility rule. The rule reads only image bytes, so it is fully decidable on the host
+# and its fixtures never need a guest.
+bootproto-host-test:
+    cargo test --manifest-path {{ bootproto_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
+
 # Host-test pure service parsing, graph bounds, and lifecycle planning.
 services-host-test:
     CARGO_TARGET_DIR={{ build_root }}/cargo/services-host cargo test --manifest-path {{ services_dir }}/Cargo.toml --lib --target x86_64-unknown-linux-gnu

@@ -23,6 +23,11 @@ pub mod elf;
 
 pub mod sha256;
 
+// The written rule for whether a candidate library may replace an installed provider in a
+// running system. It reads only the two images, so the guest, the build system and any
+// audit tool reach the same verdict from the same bytes.
+pub mod compat;
+
 // Identifies a valid `BootInfo`. The loader writes it; the kernel checks it.
 // Spells "LBSPROT2" (LiberSystem boot protocol, revision 2 - the UEFI loader).
 pub const MAGIC: u64 = 0x4c42_5350_524f_5432;
