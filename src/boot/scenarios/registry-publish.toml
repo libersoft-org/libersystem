@@ -1,0 +1,33 @@
+# Publishing a fixture artifact leaves the installed system alone.
+#
+# The registry is volatile and never touches the system volume, so a published generation
+# shadows an artifact without the installed one changing. The scenario states that as data:
+# publish, then look at what the guest says is installed.
+version = 1
+name = "registry publish"
+description = "A published generation shadows an artifact without altering the installed one."
+timeout = 180
+
+[[step]]
+do = "reset"
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "publish"
+artifact = "base-proto"
+file = "../.build/system-image/x86_64-unknown-none/lib/protocol/base-proto.lslib"
+timeout = 60
+
+[[step]]
+do = "input"
+text = "ls vol://system/lib/protocol"
+
+[[step]]
+do = "expect"
+contains = "base-proto.lslib"
+timeout = 20
+
+[[step]]
+do = "reset"

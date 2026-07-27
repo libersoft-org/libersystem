@@ -76,9 +76,11 @@ Persistent development instance (one owner at a time):
   dev-rollback <name>   return an artifact to the generation before its newest
   dev-type [--no-enter] <text...>  type into the guest terminal, with a byte count back
   dev-reset             drop the guest development state (not a reboot)
+  dev-scenario [--verbose] <file.toml>...  run declarative application scenarios
   dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 SRC = os.path.dirname(HERE)
 REPO = os.path.dirname(SRC)
 BUILD = os.path.join(REPO, '.build', 'boot')
@@ -783,7 +785,7 @@ def dev_record_boot():
 	buffer = bytearray()
 	try:
 		bounds = proto_hello(sock, buffer, 5)
-	except (SystemExit, OSError):
+	except (SystemExit, ProtoTimeout, OSError):
 		return
 	finally:
 		sock.close()
@@ -818,7 +820,7 @@ def dev_shadowed():
 		proto_hello(sock, buffer, 2)
 		artifacts, _ = read_registry(sock, buffer, 2)
 		return [(a['name'], a['generations'][-1]['generation'], published_ago(a['generations'][-1]['published_at'])) for a in artifacts]
-	except (SystemExit, OSError, struct.error):
+	except (SystemExit, ProtoTimeout, OSError, struct.error):
 		return None
 	finally:
 		sock.close()
@@ -1045,6 +1047,13 @@ PROTO_STATUS = {
 PROTO_VERDICT = {1: 'hot-publishable', 2: 'needs the cold path', 3: 'unknown (installed artifact unreadable)'}
 
 
+# Raised when a read runs out of time or the channel closes. A distinct exception rather than
+# `die` because the handshake retries: printing the reason on every attempt would report a
+# failure the next attempt is about to fix.
+class ProtoTimeout(Exception):
+	pass
+
+
 def proto_status(status):
 	return PROTO_STATUS.get(status, f'unknown status {status}')
 
@@ -1078,14 +1087,14 @@ def proto_read(sock, buffer, deadline):
 					return opcode, request, generation, status, payload
 		remaining = deadline - time.monotonic()
 		if remaining <= 0:
-			die('development channel gave no reply before its deadline')
+			raise ProtoTimeout('development channel gave no reply before its deadline')
 		sock.settimeout(remaining)
 		try:
 			chunk = sock.recv(4096)
 		except socket.timeout:
-			die('development channel gave no reply before its deadline')
+			raise ProtoTimeout('development channel gave no reply before its deadline') from None
 		if not chunk:
-			die('development channel closed while waiting for a reply')
+			raise ProtoTimeout('development channel closed while waiting for a reply')
 		buffer += chunk
 
 
@@ -1133,9 +1142,9 @@ def proto_hello(sock, buffer, timeout):
 		try:
 			opcode, _, status, payload = proto_await(sock, buffer, 1, min(time.monotonic() + PROTO_HANDSHAKE_RETRY, deadline))
 			break
-		except SystemExit:
+		except ProtoTimeout as error:
 			if time.monotonic() >= deadline:
-				raise
+				die(f'{error}; the guest never completed a handshake')
 			sock.sendall(proto_frame(OP_HELLO, 1))
 	if opcode == OP_ERROR:
 		die(f'handshake refused: {proto_status(status)}')
@@ -1154,7 +1163,10 @@ def proto_hello(sock, buffer, timeout):
 # caller passes a deadline, because the peer is a live guest that can stop answering.
 def proto_request(sock, buffer, request, opcode, payload=b'', generation=0, timeout=5, what='request', tolerate=()):
 	sock.sendall(proto_frame(opcode, request, payload, generation))
-	reply, replied_generation, status, body = proto_await(sock, buffer, request, time.monotonic() + timeout)
+	try:
+		reply, replied_generation, status, body = proto_await(sock, buffer, request, time.monotonic() + timeout)
+	except ProtoTimeout as error:
+		die(f'{what}: {error}')
 	if reply == OP_ERROR and status not in tolerate:
 		die(f'{what} refused: {proto_status(status)}')
 	return reply, replied_generation, body
@@ -1162,7 +1174,7 @@ def proto_request(sock, buffer, request, opcode, payload=b'', generation=0, time
 
 # Open a session and describe its bounds in one line, so every command that talks to the
 # guest starts from the same reported facts rather than from this host's assumptions.
-def proto_session(timeout):
+def proto_session(timeout, announce=True):
 	state, identity = dev_state()
 	if state == 'foreign':
 		dev_owner_conflict(identity)
@@ -1180,8 +1192,9 @@ def proto_session(timeout):
 	recorded = identity.get('boot')
 	if recorded and recorded != bounds['boot']:
 		die(f'the guest has restarted since this instance was recorded (boot {recorded[:16]} -> {bounds["boot"][:16]}); rerun `just dev-up`')
-	registry = f'registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact' if bounds['registry'] else 'no registry on this boot'
-	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max artifact {bounds["max_artifact"] // (1024 * 1024)} MB, {registry}, max terminal input {bounds["max_term_input"]} B)')
+	if announce:
+		registry = f'registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact' if bounds['registry'] else 'no registry on this boot'
+		print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max artifact {bounds["max_artifact"] // (1024 * 1024)} MB, {registry}, max terminal input {bounds["max_term_input"]} B)')
 	return sock, buffer, bounds
 
 
@@ -1214,8 +1227,8 @@ def cmd_dev_ping(args):
 # the guest checks them against. An abort on any host-side failure is what stops a killed
 # publish leaving a candidate parked in the guest until its deadline.
 def cmd_dev_publish(args):
-	timeout = arg_value(args, '--timeout', 15)
-	rest = [a for a in args if not a.startswith('--')]
+	timeout, rest = take_arg(args, '--timeout', 15)
+	rest = [a for a in rest if not a.startswith('--')]
 	if len(rest) != 2:
 		die('usage: dev-publish <name> <file>')
 	name, path = rest[0], rest[1]
@@ -1284,9 +1297,9 @@ def cmd_dev_publish(args):
 # shell has drained. Looping here is what makes the operation carry a line rather than a
 # character, and the guest's count is what keeps the loop from replaying bytes that landed.
 def cmd_dev_type(args):
-	timeout = arg_value(args, '--timeout', 15)
-	enter = '--no-enter' not in args
-	text = ' '.join(a for a in args if not a.startswith('--'))
+	timeout, rest = take_arg(args, '--timeout', 15)
+	enter = '--no-enter' not in rest
+	text = ' '.join(a for a in rest if not a.startswith('--'))
 	if not text:
 		die('usage: dev-type [--no-enter] <text...>')
 	payload = text.encode() + (b'\r' if enter else b'')
@@ -1395,8 +1408,8 @@ def cmd_dev_generations(args):
 # as common as failing in a development loop, and undoing it should not mean republishing an
 # image the host may no longer have.
 def cmd_dev_rollback(args):
-	timeout = arg_value(args, '--timeout', 5)
-	rest = [a for a in args if not a.startswith('--')]
+	timeout, rest = take_arg(args, '--timeout', 5)
+	rest = [a for a in rest if not a.startswith('--')]
 	if len(rest) != 1:
 		die('usage: dev-rollback <name>')
 	name = rest[0].encode()
@@ -1409,6 +1422,101 @@ def cmd_dev_rollback(args):
 		print(f'lab: {rest[0]} rolled back to generation {now}; generation {dropped} discarded')
 	finally:
 		sock.close()
+
+
+# ---- scenarios -------------------------------------------------------------
+# The bridge between the scenario runner and this instance. The runner is deliberately given
+# an object rather than this module: it decides what a scenario means, and everything about
+# how the guest is actually reached stays here.
+
+
+class LabGuest:
+	def __init__(self, timeout):
+		self.timeout = timeout
+
+	def serial_size(self):
+		try:
+			return os.path.getsize(DEV_SERIAL_LOG)
+		except OSError:
+			return 0
+
+	def serial_since(self, at):
+		try:
+			with open(DEV_SERIAL_LOG, 'rb') as handle:
+				handle.seek(at)
+				return strip_ansi(handle.read()).decode(errors='replace')
+		except OSError:
+			return ''
+
+	def wait_prompt(self, timeout):
+		try:
+			return has_prompt(ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)[-256:])
+		except (SystemExit, OSError):
+			return False
+
+	# Terminal input, resuming from the count the guest reports: the console queue is short,
+	# so anything past a keystroke or two is accepted in pieces.
+	def type_text(self, text, enter, timeout):
+		payload = text.encode() + (b'\r' if enter else b'')
+		sock, buffer, bounds = proto_session(timeout, announce=False)
+		try:
+			if len(payload) > bounds['max_term_input']:
+				return False
+			end = time.monotonic() + timeout
+			request, sent = 2, 0
+			while sent < len(payload):
+				opcode, _, body = proto_request(sock, buffer, request, OP_TERM_INPUT, payload[sent:], timeout=max(end - time.monotonic(), 0.1), what='terminal input', tolerate=(13,))
+				sent += struct.unpack('<H', body[:2])[0] if len(body) >= 2 else 0
+				request += 1
+				if opcode == OP_TERM_ACK:
+					return True
+				if time.monotonic() >= end:
+					return False
+				time.sleep(0.05)
+			return True
+		finally:
+			sock.close()
+
+	def publish(self, artifact, path, timeout):
+		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
+
+	def reset(self, timeout):
+		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-reset', '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
+
+
+def cmd_dev_scenario(args):
+	import scenario
+
+	verbose = '--verbose' in args
+	rest = [a for a in args if not a.startswith('--')]
+
+	if not rest:
+		die('usage: dev-scenario [--verbose] <file.toml>...')
+	documents = []
+	for path in rest:
+		try:
+			documents.append((path, scenario.load(path)))
+		except scenario.ScenarioError as error:
+			die(str(error))
+	# Every scenario is validated before any of them runs, so a typo in the last file does not
+	# surface after the first three have already changed the guest.
+	state, identity = dev_state()
+	if state == 'foreign':
+		dev_owner_conflict(identity)
+	if state != 'ready':
+		die(f'development instance is {state}; scenarios need a ready one (`just dev-up`)')
+	failures = 0
+	for path, document in documents:
+		name = document['name']
+		try:
+			elapsed = scenario.run(document, LabGuest(30), verbose)
+			print(f'lab: {name} passed in {elapsed:.1f} s ({os.path.relpath(path, SRC)})')
+		except scenario.ScenarioError as error:
+			print(f'lab: {name} FAILED: {error}', file=sys.stderr)
+			failures += 1
+	if failures:
+		die(f'{failures} of {len(documents)} scenario(s) failed')
+	print(f'lab: {len(documents)} scenario(s) passed')
 
 
 # ---- subcommands -----------------------------------------------------------
@@ -1696,7 +1804,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-scenario': cmd_dev_scenario, 'dev-down': cmd_dev_down}
 
 
 def main():

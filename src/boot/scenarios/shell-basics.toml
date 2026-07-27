@@ -1,0 +1,31 @@
+# The shell answers on the terminal the control channel types into.
+#
+# This is the shape an application scenario takes: typed steps with typed fields, deadlines
+# on each and on the whole, and no way to express "run this string in a shell" - the input is
+# characters going to a terminal, which is what a person driving the guest actually does.
+version = 1
+name = "shell basics"
+description = "The guest shell reads terminal input from the control channel and answers on the console."
+timeout = 120
+
+[[step]]
+do = "prompt"
+timeout = 30
+
+[[step]]
+do = "input"
+text = "echo scenario-one"
+
+[[step]]
+do = "expect"
+contains = "scenario-one"
+timeout = 20
+
+[[step]]
+do = "input"
+text = "uname"
+
+[[step]]
+do = "expect"
+contains = "LiberSystem"
+timeout = 20

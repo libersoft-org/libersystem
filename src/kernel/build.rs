@@ -318,7 +318,16 @@ fn identity_record(artifact: &Path) -> Vec<u8> {
 // absent, rather than present and refusing to run, which is the difference between a
 // boundary and a policy.
 fn included(program: &system_manifest::Program) -> bool {
-	!program.development || cfg!(feature = "development")
+	!program.development || development_configuration()
+}
+
+// Whether this build wants the development-only programs. Read from the environment cargo
+// sets for build scripts, NOT with `cfg!(feature = ...)`: a build script is a separate
+// compilation and that macro does not see the crate's features there, so it silently reports
+// false and the development configuration stages the shipping set - which is exactly what it
+// did before this was written down.
+fn development_configuration() -> bool {
+	env::var_os("CARGO_FEATURE_DEVELOPMENT").is_some()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -556,7 +565,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	}
 	files.sort_by(|a, b| a.0.cmp(&b.0));
 	assert!(!files.windows(2).any(|pair| pair[0].0 == pair[1].0), "duplicate volume package destination");
-	let expected_entries = factory_manifest.volume_destinations(cfg!(feature = "development"));
+	let expected_entries = factory_manifest.volume_destinations(development_configuration());
 	let actual_entries = files.iter().map(|(name, _)| name.clone()).collect::<BTreeSet<_>>();
 	assert_eq!(actual_entries, expected_entries, "system volume entries differ from the manifest");
 	for (name, bytes) in &files {

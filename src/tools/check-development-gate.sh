@@ -56,13 +56,23 @@ for program in "${gated[@]}"; do
 	fi
 done
 
-# 4. The shipping image declares none of them, so nothing looks for a program that is absent.
-for program in "${gated[@]}"; do
-	destination="$(jq -r --arg p "$program" '.programs[$p].destination' <<<"$manifest_json")"
-	if [[ -e "../.build/system-image/x86_64-unknown-none/${destination%.lsexe}" || -e "../.build/system-image/x86_64-unknown-none/$destination" ]]; then
-		echo "development-gate: note: $destination is staged; the tree was last built with LIBER_DEVELOPMENT=1" >&2
+# 4. The volume package that was actually built carries exactly the configuration that was
+#    asked for. This is the half that a crate-only check cannot see, and the half that failed
+#    silently once: the userspace crates were built with the feature while the kernel staged
+#    the shipping set, because a build script does not see `cfg!(feature = ...)`. Both halves
+#    agreed they were shipping, so every assertion inside the build passed while the
+#    development image had no development units in it.
+package="../.build/boot/volume.pkg"
+if [[ -e "$package" ]]; then
+	entries="$(tools/system-manifest.sh check-volume-package "$package" 2>&1 || true)"
+	wanted="shipping"
+	[[ "${LIBER_DEVELOPMENT:-0}" == "1" ]] && wanted="development"
+	if ! grep -q "($wanted configuration)" <<<"$entries"; then
+		fail "the built volume package is not the $wanted configuration: $entries"
 	fi
-done
+else
+	echo "development-gate: note: no volume package built yet, so its configuration was not checked" >&2
+fi
 
 if ((status == 0)); then
 	echo "development-gate: ${#gated[@]} development-only program(s) absent from the shipping configuration"

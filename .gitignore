@@ -46,3 +46,6 @@ Thumbs.db
 desktop.ini
 # hunkwise
 .vscode/hunkwise/
+
+# Python bytecode cache, created when lab.py imports the scenario runner beside it
+__pycache__/

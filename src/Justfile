@@ -594,6 +594,12 @@ dev-reset *args:
 dev-rollback *args:
     @boot/lab.py dev-rollback {{ args }}
 
+# run declarative application scenarios against the development instance. Scenario data is
+# versioned, bounded and has no way to express a shell command.
+# e.g. `just dev-scenario boot/scenarios/*.toml`
+dev-scenario *args:
+    @boot/lab.py dev-scenario {{ args }}
+
 # stop the development instance gracefully and release its lock
 dev-down *args:
     @boot/lab.py dev-down {{ args }}
