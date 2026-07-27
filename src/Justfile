@@ -546,6 +546,12 @@ dev-up *args:
 dev-status:
     @boot/lab.py dev-status
 
+# attach an interactive terminal to the development instance and replay its recent
+# output. Ctrl-] detaches without stopping the guest. One client owns keyboard input;
+# `just dev-console --read-only` attaches further observers. e.g. `just dev-console`
+dev-console *args:
+    @boot/lab.py dev-console {{ args }}
+
 # show, follow or grep the development instance serial log. e.g. `just dev-log -f`
 dev-log *args:
     @boot/lab.py dev-log {{ args }}
