@@ -561,6 +561,15 @@ dev-log *args:
 dev-ping *args:
     @boot/lab.py dev-ping {{ args }}
 
+# stream a file into the development instance's artifact registry, checked against its
+# digest by the guest. e.g. `just dev-publish shell ../.build/system-image/.../shell`
+dev-publish *args:
+    @boot/lab.py dev-publish {{ args }}
+
+# list the artifact generations the development instance holds
+dev-generations *args:
+    @boot/lab.py dev-generations {{ args }}
+
 # stop the development instance gracefully and release its lock
 dev-down *args:
     @boot/lab.py dev-down {{ args }}

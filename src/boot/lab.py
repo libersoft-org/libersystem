@@ -36,6 +36,7 @@
 # `sh` joins its arguments, so quoting is optional: `just lab sh time ls`.
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -70,6 +71,8 @@ Persistent development instance (one owner at a time):
   dev-console [--read-only]  attach an interactive terminal; Ctrl-] detaches
   dev-log [-f | <pat>]  show / follow / grep its serial log
   dev-ping [--count N] [--size N] [--timeout N]  exercise the control protocol
+  dev-publish <name> <file>  stream a file into the guest artifact registry
+  dev-generations       list the generations the guest holds
   dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -98,6 +101,10 @@ DEV_CONSOLE_SOCK = os.path.join(BUILD, 'dev-console.sock')
 # here and the guest's dev-channel driver holds the other end; nothing tees or logs it,
 # because it carries framed requests rather than terminal output.
 DEV_CHANNEL_SOCK = os.path.join(BUILD, 'dev-channel.sock')
+
+# An artifact name identifies a registry slot in the guest, not a path. The guest checks the
+# same rule character by character; this one exists so a typo fails before a megabyte moves.
+NAME_OK = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,47}')
 
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
@@ -428,7 +435,6 @@ def digest_tree(root, digest):
 # Content rather than timestamps: a rebuild that produces identical bytes must not read as
 # a change, or every status would claim the instance is stale.
 def instance_inputs():
-	import hashlib
 	fingerprint = {}
 	for name, roots, files in INSTANCE_INPUTS:
 		digest = hashlib.sha256()
@@ -885,6 +891,13 @@ OP_HELLO = 0x01
 OP_HELLO_ACK = 0x02
 OP_PING = 0x03
 OP_PONG = 0x04
+OP_PUB_BEGIN = 0x10
+OP_PUB_CHUNK = 0x11
+OP_PUB_COMMIT = 0x12
+OP_PUB_ABORT = 0x13
+OP_PUB_ACK = 0x14
+OP_GEN_LIST = 0x15
+OP_GEN_LIST_REPLY = 0x16
 OP_ERROR = 0xff
 
 # Each rejection the guest can name. They exist so a failure is explained by the frame that
@@ -898,6 +911,11 @@ PROTO_STATUS = {
 	5: 'handshake required first',
 	6: 'duplicate or out-of-order request id',
 	7: 'frame still incomplete at its deadline',
+	8: 'a publication is already open',
+	9: 'no candidate with that generation',
+	10: 'candidate shorter than it declared',
+	11: 'candidate does not match its declared digest',
+	12: 'no room in the registry',
 }
 
 
@@ -951,9 +969,9 @@ def proto_read(sock, buffer, deadline):
 # port. Matching on the request ID is what stops the new session reading the old one's mail.
 def proto_await(sock, buffer, request, deadline):
 	while True:
-		opcode, replied, _, status, payload = proto_read(sock, buffer, deadline)
+		opcode, replied, generation, status, payload = proto_read(sock, buffer, deadline)
 		if replied == request:
-			return opcode, status, payload
+			return opcode, generation, status, payload
 
 
 # QEMU listens on the channel socket and serves one client at a time, so a second client is
@@ -979,21 +997,32 @@ def proto_connect(timeout):
 def proto_hello(sock, buffer, timeout):
 	deadline = time.monotonic() + timeout
 	sock.sendall(proto_frame(OP_HELLO, 1))
-	opcode, status, payload = proto_await(sock, buffer, 1, deadline)
+	opcode, _, status, payload = proto_await(sock, buffer, 1, deadline)
 	if opcode == OP_ERROR:
 		die(f'handshake refused: {proto_status(status)}')
-	if opcode != OP_HELLO_ACK or len(payload) < 10:
+	if opcode != OP_HELLO_ACK or len(payload) < 20:
 		die(f'handshake reply was opcode {opcode:#04x} with {len(payload)} B of payload')
-	max_frame, max_payload, max_outstanding = struct.unpack('<IIH', payload[:10])
-	if max_frame != PROTO_MAX_FRAME or max_payload != PROTO_MAX_PAYLOAD:
-		die(f'guest reports a {max_frame} B frame bound ({max_payload} B payload); this host is built for {PROTO_MAX_FRAME} B ({PROTO_MAX_PAYLOAD} B)')
-	return max_frame, max_payload, max_outstanding
+	# The guest sends 20 bytes: 18 of bounds and 2 reserved for the next one to be added.
+	fields = struct.unpack('<IIHHIH', payload[:18])
+	bounds = {'max_frame': fields[0], 'max_payload': fields[1], 'max_outstanding': fields[2], 'max_name': fields[3], 'max_artifact': fields[4], 'max_generations': fields[5]}
+	if bounds['max_frame'] != PROTO_MAX_FRAME or bounds['max_payload'] != PROTO_MAX_PAYLOAD:
+		die(f'guest reports a {bounds["max_frame"]} B frame bound ({bounds["max_payload"]} B payload); this host is built for {PROTO_MAX_FRAME} B ({PROTO_MAX_PAYLOAD} B)')
+	return bounds
 
 
-def cmd_dev_ping(args):
-	count = arg_value(args, '--count', 1)
-	size = arg_value(args, '--size', 0)
-	timeout = arg_value(args, '--timeout', 5)
+# Send one request and return its answer, turning a refusal into a named failure. Every
+# caller passes a deadline, because the peer is a live guest that can stop answering.
+def proto_request(sock, buffer, request, opcode, payload=b'', generation=0, timeout=5, what='request'):
+	sock.sendall(proto_frame(opcode, request, payload, generation))
+	reply, replied_generation, status, body = proto_await(sock, buffer, request, time.monotonic() + timeout)
+	if reply == OP_ERROR:
+		die(f'{what} refused: {proto_status(status)}')
+	return reply, replied_generation, body
+
+
+# Open a session and describe its bounds in one line, so every command that talks to the
+# guest starts from the same reported facts rather than from this host's assumptions.
+def proto_session(timeout):
 	state, identity = dev_state()
 	if state == 'foreign':
 		dev_owner_conflict(identity)
@@ -1001,13 +1030,21 @@ def cmd_dev_ping(args):
 		die('no development instance (run `just dev-up` first)')
 	if state == 'detached':
 		die('the guest is running but no broker owns it; reattach with `just dev-up`')
-	if size > PROTO_MAX_PAYLOAD:
-		die(f'--size {size} exceeds the {PROTO_MAX_PAYLOAD} B payload bound')
 	sock = proto_connect(timeout)
 	buffer = bytearray()
+	bounds = proto_hello(sock, buffer, timeout)
+	print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max payload {bounds["max_payload"]} B, max outstanding {bounds["max_outstanding"]}, max artifact {bounds["max_artifact"]} B, {bounds["max_generations"]} generations)')
+	return sock, buffer, bounds
+
+
+def cmd_dev_ping(args):
+	count = arg_value(args, '--count', 1)
+	size = arg_value(args, '--size', 0)
+	timeout = arg_value(args, '--timeout', 5)
+	if size > PROTO_MAX_PAYLOAD:
+		die(f'--size {size} exceeds the {PROTO_MAX_PAYLOAD} B payload bound')
+	sock, buffer, _ = proto_session(timeout)
 	try:
-		max_frame, max_payload, max_outstanding = proto_hello(sock, buffer, timeout)
-		print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {max_frame} B, max payload {max_payload} B, max outstanding {max_outstanding})')
 		# Request IDs must be non-zero and strictly increasing; the handshake took 1. A ping
 		# echoes its payload, so this measures the round trip of real bytes and proves the
 		# frame arrived intact rather than merely arrived.
@@ -1015,14 +1052,92 @@ def cmd_dev_ping(args):
 		for i in range(count):
 			request = 2 + i
 			started = time.monotonic()
-			sock.sendall(proto_frame(OP_PING, request, payload))
-			opcode, status, echo = proto_await(sock, buffer, request, started + timeout)
+			opcode, _, echo = proto_request(sock, buffer, request, OP_PING, payload, timeout=timeout, what=f'ping {request}')
 			elapsed = (time.monotonic() - started) * 1000
-			if opcode == OP_ERROR:
-				die(f'ping {request} refused: {proto_status(status)}')
 			if opcode != OP_PONG or echo != payload:
 				die(f'ping {request} answered with opcode {opcode:#04x}, {len(echo)} B echoed of {len(payload)} B sent')
 			print(f'lab: pong in {elapsed:.1f} ms (request {request}, {len(echo)} B echoed)')
+	finally:
+		sock.close()
+
+
+# Publish one artifact: declare it, stream it, commit it. The host reads a local file and
+# sends its bytes; the path never crosses the wire, only the bytes and the typed metadata
+# the guest checks them against. An abort on any host-side failure is what stops a killed
+# publish leaving a candidate parked in the guest until its deadline.
+def cmd_dev_publish(args):
+	timeout = arg_value(args, '--timeout', 15)
+	rest = [a for a in args if not a.startswith('--')]
+	if len(rest) != 2:
+		die('usage: dev-publish <name> <file>')
+	name, path = rest[0], rest[1]
+	if not NAME_OK.fullmatch(name):
+		die(f'artifact name {name!r} must be 1-48 characters of letters, digits, dot, dash or underscore, and may not start with a dot')
+	try:
+		with open(path, 'rb') as handle:
+			blob = handle.read()
+	except OSError as error:
+		die(f'cannot read {path}: {error}')
+	if not blob:
+		die(f'{path} is empty')
+	digest = hashlib.sha256(blob).digest()
+	sock, buffer, bounds = proto_session(timeout)
+	try:
+		if len(blob) > bounds['max_artifact']:
+			die(f'{path} is {len(blob)} B; the guest accepts at most {bounds["max_artifact"]} B')
+		encoded = name.encode()
+		if len(encoded) > bounds['max_name']:
+			die(f'name is {len(encoded)} B; the guest accepts at most {bounds["max_name"]} B')
+		started = time.monotonic()
+		begin = struct.pack('<I', len(blob)) + digest + bytes([len(encoded)]) + encoded
+		_, generation, _ = proto_request(sock, buffer, 2, OP_PUB_BEGIN, begin, timeout=timeout, what='publication begin')
+		print(f'lab: publishing {name} as generation {generation} ({len(blob)} B, sha256 {digest.hex()[:16]}...)')
+		request = 3
+		sent = 0
+		try:
+			while sent < len(blob):
+				chunk = blob[sent:sent + bounds['max_payload']]
+				_, _, body = proto_request(sock, buffer, request, OP_PUB_CHUNK, chunk, generation, timeout, f'chunk at offset {sent}')
+				sent += len(chunk)
+				acked = struct.unpack('<I', body[:4])[0] if len(body) >= 4 else -1
+				if acked != sent:
+					die(f'guest acknowledged {acked} B after {sent} B were sent')
+				request += 1
+			proto_request(sock, buffer, request, OP_PUB_COMMIT, b'', generation, timeout, 'commit')
+		except SystemExit:
+			# The guest would drop the candidate on its own deadline; aborting now returns the
+			# megabyte it is holding immediately instead.
+			try:
+				sock.sendall(proto_frame(OP_PUB_ABORT, request + 1, b'', generation))
+			except OSError:
+				pass
+			raise
+		elapsed = (time.monotonic() - started) * 1000
+		print(f'lab: generation {generation} committed in {elapsed:.1f} ms ({sent} B, digest verified by the guest)')
+	finally:
+		sock.close()
+
+
+def cmd_dev_generations(args):
+	timeout = arg_value(args, '--timeout', 5)
+	sock, buffer, _ = proto_session(timeout)
+	try:
+		opcode, _, body = proto_request(sock, buffer, 2, OP_GEN_LIST, timeout=timeout, what='generation list')
+		if opcode != OP_GEN_LIST_REPLY or len(body) < 2:
+			die(f'generation list answered with opcode {opcode:#04x} and {len(body)} B')
+		count = struct.unpack('<H', body[:2])[0]
+		if not count:
+			print('lab: the guest holds no published generations')
+			return
+		at = 2
+		print(f'lab: {count} generation(s), oldest first')
+		for _ in range(count):
+			generation, length = struct.unpack('<II', body[at:at + 8])
+			digest = body[at + 8:at + 40]
+			name_len = body[at + 40]
+			name = body[at + 41:at + 41 + name_len].decode(errors='replace')
+			at += 41 + name_len
+			print(f'     {generation:<4} {name:<20} {length:>9} B  sha256 {digest.hex()[:16]}...')
 	finally:
 		sock.close()
 
@@ -1312,7 +1427,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-down': cmd_dev_down}
 
 
 def main():
