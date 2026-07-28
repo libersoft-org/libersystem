@@ -81,6 +81,7 @@ Persistent development instance (one owner at a time):
   dev-pointer [--x F] [--y F] [--press|--release|--click] [button]  pointer events
   dev-scenario [--verbose] <file.toml>...  run declarative application scenarios
   dev-launch <program> [args...]  launch a program through PermissionManager, print output
+  dev-stop              end the program launched through the control channel
   dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1042,6 +1043,8 @@ OP_LAUNCH = 0x30
 OP_LAUNCH_ACK = 0x31
 OP_LAUNCH_OUTPUT = 0x32
 OP_LAUNCH_BYTES = 0x33
+OP_LAUNCH_STOP = 0x34
+OP_LAUNCH_STOP_ACK = 0x35
 OP_TERM_INPUT = 0x20
 OP_TERM_ACK = 0x21
 OP_RESET = 0x22
@@ -1636,6 +1639,16 @@ class LabGuest:
 		finally:
 			sock.close()
 
+	# End the launched program. Answers whether anything was signalled, which is not the same
+	# as whether this succeeded: a program that had already finished is nothing to stop.
+	def stop_launch(self, timeout):
+		sock, buffer, _ = proto_session(timeout, announce=False)
+		try:
+			opcode, _, body = proto_request(sock, buffer, 2, OP_LAUNCH_STOP, timeout=timeout, what='stopping the launched program', tolerate=(25,))
+			return opcode == OP_LAUNCH_STOP_ACK and bool(body[:1] and body[0])
+		finally:
+			sock.close()
+
 	def publish(self, artifact, path, timeout):
 		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
 
@@ -1890,6 +1903,18 @@ def send_pointer(x=None, y=None, button=None, action='click'):
 # Named keys and chords, or a line of text with `--text`. The two are separate spellings
 # because they are separate things: `ctrl-c` is one event and `ls -l` is nine, and guessing
 # which was meant from what a word looks like would eventually guess wrong.
+def cmd_dev_stop(args):
+	timeout = arg_value(args, '--timeout', 10)
+	sock, buffer, _ = proto_session(timeout)
+	try:
+		opcode, _, body = proto_request(sock, buffer, 2, OP_LAUNCH_STOP, timeout=timeout, what='stopping the launched program', tolerate=(25,))
+		if opcode != OP_LAUNCH_STOP_ACK:
+			die('nothing has been launched through the control channel')
+		print('lab: stopped the launched program' if body[:1] and body[0] else 'lab: the launched program had already finished')
+	finally:
+		sock.close()
+
+
 def cmd_dev_key(args):
 	if '--text' in args:
 		text = ' '.join(args[args.index('--text') + 1:])
@@ -2133,7 +2158,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-down': cmd_dev_down}
 
 
 def main():

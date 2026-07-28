@@ -278,17 +278,60 @@ def run(document, lab, verbose=False):
 	total = document.get('timeout', 300)
 	deadline = time.monotonic() + total
 	started = time.monotonic()
-	for index, step in enumerate(document['step']):
-		if time.monotonic() >= deadline:
-			raise ScenarioError(f'step {index + 1}: the scenario ran past its {total} s total deadline')
-		remaining = deadline - time.monotonic()
-		limit = min(step.get('timeout', 30), remaining)
-		label = f'{index + 1}/{len(document["step"])} {step["do"]}'
-		at = time.monotonic()
-		run_step(step, guest, lab, limit, index)
-		if verbose:
-			print(f'     {label} in {(time.monotonic() - at) * 1000:.0f} ms')
+	try:
+		for index, step in enumerate(document['step']):
+			if time.monotonic() >= deadline:
+				raise ScenarioError(f'step {index + 1}: the scenario ran past its {total} s total deadline')
+			remaining = deadline - time.monotonic()
+			limit = min(step.get('timeout', 30), remaining)
+			label = f'{index + 1}/{len(document["step"])} {step["do"]}'
+			at = time.monotonic()
+			run_step(step, guest, lab, limit, index)
+			if verbose:
+				print(f'     {label} in {(time.monotonic() - at) * 1000:.0f} ms')
+	finally:
+		teardown(lab, verbose)
 	return time.monotonic() - started
+
+
+# Put the instance back the way the next run needs to find it, whether this one passed, failed
+# or ran out of time. A failed run is the case that matters: it is the one that stops halfway,
+# and everything it was holding when it stopped is still held.
+#
+# The instance is persistent and shared by every scenario, so a run that leaves a program in
+# the foreground leaves the next run looking at that program's screen instead of a prompt -
+# which reads as an instance that never became ready, so the failure lands on the innocent run
+# after the guilty one. Three things are given back, in the order they can be: the launched
+# program, the terminal, and the registry.
+#
+# Failures here are reported and not raised. A teardown that failed must not replace the
+# scenario's own result, which is what the caller is waiting to hear.
+def teardown(lab, verbose=False):
+	notes = []
+	try:
+		if lab.stop_launch(10):
+			notes.append('stopped the launched program')
+		# Give the terminal back, escalating only as far as it takes. Ctrl+C first, which drops a
+		# half-typed line at a prompt and is what a cooked terminal turns into a signal. A raw
+		# terminal does not: a program that asked for raw input is handed the byte, so Ctrl+C
+		# means nothing to it and the next two are what the tree's interactive tools answer to.
+		# Nothing here is sent unless the one before it left no prompt, so a run that ended
+		# tidily pays for one keystroke and one check.
+		for key in ('\x03', '\x1b', 'q'):
+			lab.type_text(key, False, 10)
+			if lab.wait_prompt(5):
+				break
+		else:
+			notes.append('WARNING: no shell prompt after teardown; the next run may fail on a busy terminal')
+		if not lab.reset(10):
+			notes.append('WARNING: the development state was not dropped')
+	# SystemExit included on purpose: the helpers below exit the process when the instance is
+	# unreachable, and during teardown that is something to report, not something to die of.
+	except (OSError, ValueError, SystemExit) as error:
+		notes.append(f'WARNING: teardown did not complete: {error}')
+	if verbose or any(note.startswith('WARNING') for note in notes):
+		for note in notes:
+			print(f'     {note}')
 
 
 def run_step(step, guest, lab, limit, index):

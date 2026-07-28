@@ -170,12 +170,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, b"SystemGraphService: online", 0);
 	}
 
-	// 3. serve generated `snapshot` requests until the client side closes.
+	// 3. serve generated `snapshot` requests on connections minted from the channel the
+	//    supervisor holds the client end of.
+	//
+	//    A factory rather than a single connection, because that is what being resolvable by
+	//    name requires: the supervisor mints a fresh connection per client from this root, so a
+	//    client that lost its channel when this process was replaced can ask for another. A
+	//    service served on one channel can be restarted, but nobody can reconnect to it.
 	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, supervisor_client };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve(service, &mut request, &mut reply, |req: &[u8], handle: &mut u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { system_graph::dispatch(&mut graph, req, handle, out, reply_handle) });
+		serve_multi(service, &mut request, &mut reply, |_chan: u64, req: &[u8], handle: &mut u64, out: &mut [u8], reply_handle: &mut u64| -> Option<usize> { system_graph::dispatch(&mut graph, req, handle, out, reply_handle) });
 	}
 	exit();
 }

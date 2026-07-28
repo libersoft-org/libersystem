@@ -44,7 +44,7 @@ mod bootstrap;
 #[path = "service_manager/lifecycle.rs"]
 mod lifecycle;
 
-use bootstrap::{bootstrap_serve, console_report, drive_runtime_drivers, emit_event, launch_from_volume, open_storage_directory, start_service, stop_service};
+use bootstrap::{bootstrap_serve, bootstrap_system_graph_service, console_report, drive_runtime_drivers, emit_event, launch_from_volume, open_storage_directory, start_service, stop_service};
 use lifecycle::{depends_on_scoped, has_running_dependent, serve_stats_once, shutdown_all, shutdown_order, verify_shutdown_order};
 
 // A service in the boot manifest: its package entry name, the supervisor's crash
@@ -475,14 +475,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     system volume, which stopping DeviceManager makes unavailable. The broker
 	//     stands for the life of the system (the supervise loop serves resolves and
 	//     restarts config on a runtime crash the same way).
-	let mut broker: Broker = Broker { config: config_client, device: device_client, process: broker_process, storage_admin: broker_storage_admin };
+	let mut broker: Broker = Broker { config: config_client, device: device_client, graph: graph_client, process: broker_process, storage_admin: broker_storage_admin };
 	if selftest && canary_ctrl != 0 {
 		if let Some(cfg) = index_of(b"config_service") {
 			if state[cfg] == State::Running && procs[cfg] != 0 {
 				unsafe {
 					// A real crash: kill the live instance out from under its clients.
 					signal(procs[cfg], SIG_KILL);
-					if restart_service(&mut broker, cfg, &mut state, &mut channels, &mut procs, &mut sup, policy.restart_budget, park, &mut buf) {
+					if restart_service(&mut broker, cfg, &mut state, &mut channels, &mut procs, &mut sup, &mut stats_server, policy.restart_budget, park, &mut buf) {
 						send_blocking(bootstrap, b"ConfigService: restarted", 0);
 						emit_event(log_client, b"config_service", b"restarted");
 						// The client-survives proof: the canary resolves and queries the
@@ -731,6 +731,7 @@ unsafe fn drain_closed(channel: u64, buf: &mut [u8]) {
 struct Broker {
 	config: u64,
 	device: u64,
+	graph: u64,
 	process: u64,
 	storage_admin: u64,
 }
@@ -747,6 +748,9 @@ fn cap_grants(requester: &[u8]) -> &'static [&'static [u8]] {
 		b"permission_manager" => &[CAP_CONFIG, CAP_DEVICE],
 		b"console_service" => &[CAP_CONFIG, CAP_DEVICE],
 		b"system_graph_service" => &[CAP_DEVICE],
+		// The shell resolves the system graph rather than holding the connection it was given
+		// at bring-up, so `graph` survives that service being stopped and started again.
+		b"shell" => &[CAP_GRAPH],
 		_ => &[],
 	}
 }
@@ -756,6 +760,7 @@ fn service_of_cap(name: &[u8]) -> Option<&'static [u8]> {
 	match name {
 		CAP_CONFIG => Some(b"config_service"),
 		CAP_DEVICE => Some(b"device_service"),
+		CAP_GRAPH => Some(b"system_graph_service"),
 		_ => None,
 	}
 }
@@ -773,6 +778,7 @@ unsafe fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Br
 		let root: u64 = match name {
 			CAP_CONFIG => broker.config,
 			CAP_DEVICE => broker.device,
+			CAP_GRAPH => broker.graph,
 			_ => 0,
 		};
 		let alive: bool = match service_of_cap(name).and_then(index_of) {
@@ -817,7 +823,7 @@ fn is_goodbye(request: &[u8]) -> bool {
 // failure the service is left Failed (the caller escalates). Clients holding
 // channels to the dead instance reconnect through the broker (serve_resolve above) -
 // that is the whole point.
-unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], budget: u32, park: u64, buf: &mut [u8]) -> bool {
+unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, budget: u32, park: u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		sup[idx].failure = Failure::Crashed;
 		state[idx] = State::Failed;
@@ -832,41 +838,99 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 			close(procs[idx]);
 			procs[idx] = 0;
 		}
-		let root: &mut u64 = match MANIFEST[idx].name {
-			b"config_service" => &mut broker.config,
-			b"device_service" => &mut broker.device,
-			// A Transparent service whose bootstrap this ladder cannot re-run yet.
-			_ => return false,
-		};
-		if *root != 0 {
-			close(*root);
-			*root = 0;
+		if !restartable(idx) {
+			return false;
 		}
 		// Spend from the restart budget; once exhausted, escalate rather than restart.
 		if sup[idx].restarts >= budget {
 			return false;
 		}
 		sleep_ticks(park, RESTART_BACKOFF_TICKS * (sup[idx].restarts as u64 + 1));
-		// Relaunch from the volume and re-run the SERVE bootstrap, like bring-up.
+		if !relaunch_service(broker, idx, state, channels, procs, stats_server, buf) {
+			return false;
+		}
+		sup[idx].restarts += 1;
+		sup[idx].failure = Failure::None;
+		true
+	}
+}
+
+// Start a service that was deliberately stopped. The difference from a crash restart is what
+// it is answering rather than what it does: a crash spends the restart budget and records a
+// failure, an asked-for start records neither, and there is nothing to reap because the stop
+// already did it. Refused for anything not stopped, and for anything this ladder cannot bring
+// back - saying no is better than a service that starts with clients holding dead channels.
+unsafe fn start_stopped_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, buf: &mut [u8]) -> bool {
+	unsafe {
+		if state[idx] != State::Stopped || !restartable(idx) {
+			return false;
+		}
+		if !relaunch_service(broker, idx, state, channels, procs, stats_server, buf) {
+			return false;
+		}
+		sup[idx].failure = Failure::None;
+		true
+	}
+}
+
+// Whether this ladder can bring a service back at all. It can when the supervisor holds a
+// serve root for it and knows how to re-run its bootstrap, which is the same thing as the
+// service being resolvable by name: a client of anything else holds the channel it was handed
+// at bring-up, and a replacement would leave that channel dead. The list therefore grows with
+// the broker and not before it.
+fn restartable(idx: usize) -> bool {
+	matches!(MANIFEST[idx].name, b"config_service" | b"device_service" | b"system_graph_service")
+}
+
+// Launch a fresh instance from the volume and re-run the bootstrap that brought the first one
+// up, then adopt it. Shared by the crash restart and the deliberate start above; it assumes
+// the previous instance's endpoints are already released.
+unsafe fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], stats_server: &mut u64, buf: &mut [u8]) -> bool {
+	unsafe {
+		let (process, storage_admin, device): (u64, u64, u64) = (broker.process, broker.storage_admin, broker.device);
+		let root: &mut u64 = match MANIFEST[idx].name {
+			b"config_service" => &mut broker.config,
+			b"device_service" => &mut broker.device,
+			b"system_graph_service" => &mut broker.graph,
+			// A service whose bootstrap this ladder cannot re-run.
+			_ => return false,
+		};
+		if *root != 0 {
+			close(*root);
+			*root = 0;
+		}
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return false,
 		};
-		let proc: i64 = launch_from_volume(broker.process, MANIFEST[idx].program, service_side);
+		let proc: i64 = launch_from_volume(process, MANIFEST[idx].program, service_side);
 		if proc < 0 {
 			return false;
 		}
 		// A restarted ConfigService gets a fresh client confined to its persistence
 		// directory, so the replacement reloads the persisted tree without receiving
 		// authority over the rest of the system volume.
-		if MANIFEST[idx].name == b"config_service" && broker.storage_admin != 0 {
-			let storage: u64 = open_storage_directory(broker.storage_admin, "vol://system/libexec/config_service");
+		if MANIFEST[idx].name == b"config_service" && storage_admin != 0 {
+			let storage: u64 = open_storage_directory(storage_admin, "vol://system/libexec/config_service");
 			if storage == 0 || !send_blocking(manager_side, b"STORAGE", storage) {
 				close(proc as u64);
 				return false;
 			}
 		}
-		if !bootstrap_serve(manager_side, root) {
+		// SystemGraphService is handed the supervisor's live view again, which is the whole of
+		// its bootstrap: one node per running component with a read-only handle to it, a
+		// DeviceService connection, and a fresh supervisor channel. The stats channel replaces
+		// the one the dead instance held, and the supervise loop rebuilds its wait set from it.
+		let rebuilt: bool = if MANIFEST[idx].name == b"system_graph_service" {
+			if *stats_server != 0 {
+				close(*stats_server);
+				*stats_server = 0;
+			}
+			bootstrap_system_graph_service(manager_side, procs, state, device, root, stats_server)
+		} else {
+			bootstrap_serve(manager_side, root)
+		};
+		if !rebuilt {
 			close(proc as u64);
 			return false;
 		}
@@ -880,8 +944,6 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 		channels[idx] = manager_side;
 		procs[idx] = proc as u64;
 		state[idx] = State::Running;
-		sup[idx].restarts += 1;
-		sup[idx].failure = Failure::None;
 		true
 	}
 }
@@ -1060,7 +1122,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 							emit_event(log_client, MANIFEST[idx].name, b"crashed");
 							console_report(MANIFEST[idx].name, b"crashed");
 							if MANIFEST[idx].restart == Restart::Transparent {
-								if restart_service(broker, idx, state, channels, procs, sup, policy.restart_budget, park, buf) {
+								if restart_service(broker, idx, state, channels, procs, sup, &mut stats, policy.restart_budget, park, buf) {
 									emit_event(log_client, MANIFEST[idx].name, b"restarted");
 									console_report(MANIFEST[idx].name, b"restarted");
 								} else {
@@ -1101,7 +1163,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 				}
 				2 => {
 					// The shell asked to stop a service; tear down its dependents first.
-					if !handle_admin(admin, state, channels, sup, procs, log_client, buf) {
+					if !handle_admin(admin, broker, state, channels, sup, procs, &mut stats, log_client, buf) {
 						admin = 0;
 					}
 				}
@@ -1114,7 +1176,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 				4 => {
 					// The sandboxed `stop` tool (granted the supervisor capability) asked to
 					// stop a service over its own admin channel; tear down its dependents first.
-					if !handle_admin(admin2, state, channels, sup, procs, log_client, buf) {
+					if !handle_admin(admin2, broker, state, channels, sup, procs, &mut stats, log_client, buf) {
 						admin2 = 0;
 					}
 				}
@@ -1135,7 +1197,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 // its dependents are torn down and the newline-joined list of what stopped is replied
 // for the shell to print. Returns false once the admin channel's peer (the shell) is
 // gone, so the supervisor drops it from its wait set.
-unsafe fn handle_admin(admin: u64, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) -> bool {
+unsafe fn handle_admin(admin: u64, broker: &mut Broker, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		let len: usize = match recv_blocking(admin, buf) {
 			Received::Message { len, .. } => len,
@@ -1156,6 +1218,28 @@ unsafe fn handle_admin(admin: u64, state: &mut [State; N], channels: &mut [u64; 
 			let action: u64 = if name == b"!reboot" { POWER_REBOOT } else { POWER_OFF };
 			shutdown_all(state, channels, sup, procs, log_client, buf);
 			system_power(action);
+			return true;
+		}
+		// `+name` starts a service that was stopped, the inverse of the bare name below. The
+		// reserved prefix follows the power verbs' `!`: a real service name can never begin
+		// with one, so the verb needs no separate field and an old client cannot stumble into
+		// it. Refused unless the service is stopped AND this supervisor can bring it back -
+		// which is the same question as whether its clients resolve it by name, since a
+		// replacement nobody can re-resolve is a service its clients cannot reach.
+		if let Some(wanted) = name.strip_prefix(b"+") {
+			match index_of(wanted) {
+				Some(target) if start_stopped_service(broker, target, state, channels, procs, sup, stats_server, buf) => {
+					emit_event(log_client, MANIFEST[target].name, b"started");
+					console_report(MANIFEST[target].name, b"started");
+					let mut reply: Vec<u8> = Vec::new();
+					reply.extend_from_slice(b"STARTED\n");
+					reply.extend_from_slice(MANIFEST[target].name);
+					send_blocking(admin, &reply, 0);
+				}
+				_ => {
+					send_blocking(admin, b"NOTSTARTED", 0);
+				}
+			}
 			return true;
 		}
 		match index_of(name) {

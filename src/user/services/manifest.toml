@@ -948,6 +948,15 @@ destination = "bin/ss.lsexe"
 providers = ["network-client", "network-proto", "lsrt"]
 
 [[programs]]
+name = "start"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/start.lsexe"
+providers = ["lsrt"]
+
+[[programs]]
 name = "stop"
 owner = "tools"
 role = "tool"
@@ -1351,7 +1360,7 @@ dependencies = ["log_service", "device_manager"]
 [[services]]
 name = "system_graph_service"
 program = "system_graph_service"
-restart = "escalate"
+restart = "transparent"
 dependencies = [
 	"log_service",
 	"device_manager",

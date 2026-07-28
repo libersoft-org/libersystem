@@ -476,7 +476,7 @@ unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: 
 // ("SERVE"), kept in `*graph_client` for the shell. SystemGraphService comes up after
 // every component it observes, so their handles are all captured and their state is
 // Running when its node set is built.
-unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, graph_client: &mut u64, stats_server: &mut u64) -> bool {
+pub(super) unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, graph_client: &mut u64, stats_server: &mut u64) -> bool {
 	unsafe {
 		let mut i: usize = 0;
 		while i < N {

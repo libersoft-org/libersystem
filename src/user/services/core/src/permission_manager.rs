@@ -171,6 +171,8 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"run" => Some(granted("run", alloc::vec![Capability::Process])),
 		b"perm" => Some(granted("perm", alloc::vec![Capability::Permission])),
 		b"stop" => Some(granted("stop", alloc::vec![Capability::Supervisor])),
+		// The inverse of `stop`, and granted exactly what it is granted: one admin channel.
+		b"start" => Some(granted("start", alloc::vec![Capability::Supervisor])),
 		b"lsvol" => Some(granted("lsvol", alloc::vec![Capability::Volumes])),
 		b"lssvc" => Some(granted("lssvc", alloc::vec![Capability::Services])),
 		b"lsblk" => Some(granted("lsblk", alloc::vec![Capability::Volumes])),

@@ -596,6 +596,10 @@ dev-reset *args:
 dev-restart *args:
     @boot/lab.py dev-restart {{ args }}
 
+# end the program launched through the control channel; what it printed stays readable
+dev-stop *args:
+    @boot/lab.py dev-stop {{ args }}
+
 # send key events to the instance through the emulated keyboard, not the control protocol:
 # named keys and chords, or `--text` for a line. e.g. `just dev-key ctrl-c up ret`
 dev-key *args:

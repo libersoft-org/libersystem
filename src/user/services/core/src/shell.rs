@@ -105,7 +105,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 	print_motd();
 	unsafe {
-		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin);
+		repl(console, control, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin, bootstrap);
 	}
 	// The REPL returned: the operator logged out (`exit` / Ctrl+D). Tell the supervisor
 	// this is a deliberate exit before the bootstrap channel peer-closes, so a logout is
@@ -167,7 +167,11 @@ fn print_banner(lines: &[&str]) {
 // insert/delete, command history, the editing control keys - and hands us one finished
 // line per message; we render our output (routed there via stdout). Returns when the
 // user types `exit` or sends EOF (Ctrl+D on an empty line).
-unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, admin: u64) {
+unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, admin: u64, broker: u64) {
+	// The system graph is resolved by name rather than held: it can be stopped and started
+	// again under this shell, and a channel from bring-up would be dead afterwards. The
+	// bootstrap channel is what a resolve travels on - the supervisor answers on the other end.
+	let mut graphsvc: u64 = graphsvc;
 	unsafe {
 		let mut jobs: Jobs = Jobs::new(control, session);
 		// The cwd is owned by the session (so it survives a shell restart); read it once at
@@ -262,7 +266,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// then dispatch it, reap finished jobs, and print the next prompt.
 			let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
 			let cwd_before: String = cwd.clone();
-			if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin, &mut jobs, &mut vars, &mut cwd) {
+			if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, &mut graphsvc, broker, permsvc, session, admin, &mut jobs, &mut vars, &mut cwd) {
 				return;
 			}
 			// A `cd` moved the prompt: refresh ConsoleService's copy so argument completion
@@ -701,6 +705,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"play", Shape::InteractiveArgs),
 	(b"ls", Shape::Rest),
 	(b"du", Shape::Rest),
+	(b"start", Shape::Args),
 	(b"stop", Shape::Args),
 	(b"run", Shape::Args),
 	(b"set", Shape::Args),
@@ -866,7 +871,7 @@ unsafe fn graceful_power(admin: u64, action: u64) {
 	}
 }
 
-unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: u64, permsvc: u64, session: u64, admin: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
+unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, usb: u64, procsvc: u64, netsvc: u64, inputsvc: u64, graphsvc: &mut u64, broker: u64, permsvc: u64, session: u64, admin: u64, jobs: &mut Jobs, vars: &mut Vec<(String, String)>, cwd: &mut String) -> bool {
 	unsafe {
 		// The line arrives already trimmed, `$`-expanded, and flag-normalized by
 		// `parse_and_expand`; trim again so the recursive `time <command>` path (which passes
@@ -913,7 +918,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		// tool runs to completion inside the dispatch, so the time covers it whole).
 		if let Some(rest) = line.strip_prefix(b"time ") {
 			let t0: u64 = clock_ns();
-			let quit: bool = dispatch(trim(rest), storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, permsvc, session, admin, jobs, vars, cwd);
+			let quit: bool = dispatch(trim(rest), storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, graphsvc, broker, permsvc, session, admin, jobs, vars, cwd);
 			let us: u64 = (clock_ns() - t0) / 1_000;
 			let line: String = alloc::format!("time: {}.{:03} s\n", us / 1_000_000, us % 1_000_000 / 1_000);
 			print(line.as_bytes());
@@ -990,19 +995,19 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		// process-launcher tools (`echo` / `readln` / `script`), the multi-verb `snap` /
 		// `volume`, the interactive `ps -i`, the flagged `free -h`, and the net tools.
 		if line == b"graph" {
-			query_graph(graphsvc, GraphFmt::Text);
+			query_graph(graphsvc, broker, GraphFmt::Text);
 			return false;
 		}
 		if line == b"graph json" {
-			query_graph(graphsvc, GraphFmt::Json(JsonMode::Pretty));
+			query_graph(graphsvc, broker, GraphFmt::Json(JsonMode::Pretty));
 			return false;
 		}
 		if line == b"graph json-min" {
-			query_graph(graphsvc, GraphFmt::Json(JsonMode::Min));
+			query_graph(graphsvc, broker, GraphFmt::Json(JsonMode::Min));
 			return false;
 		}
 		if line == b"graph cbor" {
-			query_graph(graphsvc, GraphFmt::Cbor);
+			query_graph(graphsvc, broker, GraphFmt::Cbor);
 			return false;
 		}
 		if line == b"ps -i" {
@@ -1432,13 +1437,16 @@ enum GraphFmt {
 // generated to_text / to_json / to_cbor on the client side - the one typed API, many
 // representations rule. A 0 handle means the service is not wired (e.g. a non-primary
 // VT for now), reported as unavailable rather than blocking.
-unsafe fn query_graph(graphsvc: u64, fmt: GraphFmt) {
+unsafe fn query_graph(graphsvc: &mut u64, broker: u64, fmt: GraphFmt) {
 	unsafe {
-		if graphsvc == 0 {
+		// A fresh sub-connection per query, re-resolving the root through the supervisor when
+		// the held one is dead. That is what lets the service be stopped and started again
+		// under a running shell: the durable reference is the capability name, not the channel.
+		let Some(connection) = connect_or_resolve(graphsvc, broker, CAP_GRAPH) else {
 			print(b"graph: service unavailable\n");
 			return;
-		}
-		let mut client = system_graph::Client::new(ChannelTransport { chan: graphsvc });
+		};
+		let mut client = system_graph::Client::new(ChannelTransport { chan: connection });
 		match client.snapshot() {
 			Some(Ok(graph)) => match fmt {
 				GraphFmt::Text => {
@@ -1454,6 +1462,8 @@ unsafe fn query_graph(graphsvc: u64, fmt: GraphFmt) {
 			Some(Err(_)) => print(b"graph: query error\n"),
 			None => print(b"graph: service unavailable\n"),
 		}
+		// The connection was minted for this query; the root stays.
+		close(connection);
 	}
 }
 

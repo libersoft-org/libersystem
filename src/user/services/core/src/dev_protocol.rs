@@ -145,6 +145,8 @@ pub const OP_LAUNCH: u8 = 0x30;
 pub const OP_LAUNCH_ACK: u8 = 0x31;
 pub const OP_LAUNCH_OUTPUT: u8 = 0x32;
 pub const OP_LAUNCH_BYTES: u8 = 0x33;
+pub const OP_LAUNCH_STOP: u8 = 0x34;
+pub const OP_LAUNCH_STOP_ACK: u8 = 0x35;
 pub const OP_TERM_INPUT: u8 = 0x20;
 pub const OP_TERM_ACK: u8 = 0x21;
 pub const OP_RESET: u8 = 0x22;
@@ -252,6 +254,11 @@ struct Generation {
 // a launch id on every frame.
 struct Launch {
 	output: u64,
+	// The launched program itself, kept so it can be stopped. A scenario that starts an
+	// interactive program has to be able to end it: without this the only way out is the
+	// program deciding to leave, and a run that fails halfway leaves it holding the terminal
+	// for every run after it.
+	task: u64,
 	buffered: Vec<u8>,
 	// Set when the buffer overran and the oldest output was dropped, so a reader is told
 	// rather than shown a gap it cannot see.
@@ -259,6 +266,21 @@ struct Launch {
 	// The program's output channel closed, which is how a launched program reports it is
 	// finished: nothing else can write there once it is gone.
 	exited: bool,
+}
+
+// Both handles go when the launch does. A launch is replaced by the next one and dropped by a
+// reset, and neither is a place to leak the process handle and the channel it wrote to.
+impl Drop for Launch {
+	fn drop(&mut self) {
+		unsafe {
+			if self.output != 0 {
+				close(self.output);
+			}
+			if self.task != 0 {
+				close(self.task);
+			}
+		}
+	}
 }
 
 // One named artifact and the generations retained for it, newest last. Retention is per
@@ -557,7 +579,7 @@ impl Session {
 		// The generation field names the candidate an operation applies to. The operations
 		// that are not about one candidate must leave it zero, so the field never acquires an
 		// accidental second meaning that a later version would have to preserve.
-		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_ROLLBACK | OP_TERM_INPUT | OP_RESET | OP_RESTART | OP_LAUNCH | OP_LAUNCH_OUTPUT);
+		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_ROLLBACK | OP_TERM_INPUT | OP_RESET | OP_RESTART | OP_LAUNCH | OP_LAUNCH_OUTPUT | OP_LAUNCH_STOP);
 		if session_scoped && generation != 0 {
 			return sink.send(OP_ERROR, request, generation, ST_MALFORMED, &[]);
 		}
@@ -578,6 +600,7 @@ impl Session {
 			OP_ROLLBACK => self.rollback(request, payload, sink),
 			OP_LAUNCH => self.launch(request, payload, sink),
 			OP_LAUNCH_OUTPUT => self.launch_output(request, sink),
+			OP_LAUNCH_STOP => self.launch_stop(request, sink),
 			OP_TERM_INPUT => terminal_input(request, payload, sink),
 			OP_RESET => self.reset(request, sink),
 			OP_RESTART => self.request_restart(request, sink),
@@ -1129,15 +1152,32 @@ impl Session {
 			None => return sink.send(OP_ERROR, request, 0, ST_LAUNCH_REFUSED, &[]),
 		};
 		let started = security::permission::Client::new(ChannelTransport { chan: self.launcher }).run(name, args, cwd, &theirs);
-		let koid: u64 = match started {
-			Some(Ok(result)) => result.info.koid,
+		let (koid, task): (u64, u64) = match started {
+			Some(Ok(result)) => (result.info.koid, result.task),
 			_ => {
 				unsafe { close(ours) };
 				return sink.send(OP_ERROR, request, 0, ST_LAUNCH_REFUSED, &[]);
 			}
 		};
-		self.launch = Some(Launch { output: ours, buffered: Vec::new(), truncated: false, exited: false });
+		self.launch = Some(Launch { output: ours, task, buffered: Vec::new(), truncated: false, exited: false });
 		sink.send(OP_LAUNCH_ACK, request, 0, ST_OK, &koid.to_le_bytes())
+	}
+
+	// Stop the launched program. What it has already printed stays readable, because a
+	// scenario tearing down still wants to know what it said before it was ended; what goes is
+	// the program. Stopping one that has already finished is not an error - a caller cleaning
+	// up cannot know which it is, and reporting that distinction is more useful than refusing.
+	//
+	// Reply payload: signalled u8.
+	fn launch_stop(&mut self, request: u32, sink: &mut impl Sink) -> bool {
+		let Some(launch) = &mut self.launch else {
+			return sink.send(OP_ERROR, request, 0, ST_NO_LAUNCH, &[]);
+		};
+		let signalled: bool = !launch.exited && launch.task != 0 && unsafe { signal(launch.task, SIG_KILL) } >= 0;
+		if signalled {
+			launch.exited = true;
+		}
+		sink.send(OP_LAUNCH_STOP_ACK, request, 0, ST_OK, &[u8::from(signalled)])
 	}
 
 	// Hand over what the launched program has printed since the last read, and say whether it

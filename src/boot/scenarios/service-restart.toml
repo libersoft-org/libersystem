@@ -1,0 +1,77 @@
+# A service can be taken away from a running system and given back, and its client recovers.
+#
+# This is the disconnect-and-restore case, and what makes it possible is that the durable
+# reference a client holds is the capability name and not the channel. The shell asks the
+# supervisor for a fresh connection to the system graph every time it renders one, so the
+# service underneath it can be replaced without the shell knowing: what dies with the old
+# instance is a channel, and a channel is not what the shell is holding on to.
+#
+# `system_graph_service` is the subject because nothing else depends on it except the shell,
+# which the supervisor exempts from a teardown. Stopping it therefore takes exactly one service
+# away, and the instance stays usable throughout - which is what makes this assertable at all
+# rather than a way to end the run.
+#
+# The three states are asserted in order, and the middle one matters most: a scenario that only
+# showed the graph working before and after would pass just as well if the stop had done
+# nothing.
+version = 1
+name = "service restart"
+description = "A service is stopped and started again under a running shell, and its client resolves the replacement by name."
+timeout = 180
+
+[[step]]
+do = "input"
+text = ""
+enter = false
+
+[[step]]
+do = "prompt"
+
+# Running: the graph renders.
+[[step]]
+do = "input"
+text = "graph"
+
+[[step]]
+do = "expect"
+contains = "type=service, state=running"
+timeout = 20
+
+# Taken away. The reply names what went, and nothing but the one service is in it.
+[[step]]
+do = "input"
+text = "stop system_graph_service"
+
+[[step]]
+do = "expect"
+contains = "system_graph_service stopped"
+timeout = 20
+
+[[step]]
+do = "input"
+text = "graph"
+
+[[step]]
+do = "expect"
+contains = "graph: service unavailable"
+timeout = 20
+
+# Given back. The supervisor re-runs the bootstrap that brought it up the first time.
+[[step]]
+do = "input"
+text = "start system_graph_service"
+
+[[step]]
+do = "expect"
+contains = "started: system_graph_service"
+timeout = 30
+
+# And the shell reaches the replacement without having been told anything about it.
+[[step]]
+do = "input"
+text = "graph"
+
+[[step]]
+do = "expect"
+contains = "type=service, state=running"
+timeout = 20

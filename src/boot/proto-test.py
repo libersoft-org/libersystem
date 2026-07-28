@@ -68,6 +68,8 @@ HELLO, HELLO_ACK, PING, PONG = 0x01, 0x02, 0x03, 0x04
 BEGIN, CHUNK, COMMIT, ABORT, PUB_ACK = 0x10, 0x11, 0x12, 0x13, 0x14
 LIST, LIST_REPLY, ROLLBACK, ROLLBACK_ACK = 0x15, 0x16, 0x17, 0x18
 TERM, TERM_ACK, RESET, RESET_ACK = 0x20, 0x21, 0x22, 0x23
+LAUNCH, LAUNCH_ACK, LAUNCH_OUTPUT, LAUNCH_BYTES = 0x30, 0x31, 0x32, 0x33
+LAUNCH_STOP, LAUNCH_STOP_ACK = 0x34, 0x35
 ERROR = 0xFF
 
 # Statuses, by the name the protocol gives each refusal.
@@ -77,6 +79,7 @@ HANDSHAKE_REQUIRED, DUPLICATE_REQUEST, TIMED_OUT, BUSY, BAD_GENERATION = 5, 6, 7
 INCOMPLETE, DIGEST_MISMATCH, NO_SPACE, TERM_REFUSED = 10, 11, 12, 13
 NOT_AN_IMAGE, WRONG_TARGET, NO_IDENTITY, NOT_OWNED = 14, 15, 16, 17
 NOTHING_TO_ROLL_BACK, NOT_DECLARED = 20, 22
+NO_LAUNCHER, LAUNCH_REFUSED, NO_LAUNCH = 23, 24, 25
 
 # The staged tree the real images come from. A publication that is expected to commit has to
 # be a real image: the guest verifies the ELF, its target, its identity record and that the
@@ -255,6 +258,12 @@ class Reply:
 	# What every case compares: what came back, and why.
 	def outcome(self):
 		return (self.opcode, self.status)
+
+
+# A launch request's payload: three typed fields, never a command line. Encoded here rather
+# than borrowed from `lab`, because the shape of a request is the thing under test.
+def launch_payload(name, args, cwd):
+	return bytes([len(name)]) + name + struct.pack('<H', len(args)) + args + struct.pack('<H', len(cwd)) + cwd
 
 
 def frame(opcode, request, payload=b'', generation=0, status=0, version=VERSION, length=None):
@@ -527,6 +536,51 @@ def group_registry(suite):
 	peer.close()
 
 
+# ---- launch: starting, reading and ending a program through the launcher ------------------
+#
+# The agent starts with a fresh restart, because "nothing has been launched" is a state only a
+# new agent is reliably in: a launch outlives the session that made it, so a previous group or
+# a previous run would otherwise decide what the first case here sees.
+def group_launch(suite):
+	suite.note('restarting the agent, so nothing is launched...')
+	guest = lab.LabGuest(60)
+	if not guest.restart(60):
+		raise SystemExit('proto-test: the agent did not restart')
+	peer = Peer()
+	suite.check('stopping when nothing was launched is refused', peer.call(LAUNCH_STOP).outcome(), (ERROR, NO_LAUNCH))
+	suite.check('reading output when nothing was launched is refused', peer.call(LAUNCH_OUTPUT).outcome(), (ERROR, NO_LAUNCH))
+	# A component the permission manifest does not cover cannot be launched. That is the
+	# boundary working: the launcher stays the authority, and the agent asks rather than loads.
+	suite.check('an unlaunchable component is refused', peer.call(LAUNCH, launch_payload(b'echo', b'', b'vol://system')).outcome(), (ERROR, LAUNCH_REFUSED))
+	suite.check('a name past the launch bound is refused', peer.call(LAUNCH, launch_payload(b'x' * 65, b'', b'vol://system')).outcome(), (ERROR, MALFORMED))
+
+	reply = peer.call(LAUNCH, launch_payload(b'uname', b'', b'vol://system'), timeout=30)
+	suite.check('a declared component launches', reply.outcome(), (LAUNCH_ACK, OK))
+	printed, exited = b'', False
+	deadline = time.monotonic() + 30
+	while not exited and time.monotonic() < deadline:
+		answer = peer.call(LAUNCH_OUTPUT, timeout=30)
+		if answer.opcode != LAUNCH_BYTES:
+			break
+		exited = bool(answer.payload[0])
+		printed += answer.payload[2:]
+	suite.check('its own output comes back, and its end with it', (b'LiberSystem' in printed, exited), (True, True))
+	# Reading consumes, so a second read of a finished program is empty and still says it ended.
+	answer = peer.call(LAUNCH_OUTPUT)
+	suite.check('reading again consumes nothing and still reports the exit', (answer.opcode, answer.payload[0], answer.payload[2:]), (LAUNCH_BYTES, 1, b''))
+	suite.check('stopping a program that already finished signals nothing', (peer.call(LAUNCH_STOP).outcome(), peer.call(LAUNCH_STOP).payload[0]), ((LAUNCH_STOP_ACK, OK), 0))
+
+	# One that does not end on its own: it holds a terminal until something ends it, which is
+	# the case the operation exists for.
+	peer.call(LAUNCH, launch_payload(b'ps', b'-i', b'vol://system'), timeout=30)
+	time.sleep(1)
+	reply = peer.call(LAUNCH_STOP)
+	suite.check('stopping a running program signals it', (reply.opcode, reply.status, reply.payload[0]), (LAUNCH_STOP_ACK, OK, 1))
+	answer = peer.call(LAUNCH_OUTPUT)
+	suite.check('and it is reported as ended afterwards', (answer.opcode, answer.payload[0]), (LAUNCH_BYTES, 1))
+	peer.close()
+
+
 # ---- pipelining: the advertised outstanding bound, actually outstanding -------------------
 #
 # Written to read while it writes, which is what pipelining is. A host that sends the whole
@@ -687,6 +741,7 @@ GROUPS = {
 	'publication': group_publication,
 	'terminal': group_terminal,
 	'registry': group_registry,
+	'launch': group_launch,
 	'pipeline': group_pipeline,
 	'fuzz': group_fuzz,
 	'untouched': group_untouched,
