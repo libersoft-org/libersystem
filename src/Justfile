@@ -633,9 +633,9 @@ dev-rollback *args:
 
 # run declarative application scenarios against the development instance. Scenario data is
 # versioned, bounded and has no way to express a shell command.
-# e.g. `just dev-scenario boot/scenarios/*.toml`
-dev-scenario *args:
-    @boot/lab.py dev-scenario {{ args }}
+# e.g. `just dev-test boot/scenarios/*.toml`
+dev-test *args:
+    @boot/lab.py dev-test {{ args }}
 
 # launch a canonical program in the development instance through PermissionManager and print
 # what it writes. e.g. `just dev-launch uname`

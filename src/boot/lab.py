@@ -81,7 +81,7 @@ Persistent development instance (one owner at a time):
   dev-restart           replace the development agent, keeping the guest running
   dev-key <key|chord>... | --text <line>  key events through the emulated keyboard
   dev-pointer [--x F] [--y F] [--press|--release|--click] [button]  pointer events
-  dev-scenario [--verbose] <file.toml>...  run declarative application scenarios
+  dev-test [--verbose] <file.toml>...  run declarative application scenarios
   dev-launch <program> [args...]  launch a program through PermissionManager, print output
   dev-stop              end the program launched through the control channel
   dev-loop <artifact> <scenario.toml>...  build, publish and run; stops at the failing phase
@@ -510,6 +510,37 @@ def instance_stale_inputs(identity):
 		return None
 	current = instance_inputs()
 	return [name for name, _, _ in INSTANCE_INPUTS if recorded.get(name) != current.get(name)]
+
+
+# Whether this process has already compared the instance against the tree it was built from.
+# The comparison walks and hashes several source trees, which is cheap once and wasteful per
+# request - and a scenario opens a session per step.
+_inputs_compared = False
+
+
+# Say so, once, when the running instance is older than the tree the caller is working in.
+#
+# Every command that speaks to the guest passes through here, so this is where a cold
+# invalidation gets explained rather than discovered later as a confusing failure: publishing
+# an artifact built against a changed boot contract into a guest that predates it is the case
+# worth naming out loud. It warns and does not refuse, because which of the two the caller
+# meant is not knowable from here - a kernel edit does not make typing at the terminal wrong -
+# and because `dev-status` is the command that exists to answer it definitively.
+def warn_stale_inputs(identity):
+	global _inputs_compared
+	# A command that composes others answers this once and says so, so its children do not each
+	# pay for the same walk. The comparison is around a quarter of a second, which is nothing
+	# to a person and a noticeable share of a warm loop.
+	if _inputs_compared or os.environ.get('LIBER_DEV_INPUTS_CHECKED') == '1':
+		return
+	_inputs_compared = True
+	stale = instance_stale_inputs(identity)
+	if not stale:
+		return
+	print(f'lab: WARNING: this instance predates the tree: {", ".join(stale)} changed since it booted', file=sys.stderr)
+	for name in stale:
+		print(f'     {name:9}{INPUT_ACTIONS[name]}', file=sys.stderr)
+	print('     a cold restart (`just dev-down && just dev-up`) is what picks it up; hot publication cannot', file=sys.stderr)
 
 
 def dev_identity_read():
@@ -1239,6 +1270,7 @@ def proto_session(timeout, announce=True):
 	recorded = identity.get('boot')
 	if recorded and recorded != bounds['boot']:
 		die(f'the guest has restarted since this instance was recorded (boot {recorded[:16]} -> {bounds["boot"][:16]}); rerun `just dev-up`')
+	warn_stale_inputs(identity)
 	if announce:
 		registry = f'registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact' if bounds['registry'] else 'no registry on this boot'
 		print(f'lab: handshake ok (protocol v{PROTO_VERSION}, max frame {bounds["max_frame"]} B, max artifact {bounds["max_artifact"] // (1024 * 1024)} MB, {registry}, max terminal input {bounds["max_term_input"]} B)')
@@ -1525,11 +1557,16 @@ def cmd_dev_loop(args):
 	if len(rest) < 2:
 		die('usage: dev-loop [--target T] <artifact> <scenario.toml>...')
 	artifact, scenarios = rest[0], rest[1:]
+	# Answered once, here, before anything is built: an instance older than the tree is the one
+	# thing a loop cannot fix by running, and each phase asking again would only repeat it.
+	_, identity = dev_state()
+	warn_stale_inputs(identity)
+	child_env = dict(os.environ, LIBER_DEV_INPUTS_CHECKED='1')
 	phases = []
 	started = time.monotonic()
 
 	at = time.monotonic()
-	build = subprocess.run([os.path.join(SRC, 'tools', 'dev-build.sh'), artifact, target], cwd=SRC, capture_output=True, text=True)
+	build = subprocess.run([os.path.join(SRC, 'tools', 'dev-build.sh'), artifact, target], cwd=SRC, env=child_env, capture_output=True, text=True)
 	phases.append(('build', time.monotonic() - at, build.returncode == 0))
 	summary = next((line for line in reversed(build.stdout.splitlines()) if 'summary target=' in line), '')
 	if build.returncode != 0:
@@ -1540,7 +1577,7 @@ def cmd_dev_loop(args):
 
 	at = time.monotonic()
 	path = staged_artifact(artifact, {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}.get(target, target))
-	publish = subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, capture_output=True, text=True)
+	publish = subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, env=child_env, capture_output=True, text=True)
 	phases.append(('publish', time.monotonic() - at, publish.returncode == 0))
 	if publish.returncode != 0:
 		report_loop(phases, started, publish.stdout + publish.stderr)
@@ -1550,7 +1587,7 @@ def cmd_dev_loop(args):
 			print(line)
 
 	at = time.monotonic()
-	run = subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-scenario'] + scenarios, cwd=SRC, capture_output=True, text=True)
+	run = subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-test'] + scenarios, cwd=SRC, env=child_env, capture_output=True, text=True)
 	phases.append(('run', time.monotonic() - at, run.returncode == 0))
 	print(run.stdout.strip())
 	report_loop(phases, started, run.stderr if run.returncode != 0 else '')
@@ -1844,14 +1881,14 @@ class LabGuest:
 		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-restart', '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
 
 
-def cmd_dev_scenario(args):
+def cmd_dev_test(args):
 	import scenario
 
 	verbose = '--verbose' in args
 	rest = [a for a in args if not a.startswith('--')]
 
 	if not rest:
-		die('usage: dev-scenario [--verbose] <file.toml>...')
+		die('usage: dev-test [--verbose] <file.toml>...')
 	documents = []
 	for path in rest:
 		try:
@@ -2359,7 +2396,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down}
 
 
 def main():
