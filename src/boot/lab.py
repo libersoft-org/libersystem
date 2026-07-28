@@ -1649,6 +1649,35 @@ class LabGuest:
 		finally:
 			sock.close()
 
+	# What the guest still holds on a scenario's behalf, as a list of plain descriptions, empty
+	# when it holds nothing. None when it could not be asked at all, which is a different and
+	# worse answer than "nothing".
+	#
+	# Asked of the guest rather than inferred from what the runner did: the point of the check
+	# is to catch the case where the runner believes it cleaned up and the guest disagrees.
+	def scope_held(self, timeout):
+		try:
+			sock, buffer, _ = proto_session(timeout, announce=False)
+		except SystemExit:
+			return None
+		held = []
+		try:
+			opcode, _, body = proto_request(sock, buffer, 2, OP_GEN_LIST, timeout=timeout, what='reading the registry', tolerate=(21,))
+			if opcode == OP_GEN_LIST_REPLY and len(body) >= 6:
+				artifacts, spent = struct.unpack('<HI', body[:6])
+				if artifacts or spent:
+					held.append(f'{artifacts} artifact(s) and {spent} B still in the registry')
+			opcode, _, body = proto_request(sock, buffer, 3, OP_LAUNCH_OUTPUT, timeout=timeout, what='reading the launch state', tolerate=(25,))
+			# A launch that has ended is nothing to hold; one that has not is this run's, still
+			# running, on an instance the next run is about to use.
+			if opcode == OP_LAUNCH_BYTES and len(body) >= 1 and not body[0]:
+				held.append('a launched program is still running')
+		except SystemExit:
+			return None
+		finally:
+			sock.close()
+		return held
+
 	def publish(self, artifact, path, timeout):
 		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
 

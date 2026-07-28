@@ -303,8 +303,18 @@ def run(document, lab, verbose=False):
 			run_step(step, guest, lab, limit, index)
 			if verbose:
 				print(f'     {label} in {(time.monotonic() - at) * 1000:.0f} ms')
-	finally:
-		teardown(lab, verbose)
+	except ScenarioError as failure:
+		# The scenario's own result is what the caller is waiting to hear, so a teardown that
+		# also went wrong is appended to it rather than replacing it.
+		left = teardown(lab, verbose)
+		raise ScenarioError(f'{failure}; and the scope was not restored: {"; ".join(left)}' if left else str(failure)) from None
+	left = teardown(lab, verbose)
+	if left:
+		# A run that passed but left the instance dirty is not a pass. The instance is shared by
+		# every scenario after it, and a scope that could not be given back is the failure this
+		# whole item exists to prevent - reported here, where it is known, rather than by
+		# whichever innocent run trips over it next.
+		raise ScenarioError(f'the scenario passed but its scope was not restored: {"; ".join(left)}')
 	return time.monotonic() - started
 
 
@@ -318,10 +328,13 @@ def run(document, lab, verbose=False):
 # after the guilty one. Three things are given back, in the order they can be: the launched
 # program, the terminal, and the registry.
 #
-# Failures here are reported and not raised. A teardown that failed must not replace the
-# scenario's own result, which is what the caller is waiting to hear.
+# The scope is then verified rather than assumed. Performing a teardown and reporting success
+# because the steps were attempted is how a run comes to leave state behind quietly; the guest
+# is asked afterwards what it is actually holding. Returns the list of things that could not be
+# given back, empty when the instance is as the next run needs to find it.
 def teardown(lab, verbose=False):
 	notes = []
+	left = []
 	try:
 		if lab.stop_launch(10):
 			notes.append('stopped the launched program')
@@ -336,16 +349,25 @@ def teardown(lab, verbose=False):
 			if lab.wait_prompt(5):
 				break
 		else:
-			notes.append('WARNING: no shell prompt after teardown; the next run may fail on a busy terminal')
+			left.append('the terminal is not at a prompt')
 		if not lab.reset(10):
-			notes.append('WARNING: the development state was not dropped')
+			left.append('the development state was not dropped')
+		# What the guest says it is holding, which is the only account of it worth having. A
+		# generation still in the registry or a launch still in flight would both be invisible
+		# from here otherwise, and both would be inherited by the next run.
+		held = lab.scope_held(10)
+		if held is None:
+			left.append('the guest did not answer when asked what it still holds')
+		else:
+			left.extend(held)
 	# SystemExit included on purpose: the helpers below exit the process when the instance is
 	# unreachable, and during teardown that is something to report, not something to die of.
 	except (OSError, ValueError, SystemExit) as error:
-		notes.append(f'WARNING: teardown did not complete: {error}')
-	if verbose or any(note.startswith('WARNING') for note in notes):
+		left.append(f'teardown did not complete: {error}')
+	if verbose:
 		for note in notes:
 			print(f'     {note}')
+	return left
 
 
 def run_step(step, guest, lab, limit, index):
