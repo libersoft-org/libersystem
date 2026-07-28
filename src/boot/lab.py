@@ -36,11 +36,13 @@
 # `sh` joins its arguments, so quoting is optional: `just lab sh time ls`.
 
 import fcntl
+import glob
 import hashlib
 import json
 import os
 import re
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -82,13 +84,16 @@ Persistent development instance (one owner at a time):
   dev-scenario [--verbose] <file.toml>...  run declarative application scenarios
   dev-launch <program> [args...]  launch a program through PermissionManager, print output
   dev-stop              end the program launched through the control channel
+  dev-loop <artifact> <scenario.toml>...  build, publish and run; stops at the failing phase
+  dev-clean [--dry-run]  prune host-side leftovers against documented limits
   dev-down              stop it gracefully and release the lock"""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 SRC = os.path.dirname(HERE)
 REPO = os.path.dirname(SRC)
-BUILD = os.path.join(REPO, '.build', 'boot')
+BUILD_ROOT = os.path.join(REPO, '.build')
+BUILD = os.path.join(BUILD_ROOT, 'boot')
 SERIAL_SOCK = os.path.join(BUILD, 'lab-serial.sock')
 CTL_SOCK = os.path.join(BUILD, 'lab-ctl.sock')
 SERIAL_LOG = os.path.join(BUILD, 'lab-serial.log')
@@ -1482,6 +1487,155 @@ def launch_payload(name, args, cwd):
 	return bytes([len(name)]) + name + struct.pack('<H', len(args)) + args + struct.pack('<H', len(cwd)) + cwd
 
 
+# Where an artifact is staged on the host, from the manifest that decides it. Programs lose
+# the `.lsexe` the manifest names them by when they are staged; libraries keep their suffix.
+# Read from the manifest rather than guessed, because the manifest is the one place that
+# decides where anything goes.
+def staged_artifact(name, target='x86_64-unknown-none'):
+	try:
+		manifest = json.loads(subprocess.run([os.path.join(SRC, 'tools', 'system-manifest.sh'), 'export-json'], cwd=SRC, capture_output=True, text=True, check=True).stdout)
+	except (OSError, ValueError, subprocess.CalledProcessError) as error:
+		die(f'cannot read the system manifest: {error}')
+	entry = manifest.get('programs', {}).get(name) or manifest.get('libraries', {}).get(name)
+	if not entry:
+		die(f'{name} is not a manifest-declared artifact; only a declared name can iterate hot')
+	destination = entry['destination']
+	if destination.endswith('.lsexe'):
+		destination = destination[: -len('.lsexe')]
+	path = os.path.join(BUILD_ROOT, 'system-image', target, destination)
+	if not os.path.isfile(path):
+		die(f'{name} is declared but not staged at {path}; build the tree first')
+	return path
+
+
+# The development loop itself: build the artifact, publish it into the running guest, and run
+# the scenarios that say whether it works. One command because it is one thought, and it stops
+# at the phase that failed rather than reporting three results the reader has to combine.
+#
+# Each phase is exactly the command a person would run by hand, invoked as such. That is what
+# keeps the loop honest: there is no faster path here that the individual commands do not have,
+# so a phase that passes here passes there.
+#
+# What makes a warm iteration cheap is the build phase's own content-addressed cache, which
+# reports what it reused; publish and run always happen, because a publication of unchanged
+# bytes costs milliseconds and a test that is skipped has not passed.
+def cmd_dev_loop(args):
+	timeout, rest = take_arg(args, '--timeout', 300)
+	target, rest = take_string_arg(rest, '--target', 'x86_64')
+	if len(rest) < 2:
+		die('usage: dev-loop [--target T] <artifact> <scenario.toml>...')
+	artifact, scenarios = rest[0], rest[1:]
+	phases = []
+	started = time.monotonic()
+
+	at = time.monotonic()
+	build = subprocess.run([os.path.join(SRC, 'tools', 'dev-build.sh'), artifact, target], cwd=SRC, capture_output=True, text=True)
+	phases.append(('build', time.monotonic() - at, build.returncode == 0))
+	summary = next((line for line in reversed(build.stdout.splitlines()) if 'summary target=' in line), '')
+	if build.returncode != 0:
+		report_loop(phases, started, build.stdout + build.stderr)
+		die(f'dev-loop: the build phase failed for {artifact}')
+	if summary:
+		print(f'lab: {summary.split("summary ", 1)[-1]}')
+
+	at = time.monotonic()
+	path = staged_artifact(artifact, {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}.get(target, target))
+	publish = subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, capture_output=True, text=True)
+	phases.append(('publish', time.monotonic() - at, publish.returncode == 0))
+	if publish.returncode != 0:
+		report_loop(phases, started, publish.stdout + publish.stderr)
+		die(f'dev-loop: publishing {artifact} failed')
+	for line in publish.stdout.splitlines():
+		if 'committed' in line or 'compatibility' in line:
+			print(line)
+
+	at = time.monotonic()
+	run = subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-scenario'] + scenarios, cwd=SRC, capture_output=True, text=True)
+	phases.append(('run', time.monotonic() - at, run.returncode == 0))
+	print(run.stdout.strip())
+	report_loop(phases, started, run.stderr if run.returncode != 0 else '')
+	if run.returncode != 0:
+		die('dev-loop: the scenarios failed')
+
+
+def report_loop(phases, started, detail):
+	if detail.strip():
+		print(detail.strip())
+	shape = '  '.join(f'{name} {"ok" if ok else "FAILED"} {elapsed:.1f}s' for name, elapsed, ok in phases)
+	print(f'lab: {shape}  total {time.monotonic() - started:.1f}s')
+
+
+# How much of each kind of host-side leftover a clean keeps. Written as numbers rather than
+# left to judgement, so what a clean removes is knowable before running it and arguable
+# afterwards. Nothing here is a source or a build input: every one of these is either output
+# that can be produced again or scratch from a run that has ended.
+KEEP_TEST_RUNS = 20
+KEEP_BASELINE_SAMPLES = 20
+
+
+# Prune what the host accumulates and nothing else.
+#
+# The rule the list below follows: a thing may be removed when it is reproducible from sources
+# or belongs to a run that is over, and may not be removed when anything still refers to it.
+# The running instance is the case that matters - its log and sockets are live state, so a
+# clean leaves them alone while it is up and says so.
+def cmd_dev_clean(args):
+	dry = '--dry-run' in args
+	removed = []
+
+	# Test logs, newest kept. They come in pairs per run, so runs are counted rather than files.
+	logs = sorted(glob.glob(os.path.join(BUILD_ROOT, 'test-logs', '*-run.log')), key=os.path.getmtime, reverse=True)
+	for stale in logs[KEEP_TEST_RUNS:]:
+		removed.append(stale)
+		removed.append(stale.replace('-run.log', '-guest.log'))
+
+	# Baseline samples, newest kept.
+	samples = sorted(glob.glob(os.path.join(BUILD_ROOT, 'dev-baseline', '*')), key=os.path.getmtime, reverse=True)
+	removed.extend(samples[KEEP_BASELINE_SAMPLES:])
+
+	# Scratch directories a build left behind, named after the process that made them. One
+	# whose process is gone can never be claimed again; one whose process is alive is in use.
+	for scratch in glob.glob(os.path.join(BUILD_ROOT, 'image-source-metadata.*')):
+		owner = scratch.rsplit('.', 1)[-1]
+		if not owner.isdigit():
+			continue
+		try:
+			os.kill(int(owner), 0)
+		except ProcessLookupError:
+			removed.append(scratch)
+		except OSError:
+			pass
+
+	# The instance's own files are live state while it is up, and stale sockets when it is not.
+	state, _ = dev_state()
+	if state in ('down', 'stale'):
+		removed.extend(path for path in (DEV_SERIAL_SOCK, DEV_CTL_SOCK, DEV_CONSOLE_SOCK, DEV_CHANNEL_SOCK) if os.path.exists(path))
+	else:
+		print(f'lab: the development instance is {state}; leaving its log and sockets alone')
+
+	total = 0
+	for path in removed:
+		if not os.path.exists(path):
+			continue
+		total += directory_bytes(path) if os.path.isdir(path) else os.path.getsize(path)
+		if not dry:
+			shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.unlink(path)
+	verb = 'would remove' if dry else 'removed'
+	print(f'lab: {verb} {len(removed)} item(s), {total // 1024} kB (keeping the {KEEP_TEST_RUNS} newest test runs and {KEEP_BASELINE_SAMPLES} newest baseline samples)')
+	print('lab: the artifact caches and staged images are left alone; they are inputs to the next build, and `just clean` is what discards them')
+
+
+def directory_bytes(path):
+	total = 0
+	for root, _, files in os.walk(path):
+		for name in files:
+			try:
+				total += os.path.getsize(os.path.join(root, name))
+			except OSError:
+				pass
+	return total
+
+
 def cmd_dev_launch(args):
 	timeout, rest = take_arg(args, '--timeout', 30)
 	if not rest:
@@ -1976,6 +2130,22 @@ def cmd_dev_pointer(args):
 
 # A screen fraction option, kept apart from `take_arg` because that one parses integers and a
 # position here is 0.0 to 1.0.
+# The string form of `take_arg`, for options whose value is a name rather than a number.
+def take_string_arg(args, name, default):
+	value, rest, skip = default, [], False
+	for index, argument in enumerate(args):
+		if skip:
+			skip = False
+			continue
+		if argument == name and index + 1 < len(args):
+			value, skip = args[index + 1], True
+		elif argument.startswith(name + '='):
+			value = argument.split('=', 1)[1]
+		else:
+			rest.append(argument)
+	return value, rest
+
+
 def take_fraction(args, name):
 	value, rest, skip = None, [], False
 	for index, argument in enumerate(args):
@@ -2189,7 +2359,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down}
 
 
 def main():

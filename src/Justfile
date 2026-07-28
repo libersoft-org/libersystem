@@ -610,6 +610,17 @@ dev-key *args:
 dev-pointer *args:
     @boot/lab.py dev-pointer {{ args }}
 
+# prune what the host accumulates - old test logs, old baseline samples, scratch from builds
+# that ended - against documented limits, and report what went. e.g. `just dev-clean --dry-run`
+dev-clean *args:
+    @boot/lab.py dev-clean {{ args }}
+
+# the development loop in one command: build an artifact, publish it into the running
+# instance, run the scenarios. Stops at the phase that failed.
+# e.g. `just dev-loop uname boot/scenarios/registry-shadow.toml`
+dev-loop *args:
+    @boot/lab.py dev-loop {{ args }}
+
 # run the development-control protocol's conformance suite against the running instance, all
 # groups or the named ones. e.g. `just proto-test`, `just proto-test registry publication`
 proto-test *groups:
