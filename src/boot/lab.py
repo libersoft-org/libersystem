@@ -1484,9 +1484,11 @@ def launch_payload(name, args, cwd):
 
 def cmd_dev_launch(args):
 	timeout, rest = take_arg(args, '--timeout', 30)
-	rest = [a for a in rest if not a.startswith('--')]
 	if not rest:
 		die('usage: dev-launch [--timeout N] <program> [args...]')
+	# Everything after the program name is the program's, dashes included. Filtering options
+	# out here would silently eat the flags of the thing being launched, which is how
+	# `dev-launch imgconv --help` came to ask imgconv to convert nothing.
 	name, program_args = rest[0], ' '.join(rest[1:])
 	sock, buffer, _ = proto_session(timeout)
 	try:

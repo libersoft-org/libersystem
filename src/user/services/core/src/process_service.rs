@@ -8,7 +8,7 @@
 // the generated `liber:system` Process bindings: they START a named program unattended,
 // LAUNCH one with a caller-provided bootstrap channel (so a policy front end like
 // PermissionManager can grant the new process its capabilities over that channel), LAUNCH
-// BOUNDED with the same bootstrap under a reusable aggregate memory-limited child Domain,
+// BOUNDED with the same bootstrap under a memory-limited child Domain of its own,
 // receive back the live process handle for job control, and LIST the processes started so
 // far as typed `process-info` records (koid + name) that render as CLI / JSON on the client.
 //
@@ -352,21 +352,28 @@ struct Processes<'a> {
 	registry: u64,
 	registry_armed: bool,
 	started: Vec<ProcessInfo>,
-	bounded_domains: Vec<(u64, u64)>,
 }
 
 impl<'a> Processes<'a> {
+	// A resource Domain for one launch, and only that one.
+	//
+	// It used to be one Domain per distinct limit, shared by every launch that asked for the
+	// same number, which made the limit an aggregate budget: two concurrent runs of the same
+	// tool divided it. The one limit in the system is `imgconv`'s, and it was measured as the
+	// whole-Domain peak of a SINGLE run - so the aggregate reading was the one the number was
+	// not sized for, and a second concurrent run would have failed inside a budget that looked
+	// generous. Per launch, each run gets what was measured.
+	//
+	// It also makes the Domain the scope of the thing it accounts. The shared ones were created
+	// on first use and never released, because there was nothing to release them at: a cache
+	// keyed by a number has no idea when the last user is gone. One per launch is handed to the
+	// process and forgotten, and the kernel frees it when the process does.
 	unsafe fn bounded_domain(&mut self, memory_limit: u64) -> Result<u64, Error> {
-		if let Some((_, domain)) = self.bounded_domains.iter().find(|(limit, _)| *limit == memory_limit) {
-			return Ok(*domain);
-		}
 		let domain = unsafe { domain_create(memory_limit, u64::MAX, u64::MAX) };
 		if domain < 0 {
 			return Err(Error::Again);
 		}
-		let domain = domain as u64;
-		self.bounded_domains.push((memory_limit, domain));
-		Ok(domain)
+		Ok(domain as u64)
 	}
 
 	// Load program `name` and create a process from it, handing the child `bootstrap` as
@@ -595,7 +602,13 @@ impl<'a> Service for Processes<'a> {
 
 	fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
 		let domain = unsafe { self.bounded_domain(memory_limit)? };
-		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap, domain) }.ok_or(Error::NotFound)?;
+		let started = unsafe { self.spawn_program(&name, bootstrap, domain) };
+		// The Domain was made for this one process and this service keeps no reference to it:
+		// a process holds its Domain, so dropping the handle here leaves the Domain alive for
+		// exactly as long as what it is accounting, and gone the moment that ends. Closing it
+		// on the failure path is the same statement about a process that never started.
+		unsafe { close(domain) };
+		let (handle, artifact) = started.ok_or(Error::NotFound)?;
 		let koid = unsafe { object_info(handle as u64) }.map(|info| info.koid).ok_or(Error::Again)?;
 		let info = ProcessInfo { koid, name: artifact };
 		self.started.push(info.clone());
@@ -630,7 +643,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 5. serve generated start/list requests until the client side closes.
-	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new(), bounded_domains: Vec::new() };
+	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new() };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {

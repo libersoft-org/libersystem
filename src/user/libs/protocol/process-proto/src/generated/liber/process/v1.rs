@@ -89,9 +89,10 @@ impl StartResult {
 /// so far, and `launch` is the full launcher primitive - it loads and starts a program
 /// with a caller-provided bootstrap channel (so a policy front end like PermissionManager
 /// can grant the new process its capabilities over that channel) and returns the live
-/// process handle for job control. `launch-bounded` is the same mechanism under a reusable
-/// child Domain keyed by the caller's memory limit; concurrent processes with the same
-/// limit share that aggregate budget. The policy front end chooses the limit, while
+/// process handle for job control. `launch-bounded` is the same mechanism under a child
+/// Domain created for that one process: the limit is what that process may use, not a budget
+/// shared with whatever else asked for the same number, and the Domain is released when the
+/// process it accounts ends. The policy front end chooses the limit, while
 /// ProcessService remains responsible only for loading. The service holds no grantable
 /// clients and decides no capability grants.
 // interface `process` over a channel: opcodes, a Service trait + dispatch, and a Client.
