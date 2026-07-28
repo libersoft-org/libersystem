@@ -27,7 +27,18 @@ status=$?
 set -e
 
 if [[ "$status" != 101 || ! -f "$object" ]] || ! llvm-readelf -h "$object" | grep -q 'Type:.*REL'; then
-	echo "build-consumer-object: $consumer did not stop after emitting its ET_REL object" >&2
+	# Say which of the three expectations broke. They fail for different reasons and want
+	# different answers: a status other than 101 means the build did not reach the final-link
+	# shim collision this technique relies on, a missing object means cargo did not re-invoke
+	# rustc so the `--emit` never ran, and a present object of the wrong kind means it did run
+	# and produced something else. One message for all three sends the reader to the wrong one.
+	if [[ "$status" != 101 ]]; then
+		echo "build-consumer-object: $consumer exited $status, not the expected 101 from the final-link shim collision (see $errors)" >&2
+	elif [[ ! -f "$object" ]]; then
+		echo "build-consumer-object: $consumer stopped at the expected link failure but emitted no object at $object; cargo did not re-invoke rustc, so --emit never ran" >&2
+	else
+		echo "build-consumer-object: $consumer emitted $object, but it is $(llvm-readelf -h "$object" | awk '/Type:/{print $2}') rather than ET_REL" >&2
+	fi
 	exit 1
 fi
 if ! grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$errors" || ! grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$errors"; then
