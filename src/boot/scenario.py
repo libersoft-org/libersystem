@@ -83,6 +83,20 @@ def as_sequences(entry):
 	return entry if isinstance(entry, tuple) else (entry,)
 
 
+# The first name in `wanted` that does not appear after the ones before it, or None when all
+# of them appear in that order. Each match resumes from where the previous one ended, so the
+# question asked is the order they were written in and not merely whether each is somewhere.
+def out_of_order(raw, wanted):
+	at = 0
+	for name in wanted:
+		found = [raw.find(sequence, at) for sequence in as_sequences(RESTORED[name])]
+		found = [position for position in found if position >= 0]
+		if not found:
+			return name
+		at = min(found) + 1
+	return None
+
+
 # The keys a line of text is typed as. Validation has already established that every character
 # maps, so this cannot fail here.
 def lab_keys_for_text(text, enter):
@@ -351,18 +365,23 @@ def run_step(step, guest, lab, limit, index):
 		if not lab.send_pointer(step.get('x'), step.get('y'), step.get('button'), step.get('action', 'click')):
 			raise ScenarioError(f'{where}: the emulated tablet refused the event')
 	elif kind == 'restored':
-		# Watched rather than sampled: the program is exiting while this runs, and its restore
-		# sequences arrive in the order it writes them, not all at once.
+		# In the order named, not merely all present. Order is the property that matters: a
+		# terminal handed back with the alternate screen left before the cursor was shown, or
+		# raw input still on while the screen switches, is a terminal a person is looking at
+		# in a wrong state, however briefly. It is also what the kernel-side harness proves,
+		# so a scenario asserting only presence would be the weaker of the two tests.
+		#
+		# Watched rather than sampled once: the program is exiting while this runs and writes
+		# its restore sequences one at a time.
 		mark = guest.at
 		end = time.monotonic() + limit
-		missing = list(step['expect'])
-		while missing and time.monotonic() < end:
-			raw = guest.raw_since(mark)
-			missing = [name for name in missing if not any(sequence in raw for sequence in as_sequences(RESTORED[name]))]
-			if missing:
-				time.sleep(0.2)
-		if missing:
-			raise ScenarioError(f'{where}: the terminal did not restore {", ".join(missing)} within {int(limit)} s')
+		while True:
+			missing = out_of_order(guest.raw_since(mark), step['expect'])
+			if missing is None:
+				break
+			if time.monotonic() >= end:
+				raise ScenarioError(f'{where}: the terminal did not restore {missing} in order within {int(limit)} s')
+			time.sleep(0.2)
 		guest.at = guest.mark()
 	elif kind == 'reset':
 		if not lab.reset(int(limit)):

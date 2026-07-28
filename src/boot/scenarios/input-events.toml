@@ -69,7 +69,7 @@ keys = ["q"]
 
 [[step]]
 do = "restored"
-expect = ["screen", "cursor", "raw", "mouse"]
+expect = ["mouse", "raw", "cursor", "screen"]
 timeout = 20
 
 [[step]]

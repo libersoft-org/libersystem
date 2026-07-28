@@ -1,0 +1,113 @@
+# The three terminal applications, each taken through its whole life on a real terminal:
+# started from a keyboard, shown reading what it was granted, driven with keys, and made to
+# give the terminal back the way it found it.
+#
+# These mirror the kernel-side harnesses for `licoview`, `licoedit` and `lico`, which drive the
+# same programs against a synthetic terminal inside the test binary. The properties asserted
+# are the same three: the program renders what it read through its one granted volume, the key
+# that ends it ends it, and every terminal mode it turned on is turned off again IN ORDER. The
+# order is the part worth insisting on - a terminal handed back with the alternate screen left
+# before the cursor was shown is a terminal a person is looking at in the wrong state.
+#
+# What this cannot see, and the kernel harness can, is the enter sequence byte by byte and the
+# exact frame boundaries: the runner reads a console stream, not one message per write. That
+# half is covered where it belongs, in `lico`'s own unit tests, which assert the enter and
+# leave byte strings exactly. Between the three of them nothing is left to trust.
+#
+# The file is `vol://system/hello.txt`, the same one the kernel harnesses open, so the content
+# assertion is the same assertion.
+version = 1
+name = "terminal lifecycle"
+description = "licoview, licoedit and lico each render, respond to keys, and restore the terminal in order."
+timeout = 300
+
+[[step]]
+do = "input"
+text = "\u0003"
+enter = false
+
+[[step]]
+do = "prompt"
+
+# licoview: renders what it read, and `q` ends it.
+[[step]]
+do = "key"
+text = "licoview vol://system/hello.txt"
+
+[[step]]
+do = "expect"
+contains = "Hello from the OS ramdisk!"
+timeout = 20
+
+[[step]]
+do = "key"
+keys = ["q"]
+
+# The order licoview writes: pointer reporting off, raw input off, cursor back, alternate
+# screen left.
+[[step]]
+do = "restored"
+expect = ["mouse", "raw", "cursor", "screen"]
+timeout = 20
+
+[[step]]
+do = "prompt"
+
+# licoedit: the same file in the editor, ended with F10 while the terminal is raw - the exit
+# path that has nothing to do with a shell reading a line.
+[[step]]
+do = "key"
+text = "licoedit vol://system/hello.txt"
+
+[[step]]
+do = "expect"
+contains = "Hello from the OS ramdisk!"
+timeout = 20
+
+[[step]]
+do = "key"
+keys = ["f10"]
+
+# No pointer reporting in the editor, so there is none to turn off.
+[[step]]
+do = "restored"
+expect = ["raw", "cursor", "screen"]
+timeout = 20
+
+[[step]]
+do = "prompt"
+
+# lico: the file manager, which has two panels and a key that moves between them. The redraw
+# after Tab is the event having been understood rather than merely delivered.
+#
+# The directory is named rather than left to default, because the shell routes an interactive
+# tool only when the line carries an argument: a bare `lico` is not a command it recognises.
+[[step]]
+do = "key"
+text = "lico vol://system"
+
+[[step]]
+do = "expect"
+contains = "Tab/pointer panel"
+timeout = 20
+
+[[step]]
+do = "key"
+keys = ["tab"]
+
+[[step]]
+do = "expect"
+contains = "Tab/pointer panel"
+timeout = 20
+
+[[step]]
+do = "key"
+keys = ["f10"]
+
+[[step]]
+do = "restored"
+expect = ["mouse", "raw", "cursor", "screen"]
+timeout = 20
+
+[[step]]
+do = "prompt"
