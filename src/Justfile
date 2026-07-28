@@ -596,6 +596,11 @@ dev-reset *args:
 dev-restart *args:
     @boot/lab.py dev-restart {{ args }}
 
+# run the development-control protocol's conformance suite against the running instance, all
+# groups or the named ones. e.g. `just proto-test`, `just proto-test registry publication`
+proto-test *groups:
+    @boot/proto-test.py {{ groups }}
+
 # return an artifact in the development instance registry to the generation before its
 # newest. e.g. `just dev-rollback base-proto`
 dev-rollback *args:
