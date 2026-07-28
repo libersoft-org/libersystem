@@ -1,0 +1,76 @@
+# Key and pointer events, through the devices rather than around them, and the terminal put
+# back afterwards.
+#
+# Every other scenario types over the control protocol, which reaches the console directly and
+# so proves nothing about the input stack. These steps inject into the emulated keyboard and
+# tablet, so what is exercised is the whole path a person's hand takes: the device, its driver,
+# InputService, the session, and the program in the foreground.
+#
+# The pointer is asserted through `licoview`, because a pointer event is only observable where
+# something reacts to it. It scrolls on the wheel and redraws when the position moves, so a
+# second banner after the first is the event having arrived - not a guess about what the screen
+# looks like. Any file long enough to scroll will do; a staged library is one that is always
+# there and never edited.
+#
+# The last assertion is the one an interactive program is most likely to get wrong: `licoview`
+# takes the alternate screen, hides the cursor, puts the terminal in raw mode and turns on
+# mouse reporting, and all four have to be given back when it exits. That is escape sequences
+# and nothing else, so it is asserted against the raw console bytes.
+version = 1
+name = "input events"
+description = "Key and pointer events reach the guest through the emulated devices, and an interactive program restores the terminal."
+timeout = 240
+
+[[step]]
+do = "input"
+text = "\u0003"
+enter = false
+
+[[step]]
+do = "prompt"
+
+# A command typed on the emulated keyboard, one key at a time.
+[[step]]
+do = "key"
+text = "uname"
+
+[[step]]
+do = "expect"
+contains = "LiberSystem"
+timeout = 20
+
+[[step]]
+do = "prompt"
+
+# An interactive program, started the same way.
+[[step]]
+do = "key"
+text = "licoview vol://system/lib/protocol/time-proto.lslib"
+
+[[step]]
+do = "expect"
+contains = "arrows/page scroll"
+timeout = 20
+
+# The wheel scrolls it, so a second banner is the pointer event having reached the program.
+[[step]]
+do = "pointer"
+button = "wheel-down"
+
+[[step]]
+do = "expect"
+contains = "arrows/page scroll"
+timeout = 20
+
+# Quit, and take the terminal back.
+[[step]]
+do = "key"
+keys = ["q"]
+
+[[step]]
+do = "restored"
+expect = ["screen", "cursor", "raw", "mouse"]
+timeout = 20
+
+[[step]]
+do = "prompt"

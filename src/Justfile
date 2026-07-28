@@ -596,6 +596,16 @@ dev-reset *args:
 dev-restart *args:
     @boot/lab.py dev-restart {{ args }}
 
+# send key events to the instance through the emulated keyboard, not the control protocol:
+# named keys and chords, or `--text` for a line. e.g. `just dev-key ctrl-c up ret`
+dev-key *args:
+    @boot/lab.py dev-key {{ args }}
+
+# send a pointer event through the emulated tablet; positions are fractions of the screen.
+# e.g. `just dev-pointer wheel-down`, `just dev-pointer --x 0.5 --y 0.5 left`
+dev-pointer *args:
+    @boot/lab.py dev-pointer {{ args }}
+
 # run the development-control protocol's conformance suite against the running instance, all
 # groups or the named ones. e.g. `just proto-test`, `just proto-test registry publication`
 proto-test *groups:

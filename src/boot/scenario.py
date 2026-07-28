@@ -31,6 +31,12 @@ import sys
 import time
 import tomllib
 
+# The emulator's key and button names come from `lab`, because they are QEMU's vocabulary
+# rather than this format's, and one list is the only way the two cannot drift. The import is
+# safe in both directions: `lab` reaches this module only from inside the command that runs a
+# scenario, so neither is waiting on the other to finish loading.
+import lab
+
 # The format revision this runner understands. A scenario states it, so a file written for a
 # later format is refused rather than half-understood.
 SCENARIO_VERSION = 1
@@ -43,6 +49,22 @@ MAX_PATTERN_BYTES = 512
 MAX_STEP_SECONDS = 300
 MAX_TOTAL_SECONDS = 1800
 MAX_ARGS_BYTES = 512
+MAX_KEYS = 64
+
+# The closed vocabularies the input and restoration steps validate against. Key names and
+# pointer buttons come from the runner's own tables so there is one list, not two that drift;
+# what a terminal restores is named here because it is the scenario format's word for it.
+#
+# Each entry is the escape sequence that puts one thing back. A program that entered the
+# alternate screen, hid the cursor, took raw input or turned on mouse reporting has to undo
+# exactly these, and a scenario says which of them it expects to see.
+RESTORED = {
+	'screen': b'\x1b[?1049l',
+	'cursor': b'\x1b[?25h',
+	'raw': b'\x1b[?9001l',
+	'mouse': (b'\x1b[?1000l', b'\x1b[?1002l', b'\x1b[?1003l'),
+	'paste': b'\x1b[?2004l',
+}
 
 # A component name, not a path and not a command line. The guest checks the same thing; this
 # is here so a scenario that meant to run a shell line is refused where it was written.
@@ -55,6 +77,18 @@ class ScenarioError(Exception):
 	pass
 
 
+# One entry of RESTORED as the alternatives that satisfy it: mouse reporting has three forms
+# and a program turns off the one it turned on.
+def as_sequences(entry):
+	return entry if isinstance(entry, tuple) else (entry,)
+
+
+# The keys a line of text is typed as. Validation has already established that every character
+# maps, so this cannot fail here.
+def lab_keys_for_text(text, enter):
+	return lab.text_keys(text, enter)
+
+
 # One step type: the fields it requires, the fields it allows, and how it runs. Keeping the
 # table declarative is what makes validation total - a step type that is not here cannot be
 # run, and a field that is not here cannot be silently ignored.
@@ -65,6 +99,18 @@ STEP_FIELDS = {
 	'publish': {'required': ('artifact', 'file'), 'optional': ('timeout',)},
 	# Send terminal input. `text` is literal; `enter` appends a carriage return.
 	'input': {'required': ('text',), 'optional': ('enter', 'timeout')},
+	# Send key events through the emulated keyboard: `text` types a line character by character,
+	# `keys` names them one at a time (`ctrl-c`, `up`, `f1`). Unlike `input`, which reaches the
+	# console directly, this takes the path a person's keyboard takes - the device, its driver,
+	# InputService and the session - so it is what exercises any of that.
+	'key': {'required': (), 'optional': ('text', 'keys', 'enter', 'timeout')},
+	# Send a pointer event through the emulated tablet. `x` and `y` are fractions of the screen,
+	# absolute because the device is a tablet; `button` and `action` press, release or click.
+	'pointer': {'required': (), 'optional': ('x', 'y', 'button', 'action', 'timeout')},
+	# Assert the terminal was put back: each name in `expect` is one thing an interactive
+	# program turns on and has to turn off again. Asserted against the raw console bytes,
+	# because restoration is escape sequences and nothing else.
+	'restored': {'required': ('expect',), 'optional': ('timeout',)},
 	# Wait for the guest's terminal output to contain `contains`, or fail on the deadline.
 	'expect': {'required': ('contains',), 'optional': ('timeout',)},
 	# Wait for the shell prompt to come back.
@@ -160,6 +206,37 @@ def validate_step(step, index, path):
 			raise ScenarioError(f'{where} ({kind}): contains is {len(step["contains"].encode())} B, at most {MAX_PATTERN_BYTES}')
 	if kind == 'publish' and not os.path.isfile(step['file']):
 		raise ScenarioError(f'{where} (publish): no such file {step["file"]}')
+	# Key names, pointer buttons and the things a terminal restores are closed vocabularies,
+	# checked here rather than at the emulator. This is the one place where what a scenario
+	# says becomes what QEMU does, and a name passed through unchecked would be a way to run
+	# monitor commands from scenario data.
+	if kind == 'key':
+		if ('text' in step) == ('keys' in step):
+			raise ScenarioError(f'{where} (key): needs exactly one of text or keys')
+		if 'keys' in step:
+			if not isinstance(step['keys'], list) or not step['keys'] or len(step['keys']) > MAX_KEYS:
+				raise ScenarioError(f'{where} (key): keys must be a list of 1..{MAX_KEYS} names')
+			for name in step['keys']:
+				if not isinstance(name, str) or lab.key_sequence(name) is None:
+					raise ScenarioError(f'{where} (key): {name!r} is not a key this runner knows')
+		elif lab.text_keys(step['text'], step.get('enter', True)) is None:
+			raise ScenarioError(f'{where} (key): text has a character with no key mapping')
+	if kind == 'pointer':
+		for axis in ('x', 'y'):
+			if axis in step and not (isinstance(step[axis], (int, float)) and not isinstance(step[axis], bool) and 0.0 <= step[axis] <= 1.0):
+				raise ScenarioError(f'{where} (pointer): {axis} must be a fraction of the screen, 0.0 to 1.0')
+		if 'button' in step and step['button'] not in lab.POINTER_BUTTONS:
+			raise ScenarioError(f'{where} (pointer): {step["button"]!r} is not a pointer button, expected one of {sorted(lab.POINTER_BUTTONS)}')
+		if 'action' in step and step['action'] not in ('press', 'release', 'click'):
+			raise ScenarioError(f'{where} (pointer): action must be press, release or click')
+		if 'x' not in step and 'y' not in step and 'button' not in step:
+			raise ScenarioError(f'{where} (pointer): needs a position, a button, or both')
+	if kind == 'restored':
+		if not isinstance(step['expect'], list) or not step['expect']:
+			raise ScenarioError(f'{where} (restored): expect must be a non-empty list')
+		for name in step['expect']:
+			if name not in RESTORED:
+				raise ScenarioError(f'{where} (restored): {name!r} is not restorable state, expected one of {sorted(RESTORED)}')
 	if 'args' in step and len(step['args'].encode()) > MAX_ARGS_BYTES:
 		raise ScenarioError(f'{where} ({kind}): args is {len(step["args"].encode())} B, at most {MAX_ARGS_BYTES}')
 	if kind == 'launch' and not PROGRAM_NAME.fullmatch(step['program']):
@@ -186,6 +263,11 @@ class Guest:
 	# Everything printed since `mark`, without consuming it.
 	def output_since(self, mark):
 		return self.lab.serial_since(mark)
+
+	# The same, with the escape sequences left in, which is the only way to see a terminal
+	# being put back.
+	def raw_since(self, mark):
+		return self.lab.serial_raw_since(mark)
 
 	def mark(self):
 		return self.lab.serial_size()
@@ -218,6 +300,27 @@ def run_step(step, guest, lab, limit, index):
 	elif kind == 'input':
 		if not lab.type_text(step['text'], step.get('enter', True), int(limit)):
 			raise ScenarioError(f'{where}: the guest console refused the input')
+	elif kind == 'key':
+		keys = step['keys'] if 'keys' in step else lab_keys_for_text(step['text'], step.get('enter', True))
+		if not lab.send_keys(keys):
+			raise ScenarioError(f'{where}: the emulated keyboard refused the events')
+	elif kind == 'pointer':
+		if not lab.send_pointer(step.get('x'), step.get('y'), step.get('button'), step.get('action', 'click')):
+			raise ScenarioError(f'{where}: the emulated tablet refused the event')
+	elif kind == 'restored':
+		# Watched rather than sampled: the program is exiting while this runs, and its restore
+		# sequences arrive in the order it writes them, not all at once.
+		mark = guest.at
+		end = time.monotonic() + limit
+		missing = list(step['expect'])
+		while missing and time.monotonic() < end:
+			raw = guest.raw_since(mark)
+			missing = [name for name in missing if not any(sequence in raw for sequence in as_sequences(RESTORED[name]))]
+			if missing:
+				time.sleep(0.2)
+		if missing:
+			raise ScenarioError(f'{where}: the terminal did not restore {", ".join(missing)} within {int(limit)} s')
+		guest.at = guest.mark()
 	elif kind == 'reset':
 		if not lab.reset(int(limit)):
 			raise ScenarioError(f'{where}: reset failed')

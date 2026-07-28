@@ -76,6 +76,9 @@ Persistent development instance (one owner at a time):
   dev-rollback <name>   return an artifact to the generation before its newest
   dev-type [--no-enter] <text...>  type into the guest terminal, with a byte count back
   dev-reset             drop the guest development state (not a reboot)
+  dev-restart           replace the development agent, keeping the guest running
+  dev-key <key|chord>... | --text <line>  key events through the emulated keyboard
+  dev-pointer [--x F] [--y F] [--press|--release|--click] [button]  pointer events
   dev-scenario [--verbose] <file.toml>...  run declarative application scenarios
   dev-launch <program> [args...]  launch a program through PermissionManager, print output
   dev-down              stop it gracefully and release the lock"""
@@ -90,6 +93,7 @@ CTL_SOCK = os.path.join(BUILD, 'lab-ctl.sock')
 SERIAL_LOG = os.path.join(BUILD, 'lab-serial.log')
 QEMU_LOG = os.path.join(BUILD, 'lab-qemu.log')
 MON_SOCK = os.path.join(BUILD, 'qemu-monitor.sock')
+QMP_SOCK = os.path.join(BUILD, 'qemu-qmp.sock')
 PCAP = os.path.join(BUILD, 'lab.pcap')
 VOLUME_IMG = os.path.join(BUILD, 'virtio-blk.img')
 USB_IMG = os.path.join(BUILD, 'usb-media.img')
@@ -132,12 +136,19 @@ def serial_size():
 
 
 def serial_since(at):
+	return strip_ansi(serial_raw_since(at)).decode(errors='replace')
+
+
+# The same bytes with nothing removed. Terminal restoration is asserted here and nowhere else:
+# putting a terminal back is escape sequences and only escape sequences, so the reader that
+# strips them cannot see whether it happened.
+def serial_raw_since(at):
 	try:
 		with open(DEV_SERIAL_LOG, 'rb') as handle:
 			handle.seek(at)
-			return strip_ansi(handle.read()).decode(errors='replace')
+			return handle.read()
 	except OSError:
-		return ''
+		return b''
 
 
 def strip_ansi(data):
@@ -1555,6 +1566,25 @@ class LabGuest:
 	def serial_since(self, at):
 		return serial_since(at)
 
+	def serial_raw_since(self, at):
+		return serial_raw_since(at)
+
+	# Key and pointer events go through the emulated devices rather than the control protocol,
+	# so a scenario that sends them exercises the input stack the way a person does: the device,
+	# its driver, InputService, the session and the foreground program. Typed input over the
+	# protocol reaches the console directly and proves none of that.
+	def send_keys(self, keys):
+		try:
+			return send_keys(keys)
+		except SystemExit:
+			return False
+
+	def send_pointer(self, x, y, button, action):
+		try:
+			return send_pointer(x, y, button, action)
+		except SystemExit:
+			return False
+
 	def wait_prompt(self, timeout):
 		try:
 			return has_prompt(ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)[-256:])
@@ -1740,20 +1770,187 @@ def cmd_log(args):
 # through (uppercase via shift-), so only the specials are listed.
 KEYMAP = {' ': 'spc', '.': 'dot', ',': 'comma', '-': 'minus', '/': 'slash', ':': 'shift-semicolon', ';': 'semicolon', '_': 'shift-minus', '=': 'equal', '\n': 'ret'}
 
+# The key names a scenario or a command may name directly, beyond letters and digits. A fixed
+# vocabulary rather than a string handed through to QEMU: this is the one place where what a
+# scenario says becomes what the emulator does, and an open channel there would be a way to
+# run monitor commands from scenario data.
+KEY_NAMES = frozenset(list(KEYMAP.values()) + ['ret', 'esc', 'tab', 'spc', 'backspace', 'delete', 'insert', 'home', 'end', 'pgup', 'pgdn', 'up', 'down', 'left', 'right'] + [f'f{index}' for index in range(1, 13)])
+MODIFIERS = frozenset(['ctrl', 'alt', 'shift'])
+# The pointer buttons QEMU knows, and the only ones a scenario may name.
+POINTER_BUTTONS = frozenset(['left', 'middle', 'right', 'wheel-up', 'wheel-down'])
+# The absolute axis range QEMU's input layer uses, whatever the guest's resolution is. A
+# scenario names a fraction of the screen, which is the only thing it can know without being
+# told the mode the guest happens to be in.
+ABSOLUTE_RANGE = 32767
+
+
+# One key name, validated. A chord is modifiers and one key joined by dashes, which is the
+# form the monitor already takes.
+def key_sequence(name):
+	parts = name.split('-')
+	key = parts[-1]
+	if not parts or any(part not in MODIFIERS for part in parts[:-1]):
+		return None
+	if len(key) == 1 and (key.isalpha() or key.isdigit()):
+		return name.lower()
+	return name if key in KEY_NAMES else None
+
+
+# The keys one line of text is typed as, or None when a character has no mapping. Typed as key
+# events rather than written into the console: this is the path a person's keyboard takes -
+# through the emulated device, the driver, InputService and the session - and the only way a
+# scenario exercises any of it.
+def text_keys(text, enter):
+	keys = []
+	for character in text + ('\n' if enter else ''):
+		if character.isalpha():
+			keys.append(f'shift-{character.lower()}' if character.isupper() else character)
+		elif character.isdigit():
+			keys.append(character)
+		elif character in KEYMAP:
+			keys.append(KEYMAP[character])
+		else:
+			return None
+	return keys
+
+
+# QMP, for the input events the human monitor has no command for. The greeting has to be read
+# and capabilities negotiated before anything is accepted, so a connection is made per batch
+# rather than kept: these are rare, and a socket held open across a guest restart would be a
+# thing to invalidate.
+def qmp_command(execute, arguments=None, timeout=5):
+	if not os.path.exists(QMP_SOCK):
+		die('no QEMU QMP socket (is the instance up?)')
+	conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+	conn.settimeout(timeout)
+	buffer = bytearray()
+
+	def reply():
+		while b'\n' not in buffer:
+			more = conn.recv(65536)
+			if not more:
+				die('the QEMU QMP socket closed')
+			buffer.extend(more)
+		line, _, rest = bytes(buffer).partition(b'\n')
+		buffer[:] = rest
+		return json.loads(line)
+
+	try:
+		conn.connect(QMP_SOCK)
+		reply()
+		conn.sendall(json.dumps({'execute': 'qmp_capabilities'}).encode() + b'\n')
+		reply()
+		request = {'execute': execute}
+		if arguments is not None:
+			request['arguments'] = arguments
+		conn.sendall(json.dumps(request).encode() + b'\n')
+		answer = reply()
+		if 'error' in answer:
+			die(f'QMP {execute} refused: {answer["error"].get("desc", answer["error"])}')
+		return answer.get('return')
+	finally:
+		conn.close()
+
+
+# Send key events into the guest through the emulated keyboard.
+def send_keys(keys):
+	for name in keys:
+		sequence = key_sequence(name)
+		if sequence is None:
+			die(f'no key named {name!r}')
+		monitor_command(f'sendkey {sequence}')
+		# The guest's line discipline is a real one: keys arriving faster than it drains lose
+		# nothing, but pacing them keeps a burst from being one indistinguishable event.
+		time.sleep(0.05)
+	return True
+
+
+# Send pointer events into the guest through the emulated tablet. `x` and `y` are fractions of
+# the screen, absolute because the device is a tablet; a button is pressed and released as one
+# event batch, which is what a click is.
+def send_pointer(x=None, y=None, button=None, action='click'):
+	events = []
+	if x is not None:
+		events.append({'type': 'abs', 'data': {'axis': 'x', 'value': int(max(0.0, min(1.0, x)) * ABSOLUTE_RANGE)}})
+	if y is not None:
+		events.append({'type': 'abs', 'data': {'axis': 'y', 'value': int(max(0.0, min(1.0, y)) * ABSOLUTE_RANGE)}})
+	if button is not None:
+		if button not in POINTER_BUTTONS:
+			die(f'no pointer button named {button!r}')
+		if action in ('press', 'click'):
+			events.append({'type': 'btn', 'data': {'down': True, 'button': button}})
+		if action in ('release', 'click'):
+			events.append({'type': 'btn', 'data': {'down': False, 'button': button}})
+	if not events:
+		die('a pointer event needs a position, a button, or both')
+	qmp_command('input-send-event', {'events': events})
+	return True
+
+
+# Named keys and chords, or a line of text with `--text`. The two are separate spellings
+# because they are separate things: `ctrl-c` is one event and `ls -l` is nine, and guessing
+# which was meant from what a word looks like would eventually guess wrong.
+def cmd_dev_key(args):
+	if '--text' in args:
+		text = ' '.join(args[args.index('--text') + 1:])
+		keys = text_keys(text, '--no-enter' not in args)
+		if keys is None:
+			die(f'no key mapping for one of the characters in {text!r}')
+	else:
+		keys = [argument for argument in args if not argument.startswith('--')]
+		if not keys:
+			die('usage: dev-key <key|chord>...   or   dev-key --text <line>   e.g. `dev-key ctrl-c up ret`')
+	send_keys(keys)
+	print(f'lab: sent {len(keys)} key event(s) through the emulated keyboard')
+
+
+def cmd_dev_pointer(args):
+	x, rest = take_fraction(args, '--x')
+	y, rest = take_fraction(rest, '--y')
+	action = 'click'
+	for name in ('press', 'release', 'click'):
+		if f'--{name}' in rest:
+			action = name
+	button = next((argument for argument in rest if not argument.startswith('--')), None)
+	if x is None and y is None and button is None:
+		die('usage: dev-pointer [--x FRACTION] [--y FRACTION] [--press|--release|--click] [button]')
+	send_pointer(x, y, button, action)
+	print('lab: sent a pointer event through the emulated tablet')
+
+
+# A screen fraction option, kept apart from `take_arg` because that one parses integers and a
+# position here is 0.0 to 1.0.
+def take_fraction(args, name):
+	value, rest, skip = None, [], False
+	for index, argument in enumerate(args):
+		if skip:
+			skip = False
+			continue
+		if argument == name and index + 1 < len(args):
+			value, skip = argument_fraction(args[index + 1], name), True
+		elif argument.startswith(name + '='):
+			value = argument_fraction(argument.split('=', 1)[1], name)
+		else:
+			rest.append(argument)
+	return value, rest
+
+
+def argument_fraction(text, name):
+	try:
+		value = float(text)
+	except ValueError:
+		die(f'{name} takes a fraction of the screen, 0.0 to 1.0, not {text!r}')
+	if not 0.0 <= value <= 1.0:
+		die(f'{name} is {value}; a fraction of the screen is 0.0 to 1.0')
+	return value
+
 
 def cmd_key(args):
 	text = ' '.join(args)
-	for ch in text + '\n':
-		if ch.isalpha():
-			key = f'shift-{ch.lower()}' if ch.isupper() else ch
-		elif ch.isdigit():
-			key = ch
-		elif ch in KEYMAP:
-			key = KEYMAP[ch]
-		else:
-			die(f'no sendkey mapping for {ch!r}')
-		monitor_command(f'sendkey {key}')
-		time.sleep(0.05)
+	keys = text_keys(text, True)
+	if keys is None:
+		die(f'no sendkey mapping for one of the characters in {text!r}')
+	send_keys(keys)
 
 
 def monitor_command(command):
@@ -1936,7 +2133,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-down': cmd_dev_down}
 
 
 def main():
