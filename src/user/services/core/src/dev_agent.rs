@@ -40,8 +40,12 @@ use crate::dev_protocol::{HEADER_LEN, MAGIC, MAX_PAYLOAD, PARTIAL_FRAME_TICKS, S
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		let mut buf: [u8; 32] = [0u8; 32];
-		let bytes: u64 = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => handle,
+		// The wire, and with it the boot's identity. The identity travels in the same message
+		// because it is not this program's to draw: this program can be replaced without the
+		// guest restarting, and a value drawn here would tell every tool the guest had rebooted
+		// each time its agent did.
+		let (bytes, nonce): (u64, [u8; 8]) = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if handle != 0 && len >= 13 && &buf[..5] == b"BYTES" => (handle, buf[5..13].try_into().unwrap_or([0u8; 8])),
 			_ => exit(),
 		};
 		// The volume client the installed artifacts are read through, so a published
@@ -50,7 +54,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// which is honest, where assuming compatibility would not be.
 		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or(0);
 		send_blocking(bootstrap, b"agent.dev: online (registry)", 0);
-		serve(bytes, bootstrap, storage)
+		serve(bytes, bootstrap, storage, nonce)
 	}
 }
 
@@ -82,9 +86,9 @@ impl Sink for ChannelSink {
 
 // Serve the session: take whatever the driver forwarded, hand it to the protocol, and block
 // until either more arrives or one of the session's deadlines comes due.
-unsafe fn serve(channel: u64, bootstrap: u64, storage: u64) -> ! {
+unsafe fn serve(channel: u64, bootstrap: u64, storage: u64, nonce: [u8; 8]) -> ! {
 	unsafe {
-		let mut session: Session = Session::new(storage);
+		let mut session: Session = Session::new(storage, nonce);
 		let mut sink: ChannelSink = ChannelSink { channel, frame: Vec::with_capacity(HEADER_LEN + MAX_PAYLOAD) };
 		let mut pending: Vec<u8> = Vec::with_capacity(HEADER_LEN + MAX_PAYLOAD);
 		// Two of the three deadlines; the third, the open publication's, belongs to the
@@ -120,6 +124,13 @@ unsafe fn serve(channel: u64, bootstrap: u64, storage: u64) -> ! {
 				if !session.consume(&mut pending, &mut sink) {
 					session.close();
 					pending.clear();
+				}
+				// A host asked for a fresh agent. The acknowledgement is already queued in the
+				// driver's channel, and a queued message outlives the sender, so leaving now is
+				// what the host asked for rather than a reply it never gets. DeviceManager holds
+				// this bootstrap and starts the replacement when it closes.
+				if session.restart_requested() {
+					exit();
 				}
 			}
 			if arrived {

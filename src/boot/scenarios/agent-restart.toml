@@ -1,0 +1,95 @@
+# The development agent can be replaced while the guest keeps running, and its replacement is
+# as capable as the one it replaced.
+#
+# Three claims, in order. The registry goes with the old agent: it lived in that process's
+# memory, so a published generation stops shadowing anything the moment the process ends -
+# that is what a restart means, and it is why there is a `reset` for the smaller thing. The
+# replacement can publish again, and what it publishes resolves at the next launch, which is
+# only true if the resolution channel reached it - a capability delivered once, before this
+# agent existed, and held by its supervisor precisely so it could be delivered again. And it
+# can launch a program, which is the same claim about the launcher.
+#
+# The port, its driver and the instance are untouched throughout. The driver keeps its device
+# and waits for the channel its new agent is listening on rather than going down with the
+# process it was serving, which is the whole reason this is survivable.
+version = 1
+name = "agent restart"
+description = "The development agent is replaced while the guest runs, and the replacement is as capable as the one before it."
+timeout = 240
+
+[[step]]
+do = "reset"
+
+# Clear the line editor before typing anything, in case an earlier scenario left characters in
+# the buffer.
+[[step]]
+do = "input"
+text = "\u0003"
+enter = false
+
+[[step]]
+do = "prompt"
+
+[[step]]
+do = "publish"
+artifact = "uname"
+file = "../.build/scenario-fixtures/uname-shadow"
+timeout = 60
+
+[[step]]
+do = "input"
+text = "uname"
+
+[[step]]
+do = "expect"
+contains = "SHADOWEDsys"
+timeout = 20
+
+[[step]]
+do = "restart"
+timeout = 60
+
+# The generation went with the agent that held it, so the installed artifact is what launches.
+[[step]]
+do = "input"
+text = "uname"
+
+[[step]]
+do = "expect"
+contains = "LiberSystem"
+timeout = 20
+
+# The replacement holds a registry of its own, and ProcessService reaches it: the resolution
+# channel was delivered a second time, to a process that did not exist when it first arrived.
+[[step]]
+do = "publish"
+artifact = "uname"
+file = "../.build/scenario-fixtures/uname-shadow"
+timeout = 60
+
+[[step]]
+do = "input"
+text = "uname"
+
+[[step]]
+do = "expect"
+contains = "SHADOWEDsys"
+timeout = 20
+
+# And it can launch, which is the same claim about the launcher.
+[[step]]
+do = "launch"
+program = "uname"
+timeout = 60
+
+[[step]]
+do = "output"
+contains = "LiberSystem"
+timeout = 30
+
+[[step]]
+do = "finished"
+timeout = 30
+
+[[step]]
+do = "reset"

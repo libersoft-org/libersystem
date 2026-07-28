@@ -122,6 +122,24 @@ ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
 
 
+# The instance's console output, as a file the broker appends to. Reading it is how anything
+# here watches the guest say something without taking the console away from whoever has it.
+def serial_size():
+	try:
+		return os.path.getsize(DEV_SERIAL_LOG)
+	except OSError:
+		return 0
+
+
+def serial_since(at):
+	try:
+		with open(DEV_SERIAL_LOG, 'rb') as handle:
+			handle.seek(at)
+			return strip_ansi(handle.read()).decode(errors='replace')
+	except OSError:
+		return ''
+
+
 def strip_ansi(data):
 	return ANSI.sub(b'', data)
 
@@ -1017,6 +1035,8 @@ OP_TERM_INPUT = 0x20
 OP_TERM_ACK = 0x21
 OP_RESET = 0x22
 OP_RESET_ACK = 0x23
+OP_RESTART = 0x24
+OP_RESTART_ACK = 0x25
 OP_ERROR = 0xff
 
 # Each rejection the guest can name. They exist so a failure is explained by the frame that
@@ -1351,6 +1371,55 @@ def cmd_dev_reset(args):
 		sock.close()
 
 
+# Replace the guest's development agent with a fresh one. Everything the old one held goes
+# with it - the registry included - and the guest keeps running: the port, its driver and the
+# instance are untouched, and the supervisor that started the agent starts the next one.
+#
+# The wait afterwards is the operation, not politeness about it. The acknowledgement means the
+# old agent accepted the request, not that a new one is serving; a caller that returned there
+# would hand the next command to a port with nobody behind it yet. So this asks for a
+# handshake until one answers, which is exactly the condition the caller cares about.
+def cmd_dev_restart(args):
+	timeout = arg_value(args, '--timeout', 30)
+	seen_at = serial_size()
+	sock, buffer, _ = proto_session(timeout)
+	try:
+		opcode, _, body = proto_request(sock, buffer, 2, OP_RESTART, timeout=timeout, what='restart')
+		if opcode != OP_RESTART_ACK or len(body) < 2:
+			die(f'restart answered with opcode {opcode:#04x} and {len(body)} B')
+		print(f'lab: the agent is ending, dropping {struct.unpack("<H", body[:2])[0]} generation(s)')
+	finally:
+		sock.close()
+	started = time.monotonic()
+	deadline = started + timeout
+	# Wait for the replacement to say so on the console before writing a byte to the port.
+	# Asking instead would cost several seconds rather than save any: the driver discards what
+	# arrives while it has no agent, so a handshake written into that window is split across it,
+	# the tail reaches the fresh agent as the beginning of a frame, and the stream only clears
+	# when the fragment deadline expires - which a caller retrying faster than that deadline
+	# keeps restarting. The supervisor prints the agent's own report when it starts, so the
+	# readiness signal already exists and costs nothing to watch.
+	at = seen_at
+	while time.monotonic() < deadline:
+		if 'agent.dev: online' in serial_since(at):
+			break
+		time.sleep(0.1)
+	else:
+		die(f'no replacement agent reported in within {timeout} s of the restart')
+	while time.monotonic() < deadline:
+		try:
+			ready, _, _ = proto_session(min(3, max(1, int(deadline - time.monotonic()))), announce=False)
+			ready.close()
+			print(f'lab: a fresh agent is serving after {(time.monotonic() - started) * 1000:.0f} ms, with an empty registry')
+			return
+		except SystemExit:
+			# Reported in but not yet reading the port, which is a moment, not a state. Backing
+			# off further than the guest's own fragment deadline keeps a failed attempt from
+			# being what makes the next one fail.
+			time.sleep(2.5)
+	die(f'no agent answered within {timeout} s of the restart')
+
+
 # Read the registry: every artifact, and the generations retained for it. The newest
 # generation of each is what currently shadows the system volume, which is the thing worth
 # seeing at a glance - a forgotten override is a fix that appears not to have worked.
@@ -1481,18 +1550,10 @@ class LabGuest:
 		self.timeout = timeout
 
 	def serial_size(self):
-		try:
-			return os.path.getsize(DEV_SERIAL_LOG)
-		except OSError:
-			return 0
+		return serial_size()
 
 	def serial_since(self, at):
-		try:
-			with open(DEV_SERIAL_LOG, 'rb') as handle:
-				handle.seek(at)
-				return strip_ansi(handle.read()).decode(errors='replace')
-		except OSError:
-			return ''
+		return serial_since(at)
 
 	def wait_prompt(self, timeout):
 		try:
@@ -1550,6 +1611,9 @@ class LabGuest:
 
 	def reset(self, timeout):
 		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-reset', '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
+
+	def restart(self, timeout):
+		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-restart', '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
 
 
 def cmd_dev_scenario(args):
@@ -1872,7 +1936,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-scenario': cmd_dev_scenario, 'dev-launch': cmd_dev_launch, 'dev-down': cmd_dev_down}
 
 
 def main():

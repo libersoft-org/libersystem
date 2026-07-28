@@ -32,6 +32,7 @@ use proto::system::process::{self, Service};
 use proto::system::volume;
 use proto::system::{Error, OpenOpts, ProcessInfo, StartResult};
 use rt::*;
+use services::REGISTRY_ANNOUNCEMENT;
 use services::executable;
 use services::graph_limits;
 
@@ -489,6 +490,11 @@ unsafe fn registry_generation(registry: &mut u64, artifact: &str) -> Option<Vec<
 		loop {
 			if channel_peek(handle) >= 0 {
 				return match recv_vec_blocking(handle) {
+					// A replacement agent announcing itself, which can land in the middle of a
+					// query because an agent can be restarted at any moment. It is not an answer
+					// and must not be read as one: a five-byte image would fail to parse and take
+					// the launch down with it. Keep waiting for the real reply instead.
+					ReceivedVec::Message { bytes, .. } if bytes == REGISTRY_ANNOUNCEMENT => continue,
 					ReceivedVec::Message { bytes, .. } if !bytes.is_empty() => Some(bytes),
 					ReceivedVec::Message { .. } => None,
 					ReceivedVec::Closed => {

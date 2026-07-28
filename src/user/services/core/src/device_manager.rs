@@ -38,6 +38,136 @@ const DEV_CHANNEL_BUS: u8 = 0;
 #[cfg(feature = "development")]
 const DEV_CHANNEL_DEV: u8 = 0x1e;
 
+// Everything this program holds on behalf of the development agent, so supervising it is one
+// value rather than five more out-parameters threaded through driver launching.
+//
+// DeviceManager supervises the agent because DeviceManager started it: it exists exactly when
+// the development channel device does, and nothing else in the system knows that. The agent
+// dying is survivable, and this is what makes it so - without a supervisor its death would
+// take the port with it, since the driver has nobody to hand bytes to and no way to acquire
+// another.
+//
+// In a shipping build none of this is reachable: the device is not bound, no agent is
+// started, and the capabilities below are never delivered.
+#[cfg_attr(not(feature = "development"), allow(dead_code))]
+#[derive(Default)]
+struct DevAgent {
+	// The agent's bootstrap. It is both how capabilities reach the agent and how this program
+	// learns the agent is gone: it closes when the process ends, however it ended.
+	bootstrap: u64,
+	// The transport driver's bootstrap, over which a replacement agent's wire is handed down.
+	// The driver keeps its device and its port across the gap and waits for that message.
+	driver: u64,
+	// A volume client of this program's own, kept past driver bring-up. The connection the
+	// drivers were read through belongs to ServiceManager's message and is closed with it,
+	// and a replacement has to be read off the volume long after that.
+	storage: u64,
+	// The capabilities delivered once, after the first agent was already running. They are
+	// retained rather than forwarded and forgotten, because a replacement that could neither
+	// launch a program nor answer a resolution query would be an agent in name only - and
+	// nothing would deliver them a second time.
+	launcher: u64,
+	registry: u64,
+	// The value every handshake reports so a tool can tell which boot answered it. It is drawn
+	// here, once, and handed to each agent: it identifies the boot, and this program is what
+	// lives as long as the boot does. An agent drawing its own would announce a reboot that did
+	// not happen every time it was replaced.
+	nonce: [u8; 8],
+}
+
+impl DevAgent {
+	// Retain a capability and pass the live agent a copy of it. A copy rather than the handle
+	// itself: this program has to be able to give the same capability to the next agent, and
+	// only one agent is ever alive to use it.
+	unsafe fn deliver(&self, tag: &[u8], held: u64) {
+		unsafe {
+			if self.bootstrap == 0 || held == 0 {
+				return;
+			}
+			let Some(info) = object_info(held) else { return };
+			let copy: i64 = duplicate(held, info.rights);
+			if copy < 0 || !send_blocking(self.bootstrap, tag, copy as u64) {
+				if copy >= 0 {
+					close(copy as u64);
+				}
+				print(b"DeviceManager: the development agent did not take ");
+				print(tag);
+				print(b"\n");
+			}
+		}
+	}
+
+	unsafe fn hold_launcher(&mut self, handle: u64) {
+		unsafe {
+			if handle == 0 {
+				return;
+			}
+			if self.bootstrap == 0 {
+				close(handle);
+				return;
+			}
+			self.launcher = handle;
+			self.deliver(b"PERM", handle);
+		}
+	}
+
+	unsafe fn hold_registry(&mut self, handle: u64) {
+		unsafe {
+			if handle == 0 {
+				return;
+			}
+			if self.bootstrap == 0 {
+				close(handle);
+				return;
+			}
+			self.registry = handle;
+			self.deliver(b"REG", handle);
+		}
+	}
+
+	// The agent's bootstrap became readable. Anything it says is passed through to the console;
+	// its closing means the process ended, and a fresh one takes its place.
+	#[cfg(feature = "development")]
+	unsafe fn supervise(&mut self, buf: &mut [u8]) {
+		unsafe {
+			match recv_blocking(self.bootstrap, buf) {
+				Received::Message { len, .. } => {
+					print(&buf[..len]);
+					print(b"\n");
+				}
+				Received::Closed => self.restart(),
+			}
+		}
+	}
+
+	// Start a replacement and give it everything the one before it had, except what it held:
+	// the registry was in the dead process's memory and is gone, which is the whole meaning of
+	// a restart. A failure at any step leaves the port transport-only rather than half-wired,
+	// and says so.
+	#[cfg(feature = "development")]
+	unsafe fn restart(&mut self) {
+		unsafe {
+			close(self.bootstrap);
+			self.bootstrap = 0;
+			if self.driver == 0 || self.storage == 0 {
+				return;
+			}
+			let Some((driver_side, agent_side)) = channel() else { return };
+			// The agent is started before the driver is told, so a start that fails leaves the
+			// driver waiting for a channel that will be offered again rather than holding one
+			// whose other end never appears.
+			self.bootstrap = start_dev_agent(self.storage, agent_side, &self.nonce);
+			if self.bootstrap == 0 || !send_blocking(self.driver, b"BYTES", driver_side) {
+				close(driver_side);
+				print(b"DeviceManager: the development agent did not restart; the control channel is transport-only\n");
+				return;
+			}
+			self.deliver(b"PERM", self.launcher);
+			self.deliver(b"REG", self.registry);
+		}
+	}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -63,9 +193,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut usbq_client: u64 = 0;
 		let mut usb_pointer: u64 = 0;
 		let mut raw_keys: u64 = 0;
-		// The development agent's bootstrap, kept so the launcher can be handed to it once
-		// PermissionManager exists - which is after this program has finished starting drivers.
-		let mut dev_agent: u64 = 0;
+		// What this program holds on behalf of the development agent: its bootstrap, so the
+		// launcher can be handed to it once PermissionManager exists - which is after this
+		// program has finished starting drivers - and so its death is noticed and answered.
+		let mut dev: DevAgent = DevAgent::default();
 		launch_boot_drivers(&package, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
@@ -83,9 +214,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    from vol://system/drivers/ and hand their channels up) or asks us to stop (which
 		//    also drops the driver channels, so the drivers shut down with us).
 		loop {
+			// The development agent's bootstrap is watched alongside ServiceManager's. Its
+			// closing is how this program learns the agent died, and answering that is this
+			// program's job because this program is what started it.
+			#[cfg(feature = "development")]
+			if dev.bootstrap != 0 && wait_any(&[bootstrap, dev.bootstrap], 0) == 1 {
+				dev.supervise(&mut buf);
+				continue;
+			}
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
-					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev_agent);
+					launch_volume_drivers(handle, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
 					if handle != 0 {
 						close(handle);
 					}
@@ -103,23 +242,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// The development agent's launcher, delivered once PermissionManager is up.
 				// Forwarded rather than held: this program has no use for it, and the agent
 				// could not have been given one when it started.
-				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DEVPERM" => {
-					if dev_agent != 0 && handle != 0 {
-						send_blocking(dev_agent, b"PERM", handle);
-					} else if handle != 0 {
-						close(handle);
-					}
-				}
+				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DEVPERM" => dev.hold_launcher(handle),
 				// The other end of the channel ProcessService already holds, so a launch can
 				// ask the registry whether it has a generation of the artifact it is about to
 				// read off the volume.
-				Received::Message { len, handle } if len >= 6 && &buf[..6] == b"DEVREG" => {
-					if dev_agent != 0 && handle != 0 {
-						send_blocking(dev_agent, b"REG", handle);
-					} else if handle != 0 {
-						close(handle);
-					}
-				}
+				Received::Message { len, handle } if len >= 6 && &buf[..6] == b"DEVREG" => dev.hold_registry(handle),
 				Received::Message { .. } => {
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
 					break;
@@ -188,7 +315,7 @@ unsafe fn launch_boot_drivers(package: &Package, buf: &mut [u8], block_client: &
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg_attr(not(feature = "development"), allow(unused_variables))] dev_agent: &mut u64) {
+unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg_attr(not(feature = "development"), allow(unused_variables))] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -252,8 +379,15 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 				// so it is started where that device is bound, and nowhere else.
 				#[cfg(feature = "development")]
 				if driver_name == b"dev_channel" && handle != 0 {
-					*dev_agent = start_dev_agent(storage, handle);
-					if *dev_agent == 0 {
+					// The driver's bootstrap is kept rather than left to leak, because a
+					// replacement agent's wire is handed down over it; and a volume connection of
+					// this program's own is opened, because the one these drivers were read
+					// through is closed as soon as this function returns.
+					dev.driver = dm_chan;
+					dev.storage = service_connect(storage).unwrap_or(0);
+					random_get(&mut dev.nonce);
+					dev.bootstrap = start_dev_agent(dev.storage, handle, &dev.nonce);
+					if dev.bootstrap == 0 {
 						print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
 					}
 				}
@@ -298,7 +432,7 @@ unsafe fn launch_volume_drivers(storage: u64, buf: &mut [u8], net_client: &mut u
 // a failure to start is reported rather than retried - a development instance without its
 // agent is still a usable guest, just one whose control channel carries nothing.
 #[cfg(feature = "development")]
-unsafe fn start_dev_agent(storage: u64, bytes: u64) -> u64 {
+unsafe fn start_dev_agent(storage: u64, bytes: u64, nonce: &[u8; 8]) -> u64 {
 	unsafe {
 		let loaded: Option<(u64, u64, usize)> = read_driver(storage, b"dev_agent");
 		let (file, mapped, size): (u64, u64, usize) = match loaded {
@@ -321,7 +455,12 @@ unsafe fn start_dev_agent(storage: u64, bytes: u64) -> u64 {
 		let started: bool = spawn(elf, agent_side) >= 0;
 		unmap_object(file);
 		close(file);
-		if !started || !send_blocking(dm_side, b"BYTES", bytes) {
+		// The wire and the boot's identity in one message: the identity is not the agent's to
+		// draw, since it outlives any one agent, and one message leaves no order to get wrong.
+		let mut opening: [u8; 13] = [0u8; 13];
+		opening[..5].copy_from_slice(b"BYTES");
+		opening[5..].copy_from_slice(nonce);
+		if !started || !send_blocking(dm_side, &opening, bytes) {
 			return 0;
 		}
 		// A volume connection of its own, so the agent can read the installed artifact a

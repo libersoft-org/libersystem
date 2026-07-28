@@ -74,6 +74,11 @@ STEP_FIELDS = {
 	'absent': {'required': ('contains',), 'optional': ('timeout',)},
 	# Drop the guest's development state: the artifact registry and any open candidate.
 	'reset': {'required': (), 'optional': ('timeout',)},
+	# Replace the guest's development agent with a fresh one and wait until it serves. Larger
+	# than `reset` in what it costs and identical in what a scenario sees afterwards, which is
+	# the point of having both: what follows this step is asserting that a replacement is as
+	# capable as the agent it replaced.
+	'restart': {'required': (), 'optional': ('timeout',)},
 	# Launch a canonical program through PermissionManager. `program` names it, `args` and
 	# `cwd` are separate typed fields - never concatenated into anything an interpreter would
 	# parse - and the component gets exactly its installed manifest's grants.
@@ -216,6 +221,9 @@ def run_step(step, guest, lab, limit, index):
 	elif kind == 'reset':
 		if not lab.reset(int(limit)):
 			raise ScenarioError(f'{where}: reset failed')
+	elif kind == 'restart':
+		if not lab.restart(int(limit)):
+			raise ScenarioError(f'{where}: the development agent did not restart')
 	elif kind == 'prompt':
 		if not lab.wait_prompt(int(limit)):
 			raise ScenarioError(f'{where}: no shell prompt within {int(limit)} s')

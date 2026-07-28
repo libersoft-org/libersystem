@@ -104,7 +104,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		send_blocking(bootstrap, b"driver.dev-channel: online (transport)", bytes_far);
 		let mut port: Port = Port { device: &device, irq, tx: &mut tx, virt: tx_virt, phys: tx_phys, busy: false };
-		pump(&device, irq, bytes, &mut rx, &mut port, rx_virt, &rx_phys)
+		pump(&device, irq, bootstrap, bytes, &mut rx, &mut port, rx_virt, &rx_phys)
 	}
 }
 
@@ -182,9 +182,10 @@ impl Port<'_> {
 // after one. Both queues share the device's single MSI-X vector, so the wait inside a
 // transmit drain can consume the very interrupt that announced newly arrived bytes; draining
 // first means the loop never blocks while work is already queued, whichever wait observed it.
-unsafe fn pump(device: &Virtio, irq: u64, bytes: u64, rx: &mut Queue, port: &mut Port, rx_virt: u64, rx_phys: &[u64]) -> ! {
+unsafe fn pump(device: &Virtio, irq: u64, bootstrap: u64, bytes: u64, rx: &mut Queue, port: &mut Port, rx_virt: u64, rx_phys: &[u64]) -> ! {
 	unsafe {
 		let mut outbound: Vec<u8> = alloc::vec![0u8; MAX_FRAME];
+		let mut bytes: u64 = bytes;
 		loop {
 			let mut worked: bool = false;
 			// Port to agent.
@@ -192,10 +193,12 @@ unsafe fn pump(device: &Virtio, irq: u64, bytes: u64, rx: &mut Queue, port: &mut
 				if id < RX_SLOTS && len > 0 {
 					let n: usize = if len as u64 > RX_SLOT { RX_SLOT as usize } else { len as usize };
 					let chunk: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * RX_SLOT) as *const u8, n);
-					// The agent going away leaves the port with nobody above it, which is not
-					// something this driver can serve around.
+					// The agent going away leaves the port with nobody above it. The port itself
+					// is fine, so this driver waits for the replacement rather than taking the
+					// device down with the process that was using it - the bytes in flight are
+					// lost with the session they belonged to, which is what a disconnect means.
 					if !send_blocking(bytes, chunk, 0) {
-						exit();
+						bytes = adopt(device, irq, bootstrap, bytes, rx, rx_phys);
 					}
 					worked = true;
 				}
@@ -209,15 +212,24 @@ unsafe fn pump(device: &Virtio, irq: u64, bytes: u64, rx: &mut Queue, port: &mut
 			// failed. Empty is unambiguous because every frame is at least a header long, and
 			// telling the agent is what turns a host that stopped reading into a session that
 			// ends deterministically rather than into replies that quietly disappear.
-			while channel_peek(bytes) >= 0 {
-				match recv_blocking(bytes, &mut outbound) {
-					Received::Message { len, .. } => {
+			// Polled rather than peeked, because a channel whose peer is gone reports nothing to
+			// read and stays ready forever: peeking would find no message, the wait below would
+			// return immediately every time, and this loop would spin at the expense of every
+			// other thread. The closure has to be observed where it is, not inferred from the
+			// absence of a message.
+			loop {
+				match try_recv(bytes, &mut outbound) {
+					Polled::Message { len, .. } => {
 						if !port.write(&outbound[..len]) && !send_blocking(bytes, &[], 0) {
-							exit();
+							bytes = adopt(device, irq, bootstrap, bytes, rx, rx_phys);
 						}
 						worked = true;
 					}
-					Received::Closed => exit(),
+					Polled::Empty => break,
+					Polled::Closed => {
+						bytes = adopt(device, irq, bootstrap, bytes, rx, rx_phys);
+						break;
+					}
 				}
 			}
 			if worked {
@@ -233,6 +245,54 @@ unsafe fn pump(device: &Virtio, irq: u64, bytes: u64, rx: &mut Queue, port: &mut
 				interrupt_ack(irq);
 			}
 			port.reclaim();
+		}
+	}
+}
+
+// The agent above this driver is gone. Drop the dead channel and wait for DeviceManager,
+// which supervises the agent, to hand down the channel its replacement is listening on.
+//
+// The receive ring keeps turning while waiting, and what arrives on it is discarded. Both
+// halves of that matter. Discarding is right because the bytes belong to a session that died
+// with the agent, and a fragment of it delivered to a fresh agent would be read as the
+// beginning of a frame; the protocol's fragment deadline is what clears the stream, and it is
+// the host that reconnects. Turning the ring is right because eight buffers is all the device
+// has: stopping here would leave it with nowhere to put what a host is still writing, and the
+// port would still be stalled once the new agent arrived.
+unsafe fn adopt(device: &Virtio, irq: u64, bootstrap: u64, dead: u64, rx: &mut Queue, rx_phys: &[u64]) -> u64 {
+	unsafe {
+		close(dead);
+		let mut buf: [u8; 16] = [0u8; 16];
+		loop {
+			let mut recycled: bool = false;
+			while let Some((id, _)) = rx.take_used() {
+				if id < RX_SLOTS {
+					rx.post_recv(id, rx_phys[id as usize], RX_SLOT as u32);
+					recycled = true;
+				}
+			}
+			if recycled {
+				rx.notify();
+			}
+			loop {
+				match try_recv(bootstrap, &mut buf) {
+					Polled::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => return handle,
+					Polled::Message { handle, .. } => {
+						if handle != 0 {
+							close(handle);
+						}
+					}
+					Polled::Empty => break,
+					// The supervisor dropped this driver's bootstrap, which is how it is told to
+					// shut down - and with it goes any prospect of a replacement.
+					Polled::Closed => exit(),
+				}
+			}
+			let ready: i64 = wait_any(&[irq, bootstrap], 0);
+			if ready == 0 {
+				let _ = device.read_isr();
+				interrupt_ack(irq);
+			}
 		}
 	}
 }

@@ -149,6 +149,8 @@ pub const OP_TERM_INPUT: u8 = 0x20;
 pub const OP_TERM_ACK: u8 = 0x21;
 pub const OP_RESET: u8 = 0x22;
 pub const OP_RESET_ACK: u8 = 0x23;
+pub const OP_RESTART: u8 = 0x24;
+pub const OP_RESTART_ACK: u8 = 0x25;
 pub const OP_ERROR: u8 = 0xff;
 
 // Statuses. Every rejection names one of these, so a failure is explained by the frame that
@@ -298,6 +300,10 @@ pub struct Session {
 	// which is exactly the situation where a tool can be talking to a guest that restarted
 	// under it - and publishing into, or reading a registry from, a boot that is not the one
 	// you think you have is the kind of confusion this whole milestone exists to remove.
+	//
+	// It is handed down rather than drawn here, because this session does not live as long as
+	// the boot does: an agent can be replaced without the guest restarting, and a value drawn
+	// per agent would tell every tool the guest had rebooted when it had not.
 	boot_nonce: [u8; 8],
 	// The volume client the installed artifacts are read through, to decide whether a
 	// candidate may stand in for the one it shadows. Zero when none was wired, which leaves
@@ -315,6 +321,10 @@ pub struct Session {
 	// delivered, and zero forever on a boot with no agent - in which case ProcessService simply
 	// never gets an answer and reads the volume, which is the shipping behaviour.
 	registry: u64,
+	// Set by a restart request and read by the program above, which is the only thing that can
+	// act on it: the protocol can decide that this agent should end, but ending it is not
+	// something a state machine behind a `Sink` gets to do.
+	restart: bool,
 	candidate: Option<Candidate>,
 	artifacts: Vec<Artifact>,
 	// Live registry content in bytes, tracked rather than recomputed so the budget can be
@@ -323,16 +333,20 @@ pub struct Session {
 }
 
 impl Session {
-	pub fn new(storage: u64) -> Session {
+	pub fn new(storage: u64, boot_nonce: [u8; 8]) -> Session {
 		let mut profile: [u8; 32] = [0u8; 32];
 		let len: usize = unsafe { boot_profile(&mut profile) };
-		let mut boot_nonce: [u8; 8] = [0u8; 8];
-		unsafe { random_get(&mut boot_nonce) };
-		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, launcher: 0, launch: None, registry: 0, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
+		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, launcher: 0, launch: None, registry: 0, restart: false, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
 	}
 
 	pub fn is_open(&self) -> bool {
 		self.handshake
+	}
+
+	// Whether a host asked this agent to end so a fresh one takes its place. Read after every
+	// parse, once the reply is already queued behind this session.
+	pub fn restart_requested(&self) -> bool {
+		self.restart
 	}
 
 	// Take the launcher, delivered after this session was created.
@@ -346,7 +360,7 @@ impl Session {
 	// may never arrive.
 	pub fn set_registry(&mut self, registry: u64) {
 		self.registry = registry;
-		unsafe { send_blocking(registry, b"AGENT", 0) };
+		unsafe { send_blocking(registry, services::REGISTRY_ANNOUNCEMENT, 0) };
 	}
 
 	pub fn registry_channel(&self) -> u64 {
@@ -543,7 +557,7 @@ impl Session {
 		// The generation field names the candidate an operation applies to. The operations
 		// that are not about one candidate must leave it zero, so the field never acquires an
 		// accidental second meaning that a later version would have to preserve.
-		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_ROLLBACK | OP_TERM_INPUT | OP_RESET | OP_LAUNCH | OP_LAUNCH_OUTPUT);
+		let session_scoped: bool = matches!(opcode, OP_PING | OP_PUB_BEGIN | OP_GEN_LIST | OP_ROLLBACK | OP_TERM_INPUT | OP_RESET | OP_RESTART | OP_LAUNCH | OP_LAUNCH_OUTPUT);
 		if session_scoped && generation != 0 {
 			return sink.send(OP_ERROR, request, generation, ST_MALFORMED, &[]);
 		}
@@ -566,6 +580,7 @@ impl Session {
 			OP_LAUNCH_OUTPUT => self.launch_output(request, sink),
 			OP_TERM_INPUT => terminal_input(request, payload, sink),
 			OP_RESET => self.reset(request, sink),
+			OP_RESTART => self.request_restart(request, sink),
 			_ => sink.send(OP_ERROR, request, generation, ST_BAD_OPCODE, &[]),
 		}
 	}
@@ -807,6 +822,23 @@ impl Session {
 		reply[..2].copy_from_slice(&dropped.to_le_bytes());
 		reply[2] = candidate;
 		sink.send(OP_RESET_ACK, request, 0, ST_OK, &reply)
+	}
+
+	// End this agent so its supervisor starts a fresh one. The acknowledgement is sent first
+	// and the flag set after, so the reply is already queued in the driver's channel when the
+	// process goes: a message that has left the sender outlives it, and the host gets its
+	// answer rather than a disconnect it has to interpret.
+	//
+	// Everything this agent holds goes with it, the registry included. That is the operation,
+	// not a side effect of it: the point of restarting is to get back the state a fresh boot
+	// would have without paying for a boot, and a restart that carried the registry across
+	// would leave the one thing most likely to be wedged exactly where it was. The reply says
+	// how many generations went, so a host that meant `reset` learns it did something larger.
+	fn request_restart(&mut self, request: u32, sink: &mut impl Sink) -> bool {
+		let dropped: u16 = self.artifacts.iter().map(|artifact| artifact.generations.len() as u16).sum();
+		let sent: bool = sink.send(OP_RESTART_ACK, request, 0, ST_OK, &dropped.to_le_bytes());
+		self.restart = true;
+		sent
 	}
 }
 
@@ -1096,7 +1128,7 @@ impl Session {
 			Some(pair) => pair,
 			None => return sink.send(OP_ERROR, request, 0, ST_LAUNCH_REFUSED, &[]),
 		};
-		let started = unsafe { security::permission::Client::new(ChannelTransport { chan: self.launcher }).run(name, args, cwd, &theirs) };
+		let started = security::permission::Client::new(ChannelTransport { chan: self.launcher }).run(name, args, cwd, &theirs);
 		let koid: u64 = match started {
 			Some(Ok(result)) => result.info.koid,
 			_ => {
