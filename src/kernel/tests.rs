@@ -588,6 +588,19 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let (key_producer, key_consumer) = Channel::create();
 	send_cap(&view_input_server, &subscribe_corr.to_le_bytes(), key_consumer, Rights::ALL)?;
 	sched::run_until_idle();
+	// Zoom in before panning, because `imgview` fits the image to the framebuffer when it opens:
+	// at the initial zoom the image is never larger than the viewport, `can_pan` is false, and an
+	// arrow key correctly redraws nothing. Panning only becomes possible once the image exceeds
+	// the viewport, so asserting a pan present without zooming first asked for the impossible -
+	// which is what this scenario did, and why it had never passed.
+	let zoom_frame = [0, 0, 0, 0, 0x2e, 0, 1];
+	key_producer.send(Message::new(zoom_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send imgview zoom key")?;
+	sched::run_until_idle();
+	let zoom_present = view_display_server.recv().map_err(|_| "imgview did not present after zoom-in")?;
+	let zoom_corr = le_u32(&zoom_present.bytes, 2);
+	view_display_server.send(Message::new([zoom_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview zoom-present reply failed")?;
+	sched::run_until_idle();
+
 	let pan_frame = [0, 0, 0, 0, 0x4f, 0, 1];
 	key_producer.send(Message::new(pan_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send imgview pan key")?;
 	sched::run_until_idle();
