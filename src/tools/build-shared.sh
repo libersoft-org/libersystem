@@ -158,6 +158,11 @@ artifact_log_dir="$artifact_output_root/logs"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
 force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
 artifact_cache_dir="$build_root/image-artifacts-$target"
+# One place for every scratch file a build makes. Apart from the outputs, so a leak shows up as
+# a directory that should have been empty rather than as litter among the artifacts, and so a
+# sweep can be written without keeping a list of patterns true.
+build_scratch="$build_root/tmp"
+mkdir -p "$build_scratch"
 provider_cargo_target="$build_root/cargo/provider-$target"
 cargo_target="$target"
 cargo_target_flags=()
@@ -182,6 +187,7 @@ targeted_state_file=""
 targeted_state_hit=0
 targeted_state_reason=""
 object_inputs=""
+pending_identity_record=""
 
 # `grep -q` stops at its first match and closes the pipe, so the producer's next write fails
 # with EPIPE. llvm-readelf reports that as exit 74, and `pipefail` makes it the status of the
@@ -226,6 +232,10 @@ report_build_summary() {
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.tmp.$$" -delete 2>/dev/null || true
 	find "$artifact_cache_dir" -maxdepth 1 -type f -name "*.$$.expected" -delete 2>/dev/null || true
 	if [[ -n "$object_inputs" ]]; then rm -f "$object_inputs"; fi
+	# The identity record in flight. Every path that finishes with one removes its own, so what
+	# leaked was each build that died between creating one and getting there - thirty of them over
+	# five days.
+	if [[ -n "$pending_identity_record" ]]; then rm -f "$pending_identity_record"; fi
 	rm -f "$build_root/image-warm-$target.state.inputs.current.$$" "$build_root/image-warm-$target.state.inputs.tmp.$$" "$build_root/image-warm-$target.state.tmp.$$"
 	rm -f "$build_root/package-dirs.$$.tmp"
 	if [[ $status == 0 && $targeted_state_hit == 0 && -n "$targeted_state_file" ]] && declare -F write_targeted_state >/dev/null; then
@@ -562,7 +572,7 @@ declare -A source_file_hashes=()
 declare -A build_file_hashes=()
 timing_event source start
 source_inventory_started=$SECONDS
-source_inventory_file="$build_root/image-sources.$$.inventory"
+source_inventory_file="$build_scratch/image-sources.$$.inventory"
 source_metadata_dir="$build_root/image-source-metadata.$$"
 source_roots_file="$source_metadata_dir/roots"
 mkdir -p "$(dirname "$source_inventory_file")"
@@ -827,8 +837,8 @@ verify_identity_note() {
 	local elf="$1"
 	local identity="$2"
 	local note dumped_note
-	note="$(mktemp "$build_root/identity-note.XXXXXX")"
-	dumped_note="$(mktemp "$build_root/identity-note.XXXXXX")"
+	note="$(mktemp "$build_scratch/identity-note.XXXXXX")"
+	dumped_note="$(mktemp "$build_scratch/identity-note.XXXXXX")"
 	rm -f "$dumped_note"
 	# Name an explicit output. Given one file, llvm-objcopy edits it in place, so verifying a
 	# staged artifact would republish identical bytes under a new inode and mtime and defeat
@@ -844,7 +854,7 @@ emit_identity() {
 	local elf="$1"
 	local identity="$2"
 	local note
-	note="$(mktemp "$build_root/identity-note.XXXXXX")"
+	note="$(mktemp "$build_scratch/identity-note.XXXXXX")"
 	if ! write_identity_note "$identity" "$note" || ! llvm-objcopy --add-section .note.liber.identity="$note" --set-section-flags .note.liber.identity=alloc,readonly "$elf" || ! verify_identity_note "$elf" "$identity"; then
 		rm -f "$note"
 		echo "build-shared: $elf identity note differs from its record" >&2
@@ -940,7 +950,7 @@ record_artifact_cache() {
 	local cache_prefix="$2"
 	local key="$3"
 	local inputs="$4"
-	mkdir -p "$artifact_cache_dir"
+	mkdir -p "$artifact_cache_dir" "$build_scratch"
 	printf '%s\n' "$key" >"$cache_prefix.build-key.tmp"
 	build_file_hashes[$out]="$(sha256sum "$out" | awk '{print $1}')"
 	printf '%s\n' "${build_file_hashes[$out]}" >"$cache_prefix.sha256.tmp"
@@ -1015,6 +1025,7 @@ record_object_reference() {
 	local object="$2"
 	local key="$3"
 	local cache_prefix="$4"
+	local consumer="$5"
 	{
 		printf 'format=liber-image-object-reference-v1\n'
 		printf 'key=%s\n' "$key"
@@ -1023,6 +1034,34 @@ record_object_reference() {
 		printf 'bytes=%s\n' "$(stat -c %s "$object")"
 	} >"$reference.tmp.$$"
 	mv "$reference.tmp.$$" "$reference"
+	prune_object_generations "$consumer" "$key"
+}
+
+# Keep one object generation per consumer: the one the reference above now names.
+#
+# The object cache is addressed by a digest of its inputs, so every distinct source content used
+# to leave a generation behind and nothing ever removed one. Keeping them buys an instant rebuild
+# when an edit is undone or a branch is switched back, and costs a set that grows with edit
+# history rather than with the artifact count - and the targeted state path set is built by a
+# `find` over that same directory. A build cache that remembers ten versions of one tool is also
+# not what anyone expects it to be doing.
+#
+# Pruning happens only after the new reference is in place, so an interrupted build can lose an
+# older generation but never the current one. The key is matched as a full 64-character digest
+# rather than by prefix: consumer names collide by prefix (`ls` and `lsblk`), and a glob would
+# eventually delete the wrong tool's cache.
+prune_object_generations() {
+	local consumer="$1"
+	local keep="$2"
+	local path base rest
+	while IFS= read -r path; do
+		base="${path##*/}"
+		rest="${base#object-$consumer-}"
+		[[ "$rest" != "$base" ]] || continue
+		[[ "$rest" =~ ^[0-9a-f]{64}(\.[a-z0-9-]+)?$ ]] || continue
+		[[ "${rest:0:64}" != "$keep" ]] || continue
+		rm -f "$path"
+	done < <(find "$artifact_cache_dir" -maxdepth 1 -type f -name "object-$consumer-*" -print)
 }
 
 # Per-artifact fast state for the full graph. Proving a warm graph from scratch dumps the
@@ -1587,7 +1626,8 @@ for spec in "$@"; do
 			printf 'provider=%s:%s\n' "$provider" "${provider_compile_digests[$provider]}"
 		done
 	} | sha256sum | awk '{print $1}')"
-	provider_expected_identity="$(mktemp "$build_root/identity-record.XXXXXX")"
+	provider_expected_identity="$(mktemp "$build_scratch/identity-record.XXXXXX")"
+	pending_identity_record="$provider_expected_identity"
 	write_identity_record library "$artifact" "$crate" "$provider_source_sha" "$row_features" "$row_providers" "$provider_expected_identity"
 	provider_expected_needed="$(for provider in $row_providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
 	provider_cache_prefix="$artifact_cache_dir/library-$artifact"
@@ -1600,6 +1640,7 @@ for spec in "$@"; do
 		timing_event unit "provider:hit:$artifact"
 		provider_identity_digests[$artifact]="$(build_file_digest "$provider_expected_identity")"
 		rm -f "$provider_expected_identity" "$provider_cache_inputs"
+		pending_identity_record=""
 		write_artifact_state "$provider_state_key" "$provider_state_header" \
 			"${provider_identity_digests[$artifact]}"$'\t'"${provider_compile_digests[$artifact]}" \
 			"$out" "$provider_cache_prefix.build-key" "$provider_cache_prefix.sha256" \
@@ -1837,6 +1878,7 @@ for spec in "$@"; do
 	provider_identity_digests[$artifact]="$(build_file_digest "$provider_expected_identity")"
 	record_artifact_cache "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_cache_inputs"
 	rm -f "$provider_expected_identity"
+	pending_identity_record=""
 	write_artifact_state "$provider_state_key" "$provider_state_header" \
 		"${provider_identity_digests[$artifact]}"$'\t'"${provider_compile_digests[$artifact]}" \
 		"$out" "$provider_cache_prefix.build-key" "$provider_cache_prefix.sha256" \
@@ -1916,14 +1958,15 @@ if [[ -n "$image_graph" ]]; then
 		((artifact_state_misses += 1))
 		build_provider_index "$providers"
 		audit_provider_export_ownership "$providers"
-		consumer_expected_identity="$(mktemp "$build_root/identity-record.XXXXXX")"
+		consumer_expected_identity="$(mktemp "$build_scratch/identity-record.XXXXXX")"
+		pending_identity_record="$consumer_expected_identity"
 		write_identity_record executable "$consumer" "$crate" "$consumer_source_sha" shared-image "$providers" "$consumer_expected_identity"
 		consumer_expected_needed="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
 		consumer_cache_prefix="$artifact_cache_dir/executable-$consumer"
 		consumer_cache_inputs="$consumer_cache_prefix.inputs.$$.expected"
 		artifact_cache_record executable "$kind $consumer $crate $stage $destination $providers" "$consumer_expected_identity" "cargo=$image_target_config_value start=$(sha256sum "$start_obj" | awk '{print $1}')" >"$consumer_cache_inputs"
 		consumer_cache_key="$(sha256sum "$consumer_cache_inputs" | awk '{print $1}')"
-		object_inputs="$(mktemp "$build_root/object-inputs.XXXXXX")"
+		object_inputs="$(mktemp "$build_scratch/object-inputs.XXXXXX")"
 		object_cache_record "$consumer" "$crate" "$consumer_source_sha" "$providers" >"$object_inputs"
 		object_key="$(sha256sum "$object_inputs" | awk '{print $1}')"
 		object_cache_prefix="$artifact_cache_dir/object-$consumer-$object_key"
@@ -1934,7 +1977,7 @@ if [[ -n "$image_graph" ]]; then
 			canonical_provider_order "$providers" >/dev/null
 			if ! object_reference_valid "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"; then
 				if object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key"; then
-					record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
+					record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix" "$consumer"
 				else
 					# The executable proved its own bytes, but the object it was built from is
 					# gone or unusable - which is exactly what a build that died partway leaves
@@ -1952,6 +1995,7 @@ if [[ -n "$image_graph" ]]; then
 				((executable_cache_hits += 1))
 				timing_event unit "executable:hit:$consumer"
 				rm -f "$consumer_expected_identity" "$consumer_cache_inputs" "$object_inputs"
+				pending_identity_record=""
 				write_artifact_state "$consumer_state_key" "$consumer_state_header" "" \
 					"$out" "$consumer_cache_prefix.build-key" "$consumer_cache_prefix.sha256" \
 					"$consumer_cache_prefix.audit" "$object_reference" "$consumer_obj" \
@@ -1977,7 +2021,7 @@ if [[ -n "$image_graph" ]]; then
 			record_object_cache "$consumer_obj" "$object_cache_prefix" "$object_key" "$object_inputs"
 			object_inputs=""
 		fi
-		record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
+		record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix" "$consumer"
 		provider_inputs=()
 		expected_needed=""
 		for provider in $providers; do
@@ -2251,6 +2295,7 @@ if [[ -n "$image_graph" ]]; then
 		record_artifact_cache "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_cache_inputs"
 		if [[ -n "$object_inputs" ]]; then rm -f "$object_inputs"; fi
 		rm -f "$consumer_expected_identity"
+		pending_identity_record=""
 		write_artifact_state "$consumer_state_key" "$consumer_state_header" "" \
 			"$out" "$consumer_cache_prefix.build-key" "$consumer_cache_prefix.sha256" \
 			"$consumer_cache_prefix.audit" "$object_reference" "$consumer_obj" \
@@ -2267,7 +2312,8 @@ if matches_line pix printf '%s\n' "${artifacts[@]}"; then
 	probe_dir="$(dirname "$probe_out")"
 	mkdir -p "$probe_dir"
 	probe_source_sha="$(source_digest "$probe")"
-	probe_expected_identity="$(mktemp "$build_root/identity-record.XXXXXX")"
+	probe_expected_identity="$(mktemp "$build_scratch/identity-record.XXXXXX")"
+	pending_identity_record="$probe_expected_identity"
 	write_identity_record executable dyn_probe dyn_probe "$probe_source_sha" - "pix lsrt" "$probe_expected_identity"
 	probe_expected_needed="$(printf '%s\n' pix.lslib lsrt.lslib | sort -u)"
 	audit_provider_export_ownership "pix lsrt"
@@ -2279,6 +2325,7 @@ if matches_line pix printf '%s\n' "${artifacts[@]}"; then
 		canonical_provider_order "pix lsrt" >/dev/null
 		verbose_log "build-shared: executable cache hit dyn_probe"
 		rm -f "$probe_expected_identity" "$probe_cache_inputs"
+		pending_identity_record=""
 		if [[ -z "$selected_artifact" ]]; then
 			audit_library_destinations
 			audit_program_destinations
@@ -2300,6 +2347,7 @@ if matches_line pix printf '%s\n' "${artifacts[@]}"; then
 	mv "$probe_candidate" "$probe_out"
 	record_artifact_cache "$probe_out" "$probe_cache_prefix" "$probe_cache_key" "$probe_cache_inputs"
 	rm -f "$probe_expected_identity"
+	pending_identity_record=""
 	echo "build-shared: $probe_out ($(stat -c %s "$probe_out") bytes)"
 fi
 

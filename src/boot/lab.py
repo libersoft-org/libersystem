@@ -1754,6 +1754,36 @@ def cmd_dev_clean(args):
 		except OSError:
 			pass
 
+	# Superseded object generations. The build keeps one per artifact and drops the rest as it
+	# goes, so these are the backlog from before it did that, plus anything left by a tool that
+	# has not been rebuilt since. They are not inputs to the next build: each artifact's
+	# `.object` reference names the one generation that is, and the others are reproducible from
+	# sources like everything else this prunes.
+	for reference in glob.glob(os.path.join(BUILD_ROOT, 'image-artifacts-*', 'executable-*.object')):
+		name = os.path.basename(reference)[len('executable-') : -len('.object')]
+		try:
+			with open(reference) as handle:
+				current = next((line.split('=', 1)[1].strip() for line in handle if line.startswith('key=')), None)
+		except OSError:
+			continue
+		if not current:
+			continue
+		for path in glob.glob(os.path.join(os.path.dirname(reference), f'object-{name}-*')):
+			key = os.path.basename(path)[len(f'object-{name}-') :].split('.', 1)[0]
+			if len(key) == 64 and key != current:
+				removed.append(path)
+
+	# Scratch a build could not clean up after itself. Its exit path removes what it made, so
+	# anything surviving here belongs to a build that was killed outright rather than one that
+	# failed. Age is the only usable test - the names carry no owner - and a build in flight is
+	# minutes, so a day is not a close call.
+	for scratch in glob.glob(os.path.join(BUILD_ROOT, 'tmp', '*')):
+		try:
+			if time.time() - os.path.getmtime(scratch) > 24 * 3600:
+				removed.append(scratch)
+		except OSError:
+			pass
+
 	# The instance's own files are live state while it is up, and stale sockets when it is not.
 	state, _ = dev_state()
 	if state in ('down', 'stale'):
@@ -1770,7 +1800,7 @@ def cmd_dev_clean(args):
 			shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.unlink(path)
 	verb = 'would remove' if dry else 'removed'
 	print(f'lab: {verb} {len(removed)} item(s), {total // 1024} kB (keeping the {KEEP_TEST_RUNS} newest test runs and {KEEP_BASELINE_SAMPLES} newest baseline samples)')
-	print('lab: the artifact caches and staged images are left alone; they are inputs to the next build, and `just clean` is what discards them')
+	print('lab: current artifacts and staged images are left alone; they are inputs to the next build, and `just clean` is what discards them')
 
 
 def directory_bytes(path):

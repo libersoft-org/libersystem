@@ -228,6 +228,23 @@ Other things that have bitten, and what they look like:
 - Ctrl-C does nothing to a program in raw mode: the byte is delivered and no signal is raised.
   Escape or `q` is what ends the tree's interactive tools.
 
+### What the build cache keeps
+
+A tool that has not changed is not recompiled, and the decision is made per artifact rather than
+for the tree as a whole. Each compiled object is stored under a digest of everything that went
+into it: the source content, the compiler and its flags, the artifact's manifest row and the API
+digest of every provider it links against. Beside it, `executable-<name>.object` names which
+digest is the current one.
+
+That is what makes skipping safe. A stale object cannot be reused, because reuse requires the
+digest to match, and a matching digest means the inputs were identical - so the bytes are the
+bytes that source produces. Change one byte of the source and the digest differs, and the tool
+is rebuilt.
+
+One generation is kept per artifact: the one the reference names. The build drops the others as
+it replaces them, so undoing a change recompiles rather than restoring an older cached object.
+`just dev-clean` sweeps up any backlog left by artifacts that have not been rebuilt since.
+
 ### Cleaning up
 
 `just dev-clean [--dry-run]` prunes what the host accumulates: test logs, baseline samples,
