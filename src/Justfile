@@ -596,6 +596,12 @@ dev-type *args:
 dev-reset *args:
     @boot/lab.py dev-reset {{ args }}
 
+# reboot the guest to a clean state when its state is corrupted, without rebuilding anything.
+# The instance, its sockets and the system volume all survive, so a persistence bug survives
+# too rather than being papered over. e.g. `just dev-reboot`
+dev-reboot *args:
+    @boot/lab.py dev-reboot {{ args }}
+
 # replace the instance's development agent with a fresh one and wait until it serves; the
 # guest keeps running and the registry goes with the old agent
 dev-restart *args:

@@ -73,11 +73,31 @@ on the summary line rather than only in the clock.
 The persistent profile is x86_64 only. The control channel it uses is not: the same port is
 present in the cold test configuration of all three targets.
 
-### When the fast loop is not enough
+### What iterates hot and what does not
 
 Only an artifact the installed manifest already declares can iterate hot. Creating a new
 governed tool or provider is a manifest change, and that costs one cold cycle before fast
-iteration on it becomes available.
+iteration on it becomes available. That is the everyday consequence of everything below: the
+first build of a new tool is always slow, and every build after it is fast.
+
+| what changed                           | iterates | why, and what it costs                                                                      |
+| -------------------------------------- | -------- | ------------------------------------------------------------------------------------------- |
+| a declared `.lsexe`                    | hot      | publish it; the next launch resolves the generation                                         |
+| a declared `.lslib`, compatible        | hot      | publish it; the loader decides compatibility at the launch                                  |
+| a declared `.lslib`, incompatible      | cold     | the registry keeps it, every launch refuses it; only a rebuild installs it                  |
+| a new governed tool or provider        | cold     | undeclared artifacts cannot be published at all                                             |
+| manifest grants or ownership           | cold     | the installed manifest is the launch authority and is read at boot                          |
+| the shared boot contract (`bootproto`) | cold     | rebuilds every binary that consumes it, kernel and loader alike                             |
+| ProcessService or PermissionManager    | cold     | the launch path itself changed, and it is staged in the volume package                      |
+| a driver                               | cold     | staged in a package and bound at boot by DeviceManager                                      |
+| the kernel                             | cold     | recompile, then image reassembly                                                            |
+| the loader                             | cold     | recompile, then image reassembly                                                            |
+| package layout                         | cold     | reassembly; on aarch64 and riscv64 also a kernel relink, since those two embed the packages |
+| QEMU device topology                   | reboot   | the VM restarts; nothing is rebuilt                                                         |
+
+A refused provider generation fails the launch rather than falling back to the installed image.
+That is deliberate: falling back would run something other than what was published while looking
+like success.
 
 `dev-status` compares the running guest against the tree in six named input classes and tells
 you which one moved. None of them is hot-publishable; each needs a rebuild, and some a reboot:
@@ -127,9 +147,8 @@ missing fix.
 
 One limitation is inherent: a launch the development agent itself starts cannot be shadowed,
 because the agent is inside the launcher call at that moment and cannot answer the resolution
-query that launch triggers. Every other launch - the shell's, boot's, anything a program starts
-
-- resolves normally, so type at the terminal when you want to see a shadowed executable run.
+query that launch triggers. Every launch that the agent does not start resolves normally, so
+type at the terminal when you want to see a shadowed executable run.
 
 ### Scenarios
 
@@ -197,11 +216,13 @@ Other things that have bitten, and what they look like:
 - A guest that restarted under the tools is refused by every session, because the guest draws a
   value per boot and each session compares it. That is deliberate: it stops a tool publishing
   into a guest that is no longer the one it was talking to.
-- A build that died partway leaves the artifact cache in a state the next build detects and
-  refuses with `dynamic <name> has no valid current ET_REL object`, and cannot repair. Delete
-  that artifact's `image-artifacts-<target>/executable-*.build-key`, `*.sha256` and
-  `state-executable-*`, then rebuild. Do not delete the cache directory itself - the builder
-  writes into it without creating it and dies on the missing path.
+- A build that died partway can leave an artifact whose executable is proved but whose object is
+  gone. The next build now says `<name> has no valid current ET_REL object; rebuilding it` and
+  rebuilds it, which is the same work it would have done on a cache miss. This used to be fatal
+  and unrepairable from outside; if you meet an older message about it, that is what changed.
+  Deleting the artifact cache directory itself is still wrong - the builder writes into it
+  without creating it and dies on the missing path. `just clean` is the supported way to discard
+  build inputs.
 - An interactive program left running wedges the scenario runner, because the guest reads as
   "starting" while an alternate screen is up. Quit it before the next run.
 - Ctrl-C does nothing to a program in raw mode: the byte is delivered and no signal is raised.

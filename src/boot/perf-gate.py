@@ -59,7 +59,11 @@ TARGET = 'x86_64'
 # selects the cold path breaks the phase budget long before it breaks the total.
 NO_CHANGE_BUDGET = 1.0
 LEAF_TOTAL_BUDGET = 5.0
-PHASE_BUDGETS = {'build': 3.5, 'publish': 1.0, 'run': 2.5}
+# The build phase is measured at 3.3 to 3.5 s across runs, so 3.5 was the measurement rather
+# than a budget: a gate sitting exactly on its own number reports machine noise as a regression
+# and gets ignored, which is worse than not having it. 4.0 leaves room for the noise without
+# hiding what this is for - selecting the cold path costs seconds, not tenths.
+PHASE_BUDGETS = {'build': 4.0, 'publish': 1.0, 'run': 2.5}
 
 # What a proportional leaf rebuild costs in work rather than in time: its own object and its own
 # executable, and nothing else. A provider miss means the change reached further than the leaf;

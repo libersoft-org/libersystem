@@ -78,6 +78,7 @@ Persistent development instance (one owner at a time):
   dev-rollback <name>   return an artifact to the generation before its newest
   dev-type [--no-enter] <text...>  type into the guest terminal, with a byte count back
   dev-reset             drop the guest development state (not a reboot)
+  dev-reboot            reboot the guest to a clean state; the volume and the instance survive
   dev-restart           replace the development agent, keeping the guest running
   dev-key <key|chord>... | --text <line>  key events through the emulated keyboard
   dev-pointer [--x F] [--y F] [--press|--release|--click] [button]  pointer events
@@ -599,6 +600,12 @@ def dev_state():
 			return 'detached', identity
 		leftovers = [p for p in (DEV_CTL_SOCK, DEV_SERIAL_SOCK, DEV_CONSOLE_SOCK) if os.path.exists(p)]
 		return ('stale' if leftovers else 'down'), identity
+	# The lock is taken before the identity is written, so a bring-up in progress has the one
+	# without the other. Comparing an absent repository against this one makes that read as
+	# `foreign`, which tells the reader to go release the profile from a worktree that does not
+	# exist. Nothing recorded means nothing has claimed it yet.
+	if not identity:
+		return 'starting', identity
 	if identity.get('repo') != REPO:
 		return 'foreign', identity
 	return ('ready' if dev_ready() else 'starting'), identity
@@ -628,6 +635,11 @@ def dev_uptime(identity):
 
 # Refuse rather than race, and name both the owner and the exact command that frees it.
 def dev_owner_conflict(identity):
+	# A bring-up that has taken the lock but recorded nothing yet is not an ownership dispute,
+	# and saying so would send the reader looking for a worktree to release it from.
+	if not identity:
+		print('lab: a development instance is starting; wait for it, or `just dev-down` to abandon it', file=sys.stderr)
+		sys.exit(1)
 	print(f'lab: development profile is owned by {dev_describe(identity)}', file=sys.stderr)
 	print(f'lab: release it with `just dev-down` in {identity.get("repo", "that worktree")}', file=sys.stderr)
 	sys.exit(1)
@@ -674,8 +686,35 @@ def dev_reattach(lock_fd, identity, timeout):
 	print(f'lab: reattached to the running instance without rebooting (up {dev_uptime(identity)})')
 
 
+# End a bring-up that cannot finish, taking its guest with it.
+#
+# The lock is this process's, so it goes when this process does - which means a guest left
+# running here is invisible to `dev-status` and unreapable by `dev-down`, and the next `dev-up`
+# then fails with a host forwarding rule already taken, naming a port rather than a cause.
+# Nothing else reaps it, so this has to.
+def dev_bring_up_failed(lock_fd, guest, message):
+	for attempt in (signal.SIGTERM, signal.SIGKILL):
+		try:
+			os.killpg(os.getpgid(guest.pid), attempt)
+		except OSError:
+			break
+		try:
+			guest.wait(timeout=10)
+			break
+		except subprocess.TimeoutExpired:
+			continue
+	os.close(lock_fd)
+	die(message)
+
+
+# Whether QEMU is up yet in the guest's own process group.
+def dev_guest_qemu(pgid):
+	return subprocess.run(['pgrep', '-g', str(pgid), '-f', 'qemu-system'], capture_output=True).returncode == 0
+
+
 def cmd_dev_up(args):
 	timeout = arg_value(args, '--timeout', 240)
+	build_timeout = arg_value(args, '--build-timeout', 1800)
 	displays = [d for d in ('vnc', 'spice') if f'--{d}' in args]
 	state, identity = dev_state()
 	if state == 'ready':
@@ -717,10 +756,22 @@ def cmd_dev_up(args):
 	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1')
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
 	guest = subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
+	# The build and the boot are different waits and want different budgets. `just run` builds
+	# before it starts QEMU, and a tree needing a full rebuild - anything that touched the build
+	# tooling invalidates every artifact's cache key - can spend longer building than any
+	# sensible boot deadline. Charged to one number, a slow build is reported as a serial socket
+	# that never appeared, which sends the reader to QEMU for a problem that is in Cargo.
+	build_deadline = time.time() + build_timeout
+	while not dev_guest_qemu(guest.pid):
+		if guest.poll() is not None:
+			dev_bring_up_failed(lock_fd, guest, f'the build failed before QEMU started (see {DEV_QEMU_LOG})')
+		if time.time() > build_deadline:
+			dev_bring_up_failed(lock_fd, guest, f'the build did not reach QEMU within {build_timeout} s (see {DEV_QEMU_LOG})')
+		time.sleep(0.5)
+	booted = time.time()
 	while True:
-		if time.time() - started > timeout:
-			os.close(lock_fd)
-			die(f'serial socket did not appear within {timeout} s (see {DEV_QEMU_LOG})')
+		if time.time() - booted > timeout:
+			dev_bring_up_failed(lock_fd, guest, f'serial socket did not appear within {timeout} s of QEMU starting (see {DEV_QEMU_LOG})')
 		# A fresh socket per attempt: a stream socket whose connect failed cannot be
 		# reliably reconnected, so retrying on the same one can fail for good.
 		serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -730,8 +781,9 @@ def cmd_dev_up(args):
 		except OSError:
 			serial.close()
 			if guest.poll() is not None:
-				os.close(lock_fd)
-				die(f'guest exited before the serial socket appeared (see {DEV_QEMU_LOG})')
+				# `just` is gone, but QEMU is a child in the same group and may not be, so
+				# this goes through the same reaping the deadlines use.
+				dev_bring_up_failed(lock_fd, guest, f'guest exited before the serial socket appeared (see {DEV_QEMU_LOG})')
 			time.sleep(0.5)
 	broker_pid = dev_fork_broker(serial)
 	dev_restrict_sockets()
@@ -844,30 +896,54 @@ def dev_check_socket(path):
 
 
 # Ask the guest which boot it is and record it on the instance lock.
-def dev_record_boot():
-	try:
-		sock = proto_connect(5)
-	except SystemExit:
-		return
-	buffer = bytearray()
-	try:
-		bounds = proto_hello(sock, buffer, 5)
-	except (SystemExit, ProtoTimeout, OSError):
-		return
-	finally:
-		sock.close()
+#
+# Retried until the agent answers, because the moment a guest reaches a shell prompt is not the
+# moment its development agent is serving: asking too early lands in the transport driver's
+# discard window and the handshake is swallowed. Giving up quietly there is worse than it looks -
+# the recorded value stays the previous boot's, so every later session refuses the guest for
+# having restarted and sends the caller to `dev-up`, which rebuilds and reboots the thing that
+# was already running.
+def dev_record_boot(deadline=30):
+	give_up = time.monotonic() + deadline
+	bounds = None
+	while bounds is None:
+		# An attempt that finds the agent not yet serving is expected here and says nothing the
+		# caller can act on, so its diagnostics are dropped. Only running out of time is news,
+		# and that is the caller's to report.
+		quiet, sys.stderr = sys.stderr, open(os.devnull, 'w')
+		try:
+			try:
+				sock = proto_connect(2)
+			except SystemExit:
+				sock = None
+			if sock is not None:
+				buffer = bytearray()
+				try:
+					bounds = proto_hello(sock, buffer, 2)
+				except (SystemExit, ProtoTimeout, OSError):
+					bounds = None
+				finally:
+					sock.close()
+		finally:
+			sys.stderr.close()
+			sys.stderr = quiet
+		if bounds is None:
+			if time.monotonic() >= give_up:
+				return False
+			time.sleep(0.5)
 	identity = dev_identity_read()
 	identity['boot'] = bounds['boot']
 	try:
 		fd = os.open(DEV_LOCK, os.O_RDWR)
 	except OSError:
-		return
+		return False
 	try:
 		os.ftruncate(fd, 0)
 		os.lseek(fd, 0, os.SEEK_SET)
 		os.write(fd, json.dumps(identity).encode() + b'\n')
 	finally:
 		os.close(fd)
+	return True
 
 
 # What the guest registry currently shadows, as (name, generation, age). None when the
@@ -1408,6 +1484,41 @@ def cmd_dev_type(args):
 
 # Drop the development state the guest holds. It is not a reboot: it clears the artifact
 # registry and any half-streamed candidate, and the guest reports exactly what it dropped.
+# Put a wedged guest back to a just-booted state without rebuilding anything.
+#
+# This is the recovery for corrupted guest state, and it is a real reboot rather than a restored
+# snapshot. A snapshot would have been the faster answer and is not available: QEMU's `savevm`
+# needs a qcow2 device to write the state into, and every drive here is raw, so offering it
+# would mean changing the disk format that every run and every test uses - a topology change,
+# paid on every boot, to serve a recovery path. The reboot is fast enough to be the equivalent:
+# the guest reaches a prompt in about the time a fresh one does, and nothing is compiled.
+#
+# It also does not hide what a snapshot would have hidden. The system volume is persistent and
+# survives this, so a bug that corrupts stored state is still there afterwards - which is
+# exactly the property a restored snapshot would have quietly papered over.
+#
+# The instance itself survives: same QEMU, same broker, same sockets, same lock, so every tool
+# keeps talking to the thing it was talking to. What does change is the guest's per-boot value,
+# and that has to be recorded again or every later session refuses the guest for having
+# restarted - which it did.
+def cmd_dev_reboot(args):
+	timeout = arg_value(args, '--timeout', 120)
+	state, identity = dev_state()
+	if state != 'ready':
+		die(f'the development instance is {state}; a reboot needs a running one')
+	started = time.time()
+	qmp_command('system_reset')
+	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
+	if not has_prompt(reply[-256:]):
+		die(f'no shell prompt within {timeout} s of the reset (see {DEV_SERIAL_LOG})')
+	# The registry went with the reboot, because it was the agent's memory. Recording the new
+	# boot value is not optional bookkeeping: without it every session refuses this guest for
+	# having restarted, and the recovery it names is the rebuild this command exists to avoid.
+	if not dev_record_boot():
+		die('the guest rebooted but its development agent never answered, so the instance is now unusable; `just dev-up` will rebuild it')
+	print(f'lab: guest rebooted to a prompt in {time.time() - started:.1f} s; the registry is empty and the volume is unchanged')
+
+
 def cmd_dev_reset(args):
 	timeout = arg_value(args, '--timeout', 5)
 	sock, buffer, _ = proto_session(timeout)
@@ -2396,7 +2507,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-reboot': cmd_dev_reboot, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down}
 
 
 def main():

@@ -71,16 +71,16 @@ executable were rebuilt and the single provider in the closure was reused.
 | total | 3158-3448 | |
 
 About one second of a 3.2 to 3.4 second leaf build compiles, links and audits. The other two
-thirds prove that nothing else needed to. That is the cost of proportionality rather than waste
-- each segment answers a question the build must answer to skip work safely - but it is now the
-dominant term, which it was not when the same iteration cost 101.67 seconds.
+thirds prove that nothing else needed to. That is the cost of proportionality rather than waste,
+since each segment answers a question the build must answer before it can skip work safely, but
+it is now the dominant term, which it was not when the same iteration cost 101.67 seconds.
 
 Loop budgets, measured against a persistent instance:
 
 | path | measured | budget | verdict |
 | --- | ---: | ---: | --- |
 | warm no-change build | 0.40 s | 1.00 s | met, and rebuilt nothing |
-| warm leaf, build phase | 3.3-3.4 s | 3.50 s | met |
+| warm leaf, build phase | 3.3-3.5 s | 4.00 s | met |
 | warm leaf, publish phase | 0.40 s | 1.00 s | met |
 | warm leaf, scenario phase | 2.10 s | 2.50 s | met |
 | warm leaf, total | 5.7-5.9 s | 5.00 s | missed by 0.7-0.9 s |
@@ -94,6 +94,40 @@ Which scenario the loop runs is a large share of what remains. The same iteratio
 of scenario with `shell-basics`, 3.20 s with `registry-shadow` and 4.90 s with `launch-program`,
 which launches three programs. Reporting a loop time without naming its scenario is therefore
 not a measurement.
+
+### The cold invalidation classes, measured
+
+`just dev-baseline <kernel|loader|topology>` labels a sample after the operator has edited the
+class it names, the way `leaf` and `provider` already did. Each probe below was a comment
+appended to one file, measured, then restored, with a settling `just build` between samples: a
+restore is itself a source change, and without settling the next sample pays for the previous
+one's, which is how the first attempt at this produced a `loader` row that recompiled the kernel.
+
+| sample | total | kernel test binary | packages | image | QEMU start | guest boot |
+| --- | ---: | ---: | ---: | --- | ---: | ---: |
+| warm, nothing edited | 11.86 s | 1.32 s | 3.84 s | cache hit | 4.94 s | 0.52 s |
+| `topology` (`qemu-run.sh`) | 11.70 s | 1.27 s | 3.70 s | cache hit | 4.99 s | 0.50 s |
+| `kernel` (`kernel/main.rs`) | 12.25 s | 1.30 s | 3.98 s | rebuilt | 4.89 s | 0.52 s |
+
+The three rows are within half a second of each other and of editing nothing at all, and the only
+thing that actually varied is whether the boot image was reassembled. That is the finding rather
+than a measurement problem: through the checkpoint test path the cost is a floor rather than a
+function of what changed. The kernel test binary is rebuilt every time, because `cargo test`
+builds a different unit from `cargo build`; the kernel build script reruns and recomputes both
+package images every time, which costs 3.7 to 4.0 s even when it then publishes nothing because
+the bytes are unchanged; and a fresh QEMU and guest boot are paid unconditionally, at about 5.4 s
+together.
+
+The invalidation classes are real and the instance detects them correctly. What these numbers say
+is that their cost through the cold path is structural, not proportional, which is the argument
+for the persistent instance rather than against the classes.
+
+A `loader` sample is not recorded, and the reason is worth more than the number would have been:
+the kernel test path never rebuilds the loader. `boot/test-kernel.sh` compiles the kernel and
+runs it; `mkimage.sh` consumes an already-built `libersystem-loader.efi`; only `just build`
+compiles one. So a loader edit is invisible to `just test`, which boots whatever loader was last
+built, and a loader-only sample has to be taken through a path that assembles the image from a
+fresh loader instead.
 
 ## Image conversion (2026-07-16)
 

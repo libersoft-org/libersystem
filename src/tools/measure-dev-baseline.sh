@@ -2,10 +2,13 @@
 # Record one development-loop timing sample without mutating source files.
 set -euo pipefail
 
-scenario="${1:?usage: measure-dev-baseline.sh <cold|warm|leaf|provider> [test-tags]}"
+scenario="${1:?usage: measure-dev-baseline.sh <cold|warm|leaf|provider|kernel|loader|topology> [test-tags]}"
 tags="${2:-smoke}"
+# `kernel`, `loader` and `topology` label the three cold invalidation classes, the ones no
+# publication can reach. Like `leaf` and `provider` they name what the operator edited before
+# running this; nothing here mutates a source file.
 case "$scenario" in
-cold | warm | leaf | provider) ;;
+cold | warm | leaf | provider | kernel | loader | topology) ;;
 *)
 	echo "dev-baseline: unknown scenario '$scenario'" >&2
 	exit 2

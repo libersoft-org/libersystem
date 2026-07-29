@@ -1929,24 +1929,35 @@ if [[ -n "$image_graph" ]]; then
 		object_cache_prefix="$artifact_cache_dir/object-$consumer-$object_key"
 		consumer_obj="$object_cache_prefix.o"
 		object_reference="$consumer_cache_prefix.object"
+		object_usable=1
 		if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$consumer_cache_prefix" "$consumer_cache_key" "$consumer_expected_identity" "$consumer_expected_needed"; then
 			canonical_provider_order "$providers" >/dev/null
 			if ! object_reference_valid "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"; then
-				object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key" || {
-					echo "build-shared: dynamic $consumer has no valid current ET_REL object" >&2
-					exit 1
-				}
-				record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
+				if object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key"; then
+					record_object_reference "$object_reference" "$consumer_obj" "$object_key" "$object_cache_prefix"
+				else
+					# The executable proved its own bytes, but the object it was built from is
+					# gone or unusable - which is exactly what a build that died partway leaves
+					# behind. Refusing here made that unrepairable from outside: the operator had
+					# to know which cache files to delete, and deleting the directory made the
+					# builder die on a path it does not create. Rebuilding the object is the same
+					# work the miss path below already does, and it restores the invariant, so
+					# take that path rather than asking anyone to repair a cache by hand.
+					echo "build-shared: $consumer has no valid current ET_REL object; rebuilding it"
+					object_usable=0
+				fi
 			fi
-			verbose_log "build-shared: executable cache hit $consumer"
-			((executable_cache_hits += 1))
-			timing_event unit "executable:hit:$consumer"
-			rm -f "$consumer_expected_identity" "$consumer_cache_inputs" "$object_inputs"
-			write_artifact_state "$consumer_state_key" "$consumer_state_header" "" \
-				"$out" "$consumer_cache_prefix.build-key" "$consumer_cache_prefix.sha256" \
-				"$consumer_cache_prefix.audit" "$object_reference" "$consumer_obj" \
-				"$object_cache_prefix.build-key" "$object_cache_prefix.sha256" "$start_obj"
-			continue
+			if [[ "$object_usable" == 1 ]]; then
+				verbose_log "build-shared: executable cache hit $consumer"
+				((executable_cache_hits += 1))
+				timing_event unit "executable:hit:$consumer"
+				rm -f "$consumer_expected_identity" "$consumer_cache_inputs" "$object_inputs"
+				write_artifact_state "$consumer_state_key" "$consumer_state_header" "" \
+					"$out" "$consumer_cache_prefix.build-key" "$consumer_cache_prefix.sha256" \
+					"$consumer_cache_prefix.audit" "$object_reference" "$consumer_obj" \
+					"$object_cache_prefix.build-key" "$object_cache_prefix.sha256" "$start_obj"
+				continue
+			fi
 		fi
 		verbose_log "build-shared: executable cache miss $consumer"
 		((executable_cache_misses += 1))
