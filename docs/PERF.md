@@ -37,6 +37,64 @@ true warm path, boot-image assembly plus fresh QEMU startup and guest boot cost 
 seconds for a scenario whose guest execution is only 39 ms. These measurements establish
 the targets for proportional single-artifact builds and the persistent guest loop.
 
+## Development loop phase review (2026-07-29)
+
+`LIBER_TIMING_LOG=<file> src/tools/dev-build.sh <artifact> <target>` appends host-nanosecond
+phase events in the same three-column format the kernel test driver and the QEMU runner already
+emit: `build`, `source`, `graph`, `providers` and `consumers` boundaries, plus one per-unit
+event `<kind>:<hit|miss>:<name>` for every provider, object and executable the build decided
+about. A unit event marks the decision, not the work, so a miss appears before the compile it
+causes; the surrounding boundaries are what time the work.
+
+`cd src && just perf-gate` measures the two loop budgets against a running development instance
+and asserts the shape of the work beside its cost, so a loop cannot look fast by skipping the
+test or by publishing something other than what it built.
+
+Sample rows recorded by `just dev-baseline` now carry a `schema` column. Rows from the
+2026-07-26 baseline predate it and measured a different set of phases, so the recorder refuses
+to append to that file rather than let the two be read as one series.
+
+The warm leaf build, segment by segment. Two samples on the documented 52-CPU host, taken with
+the caches warm and a one-line comment appended to `uname.rs`, so exactly one object and one
+executable were rebuilt and the single provider in the closure was reused.
+
+| segment | ms | what it is |
+| --- | ---: | --- |
+| script start to source stage | 181-185 | interpreter start, manifest query, artifact kind and closure resolution |
+| source inventory | 201-210 | hashing the selected closure's sources |
+| source stage to graph stage | 265-273 | targeted plan and per-artifact state resolution |
+| Cargo image graph | 240-244 | resolving rlib paths for the closure |
+| providers | 384-662 | proving the one provider in the closure unchanged |
+| consumer plan | 347-370 | cache keys, identity record and provider index for the consumer |
+| consumer compile, link and audit | 989-1003 | the only segment that produces the artifact |
+| last stage to script end | 502-517 | writing per-artifact state, the summary and cleanup |
+| total | 3158-3448 | |
+
+About one second of a 3.2 to 3.4 second leaf build compiles, links and audits. The other two
+thirds prove that nothing else needed to. That is the cost of proportionality rather than waste
+- each segment answers a question the build must answer to skip work safely - but it is now the
+dominant term, which it was not when the same iteration cost 101.67 seconds.
+
+Loop budgets, measured against a persistent instance:
+
+| path | measured | budget | verdict |
+| --- | ---: | ---: | --- |
+| warm no-change build | 0.40 s | 1.00 s | met, and rebuilt nothing |
+| warm leaf, build phase | 3.3-3.4 s | 3.50 s | met |
+| warm leaf, publish phase | 0.40 s | 1.00 s | met |
+| warm leaf, scenario phase | 2.10 s | 2.50 s | met |
+| warm leaf, total | 5.7-5.9 s | 5.00 s | missed by 0.7-0.9 s |
+
+Against the 2026-07-26 baseline the same one-line leaf edit fell from 101.67 s to about 5.8 s,
+and the unchanged path from 10.21 s to 0.40 s. Most of that is work no longer done at all rather
+than work done faster: with a persistent guest, QEMU startup (3.92 s), guest boot (0.48 s),
+volume package assembly (3.04 s) and boot-image assembly (0.54 s) are not paid per iteration.
+
+Which scenario the loop runs is a large share of what remains. The same iteration measures 2.10 s
+of scenario with `shell-basics`, 3.20 s with `registry-shadow` and 4.90 s with `launch-program`,
+which launches three programs. Reporting a loop time without naming its scenario is therefore
+not a measurement.
+
 ## Image conversion (2026-07-16)
 
 `just image-bench` builds the same no_std leaves used by `imgconv` in an optimized

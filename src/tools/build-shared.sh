@@ -44,6 +44,21 @@ verbose_log() {
 	if [[ "$verbose" == 1 ]]; then echo "$*"; fi
 }
 
+# Machine-readable phase events, in the format the kernel test driver and the QEMU runner
+# already emit: one host-nanosecond timestamp, a phase and an event, appended to the file the
+# caller names in `LIBER_TIMING_LOG`. Costed in whole seconds the summary line cannot answer
+# where a three-second build went, and a reader that has to parse prose is a reader that stops
+# being run. Per-unit events carry their own decision, so what was compiled and what was reused
+# is a fact in the record rather than an inference from the totals.
+#
+# A unit event is `<kind>:<hit|miss>:<name>` and marks the DECISION, not the work: a miss is
+# emitted where the cache is found wanting, before the compile it causes. Timing the work is
+# what the surrounding phase boundaries are for, and naming these after the work would put a
+# `built` event before the building - which is what the first version of them did.
+timing_event() {
+	if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\t%s\t%s\n' "$(date +%s%N)" "$1" "$2" >>"$LIBER_TIMING_LOG"; fi
+}
+
 target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -147,6 +162,7 @@ provider_cargo_target="$build_root/cargo/provider-$target"
 cargo_target="$target"
 cargo_target_flags=()
 build_started=$SECONDS
+timing_event build start
 provider_cache_hits=0
 provider_cache_misses=0
 object_cache_hits=0
@@ -225,6 +241,7 @@ report_build_summary() {
 		rm -f "$warm_snapshot_file"
 	fi
 	if [[ $status == 0 && -z "$selected_artifact" ]]; then check_dynamic_report_inventory; fi
+	timing_event build end
 	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds,reports:$report_seconds providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
 }
 
@@ -543,6 +560,7 @@ source_path() {
 
 declare -A source_file_hashes=()
 declare -A build_file_hashes=()
+timing_event source start
 source_inventory_started=$SECONDS
 source_inventory_file="$build_root/image-sources.$$.inventory"
 source_metadata_dir="$build_root/image-source-metadata.$$"
@@ -599,6 +617,7 @@ done < <(
 	} | sort -z | xargs -0 sha256sum --zero
 )
 source_inventory_seconds=$((SECONDS - source_inventory_started))
+timing_event source end
 
 source_file_digest() {
 	local source="$1"
@@ -1170,6 +1189,7 @@ while IFS= read -r -d '' record; do
 	build_file_hashes[$file]="$hash"
 done < <(build_file_hash_inventory | sort -z -u | xargs -0 -r sha256sum --zero)
 
+timing_event graph start
 image_graph_started=$SECONDS
 image_graph=""
 requested_artifact_names="$(printf '%s\n' "$@" | sed 's/=.*//')"
@@ -1279,6 +1299,7 @@ if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
 	fi
 fi
 image_graph_seconds=$((SECONDS - image_graph_started))
+timing_event graph end
 
 if [[ -z "$selected_artifact" ]]; then
 	artifact_state_plan="$({
@@ -1467,6 +1488,7 @@ audit_provider_export_ownership() {
 	provider_export_audit_cache[$cache_key]=1
 }
 
+timing_event providers start
 provider_started=$SECONDS
 artifacts=()
 declare -A artifact_available=()
@@ -1534,6 +1556,7 @@ for spec in "$@"; do
 		provider_compile_digests[$artifact]="$provider_state_compile"
 		artifact_state_hit[$artifact]=1
 		((provider_cache_hits += 1))
+		timing_event unit "provider:hit:$artifact"
 		verbose_log "build-shared: provider cache hit $artifact"
 		artifacts+=("$artifact")
 		artifact_available[$artifact]=1
@@ -1574,6 +1597,7 @@ for spec in "$@"; do
 	if [[ "$force_rebuild" == 0 ]] && artifact_cache_valid "$out" "$provider_cache_prefix" "$provider_cache_key" "$provider_expected_identity" "$provider_expected_needed"; then
 		verbose_log "build-shared: provider cache hit $artifact"
 		((provider_cache_hits += 1))
+		timing_event unit "provider:hit:$artifact"
 		provider_identity_digests[$artifact]="$(build_file_digest "$provider_expected_identity")"
 		rm -f "$provider_expected_identity" "$provider_cache_inputs"
 		write_artifact_state "$provider_state_key" "$provider_state_header" \
@@ -1586,6 +1610,7 @@ for spec in "$@"; do
 	fi
 	verbose_log "build-shared: provider cache miss $artifact"
 	((provider_cache_misses += 1))
+	timing_event unit "provider:miss:$artifact"
 	link_deps=()
 	export_flags=()
 	symbolic_flags=(-Bsymbolic)
@@ -1829,8 +1854,10 @@ if ((artifact_state_misses > 0)); then
 	done
 fi
 provider_seconds=$((SECONDS - provider_started))
+timing_event providers end
 
 if [[ -n "$image_graph" ]]; then
+	timing_event consumers start
 	consumer_started=$SECONDS
 	start_obj="$build_root/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
@@ -1882,6 +1909,7 @@ if [[ -n "$image_graph" ]]; then
 		if artifact_state_valid "$consumer_state_key" "$consumer_state_header" "$providers"; then
 			artifact_state_hit[$consumer]=1
 			((executable_cache_hits += 1))
+			timing_event unit "executable:hit:$consumer"
 			verbose_log "build-shared: executable cache hit $consumer"
 			continue
 		fi
@@ -1912,6 +1940,7 @@ if [[ -n "$image_graph" ]]; then
 			fi
 			verbose_log "build-shared: executable cache hit $consumer"
 			((executable_cache_hits += 1))
+			timing_event unit "executable:hit:$consumer"
 			rm -f "$consumer_expected_identity" "$consumer_cache_inputs" "$object_inputs"
 			write_artifact_state "$consumer_state_key" "$consumer_state_header" "" \
 				"$out" "$consumer_cache_prefix.build-key" "$consumer_cache_prefix.sha256" \
@@ -1921,12 +1950,15 @@ if [[ -n "$image_graph" ]]; then
 		fi
 		verbose_log "build-shared: executable cache miss $consumer"
 		((executable_cache_misses += 1))
+		timing_event unit "executable:miss:$consumer"
 		if [[ "$force_rebuild" == 0 ]] && object_cache_valid "$consumer_obj" "$object_cache_prefix" "$object_key"; then
 			verbose_log "build-shared: object cache hit $consumer"
 			((object_cache_hits += 1))
+			timing_event unit "object:hit:$consumer"
 		else
 			verbose_log "build-shared: object cache miss $consumer"
 			((object_cache_misses += 1))
+			timing_event unit "object:miss:$consumer"
 			consumer_obj_tmp="$consumer_obj.tmp.$$"
 			rm -f "$consumer_obj_tmp"
 			"$root/tools/build-consumer-object.sh" "$consumer_dir" "$image_target" "$rust_min_stack" "$rustflags" "$cargo_target" "$consumer" "$consumer_obj_tmp" "$consumer_errors" "${cargo_target_flags[@]}"
@@ -2215,6 +2247,7 @@ if [[ -n "$image_graph" ]]; then
 		echo "build-shared: $out ($(stat -c %s "$out") bytes, PIE)"
 	done <<<"$dynamic_rows"
 	consumer_seconds=$((SECONDS - consumer_started))
+	timing_event consumers end
 fi
 
 if matches_line pix printf '%s\n' "${artifacts[@]}"; then

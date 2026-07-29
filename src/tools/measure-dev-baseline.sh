@@ -21,6 +21,8 @@ events="$sample_dir/events.tsv"
 build_log="$sample_dir/shared-build.log"
 test_log="$sample_dir/kernel-test.log"
 samples="$baseline_root/samples.tsv"
+# Bumped whenever a column is added, dropped or redefined.
+SCHEMA="dev-baseline-v2"
 mkdir -p "$sample_dir"
 : >"$events"
 
@@ -102,10 +104,21 @@ total_ms="$(duration_ms "$run_started_ns" "$run_ended_ns")"
 output_lines="$(($(wc -l <"$build_log") + $(wc -l <"$test_log")))"
 output_bytes="$(($(wc -c <"$build_log") + $(wc -c <"$test_log")))"
 
-header=$'timestamp\tscenario\ttags\tsource_s\tgraph_s\tprovider_link_audit_stage_s\tconsumer_link_audit_stage_s\treport_s\tcargo_total_ms\tinit_package_ms\tvolume_package_ms\timage_assembly_ms\tqemu_startup_ms\tguest_boot_ms\tscenario_ms\tshutdown_ms\ttotal_ms\toutput_lines\toutput_bytes\tsample_dir'
+header=$'schema\ttimestamp\tscenario\ttags\tsource_s\tgraph_s\tprovider_link_audit_stage_s\tconsumer_link_audit_stage_s\treport_s\tcargo_total_ms\tinit_package_ms\tvolume_package_ms\timage_assembly_ms\tqemu_startup_ms\tguest_boot_ms\tscenario_ms\tshutdown_ms\ttotal_ms\toutput_lines\toutput_bytes\tsample_dir'
+# What a row means is the set of phases it measured, and that set changes as the loop changes.
+# A column added, dropped or redefined turns older rows into different measurements wearing the
+# same names - which is how a regression gets argued away against a number that never measured
+# the same thing. So a row carries the schema it was recorded under, and appending to a file
+# written under a different one is refused rather than reconciled: the operator moves the old
+# file aside, and both remain readable as what they actually are.
+if [[ -f "$samples" ]] && [[ "$(head -n 1 "$samples")" != "$header" ]]; then
+	echo "dev-baseline: $samples was recorded under a different schema, so its rows measured different phases" >&2
+	echo "dev-baseline: move it aside (for example to ${samples%.tsv}-previous.tsv) and rerun; do not merge the two" >&2
+	exit 1
+fi
 if [[ ! -f "$samples" ]]; then printf '%s\n' "$header" >"$samples"; fi
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-	"$stamp" "$scenario" "$tags" "${source_seconds:--}" "${graph_seconds:--}" "${provider_seconds:--}" "${consumer_seconds:--}" "${report_seconds:--}" \
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+	"$SCHEMA" "$stamp" "$scenario" "$tags" "${source_seconds:--}" "${graph_seconds:--}" "${provider_seconds:--}" "${consumer_seconds:--}" "${report_seconds:--}" \
 	"$cargo_total_ms" "$package_init_ms" "$package_volume_ms" "$image_ms" "$qemu_startup_ms" "$guest_boot_ms" "$scenario_ms" "$shutdown_ms" "$total_ms" "$output_lines" "$output_bytes" "$sample_dir" >>"$samples"
 
 sample_header=$'scenario\ttags\tsource_s\tgraph_s\tprovider_link_audit_stage_s\tconsumer_link_audit_stage_s\treport_s\tkernel_compile_link_ms\tinit_package_ms\tvolume_package_ms\timage_assembly_ms\tqemu_startup_ms\tguest_boot_ms\tscenario_ms\tshutdown_ms\ttotal_ms\toutput_lines\toutput_bytes'
