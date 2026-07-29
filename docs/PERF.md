@@ -95,6 +95,34 @@ of scenario with `shell-basics`, 3.20 s with `registry-shadow` and 4.90 s with `
 which launches three programs. Reporting a loop time without naming its scenario is therefore
 not a measurement.
 
+### Where a full rebuild's time goes
+
+A forced whole-image rebuild of x86_64 measures 406 s: source 1 s, Cargo graph 31 s, providers
+209 s, consumers 107 s. During it the host runs at 5 to 7 percent of its 52 cores.
+
+Those two facts fit together rather than contradicting each other. Sampled every 200 ms through a
+rebuild, `rustc` is running in 229 of 300 samples, so the time is spent compiling; but one
+artifact is compiled at a time, and a small crate's compile is single-threaded - 0.36 s of wall
+time against 0.39 s of CPU, a ratio of 1.07. One core of fifty-two is the utilisation observed.
+
+This is the opposite balance to a warm leaf iteration, where compilation is 15 percent of the
+time and proving things is the rest. The two numbers describe different work and are easy to
+mistake for each other.
+
+Concurrency does not come from running the existing per-artifact `cargo rustc` invocations at
+once. They share one `CARGO_TARGET_DIR`, and cargo locks it:
+
+| tools compiled | in sequence | concurrently | speedup |
+| --- | ---: | ---: | ---: |
+| 4 | 1.78 s | 1.13 s | 1.57x |
+| 8 | 3.42 s | 2.55 s | 1.34x |
+
+The gain shrinks as more are added, which is what lock contention looks like. One cargo
+invocation building the same set instead measured 74 s of CPU in 25 s of wall time, since cargo
+schedules its own unit graph. The dependency graph does not stand in the way either: derived
+from the manifest, the 61 libraries are six levels deep (1, 14, 16, 16, 13, 1) and the 72 dynamic
+volume programs depend on no other program at all.
+
 ### The cold invalidation classes, measured
 
 `just dev-baseline <kernel|loader|topology>` labels a sample after the operator has edited the

@@ -2016,7 +2016,9 @@ if [[ -n "$image_graph" ]]; then
 			timing_event unit "object:miss:$consumer"
 			consumer_obj_tmp="$consumer_obj.tmp.$$"
 			rm -f "$consumer_obj_tmp"
+			timing_event consumer object-start
 			"$root/tools/build-consumer-object.sh" "$consumer_dir" "$image_target" "$rust_min_stack" "$rustflags" "$cargo_target" "$consumer" "$consumer_obj_tmp" "$consumer_errors" "${cargo_target_flags[@]}"
+			timing_event consumer object-end
 			mv "$consumer_obj_tmp" "$consumer_obj"
 			record_object_cache "$consumer_obj" "$object_cache_prefix" "$object_key" "$object_inputs"
 			object_inputs=""
@@ -2262,7 +2264,9 @@ if [[ -n "$image_graph" ]]; then
 		published_out="$out"
 		out="$published_out.$$.candidate"
 		rm -f "$out"
+		timing_event consumer link-start
 		"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv --gc-sections --build-id=none -e _start "$start_obj" "$consumer_obj" "${provider_inputs[@]}" --no-allow-shlib-undefined -o "$out"
+		timing_event consumer link-end
 		if ! matches_output 'Type:.*DYN' llvm-readelf -h "$out"; then
 			echo "build-shared: $out is not ET_DYN" >&2
 			exit 1
