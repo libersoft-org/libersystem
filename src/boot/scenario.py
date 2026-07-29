@@ -37,6 +37,10 @@ import tomllib
 # scenario, so neither is waiting on the other to finish loading.
 import lab
 
+# The functions below take the injected guest as a parameter named `lab`, which shadows the
+# module inside them, so the timing events reach it under a second name.
+import lab as lab_module
+
 # The format revision this runner understands. A scenario states it, so a file written for a
 # later format is refused rather than half-understood.
 SCENARIO_VERSION = 1
@@ -288,6 +292,7 @@ class Guest:
 
 
 def run(document, lab, verbose=False):
+	lab_module.timing_event('scenario', f"start:{document.get('name', 'unnamed')}")
 	guest = Guest(lab)
 	total = document.get('timeout', 300)
 	deadline = time.monotonic() + total
@@ -333,6 +338,8 @@ def run(document, lab, verbose=False):
 # is asked afterwards what it is actually holding. Returns the list of things that could not be
 # given back, empty when the instance is as the next run needs to find it.
 def teardown(lab, verbose=False):
+	lab_module.timing_event('scenario', 'steps-end')
+	lab_module.timing_event('scenario', 'cleanup-start')
 	notes = []
 	left = []
 	try:
@@ -367,6 +374,7 @@ def teardown(lab, verbose=False):
 	if verbose:
 		for note in notes:
 			print(f'     {note}')
+	lab_module.timing_event('scenario', 'cleanup-end')
 	return left
 
 

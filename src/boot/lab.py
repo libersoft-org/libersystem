@@ -92,6 +92,21 @@ Persistent development instance (one owner at a time):
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 SRC = os.path.dirname(HERE)
+
+
+# The same machine-readable phase events the shared-image builder, the kernel test driver and the
+# QEMU runner emit: one host-nanosecond timestamp, a phase and an event, appended to whatever
+# file `LIBER_TIMING_LOG` names. Written here too so that a loop iteration can be attributed
+# across the host and the guest from one file, rather than from a build log and a stopwatch.
+def timing_event(phase, event):
+	path = os.environ.get('LIBER_TIMING_LOG')
+	if not path:
+		return
+	try:
+		with open(path, 'a') as handle:
+			handle.write(f'{time.time_ns()}\t{phase}\t{event}\n')
+	except OSError:
+		pass
 REPO = os.path.dirname(SRC)
 BUILD_ROOT = os.path.join(REPO, '.build')
 BUILD = os.path.join(BUILD_ROOT, 'boot')
@@ -755,6 +770,7 @@ def cmd_dev_up(args):
 	# trace of them.
 	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1')
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
+	timing_event('qemu', 'build-start')
 	guest = subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
 	# The build and the boot are different waits and want different budgets. `just run` builds
 	# before it starts QEMU, and a tree needing a full rebuild - anything that touched the build
@@ -768,6 +784,7 @@ def cmd_dev_up(args):
 		if time.time() > build_deadline:
 			dev_bring_up_failed(lock_fd, guest, f'the build did not reach QEMU within {build_timeout} s (see {DEV_QEMU_LOG})')
 		time.sleep(0.5)
+	timing_event('qemu', 'start')
 	booted = time.time()
 	while True:
 		if time.time() - booted > timeout:
@@ -806,6 +823,7 @@ def cmd_dev_up(args):
 	# Record which boot this is, now that the guest is up and its agent can answer. Every
 	# later session compares against it, so a tool can never publish into, or read a registry
 	# from, a guest that restarted since this instance was recorded.
+	timing_event('guest', 'ready')
 	dev_record_boot()
 	profile = 'development' if b'boot profile: development' in strip_ansi(reply) or dev_profile_logged() else 'not reported'
 	print(f'lab: development instance ready in {time.time() - started:.1f} s (guest profile: {profile})')
@@ -1382,6 +1400,7 @@ def cmd_dev_ping(args):
 # the guest checks them against. An abort on any host-side failure is what stops a killed
 # publish leaving a candidate parked in the guest until its deadline.
 def cmd_dev_publish(args):
+	timing_event('publish', 'start')
 	timeout, rest = take_arg(args, '--timeout', 15)
 	rest = [a for a in rest if not a.startswith('--')]
 	if len(rest) != 2:
@@ -1432,6 +1451,7 @@ def cmd_dev_publish(args):
 			raise
 		elapsed = (time.monotonic() - started) * 1000
 		print(f'lab: generation {generation} committed in {elapsed:.1f} ms ({sent} B, digest verified by the guest)')
+		timing_event('publish', 'end')
 		# The verdict is recorded, never a gate: the artifact is in the registry either way,
 		# and what this decides is whether installing it could be a hot swap.
 		if len(body) >= 4:
@@ -1504,8 +1524,12 @@ def cmd_dev_type(args):
 def cmd_dev_reboot(args):
 	timeout = arg_value(args, '--timeout', 120)
 	state, identity = dev_state()
-	if state != 'ready':
-		die(f'the development instance is {state}; a reboot needs a running one')
+	# `starting` is accepted alongside `ready`, and refusing it was the first thing using this
+	# command found wrong with it: a guest that never reached a prompt is exactly the corrupted
+	# state this exists to clear, so demanding a healthy instance refused the one case that
+	# needed it. What is refused is an instance this worktree does not own or does not have.
+	if state not in ('ready', 'starting'):
+		die(f'the development instance is {state}; a reboot needs one this worktree owns and is running')
 	started = time.time()
 	qmp_command('system_reset')
 	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)

@@ -297,6 +297,53 @@ just test-tags-aarch64 dynamic
 just test-tags-riscv64 dynamic
 ```
 
+## The gates, and what each one costs
+
+The Justfile has 118 recipes, 65 of them checks or tests, and nothing says which to run before
+releasing or how long any of them takes. Measured on the documented host:
+
+| gate                      |   time | what it settles                                       |
+| ------------------------- | -----: | ----------------------------------------------------- |
+| `bootproto-host-test`     |  < 1 s | the shared boot contract's own unit tests             |
+| `services-host-test`      |  < 1 s | service unit tests (also pulled in by any test run)   |
+| `development-gate-check`  |    1 s | a shipping build contains no development units        |
+| `volume-layout-check`     |    2 s | the built volume package matches the manifest         |
+| `app-libs-test`           |    3 s | the application libraries' unit tests                 |
+| `artifact-metadata-check` |    4 s | no stray identity or order files under the image      |
+| `gen-check`               |    5 s | generated bindings match the interface definitions    |
+| `image-conformance`       |    9 s | eleven codecs against reference implementations       |
+| `fmt-check`               |   12 s | formatting, all languages                             |
+| `source-hygiene`          |   18 s | tree hygiene and ownership rules                      |
+| `shared-libs-verify`      |  406 s | the whole image rebuilt from nothing and re-audited   |
+| `dynamic-report-check`    | ~500 s | the checked provider/consumer reports, three targets  |
+| `static-image-check`      | ~700 s | static injection audits, three targets                |
+| `fast-path-check`         |  ~20 m | targeted and authoritative builds produce equal bytes |
+| `test-all`                |      - | the QEMU suites on x86_64, aarch64 and riscv64        |
+
+What overlaps, so a release does not pay twice:
+
+- `test-all` runs the kernel suite for all three architectures, so it contains `just test`,
+  `just test-aarch64` and `just test-riscv64`.
+- `test-tags-check` is a dependency of every preflight, and it in turn pulls
+  `artifact-metadata-check` and `services-host-test`. Any test run has already paid for those.
+- The six static-injection recipes are one script in six modes sharing four dependencies. Run
+  together they build the three targets once; run separately, four times.
+
+What looks like duplication and is not: the twelve `test-*-fast*` recipes differ from their plain
+counterparts in one step, `test-preflight.sh check` rather than `write`. They verify the input
+stamp instead of rebuilding it, which is what makes them fast and what makes them wrong to use
+when userspace has actually changed.
+
+Two ordering constraints are worth knowing before running anything:
+
+- `development-gate-check` compares the built volume package against the shipping configuration,
+  and `dev-up` builds the development one. After any use of the persistent instance it fails
+  until the tree is rebuilt without `LIBER_DEVELOPMENT`. That is the gate working, not breaking.
+- `image-conformance` cross-checks the JPEG codec against Pillow through whatever `python3`
+  resolves to. `setup.sh` provides it as the `python3-pil` system package, so the failure mode
+  to recognise is not a missing dependency but a shadowing one: a virtualenv earlier on `PATH`
+  hides the system packages unless it was created with `--system-site-packages`.
+
 ## Reading what the machine did
 
 - Serial log: `boot/.build/lab-serial.log` under the harness (`lab log`), or

@@ -102,6 +102,48 @@ default: run
 shared-libs:
     @tools/build-shared.sh x86_64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client base-proto=base-proto process-proto=process-proto display-proto=display-proto input-proto=input-proto security-proto=security-proto session-proto=session-proto storage-proto=storage-proto config-proto=config-proto audio-proto=audio-proto device-proto=device-proto log-proto=log-proto network-proto=network-proto observability-proto=observability-proto resources-proto=resources-proto time-proto=time-proto audio-client=audio-client-provider config-client=config-client-provider device-client=device-client-provider log-client=log-client-provider network-client=network-client-provider observability-client=observability-client-provider process-client=process-client-provider resources-client=resources-client-provider security-client=security-client-provider time-client=time-client-provider volume-client=volume-client-provider pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface imgconv=imgconv adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack wasm=wasm lico=lico term=term service-util=services
 
+# Every release gate in one command, cheapest first so a failure arrives early.
+#
+# It exists because the gates below are individually runnable and collectively forgotten: two of
+# them were found red after sitting that way for days, precisely because no ordinary workflow
+# invokes them. Roughly half an hour on the documented host.
+#
+# `test-all` is deliberately not here. The QEMU suites on three architectures are the longest
+# thing in the tree and are run deliberately rather than swept into something else; run
+# `just test-all` beside this one.
+#
+# The order is not arbitrary either. The shipping rebuild comes before `development-gate-check`,
+# which compares the built volume package against the shipping configuration and therefore fails
+# after any use of `dev-up` until the tree is rebuilt without it - a failure about the last thing
+# somebody did rather than about the code being released.
+#
+# run every release gate in one command, cheapest first, about half an hour; `test-all` is separate
+release:
+    @echo "release: formatting, hygiene and generated sources"
+    just fmt-check
+    just source-hygiene
+    just gen-check
+    @echo "release: rebuilding the shipping configuration"
+    just build
+    just development-gate-check
+    @echo "release: host unit tests"
+    just bootproto-host-test
+    just services-host-test
+    just app-libs-test
+    @echo "release: manifest and volume agreement"
+    just artifact-metadata-check
+    just volume-layout-check
+    @echo "release: codec conformance"
+    just image-conformance
+    @echo "release: dynamic-linking audits across three targets"
+    just static-image-check
+    just dynamic-report-check
+    @echo "release: authoritative rebuild"
+    just shared-libs-verify
+    @echo "release: targeted and authoritative builds agree byte for byte"
+    just fast-path-check
+    @echo "release: every gate passed; run `just test-all` for the three-target QEMU suites"
+
 # discard all image caches and rerun the complete compile/link/audit path
 shared-libs-verify:
     @LIBER_IMAGE_REBUILD=1 just shared-libs
