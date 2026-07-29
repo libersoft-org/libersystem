@@ -1,6 +1,8 @@
 # Bugs / changes
 
+- .build is a big mess, make it clean in well organized subdirectories
 - rename uname to sysver
+- M0042 is missing, find out what was there before - it was in TODO.md and the name was M42 back then
 - some services in src/users/services/core/src/ have it's own folder (like graph_limits), but there is only tests.rs file while graph_limits.rs resides outside of this directory - fix it... move it to the proper directory
 - testing CD image should be different from release CD image (release should not have testing volumes like UDF, ISO etc.)
 - cd bin -> lico.lsexe - says command not found, but this lsexe is present in this directory
@@ -63,10 +65,10 @@
 - df, du
 - sw render / opengl / vulkan + render tests
 - audio recorder (microphone)
-- audio device selector tool (both input and output, when system has multiple sound devices)
+- audio device selector + speaker testing tool (both input and output, when system has multiple sound devices)
 - create a live video about LiberSystem
 - imgconv - does it have compression level settings?
-- add audio conversion tool
+- audioconv - audio format conversion tool
 - web camera viewer / recorder
 - shell scripts
 - Rust Doom?

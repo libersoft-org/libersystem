@@ -631,6 +631,11 @@ dev-loop *args:
 proto-test *groups:
     @boot/proto-test.py {{ groups }}
 
+# measure one warm no-change build and one warm leaf iteration against the running instance,
+# and fail when either misses its budget or the rebuild stops being proportional
+perf-gate:
+    @boot/perf-gate.py
+
 # return an artifact in the development instance registry to the generation before its
 # newest. e.g. `just dev-rollback base-proto`
 dev-rollback *args:
