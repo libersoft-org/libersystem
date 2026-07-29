@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn ffmpeg_golden() -> Vec<u8> {
-	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../..");
 	let source = root.join("src/volume/audio/test.mp3");
 	let output = root.join(".build/testdata/mp3/test.pcm");
 	std::fs::create_dir_all(output.parent().unwrap()).expect("failed to create MP3 testdata directory");
@@ -51,7 +51,7 @@ fn parses_info_gapless_range() {
 
 #[test]
 fn decodes_staged_mpeg1_stream_in_bounded_chunks() {
-	let mp3 = Mp3::parse(include_bytes!("../../../../volume/audio/test.mp3")).unwrap();
+	let mp3 = Mp3::parse(include_bytes!("../../../../../volume/audio/test.mp3")).unwrap();
 	assert_eq!(mp3.metadata(), Metadata { rate: 44_100, channels: 1, frames: 328_104, duration_ms: 7_440 });
 	let golden = ffmpeg_golden();
 	for chunk_frames in [127, 1_024] {

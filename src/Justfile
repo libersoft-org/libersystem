@@ -142,7 +142,7 @@ release:
     just shared-libs-verify
     @echo "release: targeted and authoritative builds agree byte for byte"
     just fast-path-check
-    @echo "release: every gate passed; run `just test-all` for the three-target QEMU suites"
+    @echo "release: every gate passed; run 'just test-all' for the three-target QEMU suites"
 
 # discard all image caches and rerun the complete compile/link/audit path
 shared-libs-verify:

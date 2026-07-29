@@ -181,14 +181,26 @@ fn distinguishes_unknown_from_corrupt_recognized_formats() {
 	assert_eq!(decode_frame(&tga, 0), Err(Error::InvalidImage));
 }
 
+// The palette budget is `16 + quality * 240 / 100`, and this fixture holds 21 distinct colours:
+// 16 entries at quality 0 cannot represent it and 256 at quality 100 can. So what is asserted is
+// that the indexed path is exact exactly when its budget allows and merely lossy when it does
+// not, rather than an exact round-trip at quality 0, which is arithmetically impossible - and was
+// what this test asked for from the day it was written, so it had never once passed.
 #[test]
 fn converts_opaque_bmp_to_explicit_indexed_png() {
-	let source = bmp::decode_rgba(include_bytes!("../../bmp/tests/data/external-rgb24.bmp")).unwrap();
-	let config = parse_args(b"--quality 0 --compression 100 in.bmp out.png").unwrap();
-	let (encoded, info) = convert(include_bytes!("../../bmp/tests/data/external-rgb24.bmp"), &config).unwrap();
-	assert!(encoded.windows(4).any(|window| window == b"PLTE"));
-	assert_eq!(png::decode_rgba(&encoded).unwrap(), source);
+	let bytes = include_bytes!("../../bmp/tests/data/external-rgb24.bmp");
+	let source = bmp::decode_rgba(bytes).unwrap();
+	let (coarse_bytes, info) = convert(bytes, &parse_args(b"--quality 0 --compression 100 in.bmp out.png").unwrap()).unwrap();
+	let (fine_bytes, _) = convert(bytes, &parse_args(b"--quality 100 --compression 100 in.bmp out.png").unwrap()).unwrap();
+	assert!(coarse_bytes.windows(4).any(|window| window == b"PLTE"));
+	assert!(fine_bytes.windows(4).any(|window| window == b"PLTE"));
 	assert_eq!((info.quality, info.compression), (Some(0), Some(100)));
+	assert_eq!(png::decode_rgba(&fine_bytes).unwrap(), source);
+	let coarse = png::decode_rgba(&coarse_bytes).unwrap();
+	assert_eq!((coarse.width, coarse.height), (source.width, source.height));
+	assert_eq!(coarse.pixels.iter().skip(3).step_by(4).copied().collect::<Vec<_>>(), source.pixels.iter().skip(3).step_by(4).copied().collect::<Vec<_>>());
+	let error: u64 = coarse.pixels.chunks_exact(4).zip(source.pixels.chunks_exact(4)).map(|(actual, expected)| (0..3).map(|channel| u64::from(actual[channel].abs_diff(expected[channel]))).sum::<u64>()).sum();
+	assert!(error > 0);
 }
 
 #[test]

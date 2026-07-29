@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn ffmpeg_fixture() -> Vec<u8> {
-	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+	let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../..");
 	let output = root.join(".build/testdata/wavpack/test-stereo-short.wv");
 	std::fs::create_dir_all(output.parent().unwrap()).expect("failed to create WavPack testdata directory");
 	let status = Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=997:sample_rate=44100:duration=0.1"]).args(["-filter_complex", "[0:a]pan=stereo|c0=c0|c1=-1*c0[out]", "-map", "[out]", "-c:a", "wavpack"]).arg(&output).status().expect("ffmpeg is required to generate the WavPack mutation fixture");
