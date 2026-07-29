@@ -385,7 +385,13 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	// from the granting policy. The client is a duplicate of the manager's storage
 	// connection; the cooperative schedule serializes the reads, so sharing it is safe.
 	send_package(&process_boot_kernel, init)?;
+	// The development registry channel. ProcessService receives it unconditionally, so it must be
+	// sent even here where nothing will ever answer on it: an absent one blocks that service in
+	// its bootstrap, and every launch after it waits on a reply that cannot come.
+	let (registry_server, registry_client) = Channel::create();
+	core::mem::drop(registry_server);
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL)?;
+	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL)?;
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL)?;
 
 	// TimeService: its (dead-peer) network client and its service channel. It seeds its
@@ -1418,7 +1424,13 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
 	send_package(&process_boot_kernel, init).expect("process package bootstrap");
+	// The development registry channel. ProcessService receives it unconditionally, so it must be
+	// sent even here where nothing will ever answer on it: an absent one blocks that service in
+	// its bootstrap, and every launch after it waits on a reply that cannot come.
+	let (registry_server, registry_client) = Channel::create();
+	core::mem::drop(registry_server);
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
+	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
 	send_cap(&boot_kernel, b"SND", snd_service, Rights::ALL).expect("snd bootstrap");
 	let (audio_admin, admin) = Channel::create();
@@ -1625,7 +1637,13 @@ fn start_process_service_from_volume(volume: &[u8]) -> (alloc::sync::Arc<object:
 	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
 	send_package(&process_boot_kernel, init).expect("process package bootstrap");
+	// The development registry channel. ProcessService receives it unconditionally, so it must be
+	// sent even here where nothing will ever answer on it: an absent one blocks that service in
+	// its bootstrap, and every launch after it waits on a reply that cannot come.
+	let (registry_server, registry_client) = Channel::create();
+	core::mem::drop(registry_server);
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
+	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
 	(process_boot_kernel, storage_boot_kernel, process_client)
 }
@@ -1918,7 +1936,13 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 	send_ramdisk(&storage_boot_kernel, volume).expect("test storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
 	send_package(&process_boot_kernel, init).expect("process package bootstrap");
+	// The development registry channel. ProcessService receives it unconditionally, so it must be
+	// sent even here where nothing will ever answer on it: an absent one blocks that service in
+	// its bootstrap, and every launch after it waits on a reply that cannot come.
+	let (registry_server, registry_client) = Channel::create();
+	core::mem::drop(registry_server);
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
+	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
 	let mut launch = alloc::vec::Vec::new();
 	launch.extend_from_slice(&3u16.to_le_bytes());
