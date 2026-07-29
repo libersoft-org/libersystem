@@ -611,14 +611,32 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let pan_corr = le_u32(&pan_present.bytes, 2);
 	view_display_server.send(Message::new([pan_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview pan-present reply failed")?;
 	sched::run_until_idle();
+	// Release the arrow, because panning is continuous while a key is held: a press that is
+	// never released keeps producing presents, and how many arrive before the next step is a
+	// matter of how fast the target runs. Emulated riscv64 is roughly twenty-five times slower
+	// than x86_64 here, which is enough for the difference to change what the next receive sees.
+	let pan_release = [0, 0, 0, 0, 0x4f, 0, 0];
+	key_producer.send(Message::new(pan_release.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to release imgview pan key")?;
+	sched::run_until_idle();
 	let quit_frame = [1, 0, 0, 0, 0x14, 0, 1];
 	key_producer.send(Message::new(quit_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send imgview quit key")?;
 	sched::run_until_idle();
 
-	let release = view_display_server.recv().map_err(|_| "imgview did not release its surface after q")?;
-	if release.bytes.len() < 6 || le_u16(&release.bytes, 0) != 3 {
-		return Err("imgview sent an invalid release request");
-	}
+	// Answer any presents still in flight before the release. Requiring the release to be the
+	// very next message would make this scenario depend on the target's speed rather than on
+	// `imgview` giving the surface back, which is what it is here to prove.
+	let release = loop {
+		let message = view_display_server.recv().map_err(|_| "imgview did not release its surface after q")?;
+		if message.bytes.len() >= 6 && le_u16(&message.bytes, 0) == 3 {
+			break message;
+		}
+		if message.bytes.len() < 6 || le_u16(&message.bytes, 0) != 2 {
+			return Err("imgview sent an invalid release request");
+		}
+		let corr = le_u32(&message.bytes, 2);
+		view_display_server.send(Message::new([corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview trailing-present reply failed")?;
+		sched::run_until_idle();
+	};
 	let release_corr = le_u32(&release.bytes, 2);
 	view_display_server.send(Message::new([release_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview release reply failed")?;
 	core::mem::drop(view_output);
