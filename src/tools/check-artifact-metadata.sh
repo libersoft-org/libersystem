@@ -33,7 +33,7 @@ command -v llvm-readelf >/dev/null
 	echo "artifact-metadata: missing x86_64 shared-image output" >&2
 	exit 1
 }
-if find "$image_root" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit | grep -q . || find "$build_root/image-artifacts-x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit | grep -q .; then
+if [[ -n "$(find "$image_root" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit)" || -n "$(find "$build_root/image-artifacts-x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit)" ]]; then
 	echo "artifact-metadata: obsolete identity or provider-order sidecar remains" >&2
 	exit 1
 fi

@@ -69,7 +69,7 @@ prime_graph() {
 case "$mode" in
 quick)
 	prime_graph
-	if find "$build_root/system-image/x86_64-unknown-none" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit | grep -q . || find "$build_root/image-artifacts-x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit | grep -q .; then
+	if [[ -n "$(find "$build_root/system-image/x86_64-unknown-none" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit)" || -n "$(find "$build_root/image-artifacts-x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit)" ]]; then
 		echo "shared-cache-check: obsolete identity or provider-order sidecar remains" >&2
 		exit 1
 	fi

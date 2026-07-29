@@ -68,7 +68,8 @@ fi
 
 llvm-mc -filetype=obj -triple="$triple" "${assembler_flags[@]}" "$source" -o "$temporary_object"
 
-if ! llvm-readelf -h "$temporary_object" | grep -q 'Type:.*REL'; then
+start_object_header="$(llvm-readelf -h "$temporary_object")"
+if ! grep -q 'Type:.*REL' <<<"$start_object_header"; then
 	echo "build-exe-start: generated object is not ET_REL" >&2
 	exit 1
 fi

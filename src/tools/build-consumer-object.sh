@@ -26,7 +26,11 @@ set +e
 status=$?
 set -e
 
-if [[ "$status" != 101 || ! -f "$object" ]] || ! llvm-readelf -h "$object" | grep -q 'Type:.*REL'; then
+object_header=""
+if [[ -f "$object" ]]; then
+	object_header="$(llvm-readelf -h "$object")" || object_header=""
+fi
+if [[ "$status" != 101 || ! -f "$object" ]] || ! grep -q 'Type:.*REL' <<<"$object_header"; then
 	# Say which of the three expectations broke. They fail for different reasons and want
 	# different answers: a status other than 101 means the build did not reach the final-link
 	# shim collision this technique relies on, a missing object means cargo did not re-invoke
@@ -37,7 +41,7 @@ if [[ "$status" != 101 || ! -f "$object" ]] || ! llvm-readelf -h "$object" | gre
 	elif [[ ! -f "$object" ]]; then
 		echo "build-consumer-object: $consumer stopped at the expected link failure but emitted no object at $object; cargo did not re-invoke rustc, so --emit never ran" >&2
 	else
-		echo "build-consumer-object: $consumer emitted $object, but it is $(llvm-readelf -h "$object" | awk '/Type:/{print $2}') rather than ET_REL" >&2
+		echo "build-consumer-object: $consumer emitted $object, but it is $(awk '/Type:/{print $2}' <<<"$object_header") rather than ET_REL" >&2
 	fi
 	exit 1
 fi

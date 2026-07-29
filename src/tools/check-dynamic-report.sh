@@ -223,7 +223,8 @@ current_object_bytes() {
 		echo "dynamic-report: current ET_REL hash differs for $target $tool" >&2
 		return 1
 	}
-	llvm-readelf -h "$object" | grep -q 'Type:.*REL' || {
+	object_header="$(llvm-readelf -h "$object")" || object_header=""
+	grep -q 'Type:.*REL' <<<"$object_header" || {
 		echo "dynamic-report: current object is not ET_REL for $target $tool" >&2
 		return 1
 	}

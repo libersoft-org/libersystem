@@ -52,8 +52,12 @@ manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 manifest_digest="$(sha256sum <<<"$manifest_json" | awk '{print $1}')"
 if [[ -n "$selected_artifact" ]]; then
 	if [[ -z "$selected_kind" ]]; then
+		# Test the fields directly rather than through `select`. A `select` that rejects emits
+		# nothing, and an `if` whose condition emits nothing produces nothing at all, so the
+		# `elif` was unreachable and every library resolved as unknown. Indexing a missing
+		# program yields null, which compares false and leaves exactly one boolean.
 		selected_kind="$(jq -r --arg artifact "$selected_artifact" '
-			if (.programs[$artifact] | select(.linkage == "dynamic" and .stage == "volume")) then "program"
+			if (.programs[$artifact].linkage == "dynamic" and .programs[$artifact].stage == "volume") then "program"
 			elif .libraries[$artifact] then "library"
 			else empty
 			end
@@ -162,6 +166,29 @@ targeted_state_file=""
 targeted_state_hit=0
 targeted_state_reason=""
 object_inputs=""
+
+# `grep -q` stops at its first match and closes the pipe, so the producer's next write fails
+# with EPIPE. llvm-readelf reports that as exit 74, and `pipefail` makes it the status of the
+# whole pipeline, so a successful match read as a failed read and rejected an artifact of
+# exactly the kind that was being asked for. It is a race against the producer's final flush,
+# so it struck a different check on each run and never the same one twice. Match against
+# captured output instead: a producer that really failed still fails here, on the capture,
+# which is the case a pipeline cannot tell apart from a match.
+matches_output() {
+	local pattern="$1"
+	local output
+	shift
+	output="$("$@")" || return 2
+	grep -Eq -- "$pattern" <<<"$output"
+}
+
+matches_line() {
+	local value="$1"
+	local output
+	shift
+	output="$("$@")" || return 2
+	grep -Fqx -- "$value" <<<"$output"
+}
 
 check_dynamic_report_inventory() {
 	local report_started=$SECONDS
@@ -371,7 +398,7 @@ targeted_state_paths() {
 			find "$artifact_cache_dir" -maxdepth 1 -type f \( -name "executable-$program.*" -o -name "object-$program-*" \) -print
 		done
 		printf '%s\n' "$build_root/exe-start-$target.o" "$build_root/exe-start-$target.o.build-key"
-		if [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; then
+		if [[ "$selected_kind" == library ]] && matches_output '^pix=' printf '%s\n' "${selected_specs[@]}"; then
 			printf '%s\n' "$(program_file dyn_probe)"
 			find "$artifact_cache_dir" -maxdepth 1 -type f -name 'executable-dyn_probe.*' -print
 		fi
@@ -396,7 +423,7 @@ if [[ -n "$selected_artifact" ]]; then
 	if [[ "$force_rebuild" == 0 ]] && targeted_state_valid; then
 		provider_cache_hits="${#selected_specs[@]}"
 		executable_cache_hits="${#selected_programs[@]}"
-		if [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; then
+		if [[ "$selected_kind" == library ]] && matches_output '^pix=' printf '%s\n' "${selected_specs[@]}"; then
 			((executable_cache_hits += 1))
 		fi
 		targeted_state_hit=1
@@ -719,7 +746,7 @@ fi | while read -r crate; do
 	printf '%s\n' "$crate_dir" >>"$source_digest_roots"
 	if [[ "$crate" == *-client-provider ]]; then printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_digest_roots"; fi
 done
-if [[ -z "$selected_artifact" ]] || { [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; }; then
+if [[ -z "$selected_artifact" ]] || { [[ "$selected_kind" == library ]] && matches_output '^pix=' printf '%s\n' "${selected_specs[@]}"; }; then
 	printf '%s\n' "$(source_path dyn_probe)" >>"$source_digest_roots"
 fi
 sort -u -o "$source_digest_roots" "$source_digest_roots"
@@ -869,7 +896,7 @@ artifact_cache_valid() {
 	local expected_key="$3"
 	local expected_identity="$4"
 	local expected_needed="$5"
-	local actual_needed actual_hash identity_hash
+	local actual_needed actual_hash identity_hash program_headers dynamic_section
 	[[ -f "$out" && -f "$cache_prefix.build-key" && -f "$cache_prefix.sha256" ]] || return 1
 	[[ "$(<"$cache_prefix.build-key")" == "$expected_key" ]] || return 1
 	actual_hash="$(build_file_digest "$out")" || return 1
@@ -877,11 +904,13 @@ artifact_cache_valid() {
 	verify_identity_note "$out" "$expected_identity" || return 1
 	identity_hash="$(build_file_digest "$expected_identity")" || return 1
 	if artifact_audit_cache_valid "$cache_prefix.audit" "$expected_key" "$actual_hash" "$identity_hash" "$expected_needed"; then return 0; fi
-	llvm-readelf -h "$out" | grep -q 'Type:.*DYN' || return 1
+	matches_output 'Type:.*DYN' llvm-readelf -h "$out" || return 1
 	actual_needed="$(llvm-readelf -d "$out" 2>/dev/null | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort -u)" || return 1
 	[[ "$actual_needed" == "$expected_needed" ]] || return 1
-	! llvm-readelf -l "$out" | grep -q 'INTERP' || return 1
-	! llvm-readelf -d "$out" | grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)' || return 1
+	program_headers="$(llvm-readelf -l "$out")" || return 1
+	! grep -q 'INTERP' <<<"$program_headers" || return 1
+	dynamic_section="$(llvm-readelf -d "$out")" || return 1
+	! grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)' <<<"$dynamic_section" || return 1
 	llvm-readelf -l "$out" | awk '$1 == "LOAD" && $0 ~ /W/ && $0 ~ /E/ {bad=1} END {exit bad}' || return 1
 	verify_identity_note "$out" "$expected_identity" || return 1
 	record_artifact_audit "$cache_prefix.audit" "$expected_key" "$actual_hash" "$identity_hash" "$expected_needed"
@@ -929,7 +958,7 @@ object_cache_valid() {
 	[[ "$(cat "$cache_prefix.build-key")" == "$expected_key" ]] || return 1
 	actual_hash="$(build_file_digest "$object")" || return 1
 	[[ "$(cat "$cache_prefix.sha256")" == "$actual_hash" ]] || return 1
-	llvm-readelf -h "$object" | grep -q 'Type:.*REL' || return 1
+	matches_output 'Type:.*REL' llvm-readelf -h "$object" || return 1
 	definitions="$(llvm-readelf --wide --symbols "$object" | awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' | sort -u)"
 	[[ "$definitions" == __user_main ]]
 }
@@ -1121,7 +1150,7 @@ build_file_hash_inventory() {
 		file="$artifact_output_root/${destination%.lsexe}"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	done < <(dynamic_rows)
-	if [[ -z "$selected_artifact" ]] || { [[ "$selected_kind" == library ]] && printf '%s\n' "${selected_specs[@]}" | grep -q '^pix='; }; then
+	if [[ -z "$selected_artifact" ]] || { [[ "$selected_kind" == library ]] && matches_output '^pix=' printf '%s\n' "${selected_specs[@]}"; }; then
 		file="$(program_file dyn_probe)"
 		if [[ -f "$file" ]]; then printf '%s\0' "$file"; fi
 	fi
@@ -1143,7 +1172,8 @@ done < <(build_file_hash_inventory | sort -z -u | xargs -0 -r sha256sum --zero)
 
 image_graph_started=$SECONDS
 image_graph=""
-if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
+requested_artifact_names="$(printf '%s\n' "$@" | sed 's/=.*//')"
+if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
 	image_target="$build_root/image-cargo-$target"
 	image_target_config="$build_root/image-cargo-$target.config"
 	image_graph="$build_root/image-cargo-$target.jsonl"
@@ -1208,7 +1238,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 		printf 'provider-sources=%s\n' "$image_graph_source_digest"
 	} | sha256sum | awk '{print $1}')"
 	image_graph_valid=0
-	if [[ "$force_rebuild" == 0 && -f "$image_graph_key_file" && "$(cat "$image_graph_key_file")" == "$image_graph_key" && -f "$image_graph" && -f "$image_graph_errors" && -f "$image_seed" && -f "$service_seed" && -f "$service_seed_errors" ]] && llvm-readelf -h "$image_seed" | grep -q 'Type:.*REL' && llvm-readelf -h "$service_seed" | grep -q 'Type:.*REL' && grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$image_graph_errors" && grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$image_graph_errors" && grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$service_seed_errors" && grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$service_seed_errors"; then
+	if [[ "$force_rebuild" == 0 && -f "$image_graph_key_file" && "$(cat "$image_graph_key_file")" == "$image_graph_key" && -f "$image_graph" && -f "$image_graph_errors" && -f "$image_seed" && -f "$service_seed" && -f "$service_seed_errors" ]] && matches_output 'Type:.*REL' llvm-readelf -h "$image_seed" && matches_output 'Type:.*REL' llvm-readelf -h "$service_seed" && grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$image_graph_errors" && grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$image_graph_errors" && grep -q 'duplicate symbol: __rustc::__rust_alloc_error_handler' "$service_seed_errors" && grep -q 'duplicate symbol: __rustc::__rust_no_alloc_shim_is_unstable_v2' "$service_seed_errors"; then
 		image_graph_valid=1
 		verbose_log "build-shared: Cargo image graph cache hit"
 	else
@@ -1221,7 +1251,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 		) >"$image_graph" 2>"$image_graph_errors"
 		graph_status=$?
 		set -e
-		if [[ "$graph_status" != 101 || ! -f "$image_seed" ]] || ! llvm-readelf -h "$image_seed" | grep -q 'Type:.*REL'; then
+		if [[ "$graph_status" != 101 || ! -f "$image_seed" ]] || ! matches_output 'Type:.*REL' llvm-readelf -h "$image_seed"; then
 			echo "build-shared: Cargo image graph did not stop after emitting its ET_REL seed object" >&2
 			exit 1
 		fi
@@ -1236,7 +1266,7 @@ if printf '%s\n' "$@" | sed 's/=.*//' | grep -qx lsrt; then
 		) >>"$image_graph" 2>"$service_seed_errors"
 		service_seed_status=$?
 		set -e
-		if [[ "$service_seed_status" != 101 || ! -f "$service_seed" ]] || ! llvm-readelf -h "$service_seed" | grep -q 'Type:.*REL'; then
+		if [[ "$service_seed_status" != 101 || ! -f "$service_seed" ]] || ! matches_output 'Type:.*REL' llvm-readelf -h "$service_seed"; then
 			echo "build-shared: services image graph did not stop after emitting its ET_REL seed object" >&2
 			exit 1
 		fi
@@ -1602,7 +1632,7 @@ for spec in "$@"; do
 		if [[ -n "$image_graph" ]]; then
 			qoi_codec_archive="$(jq -r 'select(.reason == "compiler-artifact" and (.package_id | startswith("registry+") and endswith("#qoi@0.4.1"))) | .filenames[] | select(endswith(".rlib"))' "$image_graph" | sort -u)"
 		else
-			qoi_codec_archive="$(find "$deps" -maxdepth 1 -name 'libqoi-*.rlib' ! -samefile "$rlib" -print | while read -r candidate; do if ! llvm-readelf --wide --symbols "$candidate" | grep -q 'pix.*RgbaImage'; then printf '%s\n' "$candidate"; fi; done | sort -u)"
+			qoi_codec_archive="$(find "$deps" -maxdepth 1 -name 'libqoi-*.rlib' ! -samefile "$rlib" -print | while read -r candidate; do if ! matches_output 'pix.*RgbaImage' llvm-readelf --wide --symbols "$candidate"; then printf '%s\n' "$candidate"; fi; done | sort -u)"
 		fi
 		if [[ "$(wc -l <<<"$qoi_codec_archive")" != 1 ]]; then qoi_codec_archive=""; fi
 		bytemuck_archive="$(find "$deps" -maxdepth 1 -name 'libbytemuck-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
@@ -1662,7 +1692,7 @@ for spec in "$@"; do
 	expected_needed=""
 	provider_count=0
 	for provider in $row_providers; do
-		if [[ "$provider" == "$artifact" || ! "$provider" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ || "$provider" == lib* ]] || ! printf '%s\n' "${artifacts[@]}" | grep -qx "$provider"; then
+		if [[ "$provider" == "$artifact" || ! "$provider" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ || "$provider" == lib* ]] || ! matches_line "$provider" printf '%s\n' "${artifacts[@]}"; then
 			echo "build-shared: library $artifact names invalid or unavailable provider $provider" >&2
 			exit 1
 		fi
@@ -1766,7 +1796,7 @@ for spec in "$@"; do
 			fi
 		done
 	fi
-	if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
+	if ! matches_output 'Type:.*DYN' llvm-readelf -h "$out"; then
 		echo "build-shared: $out is not ET_DYN" >&2
 		exit 1
 	fi
@@ -1908,7 +1938,7 @@ if [[ -n "$image_graph" ]]; then
 		provider_inputs=()
 		expected_needed=""
 		for provider in $providers; do
-			if ! printf '%s\n' "${artifacts[@]}" | grep -qx "$provider"; then
+			if ! matches_line "$provider" printf '%s\n' "${artifacts[@]}"; then
 				echo "build-shared: dynamic $consumer names unavailable provider $provider" >&2
 				exit 1
 			fi
@@ -2146,7 +2176,7 @@ if [[ -n "$image_graph" ]]; then
 		out="$published_out.$$.candidate"
 		rm -f "$out"
 		"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv --gc-sections --build-id=none -e _start "$start_obj" "$consumer_obj" "${provider_inputs[@]}" --no-allow-shlib-undefined -o "$out"
-		if ! llvm-readelf -h "$out" | grep -q 'Type:.*DYN'; then
+		if ! matches_output 'Type:.*DYN' llvm-readelf -h "$out"; then
 			echo "build-shared: $out is not ET_DYN" >&2
 			exit 1
 		fi
@@ -2156,7 +2186,9 @@ if [[ -n "$image_graph" ]]; then
 			exit 1
 		fi
 		canonical_provider_order "$providers" >/dev/null
-		if llvm-readelf -l "$out" | grep -q 'INTERP' || llvm-readelf -d "$out" | grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)'; then
+		consumer_program_headers="$(llvm-readelf -l "$out")"
+		consumer_dynamic_section="$(llvm-readelf -d "$out")"
+		if grep -q 'INTERP' <<<"$consumer_program_headers" || grep -Eq '\((RPATH|RUNPATH|TEXTREL)\)' <<<"$consumer_dynamic_section"; then
 			echo "build-shared: $out has a forbidden dynamic-loader contract" >&2
 			exit 1
 		fi
@@ -2185,7 +2217,7 @@ if [[ -n "$image_graph" ]]; then
 	consumer_seconds=$((SECONDS - consumer_started))
 fi
 
-if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
+if matches_line pix printf '%s\n' "${artifacts[@]}"; then
 	probe="$(source_path dyn_probe)"
 	probe_out="$(program_file dyn_probe)"
 	probe_dir="$(dirname "$probe_out")"
@@ -2216,7 +2248,7 @@ if printf '%s\n' "${artifacts[@]}" | grep -qx pix; then
 	rm -f "$probe_candidate"
 	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_candidate"
 	llvm-strip --strip-debug "$probe_candidate"
-	if ! llvm-readelf -h "$probe_candidate" | grep -q 'Type:.*DYN' || ! llvm-readelf -d "$probe_candidate" | grep -q 'NEEDED.*pix.lslib'; then
+	if ! matches_output 'Type:.*DYN' llvm-readelf -h "$probe_candidate" || ! matches_output 'NEEDED.*pix.lslib' llvm-readelf -d "$probe_candidate"; then
 		echo "build-shared: $probe_candidate is not a pix.lslib-linked ET_DYN" >&2
 		exit 1
 	fi

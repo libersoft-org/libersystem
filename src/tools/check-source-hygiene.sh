@@ -146,9 +146,27 @@ if [[ "$manifest_readers" != "$allowed_manifest_readers" ]]; then
 	exit 1
 fi
 
-if find src/user -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit | grep -q .; then
+if [[ -n "$(find src/user -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit)" ]]; then
 	echo "source-hygiene: a Cargo crate remains directly under src/user:" >&2
 	find src/user -mindepth 2 -maxdepth 2 -name Cargo.toml -print >&2
+	exit 1
+fi
+
+# `grep -q` stops at its first match and closes the pipe. The producer's next write then fails
+# with EPIPE, which the llvm tools report as exit 74, and `pipefail` makes that the status of the
+# whole pipeline, so a successful match reads as a failed read. It is a race against the
+# producer's final flush, so such a check passes review and most runs and then rejects a correct
+# artifact under load. Match against captured output instead.
+grep_q_pattern='[^|][|] *grep -[A-Za-z]*q'
+grep_q_pipelines=""
+while IFS= read -r script; do
+	grep -q pipefail "$script" || continue
+	script_matches="$(grep -nE "$grep_q_pattern" "$script")" || continue
+	grep_q_pipelines+="$(sed "s#^#$script:#" <<<"$script_matches")"$'\n'
+done < <(find src -name '*.sh' | sort)
+if [[ -n "$grep_q_pipelines" ]]; then
+	echo "source-hygiene: a script using pipefail pipes into grep -q, where a match can read as a failed pipeline:" >&2
+	printf '%s' "$grep_q_pipelines" >&2
 	exit 1
 fi
 

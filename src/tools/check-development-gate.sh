@@ -26,7 +26,8 @@ fi
 for program in "${gated[@]}"; do
 	owner="$(jq -r --arg p "$program" '.programs[$p].owner' <<<"$manifest_json")"
 	crate="$(tools/source-path.sh "$owner")/Cargo.toml"
-	if ! grep -A 4 "name = \"$program\"" "$crate" | grep -q 'required-features = \["development"\]'; then
+	program_block="$(grep -A 4 "name = \"$program\"" "$crate")" || program_block=""
+	if ! grep -q 'required-features = \["development"\]' <<<"$program_block"; then
 		fail "$program is development-only in the manifest but not gated by required-features in $crate"
 	fi
 done
@@ -34,7 +35,8 @@ done
 # 2. No default feature set enables it. A `development` listed in any `default = [...]` would
 #    make the gate meaningless everywhere.
 for crate in "$(tools/source-path.sh services)/Cargo.toml" "$(tools/source-path.sh drivers)/Cargo.toml" kernel/Cargo.toml; do
-	if sed -n '/^\[features\]/,/^\[/p' "$crate" | grep -E '^default = ' | grep -q development; then
+	default_features="$(sed -n '/^\[features\]/,/^\[/p' "$crate" | grep -E '^default = ')" || default_features=""
+	if grep -q development <<<"$default_features"; then
 		fail "$crate enables development by default"
 	fi
 done
