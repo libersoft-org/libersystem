@@ -107,8 +107,15 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	assert_eq!(&converted[12..16], b"VP8 ", "opaque lossy WebP uses a simple VP8 chunk");
 	let decoded = webp::decode(&converted).expect("cross-volume lossy WebP decodes");
 	assert_eq!((decoded.width, decoded.height), (source.width, source.height));
-	let squared_error: u64 = decoded.pixels.chunks_exact(4).zip(source.pixels.chunks_exact(4)).flat_map(|(actual, expected)| (0..3).map(move |channel| i64::from(actual[channel]) - i64::from(expected[channel]))).map(|difference| difference.unsigned_abs().pow(2)).sum();
-	assert!(squared_error <= u64::from(source.width) * u64::from(source.height) * 3 * 5_000, "governed 2x2 lossy WebP exceeds its bounded RGB MSE");
+	// Lossy WebP is 4:2:0, so a 2x2 image carries exactly one chroma sample: the average of all
+	// four pixels. These four average to neutral grey by construction, so the colour cannot
+	// survive and asserting a bounded RGB error here asked for the arithmetically impossible -
+	// which is what this assertion did, and why it had never passed. libwebp encodes the same
+	// input to the same greys, so the encoder is right and the assertion was wrong.
+	// Luma is full resolution and is what this size can carry, so that is what is bounded.
+	let luma = |pixel: &[u8]| -> i64 { (16839 * i64::from(pixel[0]) + 33059 * i64::from(pixel[1]) + 6420 * i64::from(pixel[2]) + (16 << 16) + (1 << 15)) >> 16 };
+	let squared_error: u64 = decoded.pixels.chunks_exact(4).zip(source.pixels.chunks_exact(4)).map(|(actual, expected)| (luma(actual) - luma(expected)).unsigned_abs().pow(2)).sum();
+	assert!(squared_error <= u64::from(source.width) * u64::from(source.height) * 64, "governed 2x2 lossy WebP exceeds its bounded luma error");
 
 	let previous = b"previous destination";
 	let full_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice()), (*b"KEEP    BMP", previous)], true);
