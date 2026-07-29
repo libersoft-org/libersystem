@@ -48,6 +48,173 @@ Notes:
   a handshake or retransmit problem without leaving the terminal. The raw file
   (`boot/.build/lab.pcap`) opens in Wireshark when more is needed.
 
+## The development instance and the fast loop
+
+`just lab boot` above is the ad-hoc harness: it boots a guest for as long as you are looking at
+it. The development instance is the other shape - one guest that stays up across many edits,
+taking new builds of a tool without rebooting. Use it for ordinary work on a leaf tool or a
+provider; use `lab` for one-off poking and for anything the persistent profile does not cover.
+
+```sh
+just dev-up                                            # boot once and keep it
+just dev-loop uname boot/scenarios/shell-basics.toml   # build -> publish -> run
+just dev-status                                        # what is running, and is it current
+just dev-console                                       # attach a terminal (--read-only to watch)
+just dev-down                                          # stop it
+```
+
+`dev-loop` is the whole iteration in one command: it builds the artifact, publishes it into the
+running guest and runs the scenarios, stopping at the phase that failed. Each phase is exactly
+the command a person would run by hand, and they are all available separately: `dev-build`,
+`dev-publish`, `dev-test`, `dev-launch`, `dev-rollback`, `dev-reset`. A warm iteration is a few
+seconds, and the build phase reports what it reused, so an unexpectedly broad rebuild is visible
+on the summary line rather than only in the clock.
+
+The persistent profile is x86_64 only. The control channel it uses is not: the same port is
+present in the cold test configuration of all three targets.
+
+### When the fast loop is not enough
+
+Only an artifact the installed manifest already declares can iterate hot. Creating a new
+governed tool or provider is a manifest change, and that costs one cold cycle before fast
+iteration on it becomes available.
+
+`dev-status` compares the running guest against the tree in six named input classes and tells
+you which one moved. None of them is hot-publishable; each needs a rebuild, and some a reboot:
+
+| class      | covers                              | a change costs                                |
+| ---------- | ----------------------------------- | --------------------------------------------- |
+| `protocol` | the shared boot contract            | rebuilds every binary that consumes it        |
+| `kernel`   | kernel sources and the built kernel | recompiles the kernel, reassembles the image  |
+| `loader`   | loader sources and the built EFI    | recompiles the loader, reassembles the image  |
+| `packages` | `init.pkg`, `volume.pkg`            | reassembles the image from unchanged binaries |
+| `image`    | the ISO and `mkimage.sh`            | reassembles the image                         |
+| `topology` | `qemu-run.sh`                       | restarts the VM; the image is not rebuilt     |
+
+The comparison is by content, so a rebuild producing identical bytes does not read as a change,
+and a reattach keeps the recorded fingerprint - the broker changed, the guest did not.
+
+Independently of all that, the full shared-image rebuild, the fresh-boot QEMU suites and the
+three-target builds remain checkpoint gates. They are not run after each local edit, and the
+fast loop is not a substitute for them.
+
+### What a published generation means
+
+Publication is transactional. Bytes stream into a bounded candidate, which is then verified for
+complete length, digest, readable image, target architecture, canonical image identity, manifest
+ownership (the record must name the artifact it is published as), declared providers covering
+the image's own dependencies, and readable dynamic metadata. Every check runs before anything
+becomes visible, and a refused candidate is dropped rather than kept, so it spends none of the
+budget. The stated limits are 32 MB per artifact, 64 MB of live registry, three retained
+generations per artifact and one publication in flight; each is checked before a byte is
+reserved.
+
+The registry is memory the development agent holds. It never touches the system volume, so a
+publication cannot damage a cold boot and a reboot returns the guest to its built state. It also
+does not survive the agent, which is what `just dev-restart` is for when the smaller `dev-reset`
+is not enough.
+
+A published `.lslib` may resolve before the installed provider only when it is compatible, and
+compatibility is decided at the launch by the loader rather than trusted from the publication -
+the registry holds incompatible generations too. A refused provider fails the launch instead of
+falling back to the installed image, because falling back would run something other than what
+was published while looking like success.
+
+`dev-rollback <name>` returns an artifact to the generation before its newest; `dev-reset` drops
+everything the registry holds. `dev-status` lists what currently shadows the volume, with each
+generation's identity and age, so a forgotten override is visible rather than debugged as a
+missing fix.
+
+One limitation is inherent: a launch the development agent itself starts cannot be shadowed,
+because the agent is inside the launcher call at that moment and cannot answer the resolution
+query that launch triggers. Every other launch - the shell's, boot's, anything a program starts
+
+- resolves normally, so type at the terminal when you want to see a shadowed executable run.
+
+### Scenarios
+
+Application scenarios are versioned TOML under `boot/scenarios/`, run by `just dev-test`. The
+interpreter is `boot/scenario.py` on the host, so nothing is staged in the guest and changing a
+scenario or the runner costs no build at all.
+
+A document is validated in full before its first step runs: the version, the step count, every
+field's type, every payload size and every deadline, per step and total. There is no step that
+hands a string to a shell, host or guest, and an unknown step or field is refused rather than
+passed to whatever might understand it. The steps are `publish`, `input`, `key`, `pointer`,
+`expect`, `absent`, `prompt`, `launch`, `output`, `finished`, `restored`, `reset` and `restart`.
+
+`input` reaches the console over the control channel; `key` and `pointer` go through the
+emulated devices instead, so they take the path a person's hand takes and are what to use when
+the input stack itself is the subject. Fixtures are built by `boot/scenarios/make-fixtures.py`
+from real staged artifacts, because the guest verifies the image it is given.
+
+Every run tears its scope down whether it passed, failed or ran out of time, and then asks the
+guest what it is still holding - a generation, a running program, a terminal that is not at a
+prompt. Anything left is the run's failure even if every step passed.
+
+### Self-tests
+
+```sh
+just dev-selftest   # three generations, one refusal, one rollback, one boot
+just proto-test     # the control protocol's conformance suite
+just perf-gate      # the loop's timing budgets, and that the work stayed proportional
+```
+
+### Where the logs are
+
+- Guest serial: `.build/boot/dev-serial.log`, or `just dev-log` to follow it.
+- QEMU's own output, including the build that produced the image: `.build/boot/dev-qemu.log`.
+- Build and guest transcripts from test runs: `.build/test-logs`.
+- One stderr file per artifact from the shared build: `.build/system-image/<target>/logs/<name>.stderr`.
+  This is where a compile failure's real message is, and it survives the run.
+- Timing samples: `.build/dev-baseline`. Setting `LIBER_TIMING_LOG=<file>` on a build or a test
+  run appends machine-readable phase events to it.
+
+### When something is wrong
+
+`dev-status` reports exactly one state and exits zero only when the instance is both ready and
+running current inputs:
+
+- `down` - nothing running. `just dev-up`.
+- `starting` - booting.
+- `ready` - usable.
+- `stale` - sockets left by an instance that is gone. `just dev-down` clears them.
+- `detached` - the guest outlived its broker. `just dev-up` reconnects a new broker to the same
+  guest rather than rebooting it.
+- `foreign` - another worktree owns the profile; it names the owner and where to release it.
+
+Other things that have bitten, and what they look like:
+
+- `dev-up`'s timeout covers the build as well as the boot, and it defaults to 240 s. On a tree
+  that needs a full rebuild - anything that changed the build tooling itself invalidates every
+  artifact's cache key - the build alone can outlast it, and the failure reads as a serial
+  socket that never appeared. Build first, or pass `--timeout`.
+- A `dev-up` that fails part way leaves its QEMU running, and nothing reaps it: the lock goes
+  away with the Python process, so `dev-status` reports `down` and `dev-down` finds no instance
+  to stop. The next `dev-up` then fails with `Could not set up host forwarding rule`, which
+  names the port and not the cause. `pgrep -af qemu-system` finds the orphan; check its command
+  line mentions `dev-serial.sock` before killing it, so an unrelated guest is not the casualty.
+- A guest that restarted under the tools is refused by every session, because the guest draws a
+  value per boot and each session compares it. That is deliberate: it stops a tool publishing
+  into a guest that is no longer the one it was talking to.
+- A build that died partway leaves the artifact cache in a state the next build detects and
+  refuses with `dynamic <name> has no valid current ET_REL object`, and cannot repair. Delete
+  that artifact's `image-artifacts-<target>/executable-*.build-key`, `*.sha256` and
+  `state-executable-*`, then rebuild. Do not delete the cache directory itself - the builder
+  writes into it without creating it and dies on the missing path.
+- An interactive program left running wedges the scenario runner, because the guest reads as
+  "starting" while an alternate screen is up. Quit it before the next run.
+- Ctrl-C does nothing to a program in raw mode: the byte is delivered and no signal is raised.
+  Escape or `q` is what ends the tree's interactive tools.
+
+### Cleaning up
+
+`just dev-clean [--dry-run]` prunes what the host accumulates: test logs, baseline samples,
+scratch directories from builds whose process is gone, and sockets no instance owns. It keeps
+the twenty newest runs and samples, reports what it removed, and leaves anything a running
+instance still refers to. It deliberately does not touch the artifact caches or the staged
+images: those are inputs to the next build, and `just clean` is what discards them.
+
 ## Timing inside the guest
 
 - The shell's `time <command>` prints the wall time of any command, measured in

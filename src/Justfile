@@ -636,6 +636,11 @@ proto-test *groups:
 perf-gate:
     @boot/perf-gate.py
 
+# publish three successive generations into one running guest, refuse a fourth, roll back and
+# reset, and prove the guest never restarted through any of it
+dev-selftest:
+    @boot/dev-selftest.py
+
 # return an artifact in the development instance registry to the generation before its
 # newest. e.g. `just dev-rollback base-proto`
 dev-rollback *args:

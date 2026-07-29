@@ -61,6 +61,15 @@ def shadowed_uname():
 	return substitute(staged('bin/uname'), b'LiberSystem', b'SHADOWEDsys', 'uname')
 
 
+# Three generations of the same executable, each naming itself. The self-test publishes them in
+# order against one guest, so what has to be readable from the program's own output is not that
+# it was shadowed but WHICH generation answered - a test that only distinguished shadowed from
+# installed would pass just as well if the second and third publications had done nothing.
+# `GENERATION1` is the same eleven characters as `LiberSystem`, so nothing in the image moves.
+def generation_uname(index):
+	return substitute(staged('bin/uname'), b'LiberSystem', f'GENERATION{index}'.encode(), f'uname generation {index}')
+
+
 # A provider generation. `process-proto` renders the process records `ps` prints, so altering
 # the field name it writes changes the output of a program that is not itself published -
 # which is what makes it visible that the provider, and only the provider, was replaced.
@@ -83,7 +92,9 @@ def incompatible_process_proto():
 
 
 os.makedirs(OUT, exist_ok=True)
-for name, build in (('uname-shadow', shadowed_uname), ('process-proto-shadow', shadowed_process_proto), ('process-proto-incompatible', incompatible_process_proto)):
+fixtures = [('uname-shadow', shadowed_uname), ('process-proto-shadow', shadowed_process_proto), ('process-proto-incompatible', incompatible_process_proto)]
+fixtures += [(f'uname-generation{index}', lambda index=index: generation_uname(index)) for index in (1, 2, 3)]
+for name, build in fixtures:
 	target = os.path.join(OUT, name)
 	with open(target, 'wb') as handle:
 		handle.write(bytes(build()))
