@@ -383,20 +383,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			i += 1;
 		}
 		if !progress {
-			// PROBE (temporary): say which services never started and why.
-			let mut j: usize = 0;
-			while j < N {
-				if state[j] != State::Running {
-					unsafe {
-						print(b"probe: not running ");
-						print(MANIFEST[j].name);
-						print(b" reason=");
-						print(failure_reason[j].as_bytes());
-						print(b"\n");
-					}
-				}
-				j += 1;
-			}
 			break;
 		}
 	}
