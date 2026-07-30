@@ -31,6 +31,13 @@ fn start_process_service(storage: &mut StorageHarness, package: &pkg::Package<'s
 	loader::spawn_elf_process(sched::root_domain(), process_elf, boot_user, Rights::ALL, 0).expect("spawn ProcessService");
 	send_package(&boot, init).expect("ProcessService package bootstrap");
 	send_cap(&boot, b"STORAGE", storage.connect(), Rights::ALL).expect("ProcessService storage bootstrap");
+	// The development registry, with its far end dropped: nothing answers, so every
+	// launch reads the volume. The handoff itself cannot be skipped - the bootstrap
+	// consumes one message per handoff in order, so a missing one swallows the SERVE
+	// channel and the service then blocks for a message that already came and went.
+	let (registry_server, registry_client) = Channel::create();
+	core::mem::drop(registry_server);
+	send_cap(&boot, b"REGISTRY", registry_client, Rights::ALL).expect("ProcessService registry bootstrap");
 	send_cap(&boot, b"SERVE", server, Rights::ALL).expect("ProcessService serve bootstrap");
 	let online = wait_message(storage, &boot, "ProcessService did not report online");
 	assert_eq!(&online.bytes[..], b"ProcessService: online", "ProcessService serves the fresh system volume");

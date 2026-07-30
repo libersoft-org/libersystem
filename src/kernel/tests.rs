@@ -1316,6 +1316,11 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 	// A "STORAGE" message carrying no client (handle 0): ProcessService reads it, finds
 	// no storage client, and loads programs from the package instead.
 	boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new(), 0)).expect("storage bootstrap");
+	// The same for "REGISTRY": no development registry answers here, so every launch
+	// reads the volume. The message still has to arrive - the bootstrap reads its
+	// handoffs in order and each read consumes whatever arrived, so a skipped one is
+	// not skipped at all, it swallows the next message and then blocks forever.
+	boot_kernel.send(Message::new(b"REGISTRY".to_vec(), alloc::vec::Vec::new(), 0)).expect("registry bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	(boot_kernel, service_client)
 }

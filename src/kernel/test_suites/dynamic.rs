@@ -228,7 +228,11 @@ fn lico_provider_loads_with_lsrt() {
 	crate::loader::load_module_into(&process, &lico, 0x2400_0000).expect("staged lico resolves its lsrt imports and registers its exports");
 	crate::loader::load_module_into(&process, &storage_proto, 0x2500_0000).expect("staged storage protocol resolves its provider imports");
 	crate::loader::load_module_into(&process, &volume_client, 0x2600_0000).expect("staged volume client resolves its provider imports");
-	assert!(process.resolve_dynamic_symbol("_RNvNtCs5EbkmrkEgCH_4lico6detect16detect_file_type").is_some(), "lico registers its file-type detector for dynamic consumers");
+	// Matched on the path and item rather than the whole mangled name: the leading
+	// `_RNvNtCs<hash>_` disambiguator is derived from the crate's compilation metadata
+	// and differs on every target, so spelling it out pins the assertion to one
+	// architecture and fails on the other two for no reason of substance.
+	assert!(process.resolve_dynamic_symbol_by_suffix("4lico6detect16detect_file_type").is_some(), "lico registers its file-type detector for dynamic consumers");
 }
 
 tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [LicoLoad, Service, Process, ProcessService, Storage]);

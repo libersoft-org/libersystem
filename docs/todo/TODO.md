@@ -19,7 +19,7 @@ storage, a CLI and framebuffer console. Every milestone has a QEMU-tested gate.
 - [x] [M0009 - Resource accounting](M0009.md)
 - [x] [M0010 - IPC latency benchmark (phase 0 gate)](M0010.md)
 - [x] [M0011 - Process and per-process address space](M0011.md)
-- [x] [M0012 - Fault isolation and crashed-process cleanup](M0012.md)
+- [ ] [M0012 - Fault isolation and crashed-process cleanup](M0012.md)
 - [x] [M0013 - Domain hierarchy and lifecycle](M0013.md)
 - [x] [M0014 - Init package and the first userspace process](M0014.md)
 - [x] [M0015 - Framebuffer text console](M0015.md)
@@ -201,7 +201,7 @@ UEFI loader to aarch64 and riscv64. All three architectures must pass under QEMU
 board-specific real-hardware support remains later work.
 
 - [x] [M0115 - Architecture abstraction layer (the HAL boundary)](M0115.md)
-- [x] [M0116 - aarch64 (ARM64) kernel + loader port](M0116.md)
+- [ ] [M0116 - aarch64 (ARM64) kernel + loader port](M0116.md)
 - [x] [M0117 - riscv64 (RISC-V) kernel + loader port](M0117.md)
 - [x] [M0118 - Multi-arch track follow-ups (the M0115-M0117 loose ends)](M0118.md)
 - [x] [M0119 - Pre-phase-3 hardening (finish before the server platform)](M0119.md)

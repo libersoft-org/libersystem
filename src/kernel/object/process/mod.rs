@@ -136,6 +136,17 @@ impl Process {
 		self.dynamic_symbols.lock().get(name).copied()
 	}
 
+	// Resolve a registered export by the tail of its mangled name. A Rust v0 symbol
+	// carries a crate disambiguator hash derived from the crate's compilation metadata
+	// (`_RNvNtCs<hash>_4lico6detect16detect_file_type`), and that hash differs per
+	// target, so the full name is not something a caller can spell portably - only the
+	// path and item after it are stable. Intended for callers that know which export
+	// they mean but cannot know the hash; the tail must be specific enough to be
+	// unambiguous, so the first match wins.
+	pub fn resolve_dynamic_symbol_by_suffix(&self, suffix: &str) -> Option<u64> {
+		self.dynamic_symbols.lock().iter().find(|(name, _)| name.ends_with(suffix)).map(|(_, address)| *address)
+	}
+
 	pub fn register_dynamic_symbols(&self, symbols: &[(String, u64)]) -> bool {
 		let mut registry = self.dynamic_symbols.lock();
 		if registry.len().checked_add(symbols.len()).is_none_or(|len| len > 65_536) || symbols.iter().any(|(name, _)| name.is_empty() || name.len() > crate::elf::MAX_DYNAMIC_SYMBOL_NAME || registry.contains_key(name)) {

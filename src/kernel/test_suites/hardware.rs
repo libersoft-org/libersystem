@@ -147,8 +147,9 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// The userspace xhci driver, driven the way DeviceManager drives it: spawn its
 	// staged ELF (it lives on the system volume under drivers/, not in the init
 	// package) with a bootstrap channel, hand it "DEVICE" + the controller's
-	// DeviceInfo + a DeviceMemory capability to its register file and "IRQ" + its
-	// MSI-X Interrupt capability, and wait for its report. The driver resets the
+	// DeviceInfo + a DeviceMemory capability to its register file, "IRQ" + its
+	// MSI-X Interrupt capability and "KEYS" + a raw keyboard sink, then wait for
+	// its report - all three handoffs, in that order. The driver resets the
 	// controller, builds the command and event rings, enumerates the root-hub
 	// ports, addresses each connected device and reads its device descriptor - QEMU
 	// hangs a hub with a USB keyboard and a USB tablet behind it and a mass-storage
@@ -190,6 +191,12 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
 	send_cap(&kernel_ep, &msg, DeviceMemory::new(bar_phys, bar_len as usize), Rights::ALL).expect("the DEVICE handoff should send");
 	send_cap(&kernel_ep, b"IRQ", interrupt, Rights::ALL).expect("the IRQ handoff should send");
+	// The raw keyboard sink is the third and last handoff, and it is not optional
+	// here: the driver tolerates an absent sink (it stores handle 0 and carries on)
+	// but blocks for the message itself, so omitting it deadlocks bring-up before
+	// the first port is probed.
+	let (_key_drain, key_sink) = object::channel::Channel::create();
+	send_cap(&kernel_ep, b"KEYS", key_sink, Rights::ALL).expect("the KEYS handoff should send");
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the xhci driver should report in");

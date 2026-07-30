@@ -770,6 +770,10 @@ fn process_service_resolves_one_final_executable_suffix() {
 	loader::spawn_elf_process(sched::root_domain(), process_elf, boot_user, Rights::ALL, 0).expect("spawn ProcessService");
 	send_package(&boot_kernel, &repeated_package).expect("custom package bootstrap");
 	boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new(), 0)).expect("empty storage bootstrap");
+	// Likewise an empty "REGISTRY": absent, but still handed over, because the
+	// bootstrap consumes one message per handoff in order and a skipped handoff
+	// swallows the next message instead of being skipped.
+	boot_kernel.send(Message::new(b"REGISTRY".to_vec(), alloc::vec::Vec::new(), 0)).expect("empty registry bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 
 	for (corr, name) in [(1u32, &b"ping"[..]), (2, &b"ping.lsexe"[..]), (3, &b"ping.lsexe.lsexe"[..])] {
@@ -1048,6 +1052,12 @@ fn pty_hosts_a_program() {
 	loader::spawn_elf_process(sched::root_domain(), process_elf, proc_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
 	send_package(&proc_boot_kernel, init).expect("process package bootstrap");
 	send_cap(&proc_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
+	// The development registry with its far end dropped, so nothing answers and every
+	// launch reads the volume. Handed over rather than skipped: the bootstrap consumes
+	// one message per handoff in order, so omitting it swallows the SERVE channel.
+	let (registry_server, registry_client) = Channel::create();
+	core::mem::drop(registry_server);
+	send_cap(&proc_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&proc_boot_kernel, b"SERVE", proc_server, Rights::ALL).expect("process serve bootstrap");
 
 	send_cap(&boot_kernel, b"CLIENT", vt1_console_a, Rights::ALL).expect("CLIENT bootstrap");
