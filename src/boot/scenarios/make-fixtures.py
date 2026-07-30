@@ -91,8 +91,15 @@ def incompatible_process_proto():
 	return substitute(staged('lib/protocol/process-proto.lslib'), b'features=shared-image', b'features=shadow-image', 'process-proto')
 
 
+# A plain data file, unlike everything else here: the fixture-area scenario needs something a
+# tool can read back, not an executable to publish, and the point is that its contents arrive
+# in the guest unchanged.
+def fixture_text():
+	return b'fixture-content-marker\n'
+
+
 os.makedirs(OUT, exist_ok=True)
-fixtures = [('uname-shadow', shadowed_uname), ('process-proto-shadow', shadowed_process_proto), ('process-proto-incompatible', incompatible_process_proto)]
+fixtures = [('uname-shadow', shadowed_uname), ('process-proto-shadow', shadowed_process_proto), ('process-proto-incompatible', incompatible_process_proto), ('fixture-text', fixture_text)]
 fixtures += [(f'uname-generation{index}', lambda index=index: generation_uname(index)) for index in (1, 2, 3)]
 for name, build in fixtures:
 	target = os.path.join(OUT, name)

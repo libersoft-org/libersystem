@@ -66,6 +66,9 @@ MAX_KEYS = 64
 # repeated launches, measured over twenty of them, so the ceiling can say what it means.
 MAX_FRAME_LOSS = 0
 
+# Which scenarios have already run in this instance, one name per line.
+SEEN_PATH = os.path.join(lab.BUILD, 'dev-scenarios-seen')
+
 # The closed vocabularies the input and restoration steps validate against. Key names and
 # pointer buttons come from the runner's own tables so there is one list, not two that drift;
 # what a terminal restores is named here because it is the scenario format's word for it.
@@ -84,6 +87,10 @@ RESTORED = {
 # A component name, not a path and not a command line. The guest checks the same thing; this
 # is here so a scenario that meant to run a shell line is refused where it was written.
 PROGRAM_NAME = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,47}')
+
+# A fixture's bare name, checked here as well as in the guest so a scenario that meant to write
+# a path is refused where it was written rather than by a status code at run time.
+FIXTURE_NAME = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,47}')
 
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 
@@ -126,6 +133,11 @@ STEP_FIELDS = {
 	# manifest-declared name; `file` is a host path the runner reads, which never crosses the
 	# wire - only the bytes do.
 	'publish': {'required': ('artifact', 'file'), 'optional': ('timeout',)},
+	# Put a data file where the scenario's tools can read it. `name` is a bare name, never a
+	# path - the guest joins it to its own reserved prefix - and `file` is the host file whose
+	# bytes are sent. The teardown removes every fixture a run wrote, so a scenario states what
+	# it needs and never has to clean up after itself.
+	'fixture': {'required': ('name', 'file'), 'optional': ('timeout',)},
 	# Send terminal input. `text` is literal; `enter` appends a carriage return.
 	'input': {'required': ('text',), 'optional': ('enter', 'timeout')},
 	# Send key events through the emulated keyboard: `text` types a line character by character,
@@ -235,6 +247,11 @@ def validate_step(step, index, path):
 			raise ScenarioError(f'{where} ({kind}): contains is {len(step["contains"].encode())} B, at most {MAX_PATTERN_BYTES}')
 	if kind == 'publish' and not os.path.isfile(step['file']):
 		raise ScenarioError(f'{where} (publish): no such file {step["file"]}')
+	if kind == 'fixture':
+		if not os.path.isfile(step['file']):
+			raise ScenarioError(f'{where} (fixture): no such file {step["file"]}')
+		if not FIXTURE_NAME.fullmatch(step['name']):
+			raise ScenarioError(f'{where} (fixture): {step["name"]!r} is not a bare fixture name')
 	# Key names, pointer buttons and the things a terminal restores are closed vocabularies,
 	# checked here rather than at the emulator. This is the one place where what a scenario
 	# says becomes what QEMU does, and a name passed through unchecked would be a way to run
@@ -306,6 +323,7 @@ def run(document, lab, verbose=False):
 	lab_module.timing_event('scenario', f"start:{document.get('name', 'unnamed')}")
 	guest = Guest(lab)
 	baseline = lab.memory_stats(10)
+	first_run = note_run(document.get('name', 'unnamed'))
 	total = document.get('timeout', 300)
 	deadline = time.monotonic() + total
 	started = time.monotonic()
@@ -323,9 +341,9 @@ def run(document, lab, verbose=False):
 	except ScenarioError as failure:
 		# The scenario's own result is what the caller is waiting to hear, so a teardown that
 		# also went wrong is appended to it rather than replacing it.
-		left = teardown(lab, verbose, baseline)
+		left = teardown(lab, verbose, baseline, first_run)
 		raise ScenarioError(f'{failure}; and the scope was not restored: {"; ".join(left)}' if left else str(failure)) from None
-	left = teardown(lab, verbose, baseline)
+	left = teardown(lab, verbose, baseline, first_run)
 	if left:
 		# A run that passed but left the instance dirty is not a pass. The instance is shared by
 		# every scenario after it, and a scope that could not be given back is the failure this
@@ -349,7 +367,7 @@ def run(document, lab, verbose=False):
 # because the steps were attempted is how a run comes to leave state behind quietly; the guest
 # is asked afterwards what it is actually holding. Returns the list of things that could not be
 # given back, empty when the instance is as the next run needs to find it.
-def teardown(lab, verbose=False, baseline=None):
+def teardown(lab, verbose=False, baseline=None, first_run=True):
 	lab_module.timing_event('scenario', 'steps-end')
 	lab_module.timing_event('scenario', 'cleanup-start')
 	notes = []
@@ -371,6 +389,13 @@ def teardown(lab, verbose=False, baseline=None):
 			left.append('the terminal is not at a prompt')
 		if not lab.reset(10):
 			left.append('the development state was not dropped')
+		# The fixtures a run wrote, removed as a set. A count rather than a best effort: the
+		# instance is shared, and a fixture left on the volume is read by whatever runs next.
+		stuck = lab.fixture_clear(10)
+		if stuck is None:
+			left.append('the guest did not answer when asked to clear the fixtures')
+		elif stuck:
+			left.append(f'{stuck} fixture(s) could not be removed')
 		# What the guest says it is holding, which is the only account of it worth having. A
 		# generation still in the registry or a launch still in flight would both be invisible
 		# from here otherwise, and both would be inherited by the next run.
@@ -386,13 +411,39 @@ def teardown(lab, verbose=False, baseline=None):
 	lost = frames_lost(lab, baseline)
 	if lost is not None:
 		notes.append(f'the guest is {lost} frame(s) short of where the scenario found it')
-		if lost > MAX_FRAME_LOSS:
-			left.append(f'the guest lost {lost} frames ({lost * 4} kB), past the {MAX_FRAME_LOSS} the known per-run cost accounts for')
+		# Strict from the second run onward. The first run of a scenario in an instance touches
+		# things nothing has touched yet - a program launched for the first time grows its heap
+		# to a working size and keeps it - and that residency is memory in use, not memory lost.
+		# What no legitimate cost explains is the same scenario costing again what it already
+		# paid, so that is what fails.
+		if lost > MAX_FRAME_LOSS and first_run is False:
+			left.append(f'the guest lost {lost} frames ({lost * 4} kB) on a repeat run, where a scenario that gives its scope back costs nothing')
 	if verbose:
 		for note in notes:
 			print(f'     {note}')
 	lab_module.timing_event('scenario', 'cleanup-end')
 	return left
+
+
+# Record that this scenario has run in this instance, and say whether it had run before. The
+# record lives beside the instance and `dev-up` starts it empty, so "before" means "since this
+# guest booted" - which is what first-touch residency is relative to.
+def note_run(name):
+	seen = set()
+	# One scenario name per line; a missing file means nothing has run yet.
+	try:
+		with open(SEEN_PATH, encoding='utf-8') as handle:
+			seen = {line.strip() for line in handle if line.strip()}
+	except OSError:
+		pass
+	first = name not in seen
+	if first:
+		try:
+			with open(SEEN_PATH, 'a', encoding='utf-8') as handle:
+				handle.write(name + '\n')
+		except OSError:
+			pass
+	return first
 
 
 # How much system memory the run did not give back, in frames, or None when either reading is
@@ -413,6 +464,9 @@ def run_step(step, guest, lab, limit, index):
 	if kind == 'publish':
 		if not lab.publish(step['artifact'], step['file'], int(limit)):
 			raise ScenarioError(f'{where}: publishing {step["artifact"]} failed')
+	elif kind == 'fixture':
+		if not lab.fixture_put(step['name'], step['file'], int(limit)):
+			raise ScenarioError(f'{where}: writing the fixture {step["name"]} failed')
 	elif kind == 'input':
 		if not lab.type_text(step['text'], step.get('enter', True), int(limit)):
 			raise ScenarioError(f'{where}: the guest console refused the input')

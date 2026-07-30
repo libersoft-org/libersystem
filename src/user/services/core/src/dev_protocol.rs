@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use bootproto::compat;
 use bootproto::elf::Elf;
@@ -159,10 +160,26 @@ pub const OP_RESTART_ACK: u8 = 0x25;
 // of a run that ended, which nothing else in a teardown can see.
 pub const OP_MEM_STATS: u8 = 0x26;
 pub const OP_MEM_STATS_REPLY: u8 = 0x27;
+// The scenario fixture area: files a scenario needs on the volume to work against, written
+// under a reserved name prefix and removed as a set. Scenarios share one persistent guest, so
+// a fixture that outlived its run would be inherited by the next one - these exist to be
+// deleted, and the run that made them is the run that answers for them.
+pub const OP_FIXTURE_PUT: u8 = 0x28;
+pub const OP_FIXTURE_ACK: u8 = 0x29;
+pub const OP_FIXTURE_CLEAR: u8 = 0x2a;
+pub const OP_FIXTURE_CLEAR_ACK: u8 = 0x2b;
 pub const OP_ERROR: u8 = 0xff;
 
 // Statuses. Every rejection names one of these, so a failure is explained by the frame that
 // caused it rather than by a timeout on the host.
+// The fixture area's bounds. Both are refusals rather than guidance: a scenario that would
+// exceed them is told so when it asks, because the alternative is a persistent guest whose
+// volume fills up over a day of runs and fails something unrelated.
+pub const FIXTURE_PREFIX: &str = "vol://system/fixture-";
+pub const MAX_FIXTURES: usize = 32;
+pub const MAX_FIXTURE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_FIXTURE_NAME: usize = 48;
+
 pub const ST_OK: u16 = 0;
 pub const ST_BAD_VERSION: u16 = 1;
 pub const ST_BAD_OPCODE: u16 = 2;
@@ -196,6 +213,9 @@ pub const ST_NO_LAUNCHER: u16 = 23;
 pub const ST_LAUNCH_REFUSED: u16 = 24;
 // Output was asked for with no launch to read it from.
 pub const ST_NO_LAUNCH: u16 = 25;
+// The fixture area is full, or the name is not one a scenario may write.
+pub const ST_FIXTURE_FULL: u16 = 26;
+pub const ST_FIXTURE_NAME: u16 = 27;
 // A publication naming an artifact the installed manifest does not declare.
 pub const ST_UNDECLARED: u16 = 22;
 
@@ -358,13 +378,18 @@ pub struct Session {
 	// Live registry content in bytes, tracked rather than recomputed so the budget can be
 	// checked before a reservation instead of after an allocation.
 	registry_bytes: usize,
+	// The fixture files this session has written, by bare name, and what they cost. Held so a
+	// clear removes exactly what was made rather than whatever currently matches the prefix -
+	// the difference matters if anything else ever writes there.
+	fixtures: Vec<String>,
+	fixture_bytes: usize,
 }
 
 impl Session {
 	pub fn new(storage: u64, boot_nonce: [u8; 8]) -> Session {
 		let mut profile: [u8; 32] = [0u8; 32];
 		let len: usize = unsafe { boot_profile(&mut profile) };
-		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, launcher: 0, launch: None, registry: 0, restart: false, candidate: None, artifacts: Vec::new(), registry_bytes: 0 }
+		Session { boot_nonce, handshake: false, high_request: 0, next_generation: 1, registry_allowed: &profile[..len] == REGISTRY_PROFILE, storage, launcher: 0, launch: None, registry: 0, restart: false, candidate: None, artifacts: Vec::new(), registry_bytes: 0, fixtures: Vec::new(), fixture_bytes: 0 }
 	}
 
 	pub fn is_open(&self) -> bool {
@@ -610,6 +635,8 @@ impl Session {
 			OP_TERM_INPUT => terminal_input(request, payload, sink),
 			OP_RESET => self.reset(request, sink),
 			OP_MEM_STATS => memory_stats(request, sink),
+			OP_FIXTURE_PUT => self.fixture_put(request, payload, sink),
+			OP_FIXTURE_CLEAR => self.fixture_clear(request, sink),
 			OP_RESTART => self.request_restart(request, sink),
 			_ => sink.send(OP_ERROR, request, generation, ST_BAD_OPCODE, &[]),
 		}
@@ -814,6 +841,81 @@ impl Session {
 	// Reply payload: artifacts u16 | registry_bytes u32 | per artifact: name_len u8 | name |
 	// generations u8 | per generation: generation u32 | length u32 | digest [u8; 32] |
 	// published_at u64 | verdict u8 | detail_len u8 | detail.
+	// Write one fixture file for the running scenario. The name is a bare name, never a path:
+	// it is joined to a reserved prefix here, so a scenario cannot reach anywhere else on the
+	// volume no matter what it asks for, and the reserved prefix is what makes a clear able to
+	// find them again.
+	//
+	// Request payload: name length u8, the name, then the bytes. Reply payload: the fixture
+	// count and the bytes held after this one.
+	fn fixture_put(&mut self, request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
+		if payload.is_empty() {
+			return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
+		}
+		let name_len: usize = payload[0] as usize;
+		if name_len == 0 || name_len > MAX_FIXTURE_NAME || payload.len() < 1 + name_len {
+			return sink.send(OP_ERROR, request, 0, ST_FIXTURE_NAME, &[]);
+		}
+		let name: &[u8] = &payload[1..1 + name_len];
+		if !name.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) || name[0] == b'.' {
+			return sink.send(OP_ERROR, request, 0, ST_FIXTURE_NAME, &[]);
+		}
+		let Ok(name) = core::str::from_utf8(name) else {
+			return sink.send(OP_ERROR, request, 0, ST_FIXTURE_NAME, &[]);
+		};
+		let body: &[u8] = &payload[1 + name_len..];
+		// A rewrite of a fixture this session already wrote costs only the difference, so a
+		// scenario that writes the same file twice is not charged twice for it.
+		let known: bool = self.fixtures.iter().any(|held| held == name);
+		if !known && self.fixtures.len() >= MAX_FIXTURES {
+			return sink.send(OP_ERROR, request, 0, ST_FIXTURE_FULL, &[]);
+		}
+		if self.fixture_bytes + body.len() > MAX_FIXTURE_BYTES {
+			return sink.send(OP_ERROR, request, 0, ST_FIXTURE_FULL, &[]);
+		}
+		let mut path: String = String::from(FIXTURE_PREFIX);
+		path.push_str(name);
+		if !unsafe { write_volume_file(self.storage, &path, body) } {
+			return sink.send(OP_ERROR, request, 0, ST_NO_SPACE, &[]);
+		}
+		if !known {
+			self.fixtures.push(String::from(name));
+		}
+		self.fixture_bytes += body.len();
+		let mut reply: Vec<u8> = Vec::with_capacity(6);
+		reply.extend_from_slice(&(self.fixtures.len() as u16).to_le_bytes());
+		reply.extend_from_slice(&(self.fixture_bytes as u32).to_le_bytes());
+		sink.send(OP_FIXTURE_ACK, request, 0, ST_OK, &reply)
+	}
+
+	// Remove every fixture this session wrote and report what is left. Left is the number that
+	// could not be removed, not the number there were: a teardown asks this to find out whether
+	// the instance is clean, and "I tried" is not an answer to that question.
+	//
+	// Reply payload: removed u16, still held u16.
+	fn fixture_clear(&mut self, request: u32, sink: &mut impl Sink) -> bool {
+		let mut removed: u16 = 0;
+		let mut stuck: Vec<String> = Vec::new();
+		for name in core::mem::take(&mut self.fixtures) {
+			let mut path: String = String::from(FIXTURE_PREFIX);
+			path.push_str(&name);
+			if unsafe { remove_volume_file(self.storage, &path) } {
+				removed += 1;
+			} else {
+				stuck.push(name);
+			}
+		}
+		let left: u16 = stuck.len() as u16;
+		self.fixtures = stuck;
+		if self.fixtures.is_empty() {
+			self.fixture_bytes = 0;
+		}
+		let mut reply: Vec<u8> = Vec::with_capacity(4);
+		reply.extend_from_slice(&removed.to_le_bytes());
+		reply.extend_from_slice(&left.to_le_bytes());
+		sink.send(OP_FIXTURE_CLEAR_ACK, request, 0, ST_OK, &reply)
+	}
+
 	fn generation_list(&mut self, request: u32, sink: &mut impl Sink) -> bool {
 		let mut reply: Vec<u8> = Vec::new();
 		reply.extend_from_slice(&(self.artifacts.len() as u16).to_le_bytes());
@@ -1129,6 +1231,32 @@ fn declared_path(name: &[u8]) -> Option<&'static str> {
 // Read an installed artifact off the system volume. Returns None when there is no storage
 // client, or the artifact cannot be opened or mapped - all of which leave the verdict
 // unknown rather than assumed.
+// Write `body` to `path` on the volume through the agent's storage client. The buffer the
+// write takes is a transferred MemoryObject, and the call consumes it either way, so there is
+// nothing to release here on a failure.
+unsafe fn write_volume_file(storage: u64, path: &str, body: &[u8]) -> bool {
+	unsafe {
+		if storage == 0 {
+			return false;
+		}
+		let Some(buffer) = ipc_client::make_buffer(body) else { return false };
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		matches!(client.write(path, &buffer), Some(Ok(())))
+	}
+}
+
+// Remove `path` from the volume. Only names this session wrote are ever passed here, so a
+// removal that fails means the file is still there and the caller is told so.
+unsafe fn remove_volume_file(storage: u64, path: &str) -> bool {
+	unsafe {
+		if storage == 0 {
+			return false;
+		}
+		let mut client = volume::Client::new(ChannelTransport { chan: storage });
+		matches!(client.remove(path), Some(Ok(())))
+	}
+}
+
 unsafe fn read_installed(storage: u64, path: &str) -> Option<Vec<u8>> {
 	unsafe {
 		if storage == 0 {

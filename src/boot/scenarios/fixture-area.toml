@@ -1,0 +1,30 @@
+# A scenario puts a data file where the guest's tools can read it, and gets it taken away again.
+#
+# The fixture area exists because the instance is persistent and shared: a run that left a file
+# behind would be read by whatever ran next, and the failure would land on the innocent run. So a
+# scenario states the files it needs, the guest writes them under a reserved prefix it chooses
+# itself (a scenario names a file, never a path), and the teardown removes the set and reports
+# anything it could not remove.
+version = 1
+name = "fixture area"
+description = "A scenario's data file reaches the guest, a tool reads it, and the teardown takes it away."
+timeout = 120
+
+[[step]]
+do = "prompt"
+timeout = 30
+
+[[step]]
+do = "fixture"
+name = "hello.txt"
+file = "../.build/scenario-fixtures/fixture-text"
+
+# The guest joins the name to its own prefix, so the file the shell sees is fixture-hello.txt.
+[[step]]
+do = "input"
+text = "cat fixture-hello.txt"
+
+[[step]]
+do = "expect"
+contains = "fixture-content-marker"
+timeout = 20

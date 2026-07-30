@@ -825,6 +825,13 @@ def cmd_dev_up(args):
 	# from, a guest that restarted since this instance was recorded.
 	timing_event('guest', 'ready')
 	dev_record_boot()
+	# A fresh guest has touched nothing, so the record of which scenarios have run starts empty.
+	# The scenario runner reads it to tell a first run's first-touch residency, which is memory
+	# in use, from a repeat run's loss, which is not.
+	try:
+		os.remove(os.path.join(BUILD, 'dev-scenarios-seen'))
+	except OSError:
+		pass
 	profile = 'development' if b'boot profile: development' in strip_ansi(reply) or dev_profile_logged() else 'not reported'
 	print(f'lab: development instance ready in {time.time() - started:.1f} s (guest profile: {profile})')
 	print(f'lab: serial log {os.path.relpath(DEV_SERIAL_LOG, SRC)}; `just dev-status`, `just dev-down`')
@@ -1183,6 +1190,10 @@ OP_RESTART = 0x24
 OP_RESTART_ACK = 0x25
 OP_MEM_STATS = 0x26
 OP_MEM_STATS_REPLY = 0x27
+OP_FIXTURE_PUT = 0x28
+OP_FIXTURE_ACK = 0x29
+OP_FIXTURE_CLEAR = 0x2a
+OP_FIXTURE_CLEAR_ACK = 0x2b
 OP_ERROR = 0xff
 
 # Each rejection the guest can name. They exist so a failure is explained by the frame that
@@ -2013,6 +2024,44 @@ class LabGuest:
 	# when it holds nothing. None when it could not be asked at all, which is a different and
 	# worse answer than "nothing".
 	#
+	# Write one fixture file into the guest's scenario fixture area. `name` is a bare name the
+	# guest joins to its own reserved prefix, so nothing here can name a path. Returns True when
+	# the guest wrote it.
+	def fixture_put(self, name, path, timeout):
+		with open(path, 'rb') as handle:
+			body = handle.read()
+		encoded = name.encode()
+		payload = bytes([len(encoded)]) + encoded + body
+		try:
+			sock, buffer, _ = proto_session(timeout, announce=False)
+		except SystemExit:
+			return False
+		try:
+			opcode, _, _ = proto_request(sock, buffer, 2, OP_FIXTURE_PUT, payload=payload, timeout=timeout, what=f'writing the fixture {name}')
+			return opcode == OP_FIXTURE_ACK
+		except SystemExit:
+			return False
+		finally:
+			sock.close()
+
+	# Remove every fixture the guest wrote for this run. Returns the number it could not remove,
+	# or None when the instance could not answer - both of which a teardown reports rather than
+	# swallows, because a fixture left behind is inherited by whatever runs next.
+	def fixture_clear(self, timeout):
+		try:
+			sock, buffer, _ = proto_session(timeout, announce=False)
+		except SystemExit:
+			return None
+		try:
+			opcode, _, body = proto_request(sock, buffer, 2, OP_FIXTURE_CLEAR, timeout=timeout, what='clearing the fixtures', tolerate=(2,))
+			if opcode != OP_FIXTURE_CLEAR_ACK or len(body) < 4:
+				return None
+			return struct.unpack('<H', body[2:4])[0]
+		except SystemExit:
+			return None
+		finally:
+			sock.close()
+
 	# The guest's system memory account, as (free_frames, total_frames, heap_free, heap_total),
 	# or None when the instance cannot answer. None also covers an instance that predates the
 	# opcode: it replies ST_BAD_OPCODE (2), which is tolerated here rather than treated as a
