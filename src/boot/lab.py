@@ -35,6 +35,7 @@
 #
 # `sh` joins its arguments, so quoting is optional: `just lab sh time ls`.
 
+import contextlib
 import fcntl
 import glob
 import hashlib
@@ -150,9 +151,20 @@ PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
 
 # The instance's console output, as a file the broker appends to. Reading it is how anything
 # here watches the guest say something without taking the console away from whoever has it.
+# Where the guest's console output is read from. The persistent instance's log by default; a
+# cold run points it at that guest's own log, the same way it points the control channel at that
+# guest's own socket. Both have to move together, or a scenario types into one guest and reads
+# another's screen.
+SERIAL_OVERRIDE = None
+
+
+def serial_log_path():
+	return SERIAL_OVERRIDE or DEV_SERIAL_LOG
+
+
 def serial_size():
 	try:
-		return os.path.getsize(DEV_SERIAL_LOG)
+		return os.path.getsize(serial_log_path())
 	except OSError:
 		return 0
 
@@ -166,7 +178,7 @@ def serial_since(at):
 # strips them cannot see whether it happened.
 def serial_raw_since(at):
 	try:
-		with open(DEV_SERIAL_LOG, 'rb') as handle:
+		with open(serial_log_path(), 'rb') as handle:
 			handle.seek(at)
 			return handle.read()
 	except OSError:
@@ -839,7 +851,7 @@ def cmd_dev_up(args):
 
 def dev_profile_logged():
 	try:
-		with open(DEV_SERIAL_LOG, 'rb') as handle:
+		with open(serial_log_path(), 'rb') as handle:
 			return b'boot profile: development' in handle.read()
 	except OSError:
 		return False
@@ -1297,14 +1309,25 @@ def proto_await(sock, buffer, request, deadline):
 # QEMU listens on the channel socket and serves one client at a time, so a second client is
 # a connection that sits in the backlog unanswered rather than one that is refused. The
 # deadline on the handshake is what turns that into a diagnosable failure.
+# The control channel a session talks over. Normally the persistent instance's; a cold run on
+# another target points this at that target's own socket for the length of the run, because the
+# protocol and everything above it are identical either way - only the endpoint differs.
+CHANNEL_OVERRIDE = None
+
+
+def channel_path():
+	return CHANNEL_OVERRIDE or DEV_CHANNEL_SOCK
+
+
 def proto_connect(timeout):
-	if not os.path.exists(DEV_CHANNEL_SOCK):
+	if not os.path.exists(channel_path()):
 		die('this instance has no development channel; restart it with `just dev-down && just dev-up`')
-	dev_check_socket(DEV_CHANNEL_SOCK)
+	if CHANNEL_OVERRIDE is None:
+		dev_check_socket(DEV_CHANNEL_SOCK)
 	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	sock.settimeout(timeout)
 	try:
-		sock.connect(DEV_CHANNEL_SOCK)
+		sock.connect(channel_path())
 	except OSError as error:
 		die(f'development channel refused a connection: {error}')
 	return sock
@@ -1360,6 +1383,13 @@ def proto_request(sock, buffer, request, opcode, payload=b'', generation=0, time
 # Open a session and describe its bounds in one line, so every command that talks to the
 # guest starts from the same reported facts rather than from this host's assumptions.
 def proto_session(timeout, announce=True):
+	if CHANNEL_OVERRIDE is not None:
+		# A cold run owns the guest it started; there is no instance record to consult and no
+		# other owner to conflict with.
+		sock = proto_connect(timeout)
+		buffer = bytearray()
+		bounds = proto_hello(sock, buffer, timeout)
+		return sock, buffer, bounds
 	state, identity = dev_state()
 	if state == 'foreign':
 		dev_owner_conflict(identity)
@@ -2152,6 +2182,102 @@ def cmd_dev_test(args):
 	print(f'lab: {len(documents)} scenario(s) passed')
 
 
+# Run scenarios against a cold boot of any target: build it with the development profile, start
+# one guest, drive it over the same protocol the persistent instance uses, and take it down again.
+#
+# This is what keeps a migrated application test from narrowing the set of architectures it is
+# exercised on. The persistent instance is x86_64-only and always will be - it exists to be fast,
+# and it earns that by staying up - but a scenario is data interpreted on the host, so the only
+# thing that ever tied it to one target was that no other target had a guest that would answer.
+# Now they do, and this is the command that starts one.
+def cmd_scenario_cold(args):
+	import scenario
+
+	global CHANNEL_OVERRIDE, SERIAL_OVERRIDE
+	verbose = '--verbose' in args
+	rest = [a for a in args if not a.startswith('--')]
+	if len(rest) < 2 or rest[0] not in ('x86_64', 'aarch64', 'riscv64'):
+		die('usage: scenario-cold [--verbose] <x86_64|aarch64|riscv64> <file.toml>...')
+	target, paths = rest[0], rest[1:]
+	documents = []
+	for path in paths:
+		try:
+			documents.append((path, scenario.load(path)))
+		except scenario.ScenarioError as error:
+			die(str(error))
+
+	env = dict(os.environ, LIBER_DEVELOPMENT='1')
+	build = {'x86_64': ['just', 'user', 'kernel-build'], 'aarch64': ['just', 'user-aarch64'], 'riscv64': ['just', 'user-riscv64']}[target]
+	print(f'lab: building {target} with the development profile')
+	if subprocess.run(build, cwd=SRC, env=env).returncode != 0:
+		die(f'the {target} userspace did not build')
+	triple = {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}[target]
+	if subprocess.run(['cargo', 'build', '--target', triple], cwd=os.path.join(SRC, 'kernel'), env=env).returncode != 0:
+		die(f'the {target} kernel did not build')
+
+	socket_path = DEV_CHANNEL_SOCK if target == 'x86_64' else os.path.join(BUILD, f'dev-channel-{target}.sock')
+	kernel = os.path.join(BUILD_ROOT, 'cargo', 'kernel', triple, 'debug', 'kernel')
+	log = os.path.join(BUILD, f'cold-{target}.log')
+	with contextlib.suppress(OSError):
+		os.remove(socket_path)
+	# A cold guest has run nothing, so the record of which scenarios have already run starts
+	# empty here for the same reason `dev-up` empties it: first-touch residency is relative to a
+	# boot, and this is a new one.
+	with contextlib.suppress(OSError):
+		os.remove(os.path.join(BUILD, 'dev-scenarios-seen'))
+	guest_env = dict(env, DEV_PROFILE='1', SERIAL=f'file:{log}')
+	print(f'lab: booting {target}; serial log {os.path.relpath(log, SRC)}')
+	guest = subprocess.Popen(['bash', 'boot/qemu-run.sh', target, kernel], cwd=SRC, env=guest_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+	failures = 0
+	try:
+		CHANNEL_OVERRIDE = socket_path
+		SERIAL_OVERRIDE = log
+		# The guest is answering when it answers, not when a timer says so: poll the handshake
+		# rather than sleeping for a number that would be wrong on both a fast and a slow target.
+		deadline = time.time() + 300
+		while time.time() < deadline:
+			if guest.poll() is not None:
+				die(f'the {target} guest exited before it served the control channel (see {log})')
+			try:
+				sock, _, _ = proto_session(5, announce=False)
+				sock.close()
+				break
+			except (OSError, SystemExit):
+				pass
+			time.sleep(1)
+		else:
+			die(f'the {target} guest never served the control channel (see {log})')
+		# The agent answers as soon as DeviceManager starts it, which is well before the boot
+		# chain has finished and a shell is at a prompt. A scenario's first step would otherwise
+		# race the rest of the boot, and on an emulated target that race is not close.
+		ready = LabGuest(30)
+		while time.time() < deadline:
+			if ready.wait_prompt(5):
+				break
+			if guest.poll() is not None:
+				die(f'the {target} guest exited while booting (see {log})')
+		else:
+			die(f'the {target} guest served its channel but never reached a shell (see {log})')
+		for path, document in documents:
+			name = document['name']
+			try:
+				elapsed = scenario.run(document, LabGuest(60), verbose)
+				print(f'lab: {name} passed in {elapsed:.1f} s on {target} ({os.path.relpath(path, SRC)})')
+			except scenario.ScenarioError as error:
+				print(f'lab: {name} FAILED on {target}: {error}', file=sys.stderr)
+				failures += 1
+	finally:
+		CHANNEL_OVERRIDE = None
+		SERIAL_OVERRIDE = None
+		with contextlib.suppress(ProcessLookupError):
+			os.killpg(os.getpgid(guest.pid), signal.SIGTERM)
+		with contextlib.suppress(Exception):
+			guest.wait(timeout=15)
+	if failures:
+		die(f'{failures} of {len(documents)} scenario(s) failed on {target}')
+	print(f'lab: {len(documents)} scenario(s) passed on {target}')
+
+
 # ---- subcommands -----------------------------------------------------------
 
 def cmd_boot(args):
@@ -2632,7 +2758,7 @@ def take_arg(args, name, default):
 	return value, rest
 
 
-COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-reboot': cmd_dev_reboot, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down}
+COMMANDS = {'boot': cmd_boot, 'sh': cmd_sh, 'int': cmd_int, 'wait': cmd_wait, 'log': cmd_log, 'key': cmd_key, 'monitor': cmd_monitor, 'usb-attach': cmd_usb_attach, 'usb-detach': cmd_usb_detach, 'pcap': cmd_pcap, 'test': cmd_test, 'shot': cmd_shot, 'quit': cmd_quit, 'dev-up': cmd_dev_up, 'dev-status': cmd_dev_status, 'dev-console': cmd_dev_console, 'dev-log': cmd_dev_log, 'dev-ping': cmd_dev_ping, 'dev-publish': cmd_dev_publish, 'dev-generations': cmd_dev_generations, 'dev-rollback': cmd_dev_rollback, 'dev-type': cmd_dev_type, 'dev-reset': cmd_dev_reset, 'dev-reboot': cmd_dev_reboot, 'dev-restart': cmd_dev_restart, 'dev-stop': cmd_dev_stop, 'dev-key': cmd_dev_key, 'dev-pointer': cmd_dev_pointer, 'dev-test': cmd_dev_test, 'dev-launch': cmd_dev_launch, 'dev-loop': cmd_dev_loop, 'dev-clean': cmd_dev_clean, 'dev-down': cmd_dev_down, 'scenario-cold': cmd_scenario_cold}
 
 
 def main():

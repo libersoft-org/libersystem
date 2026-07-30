@@ -219,9 +219,9 @@ user: shared-libs
 # from each crate's aarch64-unknown-none target dir)
 user-aarch64: shared-libs-aarch64
     cd {{ user_dir }} && cargo build --target aarch64-unknown-none
-    cd {{ services_dir }} && cargo build --target aarch64-unknown-none
+    cd {{ services_dir }} && cargo build --target aarch64-unknown-none {{ dev_features }}
     cd {{ storage_dir }} && cargo build --target aarch64-unknown-none
-    cd {{ drivers_dir }} && cargo build --target aarch64-unknown-none
+    cd {{ drivers_dir }} && cargo build --target aarch64-unknown-none {{ dev_features }}
 
 # build the WebAssembly component SDK example (the `liber` world guest) for
 # wasm32-unknown-unknown; the package builder stages it directly from .build
@@ -566,9 +566,9 @@ run-aarch64 *displays: sdk user-aarch64
 # each crate's riscv64gc-unknown-none-elf target dir)
 user-riscv64: shared-libs-riscv64
     cd {{ user_dir }} && cargo build --target riscv64gc-unknown-none-elf
-    cd {{ services_dir }} && cargo build --target riscv64gc-unknown-none-elf
+    cd {{ services_dir }} && cargo build --target riscv64gc-unknown-none-elf {{ dev_features }}
     cd {{ storage_dir }} && cargo build --target riscv64gc-unknown-none-elf
-    cd {{ drivers_dir }} && cargo build --target riscv64gc-unknown-none-elf
+    cd {{ drivers_dir }} && cargo build --target riscv64gc-unknown-none-elf {{ dev_features }}
 
 # build + boot the riscv64 build in QEMU over OpenSBI (emulated on an x86 host),
 # reaching the pinned userspace service chain over the serial console. The system
@@ -711,6 +711,13 @@ dev-rollback *args:
 # e.g. `just dev-test boot/scenarios/*.toml`
 dev-test *args:
     @boot/lab.py dev-test {{ args }}
+
+# run scenarios against a cold boot of any target, with no persistent instance: builds that
+# target with the development profile, boots one guest, drives it over the same control protocol
+# and takes it down. This is what lets an application scenario be exercised on aarch64 and
+# riscv64, where the persistent instance does not exist.
+scenario-cold *args:
+    @boot/lab.py scenario-cold {{ args }}
 
 # launch a canonical program in the development instance through PermissionManager and print
 # what it writes. e.g. `just dev-launch uname`
