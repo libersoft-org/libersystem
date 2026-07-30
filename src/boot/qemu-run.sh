@@ -637,6 +637,11 @@ qemu_run_aarch64() {
 		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
 			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
 			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "disable-legacy=on"
+			# The same discoverable GPU the test configuration supplies, and for the same
+			# reason: the virt machine has no VGA device, the interactive set offers ramfb
+			# instead, and nothing drives ramfb - so DisplayService never comes up and takes
+			# ConsoleService and the shell down with it. A driven guest needs all three.
+			qemu_args+=(-device "virtio-gpu-pci,disable-legacy=on")
 		fi
 	fi
 	qemu_append_debug_args qemu_args
@@ -748,6 +753,11 @@ qemu_run_riscv64() {
 		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
 			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
 			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" ""
+			# The same discoverable GPU the test configuration supplies, and for the same
+			# reason: the virt machine has no VGA device, the interactive set offers ramfb
+			# instead, and nothing drives ramfb - so DisplayService never comes up and takes
+			# ConsoleService and the shell down with it. A driven guest needs all three.
+			qemu_args+=(-device "virtio-gpu-pci")
 		fi
 	fi
 	qemu_append_debug_args qemu_args
