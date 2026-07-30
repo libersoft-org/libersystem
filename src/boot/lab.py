@@ -1181,6 +1181,8 @@ OP_RESET = 0x22
 OP_RESET_ACK = 0x23
 OP_RESTART = 0x24
 OP_RESTART_ACK = 0x25
+OP_MEM_STATS = 0x26
+OP_MEM_STATS_REPLY = 0x27
 OP_ERROR = 0xff
 
 # Each rejection the guest can name. They exist so a failure is explained by the frame that
@@ -2011,6 +2013,26 @@ class LabGuest:
 	# when it holds nothing. None when it could not be asked at all, which is a different and
 	# worse answer than "nothing".
 	#
+	# The guest's system memory account, as (free_frames, total_frames, heap_free, heap_total),
+	# or None when the instance cannot answer. None also covers an instance that predates the
+	# opcode: it replies ST_BAD_OPCODE (2), which is tolerated here rather than treated as a
+	# failure, because a running instance older than this check is a reason to skip the check and
+	# not a reason to fail somebody's scenario.
+	def memory_stats(self, timeout):
+		try:
+			sock, buffer, _ = proto_session(timeout, announce=False)
+		except SystemExit:
+			return None
+		try:
+			opcode, _, body = proto_request(sock, buffer, 2, OP_MEM_STATS, timeout=timeout, what='reading the memory account', tolerate=(2,))
+			if opcode != OP_MEM_STATS_REPLY or len(body) < 32:
+				return None
+			return struct.unpack('<QQQQ', body[:32])
+		except SystemExit:
+			return None
+		finally:
+			sock.close()
+
 	# Asked of the guest rather than inferred from what the runner did: the point of the check
 	# is to catch the case where the runner believes it cleaned up and the guest disagrees.
 	def scope_held(self, timeout):

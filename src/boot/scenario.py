@@ -55,6 +55,17 @@ MAX_TOTAL_SECONDS = 1800
 MAX_ARGS_BYTES = 512
 MAX_KEYS = 64
 
+# How many frames a scenario may leave the guest short of where it found it before the run is
+# treated as not having given its scope back. Measured rather than chosen: on an otherwise idle
+# instance the reading does not drift at all (six consecutive samples, identical to the frame),
+# and a shell-basics run loses 256 to 259 frames on about two thirds of runs and nothing on the
+# rest - a real per-run loss of about 1 MB that is recorded against this item and not yet fixed.
+# The ceiling is four times that known cost, so it catches a run that loses memory by the tens of
+# megabytes today while the 1 MB remains. It is the wrong number in the end: once the per-run loss
+# is fixed this wants to be zero, because "the counters returned to baseline" is the property the
+# item actually asks to verify, and any tolerance above zero is a tolerance for a leak.
+MAX_FRAME_LOSS = 1024
+
 # The closed vocabularies the input and restoration steps validate against. Key names and
 # pointer buttons come from the runner's own tables so there is one list, not two that drift;
 # what a terminal restores is named here because it is the scenario format's word for it.
@@ -294,6 +305,7 @@ class Guest:
 def run(document, lab, verbose=False):
 	lab_module.timing_event('scenario', f"start:{document.get('name', 'unnamed')}")
 	guest = Guest(lab)
+	baseline = lab.memory_stats(10)
 	total = document.get('timeout', 300)
 	deadline = time.monotonic() + total
 	started = time.monotonic()
@@ -311,9 +323,9 @@ def run(document, lab, verbose=False):
 	except ScenarioError as failure:
 		# The scenario's own result is what the caller is waiting to hear, so a teardown that
 		# also went wrong is appended to it rather than replacing it.
-		left = teardown(lab, verbose)
+		left = teardown(lab, verbose, baseline)
 		raise ScenarioError(f'{failure}; and the scope was not restored: {"; ".join(left)}' if left else str(failure)) from None
-	left = teardown(lab, verbose)
+	left = teardown(lab, verbose, baseline)
 	if left:
 		# A run that passed but left the instance dirty is not a pass. The instance is shared by
 		# every scenario after it, and a scope that could not be given back is the failure this
@@ -337,7 +349,7 @@ def run(document, lab, verbose=False):
 # because the steps were attempted is how a run comes to leave state behind quietly; the guest
 # is asked afterwards what it is actually holding. Returns the list of things that could not be
 # given back, empty when the instance is as the next run needs to find it.
-def teardown(lab, verbose=False):
+def teardown(lab, verbose=False, baseline=None):
 	lab_module.timing_event('scenario', 'steps-end')
 	lab_module.timing_event('scenario', 'cleanup-start')
 	notes = []
@@ -371,11 +383,28 @@ def teardown(lab, verbose=False):
 	# unreachable, and during teardown that is something to report, not something to die of.
 	except (OSError, ValueError, SystemExit) as error:
 		left.append(f'teardown did not complete: {error}')
+	lost = frames_lost(lab, baseline)
+	if lost is not None:
+		notes.append(f'the guest is {lost} frame(s) short of where the scenario found it')
+		if lost > MAX_FRAME_LOSS:
+			left.append(f'the guest lost {lost} frames ({lost * 4} kB), past the {MAX_FRAME_LOSS} the known per-run cost accounts for')
 	if verbose:
 		for note in notes:
 			print(f'     {note}')
 	lab_module.timing_event('scenario', 'cleanup-end')
 	return left
+
+
+# How much system memory the run did not give back, in frames, or None when either reading is
+# unavailable - an instance older than the opcode, or one that stopped answering. Never negative:
+# a run that ended with more free memory than it started with has nothing to answer for.
+def frames_lost(lab, baseline):
+	if baseline is None:
+		return None
+	after = lab.memory_stats(10)
+	if after is None:
+		return None
+	return max(0, baseline[0] - after[0])
 
 
 def run_step(step, guest, lab, limit, index):

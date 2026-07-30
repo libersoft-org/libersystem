@@ -153,6 +153,12 @@ pub const OP_RESET: u8 = 0x22;
 pub const OP_RESET_ACK: u8 = 0x23;
 pub const OP_RESTART: u8 = 0x24;
 pub const OP_RESTART_ACK: u8 = 0x25;
+// The guest's own account of system memory, so a host can ask whether a scenario gave back
+// what it took. A scenario's own launch runs in a Domain the kernel frees with the process, so
+// what this catches is the leak that outlives it: memory a service is still holding on behalf
+// of a run that ended, which nothing else in a teardown can see.
+pub const OP_MEM_STATS: u8 = 0x26;
+pub const OP_MEM_STATS_REPLY: u8 = 0x27;
 pub const OP_ERROR: u8 = 0xff;
 
 // Statuses. Every rejection names one of these, so a failure is explained by the frame that
@@ -603,6 +609,7 @@ impl Session {
 			OP_LAUNCH_STOP => self.launch_stop(request, sink),
 			OP_TERM_INPUT => terminal_input(request, payload, sink),
 			OP_RESET => self.reset(request, sink),
+			OP_MEM_STATS => memory_stats(request, sink),
 			OP_RESTART => self.request_restart(request, sink),
 			_ => sink.send(OP_ERROR, request, generation, ST_BAD_OPCODE, &[]),
 		}
@@ -875,6 +882,33 @@ impl Session {
 // of replaying a line and doubling it.
 //
 // Reply payload: accepted u16.
+// The guest's system memory account: free and total frames, free and total heap. Answered from
+// the kernel rather than tracked here, because a figure this is used to compare across a
+// scenario has to come from whatever the kernel would say if asked at any other moment.
+//
+// This is a whole-system reading on purpose, and that is the point rather than a compromise. A
+// launched program runs in a Domain of its own that the kernel frees with the process, so a leak
+// inside a scenario's own launch cannot survive it and needs no checking. What can survive it is
+// a service that took something on the run's behalf and did not give it back - a retained
+// MemoryObject, a journal entry, a registry generation - and none of that is visible from inside
+// the scope that ended. A system reading sees it, at the cost of also seeing whatever else the
+// system did meanwhile, which is why the comparison that uses it needs a tolerance rather than
+// an equality.
+//
+// Reply payload: free_frames u64, total_frames u64, heap_free u64, heap_total u64.
+fn memory_stats(request: u32, sink: &mut impl Sink) -> bool {
+	let mut stats: MemoryStats = MemoryStats::default();
+	if unsafe { rt::memory_stats(&mut stats) } < 0 {
+		return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
+	}
+	let mut reply: Vec<u8> = Vec::with_capacity(32);
+	reply.extend_from_slice(&stats.free_frames.to_le_bytes());
+	reply.extend_from_slice(&stats.total_frames.to_le_bytes());
+	reply.extend_from_slice(&stats.heap_free.to_le_bytes());
+	reply.extend_from_slice(&stats.heap_total.to_le_bytes());
+	sink.send(OP_MEM_STATS_REPLY, request, 0, ST_OK, &reply)
+}
+
 fn terminal_input(request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
 	if payload.is_empty() {
 		return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
