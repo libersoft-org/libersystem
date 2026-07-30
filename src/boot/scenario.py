@@ -69,6 +69,13 @@ MAX_FRAME_LOSS = 0
 # Which scenarios have already run in this instance, one name per line.
 SEEN_PATH = os.path.join(lab.BUILD, 'dev-scenarios-seen')
 
+# How much longer every deadline in a scenario may take, set by the runner for a guest that is
+# emulated rather than native. A scenario states its deadlines once, for one machine, and they
+# are what bounds it; a target that runs ten times slower does not make those numbers wrong, it
+# makes them the wrong unit. Scaling them keeps the scenario honest about what it waits for and
+# keeps the bound, because a scaled deadline is still a deadline.
+TIME_SCALE = 1.0
+
 # The closed vocabularies the input and restoration steps validate against. Key names and
 # pointer buttons come from the runner's own tables so there is one list, not two that drift;
 # what a terminal restores is named here because it is the scenario format's word for it.
@@ -324,7 +331,7 @@ def run(document, lab, verbose=False):
 	guest = Guest(lab)
 	baseline = lab.memory_stats(10)
 	first_run = note_run(document.get('name', 'unnamed'))
-	total = document.get('timeout', 300)
+	total = document.get('timeout', 300) * TIME_SCALE
 	deadline = time.monotonic() + total
 	started = time.monotonic()
 	try:
@@ -332,7 +339,7 @@ def run(document, lab, verbose=False):
 			if time.monotonic() >= deadline:
 				raise ScenarioError(f'step {index + 1}: the scenario ran past its {total} s total deadline')
 			remaining = deadline - time.monotonic()
-			limit = min(step.get('timeout', 30), remaining)
+			limit = min(step.get('timeout', 30) * TIME_SCALE, remaining)
 			label = f'{index + 1}/{len(document["step"])} {step["do"]}'
 			at = time.monotonic()
 			run_step(step, guest, lab, limit, index)

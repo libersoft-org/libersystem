@@ -2220,6 +2220,11 @@ def cmd_scenario_cold(args):
 	log = os.path.join(BUILD, f'cold-{target}.log')
 	with contextlib.suppress(OSError):
 		os.remove(socket_path)
+	# The previous run's serial log has to go with it. The runner reads readiness out of this
+	# file, and a leftover one still holds the last run's shell prompt - which is matched
+	# immediately, so the scenario starts typing into a guest that is still booting.
+	with contextlib.suppress(OSError):
+		os.remove(log)
 	# A cold guest has run nothing, so the record of which scenarios have already run starts
 	# empty here for the same reason `dev-up` empties it: first-touch residency is relative to a
 	# boot, and this is a new one.
@@ -2232,9 +2237,16 @@ def cmd_scenario_cold(args):
 	try:
 		CHANNEL_OVERRIDE = socket_path
 		SERIAL_OVERRIDE = log
+		# An emulated guest is slower than the native one every scenario deadline was written
+		# against, by roughly an order of magnitude on the interactive steps.
+		scenario.TIME_SCALE = 1.0 if target == 'x86_64' else 10.0
 		# The guest is answering when it answers, not when a timer says so: poll the handshake
 		# rather than sleeping for a number that would be wrong on both a fast and a slow target.
-		deadline = time.time() + 300
+		# Generous on purpose. An emulated aarch64 or riscv64 guest takes minutes to bring its
+		# whole chain up, and a deadline shorter than that does not report a slow boot - it
+		# reports a hang, which is a different thing and sends whoever reads it somewhere else
+		# entirely. This one was 300 s and cost a long hunt for a stall that was never there.
+		deadline = time.time() + 1800
 		while time.time() < deadline:
 			if guest.poll() is not None:
 				die(f'the {target} guest exited before it served the control channel (see {log})')
@@ -2250,12 +2262,26 @@ def cmd_scenario_cold(args):
 		# The agent answers as soon as DeviceManager starts it, which is well before the boot
 		# chain has finished and a shell is at a prompt. A scenario's first step would otherwise
 		# race the rest of the boot, and on an emulated target that race is not close.
-		ready = LabGuest(30)
+		# Readiness is read from the guest's own serial log, not asked of a broker: a cold run has
+		# no broker, so `wait_prompt` - which goes through one - can only ever fail here, and a
+		# readiness check that cannot succeed is worse than none. Progress is printed while
+		# waiting, because an emulated guest takes minutes and silence for minutes is
+		# indistinguishable from a hang to whoever is watching.
+		said = 0.0
 		while time.time() < deadline:
-			if ready.wait_prompt(5):
+			try:
+				with open(log, 'rb') as handle:
+					tail = handle.read()[-4096:]
+			except OSError:
+				tail = b''
+			if PROMPT.search(strip_ansi(tail)):
 				break
 			if guest.poll() is not None:
 				die(f'the {target} guest exited while booting (see {log})')
+			if time.time() - said >= 30:
+				said = time.time()
+				print(f'lab: waiting for the {target} guest to reach a shell ({len(tail)} B of console output so far)')
+			time.sleep(2)
 		else:
 			die(f'the {target} guest served its channel but never reached a shell (see {log})')
 		for path, document in documents:
