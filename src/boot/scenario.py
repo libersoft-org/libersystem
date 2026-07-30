@@ -56,15 +56,15 @@ MAX_ARGS_BYTES = 512
 MAX_KEYS = 64
 
 # How many frames a scenario may leave the guest short of where it found it before the run is
-# treated as not having given its scope back. Measured rather than chosen: on an otherwise idle
-# instance the reading does not drift at all (six consecutive samples, identical to the frame),
-# and a shell-basics run loses 256 to 259 frames on about two thirds of runs and nothing on the
-# rest - a real per-run loss of about 1 MB that is recorded against this item and not yet fixed.
-# The ceiling is four times that known cost, so it catches a run that loses memory by the tens of
-# megabytes today while the 1 MB remains. It is the wrong number in the end: once the per-run loss
-# is fixed this wants to be zero, because "the counters returned to baseline" is the property the
-# item actually asks to verify, and any tolerance above zero is a tolerance for a leak.
-MAX_FRAME_LOSS = 1024
+# treated as not having given its scope back. Zero, because the property being verified is that
+# the counters returned to baseline and any tolerance above zero is a tolerance for a leak.
+#
+# It was 1024 for as long as one existed. A scenario used to lose about a megabyte per run - the
+# runtime heap grew on every program launch and never gave a byte back - and that made a strict
+# check impossible to arm, so the ceiling stood at four times the known loss just to catch
+# something worse. With the heap coalescing its free list the loss is exactly zero across
+# repeated launches, measured over twenty of them, so the ceiling can say what it means.
+MAX_FRAME_LOSS = 0
 
 # The closed vocabularies the input and restoration steps validate against. Key names and
 # pointer buttons come from the runner's own tables so there is one list, not two that drift;
