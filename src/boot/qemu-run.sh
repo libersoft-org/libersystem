@@ -642,6 +642,15 @@ qemu_run_aarch64() {
 			# instead, and nothing drives ramfb - so DisplayService never comes up and takes
 			# ConsoleService and the shell down with it. A driven guest needs all three.
 			qemu_args+=(-device "virtio-gpu-pci,disable-legacy=on")
+			# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
+			# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
+			# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
+			# or collide with it. Without these a `key` step reaches nothing and quietly does nothing.
+			local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
+			local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+			rm -f "$dev_monitor" "$dev_qmp"
+			qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
+			qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
 		fi
 	fi
 	qemu_append_debug_args qemu_args
@@ -758,6 +767,15 @@ qemu_run_riscv64() {
 			# instead, and nothing drives ramfb - so DisplayService never comes up and takes
 			# ConsoleService and the shell down with it. A driven guest needs all three.
 			qemu_args+=(-device "virtio-gpu-pci")
+			# The monitor and QMP sockets a driven guest needs: `key` and `pointer` steps go through
+			# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
+			# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
+			# or collide with it. Without these a `key` step reaches nothing and quietly does nothing.
+			local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
+			local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+			rm -f "$dev_monitor" "$dev_qmp"
+			qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
+			qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
 		fi
 	fi
 	qemu_append_debug_args qemu_args

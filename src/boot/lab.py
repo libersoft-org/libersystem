@@ -117,6 +117,22 @@ SERIAL_LOG = os.path.join(BUILD, 'lab-serial.log')
 QEMU_LOG = os.path.join(BUILD, 'lab-qemu.log')
 MON_SOCK = os.path.join(BUILD, 'qemu-monitor.sock')
 QMP_SOCK = os.path.join(BUILD, 'qemu-qmp.sock')
+
+# The monitor and QMP endpoints in use. The persistent instance's by default; a cold run points
+# them at the guest it started, alongside the control channel and the console log. All four move
+# together or a scenario drives one guest and reads another.
+MON_OVERRIDE = None
+QMP_OVERRIDE = None
+
+
+def mon_sock():
+	return MON_OVERRIDE or MON_SOCK
+
+
+def qmp_sock():
+	return QMP_OVERRIDE or QMP_SOCK
+
+
 PCAP = os.path.join(BUILD, 'lab.pcap')
 VOLUME_IMG = os.path.join(BUILD, 'virtio-blk.img')
 USB_IMG = os.path.join(BUILD, 'usb-media.img')
@@ -1121,7 +1137,7 @@ def cmd_dev_down(args):
 	# does not own. A stale instance takes the same path on purpose: its broker is gone,
 	# which says nothing about whether its guest is still running.
 	pgid = identity.get('pgid')
-	if os.path.exists(MON_SOCK):
+	if os.path.exists(mon_sock()):
 		try:
 			monitor_command('quit')
 		except (SystemExit, OSError):
@@ -1990,6 +2006,21 @@ class LabGuest:
 			return False
 
 	def wait_prompt(self, timeout):
+		# A cold run has no broker to ask, so the guest's own console log is what answers. The
+		# broker path stays for the persistent instance, where it is cheaper than polling a file
+		# and is what every existing scenario already runs through.
+		if SERIAL_OVERRIDE is not None:
+			deadline = time.time() + timeout
+			while time.time() < deadline:
+				try:
+					with open(SERIAL_OVERRIDE, 'rb') as handle:
+						tail = handle.read()[-256:]
+				except OSError:
+					tail = b''
+				if has_prompt(tail):
+					return True
+				time.sleep(0.5)
+			return False
 		try:
 			return has_prompt(ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)[-256:])
 		except (SystemExit, OSError):
@@ -2193,7 +2224,7 @@ def cmd_dev_test(args):
 def cmd_scenario_cold(args):
 	import scenario
 
-	global CHANNEL_OVERRIDE, SERIAL_OVERRIDE
+	global CHANNEL_OVERRIDE, SERIAL_OVERRIDE, MON_OVERRIDE, QMP_OVERRIDE
 	verbose = '--verbose' in args
 	rest = [a for a in args if not a.startswith('--')]
 	if len(rest) < 2 or rest[0] not in ('x86_64', 'aarch64', 'riscv64'):
@@ -2240,6 +2271,9 @@ def cmd_scenario_cold(args):
 		# An emulated guest is slower than the native one every scenario deadline was written
 		# against, by roughly an order of magnitude on the interactive steps.
 		scenario.TIME_SCALE = 1.0 if target == 'x86_64' else 10.0
+		if target != 'x86_64':
+			MON_OVERRIDE = os.path.join(BUILD, f'qemu-monitor-{target}.sock')
+			QMP_OVERRIDE = os.path.join(BUILD, f'qemu-qmp-{target}.sock')
 		# The guest is answering when it answers, not when a timer says so: poll the handshake
 		# rather than sleeping for a number that would be wrong on both a fast and a slow target.
 		# Generous on purpose. An emulated aarch64 or riscv64 guest takes minutes to bring its
@@ -2295,6 +2329,8 @@ def cmd_scenario_cold(args):
 	finally:
 		CHANNEL_OVERRIDE = None
 		SERIAL_OVERRIDE = None
+		MON_OVERRIDE = None
+		QMP_OVERRIDE = None
 		with contextlib.suppress(ProcessLookupError):
 			os.killpg(os.getpgid(guest.pid), signal.SIGTERM)
 		with contextlib.suppress(Exception):
@@ -2442,7 +2478,7 @@ def text_keys(text, enter):
 # rather than kept: these are rare, and a socket held open across a guest restart would be a
 # thing to invalidate.
 def qmp_command(execute, arguments=None, timeout=5):
-	if not os.path.exists(QMP_SOCK):
+	if not os.path.exists(qmp_sock()):
 		die('no QEMU QMP socket (is the instance up?)')
 	conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	conn.settimeout(timeout)
@@ -2459,7 +2495,7 @@ def qmp_command(execute, arguments=None, timeout=5):
 		return json.loads(line)
 
 	try:
-		conn.connect(QMP_SOCK)
+		conn.connect(qmp_sock())
 		reply()
 		conn.sendall(json.dumps({'execute': 'qmp_capabilities'}).encode() + b'\n')
 		reply()
@@ -2605,10 +2641,10 @@ def cmd_key(args):
 
 
 def monitor_command(command):
-	if not os.path.exists(MON_SOCK):
+	if not os.path.exists(mon_sock()):
 		die('no QEMU monitor socket (is the instance up?)')
 	conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-	conn.connect(MON_SOCK)
+	conn.connect(mon_sock())
 	conn.settimeout(5)
 	conn.sendall(command.encode() + b'\n')
 	reply = b''
@@ -2745,7 +2781,7 @@ def cmd_shot(args):
 def cmd_quit(_args):
 	# The monitor socket may be a stale file from an instance that is already gone
 	# (e.g. after `lab test` replaced it) - a clean quit falls through to the kill.
-	if os.path.exists(MON_SOCK):
+	if os.path.exists(mon_sock()):
 		try:
 			monitor_command('quit')
 		except (SystemExit, OSError):
