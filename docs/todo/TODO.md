@@ -201,7 +201,7 @@ UEFI loader to aarch64 and riscv64. All three architectures must pass under QEMU
 board-specific real-hardware support remains later work.
 
 - [x] [M0115 - Architecture abstraction layer (the HAL boundary)](M0115.md)
-- [ ] [M0116 - aarch64 (ARM64) kernel + loader port](M0116.md)
+- [x] [M0116 - aarch64 (ARM64) kernel + loader port](M0116.md)
 - [x] [M0117 - riscv64 (RISC-V) kernel + loader port](M0117.md)
 - [x] [M0118 - Multi-arch track follow-ups (the M0115-M0117 loose ends)](M0118.md)
 - [x] [M0119 - Pre-phase-3 hardening (finish before the server platform)](M0119.md)
