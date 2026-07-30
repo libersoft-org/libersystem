@@ -110,12 +110,17 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	assert!(bi.magic == bootproto::MAGIC, "boot protocol magic mismatch: the loader and kernel disagree");
 	assert!(bi.version == bootproto::VERSION, "boot protocol version mismatch: rebuild the loader and kernel together");
 	serial_println!("{} kernel is starting ...", product::NAME);
-	// An ordinary boot prints nothing here, so a development instance is never mistaken
-	// for one and no production boot carries the line.
+	arch::init();
+	// Named after `arch::init` rather than before it, because that is where a backend learns
+	// where to ask. x86 reads the profile off a fixed I/O port and could answer at any moment,
+	// but aarch64 and riscv64 read it over MMIO at an address the device tree names, and the
+	// tree is parsed in `init` - asking earlier there is asking address zero.
+	//
+	// An ordinary boot prints nothing here, so a development instance is never mistaken for one
+	// and no production boot carries the line.
 	if let Some(profile) = arch::boot_profile() {
 		serial_println!("{} boot profile: {}", product::NAME, profile);
 	}
-	arch::init();
 	init_memory();
 	init_framebuffer();
 	arch::init_interrupts();

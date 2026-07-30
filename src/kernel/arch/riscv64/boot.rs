@@ -157,6 +157,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	let (ram_top, cpu_count, pcie_ecam, _plic_base, fwcfg_base) = match super::dtb::parse(dtb) {
 		Some(bi) => {
 			crate::serial_println!("riscv64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s), ECAM {:#x}, PLIC {:#x}", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count, bi.pcie_ecam, bi.plic_base);
+			super::set_fwcfg_base(bi.fwcfg_base);
 			(bi.ram_base + bi.ram_size, bi.cpu_count, bi.pcie_ecam, bi.plic_base, bi.fwcfg_base)
 		}
 		None => {

@@ -10,8 +10,11 @@
 #   DEBUG=1   QEMU waits for GDB (-s -S) on port :1234
 #   NOKVM=1   disable KVM (more reliable single-stepping under TCG)
 #   TEST=1    test mode (isa-debug-exit or semihosting, maps exit code to pass/fail)
-#   DEV_PROFILE=1 persistent development instance (x86_64 interactive only); names the
-#             profile over fw_cfg so the guest reports it. Owned by `just dev-up`.
+#   DEV_PROFILE=1 development profile: names it over fw_cfg so the guest reports it and
+#             DeviceManager starts a control agent, and attaches the channel the agent
+#             answers on. On x86_64 that is the persistent instance `just dev-up` owns; on
+#             the other targets it is a one-shot guest a scenario runner drives cold, which
+#             is why this is not x86_64-only. Refused together with TEST.
 #   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log or stdio)
 #   SMP=N     override core/hart count (default: nproc, with arch-specific caps)
 #   MEM=      override RAM (default varies by arch)
@@ -54,14 +57,18 @@ qemu_parse_displays() {
 	fi
 }
 
+# The nameref is deliberately not called `arr`: this is called from helpers whose own array
+# nameref is, and bash refuses a nameref that points at itself - it warns and appends nothing,
+# which left the sound card on the command line with the audio backend it names missing, and
+# QEMU refuses to start on that. An interactive aarch64 or riscv64 boot could not come up.
 qemu_append_audio() {
-	local -n arr="$1"
+	local -n audio_args="$1"
 	if [[ -n "${AUDIO_WAV:-}" ]]; then
-		arr+=(-audiodev "wav,id=snd0,path=$AUDIO_WAV")
+		audio_args+=(-audiodev "wav,id=snd0,path=$AUDIO_WAV")
 	elif [[ "$want_spice" == "1" ]]; then
-		arr+=(-audiodev "spice,id=snd0")
+		audio_args+=(-audiodev "spice,id=snd0")
 	else
-		arr+=(-audiodev "none,id=snd0")
+		audio_args+=(-audiodev "none,id=snd0")
 	fi
 }
 
@@ -361,16 +368,22 @@ fi
 # Reject an unsupported development profile before any image work: the profile changes
 # which host workflow owns the instance, so a request it cannot honour must fail loudly
 # rather than boot an ordinary guest that merely looks like a development one.
-if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
-	if [[ "$TARGET_ARCH" != "x86_64" ]]; then
-		echo "qemu-run: DEV_PROFILE is x86_64-only (requested $TARGET_ARCH)" >&2
-		exit 1
-	fi
-	if [[ "${TEST:-0}" == "1" ]]; then
-		echo "qemu-run: DEV_PROFILE and TEST are mutually exclusive" >&2
-		exit 1
-	fi
+if [[ "${DEV_PROFILE:-0}" == "1" && "${TEST:-0}" == "1" ]]; then
+	echo "qemu-run: DEV_PROFILE and TEST are mutually exclusive" >&2
+	exit 1
 fi
+
+# Where a development guest's control channel lives, by target. The persistent instance keeps
+# the unsuffixed name it has always had, so nothing that owns one has to learn a new path; the
+# other targets get their own so a one-shot run on one of them cannot be mistaken for it, or
+# collide with it while it is up.
+dev_channel_socket() {
+	if [[ "$TARGET_ARCH" == "x86_64" ]]; then
+		printf '%s/dev-channel.sock' "$QEMU_BUILD_DIR"
+	else
+		printf '%s/dev-channel-%s.sock' "$QEMU_BUILD_DIR" "$TARGET_ARCH"
+	fi
+}
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
@@ -555,7 +568,7 @@ qemu_run_x86_64() {
 	# nothing a normal or production boot is built from.
 	if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
 		qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
-		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel.sock" "disable-legacy=on"
+		qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "disable-legacy=on"
 	fi
 
 	# Interactive control sockets used by screenshot.sh and lab.py.
@@ -618,6 +631,13 @@ qemu_run_aarch64() {
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -aarch64 "disable-legacy=on"
+		# The development profile is not x86_64's alone: a scenario has to be runnable against
+		# a cold boot of every target, and what that needs is a guest that names the profile
+		# (so DeviceManager starts an agent) and a channel for the agent to answer on.
+		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
+			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
+			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "disable-legacy=on"
+		fi
 	fi
 	qemu_append_debug_args qemu_args
 
@@ -725,6 +745,10 @@ qemu_run_riscv64() {
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -riscv64 ""
+		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
+			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
+			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" ""
+		fi
 	fi
 	qemu_append_debug_args qemu_args
 

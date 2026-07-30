@@ -196,6 +196,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 			if bi.pcie_ecam != 0 {
 				super::pci::set_ecam_base(bi.pcie_ecam);
 			}
+			super::set_fwcfg_base(bi.fwcfg_base);
 			(bi.ram_base + bi.ram_size, bi.cpu_count, bi.fwcfg_base)
 		}
 		None => {

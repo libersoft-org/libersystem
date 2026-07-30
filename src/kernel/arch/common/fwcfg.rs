@@ -20,12 +20,18 @@
 use core::ptr::{read_volatile, write_volatile};
 
 // fw-cfg MMIO register offsets (QEMU "qemu,fw-cfg-mmio").
-const REG_SELECTOR: u64 = 8; // u16, big-endian (unused here - we select via DMA)
+const REG_SELECTOR: u64 = 8; // u16, big-endian
+const REG_DATA: u64 = 0; // the selected entry, read a byte at a time
 const REG_DMA: u64 = 16; // u64, big-endian: writing it triggers a DMA
 
 // fw-cfg well-known selectors.
 const SEL_SIGNATURE: u16 = 0x0000; // reads "QEMU"
 const SEL_FILE_DIR: u16 = 0x0019; // the file directory
+
+// One directory entry: big-endian size and selector, two reserved bytes, then a NUL-padded name.
+const DIR_ENTRY_BYTES: usize = 64;
+const DIR_NAME_OFFSET: usize = 8;
+const MAX_DIR_ENTRIES: u32 = 256;
 
 // FWCfgDmaAccess.control bits (the whole struct is big-endian in guest memory).
 const DMA_ERROR: u32 = 0x01;
@@ -53,6 +59,20 @@ struct FwCfg {
 }
 
 impl FwCfg {
+	// Select an entry. The selector register is big-endian on the MMIO interface, unlike the
+	// x86 port interface where it is little-endian.
+	unsafe fn select(&self, key: u16) {
+		unsafe { write_volatile(((self.p2v)(self.base + REG_SELECTOR)) as *mut u16, key.to_be()) };
+	}
+
+	// Read the selected entry a byte at a time. The data register is one shared cursor, so the
+	// caller reads a selection through in order.
+	unsafe fn read_bytes(&self, out: &mut [u8]) {
+		for byte in out.iter_mut() {
+			*byte = unsafe { read_volatile(((self.p2v)(self.base + REG_DATA)) as *const u8) };
+		}
+	}
+
 	// Read a big-endian u32 from guest physical `pa` (a DMA buffer field).
 	unsafe fn be32_at(&self, pa: u64) -> u32 {
 		unsafe { u32::from_be(read_volatile((self.p2v)(pa) as *const u32)) }
@@ -98,6 +118,57 @@ impl FwCfg {
 // reading/writing MMIO and guest RAM through `p2v` (the backend's phys_to_virt). Returns
 // the framebuffer on success, or None when there is no fw-cfg / no ramfb file / the
 // allocation fails - in which case the boot stays serial-only.
+// Copy the fw-cfg file `name` into `out`, returning how many bytes were written, or None when
+// the device is absent, foreign, or has no such file.
+//
+// This is the selector-and-data path rather than the DMA path the ramfb setup above uses, and
+// deliberately so: it runs before the kernel has memory to hand out, so it cannot allocate the
+// DMA descriptor or the destination buffer that path needs. Reads advance one shared cursor, so
+// a selection has to be consumed in order.
+//
+// Nothing is trusted before the signature matches. An absent device reads back whatever the bus
+// floats, which is exactly the case that must report no file rather than a plausible one.
+pub fn read_file(fwcfg_base: u64, name: &[u8], out: &mut [u8], p2v: fn(u64) -> u64) -> Option<usize> {
+	if fwcfg_base == 0 {
+		return None;
+	}
+	let fw = FwCfg { base: fwcfg_base, p2v };
+	let mut signature = [0u8; 4];
+	unsafe {
+		fw.select(SEL_SIGNATURE);
+		fw.read_bytes(&mut signature);
+	}
+	if &signature != b"QEMU" {
+		return None;
+	}
+	let mut count = [0u8; 4];
+	unsafe {
+		fw.select(SEL_FILE_DIR);
+		fw.read_bytes(&mut count);
+	}
+	// A directory this long means the signature matched by accident; stop rather than walk a
+	// length the device never wrote.
+	let count = u32::from_be_bytes(count).min(MAX_DIR_ENTRIES);
+	for _ in 0..count {
+		let mut entry = [0u8; DIR_ENTRY_BYTES];
+		unsafe { fw.read_bytes(&mut entry) };
+		let size = u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
+		let selector = u16::from_be_bytes([entry[4], entry[5]]);
+		let raw = &entry[DIR_NAME_OFFSET..];
+		let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+		if &raw[..end] != name {
+			continue;
+		}
+		let len = size.min(out.len());
+		unsafe {
+			fw.select(selector);
+			fw.read_bytes(&mut out[..len]);
+		}
+		return Some(len);
+	}
+	None
+}
+
 pub fn setup_ramfb(fwcfg_base: u64, width: u32, height: u32, p2v: fn(u64) -> u64) -> Option<RamFb> {
 	if fwcfg_base == 0 {
 		return None;

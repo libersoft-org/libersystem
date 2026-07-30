@@ -100,11 +100,26 @@ pub fn poweroff() -> ! {
 	halt_loop()
 }
 
-// Name the boot profile the host selected, or `None` for an ordinary boot. The
-// persistent development instance is x86_64-only, so this backend never reports one;
-// the cold test configuration is what drives this architecture.
+// The QEMU fw-cfg MMIO base the device tree named, recorded during boot so the profile can be
+// read before there is any memory to allocate. Zero when the tree had no fw-cfg node.
+static FWCFG_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn set_fwcfg_base(base: u64) {
+	FWCFG_BASE.store(base, core::sync::atomic::Ordering::Relaxed);
+}
+
+// Name the boot profile the host selected, or `None` for an ordinary boot. The host names it
+// over fw-cfg, so selecting one changes no byte the guest is built from - the same kernel,
+// loader and system image boot with or without it. That is what lets a scenario runner drive a
+// cold boot of this target: the profile is what makes DeviceManager start a control agent.
 pub fn boot_profile() -> Option<&'static str> {
-	None
+	let mut name = [0u8; 32];
+	let base = FWCFG_BASE.load(core::sync::atomic::Ordering::Relaxed);
+	let len = crate::arch::common::fwcfg::read_file(base, b"opt/org.libersystem/profile", &mut name, super::paging::phys_to_virt)?;
+	match &name[..len] {
+		b"development" => Some("development"),
+		_ => None,
+	}
 }
 
 // Write the CPU's model name into `out`, returning the byte count. aarch64 exposes
