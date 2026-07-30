@@ -484,8 +484,17 @@ unsafe fn registry_generation(registry: &mut u64, artifact: &str) -> Option<Vec<
 				return None;
 			}
 		}
-		if !send_blocking(handle, artifact.as_bytes(), 0) {
-			*registry = 0;
+		// Never block on this send. The registry is a development convenience whose whole
+		// contract is that an unanswered end costs a launch nothing, and `send_blocking` breaks
+		// that contract the moment the queue fills: an agent that takes queries and answers none
+		// stops being ignorable and starts stopping the boot, one launch at a time, until
+		// ProcessService is wedged and every service after it never starts. Measured before this
+		// was written: on an aarch64 development boot the 42nd query blocked forever and the
+		// chain ended at DisplayService, with nothing anywhere saying why.
+		//
+		// A refused send means the agent is not keeping up, which is the same answer as no
+		// generation - so the launch reads the volume, which is what it would have done anyway.
+		if !try_send(handle, artifact.as_bytes(), 0) {
 			return None;
 		}
 		// Look before waiting. The agent can answer before this ever reaches the wait, and a
