@@ -1,6 +1,7 @@
 # Bugs / changes
 
-- find out how shared libraries work... if they are loaded in memory just once for multiple apps using it or each app has its own instance
+- remove manual word wrapping in all documents - mainly milestone documents
+- find out how shared libraries work... if they are loaded in RAM just once for multiple apps using it or each app has its own instance
 - .build is a big mess, make it clean in well organized subdirectories
 - rename uname to sysver
 - M0042 is missing, find out what was there before - it was in TODO.md and the name was M42 back then

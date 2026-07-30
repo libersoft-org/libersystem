@@ -125,7 +125,7 @@ with image fixtures and live QEMU reads.
 - [x] [M0059 - exFAT write support (large removable media)](M0059.md)
 - [x] [M0060 - UDF filesystem backend (read-only, DVD / Blu-ray)](M0060.md)
 - [x] [M0061 - Thin shell: job-control / session service + commands as binaries](M0061.md)
-- [x] [M0062 - USB stack (xHCI + HID + mass storage)](M0062.md)
+- [ ] [M0062 - USB stack (xHCI + HID + mass storage)](M0062.md)
 - [x] [M0063 - Hardware inventory commands (lsblk / lspci / lscpu / ...)](M0063.md)
 - [x] [M0064 - Capacity quick wins (the limits-audit small fixes)](M0064.md)
 - [x] [M0065 - LiberFS sized by the disk (drop the fixed 32 MB pool)](M0065.md)

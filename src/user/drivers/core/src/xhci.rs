@@ -409,7 +409,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		PTR_SINK.store(ptr_server, Ordering::Relaxed);
 		// report in, then serve the bus for the life of the system: HID reports,
 		// block requests, and runtime attach / detach.
-		let mut report: [u8; 64] = [0u8; 64];
+		// 80 bytes, not the 64 this used to be: the longest report is "driver.xhci:
+		// online (" plus the count, " device(s))" and all three class suffixes, which
+		// comes to exactly 64 with a one-digit count and overruns the moment a machine
+		// presents ten devices. The margin covers a count of any width this bus can
+		// reach (255 slots) rather than sitting one device away from an index panic.
+		let mut report: [u8; 80] = [0u8; 80];
 		let mut n: usize = 0;
 		for &b in b"driver.xhci: online (" {
 			report[n] = b;
