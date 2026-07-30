@@ -396,17 +396,16 @@ def teardown(lab, verbose=False, baseline=None, first_run=True):
 			left.append('the terminal is not at a prompt')
 		if not lab.reset(10):
 			left.append('the development state was not dropped')
-		# The fixtures a run wrote, removed as a set. A count rather than a best effort: the
-		# instance is shared, and a fixture left on the volume is read by whatever runs next.
-		stuck = lab.fixture_clear(10)
+		# One question of the guest, answered in one exchange: remove the fixtures this run
+		# wrote, say what is still held, and report the memory account. Held is the only account
+		# worth having - a generation still in the registry or a launch still in flight would
+		# both be invisible from here - and the fixtures matter for the same reason, since the
+		# instance is shared and whatever is left is read by whatever runs next.
+		held, stuck, free = lab.teardown_state(10)
 		if stuck is None:
 			left.append('the guest did not answer when asked to clear the fixtures')
 		elif stuck:
 			left.append(f'{stuck} fixture(s) could not be removed')
-		# What the guest says it is holding, which is the only account of it worth having. A
-		# generation still in the registry or a launch still in flight would both be invisible
-		# from here otherwise, and both would be inherited by the next run.
-		held = lab.scope_held(10)
 		if held is None:
 			left.append('the guest did not answer when asked what it still holds')
 		else:
@@ -415,7 +414,7 @@ def teardown(lab, verbose=False, baseline=None, first_run=True):
 	# unreachable, and during teardown that is something to report, not something to die of.
 	except (OSError, ValueError, SystemExit) as error:
 		left.append(f'teardown did not complete: {error}')
-	lost = frames_lost(lab, baseline)
+	lost = None if baseline is None or free is None else max(0, baseline[0] - free)
 	if lost is not None:
 		notes.append(f'the guest is {lost} frame(s) short of where the scenario found it')
 		# Strict from the second run onward. The first run of a scenario in an instance touches
@@ -452,17 +451,6 @@ def note_run(name):
 			pass
 	return first
 
-
-# How much system memory the run did not give back, in frames, or None when either reading is
-# unavailable - an instance older than the opcode, or one that stopped answering. Never negative:
-# a run that ended with more free memory than it started with has nothing to answer for.
-def frames_lost(lab, baseline):
-	if baseline is None:
-		return None
-	after = lab.memory_stats(10)
-	if after is None:
-		return None
-	return max(0, baseline[0] - after[0])
 
 
 def run_step(step, guest, lab, limit, index):

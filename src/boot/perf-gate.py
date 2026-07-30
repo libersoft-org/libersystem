@@ -66,11 +66,20 @@ NO_CHANGE_BUDGET = 1.0
 # a second at most, and the remaining proposals that would close it trade correctness for time.
 # Six is what the loop does, so it is what the gate holds it to.
 LEAF_TOTAL_BUDGET = 6.0
-# The build phase is measured at 3.3 to 3.5 s across runs, so 3.5 was the measurement rather
-# than a budget: a gate sitting exactly on its own number reports machine noise as a regression
-# and gets ignored, which is worse than not having it. 4.0 leaves room for the noise without
-# hiding what this is for - selecting the cold path costs seconds, not tenths.
-PHASE_BUDGETS = {'build': 4.0, 'publish': 1.0, 'run': 2.5}
+# Set from the measured baseline with room for noise and no more, which is what makes a phase
+# budget worth having: it says which phase moved, and it can only do that if a phase can breach
+# it. The previous numbers were loose enough that publication could grow to two and a half times
+# its cost and still report `ok`, so all three said nothing while the total failed.
+#
+# Measured across three consecutive samples on the documented host: build 3.00 to 3.30 s,
+# publication 0.40 s to the hundredth every time, the scenario 2.30 s likewise. The margins are
+# about a tenth over the worst sample for the build, which is the only phase that varies, and
+# larger in proportion for the two that do not - a phase that holds steady to the hundredth needs
+# no more room than that, and a budget it cannot reach is not a budget.
+#
+# These sum to more than the total, and deliberately: they answer a different question. The total
+# asks whether the loop is fast enough to work in, and a phase budget asks which part changed.
+PHASE_BUDGETS = {'build': 3.6, 'publish': 0.6, 'run': 2.6}
 
 # What a proportional leaf rebuild costs in work rather than in time: its own object and its own
 # executable, and nothing else. A provider miss means the change reached further than the leaf;

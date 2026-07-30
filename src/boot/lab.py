@@ -2145,28 +2145,43 @@ class LabGuest:
 
 	# Asked of the guest rather than inferred from what the runner did: the point of the check
 	# is to catch the case where the runner believes it cleaned up and the guest disagrees.
-	def scope_held(self, timeout):
+	# Everything a teardown needs to know, over one session: clear the fixtures, then ask what is
+	# still held and what memory is free. Four questions down one connection rather than one each,
+	# because a session costs a handshake and a guest round trip - measured at about 0.2 s, which
+	# is not much until a teardown pays it four times and the scenario phase grows by 0.6 s.
+	#
+	# Returns (held, fixtures_stuck, free_frames); any element is None when the guest could not
+	# answer it, which the caller reports rather than treats as success.
+	def teardown_state(self, timeout):
 		try:
 			sock, buffer, _ = proto_session(timeout, announce=False)
 		except SystemExit:
-			return None
+			return None, None, None
 		held = []
+		stuck = None
+		free = None
 		try:
-			opcode, _, body = proto_request(sock, buffer, 2, OP_GEN_LIST, timeout=timeout, what='reading the registry', tolerate=(21,))
+			opcode, _, body = proto_request(sock, buffer, 2, OP_FIXTURE_CLEAR, timeout=timeout, what='clearing the fixtures', tolerate=(2,))
+			if opcode == OP_FIXTURE_CLEAR_ACK and len(body) >= 4:
+				stuck = struct.unpack('<H', body[2:4])[0]
+			opcode, _, body = proto_request(sock, buffer, 3, OP_GEN_LIST, timeout=timeout, what='reading the registry', tolerate=(21,))
 			if opcode == OP_GEN_LIST_REPLY and len(body) >= 6:
 				artifacts, spent = struct.unpack('<HI', body[:6])
 				if artifacts or spent:
 					held.append(f'{artifacts} artifact(s) and {spent} B still in the registry')
-			opcode, _, body = proto_request(sock, buffer, 3, OP_LAUNCH_OUTPUT, timeout=timeout, what='reading the launch state', tolerate=(25,))
+			opcode, _, body = proto_request(sock, buffer, 4, OP_LAUNCH_OUTPUT, timeout=timeout, what='reading the launch state', tolerate=(25,))
 			# A launch that has ended is nothing to hold; one that has not is this run's, still
 			# running, on an instance the next run is about to use.
 			if opcode == OP_LAUNCH_BYTES and len(body) >= 1 and not body[0]:
 				held.append('a launched program is still running')
+			opcode, _, body = proto_request(sock, buffer, 5, OP_MEM_STATS, timeout=timeout, what='reading the memory account', tolerate=(2,))
+			if opcode == OP_MEM_STATS_REPLY and len(body) >= 32:
+				free = struct.unpack('<QQQQ', body[:32])[0]
 		except SystemExit:
-			return None
+			return None, stuck, free
 		finally:
 			sock.close()
-		return held
+		return held, stuck, free
 
 	def publish(self, artifact, path, timeout):
 		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
