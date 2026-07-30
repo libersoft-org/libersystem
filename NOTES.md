@@ -1,5 +1,7 @@
 # Bugs / changes
 
+- check if we have only our own implementations of image and audio decoders and encoders
+- check if image and audio decoders are separate libraries + common code
 - remove manual word wrapping in all documents - mainly milestone documents
 - find out how shared libraries work... if they are loaded in RAM just once for multiple apps using it or each app has its own instance
 - .build is a big mess, make it clean in well organized subdirectories
