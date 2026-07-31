@@ -466,19 +466,31 @@ if [[ -n "$selected_artifact" ]]; then
 	if [[ "$explain" == 1 ]]; then echo "dev-build: explain decision=miss reason=$targeted_state_reason"; fi
 fi
 
+# Whatever the manifest does not declare does not belong in a staged image. This used to look
+# at `bin/` and `libexec/` only, so anything left behind under `lib/` stayed forever - and
+# something did: the `.objects-lsrt` link inputs, 72 MB per target, which moved to the build's
+# scratch area and would otherwise have sat in every existing tree with nothing to remove them.
+# The rule here is the same one `check-staged-image.sh` asserts, deliberately: a prune and a
+# check that disagree leave a tree that cannot be made to pass.
 prune_stale_program_outputs() {
 	local file relative
 	declare -A expected=()
 	while IFS= read -r relative; do
 		expected["$relative"]=1
-	done < <(jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | .destination | sub("\\.lsexe$"; "")' <<<"$manifest_json")
+	done < <(
+		jq -r '.programs[] | select(.linkage == "dynamic" and .stage == "volume") | .destination | sub("\\.lsexe$"; "")' <<<"$manifest_json"
+		jq -r '.libraries[].destination' <<<"$manifest_json"
+	)
+	# `logs/` is the build's own per-artifact transcripts, host-side by construction, which the
+	# warm snapshot excludes from its output fingerprint for the same reason.
 	while IFS= read -r -d '' file; do
 		relative="${file#"$artifact_output_root/"}"
 		if [[ -z "${expected[$relative]:-}" ]]; then
 			rm -f "$file"
 		fi
-	done < <(find "$artifact_output_root" -type f \( -path "$artifact_output_root/bin/*" -o -path "$artifact_output_root/libexec/*" \) -print0 2>/dev/null)
-	find "$artifact_output_root/bin" "$artifact_output_root/libexec" -depth -type d -empty -delete 2>/dev/null || true
+	done < <(find "$artifact_output_root" -type f -not -path "$artifact_log_dir/*" -print0 2>/dev/null)
+	find "$artifact_output_root" -depth -type d -empty -delete 2>/dev/null || true
+	mkdir -p "$artifact_output_root"
 }
 
 if [[ -z "$selected_artifact" ]]; then prune_stale_program_outputs; fi
@@ -1672,7 +1684,15 @@ for spec in "$@"; do
 			fi
 			archives+=("$archive")
 		done
-		object_root="$out_dir/.objects-lsrt"
+		# Scratch, not staged content. These are the `.o` and `.rmeta` members extracted from
+		# the PIC rlibs so their memcpy/memmove/memset/memcmp can be made visible before they
+		# are linked into `lsrt.lslib`; nothing reads them after the link and the volume
+		# package is assembled from manifest destinations, so they never reached a guest. They
+		# did sit inside the staged image - 72 MB per target of files no audit and no digest
+		# record covered, the one part of a staged image nothing validated. Moving them to the
+		# build's scratch area removes that corner rather than auditing it, and lets
+		# `staged-image-check` require that every file in an image is a declared artifact.
+		object_root="$build_scratch/objects-lsrt-$target"
 		rm -rf "$object_root"
 		mkdir -p "$object_root"
 		for archive in "${archives[@]}"; do

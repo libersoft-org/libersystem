@@ -116,9 +116,20 @@ check_target() {
 	# Anything staged that the manifest does not declare. The build's own audits cover this
 	# during a build of this target; repeating it here is what makes this script answer for
 	# the image on its own, including for a target that has not been built in this tree.
+	#
+	# Every file counts, not only the ones with an artifact's shape. This used to look at
+	# `*.lslib` and the `bin`/`libexec` trees alone, which left anything of another extension
+	# invisible - and something was: 72 MB per target of `.o` and `.rmeta` link inputs under
+	# `lib/runtime/.objects-lsrt`, covered by no audit and no digest record. They are scratch
+	# and now live in `.build/tmp`, so the question this asks can be the strict one: is every
+	# file in this image an artifact the manifest declares?
+	#
+	# `logs/` is the single exclusion and is host-side by construction - the per-artifact
+	# build transcripts the last build wrote, which the warm snapshot already excludes from
+	# its output fingerprint for the same reason. Nothing under it reaches a guest.
 	local declared undeclared
 	declared="$(cut -f 2 <<<"$expected" | sort)"
-	undeclared="$(comm -13 <(printf '%s\n' "$declared") <(find "$image" -type f \( -name '*.lslib' -o -path "$image/bin/*" -o -path "$image/libexec/*" \) -printf '%P\n' | sort))"
+	undeclared="$(comm -13 <(printf '%s\n' "$declared") <(find "$image" -type f -not -path "$image/logs/*" -printf '%P\n' | sort))"
 	if [[ -n "$undeclared" ]]; then
 		while IFS= read -r relative; do
 			[[ -n "$relative" ]] || continue

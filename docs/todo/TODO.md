@@ -224,8 +224,8 @@ board-specific real-hardware support remains later work.
 
 M0134 removes whole-system rebuild and cold-boot repetition from ordinary leaf-tool
 development while preserving the existing full release gates. Phases a-e are delivered and the
-loop is in daily use; M0134f holds five defects in the loop's own tooling, which is what keeps
-the milestone open. It no longer blocks application, utility or driver work.
+loop is in daily use; M0134f holds two defects in the build's own record-keeping, which is what
+keeps the milestone open. It no longer blocks application, utility or driver work.
 
 - [ ] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
 
