@@ -152,12 +152,12 @@ done < <(jq -r '
 	@tsv
 ' <<<"$manifest_json")
 requested_arguments=("$@")
-artifact_output_root="$build_root/system-image/$target"
+artifact_output_root="$build_root/image/$target"
 provider_output_dir="$artifact_output_root"
 artifact_log_dir="$artifact_output_root/logs"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
 force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
-artifact_cache_dir="$build_root/image-artifacts-$target"
+artifact_cache_dir="$build_root/cache/$target"
 # One place for every scratch file a build makes. Apart from the outputs, so a leak shows up as
 # a directory that should have been empty rather than as litter among the artifacts, and so a
 # sweep can be written without keeping a list of patterns true.
@@ -236,7 +236,7 @@ report_build_summary() {
 	# leaked was each build that died between creating one and getting there - thirty of them over
 	# five days.
 	if [[ -n "$pending_identity_record" ]]; then rm -f "$pending_identity_record"; fi
-	rm -f "$build_root/image-warm-$target.state.inputs.current.$$" "$build_root/image-warm-$target.state.inputs.tmp.$$" "$build_root/image-warm-$target.state.tmp.$$"
+	rm -f "$build_root/state/warm-$target.state.inputs.current.$$" "$build_root/state/warm-$target.state.inputs.tmp.$$" "$build_root/state/warm-$target.state.tmp.$$"
 	rm -f "$build_root/package-dirs.$$.tmp"
 	if [[ $status == 0 && $targeted_state_hit == 0 && -n "$targeted_state_file" ]] && declare -F write_targeted_state >/dev/null; then
 		write_targeted_state || rm -f "$targeted_state_file.tmp.$$"
@@ -263,9 +263,13 @@ if [[ "$force_rebuild" != 0 && "$force_rebuild" != 1 ]]; then
 fi
 
 command -v flock >/dev/null
-mkdir -p "$build_root" "$provider_output_dir" "$artifact_log_dir"
+# The shape of `.build` is created here rather than assumed: every group has a directory whose
+# name says what it is for, so a sweep can be written against a place instead of a list of
+# filename patterns. `state` holds what the next build reads, `logs` what the last one wrote,
+# `cache` the per-target artifact records, and `tmp` scratch that should always end up empty.
+mkdir -p "$build_root" "$build_root/state" "$build_root/logs" "$artifact_cache_dir" "$provider_output_dir" "$artifact_log_dir"
 if [[ "${LIBER_IMAGE_LOCK_HELD:-0}" != 1 ]]; then
-	exec 9>"$build_root/image-build-$target.lock"
+	exec 9>"$build_root/state/build-$target.lock"
 	flock 9
 fi
 if [[ -z "$selected_artifact" ]]; then
@@ -424,7 +428,7 @@ targeted_state_paths() {
 			printf '%s\n' "$(program_file "$program")"
 			find "$artifact_cache_dir" -maxdepth 1 -type f \( -name "executable-$program.*" -o -name "object-$program-*" \) -print
 		done
-		printf '%s\n' "$build_root/exe-start-$target.o" "$build_root/exe-start-$target.o.build-key"
+		printf '%s\n' "$build_root/state/exe-start-$target.o" "$build_root/state/exe-start-$target.o.build-key"
 		if [[ "$selected_kind" == library ]] && matches_output '^pix=' printf '%s\n' "${selected_specs[@]}"; then
 			printf '%s\n' "$(program_file dyn_probe)"
 			find "$artifact_cache_dir" -maxdepth 1 -type f -name 'executable-dyn_probe.*' -print
@@ -481,7 +485,7 @@ if [[ -z "$selected_artifact" ]]; then prune_stale_program_outputs; fi
 
 warm_input_inventory_file=""
 if [[ -z "$selected_artifact" ]]; then
-	warm_snapshot_file="$build_root/image-warm-$target.state"
+	warm_snapshot_file="$build_root/state/warm-$target.state"
 	warm_input_inventory_file="$warm_snapshot_file.inputs"
 fi
 
@@ -515,7 +519,7 @@ warm_output_fingerprint() {
 	{
 		find "$artifact_output_root" -type f ! -path "$artifact_log_dir/*" -printf 'output\t%p\t%s\t%T@\n' 2>/dev/null || true
 		find "$artifact_cache_dir" -type f -printf 'cache\t%p\t%s\t%T@\n' 2>/dev/null || true
-		for output in "$build_root/exe-start-$target.o" "$build_root/exe-start-$target.o.build-key"; do
+		for output in "$build_root/state/exe-start-$target.o" "$build_root/state/exe-start-$target.o.build-key"; do
 			if [[ -f "$output" ]]; then stat -c 'output\t%n\t%s\t%y' "$output"; fi
 		done
 	} | sort | sha256sum | awk '{print $1}'
@@ -1233,11 +1237,11 @@ image_graph_started=$SECONDS
 image_graph=""
 requested_artifact_names="$(printf '%s\n' "$@" | sed 's/=.*//')"
 if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
-	image_target="$build_root/image-cargo-$target"
-	image_target_config="$build_root/image-cargo-$target.config"
-	image_graph="$build_root/image-cargo-$target.jsonl"
-	image_graph_errors="$build_root/image-cargo-$target.stderr"
-	image_seed="$build_root/image-seed-$target.o"
+	image_target="$build_root/cargo/image-$target"
+	image_target_config="$build_root/state/cargo-$target.config"
+	image_graph="$build_root/logs/cargo-$target.jsonl"
+	image_graph_errors="$build_root/logs/cargo-$target.stderr"
+	image_seed="$build_root/state/image-seed-$target.o"
 	target_spec_digest="$(if [[ -f "$cargo_target" ]]; then sha256sum "$cargo_target" | awk '{print $1}'; else printf '%s' "$cargo_target" | sha256sum | awk '{print $1}'; fi)"
 	image_target_config_value="$({
 		printf 'format=liber-image-cargo-cache-v1\n'
@@ -1270,12 +1274,12 @@ if grep -Fqx -- lsrt <<<"$requested_artifact_names"; then
 	else
 		verbose_log "build-shared: Cargo cache hit (global build configuration)"
 	fi
-	service_seed="$build_root/image-services-seed-$target.o"
-	service_seed_errors="$build_root/image-services-seed-$target.stderr"
+	service_seed="$build_root/state/services-seed-$target.o"
+	service_seed_errors="$build_root/logs/services-seed-$target.stderr"
 	if [[ -n "$selected_artifact" ]]; then
-		image_graph_key_file="$build_root/image-cargo-$target.graph-key-$selected_kind-$selected_artifact"
+		image_graph_key_file="$build_root/state/cargo-$target.graph-key-$selected_kind-$selected_artifact"
 	else
-		image_graph_key_file="$build_root/image-cargo-$target.graph-key"
+		image_graph_key_file="$build_root/state/cargo-$target.graph-key"
 	fi
 	image_graph_source_digest="$({
 		if [[ -n "$selected_artifact" ]]; then
@@ -1901,7 +1905,7 @@ timing_event providers end
 if [[ -n "$image_graph" ]]; then
 	timing_event consumers start
 	consumer_started=$SECONDS
-	start_obj="$build_root/exe-start-$target.o"
+	start_obj="$build_root/state/exe-start-$target.o"
 	"$root/tools/build-exe-start.sh" "$target" "$start_obj"
 	dynamic_rows="$(dynamic_rows)"
 	declare -A package_source_digests=()

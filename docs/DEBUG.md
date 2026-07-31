@@ -183,8 +183,8 @@ just perf-gate      # the loop's timing budgets, and that the work stayed propor
 
 - Guest serial: `.build/boot/dev-serial.log`, or `just dev-log` to follow it.
 - QEMU's own output, including the build that produced the image: `.build/boot/dev-qemu.log`.
-- Build and guest transcripts from test runs: `.build/test-logs`.
-- One stderr file per artifact from the shared build: `.build/system-image/<target>/logs/<name>.stderr`.
+- Build and guest transcripts from test runs: `.build/logs/test`.
+- One stderr file per artifact from the shared build: `.build/image/<target>/logs/<name>.stderr`.
   This is where a compile failure's real message is, and it survives the run.
 - Timing samples: `.build/dev-baseline`. Setting `LIBER_TIMING_LOG=<file>` on a build or a test
   run appends machine-readable phase events to it.

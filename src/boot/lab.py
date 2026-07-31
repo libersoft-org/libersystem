@@ -1728,7 +1728,7 @@ def staged_artifact(name, target='x86_64-unknown-none'):
 	destination = entry['destination']
 	if destination.endswith('.lsexe'):
 		destination = destination[: -len('.lsexe')]
-	path = os.path.join(BUILD_ROOT, 'system-image', target, destination)
+	path = os.path.join(BUILD_ROOT, 'image', target, destination)
 	if not os.path.isfile(path):
 		die(f'{name} is declared but not staged at {path}; build the tree first')
 	return path
@@ -1815,13 +1815,13 @@ def cmd_dev_clean(args):
 	removed = []
 
 	# Test logs, newest kept. They come in pairs per run, so runs are counted rather than files.
-	logs = sorted(glob.glob(os.path.join(BUILD_ROOT, 'test-logs', '*-run.log')), key=os.path.getmtime, reverse=True)
+	logs = sorted(glob.glob(os.path.join(BUILD_ROOT, 'logs', 'test', '*-run.log')), key=os.path.getmtime, reverse=True)
 	for stale in logs[KEEP_TEST_RUNS:]:
 		removed.append(stale)
 		removed.append(stale.replace('-run.log', '-guest.log'))
 
 	# Baseline samples, newest kept.
-	samples = sorted(glob.glob(os.path.join(BUILD_ROOT, 'dev-baseline', '*')), key=os.path.getmtime, reverse=True)
+	samples = sorted(glob.glob(os.path.join(BUILD_ROOT, 'measure', 'dev-baseline', '*')), key=os.path.getmtime, reverse=True)
 	removed.extend(samples[KEEP_BASELINE_SAMPLES:])
 
 	# Scratch directories a build left behind, named after the process that made them. One
@@ -1842,7 +1842,7 @@ def cmd_dev_clean(args):
 	# has not been rebuilt since. They are not inputs to the next build: each artifact's
 	# `.object` reference names the one generation that is, and the others are reproducible from
 	# sources like everything else this prunes.
-	for reference in glob.glob(os.path.join(BUILD_ROOT, 'image-artifacts-*', 'executable-*.object')):
+	for reference in glob.glob(os.path.join(BUILD_ROOT, 'cache', '*', 'executable-*.object')):
 		name = os.path.basename(reference)[len('executable-') : -len('.object')]
 		try:
 			with open(reference) as handle:

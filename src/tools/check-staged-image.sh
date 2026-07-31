@@ -2,7 +2,7 @@
 # Verify that a staged system image is the one this tree produces.
 #
 # The build already records, per artifact, the sha256 of the bytes it staged
-# (`image-artifacts-<target>/{library,executable}-<name>.sha256`), and the build's own
+# (`cache/<target>/{library,executable}-<name>.sha256`), and the build's own
 # audits refuse a staged path set that differs from the manifest. What neither of those
 # answers is the question this script exists for: is the image sitting on disk right now
 # still the image this tree would produce - without paying for a rebuild to find out.
@@ -44,8 +44,8 @@ check_target() {
 	local name="$1"
 	local triple image records problems checked
 	triple="$(target_triple "$name")"
-	image="$build_root/system-image/$triple"
-	records="$build_root/image-artifacts-$triple"
+	image="$build_root/image/$triple"
+	records="$build_root/cache/$triple"
 	problems=0
 	checked=0
 
@@ -138,7 +138,7 @@ check_target() {
 targets=()
 if (($# == 0)); then
 	for name in x86_64 aarch64 riscv64; do
-		[[ -d "$build_root/system-image/$(target_triple "$name")" ]] && targets+=("$name")
+		[[ -d "$build_root/image/$(target_triple "$name")" ]] && targets+=("$name")
 	done
 	if ((${#targets[@]} == 0)); then
 		echo "staged-image: no staged image for any target; nothing to check" >&2

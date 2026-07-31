@@ -62,7 +62,7 @@ print(entry['destination'] if entry else '')
 		echo "fast-path-parity: $name is not a manifest-declared artifact" >&2
 		exit 2
 	fi
-	echo "$build/system-image/$target/${destination%.lsexe}"
+	echo "$build/image/$target/${destination%.lsexe}"
 }
 
 # The identity record as text, so a mismatch can be reported by field rather than by digest.

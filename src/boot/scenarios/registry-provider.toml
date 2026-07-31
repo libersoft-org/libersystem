@@ -52,7 +52,7 @@ timeout = 20
 [[step]]
 do = "publish"
 artifact = "process-proto"
-file = "../.build/scenario-fixtures/process-proto-shadow"
+file = "../.build/fixtures/process-proto-shadow"
 timeout = 60
 
 [[step]]
@@ -69,7 +69,7 @@ timeout = 20
 [[step]]
 do = "publish"
 artifact = "process-proto"
-file = "../.build/scenario-fixtures/process-proto-incompatible"
+file = "../.build/fixtures/process-proto-incompatible"
 timeout = 60
 
 [[step]]

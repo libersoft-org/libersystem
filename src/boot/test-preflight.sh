@@ -8,7 +8,7 @@ ARCH="${2:-}"
 SCOPE="${TEST_PREFLIGHT_SCOPE:-narrow}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
-STAMP_DIR="$REPO_ROOT/.build/test-preflight"
+STAMP_DIR="$REPO_ROOT/.build/state/preflight"
 
 usage() {
 	echo "usage: test-preflight.sh <write|check> <x86_64|aarch64|riscv64> [--scope <narrow|full>]" >&2

@@ -30,7 +30,7 @@ for arg in "$@"; do
 done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
-LOG_DIR="$REPO_ROOT/.build/test-logs"
+LOG_DIR="$REPO_ROOT/.build/logs/test"
 mkdir -p "$LOG_DIR"
 LOG_STEM="${ARCH}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 GUEST_LOG="$LOG_DIR/$LOG_STEM-guest.log"

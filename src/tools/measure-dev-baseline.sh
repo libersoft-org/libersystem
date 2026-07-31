@@ -17,7 +17,7 @@ esac
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 repo_root="$(cd "$root/.." && pwd)"
-baseline_root="$repo_root/.build/dev-baseline"
+baseline_root="$repo_root/.build/measure/dev-baseline"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 sample_dir="$baseline_root/$stamp-$scenario"
 events="$sample_dir/events.tsv"

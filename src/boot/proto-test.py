@@ -84,7 +84,7 @@ NO_LAUNCHER, LAUNCH_REFUSED, NO_LAUNCH = 23, 24, 25
 # The staged tree the real images come from. A publication that is expected to commit has to
 # be a real image: the guest verifies the ELF, its target, its identity record and that the
 # record names the artifact it was published as.
-STAGE = os.path.join(lab.REPO, '.build', 'system-image', 'x86_64-unknown-none')
+STAGE = os.path.join(lab.REPO, '.build', 'image', 'x86_64-unknown-none')
 
 # The guest deadlines two groups wait out, in seconds, taken from the protocol's own constants
 # with a margin. Waiting is the only way to observe a deadline from outside.

@@ -24,7 +24,7 @@ intrinsics may change in the next image without compatibility shims.
   leaf lives under `src/user/libs/<name>/`; runtime, service-utility and generated
   protocol providers use their declared role or peer-root paths. Cargo and linker outputs
   belong only below the repository-root `.build/`, including
-  `.build/system-image/<target>/lib/`. The system image installs every provider at its
+  `.build/image/<target>/lib/`. The system image installs every provider at its
   manifest-declared category path below `vol://system/lib/`.
 - Resolution is eager and deterministic. Lazy PLT binding, `LD_PRELOAD`, environment
   search paths, runtime library replacement, symbol interposition, and unload are not

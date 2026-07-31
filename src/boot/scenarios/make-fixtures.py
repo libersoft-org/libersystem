@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Build the fixtures the scenarios publish, into .build/scenario-fixtures.
+# Build the fixtures the scenarios publish, into .build/fixtures.
 #
 # A fixture has to be a real image - the guest verifies the ELF, its target, its identity
 # record and that the record names the artifact it is published as - so it is derived from a
@@ -13,8 +13,8 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STAGE = os.path.join(HERE, '../../../.build/system-image/x86_64-unknown-none')
-OUT = os.path.join(HERE, '../../../.build/scenario-fixtures')
+STAGE = os.path.join(HERE, '../../../.build/image/x86_64-unknown-none')
+OUT = os.path.join(HERE, '../../../.build/fixtures')
 
 
 def staged(path):

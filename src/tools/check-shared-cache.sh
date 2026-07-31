@@ -20,7 +20,9 @@ program_path() {
 
 command -v flock >/dev/null
 mkdir -p "$build_root"
-exec 8>"$build_root/image-build-x86_64-unknown-none.lock"
+# The build directory has a shape; a script that writes into it makes sure its place exists.
+mkdir -p "$build_root/state"
+exec 8>"$build_root/state/build-x86_64-unknown-none.lock"
 flock 8
 
 cleanup() {
@@ -69,7 +71,7 @@ prime_graph() {
 case "$mode" in
 quick)
 	prime_graph
-	if [[ -n "$(find "$build_root/system-image/x86_64-unknown-none" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit)" || -n "$(find "$build_root/image-artifacts-x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit)" ]]; then
+	if [[ -n "$(find "$build_root/image/x86_64-unknown-none" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit)" || -n "$(find "$build_root/cache/x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit)" ]]; then
 		echo "shared-cache-check: obsolete identity or provider-order sidecar remains" >&2
 		exit 1
 	fi
@@ -80,7 +82,7 @@ quick)
 		echo "shared-cache-check: unchanged graph did not use the warm image snapshot" >&2
 		exit 1
 	fi
-	rm -f "$build_root/system-image/x86_64-unknown-none/$(program_path echo)"
+	rm -f "$build_root/image/x86_64-unknown-none/$(program_path echo)"
 	run_graph
 	expect_only_misses provider
 	expect_only_misses executable echo
@@ -93,8 +95,8 @@ quick)
 		echo "shared-cache-check: restored output did not return to a snapshot hit" >&2
 		exit 1
 	fi
-	stale_output="$build_root/system-image/x86_64-unknown-none/lib/stale-flat.lslib"
-	cp "$build_root/system-image/x86_64-unknown-none/lib/runtime/lsrt.lslib" "$stale_output"
+	stale_output="$build_root/image/x86_64-unknown-none/lib/stale-flat.lslib"
+	cp "$build_root/image/x86_64-unknown-none/lib/runtime/lsrt.lslib" "$stale_output"
 	if run_graph; then
 		echo "shared-cache-check: stale flat provider passed the output audit" >&2
 		exit 1
@@ -111,7 +113,7 @@ quick)
 		echo "shared-cache-check: stale-output recovery did not return to a snapshot hit" >&2
 		exit 1
 	fi
-	rm -f "$build_root/image-artifacts-x86_64-unknown-none/executable-echo.build-key"
+	rm -f "$build_root/cache/x86_64-unknown-none/executable-echo.build-key"
 	run_graph
 	expect_only_misses executable echo
 	run_graph

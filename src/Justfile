@@ -632,7 +632,7 @@ dev-ping *args:
     @boot/lab.py dev-ping {{ args }}
 
 # stream a file into the development instance's artifact registry, checked against its
-# digest by the guest. e.g. `just dev-publish shell ../.build/system-image/.../shell`
+# digest by the guest. e.g. `just dev-publish shell ../.build/image/.../shell`
 dev-publish *args:
     @boot/lab.py dev-publish {{ args }}
 

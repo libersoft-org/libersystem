@@ -4,7 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 build_root="$root/../.build"
-image_root="$build_root/system-image/x86_64-unknown-none"
+image_root="$build_root/image/x86_64-unknown-none"
 
 expected="$(
 	cat <<'EOF'
@@ -33,7 +33,7 @@ command -v llvm-readelf >/dev/null
 	echo "artifact-metadata: missing x86_64 shared-image output" >&2
 	exit 1
 }
-if [[ -n "$(find "$image_root" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit)" || -n "$(find "$build_root/image-artifacts-x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit)" ]]; then
+if [[ -n "$(find "$image_root" -type f \( -name '*.identity' -o -name '*.order' \) -print -quit)" || -n "$(find "$build_root/cache/x86_64-unknown-none" -maxdepth 1 -type f -name '*.order.sha256' -print -quit)" ]]; then
 	echo "artifact-metadata: obsolete identity or provider-order sidecar remains" >&2
 	exit 1
 fi

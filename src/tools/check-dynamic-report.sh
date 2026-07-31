@@ -89,7 +89,7 @@ library_file() {
 	local provider="$2"
 	local destination
 	destination="$(jq -er --arg provider "$provider" '.libraries[$provider].destination' <<<"$manifest_json")"
-	printf '%s/system-image/%s/%s\n' "$build_root" "$target" "$destination"
+	printf '%s/image/%s/%s\n' "$build_root" "$target" "$destination"
 }
 
 canonical_manifest_order() {
@@ -187,7 +187,7 @@ immutable_load_bytes() {
 current_object_bytes() {
 	local target="$1"
 	local tool="$2"
-	local directory="$build_root/image-artifacts-$target"
+	local directory="$build_root/cache/$target"
 	local reference="$directory/executable-$tool.object"
 	local key file expected_hash expected_bytes object prefix actual_hash definitions
 	local -a record=()
@@ -324,7 +324,7 @@ generate_report() {
 				row="$(jq -er --arg tool "$tool" '.programs[$tool] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | "dynamic \(.name) \(.owner) \(.stage) \(.providers | join(" "))"' <<<"$manifest_json")"
 				providers="$(cut -d' ' -f5- <<<"$row")"
 				destination="$(jq -er --arg tool "$tool" '.programs[$tool].destination | sub("\\.lsexe$"; "")' <<<"$manifest_json")"
-				artifact="$build_root/system-image/$target/$destination"
+				artifact="$build_root/image/$target/$destination"
 				[[ -f "$artifact" ]] || {
 					echo "dynamic-report: missing $target artifact for $tool" >&2
 					return 1

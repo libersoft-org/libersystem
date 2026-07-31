@@ -37,9 +37,11 @@ source_path() {
 	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
 }
 mkdir -p "$build_root"
-exec 8>"$build_root/image-build-x86_64-unknown-none.lock"
-exec 9>"$build_root/image-build-aarch64-unknown-none.lock"
-exec 10>"$build_root/image-build-riscv64gc-unknown-none-elf.lock"
+# The build directory has a shape; a script that writes into it makes sure its place exists.
+mkdir -p "$build_root/state"
+exec 8>"$build_root/state/build-x86_64-unknown-none.lock"
+exec 9>"$build_root/state/build-aarch64-unknown-none.lock"
+exec 10>"$build_root/state/build-riscv64gc-unknown-none-elf.lock"
 flock 8
 flock 9
 flock 10
@@ -297,7 +299,7 @@ check_target() {
 	else
 		destination="$(jq -er '.programs.echo.destination | sub("\\.lsexe$"; "")' <<<"$manifest_json")"
 	fi
-	artifact="$build_root/system-image/$target/$destination"
+	artifact="$build_root/image/$target/$destination"
 	[[ -f "$artifact" ]] || {
 		echo "image-injection-check: missing staged $label artifact for $kind" >&2
 		return 1

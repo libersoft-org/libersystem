@@ -298,12 +298,12 @@ fn user_elf_path(manifest: &Path, _crate_path: &str, name: &str) -> PathBuf {
 }
 
 fn user_shared_path(manifest: &Path, destination: &str) -> PathBuf {
-	manifest.join(format!("../../.build/system-image/{}/{}", user_target(), destination))
+	manifest.join(format!("../../.build/image/{}/{}", user_target(), destination))
 }
 
 fn user_dynamic_path(manifest: &Path, destination: &str) -> PathBuf {
 	let path = destination.strip_suffix(abi::EXECUTABLE_SUFFIX).unwrap_or_else(|| panic!("dynamic destination has no executable suffix: {destination}"));
-	manifest.join(format!("../../.build/system-image/{}/{}", user_target(), path))
+	manifest.join(format!("../../.build/image/{}/{}", user_target(), path))
 }
 
 fn identity_record(artifact: &Path) -> Vec<u8> {

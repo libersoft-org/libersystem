@@ -38,7 +38,7 @@ sys.path.insert(0, HERE)
 
 import lab
 
-FIXTURES = os.path.join(lab.REPO, '.build', 'scenario-fixtures')
+FIXTURES = os.path.join(lab.REPO, '.build', 'fixtures')
 TIMEOUT = 60
 # The name the refused publication is offered under. It is a declared program, so the name
 # itself is acceptable and the refusal can only come from the identity record naming another

@@ -3,11 +3,13 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
+# The build directory has a shape; a script that writes into it makes sure its place exists.
+mkdir -p "$build_root/state"
 crate="$root/tools/system-manifest"
 target_dir="$build_root/cargo/system-manifest"
 binary="$target_dir/debug/system-manifest"
-key_file="$build_root/system-manifest-tool.key"
-lock_file="$build_root/system-manifest-tool.lock"
+key_file="$build_root/state/manifest-tool.key"
+lock_file="$build_root/state/manifest-tool.lock"
 
 command -v flock >/dev/null
 command -v sha256sum >/dev/null
