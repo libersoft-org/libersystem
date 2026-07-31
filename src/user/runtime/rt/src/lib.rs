@@ -29,6 +29,8 @@ pub use abi::*;
 // (Box, Vec, String) for programs that need it. Registers itself as the
 // #[global_allocator]; dormant until the first allocation.
 mod heap;
+// The byte-stream contract shared by stdio, pipeline edges and storage adapters.
+pub mod stream;
 
 // ELF entry: the kernel drops us into ring 3 / EL0 here with the bootstrap channel
 // handle in the first argument register. Align the stack to the ABI boundary, then
