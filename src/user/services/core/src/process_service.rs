@@ -351,10 +351,56 @@ struct Processes<'a> {
 	// never exist, which is a boot that never finishes.
 	registry: u64,
 	registry_armed: bool,
-	started: Vec<ProcessInfo>,
+	started: Vec<Launched>,
+}
+
+// One launched process, and the handle that lets this service find out whether it is still
+// running. The record used to be the `ProcessInfo` alone, which is why `ps` listed every
+// process the system had ever started: nothing removed an entry, because nothing could tell
+// that a process had ended. `launch` transfers its handle to the caller for job control, so
+// the handle kept here is a duplicate with READ only - enough for `process_stats` and not
+// enough to signal or otherwise act on somebody else's job.
+//
+// A duplicate keeps the Process object alive after the program exits, which is a zombie of
+// exactly one small kernel object and no memory: a process's mappings go with its threads.
+// `reap` closes it at the first opportunity anyone asks anything, so the zombie lasts until
+// the next launch or the next `ps` rather than until reboot.
+struct Launched {
+	info: ProcessInfo,
+	handle: u64,
 }
 
 impl<'a> Processes<'a> {
+	// Record a launch, having first dropped whatever has ended since the last one. Reaping
+	// here as well as in `list` is what bounds the record by the number of live processes
+	// rather than by how long the system has been up: a guest nobody runs `ps` on would
+	// otherwise accumulate an entry per command exactly as before, just without lying about
+	// them when finally asked.
+	fn record(&mut self, info: ProcessInfo, handle: u64) {
+		self.reap();
+		self.started.push(Launched { info, handle });
+	}
+
+	// Drop every process that is no longer running, closing the handle that was holding its
+	// kernel object. A handle this service could not duplicate (0) is kept rather than
+	// guessed about - reporting a live process as gone is the failure this replaced, in the
+	// other direction - and `process_stats` returning None means the object is already gone,
+	// which is as terminated as it gets.
+	fn reap(&mut self) {
+		let mut live: Vec<Launched> = Vec::new();
+		for entry in core::mem::take(&mut self.started) {
+			if entry.handle == 0 {
+				live.push(entry);
+				continue;
+			}
+			match unsafe { process_stats(entry.handle) } {
+				Some(stats) if stats.state == PROC_STATE_RUNNING => live.push(entry),
+				_ => unsafe { close(entry.handle) },
+			}
+		}
+		self.started = live;
+	}
+
 	// A resource Domain for one launch, and only that one.
 	//
 	// It used to be one Domain per distinct limit, shared by every launch that asked for the
@@ -584,17 +630,18 @@ unsafe fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expecte
 impl<'a> Service for Processes<'a> {
 	fn start(&mut self, name: String) -> Result<ProcessInfo, Error> {
 		// spawn with no bootstrap capability (phase 1: started processes run
-		// unattended), then read back the new process's koid and record it.
+		// unattended), then read back the new process's koid and record it. Unlike `launch`
+		// nothing else wants this handle, so it is recorded directly rather than duplicated.
 		let (handle, artifact) = unsafe { self.spawn_program(&name, 0, 0) }.ok_or(Error::NotFound)?;
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
-		unsafe { close(handle as u64) };
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
-		self.started.push(info.clone());
+		self.record(info.clone(), handle as u64);
 		Ok(info)
 	}
 
 	fn list(&mut self) -> Result<Vec<ProcessInfo>, Error> {
-		Ok(self.started.clone())
+		self.reap();
+		Ok(self.started.iter().map(|p| p.info.clone()).collect())
 	}
 
 	fn launch(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error> {
@@ -605,7 +652,8 @@ impl<'a> Service for Processes<'a> {
 		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
-		self.started.push(info.clone());
+		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
+		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 });
 		Ok(StartResult { task: handle as u64, info })
 	}
 
@@ -620,7 +668,8 @@ impl<'a> Service for Processes<'a> {
 		let (handle, artifact) = started.ok_or(Error::NotFound)?;
 		let koid = unsafe { object_info(handle as u64) }.map(|info| info.koid).ok_or(Error::Again)?;
 		let info = ProcessInfo { koid, name: artifact };
-		self.started.push(info.clone());
+		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
+		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 });
 		Ok(StartResult { task: handle as u64, info })
 	}
 }

@@ -56,7 +56,7 @@ Authority remains capability-first and explicitly delegated.
 - [x] [M0024 - virtio drivers (headless): blk, net, console](M0024.md)
 - [x] [M0025 - IDL/WIT toolchain and generators](M0025.md)
 - [x] [M0026 - StorageService over virtio-blk](M0026.md)
-- [ ] [M0027 - Core services: Process, Device, Config](M0027.md)
+- [x] [M0027 - Core services: Process, Device, Config](M0027.md)
 - [x] [M0028 - Minimal WASI host: the first Wasm component](M0028.md)
 - [x] [M0029 - Prototype file picker (powerbox)](M0029.md)
 

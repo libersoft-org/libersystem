@@ -1645,6 +1645,24 @@ fn run_process_service_requests(starts: &[(u32, &[u8])], list_correlation: Optio
 	(replies, list)
 }
 
+// How many processes ProcessService reports as live right now. Separate from
+// `run_process_service_requests` because that one drives a whole session and reads its
+// replies at the end; asking the same question twice around a termination needs the answer
+// in hand before the next step runs.
+fn process_service_list_len(service_client: &alloc::sync::Arc<object::channel::Channel>, correlation: u32) -> u16 {
+	use object::channel::Message;
+
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&2u16.to_le_bytes());
+	request.extend_from_slice(&correlation.to_le_bytes());
+	service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("list request");
+	sched::run_until_idle();
+	let reply = service_client.recv().expect("list reply").bytes;
+	assert_eq!(le_u32(&reply, 0), correlation, "list reply echoes the correlation id");
+	assert_eq!(reply[4], 1, "list succeeded");
+	le_u16(&reply, 5)
+}
+
 fn assert_process_start_reply(reply: &[u8], correlation: u32, artifact: &[u8]) {
 	assert_eq!(le_u32(reply, 0), correlation, "start reply echoes the correlation id");
 	assert_eq!(reply[4], 1, "start succeeded");

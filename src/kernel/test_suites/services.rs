@@ -750,6 +750,42 @@ fn process_service_lists_every_started_program() {
 	assert_eq!(le_u16(&list, 5), 2, "both started processes are listed");
 }
 
+tagged_test!(process_service_drops_a_terminated_process_from_the_list, [Service, Process, ProcessService]);
+fn process_service_drops_a_terminated_process_from_the_list() {
+	use object::channel::Channel;
+	use object::process::Process;
+	use object::rights::Rights;
+
+	// `ps` used to report every process the system had ever started, because nothing removed
+	// an entry - the service held no handle to a launched process and so could not tell that
+	// one had ended. It keeps a READ duplicate for exactly this, and both directions are
+	// asserted here: without the first the test would pass just as well if the launch had
+	// never been recorded, and without the second it would pass on the old behaviour.
+	let _boot_kernel = spawn_service_with_package(b"process_service");
+	let service_client = &_boot_kernel.1;
+
+	// LAUNCH rather than START, because only LAUNCH hands the live process handle back, and
+	// this test has to be the thing that ends the process.
+	let (_bootstrap_kernel, bootstrap_user) = Channel::create();
+	let name: &[u8] = b"log_service";
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&3u16.to_le_bytes());
+	request.extend_from_slice(&21u32.to_le_bytes());
+	request.extend_from_slice(&(name.len() as u16).to_le_bytes());
+	request.extend_from_slice(name);
+	request.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(service_client, &request, bootstrap_user, Rights::ALL).expect("launch request");
+	sched::run_until_idle();
+	let reply = service_client.recv().expect("launch reply");
+	assert_eq!(reply.bytes[4], 1, "the launch succeeded");
+	let process = reply.caps[0].object().into_any_arc().downcast::<Process>().expect("the launch reply carries a Process");
+
+	assert_eq!(process_service_list_len(service_client, 22), 1, "a running process is listed");
+	process.terminate();
+	sched::run_until_idle();
+	assert_eq!(process_service_list_len(service_client, 23), 0, "a terminated process leaves the list");
+}
+
 tagged_test!(process_service_resolves_one_final_executable_suffix, [Service, Process]);
 fn process_service_resolves_one_final_executable_suffix() {
 	use object::channel::{Channel, Message};
