@@ -229,6 +229,14 @@ in M0126 and M0039.
 
 - [x] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
 
+### Internationalization
+
+The system has no locale layer: TimeService serves UTC with nowhere to put an offset, the
+keyboard is a US table compiled into the input driver, and nothing formats a number or a date
+by any convention but one. M0135 adds the policy every one of those is a consumer of.
+
+- [ ] [M0135 - Locales: language, region, time zone, keyboard and formats](M0135.md)
+
 ### Definition of done (phase 2)
 
 Done when the capability-scoped appliance provides networking, wall-clock time,
