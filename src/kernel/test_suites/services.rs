@@ -5,7 +5,7 @@ use super::*;
 // records why it went down instead of seeing an unexplained peer-close. DeviceManager
 // needs the init package before it reports in; hand it a plain message where the package
 // should be and it reports the failure honestly rather than dying silently.
-tagged_test!(a_service_reports_a_bootstrap_failure, [Service]);
+tagged_test!(a_service_reports_a_bootstrap_failure, [Service, Boot]);
 fn a_service_reports_a_bootstrap_failure() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
