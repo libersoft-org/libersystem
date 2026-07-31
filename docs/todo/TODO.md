@@ -84,7 +84,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0032 - virtio-net receive path + the link/IP layer (Ethernet, ARP, IPv4, ICMP)](M0032.md)
 - [x] [M0033 - NetworkService, UDP/TCP, and the net tools as standalone programs](M0033.md)
 - [x] [M0034 - TimeService: wall-clock time (RTC + NTP)](M0034.md)
-- [ ] [M0035 - Interactive console: line editor, history, and cursor](M0035.md)
+- [x] [M0035 - Interactive console: line editor, history, and cursor](M0035.md)
 - [x] [M0036 - Pointer/mouse plumbing (virtio-input pointer + InputService)](M0036.md)
 - [x] [M0037 - Observability (full System Graph, tracing, counters, CBOR)](M0037.md)
 - [x] [M0038 - Security hardening: app sandbox, permission manifests, PermissionManager](M0038.md)
@@ -236,6 +236,14 @@ keyboard is a US table compiled into the input driver, and nothing formats a num
 by any convention but one. M0135 adds the policy every one of those is a consumer of.
 
 - [ ] [M0135 - Locales: language, region, time zone, keyboard and formats](M0135.md)
+
+### Identity
+
+The system governs components thoroughly and people not at all: there are no accounts, no
+credentials and nothing to own. M0136 adds the layer M0035k waited on - LiberFS has carried an
+uninterpreted `owner_tag` for it since it was written.
+
+- [ ] [M0136 - Identity: accounts, authentication and per-user authority](M0136.md)
 
 ### Definition of done (phase 2)
 
