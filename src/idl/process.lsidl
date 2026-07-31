@@ -45,10 +45,24 @@ record start-result {
 /// handle sent to an observer would outlive the process it accounts until the observer
 /// learned that it ended, which is the lifetime problem a Domain-per-launch removed. This
 /// answers with values, transfers no handle, and grants nothing.
+///
+/// `launch-prepared` and `release` are the start gate a pipeline needs: every stage of
+/// `a | b | c` must exist and have its stream endpoints installed before ANY of them runs, or
+/// an early stage writes into a consumer that has not been handed its reader yet. A prepared
+/// launch is a loaded process whose first thread exists and has not been queued; `release`
+/// queues it. The caller gets the same `start-result` an ordinary launch returns, so job
+/// control is identical - what differs is only that the program has not begun.
+///
+/// The start token itself never leaves this service. A reply carries one handle and a prepared
+/// launch would need two, but keeping the token here is the better answer anyway: a caller
+/// cannot hold a half-started process open indefinitely, and `release` names the koid it
+/// already has rather than a second capability to lose track of.
 interface process {
 	@op(1) start:  func(name: string) -> result<process-info, error>;
 	@op(2) list:   func() -> result<list<process-info>, error>;
 	@op(3) launch: func(name: string, bootstrap: handle<channel>) -> result<start-result, error>;
 	@op(4) launch-bounded: func(name: string, memory-limit: u64, bootstrap: handle<channel>) -> result<start-result, error>;
 	@op(5) accounting: func() -> result<list<budget>, error>;
+	@op(6) launch-prepared: func(name: string, bootstrap: handle<channel>) -> result<start-result, error>;
+	@op(7) release: func(koid: koid) -> result<bool, error>;
 }

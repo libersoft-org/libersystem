@@ -104,6 +104,18 @@ impl StartResult {
 /// handle sent to an observer would outlive the process it accounts until the observer
 /// learned that it ended, which is the lifetime problem a Domain-per-launch removed. This
 /// answers with values, transfers no handle, and grants nothing.
+///
+/// `launch-prepared` and `release` are the start gate a pipeline needs: every stage of
+/// `a | b | c` must exist and have its stream endpoints installed before ANY of them runs, or
+/// an early stage writes into a consumer that has not been handed its reader yet. A prepared
+/// launch is a loaded process whose first thread exists and has not been queued; `release`
+/// queues it. The caller gets the same `start-result` an ordinary launch returns, so job
+/// control is identical - what differs is only that the program has not begun.
+///
+/// The start token itself never leaves this service. A reply carries one handle and a prepared
+/// launch would need two, but keeping the token here is the better answer anyway: a caller
+/// cannot hold a half-started process open indefinitely, and `release` names the koid it
+/// already has rather than a second capability to lose track of.
 // interface `process` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod process {
 	use super::*;
@@ -115,6 +127,8 @@ pub mod process {
 	pub const OP_LAUNCH: u16 = 3;
 	pub const OP_LAUNCH_BOUNDED: u16 = 4;
 	pub const OP_ACCOUNTING: u16 = 5;
+	pub const OP_LAUNCH_PREPARED: u16 = 6;
+	pub const OP_RELEASE: u16 = 7;
 
 	pub trait Service {
 		fn start(&mut self, name: String) -> Result<ProcessInfo, Error>;
@@ -122,6 +136,8 @@ pub mod process {
 		fn launch(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error>;
 		fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error>;
 		fn accounting(&mut self) -> Result<Vec<Budget>, Error>;
+		fn launch_prepared(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error>;
+		fn release(&mut self, koid: Koid) -> Result<bool, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -330,6 +346,82 @@ pub mod process {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_LAUNCH_PREPARED => {
+				let name = r.string_lp()?;
+				let bootstrap = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.launch_prepared(name, bootstrap);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v12) => {
+							w.u8(1)?;
+							v12.write(w)?;
+						}
+						Err(v13) => {
+							w.u8(0)?;
+							v13.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_RELEASE => {
+				let koid = r.u64()?;
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.release(koid);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v14) => {
+							w.u8(1)?;
+							w.boolean(*v14)?;
+						}
+						Err(v15) => {
+							w.u8(0)?;
+							v15.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		*reply_handle = writer.handle();
@@ -396,12 +488,12 @@ pub mod process {
 				}
 				Some(if r.u8()? != 0 {
 					Ok({
-						let v12 = r.u16()? as usize;
-						let mut v13 = Vec::new();
-						for _ in 0..v12 {
-							v13.push(ProcessInfo::read(r)?);
+						let v16 = r.u16()? as usize;
+						let mut v17 = Vec::new();
+						for _ in 0..v16 {
+							v17.push(ProcessInfo::read(r)?);
 						}
-						v13
+						v17
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -489,16 +581,70 @@ pub mod process {
 				}
 				Some(if r.u8()? != 0 {
 					Ok({
-						let v14 = r.u16()? as usize;
-						let mut v15 = Vec::new();
-						for _ in 0..v14 {
-							v15.push(Budget::read(r)?);
+						let v18 = r.u16()? as usize;
+						let mut v19 = Vec::new();
+						for _ in 0..v18 {
+							v19.push(Budget::read(r)?);
 						}
-						v15
+						v19
 					})
 				} else {
 					Err(Error::read(r)?)
 				})
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+		pub fn launch_prepared(&mut self, name: &str, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_LAUNCH_PREPARED)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			w.set_handle(*bootstrap)?;
+			w.u32(0)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) })
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
+		pub fn release(&mut self, koid: &Koid) -> Option<Result<bool, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RELEASE)?;
+			w.u32(corr)?;
+			w.u64(*koid)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 { Ok(r.boolean()?) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
 				if reply_handle != 0 {
@@ -548,6 +694,22 @@ pub mod process {
 	fn channel_invoke_accounting(chan: u64) -> Option<Result<Vec<Budget>, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.accounting()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_launch_prepared")]
+	fn channel_invoke_launch_prepared(chan: u64, name: &str, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.launch_prepared(name, bootstrap)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_release")]
+	fn channel_invoke_release(chan: u64, koid: &Koid) -> Option<Result<bool, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.release(koid)
 	}
 }
 

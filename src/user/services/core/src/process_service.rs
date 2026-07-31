@@ -352,6 +352,13 @@ struct Processes<'a> {
 	registry: u64,
 	registry_armed: bool,
 	started: Vec<Launched>,
+	// Launches that exist but have not run, by koid and start token. A pipeline prepares every
+	// stage, installs the endpoints between them and then releases them, so that no stage can
+	// write into a consumer that has not been given its reader.
+	//
+	// A token left here is a process that never runs, which is what an abandoned transaction
+	// should leave behind: harmless, and reaped with everything else.
+	prepared: Vec<(u64, u64)>,
 }
 
 // One launched process, and the handle that lets this service find out whether it is still
@@ -655,12 +662,33 @@ unsafe fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expecte
 			close(process);
 			return entry;
 		}
-		let started = process_start(process, entry as u64, bootstrap);
-		if started < 0 {
+		// Prepare rather than start. The decision to run belongs to the caller, because a
+		// pipeline must have every stage loaded and wired before ANY of them executes - an
+		// early stage that ran now would write into a consumer with no reader yet. Every
+		// ordinary launch releases immediately and is unchanged; only a prepared launch holds
+		// the token back.
+		let thread = process_prepare(process, entry as u64, bootstrap);
+		if thread < 0 {
 			close(process);
+			return thread;
 		}
-		started
+		PREPARED_THREAD.store(thread as u64, core::sync::atomic::Ordering::Relaxed);
+		process as i64
 	}
+}
+
+// The start token of the launch this service most recently prepared.
+//
+// A one-slot handoff rather than a return value, because the spawn path returns a single i64
+// through two layers and five call sites, and widening all of them to carry a second handle
+// would touch the boot chain for a value only the layer directly above uses. Reading it is
+// immediately after the spawn that set it, on the one thread that serves this channel, so the
+// slot is never contended: this service is single-threaded by construction.
+static PREPARED_THREAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Take the token of the launch just prepared, leaving the slot empty.
+fn take_prepared_thread() -> u64 {
+	PREPARED_THREAD.swap(0, core::sync::atomic::Ordering::Relaxed)
 }
 
 impl<'a> Service for Processes<'a> {
@@ -669,6 +697,7 @@ impl<'a> Service for Processes<'a> {
 		// unattended), then read back the new process's koid and record it. Unlike `launch`
 		// nothing else wants this handle, so it is recorded directly rather than duplicated.
 		let (handle, artifact) = unsafe { self.spawn_program(&name, 0, 0) }.ok_or(Error::NotFound)?;
+		unsafe { process_release(take_prepared_thread()) };
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
 		self.record(info.clone(), handle as u64, 0);
@@ -717,11 +746,48 @@ impl<'a> Service for Processes<'a> {
 		// process handle is handed back to the caller for job control - so unlike `start`
 		// we do not close it here; it is transferred out as the reply's handle.
 		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
+		unsafe { process_release(take_prepared_thread()) };
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
 		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
 		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, 0);
 		Ok(StartResult { task: handle as u64, info })
+	}
+
+	// Load a program and leave it stopped. Identical to `launch` except that the process has
+	// not begun: the start token stays here and `release` queues it. This is what lets a
+	// pipeline exist whole before it runs - `a | b` needs b's reader installed before a writes.
+	fn launch_prepared(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error> {
+		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
+		let token = take_prepared_thread();
+		let koid: u64 = match unsafe { object_info(handle as u64) }.map(|i| i.koid) {
+			Some(koid) => koid,
+			None => {
+				// A prepared launch nobody can identify can never be released, so it would be
+				// a process stopped forever. Drop the token, which leaves a process that never
+				// runs, and report rather than leaking it.
+				unsafe { close(token) };
+				unsafe { close(handle as u64) };
+				return Err(Error::Again);
+			}
+		};
+		let info = ProcessInfo { koid, name: artifact };
+		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
+		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, 0);
+		self.prepared.push((koid, token));
+		Ok(StartResult { task: handle as u64, info })
+	}
+
+	// Start a launch prepared earlier. Returns false when that koid has no pending launch -
+	// already released, never prepared, or reaped - which a caller building a pipeline needs
+	// to distinguish from an error, because releasing twice is a bug in the caller and not a
+	// condition the system should hide.
+	fn release(&mut self, koid: u64) -> Result<bool, Error> {
+		let Some(index) = self.prepared.iter().position(|(pending, _)| *pending == koid) else {
+			return Ok(false);
+		};
+		let (_, token) = self.prepared.remove(index);
+		Ok(unsafe { process_release(token) } >= 0)
 	}
 
 	fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
@@ -736,6 +802,7 @@ impl<'a> Service for Processes<'a> {
 			unsafe { close(domain) };
 			return Err(Error::NotFound);
 		};
+		unsafe { process_release(take_prepared_thread()) };
 		let koid = unsafe { object_info(handle as u64) }.map(|info| info.koid).ok_or(Error::Again)?;
 		let info = ProcessInfo { koid, name: artifact };
 		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
@@ -771,7 +838,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 5. serve generated start/list requests until the client side closes.
-	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new() };
+	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new(), prepared: Vec::new() };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
