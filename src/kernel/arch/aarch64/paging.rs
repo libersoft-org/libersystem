@@ -335,6 +335,15 @@ pub fn unmap_page_in(ttbr: u64, virt: u64) -> Option<u64> {
 // starts as an empty L0. User pages (all below 128 TB) are mapped on demand.
 // Returns the L0 physical address, or None if out of RAM. No PT_LOCK needed: this
 // only allocates an empty root (a leaf frame alloc), it mutates no shared table.
+// Always None on aarch64, and the reason is the architecture rather than an omission. The
+// kernel lives in TTBR1 and userspace in TTBR0, and a context switch changes only TTBR0 - so a
+// user address space holds no copy of the kernel mapping to drift from, and switching into one
+// cannot lose the kernel the way a single-root architecture can. x86_64 and riscv64 both copy
+// a kernel half into every new root and need the check; here there is nothing to compare.
+pub fn kernel_half_divergence(_root: u64, _reference: u64) -> Option<(usize, u64, u64)> {
+	None
+}
+
 pub fn new_address_space() -> Option<u64> {
 	// alloc_frame returns a zeroed frame, so the L0 is already empty.
 	alloc_frame()

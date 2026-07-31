@@ -238,6 +238,27 @@ pub fn unmap_page_in(satp_root: u64, virt: u64) -> Option<u64> {
 // Create a fresh per-process address-space root that shares the kernel's high half
 // (the direct-map megapages, so the kernel stays mapped when this space is active)
 // and starts with an empty low (user) half. Returns the root physical address.
+// The first kernel-half entry of `root` that differs from `reference`, as (index, ours,
+// theirs), or None when they agree. The riscv64 twin of the x86_64 check, and for the same
+// reason: `new_address_space` COPIES the high half rather than sharing it, so every address
+// space carries a snapshot of the kernel mapping from when it was made. Switching into a root
+// whose high half no longer matches loads a table that cannot fetch the next instruction,
+// which faults, faults again in the handler, and resets the machine with nothing logged.
+pub fn kernel_half_divergence(root: u64, reference: u64) -> Option<(usize, u64, u64)> {
+	let _guard = PT_LOCK.lock();
+	unsafe {
+		let this = phys_to_virt(root) as *const u64;
+		let refr = phys_to_virt(reference) as *const u64;
+		for i in 256..512 {
+			let (a, b) = (read_volatile(this.add(i)), read_volatile(refr.add(i)));
+			if a != b {
+				return Some((i, a, b));
+			}
+		}
+	}
+	None
+}
+
 pub fn new_address_space() -> Option<u64> {
 	let root = alloc_frame()?; // zeroed
 	let _guard = PT_LOCK.lock();

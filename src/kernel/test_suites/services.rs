@@ -808,7 +808,7 @@ fn process_service_drops_a_terminated_process_from_the_list() {
 
 tagged_test!(process_service_accounts_a_bounded_launch, [Service, Process, ProcessService, Domain]);
 fn process_service_accounts_a_bounded_launch() {
-	use object::channel::{Channel, Message};
+	use object::channel::Channel;
 	use object::rights::Rights;
 
 	// A per-launch Domain used to be invisible: ProcessService created one, handed it to the
