@@ -647,6 +647,13 @@ unsafe fn spawn_canary(package: &Package, buf: &mut [u8]) -> (u64, u64) {
 		if proc < 0 {
 			return (0, 0);
 		}
+		// Label it, because this is the process a booted system faults on purpose: the
+		// self-test commands it to CRASH so the restart path is exercised on every boot.
+		// Unlabelled it reported as `unnamed` in the fault line and read like an unexplained
+		// null-pointer write in a booted system, which is exactly how it was mistaken for
+		// one. The supervisor spawns it directly rather than through ProcessService, so this
+		// is the only place its name is known.
+		set_object_name(proc as u64, "watchdog_probe");
 		match recv_blocking(ctrl, buf) {
 			Received::Message { .. } => (proc as u64, ctrl),
 			Received::Closed => {

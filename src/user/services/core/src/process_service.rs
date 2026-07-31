@@ -452,7 +452,11 @@ impl<'a> Processes<'a> {
 				}
 				let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
 				let handle = spawn_from_path(self.storage, registry, path, basename, bootstrap, domain)?;
-				return (handle >= 0).then(|| (handle, String::from(basename)));
+				if handle < 0 {
+					return None;
+				}
+				name_process(handle, basename);
+				return Some((handle, String::from(basename)));
 			}
 			let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
 			for artifact in executable::launch_candidates(name)? {
@@ -469,11 +473,25 @@ impl<'a> Processes<'a> {
 						None => continue,
 					}
 				};
-				return (handle >= 0).then_some((handle, artifact));
+				if handle < 0 {
+					continue;
+				}
+				name_process(handle, &artifact);
+				return Some((handle, artifact));
 			}
 			None
 		}
 	}
+}
+
+// Label the new process with the artifact it was launched as, so a fault message can name it.
+// The kernel reads a name out of a staged image's identity note, which covers everything on
+// the volume; the static programs in the init package carry no note, and this is the only
+// place their name is known. Best effort by design - a process that could not be labelled is
+// still a process, and refusing the launch over a label would trade a working system for a
+// better log message.
+fn name_process(handle: i64, artifact: &str) {
+	unsafe { set_object_name(handle as u64, artifact) };
 }
 
 // Read one exact `.lsexe` path through the storage client, map its shared buffer,

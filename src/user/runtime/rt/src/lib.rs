@@ -1576,6 +1576,15 @@ pub unsafe fn domain_set_limit(domain: u64, prop: u64, limit: u64) -> i64 {
 	unsafe { syscall(SYS_OBJECT_PROPERTY_SET, domain, prop, limit, 0) as i64 }
 }
 
+// Label an object (max 64 bytes of UTF-8); the handle must carry RIGHT_MANAGE. What this
+// is for is a fault message that can say which program died: an image staged on the volume
+// carries its own name in its identity note and the kernel reads it there, but the static
+// programs in the init package carry no note, so the only place their name exists is in the
+// package entry the launcher looked them up by.
+pub unsafe fn set_object_name(handle: u64, name: &str) -> i64 {
+	unsafe { syscall(SYS_OBJECT_PROPERTY_SET, handle, PROP_NAME, name.as_ptr() as u64, name.len() as u64) as i64 }
+}
+
 // Read the live per-Domain resource counters behind a Domain `handle` (the used,
 // high-water and limit of memory plus the other resource counters). The handle must carry
 // RIGHT_READ. Returns None if the handle is unknown or not a Domain; a ResourceManager

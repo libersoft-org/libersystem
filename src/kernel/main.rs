@@ -316,6 +316,11 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	let elf_image = package.lookup(b"system_manager.lsexe").ok_or("system_manager.lsexe missing from init package")?;
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
 	let process = loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, Rights::ALL, 0).map_err(|_| "failed to load SystemManager")?;
+	// The one process nothing else can name. The loader takes a name from a staged image's
+	// identity note, and the static init-package programs carry none; every other one of them
+	// is launched through ProcessService, which labels it from the package entry it was looked
+	// up by. This one the kernel launches itself, so the kernel labels it.
+	process.header().set_name("system_manager");
 	let sm_koid = process.header().koid();
 
 	// Hand SystemManager the init package as a read-only shared buffer: the kernel

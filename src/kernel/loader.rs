@@ -60,6 +60,21 @@ extern "C" fn user_process_trampoline(ctx: u64) {
 
 // Load `elf_image` into a new Process accounted to `domain`, seed it with a
 // bootstrap capability to `bootstrap`, and schedule it. Returns the Process.
+// The artifact name an image carries in its own identity note, which is what lets a fault
+// message say which program faulted. Nothing else names a process: `set_name` had exactly one
+// caller, the property syscall, so every process in a booted system was anonymous and a fault
+// could only be attributed by guessing which image an address fell in and disassembling it -
+// a guess that sent one investigation down the wrong path for hours.
+//
+// Taking it from the image rather than from a parameter is what makes it uniform: every spawn
+// path already has the bytes, and an image that carries no note (a hand-laid test fixture)
+// simply stays unnamed rather than forcing every caller to invent one.
+fn image_artifact_name(elf_image: &[u8]) -> Option<&str> {
+	let note = bootproto::elf::Elf::parse(elf_image)?.liber_identity_note()?;
+	let value = note.split(|byte| *byte == b'\n').find_map(|line| line.strip_prefix(b"artifact=".as_slice()))?;
+	core::str::from_utf8(value).ok().filter(|name| !name.is_empty())
+}
+
 pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Result<Arc<Process>, LoadError> {
 	let address_space = AddressSpace::create().ok_or(LoadError::OutOfMemory)?;
 	let mut frames: Vec<u64> = Vec::new();
@@ -80,6 +95,9 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 
 	// From here on the Process owns the frames and frees them when it is dropped.
 	let process = Process::new(address_space, domain);
+	if let Some(name) = image_artifact_name(elf_image) {
+		process.header().set_name(name);
+	}
 	process.adopt_frames(frames);
 	process.adopt_shared_pages(shared);
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
@@ -114,6 +132,11 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 		return Err(err);
 	}
 	// From here on the Process owns the frames and frees them when it is dropped.
+	// The name comes from the executable rather than from whichever module loaded last, so a
+	// dynamic program is reported under its own artifact and not under a provider of its.
+	if let Some(name) = image_artifact_name(elf_image) {
+		process.header().set_name(name);
+	}
 	process.adopt_frames(frames);
 	process.adopt_shared_pages(shared);
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);

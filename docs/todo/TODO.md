@@ -19,7 +19,7 @@ storage, a CLI and framebuffer console. Every milestone has a QEMU-tested gate.
 - [x] [M0009 - Resource accounting](M0009.md)
 - [x] [M0010 - IPC latency benchmark (phase 0 gate)](M0010.md)
 - [x] [M0011 - Process and per-process address space](M0011.md)
-- [ ] [M0012 - Fault isolation and crashed-process cleanup](M0012.md)
+- [x] [M0012 - Fault isolation and crashed-process cleanup](M0012.md)
 - [x] [M0013 - Domain hierarchy and lifecycle](M0013.md)
 - [x] [M0014 - Init package and the first userspace process](M0014.md)
 - [x] [M0015 - Framebuffer text console](M0015.md)

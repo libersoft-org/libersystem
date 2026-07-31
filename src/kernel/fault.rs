@@ -184,6 +184,15 @@ pub fn terminate_user(info: FaultInfo) -> ! {
 			let process = thread.process();
 			process.set_fault(info);
 			let koid = process.header().koid();
+			// The report belongs here rather than in each architecture's trap handler, and
+			// for two reasons that are really one. Only x86_64 printed anything, so a
+			// process could die on riscv64 and leave nothing in the log at all - a full
+			// suite run there showed no fault line even where the deliberate crash tests
+			// clearly faulted. And only here is the process in hand, so only here can the
+			// message say which one it was: an instruction pointer alone is unattributable
+			// when every EXEC image shares a load base.
+			let kind = if info.kind == FAULT_PAGE { "page fault" } else { "general protection fault" };
+			crate::serial_println!("fault: ring-3 {} (code {:#x}) at {:#x}, addr {:#x} - terminating process koid={} ({})", kind, info.error_code, info.instruction_pointer, info.address, koid, process.header().name().as_deref().unwrap_or("unnamed"));
 			// Eagerly tear the crashed process's capabilities down - detaching its
 			// IRQ, refunding its DMA and memory, and removing every handle - rather
 			// than waiting for the thread to be reaped, so a supervisor can reclaim
