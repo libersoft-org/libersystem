@@ -56,3 +56,91 @@ fn parse_and_expand_runs_the_whole_pipeline() {
 	assert_eq!(parse_and_expand(b"  ls $PATH --json  ", &values), b"ls vol://system json");
 	assert_eq!(parse_and_expand(b"GREETING=hi $NAME", &values), b"GREETING=hi world");
 }
+
+// The property this whole design turns on: an expanded value is DATA and never syntax.
+//
+// Today's shell expands before it routes, which is safe only because no operator exists. The
+// moment `|` means something, expanding first turns a variable's contents into structure - so
+// this asserts the opposite ordering directly, with the operator characters coming from
+// variables in every position that matters.
+#[test]
+fn an_expanded_value_never_becomes_syntax() {
+	let values = alloc::vec![(String::from("PIPE"), String::from("| rm")), (String::from("REDIR"), String::from("> /etc/passwd")), (String::from("AMP"), String::from("&")),];
+
+	// A variable holding `| rm` is one argument, not a pipe and a command.
+	let p = parse_pipeline(b"echo $PIPE", &values).expect("parses");
+	assert_eq!(p.stages.len(), 1, "an expanded pipe character does not create a stage");
+	assert_eq!(p.stages[0].words, alloc::vec![b"echo".to_vec(), b"| rm".to_vec()]);
+
+	// The same for a redirection: no file is named, because nothing was redirected.
+	let p = parse_pipeline(b"echo $REDIR", &values).expect("parses");
+	assert!(p.stages[0].redirects.is_empty(), "an expanded redirect character redirects nothing");
+	assert_eq!(p.stages[0].words[1], b"> /etc/passwd".to_vec());
+
+	// And for backgrounding, which would otherwise detach a job the user is watching.
+	let p = parse_pipeline(b"echo $AMP", &values).expect("parses");
+	assert!(!p.background, "an expanded ampersand does not background the job");
+}
+
+// Quoting is decided during lexing, so an operator inside quotes is a literal. If quoting were
+// applied after operators were found, `echo "a | b"` would already have been split.
+#[test]
+fn quoting_hides_operators_from_the_lexer() {
+	let none: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+	let p = parse_pipeline(b"echo \"a | b\"", &none).expect("parses");
+	assert_eq!(p.stages.len(), 1, "a quoted pipe is not a pipe");
+	assert_eq!(p.stages[0].words, alloc::vec![b"echo".to_vec(), b"a | b".to_vec()]);
+
+	let p = parse_pipeline(b"echo a\\|b", &none).expect("parses");
+	assert_eq!(p.stages.len(), 1, "an escaped pipe is not a pipe");
+}
+
+#[test]
+fn a_pipeline_splits_into_stages_with_their_own_redirects() {
+	let none: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+	let p = parse_pipeline(b"cat < in.txt | grep x | tee out.txt", &none).expect("parses");
+	assert_eq!(p.stages.len(), 3);
+	assert_eq!(p.stages[0].redirects, alloc::vec![Redirect::In(b"in.txt".to_vec())]);
+	assert!(p.stages[1].redirects.is_empty(), "a redirect belongs to its own stage only");
+	assert_eq!(p.stages[2].words, alloc::vec![b"tee".to_vec(), b"out.txt".to_vec()]);
+
+	// Redirections keep their written order, because `> a > b` and `2>&1 > f` differ by it.
+	let p = parse_pipeline(b"cmd 2>&1 > f", &none).expect("parses");
+	assert_eq!(p.stages[0].redirects, alloc::vec![Redirect::ErrToOut, Redirect::Out { path: b"f".to_vec(), append: false, stderr: false }]);
+
+	let p = parse_pipeline(b"cmd 2>> log &", &none).expect("parses");
+	assert_eq!(p.stages[0].redirects, alloc::vec![Redirect::Out { path: b"log".to_vec(), append: true, stderr: true }]);
+	assert!(p.background);
+}
+
+// Every refusal is checked before a caller could open a file or launch a stage, which is why
+// parsing is separate from running. A truncated pipeline is a different command from the one
+// that was typed, so bounds refuse rather than trim.
+#[test]
+fn malformed_lines_are_refused_not_repaired() {
+	let none: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+	assert_eq!(parse_pipeline(b"", &none), Err(ParseError::Empty));
+	assert_eq!(parse_pipeline(b"| b", &none), Err(ParseError::EmptyStage));
+	assert_eq!(parse_pipeline(b"a |", &none), Err(ParseError::EmptyStage));
+	assert_eq!(parse_pipeline(b"a | | b", &none), Err(ParseError::EmptyStage));
+	assert_eq!(parse_pipeline(b"a >", &none), Err(ParseError::DanglingOperator));
+	assert_eq!(parse_pipeline(b"a < ", &none), Err(ParseError::DanglingOperator));
+	assert_eq!(parse_pipeline(b"echo \"unclosed", &none), Err(ParseError::UnterminatedQuote));
+	assert_eq!(parse_pipeline(b"a & b", &none), Err(ParseError::DanglingOperator));
+	assert_eq!(parse_pipeline(b"cmd 3>&1", &none), Err(ParseError::UnsupportedDescriptor));
+
+	let long = alloc::vec![b'a'; MAX_LINE_BYTES + 1];
+	assert_eq!(parse_pipeline(&long, &none), Err(ParseError::TooLarge));
+	let many = alloc::vec![b"a |".to_vec(); MAX_STAGES + 1].concat();
+	assert!(matches!(parse_pipeline(&many, &none), Err(ParseError::TooLarge) | Err(ParseError::EmptyStage)));
+}
+
+// A digit is only a descriptor when it introduces a redirection, or ordinary words starting
+// with a digit would stop being words.
+#[test]
+fn a_leading_digit_is_only_a_descriptor_before_a_redirect() {
+	let none: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+	let p = parse_pipeline(b"echo 2x file2", &none).expect("parses");
+	assert_eq!(p.stages[0].words, alloc::vec![b"echo".to_vec(), b"2x".to_vec(), b"file2".to_vec()]);
+	assert!(p.stages[0].redirects.is_empty());
+}
