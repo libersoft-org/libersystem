@@ -129,7 +129,15 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
 fi
 if [[ "$status" -eq 0 ]] && ! grep -hEq '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG"; then
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
-	echo "[test-$ARCH] INCOMPLETE: QEMU exited successfully without the test-suite completion marker" >&2
+	# In test mode the only legitimate way out is the debug-exit device: the runner writes
+	# 0x10 for pass (QEMU exits 33, mapped to 0) or 0x11 for fail (35). A plain 0 means QEMU
+	# ended without the guest writing that port at all, and with `-no-reboot` that is what a
+	# guest RESET looks like - a triple fault, or a shutdown nothing in a test should be
+	# asking for. The old wording here was "QEMU exited successfully", which reads as benign
+	# and sent one investigation looking for a clean shutdown; the guest did not exit, it
+	# died in a way that leaves no message because the fault outran the fault handler.
+	echo "[test-$ARCH] GUEST RESET: QEMU ended without the debug-exit signal, so the guest reset or powered off" >&2
+	echo "[test-$ARCH] the last line of the guest log names the test it happened in; every test after it never ran" >&2
 	exit 1
 fi
 if [[ "$status" -eq 0 ]]; then

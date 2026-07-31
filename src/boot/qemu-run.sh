@@ -532,8 +532,12 @@ qemu_run_x86_64() {
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
 		set +e
+		# `QEMU_EXTRA` reaches test mode too. It is documented at the top of this file as extra
+		# QEMU arguments and did not apply here, which is the one configuration where it is
+		# most wanted: diagnosing a guest that resets needs `-d int,cpu_reset` on the run that
+		# reproduces it, and a test run is what reproduces it.
 		if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then
-			qemu-system-x86_64 "${qemu_args[@]}" &
+			qemu-system-x86_64 "${qemu_args[@]}" ${QEMU_EXTRA:-} &
 			local qemu_pid=$!
 			watch_test_timing "$qemu_pid" &
 			local watcher_pid=$!
@@ -541,7 +545,7 @@ qemu_run_x86_64() {
 			local code=$?
 			wait "$watcher_pid" || true
 		else
-			qemu-system-x86_64 "${qemu_args[@]}"
+			qemu-system-x86_64 "${qemu_args[@]}" ${QEMU_EXTRA:-}
 			local code=$?
 		fi
 		set -e

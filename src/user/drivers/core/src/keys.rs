@@ -307,7 +307,15 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		}
 		// The Power key shuts the machine down (interrupt-driven like the reboot chord,
 		// so it works even when userspace is wedged).
+		//
+		// It announces itself first, and that is not decoration. Powering off is the one
+		// action that destroys the evidence of why it happened: the machine simply stops,
+		// QEMU exits 0 with no reset and no fault, and from outside it is indistinguishable
+		// from a clean shutdown - which is exactly how a test suite came to end mid-run with
+		// nothing in the log to say who ended it. Whatever asks for this should be named
+		// while there is still a console to name it on.
 		if code == KEY_POWER {
+			unsafe { debug_write(b"driver.keys: KEY_POWER - powering off\n") };
 			system_power(POWER_OFF);
 			return;
 		}

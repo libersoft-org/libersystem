@@ -97,7 +97,7 @@ impl Service for Manager {
 		// of its two sources was quiet is less useful than one that returns what it has.
 		if self.process != 0 {
 			let mut client = process::Client::new(ChannelTransport { chan: self.process });
-			if let Some(Ok(launched)) = unsafe { client.accounting() } {
+			if let Some(Ok(launched)) = client.accounting() {
 				budgets.extend(launched);
 			}
 		}

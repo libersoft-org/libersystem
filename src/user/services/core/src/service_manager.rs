@@ -1224,6 +1224,13 @@ unsafe fn handle_admin(admin: u64, broker: &mut Broker, state: &mut [State; N], 
 		if name == b"!poweroff" || name == b"!reboot" {
 			let action: u64 = if name == b"!reboot" { POWER_REBOOT } else { POWER_OFF };
 			shutdown_all(state, channels, sup, procs, log_client, buf);
+			// Say so before doing it. Powering off destroys the evidence of why: the machine
+			// stops, QEMU exits 0 with no reset and no fault, and from outside that is
+			// indistinguishable from a clean shutdown - which is how a suite came to end
+			// mid-run with nothing naming who ended it. The comment on the self-test path
+			// above already knew this ("system_power would stop QEMU mid-suite"); the knowledge
+			// just never reached the log.
+			debug_write(b"service_manager: power verb - shutting down\n");
 			system_power(action);
 			return true;
 		}

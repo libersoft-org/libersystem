@@ -867,6 +867,7 @@ unsafe fn graceful_power(admin: u64, action: u64) {
 				let _ = recv_blocking(admin, &mut rbuf);
 			}
 		}
+		debug_write(b"shell: power request - shutting down\n");
 		system_power(action);
 	}
 }
