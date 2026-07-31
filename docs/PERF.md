@@ -157,6 +157,44 @@ compiles one. So a loader edit is invisible to `just test`, which boots whatever
 built, and a loader-only sample has to be taken through a path that assembles the image from a
 fresh loader instead.
 
+## Cold invalidation classes (2026-07-31)
+
+The three sample kinds the phase review left unrecorded. Each is a cold invalidation - a change
+no fast iteration can carry - so what they measure is the checkpoint path rather than the loop,
+and none of them is held to the loop's budgets. What they are for is the shape of the cost: what
+a developer pays when a change reaches past the artifact it touched.
+
+Schema `liber-dev-baseline-v2`, the same the phase review rows carry, so these are comparable
+with those and not with the 2026-07-26 baseline, which measured a different set of phases.
+
+| class | total | build | init package | volume package | image | QEMU start | guest boot | scenario |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| kernel-only | 15.75 s | 2.98 s | 0.68 s | 4.45 s | 0.96 s | 5.15 s | 0.51 s | 25 ms |
+| loader-only | 19.38 s | 7.26 s | 0.40 s | 3.83 s | 0.66 s | 5.89 s | - | 42 ms |
+| boot-topology | 7.56 s | 0.24 s | - | - | 0.86 s | 5.09 s | 0.52 s | 24 ms |
+
+Read against the leaf iteration's 5.6 to 6.0 s, the cheapest of the three costs more than the
+most expensive fast path, which is the whole argument for the invalidation matrix: these are the
+changes worth knowing are cold before making them, not after.
+
+The floor is the boot-topology row: nothing is rebuilt, and it still costs 7.56 s, of which
+5.09 s is QEMU starting. Every cold class pays that, so no amount of build work removes it - a
+change that needs a fresh guest costs five seconds before anything of its own is measured.
+
+The volume package dominates the two that rebuild: 4.45 s of the kernel row and 3.83 s of the
+loader row, against 0.96 s and 0.66 s to assemble the image from it. A kernel change pays it
+because the kernel's build script regenerates the packages; a loader change pays it for the
+same reason, through the same path.
+
+The loader row had to be taken by hand, and the reason is worth keeping: a loader edit is
+invisible to `just test`, which boots whatever loader was built last, so the recorder's path
+measures everything except the thing being changed. Taken through `just build`, which does
+compile it, the loader costs 7.26 s to rebuild - the largest single build cost of the three.
+The first attempt at this sample also read 2.19 s rather than 7.26 s, because the probe comment
+was the same text as the previous attempt's and cargo served the earlier compilation: a probe
+that repeats itself measures a cache hit. The recorded row uses a probe carrying the clock, as
+the performance gate does for the same reason.
+
 ## Image conversion (2026-07-16)
 
 `just image-bench` builds the same no_std leaves used by `imgconv` in an optimized
