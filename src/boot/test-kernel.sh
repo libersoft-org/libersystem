@@ -68,7 +68,40 @@ riscv64)
 	;;
 esac
 
+# Budgets are per architecture, because one number cannot serve all three: x86_64 runs under
+# KVM and the other two are emulated, measured at 13.6x and 20.9x its wall time for the same
+# suite (2026-07-31: 146 tests in 79 s, 138 in 1074 s, 139 in 1653 s).
+#
+# A single 15m budget was therefore not a budget at all - it was under the real runtime of two
+# of the three targets, so `just test-all` could not pass, and the failure reads as TIMEOUT,
+# which everyone hears as "it hung" rather than "the number is wrong". Nobody could tell
+# whether aarch64 and riscv64 were green, and the way around it was to run tags instead, where
+# the same 3m budget is under an emulated tag run and fails the same way.
+#
+# Each figure below is a measurement times headroom, not a guess: full suites at about 1.7x
+# the measured time, tag runs sized so an x86_64 run that fits 3m still fits after the
+# emulation multiplier.
+case "$ARCH" in
+x86_64)
+	FULL_TIMEOUT=15m
+	TAG_TIMEOUT=3m
+	;;
+aarch64)
+	FULL_TIMEOUT=30m
+	TAG_TIMEOUT=10m
+	;;
+riscv64)
+	FULL_TIMEOUT=45m
+	TAG_TIMEOUT=15m
+	;;
+*)
+	FULL_TIMEOUT=15m
+	TAG_TIMEOUT=3m
+	;;
+esac
+
 if [[ "$BUILD_ONLY" == "1" ]]; then
+	# A build is host work and does not run the guest, so it is not affected by emulation.
 	DEFAULT_TIMEOUT=3m
 	if [[ -n "$TAGS" ]]; then
 		MODE="build-only tags=$TAGS"
@@ -76,10 +109,10 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
 		MODE="build-only all tags"
 	fi
 elif [[ -n "$TAGS" ]]; then
-	DEFAULT_TIMEOUT=3m
+	DEFAULT_TIMEOUT="$TAG_TIMEOUT"
 	MODE="tags=$TAGS"
 else
-	DEFAULT_TIMEOUT=15m
+	DEFAULT_TIMEOUT="$FULL_TIMEOUT"
 	MODE="all tags"
 fi
 LIMIT="${TEST_TIMEOUT:-$DEFAULT_TIMEOUT}"
