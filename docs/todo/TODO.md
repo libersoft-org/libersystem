@@ -223,11 +223,11 @@ board-specific real-hardware support remains later work.
 ### Development-loop priority
 
 M0134 removes whole-system rebuild and cold-boot repetition from ordinary leaf-tool
-development while preserving the existing full release gates. Phases a-e are delivered and the
-loop is in daily use; M0134f holds two defects in the build's own record-keeping, which is what
-keeps the milestone open. It no longer blocks application, utility or driver work.
+development while preserving the existing full release gates. All six phases are delivered and
+the loop is in daily use. Two defects it found in older code are open where that code lives,
+in M0126 and M0039.
 
-- [ ] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
+- [x] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
 
 ### Definition of done (phase 2)
 

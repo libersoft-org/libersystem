@@ -4,5 +4,3 @@ extern crate alloc;
 
 pub use wire as codec;
 pub mod generated;
-
-// interrupt experiment 1785462593673308198
