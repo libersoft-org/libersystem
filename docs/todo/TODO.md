@@ -88,7 +88,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0036 - Pointer/mouse plumbing (virtio-input pointer + InputService)](M0036.md)
 - [x] [M0037 - Observability (full System Graph, tracing, counters, CBOR)](M0037.md)
 - [x] [M0038 - Security hardening: app sandbox, permission manifests, PermissionManager](M0038.md)
-- [x] [M0039 - ResourceManager policy service](M0039.md)
+- [ ] [M0039 - ResourceManager policy service](M0039.md)
 - [x] [M0040 - ServiceManager: restart policy and watchdog](M0040.md)
 - [x] [M0041 - Full Component Model + WASI preview 2 + an SDK](M0041.md)
 - [x] [M0043 - A simple persistent native filesystem](M0043.md)
@@ -211,7 +211,7 @@ board-specific real-hardware support remains later work.
 - [x] [M0123 - Shared system libraries (dynamic linking)](M0123.md)
 - [ ] [M0124 - Audio player (streaming decoders over AudioService)](M0124.md)
 - [x] [M0125 - Native executable artifacts (`.lsexe`)](M0125.md)
-- [x] [M0126 - Image conversion tool (`imgconv`)](M0126.md)
+- [ ] [M0126 - Image conversion tool (`imgconv`)](M0126.md)
 - [x] [M0127 - Userspace source and system-volume layout cleanup](M0127.md)
 - [ ] [M0128 - Declarative driver binding and lifecycle core](M0128.md)
 - [ ] [M0129 - Universal standards-based driver set](M0129.md)
@@ -222,9 +222,10 @@ board-specific real-hardware support remains later work.
 
 ### Development-loop priority
 
-M0134 is the next implementation priority before further application, utility or driver
-work. It removes whole-system rebuild and cold-boot repetition from ordinary leaf-tool
-development while preserving the existing full release gates.
+M0134 removes whole-system rebuild and cold-boot repetition from ordinary leaf-tool
+development while preserving the existing full release gates. Phases a-e are delivered and the
+loop is in daily use; M0134f holds five defects in the loop's own tooling, which is what keeps
+the milestone open. It no longer blocks application, utility or driver work.
 
 - [ ] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
 
