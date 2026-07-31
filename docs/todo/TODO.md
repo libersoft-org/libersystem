@@ -88,14 +88,14 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0036 - Pointer/mouse plumbing (virtio-input pointer + InputService)](M0036.md)
 - [x] [M0037 - Observability (full System Graph, tracing, counters, CBOR)](M0037.md)
 - [x] [M0038 - Security hardening: app sandbox, permission manifests, PermissionManager](M0038.md)
-- [ ] [M0039 - ResourceManager policy service](M0039.md)
+- [x] [M0039 - ResourceManager policy service](M0039.md)
 - [x] [M0040 - ServiceManager: restart policy and watchdog](M0040.md)
 - [x] [M0041 - Full Component Model + WASI preview 2 + an SDK](M0041.md)
 - [x] [M0043 - A simple persistent native filesystem](M0043.md)
 - [x] [M0044 - virtio-gpu driver + runtime mode-set (the resize source for the local console)](M0044.md)
 - [x] [M0045 - AudioService over virtio-sound (headless playback + capture)](M0045.md)
 - [x] [M0046 - MSI-X interrupt routing (per-device vectors)](M0046.md)
-- [x] [M0047 - Layered console: stream -> grid model -> renderer -> swappable display](M0047.md)
+- [ ] [M0047 - Layered console: stream -> grid model -> renderer -> swappable display](M0047.md)
 - [x] [M0048 - FAT / exFAT filesystem backend (read foreign removable media)](M0048.md)
 - [x] [M0049 - LiberFS: directories and capacity scaling](M0049.md)
 - [x] [M0050 - LiberFS: write semantics, metadata, and integrity](M0050.md)
@@ -227,7 +227,7 @@ development while preserving the existing full release gates. All six phases are
 the loop is in daily use. Two defects it found in older code are open where that code lives,
 in M0126 and M0039.
 
-- [x] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
+- [ ] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
 
 ### Definition of done (phase 2)
 

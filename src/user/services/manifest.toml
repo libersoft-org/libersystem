@@ -826,7 +826,7 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/resource_manager.lsexe"
-providers = ["base-proto", "ipc-client", "process-proto", "resources-proto", "wire", "lsrt"]
+providers = ["base-proto", "ipc-client", "resources-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "resource_probe"

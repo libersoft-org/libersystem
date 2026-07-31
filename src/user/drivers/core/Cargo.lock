@@ -92,6 +92,7 @@ name = "process-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "resources-proto",
  "wire",
 ]
 

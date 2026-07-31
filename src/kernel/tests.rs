@@ -1673,6 +1673,46 @@ fn process_service_list_len(service_client: &alloc::sync::Arc<object::channel::C
 	le_u16(&reply, 5)
 }
 
+// The budgets ProcessService reports for the Domains it is accounting, as (name, memory limit)
+// per budget. Decoded by hand against the generated wire form rather than through a client,
+// because the kernel harness speaks to services over raw channels: a reply is a correlation,
+// a success byte, a u16 count, then per budget a length-prefixed name and a u16-counted list
+// of {type: u8, used: u64, limit: u64}. Only the memory line is returned, which is the one a
+// launch limit is stated in.
+fn process_service_accounting(service_client: &alloc::sync::Arc<object::channel::Channel>, correlation: u32) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, u64)> {
+	use object::channel::Message;
+
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&5u16.to_le_bytes());
+	request.extend_from_slice(&correlation.to_le_bytes());
+	service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("accounting request");
+	sched::run_until_idle();
+	let reply = service_client.recv().expect("accounting reply").bytes;
+	assert_eq!(le_u32(&reply, 0), correlation, "accounting reply echoes the correlation id");
+	assert_eq!(reply[4], 1, "accounting succeeded");
+	let mut out = alloc::vec::Vec::new();
+	let mut at = 7usize;
+	for _ in 0..le_u16(&reply, 5) {
+		let name_len = le_u16(&reply, at) as usize;
+		at += 2;
+		let name = reply[at..at + name_len].to_vec();
+		at += name_len;
+		let lines = le_u16(&reply, at) as usize;
+		at += 2;
+		let mut memory_limit = 0u64;
+		for _ in 0..lines {
+			let kind = reply[at];
+			let limit = le_u64(&reply, at + 9);
+			if kind == 0 {
+				memory_limit = limit;
+			}
+			at += 17;
+		}
+		out.push((name, memory_limit));
+	}
+	out
+}
+
 fn assert_process_start_reply(reply: &[u8], correlation: u32, artifact: &[u8]) {
 	assert_eq!(le_u32(reply, 0), correlation, "start reply echoes the correlation id");
 	assert_eq!(reply[4], 1, "start succeeded");

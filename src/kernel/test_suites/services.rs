@@ -786,6 +786,57 @@ fn process_service_drops_a_terminated_process_from_the_list() {
 	assert_eq!(process_service_list_len(service_client, 23), 0, "a terminated process leaves the list");
 }
 
+tagged_test!(process_service_accounts_a_bounded_launch, [Service, Process, ProcessService, Domain]);
+fn process_service_accounts_a_bounded_launch() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// A per-launch Domain used to be invisible: ProcessService created one, handed it to the
+	// process and forgot it, and ResourceManager can only report the Domains it was given -
+	// so isolation was enforced and nothing could observe it. `accounting` answers with the
+	// live counters of every Domain this service is holding, by value and never by handle.
+	let harness = spawn_service_with_package(b"process_service");
+	let service_client = &harness.1;
+
+	// Nothing launched under a limit yet, so there is nothing to account. Without this the
+	// test could not tell a working report from one that answers with whatever it finds.
+	assert_eq!(process_service_accounting(service_client, 31).len(), 0, "a service that has bounded nothing accounts nothing");
+
+	// An ordinary launch runs in the caller's Domain and has no counters of its own, so it
+	// must not appear either - listing it would report somebody else's numbers under its name.
+	let (_plain_bootstrap, plain_child) = Channel::create();
+	let mut plain = alloc::vec::Vec::new();
+	plain.extend_from_slice(&3u16.to_le_bytes());
+	plain.extend_from_slice(&32u32.to_le_bytes());
+	plain.extend_from_slice(&(b"log_service".len() as u16).to_le_bytes());
+	plain.extend_from_slice(b"log_service");
+	plain.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(service_client, &plain, plain_child, Rights::ALL).expect("plain launch request");
+	sched::run_until_idle();
+	assert_eq!(service_client.recv().expect("plain launch reply").bytes[4], 1, "the plain launch succeeded");
+	assert_eq!(process_service_accounting(service_client, 33).len(), 0, "a launch without a stated limit has no Domain of its own to report");
+
+	// A bounded launch does have one, and it is reported under the program's own name.
+	const LIMIT: u64 = 64 * 1024 * 1024;
+	let (_bounded_bootstrap, bounded_child) = Channel::create();
+	let mut bounded = alloc::vec::Vec::new();
+	bounded.extend_from_slice(&4u16.to_le_bytes());
+	bounded.extend_from_slice(&34u32.to_le_bytes());
+	bounded.extend_from_slice(&(b"device_manager".len() as u16).to_le_bytes());
+	bounded.extend_from_slice(b"device_manager");
+	bounded.extend_from_slice(&LIMIT.to_le_bytes());
+	bounded.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(service_client, &bounded, bounded_child, Rights::ALL).expect("bounded launch request");
+	sched::run_until_idle();
+	assert_eq!(service_client.recv().expect("bounded launch reply").bytes[4], 1, "the bounded launch succeeded");
+
+	let accounted = process_service_accounting(service_client, 35);
+	assert_eq!(accounted.len(), 1, "the bounded launch is accounted, and only it");
+	let (name, memory_limit) = &accounted[0];
+	assert_eq!(name.as_slice(), b"device_manager.lsexe", "the budget is named after the program that was launched");
+	assert_eq!(*memory_limit, LIMIT, "the reported memory limit is the one the launch asked for");
+}
+
 tagged_test!(process_service_resolves_one_final_executable_suffix, [Service, Process]);
 fn process_service_resolves_one_final_executable_suffix() {
 	use object::channel::{Channel, Message};
@@ -1193,7 +1244,7 @@ fn storage_serves_volume_file_to_client() {
 	assert_eq!(actual, expected);
 }
 
-tagged_test!(resource_manager_contains_a_domain, [Service]);
+tagged_test!(resource_manager_contains_a_domain, [Service, Domain]);
 fn resource_manager_contains_a_domain() {
 	// The ResourceManager creates a bounded sub-Domain, launches resource_probe into it, and
 	// caps the Domain's memory at four one-page objects above the probe's baseline. It drives
