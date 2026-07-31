@@ -104,6 +104,36 @@ fn handle_refcount_lifetime() {
 	assert_eq!(Arc::strong_count(&obj), 1);
 }
 
+crate::tagged_test!(a_prepared_thread_does_not_run_until_released, [Object, Kernel, Process]);
+fn a_prepared_thread_does_not_run_until_released() {
+	use super::event::Event;
+	use core::sync::atomic::{AtomicBool, Ordering};
+
+	// The start gate a pipeline transaction needs: every stage of `a | b | c` must exist and
+	// have its endpoints installed before ANY of them runs, or an early stage writes into a
+	// consumer that has not been handed its reader yet.
+	//
+	// The gate was assumed to be missing mechanism - "the current launch starts immediately,
+	// so this gate is a required mechanism" - and it is not: `SYS_THREAD_CREATE` and
+	// `SYS_THREAD_START` have always been separate capability-gated steps, and every launch
+	// path simply called them back to back. This asserts the property that claim rests on.
+	static RAN: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_handle: u64) {
+		RAN.store(true, Ordering::SeqCst);
+	}
+
+	let thread = crate::sched::prepare_with_object(body, Event::create(), Rights::ALL, 0);
+
+	// The scheduler is given every chance to run it. Without this the test would pass over an
+	// implementation that merely deferred the start by a tick.
+	crate::sched::run_until_idle();
+	assert!(!RAN.load(Ordering::SeqCst), "a prepared thread does not run before it is released");
+
+	crate::sched::start_thread(&thread);
+	crate::sched::run_until_idle();
+	assert!(RAN.load(Ordering::SeqCst), "releasing the thread runs it");
+}
+
 crate::tagged_test!(a_process_group_reaches_every_member, [Object, Kernel, Process]);
 fn a_process_group_reaches_every_member() {
 	use super::address_space::AddressSpace;

@@ -1553,13 +1553,39 @@ pub unsafe fn process_load_main(process: u64, elf: &[u8]) -> i64 {
 
 pub unsafe fn process_start(process: u64, entry: u64, bootstrap: u64) -> i64 {
 	unsafe {
-		let thread = syscall(SYS_THREAD_CREATE, process, entry, USER_STACK_TOP, bootstrap);
-		if sys_is_err(thread) {
-			return thread as i64;
+		let thread = process_prepare(process, entry, bootstrap);
+		if thread < 0 {
+			return thread;
 		}
+		let started = process_release(thread as u64);
+		if started < 0 { started } else { process as i64 }
+	}
+}
+
+// Create the process's first thread WITHOUT starting it, returning the handle that starts it.
+// This is the start gate a pipeline needs: every stage of `a | b | c` must exist and have its
+// endpoints installed before ANY of them runs, or an early stage writes into a consumer that
+// has not been handed its reader yet.
+//
+// The gate is not new mechanism, which is worth stating because it was assumed to be: the
+// kernel has always had `SYS_THREAD_CREATE` and `SYS_THREAD_START` as separate capability-gated
+// steps, and `process_start` merely calls them back to back. What was missing was a way to hold
+// the two apart, which is this pair.
+//
+// The returned handle is the authority to start that one stage and nothing else. Dropping it
+// leaves a process that never runs, which is exactly what a failed transaction wants: no stage
+// observes a half-built graph because no stage has run.
+pub unsafe fn process_prepare(process: u64, entry: u64, bootstrap: u64) -> i64 {
+	unsafe { syscall(SYS_THREAD_CREATE, process, entry, USER_STACK_TOP, bootstrap) as i64 }
+}
+
+// Start a thread prepared by `process_prepare`, consuming the handle. Releasing every prepared
+// stage in turn is what makes the graph go live at once rather than piecemeal.
+pub unsafe fn process_release(thread: u64) -> i64 {
+	unsafe {
 		let started = syscall(SYS_THREAD_START, thread, 0, 0, 0);
 		close(thread);
-		if sys_is_err(started) { started as i64 } else { process as i64 }
+		if sys_is_err(started) { started as i64 } else { 0 }
 	}
 }
 

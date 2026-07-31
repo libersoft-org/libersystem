@@ -195,11 +195,24 @@ pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> 
 // Create a kernel thread on the current core, pre-seeded with a handle to
 // `object` (delivered to the thread as its bootstrap-handle argument).
 pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
+	let thread = prepare_with_object(entry, object, rights, badge);
+	start_thread(&thread);
+	thread
+}
+
+// Build a thread WITHOUT queueing it to run - the kernel-side twin of the userspace start gate
+// (`process_prepare` / `process_release`), where a pipeline's stages must all exist before any
+// of them runs. Split out of `spawn_with_object` rather than added beside it, so the two cannot
+// drift in how a thread is constructed.
+pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain());
 	let arg = process.install(object, rights, badge);
-	let thread = Thread::new(entry, arg, process);
+	Thread::new(entry, arg, process)
+}
+
+// Release a prepared thread onto the run queue.
+pub fn start_thread(thread: &Arc<Thread>) {
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
-	thread
 }
 
 // Create a kernel thread accounted to `domain` on the current core, enforcing the
