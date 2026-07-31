@@ -87,7 +87,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0035 - Interactive console: line editor, history, and cursor](M0035.md)
 - [x] [M0036 - Pointer/mouse plumbing (virtio-input pointer + InputService)](M0036.md)
 - [x] [M0037 - Observability (full System Graph, tracing, counters, CBOR)](M0037.md)
-- [x] [M0038 - Security hardening: app sandbox, permission manifests, PermissionManager](M0038.md)
+- [ ] [M0038 - Security hardening: app sandbox, permission manifests, PermissionManager](M0038.md)
 - [x] [M0039 - ResourceManager policy service](M0039.md)
 - [x] [M0040 - ServiceManager: restart policy and watchdog](M0040.md)
 - [x] [M0041 - Full Component Model + WASI preview 2 + an SDK](M0041.md)

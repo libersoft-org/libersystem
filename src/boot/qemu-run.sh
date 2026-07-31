@@ -550,6 +550,12 @@ qemu_run_x86_64() {
 		fi
 		set -e
 		timing_event qemu end
+		# 33 is the debug-exit device reporting a passing suite (the guest wrote 0x10 to
+		# port 0xf4, and QEMU reports (0x10<<1)|1); 35 is the same device reporting failure.
+		# Anything else is QEMU ending for a reason the guest never asked for. Mapping 33 to 0
+		# here without saying which of the two happened is what made a broken run read as a
+		# clean one: the caller sees 0 for a passing suite AND for a QEMU that quit on its own.
+		echo "qemu-run: test guest ended with QEMU code $code (33 = suite passed, 35 = suite failed)" >&2
 		[[ "$code" -eq 33 ]] && exit 0
 		exit "$code"
 	fi
