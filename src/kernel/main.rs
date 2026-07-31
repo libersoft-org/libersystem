@@ -349,6 +349,22 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
 	kernel_ep.send(Message::new(rdmsg, alloc::vec![rdcap], 0)).map_err(|_| "failed to hand SystemManager the ramdisk")?;
 
+	// Hand SystemManager the power capability: a handle to the root Domain carrying MANAGE,
+	// which is what `SYS_SYSTEM_POWER` checks. Stopping the machine used to need no capability
+	// at all, so every process in the system had it; it now travels the boot chain like any
+	// other authority, from here to ServiceManager and on to the two components that must be
+	// able to stop the machine - the supervisor's graceful shutdown, and the keyboard driver's
+	// Power key, which exists precisely to work when the supervisor does not.
+	//
+	// DUPLICATE is included because it is delegated onward more than once; TRANSFER because
+	// the first hop hands it over rather than sharing it.
+	//
+	// Sent AFTER the ramdisk because that is the order SystemManager reads its handoffs in,
+	// and a bootstrap read consumes whatever arrived: out of order, its RAMDISK read takes
+	// this message instead and the whole boot chain stops before the first service starts.
+	let power_cap = Capability::new(sched::root_domain() as Arc<dyn KernelObject>, Rights::MANAGE | Rights::TRANSFER | Rights::DUPLICATE, 0);
+	kernel_ep.send(Message::new(b"POWER".to_vec(), alloc::vec![power_cap], 0)).map_err(|_| "failed to hand SystemManager the power capability")?;
+
 	// Tell the boot chain which kind of boot this is: "MODE" + one byte, 1 in a test
 	// build and 0 in a production one. ServiceManager runs its bring-up self-tests
 	// (the stop-path exercise and the canary crash / hang drills) only in a test boot,

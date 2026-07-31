@@ -112,6 +112,20 @@ pub const KEY_PAUSE: u16 = 119;
 pub const KEY_102ND: u16 = 86;
 const KEY_BACKSLASH: u16 = 43;
 
+// The power capability - a root-Domain handle carrying MANAGE - which `SYS_SYSTEM_POWER`
+// requires. Held as a static rather than threaded through `feed_key` and its two callers
+// because it is set once at driver bootstrap and read from an interrupt path, which is the
+// same shape (and the same idiom) as the pointer sink in the xHCI driver.
+//
+// Zero until a driver is given one. A keyboard on a boot that handed out no power capability
+// then finds the Power key inert rather than halting the machine on a right it does not have.
+static POWER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Record the power capability this driver was handed at bootstrap.
+pub fn set_power(handle: u64) {
+	POWER.store(handle, core::sync::atomic::Ordering::Relaxed);
+}
+
 // The system power keys: Power shuts the machine down (wired like the
 // Ctrl+Alt+Delete chord); Sleep / Wake are reserved until suspend exists.
 pub const KEY_POWER: u16 = 116;
@@ -303,7 +317,7 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// held reboots the machine. The keyboard is interrupt-driven, so it fires and
 		// interrupts whatever userspace is doing, even if the shell is wedged.
 		if code == KEY_DELETE && value == 1 && mods.ctrl && mods.alt {
-			system_power(POWER_REBOOT);
+			system_power(POWER.load(core::sync::atomic::Ordering::Relaxed), POWER_REBOOT);
 		}
 		// The Power key shuts the machine down (interrupt-driven like the reboot chord,
 		// so it works even when userspace is wedged).
@@ -316,7 +330,7 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// while there is still a console to name it on.
 		if code == KEY_POWER {
 			unsafe { debug_write(b"driver.keys: KEY_POWER - powering off\n") };
-			system_power(POWER_OFF);
+			system_power(POWER.load(core::sync::atomic::Ordering::Relaxed), POWER_OFF);
 			return;
 		}
 		// The recognized keys whose subsystem does not exist yet: consumed, no bytes.

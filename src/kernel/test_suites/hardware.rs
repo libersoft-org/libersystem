@@ -191,12 +191,18 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
 	send_cap(&kernel_ep, &msg, DeviceMemory::new(bar_phys, bar_len as usize), Rights::ALL).expect("the DEVICE handoff should send");
 	send_cap(&kernel_ep, b"IRQ", interrupt, Rights::ALL).expect("the IRQ handoff should send");
-	// The raw keyboard sink is the third and last handoff, and it is not optional
-	// here: the driver tolerates an absent sink (it stores handle 0 and carries on)
-	// but blocks for the message itself, so omitting it deadlocks bring-up before
-	// the first port is probed.
+	// The raw keyboard sink is the third handoff, and it is not optional here: the
+	// driver tolerates an absent sink (it stores handle 0 and carries on) but blocks
+	// for the message itself, so omitting it deadlocks bring-up before the first port
+	// is probed.
 	let (_key_drain, key_sink) = object::channel::Channel::create();
 	send_cap(&kernel_ep, b"KEYS", key_sink, Rights::ALL).expect("the KEYS handoff should send");
+	// The power capability is the fourth, for the same reason: the driver tolerates
+	// handle 0 (the Power key goes inert) but waits for the message. This harness has no
+	// business stopping the machine, so it sends a message carrying nothing rather than a
+	// real root-Domain handle - the shape of the handoff is what bring-up needs, not the
+	// authority behind it.
+	kernel_ep.send(object::channel::Message::new(b"POWER".to_vec(), alloc::vec::Vec::new(), 0)).expect("the POWER handoff should send");
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the xhci driver should report in");

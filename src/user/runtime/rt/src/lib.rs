@@ -1405,8 +1405,12 @@ pub unsafe fn device_msix_acquire(index: u64) -> i64 {
 
 // Reboot or power off the machine: `action` is POWER_REBOOT or POWER_OFF. On success
 // the machine resets / powers off and this never returns; a negative error otherwise.
-pub unsafe fn system_power(action: u64) -> i64 {
-	unsafe { syscall(SYS_SYSTEM_POWER, action, 0, 0, 0) as i64 }
+// Reboot or power the machine off. `power` must be a handle to the ROOT Domain carrying
+// RIGHT_MANAGE - the capability the kernel checks, held by the components that are allowed to
+// stop the machine and by nobody else. Diverges on success; returns ERR_ACCESS_DENIED without
+// the capability, so a caller that was handed none fails instead of halting the system.
+pub unsafe fn system_power(power: u64, action: u64) -> i64 {
+	unsafe { syscall(SYS_SYSTEM_POWER, power, action, 0, 0) as i64 }
 }
 
 // Acknowledge a serviced device interrupt, re-arming its source so the next `wait`

@@ -43,6 +43,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1b2. receive the power capability - a root-Domain handle carrying MANAGE, which is what
+	//     `SYS_SYSTEM_POWER` now checks. This process never stops the machine itself; it holds
+	//     the capability only to pass it to ServiceManager, which is where the graceful
+	//     shutdown lives and which delegates it onward to the keyboard driver.
+	let power: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle, .. } if len == 5 && &buf[..5] == b"POWER" && handle != 0 => handle,
+		_ => exit(),
+	};
+
 	// 1c. receive the boot mode flag ("MODE" + one byte, 1 = test boot) to relay down
 	//     to ServiceManager, which gates its bring-up self-tests on it.
 	let mode: u8 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
@@ -79,6 +88,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		rd_msg[..7].copy_from_slice(b"RAMDISK");
 		rd_msg[7..].copy_from_slice(&(ramdisk_len as u64).to_le_bytes());
 		send_blocking(sm_side, &rd_msg, ramdisk_handle);
+		send_blocking(sm_side, b"POWER", power);
 		let mode_msg: [u8; 5] = [b'M', b'O', b'D', b'E', mode];
 		send_blocking(sm_side, &mode_msg, 0);
 	}

@@ -78,6 +78,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, handle } if len >= 4 && &key_buf[..4] == b"KEYS" => handle,
 			_ => 0,
 		};
+		// The power capability, arriving beside KEYS because the same two drivers own the
+		// Power key. `SYS_SYSTEM_POWER` requires it; a driver handed none finds the key
+		// inert rather than halting the machine on a right it does not hold.
+		let power: u64 = match recv_blocking(bootstrap, &mut key_buf) {
+			Received::Message { len, handle } if len >= 5 && &key_buf[..5] == b"POWER" => handle,
+			_ => 0,
+		};
+		keys::set_power(power);
 		// route this device's interrupts to MSI-X table entry 0: DeviceManager acquired
 		// an MSI-X Interrupt (device_msix_acquire), so the kernel has already programmed
 		// the table and enabled MSI-X - we just point the device's config and queue

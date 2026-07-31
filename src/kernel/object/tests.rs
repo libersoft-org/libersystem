@@ -104,6 +104,39 @@ fn handle_refcount_lifetime() {
 	assert_eq!(Arc::strong_count(&obj), 1);
 }
 
+crate::tagged_test!(system_power_refuses_a_caller_without_the_root_domain, [Object, Kernel, Syscall, Domain]);
+fn system_power_refuses_a_caller_without_the_root_domain() {
+	use super::domain::{Domain, UNLIMITED};
+	use core::sync::atomic::{AtomicI64, Ordering};
+
+	// Stopping the machine used to need no capability at all: `SYS_SYSTEM_POWER` took an
+	// action word and nothing else, so every ring-3 process in the system could halt it. It
+	// now requires MANAGE on the ROOT Domain, and this asserts the refusals - which is the
+	// only way to assert it, since the success path does not return and would take the suite
+	// with it.
+	//
+	// Both wrong keys are tried, because they fail for different reasons and only one of them
+	// is obvious. A caller with no handle at all is refused by the handle lookup; a caller
+	// holding a perfectly good Domain that is NOT the root is refused by the identity check,
+	// and that is the case that matters - killing an app Domain is not the same authority as
+	// stopping the machine, so "some Domain" must not be enough.
+	static NO_HANDLE: AtomicI64 = AtomicI64::new(0);
+	static WRONG_DOMAIN: AtomicI64 = AtomicI64::new(0);
+
+	extern "C" fn body(child_domain: u64) {
+		unsafe {
+			NO_HANDLE.store(crate::arch::syscall::invoke(crate::syscall::SYS_SYSTEM_POWER, 0, abi::POWER_OFF, 0, 0) as i64, Ordering::SeqCst);
+			WRONG_DOMAIN.store(crate::arch::syscall::invoke(crate::syscall::SYS_SYSTEM_POWER, child_domain, abi::POWER_OFF, 0, 0) as i64, Ordering::SeqCst);
+		}
+	}
+
+	let child = Domain::new_child(&crate::sched::root_domain(), UNLIMITED, UNLIMITED, UNLIMITED);
+	crate::sched::spawn_with_object(body, child, Rights::ALL, 0);
+	crate::sched::run_until_idle();
+	assert!(NO_HANDLE.load(Ordering::SeqCst) < 0, "a caller holding no capability is refused");
+	assert_eq!(WRONG_DOMAIN.load(Ordering::SeqCst), crate::syscall::ERR_ACCESS_DENIED, "a caller holding a non-root Domain is refused by identity, not merely by type");
+}
+
 crate::tagged_test!(object_property_set_names_an_object, [Object, Kernel, Syscall]);
 fn object_property_set_names_an_object() {
 	use super::event::Event;

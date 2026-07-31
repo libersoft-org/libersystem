@@ -85,7 +85,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, power: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -114,7 +114,10 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"log_service" && !bootstrap_serve(manager_side, log_client) {
 			return State::Failed;
 		}
-		if name == b"device_manager" && !bootstrap_package(manager_side, pkg_handle, pkg_len, buf) {
+		// DeviceManager also carries the power capability, because it is what starts the
+		// keyboard drivers and the Power key must keep working when this supervisor does not -
+		// that is the whole reason the key exists as a separate path from `!poweroff`.
+		if name == b"device_manager" && !(bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_power(manager_side, power)) {
 			return State::Failed;
 		}
 		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, storage_client, storage_admin) {
@@ -1173,6 +1176,18 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 // Mint an independent factory connection to a serve_multi service and transfer it to
 // ConsoleService under `tag`. The factory is a fresh client connection, so the
 // session spawner can mint per-VT clients from it without racing other holders.
+// Delegate the power capability - a root-Domain handle carrying MANAGE - to a service that
+// must be able to stop the machine. A duplicate, not the handle itself: this supervisor keeps
+// its own for the graceful `!poweroff` path, and the only other holder is the keyboard driver
+// DeviceManager starts. RIGHT_MANAGE is what `SYS_SYSTEM_POWER` checks; TRANSFER lets
+// DeviceManager pass it on to the driver, DUPLICATE lets it serve more than one keyboard.
+pub(super) unsafe fn send_power(manager_side: u64, power: u64) -> bool {
+	unsafe {
+		let copy: i64 = duplicate(power, RIGHT_MANAGE | RIGHT_TRANSFER | RIGHT_DUPLICATE);
+		copy > 0 && send_blocking(manager_side, b"POWER", copy as u64)
+	}
+}
+
 pub(super) unsafe fn send_factory(manager_side: u64, tag: &[u8], root: u64) -> bool {
 	unsafe {
 		match service_connect(root) {

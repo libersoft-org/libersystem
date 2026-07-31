@@ -851,24 +851,35 @@ unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, 
 // reboots) from there. The banner is printed before the request goes out, because the
 // teardown stops ConsoleService and the shell's output stops rendering. This blocks on
 // the admin channel while the supervisor works; it only returns if there is no admin
-// channel or the request could not be sent (a secondary VT / a minimal boot), and the
-// caller then falls back to the direct power syscall - an immediate, ungraceful stop.
+// channel or the request could not be sent (a secondary VT / a minimal boot), and the shell
+// then reports that it cannot stop the machine rather than stopping it itself.
+//
+// It used to fall through to the power syscall directly, which worked because that syscall
+// needed no capability at all. It needs one now - MANAGE on the root Domain - and the shell
+// deliberately does not hold it. Of the components that could stop the machine the shell is
+// the least trusted: it is the user's command line, it runs whatever is typed at it, and the
+// supervisor it asks is a live process that either answers or is itself the problem. A
+// backstop that bypasses the supervisor is a second, unsupervised way to halt the system, and
+// removing it leaves exactly two holders - the supervisor's graceful path, and the keyboard
+// driver's Power key, which exists to work when the supervisor does not.
 unsafe fn graceful_power(admin: u64, action: u64) {
 	unsafe {
-		if admin != 0 {
-			print(if action == POWER_REBOOT { b"rebooting...\n" } else { b"powering off...\n" });
-			let req: &[u8] = if action == POWER_REBOOT { b"!reboot" } else { b"!poweroff" };
-			if send_blocking(admin, req, 0) {
-				// The supervisor powers the machine off after the teardown, so this recv
-				// normally never returns (the machine is gone). If it does return - the
-				// channel closed because the supervisor is unexpectedly absent - fall
-				// through to the direct syscall below as a backstop.
-				let mut rbuf: [u8; 64] = [0u8; 64];
-				let _ = recv_blocking(admin, &mut rbuf);
-			}
+		if admin == 0 {
+			print(b"power: no supervisor connection; cannot stop the machine from here\n");
+			return;
 		}
-		debug_write(b"shell: power request - shutting down\n");
-		system_power(action);
+		print(if action == POWER_REBOOT { b"rebooting...\n" } else { b"powering off...\n" });
+		let req: &[u8] = if action == POWER_REBOOT { b"!reboot" } else { b"!poweroff" };
+		if !send_blocking(admin, req, 0) {
+			print(b"power: the supervisor did not accept the request\n");
+			return;
+		}
+		// The supervisor powers the machine off after the teardown, so this recv normally
+		// never returns - the machine is gone. If it does return, the supervisor closed the
+		// channel without acting, and saying so is the whole of what this can do now.
+		let mut rbuf: [u8; 64] = [0u8; 64];
+		let _ = recv_blocking(admin, &mut rbuf);
+		print(b"power: the supervisor closed the request without stopping the machine\n");
 	}
 }
 

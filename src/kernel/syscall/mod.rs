@@ -336,7 +336,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0),
 		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0),
 		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
-		SYS_SYSTEM_POWER => sys_system_power(a0),
+		SYS_SYSTEM_POWER => sys_system_power(a0, a1),
 		SYS_CONSOLE_FEED => sys_console_feed(a0, a1),
 		SYS_FRAMEBUFFER_MAP => sys_framebuffer_map(a0, a1),
 		SYS_CONSOLE_READLOG => sys_console_readlog(a0, a1),
@@ -835,10 +835,29 @@ fn sys_interrupt_ack(handle: u64) -> i64 {
 	0
 }
 
-// Reboot or power the machine off (action = POWER_REBOOT | POWER_OFF). Diverges on a
-// valid action; ERR_INVALID otherwise. Restricting this to an authorized component is
-// a PermissionManager concern, deferred.
-fn sys_system_power(action: u64) -> i64 {
+// Reboot or power the machine off (action = POWER_REBOOT | POWER_OFF), for a caller holding
+// MANAGE on the ROOT Domain. Diverges on a valid action; ERR_ACCESS_DENIED without the
+// capability, ERR_INVALID on an unknown action.
+//
+// This was ungated - any ring-3 process could halt the machine with one syscall, a sandboxed
+// component launched through PermissionManager included, in a kernel where reading one
+// Domain's counters needs a handle carrying READ. The comment here used to say that
+// restricting it was "a PermissionManager concern, deferred", which is a decision that
+// stopped being one the moment it lived only in a comment.
+//
+// The root Domain is the right key and not an arbitrary one: whoever holds MANAGE on it can
+// already `sys_domain_kill` the whole system, so being able to power it off as well is no new
+// authority. Any other Domain would be an escalation - killing the apps Domain is not the
+// same as stopping the machine - which is why the handle is compared against the root rather
+// than merely required to be some Domain.
+fn sys_system_power(handle: u64, action: u64) -> i64 {
+	let domain = match current_typed::<Domain>(handle, ObjectType::Domain, Rights::MANAGE) {
+		Ok(d) => d,
+		Err(e) => return e,
+	};
+	if !Arc::ptr_eq(&domain, &sched::root_domain()) {
+		return ERR_ACCESS_DENIED;
+	}
 	match action {
 		abi::POWER_REBOOT => arch::reset(),
 		abi::POWER_OFF => arch::poweroff(),

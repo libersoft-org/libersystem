@@ -204,6 +204,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1b2. receive the power capability - a root-Domain handle carrying MANAGE, relayed down
+	//     from the kernel. `SYS_SYSTEM_POWER` checks it, so this is what makes the graceful
+	//     `!poweroff` / `!reboot` path work; a duplicate goes to DeviceManager for the
+	//     keyboard driver's Power key, which must keep working when this supervisor does not.
+	let power: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if len == 5 && &buf[..5] == b"POWER" && handle != 0 => handle,
+		_ => exit(),
+	};
+
 	// 1c. receive the boot mode flag ("MODE" + one byte, relayed down the chain from
 	//     the kernel). The bring-up self-tests - the stop-path exercise and the canary
 	//     crash / hang drills - run only in a test boot (1); a production boot (0)
@@ -327,7 +336,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -584,7 +593,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
 	unsafe {
-		supervise(&mut state, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, park, &mut buf);
+		supervise(power, &mut state, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, park, &mut buf);
 	}
 	exit();
 }
@@ -1047,7 +1056,7 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // dropped from the wait set. The canary is restarted per policy; an admin message
 // drives a reverse-dependency stop; a stats request is answered over the `supervisor`
 // interface. Returns when nothing is left to watch.
-unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, buf: &mut [u8]) {
+unsafe fn supervise(power: u64, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
@@ -1170,7 +1179,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 				}
 				2 => {
 					// The shell asked to stop a service; tear down its dependents first.
-					if !handle_admin(admin, broker, state, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin, power, broker, state, channels, sup, procs, &mut stats, log_client, buf) {
 						admin = 0;
 					}
 				}
@@ -1183,7 +1192,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 				4 => {
 					// The sandboxed `stop` tool (granted the supervisor capability) asked to
 					// stop a service over its own admin channel; tear down its dependents first.
-					if !handle_admin(admin2, broker, state, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin2, power, broker, state, channels, sup, procs, &mut stats, log_client, buf) {
 						admin2 = 0;
 					}
 				}
@@ -1204,7 +1213,7 @@ unsafe fn supervise(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [
 // its dependents are torn down and the newline-joined list of what stopped is replied
 // for the shell to print. Returns false once the admin channel's peer (the shell) is
 // gone, so the supervisor drops it from its wait set.
-unsafe fn handle_admin(admin: u64, broker: &mut Broker, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
+unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		let len: usize = match recv_blocking(admin, buf) {
 			Received::Message { len, .. } => len,
@@ -1231,7 +1240,7 @@ unsafe fn handle_admin(admin: u64, broker: &mut Broker, state: &mut [State; N], 
 			// above already knew this ("system_power would stop QEMU mid-suite"); the knowledge
 			// just never reached the log.
 			debug_write(b"service_manager: power verb - shutting down\n");
-			system_power(action);
+			system_power(power, action);
 			return true;
 		}
 		// `+name` starts a service that was stopped, the inverse of the bare name below. The
