@@ -3,6 +3,7 @@
 package liber:process@1;
 
 use liber:base@1.{error, koid};
+use liber:resources@1.{budget};
 
 /// One process the ProcessService has started: the kernel object id of the new
 /// process and the init-package entry name it was launched from.
@@ -36,9 +37,18 @@ record start-result {
 /// process it accounts ends. The policy front end chooses the limit, while
 /// ProcessService remains responsible only for loading. The service holds no grantable
 /// clients and decides no capability grants.
+///
+/// `accounting` reports the live budget of every Domain this service currently accounts -
+/// one per running launch. It exists because a per-launch Domain is invisible to
+/// ResourceManager, which can only report the Domains it was handed, so isolation was
+/// enforced and unobservable. Reporting rather than delegating is the point: a Domain
+/// handle sent to an observer would outlive the process it accounts until the observer
+/// learned that it ended, which is the lifetime problem a Domain-per-launch removed. This
+/// answers with values, transfers no handle, and grants nothing.
 interface process {
 	@op(1) start:  func(name: string) -> result<process-info, error>;
 	@op(2) list:   func() -> result<list<process-info>, error>;
 	@op(3) launch: func(name: string, bootstrap: handle<channel>) -> result<start-result, error>;
 	@op(4) launch-bounded: func(name: string, memory-limit: u64, bootstrap: handle<channel>) -> result<start-result, error>;
+	@op(5) accounting: func() -> result<list<budget>, error>;
 }

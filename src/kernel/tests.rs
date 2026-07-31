@@ -790,10 +790,20 @@ fn run_resource_scenario() -> Result<alloc::vec::Vec<u8>, &'static str> {
 	let domain = sched::root_domain();
 	let _resource_manager = spawn_dynamic_test_process(domain, rm_elf, rm_boot_user);
 
-	// ResourceManager: the init package (to launch the probe from) and the channel its
-	// clients reach it on. The order matches ResourceManager's receive order: PACKAGE, SERVE.
+	// ResourceManager: the init package (to launch the probe from), the channel its clients
+	// reach it on, and a ProcessService client. The order matches ResourceManager's receive
+	// order: PACKAGE, SERVE, PROCESS.
+	//
+	// The process client's peer is dropped, the idiom this harness already uses for the
+	// capabilities no scenario here answers on: a bootstrap reads its handoffs in order and
+	// each read consumes whatever arrived, so a skipped one is not skipped - it swallows the
+	// next message and blocks forever. That is how adding a capability to a service breaks
+	// every caller that starts it, this harness included.
+	let (process_peer, process_client) = Channel::create();
+	core::mem::drop(process_peer);
 	send_package(&rm_boot_kernel, init)?;
 	send_cap(&rm_boot_kernel, b"SERVE", resource_server, Rights::ALL)?;
+	send_cap(&rm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
 
 	sched::run_until_idle();
 
@@ -2238,14 +2248,23 @@ impl StorageHarness {
 }
 
 fn fat16_image(files: &[([u8; 11], &[u8])], fill_free: bool) -> alloc::vec::Vec<u8> {
+	fat16_image_with_clusters(files, fill_free, 5_000)
+}
+
+// The same image with a chosen data capacity. The default 5,000 sectors is 2.5 MB, which is
+// ample for the small fixtures every other case writes and far too small for a 4K PNG: a
+// conversion that runs to completion and then cannot store its result reports `cannot write
+// output`, which reads exactly like a memory failure while being a property of the test's
+// media instead. Sizing the medium is part of measuring the conversion.
+fn fat16_image_with_clusters(files: &[([u8; 11], &[u8])], fill_free: bool, clusters: usize) -> alloc::vec::Vec<u8> {
 	const SECTOR: usize = 512;
-	const CLUSTERS: usize = 5_000;
+	let cluster_count: usize = clusters;
 	const RESERVED: usize = 1;
 	const ROOT_ENTRIES: usize = 512;
-	let fat_sectors = ((CLUSTERS + 2) * 2).div_ceil(SECTOR);
+	let fat_sectors = ((cluster_count + 2) * 2).div_ceil(SECTOR);
 	let root_sectors = (ROOT_ENTRIES * 32).div_ceil(SECTOR);
 	let first_data = RESERVED + fat_sectors + root_sectors;
-	let total = first_data + CLUSTERS;
+	let total = first_data + cluster_count;
 	let mut image = alloc::vec![0u8; total * SECTOR];
 	let fat_offset = RESERVED * SECTOR;
 	image[fat_offset..fat_offset + 2].copy_from_slice(&0xfff8u16.to_le_bytes());
@@ -2265,7 +2284,7 @@ fn fat16_image(files: &[([u8; 11], &[u8])], fill_free: bool) -> alloc::vec::Vec<
 		image[entry + 28..entry + 32].copy_from_slice(&(data.len() as u32).to_le_bytes());
 	}
 	if fill_free {
-		for cluster in files.len() + 2..CLUSTERS + 2 {
+		for cluster in files.len() + 2..cluster_count + 2 {
 			let fat = fat_offset + cluster * 2;
 			image[fat..fat + 2].copy_from_slice(&0xffffu16.to_le_bytes());
 		}

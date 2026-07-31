@@ -10,6 +10,7 @@ use core::fmt::Write as _;
 
 use crate::generated::liber::base::v1::Error;
 use crate::generated::liber::base::v1::Koid;
+use crate::generated::liber::resources::v1::Budget;
 
 /// One process the ProcessService has started: the kernel object id of the new
 /// process and the init-package entry name it was launched from.
@@ -95,6 +96,14 @@ impl StartResult {
 /// process it accounts ends. The policy front end chooses the limit, while
 /// ProcessService remains responsible only for loading. The service holds no grantable
 /// clients and decides no capability grants.
+///
+/// `accounting` reports the live budget of every Domain this service currently accounts -
+/// one per running launch. It exists because a per-launch Domain is invisible to
+/// ResourceManager, which can only report the Domains it was handed, so isolation was
+/// enforced and unobservable. Reporting rather than delegating is the point: a Domain
+/// handle sent to an observer would outlive the process it accounts until the observer
+/// learned that it ended, which is the lifetime problem a Domain-per-launch removed. This
+/// answers with values, transfers no handle, and grants nothing.
 // interface `process` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod process {
 	use super::*;
@@ -105,12 +114,14 @@ pub mod process {
 	pub const OP_LIST: u16 = 2;
 	pub const OP_LAUNCH: u16 = 3;
 	pub const OP_LAUNCH_BOUNDED: u16 = 4;
+	pub const OP_ACCOUNTING: u16 = 5;
 
 	pub trait Service {
 		fn start(&mut self, name: String) -> Result<ProcessInfo, Error>;
 		fn list(&mut self) -> Result<Vec<ProcessInfo>, Error>;
 		fn launch(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error>;
 		fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error>;
+		fn accounting(&mut self) -> Result<Vec<Budget>, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
@@ -278,6 +289,47 @@ pub mod process {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_ACCOUNTING => {
+				if r.has_handle() {
+					return None;
+				}
+				*request_handle = 0;
+				let result = service.accounting();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v9) => {
+							w.u8(1)?;
+							if v9.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v9.len() as u16)?;
+							for v11 in v9.iter() {
+								v11.write(w)?;
+							}
+						}
+						Err(v10) => {
+							w.u8(0)?;
+							v10.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						*reply_handle = writer.handle();
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		*reply_handle = writer.handle();
@@ -344,12 +396,12 @@ pub mod process {
 				}
 				Some(if r.u8()? != 0 {
 					Ok({
-						let v9 = r.u16()? as usize;
-						let mut v10 = Vec::new();
-						for _ in 0..v9 {
-							v10.push(ProcessInfo::read(r)?);
+						let v12 = r.u16()? as usize;
+						let mut v13 = Vec::new();
+						for _ in 0..v12 {
+							v13.push(ProcessInfo::read(r)?);
 						}
-						v10
+						v13
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -420,6 +472,42 @@ pub mod process {
 			}
 			decoded
 		}
+		pub fn accounting(&mut self) -> Option<Result<Vec<Budget>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_ACCOUNTING)?;
+			w.u32(corr)?;
+			let request_handle = writer.handle();
+			let request = writer.into_inner();
+			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				Some(if r.u8()? != 0 {
+					Ok({
+						let v14 = r.u16()? as usize;
+						let mut v15 = Vec::new();
+						for _ in 0..v14 {
+							v15.push(Budget::read(r)?);
+						}
+						v15
+					})
+				} else {
+					Err(Error::read(r)?)
+				})
+			})();
+			if decoded.is_none() || reader.has_handle() {
+				if reply_handle != 0 {
+					self.transport.discard_handle(reply_handle);
+				}
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -452,6 +540,14 @@ pub mod process {
 	fn channel_invoke_launch_bounded(chan: u64, name: &str, memory_limit: &u64, bootstrap: &u64) -> Option<Result<StartResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.launch_bounded(name, memory_limit, bootstrap)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_accounting")]
+	fn channel_invoke_accounting(chan: u64) -> Option<Result<Vec<Budget>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.accounting()
 	}
 }
 

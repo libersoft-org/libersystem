@@ -826,7 +826,7 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/resource_manager.lsexe"
-providers = ["resources-proto", "wire", "lsrt"]
+providers = ["base-proto", "ipc-client", "process-proto", "resources-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "resource_probe"
@@ -1688,7 +1688,7 @@ name = "process-proto"
 owner = "process-proto"
 destination = "lib/protocol/process-proto.lslib"
 features = ["shared-image"]
-providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+providers = ["base-proto", "ipc-client", "resources-proto", "wire", "lsrt"]
 
 [[libraries]]
 name = "qoi"

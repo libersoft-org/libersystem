@@ -121,7 +121,11 @@ tagged_test!(imgconv_governed_working_set_is_measured, [Image, Memory, Process, 
 fn imgconv_governed_working_set_is_measured() {
 	use object::domain::{Domain, UNLIMITED};
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
-	const IMGCONV_MEMORY_LIMIT: u64 = 96 * 1024 * 1024;
+	// Mirrors `IMGCONV_MEMORY_LIMIT` in `permission_manager.rs`, which is where the production
+	// value and the reasoning behind it live. A kernel test cannot read a userspace service's
+	// constant, so this is a copy - and a copy that drifts asserts against a quota nobody
+	// enforces, which is why the two carry each other's name.
+	const IMGCONV_MEMORY_LIMIT: u64 = 128 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
 	let imgconv_elf = program_elf(&package, volume, b"imgconv").expect("imgconv tool");
@@ -169,7 +173,32 @@ fn imgconv_governed_working_set_is_measured() {
 	assert_eq!(failure, Some(b"imgconv: out of memory\n".to_vec()), "quota failure reports a typed diagnostic");
 	assert_eq!(media.open(b"vol://media/KEEP.PNG", 0xfa17), Some(previous.to_vec()), "quota failure preserves the previous destination byte-for-byte");
 	assert!(limited_peak <= 80 * 1024 * 1024, "quota failure never exceeds its Domain limit");
-	serial_println!("imgconv governed memory: 1920x1080={} bytes, 3840x2160={} bytes, animation={} bytes", full_hd_peak, ultra_hd_peak, animation_peak);
+
+	// The shipped corpus, which is what the production quota actually has to hold and what the
+	// original measurement left out. Every case above upscales from a 2x2 BMP or a 23x15 WebP,
+	// so the decoded INPUT costs nothing and the peak is essentially one output buffer. The
+	// system volume ships one image - `wallpapers/logo.webp`, a 3840x2160 lossy WebP - and
+	// converting it needs the decoded input AND the output at once, which is the term a
+	// synthetic upscale can never show. `imgconv` could not convert it inside 96 MiB.
+	// Measured in a deliberately generous Domain rather than in the production one, so that
+	// this reports how much the conversion NEEDS instead of only that the quota refused it.
+	// An `out of memory` line is the least useful possible answer to "what should the quota
+	// be" - it is what the original 96 MiB produced here, and it says nothing about by how
+	// much. The production statement is then a comparison against a number in hand.
+	const MEASUREMENT_CEILING: u64 = 512 * 1024 * 1024;
+	// 15 MB of media against a 2.2 MB output, so capacity cannot be what decides this. The
+	// default 2.5 MB is close enough to the output size to be a suspect, and FAT16 caps at
+	// 65,524 clusters - asking for 65,536 produces an image the driver will not accept, which
+	// looks like the same `cannot write output` and is not.
+	let media_image = fat16_image_with_clusters(&[], false, 30_000);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+	let corpus_domain = Domain::new_child(&sched::root_domain(), MEASUREMENT_CEILING, UNLIMITED, UNLIMITED);
+	let (wallpaper, wallpaper_peak) = run_imgconv_harness_in(corpus_domain, imgconv_elf, b"vol://system/wallpapers/logo.webp vol://media/LOGO.PNG", &mut system, &mut media);
+	assert!(wallpaper.starts_with(b"imgconv: WebP 3840x2160 -> PNG 3840x2160"), "the shipped wallpaper converts, got {:?}", core::str::from_utf8(&wallpaper));
+	assert!(wallpaper_peak > ultra_hd_peak, "a 4K input costs more than a 4K output alone - decoded input and output are live together");
+	assert!(wallpaper_peak < IMGCONV_MEMORY_LIMIT, "the shipped corpus must fit the production quota: measured {} bytes against a {} byte limit", wallpaper_peak, IMGCONV_MEMORY_LIMIT);
+
+	serial_println!("imgconv governed memory: 1920x1080={} bytes, 3840x2160={} bytes, animation={} bytes, shipped 4K wallpaper={} bytes", full_hd_peak, ultra_hd_peak, animation_peak, wallpaper_peak);
 }
 
 tagged_test!(wasi_host_runs_a_component, [Component, Service]);

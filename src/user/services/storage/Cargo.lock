@@ -126,6 +126,7 @@ version = "0.0.0"
 dependencies = [
  "base-proto",
  "ipc-client",
+ "resources-proto",
  "wire",
 ]
 

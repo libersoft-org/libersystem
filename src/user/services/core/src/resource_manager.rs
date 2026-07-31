@@ -31,6 +31,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
+use ipc_client::ChannelTransport;
+use proto::system::process;
 use proto::system::resources::{self, Service};
 use proto::system::{Budget, Error, ResourceType, ResourceUsage};
 use rt::*;
@@ -80,11 +82,26 @@ fn budget_of(domain: u64) -> Budget {
 // `set-limit` adjusts one of its caps and reports the updated budget.
 struct Manager {
 	domain: u64,
+	// ProcessService, asked for the Domains it accounts - one per governed launch that runs
+	// under a stated limit. 0 when nothing answers, in which case `usage` reports what this
+	// manager governs itself, exactly as it did before.
+	process: u64,
 }
 
 impl Service for Manager {
 	fn usage(&mut self) -> Result<Vec<Budget>, Error> {
-		Ok(alloc::vec![budget_of(self.domain)])
+		let mut budgets: Vec<Budget> = alloc::vec![budget_of(self.domain)];
+		// The Domains this manager did not create. A failure here is not this call's failure:
+		// what this service governs is still worth reporting when the launcher has nothing to
+		// add or cannot answer, and an observability command that returns an error because one
+		// of its two sources was quiet is less useful than one that returns what it has.
+		if self.process != 0 {
+			let mut client = process::Client::new(ChannelTransport { chan: self.process });
+			if let Some(Ok(launched)) = unsafe { client.accounting() } {
+				budgets.extend(launched);
+			}
+		}
+		Ok(budgets)
 	}
 	fn set_limit(&mut self, name: String, r#type: ResourceType, limit: u64) -> Result<Budget, Error> {
 		if name.as_bytes() != BUDGET_NAME.as_bytes() {
@@ -177,6 +194,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let (_pkg_handle, archive): (u64, &[u8]) = unsafe { recv_package(bootstrap, &mut buf) }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package not delivered") });
 	let package: Package = Package::parse(archive).unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"package", b"init package malformed") });
 	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
+	// A ProcessService client, so `usage` can report the Domains this manager did not create.
+	// Every governed launch runs in a Domain of its own and this service is only ever handed
+	// the ones it made itself, so isolation was enforced and unobservable - a scenario asking
+	// what a run cost got nothing back. ProcessService answers with values rather than handing
+	// the Domain over, because an observer holding one would keep it alive past the process it
+	// accounts.
+	//
+	// Received unconditionally, which makes it a change for every caller that starts this
+	// service - including the kernel harness, where the idiom is a client whose peer is
+	// dropped. A handoff the sender skips is not skipped: it swallows the next message and
+	// then blocks forever.
+	let process_client: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"process", b"missing process client") });
 
 	// 2. create the bounded sub-Domain that hosts the governed component. It starts
 	//    uncapped; govern() sets and adjusts its memory budget around the probe.
@@ -198,7 +227,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 5. serve generated usage/set-limit requests against the live Domain until the
 	//    supervisor drops the channel.
-	let mut manager: Manager = Manager { domain };
+	let mut manager: Manager = Manager { domain, process: process_client };
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {

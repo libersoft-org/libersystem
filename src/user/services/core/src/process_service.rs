@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::process::{self, Service};
 use proto::system::volume;
-use proto::system::{Error, OpenOpts, ProcessInfo, StartResult};
+use proto::system::{Budget, Error, OpenOpts, ProcessInfo, ResourceType, ResourceUsage, StartResult};
 use rt::*;
 use services::REGISTRY_ANNOUNCEMENT;
 use services::executable;
@@ -368,6 +368,17 @@ struct Processes<'a> {
 struct Launched {
 	info: ProcessInfo,
 	handle: u64,
+	// The Domain this launch runs in, when it was given one of its own. Kept so `accounting`
+	// can report what it is holding: a per-launch Domain is invisible to ResourceManager,
+	// which reports only the Domains it was handed, so isolation was enforced and could not
+	// be observed. It is closed by the same `reap` that closes the process handle, so it
+	// still lives exactly as long as what it accounts - handing this handle to an observer
+	// instead would keep the Domain alive until that observer learned the process had ended,
+	// which is the lifetime problem a Domain-per-launch was created to remove.
+	//
+	// 0 for a launch that runs in the caller's Domain, which is every launch without a stated
+	// memory limit.
+	domain: u64,
 }
 
 impl<'a> Processes<'a> {
@@ -376,9 +387,9 @@ impl<'a> Processes<'a> {
 	// rather than by how long the system has been up: a guest nobody runs `ps` on would
 	// otherwise accumulate an entry per command exactly as before, just without lying about
 	// them when finally asked.
-	fn record(&mut self, info: ProcessInfo, handle: u64) {
+	fn record(&mut self, info: ProcessInfo, handle: u64, domain: u64) {
 		self.reap();
-		self.started.push(Launched { info, handle });
+		self.started.push(Launched { info, handle, domain });
 	}
 
 	// Drop every process that is no longer running, closing the handle that was holding its
@@ -395,7 +406,14 @@ impl<'a> Processes<'a> {
 			}
 			match unsafe { process_stats(entry.handle) } {
 				Some(stats) if stats.state == PROC_STATE_RUNNING => live.push(entry),
-				_ => unsafe { close(entry.handle) },
+				_ => unsafe {
+					close(entry.handle);
+					// The Domain goes with the process it accounted. The kernel frees it once
+					// nothing holds it, and this record was the last holder.
+					if entry.domain != 0 {
+						close(entry.domain);
+					}
+				},
 			}
 		}
 		self.started = live;
@@ -653,13 +671,44 @@ impl<'a> Service for Processes<'a> {
 		let (handle, artifact) = unsafe { self.spawn_program(&name, 0, 0) }.ok_or(Error::NotFound)?;
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
-		self.record(info.clone(), handle as u64);
+		self.record(info.clone(), handle as u64, 0);
 		Ok(info)
 	}
 
 	fn list(&mut self) -> Result<Vec<ProcessInfo>, Error> {
 		self.reap();
 		Ok(self.started.iter().map(|p| p.info.clone()).collect())
+	}
+
+	// What this service is currently accounting: one budget per live launch that runs in a
+	// Domain of its own, named after the program so a reader can tell which run it is. A
+	// launch without a stated memory limit runs in the caller's Domain and has nothing of its
+	// own to report, so it is absent rather than listed with somebody else's numbers.
+	//
+	// Values, never handles. Sending the Domain itself would make the receiver its last
+	// holder and keep it alive past the process it accounts, which is exactly the lifetime
+	// the Domain-per-launch change removed.
+	fn accounting(&mut self) -> Result<Vec<Budget>, Error> {
+		self.reap();
+		let mut budgets: Vec<Budget> = Vec::new();
+		for entry in &self.started {
+			if entry.domain == 0 {
+				continue;
+			}
+			let Some(stats) = (unsafe { domain_stats(entry.domain) }) else { continue };
+			budgets.push(Budget {
+				name: entry.info.name.clone(),
+				usage: alloc::vec![
+					ResourceUsage { r#type: ResourceType::Memory, used: stats.memory_used, limit: stats.memory_limit },
+					ResourceUsage { r#type: ResourceType::Handles, used: stats.handles_used, limit: stats.handles_limit },
+					ResourceUsage { r#type: ResourceType::Threads, used: stats.threads_used, limit: stats.threads_limit },
+					ResourceUsage { r#type: ResourceType::IpcQueue, used: stats.ipc_used, limit: stats.ipc_limit },
+					ResourceUsage { r#type: ResourceType::Dma, used: stats.dma_used, limit: stats.dma_limit },
+					ResourceUsage { r#type: ResourceType::Stack, used: stats.stack_used, limit: stats.stack_limit },
+				],
+			});
+		}
+		Ok(budgets)
 	}
 
 	fn launch(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error> {
@@ -671,23 +720,26 @@ impl<'a> Service for Processes<'a> {
 		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
 		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
-		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 });
+		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, 0);
 		Ok(StartResult { task: handle as u64, info })
 	}
 
 	fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
 		let domain = unsafe { self.bounded_domain(memory_limit)? };
 		let started = unsafe { self.spawn_program(&name, bootstrap, domain) };
-		// The Domain was made for this one process and this service keeps no reference to it:
-		// a process holds its Domain, so dropping the handle here leaves the Domain alive for
-		// exactly as long as what it is accounting, and gone the moment that ends. Closing it
-		// on the failure path is the same statement about a process that never started.
-		unsafe { close(domain) };
-		let (handle, artifact) = started.ok_or(Error::NotFound)?;
+		// The Domain was made for this one process, and the handle is kept only so
+		// `accounting` can read its counters. A process holds its own Domain, so the kernel
+		// frees it when the process ends whatever this service does; what the handle changes
+		// is that the freeing waits for the next reap, which is the same bargain the process
+		// handle already makes. A launch that never started keeps nothing.
+		let Some((handle, artifact)) = started else {
+			unsafe { close(domain) };
+			return Err(Error::NotFound);
+		};
 		let koid = unsafe { object_info(handle as u64) }.map(|info| info.koid).ok_or(Error::Again)?;
 		let info = ProcessInfo { koid, name: artifact };
 		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
-		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 });
+		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, domain);
 		Ok(StartResult { task: handle as u64, info })
 	}
 }

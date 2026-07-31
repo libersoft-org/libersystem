@@ -409,41 +409,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		PTR_SINK.store(ptr_server, Ordering::Relaxed);
 		// report in, then serve the bus for the life of the system: HID reports,
 		// block requests, and runtime attach / detach.
-		// 80 bytes, not the 64 this used to be: the longest report is "driver.xhci:
-		// online (" plus the count, " device(s))" and all three class suffixes, which
-		// comes to exactly 64 with a one-digit count and overruns the moment a machine
-		// presents ten devices. The margin covers a count of any width this bus can
-		// reach (255 slots) rather than sitting one device away from an index panic.
-		let mut report: [u8; 80] = [0u8; 80];
-		let mut n: usize = 0;
-		for &b in b"driver.xhci: online (" {
-			report[n] = b;
-			n += 1;
-		}
-		n += push_decimal(&mut report[n..], devices as u64);
-		for &b in b" device(s))" {
-			report[n] = b;
-			n += 1;
-		}
+		// Assembled through a writer that cannot overrun rather than by indexing a fixed
+		// buffer by hand. The buffer was 64 bytes and the longest report came to exactly 64
+		// with a one-digit count, so a machine presenting ten devices wrote one byte past the
+		// end and panicked on the index - it fit on the byte, which is not a margin, and the
+		// widening that followed only moved where the same edge is. What matters is that the
+		// bound is checked in one place instead of trusted at every append: an overlong report
+		// is a truncated line, never a dead driver, and the driver's job is the bus.
+		let mut report: Bounded<96> = Bounded::new();
+		report.push(b"driver.xhci: online (");
+		report.decimal(devices as u64);
+		report.push(b" device(s))");
 		if hids.any_keyboard() {
-			for &b in b" (keyboard)" {
-				report[n] = b;
-				n += 1;
-			}
+			report.push(b" (keyboard)");
 		}
 		if hids.any_pointer() {
-			for &b in b" (pointer)" {
-				report[n] = b;
-				n += 1;
-			}
+			report.push(b" (pointer)");
 		}
 		if storage.is_some() {
-			for &b in b" (storage)" {
-				report[n] = b;
-				n += 1;
-			}
+			report.push(b" (storage)");
 		}
-		send_blocking(bootstrap, &report[..n], blk_client);
+		send_blocking(bootstrap, report.as_bytes(), blk_client);
 		send_blocking(bootstrap, b"USBBUS", usbq_client);
 		send_blocking(bootstrap, b"POINTER", ptr_client);
 		service_loop(&mut hc, &mut slots, hids, storage, blk_server, usbq_server, irq);
@@ -1181,6 +1167,40 @@ unsafe fn report_device(dev: &UsbDevice) {
 }
 
 // Render a small decimal number into `out`, returning the digit count.
+// A fixed-capacity byte buffer that drops what does not fit instead of panicking. The
+// alternative shape - a caller that keeps a running index and is responsible for staying under
+// the size - is what put an index panic one device away from a working driver, and it fails at
+// the append site where the size is least visible. Here every append is checked against the
+// same bound, and a report too long for the buffer arrives cut short: a truncated status line
+// is a cosmetic loss, while a driver that panics assembling one takes the bus down with it.
+struct Bounded<const N: usize> {
+	bytes: [u8; N],
+	len: usize,
+}
+
+impl<const N: usize> Bounded<N> {
+	fn new() -> Self {
+		Bounded { bytes: [0u8; N], len: 0 }
+	}
+
+	fn push(&mut self, data: &[u8]) {
+		let room = N - self.len;
+		let take = if data.len() < room { data.len() } else { room };
+		self.bytes[self.len..self.len + take].copy_from_slice(&data[..take]);
+		self.len += take;
+	}
+
+	fn decimal(&mut self, value: u64) {
+		let mut digits: [u8; 20] = [0u8; 20];
+		let written = push_decimal(&mut digits, value);
+		self.push(&digits[..written]);
+	}
+
+	fn as_bytes(&self) -> &[u8] {
+		&self.bytes[..self.len]
+	}
+}
+
 fn push_decimal(out: &mut [u8], value: u64) -> usize {
 	let mut digits: [u8; 20] = [0u8; 20];
 	let mut v: u64 = value;

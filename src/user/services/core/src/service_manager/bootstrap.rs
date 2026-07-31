@@ -165,7 +165,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
 			return State::Failed;
 		}
-		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, pkg_handle, pkg_len, buf) {
+		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, *process_client, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		if name == b"session_service" && !bootstrap_serve(manager_side, session_client) {
@@ -711,18 +711,29 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 
 // Hand ResourceManager a read-only view of the init package (to launch the component it
 // governs from) and the channel its clients reach it on ("SERVE", the client end kept in
-// `*res_client` for the shell's `usage` command). The order matches ResourceManager's
-// receive order: PACKAGE, SERVE. The manager holds no service clients - it governs its
-// component's Domain through the kernel's resource syscalls (create the sub-Domain, set
-// its limits, read its stats), not by granting service connections.
-unsafe fn bootstrap_resource_manager(manager_side: u64, res_client: &mut u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
+// `*res_client` for the shell's `usage` command), then a ProcessService client. The order
+// matches ResourceManager's receive order: PACKAGE, SERVE, PROCESS.
+//
+// The ProcessService client is the one grantable client this manager holds, and it is held
+// to read rather than to grant: every governed launch runs in a Domain of its own, those
+// Domains are invisible to a manager that only knows the ones it created, and `accounting`
+// answers with values. The manager still governs its own component's Domain through the
+// kernel's resource syscalls, not by granting service connections.
+//
+// `resource_manager` depends on `process_service` in the service manifest, so the client is
+// live by the time this runs.
+unsafe fn bootstrap_resource_manager(manager_side: u64, res_client: &mut u64, process_client: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		// The init package, so the manager can spawn the component it governs.
 		if !bootstrap_package(manager_side, pkg_handle, pkg_len, buf) {
 			return false;
 		}
 		// The channel its clients reach it on; the client end kept for the shell.
-		bootstrap_serve(manager_side, res_client)
+		if !bootstrap_serve(manager_side, res_client) {
+			return false;
+		}
+		// A ProcessService connection, so `usage` can report the per-launch Domains.
+		send_factory(manager_side, b"PROCESS", process_client)
 	}
 }
 

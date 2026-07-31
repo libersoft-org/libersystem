@@ -10,5 +10,6 @@ shared-image = ["channel-client-impl", "ipc-client/shared-image"]
 
 [dependencies]
 base-proto = { path = "../base-proto" }
+resources-proto = { path = "../resources-proto" }
 wire = { path = "../../../../wire" }
 ipc-client = { path = "../../ipc/ipc-client", optional = true }

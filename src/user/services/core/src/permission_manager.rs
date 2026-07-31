@@ -80,9 +80,18 @@ const GRANT_RIGHTS: u32 = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSF
 // stdout console (so its `print` output renders on the launching terminal) under this tag,
 // then its argument string.
 const STDOUT_TAG: &[u8] = b"STDOUT";
-// The measured 4K imgconv whole-Domain peak is 84,475,904 bytes. Keep bounded headroom
-// for allocator granularity and profile variation without leaving the tool unlimited.
-const IMGCONV_MEMORY_LIMIT: u64 = 96 * 1024 * 1024;
+// What this is sized for, stated rather than left to be inferred from one number: converting
+// the largest image the system ships - `wallpapers/logo.webp`, 3840x2160 - which needs the
+// decoded input and the output RGBA live at the same time, about 33 MB each, plus codec
+// working memory and the allocator's chunk granularity. Measured whole-Domain peak for that
+// conversion: 109,830,144 bytes (`imgconv_governed_working_set_is_measured`).
+//
+// It was 96 MiB against a measured 84,475,904, and that measurement was a 4K conversion
+// upscaled from a 2x2 BMP - an output with no input to decode, so it never showed the term
+// that dominates a real conversion. The limit then refused the wallpaper the system installs,
+// which is the failure mode of a budget sized from a single unrepresentative sample: it
+// rejects whatever is bigger than that sample, for reasons nobody can predict from the file.
+const IMGCONV_MEMORY_LIMIT: u64 = 128 * 1024 * 1024;
 
 // A runtime permission request rides a launched component's bootstrap channel as this tag
 // followed by the requested capability's ordinal byte; the manager replies with the granted
