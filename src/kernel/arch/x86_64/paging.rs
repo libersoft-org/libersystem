@@ -314,6 +314,32 @@ pub fn unmap_page_in(pml4_phys: u64, virt: u64) -> Option<u64> {
 //
 // Assumes it runs with the kernel address space active (processes are created
 // from kernel threads / the boot context), so the active PML4 is the kernel one.
+// The first kernel-half PML4 entry of `pml4_phys` that differs from `reference`, if any, as
+// (index, entry-in-this-space, entry-in-reference). None when the two agree everywhere above
+// the user half.
+//
+// This exists because `new_address_space` COPIES the kernel half rather than sharing it, so
+// every address space carries a snapshot of the kernel mapping as it stood when that space was
+// created. A kernel-half entry that changes afterwards is therefore invisible to every space
+// made before the change, and switching to one of those loads a CR3 that does not map the
+// kernel it is executing in - which faults on the next instruction fetch, faults again in the
+// handler that needs the same mapping, and triple-faults. From outside that is a guest that
+// vanishes with no message at all.
+pub fn kernel_half_divergence(pml4_phys: u64, reference: u64) -> Option<(usize, u64, u64)> {
+	let _guard = PT_LOCK.lock();
+	unsafe {
+		let this = table_ptr(pml4_phys);
+		let refr = table_ptr(reference);
+		for i in 256..ENTRY_COUNT {
+			let (a, b) = (this.add(i).read_volatile(), refr.add(i).read_volatile());
+			if a != b {
+				return Some((i, a, b));
+			}
+		}
+	}
+	None
+}
+
 pub fn new_address_space() -> Option<u64> {
 	let pml4_phys = frame::allocate()?;
 	let _guard = PT_LOCK.lock();

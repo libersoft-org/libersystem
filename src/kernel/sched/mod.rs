@@ -635,6 +635,19 @@ pub fn on_timer_preempt(from_user: bool) {
 // and both stacks mapped.
 fn switch_address_space(want_cr3: u64) {
 	if arch::context::read_cr3() != want_cr3 {
+		// Refuse to load a CR3 whose kernel half has drifted from the kernel's own, because
+		// the alternative is not an error - it is a triple fault. The very next instruction
+		// fetch happens through these tables, so a missing kernel mapping faults at the
+		// current instruction pointer, the handler needs that same mapping and faults again,
+		// and the CPU resets with nothing on the wire. Panicking here names the address space
+		// and the entry instead.
+		let kernel_cr3 = KERNEL_CR3.load(Ordering::Acquire);
+		if kernel_cr3 != 0
+			&& want_cr3 != kernel_cr3
+			&& let Some((index, theirs, ours)) = arch::paging::kernel_half_divergence(want_cr3, kernel_cr3)
+		{
+			panic!("address space {want_cr3:#x} diverges from the kernel mapping at PML4[{index}]: {theirs:#x} vs {ours:#x}");
+		}
 		unsafe { arch::context::write_cr3(want_cr3) };
 	}
 }

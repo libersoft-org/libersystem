@@ -325,10 +325,30 @@ fn display_service_restores_the_console_surface() {
 		cap.object().into_any_arc().downcast::<MemoryObject>().expect("surface buffer is a MemoryObject")
 	}
 
+	// Paint `pixels` words across the object's frames, one frame at a time.
+	//
+	// It used to take `frames()[0]` and write the whole run contiguously from there, which is
+	// only correct while the run fits in one frame. A MemoryObject's frames come from the
+	// frame allocator and are not physically contiguous, so a 320x200 surface - 256 kB, 62.5
+	// pages - wrote past its first frame and over 61 unrelated ones. That is how a benchmark
+	// surface came to overwrite a live PML4: the kernel half of an address space became
+	// `0x00336699` repeated, the next switch into it could not fetch the next instruction, and
+	// the machine triple-faulted with nothing in the log. Every small surface here is 4x4 and
+	// fits in one frame, which is why only the one large fill ever did damage.
 	fn fill(object: &MemoryObject, pixel: u32, pixels: usize) {
-		let base = mem::hhdm_offset() + object.frames()[0];
-		let words = unsafe { core::slice::from_raw_parts_mut(base as *mut u32, pixels) };
-		words.fill(pixel);
+		const PER_FRAME: usize = crate::mem::frame::PAGE_SIZE as usize / core::mem::size_of::<u32>();
+		let mut left = pixels;
+		for frame in object.frames() {
+			if left == 0 {
+				break;
+			}
+			let take = left.min(PER_FRAME);
+			let base = mem::hhdm_offset() + frame;
+			let words = unsafe { core::slice::from_raw_parts_mut(base as *mut u32, take) };
+			words.fill(pixel);
+			left -= take;
+		}
+		assert_eq!(left, 0, "the surface has fewer frames than the fill needs");
 	}
 
 	fn set_surface_pixel(object: &MemoryObject, index: usize, pixel: u32) {

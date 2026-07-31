@@ -95,7 +95,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0044 - virtio-gpu driver + runtime mode-set (the resize source for the local console)](M0044.md)
 - [x] [M0045 - AudioService over virtio-sound (headless playback + capture)](M0045.md)
 - [x] [M0046 - MSI-X interrupt routing (per-device vectors)](M0046.md)
-- [ ] [M0047 - Layered console: stream -> grid model -> renderer -> swappable display](M0047.md)
+- [x] [M0047 - Layered console: stream -> grid model -> renderer -> swappable display](M0047.md)
 - [x] [M0048 - FAT / exFAT filesystem backend (read foreign removable media)](M0048.md)
 - [x] [M0049 - LiberFS: directories and capacity scaling](M0049.md)
 - [x] [M0050 - LiberFS: write semantics, metadata, and integrity](M0050.md)
