@@ -329,7 +329,7 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// nothing in the log to say who ended it. Whatever asks for this should be named
 		// while there is still a console to name it on.
 		if code == KEY_POWER {
-			unsafe { debug_write(b"driver.keys: KEY_POWER - powering off\n") };
+			debug_write(b"driver.keys: KEY_POWER - powering off\n");
 			system_power(POWER.load(core::sync::atomic::Ordering::Relaxed), POWER_OFF);
 			return;
 		}

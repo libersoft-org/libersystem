@@ -132,10 +132,20 @@ if [[ "$MODE" == "write" ]]; then
 	mkdir -p "$STAMP_DIR"
 	# Prepare both scopes. The fast recipes check the narrow stamp; the broad one
 	# stays available for checkpoint validation without a second preparation pass.
+	# The temporary carries this run's pid, because the name is what makes the publication
+	# atomic against a second writer and `$stamp.tmp` is a name every run shares. Two preflights
+	# overlapping - two suites started together, or one driving several architectures - had one
+	# write the file the other was about to rename, and the loser died on
+	#   mv: cannot stat '.../x86_64.narrow.sha256.tmp': No such file or directory
+	# which says nothing about a race. The rest of the build already knows this: providers link
+	# to `<name>.<pid>.candidate`, identity records come from `mktemp`, and the artifact cache
+	# sweeps `*.tmp.$$`. Renaming is atomic against a READER whatever it is called; against
+	# another writer it needs a name that cannot collide.
 	for SCOPE in narrow full; do
 		stamp="$STAMP_DIR/$ARCH.$SCOPE.sha256"
-		current_state >"$stamp.tmp"
-		mv "$stamp.tmp" "$stamp"
+		temporary="$stamp.tmp.$$"
+		current_state >"$temporary"
+		mv "$temporary" "$stamp"
 	done
 	echo "test preflight: prepared $ARCH"
 	exit 0

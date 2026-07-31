@@ -483,9 +483,44 @@ qemu_run_x86_64() {
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
 	qemu_prepare_media_images "$artifact_suffix" "$artifact_suffix" loop,ro=0 1
 
+	# An ad-hoc guest cannot run beside the persistent development instance, and the reason is
+	# not the port - it is the disks. Both attach the same raw images, QEMU takes a write lock
+	# on each, and the second guest dies on whichever it reaches first: a forwarding rule it
+	# cannot bind, or `Failed to get "write" lock` naming an image. Neither message mentions the
+	# instance that actually holds them, so the reader debugs QEMU instead of running one
+	# command. Two guests writing one image is also the corruption this milestone refuses
+	# outright, so the answer is to refuse early rather than to hand out parallel disks.
+	if [[ "${TEST:-0}" != "1" && "${DEV_PROFILE:-0}" != "1" && -e "$QEMU_BUILD_DIR/dev-instance.lock" ]] && ! flock -n "$QEMU_BUILD_DIR/dev-instance.lock" true 2>/dev/null; then
+		echo "qemu-run: a development instance is running and holds the system, media and USB images" >&2
+		echo "qemu-run: release it with \`just dev-down\` (or \`just dev-status\` to see what it is)" >&2
+		exit 1
+	fi
+
 	# Network: user-mode NIC with optional hostfwd for interactive runs.
+	#
+	# The persistent development instance forwards a different port from an ordinary run,
+	# because otherwise the two cannot coexist: the port was hard-coded, so `just run` while a
+	# `dev-up` instance was alive died on
+	#   Could not set up host forwarding rule 'tcp:127.0.0.1:5555-:80'
+	# which names the port and not the reason. That is the same rule the instance already
+	# follows for its serial, control and log paths - it owns its own names so an ad-hoc boot
+	# cannot collide with it - and the port was the one thing left out.
+	#
+	# `HOSTFWD_PORT` overrides both, for a second ad-hoc guest or a host where 5555 is taken.
 	local hostfwd=""
-	[[ "${TEST:-0}" != "1" ]] && hostfwd="hostfwd=tcp:127.0.0.1:5555-:80"
+	if [[ "${TEST:-0}" != "1" ]]; then
+		local default_port=5555
+		[[ "${DEV_PROFILE:-0}" == "1" ]] && default_port=5556
+		local port="${HOSTFWD_PORT:-$default_port}"
+		# Fail on the cause rather than leaving QEMU to fail on a rule nobody can read.
+		if ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+			echo "qemu-run: host port $port is already in use, so this guest cannot forward it" >&2
+			echo "qemu-run: a persistent development instance is the usual holder - check \`just dev-status\`, release it with \`just dev-down\`" >&2
+			echo "qemu-run: or run this guest on another port with HOSTFWD_PORT=<port>" >&2
+			exit 1
+		fi
+		hostfwd="hostfwd=tcp:127.0.0.1:$port-:80"
+	fi
 	qemu_attach_virtio_net qemu_args vnet0 "$hostfwd" "disable-legacy=on"
 
 	# virtio-serial + virtconsole: mirrors a second console to a file.

@@ -227,7 +227,7 @@ development while preserving the existing full release gates. All six phases are
 the loop is in daily use. Two defects it found in older code are open where that code lives,
 in M0126 and M0039.
 
-- [ ] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
+- [x] [M0134 - Incremental development and persistent QEMU test loop](M0134.md)
 
 ### Definition of done (phase 2)
 
