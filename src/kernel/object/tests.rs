@@ -104,6 +104,84 @@ fn handle_refcount_lifetime() {
 	assert_eq!(Arc::strong_count(&obj), 1);
 }
 
+crate::tagged_test!(a_process_group_reaches_every_member, [Object, Kernel, Process]);
+fn a_process_group_reaches_every_member() {
+	use super::address_space::AddressSpace;
+	use super::process::Process;
+	use super::process_group::{MAX_GROUP_MEMBERS, ProcessGroup};
+
+	// A pipeline is one job: Ctrl+C interrupts `a | b | c` whole, not whichever stage holds the
+	// terminal. ConsoleService holds a single Process handle today, so every stage but one
+	// would keep running with nothing able to reach it - which is what M0035j deferred and
+	// named.
+	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain());
+	let stages = alloc::vec![make(), make(), make()];
+	let group = ProcessGroup::create(&stages).expect("a three-stage group");
+	assert_eq!(group.size(), 3, "the group holds every stage it was created over");
+	assert_eq!(group.live().len(), 3, "all three are live before anything ends");
+	assert!(!group.finished(), "a group with live members is not finished");
+
+	// Terminating one stage leaves the job unfinished, which is the property a shell needs:
+	// `a | b | c` is still running while any stage is. Asserting only the all-dead case would
+	// pass over an implementation that reported finished as soon as ONE member ended.
+	stages[1].terminate();
+	assert!(!group.finished(), "one dead stage does not finish the job");
+
+	stages[0].terminate();
+	stages[2].terminate();
+	assert!(group.finished(), "the job finishes when every stage has");
+
+	// Membership is Weak, so a group never keeps a dead process alive - a strong reference here
+	// would pin every stage for the life of the job table.
+	drop(stages);
+	assert_eq!(group.live().len(), 0, "dropped members leave the live set");
+
+	// Bounds are refusals, not truncation: a group missing a stage would signal an incomplete
+	// job and nothing would say so.
+	assert!(ProcessGroup::create(&[]).is_none(), "an empty group is refused");
+	let too_many: alloc::vec::Vec<_> = (0..MAX_GROUP_MEMBERS + 1).map(|_| make()).collect();
+	assert!(ProcessGroup::create(&too_many).is_none(), "a group past the cap is refused rather than truncated");
+}
+
+crate::tagged_test!(a_clean_exit_reports_its_status, [Object, Kernel, Process]);
+fn a_clean_exit_reports_its_status() {
+	use super::process::Process;
+
+	// `SYS_USER_EXIT` took no argument and discarded a0, so a process could finish but never
+	// say how it went: a waiter saw closure and nothing else, which makes a program that ran
+	// and refused indistinguishable from one that worked. Everything downstream of that -
+	// `pipefail`, a shell's `$?`, any success-gated step - needs to tell those apart.
+	//
+	// The latch is exercised directly rather than through the syscall, and that is a
+	// constraint rather than a preference: `SYS_USER_EXIT` does not return, it longjmps to the
+	// kernel thread that entered ring 3, so a kernel test thread calling it jumps to a stack
+	// that was never parked - which double-faults, as the first version of this test did. The
+	// syscall's own one line is exercised by every process in every boot instead, since all
+	// 311 `exit()` calls in the tree now pass a status through it and a process that could not
+	// exit would take the boot chain with it.
+	let process = Process::new(super::address_space::AddressSpace::create().expect("an address space for the test process"), crate::sched::root_domain());
+
+	// Nothing reported yet is NOT zero. That distinction is why the report carries a validity
+	// flag: a process that faulted never got to say anything, and reading that as a successful
+	// zero is how a broken stage would report success.
+	assert_eq!(process.exit_status(), None, "a process that has not exited has no status");
+
+	// A failing status is 42 rather than 1, so an implementation that returns "some non-zero"
+	// still fails this.
+	process.set_exit_status(42);
+	assert_eq!(process.exit_status(), Some(42), "the reported status is the one that was set");
+
+	// First writer wins, the same rule the recorded fault follows. A multi-threaded process
+	// whose threads exit differently has one answer and it does not change under a reader.
+	process.set_exit_status(7);
+	assert_eq!(process.exit_status(), Some(42), "a later exit does not overwrite the first");
+
+	// Zero is a real status and must survive the same path, or success would read as absent.
+	let clean = Process::new(super::address_space::AddressSpace::create().expect("an address space for the test process"), crate::sched::root_domain());
+	clean.set_exit_status(0);
+	assert_eq!(clean.exit_status(), Some(0), "exiting 0 reports 0, not None");
+}
+
 crate::tagged_test!(system_power_refuses_a_caller_without_the_root_domain, [Object, Kernel, Syscall, Domain]);
 fn system_power_refuses_a_caller_without_the_root_domain() {
 	use super::domain::{Domain, UNLIMITED};

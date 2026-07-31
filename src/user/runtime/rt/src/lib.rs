@@ -247,8 +247,19 @@ pub unsafe fn syscall(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 // Terminate this process. Never returns.
 pub fn exit() -> ! {
+	exit_with(0)
+}
+
+// End this process reporting `status` to whoever waits on it. `exit()` is this with 0, which is
+// why it keeps its signature: success is the overwhelming majority of the 311 call sites in the
+// tree, and making every one of them write `exit(0)` would add no information to any of them.
+//
+// The status is latched on the Process and read back through `process_stats`, so a launcher can
+// tell a program that ran and refused from one that worked - which nothing could do before,
+// because the syscall took no argument and closure was the only signal.
+pub fn exit_with(status: u64) -> ! {
 	unsafe {
-		syscall(SYS_USER_EXIT, 0, 0, 0, 0);
+		syscall(SYS_USER_EXIT, status, 0, 0, 0);
 	}
 	loop {}
 }
@@ -1369,7 +1380,7 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 // from the process handles it holds for each component.
 pub unsafe fn process_stats(handle: u64) -> Option<ProcessStats> {
 	unsafe {
-		let mut stats: ProcessStats = ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0 };
+		let mut stats: ProcessStats = ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0, completion: 0, completion_valid: 0 };
 		let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
 		let ok: i64 = syscall(SYS_PROCESS_STATS_GET, handle, &mut stats as *mut ProcessStats as u64, size, 0) as i64;
 		if ok == 1 { Some(stats) } else { None }
@@ -1411,6 +1422,21 @@ pub unsafe fn device_msix_acquire(index: u64) -> i64 {
 // the capability, so a caller that was handed none fails instead of halting the system.
 pub unsafe fn system_power(power: u64, action: u64) -> i64 {
 	unsafe { syscall(SYS_SYSTEM_POWER, power, action, 0, 0) as i64 }
+}
+
+// Create a ProcessGroup over `processes`, so a pipeline can be signalled as the one job it is.
+// Each handle must carry RIGHT_MANAGE - the same right signalling it individually needs - so a
+// group cannot be assembled out of processes the caller could not already reach. Membership is
+// sealed at creation: there is no join, and a stage cannot leave the job it belongs to.
+// Returns the group handle, or a negative error.
+pub unsafe fn process_group_create(processes: &[u64]) -> i64 {
+	unsafe { syscall(SYS_PROCESS_GROUP_CREATE, processes.as_ptr() as u64, processes.len() as u64, 0, 0) as i64 }
+}
+
+// Deliver `signal` to every live member of a group. Authority is the group handle carrying
+// RIGHT_MANAGE; being a member grants nothing, so one stage cannot signal its siblings.
+pub unsafe fn process_group_signal(group: u64, signal: u64) -> i64 {
+	unsafe { syscall(SYS_PROCESS_GROUP_SIGNAL, group, signal, 0, 0) as i64 }
 }
 
 // Acknowledge a serviced device interrupt, re-arming its source so the next `wait`

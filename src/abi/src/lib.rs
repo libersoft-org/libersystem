@@ -182,6 +182,14 @@ pub const SYS_PROCESS_LOAD_MODULE: u64 = 63;
 // decide what to print; userspace needs the same answer to decide what a build is allowed
 // to do, and a development-only facility cannot gate itself on anything softer.
 pub const SYS_BOOT_PROFILE: u64 = 64;
+
+// Create a ProcessGroup over a set of Process handles, and signal one. A group is how a
+// pipeline is one job: `a | b | c` is interrupted as a whole, not one stage at a time.
+// Membership is fixed at creation and cannot be joined, and authority to signal comes from
+// holding the group handle with RIGHT_MANAGE - being a member grants nothing, so one stage
+// cannot signal its siblings.
+pub const SYS_PROCESS_GROUP_CREATE: u64 = 65;
+pub const SYS_PROCESS_GROUP_SIGNAL: u64 = 66;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -368,6 +376,16 @@ pub struct ProcessStats {
 	pub handle_count: u64,
 	pub memory_bytes: u64,
 	pub state: u64,
+	// What a finished process reported, which `state` alone cannot say. For PROC_STATE_STOPPED
+	// - a clean exit - this is the status the program passed to `exit_with`, and
+	// `completion_valid` is 1. For a process still running, or one that faulted or was killed
+	// and so never got to report anything, `completion_valid` is 0 and this is meaningless.
+	//
+	// The pair exists because 0 is both the most common success value and the natural "nothing
+	// here" value, and a caller deciding whether a command succeeded must not have to guess
+	// which one it is looking at.
+	pub completion: u64,
+	pub completion_valid: u64,
 }
 
 // Liveness states reported in ProcessStats::state.

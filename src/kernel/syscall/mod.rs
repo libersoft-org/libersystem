@@ -42,7 +42,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -346,6 +346,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_PROCESS_LOAD_MODULE => sys_process_load_module(a0, a1, a2, a3),
 		SYS_BOOT_PROFILE => sys_boot_profile(a0, a1),
 		SYS_PROCESS_SIGNAL => sys_process_signal(a0, a1),
+		SYS_PROCESS_GROUP_CREATE => sys_process_group_create(a0, a1),
+		SYS_PROCESS_GROUP_SIGNAL => sys_process_group_signal(a0, a1),
 		SYS_SIGNAL_CATCH => sys_signal_catch(a0),
 		SYS_SIGNAL_TAKE => sys_signal_take(a0),
 		SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2, a3),
@@ -367,7 +369,15 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_TIMER_CREATE => sys_timer_create(),
 		SYS_TIMER_SET => sys_timer_set(a0, a1),
 		SYS_TIMER_POLL => sys_timer_poll(a0),
-		SYS_USER_EXIT => arch::usermode::exit_to_kernel(),
+		SYS_USER_EXIT => {
+			// The status the program is reporting, latched on its Process before the thread
+			// leaves. This syscall took no argument at all and discarded a0, so a waiter could
+			// see that a program had finished but never whether it succeeded.
+			if let Some(thread) = sched::current_thread() {
+				thread.process().set_exit_status(a0);
+			}
+			arch::usermode::exit_to_kernel()
+		}
 		SYS_FAULT_INFO_GET => sys_fault_info_get(a0, a1),
 		SYS_DOMAIN_CREATE => sys_domain_create(a0, a1, a2),
 		SYS_DOMAIN_KILL => sys_domain_kill(a0),
@@ -1067,6 +1077,67 @@ fn sys_process_signal(process_handle: u64, signal: u64) -> i64 {
 		Ok(p) => p,
 		Err(e) => return e,
 	};
+	deliver_signal(&process, signal)
+}
+
+// Create a ProcessGroup over the Process handles in a user array, so a pipeline can be
+// signalled and waited on as the one job it is. Each handle is looked up with MANAGE - the
+// same right signalling one of them needs - so a group cannot be assembled out of processes
+// the caller could not already signal individually. Membership is sealed here: there is no
+// join, which is how "which processes does this reach" stays answerable from the handle.
+fn sys_process_group_create(handles_ptr: u64, count: u64) -> i64 {
+	use crate::object::process_group::{MAX_GROUP_MEMBERS, ProcessGroup};
+	if count == 0 || count as usize > MAX_GROUP_MEMBERS {
+		return ERR_INVALID;
+	}
+	let bytes = count * core::mem::size_of::<u64>() as u64;
+	if !user_buf_ok(handles_ptr, bytes) {
+		return ERR_INVALID;
+	}
+	let mut raw = alloc::vec![0u64; count as usize];
+	arch::paging::user_access(|| unsafe {
+		core::ptr::copy_nonoverlapping(handles_ptr as *const u64, raw.as_mut_ptr(), count as usize);
+	});
+	let mut members = alloc::vec::Vec::with_capacity(raw.len());
+	for handle in raw {
+		match current_typed::<Process>(handle, ObjectType::Process, Rights::MANAGE) {
+			Ok(process) => members.push(process),
+			Err(e) => return e,
+		}
+	}
+	let Some(group) = ProcessGroup::create(&members) else {
+		return ERR_INVALID;
+	};
+	let thread = current_thread!();
+	install_object(&thread, group, Rights::MANAGE | Rights::READ | Rights::TRANSFER | Rights::DUPLICATE, 0)
+}
+
+// Deliver `signal` to every live member of a group. Authority is the group handle carrying
+// MANAGE; membership grants nothing, so a stage cannot signal its siblings - which is the
+// confused-deputy shape Unix process groups have, where any member may signal the rest.
+//
+// Every live member is signalled even if one fails, because a partially interrupted pipeline
+// is worse than either outcome: the stages that did receive it exit and the rest keep running
+// with their peers gone.
+fn sys_process_group_signal(group_handle: u64, signal: u64) -> i64 {
+	use crate::object::process_group::ProcessGroup;
+	let group = match current_typed::<ProcessGroup>(group_handle, ObjectType::ProcessGroup, Rights::MANAGE) {
+		Ok(g) => g,
+		Err(e) => return e,
+	};
+	let mut result = 0;
+	for process in group.live() {
+		let one = deliver_signal(&process, signal);
+		if one != 0 {
+			result = one;
+		}
+	}
+	result
+}
+
+// The disposition one signal has on one process, shared by the per-process and per-group
+// syscalls so a group cannot drift from what signalling a member directly does.
+fn deliver_signal(process: &alloc::sync::Arc<Process>, signal: u64) -> i64 {
 	match signal {
 		SIG_INT if process.is_int_caught() => {
 			process.set_int_pending();
@@ -1602,7 +1673,11 @@ fn sys_process_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	} else {
 		PROC_STATE_RUNNING
 	};
-	let out = ProcessStats { messages_sent: process.messages_sent(), messages_received: process.messages_received(), handle_count: process.handle_count(), memory_bytes: process.memory_bytes(), state };
+	let (completion, completion_valid) = match process.exit_status() {
+		Some(status) => (status, 1),
+		None => (0, 0),
+	};
+	let out = ProcessStats { messages_sent: process.messages_sent(), messages_received: process.messages_received(), handle_count: process.handle_count(), memory_bytes: process.memory_bytes(), state, completion, completion_valid };
 	write_user(buf_ptr, out);
 	1
 }

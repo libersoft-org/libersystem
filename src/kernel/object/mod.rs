@@ -17,6 +17,7 @@ pub mod handle;
 pub mod interrupt;
 pub mod memory_object;
 pub mod process;
+pub mod process_group;
 pub mod rights;
 pub mod thread;
 pub mod timer;
@@ -46,6 +47,7 @@ pub enum ObjectType {
 	Interrupt,
 	DeviceMemory,
 	DmaBuffer,
+	ProcessGroup,
 }
 
 impl ObjectType {
@@ -63,6 +65,7 @@ impl ObjectType {
 			ObjectType::Interrupt => "Interrupt",
 			ObjectType::DeviceMemory => "DeviceMemory",
 			ObjectType::DmaBuffer => "DmaBuffer",
+			ObjectType::ProcessGroup => "ProcessGroup",
 		}
 	}
 
@@ -81,6 +84,7 @@ impl ObjectType {
 			ObjectType::Interrupt => 8,
 			ObjectType::DeviceMemory => 9,
 			ObjectType::DmaBuffer => 10,
+			ObjectType::ProcessGroup => 11,
 		}
 	}
 }

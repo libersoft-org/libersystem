@@ -50,6 +50,19 @@ pub struct Process {
 	// becomes waitable on - the kernel's equivalent of a process-terminated signal,
 	// so a holder of the handle can wait for the process to finish instead of polling.
 	exited: AtomicBool,
+	// The status a clean exit reported, latched by the FIRST thread to call SYS_USER_EXIT.
+	//
+	// `killed` and `exited` already say HOW a process ended - a fault or kill against a clean
+	// exit - and what was missing was the value a clean exit carries. Without it a waiter can
+	// see that a program finished but not whether it succeeded, so `pipefail`, a shell's `$?`
+	// and any success-gated step have to infer success from mere closure, which is the failure
+	// this exists to remove: a program that ran and refused is indistinguishable from one that
+	// worked.
+	//
+	// First writer wins, for the same reason the fault does: a multi-threaded process where two
+	// threads exit differently has one answer, and it is the one that arrived first.
+	exit_status: AtomicU64,
+	exit_status_set: AtomicBool,
 	// Physical frames backing this process's user image and stack. The address
 	// space frees only its page-table structure, not the leaf frames its entries
 	// point at, so the Process owns those frames and frees them on drop. Empty for
@@ -96,7 +109,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -179,6 +192,22 @@ impl Process {
 
 	// Record the fault that is terminating this process. The first fault wins:
 	// once set it is not overwritten, so the original cause is preserved.
+	// Latch the status a clean exit reported. First writer wins; later callers are ignored
+	// rather than overwriting, so the answer a waiter reads never changes once it exists.
+	pub fn set_exit_status(&self, status: u64) {
+		if !self.exit_status_set.swap(true, Ordering::AcqRel) {
+			self.exit_status.store(status, Ordering::Release);
+		}
+	}
+
+	// The status a clean exit reported, or None if this process never reported one - which is
+	// every process that faulted, was killed, or is still running. A caller that needs to tell
+	// "succeeded" from "never got to say" must distinguish those, which is why this is an
+	// Option rather than a 0 that means both.
+	pub fn exit_status(&self) -> Option<u64> {
+		self.exit_status_set.load(Ordering::Acquire).then(|| self.exit_status.load(Ordering::Acquire))
+	}
+
 	pub fn set_fault(&self, info: FaultInfo) {
 		let mut slot = self.fault.lock();
 		if slot.is_none() {
