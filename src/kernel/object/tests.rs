@@ -104,6 +104,32 @@ fn handle_refcount_lifetime() {
 	assert_eq!(Arc::strong_count(&obj), 1);
 }
 
+crate::tagged_test!(a_message_carries_several_capabilities, [Object, Kernel, Syscall, Channel]);
+fn a_message_carries_several_capabilities() {
+	use super::channel::{Channel, Message};
+	use super::event::Event;
+
+	// A message moved exactly one capability at every layer - the syscall built a one-element
+	// vector, and the generated transport had one slot - so an interface op could not hand over
+	// two however it was written. A pipeline stage needs its stdin AND its stdout, which is
+	// what found this.
+	let (sender, receiver) = Channel::create();
+	let first = Event::create();
+	let second = Event::create();
+	let (first_koid, second_koid) = (first.header().koid(), second.header().koid());
+
+	let caps = alloc::vec![super::handle::Capability::new(first as Arc<dyn KernelObject>, Rights::ALL, 0), super::handle::Capability::new(second as Arc<dyn KernelObject>, Rights::ALL, 0),];
+	sender.send(Message::new(b"two".to_vec(), caps, 0)).expect("a two-capability message sends");
+
+	let message = receiver.recv().expect("it arrives");
+	assert_eq!(message.caps.len(), 2, "both capabilities survive the queue");
+
+	// Identity, not just count: a transport that delivered the same capability twice, or
+	// swapped their order, would pass a count check and wire a stage to the wrong end.
+	assert_eq!(message.caps[0].object().header().koid(), first_koid, "the first capability is the first one sent");
+	assert_eq!(message.caps[1].object().header().koid(), second_koid, "the second is the second, in order");
+}
+
 crate::tagged_test!(a_prepared_thread_does_not_run_until_released, [Object, Kernel, Process]);
 fn a_prepared_thread_does_not_run_until_released() {
 	use super::event::Event;

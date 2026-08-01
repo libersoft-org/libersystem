@@ -1456,6 +1456,41 @@ pub unsafe fn process_group_signal(group: u64, signal: u64) -> i64 {
 	unsafe { syscall(SYS_PROCESS_GROUP_SIGNAL, group, signal, 0, 0) as i64 }
 }
 
+// Send a message transferring SEVERAL capabilities at once. The ordinary `send_blocking` moves
+// exactly one, which is what stopped an interface op from handing over two - a pipeline stage
+// needs its stdin AND its stdout, and no amount of interface design works around a transport
+// that carries one.
+//
+// All or nothing: every handle is checked before anything is sent, so a list with one bad entry
+// moves none of them. A partial transfer would leave the sender holding some of what it meant
+// to give away and the receiver wired to half a graph.
+pub unsafe fn send_caps(channel: u64, bytes: &[u8], handles: &[u64]) -> i64 {
+	if handles.is_empty() || handles.len() > MAX_MESSAGE_CAPS {
+		return ERR_INVALID;
+	}
+	let mut packed = [0u64; MAX_MESSAGE_CAPS + 1];
+	packed[0] = handles.len() as u64;
+	packed[1..=handles.len()].copy_from_slice(handles);
+	unsafe { syscall(SYS_CHANNEL_SEND_CAPS, channel, bytes.as_ptr() as u64, bytes.len() as u64, packed.as_ptr() as u64) as i64 }
+}
+
+// Receive one message and take every capability it carried, writing them into `handles` and
+// returning (bytes, count). The ordinary receive takes the first and drops the rest, which is
+// right for a receiver expecting one and silent loss for a receiver expecting more.
+//
+// Named apart from `recv_caps`, which drains a whole bootstrap sequence of named
+// single-capability messages - a different thing that happens to be about capabilities too.
+pub unsafe fn recv_message_caps(channel: u64, buf: &mut [u8], handles: &mut [u64; MAX_MESSAGE_CAPS]) -> (i64, usize) {
+	let mut packed = [0u64; MAX_MESSAGE_CAPS + 1];
+	let len = unsafe { syscall(SYS_CHANNEL_RECV_CAPS, channel, buf.as_mut_ptr() as u64, buf.len() as u64, packed.as_mut_ptr() as u64) as i64 };
+	if len < 0 {
+		return (len, 0);
+	}
+	let count = (packed[0] as usize).min(MAX_MESSAGE_CAPS);
+	handles[..count].copy_from_slice(&packed[1..=count]);
+	(len, count)
+}
+
 // Acknowledge a serviced device interrupt, re-arming its source so the next `wait`
 // on the Interrupt handle blocks until the device interrupts again.
 pub unsafe fn interrupt_ack(handle: u64) {

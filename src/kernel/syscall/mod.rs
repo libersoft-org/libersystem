@@ -312,6 +312,12 @@ fn current_typed<T: KernelObject>(handle: u64, ty: ObjectType, rights: Rights) -
 // (arch::paging::user_access): under SMAP a plain kernel store to a user page
 // faults, so every copy-out goes through here. The caller has already validated
 // the pointer with user_buf_ok.
+fn read_user<T>(ptr: u64) -> T {
+	let mut value = core::mem::MaybeUninit::<T>::uninit();
+	arch::paging::user_access(|| unsafe { value.write((ptr as *const T).read_unaligned()) });
+	unsafe { value.assume_init() }
+}
+
 fn write_user<T>(ptr: u64, value: T) {
 	arch::paging::user_access(|| unsafe { (ptr as *mut T).write_unaligned(value) });
 }
@@ -363,6 +369,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_CHANNEL_CREATE => sys_channel_create(a0, a1, a2),
 		SYS_CHANNEL_SEND => sys_channel_send(a0, a1, a2, a3),
 		SYS_CHANNEL_RECV => sys_channel_recv(a0, a1, a2, a3),
+		SYS_CHANNEL_SEND_CAPS => sys_channel_send_caps(a0, a1, a2, a3),
+		SYS_CHANNEL_RECV_CAPS => sys_channel_recv_caps(a0, a1, a2, a3),
 		SYS_EVENT_CREATE => sys_event_create(),
 		SYS_EVENT_SIGNAL => sys_event_signal(a0),
 		SYS_EVENT_POLL => sys_event_poll(a0),
@@ -1400,6 +1408,113 @@ fn sys_channel_peek(ch: u64) -> i64 {
 // Receive a message: copy up to `bytes_cap` payload bytes to `bytes_ptr` and, if
 // the message carried a transferred capability, install it and write the new
 // handle to *out_handle_ptr (0 if none). Returns the payload byte count.
+// Send a message transferring SEVERAL capabilities. `caps_ptr` points at
+// `[count, handle0, ...]`; the count travels with the list because the four argument registers
+// are already spent on the channel, the buffer and its length.
+//
+// Every handle is looked up and every one must carry TRANSFER before anything is sent, so a
+// list with one bad entry moves nothing - a partially transferred set would leave the sender
+// holding some of what it meant to give away and the receiver wired to half a graph.
+fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64) -> i64 {
+	let thread = current_thread!();
+	if !user_buf_ok(bytes_ptr, bytes_len) || !user_buf_ok(caps_ptr, 8) {
+		return ERR_INVALID;
+	}
+	let count = read_user::<u64>(caps_ptr) as usize;
+	if count == 0 || count > abi::MAX_MESSAGE_CAPS {
+		return ERR_INVALID;
+	}
+	if !user_buf_ok(caps_ptr, ((count + 1) * 8) as u64) {
+		return ERR_INVALID;
+	}
+	let mut raw = [0u64; abi::MAX_MESSAGE_CAPS];
+	for (index, slot) in raw.iter_mut().take(count).enumerate() {
+		*slot = read_user::<u64>(caps_ptr + ((index + 1) * 8) as u64);
+	}
+
+	let channel = match current_typed::<Channel>(ch, ObjectType::Channel, Rights::SEND) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	let mut bytes = alloc::vec![0u8; bytes_len as usize];
+	arch::paging::user_access(|| unsafe {
+		core::ptr::copy_nonoverlapping(bytes_ptr as *const u8, bytes.as_mut_ptr(), bytes_len as usize);
+	});
+	let badge = thread.handles().lock().badge_of(Handle::from_raw(ch)).unwrap_or(0);
+
+	// Build every capability first, so a refusal costs nothing.
+	let mut caps = Vec::with_capacity(count);
+	{
+		let table = thread.handles().lock();
+		for &handle in raw.iter().take(count) {
+			let object = match table.lookup(Handle::from_raw(handle), Rights::TRANSFER) {
+				Ok(o) => o,
+				Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+				Err(_) => return ERR_BAD_HANDLE,
+			};
+			let rights = table.rights_of(Handle::from_raw(handle)).unwrap_or(Rights::NONE);
+			let cap_badge = table.badge_of(Handle::from_raw(handle)).unwrap_or(0);
+			caps.push(Capability::new(object, rights, cap_badge));
+		}
+	}
+	match channel.send_charged(Message::new(bytes, caps, badge), thread.domain()) {
+		Ok(()) => {
+			// Delivered: only now do the sender's handles go away, and all of them together.
+			let mut table = thread.handles().lock();
+			for &handle in raw.iter().take(count) {
+				let _ = table.close(Handle::from_raw(handle));
+			}
+			thread.process().record_send();
+			0
+		}
+		Err(ChannelError::PeerClosed) => ERR_PEER_CLOSED,
+		Err(_) => ERR_WOULD_BLOCK,
+	}
+}
+
+// Receive a message and take EVERY capability it carried. `caps_ptr` is written as
+// `[count, handle0, ...]`. The ordinary `sys_channel_recv` takes the first and drops the rest,
+// which is right for a receiver expecting one and silent loss for a receiver expecting more.
+fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64) -> i64 {
+	let thread = current_thread!();
+	if !user_buf_ok(bytes_ptr, bytes_cap) || !user_buf_ok(caps_ptr, ((abi::MAX_MESSAGE_CAPS + 1) * 8) as u64) {
+		return ERR_INVALID;
+	}
+	let channel = match current_typed::<Channel>(ch, ObjectType::Channel, Rights::RECEIVE) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	let message = match channel.recv() {
+		Ok(m) => m,
+		Err(ChannelError::PeerClosed) => return ERR_PEER_CLOSED,
+		Err(_) => return ERR_WOULD_BLOCK,
+	};
+	if message.bytes.len() > bytes_cap as usize {
+		return ERR_INVALID;
+	}
+	arch::paging::user_access(|| unsafe {
+		core::ptr::copy_nonoverlapping(message.bytes.as_ptr(), bytes_ptr as *mut u8, message.bytes.len());
+	});
+	let mut installed = 0usize;
+	{
+		let mut table = thread.handles().lock();
+		for cap in message.caps.into_iter().take(abi::MAX_MESSAGE_CAPS) {
+			match table.try_insert(cap) {
+				Some(handle) => {
+					write_user(caps_ptr + ((installed + 1) * 8) as u64, handle.raw());
+					installed += 1;
+				}
+				// The table is full: stop rather than lose the rest silently. What was
+				// installed is reported, and the caller sees fewer than it expected.
+				None => break,
+			}
+		}
+	}
+	write_user(caps_ptr, installed as u64);
+	thread.process().record_recv();
+	message.bytes.len() as i64
+}
+
 fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64) -> i64 {
 	let thread = current_thread!();
 	if !user_buf_ok(bytes_ptr, bytes_cap) || (out_handle_ptr != 0 && !user_buf_ok(out_handle_ptr, 8)) {

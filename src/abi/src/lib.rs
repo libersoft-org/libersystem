@@ -188,6 +188,22 @@ pub const SYS_BOOT_PROFILE: u64 = 64;
 // Membership is fixed at creation and cannot be joined, and authority to signal comes from
 // holding the group handle with RIGHT_MANAGE - being a member grants nothing, so one stage
 // cannot signal its siblings.
+// Send and receive a message carrying SEVERAL transferred capabilities. The ordinary
+// `SYS_CHANNEL_SEND` / `SYS_CHANNEL_RECV` move exactly one, which is what stopped an interface
+// op from handing over two - a pipeline stage needs its stdin AND its stdout, and there was no
+// way to express that however the interface was written.
+//
+// Separate syscalls rather than widened ones: the single-capability path is what every one of
+// the hundred-odd call sites in the tree uses, and it already fills all four argument
+// registers. `caps_ptr` points at `[count, handle0, handle1, ...]`, so the count travels with
+// the list instead of needing a fifth argument.
+pub const SYS_CHANNEL_SEND_CAPS: u64 = 67;
+pub const SYS_CHANNEL_RECV_CAPS: u64 = 68;
+
+// The most capabilities one message may carry: stdin, stdout, stderr and one spare. Bounded
+// like everything else here, so a sender cannot make the receiver allocate by asking.
+pub const MAX_MESSAGE_CAPS: usize = 4;
+
 pub const SYS_PROCESS_GROUP_CREATE: u64 = 65;
 pub const SYS_PROCESS_GROUP_SIGNAL: u64 = 66;
 // Actions for SYS_SYSTEM_POWER.
