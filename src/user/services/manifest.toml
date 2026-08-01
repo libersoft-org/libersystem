@@ -3,9 +3,52 @@
 # canonicalization, cross-reference validation, graph bounds, and machine projections.
 schema = 1
 
+# The boot chain: what an ISO or IMG must contain to start at all. Named here because this
+# manifest is the final assembly of the whole system - the image builder should read what goes
+# into an image, not carry its own hard-coded list.
+#
+# The kernel does NOT contain the userspace. The init package is a separate boot module the
+# loader hands to the kernel, which is why it is an artifact in its own right rather than a
+# property of the kernel: the kernel binary is independent, and only packaging joins them.
+
+[[boot_artifacts]]
+name = "kernel"
+owner = "kernel"
+kind = "kernel"
+destination = "kernel"
+
+[[boot_artifacts]]
+name = "loader"
+owner = "loader"
+kind = "loader"
+destination = "EFI/BOOT/BOOTX64.EFI"
+
+[[boot_artifacts]]
+name = "init-package"
+owner = "services"
+kind = "init-package"
+destination = "init.pkg"
+
+[[boot_artifacts]]
+name = "volume-package"
+owner = "services"
+kind = "volume-package"
+destination = "volume.pkg"
+
 [[sources]]
 owner = "adpcm"
 path = "user/libs/audio/adpcm"
+
+# The boot chain's own crates. They build no userspace program and stage nothing onto a
+# volume, but their artifacts are named above, so their sources have to resolve like any
+# other owner.
+[[sources]]
+owner = "kernel"
+path = "kernel"
+
+[[sources]]
+owner = "loader"
+path = "loader"
 
 [[sources]]
 owner = "aiff"

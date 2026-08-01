@@ -71,6 +71,30 @@ stage_kernel() {
 	echo "$out"
 }
 
+# Check every boot artifact the manifest names against what is actually on disk. The manifest is
+# the single statement of what an image contains; this is how packaging enforces it rather than
+# restating the list. Packaging compiles nothing - it verifies and assembles - so a missing
+# artifact is an error here, unlike the compile phase where a missing optional library warns and
+# the build carries on.
+verify_boot_artifacts() {
+	local staged_kernel="$1"
+	local kind name destination source missing=0
+	while read -r kind name destination; do
+		[[ -n "$kind" ]] || continue
+		case "$kind" in
+		kernel) source="$staged_kernel" ;;
+		loader) source="$LOADER_EFI" ;;
+		init-package | volume-package) source="$BUILD/$destination" ;;
+		*) die "manifest names boot artifact kind '$kind', which this image builder cannot stage" ;;
+		esac
+		if [[ ! -f "$source" ]]; then
+			echo "mkimage: missing $kind '$name': $source" >&2
+			missing=1
+		fi
+	done < <(cd "$REPO_ROOT/src/tools/system-manifest" && cargo run --quiet -- boot-artifacts)
+	((missing == 0)) || die "packaging needs every artifact built first - run 'just build'"
+}
+
 # build a hybrid ISO (BIOS El Torito + UEFI), bootable as a CD or off a USB stick
 # build a UEFI-only ISO, bootable as a CD or off a USB stick
 make_iso() {
@@ -80,9 +104,7 @@ make_iso() {
 
 	local staged
 	staged="$(stage_kernel "$kernel")"
-	[[ -f "$LOADER_EFI" ]] || die "loader EFI not found: $LOADER_EFI (build the loader first)"
-	[[ -f "$BUILD/$INIT_PACKAGE" ]] || die "init package not found: $BUILD/$INIT_PACKAGE (build the kernel first)"
-	[[ -f "$BUILD/$VOLUME_PACKAGE" ]] || die "volume package not found: $BUILD/$VOLUME_PACKAGE (build the kernel first)"
+	verify_boot_artifacts "$staged"
 
 	# The FAT El Torito boot image. OVMF has no ISO9660 driver, so everything the
 	# loader reads (the kernel and the packages) must live on this FAT filesystem -
@@ -144,9 +166,7 @@ make_img() {
 
 	local staged
 	staged="$(stage_kernel "$kernel")"
-	[[ -f "$LOADER_EFI" ]] || die "loader EFI not found: $LOADER_EFI (build the loader first)"
-	[[ -f "$BUILD/$INIT_PACKAGE" ]] || die "init package not found: $BUILD/$INIT_PACKAGE (build the kernel first)"
-	[[ -f "$BUILD/$VOLUME_PACKAGE" ]] || die "volume package not found: $BUILD/$VOLUME_PACKAGE (build the kernel first)"
+	verify_boot_artifacts "$staged"
 
 	mformat -i "$esp" ::
 	mmd -i "$esp" ::/EFI ::/EFI/BOOT
@@ -188,9 +208,10 @@ img)
 *) die "unknown subcommand '$cmd' (expected 'iso' or 'img')" ;;
 esac
 
-[[ -f "$LOADER_EFI" ]] || die "loader EFI not found: $LOADER_EFI (build the loader first)"
-[[ -f "$BUILD/$INIT_PACKAGE" ]] || die "init package not found: $BUILD/$INIT_PACKAGE (build the kernel first)"
-[[ -f "$BUILD/$VOLUME_PACKAGE" ]] || die "volume package not found: $BUILD/$VOLUME_PACKAGE (build the kernel first)"
+# The same manifest-driven check as the image builders below, run before the cache key is
+# computed - hashing inputs that do not all exist would cache a decision made on a partial tree.
+# The kernel is checked here as the ELF it was given; the builders re-check the stripped copy.
+verify_boot_artifacts "$kernel"
 key_file="$output.build-key"
 key="$({
 	printf 'format=liber-boot-image-input-v1\n'

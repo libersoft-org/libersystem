@@ -245,6 +245,16 @@ uninterpreted `owner_tag` for it since it was written.
 
 - [ ] [M0136 - Identity: accounts, authentication and per-user authority](M0136.md)
 
+### Build layering
+
+The build produces a working system only when driven through `just`, and nothing says so. A
+kernel built alone succeeds while its init package is silently incomplete, and an application
+cannot be built alone at all. M0137 separates compilation from packaging and makes the manifest
+describe the whole final assembly, so a build that cannot produce a bootable system says so
+rather than producing something that resembles one.
+
+- [ ] [M0137 - Build layering: compile, then package](M0137.md)
+
 ### Definition of done (phase 2)
 
 Done when the capability-scoped appliance provides networking, wall-clock time,

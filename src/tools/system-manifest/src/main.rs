@@ -44,6 +44,22 @@ fn run() -> Result<(), String> {
 				println!("{}", program.name);
 			}
 		}
+		// The boot chain, as `<kind> <name> <destination>` lines. `mkimage.sh` consumes this
+		// instead of restating the same paths itself: what lands in an image is decided in the
+		// manifest, and a second copy of that list is a second thing to forget to update.
+		"boot-artifacts" => {
+			for artifact in manifest.boot_artifacts.values() {
+				// Spelled as the manifest spells it: `Debug` lowercased would turn InitPackage
+				// into `initpackage`, which is not the name anyone writes or greps for.
+				let kind = match artifact.kind {
+					system_manifest::BootArtifactKind::Kernel => "kernel",
+					system_manifest::BootArtifactKind::Loader => "loader",
+					system_manifest::BootArtifactKind::InitPackage => "init-package",
+					system_manifest::BootArtifactKind::VolumePackage => "volume-package",
+				};
+				println!("{kind} {} {}", artifact.name, artifact.destination.as_str());
+			}
+		}
 		"libraries" => {
 			for library in manifest.libraries.values() {
 				println!("{}", library.name);

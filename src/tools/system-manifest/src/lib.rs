@@ -24,6 +24,8 @@ struct RawManifest {
 	services: Vec<RawService>,
 	#[serde(default)]
 	libraries: Vec<RawLibrary>,
+	#[serde(default)]
+	boot_artifacts: Vec<RawBootArtifact>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -90,6 +92,43 @@ struct RawLibrary {
 	features: Vec<String>,
 	#[serde(default)]
 	providers: Vec<String>,
+}
+
+// The pieces of the boot chain: the kernel and the UEFI loader. They are not userspace
+// programs - nothing stages them onto a volume and no service supervises them - but the
+// manifest is the final assembly of the whole system, so what goes into an ISO or IMG has to
+// be named here rather than hard-coded in the image builder.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawBootArtifact {
+	name: String,
+	owner: String,
+	kind: BootArtifactKind,
+	destination: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BootArtifactKind {
+	// The kernel ELF the loader hands control to.
+	Kernel,
+	// The UEFI application the firmware starts, staged as BOOTX64.EFI (or its per-target name).
+	Loader,
+	// The init package: the pinned userspace set, handed to the kernel as a boot module rather
+	// than linked into it. Named here because packaging must fail when it is missing, and
+	// because the kernel binary genuinely does not contain it.
+	InitPackage,
+	// The volume package: everything staged onto the system volume rather than pinned into the
+	// boot module - the programs this manifest marks `stage = "volume"`.
+	VolumePackage,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BootArtifact {
+	pub name: Name,
+	pub owner: Name,
+	pub kind: BootArtifactKind,
+	pub destination: RelativePath,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -217,6 +256,7 @@ pub struct Manifest {
 	pub runtime_paths: BTreeMap<Name, RuntimePath>,
 	pub services: BTreeMap<Name, Service>,
 	pub libraries: BTreeMap<Name, Library>,
+	pub boot_artifacts: BTreeMap<Name, BootArtifact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -412,6 +452,37 @@ impl Manifest {
 			}
 		}
 
+		// The boot chain. Each kind may appear exactly once: two kernels or two loaders in one
+		// image is not a configuration, it is a mistake, and the image builder would silently
+		// pick whichever it saw last.
+		let mut boot_artifacts = BTreeMap::new();
+		let mut boot_kinds: BTreeMap<String, Name> = BTreeMap::new();
+		for raw_artifact in raw.boot_artifacts {
+			let location = format!("boot_artifacts.{}", raw_artifact.name);
+			let Some(name) = validate_name(&raw_artifact.name, &format!("{location}.name"), &mut errors) else { continue };
+			let Some(owner) = validate_name(&raw_artifact.owner, &format!("{location}.owner"), &mut errors) else { continue };
+			let Some(destination) = validate_relative_path(&raw_artifact.destination, &format!("{location}.destination"), &mut errors) else { continue };
+			if !sources.contains_key(&owner) {
+				push_error(&mut errors, format!("{location}.owner"), format!("unknown source owner {owner}"));
+			}
+			let kind_label = format!("{:?}", raw_artifact.kind);
+			if let Some(previous) = boot_kinds.insert(kind_label.clone(), name.clone()) {
+				push_error(&mut errors, format!("{location}.kind"), format!("{kind_label} is already provided by {previous}"));
+			}
+			if !destinations.insert(destination.clone()) {
+				push_error(&mut errors, format!("{location}.destination"), "duplicate staged destination");
+			}
+			if boot_artifacts.insert(name.clone(), BootArtifact { name, owner, kind: raw_artifact.kind, destination }).is_some() {
+				push_error(&mut errors, format!("{location}.name"), "duplicate boot artifact name");
+			}
+		}
+		// An image without a kernel or without a loader does not boot, so their absence is an
+		// error here rather than a discovery at packaging time.
+		for required in ["Kernel", "Loader", "InitPackage", "VolumePackage"] {
+			if !boot_kinds.contains_key(required) {
+				push_error(&mut errors, "boot_artifacts", format!("no artifact provides {required}"));
+			}
+		}
 		validate_references(&libraries, &programs, &services, &mut errors);
 		validate_graph("libraries", &libraries, |library| &library.providers, MAX_PROVIDER_DEPTH, MAX_PROVIDER_MODULES, &mut errors);
 		validate_graph("services", &services, |service| &service.dependencies, usize::MAX, usize::MAX, &mut errors);
@@ -428,7 +499,7 @@ impl Manifest {
 		if !errors.is_empty() {
 			return Err(LoadError::Validation(errors));
 		}
-		Ok(Self { schema: raw.schema, sources, programs, factory_files, runtime_paths, services, libraries })
+		Ok(Self { schema: raw.schema, sources, programs, factory_files, runtime_paths, services, libraries, boot_artifacts })
 	}
 
 	pub fn source_path(&self, owner: &str) -> Option<&str> {
