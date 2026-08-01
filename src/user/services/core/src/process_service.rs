@@ -358,7 +358,7 @@ struct Processes<'a> {
 	//
 	// A token left here is a process that never runs, which is what an abandoned transaction
 	// should leave behind: harmless, and reaped with everything else.
-	prepared: Vec<(u64, u64)>,
+	prepared: Vec<(u64, Spawned)>,
 }
 
 // One launched process, and the handle that lets this service find out whether it is still
@@ -469,40 +469,37 @@ impl<'a> Processes<'a> {
 		}
 	}
 
-	unsafe fn spawn_program(&mut self, name: &str, bootstrap: u64, domain: u64) -> Option<(i64, String)> {
+	unsafe fn spawn_program(&mut self, name: &str, bootstrap: u64, domain: u64) -> Option<(Spawned, String)> {
 		unsafe {
 			if let Some((path, basename)) = executable::explicit_path(name) {
 				if self.storage == 0 {
 					return None;
 				}
 				let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
-				let handle = spawn_from_path(self.storage, registry, path, basename, bootstrap, domain)?;
-				if handle < 0 {
-					return None;
-				}
-				name_process(handle, basename);
-				return Some((handle, String::from(basename)));
+				let spawned = spawn_from_path(self.storage, registry, path, basename, bootstrap, domain)?;
+				name_process(spawned.process, basename);
+				return Some((spawned, String::from(basename)));
 			}
 			let registry: u64 = if self.registry_ready() { self.registry } else { 0 };
 			for artifact in executable::launch_candidates(name)? {
-				let handle = if self.storage != 0 {
+				let spawned = if self.storage != 0 {
 					let logical_name = executable::logical_name(&artifact)?;
 					let path = program_path(logical_name)?;
 					match spawn_from_path(self.storage, registry, path, &artifact, bootstrap, domain) {
-						Some(handle) => handle,
+						Some(spawned) => spawned,
 						None => continue,
 					}
 				} else {
 					match self.package.lookup(artifact.as_bytes()) {
-						Some(elf) => spawn_program_bytes(self.storage, 0, elf, None, bootstrap, domain),
+						Some(elf) => match spawn_program_bytes(self.storage, 0, elf, None, bootstrap, domain) {
+							Some(spawned) => spawned,
+							None => continue,
+						},
 						None => continue,
 					}
 				};
-				if handle < 0 {
-					continue;
-				}
-				name_process(handle, &artifact);
-				return Some((handle, artifact));
+				name_process(spawned.process, &artifact);
+				return Some((spawned, artifact));
 			}
 			None
 		}
@@ -515,15 +512,15 @@ impl<'a> Processes<'a> {
 // place their name is known. Best effort by design - a process that could not be labelled is
 // still a process, and refusing the launch over a label would trade a working system for a
 // better log message.
-fn name_process(handle: i64, artifact: &str) {
-	unsafe { set_object_name(handle as u64, artifact) };
+fn name_process(handle: u64, artifact: &str) {
+	unsafe { set_object_name(handle, artifact) };
 }
 
 // Read one exact `.lsexe` path through the storage client, map its shared buffer,
 // create a process from the mapped ELF image, then release the mapping. Returns the new
 // process handle. None means the named artifact was absent; a present but invalid
 // artifact returns a negative handle so resolution never falls through to another name.
-unsafe fn spawn_from_path(storage: u64, mut registry: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<i64> {
+unsafe fn spawn_from_path(storage: u64, mut registry: u64, path: &str, artifact: &str, bootstrap: u64, domain: u64) -> Option<Spawned> {
 	unsafe {
 		let logical_name = executable::logical_name(artifact)?;
 		// Ask the development registry first. It answers with a generation of exactly this
@@ -537,10 +534,10 @@ unsafe fn spawn_from_path(storage: u64, mut registry: u64, path: &str, artifact:
 		// because a running process has already resolved against a provider, and nothing has
 		// resolved against a program that has not started yet.
 		if let Some(shadow) = registry_generation(&mut registry, logical_name) {
-			return Some(spawn_program_bytes(storage, registry, &shadow, Some(logical_name), bootstrap, domain));
+			return spawn_program_bytes(storage, registry, &shadow, Some(logical_name), bootstrap, domain);
 		}
 		let main = MappedFile::open(storage, String::from(path))?;
-		Some(spawn_program_bytes(storage, registry, main.bytes(), Some(logical_name), bootstrap, domain))
+		spawn_program_bytes(storage, registry, main.bytes(), Some(logical_name), bootstrap, domain)
 	}
 }
 
@@ -616,51 +613,53 @@ unsafe fn registry_generation(registry: &mut u64, artifact: &str) -> Option<Vec<
 	}
 }
 
-unsafe fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_identity: Option<&str>, bootstrap: u64, domain: u64) -> i64 {
+unsafe fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expected_identity: Option<&str>, bootstrap: u64, domain: u64) -> Option<Spawned> {
 	unsafe {
-		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return -1 };
-		let Some(dynamic) = elf.dynamic_info() else { return -1 };
+		let Some(elf) = bootproto::elf::Elf::parse(bytes) else { return None };
+		let Some(dynamic) = elf.dynamic_info() else { return None };
 		let Some(dynamic) = dynamic else {
 			if expected_identity.is_none() {
-				return spawn_in(bytes, bootstrap, domain);
+				let (process, thread) = spawn_prepared_in(bytes, bootstrap, domain)?;
+				return Some(Spawned { process, thread });
 			}
-			return -1;
+			return None;
 		};
-		let Some(artifact) = expected_identity else { return -1 };
-		let Some(identity) = verify_identity(&elf, "executable", artifact) else { return -1 };
-		let Some(dependencies) = dependencies(&elf, &dynamic) else { return -1 };
+		let Some(artifact) = expected_identity else { return None };
+		let Some(identity) = verify_identity(&elf, "executable", artifact) else { return None };
+		let Some(dependencies) = dependencies(&elf, &dynamic) else { return None };
 		if dependencies.is_empty() {
 			if !identity_matches_dependencies(&identity, &dependencies, &[]) {
-				return -1;
+				return None;
 			}
-			return spawn(bytes, bootstrap);
+			let (process, thread) = spawn_prepared_in(bytes, bootstrap, 0)?;
+			return Some(Spawned { process, thread });
 		}
 		if storage == 0 {
-			return -1;
+			return None;
 		}
 		let mut resolver = Resolver { storage, registry, modules: Vec::new(), visiting: Vec::new() };
 		for dependency in &dependencies {
 			if !resolver.collect(dependency, 0) {
-				return -1;
+				return None;
 			}
 		}
 		if !identity_matches_dependencies(&identity, &dependencies, &resolver.modules) {
-			return -1;
+			return None;
 		}
-		let Some(order) = resolver.order() else { return -1 };
+		let Some(order) = resolver.order() else { return None };
 		let process = process_create(domain);
 		if process < 0 {
-			return process;
+			return None;
 		}
 		let process = process as u64;
 		if !resolver.load(process, &order) {
 			close(process);
-			return -1;
+			return None;
 		}
 		let entry = process_load_main(process, bytes);
 		if entry < 0 {
 			close(process);
-			return entry;
+			return None;
 		}
 		// Prepare rather than start. The decision to run belongs to the caller, because a
 		// pipeline must have every stage loaded and wired before ANY of them executes - an
@@ -670,25 +669,37 @@ unsafe fn spawn_program_bytes(storage: u64, registry: u64, bytes: &[u8], expecte
 		let thread = process_prepare(process, entry as u64, bootstrap);
 		if thread < 0 {
 			close(process);
-			return thread;
+			return None;
 		}
-		PREPARED_THREAD.store(thread as u64, core::sync::atomic::Ordering::Relaxed);
-		process as i64
+		Some(Spawned { process, thread: thread as u64 })
 	}
 }
 
-// The start token of the launch this service most recently prepared.
-//
-// A one-slot handoff rather than a return value, because the spawn path returns a single i64
-// through two layers and five call sites, and widening all of them to carry a second handle
-// would touch the boot chain for a value only the layer directly above uses. Reading it is
-// immediately after the spawn that set it, on the one thread that serves this channel, so the
-// slot is never contended: this service is single-threaded by construction.
-static PREPARED_THREAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// A process that has been loaded but has not run: the process itself, and the token that
+// starts it. The spawn path returns both because both are results of the same operation -
+// carrying the token out of band would leave the two able to disagree about which launch they
+// describe.
+struct Spawned {
+	process: u64,
+	// The prepared first thread. Releasing it runs the program; dropping it leaves a process
+	// that never does, which is what an abandoned transaction should leave behind.
+	thread: u64,
+}
 
-// Take the token of the launch just prepared, leaving the slot empty.
-fn take_prepared_thread() -> u64 {
-	PREPARED_THREAD.swap(0, core::sync::atomic::Ordering::Relaxed)
+impl Spawned {
+	// Run it now. Every ordinary launch does this immediately; only a prepared launch holds
+	// the token back.
+	unsafe fn release(self) -> bool {
+		unsafe { process_release(self.thread) >= 0 }
+	}
+
+	// Abandon it: close both handles, leaving nothing running and nothing leaked.
+	unsafe fn abandon(self) {
+		unsafe {
+			close(self.thread);
+			close(self.process);
+		}
+	}
 }
 
 impl<'a> Service for Processes<'a> {
@@ -696,11 +707,12 @@ impl<'a> Service for Processes<'a> {
 		// spawn with no bootstrap capability (phase 1: started processes run
 		// unattended), then read back the new process's koid and record it. Unlike `launch`
 		// nothing else wants this handle, so it is recorded directly rather than duplicated.
-		let (handle, artifact) = unsafe { self.spawn_program(&name, 0, 0) }.ok_or(Error::NotFound)?;
-		unsafe { process_release(take_prepared_thread()) };
-		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
+		let (spawned, artifact) = unsafe { self.spawn_program(&name, 0, 0) }.ok_or(Error::NotFound)?;
+		let process = spawned.process;
+		unsafe { spawned.release() };
+		let koid: u64 = unsafe { object_info(process) }.map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
-		self.record(info.clone(), handle as u64, 0);
+		self.record(info.clone(), process, 0);
 		Ok(info)
 	}
 
@@ -745,37 +757,34 @@ impl<'a> Service for Processes<'a> {
 		// the new process's bootstrap), then read back the new process's koid. The live
 		// process handle is handed back to the caller for job control - so unlike `start`
 		// we do not close it here; it is transferred out as the reply's handle.
-		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
-		unsafe { process_release(take_prepared_thread()) };
-		let koid: u64 = unsafe { object_info(handle as u64) }.map(|i| i.koid).ok_or(Error::Again)?;
+		let (spawned, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
+		let process = spawned.process;
+		unsafe { spawned.release() };
+		let koid: u64 = unsafe { object_info(process) }.map(|i| i.koid).ok_or(Error::Again)?;
 		let info: ProcessInfo = ProcessInfo { koid, name: artifact };
-		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
+		let observer: i64 = unsafe { duplicate(process, RIGHT_READ) };
 		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, 0);
-		Ok(StartResult { task: handle as u64, info })
+		Ok(StartResult { task: process, info })
 	}
 
 	// Load a program and leave it stopped. Identical to `launch` except that the process has
 	// not begun: the start token stays here and `release` queues it. This is what lets a
 	// pipeline exist whole before it runs - `a | b` needs b's reader installed before a writes.
 	fn launch_prepared(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error> {
-		let (handle, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
-		let token = take_prepared_thread();
-		let koid: u64 = match unsafe { object_info(handle as u64) }.map(|i| i.koid) {
-			Some(koid) => koid,
-			None => {
-				// A prepared launch nobody can identify can never be released, so it would be
-				// a process stopped forever. Drop the token, which leaves a process that never
-				// runs, and report rather than leaking it.
-				unsafe { close(token) };
-				unsafe { close(handle as u64) };
-				return Err(Error::Again);
-			}
+		let (spawned, artifact) = unsafe { self.spawn_program(&name, bootstrap, 0) }.ok_or(Error::NotFound)?;
+		let Some(koid) = (unsafe { object_info(spawned.process) }).map(|i| i.koid) else {
+			// A prepared launch nobody can identify could never be released - a process
+			// stopped forever. Abandoning it closes both handles, so nothing runs and nothing
+			// leaks.
+			unsafe { spawned.abandon() };
+			return Err(Error::Again);
 		};
 		let info = ProcessInfo { koid, name: artifact };
-		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
+		let observer: i64 = unsafe { duplicate(spawned.process, RIGHT_READ) };
 		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, 0);
-		self.prepared.push((koid, token));
-		Ok(StartResult { task: handle as u64, info })
+		let task = spawned.process;
+		self.prepared.push((koid, spawned));
+		Ok(StartResult { task, info })
 	}
 
 	// Start a launch prepared earlier. Returns false when that koid has no pending launch -
@@ -786,8 +795,8 @@ impl<'a> Service for Processes<'a> {
 		let Some(index) = self.prepared.iter().position(|(pending, _)| *pending == koid) else {
 			return Ok(false);
 		};
-		let (_, token) = self.prepared.remove(index);
-		Ok(unsafe { process_release(token) } >= 0)
+		let (_, spawned) = self.prepared.remove(index);
+		Ok(unsafe { spawned.release() })
 	}
 
 	fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
@@ -798,16 +807,17 @@ impl<'a> Service for Processes<'a> {
 		// frees it when the process ends whatever this service does; what the handle changes
 		// is that the freeing waits for the next reap, which is the same bargain the process
 		// handle already makes. A launch that never started keeps nothing.
-		let Some((handle, artifact)) = started else {
+		let Some((spawned, artifact)) = started else {
 			unsafe { close(domain) };
 			return Err(Error::NotFound);
 		};
-		unsafe { process_release(take_prepared_thread()) };
-		let koid = unsafe { object_info(handle as u64) }.map(|info| info.koid).ok_or(Error::Again)?;
+		let process = spawned.process;
+		unsafe { spawned.release() };
+		let koid = unsafe { object_info(process) }.map(|info| info.koid).ok_or(Error::Again)?;
 		let info = ProcessInfo { koid, name: artifact };
-		let observer: i64 = unsafe { duplicate(handle as u64, RIGHT_READ) };
+		let observer: i64 = unsafe { duplicate(process, RIGHT_READ) };
 		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, domain);
-		Ok(StartResult { task: handle as u64, info })
+		Ok(StartResult { task: process, info })
 	}
 }
 

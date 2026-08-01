@@ -1598,21 +1598,41 @@ pub unsafe fn process_release(thread: u64) -> i64 {
 // Process handle, or a negative error.
 pub unsafe fn spawn_in(elf: &[u8], bootstrap: u64, domain: u64) -> i64 {
 	unsafe {
+		let (process, thread) = match spawn_prepared_in(elf, bootstrap, domain) {
+			Some(pair) => pair,
+			None => return -1,
+		};
+		let started = process_release(thread);
+		if started < 0 {
+			close(process);
+			return started;
+		}
+		process as i64
+	}
+}
+
+// Load a static program into a Domain and leave it STOPPED, returning its process and the
+// token that starts it. `spawn_in` is this followed by a release, which keeps the two paths
+// from diverging in how a process is built - the same reason the dynamic loader prepares and
+// lets its caller decide.
+pub unsafe fn spawn_prepared_in(elf: &[u8], bootstrap: u64, domain: u64) -> Option<(u64, u64)> {
+	unsafe {
 		let process = process_create(domain);
 		if process < 0 {
-			return process;
+			return None;
 		}
 		let process = process as u64;
 		let entry = process_load_main(process, elf);
 		if entry < 0 {
 			close(process);
-			return entry;
+			return None;
 		}
-		let started = process_start(process, entry as u64, bootstrap);
-		if started < 0 {
+		let thread = process_prepare(process, entry as u64, bootstrap);
+		if thread < 0 {
 			close(process);
+			return None;
 		}
-		started
+		Some((process, thread as u64))
 	}
 }
 
