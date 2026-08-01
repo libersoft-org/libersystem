@@ -92,13 +92,13 @@ pub trait Sink {
 pub struct SliceWriter<'a> {
 	buf: &'a mut [u8],
 	pos: usize,
-	handle: u64,
-	handle_occupied: bool,
+	handles: [u64; MAX_HANDLES],
+	handle_count: usize,
 }
 
 impl<'a> SliceWriter<'a> {
 	pub fn new(buf: &'a mut [u8]) -> SliceWriter<'a> {
-		SliceWriter { buf, pos: 0, handle: 0, handle_occupied: false }
+		SliceWriter { buf, pos: 0, handles: [0; MAX_HANDLES], handle_count: 0 }
 	}
 
 	// The number of bytes written so far.
@@ -106,21 +106,27 @@ impl<'a> SliceWriter<'a> {
 		self.pos
 	}
 
-	// The out-of-band handle recorded during encoding (0 = none).
+	// The first handle recorded during encoding (0 = none), for the callers that only ever
+	// send one.
 	pub fn handle(&self) -> u64 {
-		self.handle
+		self.handles[0]
+	}
+
+	// Every handle recorded, in encoding order.
+	pub fn handles(&self) -> &[u64] {
+		&self.handles[..self.handle_count]
 	}
 
 	pub fn has_handle(&self) -> bool {
-		self.handle_occupied
+		self.handle_count > 0
 	}
 
 	// Rewind to an empty buffer, dropping anything written and any recorded handle,
 	// so a failed encode can be replaced in place - the dispatch overflow fallback.
 	pub fn reset(&mut self) {
 		self.pos = 0;
-		self.handle = 0;
-		self.handle_occupied = false;
+		self.handles = [0; MAX_HANDLES];
+		self.handle_count = 0;
 	}
 }
 
@@ -131,12 +137,14 @@ impl<'a> Sink for SliceWriter<'a> {
 		Some(())
 	}
 
+	// Append a handle to be transferred with this message. Refuses past the bound rather than
+	// dropping one, because a silently missing capability is a stage wired to nothing.
 	fn set_handle(&mut self, h: u64) -> Option<()> {
-		if self.handle_occupied {
+		if self.handle_count >= MAX_HANDLES {
 			return None;
 		}
-		self.handle = h;
-		self.handle_occupied = true;
+		self.handles[self.handle_count] = h;
+		self.handle_count += 1;
 		Some(())
 	}
 }
@@ -146,18 +154,23 @@ impl<'a> Sink for SliceWriter<'a> {
 #[derive(Default)]
 pub struct VecWriter {
 	buf: Vec<u8>,
-	handle: u64,
-	handle_occupied: bool,
+	handles: [u64; MAX_HANDLES],
+	handle_count: usize,
 }
 
 impl VecWriter {
 	pub fn new() -> VecWriter {
-		VecWriter { buf: Vec::new(), handle: 0, handle_occupied: false }
+		VecWriter { buf: Vec::new(), handles: [0; MAX_HANDLES], handle_count: 0 }
 	}
 
-	// The out-of-band handle recorded during encoding (0 = none).
+	// The first handle recorded during encoding (0 = none).
 	pub fn handle(&self) -> u64 {
-		self.handle
+		self.handles[0]
+	}
+
+	// Every handle recorded, in encoding order.
+	pub fn handles(&self) -> &[u64] {
+		&self.handles[..self.handle_count]
 	}
 
 	// The bytes written so far, consuming the writer.
@@ -173,11 +186,11 @@ impl Sink for VecWriter {
 	}
 
 	fn set_handle(&mut self, h: u64) -> Option<()> {
-		if self.handle_occupied {
+		if self.handle_count >= MAX_HANDLES {
 			return None;
 		}
-		self.handle = h;
-		self.handle_occupied = true;
+		self.handles[self.handle_count] = h;
+		self.handle_count += 1;
 		Some(())
 	}
 }
@@ -195,34 +208,57 @@ pub trait Transport {
 }
 
 // A cursor that reads from a borrowed buffer.
+// The most transferred handles one message carries. The kernel has always allowed a message a
+// list of capabilities - `Message { caps: Vec<Capability> }` - and it was this layer that
+// admitted exactly one, which is what stopped a pipeline stage from being handed its stdin and
+// stdout together. Four is stdin, stdout, stderr and one spare: bounded, because everything
+// here is, and a fixed array keeps this no_std and allocation-free.
+pub const MAX_HANDLES: usize = 4;
+
 pub struct Reader<'a> {
 	buf: &'a [u8],
 	pos: usize,
-	handle: u64,
-	handle_available: bool,
+	handles: [u64; MAX_HANDLES],
+	count: usize,
+	taken: usize,
 }
 
 impl<'a> Reader<'a> {
 	pub fn new(buf: &'a [u8]) -> Reader<'a> {
-		Reader { buf, pos: 0, handle: 0, handle_available: false }
+		Reader { buf, pos: 0, handles: [0; MAX_HANDLES], count: 0, taken: 0 }
 	}
 
-	// A reader for a message that arrived with an out-of-band transferred handle.
+	// A reader for a message that arrived with one out-of-band transferred handle.
 	pub fn with_handle(buf: &'a [u8], handle: u64) -> Reader<'a> {
-		Reader { buf, pos: 0, handle, handle_available: true }
+		Reader::with_handles(buf, &[handle])
 	}
 
-	// The out-of-band handle that arrived with the message (0 = none).
+	// A reader for a message that arrived with several. They are taken in the order the
+	// encoder set them, which is the order the fields appear - so a stage's stdin and stdout
+	// cannot be swapped by a decoder reading them in a different order than they were written.
+	pub fn with_handles(buf: &'a [u8], transferred: &[u64]) -> Reader<'a> {
+		let mut handles = [0u64; MAX_HANDLES];
+		let count = transferred.len().min(MAX_HANDLES);
+		handles[..count].copy_from_slice(&transferred[..count]);
+		Reader { buf, pos: 0, handles, count, taken: 0 }
+	}
+
+	// The next transferred handle, in the order they were encoded. None once they are spent,
+	// which is what a decoder expecting one that was not sent sees.
 	pub fn take_handle(&mut self) -> Option<u64> {
-		if !self.handle_available {
+		if self.taken >= self.count {
 			return None;
 		}
-		self.handle_available = false;
-		Some(self.handle)
+		let handle = self.handles[self.taken];
+		self.taken += 1;
+		Some(handle)
 	}
 
+	// Whether any transferred handle is still unclaimed. A dispatch checks this AFTER decoding
+	// to refuse a message carrying more handles than its signature accounts for - a caller that
+	// sent a capability nothing reads must not have it silently dropped.
 	pub fn has_handle(&self) -> bool {
-		self.handle_available
+		self.taken < self.count
 	}
 
 	// The number of bytes consumed so far.

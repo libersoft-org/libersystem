@@ -526,6 +526,21 @@ pub unsafe fn inherit_stdout(bootstrap: u64) {
 			if len >= 6 && &buf[..6] == b"STDOUT" {
 				set_stdout(handle);
 				set_stdin(handle);
+				// A pipeline stage reads from one channel and writes to another, so a STDIN
+				// message may follow and replace the input half. A terminal launch sends none
+				// and keeps the full-duplex console it was just given.
+				//
+				// It is read only when one is pending rather than blocked for, because every
+				// caller that does not send it would otherwise wait forever - and that is
+				// nearly every launch in the system.
+				if channel_peek(bootstrap) >= 0 {
+					let mut sbuf: [u8; 16] = [0u8; 16];
+					if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut sbuf) {
+						if len >= 5 && &sbuf[..5] == b"STDIN" {
+							set_stdin(handle);
+						}
+					}
+				}
 			}
 		}
 	}
