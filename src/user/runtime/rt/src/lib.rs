@@ -522,26 +522,32 @@ pub fn perf_mark_val(label: &[u8], val: u64) {
 pub unsafe fn inherit_stdout(bootstrap: u64) {
 	unsafe {
 		let mut buf: [u8; 16] = [0u8; 16];
-		if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf) {
-			if len >= 6 && &buf[..6] == b"STDOUT" {
-				set_stdout(handle);
-				set_stdin(handle);
-				// A pipeline stage reads from one channel and writes to another, so a STDIN
-				// message may follow and replace the input half. A terminal launch sends none
-				// and keeps the full-duplex console it was just given.
-				//
-				// It is read only when one is pending rather than blocked for, because every
-				// caller that does not send it would otherwise wait forever - and that is
-				// nearly every launch in the system.
-				if channel_peek(bootstrap) >= 0 {
-					let mut sbuf: [u8; 16] = [0u8; 16];
-					if let Received::Message { len, handle } = recv_blocking(bootstrap, &mut sbuf) {
-						if len >= 5 && &sbuf[..5] == b"STDIN" {
-							set_stdin(handle);
-						}
-					}
-				}
+		let mut handles = [0u64; MAX_MESSAGE_CAPS];
+		// Wait for the STDOUT handoff, then take its capabilities. A pipeline stage reads from
+		// one channel and writes to another, so the launcher puts BOTH halves in this one
+		// message: capability 0 is stdout, and an optional capability 1 replaces the input
+		// half. A terminal launch sends only the first and keeps the full-duplex console.
+		//
+		// Deliberately one message and not two. A receiver cannot tell a second message that
+		// was never sent from the next handoff in the bootstrap sequence, so peeking for one
+		// and taking whatever is pending swallows the caller's next message - which is the
+		// args for nearly every launch in the system, and leaves the program blocked forever
+		// on a sequence that is now off by one. Ordered capabilities inside a single message
+		// carry the same information with no ambiguity at all.
+		loop {
+			let (len, count) = recv_message_caps(bootstrap, &mut buf, &mut handles);
+			if len == ERR_WOULD_BLOCK {
+				wait(bootstrap, 0);
+				continue;
 			}
+			if len < 0 {
+				return;
+			}
+			if len as usize >= 6 && &buf[..6] == b"STDOUT" && count >= 1 {
+				set_stdout(handles[0]);
+				set_stdin(if count >= 2 { handles[1] } else { handles[0] });
+			}
+			return;
 		}
 	}
 }

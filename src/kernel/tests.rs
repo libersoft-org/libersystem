@@ -2405,6 +2405,9 @@ fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, 
 			break;
 		}
 	}
+	if !process.is_terminated() {
+		crate::serial_println!("HANG args={:?} line={:?}", core::str::from_utf8(args), line.as_ref().map(|l| core::str::from_utf8(l)));
+	}
 	assert!(process.is_terminated(), "imgconv harness exits");
 	(line, domain.account().memory().peak())
 }
