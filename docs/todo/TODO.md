@@ -211,7 +211,7 @@ board-specific real-hardware support remains later work.
 - [x] [M0123 - Shared system libraries (dynamic linking)](M0123.md)
 - [ ] [M0124 - Audio player (streaming decoders over AudioService)](M0124.md)
 - [x] [M0125 - Native executable artifacts (`.lsexe`)](M0125.md)
-- [x] [M0126 - Image conversion tool (`imgconv`)](M0126.md)
+- [ ] [M0126 - Image conversion tool (`imgconv`)](M0126.md)
 - [x] [M0127 - Userspace source and system-volume layout cleanup](M0127.md)
 - [ ] [M0128 - Declarative driver binding and lifecycle core](M0128.md)
 - [ ] [M0129 - Universal standards-based driver set](M0129.md)

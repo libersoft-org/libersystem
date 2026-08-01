@@ -104,7 +104,7 @@ fn handle_refcount_lifetime() {
 	assert_eq!(Arc::strong_count(&obj), 1);
 }
 
-crate::tagged_test!(a_message_carries_several_capabilities, [Object, Kernel, Syscall, Channel]);
+crate::tagged_test!(a_message_carries_several_capabilities, [Object, Kernel, Syscall]);
 fn a_message_carries_several_capabilities() {
 	use super::channel::{Channel, Message};
 	use super::event::Event;
