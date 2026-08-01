@@ -165,6 +165,22 @@ pub enum ParseError {
 	// A descriptor this grammar does not implement, so `3>&1` is refused rather than
 	// silently treated as something else.
 	UnsupportedDescriptor,
+	// A builtin that mutates the shell's own state, used anywhere but as a lone foreground
+	// command. `cd x | grep y` would run `cd` in a CHILD whose state dies with it, so the
+	// directory silently does not change - refusing is the only honest answer.
+	BuiltinNotAStage,
+}
+
+// Builtins that mutate the parent shell's persistent state. They are meaningful only in the
+// shell's own process: a pipeline stage, a redirected command and a background job all run
+// somewhere whose state is discarded, so the user's intent cannot be honoured there.
+// `fg`/`bg` are here for the same reason - they act on the shell's job table.
+const STATE_MUTATING_BUILTINS: &[&[u8]] = &[b"cd", b"unset", b"export", b"fg", b"bg"];
+
+// Whether `word` names one. Assignments (`NAME=value`) are caught separately: they carry no
+// command word at all, so they are recognised by shape rather than by name.
+fn mutates_shell_state(word: &[u8]) -> bool {
+	STATE_MUTATING_BUILTINS.contains(&word) || word.iter().position(|b| *b == b'=').is_some_and(|at| at > 0 && word[..at].iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_'))
 }
 
 // One lexed token from the raw line. Operators are distinguishable from words BY CONSTRUCTION:
@@ -356,6 +372,13 @@ pub fn parse_pipeline(raw: &[u8], vars: &[(String, String)]) -> Result<Pipeline,
 		return Err(if stages.is_empty() { ParseError::Empty } else { ParseError::EmptyStage });
 	}
 	stages.push(current);
+	// A state-mutating builtin survives only as a lone foreground command with no redirection,
+	// which is the one place its effect outlives the line. Everywhere else it would run in a
+	// process whose state is thrown away, and reporting success there would be a lie.
+	let lone_foreground = stages.len() == 1 && !background && stages[0].redirects.is_empty();
+	if !lone_foreground && stages.iter().any(|stage| mutates_shell_state(&stage.words[0])) {
+		return Err(ParseError::BuiltinNotAStage);
+	}
 	Ok(Pipeline { stages, background })
 }
 

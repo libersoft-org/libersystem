@@ -144,3 +144,34 @@ fn a_leading_digit_is_only_a_descriptor_before_a_redirect() {
 	assert_eq!(p.stages[0].words, alloc::vec![b"echo".to_vec(), b"2x".to_vec(), b"file2".to_vec()]);
 	assert!(p.stages[0].redirects.is_empty());
 }
+
+#[test]
+fn a_state_mutating_builtin_is_refused_anywhere_its_effect_would_be_discarded() {
+	let none: alloc::vec::Vec<(String, String)> = alloc::vec::Vec::new();
+
+	// The one place it works: a lone foreground command, run by the shell itself.
+	let p = parse_pipeline(b"cd /tmp", &none).expect("a lone cd is the parent shell's own");
+	assert_eq!(p.stages.len(), 1);
+	assert_eq!(p.stages[0].words[0], b"cd".to_vec());
+
+	// As a pipeline stage the builtin would run in a child, so the directory would silently
+	// not change. Refusing beats reporting a success that did not happen.
+	assert_eq!(parse_pipeline(b"cd /tmp | grep x", &none), Err(ParseError::BuiltinNotAStage));
+	assert_eq!(parse_pipeline(b"ls | cd /tmp", &none), Err(ParseError::BuiltinNotAStage));
+	// Backgrounded, its state dies with the job.
+	assert_eq!(parse_pipeline(b"cd /tmp &", &none), Err(ParseError::BuiltinNotAStage));
+	// Redirected, it is no longer the shell's own command either.
+	assert_eq!(parse_pipeline(b"cd /tmp > log", &none), Err(ParseError::BuiltinNotAStage));
+
+	// Assignments are recognised by shape, not by name: they have no command word to match.
+	assert_eq!(parse_pipeline(b"NAME=value | cat", &none), Err(ParseError::BuiltinNotAStage));
+	assert!(parse_pipeline(b"NAME=value", &none).is_ok(), "a lone assignment is the shell's own");
+
+	// A path or flag that merely CONTAINS `=` is not an assignment: refusing it would break
+	// ordinary commands.
+	assert!(parse_pipeline(b"cmd --opt=v | cat", &none).is_ok(), "a flag with `=` is not an assignment");
+	assert!(parse_pipeline(b"=leading | cat", &none).is_ok(), "an empty name is not an assignment");
+
+	// And a command whose name merely starts like one is untouched.
+	assert!(parse_pipeline(b"cdrom x | cat", &none).is_ok(), "`cdrom` is not `cd`");
+}
