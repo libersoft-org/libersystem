@@ -456,7 +456,11 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 		// returned process handle is the manager's job-control handle on the component.
 		let name: String = String::from_utf8_lossy(component).into_owned();
 		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
-		let started: StartResult = match process_client.launch(&name, &child_side) {
+		// PREPARED, not started: the component is built but does not run until every grant
+		// below has been installed. A launch that fails partway is then a process that never
+		// ran at all, rather than one that observed half its capabilities and started work on
+		// the strength of them.
+		let started: StartResult = match process_client.launch_prepared(&name, &child_side) {
 			Some(Ok(started)) => started,
 			_ => {
 				close(manager_side);
@@ -464,9 +468,12 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 			}
 		};
 		let task: u64 = started.task;
+		let koid: u64 = started.info.koid;
 		let policy_name: String = match executable::logical_name(&started.info.name) {
 			Some(name) => String::from(name),
 			None => {
+				// Abandoned rather than released: dropping a prepared launch is how a failed
+				// transaction unwinds, and it leaves nothing that ever ran.
 				close(manager_side);
 				close(task);
 				return None;
@@ -495,6 +502,16 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 				}
 			}
 			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
+		}
+		// Every static grant is installed, so the graph this component can see is complete:
+		// release it. This MUST happen before the receive loop below - the manager waits on
+		// the component there, and waiting on a process that was never started is a hang, not
+		// an error. It is also the transaction's commit point: everything above can fail and
+		// leave nothing running, and nothing below can.
+		if !matches!(process_client.release(&koid), Some(Ok(true))) {
+			close(manager_side);
+			close(task);
+			return None;
 		}
 		// Handle any runtime permission requests, then capture the component's final report. A
 		// request is `REQUEST` + a capability ordinal for a capability outside the manifest;
