@@ -11,6 +11,7 @@ name = "rt"
 version = "0.0.0"
 dependencies = [
  "abi",
+ "wire",
 ]
 
 [[package]]
@@ -19,3 +20,7 @@ version = "0.0.0"
 dependencies = [
  "rt",
 ]
+
+[[package]]
+name = "wire"
+version = "0.0.0"

@@ -167,7 +167,7 @@ impl Cg {
 		}
 		self.line("#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]");
 		self.line("");
-		self.line("use crate::codec::{Reader, Sink, SliceWriter, VecWriter};");
+		self.line("use crate::codec::{Handles, Reader, Sink, SliceWriter, VecWriter};");
 		self.line("use alloc::string::String;");
 		self.line("use alloc::vec::Vec;");
 		self.line("use core::fmt::Write as _;");
@@ -402,8 +402,8 @@ impl Cg {
 		self.line("");
 		let has_non_stream: bool = supported.iter().any(|m| !matches!(&m.ret, Type::Stream(_)));
 		if has_non_stream {
-			self.line("\tpub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {");
-			self.line("\t\tlet mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };");
+			self.line("\tpub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {");
+			self.line("\t\tlet mut reader = Reader::with_handle_list(request, request_handles);");
 			self.line("\t\tlet r = &mut reader;");
 			self.line("\t\tlet op = r.u16()?;");
 			self.line("\t\tlet corr = r.u32()?;");
@@ -422,7 +422,7 @@ impl Cg {
 					args.push(pn);
 				}
 				self.line("\t\t\t\tif r.has_handle() { return None; }");
-				self.line("\t\t\t\t*request_handle = 0;");
+				self.line("\t\t\t\trequest_handles.clear();");
 				self.line(&format!("\t\t\t\tlet result = service.{}({});", field_ident(&m.name), args.join(", ")));
 				let code = self.write_place(&m.ret, "result", false).map_err(|e| Error::new(m.span, e))?;
 				// A result whose error enum carries an `again` case can degrade an
@@ -443,7 +443,7 @@ impl Cg {
 					self.line("\t\t\t\t\tSome(())");
 					self.line("\t\t\t\t})();");
 					self.line("\t\t\t\tif encoded.is_none() {");
-					self.line("\t\t\t\t\tif writer.has_handle() { *reply_handle = writer.handle(); return None; }");
+					self.line("\t\t\t\t\tif writer.has_handle() { *reply_handles = Handles::from_slice(writer.handles()); return None; }");
 					self.line("\t\t\t\t\t// the reply outgrew the caller's buffer: replace it with a typed");
 					self.line("\t\t\t\t\t// error, so the client sees a failure instead of hanging.");
 					self.line("\t\t\t\t\twriter.reset();");
@@ -460,7 +460,7 @@ impl Cg {
 					self.line("\t\t\t\t\tSome(())");
 					self.line("\t\t\t\t})();");
 					self.line("\t\t\t\tif encoded.is_none() {");
-					self.line("\t\t\t\t\tif writer.has_handle() { *reply_handle = writer.handle(); }");
+					self.line("\t\t\t\t\tif writer.has_handle() { *reply_handles = Handles::from_slice(writer.handles()); }");
 					self.line("\t\t\t\t\treturn None;");
 					self.line("\t\t\t\t}");
 				}
@@ -468,13 +468,13 @@ impl Cg {
 			}
 			self.line("\t\t\t_ => return None,");
 			self.line("\t\t}");
-			self.line("\t\t*reply_handle = writer.handle();");
+			self.line("\t\t*reply_handles = Handles::from_slice(writer.handles());");
 			self.line("\t\tSome(writer.pos())");
 			self.line("\t}");
 		} else {
 			// Every op is a stream, served out of band by the `<m>_open` helpers, so there
 			// is nothing to dispatch in band - a trivial body avoids an unreachable match.
-			self.line("\tpub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handle: &mut u64, _out: &mut [u8], _reply_handle: &mut u64) -> Option<usize> {");
+			self.line("\tpub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handles: &mut Handles, _out: &mut [u8], _reply_handles: &mut Handles) -> Option<usize> {");
 			self.line("\t\tNone");
 			self.line("\t}");
 		}
@@ -488,8 +488,8 @@ impl Cg {
 			if let Type::Stream(elem) = &m.ret {
 				let mname = field_ident(&m.name);
 				let et = rust_ty(elem).map_err(|e| Error::new(m.span, e))?;
-				self.line(&format!("\tpub fn {mname}_open<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64) -> Option<(u32, Vec<{et}>)> {{"));
-				self.line("\t\tlet mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };");
+				self.line(&format!("\tpub fn {mname}_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<{et}>)> {{"));
+				self.line("\t\tlet mut reader = Reader::with_handle_list(request, request_handles);");
 				self.line("\t\tlet r = &mut reader;");
 				self.line("\t\tlet _op = r.u16()?;");
 				self.line("\t\tlet corr = r.u32()?;");
@@ -501,7 +501,7 @@ impl Cg {
 					args.push(pn);
 				}
 				self.line("\t\tif r.has_handle() { return None; }");
-				self.line("\t\t*request_handle = 0;");
+				self.line("\t\trequest_handles.clear();");
 				self.line(&format!("\t\tlet items = service.{mname}({});", args.join(", ")));
 				self.line("\t\tSome((corr, items))");
 				self.line("\t}");
@@ -564,16 +564,17 @@ impl Cg {
 					let code = self.write_place(&p.ty, &field_ident(&p.name), true).map_err(|e| Error::new(p.span, e))?;
 					self.line(&format!("\t\t\t{code}"));
 				}
-				self.line("\t\t\tlet request_handle = writer.handle();");
+				self.line("\t\t\tlet request_handles = Handles::from_slice(writer.handles());");
 				self.line("\t\t\tlet request = writer.into_inner();");
-				self.line("\t\t\tlet (reply, reply_handle) = self.transport.call(&request, request_handle)?;");
+				self.line("\t\t\tlet mut reply_handles = Handles::new();");
+				self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;");
 				self.line("\t\t\tlet mut reader = Reader::new(&reply);");
 				self.line("\t\t\tlet r = &mut reader;");
-				self.line("\t\t\tif r.u32()? != corr || reply_handle == 0 {");
-				self.line("\t\t\t\tif reply_handle != 0 { self.transport.discard_handle(reply_handle); }");
+				self.line("\t\t\tif r.u32()? != corr || reply_handles.is_empty() {");
+				self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
 				self.line("\t\t\t\treturn None;");
 				self.line("\t\t\t}");
-				self.line("\t\t\tSome(reply_handle)");
+				self.line("\t\t\tSome(reply_handles.first())");
 				self.line("\t\t}");
 				continue;
 			}
@@ -588,10 +589,11 @@ impl Cg {
 				let code = self.write_place(&p.ty, &field_ident(&p.name), true).map_err(|e| Error::new(p.span, e))?;
 				self.line(&format!("\t\t\t{code}"));
 			}
-			self.line("\t\t\tlet request_handle = writer.handle();");
+			self.line("\t\t\tlet request_handles = Handles::from_slice(writer.handles());");
 			self.line("\t\t\tlet request = writer.into_inner();");
-			self.line("\t\t\tlet (reply, reply_handle) = self.transport.call(&request, request_handle)?;");
-			self.line("\t\t\tlet mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };");
+			self.line("\t\t\tlet mut reply_handles = Handles::new();");
+			self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;");
+			self.line("\t\t\tlet mut reader = Reader::with_handle_list(&reply, &reply_handles);");
 			let retexpr = self.read_value(&m.ret).map_err(|e| Error::new(m.span, e))?;
 			self.line("\t\t\tlet decoded = (|| {");
 			self.line("\t\t\t\tlet r = &mut reader;");
@@ -599,7 +601,7 @@ impl Cg {
 			self.line(&format!("\t\t\t\tSome({retexpr})"));
 			self.line("\t\t\t})();");
 			self.line("\t\t\tif decoded.is_none() || reader.has_handle() {");
-			self.line("\t\t\t\tif reply_handle != 0 { self.transport.discard_handle(reply_handle); }");
+			self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
 			self.line("\t\t\t\treturn None;");
 			self.line("\t\t\t}");
 			self.line("\t\t\tdecoded");

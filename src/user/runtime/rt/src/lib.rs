@@ -976,13 +976,13 @@ pub unsafe fn recv_package(channel: u64, buf: &mut [u8]) -> Option<(u64, &'stati
 // which is how a streaming op that replies out of band opts out of the byte reply.
 pub unsafe fn serve<F>(service: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
 where
-	F: FnMut(&[u8], &mut u64, &mut [u8], &mut u64) -> Option<usize>,
+	F: FnMut(&[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
 	unsafe {
 		loop {
 			match recv_blocking(service, request) {
 				Received::Message { len, .. } if len == 0 => break,
-				Received::Message { len, mut handle } => {
+				Received::Message { len, handle } => {
 					// the reserved heartbeat probe: answer it uniformly without invoking the
 					// typed dispatch, so the supervisor's watchdog can prove this service is
 					// still responsive (a service wedged inside a request never returns here
@@ -991,16 +991,23 @@ where
 						send_blocking(service, b"PONG", 0);
 						continue;
 					}
-					let mut reply_handle: u64 = 0;
-					if let Some(n) = handle_request(&request[..len], &mut handle, reply, &mut reply_handle) {
-						if !send_blocking(service, &reply[..n], reply_handle) && reply_handle != 0 {
-							close(reply_handle);
+					let mut reply_handles = wire::Handles::new();
+					let mut handles = if handle == 0 { wire::Handles::new() } else { wire::Handles::from_slice(&[handle]) };
+					if let Some(n) = handle_request(&request[..len], &mut handles, reply, &mut reply_handles) {
+						if !send_caps_blocking(service, &reply[..n], reply_handles.as_slice()) {
+							for &leftover in reply_handles.as_slice() {
+								close(leftover);
+							}
 						}
-					} else if reply_handle != 0 {
-						close(reply_handle);
+					} else {
+						for &leftover in reply_handles.as_slice() {
+							close(leftover);
+						}
 					}
-					if handle != 0 {
-						close(handle);
+					for &unclaimed in handles.as_slice() {
+						if unclaimed != 0 {
+							close(unclaimed);
+						}
 					}
 				}
 				Received::Closed => break,
@@ -1034,7 +1041,7 @@ where
 // quit sentinel) is dropped from the set; the loop ends when the root closes.
 pub unsafe fn serve_multi<F>(root: u64, request: &mut [u8], reply: &mut [u8], handle_request: F)
 where
-	F: FnMut(u64, &[u8], &mut u64, &mut [u8], &mut u64) -> Option<usize>,
+	F: FnMut(u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
 	unsafe {
 		serve_multi_seeded(root, &[], request, reply, handle_request);
@@ -1048,7 +1055,7 @@ where
 // from the set; only `root` closing ends the service.
 pub unsafe fn serve_multi_seeded<F>(root: u64, seed: &[u64], request: &mut [u8], reply: &mut [u8], handle_request: F)
 where
-	F: FnMut(u64, &[u8], &mut u64, &mut [u8], &mut u64) -> Option<usize>,
+	F: FnMut(u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
 	unsafe {
 		serve_multi_ticked(root, seed, 0, request, reply, handle_request);
@@ -1062,7 +1069,7 @@ where
 // never counts as pending progress for the scheduler's boot driver.
 pub unsafe fn serve_multi_ticked<F>(root: u64, seed: &[u64], period: u64, request: &mut [u8], reply: &mut [u8], mut handle_request: F)
 where
-	F: FnMut(u64, &[u8], &mut u64, &mut [u8], &mut u64) -> Option<usize>,
+	F: FnMut(u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
 {
 	unsafe {
 		let mut chans: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
@@ -1073,9 +1080,9 @@ where
 			if ready < 0 {
 				if ready == ERR_TIMED_OUT && period != 0 {
 					// the housekeeping tick: no channel is ready, let the handler flush.
-					let mut reply_handle: u64 = 0;
-					let mut handle: u64 = 0;
-					let _ = handle_request(0, &[], &mut handle, reply, &mut reply_handle);
+					let mut reply_handles = wire::Handles::new();
+					let mut handles = wire::Handles::new();
+					let _ = handle_request(0, &[], &mut handles, reply, &mut reply_handles);
 				}
 				continue;
 			}
@@ -1090,7 +1097,7 @@ where
 					close(chan);
 					chans.swap_remove(idx);
 				}
-				Received::Message { len, mut handle } => {
+				Received::Message { len, handle } => {
 					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
 						// the reserved heartbeat probe: answer uniformly, like serve (above).
 						send_blocking(chan, b"PONG", 0);
@@ -1106,16 +1113,26 @@ where
 							}
 						}
 					} else {
-						let mut reply_handle: u64 = 0;
-						if let Some(n) = handle_request(chan, &request[..len], &mut handle, reply, &mut reply_handle) {
-							if !send_blocking(chan, &reply[..n], reply_handle) && reply_handle != 0 {
-								close(reply_handle);
+						let mut reply_handles = wire::Handles::new();
+						// The request's capabilities go in as a list and whatever the dispatch
+						// did NOT consume comes back in the same one, so a capability the
+						// schema never accounted for is closed here instead of leaking.
+						let mut handles = if handle == 0 { wire::Handles::new() } else { wire::Handles::from_slice(&[handle]) };
+						if let Some(n) = handle_request(chan, &request[..len], &mut handles, reply, &mut reply_handles) {
+							if !send_caps_blocking(chan, &reply[..n], reply_handles.as_slice()) {
+								for &leftover in reply_handles.as_slice() {
+									close(leftover);
+								}
 							}
-						} else if reply_handle != 0 {
-							close(reply_handle);
+						} else {
+							for &leftover in reply_handles.as_slice() {
+								close(leftover);
+							}
 						}
-						if handle != 0 {
-							close(handle);
+						for &unclaimed in handles.as_slice() {
+							if unclaimed != 0 {
+								close(unclaimed);
+							}
 						}
 					}
 				}
@@ -1495,6 +1512,69 @@ pub unsafe fn recv_message_caps(channel: u64, buf: &mut [u8], handles: &mut [u64
 	let count = (packed[0] as usize).min(MAX_MESSAGE_CAPS);
 	handles[..count].copy_from_slice(&packed[1..=count]);
 	(len, count)
+}
+
+// `send_caps` with the blocking discipline of `send_blocking`: retry while the peer's queue is
+// full, waiting for room rather than spinning. An empty list degrades to the ordinary
+// single-handle send with no handle, so one call site serves both shapes.
+#[unsafe(no_mangle)]
+// Image-internal transport boundary consumed by ipc-client.lslib.
+pub unsafe fn send_caps_blocking(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {
+	unsafe {
+		if handles.is_empty() {
+			return send_blocking(channel, bytes, 0);
+		}
+		loop {
+			let signed = send_caps(channel, bytes, handles);
+			if signed == ERR_WOULD_BLOCK {
+				if wait_writable(channel) < 0 {
+					yield_now();
+				}
+				continue;
+			}
+			return signed == 0;
+		}
+	}
+}
+
+// Deliberately carries only the bytes: the capabilities are written through an out-parameter
+// instead of returned. Returning a `[u64; MAX_MESSAGE_CAPS]` inside the enum makes the return
+// value large enough that aarch64 codegen moves it with a `memcpy` call, and `ipc-client` -
+// this function's caller - is checked against an exact list of runtime imports.
+pub enum ReceivedVecCaps {
+	Message { bytes: alloc::vec::Vec<u8> },
+	Closed,
+}
+
+// `recv_vec_blocking` that keeps EVERY capability the message carried instead of the first.
+// Sized exactly by peeking first, so a reply is never truncated to a guessed ceiling.
+#[unsafe(no_mangle)]
+// Image-internal transport boundary consumed by ipc-client.lslib.
+pub unsafe fn recv_vec_caps_blocking(channel: u64, out: &mut wire::Handles) -> ReceivedVecCaps {
+	unsafe {
+		loop {
+			let pending: i64 = channel_peek(channel);
+			if pending == ERR_WOULD_BLOCK {
+				wait(channel, 0);
+				continue;
+			}
+			if pending < 0 {
+				return ReceivedVecCaps::Closed;
+			}
+			let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; pending as usize];
+			let mut handles = [0u64; MAX_MESSAGE_CAPS];
+			let (len, count) = recv_message_caps(channel, &mut bytes, &mut handles);
+			if len == ERR_WOULD_BLOCK {
+				continue;
+			}
+			if len < 0 {
+				return ReceivedVecCaps::Closed;
+			}
+			bytes.truncate(len as usize);
+			*out = wire::Handles::from_array(&handles, count);
+			return ReceivedVecCaps::Message { bytes };
+		}
+	}
 }
 
 // Acknowledge a serviced device interrupt, re-arming its source so the next `wait`

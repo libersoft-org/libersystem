@@ -1020,17 +1020,20 @@ unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut sto
 			loop {
 				let mut qreq: [u8; 64] = [0u8; 64];
 				match try_recv(usbq, &mut qreq) {
-					Polled::Message { len, mut handle } => {
+					Polled::Message { len, handle } => {
 						let mut api: UsbApi = UsbApi { slots };
 						let mut reply: [u8; 4096] = [0u8; 4096];
-						let mut reply_handle: u64 = 0;
+						let mut reply_handle = proto::codec::Handles::new();
+						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 						if let Some(n) = usb::dispatch(&mut api, &qreq[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_blocking(usbq, &reply[..n], reply_handle) && reply_handle != 0 {
-								close(reply_handle);
+							if !send_caps_blocking(usbq, &reply[..n], reply_handle.as_slice()) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
 							}
 						}
-						if handle != 0 {
-							close(handle);
+						for &unclaimed in handle.as_slice() {
+							close(unclaimed);
 						}
 					}
 					Polled::Empty => break,

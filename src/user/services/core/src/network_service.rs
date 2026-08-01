@@ -327,7 +327,8 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 				let slot: usize = slot_of[ready];
 				let chan: u64 = clients[slot];
 				match recv_blocking(chan, &mut req) {
-					Received::Message { len, mut handle } => {
+					Received::Message { len, handle } => {
+						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 						let mut new_sock: u64 = 0;
 						let mut new_sock_ci: usize = 0;
 						let mut new_client: u64 = 0;
@@ -343,15 +344,17 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 						let listeners_used: u32 = listeners.iter().filter(|l| l.chan != 0).count() as u32;
 						{
 							let mut svc: Net = Net { frames, seq: 0, stack: &mut *stack, rx: &mut rx[..], tx: &mut tx[..], new_sock: &mut new_sock, new_sock_ci: &mut new_sock_ci, new_client: &mut new_client, new_listener: &mut new_listener, new_listener_port: &mut new_listener_port, sock_room, client_room, listener_room, clients_used, sockets_used, listeners_used };
-							let mut reply_handle: u64 = 0;
+							let mut reply_handle = proto::codec::Handles::new();
 							if let Some(n2) = network::dispatch(&mut svc, &req[..len], &mut handle, &mut out, &mut reply_handle) {
-								if !send_blocking(chan, &out[..n2], reply_handle) && reply_handle != 0 {
-									close(reply_handle);
+								if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
+									for &leftover in reply_handle.as_slice() {
+										close(leftover);
+									}
 								}
 							}
 						}
-						if handle != 0 {
-							close(handle);
+						for &unclaimed in handle.as_slice() {
+							close(unclaimed);
 						}
 						if new_sock != 0 {
 							place_sock(&mut socks, SockSlot { chan: new_sock, ci: new_sock_ci, stream_prod: 0, stream_seq: 0 });
@@ -405,7 +408,8 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 		let chan: u64 = slot.chan;
 		let ci: usize = slot.ci;
 		match recv_blocking(chan, req) {
-			Received::Message { len, mut handle } => {
+			Received::Message { len, handle } => {
+				let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 				let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 				let mut closing: bool = false;
 				{
@@ -434,15 +438,17 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 							}
 						}
 					} else {
-						let mut reply_handle: u64 = 0;
+						let mut reply_handle = proto::codec::Handles::new();
 						if let Some(n2) = socket::dispatch(&mut svc, &req[..len], &mut handle, out, &mut reply_handle) {
-							if !send_blocking(chan, &out[..n2], reply_handle) && reply_handle != 0 {
-								close(reply_handle);
+							if !send_caps_blocking(chan, &out[..n2], reply_handle.as_slice()) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
 							}
 						}
 					}
-					if handle != 0 {
-						close(handle);
+					for &unclaimed in handle.as_slice() {
+						close(unclaimed);
 					}
 				}
 				if closing {

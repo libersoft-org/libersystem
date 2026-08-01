@@ -198,13 +198,21 @@ impl Sink for VecWriter {
 // A request/reply channel the generated clients call over. The userspace impl
 // sends on a channel and blocks for the reply; tests use an in-memory loopback.
 pub trait Transport {
-	// Send a request (bytes plus an optional transferred handle, 0 = none) and
-	// receive the reply (bytes plus an optional transferred handle).
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)>;
+	// Send a request (bytes plus the capabilities it transfers, in encoding order) and receive
+	// the reply the same way. A list rather than one handle because a single op may hand over
+	// several - a pipeline stage needs its stdin AND its stdout, and one slot made that
+	// impossible however the interface was written.
+	// The reply's capabilities are written through `reply_handles` rather than returned beside
+	// the bytes: returning a `Handles` inside a tuple is a 40-byte move that aarch64 codegen
+	// performs with a `memcpy` call, and `ipc-client` is held to an exact list of runtime
+	// imports that should not grow for a calling convention detail.
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>>;
 
-	// Release a reply handle that could not be decoded or was not expected by the
-	// schema. Host test transports need no action; the runtime closes it.
-	fn discard_handle(&mut self, _handle: u64) {}
+	// Release reply capabilities that could not be decoded or were not expected by the schema.
+	// Host test transports need no action; the runtime closes them. Takes the whole list: a
+	// reply refused after decoding may carry more than one, and closing only the first leaks
+	// the rest.
+	fn discard_handles(&mut self, _handles: &[u64]) {}
 }
 
 // A cursor that reads from a borrowed buffer.
@@ -234,38 +242,69 @@ impl Default for Handles {
 }
 
 impl Handles {
+	#[inline]
 	pub const fn new() -> Handles {
 		Handles { list: [0; MAX_HANDLES], count: 0 }
 	}
 
 	// Takes at most MAX_HANDLES, in the order given - which is encoding order, so a stage's
 	// stdin and stdout keep the positions their encoder gave them.
+	#[inline]
 	pub fn from_slice(handles: &[u64]) -> Handles {
 		let mut built = Handles::new();
-		built.count = handles.len().min(MAX_HANDLES);
-		built.list[..built.count].copy_from_slice(&handles[..built.count]);
+		// Copied element by element rather than with `copy_from_slice`, and read back through
+		// `get` rather than a range index, so this carries no call to `memcpy` and no slice
+		// bounds-check panic path. `ipc-client` is checked against an exact list of runtime
+		// imports, and a list this small should not add either.
+		for handle in handles.iter().take(MAX_HANDLES) {
+			built.list[built.count] = *handle;
+			built.count += 1;
+		}
 		built
 	}
 
-	pub fn as_slice(&self) -> &[u64] {
-		&self.list[..self.count]
+	// The first `count` of a raw array, for callers that receive one from a syscall. Takes a
+	// reference and copies element by element: passing the array by value is a 32-byte move
+	// that aarch64 codegen turns into a `memcpy` call, and `ipc-client` is checked against an
+	// exact list of runtime imports that should not have to grow for this.
+	#[inline]
+	pub fn from_array(list: &[u64; MAX_HANDLES], count: usize) -> Handles {
+		let mut built = Handles::new();
+		let bounded = if count > MAX_HANDLES { MAX_HANDLES } else { count };
+		while built.count < bounded {
+			built.list[built.count] = list[built.count];
+			built.count += 1;
+		}
+		built
 	}
 
+	#[inline]
+	pub fn as_slice(&self) -> &[u64] {
+		match self.list.get(..self.count) {
+			Some(handles) => handles,
+			None => &[],
+		}
+	}
+
+	#[inline]
 	pub fn len(&self) -> usize {
 		self.count
 	}
 
+	#[inline]
 	pub fn is_empty(&self) -> bool {
 		self.count == 0
 	}
 
 	// The first handle, or 0 when none was sent - for the callers that only ever expect one.
+	#[inline]
 	pub fn first(&self) -> u64 {
 		if self.count == 0 { 0 } else { self.list[0] }
 	}
 
 	// Append one, refusing past the bound rather than dropping it: a silently missing
 	// capability is a stage wired to nothing.
+	#[inline]
 	pub fn push(&mut self, handle: u64) -> Option<()> {
 		if self.count >= MAX_HANDLES {
 			return None;
@@ -275,6 +314,26 @@ impl Handles {
 		Some(())
 	}
 
+	// Remove and return the first capability, shifting the rest down; 0 when there is none.
+	// The bootstrap sequences use this: they read one named capability per message and must
+	// leave the list empty afterwards, so the serve loop does not close what was adopted.
+	#[inline]
+	pub fn take_first(&mut self) -> u64 {
+		if self.count == 0 {
+			return 0;
+		}
+		let first = self.list[0];
+		let mut index = 1;
+		while index < self.count {
+			self.list[index - 1] = self.list[index];
+			index += 1;
+		}
+		self.count -= 1;
+		self.list[self.count] = 0;
+		first
+	}
+
+	#[inline]
 	pub fn clear(&mut self) {
 		self.list = [0; MAX_HANDLES];
 		self.count = 0;

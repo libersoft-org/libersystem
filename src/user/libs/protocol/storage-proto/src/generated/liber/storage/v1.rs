@@ -3,7 +3,7 @@
 //! LiberSystem storage package - volume and file services.
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]
 
-use crate::codec::{Reader, Sink, SliceWriter, VecWriter};
+use crate::codec::{Handles, Reader, Sink, SliceWriter, VecWriter};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -359,8 +359,8 @@ pub mod volume {
 		fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error>;
 	}
 
-	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
-		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
 		let r = &mut reader;
 		let op = r.u16()?;
 		let corr = r.u32()?;
@@ -371,7 +371,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.open(o);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -390,7 +390,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -412,7 +412,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.write(path, data);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -430,7 +430,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -447,7 +447,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.remove(path);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -465,7 +465,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -482,7 +482,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.snap_create(name);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -500,7 +500,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -516,7 +516,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.snap_list();
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -541,7 +541,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -558,7 +558,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.snap_delete(name);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -576,7 +576,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -594,7 +594,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.snap_open(snapshot, path);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -613,7 +613,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -630,7 +630,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.mkdir(path);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -648,7 +648,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -665,7 +665,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.rmdir(path);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -683,7 +683,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -699,7 +699,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.capacity();
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -718,7 +718,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -734,7 +734,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.status();
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -753,7 +753,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -770,7 +770,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.set_compression(enabled);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -788,7 +788,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -804,7 +804,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.fsck();
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -823,7 +823,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -841,7 +841,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.restore(path, snapshot);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -859,7 +859,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -880,7 +880,7 @@ pub mod volume {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.write_stream(path, data);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -898,7 +898,7 @@ pub mod volume {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -912,12 +912,12 @@ pub mod volume {
 			}
 			_ => return None,
 		}
-		*reply_handle = writer.handle();
+		*reply_handles = Handles::from_slice(writer.handles());
 		Some(writer.pos())
 	}
 
-	pub fn list_open<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64) -> Option<(u32, Vec<FileInfo>)> {
-		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+	pub fn list_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<FileInfo>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
 		let r = &mut reader;
 		let _op = r.u16()?;
 		let corr = r.u32()?;
@@ -925,7 +925,7 @@ pub mod volume {
 		if r.has_handle() {
 			return None;
 		}
-		*request_handle = 0;
+		request_handles.clear();
 		let items = service.list(path);
 		Some((corr, items))
 	}
@@ -982,10 +982,11 @@ pub mod volume {
 			w.u16(OP_OPEN)?;
 			w.u32(corr)?;
 			o.write(w)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -994,9 +995,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(OpenResult::read(r)?) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1008,18 +1007,17 @@ pub mod volume {
 			w.u16(OP_LIST)?;
 			w.u32(corr)?;
 			w.bytes_lp(path.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
 			let mut reader = Reader::new(&reply);
 			let r = &mut reader;
-			if r.u32()? != corr || reply_handle == 0 {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+			if r.u32()? != corr || reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
-			Some(reply_handle)
+			Some(reply_handles.first())
 		}
 		pub fn write(&mut self, path: &str, data: &crate::codec::Buffer) -> Option<Result<(), Error>> {
 			let corr = self.next_corr();
@@ -1030,10 +1028,11 @@ pub mod volume {
 			w.bytes_lp(path.as_bytes())?;
 			w.set_handle(data.handle)?;
 			w.u64(data.len)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1042,9 +1041,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1056,10 +1053,11 @@ pub mod volume {
 			w.u16(OP_REMOVE)?;
 			w.u32(corr)?;
 			w.bytes_lp(path.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1068,9 +1066,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1082,10 +1078,11 @@ pub mod volume {
 			w.u16(OP_SNAP_CREATE)?;
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1094,9 +1091,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1107,10 +1102,11 @@ pub mod volume {
 			let w = &mut writer;
 			w.u16(OP_SNAP_LIST)?;
 			w.u32(corr)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1130,9 +1126,7 @@ pub mod volume {
 				})
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1144,10 +1138,11 @@ pub mod volume {
 			w.u16(OP_SNAP_DELETE)?;
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1156,9 +1151,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1171,10 +1164,11 @@ pub mod volume {
 			w.u32(corr)?;
 			w.bytes_lp(snapshot.as_bytes())?;
 			w.bytes_lp(path.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1183,9 +1177,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(OpenResult::read(r)?) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1197,10 +1189,11 @@ pub mod volume {
 			w.u16(OP_MKDIR)?;
 			w.u32(corr)?;
 			w.bytes_lp(path.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1209,9 +1202,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1223,10 +1214,11 @@ pub mod volume {
 			w.u16(OP_RMDIR)?;
 			w.u32(corr)?;
 			w.bytes_lp(path.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1235,9 +1227,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1248,10 +1238,11 @@ pub mod volume {
 			let w = &mut writer;
 			w.u16(OP_CAPACITY)?;
 			w.u32(corr)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1260,9 +1251,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(r.u64()?) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1273,10 +1262,11 @@ pub mod volume {
 			let w = &mut writer;
 			w.u16(OP_STATUS)?;
 			w.u32(corr)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1285,9 +1275,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(VolumeStatus::read(r)?) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1299,10 +1287,11 @@ pub mod volume {
 			w.u16(OP_SET_COMPRESSION)?;
 			w.u32(corr)?;
 			w.boolean(*enabled)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1311,9 +1300,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1324,10 +1311,11 @@ pub mod volume {
 			let w = &mut writer;
 			w.u16(OP_FSCK)?;
 			w.u32(corr)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1336,9 +1324,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(FsckReport::read(r)?) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1351,10 +1337,11 @@ pub mod volume {
 			w.u32(corr)?;
 			w.bytes_lp(path.as_bytes())?;
 			w.bytes_lp(snapshot.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1363,9 +1350,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1379,10 +1364,11 @@ pub mod volume {
 			w.bytes_lp(path.as_bytes())?;
 			w.set_handle(*data)?;
 			w.u32(0)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1391,9 +1377,7 @@ pub mod volume {
 				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded
@@ -1544,8 +1528,8 @@ pub mod volume_admin {
 		fn open_directory(&mut self, path: String) -> Result<u64, Error>;
 	}
 
-	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
-		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
 		let r = &mut reader;
 		let op = r.u16()?;
 		let corr = r.u32()?;
@@ -1556,7 +1540,7 @@ pub mod volume_admin {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.open_directory(path);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -1576,7 +1560,7 @@ pub mod volume_admin {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -1590,7 +1574,7 @@ pub mod volume_admin {
 			}
 			_ => return None,
 		}
-		*reply_handle = writer.handle();
+		*reply_handles = Handles::from_slice(writer.handles());
 		Some(writer.pos())
 	}
 
@@ -1618,10 +1602,11 @@ pub mod volume_admin {
 			w.u16(OP_OPEN_DIRECTORY)?;
 			w.u32(corr)?;
 			w.bytes_lp(path.as_bytes())?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -1637,9 +1622,7 @@ pub mod volume_admin {
 				})
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded

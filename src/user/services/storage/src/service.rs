@@ -243,18 +243,23 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		let chan: u64 = waits[ready as usize];
 		if chan == admin {
 			match unsafe { recv_blocking(admin, &mut request) } {
-				Received::Message { len, mut handle } => {
-					let mut reply_handle: u64 = 0;
+				Received::Message { len, handle } => {
+					let mut reply_handle = proto::codec::Handles::new();
+					let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 					let mut call = AdminCall { volume: vol, clients: &mut clients };
 					if let Some(reply_len) = volume_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-						if !unsafe { send_blocking(admin, &reply[..reply_len], reply_handle) } && reply_handle != 0 {
-							unsafe { close(reply_handle) };
+						if !unsafe { send_caps_blocking(admin, &reply[..reply_len], reply_handle.as_slice()) } {
+							for &leftover in reply_handle.as_slice() {
+								unsafe { close(leftover) };
+							}
 						}
-					} else if reply_handle != 0 {
-						unsafe { close(reply_handle) };
+					} else {
+						for &leftover in reply_handle.as_slice() {
+							unsafe { close(leftover) };
+						}
 					}
-					if handle != 0 {
-						unsafe { close(handle) };
+					for &unclaimed in handle.as_slice() {
+						unsafe { close(unclaimed) };
 					}
 				}
 				Received::Closed => admin = 0,
@@ -271,7 +276,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				unsafe { close(chan) };
 				clients.swap_remove(index);
 			}
-			Received::Message { len, mut handle } => {
+			Received::Message { len, handle } => {
+				let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 				if op == HEARTBEAT_OP {
 					unsafe { send_blocking(chan, b"PONG", 0) };
@@ -289,19 +295,23 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					if op == volume::OP_LIST {
 						stream_list(vol, chan, &scope, &request[..len], &mut handle);
 					} else {
-						let mut reply_handle: u64 = 0;
+						let mut reply_handle = proto::codec::Handles::new();
 						let reply_len: Option<usize> = if scope.allows_request(vol.name(), &request[..len]) { volume::dispatch(vol, &request[..len], &mut handle, &mut reply, &mut reply_handle) } else { denied_reply(&request[..len], &mut reply) };
 						if let Some(reply_len) = reply_len {
-							if !unsafe { send_blocking(chan, &reply[..reply_len], reply_handle) } && reply_handle != 0 {
-								unsafe { close(reply_handle) };
+							if !unsafe { send_caps_blocking(chan, &reply[..reply_len], reply_handle.as_slice()) } {
+								for &leftover in reply_handle.as_slice() {
+									unsafe { close(leftover) };
+								}
 							}
-						} else if reply_handle != 0 {
-							unsafe { close(reply_handle) };
+						} else {
+							for &leftover in reply_handle.as_slice() {
+								unsafe { close(leftover) };
+							}
 						}
 					}
 				}
-				if handle != 0 {
-					unsafe { close(handle) };
+				for &unclaimed in handle.as_slice() {
+					unsafe { close(unclaimed) };
 				}
 			}
 			Received::Closed => {
@@ -321,8 +331,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 // bad path replies the correlation id with NO consumer handle - the generated
 // client reads that as "no stream" - so an error stays distinguishable from an
 // empty directory (`cd` validates paths this way).
-fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], request_handle: &mut u64) {
-	let mut reader = if *request_handle == 0 { proto::codec::Reader::new(request) } else { proto::codec::Reader::with_handle(request, *request_handle) };
+fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], request_handle: &mut proto::codec::Handles) {
+	let mut reader = proto::codec::Reader::with_handle_list(request, request_handle);
 	let r = &mut reader;
 	let (corr, path): (u32, String) = match (|| Some((r.u16()?, r.u32()?, r.string_lp()?)))() {
 		Some((_op, corr, path)) => (corr, path),
@@ -331,7 +341,7 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], re
 	if r.has_handle() {
 		return;
 	}
-	*request_handle = 0;
+	request_handle.clear();
 	let corr_bytes: [u8; 4] = corr.to_le_bytes();
 	if !scope.allows_path(vol.name(), &path) {
 		unsafe {

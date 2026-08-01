@@ -3,7 +3,7 @@
 //! LiberSystem input package - pointer and input event services.
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]
 
-use crate::codec::{Reader, Sink, SliceWriter, VecWriter};
+use crate::codec::{Handles, Reader, Sink, SliceWriter, VecWriter};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -109,19 +109,19 @@ pub mod input {
 		fn subscribe_keys(&mut self, focus: u64) -> Vec<KeyEvent>;
 	}
 
-	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handle: &mut u64, _out: &mut [u8], _reply_handle: &mut u64) -> Option<usize> {
+	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handles: &mut Handles, _out: &mut [u8], _reply_handles: &mut Handles) -> Option<usize> {
 		None
 	}
 
-	pub fn subscribe_open<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64) -> Option<(u32, Vec<PointerEvent>)> {
-		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+	pub fn subscribe_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<PointerEvent>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
 		let r = &mut reader;
 		let _op = r.u16()?;
 		let corr = r.u32()?;
 		if r.has_handle() {
 			return None;
 		}
-		*request_handle = 0;
+		request_handles.clear();
 		let items = service.subscribe();
 		Some((corr, items))
 	}
@@ -154,8 +154,8 @@ pub mod input {
 		Some(value)
 	}
 
-	pub fn subscribe_keys_open<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64) -> Option<(u32, Vec<KeyEvent>)> {
-		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+	pub fn subscribe_keys_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<KeyEvent>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
 		let r = &mut reader;
 		let _op = r.u16()?;
 		let corr = r.u32()?;
@@ -166,7 +166,7 @@ pub mod input {
 		if r.has_handle() {
 			return None;
 		}
-		*request_handle = 0;
+		request_handles.clear();
 		let items = service.subscribe_keys(focus);
 		Some((corr, items))
 	}
@@ -222,18 +222,17 @@ pub mod input {
 			let w = &mut writer;
 			w.u16(OP_SUBSCRIBE)?;
 			w.u32(corr)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
 			let mut reader = Reader::new(&reply);
 			let r = &mut reader;
-			if r.u32()? != corr || reply_handle == 0 {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+			if r.u32()? != corr || reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
-			Some(reply_handle)
+			Some(reply_handles.first())
 		}
 		pub fn subscribe_keys(&mut self, focus: &u64) -> Option<u64> {
 			let corr = self.next_corr();
@@ -243,18 +242,17 @@ pub mod input {
 			w.u32(corr)?;
 			w.set_handle(*focus)?;
 			w.u32(0)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
 			let mut reader = Reader::new(&reply);
 			let r = &mut reader;
-			if r.u32()? != corr || reply_handle == 0 {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+			if r.u32()? != corr || reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
-			Some(reply_handle)
+			Some(reply_handles.first())
 		}
 	}
 
@@ -289,8 +287,8 @@ pub mod input_admin {
 		fn open_keys(&mut self) -> Result<u64, Error>;
 	}
 
-	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handle: &mut u64, out: &mut [u8], reply_handle: &mut u64) -> Option<usize> {
-		let mut reader = if *request_handle == 0 { Reader::new(request) } else { Reader::with_handle(request, *request_handle) };
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
 		let r = &mut reader;
 		let op = r.u16()?;
 		let corr = r.u32()?;
@@ -300,7 +298,7 @@ pub mod input_admin {
 				if r.has_handle() {
 					return None;
 				}
-				*request_handle = 0;
+				request_handles.clear();
 				let result = service.open_keys();
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
@@ -320,7 +318,7 @@ pub mod input_admin {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handle = writer.handle();
+						*reply_handles = Handles::from_slice(writer.handles());
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -334,7 +332,7 @@ pub mod input_admin {
 			}
 			_ => return None,
 		}
-		*reply_handle = writer.handle();
+		*reply_handles = Handles::from_slice(writer.handles());
 		Some(writer.pos())
 	}
 
@@ -361,10 +359,11 @@ pub mod input_admin {
 			let w = &mut writer;
 			w.u16(OP_OPEN_KEYS)?;
 			w.u32(corr)?;
-			let request_handle = writer.handle();
+			let request_handles = Handles::from_slice(writer.handles());
 			let request = writer.into_inner();
-			let (reply, reply_handle) = self.transport.call(&request, request_handle)?;
-			let mut reader = if reply_handle == 0 { Reader::new(&reply) } else { Reader::with_handle(&reply, reply_handle) };
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
 				if r.u32()? != corr {
@@ -380,9 +379,7 @@ pub mod input_admin {
 				})
 			})();
 			if decoded.is_none() || reader.has_handle() {
-				if reply_handle != 0 {
-					self.transport.discard_handle(reply_handle);
-				}
+				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
 			decoded

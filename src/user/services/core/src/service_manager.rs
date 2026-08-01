@@ -1005,9 +1005,9 @@ struct DrillTransport<'a> {
 }
 
 impl proto::codec::Transport for DrillTransport<'_> {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut proto::codec::Handles) -> Option<Vec<u8>> {
 		unsafe {
-			if !send_blocking(self.perm, request, request_handle) {
+			if !send_caps_blocking(self.perm, request, request_handles) {
 				return None;
 			}
 			let mut buf: [u8; 64] = [0u8; 64];
@@ -1021,9 +1021,9 @@ impl proto::codec::Transport for DrillTransport<'_> {
 							}
 						}
 					}
-					0 => match recv_vec_blocking(self.perm) {
-						ReceivedVec::Message { bytes, handle } => return Some((bytes, handle)),
-						ReceivedVec::Closed => return None,
+					0 => match recv_vec_caps_blocking(self.perm, reply_handles) {
+						ReceivedVecCaps::Message { bytes } => return Some(bytes),
+						ReceivedVecCaps::Closed => return None,
 					},
 					_ => return None,
 				}

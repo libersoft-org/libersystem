@@ -242,20 +242,25 @@ impl Audio {
 		}
 	}
 
-	fn dispatch_stream(&mut self, index: usize, request: &[u8], mut request_handle: u64) {
+	fn dispatch_stream(&mut self, index: usize, request: &[u8], request_handle: u64) {
 		let chan: u64 = self.streams[index].chan;
 		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
-		let mut reply_handle: u64 = 0;
+		let mut reply_handle = proto::codec::Handles::new();
+		let mut request_handle = if request_handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[request_handle]) };
 		let mut call = StreamCall { stream: &mut self.streams[index] };
 		if let Some(len) = pcm_stream::dispatch(&mut call, request, &mut request_handle, &mut reply, &mut reply_handle) {
-			if !unsafe { send_blocking(chan, &reply[..len], reply_handle) } && reply_handle != 0 {
-				unsafe { close(reply_handle) };
+			if !unsafe { send_caps_blocking(chan, &reply[..len], reply_handle.as_slice()) } {
+				for &leftover in reply_handle.as_slice() {
+					unsafe { close(leftover) };
+				}
 			}
-		} else if reply_handle != 0 {
-			unsafe { close(reply_handle) };
+		} else {
+			for &leftover in reply_handle.as_slice() {
+				unsafe { close(leftover) };
+			}
 		}
-		if request_handle != 0 {
-			unsafe { close(request_handle) };
+		for &unclaimed in request_handle.as_slice() {
+			unsafe { close(unclaimed) };
 		}
 	}
 
@@ -420,18 +425,23 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 			}
 			if ready_chan == admin {
 				match recv_blocking(admin, &mut request) {
-					Received::Message { len, mut handle } => {
-						let mut reply_handle: u64 = 0;
+					Received::Message { len, handle } => {
+						let mut reply_handle = proto::codec::Handles::new();
+						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 						let mut call = AdminCall { clients: &mut clients };
 						if let Some(reply_len) = audio_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_blocking(admin, &reply[..reply_len], reply_handle) && reply_handle != 0 {
-								close(reply_handle);
+							if !send_caps_blocking(admin, &reply[..reply_len], reply_handle.as_slice()) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
 							}
-						} else if reply_handle != 0 {
-							close(reply_handle);
+						} else {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
 						}
-						if handle != 0 {
-							close(handle);
+						for &unclaimed in handle.as_slice() {
+							close(unclaimed);
 						}
 					}
 					Received::Closed => exit(),
@@ -441,7 +451,8 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 			if let Some(index) = clients.iter().position(|client| client.chan == ready_chan) {
 				let scope: Scope = clients[index].scope;
 				match recv_blocking(ready_chan, &mut request) {
-					Received::Message { len, mut handle } => {
+					Received::Message { len, handle } => {
+						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 						let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 						if op == HEARTBEAT_OP {
 							send_blocking(ready_chan, b"PONG", 0);
@@ -451,18 +462,22 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 								send_blocking(ready_chan, &[], client);
 							}
 						} else {
-							let mut reply_handle: u64 = 0;
+							let mut reply_handle = proto::codec::Handles::new();
 							let mut call = RootCall { audio: &mut state, scope };
 							if let Some(reply_len) = audio::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-								if !send_blocking(ready_chan, &reply[..reply_len], reply_handle) && reply_handle != 0 {
-									close(reply_handle);
+								if !send_caps_blocking(ready_chan, &reply[..reply_len], reply_handle.as_slice()) {
+									for &leftover in reply_handle.as_slice() {
+										close(leftover);
+									}
 								}
-							} else if reply_handle != 0 {
-								close(reply_handle);
+							} else {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
 							}
 						}
-						if handle != 0 {
-							close(handle);
+						for &unclaimed in handle.as_slice() {
+							close(unclaimed);
 						}
 					}
 					Received::Closed => {

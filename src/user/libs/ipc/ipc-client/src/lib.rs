@@ -3,8 +3,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use rt::{RIGHT_MAP, RIGHT_READ, RIGHT_TRANSFER, ReceivedVec, close, duplicate, map_object, memory_object_create, recv_vec_blocking, resolve, send_blocking, unmap_object};
-use wire::{Buffer, Transport};
+use rt::{RIGHT_MAP, RIGHT_READ, RIGHT_TRANSFER, ReceivedVecCaps, close, duplicate, map_object, memory_object_create, recv_vec_caps_blocking, resolve, send_caps_blocking, unmap_object};
+use wire::{Buffer, Handles, Transport};
 
 pub unsafe fn make_buffer(bytes: &[u8]) -> Option<Buffer> {
 	unsafe {
@@ -36,21 +36,23 @@ pub struct ChannelTransport {
 }
 
 impl Transport for ChannelTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>> {
 		unsafe {
-			if !send_blocking(self.chan, request, request_handle) {
+			if !send_caps_blocking(self.chan, request, request_handles) {
 				return None;
 			}
-			match recv_vec_blocking(self.chan) {
-				ReceivedVec::Message { bytes, handle } => Some((bytes, handle)),
-				ReceivedVec::Closed => None,
+			match recv_vec_caps_blocking(self.chan, reply_handles) {
+				ReceivedVecCaps::Message { bytes } => Some(bytes),
+				ReceivedVecCaps::Closed => None,
 			}
 		}
 	}
 
-	fn discard_handle(&mut self, handle: u64) {
-		if handle != 0 {
-			unsafe { close(handle) };
+	fn discard_handles(&mut self, handles: &[u64]) {
+		for &handle in handles {
+			if handle != 0 {
+				unsafe { close(handle) };
+			}
 		}
 	}
 }
@@ -85,20 +87,20 @@ impl SvcTransport {
 }
 
 impl Transport for SvcTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>> {
 		unsafe {
 			let chan = self.channel();
 			if chan == 0 {
 				return None;
 			}
-			if !send_blocking(chan, request, request_handle) {
-				if !self.reconnect() || !send_blocking(self.chan, request, request_handle) {
+			if !send_caps_blocking(chan, request, request_handles) {
+				if !self.reconnect() || !send_caps_blocking(self.chan, request, request_handles) {
 					return None;
 				}
 			}
-			match recv_vec_blocking(self.chan) {
-				ReceivedVec::Message { bytes, handle } => Some((bytes, handle)),
-				ReceivedVec::Closed => {
+			match recv_vec_caps_blocking(self.chan, reply_handles) {
+				ReceivedVecCaps::Message { bytes } => Some(bytes),
+				ReceivedVecCaps::Closed => {
 					let _ = self.reconnect();
 					None
 				}
@@ -106,15 +108,21 @@ impl Transport for SvcTransport {
 		}
 	}
 
-	fn discard_handle(&mut self, handle: u64) {
-		if handle != 0 {
-			unsafe { close(handle) };
+	fn discard_handles(&mut self, handles: &[u64]) {
+		for &handle in handles {
+			if handle != 0 {
+				unsafe { close(handle) };
+			}
 		}
 	}
 }
 
 impl Transport for &mut SvcTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
-		(**self).call(request, request_handle)
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>> {
+		(**self).call(request, request_handles, reply_handles)
+	}
+
+	fn discard_handles(&mut self, handles: &[u64]) {
+		(**self).discard_handles(handles)
 	}
 }

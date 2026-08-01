@@ -169,9 +169,9 @@ struct DeadlineTransport {
 }
 
 impl proto::codec::Transport for DeadlineTransport {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut proto::codec::Handles) -> Option<Vec<u8>> {
 		unsafe {
-			if !send_blocking(self.chan, request, request_handle) {
+			if !send_caps_blocking(self.chan, request, request_handles) {
 				return None;
 			}
 			if wait(self.chan, clock() + self.ticks) != 0 {
@@ -179,7 +179,12 @@ impl proto::codec::Transport for DeadlineTransport {
 			}
 			let mut reply: [u8; 4096] = [0u8; 4096];
 			match try_recv(self.chan, &mut reply) {
-				Polled::Message { len, handle } => Some((reply[..len].to_vec(), handle)),
+				Polled::Message { len, handle } => {
+					if handle != 0 {
+						*reply_handles = proto::codec::Handles::from_slice(&[handle]);
+					}
+					Some(reply[..len].to_vec())
+				}
 				_ => None,
 			}
 		}

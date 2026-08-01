@@ -606,18 +606,23 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 			let admin_index: usize = gpu_first as usize + kill_present as usize;
 			if ready as usize == admin_index {
 				match recv_blocking(admin, &mut request) {
-					Received::Message { len, mut handle } => {
-						let mut reply_handle: u64 = 0;
+					Received::Message { len, handle } => {
+						let mut reply_handle = proto::codec::Handles::new();
+						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 						let mut call = AdminCall { clients: &mut clients, stats: &state.stats };
 						if let Some(n) = display_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_blocking(admin, &reply[..n], reply_handle) && reply_handle != 0 {
-								close(reply_handle);
+							if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
 							}
-						} else if reply_handle != 0 {
-							close(reply_handle);
+						} else {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
 						}
-						if handle != 0 {
-							close(handle);
+						for &unclaimed in handle.as_slice() {
+							close(unclaimed);
 						}
 					}
 					Received::Closed => exit(),
@@ -638,7 +643,8 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 					close(chan);
 					clients.swap_remove(client_index);
 				}
-				Received::Message { len, mut handle } => {
+				Received::Message { len, handle } => {
+					let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 					if op == HEARTBEAT_OP {
 						send_blocking(chan, b"PONG", 0);
@@ -655,18 +661,22 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 					} else if op == display::OP_EVENTS {
 						open_events(chan, &request[..len], &mut handle, &mut state);
 					} else {
-						let mut reply_handle: u64 = 0;
+						let mut reply_handle = proto::codec::Handles::new();
 						let mut call = DisplayCall { state: &mut state, chan };
 						if let Some(n) = display::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_blocking(chan, &reply[..n], reply_handle) && reply_handle != 0 {
-								close(reply_handle);
+							if !send_caps_blocking(chan, &reply[..n], reply_handle.as_slice()) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
 							}
-						} else if reply_handle != 0 {
-							close(reply_handle);
+						} else {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
 						}
 					}
-					if handle != 0 {
-						close(handle);
+					for &unclaimed in handle.as_slice() {
+						close(unclaimed);
 					}
 				}
 				Received::Closed => {
@@ -685,12 +695,12 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 	}
 }
 
-fn open_events(chan: u64, request: &[u8], request_handle: &mut u64, state: &mut DisplayState) {
-	if request.len() != 6 || *request_handle != 0 {
+fn open_events(chan: u64, request: &[u8], request_handle: &mut proto::codec::Handles, state: &mut DisplayState) {
+	if request.len() != 6 || !request_handle.is_empty() {
 		return;
 	}
 	let corr: u32 = read_u32(request, 2);
-	*request_handle = 0;
+	request_handle.clear();
 	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
 		Some(pair) => pair,
 		None => return,

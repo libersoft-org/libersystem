@@ -95,14 +95,24 @@ fn encode_rejects_small_buffer() {
 }
 
 #[test]
-fn codec_rejects_duplicate_handle_writes_and_reads() {
+fn codec_bounds_handle_writes_and_reads_them_in_order() {
+	// A message used to carry exactly one capability, and this test asserted the second write
+	// was refused. It now carries up to MAX_HANDLES, because a pipeline stage needs its stdin
+	// and its stdout together. What is still refused - and what matters - is going PAST the
+	// bound: dropping one silently would wire a stage to nothing.
 	let mut writer = VecWriter::new();
-	assert_eq!(writer.set_handle(11), Some(()));
-	assert_eq!(writer.set_handle(22), None);
-	assert_eq!(writer.handle(), 11);
+	for (index, handle) in [11u64, 22, 33, 44].iter().enumerate() {
+		assert_eq!(writer.set_handle(*handle), Some(()), "handle {index} fits within the bound");
+	}
+	assert_eq!(writer.set_handle(55), None, "one past the bound is refused, not dropped");
+	assert_eq!(writer.handles(), &[11, 22, 33, 44]);
+	assert_eq!(writer.handle(), 11, "the single-handle accessor still reads the first");
 
-	let mut reader = crate::codec::Reader::with_handle(&[], 33);
+	// Order is the contract: they come back exactly as they were encoded, so a decoder cannot
+	// swap a stage's stdin for its stdout by reading them in a different order.
+	let mut reader = crate::codec::Reader::with_handles(&[], &[33, 44]);
 	assert_eq!(reader.take_handle(), Some(33));
+	assert_eq!(reader.take_handle(), Some(44));
 	assert_eq!(reader.take_handle(), None);
 
 	let mut zero = crate::codec::Reader::with_handle(&[], 0);
@@ -113,12 +123,12 @@ fn codec_rejects_duplicate_handle_writes_and_reads() {
 #[test]
 fn malformed_dispatch_leaves_the_request_handle_with_the_host() {
 	let mut service = MemLog::default();
-	let mut request_handle = 77;
-	let mut reply_handle = 0;
+	let mut request_handles = crate::codec::Handles::from_slice(&[77]);
+	let mut reply_handles = crate::codec::Handles::new();
 	let mut out = [0u8; 32];
-	assert_eq!(log::dispatch(&mut service, &[1], &mut request_handle, &mut out, &mut reply_handle), None);
-	assert_eq!(request_handle, 77);
-	assert_eq!(reply_handle, 0);
+	assert_eq!(log::dispatch(&mut service, &[1], &mut request_handles, &mut out, &mut reply_handles), None);
+	assert_eq!(request_handles.as_slice(), &[77], "a refused dispatch leaves the capability with the host to close");
+	assert!(reply_handles.is_empty());
 }
 
 // An in-memory loopback transport that dispatches a request straight into a
@@ -128,13 +138,12 @@ struct Loopback<S: log::Service> {
 }
 
 impl<S: log::Service> crate::codec::Transport for Loopback<S> {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
 		let mut out = [0u8; 4096];
-		let mut reply_handle = 0u64;
-		let mut request_handle = request_handle;
-		let n = log::dispatch(&mut self.service, request, &mut request_handle, &mut out, &mut reply_handle)?;
-		assert_eq!(request_handle, 0);
-		Some((out[..n].to_vec(), reply_handle))
+		let mut request_handles = crate::codec::Handles::from_slice(request_handles);
+		let n = log::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles)?;
+		assert!(request_handles.is_empty(), "the dispatch consumed every capability the request carried");
+		Some(out[..n].to_vec())
 	}
 }
 
@@ -187,8 +196,8 @@ fn tail_stream_round_trip() {
 	q.write(w).unwrap();
 	let request = writer.into_inner();
 
-	let mut request_handle = 0;
-	let (corr, items) = log::tail_open(&mut service, &request, &mut request_handle).unwrap();
+	let mut request_handles = crate::codec::Handles::new();
+	let (corr, items) = log::tail_open(&mut service, &request, &mut request_handles).unwrap();
 	assert_eq!(corr, 7);
 	assert_eq!(items.len(), 2);
 
@@ -282,13 +291,12 @@ struct VolLoopback<S: volume::Service> {
 }
 
 impl<S: volume::Service> crate::codec::Transport for VolLoopback<S> {
-	fn call(&mut self, request: &[u8], request_handle: u64) -> Option<(Vec<u8>, u64)> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
 		let mut out = [0u8; 256];
-		let mut reply_handle = 0u64;
-		let mut request_handle = request_handle;
-		let n = volume::dispatch(&mut self.service, request, &mut request_handle, &mut out, &mut reply_handle)?;
-		assert_eq!(request_handle, 0);
-		Some((out[..n].to_vec(), reply_handle))
+		let mut request_handles = crate::codec::Handles::from_slice(request_handles);
+		let n = volume::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles)?;
+		assert!(request_handles.is_empty(), "the dispatch consumed every capability the request carried");
+		Some(out[..n].to_vec())
 	}
 }
 
@@ -330,15 +338,15 @@ fn oversized_reply_degrades_to_a_typed_error() {
 	request.extend_from_slice(&volume::OP_SNAP_LIST.to_le_bytes());
 	request.extend_from_slice(&7u32.to_le_bytes()); // correlation id
 	let mut out = [0u8; 6];
-	let mut reply_handle = 0u64;
-	let mut request_handle = 0u64;
-	let n = volume::dispatch(&mut VolStub, &request, &mut request_handle, &mut out, &mut reply_handle).expect("the fallback reply should be produced");
+	let mut request_handles = crate::codec::Handles::new();
+	let mut reply_handles = crate::codec::Handles::new();
+	let n = volume::dispatch(&mut VolStub, &request, &mut request_handles, &mut out, &mut reply_handles).expect("the fallback reply should be produced");
 	assert_eq!(&out[..4], &7u32.to_le_bytes(), "the fallback keeps the correlation id");
 	assert_eq!(out[4], 0, "the fallback is the error arm");
 	assert_eq!(Error::decode(&out[5..n]), Some(Error::Again), "the fallback error is `again`");
 	// with room to spare the same call succeeds normally.
 	let mut big = [0u8; 256];
-	let n = volume::dispatch(&mut VolStub, &request, &mut request_handle, &mut big, &mut reply_handle).expect("the real reply fits");
+	let n = volume::dispatch(&mut VolStub, &request, &mut request_handles, &mut big, &mut reply_handles).expect("the real reply fits");
 	assert_eq!(big[4], 1, "the roomy reply is the ok arm");
 	assert!(n > 6, "the ok reply carries the snapshot list");
 }
@@ -351,11 +359,11 @@ fn partial_reply_encode_returns_the_unsent_handle_to_the_host() {
 	request.u32(9).unwrap();
 	opts.write(&mut request).unwrap();
 	let request = request.into_inner();
-	let mut request_handle = 0;
-	let mut reply_handle = 0;
+	let mut request_handles = crate::codec::Handles::new();
+	let mut reply_handles = crate::codec::Handles::new();
 	let mut out = [0u8; 9]; // corr + ok tag + handle placeholder fits; size does not
-	assert_eq!(volume::dispatch(&mut VolStub, &request, &mut request_handle, &mut out, &mut reply_handle), None);
-	assert_eq!(reply_handle, 0xCAFE);
+	assert_eq!(volume::dispatch(&mut VolStub, &request, &mut request_handles, &mut out, &mut reply_handles), None);
+	assert_eq!(reply_handles.first(), 0xCAFE);
 }
 
 struct UnexpectedHandleTransport {
@@ -363,15 +371,18 @@ struct UnexpectedHandleTransport {
 }
 
 impl crate::codec::Transport for UnexpectedHandleTransport {
-	fn call(&mut self, request: &[u8], _request_handle: u64) -> Option<(Vec<u8>, u64)> {
+	fn call(&mut self, request: &[u8], _request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
 		let corr = u32::from_le_bytes(request[2..6].try_into().ok()?);
 		let mut reply = corr.to_le_bytes().to_vec();
 		reply.extend_from_slice(&[1, 0]); // Ok(()) for log.emit
-		Some((reply, 0xBAD))
+		{
+			*reply_handles = crate::codec::Handles::from_slice(&[0xBAD]);
+			Some(reply)
+		}
 	}
 
-	fn discard_handle(&mut self, handle: u64) {
-		self.discarded = handle;
+	fn discard_handles(&mut self, handles: &[u64]) {
+		self.discarded = handles.first().copied().unwrap_or(0);
 	}
 }
 

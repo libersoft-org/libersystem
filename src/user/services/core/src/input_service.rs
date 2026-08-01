@@ -370,19 +370,24 @@ unsafe fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u6
 			}
 			if admin != 0 && ready_handle == admin {
 				match recv_blocking(admin, &mut req) {
-					Received::Message { len, mut handle } => {
+					Received::Message { len, handle } => {
 						let mut reply: [u8; 64] = [0; 64];
-						let mut reply_handle: u64 = 0;
+						let mut reply_handle = proto::codec::Handles::new();
+						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 						let mut call = AdminCall { clients: &mut clients };
 						if let Some(n) = input_admin::dispatch(&mut call, &req[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_blocking(admin, &reply[..n], reply_handle) && reply_handle != 0 {
-								close(reply_handle);
+							if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
+								for &leftover in reply_handle.as_slice() {
+									close(leftover);
+								}
 							}
-						} else if reply_handle != 0 {
-							close(reply_handle);
+						} else {
+							for &leftover in reply_handle.as_slice() {
+								close(leftover);
+							}
 						}
-						if handle != 0 {
-							close(handle);
+						for &unclaimed in handle.as_slice() {
+							close(unclaimed);
 						}
 					}
 					Received::Closed => return,
@@ -461,7 +466,7 @@ fn stream_subscribe_keys(service: u64, request: &[u8], request_handle: &mut u64,
 // event then travels as its own framed message on the producer endpoint, and closing
 // the producer marks end-of-stream.
 fn stream_subscribe(service: u64, request: &[u8], state: &mut Input) {
-	let mut request_handle: u64 = 0;
+	let mut request_handle = proto::codec::Handles::new();
 	let (corr, items): (u32, Vec<PointerEvent>) = match input::subscribe_open(state, request, &mut request_handle) {
 		Some(v) => v,
 		None => return,

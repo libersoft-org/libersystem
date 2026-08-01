@@ -17,5 +17,10 @@ shared-image = []
 # format through this one runtime crate.
 abi = { path = "../../../abi" }
 
+# The bounded transferred-handle list (`wire::Handles`) that the serve loops pass between a
+# message and a generated dispatch. `wire` has no dependencies of its own, so this adds no
+# cycle, and every method on it is `#[inline]`, so it adds no runtime import either.
+wire = { path = "../../../wire" }
+
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).
