@@ -215,6 +215,72 @@ pub trait Transport {
 // here is, and a fixed array keeps this no_std and allocation-free.
 pub const MAX_HANDLES: usize = 4;
 
+// A bounded, allocation-free list of transferred handles: what one message carries.
+//
+// It exists so the signatures that pass handles around stay readable. `dispatch` used to take
+// `request_handle: &mut u64` and `reply_handle: &mut u64`, and widening those to a list as a
+// pair of parameters each (an array plus a count) would have doubled the parameter count at
+// every one of the 22 places that call a generated dispatch. One value carries both.
+#[derive(Clone, Copy)]
+pub struct Handles {
+	list: [u64; MAX_HANDLES],
+	count: usize,
+}
+
+impl Default for Handles {
+	fn default() -> Self {
+		Handles::new()
+	}
+}
+
+impl Handles {
+	pub const fn new() -> Handles {
+		Handles { list: [0; MAX_HANDLES], count: 0 }
+	}
+
+	// Takes at most MAX_HANDLES, in the order given - which is encoding order, so a stage's
+	// stdin and stdout keep the positions their encoder gave them.
+	pub fn from_slice(handles: &[u64]) -> Handles {
+		let mut built = Handles::new();
+		built.count = handles.len().min(MAX_HANDLES);
+		built.list[..built.count].copy_from_slice(&handles[..built.count]);
+		built
+	}
+
+	pub fn as_slice(&self) -> &[u64] {
+		&self.list[..self.count]
+	}
+
+	pub fn len(&self) -> usize {
+		self.count
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.count == 0
+	}
+
+	// The first handle, or 0 when none was sent - for the callers that only ever expect one.
+	pub fn first(&self) -> u64 {
+		if self.count == 0 { 0 } else { self.list[0] }
+	}
+
+	// Append one, refusing past the bound rather than dropping it: a silently missing
+	// capability is a stage wired to nothing.
+	pub fn push(&mut self, handle: u64) -> Option<()> {
+		if self.count >= MAX_HANDLES {
+			return None;
+		}
+		self.list[self.count] = handle;
+		self.count += 1;
+		Some(())
+	}
+
+	pub fn clear(&mut self) {
+		self.list = [0; MAX_HANDLES];
+		self.count = 0;
+	}
+}
+
 pub struct Reader<'a> {
 	buf: &'a [u8],
 	pos: usize,
@@ -241,6 +307,11 @@ impl<'a> Reader<'a> {
 		let count = transferred.len().min(MAX_HANDLES);
 		handles[..count].copy_from_slice(&transferred[..count]);
 		Reader { buf, pos: 0, handles, count, taken: 0 }
+	}
+
+	// A reader for a message whose handles arrived as a bounded list.
+	pub fn with_handle_list(buf: &'a [u8], transferred: &Handles) -> Reader<'a> {
+		Reader::with_handles(buf, transferred.as_slice())
 	}
 
 	// The next transferred handle, in the order they were encoded. None once they are spent,
