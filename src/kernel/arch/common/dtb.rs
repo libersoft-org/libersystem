@@ -28,6 +28,45 @@ pub struct BootInfo {
 	// QEMU fw-cfg MMIO base (0 if the tree has no fw-cfg node). Drives the ramfb
 	// early framebuffer.
 	pub fwcfg_base: u64,
+	// The boot-module archive handed over as an initrd: `/chosen/linux,initrd-start` and
+	// `linux,initrd-end`. Both 0 when none was supplied.
+	//
+	// This is how a kernel that carries no userspace gets one on a machine with no bootloader
+	// module hand-off. x86_64 receives named modules from its own UEFI loader; here QEMU loads
+	// the archive and writes its range into the device tree, which is the same idea through
+	// the mechanism this platform actually has.
+	pub modules_start: u64,
+	pub modules_end: u64,
+}
+
+// Where the runner places the boot-module archive: high in RAM, below the top, so the frame
+// pool can simply stop underneath it. The kernel scans for it rather than agreeing on an exact
+// address, which is the same discovery pattern the FDT above uses (hint, then fixed address,
+// then scan) - one less constant that two components have to keep equal.
+pub const MODULES_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+// Find a PKGARCH1 archive in the top `MODULES_SCAN_BYTES` of RAM, returning its physical base
+// and total length. The magic makes the search self-validating: a stray match still has to
+// carry a header whose entry table fits inside the region.
+pub fn find_modules(ram_base: u64, ram_size: u64, phys_to_virt: fn(u64) -> u64) -> Option<(u64, u64)> {
+	let top = ram_base + ram_size;
+	let start = top.saturating_sub(MODULES_SCAN_BYTES).max(ram_base);
+	let mut base = start & !0xFFF;
+	while base + abi::PKG_HEADER_LEN as u64 <= top {
+		let header = unsafe { core::slice::from_raw_parts(phys_to_virt(base) as *const u8, abi::PKG_HEADER_LEN) };
+		if &header[0..8] == abi::PKG_MAGIC {
+			// Trust the header only as far as the region it sits in: the archive's own entry
+			// table has to fit between here and the top of RAM, or this is not one.
+			let available = (top - base) as usize;
+			let whole = unsafe { core::slice::from_raw_parts(phys_to_virt(base) as *const u8, available) };
+			if let Some(package) = abi::Package::parse(whole) {
+				let _ = package;
+				return Some((base, available as u64));
+			}
+		}
+		base += 0x1000;
+	}
+	None
 }
 
 // FDT token + header constants.
@@ -139,6 +178,7 @@ impl Fdt {
 			let mut in_pcie: i32 = -1;
 			let mut in_plic: i32 = -1;
 			let mut in_fwcfg: i32 = -1;
+			let mut d1_chosen = false;
 			let mut addr_cells: u32 = 2;
 			let mut size_cells: u32 = 2;
 			let mut ram_base: u64 = 0;
@@ -147,6 +187,8 @@ impl Fdt {
 			let mut pcie_ecam: u64 = 0;
 			let mut plic_base: u64 = 0;
 			let mut fwcfg_base: u64 = 0;
+			let mut modules_start: u64 = 0;
+			let mut modules_end: u64 = 0;
 
 			loop {
 				let token = self.be32(p);
@@ -159,6 +201,7 @@ impl Fdt {
 						if depth == 1 {
 							d1_memory = self.str_starts(name, "memory");
 							d1_cpus = self.str_eq(name, "cpus");
+							d1_chosen = self.str_eq(name, "chosen");
 						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
 							cpu_count += 1;
 						}
@@ -176,6 +219,7 @@ impl Fdt {
 						if depth == 1 {
 							d1_memory = false;
 							d1_cpus = false;
+							d1_chosen = false;
 						}
 						if depth == in_pcie {
 							in_pcie = -1;
@@ -221,6 +265,16 @@ impl Fdt {
 							// The plic node's reg is <plic_base plic_size> in root cells.
 							let mut q = val;
 							plic_base = self.read_cells(&mut q, addr_cells);
+						} else if depth == 1 && d1_chosen && (self.str_eq(pname, "linux,initrd-start") || self.str_eq(pname, "linux,initrd-end")) {
+							// QEMU writes these as one or two cells depending on the machine, so
+							// the width is taken from the property length rather than assumed -
+							// reading a 4-byte property as 8 would produce a wild address.
+							let value = if len == 8 { ((self.be32(val) as u64) << 32) | self.be32(val + 4) as u64 } else { self.be32(val) as u64 };
+							if self.str_eq(pname, "linux,initrd-start") {
+								modules_start = value;
+							} else {
+								modules_end = value;
+							}
 						} else if in_fwcfg == depth && self.str_eq(pname, "reg") {
 							// The fw-cfg node's reg is <fwcfg_base size> in root cells.
 							let mut q = val;
@@ -236,7 +290,7 @@ impl Fdt {
 			if ram_size == 0 {
 				return None;
 			}
-			Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1), pcie_ecam, plic_base, fwcfg_base })
+			Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1), pcie_ecam, plic_base, fwcfg_base, modules_start, modules_end })
 		}
 	}
 }

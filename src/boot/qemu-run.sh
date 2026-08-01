@@ -731,6 +731,26 @@ qemu_run_aarch64() {
 			${QEMU_EXTRA:-}
 	fi
 
+	# The boot modules, handed over as an initrd. This machine has no bootloader module
+	# hand-off, so the kernel receives the archive here and finds its range in the device tree -
+	# which is why the DTB below is dumped WITH `-initrd` and `-kernel` present: dumping it
+	# without them yields a tree whose /chosen carries no initrd range, and the kernel would
+	# come up with no userspace at all.
+	# The boot packages (init.pkg + volume.pkg, wrapped in one archive), placed 32 MiB below the
+	# top of RAM and found by the kernel's magic scan rather than handed over as an initrd:
+	# QEMU cannot produce a device tree that describes one here -
+	# `dumpdtb` with `-kernel` and `-initrd` together segfaults, and `-initrd` without `-kernel`
+	# is refused - so the tree this runner loads could never carry the range. The kernel clamps
+	# its frame pool below whatever it finds, so the archive survives the whole boot.
+	local packages_args=()
+	local packages_archive="$REPO_ROOT/.build/boot/boot-packages-aarch64.pkg"
+	if [[ -f "$packages_archive" ]]; then
+		local mem_bytes packages_addr
+		mem_bytes=$((${mem%M} * 1024 * 1024))
+		packages_addr=$((0x40000000 + mem_bytes - 32 * 1024 * 1024))
+		packages_args=(-device "loader,file=$packages_archive,addr=$packages_addr,force-raw=on")
+	fi
+
 	# Direct -kernel boot: dump DTB and load it at DTB_ADDR.
 	local dtb_file
 	dtb_file="$(mktemp /tmp/qemu-virt-XXXXXX.dtb)"
@@ -748,6 +768,7 @@ qemu_run_aarch64() {
 		-smp "$smp" \
 		-m "$mem" \
 		-kernel "$kernel" \
+		"${packages_args[@]}" \
 		-device "loader,file=$dtb_file,addr=$dtb_addr" \
 		-serial "$serial" \
 		"${DISPLAY_ARGS[@]}" \
@@ -854,6 +875,18 @@ qemu_run_riscv64() {
 			${QEMU_EXTRA:-}
 	fi
 
+	# The boot packages (init.pkg + volume.pkg, wrapped in one archive), placed 32 MiB below the
+	# top of RAM and found by the kernel's magic scan - see the aarch64 path for why this is not
+	# an initrd. The kernel clamps its frame pool below the archive so it survives the boot.
+	local packages_args=()
+	local packages_archive="$REPO_ROOT/.build/boot/boot-packages-riscv64.pkg"
+	if [[ -f "$packages_archive" ]]; then
+		local mem_bytes packages_addr
+		mem_bytes=$((${mem%M} * 1024 * 1024))
+		packages_addr=$((0x80000000 + mem_bytes - 32 * 1024 * 1024))
+		packages_args=(-device "loader,file=$packages_archive,addr=$packages_addr,force-raw=on")
+	fi
+
 	# Direct -kernel boot: OpenSBI jumps to kernel entry.
 	exec qemu-system-riscv64 \
 		-machine "virt,aia=aplic-imsic" \
@@ -862,6 +895,7 @@ qemu_run_riscv64() {
 		-m "$mem" \
 		-bios "$bios" \
 		-kernel "$kernel" \
+		"${packages_args[@]}" \
 		-serial "$serial" \
 		"${DISPLAY_ARGS[@]}" \
 		-no-reboot \

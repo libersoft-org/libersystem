@@ -112,11 +112,23 @@ _start:
 "#
 );
 
-// The init and volume packages, assembled from the aarch64 userspace by build.rs
-// and embedded here (aarch64 has no bootloader module hand-off). Empty when the
-// userspace was not staged first (a bare `cargo build`).
-const INIT_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.pkg"));
-const VOLUME_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/volume.pkg"));
+// The boot modules, handed over at RUN time rather than compiled in. aarch64 virt has no
+// bootloader module hand-off, so the archive arrives as an initrd and the device tree carries
+// its range (`/chosen/linux,initrd-start` / `-end`); this reads it from there.
+//
+// The kernel used to `include_bytes!` the packages out of its own OUT_DIR, which made the
+// kernel binary contain the userspace and made building the kernel depend on having built the
+// userspace first. It no longer does either: the kernel is the same binary whatever userspace
+// is handed to it, exactly as on x86_64 where its own loader passes the modules.
+static BOOT_MODULES: crate::sync::SpinLock<Option<&'static [u8]>> = crate::sync::SpinLock::new(None);
+// The archive's physical base, so the frame pool can be clamped below it. 0 = none found.
+static MODULES_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// The archive the initrd carries, or an empty slice when none was supplied - a kernel booted
+// with no userspace still comes up, it just has nothing to start.
+fn boot_archive() -> &'static [u8] {
+	(*BOOT_MODULES.lock()).unwrap_or(&[])
+}
 
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_main(arg: u64) -> ! {
@@ -191,6 +203,15 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	let (ram_top, cpu_count, fwcfg_base) = match boot_info {
 		Some(bi) => {
 			crate::serial_println!("aarch64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s)", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count);
+			// Find the boot-module archive the runner placed high in RAM. Recorded as a physical
+			// base so the frame pool below can stop underneath it - a &'static slice into memory
+			// the allocator may hand out would be overwritten mid-boot.
+			if let Some((base, length)) = crate::arch::common::dtb::find_modules(bi.ram_base, bi.ram_size, super::paging::phys_to_virt) {
+				MODULES_PHYS.store(base, core::sync::atomic::Ordering::SeqCst);
+				let archive: &'static [u8] = unsafe { core::slice::from_raw_parts(super::paging::phys_to_virt(base) as *const u8, length as usize) };
+				*BOOT_MODULES.lock() = Some(archive);
+				crate::serial_println!("aarch64: boot packages at {:#x} ({} bytes reachable)", base, length);
+			}
 			// The boot stub already maps the 256 GB device region (BOOT_L1[256]), so
 			// the PCIe ECAM is reachable through phys_to_virt; just point PCI at it.
 			if bi.pcie_ecam != 0 {
@@ -212,7 +233,12 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// Publish the direct-map offset so the portable subsystems (heap, ELF loader,
 	// ...) reach physical frames the same way this backend does (phys | KOFF).
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
-	let (region_base, region_len) = paging::usable_region(ram_top);
+	// Stop the frame pool below the boot modules. They are read for the whole life of the boot,
+	// so a pool that could hand out those frames would corrupt the userspace image while it was
+	// still being loaded from it.
+	let modules_phys = MODULES_PHYS.load(core::sync::atomic::Ordering::SeqCst);
+	let pool_top = if modules_phys != 0 && modules_phys < ram_top { modules_phys } else { ram_top };
+	let (region_base, region_len) = paging::usable_region(pool_top);
 	let regions = [bootproto::MemRegion { base: region_base, length: region_len, kind: bootproto::MEM_USABLE, _pad: 0 }];
 	crate::mem::frame::init(&regions);
 	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
@@ -428,7 +454,12 @@ fn publish_embedded_boot_info() {
 		nm[..name.len()].copy_from_slice(name);
 		bootproto::Module { addr: bytes.as_ptr() as u64, size: bytes.len() as u64, name: nm }
 	}
-	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", INIT_PKG), module(b"volume.pkg", VOLUME_PKG)]));
+	// The archive holds the packages as named entries, so the module list is built from what
+	// was actually handed over rather than from a fixed pair the kernel was compiled with.
+	let archive = boot_archive();
+	let init = abi::Package::parse(archive).and_then(|p| p.lookup(b"init.pkg")).unwrap_or(&[]);
+	let volume = abi::Package::parse(archive).and_then(|p| p.lookup(b"volume.pkg")).unwrap_or(&[]);
+	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", init), module(b"volume.pkg", volume)]));
 	// Hand the early framebuffer (if any) to a userspace consumer of the boot info.
 	let (framebuffer, fb_present) = match *BOOT_FB.lock() {
 		Some(f) => (bootproto::Framebuffer { addr: super::paging::phys_to_virt(f.phys), width: f.width, height: f.height, pitch: f.stride, bpp: 32, red_shift: f.red_shift, red_size: f.red_size, green_shift: f.green_shift, green_size: f.green_size, blue_shift: f.blue_shift, blue_size: f.blue_size, _pad: [0; 2] }, 1u32),
@@ -446,7 +477,8 @@ fn publish_embedded_boot_info() {
 // fault is isolated (the process is terminated), so the kernel always returns here.
 #[cfg(not(test))]
 fn run_system_manager() {
-	if INIT_PKG.is_empty() || VOLUME_PKG.is_empty() {
+	if boot_archive().is_empty() {
+		crate::serial_println!("aarch64: no boot packages were handed over - userspace is not started");
 		return;
 	}
 

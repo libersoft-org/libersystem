@@ -47,6 +47,13 @@ fn select_linker_script() {
 
 // Expose the assembled volume package at a stable path so the direct AArch64/RISC-V QEMU
 // runners can lay the factory archive onto virtio-blk at LBA 0.
+// Wrap the two boot packages into ONE archive for the architectures that can only be handed a
+// single blob. aarch64 and riscv64 virt have no bootloader to pass files, so the runner loads
+// this archive into memory and the kernel finds it there.
+//
+// It is a wrapper and nothing more: it holds `init.pkg` and `volume.pkg` under exactly the
+// names the x86_64 loader passes them by, so the kernel looks each up the same way everywhere.
+// The extra layer exists only because these machines cannot hand over two things.
 fn export_cross_arch_volume() {
 	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 	if arch == "aarch64" || arch == "riscv64" {
@@ -55,9 +62,16 @@ fn export_cross_arch_volume() {
 		let build_dir: PathBuf = PathBuf::from(&manifest_dir).join("../../.build/boot");
 		let _ = fs::create_dir_all(&build_dir);
 		let vol_src: PathBuf = out_dir.join("volume.pkg");
+		let init_src: PathBuf = out_dir.join("init.pkg");
 		if vol_src.exists() {
 			let bytes: Vec<u8> = fs::read(&vol_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", vol_src.display()));
 			write_if_changed(&build_dir.join(format!("volume-{arch}.pkg")), &bytes);
+		}
+		if vol_src.exists() && init_src.exists() {
+			let init: Vec<u8> = fs::read(&init_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", init_src.display()));
+			let volume: Vec<u8> = fs::read(&vol_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", vol_src.display()));
+			let archive = build_package(&[("init.pkg", init), ("volume.pkg", volume)]);
+			write_if_changed(&build_dir.join(format!("boot-packages-{arch}.pkg")), &archive);
 		}
 	}
 }

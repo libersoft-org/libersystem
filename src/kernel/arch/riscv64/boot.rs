@@ -105,11 +105,20 @@ _start:
 "#
 );
 
-// The init + volume packages assembled by build.rs from the riscv64 userspace build.
-// riscv64 boots directly (no bootloader hand-off), so the kernel embeds them and
-// publishes its own BootInfo pointing at them. Empty if the userspace was not built.
-const INIT_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/init.pkg"));
-const VOLUME_PKG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/volume.pkg"));
+// The boot modules, handed over at RUN time rather than compiled in. riscv64 virt boots the
+// kernel directly with no bootloader hand-off, so the archive arrives as an initrd and the
+// device tree carries its range (`/chosen/linux,initrd-start` / `-end`).
+//
+// The kernel used to `include_bytes!` the packages from its own OUT_DIR, which made the kernel
+// binary contain the userspace and made building the kernel require a built userspace. It does
+// neither now: one kernel binary, whatever userspace is handed to it.
+static BOOT_MODULES: crate::sync::SpinLock<Option<&'static [u8]>> = crate::sync::SpinLock::new(None);
+// The archive's physical base, so the frame pool can be clamped below it. 0 = none found.
+static MODULES_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn boot_archive() -> &'static [u8] {
+	(*BOOT_MODULES.lock()).unwrap_or(&[])
+}
 
 #[unsafe(no_mangle)]
 extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
@@ -157,6 +166,14 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	let (ram_top, cpu_count, pcie_ecam, _plic_base, fwcfg_base) = match super::dtb::parse(dtb) {
 		Some(bi) => {
 			crate::serial_println!("riscv64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s), ECAM {:#x}, PLIC {:#x}", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count, bi.pcie_ecam, bi.plic_base);
+			// Find the boot-module archive the runner placed high in RAM, recorded as a physical
+			// base so the frame pool can stop underneath it.
+			if let Some((base, length)) = crate::arch::common::dtb::find_modules(bi.ram_base, bi.ram_size, paging::phys_to_virt) {
+				MODULES_PHYS.store(base, core::sync::atomic::Ordering::SeqCst);
+				let archive: &'static [u8] = unsafe { core::slice::from_raw_parts(paging::phys_to_virt(base) as *const u8, length as usize) };
+				*BOOT_MODULES.lock() = Some(archive);
+				crate::serial_println!("riscv64: boot packages at {:#x} ({} bytes reachable)", base, length);
+			}
 			super::set_fwcfg_base(bi.fwcfg_base);
 			(bi.ram_base + bi.ram_size, bi.cpu_count, bi.pcie_ecam, bi.plic_base, bi.fwcfg_base)
 		}
@@ -173,7 +190,11 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	super::pci::set_ecam_base(pcie_ecam);
 
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
-	let (region_base, region_len) = paging::usable_region(ram_top);
+	// Stop the frame pool below the boot modules: they are read for the whole boot, so frames
+	// handed out from that range would corrupt the userspace image while it is still loading.
+	let modules_phys = MODULES_PHYS.load(core::sync::atomic::Ordering::SeqCst);
+	let pool_top = if modules_phys != 0 && modules_phys < ram_top { modules_phys } else { ram_top };
+	let (region_base, region_len) = paging::usable_region(pool_top);
 	let regions = [bootproto::MemRegion { base: region_base, length: region_len, kind: bootproto::MEM_USABLE, _pad: 0 }];
 	crate::mem::frame::init(&regions);
 	crate::serial_println!("riscv64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
@@ -345,7 +366,10 @@ fn publish_embedded_boot_info() {
 		nm[..name.len()].copy_from_slice(name);
 		bootproto::Module { addr: bytes.as_ptr() as u64, size: bytes.len() as u64, name: nm }
 	}
-	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", INIT_PKG), module(b"volume.pkg", VOLUME_PKG)]));
+	let archive = boot_archive();
+	let init = abi::Package::parse(archive).and_then(|p| p.lookup(b"init.pkg")).unwrap_or(&[]);
+	let volume = abi::Package::parse(archive).and_then(|p| p.lookup(b"volume.pkg")).unwrap_or(&[]);
+	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", init), module(b"volume.pkg", volume)]));
 	// Hand the early framebuffer (if any) to a userspace consumer of the boot info.
 	let (framebuffer, fb_present) = match *BOOT_FB.lock() {
 		Some(f) => (bootproto::Framebuffer { addr: super::paging::phys_to_virt(f.phys), width: f.width, height: f.height, pitch: f.stride, bpp: 32, red_shift: f.red_shift, red_size: f.red_size, green_shift: f.green_shift, green_size: f.green_size, blue_shift: f.blue_shift, blue_size: f.blue_size, _pad: [0; 2] }, 1u32),
@@ -361,8 +385,8 @@ fn publish_embedded_boot_info() {
 // use (pkg::Package + loader::spawn_elf_process + the PACKAGE/RAMDISK/MODE bootstrap).
 #[cfg(not(test))]
 fn run_system_manager() {
-	if INIT_PKG.is_empty() || VOLUME_PKG.is_empty() {
-		crate::serial_println!("riscv64: system - packages not embedded (build the riscv64 userspace first)");
+	if boot_archive().is_empty() {
+		crate::serial_println!("riscv64: no boot packages were handed over - userspace is not started");
 		return;
 	}
 
