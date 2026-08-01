@@ -23,7 +23,16 @@ pub const ABI_VERSION: u32 = 1;
 
 // Control messages intercepted by the userspace runtime before typed LSIDL
 // dispatch. Typed interface opcodes must stay at or below TYPED_OP_MAX.
-pub const TYPED_OP_MAX: u16 = 0xfffb;
+//
+// PROTOCOL_INFO_OP is answered by the GENERATED dispatch rather than by rt, because rt serves
+// any interface and cannot know which package a given service implements - the generated code
+// does. It is stateless by construction: the request is the opcode and a correlation id, the
+// reply is the package identity and version, and no existing method frame changes.
+//
+// Lowering TYPED_OP_MAX from 0xfffb to 0xfffa to make room is safe as of 2026-08-01 and was
+// checked rather than assumed: the highest `@op` across all 15 `.lsidl` schemas is 16.
+pub const TYPED_OP_MAX: u16 = 0xfffa;
+pub const PROTOCOL_INFO_OP: u16 = 0xfffb;
 pub const GOODBYE_OP: u16 = 0xfffc;
 pub const RESOLVE_OP: u16 = 0xfffd;
 pub const HEARTBEAT_OP: u16 = 0xfffe;

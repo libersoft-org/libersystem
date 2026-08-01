@@ -764,6 +764,9 @@ checksum = "d4ca08e5ef825b65b056d9efbd95c8750683f0a6d0466d02e96dc2e4e360f3d2"
 [[package]]
 name = "wire"
 version = "0.0.0"
+dependencies = [
+ "abi",
+]
 
 [[package]]
 name = "zune-core"

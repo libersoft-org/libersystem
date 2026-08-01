@@ -3,7 +3,7 @@
 //! LiberSystem base package - common error enum shared across all services.
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]
 
-use crate::codec::{Handles, Reader, Sink, SliceWriter, VecWriter};
+use crate::codec::{Handles, PROTOCOL_INFO_OP, Reader, Sink, SliceWriter, VecWriter};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;

@@ -35,7 +35,7 @@ pub fn rust(file: &File, source: &str, imports: &HashMap<String, ResolvedSymbol>
 			aliases.insert(local.clone(), wire_type.clone());
 		}
 	}
-	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), again_enums, aliases };
+	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums, aliases };
 	cg.file(file, source);
 	cg.imports(imports);
 	for item in &file.items {
@@ -57,7 +57,7 @@ pub fn compat_rust(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> St
 			aliases.insert(local.clone(), wire_type.clone());
 		}
 	}
-	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), again_enums: std::collections::HashSet::new(), aliases };
+	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums: std::collections::HashSet::new(), aliases };
 	cg.compat_tests(file);
 	cg.out
 }
@@ -66,6 +66,11 @@ struct Cg {
 	out: String,
 	tmp: u32,
 	package: String,
+	// The package identity as it goes on the wire for PROTOCOL_INFO: colon-joined path and the
+	// declared version. Kept beside `package` (underscore-joined, used for symbol names)
+	// because the two spellings are not interchangeable.
+	package_id: String,
+	package_version: u32,
 	// Error-enum names that carry an `again` case, so a dispatch whose reply
 	// overflows the caller's buffer can degrade to a typed error.
 	again_enums: std::collections::HashSet<String>,
@@ -167,7 +172,7 @@ impl Cg {
 		}
 		self.line("#![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]");
 		self.line("");
-		self.line("use crate::codec::{Handles, Reader, Sink, SliceWriter, VecWriter};");
+		self.line("use crate::codec::{Handles, PROTOCOL_INFO_OP, Reader, Sink, SliceWriter, VecWriter};");
 		self.line("use alloc::string::String;");
 		self.line("use alloc::vec::Vec;");
 		self.line("use core::fmt::Write as _;");
@@ -408,6 +413,19 @@ impl Cg {
 			self.line("\t\tlet op = r.u16()?;");
 			self.line("\t\tlet corr = r.u32()?;");
 			self.line("\t\tlet mut writer = SliceWriter::new(out);");
+			// The stateless identity query. Answered here rather than in rt's serve loops
+			// because rt serves every interface and cannot know which package this service
+			// implements; the generated code is the only layer that does. Emitted before the
+			// typed match so an interface can never shadow it - the validator also refuses a
+			// typed `@op` this high, so the two guards agree.
+			self.line("\t\tif op == PROTOCOL_INFO_OP {");
+			self.line("\t\t\tlet w = &mut writer;");
+			self.line("\t\t\tw.u32(corr)?;");
+			self.line(&format!("\t\t\tw.bytes_lp(b\"{}\")?;", self.package_id));
+			self.line(&format!("\t\t\tw.u32({})?;", self.package_version));
+			self.line("\t\t\t*reply_handles = Handles::from_slice(writer.handles());");
+			self.line("\t\t\treturn Some(writer.pos());");
+			self.line("\t\t}");
 			self.line("\t\tmatch op {");
 			for m in &supported {
 				if matches!(&m.ret, Type::Stream(_)) {
@@ -550,6 +568,32 @@ impl Cg {
 		self.line("\t\t\tlet c = self.corr;");
 		self.line("\t\t\tself.corr = self.corr.wrapping_add(1);");
 		self.line("\t\t\tc");
+		self.line("\t\t}");
+		// The caller side of the identity query. Deliberately NOT cached on `Client`: the
+		// transport is synchronous and stateless and over a hundred call sites construct a
+		// fresh `Client` inline, so a "once per connection" flag here would mean once per
+		// temporary client - which is no saving and a misleading promise.
+		self.line("\t\tpub fn protocol_info(&mut self) -> Option<(String, u32)> {");
+		self.line("\t\t\tlet corr = self.next_corr();");
+		self.line("\t\t\tlet mut writer = VecWriter::new();");
+		self.line("\t\t\tlet w = &mut writer;");
+		self.line("\t\t\tw.u16(PROTOCOL_INFO_OP)?;");
+		self.line("\t\t\tw.u32(corr)?;");
+		self.line("\t\t\tlet request = writer.into_inner();");
+		self.line("\t\t\tlet mut reply_handles = Handles::new();");
+		self.line("\t\t\tlet reply = self.transport.call(&request, &[], &mut reply_handles)?;");
+		self.line("\t\t\tif !reply_handles.is_empty() {");
+		self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
+		self.line("\t\t\t\treturn None;");
+		self.line("\t\t\t}");
+		self.line("\t\t\tlet mut reader = Reader::new(&reply);");
+		self.line("\t\t\tlet r = &mut reader;");
+		self.line("\t\t\tif r.u32()? != corr {");
+		self.line("\t\t\t\treturn None;");
+		self.line("\t\t\t}");
+		self.line("\t\t\tlet package = r.string_lp()?;");
+		self.line("\t\t\tlet version = r.u32()?;");
+		self.line("\t\t\tSome((package, version))");
 		self.line("\t\t}");
 		for m in &supported {
 			let params = client_params(m)?;

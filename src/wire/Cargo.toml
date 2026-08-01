@@ -2,3 +2,6 @@
 name = "wire"
 edition = "2024"
 description = "Transport-independent LSIDL wire codec and representation primitives"
+
+[dependencies]
+abi = { path = "../abi" }

@@ -670,3 +670,51 @@ fn component_renders_cbor_map() {
 	want.push(0x60); // text(0)
 	assert_eq!(c.to_cbor(), want);
 }
+
+#[test]
+fn protocol_info_answers_with_the_package_identity() {
+	// The stateless identity query: no service state is touched, the reply is the package this
+	// generated dispatch belongs to, and NO typed method frame is involved. It is answered by
+	// the generated code because rt's serve loops serve every interface and cannot know which
+	// package a given service implements.
+	let mut service = MemLog::default();
+	let mut request = Vec::new();
+	request.extend_from_slice(&crate::codec::PROTOCOL_INFO_OP.to_le_bytes());
+	request.extend_from_slice(&99u32.to_le_bytes());
+	let mut out = [0u8; 64];
+	let mut request_handles = crate::codec::Handles::new();
+	let mut reply_handles = crate::codec::Handles::new();
+	let n = log::dispatch(&mut service, &request, &mut request_handles, &mut out, &mut reply_handles).expect("the identity query is answered");
+
+	let mut reader = crate::codec::Reader::new(&out[..n]);
+	let r = &mut reader;
+	assert_eq!(r.u32(), Some(99), "the reply carries the caller's correlation id back");
+	assert_eq!(r.string_lp().as_deref(), Some("liber:log"), "the package identity is the colon-joined path");
+	assert_eq!(r.u32(), Some(1), "the package version travels with it");
+	assert!(reply_handles.is_empty(), "an identity query transfers no capability");
+
+	// It must not disturb the service: a query is not a method call.
+	assert!(service.entries.is_empty(), "answering the query ran no service method");
+}
+
+#[test]
+fn a_typed_opcode_cannot_reach_the_reserved_control_band() {
+	// The two guards must agree: the validator refuses a typed `@op` above TYPED_OP_MAX, and
+	// the generated dispatch answers PROTOCOL_INFO_OP before consulting the typed match. If
+	// TYPED_OP_MAX ever rises to cover the control band again, an interface method could shadow
+	// the identity query and this assertion is what says so.
+	assert!(crate::codec::PROTOCOL_INFO_OP > crate::codec::TYPED_OP_MAX, "the identity opcode sits above every typed one");
+}
+
+#[test]
+fn a_client_reads_the_identity_back_over_a_transport() {
+	// End to end over the loopback: the client's query reaches the generated dispatch and the
+	// identity comes back decoded. This is what proves the two halves agree on the frame -
+	// the dispatch-side test alone would pass even if the client encoded it differently.
+	let mut client = log::Client::new(Loopback { service: MemLog::default() });
+	assert_eq!(client.protocol_info(), Some((String::from("liber:log"), 1)));
+
+	// Asking twice must give the same answer: the query carries no state, and a fresh
+	// correlation id each time must not change what comes back.
+	assert_eq!(client.protocol_info(), Some((String::from("liber:log"), 1)));
+}

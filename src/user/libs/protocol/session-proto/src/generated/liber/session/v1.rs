@@ -3,7 +3,7 @@
 //! LiberSystem session package - shell session and job control.
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]
 
-use crate::codec::{Handles, Reader, Sink, SliceWriter, VecWriter};
+use crate::codec::{Handles, PROTOCOL_INFO_OP, Reader, Sink, SliceWriter, VecWriter};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -185,6 +185,14 @@ pub mod session {
 		let op = r.u16()?;
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:session")?;
+			w.u32(1)?;
+			*reply_handles = Handles::from_slice(writer.handles());
+			return Some(writer.pos());
+		}
 		match op {
 			OP_CWD => {
 				if r.has_handle() {
@@ -621,6 +629,28 @@ pub mod session {
 			let c = self.corr;
 			self.corr = self.corr.wrapping_add(1);
 			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, &[], &mut reply_handles)?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			Some((package, version))
 		}
 		pub fn cwd(&mut self) -> Option<Result<String, Error>> {
 			let corr = self.next_corr();

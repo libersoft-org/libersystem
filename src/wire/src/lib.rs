@@ -223,6 +223,10 @@ pub trait Transport {
 // here is, and a fixed array keeps this no_std and allocation-free.
 pub const MAX_HANDLES: usize = 4;
 
+// Re-exported so generated code, which reaches this crate as `crate::codec` but never `abi`,
+// names the SAME constant the runtime and the validator use rather than a copy of its value.
+pub use abi::{PROTOCOL_INFO_OP, TYPED_OP_MAX};
+
 // A bounded, allocation-free list of transferred handles: what one message carries.
 //
 // It exists so the signatures that pass handles around stay readable. `dispatch` used to take

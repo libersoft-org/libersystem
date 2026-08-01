@@ -134,13 +134,13 @@ fn rejects_duplicate_opcode() {
 
 #[test]
 fn rejects_opcode_zero() {
-	assert_err_contains(&wrap("enum error { x }\ninterface i { @op(0) m: func() -> result<unit, error>; }"), "1..=65531");
+	assert_err_contains(&wrap("enum error { x }\ninterface i { @op(0) m: func() -> result<unit, error>; }"), "1..=65530");
 }
 
 #[test]
 fn rejects_runtime_control_opcodes() {
 	for op in [abi::GOODBYE_OP, abi::RESOLVE_OP, abi::HEARTBEAT_OP, abi::CONNECT_OP] {
-		assert_err_contains(&wrap(&format!("enum error {{ x }}\ninterface i {{ @op({op}) m: func() -> result<unit, error>; }}")), "1..=65531");
+		assert_err_contains(&wrap(&format!("enum error {{ x }}\ninterface i {{ @op({op}) m: func() -> result<unit, error>; }}")), "1..=65530");
 	}
 }
 
@@ -303,14 +303,34 @@ fn aliases_expand_through_codecs_and_reject_cycles() {
 }
 
 #[test]
-fn stream_helpers_carry_one_handle_per_open_and_frame() {
+fn stream_helpers_carry_handles_per_open_and_frame() {
+	// This asserted the SINGLE-handle shape (`call(&request, request_handle)`) until 2026-08-01.
+	// A message now carries a bounded LIST, so the call takes the request's handles as a slice
+	// and receives the reply's through an out-parameter. The per-frame helpers stay singular on
+	// purpose: one stream element transfers at most one capability, which is a property of the
+	// frame protocol rather than a limit of the transport.
 	let file = parse_only("package liber:stream@1; resource file; record held { file: handle<file> } interface feed { @op(1) open: func(source: handle<file>) -> stream<held>; }");
 	assert!(validate::validate(&file).is_empty());
 	let rust = crate::codegen::rust(&file, "stream.lsidl", &std::collections::HashMap::new()).unwrap();
-	assert!(rust.contains("self.transport.call(&request, request_handle)?"));
+	assert!(rust.contains("self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?"));
 	assert!(rust.contains("frame_handle: &mut u64"));
 	assert!(rust.contains("*frame_handle = writer.handle();"));
 	assert!(rust.contains("Reader::with_handle(msg, *frame_handle)"));
+}
+
+#[test]
+fn every_generated_dispatch_answers_the_identity_query() {
+	// The query must be emitted for every interface, ahead of the typed match so no method can
+	// shadow it, and it must report the package it was generated from rather than a guess.
+	let file = parse_only("package liber:identity@7; enum error { x } interface api { @op(1) run: func() -> result<unit, error>; }");
+	assert!(validate::validate(&file).is_empty());
+	let rust = crate::codegen::rust(&file, "identity.lsidl", &std::collections::HashMap::new()).unwrap();
+	assert!(rust.contains("if op == PROTOCOL_INFO_OP {"), "the identity query is emitted");
+	assert!(rust.contains("w.bytes_lp(b\"liber:identity\")?;"), "it reports the colon-joined package path");
+	assert!(rust.contains("w.u32(7)?;"), "it reports the declared package version");
+	let query = rust.find("if op == PROTOCOL_INFO_OP {").unwrap();
+	let typed = rust.find("match op {").unwrap();
+	assert!(query < typed, "the query is answered before the typed match, so no @op can shadow it");
 }
 
 #[test]
