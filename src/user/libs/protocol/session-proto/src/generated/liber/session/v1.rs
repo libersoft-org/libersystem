@@ -19,6 +19,11 @@ pub struct JobInfo {
 	pub id: u32,
 	pub name: String,
 	pub stopped: bool,
+	/// Whether the handle behind this job is a ProcessGroup rather than a single Process -
+	/// a pipeline rather than a command. The session needs it because signalling and waiting
+	/// take a different syscall for each, and a group is finished only once EVERY stage is,
+	/// so a partially exited pipeline stays a job.
+	pub group: bool,
 }
 
 impl JobInfo {
@@ -39,13 +44,15 @@ impl JobInfo {
 		w.u32(self.id)?;
 		w.bytes_lp(self.name.as_bytes())?;
 		w.boolean(self.stopped)?;
+		w.boolean(self.group)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<JobInfo> {
 		let id = r.u32()?;
 		let name = r.string_lp()?;
 		let stopped = r.boolean()?;
-		Some(JobInfo { id, name, stopped })
+		let group = r.boolean()?;
+		Some(JobInfo { id, name, stopped, group })
 	}
 }
 
@@ -168,7 +175,7 @@ pub mod session {
 	pub trait Service {
 		fn cwd(&mut self) -> Result<String, Error>;
 		fn chdir(&mut self, path: String) -> Result<(), Error>;
-		fn job_register(&mut self, name: String, stopped: bool, proc: u64) -> Result<u32, Error>;
+		fn job_register(&mut self, name: String, stopped: bool, group: bool, proc: u64) -> Result<u32, Error>;
 		fn job_take(&mut self, id: u32) -> Result<JobEntry, Error>;
 		fn job_list(&mut self) -> Result<Vec<JobInfo>, Error>;
 		fn job_reap(&mut self) -> Result<Vec<JobInfo>, Error>;
@@ -267,6 +274,7 @@ pub mod session {
 			OP_JOB_REGISTER => {
 				let name = r.string_lp()?;
 				let stopped = r.boolean()?;
+				let group = r.boolean()?;
 				let proc = {
 					let _ = r.u32()?;
 					r.take_handle()?
@@ -275,7 +283,7 @@ pub mod session {
 					return None;
 				}
 				request_handles.clear();
-				let result = service.job_register(name, stopped, proc);
+				let result = service.job_register(name, stopped, group, proc);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -701,7 +709,7 @@ pub mod session {
 			}
 			decoded
 		}
-		pub fn job_register(&mut self, name: &str, stopped: &bool, proc: &u64) -> Option<Result<u32, Error>> {
+		pub fn job_register(&mut self, name: &str, stopped: &bool, group: &bool, proc: &u64) -> Option<Result<u32, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -709,6 +717,7 @@ pub mod session {
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
 			w.boolean(*stopped)?;
+			w.boolean(*group)?;
 			w.set_handle(*proc)?;
 			w.u32(0)?;
 			let request_handles = Handles::from_slice(writer.handles());
@@ -981,9 +990,9 @@ pub mod session {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_session_session_job_register")]
-	fn channel_invoke_job_register(chan: u64, name: &str, stopped: &bool, proc: &u64) -> Option<Result<u32, Error>> {
+	fn channel_invoke_job_register(chan: u64, name: &str, stopped: &bool, group: &bool, proc: &u64) -> Option<Result<u32, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
-		client.job_register(name, stopped, proc)
+		client.job_register(name, stopped, group, proc)
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1081,6 +1090,13 @@ impl JobInfo {
 		} else {
 			out.push_str("false");
 		}
+		out.push(',');
+		out.push_str("\"group\":");
+		if self.group {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -1097,16 +1113,25 @@ impl JobInfo {
 		} else {
 			out.push_str("false");
 		}
+		out.push_str(", ");
+		out.push_str("group=");
+		if self.group {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::map(out, 4);
 		crate::codec::cbor::text(out, "id");
 		crate::codec::cbor::uint(out, self.id as u64);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "stopped");
 		crate::codec::cbor::boolean(out, self.stopped);
+		crate::codec::cbor::text(out, "group");
+		crate::codec::cbor::boolean(out, self.group);
 	}
 }
 

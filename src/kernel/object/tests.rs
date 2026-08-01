@@ -292,3 +292,47 @@ fn object_property_set_names_an_object() {
 	assert!(DONE.load(Ordering::SeqCst));
 	assert_eq!(event.header().name().as_deref(), Some("irq-driver"));
 }
+
+crate::tagged_test!(a_group_handle_becomes_waitable_only_once_every_stage_ends, [Object, Kernel, Process, Syscall]);
+fn a_group_handle_becomes_waitable_only_once_every_stage_ends() {
+	use super::address_space::AddressSpace;
+	use super::process::Process;
+	use super::process_group::ProcessGroup;
+	use super::rights::Rights;
+	use core::sync::atomic::{AtomicBool, Ordering};
+
+	// `wait` knew Channel, Event, Timer, Interrupt and Process but NOT ProcessGroup, so a group
+	// handle was never ready and a caller polling one waited forever. That is how a pipeline
+	// job would have failed to reap: the session polls its handle to notice completion, and a
+	// handle that never reports ready keeps the job in the table for the life of the session.
+	static READY: AtomicBool = AtomicBool::new(false);
+	extern "C" fn probe(group: u64) {
+		// A finite deadline, so an unready group returns TIMED_OUT instead of parking this
+		// thread forever - which is exactly what the missing arm used to do.
+		let result = unsafe { crate::arch::syscall::invoke(crate::syscall::SYS_WAIT, group, 1, 0, 0) };
+		READY.store(result as i64 == 0, Ordering::SeqCst);
+	}
+
+	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain());
+	let stages = alloc::vec![make(), make()];
+	let group = ProcessGroup::create(&stages).expect("a two-stage group");
+
+	READY.store(true, Ordering::SeqCst);
+	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL, 0);
+	crate::sched::run_until_idle();
+	assert!(!READY.load(Ordering::SeqCst), "a group with live stages is not ready");
+
+	// The case worth pinning: SOME stages ended. An implementation reporting ready on the
+	// first exit would announce a pipeline finished while a stage was still producing.
+	stages[0].terminate();
+	READY.store(true, Ordering::SeqCst);
+	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL, 0);
+	crate::sched::run_until_idle();
+	assert!(!READY.load(Ordering::SeqCst), "a partly exited group is still not ready");
+
+	stages[1].terminate();
+	READY.store(false, Ordering::SeqCst);
+	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL, 0);
+	crate::sched::run_until_idle();
+	assert!(READY.load(Ordering::SeqCst), "the group is ready once every stage has ended");
+}

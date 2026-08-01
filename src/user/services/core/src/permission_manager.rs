@@ -51,7 +51,7 @@ use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::network;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, Error, Manifest, StartResult, process};
+use proto::system::{AuditEntry, Capability, Error, Manifest, PipelineResult, PipelineStage, StartResult, process};
 use rt::*;
 use services::executable;
 
@@ -154,6 +154,13 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"sandbox_probe" => Some(intersected("sandbox_probe", alloc::vec![Capability::Storage, Capability::Log, Capability::Network], &[Capability::Storage, Capability::Log])),
 		b"date" => Some(granted("date", alloc::vec![Capability::Time])),
 		b"request_probe" => Some(granted("request_probe", alloc::vec![Capability::Log])),
+		// `echo` and `readln` need no capability at all: they only read and write the stdio
+		// the launch itself hands them, which is not a manifest grant. They still need an
+		// entry, because a tool with no manifest is refused - a governed launch never runs a
+		// component whose permissions were never declared, and "declared as needing nothing"
+		// has to be sayable.
+		b"echo" => Some(granted("echo", alloc::vec![])),
+		b"readln" => Some(granted("readln", alloc::vec![])),
 		b"cat" => Some(granted("cat", alloc::vec![Capability::Volumes])),
 		b"write" => Some(granted("write", alloc::vec![Capability::Volumes])),
 		b"rm" => Some(granted("rm", alloc::vec![Capability::Volumes])),
@@ -437,7 +444,77 @@ impl Service for Manager {
 			None => Err(Error::NotFound),
 		}
 	}
+
+	// Start a pipeline as one transaction. The broker allocates every edge itself: the caller
+	// names only the tools and their arguments, so it can neither pick which endpoint a stage
+	// receives nor hand one in from outside. `stdout` is the terminal end, and it belongs to
+	// the LAST stage - every earlier stage writes into the edge made for it.
+	fn run_pipeline(&mut self, stages: Vec<PipelineStage>, cwd: String, stdout: u64) -> Result<PipelineResult, Error> {
+		if stages.is_empty() || stages.len() > MAX_PIPELINE_STAGES {
+			// Bounded like every other resource here: a caller cannot ask for an unbounded
+			// number of processes and endpoints in one request.
+			unsafe { close(stdout) };
+			return Err(Error::Invalid);
+		}
+		unsafe {
+			// One edge per `A | B`. Allocated up front so a failure to make one costs nothing
+			// but the endpoints already made - no stage exists yet.
+			let mut edges: Vec<(u64, u64)> = Vec::new();
+			for _ in 1..stages.len() {
+				match channel() {
+					Some(pair) => edges.push(pair),
+					None => {
+						for (read, write) in edges {
+							close(read);
+							close(write);
+						}
+						close(stdout);
+						return Err(Error::Invalid);
+					}
+				}
+			}
+			// Stage i writes to edge i (or the terminal, if it is last) and reads from
+			// edge i-1 (or nothing, if it is first). `channel()` returns (a, b) as a connected
+			// pair; a stage writes into one end and its consumer reads the other.
+			let mut requests: Vec<StageRequest> = Vec::new();
+			for (index, stage) in stages.iter().enumerate() {
+				let out: u64 = if index + 1 == stages.len() { stdout } else { edges[index].1 };
+				let input: u64 = if index == 0 { 0 } else { edges[index - 1].0 };
+				requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input });
+			}
+			let started: Vec<StartResult> = match run_pipeline_under_manifest(self.procsvc, &requests, cwd.as_bytes(), &mut self.clients, &mut self.audit) {
+				Some(started) => started,
+				None => {
+					// The transaction released nothing, so nothing ran. The endpoints are the
+					// only thing to clean up.
+					for (read, write) in edges {
+						close(read);
+						close(write);
+					}
+					close(stdout);
+					return Err(Error::NotFound);
+				}
+			};
+			// The broker's own copies of the edge endpoints are spent: each was transferred to
+			// the stage that owns it, and holding a duplicate here would keep a pipe open after
+			// its writer exits, so the reader would never see end-of-stream.
+			let count: u32 = started.len() as u32;
+			let tasks: Vec<u64> = started.iter().map(|s| s.task).collect();
+			let group: i64 = process_group_create(&tasks);
+			for task in tasks {
+				close(task);
+			}
+			if group < 0 {
+				return Err(Error::Invalid);
+			}
+			Ok(PipelineResult { group: group as u64, stages: count })
+		}
+	}
 }
+
+// A pipeline may not ask for more stages than the shell grammar can express, so the two
+// bounds cannot disagree about what is a legal line.
+const MAX_PIPELINE_STAGES: usize = 8;
 
 // Launch a component under its permission manifest: ask ProcessService (the loading
 // mechanism) to start it with a fresh bootstrap channel, then for every capability in the
@@ -568,13 +645,17 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		let name_str: &str = core::str::from_utf8(name).ok()?;
 		let (manager_side, child_side): (u64, u64) = channel()?;
 		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
-		let started: StartResult = match if name == b"imgconv" { process_client.launch_bounded(name_str, &IMGCONV_MEMORY_LIMIT, &child_side) } else { process_client.launch(name_str, &child_side) } {
+		// Prepared, never started here: every tool goes through the same gate a pipeline stage
+		// does, so the single-stage and multi-stage paths cannot drift in how a process is
+		// built. The release is at the bottom, once the whole graph this tool can see exists.
+		let started: StartResult = match if name == b"imgconv" { process_client.launch_bounded(name_str, &IMGCONV_MEMORY_LIMIT, &child_side) } else { process_client.launch_prepared(name_str, &child_side) } {
 			Some(Ok(s)) => s,
 			_ => {
 				close(manager_side);
 				return None;
 			}
 		};
+		let prepared: bool = name != b"imgconv";
 		let policy_name: String = match executable::logical_name(&started.info.name) {
 			Some(name) => String::from(name),
 			None => {
@@ -621,7 +702,135 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		// message - sending it before the tagged grants would instead be mis-consumed by the
 		// tool's `recv_tagged` for its capabilities.
 		send_blocking(manager_side, cwd, 0);
+		// Commit: the tool's stdout, arguments, grants and cwd are all queued, so what it will
+		// observe is complete. Anything that failed above returned without releasing, which
+		// leaves a process that never ran rather than one that started on half a grant set.
+		if prepared && !matches!(process_client.release(&started.info.koid), Some(Ok(true))) {
+			close(manager_side);
+			return None;
+		}
 		close(manager_side);
+		Some(started)
+	}
+}
+
+// A pipeline stage as the broker needs it: the tool to run, its argument string, and the
+// stdio it is to be given. `stdout` is always present (the terminal for the last stage, an
+// edge's write end otherwise); `stdin` is present only for a stage that has a producer.
+struct StageRequest<'a> {
+	name: &'a [u8],
+	args: &'a [u8],
+	stdout: u64,
+	stdin: u64,
+}
+
+// Build a whole pipeline as one transaction: prepare every stage, install every stage's
+// stdio and grants, and only then release them together.
+//
+// The ordering is the point. Every stage is created behind the start gate, so a failure at
+// ANY stage - an unknown tool, a missing manifest, an endpoint that cannot be transferred -
+// returns having released nothing, and no stage has run. A pipeline that half-exists is
+// worse than one that does not: stage B reading from a producer that will never be started
+// would block forever, and stage A writing into an endpoint nobody will read would too.
+//
+// Each stage's stdio goes over in ONE message carrying ordered capabilities - stdout first,
+// stdin second when it has one - because a receiver cannot tell a second message that was
+// never sent from the next handoff in its bootstrap sequence. That is what the M0120
+// multi-capability work exists for, and it is why this needs no "does this stage have
+// stdin?" agreement between the two sides.
+unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<Vec<StartResult>> {
+	unsafe {
+		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
+		let mut prepared: Vec<(StartResult, u64)> = Vec::new();
+		// Unwind that runs on every early return: abandoning a prepared launch is how this
+		// transaction rolls back, because a stage that was never released never ran.
+		macro_rules! abandon {
+			($built:expr) => {{
+				for (started, manager_side) in $built {
+					close(manager_side);
+					close(started.task);
+				}
+				return None;
+			}};
+		}
+		for stage in stages {
+			let name_str: &str = match core::str::from_utf8(stage.name) {
+				Ok(s) => s,
+				Err(_) => abandon!(prepared),
+			};
+			let (manager_side, child_side): (u64, u64) = match channel() {
+				Some(pair) => pair,
+				None => abandon!(prepared),
+			};
+			let started: StartResult = match process_client.launch_prepared(name_str, &child_side) {
+				Some(Ok(s)) => s,
+				_ => {
+					close(manager_side);
+					abandon!(prepared);
+				}
+			};
+			let policy_name: String = match executable::logical_name(&started.info.name) {
+				Some(name) => String::from(name),
+				None => {
+					close(manager_side);
+					close(started.task);
+					abandon!(prepared);
+				}
+			};
+			let manifest: Manifest = match manifest_for(policy_name.as_bytes()) {
+				Some(manifest) => manifest,
+				None => {
+					close(manager_side);
+					close(started.task);
+					abandon!(prepared);
+				}
+			};
+			// stdout, then stdin when there is one, as ordered capabilities in one message.
+			let installed: bool = if stage.stdin == 0 { send_caps_blocking(manager_side, STDOUT_TAG, &[stage.stdout]) } else { send_caps_blocking(manager_side, STDOUT_TAG, &[stage.stdout, stage.stdin]) };
+			if !installed {
+				close(manager_side);
+				close(started.task);
+				abandon!(prepared);
+			}
+			send_blocking(manager_side, stage.args, 0);
+			for &cap in VOCABULARY.iter() {
+				let granted: bool = manifest.grants.contains(&cap);
+				if granted {
+					let ok: bool = if cap == Capability::Volumes {
+						grant_volumes(manager_side, clients)
+					} else {
+						let handle: u64 = grant_for_task(clients, cap, started.task);
+						handle != 0 && send_blocking(manager_side, tag_for(cap), handle)
+					};
+					if !ok {
+						close(manager_side);
+						close(started.task);
+						abandon!(prepared);
+					}
+				}
+				audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
+			}
+			send_blocking(manager_side, cwd, 0);
+			prepared.push((started, manager_side));
+		}
+		// Commit. Released in pipeline order so a producer is running before its consumer can
+		// find the pipe empty - not required for correctness, since a consumer blocks on an
+		// empty channel either way, but it keeps the common case from a needless wait.
+		let mut started: Vec<StartResult> = Vec::new();
+		for (result, manager_side) in prepared {
+			if !matches!(process_client.release(&result.info.koid), Some(Ok(true))) {
+				// Past the first release the transaction can no longer be unwound cleanly:
+				// stages already running are told to stop rather than left orphaned.
+				close(manager_side);
+				close(result.task);
+				for earlier in &started {
+					signal(earlier.task, abi::SIG_KILL);
+				}
+				return None;
+			}
+			close(manager_side);
+			started.push(result);
+		}
 		Some(started)
 	}
 }

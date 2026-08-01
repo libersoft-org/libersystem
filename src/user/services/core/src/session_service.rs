@@ -58,6 +58,10 @@ struct Job {
 	proc: u64,
 	name: String,
 	stopped: bool,
+	// Whether `proc` is a ProcessGroup rather than a single Process. The two are driven by
+	// different syscalls, and only the kernel can say a group is finished - which it does
+	// once every member has terminated, so a pipeline stays a job until its last stage goes.
+	group: bool,
 }
 
 // One login session's state: its working directory, its environment variables (seeded
@@ -90,10 +94,10 @@ impl Service for Session {
 	// Register a background or stopped job: the request transferred us its live Process
 	// handle, which we keep so the job outlives the shell that started it. We assign and
 	// return the small id the shell shows the user.
-	fn job_register(&mut self, name: String, stopped: bool, proc: u64) -> Result<u32, Error> {
+	fn job_register(&mut self, name: String, stopped: bool, group: bool, proc: u64) -> Result<u32, Error> {
 		let id: u32 = self.next_id;
 		self.next_id = self.next_id.wrapping_add(1);
-		self.jobs.push(Job { id, proc, name, stopped });
+		self.jobs.push(Job { id, proc, name, stopped, group });
 		Ok(id)
 	}
 
@@ -102,12 +106,12 @@ impl Service for Session {
 	fn job_take(&mut self, id: u32) -> Result<JobEntry, Error> {
 		let pos: usize = self.jobs.iter().position(|j: &Job| j.id == id).ok_or(Error::NotFound)?;
 		let job: Job = self.jobs.remove(pos);
-		Ok(JobEntry { info: JobInfo { id: job.id, name: job.name, stopped: job.stopped }, proc: job.proc })
+		Ok(JobEntry { info: JobInfo { id: job.id, name: job.name, stopped: job.stopped, group: job.group }, proc: job.proc })
 	}
 
 	// List the tracked jobs for the shell's `jobs` command.
 	fn job_list(&mut self) -> Result<Vec<JobInfo>, Error> {
-		Ok(self.jobs.iter().map(|j: &Job| JobInfo { id: j.id, name: j.name.clone(), stopped: j.stopped }).collect())
+		Ok(self.jobs.iter().map(|j: &Job| JobInfo { id: j.id, name: j.name.clone(), stopped: j.stopped, group: j.group }).collect())
 	}
 
 	// Reap finished jobs: poll each running (not stopped) job's Process handle - once it
@@ -120,7 +124,7 @@ impl Service for Session {
 			if !self.jobs[i].stopped && unsafe { poll_ready(self.jobs[i].proc) } {
 				let job: Job = self.jobs.remove(i);
 				unsafe { close(job.proc) };
-				done.push(JobInfo { id: job.id, name: job.name, stopped: job.stopped });
+				done.push(JobInfo { id: job.id, name: job.name, stopped: job.stopped, group: job.group });
 			} else {
 				i += 1;
 			}
@@ -133,10 +137,19 @@ impl Service for Session {
 	fn job_resume(&mut self, id: u32) -> Result<JobInfo, Error> {
 		let pos: usize = self.jobs.iter().position(|j: &Job| j.id == id).ok_or(Error::NotFound)?;
 		if self.jobs[pos].stopped {
-			unsafe { signal(self.jobs[pos].proc, SIG_CONT) };
+			// A group resumes every live stage; a single process resumes itself. Sending the
+			// process signal to a group handle would simply be refused, leaving a pipeline
+			// stopped forever with the session believing it had resumed.
+			unsafe {
+				if self.jobs[pos].group {
+					process_group_signal(self.jobs[pos].proc, SIG_CONT);
+				} else {
+					signal(self.jobs[pos].proc, SIG_CONT);
+				}
+			}
 			self.jobs[pos].stopped = false;
 		}
-		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped })
+		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped, group: self.jobs[pos].group })
 	}
 
 	// Read one environment variable. NotFound if the session has no variable by that name.

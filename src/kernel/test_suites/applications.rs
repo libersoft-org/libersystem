@@ -283,3 +283,19 @@ fn component_host_runs_an_sdk_component() {
 	assert!(logged, "the component reached its LogService grant - the second typed service was wired with no ambient authority");
 	assert_eq!(score, 17, "the component's float `score` export computed floor(10 * 1.5 + 2.0) on real toolchain output");
 }
+
+tagged_test!(a_governed_pipeline_starts_as_one_transaction_and_carries_data, [Service, Process, PermissionService]);
+fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
+	// `echo hello | readln` through PermissionManager: two stages, each authorized against
+	// its own manifest, the edge between them allocated by the broker, and both released
+	// together. `readln` prefixes what it reads with `in> `, so this distinguishes a consumer
+	// that actually read its producer's bytes from a producer whose output merely reached the
+	// terminal - which is what a pipeline that was never really wired would look like.
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	assert!(result.pipeline_started, "the broker started the two-stage pipeline");
+	// Asserted as "the prefix immediately precedes the payload" rather than as an exact
+	// buffer. `echo` writes its text and its newline as separate messages, so `readln` sees
+	// two lines and prefixes both; pinning the whole byte sequence would tie this test to how
+	// a producer happens to split its writes, which is not what a pipeline promises.
+	assert!(result.pipeline_read.windows(9).any(|window| window == b"in> hello"), "readln read echo's bytes through the broker-allocated edge and echoed them behind its own prefix, got {:?}", core::str::from_utf8(&result.pipeline_read));
+}

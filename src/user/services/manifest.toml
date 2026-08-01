@@ -922,6 +922,7 @@ providers = [
 	"input-proto",
 	"observability-proto",
 	"process-proto",
+	"security-proto",
 	"session-proto",
 	"storage-proto",
 	"ipc-client",

@@ -1698,6 +1698,15 @@ fn object_ready_for(object: &Arc<dyn KernelObject>, writable: bool) -> bool {
 		// process-terminated signal.
 		return process.is_terminated();
 	}
+	if let Some(group) = any.downcast_ref::<crate::object::process_group::ProcessGroup>() {
+		// A group is ready once EVERY member has terminated, which is what makes a pipeline
+		// waitable as one thing: a job stays a job until its last stage is gone, so a shell
+		// cannot announce a pipeline finished while a stage is still running.
+		//
+		// Without this arm a group handle was never ready, so a caller polling one waited
+		// forever - which is how a pipeline job would have failed to reap.
+		return group.finished();
+	}
 	false
 }
 

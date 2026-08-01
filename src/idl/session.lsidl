@@ -13,6 +13,11 @@ record job-info {
 	id:      u32,
 	name:    string,
 	stopped: bool,
+	/// Whether the handle behind this job is a ProcessGroup rather than a single Process -
+	/// a pipeline rather than a command. The session needs it because signalling and waiting
+	/// take a different syscall for each, and a group is finished only once EVERY stage is,
+	/// so a partially exited pipeline stays a job.
+	group:   bool,
 }
 
 /// A job handed back to a foregrounding shell: its info plus the live Process handle
@@ -58,7 +63,7 @@ record env-var {
 interface session {
 	@op(1)  cwd:          func() -> result<string, error>;
 	@op(2)  chdir:        func(path: string) -> result<unit, error>;
-	@op(3)  job-register: func(name: string, stopped: bool, proc: handle<task>) -> result<u32, error>;
+	@op(3)  job-register: func(name: string, stopped: bool, group: bool, proc: handle<task>) -> result<u32, error>;
 	@op(4)  job-take:     func(id: u32) -> result<job-entry, error>;
 	@op(5)  job-list:     func() -> result<list<job-info>, error>;
 	@op(6)  job-reap:     func() -> result<list<job-info>, error>;

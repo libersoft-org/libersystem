@@ -16,10 +16,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
-use proto::system::{Component, EnvVar, JobEntry, JobInfo, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{Component, EnvVar, JobEntry, JobInfo, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
-use services::shell_language::{parse_and_expand, parse_assignment, trim};
+use services::shell_language::{Pipeline, parse_and_expand, parse_assignment, parse_pipeline, trim};
 use storage_proto::path;
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
@@ -264,10 +264,29 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// The terminal delivers a whole submitted line (with a trailing newline); trim
 			// it, expand any `$NAME` / `${NAME}` against the environment, normalize its flags,
 			// then dispatch it, reap finished jobs, and print the next prompt.
-			let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
+			// A multi-stage line goes to the broker as one pipeline transaction. Parsed from
+			// the RAW line, not the expanded one: `parse_pipeline` lexes operators before any
+			// variable is substituted, so a variable holding `|` cannot turn a single command
+			// into a pipeline. Anything else - including a one-stage line, which needs no
+			// transaction - takes today's path unchanged.
 			let cwd_before: String = cwd.clone();
-			if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, &mut graphsvc, broker, permsvc, session, admin, &mut jobs, &mut vars, &mut cwd) {
-				return;
+			let pipeline = parse_pipeline(&line_buf[..n], &vars);
+			let multi_stage: bool = matches!(&pipeline, Ok(p) if p.stages.len() > 1);
+			if multi_stage {
+				let parsed = pipeline.expect("checked by multi_stage");
+				if parsed.stages.iter().any(|stage| !stage.redirects.is_empty()) {
+					// Redirection inside a pipeline is not wired yet - it waits on M0131's
+					// streaming-read adapter and transactional writer. Refusing beats running
+					// the line with the part the user asked for silently dropped.
+					print(b"shell: redirection is not supported in a pipeline yet\n");
+				} else if !run_pipeline_line(&mut jobs, permsvc, &parsed, cwd.as_bytes()) {
+					print(b"shell: pipeline could not be started\n");
+				}
+			} else {
+				let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
+				if dispatch(&prepared, storage, media, iso, udf, usb, procsvc, netsvc, inputsvc, &mut graphsvc, broker, permsvc, session, admin, &mut jobs, &mut vars, &mut cwd) {
+					return;
+				}
 			}
 			// A `cd` moved the prompt: refresh ConsoleService's copy so argument completion
 			// resolves against the new directory.
@@ -314,11 +333,23 @@ impl Jobs {
 	// the small id. None when there is no session to hold it, or the register failed - the
 	// caller then disposes of the job itself.
 	fn register(&mut self, proc: u64, name: &[u8], stopped: bool) -> Option<u32> {
+		self.register_kind(proc, name, stopped, false)
+	}
+
+	// The same registration for a whole pipeline: `proc` is a ProcessGroup, so the session
+	// signals and waits on it as a group. Split from `register` rather than given a default,
+	// because a caller that passes the wrong kind gets a job that can never be resumed or
+	// reaped and no error at the point of the mistake.
+	fn register_group(&mut self, group: u64, name: &[u8], stopped: bool) -> Option<u32> {
+		self.register_kind(group, name, stopped, true)
+	}
+
+	fn register_kind(&mut self, proc: u64, name: &[u8], stopped: bool, group: bool) -> Option<u32> {
 		if self.session == 0 {
 			return None;
 		}
 		let name_str: &str = core::str::from_utf8(name).unwrap_or("");
-		match session::Client::new(ChannelTransport { chan: self.session }).job_register(name_str, &stopped, &proc) {
+		match session::Client::new(ChannelTransport { chan: self.session }).job_register(name_str, &stopped, &group, &proc) {
 			Some(Ok(id)) => Some(id),
 			_ => None,
 		}
@@ -1314,6 +1345,89 @@ unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
 		}
 		close(out_read);
 		close(task);
+		true
+	}
+}
+
+// Run a multi-stage pipeline through PermissionManager as ONE transaction and relay the last
+// stage's output to this console.
+//
+// The shell names only the tools and their arguments. Every edge is allocated by the broker,
+// so the shell cannot choose which endpoint a stage receives, and a stage cannot be handed an
+// endpoint smuggled in from outside - the same reason a single command's stdout is a channel
+// the broker forwards rather than one the caller picks.
+//
+// Returns false when the broker refuses the pipeline, in which case NO stage was started: the
+// transaction releases nothing until every stage exists and is wired.
+unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, pipeline: &Pipeline, cwd: &[u8]) -> bool {
+	unsafe {
+		let cwd_str: &str = match core::str::from_utf8(cwd) {
+			Ok(s) => s,
+			Err(_) => return false,
+		};
+		let mut stages: Vec<PipelineStage> = Vec::new();
+		for stage in &pipeline.stages {
+			let name: &str = match core::str::from_utf8(&stage.words[0]) {
+				Ok(s) => s,
+				Err(_) => return false,
+			};
+			// The words after the command, rejoined as the argument string the governed launch
+			// contract passes. Redirections are not carried yet - a stage that names one is
+			// refused below rather than run with it silently dropped.
+			let mut args: Vec<u8> = Vec::new();
+			for word in stage.words.iter().skip(1) {
+				if !args.is_empty() {
+					args.push(b' ');
+				}
+				args.extend_from_slice(word);
+			}
+			let args_str: String = match String::from_utf8(args) {
+				Ok(s) => s,
+				Err(_) => return false,
+			};
+			stages.push(PipelineStage { name: String::from(name), args: args_str });
+		}
+		let (out_read, out_write): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return false,
+		};
+		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
+		let group: u64 = match client.run_pipeline(&stages, cwd_str, &out_write) {
+			Some(Ok(result)) => result.group,
+			_ => {
+				close(out_read);
+				return false;
+			}
+		};
+		if pipeline.background {
+			// A background pipeline becomes ONE job over its group, so `jobs`, `fg` and
+			// completion reaping treat it exactly like a background command. The relay is
+			// skipped: nothing is waiting on its output at the prompt.
+			let mut label: Vec<u8> = Vec::new();
+			for (index, stage) in pipeline.stages.iter().enumerate() {
+				if index > 0 {
+					label.extend_from_slice(b" | ");
+				}
+				label.extend_from_slice(&stage.words[0]);
+			}
+			if jobs.register_group(group, &label, false).is_none() {
+				close(group);
+			}
+			close(out_read);
+			return true;
+		}
+		// Relay until the last stage exits and its end closes. Earlier stages write into their
+		// edges, which the broker never holds a copy of, so each closes when its writer exits
+		// and its reader sees end-of-stream rather than hanging.
+		let mut obuf: [u8; 4096] = [0u8; 4096];
+		loop {
+			match recv_blocking(out_read, &mut obuf) {
+				Received::Message { len, .. } => print(&obuf[..len]),
+				Received::Closed => break,
+			}
+		}
+		close(out_read);
+		close(group);
 		true
 	}
 }
