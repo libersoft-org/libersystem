@@ -18,7 +18,7 @@ usually describes does not exist here.
   `Capped` charges as files are written.
 - Bounded everywhere: file size, entry count, name length and path depth all refuse past their
   limit rather than truncating.
-- `no_std` + `alloc`, ~270 lines, 12 unit tests. It implements the storage service's
+- `no_std` + `alloc`, ~280 lines, 14 unit tests. It implements the storage service's
   `FileSystem` trait directly, NOT `fscore::BlockDevice` - there is no block device under it.
 - Mounted as `vol://ram` (reserved) and `vol://tmp` (capped).
 
@@ -66,11 +66,17 @@ so `used + reserved` is always the capacity and never more.
 
 Two properties make that guarantee real rather than nominal, and both are easy to get wrong:
 
-- **A write releases before it allocates.** Allocating the file first would leave the new bytes
-  and the reservation outstanding at the same time, so a volume at its capacity would need twice
-  its capacity to write into itself - failing for memory it was sitting on, which is exactly the
-  failure a reservation exists to prevent. If the allocation is refused anyway, the release is
-  undone, so a failed write leaves the volume holding what it held before.
+- **A write releases before it allocates, and releases all of it.** Allocating the file first
+  would leave the new bytes and the reservation outstanding at the same time, so a volume at its
+  capacity would need twice its capacity to write into itself - failing for memory it was sitting
+  on, which is exactly the failure a reservation exists to prevent. Releasing only the difference
+  would rest on the reservation being perfectly in step, which it is not after a regrow has
+  fallen short; releasing all of it makes how much is held irrelevant to whether the write can
+  proceed. If the allocation is refused anyway, the resync puts back what the volume should hold.
+- **The reservation is dropped and reallocated, never resized.** `shrink_to_fit` reallocates and
+  COPIES what it keeps, so resizing would memcpy what remains of the reservation on every single
+  write - megabytes per write on a volume of any size, to preserve zeros nothing ever reads.
+  Dropping first also keeps the old block from being outstanding alongside the new one.
 - **Taking memory back is best effort.** After a file shrinks or is deleted the reservation
   regrows with `try_reserve_exact`; `Vec::resize` would ABORT on failure, which in a storage
   service is a crash where a degraded guarantee would do. If less comes back than was released,
