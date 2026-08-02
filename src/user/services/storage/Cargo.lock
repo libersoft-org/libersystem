@@ -94,6 +94,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libermemfs"
+version = "0.0.0"
+dependencies = [
+ "fscore",
+]
+
+[[package]]
 name = "log-proto"
 version = "0.0.0"
 dependencies = [
@@ -198,6 +205,7 @@ dependencies = [
  "ipc-client",
  "iso9660",
  "liberfs",
+ "libermemfs",
  "proto",
  "rt",
  "udf",

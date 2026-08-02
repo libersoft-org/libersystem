@@ -42,6 +42,7 @@ use alloc::vec::Vec;
 use fat::FatFs;
 use iso9660::Iso9660;
 use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
+use libermemfs::{LiberMemFs, Policy as MemPolicy};
 use proto::codec::Buffer;
 use proto::codec::{Sink, SliceWriter};
 use proto::system::{Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume, volume_admin};
@@ -59,6 +60,8 @@ const MEDIA_VOLUME: &[u8] = b"media";
 const ISO_VOLUME: &[u8] = b"iso";
 const UDF_VOLUME: &[u8] = b"udf";
 const USB_VOLUME: &[u8] = b"usb";
+const RAM_VOLUME: &[u8] = b"ram";
+const TMP_VOLUME: &[u8] = b"tmp";
 // block-service protocol with driver.virtio-blk: request [op u32][lba u64][count u32]
 // where op 0 = read, 1 = write. A read replies [status u32] carrying a MemoryObject
 // of count*512 bytes; a write transfers a MemoryObject of count*512 bytes and replies
@@ -123,6 +126,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume { fs: alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None }) },
+		// The two memory volumes. They carry no handle - there is no block device to hand over,
+		// which is the whole point - and the capacity follows the tag as a decimal byte count.
+		// A reserved volume takes its memory here, so a mount that cannot get it fails HERE
+		// rather than at the first write.
+		Received::Message { len, .. } if len >= 6 && &buf[..6] == b"RAMVOL" => match LiberMemFs::mount(MemPolicy::Reserved, mem_capacity(&buf[6..len])) {
+			Ok(fs) => Volume { fs: alloc::boxed::Box::new(MemFs { fs, name: RAM_VOLUME }) },
+			Err(_) => exit(),
+		},
+		Received::Message { len, .. } if len >= 6 && &buf[..6] == b"TMPVOL" => match LiberMemFs::mount(MemPolicy::Capped, mem_capacity(&buf[6..len])) {
+			Ok(fs) => Volume { fs: alloc::boxed::Box::new(MemFs { fs, name: TMP_VOLUME }) },
+			Err(_) => exit(),
+		},
 		_ => exit(),
 	};
 	// 2. an optional privileged admin endpoint precedes the public service endpoint.
@@ -780,6 +795,54 @@ impl FileSystem for FatBacking {
 
 // The read-only ISO9660 backend for optical and install media: read and list only, so it
 // uses the trait defaults (which refuse writes and report no snapshots) for the rest.
+// The two memory volumes behind the one shared trait. Every mutation is supported - this is the
+// only writable backend besides LiberFS - and there is deliberately no `set_clock`: file times
+// are reported as zero because nothing here outlives the boot that made it, so a timestamp would
+// describe an age that has no meaning to a caller.
+struct MemFs {
+	fs: LiberMemFs,
+	name: &'static [u8],
+}
+
+impl FileSystem for MemFs {
+	fn volume_name(&self) -> &'static [u8] {
+		self.name
+	}
+	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
+		self.fs.read_file(name).map_err(map_fs_err)
+	}
+	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
+		let entries = self.fs.list_entries(dir).map_err(map_fs_err)?;
+		Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+	}
+	fn capacity(&mut self) -> Result<u64, Error> {
+		Ok(self.fs.capacity())
+	}
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.capacity(), free_bytes: self.fs.free(), compression: false, read_only: false, filesystem: String::from("libermemfs") })
+	}
+	fn write_file(&mut self, name: &[u8], data: &[u8]) -> Result<(), Error> {
+		self.fs.write_file(name, data).map_err(map_fs_err)
+	}
+	fn remove(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.fs.remove(name).map_err(map_fs_err)
+	}
+	fn mkdir(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.fs.mkdir(name).map_err(map_fs_err)
+	}
+	fn rmdir(&mut self, name: &[u8]) -> Result<(), Error> {
+		self.fs.rmdir(name).map_err(map_fs_err)
+	}
+}
+
+// The capacity a memory volume was asked for, as decimal bytes after its tag. An unreadable or
+// absent number is a refusal rather than a default: mounting a volume of a size nobody chose is
+// how a system quietly runs out of memory later.
+fn mem_capacity(bytes: &[u8]) -> usize {
+	let text = core::str::from_utf8(bytes).unwrap_or("");
+	text.trim().parse::<usize>().unwrap_or_else(|_| unsafe { exit() })
+}
+
 struct IsoFs {
 	fs: Iso9660<IsoBlockDevice>,
 }

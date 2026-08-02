@@ -1,0 +1,9 @@
+[package]
+name = "libermemfs"
+edition = "2024"
+description = "LiberMemFS - a writable filesystem held in memory"
+
+[dependencies]
+# The shared filesystem error type. The BlockDevice trait beside it is deliberately unused:
+# there is no block device under this filesystem.
+fscore = { path = "../core" }

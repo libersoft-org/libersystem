@@ -2215,6 +2215,34 @@ impl StorageHarness {
 		panic!("StorageService harness did not report online");
 	}
 
+	// Start a StorageService over one of the memory volumes. No block device is created and
+	// none is handed over: the filesystem holds its files on the heap, so the tag carries the
+	// capacity in bytes instead of a handle. That absence is the point - every other harness
+	// below builds a disk first.
+	fn start_memory(storage_elf: &[u8], tag: &[u8], bytes: usize) -> Self {
+		use object::channel::{Channel, Message};
+		use object::rights::Rights;
+		let (boot, boot_user) = Channel::create();
+		let (block, _unused) = Channel::create();
+		let (server, client) = Channel::create();
+		let (admin, admin_child) = Channel::create();
+		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		let mut request: alloc::vec::Vec<u8> = tag.to_vec();
+		request.extend_from_slice(alloc::format!("{bytes}").as_bytes());
+		boot.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("memory volume bootstrap");
+		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
+		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: bytes as u64 };
+		for _ in 0..100_000 {
+			harness.pump();
+			if let Ok(report) = harness.boot.recv() {
+				assert_eq!(&report.bytes[..], b"StorageService: online");
+				return harness;
+			}
+		}
+		panic!("memory StorageService harness did not report online");
+	}
+
 	fn restart(mut self, storage_elf: &[u8]) -> Self {
 		use object::channel::Message;
 		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("storage shutdown request");

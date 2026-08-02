@@ -299,3 +299,30 @@ fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	// a producer happens to split its writes, which is not what a pipeline promises.
 	assert!(result.pipeline_read.windows(9).any(|window| window == b"in> hello"), "readln read echo's bytes through the broker-allocated edge and echoed them behind its own prefix, got {:?}", core::str::from_utf8(&result.pipeline_read));
 }
+
+tagged_test!(the_memory_volumes_serve_files_and_keep_nothing_across_a_restart, [Service, Storage, Filesystem]);
+fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+
+	// vol://tmp - capped. It mounts whatever the memory situation, holds only what is stored,
+	// and refuses the write that would cross its limit.
+	let mut tmp = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(tmp.write(b"vol://tmp/hello", b"from memory", 0x7001), "a memory volume is writable");
+	assert_eq!(tmp.open(b"vol://tmp/hello", 0x7002), Some(b"from memory".to_vec()), "what was written reads back");
+	assert!(tmp.write(b"vol://tmp/hello", b"replaced", 0x7003), "rewriting replaces rather than appends");
+	assert_eq!(tmp.open(b"vol://tmp/hello", 0x7004), Some(b"replaced".to_vec()));
+	assert!(!tmp.write(b"vol://tmp/big", &alloc::vec![b'x'; 8192], 0x7005), "a write past the cap is refused");
+
+	// The property no other volume has, and the one a reader would otherwise assume is broken:
+	// a restart leaves NOTHING. Every disk-backed volume in this suite reads its files back.
+	let mut tmp = tmp.restart(storage_elf);
+	assert_eq!(tmp.open(b"vol://tmp/hello", 0x7006), None, "a memory volume is empty after a restart");
+
+	// vol://ram - reserved. Same filesystem, same operations; the difference is only that its
+	// memory was taken at mount, which is why a write cannot fail for want of memory here.
+	let mut ram = StorageHarness::start_memory(storage_elf, b"RAMVOL", 4096);
+	assert!(ram.write(b"vol://ram/state", b"reserved", 0x7101), "the reserved volume is writable");
+	assert_eq!(ram.open(b"vol://ram/state", 0x7102), Some(b"reserved".to_vec()));
+	assert_eq!(ram.open(b"vol://tmp/hello", 0x7103), None, "the two volumes are separate");
+}

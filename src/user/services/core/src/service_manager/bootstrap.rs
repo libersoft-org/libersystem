@@ -956,6 +956,48 @@ unsafe fn bootstrap_udf_storage(manager_side: u64, block4_client: u64, udf_clien
 	}
 }
 
+// Bootstrap the two memory StorageService instances. Unlike every other volume there is no
+// block service to hand over - the filesystem holds its files on the heap - so the tag carries
+// the capacity in bytes instead of a handle.
+//
+// `vol://ram` is reserved: it takes its memory when it mounts, so a later write cannot fail
+// because something else took it. `vol://tmp` is capped: it holds only what is stored and
+// refuses the write that would cross the limit. One filesystem, two moments of charging.
+pub(super) const RAM_VOLUME_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const TMP_VOLUME_BYTES: usize = 16 * 1024 * 1024;
+
+unsafe fn bootstrap_memory_storage(manager_side: u64, tag: &[u8], bytes: usize, client: &mut u64) -> bool {
+	unsafe {
+		let mut request: Vec<u8> = Vec::new();
+		request.extend_from_slice(tag);
+		let mut digits = [0u8; 20];
+		let mut value = bytes;
+		let mut at = digits.len();
+		if value == 0 {
+			at -= 1;
+			digits[at] = b'0';
+		}
+		while value != 0 {
+			at -= 1;
+			digits[at] = b'0' + (value % 10) as u8;
+			value /= 10;
+		}
+		request.extend_from_slice(&digits[at..]);
+		if !send_blocking(manager_side, &request, 0) {
+			return false;
+		}
+		bootstrap_serve(manager_side, client)
+	}
+}
+
+pub(super) unsafe fn bootstrap_ram_storage(manager_side: u64, client: &mut u64) -> bool {
+	unsafe { bootstrap_memory_storage(manager_side, b"RAMVOL", RAM_VOLUME_BYTES, client) }
+}
+
+pub(super) unsafe fn bootstrap_tmp_storage(manager_side: u64, client: &mut u64) -> bool {
+	unsafe { bootstrap_memory_storage(manager_side, b"TMPVOL", TMP_VOLUME_BYTES, client) }
+}
+
 // Bootstrap the USB StorageService instance: hand it the USB stick's block service
 // ("USBBLOCK", served by the xhci driver over the Bulk-Only Transport and routed up in
 // DeviceManager's phase 2), which it mounts as the writable FAT vol://usb volume, then

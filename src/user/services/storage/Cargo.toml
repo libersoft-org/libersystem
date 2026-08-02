@@ -33,6 +33,8 @@ proto = { path = "../../../proto" }
 # The writable on-disk filesystem (LiberFS) StorageService mounts on the virtio-blk
 # disk for the persistent volume.
 liberfs = { path = "../../../fs/liberfs" }
+# LiberMemFS: the writable in-memory volumes (vol://ram, vol://tmp).
+libermemfs = { path = "../../../fs/libermemfs" }
 
 # The read-only FAT12/16/32 and exFAT backend StorageService mounts on a second
 # virtio-blk disk for the foreign-media volume.
