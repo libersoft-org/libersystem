@@ -751,6 +751,12 @@ dev-launch *args:
 dev-down *args:
     @boot/lab.py dev-down {{ args }}
 
+# build the LiveCD: a bootable ISO whose system volume is copied into memory at boot, so the
+# medium is never written to and the machine needs no disk. Carries the LiberFS system volume
+# rather than the factory archive - the shipping ISO has no archive at all.
+liveiso strip="debug": build
+    STRIP={{ strip }} boot/mkimage.sh liveiso {{ kernel_elf }}
+
 # build a bootable hybrid ISO (BIOS + UEFI) -> .build/boot/<product>.iso; STRIP=debug|all
 iso strip="debug": build
     STRIP={{ strip }} boot/mkimage.sh iso {{ kernel_elf }}

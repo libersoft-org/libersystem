@@ -98,7 +98,12 @@ verify_boot_artifacts() {
 # build a hybrid ISO (BIOS El Torito + UEFI), bootable as a CD or off a USB stick
 # build a UEFI-only ISO, bootable as a CD or off a USB stick
 make_iso() {
-	local kernel="$1" final="$BUILD/$SLUG.iso" out="$BUILD/$SLUG.iso.$$.candidate"
+	local kernel="$1" live="${2:-0}"
+	local final="$BUILD/$SLUG.iso" out="$BUILD/$SLUG.iso.$$.candidate"
+	if [[ "$live" == "1" ]]; then
+		final="$BUILD/$SLUG-live.iso"
+		out="$BUILD/$SLUG-live.iso.$$.candidate"
+	fi
 	local iso_root="$BUILD/iso_root"
 	rm -f "$out"
 
@@ -112,7 +117,16 @@ make_iso() {
 	# around it only carries this image as its UEFI El Torito boot entry.
 	local efi_img="$BUILD/efiboot.img"
 	local bytes total
-	bytes=$(($(stat -c%s "$staged") + $(stat -c%s "$BUILD/$INIT_PACKAGE") + $(stat -c%s "$BUILD/$VOLUME_PACKAGE") + $(stat -c%s "$LOADER_EFI")))
+	# The live medium carries the system VOLUME - a LiberFS image the running system copies into
+	# memory - where the test medium carries the factory archive its kernel suite uses as a
+	# fixture. One product each: a shipping ISO with no archive, and a test ISO with no volume.
+	local payload="$BUILD/$VOLUME_PACKAGE" payload_name="$VOLUME_PACKAGE"
+	if [[ "$live" == "1" ]]; then
+		payload="$BUILD/system-volume-x86_64.img"
+		payload_name="system-volume.img"
+		[[ -f "$payload" ]] || die "liveiso: no system volume at $payload (run \`just system-volume\`)"
+	fi
+	bytes=$(($(stat -c%s "$staged") + $(stat -c%s "$BUILD/$INIT_PACKAGE") + $(stat -c%s "$payload") + $(stat -c%s "$LOADER_EFI")))
 	# FAT overhead + slack, rounded up to a whole MiB (min 32 MiB).
 	total=$(((bytes + 16 * 1024 * 1024) / (1024 * 1024) + 1))
 	((total < 32)) && total=32
@@ -123,7 +137,7 @@ make_iso() {
 	mcopy -i "$efi_img" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$efi_img" "$staged" ::/kernel
 	mcopy -i "$efi_img" "$BUILD/$INIT_PACKAGE" "::/$INIT_PACKAGE"
-	mcopy -i "$efi_img" "$BUILD/$VOLUME_PACKAGE" "::/$VOLUME_PACKAGE"
+	mcopy -i "$efi_img" "$payload" "::/$payload_name"
 
 	rm -rf "$iso_root"
 	mkdir -p "$iso_root/boot"
@@ -229,11 +243,15 @@ iso)
 	output="$BUILD/$SLUG.iso"
 	mode_input="iso"
 	;;
+liveiso)
+	output="$BUILD/$SLUG-live.iso"
+	mode_input="liveiso"
+	;;
 img)
 	output="$BUILD/$SLUG.img"
 	mode_input="img:${3:-64M}"
 	;;
-*) die "unknown subcommand '$cmd' (expected 'iso' or 'img')" ;;
+*) die "unknown subcommand '$cmd' (expected 'iso', 'liveiso' or 'img')" ;;
 esac
 
 # The same manifest-driven check as the image builders below, run before the cache key is
@@ -255,7 +273,8 @@ fi
 info "cache miss $output; rebuilding"
 
 case "$cmd" in
-iso) make_iso "$kernel" ;;
+iso) make_iso "$kernel" 0 ;;
+liveiso) make_iso "$kernel" 1 ;;
 img) make_img "$kernel" "${3:-64M}" ;;
 esac
 printf '%s\n' "$key" >"$key_file.tmp.$$"

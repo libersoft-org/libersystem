@@ -22,6 +22,10 @@ use paging::{HHDM_OFFSET, PAGE_2MB, PAGE_SIZE, PageTables};
 // hands the kernel their bytes as boot-protocol modules; the aarch64 kernel embeds them).
 const INIT_PKG_FILE: &str = "init.pkg";
 const VOLUME_PKG_FILE: &str = "volume.pkg";
+// The live medium's system volume: a LiberFS image the running system copies into memory, so a
+// LiveCD needs no disk and never writes to the medium it booted from. Passed straight through as
+// a module; the kernel hands it to the storage service, which is where it becomes a volume.
+const LIVE_VOLUME_FILE: &str = "system-volume.img";
 
 // Round `v` up to a multiple of `align` (a power of two).
 fn align_up(v: u64, align: u64) -> u64 {
@@ -60,6 +64,9 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// kernel test suite's fixture. A machine without one boots exactly as before; the module is
 	// simply absent, which is what the kernel's lookup already expects.
 	let volume_pkg = root.and_then(|root| read_file(bs, root, VOLUME_PKG_FILE));
+	// Exactly one of the two is present: a test medium carries the archive, a live medium carries
+	// the volume, and an installed system carries neither because its volume is on the disk.
+	let live_volume = root.and_then(|root| read_file(bs, root, LIVE_VOLUME_FILE));
 	serial::write_str("loader: packages loaded\n");
 
 	// Load the kernel ELF: allocate + copy each PT_LOAD segment, record its
@@ -95,8 +102,13 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	unsafe {
 		*modules.add(0) = make_module(init_pkg, INIT_PKG_FILE);
 		if let Some(volume) = volume_pkg {
-			*modules.add(1) = make_module(volume, VOLUME_PKG_FILE);
-			module_count = 2;
+			*modules.add(module_count) = make_module(volume, VOLUME_PKG_FILE);
+			module_count += 1;
+		}
+		if let Some(volume) = live_volume {
+			serial::write_str("loader: live system volume handed over\n");
+			*modules.add(module_count) = make_module(volume, LIVE_VOLUME_FILE);
+			module_count += 1;
 		}
 	}
 
