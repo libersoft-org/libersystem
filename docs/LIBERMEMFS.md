@@ -95,10 +95,16 @@ Two properties make that guarantee real rather than nominal, and both are easy t
   would rest on the reservation being perfectly in step, which it is not after a regrow has
   fallen short; releasing all of it makes how much is held irrelevant to whether the write can
   proceed. If the allocation is refused anyway, the resync puts back what the volume should hold.
-- **The reservation is dropped and reallocated, never resized.** `shrink_to_fit` reallocates and
-  COPIES what it keeps, so resizing would memcpy what remains of the reservation on every single
-  write - megabytes per write on a volume of any size, to preserve zeros nothing ever reads.
-  Dropping first also keeps the old block from being outstanding alongside the new one.
+- **The reservation is dropped and reallocated, never resized - and never written to.**
+  `shrink_to_fit` reallocates and COPIES what it keeps, so resizing would memcpy what remains of
+  the reservation on every single write - megabytes per write on a volume of any size, to preserve
+  bytes nothing ever reads. Dropping first also keeps the old block from being outstanding
+  alongside the new one. Filling the new block is the same mistake wearing a different hat: it
+  costs a memset of the whole remaining reservation per mutation and buys nothing, because this
+  kernel commits and charges physical frames when a memory object is created rather than when a
+  page is first touched. Owning the allocation IS the reservation; the bytes in it are decoration.
+  Only the allocation's capacity is taken, and the size held is tracked in its own field rather
+  than read back from the vector's length.
 - **Taking memory back is best effort.** After a file shrinks or is deleted the reservation
   regrows with `try_reserve_exact`; `Vec::resize` would ABORT on failure, which in a storage
   service is a crash where a degraded guarantee would do. If less comes back than was released,

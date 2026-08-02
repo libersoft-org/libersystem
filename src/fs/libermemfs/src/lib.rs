@@ -100,7 +100,16 @@ pub struct LiberMemFs {
 	// want of it. It is never read - owning it IS the reservation - and it tracks the UNUSED part
 	// of the capacity, released as files grow and taken back as they shrink, so the volume's
 	// footprint is what it stores plus what it still holds rather than both at once.
+	//
+	// Only its CAPACITY is taken; its length stays zero and its bytes are never written. This
+	// kernel allocates physical frames when a memory object is created, not when a page is first
+	// touched (`MemoryObject::create_in` charges the Domain and calls `allocate_pages` up front),
+	// so the frames behind the heap are already committed and already charged. Writing zeros into
+	// them holds nothing that owning the allocation does not already hold.
 	reservation: Vec<u8>,
+	// What `reservation` holds. Tracked rather than read back from the vector, whose length is
+	// deliberately zero and whose capacity may legitimately exceed what was asked for.
+	reserved: usize,
 }
 
 impl LiberMemFs {
@@ -108,13 +117,14 @@ impl LiberMemFs {
 	// fails when the memory is not available; a capped volume always mounts.
 	pub fn mount(policy: Policy, capacity: usize) -> Result<LiberMemFs, FsError> {
 		let mut reservation = Vec::new();
+		let mut reserved = 0;
 		if policy == Policy::Reserved {
 			// `try_reserve` rather than a plain allocation: running out here must be an error
 			// the caller can report, not an abort inside the storage service.
 			reservation.try_reserve_exact(capacity).map_err(|_| FsError::NoSpace)?;
-			reservation.resize(capacity, 0);
+			reserved = capacity;
 		}
-		Ok(LiberMemFs { root: Node::Directory(BTreeMap::new()), policy, capacity, reservation })
+		Ok(LiberMemFs { root: Node::Directory(BTreeMap::new()), policy, capacity, reservation, reserved })
 	}
 
 	pub fn policy(&self) -> Policy {
@@ -142,7 +152,7 @@ impl LiberMemFs {
 	// which holds nothing it is not using. Exposed because the reservation is the whole
 	// difference between the two policies and a test cannot otherwise see it.
 	pub fn reserved_bytes(&self) -> u64 {
-		self.reservation.len() as u64
+		self.reserved as u64
 	}
 
 	// What can still be written, after both the data and the names already held. Reported rather
@@ -214,32 +224,51 @@ impl LiberMemFs {
 	// version only ever shrank the reservation, so deleting or shrinking a file handed that
 	// memory back to the heap rather than back to the reservation - and a volume that was
 	// supposed to guarantee its space silently stopped guaranteeing it.
+	// Give up the whole reservation. The vector and the byte count move together and must never
+	// disagree, so nothing sets either of them directly - every accounting defect in this
+	// filesystem has been two pieces of the same fact drifting apart.
+	fn release_reservation(&mut self) {
+		self.reservation = Vec::new();
+		self.reserved = 0;
+	}
+
 	fn resync_reservation(&mut self) {
 		if self.policy != Policy::Reserved {
 			return;
 		}
 		let target = self.capacity.saturating_sub(self.footprint() as usize);
-		if self.reservation.len() == target {
+		if self.reserved == target {
 			return;
 		}
 		// Dropped and reallocated rather than resized in place, in both directions.
 		//
 		// Resizing looks cheaper and is not. `shrink_to_fit` reallocates and COPIES the bytes it
 		// keeps, so every write to a reserved volume would memcpy what remains of the
-		// reservation - megabytes per write on a volume of any size, to preserve zeros that
+		// reservation - megabytes per write on a volume of any size, to preserve bytes that
 		// nothing ever reads. Dropping first also means the old block is gone before the new one
 		// is asked for, so the two are never outstanding together: the same rule the write path
 		// follows, and for the same reason.
 		//
-		// Best effort on the way back up: `Vec::resize` would ABORT on allocation failure, which
-		// in a storage service is a crash where a degraded guarantee would do. If the memory
+		// Nothing is written into the new block either. Filling it cost a memset of the whole
+		// remaining reservation on every mutation - megabytes per operation on a large volume,
+		// the same price as the copy it replaced - and bought nothing: the frames are committed
+		// and charged when the heap maps them, not when a page is first touched, so the
+		// allocation alone is the reservation.
+		//
+		// Best effort on the way back up, and fallible on purpose: any infallible allocation -
+		// `Vec::resize`, `with_capacity`, a plain `reserve` - ABORTS when the memory is not there,
+		// which in a storage service is a crash where a degraded guarantee would do. If the memory
 		// cannot be had the volume holds less than its capacity and `reserved_bytes` says so.
-		self.reservation = Vec::new();
+		self.release_reservation();
 		let mut fresh: Vec<u8> = Vec::new();
 		if fresh.try_reserve_exact(target).is_ok() {
-			fresh.resize(target, 0);
 			self.reservation = fresh;
+			self.reserved = target;
 		}
+		// The allocation's only purpose is that it exists: nothing reads it and nothing writes it,
+		// which is exactly the shape a dead-allocation optimisation is entitled to delete. Letting
+		// the pointer escape here says otherwise, and costs nothing at runtime.
+		let _ = core::hint::black_box(self.reservation.as_ptr());
 	}
 
 	pub fn read_file(&mut self, path: &[u8]) -> Result<Vec<u8>, FsError> {
@@ -290,7 +319,7 @@ impl LiberMemFs {
 		// perfectly in step, which it is not after a best-effort regrow has fallen short. The
 		// resync at the end puts back whatever the volume should still be holding.
 		if self.policy == Policy::Reserved {
-			self.reservation = Vec::new();
+			self.release_reservation();
 		}
 		// The bytes are built before the entry is replaced. Inserting an empty file first and
 		// filling it afterwards loses the previous contents when the allocation fails - a failed
@@ -349,7 +378,7 @@ impl LiberMemFs {
 		// toward the footprint, skipping this would leave the reservation permanently ahead of
 		// what the volume actually holds.
 		if self.policy == Policy::Reserved {
-			self.reservation = Vec::new();
+			self.release_reservation();
 		}
 		let inserted = match self.parent_mut(&parts) {
 			Ok((children, name)) => {
