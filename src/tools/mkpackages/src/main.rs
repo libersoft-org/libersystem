@@ -17,6 +17,38 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// Check that every artifact the manifest names has actually been built, BEFORE assembling
+// anything. This is the whole point of packaging being its own phase: it verifies and then
+// assembles, so a missing program is one clear message here rather than a panic halfway through
+// an audit, or - worse - a package quietly missing a program and an image that fails at boot.
+//
+// Every missing artifact is reported, not just the first: being told about one, rebuilding, and
+// being told about the next is a slow way to learn that the userspace was never built.
+fn verify_artifacts() {
+	let manifest = kernel_anchor();
+	let mut missing: Vec<String> = Vec::new();
+	for row in read_manifest(&manifest) {
+		let path: PathBuf = match (row.kind.as_str(), row.stage.as_str()) {
+			(_, "pinned") if row.crate_dir != "-" => user_elf_path(&manifest, &row.crate_path, &row.name),
+			("library", "volume") => user_shared_path(&manifest, row.destination.as_deref().expect("library destination")),
+			("dynamic" | "dynamic-service", "volume") => user_dynamic_path(&manifest, row.destination.as_deref().expect("program destination")),
+			("driver" | "service", "volume") => user_elf_path(&manifest, &row.crate_path, &row.name),
+			_ => continue,
+		};
+		if !path.exists() {
+			missing.push(format!("  {} ({})", row.name, path.display()));
+		}
+	}
+	if !missing.is_empty() {
+		eprintln!("mkpackages: {} artifact(s) named by the manifest are not built:", missing.len());
+		for entry in &missing {
+			eprintln!("{entry}");
+		}
+		eprintln!("mkpackages: packaging compiles nothing - run `just user` first");
+		std::process::exit(1);
+	}
+}
+
 // The repository root, found by walking up for `product.conf` rather than by counting `..`
 // segments from wherever this binary happens to live.
 fn repo_root() -> PathBuf {
@@ -57,6 +89,7 @@ fn main() {
 		env::set_var("CARGO_CFG_TARGET_ARCH", &arch);
 	}
 	let conf: Vec<(String, String)> = read_product_conf();
+	verify_artifacts();
 	assemble_init_package(&conf);
 	assemble_volume_package(&conf);
 	export_cross_arch_volume();
@@ -455,19 +488,30 @@ fn assemble_init_package(conf: &[(String, String)]) {
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
 
 	let mut entries: Vec<(&str, Vec<u8>)> = Vec::new();
+	let mut missing: usize = 0;
 	for (name, path) in &sources {
 		// Strip the pinned ELF to its loadable image, the same as the volume package -
 		// the loader executes only the program image, so the symbol and debug sections are
 		// dead weight in the kernel binary and boot memory. Fall back to the raw ELF when
-		// no `strip` tool is available, so the boot set is never dropped; an absent ELF is
-		// skipped with a warning (the kernel handles it gracefully at runtime).
+		// no `strip` tool is available, so the boot set is never dropped. A MISSING ELF is fatal:
+		// this step decides whether a bootable system exists, and a boot package assembled
+		// without one of the programs the system needs before its volume is readable produces an
+		// image that fails at boot rather than here. That was the old behaviour - a warning
+		// nobody reads and a package quietly missing a program.
 		match read_stripped(path).or_else(|| fs::read(path).ok()) {
 			Some(bytes) => entries.push((name.as_str(), bytes)),
-			None => eprintln!("mkpackages: {name} ELF not found at {} - omitting from init package (run `just user` or `just build`)", path.display()),
+			None => {
+				eprintln!("mkpackages: {name} not built: {} (run `just user`)", path.display());
+				missing += 1;
+			}
 		}
 	}
 
 	let package: Vec<u8> = build_package(&entries);
+	if missing != 0 {
+		eprintln!("mkpackages: {missing} program(s) of the boot set are not built - refusing to assemble an image that cannot boot");
+		std::process::exit(1);
+	}
 	write_if_changed(&out_pkg, &package);
 }
 
@@ -486,6 +530,7 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 	// Collect every manifest-declared factory record. Sorting below makes archive
 	// layout independent of declaration and filesystem enumeration order.
 	let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+	let mut missing: usize = 0;
 	for file in factory_manifest.factory_files.values() {
 		let path = match file.kind {
 			system_manifest::FactoryFileKind::Source => manifest.join("..").join(file.source.as_ref().expect("validated factory source").as_str()),
@@ -548,7 +593,10 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 				}
 				files.push((dest, bytes));
 			}
-			None => eprintln!("mkpackages: {} ELF not found at {} - omitting from system volume (run `just user` or `just build`)", row.name, path.display()),
+			None => {
+				eprintln!("mkpackages: {} not built: {} (run `just user`)", row.name, path.display());
+				missing += 1;
+			}
 		}
 	}
 	files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -565,6 +613,10 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 
 	let entries: Vec<(&str, Vec<u8>)> = files.iter().map(|(name, data): &(String, Vec<u8>)| (name.as_str(), data.clone())).collect();
 	let package: Vec<u8> = build_package(&entries);
+	if missing != 0 {
+		eprintln!("mkpackages: {missing} program(s) of the system volume are not built - refusing to assemble an image that cannot boot");
+		std::process::exit(1);
+	}
 	write_if_changed(&out_pkg, &package);
 }
 

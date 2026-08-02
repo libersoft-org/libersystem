@@ -240,7 +240,24 @@ impl Resolver {
 			self.visiting.push(String::from(name));
 			let module = (|| {
 				let stem = name.strip_suffix(".lslib")?;
-				let installed = MappedFile::open(self.storage, String::from(library_path(name)?))?;
+				// Name the provider that is missing. Everything below unwinds through `?` into a
+				// bare "could not start", which tells a caller nothing about WHICH library the
+				// image lacks - and a missing provider is the most likely reason a correctly
+				// built program will not start on an incorrectly built image.
+				let Some(path) = library_path(name) else {
+					print(b"loader: ");
+					print(name.as_bytes());
+					print(b": no install path is declared for this provider\n");
+					return None;
+				};
+				let Some(installed) = MappedFile::open(self.storage, String::from(path)) else {
+					print(b"loader: ");
+					print(name.as_bytes());
+					print(b": provider not found at ");
+					print(path.as_bytes());
+					print(b"\n");
+					return None;
+				};
 				// The installed image is read first even when a generation will replace it, and
 				// that order is the whole of the rule: the digest a consumer's record names is
 				// this one, and compatibility is a statement about these two images.
