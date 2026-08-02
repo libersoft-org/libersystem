@@ -127,14 +127,20 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// Everything the archive carries, at the same destinations.
 	let mut staged: Vec<(String, Vec<u8>)> = files.to_vec();
 
-	// The kernel, so the loader can read it from the volume rather than from the ESP.
-	let kernel = out_dir.join("kernel");
-	match fs::read(&kernel) {
-		Ok(bytes) => staged.push((String::from("kernel"), bytes)),
-		// Not fatal: `just packages` can run before the kernel is linked, and the loader falls
-		// back to the boot volume. A missing kernel here means a volume the loader will decline,
-		// not an image that cannot be built.
-		Err(_) => eprintln!("mkpackages: no kernel at {} yet; the system volume will not carry one", kernel.display()),
+	// The kernel, so the loader can read it from the volume rather than from the ESP - but ONLY
+	// when asked for.
+	//
+	// Staging whatever happens to be at `.build/boot/kernel` made the volume's contents depend on
+	// which recipe ran last: a test run after `just img` booted the shipping kernel from the
+	// volume instead of the test binary the harness had just built, and sat at a shell prompt
+	// until the watchdog fired. A shipping image wants its kernel on the volume; a test medium
+	// wants the harness's kernel, which is built elsewhere and staged on the ESP.
+	if env::args().any(|arg| arg == "--with-kernel") {
+		let kernel = out_dir.join("kernel");
+		match fs::read(&kernel) {
+			Ok(bytes) => staged.push((String::from("kernel"), bytes)),
+			Err(_) => eprintln!("mkpackages: no kernel at {}; the system volume will not carry one", kernel.display()),
+		}
 	}
 
 	// The pinned bootstrap set at real paths. This is the point of the milestone: a program that

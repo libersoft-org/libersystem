@@ -243,13 +243,19 @@ packages arch="x86_64":
 build: sdk user packages
     cd {{ kernel_dir }} && cargo build
     cd {{ loader_dir }} && cargo build
-    just system-volume
+    just system-volume x86_64 1
 
 # Build the system volume as a LiberFS image. Separate from `packages` and deliberately AFTER the
 # kernel: the image carries the kernel, while the archives cannot move after it because the kernel
 # embeds them. Run together, the image would stage whichever kernel the previous build left.
-system-volume arch="x86_64":
-    cd tools/mkpackages && cargo run --quiet -- {{ arch }} system-volume
+# Build the system volume as a LiberFS image. Separate from `packages` and deliberately AFTER the
+# kernel when the volume carries one.
+#
+# `kernel=1` stages the linked kernel onto the volume, which is what a bootable image wants. The
+# test path leaves it off: its kernel is the harness's test binary, staged on the ESP, and a volume
+# carrying a different one would be booted in preference to it.
+system-volume arch="x86_64" kernel="0":
+    cd tools/mkpackages && cargo run --quiet -- {{ arch }} system-volume {{ if kernel == "1" { "--with-kernel" } else { "" } }}
 
 # generate the proto crate's bindings from the LSIDL interface definitions
 # (src/idl/*.lsidl) and format the generated source
