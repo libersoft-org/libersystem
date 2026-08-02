@@ -255,6 +255,26 @@ rather than producing something that resembles one.
 
 - [ ] [M0137 - Build layering: compile, then package](M0137.md)
 
+### Boot from the filesystem
+
+Nine programs run on every boot with no file on the volume: their only copy is an entry inside
+`init.pkg`, so the most privileged parts of the system cannot be seen, replaced or checked
+through the same interface as everything else. M0138 gives the loader the filesystem backends
+the tree already has - all four are `no_std` over one shared `BlockDevice` trait - so the
+bootstrap set is read from the real volume and every running program has a file behind it.
+
+- [ ] [M0138 - The loader reads the filesystem: retire the bootstrap archive](M0138.md)
+
+### Writable memory
+
+Every volume is backed by a medium, so there is nowhere to write that does not survive a reboot
+and does not cost a disk write - no `/tmp`, and no place for state a service needs only while it
+runs. M0139 adds `LiberMemFS`: files on the heap, no block layer, no on-disk format, mounted
+as `vol://ram` (reserved at mount) and `vol://tmp` (capped at write) - one implementation, two
+accounting policies.
+
+- [ ] [M0139 - LiberMemFS: a writable filesystem that lives in memory](M0139.md)
+
 ### Definition of done (phase 2)
 
 Done when the capability-scoped appliance provides networking, wall-clock time,

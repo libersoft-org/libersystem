@@ -228,9 +228,15 @@ user-aarch64: shared-libs-aarch64
 sdk:
     cd {{ sdk_dir }} && cargo build --release --target wasm32-unknown-unknown
 
-# build the kernel (its build.rs assembles the init package from the userspace build)
-# and the own UEFI loader (staged into the boot image as BOOTX64.EFI)
-build: sdk user
+# Assemble the boot packages from an already-built userspace. Compiles nothing: it reads the
+# manifest and the ELFs the userspace build produced. Separate from the kernel because the
+# kernel is a kernel, not an image builder.
+packages arch="x86_64": user
+    cd tools/mkpackages && cargo run --quiet -- {{ arch }}
+
+# build the kernel and the own UEFI loader (staged into the boot image as BOOTX64.EFI), then
+# assemble the boot packages from the userspace built above
+build: sdk user packages
     cd {{ kernel_dir }} && cargo build
     cd {{ loader_dir }} && cargo build
 

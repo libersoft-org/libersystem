@@ -1,0 +1,16 @@
+[package]
+name = "mkpackages"
+edition = "2024"
+description = "Assemble the boot packages from a built userspace"
+
+[[bin]]
+name = "mkpackages"
+path = "src/main.rs"
+
+[dependencies]
+# The PKGARCH1 archive format constants, shared with the kernel and the storage runtime.
+abi = { path = "../../abi" }
+# ELF parsing for the identity records and the dynamic-linkage audit.
+bootproto = { path = "../../bootproto" }
+# The manifest that decides what is staged where.
+system-manifest = { path = "../system-manifest" }
