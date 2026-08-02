@@ -67,3 +67,10 @@ opt-level = 2
 
 [profile.dev.package.udf]
 opt-level = 2
+
+# LiberMemFS has no checksum, but it recomputes its footprint by walking the whole tree, and a
+# mutation does that three times (the entry count, the capacity check, the reservation resync).
+# Measured on the host: 2000 rewrites into a 2000-entry volume take 1.03 s unoptimized against
+# 79 ms optimized, a 13x difference on the path every write takes.
+[profile.dev.package.libermemfs]
+opt-level = 2

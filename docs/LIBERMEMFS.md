@@ -58,7 +58,7 @@ every operation are identical. The only difference is WHEN the memory is charged
 | charged | at mount | at write |
 | guarantees | the space is there | the space may be there |
 | when memory is short | the MOUNT fails | the WRITE fails |
-| unused space | held | available to everything else |
+| unused space | held | not taken in the first place |
 | suits | state that must not fail because something else took the memory | scratch, where waste is worse than an occasional refusal |
 
 The capacity bounds the volume's FOOTPRINT - file data plus the names holding it - not the data
@@ -130,6 +130,32 @@ runs through, and a second test now covers the directory ones.
 
 Both policies enforce the same capacity through the same check. Only the moment of charging
 differs, which is why they share an implementation.
+
+One thing the capped policy does NOT do is give memory back to the system. The userspace heap
+grows by mapping a region and never unmaps one, so freeing a file returns its bytes to the storage
+service's own free list - reusable by that process, including by the other volumes it serves - but
+the Domain stays charged at the high-water mark. A capped volume that has once been full costs the
+system exactly what a reserved one of the same size costs, permanently.
+
+So the capped policy's advantage is that it never takes what it never needs, not that it returns
+what it took, and that distinction matters when sizing one: a `vol://tmp` that briefly peaks is a
+permanent cost, while one that stays small is nearly free. Returning memory would require the heap
+to unmap regions, which is a runtime change rather than a filesystem one.
+
+## What an operation costs
+
+Every mutation recomputes the footprint by walking the whole tree, and does it three times: once
+for the entry count, once for the capacity check and once in the reservation resync. So a mutation
+is O(entries), not O(path). Measured on the host, 2000 rewrites into a 2000-entry volume take 79 ms
+optimized and 1.03 s unoptimized - which is why the storage service pins `opt-level = 2` for this
+crate in dev builds, as it does for the filesystems with checksums.
+
+Keeping a running total instead would make it O(depth), and it is deliberately not done. The
+footprint and the reservation are two copies of one fact, and every accounting defect found in this
+filesystem - five of nine - was those copies drifting apart. Deriving the number from the tree every
+time means it cannot be stale; caching it would add a third copy to keep in step, on the exact path
+that has gone wrong most often. `MAX_ENTRIES` bounds the walk at 4096 nodes, so the cost has a
+ceiling.
 
 ## Bounds
 
