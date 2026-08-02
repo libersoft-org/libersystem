@@ -291,6 +291,10 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 			panic!("get_memory_map failed");
 		}
 		let count = translate_map(buf, size, desc_size, regions);
+		// The heap lives on firmware pages, so it stops being usable exactly here. Retiring it
+		// makes a later allocation fail loudly instead of handing out memory the loader no
+		// longer owns.
+		crate::heap::retire();
 		let status = unsafe { ((*bs).exit_boot_services)(image_handle, key) };
 		if !uefi::is_error(status) {
 			return count;

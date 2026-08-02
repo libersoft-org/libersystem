@@ -24,7 +24,9 @@
 #![no_main]
 
 mod arch;
+mod blockio;
 mod elf;
+mod heap;
 mod uefi;
 
 use core::ffi::c_void;
@@ -81,11 +83,82 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	arch::serial::write_str("\nLiberSystem UEFI loader\n");
 
 	let bs = unsafe { (*system_table).boot_services };
+	// The heap has to exist before the filesystem crates are used, and cannot outlive boot
+	// services.
+	heap::init(bs);
 	let root = open_boot_volume(bs, image_handle).expect("loader: cannot open boot volume");
-	let kernel = read_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel");
+
+	// Prefer the system volume: a program that runs should have a file on the volume the user can
+	// see, which is the whole point of this milestone. The ESP copy is the fallback, so a machine
+	// whose system volume is missing or unreadable still boots far enough to say so.
+	let kernel = match read_from_system_volume(bs, KERNEL_FILE.as_bytes()) {
+		VolumeRead::Read(bytes) => {
+			arch::serial::write_str("loader: kernel read from the system volume\n");
+			bytes
+		}
+		// The two failures are reported apart on purpose. "No LiberFS volume" points at the
+		// disk, its cabling or the wrong machine; "volume found, file missing" points at the
+		// build that staged it. A single message covering both would send whoever reads this
+		// log looking in the wrong place, and this milestone's own risk note says the failure
+		// message matters more than usual here.
+		VolumeRead::NoVolume => {
+			arch::serial::write_str("loader: no LiberFS volume on any block device; using the boot volume\n");
+			read_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel")
+		}
+		VolumeRead::NotOnVolume => {
+			arch::serial::write_str("loader: system volume found but it has no kernel; using the boot volume\n");
+			read_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel")
+		}
+	};
 	arch::serial::write_str("loader: kernel loaded\n");
 
 	arch::hand_off(bs, image_handle, system_table, root, kernel);
+}
+
+// Find the LiberFS system volume among the firmware's block devices and read one file from it.
+//
+// Discovery is by SUPERBLOCK, not by device order: `LiberFs::mount` returns None for anything that
+// is not a LiberFS volume, so trying each device in turn identifies the right one even on a
+// machine with several disks. Trusting the order would boot the wrong system on exactly the
+// machines where getting it wrong matters most.
+//
+// The bytes are copied out of the heap into retained firmware pages, because the heap does not
+// survive `ExitBootServices` and the kernel image must.
+pub(crate) enum VolumeRead {
+	Read(&'static [u8]),
+	// No block device carried a LiberFS superblock.
+	NoVolume,
+	// A LiberFS volume was found, but not this file - or its bytes could not be retained.
+	NotOnVolume,
+}
+
+pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> VolumeRead {
+	let mut outcome = VolumeRead::NoVolume;
+	blockio::each_disk(bs, |disk| {
+		let Some(mut fs) = liberfs::LiberFs::mount(disk) else { return false };
+		// A LiberFS volume without this file is still the system volume; a second one is not
+		// going to be more right. Stop rather than read the same name off another disk, which
+		// is how a machine boots half of one system and half of another.
+		outcome = match fs.read_file(path) {
+			Ok(bytes) => match retain(bs, &bytes) {
+				Some(retained) => VolumeRead::Read(retained),
+				None => VolumeRead::NotOnVolume,
+			},
+			Err(_) => VolumeRead::NotOnVolume,
+		};
+		true
+	});
+	outcome
+}
+
+// Copy `bytes` into fresh LOADER_DATA pages, which the firmware retains across the hand-off.
+fn retain(bs: *mut BootServices, bytes: &[u8]) -> Option<&'static [u8]> {
+	let pages = bytes.len().div_ceil(PAGE_SIZE as usize).max(1);
+	let phys = alloc_pages(bs, pages)?;
+	unsafe {
+		core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys as *mut u8, bytes.len());
+		Some(core::slice::from_raw_parts(phys as *const u8, bytes.len()))
+	}
 }
 
 // Open the FAT volume the loader image was loaded from and return its root directory.

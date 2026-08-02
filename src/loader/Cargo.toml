@@ -12,6 +12,18 @@ path = "src/main.rs"
 [dependencies]
 bootproto = { path = "../bootproto" }
 
+# The filesystem crates, linked read-only. The loader supplies a BlockDevice over the firmware's
+# disk protocol and these read the volume above it - the same code the storage service runs after
+# ExitBootServices, rather than a second implementation of the same formats.
+fscore = { path = "../fs/core" }
+liberfs = { path = "../fs/liberfs" }
+
+# The dev build optimizes the filesystem crates for the same reason the storage service does:
+# LiberFS verifies a CRC32C per block it reads, and an unoptimized checksum is the whole cost of
+# reading the kernel here.
+[profile.dev.package.liberfs]
+opt-level = 2
+
 [profile.dev]
 panic = "abort"
 

@@ -3,5 +3,8 @@ target = "x86_64-unknown-uefi"
 target-dir = "../../.build/cargo/loader"
 
 [unstable]
-build-std = ["core", "compiler_builtins"]
+# `alloc` is built because the loader now links the filesystem crates, and LiberFS is not
+# allocation-free: a directory walk and a file read are sized at runtime. The loader supplies the
+# allocator itself (see `heap.rs`), backed by firmware pages and retired at ExitBootServices.
+build-std = ["core", "alloc", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]

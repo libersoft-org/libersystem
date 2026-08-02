@@ -160,7 +160,9 @@ pub struct BootServices {
 
 	// Library.
 	pub protocols_per_handle: *const c_void,
-	pub locate_handle_buffer: *const c_void,
+	// Enumerate every handle supporting a protocol. Needed to find the block devices: the
+	// system volume is discovered by trying them, not by trusting device order.
+	pub locate_handle_buffer: unsafe extern "efiapi" fn(LocateSearchType, *const Guid, *mut c_void, *mut usize, *mut *mut Handle) -> Status,
 	pub locate_protocol: unsafe extern "efiapi" fn(*const Guid, *mut c_void, *mut *mut c_void) -> Status,
 	pub install_multiple_protocol_interfaces: *const c_void,
 	pub uninstall_multiple_protocol_interfaces: *const c_void,
@@ -326,4 +328,40 @@ pub const ACPI_20_TABLE_GUID: Guid = Guid::new(0x8868e871, 0xe4f1, 0x11d3, [0xbc
 pub const ACPI_10_TABLE_GUID: Guid = Guid::new(0xeb9d2d30, 0x2d88, 0x11d3, [0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d]);
 // EFI_DTB_TABLE_GUID: the flattened device tree the firmware hands the OS on
 // architectures that describe hardware with a DTB (aarch64 on QEMU virt).
+pub const BLOCK_IO_PROTOCOL_GUID: Guid = Guid::new(0x964e5b21, 0x6459, 0x11d2, [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b]);
 pub const DTB_TABLE_GUID: Guid = Guid::new(0xb1b621d5, 0xf19c, 0x41a5, [0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0]);
+
+// How `locate_handle_buffer` searches. Only `BY_PROTOCOL` is used here.
+pub type LocateSearchType = u32;
+pub const BY_PROTOCOL: LocateSearchType = 2;
+
+// EFI_BLOCK_IO_MEDIA: what the firmware says about a block device. Only the fields the
+// loader needs to read blocks are named; the rest keep the layout correct.
+#[repr(C)]
+pub struct BlockIoMedia {
+	pub media_id: u32,
+	pub removable_media: bool,
+	pub media_present: bool,
+	pub logical_partition: bool,
+	pub read_only: bool,
+	pub write_caching: bool,
+	pub block_size: u32,
+	pub io_align: u32,
+	pub last_block: u64,
+	// Revision 2 fields. Present in the struct because the firmware allocates it, unused here.
+	pub lowest_aligned_lba: u64,
+	pub logical_blocks_per_physical_block: u32,
+	pub optimal_transfer_length_granularity: u32,
+}
+
+// EFI_BLOCK_IO_PROTOCOL. Read-only use: `reset`, `write_blocks` and `flush_blocks` are
+// left opaque because the loader never writes and never resets a device.
+#[repr(C)]
+pub struct BlockIo {
+	pub revision: u64,
+	pub media: *mut BlockIoMedia,
+	pub reset: *const c_void,
+	pub read_blocks: unsafe extern "efiapi" fn(*mut BlockIo, u32, u64, usize, *mut c_void) -> Status,
+	pub write_blocks: *const c_void,
+	pub flush_blocks: *const c_void,
+}
