@@ -85,7 +85,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, power: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, power: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -132,6 +132,12 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"udf_storage" && !bootstrap_udf_storage(manager_side, *block4_client, udf_client) {
 			return State::Failed;
 		}
+		if name == b"ram_storage" && !bootstrap_ram_storage(manager_side, ram_client) {
+			return State::Failed;
+		}
+		if name == b"tmp_storage" && !bootstrap_tmp_storage(manager_side, tmp_client) {
+			return State::Failed;
+		}
 		if name == b"usb_storage" && !bootstrap_usb_storage(manager_side, *block5_client, usb_client) {
 			return State::Failed;
 		}
@@ -165,7 +171,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, *process_client, pkg_handle, pkg_len, buf) {
@@ -551,7 +557,7 @@ pub(super) unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, usbq_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, usbq_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -656,9 +662,10 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			return false;
 		}
 		*admin_server2 = admin_srv2;
-		// Four fresh non-system volume StorageService connections the manager bundles with the
+		// Six fresh non-system volume StorageService connections the manager bundles with the
 		// system `storage` client under the `volumes` capability it grants the governed `lsvol`
-		// command: media (FAT/exFAT), iso (ISO9660), udf (UDF), usb (FAT off the USB stick).
+		// command: media (FAT/exFAT), iso (ISO9660), udf (UDF), usb (FAT off the USB stick), and
+		// the two memory volumes ram (reserved) and tmp (capped).
 		// Each is minted off the volume's own service factory; a volume whose disk is absent
 		// has no factory (its client is 0) and is handed over as 0, which `lsvol` shows as
 		// zero files.
@@ -676,6 +683,16 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 		}
 		let usb_conn: u64 = service_connect(usb_client).unwrap_or(0);
 		if !send_blocking(manager_side, b"STORAGE_USB", usb_conn) {
+			return false;
+		}
+		// The two memory volumes, bundled the same way. They have no disk to be absent, so a 0
+		// here means only that their service did not come up.
+		let ram_conn: u64 = service_connect(ram_client).unwrap_or(0);
+		if !send_blocking(manager_side, b"STORAGE_RAM", ram_conn) {
+			return false;
+		}
+		let tmp_conn: u64 = service_connect(tmp_client).unwrap_or(0);
+		if !send_blocking(manager_side, b"STORAGE_TMP", tmp_conn) {
 			return false;
 		}
 		// A fresh supervisor-status channel the manager grants to the governed `lssvc` command

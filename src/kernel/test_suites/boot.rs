@@ -76,9 +76,14 @@ fn init_package_starts_system_manager() {
 	// path uses is valid against the live manifest), followed by the two managers.
 	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
-	let online_reports: [&[u8]; 21] = [
+	// Seven StorageService instances: the system volume, media, iso, udf, usb, and the two
+	// memory volumes (ram and tmp). They report the same line, so the count is what says the
+	// whole set came up.
+	let online_reports: [&[u8]; 23] = [
 		b"LogService: online",
 		b"DeviceManager: online",
+		b"StorageService: online",
+		b"StorageService: online",
 		b"StorageService: online",
 		b"StorageService: online",
 		b"StorageService: online",

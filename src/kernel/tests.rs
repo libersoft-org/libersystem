@@ -427,6 +427,13 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	send_cap(&pm_boot_kernel, b"STORAGE_ISO", storage_iso_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_UDF", storage_udf_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_USB", storage_usb_client, Rights::ALL)?;
+	// The two memory volumes. Sent even though this scenario mounts neither: PermissionManager
+	// reads its bootstrap as an ORDERED sequence, so a message it expects and does not get
+	// swallows the next one and shifts everything after it - which is exactly how this failed
+	// when the pair was added to the manager and not here.
+	for tag in [b"STORAGE_RAM".as_slice(), b"STORAGE_TMP".as_slice()] {
+		pm_boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not hand PermissionManager a memory volume slot")?;
+	}
 	send_cap(&pm_boot_kernel, b"SERVICES", services_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"USBBUS", usb_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
@@ -1449,7 +1456,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("play stdout bootstrap");
 		bootstrap.send(Message::new(argument.to_vec(), alloc::vec::Vec::new(), 0)).expect("play argument bootstrap");
 		send_cap(&bootstrap, b"SYSTEM", storage, Rights::ALL).expect("play system volume bootstrap");
-		for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+		for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 			bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("play absent volume bootstrap");
 		}
 		send_cap(&bootstrap, b"AUDIO_STREAM", audio, Rights::ALL).expect("play audio-stream bootstrap");
@@ -2458,7 +2465,7 @@ fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, 
 	bootstrap.send(Message::new(args.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgconv system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgconv media volume");
-	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv absent volume");
 	}
 	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv cwd");
@@ -2506,7 +2513,7 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 	bootstrap.send(Message::new(b"--help".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview help system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview help media volume");
-	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"DISPLAY".as_slice(), b"INPUT_KEYS".as_slice()] {
+	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice(), b"DISPLAY".as_slice(), b"INPUT_KEYS".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help absent capability");
 	}
 	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help cwd");
@@ -2553,7 +2560,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	bootstrap.send(Message::new(path.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview media volume");
-	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview absent volume");
 	}
 	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("imgview display");
@@ -2739,7 +2746,7 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("lico terminal bootstrap");
 	bootstrap.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("lico empty arguments");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("lico system volume");
-	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice()] {
+	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent volume");
 	}
 	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico cwd");

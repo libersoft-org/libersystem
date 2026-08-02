@@ -86,6 +86,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let iso: u64 = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
 		let udf: u64 = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
 		let usb: u64 = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or(0);
+		// The bundle carries two more volumes after USB. They are drained even where this tool
+		// has no use for them: the sequence has no length in front of it, so a message left
+		// behind is consumed as whatever is read next.
+		let _ = recv_tagged(bootstrap, &mut buf, b"RAM");
+		let _ = recv_tagged(bootstrap, &mut buf, b"TMP");
 		// 4. receive the inherited working directory and resolve the path against it.
 		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, .. } => buf[..len].to_vec(),

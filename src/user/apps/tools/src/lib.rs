@@ -42,20 +42,27 @@ impl TerminalWriter for ConsoleWriter {
 	}
 }
 
-/// The five volume clients carried by the governed `Volumes` capability bundle.
+/// The seven volume clients carried by the governed `Volumes` capability bundle.
+///
+/// The count is part of the protocol, not a detail: the bundle is a fixed-order sequence of
+/// tagged messages with no length in front of it, so a receiver that reads five when seven were
+/// sent leaves two behind - and those are then consumed as whatever it reads next, which is its
+/// working directory. Adding a volume means adding it here in the same position.
 pub struct VolumeSet {
 	pub system: u64,
 	pub media: u64,
 	pub iso: u64,
 	pub udf: u64,
 	pub usb: u64,
+	pub ram: u64,
+	pub tmp: u64,
 }
 
 impl VolumeSet {
 	/// Receive the fixed-order volume bundle after a tool's argument message.
 	#[inline(always)]
 	pub unsafe fn receive(bootstrap: u64, buffer: &mut [u8]) -> VolumeSet {
-		unsafe { VolumeSet { system: recv_tagged(bootstrap, buffer, b"SYSTEM").unwrap_or(0), media: recv_tagged(bootstrap, buffer, b"MEDIA").unwrap_or(0), iso: recv_tagged(bootstrap, buffer, b"ISO").unwrap_or(0), udf: recv_tagged(bootstrap, buffer, b"UDF").unwrap_or(0), usb: recv_tagged(bootstrap, buffer, b"USB").unwrap_or(0) } }
+		unsafe { VolumeSet { system: recv_tagged(bootstrap, buffer, b"SYSTEM").unwrap_or(0), media: recv_tagged(bootstrap, buffer, b"MEDIA").unwrap_or(0), iso: recv_tagged(bootstrap, buffer, b"ISO").unwrap_or(0), udf: recv_tagged(bootstrap, buffer, b"UDF").unwrap_or(0), usb: recv_tagged(bootstrap, buffer, b"USB").unwrap_or(0), ram: recv_tagged(bootstrap, buffer, b"RAM").unwrap_or(0), tmp: recv_tagged(bootstrap, buffer, b"TMP").unwrap_or(0) } }
 	}
 
 	/// Route one path argument to its already-granted volume client.

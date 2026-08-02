@@ -29,6 +29,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let iso = recv_tagged(bootstrap, &mut buffer, b"ISO").unwrap_or(0);
 		let udf = recv_tagged(bootstrap, &mut buffer, b"UDF").unwrap_or(0);
 		let usb = recv_tagged(bootstrap, &mut buffer, b"USB").unwrap_or(0);
+		// Two more volumes follow USB in the bundle; drained so nothing is left to be read as
+		// the next message.
+		let _ = recv_tagged(bootstrap, &mut buffer, b"RAM");
+		let _ = recv_tagged(bootstrap, &mut buffer, b"TMP");
 		let cwd = match recv_blocking(bootstrap, &mut buffer) {
 			Received::Message { len, .. } => buffer[..len].to_vec(),
 			Received::Closed => Vec::new(),

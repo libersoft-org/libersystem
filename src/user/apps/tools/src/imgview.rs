@@ -281,6 +281,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let iso = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
 		let udf = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
 		let usb = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or(0);
+		// Two more volumes follow USB in the bundle; drained so nothing is left to be read as
+		// the next message.
+		let _ = recv_tagged(bootstrap, &mut buf, b"RAM");
+		let _ = recv_tagged(bootstrap, &mut buf, b"TMP");
 		let display_channel = recv_tagged(bootstrap, &mut buf, b"DISPLAY").unwrap_or(0);
 		let input_channel = recv_tagged(bootstrap, &mut buf, b"INPUT_KEYS").unwrap_or(0);
 		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {

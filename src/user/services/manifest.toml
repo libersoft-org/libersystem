@@ -1433,6 +1433,21 @@ program = "storage_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager"]
 
+# The two memory volumes. Same program as every other volume instance; what differs is the
+# bootstrap tag, which carries a capacity instead of a block service - there is no disk under
+# either of them.
+[[services]]
+name = "ram_storage"
+program = "storage_service"
+restart = "escalate"
+dependencies = ["log_service"]
+
+[[services]]
+name = "tmp_storage"
+program = "storage_service"
+restart = "escalate"
+dependencies = ["log_service"]
+
 [[services]]
 name = "usb_storage"
 program = "storage_service"

@@ -298,6 +298,10 @@ struct Clients {
 	storage_iso: u64,
 	storage_udf: u64,
 	storage_usb: u64,
+	// The two memory volumes. Held like every other volume client; the bundle below sends them
+	// under their own tags so the receiver's fixed order stays aligned.
+	storage_ram: u64,
+	storage_tmp: u64,
 	display_admin: u64,
 	input_admin: u64,
 	audio_admin: u64,
@@ -845,7 +849,15 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 // fails.
 unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 	unsafe {
-		let volumes: [(&[u8], u64); 5] = [(b"SYSTEM", clients.storage), (b"MEDIA", clients.storage_media), (b"ISO", clients.storage_iso), (b"UDF", clients.storage_udf), (b"USB", clients.storage_usb)];
+		let volumes: [(&[u8], u64); 7] = [
+			(b"SYSTEM", clients.storage),
+			(b"MEDIA", clients.storage_media),
+			(b"ISO", clients.storage_iso),
+			(b"UDF", clients.storage_udf),
+			(b"USB", clients.storage_usb),
+			(b"RAM", clients.storage_ram),
+			(b"TMP", clients.storage_tmp),
+		];
 		for &(tag, client) in volumes.iter() {
 			let dup: i64 = duplicate(client, GRANT_RIGHTS);
 			let handle: u64 = if dup >= 0 { dup as u64 } else { 0 };
@@ -953,6 +965,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let storage_iso: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_ISO") }.unwrap_or(0);
 	let storage_udf: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_UDF") }.unwrap_or(0);
 	let storage_usb: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_USB") }.unwrap_or(0);
+	let storage_ram: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_RAM") }.unwrap_or(0);
+	let storage_tmp: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_TMP") }.unwrap_or(0);
 	// The supervisor-status channel the manager grants to the governed `lssvc` command
 	// (whose manifest grants services): a dedicated ServiceManager status channel, separate
 	// from SystemGraphService's, the manager holds but never drives itself.
@@ -968,7 +982,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, display_admin, input_admin, audio_admin, broker: bootstrap };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, broker: bootstrap };
 	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") });
 
 	// 2. wait for the serve channel clients reach us on.
