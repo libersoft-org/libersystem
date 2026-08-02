@@ -2246,7 +2246,12 @@ impl StorageHarness {
 		// Sized for what it holds with room for metadata and growth, and never below the volume
 		// the scenarios expect to be able to write into.
 		let payload: usize = (0..entries.len()).filter_map(|i| entries.name(i).and_then(|n| entries.lookup(n)).map(|b| b.len())).sum();
-		let size = ((payload * 3).max(8 * 1024 * 1024) + BLOCK - 1) / BLOCK * BLOCK;
+		// Sized tightly on purpose. The image is built in the kernel heap and then chunked into a
+		// map of 512-byte sectors, so every byte here costs roughly twice over - and the aarch64
+		// archive is nearly twice the x86_64 one, because fixed-width instructions make its
+		// binaries bigger. A generous multiplier that is comfortable on x86_64 is not comfortable
+		// there.
+		let size = ((payload + payload / 8 + 64 * 1024) + BLOCK - 1) / BLOCK * BLOCK;
 		let opts = liberfs::FormatOpts { uuid: *b"libersystem-fix\0", label: b"system".to_vec(), compress: false };
 		let mut fs = liberfs::LiberFs::format_opts(FixtureDisk { bytes: alloc::vec![0u8; size] }, (size / BLOCK) as u64, opts).expect("format the fixture volume");
 		let mut made: alloc::collections::BTreeSet<alloc::vec::Vec<u8>> = alloc::collections::BTreeSet::new();

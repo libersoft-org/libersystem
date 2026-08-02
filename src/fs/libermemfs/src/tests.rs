@@ -1,5 +1,66 @@
 use super::*;
 
+// An allocator that can be made to fail, so the reserved policy can be tested for what it is
+// FOR: behaviour when memory runs out.
+//
+// Every test before this one ran on a host heap with room to spare, which made the whole class of
+// transient-peak defects invisible - a rewrite that briefly needs two copies of a file passes
+// happily when there is memory for four. The budget is thread-local and const-initialised, so
+// arming it in one test does not disturb the others running beside it and no allocation happens
+// while setting it up.
+//
+// Failing allocations return null. A fallible path (`try_reserve_exact`) turns that into
+// `NoSpace`; an infallible one aborts the process. That asymmetry is the point: a test that dies
+// here has found an allocation that should have been fallible and is not.
+struct Budgeted;
+
+thread_local! {
+	static BUDGET: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
+}
+
+unsafe impl std::alloc::GlobalAlloc for Budgeted {
+	unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+		let allowed = BUDGET.with(|budget| {
+			let left = budget.get();
+			if left == usize::MAX {
+				return true;
+			}
+			if layout.size() > left {
+				return false;
+			}
+			budget.set(left - layout.size());
+			true
+		});
+		if !allowed {
+			return core::ptr::null_mut();
+		}
+		unsafe { std::alloc::System.alloc(layout) }
+	}
+
+	unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+		BUDGET.with(|budget| {
+			let left = budget.get();
+			if left != usize::MAX {
+				budget.set(left + layout.size());
+			}
+		});
+		unsafe { std::alloc::System.dealloc(ptr, layout) }
+	}
+}
+
+#[global_allocator]
+static ALLOCATOR: Budgeted = Budgeted;
+
+// Run `body` with at most `bytes` outstanding, and lift the cap afterwards however it ends.
+fn within(bytes: usize, body: impl FnOnce()) {
+	BUDGET.with(|budget| budget.set(bytes));
+	let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+	BUDGET.with(|budget| budget.set(usize::MAX));
+	if let Err(panic) = outcome {
+		std::panic::resume_unwind(panic);
+	}
+}
+
 fn capped(capacity: usize) -> LiberMemFs {
 	LiberMemFs::mount(Policy::Capped, capacity).expect("a capped volume always mounts")
 }
@@ -377,10 +438,12 @@ fn the_reservation_survives_ten_thousand_random_operations() {
 	let mut rng = Lcg(0x5eed);
 	let mut refusals = 0usize;
 	let mut successes = 0usize;
+	let mut model = Model::default();
 
 	for step in 0..10_000 {
 		let path = paths[(rng.next() % paths.len() as u64) as usize];
-		let outcome = match rng.next() % 6 {
+		let kind = rng.next() % 6;
+		let outcome = match kind {
 			0 => fs.write_file(path, &alloc::vec![b'z'; (rng.next() % 40) as usize]),
 			1 => fs.write_file(path, b""),
 			2 => fs.mkdir(path),
@@ -393,6 +456,14 @@ fn the_reservation_survives_ten_thousand_random_operations() {
 		} else {
 			refusals += 1
 		}
+		model.apply(kind, outcome.is_ok(), path, &fs);
+
+		// Checked against a model kept BESIDE the filesystem rather than against the filesystem's
+		// own arithmetic. `resync_reservation` computes its target from `footprint()`, so a test
+		// asserting `footprint + reserved == capacity` agrees with the implementation even when
+		// `footprint()` is systematically wrong: the two share the error. The model adds the same
+		// number up from what the operations are known to have stored.
+		assert_eq!(model.footprint(), fs.footprint(), "step {step}: the model and the volume disagree about what is stored");
 
 		// The invariant the reserved policy IS.
 		assert_eq!(fs.footprint() + fs.reserved_bytes(), CAPACITY as u64, "step {step}: stored plus held is no longer the capacity (footprint {}, reserved {})", fs.footprint(), fs.reserved_bytes());
@@ -404,4 +475,211 @@ fn the_reservation_survives_ten_thousand_random_operations() {
 	// while proving nothing. Both paths have to have been taken.
 	assert!(successes > 500, "the sequence barely mutated the volume: {successes} succeeded");
 	assert!(refusals > 500, "the sequence barely refused anything: {refusals} refused");
+}
+
+#[test]
+fn a_file_used_as_a_directory_is_not_found_missing() {
+	// `lookup` returned `Option`, so it could not tell "absent" from "a file used as a directory".
+	// Reads answered NotFound while writes on the SAME path answered NotDir through the mutable
+	// walk - one wrong path, two different errors, and `FsError::NotDir` exists for this case.
+	let mut fs = capped(1024);
+	fs.write_file(b"f", b"x").expect("write");
+	fs.mkdir(b"d").expect("mkdir");
+
+	assert_eq!(fs.read_file(b"f/child"), Err(FsError::NotDir), "a file is not a directory to read through");
+	assert_eq!(fs.list_entries(b"f/child").err(), Some(FsError::NotDir));
+	assert_eq!(fs.write_file(b"f/child", b"x"), Err(FsError::NotDir));
+	assert_eq!(fs.mkdir(b"f/child"), Err(FsError::NotDir));
+
+	// An absent directory is still NotFound, which is the distinction being drawn.
+	assert_eq!(fs.read_file(b"absent/child"), Err(FsError::NotFound));
+	assert_eq!(fs.write_file(b"absent/child", b"x"), Err(FsError::NotFound));
+	assert_eq!(fs.mkdir(b"absent/child"), Err(FsError::NotFound));
+	assert_eq!(fs.read_file(b"d/child"), Err(FsError::NotFound));
+}
+
+#[test]
+fn a_full_volume_still_says_why_a_path_is_wrong() {
+	// The capacity used to be checked before the parent was known to exist, so every wrong path on
+	// a full volume came back NoSpace - the one error that says nothing about the path. Worse, a
+	// large write to a path that could never exist released the reservation and copied the whole
+	// payload before finding out.
+	let mut fs = capped(8);
+	fs.write_file(b"f", b"1234567").expect("fills it");
+	assert_eq!(fs.free(), 0, "the volume is full");
+
+	assert_eq!(fs.write_file(b"missing/x", b""), Err(FsError::NotFound), "an absent parent is NotFound even with no room");
+	assert_eq!(fs.write_file(b"f/x", b""), Err(FsError::NotDir), "a file as parent is NotDir even with no room");
+	assert_eq!(fs.mkdir(b"missing/x"), Err(FsError::NotFound));
+	assert_eq!(fs.mkdir(b"f/x"), Err(FsError::NotDir));
+	assert_eq!(fs.write_file(b"g", b"x"), Err(FsError::NoSpace), "a writable path still reports the real reason");
+}
+
+#[test]
+fn a_path_of_separators_is_refused_without_being_walked() {
+	// The depth limit is checked inside the loop, which bounds the vector but not the work: a path
+	// of nothing but separators has no non-empty segments, so it never reaches the limit however
+	// long it is - and `from_utf8` walks the whole thing first regardless.
+	let mut fs = capped(64);
+	let slashes = alloc::vec![b'/'; MAX_PATH_BYTES + 1];
+	assert_eq!(fs.read_file(&slashes), Err(FsError::TooLong));
+	assert_eq!(fs.write_file(&slashes, b"x"), Err(FsError::TooLong));
+	assert_eq!(fs.mkdir(&slashes), Err(FsError::TooLong));
+
+	let deepest: Vec<u8> = "d/".repeat(MAX_PATH_DEPTH).into_bytes();
+	assert!(deepest.len() <= MAX_PATH_BYTES);
+	assert_eq!(fs.read_file(&deepest), Err(FsError::NotFound), "legal depth is merely absent, not too long");
+}
+
+#[test]
+fn rewriting_reuses_the_files_own_allocation() {
+	// A rewrite used to build a second vector while the old contents were still in the tree, so a
+	// volume at its capacity needed twice the file to write into itself - the very thing the
+	// capacity check claims to avoid by subtracting the previous size.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 128).expect("mount");
+	fs.write_file(b"f", &[b'x'; 100]).expect("write");
+	assert_eq!(fs.used(), 100);
+
+	fs.write_file(b"f", &[b'y'; 10]).expect("shrink");
+	assert_eq!(fs.read_file(b"f").expect("read"), alloc::vec![b'y'; 10]);
+	fs.write_file(b"f", &[b'z'; 100]).expect("regrow to the original size");
+	assert_eq!(fs.read_file(b"f").expect("read"), alloc::vec![b'z'; 100]);
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), 128, "the invariant holds across the round trip");
+
+	// A refused rewrite still leaves the previous contents intact: the reserve happens before the
+	// clear, which the in-place path must not break.
+	assert_eq!(fs.write_file(b"f", &[b'q'; 200]), Err(FsError::NoSpace));
+	assert_eq!(fs.read_file(b"f").expect("read"), alloc::vec![b'z'; 100], "the refused rewrite changed nothing");
+}
+
+#[test]
+fn a_same_size_rewrite_fits_in_a_heap_the_size_of_the_volume() {
+	// The defect this stands for: a rewrite built a SECOND vector while the old contents were
+	// still in the tree, so a volume at its capacity needed twice the file to write into itself.
+	// On a host with spare memory that is invisible - which is why fifteen readings of the code
+	// found it and no test did.
+	//
+	// The payloads are built OUTSIDE the budget, because a caller's buffer is not part of the
+	// volume: in the storage service the bytes arrive in a transferred buffer. What the budget
+	// covers is the volume itself, with a small allowance for the tree around it.
+	const CAPACITY: usize = 64 * 1024;
+	let first = alloc::vec![b'x'; CAPACITY - 1];
+	let second = alloc::vec![b'y'; CAPACITY - 1];
+	within(CAPACITY + 16 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Capped, CAPACITY).expect("mount");
+		fs.write_file(b"f", &first).expect("the volume fills");
+		fs.write_file(b"f", &second).expect("a same-size rewrite fits without a second copy");
+		assert_eq!(fs.used(), CAPACITY as u64 - 1);
+	});
+}
+
+#[test]
+fn a_refused_write_does_not_compete_with_its_own_reservation() {
+	// A late refusal used to resync while the refused file's bytes were still allocated: the
+	// volume asked for its capacity back while holding a copy of the data it had just declined to
+	// store, so the regrow could fall short for exactly that memory.
+	//
+	// The parent is now resolved before anything is released, so the state cannot arise.
+	// The budget is calibrated so that HOLDING the refused payload makes the regrow fall short:
+	// the volume plus a little, minus half a volume of payload, is less than the volume. With the
+	// old ordering the reservation could not come back; with the parent resolved first there is
+	// nothing to come back from.
+	const CAPACITY: usize = 32 * 1024;
+	let payload = alloc::vec![b'z'; CAPACITY / 2];
+	within(CAPACITY + 4 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("mount");
+		assert_eq!(fs.reserved_bytes(), CAPACITY as u64);
+
+		assert_eq!(fs.write_file(b"missing/f", &payload), Err(FsError::NotFound), "an absent parent refuses before allocating");
+		assert_eq!(fs.footprint() + fs.reserved_bytes(), CAPACITY as u64, "a refused write leaves the reservation whole");
+
+		// And the volume still works up to its capacity afterwards, which is the guarantee.
+		fs.write_file(b"f", &payload).expect("the capacity is still writable");
+		assert_eq!(fs.footprint() + fs.reserved_bytes(), CAPACITY as u64);
+	});
+}
+
+#[test]
+fn a_read_too_large_for_the_heap_is_refused_rather_than_fatal() {
+	// `read_file` cloned the stored bytes, and `Vec::clone` aborts when the memory is not there.
+	// In a storage service that is a crash where a refusal would do. If this test DIES rather than
+	// failing, an infallible allocation has come back.
+	const CAPACITY: usize = 64 * 1024;
+	let mut fs = LiberMemFs::mount(Policy::Capped, CAPACITY).expect("mount");
+	// Less the name, which counts toward the capacity like any other byte.
+	fs.write_file(b"big", &alloc::vec![b'x'; CAPACITY - b"big".len()]).expect("write");
+	within(4 * 1024, || {
+		assert_eq!(fs.read_file(b"big"), Err(FsError::NoSpace), "a read that cannot be satisfied is refused, not fatal");
+	});
+	assert_eq!(fs.read_file(b"big").expect("read").len(), CAPACITY - b"big".len(), "the file is untouched by the refusal");
+}
+
+#[test]
+fn a_listing_too_large_for_the_heap_is_refused_rather_than_fatal() {
+	// Same for `list_entries`, which cloned every name and collected them infallibly.
+	let mut fs = capped(64 * 1024);
+	for i in 0..64 {
+		fs.write_file(alloc::format!("entry-{i:04}").as_bytes(), b"x").expect("write");
+	}
+	within(512, || {
+		assert_eq!(fs.list_entries(b"").err(), Some(FsError::NoSpace), "a listing that cannot be satisfied is refused, not fatal");
+	});
+	assert_eq!(fs.list_entries(b"").expect("list").len(), 64);
+}
+
+#[test]
+fn a_mount_that_cannot_take_its_capacity_fails_rather_than_pretending() {
+	// The reserved policy's whole claim is that the memory is taken at mount. Under a budget
+	// smaller than the capacity, the mount must fail - not succeed holding less.
+	within(16 * 1024, || {
+		assert_eq!(LiberMemFs::mount(Policy::Reserved, 1024 * 1024).err(), Some(FsError::NoSpace), "a reserved mount that cannot take its capacity fails");
+		// A capped volume of the same size mounts, because it takes nothing yet.
+		let fs = LiberMemFs::mount(Policy::Capped, 1024 * 1024).expect("a capped volume always mounts");
+		assert_eq!(fs.reserved_bytes(), 0);
+	});
+}
+
+// What the volume should contain, tracked independently of the filesystem's own accounting.
+//
+// It deliberately calls nothing the implementation uses to answer the same question: it adds up
+// what the operations are known to have stored, so a systematic error in `footprint()` cannot hide
+// behind agreeing with itself.
+#[derive(Default)]
+struct Model {
+	files: alloc::collections::BTreeMap<alloc::string::String, usize>,
+	dirs: alloc::collections::BTreeSet<alloc::string::String>,
+}
+
+impl Model {
+	fn apply(&mut self, kind: u64, succeeded: bool, path: &[u8], fs: &LiberMemFs) {
+		if !succeeded {
+			return;
+		}
+		let name = core::str::from_utf8(path).expect("test paths are utf-8");
+		match kind {
+			// A write records the size the volume now reports for that ONE entry - never a total.
+			0 | 1 => {
+				let size = fs.read_file(path).expect("a written file reads back").len();
+				self.files.insert(alloc::string::String::from(name), size);
+			}
+			2 => {
+				self.dirs.insert(alloc::string::String::from(name));
+			}
+			3 => {
+				self.files.remove(name);
+			}
+			4 => {
+				self.dirs.remove(name);
+			}
+			_ => {}
+		}
+	}
+
+	// The same number `footprint()` reports, derived from the model instead: every file's data,
+	// plus the final segment of every path, which is the name its parent holds.
+	fn footprint(&self) -> u64 {
+		let data: usize = self.files.values().sum();
+		let names: usize = self.files.keys().chain(self.dirs.iter()).map(|path| path.rsplit('/').next().map_or(0, str::len)).sum();
+		(data + names) as u64
+	}
 }

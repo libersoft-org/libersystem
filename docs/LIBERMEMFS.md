@@ -18,8 +18,9 @@ usually describes does not exist here.
   `Capped` charges as files are written.
 - Bounded everywhere: file size, entry count, name length and path depth all refuse past their
   limit rather than truncating.
-- `no_std` + `alloc`, ~320 lines, 17 unit tests. It implements the storage service's
-  `FileSystem` trait directly, NOT `fscore::BlockDevice` - there is no block device under it.
+- `no_std` + `alloc`, ~470 lines, 28 unit tests. It implements NEITHER `fscore::BlockDevice` -
+  there is no block device under it - nor the storage service's `FileSystem` trait: the service's
+  `MemFs` adapter does that, exactly as `IsoFs` and `UdfFs` wrap their backends.
 - Mounted as `vol://ram` (reserved) and `vol://tmp` (capped).
 
 ## Why not LiberFS on a RAM disk
@@ -70,8 +71,11 @@ all, because a directory stores no data.
 `used()` therefore reports file data, which is what the word means to a caller and to every other
 backend, while `footprint()` reports what the capacity actually bounds and `free()` subtracts both.
 
-`free()` is exact for rewriting a file that exists, whose name is already paid for, and one name
-short for creating a new one, which is charged for its name on top. That is the contract, not a
+`free()` reports what the volume can actually promise: the capacity rule for a capped volume, and
+for a reserved one whichever is smaller of that and what the reservation still holds - so a
+reservation that fell short shows up as less free space wherever free space is reported, including
+through the service's `status`. It is exact for rewriting a file that exists, whose name is already
+paid for, and one name short for creating a new one, which is charged for its name on top. That is the contract, not a
 rounding error: the length of a name that does not exist yet is not knowable, so a caller creating
 an entry should expect to need `free()` minus the name. Reporting `capacity - used` instead would
 be worse again - it would promise room that every name already stored has taken.
@@ -218,6 +222,25 @@ which destroyed the previous contents whenever the allocation failed.
 
 **`rmdir` never recurses.** Removing a tree by naming its root is a different operation, and
 doing it silently is how a caller loses more than it meant to.
+
+## What `Reserved` does and does not promise
+
+It takes the whole capacity at mount, so a mount fails when the memory is not available and
+nothing else in the process can take it afterwards. That much is a guarantee.
+
+What it cannot promise is that the memory comes BACK. The reservation is one contiguous
+allocation, so after deletes fragment the heap the total free memory can cover it while no single
+block does; the regrow is best effort and the volume then holds less than its capacity.
+`reservation_intact()` says whether it still does, and `free()` reports the smaller figure, so a
+degraded volume is visible rather than merely documented. A guarantee that cannot degrade needs an
+arena the volume allocates everything from - files, names and nodes - and hands nothing back to the
+global heap. That is a different design, and it is recorded as open work rather than implied here.
+
+Allocation is fallible wherever a caller can be told: the file bytes, the reservation, a read, a
+listing and the name of a new entry all answer `NoSpace` instead of aborting, and path parsing
+allocates nothing at all. What remains infallible is the map node behind an entry, because
+`BTreeMap` offers no fallible insert - so a volume can still abort on a heap tight enough to refuse
+tens of bytes, which the arena above would also fix.
 
 ## What it deliberately does not do
 

@@ -13,8 +13,14 @@
 //! Two allocation policies share this one implementation, because they differ only in WHEN the
 //! memory is charged, never in what a file or a directory is:
 //!
-//! - `Policy::Reserved` takes its whole capacity at mount. Mounting fails if the memory is not
-//!   available, and afterwards a write cannot fail for want of memory that something else took.
+//! - `Policy::Reserved` takes its whole capacity at mount, so mounting fails when the memory is
+//!   not available and nothing else in the process can take it afterwards. What it does NOT
+//!   promise is that the memory can always be taken back: the reservation is one contiguous
+//!   allocation, and after deletes fragment the heap the total free memory can cover it while no
+//!   single block does. When that happens the volume holds less than its capacity, says so
+//!   through `reserved_bytes()`, and reports it to clients as a volume no longer covering its
+//!   own free space. A guarantee that cannot degrade needs an arena the volume allocates
+//!   everything from, which is a different design and is recorded as such in M0139d.
 //! - `Policy::Capped` takes memory as files are written and refuses past the limit. Nothing is
 //!   held that is not used, and the limit is a ceiling rather than a reservation.
 
@@ -33,6 +39,13 @@ pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 4096;
 pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_PATH_DEPTH: usize = 16;
+// The longest path that can name anything: every segment at its limit, with a separator between
+// them. Checked before the path is walked, so the depth limit bounds the WORK and not only the
+// result.
+pub const MAX_PATH_BYTES: usize = MAX_PATH_DEPTH * (MAX_NAME_BYTES + 1);
+
+// A parsed path: bounded by the depth limit, so it lives on the stack.
+type Segments<'a> = [&'a str; MAX_PATH_DEPTH];
 
 // When a volume's memory is charged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +168,20 @@ impl LiberMemFs {
 		self.reserved as u64
 	}
 
+	// Whether a reserved volume still holds everything it promised.
+	//
+	// False when a regrow fell short - the memory was there at mount but could not be taken back
+	// after a delete, usually because the heap fragmented and no single block covers the
+	// reservation any more. The volume keeps working; what it has lost is the promise that a
+	// write up to its capacity cannot fail for want of memory. Capped volumes are always intact,
+	// having promised nothing.
+	//
+	// Exposed because the promise is the only thing separating the two policies, and a volume
+	// that quietly stopped keeping it is indistinguishable from one that still does.
+	pub fn reservation_intact(&self) -> bool {
+		self.policy != Policy::Reserved || self.reserved as u64 == self.capacity() - self.footprint()
+	}
+
 	// What can still be written, after both the data and the names ALREADY held.
 	//
 	// Exact for rewriting an existing file, whose name is already paid for; one name short for
@@ -163,17 +190,41 @@ impl LiberMemFs {
 	// rounding error, and a caller creating an entry should expect to need `free()` minus the name.
 	// Reporting `capacity - used` would be worse again, promising room that every name already
 	// stored has taken.
+	//
+	// A reserved volume reports what it HOLDS rather than what the capacity rule allows, and the
+	// two differ only when a regrow has fallen short. That keeps one meaning for the word: room
+	// this volume can actually promise. A degraded reservation therefore shows up as less free
+	// space everywhere it is reported - including through the storage service's `status`, which
+	// has no field for "the guarantee slipped" and would otherwise report a volume as healthy
+	// while it no longer covered its own free space.
 	pub fn free(&self) -> u64 {
-		self.capacity().saturating_sub(self.footprint())
+		let by_capacity = self.capacity().saturating_sub(self.footprint());
+		match self.policy {
+			Policy::Reserved => by_capacity.min(self.reserved as u64),
+			Policy::Capped => by_capacity,
+		}
 	}
 
 	// Split a path into its segments, rejecting everything that is not a plain relative path.
 	// `.` and `..` are refused rather than resolved: this filesystem has no working directory
 	// and no use for either, and accepting `..` would be the one way to name something outside
 	// the volume.
-	fn segments(path: &[u8]) -> Result<Vec<&str>, FsError> {
+	fn segments(path: &[u8]) -> Result<(Segments<'_>, usize), FsError> {
+		// Bounded BEFORE the UTF-8 pass, because that pass walks the whole input. Checking depth
+		// inside the loop bounds the vector but not the work: a path of a million separators has
+		// no non-empty segments, so it never reaches the depth limit however long it is, and every
+		// operation - including a read on a volume with nothing left in it - would still walk it.
+		// The longest legal path is every segment at its limit with a separator between them.
+		if path.len() > MAX_PATH_BYTES {
+			return Err(FsError::TooLong);
+		}
 		let text = core::str::from_utf8(path).map_err(|_| FsError::BadName)?;
-		let mut parts: Vec<&str> = Vec::new();
+		// A fixed array rather than a vector: the depth is bounded, so the segments fit on the
+		// stack and path parsing allocates nothing at all. It used to `push` into a `Vec`, which
+		// aborts the process when memory is short - so a read on a tight heap died before it
+		// reached the fallible allocation it was supposed to refuse at.
+		let mut parts: Segments<'_> = [""; MAX_PATH_DEPTH];
+		let mut count = 0usize;
 		for segment in text.split('/') {
 			if segment.is_empty() {
 				// Leading, trailing and doubled separators are tolerated: `/a/b/`, `a//b` and
@@ -186,39 +237,60 @@ impl LiberMemFs {
 			if segment.len() > MAX_NAME_BYTES {
 				return Err(FsError::TooLong);
 			}
-			parts.push(segment);
-			// Refused here rather than after the loop, so this vector never holds more than the
-			// depth limit. Checking at the end still returns the same error, but only after a path
-			// of a thousand segments has been parsed into a thousand entries - an allocation the
-			// caller sizes, charged to nothing, on every operation including reads. The limit is
-			// meant to bound the work, not just describe the result.
-			if parts.len() > MAX_PATH_DEPTH {
+			if count == MAX_PATH_DEPTH {
 				return Err(FsError::TooLong);
 			}
+			parts[count] = segment;
+			count += 1;
 		}
-		Ok(parts)
+		Ok((parts, count))
 	}
 
-	fn lookup(&self, parts: &[&str]) -> Option<&Node> {
+	// Resolve a path to the node it names, or say why it does not name one.
+	//
+	// `Ok(None)` means every directory on the way exists and the final name is simply absent -
+	// which is what a create needs to know. `Err(NotDir)` means a FILE was used as a directory,
+	// and `Err(NotFound)` that a directory on the way is missing. Returning `Option` conflated all
+	// three, so `read_file("f/child")` answered NotFound while `write_file` on the same path
+	// answered NotDir through the mutable walk: one wrong path, two different errors, and
+	// `FsError::NotDir` exists for exactly this case.
+	fn resolve(&self, parts: &[&str]) -> Result<Option<&Node>, FsError> {
+		let Some((name, directories)) = parts.split_last() else {
+			// The empty path names the root.
+			return Ok(Some(&self.root));
+		};
+		let children = self.parent_of(directories)?;
+		Ok(children.get(*name))
+	}
+
+	// The directory `directories` names, walking from the root. Read-only, so a caller can learn
+	// whether a parent exists BEFORE anything is released or allocated.
+	fn parent_of(&self, directories: &[&str]) -> Result<&BTreeMap<String, Node>, FsError> {
 		let mut node = &self.root;
-		for part in parts {
-			let Node::Directory(children) = node else { return None };
-			node = children.get(*part)?;
+		for part in directories {
+			let Node::Directory(children) = node else { return Err(FsError::NotDir) };
+			node = children.get(*part).ok_or(FsError::NotFound)?;
 		}
-		Some(node)
+		match node {
+			Node::Directory(children) => Ok(children),
+			Node::File(_) => Err(FsError::NotDir),
+		}
 	}
 
-	// Walk to the parent of `parts`, creating nothing. Returns the parent directory and the
-	// final name.
-	fn parent_mut<'a>(&'a mut self, parts: &[&'a str]) -> Result<(&'a mut BTreeMap<String, Node>, &'a str), FsError> {
-		let (name, directories) = parts.split_last().ok_or(FsError::BadName)?;
+	// Walk to the parent of `parts`, creating nothing.
+	//
+	// Returns the directory alone; the final name comes from `parts`, which the caller already
+	// holds. Returning the name from here would tie its lifetime to the borrow of `self`, so a
+	// caller could not hold both.
+	fn parent_mut(&mut self, parts: &[&str]) -> Result<&mut BTreeMap<String, Node>, FsError> {
+		let (_, directories) = parts.split_last().ok_or(FsError::BadName)?;
 		let mut node = &mut self.root;
 		for part in directories {
 			let Node::Directory(children) = node else { return Err(FsError::NotDir) };
 			node = children.get_mut(*part).ok_or(FsError::NotFound)?;
 		}
 		match node {
-			Node::Directory(children) => Ok((children, *name)),
+			Node::Directory(children) => Ok(children),
 			Node::File(_) => Err(FsError::NotDir),
 		}
 	}
@@ -278,25 +350,46 @@ impl LiberMemFs {
 		let _ = core::hint::black_box(self.reservation.as_ptr());
 	}
 
-	pub fn read_file(&mut self, path: &[u8]) -> Result<Vec<u8>, FsError> {
-		let parts = Self::segments(path)?;
-		match self.lookup(&parts) {
-			Some(Node::File(data)) => Ok(data.clone()),
+	// Read a whole file.
+	//
+	// The copy is fallible: `Vec::clone` aborts the process when the memory is not there, and a
+	// 64 MiB file is a 64 MiB allocation inside a storage service that should answer `NoSpace`
+	// rather than die.
+	pub fn read_file(&self, path: &[u8]) -> Result<Vec<u8>, FsError> {
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		match self.resolve(parts)? {
+			Some(Node::File(data)) => {
+				let mut out: Vec<u8> = Vec::new();
+				out.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
+				out.extend_from_slice(data);
+				Ok(out)
+			}
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			None => Err(FsError::NotFound),
 		}
 	}
 
 	// Write a whole file, creating or replacing it.
+	//
+	// The order matters and is the fix for three separate defects. Everything that can refuse is
+	// checked while the volume is untouched: the parent is resolved READ-ONLY first, so a write to
+	// a path that cannot exist costs nothing, answers `NotFound` or `NotDir` rather than `NoSpace`
+	// on a full volume, and - crucially - cannot refuse after the reservation has been released.
+	// Only then is anything released or allocated.
 	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
 		if data.len() > MAX_FILE_BYTES {
 			return Err(FsError::TooLong);
 		}
-		let parts = Self::segments(path)?;
-		// What this name holds today, if anything. Read before anything is changed, because the
-		// capacity check and the reservation release below both need it and neither may run
-		// against a half-modified tree.
-		let (previous, is_new) = match self.lookup(&parts) {
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		if parts.is_empty() {
+			// The root is a directory and cannot be written as a file.
+			return Err(FsError::IsDir);
+		}
+		// Resolves the parent as a side effect, so an absent or non-directory parent is refused
+		// here rather than after the data has been copied.
+		let (previous, is_new) = match self.resolve(parts)? {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
 			Some(Node::File(existing)) => (existing.len(), false),
 			None => {
@@ -306,101 +399,137 @@ impl LiberMemFs {
 				(0, true)
 			}
 		};
-		// Subtracting what the file already holds is what lets it be rewritten on a full volume:
-		// replacing does not need room for both copies. The check is the same for both policies;
-		// only where the memory comes from differs.
+		// Subtracting what the file already holds is what lets it be rewritten on a full volume.
 		// A new entry also costs its name; replacing an existing one does not, because the name is
 		// already there and already counted.
 		let name_cost = if is_new { parts.last().map_or(0, |name| name.len()) } else { 0 };
-		let footprint = self.footprint() as usize;
-		if footprint - previous + data.len() + name_cost > self.capacity {
+		if self.footprint() as usize - previous + data.len() + name_cost > self.capacity {
 			return Err(FsError::NoSpace);
 		}
-		// A reserved volume releases what it is holding BEFORE allocating the file. Otherwise the
+		// A reserved volume releases what it is holding BEFORE allocating. Otherwise the
 		// allocation and the reservation are outstanding at the same time and the write can fail
 		// for memory the volume is itself sitting on - precisely the failure a reservation exists
 		// to prevent.
 		//
 		// All of it, not just the difference: the whole point is that the bytes are certainly
 		// available, and releasing exactly enough leaves that resting on the reservation being
-		// perfectly in step, which it is not after a best-effort regrow has fallen short. The
-		// resync at the end puts back whatever the volume should still be holding.
+		// perfectly in step, which it is not after a best-effort regrow has fallen short.
 		if self.policy == Policy::Reserved {
 			self.release_reservation();
 		}
-		// The bytes are built before the entry is replaced. Inserting an empty file first and
-		// filling it afterwards loses the previous contents when the allocation fails - a failed
-		// write must leave what was there untouched, not truncate it to nothing.
-		let mut written: Vec<u8> = Vec::new();
-		if written.try_reserve_exact(data.len()).is_err() {
-			// The release above is undone on the way out, so a refused write leaves the volume
-			// holding exactly what it held before it was attempted.
-			self.resync_reservation();
-			return Err(FsError::NoSpace);
-		}
-		written.extend_from_slice(data);
-		// `parent_mut` can still refuse - the parent may not exist, or a path component may be a
-		// file - and it runs AFTER the reservation was released. Returning through `?` here would
-		// walk past the resync and leave the volume holding less than its capacity for the rest
-		// of its life, with nothing stored to account for it. Every exit from this point on goes
-		// through the resync.
-		match self.parent_mut(&parts) {
-			Ok((children, name)) => {
-				children.insert(String::from(name), Node::File(written));
-			}
-			Err(error) => {
-				self.resync_reservation();
-				return Err(error);
-			}
-		}
+		// In its own call so every temporary it makes is dropped BEFORE the resync. Holding a
+		// refused file's bytes while asking for the reservation back means competing with
+		// yourself for the memory: the regrow can fall short for exactly the allocation that is
+		// about to be thrown away.
+		let stored = self.store(parts, data, is_new);
 		self.resync_reservation();
+		stored
+	}
+
+	// Put `data` at `parts`, which `write_file` has already established is writable.
+	fn store(&mut self, parts: &[&str], data: &[u8], is_new: bool) -> Result<(), FsError> {
+		if !is_new {
+			// Rewriting reuses the file's own allocation. Building a second vector would hold the
+			// old contents and the new ones at once - so a volume at its capacity would need
+			// twice the file to write into itself, which is the failure the capacity check
+			// claims to have avoided by subtracting the previous size.
+			//
+			// The reserve happens BEFORE the clear, so a refused rewrite leaves the file exactly
+			// as it was rather than truncated to nothing.
+			let file = self.file_mut(parts)?;
+			if data.len() > file.len() {
+				file.try_reserve_exact(data.len() - file.len()).map_err(|_| FsError::NoSpace)?;
+			}
+			file.clear();
+			file.extend_from_slice(data);
+			return Ok(());
+		}
+		// A new entry: the bytes are built before the entry exists, so a failure leaves the tree
+		// untouched.
+		let mut written: Vec<u8> = Vec::new();
+		written.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
+		written.extend_from_slice(data);
+		let mut name = String::new();
+		let last = parts.last().copied().ok_or(FsError::BadName)?;
+		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
+		name.push_str(last);
+		let children = self.parent_mut(parts)?;
+		children.insert(name, Node::File(written));
 		Ok(())
 	}
 
-	pub fn list_entries(&mut self, path: &[u8]) -> Result<Vec<Entry>, FsError> {
-		let parts = Self::segments(path)?;
-		match self.lookup(&parts) {
-			Some(Node::Directory(children)) => Ok(children.iter().map(|(name, node)| Entry { name: name.clone(), size: node.bytes() as u64, is_dir: node.is_dir() }).collect()),
+	// The bytes of the file at `parts`, for rewriting in place.
+	fn file_mut(&mut self, parts: &[&str]) -> Result<&mut Vec<u8>, FsError> {
+		let name = *parts.last().ok_or(FsError::BadName)?;
+		let children = self.parent_mut(parts)?;
+		match children.get_mut(name) {
+			Some(Node::File(data)) => Ok(data),
+			Some(Node::Directory(_)) => Err(FsError::IsDir),
+			None => Err(FsError::NotFound),
+		}
+	}
+
+	// List a directory. Fallible throughout: a directory at the entry limit with long names is a
+	// megabyte of names, and `collect` would abort rather than refuse.
+	pub fn list_entries(&self, path: &[u8]) -> Result<Vec<Entry>, FsError> {
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		match self.resolve(parts)? {
+			Some(Node::Directory(children)) => {
+				let mut out: Vec<Entry> = Vec::new();
+				out.try_reserve_exact(children.len()).map_err(|_| FsError::NoSpace)?;
+				for (name, node) in children {
+					let mut copy = String::new();
+					copy.try_reserve_exact(name.len()).map_err(|_| FsError::NoSpace)?;
+					copy.push_str(name);
+					out.push(Entry { name: copy, size: node.bytes() as u64, is_dir: node.is_dir() });
+				}
+				Ok(out)
+			}
 			Some(Node::File(_)) => Err(FsError::NotDir),
 			None => Err(FsError::NotFound),
 		}
 	}
 
+	// Create one directory. Same ordering as `write_file`, and for the same reasons: everything
+	// that can refuse is checked before anything is released.
 	pub fn mkdir(&mut self, path: &[u8]) -> Result<(), FsError> {
-		let parts = Self::segments(path)?;
-		// A directory stores nothing but still costs its name, and that name is memory the caller
-		// asked for. Charging it is what stops a volume being filled past its capacity with
-		// directories - `mkdir` had no capacity check at all.
-		//
-		// Every check is made before anything is released, so a refusal costs nothing.
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
 		let name = *parts.last().ok_or(FsError::BadName)?;
-		if self.lookup(&parts).is_some() {
+		// Resolves the parent too, so an absent or non-directory parent refuses here.
+		if self.resolve(parts)?.is_some() {
 			return Err(FsError::Exists);
 		}
+		// A directory stores nothing but still costs its name, and that name is memory the caller
+		// asked for.
 		if self.root.count() >= MAX_ENTRIES || self.footprint() as usize + name.len() > self.capacity {
 			return Err(FsError::NoSpace);
 		}
-		// The name is an allocation like any other, so a reserved volume releases before making
-		// it - the same rule the write path follows, for the same reason. Since names now count
-		// toward the footprint, skipping this would leave the reservation permanently ahead of
-		// what the volume actually holds.
 		if self.policy == Policy::Reserved {
 			self.release_reservation();
 		}
-		let inserted = match self.parent_mut(&parts) {
-			Ok((children, name)) => {
-				children.insert(String::from(name), Node::Directory(BTreeMap::new()));
-				Ok(())
-			}
-			Err(error) => Err(error),
-		};
+		let made = self.make_dir(parts);
 		self.resync_reservation();
-		inserted
+		made
+	}
+
+	// Insert the directory, in its own call so its temporaries are gone before the resync.
+	fn make_dir(&mut self, parts: &[&str]) -> Result<(), FsError> {
+		let last = parts.last().copied().ok_or(FsError::BadName)?;
+		let mut name = String::new();
+		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
+		name.push_str(last);
+		let children = self.parent_mut(parts)?;
+		children.insert(name, Node::Directory(BTreeMap::new()));
+		Ok(())
 	}
 
 	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
-		let parts = Self::segments(path)?;
-		let (children, name) = self.parent_mut(&parts)?;
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		let name = *parts.last().ok_or(FsError::BadName)?;
+		let children = self.parent_mut(parts)?;
 		match children.get(name) {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			Some(Node::File(_)) => {
@@ -416,8 +545,10 @@ impl LiberMemFs {
 	// recursively: deleting a tree by naming its root is a different operation, and doing it
 	// silently is how a caller loses more than it meant to.
 	pub fn rmdir(&mut self, path: &[u8]) -> Result<(), FsError> {
-		let parts = Self::segments(path)?;
-		let (children, name) = self.parent_mut(&parts)?;
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		let name = *parts.last().ok_or(FsError::BadName)?;
+		let children = self.parent_mut(parts)?;
 		match children.get(name) {
 			Some(Node::Directory(entries)) if entries.is_empty() => {
 				children.remove(name);
