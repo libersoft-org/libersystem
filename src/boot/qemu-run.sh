@@ -651,7 +651,7 @@ qemu_run_aarch64() {
 	qemu_select_cpu cpu_args aarch64 cortex-a72
 
 	# System volume disk: virtio-blk holding the factory archive.
-	local volume_pkg="$QEMU_BUILD_DIR/system-volume-aarch64.img"
+	local volume_pkg="$QEMU_BUILD_DIR/volume-aarch64.pkg"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk-aarch64.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
 		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 "disable-legacy=on"
