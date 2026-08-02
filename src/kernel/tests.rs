@@ -2261,6 +2261,21 @@ impl StorageHarness {
 	// serves (FAT, ISO, UDF) are images already - reinterpreting them as archives to rebuild would
 	// be nonsense, which is exactly what happened when the two shared one function.
 	fn start_system(storage_elf: &[u8], tag: &[u8], archive: &[u8], capacity: u64) -> Self {
+		// Formatted ONCE and cloned per harness. Building it per test made the aarch64 suite
+		// exceed its watchdog: laying out a LiberFS volume is a B-tree walk and a transaction log
+		// per file, and under TCG that is minutes rather than seconds when a dozen storage tests
+		// each pay it. Copying the finished sector map is a memcpy of the same bytes.
+		static FIXTURE: crate::sync::SpinLock<Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>> = crate::sync::SpinLock::new(None);
+		if let Some(sectors) = FIXTURE.lock().as_ref() {
+			return Self::start_disk(storage_elf, tag, sectors.clone(), capacity);
+		}
+		let sectors = Self::build_system_fixture(archive);
+		*FIXTURE.lock() = Some(sectors.clone());
+		Self::start_disk(storage_elf, tag, sectors, capacity)
+	}
+
+	// Format a LiberFS volume carrying the scenario archive's files, as a sector map.
+	fn build_system_fixture(archive: &[u8]) -> alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> {
 		const BLOCK: usize = liberfs::BLOCK_SIZE;
 		let entries = pkg::Package::parse(archive).expect("scenario archive parses");
 		let payload: usize = (0..entries.len()).filter_map(|i| entries.name(i).and_then(|n| entries.lookup(n)).map(|b| b.len())).sum();
@@ -2293,7 +2308,7 @@ impl StorageHarness {
 		// than at the fixture that produced it.
 		let mut disk = fs.into_device();
 		assert!(liberfs::LiberFs::mount(FixtureDisk { sectors: disk.sectors.clone() }).is_some(), "the fixture volume does not mount");
-		Self::start_disk(storage_elf, tag, core::mem::take(&mut disk.sectors), capacity)
+		core::mem::take(&mut disk.sectors)
 	}
 
 	fn start_disk(storage_elf: &[u8], tag: &[u8], disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) -> Self {
