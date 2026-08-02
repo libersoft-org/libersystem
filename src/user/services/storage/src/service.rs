@@ -76,18 +76,19 @@ const OP_WRITE: u32 = 1;
 const OP_CAPACITY: u32 = 2;
 const OP_FLUSH: u32 = 3;
 
-// LiberFS layout on the disk: the writable filesystem starts at FS_START_SECTOR - well
-// past the factory archive at LBA 0, which the boot runner re-lays every boot and the
-// filesystem never overwrites, so created files persist across reboots. The archive
-// carries the staged program binaries, so the FS starts well past it. This
-// must exceed the largest architecture's factory archive: aarch64 program binaries are
-// roughly 1.8x the x86_64 ones (fixed-width instructions), so a 10 MB x86 archive is
-// ~18 MB on aarch64 - the region is sized generously past both (read_seed_archive also
-// bounds the archive to this region, so it doubles as the "no archive" sanity cap). The
-// pool SIZE is derived from the disk's real capacity at mount/format time (the capacity
-// query); FS_BLOCKS is only the fallback pool for a disk that cannot report one.
+// LiberFS layout on the disk: the filesystem starts at LBA 0 of its container.
+//
+// It used to start 32 MiB in, to clear a factory archive laid at LBA 0 that the service formatted
+// a fresh volume from. That archive is gone (M0138): the system volume is now built as a real
+// filesystem, so the disk carries a volume rather than a package to make one out of, and there is
+// nothing in front of it to skip. The container is a GPT partition with the LiberFS type GUID
+// when the disk has one, and otherwise the whole device - which is what the loader also assumes,
+// since firmware exposes a partition as its own block handle whose LBA 0 is the partition start.
+//
+// The pool SIZE is derived from the disk's real capacity at mount time; FS_BLOCKS is only the
+// fallback for a disk that cannot report one.
 const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
-const FS_START_SECTOR: u64 = 65536; // 32 MiB in, past the largest arch's factory archive
+const FS_START_SECTOR: u64 = 0;
 const FS_BLOCKS: u64 = 8192;
 
 // An ISO9660 logical block (2048 bytes) is this many 512-byte disk sectors; one
@@ -1146,10 +1147,15 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	let uuid: [u8; 16] = unsafe { stir_uuid() };
 	let opts: FormatOpts = FormatOpts { uuid, label: b"system".to_vec(), compress: false };
 	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client, base, limit: pool, max_sectors }, pool, opts).ok()?;
-	// stamp real time before seeding, so the factory files carry a real ctime/mtime.
 	fs.set_clock(unsafe { clock_rtc() });
-	if let Some(archive) = unsafe { read_seed_archive(block_client, max_sectors) } {
-		seed_from_archive(&mut fs, &archive);
+	// Empty, and said out loud. There used to be a factory archive at LBA 0 to seed from, and
+	// with it gone (M0138) a disk carrying no filesystem carries no system volume either - the
+	// volume is built as a filesystem now, not made on the spot from a package beside it.
+	//
+	// Formatting rather than refusing keeps a genuinely fresh disk usable, but silence here would
+	// let a machine whose system volume never arrived look exactly like one that is merely new.
+	unsafe {
+		print(b"storage: vol://system had no filesystem; formatted an EMPTY volume (nothing was seeded - the disk carries no system volume)\n");
 	}
 	Some(fs)
 }
@@ -1171,8 +1177,8 @@ unsafe fn stir_uuid() -> [u8; 16] {
 	uuid
 }
 
-// The filesystem pool the disk's real capacity allows: everything past the factory
-// archive region, in filesystem blocks - asked of the disk over the capacity query.
+// The filesystem pool the disk's real capacity allows, in filesystem blocks - asked of the disk
+// over the capacity query.
 // Falls back to the fixed FS_BLOCKS pool when the disk cannot answer (or is too
 // small for the layout), so an old driver still mounts something.
 unsafe fn disk_pool_blocks(block_client: u64) -> u64 {
@@ -1245,91 +1251,6 @@ unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
 			}
 		}
 		None
-	}
-}
-
-// Copy every file from the factory PKGARCH1 archive into the filesystem (best effort;
-// a file that does not fit is skipped).
-fn seed_from_archive(fs: &mut LiberFs<ChannelBlockDevice>, archive: &[u8]) {
-	let Some(package) = Package::parse(archive) else {
-		return;
-	};
-	for index in 0..package.len() {
-		if let Some(name) = package.name(index) {
-			if let Some(bytes) = package.lookup(name) {
-				let _ = fs.write_file(name, bytes);
-			}
-		}
-	}
-}
-
-// Read the factory PKGARCH1 archive off the virtio-blk disk at LBA 0 into a Vec,
-// leaving `block_client` open for the filesystem. The header + entry table may span
-// several sectors now that the program binaries are staged, so the whole archive is
-// read in chunks of the driver's own per-request cap (`max_sectors`). Returns
-// None if the disk holds no archive. The header's claims (the entry count, each blob's
-// end) are DISK CONTENT sizing an in-memory buffer, and this path runs exactly on a
-// disk without a valid filesystem - the least trustworthy disk there is: every claim
-// is bounded by the seed region's fixed size (the filesystem starts right past it),
-// and a claim beyond it means "no archive", never an allocation.
-unsafe fn read_seed_archive(block_client: u64, max_sectors: u32) -> Option<Vec<u8>> {
-	unsafe {
-		// the driver's per-request cap bounds each chunk, and 1 MB bounds the chunk
-		// (a driver reporting no practical limit must not size this buffer).
-		let chunk: usize = SECTOR_SIZE * max_sectors.min(2048) as usize;
-		const SEED_REGION_BYTES: usize = FS_START_SECTOR as usize * SECTOR_SIZE;
-		// `total` starts large enough to reach the entry count, grows to cover the whole
-		// entry table, then becomes the end of the last blob.
-		let mut archive: Vec<u8> = Vec::new();
-		let mut total: usize = PKG_HEADER_LEN;
-		let mut table_end: usize = 0;
-		let mut filled: usize = 0;
-		while filled < total {
-			let want: usize = ((total + chunk - 1) / chunk) * chunk;
-			if archive.len() < want {
-				archive.resize(want, 0);
-			}
-			let lba: u64 = (filled / SECTOR_SIZE) as u64;
-			if !block_read(block_client, lba, (chunk / SECTOR_SIZE) as u32, archive.as_mut_ptr().add(filled)) {
-				return None;
-			}
-			filled += chunk;
-			if table_end == 0 {
-				// the first chunk carries the magic and the entry count.
-				if &archive[..PKG_MAGIC.len()] != PKG_MAGIC {
-					return None;
-				}
-				let count: usize = u32::from_le_bytes([archive[8], archive[9], archive[10], archive[11]]) as usize;
-				let claimed: usize = PKG_HEADER_LEN + PKG_ENTRY_LEN * count;
-				if claimed > SEED_REGION_BYTES {
-					return None;
-				}
-				table_end = claimed;
-				total = table_end;
-			}
-			if total == table_end && filled >= table_end {
-				// the whole entry table is in memory: the archive's total size is the end of
-				// its last blob - bounded by the seed region like every other claim.
-				let count: usize = (table_end - PKG_HEADER_LEN) / PKG_ENTRY_LEN;
-				let mut end: usize = table_end;
-				let mut i: usize = 0;
-				while i < count {
-					let e: usize = PKG_HEADER_LEN + PKG_ENTRY_LEN * i;
-					let off: usize = u32::from_le_bytes([archive[e + PKG_NAME_LEN], archive[e + PKG_NAME_LEN + 1], archive[e + PKG_NAME_LEN + 2], archive[e + PKG_NAME_LEN + 3]]) as usize;
-					let size: usize = u32::from_le_bytes([archive[e + PKG_NAME_LEN + 4], archive[e + PKG_NAME_LEN + 5], archive[e + PKG_NAME_LEN + 6], archive[e + PKG_NAME_LEN + 7]]) as usize;
-					if off + size > end {
-						end = off + size;
-					}
-					i += 1;
-				}
-				if end > SEED_REGION_BYTES {
-					return None;
-				}
-				total = end;
-			}
-		}
-		archive.truncate(total);
-		Some(archive)
 	}
 }
 

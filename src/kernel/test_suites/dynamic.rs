@@ -251,7 +251,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
 	let (process_boot_kernel, _storage_boot_kernel, process_client) = start_process_service_from_volume(volume);
-	let mut writable_storage = StorageHarness::start(storage_elf, b"BLOCK", volume, 64 * 1024 * 1024);
+	let mut writable_storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume, 64 * 1024 * 1024);
 
 	// START a staged static tool: [op = 1 u16][corr u32][name: [len u16][utf8]].
 	let name: &[u8] = b"ptyecho";

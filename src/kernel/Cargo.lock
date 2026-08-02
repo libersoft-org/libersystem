@@ -77,6 +77,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "fscore"
+version = "0.0.0"
+
+[[package]]
 name = "gif"
 version = "0.0.0"
 dependencies = [
@@ -129,13 +133,22 @@ dependencies = [
  "abi",
  "bmp",
  "bootproto",
+ "fscore",
  "gif",
+ "liberfs",
  "pix",
  "png",
  "system-manifest",
  "term",
  "tga",
  "webp",
+]
+
+[[package]]
+name = "liberfs"
+version = "0.0.0"
+dependencies = [
+ "fscore",
 ]
 
 [[package]]

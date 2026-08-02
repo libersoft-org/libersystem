@@ -160,7 +160,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	// region, not the old fixed constant.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	const SECTOR: usize = 512;
-	let expected_pool: u64 = (CAPACITY - FACTORY_START_SECTOR * SECTOR as u64) / 4096;
+	let expected_pool: u64 = (CAPACITY - FALLBACK_START_SECTOR * SECTOR as u64) / 4096;
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
 	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
@@ -188,7 +188,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	// the freshly laid superblock (filesystem block 0 = the first sector past the
 	// factory-archive region) must record the capacity-derived pool. num_blocks sits
 	// at bytes 16..24 of the superblock - its stable on-disk ABI.
-	let sb = disk.get(&FACTORY_START_SECTOR).expect("the format should write superblock slot 0");
+	let sb = disk.get(&FALLBACK_START_SECTOR).expect("the format should write superblock slot 0");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, expected_pool, "the pool should span everything past the archive region, derived from the reported capacity");
 
@@ -260,7 +260,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 
 	// A disk partitioned by another system: a GPT whose entry array names a LiberFS
 	// partition (the type GUID 4C424653-0001-4000-8000-4C6962657246) starting at LBA
-	// 8192 - NOT the fixed factory layout's FACTORY_START_SECTOR. StorageService must
+	// 8192 - NOT the fixed factory layout's FALLBACK_START_SECTOR. StorageService must
 	// find the partition, format the volume INSIDE it, and size the pool to it.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	const PART_FIRST: u64 = 8192;
@@ -309,7 +309,9 @@ fn system_volume_lands_in_a_gpt_partition() {
 	assert_eq!(&sb[0..8], b"LIBERFS1", "the partition should carry a LiberFS superblock");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, PART_BLOCKS, "the pool should span exactly the partition");
-	assert!(disk.get(&FACTORY_START_SECTOR).is_none(), "the fixed factory offset must stay untouched on a GPT disk");
+	// The fallback offset is now LBA 0, which on a GPT disk carries the protective MBR, so the
+	// check is that no volume was laid there rather than that nothing is there at all.
+	assert!(disk.get(&FALLBACK_START_SECTOR).is_none_or(|sector| &sector[0..8] != b"LIBERFS1"), "a GPT disk must carry its volume in the partition, not at LBA 0");
 }
 
 tagged_test!(a_degenerate_gpt_entry_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);
@@ -323,7 +325,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	// the probe must SKIP it and fall back to the fixed factory layout instead of
 	// failing the format and exiting.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
-	let expected_pool: u64 = (CAPACITY - FACTORY_START_SECTOR * 512) / 4096;
+	let expected_pool: u64 = (CAPACITY - FALLBACK_START_SECTOR * 512) / 4096;
 
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
 	let mut header = alloc::vec![0u8; 512];
@@ -361,25 +363,28 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	assert!(online, "the service must fall back to the factory layout and report in");
 
 	// the fallback formatted at the factory offset, sized by the disk's capacity.
-	let sb = disk.get(&FACTORY_START_SECTOR).expect("the fallback should write superblock slot 0 at the factory offset");
+	let sb = disk.get(&FALLBACK_START_SECTOR).expect("the fallback should write superblock slot 0 at the factory offset");
 	assert_eq!(&sb[0..8], b"LIBERFS1", "the factory layout should carry the volume");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");
 }
 
-tagged_test!(a_lying_seed_archive_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);
-fn a_lying_seed_archive_cannot_kill_the_storage_service() {
+tagged_test!(garbage_where_the_superblock_should_be_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);
+fn garbage_where_the_superblock_should_be_cannot_kill_the_storage_service() {
 	use alloc::collections::BTreeMap;
 	use object::channel::Channel;
 	use object::rights::Rights;
 
-	// The boot-time seeding path runs exactly on a disk WITHOUT a valid
-	// filesystem - the least trustworthy disk there is. A PKGARCH1 header whose
-	// entry count claims a ~137 GB table used to size the read buffer straight off
-	// the disk's word; the claim must be bounded by the seed region and treated as
-	// "no archive", so the service formats an empty volume and reports in.
+	// A disk whose first sector is not a superblock is the least trustworthy disk there is, and
+	// it must produce an empty volume rather than a dead service.
+	//
+	// The bytes here are a PKGARCH1 header claiming a ~137 GB entry table, which is what this
+	// test was originally written for: the seeding path sized a read buffer straight off that
+	// word. That path is deleted (M0138) - nothing parses an archive off the disk any more - so
+	// what the case now guards is the general property rather than the specific attack, and the
+	// hostile header is as good a piece of garbage as any.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
-	let expected_pool: u64 = (CAPACITY - FACTORY_START_SECTOR * 512) / 4096;
+	let expected_pool: u64 = (CAPACITY - FALLBACK_START_SECTOR * 512) / 4096;
 
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
 	let mut header = alloc::vec![0u8; 512];
@@ -409,7 +414,7 @@ fn a_lying_seed_archive_cannot_kill_the_storage_service() {
 	assert!(online, "the service must treat the hostile claim as no archive and report in");
 
 	// the volume formatted normally (empty - nothing was seeded from the "archive").
-	let sb = disk.get(&FACTORY_START_SECTOR).expect("superblock slot 0 should sit at the factory offset");
+	let sb = disk.get(&FALLBACK_START_SECTOR).expect("superblock slot 0 should sit at the factory offset");
 	assert_eq!(&sb[0..8], b"LIBERFS1", "the factory layout should carry the volume");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
 	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");

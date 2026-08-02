@@ -8,7 +8,7 @@ fn imgview_interactions() {
 	let imgview_elf = program_elf(&package, volume, b"imgview").expect("imgview tool");
 	let source = pix::RgbaImage::new(2, 2, alloc::vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]).expect("source image");
 	let source_bmp = bmp::encode_rgba(&source).expect("encode source BMP");
-	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	run_imgview_harness_with_exit(imgview_elf, b"vol://media/SOURCE.BMP", &viewer_surface(&source), &mut system, &mut media, ImgviewExit::ZoomAndHold);
@@ -34,7 +34,7 @@ fn lico_switches_panels_and_restores_the_terminal() {
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
 	let lico_elf = program_elf(&package, volume, b"lico").expect("lico tool");
-	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
 	run_lico_harness(lico_elf, &mut system);
 }
 
@@ -47,7 +47,7 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	let imgview_elf = program_elf(&package, volume, b"imgview").expect("imgview tool");
 	let source = pix::RgbaImage::new(2, 2, alloc::vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]).expect("source image");
 	let source_bmp = bmp::encode_rgba(&source).expect("encode source BMP");
-	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
 
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
@@ -129,7 +129,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
 	let imgconv_elf = program_elf(&package, volume, b"imgconv").expect("imgconv tool");
-	let mut system = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
 	let source = pix::RgbaImage::new(2, 2, alloc::vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]).expect("source image");
 	let source_bmp = bmp::encode_rgba(&source).expect("encode source BMP");
 

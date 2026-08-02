@@ -116,7 +116,12 @@ impl fscore::BlockDevice for Image {
 fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]) {
 	const BLOCK: usize = 4096;
 	let out_dir: PathBuf = boot_dir();
-	let out_img: PathBuf = out_dir.join(conf_get(conf, "SYSTEM_VOLUME"));
+	// Per architecture, like the volume archive it replaces: the staged binaries differ, so one
+	// image cannot serve all three.
+	let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("architecture set by main");
+	let stem = conf_get(conf, "SYSTEM_VOLUME");
+	let name = stem.strip_suffix(".img").unwrap_or(stem);
+	let out_img: PathBuf = out_dir.join(format!("{name}-{arch}.img"));
 	let manifest: PathBuf = kernel_anchor();
 
 	// Everything the archive carries, at the same destinations.

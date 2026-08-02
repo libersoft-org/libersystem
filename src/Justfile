@@ -392,6 +392,7 @@ gdb:
 # only while every non-kernel input remains unchanged.
 test-preflight: sdk user test-tags-check
     just packages x86_64
+    just system-volume x86_64
     tools/check-staged-image.sh x86_64
     boot/test-preflight.sh write x86_64
 
@@ -443,6 +444,7 @@ test-tags-build-fast tags:
 # SMP=4 exercises the multi-core paths (secondary bring-up, the cross-core wake IPI).
 test-preflight-aarch64: sdk user-aarch64 test-tags-check
     just packages aarch64
+    just system-volume aarch64
     tools/check-staged-image.sh aarch64
     boot/test-preflight.sh write aarch64
 
@@ -486,6 +488,7 @@ test-tags-build-fast-aarch64 tags:
 # with `SMP=<n>` (a smaller count is faster under TCG on a many-core host).
 test-preflight-riscv64: sdk user-riscv64 test-tags-check
     just packages riscv64
+    just system-volume riscv64
     tools/check-staged-image.sh riscv64
     boot/test-preflight.sh write riscv64
 

@@ -137,7 +137,7 @@ fn directory_scoped_storage_clients_cannot_escape_their_grant() {
 	let hello_uri = alloc::format!("vol://system/{hello}");
 	let config = test_runtime_path("config-tree").expect("config runtime path");
 	let config_uri = alloc::format!("vol://system/{config}");
-	let mut storage = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
 
 	let full = storage.connect();
 	let expected = volume_file(volume, component.as_bytes()).expect("component payload in the archive");
@@ -153,8 +153,13 @@ fn directory_scoped_storage_clients_cannot_escape_their_grant() {
 	assert!(storage.open_from(&child, hello_uri.as_bytes(), 0xd104).is_none(), "a child minted by a directory scope cannot widen to the volume root");
 }
 
-tagged_test!(existing_system_volume_preserves_owned_state_when_factory_seed_changes, [Filesystem, Storage, VolumeLayout, VolumeScope]);
-fn existing_system_volume_preserves_owned_state_when_factory_seed_changes() {
+tagged_test!(existing_system_volume_preserves_owned_state_across_a_restart, [Filesystem, Storage, VolumeLayout, VolumeScope]);
+// This used to corrupt the factory archive between the two runs and assert that an existing
+// volume mounted as-is rather than being reformatted from the changed seed. There is no seed any
+// more (M0138) - and the bytes it used to corrupt are the superblock now - so what remains
+// testable, and still worth testing, is that an existing volume survives a restart with its
+// owner state intact.
+fn existing_system_volume_preserves_owned_state_across_a_restart() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
@@ -164,14 +169,13 @@ fn existing_system_volume_preserves_owned_state_when_factory_seed_changes() {
 	let hello_uri = alloc::format!("vol://system/{hello}");
 	let marker = b"preserved existing system volume state";
 	let expected_hello = volume_file(volume, hello.as_bytes()).expect("hello in factory archive");
-	let mut storage = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
 
 	assert!(storage.write(config_uri.as_bytes(), marker, 0xd200), "the fresh writable volume records owner state");
 	assert_eq!(storage.open(config_uri.as_bytes(), 0xd201), Some(marker.to_vec()), "the owner state reads before restart");
-	storage.invalidate_seed_archive();
 	let mut storage = storage.restart(storage_elf);
-	assert_eq!(storage.open(config_uri.as_bytes(), 0xd202), Some(marker.to_vec()), "an existing LiberFS mounts as-is instead of formatting from the changed factory archive");
-	assert_eq!(storage.open(hello_uri.as_bytes(), 0xd203), Some(expected_hello), "the originally seeded factory data remains available after the existing-disk restart");
+	assert_eq!(storage.open(config_uri.as_bytes(), 0xd202), Some(marker.to_vec()), "an existing LiberFS mounts as-is rather than being reformatted");
+	assert_eq!(storage.open(hello_uri.as_bytes(), 0xd203), Some(expected_hello), "the volume's own files remain available after the restart");
 }
 
 tagged_test!(fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state, [Component, Config, Drivers, Filesystem, Process, ProcessService, Service, Storage, VolumeLayout, VolumeScope]);
@@ -190,7 +194,7 @@ fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	let component_output = test_runtime_path("liber-component-output").expect("component output path");
 	let config_tree = test_runtime_path("config-tree").expect("config runtime path");
 	let journal_root = test_runtime_path("system-journal").expect("journal runtime path");
-	let mut storage = StorageHarness::start(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
 
 	for (name, path) in [("hello", hello), ("motd", motd), ("audio", audio), ("wallpaper", wallpaper)] {
 		let uri = alloc::format!("vol://system/{path}");

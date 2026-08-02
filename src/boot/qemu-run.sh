@@ -83,22 +83,29 @@ qemu_append_debug_args() {
 # Recreate the system disk when the factory package is newer. Merely overlaying LBA 0
 # is insufficient: an older LiberFS backup GPT header at the disk end would remount the
 # stale filesystem and stale userspace binaries.
+# Lay the system volume onto the disk QEMU attaches.
+#
+# This used to copy `volume.pkg` - a factory ARCHIVE - to LBA 0, and the storage service formatted
+# a filesystem 32 MiB further in and seeded it from that archive on every boot. The volume is now
+# built as a real LiberFS image (M0138), so the disk carries the volume itself: the same bytes the
+# loader reads and the storage service mounts, in one place rather than two.
+#
+# The image is copied rather than attached directly because a guest writes to its system volume,
+# and a test run must not edit the build output it was given.
 qemu_prepare_system_disk() {
-	local volume_pkg="$1"
+	local volume_image="$1"
 	local disk="$2"
-	local size=$((128 * 1024 * 1024))
-	local package_exists=0
-	[[ -f "$volume_pkg" ]] && package_exists=1
+	[[ -f "$volume_image" ]] || return 1
 
-	if [[ ! -f "$disk" || "$(stat -c%s "$disk")" -ne "$size" || ($package_exists == 1 && "$volume_pkg" -nt "$disk") ]]; then
+	# Larger than the image so the volume has room to grow; the storage service reports a volume
+	# that spans less than its container rather than silently resizing it.
+	local size=$((128 * 1024 * 1024))
+	if [[ ! -f "$disk" || "$(stat -c%s "$disk")" -ne "$size" || "$volume_image" -nt "$disk" ]]; then
 		rm -f "$disk"
 		truncate -s "$size" "$disk"
+		dd if="$volume_image" of="$disk" bs=1M conv=notrunc status=none
 	fi
-	if [[ "$package_exists" == "1" ]]; then
-		dd if="$volume_pkg" of="$disk" bs=512 conv=notrunc status=none
-		return 0
-	fi
-	return 1
+	return 0
 }
 
 # Build the reusable exFAT/FAT, ISO9660 and UDF images. The caller owns QEMU attachment
@@ -474,10 +481,10 @@ qemu_run_x86_64() {
 		-serial "${SERIAL:-stdio}"
 	)
 
-	# System volume disk: holds the factory archive at LBA 0.
-	local volume_pkg="$QEMU_BUILD_DIR/volume.pkg"
+	# System volume disk: carries the LiberFS volume itself.
+	local volume_image="$QEMU_BUILD_DIR/system-volume-x86_64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
-	qemu_prepare_system_disk "$volume_pkg" "$virtio_disk" || true
+	qemu_prepare_system_disk "$volume_image" "$virtio_disk" || true
 	qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "disable-legacy=on"
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
@@ -544,18 +551,6 @@ qemu_run_x86_64() {
 	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "disable-legacy=on"
 	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "disable-legacy=on"
 	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "disable-legacy=on"
-
-	# The system volume as a real LiberFS image, which is what the loader reads (M0138). Attached
-	# LAST on purpose: the comment above is not decoration, the boot chain's device inventory
-	# follows PCI discovery order, so a new disk anywhere earlier would renumber the ones the
-	# chain already expects. The loader finds this one by its superblock rather than its position,
-	# so being last costs nothing.
-	#
-	# It is a SEPARATE disk from the one carrying volume.pkg rather than a replacement: the
-	# storage service still seeds itself from that archive, and changing both at once would leave
-	# no way to tell which change broke a boot.
-	local system_volume="$QEMU_BUILD_DIR/system-volume.img"
-	[[ -f "$system_volume" ]] && qemu_attach_virtio_blk qemu_args "$system_volume" vsysvol "disable-legacy=on"
 
 	# Display backends: parse DISPLAYS env for vnc/spice.
 	qemu_parse_displays qemu-run
@@ -656,7 +651,7 @@ qemu_run_aarch64() {
 	qemu_select_cpu cpu_args aarch64 cortex-a72
 
 	# System volume disk: virtio-blk holding the factory archive.
-	local volume_pkg="$QEMU_BUILD_DIR/volume-aarch64.pkg"
+	local volume_pkg="$QEMU_BUILD_DIR/system-volume-aarch64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk-aarch64.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
 		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 "disable-legacy=on"
@@ -806,7 +801,7 @@ qemu_run_riscv64() {
 	qemu_select_cpu cpu_args riscv64 rv64
 
 	# System volume disk: virtio-blk holding the factory archive.
-	local volume_pkg="$QEMU_BUILD_DIR/volume-riscv64.pkg"
+	local volume_pkg="$QEMU_BUILD_DIR/system-volume-riscv64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk-riscv64.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
 		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 ""

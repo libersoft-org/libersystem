@@ -2120,11 +2120,14 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 	reply
 }
 
-// The sector where StorageService lays the fixed factory LiberFS layout when a disk
-// carries no GPT partition for it - it must mirror the storage service's own
-// FS_START_SECTOR (src/user/services/storage/src/service.rs), which sits past the largest
-// architecture's factory archive so the seed always fits ahead of the filesystem.
-const FACTORY_START_SECTOR: u64 = 65536;
+// The sector where StorageService lays the LiberFS volume when a disk carries no GPT partition
+// for it - it must mirror the storage service's own FS_START_SECTOR
+// (src/user/services/storage/src/service.rs).
+//
+// It was 65536 (32 MiB in), clearing a factory archive at LBA 0 that the service seeded a fresh
+// volume from. The archive is retired (M0138): the volume is built as a filesystem, so there is
+// nothing in front of it to skip and it starts at the beginning of its container.
+const FALLBACK_START_SECTOR: u64 = 0;
 
 // Serve pending raw-block-protocol requests (read/write/capacity/flush) over a sparse
 // in-memory sector map: the stand-in block driver behind the StorageService layout
@@ -2188,9 +2191,87 @@ struct StorageHarness {
 	capacity: u64,
 }
 
+// A disk held in memory while a fixture volume is formatted onto it, so the harness can hand
+// StorageService a disk that already carries a filesystem.
+struct FixtureDisk {
+	bytes: alloc::vec::Vec<u8>,
+}
+
+impl fscore::BlockDevice for FixtureDisk {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		let start = index as usize * buf.len();
+		let Some(src) = self.bytes.get(start..start + buf.len()) else { return false };
+		buf.copy_from_slice(src);
+		true
+	}
+
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		let start = index as usize * buf.len();
+		let Some(dst) = self.bytes.get_mut(start..start + buf.len()) else { return false };
+		dst.copy_from_slice(buf);
+		true
+	}
+}
+
 impl StorageHarness {
+	// Start a StorageService over a disk carrying `image` verbatim: a FAT, ISO or UDF medium, or
+	// any other fixture that is already a filesystem image.
 	fn start(storage_elf: &[u8], tag: &[u8], image: &[u8], capacity: u64) -> Self {
 		const SECTOR: usize = 512;
+		let mut disk = alloc::collections::BTreeMap::new();
+		for (lba, chunk) in image.chunks(SECTOR).enumerate() {
+			let mut sector = alloc::vec![0u8; SECTOR];
+			sector[..chunk.len()].copy_from_slice(chunk);
+			disk.insert(lba as u64, sector);
+		}
+		Self::start_disk(storage_elf, tag, disk, capacity)
+	}
+
+	// Start a StorageService over a disk carrying a LiberFS SYSTEM VOLUME built from the scenario
+	// archive.
+	//
+	// The archive used to be laid on the disk raw and the service formatted a volume and seeded
+	// itself from it. That seeding is gone (M0138) - the system volume is built as a filesystem
+	// now - so the fixture has to be a filesystem too. Formatting it here with the same crate the
+	// service mounts means the fixture cannot drift from the format under test.
+	//
+	// Separate from `start` because that one lays an image verbatim, and the media fixtures it
+	// serves (FAT, ISO, UDF) are images already - reinterpreting them as archives to rebuild would
+	// be nonsense, which is exactly what happened when the two shared one function.
+	fn start_system(storage_elf: &[u8], tag: &[u8], archive: &[u8], capacity: u64) -> Self {
+		const SECTOR: usize = 512;
+		const BLOCK: usize = liberfs::BLOCK_SIZE;
+		let entries = pkg::Package::parse(archive).expect("scenario archive parses");
+
+		// Sized for what it holds with room for metadata and growth, and never below the volume
+		// the scenarios expect to be able to write into.
+		let payload: usize = (0..entries.len()).filter_map(|i| entries.name(i).and_then(|n| entries.lookup(n)).map(|b| b.len())).sum();
+		let size = ((payload * 3).max(8 * 1024 * 1024) + BLOCK - 1) / BLOCK * BLOCK;
+		let opts = liberfs::FormatOpts { uuid: *b"libersystem-fix\0", label: b"system".to_vec(), compress: false };
+		let mut fs = liberfs::LiberFs::format_opts(FixtureDisk { bytes: alloc::vec![0u8; size] }, (size / BLOCK) as u64, opts).expect("format the fixture volume");
+		let mut made: alloc::collections::BTreeSet<alloc::vec::Vec<u8>> = alloc::collections::BTreeSet::new();
+		for index in 0..entries.len() {
+			let Some(name) = entries.name(index) else { continue };
+			let Some(bytes) = entries.lookup(name) else { continue };
+			let mut prefix: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+			let segments: alloc::vec::Vec<&[u8]> = name.split(|&b| b == b'/').collect();
+			for segment in &segments[..segments.len().saturating_sub(1)] {
+				if !prefix.is_empty() {
+					prefix.push(b'/');
+				}
+				prefix.extend_from_slice(segment);
+				if made.insert(prefix.clone()) {
+					fs.mkdir(&prefix).expect("fixture directory");
+				}
+			}
+			fs.write_file(name, bytes).expect("fixture file");
+		}
+
+		let image = fs.into_device().bytes;
+		// Prove the fixture mounts before handing it over. A volume that formats but does not
+		// mount would surface as "the service found no filesystem", which points at the service
+		// rather than at the fixture that produced it.
+		assert!(liberfs::LiberFs::mount(FixtureDisk { bytes: image.clone() }).is_some(), "the fixture volume does not mount");
 		let mut disk = alloc::collections::BTreeMap::new();
 		for (lba, chunk) in image.chunks(SECTOR).enumerate() {
 			let mut sector = alloc::vec![0u8; SECTOR];
@@ -2263,10 +2344,6 @@ impl StorageHarness {
 			}
 		}
 		panic!("StorageService harness did not shut down");
-	}
-
-	fn invalidate_seed_archive(&mut self) {
-		self.disk.insert(0, alloc::vec![0u8; 512]);
 	}
 
 	fn pump(&mut self) {
