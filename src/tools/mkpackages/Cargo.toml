@@ -8,6 +8,11 @@ name = "mkpackages"
 path = "src/main.rs"
 
 [dependencies]
+# The system volume is now built here as a real LiberFS image, not only as an archive. It uses
+# the same crate the loader and the storage service use, so a built image and a volume formatted
+# at runtime are the same format because they are the same code.
+liberfs = { path = "../../fs/liberfs" }
+fscore = { path = "../../fs/core" }
 # The PKGARCH1 archive format constants, shared with the kernel and the storage runtime.
 abi = { path = "../../abi" }
 # ELF parsing for the identity records and the dynamic-linkage audit.

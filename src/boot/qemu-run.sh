@@ -545,6 +545,18 @@ qemu_run_x86_64() {
 	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "disable-legacy=on"
 	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "disable-legacy=on"
 
+	# The system volume as a real LiberFS image, which is what the loader reads (M0138). Attached
+	# LAST on purpose: the comment above is not decoration, the boot chain's device inventory
+	# follows PCI discovery order, so a new disk anywhere earlier would renumber the ones the
+	# chain already expects. The loader finds this one by its superblock rather than its position,
+	# so being last costs nothing.
+	#
+	# It is a SEPARATE disk from the one carrying volume.pkg rather than a replacement: the
+	# storage service still seeds itself from that archive, and changing both at once would leave
+	# no way to tell which change broke a boot.
+	local system_volume="$QEMU_BUILD_DIR/system-volume.img"
+	[[ -f "$system_volume" ]] && qemu_attach_virtio_blk qemu_args "$system_volume" vsysvol "disable-legacy=on"
+
 	# Display backends: parse DISPLAYS env for vnc/spice.
 	qemu_parse_displays qemu-run
 	qemu_args+=("${DISPLAY_ARGS[@]}")

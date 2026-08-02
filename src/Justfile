@@ -243,6 +243,13 @@ packages arch="x86_64":
 build: sdk user packages
     cd {{ kernel_dir }} && cargo build
     cd {{ loader_dir }} && cargo build
+    just system-volume
+
+# Build the system volume as a LiberFS image. Separate from `packages` and deliberately AFTER the
+# kernel: the image carries the kernel, while the archives cannot move after it because the kernel
+# embeds them. Run together, the image would stage whichever kernel the previous build left.
+system-volume arch="x86_64":
+    cd tools/mkpackages && cargo run --quiet -- {{ arch }} system-volume
 
 # generate the proto crate's bindings from the LSIDL interface definitions
 # (src/idl/*.lsidl) and format the generated source

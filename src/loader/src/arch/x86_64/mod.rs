@@ -49,7 +49,12 @@ pub fn halt() -> ! {
 // gathers the framebuffer + RSDP, builds the page tables + BootInfo, snapshots the
 // memory map, exits boot services, and switches to the kernel's page tables.
 pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: *mut uefi::FileProtocol, kernel: &[u8]) -> ! {
-	let init_pkg = read_file(bs, root, INIT_PKG_FILE).expect("loader: cannot read init.pkg");
+	// The archive assembled from the volume wins when there is one; the ESP copy is the fallback
+	// for a machine whose system volume is missing or unreadable.
+	let init_pkg: &[u8] = match unsafe { crate::BOOTSTRAP } {
+		Some(archive) => archive,
+		None => read_file(bs, root, INIT_PKG_FILE).expect("loader: cannot read init.pkg"),
+	};
 	let volume_pkg = read_file(bs, root, VOLUME_PKG_FILE).expect("loader: cannot read volume.pkg");
 	serial::write_str("loader: packages loaded\n");
 

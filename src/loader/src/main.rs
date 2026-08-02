@@ -112,6 +112,15 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	};
 	arch::serial::write_str("loader: kernel loaded\n");
 
+	// Report which of the two sources the bootstrap set came from, for the same reason the kernel
+	// read is reported: a boot that silently used the fallback looks identical to one that did not.
+	match unsafe { BOOTSTRAP } {
+		Some(archive) => {
+			arch::serial::write_str("loader: bootstrap set assembled from the system volume\n");
+			let _ = archive;
+		}
+		None => arch::serial::write_str("loader: no bootstrap list on the volume; using the boot volume's archive\n"),
+	}
 	arch::hand_off(bs, image_handle, system_table, root, kernel);
 }
 
@@ -132,10 +141,21 @@ pub(crate) enum VolumeRead {
 	NotOnVolume,
 }
 
+// The bootstrap archive assembled from the volume, if there was one. Read in the SAME mount as
+// the kernel: mounting twice would walk every block device twice and, worse, could pick a
+// different volume for the two halves of one boot on a machine with more than one.
+pub(crate) static mut BOOTSTRAP: Option<&'static [u8]> = None;
+
 pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> VolumeRead {
 	let mut outcome = VolumeRead::NoVolume;
 	blockio::each_disk(bs, |disk| {
 		let Some(mut fs) = liberfs::LiberFs::mount(disk) else { return false };
+		// The bootstrap set, packed into the archive format the kernel already unpacks. This is
+		// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from
+		// files that exist on the volume rather than from a package built beside it.
+		if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
+			unsafe { BOOTSTRAP = retain(bs, &archive) };
+		}
 		// A LiberFS volume without this file is still the system volume; a second one is not
 		// going to be more right. Stop rather than read the same name off another disk, which
 		// is how a machine boots half of one system and half of another.

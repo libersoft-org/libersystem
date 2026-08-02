@@ -9,6 +9,8 @@
 // Read-only by construction: `write_block` and `flush` are left to the trait's refusing
 // defaults, and the protocol's write and reset entries are never called.
 
+extern crate alloc;
+
 use core::ffi::c_void;
 
 use fscore::BlockDevice;
@@ -79,4 +81,63 @@ pub(crate) fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDis
 	}
 	// The buffer came from the firmware's pool and is ours to release.
 	unsafe { ((*bs).free_pool)(handles as *mut c_void) };
+}
+
+// Assemble the bootstrap archive in memory from files on the system volume.
+//
+// This is what "retire init.pkg" means in practice. The archive stops being a build artifact and
+// becomes a hand-off structure: the loader reads `etc/bootstrap.list` from the volume, reads each
+// program it names, and packs them into exactly the format the kernel already unpacks. The kernel
+// and SystemManager are untouched - they receive the same named blob they receive today - and the
+// only thing that changed is that every one of those programs now also exists as a file the user
+// can see, which is the whole point of the milestone.
+//
+// Each line of the list is `<archive entry name> <path on the volume>`. Both are needed: the
+// kernel looks entries up by the name they have always had, which is not the path they now live
+// at.
+pub(crate) fn assemble_bootstrap(fs: &mut liberfs::LiberFs<FirmwareDisk>) -> Option<alloc::vec::Vec<u8>> {
+	use abi::{PKG_ENTRY_LEN as ENTRY_LEN, PKG_HEADER_LEN as HEADER_LEN, PKG_NAME_LEN as NAME_LEN};
+	use alloc::vec::Vec;
+
+	let list = fs.read_file(b"etc/bootstrap.list").ok()?;
+	let mut entries: Vec<(&[u8], Vec<u8>)> = Vec::new();
+	for line in list.split(|&b| b == b'\n') {
+		if line.is_empty() {
+			continue;
+		}
+		let mut parts = line.splitn(2, |&b| b == b' ');
+		let name = parts.next()?;
+		let path = parts.next()?;
+		if name.len() > NAME_LEN {
+			return None;
+		}
+		// A named program that is not on the volume is fatal rather than skipped. The bootstrap
+		// set is exactly the programs the system needs before its volume is readable, so a
+		// missing one produces a machine that dies later and further away, with nothing to say
+		// which program it was.
+		let bytes = fs.read_file(path).ok()?;
+		entries.push((name, bytes));
+	}
+	if entries.is_empty() {
+		return None;
+	}
+
+	let table = HEADER_LEN + ENTRY_LEN * entries.len();
+	let mut out: Vec<u8> = Vec::new();
+	out.extend_from_slice(abi::PKG_MAGIC);
+	out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+	out.extend_from_slice(&0u32.to_le_bytes());
+	let mut offset = table;
+	for (name, bytes) in &entries {
+		let mut field = [0u8; NAME_LEN];
+		field[..name.len()].copy_from_slice(name);
+		out.extend_from_slice(&field);
+		out.extend_from_slice(&(offset as u32).to_le_bytes());
+		out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+		offset += bytes.len();
+	}
+	for (_, bytes) in &entries {
+		out.extend_from_slice(bytes);
+	}
+	Some(out)
 }

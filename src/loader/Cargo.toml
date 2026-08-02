@@ -16,6 +16,9 @@ bootproto = { path = "../bootproto" }
 # disk protocol and these read the volume above it - the same code the storage service runs after
 # ExitBootServices, rather than a second implementation of the same formats.
 fscore = { path = "../fs/core" }
+# The package archive constants, so the archive the loader assembles in memory is the one the
+# kernel already knows how to read - shared constants rather than a second copy of the format.
+abi = { path = "../abi" }
 liberfs = { path = "../fs/liberfs" }
 
 # The dev build optimizes the filesystem crates for the same reason the storage service does:

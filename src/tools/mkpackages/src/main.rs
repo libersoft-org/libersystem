@@ -78,6 +78,126 @@ fn boot_dir() -> PathBuf {
 	dir
 }
 
+// The whole image, held in memory while it is built and written out once. A system volume is
+// tens of megabytes, which is nothing on a build host, and it keeps the block device trivial.
+struct Image {
+	bytes: Vec<u8>,
+	block: usize,
+}
+
+impl fscore::BlockDevice for Image {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		let start = index as usize * self.block;
+		let Some(src) = self.bytes.get(start..start + buf.len()) else { return false };
+		buf.copy_from_slice(src);
+		true
+	}
+
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		let start = index as usize * self.block;
+		let Some(dst) = self.bytes.get_mut(start..start + buf.len()) else { return false };
+		dst.copy_from_slice(buf);
+		true
+	}
+}
+
+// Build the system volume as a LiberFS image: the same files the archive carries, plus the
+// kernel and the pinned bootstrap set at real paths.
+//
+// This is the artifact M0138 is about. Until it existed there was no filesystem on the disk at
+// the moment the loader ran - the disk carried an archive and the storage service formatted a
+// volume from it after boot - so the loader had nothing to read and no program that runs had a
+// file the user could look at.
+//
+// Written BESIDE the archive rather than instead of it, deliberately and temporarily: the
+// storage service still seeds itself from `volume.pkg`, so replacing it in the same step that
+// teaches the loader to read a filesystem would change two things at once and leave no way to
+// tell which one broke the boot. Retiring the archive is its own item.
+fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]) {
+	const BLOCK: usize = 4096;
+	let out_dir: PathBuf = boot_dir();
+	let out_img: PathBuf = out_dir.join(conf_get(conf, "SYSTEM_VOLUME"));
+	let manifest: PathBuf = kernel_anchor();
+
+	// Everything the archive carries, at the same destinations.
+	let mut staged: Vec<(String, Vec<u8>)> = files.to_vec();
+
+	// The kernel, so the loader can read it from the volume rather than from the ESP.
+	let kernel = out_dir.join("kernel");
+	match fs::read(&kernel) {
+		Ok(bytes) => staged.push((String::from("kernel"), bytes)),
+		// Not fatal: `just packages` can run before the kernel is linked, and the loader falls
+		// back to the boot volume. A missing kernel here means a volume the loader will decline,
+		// not an image that cannot be built.
+		Err(_) => eprintln!("mkpackages: no kernel at {} yet; the system volume will not carry one", kernel.display()),
+	}
+
+	// The pinned bootstrap set at real paths. This is the point of the milestone: a program that
+	// runs should have a file on the volume, not only an entry inside an archive.
+	//
+	// The list of them is written to the volume as well, because the loader has no manifest: it
+	// needs to know WHICH files to read before the system that knows is running. This is the
+	// "manifest-named list" the milestone describes - `init.pkg` stops being an artifact and
+	// becomes a list, with the archive itself assembled in memory by the loader so the kernel and
+	// SystemManager keep receiving exactly what they receive today.
+	let mut bootstrap = String::new();
+	for row in read_manifest(&manifest) {
+		if row.stage == "pinned" && row.crate_dir != "-" {
+			let name = executable_artifact_name(&row.name);
+			let path = user_elf_path(&manifest, &row.crate_path, &row.name);
+			match read_stripped(&path).or_else(|| fs::read(&path).ok()) {
+				Some(bytes) => {
+					// The entry name inside the archive, then the path to read it from. The
+					// loader needs both: the kernel looks entries up by the name they have
+					// today, which is not the path they now live at.
+					bootstrap.push_str(&format!("{name} libexec/{name}\n"));
+					staged.push((format!("libexec/{name}"), bytes));
+				}
+				None => eprintln!("mkpackages: pinned {name} not built: {}", path.display()),
+			}
+		}
+	}
+	staged.push((String::from("etc/bootstrap.list"), bootstrap.into_bytes()));
+
+	// Sized to hold what is staged with room to grow, rounded to whole blocks. LiberFS needs
+	// metadata beyond the file bytes, so the slack is not decoration.
+	let payload: usize = staged.iter().map(|(name, bytes)| name.len() + bytes.len()).sum();
+	let size = ((payload * 2).max(16 * 1024 * 1024) + BLOCK - 1) / BLOCK * BLOCK;
+	let opts = liberfs::FormatOpts { uuid: *b"libersystem-vol\0", label: b"system".to_vec(), compress: false };
+	let mut fs_image = liberfs::LiberFs::format_opts(Image { bytes: vec![0u8; size], block: BLOCK }, (size / BLOCK) as u64, opts).unwrap_or_else(|error| panic!("mkpackages: cannot format a {size}-byte system volume: {error:?}"));
+
+	let mut made: BTreeSet<String> = BTreeSet::new();
+	for (destination, bytes) in &staged {
+		let destination = destination.trim_start_matches('/');
+		if let Some((dirs, _)) = destination.rsplit_once('/') {
+			let mut prefix = String::new();
+			for segment in dirs.split('/') {
+				if !prefix.is_empty() {
+					prefix.push('/');
+				}
+				prefix.push_str(segment);
+				if made.insert(prefix.clone()) {
+					fs_image.mkdir(prefix.as_bytes()).unwrap_or_else(|error| panic!("mkpackages: cannot create /{prefix}: {error:?}"));
+				}
+			}
+		}
+		fs_image.write_file(destination.as_bytes(), bytes).unwrap_or_else(|error| panic!("mkpackages: cannot write /{destination} ({} bytes): {error:?}", bytes.len()));
+	}
+
+	// Read the image back through the same path the loader takes, before it is written out. A
+	// volume that formats but does not mount is worth catching here rather than on a machine
+	// that will not boot.
+	let image = fs_image.into_device();
+	let mut check = liberfs::LiberFs::mount(Image { bytes: image.bytes.clone(), block: BLOCK }).unwrap_or_else(|| panic!("mkpackages: the system volume does not mount"));
+	for (destination, bytes) in &staged {
+		let destination = destination.trim_start_matches('/');
+		let read = check.read_file(destination.as_bytes()).unwrap_or_else(|error| panic!("mkpackages: /{destination} was written but cannot be read back: {error:?}"));
+		assert_eq!(read.len(), bytes.len(), "mkpackages: /{destination} reads back a different size");
+	}
+
+	write_if_changed(&out_img, &image.bytes);
+}
+
 fn main() {
 	// The target architecture the packages are for, as cargo spells it - the caller passes what
 	// build.rs used to read from CARGO_CFG_TARGET_ARCH.
@@ -89,6 +209,17 @@ fn main() {
 		env::set_var("CARGO_CFG_TARGET_ARCH", &arch);
 	}
 	let conf: Vec<(String, String)> = read_product_conf();
+
+	// The system volume image is built in a SEPARATE step, after the kernel is linked, because it
+	// carries the kernel. The archives cannot move after the kernel for the opposite reason - the
+	// kernel embeds them - so the two cannot share one pass, and building the image alongside the
+	// archives would stage whichever kernel the previous build left behind.
+	if env::args().nth(2).as_deref() == Some("system-volume") {
+		verify_artifacts();
+		assemble_system_volume(&conf, &volume_files(&conf));
+		return;
+	}
+
 	verify_artifacts();
 	assemble_init_package(&conf);
 	assemble_volume_package(&conf);
@@ -519,9 +650,20 @@ fn assemble_init_package(conf: &[(String, String)]) {
 // packed into .build/boot/volume.pkg using its relative path. The kernel loads it
 // as a second boot module and serves its files through StorageService over vol://.
 fn assemble_volume_package(conf: &[(String, String)]) {
-	let manifest: PathBuf = kernel_anchor();
+	let files = volume_files(conf);
 	let out_dir: PathBuf = boot_dir();
 	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "VOLUME_PACKAGE"));
+	let entries: Vec<(&str, Vec<u8>)> = files.iter().map(|(name, data): &(String, Vec<u8>)| (name.as_str(), data.clone())).collect();
+	write_if_changed(&out_pkg, &build_package(&entries));
+}
+
+// Every file the system volume carries, at its manifest destination. Shared by the archive and
+// the LiberFS image so the two cannot stage different sets - which is exactly the drift between
+// an artifact and the volume that this milestone removes.
+fn volume_files(conf: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
+	let _ = conf;
+	let manifest: PathBuf = kernel_anchor();
+	let out_dir: PathBuf = boot_dir();
 
 	fs::create_dir_all(&out_dir).unwrap_or_else(|e: std::io::Error| panic!("cannot create {}: {e}", out_dir.display()));
 
@@ -611,13 +753,11 @@ fn assemble_volume_package(conf: &[(String, String)]) {
 		}
 	}
 
-	let entries: Vec<(&str, Vec<u8>)> = files.iter().map(|(name, data): &(String, Vec<u8>)| (name.as_str(), data.clone())).collect();
-	let package: Vec<u8> = build_package(&entries);
 	if missing != 0 {
 		eprintln!("mkpackages: {missing} program(s) of the system volume are not built - refusing to assemble an image that cannot boot");
 		std::process::exit(1);
 	}
-	write_if_changed(&out_pkg, &package);
+	files
 }
 
 // Expose the assembled volume package at a stable path so the direct AArch64/RISC-V QEMU
