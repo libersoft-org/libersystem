@@ -555,19 +555,39 @@ impl volume::Service for Volume {
 		if data == 0 {
 			return Err(Error::Invalid);
 		}
+		// The destination is checked BEFORE a byte is accepted. Validating afterwards let a client
+		// spend the service's whole heap streaming to a path that never existed.
+		let limit: usize = {
+			let name: &[u8] = self.writable_name(&path)?;
+			let _ = name;
+			self.fs.capacity().unwrap_or(0) as usize
+		};
 		let mut bytes: Vec<u8> = Vec::new();
+		let mut over = false;
 		loop {
 			match unsafe { recv_vec_blocking(data) } {
 				ReceivedVec::Message { bytes: chunk, .. } => {
 					if chunk.is_empty() {
 						break;
 					}
-					bytes.extend_from_slice(&chunk);
+					// Bounded as it arrives, and fallibly. Waiting for the end to find out the
+					// stream was too big means holding all of it first, which is the denial of
+					// service rather than the check for it. The stream is drained either way, so
+					// the sender is not left blocked on a channel nobody reads.
+					if !over && bytes.len().saturating_add(chunk.len()) <= limit && bytes.try_reserve(chunk.len()).is_ok() {
+						bytes.extend_from_slice(&chunk);
+					} else {
+						over = true;
+						bytes = Vec::new();
+					}
 				}
 				ReceivedVec::Closed => break,
 			}
 		}
 		unsafe { close(data) };
+		if over {
+			return Err(Error::Again);
+		}
 		let name: &[u8] = self.writable_name(&path)?;
 		self.fs.write_file(name, &bytes)
 	}
@@ -814,7 +834,14 @@ impl FileSystem for MemFs {
 	}
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
 		let entries = self.fs.list_entries(dir).map_err(map_fs_err)?;
-		Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+		// The backend already reserved fallibly and copied each name once; collecting infallibly
+		// here and rebuilding every name would undo both. `Entry` owns its `String`, so it moves.
+		let mut out: Vec<FileInfo> = Vec::new();
+		out.try_reserve_exact(entries.len()).map_err(|_| Error::Again)?;
+		for entry in entries {
+			out.push(FileInfo { name: entry.name, size: entry.size, r#type: if entry.is_dir { FileType::Dir } else { FileType::File }, mtime: 0, ctime: 0 });
+		}
+		Ok(out)
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
 		Ok(self.fs.capacity())
@@ -1285,7 +1312,17 @@ unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 				return None;
 			}
 		};
-		let mut bytes: Vec<u8> = alloc::vec![0u8; len];
+		// Fallible: this is the client's payload, sized by the client, and an infallible
+		// allocation here aborts the whole service instead of answering `again`. It is also
+		// allocated while a memory volume still holds its reservation, so on a tight heap this is
+		// exactly where the process dies.
+		let mut bytes: Vec<u8> = Vec::new();
+		if bytes.try_reserve_exact(len).is_err() {
+			unmap_object(data.handle);
+			close(data.handle);
+			return None;
+		}
+		bytes.resize(len, 0);
 		core::ptr::copy_nonoverlapping(base as *const u8, bytes.as_mut_ptr(), len);
 		unmap_object(data.handle);
 		close(data.handle);

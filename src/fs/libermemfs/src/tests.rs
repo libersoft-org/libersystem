@@ -207,9 +207,12 @@ fn a_reserved_volume_keeps_its_guarantee_when_files_shrink_or_go() {
 	fs.write_file(b"a", &[b'x'; 40]).expect("write");
 	assert_eq!(fs.reserved_bytes(), 23, "what a file and its name use is no longer held separately");
 
-	// Shrinking must return the difference to the reservation, not to the heap.
+	// Shrinking does NOT give the memory back, because the file keeps its allocation: a vector
+	// that is cleared still owns its buffer. Reporting it as free is what let a volume be pushed
+	// past its capacity by writing large and then truncating.
 	fs.write_file(b"a", &[b'x'; 8]).expect("shrink");
-	assert_eq!(fs.reserved_bytes(), 55, "shrinking gives the memory back to the volume");
+	assert_eq!(fs.used(), 8, "the volume stores eight bytes");
+	assert_eq!(fs.reserved_bytes(), 23, "but still holds what the file has not released");
 
 	// So must deleting.
 	fs.remove(b"a").expect("remove");
@@ -402,12 +405,16 @@ fn free_is_room_for_data_and_a_new_entry_still_pays_for_its_name() {
 
 	// Rewriting into the existing entry can use all of it, because the name is already paid for.
 	fs.write_file(b"aaaa", &[b'x'; 16]).expect("a rewrite may use the whole of free()");
-	fs.write_file(b"aaaa", &[b'x'; 10]).expect("back down");
+	assert_eq!(fs.free(), 0, "the file now holds the whole volume");
 
-	// Creating a new one cannot: the name is charged on top.
-	assert_eq!(fs.write_file(b"b", &[b'x'; 6]), Err(FsError::NoSpace), "free() bytes plus a name is over");
-	fs.write_file(b"b", &[b'x'; 5]).expect("free() less the name fits exactly");
-	assert_eq!(fs.free(), 0);
+	// Writing less does not hand the difference back: the file keeps the allocation it grew to.
+	fs.write_file(b"aaaa", &[b'x'; 10]).expect("back down");
+	assert_eq!(fs.used(), 10, "ten bytes are stored");
+	assert_eq!(fs.free(), 0, "and none of what it grew to is free again");
+
+	// Removing it is what releases the allocation.
+	fs.remove(b"aaaa").expect("remove");
+	assert_eq!(fs.free(), 20);
 }
 
 // A deterministic pseudo-random sequence. No dependency, and the same run every time, so a
@@ -443,8 +450,9 @@ fn the_reservation_survives_ten_thousand_random_operations() {
 	for step in 0..10_000 {
 		let path = paths[(rng.next() % paths.len() as u64) as usize];
 		let kind = rng.next() % 6;
+		let wrote = if kind == 0 { (rng.next() % 40) as usize } else { 0 };
 		let outcome = match kind {
-			0 => fs.write_file(path, &alloc::vec![b'z'; (rng.next() % 40) as usize]),
+			0 => fs.write_file(path, &alloc::vec![b'z'; wrote]),
 			1 => fs.write_file(path, b""),
 			2 => fs.mkdir(path),
 			3 => fs.remove(path),
@@ -456,7 +464,7 @@ fn the_reservation_survives_ten_thousand_random_operations() {
 		} else {
 			refusals += 1
 		}
-		model.apply(kind, outcome.is_ok(), path, &fs);
+		model.apply(kind, outcome.is_ok(), path, wrote);
 
 		// Checked against a model kept BESIDE the filesystem rather than against the filesystem's
 		// own arithmetic. `resync_reservation` computes its target from `footprint()`, so a test
@@ -651,16 +659,18 @@ struct Model {
 }
 
 impl Model {
-	fn apply(&mut self, kind: u64, succeeded: bool, path: &[u8], fs: &LiberMemFs) {
+	fn apply(&mut self, kind: u64, succeeded: bool, path: &[u8], wrote: usize) {
 		if !succeeded {
 			return;
 		}
 		let name = core::str::from_utf8(path).expect("test paths are utf-8");
 		match kind {
-			// A write records the size the volume now reports for that ONE entry - never a total.
+			// A file holds the largest size ever written to it until it is removed, because a
+			// cleared vector keeps its buffer. The model derives that from the sizes it asked
+			// for - it never reads a length back from the implementation it is checking.
 			0 | 1 => {
-				let size = fs.read_file(path).expect("a written file reads back").len();
-				self.files.insert(alloc::string::String::from(name), size);
+				let held = self.files.get(name).copied().unwrap_or(0).max(wrote);
+				self.files.insert(alloc::string::String::from(name), held);
 			}
 			2 => {
 				self.dirs.insert(alloc::string::String::from(name));
@@ -682,4 +692,31 @@ impl Model {
 		let names: usize = self.files.keys().chain(self.dirs.iter()).map(|path| path.rsplit('/').next().map_or(0, str::len)).sum();
 		(data + names) as u64
 	}
+}
+
+#[test]
+fn a_shrunk_file_keeps_its_allocation_and_the_volume_says_so() {
+	// The regression this stands for: rewriting in place stopped the transient second copy but
+	// `Vec::clear` keeps the buffer, so a file shrunk to nothing still owned its memory while the
+	// accounting counted `len` and reported the volume empty. That is worse than what it replaced
+	// - the old defect held two copies briefly and the numbers showed both; this one held one
+	// copy forever and the numbers showed neither.
+	//
+	// Measured against real memory, not accounting: 64 KiB volume, 80 KiB heap. If the shrink
+	// released the file's buffer, both writes fit one after the other. If it did not - and it does
+	// not - the volume must refuse the second write rather than accept it and run the heap out.
+	let big = alloc::vec![b'x'; 60 * 1024];
+	within(80 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Capped, 64 * 1024).expect("mount");
+		fs.write_file(b"a", &big).expect("write");
+		fs.write_file(b"a", b"").expect("shrink to nothing");
+		assert_eq!(fs.used(), 0, "nothing is stored any more");
+		assert!(fs.free() < 8 * 1024, "but the volume still counts what the file holds: free={}", fs.free());
+		assert_eq!(fs.write_file(b"b", &big), Err(FsError::NoSpace), "a second large file is refused, not accepted into memory that is gone");
+
+		// Removing the file is what actually releases it, and then the write fits.
+		fs.remove(b"a").expect("remove");
+		assert_eq!(fs.free(), 64 * 1024, "the name goes with the file");
+		fs.write_file(b"b", &big).expect("after the release the volume has the room it reports");
+	});
 }

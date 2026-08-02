@@ -42,6 +42,10 @@ pub const MAX_PATH_DEPTH: usize = 16;
 // The longest path that can name anything: every segment at its limit, with a separator between
 // them. Checked before the path is walked, so the depth limit bounds the WORK and not only the
 // result.
+// Below this a partial reservation is not worth another attempt: the remainder cannot cover a
+// meaningful write, and each attempt is a refused allocation.
+const MIN_RESERVATION_STEP: usize = 4096;
+
 pub const MAX_PATH_BYTES: usize = MAX_PATH_DEPTH * (MAX_NAME_BYTES + 1);
 
 // A parsed path: bounded by the depth limit, so it lives on the stack.
@@ -74,6 +78,22 @@ impl Node {
 		match self {
 			Node::File(data) => data.len(),
 			Node::Directory(children) => children.values().map(Node::bytes).sum(),
+		}
+	}
+
+	// The memory this node's subtree actually HOLDS, which is not what it stores: a vector keeps
+	// its allocation when it is cleared, so a file shrunk from 60 KiB to nothing still owns 60 KiB.
+	//
+	// Counting `len` made the volume report that memory as free while the file still had it -
+	// which let a capped volume be pushed to multiples of its capacity by a grow-and-shrink cycle,
+	// and let a reserved volume hold its files' historical capacity AND a full reservation at
+	// once, reporting itself intact throughout. Every accounting question - the capacity check,
+	// `free`, the reservation target - is answered from this; only `used` reports `len`, because
+	// that is what the word means to a caller.
+	fn allocated(&self) -> usize {
+		match self {
+			Node::File(data) => data.capacity(),
+			Node::Directory(children) => children.values().map(Node::allocated).sum(),
 		}
 	}
 
@@ -158,7 +178,7 @@ impl LiberMemFs {
 	// This is what the capacity bounds, so a volume cannot exceed it by filling itself with
 	// names instead of contents.
 	pub fn footprint(&self) -> u64 {
-		(self.root.bytes() + self.root.names()) as u64
+		(self.root.allocated() + self.root.names()) as u64
 	}
 
 	// The bytes a reserved volume is holding but not yet storing. Zero for a capped volume,
@@ -339,10 +359,26 @@ impl LiberMemFs {
 		// which in a storage service is a crash where a degraded guarantee would do. If the memory
 		// cannot be had the volume holds less than its capacity and `reserved_bytes` says so.
 		self.release_reservation();
-		let mut fresh: Vec<u8> = Vec::new();
-		if fresh.try_reserve_exact(target).is_ok() {
-			self.reservation = fresh;
-			self.reserved = target;
+		// Best effort meaning what it says: take the target if it can be had, and otherwise take
+		// as much of it as can. Asking once and giving up left the volume holding NOTHING when a
+		// regrow fell short - worse than the shortfall it was reacting to, and a strange reading
+		// of "best effort".
+		//
+		// Halving rather than searching: each step is one failed allocation, so the whole retry
+		// costs a handful of refused requests instead of a scan, and it stops well before the
+		// remainder is too small to be worth holding.
+		let mut want = target;
+		while want > 0 {
+			let mut fresh: Vec<u8> = Vec::new();
+			if fresh.try_reserve_exact(want).is_ok() {
+				self.reservation = fresh;
+				self.reserved = want;
+				break;
+			}
+			if want < MIN_RESERVATION_STEP {
+				break;
+			}
+			want /= 2;
 		}
 		// The allocation's only purpose is that it exists: nothing reads it and nothing writes it,
 		// which is exactly the shape a dead-allocation optimisation is entitled to delete. Letting
@@ -389,21 +425,24 @@ impl LiberMemFs {
 		}
 		// Resolves the parent as a side effect, so an absent or non-directory parent is refused
 		// here rather than after the data has been copied.
-		let (previous, is_new) = match self.resolve(parts)? {
+		// What this name holds today and what it would hold afterwards - both as ALLOCATIONS, since
+		// that is what the capacity bounds. A rewrite that fits inside the file's existing
+		// allocation costs nothing; one that does not grows it to exactly the new length.
+		let (previous, becomes, is_new) = match self.resolve(parts)? {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
-			Some(Node::File(existing)) => (existing.len(), false),
+			Some(Node::File(existing)) => (existing.capacity(), existing.capacity().max(data.len()), false),
 			None => {
 				if self.root.count() >= MAX_ENTRIES {
 					return Err(FsError::NoSpace);
 				}
-				(0, true)
+				(0, data.len(), true)
 			}
 		};
 		// Subtracting what the file already holds is what lets it be rewritten on a full volume.
 		// A new entry also costs its name; replacing an existing one does not, because the name is
 		// already there and already counted.
 		let name_cost = if is_new { parts.last().map_or(0, |name| name.len()) } else { 0 };
-		if self.footprint() as usize - previous + data.len() + name_cost > self.capacity {
+		if self.footprint() as usize - previous + becomes + name_cost > self.capacity {
 			return Err(FsError::NoSpace);
 		}
 		// A reserved volume releases what it is holding BEFORE allocating. Otherwise the

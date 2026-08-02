@@ -68,7 +68,13 @@ SECTIONS
 		/* boot stack: reserved RAM (uninitialized), higher-half addresses. */
 		. = ALIGN(16);
 		__boot_stack_bottom = .;
-		. += 0x10000; /* 64 KiB */
+		/* 256 KiB. Was 64 KiB, which the boot path fitted in comfortably until the test suite
+		   began formatting a LiberFS volume in the kernel to build its storage fixture: that
+		   walks a B-tree and a transaction log, and it overflowed into .bss. The symptom was
+		   memory corruption rather than a fault - a `serial_println!` printing megabytes of
+		   memory, and data aborts at addresses that made no sense - so the cost of getting this
+		   wrong is high and the 192 KiB of reserved image is cheap. */
+		. += 0x40000;
 		__boot_stack_top = .;
 	} :data
 

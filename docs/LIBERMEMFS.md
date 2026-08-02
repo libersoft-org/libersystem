@@ -18,7 +18,7 @@ usually describes does not exist here.
   `Capped` charges as files are written.
 - Bounded everywhere: file size, entry count, name length and path depth all refuse past their
   limit rather than truncating.
-- `no_std` + `alloc`, ~470 lines, 28 unit tests. It implements NEITHER `fscore::BlockDevice` -
+- `no_std` + `alloc`, ~490 lines, 29 unit tests. It implements NEITHER `fscore::BlockDevice` -
   there is no block device under it - nor the storage service's `FileSystem` trait: the service's
   `MemFs` adapter does that, exactly as `IsoFs` and `UdfFs` wrap their backends.
 - Mounted as `vol://ram` (reserved) and `vol://tmp` (capped).
@@ -80,6 +80,11 @@ rounding error: the length of a name that does not exist yet is not knowable, so
 an entry should expect to need `free()` minus the name. Reporting `capacity - used` instead would
 be worse again - it would promise room that every name already stored has taken.
 
+The footprint counts a file's ALLOCATION rather than its contents, because a cleared vector keeps
+its buffer: a file shrunk from 60 KiB to nothing still owns 60 KiB, and counting what it stored
+would report that memory as free while the file had it. `used()` still reports contents; the
+capacity, `free()` and the reservation all work from what is held.
+
 What the footprint still does NOT count is the per-entry overhead: the map node holding each
 entry, and the vector header inside it - on the order of fifty to a hundred bytes each, none of it
 charged. This is left uncharged deliberately rather than overlooked. A name is caller-controlled
@@ -91,7 +96,7 @@ wrong on the next allocator. A caller sizing a reserved volume should treat the 
 bounding stored bytes and names, not as the volume's total cost to the heap.
 
 A reserved volume holds a buffer of exactly its unused capacity, resynced after every mutation,
-so `footprint + reserved` is always the capacity and never more. Because names count, that
+so while the reservation is intact `footprint + reserved` is the capacity - and after a regrow has fallen short it is less, which `reservation_intact()` reports. Because names count, that
 includes `mkdir` and `rmdir`: creating a directory takes its name's bytes out of the reservation
 and removing one puts them back, which is easy to miss because a directory stores no data.
 
@@ -125,7 +130,7 @@ Two properties make that guarantee real rather than nominal, and both are easy t
 
 The invariant is worth stating on its own because it is what the reserved policy IS, and because
 every one of the accounting defects found in this filesystem was a violation of it:
-**`footprint + reserved` always equals the capacity.** A test asserts it across six different ways
+**`footprint + reserved` equals the capacity while `reservation_intact()` holds.** A test asserts it across six different ways
 for an operation to be refused, which is a stronger check than one test per known bug - it caught
 a defect that had not been thought of. It has one limit worth knowing before trusting it: it drove
 only file operations, so when names began to count it went on passing while every directory
@@ -139,7 +144,10 @@ One thing the capped policy does NOT do is give memory back to the system. The u
 grows by mapping a region and never unmaps one, so freeing a file returns its bytes to the storage
 service's own free list - reusable by that process, including by the other volumes it serves - but
 the Domain stays charged at the high-water mark. A capped volume that has once been full costs the
-system exactly what a reserved one of the same size costs, permanently.
+system what its files still hold, permanently - and because a file keeps the allocation it grew
+to, a grow-and-shrink cycle across several files can leave it holding multiples of what it
+stores. The capacity check counts what is held rather than what is stored, so the volume refuses
+rather than exceeding itself, but the memory is not returned until the files are removed.
 
 So the capped policy's advantage is that it never takes what it never needs, not that it returns
 what it took, and that distinction matters when sizing one: a `vol://tmp` that briefly peaks is a
