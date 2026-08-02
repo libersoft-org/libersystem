@@ -2191,24 +2191,46 @@ struct StorageHarness {
 	capacity: u64,
 }
 
-// A disk held in memory while a fixture volume is formatted onto it, so the harness can hand
-// StorageService a disk that already carries a filesystem.
+// The harness disk itself, as a block device, so a fixture volume can be formatted straight into
+// the sector map the harness will serve.
+//
+// The first version built the whole image as one contiguous `Vec` and then chopped it into
+// sectors. That is two copies of a multi-megabyte volume in the kernel heap, and the contiguous
+// one is the expensive half: the kernel allocator grows in 2 MiB regions and first-fits within
+// them, so a single 8 MiB request has to find eight coalesced regions. It held on x86_64 and did
+// not on aarch64, whose binaries - and therefore whose volume - are close to twice the size.
+// Writing sectors as they are produced removes the contiguous allocation entirely.
 struct FixtureDisk {
-	bytes: alloc::vec::Vec<u8>,
+	sectors: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>,
+}
+
+impl FixtureDisk {
+	const SECTOR: usize = 512;
 }
 
 impl fscore::BlockDevice for FixtureDisk {
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
-		let start = index as usize * buf.len();
-		let Some(src) = self.bytes.get(start..start + buf.len()) else { return false };
-		buf.copy_from_slice(src);
+		let per = buf.len() / Self::SECTOR;
+		for s in 0..per {
+			let lba = index * per as u64 + s as u64;
+			let out = &mut buf[s * Self::SECTOR..(s + 1) * Self::SECTOR];
+			match self.sectors.get(&lba) {
+				Some(sector) => out.copy_from_slice(sector),
+				// An unwritten sector reads as zeros, like a fresh disk.
+				None => out.fill(0),
+			}
+		}
 		true
 	}
 
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
-		let start = index as usize * buf.len();
-		let Some(dst) = self.bytes.get_mut(start..start + buf.len()) else { return false };
-		dst.copy_from_slice(buf);
+		let per = buf.len() / Self::SECTOR;
+		for s in 0..per {
+			let lba = index * per as u64 + s as u64;
+			let mut sector = alloc::vec![0u8; Self::SECTOR];
+			sector.copy_from_slice(&buf[s * Self::SECTOR..(s + 1) * Self::SECTOR]);
+			self.sectors.insert(lba, sector);
+		}
 		true
 	}
 }
@@ -2239,21 +2261,15 @@ impl StorageHarness {
 	// serves (FAT, ISO, UDF) are images already - reinterpreting them as archives to rebuild would
 	// be nonsense, which is exactly what happened when the two shared one function.
 	fn start_system(storage_elf: &[u8], tag: &[u8], archive: &[u8], capacity: u64) -> Self {
-		const SECTOR: usize = 512;
 		const BLOCK: usize = liberfs::BLOCK_SIZE;
 		let entries = pkg::Package::parse(archive).expect("scenario archive parses");
-
-		// Sized for what it holds with room for metadata and growth, and never below the volume
-		// the scenarios expect to be able to write into.
 		let payload: usize = (0..entries.len()).filter_map(|i| entries.name(i).and_then(|n| entries.lookup(n)).map(|b| b.len())).sum();
-		// Sized tightly on purpose. The image is built in the kernel heap and then chunked into a
-		// map of 512-byte sectors, so every byte here costs roughly twice over - and the aarch64
-		// archive is nearly twice the x86_64 one, because fixed-width instructions make its
-		// binaries bigger. A generous multiplier that is comfortable on x86_64 is not comfortable
-		// there.
-		let size = ((payload + payload / 8 + 64 * 1024) + BLOCK - 1) / BLOCK * BLOCK;
+		// Room for the files, their metadata, and what the scenarios write afterwards.
+		let size = ((payload + payload / 4 + 1024 * 1024) + BLOCK - 1) / BLOCK * BLOCK;
+
 		let opts = liberfs::FormatOpts { uuid: *b"libersystem-fix\0", label: b"system".to_vec(), compress: false };
-		let mut fs = liberfs::LiberFs::format_opts(FixtureDisk { bytes: alloc::vec![0u8; size] }, (size / BLOCK) as u64, opts).expect("format the fixture volume");
+		let disk = FixtureDisk { sectors: alloc::collections::BTreeMap::new() };
+		let mut fs = liberfs::LiberFs::format_opts(disk, (size / BLOCK) as u64, opts).expect("format the fixture volume");
 		let mut made: alloc::collections::BTreeSet<alloc::vec::Vec<u8>> = alloc::collections::BTreeSet::new();
 		for index in 0..entries.len() {
 			let Some(name) = entries.name(index) else { continue };
@@ -2272,18 +2288,12 @@ impl StorageHarness {
 			fs.write_file(name, bytes).expect("fixture file");
 		}
 
-		let image = fs.into_device().bytes;
 		// Prove the fixture mounts before handing it over. A volume that formats but does not
-		// mount would surface as "the service found no filesystem", which points at the service
-		// rather than at the fixture that produced it.
-		assert!(liberfs::LiberFs::mount(FixtureDisk { bytes: image.clone() }).is_some(), "the fixture volume does not mount");
-		let mut disk = alloc::collections::BTreeMap::new();
-		for (lba, chunk) in image.chunks(SECTOR).enumerate() {
-			let mut sector = alloc::vec![0u8; SECTOR];
-			sector[..chunk.len()].copy_from_slice(chunk);
-			disk.insert(lba as u64, sector);
-		}
-		Self::start_disk(storage_elf, tag, disk, capacity)
+		// mount surfaces as "the service found no filesystem", which points at the service rather
+		// than at the fixture that produced it.
+		let mut disk = fs.into_device();
+		assert!(liberfs::LiberFs::mount(FixtureDisk { sectors: disk.sectors.clone() }).is_some(), "the fixture volume does not mount");
+		Self::start_disk(storage_elf, tag, core::mem::take(&mut disk.sectors), capacity)
 	}
 
 	fn start_disk(storage_elf: &[u8], tag: &[u8], disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) -> Self {
