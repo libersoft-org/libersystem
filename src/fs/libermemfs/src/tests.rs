@@ -226,3 +226,23 @@ fn no_refused_operation_leaves_a_reserved_volume_holding_less_than_it_should() {
 	fs.write_file(b"afile", &[b'y'; 116]).expect("the rest of the capacity is still writable");
 	assert_eq!(fs.used() + fs.reserved_bytes(), 128);
 }
+
+#[test]
+fn a_write_after_a_short_regrow_still_reaches_the_capacity() {
+	// The reservation can legitimately fall short: regrowing it is best effort, so after a
+	// delete on a tight machine it may hold less than the capacity. The write path must not
+	// assume it is perfectly in step - releasing "just the difference" would then release less
+	// than the file needs, and the write would fail on a volume that has the room.
+	//
+	// Releasing all of it makes the amount held irrelevant to whether the write can proceed.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 64).expect("mount");
+	fs.write_file(b"a", &[b'x'; 64]).expect("fill it");
+	assert_eq!(fs.reserved_bytes(), 0, "a full reserved volume holds nothing back");
+
+	// From full, straight to full again with a different file: the release has to cover the
+	// whole write, not the difference from a reservation that is currently empty.
+	fs.remove(b"a").expect("remove");
+	fs.write_file(b"b", &[b'y'; 64]).expect("the whole capacity is writable again");
+	assert_eq!(fs.used(), 64);
+	assert_eq!(fs.used() + fs.reserved_bytes(), 64);
+}

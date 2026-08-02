@@ -190,22 +190,26 @@ impl LiberMemFs {
 			return;
 		}
 		let target = self.capacity.saturating_sub(self.used() as usize);
-		let held = self.reservation.len();
-		if target <= held {
-			// Giving memory up always works. Released rather than merely shortened, so the
-			// volume's footprint is what it stores plus what it still holds, not both at their
-			// high-water marks.
-			self.reservation.truncate(target);
-			self.reservation.shrink_to_fit();
+		if self.reservation.len() == target {
 			return;
 		}
-		// Taking it back can fail, and `resize` would ABORT rather than report it - which in a
-		// storage service is a crash where a degraded guarantee would do. Best effort: reserve
-		// what is available, and if less comes back than was released, the volume holds less
-		// than its capacity and `reserved_bytes` says so. A caller that cares can see it;
-		// nothing is corrupted either way.
-		if self.reservation.try_reserve_exact(target - held).is_ok() {
-			self.reservation.resize(target, 0);
+		// Dropped and reallocated rather than resized in place, in both directions.
+		//
+		// Resizing looks cheaper and is not. `shrink_to_fit` reallocates and COPIES the bytes it
+		// keeps, so every write to a reserved volume would memcpy what remains of the
+		// reservation - megabytes per write on a volume of any size, to preserve zeros that
+		// nothing ever reads. Dropping first also means the old block is gone before the new one
+		// is asked for, so the two are never outstanding together: the same rule the write path
+		// follows, and for the same reason.
+		//
+		// Best effort on the way back up: `Vec::resize` would ABORT on allocation failure, which
+		// in a storage service is a crash where a degraded guarantee would do. If the memory
+		// cannot be had the volume holds less than its capacity and `reserved_bytes` says so.
+		self.reservation = Vec::new();
+		let mut fresh: Vec<u8> = Vec::new();
+		if fresh.try_reserve_exact(target).is_ok() {
+			fresh.resize(target, 0);
+			self.reservation = fresh;
 		}
 	}
 
@@ -244,15 +248,17 @@ impl LiberMemFs {
 		if used - previous + data.len() > self.capacity {
 			return Err(FsError::NoSpace);
 		}
-		// A reserved volume releases the bytes it is holding BEFORE allocating the file, because
-		// otherwise the allocation and the reservation would be outstanding at the same time and
-		// the write could fail for memory the volume was itself sitting on - which is precisely
-		// the failure the reservation exists to prevent.
-		let needed = data.len().saturating_sub(previous);
-		if self.policy == Policy::Reserved && needed != 0 {
-			let held = self.reservation.len();
-			self.reservation.truncate(held.saturating_sub(needed));
-			self.reservation.shrink_to_fit();
+		// A reserved volume releases what it is holding BEFORE allocating the file. Otherwise the
+		// allocation and the reservation are outstanding at the same time and the write can fail
+		// for memory the volume is itself sitting on - precisely the failure a reservation exists
+		// to prevent.
+		//
+		// All of it, not just the difference: the whole point is that the bytes are certainly
+		// available, and releasing exactly enough leaves that resting on the reservation being
+		// perfectly in step, which it is not after a best-effort regrow has fallen short. The
+		// resync at the end puts back whatever the volume should still be holding.
+		if self.policy == Policy::Reserved {
+			self.reservation = Vec::new();
 		}
 		// The bytes are built before the entry is replaced. Inserting an empty file first and
 		// filling it afterwards loses the previous contents when the allocation fails - a failed
