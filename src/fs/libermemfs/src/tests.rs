@@ -174,3 +174,55 @@ fn a_failed_write_leaves_the_previous_contents_intact() {
 	// allocator that can be made to fail. The fix was to build the bytes first and insert once
 	// they exist, so no ordering is left where a failure can truncate the previous contents.
 }
+
+#[test]
+fn a_reserved_write_draws_on_the_reservation_instead_of_allocating_beside_it() {
+	// The reservation exists so a write up to the capacity cannot fail for want of memory. That
+	// only holds if the bytes are RELEASED before the file is allocated: allocating first leaves
+	// both outstanding at once, so a volume at its capacity would need twice its capacity to
+	// write into itself - failing for memory it was sitting on.
+	//
+	// The observable consequence is that the two never exceed the capacity between them.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 100).expect("mount");
+	// Each write replaces the same file, so what is stored is simply the last size written -
+	// grown, then grown again to the whole capacity, then shrunk.
+	for write in [30usize, 100, 10] {
+		fs.write_file(b"f", &alloc::vec![b'z'; write]).expect("write within capacity");
+		assert_eq!(fs.used(), write as u64);
+		assert_eq!(fs.used() + fs.reserved_bytes(), 100, "stored plus held is always the capacity, never more");
+	}
+}
+
+#[test]
+fn no_refused_operation_leaves_a_reserved_volume_holding_less_than_it_should() {
+	// `used + reserved == capacity` is the invariant the reserved policy IS. Every refusal has
+	// to preserve it, and the ones that refuse LATE are the dangerous ones: a write releases
+	// reservation bytes before it allocates, so a refusal after that point must give them back.
+	// `parent_mut` refusing an absent or non-directory parent is exactly such a late refusal,
+	// and returning through `?` there used to walk straight past the resync - leaving the volume
+	// permanently holding less than its capacity with nothing stored to account for it.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 128).expect("mount");
+	fs.mkdir(b"d").expect("mkdir");
+	fs.write_file(b"d/keep", b"1234").expect("write");
+	fs.write_file(b"afile", b"12345678").expect("write");
+
+	let refusals: [(&[u8], &[u8]); 6] = [
+		(b"missing/f", b"x"),      // parent does not exist
+		(b"afile/under", b"x"),    // a file used as a path component
+		(b"d", b"x"),              // the target is a directory
+		(b"../escape", b"x"),      // a rejected path
+		(b"", b"x"),               // the root
+		(b"d/keep", &[b'x'; 200]), // past the capacity
+	];
+	for (path, data) in refusals {
+		assert!(fs.write_file(path, data).is_err(), "{:?} must be refused", core::str::from_utf8(path));
+		assert_eq!(fs.used() + fs.reserved_bytes(), 128, "a refused write left the reservation short: {:?}", core::str::from_utf8(path));
+	}
+
+	// The contents are untouched by all of it, and the volume still works.
+	assert_eq!(fs.read_file(b"d/keep").expect("read"), b"1234".to_vec());
+	assert_eq!(fs.read_file(b"afile").expect("read"), b"12345678".to_vec());
+	assert_eq!(fs.used(), 12);
+	fs.write_file(b"afile", &[b'y'; 116]).expect("the rest of the capacity is still writable");
+	assert_eq!(fs.used() + fs.reserved_bytes(), 128);
+}

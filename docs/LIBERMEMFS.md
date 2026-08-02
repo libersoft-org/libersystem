@@ -18,7 +18,7 @@ usually describes does not exist here.
   `Capped` charges as files are written.
 - Bounded everywhere: file size, entry count, name length and path depth all refuse past their
   limit rather than truncating.
-- `no_std` + `alloc`, ~260 lines, 11 unit tests. It implements the storage service's
+- `no_std` + `alloc`, ~270 lines, 12 unit tests. It implements the storage service's
   `FileSystem` trait directly, NOT `fscore::BlockDevice` - there is no block device under it.
 - Mounted as `vol://ram` (reserved) and `vol://tmp` (capped).
 
@@ -62,11 +62,29 @@ every operation are identical. The only difference is WHEN the memory is charged
 | suits | state that must not fail because something else took the memory | scratch, where waste is worse than an occasional refusal |
 
 A reserved volume holds a buffer of exactly its unused capacity, resynced after every mutation,
-so its footprint is what it stores plus what it still holds - never both at their high-water
-marks. Growing that buffer back after a file shrinks or is deleted is best effort: it uses
-`try_reserve_exact` and, if the memory cannot be had, leaves the volume holding less than its
-capacity rather than aborting. `reserved_bytes()` reports what is actually held, so a degraded
-guarantee is visible rather than assumed.
+so `used + reserved` is always the capacity and never more.
+
+Two properties make that guarantee real rather than nominal, and both are easy to get wrong:
+
+- **A write releases before it allocates.** Allocating the file first would leave the new bytes
+  and the reservation outstanding at the same time, so a volume at its capacity would need twice
+  its capacity to write into itself - failing for memory it was sitting on, which is exactly the
+  failure a reservation exists to prevent. If the allocation is refused anyway, the release is
+  undone, so a failed write leaves the volume holding what it held before.
+- **Taking memory back is best effort.** After a file shrinks or is deleted the reservation
+  regrows with `try_reserve_exact`; `Vec::resize` would ABORT on failure, which in a storage
+  service is a crash where a degraded guarantee would do. If less comes back than was released,
+  the volume holds less than its capacity and `reserved_bytes()` says so.
+- **Every refusal restores the invariant, including the late ones.** A write releases before it
+  allocates, so a refusal AFTER that point - an absent parent, a file used as a path component -
+  has to give the bytes back on the way out. Returning through `?` there walks past the resync
+  and leaves the volume permanently short with nothing stored to account for it.
+
+The invariant is worth stating on its own because it is what the reserved policy IS, and because
+every one of the defects found in this filesystem was a violation of it: **`used + reserved`
+always equals the capacity.** A test asserts it across six different ways for an operation to be
+refused, which is a stronger check than one test per known bug - it caught a defect that had not
+been thought of.
 
 Both policies enforce the same capacity through the same check. Only the moment of charging
 differs, which is why they share an implementation.
@@ -113,12 +131,10 @@ LiberFS are the only writable backends.
 | `rmdir` | empty directories only; a populated one is `NotEmpty` |
 | `capacity` / `status` | capacity, free bytes, never read-only, filesystem name `libermemfs` |
 
-Two behaviours are worth stating because they are decisions rather than consequences:
+Three behaviours are worth stating because they are decisions rather than consequences:
 
-**Replacing frees before it allocates the accounting, not the memory.** The capacity check
-subtracts the existing file's size first, so rewriting a file on a full volume succeeds instead
-of demanding room for both copies. The new bytes are still built before the entry is replaced -
-see below.
+**Replacing subtracts before it adds.** The capacity check subtracts the existing file's size
+first, so rewriting a file on a full volume succeeds instead of demanding room for both copies.
 
 **A failed write changes nothing.** The bytes are allocated and filled BEFORE the directory
 entry is replaced. An earlier version inserted an empty file first and filled it afterwards,

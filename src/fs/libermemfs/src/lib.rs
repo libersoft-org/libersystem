@@ -83,9 +83,10 @@ pub struct LiberMemFs {
 	root: Node,
 	policy: Policy,
 	capacity: usize,
-	// Held only by a reserved volume: the memory taken at mount so a later write cannot fail
-	// for want of it. It is never read - owning it IS the reservation - and it shrinks as files
-	// are written so the volume's total footprint stays at the capacity rather than doubling.
+	// Held only by a reserved volume: the memory taken at mount so a later write cannot fail for
+	// want of it. It is never read - owning it IS the reservation - and it tracks the UNUSED part
+	// of the capacity, released as files grow and taken back as they shrink, so the volume's
+	// footprint is what it stores plus what it still holds rather than both at once.
 	reservation: Vec<u8>,
 }
 
@@ -180,12 +181,10 @@ impl LiberMemFs {
 	// Hold exactly the unused part of a reserved volume's capacity, so its footprint stays at
 	// what it took at mount however its contents change.
 	//
-	// It has to run after EVERY mutation, not just after a write that grows a file. The first
+	// It has to run after EVERY mutation, not just after a write that grows a file. An earlier
 	// version only ever shrank the reservation, so deleting or shrinking a file handed that
 	// memory back to the heap rather than back to the reservation - and a volume that was
 	// supposed to guarantee its space silently stopped guaranteeing it.
-	//
-	// Growing back is safe: the bytes were released by this same call path a moment earlier.
 	fn resync_reservation(&mut self) {
 		if self.policy != Policy::Reserved {
 			return;
@@ -219,49 +218,67 @@ impl LiberMemFs {
 		}
 	}
 
-	// Write a whole file, creating or replacing it. Replacing frees the old bytes first, so
-	// rewriting a file at the capacity succeeds rather than needing room for both copies.
+	// Write a whole file, creating or replacing it.
 	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
 		if data.len() > MAX_FILE_BYTES {
 			return Err(FsError::TooLong);
 		}
 		let parts = Self::segments(path)?;
-		let entries = self.root.count();
-		let used = self.used() as usize;
-		let capacity = self.capacity;
-		let policy = self.policy;
-		// The tree mutation happens in its own scope so its borrow of `self` ends before the
-		// reservation below is touched - two disjoint borrows expressed as two statements
-		// rather than as an unsafe aliasing trick.
-		let previous = {
-			let (children, name) = self.parent_mut(&parts)?;
-			let previous = match children.get(name) {
-				Some(Node::Directory(_)) => return Err(FsError::IsDir),
-				Some(Node::File(existing)) => existing.len(),
-				None => {
-					if entries >= MAX_ENTRIES {
-						return Err(FsError::NoSpace);
-					}
-					0
+		// What this name holds today, if anything. Read before anything is changed, because the
+		// capacity check and the reservation release below both need it and neither may run
+		// against a half-modified tree.
+		let previous = match self.lookup(&parts) {
+			Some(Node::Directory(_)) => return Err(FsError::IsDir),
+			Some(Node::File(existing)) => existing.len(),
+			None => {
+				if self.root.count() >= MAX_ENTRIES {
+					return Err(FsError::NoSpace);
 				}
-			};
-			// The capacity check is the same for both policies - what differs is only whether the
-			// memory was already taken at mount. Subtracting `previous` first is what lets a file be
-			// rewritten at a full volume: replacing does not need room for both copies.
-			let after = used - previous + data.len();
-			if after > capacity {
-				return Err(FsError::NoSpace);
+				0
 			}
-			// The bytes are built BEFORE the entry is replaced. Inserting an empty file first and
-			// filling it afterwards loses the previous contents when the allocation fails - a
-			// failed write must leave what was there untouched, not truncate it to nothing.
-			let mut written: Vec<u8> = Vec::new();
-			written.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
-			written.extend_from_slice(data);
-			children.insert(String::from(name), Node::File(written));
-			previous
 		};
-		let _ = previous;
+		// Subtracting what the file already holds is what lets it be rewritten on a full volume:
+		// replacing does not need room for both copies. The check is the same for both policies;
+		// only where the memory comes from differs.
+		let used = self.used() as usize;
+		if used - previous + data.len() > self.capacity {
+			return Err(FsError::NoSpace);
+		}
+		// A reserved volume releases the bytes it is holding BEFORE allocating the file, because
+		// otherwise the allocation and the reservation would be outstanding at the same time and
+		// the write could fail for memory the volume was itself sitting on - which is precisely
+		// the failure the reservation exists to prevent.
+		let needed = data.len().saturating_sub(previous);
+		if self.policy == Policy::Reserved && needed != 0 {
+			let held = self.reservation.len();
+			self.reservation.truncate(held.saturating_sub(needed));
+			self.reservation.shrink_to_fit();
+		}
+		// The bytes are built before the entry is replaced. Inserting an empty file first and
+		// filling it afterwards loses the previous contents when the allocation fails - a failed
+		// write must leave what was there untouched, not truncate it to nothing.
+		let mut written: Vec<u8> = Vec::new();
+		if written.try_reserve_exact(data.len()).is_err() {
+			// The release above is undone on the way out, so a refused write leaves the volume
+			// holding exactly what it held before it was attempted.
+			self.resync_reservation();
+			return Err(FsError::NoSpace);
+		}
+		written.extend_from_slice(data);
+		// `parent_mut` can still refuse - the parent may not exist, or a path component may be a
+		// file - and it runs AFTER the reservation was released. Returning through `?` here would
+		// walk past the resync and leave the volume holding less than its capacity for the rest
+		// of its life, with nothing stored to account for it. Every exit from this point on goes
+		// through the resync.
+		match self.parent_mut(&parts) {
+			Ok((children, name)) => {
+				children.insert(String::from(name), Node::File(written));
+			}
+			Err(error) => {
+				self.resync_reservation();
+				return Err(error);
+			}
+		}
 		self.resync_reservation();
 		Ok(())
 	}
