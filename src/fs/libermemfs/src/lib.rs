@@ -64,6 +64,19 @@ impl Node {
 		}
 	}
 
+	// The bytes this node's subtree spends on NAMES. A name is memory the caller caused to be
+	// allocated, so it counts against the capacity: without it a volume could be filled with
+	// 4095 maximum-length names and exceed its capacity by a megabyte - a quarter of a 4 MiB
+	// reserved volume, which would make "reserved" mean nothing.
+	//
+	// A node does not count its own name; the parent holding the key does.
+	fn names(&self) -> usize {
+		match self {
+			Node::File(_) => 0,
+			Node::Directory(children) => children.iter().map(|(name, node)| name.len() + node.names()).sum(),
+		}
+	}
+
 	fn count(&self) -> usize {
 		match self {
 			Node::File(_) => 1,
@@ -112,8 +125,17 @@ impl LiberMemFs {
 		self.capacity as u64
 	}
 
+	// The file data stored, which is what a caller means by "used" and what every other backend
+	// reports. It deliberately excludes names - see `footprint` for what the capacity bounds.
 	pub fn used(&self) -> u64 {
 		self.root.bytes() as u64
+	}
+
+	// The memory this volume has caused to be allocated: file data plus the names holding it.
+	// This is what the capacity bounds, so a volume cannot exceed it by filling itself with
+	// names instead of contents.
+	pub fn footprint(&self) -> u64 {
+		(self.root.bytes() + self.root.names()) as u64
 	}
 
 	// The bytes a reserved volume is holding but not yet storing. Zero for a capped volume,
@@ -123,8 +145,10 @@ impl LiberMemFs {
 		self.reservation.len() as u64
 	}
 
+	// What can still be written, after both the data and the names already held. Reported rather
+	// than `capacity - used`, which would promise room that the next name will take.
 	pub fn free(&self) -> u64 {
-		self.capacity().saturating_sub(self.used())
+		self.capacity().saturating_sub(self.footprint())
 	}
 
 	// Split a path into its segments, rejecting everything that is not a plain relative path.
@@ -189,7 +213,7 @@ impl LiberMemFs {
 		if self.policy != Policy::Reserved {
 			return;
 		}
-		let target = self.capacity.saturating_sub(self.used() as usize);
+		let target = self.capacity.saturating_sub(self.footprint() as usize);
 		if self.reservation.len() == target {
 			return;
 		}
@@ -244,8 +268,11 @@ impl LiberMemFs {
 		// Subtracting what the file already holds is what lets it be rewritten on a full volume:
 		// replacing does not need room for both copies. The check is the same for both policies;
 		// only where the memory comes from differs.
-		let used = self.used() as usize;
-		if used - previous + data.len() > self.capacity {
+		// A new entry also costs its name; replacing an existing one does not, because the name is
+		// already there and already counted.
+		let name_cost = if previous == 0 && self.lookup(&parts).is_none() { parts.last().map_or(0, |name| name.len()) } else { 0 };
+		let footprint = self.footprint() as usize;
+		if footprint - previous + data.len() + name_cost > self.capacity {
 			return Err(FsError::NoSpace);
 		}
 		// A reserved volume releases what it is holding BEFORE allocating the file. Otherwise the
@@ -301,11 +328,16 @@ impl LiberMemFs {
 	pub fn mkdir(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let parts = Self::segments(path)?;
 		let entries = self.root.count();
+		// A directory stores nothing but still costs its name, and that name is memory the caller
+		// asked for. Charging it is what stops a volume being filled past its capacity with
+		// directories - `mkdir` had no capacity check at all.
+		let footprint = self.footprint() as usize;
+		let capacity = self.capacity;
 		let (children, name) = self.parent_mut(&parts)?;
 		if children.contains_key(name) {
 			return Err(FsError::Exists);
 		}
-		if entries >= MAX_ENTRIES {
+		if entries >= MAX_ENTRIES || footprint + name.len() > capacity {
 			return Err(FsError::NoSpace);
 		}
 		children.insert(String::from(name), Node::Directory(BTreeMap::new()));

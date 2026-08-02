@@ -28,9 +28,12 @@ fn files_and_directories_round_trip() {
 fn rewriting_a_file_replaces_it_rather_than_appending() {
 	// The case a fresh implementation gets wrong: a second write must not leave the first
 	// write's bytes behind, and must not need room for both copies at once.
-	let mut fs = capped(8);
+	// Capacity 9 holds 8 bytes plus the one-byte name: a name counts against the capacity, so a
+	// volume sized to the data alone has no room for what identifies it.
+	let mut fs = capped(9);
 	fs.write_file(b"f", b"aaaaaaaa").expect("fills the volume exactly");
 	assert_eq!(fs.used(), 8);
+	assert_eq!(fs.footprint(), 9, "the name is part of what the capacity bounds");
 	fs.write_file(b"f", b"bb").expect("rewriting at capacity succeeds");
 	assert_eq!(fs.read_file(b"f").expect("read"), b"bb".to_vec());
 	assert_eq!(fs.used(), 2);
@@ -80,9 +83,9 @@ fn a_directory_with_entries_is_not_removed_silently() {
 fn a_capped_volume_refuses_the_write_that_crosses_its_limit() {
 	// The capped policy's whole behaviour: it mounts regardless, and the refusal lands on the
 	// write rather than at mount.
-	let mut fs = capped(10);
+	let mut fs = capped(12);
 	fs.write_file(b"a", b"12345").expect("fits");
-	assert_eq!(fs.free(), 5);
+	assert_eq!(fs.free(), 6, "five bytes of data and a one-byte name");
 	assert_eq!(fs.write_file(b"b", b"123456"), Err(FsError::NoSpace), "one byte over the cap is refused");
 	fs.write_file(b"b", b"12345").expect("exactly the remainder fits");
 	assert_eq!(fs.free(), 0);
@@ -101,7 +104,7 @@ fn a_reserved_volume_holds_its_capacity_from_the_moment_it_mounts() {
 	assert_eq!(fs.policy(), Policy::Reserved);
 	assert_eq!(fs.capacity(), 16);
 	assert_eq!(fs.used(), 0);
-	fs.write_file(b"a", b"1234567890123456").expect("the whole capacity is writable");
+	fs.write_file(b"a", b"123456789012345").expect("the whole capacity is writable");
 	assert_eq!(fs.free(), 0);
 	assert_eq!(fs.write_file(b"b", b"x"), Err(FsError::NoSpace));
 }
@@ -141,11 +144,11 @@ fn a_reserved_volume_keeps_its_guarantee_when_files_shrink_or_go() {
 	assert_eq!(fs.reserved_bytes(), 64, "an empty reserved volume holds all of it");
 
 	fs.write_file(b"a", &[b'x'; 40]).expect("write");
-	assert_eq!(fs.reserved_bytes(), 24, "what a file uses is no longer held separately");
+	assert_eq!(fs.reserved_bytes(), 23, "what a file and its name use is no longer held separately");
 
 	// Shrinking must return the difference to the reservation, not to the heap.
 	fs.write_file(b"a", &[b'x'; 8]).expect("shrink");
-	assert_eq!(fs.reserved_bytes(), 56, "shrinking gives the memory back to the volume");
+	assert_eq!(fs.reserved_bytes(), 55, "shrinking gives the memory back to the volume");
 
 	// So must deleting.
 	fs.remove(b"a").expect("remove");
@@ -153,7 +156,7 @@ fn a_reserved_volume_keeps_its_guarantee_when_files_shrink_or_go() {
 	assert_eq!(fs.used(), 0);
 
 	// And the guarantee still holds afterwards: the whole capacity is writable again.
-	fs.write_file(b"b", &[b'y'; 64]).expect("the full capacity is available after the round trip");
+	fs.write_file(b"b", &[b'y'; 63]).expect("the full capacity is available after the round trip");
 }
 
 #[test]
@@ -186,10 +189,10 @@ fn a_reserved_write_draws_on_the_reservation_instead_of_allocating_beside_it() {
 	let mut fs = LiberMemFs::mount(Policy::Reserved, 100).expect("mount");
 	// Each write replaces the same file, so what is stored is simply the last size written -
 	// grown, then grown again to the whole capacity, then shrunk.
-	for write in [30usize, 100, 10] {
+	for write in [30usize, 99, 10] {
 		fs.write_file(b"f", &alloc::vec![b'z'; write]).expect("write within capacity");
 		assert_eq!(fs.used(), write as u64);
-		assert_eq!(fs.used() + fs.reserved_bytes(), 100, "stored plus held is always the capacity, never more");
+		assert_eq!(fs.footprint() + fs.reserved_bytes(), 100, "stored plus held is always the capacity, never more");
 	}
 }
 
@@ -216,15 +219,15 @@ fn no_refused_operation_leaves_a_reserved_volume_holding_less_than_it_should() {
 	];
 	for (path, data) in refusals {
 		assert!(fs.write_file(path, data).is_err(), "{:?} must be refused", core::str::from_utf8(path));
-		assert_eq!(fs.used() + fs.reserved_bytes(), 128, "a refused write left the reservation short: {:?}", core::str::from_utf8(path));
+		assert_eq!(fs.footprint() + fs.reserved_bytes(), 128, "a refused write left the reservation short: {:?}", core::str::from_utf8(path));
 	}
 
 	// The contents are untouched by all of it, and the volume still works.
 	assert_eq!(fs.read_file(b"d/keep").expect("read"), b"1234".to_vec());
 	assert_eq!(fs.read_file(b"afile").expect("read"), b"12345678".to_vec());
 	assert_eq!(fs.used(), 12);
-	fs.write_file(b"afile", &[b'y'; 116]).expect("the rest of the capacity is still writable");
-	assert_eq!(fs.used() + fs.reserved_bytes(), 128);
+	fs.write_file(b"afile", &[b'y'; 108]).expect("the rest of the capacity is still writable");
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), 128);
 }
 
 #[test]
@@ -236,13 +239,39 @@ fn a_write_after_a_short_regrow_still_reaches_the_capacity() {
 	//
 	// Releasing all of it makes the amount held irrelevant to whether the write can proceed.
 	let mut fs = LiberMemFs::mount(Policy::Reserved, 64).expect("mount");
-	fs.write_file(b"a", &[b'x'; 64]).expect("fill it");
+	fs.write_file(b"a", &[b'x'; 63]).expect("fill it");
 	assert_eq!(fs.reserved_bytes(), 0, "a full reserved volume holds nothing back");
 
 	// From full, straight to full again with a different file: the release has to cover the
 	// whole write, not the difference from a reservation that is currently empty.
 	fs.remove(b"a").expect("remove");
-	fs.write_file(b"b", &[b'y'; 64]).expect("the whole capacity is writable again");
-	assert_eq!(fs.used(), 64);
-	assert_eq!(fs.used() + fs.reserved_bytes(), 64);
+	fs.write_file(b"b", &[b'y'; 63]).expect("the whole capacity is writable again");
+	assert_eq!(fs.used(), 63);
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), 64);
+}
+
+#[test]
+fn names_cannot_be_used_to_exceed_the_capacity() {
+	// A name is memory the caller asked for. Counting only file contents left a hole: a volume
+	// could be filled with long names holding nothing and end up a megabyte over its capacity -
+	// a quarter of a 4 MiB reserved volume, which would make "reserved" mean nothing.
+	//
+	// `mkdir` is the sharper case, because a directory stores no data at all and used to have no
+	// capacity check whatsoever.
+	let mut fs = capped(20);
+	fs.mkdir(b"aaaaaaaaaa").expect("ten bytes of name fit");
+	assert_eq!(fs.used(), 0, "a directory stores nothing");
+	assert_eq!(fs.footprint(), 10, "but its name is memory the volume is accountable for");
+	assert_eq!(fs.free(), 10);
+
+	fs.mkdir(b"bbbbbbbbbb").expect("the rest fits exactly");
+	assert_eq!(fs.free(), 0);
+	assert_eq!(fs.mkdir(b"c"), Err(FsError::NoSpace), "a one-byte name past a full volume is refused");
+	assert_eq!(fs.write_file(b"d", b""), Err(FsError::NoSpace), "so is an empty file, which is all name");
+
+	// Freeing a name frees its bytes back.
+	fs.rmdir(b"bbbbbbbbbb").expect("rmdir");
+	assert_eq!(fs.free(), 10);
+	fs.write_file(b"e", b"123456789").expect("nine bytes plus a one-byte name");
+	assert_eq!(fs.free(), 0);
 }
