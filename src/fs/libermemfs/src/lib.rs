@@ -223,13 +223,6 @@ impl LiberMemFs {
 		}
 	}
 
-	// Hold exactly the unused part of a reserved volume's capacity, so its footprint stays at
-	// what it took at mount however its contents change.
-	//
-	// It has to run after EVERY mutation, not just after a write that grows a file. An earlier
-	// version only ever shrank the reservation, so deleting or shrinking a file handed that
-	// memory back to the heap rather than back to the reservation - and a volume that was
-	// supposed to guarantee its space silently stopped guaranteeing it.
 	// Give up the whole reservation. The vector and the byte count move together and must never
 	// disagree, so nothing sets either of them directly - every accounting defect in this
 	// filesystem has been two pieces of the same fact drifting apart.
@@ -238,6 +231,14 @@ impl LiberMemFs {
 		self.reserved = 0;
 	}
 
+	// Hold exactly the unused part of a reserved volume's capacity, so its footprint stays at
+	// what it took at mount however its contents change.
+	//
+	// It has to run after EVERY mutation, not just after a write that grows a file. An earlier
+	// version only ever shrank the reservation, so deleting or shrinking a file handed that
+	// memory back to the heap rather than back to the reservation - and a volume that was
+	// supposed to guarantee its space silently stopped guaranteeing it. `mkdir` and `rmdir` count
+	// too, since a name is part of the footprint.
 	fn resync_reservation(&mut self) {
 		if self.policy != Policy::Reserved {
 			return;
