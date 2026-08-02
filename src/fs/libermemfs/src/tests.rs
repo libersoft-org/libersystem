@@ -316,12 +316,12 @@ fn a_path_limit_bounds_the_parsing_and_not_only_the_answer() {
 	//
 	// The refusal is the same; what changed is that it now costs a bounded amount of work.
 	let mut fs = capped(0);
-	let sprawling: Vec<u8> = core::iter::repeat("s/").take(10_000).collect::<String>().into_bytes();
+	let sprawling: Vec<u8> = "s/".repeat(10_000).into_bytes();
 	assert_eq!(fs.read_file(&sprawling), Err(FsError::TooLong));
 	assert_eq!(fs.write_file(&sprawling, b"x"), Err(FsError::TooLong));
 
 	// Exactly at the limit is still accepted, so the bound did not move.
-	let deepest: Vec<u8> = core::iter::repeat("d/").take(MAX_PATH_DEPTH).collect::<String>().into_bytes();
+	let deepest: Vec<u8> = "d/".repeat(MAX_PATH_DEPTH).into_bytes();
 	assert_eq!(fs.read_file(&deepest), Err(FsError::NotFound), "sixteen segments is a legal path, merely absent");
 }
 
@@ -347,4 +347,61 @@ fn free_is_room_for_data_and_a_new_entry_still_pays_for_its_name() {
 	assert_eq!(fs.write_file(b"b", &[b'x'; 6]), Err(FsError::NoSpace), "free() bytes plus a name is over");
 	fs.write_file(b"b", &[b'x'; 5]).expect("free() less the name fits exactly");
 	assert_eq!(fs.free(), 0);
+}
+
+// A deterministic pseudo-random sequence. No dependency, and the same run every time, so a
+// failure is reproducible rather than a story about a machine that saw it once.
+struct Lcg(u64);
+
+impl Lcg {
+	fn next(&mut self) -> u64 {
+		self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+		self.0 >> 33
+	}
+}
+
+#[test]
+fn the_reservation_survives_ten_thousand_random_operations() {
+	// Five of the ten defects in this filesystem were the footprint and the reservation drifting
+	// apart, and every one was found by READING the code - the tests written alongside it all
+	// checked hand-picked sequences, so they only ever asked the questions their author had
+	// already thought of.
+	//
+	// This asks the one question mechanically: after EVERY operation, whatever it was and whether
+	// it succeeded or was refused, does the volume still hold exactly what it should? The capacity
+	// is deliberately tiny so that refusals - where four of those five defects lived - are the
+	// common case rather than the exception.
+	const CAPACITY: usize = 64;
+	let paths: [&[u8]; 8] = [b"a", b"bb", b"ccc", b"d", b"d/x", b"d/yy", b"e", b"e/f"];
+	let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("mount");
+	let mut rng = Lcg(0x5eed);
+	let mut refusals = 0usize;
+	let mut successes = 0usize;
+
+	for step in 0..10_000 {
+		let path = paths[(rng.next() % paths.len() as u64) as usize];
+		let outcome = match rng.next() % 6 {
+			0 => fs.write_file(path, &alloc::vec![b'z'; (rng.next() % 40) as usize]),
+			1 => fs.write_file(path, b""),
+			2 => fs.mkdir(path),
+			3 => fs.remove(path),
+			4 => fs.rmdir(path),
+			_ => fs.read_file(path).map(|_| ()),
+		};
+		if outcome.is_ok() {
+			successes += 1
+		} else {
+			refusals += 1
+		}
+
+		// The invariant the reserved policy IS.
+		assert_eq!(fs.footprint() + fs.reserved_bytes(), CAPACITY as u64, "step {step}: stored plus held is no longer the capacity (footprint {}, reserved {})", fs.footprint(), fs.reserved_bytes());
+		// And the bound it enforces, which no refusal may leave crossed.
+		assert!(fs.footprint() <= CAPACITY as u64, "step {step}: the footprint passed the capacity");
+	}
+
+	// A run that never stored anything, or never refused anything, would pass the assertions above
+	// while proving nothing. Both paths have to have been taken.
+	assert!(successes > 500, "the sequence barely mutated the volume: {successes} succeeded");
+	assert!(refusals > 500, "the sequence barely refused anything: {refusals} refused");
 }
