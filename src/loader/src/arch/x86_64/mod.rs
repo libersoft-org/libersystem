@@ -48,14 +48,18 @@ pub fn halt() -> ! {
 // volume (the kernel gets them as boot-protocol modules), loads the kernel ELF,
 // gathers the framebuffer + RSDP, builds the page tables + BootInfo, snapshots the
 // memory map, exits boot services, and switches to the kernel's page tables.
-pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: *mut uefi::FileProtocol, kernel: &[u8]) -> ! {
+pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
 	// The archive assembled from the volume wins when there is one; the ESP copy is the fallback
 	// for a machine whose system volume is missing or unreadable.
 	let init_pkg: &[u8] = match unsafe { crate::BOOTSTRAP } {
 		Some(archive) => archive,
-		None => read_file(bs, root, INIT_PKG_FILE).expect("loader: cannot read init.pkg"),
+		None => crate::read_boot_file(bs, root, INIT_PKG_FILE).expect("loader: cannot read init.pkg"),
 	};
-	let volume_pkg = read_file(bs, root, VOLUME_PKG_FILE).expect("loader: cannot read volume.pkg");
+	// Optional. The system volume is a filesystem on the disk now, not an archive handed over at
+	// boot (M0138), so a shipping image carries no `volume.pkg` at all - it survives only as the
+	// kernel test suite's fixture. A machine without one boots exactly as before; the module is
+	// simply absent, which is what the kernel's lookup already expects.
+	let volume_pkg = root.and_then(|root| read_file(bs, root, VOLUME_PKG_FILE));
 	serial::write_str("loader: packages loaded\n");
 
 	// Load the kernel ELF: allocate + copy each PT_LOAD segment, record its
@@ -84,11 +88,16 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let regions_phys = alloc_pages(bs, regions_pages).expect("loader: cannot allocate region array");
 	let modules_phys = alloc_pages(bs, 1).expect("loader: cannot allocate module array");
 
-	// Publish the two loaded packages as modules.
+	// Publish the loaded packages as modules. The volume archive is only there when the image
+	// carries one.
 	let modules = modules_phys as *mut Module;
+	let mut module_count = 1usize;
 	unsafe {
 		*modules.add(0) = make_module(init_pkg, INIT_PKG_FILE);
-		*modules.add(1) = make_module(volume_pkg, VOLUME_PKG_FILE);
+		if let Some(volume) = volume_pkg {
+			*modules.add(1) = make_module(volume, VOLUME_PKG_FILE);
+			module_count = 2;
+		}
 	}
 
 	// The highest physical address the HHDM and identity map must cover.
@@ -118,7 +127,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		(*boot_info).hhdm_offset = HHDM_OFFSET;
 		(*boot_info).memmap = HHDM_OFFSET + regions_phys;
 		(*boot_info).modules = HHDM_OFFSET + modules_phys;
-		(*boot_info).modules_len = 2;
+		(*boot_info).modules_len = module_count as u64;
 		(*boot_info).framebuffer = fb.info;
 		(*boot_info).fb_present = fb.present as u32;
 		(*boot_info)._pad1 = 0;

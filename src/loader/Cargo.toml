@@ -20,11 +20,18 @@ fscore = { path = "../fs/core" }
 # kernel already knows how to read - shared constants rather than a second copy of the format.
 abi = { path = "../abi" }
 liberfs = { path = "../fs/liberfs" }
+# FAT, read-only. The firmware mounts the ESP for us through Simple File System, so this is not
+# how the loader reads its own boot volume - it is how it reads a FAT medium the firmware will
+# NOT mount, which is what an installer or rescue stick on unusual firmware looks like.
+fat = { path = "../fs/fat" }
 
 # The dev build optimizes the filesystem crates for the same reason the storage service does:
 # LiberFS verifies a CRC32C per block it reads, and an unoptimized checksum is the whole cost of
 # reading the kernel here.
 [profile.dev.package.liberfs]
+opt-level = 2
+
+[profile.dev.package.fat]
 opt-level = 2
 
 [profile.dev]

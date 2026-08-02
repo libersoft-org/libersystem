@@ -86,7 +86,10 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// The heap has to exist before the filesystem crates are used, and cannot outlive boot
 	// services.
 	heap::init(bs);
-	let root = open_boot_volume(bs, image_handle).expect("loader: cannot open boot volume");
+	// The firmware normally mounts the boot volume for us. When it does not - a medium its Simple
+	// File System driver declines - the FAT backend below reads it through the block protocol
+	// instead, which is the whole reason that crate is linked.
+	let root = open_boot_volume(bs, image_handle);
 
 	// Prefer the system volume: a program that runs should have a file on the volume the user can
 	// see, which is the whole point of this milestone. The ESP copy is the fallback, so a machine
@@ -103,11 +106,11 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		// message matters more than usual here.
 		VolumeRead::NoVolume => {
 			arch::serial::write_str("loader: no LiberFS volume on any block device; using the boot volume\n");
-			read_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel")
+			read_boot_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel")
 		}
 		VolumeRead::NotOnVolume => {
 			arch::serial::write_str("loader: system volume found but it has no kernel; using the boot volume\n");
-			read_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel")
+			read_boot_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel")
 		}
 	};
 	arch::serial::write_str("loader: kernel loaded\n");
@@ -169,6 +172,40 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 		true
 	});
 	outcome
+}
+
+// Read a file from the boot medium: through the firmware when it mounted the volume, and through
+// the FAT backend over the block protocol when it did not.
+pub(crate) fn read_boot_file(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, name: &str) -> Option<&'static [u8]> {
+	if let Some(root) = root
+		&& let Some(bytes) = read_file(bs, root, name)
+	{
+		return Some(bytes);
+	}
+	arch::serial::write_str("loader: the firmware did not mount the boot volume; reading it as FAT\n");
+	read_from_fat(bs, name.as_bytes())
+}
+
+// Read a file from a FAT medium the firmware did not mount for us.
+//
+// The ESP is read through Simple File System, which the firmware provides, so this is not the
+// ordinary path - it is the one for a medium the firmware declines to mount, which is what an
+// installer or rescue stick looks like on firmware that only understands its own disk. Read-only,
+// like everything else here.
+pub(crate) fn read_from_fat(bs: *mut BootServices, path: &[u8]) -> Option<&'static [u8]> {
+	let mut found: Option<&'static [u8]> = None;
+	blockio::each_disk(bs, |disk| {
+		let Some(mut fs) = fat::FatFs::mount(disk) else { return false };
+		match fs.read_file(path) {
+			Ok(bytes) => {
+				found = retain(bs, &bytes);
+				true
+			}
+			// A FAT volume without this file is not the one we want; the next medium might be.
+			Err(_) => false,
+		}
+	});
+	found
 }
 
 // Copy `bytes` into fresh LOADER_DATA pages, which the firmware retains across the hand-off.

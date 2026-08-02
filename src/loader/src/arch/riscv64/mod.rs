@@ -49,7 +49,7 @@ pub fn halt() -> ! {
 // Place the kernel at its physical link addresses, find the device tree and boot hart
 // id, exit boot services, turn paging off and enter the kernel's boot stub with the
 // hart id in a0 and the DTB in a1.
-pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, _root: *mut uefi::FileProtocol, kernel: &[u8]) -> ! {
+pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, _root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
 	let entry = load_kernel(bs, kernel);
 	serial::write_str("loader: kernel ELF loaded at its physical link addresses\n");
 

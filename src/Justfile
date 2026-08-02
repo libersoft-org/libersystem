@@ -759,6 +759,22 @@ iso strip="debug": build
 img size="64M" strip="debug": build
     STRIP={{ strip }} boot/mkimage.sh img {{ kernel_elf }} {{ size }}
 
+# build the raw disk image and convert it to QCOW2 -> .build/boot/<product>.qcow2
+#
+# Worth having beside the raw image because a raw 64 MiB image is 64 MiB whether or not it is
+# used, while QCOW2 stores only the blocks that were written - a fraction of that to keep, to copy
+# and to hand to someone. The raw image stays: it is what gets written to a USB stick, and QCOW2
+# is not something a disk can be.
+qcow2 size="64M" strip="debug": (img size strip)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    slug="$(grep -m1 '^PRODUCT_NAME=' ../product.conf | cut -d'"' -f2 | tr '[:upper:]' '[:lower:]')"
+    raw="{{ build_root }}/boot/$slug.img"
+    out="${raw%.img}.qcow2"
+    [[ -f "$raw" ]] || { echo "qcow2: no raw image at $raw" >&2; exit 1; }
+    qemu-img convert -f raw -O qcow2 "$raw" "$out"
+    printf 'qcow2: wrote %s (%s from %s raw)\n' "$out" "$(du -h "$out" | cut -f1)" "$(du -h "$raw" | cut -f1)"
+
 # host-test pure application-side pixel, input, PCM and image helpers
 app-libs-test:
     cargo test --manifest-path {{ pix_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu

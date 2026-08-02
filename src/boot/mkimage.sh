@@ -150,9 +150,19 @@ make_img() {
 	rm -f "$out"
 	truncate -s "$size" "$out"
 
-	# GPT with a single EFI System Partition (ef00, FAT) holding the loader, the
-	# kernel and the packages. No BIOS boot partition: the platform is UEFI-only.
-	sgdisk "$out" -n 1:2048:0 -t 1:ef00 -c 1:ESP >/dev/null
+	# GPT with two partitions: an EFI System Partition (ef00, FAT) holding the loader and the
+	# boot fallback copies, and a LiberFS system volume holding everything else.
+	#
+	# The second partition is what makes this an installed system rather than a boot medium. The
+	# storage service finds it by the LiberFS type GUID rather than by device order, and the
+	# loader finds it by its superblock - firmware exposes a partition as its own block handle, so
+	# LBA 0 of that handle is the volume's own start (M0138).
+	#
+	# The ESP is fixed at 32 MiB: it needs the loader, the kernel and the init fallback, and every
+	# byte beyond that is a byte the system volume does not get.
+	local esp_end=$((2048 + 32 * 1024 * 1024 / 512 - 1))
+	sgdisk "$out" -n "1:2048:$esp_end" -t 1:ef00 -c 1:ESP >/dev/null
+	sgdisk "$out" -n 2:0:0 -t 2:4C424653-0001-4000-8000-4C6962657246 -c 2:system >/dev/null
 
 	# read back the ESP's exact start and length (mtools cannot parse GPT, so we
 	# build the FAT filesystem as a standalone image and splice it into place).
@@ -173,11 +183,29 @@ make_img() {
 	mcopy -i "$esp" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$esp" "$staged" ::/kernel
 	mcopy -i "$esp" "$BUILD/$INIT_PACKAGE" "::/$INIT_PACKAGE"
-	mcopy -i "$esp" "$BUILD/$VOLUME_PACKAGE" "::/$VOLUME_PACKAGE"
+	# No volume archive: the system volume is a filesystem in partition 2, and the archive exists
+	# only as the kernel test suite's fixture (M0138).
 
 	# splice the populated FAT filesystem into the ESP region of the disk
 	dd if="$esp" of="$out" bs=512 seek="$esp_start" conv=notrunc status=none
 	rm -f "$esp"
+
+	# Lay the system volume into partition 2. Built by `just system-volume`, which runs after the
+	# kernel so the image carries the kernel that was just linked.
+	local volume="$BUILD/system-volume-x86_64.img"
+	if [[ -f "$volume" ]]; then
+		local sys_start sys_sectors
+		sys_start="$(sgdisk -i 2 "$out" | awk '/^First sector:/ {print $3}')"
+		sys_sectors="$(sgdisk -i 2 "$out" | awk '/^Partition size:/ {print $3}')"
+		local volume_sectors=$(($(stat -c%s "$volume") / 512))
+		if ((volume_sectors > sys_sectors)); then
+			echo "mkimage: the system volume ($((volume_sectors / 2048)) MiB) does not fit the partition ($((sys_sectors / 2048)) MiB); build a larger image" >&2
+			exit 1
+		fi
+		dd if="$volume" of="$out" bs=512 seek="$sys_start" conv=notrunc status=none
+	else
+		echo "mkimage: no system volume at $volume; the image has an empty system partition" >&2
+	fi
 	mv "$out" "$final"
 
 	info "wrote $final ($size, GPT: ESP)"
