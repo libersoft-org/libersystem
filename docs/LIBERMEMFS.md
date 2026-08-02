@@ -18,7 +18,7 @@ usually describes does not exist here.
   `Capped` charges as files are written.
 - Bounded everywhere: file size, entry count, name length and path depth all refuse past their
   limit rather than truncating.
-- `no_std` + `alloc`, ~280 lines, 14 unit tests. It implements the storage service's
+- `no_std` + `alloc`, ~310 lines, 16 unit tests. It implements the storage service's
   `FileSystem` trait directly, NOT `fscore::BlockDevice` - there is no block device under it.
 - Mounted as `vol://ram` (reserved) and `vol://tmp` (capped).
 
@@ -61,8 +61,20 @@ every operation are identical. The only difference is WHEN the memory is charged
 | unused space | held | available to everything else |
 | suits | state that must not fail because something else took the memory | scratch, where waste is worse than an occasional refusal |
 
+The capacity bounds the volume's FOOTPRINT - file data plus the names holding it - not the data
+alone. A name is memory the caller asked for, and counting only contents left a hole: a volume
+could be filled with long names storing nothing and end up a megabyte over its capacity, a
+quarter of a 4 MiB reserved volume. `mkdir` was the sharper case, having had no capacity check at
+all, because a directory stores no data.
+
+`used()` therefore reports file data, which is what the word means to a caller and to every other
+backend, while `footprint()` reports what the capacity actually bounds and `free()` subtracts
+both - so it does not promise room that the next name will take.
+
 A reserved volume holds a buffer of exactly its unused capacity, resynced after every mutation,
-so `used + reserved` is always the capacity and never more.
+so `footprint + reserved` is always the capacity and never more. Because names count, that
+includes `mkdir` and `rmdir`: creating a directory takes its name's bytes out of the reservation
+and removing one puts them back, which is easy to miss because a directory stores no data.
 
 Two properties make that guarantee real rather than nominal, and both are easy to get wrong:
 
@@ -87,10 +99,13 @@ Two properties make that guarantee real rather than nominal, and both are easy t
   and leaves the volume permanently short with nothing stored to account for it.
 
 The invariant is worth stating on its own because it is what the reserved policy IS, and because
-every one of the defects found in this filesystem was a violation of it: **`used + reserved`
-always equals the capacity.** A test asserts it across six different ways for an operation to be
-refused, which is a stronger check than one test per known bug - it caught a defect that had not
-been thought of.
+every one of the accounting defects found in this filesystem was a violation of it:
+**`footprint + reserved` always equals the capacity.** A test asserts it across six different ways
+for an operation to be refused, which is a stronger check than one test per known bug - it caught
+a defect that had not been thought of. It has one limit worth knowing before trusting it: it drove
+only file operations, so when names began to count it went on passing while every directory
+operation broke the invariant. An invariant test is only as strong as the set of operations it
+runs through, and a second test now covers the directory ones.
 
 Both policies enforce the same capacity through the same check. Only the moment of charging
 differs, which is why they share an implementation.
@@ -104,6 +119,7 @@ of service whatever it is called.
 | --- | --- | --- |
 | `MAX_FILE_BYTES` | 64 MiB | `TooLong` |
 | `MAX_ENTRIES` | 4096 nodes | `NoSpace` |
+| the capacity, over data AND names | per mount | `NoSpace` |
 | `MAX_NAME_BYTES` | 255 per segment | `TooLong` |
 | `MAX_PATH_DEPTH` | 16 segments | `TooLong` |
 

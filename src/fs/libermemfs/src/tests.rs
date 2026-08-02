@@ -275,3 +275,34 @@ fn names_cannot_be_used_to_exceed_the_capacity() {
 	fs.write_file(b"e", b"123456789").expect("nine bytes plus a one-byte name");
 	assert_eq!(fs.free(), 0);
 }
+
+#[test]
+fn directory_operations_keep_the_reservation_in_step_too() {
+	// Once names count toward the footprint, `mkdir` and `rmdir` change it - so they are
+	// reservation-affecting operations, which they had not been. Neither touched the reservation
+	// after that change, so a reserved volume drifted out of step on every directory operation:
+	// `mkdir` allocated a name while the reservation still held its bytes, and `rmdir` freed one
+	// without taking it back.
+	//
+	// The existing invariant test only exercised files, which is why this went unnoticed.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 64).expect("mount");
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), 64);
+
+	fs.mkdir(b"alpha").expect("mkdir");
+	assert_eq!(fs.footprint(), 5, "the name is the whole of a directory's cost");
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), 64, "mkdir must take its name from the reservation");
+
+	fs.write_file(b"alpha/f", b"1234").expect("write");
+	assert_eq!(fs.footprint(), 10, "five for the directory, one for the file name, four of data");
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), 64);
+
+	fs.remove(b"alpha/f").expect("remove");
+	fs.rmdir(b"alpha").expect("rmdir");
+	assert_eq!(fs.footprint(), 0);
+	assert_eq!(fs.reserved_bytes(), 64, "rmdir must give the name's bytes back to the reservation");
+
+	// A refused mkdir must not disturb it either.
+	fs.mkdir(b"beta").expect("mkdir");
+	assert_eq!(fs.mkdir(b"beta"), Err(FsError::Exists));
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), 64, "a refused mkdir changes nothing");
+}

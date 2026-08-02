@@ -255,14 +255,14 @@ impl LiberMemFs {
 		// What this name holds today, if anything. Read before anything is changed, because the
 		// capacity check and the reservation release below both need it and neither may run
 		// against a half-modified tree.
-		let previous = match self.lookup(&parts) {
+		let (previous, is_new) = match self.lookup(&parts) {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
-			Some(Node::File(existing)) => existing.len(),
+			Some(Node::File(existing)) => (existing.len(), false),
 			None => {
 				if self.root.count() >= MAX_ENTRIES {
 					return Err(FsError::NoSpace);
 				}
-				0
+				(0, true)
 			}
 		};
 		// Subtracting what the file already holds is what lets it be rewritten on a full volume:
@@ -270,7 +270,7 @@ impl LiberMemFs {
 		// only where the memory comes from differs.
 		// A new entry also costs its name; replacing an existing one does not, because the name is
 		// already there and already counted.
-		let name_cost = if previous == 0 && self.lookup(&parts).is_none() { parts.last().map_or(0, |name| name.len()) } else { 0 };
+		let name_cost = if is_new { parts.last().map_or(0, |name| name.len()) } else { 0 };
 		let footprint = self.footprint() as usize;
 		if footprint - previous + data.len() + name_cost > self.capacity {
 			return Err(FsError::NoSpace);
@@ -327,21 +327,34 @@ impl LiberMemFs {
 
 	pub fn mkdir(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let parts = Self::segments(path)?;
-		let entries = self.root.count();
 		// A directory stores nothing but still costs its name, and that name is memory the caller
 		// asked for. Charging it is what stops a volume being filled past its capacity with
 		// directories - `mkdir` had no capacity check at all.
-		let footprint = self.footprint() as usize;
-		let capacity = self.capacity;
-		let (children, name) = self.parent_mut(&parts)?;
-		if children.contains_key(name) {
+		//
+		// Every check is made before anything is released, so a refusal costs nothing.
+		let name = *parts.last().ok_or(FsError::BadName)?;
+		if self.lookup(&parts).is_some() {
 			return Err(FsError::Exists);
 		}
-		if entries >= MAX_ENTRIES || footprint + name.len() > capacity {
+		if self.root.count() >= MAX_ENTRIES || self.footprint() as usize + name.len() > self.capacity {
 			return Err(FsError::NoSpace);
 		}
-		children.insert(String::from(name), Node::Directory(BTreeMap::new()));
-		Ok(())
+		// The name is an allocation like any other, so a reserved volume releases before making
+		// it - the same rule the write path follows, for the same reason. Since names now count
+		// toward the footprint, skipping this would leave the reservation permanently ahead of
+		// what the volume actually holds.
+		if self.policy == Policy::Reserved {
+			self.reservation = Vec::new();
+		}
+		let inserted = match self.parent_mut(&parts) {
+			Ok((children, name)) => {
+				children.insert(String::from(name), Node::Directory(BTreeMap::new()));
+				Ok(())
+			}
+			Err(error) => Err(error),
+		};
+		self.resync_reservation();
+		inserted
 	}
 
 	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
@@ -367,6 +380,9 @@ impl LiberMemFs {
 		match children.get(name) {
 			Some(Node::Directory(entries)) if entries.is_empty() => {
 				children.remove(name);
+				// The name it held counted toward the footprint, so removing it gives those
+				// bytes back and a reserved volume must take them into its reservation.
+				self.resync_reservation();
 				Ok(())
 			}
 			Some(Node::Directory(_)) => Err(FsError::NotEmpty),
