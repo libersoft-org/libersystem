@@ -253,7 +253,7 @@ cannot be built alone at all. M0137 separates compilation from packaging and mak
 describe the whole final assembly, so a build that cannot produce a bootable system says so
 rather than producing something that resembles one.
 
-- [ ] [M0137 - Build layering: compile, then package](M0137.md)
+- [x] [M0137 - Build layering: compile, then package](M0137.md)
 
 ### Boot from the filesystem
 
