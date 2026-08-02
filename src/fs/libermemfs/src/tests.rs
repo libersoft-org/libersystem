@@ -198,7 +198,7 @@ fn a_reserved_write_draws_on_the_reservation_instead_of_allocating_beside_it() {
 
 #[test]
 fn no_refused_operation_leaves_a_reserved_volume_holding_less_than_it_should() {
-	// `used + reserved == capacity` is the invariant the reserved policy IS. Every refusal has
+	// `footprint + reserved == capacity` is the invariant the reserved policy IS. Every refusal has
 	// to preserve it, and the ones that refuse LATE are the dangerous ones: a write releases
 	// reservation bytes before it allocates, so a refusal after that point must give them back.
 	// `parent_mut` refusing an absent or non-directory parent is exactly such a late refusal,
@@ -305,4 +305,22 @@ fn directory_operations_keep_the_reservation_in_step_too() {
 	fs.mkdir(b"beta").expect("mkdir");
 	assert_eq!(fs.mkdir(b"beta"), Err(FsError::Exists));
 	assert_eq!(fs.footprint() + fs.reserved_bytes(), 64, "a refused mkdir changes nothing");
+}
+
+#[test]
+fn a_path_limit_bounds_the_parsing_and_not_only_the_answer() {
+	// The depth limit used to be checked after the whole path had been split, so a path of a
+	// thousand segments was parsed into a thousand entries before being refused for having too
+	// many. That allocation is sized by the caller, charged to nothing, and happens on every
+	// operation including reads on a volume with no capacity left.
+	//
+	// The refusal is the same; what changed is that it now costs a bounded amount of work.
+	let mut fs = capped(0);
+	let sprawling: Vec<u8> = core::iter::repeat("s/").take(10_000).collect::<String>().into_bytes();
+	assert_eq!(fs.read_file(&sprawling), Err(FsError::TooLong));
+	assert_eq!(fs.write_file(&sprawling, b"x"), Err(FsError::TooLong));
+
+	// Exactly at the limit is still accepted, so the bound did not move.
+	let deepest: Vec<u8> = core::iter::repeat("d/").take(MAX_PATH_DEPTH).collect::<String>().into_bytes();
+	assert_eq!(fs.read_file(&deepest), Err(FsError::NotFound), "sixteen segments is a legal path, merely absent");
 }

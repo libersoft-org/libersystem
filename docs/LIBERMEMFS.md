@@ -18,7 +18,7 @@ usually describes does not exist here.
   `Capped` charges as files are written.
 - Bounded everywhere: file size, entry count, name length and path depth all refuse past their
   limit rather than truncating.
-- `no_std` + `alloc`, ~310 lines, 16 unit tests. It implements the storage service's
+- `no_std` + `alloc`, ~320 lines, 17 unit tests. It implements the storage service's
   `FileSystem` trait directly, NOT `fscore::BlockDevice` - there is no block device under it.
 - Mounted as `vol://ram` (reserved) and `vol://tmp` (capped).
 
@@ -70,6 +70,16 @@ all, because a directory stores no data.
 `used()` therefore reports file data, which is what the word means to a caller and to every other
 backend, while `footprint()` reports what the capacity actually bounds and `free()` subtracts
 both - so it does not promise room that the next name will take.
+
+What the footprint still does NOT count is the per-entry overhead: the map node holding each
+entry, and the vector header inside it - on the order of fifty to a hundred bytes each, none of it
+charged. This is left uncharged deliberately rather than overlooked. A name is caller-controlled
+and unbounded per entry, which is why not charging it was a hole worth closing; per-entry overhead
+is a fixed implementation-defined cost already bounded by `MAX_ENTRIES`, so the worst case is a few
+hundred kilobytes whatever the capacity. Charging it would mean writing an allocator-internals
+guess into the capacity semantics - a 20-byte volume that can hold nothing - and the guess would be
+wrong on the next allocator. A caller sizing a reserved volume should treat the capacity as
+bounding stored bytes and names, not as the volume's total cost to the heap.
 
 A reserved volume holds a buffer of exactly its unused capacity, resynced after every mutation,
 so `footprint + reserved` is always the capacity and never more. Because names count, that
@@ -124,8 +134,15 @@ of service whatever it is called.
 | `MAX_PATH_DEPTH` | 16 segments | `TooLong` |
 
 The entry count includes the root directory, so 4095 are usable. Path depth bounds the recursion
-in the two tree walks (`bytes()` and `count()`), so neither can be driven into a deep-recursion
-fault by a crafted path.
+in the three tree walks (`bytes()`, `names()` and `count()`), so none can be driven into a
+deep-recursion fault by a crafted path: a directory at depth 16 can be created, and anything under
+it needs a 17-segment path, which is refused.
+
+The depth limit is enforced as the path is split rather than after. Checking at the end returns the
+same error but only once a path of ten thousand segments has been parsed into ten thousand entries
+- an allocation the caller sizes, charged to no volume, on every operation including reads against
+a volume with nothing left in it. A limit meant to bound work has to be applied while the work is
+being done.
 
 ## Paths
 

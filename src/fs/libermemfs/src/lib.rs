@@ -171,9 +171,14 @@ impl LiberMemFs {
 				return Err(FsError::TooLong);
 			}
 			parts.push(segment);
-		}
-		if parts.len() > MAX_PATH_DEPTH {
-			return Err(FsError::TooLong);
+			// Refused here rather than after the loop, so this vector never holds more than the
+			// depth limit. Checking at the end still returns the same error, but only after a path
+			// of a thousand segments has been parsed into a thousand entries - an allocation the
+			// caller sizes, charged to nothing, on every operation including reads. The limit is
+			// meant to bound the work, not just describe the result.
+			if parts.len() > MAX_PATH_DEPTH {
+				return Err(FsError::TooLong);
+			}
 		}
 		Ok(parts)
 	}
