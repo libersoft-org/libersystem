@@ -129,3 +129,48 @@ fn an_empty_volume_reports_nothing_and_a_missing_path_is_not_found() {
 	assert_eq!(fs.list_entries(b"absent").err(), Some(FsError::NotFound));
 	assert_eq!(fs.write_file(b"missing/dir/f", b"x"), Err(FsError::NotFound), "a write does not create parent directories");
 }
+
+#[test]
+fn a_reserved_volume_keeps_its_guarantee_when_files_shrink_or_go() {
+	// The first version only ever shrank the reservation, so freeing bytes handed them to the
+	// heap instead of back to the reservation: the volume kept reporting its capacity while no
+	// longer holding it, and a later write could fail for memory something else had taken.
+	// The footprint is what matters, and the only handle a test has on it is the reservation
+	// tracking the unused part exactly.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 64).expect("mount");
+	assert_eq!(fs.reserved_bytes(), 64, "an empty reserved volume holds all of it");
+
+	fs.write_file(b"a", &[b'x'; 40]).expect("write");
+	assert_eq!(fs.reserved_bytes(), 24, "what a file uses is no longer held separately");
+
+	// Shrinking must return the difference to the reservation, not to the heap.
+	fs.write_file(b"a", &[b'x'; 8]).expect("shrink");
+	assert_eq!(fs.reserved_bytes(), 56, "shrinking gives the memory back to the volume");
+
+	// So must deleting.
+	fs.remove(b"a").expect("remove");
+	assert_eq!(fs.reserved_bytes(), 64, "an emptied reserved volume holds all of it again");
+	assert_eq!(fs.used(), 0);
+
+	// And the guarantee still holds afterwards: the whole capacity is writable again.
+	fs.write_file(b"b", &[b'y'; 64]).expect("the full capacity is available after the round trip");
+}
+
+#[test]
+fn a_failed_write_leaves_the_previous_contents_intact() {
+	// The entry used to be replaced by an empty file BEFORE the bytes were allocated, so a
+	// write that could not be satisfied destroyed what was already there. A refused write must
+	// change nothing.
+	let mut fs = capped(16);
+	fs.write_file(b"f", b"original").expect("write");
+
+	assert_eq!(fs.write_file(b"f", &[b'x'; 32]), Err(FsError::NoSpace), "a write past the cap is refused");
+	assert_eq!(fs.read_file(b"f").expect("still there"), b"original".to_vec(), "the refused write left the file untouched");
+	assert_eq!(fs.used(), 8);
+
+	// What this test can reach is the CAPACITY refusal, which returns before the entry is
+	// touched. The bug it stands for was on the other path - an allocation failure after the
+	// entry had already been replaced - and that one cannot be provoked here without an
+	// allocator that can be made to fail. The fix was to build the bytes first and insert once
+	// they exist, so no ordering is left where a failure can truncate the previous contents.
+}

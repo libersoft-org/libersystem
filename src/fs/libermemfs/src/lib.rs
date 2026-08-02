@@ -115,6 +115,13 @@ impl LiberMemFs {
 		self.root.bytes() as u64
 	}
 
+	// The bytes a reserved volume is holding but not yet storing. Zero for a capped volume,
+	// which holds nothing it is not using. Exposed because the reservation is the whole
+	// difference between the two policies and a test cannot otherwise see it.
+	pub fn reserved_bytes(&self) -> u64 {
+		self.reservation.len() as u64
+	}
+
 	pub fn free(&self) -> u64 {
 		self.capacity().saturating_sub(self.used())
 	}
@@ -170,6 +177,39 @@ impl LiberMemFs {
 		}
 	}
 
+	// Hold exactly the unused part of a reserved volume's capacity, so its footprint stays at
+	// what it took at mount however its contents change.
+	//
+	// It has to run after EVERY mutation, not just after a write that grows a file. The first
+	// version only ever shrank the reservation, so deleting or shrinking a file handed that
+	// memory back to the heap rather than back to the reservation - and a volume that was
+	// supposed to guarantee its space silently stopped guaranteeing it.
+	//
+	// Growing back is safe: the bytes were released by this same call path a moment earlier.
+	fn resync_reservation(&mut self) {
+		if self.policy != Policy::Reserved {
+			return;
+		}
+		let target = self.capacity.saturating_sub(self.used() as usize);
+		let held = self.reservation.len();
+		if target <= held {
+			// Giving memory up always works. Released rather than merely shortened, so the
+			// volume's footprint is what it stores plus what it still holds, not both at their
+			// high-water marks.
+			self.reservation.truncate(target);
+			self.reservation.shrink_to_fit();
+			return;
+		}
+		// Taking it back can fail, and `resize` would ABORT rather than report it - which in a
+		// storage service is a crash where a degraded guarantee would do. Best effort: reserve
+		// what is available, and if less comes back than was released, the volume holds less
+		// than its capacity and `reserved_bytes` says so. A caller that cares can see it;
+		// nothing is corrupted either way.
+		if self.reservation.try_reserve_exact(target - held).is_ok() {
+			self.reservation.resize(target, 0);
+		}
+	}
+
 	pub fn read_file(&mut self, path: &[u8]) -> Result<Vec<u8>, FsError> {
 		let parts = Self::segments(path)?;
 		match self.lookup(&parts) {
@@ -212,20 +252,17 @@ impl LiberMemFs {
 			if after > capacity {
 				return Err(FsError::NoSpace);
 			}
-			children.insert(String::from(name), Node::File(Vec::new()));
-			let Some(Node::File(slot)) = children.get_mut(name) else { return Err(FsError::Invalid) };
-			slot.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
-			slot.extend_from_slice(data);
-			// A reserved volume hands its own held memory over to the file rather than allocating
-			// on top of it, so the volume's footprint stays at the capacity it took at mount instead
-			// of growing to twice what is stored.
+			// The bytes are built BEFORE the entry is replaced. Inserting an empty file first and
+			// filling it afterwards loses the previous contents when the allocation fails - a
+			// failed write must leave what was there untouched, not truncate it to nothing.
+			let mut written: Vec<u8> = Vec::new();
+			written.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
+			written.extend_from_slice(data);
+			children.insert(String::from(name), Node::File(written));
 			previous
 		};
-		if policy == Policy::Reserved {
-			let held = self.reservation.len();
-			self.reservation.truncate(held.saturating_sub(data.len().saturating_sub(previous)));
-			self.reservation.shrink_to_fit();
-		}
+		let _ = previous;
+		self.resync_reservation();
 		Ok(())
 	}
 
@@ -259,6 +296,7 @@ impl LiberMemFs {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			Some(Node::File(_)) => {
 				children.remove(name);
+				self.resync_reservation();
 				Ok(())
 			}
 			None => Err(FsError::NotFound),
