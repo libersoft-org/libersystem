@@ -273,7 +273,7 @@ runs. M0139 adds `LiberMemFS`: files on the heap, no block layer, no on-disk for
 as `vol://ram` (reserved at mount) and `vol://tmp` (capped at write) - one implementation, two
 accounting policies.
 
-- [ ] [M0139 - LiberMemFS: a writable filesystem that lives in memory](M0139.md)
+- [x] [M0139 - LiberMemFS: a writable filesystem that lives in memory](M0139.md)
 
 ### Definition of done (phase 2)
 
