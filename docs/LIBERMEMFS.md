@@ -68,8 +68,13 @@ quarter of a 4 MiB reserved volume. `mkdir` was the sharper case, having had no 
 all, because a directory stores no data.
 
 `used()` therefore reports file data, which is what the word means to a caller and to every other
-backend, while `footprint()` reports what the capacity actually bounds and `free()` subtracts
-both - so it does not promise room that the next name will take.
+backend, while `footprint()` reports what the capacity actually bounds and `free()` subtracts both.
+
+`free()` is exact for rewriting a file that exists, whose name is already paid for, and one name
+short for creating a new one, which is charged for its name on top. That is the contract, not a
+rounding error: the length of a name that does not exist yet is not knowable, so a caller creating
+an entry should expect to need `free()` minus the name. Reporting `capacity - used` instead would
+be worse again - it would promise room that every name already stored has taken.
 
 What the footprint still does NOT count is the per-entry overhead: the map node holding each
 entry, and the vector header inside it - on the order of fifty to a hundred bytes each, none of it

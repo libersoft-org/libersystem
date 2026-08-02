@@ -155,8 +155,14 @@ impl LiberMemFs {
 		self.reserved as u64
 	}
 
-	// What can still be written, after both the data and the names already held. Reported rather
-	// than `capacity - used`, which would promise room that the next name will take.
+	// What can still be written, after both the data and the names ALREADY held.
+	//
+	// Exact for rewriting an existing file, whose name is already paid for; one name short for
+	// creating a new one, which is charged for its name on top. Nothing can do better - the length
+	// of a name that does not exist yet is not knowable - so this is the contract rather than a
+	// rounding error, and a caller creating an entry should expect to need `free()` minus the name.
+	// Reporting `capacity - used` would be worse again, promising room that every name already
+	// stored has taken.
 	pub fn free(&self) -> u64 {
 		self.capacity().saturating_sub(self.footprint())
 	}

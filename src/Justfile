@@ -84,9 +84,11 @@ term_dir := "$(tools/source-path.sh term)"
 bootproto_dir := "bootproto"
 loader_dir := "loader"
 liberfs_dir := "fs/liberfs"
+libermemfs_dir := "fs/libermemfs"
 fat_dir := "fs/fat"
 iso9660_dir := "fs/iso9660"
 udf_dir := "fs/udf"
+
 fscore_dir := "fs/core"
 target := "x86_64-unknown-none"
 build_root := "../.build"
@@ -129,6 +131,7 @@ release:
     @echo "release: host unit tests"
     just bootproto-host-test
     just services-host-test
+    just fs-host-test
     just app-libs-test
     @echo "release: manifest and volume agreement"
     just artifact-metadata-check
@@ -787,6 +790,19 @@ bootproto-host-test:
 services-host-test:
     CARGO_TARGET_DIR={{ build_root }}/cargo/services-host cargo test --manifest-path {{ services_dir }}/Cargo.toml --lib --target x86_64-unknown-linux-gnu
 
+# Host-test every filesystem: LiberFS, FAT, ISO9660, UDF and LiberMemFS, plus the error and
+# BlockDevice contract they share. These are pure host tests - a filesystem decides what it does
+# from its own bytes, so none of them needs a guest - and they were reachable only by hand until
+# now, which meant 217 tests guarded nothing. The three-target QEMU suites exercise the storage
+# service through IPC; they do not cover a filesystem's own edge cases.
+fs-host-test:
+    cargo test --manifest-path {{ fscore_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
+    cargo test --manifest-path {{ liberfs_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
+    cargo test --manifest-path {{ libermemfs_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
+    cargo test --manifest-path {{ fat_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
+    cargo test --manifest-path {{ iso9660_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
+    cargo test --manifest-path {{ udf_dir }}/Cargo.toml --target x86_64-unknown-linux-gnu
+
 # Measure the staged MP3 decoder in an optimized host build and fail below real time.
 audio-bench:
     cargo run --release --manifest-path {{ audio_bench_dir }}/Cargo.toml
@@ -911,9 +927,11 @@ fmt:
     cd {{ loader_dir }} && cargo fmt
     cd {{ fscore_dir }} && cargo fmt
     cd {{ liberfs_dir }} && cargo fmt
+    cd {{ libermemfs_dir }} && cargo fmt
     cd {{ fat_dir }} && cargo fmt
     cd {{ iso9660_dir }} && cargo fmt
     cd {{ udf_dir }} && cargo fmt
+
     shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-development-gate.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
     cd .. && taplo fmt
 
@@ -986,9 +1004,11 @@ _fmt-check:
     cd {{ loader_dir }} && cargo fmt --check
     cd {{ fscore_dir }} && cargo fmt --check
     cd {{ liberfs_dir }} && cargo fmt --check
+    cd {{ libermemfs_dir }} && cargo fmt --check
     cd {{ fat_dir }} && cargo fmt --check
     cd {{ iso9660_dir }} && cargo fmt --check
     cd {{ udf_dir }} && cargo fmt --check
+
     shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-development-gate.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
     cd .. && taplo fmt --check
 

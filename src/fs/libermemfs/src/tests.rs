@@ -324,3 +324,27 @@ fn a_path_limit_bounds_the_parsing_and_not_only_the_answer() {
 	let deepest: Vec<u8> = core::iter::repeat("d/").take(MAX_PATH_DEPTH).collect::<String>().into_bytes();
 	assert_eq!(fs.read_file(&deepest), Err(FsError::NotFound), "sixteen segments is a legal path, merely absent");
 }
+
+#[test]
+fn free_is_room_for_data_and_a_new_entry_still_pays_for_its_name() {
+	// `free()` subtracts the names already held, which is what the capacity bounds - but it cannot
+	// subtract the name of a file that does not exist yet. So the number is exact for REWRITING an
+	// existing file and one name short for CREATING one, and the comment that used to sit on it
+	// claimed otherwise.
+	//
+	// This is a contract, not a defect: nothing can know how long the next name will be. It is
+	// pinned here because a wrong belief about it is what produced two of the accounting defects
+	// in this filesystem.
+	let mut fs = capped(20);
+	fs.write_file(b"aaaa", &[b'x'; 10]).expect("write");
+	assert_eq!(fs.free(), 6, "twenty less ten of data and four of name");
+
+	// Rewriting into the existing entry can use all of it, because the name is already paid for.
+	fs.write_file(b"aaaa", &[b'x'; 16]).expect("a rewrite may use the whole of free()");
+	fs.write_file(b"aaaa", &[b'x'; 10]).expect("back down");
+
+	// Creating a new one cannot: the name is charged on top.
+	assert_eq!(fs.write_file(b"b", &[b'x'; 6]), Err(FsError::NoSpace), "free() bytes plus a name is over");
+	fs.write_file(b"b", &[b'x'; 5]).expect("free() less the name fits exactly");
+	assert_eq!(fs.free(), 0);
+}
