@@ -274,9 +274,16 @@ unsafe impl GlobalAlloc for LockedHeap {
 				None => ptr::null_mut(),
 			}
 		};
-		if pointer.is_null() {
-			crate::alloc_failure()
-		}
+		// Null is RETURNED, not turned into an exit. `GlobalAlloc` says a failed allocation
+		// answers null, and everything fallible in userspace is built on that: `try_reserve` and
+		// friends can only report `NoSpace` if they are given the chance to see it.
+		//
+		// This used to call `alloc_failure()` here, which printed and exited - so an allocation
+		// could never fail, only end the process. Every `try_reserve` in the tree was unreachable
+		// code, including a filesystem that had been carefully written around them and tested
+		// against a stand-in allocator that did return null. An infallible allocation still ends
+		// the program, but through Rust's own allocation-error handler and the panic handler
+		// beside it, which is where that decision belongs.
 		pointer
 	}
 

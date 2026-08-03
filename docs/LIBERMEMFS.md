@@ -246,9 +246,14 @@ global heap. That is a different design, and it is recorded as open work rather 
 
 Allocation is fallible wherever a caller can be told: the file bytes, the reservation, a read, a
 listing and the name of a new entry all answer `NoSpace` instead of aborting, and path parsing
-allocates nothing at all. What remains infallible is the map node behind an entry, because
-`BTreeMap` offers no fallible insert - so a volume can still abort on a heap tight enough to refuse
-tens of bytes, which the arena above would also fix.
+allocates nothing at all. This became true of the RUNNING system only when `rt`'s allocator was
+changed to return null on exhaustion - it computed the null and then called an exit handler with
+it, so every `try_reserve` in userspace was unreachable and the fallible paths here were only ever
+exercised against a test allocator this crate wrote for itself.
+
+What remains infallible is the map node behind an entry, because `BTreeMap` offers no fallible
+insert - so a volume can still abort on a heap tight enough to refuse tens of bytes. It is the last
+one, and the arena would remove it along with the two costs above.
 
 ## What it deliberately does not do
 

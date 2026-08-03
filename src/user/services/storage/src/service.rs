@@ -456,6 +456,14 @@ trait FileSystem {
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error>;
 	// The byte size of the backing block device (for the `lsblk` inventory).
 	fn capacity(&mut self) -> Result<u64, Error>;
+
+	// The most a single write may carry, which is what a streaming write has to be bounded by.
+	// The volume's capacity is the wrong bound - on a disk backend that is the size of the disk,
+	// and on any backend it ignores both the per-file limit and how full the volume already is.
+	// The default is deliberately modest: a backend that can take more says so.
+	fn max_write_len(&mut self) -> usize {
+		16 * 1024 * 1024
+	}
 	// The filesystem's own identity and health numbers (for `lsvol` / `status`).
 	fn status(&mut self) -> Result<VolumeStatus, Error>;
 
@@ -511,6 +519,46 @@ impl Volume {
 	}
 }
 
+impl Volume {
+	// Collect a streamed write, bounded at every step.
+	fn receive_stream(&mut self, data: u64, path: &str) -> Result<Vec<u8>, Error> {
+		// Validated before a byte is accepted, and against what a single write may actually be -
+		// not the volume's whole capacity, which on a disk backend is the size of the disk. A
+		// stream to a path that cannot exist should cost a parse, not a heap.
+		self.writable_name(path)?;
+		let limit: usize = self.fs.max_write_len();
+
+		let mut bytes: Vec<u8> = Vec::new();
+		loop {
+			// Bounded at RECEPTION. The accumulation check below cannot help if a single chunk
+			// has already been allocated at whatever size the sender chose.
+			match unsafe { recv_vec_bounded(data, limit.saturating_sub(bytes.len())) } {
+				BoundedVec::Message { bytes: chunk, handle } => {
+					// A stream carries plain messages. A client that transfers a capability
+					// anyway must not leak it into this service's table.
+					if handle != 0 {
+						unsafe { close(handle) };
+					}
+					if chunk.is_empty() {
+						break;
+					}
+					if bytes.try_reserve(chunk.len()).is_err() {
+						return Err(Error::Again);
+					}
+					bytes.extend_from_slice(&chunk);
+				}
+				// Over the limit, or refused before it was allocated. Stop reading rather than
+				// draining politely: a sender that keeps writing would otherwise hold this
+				// service in the method for as long as it liked, and blocking a hostile sender is
+				// the smaller harm.
+				BoundedVec::TooLarge { .. } => return Err(Error::Again),
+				BoundedVec::Closed => break,
+			}
+		}
+		Ok(bytes)
+	}
+}
+
 impl volume::Service for Volume {
 	// Resolve a vol:// path and hand back the file's bytes as a read-only shared
 	// buffer (out-of-band handle<file>) plus its length - a zero-copy read.
@@ -539,11 +587,15 @@ impl volume::Service for Volume {
 	// Create or overwrite a file from the zero-copy `data` buffer. The transferred
 	// buffer handle is always consumed. A read-only volume refuses with `denied`.
 	fn write(&mut self, path: String, data: Buffer) -> Result<(), Error> {
-		// always release the transferred buffer handle, copying its bytes out first.
-		let bytes: Option<Vec<u8>> = unsafe { read_buffer(&data) };
+		// Mapped and lent, never copied into this service's heap: the filesystem releases its
+		// reservation before it makes its own copy, which is the whole point of having one.
+		//
+		// The path is checked BEFORE the buffer is touched, so a write to a path that cannot exist
+		// costs a parse rather than a mapping. The guard releases the mapping and the handle on
+		// every path out, including the early refusals.
+		let buffer = unsafe { map_buffer(&data) }.ok_or(Error::Invalid)?;
 		let name: &[u8] = self.writable_name(&path)?;
-		let bytes: Vec<u8> = bytes.ok_or(Error::Invalid)?;
-		self.fs.write_file(name, &bytes)
+		self.fs.write_file(name, buffer.as_slice())
 	}
 
 	// The streaming write form: the file's bytes arrive as plain messages on the
@@ -555,39 +607,12 @@ impl volume::Service for Volume {
 		if data == 0 {
 			return Err(Error::Invalid);
 		}
-		// The destination is checked BEFORE a byte is accepted. Validating afterwards let a client
-		// spend the service's whole heap streaming to a path that never existed.
-		let limit: usize = {
-			let name: &[u8] = self.writable_name(&path)?;
-			let _ = name;
-			self.fs.capacity().unwrap_or(0) as usize
-		};
-		let mut bytes: Vec<u8> = Vec::new();
-		let mut over = false;
-		loop {
-			match unsafe { recv_vec_blocking(data) } {
-				ReceivedVec::Message { bytes: chunk, .. } => {
-					if chunk.is_empty() {
-						break;
-					}
-					// Bounded as it arrives, and fallibly. Waiting for the end to find out the
-					// stream was too big means holding all of it first, which is the denial of
-					// service rather than the check for it. The stream is drained either way, so
-					// the sender is not left blocked on a channel nobody reads.
-					if !over && bytes.len().saturating_add(chunk.len()) <= limit && bytes.try_reserve(chunk.len()).is_ok() {
-						bytes.extend_from_slice(&chunk);
-					} else {
-						over = true;
-						bytes = Vec::new();
-					}
-				}
-				ReceivedVec::Closed => break,
-			}
-		}
+		// The stream's channel is owned from here on: the generated dispatch has handed it over,
+		// so every path out of this method has to close it. A `?` before the close leaked it, and
+		// a client repeating a bad path could exhaust the handle table that way.
+		let outcome = self.receive_stream(data, &path);
 		unsafe { close(data) };
-		if over {
-			return Err(Error::Again);
-		}
+		let bytes = outcome?;
 		let name: &[u8] = self.writable_name(&path)?;
 		self.fs.write_file(name, &bytes)
 	}
@@ -845,6 +870,10 @@ impl FileSystem for MemFs {
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
 		Ok(self.fs.capacity())
+	}
+	fn max_write_len(&mut self) -> usize {
+		// What this volume could still take, and never more than one file may be.
+		(self.fs.free() as usize).min(libermemfs::MAX_FILE_BYTES)
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.capacity(), free_bytes: self.fs.free(), compression: false, read_only: false, filesystem: String::from("libermemfs") })
@@ -1281,9 +1310,74 @@ unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
 	}
 }
 
+// The transferred buffer's bytes, borrowed in place.
+//
+// The caller sees the client's payload without it being copied into this service's heap first.
+// That copy was the reason a memory volume's reservation could not be used: the payload was built
+// beside the reservation, so a 63 MiB write into a 64 MiB reserved volume needed both at once and
+// the volume's own guarantee was unreachable through the public API. Mapping and lending lets the
+// filesystem release before it copies, which is what the reservation is for.
+//
+// The mapping and the handle are released when the guard drops, on every path.
+struct MappedBuffer {
+	handle: u64,
+	base: u64,
+	len: usize,
+}
+
+impl MappedBuffer {
+	fn as_slice(&self) -> &[u8] {
+		if self.len == 0 {
+			return &[];
+		}
+		unsafe { core::slice::from_raw_parts(self.base as *const u8, self.len) }
+	}
+}
+
+impl Drop for MappedBuffer {
+	fn drop(&mut self) {
+		unsafe {
+			if self.base != 0 {
+				unmap_object(self.handle);
+			}
+			close(self.handle);
+		}
+	}
+}
+
+// Map a transferred buffer for borrowing. Always consumes the handle. None when the handle is
+// unusable or the claimed length exceeds what the client actually backed with memory.
+unsafe fn map_buffer(data: &Buffer) -> Option<MappedBuffer> {
+	unsafe {
+		if data.handle == 0 {
+			return None;
+		}
+		let len: usize = data.len as usize;
+		let real: usize = match object_info(data.handle) {
+			Some(info) => info.size as usize,
+			None => 0,
+		};
+		if len > real {
+			close(data.handle);
+			return None;
+		}
+		if len == 0 {
+			return Some(MappedBuffer { handle: data.handle, base: 0, len: 0 });
+		}
+		match map_object(data.handle) {
+			Some(base) => Some(MappedBuffer { handle: data.handle, base, len }),
+			None => {
+				close(data.handle);
+				None
+			}
+		}
+	}
+}
+
 // Copy the bytes behind a zero-copy `data` buffer out into a Vec and release the
 // transferred buffer handle. Always consumes the handle. Returns None on failure or
 // if the claimed length exceeds the transferred object's real size.
+#[allow(dead_code)]
 unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 	unsafe {
 		if data.handle == 0 {

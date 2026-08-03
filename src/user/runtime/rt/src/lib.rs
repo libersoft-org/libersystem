@@ -82,6 +82,16 @@ unsafe extern "C" {
 	fn __user_main(bootstrap: u64) -> !;
 }
 
+// The allocation-error handler for the ordinary build, matching the one the shared-image build
+// already had: an infallible allocation that cannot be satisfied says so and exits, rather than
+// dying without a word. Fallible allocations never reach here - they get their null back and
+// answer for themselves.
+#[cfg(not(feature = "shared-image"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn __rust_alloc_error_handler(_size: usize, _align: usize) -> ! {
+	alloc_failure()
+}
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
 	unsafe {
@@ -659,6 +669,17 @@ pub enum ReceivedVec {
 	Closed,
 }
 
+// What a BOUNDED receive can answer. Its own type rather than a third variant on `ReceivedVec`:
+// eight callers match that exhaustively and none of them sets a ceiling, so widening it would
+// have meant eight arms for a case that cannot arise there.
+pub enum BoundedVec {
+	Message { bytes: alloc::vec::Vec<u8>, handle: u64 },
+	Closed,
+	// Larger than the receiver said it would hold. Refused WITHOUT allocating for it, which is
+	// the only useful moment to refuse.
+	TooLarge { len: usize },
+}
+
 // The byte length of the next pending message without dequeuing it: >= 0, or
 // ERR_WOULD_BLOCK / ERR_PEER_CLOSED (negative) - the raw peek.
 pub unsafe fn channel_peek(channel: u64) -> i64 {
@@ -671,6 +692,21 @@ pub unsafe fn channel_peek(channel: u64) -> i64 {
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
 pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
+	match unsafe { recv_vec_bounded(channel, usize::MAX) } {
+		BoundedVec::Message { bytes, handle } => ReceivedVec::Message { bytes, handle },
+		// Unreachable with no ceiling, and closing is the safe reading of it either way.
+		BoundedVec::Closed | BoundedVec::TooLarge { .. } => ReceivedVec::Closed,
+	}
+}
+
+// Receive one message, refusing anything larger than `max` WITHOUT allocating for it.
+//
+// The ceiling belongs to the caller because only the caller knows what it will hold: a storage
+// service accepting a file has a limit, a client reading its own reply does not. Refusing before
+// the allocation is the point - checking afterwards means the sender has already chosen how much
+// of the receiver's memory to take.
+#[unsafe(no_mangle)]
+pub unsafe fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
 	unsafe {
 		loop {
 			let pending: i64 = channel_peek(channel);
@@ -679,9 +715,18 @@ pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
 				continue;
 			}
 			if pending < 0 {
-				return ReceivedVec::Closed;
+				return BoundedVec::Closed;
 			}
-			let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; pending as usize];
+			if pending as usize > max {
+				return BoundedVec::TooLarge { len: pending as usize };
+			}
+			// Fallible: `vec![0u8; pending]` sized the heap from a number the SENDER chose and
+			// could not fail, so one large message ended the receiving service outright.
+			let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+			if bytes.try_reserve_exact(pending as usize).is_err() {
+				return BoundedVec::Closed;
+			}
+			bytes.resize(pending as usize, 0);
 			let mut handle: u64 = 0;
 			let got: i64 = syscall(SYS_CHANNEL_RECV, channel, bytes.as_mut_ptr() as u64, bytes.len() as u64, &mut handle as *mut u64 as u64) as i64;
 			if got == ERR_WOULD_BLOCK {
@@ -689,10 +734,10 @@ pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
 				continue;
 			}
 			if got < 0 {
-				return ReceivedVec::Closed;
+				return BoundedVec::Closed;
 			}
 			bytes.truncate(got as usize);
-			return ReceivedVec::Message { bytes, handle };
+			return BoundedVec::Message { bytes, handle };
 		}
 	}
 }

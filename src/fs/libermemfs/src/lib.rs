@@ -21,14 +21,15 @@
 //!   through `reserved_bytes()`, and reports it to clients as a volume no longer covering its
 //!   own free space. A guarantee that cannot degrade needs an arena the volume allocates
 //!   everything from, which is a different design and is recorded as such in M0139d.
-//! - `Policy::Capped` takes memory as files are written and refuses past the limit. Nothing is
-//!   held that is not used, and the limit is a ceiling rather than a reservation.
+//! - `Policy::Capped` takes memory as files are written and refuses past the limit: nothing is
+//!   taken in advance, and the limit is a ceiling rather than a reservation. It is NOT true that
+//!   nothing unused is held - a file keeps the allocation it grew to until it is removed, and the
+//!   capacity counts that, so a volume can be full of memory it is no longer storing anything in.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use fscore::FsError;
@@ -56,14 +57,54 @@ type Segments<'a> = [&'a str; MAX_PATH_DEPTH];
 pub enum Policy {
 	// Charged at mount: the capacity is held whether or not it is used.
 	Reserved,
-	// Charged at write: only what is stored is held, up to the capacity.
+	// Charged at write, and released only when a file is removed - a shrunken file keeps its
+	// allocation, which the capacity counts.
 	Capped,
 }
+
+// A directory's children: sorted by name, so lookup is a binary search and listing is already in
+// order, and backed by a `Vec` so the space for an entry can be reserved FALLIBLY.
+//
+// `BTreeMap` was the obvious choice and the last thing here that could end the process: it has no
+// fallible insert, so a volume that had checked its capacity, reserved its data and reserved its
+// name could still die allocating the node to put them in. Everything else in this filesystem
+// answers `NoSpace`; this was the one place that answered by exiting.
+type Children = Vec<(String, Node)>;
 
 // One entry in a directory. Files own their bytes; directories own their children.
 enum Node {
 	File(Vec<u8>),
-	Directory(BTreeMap<String, Node>),
+	Directory(Children),
+}
+
+// Find `name` among sorted children.
+fn find<'a>(children: &'a Children, name: &str) -> Option<&'a Node> {
+	children.binary_search_by(|(key, _)| key.as_str().cmp(name)).ok().map(|at| &children[at].1)
+}
+
+fn find_mut<'a>(children: &'a mut Children, name: &str) -> Option<&'a mut Node> {
+	let at = children.binary_search_by(|(key, _)| key.as_str().cmp(name)).ok()?;
+	Some(&mut children[at].1)
+}
+
+// Insert or replace, reserving the slot before anything is moved into it.
+fn insert(children: &mut Children, name: String, node: Node) -> Result<(), FsError> {
+	match children.binary_search_by(|(key, _)| key.as_str().cmp(name.as_str())) {
+		Ok(at) => {
+			children[at].1 = node;
+			Ok(())
+		}
+		Err(at) => {
+			children.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+			children.insert(at, (name, node));
+			Ok(())
+		}
+	}
+}
+
+fn remove(children: &mut Children, name: &str) -> Option<Node> {
+	let at = children.binary_search_by(|(key, _)| key.as_str().cmp(name)).ok()?;
+	Some(children.remove(at).1)
 }
 
 impl Node {
@@ -77,7 +118,7 @@ impl Node {
 	fn bytes(&self) -> usize {
 		match self {
 			Node::File(data) => data.len(),
-			Node::Directory(children) => children.values().map(Node::bytes).sum(),
+			Node::Directory(children) => children.iter().map(|(_, node)| node.bytes()).sum(),
 		}
 	}
 
@@ -93,7 +134,7 @@ impl Node {
 	fn allocated(&self) -> usize {
 		match self {
 			Node::File(data) => data.capacity(),
-			Node::Directory(children) => children.values().map(Node::allocated).sum(),
+			Node::Directory(children) => children.iter().map(|(_, node)| node.allocated()).sum(),
 		}
 	}
 
@@ -113,7 +154,7 @@ impl Node {
 	fn count(&self) -> usize {
 		match self {
 			Node::File(_) => 1,
-			Node::Directory(children) => 1 + children.values().map(Node::count).sum::<usize>(),
+			Node::Directory(children) => 1 + children.iter().map(|(_, node)| node.count()).sum::<usize>(),
 		}
 	}
 }
@@ -139,7 +180,7 @@ pub struct LiberMemFs {
 	// touched (`MemoryObject::create_in` charges the Domain and calls `allocate_pages` up front),
 	// so the frames behind the heap are already committed and already charged. Writing zeros into
 	// them holds nothing that owning the allocation does not already hold.
-	reservation: Vec<u8>,
+	reservation: Vec<Vec<u8>>,
 	// What `reservation` holds. Tracked rather than read back from the vector, whose length is
 	// deliberately zero and whose capacity may legitimately exceed what was asked for.
 	reserved: usize,
@@ -154,10 +195,12 @@ impl LiberMemFs {
 		if policy == Policy::Reserved {
 			// `try_reserve` rather than a plain allocation: running out here must be an error
 			// the caller can report, not an abort inside the storage service.
-			reservation.try_reserve_exact(capacity).map_err(|_| FsError::NoSpace)?;
+			let mut first: Vec<u8> = Vec::new();
+			first.try_reserve_exact(capacity).map_err(|_| FsError::NoSpace)?;
+			reservation.push(first);
 			reserved = capacity;
 		}
-		Ok(LiberMemFs { root: Node::Directory(BTreeMap::new()), policy, capacity, reservation, reserved })
+		Ok(LiberMemFs { root: Node::Directory(Children::new()), policy, capacity, reservation, reserved })
 	}
 
 	pub fn policy(&self) -> Policy {
@@ -199,7 +242,7 @@ impl LiberMemFs {
 	// Exposed because the promise is the only thing separating the two policies, and a volume
 	// that quietly stopped keeping it is indistinguishable from one that still does.
 	pub fn reservation_intact(&self) -> bool {
-		self.policy != Policy::Reserved || self.reserved as u64 == self.capacity() - self.footprint()
+		self.policy != Policy::Reserved || self.reserved as u64 == self.capacity().saturating_sub(self.footprint())
 	}
 
 	// What can still be written, after both the data and the names ALREADY held.
@@ -280,16 +323,16 @@ impl LiberMemFs {
 			return Ok(Some(&self.root));
 		};
 		let children = self.parent_of(directories)?;
-		Ok(children.get(*name))
+		Ok(find(children, name))
 	}
 
 	// The directory `directories` names, walking from the root. Read-only, so a caller can learn
 	// whether a parent exists BEFORE anything is released or allocated.
-	fn parent_of(&self, directories: &[&str]) -> Result<&BTreeMap<String, Node>, FsError> {
+	fn parent_of(&self, directories: &[&str]) -> Result<&Children, FsError> {
 		let mut node = &self.root;
 		for part in directories {
 			let Node::Directory(children) = node else { return Err(FsError::NotDir) };
-			node = children.get(*part).ok_or(FsError::NotFound)?;
+			node = find(children, part).ok_or(FsError::NotFound)?;
 		}
 		match node {
 			Node::Directory(children) => Ok(children),
@@ -302,12 +345,12 @@ impl LiberMemFs {
 	// Returns the directory alone; the final name comes from `parts`, which the caller already
 	// holds. Returning the name from here would tie its lifetime to the borrow of `self`, so a
 	// caller could not hold both.
-	fn parent_mut(&mut self, parts: &[&str]) -> Result<&mut BTreeMap<String, Node>, FsError> {
+	fn parent_mut(&mut self, parts: &[&str]) -> Result<&mut Children, FsError> {
 		let (_, directories) = parts.split_last().ok_or(FsError::BadName)?;
 		let mut node = &mut self.root;
 		for part in directories {
 			let Node::Directory(children) = node else { return Err(FsError::NotDir) };
-			node = children.get_mut(*part).ok_or(FsError::NotFound)?;
+			node = find_mut(children, part).ok_or(FsError::NotFound)?;
 		}
 		match node {
 			Node::Directory(children) => Ok(children),
@@ -321,6 +364,17 @@ impl LiberMemFs {
 	fn release_reservation(&mut self) {
 		self.reservation = Vec::new();
 		self.reserved = 0;
+	}
+
+	// Take `bytes` for the reservation, or report that it could not be had.
+	fn reserve_chunk(&mut self, bytes: usize) -> bool {
+		let mut fresh: Vec<u8> = Vec::new();
+		if fresh.try_reserve_exact(bytes).is_err() {
+			return false;
+		}
+		self.reservation.push(fresh);
+		self.reserved += bytes;
+		true
 	}
 
 	// Hold exactly the unused part of a reserved volume's capacity, so its footprint stays at
@@ -358,22 +412,39 @@ impl LiberMemFs {
 		// `Vec::resize`, `with_capacity`, a plain `reserve` - ABORTS when the memory is not there,
 		// which in a storage service is a crash where a degraded guarantee would do. If the memory
 		// cannot be had the volume holds less than its capacity and `reserved_bytes` says so.
-		self.release_reservation();
-		// Best effort meaning what it says: take the target if it can be had, and otherwise take
-		// as much of it as can. Asking once and giving up left the volume holding NOTHING when a
-		// regrow fell short - worse than the shortfall it was reacting to, and a strange reading
-		// of "best effort".
+		// Grown by ADDING a chunk, never by replacing what is already held.
 		//
-		// Halving rather than searching: each step is one failed allocation, so the whole retry
-		// costs a handful of refused requests instead of a scan, and it stops well before the
-		// remainder is too small to be worth holding.
-		let mut want = target;
+		// Releasing first and then hunting could leave the volume worse than it started: holding
+		// 32 MiB, asked for 33, and ending with 16 because that was the first size that fit. "Best
+		// effort" has to mean at least what it already had. Holding the reservation as several
+		// chunks also makes fragmentation far less likely to defeat it - a heap with no 33 MiB
+		// block very often has two of 16.
+		let held: usize = self.reserved;
+		if target < held {
+			// Shrinking: give back whole chunks from the end until the rest fits the target.
+			while self.reserved > target {
+				let Some(chunk) = self.reservation.pop() else { break };
+				self.reserved -= chunk.len();
+			}
+			// One chunk may still straddle the target; trading it for an exact one is worth a
+			// single allocation, and failing that the volume simply holds a little less.
+			if self.reserved < target {
+				let mut fresh: Vec<u8> = Vec::new();
+				if fresh.try_reserve_exact(target - self.reserved).is_ok() {
+					self.reserved += target - self.reserved;
+					self.reservation.push(fresh);
+				}
+			}
+			return;
+		}
+		// Growing: ask for the whole shortfall first, and only halve after a refusal. The floor
+		// bounds the RETRIES, not the first attempt - guarding the first ask would refuse to grow
+		// a small volume at all.
+		let mut want = target - held;
 		while want > 0 {
-			let mut fresh: Vec<u8> = Vec::new();
-			if fresh.try_reserve_exact(want).is_ok() {
-				self.reservation = fresh;
-				self.reserved = want;
-				break;
+			if self.reserve_chunk(want) {
+				want = target - self.reserved;
+				continue;
 			}
 			if want < MIN_RESERVATION_STEP {
 				break;
@@ -383,7 +454,9 @@ impl LiberMemFs {
 		// The allocation's only purpose is that it exists: nothing reads it and nothing writes it,
 		// which is exactly the shape a dead-allocation optimisation is entitled to delete. Letting
 		// the pointer escape here says otherwise, and costs nothing at runtime.
-		let _ = core::hint::black_box(self.reservation.as_ptr());
+		for chunk in &self.reservation {
+			let _ = core::hint::black_box(chunk.as_ptr());
+		}
 	}
 
 	// Read a whole file.
@@ -453,7 +526,11 @@ impl LiberMemFs {
 		// All of it, not just the difference: the whole point is that the bytes are certainly
 		// available, and releasing exactly enough leaves that resting on the reservation being
 		// perfectly in step, which it is not after a best-effort regrow has fallen short.
-		if self.policy == Policy::Reserved {
+		// Released only when something is actually going to be allocated. A rewrite that fits
+		// inside the file's existing buffer allocates nothing - no data, no name, no map node - so
+		// giving up the reservation and hunting for it again could only make the volume worse.
+		let allocates = becomes > previous || is_new;
+		if self.policy == Policy::Reserved && allocates {
 			self.release_reservation();
 		}
 		// In its own call so every temporary it makes is dropped BEFORE the resync. Holding a
@@ -493,15 +570,14 @@ impl LiberMemFs {
 		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
 		name.push_str(last);
 		let children = self.parent_mut(parts)?;
-		children.insert(name, Node::File(written));
-		Ok(())
+		insert(children, name, Node::File(written))
 	}
 
 	// The bytes of the file at `parts`, for rewriting in place.
 	fn file_mut(&mut self, parts: &[&str]) -> Result<&mut Vec<u8>, FsError> {
 		let name = *parts.last().ok_or(FsError::BadName)?;
 		let children = self.parent_mut(parts)?;
-		match children.get_mut(name) {
+		match find_mut(children, name) {
 			Some(Node::File(data)) => Ok(data),
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			None => Err(FsError::NotFound),
@@ -560,8 +636,7 @@ impl LiberMemFs {
 		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
 		name.push_str(last);
 		let children = self.parent_mut(parts)?;
-		children.insert(name, Node::Directory(BTreeMap::new()));
-		Ok(())
+		insert(children, name, Node::Directory(Children::new()))
 	}
 
 	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
@@ -569,10 +644,10 @@ impl LiberMemFs {
 		let parts = &parts[..count];
 		let name = *parts.last().ok_or(FsError::BadName)?;
 		let children = self.parent_mut(parts)?;
-		match children.get(name) {
+		match find(children, name) {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			Some(Node::File(_)) => {
-				children.remove(name);
+				remove(children, name);
 				self.resync_reservation();
 				Ok(())
 			}
@@ -588,9 +663,9 @@ impl LiberMemFs {
 		let parts = &parts[..count];
 		let name = *parts.last().ok_or(FsError::BadName)?;
 		let children = self.parent_mut(parts)?;
-		match children.get(name) {
+		match find(children, name) {
 			Some(Node::Directory(entries)) if entries.is_empty() => {
-				children.remove(name);
+				remove(children, name);
 				// The name it held counted toward the footprint, so removing it gives those
 				// bytes back and a reserved volume must take them into its reservation.
 				self.resync_reservation();

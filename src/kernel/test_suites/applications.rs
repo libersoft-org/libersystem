@@ -319,6 +319,21 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	let mut tmp = tmp.restart(storage_elf);
 	assert_eq!(tmp.open(b"vol://tmp/hello", 0x7006), None, "a memory volume is empty after a restart");
 
+	// A write of nearly the whole capacity, through the PUBLIC path - a transferred buffer, the
+	// way every real client writes.
+	//
+	// This is what the reserved policy is for, and until the service stopped copying the payload
+	// into its own heap before calling the filesystem it could not be relied on: the copy sat
+	// beside the reservation, so writing 4 KiB into a 4 KiB volume needed 8 KiB and the guarantee
+	// the volume had taken was unreachable from outside. The service now lends the mapped buffer
+	// and the filesystem releases before it copies.
+	let mut nearly_full = StorageHarness::start_memory(storage_elf, b"RAMVOL", 4096);
+	let payload = alloc::vec![b'p'; 4096 - b"whole".len()];
+	assert!(nearly_full.write(b"vol://ram/whole", &payload, 0x7201), "a reserved volume takes a write that fills it");
+	assert_eq!(nearly_full.open(b"vol://ram/whole", 0x7202).map(|bytes| bytes.len()), Some(payload.len()), "and reads it back whole");
+	// One byte more than the volume holds is refused, not accepted into memory it does not have.
+	assert!(!nearly_full.write(b"vol://ram/more", b"x", 0x7203), "a full reserved volume refuses the next write");
+
 	// vol://ram - reserved. Same filesystem, same operations; the difference is only that its
 	// memory was taken at mount, which is why a write cannot fail for want of memory here.
 	let mut ram = StorageHarness::start_memory(storage_elf, b"RAMVOL", 4096);

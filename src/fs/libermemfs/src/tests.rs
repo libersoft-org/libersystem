@@ -720,3 +720,43 @@ fn a_shrunk_file_keeps_its_allocation_and_the_volume_says_so() {
 		fs.write_file(b"b", &big).expect("after the release the volume has the room it reports");
 	});
 }
+
+#[test]
+fn growing_past_a_files_high_water_mark_needs_both_blocks() {
+	// The growth case the earlier test only appeared to cover. Rewriting 100 -> 10 -> 100 never
+	// reallocates: the file kept the capacity it grew to, so the last write reuses it. A real
+	// growth past the high-water mark has to move the buffer, and while it does, the old block
+	// and the new one both exist - which is what this measures.
+	//
+	// The budget holds the volume, the new block and a little slack, but NOT the old block as
+	// well. If the write is refused, it is refused cleanly and the file is intact; the point is
+	// that it cannot corrupt or abort.
+	const SMALL: usize = 16 * 1024;
+	const LARGE: usize = 48 * 1024;
+	let small = alloc::vec![b'a'; SMALL];
+	let large = alloc::vec![b'b'; LARGE];
+	within(LARGE + 8 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Capped, 64 * 1024).expect("mount");
+		fs.write_file(b"f", &small).expect("the first write fits");
+		assert_eq!(fs.footprint(), SMALL as u64 + 1);
+
+		// 16 KiB held plus 48 KiB wanted is over the budget, so the reallocation cannot happen.
+		// It must come back as a refusal, with the file still readable.
+		match fs.write_file(b"f", &large) {
+			Ok(()) => assert_eq!(fs.used(), LARGE as u64, "if it fit, it fit completely"),
+			Err(error) => {
+				assert_eq!(error, FsError::NoSpace, "a growth that cannot be satisfied is refused");
+				assert_eq!(fs.read_file(b"f").expect("the file survives").len(), SMALL, "a refused growth leaves the file whole");
+			}
+		}
+	});
+
+	// With room for both blocks it simply succeeds, which shows the refusal above was about
+	// memory and not about the capacity rule.
+	within(SMALL + LARGE + 8 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Capped, 64 * 1024).expect("mount");
+		fs.write_file(b"f", &small).expect("write");
+		fs.write_file(b"f", &large).expect("the growth fits when both blocks do");
+		assert_eq!(fs.used(), LARGE as u64);
+	});
+}
