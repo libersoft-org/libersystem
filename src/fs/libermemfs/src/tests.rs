@@ -802,3 +802,29 @@ fn a_reserved_mount_that_cannot_take_its_slot_fails_rather_than_aborting() {
 		assert_eq!(LiberMemFs::mount(Policy::Reserved, 1024 * 1024).err(), Some(FsError::NoSpace), "a mount that cannot be satisfied is refused, not fatal");
 	});
 }
+
+#[test]
+fn an_owned_rewrite_is_judged_by_the_write_it_will_actually_do() {
+	// The guard and the write disagreed. `write_file_owned` charged the incoming vector's
+	// CAPACITY unconditionally, while `adopt` keeps the file's existing buffer whenever the new
+	// contents fit and copies into it - taking on nothing new at all.
+	//
+	// That matters because an allocator may hand back more than was asked for, which this
+	// filesystem is careful to respect everywhere else. A stream that fits the destination could
+	// therefore be refused for the size of the buffer it happened to arrive in.
+	//
+	// Built to be unambiguous: the volume has room for the file and nothing more, and the
+	// incoming vector holds less data in a much larger allocation.
+	let mut fs = LiberMemFs::mount(Policy::Capped, 4096 + 1).expect("mount");
+	fs.write_file(b"a", &alloc::vec![b'x'; 4096]).expect("seed a file that fills the volume");
+
+	let mut incoming: Vec<u8> = Vec::with_capacity(8192);
+	incoming.extend_from_slice(&[b'y'; 1024]);
+	assert!(incoming.capacity() >= 8192, "the point of the test is an over-allocated buffer");
+
+	fs.write_file_owned(b"a", incoming).expect("a rewrite that fits the file's own buffer is not refused for the size of the vector it came in");
+	assert_eq!(fs.read_file(b"a").map(|bytes| bytes.to_vec()), Ok(alloc::vec![b'y'; 1024]), "and the bytes stored are the bytes sent");
+	// The name costs the one byte the capacity was given over the file, so a volume holding both
+	// is exactly full - and stays that way, because the rewrite took on nothing new.
+	assert_eq!(fs.free(), 0, "the file kept its allocation, so the volume is no freer than before");
+}

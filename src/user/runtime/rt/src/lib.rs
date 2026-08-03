@@ -757,7 +757,13 @@ pub unsafe fn recv_vec_deadline(channel: u64, max: usize, deadline: u64) -> Boun
 				// `run_until_idle` then HALTS until the deadline whenever the run queue empties -
 				// so a service guarding an idle stream stalls the very peer that would feed it.
 				// This wait is a guard, not progress: the kernel still wakes it when due.
-				wait_periodic(channel, deadline);
+				let waited: i64 = wait_periodic(channel, deadline);
+				// Spinning until the deadline is not a better answer than saying the wait cannot
+				// be done: a channel handed over with READ but without WAIT lets the peek work
+				// while every wait fails immediately.
+				if waited < 0 && waited != ERR_TIMED_OUT {
+					return BoundedVec::ReceiveError;
+				}
 				continue;
 			}
 			if pending == ERR_PEER_CLOSED {
@@ -861,6 +867,50 @@ pub unsafe fn try_recv(channel: u64, buf: &mut [u8]) -> Polled {
 // send-only stdout dup) falls back to yielding; a send refused by the Domain's
 // IPC-queue quota rather than queue room also degrades to the yield pace (the
 // writable wait reads ready then, since the queue itself has space).
+// How a bounded send ended.
+pub enum SendOutcome {
+	Delivered,
+	// The peer is gone, or the send was refused outright.
+	Failed,
+	// The queue stayed full to the deadline: the peer holds the channel but is not draining it.
+	// SEPARATE from `Failed` because it is the ending a caller can do something about - abandon
+	// the stream and close both ends - whereas the other two are already over.
+	Stalled,
+}
+
+// `send_blocking` that gives up at `deadline` (absolute LAPIC ticks; 0 waits forever).
+//
+// A service producing a stream cannot wait forever for its consumer. A client that takes the
+// consumer handle and then stops reading fills the queue, and an unbounded send then holds the
+// whole service - every other client, every volume - for as long as the client likes. This is the
+// outbound twin of `recv_vec_deadline`, and it was the direction that had no bound at all.
+#[unsafe(no_mangle)]
+pub unsafe fn send_deadline(channel: u64, bytes: &[u8], xfer: u64, deadline: u64) -> SendOutcome {
+	unsafe {
+		loop {
+			let signed: i64 = syscall(SYS_CHANNEL_SEND, channel, bytes.as_ptr() as u64, bytes.len() as u64, xfer) as i64;
+			if signed != ERR_WOULD_BLOCK {
+				return if signed == 0 { SendOutcome::Delivered } else { SendOutcome::Failed };
+			}
+			if deadline != 0 && clock() >= deadline {
+				return SendOutcome::Stalled;
+			}
+			// PERIODIC for the reason `recv_vec_deadline` gives: a plain timed wait counts as
+			// pending progress and `run_until_idle` then halts until the deadline, stalling the
+			// peer that would drain the queue.
+			let waited: i64 = syscall(SYS_WAIT, channel, deadline, WAIT_WRITABLE | WAIT_PERIODIC, 0) as i64;
+			// A wait that could not be PERFORMED - a handle without the WAIT right, say - would
+			// otherwise send this loop spinning at full speed until the deadline. Timing out is
+			// the expected ending and goes around; anything else means waiting is not available
+			// on this channel, and burning a core until the deadline is not a better answer than
+			// giving up.
+			if waited < 0 && waited != ERR_TIMED_OUT {
+				return SendOutcome::Failed;
+			}
+		}
+	}
+}
+
 pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 	unsafe {
 		loop {

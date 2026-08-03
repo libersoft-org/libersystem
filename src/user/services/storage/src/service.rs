@@ -400,16 +400,33 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], re
 		Some(pair) => pair,
 		None => return,
 	};
+	// CHECKED. If the client closed the main channel just after asking, the consumer handle is
+	// never delivered - and it was previously never closed either, so it leaked AND left the
+	// producer with a live peer nobody would ever read. The next send then blocked forever, which
+	// is a permanent stop of the whole service caused by a client merely hanging up.
 	unsafe {
-		send_blocking(service, &corr_bytes, consumer);
+		if !send_blocking(service, &corr_bytes, consumer) {
+			close(consumer);
+			close(producer);
+			return;
+		}
 	}
 	let mut frame: [u8; 1024] = [0u8; 1024];
 	for (seq, item) in items.iter().enumerate() {
 		let mut frame_handle: u64 = 0;
 		if let Some(n) = volume::list_frame(seq as u32, item, &mut frame, &mut frame_handle) {
-			unsafe {
-				if !send_blocking(producer, &frame[..n], frame_handle) && frame_handle != 0 {
-					close(frame_handle);
+			// BOUNDED. A client that takes the consumer handle and then stops reading fills this
+			// queue, and an unbounded send held the entire service on it - the same defect the
+			// inbound stream had, in the direction that had no bound at all. Abandoning a stalled
+			// listing truncates it for that client; blocking truncates it for every client.
+			let outcome = unsafe { send_deadline(producer, &frame[..n], frame_handle, clock().saturating_add(STREAM_IDLE_TICKS)) };
+			match outcome {
+				SendOutcome::Delivered => {}
+				SendOutcome::Failed | SendOutcome::Stalled => {
+					if frame_handle != 0 {
+						unsafe { close(frame_handle) };
+					}
+					break;
 				}
 			}
 		} else if frame_handle != 0 {

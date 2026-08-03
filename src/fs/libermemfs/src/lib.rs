@@ -625,9 +625,18 @@ impl LiberMemFs {
 				(0, true)
 			}
 		};
-		// The buffer arrives already allocated, so what the volume takes on is its CAPACITY.
+		// The buffer arrives already allocated, so what the volume takes on is its CAPACITY -
+		// EXCEPT where `adopt` keeps the file's existing buffer and copies into it, which it does
+		// whenever the new contents fit. There the volume takes on nothing new at all.
+		//
+		// Charging `data.capacity()` in that branch refused writes that would have fitted: an
+		// allocator may hand `try_reserve_exact` more than was asked for, so a 60 MB stream into a
+		// 64 MB file could arrive in a 68 MB vector and be rejected while the write it guards
+		// would have reused the 64 MB already there. This filesystem is careful elsewhere to
+		// respect over-allocation; the guard has to branch the way the write does.
 		let name_cost = if is_new { parts.last().map_or(0, |name| name.len()) } else { 0 };
-		if self.footprint() as usize - previous + data.capacity() + name_cost > self.capacity {
+		let becomes = if !is_new && data.len() <= previous { previous } else { data.capacity() };
+		if self.footprint() as usize - previous + becomes + name_cost > self.capacity {
 			return Err(FsError::NoSpace);
 		}
 		// Only the name and the entry slot are allocated here, so the reservation is released
