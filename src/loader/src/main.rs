@@ -115,6 +115,14 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	};
 	arch::serial::write_str("loader: kernel loaded\n");
 
+	// A live medium's volume is a FILE on the boot filesystem, so the disk scan above never saw it.
+	// Read it here, before the report below, and let it supply the bootstrap set the same way an
+	// installed system's partition does.
+	unsafe { LIVE_VOLUME = read_boot_file(bs, root, LIVE_VOLUME_FILE) };
+	if let Some(image) = unsafe { LIVE_VOLUME } {
+		bootstrap_from_image(bs, image);
+	}
+
 	// Report which of the two sources the bootstrap set came from, for the same reason the kernel
 	// read is reported: a boot that silently used the fallback looks identical to one that did not.
 	match unsafe { BOOTSTRAP } {
@@ -148,6 +156,30 @@ pub(crate) enum VolumeRead {
 // the kernel: mounting twice would walk every block device twice and, worse, could pick a
 // different volume for the two halves of one boot on a machine with more than one.
 pub(crate) static mut BOOTSTRAP: Option<&'static [u8]> = None;
+
+// The live medium's system volume, read once. It is needed twice - to assemble the bootstrap set
+// from and to hand to the kernel as a module - and it is the largest thing this loader reads, so
+// reading it per use would cost another copy of it in firmware pages.
+pub(crate) static mut LIVE_VOLUME: Option<&'static [u8]> = None;
+pub(crate) const LIVE_VOLUME_FILE: &str = "system-volume.img";
+
+// Assemble the bootstrap set from a system volume held in memory rather than on a disk.
+//
+// This is what lets a LIVE medium retire its `init.pkg`: the volume it carries names its own
+// bootstrap programs in `etc/bootstrap.list`, exactly as an installed one does, but it is a file on
+// FAT rather than a partition, so `read_from_system_volume` never sees it.
+//
+// Does nothing when a disk already answered - an installed system's own volume wins over an image
+// that happens to be lying on the boot medium beside it.
+pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) {
+	if unsafe { BOOTSTRAP }.is_some() {
+		return;
+	}
+	let Some(mut fs) = liberfs::LiberFs::mount(blockio::ImageDisk { bytes }) else { return };
+	if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
+		unsafe { BOOTSTRAP = retain(bs, &archive) };
+	}
+}
 
 pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> VolumeRead {
 	let mut outcome = VolumeRead::NoVolume;

@@ -138,6 +138,8 @@ make_iso() {
 	else
 		[[ -f "$payload" ]] || die "iso: no system volume at $payload (run \`just system-volume\`)"
 	fi
+	# The init package is counted whether or not it is staged: it is the smaller of the two payloads
+	# and over-sizing a FAT image by a few megabytes is cheaper than getting it wrong.
 	bytes=$(($(stat -c%s "$staged") + $(stat -c%s "$BUILD/$INIT_PACKAGE") + $(stat -c%s "$payload") + $(stat -c%s "$LOADER_EFI")))
 	# FAT overhead + slack, rounded up to a whole MiB (min 32 MiB).
 	total=$(((bytes + 16 * 1024 * 1024) / (1024 * 1024) + 1))
@@ -148,7 +150,13 @@ make_iso() {
 	mmd -i "$efi_img" ::/EFI ::/EFI/BOOT
 	mcopy -i "$efi_img" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$efi_img" "$staged" ::/kernel
-	mcopy -i "$efi_img" "$BUILD/$INIT_PACKAGE" "::/$INIT_PACKAGE"
+	# The SHIPPING medium carries no `init.pkg`: its system volume names its own bootstrap programs
+	# in `etc/bootstrap.list` and the loader assembles the set from there, which is what this
+	# milestone set out to do. The TEST medium still needs it - it carries the factory archive
+	# rather than a volume, so there is no list to read.
+	if [[ "$test_medium" == "1" ]]; then
+		mcopy -i "$efi_img" "$BUILD/$INIT_PACKAGE" "::/$INIT_PACKAGE"
+	fi
 	mcopy -i "$efi_img" "$payload" "::/$payload_name"
 
 	rm -rf "$iso_root"

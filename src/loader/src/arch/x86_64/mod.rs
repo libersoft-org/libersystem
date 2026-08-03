@@ -25,7 +25,6 @@ use crate::VOLUME_PKG_FILE;
 // The live medium's system volume: a LiberFS image the running system copies into memory, so a
 // LiveCD needs no disk and never writes to the medium it booted from. Passed straight through as
 // a module; the kernel hands it to the storage service, which is where it becomes a volume.
-const LIVE_VOLUME_FILE: &str = "system-volume.img";
 
 // Round `v` up to a multiple of `align` (a power of two).
 fn align_up(v: u64, align: u64) -> u64 {
@@ -53,6 +52,10 @@ pub fn halt() -> ! {
 // gathers the framebuffer + RSDP, builds the page tables + BootInfo, snapshots the
 // memory map, exits boot services, and switches to the kernel's page tables.
 pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
+	// Already read in `main`, where it also supplied the bootstrap set: exactly one of the two is
+	// present - a test medium carries the archive, a live medium the volume, and an installed
+	// system neither, because its volume is on the disk.
+	let live_volume = unsafe { crate::LIVE_VOLUME };
 	// The archive assembled from the volume wins when there is one; the ESP copy is the fallback
 	// for a machine whose system volume is missing or unreadable.
 	let init_pkg: &[u8] = match unsafe { crate::BOOTSTRAP } {
@@ -64,9 +67,6 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// kernel test suite's fixture. A machine without one boots exactly as before; the module is
 	// simply absent, which is what the kernel's lookup already expects.
 	let volume_pkg = root.and_then(|root| read_file(bs, root, VOLUME_PKG_FILE));
-	// Exactly one of the two is present: a test medium carries the archive, a live medium carries
-	// the volume, and an installed system carries neither because its volume is on the disk.
-	let live_volume = root.and_then(|root| read_file(bs, root, LIVE_VOLUME_FILE));
 	serial::write_str("loader: packages loaded\n");
 
 	// Load the kernel ELF: allocate + copy each PT_LOAD segment, record its
@@ -107,7 +107,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		}
 		if let Some(volume) = live_volume {
 			serial::write_str("loader: live system volume handed over\n");
-			*modules.add(module_count) = crate::make_module(volume, LIVE_VOLUME_FILE, HHDM_OFFSET);
+			*modules.add(module_count) = crate::make_module(volume, crate::LIVE_VOLUME_FILE, HHDM_OFFSET);
 			module_count += 1;
 		}
 	}

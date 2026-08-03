@@ -347,9 +347,18 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// mount a volume.
 	let (volume, tag): (&[u8], &[u8]) = match module_bytes("system-volume.img") {
 		Some(image) => (image, b"LIVEVOL"),
-		None => (volume_package_bytes().ok_or("volume package module not found")?, b"RAMDISK"),
+		// An INSTALLED system has neither: its volume is a partition the storage service mounts
+		// off the disk, so there is no archive to seed from and no image to copy. The message is
+		// still sent, empty, because this bootstrap carries its length implicitly at both ends and
+		// every message after it is positional - leaving it out stops the chain at SystemManager's
+		// next read. ServiceManager drops this capability on the disk path in any case.
+		//
+		// Refusing here instead is what broke the disk image: it boots its kernel and its
+		// bootstrap set from the volume, which is exactly what this milestone set out to do, and
+		// then died for the absence of the artifact that work removed.
+		None => (volume_package_bytes().unwrap_or(&[]), b"RAMDISK"),
 	};
-	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
+	let ramdisk = MemoryObject::create(volume.len().max(1)).ok_or("no memory for the ramdisk")?;
 	copy_into_object(&ramdisk, volume);
 	let mut rdmsg = alloc::vec::Vec::with_capacity(7 + 8);
 	rdmsg.extend_from_slice(tag);

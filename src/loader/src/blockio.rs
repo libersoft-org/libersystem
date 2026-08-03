@@ -44,6 +44,31 @@ impl BlockDevice for FirmwareDisk {
 	}
 }
 
+// A block device over an image ALREADY IN MEMORY.
+//
+// A live medium carries its system volume as a FILE on the boot filesystem, not as a partition, so
+// no amount of block-device enumeration finds it - which is why a live boot fell back to the ESP's
+// `init.pkg` for its bootstrap set while holding the volume that names it. The bytes are addressable
+// either way; only the path to them differs.
+pub(crate) struct ImageDisk {
+	pub(crate) bytes: &'static [u8],
+}
+
+impl BlockDevice for ImageDisk {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		// Checked throughout: `index` comes from a filesystem parsing an image this loader did not
+		// produce, so an offset past the end must refuse rather than wrap into the middle of it.
+		let Some(offset) = index.checked_mul(buf.len() as u64) else { return false };
+		let Ok(offset) = usize::try_from(offset) else { return false };
+		let Some(end) = offset.checked_add(buf.len()) else { return false };
+		if end > self.bytes.len() {
+			return false;
+		}
+		buf.copy_from_slice(&self.bytes[offset..end]);
+		true
+	}
+}
+
 // Every block device the firmware knows about, in the order it reports them.
 //
 // `logical_partition` devices are included deliberately: on a GPT disk the firmware exposes both
@@ -95,7 +120,9 @@ pub(crate) fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDis
 // Each line of the list is `<archive entry name> <path on the volume>`. Both are needed: the
 // kernel looks entries up by the name they have always had, which is not the path they now live
 // at.
-pub(crate) fn assemble_bootstrap(fs: &mut liberfs::LiberFs<FirmwareDisk>) -> Option<alloc::vec::Vec<u8>> {
+// Generic over the device: the same volume is read off a partition on an installed system and out
+// of an image in memory on a live medium, and the difference stops at the block layer.
+pub(crate) fn assemble_bootstrap<D: BlockDevice>(fs: &mut liberfs::LiberFs<D>) -> Option<alloc::vec::Vec<u8>> {
 	use abi::{PKG_ENTRY_LEN as ENTRY_LEN, PKG_HEADER_LEN as HEADER_LEN, PKG_NAME_LEN as NAME_LEN};
 	use alloc::vec::Vec;
 
