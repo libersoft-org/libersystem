@@ -533,9 +533,22 @@ impl Volume {
 		// Validates the destination as a side effect: a stream to a missing parent, to a file used
 		// as a directory, or to a directory is refused HERE rather than after the whole file has
 		// been held in memory.
+		unsafe { print(b"DIAG receive_stream entered\n") };
 		let limit: usize = {
-			let name: &[u8] = self.writable_name(path)?;
-			self.fs.writable_len(name)?
+			let name: &[u8] = match self.writable_name(path) {
+				Ok(name) => name,
+				Err(e) => {
+					unsafe { print(b"DIAG writable_name refused\n") };
+					return Err(e);
+				}
+			};
+			match self.fs.writable_len(name) {
+				Ok(limit) => limit,
+				Err(e) => {
+					unsafe { print(b"DIAG writable_len refused\n") };
+					return Err(e);
+				}
+			}
 		};
 
 		let mut bytes: Vec<u8> = Vec::new();

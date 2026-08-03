@@ -334,6 +334,11 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	// One byte more than the volume holds is refused, not accepted into memory it does not have.
 	assert!(!nearly_full.write(b"vol://ram/more", b"x", 0x7203), "a full reserved volume refuses the next write");
 
+	let mut streamed = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(streamed.write(b"vol://tmp/f", b"original contents", 0x7301), "seed the destination");
+	assert!(streamed.write_stream(b"vol://tmp/f", &[b"new ", b"contents"], 0x7302, None), "a stream that closes cleanly is written");
+	assert_eq!(streamed.open(b"vol://tmp/f", 0x7303), Some(b"new contents".to_vec()), "and the bytes that arrive are the bytes that are stored");
+
 	// vol://ram - reserved. Same filesystem, same operations; the difference is only that its
 	// memory was taken at mount, which is why a write cannot fail for want of memory here.
 	let mut ram = StorageHarness::start_memory(storage_elf, b"RAMVOL", 4096);

@@ -2449,6 +2449,40 @@ impl StorageHarness {
 		None
 	}
 
+	// Write through the STREAMING path: the service is handed a channel and reads chunks off it
+	// until the sender closes.
+	fn write_stream(&mut self, path: &[u8], chunks: &[&[u8]], corr: u32, oversized: Option<usize>) -> bool {
+		use object::channel::{Channel, Message};
+		use object::rights::Rights;
+		let (service_side, our_side) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&16u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&self.client, &request, service_side, Rights::ALL).expect("storage write-stream request");
+		for _ in 0..64 {
+			self.pump();
+		}
+		for chunk in chunks {
+			let _ = our_side.send(Message::new(chunk.to_vec(), alloc::vec::Vec::new(), 0));
+			self.pump();
+		}
+		if let Some(len) = oversized {
+			let _ = our_side.send(Message::new(alloc::vec![b'!'; len], alloc::vec::Vec::new(), 0));
+			self.pump();
+		}
+		drop(our_side);
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&1);
+			}
+		}
+		false
+	}
+
 	fn write(&mut self, path: &[u8], data: &[u8], corr: u32) -> bool {
 		use object::memory_object::MemoryObject;
 		use object::rights::Rights;
