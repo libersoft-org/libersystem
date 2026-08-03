@@ -131,6 +131,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// which is the whole point - and the capacity follows the tag as a decimal byte count.
 		// A reserved volume takes its memory here, so a mount that cannot get it fails HERE
 		// rather than at the first write.
+		// A LIVE system volume: a LiberFS image handed over in memory, copied into a writable
+		// memory volume. The medium it came from is read-only - an optical disc, or a stick nobody
+		// wants written to - so the running system needs its own copy, and that copy disappears at
+		// power off, which is what makes it a live session.
+		//
+		// This is seeding, which M0138 retired for disks, and the distinction is the point: on a
+		// disk the archive was a SECOND copy of what the volume already held, and removing that
+		// duplication is what the milestone is for. On read-only media there is no first copy.
+		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => match unsafe { live_volume(handle) } {
+			Some(fs) => Volume { fs: alloc::boxed::Box::new(MemFs { fs, name: SYSTEM_VOLUME }) },
+			None => exit(),
+		},
 		Received::Message { len, .. } if len >= 6 && &buf[..6] == b"RAMVOL" => match LiberMemFs::mount(MemPolicy::Reserved, mem_capacity(&buf[6..len])) {
 			Ok(fs) => Volume { fs: alloc::boxed::Box::new(MemFs { fs, name: RAM_VOLUME }) },
 			Err(_) => exit(),
@@ -935,6 +947,63 @@ impl FileSystem for MemFs {
 	}
 	fn rmdir(&mut self, name: &[u8]) -> Result<(), Error> {
 		self.fs.rmdir(name).map_err(map_fs_err)
+	}
+}
+
+// A block device over bytes already in memory, so a filesystem image handed over as a buffer can
+// be mounted without a disk behind it.
+struct ImageDevice {
+	bytes: Vec<u8>,
+}
+
+impl BlockDevice for ImageDevice {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		let start = index as usize * buf.len();
+		match self.bytes.get(start..start + buf.len()) {
+			Some(src) => {
+				buf.copy_from_slice(src);
+				true
+			}
+			None => false,
+		}
+	}
+}
+
+// Build the live system volume: mount the handed-over LiberFS image and copy every file it holds
+// into a writable memory volume, which is then served as `vol://system`.
+//
+// Sized from the image rather than from the scratch sizes the other memory volumes carry: a live
+// session's system volume holds what the medium shipped, plus room to work in.
+unsafe fn live_volume(handle: u64) -> Option<LiberMemFs> {
+	let image = unsafe { read_buffer(&Buffer { handle, len: unsafe { object_info(handle) }?.size }) }?;
+	let capacity = image.len() + image.len() / 2 + 4 * 1024 * 1024;
+	let mut source = LiberFs::mount(ImageDevice { bytes: image })?;
+	let mut live = LiberMemFs::mount(MemPolicy::Capped, capacity).ok()?;
+	copy_tree(&mut source, &mut live, b"");
+	unsafe {
+		print(b"storage: vol://system is a live copy in memory (the medium is never written)\n");
+	}
+	Some(live)
+}
+
+// Copy one directory and everything under it from the image into the live volume.
+fn copy_tree(source: &mut LiberFs<ImageDevice>, live: &mut LiberMemFs, dir: &[u8]) {
+	let Ok(entries) = (if dir.is_empty() { source.list() } else { source.read_dir(dir) }) else { return };
+	for (name, _, is_dir, _, _) in entries.into_iter() {
+		let mut path: Vec<u8> = Vec::new();
+		if !dir.is_empty() {
+			path.extend_from_slice(dir);
+			path.push(b'/');
+		}
+		path.extend_from_slice(&name);
+		if is_dir {
+			let _ = live.mkdir(&path);
+			copy_tree(source, live, &path);
+		} else if let Ok(bytes) = source.read_file(&path) {
+			// Handed over by ownership: the bytes are already allocated, so the live volume adopts
+			// them instead of making a third copy of every file on the medium.
+			let _ = live.write_file_owned(&path, bytes);
+		}
 	}
 }
 

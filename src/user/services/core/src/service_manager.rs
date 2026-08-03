@@ -197,9 +197,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     routed up from DeviceManager, so the embedded ramdisk is no longer used in
 	//     the boot path; we drop the capability rather than delegate it. (The kernel's
 	//     direct StorageService test still drives the older RAMDISK bootstrap mode.)
-	match unsafe { recv_blocking(bootstrap, &mut buf) } {
+	// A LIVE medium sends `LIVEVOL` instead: a whole LiberFS image the running system copies into
+	// memory, because the medium it booted from is read-only. That one is KEPT and handed to the
+	// storage service; the legacy archive is still dropped, since the volume comes off the disk.
+	let live_volume: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => handle,
 		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"RAMDISK" => unsafe {
 			close(handle);
+			0
 		},
 		_ => exit(),
 	};
@@ -338,7 +343,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;

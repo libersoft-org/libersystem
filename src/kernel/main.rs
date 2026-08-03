@@ -340,11 +340,19 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// Hand SystemManager the ramdisk volume the same way, so it can be delegated
 	// down to the StorageService the boot chain brings up. "RAMDISK" + length with a
 	// read-only buffer capability the StorageService will map and serve files from.
-	let volume = volume_package_bytes().ok_or("volume package module not found")?;
+	// A LIVE medium carries a whole filesystem here instead of an archive: the loader read
+	// `system-volume.img` off the boot medium and handed it over as a module, and the running
+	// system copies it into memory because the medium it booted from cannot be written. The tag
+	// says which of the two arrived, so the storage service knows whether to unpack an archive or
+	// mount a volume.
+	let (volume, tag): (&[u8], &[u8]) = match module_bytes("system-volume.img") {
+		Some(image) => (image, b"LIVEVOL"),
+		None => (volume_package_bytes().ok_or("volume package module not found")?, b"RAMDISK"),
+	};
 	let ramdisk = MemoryObject::create(volume.len()).ok_or("no memory for the ramdisk")?;
 	copy_into_object(&ramdisk, volume);
 	let mut rdmsg = alloc::vec::Vec::with_capacity(7 + 8);
-	rdmsg.extend_from_slice(b"RAMDISK");
+	rdmsg.extend_from_slice(tag);
 	rdmsg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
 	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
 	kernel_ep.send(Message::new(rdmsg, alloc::vec![rdcap], 0)).map_err(|_| "failed to hand SystemManager the ramdisk")?;

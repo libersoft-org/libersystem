@@ -85,7 +85,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, power: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, power: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -120,7 +120,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"device_manager" && !(bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_power(manager_side, power)) {
 			return State::Failed;
 		}
-		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, storage_client, storage_admin) {
+		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, live_volume, storage_client, storage_admin) {
 			return State::Failed;
 		}
 		if name == b"media_storage" && !bootstrap_media_storage(manager_side, *block2_client, media_client) {
@@ -896,9 +896,15 @@ unsafe fn bootstrap_process_service(manager_side: u64, pkg_handle: u64, pkg_len:
 // and a public service channel over `manager_side`: "BLOCK" transfers the block-read
 // service channel routed up from DeviceManager, "ADMIN" is retained only by this
 // supervisor, then "SERVE" transfers one end of a fresh public service channel.
-unsafe fn bootstrap_storage(manager_side: u64, block_client: u64, storage_client: &mut u64, storage_admin: &mut u64) -> bool {
+unsafe fn bootstrap_storage(manager_side: u64, block_client: u64, live_volume: u64, storage_client: &mut u64, storage_admin: &mut u64) -> bool {
 	unsafe {
-		if !send_blocking(manager_side, b"BLOCK", block_client) {
+		// One message either way, in the same position: a live system serves its volume from a
+		// filesystem image copied into memory, an installed one from the disk. Sending an EXTRA
+		// message instead would shift everything after it, and this bootstrap carries its length
+		// implicitly at both ends - the desyncs that cost the most this milestone all came from
+		// exactly that.
+		let (tag, handle): (&[u8], u64) = if live_volume != 0 { (b"LIVEVOL", live_volume) } else { (b"BLOCK", block_client) };
+		if !send_blocking(manager_side, tag, handle) {
 			return false;
 		}
 		let (service_admin, manager_admin): (u64, u64) = match channel() {
