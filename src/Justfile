@@ -255,7 +255,21 @@ build: sdk user packages
 # test path leaves it off: its kernel is the harness's test binary, staged on the ESP, and a volume
 # carrying a different one would be booted in preference to it.
 system-volume arch="x86_64" kernel="0":
-    cd tools/mkpackages && cargo run --quiet -- {{ arch }} system-volume {{ if kernel == "1" { "--with-kernel" } else { "" } }}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Absolute, because the recipe changes directory: the kernel path is resolved HERE, where the
+    # relative paths in this file are anchored, not inside the tool's own working directory.
+    kernel_arg=""
+    if [[ "{{ kernel }}" == "1" ]]; then
+        case "{{ arch }}" in
+            x86_64) triple=x86_64-unknown-none ;;
+            aarch64) triple=aarch64-unknown-none ;;
+            riscv64) triple=riscv64gc-unknown-none-elf ;;
+            *) echo "system-volume: unknown arch {{ arch }}" >&2; exit 1 ;;
+        esac
+        kernel_arg="--with-kernel=$(realpath {{ cargo_kernel_dir }})/$triple/debug/kernel"
+    fi
+    cd tools/mkpackages && cargo run --quiet -- {{ arch }} system-volume $kernel_arg
 
 # generate the proto crate's bindings from the LSIDL interface definitions
 # (src/idl/*.lsidl) and format the generated source
@@ -762,7 +776,9 @@ iso strip="debug": build (system-volume "x86_64")
     STRIP={{ strip }} boot/mkimage.sh iso {{ kernel_elf }}
 
 # build a raw bootable disk image for USB / SD card / HDD (BIOS + UEFI); SIZE e.g. 128M, 1G; STRIP=debug|all
-img size="64M" strip="debug": build
+# 128M by default: the volume carries the kernel and the full userspace, and the ESP now carries
+# the bootstrap set as files beside it, so 64 MiB no longer fits both.
+img size="128M" strip="debug": build
     STRIP={{ strip }} boot/mkimage.sh img {{ kernel_elf }} {{ size }}
 
 # build the raw disk image and convert it to QCOW2 -> .build/boot/<product>.qcow2
@@ -771,7 +787,7 @@ img size="64M" strip="debug": build
 # used, while QCOW2 stores only the blocks that were written - a fraction of that to keep, to copy
 # and to hand to someone. The raw image stays: it is what gets written to a USB stick, and QCOW2
 # is not something a disk can be.
-qcow2 size="64M" strip="debug": (img size strip)
+qcow2 size="128M" strip="debug": (img size strip)
     #!/usr/bin/env bash
     set -euo pipefail
     slug="$(grep -m1 '^PRODUCT_NAME=' ../product.conf | cut -d'"' -f2 | tr '[:upper:]' '[:lower:]')"

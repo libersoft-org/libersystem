@@ -100,6 +100,15 @@ verify_boot_artifacts() {
 
 # build a hybrid ISO (BIOS El Torito + UEFI), bootable as a CD or off a USB stick
 # build a UEFI-only ISO, bootable as a CD or off a USB stick
+# Copy the loader's fallback bootstrap set onto a FAT image, in the layout the loader reads.
+stage_bootstrap_files() {
+	local image="$1" root="$BUILD/bootstrap-${2:-x86_64}"
+	[[ -d "$root" ]] || die "no fallback bootstrap set at $root (run \`just system-volume\`)"
+	mmd -i "$image" ::/etc ::/libexec
+	mcopy -i "$image" "$root/etc/bootstrap.list" ::/etc/bootstrap.list
+	mcopy -i "$image" "$root"/libexec/* ::/libexec/
+}
+
 make_iso() {
 	local kernel="$1" test_medium="${2:-0}"
 	local final="$BUILD/$SLUG.iso" out="$BUILD/$SLUG.iso.$$.candidate"
@@ -150,12 +159,15 @@ make_iso() {
 	mmd -i "$efi_img" ::/EFI ::/EFI/BOOT
 	mcopy -i "$efi_img" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$efi_img" "$staged" ::/kernel
-	# The SHIPPING medium carries no `init.pkg`: its system volume names its own bootstrap programs
-	# in `etc/bootstrap.list` and the loader assembles the set from there, which is what this
-	# milestone set out to do. The TEST medium still needs it - it carries the factory archive
-	# rather than a volume, so there is no list to read.
+	# The TEST medium carries the bootstrap set as FILES, the same way the disk image's ESP does
+	# and the same way the system volume does. It needs its own copy because it carries the factory
+	# archive rather than a volume, so there is no volume list to read - but it gets one by the
+	# same mechanism rather than as a packaged `init.pkg`.
+	#
+	# The SHIPPING medium needs none: its system volume is right there on the same filesystem and
+	# names its own programs, and a medium whose volume is unreadable has nothing else to boot.
 	if [[ "$test_medium" == "1" ]]; then
-		mcopy -i "$efi_img" "$BUILD/$INIT_PACKAGE" "::/$INIT_PACKAGE"
+		stage_bootstrap_files "$efi_img" x86_64
 	fi
 	mcopy -i "$efi_img" "$payload" "::/$payload_name"
 
@@ -216,7 +228,13 @@ make_img() {
 	mmd -i "$esp" ::/EFI ::/EFI/BOOT
 	mcopy -i "$esp" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$esp" "$staged" ::/kernel
-	mcopy -i "$esp" "$BUILD/$INIT_PACKAGE" "::/$INIT_PACKAGE"
+	# The bootstrap set as FILES, not as a packaged archive.
+	#
+	# This is the recovery path for a machine whose system volume is missing or unreadable, and it
+	# is now the same shape as the volume's own: `etc/bootstrap.list` naming programs under
+	# `libexec/`, assembled by the same loader code. `init.pkg` was the second mechanism for this
+	# one job, and the only one of the two whose programs could not be replaced individually.
+	stage_bootstrap_files "$esp" x86_64
 	# No volume archive: the system volume is a filesystem in partition 2, and the archive exists
 	# only as the kernel test suite's fixture (M0138).
 

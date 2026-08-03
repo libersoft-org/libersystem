@@ -135,11 +135,18 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// volume instead of the test binary the harness had just built, and sat at a shell prompt
 	// until the watchdog fired. A shipping image wants its kernel on the volume; a test medium
 	// wants the harness's kernel, which is built elsewhere and staged on the ESP.
-	if env::args().any(|arg| arg == "--with-kernel") {
-		let kernel = out_dir.join("kernel");
+	// `--with-kernel=<path>`, and the path is REQUIRED rather than assumed.
+	//
+	// It used to read `.build/boot/kernel`, a slot every image builder writes to and nobody owns.
+	// The volume is built before that slot is written, so it took whatever the previous recipe had
+	// left there - and a `just img` after a test run put the TEST kernel on the shipping volume,
+	// which then booted into the test suite off a disk image. This is the second time that shared
+	// slot has done exactly this; naming the file removes the slot from the path entirely.
+	if let Some(arg) = env::args().find(|arg| arg.starts_with("--with-kernel=")) {
+		let kernel = PathBuf::from(&arg["--with-kernel=".len()..]);
 		match fs::read(&kernel) {
 			Ok(bytes) => staged.push((String::from("kernel"), bytes)),
-			Err(_) => eprintln!("mkpackages: no kernel at {}; the system volume will not carry one", kernel.display()),
+			Err(error) => panic!("mkpackages: cannot read the kernel at {}: {error}", kernel.display()),
 		}
 	}
 
@@ -152,6 +159,10 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// becomes a list, with the archive itself assembled in memory by the loader so the kernel and
 	// SystemManager keep receiving exactly what they receive today.
 	let mut bootstrap = String::new();
+	// The pinned programs alone, kept aside for the boot medium's fallback copy. `staged` is the
+	// whole volume - 154 files - and the fallback needs only what the loader must read before the
+	// system that knows the rest is running.
+	let mut fallback: Vec<(String, Vec<u8>)> = Vec::new();
 	for row in read_manifest(&manifest) {
 		if row.stage == "pinned" && row.crate_dir != "-" {
 			let name = executable_artifact_name(&row.name);
@@ -162,13 +173,38 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 					// loader needs both: the kernel looks entries up by the name they have
 					// today, which is not the path they now live at.
 					bootstrap.push_str(&format!("{name} libexec/{name}\n"));
+					fallback.push((format!("libexec/{name}"), bytes.clone()));
 					staged.push((format!("libexec/{name}"), bytes));
 				}
 				None => eprintln!("mkpackages: pinned {name} not built: {}", path.display()),
 			}
 		}
 	}
-	staged.push((String::from("etc/bootstrap.list"), bootstrap.into_bytes()));
+	staged.push((String::from("etc/bootstrap.list"), bootstrap.clone().into_bytes()));
+
+	// The SAME files, written out for staging on the boot medium's own filesystem.
+	//
+	// This is what lets `init.pkg` stop existing. A machine whose system volume is missing or
+	// unreadable still needs a bootstrap set, and it used to get one as a packaged archive staged
+	// beside the volume - a second mechanism for a job the volume already does one way. The loader
+	// now reads a list and files in both places, so the fallback is the same code reading the same
+	// shapes, and the programs on it can be replaced one at a time instead of rebuilt as a blob.
+	{
+		fallback.push((String::from("etc/bootstrap.list"), bootstrap.clone().into_bytes()));
+		// Architecture-qualified, like `init-<arch>.pkg` beside it. An unqualified directory is the
+		// same trap that put x86_64 programs on a riscv64 ESP: every architecture's build writes
+		// it, so it holds whichever built last.
+		let arch: String = env::args().nth(1).unwrap_or_default();
+		let root = boot_dir().join(format!("bootstrap-{arch}"));
+		let _ = fs::remove_dir_all(&root);
+		for (name, bytes) in &fallback {
+			let path = root.join(name);
+			if let Some(parent) = path.parent() {
+				let _ = fs::create_dir_all(parent);
+			}
+			write_if_changed(&path, bytes);
+		}
+	}
 
 	// Sized to hold what is staged with room to grow, rounded to whole blocks. LiberFS needs
 	// metadata beyond the file bytes, so the slack is not decoration.

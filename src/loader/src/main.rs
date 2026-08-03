@@ -115,6 +115,36 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	};
 	arch::serial::write_str("loader: kernel loaded\n");
 
+	// The BOOT medium as the last source, when no system volume answered. A machine whose volume is
+	// missing or unreadable still boots, and it boots the same way as every other machine - the
+	// same list, the same files, assembled by the same code. This is what replaced staging a
+	// packaged `init.pkg` beside it: an archive is a second mechanism for one job, and the only one
+	// of the two whose programs a user cannot see or replace one at a time.
+	//
+	// Read through the FAT backend rather than the firmware's file protocol on purpose. It takes
+	// the same `/`-separated paths the volume list already uses, so no path is translated between
+	// the two sources - and it works on firmware that declines to mount the ESP, which is exactly
+	// the machine this fallback exists for.
+	fn bootstrap_from_boot_medium(bs: *mut BootServices) {
+		if unsafe { BOOTSTRAP }.is_some() {
+			return;
+		}
+		blockio::each_disk(bs, |disk| {
+			let Some(mut fs) = fat::FatFs::mount(disk) else { return false };
+			match blockio::assemble_bootstrap(&mut fs) {
+				Some(archive) => {
+					unsafe {
+						BOOTSTRAP = retain(bs, &archive);
+						BOOTSTRAP_SOURCE = "the boot medium (the system volume did not answer)";
+					}
+					true
+				}
+				// A FAT volume without a bootstrap list is not the boot medium; the next might be.
+				None => false,
+			}
+		});
+	}
+
 	// A live medium's volume is a FILE on the boot filesystem, so the disk scan above never saw it.
 	// Read it here, before the report below, and let it supply the bootstrap set the same way an
 	// installed system's partition does.
@@ -123,14 +153,20 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		bootstrap_from_image(bs, image);
 	}
 
-	// Report which of the two sources the bootstrap set came from, for the same reason the kernel
-	// read is reported: a boot that silently used the fallback looks identical to one that did not.
+	bootstrap_from_boot_medium(bs);
+
+	// Report which of the sources the bootstrap set came from, for the same reason the kernel read
+	// is reported: a boot that silently used the fallback looks identical to one that did not.
 	match unsafe { BOOTSTRAP } {
 		Some(archive) => {
-			arch::serial::write_str("loader: bootstrap set assembled from the system volume\n");
+			arch::serial::write_str("loader: bootstrap set assembled from ");
+			arch::serial::write_str(unsafe { BOOTSTRAP_SOURCE });
+			arch::serial::write_str("\n");
 			let _ = archive;
 		}
-		None => arch::serial::write_str("loader: no bootstrap list on the volume; using the boot volume's archive\n"),
+		// Every source has been tried, so this names a machine that cannot boot rather than one
+		// taking a slower path. The kernel is loaded and will say the same thing again.
+		None => arch::serial::write_str("loader: NO bootstrap list on the system volume, the live image or the boot medium\n"),
 	}
 	arch::hand_off(bs, image_handle, system_table, root, kernel);
 }
@@ -156,6 +192,10 @@ pub(crate) enum VolumeRead {
 // the kernel: mounting twice would walk every block device twice and, worse, could pick a
 // different volume for the two halves of one boot on a machine with more than one.
 pub(crate) static mut BOOTSTRAP: Option<&'static [u8]> = None;
+// WHERE the bootstrap set came from. Three sources now answer in turn, and a boot that used the
+// last one looks identical to a boot that used the first unless it says so - which is the same
+// reason the kernel read is reported.
+static mut BOOTSTRAP_SOURCE: &str = "";
 
 // The live medium's system volume, read once. It is needed twice - to assemble the bootstrap set
 // from and to hand to the kernel as a module - and it is the largest thing this loader reads, so
@@ -177,7 +217,10 @@ pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) 
 	}
 	let Some(mut fs) = liberfs::LiberFs::mount(blockio::ImageDisk { bytes }) else { return };
 	if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
-		unsafe { BOOTSTRAP = retain(bs, &archive) };
+		unsafe {
+			BOOTSTRAP = retain(bs, &archive);
+			BOOTSTRAP_SOURCE = "the live medium's volume image";
+		}
 	}
 }
 
@@ -189,7 +232,10 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 		// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from
 		// files that exist on the volume rather than from a package built beside it.
 		if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
-			unsafe { BOOTSTRAP = retain(bs, &archive) };
+			unsafe {
+				BOOTSTRAP = retain(bs, &archive);
+				BOOTSTRAP_SOURCE = "the system volume";
+			}
 		}
 		// A LiberFS volume without this file is still the system volume; a second one is not
 		// going to be more right. Stop rather than read the same name off another disk, which

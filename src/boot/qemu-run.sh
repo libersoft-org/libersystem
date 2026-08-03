@@ -310,14 +310,19 @@ qemu_build_esp() {
 	# up with no userspace at all - the device-tree architectures used to get theirs from an
 	# archive the runner laid in RAM, which the loader path does not use.
 	#
-	# ARCHITECTURE-QUALIFIED, and staged under the plain name the loader looks for. Every build
-	# writes `.build/boot/init.pkg`, so that file is whichever architecture was built last -
-	# taking it verbatim put x86_64 programs on a riscv64 ESP and the boot died at
-	# "failed to load SystemManager", one step after a loader hand-off that had gone perfectly.
-	local init_pkg="$QEMU_BUILD_DIR/init-${arch}.pkg" volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
-	[[ -f "$init_pkg" ]] || init_pkg="$QEMU_BUILD_DIR/init.pkg"
+	# The bootstrap set as FILES, the same shape the system volume carries and the same shape the
+	# shipping media use. Architecture-qualified: every build writes the unqualified name, so
+	# taking that verbatim put x86_64 programs on a riscv64 ESP and the boot died at "failed to
+	# load SystemManager", one step after a loader hand-off that had gone perfectly.
+	local bootstrap="$QEMU_BUILD_DIR/bootstrap-${arch}"
+	if [[ -d "$bootstrap" ]]; then
+		mmd -i "$ESP" ::/etc ::/libexec
+		mcopy -i "$ESP" "$bootstrap/etc/bootstrap.list" ::/etc/bootstrap.list
+		mcopy -i "$ESP" "$bootstrap"/libexec/* ::/libexec/
+	fi
+	# The factory archive still travels for the tests that read it as a fixture.
+	local volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
 	[[ -f "$volume_pkg" ]] || volume_pkg="$QEMU_BUILD_DIR/volume.pkg"
-	[[ -f "$init_pkg" ]] && mcopy -i "$ESP" "$init_pkg" ::/init.pkg
 	[[ -f "$volume_pkg" ]] && mcopy -i "$ESP" "$volume_pkg" ::/volume.pkg
 }
 

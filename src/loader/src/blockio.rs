@@ -120,13 +120,33 @@ pub(crate) fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDis
 // Each line of the list is `<archive entry name> <path on the volume>`. Both are needed: the
 // kernel looks entries up by the name they have always had, which is not the path they now live
 // at.
-// Generic over the device: the same volume is read off a partition on an installed system and out
-// of an image in memory on a live medium, and the difference stops at the block layer.
-pub(crate) fn assemble_bootstrap<D: BlockDevice>(fs: &mut liberfs::LiberFs<D>) -> Option<alloc::vec::Vec<u8>> {
+// Generic over the FILESYSTEM, not just the device. The same list is read three ways now: off a
+// LiberFS partition on an installed system, out of a LiberFS image in memory on a live medium, and
+// off the FAT boot filesystem when the system volume cannot be read at all. One mechanism, three
+// places - which is the point. The recovery path used to be a packaged archive instead, so the
+// same job was done twice by two different means, and only one of them put the programs somewhere
+// a user could replace them.
+pub(crate) trait ReadsFiles {
+	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>>;
+}
+
+impl<D: BlockDevice> ReadsFiles for liberfs::LiberFs<D> {
+	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+		self.read_file(path).ok()
+	}
+}
+
+impl<D: BlockDevice> ReadsFiles for fat::FatFs<D> {
+	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+		self.read_file(path).ok()
+	}
+}
+
+pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> Option<alloc::vec::Vec<u8>> {
 	use abi::{PKG_ENTRY_LEN as ENTRY_LEN, PKG_HEADER_LEN as HEADER_LEN, PKG_NAME_LEN as NAME_LEN};
 	use alloc::vec::Vec;
 
-	let list = fs.read_file(b"etc/bootstrap.list").ok()?;
+	let list = fs.read(b"etc/bootstrap.list")?;
 	let mut entries: Vec<(&[u8], Vec<u8>)> = Vec::new();
 	for line in list.split(|&b| b == b'\n') {
 		if line.is_empty() {
@@ -142,7 +162,7 @@ pub(crate) fn assemble_bootstrap<D: BlockDevice>(fs: &mut liberfs::LiberFs<D>) -
 		// set is exactly the programs the system needs before its volume is readable, so a
 		// missing one produces a machine that dies later and further away, with nothing to say
 		// which program it was.
-		let bytes = fs.read_file(path).ok()?;
+		let bytes = fs.read(path)?;
 		entries.push((name, bytes));
 	}
 	if entries.is_empty() {
