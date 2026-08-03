@@ -1616,7 +1616,9 @@ unsafe fn print_hex(bytes: &[u8]) {
 fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 	let mut client = volume::Client::new(ChannelTransport { chan: storage });
 	match client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
-		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
+		// Name completion: offering fewer names claims nothing, so an abnormal drain
+		// degrades to none rather than failing the shell.
+		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
 		None => Vec::new(),
 	}
 }
@@ -1651,7 +1653,7 @@ fn completion_dir_entries(cwd: &str, token: &[u8], storage: u64, media: u64, iso
 	let mut client = volume::Client::new(ChannelTransport { chan });
 	let mut names: Vec<Vec<u8>> = Vec::new();
 	if let Some(consumer) = client.list(&target) {
-		for f in unsafe { drain_stream(consumer, volume::list_read) } {
+		for f in unsafe { drain_stream(consumer, volume::list_read) }.unwrap_or_default() {
 			let mut name: Vec<u8> = f.name.into_bytes();
 			if f.r#type == proto::system::FileType::Dir {
 				name.push(b'/');

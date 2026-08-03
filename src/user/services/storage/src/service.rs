@@ -89,6 +89,16 @@ const OP_FLUSH: u32 = 3;
 // fallback for a disk that cannot report one.
 const SECTORS_PER_BLOCK: u64 = (liberfs::BLOCK_SIZE / SECTOR_SIZE) as u64;
 const FS_START_SECTOR: u64 = 0;
+// How long a streamed write may go without a chunk before the service gives up on it, in the LAPIC
+// ticks `wait` takes. Long enough that a slow but real sender is not punished, short enough that a
+// silent one does not hold the service.
+//
+// Deliberately generous. This is not a latency budget - it is the point at which a sender is
+// treated as gone, and punishing a slow-but-real client would be a worse failure than waiting a
+// while for a hostile one. Against a client that never sends anything, any finite bound is the
+// whole of the improvement.
+// The LAPIC timer runs at 100 Hz, so a tick is 10 ms and this is thirty seconds.
+const STREAM_IDLE_TICKS: u64 = 3_000;
 const FS_BLOCKS: u64 = 8192;
 
 // An ISO9660 logical block (2048 bytes) is this many 512-byte disk sectors; one
@@ -487,9 +497,12 @@ trait FileSystem {
 	// destination, so a streaming caller learns about a missing parent before it accepts a byte
 	// instead of after it has held the whole file.
 	//
-	// The default is deliberately modest and path-blind; a backend that knows better says so.
-	fn writable_len(&mut self, _name: &[u8]) -> Result<usize, Error> {
-		Ok(16 * 1024 * 1024)
+	// `None` means "this backend does not answer for a path": the caller must not turn that into a
+	// limit of its own. A default of 16 MiB was worse than no answer - it silently became the
+	// ceiling for ORDINARY writes on every backend that had not overridden it, so a 20 MiB write
+	// to the disk was refused for a limit invented on behalf of streaming.
+	fn writable_len(&mut self, _name: &[u8]) -> Option<Result<usize, Error>> {
+		None
 	}
 	// The filesystem's own identity and health numbers (for `lsvol` / `status`).
 	fn status(&mut self) -> Result<VolumeStatus, Error>;
@@ -558,16 +571,33 @@ impl Volume {
 		// Validates the destination as a side effect: a stream to a missing parent, to a file used
 		// as a directory, or to a directory is refused HERE rather than after the whole file has
 		// been held in memory.
+		// A backend that answers for the path gives the real ceiling; one that does not gets the
+		// per-file maximum, because a stream must be bounded by SOMETHING before it accepts a byte
+		// - unlike an ordinary write, where the whole payload already exists and the backend can
+		// simply refuse it.
 		let limit: usize = {
 			let name: &[u8] = self.writable_name(path)?;
-			self.fs.writable_len(name)?
+			match self.fs.writable_len(name) {
+				Some(answer) => answer?,
+				None => 64 * 1024 * 1024,
+			}
 		};
 
 		let mut bytes: Vec<u8> = Vec::new();
 		loop {
 			// Bounded at RECEPTION. The accumulation check below cannot help if a single chunk
 			// has already been allocated at whatever size the sender chose.
-			match unsafe { recv_vec_bounded(data, limit.saturating_sub(bytes.len())) } {
+			// Bounded in TIME as well as in size. The serve loop runs this synchronously, so a
+			// client that opens a stream and then says nothing would otherwise hold the whole
+			// service - every other client, every other volume, the admin endpoint - for as long
+			// as it liked. The previous round stopped a sender from drowning the service in data;
+			// it did not stop one from stopping it with silence.
+			//
+			// A deadline bounds the harm rather than removing it: the service is still unavailable
+			// while it waits. Streams belong in the event loop as pending operations, which is a
+			// larger change and is recorded as such.
+			let deadline = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
+			match unsafe { recv_vec_deadline(data, limit.saturating_sub(bytes.len()), deadline) } {
 				BoundedVec::Message { bytes: chunk, handle } => {
 					// A stream carries plain messages. A client that transfers a capability
 					// anyway must not leak it into this service's table.
@@ -586,7 +616,11 @@ impl Volume {
 				// draining politely: a sender that keeps writing would otherwise hold this
 				// service in the method for as long as it liked, and blocking a hostile sender is
 				// the smaller harm.
-				BoundedVec::TooLarge { .. } => return Err(Error::Invalid),
+				// `Again` throughout, matching the ordinary write: the request was well formed and
+				// the volume could not take it now. Reporting `Invalid` here made the same refusal
+				// look permanent through one transport and retryable through the other.
+				BoundedVec::TooLarge { .. } => return Err(Error::Again),
+				BoundedVec::Idle => return Err(Error::Again),
 				// NOT an end of file. Running out of memory, or a channel error, used to look
 				// exactly like the sender finishing - so the prefix received so far was written
 				// over the destination and the call reported success. A write that cannot be
@@ -594,6 +628,7 @@ impl Volume {
 				// fixed in its backend and lost again here.
 				BoundedVec::NoMemory { .. } => return Err(Error::Again),
 				BoundedVec::ReceiveError => return Err(Error::Invalid),
+				// (no other endings)
 				// The sender is done. The only ending that means the file is whole.
 				BoundedVec::PeerClosed => break,
 			}
@@ -631,23 +666,24 @@ impl volume::Service for Volume {
 	// buffer handle is always consumed. A read-only volume refuses with `denied`.
 	fn write(&mut self, path: String, data: Buffer) -> Result<(), Error> {
 		// Mapped and lent, never copied into this service's heap: the filesystem releases its
-		// reservation before it makes its own copy, which is the whole point of having one.
-		//
-		// The path is checked BEFORE the buffer is touched, so a write to a path that cannot exist
-		// costs a parse rather than a mapping. The guard releases the mapping and the handle on
-		// every path out, including the early refusals.
-		// Parsed and validated BEFORE the buffer is mapped. Mapping first let a client hand over a
-		// huge object and have it mapped - kernel structures and address space - only to be
-		// refused for a path that was never writable. The comment here used to claim this order
-		// while the code did the opposite.
-		let allowed = {
+		// reservation before it makes its own copy, which is the whole point of having one. The
+		// path is checked before the buffer is touched, so a write to a path that cannot exist
+		// costs a parse rather than a mapping.
+		// Owned before anything can refuse. Validating first was right and left the handle behind
+		// on every early return, because the guard that closes it was created afterwards - so a
+		// client repeating a bad path drained the service's handle table one call at a time.
+		let owned = OwnedHandle::new(data.handle);
+		let allowed: Option<usize> = {
 			let name: &[u8] = self.writable_name(&path)?;
-			self.fs.writable_len(name)?
+			self.fs.writable_len(name).transpose()?
 		};
-		if data.len as usize > allowed {
+		// Only a backend that answered for this path gets to refuse here; the rest decide in
+		// `write_file`, as they always did.
+		if allowed.is_some_and(|allowed| data.len as usize > allowed) {
+			// The volume cannot take this now; the request itself was well formed.
 			return Err(Error::Again);
 		}
-		let buffer = unsafe { map_buffer(&data) }.ok_or(Error::Invalid)?;
+		let buffer = unsafe { map_buffer(&Buffer { handle: owned.release(), len: data.len }) }.ok_or(Error::Invalid)?;
 		let name: &[u8] = self.writable_name(&path)?;
 		self.fs.write_file(name, buffer.as_slice())
 	}
@@ -925,8 +961,8 @@ impl FileSystem for MemFs {
 	fn capacity(&mut self) -> Result<u64, Error> {
 		Ok(self.fs.capacity())
 	}
-	fn writable_len(&mut self, name: &[u8]) -> Result<usize, Error> {
-		self.fs.writable_len(name).map_err(map_fs_err)
+	fn writable_len(&mut self, name: &[u8]) -> Option<Result<usize, Error>> {
+		Some(self.fs.writable_len(name).map_err(map_fs_err))
 	}
 	fn write_file_owned(&mut self, name: &[u8], data: Vec<u8>) -> Result<(), Error> {
 		// Adopted, not copied: the streamed buffer becomes the file's own storage, so a reserved
@@ -958,8 +994,14 @@ struct ImageDevice {
 
 impl BlockDevice for ImageDevice {
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
-		let start = index as usize * buf.len();
-		match self.bytes.get(start..start + buf.len()) {
+		// Checked, because the index comes from the image being read: a damaged or crafted
+		// superblock can name a block far past the end, and multiplying it out unchecked is a
+		// panic in debug and a wrapped read of the wrong block in release. A block device should
+		// refuse an impossible index itself rather than trust every parser above it.
+		let Ok(index) = usize::try_from(index) else { return false };
+		let Some(start) = index.checked_mul(buf.len()) else { return false };
+		let Some(end) = start.checked_add(buf.len()) else { return false };
+		match self.bytes.get(start..end) {
 			Some(src) => {
 				buf.copy_from_slice(src);
 				true
@@ -976,35 +1018,76 @@ impl BlockDevice for ImageDevice {
 // session's system volume holds what the medium shipped, plus room to work in.
 unsafe fn live_volume(handle: u64) -> Option<LiberMemFs> {
 	let image = unsafe { read_buffer(&Buffer { handle, len: unsafe { object_info(handle) }?.size }) }?;
-	let capacity = image.len() + image.len() / 2 + 4 * 1024 * 1024;
+	// Sized from what the image HOLDS, not from how big the image is: a compressed source expands,
+	// names cost, and a buffer keeps the capacity it grew to. Guessing from the image size is how
+	// a copy runs out of room half way through.
 	let mut source = LiberFs::mount(ImageDevice { bytes: image })?;
-	let mut live = LiberMemFs::mount(MemPolicy::Capped, capacity).ok()?;
-	copy_tree(&mut source, &mut live, b"");
+	let wanted = match measure(&mut source, b"") {
+		Some(bytes) => bytes + bytes / 4 + 4 * 1024 * 1024,
+		None => return None,
+	};
+	let mut live = LiberMemFs::mount(MemPolicy::Capped, wanted).ok()?;
+	// Every failure stops the import. A live system that comes up missing executables because a
+	// write was refused half way through is worse than one that refuses to come up: the first is
+	// discovered by whoever needed the missing file.
+	let copied = copy_tree(&mut source, &mut live, b"")?;
 	unsafe {
 		print(b"storage: vol://system is a live copy in memory (the medium is never written)\n");
 	}
+	let _ = copied;
 	Some(live)
 }
 
+// The bytes a source subtree holds, so the live volume can be sized before anything is copied.
+fn measure(source: &mut LiberFs<ImageDevice>, dir: &[u8]) -> Option<usize> {
+	let entries = (if dir.is_empty() { source.list() } else { source.read_dir(dir) }).ok()?;
+	let mut total = 0usize;
+	for (name, size, is_dir, _, _) in entries.into_iter() {
+		let mut path: Vec<u8> = Vec::new();
+		path.try_reserve_exact(dir.len() + 1 + name.len()).ok()?;
+		if !dir.is_empty() {
+			path.extend_from_slice(dir);
+			path.push(b'/');
+		}
+		path.extend_from_slice(&name);
+		total = total.checked_add(name.len())?;
+		if is_dir {
+			total = total.checked_add(measure(source, &path)?)?;
+		} else {
+			total = total.checked_add(size as usize)?;
+		}
+	}
+	Some(total)
+}
+
 // Copy one directory and everything under it from the image into the live volume.
-fn copy_tree(source: &mut LiberFs<ImageDevice>, live: &mut LiberMemFs, dir: &[u8]) {
-	let Ok(entries) = (if dir.is_empty() { source.list() } else { source.read_dir(dir) }) else { return };
+//
+// Returns the number of files copied, or None at the FIRST failure. Ignoring failures let a
+// directory that could not be created be recursed into anyway, so every file under it failed on a
+// missing parent and was dropped too - silently, with the volume then reported as ready.
+fn copy_tree(source: &mut LiberFs<ImageDevice>, live: &mut LiberMemFs, dir: &[u8]) -> Option<usize> {
+	let entries = (if dir.is_empty() { source.list() } else { source.read_dir(dir) }).ok()?;
+	let mut copied = 0usize;
 	for (name, _, is_dir, _, _) in entries.into_iter() {
 		let mut path: Vec<u8> = Vec::new();
+		path.try_reserve_exact(dir.len() + 1 + name.len()).ok()?;
 		if !dir.is_empty() {
 			path.extend_from_slice(dir);
 			path.push(b'/');
 		}
 		path.extend_from_slice(&name);
 		if is_dir {
-			let _ = live.mkdir(&path);
-			copy_tree(source, live, &path);
-		} else if let Ok(bytes) = source.read_file(&path) {
+			live.mkdir(&path).ok()?;
+			copied += copy_tree(source, live, &path)?;
+		} else {
 			// Handed over by ownership: the bytes are already allocated, so the live volume adopts
 			// them instead of making a third copy of every file on the medium.
-			let _ = live.write_file_owned(&path, bytes);
+			let bytes = source.read_file(&path).ok()?;
+			live.write_file_owned(&path, bytes).ok()?;
+			copied += 1;
 		}
 	}
+	Some(copied)
 }
 
 // The capacity a memory volume was asked for, as decimal bytes after its tag. An unreadable or
@@ -1438,6 +1521,37 @@ struct MappedBuffer {
 	handle: u64,
 	base: u64,
 	len: usize,
+}
+
+// A transferred handle owned from the moment it arrives.
+//
+// The generated dispatch takes the handle out of the request and hands ownership to the method,
+// so anything that returns without closing it loses it for good - and a client repeating a
+// refused call exhausts the service's table. Taking ownership on the FIRST line means no
+// validation, however early, can leak it.
+struct OwnedHandle {
+	handle: u64,
+}
+
+impl OwnedHandle {
+	fn new(handle: u64) -> Self {
+		Self { handle }
+	}
+
+	// Give the handle up to something that will close it itself.
+	fn release(mut self) -> u64 {
+		let handle = self.handle;
+		self.handle = 0;
+		handle
+	}
+}
+
+impl Drop for OwnedHandle {
+	fn drop(&mut self) {
+		if self.handle != 0 {
+			unsafe { close(self.handle) };
+		}
+	}
 }
 
 impl MappedBuffer {

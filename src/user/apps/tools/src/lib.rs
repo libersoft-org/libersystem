@@ -168,6 +168,13 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 					close(consumer);
 					return Ok(entries);
 				}
+				// The caller asked for a directory's contents and gets an error instead of a
+				// prefix. `OutOfMemory` already exists for exactly this and is what an abnormal
+				// ending means here.
+				ReceivedVec::Failed => {
+					close(consumer);
+					return Err(ListDirectoryError::OutOfMemory);
+				}
 			}
 		}
 	}

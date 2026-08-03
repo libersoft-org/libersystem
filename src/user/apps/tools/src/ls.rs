@@ -243,7 +243,12 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 		// sort applies like in the text form; the sizes stay raw bytes - units are a
 		// text-rendering concern).
 		if let Some(mode) = mode {
-			let mut files: Vec<FileInfo> = drain_stream(consumer, volume::list_read);
+			// A listing printed to the user IS a claim about the directory. Say it failed
+			// rather than print a prefix of it as though it were everything.
+			let Some(mut files) = drain_stream(consumer, volume::list_read) else {
+				print(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
+				return;
+			};
 			sort_files(&mut files, key, reverse);
 			let mut out = String::from("[");
 			for (i, f) in files.iter().enumerate() {
@@ -278,13 +283,20 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 						}
 					}
 					ReceivedVec::Closed => break,
+					ReceivedVec::Failed => {
+						print(b"ls: listing failed partway through; what is shown above is incomplete\n");
+						break;
+					}
 				}
 			}
 			close(consumer);
 			summary(dirs, plain, total, unit);
 			return;
 		}
-		let mut files: Vec<FileInfo> = drain_stream(consumer, volume::list_read);
+		let Some(mut files) = drain_stream(consumer, volume::list_read) else {
+			print(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
+			return;
+		};
 		sort_files(&mut files, key, reverse);
 		print(uri);
 		print(b":\n");

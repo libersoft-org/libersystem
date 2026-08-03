@@ -159,7 +159,9 @@ unsafe fn du(storage: u64, uri: String, summary_only: bool, human: bool, mode: O
 unsafe fn walk(client: &mut VolumeClient, uri: &str, depth: u32, usage: &mut Vec<DirUsage>) -> Option<u64> {
 	unsafe {
 		let consumer: u64 = client.list(uri)?;
-		let entries: Vec<FileInfo> = drain_stream(consumer, volume::list_read);
+		// Same as an unreadable directory: a total built from part of a listing is wrong,
+		// not merely small.
+		let entries: Vec<FileInfo> = drain_stream(consumer, volume::list_read)?;
 		let mut total: u64 = 0;
 		for e in &entries {
 			if e.r#type == FileType::Dir {

@@ -265,7 +265,7 @@ impl LiberMemFs {
 		let free = self.capacity.saturating_sub(self.footprint() as usize);
 		match self.resolve(parts)? {
 			// A rewrite may use what the file already holds, plus whatever is still free.
-			Some(Node::File(existing)) => Ok((existing.capacity() + free).min(MAX_FILE_BYTES)),
+			Some(Node::File(existing)) => Ok(existing.capacity().saturating_add(free).min(MAX_FILE_BYTES)),
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			// A new entry pays for its name out of the same free space.
 			None => {
@@ -643,8 +643,17 @@ impl LiberMemFs {
 	// Take ownership of `data` as the file at `parts`.
 	fn adopt(&mut self, parts: &[&str], data: Vec<u8>, is_new: bool) -> Result<(), FsError> {
 		if !is_new {
+			// Reusing the file's existing buffer when the new contents fit, exactly as an ordinary
+			// rewrite does. Assigning the incoming vector instead would silently COMPACT the file
+			// - the same logical shrink accounting differently depending on which API the caller
+			// reached for - and the document says a file keeps its allocation until it is removed.
 			let file = self.file_mut(parts)?;
-			*file = data;
+			if data.len() <= file.capacity() {
+				file.clear();
+				file.extend_from_slice(&data);
+			} else {
+				*file = data;
+			}
 			return Ok(());
 		}
 		let last = parts.last().copied().ok_or(FsError::BadName)?;

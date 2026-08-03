@@ -582,9 +582,12 @@ unsafe fn registry_generation(registry: &mut u64, artifact: &str) -> Option<Vec<
 		// held at the previous launch, which is worse than not resolving at all because it
 		// looks like it worked.
 		while channel_peek(handle) >= 0 {
-			if let ReceivedVec::Closed = recv_vec_blocking(handle) {
-				*registry = 0;
-				return None;
+			match recv_vec_blocking(handle) {
+				ReceivedVec::Closed | ReceivedVec::Failed => {
+					*registry = 0;
+					return None;
+				}
+				ReceivedVec::Message { .. } => {}
 			}
 		}
 		// Never block on this send. The registry is a development convenience whose whole
@@ -616,7 +619,8 @@ unsafe fn registry_generation(registry: &mut u64, artifact: &str) -> Option<Vec<
 					ReceivedVec::Message { bytes, .. } if bytes == REGISTRY_ANNOUNCEMENT => continue,
 					ReceivedVec::Message { bytes, .. } if !bytes.is_empty() => Some(bytes),
 					ReceivedVec::Message { .. } => None,
-					ReceivedVec::Closed => {
+					// Either way there is no answer coming on this channel.
+					ReceivedVec::Closed | ReceivedVec::Failed => {
 						*registry = 0;
 						None
 					}

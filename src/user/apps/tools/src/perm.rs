@@ -76,6 +76,10 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 					}
 				}
 				ReceivedVec::Closed => break,
+				ReceivedVec::Failed => {
+					print(b"perm: the audit stream ended abnormally; what is shown above is incomplete\n");
+					break;
+				}
 			}
 		}
 		close(consumer);

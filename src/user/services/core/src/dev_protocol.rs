@@ -491,6 +491,13 @@ impl Session {
 					launch.exited = true;
 					return;
 				}
+				// The launch is over either way, but its output was NOT delivered in full -
+				// mark it truncated so the buffered text is not read as everything it printed.
+				ReceivedVec::Failed => {
+					launch.truncated = true;
+					launch.exited = true;
+					return;
+				}
 			}
 		}
 	}

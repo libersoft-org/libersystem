@@ -9,7 +9,7 @@ record volume-status(label:string,total-bytes:u64,free-bytes:u64,compression:boo
 record fsck-report(checksum-failures:u32,damaged:list<string>)
 interface volume
 method volume.open op=1 (o:open-opts:rights=) -> result<open-result, liber:base@1::error>
-method volume.list op=2 (path:string:rights=) -> result<stream<file-info>, liber:base@1::error>
+method volume.list op=2 (path:string:rights=) -> stream<file-info>
 method volume.write op=3 (path:string:rights=,data:buffer:rights=) -> result<unit, liber:base@1::error>
 method volume.remove op=4 (path:string:rights=) -> result<unit, liber:base@1::error>
 method volume.snap-create op=5 (name:string:rights=) -> result<unit, liber:base@1::error>

@@ -666,7 +666,15 @@ pub unsafe fn recv_blocking(channel: u64, buf: &mut [u8]) -> Received {
 // its bytes and any transferred handle, or Closed once the peer is gone.
 pub enum ReceivedVec {
 	Message { bytes: alloc::vec::Vec<u8>, handle: u64 },
+	// The sender is done. THE ONLY ending that means end-of-file.
 	Closed,
+	// The receive itself failed - out of memory for the message, or the kernel refused it.
+	//
+	// Distinct from `Closed` because these used to BE `Closed`: a consumer accumulating a stream
+	// across several messages would stop, treat what it had as the whole thing, and report
+	// success. A listing came back short, a copy came back truncated, and nothing said so. The
+	// caller may still choose to stop here - it may NOT call the result complete.
+	Failed,
 }
 
 // What a BOUNDED receive can answer. Its own type rather than a third variant on `ReceivedVec`:
@@ -688,6 +696,9 @@ pub enum BoundedVec {
 	NoMemory { len: usize },
 	// The channel answered an error that is not a close.
 	ReceiveError,
+	// Nothing arrived before the caller's deadline. The sender may be slow, gone, or hostile; the
+	// receiver stops waiting either way.
+	Idle,
 }
 
 // The byte length of the next pending message without dequeuing it: >= 0, or
@@ -704,10 +715,10 @@ pub unsafe fn channel_peek(channel: u64) -> i64 {
 pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
 	match unsafe { recv_vec_bounded(channel, usize::MAX) } {
 		BoundedVec::Message { bytes, handle } => ReceivedVec::Message { bytes, handle },
-		// Unreachable with no ceiling, and closing is the safe reading of it either way.
-		// This caller sets no ceiling and cannot act on the distinction; everything that is not a
-		// message ends its loop.
-		BoundedVec::PeerClosed | BoundedVec::TooLarge { .. } | BoundedVec::NoMemory { .. } | BoundedVec::ReceiveError => ReceivedVec::Closed,
+		BoundedVec::PeerClosed => ReceivedVec::Closed,
+		// `TooLarge` and `Idle` cannot arise here - this caller sets no ceiling and no deadline -
+		// but they are not end-of-file either, so they fold in with the two that can.
+		BoundedVec::NoMemory { .. } | BoundedVec::ReceiveError | BoundedVec::TooLarge { .. } | BoundedVec::Idle => ReceivedVec::Failed,
 	}
 }
 
@@ -719,11 +730,34 @@ pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
 // of the receiver's memory to take.
 #[unsafe(no_mangle)]
 pub unsafe fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
+	unsafe { recv_vec_deadline(channel, max, 0) }
+}
+
+// The same, giving up at `deadline` (absolute LAPIC ticks, the unit `wait` takes and `clock()`
+// reports; 0 waits forever).
+//
+// Ticks and not nanoseconds: `clock_ns()` exists and reads a different clock, and passing its
+// value here makes the deadline a number so large the wait never expires - a hang that looks like
+// a deadlock rather than a wrong unit.
+//
+// A service that reads from an untrusted peer inside its own serve loop cannot wait without a
+// limit: a client that opens a stream, sends nothing and keeps the channel open holds the whole
+// service - every other client, every other volume - for as long as it likes. Waiting forever is
+// only safe when the peer is trusted to finish.
+#[unsafe(no_mangle)]
+pub unsafe fn recv_vec_deadline(channel: u64, max: usize, deadline: u64) -> BoundedVec {
 	unsafe {
 		loop {
 			let pending: i64 = channel_peek(channel);
 			if pending == ERR_WOULD_BLOCK {
-				wait(channel, 0);
+				if deadline != 0 && clock() >= deadline {
+					return BoundedVec::Idle;
+				}
+				// PERIODIC deliberately. A plain timed wait counts as pending progress, and
+				// `run_until_idle` then HALTS until the deadline whenever the run queue empties -
+				// so a service guarding an idle stream stalls the very peer that would feed it.
+				// This wait is a guard, not progress: the kernel still wakes it when due.
+				wait_periodic(channel, deadline);
 				continue;
 			}
 			if pending == ERR_PEER_CLOSED {
@@ -764,7 +798,12 @@ pub unsafe fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
 // and collect the items (the producer closing the channel marks end-of-stream).
 // The consumer handle is closed. A consumer that renders incrementally loops over
 // `recv_vec_blocking` by hand instead.
-pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64, read: F) -> alloc::vec::Vec<T> {
+//
+// `None` when the stream ended abnormally - out of memory, or a channel error. The items
+// collected so far are DISCARDED rather than returned, because a caller handed a plain vector
+// cannot tell a short listing from a complete one and every caller here goes on to count, total
+// or print it as the whole answer.
+pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
 	unsafe {
 		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
 		loop {
@@ -778,10 +817,14 @@ pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64
 					}
 				}
 				ReceivedVec::Closed => break,
+				ReceivedVec::Failed => {
+					close(consumer);
+					return None;
+				}
 			}
 		}
 		close(consumer);
-		items
+		Some(items)
 	}
 }
 

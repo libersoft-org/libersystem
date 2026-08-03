@@ -116,7 +116,9 @@ unsafe fn serve(channel: u64, bootstrap: u64, storage: u64, nonce: [u8; 8]) -> !
 					}
 					ReceivedVec::Message { bytes, .. } => pending.extend_from_slice(&bytes),
 					// The driver is gone, so there is no channel left to serve or answer on.
-					ReceivedVec::Closed => exit(),
+					// A failed receive ends the session the same way - it cannot be served
+					// either - but it is a DIFFERENT fact, and folding the two hid it.
+					ReceivedVec::Closed | ReceivedVec::Failed => exit(),
 				}
 				arrived = true;
 				// A driver that stopped accepting replies is as good as gone for this session.

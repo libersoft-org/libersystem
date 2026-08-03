@@ -243,9 +243,10 @@ doing it silently is how a caller loses more than it meant to.
 It takes the whole capacity at mount, so a mount fails when the memory is not available and
 nothing else in the process can take it afterwards. That much is a guarantee.
 
-What it cannot promise is that the memory comes BACK. The reservation is one contiguous
-allocation, so after deletes fragment the heap the total free memory can cover it while no single
-block does; the regrow is best effort and the volume then holds less than its capacity.
+What it cannot promise is that the memory comes BACK. The regrow is best effort: after deletes
+fragment the heap, a chunk of the size wanted may not be there and the volume then holds less than
+its capacity. Holding it in several chunks makes that far less likely than one block would - a heap
+with no 33 MiB block very often has two of 16 - but it does not make it impossible.
 `reservation_intact()` says whether it still does, and `free()` reports the smaller figure, so a
 degraded volume is visible rather than merely documented. A guarantee that cannot degrade needs an
 arena the volume allocates everything from - files, names and nodes - and hands nothing back to the
