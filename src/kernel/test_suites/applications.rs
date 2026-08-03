@@ -360,6 +360,14 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	// The sender holds its end OPEN and sends nothing, so a reply can only be a decision about the
 	// destination. An empty stream would not test this: dropping the sender ends it cleanly and the
 	// refusal then comes from the write at the end, exactly as it did before the plan existed.
+	// A sender that drips one byte at a time, always inside the idle window, is still ended.
+	//
+	// The idle deadline is rebuilt after every chunk, so this sender is NEVER idle - it renewed
+	// its window forever and held the service with it. The total deadline, fixed when the request
+	// arrives and immune to anything the sender does, is what ends it.
+	let mut slow = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(slow.stream_slowloris(b"vol://tmp/drip", 0x7306, 400, 4), "a sender that stays just inside the idle window is still given up on");
+
 	let mut readonly = StorageHarness::start_archive(storage_elf);
 	assert!(readonly.stream_refused_before_sending(b"vol://system/anything", 0x7305), "a stream to a read-only volume is refused before the sender offers a byte");
 	assert_eq!(streamed.open(b"vol://tmp/f", 0x7305), Some(b"new contents".to_vec()), "and the destination still holds what it held - no prefix was written");

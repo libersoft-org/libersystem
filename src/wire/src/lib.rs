@@ -455,9 +455,16 @@ impl<'a> Reader<'a> {
 		self.take(n)
 	}
 
+	// Fallible in its ALLOCATION as well as its parse. `bytes.to_vec()` aborts the process through
+	// the allocation error handler when the heap is short, which turned a decoder into a second
+	// way for a message to kill its receiver - the one place the transport had just been taught
+	// not to. `None` covers both endings, and every caller already treats it as a failed frame.
 	pub fn string_lp(&mut self) -> Option<String> {
 		let bytes = self.bytes_lp()?;
-		String::from_utf8(bytes.to_vec()).ok()
+		let mut owned: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		owned.try_reserve_exact(bytes.len()).ok()?;
+		owned.extend_from_slice(bytes);
+		String::from_utf8(owned).ok()
 	}
 }
 

@@ -815,12 +815,25 @@ pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64
 		loop {
 			match recv_vec_blocking(consumer) {
 				ReceivedVec::Message { bytes, mut handle } => {
-					if let Some(item) = read(&bytes, &mut handle) {
-						items.push(item);
-					}
+					let decoded = read(&bytes, &mut handle);
 					if handle != 0 {
 						close(handle);
 					}
+					// A frame that will not decode ENDS the stream. Skipping it and carrying on
+					// returned a short list as a complete one - the same defect the transport was
+					// just fixed for, one layer down in the decoder.
+					let Some(item) = decoded else {
+						close(consumer);
+						return None;
+					};
+					// Fallible for the same reason the message buffer is: growing this vector with
+					// `push` aborts the process through the allocation error handler, so a caller
+					// that asked for a listing could be killed by one instead of being told.
+					if items.try_reserve(1).is_err() {
+						close(consumer);
+						return None;
+					}
+					items.push(item);
 				}
 				ReceivedVec::Closed => break,
 				ReceivedVec::Failed => {

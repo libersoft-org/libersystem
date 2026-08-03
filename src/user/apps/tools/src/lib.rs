@@ -132,6 +132,10 @@ pub enum ListDirectoryError {
 	Unavailable,
 	TooManyEntries,
 	OutOfMemory,
+	// A frame arrived that would not decode. Its own ending rather than one of the above, because
+	// the answer to it is different: retrying an out-of-memory listing may work, retrying a
+	// malformed one will not.
+	Malformed,
 }
 
 /// Collect at most `limit` typed directory entries from a granted volume client.
@@ -152,7 +156,14 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 					if handle != 0 {
 						close(handle);
 					}
-					if let Some(entry) = entry {
+					// A frame that will not decode ends the listing rather than being dropped from
+					// it: the caller asked what is in a directory and must not be handed a shorter
+					// answer that looks whole.
+					let Some(entry) = entry else {
+						close(consumer);
+						return Err(ListDirectoryError::Malformed);
+					};
+					{
 						if entries.len() == limit {
 							close(consumer);
 							return Err(ListDirectoryError::TooManyEntries);

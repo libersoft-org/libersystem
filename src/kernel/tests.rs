@@ -2548,6 +2548,38 @@ impl StorageHarness {
 		false
 	}
 
+	// A sender that never goes idle but never finishes: one byte, then pumping until the idle
+	// window would have expired, over and over. Returns true if the service gave up on it.
+	//
+	// This is the case the idle deadline alone did NOT cover. That deadline is rebuilt after every
+	// chunk, so a sender drip-feeding just under it renews its window forever while never being
+	// idle - and the service, receiving synchronously, is unavailable to everyone else for as long
+	// as the sender cares to continue.
+	fn stream_slowloris(&mut self, path: &[u8], corr: u32, drips: usize, pumps_per_drip: usize) -> bool {
+		use object::channel::{Channel, Message};
+		use object::rights::Rights;
+		let (service_side, our_side) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&16u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&self.client, &request, service_side, Rights::ALL).expect("storage write-stream request");
+		for _ in 0..drips {
+			let _ = our_side.send(Message::new(alloc::vec![b'.'], alloc::vec::Vec::new(), 0));
+			for _ in 0..pumps_per_drip {
+				self.pump();
+				if let Ok(reply) = self.client.recv() {
+					// The service ended it. A refusal is the pass: the sender is still holding the
+					// channel open and still willing to send more.
+					return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&0);
+				}
+			}
+		}
+		false
+	}
+
 	fn write(&mut self, path: &[u8], data: &[u8], corr: u32) -> bool {
 		use object::memory_object::MemoryObject;
 		use object::rights::Rights;

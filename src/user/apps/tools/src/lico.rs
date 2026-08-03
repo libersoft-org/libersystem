@@ -353,6 +353,7 @@ fn list_error(error: ListDirectoryError) -> &'static [u8] {
 		ListDirectoryError::Unavailable => b"selected volume is unavailable",
 		ListDirectoryError::TooManyEntries => b"directory exceeds the 4096-entry panel bound",
 		ListDirectoryError::OutOfMemory => b"not enough memory for the directory listing",
+		ListDirectoryError::Malformed => b"the directory listing arrived damaged and was not shown in part",
 	}
 }
 

@@ -99,6 +99,33 @@ const FS_START_SECTOR: u64 = 0;
 // whole of the improvement.
 // The LAPIC timer runs at 100 Hz, so a tick is 10 ms and this is thirty seconds.
 const STREAM_IDLE_TICKS: u64 = 3_000;
+
+// The most a whole stream may take, counted from the request rather than from the last chunk.
+//
+// The idle deadline alone bounds SILENCE, not slowness: it is rebuilt after every chunk, so a
+// sender that emits one byte just before each window expires renews it forever and holds the
+// serve loop for as long as it likes. Two deadlines are needed because they answer different
+// questions - "has this sender gone away?" and "has this operation run long enough?" - and
+// neither implies the other.
+//
+// Five minutes: long enough that a slow but genuine transfer of the largest stream this service
+// accepts is not cut off, short enough that a client cannot own the service for an afternoon.
+const STREAM_TOTAL_TICKS: u64 = 30_000;
+
+// A stream that has sent this many chunks must be averaging at least `STREAM_MIN_CHUNK` bytes in
+// each, or it is refused.
+//
+// The time-based deadlines bound how LONG a sender may hold the service. This bounds how much
+// WORK it may cost per byte delivered, and that is what a slowloris actually is: a sender that is
+// never idle and never finished, drip-feeding a byte at a time. Bounding the pattern rather than
+// the clock also makes it checkable without one - the deadlines depend on real elapsed time, which
+// no test here can fast-forward.
+//
+// The allowance is deliberately loose: 256 chunks before the rule applies at all, and 64 bytes
+// average after that. A small file sent in small pieces never reaches the first, and a client
+// sending 4 KiB chunks is 64x clear of the second.
+const STREAM_CHUNK_GRACE: usize = 256;
+const STREAM_MIN_CHUNK: usize = 64;
 const FS_BLOCKS: u64 = 8192;
 
 // An ISO9660 logical block (2048 bytes) is this many 512-byte disk sectors; one
@@ -619,18 +646,26 @@ impl Volume {
 		// per-file maximum, because a stream must be bounded by SOMETHING before it accepts a byte
 		// - unlike an ordinary write, where the whole payload already exists and the backend can
 		// simply refuse it.
-		let limit: usize = {
+		// The ceiling AND where it came from. Exceeding the two means different things to a client:
+		// a filesystem's ceiling is the space it has, so a later attempt may fit, while
+		// `STREAM_ACCUMULATION` is this service's own policy and no amount of waiting changes it.
+		// Reporting both as `Again` told a client to retry something that can only fail.
+		let (limit, limit_is_policy): (usize, bool) = {
 			let name: &[u8] = self.writable_name(path)?;
 			match self.fs.write_plan(name) {
 				// A read-only volume, a missing parent, a directory in the way: refused HERE,
 				// before a byte is accepted, which is what the plan exists for.
 				WritePlan::Refused(e) => return Err(e),
-				WritePlan::Allowed { max_len: Some(max) } => max,
-				WritePlan::Allowed { max_len: None } => STREAM_ACCUMULATION,
+				WritePlan::Allowed { max_len: Some(max) } => (max, false),
+				WritePlan::Allowed { max_len: None } => (STREAM_ACCUMULATION, true),
 			}
 		};
 
+		// Fixed once, before the first chunk: a total deadline that a sender cannot push back by
+		// sending something.
+		let expires = unsafe { clock() }.saturating_add(STREAM_TOTAL_TICKS);
 		let mut bytes: Vec<u8> = Vec::new();
+		let mut chunks: usize = 0;
 		loop {
 			// Bounded at RECEPTION. The accumulation check below cannot help if a single chunk
 			// has already been allocated at whatever size the sender chose.
@@ -643,7 +678,12 @@ impl Volume {
 			// A deadline bounds the harm rather than removing it: the service is still unavailable
 			// while it waits. Streams belong in the event loop as pending operations, which is a
 			// larger change and is recorded as such.
-			let deadline = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
+			//
+			// The EARLIER of the two deadlines: idle (has the sender gone away) and total (has this
+			// operation run long enough). Taking the idle one alone let a sender renew its window
+			// with a single byte and hold the service indefinitely while never being idle.
+			let idle = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
+			let deadline = core::cmp::min(idle, expires);
 			match unsafe { recv_vec_deadline(data, limit.saturating_sub(bytes.len()), deadline) } {
 				BoundedVec::Message { bytes: chunk, handle } => {
 					// A stream carries plain messages. A client that transfers a capability
@@ -658,6 +698,12 @@ impl Volume {
 						return Err(Error::Again);
 					}
 					bytes.extend_from_slice(&chunk);
+					chunks += 1;
+					// Refused as malformed rather than retryable: a sender behaving this way will
+					// behave the same way if it tries again.
+					if chunks > STREAM_CHUNK_GRACE && bytes.len() / chunks < STREAM_MIN_CHUNK {
+						return Err(Error::Invalid);
+					}
 				}
 				// Over the limit, or refused before it was allocated. Stop reading rather than
 				// draining politely: a sender that keeps writing would otherwise hold this
@@ -666,7 +712,9 @@ impl Volume {
 				// `Again` throughout, matching the ordinary write: the request was well formed and
 				// the volume could not take it now. Reporting `Invalid` here made the same refusal
 				// look permanent through one transport and retryable through the other.
-				BoundedVec::TooLarge { .. } => return Err(Error::Again),
+				BoundedVec::TooLarge { .. } => return Err(if limit_is_policy { Error::Invalid } else { Error::Again }),
+				// Both deadlines surface here; `Again` fits either, because the request was well
+				// formed and a later attempt may succeed.
 				BoundedVec::Idle => return Err(Error::Again),
 				// NOT an end of file. Running out of memory, or a channel error, used to look
 				// exactly like the sender finishing - so the prefix received so far was written
@@ -1093,15 +1141,19 @@ unsafe fn live_volume(handle: u64) -> Option<LiberMemFs> {
 	// names cost, and a buffer keeps the capacity it grew to. Guessing from the image size is how
 	// a copy runs out of room half way through.
 	let mut source = LiberFs::mount(ImageDevice { bytes: image })?;
-	let wanted = match measure(&mut source, b"") {
-		Some(bytes) => bytes + bytes / 4 + 4 * 1024 * 1024,
+	// Checked throughout, matching `measure` itself. Corrupt metadata that measures near the top
+	// of the address space would otherwise panic in debug and WRAP in release - and a wrapped
+	// total sizes the volume far too small, which is the worst of the three outcomes because it
+	// looks like a successful mount.
+	let wanted = match measure(&mut source, b"", 0) {
+		Some(bytes) => bytes.checked_add(bytes / 4)?.checked_add(4 * 1024 * 1024)?,
 		None => return None,
 	};
 	let mut live = LiberMemFs::mount(MemPolicy::Capped, wanted).ok()?;
 	// Every failure stops the import. A live system that comes up missing executables because a
 	// write was refused half way through is worse than one that refuses to come up: the first is
 	// discovered by whoever needed the missing file.
-	let copied = copy_tree(&mut source, &mut live, b"")?;
+	let copied = copy_tree(&mut source, &mut live, b"", 0)?;
 	unsafe {
 		print(b"storage: vol://system is a live copy in memory (the medium is never written)\n");
 	}
@@ -1110,7 +1162,15 @@ unsafe fn live_volume(handle: u64) -> Option<LiberMemFs> {
 }
 
 // The bytes a source subtree holds, so the live volume can be sized before anything is copied.
-fn measure(source: &mut LiberFs<ImageDevice>, dir: &[u8]) -> Option<usize> {
+// The deepest the import walks. A source image may nest deeper than the destination accepts, and
+// the destination refuses the PATH at write time - after the walk has already recursed that far on
+// a kernel stack. Bounded here, where the recursion is, rather than trusted to the far end.
+const IMPORT_MAX_DEPTH: u32 = 16;
+
+fn measure(source: &mut LiberFs<ImageDevice>, dir: &[u8], depth: u32) -> Option<usize> {
+	if depth > IMPORT_MAX_DEPTH {
+		return None;
+	}
 	let entries = (if dir.is_empty() { source.list() } else { source.read_dir(dir) }).ok()?;
 	let mut total = 0usize;
 	for (name, size, is_dir, _, _) in entries.into_iter() {
@@ -1123,7 +1183,7 @@ fn measure(source: &mut LiberFs<ImageDevice>, dir: &[u8]) -> Option<usize> {
 		path.extend_from_slice(&name);
 		total = total.checked_add(name.len())?;
 		if is_dir {
-			total = total.checked_add(measure(source, &path)?)?;
+			total = total.checked_add(measure(source, &path, depth + 1)?)?;
 		} else {
 			total = total.checked_add(size as usize)?;
 		}
@@ -1136,7 +1196,10 @@ fn measure(source: &mut LiberFs<ImageDevice>, dir: &[u8]) -> Option<usize> {
 // Returns the number of files copied, or None at the FIRST failure. Ignoring failures let a
 // directory that could not be created be recursed into anyway, so every file under it failed on a
 // missing parent and was dropped too - silently, with the volume then reported as ready.
-fn copy_tree(source: &mut LiberFs<ImageDevice>, live: &mut LiberMemFs, dir: &[u8]) -> Option<usize> {
+fn copy_tree(source: &mut LiberFs<ImageDevice>, live: &mut LiberMemFs, dir: &[u8], depth: u32) -> Option<usize> {
+	if depth > IMPORT_MAX_DEPTH {
+		return None;
+	}
 	let entries = (if dir.is_empty() { source.list() } else { source.read_dir(dir) }).ok()?;
 	let mut copied = 0usize;
 	for (name, _, is_dir, _, _) in entries.into_iter() {
@@ -1149,7 +1212,7 @@ fn copy_tree(source: &mut LiberFs<ImageDevice>, live: &mut LiberMemFs, dir: &[u8
 		path.extend_from_slice(&name);
 		if is_dir {
 			live.mkdir(&path).ok()?;
-			copied += copy_tree(source, live, &path)?;
+			copied += copy_tree(source, live, &path, depth + 1)?;
 		} else {
 			// Handed over by ownership: the bytes are already allocated, so the live volume adopts
 			// them instead of making a third copy of every file on the medium.
