@@ -35,12 +35,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 1b. receive the ramdisk volume buffer to delegate to StorageService. We never
 	//     map it ourselves - just hold the capability and its length to pass down.
-	let (ramdisk_handle, ramdisk_len): (u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
+	//
+	//     TWO tags arrive here, and this process does not care which: `RAMDISK` is an archive to
+	//     unpack, `LIVEVOL` a whole LiberFS image to mount, and only StorageService acts on the
+	//     difference. What matters is that the tag is RELAYED rather than rewritten - accepting
+	//     both and forwarding one would tell ServiceManager the wrong thing about a live medium.
+	//
+	//     Accepting only `RAMDISK` here is what kept the LiveCD from booting: the tag did not
+	//     match, the arm below exited, and the boot chain stopped before its first service with
+	//     nothing said. Hence the report on the way out - a bootstrap that cannot proceed should
+	//     name what it received, not vanish.
+	let (volume_tag, ramdisk_handle, ramdisk_len): ([u8; 7], u64, usize) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && (&buf[..7] == b"RAMDISK" || &buf[..7] == b"LIVEVOL") => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
-			(handle, length)
+			let mut tag: [u8; 7] = [0u8; 7];
+			tag.copy_from_slice(&buf[..7]);
+			(tag, handle, length)
 		}
-		_ => exit(),
+		_ => {
+			unsafe { print(b"SystemManager: expected RAMDISK or LIVEVOL in the bootstrap; boot chain stops here\n") };
+			exit()
+		}
 	};
 
 	// 1b2. receive the power capability - a root-Domain handle carrying MANAGE, which is what
@@ -85,7 +100,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		pkg_msg[7..].copy_from_slice(&(pkg_len as u64).to_le_bytes());
 		send_blocking(sm_side, &pkg_msg, pkg_handle);
 		let mut rd_msg: [u8; 7 + 8] = [0u8; 7 + 8];
-		rd_msg[..7].copy_from_slice(b"RAMDISK");
+		rd_msg[..7].copy_from_slice(&volume_tag);
 		rd_msg[7..].copy_from_slice(&(ramdisk_len as u64).to_le_bytes());
 		send_blocking(sm_side, &rd_msg, ramdisk_handle);
 		send_blocking(sm_side, b"POWER", power);

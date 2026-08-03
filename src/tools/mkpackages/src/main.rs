@@ -792,6 +792,16 @@ fn export_cross_arch_volume() {
 			let bytes: Vec<u8> = fs::read(&vol_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", vol_src.display()));
 			write_if_changed(&build_dir.join(format!("volume-{arch}.pkg")), &bytes);
 		}
+		// `init.pkg` is written under one name by EVERY architecture's build, so the copy in
+		// `.build/boot` is simply whichever built last. That is invisible until something reads it
+		// by that name: the UEFI ESP builder did, and staged x86_64 programs onto a riscv64 boot
+		// disk, where the kernel loaded the package fine and then failed to start SystemManager
+		// because its ELF was for another machine. Exported per architecture for the same reason
+		// the volume already is.
+		if init_src.exists() {
+			let bytes: Vec<u8> = fs::read(&init_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", init_src.display()));
+			write_if_changed(&build_dir.join(format!("init-{arch}.pkg")), &bytes);
+		}
 		if vol_src.exists() && init_src.exists() {
 			let init: Vec<u8> = fs::read(&init_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", init_src.display()));
 			let volume: Vec<u8> = fs::read(&vol_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", vol_src.display()));

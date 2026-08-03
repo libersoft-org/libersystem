@@ -2,7 +2,10 @@
 # mkimage.sh - assemble bootable OS images from the kernel ELF.
 #
 # Subcommands:
-#   mkimage.sh iso <kernel-elf>          build a UEFI-only bootable CD image (.iso)
+#   mkimage.sh iso <kernel-elf>          build the shipping CD image (.iso): system volume, no
+#                                        factory archive
+#   mkimage.sh testiso <kernel-elf>      build the test CD image (-test.iso): the factory archive
+#                                        the kernel suite needs as its fixture
 #   mkimage.sh img <kernel-elf> [size]   build a raw UEFI-only disk image (.img)
 #
 # The platform is UEFI-only and boots through the own loader. Both images carry a
@@ -98,11 +101,11 @@ verify_boot_artifacts() {
 # build a hybrid ISO (BIOS El Torito + UEFI), bootable as a CD or off a USB stick
 # build a UEFI-only ISO, bootable as a CD or off a USB stick
 make_iso() {
-	local kernel="$1" live="${2:-0}"
+	local kernel="$1" test_medium="${2:-0}"
 	local final="$BUILD/$SLUG.iso" out="$BUILD/$SLUG.iso.$$.candidate"
-	if [[ "$live" == "1" ]]; then
-		final="$BUILD/$SLUG-live.iso"
-		out="$BUILD/$SLUG-live.iso.$$.candidate"
+	if [[ "$test_medium" == "1" ]]; then
+		final="$BUILD/$SLUG-test.iso"
+		out="$BUILD/$SLUG-test.iso.$$.candidate"
 	fi
 	local iso_root="$BUILD/iso_root"
 	rm -f "$out"
@@ -117,14 +120,23 @@ make_iso() {
 	# around it only carries this image as its UEFI El Torito boot entry.
 	local efi_img="$BUILD/efiboot.img"
 	local bytes total
-	# The live medium carries the system VOLUME - a LiberFS image the running system copies into
-	# memory - where the test medium carries the factory archive its kernel suite uses as a
-	# fixture. One product each: a shipping ISO with no archive, and a test ISO with no volume.
-	local payload="$BUILD/$VOLUME_PACKAGE" payload_name="$VOLUME_PACKAGE"
-	if [[ "$live" == "1" ]]; then
-		payload="$BUILD/system-volume-x86_64.img"
-		payload_name="system-volume.img"
-		[[ -f "$payload" ]] || die "liveiso: no system volume at $payload (run \`just system-volume\`)"
+	# TWO media, one builder. The SHIPPING ISO carries the system VOLUME - a LiberFS image the
+	# running system copies into memory, because a CD cannot be written - and no factory archive.
+	# The TEST ISO carries the archive instead, because the x86_64 kernel suite boots this exact
+	# artifact and reads `volume.pkg` twice: as the source its fixture volume is built from, and as
+	# the table of expected file contents.
+	#
+	# The split is the point of the item, and it was briefly collapsed on the belief that nothing
+	# booted the archive-carrying ISO. The device-tree runners do build their own ESP - but the
+	# x86_64 runner calls this script and boots what it returns, which is how a shipping medium and
+	# a test medium had become one artifact in the first place.
+	local payload="$BUILD/system-volume-x86_64.img" payload_name="system-volume.img"
+	if [[ "$test_medium" == "1" ]]; then
+		payload="$BUILD/$VOLUME_PACKAGE"
+		payload_name="$VOLUME_PACKAGE"
+		[[ -f "$payload" ]] || die "testiso: no volume package at $payload (run \`just packages\`)"
+	else
+		[[ -f "$payload" ]] || die "iso: no system volume at $payload (run \`just system-volume\`)"
 	fi
 	bytes=$(($(stat -c%s "$staged") + $(stat -c%s "$BUILD/$INIT_PACKAGE") + $(stat -c%s "$payload") + $(stat -c%s "$LOADER_EFI")))
 	# FAT overhead + slack, rounded up to a whole MiB (min 32 MiB).
@@ -243,15 +255,15 @@ iso)
 	output="$BUILD/$SLUG.iso"
 	mode_input="iso"
 	;;
-liveiso)
-	output="$BUILD/$SLUG-live.iso"
-	mode_input="liveiso"
+testiso)
+	output="$BUILD/$SLUG-test.iso"
+	mode_input="testiso"
 	;;
 img)
 	output="$BUILD/$SLUG.img"
 	mode_input="img:${3:-64M}"
 	;;
-*) die "unknown subcommand '$cmd' (expected 'iso', 'liveiso' or 'img')" ;;
+*) die "unknown subcommand '$cmd' (expected 'iso', 'testiso' or 'img')" ;;
 esac
 
 # The same manifest-driven check as the image builders below, run before the cache key is
@@ -263,7 +275,10 @@ key="$({
 	printf 'format=liber-boot-image-input-v1\n'
 	printf 'mode=%s\n' "$mode_input"
 	printf 'strip=%s\n' "$STRIP"
-	sha256sum "$0" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/$INIT_PACKAGE" "$BUILD/$VOLUME_PACKAGE"
+	# BOTH payloads are hashed, whichever medium is being built: the shipping ISO carries the
+	# system volume and the test ISO the archive, and keying on only one would serve a stale image
+	# whenever the other changed. `mode=` above already separates the two outputs.
+	sha256sum "$0" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/$INIT_PACKAGE" "$BUILD/$VOLUME_PACKAGE" "$BUILD/system-volume-x86_64.img"
 } | sha256sum | awk '{print $1}')"
 if [[ -f "$output" && -f "$key_file" && "$(<"$key_file")" == "$key" ]]; then
 	info "cache hit $output"
@@ -274,7 +289,7 @@ info "cache miss $output; rebuilding"
 
 case "$cmd" in
 iso) make_iso "$kernel" 0 ;;
-liveiso) make_iso "$kernel" 1 ;;
+testiso) make_iso "$kernel" 1 ;;
 img) make_img "$kernel" "${3:-64M}" ;;
 esac
 printf '%s\n' "$key" >"$key_file.tmp.$$"

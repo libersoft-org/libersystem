@@ -309,8 +309,16 @@ qemu_build_esp() {
 	# The boot packages, so the loader has something to hand over. Without them a UEFI boot comes
 	# up with no userspace at all - the device-tree architectures used to get theirs from an
 	# archive the runner laid in RAM, which the loader path does not use.
-	[[ -f "$QEMU_BUILD_DIR/init.pkg" ]] && mcopy -i "$ESP" "$QEMU_BUILD_DIR/init.pkg" ::/init.pkg
-	[[ -f "$QEMU_BUILD_DIR/volume.pkg" ]] && mcopy -i "$ESP" "$QEMU_BUILD_DIR/volume.pkg" ::/volume.pkg
+	#
+	# ARCHITECTURE-QUALIFIED, and staged under the plain name the loader looks for. Every build
+	# writes `.build/boot/init.pkg`, so that file is whichever architecture was built last -
+	# taking it verbatim put x86_64 programs on a riscv64 ESP and the boot died at
+	# "failed to load SystemManager", one step after a loader hand-off that had gone perfectly.
+	local init_pkg="$QEMU_BUILD_DIR/init-${arch}.pkg" volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
+	[[ -f "$init_pkg" ]] || init_pkg="$QEMU_BUILD_DIR/init.pkg"
+	[[ -f "$volume_pkg" ]] || volume_pkg="$QEMU_BUILD_DIR/volume.pkg"
+	[[ -f "$init_pkg" ]] && mcopy -i "$ESP" "$init_pkg" ::/init.pkg
+	[[ -f "$volume_pkg" ]] && mcopy -i "$ESP" "$volume_pkg" ::/volume.pkg
 }
 
 normalize_arch() {
@@ -453,9 +461,13 @@ qemu_run_x86_64() {
 	# BOOTX64.EFI); it lives in its own crate with its own UEFI target.
 	(cd "$HERE/../loader" && cargo build) >&2
 
-	# Build the bootable ISO (mkimage.sh prints its path on stdout)
-	local iso
-	iso="$("$HERE/mkimage.sh" iso "$kernel")"
+	# Build the bootable ISO (mkimage.sh prints its path on stdout).
+	#
+	# The suite boots the TEST medium: it reads `volume.pkg` off it as its fixture source and as
+	# the table of expected file contents, which the shipping ISO deliberately no longer carries.
+	local iso iso_mode="iso"
+	[[ "${TEST:-0}" == "1" ]] && iso_mode="testiso"
+	iso="$("$HERE/mkimage.sh" "$iso_mode" "$kernel")"
 
 	# UEFI firmware (OVMF): the platform boots through UEFI, not SeaBIOS - the ISO is
 	# hybrid, and development deliberately exercises the UEFI path (the own UEFI-only
@@ -860,6 +872,21 @@ qemu_run_riscv64() {
 
 	if [[ "$uefi" == "1" ]]; then
 		# Boot through the own UEFI loader under U-Boot.
+		#
+		# U-Boot is clamped to at most 8 harts, and this is not tidiness - it is the whole reason
+		# this path "produced no output at all". `-smp` defaults to `nproc`, and on a host with
+		# enough cores that number is passed straight through: measured 2026-08-03, this U-Boot
+		# build prints its banner at 50 harts and prints NOTHING at 51, so a 52-core host got a
+		# silent failure that looked like the loader or the hand-rolled EFI image was at fault.
+		# OpenSBI still ran and still logged, which is what made it read as a boot that got
+		# further than it did.
+		#
+		# The clamp is announced rather than silent: overriding an explicit SMP= without saying so
+		# is how a measurement gets attributed to the wrong core count.
+		if ((smp > 8)); then
+			echo "qemu-run: riscv64 UEFI: capping -smp $smp to 8 (U-Boot stops booting above ~50 harts)" >&2
+			smp=8
+		fi
 		local loader_efi="${LOADER_EFI:-$REPO_ROOT/.build/cargo/loader/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi}"
 		[[ -f "$loader_efi" ]] || {
 			echo "qemu-run: loader EFI not found: $loader_efi (run 'just loader-riscv64')" >&2

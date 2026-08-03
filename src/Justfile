@@ -502,8 +502,8 @@ test-preflight-riscv64: sdk user-riscv64 test-tags-check
     tools/check-staged-image.sh riscv64
     boot/test-preflight.sh write riscv64
 
-test-riscv64: test-preflight-riscv64
-    boot/test-kernel.sh riscv64
+test-riscv64: test-preflight-riscv64 loader-riscv64
+    UEFI={{ env('UEFI', '1') }} boot/test-kernel.sh riscv64
 
 # Run the union of the requested riscv64 tags plus the smoke set.
 test-tags-riscv64 tags: test-preflight-riscv64
@@ -769,14 +769,13 @@ dev-launch *args:
 dev-down *args:
     @boot/lab.py dev-down {{ args }}
 
-# build the LiveCD: a bootable ISO whose system volume is copied into memory at boot, so the
-# medium is never written to and the machine needs no disk. Carries the LiberFS system volume
-# rather than the factory archive - the shipping ISO has no archive at all.
-liveiso strip="debug": build
-    STRIP={{ strip }} boot/mkimage.sh liveiso {{ kernel_elf }}
-
-# build a bootable hybrid ISO (BIOS + UEFI) -> .build/boot/<product>.iso; STRIP=debug|all
-iso strip="debug": build
+# build the bootable ISO -> .build/boot/<product>.iso; STRIP=debug|all
+#
+# This IS the LiveCD, and it is the only ISO: the system volume it carries is copied into memory
+# at boot, so the medium is never written and the machine needs no disk. It carries no factory
+# archive - `liveiso` used to build this separately and the two have been one product since the
+# archive left the shipping medium.
+iso strip="debug": build (system-volume "x86_64")
     STRIP={{ strip }} boot/mkimage.sh iso {{ kernel_elf }}
 
 # build a raw bootable disk image for USB / SD card / HDD (BIOS + UEFI); SIZE e.g. 128M, 1G; STRIP=debug|all
