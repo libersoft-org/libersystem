@@ -674,10 +674,20 @@ pub enum ReceivedVec {
 // have meant eight arms for a case that cannot arise there.
 pub enum BoundedVec {
 	Message { bytes: alloc::vec::Vec<u8>, handle: u64 },
-	Closed,
+	// The sender is done. THE ONLY ending a caller may read as end-of-file.
+	//
+	// The other three used to be this one, and a receiver collecting a file could not tell "the
+	// sender finished" from "this receiver ran out of memory" - so an out-of-memory in the middle
+	// of a streamed write looked like a complete file and a truncated prefix was saved over the
+	// original. Distinguishing them is the whole point of this type.
+	PeerClosed,
 	// Larger than the receiver said it would hold. Refused WITHOUT allocating for it, which is
 	// the only useful moment to refuse.
 	TooLarge { len: usize },
+	// The receiver could not allocate room for the message. The message is still pending.
+	NoMemory { len: usize },
+	// The channel answered an error that is not a close.
+	ReceiveError,
 }
 
 // The byte length of the next pending message without dequeuing it: >= 0, or
@@ -695,7 +705,9 @@ pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
 	match unsafe { recv_vec_bounded(channel, usize::MAX) } {
 		BoundedVec::Message { bytes, handle } => ReceivedVec::Message { bytes, handle },
 		// Unreachable with no ceiling, and closing is the safe reading of it either way.
-		BoundedVec::Closed | BoundedVec::TooLarge { .. } => ReceivedVec::Closed,
+		// This caller sets no ceiling and cannot act on the distinction; everything that is not a
+		// message ends its loop.
+		BoundedVec::PeerClosed | BoundedVec::TooLarge { .. } | BoundedVec::NoMemory { .. } | BoundedVec::ReceiveError => ReceivedVec::Closed,
 	}
 }
 
@@ -714,8 +726,11 @@ pub unsafe fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
 				wait(channel, 0);
 				continue;
 			}
+			if pending == ERR_PEER_CLOSED {
+				return BoundedVec::PeerClosed;
+			}
 			if pending < 0 {
-				return BoundedVec::Closed;
+				return BoundedVec::ReceiveError;
 			}
 			if pending as usize > max {
 				return BoundedVec::TooLarge { len: pending as usize };
@@ -724,7 +739,7 @@ pub unsafe fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
 			// could not fail, so one large message ended the receiving service outright.
 			let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
 			if bytes.try_reserve_exact(pending as usize).is_err() {
-				return BoundedVec::Closed;
+				return BoundedVec::NoMemory { len: pending as usize };
 			}
 			bytes.resize(pending as usize, 0);
 			let mut handle: u64 = 0;
@@ -733,8 +748,11 @@ pub unsafe fn recv_vec_bounded(channel: u64, max: usize) -> BoundedVec {
 				// another receiver raced the peeked message away; go around.
 				continue;
 			}
+			if got == ERR_PEER_CLOSED {
+				return BoundedVec::PeerClosed;
+			}
 			if got < 0 {
-				return BoundedVec::Closed;
+				return BoundedVec::ReceiveError;
 			}
 			bytes.truncate(got as usize);
 			return BoundedVec::Message { bytes, handle };

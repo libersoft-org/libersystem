@@ -457,12 +457,17 @@ trait FileSystem {
 	// The byte size of the backing block device (for the `lsblk` inventory).
 	fn capacity(&mut self) -> Result<u64, Error>;
 
-	// The most a single write may carry, which is what a streaming write has to be bounded by.
-	// The volume's capacity is the wrong bound - on a disk backend that is the size of the disk,
-	// and on any backend it ignores both the per-file limit and how full the volume already is.
-	// The default is deliberately modest: a backend that can take more says so.
-	fn max_write_len(&mut self) -> usize {
-		16 * 1024 * 1024
+	// The most a write to THIS PATH may carry, or why it cannot be written at all.
+	//
+	// Asked of the path rather than the volume, because a bound taken from the volume is wrong in
+	// both directions: it refuses a rewrite of a file that already holds the space it needs, and
+	// it accepts a new file whose name then does not fit. Answering here also validates the
+	// destination, so a streaming caller learns about a missing parent before it accepts a byte
+	// instead of after it has held the whole file.
+	//
+	// The default is deliberately modest and path-blind; a backend that knows better says so.
+	fn writable_len(&mut self, _name: &[u8]) -> Result<usize, Error> {
+		Ok(16 * 1024 * 1024)
 	}
 	// The filesystem's own identity and health numbers (for `lsvol` / `status`).
 	fn status(&mut self) -> Result<VolumeStatus, Error>;
@@ -525,8 +530,13 @@ impl Volume {
 		// Validated before a byte is accepted, and against what a single write may actually be -
 		// not the volume's whole capacity, which on a disk backend is the size of the disk. A
 		// stream to a path that cannot exist should cost a parse, not a heap.
-		self.writable_name(path)?;
-		let limit: usize = self.fs.max_write_len();
+		// Validates the destination as a side effect: a stream to a missing parent, to a file used
+		// as a directory, or to a directory is refused HERE rather than after the whole file has
+		// been held in memory.
+		let limit: usize = {
+			let name: &[u8] = self.writable_name(path)?;
+			self.fs.writable_len(name)?
+		};
 
 		let mut bytes: Vec<u8> = Vec::new();
 		loop {
@@ -542,7 +552,7 @@ impl Volume {
 					if chunk.is_empty() {
 						break;
 					}
-					if bytes.try_reserve(chunk.len()).is_err() {
+					if bytes.try_reserve_exact(chunk.len()).is_err() {
 						return Err(Error::Again);
 					}
 					bytes.extend_from_slice(&chunk);
@@ -551,8 +561,16 @@ impl Volume {
 				// draining politely: a sender that keeps writing would otherwise hold this
 				// service in the method for as long as it liked, and blocking a hostile sender is
 				// the smaller harm.
-				BoundedVec::TooLarge { .. } => return Err(Error::Again),
-				BoundedVec::Closed => break,
+				BoundedVec::TooLarge { .. } => return Err(Error::Invalid),
+				// NOT an end of file. Running out of memory, or a channel error, used to look
+				// exactly like the sender finishing - so the prefix received so far was written
+				// over the destination and the call reported success. A write that cannot be
+				// completed must leave the file as it was, which is the property this filesystem
+				// fixed in its backend and lost again here.
+				BoundedVec::NoMemory { .. } => return Err(Error::Again),
+				BoundedVec::ReceiveError => return Err(Error::Invalid),
+				// The sender is done. The only ending that means the file is whole.
+				BoundedVec::PeerClosed => break,
 			}
 		}
 		Ok(bytes)
@@ -593,6 +611,17 @@ impl volume::Service for Volume {
 		// The path is checked BEFORE the buffer is touched, so a write to a path that cannot exist
 		// costs a parse rather than a mapping. The guard releases the mapping and the handle on
 		// every path out, including the early refusals.
+		// Parsed and validated BEFORE the buffer is mapped. Mapping first let a client hand over a
+		// huge object and have it mapped - kernel structures and address space - only to be
+		// refused for a path that was never writable. The comment here used to claim this order
+		// while the code did the opposite.
+		let allowed = {
+			let name: &[u8] = self.writable_name(&path)?;
+			self.fs.writable_len(name)?
+		};
+		if data.len as usize > allowed {
+			return Err(Error::Again);
+		}
 		let buffer = unsafe { map_buffer(&data) }.ok_or(Error::Invalid)?;
 		let name: &[u8] = self.writable_name(&path)?;
 		self.fs.write_file(name, buffer.as_slice())
@@ -871,9 +900,8 @@ impl FileSystem for MemFs {
 	fn capacity(&mut self) -> Result<u64, Error> {
 		Ok(self.fs.capacity())
 	}
-	fn max_write_len(&mut self) -> usize {
-		// What this volume could still take, and never more than one file may be.
-		(self.fs.free() as usize).min(libermemfs::MAX_FILE_BYTES)
+	fn writable_len(&mut self, name: &[u8]) -> Result<usize, Error> {
+		self.fs.writable_len(name).map_err(map_fs_err)
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.capacity(), free_bytes: self.fs.free(), compression: false, read_only: false, filesystem: String::from("libermemfs") })

@@ -47,7 +47,24 @@ pub const MAX_PATH_DEPTH: usize = 16;
 // meaningful write, and each attempt is a refused allocation.
 const MIN_RESERVATION_STEP: usize = 4096;
 
+// A ceiling on how many pieces a reservation may be split into. A badly fragmented heap could
+// otherwise leave a volume holding thousands of small chunks, whose own vector and allocator
+// headers are memory the capacity does not count.
+const MAX_RESERVATION_CHUNKS: usize = 64;
+
 pub const MAX_PATH_BYTES: usize = MAX_PATH_DEPTH * (MAX_NAME_BYTES + 1);
+
+// One piece of a reserved volume's held memory.
+//
+// The size is recorded rather than read off the buffer, because the buffer's LENGTH is zero on
+// purpose - only its capacity is taken, and nothing is ever written into it. Subtracting
+// `len()` when giving a chunk back therefore subtracted nothing: the reservation emptied itself
+// while the accounting went on claiming every byte was still held.
+struct Chunk {
+	// Held for its capacity alone. Never read, never written.
+	allocation: Vec<u8>,
+	bytes: usize,
+}
 
 // A parsed path: bounded by the depth limit, so it lives on the stack.
 type Segments<'a> = [&'a str; MAX_PATH_DEPTH];
@@ -180,7 +197,7 @@ pub struct LiberMemFs {
 	// touched (`MemoryObject::create_in` charges the Domain and calls `allocate_pages` up front),
 	// so the frames behind the heap are already committed and already charged. Writing zeros into
 	// them holds nothing that owning the allocation does not already hold.
-	reservation: Vec<Vec<u8>>,
+	reservation: Vec<Chunk>,
 	// What `reservation` holds. Tracked rather than read back from the vector, whose length is
 	// deliberately zero and whose capacity may legitimately exceed what was asked for.
 	reserved: usize,
@@ -195,9 +212,10 @@ impl LiberMemFs {
 		if policy == Policy::Reserved {
 			// `try_reserve` rather than a plain allocation: running out here must be an error
 			// the caller can report, not an abort inside the storage service.
-			let mut first: Vec<u8> = Vec::new();
-			first.try_reserve_exact(capacity).map_err(|_| FsError::NoSpace)?;
-			reservation.push(first);
+			let mut allocation: Vec<u8> = Vec::new();
+			allocation.try_reserve_exact(capacity).map_err(|_| FsError::NoSpace)?;
+			reservation.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+			reservation.push(Chunk { allocation, bytes: capacity });
 			reserved = capacity;
 		}
 		Ok(LiberMemFs { root: Node::Directory(Children::new()), policy, capacity, reservation, reserved })
@@ -231,6 +249,35 @@ impl LiberMemFs {
 		self.reserved as u64
 	}
 
+	// The most that may be written to `path`, and whether the path can be written at all.
+	//
+	// Answered for the PATH rather than for the volume, because the two differ in both directions.
+	// Reporting the free space refuses a rewrite of a file that already holds the whole volume -
+	// the write would reuse its buffer and need nothing new - and it accepts a new file of exactly
+	// the free space, whose name then does not fit. A streaming caller has to know this before it
+	// accepts a byte.
+	pub fn writable_len(&self, path: &[u8]) -> Result<usize, FsError> {
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		if parts.is_empty() {
+			return Err(FsError::IsDir);
+		}
+		let free = self.capacity.saturating_sub(self.footprint() as usize);
+		match self.resolve(parts)? {
+			// A rewrite may use what the file already holds, plus whatever is still free.
+			Some(Node::File(existing)) => Ok((existing.capacity() + free).min(MAX_FILE_BYTES)),
+			Some(Node::Directory(_)) => Err(FsError::IsDir),
+			// A new entry pays for its name out of the same free space.
+			None => {
+				if self.root.count() >= MAX_ENTRIES {
+					return Err(FsError::NoSpace);
+				}
+				let name = parts.last().map_or(0, |name| name.len());
+				Ok(free.saturating_sub(name).min(MAX_FILE_BYTES))
+			}
+		}
+	}
+
 	// Whether a reserved volume still holds everything it promised.
 	//
 	// False when a regrow fell short - the memory was there at mount but could not be taken back
@@ -242,7 +289,11 @@ impl LiberMemFs {
 	// Exposed because the promise is the only thing separating the two policies, and a volume
 	// that quietly stopped keeping it is indistinguishable from one that still does.
 	pub fn reservation_intact(&self) -> bool {
-		self.policy != Policy::Reserved || self.reserved as u64 == self.capacity().saturating_sub(self.footprint())
+		// The footprint must also be WITHIN the capacity. `try_reserve_exact` promises at least
+		// what was asked for and may give more, so a generous allocator can put the footprint over
+		// the capacity - and then `capacity - footprint` saturates to zero, which a volume holding
+		// nothing would match. Saturating removed the panic; this removes the false answer.
+		self.policy != Policy::Reserved || (self.footprint() <= self.capacity() && self.reserved as u64 == self.capacity() - self.footprint())
 	}
 
 	// What can still be written, after both the data and the names ALREADY held.
@@ -367,12 +418,22 @@ impl LiberMemFs {
 	}
 
 	// Take `bytes` for the reservation, or report that it could not be had.
+	//
+	// The SLOT is reserved before the chunk, because pushing is an allocation too: the chunk was
+	// taken fallibly and then stored with an infallible `push`, which ends the process now that
+	// the allocator returns null instead of exiting on its own.
 	fn reserve_chunk(&mut self, bytes: usize) -> bool {
-		let mut fresh: Vec<u8> = Vec::new();
-		if fresh.try_reserve_exact(bytes).is_err() {
+		if bytes == 0 || self.reservation.len() >= MAX_RESERVATION_CHUNKS {
 			return false;
 		}
-		self.reservation.push(fresh);
+		if self.reservation.try_reserve(1).is_err() {
+			return false;
+		}
+		let mut allocation: Vec<u8> = Vec::new();
+		if allocation.try_reserve_exact(bytes).is_err() {
+			return false;
+		}
+		self.reservation.push(Chunk { allocation, bytes });
 		self.reserved += bytes;
 		true
 	}
@@ -424,16 +485,12 @@ impl LiberMemFs {
 			// Shrinking: give back whole chunks from the end until the rest fits the target.
 			while self.reserved > target {
 				let Some(chunk) = self.reservation.pop() else { break };
-				self.reserved -= chunk.len();
+				self.reserved -= chunk.bytes;
 			}
 			// One chunk may still straddle the target; trading it for an exact one is worth a
 			// single allocation, and failing that the volume simply holds a little less.
 			if self.reserved < target {
-				let mut fresh: Vec<u8> = Vec::new();
-				if fresh.try_reserve_exact(target - self.reserved).is_ok() {
-					self.reserved += target - self.reserved;
-					self.reservation.push(fresh);
-				}
+				self.reserve_chunk(target - self.reserved);
 			}
 			return;
 		}
@@ -455,7 +512,7 @@ impl LiberMemFs {
 		// which is exactly the shape a dead-allocation optimisation is entitled to delete. Letting
 		// the pointer escape here says otherwise, and costs nothing at runtime.
 		for chunk in &self.reservation {
-			let _ = core::hint::black_box(chunk.as_ptr());
+			let _ = core::hint::black_box(chunk.allocation.as_ptr());
 		}
 	}
 

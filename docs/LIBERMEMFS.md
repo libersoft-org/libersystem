@@ -18,7 +18,7 @@ usually describes does not exist here.
   `Capped` charges as files are written.
 - Bounded everywhere: file size, entry count, name length and path depth all refuse past their
   limit rather than truncating.
-- `no_std` + `alloc`, ~490 lines, 29 unit tests. It implements NEITHER `fscore::BlockDevice` -
+- `no_std` + `alloc`, ~700 lines, 32 unit tests. It implements NEITHER `fscore::BlockDevice` -
   there is no block device under it - nor the storage service's `FileSystem` trait: the service's
   `MemFs` adapter does that, exactly as `IsoFs` and `UdfFs` wrap their backends.
 - Mounted as `vol://ram` (reserved) and `vol://tmp` (capped).
@@ -109,6 +109,13 @@ Two properties make that guarantee real rather than nominal, and both are easy t
   would rest on the reservation being perfectly in step, which it is not after a regrow has
   fallen short; releasing all of it makes how much is held irrelevant to whether the write can
   proceed. If the allocation is refused anyway, the resync puts back what the volume should hold.
+The reservation is held as several CHUNKS rather than one block. A regrow adds to what is there
+instead of replacing it, so it can never end below what it already had - releasing first and then
+hunting could leave a volume holding 32 MiB, asked for 33, and ending with 16. Chunks also make
+fragmentation far less likely to defeat it: a heap with no 33 MiB block very often has two of 16.
+Each chunk records the size it stands for, because its buffer's length is zero by design and only
+its capacity is taken.
+
 - **The reservation is dropped and reallocated, never resized - and never written to.**
   `shrink_to_fit` reallocates and COPIES what it keeps, so resizing would memcpy what remains of
   the reservation on every single write - megabytes per write on a volume of any size, to preserve
@@ -251,9 +258,10 @@ changed to return null on exhaustion - it computed the null and then called an e
 it, so every `try_reserve` in userspace was unreachable and the fallible paths here were only ever
 exercised against a test allocator this crate wrote for itself.
 
-What remains infallible is the map node behind an entry, because `BTreeMap` offers no fallible
-insert - so a volume can still abort on a heap tight enough to refuse tens of bytes. It is the last
-one, and the arena would remove it along with the two costs above.
+Nothing here is infallible any more. A directory is a `Vec<(String, Node)>` kept sorted rather
+than a `BTreeMap`, so the slot for a new entry is reserved with `try_reserve` before anything moves
+into it - `BTreeMap` had no fallible insert and was the last allocation that could end the process
+after every check had passed.
 
 ## What it deliberately does not do
 

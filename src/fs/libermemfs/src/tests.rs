@@ -760,3 +760,45 @@ fn growing_past_a_files_high_water_mark_needs_both_blocks() {
 		assert_eq!(fs.used(), LARGE as u64);
 	});
 }
+
+#[test]
+fn giving_reservation_back_actually_reduces_what_is_held() {
+	// Guards the reservation's accounting across ordinary use: what is stored plus what is held is
+	// the capacity, and storing more holds less.
+	//
+	// It does NOT reach the shrink branch, and saying so is the point. That branch subtracted
+	// `chunk.len()`, which is zero by design because only a chunk's capacity is taken - so it
+	// would free every chunk while the accounting claimed the memory was still held. The bug is
+	// fixed; this test cannot prove it, because every operation that grows the footprint releases
+	// the whole reservation first and so always takes the GROW path. The branch is unreachable
+	// through the public API today, which is why the defect sat there unnoticed and why it will
+	// bite the first time an operation changes the footprint without releasing.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 64 * 1024).expect("mount");
+	assert_eq!(fs.reserved_bytes(), 64 * 1024);
+
+	// Storing something forces the reservation down to the remainder.
+	fs.write_file(b"f", &alloc::vec![b'x'; 16 * 1024]).expect("write");
+	let held = fs.reserved_bytes();
+	assert_eq!(fs.footprint() + held, 64 * 1024, "what is stored plus what is held is the capacity");
+
+	// Storing more forces it down again - the step the broken arithmetic could not take.
+	fs.write_file(b"g", &alloc::vec![b'y'; 16 * 1024]).expect("write");
+	assert!(fs.reserved_bytes() < held, "holding less after storing more: {} then {}", held, fs.reserved_bytes());
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), 64 * 1024);
+	assert!(fs.reservation_intact(), "and the volume still holds exactly what it should");
+}
+
+#[test]
+fn a_reserved_mount_that_cannot_take_its_slot_fails_rather_than_aborting() {
+	// A reserved mount that cannot be satisfied must be refused rather than fatal. If this test
+	// DIES instead of failing, an infallible allocation is back on the mount path.
+	//
+	// It does not isolate the slot in the outer vector: with a budget this small the chunk itself
+	// is refused first, so the `try_reserve` guarding the slot is never the thing that fires.
+	// Calibrating a budget that admits a megabyte chunk and refuses a pointer-sized slot is not
+	// something this harness can do reliably, so the slot's fallibility is argued from the code
+	// rather than demonstrated here.
+	within(2 * 1024, || {
+		assert_eq!(LiberMemFs::mount(Policy::Reserved, 1024 * 1024).err(), Some(FsError::NoSpace), "a mount that cannot be satisfied is refused, not fatal");
+	});
+}
