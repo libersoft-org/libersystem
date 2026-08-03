@@ -457,6 +457,16 @@ trait FileSystem {
 	// The byte size of the backing block device (for the `lsblk` inventory).
 	fn capacity(&mut self) -> Result<u64, Error>;
 
+	// Write a file from a buffer the caller hands over.
+	//
+	// A streamed write has already built the whole file in memory, so copying it again into the
+	// backend doubles the peak for no reason - and on a reserved memory volume it is the
+	// difference between accepting a file and refusing it. Backends that must copy anyway (a
+	// disk) simply borrow the slice; the memory backend adopts the allocation.
+	fn write_file_owned(&mut self, name: &[u8], data: Vec<u8>) -> Result<(), Error> {
+		self.write_file(name, &data)
+	}
+
 	// The most a write to THIS PATH may carry, or why it cannot be written at all.
 	//
 	// Asked of the path rather than the volume, because a bound taken from the volume is wrong in
@@ -533,22 +543,12 @@ impl Volume {
 		// Validates the destination as a side effect: a stream to a missing parent, to a file used
 		// as a directory, or to a directory is refused HERE rather than after the whole file has
 		// been held in memory.
-		unsafe { print(b"DIAG receive_stream entered\n") };
+		// Validates the destination as a side effect: a stream to a missing parent, to a file used
+		// as a directory, or to a directory is refused HERE rather than after the whole file has
+		// been held in memory.
 		let limit: usize = {
-			let name: &[u8] = match self.writable_name(path) {
-				Ok(name) => name,
-				Err(e) => {
-					unsafe { print(b"DIAG writable_name refused\n") };
-					return Err(e);
-				}
-			};
-			match self.fs.writable_len(name) {
-				Ok(limit) => limit,
-				Err(e) => {
-					unsafe { print(b"DIAG writable_len refused\n") };
-					return Err(e);
-				}
-			}
+			let name: &[u8] = self.writable_name(path)?;
+			self.fs.writable_len(name)?
 		};
 
 		let mut bytes: Vec<u8> = Vec::new();
@@ -656,7 +656,7 @@ impl volume::Service for Volume {
 		unsafe { close(data) };
 		let bytes = outcome?;
 		let name: &[u8] = self.writable_name(&path)?;
-		self.fs.write_file(name, &bytes)
+		self.fs.write_file_owned(name, bytes)
 	}
 
 	// Delete a file. A read-only volume refuses with `denied`.
@@ -915,6 +915,11 @@ impl FileSystem for MemFs {
 	}
 	fn writable_len(&mut self, name: &[u8]) -> Result<usize, Error> {
 		self.fs.writable_len(name).map_err(map_fs_err)
+	}
+	fn write_file_owned(&mut self, name: &[u8], data: Vec<u8>) -> Result<(), Error> {
+		// Adopted, not copied: the streamed buffer becomes the file's own storage, so a reserved
+		// volume needs the memory once instead of twice.
+		self.fs.write_file_owned(name, data).map_err(map_fs_err)
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.capacity(), free_bytes: self.fs.free(), compression: false, read_only: false, filesystem: String::from("libermemfs") })

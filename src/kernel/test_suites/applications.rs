@@ -339,6 +339,20 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	assert!(streamed.write_stream(b"vol://tmp/f", &[b"new ", b"contents"], 0x7302, None), "a stream that closes cleanly is written");
 	assert_eq!(streamed.open(b"vol://tmp/f", 0x7303), Some(b"new contents".to_vec()), "and the bytes that arrive are the bytes that are stored");
 
+	// A stream that ends ABNORMALLY must not replace the destination with what arrived first.
+	//
+	// This is the property the backend fixed as its very first defect - a write that cannot be
+	// completed leaves the file as it was - and the streaming layer lost again: every abnormal
+	// ending looked like the sender finishing, so the prefix already collected was written and
+	// the call reported success. Out of memory is the ending that motivated the fix and cannot be
+	// forced from a kernel test, because the service grows its own heap; an oversized chunk
+	// reaches the same decision and is the reachable substitute.
+	assert!(!streamed.write_stream(b"vol://tmp/f", &[b"partial"], 0x7304, Some(8192)), "a stream that ends abnormally is refused");
+	assert_eq!(streamed.open(b"vol://tmp/f", 0x7305), Some(b"new contents".to_vec()), "and the destination still holds what it held - no prefix was written");
+
+	// A path that cannot be written is refused before any of it is collected.
+	assert!(!streamed.write_stream(b"vol://tmp/missing/f", &[b"x"], 0x7306, None), "an absent parent is refused, not collected");
+
 	// vol://ram - reserved. Same filesystem, same operations; the difference is only that its
 	// memory was taken at mount, which is why a write cannot fail for want of memory here.
 	let mut ram = StorageHarness::start_memory(storage_elf, b"RAMVOL", 4096);

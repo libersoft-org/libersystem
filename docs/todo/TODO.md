@@ -187,7 +187,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0136 - Identity: accounts, authentication and per-user authority](M0136.md)
 - [x] [M0137 - Build layering: compile, then package](M0137.md)
 - [ ] [M0138 - The loader reads the filesystem: retire the bootstrap archive](M0138.md)
-- [ ] [M0139 - LiberMemFS: a writable filesystem that lives in memory](M0139.md)
+- [x] [M0139 - LiberMemFS: a writable filesystem that lives in memory](M0139.md)
 
 ### Definition of done (phase 2)
 

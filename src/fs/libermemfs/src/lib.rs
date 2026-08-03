@@ -599,6 +599,62 @@ impl LiberMemFs {
 		stored
 	}
 
+	// Write a file from a buffer the caller hands over, taking ownership of the allocation.
+	//
+	// A streamed write collects the whole file before the filesystem sees any of it, so the
+	// collected buffer and the volume's reservation are outstanding at the same time - a reserved
+	// volume would accept a file through `write_file` and refuse the identical file through a
+	// stream, because the stream needs the memory twice. Taking the caller's buffer as the file's
+	// own storage removes the second copy: nothing is allocated here at all.
+	pub fn write_file_owned(&mut self, path: &[u8], data: Vec<u8>) -> Result<(), FsError> {
+		if data.len() > MAX_FILE_BYTES {
+			return Err(FsError::TooLong);
+		}
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		if parts.is_empty() {
+			return Err(FsError::IsDir);
+		}
+		let (previous, is_new) = match self.resolve(parts)? {
+			Some(Node::Directory(_)) => return Err(FsError::IsDir),
+			Some(Node::File(existing)) => (existing.capacity(), false),
+			None => {
+				if self.root.count() >= MAX_ENTRIES {
+					return Err(FsError::NoSpace);
+				}
+				(0, true)
+			}
+		};
+		// The buffer arrives already allocated, so what the volume takes on is its CAPACITY.
+		let name_cost = if is_new { parts.last().map_or(0, |name| name.len()) } else { 0 };
+		if self.footprint() as usize - previous + data.capacity() + name_cost > self.capacity {
+			return Err(FsError::NoSpace);
+		}
+		// Only the name and the entry slot are allocated here, so the reservation is released
+		// only when there is something to release it for.
+		if self.policy == Policy::Reserved && is_new {
+			self.release_reservation();
+		}
+		let stored = self.adopt(parts, data, is_new);
+		self.resync_reservation();
+		stored
+	}
+
+	// Take ownership of `data` as the file at `parts`.
+	fn adopt(&mut self, parts: &[&str], data: Vec<u8>, is_new: bool) -> Result<(), FsError> {
+		if !is_new {
+			let file = self.file_mut(parts)?;
+			*file = data;
+			return Ok(());
+		}
+		let last = parts.last().copied().ok_or(FsError::BadName)?;
+		let mut name = String::new();
+		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
+		name.push_str(last);
+		let children = self.parent_mut(parts)?;
+		insert(children, name, Node::File(data))
+	}
+
 	// Put `data` at `parts`, which `write_file` has already established is writable.
 	fn store(&mut self, parts: &[&str], data: &[u8], is_new: bool) -> Result<(), FsError> {
 		if !is_new {
