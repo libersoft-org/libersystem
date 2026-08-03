@@ -113,12 +113,7 @@ _start:
 // binary contain the userspace and made building the kernel require a built userspace. It does
 // neither now: one kernel binary, whatever userspace is handed to it.
 static BOOT_MODULES: crate::sync::SpinLock<Option<&'static [u8]>> = crate::sync::SpinLock::new(None);
-// The archive's physical base, so the frame pool can be clamped below it. 0 = none found.
-static MODULES_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-// Whether the archive came from the loader (already the init package) or from the runner's
-// wrapper (holding it as an entry). The two are read differently.
-static FROM_LOADER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 // The boot argument, kept so a module can be looked up after the early boot has moved on.
 static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -178,7 +173,6 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// everything conditioned on one is dead there.
 	if let Some(archive) = loader_archive(arg) {
 		*BOOT_MODULES.lock() = Some(archive);
-		FROM_LOADER.store(true, core::sync::atomic::Ordering::SeqCst);
 		crate::serial_println!("riscv64: boot packages handed over by the loader ({} bytes)", archive.len());
 	}
 
@@ -217,18 +211,6 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	let (ram_top, cpu_count, pcie_ecam, _plic_base, fwcfg_base) = match super::dtb::parse(dtb) {
 		Some(bi) => {
 			crate::serial_println!("riscv64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s), ECAM {:#x}, PLIC {:#x}", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count, bi.pcie_ecam, bi.plic_base);
-			// Find the boot-module archive the runner placed high in RAM, recorded as a physical
-			// base so the frame pool can stop underneath it.
-			// Scanned only when the loader handed nothing over: the scan looks for a magic number
-			// in RAM and can match something that is not an archive at all.
-			if BOOT_MODULES.lock().is_some() {
-				// already handed over
-			} else if let Some((base, length)) = crate::arch::common::dtb::find_modules(bi.ram_base, bi.ram_size, paging::phys_to_virt) {
-				MODULES_PHYS.store(base, core::sync::atomic::Ordering::SeqCst);
-				let archive: &'static [u8] = unsafe { core::slice::from_raw_parts(paging::phys_to_virt(base) as *const u8, length as usize) };
-				*BOOT_MODULES.lock() = Some(archive);
-				crate::serial_println!("riscv64: boot packages at {:#x} ({} bytes reachable)", base, length);
-			}
 			super::set_fwcfg_base(bi.fwcfg_base);
 			(bi.ram_base + bi.ram_size, bi.cpu_count, bi.pcie_ecam, bi.plic_base, bi.fwcfg_base)
 		}
@@ -245,11 +227,10 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	super::pci::set_ecam_base(pcie_ecam);
 
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
-	// Stop the frame pool below the boot modules: they are read for the whole boot, so frames
-	// handed out from that range would corrupt the userspace image while it is still loading.
-	let modules_phys = MODULES_PHYS.load(core::sync::atomic::Ordering::SeqCst);
-	let pool_top = if modules_phys != 0 && modules_phys < ram_top { modules_phys } else { ram_top };
-	let (region_base, region_len) = paging::usable_region(pool_top);
+	// The pool runs to the top of RAM. It used to stop below a boot archive the runner had laid
+	// high in memory; nothing is laid there any more, and a clamp without the thing it protects
+	// only loses frames.
+	let (region_base, region_len) = paging::usable_region(ram_top);
 	let regions = [bootproto::MemRegion { base: region_base, length: region_len, kind: bootproto::MEM_USABLE, _pad: 0 }];
 	crate::mem::frame::init(&regions);
 	crate::serial_println!("riscv64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
@@ -421,11 +402,16 @@ fn publish_embedded_boot_info() {
 		nm[..name.len()].copy_from_slice(name);
 		bootproto::Module { addr: bytes.as_ptr() as u64, size: bytes.len() as u64, name: nm }
 	}
-	// Two shapes: the loader hands over the bootstrap archive itself, the `-kernel` runner a
-	// wrapper holding it as an entry. Unwrapping the former looks for an init.pkg inside an
-	// init.pkg. The wrapper is what M0138c retires.
+	// The loader hands over the bootstrap archive ITSELF - it read the programs off the volume and
+	// packed them, so what arrives is already the init package, and `volume.pkg` arrives beside it
+	// as its own named module.
+	//
+	// The `-kernel` runner used to lay down a WRAPPER holding both as entries, because a machine
+	// with no loader can be handed exactly one blob. That shape is retired: unwrapping it looked
+	// for an `init.pkg` inside an init.pkg, which was the last of four separate reasons this
+	// kernel reported a malformed init package while holding a perfectly good one.
 	let archive = boot_archive();
-	let (init, volume): (&[u8], &[u8]) = if FROM_LOADER.load(core::sync::atomic::Ordering::SeqCst) { (archive, loader_module(b"volume.pkg").unwrap_or(&[])) } else { (abi::Package::parse(archive).and_then(|p| p.lookup(b"init.pkg")).unwrap_or(&[]), abi::Package::parse(archive).and_then(|p| p.lookup(b"volume.pkg")).unwrap_or(&[])) };
+	let (init, volume): (&[u8], &[u8]) = (archive, loader_module(b"volume.pkg").unwrap_or(&[]));
 	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", init), module(b"volume.pkg", volume)]));
 	// Hand the early framebuffer (if any) to a userspace consumer of the boot info.
 	let (framebuffer, fb_present) = match *BOOT_FB.lock() {

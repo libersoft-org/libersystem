@@ -596,12 +596,12 @@ loader-riscv64:
     echo "loader-riscv64: wrote $out.efi"
 
 # build + boot the ARM64 build in QEMU (native on an aarch64 host, emulated on an x86
-# host), reaching the interactive shell over the serial console. Uses QEMU's direct
-# -kernel load - the quick path; `run-aarch64-uefi` boots the same system through the
-# own UEFI loader. Add live displays as arguments (combinable): `just run-aarch64 vnc spice`.
-run-aarch64 *displays: sdk user-aarch64
+# host), reaching the interactive shell over the serial console. Boots through the own
+# UEFI loader under AAVMF - the only path, since the `-kernel` boot's package wrapper was
+# retired (M0138c). Add live displays as arguments (combinable): `just run-aarch64 vnc spice`.
+run-aarch64 *displays: sdk user-aarch64 loader-aarch64
     cd {{ kernel_dir }} && cargo build --target aarch64-unknown-none
-    DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{ cargo_kernel_dir }}/aarch64-unknown-none/debug/kernel
+    UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{ cargo_kernel_dir }}/aarch64-unknown-none/debug/kernel
 
 # build the userspace programs for riscv64 (the riscv64 kernel build.rs reads them from
 # each crate's riscv64gc-unknown-none-elf target dir)
@@ -611,29 +611,12 @@ user-riscv64: shared-libs-riscv64
     cd {{ storage_dir }} && cargo build --target riscv64gc-unknown-none-elf
     cd {{ drivers_dir }} && cargo build --target riscv64gc-unknown-none-elf {{ dev_features }}
 
-# build + boot the riscv64 build in QEMU over OpenSBI (emulated on an x86 host),
-# reaching the pinned userspace service chain over the serial console. The system
-# volume is a polled virtio-blk disk (StorageService reads the factory archive from
-# it), so no per-device interrupt path is needed for the core chain.
-run-riscv64 *displays: sdk user-riscv64
-    cd {{ kernel_dir }} && cargo build --target riscv64gc-unknown-none-elf
-    DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{ cargo_kernel_dir }}/riscv64gc-unknown-none-elf/debug/kernel
-
-# build + boot the full riscv64 system through the own UEFI loader under U-Boot (the
-# qemu-riscv64 S-mode U-Boot on OpenSBI, instead of QEMU's direct -kernel load): U-Boot's
-# EFI boot manager launches /EFI/BOOT/BOOTRISCV64.EFI off the FAT ESP, which reads the
-# kernel off the same volume, places it at its physical link addresses and enters the
-# kernel's boot stub - the same entry state OpenSBI's -kernel boot produces.
-run-riscv64-uefi *displays: sdk user-riscv64 loader-riscv64
+# build + boot the riscv64 build in QEMU through the own UEFI loader under U-Boot,
+# reaching the userspace service chain over the serial console. The system volume is a
+# polled virtio-blk disk, so no per-device interrupt path is needed for the core chain.
+run-riscv64 *displays: sdk user-riscv64 loader-riscv64
     cd {{ kernel_dir }} && cargo build --target riscv64gc-unknown-none-elf
     UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{ cargo_kernel_dir }}/riscv64gc-unknown-none-elf/debug/kernel
-
-# build + boot the full aarch64 system through the own UEFI loader under the AAVMF
-# firmware (instead of QEMU's direct -kernel load), reaching the interactive shell.
-# Add live displays as arguments (combinable): `just run-aarch64-uefi vnc spice`.
-run-aarch64-uefi *displays: sdk user-aarch64 loader-aarch64
-    cd {{ kernel_dir }} && cargo build --target aarch64-unknown-none
-    UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{ cargo_kernel_dir }}/aarch64-unknown-none/debug/kernel
 
 # screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
 # snaps a live `just run` if one is up, else boots a throwaway. e.g. just screenshot shot.png

@@ -45,30 +45,6 @@ pub struct BootInfo {
 // then scan) - one less constant that two components have to keep equal.
 pub const MODULES_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
-// Find a PKGARCH1 archive in the top `MODULES_SCAN_BYTES` of RAM, returning its physical base
-// and total length. The magic makes the search self-validating: a stray match still has to
-// carry a header whose entry table fits inside the region.
-pub fn find_modules(ram_base: u64, ram_size: u64, phys_to_virt: fn(u64) -> u64) -> Option<(u64, u64)> {
-	let top = ram_base + ram_size;
-	let start = top.saturating_sub(MODULES_SCAN_BYTES).max(ram_base);
-	let mut base = start & !0xFFF;
-	while base + abi::PKG_HEADER_LEN as u64 <= top {
-		let header = unsafe { core::slice::from_raw_parts(phys_to_virt(base) as *const u8, abi::PKG_HEADER_LEN) };
-		if &header[0..8] == abi::PKG_MAGIC {
-			// Trust the header only as far as the region it sits in: the archive's own entry
-			// table has to fit between here and the top of RAM, or this is not one.
-			let available = (top - base) as usize;
-			let whole = unsafe { core::slice::from_raw_parts(phys_to_virt(base) as *const u8, available) };
-			if let Some(package) = abi::Package::parse(whole) {
-				let _ = package;
-				return Some((base, available as u64));
-			}
-		}
-		base += 0x1000;
-	}
-	None
-}
-
 // FDT token + header constants.
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;
