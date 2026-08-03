@@ -29,7 +29,7 @@ pub fn halt() -> ! {
 
 // Place the kernel at its physical link addresses, find the device tree, exit boot
 // services, and enter the kernel's boot stub with the MMU off and the DTB in x0.
-pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, _root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
+pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
 	let entry = load_kernel(bs, kernel);
 	serial::write_str("loader: kernel ELF loaded at its physical link addresses\n");
 
@@ -43,7 +43,24 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// the `-kernel` path programs ramfb itself instead). The kernel enters through its
 	// own boot stub, which forwards x0 to the kernel entry; there it tells a BootInfo
 	// from a raw DTB pointer (the `-kernel` entry state) by the BootInfo magic.
-	let boot_info = build_boot_info(bs, dtb);
+	// The bootstrap set, published as modules exactly as on x86_64.
+	//
+	// This arch used to get its programs from an archive placed in RAM by the runner and found by
+	// scanning for a magic number, because the loader handed over nothing. That works for a
+	// direct `-kernel` boot and not at all under UEFI, where nobody lays the archive down - the
+	// kernel came up and reported its init package malformed, having found no package at all.
+	// Reading it here is what makes the loader path usable on this architecture (M0138c).
+	let init_pkg = match unsafe { crate::BOOTSTRAP } {
+		Some(archive) => {
+			serial::write_str("loader: bootstrap set assembled from the system volume\n");
+			Some(archive)
+		}
+		None => crate::read_boot_file(bs, root, crate::INIT_PKG_FILE),
+	};
+	// The factory archive too, when the medium carries one: the kernel test suite uses it as its
+	// fixture, and a shipping medium simply has none.
+	let volume_pkg = root.and_then(|root| crate::read_file(bs, root, crate::VOLUME_PKG_FILE));
+	let boot_info = build_boot_info(bs, dtb, init_pkg, volume_pkg);
 
 	// ExitBootServices is the last firmware call; after it no service may be used.
 	exit_boot_services(bs, image_handle);
@@ -79,13 +96,26 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 // through its own direct map, so `framebuffer.addr` is the PHYSICAL base (this backend
 // builds no page tables). Only the fields the device-tree kernel path reads are set;
 // the memmap / modules / rsdp / trampoline are x86-only.
-fn build_boot_info(bs: *mut BootServices, dtb: u64) -> u64 {
+fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u8]>, volume_pkg: Option<&'static [u8]>) -> u64 {
 	let fb = crate::locate_framebuffer(bs);
 	serial::write_str(if fb.present { "loader: GOP framebuffer found\n" } else { "loader: no GOP framebuffer (serial-only boot log)\n" });
 	let phys = crate::alloc_pages(bs, 1).expect("loader: cannot allocate BootInfo");
 	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: 32, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
 	unsafe {
-		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: 0, memmap_len: 0, modules: 0, modules_len: 0, framebuffer, fb_present: fb.present as u32, _pad1: 0, rsdp: 0, smp_trampoline: 0, dtb };
+		let (modules, modules_len) = match (init_pkg, crate::alloc_pages(bs, 1)) {
+			(Some(bytes), Some(array)) => {
+				let entries = array as *mut bootproto::Module;
+				*entries = crate::make_module(bytes, crate::INIT_PKG_FILE, 0);
+				let mut count = 1u64;
+				if let Some(volume) = volume_pkg {
+					*entries.add(1) = crate::make_module(volume, crate::VOLUME_PKG_FILE, 0);
+					count = 2;
+				}
+				(array, count)
+			}
+			_ => (0, 0),
+		};
+		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: 0, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, _pad1: 0, rsdp: 0, smp_trampoline: 0, dtb };
 	}
 	phys
 }

@@ -20,8 +20,8 @@ use paging::{HHDM_OFFSET, PAGE_2MB, PAGE_SIZE, PageTables};
 
 // The init/volume package filenames on the boot volume (the x86 loader reads them and
 // hands the kernel their bytes as boot-protocol modules; the aarch64 kernel embeds them).
-const INIT_PKG_FILE: &str = "init.pkg";
-const VOLUME_PKG_FILE: &str = "volume.pkg";
+use crate::INIT_PKG_FILE;
+use crate::VOLUME_PKG_FILE;
 // The live medium's system volume: a LiberFS image the running system copies into memory, so a
 // LiveCD needs no disk and never writes to the medium it booted from. Passed straight through as
 // a module; the kernel hands it to the storage service, which is where it becomes a volume.
@@ -100,14 +100,14 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let modules = modules_phys as *mut Module;
 	let mut module_count = 1usize;
 	unsafe {
-		*modules.add(0) = make_module(init_pkg, INIT_PKG_FILE);
+		*modules.add(0) = crate::make_module(init_pkg, INIT_PKG_FILE, HHDM_OFFSET);
 		if let Some(volume) = volume_pkg {
-			*modules.add(module_count) = make_module(volume, VOLUME_PKG_FILE);
+			*modules.add(module_count) = crate::make_module(volume, VOLUME_PKG_FILE, HHDM_OFFSET);
 			module_count += 1;
 		}
 		if let Some(volume) = live_volume {
 			serial::write_str("loader: live system volume handed over\n");
-			*modules.add(module_count) = make_module(volume, LIVE_VOLUME_FILE);
+			*modules.add(module_count) = crate::make_module(volume, LIVE_VOLUME_FILE, HHDM_OFFSET);
 			module_count += 1;
 		}
 	}
@@ -213,13 +213,6 @@ fn load_kernel(bs: *mut BootServices, kernel: &[u8], out: &mut [KernelSegment; M
 
 // Build a boot-protocol module for a loaded package: its HHDM address, size, and
 // NUL-padded name.
-fn make_module(bytes: &[u8], name: &str) -> Module {
-	let mut m = Module { addr: HHDM_OFFSET + bytes.as_ptr() as u64, size: bytes.len() as u64, name: [0; 32] };
-	let n = name.len().min(m.name.len());
-	m.name[..n].copy_from_slice(&name.as_bytes()[..n]);
-	m
-}
-
 // The framebuffer the loader found, plus its physical base + byte size (for the
 // HHDM mapping) and whether one is present at all.
 struct FbResult {

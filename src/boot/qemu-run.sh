@@ -306,6 +306,11 @@ qemu_build_esp() {
 	mmd -i "$ESP" ::/EFI ::/EFI/BOOT
 	mcopy -i "$ESP" "$loader_efi" "::/EFI/BOOT/$boot_name"
 	mcopy -i "$ESP" "$STAGED_KERNEL" ::/kernel
+	# The boot packages, so the loader has something to hand over. Without them a UEFI boot comes
+	# up with no userspace at all - the device-tree architectures used to get theirs from an
+	# archive the runner laid in RAM, which the loader path does not use.
+	[[ -f "$QEMU_BUILD_DIR/init.pkg" ]] && mcopy -i "$ESP" "$QEMU_BUILD_DIR/init.pkg" ::/init.pkg
+	[[ -f "$QEMU_BUILD_DIR/volume.pkg" ]] && mcopy -i "$ESP" "$QEMU_BUILD_DIR/volume.pkg" ::/volume.pkg
 }
 
 normalize_arch() {

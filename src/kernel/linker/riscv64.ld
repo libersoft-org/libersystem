@@ -73,7 +73,12 @@ SECTIONS
 		/* boot stack: reserved RAM (uninitialized), higher-half addresses. */
 		. = ALIGN(16);
 		__boot_stack_bottom = .;
-		. += 0x10000; /* 64 KiB */
+		/* 256 KiB, for the same reason as aarch64: the test suite formats a LiberFS volume in
+		   the kernel to build its storage fixture, which walks a B-tree and a transaction log and
+		   overflowed 64 KiB into .bss. The symptom is corruption rather than a fault - the serial
+		   port dumps memory - so the cost of getting it wrong is high and the reserved image is
+		   cheap. Fixed on aarch64 first; this one was missed, and riscv64 failed the same way. */
+		. += 0x40000;
 		__boot_stack_top = .;
 	} :data
 

@@ -116,6 +116,48 @@ static BOOT_MODULES: crate::sync::SpinLock<Option<&'static [u8]>> = crate::sync:
 // The archive's physical base, so the frame pool can be clamped below it. 0 = none found.
 static MODULES_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// Whether the archive came from the loader (already the init package) or from the runner's
+// wrapper (holding it as an entry). The two are read differently.
+static FROM_LOADER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// The boot argument, kept so a module can be looked up after the early boot has moved on.
+static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// A named module from the loader's hand-off, translated into the kernel's map.
+//
+// The loader hands over PHYSICAL addresses, because it runs before this kernel builds its map -
+// so every read goes through `phys_to_virt`, exactly like the scanned archive.
+fn loader_module_at(arg: u64, want: &[u8]) -> Option<&'static [u8]> {
+	if arg == 0 {
+		return None;
+	}
+	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return None;
+	}
+	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
+	let (modules_phys, modules_len) = unsafe { (core::ptr::read_volatile(core::ptr::addr_of!((*bi).modules)), core::ptr::read_volatile(core::ptr::addr_of!((*bi).modules_len))) };
+	if modules_phys == 0 || modules_len == 0 {
+		return None;
+	}
+	let modules = unsafe { core::slice::from_raw_parts(super::paging::phys_to_virt(modules_phys) as *const bootproto::Module, modules_len as usize) };
+	for module in modules {
+		let end = module.name.iter().position(|&b| b == 0).unwrap_or(module.name.len());
+		if &module.name[..end] == want {
+			return Some(unsafe { core::slice::from_raw_parts(super::paging::phys_to_virt(module.addr) as *const u8, module.size as usize) });
+		}
+	}
+	None
+}
+
+fn loader_archive(arg: u64) -> Option<&'static [u8]> {
+	BOOT_ARG.store(arg, core::sync::atomic::Ordering::SeqCst);
+	loader_module_at(arg, crate::product::INIT_PACKAGE.as_bytes())
+}
+
+fn loader_module(want: &[u8]) -> Option<&'static [u8]> {
+	loader_module_at(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), want)
+}
+
 fn boot_archive() -> &'static [u8] {
 	(*BOOT_MODULES.lock()).unwrap_or(&[])
 }
@@ -130,6 +172,15 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// draws its earliest boot log to the display instead of programming ramfb itself.
 	let (dtb, uefi_fb) = decode_boot_arg(arg);
 	crate::serial_println!("riscv64: hart {hartid}, DTB @ {dtb:#x}");
+
+	// The loader's hand-off, taken BEFORE anything else looks at the boot argument - it must not
+	// sit inside a device-tree branch, because under UEFI the firmware exposes no DTB and
+	// everything conditioned on one is dead there.
+	if let Some(archive) = loader_archive(arg) {
+		*BOOT_MODULES.lock() = Some(archive);
+		FROM_LOADER.store(true, core::sync::atomic::Ordering::SeqCst);
+		crate::serial_println!("riscv64: boot packages handed over by the loader ({} bytes)", archive.len());
+	}
 
 	// Prove the higher half is live: read back the VA this function is linked at.
 	let here = riscv64_main as usize;
@@ -168,7 +219,11 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 			crate::serial_println!("riscv64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s), ECAM {:#x}, PLIC {:#x}", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count, bi.pcie_ecam, bi.plic_base);
 			// Find the boot-module archive the runner placed high in RAM, recorded as a physical
 			// base so the frame pool can stop underneath it.
-			if let Some((base, length)) = crate::arch::common::dtb::find_modules(bi.ram_base, bi.ram_size, paging::phys_to_virt) {
+			// Scanned only when the loader handed nothing over: the scan looks for a magic number
+			// in RAM and can match something that is not an archive at all.
+			if BOOT_MODULES.lock().is_some() {
+				// already handed over
+			} else if let Some((base, length)) = crate::arch::common::dtb::find_modules(bi.ram_base, bi.ram_size, paging::phys_to_virt) {
 				MODULES_PHYS.store(base, core::sync::atomic::Ordering::SeqCst);
 				let archive: &'static [u8] = unsafe { core::slice::from_raw_parts(paging::phys_to_virt(base) as *const u8, length as usize) };
 				*BOOT_MODULES.lock() = Some(archive);
@@ -366,9 +421,11 @@ fn publish_embedded_boot_info() {
 		nm[..name.len()].copy_from_slice(name);
 		bootproto::Module { addr: bytes.as_ptr() as u64, size: bytes.len() as u64, name: nm }
 	}
+	// Two shapes: the loader hands over the bootstrap archive itself, the `-kernel` runner a
+	// wrapper holding it as an entry. Unwrapping the former looks for an init.pkg inside an
+	// init.pkg. The wrapper is what M0138c retires.
 	let archive = boot_archive();
-	let init = abi::Package::parse(archive).and_then(|p| p.lookup(b"init.pkg")).unwrap_or(&[]);
-	let volume = abi::Package::parse(archive).and_then(|p| p.lookup(b"volume.pkg")).unwrap_or(&[]);
+	let (init, volume): (&[u8], &[u8]) = if FROM_LOADER.load(core::sync::atomic::Ordering::SeqCst) { (archive, loader_module(b"volume.pkg").unwrap_or(&[])) } else { (abi::Package::parse(archive).and_then(|p| p.lookup(b"init.pkg")).unwrap_or(&[]), abi::Package::parse(archive).and_then(|p| p.lookup(b"volume.pkg")).unwrap_or(&[])) };
 	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", init), module(b"volume.pkg", volume)]));
 	// Hand the early framebuffer (if any) to a userspace consumer of the boot info.
 	let (framebuffer, fb_present) = match *BOOT_FB.lock() {

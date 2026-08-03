@@ -208,6 +208,21 @@ pub(crate) fn read_from_fat(bs: *mut BootServices, path: &[u8]) -> Option<&'stat
 	found
 }
 
+// The archive name every architecture hands the kernel its bootstrap set under.
+pub(crate) const INIT_PKG_FILE: &str = "init.pkg";
+// The factory archive, carried by a test medium and by nothing else.
+pub(crate) const VOLUME_PKG_FILE: &str = "volume.pkg";
+
+// Describe a loaded blob for the kernel. `bias` is added to the physical address: x86_64 hands
+// over higher-half addresses because it has already built the map, the device-tree architectures
+// hand over physical ones because the kernel builds its own.
+pub(crate) fn make_module(bytes: &[u8], name: &str, bias: u64) -> bootproto::Module {
+	let mut module = bootproto::Module { addr: bias + bytes.as_ptr() as u64, size: bytes.len() as u64, name: [0; 32] };
+	let n = name.len().min(module.name.len());
+	module.name[..n].copy_from_slice(&name.as_bytes()[..n]);
+	module
+}
+
 // Copy `bytes` into fresh LOADER_DATA pages, which the firmware retains across the hand-off.
 fn retain(bs: *mut BootServices, bytes: &[u8]) -> Option<&'static [u8]> {
 	let pages = bytes.len().div_ceil(PAGE_SIZE as usize).max(1);

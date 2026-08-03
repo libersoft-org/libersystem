@@ -123,9 +123,55 @@ _start:
 static BOOT_MODULES: crate::sync::SpinLock<Option<&'static [u8]>> = crate::sync::SpinLock::new(None);
 // The archive's physical base, so the frame pool can be clamped below it. 0 = none found.
 static MODULES_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// Whether the archive came from the loader (already the init package) or from the runner's
+// wrapper (holding it as an entry). The two are read differently.
+static FROM_LOADER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // The archive the initrd carries, or an empty slice when none was supplied - a kernel booted
 // with no userspace still comes up, it just has nothing to start.
+// The bootstrap archive the UEFI loader passed as a module, translated into the kernel's map.
+//
+// The loader hands over physical addresses because it runs before this kernel builds its own
+// higher-half map; reading them raw is how the first attempt failed, with the kernel reporting a
+// malformed init package it had never actually read.
+// A named module from the loader's hand-off, translated into the kernel's map.
+fn loader_module_at(arg: u64, want: &[u8]) -> Option<&'static [u8]> {
+	if arg == 0 {
+		return None;
+	}
+	// The same test `decode_boot_arg` makes: a BootInfo or a raw DTB pointer. Read here rather
+	// than from the published BootInfo because this runs before the kernel publishes one.
+	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return None;
+	}
+	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
+	let (modules_phys, modules_len) = unsafe { (core::ptr::read_volatile(core::ptr::addr_of!((*bi).modules)), core::ptr::read_volatile(core::ptr::addr_of!((*bi).modules_len))) };
+	if modules_phys == 0 || modules_len == 0 {
+		return None;
+	}
+	let modules = unsafe { core::slice::from_raw_parts(super::paging::phys_to_virt(modules_phys) as *const bootproto::Module, modules_len as usize) };
+	for module in modules {
+		let end = module.name.iter().position(|&b| b == 0).unwrap_or(module.name.len());
+		if &module.name[..end] == want {
+			return Some(unsafe { core::slice::from_raw_parts(super::paging::phys_to_virt(module.addr) as *const u8, module.size as usize) });
+		}
+	}
+	None
+}
+
+// The boot argument, kept so a module can be looked up after the early boot has moved on.
+static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn loader_archive(arg: u64) -> Option<&'static [u8]> {
+	BOOT_ARG.store(arg, core::sync::atomic::Ordering::SeqCst);
+	loader_module_at(arg, crate::product::INIT_PACKAGE.as_bytes())
+}
+
+fn loader_module(want: &[u8]) -> Option<&'static [u8]> {
+	loader_module_at(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), want)
+}
+
 fn boot_archive() -> &'static [u8] {
 	(*BOOT_MODULES.lock()).unwrap_or(&[])
 }
@@ -151,6 +197,18 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// magic at the target; the UEFI path also carries a GOP framebuffer, so the kernel
 	// draws its earliest boot log to the display instead of programming ramfb itself.
 	let (dtb, uefi_fb) = decode_boot_arg(arg);
+
+	// The loader's hand-off, taken BEFORE anything else looks at the boot argument.
+	//
+	// It has to be outside the device-tree branch: under UEFI the firmware exposes no DTB at all,
+	// so everything conditioned on one is dead there - which is exactly how the first attempt
+	// failed, with the kernel reporting a malformed init package that its own code had skipped
+	// over. The addresses are physical, because the loader runs before this kernel has a map.
+	if let Some(archive) = loader_archive(arg) {
+		*BOOT_MODULES.lock() = Some(archive);
+		FROM_LOADER.store(true, core::sync::atomic::Ordering::SeqCst);
+		crate::serial_println!("aarch64: boot packages handed over by the loader ({} bytes)", archive.len());
+	}
 
 	crate::serial_println!("{} kernel is starting ...", crate::product::NAME);
 	crate::serial_println!("arch: aarch64 | EL{el} | DTB {dtb:#x}");
@@ -206,7 +264,14 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 			// Find the boot-module archive the runner placed high in RAM. Recorded as a physical
 			// base so the frame pool below can stop underneath it - a &'static slice into memory
 			// the allocator may hand out would be overwritten mid-boot.
-			if let Some((base, length)) = crate::arch::common::dtb::find_modules(bi.ram_base, bi.ram_size, super::paging::phys_to_virt) {
+			// Scanned only when the loader handed nothing over. The scan looks for a magic number
+			// in RAM, and under UEFI - where no archive is laid down at all - it can match
+			// something else entirely: it claimed a 57 MB "archive" and overwrote the one the
+			// loader had actually passed. A hand-off that names what it contains beats a search
+			// that hopes.
+			if BOOT_MODULES.lock().is_some() {
+				// already handed over
+			} else if let Some((base, length)) = crate::arch::common::dtb::find_modules(bi.ram_base, bi.ram_size, super::paging::phys_to_virt) {
 				MODULES_PHYS.store(base, core::sync::atomic::Ordering::SeqCst);
 				let archive: &'static [u8] = unsafe { core::slice::from_raw_parts(super::paging::phys_to_virt(base) as *const u8, length as usize) };
 				*BOOT_MODULES.lock() = Some(archive);
@@ -456,9 +521,19 @@ fn publish_embedded_boot_info() {
 	}
 	// The archive holds the packages as named entries, so the module list is built from what
 	// was actually handed over rather than from a fixed pair the kernel was compiled with.
+	// Two shapes, because there are two ways the packages arrive.
+	//
+	// The loader hands over the bootstrap archive ITSELF - it read the programs off the volume and
+	// packed them, so what arrives is already the init package. The `-kernel` runner instead lays
+	// down a WRAPPER holding `init.pkg` and `volume.pkg` as entries, because it can pass only one
+	// blob. Unwrapping the loader's archive looks for an `init.pkg` inside an init.pkg and finds
+	// nothing, which is the last of four different reasons this kernel reported a malformed init
+	// package while holding a perfectly good one.
+	//
+	// The wrapper is what M0138c retires; until the `-kernel` path goes, both shapes are read.
 	let archive = boot_archive();
-	let init = abi::Package::parse(archive).and_then(|p| p.lookup(b"init.pkg")).unwrap_or(&[]);
-	let volume = abi::Package::parse(archive).and_then(|p| p.lookup(b"volume.pkg")).unwrap_or(&[]);
+	let from_loader = FROM_LOADER.load(core::sync::atomic::Ordering::SeqCst);
+	let (init, volume): (&[u8], &[u8]) = if from_loader { (archive, loader_module(b"volume.pkg").unwrap_or(&[])) } else { (abi::Package::parse(archive).and_then(|p| p.lookup(b"init.pkg")).unwrap_or(&[]), abi::Package::parse(archive).and_then(|p| p.lookup(b"volume.pkg")).unwrap_or(&[])) };
 	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", init), module(b"volume.pkg", volume)]));
 	// Hand the early framebuffer (if any) to a userspace consumer of the boot info.
 	let (framebuffer, fb_present) = match *BOOT_FB.lock() {

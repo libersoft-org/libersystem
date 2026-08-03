@@ -454,8 +454,12 @@ test-preflight-aarch64: sdk user-aarch64 test-tags-check
     tools/check-staged-image.sh aarch64
     boot/test-preflight.sh write aarch64
 
-test-aarch64: test-preflight-aarch64
-    boot/test-kernel.sh aarch64
+# Booted through the OWN UEFI LOADER, not QEMU's `-kernel`: the loader reads the kernel and the
+# bootstrap set and hands them over as named modules, which is the path a real machine takes and
+# the one M0138 makes canonical. `UEFI=0 just test-aarch64` still exercises the direct boot while
+# it exists.
+test-aarch64: test-preflight-aarch64 loader-aarch64
+    UEFI={{ env('UEFI', '1') }} boot/test-kernel.sh aarch64
 
 # Run the union of the requested aarch64 tags plus the smoke set.
 test-tags-aarch64 tags: test-preflight-aarch64
@@ -576,12 +580,20 @@ loader-aarch64:
 # script (loader/riscv64-pe.ld); llvm-objcopy then flattens it into a valid EFI
 # application, padded to the image end so its section raw data is fully backed.
 loader-riscv64:
-    RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/loader/riscv64-pe.ld" \
-        cargo build --manifest-path {{ loader_dir }}/Cargo.toml --target riscv64gc-unknown-none-elf &&
-    END=$(llvm-readelf -s {{ cargo_loader_dir }}/riscv64gc-unknown-none-elf/debug/libersystem-loader | awk '/ _pe_image_end$/{print "0x"$2; exit}') &&
-    llvm-objcopy -O binary --pad-to "$END" \
-        {{ cargo_loader_dir }}/riscv64gc-unknown-none-elf/debug/libersystem-loader \
-        {{ cargo_loader_dir }}/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Built from the loader's own directory so cargo reads ITS `.cargo/config.toml`. Run with
+    # `--manifest-path` from elsewhere, cargo takes the configuration of the working directory
+    # instead - which has no `build-std` for this target, so the build failed with "can't find
+    # crate for core" and the recipe had been red for as long as anyone had looked.
+    cd {{ loader_dir }}
+    RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/riscv64-pe.ld" \
+        cargo build --target riscv64gc-unknown-none-elf
+    out="../../.build/cargo/loader/riscv64gc-unknown-none-elf/debug/libersystem-loader"
+    end=$(llvm-readelf -s "$out" | awk '/ _pe_image_end$/{print "0x"$2; exit}' || true)
+    [[ -n "$end" ]] || { echo "loader-riscv64: no _pe_image_end symbol in $out" >&2; exit 1; }
+    llvm-objcopy -O binary --pad-to "$end" "$out" "$out.efi"
+    echo "loader-riscv64: wrote $out.efi"
 
 # build + boot the ARM64 build in QEMU (native on an aarch64 host, emulated on an x86
 # host), reaching the interactive shell over the serial console. Uses QEMU's direct
