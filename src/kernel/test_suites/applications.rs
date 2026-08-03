@@ -348,6 +348,20 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	// forced from a kernel test, because the service grows its own heap; an oversized chunk
 	// reaches the same decision and is the reachable substitute.
 	assert!(!streamed.write_stream(b"vol://tmp/f", &[b"partial"], 0x7304, Some(8192)), "a stream that ends abnormally is refused");
+
+	// A medium that cannot be written refuses the stream BEFORE it accepts anything.
+	//
+	// This used to be impossible to express: the backend answered a single `Option<Result<usize>>`
+	// where `None` meant "no cheap limit", "read-only" and "cannot validate the path" all at once,
+	// so a read-only volume fell through to the caller's fallback ceiling and took up to 64 MiB
+	// into memory before anything refused it. The backend now answers with a PLAN, and a refusal
+	// is one of the answers.
+	//
+	// The sender holds its end OPEN and sends nothing, so a reply can only be a decision about the
+	// destination. An empty stream would not test this: dropping the sender ends it cleanly and the
+	// refusal then comes from the write at the end, exactly as it did before the plan existed.
+	let mut readonly = StorageHarness::start_archive(storage_elf);
+	assert!(readonly.stream_refused_before_sending(b"vol://system/anything", 0x7305), "a stream to a read-only volume is refused before the sender offers a byte");
 	assert_eq!(streamed.open(b"vol://tmp/f", 0x7305), Some(b"new contents".to_vec()), "and the destination still holds what it held - no prefix was written");
 
 	// A path that cannot be written is refused before any of it is collected.

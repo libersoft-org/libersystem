@@ -483,6 +483,28 @@ impl FatBacking {
 // the universal operations; the mutation and snapshot operations default to the read-only
 // answer (a foreign or optical medium refuses them), so a read-only backend implements
 // only the four read operations.
+// What a filesystem says about writing to one path, BEFORE a byte is accepted.
+enum WritePlan {
+	// The path may be written. `max_len` is a real ceiling from this filesystem, or `None` when it
+	// has none to give before the write is attempted.
+	Allowed { max_len: Option<usize> },
+	// It may not, and this is why: a read-only medium, a policy refusal, a missing parent, a
+	// directory in the way. Returned before the caller allocates anything for the payload.
+	Refused(Error),
+}
+
+// The most a STREAM may accumulate when the filesystem gives no ceiling of its own.
+//
+// This is the receiver's policy and nothing else. It is not a filesystem limit and not a protocol
+// limit - an ordinary write to LiberFS may legitimately exceed it, because the payload already
+// exists and the filesystem decides. It exists because a stream must be bounded by SOMETHING
+// before it accepts the first byte, and the sender chooses how much to send.
+//
+// It cannot currently be stated in the contract: LSIDL has no constant declarations, so putting
+// this number in `idl/*.lsidl` needs generator work. Until then a client learns it by being
+// refused, which is the honest description of where it lives.
+const STREAM_ACCUMULATION: usize = 64 * 1024 * 1024;
+
 trait FileSystem {
 	// The vol:// volume name this backend answers to.
 	fn volume_name(&self) -> &'static [u8];
@@ -506,20 +528,25 @@ trait FileSystem {
 		self.write_file(name, &data)
 	}
 
-	// The most a write to THIS PATH may carry, or why it cannot be written at all.
+	// Whether this path may be written at all, and how much a single write may carry.
 	//
 	// Asked of the path rather than the volume, because a bound taken from the volume is wrong in
 	// both directions: it refuses a rewrite of a file that already holds the space it needs, and
-	// it accepts a new file whose name then does not fit. Answering here also validates the
-	// destination, so a streaming caller learns about a missing parent before it accepts a byte
-	// instead of after it has held the whole file.
+	// it accepts a new file whose name then does not fit.
 	//
-	// `None` means "this backend does not answer for a path": the caller must not turn that into a
-	// limit of its own. A default of 16 MiB was worse than no answer - it silently became the
-	// ceiling for ORDINARY writes on every backend that had not overridden it, so a 20 MiB write
-	// to the disk was refused for a limit invented on behalf of streaming.
-	fn writable_len(&mut self, _name: &[u8]) -> Option<Result<usize, Error>> {
-		None
+	// The point of a PLAN rather than a length is that a refusal is an answer. The previous shape
+	// returned `Option<Result<usize, Error>>`, where `None` meant three different things at once -
+	// "no cheap limit", "read-only medium" and "cannot validate the path yet" - so a stream to an
+	// ISO volume accepted up to the caller's ceiling before anything refused it, and the comment
+	// claiming the destination was validated first held for one backend only.
+	//
+	// `max_len: None` means this filesystem has no ceiling to give before the write: it is bounded
+	// by the medium at commit time. It is NOT permission to invent one - see `STREAM_ACCUMULATION`.
+	//
+	// The default is a refusal, matching the default mutations below: a backend that has not
+	// implemented writing must not read as writable-with-unknown-limit.
+	fn write_plan(&mut self, _name: &[u8]) -> WritePlan {
+		WritePlan::Refused(Error::Invalid)
 	}
 	// The filesystem's own identity and health numbers (for `lsvol` / `status`).
 	fn status(&mut self) -> Result<VolumeStatus, Error>;
@@ -594,9 +621,12 @@ impl Volume {
 		// simply refuse it.
 		let limit: usize = {
 			let name: &[u8] = self.writable_name(path)?;
-			match self.fs.writable_len(name) {
-				Some(answer) => answer?,
-				None => 64 * 1024 * 1024,
+			match self.fs.write_plan(name) {
+				// A read-only volume, a missing parent, a directory in the way: refused HERE,
+				// before a byte is accepted, which is what the plan exists for.
+				WritePlan::Refused(e) => return Err(e),
+				WritePlan::Allowed { max_len: Some(max) } => max,
+				WritePlan::Allowed { max_len: None } => STREAM_ACCUMULATION,
 			}
 		};
 
@@ -692,10 +722,17 @@ impl volume::Service for Volume {
 		let owned = OwnedHandle::new(data.handle);
 		let allowed: Option<usize> = {
 			let name: &[u8] = self.writable_name(&path)?;
-			self.fs.writable_len(name).transpose()?
+			match self.fs.write_plan(name) {
+				// Refused before the payload is mapped rather than after: a write to a read-only
+				// volume used to map the client's buffer first and refuse in `write_file`.
+				WritePlan::Refused(e) => return Err(e),
+				WritePlan::Allowed { max_len } => max_len,
+			}
 		};
-		// Only a backend that answered for this path gets to refuse here; the rest decide in
-		// `write_file`, as they always did.
+		// A ceiling is only checked when the filesystem gave one. `STREAM_ACCUMULATION` is
+		// deliberately NOT applied here: the payload already exists in the client's memory, so
+		// there is nothing for this service to be protected from, and applying it was the
+		// regression that refused a 20 MiB disk write for a limit invented on behalf of streaming.
 		if allowed.is_some_and(|allowed| data.len as usize > allowed) {
 			// The volume cannot take this now; the request itself was well formed.
 			return Err(Error::Again);
@@ -857,6 +894,16 @@ struct DiskFs {
 }
 
 impl FileSystem for DiskFs {
+	// Writable unless the mount itself is read-only (a snapshot, or a volume degraded by a corrupt
+	// snapshot table). No ceiling before the write: free blocks are a lower bound on what fits
+	// because this filesystem compresses, so quoting them as a maximum would refuse writes that
+	// would have succeeded.
+	fn write_plan(&mut self, _name: &[u8]) -> WritePlan {
+		if self.fs.is_read_only() {
+			return WritePlan::Refused(Error::Denied);
+		}
+		WritePlan::Allowed { max_len: None }
+	}
 	fn volume_name(&self) -> &'static [u8] {
 		SYSTEM_VOLUME
 	}
@@ -920,6 +967,10 @@ impl FileSystem for DiskFs {
 // delete files), but no directory writes, snapshots, compression or fsck - so it uses the
 // trait defaults for those. Mounting is lazy and self-healing (see `FatBacking::run`).
 impl FileSystem for FatBacking {
+	// Writable, with no ceiling to give before the write: the FAT backend decides at commit time.
+	fn write_plan(&mut self, _name: &[u8]) -> WritePlan {
+		WritePlan::Allowed { max_len: None }
+	}
 	fn volume_name(&self) -> &'static [u8] {
 		self.name
 	}
@@ -978,8 +1029,11 @@ impl FileSystem for MemFs {
 	fn capacity(&mut self) -> Result<u64, Error> {
 		Ok(self.fs.capacity())
 	}
-	fn writable_len(&mut self, name: &[u8]) -> Option<Result<usize, Error>> {
-		Some(self.fs.writable_len(name).map_err(map_fs_err))
+	fn write_plan(&mut self, name: &[u8]) -> WritePlan {
+		match self.fs.writable_len(name) {
+			Ok(max) => WritePlan::Allowed { max_len: Some(max) },
+			Err(e) => WritePlan::Refused(map_fs_err(e)),
+		}
 	}
 	fn write_file_owned(&mut self, name: &[u8], data: Vec<u8>) -> Result<(), Error> {
 		// Adopted, not copied: the streamed buffer becomes the file's own storage, so a reserved
@@ -1178,6 +1232,11 @@ impl ArchiveFs {
 }
 
 impl FileSystem for ArchiveFs {
+	// `denied` rather than `invalid`, matching its mutations: the boot archive is refused as a
+	// matter of policy, not because writing was never implemented.
+	fn write_plan(&mut self, _name: &[u8]) -> WritePlan {
+		WritePlan::Refused(Error::Denied)
+	}
 	fn volume_name(&self) -> &'static [u8] {
 		SYSTEM_VOLUME
 	}

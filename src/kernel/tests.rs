@@ -2361,6 +2361,40 @@ impl StorageHarness {
 		panic!("memory StorageService harness did not report online");
 	}
 
+	// A READ-ONLY volume: the boot archive, handed over exactly as the kernel hands it to the
+	// real service. There was no read-only volume in this harness at all, which is why "a stream
+	// to a medium that cannot be written is refused before the first byte" had nothing to test
+	// against.
+	fn start_archive(storage_elf: &[u8]) -> Self {
+		use object::channel::{Channel, Message};
+		use object::memory_object::MemoryObject;
+		use object::rights::Rights;
+		let volume = volume_package_bytes().expect("volume package module not found");
+		let (boot, boot_user) = Channel::create();
+		let (block, _unused) = Channel::create();
+		let (server, client) = Channel::create();
+		let (admin, admin_child) = Channel::create();
+		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		let ramdisk = MemoryObject::create(volume.len()).expect("no memory for the archive");
+		copy_into_object(&ramdisk, volume);
+		let mut request = alloc::vec::Vec::with_capacity(7 + 8);
+		request.extend_from_slice(b"RAMDISK");
+		request.extend_from_slice(&(volume.len() as u64).to_le_bytes());
+		let cap = object::handle::Capability::new(ramdisk as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP, 0);
+		boot.send(Message::new(request, alloc::vec![cap], 0)).expect("archive volume bootstrap");
+		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
+		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: volume.len() as u64 };
+		for _ in 0..100_000 {
+			harness.pump();
+			if let Ok(report) = harness.boot.recv() {
+				assert_eq!(&report.bytes[..], b"StorageService: online");
+				return harness;
+			}
+		}
+		panic!("archive StorageService harness did not report online");
+	}
+
 	fn restart(mut self, storage_elf: &[u8]) -> Self {
 		use object::channel::Message;
 		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("storage shutdown request");
@@ -2478,6 +2512,37 @@ impl StorageHarness {
 			self.pump();
 			if let Ok(reply) = self.client.recv() {
 				return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&1);
+			}
+		}
+		false
+	}
+
+	// Open a write stream and see whether the service refuses it WITHOUT being sent anything.
+	//
+	// The distinction this draws is the whole point of the write plan: a refusal that arrives on
+	// the strength of the destination alone, before the sender has offered a byte. Checking with
+	// an empty stream does not draw it - dropping the sender ends the stream cleanly and the
+	// refusal then comes from the write at the end, which is what happened before the plan existed
+	// and would let a weaker implementation pass.
+	//
+	// Returns true when a failure reply arrives while the sender is still holding its end open.
+	fn stream_refused_before_sending(&mut self, path: &[u8], corr: u32) -> bool {
+		use object::channel::Channel;
+		use object::rights::Rights;
+		let (service_side, _our_side) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&16u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&self.client, &request, service_side, Rights::ALL).expect("storage write-stream request");
+		// `_our_side` stays alive for the whole loop, so the stream is never closed and nothing is
+		// ever sent: any reply here is a decision made about the destination.
+		for _ in 0..20_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&0);
 			}
 		}
 		false
