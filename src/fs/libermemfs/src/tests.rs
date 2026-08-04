@@ -910,3 +910,27 @@ fn a_streamed_rewrite_is_not_promised_the_room_an_ordinary_one_has() {
 	assert_eq!(fs.stream_begin(b"f"), Ok(()), "opening the stream is still allowed");
 	assert_eq!(fs.stream_push(&payload), Err(FsError::NoSpace), "but its first chunk is refused, as the plan said");
 }
+
+#[test]
+fn receiving_into_the_volume_costs_one_buffer_rather_than_two() {
+	// The earlier accounting test built its chunk OUTSIDE the budgeted block, so the transport's
+	// own allocation was never measured - and that allocation was the point: the service used to
+	// receive a message into its own vector and the filesystem then copied it, so every chunk
+	// existed twice.
+	//
+	// Here the space comes from the volume and is written in place, so the peak is one buffer.
+	// Sized so two copies would not fit: a 64 KiB volume in a 96 KiB heap, taking 48 KiB in.
+	within(96 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Capped, 64 * 1024).expect("mount");
+		fs.stream_begin(b"a").expect("begin");
+		let spare = fs.stream_spare(48 * 1024).expect("the volume hands out room for the chunk");
+		assert_eq!(spare.len(), 48 * 1024, "and it is the size that was asked for");
+		// What a receive would do: fill it in place. No second buffer exists at any point.
+		for (i, byte) in spare.iter_mut().enumerate() {
+			*byte = (i & 0xff) as u8;
+		}
+		fs.stream_advance(48 * 1024, 48 * 1024);
+		fs.stream_commit().expect("commit");
+		assert_eq!(fs.used(), 48 * 1024, "the file holds what was received");
+	});
+}

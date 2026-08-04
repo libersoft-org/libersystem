@@ -741,6 +741,53 @@ impl LiberMemFs {
 		Ok(())
 	}
 
+	// Make room for `want` more bytes and hand back the space to receive INTO.
+	//
+	// The transport used to allocate the whole message as its own vector and then copy it in here,
+	// so a reserved volume held its reservation, that chunk, the pending buffer and - while it grew
+	// - the pending buffer's old and new allocations, all at once. The reservation could not
+	// promise to take one chunk near its capacity because of a buffer the volume did not know
+	// about. Receiving straight into the pending buffer removes both the second allocation and the
+	// copy.
+	//
+	// The space is zeroed rather than exposed uninitialised: a memset costs far less than the
+	// allocation it replaces, and the alternative is unsafe code on the receive path of a service
+	// that reads from untrusted peers.
+	pub fn stream_spare(&mut self, want: usize) -> Result<&mut [u8], FsError> {
+		let Some(pending) = self.pending.as_ref() else { return Err(FsError::Invalid) };
+		let filled = pending.data.len();
+		let total = filled.saturating_add(want);
+		if total > MAX_FILE_BYTES {
+			self.stream_abort();
+			return Err(FsError::TooLong);
+		}
+		let without = (self.footprint() as usize).saturating_sub(pending.data.capacity());
+		if without.saturating_add(total) > self.capacity {
+			self.stream_abort();
+			return Err(FsError::NoSpace);
+		}
+		if self.policy == Policy::Reserved {
+			self.release_reservation();
+		}
+		let pending = self.pending.as_mut().ok_or(FsError::Invalid)?;
+		if pending.data.try_reserve_exact(want).is_err() {
+			self.stream_abort();
+			return Err(FsError::NoSpace);
+		}
+		pending.data.resize(total, 0);
+		let pending = self.pending.as_mut().ok_or(FsError::Invalid)?;
+		Ok(&mut pending.data[filled..])
+	}
+
+	// Keep `written` of the space handed out, discarding the rest.
+	pub fn stream_advance(&mut self, offered: usize, written: usize) {
+		if let Some(pending) = self.pending.as_mut() {
+			let keep = pending.data.len().saturating_sub(offered.saturating_sub(written.min(offered)));
+			pending.data.truncate(keep);
+		}
+		self.resync_reservation();
+	}
+
 	// Store what arrived. The buffer becomes the file's own storage, so nothing is copied and the
 	// volume never holds two versions of the contents at once.
 	pub fn stream_commit(&mut self) -> Result<(), FsError> {

@@ -722,6 +722,40 @@ pub unsafe fn recv_vec_blocking(channel: u64) -> ReceivedVec {
 	}
 }
 
+// How a receive INTO a caller's buffer ended.
+pub enum RecvInto {
+	// Bytes written. Any transferred handle is closed rather than returned: this path is for bulk
+	// stream chunks, which carry none.
+	Received(usize),
+	PeerClosed,
+	// Nothing there after all - a wait said readable and another reader took it first.
+	Empty,
+	Failed,
+}
+
+// Receive one message straight into `buf`, without allocating for it.
+//
+// The ordinary path allocates a vector the size the SENDER chose, which is right when the receiver
+// has nowhere to put the bytes yet. A service streaming into a filesystem does: the destination can
+// hand out the space, and the intermediate vector is then a second copy of every chunk, outstanding
+// beside whatever the destination is already holding.
+#[unsafe(no_mangle)]
+pub unsafe fn recv_into(channel: u64, buf: &mut [u8]) -> RecvInto {
+	unsafe {
+		let mut handle: u64 = 0;
+		let got: i64 = syscall(SYS_CHANNEL_RECV, channel, buf.as_mut_ptr() as u64, buf.len() as u64, &mut handle as *mut u64 as u64) as i64;
+		if handle != 0 {
+			close(handle);
+		}
+		match got {
+			n if n >= 0 => RecvInto::Received(n as usize),
+			ERR_PEER_CLOSED => RecvInto::PeerClosed,
+			ERR_WOULD_BLOCK => RecvInto::Empty,
+			_ => RecvInto::Failed,
+		}
+	}
+}
+
 // Receive one message, refusing anything larger than `max` WITHOUT allocating for it.
 //
 // The ceiling belongs to the caller because only the caller knows what it will hold: a storage
@@ -1755,7 +1789,10 @@ pub unsafe fn recv_message_caps(channel: u64, buf: &mut [u8], handles: &mut [u64
 // A reply is the last place one client can stop a service: streams no longer block the loop while
 // they transfer, but a client that fills its reply queue and stops reading held it on the answer.
 // A caller that gets `Stalled` is expected to treat that client as gone rather than wait for it.
-#[unsafe(no_mangle)]
+//
+// No `no_mangle`: this one is called across the image only through the storage service's own crate,
+// not through the shared-image transport boundary, and an exported symbol nothing imports is a
+// symbol the image checker has to be told about.
 pub unsafe fn send_caps_deadline(channel: u64, bytes: &[u8], handles: &[u64], deadline: u64) -> SendOutcome {
 	unsafe {
 		if handles.is_empty() {

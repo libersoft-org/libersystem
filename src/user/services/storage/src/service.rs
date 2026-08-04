@@ -432,6 +432,59 @@ enum StreamStep {
 // other clients nothing.
 fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 	let room = p.limit.saturating_sub(p.received);
+	// Straight into the destination when it can hand out the space.
+	//
+	// The path below allocates the message as its own vector and the filesystem then copies it, so
+	// every chunk exists twice for as long as the copy takes - beside the reservation, the pending
+	// buffer, and the pending buffer's old allocation while it grows. That is why a reserved volume
+	// could not promise to take one chunk near its capacity.
+	if p.incremental {
+		let waiting: i64 = unsafe { channel_peek(p.stream) };
+		if waiting == ERR_PEER_CLOSED {
+			return StreamStep::Done(Ok(()));
+		}
+		if waiting < 0 {
+			return StreamStep::More;
+		}
+		let want = waiting as usize;
+		if want == 0 {
+			// An empty message is the sender saying it is finished; take it and stop.
+			let mut nothing: [u8; 1] = [0u8; 1];
+			let _ = unsafe { recv_into(p.stream, &mut nothing[..0]) };
+			return StreamStep::Done(Ok(()));
+		}
+		if want > room {
+			return StreamStep::Done(Err(if p.limit_is_policy { Error::Invalid } else { Error::Again }));
+		}
+		let offered = want;
+		let written = match vol.fs.stream_spare(want) {
+			Some(Ok(spare)) => match unsafe { recv_into(p.stream, spare) } {
+				RecvInto::Received(n) => n,
+				RecvInto::PeerClosed => {
+					vol.fs.stream_advance(offered, 0);
+					return StreamStep::Done(Ok(()));
+				}
+				RecvInto::Empty => {
+					vol.fs.stream_advance(offered, 0);
+					return StreamStep::More;
+				}
+				RecvInto::Failed => {
+					vol.fs.stream_advance(offered, 0);
+					return StreamStep::Done(Err(Error::Invalid));
+				}
+			},
+			Some(Err(e)) => return StreamStep::Done(Err(e)),
+			None => 0,
+		};
+		vol.fs.stream_advance(offered, written);
+		p.received = p.received.saturating_add(written);
+		p.chunks += 1;
+		if p.chunks > STREAM_CHUNK_GRACE && p.received / p.chunks < STREAM_MIN_CHUNK {
+			return StreamStep::Done(Err(Error::Invalid));
+		}
+		p.idle = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
+		return StreamStep::More;
+	}
 	match unsafe { recv_vec_bounded(p.stream, room) } {
 		BoundedVec::Message { bytes: chunk, handle } => {
 			// A stream carries plain messages; a capability sent anyway must not leak into this
@@ -939,6 +992,12 @@ trait FileSystem {
 	fn stream_push(&mut self, _chunk: &[u8]) -> Result<(), Error> {
 		Err(Error::Invalid)
 	}
+	// Space to receive into, so a chunk is not allocated twice - once by the transport and once by
+	// the destination.
+	fn stream_spare(&mut self, _want: usize) -> Option<Result<&mut [u8], Error>> {
+		None
+	}
+	fn stream_advance(&mut self, _offered: usize, _written: usize) {}
 	fn stream_commit(&mut self) -> Result<(), Error> {
 		Err(Error::Invalid)
 	}
@@ -1019,152 +1078,7 @@ impl Volume {
 	}
 }
 
-impl Volume {
-	// Collect a streamed write, bounded at every step.
-	// Receive a stream and STORE it. One method rather than two, because the pending write in the
-	// filesystem has to be committed or abandoned on every path out, and a caller that receives
-	// bytes and stores them separately can leave one open.
-	fn receive_stream(&mut self, data: u64, path: &str) -> Result<(), Error> {
-		let incremental: bool = match self.fs.stream_begin(self.writable_name(path)?) {
-			Some(result) => {
-				result?;
-				true
-			}
-			None => false,
-		};
-		match self.receive_body(data, path, incremental) {
-			Ok(bytes) => {
-				if incremental {
-					self.fs.stream_commit()
-				} else {
-					let name: &[u8] = self.writable_name(path)?;
-					self.fs.write_file_owned(name, bytes)
-				}
-			}
-			Err(e) => {
-				// A stream that cannot be completed leaves the destination exactly as it was -
-				// the first property this filesystem fixed, and the one a half-received pending
-				// write would quietly take back.
-				if incremental {
-					self.fs.stream_abort();
-				}
-				Err(e)
-			}
-		}
-	}
-
-	fn receive_body(&mut self, data: u64, path: &str, incremental: bool) -> Result<Vec<u8>, Error> {
-		// Validated before a byte is accepted, and against what a single write may actually be -
-		// not the volume's whole capacity, which on a disk backend is the size of the disk. A
-		// stream to a path that cannot exist should cost a parse, not a heap.
-		// Validates the destination as a side effect: a stream to a missing parent, to a file used
-		// as a directory, or to a directory is refused HERE rather than after the whole file has
-		// been held in memory.
-		// Validates the destination as a side effect: a stream to a missing parent, to a file used
-		// as a directory, or to a directory is refused HERE rather than after the whole file has
-		// been held in memory.
-		// A backend that answers for the path gives the real ceiling; one that does not gets the
-		// per-file maximum, because a stream must be bounded by SOMETHING before it accepts a byte
-		// - unlike an ordinary write, where the whole payload already exists and the backend can
-		// simply refuse it.
-		// The ceiling AND where it came from. Exceeding the two means different things to a client:
-		// a filesystem's ceiling is the space it has, so a later attempt may fit, while
-		// `STREAM_ACCUMULATION` is this service's own policy and no amount of waiting changes it.
-		// Reporting both as `Again` told a client to retry something that can only fail.
-		let (limit, limit_is_policy): (usize, bool) = {
-			let name: &[u8] = self.writable_name(path)?;
-			match self.fs.write_plan(name) {
-				// A read-only volume, a missing parent, a directory in the way: refused HERE,
-				// before a byte is accepted, which is what the plan exists for.
-				WritePlan::Refused(e) => return Err(e),
-				WritePlan::Allowed { max_len: Some(max) } => (max, false),
-				WritePlan::Allowed { max_len: None } => (STREAM_ACCUMULATION, true),
-			}
-		};
-
-		// Fixed once, before the first chunk: a total deadline that a sender cannot push back by
-		// sending something.
-		let expires = unsafe { clock() }.saturating_add(STREAM_TOTAL_TICKS);
-		let mut bytes: Vec<u8> = Vec::new();
-		let mut received: usize = 0;
-		let mut chunks: usize = 0;
-		loop {
-			// Bounded at RECEPTION. The accumulation check below cannot help if a single chunk
-			// has already been allocated at whatever size the sender chose.
-			// Bounded in TIME as well as in size. The serve loop runs this synchronously, so a
-			// client that opens a stream and then says nothing would otherwise hold the whole
-			// service - every other client, every other volume, the admin endpoint - for as long
-			// as it liked. The previous round stopped a sender from drowning the service in data;
-			// it did not stop one from stopping it with silence.
-			//
-			// A deadline bounds the harm rather than removing it: the service is still unavailable
-			// while it waits. Streams belong in the event loop as pending operations, which is a
-			// larger change and is recorded as such.
-			//
-			// The EARLIER of the two deadlines: idle (has the sender gone away) and total (has this
-			// operation run long enough). Taking the idle one alone let a sender renew its window
-			// with a single byte and hold the service indefinitely while never being idle.
-			let idle = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
-			let deadline = core::cmp::min(idle, expires);
-			match unsafe { recv_vec_deadline(data, limit.saturating_sub(received), deadline) } {
-				BoundedVec::Message { bytes: chunk, handle } => {
-					// A stream carries plain messages. A client that transfers a capability
-					// anyway must not leak it into this service's table.
-					if handle != 0 {
-						unsafe { close(handle) };
-					}
-					if chunk.is_empty() {
-						break;
-					}
-					// INTO the filesystem when it takes chunks, into this heap when it does not.
-					//
-					// The difference is who accounts for the memory. A memory volume and its
-					// incoming stream compete for the same heap, and accumulating here made the
-					// volume's `free()` report room the service had already spent - so an ordinary
-					// write succeeded where the identical stream ran the heap out. A disk backend
-					// has its own space and this heap is only a staging area, so it accumulates.
-					if incremental {
-						self.fs.stream_push(&chunk)?;
-					} else {
-						if bytes.try_reserve_exact(chunk.len()).is_err() {
-							return Err(Error::Again);
-						}
-						bytes.extend_from_slice(&chunk);
-					}
-					received = received.saturating_add(chunk.len());
-					chunks += 1;
-					// Refused as malformed rather than retryable: a sender behaving this way will
-					// behave the same way if it tries again.
-					if chunks > STREAM_CHUNK_GRACE && received / chunks < STREAM_MIN_CHUNK {
-						return Err(Error::Invalid);
-					}
-				}
-				// Over the limit, or refused before it was allocated. Stop reading rather than
-				// draining politely: a sender that keeps writing would otherwise hold this
-				// service in the method for as long as it liked, and blocking a hostile sender is
-				// the smaller harm.
-				// `Again` throughout, matching the ordinary write: the request was well formed and
-				// the volume could not take it now. Reporting `Invalid` here made the same refusal
-				// look permanent through one transport and retryable through the other.
-				BoundedVec::TooLarge { .. } => return Err(if limit_is_policy { Error::Invalid } else { Error::Again }),
-				// Both deadlines surface here; `Again` fits either, because the request was well
-				// formed and a later attempt may succeed.
-				BoundedVec::Idle => return Err(Error::Again),
-				// NOT an end of file. Running out of memory, or a channel error, used to look
-				// exactly like the sender finishing - so the prefix received so far was written
-				// over the destination and the call reported success. A write that cannot be
-				// completed must leave the file as it was, which is the property this filesystem
-				// fixed in its backend and lost again here.
-				BoundedVec::NoMemory { .. } => return Err(Error::Again),
-				BoundedVec::ReceiveError => return Err(Error::Invalid),
-				// (no other endings)
-				// The sender is done. The only ending that means the file is whole.
-				BoundedVec::PeerClosed => break,
-			}
-		}
-		Ok(bytes)
-	}
-}
+impl Volume {}
 
 impl volume::Service for Volume {
 	// Resolve a vol:// path and hand back the file's bytes as a read-only shared
@@ -1224,22 +1138,19 @@ impl volume::Service for Volume {
 		self.fs.write_file(name, buffer.as_slice())
 	}
 
-	// UNREACHABLE from the serve loop, which intercepts `OP_WRITE_STREAM` and registers a pending
-	// write instead of receiving one here. It stays because the generated trait requires it, and
-	// because a caller that reaches the generated dispatch directly - the direct-service test does
-	// - still gets correct behaviour rather than a stub.
+	// UNREACHABLE. The serve loop intercepts `OP_WRITE_STREAM` and registers a pending write, so
+	// nothing dispatches here; the method exists because the generated trait requires it.
 	//
-	// Kept synchronous on purpose: this path has no serve loop to return to.
-	fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error> {
-		if data == 0 {
-			return Err(Error::Invalid);
+	// It used to carry a SECOND, synchronous implementation of the same protocol - receive the
+	// whole stream, then store it - kept "so the direct-dispatch path still behaves". Nothing takes
+	// that path: the only direct dispatch in the tree is a stub in the protocol tests. Two
+	// implementations of one protocol, with different orderings and different bounds, is a drift
+	// waiting to happen, so the unreachable one is gone rather than maintained.
+	fn write_stream(&mut self, _path: String, data: u64) -> Result<(), Error> {
+		if data != 0 {
+			unsafe { close(data) };
 		}
-		// The stream's channel is owned from here on: the generated dispatch has handed it over,
-		// so every path out of this method has to close it. A `?` before the close leaked it, and
-		// a client repeating a bad path could exhaust the handle table that way.
-		let outcome = self.receive_stream(data, &path);
-		unsafe { close(data) };
-		outcome
+		Err(Error::Invalid)
 	}
 
 	// Delete a file. A read-only volume refuses with `denied`.
@@ -1562,6 +1473,12 @@ impl FileSystem for MemFs {
 	}
 	fn stream_push(&mut self, chunk: &[u8]) -> Result<(), Error> {
 		self.fs.stream_push(chunk).map_err(map_fs_err)
+	}
+	fn stream_spare(&mut self, want: usize) -> Option<Result<&mut [u8], Error>> {
+		Some(self.fs.stream_spare(want).map_err(map_fs_err))
+	}
+	fn stream_advance(&mut self, offered: usize, written: usize) {
+		self.fs.stream_advance(offered, written);
 	}
 	fn stream_commit(&mut self) -> Result<(), Error> {
 		self.fs.stream_commit().map_err(map_fs_err)
