@@ -15,7 +15,8 @@
 //!
 //! - `Policy::Reserved` takes its whole capacity at mount, so mounting fails when the memory is
 //!   not available and nothing else in the process can take it afterwards. What it does NOT
-//!   promise is that the memory can always be taken back: the reservation is one contiguous
+//!   promise is that the memory can always be taken back: the reservation is held as a bounded
+//!   list of chunks (see `MAX_RESERVATION_CHUNKS`) rather than one contiguous
 //!   allocation, and after deletes fragment the heap the total free memory can cover it while no
 //!   single block does. When that happens the volume holds less than its capacity, says so
 //!   through `reserved_bytes()`, and reports it to clients as a volume no longer covering its
@@ -273,6 +274,37 @@ impl LiberMemFs {
 	// the write would reuse its buffer and need nothing new - and it accepts a new file of exactly
 	// the free space, whose name then does not fit. A streaming caller has to know this before it
 	// accepts a byte.
+	// The most a STREAM to this path may carry, which is not the same answer.
+	//
+	// `writable_len` is right for an ordinary write, which replaces a file's contents in place and
+	// may therefore use what that file already holds. A stream cannot: it keeps the old contents
+	// until the commit - that is what makes a failed transfer leave the file as it was - and builds
+	// the new ones beside them. So the old file's allocation is NOT available to it, and answering
+	// as if it were let a stream be admitted by the preflight and refused by its first chunk.
+	//
+	// The asymmetry is real rather than an accounting slip: an atomic replace needs room for both
+	// versions at once. This says so instead of promising otherwise.
+	pub fn stream_len(&self, path: &[u8]) -> Result<usize, FsError> {
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		if parts.is_empty() {
+			return Err(FsError::IsDir);
+		}
+		let free = self.capacity.saturating_sub(self.footprint() as usize);
+		match self.resolve(parts)? {
+			Some(Node::Directory(_)) => Err(FsError::IsDir),
+			// The old file stays where it is, so only what is genuinely free is available.
+			Some(Node::File(_)) => Ok(free.min(MAX_FILE_BYTES)),
+			None => {
+				if self.root.count() >= MAX_ENTRIES {
+					return Ok(0);
+				}
+				let name = parts.last().map_or(0, |name| name.len());
+				Ok(free.saturating_sub(name).min(MAX_FILE_BYTES))
+			}
+		}
+	}
+
 	pub fn writable_len(&self, path: &[u8]) -> Result<usize, FsError> {
 		let (parts, count) = Self::segments(path)?;
 		let parts = &parts[..count];
@@ -645,6 +677,12 @@ impl LiberMemFs {
 				}
 			}
 		}
+		// The path counts against the volume, so opening a stream on a full one must be refused
+		// rather than quietly taking it over capacity. Nothing of the file has arrived yet; this is
+		// the entry's own cost.
+		if (self.footprint() as usize).saturating_add(path.len()) > self.capacity {
+			return Err(FsError::NoSpace);
+		}
 		let mut owned: Vec<u8> = Vec::new();
 		owned.try_reserve_exact(path.len()).map_err(|_| FsError::NoSpace)?;
 		owned.extend_from_slice(path);
@@ -707,8 +745,16 @@ impl LiberMemFs {
 	// volume never holds two versions of the contents at once.
 	pub fn stream_commit(&mut self) -> Result<(), FsError> {
 		let Some(pending) = self.pending.take() else { return Err(FsError::Invalid) };
+		// Adopt FIRST, resync once at the end.
+		//
+		// Resyncing here regrew the reservation while the data and the path were still alive in
+		// this local - memory the volume had just stopped counting and was about to hand to the
+		// file - so the regrow competed with itself. `write_file_owned` resyncs after the adoption,
+		// which is the only moment the volume's footprint is what it will be.
+		let stored = self.write_file_owned(&pending.path, pending.data);
+		drop(pending.path);
 		self.resync_reservation();
-		self.write_file_owned(&pending.path, pending.data)
+		stored
 	}
 
 	// Give up. The room goes back to the volume, and the destination is untouched - a stream that

@@ -886,3 +886,27 @@ fn a_stream_that_grows_past_its_spare_capacity_reserves_fallibly() {
 		assert!(!fs.streaming(), "and the refused stream is abandoned rather than left half-received");
 	});
 }
+
+#[test]
+fn a_streamed_rewrite_is_not_promised_the_room_an_ordinary_one_has() {
+	// The two answers differ, and the difference is real rather than an accounting slip.
+	//
+	// An ordinary rewrite replaces a file's contents in place, so it may spend what that file
+	// already holds. A stream cannot: it keeps the old contents until the commit - which is what
+	// makes a failed transfer leave the file as it was - and builds the new ones beside them.
+	//
+	// Answering both with the same figure let a stream be admitted by the preflight and refused by
+	// its first chunk, on a volume that had told it there was room.
+	let mut fs = LiberMemFs::mount(Policy::Capped, 4096).expect("mount");
+	let payload = alloc::vec![b'x'; 4000];
+	fs.write_file(b"f", &payload).expect("fill the volume");
+
+	let ordinary = fs.writable_len(b"f").expect("an ordinary rewrite has an answer");
+	let streamed = fs.stream_len(b"f").expect("so does a streamed one");
+	assert!(ordinary >= 4000, "an ordinary rewrite may reuse what the file holds: {ordinary}");
+	assert!(streamed < 100, "a streamed rewrite may not, because the old contents stay: {streamed}");
+
+	// And the preflight now matches what the stream can actually do.
+	assert_eq!(fs.stream_begin(b"f"), Ok(()), "opening the stream is still allowed");
+	assert_eq!(fs.stream_push(&payload), Err(FsError::NoSpace), "but its first chunk is refused, as the plan said");
+}

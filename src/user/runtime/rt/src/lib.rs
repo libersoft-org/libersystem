@@ -991,9 +991,24 @@ pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 // true on delivery, false if the queue is full (WOULD_BLOCK) or the peer is gone. Used
 // for droppable traffic - e.g. mouse reports to a program that may not be reading them.
 pub unsafe fn try_send(channel: u64, bytes: &[u8], xfer: u64) -> bool {
+	matches!(unsafe { try_send_outcome(channel, bytes, xfer) }, SendOutcome::Delivered)
+}
+
+// `try_send` that says WHY it did not send.
+//
+// A full queue and a departed peer are different facts and a bool cannot carry the difference: a
+// listing whose consumer had closed stayed alive to its deadline, waking the loop every tick and
+// refusing a second listing, for a consumer that was never going to read again. `Stalled` here
+// means "no room now"; `Failed` means "there is nobody there".
+#[unsafe(no_mangle)]
+pub unsafe fn try_send_outcome(channel: u64, bytes: &[u8], xfer: u64) -> SendOutcome {
 	unsafe {
-		let result: u64 = syscall(SYS_CHANNEL_SEND, channel, bytes.as_ptr() as u64, bytes.len() as u64, xfer);
-		result == 0
+		let signed: i64 = syscall(SYS_CHANNEL_SEND, channel, bytes.as_ptr() as u64, bytes.len() as u64, xfer) as i64;
+		match signed {
+			0 => SendOutcome::Delivered,
+			ERR_WOULD_BLOCK => SendOutcome::Stalled,
+			_ => SendOutcome::Failed,
+		}
 	}
 }
 
@@ -1733,6 +1748,35 @@ pub unsafe fn recv_message_caps(channel: u64, buf: &mut [u8], handles: &mut [u64
 // `send_caps` with the blocking discipline of `send_blocking`: retry while the peer's queue is
 // full, waiting for room rather than spinning. An empty list degrades to the ordinary
 // single-handle send with no handle, so one call site serves both shapes.
+#[unsafe(no_mangle)]
+// Image-internal transport boundary consumed by ipc-client.lslib.
+// `send_caps_blocking` that gives up at `deadline` (absolute ticks; 0 waits forever).
+//
+// A reply is the last place one client can stop a service: streams no longer block the loop while
+// they transfer, but a client that fills its reply queue and stops reading held it on the answer.
+// A caller that gets `Stalled` is expected to treat that client as gone rather than wait for it.
+#[unsafe(no_mangle)]
+pub unsafe fn send_caps_deadline(channel: u64, bytes: &[u8], handles: &[u64], deadline: u64) -> SendOutcome {
+	unsafe {
+		if handles.is_empty() {
+			return send_deadline(channel, bytes, 0, deadline);
+		}
+		loop {
+			let signed = send_caps(channel, bytes, handles);
+			if signed != ERR_WOULD_BLOCK {
+				return if signed == 0 { SendOutcome::Delivered } else { SendOutcome::Failed };
+			}
+			if deadline != 0 && clock() >= deadline {
+				return SendOutcome::Stalled;
+			}
+			let waited: i64 = syscall(SYS_WAIT, channel, deadline, WAIT_WRITABLE | WAIT_PERIODIC, 0) as i64;
+			if waited < 0 && waited != ERR_TIMED_OUT {
+				return SendOutcome::Failed;
+			}
+		}
+	}
+}
+
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
 pub unsafe fn send_caps_blocking(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {

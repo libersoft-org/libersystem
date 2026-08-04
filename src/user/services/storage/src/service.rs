@@ -104,6 +104,15 @@ const FS_START_SECTOR: u64 = 0;
 // The timer runs at 100 Hz on every architecture, so a tick is 10 ms and this is thirty seconds.
 const STREAM_IDLE_TICKS: u64 = 3_000;
 
+// How long a reply waits for a client that is not reading it.
+//
+// The last place one client could stop this service. Streams stopped blocking the loop while they
+// transfer, but the ANSWER still went out through an unbounded send, so a client that filled its
+// reply queue and stopped reading held the loop on it - every other client, every volume. A client
+// that will not take its reply for ten seconds is treated as gone and its channel is dropped;
+// keeping it would mean keeping everyone else waiting for it.
+const REPLY_TICKS: u64 = 1_000;
+
 // The most a whole stream may take, counted from the request rather than from the last chunk.
 //
 // The idle deadline alone bounds SILENCE, not slowness: it is rebuilt after every chunk, so a
@@ -364,9 +373,9 @@ fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], re
 		Some((corr, path, data))
 	})();
 	let Some((corr, path, data)) = parsed else {
-		for &leftover in request_handle.as_slice() {
-			unsafe { close(leftover) };
-		}
+		// Left for the serve loop to close, which closes whatever is unclaimed after every request.
+		// Closing here as well left the list populated, so the same handles were closed twice -
+		// harmless while slots are not reused, and wrong regardless of that.
 		return Err((0, Error::Invalid));
 	};
 	request_handle.clear();
@@ -399,7 +408,7 @@ fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], re
 		Ok(name) => name,
 		Err(e) => return refuse(e),
 	};
-	let (limit, limit_is_policy): (usize, bool) = match vol.fs.write_plan(name) {
+	let (limit, limit_is_policy): (usize, bool) = match vol.fs.stream_plan(name) {
 		WritePlan::Refused(e) => return refuse(e),
 		WritePlan::Allowed { max_len: Some(max) } => (max, false),
 		WritePlan::Allowed { max_len: None } => (STREAM_ACCUMULATION, true),
@@ -487,7 +496,9 @@ fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, 
 	};
 	unsafe { close(p.stream) };
 	if let Some(len) = write_stream_reply(p.corr, result, reply) {
-		unsafe { send_blocking(p.client, &reply[..len], 0) };
+		// Bounded: a client that has stopped reading its replies must not hold the service on this
+		// one. Nothing to do if it will not take it - the stream is already finished either way.
+		unsafe { send_deadline(p.client, &reply[..len], 0, clock().saturating_add(REPLY_TICKS)) };
 	}
 }
 
@@ -612,6 +623,10 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 			}
 			Received::Message { len, handle } => {
 				let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+				// Set when a client would not take its reply within the bound. It is dropped below:
+				// a client that has stopped reading is gone for every practical purpose, and the
+				// alternative is holding the whole service for it.
+				let mut stalled = false;
 				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 				if op == volume::OP_WRITE_STREAM {}
 				if op == HEARTBEAT_OP {
@@ -651,16 +666,28 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						let mut reply_handle = proto::codec::Handles::new();
 						let reply_len: Option<usize> = if scope.allows_request(vol.name(), &request[..len]) { volume::dispatch(vol, &request[..len], &mut handle, &mut reply, &mut reply_handle) } else { denied_reply(&request[..len], &mut reply) };
 						if let Some(reply_len) = reply_len {
-							if !unsafe { send_caps_blocking(chan, &reply[..reply_len], reply_handle.as_slice()) } {
+							// Bounded, and a client that will not take its answer is dropped below
+							// rather than waited for.
+							let sent = unsafe { send_caps_deadline(chan, &reply[..reply_len], reply_handle.as_slice(), clock().saturating_add(REPLY_TICKS)) };
+							if !matches!(sent, SendOutcome::Delivered) {
 								for &leftover in reply_handle.as_slice() {
 									unsafe { close(leftover) };
 								}
+								stalled = matches!(sent, SendOutcome::Stalled);
 							}
 						} else {
 							for &leftover in reply_handle.as_slice() {
 								unsafe { close(leftover) };
 							}
 						}
+					}
+				}
+				if stalled {
+					// Never the root client: dropping that ends the service, and a stalled root is
+					// the boot chain's problem rather than something to resolve by exiting.
+					if index != 0 {
+						unsafe { close(chan) };
+						clients.swap_remove(index);
 					}
 				}
 				for &unclaimed in handle.as_slice() {
@@ -714,32 +741,44 @@ fn pump_list(p: &mut PendingList) -> bool {
 	// alone: closing carries no information, so completion has to be said rather than implied.
 	while p.seq <= p.items.len() {
 		if p.seq == p.items.len() {
-			if unsafe { try_send(p.producer, &[], 0) } {
-				p.seq += 1;
-				return true;
-			}
-			return unsafe { clock() } >= p.expires;
+			return match unsafe { try_send_outcome(p.producer, &[], 0) } {
+				SendOutcome::Delivered | SendOutcome::Failed => true,
+				SendOutcome::Stalled => (unsafe { clock() }) >= p.expires,
+			};
 		}
 		let mut frame_handle: u64 = 0;
 		let Some(n) = volume::list_frame(p.seq as u32, &p.items[p.seq], &mut frame, &mut frame_handle) else {
-			// An entry that will not encode is skipped, as it always was; the alternative is to
-			// abandon a listing over one name.
+			// An entry that will not encode ENDS the listing, without the terminal frame, so the
+			// client is told the answer is incomplete. Skipping it produced a directory listing
+			// that silently lacked a name - the same defect as a truncated one, one entry at a
+			// time, and the reader cannot see the gap because it ignores the sequence number.
 			if frame_handle != 0 {
 				unsafe { close(frame_handle) };
 			}
-			p.seq += 1;
-			continue;
+			return true;
 		};
-		if unsafe { try_send(p.producer, &frame[..n], frame_handle) } {
-			p.seq += 1;
-			continue;
+		match unsafe { try_send_outcome(p.producer, &frame[..n], frame_handle) } {
+			SendOutcome::Delivered => {
+				p.seq += 1;
+				continue;
+			}
+			// Nobody is there. Waiting out the deadline for a consumer that has closed wakes the
+			// loop every tick and refuses the next listing, for nothing.
+			SendOutcome::Failed => {
+				if frame_handle != 0 {
+					unsafe { close(frame_handle) };
+				}
+				return true;
+			}
+			// The queue is full. Give up only once the consumer has had long enough; otherwise
+			// come back on the next pass.
+			SendOutcome::Stalled => {
+				if frame_handle != 0 {
+					unsafe { close(frame_handle) };
+				}
+				return unsafe { clock() } >= p.expires;
+			}
 		}
-		// The queue is full. Give up only once the consumer has had long enough; otherwise come
-		// back on the next pass.
-		if frame_handle != 0 {
-			unsafe { close(frame_handle) };
-		}
-		return unsafe { clock() } >= p.expires;
 	}
 	true
 }
@@ -888,6 +927,12 @@ trait FileSystem {
 	// service's heap is only a staging area. It matters for the memory filesystem, where the
 	// accumulator and the destination compete for the SAME memory and the volume's accounting
 	// could not see half of it: `free()` reported room the service had already spent.
+	// What a STREAM to this path may carry. Defaults to the ordinary plan, which is right for every
+	// backend whose bytes are bound for a medium: only the memory filesystem pays for holding the
+	// old contents and the new ones at once.
+	fn stream_plan(&mut self, name: &[u8]) -> WritePlan {
+		self.write_plan(name)
+	}
 	fn stream_begin(&mut self, _name: &[u8]) -> Option<Result<(), Error>> {
 		None
 	}
@@ -1334,9 +1379,25 @@ impl FileSystem for DiskFs {
 	// snapshot table). No ceiling before the write: free blocks are a lower bound on what fits
 	// because this filesystem compresses, so quoting them as a maximum would refuse writes that
 	// would have succeeded.
-	fn write_plan(&mut self, _name: &[u8]) -> WritePlan {
+	//
+	// The DESTINATION is checked, which it was not: this backend ignored the name it was given and
+	// answered `Allowed` for anything, so a stream to a missing parent accepted up to the whole
+	// accumulation ceiling before failing at commit. The comment promising validation before the
+	// first byte held for the memory filesystem alone.
+	fn write_plan(&mut self, name: &[u8]) -> WritePlan {
 		if self.fs.is_read_only() {
 			return WritePlan::Refused(Error::Denied);
+		}
+		// A path that names an existing DIRECTORY cannot be written as a file.
+		if self.fs.read_dir(name).is_ok() {
+			return WritePlan::Refused(Error::Invalid);
+		}
+		// The parent has to exist. An empty parent is the volume root, which always does.
+		if let Some(cut) = name.iter().rposition(|&b| b == b'/') {
+			let parent = &name[..cut];
+			if !parent.is_empty() && self.fs.read_dir(parent).is_err() {
+				return WritePlan::Refused(Error::NotFound);
+			}
 		}
 		WritePlan::Allowed { max_len: None }
 	}
@@ -1404,7 +1465,19 @@ impl FileSystem for DiskFs {
 // trait defaults for those. Mounting is lazy and self-healing (see `FatBacking::run`).
 impl FileSystem for FatBacking {
 	// Writable, with no ceiling to give before the write: the FAT backend decides at commit time.
-	fn write_plan(&mut self, _name: &[u8]) -> WritePlan {
+	// The destination is checked for the same reason as on the disk backend - a stream to a path
+	// that cannot exist should cost a lookup, not a transfer.
+	fn write_plan(&mut self, name: &[u8]) -> WritePlan {
+		let Some(fs) = self.fs.as_mut() else { return WritePlan::Refused(Error::NotFound) };
+		if fs.list_dir(name).is_ok() {
+			return WritePlan::Refused(Error::Invalid);
+		}
+		if let Some(cut) = name.iter().rposition(|&b| b == b'/') {
+			let parent = &name[..cut];
+			if !parent.is_empty() && fs.list_dir(parent).is_err() {
+				return WritePlan::Refused(Error::NotFound);
+			}
+		}
 		WritePlan::Allowed { max_len: None }
 	}
 	fn volume_name(&self) -> &'static [u8] {
@@ -1467,6 +1540,14 @@ impl FileSystem for MemFs {
 	}
 	fn write_plan(&mut self, name: &[u8]) -> WritePlan {
 		match self.fs.writable_len(name) {
+			Ok(max) => WritePlan::Allowed { max_len: Some(max) },
+			Err(e) => WritePlan::Refused(map_fs_err(e)),
+		}
+	}
+	// A streamed rewrite keeps the old file until the commit, so it cannot spend what that file
+	// holds. Answering with the ordinary figure admitted streams the first chunk then refused.
+	fn stream_plan(&mut self, name: &[u8]) -> WritePlan {
+		match self.fs.stream_len(name) {
 			Ok(max) => WritePlan::Allowed { max_len: Some(max) },
 			Err(e) => WritePlan::Refused(map_fs_err(e)),
 		}

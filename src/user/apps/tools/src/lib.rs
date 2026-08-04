@@ -152,6 +152,11 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 		loop {
 			match recv_vec_blocking(consumer) {
 				ReceivedVec::Message { bytes, mut handle } => {
+					// The terminal frame: everything before it was the whole directory.
+					if bytes.is_empty() {
+						close(consumer);
+						return Ok(entries);
+					}
 					let entry = volume::list_read(&bytes, &mut handle);
 					if handle != 0 {
 						close(handle);
@@ -175,9 +180,11 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 						entries.push(entry);
 					}
 				}
+				// Closed WITHOUT the terminal frame: the producer gave up part way, so what arrived
+				// is a prefix. Returning it as the directory is the defect this marker exists for.
 				ReceivedVec::Closed => {
 					close(consumer);
-					return Ok(entries);
+					return Err(ListDirectoryError::Malformed);
 				}
 				// The caller asked for a directory's contents and gets an error instead of a
 				// prefix. `OutOfMemory` already exists for exactly this and is what an abnormal
