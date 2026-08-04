@@ -2499,7 +2499,15 @@ impl StorageHarness {
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = client.recv() {
-				if le_u32(&reply.bytes, 0) != corr || reply.bytes.get(4) != Some(&1) {
+				// A reply for ANOTHER correlation is not this call's answer. Skipping it matters
+				// now that two operations can be outstanding at once: with a stream pending, its
+				// reply may land here first, and treating that as this call's failure made the
+				// concurrency test fail on the emulated architectures only - where the stream had
+				// time to expire before the read was issued.
+				if le_u32(&reply.bytes, 0) != corr {
+					continue;
+				}
+				if reply.bytes.get(4) != Some(&1) {
 					return None;
 				}
 				let size = le_u64(&reply.bytes, 9) as usize;
@@ -2625,7 +2633,7 @@ impl StorageHarness {
 		send_cap(&self.client, &request, service_side, Rights::ALL).expect("storage write-stream request");
 		// Enough for the service to take the request and register it, not enough for anything to
 		// time out.
-		for _ in 0..512 {
+		for _ in 0..64 {
 			self.pump();
 		}
 		our_side

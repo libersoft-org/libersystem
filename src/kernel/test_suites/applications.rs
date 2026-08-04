@@ -406,8 +406,11 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	}
 	let idle_consumer = listed.list_without_reading(b"vol://tmp", 0x7780);
 	assert!(idle_consumer.is_some(), "the listing hands back a consumer");
-	advance_clock(8_000);
-	assert_eq!(listed.open(b"vol://tmp/f0", 0x7781), Some(b"x".to_vec()), "the service serves other clients once it gives up on an unread listing");
+	// NO clock advance. The listing is produced between passes of the serve loop, so a consumer
+	// that stops reading costs one pass rather than the service - it does not have to be given up
+	// on first. An earlier version of this test needed the clock moved past the send deadline,
+	// which is what "bounded" looked like before it became "not blocking".
+	assert_eq!(listed.open(b"vol://tmp/f0", 0x7781), Some(b"x".to_vec()), "the service serves other clients while a listing goes unread");
 	drop(idle_consumer);
 
 	// A refused write must not cost the service a handle.

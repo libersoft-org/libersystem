@@ -480,7 +480,18 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 	// which is the accounting hole the incremental path exists to close. Refusing the second with
 	// `Again` says something true and retryable rather than silently changing how it is charged.
 	let mut pending: Option<PendingWrite> = None;
+	// One listing in flight, for the same reason as the write: the service produces it between
+	// passes, and a second would need its own slot and its own bound for no gain today.
+	let mut listing: Option<PendingList> = None;
 	loop {
+		// Push what the consumer will take right now. Nothing here blocks, so a consumer that has
+		// stopped reading costs this pass and nothing else.
+		if let Some(l) = listing.as_mut() {
+			if pump_list(l) {
+				unsafe { close(l.producer) };
+				listing = None;
+			}
+		}
 		let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 2);
 		if admin != 0 {
 			waits.push(admin);
@@ -493,7 +504,16 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		}
 		// Wake for the stream's deadline even if nothing arrives, so a silent sender is given up on
 		// rather than waited out.
-		let deadline: u64 = pending.as_ref().map_or(0, |p| p.deadline());
+		// A stalled listing polls rather than sleeps: `wait_any` applies one readiness sense to the
+		// whole set, so a producer waiting for ROOM cannot be waited on beside clients waiting to
+		// be READ. A tick at a time keeps the service responsive and costs a wake per tick only
+		// while a consumer is actually behind. Mixed senses in `wait_any` would remove the poll.
+		let deadline: u64 = match (pending.as_ref(), listing.is_some()) {
+			(Some(p), false) => p.deadline(),
+			(Some(p), true) => core::cmp::min(p.deadline(), unsafe { clock() }.saturating_add(1)),
+			(None, true) => unsafe { clock() }.saturating_add(1),
+			(None, false) => 0,
+		};
 		// PERIODIC, for the reason `recv_vec_deadline` gives: a plain timed wait counts as pending
 		// progress, and `run_until_idle` then halts until the deadline whenever the run queue
 		// empties. With a stream's deadline in the set, that means the peer which would SEND the
@@ -510,6 +530,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				}
 			}
 			continue;
+			// A stalled listing needs no branch here: the push at the top of the loop retries it,
+			// and gives it up once its own deadline passes.
 		}
 		let chan: u64 = waits[ready as usize];
 		if let Some(p) = pending.as_ref() {
@@ -575,7 +597,13 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					// read-only backends, while denied requests never reach their filesystem.
 					vol.fs.set_clock(unsafe { clock_rtc() });
 					if op == volume::OP_LIST {
-						stream_list(vol, chan, &scope, &request[..len], &mut handle);
+						// A second listing while one is in flight is refused, like a second stream.
+						if listing.is_some() {
+							let corr = if len >= 6 { u32::from_le_bytes([request[2], request[3], request[4], request[5]]) } else { 0 };
+							unsafe { send_blocking(chan, &corr.to_le_bytes(), 0) };
+						} else {
+							listing = stream_list(vol, chan, &scope, &request[..len], &mut handle);
+						}
 					} else if op == volume::OP_WRITE_STREAM {
 						// Registered rather than received. `begin_stream` answers the client only
 						// when it refuses; otherwise the reply waits until the stream ends, and the
@@ -625,15 +653,61 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 // bad path replies the correlation id with NO consumer handle - the generated
 // client reads that as "no stream" - so an error stays distinguishable from an
 // empty directory (`cd` validates paths this way).
-fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], request_handle: &mut proto::codec::Handles) {
+// A listing the service has started and not finished.
+//
+// The entries are produced one at a time between passes of the serve loop, for the same reason a
+// write stream takes one chunk at a time: a consumer that does not read must not hold the service.
+// It used to send them with an unbounded blocking send, and a client that took the handle and
+// stopped reading stopped StorageService permanently.
+struct PendingList {
+	producer: u64,
+	items: Vec<FileInfo>,
+	seq: usize,
+	// Absolute ticks. A consumer that never drains is given up on rather than waited for.
+	expires: u64,
+}
+
+// Push as many entries as the consumer will take right now, without blocking.
+//
+// Returns true when the listing is finished (or abandoned) and the caller should drop it. The
+// service comes back here on the next pass, so a consumer that drains slowly still gets everything
+// while everyone else keeps being served.
+fn pump_list(p: &mut PendingList) -> bool {
+	let mut frame: [u8; 1024] = [0u8; 1024];
+	while p.seq < p.items.len() {
+		let mut frame_handle: u64 = 0;
+		let Some(n) = volume::list_frame(p.seq as u32, &p.items[p.seq], &mut frame, &mut frame_handle) else {
+			// An entry that will not encode is skipped, as it always was; the alternative is to
+			// abandon a listing over one name.
+			if frame_handle != 0 {
+				unsafe { close(frame_handle) };
+			}
+			p.seq += 1;
+			continue;
+		};
+		if unsafe { try_send(p.producer, &frame[..n], frame_handle) } {
+			p.seq += 1;
+			continue;
+		}
+		// The queue is full. Give up only once the consumer has had long enough; otherwise come
+		// back on the next pass.
+		if frame_handle != 0 {
+			unsafe { close(frame_handle) };
+		}
+		return unsafe { clock() } >= p.expires;
+	}
+	true
+}
+
+fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], request_handle: &mut proto::codec::Handles) -> Option<PendingList> {
 	let mut reader = proto::codec::Reader::with_handle_list(request, request_handle);
 	let r = &mut reader;
 	let (corr, path): (u32, String) = match (|| Some((r.u16()?, r.u32()?, r.string_lp()?)))() {
 		Some((_op, corr, path)) => (corr, path),
-		None => return,
+		None => return None,
 	};
 	if r.has_handle() {
-		return;
+		return None;
 	}
 	request_handle.clear();
 	let corr_bytes: [u8; 4] = corr.to_le_bytes();
@@ -641,7 +715,7 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], re
 		unsafe {
 			send_blocking(service, &corr_bytes, 0);
 		}
-		return;
+		return None;
 	}
 	let items: Vec<FileInfo> = match vol.list_entries(&path) {
 		Ok(items) => items,
@@ -649,12 +723,12 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], re
 			unsafe {
 				send_blocking(service, &corr_bytes, 0);
 			}
-			return;
+			return None;
 		}
 	};
 	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
 		Some(pair) => pair,
-		None => return,
+		None => return None,
 	};
 	// CHECKED. If the client closed the main channel just after asking, the consumer handle is
 	// never delivered - and it was previously never closed either, so it leaked AND left the
@@ -664,34 +738,12 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], re
 		if !send_blocking(service, &corr_bytes, consumer) {
 			close(consumer);
 			close(producer);
-			return;
+			return None;
 		}
 	}
-	let mut frame: [u8; 1024] = [0u8; 1024];
-	for (seq, item) in items.iter().enumerate() {
-		let mut frame_handle: u64 = 0;
-		if let Some(n) = volume::list_frame(seq as u32, item, &mut frame, &mut frame_handle) {
-			// BOUNDED. A client that takes the consumer handle and then stops reading fills this
-			// queue, and an unbounded send held the entire service on it - the same defect the
-			// inbound stream had, in the direction that had no bound at all. Abandoning a stalled
-			// listing truncates it for that client; blocking truncates it for every client.
-			let outcome = unsafe { send_deadline(producer, &frame[..n], frame_handle, clock().saturating_add(STREAM_IDLE_TICKS)) };
-			match outcome {
-				SendOutcome::Delivered => {}
-				SendOutcome::Failed | SendOutcome::Stalled => {
-					if frame_handle != 0 {
-						unsafe { close(frame_handle) };
-					}
-					break;
-				}
-			}
-		} else if frame_handle != 0 {
-			unsafe { close(frame_handle) };
-		}
-	}
-	unsafe {
-		close(producer);
-	}
+	// Handed back to the serve loop rather than produced here. Sending the entries in place is what
+	// let one unreading consumer stop the service; the loop pushes what fits between passes.
+	Some(PendingList { producer, items, seq: 0, expires: unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS) })
 }
 
 // The volume backing, behind the generated Storage.Volume contract: either a
