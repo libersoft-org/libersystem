@@ -291,21 +291,237 @@ fn denied_reply(request: &[u8], reply: &mut [u8]) -> Option<usize> {
 	Some(writer.pos())
 }
 
+// A write stream the service has accepted but not finished.
+//
+// The point of this type is that the serve loop RETURNS after every chunk. Receiving a stream
+// synchronously meant one client held the service for the whole transfer - every other client,
+// every volume, the admin endpoint - and three rounds of review answered that with a deadline,
+// which bounds the harm rather than removing it.
+struct PendingWrite {
+	// The client's end of the stream, and the channel its reply goes back on.
+	stream: u64,
+	client: u64,
+	corr: u32,
+	path: String,
+	// Absolute ticks. The idle one is renewed by every chunk; the total one is not, so a sender
+	// that drip-feeds cannot hold the entry forever.
+	idle: u64,
+	expires: u64,
+	// Whether the filesystem is accumulating this itself. When it is, the memory is charged to the
+	// volume as it arrives instead of piling up here where its accounting cannot see it.
+	incremental: bool,
+	bytes: Vec<u8>,
+	received: usize,
+	chunks: usize,
+	limit: usize,
+	limit_is_policy: bool,
+}
+
+impl PendingWrite {
+	fn deadline(&self) -> u64 {
+		core::cmp::min(self.idle, self.expires)
+	}
+}
+
+// `[corr][1]` for success, `[corr][0][error]` for failure - the shape the generated dispatch
+// writes, produced by hand because this reply is sent long after the call that asked for it.
+fn write_stream_reply(corr: u32, result: Result<(), Error>, out: &mut [u8]) -> Option<usize> {
+	let mut writer = SliceWriter::new(out);
+	let w = &mut writer;
+	w.u32(corr)?;
+	match result {
+		Ok(()) => w.u8(1)?,
+		Err(e) => {
+			w.u8(0)?;
+			e.write(w)?;
+		}
+	}
+	Some(writer.pos())
+}
+
+// Accept a write stream, or refuse it before a byte is taken.
+//
+// The destination is validated here - a read-only volume, a missing parent, a directory in the way
+// - so a refusal costs a parse rather than a transfer. `Err` carries the correlation id because the
+// caller has to answer the client that asked.
+fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], request_handle: &mut proto::codec::Handles, busy: bool) -> Result<PendingWrite, (u32, Error)> {
+	let mut reader = proto::codec::Reader::with_handle_list(request, request_handle);
+	let r = &mut reader;
+	let parsed: Option<(u32, String, u64)> = (|| {
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		let path = r.string_lp()?;
+		let _len = r.u32()?;
+		let data = r.take_handle()?;
+		Some((corr, path, data))
+	})();
+	let Some((corr, path, data)) = parsed else {
+		for &leftover in request_handle.as_slice() {
+			unsafe { close(leftover) };
+		}
+		return Err((0, Error::Invalid));
+	};
+	request_handle.clear();
+	// Every refusal from here on owns the stream channel and has to close it.
+	let refuse = |e: Error| {
+		unsafe { close(data) };
+		Err((corr, e))
+	};
+	if !scope.allows_request(vol.name(), request) {
+		return refuse(Error::Denied);
+	}
+	// One at a time: see the note where `pending` is declared.
+	if busy {
+		return refuse(Error::Again);
+	}
+	vol.fs.set_clock(unsafe { clock_rtc() });
+	let name: &[u8] = match vol.writable_name(&path) {
+		Ok(name) => name,
+		Err(e) => return refuse(e),
+	};
+	let (limit, limit_is_policy): (usize, bool) = match vol.fs.write_plan(name) {
+		WritePlan::Refused(e) => return refuse(e),
+		WritePlan::Allowed { max_len: Some(max) } => (max, false),
+		WritePlan::Allowed { max_len: None } => (STREAM_ACCUMULATION, true),
+	};
+	let incremental: bool = match vol.fs.stream_begin(name) {
+		Some(Ok(())) => true,
+		Some(Err(e)) => return refuse(e),
+		None => false,
+	};
+	let now = unsafe { clock() };
+	Ok(PendingWrite { stream: data, client, corr, path, idle: now.saturating_add(STREAM_IDLE_TICKS), expires: now.saturating_add(STREAM_TOTAL_TICKS), incremental, bytes: Vec::new(), received: 0, chunks: 0, limit, limit_is_policy })
+}
+
+enum StreamStep {
+	More,
+	Done(Result<(), Error>),
+}
+
+// Take ONE chunk and return to the loop. This is the whole difference from the synchronous
+// version: the service is available again between every chunk, so a slow or silent sender costs
+// other clients nothing.
+fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
+	let room = p.limit.saturating_sub(p.received);
+	match unsafe { recv_vec_bounded(p.stream, room) } {
+		BoundedVec::Message { bytes: chunk, handle } => {
+			// A stream carries plain messages; a capability sent anyway must not leak into this
+			// service's table.
+			if handle != 0 {
+				unsafe { close(handle) };
+			}
+			if chunk.is_empty() {
+				return StreamStep::Done(Ok(()));
+			}
+			if p.incremental {
+				if let Err(e) = vol.fs.stream_push(&chunk) {
+					return StreamStep::Done(Err(e));
+				}
+			} else if p.bytes.try_reserve_exact(chunk.len()).is_err() {
+				return StreamStep::Done(Err(Error::Again));
+			} else {
+				p.bytes.extend_from_slice(&chunk);
+			}
+			p.received = p.received.saturating_add(chunk.len());
+			p.chunks += 1;
+			// A drip-feeder is refused for the pattern, not the clock: it is never idle, so no
+			// deadline catches it.
+			if p.chunks > STREAM_CHUNK_GRACE && p.received / p.chunks < STREAM_MIN_CHUNK {
+				return StreamStep::Done(Err(Error::Invalid));
+			}
+			// Idle window renewed by arrival; the total deadline is not, which is what stops the
+			// renewal being unbounded.
+			p.idle = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
+			StreamStep::More
+		}
+		// The sender is done. The only ending that means the file is whole.
+		BoundedVec::PeerClosed => StreamStep::Done(Ok(())),
+		BoundedVec::TooLarge { .. } => StreamStep::Done(Err(if p.limit_is_policy { Error::Invalid } else { Error::Again })),
+		BoundedVec::NoMemory { .. } => StreamStep::Done(Err(Error::Again)),
+		BoundedVec::ReceiveError => StreamStep::Done(Err(Error::Invalid)),
+		// Nothing there after all - the wait said readable, so this is a race with another reader
+		// rather than an ending.
+		BoundedVec::Idle => StreamStep::More,
+	}
+}
+
+// Store what arrived (or give it up), close the stream, and answer the client that asked.
+fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, reply: &mut [u8]) {
+	let result = match outcome {
+		Ok(()) => {
+			if p.incremental {
+				vol.fs.stream_commit()
+			} else {
+				match vol.writable_name(&p.path) {
+					Ok(name) => vol.fs.write_file_owned(name, p.bytes),
+					Err(e) => Err(e),
+				}
+			}
+		}
+		Err(e) => {
+			if p.incremental {
+				vol.fs.stream_abort();
+			}
+			Err(e)
+		}
+	};
+	unsafe { close(p.stream) };
+	if let Some(len) = write_stream_reply(p.corr, result, reply) {
+		unsafe { send_blocking(p.client, &reply[..len], 0) };
+	}
+}
+
 fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full }];
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
+	// At most one at a time. The memory filesystem accumulates a stream in the volume itself and
+	// has room for one such write; a second would have to fall back to accumulating in this heap,
+	// which is the accounting hole the incremental path exists to close. Refusing the second with
+	// `Again` says something true and retryable rather than silently changing how it is charged.
+	let mut pending: Option<PendingWrite> = None;
 	loop {
-		let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + usize::from(admin != 0));
+		let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 2);
 		if admin != 0 {
 			waits.push(admin);
 		}
 		waits.extend(clients.iter().map(|client| client.chan));
-		let ready: i64 = unsafe { wait_any(&waits, 0) };
+		// The stream waits WITH everything else, so a chunk arriving and a new client asking for
+		// something are the same kind of event and neither excludes the other.
+		if let Some(p) = pending.as_ref() {
+			waits.push(p.stream);
+		}
+		// Wake for the stream's deadline even if nothing arrives, so a silent sender is given up on
+		// rather than waited out.
+		let deadline: u64 = pending.as_ref().map_or(0, |p| p.deadline());
+		// PERIODIC, for the reason `recv_vec_deadline` gives: a plain timed wait counts as pending
+		// progress, and `run_until_idle` then halts until the deadline whenever the run queue
+		// empties. With a stream's deadline in the set, that means the peer which would SEND the
+		// next chunk cannot run - the service sleeps thirty seconds and gives up on a sender that
+		// was never given the chance to speak. This wait is a guard, not progress.
+		let ready: i64 = unsafe { wait_any_periodic(&waits, deadline) };
 		if ready < 0 {
+			// Timed out, or the wait itself failed. Either way the only thing that can be due is
+			// the stream's deadline.
+			if let Some(p) = pending.as_ref() {
+				if unsafe { clock() } >= p.deadline() {
+					let p = pending.take().expect("checked");
+					finish_stream(vol, p, Err(Error::Again), &mut reply);
+				}
+			}
 			continue;
 		}
 		let chan: u64 = waits[ready as usize];
+		if let Some(p) = pending.as_ref() {
+			if chan == p.stream {
+				let mut p = pending.take().expect("checked");
+				match take_chunk(vol, &mut p) {
+					StreamStep::More => pending = Some(p),
+					StreamStep::Done(result) => finish_stream(vol, p, result, &mut reply),
+				}
+				continue;
+			}
+		}
 		if chan == admin {
 			match unsafe { recv_blocking(admin, &mut request) } {
 				Received::Message { len, handle } => {
@@ -344,6 +560,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 			Received::Message { len, handle } => {
 				let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+				if op == volume::OP_WRITE_STREAM {}
 				if op == HEARTBEAT_OP {
 					unsafe { send_blocking(chan, b"PONG", 0) };
 				} else if op == CONNECT_OP {
@@ -359,6 +576,18 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					vol.fs.set_clock(unsafe { clock_rtc() });
 					if op == volume::OP_LIST {
 						stream_list(vol, chan, &scope, &request[..len], &mut handle);
+					} else if op == volume::OP_WRITE_STREAM {
+						// Registered rather than received. `begin_stream` answers the client only
+						// when it refuses; otherwise the reply waits until the stream ends, and the
+						// loop goes straight back to serving everyone else.
+						match begin_stream(vol, chan, &scope, &request[..len], &mut handle, pending.is_some()) {
+							Ok(entry) => pending = Some(entry),
+							Err((corr, e)) => {
+								if let Some(reply_len) = write_stream_reply(corr, Err(e), &mut reply) {
+									unsafe { send_blocking(chan, &reply[..reply_len], 0) };
+								}
+							}
+						}
 					} else {
 						let mut reply_handle = proto::codec::Handles::new();
 						let reply_len: Option<usize> = if scope.allows_request(vol.name(), &request[..len]) { volume::dispatch(vol, &request[..len], &mut handle, &mut reply, &mut reply_handle) } else { denied_reply(&request[..len], &mut reply) };
@@ -853,11 +1082,12 @@ impl volume::Service for Volume {
 		self.fs.write_file(name, buffer.as_slice())
 	}
 
-	// The streaming write form: the file's bytes arrive as plain messages on the
-	// transferred `data` channel (an empty message or the peer closing marks the
-	// end), so a file's size is bounded by the filesystem, never by one transfer.
-	// The channel handle is always consumed; the reply goes out once the whole
-	// file is written.
+	// UNREACHABLE from the serve loop, which intercepts `OP_WRITE_STREAM` and registers a pending
+	// write instead of receiving one here. It stays because the generated trait requires it, and
+	// because a caller that reaches the generated dispatch directly - the direct-service test does
+	// - still gets correct behaviour rather than a stub.
+	//
+	// Kept synchronous on purpose: this path has no serve loop to return to.
 	fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error> {
 		if data == 0 {
 			return Err(Error::Invalid);
