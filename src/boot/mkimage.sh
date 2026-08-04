@@ -87,7 +87,10 @@ verify_boot_artifacts() {
 		case "$kind" in
 		kernel) source="$staged_kernel" ;;
 		loader) source="$LOADER_EFI" ;;
-		init-package | volume-package) source="$BUILD/$destination" ;;
+		# The manifest names these by their DESTINATION on the medium (`init.pkg`); in the build
+		# directory they carry the architecture, because every architecture writes them and an
+		# unqualified name holds whichever ran last.
+		init-package | volume-package) source="$BUILD/${destination%.pkg}-x86_64.pkg" ;;
 		*) die "manifest names boot artifact kind '$kind', which this image builder cannot stage" ;;
 		esac
 		if [[ ! -f "$source" ]]; then
@@ -95,7 +98,7 @@ verify_boot_artifacts() {
 			missing=1
 		fi
 	done < <(cd "$REPO_ROOT/src/tools/system-manifest" && cargo run --quiet -- boot-artifacts)
-	((missing == 0)) || die "packaging needs every artifact built first - run 'just build'"
+	((missing == 0)) || die "packaging needs every artifact built first - run './build.sh'"
 }
 
 # build a hybrid ISO (BIOS El Torito + UEFI), bootable as a CD or off a USB stick
@@ -141,9 +144,10 @@ make_iso() {
 	# a test medium had become one artifact in the first place.
 	local payload="$BUILD/system-volume-x86_64.img" payload_name="system-volume.img"
 	if [[ "$test_medium" == "1" ]]; then
-		# Architecture-qualified: the unqualified name is whichever build ran last.
+		# Architecture-qualified in the build directory, staged under the plain name the kernel
+		# looks it up by. The unqualified BUILD file no longer exists: every architecture wrote it,
+		# so it held whichever ran last.
 		payload="$BUILD/volume-x86_64.pkg"
-		[[ -f "$payload" ]] || payload="$BUILD/$VOLUME_PACKAGE"
 		payload_name="$VOLUME_PACKAGE"
 		[[ -f "$payload" ]] || die "testiso: no volume package at $payload (run \`just packages\`)"
 	else
@@ -151,7 +155,7 @@ make_iso() {
 	fi
 	# The init package is counted whether or not it is staged: it is the smaller of the two payloads
 	# and over-sizing a FAT image by a few megabytes is cheaper than getting it wrong.
-	bytes=$(($(stat -c%s "$staged") + $(stat -c%s "$BUILD/$INIT_PACKAGE") + $(stat -c%s "$payload") + $(stat -c%s "$LOADER_EFI")))
+	bytes=$(($(stat -c%s "$staged") + $(stat -c%s "$BUILD/init-x86_64.pkg") + $(stat -c%s "$payload") + $(stat -c%s "$LOADER_EFI")))
 	# FAT overhead + slack, rounded up to a whole MiB (min 32 MiB).
 	total=$(((bytes + 16 * 1024 * 1024) / (1024 * 1024) + 1))
 	((total < 32)) && total=32
@@ -306,7 +310,7 @@ key="$({
 	# BOTH payloads are hashed, whichever medium is being built: the shipping ISO carries the
 	# system volume and the test ISO the archive, and keying on only one would serve a stale image
 	# whenever the other changed. `mode=` above already separates the two outputs.
-	sha256sum "$0" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/$INIT_PACKAGE" "$BUILD/$VOLUME_PACKAGE" "$BUILD/system-volume-x86_64.img"
+	sha256sum "$0" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg" "$BUILD/volume-x86_64.pkg" "$BUILD/system-volume-x86_64.img"
 } | sha256sum | awk '{print $1}')"
 if [[ -f "$output" && -f "$key_file" && "$(<"$key_file")" == "$key" ]]; then
 	info "cache hit $output"

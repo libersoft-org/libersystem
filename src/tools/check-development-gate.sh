@@ -64,7 +64,7 @@ done
 #    the shipping set, because a build script does not see `cfg!(feature = ...)`. Both halves
 #    agreed they were shipping, so every assertion inside the build passed while the
 #    development image had no development units in it.
-package="../.build/boot/volume.pkg"
+package="../.build/boot/volume-x86_64.pkg"
 if [[ -e "$package" ]]; then
 	entries="$(tools/system-manifest.sh check-volume-package "$package" 2>&1 || true)"
 	wanted="shipping"

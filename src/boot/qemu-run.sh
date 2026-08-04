@@ -756,7 +756,13 @@ qemu_run_aarch64() {
 			exit 1
 		}
 		qemu_build_esp aarch64 "$kernel" "$loader_efi" BOOTAA64.EFI
-		local vars="$QEMU_BUILD_DIR/aavmf-vars.fd"
+		# A private copy per run, like the OVMF path above. One shared file means two aarch64 runs
+		# write each other's firmware variables, and the script `exec`s QEMU so no trap can clean up
+		# afterwards - stale copies from earlier runs are unlinked here instead, while a still-
+		# running instance keeps its own alive through its open descriptor.
+		rm -f "$QEMU_BUILD_DIR/aavmf-vars."*.fd
+		local vars
+		vars="$(mktemp "$QEMU_BUILD_DIR/aavmf-vars.XXXXXX.fd")"
 		cp "$aavmf_vars" "$vars"
 		# ESP goes last so system volume enumerates ahead of it.
 		qemu_attach_virtio_blk qemu_args "$ESP" esp "disable-legacy=on"

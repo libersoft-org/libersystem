@@ -150,7 +150,14 @@ preflight_fast() {
 	(cd "$SRC_DIR" && boot/test-preflight.sh check "$arch")
 }
 
-for arch in "${archs[@]}"; do
+# --arch all runs the architectures CONCURRENTLY.
+#
+# They no longer share anything: the ESP, the system disk, the FAT/ISO/UDF/USB media and the
+# firmware variable stores are all per-architecture, and the package archives stopped being written
+# under one name. Cargo still serialises the compile through its target-directory lock, which is
+# fine - the compile is short and cached, and the two emulated boots are what took the hour.
+run_arch() {
+	local arch="$1"
 	require_no_stray_qemu "$arch"
 	if [[ $fast -eq 1 ]]; then preflight_fast "$arch"; else preflight_full "$arch"; fi
 	args=("$arch")
@@ -163,4 +170,25 @@ for arch in "${archs[@]}"; do
 	else
 		(cd "$SRC_DIR" && UEFI="${UEFI:-1}" boot/test-kernel.sh "${args[@]}")
 	fi
+}
+
+if [[ ${#archs[@]} -eq 1 ]]; then
+	run_arch "${archs[0]}"
+	exit 0
+fi
+
+# Started together, waited for individually, so one architecture's failure does not hide another's
+# result - and every one of them is reported.
+pids=()
+for arch in "${archs[@]}"; do
+	run_arch "$arch" &
+	pids+=("$!")
 done
+failed=()
+for i in "${!pids[@]}"; do
+	wait "${pids[$i]}" || failed+=("${archs[$i]}")
+done
+if [[ ${#failed[@]} -gt 0 ]]; then
+	die "failed: ${failed[*]}"
+fi
+note "all architectures passed: ${archs[*]}"

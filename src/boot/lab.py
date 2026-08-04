@@ -494,7 +494,7 @@ INSTANCE_INPUTS = (
 	('protocol', ['src/bootproto'], []),
 	('kernel', ['src/kernel'], ['.build/cargo/kernel/x86_64-unknown-none/debug/kernel']),
 	('loader', ['src/loader'], ['.build/cargo/loader/x86_64-unknown-uefi/debug/libersystem-loader.efi']),
-	('packages', [], ['.build/boot/init.pkg', '.build/boot/volume.pkg']),
+	('packages', [], ['.build/boot/init-x86_64.pkg', '.build/boot/volume-x86_64.pkg']),
 	('image', [], ['.build/boot/libersystem.iso', 'src/boot/mkimage.sh']),
 	('topology', [], ['src/boot/qemu-run.sh']),
 )

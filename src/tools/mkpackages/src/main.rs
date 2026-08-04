@@ -245,6 +245,22 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	write_if_changed(&out_img, &image.bytes);
 }
 
+// `init.pkg` -> `init-riscv64.pkg`. Every architecture's build writes these, so an unqualified name
+// holds whichever ran LAST - a shared slot that has now handed the wrong artifact to something four
+// separate times: a riscv64 ESP got x86_64 programs, a disk image got the test kernel, and the
+// x86_64 suite got a riscv64 volume archive and failed parsing it as ELF.
+//
+// Qualified copies used to be made AFTER the fact, which left the unqualified name in place for
+// anything that still read it. Writing the qualified name in the first place is what removes the
+// slot rather than working around it.
+fn qualified(name: &str) -> String {
+	let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+	match name.rsplit_once('.') {
+		Some((stem, ext)) if !arch.is_empty() => format!("{stem}-{arch}.{ext}"),
+		_ => String::from(name),
+	}
+}
+
 fn main() {
 	// The target architecture the packages are for, as cargo spells it - the caller passes what
 	// build.rs used to read from CARGO_CFG_TARGET_ARCH.
@@ -270,7 +286,6 @@ fn main() {
 	verify_artifacts();
 	assemble_init_package(&conf);
 	assemble_volume_package(&conf);
-	export_cross_arch_volume();
 }
 
 #[derive(Clone)]
@@ -649,7 +664,7 @@ fn build_package(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 fn assemble_init_package(conf: &[(String, String)]) {
 	let manifest: PathBuf = kernel_anchor();
 	let out_dir: PathBuf = boot_dir();
-	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "INIT_PACKAGE"));
+	let out_pkg: PathBuf = out_dir.join(qualified(conf_get(conf, "INIT_PACKAGE")));
 
 	// (package entry name, ELF path). The init package holds only the pinned bootstrap set:
 	// the pinned services and the bootstrap block driver. Every other service,
@@ -699,7 +714,7 @@ fn assemble_init_package(conf: &[(String, String)]) {
 fn assemble_volume_package(conf: &[(String, String)]) {
 	let files = volume_files(conf);
 	let out_dir: PathBuf = boot_dir();
-	let out_pkg: PathBuf = out_dir.join(conf_get(conf, "VOLUME_PACKAGE"));
+	let out_pkg: PathBuf = out_dir.join(qualified(conf_get(conf, "VOLUME_PACKAGE")));
 	let entries: Vec<(&str, Vec<u8>)> = files.iter().map(|(name, data): &(String, Vec<u8>)| (name.as_str(), data.clone())).collect();
 	write_if_changed(&out_pkg, &build_package(&entries));
 }
@@ -813,37 +828,3 @@ fn volume_files(conf: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
 // single blob. aarch64 and riscv64 virt have no bootloader to pass files, so the runner loads
 // this archive into memory and the kernel finds it there.
 //
-// The `boot-packages-<arch>.pkg` wrapper this used to build is gone (M0138c). It existed only
-// because a machine booted with `-kernel` can be handed exactly one blob; all three architectures
-// now boot through the loader, which hands over each module under its own name.
-fn export_cross_arch_volume() {
-	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-	// EVERY architecture, not just the device-tree ones.
-	//
-	// The unqualified `volume.pkg` and `init.pkg` are written by every build, so after
-	// `--arch all` they hold whichever ran LAST. A test ISO staged that file and the x86_64 suite
-	// booted riscv64 binaries, failing at "dynamic test main is ELF". x86_64 had no qualified copy
-	// to fall back to because this exported them only for the other two - which is the same
-	// unqualified-shared-slot defect that has now served the wrong artifact three times.
-	{
-		let out_dir: PathBuf = boot_dir();
-		let build_dir: PathBuf = boot_dir();
-		let _ = fs::create_dir_all(&build_dir);
-		let vol_src: PathBuf = out_dir.join("volume.pkg");
-		let init_src: PathBuf = out_dir.join("init.pkg");
-		if vol_src.exists() {
-			let bytes: Vec<u8> = fs::read(&vol_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", vol_src.display()));
-			write_if_changed(&build_dir.join(format!("volume-{arch}.pkg")), &bytes);
-		}
-		// `init.pkg` is written under one name by EVERY architecture's build, so the copy in
-		// `.build/boot` is simply whichever built last. That is invisible until something reads it
-		// by that name: the UEFI ESP builder did, and staged x86_64 programs onto a riscv64 boot
-		// disk, where the kernel loaded the package fine and then failed to start SystemManager
-		// because its ELF was for another machine. Exported per architecture for the same reason
-		// the volume already is.
-		if init_src.exists() {
-			let bytes: Vec<u8> = fs::read(&init_src).unwrap_or_else(|error| panic!("cannot read {}: {error}", init_src.display()));
-			write_if_changed(&build_dir.join(format!("init-{arch}.pkg")), &bytes);
-		}
-	}
-}

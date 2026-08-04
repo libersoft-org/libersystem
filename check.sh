@@ -22,7 +22,7 @@ declare -A GATES=(
 	["malformed-dynamic"]="tools/check-static-injection.sh malformed-dynamic"
 	["malformed-symbol-relocation"]="tools/check-static-injection.sh malformed-symbol-relocation"
 	["identity-note"]="tools/check-static-injection.sh identity-note"
-	["volume-layout"]="tools/system-manifest.sh check-volume-package ../.build/boot/volume.pkg"
+	["volume-layout"]="tools/system-manifest.sh check-volume-package ../.build/boot/volume-x86_64.pkg"
 )
 
 FORMATS=(bmp gif ico icns jpeg pcx png ppm qoi tga webp)
