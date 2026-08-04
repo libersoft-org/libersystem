@@ -93,23 +93,31 @@ const FS_START_SECTOR: u64 = 0;
 // ticks `wait` takes. Long enough that a slow but real sender is not punished, short enough that a
 // silent one does not hold the service.
 //
-// Deliberately generous. This is not a latency budget - it is the point at which a sender is
-// treated as gone, and punishing a slow-but-real client would be a worse failure than waiting a
-// while for a hostile one. Against a client that never sends anything, any finite bound is the
-// whole of the improvement.
-// The LAPIC timer runs at 100 Hz, so a tick is 10 ms and this is thirty seconds.
+// WHAT THIS BOUNDS NOW. It used to be the defence against one client stopping the service, because
+// the receive ran inside the serve loop. It is not that any more - a stream is a pending operation
+// and the loop returns after every chunk - so what remains is the lifetime of a table ENTRY: a
+// slot, a path, a channel handle and whatever the volume is holding for it.
+//
+// That is a different question with different stakes. Cutting a slow sender off early costs a real
+// client its transfer; letting a gone one linger costs one entry. So the bound stays generous.
+//
+// The timer runs at 100 Hz on every architecture, so a tick is 10 ms and this is thirty seconds.
 const STREAM_IDLE_TICKS: u64 = 3_000;
 
 // The most a whole stream may take, counted from the request rather than from the last chunk.
 //
 // The idle deadline alone bounds SILENCE, not slowness: it is rebuilt after every chunk, so a
-// sender that emits one byte just before each window expires renews it forever and holds the
-// serve loop for as long as it likes. Two deadlines are needed because they answer different
-// questions - "has this sender gone away?" and "has this operation run long enough?" - and
-// neither implies the other.
+// sender that emits one byte just before each window expires renews it forever. Two deadlines are
+// needed because they answer different questions - "has this sender gone away?" and "has this
+// operation run long enough?" - and neither implies the other.
+//
+// What it protects has changed with the rest: a renewing sender no longer holds the service, it
+// holds the one slot a pending write occupies, and with one slot per volume that still means the
+// NEXT stream to that volume is refused for as long as it lasts. That is what this bounds - not
+// availability, but how long one client may keep the queue to itself.
 //
 // Five minutes: long enough that a slow but genuine transfer of the largest stream this service
-// accepts is not cut off, short enough that a client cannot own the service for an afternoon.
+// accepts is not cut off, short enough that a client cannot own the slot for an afternoon.
 const STREAM_TOTAL_TICKS: u64 = 30_000;
 
 // A stream that has sent this many chunks must be averaging at least `STREAM_MIN_CHUNK` bytes in
