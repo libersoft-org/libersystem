@@ -375,6 +375,18 @@ fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], re
 		unsafe { close(data) };
 		Err((corr, e))
 	};
+	// The handle has to BE a channel this service can read and wait on.
+	//
+	// The interface declares `handle<channel>` and nothing more, so a client may transfer anything
+	// - a memory object, a channel without WAIT - and the loop would put it straight into the
+	// shared `wait_any_periodic`. A wait that cannot be performed returns an error rather than
+	// blocking, and the loop's error branch retries, so one bad handle spins the service until the
+	// deadline. Checked here, where refusing costs a parse.
+	const OBJECT_TYPE_CHANNEL: u64 = 5;
+	match unsafe { object_info(data) } {
+		Some(info) if info.object_type == OBJECT_TYPE_CHANNEL && info.rights & RIGHT_READ != 0 && info.rights & RIGHT_WAIT != 0 => {}
+		_ => return refuse(Error::Invalid),
+	}
 	if !scope.allows_request(vol.name(), request) {
 		return refuse(Error::Denied);
 	}
@@ -529,8 +541,19 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		// was never given the chance to speak. This wait is a guard, not progress.
 		let ready: i64 = unsafe { wait_any_periodic(&waits, deadline) };
 		if ready < 0 {
-			// Timed out, or the wait itself failed. Either way the only thing that can be due is
-			// the stream's deadline.
+			// A wait that TIMED OUT is ordinary; one that could not be performed is not, and
+			// retrying it spins the loop at full speed until the deadline serving nobody. The
+			// same distinction was drawn in `recv_vec_deadline` and then lost when the wait moved
+			// up here, so a pending operation is given up on rather than retried.
+			if ready != ERR_TIMED_OUT {
+				if let Some(p) = pending.take() {
+					finish_stream(vol, p, Err(Error::Invalid), &mut reply);
+				}
+				if let Some(l) = listing.take() {
+					unsafe { close(l.producer) };
+				}
+				continue;
+			}
 			if let Some(p) = pending.as_ref() {
 				if unsafe { clock() } >= p.deadline() {
 					let p = pending.take().expect("checked");

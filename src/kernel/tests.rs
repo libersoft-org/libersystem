@@ -2615,6 +2615,110 @@ impl StorageHarness {
 		false
 	}
 
+	// Hand the service a TRUNCATED LiberFS image as a live volume.
+	//
+	// A live medium's system volume is copied into memory at boot, and a copy that fails half way
+	// must be refused rather than served: a system missing executables that reports itself healthy
+	// is worse than one that does not come up. The service exits on a failed import, so the test is
+	// that it never reports itself online.
+	//
+	// Returns true if it came up anyway.
+	fn live_volume_comes_up(storage_elf: &[u8], image: &[u8]) -> bool {
+		use object::channel::{Channel, Message};
+		use object::memory_object::MemoryObject;
+		use object::rights::Rights;
+		let (boot, boot_user) = Channel::create();
+		let (block, _unused) = Channel::create();
+		let (server, client) = Channel::create();
+		let (admin, admin_child) = Channel::create();
+		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		let buffer = MemoryObject::create(image.len().max(1)).expect("no memory for the live image");
+		copy_into_object(&buffer, image);
+		let mut request = alloc::vec::Vec::with_capacity(7 + 8);
+		request.extend_from_slice(b"LIVEVOL");
+		request.extend_from_slice(&(image.len() as u64).to_le_bytes());
+		let cap = object::handle::Capability::new(buffer as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP, 0);
+		boot.send(Message::new(request, alloc::vec![cap], 0)).expect("live volume bootstrap");
+		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
+		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: image.len() as u64, process: None };
+		for _ in 0..100_000 {
+			harness.pump();
+			if let Ok(report) = harness.boot.recv() {
+				return &report.bytes[..] == b"StorageService: online";
+			}
+		}
+		false
+	}
+
+	// A LiberFS image as contiguous bytes, for the cases that need one in memory rather than as a
+	// sector map: a live volume arrives as a buffer, not as a disk.
+	fn fixture_image(archive: &[u8]) -> alloc::vec::Vec<u8> {
+		let sectors = Self::build_system_fixture(archive);
+		let mut bytes = alloc::vec::Vec::new();
+		for (lba, sector) in &sectors {
+			let offset = (*lba as usize) * 512;
+			if bytes.len() < offset + sector.len() {
+				bytes.resize(offset + sector.len(), 0);
+			}
+			bytes[offset..offset + sector.len()].copy_from_slice(sector);
+		}
+		bytes
+	}
+
+	// Ask for a listing on a channel and hang up before the reply can be delivered.
+	//
+	// The service mints the consumer, tries to hand it over, and finds nobody there. That send used
+	// to be unchecked: the consumer leaked, and because it stayed open inside the service the
+	// producer kept a live peer nobody would ever read - so the next send on it blocked forever.
+	fn list_then_hang_up(&mut self, path: &[u8], corr: u32) {
+		use object::channel::Message;
+		let second = self.connect();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		second.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage list request");
+		// Gone before the service can answer.
+		drop(second);
+		for _ in 0..512 {
+			self.pump();
+		}
+	}
+
+	// Open a write stream with a handle the service cannot wait on.
+	//
+	// The interface says `handle<channel>` and no more, so a client may transfer a channel stripped
+	// of WAIT - or something that is not a channel at all. Putting that into the shared wait set
+	// makes every wait fail immediately, and a loop that retries on error then spins at full speed
+	// serving nobody. Returns true if the service refused it.
+	fn stream_with_rights(&mut self, path: &[u8], corr: u32, rights: object::rights::Rights) -> bool {
+		use object::channel::Channel;
+		let (service_side, _our_side) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&16u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&self.client, &request, service_side, rights).expect("storage write-stream request");
+		// This CANNOT tell a prompt refusal from a thirty-second spin, and the attempt is recorded
+		// rather than hidden. A service spinning on a wait it cannot perform keeps the run queue
+		// non-empty, so `run_until_idle` never settles and each of these pumps takes as long as the
+		// spin does - two thousand of them span the deadline, and the reply arrives either way.
+		// It is the same structural limit that stopped `yield` from bounding a stalled send.
+		//
+		// What it does assert: the service answers rather than dying or going silent.
+		for _ in 0..2_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&0);
+			}
+		}
+		false
+	}
+
 	// Register a write stream and RETURN, keeping the sender.
 	//
 	// The stream stays pending: nothing is sent, nothing is closed, and the service has answered

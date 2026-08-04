@@ -860,3 +860,29 @@ fn a_stream_is_charged_to_the_volume_while_it_arrives() {
 		assert_eq!(fs.used(), 40 * 1024, "and the file that was already there is untouched");
 	});
 }
+
+#[test]
+fn a_stream_that_grows_past_its_spare_capacity_reserves_fallibly() {
+	// Growing a stream past what the heap can give reports NoSpace rather than aborting.
+	//
+	// It does NOT reproduce the defect it was written for, and that is worth stating rather than
+	// implying. `stream_push` reserved `want - capacity` where `try_reserve_exact(additional)`
+	// guarantees `len + additional`; asking from CAPACITY is too little whenever `len < capacity`,
+	// and the append then grows infallibly. But this path reserves exactly what it appends, so
+	// `len` and `capacity` move together and the gap only opens if the allocator returns more than
+	// it was asked for. Forcing that needs control of the allocator this harness does not have.
+	//
+	// What it does cover is the fallible path itself: a volume with room for the data and a heap
+	// without it must refuse, not abort.
+	let first = alloc::vec![b'a'; 24 * 1024];
+	let second = alloc::vec![b'b'; 40 * 1024];
+	within(48 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Capped, 1024 * 1024).expect("mount");
+		fs.stream_begin(b"g").expect("begin");
+		fs.stream_push(&first).expect("the first chunk fits");
+		// The volume has room for the whole stream; the HEAP does not. Growing must report that
+		// rather than abort, which is only possible if the reservation asked for the right amount.
+		assert_eq!(fs.stream_push(&second), Err(FsError::NoSpace), "growing past the spare capacity is refused, not aborted");
+		assert!(!fs.streaming(), "and the refused stream is abandoned rather than left half-received");
+	});
+}

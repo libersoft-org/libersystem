@@ -413,6 +413,46 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	assert_eq!(listed.open(b"vol://tmp/f0", 0x7781), Some(b"x".to_vec()), "the service serves other clients while a listing goes unread");
 	drop(idle_consumer);
 
+	// A stream handle the service cannot wait on is refused before it reaches the wait set.
+	//
+	// READ but no WAIT: every wait on it fails immediately, and a loop that retries on error spins
+	// until the deadline serving nobody. The refusal has to happen where it costs a parse.
+	let mut rights = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(rights.stream_with_rights(b"vol://tmp/nowait", 0x7a01, object::rights::Rights::READ), "a stream handle without WAIT is refused");
+	assert!(rights.write(b"vol://tmp/after", b"x", 0x7a02), "and the service is still serving afterwards");
+
+	// A live import that cannot be completed is refused, not served in part.
+	//
+	// The medium is read-only, so its volume is copied into memory at boot; a copy that fails half
+	// way leaves a system missing executables. Reporting that as healthy is worse than not coming
+	// up at all, because nothing downstream can tell the difference. The whole image comes up; the
+	// same image cut short does not.
+	{
+		let volume = volume_package_bytes().expect("volume package module not found");
+		let whole = StorageHarness::fixture_image(volume);
+		assert!(StorageHarness::live_volume_comes_up(storage_elf, &whole), "a complete live volume mounts");
+		let cut = whole.len() * 3 / 5;
+		assert!(!StorageHarness::live_volume_comes_up(storage_elf, &whole[..cut]), "one cut short is refused rather than served with holes in it");
+	}
+
+	// A client that hangs up between asking for a listing and being answered.
+	//
+	// The service mints a consumer and hands it over; that send was unchecked, so when the client
+	// was gone the handle leaked AND the producer kept a live peer nobody would read, which blocked
+	// the next send on it forever. Both are invisible from outside - the service simply stops - so
+	// the test is that it still answers afterwards, and that it costs no handles.
+	let mut hangup = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(hangup.write(b"vol://tmp/here", b"still here", 0x7901), "seed a file");
+	let before = hangup.handle_count();
+	for i in 0..8u32 {
+		hangup.list_then_hang_up(b"vol://tmp", 0x7910 + i);
+	}
+	assert_eq!(hangup.open(b"vol://tmp/here", 0x7920), Some(b"still here".to_vec()), "the service survives a client that hangs up mid-listing");
+	// EXACTLY the same count. A tolerance here would have admitted one leak per hang-up, which is
+	// the whole defect - the first version of this assertion allowed +8 for eight hang-ups and
+	// passed with the fix removed.
+	assert_eq!(hangup.handle_count(), before, "and leaks no handle when the client is gone");
+
 	// A refused write must not cost the service a handle.
 	//
 	// The ordinary write takes a buffer capability, and validation used to happen BEFORE the guard

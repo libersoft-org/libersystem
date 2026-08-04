@@ -675,12 +675,28 @@ impl LiberMemFs {
 			self.release_reservation();
 		}
 		let pending = self.pending.as_mut().ok_or(FsError::Invalid)?;
-		if pending.data.capacity() < want {
-			let extra = want - pending.data.capacity();
-			if pending.data.try_reserve_exact(extra).is_err() {
-				self.stream_abort();
-				return Err(FsError::NoSpace);
-			}
+		// `chunk.len()`, NOT `want - capacity`.
+		//
+		// `try_reserve_exact(additional)` guarantees room for `len + additional`, not for
+		// `capacity + additional`. Reserving the difference from CAPACITY asks for too little
+		// whenever `len < capacity < want` - with len 20, capacity 32 and want 40 it asks for 28,
+		// which is already satisfied - and the `extend_from_slice` below then grows the vector
+		// through the ordinary INFALLIBLE path. Under memory pressure that aborts the service,
+		// which is the single failure this filesystem exists to avoid.
+		// `chunk.len()`, NOT `want - capacity`.
+		//
+		// `try_reserve_exact(additional)` guarantees room for `len + additional`, not for
+		// `capacity + additional`. Reserving the difference from CAPACITY asks for too little
+		// whenever `len < capacity`, and the `extend_from_slice` below then grows the vector
+		// through the ordinary INFALLIBLE path - an abort where the volume should have reported
+		// NoSpace, which is the single failure this filesystem exists to avoid.
+		//
+		// Reachable only when the allocator returns more than was asked for: this path reserves
+		// exactly what it appends, so `len` and `capacity` move together otherwise. That makes it a
+		// latent defect rather than a reproducible one, and the reason no test here forces it.
+		if pending.data.try_reserve_exact(chunk.len()).is_err() {
+			self.stream_abort();
+			return Err(FsError::NoSpace);
 		}
 		pending.data.extend_from_slice(chunk);
 		self.resync_reservation();
