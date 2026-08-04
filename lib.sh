@@ -52,6 +52,18 @@ target_triple() {
 	esac
 }
 
+# The LOADER's triple, which is NOT the kernel's: it is a UEFI application on x86_64 and aarch64,
+# and a hand-rolled ELF on riscv64. Checking for it under the kernel's triple is why a build that
+# had just produced it was reported as missing.
+loader_triple() {
+	case "$1" in
+	x86_64) echo x86_64-unknown-uefi ;;
+	aarch64) echo aarch64-unknown-uefi ;;
+	riscv64) echo riscv64gc-unknown-none-elf ;;
+	*) die "no loader triple for '$1'" ;;
+	esac
+}
+
 # Run a build step at most once per invocation.
 #
 # This replaces the Justfile's dependency graph, and it is the part of the move that has to be

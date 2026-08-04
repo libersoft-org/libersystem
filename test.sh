@@ -100,7 +100,7 @@ require_built() {
 	local arch="$1" volume="$BUILD_DIR/boot/system-volume-$arch.img"
 	[[ -f "$volume" ]] || die "no system volume for $arch - run: ./build.sh --arch $arch"
 	if [[ "$arch" != x86_64 ]]; then
-		local efi="$BUILD_DIR/cargo/loader/$(target_triple "$arch")/debug/libersystem-loader.efi"
+		local efi="$BUILD_DIR/cargo/loader/$(loader_triple "$arch")/debug/libersystem-loader.efi"
 		[[ -f "$efi" ]] || die "no loader for $arch - run: ./build.sh --arch $arch --part loader"
 	fi
 }

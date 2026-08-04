@@ -130,6 +130,10 @@ Builds the system. With no arguments: every part, for x86_64.
   --arch ARCH   x86_64 | aarch64 | riscv64 | all          (default: x86_64)
   --part PART   $PARTS_ALL | all       (default: all)
   --            everything after this is passed to cargo
+  --kernel-on-volume
+                put the kernel on the system volume - what ./image.sh does for shipping media. A
+                test run needs it absent, because the suite boots its own kernel from the ESP and
+                the loader prefers the volume's. Off by default.
   -h, --help    this text
 
 parts, in the order they are built:
@@ -156,6 +160,7 @@ EOF
 archs=()
 parts=()
 cargo_args=()
+kernel_on_volume=0
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -173,6 +178,10 @@ while [[ $# -gt 0 ]]; do
 		mapfile -t picked <<<"$picked_raw"
 		parts+=("${picked[@]}")
 		shift 2
+		;;
+	--kernel-on-volume)
+		kernel_on_volume=1
+		shift
 		;;
 	--)
 		shift
@@ -208,11 +217,14 @@ for arch in "${archs[@]}"; do
 	wants kernel && ensure step_kernel "$arch"
 	wants loader && ensure step_loader "$arch"
 	wants packages && ensure step_packages "$arch"
-	# The volume takes the kernel only when this invocation built one, so a `--part volume` on its
-	# own cannot stamp a stale kernel onto the volume.
-	if wants volume; then
-		if wants kernel; then ensure step_volume "$arch" 1; else ensure step_volume "$arch" 0; fi
-	fi
+	# The volume carries a kernel only when an IMAGE is being assembled, never as a side effect of
+	# building.
+	#
+	# A shipping medium wants its kernel on the volume - that is the point of M0138. A test run
+	# wants it absent, because the suite boots a different kernel staged on the ESP and the loader
+	# prefers the volume's. Putting it there during an ordinary build made `./test.sh` boot the
+	# SHIPPING kernel into an interactive shell and time out after fifteen minutes.
+	wants volume && ensure step_volume "$arch" "$kernel_on_volume"
 done
 
 note "built: ${parts[*]} for ${archs[*]}"
