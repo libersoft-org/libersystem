@@ -204,8 +204,17 @@ pub mod apic {
 	pub fn send_startup(_dest: u32, _vector: u8) {
 		todo!("aarch64 PSCI wake")
 	}
+	// See the x86_64 note: a test build adds a harness-controlled skew so a deadline is reachable.
 	pub fn ticks() -> u64 {
-		super::gic::ticks()
+		let base = super::gic::ticks();
+		#[cfg(test)]
+		{
+			base + crate::tests::clock_skew()
+		}
+		#[cfg(not(test))]
+		{
+			base
+		}
 	}
 	pub fn init() {
 		todo!("aarch64 GIC + timer")

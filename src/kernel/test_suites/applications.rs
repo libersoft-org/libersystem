@@ -368,6 +368,34 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	let mut slow = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
 	assert!(slow.stream_slowloris(b"vol://tmp/drip", 0x7306, 400, 4), "a sender that stays just inside the idle window is still given up on");
 
+	// A sender that opens a stream and says nothing is given up on.
+	//
+	// The bound is a deadline, and until the harness could move the guest clock this could only be
+	// waited out - a hundred thousand scheduler passes advance it by a few hundred ticks, so a
+	// thirty-second bound was about a million pumps away. The sender is held OPEN throughout:
+	// closing it would end the stream cleanly and test nothing.
+	let mut silent = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(silent.stream_idle_until_deadline(b"vol://tmp/quiet", 0x7701, 8_000), "a stream that says nothing is dropped once its deadline passes");
+	assert!(silent.write(b"vol://tmp/after", b"x", 0x7702), "and the service serves the next client");
+
+	// A listing nobody reads must not stop the service either.
+	//
+	// Past the channel's 64-message queue the send blocks, and an unbounded one held StorageService
+	// there permanently - the same defect as a silent sender, in the direction that had no bound at
+	// all. Eighty entries so the queue actually fills: with two, the send never blocks and the test
+	// would pass with the bound removed.
+	let mut listed = StorageHarness::start_memory(storage_elf, b"TMPVOL", 16 * 1024);
+	for i in 0..80u32 {
+		let mut path = b"vol://tmp/f".to_vec();
+		path.extend_from_slice(alloc::format!("{i}").as_bytes());
+		assert!(listed.write(&path, b"x", 0x7710 + i), "seed entry {i}");
+	}
+	let idle_consumer = listed.list_without_reading(b"vol://tmp", 0x7780);
+	assert!(idle_consumer.is_some(), "the listing hands back a consumer");
+	advance_clock(8_000);
+	assert_eq!(listed.open(b"vol://tmp/f0", 0x7781), Some(b"x".to_vec()), "the service serves other clients once it gives up on an unread listing");
+	drop(idle_consumer);
+
 	// A refused write must not cost the service a handle.
 	//
 	// The ordinary write takes a buffer capability, and validation used to happen BEFORE the guard

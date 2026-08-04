@@ -280,8 +280,17 @@ pub mod apic {
 	pub fn send_init(_dest: u32) {}
 	pub fn send_startup(_dest: u32, _vector: u8) {}
 
+	// See the x86_64 note: a test build adds a harness-controlled skew so a deadline is reachable.
 	pub fn ticks() -> u64 {
-		TICKS.load(Ordering::Relaxed)
+		let base = TICKS.load(Ordering::Relaxed);
+		#[cfg(test)]
+		{
+			base + crate::tests::clock_skew()
+		}
+		#[cfg(not(test))]
+		{
+			base
+		}
 	}
 
 	// Advance the tick counter and re-arm the timer. Called from the S-mode timer

@@ -71,6 +71,24 @@ fn volume_file(volume: &[u8], name: &[u8]) -> Result<alloc::vec::Vec<u8>, &'stat
 // package; every other program resolves through the manifest-declared system-volume path.
 // The returned slice borrows
 // the 'static module data, so it outlives the temporary volume Package.
+// Time the harness can move.
+//
+// Added to every architecture's tick counter in a test build. Nothing in the system distinguishes
+// it from time passing - the scheduler's timed waiters are compared against the same reading - so a
+// test can reach a deadline deliberately instead of waiting it out.
+static CLOCK_SKEW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn clock_skew() -> u64 {
+	CLOCK_SKEW.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// Push the guest's notion of time forward. Waiters due after the jump are woken by the scheduler's
+// deadline check, which runs on every pass of `run_until_idle` - so a pump after this is what
+// actually delivers the wake.
+pub(crate) fn advance_clock(ticks: u64) {
+	CLOCK_SKEW.fetch_add(ticks, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn program_elf(package: &pkg::Package<'static>, volume: &'static [u8], name: &[u8]) -> Option<&'static [u8]> {
 	let mut artifact: alloc::vec::Vec<u8> = name.to_vec();
 	artifact.extend_from_slice(b".lsexe");
@@ -2587,6 +2605,63 @@ impl StorageHarness {
 			}
 		}
 		false
+	}
+
+	// Open a write stream, send NOTHING, and move the clock past the service's idle bound.
+	//
+	// The bound is a deadline, so without a way to move time this could only be waited out - about
+	// a million scheduler passes. Returns true if the service gave the stream up.
+	fn stream_idle_until_deadline(&mut self, path: &[u8], corr: u32, skip: u64) -> bool {
+		use object::channel::Channel;
+		use object::rights::Rights;
+		let (service_side, _our_side) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&16u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&self.client, &request, service_side, Rights::ALL).expect("storage write-stream request");
+		// Let the service reach its receive before time moves, so the deadline it computes is the
+		// one being tested rather than one already in the past.
+		for _ in 0..256 {
+			self.pump();
+		}
+		advance_clock(skip);
+		// `_our_side` is held for the whole loop: the sender is present and silent, which is the
+		// case the bound exists for. Dropping it would end the stream cleanly and prove nothing.
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&0);
+			}
+		}
+		false
+	}
+
+	// Ask for a listing, take the consumer, and never read from it.
+	//
+	// The service produces entries into a channel nobody drains; past the channel's queue depth the
+	// send blocks, and an unbounded one held the whole service there. Returns the consumer so the
+	// caller can keep it open - dropping it would let the send fail for a different reason.
+	fn list_without_reading(&mut self, path: &[u8], corr: u32) -> Option<alloc::sync::Arc<object::channel::Channel>> {
+		use object::channel::{Channel, Message};
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		self.client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage list request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				if le_u32(&reply.bytes, 0) != corr {
+					continue;
+				}
+				return reply.caps.first().and_then(|cap| cap.object().into_any_arc().downcast::<Channel>().ok());
+			}
+		}
+		None
 	}
 
 	fn write(&mut self, path: &[u8], data: &[u8], corr: u32) -> bool {
