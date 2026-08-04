@@ -201,6 +201,20 @@ pub struct LiberMemFs {
 	// What `reservation` holds. Tracked rather than read back from the vector, whose length is
 	// deliberately zero and whose capacity may legitimately exceed what was asked for.
 	reserved: usize,
+	// A stream being received into this volume, before it becomes a file.
+	//
+	// It lives HERE rather than on the caller's heap because the accounting has to see it. A
+	// storage service accumulating a stream in its own `Vec` consumes memory this volume knows
+	// nothing about, so `free()` keeps reporting room that is already spent and a reserved volume's
+	// guarantee - the whole point of the policy - does not cover the operation that needs it most.
+	// The identical write through the ordinary path succeeded while the stream ran the heap out.
+	pending: Option<Pending>,
+}
+
+// A stream in progress: where it is going, and what has arrived so far.
+struct Pending {
+	path: Vec<u8>,
+	data: Vec<u8>,
 }
 
 impl LiberMemFs {
@@ -218,7 +232,7 @@ impl LiberMemFs {
 			reservation.push(Chunk { allocation, bytes: capacity });
 			reserved = capacity;
 		}
-		Ok(LiberMemFs { root: Node::Directory(Children::new()), policy, capacity, reservation, reserved })
+		Ok(LiberMemFs { root: Node::Directory(Children::new()), policy, capacity, reservation, reserved, pending: None })
 	}
 
 	pub fn policy(&self) -> Policy {
@@ -239,7 +253,10 @@ impl LiberMemFs {
 	// This is what the capacity bounds, so a volume cannot exceed it by filling itself with
 	// names instead of contents.
 	pub fn footprint(&self) -> u64 {
-		(self.root.allocated() + self.root.names()) as u64
+		// The pending stream counts. It is memory this volume has caused to be allocated, exactly
+		// like a file's, and leaving it out is what let the accounting disagree with the heap.
+		let pending = self.pending.as_ref().map_or(0, |p| p.data.capacity() + p.path.capacity());
+		(self.root.allocated() + self.root.names() + pending) as u64
 	}
 
 	// The bytes a reserved volume is holding but not yet storing. Zero for a capped volume,
@@ -606,6 +623,90 @@ impl LiberMemFs {
 	// volume would accept a file through `write_file` and refuse the identical file through a
 	// stream, because the stream needs the memory twice. Taking the caller's buffer as the file's
 	// own storage removes the second copy: nothing is allocated here at all.
+	// Begin receiving a stream into `path`.
+	//
+	// The destination is validated NOW, so a stream to a missing parent or to a directory is
+	// refused before a byte is taken, and the caller learns it while it still costs nothing.
+	pub fn stream_begin(&mut self, path: &[u8]) -> Result<(), FsError> {
+		if self.pending.is_some() {
+			return Err(FsError::Invalid);
+		}
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		if parts.is_empty() {
+			return Err(FsError::IsDir);
+		}
+		match self.resolve(parts)? {
+			Some(Node::Directory(_)) => return Err(FsError::IsDir),
+			Some(Node::File(_)) => {}
+			None => {
+				if self.root.count() >= MAX_ENTRIES {
+					return Err(FsError::NoSpace);
+				}
+			}
+		}
+		let mut owned: Vec<u8> = Vec::new();
+		owned.try_reserve_exact(path.len()).map_err(|_| FsError::NoSpace)?;
+		owned.extend_from_slice(path);
+		self.pending = Some(Pending { path: owned, data: Vec::new() });
+		self.resync_reservation();
+		Ok(())
+	}
+
+	// Take one chunk. Charged against the volume as it arrives, so a stream that will not fit is
+	// refused at the chunk that crosses the line rather than when the heap runs out.
+	pub fn stream_push(&mut self, chunk: &[u8]) -> Result<(), FsError> {
+		let Some(pending) = self.pending.as_ref() else { return Err(FsError::Invalid) };
+		let want = pending.data.len().saturating_add(chunk.len());
+		if want > MAX_FILE_BYTES {
+			self.stream_abort();
+			return Err(FsError::TooLong);
+		}
+		// What the volume would hold once this chunk is in: everything except the pending buffer's
+		// current allocation, plus what it would grow to.
+		let without = (self.footprint() as usize).saturating_sub(pending.data.capacity());
+		if without.saturating_add(want) > self.capacity {
+			self.stream_abort();
+			return Err(FsError::NoSpace);
+		}
+		// A reserved volume gives the room back BEFORE the allocation, so the two are never
+		// outstanding at once - the failure the reservation exists to prevent.
+		if self.policy == Policy::Reserved {
+			self.release_reservation();
+		}
+		let pending = self.pending.as_mut().ok_or(FsError::Invalid)?;
+		if pending.data.capacity() < want {
+			let extra = want - pending.data.capacity();
+			if pending.data.try_reserve_exact(extra).is_err() {
+				self.stream_abort();
+				return Err(FsError::NoSpace);
+			}
+		}
+		pending.data.extend_from_slice(chunk);
+		self.resync_reservation();
+		Ok(())
+	}
+
+	// Store what arrived. The buffer becomes the file's own storage, so nothing is copied and the
+	// volume never holds two versions of the contents at once.
+	pub fn stream_commit(&mut self) -> Result<(), FsError> {
+		let Some(pending) = self.pending.take() else { return Err(FsError::Invalid) };
+		self.resync_reservation();
+		self.write_file_owned(&pending.path, pending.data)
+	}
+
+	// Give up. The room goes back to the volume, and the destination is untouched - a stream that
+	// cannot be completed leaves the file exactly as it was.
+	pub fn stream_abort(&mut self) {
+		self.pending = None;
+		self.resync_reservation();
+	}
+
+	// Whether a stream is in progress, for a caller that has to decide whether to abort one.
+	pub fn streaming(&self) -> bool {
+		self.pending.is_some()
+	}
+
 	pub fn write_file_owned(&mut self, path: &[u8], data: Vec<u8>) -> Result<(), FsError> {
 		if data.len() > MAX_FILE_BYTES {
 			return Err(FsError::TooLong);

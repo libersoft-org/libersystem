@@ -2189,6 +2189,10 @@ struct StorageHarness {
 	admin: alloc::sync::Arc<object::channel::Channel>,
 	disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>,
 	capacity: u64,
+	// The service's own process, so a test can read its handle table. Handle leaks are invisible
+	// from the outside - the service keeps answering, one handle poorer each time - until the table
+	// is full and every later request fails for a reason unrelated to what caused it.
+	process: Option<alloc::sync::Arc<object::process::Process>>,
 }
 
 // The harness disk itself, as a block device, so a fixture volume can be formatted straight into
@@ -2322,7 +2326,7 @@ impl StorageHarness {
 		send_cap(&boot, tag, block_child, Rights::ALL).expect("storage block bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
-		let mut harness = Self { boot, block, client, admin, disk, capacity };
+		let mut harness = Self { boot, block, client, admin, disk, capacity, process: None };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -2344,13 +2348,13 @@ impl StorageHarness {
 		let (block, _unused) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
-		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		let process = loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
 		let mut request: alloc::vec::Vec<u8> = tag.to_vec();
 		request.extend_from_slice(alloc::format!("{bytes}").as_bytes());
 		boot.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("memory volume bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
-		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: bytes as u64 };
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: bytes as u64, process: Some(process) };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -2384,7 +2388,7 @@ impl StorageHarness {
 		boot.send(Message::new(request, alloc::vec![cap], 0)).expect("archive volume bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
-		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: volume.len() as u64 };
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: volume.len() as u64, process: None };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -2393,6 +2397,11 @@ impl StorageHarness {
 			}
 		}
 		panic!("archive StorageService harness did not report online");
+	}
+
+	// How many handles the service holds right now.
+	fn handle_count(&self) -> u64 {
+		self.process.as_ref().expect("this harness did not keep the service process").handle_count()
 	}
 
 	fn restart(mut self, storage_elf: &[u8]) -> Self {

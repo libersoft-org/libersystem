@@ -322,7 +322,6 @@ qemu_build_esp() {
 	fi
 	# The factory archive still travels for the tests that read it as a fixture.
 	local volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
-	[[ -f "$volume_pkg" ]] || volume_pkg="$QEMU_BUILD_DIR/volume.pkg"
 	[[ -f "$volume_pkg" ]] && mcopy -i "$ESP" "$volume_pkg" ::/volume.pkg
 }
 

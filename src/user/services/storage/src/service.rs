@@ -555,6 +555,24 @@ trait FileSystem {
 		self.write_file(name, &data)
 	}
 
+	// Receive a stream INTO the filesystem, chunk by chunk, rather than accumulating it outside.
+	//
+	// The default is "not supported", and a caller that gets `None` falls back to accumulating -
+	// which is right for a disk, where the bytes are going to a medium with its own space and the
+	// service's heap is only a staging area. It matters for the memory filesystem, where the
+	// accumulator and the destination compete for the SAME memory and the volume's accounting
+	// could not see half of it: `free()` reported room the service had already spent.
+	fn stream_begin(&mut self, _name: &[u8]) -> Option<Result<(), Error>> {
+		None
+	}
+	fn stream_push(&mut self, _chunk: &[u8]) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn stream_commit(&mut self) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn stream_abort(&mut self) {}
+
 	// Whether this path may be written at all, and how much a single write may carry.
 	//
 	// Asked of the path rather than the volume, because a bound taken from the volume is wrong in
@@ -632,7 +650,39 @@ impl Volume {
 
 impl Volume {
 	// Collect a streamed write, bounded at every step.
-	fn receive_stream(&mut self, data: u64, path: &str) -> Result<Vec<u8>, Error> {
+	// Receive a stream and STORE it. One method rather than two, because the pending write in the
+	// filesystem has to be committed or abandoned on every path out, and a caller that receives
+	// bytes and stores them separately can leave one open.
+	fn receive_stream(&mut self, data: u64, path: &str) -> Result<(), Error> {
+		let incremental: bool = match self.fs.stream_begin(self.writable_name(path)?) {
+			Some(result) => {
+				result?;
+				true
+			}
+			None => false,
+		};
+		match self.receive_body(data, path, incremental) {
+			Ok(bytes) => {
+				if incremental {
+					self.fs.stream_commit()
+				} else {
+					let name: &[u8] = self.writable_name(path)?;
+					self.fs.write_file_owned(name, bytes)
+				}
+			}
+			Err(e) => {
+				// A stream that cannot be completed leaves the destination exactly as it was -
+				// the first property this filesystem fixed, and the one a half-received pending
+				// write would quietly take back.
+				if incremental {
+					self.fs.stream_abort();
+				}
+				Err(e)
+			}
+		}
+	}
+
+	fn receive_body(&mut self, data: u64, path: &str, incremental: bool) -> Result<Vec<u8>, Error> {
 		// Validated before a byte is accepted, and against what a single write may actually be -
 		// not the volume's whole capacity, which on a disk backend is the size of the disk. A
 		// stream to a path that cannot exist should cost a parse, not a heap.
@@ -665,6 +715,7 @@ impl Volume {
 		// sending something.
 		let expires = unsafe { clock() }.saturating_add(STREAM_TOTAL_TICKS);
 		let mut bytes: Vec<u8> = Vec::new();
+		let mut received: usize = 0;
 		let mut chunks: usize = 0;
 		loop {
 			// Bounded at RECEPTION. The accumulation check below cannot help if a single chunk
@@ -684,7 +735,7 @@ impl Volume {
 			// with a single byte and hold the service indefinitely while never being idle.
 			let idle = unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS);
 			let deadline = core::cmp::min(idle, expires);
-			match unsafe { recv_vec_deadline(data, limit.saturating_sub(bytes.len()), deadline) } {
+			match unsafe { recv_vec_deadline(data, limit.saturating_sub(received), deadline) } {
 				BoundedVec::Message { bytes: chunk, handle } => {
 					// A stream carries plain messages. A client that transfers a capability
 					// anyway must not leak it into this service's table.
@@ -694,14 +745,26 @@ impl Volume {
 					if chunk.is_empty() {
 						break;
 					}
-					if bytes.try_reserve_exact(chunk.len()).is_err() {
-						return Err(Error::Again);
+					// INTO the filesystem when it takes chunks, into this heap when it does not.
+					//
+					// The difference is who accounts for the memory. A memory volume and its
+					// incoming stream compete for the same heap, and accumulating here made the
+					// volume's `free()` report room the service had already spent - so an ordinary
+					// write succeeded where the identical stream ran the heap out. A disk backend
+					// has its own space and this heap is only a staging area, so it accumulates.
+					if incremental {
+						self.fs.stream_push(&chunk)?;
+					} else {
+						if bytes.try_reserve_exact(chunk.len()).is_err() {
+							return Err(Error::Again);
+						}
+						bytes.extend_from_slice(&chunk);
 					}
-					bytes.extend_from_slice(&chunk);
+					received = received.saturating_add(chunk.len());
 					chunks += 1;
 					// Refused as malformed rather than retryable: a sender behaving this way will
 					// behave the same way if it tries again.
-					if chunks > STREAM_CHUNK_GRACE && bytes.len() / chunks < STREAM_MIN_CHUNK {
+					if chunks > STREAM_CHUNK_GRACE && received / chunks < STREAM_MIN_CHUNK {
 						return Err(Error::Invalid);
 					}
 				}
@@ -804,9 +867,7 @@ impl volume::Service for Volume {
 		// a client repeating a bad path could exhaust the handle table that way.
 		let outcome = self.receive_stream(data, &path);
 		unsafe { close(data) };
-		let bytes = outcome?;
-		let name: &[u8] = self.writable_name(&path)?;
-		self.fs.write_file_owned(name, bytes)
+		outcome
 	}
 
 	// Delete a file. A read-only volume refuses with `denied`.
@@ -1087,6 +1148,18 @@ impl FileSystem for MemFs {
 		// Adopted, not copied: the streamed buffer becomes the file's own storage, so a reserved
 		// volume needs the memory once instead of twice.
 		self.fs.write_file_owned(name, data).map_err(map_fs_err)
+	}
+	fn stream_begin(&mut self, name: &[u8]) -> Option<Result<(), Error>> {
+		Some(self.fs.stream_begin(name).map_err(map_fs_err))
+	}
+	fn stream_push(&mut self, chunk: &[u8]) -> Result<(), Error> {
+		self.fs.stream_push(chunk).map_err(map_fs_err)
+	}
+	fn stream_commit(&mut self) -> Result<(), Error> {
+		self.fs.stream_commit().map_err(map_fs_err)
+	}
+	fn stream_abort(&mut self) {
+		self.fs.stream_abort();
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
 		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.capacity(), free_bytes: self.fs.free(), compression: false, read_only: false, filesystem: String::from("libermemfs") })

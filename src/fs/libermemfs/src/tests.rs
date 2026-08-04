@@ -828,3 +828,35 @@ fn an_owned_rewrite_is_judged_by_the_write_it_will_actually_do() {
 	// is exactly full - and stays that way, because the rewrite took on nothing new.
 	assert_eq!(fs.free(), 0, "the file kept its allocation, so the volume is no freer than before");
 }
+
+#[test]
+fn a_stream_is_charged_to_the_volume_while_it_arrives() {
+	// The conflict this closes: the storage service accumulated a stream in ITS heap, so the
+	// volume's accounting knew nothing about it. `free()` kept reporting room that was already
+	// spent, and a reserved volume - whose whole promise is that the memory is there - could not
+	// cover the operation that needed the promise most.
+	//
+	// Measured against real memory, not against the numbers: a 64 KiB volume and an 80 KiB heap.
+	// Accumulating outside the volume, two 40 KiB streams both "fit" and the second runs the heap
+	// out. Charged as they arrive, the second is refused by the volume instead.
+	let chunk = alloc::vec![b'x'; 20 * 1024];
+	within(80 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Capped, 64 * 1024).expect("mount");
+		fs.stream_begin(b"a").expect("begin");
+		fs.stream_push(&chunk).expect("first chunk");
+		assert!(fs.free() < 46 * 1024, "the volume counts what has arrived: free={}", fs.free());
+		fs.stream_push(&chunk).expect("second chunk");
+		fs.stream_commit().expect("commit");
+		// `used()` rather than reading it back: `read_file` COPIES, so a read-back inside this
+		// budget would fail for the reader's allocation and say nothing about the accounting.
+		assert_eq!(fs.used(), 40 * 1024, "and the file holds what was streamed");
+
+		// A second stream of the same size does not fit, and is refused by the VOLUME rather than
+		// by the allocator.
+		fs.stream_begin(b"b").expect("begin the second");
+		fs.stream_push(&chunk).expect("its first chunk");
+		assert_eq!(fs.stream_push(&chunk), Err(FsError::NoSpace), "the volume refuses what it cannot hold");
+		assert!(!fs.streaming(), "a refused push abandons the stream rather than leaving it half-received");
+		assert_eq!(fs.used(), 40 * 1024, "and the file that was already there is untouched");
+	});
+}

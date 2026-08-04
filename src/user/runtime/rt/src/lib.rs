@@ -911,6 +911,12 @@ pub unsafe fn send_deadline(channel: u64, bytes: &[u8], xfer: u64, deadline: u64
 			// PERIODIC for the reason `recv_vec_deadline` gives: a plain timed wait counts as
 			// pending progress and `run_until_idle` then halts until the deadline, stalling the
 			// peer that would drain the queue.
+			// A bound on ATTEMPTS was tried here and removed. Counting them around a wait is
+			// meaningless - the wait sleeps to the deadline, so the counter reaches two - and
+			// yielding instead is worse than useless: a service spinning on yield keeps the run
+			// queue non-empty, so `run_until_idle` never settles and the peer that would drain the
+			// channel never runs at all. Sleeping until writable or the deadline is the only shape
+			// that lets the other side make progress.
 			let waited: i64 = syscall(SYS_WAIT, channel, deadline, WAIT_WRITABLE | WAIT_PERIODIC, 0) as i64;
 			// A wait that could not be PERFORMED - a handle without the WAIT right, say - would
 			// otherwise send this loop spinning at full speed until the deadline. Timing out is

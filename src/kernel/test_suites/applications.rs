@@ -368,6 +368,23 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	let mut slow = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
 	assert!(slow.stream_slowloris(b"vol://tmp/drip", 0x7306, 400, 4), "a sender that stays just inside the idle window is still given up on");
 
+	// A refused write must not cost the service a handle.
+	//
+	// The ordinary write takes a buffer capability, and validation used to happen BEFORE the guard
+	// that closes it, so every `?` on the way out left one behind. Nothing visible happens: the
+	// service keeps answering, one handle poorer each time, until its table is full and every later
+	// request fails for a reason unrelated to what caused it. Only a count taken before and after
+	// shows it.
+	let mut leaky = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(leaky.write(b"vol://tmp/real", b"x", 0x7501), "a good write still works");
+	let before = leaky.handle_count();
+	for i in 0..32u32 {
+		// A path inside a FILE, which cannot be a directory: refused after the buffer arrives.
+		assert!(!leaky.write(b"vol://tmp/real/under-a-file", b"y", 0x7510 + i), "a bad write is refused");
+	}
+	assert_eq!(leaky.handle_count(), before, "thirty-two refused writes cost the service no handles");
+	assert!(leaky.write(b"vol://tmp/second", b"z", 0x7540), "and the service still works afterwards");
+
 	let mut readonly = StorageHarness::start_archive(storage_elf);
 	assert!(readonly.stream_refused_before_sending(b"vol://system/anything", 0x7305), "a stream to a read-only volume is refused before the sender offers a byte");
 	assert_eq!(streamed.open(b"vol://tmp/f", 0x7305), Some(b"new contents".to_vec()), "and the destination still holds what it held - no prefix was written");
