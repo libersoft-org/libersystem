@@ -20,6 +20,11 @@ Boots the system in QEMU, headless, with the serial console on your terminal.
   --image PATH    boot THIS medium and build nothing (from ./image.sh)
   --attach PATH   attach an extra disk or CD image, repeatable or comma-separated
   --display D     vnc | spice | all - attach a live display server (they combine)
+  --smp N         cores given to the guest (default: the host's, capped at 8 on aarch64/riscv64)
+  --mem SIZE      guest memory, QEMU-style: 512M, 4G
+  --serial SPEC   QEMU serial backend, e.g. --serial file:boot.log
+  --vnc-addr A    VNC bind address and display (default 0.0.0.0:0)
+  --spice-port P  SPICE port (default 5930)
   --debug         wait for GDB on :1234, no KVM
   -h, --help      this text
 
@@ -33,12 +38,6 @@ three steps, not one:
     ./build.sh                          # 1. compile
     ./image.sh --format iso             # 2. assemble a medium
     ./run.sh --image .build/boot/libersystem.iso   # 3. boot exactly that
-
-environment:
-  SMP=<n>          cores given to the guest
-  MEM=<size>       guest memory
-  SERIAL=<spec>    QEMU serial backend, e.g. SERIAL=file:boot.log
-  VNC_ADDR=<addr>  bind address for --display vnc
 
 All three architectures boot the same way a real machine does: firmware runs the system's own
 loader, which reads the kernel and the bootstrap programs off the system volume. aarch64 and
@@ -90,6 +89,37 @@ while [[ $# -gt 0 ]]; do
 			[[ -f "$path" ]] || die "no medium at '$path'"
 			attach+=("$path")
 		done
+		shift 2
+		;;
+	# These become environment variables for qemu-run.sh, which is the layer that speaks to QEMU.
+	# The flag is the interface; the variable is plumbing. Passing them as bare variables worked and
+	# still does, but nothing announced them - they were not in --help and a typo was silent.
+	--smp)
+		[[ $# -ge 2 ]] || die "--smp needs a count"
+		[[ "$2" =~ ^[0-9]+$ ]] || die "--smp takes a number, got '$2'"
+		export SMP="$2"
+		shift 2
+		;;
+	--mem)
+		[[ $# -ge 2 ]] || die "--mem needs a size"
+		[[ "$2" =~ ^[0-9]+[KMG]?$ ]] || die "--mem takes a QEMU size like 512M or 4G, got '$2'"
+		export MEM="$2"
+		shift 2
+		;;
+	--serial)
+		[[ $# -ge 2 ]] || die "--serial needs a spec"
+		export SERIAL="$2"
+		shift 2
+		;;
+	--vnc-addr)
+		[[ $# -ge 2 ]] || die "--vnc-addr needs an address"
+		export VNC_ADDR="$2"
+		shift 2
+		;;
+	--spice-port)
+		[[ $# -ge 2 ]] || die "--spice-port needs a port"
+		[[ "$2" =~ ^[0-9]+$ ]] || die "--spice-port takes a number, got '$2'"
+		export SPICE_PORT="$2"
 		shift 2
 		;;
 	--debug)

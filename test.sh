@@ -22,11 +22,9 @@ With no arguments: every test, x86_64.
   --list-tags    print the tags this kernel defines and exit
   --fast         reuse a content-verified userspace preflight instead of rebuilding it
   --build-only   compile the test kernel without booting QEMU
+  --smp N        cores given to the guest
+  --timeout SEC  per-suite wall-clock limit
   -h, --help     this text
-
-environment:
-  SMP=<n>          cores given to the guest
-  TEST_TIMEOUT=<s> per-suite wall-clock limit
 
 examples:
   ./test.sh
@@ -72,6 +70,18 @@ while [[ $# -gt 0 ]]; do
 	--build-only)
 		build_only=1
 		shift
+		;;
+	--smp)
+		[[ $# -ge 2 ]] || die "--smp needs a count"
+		[[ "$2" =~ ^[0-9]+$ ]] || die "--smp takes a number, got '$2'"
+		export SMP="$2"
+		shift 2
+		;;
+	--timeout)
+		[[ $# -ge 2 ]] || die "--timeout needs seconds"
+		[[ "$2" =~ ^[0-9]+[smh]?$ ]] || die "--timeout takes seconds (or 5m, 1h), got '$2'"
+		export TEST_TIMEOUT="$2"
+		shift 2
 		;;
 	*) die "unexpected argument '$1' (try --help)" ;;
 	esac

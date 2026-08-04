@@ -51,9 +51,9 @@ Building produces no image. `./image.sh` assembles one, `./run.sh` boots one.
 ./run.sh --attach data.img                      # attach an extra disk or CD
 ```
 
-`run.sh` builds nothing - `build.sh` does that. QEMU runs headless with the serial console on your terminal, ending at a `vol://system>` prompt. `SERIAL=file:boot.log ./run.sh` redirects it.
+`run.sh` builds nothing - `build.sh` does that. QEMU runs headless with the serial console on your terminal, ending at a `vol://system>` prompt; `--serial file:boot.log` redirects it. Guest size is `--smp N` and `--mem 4G`.
 
-**Cores.** The guest gets the host's core count, capped at 8 on aarch64 and riscv64. aarch64 because QEMU's `virt` GICv2 addresses at most 8 CPU interfaces; riscv64 because U-Boot stops booting above roughly 50 harts - on a bigger host the guest produces no output at all while OpenSBI logs normally, which reads as a broken loader rather than as too many CPUs. Override with `SMP=<n>`.
+**Cores.** The guest gets the host's core count, capped at 8 on aarch64 and riscv64. aarch64 because QEMU's `virt` GICv2 addresses at most 8 CPU interfaces; riscv64 because U-Boot stops booting above roughly 50 harts - on a bigger host the guest produces no output at all while OpenSBI logs normally, which reads as a broken loader rather than as too many CPUs. Override with `--smp N`.
 
 **Devices.** x86_64 and aarch64 attach the same set: `virtio-gpu`, keyboard/tablet, `virtio-sound`, `virtio-net`, `virtio-serial` and xHCI USB. riscv64 is serial-console only. On aarch64 the boot log is replayed onto the display once ConsoleService takes over, because the `virt` machine has no VGA framebuffer to draw it on directly.
 
@@ -71,7 +71,7 @@ A `virtio-net` NIC on QEMU's user-mode network: the guest gets `10.0.2.15` by DH
 
 x86_64 and aarch64 only. The serial console keeps running alongside. Audio is routed through SPICE, so `beep [hz] [ms]` in the shell needs a SPICE display and a connected client (`remote-viewer spice://HOST:5930`); without one the device plays into a null sink.
 
-> The servers bind to `0.0.0.0` with no password. On a machine reachable from untrusted networks use `VNC_ADDR=127.0.0.1:0 ./run.sh --display vnc` and tunnel with `ssh -L 5900:localhost:5900 user@HOST`. `SPICE_PORT` sets the SPICE port.
+> The servers bind to `0.0.0.0` with no password. On a machine reachable from untrusted networks use `./run.sh --display vnc --vnc-addr 127.0.0.1:0` and tunnel with `ssh -L 5900:localhost:5900 user@HOST`. `--spice-port` sets the SPICE port.
 
 ### Screenshot
 
@@ -85,7 +85,7 @@ Attaches to a live run and snaps the current frame; otherwise boots a throwaway 
 ## Bootable images
 
 ```sh
-./image.sh --format iso                  # LiveCD
+./image.sh --format iso                  # Live CD
 ./image.sh --format img --size 1G        # installed system (default 128M)
 ./image.sh --format qcow2                # the same disk, stored sparsely
 ./image.sh --format iso --strip all      # smaller: drop the symbol table too
@@ -93,7 +93,7 @@ Attaches to a live run and snaps the current frame; otherwise boots a throwaway 
 
 Written to `.build/boot/`, bootable on any UEFI machine.
 
-**ISO is a LiveCD.** The medium carries a LiberFS system volume that the running system copies into memory at boot. Nothing is written back: no disk needed, and changes are gone when the session ends.
+**ISO is a Live CD.** The medium carries a LiberFS system volume that the running system copies into memory at boot. Nothing is written back: no disk needed, and changes are gone when the session ends.
 
 **IMG is an installed system.** Two partitions - an ESP with the loader and a recovery copy of the bootstrap programs, and a LiberFS system volume with the kernel and everything else. The loader finds the volume by its superblock rather than by device order, so it boots whatever else is attached.
 
@@ -149,8 +149,8 @@ Every script is at the repository root and answers `--help`.
 | Command | Description |
 | --- | --- |
 | `./build.sh [--arch A] [--part P]` | Build the system or the parts you name. Anything after `--` goes to cargo. |
-| `./run.sh [--arch A] [--image PATH] [--attach PATH] [--display D] [--debug]` | Boot in QEMU. Builds nothing. |
-| `./test.sh [--arch A] [--tags T] [--fast] [--build-only]` | Run the in-kernel test suites. |
+| `./run.sh [--arch A] [--image PATH] [--attach PATH] [--display D] [--smp N] [--mem S] [--serial SPEC] [--debug]` | Boot in QEMU. Builds nothing. |
+| `./test.sh [--arch A] [--tags T] [--fast] [--build-only] [--smp N] [--timeout S]` | Run the in-kernel test suites. |
 | `./image.sh [--format F] [--size S] [--strip L]` | Build bootable images (`iso`, `img`, `qcow2`). |
 | `./check.sh [--gate N] [--conformance F]` | Build gates and image conformance suites; no arguments means all. |
 | `./clean.sh [--part P] [--dry-run]` | Remove build output (`cargo`, `boot`, `logs`). |
