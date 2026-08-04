@@ -368,6 +368,20 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	let mut slow = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
 	assert!(slow.stream_slowloris(b"vol://tmp/drip", 0x7306, 400, 4), "a sender that stays just inside the idle window is still given up on");
 
+	// THE POINT OF THE PENDING-STREAM MODEL: another client is served while a stream is open.
+	//
+	// Receiving a stream synchronously meant one client held the service for the whole transfer -
+	// every other client, every volume, the admin endpoint - and three rounds of review answered
+	// that with a deadline, which bounds the harm rather than removing it. With the stream as a
+	// pending operation the loop returns after every chunk, so this read is answered while the
+	// stream is still open and unfinished.
+	let mut concurrent = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(concurrent.write(b"vol://tmp/other", b"served", 0x7801), "seed a file for the second request");
+	let sender = concurrent.stream_pending(b"vol://tmp/slow", 0x7802);
+	assert_eq!(concurrent.open(b"vol://tmp/other", 0x7803), Some(b"served".to_vec()), "a second request is answered while a stream is pending");
+	assert!(concurrent.stream_finish(sender, &[b"done"], 0x7802), "and the stream still completes afterwards");
+	assert_eq!(concurrent.open(b"vol://tmp/slow", 0x7804), Some(b"done".to_vec()), "with the bytes that were streamed");
+
 	// A sender that opens a stream and says nothing is given up on.
 	//
 	// The bound is a deadline, and until the harness could move the guest clock this could only be

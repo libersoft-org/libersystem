@@ -2607,6 +2607,47 @@ impl StorageHarness {
 		false
 	}
 
+	// Register a write stream and RETURN, keeping the sender.
+	//
+	// The stream stays pending: nothing is sent, nothing is closed, and the service has answered
+	// nothing yet. What the caller does next is the point - anything the service still does is
+	// something it could not have done while receiving a stream synchronously.
+	fn stream_pending(&mut self, path: &[u8], corr: u32) -> alloc::sync::Arc<object::channel::Channel> {
+		use object::channel::Channel;
+		use object::rights::Rights;
+		let (service_side, our_side) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&16u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&self.client, &request, service_side, Rights::ALL).expect("storage write-stream request");
+		// Enough for the service to take the request and register it, not enough for anything to
+		// time out.
+		for _ in 0..512 {
+			self.pump();
+		}
+		our_side
+	}
+
+	// Send the chunks a pending stream is waiting for, then close it and collect the reply.
+	fn stream_finish(&mut self, sender: alloc::sync::Arc<object::channel::Channel>, chunks: &[&[u8]], corr: u32) -> bool {
+		use object::channel::Message;
+		for chunk in chunks {
+			let _ = sender.send(Message::new(chunk.to_vec(), alloc::vec::Vec::new(), 0));
+			self.pump();
+		}
+		drop(sender);
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&1);
+			}
+		}
+		false
+	}
+
 	// Open a write stream, send NOTHING, and move the clock past the service's idle bound.
 	//
 	// The bound is a deadline, so without a way to move time this could only be waited out - about
