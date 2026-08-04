@@ -10,9 +10,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # The three verbs that are NOT lab.py, kept here rather than hidden: each runs a different tool.
 declare -A SPECIAL=(
-	[baseline]="tools/measure-dev-baseline.sh"
-	[build]="tools/dev-build.sh"
-	[selftest]="boot/dev-selftest.py"
+	["baseline"]="tools/measure-dev-baseline.sh"
+	["build"]="tools/dev-build.sh"
+	["selftest"]="boot/dev-selftest.py"
 )
 
 LAB_VERBS=(up down status console log ping publish generations type reset reboot restart stop key pointer clean loop rollback test launch)

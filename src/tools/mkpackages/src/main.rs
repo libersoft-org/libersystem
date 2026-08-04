@@ -818,7 +818,14 @@ fn volume_files(conf: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
 // now boot through the loader, which hands over each module under its own name.
 fn export_cross_arch_volume() {
 	let arch: String = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-	if arch == "aarch64" || arch == "riscv64" {
+	// EVERY architecture, not just the device-tree ones.
+	//
+	// The unqualified `volume.pkg` and `init.pkg` are written by every build, so after
+	// `--arch all` they hold whichever ran LAST. A test ISO staged that file and the x86_64 suite
+	// booted riscv64 binaries, failing at "dynamic test main is ELF". x86_64 had no qualified copy
+	// to fall back to because this exported them only for the other two - which is the same
+	// unqualified-shared-slot defect that has now served the wrong artifact three times.
+	{
 		let out_dir: PathBuf = boot_dir();
 		let build_dir: PathBuf = boot_dir();
 		let _ = fs::create_dir_all(&build_dir);

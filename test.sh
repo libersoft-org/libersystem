@@ -96,6 +96,34 @@ done
 # something other than what you meant - and because a suite that rebuilds is a suite you cannot
 # point at an artifact you already have. The test KERNEL is still compiled here, by `cargo test`,
 # because building and running it is one operation as far as cargo is concerned.
+# A QEMU already holding this architecture's disk images.
+#
+# Two runs at once fail deep inside QEMU with `Is another process using the image [...]`, naming
+# the FILE and not the run that holds it - which reads as a test failure and is not one. It has
+# cost four runs in this tree, every time from an instance someone (usually me) left behind. The
+# check belongs here because this script's job is to refuse with a reason rather than to discover
+# the reason at minute thirty.
+require_no_stray_qemu() {
+	local arch="$1" pattern pids
+	case "$arch" in
+	x86_64) pattern="qemu-system-x86_64" ;;
+	aarch64) pattern="qemu-system-aarch64" ;;
+	riscv64) pattern="qemu-system-riscv64" ;;
+	esac
+	# ANCHORED at the start of the command line.
+	#
+	# Plain `-f "$pattern"` matches anything that merely MENTIONS qemu - a wrapper script, a grep,
+	# the shell that typed the kill command - so the check fired on itself and named a different PID
+	# every time. `-x` on the process name cannot work either: the kernel truncates it to 15
+	# characters and `qemu-system-riscv64` is 19, so it matches nothing at all and the check silently
+	# never fires. Anchoring the command line catches the real process and nothing that talks about
+	# it.
+	pids="$(pgrep -f "^([^ ]*/)?$pattern " 2>/dev/null || true)"
+	[[ -z "$pids" ]] && return 0
+	die "a $pattern is already running (PID ${pids//$'\n'/, }) and holds this architecture's disk images.
+    It is probably a run left behind. Stop it and try again:  kill ${pids//$'\n'/ }"
+}
+
 require_built() {
 	local arch="$1" volume="$BUILD_DIR/boot/system-volume-$arch.img"
 	[[ -f "$volume" ]] || die "no system volume for $arch - run: ./build.sh --arch $arch"
@@ -123,6 +151,7 @@ preflight_fast() {
 }
 
 for arch in "${archs[@]}"; do
+	require_no_stray_qemu "$arch"
 	if [[ $fast -eq 1 ]]; then preflight_fast "$arch"; else preflight_full "$arch"; fi
 	args=("$arch")
 	[[ -n "$tags" ]] && args+=("$tags")

@@ -141,7 +141,9 @@ make_iso() {
 	# a test medium had become one artifact in the first place.
 	local payload="$BUILD/system-volume-x86_64.img" payload_name="system-volume.img"
 	if [[ "$test_medium" == "1" ]]; then
-		payload="$BUILD/$VOLUME_PACKAGE"
+		# Architecture-qualified: the unqualified name is whichever build ran last.
+		payload="$BUILD/volume-x86_64.pkg"
+		[[ -f "$payload" ]] || payload="$BUILD/$VOLUME_PACKAGE"
 		payload_name="$VOLUME_PACKAGE"
 		[[ -f "$payload" ]] || die "testiso: no volume package at $payload (run \`just packages\`)"
 	else

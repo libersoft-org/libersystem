@@ -12,17 +12,17 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # name -> command, run from src/. The static-injection family shares one script and differs by its
 # argument, which is exactly the shape that became six recipe names.
 declare -A GATES=(
-	[development - gate]="tools/check-development-gate.sh"
-	[artifact - metadata]="tools/check-artifact-metadata.sh"
-	[dynamic - report]="tools/check-dynamic-report.sh --check"
-	[test - tags]="boot/check-test-tags.sh"
-	[static - image]="tools/check-static-injection.sh static"
-	[undeclared - edge]="tools/check-static-injection.sh undeclared-edge"
-	[duplicate - edge]="tools/check-static-injection.sh duplicate-edge"
-	[malformed - dynamic]="tools/check-static-injection.sh malformed-dynamic"
-	[malformed - symbol - relocation]="tools/check-static-injection.sh malformed-symbol-relocation"
-	[identity - note]="tools/check-static-injection.sh identity-note"
-	[volume - layout]="tools/system-manifest.sh check-volume-package ../.build/boot/volume.pkg"
+	["development-gate"]="tools/check-development-gate.sh"
+	["artifact-metadata"]="tools/check-artifact-metadata.sh"
+	["dynamic-report"]="tools/check-dynamic-report.sh --check"
+	["test-tags"]="boot/check-test-tags.sh"
+	["static-image"]="tools/check-static-injection.sh static"
+	["undeclared-edge"]="tools/check-static-injection.sh undeclared-edge"
+	["duplicate-edge"]="tools/check-static-injection.sh duplicate-edge"
+	["malformed-dynamic"]="tools/check-static-injection.sh malformed-dynamic"
+	["malformed-symbol-relocation"]="tools/check-static-injection.sh malformed-symbol-relocation"
+	["identity-note"]="tools/check-static-injection.sh identity-note"
+	["volume-layout"]="tools/system-manifest.sh check-volume-package ../.build/boot/volume.pkg"
 )
 
 FORMATS=(bmp gif ico icns jpeg pcx png ppm qoi tga webp)
