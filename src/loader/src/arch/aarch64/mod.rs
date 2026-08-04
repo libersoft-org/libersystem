@@ -50,11 +50,12 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// direct `-kernel` boot and not at all under UEFI, where nobody lays the archive down - the
 	// kernel came up and reported its init package malformed, having found no package at all.
 	// Reading it here is what makes the loader path usable on this architecture (M0138c).
+	// `main` has already reported WHERE the set came from, and there are three possible answers.
+	// Saying "from the system volume" here claimed the first of them unconditionally, so a riscv64
+	// boot that had actually assembled its set from the boot medium said both things, one after
+	// the other, and the wrong one last.
 	let init_pkg = match unsafe { crate::BOOTSTRAP } {
-		Some(archive) => {
-			serial::write_str("loader: bootstrap set assembled from the system volume\n");
-			Some(archive)
-		}
+		Some(archive) => Some(archive),
 		None => crate::read_boot_file(bs, root, crate::INIT_PKG_FILE),
 	};
 	// The factory archive too, when the medium carries one: the kernel test suite uses it as its

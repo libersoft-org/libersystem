@@ -2,7 +2,7 @@
 
 use base_proto::generated::liber::base::v1::Error;
 use core::arch::global_asm;
-use rt::{close, recv_vec_blocking, send_blocking, ReceivedVec};
+use rt::{ReceivedVec, close, recv_vec_blocking, send_blocking};
 use storage_proto::generated::liber::storage::v1::volume;
 use wire::{Sink, VecWriter};
 

@@ -98,58 +98,12 @@ cargo_sdk_dir := build_root / "cargo/sdk"
 kernel_elf := cargo_kernel_dir / target / "debug" / "kernel"
 
 # default: build and run in QEMU
-default: run
-
-# build the first system-image shared-object pilot
-shared-libs:
-    @tools/build-shared.sh x86_64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client base-proto=base-proto resources-proto=resources-proto process-proto=process-proto display-proto=display-proto input-proto=input-proto security-proto=security-proto session-proto=session-proto storage-proto=storage-proto config-proto=config-proto audio-proto=audio-proto device-proto=device-proto log-proto=log-proto network-proto=network-proto observability-proto=observability-proto time-proto=time-proto audio-client=audio-client-provider config-client=config-client-provider device-client=device-client-provider log-client=log-client-provider network-client=network-client-provider observability-client=observability-client-provider process-client=process-client-provider resources-client=resources-client-provider security-client=security-client-provider time-client=time-client-provider volume-client=volume-client-provider pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface imgconv=imgconv adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack wasm=wasm lico=lico term=term service-util=services
-
-# Every release gate in one command, cheapest first so a failure arrives early.
-#
-# It exists because the gates below are individually runnable and collectively forgotten: two of
-# them were found red after sitting that way for days, precisely because no ordinary workflow
-# invokes them. Roughly half an hour on the documented host.
-#
-# `test-all` is deliberately not here. The QEMU suites on three architectures are the longest
-# thing in the tree and are run deliberately rather than swept into something else; run
-# `just test-all` beside this one.
-#
-# The order is not arbitrary either. The shipping rebuild comes before `development-gate-check`,
-# which compares the built volume package against the shipping configuration and therefore fails
-# after any use of `dev-up` until the tree is rebuilt without it - a failure about the last thing
-# somebody did rather than about the code being released.
-#
-# run every release gate in one command, cheapest first, about half an hour; `test-all` is separate
-release:
-    @echo "release: formatting, hygiene and generated sources"
-    just fmt-check
-    just source-hygiene
-    just gen-check
-    @echo "release: rebuilding the shipping configuration"
-    just build
-    just development-gate-check
-    @echo "release: host unit tests"
-    just bootproto-host-test
-    just services-host-test
-    just fs-host-test
-    just app-libs-test
-    @echo "release: manifest and volume agreement"
-    just artifact-metadata-check
-    just volume-layout-check
-    @echo "release: codec conformance"
-    just image-conformance
-    @echo "release: dynamic-linking audits across three targets"
-    just static-image-check
-    just dynamic-report-check
-    @echo "release: authoritative rebuild"
-    just shared-libs-verify
-    @echo "release: targeted and authoritative builds agree byte for byte"
-    just fast-path-check
-    @echo "release: every gate passed; run 'just test-all' for the three-target QEMU suites"
+default:
+    @echo "the build interface moved to scripts at the repo root: ./build.sh ./run.sh ./test.sh ./image.sh ./check.sh ./clean.sh ./dev.sh (each takes --help)"
 
 # discard all image caches and rerun the complete compile/link/audit path
 shared-libs-verify:
-    @LIBER_IMAGE_REBUILD=1 just shared-libs
+    @LIBER_IMAGE_REBUILD=1 ../build.sh --part libs
 
 # Prove a targeted build and the authoritative rebuild produce the same bytes, over a leaf
 # executable, a provider with consumers and the runtime provider. Both sides rebuild for real.
@@ -160,116 +114,9 @@ fast-path-check target="x86_64" *artifacts:
 shared-cache-check mode="quick":
     tools/check-shared-cache.sh {{ mode }}
 
-# Record one cold, warm, leaf-edit or provider-edit development-loop sample.
-dev-baseline scenario tags="smoke":
-    @tools/measure-dev-baseline.sh "{{ scenario }}" "{{ tags }}"
-
-# Build and audit one manifest-owned dynamic artifact and its affected closure.
-dev-build *arguments:
-    @tools/dev-build.sh {{ arguments }}
-
-# Verify the development agent, its artifact registry and the control port's transport are
-# absent from the shipping configuration rather than merely refusing to run in it.
-development-gate-check:
-    tools/check-development-gate.sh
-
-# Reject an ET_EXEC mutation before it can rewrite any target's staged system volume.
-static-image-check: sdk user user-aarch64 user-riscv64
-    tools/check-static-injection.sh static
-
-# Reject a staged but undeclared DT_NEEDED provider before it can rewrite any target's system volume.
-undeclared-edge-check: sdk user user-aarch64 user-riscv64
-    tools/check-static-injection.sh undeclared-edge
-
-# Reject duplicate DT_NEEDED metadata before it can rewrite any target's staged system volume.
-duplicate-edge-check: sdk user user-aarch64 user-riscv64
-    tools/check-static-injection.sh duplicate-edge
-
-# Reject malformed PT_DYNAMIC metadata before it can rewrite any target's staged system volume.
-malformed-dynamic-check: sdk user user-aarch64 user-riscv64
-    tools/check-static-injection.sh malformed-dynamic
-
-# Reject malformed symbol and relocation metadata before it can rewrite any target's system volume.
-malformed-symbol-relocation-check: sdk user user-aarch64 user-riscv64
-    tools/check-static-injection.sh malformed-symbol-relocation
-
-# Reject a malformed embedded identity record before it can rewrite any target's system volume.
-identity-note-check: sdk user user-aarch64 user-riscv64
-    tools/check-static-injection.sh identity-note
-
-# Verify the checked dynamic executable report against all three staged target graphs.
-dynamic-report-check: sdk user user-aarch64 user-riscv64
-    tools/check-dynamic-report.sh --check
-
 # Regenerate the checked dynamic executable report from all three staged target graphs.
-dynamic-report-update: sdk user user-aarch64 user-riscv64
+dynamic-report-update:
     tools/check-dynamic-report.sh --write
-
-shared-libs-aarch64:
-    @tools/build-shared.sh aarch64-unknown-none lsrt=rt wire=wire ipc-client=ipc-client base-proto=base-proto resources-proto=resources-proto process-proto=process-proto display-proto=display-proto input-proto=input-proto security-proto=security-proto session-proto=session-proto storage-proto=storage-proto config-proto=config-proto audio-proto=audio-proto device-proto=device-proto log-proto=log-proto network-proto=network-proto observability-proto=observability-proto time-proto=time-proto audio-client=audio-client-provider config-client=config-client-provider device-client=device-client-provider log-client=log-client-provider network-client=network-client-provider observability-client=observability-client-provider process-client=process-client-provider resources-client=resources-client-provider security-client=security-client-provider time-client=time-client-provider volume-client=volume-client-provider pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface imgconv=imgconv adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack wasm=wasm lico=lico term=term service-util=services
-
-shared-libs-riscv64:
-    @tools/build-shared.sh riscv64gc-unknown-none-elf lsrt=rt wire=wire ipc-client=ipc-client base-proto=base-proto resources-proto=resources-proto process-proto=process-proto display-proto=display-proto input-proto=input-proto security-proto=security-proto session-proto=session-proto storage-proto=storage-proto config-proto=config-proto audio-proto=audio-proto device-proto=device-proto log-proto=log-proto network-proto=network-proto observability-proto=observability-proto time-proto=time-proto audio-client=audio-client-provider config-client=config-client-provider device-client=device-client-provider log-client=log-client-provider network-client=network-client-provider observability-client=observability-client-provider process-client=process-client-provider resources-client=resources-client-provider security-client=security-client-provider time-client=time-client-provider volume-client=volume-client-provider pix=pix inflate=inflate deflate=deflate quantize=quantize bmp=bmp png=png apng=apng gif=gif ico=ico icns=icns jpeg=jpeg pcx=pcx ppm=ppm qoi=qoi tga=tga webp=webp keys=keys pcm=pcm surface=surface imgconv=imgconv adpcm=adpcm aiff=aiff flac=flac mp3=mp3 ogg=ogg vorbis=vorbis wav=wav wavpack=wavpack wasm=wasm lico=lico term=term service-util=services
-
-# build the userspace programs that make up the init package
-user: shared-libs
-    cd {{ user_dir }} && cargo build
-    cd {{ services_dir }} && cargo build {{ dev_features }}
-    cd {{ storage_dir }} && cargo build
-    cd {{ drivers_dir }} && cargo build {{ dev_features }}
-
-# build the userspace programs for aarch64 (the aarch64 kernel build.rs reads them
-# from each crate's aarch64-unknown-none target dir)
-user-aarch64: shared-libs-aarch64
-    cd {{ user_dir }} && cargo build --target aarch64-unknown-none
-    cd {{ services_dir }} && cargo build --target aarch64-unknown-none {{ dev_features }}
-    cd {{ storage_dir }} && cargo build --target aarch64-unknown-none
-    cd {{ drivers_dir }} && cargo build --target aarch64-unknown-none {{ dev_features }}
-
-# build the WebAssembly component SDK example (the `liber` world guest) for
-# wasm32-unknown-unknown; the package builder stages it directly from .build
-sdk:
-    cd {{ sdk_dir }} && cargo build --release --target wasm32-unknown-unknown
-
-# Assemble the boot packages from an already-built userspace. Compiles nothing and depends on
-# nothing: it reads the manifest, checks that every program it names is built, and refuses if one
-# is not. Deliberately without a `user` dependency - a packaging step that quietly builds what it
-# is missing cannot tell you that something was missing.
-packages arch="x86_64":
-    cd tools/mkpackages && cargo run --quiet -- {{ arch }}
-
-# build the kernel and the own UEFI loader (staged into the boot image as BOOTX64.EFI), then
-# assemble the boot packages from the userspace built above
-build: sdk user packages
-    cd {{ kernel_dir }} && cargo build
-    cd {{ loader_dir }} && cargo build
-    just system-volume x86_64 1
-
-# Build the system volume as a LiberFS image. Separate from `packages` and deliberately AFTER the
-# kernel: the image carries the kernel, while the archives cannot move after it because the kernel
-# embeds them. Run together, the image would stage whichever kernel the previous build left.
-# Build the system volume as a LiberFS image. Separate from `packages` and deliberately AFTER the
-# kernel when the volume carries one.
-#
-# `kernel=1` stages the linked kernel onto the volume, which is what a bootable image wants. The
-# test path leaves it off: its kernel is the harness's test binary, staged on the ESP, and a volume
-# carrying a different one would be booted in preference to it.
-system-volume arch="x86_64" kernel="0":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # Absolute, because the recipe changes directory: the kernel path is resolved HERE, where the
-    # relative paths in this file are anchored, not inside the tool's own working directory.
-    kernel_arg=""
-    if [[ "{{ kernel }}" == "1" ]]; then
-        case "{{ arch }}" in
-            x86_64) triple=x86_64-unknown-none ;;
-            aarch64) triple=aarch64-unknown-none ;;
-            riscv64) triple=riscv64gc-unknown-none-elf ;;
-            *) echo "system-volume: unknown arch {{ arch }}" >&2; exit 1 ;;
-        esac
-        kernel_arg="--with-kernel=$(realpath {{ cargo_kernel_dir }})/$triple/debug/kernel"
-    fi
-    cd tools/mkpackages && cargo run --quiet -- {{ arch }} system-volume $kernel_arg
 
 # generate the proto crate's bindings from the LSIDL interface definitions
 # (src/idl/*.lsidl) and format the generated source
@@ -361,207 +208,27 @@ gen-accept-breaking:
     cd {{ storage_proto_dir }} && cargo fmt
     cd {{ proto_dir }} && cargo fmt
 
-# Build + boot one architecture through the unified QEMU runner. With no architecture,
-# use the host architecture; an explicit first target runs natively or under emulation.
-# A display may still be the first argument: `just run vnc` remains native.
-# Examples: `just run`, `just run vnc`, `just run aarch64`, `just run riscv64 vnc`.
-run *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    target=""
-    displays=()
-    for arg in {{ args }}; do
-    if [[ -z "$target" && ${#displays[@]} -eq 0 && "$arg" =~ ^(x86_64|aarch64|riscv64)$ ]]; then
-        target="$arg"
-    else
-        displays+=("$arg")
-    fi
-    done
-    if [[ -z "$target" ]]; then
-    case "$(uname -m)" in
-    x86_64) target=x86_64 ;;
-    aarch64 | arm64) target=aarch64 ;;
-    riscv64) target=riscv64 ;;
-    *) echo "just run: unsupported host architecture '$(uname -m)'" >&2 && exit 1 ;;
-    esac
-    fi
-    case "$target" in
-    x86_64) just run-x86_64 "${displays[@]}" ;;
-    aarch64) just run-aarch64 "${displays[@]}" ;;
-    riscv64) just run-riscv64 "${displays[@]}" ;;
-    *) echo "just run: unknown architecture '$target' (expected x86_64, aarch64, or riscv64)" >&2 && exit 1 ;;
-    esac
-
-# build + boot the x86_64 build in QEMU (native with KVM on an x86_64 host, emulated
-# elsewhere). Add live displays as arguments (combinable): `just run-x86_64 vnc spice`.
-run-x86_64 *displays: sdk user
-    cd {{ kernel_dir }} && cargo build
-    DISPLAYS="{{ displays }}" boot/qemu-run.sh x86_64 {{ kernel_elf }}
-
 # build + boot, QEMU waits for GDB (port :1234)
-debug: sdk user
-    cd {{ kernel_dir }} && cargo build
-    DEBUG=1 NOKVM=1 boot/qemu-run.sh x86_64 {{ kernel_elf }}
+debug:
+    ../run.sh --debug
 
 # attach GDB to a running QEMU (run in a second panel after 'just debug')
 gdb:
     gdb -x boot/gdb-init {{ kernel_elf }}
 
-# Build the x86_64 userspace graph and validate its artifacts before kernel test
-# runs. The resulting stamp lets the focused fast recipes reuse those artifacts
-# only while every non-kernel input remains unchanged.
-test-preflight: sdk user test-tags-check
-    just packages x86_64
-    just system-volume x86_64
-    tools/check-staged-image.sh x86_64
-    boot/test-preflight.sh write x86_64
-
-# Run every x86_64 test in QEMU (isa-debug-exit). TEST_TIMEOUT overrides the
-# 15-minute full-suite watchdog.
-test: test-preflight
-    boot/test-kernel.sh x86_64
-
-# Run the union of the requested x86_64 tags plus the smoke set.
-test-tags tags: test-preflight
-    boot/test-kernel.sh x86_64 "{{ tags }}"
-
 # Exercise x86_64 SMP bring-up at the host core count as a checkpoint gate.
-test-smp-checkpoint: test-preflight
+test-smp-checkpoint:
     SMP="$(nproc)" boot/test-kernel.sh x86_64 "smp"
-
-# Compile the x86_64 test kernel and selected descriptors without booting QEMU.
-# This preserves the normal target, build-std and package-assembly path for quick
-# validation between small mechanical test ownership moves.
-test-build: test-preflight
-    boot/test-kernel.sh x86_64 --build-only
-
-test-tags-build tags: test-preflight
-    boot/test-kernel.sh x86_64 "{{ tags }}" --build-only
-
-# Reuse a content-verified x86_64 userspace preflight while Cargo rebuilds the
-# current kernel test image and QEMU executes it.
-test-fast:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check x86_64
-    boot/test-kernel.sh x86_64
-
-test-tags-fast tags:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check x86_64
-    boot/test-kernel.sh x86_64 "{{ tags }}"
-
-test-build-fast:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check x86_64
-    boot/test-kernel.sh x86_64 --build-only
-
-test-tags-build-fast tags:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check x86_64
-    boot/test-kernel.sh x86_64 "{{ tags }}" --build-only
-
-# run the kernel test suite in QEMU on aarch64 (Arm semihosting exit maps pass/fail).
-# SMP=4 exercises the multi-core paths (secondary bring-up, the cross-core wake IPI).
-test-preflight-aarch64: sdk user-aarch64 test-tags-check
-    just packages aarch64
-    just system-volume aarch64
-    tools/check-staged-image.sh aarch64
-    boot/test-preflight.sh write aarch64
-
-# Booted through the OWN UEFI LOADER, not QEMU's `-kernel`: the loader reads the kernel and the
-# bootstrap set and hands them over as named modules, which is the path a real machine takes and
-# the one M0138 makes canonical. `UEFI=0 just test-aarch64` still exercises the direct boot while
-# it exists.
-test-aarch64: test-preflight-aarch64 loader-aarch64
-    UEFI={{ env('UEFI', '1') }} boot/test-kernel.sh aarch64
-
-# Run the union of the requested aarch64 tags plus the smoke set.
-test-tags-aarch64 tags: test-preflight-aarch64
-    SMP="${SMP:-4}" boot/test-kernel.sh aarch64 "{{ tags }}"
-
-# Compile the aarch64 test kernel and selected descriptors without booting QEMU.
-test-build-aarch64: test-preflight-aarch64
-    boot/test-kernel.sh aarch64 --build-only
-
-test-tags-build-aarch64 tags: test-preflight-aarch64
-    boot/test-kernel.sh aarch64 "{{ tags }}" --build-only
-
-test-fast-aarch64:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check aarch64
-    SMP="${SMP:-4}" boot/test-kernel.sh aarch64
-
-test-tags-fast-aarch64 tags:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check aarch64
-    SMP="${SMP:-4}" boot/test-kernel.sh aarch64 "{{ tags }}"
-
-test-build-fast-aarch64:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check aarch64
-    boot/test-kernel.sh aarch64 --build-only
-
-test-tags-build-fast-aarch64 tags:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check aarch64
-    boot/test-kernel.sh aarch64 "{{ tags }}" --build-only
-
-# run the kernel test suite in QEMU on riscv64 over OpenSBI (RISC-V semihosting exit
-# maps pass/fail). Defaults to `nproc` harts (like the x86 `test` recipe), exercising the
-# multi-hart paths (SBI HSM hart_start bring-up, the SBI IPI cross-hart wake); override
-# with `SMP=<n>` (a smaller count is faster under TCG on a many-core host).
-test-preflight-riscv64: sdk user-riscv64 test-tags-check
-    just packages riscv64
-    just system-volume riscv64
-    tools/check-staged-image.sh riscv64
-    boot/test-preflight.sh write riscv64
-
-test-riscv64: test-preflight-riscv64 loader-riscv64
-    UEFI={{ env('UEFI', '1') }} boot/test-kernel.sh riscv64
-
-# Run the union of the requested riscv64 tags plus the smoke set.
-test-tags-riscv64 tags: test-preflight-riscv64
-    SMP="${SMP:-4}" boot/test-kernel.sh riscv64 "{{ tags }}"
-
-# Compile the riscv64 test kernel and selected descriptors without booting QEMU.
-test-build-riscv64: test-preflight-riscv64
-    boot/test-kernel.sh riscv64 --build-only
-
-test-tags-build-riscv64 tags: test-preflight-riscv64
-    boot/test-kernel.sh riscv64 "{{ tags }}" --build-only
-
-test-fast-riscv64:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check riscv64
-    SMP="${SMP:-4}" boot/test-kernel.sh riscv64
-
-test-tags-fast-riscv64 tags:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check riscv64
-    SMP="${SMP:-4}" boot/test-kernel.sh riscv64 "{{ tags }}"
-
-test-build-fast-riscv64:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check riscv64
-    boot/test-kernel.sh riscv64 --build-only
-
-test-tags-build-fast-riscv64 tags:
-    boot/check-test-tags.sh
-    boot/test-preflight.sh check riscv64
-    boot/test-kernel.sh riscv64 "{{ tags }}" --build-only
 
 # Run all tests on all architectures. TCG guests are intentionally serial to avoid
 # host contention; this is the periodic integration check, not the per-task path.
-test-all: sdk user user-aarch64 user-riscv64 test-tags-check
+test-all: test-tags-check
     boot/test-all.sh
 
 # Cheap source and manifest checks; the Rust type system separately rejects
 # unknown/empty tags, and the image builder verifies actual ELF metadata.
-test-tags-check: artifact-metadata-check services-host-test
+test-tags-check: services-host-test
     boot/check-test-tags.sh
-
-artifact-metadata-check:
-    tools/check-artifact-metadata.sh
 
 # Answer whether the staged system images on disk are the ones this tree produces, by
 # hashing every declared artifact against the digest the build recorded when it staged it.
@@ -571,9 +238,6 @@ artifact-metadata-check:
 # like a code defect. With no argument every target that has a staged image is checked.
 staged-image-check *targets:
     tools/check-staged-image.sh {{ targets }}
-
-volume-layout-check: build
-    tools/system-manifest.sh check-volume-package ../.build/boot/volume.pkg
 
 # Reject generated or compiled artifacts anywhere below src or in the Git index.
 source-hygiene:
@@ -609,32 +273,9 @@ loader-riscv64:
     llvm-objcopy -O binary --pad-to "$end" "$out" "$out.efi"
     echo "loader-riscv64: wrote $out.efi"
 
-# build + boot the ARM64 build in QEMU (native on an aarch64 host, emulated on an x86
-# host), reaching the interactive shell over the serial console. Boots through the own
-# UEFI loader under AAVMF - the only path, since the `-kernel` boot's package wrapper was
-# retired (M0138c). Add live displays as arguments (combinable): `just run-aarch64 vnc spice`.
-run-aarch64 *displays: sdk user-aarch64 loader-aarch64
-    cd {{ kernel_dir }} && cargo build --target aarch64-unknown-none
-    UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh aarch64 {{ cargo_kernel_dir }}/aarch64-unknown-none/debug/kernel
-
-# build the userspace programs for riscv64 (the riscv64 kernel build.rs reads them from
-# each crate's riscv64gc-unknown-none-elf target dir)
-user-riscv64: shared-libs-riscv64
-    cd {{ user_dir }} && cargo build --target riscv64gc-unknown-none-elf
-    cd {{ services_dir }} && cargo build --target riscv64gc-unknown-none-elf {{ dev_features }}
-    cd {{ storage_dir }} && cargo build --target riscv64gc-unknown-none-elf
-    cd {{ drivers_dir }} && cargo build --target riscv64gc-unknown-none-elf {{ dev_features }}
-
-# build + boot the riscv64 build in QEMU through the own UEFI loader under U-Boot,
-# reaching the userspace service chain over the serial console. The system volume is a
-# polled virtio-blk disk, so no per-device interrupt path is needed for the core chain.
-run-riscv64 *displays: sdk user-riscv64 loader-riscv64
-    cd {{ kernel_dir }} && cargo build --target riscv64gc-unknown-none-elf
-    UEFI=1 DISPLAYS="{{ displays }}" SERIAL=stdio bash boot/qemu-run.sh riscv64 {{ cargo_kernel_dir }}/riscv64gc-unknown-none-elf/debug/kernel
-
 # screenshot the framebuffer to a file (format by extension: png/jpg/webp/...);
-# snaps a live `just run` if one is up, else boots a throwaway. e.g. just screenshot shot.png
-screenshot path: build
+# snaps a live `./run.sh` if one is up, else boots a throwaway. e.g. just screenshot shot.png
+screenshot path:
     boot/screenshot.sh {{ path }}
 
 # drive a live instance for debugging: boot it, run shell commands in it and get
@@ -642,87 +283,6 @@ screenshot path: build
 # e.g. `just lab boot --fresh`, `just lab sh time ls`, `just lab help`
 lab *args:
     boot/lab.py {{ args }}
-
-# boot one development guest and keep it alive so later commands reuse it instead of
-# paying for a boot each time. One instance owns the profile at a time; a second caller
-# is told who holds it and how to release it. e.g. `just dev-up`, `just dev-up --vnc`
-dev-up *args:
-    boot/lab.py dev-up {{ args }}
-
-# report the development instance state: down, starting, ready, stale or foreign.
-# Exits 0 only when it is ready, so scripts can gate on it.
-dev-status:
-    @boot/lab.py dev-status
-
-# attach an interactive terminal to the development instance and replay its recent
-# output. Ctrl-] detaches without stopping the guest. One client owns keyboard input;
-# `just dev-console --read-only` attaches further observers. e.g. `just dev-console`
-dev-console *args:
-    @boot/lab.py dev-console {{ args }}
-
-# show, follow or grep the development instance serial log. e.g. `just dev-log -f`
-dev-log *args:
-    @boot/lab.py dev-log {{ args }}
-
-# exercise the development-control protocol over the instance's control channel:
-# handshake, then round-trip echoed frames. e.g. `just dev-ping --count 5 --size 4096`
-dev-ping *args:
-    @boot/lab.py dev-ping {{ args }}
-
-# stream a file into the development instance's artifact registry, checked against its
-# digest by the guest. e.g. `just dev-publish shell ../.build/image/.../shell`
-dev-publish *args:
-    @boot/lab.py dev-publish {{ args }}
-
-# list the artifact generations the development instance holds
-dev-generations *args:
-    @boot/lab.py dev-generations {{ args }}
-
-# type into the development instance's terminal over the control channel, and get back the
-# byte count its console accepted. e.g. `just dev-type ls -l`
-dev-type *args:
-    @boot/lab.py dev-type {{ args }}
-
-# drop the development state the instance holds (registry and any open candidate); not a
-# reboot, and it reports exactly what it dropped
-dev-reset *args:
-    @boot/lab.py dev-reset {{ args }}
-
-# reboot the guest to a clean state when its state is corrupted, without rebuilding anything.
-# The instance, its sockets and the system volume all survive, so a persistence bug survives
-# too rather than being papered over. e.g. `just dev-reboot`
-dev-reboot *args:
-    @boot/lab.py dev-reboot {{ args }}
-
-# replace the instance's development agent with a fresh one and wait until it serves; the
-# guest keeps running and the registry goes with the old agent
-dev-restart *args:
-    @boot/lab.py dev-restart {{ args }}
-
-# end the program launched through the control channel; what it printed stays readable
-dev-stop *args:
-    @boot/lab.py dev-stop {{ args }}
-
-# send key events to the instance through the emulated keyboard, not the control protocol:
-# named keys and chords, or `--text` for a line. e.g. `just dev-key ctrl-c up ret`
-dev-key *args:
-    @boot/lab.py dev-key {{ args }}
-
-# send a pointer event through the emulated tablet; positions are fractions of the screen.
-# e.g. `just dev-pointer wheel-down`, `just dev-pointer --x 0.5 --y 0.5 left`
-dev-pointer *args:
-    @boot/lab.py dev-pointer {{ args }}
-
-# prune what the host accumulates - old test logs, old baseline samples, scratch from builds
-# that ended - against documented limits, and report what went. e.g. `just dev-clean --dry-run`
-dev-clean *args:
-    @boot/lab.py dev-clean {{ args }}
-
-# the development loop in one command: build an artifact, publish it into the running
-# instance, run the scenarios. Stops at the phase that failed.
-# e.g. `just dev-loop uname boot/scenarios/registry-shadow.toml`
-dev-loop *args:
-    @boot/lab.py dev-loop {{ args }}
 
 # run the development-control protocol's conformance suite against the running instance, all
 # groups or the named ones. e.g. `just proto-test`, `just proto-test registry publication`
@@ -734,68 +294,12 @@ proto-test *groups:
 perf-gate:
     @boot/perf-gate.py
 
-# publish three successive generations into one running guest, refuse a fourth, roll back and
-# reset, and prove the guest never restarted through any of it
-dev-selftest:
-    @boot/dev-selftest.py
-
-# return an artifact in the development instance registry to the generation before its
-# newest. e.g. `just dev-rollback base-proto`
-dev-rollback *args:
-    @boot/lab.py dev-rollback {{ args }}
-
-# run declarative application scenarios against the development instance. Scenario data is
-# versioned, bounded and has no way to express a shell command.
-# e.g. `just dev-test boot/scenarios/*.toml`
-dev-test *args:
-    @boot/lab.py dev-test {{ args }}
-
 # run scenarios against a cold boot of any target, with no persistent instance: builds that
 # target with the development profile, boots one guest, drives it over the same control protocol
 # and takes it down. This is what lets an application scenario be exercised on aarch64 and
 # riscv64, where the persistent instance does not exist.
 scenario-cold *args:
     @boot/lab.py scenario-cold {{ args }}
-
-# launch a canonical program in the development instance through PermissionManager and print
-# what it writes. e.g. `just dev-launch uname`
-dev-launch *args:
-    @boot/lab.py dev-launch {{ args }}
-
-# stop the development instance gracefully and release its lock
-dev-down *args:
-    @boot/lab.py dev-down {{ args }}
-
-# build the bootable ISO -> .build/boot/<product>.iso; STRIP=debug|all
-#
-# This IS the LiveCD, and it is the only ISO: the system volume it carries is copied into memory
-# at boot, so the medium is never written and the machine needs no disk. It carries no factory
-# archive - `liveiso` used to build this separately and the two have been one product since the
-# archive left the shipping medium.
-iso strip="debug": build (system-volume "x86_64")
-    STRIP={{ strip }} boot/mkimage.sh iso {{ kernel_elf }}
-
-# build a raw bootable disk image for USB / SD card / HDD (BIOS + UEFI); SIZE e.g. 128M, 1G; STRIP=debug|all
-# 128M by default: the volume carries the kernel and the full userspace, and the ESP now carries
-# the bootstrap set as files beside it, so 64 MiB no longer fits both.
-img size="128M" strip="debug": build
-    STRIP={{ strip }} boot/mkimage.sh img {{ kernel_elf }} {{ size }}
-
-# build the raw disk image and convert it to QCOW2 -> .build/boot/<product>.qcow2
-#
-# Worth having beside the raw image because a raw 64 MiB image is 64 MiB whether or not it is
-# used, while QCOW2 stores only the blocks that were written - a fraction of that to keep, to copy
-# and to hand to someone. The raw image stays: it is what gets written to a USB stick, and QCOW2
-# is not something a disk can be.
-qcow2 size="128M" strip="debug": (img size strip)
-    #!/usr/bin/env bash
-    set -euo pipefail
-    slug="$(grep -m1 '^PRODUCT_NAME=' ../product.conf | cut -d'"' -f2 | tr '[:upper:]' '[:lower:]')"
-    raw="{{ build_root }}/boot/$slug.img"
-    out="${raw%.img}.qcow2"
-    [[ -f "$raw" ]] || { echo "qcow2: no raw image at $raw" >&2; exit 1; }
-    qemu-img convert -f raw -O qcow2 "$raw" "$out"
-    printf 'qcow2: wrote %s (%s from %s raw)\n' "$out" "$(du -h "$out" | cut -f1)" "$(du -h "$raw" | cut -f1)"
 
 # host-test pure application-side pixel, input, PCM and image helpers
 app-libs-test:
@@ -859,207 +363,6 @@ audio-bench:
 image-bench:
     cargo run --release --manifest-path {{ image_bench_dir }}/Cargo.toml
 
-# Validate every supported image profile with independent host implementations.
-image-conformance: bmp-conformance gif-conformance ico-conformance icns-conformance jpeg-conformance pcx-conformance png-conformance ppm-conformance qoi-conformance tga-conformance webp-conformance
-
-# Validate BMP decode/encode profiles with ImageMagick.
-bmp-conformance:
-    cargo run --release --manifest-path {{ bmp_conformance_dir }}/Cargo.toml
-
-# Validate GIF decode/encode profiles with ImageMagick and gifsicle.
-gif-conformance:
-    cargo run --release --manifest-path {{ gif_conformance_dir }}/Cargo.toml
-
-# Validate ICO decode/encode profiles with ImageMagick and icoutils.
-ico-conformance:
-    cargo run --release --manifest-path {{ ico_conformance_dir }}/Cargo.toml
-
-# Validate ICNS decode/encode profiles with icnsutils and ImageMagick.
-icns-conformance:
-    cargo run --release --manifest-path {{ icns_conformance_dir }}/Cargo.toml
-
-# Validate baseline JPEG profiles with ImageMagick and Pillow.
-jpeg-conformance:
-    cargo run --release --manifest-path {{ jpeg_conformance_dir }}/Cargo.toml
-
-# Validate PCX decode/encode profiles with ImageMagick and Netpbm.
-pcx-conformance:
-    cargo run --release --manifest-path {{ pcx_conformance_dir }}/Cargo.toml
-
-# Validate PNG/APNG profiles with pngcheck, ImageMagick, Pillow and apngdis.
-png-conformance:
-    cargo run --release --manifest-path {{ png_conformance_dir }}/Cargo.toml
-
-# Validate PPM decode/encode profiles with ImageMagick and Netpbm.
-ppm-conformance:
-    cargo run --release --manifest-path {{ ppm_conformance_dir }}/Cargo.toml
-
-# Validate QOI decode/encode profiles with ImageMagick and Netpbm.
-qoi-conformance:
-    cargo run --release --manifest-path {{ qoi_conformance_dir }}/Cargo.toml
-
-# Validate TGA decode/encode profiles with ImageMagick.
-tga-conformance:
-    cargo run --release --manifest-path {{ tga_conformance_dir }}/Cargo.toml
-
-# Validate VP8, VP8L, ALPH and animated WebP with libwebp and ImageMagick.
-webp-conformance:
-    cargo run --release --manifest-path {{ webp_conformance_dir }}/Cargo.toml
-
 # Run every image leaf and the central sniffer through deterministic hostile inputs.
 image-mutate:
     cargo run --release --manifest-path {{ image_mutate_dir }}/Cargo.toml
-
-# format all code (Rust via rustfmt, shell via shfmt)
-fmt:
-    cd {{ system_manifest_dir }} && cargo fmt
-    cd {{ abi_dir }} && cargo fmt
-    cd {{ wire_dir }} && cargo fmt
-    cd {{ rt_dir }} && cargo fmt
-    cd {{ ipc_client_dir }} && cargo fmt
-    cd {{ pix_dir }} && cargo fmt
-    cd {{ keys_dir }} && cargo fmt
-    cd {{ pcm_dir }} && cargo fmt
-    cd {{ surface_dir }} && cargo fmt
-    cd {{ bmp_dir }} && cargo fmt
-    cd {{ inflate_dir }} && cargo fmt
-    cd {{ deflate_dir }} && cargo fmt
-    cd {{ png_dir }} && cargo fmt
-    cd {{ apng_dir }} && cargo fmt
-    cd {{ quantize_dir }} && cargo fmt
-    cd {{ gif_dir }} && cargo fmt
-    cd {{ imgconv_dir }} && cargo fmt
-    cd {{ ico_dir }} && cargo fmt
-    cd {{ icns_dir }} && cargo fmt
-    cd {{ jpeg_dir }} && cargo fmt
-    cd {{ pcx_dir }} && cargo fmt
-    cd {{ ppm_dir }} && cargo fmt
-    cd {{ qoi_dir }} && cargo fmt
-    cd {{ tga_dir }} && cargo fmt
-    cd {{ webp_dir }} && cargo fmt
-    cd {{ adpcm_dir }} && cargo fmt
-    cd {{ aiff_dir }} && cargo fmt
-    cd {{ flac_dir }} && cargo fmt
-    cd {{ mp3_dir }} && cargo fmt
-    cd {{ ogg_dir }} && cargo fmt
-    cd {{ vorbis_dir }} && cargo fmt
-    cd {{ wav_dir }} && cargo fmt
-    cd {{ wavpack_dir }} && cargo fmt
-    cd {{ kernel_dir }} && cargo fmt
-    cd {{ user_dir }} && cargo fmt
-    cd {{ services_dir }} && cargo fmt
-    cd {{ storage_dir }} && cargo fmt
-    cd {{ drivers_dir }} && cargo fmt
-    cd {{ usertools_dir }} && cargo fmt
-    cd {{ tools_dir }} && cargo fmt
-    cd {{ audio_bench_dir }} && cargo fmt
-    cd {{ image_bench_dir }} && cargo fmt
-    cd {{ bmp_conformance_dir }} && cargo fmt
-    cd {{ gif_conformance_dir }} && cargo fmt
-    cd {{ ico_conformance_dir }} && cargo fmt
-    cd {{ icns_conformance_dir }} && cargo fmt
-    cd {{ jpeg_conformance_dir }} && cargo fmt
-    cd {{ pcx_conformance_dir }} && cargo fmt
-    cd {{ png_conformance_dir }} && cargo fmt
-    cd {{ ppm_conformance_dir }} && cargo fmt
-    cd {{ qoi_conformance_dir }} && cargo fmt
-    cd {{ tga_conformance_dir }} && cargo fmt
-    cd {{ webp_conformance_dir }} && cargo fmt
-    cd {{ image_mutate_dir }} && cargo fmt
-    cd {{ proto_dir }} && cargo fmt
-    cd {{ wasm_dir }} && cargo fmt
-    cd {{ sdk_dir }} && cargo fmt
-    cd {{ lico_dir }} && cargo fmt
-    cd {{ term_dir }} && cargo fmt
-    cd {{ bootproto_dir }} && cargo fmt
-    cd {{ loader_dir }} && cargo fmt
-    cd {{ fscore_dir }} && cargo fmt
-    cd {{ liberfs_dir }} && cargo fmt
-    cd {{ libermemfs_dir }} && cargo fmt
-    cd {{ fat_dir }} && cargo fmt
-    cd {{ iso9660_dir }} && cargo fmt
-    cd {{ udf_dir }} && cargo fmt
-
-    shfmt -w ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-development-gate.sh tools/check-shared-cache.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
-    cd .. && taplo fmt
-
-# check formatting without writing changes (CI-friendly)
-fmt-check:
-    @just --quiet _fmt-check
-
-[private]
-_fmt-check:
-    cd {{ system_manifest_dir }} && cargo fmt --check
-    cd {{ abi_dir }} && cargo fmt --check
-    cd {{ wire_dir }} && cargo fmt --check
-    cd {{ rt_dir }} && cargo fmt --check
-    cd {{ ipc_client_dir }} && cargo fmt --check
-    cd {{ pix_dir }} && cargo fmt --check
-    cd {{ keys_dir }} && cargo fmt --check
-    cd {{ pcm_dir }} && cargo fmt --check
-    cd {{ surface_dir }} && cargo fmt --check
-    cd {{ bmp_dir }} && cargo fmt --check
-    cd {{ inflate_dir }} && cargo fmt --check
-    cd {{ deflate_dir }} && cargo fmt --check
-    cd {{ png_dir }} && cargo fmt --check
-    cd {{ apng_dir }} && cargo fmt --check
-    cd {{ quantize_dir }} && cargo fmt --check
-    cd {{ gif_dir }} && cargo fmt --check
-    cd {{ imgconv_dir }} && cargo fmt --check
-    cd {{ ico_dir }} && cargo fmt --check
-    cd {{ icns_dir }} && cargo fmt --check
-    cd {{ jpeg_dir }} && cargo fmt --check
-    cd {{ pcx_dir }} && cargo fmt --check
-    cd {{ ppm_dir }} && cargo fmt --check
-    cd {{ qoi_dir }} && cargo fmt --check
-    cd {{ tga_dir }} && cargo fmt --check
-    cd {{ webp_dir }} && cargo fmt --check
-    cd {{ adpcm_dir }} && cargo fmt --check
-    cd {{ aiff_dir }} && cargo fmt --check
-    cd {{ flac_dir }} && cargo fmt --check
-    cd {{ mp3_dir }} && cargo fmt --check
-    cd {{ ogg_dir }} && cargo fmt --check
-    cd {{ vorbis_dir }} && cargo fmt --check
-    cd {{ wav_dir }} && cargo fmt --check
-    cd {{ wavpack_dir }} && cargo fmt --check
-    cd {{ kernel_dir }} && cargo fmt --check
-    cd {{ user_dir }} && cargo fmt --check
-    cd {{ services_dir }} && cargo fmt --check
-    cd {{ storage_dir }} && cargo fmt --check
-    cd {{ drivers_dir }} && cargo fmt --check
-    cd {{ usertools_dir }} && cargo fmt --check
-    cd {{ tools_dir }} && cargo fmt --check
-    cd {{ audio_bench_dir }} && cargo fmt --check
-    cd {{ image_bench_dir }} && cargo fmt --check
-    cd {{ bmp_conformance_dir }} && cargo fmt --check
-    cd {{ gif_conformance_dir }} && cargo fmt --check
-    cd {{ ico_conformance_dir }} && cargo fmt --check
-    cd {{ icns_conformance_dir }} && cargo fmt --check
-    cd {{ jpeg_conformance_dir }} && cargo fmt --check
-    cd {{ pcx_conformance_dir }} && cargo fmt --check
-    cd {{ png_conformance_dir }} && cargo fmt --check
-    cd {{ ppm_conformance_dir }} && cargo fmt --check
-    cd {{ qoi_conformance_dir }} && cargo fmt --check
-    cd {{ tga_conformance_dir }} && cargo fmt --check
-    cd {{ webp_conformance_dir }} && cargo fmt --check
-    cd {{ image_mutate_dir }} && cargo fmt --check
-    cd {{ proto_dir }} && cargo fmt --check
-    cd {{ wasm_dir }} && cargo fmt --check
-    cd {{ sdk_dir }} && cargo fmt --check
-    cd {{ lico_dir }} && cargo fmt --check
-    cd {{ term_dir }} && cargo fmt --check
-    cd {{ bootproto_dir }} && cargo fmt --check
-    cd {{ loader_dir }} && cargo fmt --check
-    cd {{ fscore_dir }} && cargo fmt --check
-    cd {{ liberfs_dir }} && cargo fmt --check
-    cd {{ libermemfs_dir }} && cargo fmt --check
-    cd {{ fat_dir }} && cargo fmt --check
-    cd {{ iso9660_dir }} && cargo fmt --check
-    cd {{ udf_dir }} && cargo fmt --check
-
-    shfmt -d ../setup.sh boot/qemu-run.sh boot/mkimage.sh boot/screenshot.sh boot/test-kernel.sh boot/test-preflight.sh boot/test-all.sh boot/check-test-tags.sh tools/build-consumer-object.sh tools/check-development-gate.sh tools/check-dynamic-report.sh tools/check-shared-cache.sh tools/check-source-hygiene.sh tools/check-static-injection.sh tools/measure-dev-baseline.sh tools/source-path.sh
-    cd .. && taplo fmt --check
-
-# clean build artifacts
-clean:
-    rm -rf {{ build_root }}

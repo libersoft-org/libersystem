@@ -14,8 +14,25 @@ if (($# > 1)); then
 	usage
 fi
 
+# Every Rust crate in the tree, DISCOVERED rather than listed.
+#
+# The Justfile carried the list by hand - 67 directories in `fmt` and the same 67 again in
+# `fmt-check`, 134 lines of it. The tree has 106 crates, so 39 of them were never formatted and
+# never checked: a second source of truth that had already drifted. Finding them is one line and
+# cannot go stale.
+rust_crate_dirs() {
+	find "$ROOT/src" -name Cargo.toml -not -path '*/target/*' -printf '%h\n' | sort -u
+}
+
+format_all_rust() {
+	local dir
+	while IFS= read -r dir; do
+		(cd "$dir" && cargo fmt ${1:-})
+	done < <(rust_crate_dirs)
+}
+
 if (($# == 0)); then
-	(cd "$ROOT/src" && just fmt)
+	format_all_rust
 	shopt -s nullglob
 	root_shell_files=("$ROOT"/*.sh)
 	if ((${#root_shell_files[@]} > 0)); then

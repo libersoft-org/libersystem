@@ -65,6 +65,49 @@ fn run() -> Result<(), String> {
 				println!("{}", library.name);
 			}
 		}
+		// `<library>=<crate>` for every shared library, which is exactly what the shared-image
+		// builder takes on its command line.
+		//
+		// That list lived in the Justfile, written out by hand THREE times - once per architecture,
+		// in a single 900-character line. It is derivable from this manifest, which the file itself
+		// calls the only hand-edited source of truth, so keeping a copy of it anywhere else is a
+		// second source of truth waiting to disagree.
+		"library-crates" => {
+			// DEPENDENCY ORDER, not alphabetical. The shared-image builder needs a provider
+			// compiled before anything that links it - alphabetical order fails immediately with
+			// "adpcm has no compile identity for provider lsrt".
+			//
+			// The Justfile's hand-written list carried that order implicitly, as knowledge nobody
+			// had written down: it looked like a list and was actually a topological sort someone
+			// had done by hand and would have had to redo for every new library. The manifest
+			// records `providers` per library, so the order is derivable.
+			let mut emitted: BTreeSet<&str> = std::collections::BTreeSet::new();
+			let mut order: Vec<&system_manifest::Library> = Vec::new();
+			// Repeated passes rather than recursion: the graph is small and a cycle must end the
+			// loop with a message rather than a stack overflow.
+			loop {
+				let mut progressed = false;
+				for library in manifest.libraries.values() {
+					if emitted.contains(library.name.as_str()) {
+						continue;
+					}
+					if library.providers.iter().all(|p| emitted.contains(p.as_str()) || !manifest.libraries.contains_key(p)) {
+						emitted.insert(library.name.as_str());
+						order.push(library);
+						progressed = true;
+					}
+				}
+				if !progressed {
+					break;
+				}
+			}
+			if order.len() != manifest.libraries.len() {
+				return Err(String::from("library-crates: the provider graph has a cycle"));
+			}
+			for library in order {
+				println!("{}={}", library.name, library.owner);
+			}
+		}
 		"consumers-of" => {
 			let provider = arguments.next().ok_or_else(|| String::from("usage: system-manifest consumers-of <library>"))?;
 			for program in manifest.programs.values().filter(|program| program.providers.iter().any(|candidate| candidate.as_str() == provider)) {

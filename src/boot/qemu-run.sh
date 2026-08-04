@@ -470,9 +470,24 @@ qemu_run_x86_64() {
 	#
 	# The suite boots the TEST medium: it reads `volume.pkg` off it as its fixture source and as
 	# the table of expected file contents, which the shipping ISO deliberately no longer carries.
+	# BOOT_IMAGE names a medium to boot INSTEAD of building one.
+	#
+	# Without it this function always built an image, so "boot the thing I just built" was not
+	# expressible: the build, the imaging and the run were one step, and what ended up on the medium
+	# could not be inspected between them. That is how a disk image came to carry the TEST kernel -
+	# nothing sat between assembling it and booting it.
 	local iso iso_mode="iso"
-	[[ "${TEST:-0}" == "1" ]] && iso_mode="testiso"
-	iso="$("$HERE/mkimage.sh" "$iso_mode" "$kernel")"
+	if [[ -n "${BOOT_IMAGE:-}" ]]; then
+		[[ -f "$BOOT_IMAGE" ]] || {
+			echo "qemu-run: no image at $BOOT_IMAGE" >&2
+			exit 1
+		}
+		iso="$BOOT_IMAGE"
+		echo "qemu-run: booting $iso (built elsewhere; nothing was rebuilt)" >&2
+	else
+		[[ "${TEST:-0}" == "1" ]] && iso_mode="testiso"
+		iso="$("$HERE/mkimage.sh" "$iso_mode" "$kernel")"
+	fi
 
 	# UEFI firmware (OVMF): the platform boots through UEFI, not SeaBIOS - the ISO is
 	# hybrid, and development deliberately exercises the UEFI path (the own UEFI-only

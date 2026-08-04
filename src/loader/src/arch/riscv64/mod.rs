@@ -69,11 +69,12 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// architecture has no userspace under UEFI: its programs used to come from an archive the
 	// runner laid in RAM and the kernel found by scanning for a magic number, which the loader
 	// path neither lays down nor needs (M0138c).
+	// `main` has already reported WHERE the set came from, and there are three possible answers.
+	// Saying "from the system volume" here claimed the first of them unconditionally, so a riscv64
+	// boot that had actually assembled its set from the boot medium said both things, one after
+	// the other, and the wrong one last.
 	let init_pkg = match unsafe { crate::BOOTSTRAP } {
-		Some(archive) => {
-			serial::write_str("loader: bootstrap set assembled from the system volume\n");
-			Some(archive)
-		}
+		Some(archive) => Some(archive),
 		None => crate::read_boot_file(bs, root, crate::INIT_PKG_FILE),
 	};
 	let volume_pkg = root.and_then(|root| crate::read_file(bs, root, crate::VOLUME_PKG_FILE));

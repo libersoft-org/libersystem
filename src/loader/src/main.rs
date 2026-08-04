@@ -23,6 +23,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod arch;
 mod blockio;
 mod elf;
@@ -125,9 +127,53 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// the same `/`-separated paths the volume list already uses, so no path is translated between
 	// the two sources - and it works on firmware that declines to mount the ESP, which is exactly
 	// the machine this fallback exists for.
-	fn bootstrap_from_boot_medium(bs: *mut BootServices) {
+	// A reader over the boot volume the FIRMWARE mounted, for the case the FAT scan cannot cover.
+	//
+	// Both are needed, and finding that out cost a red riscv64 suite. Under OVMF the ESP is
+	// enumerated as a block device AND mounted, so scanning for FAT finds it. Under U-Boot it is
+	// mounted but NOT exposed as a block device - the kernel read through the firmware succeeded
+	// while the FAT scan saw nothing - so a fallback built only on the scan finds no bootstrap list
+	// on exactly the machines that need one. The reverse case is real too: firmware that declines
+	// to mount the medium is why the scan exists.
+	//
+	// Paths are translated here because UEFI separates with `\` while the list, the volume and the
+	// FAT backend all use `/`. One translation at one boundary, rather than two path vocabularies.
+	struct FirmwareVolume {
+		bs: *mut BootServices,
+		root: *mut uefi::FileProtocol,
+	}
+
+	impl blockio::ReadsFiles for FirmwareVolume {
+		fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+			let mut name = [0u8; 128];
+			if path.len() >= name.len() {
+				return None;
+			}
+			for (i, &b) in path.iter().enumerate() {
+				name[i] = if b == b'/' { b'\\' } else { b };
+			}
+			let name = core::str::from_utf8(&name[..path.len()]).ok()?;
+			let bytes = read_file(self.bs, self.root, name)?;
+			let mut owned = alloc::vec::Vec::new();
+			owned.try_reserve_exact(bytes.len()).ok()?;
+			owned.extend_from_slice(bytes);
+			Some(owned)
+		}
+	}
+
+	fn bootstrap_from_boot_medium(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) {
 		if unsafe { BOOTSTRAP }.is_some() {
 			return;
+		}
+		if let Some(root) = root {
+			let mut volume = FirmwareVolume { bs, root };
+			if let Some(archive) = blockio::assemble_bootstrap(&mut volume) {
+				unsafe {
+					BOOTSTRAP = retain(bs, &archive);
+					BOOTSTRAP_SOURCE = "the boot medium (the system volume did not answer)";
+				}
+				return;
+			}
 		}
 		blockio::each_disk(bs, |disk| {
 			let Some(mut fs) = fat::FatFs::mount(disk) else { return false };
@@ -153,7 +199,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		bootstrap_from_image(bs, image);
 	}
 
-	bootstrap_from_boot_medium(bs);
+	bootstrap_from_boot_medium(bs, root);
 
 	// Report which of the sources the bootstrap set came from, for the same reason the kernel read
 	// is reported: a boot that silently used the fallback looks identical to one that did not.

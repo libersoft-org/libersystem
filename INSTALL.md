@@ -46,18 +46,22 @@ The project pins the nightly toolchain via `rust-toolchain.toml`, so no global t
 The kernel is built for the `x86_64-unknown-none` target. From the `src` directory:
 
 ```sh
-just build
+./build.sh
 ```
 
-This first builds the userspace programs (the services, drivers and command-line tools that make up the init package) and the SDK component, then compiles the kernel ELF - which embeds the init package - into `kernel/target/x86_64-unknown-none/debug/kernel`. A plain build does not produce a disk image - the run step assembles a bootable ISO on demand, and you can build standalone images with [`just iso`](#create-bootable-images) and [`just img`](#create-bootable-images).
+This builds the userspace programs (the services, drivers and command-line tools), the SDK component, the kernel ELF into `.build/cargo/kernel/x86_64-unknown-none/debug/kernel`, the system's own UEFI loader, and the LiberFS **system volume** the loader reads all of it from.
+
+The kernel does not contain the userspace. It used to - the programs that run before a disk is readable were compiled into the kernel binary, which made building the kernel require a built userspace and put those programs somewhere the user could not look. They are files on the system volume now, listed in `etc/bootstrap.list`, and the loader reads them and hands them over. One kernel binary, whatever userspace it is given.
+
+A plain build does not produce a disk image - the run step assembles one on demand, and you can build standalone images with [`./image.sh`](#create-bootable-images).
 
 ## Run
 
 ```sh
-just run
+./run.sh
 ```
 
-`just run` builds and boots the **host's native architecture** (the `x86_64` build on an x86_64 host, the `aarch64` build on an ARM64 host). It launches QEMU headless, with the system's serial console wired to your terminal. The boot log reports each service coming online and ends at an interactive shell prompt:
+`./run.sh` builds and boots the **host's native architecture** (the `x86_64` build on an x86_64 host, the `aarch64` build on an ARM64 host). It launches QEMU headless, with the system's serial console wired to your terminal. The boot log reports each service coming online and ends at an interactive shell prompt:
 
 ```
 vol://system>
@@ -66,28 +70,26 @@ vol://system>
 To capture the serial output to a file instead of the terminal (useful over SSH or in scripts):
 
 ```sh
-SERIAL=file:boot.log just run
+SERIAL=file:boot.log ./run.sh
 ```
 
-QEMU uses KVM (with `-cpu host`) when `/dev/kvm` is available, and gives the guest as many cores as the host has (`nproc`); override the count with `SMP=<n> just run`.
+QEMU uses KVM (with `-cpu host`) when `/dev/kvm` is available, and gives the guest as many cores as the host has (`nproc`); override the count with `SMP=<n> ./run.sh`.
 
 ### Running a specific architecture
 
-`just run` picks the host's architecture; to force a particular one - it runs emulated when it is not the host's - use the explicit recipes:
+`./run.sh` picks the host's architecture; to force a particular one - it runs emulated when it is not the host's - name it:
 
 ```sh
-just run-x86_64        # the x86_64 build (native with KVM on an x86_64 host)
-just run-aarch64       # the ARM64 build via QEMU's direct -kernel load (the quick path)
-just run-aarch64-uefi  # the ARM64 build booted through the system's own UEFI loader (AAVMF)
-just run-riscv64       # the RISC-V build via QEMU's direct -kernel load over OpenSBI (the quick path)
-just run-riscv64-uefi  # the RISC-V build booted through the system's own UEFI loader (U-Boot)
+./run.sh --arch x86_64    # the x86_64 build (native with KVM on an x86_64 host)
+./run.sh --arch aarch64   # the ARM64 build, booted through the system's own UEFI loader (AAVMF)
+./run.sh --arch riscv64   # the RISC-V build, booted through the system's own UEFI loader (U-Boot)
 ```
 
-They all reach the same interactive shell. `run-aarch64` boots the kernel the fast way (QEMU loads it directly); `run-aarch64-uefi` exercises the full firmware path - the AAVMF UEFI firmware runs the system's own `BOOTAA64.EFI` loader, which reads the kernel off a FAT boot volume and hands off exactly as it would on real hardware. The ARM64 build is emulated on an x86_64 host (no KVM), so it boots more slowly than the native run. The ARM64 runs attach the **same device set as x86_64** - `virtio-gpu` (the graphical display), `virtio-keyboard` / `virtio-tablet` input, `virtio-sound`, `virtio-net`, `virtio-serial` and the xHCI USB stack - so the `vnc` / `spice` displays below work identically. The one difference is the boot log: QEMU's `virt` machine has no VGA framebuffer, so the kernel does not draw the boot log pixel-by-pixel as on x86_64; instead the log is replayed as text onto the virtio-gpu display once ConsoleService takes over, so it still appears on screen.
+They all reach the same interactive shell, and all three take the **same path a real machine takes**: firmware runs the system's own loader (`BOOTX64.EFI`, `BOOTAA64.EFI`, `BOOTRISCV64.EFI`), the loader reads the kernel and the bootstrap programs off the system volume, and hands off. There used to be a second, faster way in for ARM64 and RISC-V - QEMU's direct `-kernel` load, with the userspace passed as one packaged blob - and separate `run-aarch64-uefi` / `run-riscv64-uefi` recipes for the firmware path. That blob was retired with the packaged bootstrap archive it carried, so there is one way in now and the `-uefi` recipes are gone. The ARM64 build is emulated on an x86_64 host (no KVM), so it boots more slowly than the native run. The ARM64 runs attach the **same device set as x86_64** - `virtio-gpu` (the graphical display), `virtio-keyboard` / `virtio-tablet` input, `virtio-sound`, `virtio-net`, `virtio-serial` and the xHCI USB stack - so the `vnc` / `spice` displays below work identically. The one difference is the boot log: QEMU's `virt` machine has no VGA framebuffer, so the kernel does not draw the boot log pixel-by-pixel as on x86_64; instead the log is replayed as text onto the virtio-gpu display once ConsoleService takes over, so it still appears on screen.
 
-The RISC-V build is always emulated. `run-riscv64` boots the kernel the fast way (QEMU's `-kernel` load over OpenSBI, which hands off in S-mode with the device tree); `run-riscv64-uefi` exercises the full firmware path - QEMU runs the S-mode U-Boot on OpenSBI, and U-Boot's EFI boot manager launches the system's own `BOOTRISCV64.EFI` loader off a FAT boot volume, which reads the kernel and hands off exactly as it would on real hardware. The RISC-V runs are **serial-console only** (headless, no `virtio-gpu`), so `vnc` / `spice` do not apply; they attach the storage volumes, a `virtio-net` NIC and an xHCI USB stack (keyboard / tablet / mass-storage). Override the core count with `SMP=<n>` (the recipes default to `SMP=4`).
+The RISC-V build is always emulated. QEMU runs the S-mode U-Boot on OpenSBI, and U-Boot's EFI boot manager launches the system's own `BOOTRISCV64.EFI` loader, which reads the kernel and hands off exactly as it would on real hardware. The RISC-V runs are **serial-console only** (headless, no `virtio-gpu`), so `vnc` / `spice` do not apply; they attach the storage volumes, a `virtio-net` NIC and an xHCI USB stack (keyboard / tablet / mass-storage). Override the core count with `SMP=<n>` (the default is the host's core count, capped at 8 - see below).
 
-Like the native run, the ARM64 runs give the guest as many cores as the host has, but capped at **8** - the GICv2 interrupt controller QEMU's `virt` machine emulates addresses at most 8 CPU interfaces. Override the count on any run/test with `SMP=<n>` (e.g. `SMP=4 just run-aarch64`, `SMP=1 just test-aarch64`).
+Like the native run, the ARM64 runs give the guest as many cores as the host has, but capped at **8** - the GICv2 interrupt controller QEMU's `virt` machine emulates addresses at most 8 CPU interfaces. The RISC-V runs are capped at 8 for a different reason: U-Boot stops booting above roughly 50 harts, and on a host with more cores than that the guest produced no output at all while OpenSBI logged normally, which reads as a broken loader rather than as too many CPUs. Override the count on any run/test with `SMP=<n>` (e.g. `SMP=4 ./run.sh --arch aarch64`, `SMP=1 ./test.sh --arch aarch64`).
 
 ### Networking
 
@@ -99,12 +101,12 @@ curl http://127.0.0.1:5555/
 
 ### Graphical display (VNC / SPICE)
 
-The graphical displays apply to the **x86_64 and ARM64** builds - the x86_64 run (`just run` on an x86_64 host, or `just run-x86_64` anywhere) and the ARM64 runs (`just run-aarch64` / `just run-aarch64-uefi`); the RISC-V runs are serial-console only, so `vnc` / `spice` do not apply there. Every run is headless by default - the framebuffer is still rendered internally, but no window is shown. To watch it live, attach a display server as an argument; the two combine freely with each other (and with any other `just run` arguments):
+The graphical displays apply to the **x86_64 and ARM64** builds - the x86_64 run (`./run.sh` on an x86_64 host, or `./run.sh --arch x86_64` anywhere) and the ARM64 runs (`./run.sh --arch aarch64`); the RISC-V runs are serial-console only, so `vnc` / `spice` do not apply there. Every run is headless by default - the framebuffer is still rendered internally, but no window is shown. To watch it live, attach a display server as an argument; the two combine freely with each other (and with any other `./run.sh` arguments):
 
 ```sh
-just run vnc        # VNC server on port 5900
-just run spice      # SPICE server on port 5930
-just run vnc spice  # both at the same time
+./run.sh --display vnc         # VNC server on port 5900
+./run.sh --display spice       # SPICE server on port 5930
+./run.sh --display vnc,spice   # both at the same time
 ```
 
 Then connect from your machine - for example a VNC viewer to `HOST:5900`, or `remote-viewer spice://HOST:5930`. The serial console keeps running on your terminal alongside the graphical display.
@@ -112,7 +114,7 @@ Then connect from your machine - for example a VNC viewer to `HOST:5900`, or `re
 The servers bind to all interfaces (`0.0.0.0`) without a password. On a machine reachable from untrusted networks, restrict the bind to localhost and connect over an SSH tunnel instead:
 
 ```sh
-VNC_ADDR=127.0.0.1:0 just run vnc      # VNC on localhost:5900 only
+VNC_ADDR=127.0.0.1:0 ./run.sh --display vnc   # VNC on localhost:5900 only
 ssh -L 5900:localhost:5900 user@HOST   # from your machine, then point the viewer at localhost:5900
 ```
 
@@ -123,7 +125,7 @@ ssh -L 5900:localhost:5900 user@HOST   # from your machine, then point the viewe
 Interactive runs attach a `virtio-sound` device that the userspace `driver.virtio-snd` + `AudioService` drive for PCM playback. The shell `beep [hz] [ms]` command plays a tone (default 440 Hz for 200 ms). Audio is routed to the host through SPICE, so to hear it run with a SPICE display and connect a SPICE client:
 
 ```sh
-just run spice                         # then: remote-viewer spice://HOST:5930
+./run.sh --display spice                      # then: remote-viewer spice://HOST:5930
 ```
 
 Without a SPICE display the device is still present (the guest plays into a null sink, nothing is emitted). The headless test path attaches no sound device, so there `beep` reports `no audio device`.
@@ -137,35 +139,37 @@ just screenshot shot.png
 just screenshot /root/screenshot.webp
 ```
 
-If a `just run` instance is already up, it attaches to it and snaps the **current** frame with no reboot - so you can grab a screenshot at any moment during a live run. Otherwise it boots a throwaway headless instance, waits for the boot log to finish, snaps that, and shuts it down. Format conversion uses ImageMagick (`png`/`jpg`/`webp`/...); a `netpbm`-only system can still write `png`/`jpg`/`ppm`.
+If a `./run.sh` instance is already up, it attaches to it and snaps the **current** frame with no reboot - so you can grab a screenshot at any moment during a live run. Otherwise it boots a throwaway headless instance, waits for the boot log to finish, snaps that, and shuts it down. Format conversion uses ImageMagick (`png`/`jpg`/`webp`/...); a `netpbm`-only system can still write `png`/`jpg`/`ppm`.
 
 ## Create bootable images
 
-`just run` builds and boots a throwaway image automatically. To boot LiberSystem on real hardware - or to keep an image around - you can build standalone images explicitly. Both are written to `boot/.build/` and boot on any UEFI machine.
+`./run.sh` builds and boots a throwaway image automatically. To boot LiberSystem on real hardware - or to keep an image around - you can build standalone images explicitly. Both are written to `.build/boot/` and boot on any UEFI machine.
 
 ### CD/DVD image (ISO)
 
 ```sh
-just iso
+./image.sh --format iso
 ```
 
-Builds a UEFI-only bootable image at `boot/.build/libersystem.iso`. Burn it to a CD/DVD, or write it straight to a USB stick (the EFI boot image is exposed as a GPT partition, so it also boots from a flash drive):
+Builds a UEFI-only bootable image at `.build/boot/libersystem.iso`. Burn it to a CD/DVD, or write it straight to a USB stick (the EFI boot image is exposed as a GPT partition, so it also boots from a flash drive).
+
+It is a **LiveCD**: the medium carries a LiberFS system volume, which the running system copies into memory at boot. Nothing is written back - the machine needs no disk, and a session's changes are gone when it stops.
 
 ```sh
-sudo dd if=boot/.build/libersystem.iso of=/dev/sdX bs=4M conv=fsync status=progress
+sudo dd if=.build/boot/libersystem.iso of=/dev/sdX bs=4M conv=fsync status=progress
 ```
 
 ### Raw disk image (IMG)
 
 ```sh
-just img        # default size 64M
-just img 1G     # custom size (truncate-style suffixes: M, G, ...)
+./image.sh --format img              # default size 128M
+./image.sh --format img --size 1G    # custom size (truncate-style suffixes: M, G - no trailing B)
 ```
 
-Builds a raw GPT disk image at `boot/.build/libersystem.img` for a USB stick, SD card or hard disk. It holds a single EFI System Partition with the own UEFI loader, the kernel and the packages, so it boots on any UEFI machine. Write it to a device with:
+Builds a raw GPT disk image at `.build/boot/libersystem.img` for a USB stick, SD card or hard disk. Unlike the ISO this is an **installed** system: two partitions, an EFI System Partition holding the loader and a recovery copy of the bootstrap programs, and a LiberFS system volume holding the kernel and everything else. The loader finds the volume by its superblock rather than by device order, so it boots on any UEFI machine whatever else is attached. Write it to a device with:
 
 ```sh
-sudo dd if=boot/.build/libersystem.img of=/dev/sdX bs=4M conv=fsync status=progress
+sudo dd if=.build/boot/libersystem.img of=/dev/sdX bs=4M conv=fsync status=progress
 ```
 
 > Replace `/dev/sdX` with your target device (for example `/dev/sdb`). **Double-check the device name** - `dd` overwrites it without confirmation.
@@ -175,9 +179,9 @@ sudo dd if=boot/.build/libersystem.img of=/dev/sdX bs=4M conv=fsync status=progr
 The kernel placed into an image is always stripped, because the debug info is never used at boot (the loader loads only the loadable segments, and the debugger reads symbols from the on-disk build). The amount stripped is selectable - it never affects booting, only the image size:
 
 ```sh
-just iso          # STRIP=debug (default): drop DWARF, keep the symbol table
-just iso all      # STRIP=all: also drop the symbol table (smallest image)
-just img 128M all # same switch on the disk image (after the size)
+./image.sh --format iso                      # --strip debug (default): drop DWARF, keep symbols
+./image.sh --format iso --strip all          # also drop the symbol table (smallest image)
+./image.sh --format img --size 128M --strip all
 ```
 
 ## Test
@@ -185,7 +189,7 @@ just img 128M all # same switch on the disk image (after the size)
 LiberSystem ships an in-kernel test harness that runs under QEMU and reports the result through QEMU's `isa-debug-exit` device:
 
 ```sh
-just test
+./test.sh
 ```
 
 A successful run prints each test with `[ok]` and exits zero.
@@ -193,9 +197,10 @@ A successful run prints each test with `[ok]` and exits zero.
 The same suite runs on the ARM64 and RISC-V builds (emulated on an x86_64 host), where the result is reported through Arm / RISC-V semihosting instead of `isa-debug-exit`:
 
 ```sh
-just test-aarch64          # the ARM64 build (all host cores, capped at 8 - see below)
-SMP=1 just test-aarch64    # a single core
-just test-riscv64          # the RISC-V build (RISC-V semihosting; SMP=4 by default)
+./test.sh --arch aarch64        # the ARM64 build (all host cores, capped at 8 - see below)
+SMP=1 ./test.sh --arch aarch64  # a single core
+./test.sh --arch riscv64        # the RISC-V build (RISC-V semihosting; host cores, capped at 8)
+./test.sh --arch all            # all three, in turn
 ```
 
 ## Debugging
@@ -229,37 +234,39 @@ just gdb
 
 Run `just --list` to see every available command. The most useful ones:
 
+The build interface is a set of scripts at the repository root. Each takes flags rather than
+encoding its arguments in its name, and each answers `--help`:
+
 | Command | Description |
 | --- | --- |
-| `just build` | Build everything: the userspace programs, the SDK component, and the kernel (whose build embeds the init package). |
-| `just run [vnc] [spice]` | Build and boot the **host's native architecture** in QEMU (headless by default; on the x86_64 build add `vnc` and/or `spice` for a live VNC `:5900` / SPICE `:5930` display - they combine). |
-| `just run-x86_64 [vnc] [spice]` | Force the x86_64 build (native with KVM on an x86_64 host, emulated elsewhere). |
-| `just run-aarch64` | Force the ARM64 build via QEMU's direct `-kernel` load (headless serial; native on an ARM64 host, emulated on x86_64). |
-| `just run-aarch64-uefi` | Force the ARM64 build booted through the system's own UEFI loader under the AAVMF firmware. |
-| `just run-riscv64` | Force the RISC-V build via QEMU's direct `-kernel` load over OpenSBI (headless serial; always emulated). |
-| `just run-riscv64-uefi` | Force the RISC-V build booted through the system's own UEFI loader under U-Boot's EFI boot manager. |
-| `just screenshot <path>` | Save a framebuffer image to `<path>` (format by extension: png/jpg/webp/...); snaps a live `just run` if one is up, else boots a throwaway. |
-| `just iso [strip]` | Build a hybrid BIOS+UEFI ISO into `boot/.build/` (`strip` = `debug` or `all`). |
-| `just img [size] [strip]` | Build a raw GPT disk image (default `64M`) into `boot/.build/`. |
-| `just test` | Run the in-kernel test harness in QEMU. |
-| `just test-aarch64` | Run the in-kernel test harness for the ARM64 build under QEMU (Arm semihosting maps pass/fail; defaults to all host cores capped at 8 - the GICv2 limit - override with `SMP=<n>`). |
-| `just test-riscv64` | Run the in-kernel test harness for the RISC-V build under QEMU (RISC-V semihosting maps pass/fail; defaults to `SMP=4` - override with `SMP=<n>`). |
-| `just static-image-check` | Temporarily inject an `ET_EXEC` header into a staged dynamic executable on all three targets; package assembly must reject it before rewriting the system volume, then restore each artifact. |
-| `just undeclared-edge-check` | Temporarily change a staged executable's `DT_NEEDED` provider from declared `lsrt.lslib` to staged but undeclared `wire.lslib` on all three targets; package assembly must reject it before rewriting the system volume, then restore each artifact. |
-| `just duplicate-edge-check` | Temporarily make two staged `DT_NEEDED` entries name the same provider on all three targets; package assembly must reject the duplicate before rewriting the system volume, then restore each artifact. |
-| `just malformed-dynamic-check` | Temporarily inject a second `PT_DYNAMIC`, remove `DT_NULL`, and duplicate `DT_STRTAB` metadata in a staged executable on all three targets; package assembly must reject each form before rewriting the system volume, then restore each artifact. |
-| `just malformed-symbol-relocation-check` | Temporarily inject an invalid `DT_SYMENT`, oversized SysV symbol count, and misaligned `DT_PLTRELSZ` into a staged executable on all three targets; package assembly must reject each form before rewriting the system volume, then restore each artifact. |
-| `just identity-note-check` | Temporarily corrupt the embedded identity record in a staged dynamic executable on all three targets; package assembly must reject it before rewriting the system volume, then restore the ELF. |
-| `just dynamic-report-check` | Build all three target graphs and verify detailed, per-wave and whole-image reports against current ET_REL objects, imports, providers, closure, PIE/provider size and private/shared footprint. |
+| `./build.sh [--arch A] [--part P]` | Build the system, or the parts you name (`kernel`, `user`, `libs`, `loader`, `packages`, `volume`, `sdk`, `all`). Anything after `--` goes to cargo. |
+| `./run.sh [--arch A] [--display D] [--debug]` | Build and boot in QEMU. Defaults to the host's architecture. |
+| `./test.sh [--arch A] [--tags T] [--fast] [--build-only]` | Run the in-kernel test suites. |
+| `./image.sh [--format F] [--size S] [--strip L]` | Build bootable images (`iso`, `img`, `qcow2`). |
+| `./check.sh [--gate N] [--conformance F]` | Run the build gates and image conformance suites; no arguments means all of them. |
+| `./clean.sh [--part P] [--dry-run]` | Remove build output (`cargo`, `boot`, `logs`). |
+| `./dev.sh <verb> [args]` | Drive the persistent development guest. |
+
+A Justfile remains in `src/` for the specialist recipes that are not part of this interface -
+formatting, the IDL generator, host-side test crates, benchmarks and the two loader builds whose
+bodies genuinely differ per architecture. `just --list` shows them.
+
+| Justfile recipe | Description |
+| --- | --- |
+| `./check.sh --gate undeclared-edge` | Temporarily change a staged executable's `DT_NEEDED` provider from declared `lsrt.lslib` to staged but undeclared `wire.lslib` on all three targets; package assembly must reject it before rewriting the system volume, then restore each artifact. |
+| `./check.sh --gate duplicate-edge` | Temporarily make two staged `DT_NEEDED` entries name the same provider on all three targets; package assembly must reject the duplicate before rewriting the system volume, then restore each artifact. |
+| `./check.sh --gate malformed-dynamic` | Temporarily inject a second `PT_DYNAMIC`, remove `DT_NULL`, and duplicate `DT_STRTAB` metadata in a staged executable on all three targets; package assembly must reject each form before rewriting the system volume, then restore each artifact. |
+| `./check.sh --gate malformed-symbol-relocation` | Temporarily inject an invalid `DT_SYMENT`, oversized SysV symbol count, and misaligned `DT_PLTRELSZ` into a staged executable on all three targets; package assembly must reject each form before rewriting the system volume, then restore each artifact. |
+| `./check.sh --gate identity-note` | Temporarily corrupt the embedded identity record in a staged dynamic executable on all three targets; package assembly must reject it before rewriting the system volume, then restore the ELF. |
+| `./check.sh --gate dynamic-report` | Build all three target graphs and verify detailed, per-wave and whole-image reports against current ET_REL objects, imports, providers, closure, PIE/provider size and private/shared footprint. |
 | `just dynamic-report-update` | Build all three target graphs and regenerate all checked dynamic executable reports. |
 | `just lab <cmd>` | Drive a live instance for debugging (boot, run guest shell commands, logs, packet capture - see [docs/DEBUG.md](./docs/DEBUG.md)). |
 | `just debug` | Boot in QEMU and wait for GDB on `:1234`. |
 | `just gdb` | Attach GDB to a waiting QEMU instance. |
-| `just user` | Build only the userspace programs (services, drivers, tools). |
-| `just sdk` | Build the SDK's Wasm component and stage it into the system volume. |
+| `./build.sh --part user` | Build the userspace programs (services, drivers, tools) for one architecture. |
+| `./build.sh --part sdk` | Build the SDK component. |
 | `just gen` | Regenerate the typed service bindings and docs from the LSIDL definitions (`idl/*.lsidl`). |
 | `just fmt` | Format all code (Rust via `rustfmt`, shell via `shfmt`). |
 | `just fmt-check` | Check formatting without writing changes (CI-friendly). |
-| `just clean` | Remove build artifacts. |
 
 > `just fmt` and `just fmt-check` additionally require [`shfmt`](https://github.com/mvdan/sh) on your `PATH`.
