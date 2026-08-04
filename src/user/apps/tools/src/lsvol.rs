@@ -193,7 +193,7 @@ unsafe fn volume_count(storage: u64, uri: &str) -> usize {
 	let mut client = VolumeClient::new(storage);
 	match client.list(uri) {
 		// A count is a claim about the whole directory; an abnormal drain cannot support one.
-		Some(consumer) => match unsafe { drain_stream(consumer, volume::list_read) } {
+		Some(consumer) => match unsafe { drain_stream_complete(consumer, volume::list_read) } {
 			Some(entries) => entries.len(),
 			None => 0,
 		},

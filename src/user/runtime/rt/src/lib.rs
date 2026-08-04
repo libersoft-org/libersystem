@@ -809,6 +809,47 @@ pub unsafe fn recv_vec_deadline(channel: u64, max: usize, deadline: u64) -> Boun
 // collected so far are DISCARDED rather than returned, because a caller handed a plain vector
 // cannot tell a short listing from a complete one and every caller here goes on to count, total
 // or print it as the whole answer.
+// Drain a stream that says when it is COMPLETE, rather than one that merely stops.
+//
+// An empty message is the terminal frame. Closing without one means the producer gave up part way,
+// which a plain close cannot express: "the channel closed" is what a finished stream looks like
+// too, so a consumer had no way to tell the whole of a directory from the first sixty-four entries
+// of it. Producers that do not send the marker should use `drain_stream`.
+pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
+	unsafe {
+		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+		loop {
+			match recv_vec_blocking(consumer) {
+				ReceivedVec::Message { bytes, mut handle } => {
+					if handle != 0 {
+						close(handle);
+					}
+					// The terminal frame: everything before it was the whole answer.
+					if bytes.is_empty() {
+						close(consumer);
+						return Some(items);
+					}
+					let Some(item) = read(&bytes, &mut handle) else {
+						close(consumer);
+						return None;
+					};
+					if items.try_reserve(1).is_err() {
+						close(consumer);
+						return None;
+					}
+					items.push(item);
+				}
+				// Closed WITHOUT the terminal frame: the producer stopped early, and what arrived is
+				// a prefix rather than an answer.
+				ReceivedVec::Closed | ReceivedVec::Failed => {
+					close(consumer);
+					return None;
+				}
+			}
+		}
+	}
+}
+
 pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
 	unsafe {
 		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();

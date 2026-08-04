@@ -245,7 +245,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 		if let Some(mode) = mode {
 			// A listing printed to the user IS a claim about the directory. Say it failed
 			// rather than print a prefix of it as though it were everything.
-			let Some(mut files) = drain_stream(consumer, volume::list_read) else {
+			let Some(mut files) = drain_stream_complete(consumer, volume::list_read) else {
 				print(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
 				return;
 			};
@@ -293,7 +293,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 			summary(dirs, plain, total, unit);
 			return;
 		}
-		let Some(mut files) = drain_stream(consumer, volume::list_read) else {
+		let Some(mut files) = drain_stream_complete(consumer, volume::list_read) else {
 			print(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
 			return;
 		};

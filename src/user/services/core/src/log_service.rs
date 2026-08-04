@@ -126,7 +126,7 @@ impl Disk {
 			// weaker than they look: reporting "no boots" makes the next boot REUSE a number and
 			// overwrite an existing journal. That hazard predates this change and is recorded
 			// separately; what matters here is that a SHORT listing no longer looks complete.
-			Some(consumer) => match unsafe { drain_stream(consumer, volume::list_read) } {
+			Some(consumer) => match unsafe { drain_stream_complete(consumer, volume::list_read) } {
 				Some(entries) => entries.iter().filter_map(|e| e.name.strip_prefix("boot-").and_then(|n| n.parse::<u32>().ok())).collect(),
 				None => return 0,
 			},

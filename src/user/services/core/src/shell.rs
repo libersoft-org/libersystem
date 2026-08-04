@@ -1618,7 +1618,7 @@ fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 	match client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
 		// Name completion: offering fewer names claims nothing, so an abnormal drain
 		// degrades to none rather than failing the shell.
-		Some(consumer) => unsafe { drain_stream(consumer, volume::list_read) }.unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
+		Some(consumer) => unsafe { drain_stream_complete(consumer, volume::list_read) }.unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
 		None => Vec::new(),
 	}
 }
@@ -1653,7 +1653,7 @@ fn completion_dir_entries(cwd: &str, token: &[u8], storage: u64, media: u64, iso
 	let mut client = volume::Client::new(ChannelTransport { chan });
 	let mut names: Vec<Vec<u8>> = Vec::new();
 	if let Some(consumer) = client.list(&target) {
-		for f in unsafe { drain_stream(consumer, volume::list_read) }.unwrap_or_default() {
+		for f in unsafe { drain_stream_complete(consumer, volume::list_read) }.unwrap_or_default() {
 			let mut name: Vec<u8> = f.name.into_bytes();
 			if f.r#type == proto::system::FileType::Dir {
 				name.push(b'/');
@@ -1699,7 +1699,7 @@ unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media
 		match client.list(&target) {
 			Some(consumer) => {
 				// a valid directory is enough - drain the entry stream unused.
-				let _ = drain_stream(consumer, volume::list_read);
+				let _ = drain_stream_complete(consumer, volume::list_read);
 				cwd.clear();
 				cwd.push_str(&target);
 				// Persist the new cwd in the session so it outlives this shell; the local

@@ -740,7 +740,7 @@ unsafe fn command_vocab(console: &mut Console) -> Vec<Vec<u8>> {
 				let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
 				if let Some(consumer) = client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
 					// Completion again: fewer names, no false claim.
-					names = drain_stream(consumer, proto::system::volume::list_read).unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect();
+					names = drain_stream_complete(consumer, proto::system::volume::list_read).unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect();
 				}
 				close(storage);
 			}
@@ -782,7 +782,7 @@ unsafe fn path_vocab(console: &mut Console, fg: usize, tok_start: usize) -> Vec<
 		if let Some(storage) = service_connect(console.facs.storage) {
 			let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
 			if let Some(consumer) = client.list(&target) {
-				for f in drain_stream(consumer, proto::system::volume::list_read).unwrap_or_default() {
+				for f in drain_stream_complete(consumer, proto::system::volume::list_read).unwrap_or_default() {
 					let mut name: Vec<u8> = f.name.into_bytes();
 					if f.r#type == proto::system::FileType::Dir {
 						name.push(b'/');

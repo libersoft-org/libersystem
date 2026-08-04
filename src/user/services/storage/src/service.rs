@@ -705,7 +705,21 @@ struct PendingList {
 // while everyone else keeps being served.
 fn pump_list(p: &mut PendingList) -> bool {
 	let mut frame: [u8; 1024] = [0u8; 1024];
-	while p.seq < p.items.len() {
+	// One past the last entry is the TERMINAL frame: an empty message meaning "that was all".
+	//
+	// Without it a listing given up on looks exactly like one that finished - the producer closes
+	// either way, and a closed channel is what "done" has always meant - so a client could take the
+	// first 64 entries of a large directory for the whole of it. That is "a short listing looks
+	// complete" for the third time, from a third cause, and it cannot be fixed in the producer
+	// alone: closing carries no information, so completion has to be said rather than implied.
+	while p.seq <= p.items.len() {
+		if p.seq == p.items.len() {
+			if unsafe { try_send(p.producer, &[], 0) } {
+				p.seq += 1;
+				return true;
+			}
+			return unsafe { clock() } >= p.expires;
+		}
 		let mut frame_handle: u64 = 0;
 		let Some(n) = volume::list_frame(p.seq as u32, &p.items[p.seq], &mut frame, &mut frame_handle) else {
 			// An entry that will not encode is skipped, as it always was; the alternative is to
