@@ -299,8 +299,12 @@ impl LiberMemFs {
 				if self.root.count() >= MAX_ENTRIES {
 					return Ok(0);
 				}
-				let name = parts.last().map_or(0, |name| name.len());
-				Ok(free.saturating_sub(name).min(MAX_FILE_BYTES))
+				// The WHOLE path, not the final name. `stream_begin` charges `path.len()` against
+				// the capacity and keeps the whole path in the pending state, so subtracting only
+				// the last segment announced a limit a nested destination could not actually take -
+				// a stream accepted under its declared ceiling and refused with `NoSpace` before
+				// reaching it. The two numbers have to be the same number.
+				Ok(free.saturating_sub(path.len()).min(MAX_FILE_BYTES))
 			}
 		}
 	}
@@ -683,10 +687,32 @@ impl LiberMemFs {
 		if (self.footprint() as usize).saturating_add(path.len()) > self.capacity {
 			return Err(FsError::NoSpace);
 		}
+		// Release the reservation BEFORE allocating, the way the ordinary write does.
+		//
+		// A reserved volume holds its whole free capacity in the reservation, so allocating the
+		// path beside it competes with memory the volume itself is sitting on: a stream could be
+		// refused for want of a few bytes the volume was holding for exactly this. The ordinary
+		// path has released first since the reservation existed; the stream path did not.
+		if self.policy == Policy::Reserved {
+			self.release_reservation();
+		}
 		let mut owned: Vec<u8> = Vec::new();
-		owned.try_reserve_exact(path.len()).map_err(|_| FsError::NoSpace)?;
+		if owned.try_reserve_exact(path.len()).is_err() {
+			// Put the volume back the way it was before reporting the refusal.
+			self.resync_reservation();
+			return Err(FsError::NoSpace);
+		}
 		owned.extend_from_slice(path);
 		self.pending = Some(Pending { path: owned, data: Vec::new() });
+		// The allocator may hand back more than was asked for, and `footprint` counts what it
+		// actually gave. A volume must not end up over its own capacity because it was given a
+		// generous answer, so the overshoot is undone here rather than merely noticed later by
+		// `reservation_intact`.
+		if (self.footprint() as usize) > self.capacity {
+			self.stream_abort();
+			self.resync_reservation();
+			return Err(FsError::NoSpace);
+		}
 		self.resync_reservation();
 		Ok(())
 	}
@@ -775,6 +801,13 @@ impl LiberMemFs {
 			return Err(FsError::NoSpace);
 		}
 		pending.data.resize(total, 0);
+		// `try_reserve_exact` promises at least what was asked for and may give more, and the
+		// footprint counts what it actually gave. Undo an overshoot rather than leave the volume
+		// over its own capacity and find out later from an invariant check.
+		if (self.footprint() as usize) > self.capacity {
+			self.stream_abort();
+			return Err(FsError::NoSpace);
+		}
 		let pending = self.pending.as_mut().ok_or(FsError::Invalid)?;
 		Ok(&mut pending.data[filled..])
 	}
@@ -798,10 +831,14 @@ impl LiberMemFs {
 		// this local - memory the volume had just stopped counting and was about to hand to the
 		// file - so the regrow competed with itself. `write_file_owned` resyncs after the adoption,
 		// which is the only moment the volume's footprint is what it will be.
-		let stored = self.write_file_owned(&pending.path, pending.data);
-		drop(pending.path);
-		self.resync_reservation();
-		stored
+		// ONE resync, and it is `write_file_owned`'s own.
+		//
+		// This used to resync again after dropping the path, which is where "resync once at the
+		// end" stopped being true. The second one could not be the only one either: the path has
+		// to stay alive while the store reads it, so whichever resync runs last still runs with it
+		// held. What matters is that it is now a path - a few hundred bytes at most - rather than
+		// the whole file's buffer, which is what the adopt-before-resync change removed.
+		self.write_file_owned(&pending.path, pending.data)
 	}
 
 	// Give up. The room goes back to the volume, and the destination is untouched - a stream that

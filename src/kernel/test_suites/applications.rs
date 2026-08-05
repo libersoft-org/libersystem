@@ -410,6 +410,17 @@ fn the_memory_volumes_bound_and_answer_streams() {
 	assert!(silent.stream_idle_until_deadline(b"vol://tmp/quiet", 0x7701, 8_000), "a stream that says nothing is dropped once its deadline passes");
 	assert!(silent.write(b"vol://tmp/after", b"x", 0x7702), "and the service serves the next client");
 
+	// A client that vanishes mid-stream takes its pending write with it.
+	//
+	// The pending write remembered the channel to answer on as a bare handle, and nothing tied the
+	// two together: removing the client left the write collecting, holding the one pending slot and
+	// the volume's memory, ready to commit a file for a caller that no longer existed and to answer
+	// through a handle that had been closed. Today that send only fails; the day handle numbers are
+	// reused it would answer the wrong client. The proof is that the NEXT stream gets the slot.
+	let mut orphan = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(orphan.stream_orphaned_by_client(b"vol://tmp/orphan", 0x7b01), "a pending write is given up with the client that asked for it");
+	assert_eq!(orphan.open(b"vol://tmp/orphan", 0x7b03), None, "and nothing was committed for a caller that had gone");
+
 	// A stream handle the service cannot wait on is refused before it reaches the wait set.
 	//
 	// READ but no WAIT: every wait on it fails immediately, and a loop that retries on error spins

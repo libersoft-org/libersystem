@@ -936,15 +936,25 @@ pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &mut u64) -> Option<T>>(cons
 		loop {
 			match recv_vec_blocking(consumer) {
 				ReceivedVec::Message { bytes, mut handle } => {
-					if handle != 0 {
-						close(handle);
-					}
 					// The terminal frame: everything before it was the whole answer.
 					if bytes.is_empty() {
+						if handle != 0 {
+							close(handle);
+						}
 						close(consumer);
 						return Some(items);
 					}
-					let Some(item) = read(&bytes, &mut handle) else {
+					// DECODE first, then close what the decoder did not claim - the order
+					// `drain_stream` already uses. Closing first and then handing the same
+					// still-non-zero number to `read` gave the decoder a handle that was already
+					// gone. Harmless for `FileInfo`, which carries none, and wrong for the generic
+					// helper this is.
+					let decoded = read(&bytes, &mut handle);
+					// Whatever the decoder left behind is ours to close, on both paths.
+					if handle != 0 {
+						close(handle);
+					}
+					let Some(item) = decoded else {
 						close(consumer);
 						return None;
 					};

@@ -443,8 +443,15 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 		if waiting == ERR_PEER_CLOSED {
 			return StreamStep::Done(Ok(()));
 		}
-		if waiting < 0 {
+		// Only "nothing yet" means try again. Any other failure ends the stream: retrying it says
+		// the sender is merely slow, which is a claim the error does not support. The handle
+		// validation in `begin_stream` removes most ways to reach this, which is a reason it has
+		// not bitten rather than a reason to fold every error into patience.
+		if waiting == ERR_WOULD_BLOCK {
 			return StreamStep::More;
+		}
+		if waiting < 0 {
+			return StreamStep::Done(Err(Error::Invalid));
 		}
 		let want = waiting as usize;
 		if want == 0 {
@@ -528,6 +535,48 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 }
 
 // Store what arrived (or give it up), close the stream, and answer the client that asked.
+// Give up a pending write whose client is gone.
+//
+// `PendingWrite` remembers the channel to answer on as a bare handle. When that client is removed -
+// on a quit message, on a stalled reply, or on a closed peer - the write went on regardless: it
+// kept the single pending slot and the volume's memory, committed a file for a caller that no
+// longer existed, and finally answered through a handle that had been closed. Today that send only
+// fails; the day handle numbers are reused it delivers one client's answer to another.
+//
+// Nothing is sent. There is nobody to tell, and the number that named them may already mean
+// something else.
+// Answer a client, bounded. Returns whether the client STALLED and should be dropped.
+//
+// Every reply goes through here. The typed dispatch was given a deadline and called the last place
+// a client could stop the service, which was not true: the heartbeat, both `CONNECT` answers, the
+// second-listing refusal and the immediate stream refusal all answered through an unbounded send.
+// A client that sends heartbeats and never reads them fills its queue, and the next `PONG` holds
+// the whole service with no deadline at all.
+//
+// Handles it could not hand over are closed here, so a refused answer never leaks the capability
+// it was carrying.
+fn reply_to(chan: u64, bytes: &[u8], handles: &[u64]) -> bool {
+	let sent = unsafe { send_caps_deadline(chan, bytes, handles, clock().saturating_add(REPLY_TICKS)) };
+	if matches!(sent, SendOutcome::Delivered) {
+		return false;
+	}
+	for &leftover in handles {
+		unsafe { close(leftover) };
+	}
+	matches!(sent, SendOutcome::Stalled)
+}
+
+fn abandon_pending(vol: &mut Volume, pending: &mut Option<PendingWrite>, chan: u64) {
+	if pending.as_ref().is_none_or(|p| p.client != chan) {
+		return;
+	}
+	let p = pending.take().expect("checked");
+	if p.incremental {
+		vol.fs.stream_abort();
+	}
+	unsafe { close(p.stream) };
+}
+
 fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, reply: &mut [u8]) {
 	let result = match outcome {
 		Ok(()) => {
@@ -671,6 +720,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				if index == 0 {
 					exit();
 				}
+				abandon_pending(vol, &mut pending, chan);
 				unsafe { close(chan) };
 				clients.swap_remove(index);
 			}
@@ -681,15 +731,14 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				// alternative is holding the whole service for it.
 				let mut stalled = false;
 				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-				if op == volume::OP_WRITE_STREAM {}
 				if op == HEARTBEAT_OP {
-					unsafe { send_blocking(chan, b"PONG", 0) };
+					stalled = reply_to(chan, b"PONG", &[]);
 				} else if op == CONNECT_OP {
 					if let Some((server, client)) = unsafe { channel() } {
 						clients.push(Client { chan: server, scope });
-						unsafe { send_blocking(chan, &[], client) };
+						stalled = reply_to(chan, &[], &[client]);
 					} else {
-						unsafe { send_blocking(chan, &[], 0) };
+						stalled = reply_to(chan, &[], &[]);
 					}
 				} else {
 					// Stamp mutations before authorization and dispatch. The clock is a no-op on
@@ -699,7 +748,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						// A second listing while one is in flight is refused, like a second stream.
 						if listing.is_some() {
 							let corr = if len >= 6 { u32::from_le_bytes([request[2], request[3], request[4], request[5]]) } else { 0 };
-							unsafe { send_blocking(chan, &corr.to_le_bytes(), 0) };
+							stalled = reply_to(chan, &corr.to_le_bytes(), &[]);
 						} else {
 							listing = stream_list(vol, chan, &scope, &request[..len], &mut handle);
 						}
@@ -711,7 +760,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 							Ok(entry) => pending = Some(entry),
 							Err((corr, e)) => {
 								if let Some(reply_len) = write_stream_reply(corr, Err(e), &mut reply) {
-									unsafe { send_blocking(chan, &reply[..reply_len], 0) };
+									stalled = reply_to(chan, &reply[..reply_len], &[]);
 								}
 							}
 						}
@@ -721,13 +770,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						if let Some(reply_len) = reply_len {
 							// Bounded, and a client that will not take its answer is dropped below
 							// rather than waited for.
-							let sent = unsafe { send_caps_deadline(chan, &reply[..reply_len], reply_handle.as_slice(), clock().saturating_add(REPLY_TICKS)) };
-							if !matches!(sent, SendOutcome::Delivered) {
-								for &leftover in reply_handle.as_slice() {
-									unsafe { close(leftover) };
-								}
-								stalled = matches!(sent, SendOutcome::Stalled);
-							}
+							stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice());
 						} else {
 							for &leftover in reply_handle.as_slice() {
 								unsafe { close(leftover) };
@@ -739,6 +782,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					// Never the root client: dropping that ends the service, and a stalled root is
 					// the boot chain's problem rather than something to resolve by exiting.
 					if index != 0 {
+						abandon_pending(vol, &mut pending, chan);
 						unsafe { close(chan) };
 						clients.swap_remove(index);
 					}
@@ -751,6 +795,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				if index == 0 {
 					exit();
 				}
+				abandon_pending(vol, &mut pending, chan);
 				unsafe { close(chan) };
 				clients.swap_remove(index);
 			}
@@ -902,11 +947,22 @@ struct FatBacking {
 impl FatBacking {
 	// Run `op` on the mounted filesystem (mounting on first use), dropping the mount
 	// on an I/O failure - the media was unplugged - so the next request remounts.
-	fn run<R>(&mut self, op: impl FnOnce(&mut FatFs<FatBlockDevice>) -> Result<R, FsError>) -> Result<R, Error> {
+	// The mounted filesystem, mounting on first use.
+	//
+	// Extracted because `write_plan` did not do it and every other operation did. A volume whose
+	// FIRST request was a write answered `NotFound` from an unmounted backing, and started working
+	// only once a `list`, `read` or `status` had mounted it as a side effect - so `write
+	// vol://media/file` failed after boot and succeeded after anything else. Both paths reach the
+	// filesystem the same way now, and a third cannot forget.
+	fn ensure_mounted(&mut self) -> Result<&mut FatFs<FatBlockDevice>, Error> {
 		if self.fs.is_none() {
 			self.fs = FatFs::mount(FatBlockDevice { chan: self.chan });
 		}
-		let fs: &mut FatFs<FatBlockDevice> = self.fs.as_mut().ok_or(Error::NotFound)?;
+		self.fs.as_mut().ok_or(Error::NotFound)
+	}
+
+	fn run<R>(&mut self, op: impl FnOnce(&mut FatFs<FatBlockDevice>) -> Result<R, FsError>) -> Result<R, Error> {
+		let fs: &mut FatFs<FatBlockDevice> = self.ensure_mounted()?;
 		// stamp the wall clock so entries we write carry real timestamps (the same
 		// RTC source the LiberFS volume is stamped with).
 		fs.set_clock(unsafe { clock_rtc() });
@@ -1102,6 +1158,12 @@ impl volume::Service for Volume {
 	// entry (the serve loop frames the vector onto a sub-channel), so a big directory
 	// never has to fit one reply; a bad path is an empty stream.
 	fn list(&mut self, path: String) -> Vec<FileInfo> {
+		// An empty listing for a path that could not be read is the semantics this milestone spent
+		// a round removing everywhere else. It survives here because the generated trait gives this
+		// method no way to fail - `list` returns `stream<file-info>` in the schema, with no error
+		// arm - and because the serve loop answers OP_LIST itself and never calls this. Dead today;
+		// wrong the day a generated dispatch does call it, and not fixable from this side. It goes
+		// with the schema change that gives the listing protocol its terminal frame.
 		self.list_entries(&path).unwrap_or_default()
 	}
 
@@ -1300,14 +1362,27 @@ impl FileSystem for DiskFs {
 			return WritePlan::Refused(Error::Denied);
 		}
 		// A path that names an existing DIRECTORY cannot be written as a file.
-		if self.fs.read_dir(name).is_ok() {
-			return WritePlan::Refused(Error::Invalid);
+		//
+		// Only a successful read decides that. Treating any failure as "not a directory" let an
+		// I/O error read as permission to proceed - the preflight would accept a write to a
+		// filesystem it had just failed to inspect.
+		match self.fs.read_dir(name) {
+			Ok(_) => return WritePlan::Refused(Error::Invalid),
+			Err(FsError::NotFound) | Err(FsError::NotDir) => {}
+			Err(e) => return WritePlan::Refused(map_fs_err(e)),
 		}
 		// The parent has to exist. An empty parent is the volume root, which always does.
+		//
+		// The concrete reason is kept. Asking only whether the call failed merged a missing parent
+		// with a parent that is a FILE, with an I/O error and with a corrupt filesystem, and
+		// answered `NotFound` for all four - so `file/child` blamed the wrong thing and an
+		// unreadable medium looked like an absent directory.
 		if let Some(cut) = name.iter().rposition(|&b| b == b'/') {
 			let parent = &name[..cut];
-			if !parent.is_empty() && self.fs.read_dir(parent).is_err() {
-				return WritePlan::Refused(Error::NotFound);
+			if !parent.is_empty()
+				&& let Err(e) = self.fs.read_dir(parent)
+			{
+				return WritePlan::Refused(map_fs_err(e));
 			}
 		}
 		WritePlan::Allowed { max_len: None }
@@ -1379,14 +1454,26 @@ impl FileSystem for FatBacking {
 	// The destination is checked for the same reason as on the disk backend - a stream to a path
 	// that cannot exist should cost a lookup, not a transfer.
 	fn write_plan(&mut self, name: &[u8]) -> WritePlan {
-		let Some(fs) = self.fs.as_mut() else { return WritePlan::Refused(Error::NotFound) };
-		if fs.list_dir(name).is_ok() {
-			return WritePlan::Refused(Error::Invalid);
+		// Mount if this is the volume's first request. Reading `self.fs` directly refused every
+		// write that arrived before some other operation had mounted the medium.
+		let fs: &mut FatFs<FatBlockDevice> = match self.ensure_mounted() {
+			Ok(fs) => fs,
+			Err(e) => return WritePlan::Refused(e),
+		};
+		// As on LiberFS: only a successful read says "this is a directory"; a failure to look is
+		// not permission to write.
+		match fs.list_dir(name) {
+			Ok(_) => return WritePlan::Refused(Error::Invalid),
+			Err(FsError::NotFound) | Err(FsError::NotDir) => {}
+			Err(e) => return WritePlan::Refused(map_fs_err(e)),
 		}
 		if let Some(cut) = name.iter().rposition(|&b| b == b'/') {
 			let parent = &name[..cut];
-			if !parent.is_empty() && fs.list_dir(parent).is_err() {
-				return WritePlan::Refused(Error::NotFound);
+			// The concrete reason, for the same reason as on LiberFS above.
+			if !parent.is_empty()
+				&& let Err(e) = fs.list_dir(parent)
+			{
+				return WritePlan::Refused(map_fs_err(e));
 			}
 		}
 		WritePlan::Allowed { max_len: None }

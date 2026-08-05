@@ -2847,6 +2847,50 @@ impl StorageHarness {
 	//
 	// The bound is a deadline, so without a way to move time this could only be waited out - about
 	// a million scheduler passes. Returns true if the service gave the stream up.
+	// Open a write stream from a SUBCLIENT, send one chunk, then drop that client entirely -
+	// request channel and all - while the stream is still pending.
+	//
+	// Returns whether the service went on serving. What is being asked is not only that it
+	// survives: the pending write held the one pending slot and the volume's memory, and its reply
+	// was addressed to a handle that no longer named anything.
+	fn stream_orphaned_by_client(&mut self, path: &[u8], corr: u32) -> bool {
+		use object::channel::{Channel, Message};
+		use object::rights::Rights;
+		let sub = self.connect();
+		let (service_side, our_side) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&16u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&sub, &request, service_side, Rights::ALL).expect("orphan write-stream request");
+		for _ in 0..64 {
+			self.pump();
+		}
+		let _ = our_side.send(Message::new(b"half a file".to_vec(), alloc::vec::Vec::new(), 0));
+		self.pump();
+		// ONLY the request channel goes. The stream stays open on purpose: closing it too would
+		// end the stream cleanly, the file would be committed for good reason, and the test would
+		// be measuring an ordinary completion instead of an orphan.
+		drop(sub);
+		for _ in 0..256 {
+			self.pump();
+		}
+		drop(our_side);
+		for _ in 0..64 {
+			self.pump();
+		}
+		// Two separate facts, reported separately so a failure says which one broke: the service
+		// still answers at all, and the pending SLOT is free for the next stream - which it would
+		// not be if the orphan were still holding it.
+		if !self.write(b"vol://tmp/after-orphan", b"x", corr.wrapping_add(1)) {
+			return false;
+		}
+		let sender = self.stream_pending(b"vol://tmp/next", corr.wrapping_add(2));
+		self.stream_finish(sender, &[b"kept"], corr.wrapping_add(2))
+	}
+
 	fn stream_idle_until_deadline(&mut self, path: &[u8], corr: u32, skip: u64) -> bool {
 		use object::channel::Channel;
 		use object::rights::Rights;
