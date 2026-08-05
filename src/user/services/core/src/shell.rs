@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
-use proto::system::{Component, EnvVar, JobEntry, JobInfo, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{Component, EnvVar, JobEntry, JobInfo, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
 use services::shell_language::{Pipeline, parse_and_expand, parse_assignment, parse_pipeline, trim};
@@ -858,16 +858,16 @@ unsafe fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8]) 
 // Route a line to a net tool from `NET_TOOLS`, returning whether it matched one. Each is
 // spawned over a fresh NetworkService client, foreground or (with a trailing `&`, the
 // caller's `bg`) background; the arg-taking forms pass the rest of the line through.
-unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, bg: bool) -> bool {
+unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, cwd: &[u8], bg: bool) -> bool {
 	unsafe {
 		for &(word, tool, takes_args) in NET_TOOLS {
 			if takes_args {
 				if let Some(rest) = strip_word(line, word) {
-					spawn_net_tool(jobs, netsvc, procsvc, tool, trim(rest), bg);
+					spawn_net_tool(jobs, netsvc, procsvc, tool, trim(rest), cwd, bg);
 					return true;
 				}
 			} else if line == word {
-				spawn_net_tool(jobs, netsvc, procsvc, tool, b"", bg);
+				spawn_net_tool(jobs, netsvc, procsvc, tool, b"", cwd, bg);
 				return true;
 			}
 		}
@@ -1071,25 +1071,25 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		}
 		// the network views: a table of net tools spawned over a fresh NetworkService client
 		// (`httpd` is separate - it always backgrounds).
-		if dispatch_net(line, jobs, netsvc, procsvc, bg) {
+		if dispatch_net(line, jobs, netsvc, procsvc, cwd.as_bytes(), bg) {
 			return false;
 		}
 		if line == b"httpd" {
-			spawn_net_tool(jobs, netsvc, procsvc, b"httpd", b"", true);
+			spawn_net_tool(jobs, netsvc, procsvc, b"httpd", b"", cwd.as_bytes(), true);
 			return false;
 		}
 		if line == b"echo" {
-			exec(jobs, procsvc, b"echo", b"", 0, bg);
+			exec(jobs, procsvc, b"echo", b"", cwd.as_bytes(), 0, bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
-			exec(jobs, procsvc, b"echo", trim(rest), 0, bg);
+			exec(jobs, procsvc, b"echo", trim(rest), cwd.as_bytes(), 0, bg);
 			return false;
 		}
 		if line == b"readln" {
 			// readln reads its stdin and echoes each line - the interactive counterpart to
 			// echo, proving a foreground tool reads keyboard input, not just prints.
-			exec(jobs, procsvc, b"readln", b"", 0, bg);
+			exec(jobs, procsvc, b"readln", b"", cwd.as_bytes(), 0, bg);
 			return false;
 		}
 		if line == b"cd" {
@@ -1149,11 +1149,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			return false;
 		}
 		if line == b"script" {
-			run_script(jobs, procsvc, b"");
+			run_script(jobs, procsvc, b"", cwd.as_bytes());
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"script ") {
-			run_script(jobs, procsvc, trim(rest));
+			run_script(jobs, procsvc, trim(rest), cwd.as_bytes());
 			return false;
 		}
 		// everything else is a governed tool: match it against the tool table.
@@ -1177,7 +1177,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 // via SYS_DEBUG_WRITE); the shell waits on the Process handle, which the kernel readies
 // once the process terminates - so no completion channel or zombie-lag handling is needed.
 // This is the foreground exec primitive the net tools build on.
-unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64, bg: bool) {
+unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], cap: u64, bg: bool) {
 	unsafe {
 		let name_str: &str = match core::str::from_utf8(name) {
 			Ok(s) => s,
@@ -1215,7 +1215,22 @@ unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cap: u64
 		// (a full-duplex dup of our console channel, the controlling terminal) - then its
 		// arguments + an optional inherited capability (e.g. a NetworkService client).
 		send_stdout(parent, !bg);
-		send_blocking(parent, args, cap);
+		// The launch context - the arguments and the working directory - in one versioned record,
+		// with the optional inherited capability riding the same message so the child receives
+		// both or neither. The arguments used to be the message; the working directory reached a
+		// child only through PermissionManager, so a shell-spawned tool had none.
+		let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: Vec::new() };
+		match context.encode_vec() {
+			Some(bytes) if bytes.len() <= rt::LAUNCH_CONTEXT_MAX => {
+				send_blocking(parent, &bytes, cap);
+			}
+			_ => {
+				print(name);
+				print(b": could not encode the launch context\n");
+				close(parent);
+				return;
+			}
+		}
 		// The bootstrap is delivered; the child drains it from its own end, so the shell no
 		// longer needs the parent end. Drop it - the shell now tracks the job solely by its
 		// waitable Process handle (ready once the child terminates), not a completion channel.
@@ -1270,7 +1285,7 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 // the tool alongside its arguments. Each tool talks to NetworkService over its own
 // channel rather than sharing the shell's (a shared channel would race), and the
 // shell keeps its own `netsvc`.
-unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8], args: &[u8], bg: bool) {
+unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], bg: bool) {
 	unsafe {
 		if netsvc == 0 {
 			print(name);
@@ -1286,7 +1301,7 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8]
 				return;
 			}
 		};
-		exec(jobs, procsvc, name, args, tool_netsvc, bg);
+		exec(jobs, procsvc, name, args, cwd, tool_netsvc, bg);
 	}
 }
 
@@ -1476,7 +1491,7 @@ unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args:
 // pty's shell with `cmd` and prints the captured session. This is the foreground side of
 // the PTY abstraction - a program (script) hosting a terminal it is not the hardware
 // console for (the same path a future ssh drives).
-unsafe fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8]) {
+unsafe fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8], cwd: &[u8]) {
 	unsafe {
 		// `PTY_OPEN` + the program to host (a shell); the console replies `PTY` + the master.
 		let mut req: [u8; 13] = [0u8; 13];
@@ -1491,7 +1506,7 @@ unsafe fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8]) {
 				return;
 			}
 		};
-		exec(jobs, procsvc, b"script", cmd, master, false);
+		exec(jobs, procsvc, b"script", cmd, cwd, master, false);
 	}
 }
 

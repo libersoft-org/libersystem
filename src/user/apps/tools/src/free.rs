@@ -13,6 +13,7 @@
 extern crate alloc;
 
 use alloc::string::String;
+use proto::system::LaunchContext;
 use rt::*;
 
 // Bytes per physical frame.
@@ -27,10 +28,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the sub-form ("" for bytes, "-h" for
 		//    human-readable units).
-		let human: bool = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => &buf[..len] == b"-h",
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let argument: &[u8] = context.arguments.as_bytes();
+		let human: bool = argument == b"-h";
 		// 3. read the totals and render one row per pool.
 		let mut stats = MemoryStats::default();
 		if memory_stats(&mut stats) <= 0 {

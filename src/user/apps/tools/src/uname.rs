@@ -31,7 +31,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string (uname takes none, but the launch protocol
 		//    sends one).
-		let _ = recv_blocking(bootstrap, &mut buf);
+		let _ = recv_launch_bytes(bootstrap);
 		// 3. print the identity: "<name> <version> <arch>".
 		print(env!("PRODUCT_NAME").as_bytes());
 		print(b" ");

@@ -34,7 +34,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string (dmesg takes none, but the launch protocol
 		//    sends one).
-		let _ = recv_blocking(bootstrap, &mut buf);
+		let _ = recv_launch_bytes(bootstrap);
 		// 3. read the kernel boot log and print it, breaking at line boundaries.
 		let mut log: Vec<u8> = alloc::vec![0u8; LOG_CAPACITY];
 		let n: i64 = console_readlog(&mut log);

@@ -15,6 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::system::LaunchContext;
 use rt::*;
 use volume_client::VolumeClient;
 
@@ -26,10 +27,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the snapshot sub-form.
-		let args: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let args: Vec<u8> = context.arguments.clone().into_bytes();
 		// 3. receive the one capability the manifest grants: a StorageService client.
 		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or_else(|| exit());
 		snap(storage, &args);

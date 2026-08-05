@@ -20,6 +20,118 @@ pub type Ticks = u64;
 /// Since package version 1.
 pub type Name = String;
 
+/// One environment variable: a name and its value. `PATH` is one such variable, so a search
+/// path and user-defined variables share the same table.
+///
+/// It lives in `base` rather than in `session`, where it was first written, because it is half
+/// of the launch context below - and the launch context is what EVERY program is born with, not
+/// something only clients of the session interface need. A type that universal belongs in the
+/// package everything already imports; the alternative was making the whole session interface a
+/// dependency of the runtime, and through it of every program, to let a tool read its arguments.
+/// Since package version 1.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvVar {
+	pub name: String,
+	pub value: String,
+}
+
+impl EnvVar {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_inner())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<EnvVar> {
+		EnvVar::read(&mut Reader::new(bytes))
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.name.as_bytes())?;
+		w.bytes_lp(self.value.as_bytes())?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<EnvVar> {
+		let name = r.string_lp()?;
+		let value = r.string_lp()?;
+		Some(EnvVar { name, value })
+	}
+}
+
+/// Everything a program is born knowing: the argument string it was launched with, the
+/// directory it resolves relative paths against, and a snapshot of the session environment as
+/// it stood at that moment.
+///
+/// One versioned record rather than a run of bare messages. The launcher used to send the
+/// arguments, then the capability grants, then the working directory - and the working
+/// directory had to go LAST, because a tool reads its grants with a tagged receive and a bare
+/// message arriving early is taken as whatever the tool reads next. That ordering was a rule in
+/// a comment, enforced nowhere, across a launcher and fifty-two programs.
+///
+/// A SNAPSHOT, deliberately, not a view: the child gets the values, never a capability to the
+/// session that holds them, so it can read what it inherited and cannot change what its parent
+/// or its session will see. `PATH` reaches `which` this way without anyone being handed the
+/// means to rewrite it.
+///
+/// It carries no `handle<...>` field and must not gain one. Capabilities are granted under their
+/// own tags, where the policy that decided them is visible; data a program merely inherits
+/// belongs here. Schema validation computes handle cardinality per record, so that separation is
+/// checked rather than remembered.
+///
+/// Secrets do not belong in the environment. This table is inherited by every program the
+/// session launches, which is the opposite of what a secret needs.
+/// Since package version 1.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LaunchContext {
+	pub arguments: String,
+	pub cwd: String,
+	pub environment: Vec<EnvVar>,
+}
+
+impl LaunchContext {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_inner())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<LaunchContext> {
+		LaunchContext::read(&mut Reader::new(bytes))
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.arguments.as_bytes())?;
+		w.bytes_lp(self.cwd.as_bytes())?;
+		if self.environment.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.environment.len() as u16)?;
+		for v0 in self.environment.iter() {
+			v0.write(w)?;
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<LaunchContext> {
+		let arguments = r.string_lp()?;
+		let cwd = r.string_lp()?;
+		let environment = {
+			let v1 = r.u16()? as usize;
+			let mut v2 = Vec::new();
+			for _ in 0..v1 {
+				v2.push(EnvVar::read(r)?);
+			}
+			v2
+		};
+		Some(LaunchContext { arguments, cwd, environment })
+	}
+}
+
 /// A common error enum rendered identically in binary, JSON, and CLI.
 /// Each case names a kernel ERR_* condition; the wire value is the enum's
 /// own 0-based ordinal, not the negative ERR_* number.
@@ -63,6 +175,121 @@ impl Error {
 			3 => Some(Error::Again),
 			4 => Some(Error::Closed),
 			_ => None,
+		}
+	}
+}
+
+impl EnvVar {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"value\":");
+		crate::codec::json_escape(&self.value, out);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("value=");
+		out.push_str(&self.value);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "value");
+		crate::codec::cbor::text(out, &self.value);
+	}
+}
+
+impl LaunchContext {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"arguments\":");
+		crate::codec::json_escape(&self.arguments, out);
+		out.push(',');
+		out.push_str("\"cwd\":");
+		crate::codec::json_escape(&self.cwd, out);
+		out.push(',');
+		out.push_str("\"environment\":");
+		out.push('[');
+		let mut v4 = true;
+		for v3 in self.environment.iter() {
+			if !v4 {
+				out.push(',');
+			}
+			v4 = false;
+			v3.to_json_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("arguments=");
+		out.push_str(&self.arguments);
+		out.push_str(", ");
+		out.push_str("cwd=");
+		out.push_str(&self.cwd);
+		out.push_str(", ");
+		out.push_str("environment=");
+		out.push('[');
+		let mut v6 = true;
+		for v5 in self.environment.iter() {
+			if !v6 {
+				out.push_str(", ");
+			}
+			v6 = false;
+			v5.to_text_into(out);
+		}
+		out.push(']');
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "arguments");
+		crate::codec::cbor::text(out, &self.arguments);
+		crate::codec::cbor::text(out, "cwd");
+		crate::codec::cbor::text(out, &self.cwd);
+		crate::codec::cbor::text(out, "environment");
+		crate::codec::cbor::array(out, self.environment.len());
+		for v7 in self.environment.iter() {
+			v7.to_cbor_into(out);
 		}
 	}
 }

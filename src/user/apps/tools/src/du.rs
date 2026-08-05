@@ -27,7 +27,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::codec::JsonMode;
-use proto::system::{FileInfo, FileType, volume};
+use proto::system::{FileInfo, FileType, LaunchContext, volume};
 use rt::*;
 use storage_proto::path;
 use volume_client::VolumeClient;
@@ -55,10 +55,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. adopt the forwarded stdout console (the first bootstrap message).
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - flags and an optional path, in any order.
-		let arg_raw: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let arg_raw: Vec<u8> = context.arguments.clone().into_bytes();
 		let mut summary_only: bool = false;
 		let mut human: bool = false;
 		let mut mode: Option<JsonMode> = None;
@@ -92,10 +93,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let udf: u64 = volumes.take(CAP_UDF);
 		let usb: u64 = volumes.take(CAP_USB);
 		// 4. receive the inherited working directory and resolve the path against it.
-		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => Vec::new(),
-		};
+		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
 		let uri: String = match path::resolve(cwd_str, &arg) {
 			Some(u) => u,

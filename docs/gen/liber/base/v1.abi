@@ -5,4 +5,8 @@ alias ticks=u64
 meta alias ticks since=1 deprecated=-
 alias name=string
 meta alias name since=1 deprecated=-
+record env-var(name:string,value:string)
+meta record env-var since=1 deprecated=-
+record launch-context(arguments:string,cwd:string,environment:list<env-var>)
+meta record launch-context since=1 deprecated=-
 enum error(denied=0,not-found=1,invalid=2,again=3,closed=4)

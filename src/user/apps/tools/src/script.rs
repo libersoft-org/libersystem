@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use proto::system::LaunchContext;
 use rt::*;
 
 // Record a pty session: given the master end of a pseudo-terminal hosting a fresh shell
@@ -16,14 +17,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// The shell hands us our stdout (the real console), then the command line to record
 		// plus the pty master channel.
 		inherit_stdout(bootstrap);
-		let (len, master): (usize, u64) = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } => (len, handle),
-			Received::Closed => exit(),
+		// The context and the PTY master arrive together: `recv_launch_with` returns the one
+		// capability a launcher may attach to that message, so the program has both or neither.
+		let (context_bytes, master) = match recv_launch_with(bootstrap) {
+			Some(pair) => pair,
+			None => exit(),
+		};
+		let context: LaunchContext = match LaunchContext::decode(&context_bytes) {
+			Some(context) => context,
+			None => exit(),
 		};
 		if master == 0 {
 			print(b"script: no pty\n");
 		} else {
-			record(master, &buf[..len]);
+			record(master, context.arguments.as_bytes());
 			close(master);
 		}
 	}

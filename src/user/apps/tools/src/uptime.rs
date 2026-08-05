@@ -20,7 +20,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string (uptime takes none, but the launch protocol
 		//    sends one).
-		let _ = recv_blocking(bootstrap, &mut buf);
+		let _ = recv_launch_bytes(bootstrap);
 		// 3. render the time since boot from the monotonic clock.
 		let seconds: u64 = clock_ns() / 1_000_000_000;
 		let mut line: [u8; 48] = [0u8; 48];

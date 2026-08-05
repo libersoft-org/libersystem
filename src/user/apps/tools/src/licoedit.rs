@@ -11,6 +11,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use lico::{FileType, InputDecoder, InputEvent, Key, MouseTracking, TerminalGuard, TerminalOptions, TerminalWriter, TextBuffer, TextBufferError, append_display_line, detect_file_type};
+use proto::system::LaunchContext;
 use rt::*;
 use storage_proto::path;
 use tools::{ConsoleWriter, VolumeSet, read_volume_file};
@@ -32,15 +33,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut bootstrap_buffer = [0u8; 256];
 	unsafe {
 		inherit_stdout(bootstrap);
-		let argument: Vec<u8> = match recv_blocking(bootstrap, &mut bootstrap_buffer) {
-			Received::Message { len, .. } => bootstrap_buffer[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let argument: Vec<u8> = context.arguments.clone().into_bytes();
 		let volumes = VolumeSet::receive(bootstrap, &mut bootstrap_buffer);
-		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut bootstrap_buffer) {
-			Received::Message { len, .. } => bootstrap_buffer[..len].to_vec(),
-			Received::Closed => Vec::new(),
-		};
+		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
 		let argument = trim(&argument);
 		if argument.is_empty() || argument.iter().any(u8::is_ascii_whitespace) {

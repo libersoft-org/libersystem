@@ -17,7 +17,7 @@ use audio_client::{AudioClient, PcmStreamClient};
 use flac::Flac;
 use ipc_client::make_buffer;
 use mp3::Mp3;
-use proto::system::OpenOpts;
+use proto::system::{LaunchContext, OpenOpts};
 use rt::*;
 use storage_proto::path;
 use volume_client::VolumeClient;
@@ -78,10 +78,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf = [0u8; 256];
 	unsafe {
 		inherit_stdout(bootstrap);
-		let arg = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let argument: &[u8] = context.arguments.as_bytes();
+		let arg = argument.to_vec();
 		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
 		// for are simply not taken, and the set closes them when it drops - where before they had
 		// to be drained by hand, because a message left on the channel was read as the NEXT thing
@@ -93,11 +95,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let udf = volumes.take(CAP_UDF);
 		let usb = volumes.take(CAP_USB);
 		let audio_channel = recv_tagged(bootstrap, &mut buf, b"AUDIO_STREAM").unwrap_or(0);
-		let cwd = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => Vec::new(),
-		};
-		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
+		let cwd: &str = &context.cwd;
 		let arg = trim(&arg);
 		let Some(uri) = path::resolve(cwd, arg) else {
 			print(b"play: invalid path\n");

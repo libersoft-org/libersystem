@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use imgconv::Error;
 use ipc_client::make_buffer;
-use proto::system::OpenOpts;
+use proto::system::{LaunchContext, OpenOpts};
 use rt::*;
 use storage_proto::path;
 use volume_client::VolumeClient;
@@ -20,10 +20,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		inherit_stdout(bootstrap);
 		set_alloc_error_message(b"imgconv: out of memory\n");
-		let args = match recv_blocking(bootstrap, &mut buffer) {
-			Received::Message { len, .. } => buffer[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let argument: &[u8] = context.arguments.as_bytes();
+		let args = argument.to_vec();
 		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
 		// for are simply not taken, and the set closes them when it drops - where before they had
 		// to be drained by hand, because a message left on the channel was read as the NEXT thing
@@ -34,11 +36,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let iso = volumes.take(CAP_ISO);
 		let udf = volumes.take(CAP_UDF);
 		let usb = volumes.take(CAP_USB);
-		let cwd = match recv_blocking(bootstrap, &mut buffer) {
-			Received::Message { len, .. } => buffer[..len].to_vec(),
-			Received::Closed => Vec::new(),
-		};
-		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
+		let cwd: &str = &context.cwd;
 		if trim(&args) == b"--help" {
 			print(imgconv::help_text().as_bytes());
 			exit();

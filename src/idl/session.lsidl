@@ -2,7 +2,7 @@
 
 package liber:session@1;
 
-use liber:base@1.{error};
+use liber:base@1.{env-var, error};
 use liber:process@1.{task};
 
 /// One tracked job in a session's job table: its small id (assigned by the session and
@@ -27,15 +27,6 @@ record job-info {
 record job-entry {
 	info: job-info,
 	proc: handle<task>,
-}
-
-/// One environment variable of a session: a name and its value. `PATH` is one such
-/// variable (seeded with a default), so a search path and user-defined variables share the
-/// same table. The shell expands `$name` references against it and persists edits in the
-/// session, so the environment survives a shell restart the way the cwd and jobs do.
-record env-var {
-	name:  string,
-	value: string,
 }
 
 /// The SessionService contract: a login session is a long-lived object owning the

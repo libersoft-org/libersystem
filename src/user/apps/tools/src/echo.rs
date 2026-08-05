@@ -12,6 +12,7 @@
 #![no_std]
 #![no_main]
 
+use proto::system::LaunchContext;
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -20,8 +21,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		inherit_stdout(bootstrap);
 		// The parent (the shell) hands us our arguments as one message; echo them.
-		if let Received::Message { len, .. } = recv_blocking(bootstrap, &mut buf) {
-			print(&buf[..len]);
+		if let Some(context) = recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			print(context.arguments.as_bytes());
 			print(b"\n");
 		}
 	}

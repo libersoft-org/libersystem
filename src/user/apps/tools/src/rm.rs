@@ -16,6 +16,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use proto::system::LaunchContext;
 use rt::*;
 use storage_proto::path;
 use volume_client::VolumeClient;
@@ -28,10 +29,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the file path (relative to cwd or an absolute URI).
-		let arg: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let arg: Vec<u8> = context.arguments.clone().into_bytes();
 		// 3. receive the four volume clients the `volumes` capability bundles (SYSTEM / MEDIA /
 		//    ISO / UDF, in grant order); a volume whose disk is absent arrives as 0.
 		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
@@ -46,10 +48,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let usb: u64 = volumes.take(CAP_USB);
 		// 4. receive the inherited working directory (the last bootstrap message), and resolve
 		//    the path argument against it so a relative path reaches the same file the shell would.
-		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => Vec::new(),
-		};
+		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
 		let uri: String = match path::resolve(cwd_str, &arg) {
 			Some(u) => u,

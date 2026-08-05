@@ -19,7 +19,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use log_client::LogClient;
 use proto::codec::JsonMode;
-use proto::system::{Entry, Query, Timestamp, log};
+use proto::system::{Entry, LaunchContext, Query, Timestamp, log};
 use rt::*;
 use time_client::TimeClient;
 
@@ -31,10 +31,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the sub-form ("", "json", "tail", "tail json").
-		let args: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let args: Vec<u8> = context.arguments.clone().into_bytes();
 		// 3. receive the two capabilities the manifest grants, in vocabulary order: log then time.
 		let logsvc: u64 = recv_tagged(bootstrap, &mut buf, b"LOG").unwrap_or_else(|| exit());
 		let timesvc: u64 = recv_tagged(bootstrap, &mut buf, b"TIME").unwrap_or_else(|| exit());

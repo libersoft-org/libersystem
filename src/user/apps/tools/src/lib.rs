@@ -16,8 +16,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use lico::TerminalWriter;
 use proto::codec::JsonMode;
-use proto::system::{FileInfo, OpenOpts, volume};
-use rt::{Received, ReceivedVec, close, exit, map_object, recv_blocking, recv_tagged, recv_vec_blocking, send_blocking, unmap_object};
+use proto::system::{FileInfo, LaunchContext, OpenOpts, volume};
+use rt::{Received, ReceivedVec, close, exit, map_object, recv_blocking, recv_launch_bytes, recv_tagged, recv_vec_blocking, send_blocking, unmap_object};
 use storage_proto::path;
 use volume_client::VolumeClient;
 
@@ -269,9 +269,9 @@ pub fn push_decimal(out: &mut String, value: u64) {
 //
 // # Safety
 // `bootstrap` must be the tool's live bootstrap channel handle.
-pub unsafe fn recv_json_mode(bootstrap: u64, buf: &mut [u8]) -> Option<JsonMode> {
-	match unsafe { recv_blocking(bootstrap, buf) } {
-		Received::Message { len, .. } => JsonMode::parse(&buf[..len]),
-		Received::Closed => exit(),
+pub unsafe fn recv_json_mode(bootstrap: u64) -> Option<JsonMode> {
+	match unsafe { recv_launch_bytes(bootstrap) }.as_deref().and_then(LaunchContext::decode) {
+		Some(context) => JsonMode::parse(context.arguments.as_bytes()),
+		None => exit(),
 	}
 }

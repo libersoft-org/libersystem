@@ -20,6 +20,7 @@ use alloc::string::String;
 use lico::{MouseTracking, TerminalGuard, TerminalOptions};
 use process_client::ProcessClient;
 use proto::codec::JsonMode;
+use proto::system::LaunchContext;
 use resources_client::ResourcesClient;
 use rt::*;
 use tools::ConsoleWriter;
@@ -37,10 +38,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string: "" for the plain list, "-i" for the live view,
 		//    "json" / "json-min" for a JSON array.
-		let arg: alloc::vec::Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let argument: &[u8] = context.arguments.as_bytes();
+		let arg: alloc::vec::Vec<u8> = argument.to_vec();
 		let interactive: bool = arg == b"-i";
 		let mode: Option<JsonMode> = JsonMode::parse(&arg);
 		// 3. receive the two capabilities the manifest grants, in vocabulary order: a

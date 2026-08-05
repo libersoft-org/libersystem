@@ -23,7 +23,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string (date takes none, but the launch protocol sends one).
-		let _ = recv_blocking(bootstrap, &mut buf);
+		let _ = recv_launch_bytes(bootstrap);
 		// 3. receive the one capability the manifest grants: a TimeService client.
 		let timesvc: u64 = recv_tagged(bootstrap, &mut buf, b"TIME").unwrap_or_else(|| exit());
 		date(timesvc);

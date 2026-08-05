@@ -26,7 +26,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		inherit_stdout(bootstrap);
 		// Drain the argv/capability message so the bootstrap protocol stays in step; readln
 		// takes no arguments.
-		let _ = recv_blocking(bootstrap, &mut buf);
+		let _ = recv_launch_bytes(bootstrap);
 		// Read cooked input lines and echo each back until end-of-input.
 		while let Some(n) = read_line(&mut buf) {
 			print(b"in> ");

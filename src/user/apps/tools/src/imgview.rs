@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use keys::usage;
 use pix::{Image, Target};
-use proto::system::{OpenOpts, input};
+use proto::system::{LaunchContext, OpenOpts, input};
 use rt::*;
 use storage_proto::path;
 use volume_client::VolumeClient;
@@ -272,10 +272,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0; 256];
 	unsafe {
 		inherit_stdout(bootstrap);
-		let arg: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let arg: Vec<u8> = context.arguments.clone().into_bytes();
 		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
 		// for are simply not taken, and the set closes them when it drops - where before they had
 		// to be drained by hand, because a message left on the channel was read as the NEXT thing
@@ -288,10 +289,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let usb = volumes.take(CAP_USB);
 		let display_channel = recv_tagged(bootstrap, &mut buf, b"DISPLAY").unwrap_or(0);
 		let input_channel = recv_tagged(bootstrap, &mut buf, b"INPUT_KEYS").unwrap_or(0);
-		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => Vec::new(),
-		};
+		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
 		let arg = trim(&arg);
 		if arg == b"--help" {

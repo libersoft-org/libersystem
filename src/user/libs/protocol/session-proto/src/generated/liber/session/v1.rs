@@ -8,6 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+use crate::generated::liber::base::v1::EnvVar;
 use crate::generated::liber::base::v1::Error;
 
 /// One tracked job in a session's job table: its small id (assigned by the session and
@@ -93,42 +94,6 @@ impl JobEntry {
 			r.take_handle()?
 		};
 		Some(JobEntry { info, proc })
-	}
-}
-
-/// One environment variable of a session: a name and its value. `PATH` is one such
-/// variable (seeded with a default), so a search path and user-defined variables share the
-/// same table. The shell expands `$name` references against it and persists edits in the
-/// session, so the environment survives a shell restart the way the cwd and jobs do.
-#[derive(Clone, Debug, PartialEq)]
-pub struct EnvVar {
-	pub name: String,
-	pub value: String,
-}
-
-impl EnvVar {
-	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
-		let mut w = SliceWriter::new(out);
-		self.write(&mut w)?;
-		Some(w.pos())
-	}
-	pub fn encode_vec(&self) -> Option<Vec<u8>> {
-		let mut w = VecWriter::new();
-		self.write(&mut w)?;
-		Some(w.into_inner())
-	}
-	pub fn decode(bytes: &[u8]) -> Option<EnvVar> {
-		EnvVar::read(&mut Reader::new(bytes))
-	}
-	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
-		w.bytes_lp(self.name.as_bytes())?;
-		w.bytes_lp(self.value.as_bytes())?;
-		Some(())
-	}
-	pub fn read(r: &mut Reader) -> Option<EnvVar> {
-		let name = r.string_lp()?;
-		let value = r.string_lp()?;
-		Some(EnvVar { name, value })
 	}
 }
 
@@ -1175,49 +1140,6 @@ impl JobEntry {
 		self.info.to_cbor_into(out);
 		crate::codec::cbor::text(out, "proc");
 		crate::codec::cbor::uint(out, self.proc as u64);
-	}
-}
-
-impl EnvVar {
-	pub fn to_json(&self) -> String {
-		let mut s = String::new();
-		self.to_json_into(&mut s);
-		s
-	}
-	pub fn to_text(&self) -> String {
-		let mut s = String::new();
-		self.to_text_into(&mut s);
-		s
-	}
-	pub fn to_cbor(&self) -> Vec<u8> {
-		let mut v = Vec::new();
-		self.to_cbor_into(&mut v);
-		v
-	}
-	pub(crate) fn to_json_into(&self, out: &mut String) {
-		out.push('{');
-		out.push_str("\"name\":");
-		crate::codec::json_escape(&self.name, out);
-		out.push(',');
-		out.push_str("\"value\":");
-		crate::codec::json_escape(&self.value, out);
-		out.push('}');
-	}
-	pub(crate) fn to_text_into(&self, out: &mut String) {
-		out.push('{');
-		out.push_str("name=");
-		out.push_str(&self.name);
-		out.push_str(", ");
-		out.push_str("value=");
-		out.push_str(&self.value);
-		out.push('}');
-	}
-	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 2);
-		crate::codec::cbor::text(out, "name");
-		crate::codec::cbor::text(out, &self.name);
-		crate::codec::cbor::text(out, "value");
-		crate::codec::cbor::text(out, &self.value);
 	}
 }
 

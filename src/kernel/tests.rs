@@ -103,6 +103,23 @@ fn program_elf(package: &pkg::Package<'static>, volume: &'static [u8], name: &[u
 // Send a tagged capability over a bootstrap channel: wrap `object` in a Capability
 // carrying `rights` and send it with `payload` as the message bytes. The shared
 // "hand a process one of its initial capabilities" step the scenarios repeat.
+// Encode a launch context the way `base_proto`'s generated codec does: the argument string, the
+// working directory, and an environment count, each little-endian length-prefixed.
+//
+// Hand-built because the kernel links no userspace protocol crate, which makes this the one place
+// in the tree that restates the record's shape. It is written once, here, rather than at each of
+// the thirteen stagings that need it - and if it ever disagrees with the schema, every governed
+// tool test fails at once rather than one of them subtly.
+pub(crate) fn launch_context(arguments: &[u8], cwd: &[u8]) -> alloc::vec::Vec<u8> {
+	let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for field in [arguments, cwd] {
+		out.extend_from_slice(&(field.len() as u16).to_le_bytes());
+		out.extend_from_slice(field);
+	}
+	out.extend_from_slice(&0u16.to_le_bytes()); // no environment variables
+	out
+}
+
 fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> Result<(), &'static str> {
 	let cap = object::handle::Capability::new(object, rights, 0);
 	channel.send(object::channel::Message::new(payload.to_vec(), alloc::vec![cap], 0)).map_err(|_| "bootstrap capability send failed")
@@ -1479,7 +1496,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		assert_eq!(reply.bytes[4], 1, "dynamic play loaded with its providers");
 		let process = reply.caps[0].object().into_any_arc().downcast::<object::process::Process>().expect("play launch returns a Process");
 		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("play stdout bootstrap");
-		bootstrap.send(Message::new(argument.to_vec(), alloc::vec::Vec::new(), 0)).expect("play argument bootstrap");
+		bootstrap.send(Message::new(launch_context(argument, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("play argument bootstrap");
 		send_cap(&bootstrap, b"SYSTEM", storage, Rights::ALL).expect("play system volume bootstrap");
 		for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 			bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("play absent volume bootstrap");
@@ -2998,14 +3015,13 @@ fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, 
 	let (stdout, child_stdout) = Channel::create();
 	let process = spawn_dynamic_test_process(domain.clone(), imgconv_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgconv stdout");
-	bootstrap.send(Message::new(args.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv args");
+	bootstrap.send(Message::new(launch_context(args, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgconv args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgconv system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgconv media volume");
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv absent volume");
 	}
 	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
-	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv cwd");
 	let mut line = None;
 	for _ in 0..100_000 {
 		system.pump();
@@ -3047,7 +3063,7 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 	let (stdout, child_stdout) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview help stdout");
-	bootstrap.send(Message::new(b"--help".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help args");
+	bootstrap.send(Message::new(crate::tests::launch_context(b"--help", b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgview help args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview help system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview help media volume");
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
@@ -3058,7 +3074,6 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 	for tag in [b"DISPLAY".as_slice(), b"INPUT_KEYS".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help absent capability");
 	}
-	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help cwd");
 	let output = loop {
 		system.pump();
 		media.pump();
@@ -3099,7 +3114,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	let (input, input_client) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview stdout");
-	bootstrap.send(Message::new(path.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview args");
+	bootstrap.send(Message::new(launch_context(path, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgview args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview media volume");
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
@@ -3108,7 +3123,6 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("imgview display");
 	send_cap(&bootstrap, b"INPUT_KEYS", input_client, Rights::ALL).expect("imgview input");
-	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview cwd");
 
 	let acquire = loop {
 		system.pump();
@@ -3287,13 +3301,12 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	let (terminal, terminal_child) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), lico_elf, child);
 	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("lico terminal bootstrap");
-	bootstrap.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("lico empty arguments");
+	bootstrap.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new(), 0)).expect("lico empty arguments");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("lico system volume");
 	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent volume");
 	}
 	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
-	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico cwd");
 
 	let mut output = alloc::vec::Vec::new();
 	let mut rendered = false;

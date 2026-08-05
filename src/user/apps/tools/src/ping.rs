@@ -26,7 +26,7 @@ use core::fmt::Write;
 
 use network_client::NetworkClient;
 use proto::codec::{JsonMode, json_escape};
-use proto::system::{Ipv4Addr, PingReply, PingStatus};
+use proto::system::{Ipv4Addr, LaunchContext, PingReply, PingStatus};
 use rt::*;
 use tools::parse_u64;
 
@@ -44,10 +44,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		// Governed launch sends arguments first, then the tagged NetworkService grant.
 		inherit_stdout(bootstrap);
-		let len: usize = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => len,
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let argument: &[u8] = context.arguments.as_bytes();
+		let len: usize = argument.len();
 		let netsvc: u64 = recv_tagged(bootstrap, &mut buf, b"NETWORK").unwrap_or_else(|| exit());
 		ping(netsvc, &buf[..len]);
 		// Drop our client channel (NetworkService reclaims the slot) and exit; the

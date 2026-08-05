@@ -383,7 +383,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/beep.lsexe"
-providers = ["audio-client", "lsrt"]
+providers = ["base-proto", "audio-client", "lsrt"]
 
 [[programs]]
 name = "cat"
@@ -392,7 +392,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/cat.lsexe"
-providers = ["volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "component_host"
@@ -410,7 +410,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/config.lsexe"
-providers = ["config-client", "config-proto", "lsrt"]
+providers = ["base-proto", "config-client", "config-proto", "lsrt"]
 
 [[programs]]
 name = "config_service"
@@ -492,7 +492,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/du.lsexe"
-providers = ["volume-client", "storage-proto", "wire", "lsrt"]
+providers = ["base-proto", "volume-client", "storage-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "dyn_probe"
@@ -510,7 +510,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/echo.lsexe"
-providers = ["lsrt"]
+providers = ["base-proto", "lsrt"]
 
 [[programs]]
 name = "file_picker"
@@ -528,7 +528,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/free.lsexe"
-providers = ["lsrt"]
+providers = ["base-proto", "lsrt"]
 
 [[programs]]
 name = "graphics_probe"
@@ -555,7 +555,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/imgconv.lsexe"
-providers = ["imgconv", "volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "imgconv", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "imgview"
@@ -564,7 +564,16 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/imgview.lsexe"
-providers = ["imgconv", "pix", "surface", "volume-client", "input-proto", "storage-proto", "lsrt"]
+providers = [
+	"base-proto",
+	"imgconv",
+	"pix",
+	"surface",
+	"volume-client",
+	"input-proto",
+	"storage-proto",
+	"lsrt",
+]
 
 [[programs]]
 name = "input_service"
@@ -591,7 +600,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/log.lsexe"
-providers = ["log-client", "time-client", "log-proto", "time-proto", "wire", "lsrt"]
+providers = ["base-proto", "log-client", "time-client", "log-proto", "time-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "log_service"
@@ -609,7 +618,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/ls.lsexe"
-providers = ["volume-client", "storage-proto", "time-proto", "wire", "lsrt"]
+providers = ["base-proto", "volume-client", "storage-proto", "time-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lsblk"
@@ -618,7 +627,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsblk.lsexe"
-providers = ["volume-client", "wire", "lsrt"]
+providers = ["base-proto", "volume-client", "wire", "lsrt"]
 
 [[programs]]
 name = "lscpu"
@@ -627,7 +636,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lscpu.lsexe"
-providers = ["wire", "lsrt"]
+providers = ["base-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lsdev"
@@ -636,7 +645,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsdev.lsexe"
-providers = ["device-client", "device-proto", "wire", "lsrt"]
+providers = ["base-proto", "device-client", "device-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lsirq"
@@ -645,7 +654,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsirq.lsexe"
-providers = ["wire", "lsrt"]
+providers = ["base-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lsmem"
@@ -654,7 +663,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsmem.lsexe"
-providers = ["wire", "lsrt"]
+providers = ["base-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lspci"
@@ -663,7 +672,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lspci.lsexe"
-providers = ["wire", "lsrt"]
+providers = ["base-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lssvc"
@@ -672,7 +681,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lssvc.lsexe"
-providers = ["observability-client", "observability-proto", "wire", "lsrt"]
+providers = ["base-proto", "observability-client", "observability-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lsusb"
@@ -681,7 +690,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsusb.lsexe"
-providers = ["device-client", "device-proto", "wire", "lsrt"]
+providers = ["base-proto", "device-client", "device-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lsvol"
@@ -690,7 +699,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsvol.lsexe"
-providers = ["volume-client", "storage-proto", "wire", "lsrt"]
+providers = ["base-proto", "volume-client", "storage-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "licoview"
@@ -699,7 +708,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/licoview.lsexe"
-providers = ["lico", "volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "lico", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "licoedit"
@@ -708,7 +717,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/licoedit.lsexe"
-providers = ["lico", "volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "lico", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "lico"
@@ -717,7 +726,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lico.lsexe"
-providers = ["lico", "volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "lico", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "mkdir"
@@ -726,7 +735,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/mkdir.lsexe"
-providers = ["volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "nc"
@@ -735,7 +744,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/nc.lsexe"
-providers = ["network-client", "network-proto", "lsrt"]
+providers = ["base-proto", "network-client", "network-proto", "lsrt"]
 
 [[programs]]
 name = "network_service"
@@ -753,7 +762,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/nslookup.lsexe"
-providers = ["network-client", "network-proto", "lsrt"]
+providers = ["base-proto", "network-client", "network-proto", "lsrt"]
 
 [[programs]]
 name = "perm"
@@ -762,7 +771,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/perm.lsexe"
-providers = ["security-client", "security-proto", "wire", "lsrt"]
+providers = ["base-proto", "security-client", "security-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "permission_manager"
@@ -788,7 +797,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/ping.lsexe"
-providers = ["network-client", "network-proto", "wire", "lsrt"]
+providers = ["base-proto", "network-client", "network-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "play"
@@ -798,6 +807,7 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/play.lsexe"
 providers = [
+	"base-proto",
 	"aiff",
 	"flac",
 	"mp3",
@@ -827,6 +837,7 @@ linkage = "dynamic"
 stage = "volume"
 destination = "bin/ps.lsexe"
 providers = [
+	"base-proto",
 	"process-client",
 	"resources-client",
 	"process-proto",
@@ -887,7 +898,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/rm.lsexe"
-providers = ["volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "rmdir"
@@ -896,7 +907,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/rmdir.lsexe"
-providers = ["volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "run"
@@ -905,7 +916,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/run.lsexe"
-providers = ["process-client", "process-proto", "lsrt"]
+providers = ["base-proto", "process-client", "process-proto", "lsrt"]
 
 [[programs]]
 name = "sandbox_probe"
@@ -923,7 +934,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/script.lsexe"
-providers = ["lsrt"]
+providers = ["base-proto", "lsrt"]
 
 [[programs]]
 name = "service_manager"
@@ -950,7 +961,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/set.lsexe"
-providers = ["config-client", "lsrt"]
+providers = ["base-proto", "config-client", "lsrt"]
 
 [[programs]]
 name = "shell"
@@ -980,7 +991,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/snap.lsexe"
-providers = ["volume-client", "lsrt"]
+providers = ["base-proto", "volume-client", "lsrt"]
 
 [[programs]]
 name = "ss"
@@ -998,7 +1009,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/start.lsexe"
-providers = ["lsrt"]
+providers = ["base-proto", "lsrt"]
 
 [[programs]]
 name = "stop"
@@ -1007,7 +1018,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/stop.lsexe"
-providers = ["lsrt"]
+providers = ["base-proto", "lsrt"]
 
 [[programs]]
 name = "storage_client"
@@ -1052,7 +1063,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/tcp.lsexe"
-providers = ["network-client", "network-proto", "lsrt"]
+providers = ["base-proto", "network-client", "network-proto", "lsrt"]
 
 [[programs]]
 name = "time_service"
@@ -1088,7 +1099,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/usage.lsexe"
-providers = ["resources-client", "resources-proto", "wire", "lsrt"]
+providers = ["base-proto", "resources-client", "resources-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "virtio_blk"
@@ -1171,7 +1182,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/volume.lsexe"
-providers = ["volume-client", "lsrt"]
+providers = ["base-proto", "volume-client", "lsrt"]
 
 [[programs]]
 name = "wasi_host"
@@ -1198,7 +1209,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/write.lsexe"
-providers = ["volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "xhci"

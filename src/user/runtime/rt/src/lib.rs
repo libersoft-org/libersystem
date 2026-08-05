@@ -562,6 +562,60 @@ pub unsafe fn inherit_stdout(bootstrap: u64) {
 	}
 }
 
+// The largest launch context a program will accept.
+//
+// The context is data its launcher chose, and a program has no way to bound what it is handed
+// except by saying so. 64 KiB is far above any real argument string, working directory and
+// environment together, and far below anything that would matter to a program's heap.
+pub const LAUNCH_CONTEXT_MAX: usize = 64 * 1024;
+
+// Receive the launch context: the argument string, the working directory to resolve relative
+// paths against, and the environment snapshot the launcher took. Sent as ONE message right after
+// the STDOUT handoff, before any capability grant.
+//
+// This replaced a run of bare messages - the arguments, then the grants, then the working
+// directory - where the working directory had to come LAST because a tool reads its grants with
+// a tagged receive, and a bare message arriving early is taken as whatever the tool reads next.
+// The rule lived in a comment in the launcher and had to be obeyed by fifty-two programs.
+//
+// None when the message is missing, oversized or not a well-formed context. A program that
+// cannot read its own context has no arguments and no cwd, so every caller treats this as fatal;
+// it is returned rather than panicked so the caller decides how to say so.
+// The runtime hands back the BYTES and the caller decodes them with the schema's own type.
+//
+// It cannot decode them itself, and the reason is structural rather than a matter of taste: every
+// shared library in this system depends on `lsrt` for its runtime, so `lsrt` sits at the bottom of
+// that graph and may depend on none of them. Linking `base-proto` here is a cycle the manifest
+// refuses by name - `lsrt -> base-proto -> lsrt`. The alternative, restating the record's shape
+// here against `wire`, would put a second definition of the format in the one place that must
+// never disagree with the schema. So the split is: the runtime bounds and delivers the message,
+// and the program that needs the fields links the package that defines them.
+pub unsafe fn recv_launch_bytes(bootstrap: u64) -> Option<alloc::vec::Vec<u8>> {
+	let (bytes, capability) = unsafe { recv_launch_with(bootstrap) }?;
+	// A launcher may attach one capability to this message, and a program that does not expect
+	// one must not simply drop it: a discarded handle stays open for the life of the process,
+	// which is how every governed tool leaked two volume clients per launch. Closing it is the
+	// same rule `CapSet` follows for a grant nobody claims.
+	if capability != 0 {
+		unsafe { close(capability) };
+	}
+	Some(bytes)
+}
+
+// The launch context together with the one capability a launcher may attach to that message.
+//
+// The shell uses it where a program must receive something atomically with its context - the
+// PTY master for `script`, a NetworkService client for the net tools. It rides the message
+// rather than the record: the context is data a program inherits, and a capability is not data.
+// Sending it separately would put the receiver back where it cannot tell "none was sent" from
+// "not sent yet", which is the ambiguity this whole shape exists to remove.
+pub unsafe fn recv_launch_with(bootstrap: u64) -> Option<(alloc::vec::Vec<u8>, u64)> {
+	match unsafe { recv_vec_bounded(bootstrap, LAUNCH_CONTEXT_MAX) } {
+		BoundedVec::Message { bytes, handle } => Some((bytes, handle)),
+		_ => None,
+	}
+}
+
 // Read one cooked line of input from this program's stdin (its controlling terminal):
 // blocks until the terminal delivers a submitted line, copies it (with its trailing
 // newline) into `buf` and returns its length, or None at end-of-input - Ctrl+D, the

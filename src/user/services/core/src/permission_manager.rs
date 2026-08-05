@@ -51,7 +51,7 @@ use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::network;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, Error, Manifest, PipelineResult, PipelineStage, StartResult, process};
+use proto::system::{AuditEntry, Capability, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, StartResult, process};
 use rt::*;
 use services::executable;
 
@@ -679,7 +679,11 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		// Forward the stdout console first (the tool's `inherit_stdout` reads the first
 		// message), then the argument string, then the manifest grants.
 		send_blocking(manager_side, STDOUT_TAG, stdout);
-		send_blocking(manager_side, args, 0);
+		if !send_launch_context(manager_side, args, cwd) {
+			close(manager_side);
+			close(started.task);
+			return None;
+		}
 		for &cap in VOCABULARY.iter() {
 			let granted: bool = manifest.grants.contains(&cap);
 			if granted {
@@ -700,12 +704,6 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 			}
 			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
 		}
-		// Hand over the inherited working directory last, after the capability grants. It is
-		// plain data (no handle), so a tool resolves a relative path argument against it; a
-		// tool that takes no path simply never reads it, leaving it a harmless trailing
-		// message - sending it before the tagged grants would instead be mis-consumed by the
-		// tool's `recv_tagged` for its capabilities.
-		send_blocking(manager_side, cwd, 0);
 		// Commit: the tool's stdout, arguments, grants and cwd are all queued, so what it will
 		// observe is complete. Anything that failed above returned without releasing, which
 		// leaves a process that never ran rather than one that started on half a grant set.
@@ -796,7 +794,11 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 				close(started.task);
 				abandon!(prepared);
 			}
-			send_blocking(manager_side, stage.args, 0);
+			if !send_launch_context(manager_side, stage.args, cwd) {
+				close(manager_side);
+				close(started.task);
+				abandon!(prepared);
+			}
 			for &cap in VOCABULARY.iter() {
 				let granted: bool = manifest.grants.contains(&cap);
 				if granted {
@@ -814,7 +816,6 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 				}
 				audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted, dynamic: false });
 			}
-			send_blocking(manager_side, cwd, 0);
 			prepared.push((started, manager_side));
 		}
 		// Commit. Released in pipeline order so a producer is running before its consumer can
@@ -837,6 +838,31 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 		}
 		Some(started)
 	}
+}
+
+// Send a launched program its context: the arguments it was invoked with, the working directory
+// it resolves relative paths against, and the environment it inherits.
+//
+// One message, right after the stdout handoff and BEFORE any capability grant. It used to be two
+// bare messages with the grants between them, and the second - the working directory - had to be
+// last, because a tool reads its grants with a tagged receive and a bare message arriving early
+// is consumed as whatever that tool reads next. Growing that sequence is what shifted the
+// `volumes` bundle by two and surfaced, four steps later, as a tool reading a volume client as
+// its working directory.
+//
+// The environment is a SNAPSHOT and it is empty here for now: the table lives in SessionService,
+// which this manager holds no client for, and threading it through the `run` op is its own step.
+// The field exists so that arrives as a value rather than as a change of shape.
+//
+// Returns false if the context cannot be encoded or sent, which the callers treat like any other
+// failed grant: the process is abandoned rather than started with half a context.
+unsafe fn send_launch_context(manager_side: u64, args: &[u8], cwd: &[u8]) -> bool {
+	let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: Vec::new() };
+	let Some(bytes) = context.encode_vec() else { return false };
+	if bytes.len() > rt::LAUNCH_CONTEXT_MAX {
+		return false;
+	}
+	unsafe { send_blocking(manager_side, &bytes, 0) }
 }
 
 // Grant the volume StorageService clients the `volumes` capability bundles, each under its own

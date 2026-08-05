@@ -15,23 +15,25 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::vec::Vec;
-use proto::system::OpenOpts;
+use proto::system::{LaunchContext, OpenOpts};
 use rt::*;
 use storage_proto::path;
 use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our output
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
-		// 2. receive the argument string - the file path (relative to cwd or an absolute URI).
-		let arg: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		// 2. receive the launch context: the argument string (the file path, relative to the
+		//    working directory or an absolute URI) and that working directory, in one versioned
+		//    record. They used to be two bare messages with the capability grants between them,
+		//    and the cwd had to be LAST, because a bare message arriving before the grants is
+		//    consumed by the tagged receive that reads them.
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
 		// 3. receive the four volume clients the `volumes` capability bundles (SYSTEM / MEDIA /
 		//    ISO / UDF, in grant order); a volume whose disk is absent arrives as 0.
@@ -45,14 +47,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let iso: u64 = volumes.take(CAP_ISO);
 		let udf: u64 = volumes.take(CAP_UDF);
 		let usb: u64 = volumes.take(CAP_USB);
-		// 4. receive the inherited working directory (the last bootstrap message), and resolve
-		//    the path argument against it so a relative path reaches the same file the shell would.
-		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => Vec::new(),
-		};
-		let cwd_str: &str = core::str::from_utf8(&cwd).unwrap_or("");
-		let uri: String = match path::resolve(cwd_str, &arg) {
+		// 4. resolve the path argument against the inherited working directory, so a relative
+		//    path reaches the same file the shell would.
+		let arg: &[u8] = context.arguments.as_bytes();
+		let cwd_str: &str = &context.cwd;
+		let uri: String = match path::resolve(cwd_str, arg) {
 			Some(u) => u,
 			None => {
 				print(b"cat: invalid path\n");
@@ -60,7 +59,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		};
 		// route the path to the client for the volume it names.
-		let storage: u64 = path::volume_client(cwd_str, &arg, system, media, iso, udf, usb);
+		let storage: u64 = path::volume_client(cwd_str, arg, system, media, iso, udf, usb);
 		cat(storage, uri.as_bytes());
 	}
 	exit();

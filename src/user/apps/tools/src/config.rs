@@ -18,7 +18,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use config_client::ConfigClient;
-use proto::system::ConfigEntry;
+use proto::system::{ConfigEntry, LaunchContext};
 use rt::*;
 
 #[unsafe(no_mangle)]
@@ -29,10 +29,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    renders on the same terminal as the shell that launched us.
 		inherit_stdout(bootstrap);
 		// 2. receive the argument string - the sub-form ("" lists all, "<key>" reads one node).
-		let args: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, .. } => buf[..len].to_vec(),
-			Received::Closed => exit(),
+		let context: LaunchContext = match recv_launch_bytes(bootstrap).as_deref().and_then(LaunchContext::decode) {
+			Some(context) => context,
+			None => exit(),
 		};
+		let args: Vec<u8> = context.arguments.clone().into_bytes();
 		// 3. receive the one capability the manifest grants: a ConfigService client.
 		let cfgsvc: u64 = recv_tagged(bootstrap, &mut buf, b"CONFIG").unwrap_or_else(|| exit());
 		if args.is_empty() {
