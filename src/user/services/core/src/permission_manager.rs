@@ -51,7 +51,7 @@ use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::network;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, StartResult, process};
+use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, StartResult, process};
 use rt::*;
 use services::executable;
 
@@ -442,8 +442,12 @@ impl Service for Manager {
 	fn audit(&mut self) -> Vec<AuditEntry> {
 		self.audit.clone()
 	}
-	fn run(&mut self, name: String, args: String, cwd: String, stdout: u64) -> Result<StartResult, Error> {
-		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), stdout, &mut self.clients, &mut self.audit) } {
+	fn run(&mut self, name: String, args: String, cwd: String, environment: Vec<EnvVar>, stdout: u64) -> Result<StartResult, Error> {
+		if !environment_is_acceptable(&environment) {
+			unsafe { close(stdout) };
+			return Err(Error::Invalid);
+		}
+		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, &mut self.clients, &mut self.audit) } {
 			Some(started) => Ok(started),
 			None => Err(Error::NotFound),
 		}
@@ -453,7 +457,11 @@ impl Service for Manager {
 	// names only the tools and their arguments, so it can neither pick which endpoint a stage
 	// receives nor hand one in from outside. `stdout` is the terminal end, and it belongs to
 	// the LAST stage - every earlier stage writes into the edge made for it.
-	fn run_pipeline(&mut self, stages: Vec<PipelineStage>, cwd: String, stdout: u64) -> Result<PipelineResult, Error> {
+	fn run_pipeline(&mut self, stages: Vec<PipelineStage>, cwd: String, environment: Vec<EnvVar>, stdout: u64) -> Result<PipelineResult, Error> {
+		if !environment_is_acceptable(&environment) {
+			unsafe { close(stdout) };
+			return Err(Error::Invalid);
+		}
 		if stages.is_empty() || stages.len() > MAX_PIPELINE_STAGES {
 			// Bounded like every other resource here: a caller cannot ask for an unbounded
 			// number of processes and endpoints in one request.
@@ -486,7 +494,7 @@ impl Service for Manager {
 				let input: u64 = if index == 0 { 0 } else { edges[index - 1].0 };
 				requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input });
 			}
-			let started: Vec<StartResult> = match run_pipeline_under_manifest(self.procsvc, &requests, cwd.as_bytes(), &mut self.clients, &mut self.audit) {
+			let started: Vec<StartResult> = match run_pipeline_under_manifest(self.procsvc, &requests, cwd.as_bytes(), &environment, &mut self.clients, &mut self.audit) {
 				Some(started) => started,
 				None => {
 					// The transaction released nothing, so nothing ran. The endpoints are the
@@ -644,7 +652,7 @@ unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients
 // manifest's capabilities in vocabulary order (auditing each decision). Returns the live
 // process handle (for the caller's job control) and the per-capability decisions, or None if
 // the tool has no manifest, the argument is not a known program name, or the launch fails.
-unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
+unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], environment: &[EnvVar], stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
 	unsafe {
 		let name_str: &str = core::str::from_utf8(name).ok()?;
 		let (manager_side, child_side): (u64, u64) = channel()?;
@@ -679,7 +687,7 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		// Forward the stdout console first (the tool's `inherit_stdout` reads the first
 		// message), then the argument string, then the manifest grants.
 		send_blocking(manager_side, STDOUT_TAG, stdout);
-		if !send_launch_context(manager_side, args, cwd) {
+		if !send_launch_context(manager_side, args, cwd, environment) {
 			close(manager_side);
 			close(started.task);
 			return None;
@@ -740,7 +748,7 @@ struct StageRequest<'a> {
 // never sent from the next handoff in its bootstrap sequence. That is what the M0120
 // multi-capability work exists for, and it is why this needs no "does this stage have
 // stdin?" agreement between the two sides.
-unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<Vec<StartResult>> {
+unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], environment: &[EnvVar], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<Vec<StartResult>> {
 	unsafe {
 		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
 		let mut prepared: Vec<(StartResult, u64)> = Vec::new();
@@ -794,7 +802,7 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 				close(started.task);
 				abandon!(prepared);
 			}
-			if !send_launch_context(manager_side, stage.args, cwd) {
+			if !send_launch_context(manager_side, stage.args, cwd, environment) {
 				close(manager_side);
 				close(started.task);
 				abandon!(prepared);
@@ -840,6 +848,47 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 	}
 }
 
+// What a launch context's environment may carry, checked by the LAUNCHER rather than trusted from
+// the caller. The shell proposes the table; this manager decides what a child is born with, the
+// same way it decides which capabilities it gets.
+//
+// Refused rather than trimmed. Silently dropping a variable that is too long, or the sixty-fifth
+// of sixty-four, gives a program an environment its caller never described - and the difference
+// surfaces as a tool behaving differently for reasons nothing reports. A caller that asks for more
+// than this is told.
+//
+// The total is well under `rt::LAUNCH_CONTEXT_MAX`, which bounds the whole encoded record: the
+// arguments and the working directory have to fit beside it.
+const MAX_ENV_VARS: usize = 64;
+const MAX_ENV_NAME: usize = 64;
+const MAX_ENV_VALUE: usize = 4096;
+const MAX_ENV_BYTES: usize = 32 * 1024;
+
+// Whether an environment table may be handed to a child.
+//
+// A name is what a shell expands, so it is bounded, non-empty, and free of `=` (which would make
+// the pair unparseable wherever it is rendered as `NAME=value`) and of NUL. Values are bounded but
+// otherwise opaque - they are data.
+fn environment_is_acceptable(environment: &[EnvVar]) -> bool {
+	if environment.len() > MAX_ENV_VARS {
+		return false;
+	}
+	let mut total: usize = 0;
+	for variable in environment {
+		if variable.name.is_empty() || variable.name.len() > MAX_ENV_NAME || variable.value.len() > MAX_ENV_VALUE {
+			return false;
+		}
+		if variable.name.bytes().any(|byte| byte == b'=' || byte == 0) {
+			return false;
+		}
+		total += variable.name.len() + variable.value.len();
+		if total > MAX_ENV_BYTES {
+			return false;
+		}
+	}
+	true
+}
+
 // Send a launched program its context: the arguments it was invoked with, the working directory
 // it resolves relative paths against, and the environment it inherits.
 //
@@ -850,14 +899,14 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 // `volumes` bundle by two and surfaced, four steps later, as a tool reading a volume client as
 // its working directory.
 //
-// The environment is a SNAPSHOT and it is empty here for now: the table lives in SessionService,
-// which this manager holds no client for, and threading it through the `run` op is its own step.
-// The field exists so that arrives as a value rather than as a change of shape.
+// The environment is a SNAPSHOT: the values as they stood when the launch was asked for, never a
+// capability to the session that holds them. The caller proposes it and this manager decides it,
+// which is why it is checked here rather than where it was read.
 //
 // Returns false if the context cannot be encoded or sent, which the callers treat like any other
 // failed grant: the process is abandoned rather than started with half a context.
-unsafe fn send_launch_context(manager_side: u64, args: &[u8], cwd: &[u8]) -> bool {
-	let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: Vec::new() };
+unsafe fn send_launch_context(manager_side: u64, args: &[u8], cwd: &[u8], environment: &[EnvVar]) -> bool {
+	let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: environment.to_vec() };
 	let Some(bytes) = context.encode_vec() else { return false };
 	if bytes.len() > rt::LAUNCH_CONTEXT_MAX {
 		return false;
@@ -910,7 +959,7 @@ unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &mut
 			Some(pair) => pair,
 			None => return Vec::new(),
 		};
-		let started: StartResult = match run_tool_under_manifest(procsvc, name, args, b"", console, clients, audit) {
+		let started: StartResult = match run_tool_under_manifest(procsvc, name, args, b"", &[], console, clients, audit) {
 			Some(s) => s,
 			None => {
 				close(output);

@@ -9,12 +9,12 @@ image_root="$build_root/image/x86_64-unknown-none"
 expected="$(
 	cat <<'EOF'
 dynamic dmesg tools volume lsrt
-dynamic du tools volume lsrt storage-proto volume-client wire
-dynamic free tools volume lsrt
-dynamic lscpu tools volume lsrt wire
-dynamic lsirq tools volume lsrt wire
-dynamic lsmem tools volume lsrt wire
-dynamic lspci tools volume lsrt wire
+dynamic du tools volume base-proto lsrt storage-proto volume-client wire
+dynamic free tools volume base-proto lsrt
+dynamic lscpu tools volume base-proto lsrt wire
+dynamic lsirq tools volume base-proto lsrt wire
+dynamic lsmem tools volume base-proto lsrt wire
+dynamic lspci tools volume base-proto lsrt wire
 dynamic readln tools volume lsrt
 dynamic uname tools volume lsrt
 dynamic uptime tools volume lsrt

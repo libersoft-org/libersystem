@@ -528,6 +528,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	}
 	pipeline_request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
 	pipeline_request.extend_from_slice(b"vol://system");
+	pipeline_request.extend_from_slice(&0u16.to_le_bytes()); // an empty environment
 	pipeline_request.extend_from_slice(&0u32.to_le_bytes());
 	send_cap(&perm_client, &pipeline_request, pipeline_write_end, Rights::ALL)?;
 	sched::run_until_idle();
@@ -590,6 +591,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 		run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		run.extend_from_slice(value);
 	}
+	run.extend_from_slice(&0u16.to_le_bytes()); // an empty environment
 	run.extend_from_slice(&0u32.to_le_bytes());
 	let graphics_start = arch::tsc::now();
 	send_cap(&perm_client, &run, graphics_stdout, Rights::ALL)?;
@@ -617,6 +619,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 		view_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		view_run.extend_from_slice(value);
 	}
+	view_run.extend_from_slice(&0u16.to_le_bytes()); // an empty environment
 	view_run.extend_from_slice(&0u32.to_le_bytes());
 	send_cap(&perm_client, &view_run, view_stdout, Rights::ALL)?;
 	sched::run_until_idle();
@@ -746,6 +749,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 		mp3_run.extend_from_slice(&(value.len() as u16).to_le_bytes());
 		mp3_run.extend_from_slice(value);
 	}
+	mp3_run.extend_from_slice(&0u16.to_le_bytes()); // an empty environment
 	mp3_run.extend_from_slice(&0u32.to_le_bytes());
 	send_cap(&perm_client, &mp3_run, mp3_stdout, Rights::ALL)?;
 	sched::run_until_idle();

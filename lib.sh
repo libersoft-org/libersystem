@@ -79,6 +79,29 @@ ensure() {
 	"$@"
 }
 
+# The sources a built system volume reflects. Shared by build.sh, which records their digest, and
+# test.sh, which refuses to run a suite against a build that does not match it. Defined HERE
+# because both need it: keeping it in build.sh left test.sh computing a digest of nothing, which
+# matched no stamp and refused every run.
+VOLUME_SOURCES=(user fs wire abi proto idl tools/mkpackages)
+
+# A digest of every source file a build reads, so "has it changed" is answered by CONTENT.
+#
+# Modification times cannot answer it. `mkpackages` skips a write whose bytes are unchanged, so an
+# artifact can be older than a source it already reflects; and a `git checkout`, a commit hook or a
+# formatter touches a source without changing a byte of it. Both happened in one day, and both made
+# the suite refuse to run against a build that was already correct.
+#
+# Cheap enough to do on every check: a few thousand files hashed once, against test runs measured in
+# tens of minutes.
+source_digest() {
+	local dir
+	for dir in "$@"; do
+		[[ -d "$SRC_DIR/$dir" ]] || continue
+		find "$SRC_DIR/$dir" -name '*.rs' -o -name '*.toml' -o -name '*.lsidl' | sort
+	done | xargs -r sha256sum 2>/dev/null | sha256sum | cut -d" " -f1
+}
+
 # `--help` for every script, built from a here-doc the script supplies.
 usage_and_exit() {
 	cat

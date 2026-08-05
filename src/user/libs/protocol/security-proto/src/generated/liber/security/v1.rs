@@ -8,6 +8,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+use crate::generated::liber::base::v1::EnvVar;
 use crate::generated::liber::base::v1::Error;
 use crate::generated::liber::process::v1::StartResult as ProcessStartResult;
 
@@ -300,14 +301,14 @@ pub mod permission {
 	pub trait Service {
 		fn lookup(&mut self, component: String) -> Result<Manifest, Error>;
 		fn audit(&mut self) -> Vec<AuditEntry>;
-		fn run(&mut self, name: String, args: String, cwd: String, stdout: u64) -> Result<ProcessStartResult, Error>;
+		fn run(&mut self, name: String, args: String, cwd: String, environment: Vec<EnvVar>, stdout: u64) -> Result<ProcessStartResult, Error>;
 		/// Start a whole pipeline as ONE transaction: every stage is authorized against its own
 		/// manifest and created behind the start gate, the edges are allocated by the broker, and
 		/// the stages are released together. A failure at any stage starts none of them, because
 		/// a half-built pipeline is worse than none - a consumer whose producer never starts
 		/// blocks forever. `stdout` is the terminal end the LAST stage writes to; every earlier
 		/// stage writes into the edge the broker made for it.
-		fn run_pipeline(&mut self, stages: Vec<PipelineStage>, cwd: String, stdout: u64) -> Result<PipelineResult, Error>;
+		fn run_pipeline(&mut self, stages: Vec<PipelineStage>, cwd: String, environment: Vec<EnvVar>, stdout: u64) -> Result<PipelineResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -365,6 +366,14 @@ pub mod permission {
 				let name = r.string_lp()?;
 				let args = r.string_lp()?;
 				let cwd = r.string_lp()?;
+				let environment = {
+					let v8 = r.u16()? as usize;
+					let mut v9 = Vec::new();
+					for _ in 0..v8 {
+						v9.push(EnvVar::read(r)?);
+					}
+					v9
+				};
 				let stdout = {
 					let _ = r.u32()?;
 					r.take_handle()?
@@ -373,18 +382,18 @@ pub mod permission {
 					return None;
 				}
 				request_handles.clear();
-				let result = service.run(name, args, cwd, stdout);
+				let result = service.run(name, args, cwd, environment, stdout);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v8) => {
+						Ok(v10) => {
 							w.u8(1)?;
-							v8.write(w)?;
+							v10.write(w)?;
 						}
-						Err(v9) => {
+						Err(v11) => {
 							w.u8(0)?;
-							v9.write(w)?;
+							v11.write(w)?;
 						}
 					}
 					Some(())
@@ -405,14 +414,22 @@ pub mod permission {
 			}
 			OP_RUN_PIPELINE => {
 				let stages = {
-					let v10 = r.u16()? as usize;
-					let mut v11 = Vec::new();
-					for _ in 0..v10 {
-						v11.push(PipelineStage::read(r)?);
+					let v12 = r.u16()? as usize;
+					let mut v13 = Vec::new();
+					for _ in 0..v12 {
+						v13.push(PipelineStage::read(r)?);
 					}
-					v11
+					v13
 				};
 				let cwd = r.string_lp()?;
+				let environment = {
+					let v14 = r.u16()? as usize;
+					let mut v15 = Vec::new();
+					for _ in 0..v14 {
+						v15.push(EnvVar::read(r)?);
+					}
+					v15
+				};
 				let stdout = {
 					let _ = r.u32()?;
 					r.take_handle()?
@@ -421,18 +438,18 @@ pub mod permission {
 					return None;
 				}
 				request_handles.clear();
-				let result = service.run_pipeline(stages, cwd, stdout);
+				let result = service.run_pipeline(stages, cwd, environment, stdout);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v12) => {
+						Ok(v16) => {
 							w.u8(1)?;
-							v12.write(w)?;
+							v16.write(w)?;
 						}
-						Err(v13) => {
+						Err(v17) => {
 							w.u8(0)?;
-							v13.write(w)?;
+							v17.write(w)?;
 						}
 					}
 					Some(())
@@ -580,7 +597,7 @@ pub mod permission {
 			}
 			Some(reply_handles.first())
 		}
-		pub fn run(&mut self, name: &str, args: &str, cwd: &str, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
+		pub fn run(&mut self, name: &str, args: &str, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -589,6 +606,13 @@ pub mod permission {
 			w.bytes_lp(name.as_bytes())?;
 			w.bytes_lp(args.as_bytes())?;
 			w.bytes_lp(cwd.as_bytes())?;
+			if environment.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(environment.len() as u16)?;
+			for v18 in environment.iter() {
+				v18.write(w)?;
+			}
 			w.set_handle(*stdout)?;
 			w.u32(0)?;
 			let request_handles = Handles::from_slice(writer.handles());
@@ -609,7 +633,7 @@ pub mod permission {
 			}
 			decoded
 		}
-		pub fn run_pipeline(&mut self, stages: &Vec<PipelineStage>, cwd: &str, stdout: &u64) -> Option<Result<PipelineResult, Error>> {
+		pub fn run_pipeline(&mut self, stages: &Vec<PipelineStage>, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<PipelineResult, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -619,10 +643,17 @@ pub mod permission {
 				return None;
 			}
 			w.u16(stages.len() as u16)?;
-			for v14 in stages.iter() {
-				v14.write(w)?;
+			for v19 in stages.iter() {
+				v19.write(w)?;
 			}
 			w.bytes_lp(cwd.as_bytes())?;
+			if environment.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(environment.len() as u16)?;
+			for v20 in environment.iter() {
+				v20.write(w)?;
+			}
 			w.set_handle(*stdout)?;
 			w.u32(0)?;
 			let request_handles = Handles::from_slice(writer.handles());
@@ -664,17 +695,17 @@ pub mod permission {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_run")]
-	fn channel_invoke_run(chan: u64, name: &str, args: &str, cwd: &str, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
+	fn channel_invoke_run(chan: u64, name: &str, args: &str, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
-		client.run(name, args, cwd, stdout)
+		client.run(name, args, cwd, environment, stdout)
 	}
 
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_run_pipeline")]
-	fn channel_invoke_run_pipeline(chan: u64, stages: &Vec<PipelineStage>, cwd: &str, stdout: &u64) -> Option<Result<PipelineResult, Error>> {
+	fn channel_invoke_run_pipeline(chan: u64, stages: &Vec<PipelineStage>, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<PipelineResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
-		client.run_pipeline(stages, cwd, stdout)
+		client.run_pipeline(stages, cwd, environment, stdout)
 	}
 }
 
@@ -788,25 +819,25 @@ impl Manifest {
 		out.push(',');
 		out.push_str("\"requested\":");
 		out.push('[');
-		let mut v16 = true;
-		for v15 in self.requested.iter() {
-			if !v16 {
+		let mut v22 = true;
+		for v21 in self.requested.iter() {
+			if !v22 {
 				out.push(',');
 			}
-			v16 = false;
-			v15.to_json_into(out);
+			v22 = false;
+			v21.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"grants\":");
 		out.push('[');
-		let mut v18 = true;
-		for v17 in self.grants.iter() {
-			if !v18 {
+		let mut v24 = true;
+		for v23 in self.grants.iter() {
+			if !v24 {
 				out.push(',');
 			}
-			v18 = false;
-			v17.to_json_into(out);
+			v24 = false;
+			v23.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -818,25 +849,25 @@ impl Manifest {
 		out.push_str(", ");
 		out.push_str("requested=");
 		out.push('[');
-		let mut v20 = true;
-		for v19 in self.requested.iter() {
-			if !v20 {
+		let mut v26 = true;
+		for v25 in self.requested.iter() {
+			if !v26 {
 				out.push_str(", ");
 			}
-			v20 = false;
-			v19.to_text_into(out);
+			v26 = false;
+			v25.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("grants=");
 		out.push('[');
-		let mut v22 = true;
-		for v21 in self.grants.iter() {
-			if !v22 {
+		let mut v28 = true;
+		for v27 in self.grants.iter() {
+			if !v28 {
 				out.push_str(", ");
 			}
-			v22 = false;
-			v21.to_text_into(out);
+			v28 = false;
+			v27.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -847,13 +878,13 @@ impl Manifest {
 		crate::codec::cbor::text(out, &self.component);
 		crate::codec::cbor::text(out, "requested");
 		crate::codec::cbor::array(out, self.requested.len());
-		for v23 in self.requested.iter() {
-			v23.to_cbor_into(out);
+		for v29 in self.requested.iter() {
+			v29.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "grants");
 		crate::codec::cbor::array(out, self.grants.len());
-		for v24 in self.grants.iter() {
-			v24.to_cbor_into(out);
+		for v30 in self.grants.iter() {
+			v30.to_cbor_into(out);
 		}
 	}
 }

@@ -517,7 +517,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						if drill_perm != 0 {
 							if let (Some(pm), Some((output, console))) = (index_of(b"permission_manager"), channel()) {
 								let mut perm_drill = permission::Client::new(DrillTransport { perm: drill_perm, pm_ctrl: channels[pm], broker: &broker, state: &state });
-								match perm_drill.run("config", "system.name", "vol://system", &console) {
+								match perm_drill.run("config", "system.name", "vol://system", &alloc::vec::Vec::new(), &console) {
 									Some(Ok(started)) => {
 										// The tool prints in pieces (the value, then the newline)
 										// and exits, closing its stdout - collect to the close.

@@ -238,8 +238,13 @@ for arch in "${archs[@]}"; do
 	# architecture AND per part, so `--part loader` cannot vouch for a userspace it never touched -
 	# a single stamp listing this run's parts would erase the record of the build before it.
 	mkdir -p "$BUILD_DIR/state"
+	# Each part records the digest of the sources IT reads, so a loader-only edit does not
+	# invalidate a userspace that no byte of it touched, and vice versa.
 	for part in "${parts[@]}"; do
-		: >"$BUILD_DIR/state/built-$arch-$part"
+		case "$part" in
+		loader) printf '%s\n' "$(source_digest loader)" >"$BUILD_DIR/state/built-$arch-$part" ;;
+		*) printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$part" ;;
+		esac
 	done
 done
 

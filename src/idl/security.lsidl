@@ -2,7 +2,7 @@
 
 package liber:security@1;
 
-use liber:base@1.{error};
+use liber:base@1.{env-var, error};
 use liber:process@1.{start-result as process-start-result, task};
 
 /// The kinds of capability a component may be declared to receive: a connection to one
@@ -94,12 +94,12 @@ record pipeline-result {
 interface permission {
 	@op(1) lookup: func(component: string) -> result<manifest, error>;
 	@op(2) audit:  func() -> stream<audit-entry>;
-	@op(3) run:    func(name: string, args: string, cwd: string, stdout: handle<channel>) -> result<process-start-result, error>;
+	@op(3) run:    func(name: string, args: string, cwd: string, environment: list<env-var>, stdout: handle<channel>) -> result<process-start-result, error>;
 	/// Start a whole pipeline as ONE transaction: every stage is authorized against its own
 	/// manifest and created behind the start gate, the edges are allocated by the broker, and
 	/// the stages are released together. A failure at any stage starts none of them, because
 	/// a half-built pipeline is worse than none - a consumer whose producer never starts
 	/// blocks forever. `stdout` is the terminal end the LAST stage writes to; every earlier
 	/// stage writes into the edge the broker made for it.
-	@op(4) run-pipeline: func(stages: list<pipeline-stage>, cwd: string, stdout: handle<channel>) -> result<pipeline-result, error>;
+	@op(4) run-pipeline: func(stages: list<pipeline-stage>, cwd: string, environment: list<env-var>, stdout: handle<channel>) -> result<pipeline-result, error>;
 }

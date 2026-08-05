@@ -279,7 +279,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 					// streaming-read adapter and transactional writer. Refusing beats running
 					// the line with the part the user asked for silently dropped.
 					print(b"shell: redirection is not supported in a pipeline yet\n");
-				} else if !run_pipeline_line(&mut jobs, permsvc, &parsed, cwd.as_bytes()) {
+				} else if !run_pipeline_line(&mut jobs, permsvc, &parsed, cwd.as_bytes(), &vars) {
 					print(b"shell: pipeline could not be started\n");
 				}
 			} else {
@@ -807,45 +807,45 @@ unsafe fn print_help(cmd: Option<&[u8]>) {
 	}
 }
 
-unsafe fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8]) -> bool {
+unsafe fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8], vars: &[(String, String)]) -> bool {
 	unsafe {
 		for &(name, shape) in TOOLS {
 			match shape {
 				Shape::Bare => {
 					if line == name {
-						run_tool(permsvc, name, b"", cwd);
+						run_tool(permsvc, name, b"", cwd, vars);
 						return true;
 					}
 				}
 				Shape::Json => {
 					if line == name {
-						run_tool(permsvc, name, b"", cwd);
+						run_tool(permsvc, name, b"", cwd, vars);
 						return true;
 					}
 					if let Some(args) = json_subform(line, name) {
-						run_tool(permsvc, name, args, cwd);
+						run_tool(permsvc, name, args, cwd, vars);
 						return true;
 					}
 				}
 				Shape::Rest => {
 					if line == name {
-						run_tool(permsvc, name, b"", cwd);
+						run_tool(permsvc, name, b"", cwd, vars);
 						return true;
 					}
 					if let Some(rest) = strip_word(line, name) {
-						run_tool(permsvc, name, trim(rest), cwd);
+						run_tool(permsvc, name, trim(rest), cwd, vars);
 						return true;
 					}
 				}
 				Shape::Args => {
 					if let Some(rest) = strip_word(line, name) {
-						run_tool(permsvc, name, trim(rest), cwd);
+						run_tool(permsvc, name, trim(rest), cwd, vars);
 						return true;
 					}
 				}
 				Shape::InteractiveArgs => {
 					if let Some(rest) = strip_word(line, name) {
-						run_tool_interactive(jobs, permsvc, name, trim(rest), cwd);
+						run_tool_interactive(jobs, permsvc, name, trim(rest), cwd, vars);
 						return true;
 					}
 				}
@@ -858,16 +858,16 @@ unsafe fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8]) 
 // Route a line to a net tool from `NET_TOOLS`, returning whether it matched one. Each is
 // spawned over a fresh NetworkService client, foreground or (with a trailing `&`, the
 // caller's `bg`) background; the arg-taking forms pass the rest of the line through.
-unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, cwd: &[u8], bg: bool) -> bool {
+unsafe fn dispatch_net(line: &[u8], jobs: &mut Jobs, netsvc: u64, procsvc: u64, cwd: &[u8], vars: &[(String, String)], bg: bool) -> bool {
 	unsafe {
 		for &(word, tool, takes_args) in NET_TOOLS {
 			if takes_args {
 				if let Some(rest) = strip_word(line, word) {
-					spawn_net_tool(jobs, netsvc, procsvc, tool, trim(rest), cwd, bg);
+					spawn_net_tool(jobs, netsvc, procsvc, tool, trim(rest), cwd, vars, bg);
 					return true;
 				}
 			} else if line == word {
-				spawn_net_tool(jobs, netsvc, procsvc, tool, b"", cwd, bg);
+				spawn_net_tool(jobs, netsvc, procsvc, tool, b"", cwd, vars, bg);
 				return true;
 			}
 		}
@@ -1058,11 +1058,11 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			// launches through the interactive path: the same governed PermissionManager
 			// launch, but handed a full-duplex dup of this console instead of a relay, and
 			// set as the tty's foreground job.
-			run_tool_interactive(jobs, permsvc, b"ps", b"-i", cwd.as_bytes());
+			run_tool_interactive(jobs, permsvc, b"ps", b"-i", cwd.as_bytes(), vars);
 			return false;
 		}
 		if line == b"free -h" {
-			run_tool(permsvc, b"free", b"-h", cwd.as_bytes());
+			run_tool(permsvc, b"free", b"-h", cwd.as_bytes(), vars);
 			return false;
 		}
 		if line == b"mouse" {
@@ -1071,25 +1071,25 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 		}
 		// the network views: a table of net tools spawned over a fresh NetworkService client
 		// (`httpd` is separate - it always backgrounds).
-		if dispatch_net(line, jobs, netsvc, procsvc, cwd.as_bytes(), bg) {
+		if dispatch_net(line, jobs, netsvc, procsvc, cwd.as_bytes(), vars, bg) {
 			return false;
 		}
 		if line == b"httpd" {
-			spawn_net_tool(jobs, netsvc, procsvc, b"httpd", b"", cwd.as_bytes(), true);
+			spawn_net_tool(jobs, netsvc, procsvc, b"httpd", b"", cwd.as_bytes(), vars, true);
 			return false;
 		}
 		if line == b"echo" {
-			exec(jobs, procsvc, b"echo", b"", cwd.as_bytes(), 0, bg);
+			exec(jobs, procsvc, b"echo", b"", cwd.as_bytes(), vars, 0, bg);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"echo ") {
-			exec(jobs, procsvc, b"echo", trim(rest), cwd.as_bytes(), 0, bg);
+			exec(jobs, procsvc, b"echo", trim(rest), cwd.as_bytes(), vars, 0, bg);
 			return false;
 		}
 		if line == b"readln" {
 			// readln reads its stdin and echoes each line - the interactive counterpart to
 			// echo, proving a foreground tool reads keyboard input, not just prints.
-			exec(jobs, procsvc, b"readln", b"", cwd.as_bytes(), 0, bg);
+			exec(jobs, procsvc, b"readln", b"", cwd.as_bytes(), vars, 0, bg);
 			return false;
 		}
 		if line == b"cd" {
@@ -1109,7 +1109,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			// Launch `snap` as its own sandboxed ELF through PermissionManager (the launcher /
 			// granter), which grants it a storage client and forwards this terminal and the
 			// snapshot sub-form.
-			run_tool(permsvc, b"snap", b"list", cwd.as_bytes());
+			run_tool(permsvc, b"snap", b"list", cwd.as_bytes(), vars);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"snap create ") {
@@ -1117,7 +1117,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
 			arg.extend_from_slice(b"create ");
 			arg.extend_from_slice(name);
-			run_tool(permsvc, b"snap", &arg, cwd.as_bytes());
+			run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"snap delete ") {
@@ -1125,7 +1125,7 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			let mut arg: Vec<u8> = Vec::with_capacity(7 + name.len());
 			arg.extend_from_slice(b"delete ");
 			arg.extend_from_slice(name);
-			run_tool(permsvc, b"snap", &arg, cwd.as_bytes());
+			run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"snap cat ") {
@@ -1133,31 +1133,31 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 			let mut arg: Vec<u8> = Vec::with_capacity(4 + rest.len());
 			arg.extend_from_slice(b"cat ");
 			arg.extend_from_slice(rest);
-			run_tool(permsvc, b"snap", &arg, cwd.as_bytes());
+			run_tool(permsvc, b"snap", &arg, cwd.as_bytes(), vars);
 			return false;
 		}
 		if line == b"volume" || line == b"volume status" {
 			// Launch `volume` as its own sandboxed ELF through PermissionManager: the
 			// filesystem's identity and health (label, size, free, compression, mount mode).
-			run_tool(permsvc, b"volume", b"status", cwd.as_bytes());
+			run_tool(permsvc, b"volume", b"status", cwd.as_bytes(), vars);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"volume ") {
 			// the other volume verbs (compress on|off, fsck, restore <uri> [snapshot])
 			// pass through whole; the tool validates the sub-form.
-			run_tool(permsvc, b"volume", trim(rest), cwd.as_bytes());
+			run_tool(permsvc, b"volume", trim(rest), cwd.as_bytes(), vars);
 			return false;
 		}
 		if line == b"script" {
-			run_script(jobs, procsvc, b"", cwd.as_bytes());
+			run_script(jobs, procsvc, b"", cwd.as_bytes(), vars);
 			return false;
 		}
 		if let Some(rest) = line.strip_prefix(b"script ") {
-			run_script(jobs, procsvc, trim(rest), cwd.as_bytes());
+			run_script(jobs, procsvc, trim(rest), cwd.as_bytes(), vars);
 			return false;
 		}
 		// everything else is a governed tool: match it against the tool table.
-		if dispatch_tool(line, jobs, permsvc, cwd.as_bytes()) {
+		if dispatch_tool(line, jobs, permsvc, cwd.as_bytes(), vars) {
 			return false;
 		}
 		print(b"\x1b[31munknown command: ");
@@ -1177,7 +1177,17 @@ unsafe fn dispatch(line: &[u8], storage: u64, media: u64, iso: u64, udf: u64, us
 // via SYS_DEBUG_WRITE); the shell waits on the Process handle, which the kernel readies
 // once the process terminates - so no completion channel or zombie-lag handling is needed.
 // This is the foreground exec primitive the net tools build on.
-unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], cap: u64, bg: bool) {
+// The session's variable table as a launch context carries it: a snapshot, taken now.
+//
+// The shell holds the session capability and the child never does, which is the point - a program
+// inherits the VALUES and no means to change what its parent or its session will see. `PATH`
+// reaches `which` this way. PermissionManager checks the table before it hands any of it on, so
+// what this builds is a proposal, not a decision.
+fn environment_snapshot(vars: &[(String, String)]) -> Vec<EnvVar> {
+	vars.iter().map(|(name, value): &(String, String)| EnvVar { name: name.clone(), value: value.clone() }).collect()
+}
+
+unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)], cap: u64, bg: bool) {
 	unsafe {
 		let name_str: &str = match core::str::from_utf8(name) {
 			Ok(s) => s,
@@ -1219,7 +1229,7 @@ unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u
 		// with the optional inherited capability riding the same message so the child receives
 		// both or neither. The arguments used to be the message; the working directory reached a
 		// child only through PermissionManager, so a shell-spawned tool had none.
-		let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: Vec::new() };
+		let context = LaunchContext { arguments: String::from_utf8_lossy(args).into_owned(), cwd: String::from_utf8_lossy(cwd).into_owned(), environment: environment_snapshot(vars) };
 		match context.encode_vec() {
 			Some(bytes) if bytes.len() <= rt::LAUNCH_CONTEXT_MAX => {
 				send_blocking(parent, &bytes, cap);
@@ -1285,7 +1295,7 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 // the tool alongside its arguments. Each tool talks to NetworkService over its own
 // channel rather than sharing the shell's (a shared channel would race), and the
 // shell keeps its own `netsvc`.
-unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], bg: bool) {
+unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)], bg: bool) {
 	unsafe {
 		if netsvc == 0 {
 			print(name);
@@ -1301,7 +1311,7 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8]
 				return;
 			}
 		};
-		exec(jobs, procsvc, name, args, cwd, tool_netsvc, bg);
+		exec(jobs, procsvc, name, args, cwd, vars, tool_netsvc, bg);
 	}
 }
 
@@ -1319,7 +1329,7 @@ unsafe fn spawn_net_tool(jobs: &mut Jobs, netsvc: u64, procsvc: u64, name: &[u8]
 // PermissionManager (the launcher / granter), never the raw process loader, so each command
 // runs with exactly its manifest's capabilities. Foreground only for now (no
 // background / job control).
-unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
+unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)]) -> bool {
 	unsafe {
 		let name_str: &str = match core::str::from_utf8(name) {
 			Ok(s) => s,
@@ -1341,7 +1351,7 @@ unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
 		// channel. On the request that end is transferred away (to PermissionManager and on to
 		// the command), so we keep only the read end and never close the write end ourselves.
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		let task: u64 = match client.run(name_str, args_str, cwd_str, &out_write) {
+		let task: u64 = match client.run(name_str, args_str, cwd_str, &environment_snapshot(vars), &out_write) {
 			Some(Ok(started)) => started.task,
 			_ => {
 				close(out_read);
@@ -1374,7 +1384,7 @@ unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
 //
 // Returns false when the broker refuses the pipeline, in which case NO stage was started: the
 // transaction releases nothing until every stage exists and is wired.
-unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, pipeline: &Pipeline, cwd: &[u8]) -> bool {
+unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, pipeline: &Pipeline, cwd: &[u8], vars: &[(String, String)]) -> bool {
 	unsafe {
 		let cwd_str: &str = match core::str::from_utf8(cwd) {
 			Ok(s) => s,
@@ -1407,7 +1417,7 @@ unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, pipeline: &Pipeline, 
 			None => return false,
 		};
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		let group: u64 = match client.run_pipeline(&stages, cwd_str, &out_write) {
+		let group: u64 = match client.run_pipeline(&stages, cwd_str, &environment_snapshot(vars), &out_write) {
 			Some(Ok(result)) => result.group,
 			_ => {
 				close(out_read);
@@ -1454,7 +1464,7 @@ unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, pipeline: &Pipeline, 
 // needs to flip the tty raw and redraw in place. The shell parks until the command
 // exits (or hands it to the session on a Ctrl+Z suspend), exactly like an exec'd
 // foreground job. Returns false if the command could not be launched.
-unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8]) -> bool {
+unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(String, String)]) -> bool {
 	unsafe {
 		let name_str: &str = match core::str::from_utf8(name) {
 			Ok(s) => s,
@@ -1477,7 +1487,7 @@ unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args:
 			return false;
 		}
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		let task: u64 = match client.run(name_str, args_str, cwd_str, &(dup as u64)) {
+		let task: u64 = match client.run(name_str, args_str, cwd_str, &environment_snapshot(vars), &(dup as u64)) {
 			Some(Ok(started)) => started.task,
 			Some(Err(_)) | None => return false,
 		};
@@ -1491,7 +1501,7 @@ unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args:
 // pty's shell with `cmd` and prints the captured session. This is the foreground side of
 // the PTY abstraction - a program (script) hosting a terminal it is not the hardware
 // console for (the same path a future ssh drives).
-unsafe fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8], cwd: &[u8]) {
+unsafe fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8], cwd: &[u8], vars: &[(String, String)]) {
 	unsafe {
 		// `PTY_OPEN` + the program to host (a shell); the console replies `PTY` + the master.
 		let mut req: [u8; 13] = [0u8; 13];
@@ -1506,7 +1516,7 @@ unsafe fn run_script(jobs: &mut Jobs, procsvc: u64, cmd: &[u8], cwd: &[u8]) {
 				return;
 			}
 		};
-		exec(jobs, procsvc, b"script", cmd, cwd, master, false);
+		exec(jobs, procsvc, b"script", cmd, cwd, vars, master, false);
 	}
 }
 
