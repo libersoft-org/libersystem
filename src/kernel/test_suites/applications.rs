@@ -463,6 +463,22 @@ fn the_memory_volumes_bound_expensive_streams() {
 	let (_volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
 
+	// An ordinary write LARGER than the streaming ceiling reaches the disk.
+	//
+	// A 16 MiB default was once returned for every backend that did not answer for a path, so a
+	// write bigger than that was refused for a limit invented on behalf of streaming - by a volume
+	// with room for it. The backend answers for itself now, and only a STREAM is bounded, because
+	// there the service holds the bytes before the filesystem sees them.
+	//
+	// Affordable because the volume is EMPTY: formatting costs a B-tree walk per file, not per
+	// megabyte, so a 32 MiB volume with nothing in it is as cheap to build as a small one.
+	{
+		let mut big = StorageHarness::start_empty(storage_elf, 32 * 1024 * 1024);
+		let payload = alloc::vec![b'w'; 17 * 1024 * 1024];
+		assert!(big.write(b"vol://system/large", &payload, 0x7b01), "a 17 MiB write is not refused for a 16 MiB limit that belongs to nothing");
+		assert_eq!(big.open(b"vol://system/large", 0x7b02).map(|bytes| bytes.len()), Some(payload.len()), "and it reads back whole");
+	}
+
 	// A listing nobody reads must not stop the service either.
 	//
 	// Past the channel's 64-message queue the send blocks, and an unbounded one held StorageService

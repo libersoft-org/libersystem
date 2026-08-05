@@ -718,3 +718,29 @@ fn a_client_reads_the_identity_back_over_a_transport() {
 	// correlation id each time must not change what comes back.
 	assert_eq!(client.protocol_info(), Some((String::from("liber:log"), 1)));
 }
+
+#[test]
+fn a_listing_frame_that_will_not_decode_is_refused_rather_than_read_as_an_entry() {
+	// The decoder half of "a short listing must not look complete".
+	//
+	// A frame the reader cannot decode used to be dropped from the listing and the stream still
+	// ended cleanly, so a directory came back silently missing a name - a truncation one entry at
+	// a time, invisible because the reader ignores the sequence number and cannot see the gap. The
+	// producer now ends the listing instead, and this is the half that says the reader agrees:
+	// a damaged frame is `None`, not a guess.
+	let mut handle: u64 = 0;
+
+	// Truncated after the sequence number, with no record behind it.
+	assert!(volume::list_read(&[1, 0, 0, 0], &mut handle).is_none(), "a frame with a sequence and nothing else is not an entry");
+
+	// Empty: the terminal marker, which is not an entry either and must not decode as one.
+	assert!(volume::list_read(&[], &mut handle).is_none(), "the terminal frame is not an entry");
+
+	// A length prefix that promises more than the frame carries.
+	assert!(volume::list_read(&[1, 0, 0, 0, 0xff, 0xff], &mut handle).is_none(), "a name longer than the frame is refused");
+
+	// A positive case belongs here and is missing on purpose: `FileInfo` and `FileType` are not
+	// visible from this module, so a well-formed frame cannot be constructed to prove the reader
+	// accepts one. The service-side tests cover that - every listing in the kernel suite decodes
+	// real entries - so what is left for here is the refusals above.
+}

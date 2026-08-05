@@ -2282,6 +2282,12 @@ impl StorageHarness {
 	// Separate from `start` because that one lays an image verbatim, and the media fixtures it
 	// serves (FAT, ISO, UDF) are images already - reinterpreting them as archives to rebuild would
 	// be nonsense, which is exactly what happened when the two shared one function.
+	// A disk-backed harness over an empty volume of `bytes`, for the cases that need free space
+	// rather than contents.
+	fn start_empty(storage_elf: &[u8], bytes: usize) -> Self {
+		Self::start_disk(storage_elf, b"BLOCK", Self::build_empty_fixture(bytes), bytes as u64)
+	}
+
 	fn start_system(storage_elf: &[u8], tag: &[u8], archive: &[u8], capacity: u64) -> Self {
 		// Formatted ONCE and cloned per harness. Building it per test made the aarch64 suite
 		// exceed its watchdog: laying out a LiberFS volume is a B-tree walk and a transaction log
@@ -2297,6 +2303,28 @@ impl StorageHarness {
 	}
 
 	// Format a LiberFS volume carrying the scenario archive's files, as a sector map.
+	// An EMPTY volume of a given size, formatted once per size and cached.
+	//
+	// The note on `start_system` says formatting is expensive, and it is - but per FILE: a B-tree
+	// walk and a transaction log each. An empty volume is a superblock and allocator metadata
+	// whatever its size, which is what makes a large one affordable and lets a write bigger than
+	// the old invented 16 MiB ceiling be tested at all.
+	fn build_empty_fixture(bytes: usize) -> alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> {
+		const BLOCK: usize = liberfs::BLOCK_SIZE;
+		static EMPTY: crate::sync::SpinLock<Option<(usize, alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>)>> = crate::sync::SpinLock::new(None);
+		if let Some((size, sectors)) = EMPTY.lock().as_ref() {
+			if *size == bytes {
+				return sectors.clone();
+			}
+		}
+		let opts = liberfs::FormatOpts { uuid: *b"libersystem-emp\0", label: b"system".to_vec(), compress: false };
+		let disk = FixtureDisk { sectors: alloc::collections::BTreeMap::new() };
+		let fs = liberfs::LiberFs::format_opts(disk, (bytes / BLOCK) as u64, opts).expect("format the empty fixture");
+		let sectors = fs.into_device().sectors;
+		*EMPTY.lock() = Some((bytes, sectors.clone()));
+		sectors
+	}
+
 	// A minimal LiberFS volume: two small files, formatted once and cached like the big one.
 	fn build_tiny_fixture() -> alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> {
 		const BLOCK: usize = liberfs::BLOCK_SIZE;
