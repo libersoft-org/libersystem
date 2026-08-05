@@ -211,6 +211,7 @@ fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	let (echo_boot, echo_process) = launch_volume_program(&mut storage, &process_client, "echo", 0xd320);
 	let (echo_stdout, echo_stdout_child) = Channel::create();
 	send_cap(&echo_boot, b"STDOUT", echo_stdout_child, Rights::ALL).expect("echo stdout bootstrap");
+	echo_boot.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	echo_boot.send(Message::new(crate::tests::launch_context(b"fresh volume command", b""), alloc::vec::Vec::new(), 0)).expect("echo argument bootstrap");
 	assert_eq!(&wait_message(&mut storage, &echo_stdout, "echo did not print its command result").bytes[..], b"fresh volume command", "a tool launches from bin through ProcessService");
 	assert_eq!(&wait_message(&mut storage, &echo_stdout, "echo did not print its newline").bytes[..], b"\n");

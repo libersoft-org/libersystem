@@ -46,11 +46,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn stop_service(admin: u64, name: &[u8]) {
 	unsafe {
 		if name.is_empty() {
-			print(b"stop: usage: stop <service>\n");
+			eprint(b"stop: usage: stop <service>\n");
 			return;
 		}
 		if !send_blocking(admin, name, 0) {
-			print(b"stop: request failed\n");
+			eprint(b"stop: request failed\n");
 			return;
 		}
 		let mut rbuf: [u8; 512] = [0u8; 512];
@@ -61,13 +61,13 @@ unsafe fn stop_service(admin: u64, name: &[u8]) {
 					print(&rbuf[8..len]);
 					print(b"\n");
 				} else if len >= 8 && &rbuf[..8] == b"NOTFOUND" {
-					print(b"stop: no such running service\n");
+					eprint(b"stop: no such running service\n");
 				} else {
 					print(&rbuf[..len]);
 					print(b"\n");
 				}
 			}
-			Received::Closed => print(b"stop: supervisor gone\n"),
+			Received::Closed => eprint(b"stop: supervisor gone\n"),
 		}
 	}
 }

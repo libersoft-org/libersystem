@@ -47,7 +47,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				match core::str::from_utf8(&r[..end]).ok().and_then(|n| n.parse::<u32>().ok()) {
 					Some(n) => (Some(n), r.get(end + 1..).unwrap_or(b"")),
 					None => {
-						print(b"log: usage: log --boot <n> [json]\n");
+						eprint(b"log: usage: log --boot <n> [json]\n");
 						exit();
 					}
 				}
@@ -102,8 +102,8 @@ unsafe fn query_log(logsvc: u64, timesvc: u64, boot: Option<u32>, mode: Option<J
 					}
 				}
 			}
-			Some(Err(_)) => print(b"log: query error\n"),
-			None => print(b"log: service unavailable\n"),
+			Some(Err(_)) => eprint(b"log: query error\n"),
+			None => eprint(b"log: service unavailable\n"),
 		}
 	}
 }
@@ -122,7 +122,7 @@ unsafe fn tail_log(logsvc: u64, timesvc: u64, mode: Option<JsonMode>) {
 		let consumer: u64 = match client.tail(&q) {
 			Some(h) => h,
 			None => {
-				print(b"log: service unavailable\n");
+				eprint(b"log: service unavailable\n");
 				return;
 			}
 		};

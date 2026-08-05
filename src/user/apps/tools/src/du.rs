@@ -98,7 +98,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let uri: String = match path::resolve(cwd_str, &arg) {
 			Some(u) => u,
 			None => {
-				print(b"du: invalid path\n");
+				eprint(b"du: invalid path\n");
 				exit();
 			}
 		};
@@ -118,7 +118,7 @@ unsafe fn du(storage: u64, uri: String, summary_only: bool, human: bool, mode: O
 		let total: u64 = match total {
 			Some(t) => t,
 			None => {
-				print(b"du: cannot read the path\n");
+				eprint(b"du: cannot read the path\n");
 				return;
 			}
 		};

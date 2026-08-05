@@ -53,7 +53,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			out.push('\n');
 		}
 		if index == 0 {
-			print(b"lspci: query error\n");
+			eprint(b"lspci: query error\n");
 		} else {
 			print(out.as_bytes());
 		}

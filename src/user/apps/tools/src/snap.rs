@@ -62,7 +62,7 @@ unsafe fn snap(storage: u64, args: &[u8]) {
 				}
 				None => print(b"usage: snap cat <name> <vol://...>\n"),
 			},
-			_ => print(b"snap: unknown subcommand\n"),
+			_ => eprint(b"snap: unknown subcommand\n"),
 		}
 	}
 }
@@ -74,7 +74,7 @@ unsafe fn snap_list(storage: u64) {
 		let snaps = match client.snap_list() {
 			Some(Ok(s)) => s,
 			_ => {
-				print(b"snap: StorageService unavailable\n");
+				eprint(b"snap: StorageService unavailable\n");
 				return;
 			}
 		};

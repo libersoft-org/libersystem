@@ -65,8 +65,8 @@ unsafe fn query_bus(ussvc: u64, mode: Option<JsonMode>) {
 					}
 				}
 			}
-			Some(Err(_)) => print(b"lsusb: query error\n"),
-			None => print(b"lsusb: service unavailable\n"),
+			Some(Err(_)) => eprint(b"lsusb: query error\n"),
+			None => eprint(b"lsusb: service unavailable\n"),
 		}
 	}
 }

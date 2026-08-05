@@ -1500,6 +1500,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		assert_eq!(reply.bytes[4], 1, "dynamic play loaded with its providers");
 		let process = reply.caps[0].object().into_any_arc().downcast::<object::process::Process>().expect("play launch returns a Process");
 		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("play stdout bootstrap");
+		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 		bootstrap.send(Message::new(launch_context(argument, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("play argument bootstrap");
 		send_cap(&bootstrap, b"SYSTEM", storage, Rights::ALL).expect("play system volume bootstrap");
 		for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
@@ -3019,6 +3020,7 @@ fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, 
 	let (stdout, child_stdout) = Channel::create();
 	let process = spawn_dynamic_test_process(domain.clone(), imgconv_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgconv stdout");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	bootstrap.send(Message::new(launch_context(args, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgconv args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgconv system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgconv media volume");
@@ -3067,6 +3069,7 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 	let (stdout, child_stdout) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview help stdout");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	bootstrap.send(Message::new(crate::tests::launch_context(b"--help", b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgview help args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview help system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview help media volume");
@@ -3118,6 +3121,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	let (input, input_client) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview stdout");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	bootstrap.send(Message::new(launch_context(path, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgview args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview media volume");
@@ -3305,6 +3309,7 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	let (terminal, terminal_child) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), lico_elf, child);
 	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("lico terminal bootstrap");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	bootstrap.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new(), 0)).expect("lico empty arguments");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("lico system volume");
 	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {

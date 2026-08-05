@@ -58,8 +58,8 @@ unsafe fn list_config(cfgsvc: u64) {
 					print(b"\n");
 				}
 			}
-			Some(Err(_)) => print(b"config: query error\n"),
-			None => print(b"config: service unavailable\n"),
+			Some(Err(_)) => eprint(b"config: query error\n"),
+			None => eprint(b"config: service unavailable\n"),
 		}
 	}
 }
@@ -70,7 +70,7 @@ unsafe fn get_config(cfgsvc: u64, key: &[u8]) {
 		let key = match core::str::from_utf8(key) {
 			Ok(s) => s,
 			Err(_) => {
-				print(b"config: invalid key\n");
+				eprint(b"config: invalid key\n");
 				return;
 			}
 		};
@@ -81,11 +81,11 @@ unsafe fn get_config(cfgsvc: u64, key: &[u8]) {
 				print(b"\n");
 			}
 			Some(Err(_)) => {
-				print(b"config: no such key ");
+				eprint(b"config: no such key ");
 				print(key.as_bytes());
 				print(b"\n");
 			}
-			None => print(b"config: service unavailable\n"),
+			None => eprint(b"config: service unavailable\n"),
 		}
 	}
 }
@@ -97,14 +97,14 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 		let split: usize = match rest.iter().position(|&b| b == b' ') {
 			Some(i) if i > 0 && i + 1 < rest.len() => i,
 			_ => {
-				print(b"config: usage: config set <key> <value>\n");
+				eprint(b"config: usage: config set <key> <value>\n");
 				return;
 			}
 		};
 		let (key, value): (&str, &str) = match (core::str::from_utf8(&rest[..split]), core::str::from_utf8(&rest[split + 1..])) {
 			(Ok(k), Ok(v)) => (k, v),
 			_ => {
-				print(b"config: invalid key or value\n");
+				eprint(b"config: invalid key or value\n");
 				return;
 			}
 		};
@@ -115,8 +115,8 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 				print(entry.to_text().as_bytes());
 				print(b"\n");
 			}
-			Some(Err(_)) => print(b"config: set refused\n"),
-			None => print(b"config: service unavailable\n"),
+			Some(Err(_)) => eprint(b"config: set refused\n"),
+			None => eprint(b"config: service unavailable\n"),
 		}
 	}
 }

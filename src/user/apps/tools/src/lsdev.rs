@@ -66,8 +66,8 @@ unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 					}
 				}
 			}
-			Some(Err(_)) => print(b"lsdev: query error\n"),
-			None => print(b"lsdev: service unavailable\n"),
+			Some(Err(_)) => eprint(b"lsdev: query error\n"),
+			None => eprint(b"lsdev: service unavailable\n"),
 		}
 	}
 }

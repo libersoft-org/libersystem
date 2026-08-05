@@ -1286,7 +1286,11 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 		} else {
 			0
 		};
-		send_blocking(parent, b"STDOUT", dup);
+		// A named run, ended by READY. The shell hands over one endpoint - its console, which is
+		// full duplex, so the child reads and writes the same channel - and names it rather than
+		// relying on its position. What it does not send simply does not arrive.
+		send_blocking(parent, CAP_STDOUT, dup);
+		send_ready(parent);
 	}
 }
 

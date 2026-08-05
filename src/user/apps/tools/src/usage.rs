@@ -65,8 +65,8 @@ unsafe fn query_resource(ressvc: u64, mode: Option<JsonMode>) {
 					}
 				}
 			}
-			Some(Err(_)) => print(b"usage: query error\n"),
-			None => print(b"usage: service unavailable\n"),
+			Some(Err(_)) => eprint(b"usage: query error\n"),
+			None => eprint(b"usage: service unavailable\n"),
 		}
 	}
 }

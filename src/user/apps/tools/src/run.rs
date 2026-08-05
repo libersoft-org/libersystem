@@ -44,7 +44,7 @@ unsafe fn run_process(procsvc: u64, name: &[u8]) {
 		let name = match core::str::from_utf8(name) {
 			Ok(s) => s,
 			Err(_) => {
-				print(b"run: invalid name\n");
+				eprint(b"run: invalid name\n");
 				return;
 			}
 		};
@@ -56,11 +56,11 @@ unsafe fn run_process(procsvc: u64, name: &[u8]) {
 				print(b"\n");
 			}
 			Some(Err(_)) => {
-				print(b"run: could not start ");
+				eprint(b"run: could not start ");
 				print(name.as_bytes());
 				print(b"\n");
 			}
-			None => print(b"run: service unavailable\n"),
+			None => eprint(b"run: service unavailable\n"),
 		}
 	}
 }

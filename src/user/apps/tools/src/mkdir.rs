@@ -53,7 +53,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let uri: String = match path::resolve(cwd_str, &arg) {
 			Some(u) => u,
 			None => {
-				print(b"mkdir: invalid path\n");
+				eprint(b"mkdir: invalid path\n");
 				exit();
 			}
 		};
@@ -77,7 +77,7 @@ unsafe fn mkdir(storage: u64, uri: &[u8]) {
 				print(b"\n");
 			}
 			_ => {
-				print(b"mkdir: could not create ");
+				eprint(b"mkdir: could not create ");
 				print(uri);
 				print(b"\n");
 			}

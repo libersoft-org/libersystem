@@ -68,7 +68,7 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 		let sp: usize = match args.iter().position(|&b: &u8| b == b' ') {
 			Some(i) => i,
 			None => {
-				print(b"tcp: usage: tcp <ip> <port>\n");
+				eprint(b"tcp: usage: tcp <ip> <port>\n");
 				return;
 			}
 		};
@@ -76,14 +76,14 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 		let addr: Ipv4Addr = match Ipv4Addr::parse(host) {
 			Some(a) => a,
 			None => {
-				print(b"tcp: invalid address\n");
+				eprint(b"tcp: invalid address\n");
 				return;
 			}
 		};
 		let port: u16 = match parse_port(trim(&args[sp + 1..])) {
 			Some(p) => p,
 			None => {
-				print(b"tcp: invalid port\n");
+				eprint(b"tcp: invalid port\n");
 				return;
 			}
 		};
@@ -93,19 +93,19 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 		let sockh: u64 = match net.connect(&ep) {
 			Some(Ok(h)) => h,
 			Some(Err(Error::NotFound)) => {
-				print(b"tcp: unreachable (no route)\n");
+				eprint(b"tcp: unreachable (no route)\n");
 				return;
 			}
 			Some(Err(Error::Denied)) => {
-				print(b"tcp: connection refused\n");
+				eprint(b"tcp: connection refused\n");
 				return;
 			}
 			Some(Err(_)) => {
-				print(b"tcp: connection timed out\n");
+				eprint(b"tcp: connection timed out\n");
 				return;
 			}
 			None => {
-				print(b"tcp: service unavailable\n");
+				eprint(b"tcp: service unavailable\n");
 				return;
 			}
 		};
@@ -120,7 +120,7 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 		let probe: Buffer = match make_buffer(b"GET / HTTP/1.0\r\n\r\n") {
 			Some(b) => b,
 			None => {
-				print(b"tcp: out of memory\n");
+				eprint(b"tcp: out of memory\n");
 				let _ = sock.close();
 				close(sockh);
 				return;
@@ -146,7 +146,7 @@ unsafe fn connect(netsvc: u64, args: &[u8]) {
 			}
 			print(b"\n");
 		} else {
-			print(b"tcp: send failed\n");
+			eprint(b"tcp: send failed\n");
 		}
 		let _ = sock.close();
 		close(sockh);

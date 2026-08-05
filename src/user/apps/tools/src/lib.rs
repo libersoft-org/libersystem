@@ -15,9 +15,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lico::TerminalWriter;
-use proto::codec::JsonMode;
-use proto::system::{FileInfo, LaunchContext, OpenOpts, volume};
-use rt::{Received, ReceivedVec, close, exit, map_object, recv_blocking, recv_launch_bytes, recv_tagged, recv_vec_blocking, send_blocking, unmap_object};
+use proto::system::{FileInfo, OpenOpts, volume};
+use rt::{ReceivedVec, close, map_object, recv_tagged, recv_vec_blocking, send_blocking, unmap_object};
 use storage_proto::path;
 use volume_client::VolumeClient;
 
@@ -259,19 +258,5 @@ pub fn push_decimal(out: &mut String, value: u64) {
 	}
 	for i in 0..n {
 		out.push(digits[n - 1 - i] as char);
-	}
-}
-
-// Receive a tool's argument string (the first bootstrap message) and parse the JSON
-// mode it selects: `Some` for `json` / `json-min`, `None` for the default text form.
-// The peer closing before the argument arrives means the launcher gave up, so the tool
-// exits - the same handshake every `--json`-capable tool performs.
-//
-// # Safety
-// `bootstrap` must be the tool's live bootstrap channel handle.
-pub unsafe fn recv_json_mode(bootstrap: u64) -> Option<JsonMode> {
-	match unsafe { recv_launch_bytes(bootstrap) }.as_deref().and_then(LaunchContext::decode) {
-		Some(context) => JsonMode::parse(context.arguments.as_bytes()),
-		None => exit(),
 	}
 }

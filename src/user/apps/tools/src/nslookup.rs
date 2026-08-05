@@ -41,13 +41,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn resolve(netsvc: u64, name: &[u8]) {
 	unsafe {
 		if name.is_empty() || name.len() > 120 {
-			print(b"nslookup: invalid name\n");
+			eprint(b"nslookup: invalid name\n");
 			return;
 		}
 		let name_str: &str = match core::str::from_utf8(name) {
 			Ok(s) => s,
 			Err(_) => {
-				print(b"nslookup: invalid name\n");
+				eprint(b"nslookup: invalid name\n");
 				return;
 			}
 		};
@@ -62,11 +62,11 @@ unsafe fn resolve(netsvc: u64, name: &[u8]) {
 				print(b"\n");
 			}
 			Some(Err(_)) => {
-				print(b"nslookup: could not resolve ");
+				eprint(b"nslookup: could not resolve ");
 				print(name);
 				print(b"\n");
 			}
-			None => print(b"nslookup: network service gone\n"),
+			None => eprint(b"nslookup: network service gone\n"),
 		}
 	}
 }

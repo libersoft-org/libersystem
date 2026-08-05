@@ -371,6 +371,32 @@ pub fn stdin() -> u64 {
 	STDIN.load(Ordering::Relaxed)
 }
 
+// The channel a program's error output goes to, or 0 for none. Separate from stdout so a caller
+// can redirect one without the other; 0 means `eprint` falls back to stdout, which is what an
+// ordinary terminal launch wants and what every launch did before this endpoint existed.
+static STDERR: AtomicU64 = AtomicU64::new(0);
+
+// Route this program's error output to a channel. 0 restores the fallback to stdout.
+pub fn set_stderr(channel: u64) {
+	STDERR.store(channel, Ordering::Relaxed);
+}
+
+// This program's current stderr channel (0 = share stdout).
+pub fn stderr() -> u64 {
+	STDERR.load(Ordering::Relaxed)
+}
+
+// Write to this program's error stream: its own channel when it was given one, and stdout when it
+// was not. A diagnostic still reaches the terminal of a launch that separates neither, which is
+// every launch today - so a tool can be written against the distinction before anything redirects.
+pub unsafe fn eprint(bytes: &[u8]) {
+	let error: u64 = STDERR.load(Ordering::Relaxed);
+	if error != 0 && unsafe { send_blocking(error, bytes, 0) } {
+		return;
+	}
+	unsafe { print(bytes) };
+}
+
 // Lightweight cross-process perf tracing for latency hunting, off by default. `perf_mark`
 // emits a `\x1ePERF <label> <tsc>` line straight to the kernel debug serial (NOT the
 // console channel), so a marker reaches the host trace tool (boot/perf-trace.py) without
@@ -531,34 +557,35 @@ pub fn perf_mark_val(label: &[u8], val: u64) {
 #[unsafe(no_mangle)]
 pub unsafe fn inherit_stdout(bootstrap: u64) {
 	unsafe {
-		let mut buf: [u8; 16] = [0u8; 16];
-		let mut handles = [0u64; MAX_MESSAGE_CAPS];
-		// Wait for the STDOUT handoff, then take its capabilities. A pipeline stage reads from
-		// one channel and writes to another, so the launcher puts BOTH halves in this one
-		// message: capability 0 is stdout, and an optional capability 1 replaces the input
-		// half. A terminal launch sends only the first and keeps the full-duplex console.
+		// Take the launch endpoints BY NAME: output, input and error stream, any of them absent.
 		//
-		// Deliberately one message and not two. A receiver cannot tell a second message that
-		// was never sent from the next handoff in the bootstrap sequence, so peeking for one
-		// and taking whatever is pending swallows the caller's next message - which is the
-		// args for nearly every launch in the system, and leaves the program blocked forever
-		// on a sequence that is now off by one. Ordered capabilities inside a single message
-		// carry the same information with no ambiguity at all.
-		loop {
-			let (len, count) = recv_message_caps(bootstrap, &mut buf, &mut handles);
-			if len == ERR_WOULD_BLOCK {
-				wait(bootstrap, 0);
-				continue;
-			}
-			if len < 0 {
-				return;
-			}
-			if len as usize >= 6 && &buf[..6] == b"STDOUT" && count >= 1 {
-				set_stdout(handles[0]);
-				set_stdin(if count >= 2 { handles[1] } else { handles[0] });
-			}
+		// This was one message carrying ordered capabilities - 0 stdout, an optional 1 stdin -
+		// and the ordering was deliberate: at the time a receiver could not tell an endpoint that
+		// was never sent from the next handoff in the sequence, so peeking for a trailing one
+		// swallowed the caller's next message and left the program blocked forever on a sequence
+		// off by one. It broke `imgconv --help` before any sender for it even existed.
+		//
+		// The terminator answers that: a named run ends at READY, so absent is absent. Position
+		// could not have carried the third endpoint anyway - `cmd 2> file &` has an output and an
+		// error stream with no input between them.
+		//
+		// The name is unchanged so every program that calls this keeps working; only what arrives
+		// on the channel changed.
+		let mut endpoints: CapSet = recv_caps(bootstrap);
+		let out: u64 = endpoints.take(CAP_STDOUT);
+		if out == 0 {
 			return;
 		}
+		set_stdout(out);
+		// A controlling terminal is full-duplex, so a launch that sends no separate input reads
+		// from the channel it writes to; a pipeline stage is handed a different one. A background
+		// launch gets a send-only dup, where the read simply fails - which is the end-of-input it
+		// should see.
+		let input: u64 = endpoints.take(CAP_STDIN);
+		set_stdin(if input != 0 { input } else { out });
+		// Absent leaves 0, and `eprint` then writes to stdout - today's behaviour for every
+		// launch, kept until something actually redirects one and not the other.
+		set_stderr(endpoints.take(CAP_STDERR));
 	}
 }
 
@@ -1199,6 +1226,18 @@ pub const CAP_SERVE: &[u8] = b"SERVE";
 // receives the bundle, because a message a tool did not drain was consumed as whatever it read
 // next - which is how growing this from five to seven left two behind in every governed tool,
 // and surfaced as a working directory that was really a volume client.
+// The three launch endpoints, named rather than positional. A program is handed its output, its
+// input and its error stream by name, and any of them may be absent.
+//
+// They were ordered capabilities in one message - capability 0 stdout, an optional capability 1
+// stdin - and that was right at the time: a receiver could not tell a message that was never sent
+// from the next handoff in the sequence, so an endpoint could not simply follow. The terminator
+// removed that objection, and position brings a hole of its own the moment stderr exists:
+// `cmd 2> file &` is an output and an error stream with no input between them, which no ordered
+// list can express without a placeholder nobody would remember to send.
+pub const CAP_STDOUT: &[u8] = b"STDOUT";
+pub const CAP_STDIN: &[u8] = b"STDIN";
+pub const CAP_STDERR: &[u8] = b"STDERR";
 pub const CAP_SYSTEM: &[u8] = b"SYSTEM";
 pub const CAP_RAM: &[u8] = b"RAM";
 pub const CAP_TMP: &[u8] = b"TMP";

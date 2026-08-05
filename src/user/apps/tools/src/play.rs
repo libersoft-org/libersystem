@@ -98,21 +98,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let cwd: &str = &context.cwd;
 		let arg = trim(&arg);
 		let Some(uri) = path::resolve(cwd, arg) else {
-			print(b"play: invalid path\n");
+			eprint(b"play: invalid path\n");
 			exit();
 		};
 		let storage = path::volume_client(cwd, arg, system, media, iso, udf, usb);
 		if storage == 0 || audio_channel == 0 {
-			print(b"play: capability unavailable\n");
+			eprint(b"play: capability unavailable\n");
 			exit();
 		}
 		let Some(file) = MappedFile::open(storage, uri) else {
-			print(b"play: cannot open audio\n");
+			eprint(b"play: cannot open audio\n");
 			exit();
 		};
 		catch_interrupt();
 		if play_audio(audio_channel, file.bytes()).is_err() {
-			print(b"play: unsupported or invalid audio\n");
+			eprint(b"play: unsupported or invalid audio\n");
 		}
 	}
 	exit();

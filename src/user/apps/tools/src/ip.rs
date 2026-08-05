@@ -63,8 +63,8 @@ unsafe fn show(netsvc: u64) {
 					}
 				}
 			}
-			Some(Err(_)) => print(b"ip: network error\n"),
-			None => print(b"ip: service unavailable\n"),
+			Some(Err(_)) => eprint(b"ip: network error\n"),
+			None => eprint(b"ip: service unavailable\n"),
 		}
 	}
 }

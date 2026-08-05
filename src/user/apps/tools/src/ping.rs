@@ -97,12 +97,12 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 		let (count, format, target): (Option<u32>, OutputFormat, &[u8]) = match parse_args(args) {
 			Some(parsed) => parsed,
 			None => {
-				print(b"ping: usage: ping [-c count] [--json] <host>\n");
+				eprint(b"ping: usage: ping [-c count] [--json] <host>\n");
 				return;
 			}
 		};
 		if target.is_empty() {
-			print(b"ping: usage: ping [-c count] [--json] <host>\n");
+			eprint(b"ping: usage: ping [-c count] [--json] <host>\n");
 			return;
 		}
 		// An unbounded ping never produces its final JSON document, so default to four
@@ -193,7 +193,7 @@ unsafe fn ping(netsvc: u64, args: &[u8]) {
 				}
 				None => {
 					if format == OutputFormat::Cli {
-						print(b"ping: network service unavailable\n");
+						eprint(b"ping: network service unavailable\n");
 					}
 					break;
 				}

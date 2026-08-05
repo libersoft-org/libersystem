@@ -50,7 +50,7 @@ unsafe fn beep(audiosvc: u64, args: &[u8]) {
 			match parse_u64(f) {
 				Some(v) => freq = v.min(u16::MAX as u64) as u16,
 				None => {
-					print(b"beep: invalid frequency\n");
+					eprint(b"beep: invalid frequency\n");
 					return;
 				}
 			}
@@ -59,7 +59,7 @@ unsafe fn beep(audiosvc: u64, args: &[u8]) {
 			match parse_u64(m) {
 				Some(v) => millis = v.min(u32::MAX as u64) as u32,
 				None => {
-					print(b"beep: invalid duration\n");
+					eprint(b"beep: invalid duration\n");
 					return;
 				}
 			}
@@ -67,8 +67,8 @@ unsafe fn beep(audiosvc: u64, args: &[u8]) {
 		let mut client = AudioClient::new(audiosvc);
 		match client.beep(&freq, &millis) {
 			Some(Ok(())) => {}
-			Some(Err(_)) => print(b"beep: no audio device\n"),
-			None => print(b"beep: service unavailable\n"),
+			Some(Err(_)) => eprint(b"beep: no audio device\n"),
+			None => eprint(b"beep: service unavailable\n"),
 		}
 	}
 }

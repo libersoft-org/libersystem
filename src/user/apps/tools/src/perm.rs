@@ -51,7 +51,7 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 		let consumer: u64 = match client.audit() {
 			Some(c) => c,
 			None => {
-				print(b"perm: service unavailable\n");
+				eprint(b"perm: service unavailable\n");
 				return;
 			}
 		};
@@ -78,7 +78,7 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 				}
 				ReceivedVec::Closed => break,
 				ReceivedVec::Failed => {
-					print(b"perm: the audit stream ended abnormally; what is shown above is incomplete\n");
+					eprint(b"perm: the audit stream ended abnormally; what is shown above is incomplete\n");
 					break;
 				}
 			}

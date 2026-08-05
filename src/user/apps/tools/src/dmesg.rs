@@ -39,7 +39,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut log: Vec<u8> = alloc::vec![0u8; LOG_CAPACITY];
 		let n: i64 = console_readlog(&mut log);
 		if n <= 0 {
-			print(b"dmesg: no kernel log\n");
+			eprint(b"dmesg: no kernel log\n");
 			exit();
 		}
 		let text: &[u8] = &log[..n as usize];

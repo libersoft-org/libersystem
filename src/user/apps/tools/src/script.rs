@@ -28,7 +28,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 		if master == 0 {
-			print(b"script: no pty\n");
+			eprint(b"script: no pty\n");
 		} else {
 			record(master, context.arguments.as_bytes());
 			close(master);
@@ -40,7 +40,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // Drive the pty's shell and print the captured session.
 unsafe fn record(master: u64, cmd: &[u8]) {
 	unsafe {
-		print(b"script: recording a pty session\n");
+		eprint(b"script: recording a pty session\n");
 		print(b"-------- session --------\n");
 		// run the command (if any), then exit, so the session ends and the pty closes.
 		if !cmd.is_empty() {

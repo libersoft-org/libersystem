@@ -1225,6 +1225,7 @@ fn ps_live_view_drives_the_terminal_contract() {
 	let (proc_host, proc_child) = Channel::create();
 	let _ps = spawn_dynamic_test_process(sched::root_domain(), ps_elf, boot_user);
 	send_cap(&boot_kernel, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
+	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	boot_kernel.send(Message::new(crate::tests::launch_context(b"-i", b""), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
 	send_cap(&boot_kernel, b"RESOURCE", res_child, Rights::ALL).expect("RESOURCE bootstrap");
 	send_cap(&boot_kernel, b"PROCESS", proc_child, Rights::ALL).expect("PROCESS bootstrap");

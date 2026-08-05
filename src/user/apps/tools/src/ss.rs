@@ -38,7 +38,7 @@ unsafe fn show(netsvc: u64) {
 		match client.sockets() {
 			Some(Ok(socks)) => {
 				if socks.is_empty() {
-					print(b"ss: no sockets\n");
+					eprint(b"ss: no sockets\n");
 				} else {
 					print(b"State     Local            Peer\n");
 					for s in &socks {
@@ -65,8 +65,8 @@ unsafe fn show(netsvc: u64) {
 					}
 				}
 			}
-			Some(Err(_)) => print(b"ss: network error\n"),
-			None => print(b"ss: service unavailable\n"),
+			Some(Err(_)) => eprint(b"ss: network error\n"),
+			None => eprint(b"ss: service unavailable\n"),
 		}
 		// The pool utilization footer: the client, socket and listener channels the
 		// service currently stands on, and its live TCP connections. Every set grows on

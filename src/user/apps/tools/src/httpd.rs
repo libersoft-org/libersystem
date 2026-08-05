@@ -43,11 +43,11 @@ unsafe fn serve(netsvc: u64) {
 		let listen_chan: u64 = match net.listen(&HTTP_PORT) {
 			Some(Ok(h)) => h,
 			_ => {
-				print(b"httpd: listen failed\n");
+				eprint(b"httpd: listen failed\n");
 				return;
 			}
 		};
-		print(b"httpd: listening on port 80\n");
+		eprint(b"httpd: listening on port 80\n");
 		let mut lis = ListenerClient::new(listen_chan);
 		// accept() blocks until an inbound connection completes; the loop ends when the
 		// listener channel closes (NetworkService gone).
@@ -73,9 +73,9 @@ unsafe fn respond(sockh: u64) {
 		match make_buffer(RESPONSE) {
 			Some(body) => {
 				let _ = sock.send(&body);
-				print(b"httpd: served a request\n");
+				eprint(b"httpd: served a request\n");
 			}
-			None => print(b"httpd: out of memory\n"),
+			None => eprint(b"httpd: out of memory\n"),
 		}
 		let _ = sock.close();
 	}

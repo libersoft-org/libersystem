@@ -59,7 +59,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let uri: String = match path::resolve(cwd_str, path_arg) {
 			Some(u) => u,
 			None => {
-				print(b"write: invalid path\n");
+				eprint(b"write: invalid path\n");
 				exit();
 			}
 		};
@@ -83,7 +83,7 @@ unsafe fn write(storage: u64, uri: &str, text: &[u8]) {
 		let (producer, consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => {
-				print(b"write: out of memory\n");
+				eprint(b"write: out of memory\n");
 				return;
 			}
 		};
@@ -91,7 +91,7 @@ unsafe fn write(storage: u64, uri: &str, text: &[u8]) {
 			Some(pending) => pending,
 			None => {
 				close(producer);
-				print(b"write: could not write ");
+				eprint(b"write: could not write ");
 				print(uri.as_bytes());
 				print(b"\n");
 				return;
@@ -108,7 +108,7 @@ unsafe fn write(storage: u64, uri: &str, text: &[u8]) {
 			print(uri.as_bytes());
 			print(b"\n");
 		} else {
-			print(b"write: could not write ");
+			eprint(b"write: could not write ");
 			print(uri.as_bytes());
 			print(b"\n");
 		}

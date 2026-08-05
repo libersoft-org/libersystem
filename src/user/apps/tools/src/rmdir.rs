@@ -53,7 +53,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let uri: String = match path::resolve(cwd_str, &arg) {
 			Some(u) => u,
 			None => {
-				print(b"rmdir: invalid path\n");
+				eprint(b"rmdir: invalid path\n");
 				exit();
 			}
 		};
@@ -77,7 +77,7 @@ unsafe fn rmdir(storage: u64, uri: &[u8]) {
 				print(b"\n");
 			}
 			_ => {
-				print(b"rmdir: could not remove ");
+				eprint(b"rmdir: could not remove ");
 				print(uri);
 				print(b"\n");
 			}

@@ -47,30 +47,30 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			exit();
 		}
 		let Some(uri) = path::resolve(cwd, argument) else {
-			print(b"licoedit: invalid path\n");
+			eprint(b"licoedit: invalid path\n");
 			exit();
 		};
 		let storage = volumes.client_for(cwd, argument);
 		let file = match read_volume_file(storage, &uri, MAX_EDIT_BYTES) {
 			Ok(file) => file,
 			Err(_) => {
-				print(b"licoedit: cannot open file or it exceeds the current 512 kB limit\n");
+				eprint(b"licoedit: cannot open file or it exceeds the current 512 kB limit\n");
 				exit();
 			}
 		};
 		if matches!(detect_file_type(argument, &file[..file.len().min(32)], false), FileType::Binary | FileType::Archive | FileType::Executable | FileType::Image | FileType::Audio) {
-			print(b"licoedit: binary content opens read-only in licoview\n");
+			eprint(b"licoedit: binary content opens read-only in licoview\n");
 			exit();
 		}
 		let mut buffer = match TextBuffer::from_bytes(&file, MAX_EDIT_BYTES) {
 			Ok(buffer) => buffer,
 			Err(_) => {
-				print(b"licoedit: cannot allocate editor buffer\n");
+				eprint(b"licoedit: cannot allocate editor buffer\n");
 				exit();
 			}
 		};
 		if stdin() == 0 || stdout() == 0 {
-			print(b"licoedit: interactive terminal unavailable\n");
+			eprint(b"licoedit: interactive terminal unavailable\n");
 		} else {
 			catch_interrupt();
 			let mut output = ConsoleWriter::new(stdout());

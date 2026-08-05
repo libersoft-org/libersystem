@@ -63,7 +63,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			out.push('\n');
 		}
 		if index == 0 {
-			print(b"lsirq: query error\n");
+			eprint(b"lsirq: query error\n");
 		} else {
 			print(out.as_bytes());
 		}

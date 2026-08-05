@@ -51,14 +51,14 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 		let key = match core::str::from_utf8(key) {
 			Ok(s) => s,
 			Err(_) => {
-				print(b"set: invalid key\n");
+				eprint(b"set: invalid key\n");
 				return;
 			}
 		};
 		let value = match core::str::from_utf8(value) {
 			Ok(s) => s,
 			Err(_) => {
-				print(b"set: invalid value\n");
+				eprint(b"set: invalid value\n");
 				return;
 			}
 		};
@@ -66,8 +66,8 @@ unsafe fn set_config(cfgsvc: u64, rest: &[u8]) {
 		let mut client = ConfigClient::new(cfgsvc);
 		match client.set(&entry) {
 			Some(Ok(())) => print(b"ok\n"),
-			Some(Err(_)) => print(b"set: error\n"),
-			None => print(b"set: service unavailable\n"),
+			Some(Err(_)) => eprint(b"set: error\n"),
+			None => eprint(b"set: service unavailable\n"),
 		}
 	}
 }

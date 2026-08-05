@@ -49,19 +49,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			exit();
 		}
 		let Some(uri) = path::resolve(cwd, arg) else {
-			print(b"licoview: invalid path\n");
+			eprint(b"licoview: invalid path\n");
 			exit();
 		};
 		let storage = volumes.client_for(cwd, arg);
 		let file = match read_volume_file(storage, &uri, MAX_VIEW_BYTES) {
 			Ok(file) => file,
 			Err(_) => {
-				print(b"licoview: cannot open file or it exceeds the current 512 kB limit\n");
+				eprint(b"licoview: cannot open file or it exceeds the current 512 kB limit\n");
 				exit();
 			}
 		};
 		if stdin() == 0 || stdout() == 0 {
-			print(b"licoview: interactive terminal unavailable\n");
+			eprint(b"licoview: interactive terminal unavailable\n");
 		} else {
 			catch_interrupt();
 			let mut output = ConsoleWriter::new(stdout());

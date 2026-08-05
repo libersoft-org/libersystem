@@ -35,7 +35,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut ids: [u32; 64] = [0u32; 64];
 		let count: i64 = cpu_info(&mut ids);
 		if count <= 0 {
-			print(b"lscpu: query error\n");
+			eprint(b"lscpu: query error\n");
 			exit();
 		}
 		let mut model_buf: [u8; 64] = [0u8; 64];

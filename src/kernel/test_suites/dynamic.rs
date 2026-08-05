@@ -319,6 +319,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert!(echo_process.handle_count() >= 1, "dynamic echo owns its bootstrap handle");
 	assert!(!echo_bootstrap_kernel.is_peer_closed(), "dynamic echo bootstrap peer is open before initialization");
 	send_cap(&echo_bootstrap_kernel, b"STDOUT", echo_stdout_user, Rights::ALL).expect("dynamic echo stdout bootstrap");
+	echo_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	echo_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"dynamic echo", b""), alloc::vec::Vec::new(), 0)).expect("dynamic echo arguments");
 	assert!(!echo_bootstrap_kernel.is_peer_closed(), "dynamic echo bootstrap peer remains open after initialization is queued");
 	sched::run_until_idle();
@@ -356,11 +357,44 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	let ip_reply = process_client.recv().expect("shell-shaped ip launch reply");
 	assert_eq!(le_u32(&ip_reply.bytes, 0), 24);
 	send_cap(&ip_bootstrap_kernel, b"STDOUT", ip_stdout_user, Rights::ALL).expect("shell-shaped ip stdout");
+	ip_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	send_cap(&ip_bootstrap_kernel, &crate::tests::launch_context(b"", b""), ip_net_user, Rights::ALL).expect("shell-shaped ip context with its client attached");
 	sched::run_until_idle();
 	let ip_request = ip_net_kernel.recv().expect("a shell-launched net tool queries the client attached to its launch context");
 	assert_eq!(le_u16(&ip_request.bytes, 0), 1, "the query is the NetworkService info op");
 	let _ = ip_stdout_kernel;
+
+	// A program given a SEPARATE error stream writes its diagnostic there and leaves stdout alone.
+	//
+	// Every launch today hands over one console, and `eprint` falls back to stdout when no error
+	// endpoint arrives - which is why moving a hundred and forty-three diagnostics onto it changed
+	// nothing anyone could observe. That is the right default and a poor test: it proves the
+	// fallback, not the endpoint. This gives `cat` two channels and asks which one the message
+	// came out of.
+	let cat_name: &[u8] = b"cat";
+	let (cat_out_kernel, cat_out_user) = Channel::create();
+	let (cat_err_kernel, cat_err_user) = Channel::create();
+	let (cat_bootstrap_kernel, cat_bootstrap_user) = Channel::create();
+	let mut cat_launch = alloc::vec::Vec::new();
+	cat_launch.extend_from_slice(&3u16.to_le_bytes());
+	cat_launch.extend_from_slice(&25u32.to_le_bytes());
+	cat_launch.extend_from_slice(&(cat_name.len() as u16).to_le_bytes());
+	cat_launch.extend_from_slice(cat_name);
+	cat_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &cat_launch, cat_bootstrap_user, Rights::ALL).expect("split-stream cat launch request");
+	sched::run_until_idle();
+	assert_eq!(le_u32(&process_client.recv().expect("split-stream cat launch reply").bytes, 0), 25);
+	send_cap(&cat_bootstrap_kernel, b"STDOUT", cat_out_user, Rights::ALL).expect("split-stream cat stdout");
+	send_cap(&cat_bootstrap_kernel, b"STDERR", cat_err_user, Rights::ALL).expect("split-stream cat stderr");
+	cat_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
+	// A path no volume can name, so the tool fails before it needs a volume client. The bundle is
+	// still sent - empty - because the tool takes it before it resolves anything.
+	cat_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"::not-a-path", b""), alloc::vec::Vec::new(), 0)).expect("split-stream cat context");
+	cat_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("split-stream cat empty volume bundle");
+	sched::run_until_idle();
+	let diagnostic = cat_err_kernel.recv().expect("the diagnostic goes to the error stream it was given");
+	assert_eq!(&diagnostic.bytes, b"cat: invalid path\n");
+	assert!(cat_out_kernel.recv().is_err(), "and stdout stays clean, which is the whole point of separating them");
 
 	// Load the generated date PIE directly as well. Its capability protocol is covered by
 	// PermissionManager; this assertion isolates staging, provider-DAG loading and relocation
@@ -451,6 +485,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(le_u32(&readln_reply.bytes, 0), 59);
 	assert_eq!(readln_reply.bytes[4], 1, "dynamic readln loaded with lsrt");
 	send_cap(&readln_bootstrap_kernel, b"STDOUT", readln_console, Rights::ALL).expect("dynamic readln console bootstrap");
+	readln_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	readln_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"", b""), alloc::vec::Vec::new(), 0)).expect("dynamic readln arguments");
 	sched::run_until_idle();
 	readln_output.send(Message::new(b"hello\n".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic readln input");
@@ -488,6 +523,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		assert_eq!(tool_reply.bytes[4], 1, "the inventory PIE loaded with its manifest providers");
 		let tool_process = tool_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("dynamic inventory capability is a Process");
 		send_cap(&tool_bootstrap_kernel, b"STDOUT", output_user, Rights::ALL).expect("dynamic inventory stdout bootstrap");
+		tool_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 		tool_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"", b""), alloc::vec::Vec::new(), 0)).expect("dynamic inventory arguments");
 		let mut captured = alloc::vec::Vec::new();
 		for _ in 0..100_000 {
@@ -534,6 +570,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(le_u32(&mkdir_reply.bytes, 0), 26);
 	assert_eq!(mkdir_reply.bytes[4], 1, "the mkdir PIE loaded with its manifest providers");
 	send_cap(&mkdir_bootstrap_kernel, b"STDOUT", mkdir_stdout_user, Rights::ALL).expect("dynamic mkdir stdout bootstrap");
+	mkdir_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	mkdir_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"vol://system/dynamic-dir", b"vol://system/"), alloc::vec::Vec::new(), 0)).expect("dynamic mkdir arguments");
 	send_cap(&mkdir_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic mkdir system volume");
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
@@ -567,6 +604,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(le_u32(&write_reply.bytes, 0), 22);
 	assert_eq!(write_reply.bytes[4], 1, "the write PIE loaded with its manifest providers");
 	send_cap(&write_bootstrap_kernel, b"STDOUT", write_stdout_user, Rights::ALL).expect("dynamic write stdout bootstrap");
+	write_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	write_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"vol://system/dynamic-dir/dynamic-write.txt dynamic write", b"vol://system/"), alloc::vec::Vec::new(), 0)).expect("dynamic write arguments");
 	send_cap(&write_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic write system volume");
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
@@ -600,6 +638,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(le_u32(&cat_reply.bytes, 0), 23);
 	assert_eq!(cat_reply.bytes[4], 1, "the cat PIE loaded for write read-back");
 	send_cap(&cat_bootstrap_kernel, b"STDOUT", cat_stdout_user, Rights::ALL).expect("dynamic cat stdout bootstrap");
+	cat_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	cat_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"vol://system/dynamic-dir/dynamic-write.txt", b"vol://system/"), alloc::vec::Vec::new(), 0)).expect("dynamic cat arguments");
 	send_cap(&cat_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic cat system volume");
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
@@ -633,6 +672,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		assert_eq!(tool_reply.bytes[4], 1, "the traversal PIE loaded with its manifest providers");
 		let tool_process = tool_reply.caps[0].object().into_any_arc().downcast::<Process>().expect("dynamic traversal capability is a Process");
 		send_cap(&tool_bootstrap_kernel, b"STDOUT", output_user, Rights::ALL).expect("dynamic traversal stdout bootstrap");
+		tool_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 		tool_bootstrap_kernel.send(Message::new(crate::tests::launch_context(arguments, b"vol://system/"), alloc::vec::Vec::new(), 0)).expect("dynamic traversal arguments");
 		send_cap(&tool_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic traversal system volume");
 		for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
@@ -673,6 +713,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(le_u32(&full_rmdir_reply.bytes, 0), 27);
 	assert_eq!(full_rmdir_reply.bytes[4], 1, "the rmdir PIE loaded for non-empty rejection");
 	send_cap(&full_rmdir_bootstrap_kernel, b"STDOUT", full_rmdir_stdout_user, Rights::ALL).expect("non-empty rmdir stdout bootstrap");
+	full_rmdir_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	full_rmdir_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"vol://system/dynamic-dir", b"vol://system/"), alloc::vec::Vec::new(), 0)).expect("non-empty rmdir arguments");
 	send_cap(&full_rmdir_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("non-empty rmdir system volume");
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
@@ -706,6 +747,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(le_u32(&rm_reply.bytes, 0), 24);
 	assert_eq!(rm_reply.bytes[4], 1, "the rm PIE loaded with its manifest providers");
 	send_cap(&rm_bootstrap_kernel, b"STDOUT", rm_stdout_user, Rights::ALL).expect("dynamic rm stdout bootstrap");
+	rm_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	rm_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"vol://system/dynamic-dir/dynamic-write.txt", b"vol://system/"), alloc::vec::Vec::new(), 0)).expect("dynamic rm arguments");
 	send_cap(&rm_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("dynamic rm system volume");
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
@@ -738,6 +780,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(le_u32(&rmdir_reply.bytes, 0), 28);
 	assert_eq!(rmdir_reply.bytes[4], 1, "the rmdir PIE loaded for empty removal");
 	send_cap(&rmdir_bootstrap_kernel, b"STDOUT", rmdir_stdout_user, Rights::ALL).expect("empty rmdir stdout bootstrap");
+	rmdir_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	rmdir_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"vol://system/dynamic-dir", b"vol://system/"), alloc::vec::Vec::new(), 0)).expect("empty rmdir arguments");
 	send_cap(&rmdir_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("empty rmdir system volume");
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
@@ -770,6 +813,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(le_u32(&missing_reply.bytes, 0), 25);
 	assert_eq!(missing_reply.bytes[4], 1, "the cat PIE loaded for negative read-back");
 	send_cap(&missing_bootstrap_kernel, b"STDOUT", missing_stdout_user, Rights::ALL).expect("missing-file cat stdout bootstrap");
+	missing_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	missing_bootstrap_kernel.send(Message::new(crate::tests::launch_context(b"vol://system/dynamic-dir/dynamic-write.txt", b"vol://system/"), alloc::vec::Vec::new(), 0)).expect("missing-file cat arguments");
 	send_cap(&missing_bootstrap_kernel, b"SYSTEM", writable_storage.client.clone(), Rights::ALL).expect("missing-file cat system volume");
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {

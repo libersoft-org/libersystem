@@ -84,8 +84,8 @@ unsafe fn query_processes(procsvc: u64, mode: Option<JsonMode>) {
 					}
 				}
 			}
-			Some(Err(_)) => print(b"ps: query error\n"),
-			None => print(b"ps: service unavailable\n"),
+			Some(Err(_)) => eprint(b"ps: query error\n"),
+			None => eprint(b"ps: service unavailable\n"),
 		}
 	}
 }

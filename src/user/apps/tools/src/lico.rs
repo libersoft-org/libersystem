@@ -116,13 +116,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			match path::resolve(cwd, argument) {
 				Some(path) => path,
 				None => {
-					print(b"lico: invalid path\n");
+					eprint(b"lico: invalid path\n");
 					exit();
 				}
 			}
 		};
 		if stdin() == 0 || stdout() == 0 {
-			print(b"lico: interactive terminal unavailable\n");
+			eprint(b"lico: interactive terminal unavailable\n");
 		} else {
 			catch_interrupt();
 			let mut output = ConsoleWriter::new(stdout());

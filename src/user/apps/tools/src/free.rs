@@ -37,7 +37,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 3. read the totals and render one row per pool.
 		let mut stats = MemoryStats::default();
 		if memory_stats(&mut stats) <= 0 {
-			print(b"free: query error\n");
+			eprint(b"free: query error\n");
 			exit();
 		}
 		let mut out = String::new();

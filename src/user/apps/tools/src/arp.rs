@@ -37,7 +37,7 @@ unsafe fn show(netsvc: u64) {
 		match client.info() {
 			Some(Ok(info)) => {
 				if info.neighbors.is_empty() {
-					print(b"arp: no neighbors\n");
+					eprint(b"arp: no neighbors\n");
 					return;
 				}
 				let mut tmp: [u8; 18] = [0u8; 18];
@@ -50,8 +50,8 @@ unsafe fn show(netsvc: u64) {
 					print(b"\n");
 				}
 			}
-			Some(Err(_)) => print(b"arp: network error\n"),
-			None => print(b"arp: service unavailable\n"),
+			Some(Err(_)) => eprint(b"arp: network error\n"),
+			None => eprint(b"arp: service unavailable\n"),
 		}
 	}
 }

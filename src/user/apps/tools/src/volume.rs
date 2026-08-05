@@ -63,7 +63,7 @@ unsafe fn run(storage: u64, args: &[u8]) {
 				None if !rest.is_empty() => restore(storage, rest, b""),
 				None => print(b"usage: volume restore <vol://...> [snapshot]\n"),
 			},
-			_ => print(b"volume: unknown subcommand (status, compress on|off, fsck, restore)\n"),
+			_ => eprint(b"volume: unknown subcommand (status, compress on|off, fsck, restore)\n"),
 		}
 	}
 }
@@ -76,7 +76,7 @@ unsafe fn status(storage: u64) {
 		let st = match client.status() {
 			Some(Ok(st)) => st,
 			_ => {
-				print(b"volume: StorageService unavailable\n");
+				eprint(b"volume: StorageService unavailable\n");
 				return;
 			}
 		};
@@ -103,7 +103,7 @@ unsafe fn set_compression(storage: u64, enabled: bool) {
 		match client.set_compression(&enabled) {
 			Some(Ok(())) => print(if enabled { b"compression on (new writes compress)\n" as &[u8] } else { b"compression off (new writes stay raw)\n" }),
 			Some(Err(_)) => print(b"volume compress: refused (read-only volume?)\n"),
-			None => print(b"volume: StorageService unavailable\n"),
+			None => eprint(b"volume: StorageService unavailable\n"),
 		}
 	}
 }
@@ -115,7 +115,7 @@ unsafe fn fsck(storage: u64) {
 		let report = match client.fsck() {
 			Some(Ok(r)) => r,
 			_ => {
-				print(b"volume: StorageService unavailable\n");
+				eprint(b"volume: StorageService unavailable\n");
 				return;
 			}
 		};
@@ -160,7 +160,7 @@ unsafe fn restore(storage: u64, uri: &[u8], snapshot: &[u8]) {
 				print(uri);
 				print(b" (missing file or snapshot?)\n");
 			}
-			None => print(b"volume: StorageService unavailable\n"),
+			None => eprint(b"volume: StorageService unavailable\n"),
 		}
 	}
 }

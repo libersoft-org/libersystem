@@ -165,7 +165,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let uri: String = match path::resolve(cwd_str, &arg) {
 			Some(u) => u,
 			None => {
-				print(b"ls: invalid path\n");
+				eprint(b"ls: invalid path\n");
 				exit();
 			}
 		};
@@ -223,7 +223,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 		let path: &str = match core::str::from_utf8(uri) {
 			Ok(s) => s,
 			Err(_) => {
-				print(b"ls: invalid path\n");
+				eprint(b"ls: invalid path\n");
 				return;
 			}
 		};
@@ -233,7 +233,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 		let consumer: u64 = match client.list(path) {
 			Some(c) => c,
 			None => {
-				print(b"ls: StorageService unavailable\n");
+				eprint(b"ls: StorageService unavailable\n");
 				return;
 			}
 		};
@@ -244,7 +244,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 			// A listing printed to the user IS a claim about the directory. Say it failed
 			// rather than print a prefix of it as though it were everything.
 			let Some(mut files) = drain_stream_complete(consumer, volume::list_read) else {
-				print(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
+				eprint(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
 				return;
 			};
 			sort_files(&mut files, key, reverse);
@@ -282,7 +282,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 					}
 					ReceivedVec::Closed => break,
 					ReceivedVec::Failed => {
-						print(b"ls: listing failed partway through; what is shown above is incomplete\n");
+						eprint(b"ls: listing failed partway through; what is shown above is incomplete\n");
 						break;
 					}
 				}
@@ -292,7 +292,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 			return;
 		}
 		let Some(mut files) = drain_stream_complete(consumer, volume::list_read) else {
-			print(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
+			eprint(b"ls: listing failed partway through (nothing shown rather than a partial one)\n");
 			return;
 		};
 		sort_files(&mut files, key, reverse);

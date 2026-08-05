@@ -49,14 +49,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn start_service(admin: u64, name: &[u8]) {
 	unsafe {
 		if name.is_empty() {
-			print(b"start: usage: start <service>\n");
+			eprint(b"start: usage: start <service>\n");
 			return;
 		}
 		let mut request: Vec<u8> = Vec::with_capacity(name.len() + 1);
 		request.push(b'+');
 		request.extend_from_slice(name);
 		if !send_blocking(admin, &request, 0) {
-			print(b"start: request failed\n");
+			eprint(b"start: request failed\n");
 			return;
 		}
 		let mut reply: [u8; 512] = [0u8; 512];
@@ -67,13 +67,13 @@ unsafe fn start_service(admin: u64, name: &[u8]) {
 					print(&reply[8..len]);
 					print(b"\n");
 				} else if len >= 10 && &reply[..10] == b"NOTSTARTED" {
-					print(b"start: not a stopped service this supervisor can bring back\n");
+					eprint(b"start: not a stopped service this supervisor can bring back\n");
 				} else {
 					print(&reply[..len]);
 					print(b"\n");
 				}
 			}
-			Received::Closed => print(b"start: supervisor gone\n"),
+			Received::Closed => eprint(b"start: supervisor gone\n"),
 		}
 	}
 }

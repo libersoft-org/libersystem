@@ -56,18 +56,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let input_storage = path::volume_client(cwd, config.input.as_bytes(), system, media, iso, udf, usb);
 		let output_storage = path::volume_client(cwd, config.output.as_bytes(), system, media, iso, udf, usb);
 		if input_storage == 0 || output_storage == 0 {
-			print(b"imgconv: volume unavailable\n");
+			eprint(b"imgconv: volume unavailable\n");
 			exit();
 		}
 		let input = match read_file(input_storage, &input_uri) {
 			Some(input) => input,
 			None => {
-				print(b"imgconv: cannot read input\n");
+				eprint(b"imgconv: cannot read input\n");
 				exit();
 			}
 		};
 		if !config.force && exists(output_storage, &output_uri) {
-			print(b"imgconv: destination exists (use --force)\n");
+			eprint(b"imgconv: destination exists (use --force)\n");
 			exit();
 		}
 		let (encoded, info) = match imgconv::convert(&input, &config) {
@@ -77,13 +77,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let staged = match make_buffer(&encoded) {
 			Some(staged) => staged,
 			None => {
-				print(b"imgconv: out of memory\n");
+				eprint(b"imgconv: out of memory\n");
 				exit();
 			}
 		};
 		let mut client = VolumeClient::new(output_storage);
 		if !matches!(client.write(&output_uri, &staged), Some(Ok(()))) {
-			print(b"imgconv: cannot write output\n");
+			eprint(b"imgconv: cannot write output\n");
 			exit();
 		}
 		let mut line = String::from("imgconv: ");

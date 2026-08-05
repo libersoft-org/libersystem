@@ -76,10 +76,10 @@ const CAT_NAME: &[u8] = b"cat";
 const IP_NAME: &[u8] = b"ip";
 const GRANT_RIGHTS: u32 = RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER;
 
-// A system tool launched through `run` receives, before its manifest grants, the caller's
-// stdout console (so its `print` output renders on the launching terminal) under this tag,
-// then its argument string.
-const STDOUT_TAG: &[u8] = b"STDOUT";
+// A system tool launched through `run` receives, before its manifest grants, its launch
+// endpoints as a named run (the caller's console, so its `print` output renders on the launching
+// terminal), then its launch context.
+
 // What this is sized for, stated rather than left to be inferred from one number: converting
 // the largest image the system ships - `wallpapers/logo.webp`, 3840x2160 - which needs the
 // decoded input and the output RGBA live at the same time, about 33 MB each, plus codec
@@ -686,7 +686,10 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		};
 		// Forward the stdout console first (the tool's `inherit_stdout` reads the first
 		// message), then the argument string, then the manifest grants.
-		send_blocking(manager_side, STDOUT_TAG, stdout);
+		// The launch endpoints, named and ended by READY. A governed tool gets the caller's
+		// console, which is full duplex, so it reads and writes the same channel.
+		send_blocking(manager_side, CAP_STDOUT, stdout);
+		send_ready(manager_side);
 		if !send_launch_context(manager_side, args, cwd, environment) {
 			close(manager_side);
 			close(started.task);
@@ -796,7 +799,9 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 				}
 			};
 			// stdout, then stdin when there is one, as ordered capabilities in one message.
-			let installed: bool = if stage.stdin == 0 { send_caps_blocking(manager_side, STDOUT_TAG, &[stage.stdout]) } else { send_caps_blocking(manager_side, STDOUT_TAG, &[stage.stdout, stage.stdin]) };
+			// A stage writes into one edge and reads from another, so the two endpoints are
+			// named separately rather than told apart by how many arrived.
+			let installed: bool = send_blocking(manager_side, CAP_STDOUT, stage.stdout) && (stage.stdin == 0 || send_blocking(manager_side, CAP_STDIN, stage.stdin)) && send_ready(manager_side);
 			if !installed {
 				close(manager_side);
 				close(started.task);

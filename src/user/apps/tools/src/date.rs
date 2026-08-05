@@ -42,7 +42,7 @@ unsafe fn date(timesvc: u64) {
 		let ts: Timestamp = match client.now() {
 			Some(Ok(t)) => t,
 			_ => {
-				print(b"date: time error\n");
+				eprint(b"date: time error\n");
 				return;
 			}
 		};

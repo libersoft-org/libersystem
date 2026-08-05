@@ -305,7 +305,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			exit();
 		}
 		let Some(uri) = path::resolve(cwd, arg) else {
-			print(b"imgview: invalid path\n");
+			eprint(b"imgview: invalid path\n");
 			exit();
 		};
 		let storage = path::volume_client(cwd, arg, system, media, iso, udf, usb);
@@ -315,7 +315,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			exit();
 		};
 		if display_channel == 0 || input_channel == 0 {
-			print(b"imgview: graphical capabilities unavailable\n");
+			eprint(b"imgview: graphical capabilities unavailable\n");
 			close_if_present(display_channel);
 			close_if_present(input_channel);
 			exit();
@@ -346,7 +346,7 @@ unsafe fn close_if_present(handle: u64) {
 unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 	unsafe {
 		if storage == 0 {
-			print(b"imgview: volume unavailable\n");
+			eprint(b"imgview: volume unavailable\n");
 			return None;
 		}
 		let opts = OpenOpts { path: String::from(uri), write: false, create: false };
@@ -354,7 +354,7 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 		let opened = match client.open(&opts) {
 			Some(Ok(opened)) if opened.file != 0 => opened,
 			_ => {
-				print(b"imgview: cannot open image\n");
+				eprint(b"imgview: cannot open image\n");
 				return None;
 			}
 		};
@@ -362,7 +362,7 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 			Ok(len) if len != 0 => len,
 			_ => {
 				close(opened.file);
-				print(b"imgview: invalid image size\n");
+				eprint(b"imgview: invalid image size\n");
 				return None;
 			}
 		};
@@ -370,7 +370,7 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 			Some(mapped) => mapped,
 			None => {
 				close(opened.file);
-				print(b"imgview: cannot map image\n");
+				eprint(b"imgview: cannot map image\n");
 				return None;
 			}
 		};
@@ -384,7 +384,7 @@ unsafe fn load_image(storage: u64, uri: &str) -> Option<DecodedImage> {
 		match decoded {
 			Some(image) => Some(image),
 			None => {
-				print(b"imgview: unsupported or invalid image\n");
+				eprint(b"imgview: unsupported or invalid image\n");
 				None
 			}
 		}
@@ -395,7 +395,7 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 	unsafe {
 		let display = surface::connect(display_channel);
 		let Some(surface) = surface::acquire(&display, 0, 0).and_then(Result::ok) else {
-			print(b"imgview: cannot acquire display\n");
+			eprint(b"imgview: cannot acquire display\n");
 			return;
 		};
 		let framebuffer = surface.framebuffer();

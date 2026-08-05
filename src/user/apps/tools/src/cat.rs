@@ -54,7 +54,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let uri: String = match path::resolve(cwd_str, arg) {
 			Some(u) => u,
 			None => {
-				print(b"cat: invalid path\n");
+				eprint(b"cat: invalid path\n");
 				exit();
 			}
 		};
@@ -74,7 +74,7 @@ unsafe fn cat(storage: u64, uri: &[u8]) {
 		let result = match client.open(&opts) {
 			Some(Ok(r)) => r,
 			_ => {
-				print(b"cat: ");
+				eprint(b"cat: ");
 				print(uri);
 				print(b": cannot open\n");
 				return;

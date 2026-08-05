@@ -90,8 +90,8 @@ unsafe fn query_services(statsvc: u64, mode: Option<JsonMode>, filter: &[u8]) {
 					}
 				}
 			}
-			Some(Err(_)) => print(b"lssvc: query error\n"),
-			None => print(b"lssvc: service unavailable\n"),
+			Some(Err(_)) => eprint(b"lssvc: query error\n"),
+			None => eprint(b"lssvc: service unavailable\n"),
 		}
 	}
 }
