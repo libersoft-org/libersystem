@@ -225,6 +225,22 @@ for arch in "${archs[@]}"; do
 	# prefers the volume's. Putting it there during an ordinary build made `./test.sh` boot the
 	# SHIPPING kernel into an interactive shell and time out after fifteen minutes.
 	wants volume && ensure step_volume "$arch" "$kernel_on_volume"
+	# Record that a build ran over the sources as they stand now.
+	#
+	# `./test.sh` refuses a build older than its sources, which is right - it caught two stale
+	# runs in one afternoon - but it read that age off the built artifacts, and those do not
+	# always get rewritten. `mkpackages` skips a write whose bytes are unchanged (`write_if_changed`),
+	# so a kernel-only edit, or a `git checkout` that restores a file to what was already built,
+	# leaves the sources newer than an image that is byte-for-byte current. The suite then refused
+	# to run and asked for the very build that had just succeeded.
+	#
+	# The stamp says what the artifacts cannot: a build covered these sources. One file per
+	# architecture AND per part, so `--part loader` cannot vouch for a userspace it never touched -
+	# a single stamp listing this run's parts would erase the record of the build before it.
+	mkdir -p "$BUILD_DIR/state"
+	for part in "${parts[@]}"; do
+		: >"$BUILD_DIR/state/built-$arch-$part"
+	done
 done
 
 note "built: ${parts[*]} for ${archs[*]}"

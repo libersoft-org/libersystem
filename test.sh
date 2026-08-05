@@ -155,8 +155,19 @@ require_built() {
 	# `./test.sh --arch aarch64` ran the previous binary and said nothing. That cost two
 	# twenty-minute runs in one afternoon, and both times the failure looked like a defect in the
 	# code under test.
+	#
+	# Measured against the stamp `./build.sh` writes, not against the artifacts. An artifact's
+	# age understates the build's: `mkpackages` declines to rewrite a file whose bytes are
+	# unchanged, so a kernel-only edit - or a `git checkout` restoring a file to what was already
+	# built - leaves the sources newer than an image that is byte-for-byte current, and the suite
+	# refused to run while asking for the build that had just succeeded. The stamp records what
+	# the artifacts cannot: that a build looked at these sources.
+	# `volume` is the part that produces the image the suite boots, and it is the last of the
+	# chain that feeds it, so its stamp is the one that dates the userspace.
+	local stamp="$BUILD_DIR/state/built-$arch-volume"
+	[[ -f "$stamp" ]] || die "no build stamp for $arch - run: ./build.sh --arch $arch"
 	local stale
-	if stale="$(newer_than "$volume" "${VOLUME_SOURCES[@]}")"; then
+	if stale="$(newer_than "$stamp" "${VOLUME_SOURCES[@]}")"; then
 		die "the $arch build is older than $stale
     Nothing here rebuilds it, so the suite would test the previous one:  ./build.sh --arch $arch"
 	fi
