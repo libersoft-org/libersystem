@@ -2891,6 +2891,42 @@ impl StorageHarness {
 		self.stream_finish(sender, &[b"kept"], corr.wrapping_add(2))
 	}
 
+	// Flood a SUBCLIENT's reply queue with heartbeats it never reads, then ask the service for
+	// something on the root client.
+	//
+	// The heartbeat answered through an unbounded send. A client that asks and never listens fills
+	// its reply queue, and the next `PONG` then held the whole service - every other client, every
+	// volume, the admin endpoint - with no deadline to end it. The typed dispatch had been given a
+	// bound and called the last such place, which was not true of the heartbeat, either `CONNECT`
+	// form, or the two refusals.
+	//
+	// Returns whether the service is still serving. The clock is moved past the reply deadline so
+	// the stalled subclient is given up on rather than waited out.
+	fn heartbeat_flood_from_silent_client(&mut self, corr: u32, skip: u64) -> bool {
+		use object::channel::Message;
+		let sub = self.connect();
+		// Send and let the service answer, over and over, WITHOUT ever reading a reply.
+		//
+		// Sending a burst first does not work and looked like it did: the request queue fills at the
+		// same depth as the reply queue, so the extra sends are dropped and the service answers
+		// exactly as many as the reply queue can hold - never one more, which is the one that
+		// blocks. Interleaving keeps the requests flowing so the replies pile up past the depth.
+		for _ in 0..200 {
+			let _ = sub.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0));
+			self.pump();
+		}
+		advance_clock(skip);
+		for _ in 0..512 {
+			self.pump();
+		}
+		// The stalled client stays ALIVE across the probe. Dropping it first closes its end, which
+		// releases a blocked send all by itself - so the service recovered for a reason that had
+		// nothing to do with the deadline, and the test passed with the bound removed.
+		let served = self.write(b"vol://tmp/after-flood", b"x", corr);
+		drop(sub);
+		served
+	}
+
 	fn stream_idle_until_deadline(&mut self, path: &[u8], corr: u32, skip: u64) -> bool {
 		use object::channel::Channel;
 		use object::rights::Rights;

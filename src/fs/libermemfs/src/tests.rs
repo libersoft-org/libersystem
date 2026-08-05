@@ -912,6 +912,39 @@ fn a_streamed_rewrite_is_not_promised_the_room_an_ordinary_one_has() {
 }
 
 #[test]
+fn what_the_stream_preflight_promises_a_nested_path_is_what_it_can_take() {
+	// The preflight subtracted the final NAME while the stream charged the whole PATH, so a
+	// destination a few directories deep was told a limit it could not reach: accepted under its
+	// declared ceiling and refused with `NoSpace` before getting there. The deeper the path, the
+	// bigger the lie.
+	//
+	// The property is one sentence: write exactly what you were promised, and it commits.
+	let mut fs = capped(4096);
+	fs.mkdir(b"a").expect("a");
+	fs.mkdir(b"a/b").expect("a/b");
+	fs.mkdir(b"a/b/c").expect("a/b/c");
+	let path: &[u8] = b"a/b/c/file";
+	let promised = fs.stream_len(path).expect("a nested destination has an answer");
+	fs.stream_begin(path).expect("open the stream");
+	let payload = alloc::vec![b'x'; promised];
+	assert_eq!(fs.stream_push(&payload), Ok(()), "the promised bytes are accepted");
+	assert_eq!(fs.stream_commit(), Ok(()), "and the volume takes them");
+	assert_eq!(fs.read_file(path).as_deref(), Ok(&payload[..]), "all of them");
+}
+
+// A test for the reserved volume opening a stream out of its own reservation stood here and was
+// removed, because it passed with the fix reverted.
+//
+// The fault is real - the stream path allocated the pending path beside a reservation holding the
+// volume's whole capacity, where the ordinary write path has released first for as long as the
+// reservation has existed. What a host test cannot produce is the condition that makes it visible:
+// a heap tight enough that those bytes can only come from the reservation. Here the process has
+// gigabytes, so the allocation succeeds either way and the assertion is decoration.
+//
+// It belongs in the kernel suite, against a guest heap sized around the volume - the shape
+// `receiving_into_the_volume_costs_one_buffer_rather_than_two` uses for the same reason.
+
+#[test]
 fn receiving_into_the_volume_costs_one_buffer_rather_than_two() {
 	// The earlier accounting test built its chunk OUTSIDE the budgeted block, so the transport's
 	// own allocation was never measured - and that allocation was the point: the service used to

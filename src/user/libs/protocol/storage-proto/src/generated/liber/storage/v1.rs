@@ -339,6 +339,25 @@ pub mod volume {
 
 	pub trait Service {
 		fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error>;
+		/// List a directory, one entry per frame.
+		///
+		/// The stream ENDS WITH AN EMPTY FRAME. Everything before it is the whole listing; a stream
+		/// that closes without one was cut short, and what arrived is a prefix rather than an answer.
+		/// A consumer that cannot tell those apart reports a truncated directory as an empty one -
+		/// which is what happened here, and cost a round to find, because a producer that failed
+		/// halfway looked exactly like one that had finished.
+		///
+		/// The convention was implemented in the runtime helper and in the consumers chosen by hand;
+		/// stating it HERE is what makes it reachable by a client generated from this contract alone.
+		/// It is specific to this stream: the other `stream<...>` returns in this tree do not send a
+		/// terminal frame, and their consumers do not look for one.
+		///
+		/// What it does NOT have is an error arm, and it cannot have one yet. `result<stream<T>, error>`
+		/// parses, but the generator defers bindings for it - the method then vanishes from the trait
+		/// entirely, replaced by a "bindings deferred" comment - so wrapping this return removes the
+		/// binding rather than improving it. Until the generator emits result-wrapped streams, the
+		/// service answers a listing it could not read with an empty one, which is the semantics this
+		/// contract otherwise spent a round removing. Recorded in M0139 and belonging to M0120.
 		fn list(&mut self, path: String) -> Vec<FileInfo>;
 		fn write(&mut self, path: String, data: crate::codec::Buffer) -> Result<(), Error>;
 		fn remove(&mut self, path: String) -> Result<(), Error>;

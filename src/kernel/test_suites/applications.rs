@@ -300,6 +300,26 @@ fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	assert!(result.pipeline_read.windows(9).any(|window| window == b"in> hello"), "readln read echo's bytes through the broker-allocated edge and echoed them behind its own prefix, got {:?}", core::str::from_utf8(&result.pipeline_read));
 }
 
+tagged_test!(a_fat_volume_accepts_a_write_as_its_first_operation, [Service, Storage, Filesystem]);
+fn a_fat_volume_accepts_a_write_as_its_first_operation() {
+	// The FAT backing mounts lazily, and the destination validation added with the write-stream
+	// work read `self.fs` directly instead of mounting - so `write vol://media/file` answered
+	// `NotFound` when it was the FIRST thing asked of the volume, and started working only after a
+	// `list`, `read` or `status` had mounted it as a side effect. A volume that works depending on
+	// what you did before it is the kind of fault that gets reported as "sometimes".
+	//
+	// The order is the whole test: write FIRST, read afterwards.
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	// `false`: the image keeps free clusters. `true` fills them, which is how the failed-overwrite
+	// test above makes a write fail on purpose - and is what made the first version of this test
+	// fail for a reason that had nothing to do with mounting.
+	let image = fat16_image(&[(*b"SEED    TXT", b"seed")], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &image, image.len() as u64);
+	assert!(media.write(b"vol://media/FIRST.TXT", b"written first", 0x7f01), "a write is accepted as the volume's first operation");
+	assert_eq!(media.open(b"vol://media/FIRST.TXT", 0x7f02), Some(b"written first".to_vec()), "and the bytes are there");
+}
+
 tagged_test!(the_memory_volumes_serve_files_and_keep_nothing_across_a_restart, [Service, Storage, Filesystem]);
 fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	let (_volume, package) = scenario_packages().expect("scenario packages");
@@ -420,6 +440,15 @@ fn the_memory_volumes_bound_and_answer_streams() {
 	let mut orphan = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
 	assert!(orphan.stream_orphaned_by_client(b"vol://tmp/orphan", 0x7b01), "a pending write is given up with the client that asked for it");
 	assert_eq!(orphan.open(b"vol://tmp/orphan", 0x7b03), None, "and nothing was committed for a caller that had gone");
+
+	// A client that asks and never listens does not get to hold the service.
+	//
+	// Every answer is bounded now, not only the typed dispatch: the heartbeat, both `CONNECT`
+	// forms and the two refusals answered through an unbounded send, so a queue full of unread
+	// `PONG`s stopped everyone. The clock is moved past the reply deadline, because the bound is a
+	// deadline and waiting one out honestly would take about a million scheduler passes.
+	let mut flood = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(flood.heartbeat_flood_from_silent_client(0x7c01, 2_000), "a client that never reads its heartbeat replies is dropped, not waited for");
 
 	// A stream handle the service cannot wait on is refused before it reaches the wait set.
 	//
