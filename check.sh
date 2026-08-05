@@ -54,11 +54,27 @@ Gates that inspect built artifacts expect a build to exist; run ./build.sh first
 EOF
 }
 
+# Report HOW a gate failed, not just that the run stopped.
+#
+# `set -e` made a failing gate end the run with whatever the gate had printed - which for a gate
+# that is KILLED is nothing at all. Three runs ended that way in one night, each at a different
+# point, and the empty log left no way to tell a gate that refused its input from one that was
+# taken out from under us. A status is not a diagnosis, but it separates those two: an ordinary
+# non-zero exit means the gate decided, and a signal means something else decided for it.
 run_gate() {
-	local name="$1" cmd="${GATES[$1]:-}"
+	local name="$1" cmd="${GATES[$1]:-}" status=0
 	[[ -n "$cmd" ]] || die "unknown gate '$name' (--list to see them)"
 	note "gate: $name"
-	(cd "$SRC_DIR" && eval "$cmd")
+	(cd "$SRC_DIR" && eval "$cmd") || status=$?
+	if [[ "$status" -ne 0 ]]; then
+		# Bash reports a killed child as 128 + the signal number.
+		if [[ "$status" -gt 128 ]]; then
+			note "gate '$name' was KILLED by signal $((status - 128)) - it did not fail, something stopped it"
+		else
+			note "gate '$name' failed (exit $status)"
+		fi
+		return "$status"
+	fi
 }
 
 run_conformance() {
