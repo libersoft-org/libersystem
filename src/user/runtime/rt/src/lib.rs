@@ -1293,6 +1293,25 @@ pub unsafe fn recv_tagged(channel: u64, buf: &mut [u8], tag: &[u8]) -> Option<u6
 	}
 }
 
+// The capability a program was given, from whichever launcher started it.
+//
+// A launcher may attach one capability to the launch-context message, or send it afterwards under
+// a tag, and a program reached by BOTH has to accept either. The net tools are: the shell opens a
+// NetworkService client and attaches it, while PermissionManager grants one under `CAP_NETWORK` in
+// its own sequence. A tool that waited only for the tag waited forever when the shell started it -
+// and since the shell matches its net commands before the governed router, that was every net
+// command typed at a prompt. It went unnoticed because the governed path is the one the tests
+// cover, and because the manager's startup demonstration runs `ip` that way, so output appears at
+// boot regardless.
+//
+// None when neither arrived, which for these callers is fatal.
+pub unsafe fn granted_capability(bootstrap: u64, attached: u64, tag: &[u8], buf: &mut [u8]) -> Option<u64> {
+	if attached != 0 {
+		return Some(attached);
+	}
+	unsafe { recv_tagged(bootstrap, buf, tag) }
+}
+
 // Receive a "PACKAGE" message - the tag, a u64 little-endian byte length, and a
 // transferred MemoryObject holding a PKGARCH1 archive - then map the object and
 // return its kept handle plus the mapped archive bytes. The archive stays mapped

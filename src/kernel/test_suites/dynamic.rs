@@ -329,6 +329,39 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	assert_eq!(&echo_output.bytes, b"dynamic echo");
 	assert_eq!(&echo_stdout_kernel.recv().expect("dynamic echo newline").bytes, b"\n");
 
+	// A net tool launched the way the SHELL launches one: its NetworkService client rides the
+	// launch-context message rather than arriving under a tag.
+	//
+	// `ip` has two launchers with two different shapes. PermissionManager grants it under `NETWORK`
+	// in its startup demonstration, which is the path every existing test covers - and the reason
+	// nobody noticed the other one. The shell reaches the same program through `dispatch_net`,
+	// which opens a client and hands it to `exec` as the single capability attached to the context
+	// message. Nothing in the shell ever sends a `NETWORK` message, so a tool that waits for one
+	// waits forever: every net command typed at a prompt started a process that never answered.
+	//
+	// The assertion is that the tool ASKS the client it was handed. That is the first thing it
+	// does with a working client and the thing it cannot do with none.
+	let ip_name: &[u8] = b"ip";
+	let (ip_stdout_kernel, ip_stdout_user) = Channel::create();
+	let (ip_bootstrap_kernel, ip_bootstrap_user) = Channel::create();
+	let (ip_net_kernel, ip_net_user) = Channel::create();
+	let mut ip_launch = alloc::vec::Vec::new();
+	ip_launch.extend_from_slice(&3u16.to_le_bytes());
+	ip_launch.extend_from_slice(&24u32.to_le_bytes());
+	ip_launch.extend_from_slice(&(ip_name.len() as u16).to_le_bytes());
+	ip_launch.extend_from_slice(ip_name);
+	ip_launch.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&process_client, &ip_launch, ip_bootstrap_user, Rights::ALL).expect("shell-shaped ip launch request");
+	sched::run_until_idle();
+	let ip_reply = process_client.recv().expect("shell-shaped ip launch reply");
+	assert_eq!(le_u32(&ip_reply.bytes, 0), 24);
+	send_cap(&ip_bootstrap_kernel, b"STDOUT", ip_stdout_user, Rights::ALL).expect("shell-shaped ip stdout");
+	send_cap(&ip_bootstrap_kernel, &crate::tests::launch_context(b"", b""), ip_net_user, Rights::ALL).expect("shell-shaped ip context with its client attached");
+	sched::run_until_idle();
+	let ip_request = ip_net_kernel.recv().expect("a shell-launched net tool queries the client attached to its launch context");
+	assert_eq!(le_u16(&ip_request.bytes, 0), 1, "the query is the NetworkService info op");
+	let _ = ip_stdout_kernel;
+
 	// Load the generated date PIE directly as well. Its capability protocol is covered by
 	// PermissionManager; this assertion isolates staging, provider-DAG loading and relocation
 	// from that policy layer so a loader failure cannot collapse into an empty tool result.

@@ -22,8 +22,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		// Governed launch sends arguments first, then the tagged NetworkService grant.
 		inherit_stdout(bootstrap);
-		let Some(_) = recv_launch_bytes(bootstrap) else { exit() };
-		let netsvc: u64 = recv_tagged(bootstrap, &mut buf, b"NETWORK").unwrap_or_else(|| exit());
+		let Some((_, attached)) = recv_launch_with(bootstrap) else { exit() };
+		let netsvc: u64 = granted_capability(bootstrap, attached, CAP_NETWORK, &mut buf).unwrap_or_else(|| exit());
 		show(netsvc);
 		close(netsvc);
 	}
