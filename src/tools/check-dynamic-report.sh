@@ -55,11 +55,11 @@ for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do waves[$to
 for tool in date log config set lsdev lsusb lssvc usage ps run perm start stop beep; do waves[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss; do waves[$tool]=4; done
 for tool in imgview imgconv play graphics_probe lico licoedit licoview; do waves[$tool]=5; done
-tests[1]='just test-tags service,process,storage'
-tests[2]='just test-tags service,process,storage'
-tests[3]='just test-tags service,process,storage'
-tests[4]='just test-tags service,process'
-tests[5]='just test-tags image,audio,service,process,storage'
+tests[1]='./test.sh --tags service,process,storage'
+tests[2]='./test.sh --tags service,process,storage'
+tests[3]='./test.sh --tags service,process,storage'
+tests[4]='./test.sh --tags service,process'
+tests[5]='./test.sh --tags image,audio,service,process,storage'
 
 manifest_tools="$(jq -r '.programs[] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | .name' <<<"$manifest_json" | sort)"
 wave_tools="$(printf '%s\n' "${!waves[@]}" | sort)"
@@ -408,7 +408,7 @@ generate_image_report() {
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
 		staged_bytes=$((${image_pie_bytes[$target]} + ${image_provider_bytes[$target]}))
 		shared_bytes=$((${image_shared_executable_bytes[$target]} + ${image_provider_shared_bytes[$target]}))
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "${image_tools_count[$target]}" "${image_object_bytes[$target]}" "${image_pie_bytes[$target]}" "${image_provider_bytes[$target]}" "$staged_bytes" "${image_private_bytes[$target]}" "$shared_bytes" 'just dynamic-report-check'
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "${image_tools_count[$target]}" "${image_object_bytes[$target]}" "${image_pie_bytes[$target]}" "${image_provider_bytes[$target]}" "$staged_bytes" "${image_private_bytes[$target]}" "$shared_bytes" './check.sh --gate dynamic-report'
 	done
 }
 

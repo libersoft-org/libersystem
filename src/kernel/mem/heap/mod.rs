@@ -60,13 +60,45 @@ fn grow(heap: &mut Heap, at_least: usize) -> bool {
 	while virt < base + bytes {
 		let phys = match frame::allocate() {
 			Some(p) => p,
-			None => return false,
+			// Out of frames partway through. Everything claimed so far has to go back, or
+			// running out of memory would COST memory: the virtual range was claimed by the
+			// bump above and the frames below `virt` are mapped into it, and a bare `return
+			// false` handed the range to nobody and left those frames unreachable for the life
+			// of the boot. The next grow would then start past a hole it can never use.
+			//
+			// Unwinding rather than reserving the range at the end, because the frames must be
+			// returned either way - the ordering of the bump only decides whether the virtual
+			// range leaks as well.
+			None => {
+				unwind(base, virt, base + bytes);
+				return false;
+			}
 		};
 		paging::map_page(virt, phys, paging::WRITABLE | paging::NO_EXECUTE);
 		virt += PAGE_SIZE;
 	}
 	unsafe { heap.add_free_region(base as usize, bytes as usize) };
 	true
+}
+
+// Give back a partial growth region: unmap every page from `base` up to (not including) `mapped`,
+// free the frame each held, and release the virtual range.
+//
+// The range is released with a compare-exchange rather than a subtracting `fetch_sub`: only the
+// caller that is still the LAST claimant may take it back. `grow` runs under the allocator lock so
+// today there is no second claimant, but a rollback that assumes it is last is the kind of
+// arithmetic that silently overlaps two regions the moment that stops being true. If the exchange
+// fails, the virtual range stays claimed - address space, of which there is 2^48, rather than
+// frames, of which there are not.
+fn unwind(base: u64, mapped: u64, end: u64) {
+	let mut virt = base;
+	while virt < mapped {
+		if let Some(phys) = paging::unmap_page(virt) {
+			frame::deallocate(phys);
+		}
+		virt += PAGE_SIZE;
+	}
+	let _ = NEXT_REGION.compare_exchange(end, base, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 // The heap's totals: (total bytes mapped so far, bytes currently free), the free
@@ -255,6 +287,19 @@ unsafe impl GlobalAlloc for LockedHeap {
 
 const fn align_up(value: usize, align: usize) -> usize {
 	(value + align - 1) & !(align - 1)
+}
+
+// Ask the allocator for memory and get back null on failure, instead of the abort that `Box` and
+// `Vec` take on OOM. Deliberately test-only: production code that cannot get memory has nothing
+// useful to do with the news, and the whole point of the growth path is that it is invisible.
+#[cfg(test)]
+pub fn try_alloc(layout: Layout) -> *mut u8 {
+	unsafe { ALLOCATOR.alloc(layout) }
+}
+
+#[cfg(test)]
+pub fn dealloc(pointer: *mut u8, layout: Layout) {
+	unsafe { ALLOCATOR.dealloc(pointer, layout) }
 }
 
 #[cfg(test)]

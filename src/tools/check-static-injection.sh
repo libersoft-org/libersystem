@@ -58,18 +58,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-build_kernel() {
-	local target="$1"
+# Drive the step that reads the staged artifacts and refuses the malformed ones.
+#
+# That used to be the kernel's build.rs, so this gate rebuilt the kernel - with a `cargo clean -p
+# kernel` in front, because a build.rs only reruns when cargo thinks it must. M0137 split compiling
+# from packaging and moved every one of these rejections into `mkpackages`; the kernel's build.rs
+# now says so itself. From that commit until this one the gate compiled a kernel that reads no
+# artifacts, saw it succeed, and reported that an injection had been caught. Six gates in the
+# `static-image` family did this. Nothing here needs a kernel: what is under test is packaging.
+package_arch() {
+	local arch="$1"
 	local output="$2"
 	local status
-	pushd "$root/kernel" >/dev/null
-	if [[ "$target" == x86_64-unknown-none ]]; then
-		timeout 600 cargo clean -p kernel >/dev/null 2>&1
-		if timeout 600 cargo build >"$output" 2>&1; then status=0; else status=$?; fi
-	else
-		timeout 600 cargo clean -p kernel --target "$target" >/dev/null 2>&1
-		if timeout 600 cargo build --target "$target" >"$output" 2>&1; then status=0; else status=$?; fi
-	fi
+	pushd "$root/tools/mkpackages" >/dev/null
+	if timeout 600 cargo run --quiet -- "$arch" >"$output" 2>&1; then status=0; else status=$?; fi
 	popd >/dev/null
 	return "$status"
 }
@@ -305,7 +307,7 @@ check_target() {
 		return 1
 	}
 	baseline_log="$(mktemp)"
-	build_kernel "$target" "$baseline_log"
+	package_arch "$label" "$baseline_log"
 	[[ -f "$volume" ]] || {
 		echo "image-injection-check: kernel build did not export $label volume package" >&2
 		return 1
@@ -321,7 +323,7 @@ check_target() {
 	for mutation in "${mutations[@]}"; do
 		cp "$backup" "$artifact"
 		inject_artifact
-		if build_kernel "$target" "$failure_log"; then
+		if package_arch "$label" "$failure_log"; then
 			cat "$failure_log" >&2
 			echo "image-injection-check: $label $mutation injection unexpectedly built" >&2
 			return 1
@@ -332,7 +334,7 @@ check_target() {
 		fi
 		after_failure="$(sha256sum "$volume" | awk '{print $1}')"
 		if [[ "$before" != "$after_failure" ]]; then
-			echo "image-injection-check: $label rewrote volume.pkg after rejecting $mutation" >&2
+			echo "image-injection-check: $label rewrote $volume_name after rejecting $mutation" >&2
 			return 1
 		fi
 		restore_artifact
@@ -340,7 +342,7 @@ check_target() {
 			echo "image-injection-check: $label failed to restore the dynamic artifact" >&2
 			return 1
 		fi
-		build_kernel "$target" "$restore_log"
+		package_arch "$label" "$restore_log"
 		after_restore="$(sha256sum "$volume" | awk '{print $1}')"
 		if [[ "$before" != "$after_restore" ]]; then
 			echo "image-injection-check: $label rebuilt a different volume after artifact restoration" >&2
@@ -358,11 +360,11 @@ check_target() {
 
 case "$mode" in
 all)
-	check_target x86_64 x86_64-unknown-none volume.pkg
+	check_target x86_64 x86_64-unknown-none volume-x86_64.pkg
 	check_target aarch64 aarch64-unknown-none volume-aarch64.pkg
 	check_target riscv64 riscv64gc-unknown-none-elf volume-riscv64.pkg
 	;;
-x86_64) check_target x86_64 x86_64-unknown-none volume.pkg ;;
+x86_64) check_target x86_64 x86_64-unknown-none volume-x86_64.pkg ;;
 aarch64) check_target aarch64 aarch64-unknown-none volume-aarch64.pkg ;;
 riscv64) check_target riscv64 riscv64gc-unknown-none-elf volume-riscv64.pkg ;;
 *)

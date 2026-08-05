@@ -190,6 +190,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0139 - LiberMemFS: a writable filesystem that lives in memory](M0139.md)
 - [x] [M0140 - The build interface: scripts with flags, and a Justfile that stops being one](M0140.md)
 - [x] [M0141 - Streams as pending operations, and a harness that can move the clock](M0141.md)
+- [x] [M0142 - Gates that stopped checking](M0142.md)
 
 ### Definition of done (phase 2)
 
