@@ -31,6 +31,22 @@ const HEAP_START: u64 = 0xffff_e000_0000_0000;
 const HEAP_START: u64 = 0xffff_ffd0_0000_0000;
 const HEAP_REGION: u64 = 2 * 1024 * 1024; // the initial size and the growth unit
 
+// How far the heap may grow.
+//
+// The bump had no bound at all, which read as "the frame pool is the real limit" - true for
+// physical memory and false for the page tables above it. Every top-level entry the window
+// crosses has to exist BEFORE the first address space is created, because address spaces copy
+// the kernel half rather than share it and a later entry is invisible to the ones already made.
+// A window that cannot be enumerated cannot be reserved, so it gets a size.
+//
+// 512 GiB is one PML4 entry on x86_64 and aarch64. riscv64's Sv39 top level covers 1 GiB, so
+// the window is stated in whole entries there and kept well inside the 64 GiB gap between the
+// heap line and the kernel mmap window above it.
+#[cfg(not(target_arch = "riscv64"))]
+pub(crate) const HEAP_WINDOW: u64 = 512 * 1024 * 1024 * 1024;
+#[cfg(target_arch = "riscv64")]
+pub(crate) const HEAP_WINDOW: u64 = 8 * 1024 * 1024 * 1024;
+
 // The virtual base the next growth region maps at (bumped under the allocator lock).
 static NEXT_REGION: AtomicU64 = AtomicU64::new(0);
 
@@ -50,12 +66,25 @@ pub fn init() {
 	unsafe { ALLOCATOR.lock().init(HEAP_START as usize, HEAP_REGION as usize) };
 }
 
+// Give the whole heap window its top-level page-table entries, so no later growth creates one.
+// Called at boot, before any address space exists to be copied from the kernel's.
+pub fn reserve_window() {
+	paging::reserve_kernel_top_level(HEAP_START, HEAP_WINDOW);
+}
+
 // Map another heap region (at least `at_least` bytes, in HEAP_REGION multiples) and
 // hand it to the free list. Called under the allocator lock when an allocation finds
 // no fitting region; false when the frame pool is exhausted (the real OOM).
 fn grow(heap: &mut Heap, at_least: usize) -> bool {
 	let bytes: u64 = (at_least as u64 + PAGE_SIZE).next_multiple_of(HEAP_REGION);
 	let base: u64 = NEXT_REGION.fetch_add(bytes, Ordering::Relaxed);
+	// Past the reserved window there are no top-level entries, and creating one here would be
+	// invisible to every address space already made - a triple fault the next time one of them
+	// is switched to. Refuse instead, and give the range back so the bump does not run away.
+	if base + bytes > HEAP_START + HEAP_WINDOW {
+		let _ = NEXT_REGION.compare_exchange(base + bytes, base, Ordering::Relaxed, Ordering::Relaxed);
+		return false;
+	}
 	let mut virt = base;
 	while virt < base + bytes {
 		let phys = match frame::allocate() {

@@ -68,6 +68,12 @@ pub fn init(regions: &[MemRegion], hhdm: u64) {
 	// fragmentation is bounded by memory, not a fixed table), and the memory map
 	// can be retained (Vec) for runtime inspection.
 	frame::upgrade_to_heap();
+	// Reserve every top-level page-table entry the kernel's two growing windows can ever need,
+	// while the kernel's is still the only address space in existence. After this point a new
+	// address space copies a kernel half that is already complete, and nothing the heap or the
+	// mmap pool does later can add an entry the copies would miss.
+	heap::reserve_window();
+	crate::syscall::reserve_kernel_vmap();
 	let mut retained = MEMMAP.lock();
 	for region in regions {
 		retained.push(abi::MemmapRegion { base: region.base, length: region.length, kind: region.kind, _pad: 0 });

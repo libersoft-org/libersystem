@@ -1120,6 +1120,34 @@ pub const CAP_FNET: &[u8] = b"FNET";
 pub const CAP_DISPLAY: &[u8] = b"DISPLAY";
 pub const CAP_GPU: &[u8] = b"GPU";
 pub const CAP_POINTER: &[u8] = b"POINTER";
+// The PermissionManager handshake (ServiceManager -> PermissionManager). It takes more
+// capabilities than any other child - twenty-three - because it grants narrowed copies of them
+// to the governed tools it launches, so its handshake is where an ordered run of messages was
+// most expensive to get wrong. The tag bytes are the ones this handshake already used; only the
+// mechanism changed, from position to name.
+pub const CAP_NETWORK: &[u8] = b"NETWORK";
+pub const CAP_DISPLAY_ADMIN: &[u8] = b"DISPLAY_ADMIN";
+pub const CAP_INPUT_ADMIN: &[u8] = b"INPUT_ADMIN";
+pub const CAP_AUDIO_ADMIN: &[u8] = b"AUDIO_ADMIN";
+pub const CAP_PROCESS_GRANT: &[u8] = b"PROCESS_GRANT";
+pub const CAP_SUPERVISOR: &[u8] = b"SUPERVISOR";
+pub const CAP_STORAGE_MEDIA: &[u8] = b"STORAGE_MEDIA";
+pub const CAP_STORAGE_ISO: &[u8] = b"STORAGE_ISO";
+pub const CAP_STORAGE_UDF: &[u8] = b"STORAGE_UDF";
+pub const CAP_STORAGE_USB: &[u8] = b"STORAGE_USB";
+pub const CAP_STORAGE_RAM: &[u8] = b"STORAGE_RAM";
+pub const CAP_STORAGE_TMP: &[u8] = b"STORAGE_TMP";
+pub const CAP_SERVICES: &[u8] = b"SERVICES";
+pub const CAP_USBBUS: &[u8] = b"USBBUS";
+pub const CAP_SERVE: &[u8] = b"SERVE";
+// The `volumes` bundle PermissionManager grants to a governed tool: one tag per mounted volume,
+// a tag with no handle where a volume is absent. Adding one used to mean editing every tool that
+// receives the bundle, because a message a tool did not drain was consumed as whatever it read
+// next - which is how growing this from five to seven left two behind in every governed tool,
+// and surfaced as a working directory that was really a volume client.
+pub const CAP_SYSTEM: &[u8] = b"SYSTEM";
+pub const CAP_RAM: &[u8] = b"RAM";
+pub const CAP_TMP: &[u8] = b"TMP";
 
 // A received bootstrap capability set: every named capability the parent sent
 // before READY, taken by name. Whatever the receiver does not take is closed when

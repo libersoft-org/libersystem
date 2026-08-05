@@ -232,6 +232,17 @@ fn alloc_kernel_vrange(len: u64) -> u64 {
 	KERNEL_VMAP.lock().alloc(len)
 }
 
+// Give the whole kernel mmap window its top-level page-table entries, so no later mapping into
+// it creates one. Called at boot, before any address space exists to be copied from the kernel's.
+//
+// This window is what caught the problem: an address space made before the first object was
+// mapped here lacked the entry, and the scheduler's guard refused to switch to it rather than
+// let the machine triple-fault. The window is bounded (MMAP_WINDOW) precisely so it can be
+// enumerated and reserved.
+pub(crate) fn reserve_kernel_vmap() {
+	crate::arch::paging::reserve_kernel_top_level(KERNEL_MMAP_BASE, MMAP_WINDOW);
+}
+
 fn alloc_user_vrange(len: u64) -> u64 {
 	USER_VMAP.lock().alloc(len)
 }

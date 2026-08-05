@@ -82,15 +82,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Received::Message { len, .. } => buf[..len].to_vec(),
 			Received::Closed => exit(),
 		};
-		let system = recv_tagged(bootstrap, &mut buf, b"SYSTEM").unwrap_or(0);
-		let media = recv_tagged(bootstrap, &mut buf, b"MEDIA").unwrap_or(0);
-		let iso = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
-		let udf = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
-		let usb = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or(0);
-		// Two more volumes follow USB in the bundle; drained so nothing is left to be read as
-		// the next message.
-		let _ = recv_tagged(bootstrap, &mut buf, b"RAM");
-		let _ = recv_tagged(bootstrap, &mut buf, b"TMP");
+		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
+		// for are simply not taken, and the set closes them when it drops - where before they had
+		// to be drained by hand, because a message left on the channel was read as the NEXT thing
+		// this tool expected.
+		let mut volumes: CapSet = recv_caps(bootstrap);
+		let system = volumes.take(CAP_SYSTEM);
+		let media = volumes.take(CAP_MEDIA);
+		let iso = volumes.take(CAP_ISO);
+		let udf = volumes.take(CAP_UDF);
+		let usb = volumes.take(CAP_USB);
 		let audio_channel = recv_tagged(bootstrap, &mut buf, b"AUDIO_STREAM").unwrap_or(0);
 		let cwd = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, .. } => buf[..len].to_vec(),

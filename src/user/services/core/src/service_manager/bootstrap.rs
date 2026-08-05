@@ -565,12 +565,12 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(h) => h,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"STORAGE", storage) {
+		if !send_blocking(manager_side, CAP_STORAGE, storage) {
 			return false;
 		}
 		// A duplicable LogService client, so the manager can grant a narrowed copy.
 		let log_dup: i64 = duplicate(log_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER | RIGHT_DUPLICATE);
-		if log_dup < 0 || !send_blocking(manager_side, b"LOG", log_dup as u64) {
+		if log_dup < 0 || !send_blocking(manager_side, CAP_LOG, log_dup as u64) {
 			return false;
 		}
 		// A fresh NetworkService connection the manager holds but withholds from the
@@ -581,7 +581,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(Ok(h)) => h,
 			_ => return false,
 		};
-		if !send_blocking(manager_side, b"NETWORK", perm_net) {
+		if !send_blocking(manager_side, CAP_NETWORK, perm_net) {
 			return false;
 		}
 		// A fresh TimeService connection the manager grants to the governed `date` command
@@ -590,7 +590,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(h) => h,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"TIME", time_conn) {
+		if !send_blocking(manager_side, CAP_TIME, time_conn) {
 			return false;
 		}
 		// A fresh ConfigService connection the manager grants to the governed `config` / `set`
@@ -599,7 +599,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(h) => h,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"CONFIG", config_conn) {
+		if !send_blocking(manager_side, CAP_CONFIG, config_conn) {
 			return false;
 		}
 		// A fresh DeviceService connection the manager grants to the governed `dev` command
@@ -608,7 +608,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(h) => h,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"DEVICE", device_conn) {
+		if !send_blocking(manager_side, CAP_DEVICE, device_conn) {
 			return false;
 		}
 		// A fresh AudioService connection the manager grants to the governed `beep` command
@@ -617,16 +617,16 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(h) => h,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"AUDIO", audio_conn) {
+		if !send_blocking(manager_side, CAP_AUDIO, audio_conn) {
 			return false;
 		}
-		if !send_blocking(manager_side, b"DISPLAY_ADMIN", display_admin) {
+		if !send_blocking(manager_side, CAP_DISPLAY_ADMIN, display_admin) {
 			return false;
 		}
-		if !send_blocking(manager_side, b"INPUT_ADMIN", input_admin) {
+		if !send_blocking(manager_side, CAP_INPUT_ADMIN, input_admin) {
 			return false;
 		}
-		if !send_blocking(manager_side, b"AUDIO_ADMIN", audio_admin) {
+		if !send_blocking(manager_side, CAP_AUDIO_ADMIN, audio_admin) {
 			return false;
 		}
 		// A fresh ResourceManager connection the manager grants to the governed `usage` command
@@ -635,7 +635,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(h) => h,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"RESOURCE", resource_conn) {
+		if !send_blocking(manager_side, CAP_RESOURCE, resource_conn) {
 			return false;
 		}
 		// A fresh ProcessService connection the manager grants to the governed `ps` command
@@ -645,7 +645,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(h) => h,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"PROCESS_GRANT", process_grant) {
+		if !send_blocking(manager_side, CAP_PROCESS_GRANT, process_grant) {
 			return false;
 		}
 		// A fresh admin channel the manager grants to the governed `stop` command (whose
@@ -658,7 +658,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(pair) => pair,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"SUPERVISOR", admin_cli2) {
+		if !send_blocking(manager_side, CAP_SUPERVISOR, admin_cli2) {
 			return false;
 		}
 		*admin_server2 = admin_srv2;
@@ -670,29 +670,29 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 		// has no factory (its client is 0) and is handed over as 0, which `lsvol` shows as
 		// zero files.
 		let media_conn: u64 = service_connect(media_client).unwrap_or(0);
-		if !send_blocking(manager_side, b"STORAGE_MEDIA", media_conn) {
+		if !send_blocking(manager_side, CAP_STORAGE_MEDIA, media_conn) {
 			return false;
 		}
 		let iso_conn: u64 = service_connect(iso_client).unwrap_or(0);
-		if !send_blocking(manager_side, b"STORAGE_ISO", iso_conn) {
+		if !send_blocking(manager_side, CAP_STORAGE_ISO, iso_conn) {
 			return false;
 		}
 		let udf_conn: u64 = service_connect(udf_client).unwrap_or(0);
-		if !send_blocking(manager_side, b"STORAGE_UDF", udf_conn) {
+		if !send_blocking(manager_side, CAP_STORAGE_UDF, udf_conn) {
 			return false;
 		}
 		let usb_conn: u64 = service_connect(usb_client).unwrap_or(0);
-		if !send_blocking(manager_side, b"STORAGE_USB", usb_conn) {
+		if !send_blocking(manager_side, CAP_STORAGE_USB, usb_conn) {
 			return false;
 		}
 		// The two memory volumes, bundled the same way. They have no disk to be absent, so a 0
 		// here means only that their service did not come up.
 		let ram_conn: u64 = service_connect(ram_client).unwrap_or(0);
-		if !send_blocking(manager_side, b"STORAGE_RAM", ram_conn) {
+		if !send_blocking(manager_side, CAP_STORAGE_RAM, ram_conn) {
 			return false;
 		}
 		let tmp_conn: u64 = service_connect(tmp_client).unwrap_or(0);
-		if !send_blocking(manager_side, b"STORAGE_TMP", tmp_conn) {
+		if !send_blocking(manager_side, CAP_STORAGE_TMP, tmp_conn) {
 			return false;
 		}
 		// A fresh supervisor-status channel the manager grants to the governed `lssvc` command
@@ -704,7 +704,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(pair) => pair,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"SERVICES", status_cli) {
+		if !send_blocking(manager_side, CAP_SERVICES, status_cli) {
 			return false;
 		}
 		*stats_server2 = status_srv;
@@ -712,7 +712,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 		// command (whose manifest grants usb): handed up by DeviceManager in phase 2, held by
 		// the supervisor until here (0 when the driver never came up - the manager simply
 		// cannot grant what it does not hold).
-		if !send_blocking(manager_side, b"USBBUS", usbq_client) {
+		if !send_blocking(manager_side, CAP_USBBUS, usbq_client) {
 			return false;
 		}
 		// A fresh ProcessService connection the manager drives to load the components it
@@ -721,11 +721,17 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			Some(h) => h,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"PROCESS", proc_conn) {
+		if !send_blocking(manager_side, CAP_PROCESS, proc_conn) {
 			return false;
 		}
 		// The channel its clients reach it on; the client end kept for the shell.
-		bootstrap_serve(manager_side, perm_client)
+		if !bootstrap_serve(manager_side, perm_client) {
+			return false;
+		}
+		// END the run. Without it the receiver cannot tell "the parent sent everything" from
+		// "the parent is not finished yet", which is what made a receive with no matching send
+		// wait forever - or worse, take the next handoff in the sequence and read it as its own.
+		send_ready(manager_side)
 	}
 }
 
@@ -791,7 +797,7 @@ pub(super) unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> boo
 			Some(pair) => pair,
 			None => return false,
 		};
-		if !send_blocking(manager_side, b"SERVE", service_server) {
+		if !send_blocking(manager_side, CAP_SERVE, service_server) {
 			return false;
 		}
 		*client = service_client;

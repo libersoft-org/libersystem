@@ -155,7 +155,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0104 - Architecture sweep: memory protection, the display path, and the plumbing debt](M0104.md)
 - [x] [M0105 - Kernel wake path: per-object wait queues, cross-core wake IPIs, and the serial RX interrupt](M0105.md)
 - [x] [M0106 - Ring-3 preemption: per-thread kernel entry stacks](M0106.md)
-- [ ] [M0107 - Kernel hardening: SMAP/SMEP, frame allocator bounds, and channel backpressure](M0107.md)
+- [x] [M0107 - Kernel hardening: SMAP/SMEP, frame allocator bounds, and channel backpressure](M0107.md)
 - [x] [M0108 - ABI versioning and boot image hygiene](M0108.md)
 - [x] [M0109 - Service lifecycle: a data-driven manifest, a typed grant sender, and honest failure reports](M0109.md)
 - [x] [M0110 - Runtime elasticity: NetworkService capacity and device hotplug](M0110.md)

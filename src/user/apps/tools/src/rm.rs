@@ -34,16 +34,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// 3. receive the four volume clients the `volumes` capability bundles (SYSTEM / MEDIA /
 		//    ISO / UDF, in grant order); a volume whose disk is absent arrives as 0.
-		let system: u64 = recv_tagged(bootstrap, &mut buf, b"SYSTEM").unwrap_or(0);
-		let media: u64 = recv_tagged(bootstrap, &mut buf, b"MEDIA").unwrap_or(0);
-		let iso: u64 = recv_tagged(bootstrap, &mut buf, b"ISO").unwrap_or(0);
-		let udf: u64 = recv_tagged(bootstrap, &mut buf, b"UDF").unwrap_or(0);
-		let usb: u64 = recv_tagged(bootstrap, &mut buf, b"USB").unwrap_or(0);
-		// The bundle carries two more volumes after USB. They are drained even where this tool
-		// has no use for them: the sequence has no length in front of it, so a message left
-		// behind is consumed as whatever is read next.
-		let _ = recv_tagged(bootstrap, &mut buf, b"RAM");
-		let _ = recv_tagged(bootstrap, &mut buf, b"TMP");
+		// Taken BY NAME out of the bundle, which ends at READY. The volumes this tool has no use
+		// for are simply not taken, and the set closes them when it drops - where before they had
+		// to be drained by hand, because a message left on the channel was read as the NEXT thing
+		// this tool expected, and the thing after the bundle is the working directory.
+		let mut volumes: CapSet = recv_caps(bootstrap);
+		let system: u64 = volumes.take(CAP_SYSTEM);
+		let media: u64 = volumes.take(CAP_MEDIA);
+		let iso: u64 = volumes.take(CAP_ISO);
+		let udf: u64 = volumes.take(CAP_UDF);
+		let usb: u64 = volumes.take(CAP_USB);
 		// 4. receive the inherited working directory (the last bootstrap message), and resolve
 		//    the path argument against it so a relative path reaches the same file the shell would.
 		let cwd: Vec<u8> = match recv_blocking(bootstrap, &mut buf) {

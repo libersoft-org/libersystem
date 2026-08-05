@@ -445,10 +445,11 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	send_cap(&pm_boot_kernel, b"STORAGE_ISO", storage_iso_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_UDF", storage_udf_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"STORAGE_USB", storage_usb_client, Rights::ALL)?;
-	// The two memory volumes. Sent even though this scenario mounts neither: PermissionManager
-	// reads its bootstrap as an ORDERED sequence, so a message it expects and does not get
-	// swallows the next one and shifts everything after it - which is exactly how this failed
-	// when the pair was added to the manager and not here.
+	// The two memory volumes. Sent even though this scenario mounts neither, though no longer
+	// because it must be: PermissionManager now takes its capabilities by NAME, so one it never
+	// receives simply reads as absent instead of swallowing the next message and shifting
+	// everything after it - which is exactly how this failed when the pair was added to the
+	// manager and not here. Kept because the scenario is more faithful for sending them.
 	for tag in [b"STORAGE_RAM".as_slice(), b"STORAGE_TMP".as_slice()] {
 		pm_boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not hand PermissionManager a memory volume slot")?;
 	}
@@ -456,6 +457,12 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	send_cap(&pm_boot_kernel, b"USBBUS", usb_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"PROCESS", process_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"SERVE", perm_server, Rights::ALL)?;
+	// END the run, the way the supervisor does. PermissionManager takes its capabilities by name
+	// out of a set read up to this terminator, so without it the manager waits for a message that
+	// never comes and does nothing at all - which is how this harness first failed after that
+	// migration. Being a hand-written third sender of a handshake is exactly why the ordered
+	// version of it kept drifting.
+	pm_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not end PermissionManager's bootstrap")?;
 
 	sched::run_until_idle();
 	let open_request = net_server.recv().map_err(|_| "PermissionManager did not request a fresh NetworkService client")?;
@@ -1477,6 +1484,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 			bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("play absent volume bootstrap");
 		}
+		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 		send_cap(&bootstrap, b"AUDIO_STREAM", audio, Rights::ALL).expect("play audio-stream bootstrap");
 		bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("play cwd bootstrap");
 		(stdout, process)
@@ -2996,6 +3004,7 @@ fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, 
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv absent volume");
 	}
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv cwd");
 	let mut line = None;
 	for _ in 0..100_000 {
@@ -3041,7 +3050,12 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 	bootstrap.send(Message::new(b"--help".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview help system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview help media volume");
-	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice(), b"DISPLAY".as_slice(), b"INPUT_KEYS".as_slice()] {
+	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help absent capability");
+	}
+	// The bundle ends here; DISPLAY and INPUT_KEYS are separate grants that follow it.
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
+	for tag in [b"DISPLAY".as_slice(), b"INPUT_KEYS".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help absent capability");
 	}
 	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help cwd");
@@ -3091,6 +3105,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview absent volume");
 	}
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("imgview display");
 	send_cap(&bootstrap, b"INPUT_KEYS", input_client, Rights::ALL).expect("imgview input");
 	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview cwd");
@@ -3277,6 +3292,7 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent volume");
 	}
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico cwd");
 
 	let mut output = alloc::vec::Vec::new();

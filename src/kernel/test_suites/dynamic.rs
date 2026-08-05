@@ -506,6 +506,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
 		mkdir_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic mkdir absent volume");
 	}
+	mkdir_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	mkdir_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic mkdir cwd");
 	let mut mkdir_prefix = None;
 	for _ in 0..100_000 {
@@ -539,6 +540,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
 		write_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic write absent volume");
 	}
+	write_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	write_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic write cwd");
 	let mut write_prefix = None;
 	for _ in 0..100_000 {
@@ -572,6 +574,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
 		cat_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic cat absent volume");
 	}
+	cat_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	cat_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic cat cwd");
 	let mut cat_output = None;
 	for _ in 0..100_000 {
@@ -605,6 +608,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 		for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
 			tool_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic traversal absent volume");
 		}
+		tool_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 		tool_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic traversal cwd");
 		let mut captured = alloc::vec::Vec::new();
 		for _ in 0..100_000 {
@@ -645,6 +649,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
 		full_rmdir_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("non-empty rmdir absent volume");
 	}
+	full_rmdir_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	full_rmdir_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("non-empty rmdir cwd");
 	let mut full_rmdir_prefix = None;
 	for _ in 0..100_000 {
@@ -678,6 +683,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
 		rm_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic rm absent volume");
 	}
+	rm_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	rm_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("dynamic rm cwd");
 	let mut rm_prefix = None;
 	for _ in 0..100_000 {
@@ -710,6 +716,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
 		rmdir_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("empty rmdir absent volume");
 	}
+	rmdir_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	rmdir_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("empty rmdir cwd");
 	let mut rmdir_prefix = None;
 	for _ in 0..100_000 {
@@ -742,6 +749,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	for tag in [&b"MEDIA"[..], &b"ISO"[..], &b"UDF"[..], &b"USB"[..], &b"RAM"[..], &b"TMP"[..]] {
 		missing_bootstrap_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("missing-file cat absent volume");
 	}
+	missing_bootstrap_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	missing_bootstrap_kernel.send(Message::new(b"vol://system/".to_vec(), alloc::vec::Vec::new(), 0)).expect("missing-file cat cwd");
 	let mut missing_prefix = None;
 	for _ in 0..100_000 {

@@ -237,6 +237,38 @@ pub fn remove_bootstrap_identity() {
 	}
 }
 
+// Give every top-level entry covering [base, base + len) a table, in the kernel's own PML4,
+// before any address space exists to be copied from it.
+//
+// `new_address_space` COPIES the kernel half. That is fine for mappings made UNDER an existing
+// PML4 entry - the copied entry points at the kernel's own intermediate tables, so later changes
+// below it are visible everywhere - but a mapping that needs a NEW PML4 entry writes it only into
+// the kernel's table. Every address space made before that moment is missing it, and switching to
+// one loads a CR3 that does not map the kernel executing in it: fault, fault again in the handler
+// that needs the same mapping, triple fault, guest gone with nothing on the wire.
+//
+// `kernel_half_divergence` exists to catch exactly that and turn it into a panic naming the entry.
+// It has been catching it: with a narrow tag selection, the first mapping into the kernel mmap
+// window landed after an address space had been created and the suite died at PML4[464]. A guard
+// that reports the collapse is worth having; not reaching the state at all is worth more.
+//
+// The cost is one frame per top-level slot, paid once at boot: the tables are empty, and every
+// address space then inherits entries that will never change again.
+pub fn reserve_kernel_top_level(base: u64, len: u64) {
+	const SLOT: u64 = 1 << 39; // one PML4 entry
+	let _guard = PT_LOCK.lock();
+	let pml4_phys = active_pml4_phys();
+	let mut virt = base & !(SLOT - 1);
+	let end = base + len;
+	unsafe {
+		let pml4 = table_ptr(pml4_phys);
+		while virt < end {
+			next_table_create(pml4, table_index(virt, 39), 0).expect("out of frames: kernel-half reservation");
+			virt += SLOT;
+		}
+	}
+}
+
 // Map `virt` to `phys` in the address space rooted at `pml4_phys`. The mapping
 // takes effect immediately if that address space is the active one; otherwise it
 // becomes visible when CR3 is loaded with it (which flushes the TLB anyway), so
@@ -325,6 +357,9 @@ pub fn unmap_page_in(pml4_phys: u64, virt: u64) -> Option<u64> {
 // kernel it is executing in - which faults on the next instruction fetch, faults again in the
 // handler that needs the same mapping, and triple-faults. From outside that is a guest that
 // vanishes with no message at all.
+// Bits the CPU writes into a page-table entry on its own: Accessed (5) and Dirty (6).
+const HARDWARE_MAINTAINED: u64 = (1 << 5) | (1 << 6);
+
 pub fn kernel_half_divergence(pml4_phys: u64, reference: u64) -> Option<(usize, u64, u64)> {
 	let _guard = PT_LOCK.lock();
 	unsafe {
@@ -332,7 +367,12 @@ pub fn kernel_half_divergence(pml4_phys: u64, reference: u64) -> Option<(usize, 
 		let refr = table_ptr(reference);
 		for i in 256..ENTRY_COUNT {
 			let (a, b) = (this.add(i).read_volatile(), refr.add(i).read_volatile());
-			if a != b {
+			// Compare what SOFTWARE wrote. The CPU sets Accessed on every entry it walks and
+			// Dirty on the ones it writes through, so a copy taken before the kernel first
+			// touched an entry differs from the original in bits neither side chose. Reporting
+			// that as divergence is a false alarm about a mapping that is identical where it
+			// matters - the frame it points at and the permissions it grants.
+			if a & !HARDWARE_MAINTAINED != b & !HARDWARE_MAINTAINED {
 				return Some((i, a, b));
 			}
 		}

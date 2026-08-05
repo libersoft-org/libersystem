@@ -307,7 +307,19 @@ check_target() {
 		return 1
 	}
 	baseline_log="$(mktemp)"
-	package_arch "$label" "$baseline_log"
+	# Say so when the BASELINE cannot be built, because that is this gate's most likely failure and
+	# it used to be its quietest. The gate mutates a staged artifact in place and restores it from
+	# an EXIT trap, so a run that is killed rather than exiting leaves the artifact malformed - and
+	# the next run's baseline then fails, correctly, because `mkpackages` refuses it. Unguarded
+	# under `set -e` that was an empty log and exit 1: no message, no artifact named, nothing to
+	# act on. It cost two wrong diagnoses in one night.
+	if ! package_arch "$label" "$baseline_log"; then
+		cat "$baseline_log" >&2
+		echo "image-injection-check: $label baseline packaging failed before any injection" >&2
+		echo "  A previous run of this gate may have been killed while $artifact was mutated." >&2
+		echo "  Rebuild it and try again:  ./build.sh --arch $label --part user" >&2
+		return 1
+	fi
 	[[ -f "$volume" ]] || {
 		echo "image-injection-check: kernel build did not export $label volume package" >&2
 		return 1
@@ -342,7 +354,11 @@ check_target() {
 			echo "image-injection-check: $label failed to restore the dynamic artifact" >&2
 			return 1
 		fi
-		package_arch "$label" "$restore_log"
+		if ! package_arch "$label" "$restore_log"; then
+			cat "$restore_log" >&2
+			echo "image-injection-check: $label could not rebuild after restoring $mutation" >&2
+			return 1
+		fi
 		after_restore="$(sha256sum "$volume" | awk '{print $1}')"
 		if [[ "$before" != "$after_restore" ]]; then
 			echo "image-injection-check: $label rebuilt a different volume after artifact restoration" >&2

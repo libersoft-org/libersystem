@@ -344,6 +344,13 @@ pub fn kernel_half_divergence(_root: u64, _reference: u64) -> Option<(usize, u64
 	None
 }
 
+// Nothing to reserve, for the same reason there is nothing to compare: the kernel's top-level
+// entries live in TTBR1, which every address space shares rather than copies, so one created
+// after a process exists is already visible to it. The callers reserve unconditionally - a
+// window that must exist everywhere is a property of the layout, not of the architecture that
+// happens to need help enforcing it.
+pub fn reserve_kernel_top_level(_base: u64, _len: u64) {}
+
 pub fn new_address_space() -> Option<u64> {
 	// alloc_frame returns a zeroed frame, so the L0 is already empty.
 	alloc_frame()

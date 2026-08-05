@@ -839,24 +839,27 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 	}
 }
 
-// Grant the five volume StorageService clients the `volumes` capability bundles, in a fixed
-// order under their own per-volume tags: the system (writable LiberFS), media (FAT/exFAT),
-// iso (ISO9660), udf (UDF) and usb (FAT off the USB stick) volumes. Each held client is
-// duplicated (narrowed to a client's rights, the manager keeping its own) and transferred;
-// a volume whose disk is absent is held as 0 and handed over as a tagged message with no
-// handle, which `lsvol` reads as zero files - so the grant always sends exactly five
-// messages and the receiver's order stays aligned. Returns false only if a transfer itself
-// fails.
+// Grant the volume StorageService clients the `volumes` capability bundles, each under its own
+// tag: system (writable LiberFS), media (FAT/exFAT), iso (ISO9660), udf (UDF), usb (FAT off the
+// USB stick), and the two memory volumes. Each held client is duplicated (narrowed to a client's
+// rights, the manager keeping its own) and transferred; a volume whose disk is absent is held as
+// 0 and handed over as a tagged message with no handle. The run ends with READY, so a tool takes
+// what it wants BY NAME and what it leaves is closed for it.
+//
+// The sentence that stood here said the grant "always sends exactly five messages and the
+// receiver's order stays aligned", and by then it sent seven. That is the failure this shape
+// removes rather than a comment that needed updating: keeping a count in prose, in one file, that
+// twelve others depend on positionally. Returns false only if a transfer itself fails.
 unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 	unsafe {
 		let volumes: [(&[u8], u64); 7] = [
-			(b"SYSTEM", clients.storage),
-			(b"MEDIA", clients.storage_media),
-			(b"ISO", clients.storage_iso),
-			(b"UDF", clients.storage_udf),
-			(b"USB", clients.storage_usb),
-			(b"RAM", clients.storage_ram),
-			(b"TMP", clients.storage_tmp),
+			(CAP_SYSTEM, clients.storage),
+			(CAP_MEDIA, clients.storage_media),
+			(CAP_ISO, clients.storage_iso),
+			(CAP_UDF, clients.storage_udf),
+			(CAP_USB, clients.storage_usb),
+			(CAP_RAM, clients.storage_ram),
+			(CAP_TMP, clients.storage_tmp),
 		];
 		for &(tag, client) in volumes.iter() {
 			let dup: i64 = duplicate(client, GRANT_RIGHTS);
@@ -865,7 +868,7 @@ unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 				return false;
 			}
 		}
-		true
+		send_ready(manager_side)
 	}
 }
 
@@ -939,42 +942,53 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    process-bound display, key-only input and playback-only audio grants; applications never
 	//    receive those admin interfaces. The permission capability is minted locally below as a
 	//    self-connection. Legacy broad `input` and `graph` remain declared but unwired.
-	let storage: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE") }.unwrap_or(0);
-	let log: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"LOG") }.unwrap_or(0);
-	let network: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"NETWORK") }.unwrap_or(0);
-	let time: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"TIME") }.unwrap_or(0);
-	let config: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CONFIG") }.unwrap_or(0);
-	let device: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DEVICE") }.unwrap_or(0);
-	let audio: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO") }.unwrap_or(0);
-	let display_admin: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"DISPLAY_ADMIN") }.unwrap_or(0);
-	let input_admin: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"INPUT_ADMIN") }.unwrap_or(0);
-	let audio_admin: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"AUDIO_ADMIN") }.unwrap_or(0);
-	let resource: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"RESOURCE") }.unwrap_or(0);
-	let process: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS_GRANT") }.unwrap_or(0);
+	//
+	// Taken BY NAME out of one set, not read in order off the channel. This handshake used to be
+	// twenty-three positional receives matched against twenty-three sends in another file, with
+	// nothing marking where the run ended - and `unwrap_or(0)`, which is right for a capability
+	// the supervisor genuinely cannot grant, made a drifted sequence indistinguishable from a
+	// withheld one. Adding two receives here without matching sends once reported that
+	// NetworkService had not asked for a client: a true statement about the wrong service, four
+	// steps from the edit. `recv_caps` reads to the READY terminator and `take` matches on the
+	// tag, so a capability that is absent reads as absent and an order that has changed does not
+	// read as anything at all.
+	let mut caps: CapSet = unsafe { recv_caps(bootstrap) };
+	let storage: u64 = caps.take(CAP_STORAGE);
+	let log: u64 = caps.take(CAP_LOG);
+	let network: u64 = caps.take(CAP_NETWORK);
+	let time: u64 = caps.take(CAP_TIME);
+	let config: u64 = caps.take(CAP_CONFIG);
+	let device: u64 = caps.take(CAP_DEVICE);
+	let audio: u64 = caps.take(CAP_AUDIO);
+	let display_admin: u64 = caps.take(CAP_DISPLAY_ADMIN);
+	let input_admin: u64 = caps.take(CAP_INPUT_ADMIN);
+	let audio_admin: u64 = caps.take(CAP_AUDIO_ADMIN);
+	let resource: u64 = caps.take(CAP_RESOURCE);
+	let process: u64 = caps.take(CAP_PROCESS_GRANT);
 	// The admin channel the manager grants to the governed `stop` command (whose manifest
 	// grants supervisor): a dedicated ServiceManager admin channel, separate from the shell's,
 	// the manager holds but never drives itself - it only duplicates a narrowed copy onto the
 	// sandboxed `stop` tool, which speaks the bare request/reply teardown protocol over it.
-	let supervisor: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SUPERVISOR") }.unwrap_or(0);
+	let supervisor: u64 = caps.take(CAP_SUPERVISOR);
 	// The three non-system volume StorageService clients the supervisor connects for the
 	// manager, bundled with the system `storage` client under the `volumes` capability the
 	// governed `lsvol` command is granted: media (FAT/exFAT), iso (ISO9660), udf (UDF). A
 	// volume whose disk is absent arrives as 0 (the manager simply cannot grant what it does
 	// not hold), and `lsvol` shows it as zero files.
-	let storage_media: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_MEDIA") }.unwrap_or(0);
-	let storage_iso: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_ISO") }.unwrap_or(0);
-	let storage_udf: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_UDF") }.unwrap_or(0);
-	let storage_usb: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_USB") }.unwrap_or(0);
-	let storage_ram: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_RAM") }.unwrap_or(0);
-	let storage_tmp: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"STORAGE_TMP") }.unwrap_or(0);
+	let storage_media: u64 = caps.take(CAP_STORAGE_MEDIA);
+	let storage_iso: u64 = caps.take(CAP_STORAGE_ISO);
+	let storage_udf: u64 = caps.take(CAP_STORAGE_UDF);
+	let storage_usb: u64 = caps.take(CAP_STORAGE_USB);
+	let storage_ram: u64 = caps.take(CAP_STORAGE_RAM);
+	let storage_tmp: u64 = caps.take(CAP_STORAGE_TMP);
 	// The supervisor-status channel the manager grants to the governed `lssvc` command
 	// (whose manifest grants services): a dedicated ServiceManager status channel, separate
 	// from SystemGraphService's, the manager holds but never drives itself.
-	let services: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVICES") }.unwrap_or(0);
+	let services: u64 = caps.take(CAP_SERVICES);
 	// The xHCI driver's USB bus query channel the manager grants to the governed `lsusb`
 	// command (whose manifest grants usb): the driver serves the typed `usb` inventory on
 	// it; 0 when the driver never came up.
-	let usb: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"USBBUS") }.unwrap_or(0);
+	let usb: u64 = caps.take(CAP_USBBUS);
 	// Mint the manager's self-connection: a dedicated channel pair whose server end is seeded
 	// into the serve set below (so requests on it are dispatched like any other client's) and
 	// whose client end the manager holds as the grantable `permission` capability. The governed
@@ -983,10 +997,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
 	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, broker: bootstrap };
-	let procsvc: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"PROCESS") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") });
+	let procsvc: u64 = match caps.take(CAP_PROCESS) {
+		0 => unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") },
+		handle => handle,
+	};
 
 	// 2. wait for the serve channel clients reach us on.
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
+	let service: u64 = match caps.take(CAP_SERVE) {
+		0 => unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") },
+		handle => handle,
+	};
 
 	// 3. launch each governed component under its manifest, accumulating one shared audit
 	//    trail: sandbox_probe (granted storage + log, denied the rest) reads its one file and

@@ -153,6 +153,37 @@ pub fn frames_free() -> u64 {
 
 // ---- 4 kB page mapping -------------------------------------------------------
 
+// Give every top-level entry covering [base, base + len) a table, in the kernel's own root,
+// before any address space exists to be copied from it.
+//
+// `new_address_space` COPIES the high half. Mappings made UNDER an existing top-level entry are
+// visible everywhere - the copy points at the kernel's own intermediate tables - but one that
+// needs a NEW top-level entry writes it only into the kernel's root. Every address space made
+// before that moment lacks it, and switching to one loads a root that cannot fetch the next
+// instruction: fault, fault again in the handler needing the same mapping, and the machine
+// resets with nothing logged. `kernel_half_divergence` catches it and names the entry; not
+// reaching the state at all is better than a good report of it.
+//
+// Sv39's top level covers 1 GiB per entry rather than x86_64's 512 GiB, so a window costs
+// proportionally more entries here - still one empty frame each, paid once at boot.
+pub fn reserve_kernel_top_level(base: u64, len: u64) {
+	const SLOT: u64 = 1 << 30; // one Sv39 level-2 entry
+	let _guard = PT_LOCK.lock();
+	let root = current_satp_root();
+	let table = phys_to_virt(root) as *mut u64;
+	let mut va = base & !(SLOT - 1);
+	let end = base + len;
+	while va < end {
+		let idx = ((va >> 30) & 0x1ff) as usize;
+		let desc = unsafe { read_volatile(table.add(idx)) };
+		if desc & PTE_V == 0 {
+			let frame = alloc_frame().expect("out of frames: kernel-half reservation");
+			unsafe { write_volatile(table.add(idx), pte_ppn(frame) | PTE_V) };
+		}
+		va += SLOT;
+	}
+}
+
 // Map one 4 kB page `va -> pa` in the tree rooted at `root` (a physical Sv39 root),
 // allocating any missing intermediate tables, then flush the TLB.
 unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), ()> {
@@ -244,6 +275,9 @@ pub fn unmap_page_in(satp_root: u64, virt: u64) -> Option<u64> {
 // space carries a snapshot of the kernel mapping from when it was made. Switching into a root
 // whose high half no longer matches loads a table that cannot fetch the next instruction,
 // which faults, faults again in the handler, and resets the machine with nothing logged.
+// Bits the hardware may write into a page-table entry on its own.
+const HARDWARE_MAINTAINED: u64 = PTE_A | PTE_D;
+
 pub fn kernel_half_divergence(root: u64, reference: u64) -> Option<(usize, u64, u64)> {
 	let _guard = PT_LOCK.lock();
 	unsafe {
@@ -251,7 +285,11 @@ pub fn kernel_half_divergence(root: u64, reference: u64) -> Option<(usize, u64, 
 		let refr = phys_to_virt(reference) as *const u64;
 		for i in 256..512 {
 			let (a, b) = (read_volatile(this.add(i)), read_volatile(refr.add(i)));
-			if a != b {
+			// Compare what SOFTWARE wrote. Sv39 lets an implementation set Accessed and Dirty
+			// itself, so a copy taken before the kernel first walked an entry can differ from
+			// the original in bits neither side chose - a false alarm about a mapping that is
+			// identical in the frame it points at and the permissions it grants.
+			if a & !HARDWARE_MAINTAINED != b & !HARDWARE_MAINTAINED {
 				return Some((i, a, b));
 			}
 		}
