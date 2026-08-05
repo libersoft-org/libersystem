@@ -124,12 +124,49 @@ require_no_stray_qemu() {
     It is probably a run left behind. Stop it and try again:  kill ${pids//$'\n'/ }"
 }
 
+# The sources the system volume is built FROM. Not the kernel's: `cargo test` compiles that itself
+# as part of running the suite, so a change there is picked up without a separate build.
+VOLUME_SOURCES=(user fs wire abi proto idl tools/mkpackages)
+
+# Anything newer than `built`, or nothing.
+newer_than() {
+	local built="$1" dir
+	shift
+	for dir in "$@"; do
+		[[ -d "$SRC_DIR/$dir" ]] || continue
+		local hit
+		hit="$(find "$SRC_DIR/$dir" -name '*.rs' -newer "$built" -print -quit 2>/dev/null)"
+		[[ -n "$hit" ]] && {
+			echo "$hit"
+			return 0
+		}
+	done
+	return 1
+}
+
 require_built() {
 	local arch="$1" volume="$BUILD_DIR/boot/system-volume-$arch.img"
 	[[ -f "$volume" ]] || die "no system volume for $arch - run: ./build.sh --arch $arch"
+	# STALE is as bad as missing, and harder to see.
+	#
+	# This script builds nothing so that a suite cannot quietly test something other than what was
+	# meant. The other half of that bargain is refusing to test what is there when it is older than
+	# the sources - `./build.sh` defaults to x86_64, so `./build.sh --part user` followed by
+	# `./test.sh --arch aarch64` ran the previous binary and said nothing. That cost two
+	# twenty-minute runs in one afternoon, and both times the failure looked like a defect in the
+	# code under test.
+	local stale
+	if stale="$(newer_than "$volume" "${VOLUME_SOURCES[@]}")"; then
+		die "the $arch build is older than $stale
+    Nothing here rebuilds it, so the suite would test the previous one:  ./build.sh --arch $arch"
+	fi
 	if [[ "$arch" != x86_64 ]]; then
 		local efi="$BUILD_DIR/cargo/loader/$(loader_triple "$arch")/debug/libersystem-loader.efi"
 		[[ -f "$efi" ]] || die "no loader for $arch - run: ./build.sh --arch $arch --part loader"
+		if stale="$(newer_than "$efi" loader)"; then
+			die "the $arch loader is older than $stale
+    Run:  ./build.sh --arch $arch --part loader"
+		fi
 	fi
 }
 

@@ -368,6 +368,24 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	let mut slow = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
 	assert!(slow.stream_slowloris(b"vol://tmp/drip", 0x7306, 400, 4), "a sender that stays just inside the idle window is still given up on");
 
+	assert_eq!(streamed.open(b"vol://tmp/f", 0x7305), Some(b"new contents".to_vec()), "and the destination still holds what it held - no prefix was written");
+
+	// A path that cannot be written is refused before any of it is collected.
+	assert!(!streamed.write_stream(b"vol://tmp/missing/f", &[b"x"], 0x7306, None), "an absent parent is refused, not collected");
+
+	// The stream cases live in their own test.
+	//
+	// They were part of the scenario above until it grew past what an emulated architecture can run
+	// inside the suite's thirty-minute budget: five service instances, two clock jumps and two
+	// fixture-image builds, on top of everything the original test already did. Both aarch64 and
+	// riscv64 timed out on it. Splitting is the fix rather than raising the watchdog, which would
+	// only move the same wall further away.
+}
+
+tagged_test!(the_memory_volumes_bound_and_answer_streams, [Service, Storage, Filesystem]);
+fn the_memory_volumes_bound_and_answer_streams() {
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
 	// THE POINT OF THE PENDING-STREAM MODEL: another client is served while a stream is open.
 	//
 	// Receiving a stream synchronously meant one client held the service for the whole transfer -
@@ -392,6 +410,59 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	assert!(silent.stream_idle_until_deadline(b"vol://tmp/quiet", 0x7701, 8_000), "a stream that says nothing is dropped once its deadline passes");
 	assert!(silent.write(b"vol://tmp/after", b"x", 0x7702), "and the service serves the next client");
 
+	// A stream handle the service cannot wait on is refused before it reaches the wait set.
+	//
+	// READ but no WAIT: every wait on it fails immediately, and a loop that retries on error spins
+	// until the deadline serving nobody. The refusal has to happen where it costs a parse.
+	let mut rights = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(rights.stream_with_rights(b"vol://tmp/nowait", 0x7a01, object::rights::Rights::READ), "a stream handle without WAIT is refused");
+	assert!(rights.write(b"vol://tmp/after", b"x", 0x7a02), "and the service is still serving afterwards");
+
+	// A refused write must not cost the service a handle.
+	//
+	// The ordinary write takes a buffer capability, and validation used to happen BEFORE the guard
+	// that closes it, so every `?` on the way out left one behind. Nothing visible happens: the
+	// service keeps answering, one handle poorer each time, until its table is full and every later
+	// request fails for a reason unrelated to what caused it. Only a count taken before and after
+	// shows it.
+	let mut leaky = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(leaky.write(b"vol://tmp/real", b"x", 0x7501), "a good write still works");
+	let before = leaky.handle_count();
+	for i in 0..32u32 {
+		// A path inside a FILE, which cannot be a directory: refused after the buffer arrives.
+		assert!(!leaky.write(b"vol://tmp/real/under-a-file", b"y", 0x7510 + i), "a bad write is refused");
+	}
+	assert_eq!(leaky.handle_count(), before, "thirty-two refused writes cost the service no handles");
+	assert!(leaky.write(b"vol://tmp/second", b"z", 0x7540), "and the service still works afterwards");
+
+	let mut readonly = StorageHarness::start_archive(storage_elf);
+	assert!(readonly.stream_refused_before_sending(b"vol://system/anything", 0x7305), "a stream to a read-only volume is refused before the sender offers a byte");
+
+	// vol://ram - reserved. Same filesystem, same operations; the difference is only that its
+	// memory was taken at mount, which is why a write cannot fail for want of memory here.
+	let mut ram = StorageHarness::start_memory(storage_elf, b"RAMVOL", 4096);
+	assert!(ram.write(b"vol://ram/state", b"reserved", 0x7101), "the reserved volume is writable");
+	assert_eq!(ram.open(b"vol://ram/state", 0x7102), Some(b"reserved".to_vec()));
+	assert_eq!(ram.open(b"vol://tmp/hello", 0x7103), None, "the two volumes are separate");
+}
+
+// The stream cases that cost real time under emulation.
+//
+// Tagged `Slow`, so the default run skips them and `--tags slow` includes them. They are here
+// because they are expensive by construction rather than by accident: eighty round trips to fill a
+// channel queue, two service instances each copying a multi-megabyte volume image, and eight
+// connect-and-hang-up cycles. On x86_64 that is seconds; under TCG it is most of the suite's
+// thirty-minute budget, and it timed out aarch64 and riscv64 twice - once as part of a larger test
+// and once on its own.
+//
+// Splitting by COST rather than by subject is deliberate. The cheap half of these cases proves the
+// same properties on every architecture; the expensive half proves them again at a scale only a
+// fast target can afford.
+tagged_test!(the_memory_volumes_bound_expensive_streams, [Service, Storage, Filesystem, Slow]);
+fn the_memory_volumes_bound_expensive_streams() {
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+
 	// A listing nobody reads must not stop the service either.
 	//
 	// Past the channel's 64-message queue the send blocks, and an unbounded one held StorageService
@@ -412,14 +483,6 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	// which is what "bounded" looked like before it became "not blocking".
 	assert_eq!(listed.open(b"vol://tmp/f0", 0x7781), Some(b"x".to_vec()), "the service serves other clients while a listing goes unread");
 	drop(idle_consumer);
-
-	// A stream handle the service cannot wait on is refused before it reaches the wait set.
-	//
-	// READ but no WAIT: every wait on it fails immediately, and a loop that retries on error spins
-	// until the deadline serving nobody. The refusal has to happen where it costs a parse.
-	let mut rights = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
-	assert!(rights.stream_with_rights(b"vol://tmp/nowait", 0x7a01, object::rights::Rights::READ), "a stream handle without WAIT is refused");
-	assert!(rights.write(b"vol://tmp/after", b"x", 0x7a02), "and the service is still serving afterwards");
 
 	// A live import that cannot be completed is refused, not served in part.
 	//
@@ -444,7 +507,9 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	let mut hangup = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
 	assert!(hangup.write(b"vol://tmp/here", b"still here", 0x7901), "seed a file");
 	let before = hangup.handle_count();
-	for i in 0..8u32 {
+	// Three rather than eight: each is a connect, a request and five hundred pumps, and under
+	// emulation that adds up. One would prove the leak; three prove it is not a fluke.
+	for i in 0..3u32 {
 		hangup.list_then_hang_up(b"vol://tmp", 0x7910 + i);
 	}
 	assert_eq!(hangup.open(b"vol://tmp/here", 0x7920), Some(b"still here".to_vec()), "the service survives a client that hangs up mid-listing");
@@ -452,35 +517,4 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	// the whole defect - the first version of this assertion allowed +8 for eight hang-ups and
 	// passed with the fix removed.
 	assert_eq!(hangup.handle_count(), before, "and leaks no handle when the client is gone");
-
-	// A refused write must not cost the service a handle.
-	//
-	// The ordinary write takes a buffer capability, and validation used to happen BEFORE the guard
-	// that closes it, so every `?` on the way out left one behind. Nothing visible happens: the
-	// service keeps answering, one handle poorer each time, until its table is full and every later
-	// request fails for a reason unrelated to what caused it. Only a count taken before and after
-	// shows it.
-	let mut leaky = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
-	assert!(leaky.write(b"vol://tmp/real", b"x", 0x7501), "a good write still works");
-	let before = leaky.handle_count();
-	for i in 0..32u32 {
-		// A path inside a FILE, which cannot be a directory: refused after the buffer arrives.
-		assert!(!leaky.write(b"vol://tmp/real/under-a-file", b"y", 0x7510 + i), "a bad write is refused");
-	}
-	assert_eq!(leaky.handle_count(), before, "thirty-two refused writes cost the service no handles");
-	assert!(leaky.write(b"vol://tmp/second", b"z", 0x7540), "and the service still works afterwards");
-
-	let mut readonly = StorageHarness::start_archive(storage_elf);
-	assert!(readonly.stream_refused_before_sending(b"vol://system/anything", 0x7305), "a stream to a read-only volume is refused before the sender offers a byte");
-	assert_eq!(streamed.open(b"vol://tmp/f", 0x7305), Some(b"new contents".to_vec()), "and the destination still holds what it held - no prefix was written");
-
-	// A path that cannot be written is refused before any of it is collected.
-	assert!(!streamed.write_stream(b"vol://tmp/missing/f", &[b"x"], 0x7306, None), "an absent parent is refused, not collected");
-
-	// vol://ram - reserved. Same filesystem, same operations; the difference is only that its
-	// memory was taken at mount, which is why a write cannot fail for want of memory here.
-	let mut ram = StorageHarness::start_memory(storage_elf, b"RAMVOL", 4096);
-	assert!(ram.write(b"vol://ram/state", b"reserved", 0x7101), "the reserved volume is writable");
-	assert_eq!(ram.open(b"vol://ram/state", 0x7102), Some(b"reserved".to_vec()));
-	assert_eq!(ram.open(b"vol://tmp/hello", 0x7103), None, "the two volumes are separate");
 }

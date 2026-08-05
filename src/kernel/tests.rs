@@ -2297,6 +2297,24 @@ impl StorageHarness {
 	}
 
 	// Format a LiberFS volume carrying the scenario archive's files, as a sector map.
+	// A minimal LiberFS volume: two small files, formatted once and cached like the big one.
+	fn build_tiny_fixture() -> alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> {
+		const BLOCK: usize = liberfs::BLOCK_SIZE;
+		static TINY: crate::sync::SpinLock<Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>>> = crate::sync::SpinLock::new(None);
+		if let Some(sectors) = TINY.lock().as_ref() {
+			return sectors.clone();
+		}
+		let size = 512 * 1024;
+		let opts = liberfs::FormatOpts { uuid: *b"libersystem-tin\0", label: b"system".to_vec(), compress: false };
+		let disk = FixtureDisk { sectors: alloc::collections::BTreeMap::new() };
+		let mut fs = liberfs::LiberFs::format_opts(disk, (size / BLOCK) as u64, opts).expect("format the tiny fixture");
+		fs.write_file(b"hello.txt", b"hello").expect("write hello");
+		fs.write_file(b"motd.txt", b"motd").expect("write motd");
+		let sectors = fs.into_device().sectors;
+		*TINY.lock() = Some(sectors.clone());
+		sectors
+	}
+
 	fn build_system_fixture(archive: &[u8]) -> alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> {
 		const BLOCK: usize = liberfs::BLOCK_SIZE;
 		let entries = pkg::Package::parse(archive).expect("scenario archive parses");
@@ -2654,7 +2672,14 @@ impl StorageHarness {
 	// A LiberFS image as contiguous bytes, for the cases that need one in memory rather than as a
 	// sector map: a live volume arrives as a buffer, not as a disk.
 	fn fixture_image(archive: &[u8]) -> alloc::vec::Vec<u8> {
-		let sectors = Self::build_system_fixture(archive);
+		let _ = archive;
+		// A SMALL volume of its own rather than the scenario archive's.
+		//
+		// The scenario fixture is megabytes, and this is copied into a memory object and mounted
+		// twice - whole and truncated. Under emulation that alone is minutes. Nothing here needs
+		// the scenario's contents: the test is about an import that cannot be completed, and two
+		// files prove it as well as two hundred.
+		let sectors = Self::build_tiny_fixture();
 		let mut bytes = alloc::vec::Vec::new();
 		for (lba, sector) in &sectors {
 			let offset = (*lba as usize) * 512;
