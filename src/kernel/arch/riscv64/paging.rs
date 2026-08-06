@@ -81,7 +81,28 @@ fn flush_tlb() {
 // pre-set so the hardware never faults to update them). Every mapped page is at least
 // readable; NO_CACHE has no base-Sv39 PTE encoding (QEMU virt's device regions carry
 // their attributes in the physical memory map), so it is ignored.
+// Whether a per-page uncacheable attribute can be EXPRESSED on this port. It cannot: Sv39
+// has no memory-type field, and saying it per page needs the Svpbmt extension, which is
+// not implemented here.
+//
+// So `NO_CACHE` is accepted and not translated, and the mapping's behaviour comes from
+// the platform's physical memory attributes instead. On QEMU virt those mark the MMIO
+// regions as device memory and everything works, which is why this has never shown. On a
+// platform whose PMAs say otherwise, a driver's MMIO would be mapped cacheable and its
+// writes reordered or held in a cache line, with nothing anywhere reporting that the
+// request was not honoured.
+//
+// Refusing the mapping instead was tried and is worse: it takes every device on the port
+// with it, turning a case that works into a boot that does not. What is done here is to
+// make the gap ASKABLE rather than implied - a caller or a test can find out - and to
+// leave the real answer (Svpbmt, or a platform PMA check) as work this port still owes.
+pub fn no_cache_supported() -> bool {
+	false
+}
+
 fn leaf_bits(flags: u64) -> u64 {
+	// `NO_CACHE` is deliberately not translated: see `no_cache_supported`. The mapper
+	// refuses such a request rather than quietly dropping it.
 	let mut bits = PTE_V | PTE_A | PTE_D | PTE_R;
 	if flags & WRITABLE != 0 {
 		bits |= PTE_W;

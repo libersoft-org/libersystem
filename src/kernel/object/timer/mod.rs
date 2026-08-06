@@ -26,14 +26,24 @@ impl Timer {
 	}
 
 	// Arm the timer to fire when the tick counter reaches `deadline_ticks`.
+	//
+	// Wakes whoever is waiting on this timer's koid. It did not, and a thread that began
+	// waiting on an UNARMED timer stayed parked after another thread armed it - there was
+	// nothing to tell it the state it had been waiting for now existed. Readiness that is
+	// published without a wake is readiness nobody arrives to see.
 	pub fn set(&self, deadline_ticks: u64) {
 		self.deadline.store(deadline_ticks, Ordering::Release);
 		self.armed.store(true, Ordering::Release);
+		crate::sched::wake_object(self.header.koid());
 	}
 
 	// Disarm the timer.
+	//
+	// Also a wake: a waiter blocked on a deadline that has just been withdrawn has to be
+	// let go rather than left waiting for a moment that will not come.
 	pub fn cancel(&self) {
 		self.armed.store(false, Ordering::Release);
+		crate::sched::wake_object(self.header.koid());
 	}
 
 	// True if the timer is armed and its deadline has been reached.

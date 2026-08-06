@@ -131,6 +131,27 @@ pub struct HandleTable {
 	domain: Option<Arc<Domain>>,
 }
 
+// Advance a freed slot's generation and return it to the free list - unless doing so
+// would wrap it back to a value it has already used.
+//
+// The generation is what makes a closed handle stay closed: a raw handle names a slot
+// and the generation it expects, and a mismatch is a bad handle. A wrapping increment
+// therefore has an end: after 2^32 recycles of one slot the counter comes back round and
+// a long-dead handle matches again. It takes deliberate churn to reach, and "deliberate
+// churn" is the threat model.
+//
+// A slot at the end of its generations is simply not reused. One slot of a table is a
+// negligible loss; a handle coming back from the dead is not.
+fn retire_or_recycle(slot: &mut Slot, free: &mut Vec<u32>, index: usize) {
+	match slot.generation.checked_add(1) {
+		Some(next) => {
+			slot.generation = next;
+			free.push(index as u32);
+		}
+		None => slot.generation = u32::MAX,
+	}
+}
+
 impl HandleTable {
 	pub const fn new() -> Self {
 		Self { slots: Vec::new(), free: Vec::new(), domain: None }
@@ -331,8 +352,7 @@ impl HandleTable {
 		}
 		let slot = self.slots.get_mut(index).ok_or(HandleError::BadHandle)?;
 		let cap = slot.cap.take().ok_or(HandleError::BadHandle)?;
-		slot.generation = slot.generation.wrapping_add(1);
-		self.free.push(index as u32);
+		retire_or_recycle(slot, &mut self.free, index);
 		if let Some(domain) = &self.domain {
 			domain.uncharge_handles(1);
 		}
@@ -354,8 +374,7 @@ impl HandleTable {
 			return Err(HandleError::BadHandle);
 		}
 		slot.cap = None;
-		slot.generation = slot.generation.wrapping_add(1);
-		self.free.push(index as u32);
+		retire_or_recycle(slot, &mut self.free, index);
 		if let Some(domain) = &self.domain {
 			domain.uncharge_handles(1);
 		}

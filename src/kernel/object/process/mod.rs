@@ -45,6 +45,16 @@ pub struct Process {
 	// Set when the process is killed (by a fault or a Domain kill); its threads
 	// observe this at their next scheduling point and exit.
 	killed: AtomicBool,
+	// Set the moment a process starts going away, BEFORE any cleanup runs, and never
+	// cleared. The terminal flags above are published when the process is gone; this is
+	// published when it is going - and the difference is a window every mutating syscall
+	// could previously slip through.
+	//
+	// A cleanup takes a snapshot of what to unmap and what to close. A thread that
+	// registers a mapping, or creates a thread, after that snapshot and before the flag it
+	// checks is set, leaves something behind that nothing will ever collect. Refusing from
+	// here on closes the window at its start rather than at its end.
+	terminating: AtomicBool,
 	// Set when the process's last thread has exited (a clean exit, no kill). Together
 	// with `killed` this is the terminal "process gone" condition a Process handle
 	// becomes waitable on - the kernel's equivalent of a process-terminated signal,
@@ -117,7 +127,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), live_thread_count: AtomicUsize::new(0) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), live_thread_count: AtomicUsize::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -236,6 +246,13 @@ impl Process {
 		*self.fault.lock()
 	}
 
+	// Whether this process has begun going away. True from the first moment of a kill or a
+	// clean exit, and the condition every mutating syscall refuses on: after this, nothing
+	// new may be registered that the cleanup already walking past would miss.
+	pub fn is_terminating(&self) -> bool {
+		self.terminating.load(Ordering::Acquire)
+	}
+
 	// Whether this process has been killed and its threads should exit.
 	pub fn is_killed(&self) -> bool {
 		self.killed.load(Ordering::Acquire)
@@ -250,8 +267,12 @@ impl Process {
 	// a supervisor or job table legitimately holds one long after the exit. Idempotent:
 	// the scheduler calls it as the final thread retires.
 	pub fn mark_exited(&self) {
-		self.exited.store(true, Ordering::Release);
+		// same order as `terminate`: going away, then the cleanup, then gone. A waiter that
+		// saw `exited` used to be able to observe a finished process whose handles were
+		// still open and whose mappings still existed.
+		self.terminating.store(true, Ordering::Release);
 		self.handles.lock().close_all();
+		self.exited.store(true, Ordering::Release);
 		sched::wake_object(self.header.koid());
 	}
 
@@ -392,9 +413,13 @@ impl Process {
 	// Its threads observe the kill at their next scheduling point and exit,
 	// releasing the last reference to the Process.
 	pub fn terminate(&self) {
-		self.killed.store(true, Ordering::Release);
+		// Terminating FIRST, terminal last. Everything that could add to what has to be
+		// cleaned up refuses from here, so the cleanup below sees a set that cannot grow
+		// under it; `killed` is published at the end, when it is true.
+		self.terminating.store(true, Ordering::Release);
 		self.unmap_objects();
 		self.handles.lock().close_all();
+		self.killed.store(true, Ordering::Release);
 		// A kill is a terminal state, so wake anything blocked on this process handle to
 		// observe it - the same process-terminated signal a clean exit delivers.
 		sched::wake_object(self.header.koid());

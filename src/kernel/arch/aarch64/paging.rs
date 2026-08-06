@@ -236,8 +236,16 @@ pub fn smap_enabled() -> bool {
 pub fn smep_enabled() -> bool {
 	false
 }
+// Whether mappings carry execute-never. On this port they always do: `leaf_bits` sets
+// the XN attributes for every non-executable page unconditionally, with no CPU feature to
+// enable and nothing to turn it off.
+//
+// Reporting `false` was a plain contradiction of the mapper beside it, and the kind that
+// hides rather than breaks: a test asking whether NX is active would skip its own check,
+// and an operator reading the report would be told a protection is off while every leaf
+// in the tables is using it.
 pub fn nx_enabled() -> bool {
-	false
+	true
 }
 pub fn clac_on_entry() {}
 

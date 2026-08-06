@@ -60,7 +60,7 @@ pub struct Thread {
 	// services that yield to one another on one core keep separate syscall stacks.
 	syscall_rsp: AtomicU64,
 	// Owns the kernel stack memory; accessed only through kstack_ptr.
-	stack: Box<[u8]>,
+	stack: KernelStack,
 	// Set the first time the thread is enqueued through thread_start, so a thread
 	// built suspended (the userspace spawn path) can be started exactly once and a
 	// repeated start is a safe no-op rather than a double-enqueue.
@@ -68,6 +68,64 @@ pub struct Thread {
 	// The process this thread belongs to. It owns the address space, handle table,
 	// and Domain the thread runs under, and outlives the thread.
 	process: Arc<Process>,
+}
+
+// A kernel thread's stack, in its own virtual range with an unmapped page below it.
+//
+// It was a `Box<[u8]>` from the kernel heap, which means an overflow does not fault: it
+// walks into whatever the allocator put underneath - another thread's stack, a heap
+// object, allocator metadata - and the damage surfaces somewhere else entirely, at some
+// later time, with nothing pointing back at the thread that caused it.
+//
+// A guard page turns that into a page fault at the moment of the overflow. The frames are
+// mapped one page above the base of the range, so the base page is never mapped and the
+// first write past the bottom of the stack faults on an address that names the thread it
+// belongs to.
+pub struct KernelStack {
+	// Base of the reserved range - the guard page. Never mapped.
+	base: u64,
+	pages: usize,
+}
+
+impl KernelStack {
+	fn allocate() -> Self {
+		let pages = KERNEL_STACK_SIZE.div_ceil(crate::mem::frame::PAGE_SIZE as usize);
+		let len = (pages as u64 + 1) * crate::mem::frame::PAGE_SIZE;
+		let base = crate::syscall::alloc_kernel_vrange(len);
+		assert!(base != 0, "out of kernel virtual address space for a thread stack");
+		let space = crate::object::address_space::AddressSpace::kernel();
+		let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE;
+		for page in 0..pages {
+			let frame = crate::mem::frame::allocate().expect("out of frames: kernel thread stack");
+			// one page above `base`, so `base` itself stays unmapped and is the guard.
+			let at = base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
+			space.map(at, frame, flags);
+		}
+		// zeroed through a raw write rather than through a slice taken from `&self`,
+		// which would be handing out a `&mut` from a shared borrow.
+		unsafe { core::ptr::write_bytes((base + crate::mem::frame::PAGE_SIZE) as *mut u8, 0, pages * crate::mem::frame::PAGE_SIZE as usize) };
+		Self { base, pages }
+	}
+
+	// The stack bytes, above the guard page. `&mut self` because this hands out the only
+	// mutable view of a region this struct owns exclusively.
+	fn as_mut_slice(&mut self) -> &mut [u8] {
+		let start = self.base + crate::mem::frame::PAGE_SIZE;
+		unsafe { core::slice::from_raw_parts_mut(start as *mut u8, self.pages * crate::mem::frame::PAGE_SIZE as usize) }
+	}
+}
+
+impl Drop for KernelStack {
+	fn drop(&mut self) {
+		let space = crate::object::address_space::AddressSpace::kernel();
+		for page in 0..self.pages {
+			let at = self.base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
+			if let Some(frame) = space.unmap(at) {
+				crate::mem::frame::deallocate(frame);
+			}
+		}
+		crate::syscall::free_vrange(self.base, (self.pages as u64 + 1) * crate::mem::frame::PAGE_SIZE);
+	}
 }
 
 impl Thread {
@@ -90,8 +148,8 @@ impl Thread {
 
 	// Shared constructor tail: fabricate the initial stack and assemble the Thread.
 	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
-		let mut stack = alloc::vec![0u8; KERNEL_STACK_SIZE].into_boxed_slice();
-		let sp = arch::context::init_thread_stack(&mut stack, entry, arg);
+		let mut stack = KernelStack::allocate();
+		let sp = arch::context::init_thread_stack(stack.as_mut_slice(), entry, arg);
 		let thread = Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process });
 		// Forward-link the thread to its process so signal delivery can reach it.
 		thread.process.register_thread(&thread);

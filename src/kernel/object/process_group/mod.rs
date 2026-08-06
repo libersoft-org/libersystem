@@ -41,6 +41,9 @@ pub struct ProcessGroup {
 	header: ObjectHeader,
 	// Weak, so membership never extends a member's life. Fixed at creation: there is no join.
 	members: SpinLock<Vec<Weak<Process>>>,
+	// The membership count at creation. `members` is pruned as processes die, so it
+	// cannot answer a question about the original set.
+	original_size: usize,
 }
 
 impl_kernel_object!(ProcessGroup, ProcessGroup);
@@ -53,8 +56,9 @@ impl ProcessGroup {
 		if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
 			return None;
 		}
-		let weak = members.iter().map(Arc::downgrade).collect();
-		Some(Arc::new(Self { header: ObjectHeader::new(), members: SpinLock::new(weak) }))
+		let weak: Vec<Weak<Process>> = members.iter().map(Arc::downgrade).collect();
+		let original_size = weak.len();
+		Some(Arc::new(Self { header: ObjectHeader::new(), members: SpinLock::new(weak), original_size }))
 	}
 
 	// The members still alive, as owning references. Dead entries are dropped from the list as
@@ -73,9 +77,21 @@ impl ProcessGroup {
 		self.live().iter().all(|process| process.is_terminated())
 	}
 
-	// How many processes this group was created over, live or not. Reported for observability;
-	// it never changes, because membership is sealed.
+	// How many processes this group was created over, live or not.
+	//
+	// Stored, because it is documented as never changing and `live()` prunes dead weak
+	// references out of the same vector it was being read from - so it shrank as members
+	// died, which is the opposite of what it says.
 	pub fn size(&self) -> usize {
-		self.members.lock().len()
+		self.original_size
+	}
+
+	// Wake anyone waiting on this group. Called when a member reaches a terminal state.
+	//
+	// A waiter registers on the GROUP's koid while a process termination wakes only the
+	// process's own, and nothing connected the two - so a group could report `finished()`
+	// while a waiter without a timeout stayed parked forever. The group has to be told.
+	pub fn notify_member_terminated(&self) {
+		crate::sched::wake_object(self.header.koid());
 	}
 }

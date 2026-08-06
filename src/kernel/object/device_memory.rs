@@ -14,9 +14,10 @@ use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use super::address_space::AddressSpace;
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
-use crate::arch::paging;
 use crate::mem::frame::PAGE_SIZE;
+use crate::sync::SpinLock;
 
 pub struct DeviceMemory {
 	header: ObjectHeader,
@@ -24,14 +25,23 @@ pub struct DeviceMemory {
 	phys_base: u64,
 	// Length of the region in bytes.
 	len: usize,
-	// Virtual base this region is currently mapped at (0 = unmapped).
+	// Virtual base this region is currently mapped at (0 = unmapped), and the address
+	// space it is mapped IN.
+	//
+	// The address space was not recorded, and `Drop` called the active-address-space
+	// `unmap_page` - so the last reference going away in a supervisor, on another thread,
+	// or during some other process's teardown unmapped that virtual address from whichever
+	// space happened to be current. The unrelated process lost a page, the driver's real
+	// mapping survived the capability that justified it, and the virtual range went back
+	// to the pool while it was still mapped.
 	mapped_at: AtomicU64,
+	mapped_in: SpinLock<Option<Arc<AddressSpace>>>,
 }
 
 impl DeviceMemory {
 	// A capability to the physical MMIO region [phys_base, phys_base + len).
 	pub fn new(phys_base: u64, len: usize) -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), phys_base, len, mapped_at: AtomicU64::new(0) })
+		Arc::new(Self { header: ObjectHeader::new(), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
 	}
 
 	pub fn phys_base(&self) -> u64 {
@@ -46,17 +56,37 @@ impl DeviceMemory {
 		self.len == 0
 	}
 
-	// Number of pages the region spans (at least one).
+	// Number of pages the region spans (at least one), counted from the aligned base so an
+	// unaligned region still covers its own tail.
 	pub fn pages(&self) -> usize {
-		self.len.div_ceil(PAGE_SIZE as usize).max(1)
+		(self.page_offset() as usize + self.len).div_ceil(PAGE_SIZE as usize).max(1)
 	}
 
 	pub fn mapped_at(&self) -> u64 {
 		self.mapped_at.load(Ordering::Acquire)
 	}
 
-	pub fn set_mapped_at(&self, virt: u64) {
+	// Record where this region is mapped AND in which address space, so the teardown can
+	// reach the same one rather than whichever is active when the last reference dies.
+	pub fn set_mapped_in(&self, virt: u64, space: Arc<AddressSpace>) {
+		*self.mapped_in.lock() = Some(space);
 		self.mapped_at.store(virt, Ordering::Release);
+	}
+
+	// The physical offset within the first mapped page.
+	//
+	// A region whose physical base is not page-aligned is mapped from the page BELOW it,
+	// so the address a caller wants is that many bytes into the mapping. Nothing recorded
+	// this, and the low bits of a BAR are simply not representable in a PTE - so a device
+	// whose registers do not begin on a page boundary handed back a virtual address
+	// pointing at the wrong place.
+	pub fn page_offset(&self) -> u64 {
+		self.phys_base % PAGE_SIZE
+	}
+
+	// The page-aligned physical base the mapping actually starts from.
+	pub fn aligned_phys_base(&self) -> u64 {
+		self.phys_base - self.page_offset()
 	}
 }
 
@@ -68,9 +98,20 @@ impl Drop for DeviceMemory {
 		// after the capability is gone, and return its address range to the window's
 		// pool. The physical range is hardware, not owned RAM, so nothing is freed.
 		let base = self.mapped_at.load(Ordering::Acquire);
+		let space = self.mapped_in.lock().take();
 		if base != 0 {
 			for i in 0..self.pages() {
-				paging::unmap_page(base + i as u64 * PAGE_SIZE);
+				match &space {
+					// the address space it was mapped in, which is the only one this
+					// mapping was ever in.
+					Some(space) => {
+						space.unmap(base + i as u64 * PAGE_SIZE);
+					}
+					// nothing recorded a space: a mapping made before this object learned
+					// to remember one, or none at all. Leave the tables alone rather than
+					// unmap a page out of whichever space happens to be active.
+					None => {}
+				}
 			}
 			crate::syscall::free_vrange(base, self.pages() as u64 * PAGE_SIZE);
 		}

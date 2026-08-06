@@ -260,7 +260,7 @@ const MMAP_WINDOW: u64 = 0x0000_1000_0000_0000;
 #[cfg(target_arch = "riscv64")]
 const MMAP_WINDOW: u64 = 0x0000_0010_0000_0000;
 
-fn alloc_kernel_vrange(len: u64) -> u64 {
+pub(crate) fn alloc_kernel_vrange(len: u64) -> u64 {
 	KERNEL_VMAP.lock().alloc(len)
 }
 
@@ -492,6 +492,14 @@ fn sys_dma_buffer_create(size: u64) -> i64 {
 // Map a DmaBuffer into the caller's address space. One mapping per address space;
 // the driver and a display server may map the same backing concurrently.
 fn sys_dma_buffer_map(handle: u64) -> i64 {
+	// Nothing new once the process has begun going away: its cleanup has already taken
+	// its snapshot of what to unmap, and a mapping registered after that is one nothing
+	// will ever collect.
+	if let Some(thread) = crate::sched::current_thread() {
+		if thread.process().is_terminating() {
+			return ERR_INVALID;
+		}
+	}
 	let thread = current_thread!();
 	let dma = match current_typed::<DmaBuffer>(handle, ObjectType::DmaBuffer, Rights::MAP) {
 		Ok(o) => o,
@@ -754,13 +762,25 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 	if user {
 		flags |= arch::paging::USER;
 	}
-	let phys_base = device.phys_base();
+	// From the ALIGNED physical base, and the caller gets its offset back. A BAR that does
+	// not begin on a page boundary cannot be expressed in a PTE, so mapping from
+	// `phys_base` silently dropped its low bits and returned an address pointing at the
+	// wrong register.
+	let phys_base = device.aligned_phys_base();
 	if !map_pages_or_rollback(base, pages, flags, |i| phys_base + i as u64 * PAGE_SIZE) {
 		free_vrange(base, len);
 		return ERR_NO_MEMORY;
 	}
-	device.set_mapped_at(base);
-	base as i64
+	let space = if user {
+		match crate::sched::current_thread() {
+			Some(thread) => thread.process().address_space().clone(),
+			None => return ERR_INVALID,
+		}
+	} else {
+		crate::object::address_space::AddressSpace::kernel()
+	};
+	device.set_mapped_in(base, space);
+	(base + device.page_offset()) as i64
 }
 
 // Write the DeviceInfo for the virtio device at `index` (its type + MMIO struct
@@ -1070,6 +1090,13 @@ fn sys_process_load_module(process_handle: u64, elf_ptr: u64, elf_len: u64, bias
 // thread in rdi - the way a process is endowed with its initial capability.
 // Requires the MANAGE right on the process handle (and TRANSFER on the bootstrap).
 fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_handle: u64) -> i64 {
+	// A thread created into a process that is going away would never be reaped: the
+	// live-thread counter that decides the finaliser has already reached zero.
+	if let Some(thread) = crate::sched::current_thread() {
+		if thread.process().is_terminating() {
+			return ERR_INVALID;
+		}
+	}
 	let thread = current_thread!();
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
 		Ok(o) => o,
@@ -1260,6 +1287,14 @@ fn sys_console_attach(handle: u64) -> i64 {
 
 // Map a MemoryObject into the kernel address space, returning its virtual base.
 fn sys_memory_map(handle: u64) -> i64 {
+	// Nothing new once the process has begun going away: its cleanup has already taken
+	// its snapshot of what to unmap, and a mapping registered after that is one nothing
+	// will ever collect.
+	if let Some(thread) = crate::sched::current_thread() {
+		if thread.process().is_terminating() {
+			return ERR_INVALID;
+		}
+	}
 	let thread = current_thread!();
 	let memory = match current_typed::<MemoryObject>(handle, ObjectType::MemoryObject, Rights::MAP) {
 		Ok(memory) => memory,
@@ -1656,6 +1691,12 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 		}
 	};
 	let koid = object.header().koid();
+	// A ProcessGroup is ready when its MEMBERS terminate, and a terminating process wakes
+	// its own koid - not the group's. Nothing connected the two, so a waiter on a group
+	// could stay parked while the group reported itself finished. Registering on the
+	// members as well as the group is the fix that needs no back-link from a process to
+	// the groups it belongs to: the wake it already sends is the one being listened for.
+	let group_koids: Vec<u64> = object.as_any().downcast_ref::<crate::object::process_group::ProcessGroup>().map(|group| core::iter::once(koid).chain(group.live().iter().map(|member| member.header().koid())).collect()).unwrap_or_default();
 	// Condition-variable loop: re-check readiness after each wake, so an early or
 	// spurious wake just re-blocks and a deadline is honored on re-check. A signal that
 	// arrives while blocked is honoured first: a kill retires the thread, a stop parks it.
@@ -1675,7 +1716,11 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
 		}
-		sched::block_on_flagged(koid, block_deadline, periodic, || object_ready_for(&object, writable));
+		if group_koids.is_empty() {
+			sched::block_on_flagged(koid, block_deadline, periodic, || object_ready_for(&object, writable));
+		} else {
+			sched::block_on_any(&group_koids, block_deadline, periodic, || object_ready_for(&object, writable));
+		}
 	}
 }
 
