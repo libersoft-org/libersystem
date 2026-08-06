@@ -1,5 +1,42 @@
 use super::*;
 
+tagged_test!(a_capability_transfer_moves_it_exactly_once, [Process, Syscall, Ipc]);
+fn a_capability_transfer_moves_it_exactly_once() {
+	// A transfer was a clone under the lock, a send, and then a re-lookup and a `close`
+	// whose result was DISCARDED. Two ways that mints a capability without the
+	// `DUPLICATE` right, and the second needs no race at all: name the same handle twice
+	// in one batch and each is cloned independently, then the close runs twice and the
+	// second failure is thrown away.
+	use crate::object::channel::Channel;
+	use crate::object::handle::{Handle, HandleTable};
+	use crate::object::rights::Rights;
+
+	let mut table = HandleTable::new();
+	let (carried, _peer) = Channel::create();
+	let handle = table.insert_object(carried, Rights::ALL, 0);
+
+	// Taking it MOVES it: the handle is dead immediately, with no window in which it
+	// still names anything.
+	let cap = table.take(handle, Rights::TRANSFER).expect("the first take succeeds");
+	assert!(table.take(handle, Rights::TRANSFER).is_err(), "a taken handle names nothing");
+	assert!(table.rights_of(handle).is_err(), "and cannot be inspected either");
+
+	// Putting it back gives a NEW handle - the old slot generation died with the take -
+	// which is the honest outcome of a move that had to be undone.
+	let returned = table.put_back(cap);
+	assert_ne!(returned.raw(), handle.raw(), "a returned capability arrives under a new handle");
+	assert!(table.rights_of(returned).is_ok(), "and that handle works");
+
+	// The duplicate-in-one-batch case. The syscall refuses it on this predicate, which is
+	// tested directly rather than through the call: this context has no current thread,
+	// so the syscall cannot reach its own check.
+	assert!(crate::syscall::has_repeat(&[7, 9, 7]), "a repeated handle is a repeat");
+	assert!(crate::syscall::has_repeat(&[4, 4]), "even two of them");
+	assert!(!crate::syscall::has_repeat(&[1, 2, 3, 4]), "and distinct handles are not");
+	assert!(!crate::syscall::has_repeat(&[]), "nor is an empty array");
+	let _ = Handle::from_raw(returned.raw());
+}
+
 tagged_test!(mapping_over_a_live_page_is_refused_not_performed, [Memory, Process]);
 fn mapping_over_a_live_page_is_refused_not_performed() {
 	// The leaf write was unconditional, so mapping over an existing page silently

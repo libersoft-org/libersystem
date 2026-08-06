@@ -128,6 +128,19 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 		}
 	};
 	if let Err(err) = map_stack(process.address_space(), &mut frames) {
+		// UNMAP before freeing. The segments above are mapped into the process's live page
+		// tables, and `free_frames` hands their frames back to the allocator - so without
+		// this the tables went on naming memory that had been given away, and the next
+		// owner of those frames shared them with a live address space. A use-after-free of
+		// physical memory, reachable by nothing more than running out of memory at the
+		// wrong moment.
+		for (start, end) in elf::loaded_ranges(elf_image) {
+			let mut address = start;
+			while address < end {
+				let _ = process.address_space().unmap(address);
+				address += PAGE_SIZE;
+			}
+		}
 		free_frames(frames);
 		return Err(err);
 	}
@@ -195,14 +208,30 @@ fn map_stack(address_space: &AddressSpace, frames: &mut Vec<u64>) -> Result<(), 
 	let hhdm = hhdm_offset();
 	let base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
 	for page in 0..USER_STACK_PAGES {
-		let frame = frame::allocate().ok_or(LoadError::OutOfMemory)?;
+		let Some(frame) = frame::allocate() else {
+			unmap_stack(address_space, page);
+			return Err(LoadError::OutOfMemory);
+		};
 		frames.push(frame);
 		unsafe {
 			core::ptr::write_bytes((hhdm + frame) as *mut u8, 0, PAGE_SIZE as usize);
 		}
-		address_space.try_map(base + page * PAGE_SIZE, frame, flags).map_err(|_| LoadError::OutOfMemory)?;
+		if address_space.try_map(base + page * PAGE_SIZE, frame, flags).is_err() {
+			unmap_stack(address_space, page);
+			return Err(LoadError::OutOfMemory);
+		}
 	}
 	Ok(())
+}
+
+// Take down the stack pages mapped so far, for a stack mapping that failed partway. The
+// frames themselves are in the caller's `frames` list and are freed with the rest; what
+// this removes is the page-table entries that would otherwise outlive them.
+fn unmap_stack(address_space: &AddressSpace, mapped_pages: u64) {
+	let base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+	for page in 0..mapped_pages {
+		let _ = address_space.unmap(base + page * PAGE_SIZE);
+	}
 }
 
 // Free frames accumulated on an error path, before any Process exists to adopt

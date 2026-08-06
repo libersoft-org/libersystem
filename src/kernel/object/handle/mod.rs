@@ -309,6 +309,44 @@ impl HandleTable {
 
 	// Close a handle: drop its capability (releasing one object reference) and
 	// recycle the slot under a new generation so the old handle value is dead.
+	// Remove a capability from this table and hand it to the caller, requiring `rights`.
+	//
+	// This is what a TRANSFER is: the capability leaves here and arrives there, once. It
+	// used to be a clone under the lock, a send, and then a re-lookup and a `close` whose
+	// result was DISCARDED - so two threads transferring the same handle both cloned it
+	// and only one close succeeded, and a single caller could simply name the same handle
+	// twice in one batch. Either way one handle became two capabilities without the
+	// `DUPLICATE` right, which is the one thing a capability system must not do.
+	//
+	// The slot's generation is bumped like `close` does, so the raw handle the caller
+	// still holds is dead the moment this returns - there is no window in which it names
+	// anything.
+	pub fn take(&mut self, handle: Handle, rights: Rights) -> Result<Capability, HandleError> {
+		let index = handle.index() as usize;
+		{
+			let cap = self.live_cap_of(handle)?;
+			if !cap.rights.contains(rights) {
+				return Err(HandleError::AccessDenied);
+			}
+		}
+		let slot = self.slots.get_mut(index).ok_or(HandleError::BadHandle)?;
+		let cap = slot.cap.take().ok_or(HandleError::BadHandle)?;
+		slot.generation = slot.generation.wrapping_add(1);
+		self.free.push(index as u32);
+		if let Some(domain) = &self.domain {
+			domain.uncharge_handles(1);
+		}
+		Ok(cap)
+	}
+
+	// Put a taken capability back, for a transfer that could not be completed. The handle
+	// it returns is a NEW one - the old raw value died with its slot generation - which is
+	// why the rollback path has to hand the caller its new handles rather than pretending
+	// nothing happened.
+	pub fn put_back(&mut self, cap: Capability) -> Handle {
+		self.insert(cap)
+	}
+
 	pub fn close(&mut self, handle: Handle) -> Result<(), HandleError> {
 		let index = handle.index() as usize;
 		let slot = self.slots.get_mut(index).ok_or(HandleError::BadHandle)?;

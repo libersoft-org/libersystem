@@ -143,27 +143,39 @@ impl Channel {
 	// queue is at its limit, PeerClosed if the peer is gone. Internal kernel IPC;
 	// the queued bytes are not charged to any Domain.
 	pub fn send(&self, msg: Message) -> Result<(), ChannelError> {
-		self.send_inner(msg, None)
+		self.send_inner(msg, None).map_err(|(err, _)| err)
 	}
 
 	// Like `send`, but charge the queued bytes to `sender`'s in-transit IPC quota
 	// (refunded when the message is received or the channel closes). Returns Full -
 	// the backpressure signal - if `sender` is at its queue cap.
 	pub fn send_charged(&self, msg: Message, sender: &Arc<Domain>) -> Result<(), ChannelError> {
+		self.send_inner(msg, Some(sender)).map_err(|(err, _)| err)
+	}
+
+	// The same, returning the capabilities the message carried when it could not be sent.
+	//
+	// A send that fails takes the message with it, and with the message the capabilities
+	// it was carrying - which the sender had already given up. That is a capability
+	// LOST: not duplicated, not leaked, gone, with the sender told only "would block".
+	// A caller doing a real transfer needs them back to put them where they were.
+	pub fn send_charged_or_return(&self, msg: Message, sender: &Arc<Domain>) -> Result<(), (ChannelError, Vec<Capability>)> {
 		self.send_inner(msg, Some(sender))
 	}
 
-	fn send_inner(&self, mut msg: Message, sender: Option<&Arc<Domain>>) -> Result<(), ChannelError> {
-		let peer = self.peer().ok_or(ChannelError::PeerClosed)?;
+	fn send_inner(&self, mut msg: Message, sender: Option<&Arc<Domain>>) -> Result<(), (ChannelError, Vec<Capability>)> {
+		let Some(peer) = self.peer() else {
+			return Err((ChannelError::PeerClosed, msg.caps));
+		};
 		{
 			let mut inbox = peer.inbox.lock();
 			if inbox.len() >= peer.limit {
-				return Err(ChannelError::Full);
+				return Err((ChannelError::Full, msg.caps));
 			}
 			// Charge only once space is assured, so a refused message charges nothing.
 			if let Some(domain) = sender {
 				if !msg.charge_queue(domain) {
-					return Err(ChannelError::Full);
+					return Err((ChannelError::Full, msg.caps));
 				}
 			}
 			inbox.push_back(msg);

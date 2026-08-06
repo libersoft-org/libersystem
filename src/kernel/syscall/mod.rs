@@ -69,6 +69,16 @@ pub use abi::DomainStats;
 // re-exported here next to their syscalls.
 pub use abi::{IrqInfo, MemmapRegion, MemoryStats, PciInfo};
 
+// Does any value appear twice?
+//
+// A handle may be named ONCE in a transfer array. Naming it twice used to mint two
+// capabilities from one - no race required, just a repeated number - because each was
+// cloned independently and the close afterwards ran twice with the second failure
+// discarded. Quadratic, over an array bounded by `MAX_MESSAGE_CAPS`.
+pub(crate) fn has_repeat(values: &[u64]) -> bool {
+	values.iter().enumerate().any(|(i, v)| values[..i].contains(v))
+}
+
 // A zeroed byte buffer of `len`, or None if the allocator will not give it.
 //
 // Every allocation sized from a userspace number goes through this. They were plain `vec!`
@@ -1492,33 +1502,52 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 	});
 	let badge = thread.handles().lock().badge_of(Handle::from_raw(ch)).unwrap_or(0);
 
-	// Build every capability first, so a refusal costs nothing.
-	let mut caps = Vec::with_capacity(count);
+	if has_repeat(&raw[..count]) {
+		return ERR_INVALID;
+	}
+
+	// TAKE every capability, under one lock, or take none. The handles are gone from the
+	// sender's table when this block ends: a transfer moves a capability, and a move that
+	// leaves the source in place is a duplication however the bookkeeping is written.
+	let mut caps: Vec<Capability> = Vec::with_capacity(count);
 	{
-		let table = thread.handles().lock();
+		let mut table = thread.handles().lock();
 		for &handle in raw.iter().take(count) {
-			let object = match table.lookup(Handle::from_raw(handle), Rights::TRANSFER) {
-				Ok(o) => o,
-				Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
-				Err(_) => return ERR_BAD_HANDLE,
-			};
-			let rights = table.rights_of(Handle::from_raw(handle)).unwrap_or(Rights::NONE);
-			let cap_badge = table.badge_of(Handle::from_raw(handle)).unwrap_or(0);
-			caps.push(Capability::new(object, rights, cap_badge));
+			match table.take(Handle::from_raw(handle), Rights::TRANSFER) {
+				Ok(cap) => caps.push(cap),
+				Err(err) => {
+					// put back whatever was taken before the refusal, so a rejected send
+					// costs the caller nothing but the handle VALUES, which are reissued.
+					for cap in caps {
+						table.put_back(cap);
+					}
+					return match err {
+						HandleError::AccessDenied => ERR_ACCESS_DENIED,
+						_ => ERR_BAD_HANDLE,
+					};
+				}
+			}
 		}
 	}
-	match channel.send_charged(Message::new(bytes, caps, badge), thread.domain()) {
+	match channel.send_charged_or_return(Message::new(bytes, caps, badge), thread.domain()) {
 		Ok(()) => {
-			// Delivered: only now do the sender's handles go away, and all of them together.
-			let mut table = thread.handles().lock();
-			for &handle in raw.iter().take(count) {
-				let _ = table.close(Handle::from_raw(handle));
-			}
 			thread.process().record_send();
 			0
 		}
-		Err(ChannelError::PeerClosed) => ERR_PEER_CLOSED,
-		Err(_) => ERR_WOULD_BLOCK,
+		Err(err) => {
+			// Undelivered: the capabilities come back. They arrive under new handles -
+			// their old slots died when they were taken - which is the honest outcome of
+			// a move that had to be undone, and better than the old behaviour of losing
+			// them or leaving two copies about.
+			let mut table = thread.handles().lock();
+			for cap in err.1 {
+				table.put_back(cap);
+			}
+			match err.0 {
+				ChannelError::PeerClosed => ERR_PEER_CLOSED,
+				_ => ERR_WOULD_BLOCK,
+			}
+		}
 	}
 }
 

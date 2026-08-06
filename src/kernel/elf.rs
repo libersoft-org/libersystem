@@ -74,6 +74,32 @@ pub fn load_into(elf: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>, s
 	load_parsed(&image, addr_space, frames, shared, bias, window, true, &|_| None).map(|loaded| loaded.0)
 }
 
+// The virtual ranges a successful load left mapped, so a caller whose own later step
+// fails can take them down before it frees the frames underneath them.
+//
+// Without this the loader freed the ELF frames when the STACK mapping failed and unmapped
+// nothing: the process's page tables went on naming frames that were back in the
+// allocator, and the next thing to be handed one of them shared physical memory with a
+// live address space. `load_parsed` unmaps its own segments when IT fails; this is for the
+// failure that happens after it has succeeded.
+pub fn loaded_ranges(elf: &[u8]) -> Vec<(u64, u64)> {
+	let Some(image) = bootproto::elf::Elf::parse(elf) else {
+		return Vec::new();
+	};
+	let bias = if image.image_type == bootproto::elf::ET_DYN { DYNAMIC_MAIN_BASE } else { 0 };
+	let mut out = Vec::new();
+	for i in 0..image.segment_count() {
+		let Some(ph) = image.segment(i) else { continue };
+		if ph.p_type != bootproto::elf::PT_LOAD {
+			continue;
+		}
+		let Some(start) = ph.p_vaddr.checked_add(bias).map(align_down) else { continue };
+		let Some(end) = ph.p_vaddr.checked_add(bias).and_then(|v| v.checked_add(ph.p_memsz)).and_then(align_up) else { continue };
+		out.push((start, end));
+	}
+	out
+}
+
 pub fn load_resolved_into(elf: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>, shared: &mut Vec<Arc<SharedPage>>, resolve: &impl Fn(&str) -> Option<u64>) -> Result<u64, ElfError> {
 	let image = bootproto::elf::Elf::parse(elf).ok_or(ElfError::BadImage)?;
 	let bias = if image.image_type == bootproto::elf::ET_DYN { DYNAMIC_MAIN_BASE } else { 0 };
