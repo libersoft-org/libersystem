@@ -30,11 +30,29 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 // sized by the machine's real core count.
 static LAPIC_IDS: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
 
-// The CPU id and LAPIC id the next application processor reads on entry. APs are
-// woken one at a time and each is waited on before the next, so a single slot
-// suffices (the AP has consumed both long before the next wake overwrites them).
+// The CPU id and LAPIC id the next application processor reads on entry.
+//
+// "A single slot suffices, the AP has consumed both long before the next wake
+// overwrites them" was the reasoning, and it holds for every AP that answers. The one
+// that does NOT is the whole problem: the wait below gives up after a timeout and the
+// BSP moves on, rewriting all three slots for the next core. An AP that was merely slow
+// then wakes into someone else's identity - another core's id, another core's LAPIC,
+// another core's stack - and initialises a per-CPU slot that is already taken, on a
+// stack that is already in use.
+//
+// So the identity is published as a SEQLOCK and taken by a claim. `AP_SEQ` is odd while
+// the slots are being written and even when they are stable, which lets an AP tell a torn
+// read from a whole one; `AP_INVITE` names the generation currently open, and an AP joins
+// only by winning a compare-exchange against it. That ties the identity it read to the
+// invitation it is answering: a core whose invitation has been superseded loses the CAS
+// and parks instead of joining, which is the outcome that costs a core rather than the
+// machine.
 static AP_CPU_ID: AtomicUsize = AtomicUsize::new(0);
 static AP_LAPIC_ID: AtomicU32 = AtomicU32::new(0);
+// Even and stable, odd while the two slots above are being rewritten.
+static AP_SEQ: AtomicUsize = AtomicUsize::new(0);
+// The generation an arriving AP may claim, or 0 for "nothing is open".
+static AP_INVITE: AtomicUsize = AtomicUsize::new(0);
 
 // Each application processor's kernel stack in 16-byte words (64 KiB), 16-aligned
 // (a Box<[u128]>) so the trampoline's `call` into Rust lands ABI-aligned.
@@ -155,9 +173,15 @@ pub fn init(boot_info: &BootInfo) {
 			}
 			let cpu_id = online; // contiguous id for the next core to report in
 			let stack = alloc_ap_stack();
+			// close whatever was open, write the new identity, then publish it. A late
+			// AP from the previous round can be anywhere in here and will fail its claim.
+			AP_INVITE.store(0, Ordering::SeqCst);
+			AP_SEQ.fetch_add(1, Ordering::SeqCst); // odd: writing
 			AP_CPU_ID.store(cpu_id, Ordering::SeqCst);
 			AP_LAPIC_ID.store(lapic, Ordering::SeqCst);
 			unsafe { arch::apboot::set_stack(tramp, stack) };
+			let generation = AP_SEQ.fetch_add(1, Ordering::SeqCst) + 1; // even: stable
+			AP_INVITE.store(generation, Ordering::SeqCst);
 
 			// INIT, then two STARTUP IPIs (with the Intel-prescribed pauses), then
 			// wait for this AP to run its per-CPU init and report in.
@@ -169,6 +193,9 @@ pub fn init(boot_info: &BootInfo) {
 			if wait_online(online + 1, 100_000) {
 				online += 1;
 			} else {
+				// Withdraw the invitation before the next one is written. An AP that
+				// turns up after this finds nothing open and parks.
+				AP_INVITE.store(0, Ordering::SeqCst);
 				crate::serial_println!("smp: WARNING: AP lapic_id {} did not come online", lapic);
 			}
 		}
@@ -181,14 +208,43 @@ pub fn init(boot_info: &BootInfo) {
 // published, runs its per-CPU init, reports in, then parks in the scheduler idle
 // loop so threads can be scheduled onto it.
 extern "C" fn ap_entry() -> ! {
-	let cpu_id = AP_CPU_ID.load(Ordering::SeqCst);
-	let lapic_id = AP_LAPIC_ID.load(Ordering::SeqCst);
+	// Read the identity and the generation it belongs to together, then claim that exact
+	// generation. Losing the claim means this core's invitation was withdrawn or taken -
+	// it is late, its slots now describe another core, and the only safe thing it can do
+	// is stop. Halting costs one core; joining on someone else's stack costs the machine.
+	let Some((cpu_id, lapic_id)) = claim_identity() else {
+		arch::halt_loop();
+	};
 	arch::init_ap(cpu_id, lapic_id);
 	// Publish the topology entry before counting the core online, so the BSP cannot
 	// observe a completed bring-up while the entry is still stale.
 	report(cpu_id, lapic_id);
 	ONLINE.fetch_add(1, Ordering::Release);
 	crate::sched::cpu_idle_loop()
+}
+
+// Read the published identity coherently and claim the invitation it belongs to, or None
+// if this core arrived too late.
+//
+// The seqlock loop is what makes the pair coherent: an odd sequence means the BSP is
+// mid-write, and a sequence that changed across the read means the snapshot is torn. The
+// claim then ties that snapshot to the invitation - if the BSP has moved on, `AP_INVITE`
+// no longer names this generation and the exchange fails.
+fn claim_identity() -> Option<(usize, u32)> {
+	for _ in 0..1_000_000 {
+		let before = AP_SEQ.load(Ordering::SeqCst);
+		if before % 2 == 1 {
+			core::hint::spin_loop();
+			continue;
+		}
+		let cpu_id = AP_CPU_ID.load(Ordering::SeqCst);
+		let lapic_id = AP_LAPIC_ID.load(Ordering::SeqCst);
+		if AP_SEQ.load(Ordering::SeqCst) != before {
+			continue;
+		}
+		return AP_INVITE.compare_exchange(before, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok().then_some((cpu_id, lapic_id));
+	}
+	None
 }
 
 // Spin until at least `target` cores are online or `spin_us` microseconds elapse.

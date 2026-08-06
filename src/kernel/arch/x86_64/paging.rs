@@ -295,6 +295,17 @@ pub fn try_map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> Resu
 		let pd = table_ptr(next_table_create(pdpt, table_index(virt, 30), parent_flags).ok_or(())?);
 		let pt = table_ptr(next_table_create(pd, table_index(virt, 21), parent_flags).ok_or(())?);
 		let entry = pt.add(table_index(virt, 12));
+		// Refuse to replace a live mapping. The write was unconditional, so mapping over
+		// an existing page silently dropped the frame that was there: a second load
+		// overwrote the first, two concurrent stack faults could overwrite each other, and
+		// one loader's rollback could unmap another's page. Nothing reported any of it,
+		// because from the mapper's point of view nothing had happened.
+		//
+		// A caller that MEANS to replace a mapping unmaps first, which is the operation
+		// that returns the old frame to whoever owns it.
+		if entry.read_volatile() & PRESENT != 0 {
+			return Err(());
+		}
 		entry.write_volatile((phys & ADDR_MASK) | flags | PRESENT);
 		invlpg(virt);
 	}

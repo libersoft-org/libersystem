@@ -202,6 +202,11 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), (
 		table = phys_to_virt(next) as *mut u64;
 	}
 	let idx = ((va >> 12) & 0x1ff) as usize;
+	// see the note on the x86_64 port: replacing a live mapping loses the frame that was
+	// there, with nothing to report it.
+	if unsafe { read_volatile(table.add(idx)) } & PTE_V != 0 {
+		return Err(());
+	}
 	unsafe { write_volatile(table.add(idx), pte_ppn(pa) | leaf_bits(flags)) };
 	flush_tlb();
 	Ok(())

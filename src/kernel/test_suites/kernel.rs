@@ -1,5 +1,33 @@
 use super::*;
 
+tagged_test!(mapping_over_a_live_page_is_refused_not_performed, [Memory, Process]);
+fn mapping_over_a_live_page_is_refused_not_performed() {
+	// The leaf write was unconditional, so mapping over an existing page silently
+	// replaced it and the frame that was there was simply lost - no owner, no error, no
+	// way to notice. A second process load overwrote the first, two stack faults could
+	// overwrite each other, and one loader's rollback could unmap another's page.
+	use crate::arch::paging::{PRESENT, USER, WRITABLE};
+	use crate::object::address_space::AddressSpace;
+
+	let space = AddressSpace::create().expect("address space");
+	let first = crate::mem::frame::allocate().expect("a frame");
+	let second = crate::mem::frame::allocate().expect("another frame");
+	let at = 0x40_0000u64;
+
+	assert!(space.try_map(at, first, PRESENT | USER | WRITABLE).is_ok(), "the first mapping is made");
+	assert!(space.try_map(at, second, PRESENT | USER | WRITABLE).is_err(), "the second must be refused, not performed");
+	// and the first mapping is untouched, which is the half that matters: a refusal that
+	// damaged the existing entry would be no better than the overwrite.
+	assert_eq!(space.unmap(at), Some(first), "the original frame is still the one mapped there");
+	// with the page free again, the same address maps fine - the refusal is about the
+	// mapping being live, not about the address.
+	assert!(space.try_map(at, second, PRESENT | USER | WRITABLE).is_ok(), "an unmapped address still maps");
+	assert_eq!(space.unmap(at), Some(second));
+
+	crate::mem::frame::deallocate(first);
+	crate::mem::frame::deallocate(second);
+}
+
 tagged_test!(duplicating_a_handle_is_charged_like_any_other_install, [Process, Syscall]);
 fn duplicating_a_handle_is_charged_like_any_other_install() {
 	// `duplicate` finished with the UNBOUNDED insert, so a process holding one duplicable

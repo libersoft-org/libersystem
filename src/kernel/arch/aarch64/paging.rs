@@ -199,6 +199,11 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), (
 	}
 	let idx = ((va >> 12) & 0x1ff) as usize;
 	unsafe {
+		// see the note on the x86_64 port: replacing a live mapping loses the frame that
+		// was there, with nothing to report it.
+		if core::ptr::read_volatile(table.add(idx)) & VALID != 0 {
+			return Err(());
+		}
 		core::ptr::write_volatile(table.add(idx), (pa & ADDR_MASK) | leaf_bits(flags));
 		asm!(
 			"dsb ishst",
