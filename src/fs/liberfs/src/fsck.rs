@@ -92,7 +92,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// tree, and verifying it a second time reports nothing new. Snapshots sharing
 		// subtrees with each other is the normal case, so this is also most of the work
 		// saved on a healthy volume.
-		let mut visited = vec![0u8; self.free.len()];
+		let mut visited = try_zeroed(self.free.len())?;
 		for i in 0..self.snapshots.len() {
 			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
 			checksum_failures = checksum_failures.saturating_add(match self.check_inode_tree(root, crc, TREE_DEPTH_MAX, &mut visited) {
@@ -174,9 +174,26 @@ impl<D: BlockDevice> LiberFs<D> {
 		// every inode in the tree, checked as a shape and collected so the ones no name
 		// reaches can be named.
 		let mut inodes: BTreeSet<u32> = BTreeSet::new();
-		let mut seen_blocks = vec![0u8; self.free.len()];
+		let Ok(mut seen_blocks) = try_zeroed(self.free.len()) else {
+			note("not enough memory to check the inode tree's structure", faults);
+			return;
+		};
 		if self.walk_inode_records(self.inode_root, self.inode_root_crc, TREE_DEPTH_MAX, &mut inodes, &mut seen_blocks, faults).is_err() {
 			note("the inode tree could not be walked to the end", faults);
+		}
+
+		// the directory trees, which the walk above reaches only as `dir_root` pointers.
+		// The inode tree is checked strictly and directory trees were reached mostly
+		// through `dir_leaf_parse`, which is deliberately tolerant: a record running past
+		// the end of a block ends the parse and it returns what it managed to read. So a
+		// truncated leaf produced a directory that lists part of itself, a `lookup` that
+		// cannot find an entry which is on the medium, and an insert that then edits a
+		// list already out of order - with nothing reporting a structural cause.
+		for &num in inodes.iter() {
+			let Ok(inode) = self.read_inode(num) else { continue };
+			if inode.r#type == TYPE_DIR {
+				self.check_dir_structure(num, &inode, faults);
+			}
 		}
 
 		// reachability: every inode record should be findable from the root by name.
@@ -199,6 +216,12 @@ impl<D: BlockDevice> LiberFs<D> {
 				}
 			}
 		}
+		// and the counter against the highest key the walk actually found.
+		if let Some(&highest) = inodes.iter().next_back() {
+			if self.next_inode <= highest {
+				faults.push(alloc::format!("next_inode {} is not above the highest live inode {highest}", self.next_inode).into_bytes());
+			}
+		}
 		let orphans = inodes.difference(&reached).count();
 		if orphans != 0 {
 			faults.push(alloc::format!("{orphans} inode record(s) reachable from no name").into_bytes());
@@ -209,6 +232,12 @@ impl<D: BlockDevice> LiberFs<D> {
 	// it holds. Keys must ascend strictly within a leaf, a block must appear once, and
 	// each file's extent map must be ordered, non-overlapping and as long as it claims.
 	fn walk_inode_records(&mut self, ptr: u64, crc: u32, depth: usize, inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>) -> Result<(), FsError> {
+		self.walk_inode_records_in(ptr, crc, depth, (None, None), inodes, seen, faults)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn walk_inode_records_in(&mut self, ptr: u64, crc: u32, depth: usize, range: (Option<u64>, Option<u64>), inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>) -> Result<(), FsError> {
+		let (lower, upper) = range;
 		if ptr == 0 {
 			return Ok(());
 		}
@@ -235,6 +264,11 @@ impl<D: BlockDevice> LiberFs<D> {
 				if last.is_some_and(|l| key <= l) {
 					faults.push(alloc::format!("inode leaf {ptr} is not in ascending key order").into_bytes());
 				}
+				// and inside the interval the separators above route to this leaf, or the
+				// record is on the medium and reachable by no lookup.
+				if lower.is_some_and(|l| key < l) || upper.is_some_and(|u| key >= u) {
+					faults.push(alloc::format!("inode leaf {ptr} holds a key routing will never reach").into_bytes());
+				}
 				last = Some(key);
 				if key > u32::MAX as u64 {
 					faults.push(alloc::format!("inode leaf {ptr} holds a key outside the inode number range").into_bytes());
@@ -243,6 +277,11 @@ impl<D: BlockDevice> LiberFs<D> {
 				inodes.insert(key as u32);
 				let mut inode = Inode::parse(&buf[off + 8..off + 8 + INODE_SIZE]);
 				if inode.r#type == TYPE_FILE {
+					self.check_file_shape(key as u32, &mut inode, faults);
+				} else if inode.r#type != TYPE_DIR {
+					// no writer emits one, so its presence is a fact worth naming even
+					// though the free-map walk reserves its blocks conservatively.
+					faults.push(alloc::format!("inode {key} has type {} which this build does not define", inode.r#type).into_bytes());
 					self.check_file_shape(key as u32, &mut inode, faults);
 				}
 			}
@@ -260,12 +299,119 @@ impl<D: BlockDevice> LiberFs<D> {
 				last = Some(sep);
 			}
 			for i in 0..=count {
-				if self.walk_inode_records(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, inodes, seen, faults).is_err() {
+				let child_lower = if i == 0 { lower } else { Some(sep_key(&buf, i - 1)) };
+				let child_upper = if i == count { upper } else { Some(sep_key(&buf, i)) };
+				if self.walk_inode_records_in(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, (child_lower, child_upper), inodes, seen, faults).is_err() {
 					faults.push(alloc::format!("subtree under {ptr} could not be walked").into_bytes());
 				}
 			}
 		}
 		Ok(())
+	}
+
+	// One directory's B+tree, checked as a structure rather than parsed for whatever it
+	// yields: node types, record counts against what the header claims and against what
+	// the block can hold, every record complete, `(hash, name)` strictly ascending, no
+	// duplicate names, the stored hash equal to the name's own, names that are the text
+	// the format says they are, separators ascending - and the inode's `size` equal to
+	// the number of entries actually there.
+	fn check_dir_structure(&mut self, num: u32, inode: &Inode, faults: &mut Vec<Vec<u8>>) {
+		let Ok(mut visited) = try_zeroed(self.free.len()) else { return };
+		// (block, crc, depth remaining, the half-open key interval this subtree is routed
+		// for). `route_child` advances while `sep(i) <= key`, so child `i` holds keys in
+		// `[sep(i-1), sep(i))` - lower inclusive, upper exclusive, and `None` at either
+		// end is that end of the key space.
+		//
+		// This is what the other checks cannot see. Ordering within a leaf and ordering
+		// among separators are both local; a leaf can be perfectly ordered and still hold
+		// records that routing will never reach, because the separators above it send
+		// their hashes down a different child. Those entries are on the medium, count
+		// against the directory's size, and are findable by nothing.
+		type Range = (Option<u64>, Option<u64>);
+		let mut stack: Vec<(u64, u32, usize, Range)> = Vec::new();
+		if inode.dir_root != 0 {
+			stack.push((inode.dir_root, inode.dir_root_crc, TREE_DEPTH_MAX, (None, None)));
+		}
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut entries: u64 = 0;
+		let mut names: BTreeSet<Vec<u8>> = BTreeSet::new();
+		while let Some((ptr, crc, left, (lower, upper))) = stack.pop() {
+			if ptr == 0 {
+				continue;
+			}
+			if left == 0 || ptr >= self.num_blocks {
+				faults.push(alloc::format!("inode {num}: a directory node outside the pool or past the depth limit").into_bytes());
+				continue;
+			}
+			if test_bit(&visited, ptr) {
+				faults.push(alloc::format!("inode {num}: directory block {ptr} appears twice in one tree").into_bytes());
+				continue;
+			}
+			set_bit(&mut visited, ptr);
+			if self.read_node(ptr, crc, &mut buf).is_err() {
+				faults.push(alloc::format!("inode {num}: a directory node that does not match the checksum recorded for it").into_bytes());
+				continue;
+			}
+			match node_type(&buf) {
+				NODE_LEAF => {
+					let recs = dir_leaf_parse(&buf);
+					// `dir_leaf_parse` stops at a record it cannot complete, so a count
+					// short of the header's is a truncated leaf - the case that makes a
+					// directory list part of itself.
+					if recs.len() != node_count(&buf) {
+						faults.push(alloc::format!("inode {num}: directory leaf {ptr} holds {} of the {} records it claims", recs.len(), node_count(&buf)).into_bytes());
+					}
+					let mut last: Option<(u64, Vec<u8>)> = None;
+					for rec in recs {
+						entries += 1;
+						if lower.is_some_and(|l| rec.hash < l) || upper.is_some_and(|u| rec.hash >= u) {
+							faults.push(alloc::format!("inode {num}: directory leaf {ptr} holds a record routing will never reach").into_bytes());
+						}
+						if name_hash(&rec.name) != rec.hash {
+							faults.push(alloc::format!("inode {num}: a directory record whose stored hash is not its name's").into_bytes());
+						}
+						if core::str::from_utf8(&rec.name).is_err() || rec.name.is_empty() {
+							faults.push(alloc::format!("inode {num}: a directory record whose name is not the text the format requires").into_bytes());
+						}
+						if let Some((lh, ln)) = &last {
+							if (rec.hash, &rec.name) <= (*lh, ln) {
+								faults.push(alloc::format!("inode {num}: directory leaf {ptr} is not in ascending (hash, name) order").into_bytes());
+							}
+						}
+						if !names.insert(rec.name.clone()) {
+							faults.push(alloc::format!("inode {num}: a name appears twice in the directory").into_bytes());
+						}
+						last = Some((rec.hash, rec.name));
+					}
+				}
+				NODE_INTERNAL => {
+					if node_count(&buf) > INTERNAL_MAX - 1 {
+						faults.push(alloc::format!("inode {num}: directory node {ptr} claims more children than it can hold").into_bytes());
+					}
+					let count = internal_count(&buf);
+					let mut last: Option<u64> = None;
+					for i in 0..count {
+						let sep = sep_key(&buf, i);
+						if last.is_some_and(|l| sep <= l) {
+							faults.push(alloc::format!("inode {num}: directory node {ptr} has separators out of order").into_bytes());
+						}
+						last = Some(sep);
+					}
+					for i in 0..=count {
+						let child_lower = if i == 0 { lower } else { Some(sep_key(&buf, i - 1)) };
+						let child_upper = if i == count { upper } else { Some(sep_key(&buf, i)) };
+						stack.push((child_ptr(&buf, i), child_crc(&buf, i), left - 1, (child_lower, child_upper)));
+					}
+				}
+				other => faults.push(alloc::format!("inode {num}: directory block {ptr} has node type {other}, which is not a node").into_bytes()),
+			}
+		}
+		// `size` is a cached count and the tree is the fact; nothing compared them, so a
+		// directory could claim any number - including one that overflows on the next
+		// insert.
+		if inode.size != entries {
+			faults.push(alloc::format!("inode {num}: size says {} entries and the tree holds {entries}", inode.size).into_bytes());
+		}
 	}
 
 	// One file's extent map: as long as the inode claims, ordered by logical offset,
@@ -287,7 +433,15 @@ impl<D: BlockDevice> LiberFs<D> {
 			if end.is_some_and(|e| ext.logical < e) {
 				faults.push(alloc::format!("inode {num}: extents overlap or are out of order").into_bytes());
 			}
-			end = Some(ext.logical + ext.length as u64);
+			// `check_extent` bounds the PHYSICAL span and says nothing about `logical`, so a
+			// run at the top of the address space passes it and then overflowed this sum -
+			// a panic in debug, and in release a wrapped value that gets the overlap
+			// comparison above wrong for every extent after it.
+			let Some(next_end) = ext.logical.checked_add(ext.length as u64) else {
+				faults.push(alloc::format!("inode {num}: an extent whose logical range leaves the address space").into_bytes());
+				continue;
+			};
+			end = Some(next_end);
 		}
 	}
 

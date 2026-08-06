@@ -98,7 +98,10 @@ impl<D: BlockDevice> LiberFs<D> {
 		dir.dir_root = root;
 		dir.dir_root_crc = crc;
 		if !existed {
-			dir.size += 1;
+			// a checksummed `size` of u64::MAX is not something any writer produces, and
+			// nothing refuses such an inode at mount - so this panicked in debug and wrapped
+			// to zero in release, committing a count that says the directory is empty.
+			dir.size = dir.size.checked_add(1).ok_or(FsError::Corrupt)?;
 		}
 		dir.mtime = self.clock;
 		self.write_inode(dir_num, &mut dir)?;
@@ -145,35 +148,67 @@ impl<D: BlockDevice> LiberFs<D> {
 	// propagates, so a delete refuses rather than assuming there was nothing there.
 	pub(crate) fn dir_has_entries(&mut self, inode: &Inode) -> Result<bool, FsError> {
 		let mut out = Vec::new();
-		self.collect_dir_entries(inode.dir_root, inode.dir_root_crc, &mut out, TREE_DEPTH_MAX)?;
+		// one entry is the whole answer, so the walk stops there rather than reading the
+		// rest of a directory it has already decided about.
+		self.collect_dir_entries_bounded(inode.dir_root, inode.dir_root_crc, &mut out, TREE_DEPTH_MAX, true)?;
 		Ok(!out.is_empty())
 	}
 
 	// Walk the directory B+tree rooted at (`ptr`, `crc`), appending each leaf's entries.
-	// The depth budget bounds the recursion (and so the stack) against a hostile chain
-	// of one-child internals; no legitimate tree comes near it.
-	pub(crate) fn collect_dir_entries(&mut self, ptr: u64, crc: u32, out: &mut Vec<(Vec<u8>, u32)>, depth: usize) -> Result<(), FsError> {
-		if ptr == 0 {
+	//
+	// Iterative, with a visited bitmap, and both matter. The depth budget alone bounded
+	// the STACK and not the work: an internal node whose two hundred child links all point
+	// at the next level's single node - checksums agreeing throughout, which is buildable
+	// bottom-up - was walked `fanout ^ depth` times. Every ordinary directory operation
+	// comes through here, so `list`, `read_dir`, `rmdir`, the replacing `rename`,
+	// `subtree_contains` and the live namespace walk of `fsck` could all be made to run
+	// for a practical eternity by one small image. A read-only mount does not help; these
+	// are all reads.
+	//
+	// A block reached twice within ONE directory tree is corruption, not sharing: a tree
+	// in a single generation is a tree, and the copy-on-write sharing that is legal
+	// elsewhere is between generations, never inside one.
+	//
+	// `stop_early` lets a caller that only needs to know whether ANY entry exists stop at
+	// the first one instead of building the whole list.
+	pub(crate) fn collect_dir_entries_bounded(&mut self, root: u64, root_crc: u32, out: &mut Vec<(Vec<u8>, u32)>, depth: usize, stop_early: bool) -> Result<(), FsError> {
+		if root == 0 {
 			return Ok(());
 		}
-		if depth == 0 {
-			return Err(FsError::Corrupt);
-		}
+		let mut visited = try_zeroed(self.free.len())?;
+		// (block, crc, depth remaining)
+		let mut stack: Vec<(u64, u32, usize)> = vec![(root, root_crc, depth)];
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		self.read_node(ptr, crc, &mut buf)?;
-		if node_type(&buf) == NODE_LEAF {
-			for rec in dir_leaf_parse(&buf) {
-				out.push((rec.name, rec.child));
+		while let Some((ptr, crc, left)) = stack.pop() {
+			if ptr == 0 {
+				continue;
 			}
-		} else {
-			let count = internal_count(&buf);
-			for i in 0..=count {
-				let cp = child_ptr(&buf, i);
-				let cc = child_crc(&buf, i);
-				self.collect_dir_entries(cp, cc, out, depth - 1)?;
+			if left == 0 || ptr >= self.num_blocks {
+				return Err(FsError::Corrupt);
+			}
+			if test_bit(&visited, ptr) {
+				return Err(FsError::Corrupt);
+			}
+			set_bit(&mut visited, ptr);
+			self.read_node(ptr, crc, &mut buf)?;
+			if node_type(&buf) == NODE_LEAF {
+				for rec in dir_leaf_parse(&buf) {
+					out.push((rec.name, rec.child));
+					if stop_early {
+						return Ok(());
+					}
+				}
+			} else {
+				for i in 0..=internal_count(&buf) {
+					stack.push((child_ptr(&buf, i), child_crc(&buf, i), left - 1));
+				}
 			}
 		}
 		Ok(())
+	}
+
+	pub(crate) fn collect_dir_entries(&mut self, ptr: u64, crc: u32, out: &mut Vec<(Vec<u8>, u32)>, depth: usize) -> Result<(), FsError> {
+		self.collect_dir_entries_bounded(ptr, crc, out, depth, false)
 	}
 
 	// directory B+tree operations over variable-length leaf records. Internal nodes

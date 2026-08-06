@@ -130,7 +130,12 @@ impl<D: BlockDevice> LiberFs<D> {
 			if crc32c(&block) != crc {
 				return Err(FsError::Corrupt);
 			}
-			let count = (u32::from_le_bytes(block[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize).min(SNAPS_PER_BLOCK);
+			// a count above what the block can hold is impossible, not something to trim
+			// down to the nearest possible value and carry on with.
+			let count = u32::from_le_bytes(block[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize;
+			if count > SNAPS_PER_BLOCK {
+				return Err(FsError::Corrupt);
+			}
 			for i in 0..count {
 				let off = SNAP_HDR + i * SNAP_REC;
 				let name = name_in(&block[off..off + SNAP_NAME_MAX]).to_vec();

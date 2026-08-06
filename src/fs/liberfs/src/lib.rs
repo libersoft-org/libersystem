@@ -322,6 +322,21 @@ pub struct Stat {
 // FORMAT, and a caller sizing a volume needs to be able to name it.
 pub const MAX_BLOCKS: u64 = 1 << 40;
 
+// A zeroed byte map of `len`, or `NoSpace` if the machine will not give it.
+//
+// Every one of these is sized from a number read off the medium, and `vec![0u8; len]`
+// ABORTS the process when the allocator refuses. `MAX_BLOCKS` bounds what the format may
+// claim - 4 PiB, whose bitmap is 128 GiB - and a mount builds several such maps, so a
+// checksum-consistent superblock naming a legal size could take StorageService down
+// through the allocator rather than returning a mount error. The format's ceiling and the
+// machine's are different numbers, and only one of them was being checked.
+pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
+	let mut v: Vec<u8> = Vec::new();
+	v.try_reserve_exact(len).map_err(|_| FsError::NoSpace)?;
+	v.resize(len, 0);
+	Ok(v)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsckReport {
 	pub checksum_failures: u32,
@@ -459,8 +474,17 @@ impl Extent {
 		// clamp the lengths to what one checksum block can cover (the writer's own
 		// ceiling): the record comes off the medium, and a checksummed-but-hostile
 		// length must not drive the block loops or decode buffers past all reason.
-		let length = u32::from_le_bytes(buf[16..20].try_into().unwrap()).min(CRCS_PER_BLOCK as u32);
-		let store_len = u32::from_le_bytes(buf[32..36].try_into().unwrap()).min(CRCS_PER_BLOCK as u32);
+		// Raw, deliberately. These used to be clamped to CRCS_PER_BLOCK here, which turned
+		// an impossible extent into a possible one before anything could object: a forged
+		// 5000/5000 arrived at `check_extent` as a perfectly well-formed 1024/1024 raw run
+		// and passed. The file was then silently reinterpreted as a shorter run plus a
+		// hole, the blocks past the first 1024 were reserved by nobody, `fsck` never saw
+		// the value that was actually on the medium, and the mount stayed writable.
+		//
+		// The ceiling is now the validator's business: a run cannot be longer than the
+		// checksum block that vouches for it, and `check_extent` says so.
+		let length = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+		let store_len = u32::from_le_bytes(buf[32..36].try_into().unwrap());
 		Extent { logical: u64::from_le_bytes(buf[0..8].try_into().unwrap()), physical: u64::from_le_bytes(buf[8..16].try_into().unwrap()), length, csum_crc: u32::from_le_bytes(buf[20..24].try_into().unwrap()), csum: u64::from_le_bytes(buf[24..32].try_into().unwrap()), store_len, clen: u32::from_le_bytes(buf[36..40].try_into().unwrap()) }
 	}
 
@@ -669,6 +693,19 @@ pub(crate) const DECOMP_CACHE_ENTRIES: usize = 8;
 // argument for the paths that were left out of it.
 //
 // Only `Unformatted` may be answered by formatting. Everything else keeps every byte where it is.
+// Which generation a mount is asking for, and on what terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountMode {
+	// The live generation, writable. Refuses when anything about the OTHER slot is
+	// unknown, because a writable mount that proceeds anyway can overwrite it.
+	Newest,
+	// The generation one commit back, read-only. Needs both slots valid by definition.
+	Previous,
+	// The newest slot that parses, whatever the other one did - always read-only, so
+	// nothing it cannot account for can be overwritten.
+	Recovery,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountError {
 	// No superblock: a blank disk, or one belonging to something else.
@@ -681,6 +718,11 @@ pub enum MountError {
 	Io,
 	// The medium does not cover the pool the superblock claims.
 	DeviceTooSmall,
+	// The volume is a size this machine cannot hold the free maps for. A limit of the
+	// RUNNING SYSTEM rather than of the format - the same volume may mount elsewhere,
+	// and nothing about the medium is wrong. Reported instead of aborting the process
+	// through the allocator, which is what an infallible `vec!` did.
+	NoMemory,
 }
 
 // What identifies a cached decode. The address alone is not enough: truncating a live
@@ -837,6 +879,12 @@ pub struct LiberFs<D: BlockDevice> {
 	// block seen twice, which `derive_free` turns into corruption.
 	mark_strict: bool,
 	mark_dup: Option<u64>,
+	// The highest inode key the live walk saw. `next_inode` hands out numbers ABOVE
+	// everything in use, and checking only that `next_inode` itself is free is not that
+	// invariant: with inodes 1 and 3 live and 2 deleted, a counter of 2 passes - and the
+	// second file created then takes 3 and overwrites the one that exists, along with
+	// every name pointing at it.
+	mark_max_inode: u64,
 	// Volume identity and the per-volume compression switch, carried in the superblock.
 	uuid: [u8; 16],
 	label: [u8; LABEL_MAX],

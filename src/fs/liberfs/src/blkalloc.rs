@@ -392,6 +392,13 @@ impl<D: BlockDevice> LiberFs<D> {
 		if ext.length == 0 {
 			return Err(FsError::Corrupt);
 		}
+		// One checksum block holds one CRC32C per stored block, so a run cannot serve or
+		// store more blocks than that block has room to vouch for. The parser used to clamp
+		// to this value and hand on something that looked legal; the ceiling belongs here,
+		// where exceeding it is an answer rather than a silent repair.
+		if ext.length as usize > CRCS_PER_BLOCK || ext.store_len as usize > CRCS_PER_BLOCK {
+			return Err(FsError::Corrupt);
+		}
 		// a run covers blocks that were once raw data in this pool, so it cannot be
 		// logically longer than the pool. For a raw run the address gate below implies
 		// this; a compressed one is only bounded by `store_len < length`, which leaves

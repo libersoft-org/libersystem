@@ -58,6 +58,61 @@ impl BlockDevice for DeadDevice {
 	}
 }
 
+// Fails reads of one chosen block, and counts nothing else.
+struct OneBadSlotDevice {
+	inner: MemDevice,
+	bad: u64,
+}
+
+impl BlockDevice for OneBadSlotDevice {
+	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		if index == self.bad {
+			return false;
+		}
+		self.inner.read_block(index, buf)
+	}
+
+	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		self.inner.write_block(index, buf)
+	}
+
+	fn flush(&mut self) -> bool {
+		self.inner.flush()
+	}
+}
+
+#[test]
+fn one_good_slot_beside_one_unknown_slot_is_not_a_writable_mount() {
+	// the slot that did not answer is the one whose generation is unknown - and a
+	// writable mount that proceeds without knowing it will hand out the blocks that
+	// generation holds and then overwrite the slot itself. One failed 4 KiB read was
+	// enough to destroy a newer, perfectly consistent generation.
+	//
+	// Two commits, so the two slots hold different generations and both are valid.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"one.txt", b"first").unwrap();
+	fs.write_file(b"two.txt", b"second").unwrap();
+	let good = fs.into_device();
+	let newest = newest_super_slot(&good);
+	assert!(LiberFs::mount(good.clone()).unwrap().read_file(b"two.txt").is_ok(), "the untouched image mounts and has both files");
+
+	// the NEWER slot cannot be read. The older one is intact and would mount happily.
+	let dev = OneBadSlotDevice { inner: good.clone(), bad: newest as u64 };
+	assert_eq!(LiberFs::mount(dev).err(), Some(MountError::Io), "a slot that did not answer is not a slot to write past");
+
+	// and the same when the other slot is a format this build does not know.
+	let mut dev = good.clone();
+	forge_superblock(&mut dev, newest as usize, |sb| sb[8..12].copy_from_slice(&99u32.to_le_bytes()));
+	assert_eq!(LiberFs::mount(dev).err(), Some(MountError::Unsupported), "an older build may not write over a newer format's generation");
+
+	// the recovery door is open, and is read-only.
+	let dev = OneBadSlotDevice { inner: good.clone(), bad: newest as u64 };
+	let mut rec = LiberFs::mount_recovery(dev).expect("recovery mounts what it can read");
+	assert!(rec.is_read_only(), "recovery never writes");
+	assert_eq!(rec.read_file(b"one.txt").unwrap(), b"first", "and it can still get the data off");
+	assert_eq!(rec.write_file(b"three.txt", b"x"), Err(FsError::ReadOnly));
+}
+
 #[test]
 fn a_mount_failure_says_which_failure_it_was() {
 	// The whole point of the typed error, and the reason it exists: the CALLER formats.
@@ -1774,9 +1829,12 @@ fn the_record_layouts_match_the_specification() {
 	assert_eq!(&rec[32..36], &0x5152_5354u32.to_le_bytes(), "store_len");
 	assert_eq!(&rec[36..40], &0x6162_6364u32.to_le_bytes(), "clen");
 	let back = Extent::parse(&rec);
-	// the parser clamps both lengths to one checksum block's coverage (CRCS_PER_BLOCK):
-	// the writer never exceeds it, so a larger stored value is hostile or corrupt.
-	assert_eq!((back.logical, back.physical, back.length, back.csum, back.csum_crc, back.store_len, back.clen), (ext.logical, ext.physical, CRCS_PER_BLOCK as u32, ext.csum, ext.csum_crc, CRCS_PER_BLOCK as u32, ext.clen));
+	// the parser reads the record back FAITHFULLY, including values no legitimate writer
+	// emits. It used to clamp both lengths to one checksum block's coverage here, which
+	// meant an impossible extent arrived at the validator looking possible - so the
+	// ceiling moved to `check_extent`, where exceeding it is an answer instead of a
+	// silent repair.
+	assert_eq!((back.logical, back.physical, back.length, back.csum, back.csum_crc, back.store_len, back.clen), (ext.logical, ext.physical, ext.length, ext.csum, ext.csum_crc, ext.store_len, ext.clen));
 
 	// one file inode slot: 256 bytes, header fields then the file overlay.
 	let mut inode = Inode::empty(TYPE_FILE);
@@ -2704,6 +2762,111 @@ fn fsck_reports_shapes_no_checksum_can_object_to() {
 }
 
 #[test]
+fn fsck_finds_a_record_routing_will_never_reach() {
+	// the check no local rule can make. A leaf can be perfectly ordered, its hashes can
+	// all match their names, and the separators above it can be perfectly ascending -
+	// and the leaf can still hold records that routing sends down the OTHER child. They
+	// are on the medium, they count against the directory's size, and no lookup will ever
+	// find them.
+	//
+	// Two records with known hashes, a separator between them, and both put on the wrong
+	// side of it.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"d").unwrap();
+	fs.write_file(b"d/aaa", b"one").unwrap();
+	fs.write_file(b"d/zzz", b"two").unwrap();
+	let a_num = fs.lookup(b"d/aaa").unwrap().unwrap();
+	let z_num = fs.lookup(b"d/zzz").unwrap().unwrap();
+	assert_eq!(fs.fsck().unwrap().structural_failures, 0, "the real tree is sound");
+	let mut dev = fs.into_device();
+
+	let (ha, hz) = (name_hash(b"aaa"), name_hash(b"zzz"));
+	let (lo_name, lo_hash, lo_child, hi_name, hi_hash, hi_child) = if ha < hz { (b"aaa".as_slice(), ha, a_num, b"zzz".as_slice(), hz, z_num) } else { (b"zzz".as_slice(), hz, z_num, b"aaa".as_slice(), ha, a_num) };
+	// the separator is the higher hash, so child 0 is routed (-inf, hi) and child 1
+	// [hi, +inf). Each record then goes into the leaf that cannot be reached for it.
+	let (leaf0, leaf1, internal) = (30usize, 31usize, 32usize);
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	dir_leaf_write(&mut buf, &[DirRec { hash: hi_hash, name: hi_name.to_vec(), child: hi_child }]);
+	dev.blocks[leaf0 * BLOCK_SIZE..(leaf0 + 1) * BLOCK_SIZE].copy_from_slice(&buf);
+	let crc0 = crc32c(&buf);
+	dir_leaf_write(&mut buf, &[DirRec { hash: lo_hash, name: lo_name.to_vec(), child: lo_child }]);
+	dev.blocks[leaf1 * BLOCK_SIZE..(leaf1 + 1) * BLOCK_SIZE].copy_from_slice(&buf);
+	let crc1 = crc32c(&buf);
+
+	let at = internal * BLOCK_SIZE;
+	dev.blocks[at..at + BLOCK_SIZE].fill(0);
+	node_set_header(&mut dev.blocks[at..at + NODE_HDR], NODE_INTERNAL, 1);
+	set_sep(&mut dev.blocks[at..at + BLOCK_SIZE], 0, hi_hash);
+	for (i, (blk, crc)) in [(leaf0, crc0), (leaf1, crc1)].iter().enumerate() {
+		let off = at + INTERNAL_CHILD_BASE + i * CHILD_SIZE;
+		dev.blocks[off..off + 8].copy_from_slice(&(*blk as u64).to_le_bytes());
+		dev.blocks[off + 8..off + 12].copy_from_slice(&crc.to_le_bytes());
+	}
+	let icrc = crc32c(&dev.blocks[at..at + BLOCK_SIZE]);
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_MAP_OFF..INO_MAP_OFF + 8].copy_from_slice(&(internal as u64).to_le_bytes());
+		slot[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&icrc.to_le_bytes());
+		slot[INO_SIZE_OFF..INO_SIZE_OFF + 8].copy_from_slice(&2u64.to_le_bytes());
+	});
+
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"routing will never reach"), "a misrouted record must be named: {:?}", report.faults);
+	// and the ordering and hash checks stay quiet, so this is the range check speaking.
+	assert!(!mentions(&report.faults, b"ascending"), "the leaves are ordered: {:?}", report.faults);
+	assert!(!mentions(&report.faults, b"stored hash"), "the hashes match their names: {:?}", report.faults);
+}
+
+#[test]
+fn fsck_checks_directory_trees_as_structures() {
+	// the inode tree was checked strictly and directory trees were reached mostly through
+	// `dir_leaf_parse`, which stops at a record it cannot complete and returns what it
+	// read. A truncated leaf therefore produced a directory that lists part of itself and
+	// a `lookup` that cannot find an entry which is on the medium - with `fsck` reporting
+	// no structural cause for any of it.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"d").unwrap();
+	for n in [b"a.txt".as_slice(), b"b.txt".as_slice(), b"c.txt".as_slice()] {
+		let mut path = b"d/".to_vec();
+		path.extend_from_slice(n);
+		fs.write_file(&path, b"payload").unwrap();
+	}
+	let dir = fs.lookup(b"d").unwrap().unwrap();
+	let root = fs.read_inode(dir).unwrap().dir_root;
+	assert_eq!(fs.fsck().unwrap().structural_failures, 0, "a healthy volume has no structural faults");
+	let good = fs.into_device();
+
+	// a leaf claiming far more records than the block can hold: `dir_leaf_parse` walks
+	// until a record would run past the end and then stops, returning fewer than the
+	// header promised. That is the truncated-leaf shape, and the count is what names it.
+	//
+	// It has to be FAR more. Claiming a few extra just makes the parser read on into the
+	// zero padding and hand back that many zero-length records - caught too, but by the
+	// hash and ordering checks rather than by the count.
+	let mut dev = good.clone();
+	{
+		let at = root as usize * BLOCK_SIZE;
+		dev.blocks[at + 2..at + 4].copy_from_slice(&400u16.to_le_bytes());
+	}
+	let crc = crc32c(&dev.blocks[root as usize * BLOCK_SIZE..(root as usize + 1) * BLOCK_SIZE]);
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes());
+	});
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"of the"), "the short leaf must be named: {:?}", report.faults);
+
+	// and a directory whose cached size disagrees with its own tree.
+	let mut dev = good.clone();
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_SIZE_OFF..INO_SIZE_OFF + 8].copy_from_slice(&99u64.to_le_bytes());
+	});
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"the tree holds"), "the size mismatch must be named: {:?}", report.faults);
+}
+
+#[test]
 fn fsck_reports_an_extent_map_that_overlaps_itself() {
 	// two runs of one file covering the same logical block. Each is individually
 	// possible - in the pool, right shape - and together they are not.
@@ -2753,6 +2916,23 @@ fn a_label_is_the_utf8_it_claims_to_be() {
 	let dev = fs.into_device();
 	let fs = LiberFs::mount(dev).unwrap();
 	assert_eq!(fs.label(), "archiv-zálohy".as_bytes(), "and again after a remount");
+}
+
+#[test]
+fn a_volume_this_machine_cannot_map_is_an_error_not_an_abort() {
+	// under MAX_BLOCKS and still enormous: a superblock may legally claim a size whose
+	// free maps do not fit in this machine, and a mount builds several of them. The
+	// allocation used to be an infallible `vec!`, which aborts the process - so a
+	// checksum-consistent number took StorageService down instead of returning an error.
+	//
+	// 2^39 blocks is half the format ceiling; its bitmap is 64 GiB, and the mount wants
+	// two before it walks anything.
+	let huge = MAX_BLOCKS / 2;
+	assert_eq!(LiberFs::format(MemDevice::new(8), huge).err(), Some(FsError::NoSpace), "the format path reports rather than aborts");
+	// and the helper itself, which is what every derived map goes through.
+	assert_eq!(try_zeroed((huge / 8) as usize).err(), Some(FsError::NoSpace));
+	// while an ordinary size still succeeds, so the guard is not simply refusing.
+	assert!(try_zeroed(1024).is_ok());
 }
 
 #[test]
@@ -3148,6 +3328,58 @@ impl BlockDevice for ReadBudgetDevice {
 }
 
 #[test]
+fn a_checksum_consistent_fan_cannot_make_a_listing_exponential() {
+	// the same shape as the fsck test below, aimed at the path every ordinary directory
+	// operation takes. `collect_dir_entries` had the depth budget and no visited set, so
+	// it bounded the stack and not the work: nine levels of twelve-way fan at one node
+	// each is twelve to the eighth visits over a tree of ten blocks.
+	//
+	// Read-only is no defence here - `list` and `read_dir` are reads.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"d").unwrap();
+	fs.write_file(b"d/keep.txt", b"payload").unwrap();
+	let mut dev = fs.into_device();
+
+	const LEVELS: usize = 9;
+	const FAN: usize = 12;
+	let top = 20usize;
+	let leaf = top + LEVELS;
+	{
+		let at = leaf * BLOCK_SIZE;
+		dev.blocks[at..at + BLOCK_SIZE].fill(0);
+		node_set_header(&mut dev.blocks[at..at + NODE_HDR], NODE_LEAF, 0);
+	}
+	let mut child = leaf as u64;
+	let mut child_crc = crc32c(&dev.blocks[leaf * BLOCK_SIZE..(leaf + 1) * BLOCK_SIZE]);
+	for level in (0..LEVELS).rev() {
+		let blk = top + level;
+		let at = blk * BLOCK_SIZE;
+		dev.blocks[at..at + BLOCK_SIZE].fill(0);
+		node_set_header(&mut dev.blocks[at..at + NODE_HDR], NODE_INTERNAL, FAN - 1);
+		for i in 0..FAN {
+			let off = at + INTERNAL_CHILD_BASE + i * CHILD_SIZE;
+			dev.blocks[off..off + 8].copy_from_slice(&child.to_le_bytes());
+			dev.blocks[off + 8..off + 12].copy_from_slice(&child_crc.to_le_bytes());
+		}
+		child = blk as u64;
+		child_crc = crc32c(&dev.blocks[at..at + BLOCK_SIZE]);
+	}
+	// hang it off the directory inode, whose slot `forge_inode_slot` reaches.
+	forge_inode_slot(&mut dev, |slot| {
+		slot[INO_TYPE_OFF] = TYPE_DIR;
+		slot[INO_MAP_OFF..INO_MAP_OFF + 8].copy_from_slice(&child.to_le_bytes());
+		slot[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&child_crc.to_le_bytes());
+	});
+
+	let dev = ReadBudgetDevice { inner: dev, left: 20_000 };
+	let mut fs = LiberFs::mount(dev).expect("the forged tree is checksum-consistent, so it mounts");
+	// whatever it answers, it answers - a repeated node inside one directory tree is
+	// corruption, and the walk is bounded by the pool either way.
+	let _ = fs.list();
+	let _ = fs.read_dir(b"d");
+}
+
+#[test]
 fn a_checksum_consistent_fan_cannot_make_fsck_exponential() {
 	// the raw marking walk carries a visited bitmap; `check_inode_tree` carried only a
 	// depth limit, which protects the stack and not the clock. This shape needs no cycle
@@ -3251,6 +3483,20 @@ fn an_unknown_inode_type_is_inert_and_removable() {
 	assert_eq!(fs.read_file(b"odd"), Err(FsError::IsDir), "a read refuses the unknown type");
 	assert_eq!(fs.write_file(b"odd", b"x"), Err(FsError::IsDir), "an overwrite refuses it too");
 	assert_eq!(fs.list().unwrap().len(), 1, "the record lists inert");
+
+	// and its blocks are RESERVED, which is the half that was missing. The usual way an
+	// unknown type appears is a flipped byte in the type field of a real file, and its
+	// data blocks were reserved by nobody while the volume stayed writable - so the
+	// allocator could hand out blocks that were still recoverable. Marking it as the file
+	// it parses as costs at worst some held space until the record is removed.
+	let odd = fs.lookup(b"odd").unwrap().unwrap();
+	let data = fs.read_inode(odd).unwrap().extents[0].physical;
+	assert!(fs.is_alloc(data), "the blocks behind an unknown type may not be free for the allocator");
+	// the structural pass names it rather than passing over it in silence.
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"does not define"), "fsck names the unknown type: {:?}", report.faults);
+
+	// and the repair verb still works, which read-only degradation would have cost.
 	fs.remove(b"odd").unwrap();
 	assert_eq!(fs.list().unwrap().len(), 0, "the repair verb clears it");
 }

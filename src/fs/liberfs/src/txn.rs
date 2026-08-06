@@ -199,8 +199,9 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn derive_free(&mut self) -> Result<(), FsError> {
 		self.walk_damage = false;
 		self.mark_dup = None;
+		self.mark_max_inode = 0;
 		let len = self.free.len();
-		let mut live = vec![0u8; len];
+		let mut live = try_zeroed(len)?;
 		set_bit(&mut live, 0);
 		set_bit(&mut live, 1);
 		// the live generation is the one place where every block has exactly one owner.
@@ -225,12 +226,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		// everything past here spans generations, where sharing is legal by design.
 		let dup = self.mark_dup.take();
 		self.mark_strict = false;
-		let mut pinned = vec![0u8; len];
+		let mut pinned = try_zeroed(len)?;
 		for i in 0..self.snapshots.len() {
 			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
 			self.mark_inode_tree(root, crc, &mut pinned)?;
 		}
-		let mut prev = vec![0u8; len];
+		let mut prev = try_zeroed(len)?;
 		if self.prev_valid {
 			self.mark_inode_tree(self.prev_inode_root, self.prev_inode_root_crc, &mut prev)?;
 			// and its snapshot table: both the chain's own blocks and the generations it
@@ -334,7 +335,12 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			if node_type(&buf) == NODE_LEAF {
 				for i in 0..leaf_count(&buf, INODE_REC) {
-					let off = NODE_HDR + i * INODE_REC + 8;
+					let rec = NODE_HDR + i * INODE_REC;
+					if self.mark_strict {
+						let key = u64::from_le_bytes(buf[rec..rec + 8].try_into().unwrap());
+						self.mark_max_inode = self.mark_max_inode.max(key);
+					}
+					let off = rec + 8;
 					let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
 					if inode.r#type == TYPE_FILE {
 						// complete the extent map from the overflow chain before marking
@@ -347,6 +353,26 @@ impl<D: BlockDevice> LiberFs<D> {
 						}
 					} else if inode.r#type == TYPE_DIR {
 						self.mark_dir_tree(inode.dir_root, inode.dir_root_crc, map)?;
+					} else {
+						// A type byte that is neither is documented as inert - reads and
+						// writes refuse it, a listing shows it, `remove` clears it - and that
+						// story holds for an inode AUTHORED that way. It does not hold for the
+						// way one actually appears: a flipped byte in the type field of a real
+						// file. Its data, checksum and spill blocks were then reserved by
+						// nobody while the mount stayed writable, so the allocator could hand
+						// out blocks that were still recoverable.
+						//
+						// Marked as a FILE, which is what `Inode::parse` already builds it as.
+						// Degrading to read-only would protect the same blocks and take the
+						// repair verb with it - the operator could no longer remove the record
+						// that caused it. Reserving is the conservative direction here: at
+						// worst it holds blocks nothing needs until the inode is removed, and
+						// at best it is exactly right, because the record usually IS a file.
+						// The structural pass reports the type, so it is not silent either.
+						let marked = self.load_spill(&mut inode).and_then(|()| self.collect_inode_blocks(&inode, map));
+						if marked.is_err() {
+							self.walk_damage = true;
+						}
 					}
 				}
 			} else {

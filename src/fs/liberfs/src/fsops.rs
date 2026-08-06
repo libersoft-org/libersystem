@@ -30,6 +30,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// an enormous infallible allocation on a 64-bit one. The bound is documented as
 		// the format's maximum volume size and refused here.
 		let map_len = free_map_len(num_blocks)?;
+		let (free_map, pinned_map) = (try_zeroed(map_len)?, try_zeroed(map_len)?);
 		let leaf_block: u64 = POOL_START;
 		let mut label = [0u8; LABEL_MAX];
 		// The record is specified as UTF-8, so it has to BE UTF-8 - and a NUL inside it
@@ -72,7 +73,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_snap_root: 0, prev_snap_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; map_len], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; map_len], snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, walk_damage: false, mark_strict: false, mark_dup: None, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_snap_root: 0, prev_snap_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: free_map, data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: pinned_map, snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, walk_damage: false, mark_strict: false, mark_dup: None, mark_max_inode: 0, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -80,7 +81,16 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Mount an existing LiberFS on `dev` at its newest committed generation. Returns None
 	// if neither superblock slot is a valid LiberFS (an unformatted or foreign disk).
 	pub fn mount(dev: D) -> Result<LiberFs<D>, MountError> {
-		Self::mount_at(dev, true)
+		Self::mount_at(dev, MountMode::Newest)
+	}
+
+	// Mount the newest slot that parses, whatever happened to the other one, and never
+	// writable. The recovery door for the refusals `Newest` now makes: an operator whose
+	// disk lost a superblock read, or whose volume was written by a build this one does
+	// not know, can still get the data off. It is deliberately a different call, because
+	// the whole point of the refusal is that this is not something to do by accident.
+	pub fn mount_recovery(dev: D) -> Result<LiberFs<D>, MountError> {
+		Self::mount_at(dev, MountMode::Recovery)
 	}
 
 	// Mount the previous generation read-only: the consistent snapshot of the
@@ -90,7 +100,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub fn mount_snapshot(dev: D) -> Option<LiberFs<D>> {
 		// An `Option` here on purpose: nothing formats on the strength of this answer, and "there
 		// is no older generation" is the ordinary case rather than a fault to report.
-		Self::mount_at(dev, false).ok()
+		Self::mount_at(dev, MountMode::Previous).ok()
 	}
 
 	// Mount a named snapshot read-only: the consistent, pinned state captured when the
@@ -117,7 +127,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		Some(fs)
 	}
 
-	pub(crate) fn mount_at(mut dev: D, newest: bool) -> Result<LiberFs<D>, MountError> {
+	pub(crate) fn mount_at(mut dev: D, mode: MountMode) -> Result<LiberFs<D>, MountError> {
+		let newest = !matches!(mode, MountMode::Previous);
 		// read and validate both superblock slots.
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		let mut slots: [Option<Superblock>; SUPER_SLOTS as usize] = [None, None];
@@ -157,6 +168,27 @@ impl<D: BlockDevice> LiberFs<D> {
 				MountError::Unformatted
 			}
 		};
+		// A slot that did not answer, or that this build cannot read, is not a slot whose
+		// generation is known - and a WRITABLE mount that proceeds without knowing it will
+		// hand out the blocks that slot's generation holds and then overwrite the slot
+		// itself. One failed 4 KiB read was enough to destroy a newer consistent
+		// generation, and an older build meeting a newer format did the same thing on
+		// purpose.
+		//
+		// These flags used to be consulted only when NOTHING parsed, which is the one case
+		// where they change nothing that matters: there is no volume to protect. They are
+		// consulted here instead, where there IS one.
+		//
+		// `Recovery` skips this and is read-only for exactly that reason; `Previous` is
+		// read-only by construction and already requires two valid slots.
+		if matches!(mode, MountMode::Newest) {
+			if saw_io {
+				return Err(MountError::Io);
+			}
+			if saw_unsupported {
+				return Err(MountError::Unsupported);
+			}
+		}
 		// order the valid slots by generation: the higher is the live root, the lower
 		// the snapshot.
 		let mut valid: Vec<(u32, u64)> = (0..SUPER_SLOTS).filter_map(|s| slots[s as usize].map(|sb| (s, sb.generation))).collect();
@@ -182,6 +214,10 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(MountError::DeviceTooSmall);
 		}
 		let map_len = free_map_len(sb.num_blocks).map_err(|_| MountError::Unsupported)?;
+		// built before the filesystem, so a size this machine cannot map is a mount ERROR
+		// and not an allocator abort taking the whole service with it.
+		let free_map = try_zeroed(map_len).map_err(|_| MountError::NoMemory)?;
+		let pinned_map = try_zeroed(map_len).map_err(|_| MountError::NoMemory)?;
 		let (prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid) = match prev_slot {
 			Some(ps) => {
 				let psb = slots[ps as usize].ok_or(MountError::Corrupt)?;
@@ -190,7 +226,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, 0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; map_len], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; map_len], snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, walk_damage: false, mark_strict: false, mark_dup: None, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: free_map, data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: pinned_map, snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, walk_damage: false, mark_strict: false, mark_dup: None, mark_max_inode: 0, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		// a corrupt snapshot table degrades the mount to read-only instead of failing it:
 		// the pinned generations it named can no longer be reserved, so a commit could
 		// reuse their blocks - refusing every mutation keeps them (and the table block
@@ -205,6 +241,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		// mount never allocates, so the incomplete map is harmless, and failing the
 		// mount instead would present the volume as unformatted (and cost its data to
 		// the next format). An error other than Corrupt still fails the mount.
+		if matches!(mode, MountMode::Recovery) {
+			fs.read_only = true;
+		}
 		match fs.derive_free() {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => fs.read_only = true,
@@ -217,6 +256,13 @@ impl<D: BlockDevice> LiberFs<D> {
 		// `next_inode` naming an inode that ALREADY exists is the dangerous one -
 		// `alloc_inode` hands the number out unexamined, so the next file created takes
 		// over an existing inode and every name pointing at it.
+		// The counter must sit above EVERY live inode, not merely on a free number. The
+		// live walk in `derive_free` above recorded the highest key it saw, which is the
+		// whole invariant; the direct read stays as a cheap second opinion for the case
+		// the walk could not complete.
+		if (fs.next_inode as u64) <= fs.mark_max_inode {
+			fs.read_only = true;
+		}
 		match fs.read_inode(fs.next_inode) {
 			Err(FsError::Invalid) => {}
 			Ok(_) => fs.read_only = true,
@@ -523,7 +569,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			// mark-then-scan is O(pool) per call - accepted: this path runs only for a
 			// damaged directory (never on a healthy volume), and the marked map is the
 			// one exact answer to "which blocks does this tree hold".
-			let mut map = vec![0u8; self.free.len()];
+			let mut map = try_zeroed(self.free.len())?;
 			self.mark_dir_tree(inode.dir_root, inode.dir_root_crc, &mut map)?;
 			for b in 0..self.num_blocks {
 				if test_bit(&map, b) {
@@ -692,5 +738,12 @@ fn parse_checked(block: &[u8]) -> Option<Superblock> {
 	uuid.copy_from_slice(&block[SB_UUID_OFF..SB_UUID_OFF + 16]);
 	let mut label = [0u8; LABEL_MAX];
 	label.copy_from_slice(&block[SB_LABEL_OFF..SB_LABEL_OFF + LABEL_MAX]);
+	// The write side refuses a label that is not UTF-8 or that carries a NUL; the read
+	// side accepted anything, so a volume authored elsewhere produced a `label()` that was
+	// not what the record held. `name_in` is what `label()` returns, so that is what has
+	// to be text - the padding after it is not part of the name.
+	if core::str::from_utf8(name_in(&label)).is_err() {
+		return None;
+	}
 	Some(Superblock { num_blocks, generation, inode_root, inode_root_crc: u32::from_le_bytes(block[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].try_into().ok()?), next_inode, root_inode, snap_root, snap_root_crc: u32::from_le_bytes(block[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].try_into().ok()?), uuid, label, compress: block[SB_COMPRESS_OFF] != 0 })
 }

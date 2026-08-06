@@ -320,10 +320,19 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
-	// The disk's content must never deny storage. A GPT names a LiberFS
-	// partition too small to format (8 sectors - below even the superblock slots):
-	// the probe must SKIP it and fall back to the fixed factory layout instead of
-	// failing the format and exiting.
+	// A GPT names a LiberFS partition too small to use (8 sectors - below even the
+	// superblock slots). The probe skips that entry, finds no usable one, and the disk is
+	// then a GPT disk with no LiberFS partition - which is somebody's partition table,
+	// not a blank disk.
+	//
+	// This test used to demand the opposite: fall back to the factory layout and format.
+	// The factory layout starts at sector ZERO, so "falling back" meant laying a
+	// filesystem over the protective MBR, the GPT header, the entry array and whatever
+	// else the disk carried. "The disk's content must never deny storage" is the wrong
+	// rule when the content is a partition table - M0143 established that a mount answers
+	// "I could not tell" by changing nothing, and this is the same rule one layer down.
+	//
+	// So the service refuses, and the whole point is what the disk looks like afterwards.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	let expected_pool: u64 = (CAPACITY - FALLBACK_START_SECTOR * 512) / 4096;
 
@@ -350,23 +359,26 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
 
+	let header_before = disk.get(&1).expect("the GPT header is on the disk").clone();
+	let entries_before = disk.get(&2).expect("the entry array is on the disk").clone();
 	let mut online = false;
 	'serve: for _ in 0..100_000 {
 		sched::run_until_idle();
 		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
 		if let Ok(report) = boot_kernel.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online", "the service must survive the degenerate entry");
+			assert_eq!(&report.bytes[..], b"StorageService: online", "if it reports at all it reports online");
 			online = true;
 			break 'serve;
 		}
 	}
-	assert!(online, "the service must fall back to the factory layout and report in");
+	assert!(!online, "a GPT disk with no usable LiberFS partition is not a disk to format");
 
-	// the fallback formatted at the factory offset, sized by the disk's capacity.
-	let sb = disk.get(&FALLBACK_START_SECTOR).expect("the fallback should write superblock slot 0 at the factory offset");
-	assert_eq!(&sb[0..8], b"LIBERFS1", "the factory layout should carry the volume");
-	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
-	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");
+	// nothing was written. The partition table is exactly as it was, and no superblock
+	// was laid at sector zero on top of it.
+	assert_eq!(disk.get(&1), Some(&header_before), "the GPT header must be untouched");
+	assert_eq!(disk.get(&2), Some(&entries_before), "the partition entry array must be untouched");
+	assert!(disk.get(&FALLBACK_START_SECTOR).is_none_or(|s| &s[0..8] != b"LIBERFS1"), "no filesystem may be laid over a partition table");
+	let _ = expected_pool;
 }
 
 tagged_test!(garbage_where_the_superblock_should_be_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);

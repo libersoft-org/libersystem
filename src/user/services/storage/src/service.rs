@@ -1998,9 +1998,35 @@ impl udf::BlockDevice for UdfBlockDevice {
 // mounts the same volume), else the fixed region past the factory archive; a fresh
 // format spans the whole container. The block channel stays open for the serve loop.
 unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
-	let (base, pool): (u64, u64) = match unsafe { gpt_liberfs_partition(block_client) } {
-		Some((first, last)) => (first, (last - first + 1) / SECTORS_PER_BLOCK),
-		None => (FS_START_SECTOR, unsafe { disk_pool_blocks(block_client) }),
+	// What the disk is, before deciding what may be written to it. Only two answers lead
+	// anywhere near a format, and the difference between them and the other three is the
+	// difference between a blank disk and somebody else's.
+	let probe = unsafe { gpt_liberfs_partition(block_client) };
+	let (base, pool): (u64, u64) = match probe {
+		PartitionProbe::LiberFs { first, last } => (first, (last - first + 1) / SECTORS_PER_BLOCK),
+		PartitionProbe::RawDisk => (FS_START_SECTOR, unsafe { disk_pool_blocks(block_client) }),
+		// Everything else means the whole-device fallback is not available, because the
+		// fallback starts at sector ZERO - it would lay a filesystem over the protective
+		// MBR, the GPT header, the entry array and every partition the disk carries.
+		// Refusing costs a boot; the alternative cost the disk.
+		PartitionProbe::GptWithoutLiberFs => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: the disk has a GPT with no LiberFS partition. Nothing was changed - create one, or attach the right disk\n");
+			}
+			return None;
+		}
+		PartitionProbe::CorruptGpt => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: the disk begins a GPT this build cannot read. Nothing was changed - this is not a blank disk\n");
+			}
+			return None;
+		}
+		PartitionProbe::Io => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: the disk did not answer while its partition table was read. Nothing was changed - check the device and reboot\n");
+			}
+			return None;
+		}
 	};
 	let max_sectors: u32 = unsafe { block_request_sectors(block_client) };
 	// an existing filesystem (files persisted from a previous boot) mounts as-is, at
@@ -2112,26 +2138,46 @@ const LIBERFS_GUID_ON_DISK: [u8; 16] = [0x53, 0x46, 0x42, 0x4C, 0x01, 0x00, 0x00
 // making the format fail.
 const MIN_PARTITION_SECTORS: u64 = 16 * SECTORS_PER_BLOCK;
 
+// What the disk turned out to be. An `Option` said all of these with one word - and
+// `mount_or_format` answered that word by formatting the whole device from sector zero,
+// which is where the protective MBR, the GPT header and the partition entry array live.
+// A read that failed and a disk that is genuinely blank are not the same claim, and only
+// one of them may be answered by writing.
+enum PartitionProbe {
+	// LBA 1 was read and carries no GPT signature: the fixed factory layout applies.
+	RawDisk,
+	// A GPT naming a LiberFS partition, as (first LBA, last LBA).
+	LiberFs { first: u64, last: u64 },
+	// A GPT read end to end that names no LiberFS partition. The disk is somebody's.
+	GptWithoutLiberFs,
+	// A GPT signature followed by a header this build cannot believe.
+	CorruptGpt,
+	// The device did not answer. Nothing is known about what is on it.
+	Io,
+}
+
 // Probe the disk for a GPT and return the first usable partition carrying the
 // LiberFS type GUID as its (first LBA, last LBA), or None (no GPT, or no usable
 // LiberFS partition - the fixed factory layout applies then). Reads the header at
 // LBA 1 and walks the entry array it points at, one 8-sector page at a time. A
 // malformed header (the GPT spec requires a power-of-two entry size >= 128) or a
 // degenerate entry (an impossible or too-small span) is skipped, never trusted.
-unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
+unsafe fn gpt_liberfs_partition(block_client: u64) -> PartitionProbe {
 	unsafe {
 		let mut header = [0u8; SECTOR_SIZE];
 		if !block_read(block_client, 1, 1, header.as_mut_ptr()) {
-			return None;
+			return PartitionProbe::Io;
 		}
+		// The ONLY answer that means "this disk carries no partition table": LBA 1 was
+		// read, and it does not begin a GPT.
 		if &header[0..8] != b"EFI PART" {
-			return None;
+			return PartitionProbe::RawDisk;
 		}
 		let entries_lba = u64::from_le_bytes(header[72..80].try_into().unwrap());
 		let num_entries = u32::from_le_bytes(header[80..84].try_into().unwrap()) as usize;
 		let entry_size = u32::from_le_bytes(header[84..88].try_into().unwrap()) as usize;
 		if entry_size < 128 || entry_size > SECTOR_SIZE || !entry_size.is_power_of_two() || num_entries == 0 {
-			return None;
+			return PartitionProbe::CorruptGpt;
 		}
 		// walk the entry array a page (8 sectors) at a time; a standard 128-entry,
 		// 128-byte-entry array is 4 pages.
@@ -2142,7 +2188,7 @@ unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
 		while index < num_entries.min(512) {
 			let lba = entries_lba + (index / per_page * PAGE_SECTORS) as u64;
 			if !block_read(block_client, lba, PAGE_SECTORS as u32, page.as_mut_ptr()) {
-				return None;
+				return PartitionProbe::Io;
 			}
 			for slot in 0..per_page {
 				if index >= num_entries {
@@ -2155,13 +2201,15 @@ unsafe fn gpt_liberfs_partition(block_client: u64) -> Option<(u64, u64)> {
 					// a degenerate span is skipped, not fatal: keep scanning, another
 					// entry may be the real volume.
 					if first != 0 && last > first && last - first + 1 >= MIN_PARTITION_SECTORS {
-						return Some((first, last));
+						return PartitionProbe::LiberFs { first, last };
 					}
 				}
 				index += 1;
 			}
 		}
-		None
+		// a GPT that was read end to end and names no LiberFS partition. That is a
+		// complete answer about a disk that BELONGS to something else.
+		PartitionProbe::GptWithoutLiberFs
 	}
 }
 
