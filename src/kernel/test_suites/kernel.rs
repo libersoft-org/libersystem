@@ -1,5 +1,27 @@
 use super::*;
 
+tagged_test!(a_syscall_may_not_ask_the_kernel_for_an_unbounded_allocation, [Syscall, Memory]);
+fn a_syscall_may_not_ask_the_kernel_for_an_unbounded_allocation() {
+	// Every allocation the kernel sizes from a userspace number used to be a plain `vec!`
+	// with no ceiling above it: one syscall could name a length and the kernel would try
+	// to satisfy it, answering exhaustion through the allocation-error handler rather
+	// than with an error code.
+	//
+	// The buffer here is deliberately real and small - what is being tested is that the
+	// LENGTH is refused before anything is allocated, so `user_buf_ok` never even runs.
+	// Every one of these is refused on the LENGTH alone, before a handle is resolved or a
+	// lock is taken - which is why the handle below is 0 and the buffer is 64 bytes.
+	let buf = [0u8; 64];
+
+	assert_eq!(crate::syscall::syscall_dispatch(abi::SYS_CHANNEL_SEND, 0, buf.as_ptr() as u64, abi::MAX_MESSAGE_BYTES as u64 + 1, 0) as i64, crate::syscall::ERR_INVALID, "a message larger than the ABI allows is refused, not attempted");
+	assert_eq!(crate::syscall::syscall_dispatch(abi::SYS_PROCESS_LOAD, 0, buf.as_ptr() as u64, abi::MAX_ELF_BYTES as u64 + 1, 0) as i64, crate::syscall::ERR_INVALID, "an ELF larger than the ABI allows is refused before the handle is even resolved");
+	assert_eq!(crate::syscall::syscall_dispatch(abi::SYS_WAIT_ANY, buf.as_ptr() as u64, abi::MAX_WAIT_HANDLES as u64 + 1, 0, 0) as i64, crate::syscall::ERR_INVALID, "a wait set larger than the ABI allows is refused");
+	// That the ceilings do not simply refuse everything is not asserted here - this
+	// context has no current thread, so an ordinary send cannot get far enough to tell
+	// the size check apart from the thread lookup. It is covered by the rest of the
+	// suite, which sends real messages through these same paths in every service test.
+}
+
 tagged_test!(a_cpu_bound_ring3_thread_is_preempted, [Scheduler, Process]);
 fn a_cpu_bound_ring3_thread_is_preempted() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};

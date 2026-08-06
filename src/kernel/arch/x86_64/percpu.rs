@@ -138,3 +138,12 @@ pub fn set_rsp0(value: u64) {
 pub fn in_user_syscall() -> bool {
 	this_cpu().from_user != 0
 }
+
+// Declare who the running core is servicing. Set by the ring-3 entry stub (to true, in
+// assembly) and by the kernel's own `invoke` (to false), which is the only other way into
+// the syscall table. The other two ports have always had this; x86_64 did not, because it
+// inferred the answer from the caller's return address - see the note on `syscall_entry`.
+pub fn set_from_user(value: bool) {
+	let base = msr::read(IA32_GS_BASE);
+	unsafe { (*(base as *mut PerCpu)).from_user = u64::from(value) };
+}

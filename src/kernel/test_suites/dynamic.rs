@@ -1,5 +1,82 @@
 use super::*;
 
+tagged_test!(an_et_exec_may_not_name_the_kernel_half, [Dynamic, Memory, Process, Boot]);
+fn an_et_exec_may_not_name_the_kernel_half() {
+	// The first link of a complete escalation chain on x86_64, and the only one that was
+	// a design decision rather than an oversight: segments were checked against a window
+	// that is `None` for ET_EXEC, so an executable could name any address at all.
+	//
+	// Mapped into the higher half with the USER bit, such a page runs ring-3 code at a
+	// negative address - and the syscall entry stub used to read a negative return
+	// address as a kernel self-call, which skips the stack switch and clears `from_user`,
+	// after which every `user_buf_ok` in the kernel accepts any pointer. The stub no
+	// longer decides that way; this test is about the other two defences, either of which
+	// refuses the premise on its own.
+	use crate::elf::ElfError;
+	use crate::memlayout::USER_VA_END;
+	use crate::object::address_space::AddressSpace;
+
+	fn put16(bytes: &mut [u8], offset: usize, value: u16) {
+		bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+	}
+	fn put32(bytes: &mut [u8], offset: usize, value: u32) {
+		bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+	}
+	fn put64(bytes: &mut [u8], offset: usize, value: u64) {
+		bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+	}
+
+	// A minimal ET_EXEC with one executable PT_LOAD at `address`.
+	fn exec_image(address: u64) -> Vec<u8> {
+		const CODE_OFFSET: usize = 0x200;
+		let mut bytes = alloc::vec![0u8; CODE_OFFSET + 0x40];
+		bytes[..4].copy_from_slice(b"\x7fELF");
+		bytes[4] = 2;
+		bytes[5] = 1;
+		put16(&mut bytes, 16, 2); // ET_EXEC
+		put16(&mut bytes, 18, elf_machine());
+		put32(&mut bytes, 20, 1);
+		put64(&mut bytes, 24, address); // entry
+		put64(&mut bytes, 32, 64);
+		put16(&mut bytes, 52, 64);
+		put16(&mut bytes, 54, 56);
+		put16(&mut bytes, 56, 1);
+		let base = 64;
+		put32(&mut bytes, base, 1); // PT_LOAD
+		put32(&mut bytes, base + 4, 5); // R+X
+		put64(&mut bytes, base + 8, CODE_OFFSET as u64);
+		put64(&mut bytes, base + 16, address);
+		put64(&mut bytes, base + 24, 0);
+		put64(&mut bytes, base + 32, 1);
+		put64(&mut bytes, base + 40, 1);
+		put64(&mut bytes, base + 48, 1);
+		bytes[CODE_OFFSET] = 0xc3;
+		bytes
+	}
+
+	let space = AddressSpace::create().expect("address space");
+	let mut frames = Vec::new();
+	let mut shared = Vec::new();
+
+	// a legitimate low address still loads, so the bound is not simply refusing.
+	assert!(crate::elf::load_into(&exec_image(0x40_0000), &space, &mut frames, &mut shared).is_ok(), "an ordinary ET_EXEC must still load");
+
+	// the kernel half, one page below the ceiling, and the very top - all refused.
+	for address in [USER_VA_END, USER_VA_END + 0x1000, 0xffff_8000_0000_0000, u64::MAX & !0xfff] {
+		let mut f = Vec::new();
+		let mut sh = Vec::new();
+		assert_eq!(crate::elf::load_into(&exec_image(address), &space, &mut f, &mut sh).err(), Some(ElfError::BadImage), "an ET_EXEC naming {address:#x} may not load");
+		assert!(f.is_empty(), "and it may not have left frames mapped behind it");
+	}
+
+	// and the mapper refuses a USER mapping there even asked directly, which is the
+	// defence that does not depend on the image being an ELF at all.
+	let frame = crate::mem::frame::allocate().expect("a frame");
+	assert!(space.try_map(USER_VA_END, frame, crate::arch::paging::PRESENT | crate::arch::paging::USER).is_err(), "no USER mapping outside the user half");
+	assert!(space.try_map(USER_VA_END - 0x1000, frame, crate::arch::paging::PRESENT | crate::arch::paging::USER).is_ok(), "the last user page is still mappable");
+	crate::mem::frame::deallocate(frame);
+}
+
 tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Dynamic, DynamicReject, Memory, Process]);
 fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	use crate::elf::ElfError;

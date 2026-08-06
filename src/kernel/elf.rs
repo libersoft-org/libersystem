@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use crate::arch;
 use crate::mem::frame::{self, PAGE_SIZE};
 use crate::mem::hhdm_offset;
+use crate::memlayout::USER_VA_END;
 use crate::object::address_space::AddressSpace;
 use crate::sync::SpinLock;
 
@@ -147,6 +148,19 @@ fn validate_segment(ph: &bootproto::elf::ProgramHeader, bias: u64, window: Optio
 	}
 	let start = ph.p_vaddr.checked_add(bias).map(align_down).ok_or(ElfError::BadImage)?;
 	let end = align_up(ph.p_vaddr.checked_add(bias).and_then(|value| value.checked_add(ph.p_memsz)).ok_or(ElfError::BadImage)?).ok_or(ElfError::BadImage)?;
+	// Userspace, ALWAYS, whatever the image type. `window` is the tighter bound a
+	// dynamic image is confined to; it was the only bound there was, and it is `None`
+	// for ET_EXEC - so an executable could name any address at all, including the
+	// kernel half, and the mapper would map it there with the USER bit set.
+	//
+	// On x86_64 that was the first link of a complete escalation: a user page in the
+	// higher half, executed, issuing `syscall` - and the entry stub used to read the
+	// resulting negative return address as a kernel self-call. The stub no longer
+	// decides that way, and this refuses the premise as well. Two independent defences
+	// for one hole, deliberately.
+	if start >= USER_VA_END || end > USER_VA_END || end <= start {
+		return Err(ElfError::BadImage);
+	}
 	if window.is_some_and(|(window_start, window_end)| start < window_start || end > window_end) {
 		return Err(ElfError::BadImage);
 	}

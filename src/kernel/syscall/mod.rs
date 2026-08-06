@@ -69,6 +69,28 @@ pub use abi::DomainStats;
 // re-exported here next to their syscalls.
 pub use abi::{IrqInfo, MemmapRegion, MemoryStats, PciInfo};
 
+// A zeroed byte buffer of `len`, or None if the allocator will not give it.
+//
+// Every allocation sized from a userspace number goes through this. They were plain `vec!`
+// macros, which abort the process on exhaustion instead of returning - so a syscall naming a
+// large length answered with an allocation-error handler rather than an error code. The
+// explicit ceilings in `abi` bound what may be asked for; this bounds what happens when the
+// machine cannot supply even that.
+fn try_zeroed_bytes(len: usize) -> Option<Vec<u8>> {
+	let mut v: Vec<u8> = Vec::new();
+	v.try_reserve_exact(len).ok()?;
+	v.resize(len, 0);
+	Some(v)
+}
+
+// The same for a u64 array.
+fn try_zeroed_u64(len: usize) -> Option<Vec<u64>> {
+	let mut v: Vec<u64> = Vec::new();
+	v.try_reserve_exact(len).ok()?;
+	v.resize(len, 0);
+	Some(v)
+}
+
 // Validate a caller-supplied buffer. Always accepts kernel self-calls; for a
 // ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space
 // and every page it touches to be mapped in the active address space. The bounds
@@ -991,7 +1013,7 @@ fn sys_process_create(domain_handle: u64) -> i64 {
 // memory_object_create + memory_map. The kernel maps the program and a ring-3
 // stack into the target process. Requires the MANAGE right on the process handle.
 fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
-	if elf_len == 0 || !user_buf_ok(elf_ptr, elf_len) {
+	if elf_len == 0 || elf_len as usize > abi::MAX_ELF_BYTES || !user_buf_ok(elf_ptr, elf_len) {
 		return ERR_INVALID;
 	}
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
@@ -1016,7 +1038,7 @@ fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
 }
 
 fn sys_process_load_module(process_handle: u64, elf_ptr: u64, elf_len: u64, bias: u64) -> i64 {
-	if elf_len == 0 || !user_buf_ok(elf_ptr, elf_len) {
+	if elf_len == 0 || elf_len as usize > abi::MAX_ELF_BYTES || !user_buf_ok(elf_ptr, elf_len) {
 		return ERR_INVALID;
 	}
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
@@ -1113,7 +1135,9 @@ fn sys_process_group_create(handles_ptr: u64, count: u64) -> i64 {
 	if !user_buf_ok(handles_ptr, bytes) {
 		return ERR_INVALID;
 	}
-	let mut raw = alloc::vec![0u64; count as usize];
+	let Some(mut raw) = try_zeroed_u64(count as usize) else {
+		return ERR_NO_MEMORY;
+	};
 	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(handles_ptr as *const u64, raw.as_mut_ptr(), count as usize);
 	});
@@ -1302,7 +1326,9 @@ fn read_bytes(ptr: u64, len: usize) -> Vec<u8> {
 	if ptr == 0 || len == 0 {
 		return Vec::new();
 	}
-	let mut bytes = alloc::vec![0u8; len];
+	let Some(mut bytes) = try_zeroed_bytes(len) else {
+		return Vec::new();
+	};
 	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(ptr as *const u8, bytes.as_mut_ptr(), len);
 	});
@@ -1349,6 +1375,11 @@ fn sys_channel_create(out0_ptr: u64, out1_ptr: u64, depth: u64) -> i64 {
 // transferred handle is consumed only on a successful send (left intact on
 // failure, so the caller can retry on WOULD_BLOCK).
 fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
+	// The length is refused before anything is looked up or locked: a number this large is
+	// not a message whatever handle it names, and answering it costs nothing.
+	if bytes_len as usize > abi::MAX_MESSAGE_BYTES {
+		return ERR_INVALID;
+	}
 	let thread = current_thread!();
 	let object = {
 		let table = thread.handles().lock();
@@ -1427,6 +1458,9 @@ fn sys_channel_peek(ch: u64) -> i64 {
 // list with one bad entry moves nothing - a partially transferred set would leave the sender
 // holding some of what it meant to give away and the receiver wired to half a graph.
 fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64) -> i64 {
+	if bytes_len as usize > abi::MAX_MESSAGE_BYTES {
+		return ERR_INVALID;
+	}
 	let thread = current_thread!();
 	if !user_buf_ok(bytes_ptr, bytes_len) || !user_buf_ok(caps_ptr, 8) {
 		return ERR_INVALID;
@@ -1447,7 +1481,9 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 		Ok(c) => c,
 		Err(e) => return e,
 	};
-	let mut bytes = alloc::vec![0u8; bytes_len as usize];
+	let Some(mut bytes) = try_zeroed_bytes(bytes_len as usize) else {
+		return ERR_NO_MEMORY;
+	};
 	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(bytes_ptr as *const u8, bytes.as_mut_ptr(), bytes_len as usize);
 	});
@@ -1617,6 +1653,12 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 // a control channel at once, waking on whichever is ready first. Each handle needs
 // the WAIT right. `flags` may carry WAIT_PERIODIC (see sys_wait).
 fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 {
+	// A fixed ceiling first, before the caller's holdings are consulted: the handle limit
+	// is itself reachable past its bound through `SYS_HANDLE_DUPLICATE`, so "as many as
+	// you hold" is not a bound.
+	if count as usize > abi::MAX_WAIT_HANDLES {
+		return ERR_INVALID;
+	}
 	let periodic = flags & abi::WAIT_PERIODIC != 0;
 	let thread = current_thread!();
 	let n = count as usize;
@@ -1625,12 +1667,16 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 	// handle count bounds the table. This is the real bound on the caller's array
 	// (the scratch tables live on the kernel heap, so it is not a memory cap).
 	let held = thread.process().domain().account().handles().used();
+	// A fixed ceiling as well as the caller's holding: the handle limit is reachable past
+	// its own bound through `SYS_HANDLE_DUPLICATE`, so "as many as you hold" is not a bound.
 	if n == 0 || n as u64 > held || !user_buf_ok(handles_ptr, count * 8) {
 		return ERR_INVALID;
 	}
 	// Copy the caller's handle array into a kernel buffer through the sanctioned
 	// SMAP window before resolving it.
-	let mut raw: alloc::vec::Vec<u64> = alloc::vec![0u64; n];
+	let Some(mut raw) = try_zeroed_u64(n) else {
+		return ERR_NO_MEMORY;
+	};
 	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(handles_ptr as *const u64, raw.as_mut_ptr(), n);
 	});
@@ -1639,7 +1685,9 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 	// blocking call, so the allocation is never on a hot path.
 	let mut objects: alloc::vec::Vec<Option<Arc<dyn KernelObject>>> = alloc::vec::Vec::new();
 	objects.resize_with(n, || None);
-	let mut koids: alloc::vec::Vec<u64> = alloc::vec![0u64; n];
+	let Some(mut koids) = try_zeroed_u64(n) else {
+		return ERR_NO_MEMORY;
+	};
 	{
 		let table = thread.handles().lock();
 		for i in 0..n {

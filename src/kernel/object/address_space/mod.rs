@@ -44,7 +44,14 @@ impl AddressSpace {
 	}
 
 	// Map `virt` to physical frame `phys` with `flags` in this address space.
+	//
+	// Panics on a USER mapping outside the user half rather than making one. This is the
+	// infallible sibling of `try_map` and it carries the same bound for the same reason -
+	// a bound that only one of two doors enforces is a bound with a door beside it. Every
+	// caller of this one is kernel-internal with an address it computed itself, so
+	// reaching this is a kernel bug and says so.
 	pub fn map(&self, virt: u64, phys: u64, flags: u64) {
+		assert!(flags & arch::paging::USER == 0 || user_range_ok(virt), "USER mapping outside the user half: {virt:#x}");
 		arch::paging::map_page_in(self.cr3, virt, phys, flags);
 	}
 
@@ -53,6 +60,18 @@ impl AddressSpace {
 	// growth under memory pressure degrades to a clean error instead of panicking
 	// the kernel. Nothing is left mapped on failure.
 	pub fn try_map(&self, virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+		// Anything carrying USER is a user mapping, and a user mapping outside the user
+		// half is not a thing this kernel makes. It made them: nothing here bounded the
+		// address, and an `ET_EXEC` image naming a higher-half `p_vaddr` was mapped there
+		// with the USER bit set - the first link of a full escalation on x86_64.
+		//
+		// The bound lives here rather than only in the ELF validator because this is the
+		// narrowest place every user mapping passes through: the loader, the stack, the
+		// fault handler's demand-grown pages and the mmap paths all arrive at this one
+		// call. A caller that means to map kernel memory says so by not passing USER.
+		if flags & arch::paging::USER != 0 && !user_range_ok(virt) {
+			return Err(());
+		}
 		arch::paging::try_map_page_in(self.cr3, virt, phys, flags)
 	}
 
@@ -60,6 +79,11 @@ impl AddressSpace {
 	pub fn unmap(&self, virt: u64) -> Option<u64> {
 		arch::paging::unmap_page_in(self.cr3, virt)
 	}
+}
+
+// Does one page starting at `virt` lie wholly inside the user half?
+fn user_range_ok(virt: u64) -> bool {
+	virt < crate::memlayout::USER_VA_END && virt.checked_add(crate::mem::frame::PAGE_SIZE).is_some_and(|end| end <= crate::memlayout::USER_VA_END)
 }
 
 impl Drop for AddressSpace {

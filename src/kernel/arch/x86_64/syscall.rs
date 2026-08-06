@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 
-use core::arch::{asm, global_asm};
+use core::arch::global_asm;
 
 use super::msr;
 use super::percpu;
@@ -52,10 +52,21 @@ global_asm!(
 	".global syscall_entry",
 	"syscall_entry:",
 	// Entry: rcx = return rip, r11 = saved rflags, rax = number,
-	// rdi/rsi/rdx/r10 = args. A kernel self-call has a higher-half (negative)
-	// return rip; a userspace call has a lower-half (positive) one.
-	"test rcx, rcx",
-	"js 2f",
+	// rdi/rsi/rdx/r10 = args.
+	//
+	// This stub is reached from RING 3 AND FROM NOWHERE ELSE, so there is nothing to
+	// decide here. It used to branch on the sign of the return rip - a higher-half
+	// address meant a kernel self-call - and that was a hole rather than a heuristic:
+	// nothing stopped ring-3 code from RUNNING at a higher-half address, and a process
+	// that arranged to be there was handed the kernel path. That path does not switch to
+	// the kernel stack and sets `from_user = 0`, after which every `user_buf_ok` in the
+	// kernel returns true for any address at all. Origin must never be inferred from an
+	// address the caller controls.
+	//
+	// The kernel's own `invoke` calls `syscall_dispatch` directly now, exactly as the
+	// AArch64 and RISC-V ports have always done, so the `syscall` instruction is a ring-3
+	// interface only and this stub can treat every entry as untrusted.
+	//
 	// ring-3 path: switch to the thread's kernel stack and save the user return
 	// state on it. Keeping rsp/rip/rflags on this thread's own stack (rather than a
 	// per-CPU slot) lets the handler yield to another cooperative ring-3 service on
@@ -90,33 +101,6 @@ global_asm!(
 	"pop r11",
 	"pop rsp",
 	"sysretq",
-	// ring-0 self-call path: already on a kernel stack, stay on it.
-	"2:",
-	// Establish from_user = 0 explicitly: a prior ring-3 syscall that yielded may
-	// have left the per-CPU flag set, and a kernel self-call must never have its
-	// pointers treated as user pointers.
-	"mov qword ptr gs:[{fu}], 0",
-	"push rcx",
-	"push r11",
-	"push rbp",
-	"mov rbp, rsp",
-	"and rsp, -16",
-	// Marshal (num, a0, a1, a2, a3) into the SysV argument registers. This order
-	// never overwrites a source register before it has been read.
-	"mov r8, r10",
-	"mov rcx, rdx",
-	"mov rdx, rsi",
-	"mov rsi, rdi",
-	"mov rdi, rax",
-	"call syscall_dispatch",
-	// rax holds the return value (kept for the syscall return register).
-	"mov rsp, rbp",
-	"pop rbp",
-	"pop r11",
-	"pop rcx",
-	"push r11",
-	"popfq",
-	"jmp rcx",
 	krsp = const percpu::KERNEL_RSP_OFFSET,
 	fu = const percpu::FROM_USER_OFFSET,
 );
@@ -134,26 +118,24 @@ pub fn init() {
 	msr::write(IA32_FMASK, FMASK);
 }
 
-// Issue a system call from kernel mode (ring 0). Exercises the real `syscall`
-// instruction and the entry stub. Returns the value the handler left in RAX.
+// Issue a system call from kernel mode (ring 0): straight to the portable syscall
+// table, the way the in-kernel callers and the test harness use it, and the way the
+// AArch64 and RISC-V ports have always done it.
 //
-// SAFETY: performs a raw `syscall`; the per-core syscall MSRs must be initialized
-// first (see init()). The handler runs with interrupts masked.
+// It used to execute a real `syscall` instruction and rely on the entry stub telling
+// ring 0 from ring 3 by the sign of the return address. That is the hole documented on
+// the stub above: an address the caller controls cannot establish who the caller is. A
+// ring-0 caller reaching a ring-3 entry point is not a thing to detect - it is a thing to
+// make impossible, and one plain function call does that.
+//
+// `from_user = false` is set here for the same reason the other two ports set it: the
+// buffer checks must accept kernel-owned buffers, and a prior ring-3 syscall that yielded
+// may have left the per-CPU flag set.
+//
+// SAFETY: kept `unsafe` for its callers' sake - the syscall table it reaches expects the
+// arguments a syscall's ABI defines, and passing the wrong ones is as unsound here as it
+// would be from ring 3.
 pub unsafe fn invoke(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-	unsafe {
-		let ret: u64;
-		asm!(
-			"syscall",
-			inlateout("rax") num => ret,
-			inlateout("rdi") a0 => _,
-			inlateout("rsi") a1 => _,
-			inlateout("rdx") a2 => _,
-			inlateout("r10") a3 => _,
-			lateout("rcx") _,
-			lateout("r11") _,
-			lateout("r8") _,
-			lateout("r9") _,
-		);
-		ret
-	}
+	super::percpu::set_from_user(false);
+	crate::syscall::syscall_dispatch(num, a0, a1, a2, a3)
 }

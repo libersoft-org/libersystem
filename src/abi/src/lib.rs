@@ -213,6 +213,25 @@ pub const SYS_CHANNEL_RECV_CAPS: u64 = 68;
 // like everything else here, so a sender cannot make the receiver allocate by asking.
 pub const MAX_MESSAGE_CAPS: usize = 4;
 
+// The most bytes one message may carry. There was no limit at all: `sys_channel_send` sized a
+// kernel `Vec` straight off the caller's length and built the payload BEFORE the message was
+// charged to any quota, so one syscall could ask the kernel for an allocation of any size, and
+// an infallible `vec!` answers exhaustion by aborting rather than returning. The quota bounded
+// what could be QUEUED and not what could be allocated on the way there.
+//
+// 1 MiB is far above what the services exchange (a launch context is capped at 64 KiB) and far
+// below anything that threatens the kernel heap.
+pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+// The most handles one `SYS_WAIT_ANY` may name. It was bounded by how many handles the caller
+// holds, which is a limit that another finding shows is itself reachable past its ceiling - so
+// this is the fixed one the audit asked for.
+pub const MAX_WAIT_HANDLES: usize = 256;
+
+// The largest ELF image `SYS_PROCESS_LOAD` will read out of a caller's buffer. A program that
+// does not fit is refused rather than sized into a kernel allocation.
+pub const MAX_ELF_BYTES: usize = 64 * 1024 * 1024;
+
 pub const SYS_PROCESS_GROUP_CREATE: u64 = 65;
 pub const SYS_PROCESS_GROUP_SIGNAL: u64 = 66;
 // Actions for SYS_SYSTEM_POWER.
