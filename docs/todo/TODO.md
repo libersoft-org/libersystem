@@ -191,7 +191,8 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0140 - The build interface: scripts with flags, and a Justfile that stops being one](M0140.md)
 - [x] [M0141 - Streams as pending operations, and a harness that can move the clock](M0141.md)
 - [x] [M0142 - Gates that stopped checking](M0142.md)
-- [ ] [M0143 - LiberFS: what a mount may not do, and what a checksum does not prove](M0143.md)
+- [x] [M0143 - LiberFS: what a mount may not do, and what a checksum does not prove](M0143.md)
+- [ ] [M0144 - LiberFS: what a mount may still lose, and what a parser may not quietly repair](M0144.md)
 
 ### Definition of done (phase 2)
 
