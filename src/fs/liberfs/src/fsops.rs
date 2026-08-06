@@ -24,10 +24,23 @@ impl<D: BlockDevice> LiberFs<D> {
 		if num_blocks <= POOL_START + 1 {
 			return Err(FsError::Invalid);
 		}
+		// the free maps are sized from the pool, and the cast was unchecked in both
+		// places: it truncates on a 32-bit target - producing a bitmap too small for the
+		// volume, so the allocator would hand out blocks it never tracked - and asks for
+		// an enormous infallible allocation on a 64-bit one. The bound is documented as
+		// the format's maximum volume size and refused here.
+		let map_len = free_map_len(num_blocks)?;
 		let leaf_block: u64 = POOL_START;
 		let mut label = [0u8; LABEL_MAX];
-		// clamp the label to LABEL_MAX without cutting a UTF-8 character in half (the
-		// record is specified as UTF-8): back the cut off any continuation bytes.
+		// The record is specified as UTF-8, so it has to BE UTF-8 - and a NUL inside it
+		// would silently truncate the label at the next mount, since `label()` reads up to
+		// the first NUL. Neither was checked: only the clamp below was, which avoided
+		// cutting a character in half in a value that might not have been text at all.
+		// Same treatment as a snapshot name, and for the same reason.
+		if opts.label.contains(&0) || core::str::from_utf8(&opts.label).is_err() {
+			return Err(FsError::BadName);
+		}
+		// clamp the label to LABEL_MAX without cutting a UTF-8 character in half.
 		let mut take = opts.label.len().min(LABEL_MAX);
 		while take > 0 && take < opts.label.len() && (opts.label[take] & 0xC0) == 0x80 {
 			take -= 1;
@@ -59,7 +72,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; (num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, walk_damage: false, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_snap_root: 0, prev_snap_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: vec![0u8; map_len], data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; map_len], snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, walk_damage: false, mark_strict: false, mark_dup: None, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -91,6 +104,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		fs.inode_root_crc = snap.inode_root_crc;
 		fs.generation = snap.generation;
 		fs.read_only = true;
+		// switching the root switches the generation, so every cache keyed by something
+		// this generation decides is now describing the wrong tree - the same clearing
+		// `with_root` does for the same reason. This was latent rather than harmless:
+		// nothing populated these caches between the mount and the swap, so the stale
+		// entries had no chance to exist. The moment the mount read a single inode of its
+		// own, the root directory it cached was the LIVE one and the snapshot resolved
+		// every path through it.
+		fs.icache.clear();
+		fs.dcache.clear();
+		fs.decomp.clear();
 		Some(fs)
 	}
 
@@ -158,15 +181,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		if !dev.read_block(sb.num_blocks - 1, &mut buf) {
 			return Err(MountError::DeviceTooSmall);
 		}
-		let (prev_inode_root, prev_inode_root_crc, prev_valid) = match prev_slot {
+		let map_len = free_map_len(sb.num_blocks).map_err(|_| MountError::Unsupported)?;
+		let (prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid) = match prev_slot {
 			Some(ps) => {
 				let psb = slots[ps as usize].ok_or(MountError::Corrupt)?;
-				(psb.inode_root, psb.inode_root_crc, true)
+				(psb.inode_root, psb.inode_root_crc, psb.snap_root, psb.snap_root_crc, true)
 			}
-			None => (0, 0, false),
+			None => (0, 0, 0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; (sb.num_blocks as usize).div_ceil(8)], snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, walk_damage: false, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: vec![0u8; map_len], data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: vec![0u8; map_len], snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, walk_damage: false, mark_strict: false, mark_dup: None, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		// a corrupt snapshot table degrades the mount to read-only instead of failing it:
 		// the pinned generations it named can no longer be reserved, so a commit could
 		// reuse their blocks - refusing every mutation keeps them (and the table block
@@ -185,6 +209,26 @@ impl<D: BlockDevice> LiberFs<D> {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => fs.read_only = true,
 			Err(_) => return Err(MountError::Io),
+		}
+		// the two superblock relations that need the tree to settle. Both are read-only
+		// degradations rather than mount failures: the volume's data is intact and
+		// readable, and read-only is exactly what forecloses the harm in each case.
+		//
+		// `next_inode` naming an inode that ALREADY exists is the dangerous one -
+		// `alloc_inode` hands the number out unexamined, so the next file created takes
+		// over an existing inode and every name pointing at it.
+		match fs.read_inode(fs.next_inode) {
+			Err(FsError::Invalid) => {}
+			Ok(_) => fs.read_only = true,
+			Err(FsError::Corrupt | FsError::Io) => fs.read_only = true,
+			Err(e) => return Err(map_mount_error(e)),
+		}
+		// and the root of the namespace has to be a directory, or every path resolution
+		// starts from something that cannot hold names.
+		match fs.read_inode(fs.root_inode) {
+			Ok(inode) if inode.r#type == TYPE_DIR => {}
+			Ok(_) | Err(FsError::Invalid | FsError::Corrupt | FsError::Io) => fs.read_only = true,
+			Err(e) => return Err(map_mount_error(e)),
 		}
 		Ok(fs)
 	}
@@ -239,8 +283,16 @@ impl<D: BlockDevice> LiberFs<D> {
 	}
 
 	// Resolve a path to its inode number, or None if any segment is missing.
-	pub fn lookup(&mut self, path: &[u8]) -> Option<u32> {
-		self.resolve(path).ok()
+	// `Ok(None)` means the path names nothing. Every other answer is an ERROR and says
+	// which: this used to be `resolve(path).ok()`, which made "no such file" and a disk
+	// that could not be read and a malformed path into the same word - the mount's
+	// ambiguity one layer up.
+	pub fn lookup(&mut self, path: &[u8]) -> Result<Option<u32>, FsError> {
+		match self.resolve(path) {
+			Ok(num) => Ok(Some(num)),
+			Err(FsError::NotFound) => Ok(None),
+			Err(e) => Err(e),
+		}
 	}
 
 	// Read the whole file at `path` into a freshly allocated buffer.
@@ -288,7 +340,11 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			let run_start = lb * BLOCK_SIZE as u64;
 			let copy_start = offset.max(run_start);
-			let copy_end = end.min(run_start + n * BLOCK_SIZE as u64);
+			// same ceiling as `write_at_inner`: a sparse file may legitimately be sized to
+			// the top of the address space, and the last run of it starts within a run's
+			// length of u64::MAX. `end` bounds the result either way, so saturating is
+			// exact rather than merely safe.
+			let copy_end = end.min(run_start.saturating_add(n * BLOCK_SIZE as u64));
 			out.extend_from_slice(&buf[(copy_start - run_start) as usize..(copy_end - run_start) as usize]);
 			lb += n;
 		}
@@ -362,6 +418,14 @@ impl<D: BlockDevice> LiberFs<D> {
 			Some((_, o)) => o.ctime,
 			None => self.clock,
 		};
+		// the owner travels with the ctime, and for the same reason: overwriting a file's
+		// CONTENTS does not make it a different file. This path builds a fresh inode
+		// while the partial-write and truncate paths keep the existing one - so they kept
+		// the tag and this one silently cleared it, against the documented contract.
+		// Nothing consumes the tag yet, which is exactly how it would have stayed wrong.
+		if let Some((_, o)) = &old {
+			inode.owner_tag = o.owner_tag;
+		}
 		inode.mtime = self.clock;
 		if let Some((_, o)) = &old {
 			self.drop_inode_blocks(o)?;
@@ -429,7 +493,10 @@ impl<D: BlockDevice> LiberFs<D> {
 			Err(e) => return Err(e),
 		};
 		if let Some(inode) = &inode {
-			if inode.r#type == TYPE_DIR && inode.size != 0 {
+			// `size` is a cached count and the tree is the fact. A directory that claims
+			// to be empty and is not would otherwise have its tree freed while its
+			// children stayed in the inode table, reachable by nothing.
+			if inode.r#type == TYPE_DIR && (inode.size != 0 || self.dir_has_entries(inode)?) {
 				return Err(FsError::NotEmpty);
 			}
 
@@ -457,7 +524,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			// damaged directory (never on a healthy volume), and the marked map is the
 			// one exact answer to "which blocks does this tree hold".
 			let mut map = vec![0u8; self.free.len()];
-			self.mark_dir_tree(inode.dir_root, &mut map)?;
+			self.mark_dir_tree(inode.dir_root, inode.dir_root_crc, &mut map)?;
 			for b in 0..self.num_blocks {
 				if test_bit(&map, b) {
 					self.drop_block(b);
@@ -498,11 +565,33 @@ pub(crate) fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 	block
 }
 
+// Bytes of bitmap for a pool of `num_blocks`, refusing a volume this build cannot hold a
+// map for.
+fn free_map_len(num_blocks: u64) -> Result<usize, FsError> {
+	if num_blocks > MAX_BLOCKS {
+		return Err(FsError::Invalid);
+	}
+	usize::try_from(num_blocks).map(|n| n.div_ceil(8)).map_err(|_| FsError::Invalid)
+}
+
+// The mount's answer to an error that is not one of the ones it handles by name.
+fn map_mount_error(e: FsError) -> MountError {
+	match e {
+		FsError::Io => MountError::Io,
+		_ => MountError::Corrupt,
+	}
+}
+
 // Parse and validate a superblock block: it must carry the LiberFS magic and version,
 // match this build's block size, feature flags, and algorithm ids, and pass its own
 // CRC32C. Returns None otherwise (an unformatted slot, a foreign disk, a torn commit,
 // or a volume laid down by a build with a different layout or algorithms - which the
 // flags catch instead of a silent mis-parse).
+//
+// The mount path reads slots through `read_slot` directly, because it needs to know WHICH
+// way a slot failed; this collapses that back to yes-or-no for the tests, which mostly
+// want the fields out of a slot they know is good.
+#[cfg(test)]
 pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
 	match read_slot(block) {
 		SlotRead::Valid(sb) => Some(sb),
@@ -572,9 +661,36 @@ fn parse_checked(block: &[u8]) -> Option<Superblock> {
 	if num_blocks <= POOL_START + 1 {
 		return None;
 	}
+	// A CRC proves integrity, not sense, and the fields were only ever checked one at a
+	// time. What follows is the relations BETWEEN them, as far as they can be settled
+	// without reading anything - the two that need the tree are settled at mount.
+	let inode_root = u64::from_le_bytes(block[SB_INODE_ROOT_OFF..SB_INODE_ROOT_OFF + 8].try_into().ok()?);
+	let snap_root = u64::from_le_bytes(block[SB_SNAP_ROOT_OFF..SB_SNAP_ROOT_OFF + 8].try_into().ok()?);
+	let next_inode = u32::from_le_bytes(block[SB_NEXT_INODE_OFF..SB_NEXT_INODE_OFF + 4].try_into().ok()?);
+	let root_inode = u32::from_le_bytes(block[SB_ROOT_INODE_OFF..SB_ROOT_INODE_OFF + 4].try_into().ok()?);
+	let generation = u64::from_le_bytes(block[SB_GENERATION_OFF..SB_GENERATION_OFF + 8].try_into().ok()?);
+	// every formatted volume has a root leaf, so 0 is not a root, and a root outside the
+	// pool cannot be read at all.
+	if inode_root == 0 || inode_root >= num_blocks {
+		return None;
+	}
+	// the snapshot chain may legitimately be absent; it may not be outside the pool.
+	if snap_root >= num_blocks {
+		return None;
+	}
+	// `next_inode` hands out numbers ABOVE everything in use, and the root directory is
+	// always in use - so a counter at or below it names something that already exists,
+	// and `alloc_inode` would hand it out for a new file to take over.
+	if next_inode <= root_inode {
+		return None;
+	}
+	// the generation is incremented at every commit, and the increment is unchecked.
+	if generation == u64::MAX {
+		return None;
+	}
 	let mut uuid = [0u8; 16];
 	uuid.copy_from_slice(&block[SB_UUID_OFF..SB_UUID_OFF + 16]);
 	let mut label = [0u8; LABEL_MAX];
 	label.copy_from_slice(&block[SB_LABEL_OFF..SB_LABEL_OFF + LABEL_MAX]);
-	Some(Superblock { num_blocks, generation: u64::from_le_bytes(block[SB_GENERATION_OFF..SB_GENERATION_OFF + 8].try_into().ok()?), inode_root: u64::from_le_bytes(block[SB_INODE_ROOT_OFF..SB_INODE_ROOT_OFF + 8].try_into().ok()?), inode_root_crc: u32::from_le_bytes(block[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].try_into().ok()?), next_inode: u32::from_le_bytes(block[SB_NEXT_INODE_OFF..SB_NEXT_INODE_OFF + 4].try_into().ok()?), root_inode: u32::from_le_bytes(block[SB_ROOT_INODE_OFF..SB_ROOT_INODE_OFF + 4].try_into().ok()?), snap_root: u64::from_le_bytes(block[SB_SNAP_ROOT_OFF..SB_SNAP_ROOT_OFF + 8].try_into().ok()?), snap_root_crc: u32::from_le_bytes(block[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].try_into().ok()?), uuid, label, compress: block[SB_COMPRESS_OFF] != 0 })
+	Some(Superblock { num_blocks, generation, inode_root, inode_root_crc: u32::from_le_bytes(block[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].try_into().ok()?), next_inode, root_inode, snap_root, snap_root_crc: u32::from_le_bytes(block[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].try_into().ok()?), uuid, label, compress: block[SB_COMPRESS_OFF] != 0 })
 }

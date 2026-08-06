@@ -145,6 +145,13 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Hand out a fresh inode number from the monotonic counter (never reused). The
 	// caller writes the inode right after, so nothing is inserted into the tree here.
+	// Inode numbers are handed out MONOTONICALLY and never reused, so the counter is a
+	// lifetime budget rather than a concurrent-file limit: a volume that churns temporary
+	// files exhausts it however empty the disk is, at about 4.3 billion creations. That
+	// is a documented limit of this format version, not an oversight - reuse would need
+	// either a free-inode map or a generation number beside each record, and widening the
+	// field is a format revision. The refusal below is what keeps it from wrapping into
+	// an inode that already exists.
 	pub(crate) fn alloc_inode(&mut self) -> Result<u32, FsError> {
 		let num = self.next_inode;
 		if num == u32::MAX {

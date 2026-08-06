@@ -99,9 +99,19 @@ impl<D: BlockDevice> LiberFs<D> {
 	// reserved and a commit could reuse their blocks. Silently dropping the table here
 	// would quietly destroy every named snapshot.
 	pub(crate) fn load_snapshot_table(&mut self) -> Result<(), FsError> {
-		self.snapshots = Vec::new();
-		let mut ptr = self.snap_root;
-		let mut crc = self.snap_root_crc;
+		self.snapshots = self.read_snapshot_table(self.snap_root, self.snap_root_crc, &mut |_| {})?;
+		Ok(())
+	}
+
+	// The chain walk itself, over an ARBITRARY root, so the previous generation's table
+	// can be read too - that generation's snapshots have to stay reserved until the
+	// superblock describing them is itself overwritten, and nothing could read them
+	// before this was separable. `seen` is handed every chain block as it is visited,
+	// which is what lets the free-map walk reserve the table's own blocks in one pass.
+	pub(crate) fn read_snapshot_table(&mut self, root: u64, root_crc: u32, seen: &mut dyn FnMut(u64)) -> Result<Vec<Snapshot>, FsError> {
+		let mut out = Vec::new();
+		let mut ptr = root;
+		let mut crc = root_crc;
 		let mut block = vec![0u8; BLOCK_SIZE];
 		let mut steps = 0u64;
 		while ptr != 0 {
@@ -113,6 +123,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Err(FsError::Corrupt);
 			}
 			steps += 1;
+			seen(ptr);
 			if !self.dev.read_block(ptr, &mut block) {
 				return Err(FsError::Io);
 			}
@@ -126,12 +137,39 @@ impl<D: BlockDevice> LiberFs<D> {
 				let inode_root = u64::from_le_bytes(block[off + SNAP_ROOT_OFF..off + SNAP_ROOT_OFF + 8].try_into().unwrap());
 				let inode_root_crc = u32::from_le_bytes(block[off + SNAP_ROOT_CRC_OFF..off + SNAP_ROOT_CRC_OFF + 4].try_into().unwrap());
 				let generation = u64::from_le_bytes(block[off + SNAP_GEN_OFF..off + SNAP_GEN_OFF + 8].try_into().unwrap());
-				self.snapshots.push(Snapshot { name, inode_root, inode_root_crc, generation });
+				// A record read off the medium gets the same scrutiny as one being
+				// written, which it did not before: `create_snapshot` demands a non-empty
+				// unique UTF-8 name, and the loader demanded nothing at all - so a forged
+				// or damaged table could name a snapshot with no name, two with the same
+				// name, or a root outside the pool, and the mount stayed writable.
+				//
+				// The name is already NUL-terminated by `name_in`, so what is left to
+				// check is that something survives the terminator and that it is text.
+				if name.is_empty() || core::str::from_utf8(&name).is_err() {
+					return Err(FsError::Corrupt);
+				}
+				if out.iter().any(|s: &Snapshot| s.name == name) {
+					return Err(FsError::Corrupt);
+				}
+				// a root of 0 is the "no tree" sentinel and no generation has one - even a
+				// freshly formatted volume has a root leaf - and a root outside the pool
+				// cannot be walked at all.
+				if inode_root == 0 || inode_root >= self.num_blocks {
+					return Err(FsError::Corrupt);
+				}
+				// a snapshot pins a generation that ALREADY happened: the record carries
+				// the generation live when it was taken, and the superblock carries the
+				// one the commit produced, so a stored number above the live one is
+				// impossible however it got there.
+				if generation > self.generation {
+					return Err(FsError::Corrupt);
+				}
+				out.push(Snapshot { name, inode_root, inode_root_crc, generation });
 			}
 			ptr = u64::from_le_bytes(block[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].try_into().unwrap());
 			crc = u32::from_le_bytes(block[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].try_into().unwrap());
 		}
-		Ok(())
+		Ok(out)
 	}
 
 	// Recover the device, consuming the filesystem.
@@ -216,14 +254,20 @@ impl<D: BlockDevice> LiberFs<D> {
 			let mut buf = vec![0u8; BLOCK_SIZE];
 			for lb in first..=last {
 				let block_start = lb * BLOCK_SIZE as u64;
-				let full = start <= block_start && end >= block_start + BLOCK_SIZE as u64;
+				// The guard above refuses a write that runs PAST the addressable end, so
+				// everything here is inside it - but the last block of the address space
+				// begins less than a block below the ceiling, and adding BLOCK_SIZE to its
+				// absolute start overflows: a panic in debug, a wrap in release. The
+				// distances are computed from `end` and `block_start` instead, which are
+				// both known to be in range, and the one remaining sum saturates.
+				let full = start <= block_start && end - block_start >= BLOCK_SIZE as u64;
 				// a full-block overwrite needs no read; a partial one preserves whatever
 				// is there (zeros for a hole or a block past the old end).
 				if full || !self.read_logical(&inode, lb, &mut buf)? {
 					buf.fill(0);
 				}
 				let copy_start = start.max(block_start);
-				let copy_end = end.min(block_start + BLOCK_SIZE as u64);
+				let copy_end = end.min(block_start.saturating_add(BLOCK_SIZE as u64));
 				let buf_off = (copy_start - block_start) as usize;
 				let data_off = (copy_start - start) as usize;
 				let n = (copy_end - copy_start) as usize;
@@ -307,7 +351,9 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Ok(());
 			}
 			let ti = self.read_inode(inode_t)?;
-			if ti.r#type == TYPE_DIR && ti.size != 0 {
+			// same as the delete path: the tree decides, not the cached count, since
+			// replacing this name frees the directory it used to hold.
+			if ti.r#type == TYPE_DIR && (ti.size != 0 || self.dir_has_entries(&ti)?) {
 				return Err(FsError::NotEmpty);
 			}
 		}

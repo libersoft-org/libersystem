@@ -133,6 +133,22 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(out)
 	}
 
+	// Does this directory hold anything, according to its TREE rather than its `size`?
+	//
+	// Emptiness was `inode.size == 0`, a cached count. A damaged image can have a
+	// directory whose size says zero and whose tree still holds entries; deleting it then
+	// freed the tree and left the child inodes in the global inode table - live to the
+	// free-map walk, unreachable from any name, and invisible to a namespace-based
+	// `fsck`, which can only see what it can reach.
+	//
+	// A tree that cannot be READ is not evidence of emptiness either: the error
+	// propagates, so a delete refuses rather than assuming there was nothing there.
+	pub(crate) fn dir_has_entries(&mut self, inode: &Inode) -> Result<bool, FsError> {
+		let mut out = Vec::new();
+		self.collect_dir_entries(inode.dir_root, inode.dir_root_crc, &mut out, TREE_DEPTH_MAX)?;
+		Ok(!out.is_empty())
+	}
+
 	// Walk the directory B+tree rooted at (`ptr`, `crc`), appending each leaf's entries.
 	// The depth budget bounds the recursion (and so the stack) against a hostile chain
 	// of one-child internals; no legitimate tree comes near it.
@@ -227,7 +243,19 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			// overfull: split at a hash boundary near the byte midpoint (records sharing
 			// a hash must stay in one leaf, since internal nodes route by hash alone).
-			let split = dir_split_point(&recs);
+			// When no such boundary exists - every record in the leaf shares one hash -
+			// there is no split this format can represent, and the fallback used to cut
+			// the group at index 1 anyway. Routing then reached one of the two leaves and
+			// every name in the other became unfindable while still occupying the tree.
+			//
+			// Refusing the insert is the honest answer until the format grows either
+			// full-key routing in the separators or a collision chain: nothing is lost,
+			// nothing becomes invisible, and the caller is told the directory is full.
+			// Getting here at all takes enough names colliding in a 64-bit hash to
+			// overflow a whole leaf, which is a construction rather than an accident.
+			let Some(split) = dir_split_point(&recs) else {
+				return Err(FsError::NoSpace);
+			};
 			let left_dest = self.node_dest(ptr)?;
 			let right_dest = self.alloc_meta()?;
 			let mut lbuf = vec![0u8; BLOCK_SIZE];
@@ -303,7 +331,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		for (name, inode_num) in self.dir_entries_of(dir_num)? {
 			match self.read_inode(inode_num) {
 				Ok(inode) => out.push((name, inode.size, inode.r#type == TYPE_DIR, inode.mtime, inode.ctime)),
-				Err(FsError::Invalid | FsError::Corrupt | FsError::Io) => {}
+				// a dangling or damaged entry is skipped, by decision: a listing must not
+				// be stopped by one bad record on a volume the operator is trying to
+				// rescue, and `fsck` is what names those.
+				//
+				// An I/O failure is NOT that. The disk did not answer, so nothing is known
+				// about the entry - and a listing that quietly omits it says the file is
+				// gone, which a backup or sync tool downstream reads as a deletion to
+				// propagate. One transient read then deletes the file at the other end.
+				Err(FsError::Io) => return Err(FsError::Io),
+				Err(FsError::Invalid | FsError::Corrupt) => {}
 				Err(e) => return Err(e),
 			}
 		}
@@ -384,15 +421,27 @@ impl<D: BlockDevice> LiberFs<D> {
 	// compressed) blocks and its checksum block, plus the blocks of the extent overflow
 	// chain.
 	pub(crate) fn collect_inode_blocks(&mut self, inode: &Inode, bitmap: &mut [u8]) -> Result<(), FsError> {
-		for ext in inode.extents.iter() {
+		for i in 0..inode.extents.len() {
+			let ext = &inode.extents[i];
+			// The free map is what the allocator hands blocks out from, so an extent whose
+			// fields contradict each other may not be marked from: the loop below walks
+			// `store_len`, the read path serves `length`, and where those disagree the
+			// difference is a block one file reads and the allocator believes is free.
+			// Refusing here reaches the caller as walk damage, which degrades the mount to
+			// read-only - the same treatment the tree already gives a node it cannot read,
+			// and for the same reason: nothing may be handed out on the strength of a map
+			// derived from metadata that cannot be true.
+			self.check_extent(ext)?;
 			for off in 0..ext.store_len as u64 {
-				set_bit(bitmap, ext.stored(off));
+				self.mark(bitmap, ext.stored(off));
 			}
 			if ext.csum != 0 {
-				set_bit(bitmap, ext.csum);
+				self.mark(bitmap, ext.csum);
 			}
 		}
-		self.walk_chain(inode.spill, |_fs, ptr| set_bit(bitmap, ptr))
+		self.walk_chain(inode.spill, |fs, ptr| {
+			fs.mark(bitmap, ptr);
+		})
 	}
 }
 
@@ -459,7 +508,9 @@ pub(crate) fn dir_recs_search(recs: &[DirRec], hash: u64, name: &[u8]) -> Result
 // Where to split an overfull leaf's records: the record index nearest the byte
 // midpoint, nudged so two records sharing a hash never straddle the split (the parent
 // routes by hash alone). Mirrors the fixed-record `leaf_split_point`.
-pub(crate) fn dir_split_point(recs: &[DirRec]) -> usize {
+// The index to split an overfull leaf at, or None when every record shares one hash and
+// no split keeps the group whole.
+pub(crate) fn dir_split_point(recs: &[DirRec]) -> Option<usize> {
 	let total = dir_leaf_size(recs) - NODE_HDR;
 	let mut acc = 0usize;
 	let mut mid = recs.len() / 2;
@@ -475,13 +526,18 @@ pub(crate) fn dir_split_point(recs: &[DirRec]) -> usize {
 		up += 1;
 	}
 	if up < recs.len() {
-		return up;
+		return Some(up);
 	}
 	let mut down = mid;
 	while down > 1 && recs[down].hash == recs[down - 1].hash {
 		down -= 1;
 	}
-	down
+	// `down` stopped at 1 either because it found a boundary there or because it ran out
+	// of room to keep looking. Only the first is a split; the second would cut the group.
+	if down >= 1 && recs[down].hash != recs[down - 1].hash {
+		return Some(down);
+	}
+	None
 }
 
 // The name held in a directory record's NUL-padded name field: up to the first NUL.

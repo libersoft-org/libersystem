@@ -314,10 +314,26 @@ pub struct Stat {
 // holding them - so the operator knows WHAT is damaged, and [`LiberFs::restore_file`]
 // knows what to heal from a pinned generation. (Copy-on-write left fsck nothing to
 // reclaim: a crash can no longer leak blocks or orphan an inode.)
+// The largest volume this format describes, in blocks: 2^40 blocks is 4 PiB at a 4 KiB
+// block, and the free bitmap for one is already 128 GiB - so what bites first is the
+// memory for the map, not the width of the field. Formatting or mounting past this is
+// refused rather than truncated into a bitmap too small for the volume, which would have
+// the allocator hand out blocks it never tracked. Public because it is a limit of the
+// FORMAT, and a caller sizing a volume needs to be able to name it.
+pub const MAX_BLOCKS: u64 = 1 << 40;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsckReport {
 	pub checksum_failures: u32,
 	pub damaged: Vec<Vec<u8>>,
+	// What the STRUCTURAL pass found: shapes that are internally impossible even though
+	// every block they live in matches its checksum. A checksum proves a block came back
+	// as it was written; it has no opinion about whether what was written can be true.
+	// Kept apart from `checksum_failures` because the two mean different things to an
+	// operator: one says the medium is failing, the other says the metadata is wrong.
+	pub structural_failures: u32,
+	// One line per structural fault, in the order found, naming what and where.
+	pub faults: Vec<Vec<u8>>,
 }
 
 // A fixed-size block device: the whole filesystem is read and written one
@@ -611,6 +627,12 @@ struct Txn {
 	snap_root: u64,
 	snap_root_crc: u32,
 	snapshots: Vec<Snapshot>,
+	// The per-volume compression switch, saved with everything else because
+	// `set_compression` changes it INSIDE the transaction. Without it here, a commit
+	// that failed at its first barrier left the caller told `Io`, the disk without the
+	// change, and the filesystem in memory reporting it as made - and writing it into
+	// the superblock on the next unrelated commit.
+	compress: bool,
 }
 
 // A mounted LiberFS over a block device. Copy-on-write: the inodes are reached through
@@ -661,8 +683,16 @@ pub enum MountError {
 	DeviceTooSmall,
 }
 
+// What identifies a cached decode. The address alone is not enough: truncating a live
+// file leaves the physical blocks and the compressed stream untouched while shrinking
+// `length`, so the live extent and the snapshot's longer one share a starting block and
+// describe different data. Reading the live version cached the SHORT decode, and the
+// snapshot then read its first block correctly and got zeros for the rest - which
+// `restore_file` could write back into the live tree as fact.
+pub(crate) type DecompKey = (u64, u32, u32);
+
 pub(crate) struct DecompCache {
-	entries: Vec<(u64, Vec<u8>)>,
+	entries: Vec<(DecompKey, Vec<u8>)>,
 }
 
 impl DecompCache {
@@ -672,7 +702,7 @@ impl DecompCache {
 
 	// The decompressed bytes of the run keyed at `key`, promoted to most-recently-used, or
 	// None on a miss.
-	pub(crate) fn get(&mut self, key: u64) -> Option<&[u8]> {
+	pub(crate) fn get(&mut self, key: DecompKey) -> Option<&[u8]> {
 		let pos = self.entries.iter().position(|(k, _)| *k == key)?;
 		let entry = self.entries.remove(pos);
 		self.entries.push(entry);
@@ -681,7 +711,7 @@ impl DecompCache {
 
 	// Cache `data` for the run keyed at `key` as most-recently-used, evicting the least-
 	// recently-used run when the cache is full. A key already present is replaced.
-	pub(crate) fn insert(&mut self, key: u64, data: Vec<u8>) {
+	pub(crate) fn insert(&mut self, key: DecompKey, data: Vec<u8>) {
 		if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
 			self.entries.remove(pos);
 		}
@@ -691,11 +721,11 @@ impl DecompCache {
 		self.entries.push((key, data));
 	}
 
-	// Drop the run keyed at `key`, if cached (its stored blocks are being rewritten).
-	pub(crate) fn forget(&mut self, key: u64) {
-		if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
-			self.entries.remove(pos);
-		}
+	// Drop every cached run starting at `block` (its stored blocks are being rewritten).
+	// All of them: one address can now carry several keys, and the one being invalidated
+	// is the one whose bytes are about to change - which is every one of them.
+	pub(crate) fn forget(&mut self, block: u64) {
+		self.entries.retain(|((p, _, _), _)| *p != block);
 	}
 
 	// Drop every cached run (a transaction boundary reused blocks the cache described).
@@ -720,6 +750,13 @@ pub struct LiberFs<D: BlockDevice> {
 	// reserved so a commit does not reuse its blocks.
 	prev_inode_root: u64,
 	prev_inode_root_crc: u32,
+	// The previous generation's SNAPSHOT table, kept for the same reason as its inode
+	// root. Without it, deleting a snapshot and committing left the older superblock
+	// describing a generation in which that snapshot was live, while its table blocks
+	// and the blocks its root reached had already been declared free - so a crash before
+	// the next commit could leave a mountable superblock naming data that was gone.
+	prev_snap_root: u64,
+	prev_snap_root_crc: u32,
 	prev_valid: bool,
 	// The snapshot table: the block the superblock points at (`snap_root` and its CRC32C)
 	// and the named snapshots loaded from it, each pinning an earlier generation's root
@@ -786,6 +823,20 @@ pub struct LiberFs<D: BlockDevice> {
 	// must degrade (a mount goes read-only, a commit refuses) rather than allocate
 	// from a map that may hand out live blocks.
 	walk_damage: bool,
+	// Two-owner detection for the free-map walks. Marking a bitmap is idempotent -
+	// setting a bit twice is setting a bit - so an image in which two files point at one
+	// data block, or two parents at one subtree, derives a free map that looks perfect.
+	// Delete one owner and the block joins `dead`; a commit later hands it out while the
+	// other owner is still reading it.
+	//
+	// `mark_strict` is set only for the walk of the LIVE generation, where every block
+	// has exactly one owner. Sharing ACROSS generations is the whole point of
+	// copy-on-write and stays legal: the previous generation and the snapshots are
+	// marked into their own maps, and all the snapshots share one map precisely because
+	// they are expected to share subtrees with each other. `mark_dup` holds the first
+	// block seen twice, which `derive_free` turns into corruption.
+	mark_strict: bool,
+	mark_dup: Option<u64>,
 	// Volume identity and the per-volume compression switch, carried in the superblock.
 	uuid: [u8; 16],
 	label: [u8; LABEL_MAX],

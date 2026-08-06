@@ -490,7 +490,12 @@ prune_stale_program_outputs() {
 		fi
 	done < <(find "$artifact_output_root" -type f -not -path "$artifact_log_dir/*" -print0 2>/dev/null)
 	find "$artifact_output_root" -depth -type d -empty -delete 2>/dev/null || true
-	mkdir -p "$artifact_output_root"
+	# The empty-directory sweep above takes `logs/` with it whenever the last build left
+	# it empty, and the consumer stage REDIRECTS into that directory rather than creating
+	# it - so the next build died on a shell redirect with "No such file or directory".
+	# It only ever showed up on a from-scratch build of an architecture, because any
+	# earlier build left transcripts behind that kept the directory alive.
+	mkdir -p "$artifact_output_root" "$artifact_log_dir"
 }
 
 if [[ -z "$selected_artifact" ]]; then prune_stale_program_outputs; fi

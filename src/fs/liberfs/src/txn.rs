@@ -19,7 +19,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// previous generation on commit, and clear the transaction-scoped state (the fresh
 	// and dead block sets and the caches).
 	pub(crate) fn begin(&mut self) {
-		self.txn = Some(Txn { inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc, snapshots: self.snapshots.clone() });
+		self.txn = Some(Txn { inode_root: self.inode_root, inode_root_crc: self.inode_root_crc, next_inode: self.next_inode, snap_root: self.snap_root, snap_root_crc: self.snap_root_crc, snapshots: self.snapshots.clone(), compress: self.compress });
 		self.fresh.clear();
 		self.dead.clear();
 		self.snapshots_dirty = false;
@@ -45,6 +45,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		// before the barrier: the first returns claimed-but-unused blocks, the second
 		// is a transaction block write like any other.
 		self.release_run();
+		// the generation numbers every commit and nothing refused the last one, so the
+		// increment below could wrap and produce a superblock that looks OLDER than the
+		// one it supersedes - which would make the volume mount at the wrong generation
+		// from then on. Refuse the commit instead; the volume stays exactly as it is.
+		if self.generation == u64::MAX {
+			self.abort();
+			return Err(FsError::NoSpace);
+		}
 		if let Err(e) = self.flush_wcsum() {
 			self.abort();
 			return Err(e);
@@ -72,6 +80,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		if let Some(t) = self.txn.take() {
 			self.prev_inode_root = t.inode_root;
 			self.prev_inode_root_crc = t.inode_root_crc;
+			self.prev_snap_root = t.snap_root;
+			self.prev_snap_root_crc = t.snap_root_crc;
 			self.prev_valid = true;
 		}
 		self.generation += 1;
@@ -132,6 +142,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			self.snap_root = t.snap_root;
 			self.snap_root_crc = t.snap_root_crc;
 			self.snapshots = t.snapshots;
+			self.compress = t.compress;
 		}
 		self.release_run();
 		let fresh = core::mem::take(&mut self.fresh);
@@ -171,13 +182,30 @@ impl<D: BlockDevice> LiberFs<D> {
 	// holds - exactly what the next commit may free). Called at mount, from fsck, and
 	// after a commit that changed the snapshot set; every other commit maintains the
 	// state incrementally.
+	// Set `b` in `map`, reporting whether it was already set. Under `mark_strict` a
+	// repeat is recorded as two owners of one block - the thing a bitmap cannot
+	// otherwise express. The FIRST repeat is kept; later ones change nothing.
+	pub(crate) fn mark(&mut self, map: &mut [u8], b: u64) -> bool {
+		if test_bit(map, b) {
+			if self.mark_strict && self.mark_dup.is_none() {
+				self.mark_dup = Some(b);
+			}
+			return false;
+		}
+		set_bit(map, b);
+		true
+	}
+
 	pub(crate) fn derive_free(&mut self) -> Result<(), FsError> {
 		self.walk_damage = false;
+		self.mark_dup = None;
 		let len = self.free.len();
 		let mut live = vec![0u8; len];
 		set_bit(&mut live, 0);
 		set_bit(&mut live, 1);
-		self.mark_inode_tree(self.inode_root, &mut live)?;
+		// the live generation is the one place where every block has exactly one owner.
+		self.mark_strict = true;
+		self.mark_inode_tree(self.inode_root, self.inode_root_crc, &mut live)?;
 		// every block of the snapshot chain and every pinned snapshot generation stay
 		// reserved, so a later commit never reuses an earlier root's blocks. The raw walk
 		// stops at a pointer outside the pool or a link that cannot be read (flagged as
@@ -186,7 +214,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			let mut ptr = self.snap_root;
 			let mut buf = vec![0u8; BLOCK_SIZE];
 			while ptr != 0 && ptr < self.num_blocks && !test_bit(&live, ptr) {
-				set_bit(&mut live, ptr);
+				self.mark(&mut live, ptr);
 				if !self.dev.read_block(ptr, &mut buf) {
 					self.walk_damage = true;
 					break;
@@ -194,14 +222,38 @@ impl<D: BlockDevice> LiberFs<D> {
 				ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
 			}
 		}
+		// everything past here spans generations, where sharing is legal by design.
+		let dup = self.mark_dup.take();
+		self.mark_strict = false;
 		let mut pinned = vec![0u8; len];
 		for i in 0..self.snapshots.len() {
-			let root = self.snapshots[i].inode_root;
-			self.mark_inode_tree(root, &mut pinned)?;
+			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
+			self.mark_inode_tree(root, crc, &mut pinned)?;
 		}
 		let mut prev = vec![0u8; len];
 		if self.prev_valid {
-			self.mark_inode_tree(self.prev_inode_root, &mut prev)?;
+			self.mark_inode_tree(self.prev_inode_root, self.prev_inode_root_crc, &mut prev)?;
+			// and its snapshot table: both the chain's own blocks and the generations it
+			// names. A snapshot deleted in the live generation is still live in the one
+			// the older superblock describes, and that superblock is mountable until the
+			// next commit overwrites its slot - which is exactly when `dead_prev` frees
+			// these blocks. Reading it is best-effort: a table that cannot be read leaves
+			// the reservation incomplete, so it is damage, and read-only is the answer.
+			if self.prev_snap_root != 0 {
+				let (root, crc) = (self.prev_snap_root, self.prev_snap_root_crc);
+				let mut chain: Vec<u64> = Vec::new();
+				match self.read_snapshot_table(root, crc, &mut |b| chain.push(b)) {
+					Ok(snaps) => {
+						for b in chain {
+							self.mark(&mut prev, b);
+						}
+						for s in snaps {
+							self.mark_inode_tree(s.inode_root, s.inode_root_crc, &mut prev)?;
+						}
+					}
+					Err(_) => self.walk_damage = true,
+				}
+			}
 		}
 		// the free map is the union; dead_prev is what only the previous generation
 		// (and no snapshot) holds - the blocks the next commit is allowed to free.
@@ -225,6 +277,13 @@ impl<D: BlockDevice> LiberFs<D> {
 		if core::mem::take(&mut self.walk_damage) {
 			return Err(FsError::Corrupt);
 		}
+		// two owners of one block in the live generation. The map itself cannot show it -
+		// it is one bit either way - so it is caught while deriving and reported here.
+		// Allocating from such a map is safe; the danger is the DELETE, which returns a
+		// block the other owner still reads. Read-only forecloses both.
+		if dup.is_some() {
+			return Err(FsError::Corrupt);
+		}
 		Ok(())
 	}
 
@@ -236,8 +295,8 @@ impl<D: BlockDevice> LiberFs<D> {
 	// would present an intact-superblock volume as unformatted, and one flipped bit must
 	// not cost the volume. Iterative (an explicit work list), so the depth of the trees
 	// never grows the call stack.
-	pub(crate) fn mark_inode_tree(&mut self, root: u64, map: &mut [u8]) -> Result<(), FsError> {
-		let mut nodes: Vec<u64> = Vec::new();
+	pub(crate) fn mark_inode_tree(&mut self, root: u64, root_crc: u32, map: &mut [u8]) -> Result<(), FsError> {
+		let mut nodes: Vec<(u64, u32)> = Vec::new();
 		// a pointer outside the pool is a corrupt link (skipped, not followed into
 		// whatever lies past the volume); an already-marked node is either a corrupt
 		// cycle (which must not hang the walk) or a subtree shared with an earlier
@@ -245,13 +304,31 @@ impl<D: BlockDevice> LiberFs<D> {
 		// both. Marking happens at PUSH, so a hostile node fanning hundreds of links
 		// at one block queues it once, not once per link - the work list stays
 		// bounded by the pool.
-		if root != 0 && root < self.num_blocks && !test_bit(map, root) {
-			set_bit(map, root);
-			nodes.push(root);
+		if root != 0 && root < self.num_blocks && self.mark(map, root) {
+			nodes.push((root, root_crc));
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		while let Some(ptr) = nodes.pop() {
+		while let Some((ptr, want)) = nodes.pop() {
 			if !self.dev.read_block(ptr, &mut buf) {
+				self.walk_damage = true;
+				continue;
+			}
+			// Under `mark_strict` - the live generation - a node is checked against the CRC
+			// its PARENT recorded for it. Without this the walk followed any block that read
+			// cleanly, so a node the parent would have rejected could move an extent pointer,
+			// hide a subtree, or omit a live block from the map, and the mount stayed
+			// WRITABLE, because nothing had failed. A checksum-blind walk is a recovery tool,
+			// not a source of truth for an allocator. The older generations keep the blind
+			// walk on purpose: there the point is to reserve what MIGHT still be referenced,
+			// and refusing to follow damage would under-reserve.
+			if self.mark_strict && crc32c(&buf) != want {
+				self.walk_damage = true;
+				continue;
+			}
+			// a byte that is neither node type was treated as an internal node, so the
+			// walk read separators and child links out of whatever the block held. A
+			// block that is not a node of the tree is damage in every generation.
+			if node_type(&buf) != NODE_LEAF && node_type(&buf) != NODE_INTERNAL {
 				self.walk_damage = true;
 				continue;
 			}
@@ -269,15 +346,14 @@ impl<D: BlockDevice> LiberFs<D> {
 							self.walk_damage = true;
 						}
 					} else if inode.r#type == TYPE_DIR {
-						self.mark_dir_tree(inode.dir_root, map)?;
+						self.mark_dir_tree(inode.dir_root, inode.dir_root_crc, map)?;
 					}
 				}
 			} else {
 				for i in 0..=internal_count(&buf) {
 					let child = child_ptr(&buf, i);
-					if child < self.num_blocks && !test_bit(map, child) {
-						set_bit(map, child);
-						nodes.push(child);
+					if child < self.num_blocks && self.mark(map, child) {
+						nodes.push((child, child_crc(&buf, i)));
 					}
 				}
 			}
@@ -288,26 +364,32 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Mark every node block of a directory's B+tree. The entries themselves point at
 	// inodes, which the inode-tree walk already covers, so only the nodes are marked.
 	// Iterative and damage-tolerant like `mark_inode_tree`.
-	pub(crate) fn mark_dir_tree(&mut self, root: u64, map: &mut [u8]) -> Result<(), FsError> {
-		let mut nodes: Vec<u64> = Vec::new();
+	pub(crate) fn mark_dir_tree(&mut self, root: u64, root_crc: u32, map: &mut [u8]) -> Result<(), FsError> {
+		let mut nodes: Vec<(u64, u32)> = Vec::new();
 		// same guards as `mark_inode_tree`: skip out-of-pool links and marked blocks,
 		// marking at push so the work list stays bounded by the pool.
-		if root != 0 && root < self.num_blocks && !test_bit(map, root) {
-			set_bit(map, root);
-			nodes.push(root);
+		if root != 0 && root < self.num_blocks && self.mark(map, root) {
+			nodes.push((root, root_crc));
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		while let Some(ptr) = nodes.pop() {
+		while let Some((ptr, want)) = nodes.pop() {
 			if !self.dev.read_block(ptr, &mut buf) {
+				self.walk_damage = true;
+				continue;
+			}
+			if self.mark_strict && crc32c(&buf) != want {
+				self.walk_damage = true;
+				continue;
+			}
+			if node_type(&buf) != NODE_LEAF && node_type(&buf) != NODE_INTERNAL {
 				self.walk_damage = true;
 				continue;
 			}
 			if node_type(&buf) == NODE_INTERNAL {
 				for i in 0..=internal_count(&buf) {
 					let child = child_ptr(&buf, i);
-					if child < self.num_blocks && !test_bit(map, child) {
-						set_bit(map, child);
-						nodes.push(child);
+					if child < self.num_blocks && self.mark(map, child) {
+						nodes.push((child, child_crc(&buf, i)));
 					}
 				}
 			}

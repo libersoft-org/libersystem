@@ -240,6 +240,10 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn drop_inode_blocks(&mut self, inode: &Inode) -> Result<(), FsError> {
 		for i in 0..inode.extents.len() {
 			let ext = inode.extents[i];
+			// same reason as marking: dropping `store_len` blocks of a run that serves
+			// `length` returns fewer blocks than the file was reading, and the remainder
+			// leaks. An impossible extent refuses the drop rather than half-performing it.
+			self.check_extent(&ext)?;
 			for off in 0..ext.store_len as u64 {
 				self.drop_block(ext.stored(off));
 			}
@@ -373,6 +377,52 @@ impl<D: BlockDevice> LiberFs<D> {
 	// physical address past the pool through the gap. A compressed run reads only
 	// its `store_len` stored blocks (its `length` is a logical span, not addresses).
 	pub(crate) fn check_extent(&self, ext: &Extent) -> Result<(), FsError> {
+		// The SHAPE first, because the addresses only mean something once the fields agree.
+		//
+		// The format says a raw run has `clen == 0` and `store_len == length`; the parser clamped
+		// the two independently and never compared them. That let a validly checksummed extent
+		// claim `length = 2, store_len = 1` - and the two disagreed about which blocks it owns.
+		// The read path serves logical offsets up to `length`, so it reached both blocks, while
+		// every marking loop walks `0..store_len` and marked one. The block nobody marked stayed
+		// free for the allocator to hand to another file, which then quietly overwrote it.
+		//
+		// The existing test covered the variant whose forged span leaves the pool, which the
+		// address gate below catches. The dangerous one is entirely inside the pool, where nothing
+		// looked.
+		if ext.length == 0 {
+			return Err(FsError::Corrupt);
+		}
+		// a run covers blocks that were once raw data in this pool, so it cannot be
+		// logically longer than the pool. For a raw run the address gate below implies
+		// this; a compressed one is only bounded by `store_len < length`, which leaves
+		// `length` free to name a 16 TiB decompression buffer.
+		if ext.length as u64 > self.num_blocks {
+			return Err(FsError::Corrupt);
+		}
+		if ext.clen == 0 {
+			if ext.store_len != ext.length {
+				return Err(FsError::Corrupt);
+			}
+		} else {
+			// A compressed run must store something, and its stream has to fit in the
+			// blocks it says it stored.
+			//
+			// It is TEMPTING to also demand `store_len < length`, since that is what makes
+			// a run worth compressing - and it is wrong. Truncating a compressed file
+			// shrinks `length` and leaves the stored blocks exactly where they are,
+			// because decoding needs the whole stream to reach any of it. So a legitimate
+			// run can store more blocks than it now serves. A first version of this check
+			// demanded it anyway and made every truncated compressed file unreadable.
+			if ext.store_len == 0 {
+				return Err(FsError::Corrupt);
+			}
+			if ext.clen as usize > ext.store_len as usize * BLOCK_SIZE {
+				return Err(FsError::Corrupt);
+			}
+		}
+		// The addresses. A raw run's gated span still covers `length` as well as `store_len`: the
+		// two are equal now, and keeping the `max` costs nothing while the shape check is what
+		// guarantees it.
 		let span = if ext.clen == 0 { ext.length.max(ext.store_len) } else { ext.store_len };
 		if ext.csum >= self.num_blocks || ext.stored(span.saturating_sub(1) as u64) >= self.num_blocks {
 			return Err(FsError::Corrupt);
@@ -393,11 +443,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		if ext.clen != 0 {
 			// a compressed run: serve the block from the whole extent's decompressed
 			// image, decoding once and caching it (in a small LRU) for later reads of it.
-			if self.decomp.get(ext.physical).is_none() {
+			let key: DecompKey = (ext.physical, ext.length, ext.clen);
+			if self.decomp.get(key).is_none() {
 				let decoded = self.decompress_extent(&ext)?;
-				self.decomp.insert(ext.physical, decoded);
+				self.decomp.insert(key, decoded);
 			}
-			let data = self.decomp.get(ext.physical).unwrap();
+			let data = self.decomp.get(key).unwrap();
 			let start = (lb - ext.logical) as usize * BLOCK_SIZE;
 			buf.fill(0);
 			if start < data.len() {
@@ -640,7 +691,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// a slice past the stored bytes must never panic. The decoder is bounded by the
 		// run's logical size, so a lying stream header cannot demand an absurd allocation.
 		let clen = (ext.clen as usize).min(comp.len());
-		Ok(lz_decompress(&comp[..clen], ext.length as usize * BLOCK_SIZE))
+		lz_decompress(&comp[..clen], ext.length as usize * BLOCK_SIZE).ok_or(FsError::Corrupt)
 	}
 
 	// Try to transparently compress each of a freshly written file's raw extents in
@@ -906,11 +957,27 @@ fn lz_put_extra(out: &mut Vec<u8>, len: usize, nibble_max: usize) {
 // malformed stream yields whatever decoded cleanly rather than panicking - and the
 // stream's own length header is clamped to `max`, so hostile bytes (which can carry
 // valid checksums) cannot demand an unbounded allocation.
-pub(crate) fn lz_decompress(src: &[u8], max: usize) -> Vec<u8> {
+pub(crate) fn lz_decompress(src: &[u8], max: usize) -> Option<Vec<u8>> {
 	if src.len() < 4 {
-		return Vec::new();
+		return None;
 	}
-	let n = (u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize).min(max);
+	// The stream must be able to FILL the range asked of it. It used to be clamped with
+	// `min(max)` and whatever the decoder managed before the stream stopped making sense
+	// was the answer - the read path then padded the rest of the logical block with zeros
+	// and returned it as data. Every physical checksum can be valid while that happens,
+	// because it is not bit rot: it is a stream that is internally wrong, and no checksum
+	// has an opinion about that.
+	//
+	// More than `max` is legal and common: truncating a compressed file shrinks the run's
+	// logical length while the stored stream stays whole, so the header keeps describing
+	// the ORIGINAL size. Only a header promising LESS than the run must serve is a
+	// contradiction. The decode is bounded by `max` either way, so a lying header still
+	// cannot demand an allocation.
+	let header = u32::from_le_bytes(src[0..4].try_into().unwrap()) as usize;
+	if header < max {
+		return None;
+	}
+	let n = max;
 	let mut out = Vec::with_capacity(n);
 	let mut p = 4;
 	while out.len() < n && p < src.len() {
@@ -921,11 +988,11 @@ pub(crate) fn lz_decompress(src: &[u8], max: usize) -> Vec<u8> {
 		if lit == 15 {
 			match lz_take_extra(src, &mut p) {
 				Some(extra) => lit += extra,
-				None => return out,
+				None => return None,
 			}
 		}
 		if p + lit > src.len() {
-			return out;
+			return None;
 		}
 		let take = lit.min(n - out.len());
 		out.extend_from_slice(&src[p..p + take]);
@@ -940,12 +1007,12 @@ pub(crate) fn lz_decompress(src: &[u8], max: usize) -> Vec<u8> {
 		if ml == 15 {
 			match lz_take_extra(src, &mut p) {
 				Some(extra) => ml += extra,
-				None => return out,
+				None => return None,
 			}
 		}
 		ml += LZ_MIN_MATCH;
 		if offset == 0 || offset > out.len() {
-			return out;
+			return None;
 		}
 		let start = out.len() - offset;
 		for k in 0..ml.min(n - out.len()) {
@@ -953,7 +1020,12 @@ pub(crate) fn lz_decompress(src: &[u8], max: usize) -> Vec<u8> {
 			out.push(byte);
 		}
 	}
-	out
+	// and it has to have produced the WHOLE range: a stream that simply stops is
+	// truncated, not short.
+	if out.len() != n {
+		return None;
+	}
+	Some(out)
 }
 
 // Read an LZ4 length extension at `*p`: 255-valued bytes plus the final remainder.
