@@ -111,7 +111,10 @@ for name in "${sample[@]}"; do
 		echo "     the identity records match, so the two builds disagree about the code itself" >&2
 		continue
 	}
-	first="$(diff <(identity_record "$keep/$name") <(identity_record "$path") | grep '^[<>]' | head -2 | tr '\n' ' ')"
+	# `diff` exits 1 when the files differ, which is the case being reported, so its status
+	# is not an error here - and `head` closing the pipe would make it one anyway.
+	differing="$(diff <(identity_record "$keep/$name") <(identity_record "$path") || true)"
+	first="$(grep '^[<>]' <<<"$differing" | sed -n '1,2p' | tr '\n' ' ')"
 	echo "     first identity difference: $first" >&2
 done
 

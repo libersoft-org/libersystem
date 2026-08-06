@@ -162,16 +162,16 @@ fi
 # `llvm-readelf | awk '...; exit}'` in the injection checks, which is what made a gate exit 74
 # with no output, a different gate each run.
 #
-# `head` and friends are the same hazard and are NOT scanned for yet: the tree has a dozen
-# `find | sort | head -n1` pipelines whose producers would take SIGPIPE the same way, and
-# converting them is its own piece of work. Recorded in M0142 rather than left implied.
+# `head` is in now too. It was left out at first because the tree had thirteen copies of
+# `find ... | sort -nr | head -n1 | cut` and one rule should not land as a dozen failures;
+# they are one `newest_matching` helper since, so the rule can cover them.
 #
 # Comment lines are skipped, or this check flags the paragraph explaining itself.
 # The awk alternative deliberately does not try to respect quoting: an awk program routinely
 # contains BOTH quote characters - `awk '$1 == "DYNAMIC" {print $2; exit}'` is the very line
 # this was written for - so a class excluding them stops at the first inner quote and matches
 # nothing. That was this check's first version, and it passed the tree while the bug was in it.
-early_close_pattern="^[^#]*[^|][|] *(grep -[A-Za-z]*q|grep -[A-Za-z]*m[0-9 ]|awk .*exit *}|sed -n .*[;']q)"
+early_close_pattern="^[^#]*[^|][|] *(grep -[A-Za-z]*q|grep -[A-Za-z]*m[0-9 ]|awk .*exit *}|sed -n .*[;']q|head( |$))"
 early_close_pipelines=""
 while IFS= read -r script; do
 	grep -q pipefail "$script" || continue
@@ -189,8 +189,12 @@ physical_user_crates="$(mktemp)"
 declared_user_crates="$(mktemp)"
 trap 'rm -f "$source_rows" "$physical_user_crates" "$declared_user_crates"' EXIT
 jq -r '.sources[] | [.owner, .path] | @tsv' <<<"$manifest_json" | sort >"$source_rows"
-duplicate_owner="$(cut -f1 "$source_rows" | uniq -d | head -n1)"
-duplicate_path="$(cut -f2 "$source_rows" | sort | uniq -d | head -n1)"
+# captured whole, then first-lined - `head` closing the pipe on `uniq` is the hazard this
+# very script refuses everywhere else.
+duplicate_owners="$(cut -f1 "$source_rows" | uniq -d)"
+duplicate_paths="$(cut -f2 "$source_rows" | sort | uniq -d)"
+duplicate_owner="${duplicate_owners%%$'\n'*}"
+duplicate_path="${duplicate_paths%%$'\n'*}"
 if [[ -n "$duplicate_owner" || -n "$duplicate_path" ]]; then
 	echo "source-hygiene: duplicate manifest source owner or path: ${duplicate_owner:-$duplicate_path}" >&2
 	exit 1

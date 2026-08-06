@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# `-E` (errtrace) matters as much as `-e` here: without it the ERR trap below is NOT
+# inherited by functions, subshells or command substitutions, and everything this script
+# does of consequence happens inside `check_target`. A trap that does not fire where the
+# work is looks exactly like a script that failed for no reason - which is what this gate
+# has looked like every time it died.
+set -Eeuo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
@@ -50,10 +55,33 @@ restore_artifact() {
 	if [[ -n "$artifact" && -n "$backup" && -f "$backup" ]]; then cp "$backup" "$artifact"; fi
 }
 
+# The command that failed, captured while bash still knows it.
+#
+# This gate has died silently more than once - exit 74 and exit 1 with no output at all,
+# a different gate each time and never reproducible on demand. Under `set -e` a failing
+# command anywhere kills the script with only its status to show for it, and a status on
+# its own has proved to be not enough to identify anything: one plausible reconstruction
+# from the number alone was followed for an evening and turned out to be impossible.
+#
+# So the next occurrence names itself. `$BASH_COMMAND` is the command being run when the
+# trap fires and `$LINENO` is where it lives, which together are the whole question.
+# Reported the moment it happens rather than remembered for the exit, because a command
+# substitution runs in a subshell and nothing it assigns survives to the EXIT trap. ERR
+# does not fire for a command whose failure is being TESTED - an `if`, a `while`, a `&&`,
+# a `!` - so this stays quiet for every failure the script handles itself.
+on_error() {
+	echo "image-injection-check: failed at line $1 with status $2:" >&2
+	echo "  $BASH_COMMAND" >&2
+}
+trap 'on_error "$LINENO" "$?"' ERR
+
 cleanup() {
 	local status=$?
 	restore_artifact
 	rm -f "$backup" "$baseline_log" "$failure_log" "$restore_log"
+	if [[ "$status" -ne 0 ]]; then
+		echo "image-injection-check: exiting $status (kind=$kind mode=$mode mutation=${mutation:-none})" >&2
+	fi
 	exit "$status"
 }
 trap cleanup EXIT

@@ -189,6 +189,23 @@ targeted_state_reason=""
 object_inputs=""
 pending_identity_record=""
 
+# The newest file in `dir` matching `pattern`, by modification time, or empty if there is
+# none. Thirteen copies of `find ... | sort -nr | head -n1 | cut` said this before.
+#
+# `head` closes the pipe once it has its line, so `sort` takes SIGPIPE and `pipefail` makes
+# that the status of the pipeline - the same hazard as `grep -q` below, and safe today only
+# because a handful of paths fit in the pipe buffer, which is a property nobody is holding
+# fixed. `sort` cannot emit anything before it has read ALL of its input, so capturing the
+# sorted list and taking its first line with parameter expansion leaves no early reader
+# anywhere in the chain.
+newest_matching() {
+	local dir="$1" pattern="$2" listing first
+	listing="$(find "$dir" -maxdepth 1 -name "$pattern" -printf '%T@ %p\n' | LC_ALL=C sort -nr)" || return $?
+	[[ -n "$listing" ]] || return 0
+	first="${listing%%$'\n'*}"
+	printf '%s\n' "${first#* }"
+}
+
 # `grep -q` stops at its first match and closes the pipe, so the producer's next write fails
 # with EPIPE. llvm-readelf reports that as exit 74, and `pipefail` makes it the status of the
 # whole pipeline, so a successful match read as a failed read and rejected an artifact of
@@ -1590,7 +1607,7 @@ for spec in "$@"; do
 			echo "build-shared: $artifact has invalid feature set '$row_features'" >&2
 			exit 1
 		fi
-		if [[ "$(tr ',' '\n' <<<"$row_features" | sort | uniq -d | head -n1)" != "" ]]; then
+		if [[ -n "$(tr ',' '\n' <<<"$row_features" | sort | uniq -d)" ]]; then
 			echo "build-shared: $artifact repeats a build feature" >&2
 			exit 1
 		fi
@@ -1629,7 +1646,7 @@ for spec in "$@"; do
 	else
 		(cd "$crate_dir" && CARGO_TARGET_DIR="$provider_cargo_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo "${cargo_target_flags[@]}" -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$cargo_target" --lib "${features[@]}")
 		deps="$provider_cargo_target/$target/release/deps"
-		rlib="$(find "$deps" -maxdepth 1 -name "lib${crate_rust}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		rlib="$(newest_matching "$deps" "lib${crate_rust}-*.rlib")"
 	fi
 	if [[ -z "$rlib" ]]; then
 		echo "build-shared: no rlib produced for $crate" >&2
@@ -1682,7 +1699,7 @@ for spec in "$@"; do
 		symbolic_flags=()
 		archives=()
 		for dependency in core alloc compiler_builtins abi rt; do
-			archive="$(find "$deps" -maxdepth 1 -name "lib${dependency}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+			archive="$(newest_matching "$deps" "lib${dependency}-*.rlib")"
 			if [[ -z "$archive" ]]; then
 				echo "build-shared: missing PIC archive $dependency for lsrt.lslib" >&2
 				exit 1
@@ -1715,8 +1732,8 @@ for spec in "$@"; do
 	fi
 	case "$artifact" in
 	deflate)
-		miniz_archive="$(find "$deps" -maxdepth 1 -name 'libminiz_oxide-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
-		adler_archive="$(find "$deps" -maxdepth 1 -name 'libadler2-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		miniz_archive="$(newest_matching "$deps" 'libminiz_oxide-*.rlib')"
+		adler_archive="$(newest_matching "$deps" 'libadler2-*.rlib')"
 		if [[ -z "$miniz_archive" || -z "$adler_archive" ]]; then
 			echo "build-shared: missing miniz_oxide/adler2 archive for deflate.lslib" >&2
 			exit 1
@@ -1730,7 +1747,7 @@ for spec in "$@"; do
 			qoi_codec_archive="$(find "$deps" -maxdepth 1 -name 'libqoi-*.rlib' ! -samefile "$rlib" -print | while read -r candidate; do if ! matches_output 'pix.*RgbaImage' llvm-readelf --wide --symbols "$candidate"; then printf '%s\n' "$candidate"; fi; done | sort -u)"
 		fi
 		if [[ "$(wc -l <<<"$qoi_codec_archive")" != 1 ]]; then qoi_codec_archive=""; fi
-		bytemuck_archive="$(find "$deps" -maxdepth 1 -name 'libbytemuck-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		bytemuck_archive="$(newest_matching "$deps" 'libbytemuck-*.rlib')"
 		if [[ -z "$qoi_codec_archive" || -z "$bytemuck_archive" ]]; then
 			echo "build-shared: missing qoi/bytemuck archive for qoi.lslib" >&2
 			exit 1
@@ -1738,7 +1755,7 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "$rlib" "$qoi_codec_archive" "$bytemuck_archive" --no-whole-archive)
 		;;
 	gif)
-		weezl_archive="$(find "$deps" -maxdepth 1 -name 'libweezl-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		weezl_archive="$(newest_matching "$deps" 'libweezl-*.rlib')"
 		if [[ -z "$weezl_archive" ]]; then
 			echo "build-shared: missing weezl archive for gif.lslib" >&2
 			exit 1
@@ -1746,9 +1763,9 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "$rlib" "$weezl_archive" --no-whole-archive)
 		;;
 	jpeg)
-		jpeg_encoder_archive="$(find "$deps" -maxdepth 1 -name 'libjpeg_encoder-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
-		zune_core_archive="$(find "$deps" -maxdepth 1 -name 'libzune_core-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
-		zune_jpeg_archive="$(find "$deps" -maxdepth 1 -name 'libzune_jpeg-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		jpeg_encoder_archive="$(newest_matching "$deps" 'libjpeg_encoder-*.rlib')"
+		zune_core_archive="$(newest_matching "$deps" 'libzune_core-*.rlib')"
+		zune_jpeg_archive="$(newest_matching "$deps" 'libzune_jpeg-*.rlib')"
 		if [[ -z "$jpeg_encoder_archive" || -z "$zune_core_archive" || -z "$zune_jpeg_archive" ]]; then
 			echo "build-shared: missing JPEG engine archives for jpeg.lslib" >&2
 			exit 1
@@ -1758,7 +1775,7 @@ for spec in "$@"; do
 	webp)
 		webp_archives=()
 		for dependency in ai_byteorder_lite ai_image_webp ai_quick_error allocator_api2 equivalent foldhash hashbrown memchr no_std_io; do
-			archive="$(find "$deps" -maxdepth 1 -name "lib${dependency}-*.rlib" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+			archive="$(newest_matching "$deps" "lib${dependency}-*.rlib")"
 			if [[ -z "$archive" ]]; then
 				echo "build-shared: missing $dependency archive for webp.lslib" >&2
 				exit 1
@@ -1768,7 +1785,7 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "$rlib" "${webp_archives[@]}" --no-whole-archive)
 		;;
 	mp3)
-		nanomp3_archive="$(find "$deps" -maxdepth 1 -name 'libnanomp3-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		nanomp3_archive="$(newest_matching "$deps" 'libnanomp3-*.rlib')"
 		if [[ -z "$nanomp3_archive" ]]; then
 			echo "build-shared: missing nanomp3 archive for mp3.lslib" >&2
 			exit 1
@@ -1776,7 +1793,7 @@ for spec in "$@"; do
 		link_inputs=(--whole-archive "$rlib" "$nanomp3_archive" --no-whole-archive)
 		;;
 	vorbis)
-		libm_archive="$(find "$deps" -maxdepth 1 -name 'liblibm-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+		libm_archive="$(newest_matching "$deps" 'liblibm-*.rlib')"
 		if [[ -z "$libm_archive" ]]; then
 			echo "build-shared: missing libm archive for vorbis.lslib" >&2
 			exit 1
@@ -1947,7 +1964,10 @@ if [[ -n "$image_graph" ]]; then
 		diff -u <(printf '%s\n' "$cargo_tools") <(printf '%s\n' "$manifest_tools") >&2 || true
 		exit 1
 	fi
-	duplicate_consumer="$(awk '{print $2}' <<<"$dynamic_rows" | uniq -d | head -n1)"
+	# captured, then first-lined: `head` would close the pipe on `uniq` for the same reason
+	# `newest_matching` avoids it above.
+	duplicate_consumers="$(awk '{print $2}' <<<"$dynamic_rows" | uniq -d)"
+	duplicate_consumer="${duplicate_consumers%%$'\n'*}"
 	if [[ -n "$duplicate_consumer" ]]; then
 		echo "build-shared: duplicate dynamic executable $duplicate_consumer" >&2
 		exit 1
@@ -2367,7 +2387,7 @@ if matches_line pix printf '%s\n' "${artifacts[@]}"; then
 	fi
 	verbose_log "build-shared: executable cache miss dyn_probe"
 	(cd "$probe" && CARGO_TARGET_DIR="$provider_cargo_target" RUST_MIN_STACK="$rust_min_stack" RUSTFLAGS="$rustflags" cargo -Z build-std=core,alloc,compiler_builtins -Z build-std-features=compiler-builtins-mem build --quiet --release --target "$target" --lib)
-	probe_rlib="$(find "$provider_cargo_target/$target/release/deps" -maxdepth 1 -name 'libdyn_probe-*.rlib' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)"
+	probe_rlib="$(newest_matching "$provider_cargo_target/$target/release/deps" 'libdyn_probe-*.rlib')"
 	probe_candidate="$probe_out.$$.candidate"
 	rm -f "$probe_candidate"
 	"$lld" -flavor gnu -m "$emulation" -pie --no-dynamic-linker --hash-style=sysv -e _start --whole-archive "$probe_rlib" --no-whole-archive "$(library_file pix)" "$(library_file lsrt)" --no-allow-shlib-undefined -o "$probe_candidate"
