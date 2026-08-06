@@ -100,8 +100,8 @@ write_u32_le() {
 
 dynamic_words() {
 	local dynamic_offset_hex dynamic_size_hex dynamic_offset dynamic_size
-	dynamic_offset_hex="$(llvm-readelf -lW "$artifact" | awk '$1 == "DYNAMIC" {print $2; exit}')"
-	dynamic_size_hex="$(llvm-readelf -lW "$artifact" | awk '$1 == "DYNAMIC" {print $5; exit}')"
+	dynamic_offset_hex="$(awk_on_output '$1 == "DYNAMIC" {print $2; exit}' llvm-readelf -lW "$artifact")"
+	dynamic_size_hex="$(awk_on_output '$1 == "DYNAMIC" {print $5; exit}' llvm-readelf -lW "$artifact")"
 	if [[ -z "$dynamic_offset_hex" || -z "$dynamic_size_hex" ]]; then
 		echo "image-injection-check: $mutation found no PT_DYNAMIC segment in $artifact" >&2
 		return 1
@@ -127,6 +127,26 @@ dynamic_value_offset() {
 	return 1
 }
 
+# `awk ... exit` stops at its first match and closes the pipe, so llvm-readelf's next write
+# fails with EPIPE - which the llvm tools report as exit 74, and `pipefail` makes that the
+# status of the whole pipeline. In a command substitution under `set -e` that kills the
+# script outright, with no message and no artifact named: the gate simply exits 74.
+#
+# It is a race against the producer's final flush, so it strikes a different gate on each
+# run and never the same one twice, and passes on replication. The tree has met this twice
+# before with `grep -q` - `build-shared.sh` and `check-source-hygiene.sh` both carry the
+# same note - and the source-hygiene gate that scans for it only knows the `grep -q` shape.
+#
+# Capture first, then match against the capture: a producer that really failed still fails
+# here, on the capture, which is the case a pipeline cannot tell apart from a match.
+awk_on_output() {
+	local program="$1"
+	local output
+	shift
+	output="$("$@")" || return $?
+	awk "$program" <<<"$output"
+}
+
 virtual_file_offset() {
 	local requested="$1"
 	local file_offset virtual_address file_size
@@ -135,7 +155,7 @@ virtual_file_offset() {
 			printf '%s\n' "$((file_offset + requested - virtual_address))"
 			return
 		fi
-	done < <(llvm-readelf -lW "$artifact" | awk '$1 == "LOAD" {print $2, $3, $5}')
+	done < <(awk_on_output '$1 == "LOAD" {print $2, $3, $5}' llvm-readelf -lW "$artifact")
 	echo "image-injection-check: $mutation virtual address $requested is not file-backed in $artifact" >&2
 	return 1
 }
@@ -167,8 +187,8 @@ inject_artifact() {
 		local -a words=()
 		local -a needed_indices=()
 		local -a needed_values=()
-		dynamic_offset_hex="$(llvm-readelf -lW "$artifact" | awk '$1 == "DYNAMIC" {print $2; exit}')"
-		dynamic_size_hex="$(llvm-readelf -lW "$artifact" | awk '$1 == "DYNAMIC" {print $5; exit}')"
+		dynamic_offset_hex="$(awk_on_output '$1 == "DYNAMIC" {print $2; exit}' llvm-readelf -lW "$artifact")"
+		dynamic_size_hex="$(awk_on_output '$1 == "DYNAMIC" {print $5; exit}' llvm-readelf -lW "$artifact")"
 		if [[ -z "$dynamic_offset_hex" || -z "$dynamic_size_hex" ]]; then
 			echo "image-injection-check: $kind found no PT_DYNAMIC segment in $artifact" >&2
 			return 1
@@ -257,7 +277,7 @@ inject_artifact() {
 		;;
 	identity-note)
 		local note_offset_hex note_size_hex note_offset note_size profile_offset
-		read -r note_offset_hex note_size_hex < <(llvm-readelf -SW "$artifact" | awk '$2 == ".note.liber.identity" {print $5, $6; exit}')
+		read -r note_offset_hex note_size_hex < <(awk_on_output '$2 == ".note.liber.identity" {print $5, $6; exit}' llvm-readelf -SW "$artifact")
 		if [[ -z "$note_offset_hex" || -z "$note_size_hex" ]]; then
 			echo "image-injection-check: $mutation found no identity note in $artifact" >&2
 			return 1

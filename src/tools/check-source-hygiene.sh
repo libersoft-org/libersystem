@@ -152,21 +152,35 @@ if [[ -n "$(find src/user -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit)
 	exit 1
 fi
 
-# `grep -q` stops at its first match and closes the pipe. The producer's next write then fails
+# A reader that stops at its first match closes the pipe. The producer's next write then fails
 # with EPIPE, which the llvm tools report as exit 74, and `pipefail` makes that the status of the
 # whole pipeline, so a successful match reads as a failed read. It is a race against the
 # producer's final flush, so such a check passes review and most runs and then rejects a correct
 # artifact under load. Match against captured output instead.
-grep_q_pattern='[^|][|] *grep -[A-Za-z]*q'
-grep_q_pipelines=""
+#
+# `grep -q` was the shape this knew about, and it was not the only one. It missed an
+# `llvm-readelf | awk '...; exit}'` in the injection checks, which is what made a gate exit 74
+# with no output, a different gate each run.
+#
+# `head` and friends are the same hazard and are NOT scanned for yet: the tree has a dozen
+# `find | sort | head -n1` pipelines whose producers would take SIGPIPE the same way, and
+# converting them is its own piece of work. Recorded in M0142 rather than left implied.
+#
+# Comment lines are skipped, or this check flags the paragraph explaining itself.
+# The awk alternative deliberately does not try to respect quoting: an awk program routinely
+# contains BOTH quote characters - `awk '$1 == "DYNAMIC" {print $2; exit}'` is the very line
+# this was written for - so a class excluding them stops at the first inner quote and matches
+# nothing. That was this check's first version, and it passed the tree while the bug was in it.
+early_close_pattern="^[^#]*[^|][|] *(grep -[A-Za-z]*q|grep -[A-Za-z]*m[0-9 ]|awk .*exit *}|sed -n .*[;']q)"
+early_close_pipelines=""
 while IFS= read -r script; do
 	grep -q pipefail "$script" || continue
-	script_matches="$(grep -nE "$grep_q_pattern" "$script")" || continue
-	grep_q_pipelines+="$(sed "s#^#$script:#" <<<"$script_matches")"$'\n'
+	script_matches="$(grep -nE "$early_close_pattern" "$script")" || continue
+	early_close_pipelines+="$(sed "s#^#$script:#" <<<"$script_matches")"$'\n'
 done < <(find src -name '*.sh' | sort)
-if [[ -n "$grep_q_pipelines" ]]; then
-	echo "source-hygiene: a script using pipefail pipes into grep -q, where a match can read as a failed pipeline:" >&2
-	printf '%s' "$grep_q_pipelines" >&2
+if [[ -n "$early_close_pipelines" ]]; then
+	echo "source-hygiene: a script using pipefail pipes into a reader that can stop early, where a match reads as a failed pipeline:" >&2
+	printf '%s' "$early_close_pipelines" >&2
 	exit 1
 fi
 

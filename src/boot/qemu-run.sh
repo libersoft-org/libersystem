@@ -556,7 +556,14 @@ qemu_run_x86_64() {
 		[[ "${DEV_PROFILE:-0}" == "1" ]] && default_port=5556
 		local port="${HOSTFWD_PORT:-$default_port}"
 		# Fail on the cause rather than leaving QEMU to fail on a rule nobody can read.
-		if ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+		#
+		# Capture before matching: `grep -q` stops at its first match and closes the pipe, so
+		# `ss` takes SIGPIPE and `pipefail` makes that the status of the pipeline - a port
+		# that IS in use could read as a failed check. The same shape the source-hygiene gate
+		# refuses everywhere else, which is how it was found.
+		local listeners
+		listeners="$(ss -ltn "sport = :$port" 2>/dev/null || true)"
+		if grep -q LISTEN <<<"$listeners"; then
 			echo "qemu-run: host port $port is already in use, so this guest cannot forward it" >&2
 			echo "qemu-run: a persistent development instance is the usual holder - check \`just dev-status\`, release it with \`just dev-down\`" >&2
 			echo "qemu-run: or run this guest on another port with HOSTFWD_PORT=<port>" >&2
