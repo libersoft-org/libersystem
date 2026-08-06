@@ -187,7 +187,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0136 - Identity: accounts, authentication and per-user authority](M0136.md)
 - [x] [M0137 - Build layering: compile, then package](M0137.md)
 - [x] [M0138 - The loader reads the filesystem: retire the bootstrap archive](M0138.md)
-- [ ] [M0139 - LiberMemFS: a writable filesystem that lives in memory](M0139.md)
+- [x] [M0139 - LiberMemFS: a writable filesystem that lives in memory](M0139.md)
 - [x] [M0140 - The build interface: scripts with flags, and a Justfile that stops being one](M0140.md)
 - [x] [M0141 - Streams as pending operations, and a harness that can move the clock](M0141.md)
 - [x] [M0142 - Gates that stopped checking](M0142.md)

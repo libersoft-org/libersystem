@@ -87,8 +87,20 @@ x86_64)
 	TAG_TIMEOUT=3m
 	;;
 aarch64)
-	FULL_TIMEOUT=30m
-	TAG_TIMEOUT=10m
+	# 45m, matching riscv64: both are TCG-emulated, and the asymmetry was arbitrary.
+	#
+	# Raising a watchdog is normally the wrong answer here, and this tree has said so: a timeout
+	# from ONE test grown to twelve cases was fixed by splitting it, not by waiting longer. This is
+	# the other case. Measured 2026-08-06: aarch64 completed 142 of 150 tests in the 30 minutes it
+	# had - about 12.7 seconds each, so the suite needs roughly 32 - while riscv64, the SLOWER
+	# target, finished all 150 in 2161s of its 2700 and sat at 80% of its budget.
+	#
+	# The suite has grown across many milestones and this number did not, so it had drifted to
+	# 99.4% before the three tests that tipped it, which means any addition at all would have. The
+	# tests that tipped it were cheapened first and re-checked to still fail without their fixes;
+	# what is left is not a hot spot to split but a budget that stopped matching the work.
+	FULL_TIMEOUT=45m
+	TAG_TIMEOUT=15m
 	;;
 riscv64)
 	FULL_TIMEOUT=45m

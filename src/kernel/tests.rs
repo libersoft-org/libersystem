@@ -2874,11 +2874,11 @@ impl StorageHarness {
 		// end the stream cleanly, the file would be committed for good reason, and the test would
 		// be measuring an ordinary completion instead of an orphan.
 		drop(sub);
-		for _ in 0..256 {
+		for _ in 0..128 {
 			self.pump();
 		}
 		drop(our_side);
-		for _ in 0..64 {
+		for _ in 0..32 {
 			self.pump();
 		}
 		// Two separate facts, reported separately so a failure says which one broke: the service
@@ -2911,12 +2911,15 @@ impl StorageHarness {
 		// same depth as the reply queue, so the extra sends are dropped and the service answers
 		// exactly as many as the reply queue can hold - never one more, which is the one that
 		// blocks. Interleaving keeps the requests flowing so the replies pile up past the depth.
-		for _ in 0..200 {
+		// Eighty, not two hundred: the reply queue is 64 deep, so the queue is full and the next
+		// answer is blocking well before this ends. Every iteration is a full scheduler pass, which
+		// under emulation is the most expensive thing this test does.
+		for _ in 0..80 {
 			let _ = sub.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0));
 			self.pump();
 		}
 		advance_clock(skip);
-		for _ in 0..512 {
+		for _ in 0..128 {
 			self.pump();
 		}
 		// The stalled client stays ALIVE across the probe. Dropping it first closes its end, which

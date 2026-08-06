@@ -932,17 +932,36 @@ fn what_the_stream_preflight_promises_a_nested_path_is_what_it_can_take() {
 	assert_eq!(fs.read_file(path).as_deref(), Ok(&payload[..]), "all of them");
 }
 
-// A test for the reserved volume opening a stream out of its own reservation stood here and was
-// removed, because it passed with the fix reverted.
-//
-// The fault is real - the stream path allocated the pending path beside a reservation holding the
-// volume's whole capacity, where the ordinary write path has released first for as long as the
-// reservation has existed. What a host test cannot produce is the condition that makes it visible:
-// a heap tight enough that those bytes can only come from the reservation. Here the process has
-// gigabytes, so the allocation succeeds either way and the assertion is decoration.
-//
-// It belongs in the kernel suite, against a guest heap sized around the volume - the shape
-// `receiving_into_the_volume_costs_one_buffer_rather_than_two` uses for the same reason.
+#[test]
+fn a_reserved_volume_opens_a_stream_out_of_its_own_reservation() {
+	// A reserved volume holds its whole free capacity, so allocating the pending path BESIDE the
+	// reservation competes with memory the volume is itself sitting on: the stream can be refused
+	// for want of bytes the volume was holding for exactly this. The ordinary write path has
+	// released before allocating for as long as the reservation has existed.
+	//
+	// The budget is what makes it visible, and this test was once deleted for want of it: with a
+	// host heap of gigabytes the extra allocation succeeds either way and the assertion is
+	// decoration. Capped just past the volume, the path's bytes can only come from the reservation.
+	const CAPACITY: usize = 4096;
+	// The slack is SMALLER than the path: without releasing first, those bytes are simply not
+	// there, which is the whole condition. At `CAPACITY + 1024` the test passed with the fix
+	// reverted, because a kilobyte of slack covers a 200-byte name however the volume behaves.
+	// Built BEFORE the budget: `vec![...]` is an infallible allocation, and one made inside the cap
+	// aborts the process rather than failing - which is the harness working as intended and is why
+	// the test's own scaffolding has to be allocated outside it.
+	//
+	// A long FLAT name: it costs real bytes without needing parent directories, which would have to
+	// be created first and would themselves be refused on a budget this tight.
+	let name = alloc::vec![b'n'; 255];
+	within(CAPACITY + 320, || {
+		let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("a reserved volume mounts");
+		assert!(fs.reserved_bytes() > 0, "the volume is holding its capacity");
+		assert_eq!(fs.stream_begin(&name), Ok(()), "a stream opens against the volume's own reservation");
+		assert!(fs.reservation_intact(), "and the volume still keeps its promise");
+		fs.stream_abort();
+		assert!(fs.reservation_intact(), "as it does after giving the stream up");
+	});
+}
 
 #[test]
 fn receiving_into_the_volume_costs_one_buffer_rather_than_two() {
