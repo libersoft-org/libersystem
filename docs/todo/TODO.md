@@ -192,7 +192,8 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0141 - Streams as pending operations, and a harness that can move the clock](M0141.md)
 - [x] [M0142 - Gates that stopped checking](M0142.md)
 - [x] [M0143 - LiberFS: what a mount may not do, and what a checksum does not prove](M0143.md)
-- [ ] [M0144 - LiberFS: what a mount may still lose, and what a parser may not quietly repair](M0144.md)
+- [x] [M0144 - LiberFS: what a mount may still lose, and what a parser may not quietly repair](M0144.md)
+- [ ] [M0145 - The kernel's lowest layers do not yet keep the promises the upper ones make](M0145.md)
 
 ### Definition of done (phase 2)
 
