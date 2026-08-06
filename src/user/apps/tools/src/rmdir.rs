@@ -78,8 +78,8 @@ unsafe fn rmdir(storage: u64, uri: &[u8]) {
 			}
 			_ => {
 				eprint(b"rmdir: could not remove ");
-				print(uri);
-				print(b"\n");
+				eprint(uri);
+				eprint(b"\n");
 			}
 		}
 	}

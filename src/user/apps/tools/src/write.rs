@@ -92,8 +92,8 @@ unsafe fn write(storage: u64, uri: &str, text: &[u8]) {
 			None => {
 				close(producer);
 				eprint(b"write: could not write ");
-				print(uri.as_bytes());
-				print(b"\n");
+				eprint(uri.as_bytes());
+				eprint(b"\n");
 				return;
 			}
 		};
@@ -109,8 +109,8 @@ unsafe fn write(storage: u64, uri: &str, text: &[u8]) {
 			print(b"\n");
 		} else {
 			eprint(b"write: could not write ");
-			print(uri.as_bytes());
-			print(b"\n");
+			eprint(uri.as_bytes());
+			eprint(b"\n");
 		}
 	}
 }

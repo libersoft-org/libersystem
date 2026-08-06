@@ -492,7 +492,21 @@ impl Service for Manager {
 			for (index, stage) in stages.iter().enumerate() {
 				let out: u64 = if index + 1 == stages.len() { stdout } else { edges[index].1 };
 				let input: u64 = if index == 0 { 0 } else { edges[index - 1].0 };
-				requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input });
+				// A stage's diagnostics belong on the TERMINAL, not in the pipe.
+				//
+				// Every stage but the last writes into an edge, and until the error endpoint
+				// existed a diagnostic had nowhere else to go: `eprint` falls back to stdout, so
+				// `cat missing | readln` would hand "cat: invalid path" to `readln` as if it were
+				// data. Each stage gets its own send-only duplicate of the terminal, so a message
+				// reaches the person and the pipe carries only what the tool produced.
+				//
+				// Send-only deliberately: a stage has no business READING the terminal through the
+				// channel it reports errors on.
+				let error: u64 = {
+					let dup: i64 = duplicate(stdout, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+					if dup > 0 { dup as u64 } else { 0 }
+				};
+				requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input, stderr: error });
 			}
 			let started: Vec<StartResult> = match run_pipeline_under_manifest(self.procsvc, &requests, cwd.as_bytes(), &environment, &mut self.clients, &mut self.audit) {
 				Some(started) => started,
@@ -735,6 +749,8 @@ struct StageRequest<'a> {
 	args: &'a [u8],
 	stdout: u64,
 	stdin: u64,
+	// The terminal, so a stage's diagnostics do not travel down the pipe as data.
+	stderr: u64,
 }
 
 // Build a whole pipeline as one transaction: prepare every stage, install every stage's
@@ -801,7 +817,7 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 			// stdout, then stdin when there is one, as ordered capabilities in one message.
 			// A stage writes into one edge and reads from another, so the two endpoints are
 			// named separately rather than told apart by how many arrived.
-			let installed: bool = send_blocking(manager_side, CAP_STDOUT, stage.stdout) && (stage.stdin == 0 || send_blocking(manager_side, CAP_STDIN, stage.stdin)) && send_ready(manager_side);
+			let installed: bool = send_blocking(manager_side, CAP_STDOUT, stage.stdout) && (stage.stdin == 0 || send_blocking(manager_side, CAP_STDIN, stage.stdin)) && (stage.stderr == 0 || send_blocking(manager_side, CAP_STDERR, stage.stderr)) && send_ready(manager_side);
 			if !installed {
 				close(manager_side);
 				close(started.task);

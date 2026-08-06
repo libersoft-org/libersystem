@@ -82,8 +82,8 @@ unsafe fn get_config(cfgsvc: u64, key: &[u8]) {
 			}
 			Some(Err(_)) => {
 				eprint(b"config: no such key ");
-				print(key.as_bytes());
-				print(b"\n");
+				eprint(key.as_bytes());
+				eprint(b"\n");
 			}
 			None => eprint(b"config: service unavailable\n"),
 		}

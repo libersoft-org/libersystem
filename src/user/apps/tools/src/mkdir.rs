@@ -78,8 +78,8 @@ unsafe fn mkdir(storage: u64, uri: &[u8]) {
 			}
 			_ => {
 				eprint(b"mkdir: could not create ");
-				print(uri);
-				print(b"\n");
+				eprint(uri);
+				eprint(b"\n");
 			}
 		}
 	}

@@ -286,6 +286,10 @@ struct PermissionScenarioResult {
 	// started it at all - the transaction's observable result.
 	pipeline_read: alloc::vec::Vec<u8>,
 	pipeline_started: bool,
+	// What the terminal saw from a pipeline whose FIRST stage fails: its diagnostic must arrive
+	// as itself, not relayed by the consumer, which is the difference between an error stream on
+	// the terminal and one that empties into the pipe.
+	diagnostic_read: alloc::vec::Vec<u8>,
 	expected: alloc::vec::Vec<u8>,
 	probe_read: alloc::vec::Vec<u8>,
 	probe_summary: alloc::vec::Vec<u8>,
@@ -547,6 +551,38 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 			}
 		}
 	}
+	// A pipeline whose PRODUCER fails: its diagnostic belongs on the terminal, not in the pipe.
+	//
+	// `cat` refuses a path no volume can name and says so. Every stage but the last writes into an
+	// edge, so without an error endpoint that sentence goes to stdout - the edge - and `readln`
+	// reads it as input and echoes it behind its own `in> ` prefix. With one, the terminal sees the
+	// message itself and the pipe carries nothing.
+	let (diagnostic_read_end, diagnostic_write_end) = Channel::create();
+	let mut diagnostic_request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	diagnostic_request.extend_from_slice(&4u16.to_le_bytes());
+	diagnostic_request.extend_from_slice(&1u32.to_le_bytes());
+	diagnostic_request.extend_from_slice(&2u16.to_le_bytes());
+	for (name, args) in [(&b"cat"[..], &b"::not-a-path"[..]), (&b"readln"[..], &b""[..])] {
+		for value in [name, args] {
+			diagnostic_request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+			diagnostic_request.extend_from_slice(value);
+		}
+	}
+	diagnostic_request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
+	diagnostic_request.extend_from_slice(b"vol://system");
+	diagnostic_request.extend_from_slice(&0u16.to_le_bytes());
+	diagnostic_request.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&perm_client, &diagnostic_request, diagnostic_write_end, Rights::ALL)?;
+	sched::run_until_idle();
+	let _ = perm_client.recv();
+	let mut diagnostic_read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..16 {
+		sched::run_until_idle();
+		match diagnostic_read_end.recv() {
+			Ok(message) => diagnostic_read.extend_from_slice(&message.bytes),
+			Err(_) => break,
+		}
+	}
 
 	// PermissionManager reports its "online" line, then each governed component's proof and
 	// decisions summary: the bytes sandbox_probe read through its one granted storage
@@ -566,7 +602,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let ip_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip output")?;
 	let ip_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip decisions summary")?;
 	if scenario != PermissionScenario::ScopedGrants {
-		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
+		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
 	}
 
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
@@ -802,7 +838,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	if !mp3_process.is_terminated() {
 		return Err("MP3 play did not exit");
 	}
-	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
+	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
 }
 
 // Build the component topology and run it to completion. A StorageService serves

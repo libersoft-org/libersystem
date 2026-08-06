@@ -63,8 +63,8 @@ unsafe fn resolve(netsvc: u64, name: &[u8]) {
 			}
 			Some(Err(_)) => {
 				eprint(b"nslookup: could not resolve ");
-				print(name);
-				print(b"\n");
+				eprint(name);
+				eprint(b"\n");
 			}
 			None => eprint(b"nslookup: network service gone\n"),
 		}

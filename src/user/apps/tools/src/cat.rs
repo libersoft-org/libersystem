@@ -75,8 +75,8 @@ unsafe fn cat(storage: u64, uri: &[u8]) {
 			Some(Ok(r)) => r,
 			_ => {
 				eprint(b"cat: ");
-				print(uri);
-				print(b": cannot open\n");
+				eprint(uri);
+				eprint(b": cannot open\n");
 				return;
 			}
 		};

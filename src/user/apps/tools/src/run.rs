@@ -57,8 +57,8 @@ unsafe fn run_process(procsvc: u64, name: &[u8]) {
 			}
 			Some(Err(_)) => {
 				eprint(b"run: could not start ");
-				print(name.as_bytes());
-				print(b"\n");
+				eprint(name.as_bytes());
+				eprint(b"\n");
 			}
 			None => eprint(b"run: service unavailable\n"),
 		}

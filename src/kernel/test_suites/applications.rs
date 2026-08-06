@@ -298,6 +298,14 @@ fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	// two lines and prefixes both; pinning the whole byte sequence would tie this test to how
 	// a producer happens to split its writes, which is not what a pipeline promises.
 	assert!(result.pipeline_read.windows(9).any(|window| window == b"in> hello"), "readln read echo's bytes through the broker-allocated edge and echoed them behind its own prefix, got {:?}", core::str::from_utf8(&result.pipeline_read));
+
+	// A failing PRODUCER reports to the terminal, and the pipe carries nothing.
+	//
+	// Every stage but the last writes into an edge, so before the error endpoint existed a stage's
+	// diagnostic went to stdout - the edge - and the consumer read it as input. The two assertions
+	// are the whole distinction: the message arrives, and it does NOT arrive relayed.
+	assert!(result.diagnostic_read.windows(12).any(|window| window == b"cannot open\n"), "a failing stage's diagnostic reaches the terminal, got {:?}", core::str::from_utf8(&result.diagnostic_read));
+	assert!(!result.diagnostic_read.windows(8).any(|window| window == b"in> cat:"), "and it went to the terminal rather than down the pipe, where the consumer would have echoed it: {:?}", core::str::from_utf8(&result.diagnostic_read));
 }
 
 tagged_test!(a_fat_volume_accepts_a_write_as_its_first_operation, [Service, Storage, Filesystem]);
