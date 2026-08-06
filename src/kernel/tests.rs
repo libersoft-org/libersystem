@@ -2441,7 +2441,7 @@ impl StorageHarness {
 		// mount surfaces as "the service found no filesystem", which points at the service rather
 		// than at the fixture that produced it.
 		let mut disk = fs.into_device();
-		assert!(liberfs::LiberFs::mount(FixtureDisk { sectors: disk.sectors.clone() }).is_some(), "the fixture volume does not mount");
+		assert!(liberfs::LiberFs::mount(FixtureDisk { sectors: disk.sectors.clone() }).is_ok(), "the fixture volume does not mount");
 		core::mem::take(&mut disk.sectors)
 	}
 

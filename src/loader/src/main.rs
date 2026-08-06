@@ -261,7 +261,7 @@ pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) 
 	if unsafe { BOOTSTRAP }.is_some() {
 		return;
 	}
-	let Some(mut fs) = liberfs::LiberFs::mount(blockio::ImageDisk { bytes }) else { return };
+	let Ok(mut fs) = liberfs::LiberFs::mount(blockio::ImageDisk { bytes }) else { return };
 	if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
 		unsafe {
 			BOOTSTRAP = retain(bs, &archive);
@@ -273,7 +273,7 @@ pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) 
 pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> VolumeRead {
 	let mut outcome = VolumeRead::NoVolume;
 	blockio::each_disk(bs, |disk| {
-		let Some(mut fs) = liberfs::LiberFs::mount(disk) else { return false };
+		let Ok(mut fs) = liberfs::LiberFs::mount(disk) else { return false };
 		// The bootstrap set, packed into the archive format the kernel already unpacks. This is
 		// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from
 		// files that exist on the volume rather than from a package built beside it.

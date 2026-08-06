@@ -634,6 +634,33 @@ pub(crate) const DECOMP_CACHE_ENTRIES: usize = 8;
 // The most-recently-used entry is last; a full cache evicts the least-recently-used one
 // (at the front). Bounded to DECOMP_CACHE_ENTRIES runs, so a pathological read pattern
 // cannot grow it without limit.
+// Why a mount failed, because the caller's next move depends on it.
+//
+// This was an `Option`, and the storage service read every `None` as "no filesystem here" and laid
+// down a fresh one. A disk that failed to answer, a volume written by a build that reads a
+// different layout, and a genuinely blank disk were the same answer - so a transient device fault
+// at boot was enough to reformat a healthy system volume.
+//
+// The tree had already fought this twice: a corrupt snapshot table degrades the mount to read-only
+// rather than failing, and so does an incomplete generation walk, precisely because failing would
+// "present the volume as unformatted (and cost its data to the next format)". This finishes that
+// argument for the paths that were left out of it.
+//
+// Only `Unformatted` may be answered by formatting. Everything else keeps every byte where it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountError {
+	// No superblock: a blank disk, or one belonging to something else.
+	Unformatted,
+	// Ours, and written by a build this one cannot read - a version, feature set or algorithm.
+	Unsupported,
+	// Ours and readable, and its structure failed its own checks.
+	Corrupt,
+	// The device did not answer. Says nothing about what is on it.
+	Io,
+	// The medium does not cover the pool the superblock claims.
+	DeviceTooSmall,
+}
+
 pub(crate) struct DecompCache {
 	entries: Vec<(u64, Vec<u8>)>,
 }

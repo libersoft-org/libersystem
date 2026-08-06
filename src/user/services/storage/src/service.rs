@@ -41,7 +41,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use fat::FatFs;
 use iso9660::Iso9660;
-use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs};
+use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs, MountError};
 use libermemfs::{LiberMemFs, Policy as MemPolicy};
 use proto::codec::Buffer;
 use proto::codec::{Sink, SliceWriter};
@@ -1625,7 +1625,9 @@ unsafe fn live_volume(handle: u64) -> Option<LiberMemFs> {
 	// Sized from what the image HOLDS, not from how big the image is: a compressed source expands,
 	// names cost, and a buffer keeps the capacity it grew to. Guessing from the image size is how
 	// a copy runs out of room half way through.
-	let mut source = LiberFs::mount(ImageDevice { bytes: image })?;
+	// A truncated or foreign image is simply not a live volume here - this path builds one from a
+	// staged image and has nothing to format, so the reason is not actionable.
+	let mut source = LiberFs::mount(ImageDevice { bytes: image }).ok()?;
 	// Checked throughout, matching `measure` itself. Corrupt metadata that measures near the top
 	// of the address space would otherwise panic in debug and WRAP in release - and a wrapped
 	// total sizes the volume far too small, which is the worst of the three outcomes because it
@@ -2004,7 +2006,38 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	// an existing filesystem (files persisted from a previous boot) mounts as-is, at
 	// the size recorded in its superblock - never silently grown, the free map would
 	// not match. A volume smaller than its container allows is reported.
-	if let Some(fs) = LiberFs::mount(ChannelBlockDevice { chan: block_client, base, limit: pool, max_sectors }) {
+	// Format ONLY when the disk says there is nothing here.
+	//
+	// Every other answer leaves the volume untouched and says which it was. This read every failure
+	// as a blank disk, so a device that hiccupped during boot, or a volume written by a build with
+	// a different layout, was answered by laying a fresh filesystem over it - a transient fault
+	// turned into permanent loss. The service already refused to do that for two corruption cases;
+	// this is the same rule for the rest.
+	let mounted = LiberFs::mount(ChannelBlockDevice { chan: block_client, base, limit: pool, max_sectors });
+	match mounted {
+		Err(MountError::Unformatted) => {}
+		Err(reason) => {
+			unsafe {
+				print(match reason {
+					MountError::Io => b"storage: vol://system NOT mounted: the disk did not answer. Nothing was changed - check the device and reboot; this is not a blank disk
+"
+					.as_slice(),
+					MountError::Unsupported => b"storage: vol://system NOT mounted: written by a newer or different LiberFS build. Nothing was changed - boot a build that reads it
+"
+					.as_slice(),
+					MountError::DeviceTooSmall => b"storage: vol://system NOT mounted: the medium is smaller than the volume it claims. Nothing was changed
+"
+					.as_slice(),
+					_ => b"storage: vol://system NOT mounted: its superblocks are damaged. Nothing was changed - copy data off or restore before reformatting
+"
+					.as_slice(),
+				});
+			}
+			return None;
+		}
+		Ok(_) => {}
+	}
+	if let Ok(fs) = mounted {
 		if fs.num_blocks() != pool {
 			unsafe {
 				print(b"storage: vol://system spans less than the disk allows (formatted earlier; online resize is future work)\n");

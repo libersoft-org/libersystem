@@ -235,7 +235,7 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// volume that formats but does not mount is worth catching here rather than on a machine
 	// that will not boot.
 	let image = fs_image.into_device();
-	let mut check = liberfs::LiberFs::mount(Image { bytes: image.bytes.clone(), block: BLOCK }).unwrap_or_else(|| panic!("mkpackages: the system volume does not mount"));
+	let mut check = liberfs::LiberFs::mount(Image { bytes: image.bytes.clone(), block: BLOCK }).unwrap_or_else(|reason| panic!("mkpackages: the system volume does not mount: {reason:?}"));
 	for (destination, bytes) in &staged {
 		let destination = destination.trim_start_matches('/');
 		let read = check.read_file(destination.as_bytes()).unwrap_or_else(|error| panic!("mkpackages: /{destination} was written but cannot be read back: {error:?}"));

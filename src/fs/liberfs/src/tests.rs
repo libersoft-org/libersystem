@@ -46,6 +46,44 @@ impl BlockDevice for MemDevice {
 
 const NBLOCKS: u64 = 64;
 
+// A device that refuses to read, so a mount failure can be told apart from a blank disk.
+struct DeadDevice;
+
+impl BlockDevice for DeadDevice {
+	fn read_block(&mut self, _index: u64, _buf: &mut [u8]) -> bool {
+		false
+	}
+	fn write_block(&mut self, _index: u64, _buf: &[u8]) -> bool {
+		false
+	}
+}
+
+#[test]
+fn a_mount_failure_says_which_failure_it_was() {
+	// The whole point of the typed error, and the reason it exists: the CALLER formats.
+	//
+	// `mount` used to answer `None` for a blank disk, an unreadable device, and a volume written by
+	// a build with a different layout alike, and the storage service read every one of them as "no
+	// filesystem here" and laid down a fresh one. A device that hiccupped at boot was enough to
+	// destroy a healthy system volume. These three answers must never be the same answer.
+	assert_eq!(LiberFs::mount(DeadDevice).err(), Some(MountError::Io), "a device that will not read is not a blank disk");
+
+	let blank = MemDevice::new(64);
+	assert_eq!(LiberFs::mount(blank).err(), Some(MountError::Unformatted), "a disk with no superblock is the one case that may be formatted");
+
+	// Ours, and from a build this one cannot read: the magic matches and the version does not.
+	// `into_device` rather than a clone: formatting a COPY leaves the original blank, and the test
+	// then measures an unformatted disk while claiming to measure an unsupported one.
+	let mut dev = LiberFs::format(MemDevice::new(64), 64).expect("format").into_device();
+	let mut block = vec![0u8; BLOCK_SIZE];
+	assert!(dev.read_block(0, &mut block), "read the superblock back");
+	let bumped = u32::from_le_bytes(block[SB_VERSION_OFF..SB_VERSION_OFF + 4].try_into().unwrap()) + 1;
+	block[SB_VERSION_OFF..SB_VERSION_OFF + 4].copy_from_slice(&bumped.to_le_bytes());
+	assert!(dev.write_block(0, &block), "write it back");
+	assert!(dev.write_block(1, &block), "and the second slot with it");
+	assert_eq!(LiberFs::mount(dev).err(), Some(MountError::Unsupported), "a volume from a build we cannot read is not a blank disk either");
+}
+
 #[test]
 fn format_then_mount_is_empty() {
 	let dev = MemDevice::new(NBLOCKS);
@@ -59,7 +97,7 @@ fn format_then_mount_is_empty() {
 #[test]
 fn mount_rejects_unformatted_device() {
 	let dev = MemDevice::new(NBLOCKS);
-	assert!(LiberFs::mount(dev).is_none());
+	assert!(LiberFs::mount(dev).is_err());
 }
 
 #[test]
@@ -1091,7 +1129,7 @@ fn a_volume_with_foreign_feature_flags_does_not_mount() {
 	};
 	let crc = crc32c(&crc_probe);
 	dev.blocks[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
-	assert!(LiberFs::mount(dev).is_none());
+	assert!(LiberFs::mount(dev).is_err());
 }
 
 #[test]
@@ -1809,9 +1847,9 @@ fn an_insane_pool_size_in_the_superblock_is_refused() {
 	let fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let mut dev = fs.into_device();
 	forge_superblock(&mut dev, 0, |sb| sb[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].copy_from_slice(&0u64.to_le_bytes()));
-	assert!(LiberFs::mount(dev.clone()).is_none());
+	assert!(LiberFs::mount(dev.clone()).is_err());
 	forge_superblock(&mut dev, 0, |sb| sb[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].copy_from_slice(&(1u64 << 60).to_le_bytes()));
-	assert!(LiberFs::mount(dev).is_none());
+	assert!(LiberFs::mount(dev).is_err());
 }
 
 #[test]
@@ -2149,7 +2187,7 @@ fn random_corruption_never_panics_or_hangs() {
 		}
 		// whatever the damage: the mount refuses, degrades, or serves - and every
 		// probe completes with a Result, never a panic, hang, or blow-up.
-		let Some(mut fs) = LiberFs::mount(dev) else {
+		let Ok(mut fs) = LiberFs::mount(dev) else {
 			continue;
 		};
 		let _ = fs.fsck();

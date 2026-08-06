@@ -66,7 +66,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// Mount an existing LiberFS on `dev` at its newest committed generation. Returns None
 	// if neither superblock slot is a valid LiberFS (an unformatted or foreign disk).
-	pub fn mount(dev: D) -> Option<LiberFs<D>> {
+	pub fn mount(dev: D) -> Result<LiberFs<D>, MountError> {
 		Self::mount_at(dev, true)
 	}
 
@@ -75,7 +75,9 @@ impl<D: BlockDevice> LiberFs<D> {
 	// freshly formatted or single-generation volume has no older snapshot). The handle
 	// is read-only: every mutation is refused, so the generations can never interleave.
 	pub fn mount_snapshot(dev: D) -> Option<LiberFs<D>> {
-		Self::mount_at(dev, false)
+		// An `Option` here on purpose: nothing formats on the strength of this answer, and "there
+		// is no older generation" is the ordinary case rather than a fault to report.
+		Self::mount_at(dev, false).ok()
 	}
 
 	// Mount a named snapshot read-only: the consistent, pinned state captured when the
@@ -83,7 +85,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// `mount_snapshot`, the handle refuses every mutation; the live free map (which
 	// already reserves the snapshot's blocks) is reused unchanged.
 	pub fn mount_named_snapshot(dev: D, name: &[u8]) -> Option<LiberFs<D>> {
-		let mut fs = Self::mount(dev)?;
+		let mut fs = Self::mount(dev).ok()?;
 		let snap = fs.snapshots.iter().find(|s| s.name == name)?.clone();
 		fs.inode_root = snap.inode_root;
 		fs.inode_root_crc = snap.inode_root_crc;
@@ -92,42 +94,73 @@ impl<D: BlockDevice> LiberFs<D> {
 		Some(fs)
 	}
 
-	pub(crate) fn mount_at(mut dev: D, newest: bool) -> Option<LiberFs<D>> {
+	pub(crate) fn mount_at(mut dev: D, newest: bool) -> Result<LiberFs<D>, MountError> {
 		// read and validate both superblock slots.
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		let mut slots: [Option<Superblock>; SUPER_SLOTS as usize] = [None, None];
+		// What the slots turned out to be, so a failure can say which it was. An I/O failure
+		// anywhere outranks everything: a device that did not answer has told us nothing about
+		// what is on it, and "nothing" must never be read as "blank".
+		let mut saw_io = false;
+		let mut saw_ours = false;
+		let mut saw_unsupported = false;
 		for s in 0..SUPER_SLOTS {
-			if dev.read_block(s as u64, &mut buf) {
-				slots[s as usize] = parse_superblock(&buf);
+			if !dev.read_block(s as u64, &mut buf) {
+				saw_io = true;
+				continue;
+			}
+			match read_slot(&buf) {
+				SlotRead::Valid(sb) => {
+					saw_ours = true;
+					slots[s as usize] = Some(sb);
+				}
+				SlotRead::Corrupt => saw_ours = true,
+				SlotRead::Unsupported => {
+					saw_ours = true;
+					saw_unsupported = true;
+				}
+				SlotRead::Unformatted => {}
 			}
 		}
+		// The verdict when no slot is usable, in order of what it costs to be wrong about.
+		let no_slot = || -> MountError {
+			if saw_io {
+				MountError::Io
+			} else if saw_unsupported {
+				MountError::Unsupported
+			} else if saw_ours {
+				MountError::Corrupt
+			} else {
+				MountError::Unformatted
+			}
+		};
 		// order the valid slots by generation: the higher is the live root, the lower
 		// the snapshot.
 		let mut valid: Vec<(u32, u64)> = (0..SUPER_SLOTS).filter_map(|s| slots[s as usize].map(|sb| (s, sb.generation))).collect();
 		valid.sort_by_key(|&(_, g)| g);
 		let (cur_slot, prev_slot) = if newest {
-			let &(cur, _) = valid.last()?;
+			let &(cur, _) = valid.last().ok_or_else(no_slot)?;
 			let prev = valid.iter().rev().nth(1).map(|&(s, _)| s);
 			(cur, prev)
 		} else {
 			// the snapshot: the lower generation, only if there are two.
 			if valid.len() < 2 {
-				return None;
+				return Err(MountError::Unformatted);
 			}
 			(valid[0].0, None)
 		};
 
-		let sb = slots[cur_slot as usize]?;
+		let sb = slots[cur_slot as usize].ok_or(MountError::Corrupt)?;
 		// the medium must actually cover the claimed pool: a checksummed superblock can
 		// still lie about `num_blocks` (hostile authoring), and sizing the free maps or
 		// walking the generations off such a claim means an absurd allocation or reads
 		// past the volume. Probing the last claimed block bounds the claim by the device.
 		if !dev.read_block(sb.num_blocks - 1, &mut buf) {
-			return None;
+			return Err(MountError::DeviceTooSmall);
 		}
 		let (prev_inode_root, prev_inode_root_crc, prev_valid) = match prev_slot {
 			Some(ps) => {
-				let psb = slots[ps as usize]?;
+				let psb = slots[ps as usize].ok_or(MountError::Corrupt)?;
 				(psb.inode_root, psb.inode_root_crc, true)
 			}
 			None => (0, 0, false),
@@ -141,7 +174,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		match fs.load_snapshot_table() {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => fs.read_only = true,
-			Err(_) => return None,
+			Err(_) => return Err(MountError::Io),
 		}
 		// a generation walk that could not complete (an unreadable node, a broken spill
 		// chain) leaves the free map incomplete: degrade to read-only - a read-only
@@ -151,9 +184,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		match fs.derive_free() {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => fs.read_only = true,
-			Err(_) => return None,
+			Err(_) => return Err(MountError::Io),
 		}
-		Some(fs)
+		Ok(fs)
 	}
 
 	// Is this mount read-only (a snapshot mount, or degraded by a corrupt snapshot
@@ -471,24 +504,60 @@ pub(crate) fn serialize_superblock(sb: &Superblock) -> Vec<u8> {
 // or a volume laid down by a build with a different layout or algorithms - which the
 // flags catch instead of a silent mis-parse).
 pub(crate) fn parse_superblock(block: &[u8]) -> Option<Superblock> {
+	match read_slot(block) {
+		SlotRead::Valid(sb) => Some(sb),
+		_ => None,
+	}
+}
+
+// What a superblock slot turned out to be.
+//
+// The distinction exists because the CALLER formats. Collapsing "there is no filesystem here" into
+// the same answer as "this disk did not answer" or "this was written by a build we cannot read"
+// means a transient fault and an unsupported version both look like a blank disk, and the volume
+// is reformatted. Every arm below is a different decision about someone's data.
+pub(crate) enum SlotRead {
+	Valid(Superblock),
+	// No magic: a blank slot, or a disk that is not ours.
+	Unformatted,
+	// Our magic, and a version, block size, feature set or algorithm this build cannot read.
+	Unsupported,
+	// Ours and readable, and it failed its own checks - a torn commit, bit rot, a claim the
+	// layout cannot support.
+	Corrupt,
+}
+
+pub(crate) fn read_slot(block: &[u8]) -> SlotRead {
 	if block.len() < BLOCK_SIZE {
-		return None;
+		return SlotRead::Corrupt;
 	}
 	if block[SB_MAGIC_OFF..SB_MAGIC_OFF + 8] != MAGIC {
-		return None;
+		return SlotRead::Unformatted;
 	}
-	if u32::from_le_bytes(block[SB_VERSION_OFF..SB_VERSION_OFF + 4].try_into().ok()?) != VERSION {
-		return None;
-	}
-	if u32::from_le_bytes(block[SB_BLOCK_SIZE_OFF..SB_BLOCK_SIZE_OFF + 4].try_into().ok()?) != BLOCK_SIZE as u32 {
-		return None;
-	}
-	if u64::from_le_bytes(block[SB_FEATURES_OFF..SB_FEATURES_OFF + 8].try_into().ok()?) != FEATURES {
-		return None;
+	// Past this point the disk IS ours, so nothing below may report it as unformatted.
+	let field = |off: usize, len: usize| -> Option<u64> {
+		match len {
+			4 => block[off..off + 4].try_into().ok().map(|b| u64::from(u32::from_le_bytes(b))),
+			_ => block[off..off + 8].try_into().ok().map(u64::from_le_bytes),
+		}
+	};
+	let (Some(version), Some(block_size), Some(features)) = (field(SB_VERSION_OFF, 4), field(SB_BLOCK_SIZE_OFF, 4), field(SB_FEATURES_OFF, 8)) else {
+		return SlotRead::Corrupt;
+	};
+	if version != u64::from(VERSION) || block_size != BLOCK_SIZE as u64 || features != FEATURES {
+		return SlotRead::Unsupported;
 	}
 	if block[SB_CSUM_ALGO_OFF] != CSUM_ALGO_CRC32C || block[SB_CODEC_OFF] != CODEC_LZ4 {
-		return None;
+		return SlotRead::Unsupported;
 	}
+	match parse_checked(block) {
+		Some(sb) => SlotRead::Valid(sb),
+		None => SlotRead::Corrupt,
+	}
+}
+
+// The rest of the parse, once the slot is known to be ours and readable by this build.
+fn parse_checked(block: &[u8]) -> Option<Superblock> {
 	// verify the self-CRC by recomputing over the block with its CRC bytes zeroed.
 	let stored = u32::from_le_bytes(block[SB_CRC_OFFSET..SB_CRC_OFFSET + 4].try_into().ok()?);
 	let mut probe = block[..BLOCK_SIZE].to_vec();
