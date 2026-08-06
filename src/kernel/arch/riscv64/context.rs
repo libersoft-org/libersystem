@@ -55,7 +55,12 @@ switch_context:
 	fsd     fs9, 22*8(sp)
 	fsd     fs10, 23*8(sp)
 	fsd     fs11, 24*8(sp)
-	sd      sp, 0(a0)            // *old_sp = sp
+	// Release fence, then the store. Same reasoning as the AArch64 port: this slot is
+	// what a waker on another hart spins on, and a plain store could become visible
+	// before the register frame above it - letting that hart resume a half-written
+	// context. `fence rw, w` orders every prior read and write before the store below.
+	fence   rw, w
+	sd      sp, 0(a0)            // *old_sp = sp (release)
 	mv      sp, a1              // load the incoming stack pointer
 	ld      ra,   0*8(sp)
 	ld      s0,   1*8(sp)

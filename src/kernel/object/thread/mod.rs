@@ -137,6 +137,15 @@ impl Thread {
 	}
 
 	// Address of the saved-stack-pointer slot, handed to switch_context.
+	//
+	// The context switch writes this slot from assembly while Rust reads it atomically,
+	// which is only sound because both halves of the pairing are stated and kept: the
+	// assembly store is a RELEASE (`stlr` on AArch64, a `fence rw, w` on RISC-V, and the
+	// architecture's own guarantee on x86-64), and every reader below uses `Acquire`. The
+	// slot is the publication itself - zero means "not parked yet" and a non-zero stack
+	// pointer means "this context is complete and may be resumed" - so a store that could
+	// be seen before the register frame it describes would hand another core a half-written
+	// thread. Any change to either side has to move the other with it.
 	pub fn kstack_ptr_addr(&self) -> *mut u64 {
 		self.kstack_ptr.as_ptr()
 	}

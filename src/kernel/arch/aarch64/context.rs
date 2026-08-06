@@ -36,7 +36,14 @@ switch_context:
 	stp     d12, d13, [sp, #128]
 	stp     d14, d15, [sp, #144]
 	mov     x2, sp
-	str     x2, [x0]        // *old_sp = sp
+	// RELEASE store, and the ordering is the whole point rather than a nicety. This slot
+	// is the parked-thread publication: a waker on another core spins until it reads a
+	// non-zero stack pointer here and then resumes the context those registers describe.
+	// A plain `str` carries no ordering, so that core could observe the pointer before the
+	// register frame stored above it is globally visible - and restore a context that is
+	// half written. `stlr` orders every store above it before this one, which is exactly
+	// the guarantee the reader's acquire load is paired with.
+	stlr    x2, [x0]        // *old_sp = sp (release)
 	mov     sp, x1          // load the incoming stack pointer
 	ldp     x19, x20, [sp, #0]
 	ldp     x21, x22, [sp, #16]

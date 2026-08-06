@@ -1,5 +1,70 @@
 use super::*;
 
+tagged_test!(duplicating_a_handle_is_charged_like_any_other_install, [Process, Syscall]);
+fn duplicating_a_handle_is_charged_like_any_other_install() {
+	// `duplicate` finished with the UNBOUNDED insert, so a process holding one duplicable
+	// handle could pass its handle limit indefinitely just by asking. Worse than the count
+	// itself: other checks bound themselves by "how many handles the caller holds", which
+	// made them bounded by nothing.
+	use crate::object::channel::Channel;
+	use crate::object::domain::Domain;
+	use crate::object::handle::{Handle, HandleError, HandleTable};
+	use crate::object::rights::Rights;
+
+	// a domain whose handle limit is four, so the quota is reached in a few steps.
+	let domain = Domain::new_child(&Domain::root(), u64::MAX, 4, u64::MAX);
+	let mut table = HandleTable::new();
+	table.set_domain(domain);
+	let (channel, _peer) = Channel::create();
+	let first = table.try_insert_object(channel, Rights::ALL, 0).expect("the first handle fits");
+
+	// duplicate until the quota says no, and it must say no rather than growing forever.
+	let mut made = 0;
+	loop {
+		match table.duplicate(first, Rights::ALL) {
+			Ok(_) => {
+				made += 1;
+				assert!(made < 64, "duplicate must stop at the quota, not run away");
+			}
+			Err(HandleError::LimitReached) => break,
+			Err(other) => panic!("unexpected error from duplicate: {other:?}"),
+		}
+	}
+	assert_eq!(made, 3, "one original plus three duplicates fills a limit of four");
+	let _ = table.close(Handle::from_raw(first.raw()));
+}
+
+tagged_test!(the_last_thread_out_is_decided_by_a_counter_not_a_snapshot, [Process, Scheduler]);
+fn the_last_thread_out_is_decided_by_a_counter_not_a_snapshot() {
+	// Whether a thread is the last one out was read from a snapshot of the OTHER live
+	// threads. Two threads exiting at the same time each saw the other, neither called
+	// itself the last, and the process was never finalised - alive forever, with `wait`
+	// never returning and its handles never closing.
+	//
+	// The interleaving that does it cannot be forced from here, so what is tested is the
+	// property that makes it impossible: the decision is a counter, and exactly one caller
+	// gets it however many arrive.
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+
+	extern "C" fn nothing(_: u64) {}
+
+	let space = AddressSpace::create().expect("address space");
+	let process = Process::new(space, crate::object::domain::Domain::root());
+
+	// four threads registered, four exits, exactly one "you were the last".
+	let threads: alloc::vec::Vec<_> = (0..4).map(|_| crate::object::thread::Thread::new(nothing, 0, process.clone())).collect();
+	assert_eq!(threads.len(), 4);
+	let lasts = (0..4).filter(|_| process.thread_exited()).count();
+	assert_eq!(lasts, 1, "exactly one thread may be told it was the last");
+
+	// and it is the final one, not whichever ran first.
+	let process2 = Process::new(AddressSpace::create().expect("address space"), crate::object::domain::Domain::root());
+	let _t: alloc::vec::Vec<_> = (0..2).map(|_| crate::object::thread::Thread::new(nothing, 0, process2.clone())).collect();
+	assert!(!process2.thread_exited(), "the first of two is not the last");
+	assert!(process2.thread_exited(), "the second of two is");
+}
+
 tagged_test!(a_syscall_may_not_ask_the_kernel_for_an_unbounded_allocation, [Syscall, Memory]);
 fn a_syscall_may_not_ask_the_kernel_for_an_unbounded_allocation() {
 	// Every allocation the kernel sizes from a userspace number used to be a plain `vec!`

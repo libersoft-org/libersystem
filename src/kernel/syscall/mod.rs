@@ -1305,6 +1305,9 @@ fn sys_handle_duplicate(handle: u64, rights_bits: u64) -> i64 {
 	match table.duplicate(Handle::from_raw(handle), new_rights) {
 		Ok(h) => h.raw() as i64,
 		Err(HandleError::AccessDenied) => ERR_ACCESS_DENIED,
+		// A full quota is not a bad handle, and saying so is the difference between a
+		// caller that can back off and one that thinks it was given a broken handle.
+		Err(HandleError::LimitReached) => ERR_RESOURCE_EXHAUSTED,
 		Err(_) => ERR_BAD_HANDLE,
 	}
 }

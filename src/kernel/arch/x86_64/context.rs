@@ -36,6 +36,10 @@ global_asm!(
 	"and rsp, -16",
 	"fxsave64 [rsp]",
 	"mov [rsp + 512], rax",
+	// *old_sp = sp, and this is the parked-thread publication a waker on another core
+	// spins on. A plain store suffices HERE and only here: x86-64 is total-store-ordered,
+	// so every store above this one is already globally visible before it. The AArch64 and
+	// RISC-V ports carry an explicit release at the same instruction, because they are not.
 	"mov [rdi], rsp",
 	"mov rsp, rsi",
 	"fxrstor64 [rsp]",

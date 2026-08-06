@@ -63,6 +63,10 @@ pub struct Process {
 	// threads exit differently has one answer, and it is the one that arrived first.
 	exit_status: AtomicU64,
 	exit_status_set: AtomicBool,
+	// Who gets to write the status, kept apart from whether one is READABLE. One flag
+	// cannot do both: it has to be claimed before the value is written and published
+	// after, and those are opposite orders.
+	exit_status_claimed: AtomicBool,
 	// Physical frames backing this process's user image and stack. The address
 	// space frees only its page-table structure, not the leaf frames its entries
 	// point at, so the Process owns those frames and frees them on drop. Empty for
@@ -72,6 +76,10 @@ pub struct Process {
 	// alive). Signal delivery wakes each so a blocked thread observes a kill / stop at
 	// its next scheduling point.
 	threads: SpinLock<Vec<Weak<Thread>>>,
+	// How many threads of this process have been registered and not yet reported exiting.
+	// The `threads` vector answers "which threads exist to signal"; this answers "am I the
+	// last one out", which is a different question and cannot be read off a snapshot.
+	live_thread_count: AtomicUsize,
 	// Set while the process is suspended (SIGSTOP); its threads park at their next
 	// scheduling point until resumed (SIGCONT).
 	stopped: AtomicBool,
@@ -109,7 +117,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), live_thread_count: AtomicUsize::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it.
 		process.domain.register_process(&process);
 		process
@@ -195,8 +203,16 @@ impl Process {
 	// Latch the status a clean exit reported. First writer wins; later callers are ignored
 	// rather than overwriting, so the answer a waiter reads never changes once it exists.
 	pub fn set_exit_status(&self, status: u64) {
-		if !self.exit_status_set.swap(true, Ordering::AcqRel) {
-			self.exit_status.store(status, Ordering::Release);
+		// The value first, THEN the flag that says there is one. It was the other way
+		// round, so a reader that saw the flag could still read the old status - zero, for
+		// every process that had not exited before - and report a clean exit for a value
+		// that had not been written yet.
+		//
+		// The swap still decides who writes (first writer wins), and the store beneath it
+		// is what the release below publishes.
+		if !self.exit_status_claimed.swap(true, Ordering::AcqRel) {
+			self.exit_status.store(status, Ordering::Relaxed);
+			self.exit_status_set.store(true, Ordering::Release);
 		}
 	}
 
@@ -249,7 +265,21 @@ impl Process {
 	// Record a thread as belonging to this process (a weak forward link), so signal
 	// delivery can reach it. Called as the thread is built.
 	pub fn register_thread(&self, thread: &Arc<Thread>) {
+		self.live_thread_count.fetch_add(1, Ordering::AcqRel);
 		self.threads.lock().push(Arc::downgrade(thread));
+	}
+
+	// One thread of this process has finished. Returns true for the thread that was the
+	// LAST one, exactly once, whichever order they arrive in.
+	//
+	// The scheduler used to decide this by counting the other live threads in a snapshot:
+	// two last threads exiting at the same time each saw the other, neither called itself
+	// the last, and neither finalised the process. It then stayed formally alive forever -
+	// `wait` never returning, handles never closing, peers never seeing `PeerClosed`,
+	// quotas never released. A snapshot cannot answer a question about the moment after
+	// it was taken; a counter can.
+	pub fn thread_exited(&self) -> bool {
+		self.live_thread_count.fetch_sub(1, Ordering::AcqRel) == 1
 	}
 
 	// This process's currently-live threads, pruning any that have been dropped.

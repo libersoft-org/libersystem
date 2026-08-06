@@ -83,8 +83,24 @@ impl ResourceCounter {
 	// must always succeed (e.g. installing a transferred capability) but still
 	// keep the count exact; the limit is enforced at the create boundaries.
 	fn charge(&self, amount: u64) {
-		let next = self.used.fetch_add(amount, Ordering::AcqRel).saturating_add(amount);
-		self.peak.fetch_max(next, Ordering::AcqRel);
+		// Saturating in the ATOMIC, not only in the value computed from it. `fetch_add`
+		// wraps, and the `saturating_add` beneath it only saturated the number used for
+		// the peak - so a counter driven past u64::MAX came back as a small number and
+		// every limit derived from it was suddenly satisfied.
+		//
+		// A compare-exchange loop because there is no saturating fetch: read, saturate,
+		// swap, retry if someone got there first.
+		let mut current = self.used.load(Ordering::Acquire);
+		loop {
+			let next = current.saturating_add(amount);
+			match self.used.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+				Ok(_) => {
+					self.peak.fetch_max(next, Ordering::AcqRel);
+					return;
+				}
+				Err(seen) => current = seen,
+			}
+		}
 	}
 
 	fn observe_peak(&self) {

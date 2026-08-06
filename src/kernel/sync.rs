@@ -11,6 +11,7 @@
 // it interrupted. Nested locks restore correctly (only the outermost re-enables).
 #![allow(dead_code)]
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,14 +44,14 @@ impl<T> SpinLock<T> {
 				core::hint::spin_loop();
 			}
 		}
-		SpinLockGuard { lock: self, was_enabled }
+		SpinLockGuard { lock: self, was_enabled, _not_send: PhantomData }
 	}
 
 	pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
 		let was_enabled = arch::interrupts_enabled();
 		arch::disable_interrupts();
 		if self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-			Some(SpinLockGuard { lock: self, was_enabled })
+			Some(SpinLockGuard { lock: self, was_enabled, _not_send: PhantomData })
 		} else {
 			// Acquisition failed: restore the interrupt state we just disabled.
 			if was_enabled {
@@ -65,6 +66,15 @@ pub struct SpinLockGuard<'a, T> {
 	lock: &'a SpinLock<T>,
 	// Whether interrupts were enabled when this lock was taken; restored on drop.
 	was_enabled: bool,
+	// Pins the guard to the CPU that took the lock.
+	//
+	// It held only a reference and a bool, which made it automatically `Send` whenever the
+	// lock is `Sync` - and its `Drop` restores the interrupt state of whichever CPU runs
+	// the drop. Handing a guard to another core therefore re-enables interrupts on the
+	// wrong one and leaves the original with them off, permanently, with nothing to point
+	// at afterwards. A raw pointer is the standard way to say "this value does not cross
+	// cores"; nothing is ever read through it.
+	_not_send: PhantomData<*const ()>,
 }
 
 impl<T> Deref for SpinLockGuard<'_, T> {

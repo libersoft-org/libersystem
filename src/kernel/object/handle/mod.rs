@@ -23,6 +23,10 @@ pub enum HandleError {
 	WrongType,
 	AccessDenied,
 	Revoked,
+	// The Domain's handle quota is full. Distinct from AccessDenied on purpose: the
+	// caller had the right and the resource was not there, which is a different thing to
+	// tell an operator and a different thing for a caller to retry.
+	LimitReached,
 }
 
 // Opaque per-process handle: packs (slot generation, slot index).
@@ -230,21 +234,36 @@ impl HandleTable {
 		Ok(cap.object.clone())
 	}
 
+	// The capability behind a handle, checked the way `lookup` checks it: the slot must
+	// match its generation AND the object must not have been revoked.
+	//
+	// `cap_of` alone answers only the first, and the introspection accessors used it
+	// directly - so a revoked handle still reported its rights and its badge, and still
+	// appeared alive in the System Graph. One validation, used by everything, is the only
+	// way those two answers stay the same answer.
+	fn live_cap_of(&self, handle: Handle) -> Result<&Capability, HandleError> {
+		let cap = self.cap_of(handle)?;
+		if !cap.is_valid() {
+			return Err(HandleError::Revoked);
+		}
+		Ok(cap)
+	}
+
 	// Inspect the rights a handle carries (a get_info-style query).
 	pub fn rights_of(&self, handle: Handle) -> Result<Rights, HandleError> {
-		Ok(self.cap_of(handle)?.rights)
+		Ok(self.live_cap_of(handle)?.rights)
 	}
 
 	// Inspect the badge a handle carries (stamped onto messages it sends).
 	pub fn badge_of(&self, handle: Handle) -> Result<u64, HandleError> {
-		Ok(self.cap_of(handle)?.badge)
+		Ok(self.live_cap_of(handle)?.badge)
 	}
 
 	// Introspect a handle: the identity, type, rights, and badge behind it. Like
 	// rights_of/badge_of this is a get_info-style query; it underlies the
 	// object_info_get syscall. Returns None for a bad or stale handle.
 	pub fn info(&self, handle: Handle) -> Option<HandleInfo> {
-		let cap = self.cap_of(handle).ok()?;
+		let cap = self.live_cap_of(handle).ok()?;
 		Some(HandleInfo::from_cap(cap))
 	}
 
@@ -254,6 +273,11 @@ impl HandleTable {
 		let mut out = Vec::new();
 		for slot in &self.slots {
 			if let Some(cap) = &slot.cap {
+				// a revoked capability is not an entry of this table any more, however
+				// intact its slot looks - the System Graph showed them as live.
+				if !cap.is_valid() {
+					continue;
+				}
 				out.push(HandleInfo::from_cap(cap));
 			}
 		}
@@ -276,7 +300,11 @@ impl HandleTable {
 			}
 			(cap.object.clone(), cap.badge)
 		};
-		Ok(self.insert(Capability::new(object, new_rights, badge)))
+		// Through the QUOTA, like every other user-reachable install. This was the
+		// unbounded `insert`, so a process holding one duplicable handle could pass
+		// `PROP_HANDLE_LIMIT` indefinitely by asking - and other checks that bound
+		// themselves by "how many handles the caller holds" were bounded by nothing.
+		self.try_insert(Capability::new(object, new_rights, badge)).ok_or(HandleError::LimitReached)
 	}
 
 	// Close a handle: drop its capability (releasing one object reference) and

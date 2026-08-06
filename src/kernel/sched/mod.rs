@@ -290,10 +290,11 @@ pub fn exit() -> ! {
 	// refunded.
 	{
 		if let Some(thread) = current_thread() {
-			let process = thread.process();
-			let others = process.live_threads().iter().filter(|t: &&Arc<Thread>| !Arc::ptr_eq(t, &thread)).count();
-			if others == 0 {
-				process.mark_exited();
+			// Exactly one thread gets `true` here, whichever order they arrive in - see
+			// `thread_exited`. This was a snapshot count of the OTHER live threads, which
+			// two threads exiting together both read as non-zero.
+			if thread.process().thread_exited() {
+				thread.process().mark_exited();
 			}
 		}
 	}
