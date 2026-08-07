@@ -1104,28 +1104,38 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 	};
 	// Move the bootstrap capability (if any) into the child, recording the handle
 	// value the child will see, so the kernel can wire it into the thread's rdi.
+	// TAKE the bootstrap - a transfer moves the capability, and the caller's handle dies
+	// with the take rather than being closed afterwards by a call whose failure was
+	// discarded.
 	let child_bootstrap = if bootstrap_handle != 0 {
-		let cap = {
-			let table = thread.handles().lock();
-			let xobject = match table.lookup(Handle::from_raw(bootstrap_handle), Rights::TRANSFER) {
-				Ok(o) => o,
-				Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
-				Err(_) => return ERR_BAD_HANDLE,
-			};
-			let rights = table.rights_of(Handle::from_raw(bootstrap_handle)).unwrap_or(Rights::NONE);
-			let badge = table.badge_of(Handle::from_raw(bootstrap_handle)).unwrap_or(0);
-			Capability::new(xobject, rights, badge)
+		let cap = match thread.handles().lock().take(Handle::from_raw(bootstrap_handle), Rights::TRANSFER) {
+			Ok(cap) => cap,
+			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+			Err(_) => return ERR_BAD_HANDLE,
 		};
-		let child_handle = process.handles().lock().insert(cap).raw();
-		// The capability now lives in the child: consume the caller's handle.
-		let _ = thread.handles().lock().close(Handle::from_raw(bootstrap_handle));
-		child_handle
+		match process.handles().lock().try_insert(cap) {
+			Some(handle) => handle.raw(),
+			None => return ERR_RESOURCE_EXHAUSTED,
+		}
 	} else {
 		0
 	};
+	// And if the THREAD cannot be made, the capability goes back where it came from.
+	//
+	// It used to be left in the child: moved in, closed in the caller, and only then was
+	// the thread created - so a thread quota or a stack allocation that failed left the
+	// capability sitting in a process with no thread to receive its handle, and gone from
+	// the caller that owned it. Neither party had it and nothing said so.
 	let new_thread = match loader::create_user_thread(&process, entry, stack_top, child_bootstrap) {
 		Some(t) => t,
-		None => return ERR_RESOURCE_EXHAUSTED,
+		None => {
+			if child_bootstrap != 0 {
+				if let Ok(cap) = process.handles().lock().take(Handle::from_raw(child_bootstrap), Rights::NONE) {
+					thread.handles().lock().put_back(cap);
+				}
+			}
+			return ERR_RESOURCE_EXHAUSTED;
+		}
 	};
 	install_object(&thread, new_thread, Rights::ALL, 0)
 }
@@ -1598,14 +1608,30 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 		Ok(c) => c,
 		Err(e) => return e,
 	};
+	// Look BEFORE taking. A message that cannot be delivered must stay in the queue, so
+	// the caller can come back with a bigger buffer or after closing some handles - taking
+	// it first and then reporting the problem destroyed a message nobody could retry.
+	let (payload, cap_count) = match channel.peek_shape() {
+		Ok(shape) => shape,
+		Err(ChannelError::PeerClosed) => return ERR_PEER_CLOSED,
+		Err(_) => return ERR_WOULD_BLOCK,
+	};
+	if payload > bytes_cap as usize {
+		return ERR_INVALID;
+	}
+	// And room for every capability it carries, reserved up front. Installing a prefix and
+	// dropping the rest is the same loss one message at a time.
+	{
+		let mut table = thread.handles().lock();
+		if !table.reserve(cap_count) {
+			return ERR_RESOURCE_EXHAUSTED;
+		}
+	}
 	let message = match channel.recv() {
 		Ok(m) => m,
 		Err(ChannelError::PeerClosed) => return ERR_PEER_CLOSED,
 		Err(_) => return ERR_WOULD_BLOCK,
 	};
-	if message.bytes.len() > bytes_cap as usize {
-		return ERR_INVALID;
-	}
 	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(message.bytes.as_ptr(), bytes_ptr as *mut u8, message.bytes.len());
 	});
@@ -1613,16 +1639,14 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 	{
 		let mut table = thread.handles().lock();
 		for cap in message.caps.into_iter().take(abi::MAX_MESSAGE_CAPS) {
-			match table.try_insert(cap) {
-				Some(handle) => {
-					write_user(caps_ptr + ((installed + 1) * 8) as u64, handle.raw());
-					installed += 1;
-				}
-				// The table is full: stop rather than lose the rest silently. What was
-				// installed is reported, and the caller sees fewer than it expected.
-				None => break,
-			}
+			// against the reservation taken above -  would charge the quota a
+			// second time for a handle already paid for.
+			let handle = table.insert_reserved(cap);
+			write_user(caps_ptr + ((installed + 1) * 8) as u64, handle.raw());
+			installed += 1;
 		}
+		// give back whatever the reservation covered and the message did not use.
+		table.release_reservation(cap_count.saturating_sub(installed));
 	}
 	write_user(caps_ptr, installed as u64);
 	thread.process().record_recv();

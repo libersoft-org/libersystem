@@ -204,6 +204,36 @@ impl HandleTable {
 
 	// Install a capability, enforcing the Domain's handle quota. Returns None
 	// (charging nothing) if the table's Domain is at its handle cap.
+	// Reserve room for `count` more handles, or refuse. Charges the quota up front so a
+	// later `insert` cannot be refused for space - which is what lets a receive know it can
+	// deliver a whole message before it takes it out of the queue.
+	pub fn reserve(&mut self, count: usize) -> bool {
+		let Some(domain) = &self.domain else {
+			return true;
+		};
+		for taken in 0..count {
+			if !domain.try_charge_handle() {
+				domain.uncharge_handles(taken as u64);
+				return false;
+			}
+		}
+		true
+	}
+
+	// Install a capability against a reservation already taken by `reserve`. Charges
+	// nothing: the quota for this handle was paid when the room was booked, and charging
+	// again here would bill twice for one handle.
+	pub fn insert_reserved(&mut self, cap: Capability) -> Handle {
+		self.place(cap)
+	}
+
+	// Give back part of a reservation that was not used.
+	pub fn release_reservation(&mut self, count: usize) {
+		if let Some(domain) = &self.domain {
+			domain.uncharge_handles(count as u64);
+		}
+	}
+
 	pub fn try_insert(&mut self, cap: Capability) -> Option<Handle> {
 		if let Some(domain) = &self.domain {
 			if !domain.try_charge_handle() {

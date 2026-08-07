@@ -291,6 +291,16 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 	let rsdp = (hhdm + rsdp_phys) as *const u8;
 	// RSDP: revision at offset 15; RSDT (u32) at 16 for revision 0/1, XSDT (u64) at
 	// 24 for revision 2+.
+	// The RSDP has its own checksum over its first 20 bytes (and revision 2+ extends it,
+	// which is not checked here - the first 20 cover the pointers this code reads).
+	let mut sum: u8 = 0;
+	for i in 0..20 {
+		sum = sum.wrapping_add(unsafe { *rsdp.add(i) });
+	}
+	if sum != 0 {
+		crate::serial_println!("smp: the ACPI RSDP failed its checksum; running single-core");
+		return out;
+	}
 	let revision = unsafe { *rsdp.add(15) };
 	let madt = if revision >= 2 {
 		let xsdt = unsafe { core::ptr::read_unaligned(rsdp.add(24) as *const u64) };
@@ -304,6 +314,34 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 	};
 	parse_madt(hhdm, madt, &mut out);
 	out
+}
+
+// Does the ACPI table at `phys` pass its own checksum, and is its length sane?
+//
+// Firmware tables were read on trust: a signature match and a minimum length, then the
+// entries were walked. A damaged or hostile table can name a length that sends the walk
+// off the end of the direct map, and ACPI's own answer to "is this table intact" - the
+// bytes of the table sum to zero mod 256 - was never asked.
+//
+// This does not make firmware trustworthy; it makes a corrupt table fail as a corrupt
+// table rather than as a wild read.
+fn table_ok(hhdm: u64, phys: u64) -> bool {
+	if phys == 0 {
+		return false;
+	}
+	let len = table_length(hhdm, phys) as usize;
+	// The header alone is 36 bytes; a table claiming less is not one. The ceiling is a
+	// sanity bound - no real ACPI table is megabytes - and it is what stops a bad length
+	// turning into a long walk through unmapped memory.
+	if !(36..=1024 * 1024).contains(&len) {
+		return false;
+	}
+	let base = (hhdm + phys) as *const u8;
+	let mut sum: u8 = 0;
+	for i in 0..len {
+		sum = sum.wrapping_add(unsafe { *base.add(i) });
+	}
+	sum == 0
 }
 
 // The 4-byte signature of the ACPI table at physical `phys` (read via the HHDM).
@@ -323,16 +361,18 @@ fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize) -> Option<u64> {
 	if sdt_phys == 0 {
 		return None;
 	}
-	let len = table_length(hhdm, sdt_phys) as usize;
-	if len < 36 {
+	if !table_ok(hhdm, sdt_phys) {
+		crate::serial_println!("smp: the ACPI root table failed its own checksum; not walking it");
 		return None;
 	}
+	let len = table_length(hhdm, sdt_phys) as usize;
 	let base = (hhdm + sdt_phys + 36) as *const u8;
 	let count = (len - 36) / ptr_size;
 	for i in 0..count {
 		let entry = unsafe { base.add(i * ptr_size) };
 		let phys = if ptr_size == 8 { unsafe { core::ptr::read_unaligned(entry as *const u64) } } else { unsafe { core::ptr::read_unaligned(entry as *const u32) as u64 } };
-		if table_signature(hhdm, phys) == *b"APIC" {
+		// the signature says what it claims to be; the checksum says whether to believe it.
+		if phys != 0 && table_signature(hhdm, phys) == *b"APIC" && table_ok(hhdm, phys) {
 			return Some(phys);
 		}
 	}

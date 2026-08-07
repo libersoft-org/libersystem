@@ -32,6 +32,10 @@ use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
 
+// How many free runs the heap-backed table can hold. Reserved once and never grown - see
+// `upgrade_to_heap`. Sized well past what a healthy pool fragments into.
+const MAX_RUNS: usize = 8192;
+
 pub const PAGE_SIZE: u64 = 4096;
 
 // The most disjoint free runs the pre-heap seed table holds: enough for one run
@@ -94,6 +98,12 @@ impl FrameAllocator {
 	fn insert_at(&mut self, at: usize, run: Run) -> bool {
 		match &mut self.heap {
 			Some(v) => {
+				// never grows: the capacity was reserved once, outside this lock. A table
+				// at capacity refuses rather than allocating from the heap it feeds.
+				if v.len() == v.capacity() {
+					crate::serial_println!("frame: run table full ({} runs); a freed span is not being tracked", v.len());
+					return false;
+				}
 				v.insert(at, run);
 				true
 			}
@@ -236,11 +246,29 @@ pub fn init(regions: &[MemRegion]) {
 // while the frame lock is held cannot re-enter this allocator - the kernel heap
 // never allocates frames at runtime (its window is mapped once at boot).
 pub fn upgrade_to_heap() {
+	// The capacity is reserved ONCE, here, outside the allocator lock, and the table never
+	// grows again. That is what breaks the cycle: `insert_at` running under the frame lock
+	// used to be able to grow this `Vec`, which calls the global allocator, whose `grow`
+	// calls `frame::allocate` - straight back into the lock this thread already holds.
+	//
+	// The comment on this module said the heap "never allocates frames at runtime", and
+	// `heap::grow` is reached from `alloc` whenever a request does not fit, so it was not
+	// true. Rather than argue about when the heap grows, the table simply stops being able
+	// to ask.
+	//
+	// MAX_RUNS bounds fragmentation, not memory: a run is a contiguous free span, and a
+	// pool splintered into more spans than this is one where something else has already
+	// gone wrong. `insert_at` refuses past it and says so, which loses a run rather than
+	// deadlocking the machine.
 	let mut allocator = ALLOCATOR.lock();
 	if allocator.heap.is_some() {
 		return;
 	}
-	let mut runs = Vec::with_capacity((allocator.seed_len * 2).max(64));
+	let mut runs = Vec::new();
+	if runs.try_reserve_exact(MAX_RUNS).is_err() {
+		crate::serial_println!("frame: could not reserve the run table; staying on the seed table");
+		return;
+	}
 	runs.extend_from_slice(&allocator.seed[..allocator.seed_len]);
 	allocator.heap = Some(runs);
 }

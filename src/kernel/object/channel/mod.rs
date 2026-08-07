@@ -212,8 +212,19 @@ impl Channel {
 	// The byte length of the next pending message without dequeuing it, so a
 	// receiver can size its buffer exactly before the recv.
 	pub fn peek_len(&self) -> Result<usize, ChannelError> {
+		self.peek_shape().map(|(bytes, _)| bytes)
+	}
+
+	// The next message's payload size AND capability count, without taking it.
+	//
+	// A receive that dequeues first and only then discovers it cannot deliver has already
+	// destroyed the message: a buffer one byte too small, or a handle table with no room
+	// for the capabilities, and the message is gone with an error returned. A caller
+	// cannot retry what no longer exists. Both numbers have to be knowable BEFORE the
+	// message leaves the queue.
+	pub fn peek_shape(&self) -> Result<(usize, usize), ChannelError> {
 		if let Some(msg) = self.inbox.lock().front() {
-			return Ok(msg.bytes.len());
+			return Ok((msg.bytes.len(), msg.caps.len()));
 		}
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
 	}
