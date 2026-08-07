@@ -1154,3 +1154,145 @@ fn channel_capability_transfer_is_zero_copy() {
 	assert_eq!(MARKER.load(Ordering::SeqCst), 0xa5a5_0000_5a5a_1111);
 	assert_eq!(NOTE_LEN.load(Ordering::SeqCst), 3);
 }
+
+// Create a channel pair through the syscall, returning both endpoint handles. `depth` bounds
+// the queue, which is what lets a test arrange a send that must be refused.
+unsafe fn channel_pair(depth: u64) -> (u64, u64) {
+	let mut first = 0u64;
+	let mut second = 0u64;
+	let result = unsafe { arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut first as *mut u64 as u64, &mut second as *mut u64 as u64, depth, 0) };
+	assert_eq!(result as i64, 0, "channel_create");
+	(first, second)
+}
+
+// Does `handle` still name anything in the caller's table? Asked with OBJECT_INFO_GET, which
+// requires `Rights::NONE` and so answers exactly this and nothing else. `CHANNEL_PEEK` looks
+// like the natural probe and is not: it reports WOULD_BLOCK for a live endpoint with an empty
+// queue, which is every endpoint here. `HANDLE_DUPLICATE` is not it either - it needs the
+// DUPLICATE right, so it answers a question about rights rather than about existence.
+unsafe fn handle_is_live(handle: u64) -> bool {
+	let mut info = [0u8; 256];
+	assert!(info.len() >= core::mem::size_of::<syscall::ObjectInfo>(), "the info buffer must fit an ObjectInfo");
+	!syscall::sys_is_err(unsafe { arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, handle, info.as_mut_ptr() as u64, info.len() as u64, 0) })
+}
+
+// How many handles the calling thread's process holds. Read from the table rather than by
+// probing values: a handle packs a generation above its index, so the raw numbers are large
+// and sparse and there is no range to scan. The absolute count depends on what the thread was
+// seeded with, so it is only ever compared against itself.
+fn live_handle_count() -> u64 {
+	sched::current_thread().expect("a current thread").process().handle_count()
+}
+
+tagged_test!(a_refused_capability_send_leaves_every_handle_with_the_sender, [Process, Syscall, Ipc]);
+fn a_refused_capability_send_leaves_every_handle_with_the_sender() {
+	// A batch transfer is all-or-nothing in BOTH directions, and the second direction is the
+	// one with nowhere to put a mistake. Taking every handle under one lock is the easy half;
+	// what happens when the send THEN fails - a full queue, a closed peer - decides whether the
+	// caller still owns what it tried to give away. Losing them there is an unrecoverable loss
+	// of authority, and leaving them taken-but-not-sent is the same thing with the objects
+	// still alive.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			// A transport one message deep, filled, so the capability send onto it must fail.
+			let (transport, _peer) = channel_pair(1);
+			let payload = [0u8; 8];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, transport, payload.as_ptr() as u64, payload.len() as u64, 0) as i64, 0, "the first message fills the queue");
+			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, transport, payload.as_ptr() as u64, payload.len() as u64, 0)), "the second must be refused");
+
+			let (carried_a, _a) = channel_pair(4);
+			let (carried_b, _b) = channel_pair(4);
+			let (carried_c, _c) = channel_pair(4);
+			let request = [3u64, carried_a, carried_b, carried_c];
+			let before = live_handle_count();
+			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS, transport, payload.as_ptr() as u64, payload.len() as u64, request.as_ptr() as u64)), "a capability send onto a full queue must be refused");
+
+			// The capabilities come back under NEW handles - their old slots died when they
+			// were taken, which is the honest outcome of a move that had to be undone - so
+			// the old values must be dead and three others must have appeared in their place.
+			for handle in [carried_a, carried_b, carried_c] {
+				assert!(!handle_is_live(handle), "the handle a refused send took must not still name anything");
+			}
+			assert_eq!(live_handle_count(), before, "a refused send must leave the sender exactly the capabilities it had");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the transfer thread ran to completion");
+}
+
+tagged_test!(a_receiver_too_small_for_a_message_keeps_it_queued, [Process, Syscall, Ipc]);
+fn a_receiver_too_small_for_a_message_keeps_it_queued() {
+	// A message that cannot be delivered has to stay deliverable. Taking it off the queue and
+	// then reporting that the buffer was too small destroys a message nobody can retry - and
+	// the caller that would have retried with a bigger buffer has nothing left to retry for.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let (sender, receiver) = channel_pair(4);
+			let (carried, _peer) = channel_pair(4);
+			let payload = [0xABu8; 64];
+			let request = [1u64, carried];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS, sender, payload.as_ptr() as u64, payload.len() as u64, request.as_ptr() as u64) as i64, 0, "the capability send succeeds");
+
+			// Too small, twice: the second attempt is what proves the first did not consume
+			// the message.
+			let mut small = [0u8; 8];
+			let mut caps_out = [0u64; abi::MAX_MESSAGE_CAPS + 1];
+			for attempt in 0..2 {
+				assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, receiver, small.as_mut_ptr() as u64, small.len() as u64, caps_out.as_mut_ptr() as u64)), "attempt {attempt} with an 8-byte buffer must be refused");
+			}
+
+			// And a big enough buffer still gets the whole thing, capability included.
+			let mut big = [0u8; 64];
+			assert!(!syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, receiver, big.as_mut_ptr() as u64, big.len() as u64, caps_out.as_mut_ptr() as u64)), "a buffer the message fits must receive it");
+			assert_eq!(big, payload, "the payload survived the two refusals intact");
+			assert_eq!(caps_out[0], 1, "the capability came with it");
+			assert!(handle_is_live(caps_out[1]), "and it arrived as a live capability");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
+}
+
+tagged_test!(a_batch_naming_one_handle_twice_is_refused_whole, [Process, Syscall, Ipc]);
+fn a_batch_naming_one_handle_twice_is_refused_whole() {
+	// The duplication that needs no race: name the same handle twice in one batch, and a
+	// transfer that clones each entry independently mints a second capability without the
+	// DUPLICATE right. Refused through the syscall here rather than on the predicate alone -
+	// this thread has a handle table, so the whole path runs.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let (transport, _peer) = channel_pair(8);
+			let (carried, _a) = channel_pair(4);
+			let (other, _b) = channel_pair(4);
+			let payload = [0u8; 4];
+			for request in [[2u64, carried, carried, 0], [3, carried, other, carried]] {
+				assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS, transport, payload.as_ptr() as u64, payload.len() as u64, request.as_ptr() as u64)), "a batch naming one handle twice must be refused");
+			}
+			// And refused WHOLE: both handles still work, so nothing was taken on the way to
+			// the refusal.
+			for handle in [carried, other] {
+				assert!(handle_is_live(handle), "a refused batch must leave every handle it named");
+			}
+			// A batch of distinct handles goes through, so the refusal is about the repeat and
+			// not about the call.
+			let request = [2u64, carried, other, 0];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS, transport, payload.as_ptr() as u64, payload.len() as u64, request.as_ptr() as u64) as i64, 0, "distinct handles transfer");
+			assert!(!handle_is_live(carried), "and that batch DID take them");
+			assert!(!handle_is_live(other));
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the batch thread ran to completion");
+}
