@@ -1387,3 +1387,68 @@ fn a_terminating_process_takes_no_new_mappings() {
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the termination thread ran to completion");
 }
+
+tagged_test!(a_timer_armed_after_the_wait_began_still_wakes_it, [Object, Scheduler, Syscall]);
+fn a_timer_armed_after_the_wait_began_still_wakes_it() {
+	// Waiting on a timer that is not armed yet is an ordinary thing to do - the waiter and the
+	// arming thread are two independent components - and the waiter has nothing to re-check
+	// until somebody tells it to look. Readiness published without a wake is readiness nobody
+	// arrives to see, and the thread stays parked for the life of the system.
+	//
+	// The parking is established rather than assumed: the waiter is run to the point where it
+	// has actually blocked, and that is asserted, before the timer is armed at all.
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	static WOKE: AtomicBool = AtomicBool::new(false);
+	static RESULT: AtomicU64 = AtomicU64::new(u64::MAX);
+	extern "C" fn waiter(handle: u64) {
+		// deadline 0 = no timeout of its own, so the ONLY thing that can end this wait is the
+		// timer being armed and reaching its deadline.
+		let result = unsafe { arch::syscall::invoke(syscall::SYS_WAIT, handle, 0, 0, 0) };
+		RESULT.store(result, Ordering::SeqCst);
+		WOKE.store(true, Ordering::SeqCst);
+	}
+
+	WOKE.store(false, Ordering::SeqCst);
+	RESULT.store(u64::MAX, Ordering::SeqCst);
+	let timer = object::timer::Timer::create();
+	let thread = sched::spawn_with_object(waiter, timer.clone(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(!WOKE.load(Ordering::SeqCst), "the waiter must not return while the timer is unarmed");
+	assert_eq!(thread.state(), object::thread::ThreadState::Blocked, "the waiter must be parked, not spinning - otherwise this proves nothing about the wake");
+
+	// Arm it, with a deadline already reached, so the wake is the only thing that can be late.
+	timer.set(arch::apic::ticks());
+	sched::run_until_idle();
+	assert!(WOKE.load(Ordering::SeqCst), "arming a timer must wake a thread already waiting on it");
+	assert_eq!(RESULT.load(Ordering::SeqCst), 0, "the wait should report readiness, not a timeout");
+}
+
+tagged_test!(wait_any_on_only_a_timer_returns_when_it_fires, [Object, Scheduler, Syscall]);
+fn wait_any_on_only_a_timer_returns_when_it_fires() {
+	// The same case through `WAIT_ANY`, which derives its block deadline from the set rather
+	// than from one object. A set whose only member is an unarmed timer, with no external
+	// timeout, has nothing to time out ON - so a waiter that did not get a wake on arming
+	// would park forever with no deadline to rescue it.
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	static WOKE: AtomicBool = AtomicBool::new(false);
+	static RESULT: AtomicU64 = AtomicU64::new(u64::MAX);
+	extern "C" fn waiter(handle: u64) {
+		let handles = [handle];
+		let result = unsafe { arch::syscall::invoke(syscall::SYS_WAIT_ANY, handles.as_ptr() as u64, 1, 0, 0) };
+		RESULT.store(result, Ordering::SeqCst);
+		WOKE.store(true, Ordering::SeqCst);
+	}
+
+	WOKE.store(false, Ordering::SeqCst);
+	RESULT.store(u64::MAX, Ordering::SeqCst);
+	let timer = object::timer::Timer::create();
+	let thread = sched::spawn_with_object(waiter, timer.clone(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(!WOKE.load(Ordering::SeqCst), "the waiter must not return while the timer is unarmed");
+	assert_eq!(thread.state(), object::thread::ThreadState::Blocked, "the waiter must be parked");
+
+	timer.set(arch::apic::ticks());
+	sched::run_until_idle();
+	assert!(WOKE.load(Ordering::SeqCst), "wait_any over a lone timer must return when it is armed");
+	assert_eq!(RESULT.load(Ordering::SeqCst), 0, "it should report index 0 - the handle that became ready");
+}
