@@ -470,3 +470,178 @@ fn the_crc32_is_the_one_uefi_specifies() {
 	assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
 	assert_eq!(crc32(b"The quick brown fox jumps over the lazy dog"), 0x414F_A339);
 }
+
+// The non-zero bytes of a GPT that `sgdisk` actually wrote, recorded from an image built with
+// the exact commands `src/boot/mkimage.sh` uses for an installed system: a 256 MiB disk, a
+// 32 MiB EFI System Partition, and the rest a LiberFS partition. Sparse, because the table is -
+// the whole of it is about three hundred non-zero bytes.
+//
+// This is the one fixture here that a mistake SHARED between the builder above and the parser
+// under test cannot survive: nothing in it came from this crate. If the CRC convention, a field
+// offset or the entry-array layout were wrong in the same way on both sides, every other test in
+// this file would still pass and this one would not.
+const SGDISK_MBR: (u64, &[(usize, &[u8])]) = (0, &[(448, &[0x02, 0x00, 0xEE, 0xA2, 0x02, 0x20, 0x01]), (458, &[0xFF, 0xFF, 0x07]), (510, &[0x55, 0xAA])]);
+const SGDISK_PRIMARY: (u64, &[(usize, &[u8])]) = (
+	1,
+	&[
+		(0, &[0x45, 0x46, 0x49, 0x20, 0x50, 0x41, 0x52, 0x54]),
+		(10, &[0x01, 0x00, 0x5C]),
+		(16, &[0x21, 0xC1, 0xEB, 0xAC]),
+		(24, &[0x01]),
+		(32, &[0xFF, 0xFF, 0x07]),
+		(40, &[0x22]),
+		(48, &[0xDE, 0xFF, 0x07]),
+		(56, &[0xC1, 0x5B, 0xAD, 0x12, 0xB4, 0xC3, 0xB1, 0x46, 0xA6, 0x15, 0x8F, 0x5E, 0x08, 0xEE, 0xDA, 0xC9, 0x02]),
+		(80, &[0x80]),
+		(84, &[0x80]),
+		(88, &[0x84, 0x6C, 0x8F, 0x9A]),
+	],
+);
+const SGDISK_BACKUP: (u64, &[(usize, &[u8])]) = (
+	524287,
+	&[
+		(0, &[0x45, 0x46, 0x49, 0x20, 0x50, 0x41, 0x52, 0x54]),
+		(10, &[0x01, 0x00, 0x5C]),
+		(16, &[0x49, 0x7E, 0x7C, 0x26]),
+		(24, &[0xFF, 0xFF, 0x07]),
+		(32, &[0x01]),
+		(40, &[0x22]),
+		(48, &[0xDE, 0xFF, 0x07]),
+		(56, &[0xC1, 0x5B, 0xAD, 0x12, 0xB4, 0xC3, 0xB1, 0x46, 0xA6, 0x15, 0x8F, 0x5E, 0x08, 0xEE, 0xDA, 0xC9, 0xDF, 0xFF, 0x07]),
+		(80, &[0x80]),
+		(84, &[0x80]),
+		(88, &[0x84, 0x6C, 0x8F, 0x9A]),
+	],
+);
+const SGDISK_ENTRIES: (u64, &[(usize, &[u8])]) = (
+	2,
+	&[
+		(
+			0,
+			&[
+				0x28,
+				0x73,
+				0x2A,
+				0xC1,
+				0x1F,
+				0xF8,
+				0xD2,
+				0x11,
+				0xBA,
+				0x4B,
+				0x00,
+				0xA0,
+				0xC9,
+				0x3E,
+				0xC9,
+				0x3B,
+				0x3B,
+				0x43,
+				0x0B,
+				0x5D,
+				0x75,
+				0x99,
+				0x91,
+				0x42,
+				0x85,
+				0x85,
+				0x21,
+				0xF9,
+				0xB2,
+				0x1C,
+				0x70,
+				0xC8,
+				0x00,
+				0x08,
+			],
+		),
+		(40, &[0xFF, 0x07, 0x01]),
+		(56, &[0x45, 0x00, 0x53, 0x00, 0x50]),
+		(128, &[0x53, 0x46, 0x42, 0x4C, 0x01]),
+		(
+			135,
+			&[
+				0x40,
+				0x80,
+				0x00,
+				0x4C,
+				0x69,
+				0x62,
+				0x65,
+				0x72,
+				0x46,
+				0x7E,
+				0x93,
+				0x67,
+				0x8C,
+				0x60,
+				0x6A,
+				0xB5,
+				0x48,
+				0x83,
+				0x44,
+				0x0A,
+				0xE1,
+				0x1E,
+				0xD7,
+				0xC0,
+				0xA9,
+				0x00,
+				0x08,
+				0x01,
+			],
+		),
+		(168, &[0xDE, 0xFF, 0x07]),
+		(184, &[0x73, 0x00, 0x79, 0x00, 0x73, 0x00, 0x74, 0x00, 0x65, 0x00, 0x6D]),
+	],
+);
+// the backup entry array, byte for byte the primary's, at the sector the backup header names.
+const SGDISK_BACKUP_ENTRIES_LBA: u64 = 524255;
+const SGDISK_SECTORS: u64 = 524288;
+const SGDISK_FIRST: u64 = 67584;
+const SGDISK_LAST: u64 = 524254;
+
+// Rebuild that disk in memory: every recorded run laid at its sector, the rest zeros.
+fn sgdisk_image() -> Image {
+	let mut img = Image::new(SGDISK_SECTORS);
+	let mut lay = |(lba, runs): (u64, &[(usize, &[u8])])| {
+		img.edit(lba, |sector| {
+			for (off, bytes) in runs {
+				sector[*off..*off + bytes.len()].copy_from_slice(bytes);
+			}
+		});
+	};
+	lay(SGDISK_MBR);
+	lay(SGDISK_PRIMARY);
+	lay(SGDISK_BACKUP);
+	lay(SGDISK_ENTRIES);
+	// the backup array is the primary's, at the sector the backup header names.
+	lay((SGDISK_BACKUP_ENTRIES_LBA, SGDISK_ENTRIES.1));
+	img
+}
+
+#[test]
+fn a_table_written_by_sgdisk_reads_as_the_partition_it_names() {
+	// The installed system's disk, as `src/boot/mkimage.sh` builds it. Nothing in this
+	// system produced the table - if this build's idea of a GPT were wrong, this is where
+	// it would show.
+	let mut img = sgdisk_image();
+	assert_eq!(probe(&mut img), Disk::LiberFs { first: SGDISK_FIRST, last: SGDISK_LAST });
+}
+
+#[test]
+fn a_real_table_with_its_primary_header_gone_comes_back_from_the_backup() {
+	// the same disk with LBA 1 zeroed, which is what a half-finished write leaves. The
+	// protective MBR still says a GPT is supposed to be here, the backup still verifies,
+	// and the partition is found - a disk in this state is one repair away from fine and
+	// exactly the one that must not be formatted.
+	let mut img = sgdisk_image();
+	img.put(1, &[0u8; SECTOR_SIZE]);
+	assert_eq!(probe(&mut img), Disk::LiberFs { first: SGDISK_FIRST, last: SGDISK_LAST });
+
+	// and with both copies gone it is damage, not a blank disk.
+	let mut img = sgdisk_image();
+	img.put(1, &[0u8; SECTOR_SIZE]);
+	img.put(SGDISK_SECTORS - 1, &[0u8; SECTOR_SIZE]);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt);
+}
