@@ -1209,13 +1209,28 @@ fn a_refused_capability_send_leaves_every_handle_with_the_sender() {
 			let before = live_handle_count();
 			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS, transport, payload.as_ptr() as u64, payload.len() as u64, request.as_ptr() as u64)), "a capability send onto a full queue must be refused");
 
-			// The capabilities come back under NEW handles - their old slots died when they
-			// were taken, which is the honest outcome of a move that had to be undone - so
-			// the old values must be dead and three others must have appeared in their place.
+			// The capabilities come back TO THE HANDLES THEY CAME FROM.
+			//
+			// This assertion used to say the opposite - that the old values were dead and the
+			// capabilities had reappeared under new handles nobody was told about - and called
+			// that "the honest outcome of a move that had to be undone". The count was right, so
+			// the kernel looked correct, and what it actually meant was that userspace could not
+			// reach them: a caller doing the only sensible thing with a failed send, closing what
+			// it could not hand over, closed a value that was already dead. One capability leaked
+			// per failed transfer, out of code that was doing exactly the right thing, with
+			// nothing in the ABI able to tell it otherwise.
+			//
+			// A refused send now costs the caller nothing at all - not the capability, and not the
+			// handle it was named by.
 			for handle in [carried_a, carried_b, carried_c] {
-				assert!(!handle_is_live(handle), "the handle a refused send took must not still name anything");
+				assert!(handle_is_live(handle), "a refused send must give the handle back, not reissue the capability elsewhere");
 			}
 			assert_eq!(live_handle_count(), before, "a refused send must leave the sender exactly the capabilities it had");
+
+			// and the handles still WORK: a live slot that cannot be used is a leak with better
+			// manners.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, carried_a, 0, 0, 0) as i64, 0, "the returned handle closes like any other");
+			assert_eq!(live_handle_count(), before - 1, "and closing it releases exactly one");
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}

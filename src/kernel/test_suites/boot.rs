@@ -463,52 +463,51 @@ fn a_volume_on_the_whole_device_survives_a_remount() {
 tagged_test!(garbage_where_the_superblock_should_be_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);
 fn garbage_where_the_superblock_should_be_cannot_kill_the_storage_service() {
 	use alloc::collections::BTreeMap;
-	use object::channel::Channel;
-	use object::rights::Rights;
 
-	// A disk whose first sector is not a superblock is the least trustworthy disk there is, and
-	// it must produce an empty volume rather than a dead service.
+	// A disk whose first sector is neither a superblock nor a partition table is the least
+	// trustworthy disk there is, and the service must survive it.
 	//
-	// The bytes here are a PKGARCH1 header claiming a ~137 GB entry table, which is what this
-	// test was originally written for: the seeding path sized a read buffer straight off that
-	// word. That path is deleted (M0138) - nothing parses an archive off the disk any more - so
-	// what the case now guards is the general property rather than the specific attack, and the
-	// hostile header is as good a piece of garbage as any.
+	// The bytes are a PKGARCH1 header claiming a ~137 GB entry table, which is what this test was
+	// originally written for: the seeding path sized a read buffer straight off that word. That
+	// path is deleted (M0138), so what the case guards now is the general property - and the
+	// property CHANGED with the fourth audit. It used to demand an empty volume formatted over the
+	// garbage, on the reasoning that unrecognised bytes are as good as no bytes.
+	//
+	// They are not. There is no complete list of what a disk can hold, so "I did not recognise
+	// this" is not evidence the disk is free - and the one disk in the world that most needs not to
+	// be formatted is the one nobody can identify. Surviving still means not dying; it no longer
+	// means writing.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
-	let expected_pool: u64 = (CAPACITY - FALLBACK_START_SECTOR * 512) / 4096;
-
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
 	let mut header = alloc::vec![0u8; 512];
 	header[0..8].copy_from_slice(b"PKGARCH1");
 	header[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
-	disk.insert(0, header);
+	disk.insert(0, header.clone());
 
-	let (_volume, package) = scenario_packages().expect("boot modules should be present");
-	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
-	let (boot_kernel, boot_user) = Channel::create();
-	let (blk_host, blk_child) = Channel::create();
-	let (serve_server, _serve_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the StorageService should load");
-	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
-	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
+	assert!(!storage_on_disk(&mut disk, CAPACITY), "unrecognised bytes are not permission to format");
+	assert_eq!(disk.get(&0), Some(&header), "the sector must be exactly as it was");
+	assert_eq!(disk.len(), 1, "and nothing may be written anywhere else either");
+}
 
-	let mut online = false;
-	'serve: for _ in 0..100_000 {
-		sched::run_until_idle();
-		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
-		if let Ok(report) = boot_kernel.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online", "the service must survive the lying archive");
-			online = true;
-			break 'serve;
-		}
-	}
-	assert!(online, "the service must treat the hostile claim as no archive and report in");
+tagged_test!(a_raw_foreign_filesystem_past_the_first_sector_is_not_formatted, [Service, Storage, Filesystem, Slow]);
+fn a_raw_foreign_filesystem_past_the_first_sector_is_not_formatted() {
+	use alloc::collections::BTreeMap;
 
-	// the volume formatted normally (empty - nothing was seeded from the "archive").
-	let sb = disk.get(&FALLBACK_START_SECTOR).expect("superblock slot 0 should sit at the factory offset");
-	assert_eq!(&sb[0..8], b"LIBERFS1", "the factory layout should carry the volume");
-	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
-	assert_eq!(num_blocks, expected_pool, "the pool should span the capacity-derived factory region");
+	// The fourth audit's case, end to end. ext4 leaves the first 1024 bytes of the device alone and
+	// puts its superblock there - LBA 2, one sector past where the probe used to stop looking - so
+	// a whole-device ext4 showed nothing at LBA 0, nothing at LBA 1, answered "blank", and had a
+	// LiberFS laid over it.
+	const CAPACITY: u64 = 64 * 1024 * 1024;
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	let mut sb = alloc::vec![0u8; 512];
+	sb[56] = 0x53;
+	sb[57] = 0xEF;
+	sb[4..8].copy_from_slice(&65_536u32.to_le_bytes());
+	disk.insert(2, sb.clone());
+
+	assert!(!storage_on_disk(&mut disk, CAPACITY), "a filesystem that begins past the first sector is still a filesystem");
+	assert_eq!(disk.get(&2), Some(&sb), "its superblock must be exactly as it was");
+	assert_eq!(disk.len(), 1, "and nothing may be written over the rest of it");
 }
 
 tagged_test!(system_manager_recovery_escalates_after_repeated_crashes, [Process]);

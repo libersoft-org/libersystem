@@ -6,10 +6,19 @@
 # has looked like every time it died.
 set -Eeuo pipefail
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
-build_root="$root/../.build"
-manifest_json="$("$root/tools/system-manifest.sh" export-json)"
-first="${1:-static}"
+# EVERYTHING below the traps, and the traps come FIRST.
+#
+# They used to be installed sixty-nine lines in, after a command substitution that shells out to the
+# manifest tool, six `command -v` probes, two `mkdir`s, three `exec` redirections onto lock files and
+# three blocking `flock`s. Under `set -e` a failure in any of those ends the script with nothing but
+# a status - which is the exact signature this milestone has been chasing: exit 1 and exit 74, both
+# with no output at all, not even the first architecture's result, with stderr captured. The
+# diagnostic that was added to name the failing command could not fire, because it did not exist yet
+# when those lines ran.
+#
+# So the state the traps read is declared first, the traps are armed second, and only then does the
+# script do anything that can fail. `phase` records where it has got to, so even a death that
+# outruns the ERR trap - a signal, or the shell itself going - leaves its last known position.
 kind="static"
 mode="all"
 mutation=""
@@ -18,6 +27,49 @@ backup=""
 baseline_log=""
 failure_log=""
 restore_log=""
+phase="starting"
+
+restore_artifact() {
+	if [[ -n "$artifact" && -n "$backup" && -f "$backup" ]]; then cp "$backup" "$artifact"; fi
+}
+
+# The command that failed, captured while bash still knows it.
+#
+# This gate has died silently more than once - exit 74 and exit 1 with no output at all, a different
+# gate each time and never reproducible on demand. Under `set -e` a failing command anywhere kills
+# the script with only its status to show for it, and a status on its own has proved to be not
+# enough to identify anything: one plausible reconstruction from the number alone was followed for
+# an evening and turned out to be impossible.
+#
+# So the next occurrence names itself. `$BASH_COMMAND` is the command being run when the trap fires
+# and `$LINENO` is where it lives, which together are the whole question. Reported the moment it
+# happens rather than remembered for the exit, because a command substitution runs in a subshell and
+# nothing it assigns survives to the EXIT trap. ERR does not fire for a command whose failure is
+# being TESTED - an `if`, a `while`, a `&&`, a `!` - so this stays quiet for every failure the
+# script handles itself.
+on_error() {
+	echo "image-injection-check: failed at line $1 with status $2 (phase=$phase):" >&2
+	echo "  $BASH_COMMAND" >&2
+}
+trap 'on_error "$LINENO" "$?"' ERR
+
+cleanup() {
+	local status=$?
+	restore_artifact
+	rm -f "$backup" "$baseline_log" "$failure_log" "$restore_log"
+	if [[ "$status" -ne 0 ]]; then
+		echo "image-injection-check: exiting $status (phase=$phase kind=$kind mode=$mode mutation=${mutation:-none})" >&2
+	fi
+	exit "$status"
+}
+trap cleanup EXIT
+
+phase="resolving the source root"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+build_root="$root/../.build"
+phase="reading the manifest"
+manifest_json="$("$root/tools/system-manifest.sh" export-json)"
+first="${1:-static}"
 
 case "$first" in
 static | undeclared-edge | duplicate-edge | malformed-dynamic | malformed-symbol-relocation | identity-note)
@@ -31,6 +83,7 @@ all | x86_64 | aarch64 | riscv64) mode="$first" ;;
 	;;
 esac
 
+phase="checking for the tools this gate needs"
 command -v dd >/dev/null
 command -v flock >/dev/null
 command -v llvm-readelf >/dev/null
@@ -41,50 +94,27 @@ command -v timeout >/dev/null
 source_path() {
 	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
 }
+phase="preparing the build directory"
 mkdir -p "$build_root"
 # The build directory has a shape; a script that writes into it makes sure its place exists.
 mkdir -p "$build_root/state"
+# Named one at a time: a redirection that cannot be made is one of the few things here that can
+# plausibly answer with an I/O status, and this gate has died with one.
+phase="opening the x86_64 build lock"
 exec 8>"$build_root/state/build-x86_64-unknown-none.lock"
+phase="opening the aarch64 build lock"
 exec 9>"$build_root/state/build-aarch64-unknown-none.lock"
+phase="opening the riscv64 build lock"
 exec 10>"$build_root/state/build-riscv64gc-unknown-none-elf.lock"
+# Blocking, deliberately: a gate that gave up on a lock would be a gate that stopped checking, which
+# is the failure this milestone exists to record. If this is where it hangs, `phase` says so.
+phase="waiting for the x86_64 build lock"
 flock 8
+phase="waiting for the aarch64 build lock"
 flock 9
+phase="waiting for the riscv64 build lock"
 flock 10
-
-restore_artifact() {
-	if [[ -n "$artifact" && -n "$backup" && -f "$backup" ]]; then cp "$backup" "$artifact"; fi
-}
-
-# The command that failed, captured while bash still knows it.
-#
-# This gate has died silently more than once - exit 74 and exit 1 with no output at all,
-# a different gate each time and never reproducible on demand. Under `set -e` a failing
-# command anywhere kills the script with only its status to show for it, and a status on
-# its own has proved to be not enough to identify anything: one plausible reconstruction
-# from the number alone was followed for an evening and turned out to be impossible.
-#
-# So the next occurrence names itself. `$BASH_COMMAND` is the command being run when the
-# trap fires and `$LINENO` is where it lives, which together are the whole question.
-# Reported the moment it happens rather than remembered for the exit, because a command
-# substitution runs in a subshell and nothing it assigns survives to the EXIT trap. ERR
-# does not fire for a command whose failure is being TESTED - an `if`, a `while`, a `&&`,
-# a `!` - so this stays quiet for every failure the script handles itself.
-on_error() {
-	echo "image-injection-check: failed at line $1 with status $2:" >&2
-	echo "  $BASH_COMMAND" >&2
-}
-trap 'on_error "$LINENO" "$?"' ERR
-
-cleanup() {
-	local status=$?
-	restore_artifact
-	rm -f "$backup" "$baseline_log" "$failure_log" "$restore_log"
-	if [[ "$status" -ne 0 ]]; then
-		echo "image-injection-check: exiting $status (kind=$kind mode=$mode mutation=${mutation:-none})" >&2
-	fi
-	exit "$status"
-}
-trap cleanup EXIT
+phase="ready"
 
 # Drive the step that reads the staged artifacts and refuses the malformed ones.
 #
@@ -339,6 +369,7 @@ rejection_pattern() {
 }
 
 check_target() {
+	phase="checking $kind on ${1:-?}"
 	local label="$1"
 	local target="$2"
 	local volume_name="$3"

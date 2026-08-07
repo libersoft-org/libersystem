@@ -3022,6 +3022,90 @@ impl StorageHarness {
 		served
 	}
 
+	// Fill the ROOT client's reply queue, let a reply time out, and then have the root ask for a
+	// LISTING. Returns whether a client that connected beforehand is still served.
+	//
+	// The root, deliberately, because it is the one client the service never drops - closing it
+	// would end the service. So a stalled root stays in the table with its queue full, and its next
+	// request is exactly the case the bound has to cover.
+	//
+	// An earlier version flooded a SUBCLIENT and was green with the bound reverted: the service
+	// drops a subclient on its first stalled reply, so the listing went to a channel that was
+	// already closed and never reached the code under test. Only the revert showed it.
+	fn root_lists_after_filling_its_reply_queue(&mut self, corr: u32, skip: u64) -> bool {
+		use object::channel::Message;
+		// Minted BEFORE the flood: the prober is a request/reply on the root, and once the root's
+		// queue is full there is no way to ask for one.
+		let prober = self.connect();
+		for _ in 0..80 {
+			let _ = self.client.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0));
+			self.pump();
+		}
+		advance_clock(skip);
+		for _ in 0..128 {
+			self.pump();
+		}
+		// The listing, on a root whose queue is full and which has already stalled once.
+		let path: &[u8] = b"vol://tmp";
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		let _ = self.client.send(Message::new(request, alloc::vec::Vec::new(), 0));
+		for _ in 0..64 {
+			self.pump();
+		}
+		// Past the listing's own deadline as well: a listing whose consumer nobody reads POLLS every
+		// tick, so leaving one alive means `run_until_idle` never idles and the harness never gets
+		// its turn back.
+		advance_clock(skip);
+		for _ in 0..128 {
+			self.pump();
+		}
+		// Is anybody else still being served? Asked on the prober, because the root is the client
+		// that stopped reading.
+		let mut heartbeat = alloc::vec::Vec::new();
+		heartbeat.extend_from_slice(&abi::HEARTBEAT_OP.to_le_bytes());
+		if prober.send(Message::new(heartbeat, alloc::vec::Vec::new(), 0)).is_err() {
+			return false;
+		}
+		for _ in 0..4_000 {
+			self.pump();
+			if let Ok(reply) = prober.recv() {
+				return reply.bytes == b"PONG";
+			}
+		}
+		false
+	}
+
+	// Connect over and over until the service refuses, and report how many it granted.
+	//
+	// A refusal is an empty reply carrying no capability, which is what this call answers with when
+	// the table is full or a channel cannot be minted. `None` means it never refused.
+	fn connect_until_refused(&mut self, limit: usize) -> Option<usize> {
+		use object::channel::{Channel, Message};
+		let mut granted: Vec<alloc::sync::Arc<Channel>> = alloc::vec::Vec::new();
+		for _ in 0..limit {
+			self.client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("storage connect request");
+			let mut answered = false;
+			for _ in 0..2_000 {
+				self.pump();
+				if let Ok(reply) = self.client.recv() {
+					match reply.caps.first() {
+						Some(cap) => granted.push(cap.object().into_any_arc().downcast::<Channel>().expect("a connection is a channel")),
+						// the refusal form: an empty reply with nothing in it.
+						None => return Some(granted.len()),
+					}
+					answered = true;
+					break;
+				}
+			}
+			assert!(answered, "the service answered every connect it was given");
+		}
+		None
+	}
+
 	fn stream_idle_until_deadline(&mut self, path: &[u8], corr: u32, skip: u64) -> bool {
 		use object::channel::Channel;
 		use object::rights::Rights;

@@ -31,7 +31,6 @@
 
 extern crate alloc;
 
-use alloc::vec;
 use alloc::vec::Vec;
 
 // The sector size this crate speaks. GPT is defined in terms of the medium's logical block
@@ -111,10 +110,23 @@ pub trait Sectors {
 // corrupt GPT is a table to repair, and an I/O failure is a cable to check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disk {
-	// LBA 0 and LBA 1 were both read and neither carries a partition table, a protective
-	// MBR, or a filesystem this build recognises. The ONLY answer that licenses laying a
-	// filesystem over a whole device.
+	// The disk carries no partition table and every byte of it this build looked at is ZERO.
+	// The ONLY answer that licenses laying a filesystem over a whole device.
+	//
+	// Positive evidence, not the absence of a signature. The first version of this crate
+	// answered `Blank` whenever it recognised nothing, which is the mistake this whole
+	// milestone is about, one level in: a raw ext4 puts its superblock at byte 1024 - the
+	// third sector - so the probe decided before the filesystem began, and the service then
+	// formatted over it. There is no complete list of filesystem signatures and there never
+	// will be; there is a complete answer to "is this medium empty", and it is that the
+	// bytes are zero.
 	Blank,
+	// The disk carries no partition table, no filesystem this build recognises, and bytes
+	// that are not zero. Something is on it and this build cannot say what.
+	//
+	// The whole reason this variant exists: a false positive here costs a boot, and a false
+	// negative costs the disk.
+	UnknownData,
 	// No partition table, and LBA 0 carries a LiberFS superblock: a volume written straight
 	// onto the medium by this system, which is what the fixed whole-device layout produces.
 	//
@@ -142,6 +154,10 @@ pub enum Disk {
 	ForeignFilesystem { name: &'static str },
 	// The device did not answer. Nothing at all is known about what is on it.
 	Io,
+	// This machine would not give the probe the memory to verify a table. Says nothing about
+	// the disk, which is exactly why it is its own answer rather than folded into `CorruptGpt`
+	// - one of those means "repair the table" and the other means "the disk is fine".
+	NoMemory,
 }
 
 // Read the disk and say what it is. Nothing is written and nothing is assumed; every answer
@@ -159,13 +175,15 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 	let mbr = classify_mbr(&lba0);
 	if &lba1[HDR_SIGNATURE..HDR_SIGNATURE + 8] == b"EFI PART" {
 		return match read_gpt(dev, &lba1) {
-			Some(gpt) => find_liberfs(&gpt),
+			Ok(gpt) => find_liberfs(&gpt),
+			Err(Fault::NoMemory) => Disk::NoMemory,
 			// the signature is there and the table is not believable. Consult the backup
 			// before condemning it: a damaged primary header with an intact backup is the
 			// case UEFI defines a backup FOR.
-			None => match backup_gpt(dev) {
-				Some(gpt) => find_liberfs(&gpt),
-				None => Disk::CorruptGpt,
+			Err(Fault::Unusable) => match backup_gpt(dev) {
+				Ok(gpt) => find_liberfs(&gpt),
+				Err(Fault::NoMemory) => Disk::NoMemory,
+				Err(Fault::Unusable) => Disk::CorruptGpt,
 			},
 		};
 	}
@@ -173,8 +191,9 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 	// absence is damage rather than a plain MBR disk - and the backup is where to look.
 	if mbr == Mbr::Protective {
 		return match backup_gpt(dev) {
-			Some(gpt) => find_liberfs(&gpt),
-			None => Disk::CorruptGpt,
+			Ok(gpt) => find_liberfs(&gpt),
+			Err(Fault::NoMemory) => Disk::NoMemory,
+			Err(Fault::Unusable) => Disk::CorruptGpt,
 		};
 	}
 	if mbr == Mbr::Partitioned {
@@ -188,7 +207,57 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 	if let Some(name) = foreign_filesystem(&lba0) {
 		return Disk::ForeignFilesystem { name };
 	}
-	Disk::Blank
+	// Nothing was recognised, which is not the same claim as nothing being there. What decides
+	// it is whether the medium is ZERO where anything at all would announce itself.
+	match scanned_blank(dev, &lba0, &lba1) {
+		Some(true) => Disk::Blank,
+		Some(false) => Disk::UnknownData,
+		None => Disk::Io,
+	}
+}
+
+// The span a blank disk has to be zero across, in sectors from the start: the two table
+// sectors, then every announcement point up to and including 64 KiB.
+//
+// It covers, in order: the MBR and GPT header sectors; the ext4 / xfs / btrfs-adjacent
+// superblock region at 1 KiB; the swap signature near 4 KiB; the ISO9660 and UDF volume
+// descriptors at 32 KiB; and the btrfs superblock at 64 KiB. That is 129 single-sector reads,
+// once, at boot - the cost of not formatting somebody's disk.
+const BLANK_SCAN_SECTORS: u64 = 129;
+
+// And the far ones, which no contiguous prefix of a sane length would reach: the ZFS labels,
+// which sit at 256 KiB and 512 KiB from the start of the device.
+const BLANK_FAR_PROBES: [u64; 2] = [512, 1024];
+
+// Is every byte this build looks at zero? None if the device stopped answering.
+//
+// A sector past the end of the medium is not a failure - a device smaller than the scan simply
+// has nothing there to look at - so the scan is bounded by the reported capacity when there is
+// one, and a read that fails beyond it ends the scan rather than condemning the disk.
+fn scanned_blank(dev: &mut impl Sectors, lba0: &[u8], lba1: &[u8]) -> Option<bool> {
+	if lba0.iter().any(|&b| b != 0) || lba1.iter().any(|&b| b != 0) {
+		return Some(false);
+	}
+	let capacity = dev.capacity();
+	let mut sector = [0u8; SECTOR_SIZE];
+	for lba in (2..BLANK_SCAN_SECTORS).chain(BLANK_FAR_PROBES) {
+		// a sector the medium does not have is nothing to object to.
+		if capacity.is_some_and(|c| lba >= c) {
+			continue;
+		}
+		if !dev.read(lba, &mut sector) {
+			// A device that reported a capacity and then refused a sector inside it is
+			// failing, and this scan is deciding whether the disk may be written over -
+			// so it says so rather than deciding on what it managed to read. A device that
+			// would not report a capacity at all cannot be bounded, and a refusal there is
+			// taken as the end of the medium.
+			return if capacity.is_none() { Some(true) } else { None };
+		}
+		if sector.iter().any(|&b| b != 0) {
+			return Some(false);
+		}
+	}
+	Some(true)
 }
 
 // What LBA 0's partition table looks like.
@@ -250,8 +319,34 @@ struct Gpt {
 	entries_last_lba: u64,
 }
 
-// Verify a GPT header block and the entry array it points at, or None if anything about it
-// cannot be true.
+// Why a GPT could not be acted on. The two are kept apart because they are claims about
+// different things: one is about the disk, the other about this machine - and answering
+// "your partition table is damaged" when the truth is "I could not allocate 16 KiB" sends an
+// operator to the wrong component. LiberFS learned the same lesson as `MountError::NoMemory`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+	// The table is not one this build can believe.
+	Unusable,
+	// The table might be fine; the memory to verify it was not there.
+	NoMemory,
+}
+
+// A zeroed buffer of `len`, or `NoMemory` if the machine will not give it.
+//
+// This crate exists partly so that a hostile disk cannot take StorageService down, and it was
+// doing its own allocation with `vec![0u8; n]` - which ABORTS the process when the allocator
+// refuses. The size is bounded (`MAX_ENTRIES` and the entry-size ceiling cap the array at about
+// 256 KiB), so it is not an attacker's number without limit; it is still an allocation on a
+// path whose whole point is to report rather than die.
+fn try_zeroed(len: usize) -> Result<Vec<u8>, Fault> {
+	let mut v: Vec<u8> = Vec::new();
+	v.try_reserve_exact(len).map_err(|_| Fault::NoMemory)?;
+	v.resize(len, 0);
+	Ok(v)
+}
+
+// Verify a GPT header block and the entry array it points at, or a `Fault` saying which kind of
+// answer this is.
 //
 // The old probe checked the signature, that `entry_size` was a power of two in range, that
 // `num_entries` was non-zero, and then trusted the rest. It checked NEITHER CRC, no header
@@ -259,77 +354,78 @@ struct Gpt {
 // type GUID, `first = 1` and `last = 100000` passed every test there was, and the mount then
 // targeted LBA 1, which is the primary GPT header itself. Finding no superblock there, the
 // service formatted on top of the partition table that had named the partition.
-fn read_gpt(dev: &mut impl Sectors, header: &[u8]) -> Option<Gpt> {
+fn read_gpt(dev: &mut impl Sectors, header: &[u8]) -> Result<Gpt, Fault> {
 	if &header[HDR_SIGNATURE..HDR_SIGNATURE + 8] != b"EFI PART" {
-		return None;
+		return Err(Fault::Unusable);
 	}
 	// revision 1.0 is what every GPT in existence carries; a different one is a format this
 	// build has not been told how to read.
-	if u32::from_le_bytes(header[HDR_REVISION..HDR_REVISION + 4].try_into().ok()?) != 0x0001_0000 {
-		return None;
+	if u32::from_le_bytes(header[HDR_REVISION..HDR_REVISION + 4].try_into().ok().ok_or(Fault::Unusable)?) != 0x0001_0000 {
+		return Err(Fault::Unusable);
 	}
-	let header_size = u32::from_le_bytes(header[HDR_SIZE..HDR_SIZE + 4].try_into().ok()?) as usize;
+	let header_size = u32::from_le_bytes(header[HDR_SIZE..HDR_SIZE + 4].try_into().ok().ok_or(Fault::Unusable)?) as usize;
 	if header_size < HDR_SIZE_MIN || header_size > SECTOR_SIZE {
-		return None;
+		return Err(Fault::Unusable);
 	}
 	// the header's own CRC32, computed over `header_size` bytes with the CRC field zeroed.
 	// This is the check that makes every field below worth reading at all.
-	let stored = u32::from_le_bytes(header[HDR_CRC..HDR_CRC + 4].try_into().ok()?);
-	let mut probe = header[..header_size].to_vec();
+	let stored = u32::from_le_bytes(header[HDR_CRC..HDR_CRC + 4].try_into().ok().ok_or(Fault::Unusable)?);
+	let mut probe = try_zeroed(header_size)?;
+	probe.copy_from_slice(&header[..header_size]);
 	probe[HDR_CRC..HDR_CRC + 4].fill(0);
 	if crc32(&probe) != stored {
-		return None;
+		return Err(Fault::Unusable);
 	}
 
-	let header_lba = u64::from_le_bytes(header[HDR_CURRENT_LBA..HDR_CURRENT_LBA + 8].try_into().ok()?);
-	let backup_lba = u64::from_le_bytes(header[HDR_BACKUP_LBA..HDR_BACKUP_LBA + 8].try_into().ok()?);
-	let first_usable = u64::from_le_bytes(header[HDR_FIRST_USABLE..HDR_FIRST_USABLE + 8].try_into().ok()?);
-	let last_usable = u64::from_le_bytes(header[HDR_LAST_USABLE..HDR_LAST_USABLE + 8].try_into().ok()?);
-	let entries_lba = u64::from_le_bytes(header[HDR_ENTRIES_LBA..HDR_ENTRIES_LBA + 8].try_into().ok()?);
-	let num_entries = u32::from_le_bytes(header[HDR_NUM_ENTRIES..HDR_NUM_ENTRIES + 4].try_into().ok()?) as u64;
-	let entry_size = u32::from_le_bytes(header[HDR_ENTRY_SIZE..HDR_ENTRY_SIZE + 4].try_into().ok()?) as usize;
+	let header_lba = u64::from_le_bytes(header[HDR_CURRENT_LBA..HDR_CURRENT_LBA + 8].try_into().ok().ok_or(Fault::Unusable)?);
+	let backup_lba = u64::from_le_bytes(header[HDR_BACKUP_LBA..HDR_BACKUP_LBA + 8].try_into().ok().ok_or(Fault::Unusable)?);
+	let first_usable = u64::from_le_bytes(header[HDR_FIRST_USABLE..HDR_FIRST_USABLE + 8].try_into().ok().ok_or(Fault::Unusable)?);
+	let last_usable = u64::from_le_bytes(header[HDR_LAST_USABLE..HDR_LAST_USABLE + 8].try_into().ok().ok_or(Fault::Unusable)?);
+	let entries_lba = u64::from_le_bytes(header[HDR_ENTRIES_LBA..HDR_ENTRIES_LBA + 8].try_into().ok().ok_or(Fault::Unusable)?);
+	let num_entries = u32::from_le_bytes(header[HDR_NUM_ENTRIES..HDR_NUM_ENTRIES + 4].try_into().ok().ok_or(Fault::Unusable)?) as u64;
+	let entry_size = u32::from_le_bytes(header[HDR_ENTRY_SIZE..HDR_ENTRY_SIZE + 4].try_into().ok().ok_or(Fault::Unusable)?) as usize;
 
 	// the relations BETWEEN the fields, which a CRC cannot speak to: a header may be
 	// perfectly intact and still describe a disk that cannot exist.
 	// LBA 0 is the protective MBR's sector by spec, so neither copy of the header can be
 	// there, and the two copies cannot be the same sector.
 	if header_lba == backup_lba || header_lba == 0 || backup_lba == 0 {
-		return None;
+		return Err(Fault::Unusable);
 	}
 	if first_usable == 0 || last_usable < first_usable {
-		return None;
+		return Err(Fault::Unusable);
 	}
 	// the UEFI spec puts both copies of the metadata OUTSIDE the usable range, which is what
 	// makes "a partition inside the usable range cannot overlap the tables" true.
 	if header_lba >= first_usable && header_lba <= last_usable {
-		return None;
+		return Err(Fault::Unusable);
 	}
 	if backup_lba >= first_usable && backup_lba <= last_usable {
-		return None;
+		return Err(Fault::Unusable);
 	}
 	// the entry array: a power-of-two width no smaller than the 128 bytes the spec fixes,
 	// at least one entry, and a span that fits in the address space.
 	if entry_size < 128 || entry_size > SECTOR_SIZE || !entry_size.is_power_of_two() {
-		return None;
+		return Err(Fault::Unusable);
 	}
 	if num_entries == 0 || entries_lba == 0 {
-		return None;
+		return Err(Fault::Unusable);
 	}
 	// checked throughout: `num_entries * entry_size` is two numbers off the medium
 	// multiplied together, and the product decides how far the array reaches.
-	let array_bytes = num_entries.checked_mul(entry_size as u64)?;
+	let array_bytes = num_entries.checked_mul(entry_size as u64).ok_or(Fault::Unusable)?;
 	let array_sectors = array_bytes.div_ceil(SECTOR_SIZE as u64);
-	let entries_last_lba = entries_lba.checked_add(array_sectors)?.checked_sub(1)?;
+	let entries_last_lba = entries_lba.checked_add(array_sectors).and_then(|n| n.checked_sub(1)).ok_or(Fault::Unusable)?;
 	// and the array is metadata too, so it may not sit in the usable range either.
 	if entries_last_lba >= first_usable && entries_lba <= last_usable {
-		return None;
+		return Err(Fault::Unusable);
 	}
 
 	// the device is the outermost bound on every number above. A device that will not say
 	// its size leaves the header unbounded, and an unbounded header may not be acted on.
-	let capacity = dev.capacity()?;
+	let capacity = dev.capacity().ok_or(Fault::Unusable)?;
 	if last_usable >= capacity || header_lba >= capacity || backup_lba >= capacity || entries_last_lba >= capacity {
-		return None;
+		return Err(Fault::Unusable);
 	}
 
 	// the entry array's own CRC32, over exactly `num_entries * entry_size` bytes. Without
@@ -338,35 +434,35 @@ fn read_gpt(dev: &mut impl Sectors, header: &[u8]) -> Option<Gpt> {
 	if walk != num_entries {
 		// the array is longer than this build walks, so its CRC cannot be confirmed and the
 		// entries cannot be trusted. Refusing is the honest answer.
-		return None;
+		return Err(Fault::Unusable);
 	}
-	let mut array: Vec<u8> = vec![0u8; array_bytes as usize];
+	let mut array: Vec<u8> = try_zeroed(array_bytes as usize)?;
 	let mut sector = [0u8; SECTOR_SIZE];
 	for i in 0..array_sectors {
-		if !dev.read(entries_lba.checked_add(i)?, &mut sector) {
-			return None;
+		if !dev.read(entries_lba.checked_add(i).ok_or(Fault::Unusable)?, &mut sector) {
+			return Err(Fault::Unusable);
 		}
 		let start = (i * SECTOR_SIZE as u64) as usize;
 		let end = (start + SECTOR_SIZE).min(array.len());
 		array[start..end].copy_from_slice(&sector[..end - start]);
 	}
-	let stored = u32::from_le_bytes(header[HDR_ENTRIES_CRC..HDR_ENTRIES_CRC + 4].try_into().ok()?);
+	let stored = u32::from_le_bytes(header[HDR_ENTRIES_CRC..HDR_ENTRIES_CRC + 4].try_into().ok().ok_or(Fault::Unusable)?);
 	if crc32(&array) != stored {
-		return None;
+		return Err(Fault::Unusable);
 	}
 
-	Some(Gpt { entries: array, entry_size, first_usable, last_usable, header_lba, backup_lba, entries_lba, entries_last_lba })
+	Ok(Gpt { entries: array, entry_size, first_usable, last_usable, header_lba, backup_lba, entries_lba, entries_last_lba })
 }
 
 // The backup GPT: its header is the disk's LAST sector, and it describes the same partitions
 // as the primary. Consulted only when the primary did not verify, which is what a backup is
 // for - and it is the difference between telling an operator their table is damaged and
 // telling them their disk is blank.
-fn backup_gpt(dev: &mut impl Sectors) -> Option<Gpt> {
-	let capacity = dev.capacity()?;
+fn backup_gpt(dev: &mut impl Sectors) -> Result<Gpt, Fault> {
+	let capacity = dev.capacity().ok_or(Fault::Unusable)?;
 	let mut header = [0u8; SECTOR_SIZE];
-	if !dev.read(capacity.checked_sub(1)?, &mut header) {
-		return None;
+	if !dev.read(capacity.checked_sub(1).ok_or(Fault::Unusable)?, &mut header) {
+		return Err(Fault::Unusable);
 	}
 	read_gpt(dev, &header)
 }

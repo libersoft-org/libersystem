@@ -77,7 +77,7 @@ const WRITE_CHUNK: usize = 32 * 1024;
 
 // Send the text through the storage grant's streaming write form - the file's bytes
 // travel as plain messages on a fresh channel (closed = end of data), so a file's
-// size is bounded by the filesystem, never by one transfer.
+// size is bounded by the filesystem and by the service's own accumulation policy, never by one transfer.
 unsafe fn write(storage: u64, uri: &str, text: &[u8]) {
 	unsafe {
 		let (producer, consumer): (u64, u64) = match channel() {

@@ -8,6 +8,7 @@
 
 use super::*;
 use alloc::collections::BTreeMap;
+use alloc::vec;
 
 // A sparse disk: sectors that were never written read back as zeros, which is what a fresh
 // image gives. `capacity` is declared rather than derived, so a partition table that reaches
@@ -230,15 +231,17 @@ fn a_hybrid_mbr_reads_as_a_table_not_as_emptiness() {
 }
 
 #[test]
-fn an_empty_mbr_signature_alone_does_not_claim_the_disk() {
-	// a boot signature with four empty slots is what a zeroed disk that has been through a
-	// partitioner looks like. Nothing is named, so nothing is at stake.
+fn an_empty_mbr_signature_alone_names_no_partition_and_is_still_not_blank() {
+	// a boot signature with four empty slots names nothing, so it is not `MbrWithoutLiberFs`.
+	// It is not `Blank` either, and that is the point: those two bytes are somebody's, the
+	// 446 in front of them are where a boot loader lives, and this build cannot say what is
+	// there. "Nothing is NAMED" and "nothing is THERE" are different claims.
 	let mut img = Image::new(CAPACITY);
 	img.edit(0, |mbr| {
 		mbr[510] = 0x55;
 		mbr[511] = 0xAA;
 	});
-	assert_eq!(probe(&mut img), Disk::Blank);
+	assert_eq!(probe(&mut img), Disk::UnknownData);
 }
 
 #[test]
@@ -644,4 +647,90 @@ fn a_real_table_with_its_primary_header_gone_comes_back_from_the_backup() {
 	img.put(1, &[0u8; SECTOR_SIZE]);
 	img.put(SGDISK_SECTORS - 1, &[0u8; SECTOR_SIZE]);
 	assert_eq!(probe(&mut img), Disk::CorruptGpt);
+}
+
+// M0146 follow-up: the disks a probe that answers "I recognised nothing" with `Blank` formats.
+
+#[test]
+fn a_raw_ext4_is_not_a_blank_disk() {
+	// The case the fourth audit named, and the clearest of them. ext4 leaves the first 1024
+	// bytes of the device alone - historically for a boot block - and puts its superblock
+	// there, with the magic 0xEF53 at offset 0x38 within it. At 512-byte sectors that is
+	// LBA 2, byte 56: one sector past where the old probe stopped looking.
+	//
+	// So a disk carrying a whole-device ext4 had no MBR, no GPT and nothing recognisable at
+	// LBA 0, answered `Blank`, and the service laid a LiberFS over it.
+	let mut img = Image::new(CAPACITY);
+	img.edit(2, |sb| {
+		sb[56] = 0x53;
+		sb[57] = 0xEF;
+		// the block count and a plausible first-inode field, so it looks like the real thing
+		// rather than two bytes in a void.
+		sb[4..8].copy_from_slice(&65_536u32.to_le_bytes());
+		sb[84..88].copy_from_slice(&11u32.to_le_bytes());
+	});
+	assert_eq!(probe(&mut img), Disk::UnknownData);
+}
+
+#[test]
+fn a_raw_iso9660_is_not_a_blank_disk() {
+	// ISO9660 puts its primary volume descriptor at logical sector 16 of 2048 bytes - byte
+	// 32768, LBA 64 - and UDF's descriptors sit in the same region. The crate documented that
+	// it does not recognise either of them and then answered `Blank` anyway, which made the
+	// admission worse than useless.
+	let mut img = Image::new(CAPACITY);
+	img.edit(64, |pvd| {
+		pvd[0] = 1;
+		pvd[1..6].copy_from_slice(b"CD001");
+		pvd[6] = 1;
+	});
+	assert_eq!(probe(&mut img), Disk::UnknownData);
+}
+
+#[test]
+fn a_disk_of_arbitrary_bytes_is_not_a_blank_disk() {
+	// No table, no signature this build knows or ever will know, and not a filesystem at
+	// all - a raw database extent, an encrypted volume, a dd of something. There is no
+	// complete list of what a disk can hold, which is why the question this build asks is
+	// "are the bytes zero" rather than "do I recognise them".
+	for lba in [2u64, 7, 64, 128, BLANK_FAR_PROBES[0], BLANK_FAR_PROBES[1]] {
+		let mut img = Image::new(CAPACITY);
+		img.edit(lba, |s| s[17] = 0x01);
+		assert_eq!(probe(&mut img), Disk::UnknownData, "one non-zero byte at LBA {lba} is somebody's");
+	}
+}
+
+#[test]
+fn a_disk_of_zeros_is_the_one_that_may_be_formatted() {
+	// and the other side of it, or the rule would just be a refusal: a device that reads back
+	// zeros everywhere this build looks is blank, and stays the one answer that permits a
+	// whole-device format.
+	let mut img = Image::new(CAPACITY);
+	assert_eq!(probe(&mut img), Disk::Blank);
+
+	// a device SMALLER than the scan is not thereby unknowable - a sector the medium does not
+	// have is nothing to object to.
+	let mut small = Image::new(8);
+	assert_eq!(probe(&mut small), Disk::Blank);
+}
+
+#[test]
+fn a_device_that_stops_answering_inside_the_scan_is_not_declared_blank() {
+	// the scan is what licenses a format, so a device that reported a capacity and then
+	// refused a sector inside it does not get to have the rest of the read stand in for the
+	// part that failed.
+	let mut img = Image::new(CAPACITY);
+	img.dead.insert(64, ());
+	assert_eq!(probe(&mut img), Disk::Io);
+}
+
+#[test]
+fn a_table_this_machine_cannot_hold_is_not_a_damaged_table() {
+	// `read_gpt` allocated with `vec![0u8; n]`, which aborts the process when the allocator
+	// refuses - in the crate written so that a disk could not take StorageService down. The
+	// answer now distinguishes the machine from the medium, the same way `MountError::NoMemory`
+	// does one layer up: "your partition table is damaged" sends an operator to the wrong
+	// component entirely.
+	assert!(try_zeroed(16 * 1024).is_ok(), "an ordinary entry array still allocates");
+	assert_eq!(try_zeroed(usize::MAX / 2).err(), Some(Fault::NoMemory), "and one this machine cannot hold reports");
 }

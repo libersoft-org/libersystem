@@ -236,6 +236,20 @@ enum Scope {
 struct Client {
 	chan: u64,
 	scope: Scope,
+	// Set when this client would not take an answer within the bound, cleared the moment it takes
+	// one. While it is set, answers to this client are attempted ONCE and abandoned rather than
+	// waited on.
+	//
+	// Bounding each send stopped the permanent stop and left a starvation window behind it: a
+	// client that has stopped reading still has a queue full of REQUESTS, and every one of them
+	// cost the whole service another reply deadline. For a subclient that hardly showed - it is
+	// dropped on its first stall and its backlog goes with it - and the root client is never
+	// dropped, because closing it ends the service. So a root that stopped listening held everyone
+	// else up, one deadline per queued request, which is the same defect as the unbounded send with
+	// a slower clock.
+	//
+	// Waiting is the part that costs other people. Attempting is not.
+	quiet: bool,
 }
 
 struct AdminCall<'a> {
@@ -247,7 +261,16 @@ impl volume_admin::Service for AdminCall<'_> {
 	fn open_directory(&mut self, path: String) -> Result<u64, Error> {
 		let scope: Scope = Scope::directory(self.volume, &path)?;
 		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
-		self.clients.push(Client { chan: server, scope });
+		// A refused admission closes BOTH ends: the grant did not happen, so neither handle has an
+		// owner. `Again` is what it is - the table is full or the machine is short, and both are
+		// conditions a caller can retry rather than a fault in the request.
+		if !admit_client(self.clients, Client { chan: server, scope, quiet: false }) {
+			unsafe {
+				close(server);
+				close(client);
+			}
+			return Err(Error::Again);
+		}
 		Ok(client)
 	}
 }
@@ -555,15 +578,31 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 //
 // Handles it could not hand over are closed here, so a refused answer never leaks the capability
 // it was carrying.
-fn reply_to(chan: u64, bytes: &[u8], handles: &[u64]) -> bool {
-	let sent = unsafe { send_caps_deadline(chan, bytes, handles, clock().saturating_add(REPLY_TICKS)) };
-	if matches!(sent, SendOutcome::Delivered) {
-		return false;
+fn reply_to(chan: u64, bytes: &[u8], handles: &[u64], wait: bool) -> bool {
+	matches!(reply_outcome(chan, bytes, handles, wait), SendOutcome::Stalled)
+}
+
+// The same send, with WHICH ending it had.
+//
+// `reply_to` collapses the three outcomes into "should the caller drop this subclient", which is
+// all most callers need. It is not enough for an answer that carries a capability: `Delivered` and
+// `Failed` both come back as `false`, so a handover to a peer that had already gone read as
+// success, and the other end of the channel was left open with nobody who could ever take it.
+fn reply_outcome(chan: u64, bytes: &[u8], handles: &[u64], wait: bool) -> SendOutcome {
+	// `wait` is false for a client already known not to be reading: the send is attempted and
+	// abandoned at once, so its backlog costs the service nothing but the attempts. A deadline of
+	// the current tick is what "try once" looks like to `send_caps_deadline`; zero would mean
+	// forever, which is the opposite.
+	let sent = unsafe {
+		let deadline = if wait { clock().saturating_add(REPLY_TICKS) } else { clock().max(1) };
+		send_caps_deadline(chan, bytes, handles, deadline)
+	};
+	if !matches!(sent, SendOutcome::Delivered) {
+		for &leftover in handles {
+			unsafe { close(leftover) };
+		}
 	}
-	for &leftover in handles {
-		unsafe { close(leftover) };
-	}
-	matches!(sent, SendOutcome::Stalled)
+	sent
 }
 
 fn abandon_pending(vol: &mut Volume, pending: &mut Option<PendingWrite>, chan: u64) {
@@ -577,7 +616,14 @@ fn abandon_pending(vol: &mut Volume, pending: &mut Option<PendingWrite>, chan: u
 	unsafe { close(p.stream) };
 }
 
-fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, reply: &mut [u8]) {
+// Finish a write stream and answer the client that asked for it. Returns the client's channel when
+// it would not take that answer, so the caller drops the subclient like any other stall.
+//
+// The send was made bounded and its outcome then discarded, which fixed the permanent hang and left
+// a slower leak in its place: a subclient whose queue is full at exactly this moment stays in the
+// table holding its channel, and nothing ever revisits it. `reply_to` already reports a stall for
+// every other answer in the service; this one had its own.
+fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, reply: &mut [u8]) -> Option<u64> {
 	let result = match outcome {
 		Ok(()) => {
 			if p.incremental {
@@ -599,13 +645,41 @@ fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, 
 	unsafe { close(p.stream) };
 	if let Some(len) = write_stream_reply(p.corr, result, reply) {
 		// Bounded: a client that has stopped reading its replies must not hold the service on this
-		// one. Nothing to do if it will not take it - the stream is already finished either way.
-		unsafe { send_deadline(p.client, &reply[..len], 0, clock().saturating_add(REPLY_TICKS)) };
+		// one. The stream is finished either way; what a stall still decides is whether that client
+		// keeps its place in the table.
+		if matches!(unsafe { send_deadline(p.client, &reply[..len], 0, clock().saturating_add(REPLY_TICKS)) }, SendOutcome::Stalled) {
+			return Some(p.client);
+		}
 	}
+	None
+}
+
+// Drop a subclient that would not take its answer, wherever the stall was noticed.
+//
+// The root client is never dropped: it is the boot chain's channel, closing it ends the service,
+// and a root that has stopped reading is the boot chain's problem rather than something to resolve
+// by exiting. Index 0 is the root by construction - `serve_volume` seeds the table with it.
+fn drop_stalled(vol: &mut Volume, clients: &mut Vec<Client>, pending: &mut Option<PendingWrite>, chan: u64) {
+	let Some(index) = clients.iter().position(|c| c.chan == chan) else { return };
+	if index == 0 {
+		return;
+	}
+	abandon_pending(vol, pending, chan);
+	unsafe { close(chan) };
+	clients.swap_remove(index);
 }
 
 fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
-	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full }];
+	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full, quiet: false }];
+	// Allocated ONCE and cleared each pass. It was rebuilt with `Vec::with_capacity` on every trip
+	// round the event loop, which is an infallible allocation on the hot path of a service whose
+	// whole design is that it reports rather than aborts. `MAX_CLIENTS + 2` is its final size (the
+	// admin channel and the write stream are the two), so after this it never grows again.
+	let mut waits: Vec<u64> = Vec::new();
+	if waits.try_reserve_exact(MAX_CLIENTS + 2).is_err() {
+		unsafe { print(b"storage: cannot allocate the wait set; the service cannot serve\n") };
+		unsafe { exit() };
+	}
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	// At most one at a time. The memory filesystem accumulates a stream in the volume itself and
@@ -625,7 +699,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				listing = None;
 			}
 		}
-		let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 2);
+		waits.clear();
 		if admin != 0 {
 			waits.push(admin);
 		}
@@ -670,7 +744,9 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 			if let Some(p) = pending.as_ref() {
 				if unsafe { clock() } >= p.deadline() {
 					let p = pending.take().expect("checked");
-					finish_stream(vol, p, Err(Error::Again), &mut reply);
+					if let Some(stalled) = finish_stream(vol, p, Err(Error::Again), &mut reply) {
+						drop_stalled(vol, &mut clients, &mut pending, stalled);
+					}
 				}
 			}
 			continue;
@@ -683,7 +759,11 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				let mut p = pending.take().expect("checked");
 				match take_chunk(vol, &mut p) {
 					StreamStep::More => pending = Some(p),
-					StreamStep::Done(result) => finish_stream(vol, p, result, &mut reply),
+					StreamStep::Done(result) => {
+						if let Some(stalled) = finish_stream(vol, p, result, &mut reply) {
+							drop_stalled(vol, &mut clients, &mut pending, stalled);
+						}
+					}
 				}
 				continue;
 			}
@@ -695,11 +775,16 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
 					let mut call = AdminCall { volume: vol, clients: &mut clients };
 					if let Some(reply_len) = volume_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
-						if !unsafe { send_caps_blocking(admin, &reply[..reply_len], reply_handle.as_slice()) } {
-							for &leftover in reply_handle.as_slice() {
-								unsafe { close(leftover) };
-							}
-						}
+						// Bounded like every other answer. Admin is privileged, so this is
+						// availability rather than exposure - but "no unbounded send to a client
+						// remains" is a claim that is either true or it is not, and an admin that
+						// stops reading its replies held the whole service exactly as a client
+						// would. `reply_to` closes the handles it could not hand over.
+						//
+						// A stall does NOT drop the admin channel: it is the operator's way in,
+						// there is only one of it, and closing it turns a slow console into a
+						// service that can no longer be administered at all.
+						reply_to(admin, &reply[..reply_len], reply_handle.as_slice(), true);
 					} else {
 						for &leftover in reply_handle.as_slice() {
 							unsafe { close(leftover) };
@@ -715,6 +800,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		}
 		let Some(index) = clients.iter().position(|client| client.chan == chan) else { continue };
 		let scope: Scope = clients[index].scope.clone();
+		let quiet: bool = clients[index].quiet;
 		match unsafe { recv_blocking(chan, &mut request) } {
 			Received::Message { len, .. } if len == 0 => {
 				if index == 0 {
@@ -732,13 +818,22 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				let mut stalled = false;
 				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 				if op == HEARTBEAT_OP {
-					stalled = reply_to(chan, b"PONG", &[]);
+					stalled = reply_to(chan, b"PONG", &[], !quiet);
 				} else if op == CONNECT_OP {
-					if let Some((server, client)) = unsafe { channel() } {
-						clients.push(Client { chan: server, scope });
-						stalled = reply_to(chan, &[], &[client]);
-					} else {
-						stalled = reply_to(chan, &[], &[]);
+					// An empty reply with no handle is this call's refusal form, and a table that is
+					// full uses it like a channel that could not be created.
+					match unsafe { channel() } {
+						Some((server, client)) if admit_client(&mut clients, Client { chan: server, scope, quiet: false }) => {
+							stalled = reply_to(chan, &[], &[client], !quiet);
+						}
+						Some((server, client)) => {
+							unsafe {
+								close(server);
+								close(client);
+							}
+							stalled = reply_to(chan, &[], &[], !quiet);
+						}
+						None => stalled = reply_to(chan, &[], &[], !quiet),
 					}
 				} else {
 					// Stamp mutations before authorization and dispatch. The clock is a no-op on
@@ -748,9 +843,13 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						// A second listing while one is in flight is refused, like a second stream.
 						if listing.is_some() {
 							let corr = if len >= 6 { u32::from_le_bytes([request[2], request[3], request[4], request[5]]) } else { 0 };
-							stalled = reply_to(chan, &corr.to_le_bytes(), &[]);
+							stalled = reply_to(chan, &corr.to_le_bytes(), &[], !quiet);
 						} else {
-							listing = stream_list(vol, chan, &scope, &request[..len], &mut handle);
+							match stream_list(vol, chan, &scope, quiet, &request[..len], &mut handle) {
+								ListStart::Started(started) => listing = Some(started),
+								ListStart::Done => {}
+								ListStart::ClientStalled => stalled = true,
+							}
 						}
 					} else if op == volume::OP_WRITE_STREAM {
 						// Registered rather than received. `begin_stream` answers the client only
@@ -760,7 +859,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 							Ok(entry) => pending = Some(entry),
 							Err((corr, e)) => {
 								if let Some(reply_len) = write_stream_reply(corr, Err(e), &mut reply) {
-									stalled = reply_to(chan, &reply[..reply_len], &[]);
+									stalled = reply_to(chan, &reply[..reply_len], &[], !quiet);
 								}
 							}
 						}
@@ -770,7 +869,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						if let Some(reply_len) = reply_len {
 							// Bounded, and a client that will not take its answer is dropped below
 							// rather than waited for.
-							stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice());
+							stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice(), !quiet);
 						} else {
 							for &leftover in reply_handle.as_slice() {
 								unsafe { close(leftover) };
@@ -780,11 +879,21 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				}
 				if stalled {
 					// Never the root client: dropping that ends the service, and a stalled root is
-					// the boot chain's problem rather than something to resolve by exiting.
+					// the boot chain's problem rather than something to resolve by exiting. What it
+					// gets instead is the quiet flag, so the REST of its backlog is answered without
+					// waiting and nobody else pays for it.
 					if index != 0 {
 						abandon_pending(vol, &mut pending, chan);
 						unsafe { close(chan) };
 						clients.swap_remove(index);
+					} else {
+						clients[0].quiet = true;
+					}
+				} else if let Some(client) = clients.get_mut(index) {
+					// It took its answer, so it is reading again. Cleared on the way through rather
+					// than probed for: the send is the probe.
+					if client.chan == chan {
+						client.quiet = false;
 					}
 				}
 				for &unclaimed in handle.as_slice() {
@@ -881,51 +990,77 @@ fn pump_list(p: &mut PendingList) -> bool {
 	true
 }
 
-fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, request: &[u8], request_handle: &mut proto::codec::Handles) -> Option<PendingList> {
+// How a listing request ended. Three outcomes rather than `Option`, because bounding the answer
+// introduces a third: the client that will not take it.
+enum ListStart {
+	// Under way; the serve loop pumps it between passes.
+	Started(PendingList),
+	// Finished here - refused, unreadable, or answered outright. Nothing for the loop to do.
+	Done,
+	// The client did not take its answer within the deadline. The loop drops that subclient,
+	// exactly as it does for every other reply.
+	ClientStalled,
+}
+
+// Begin a listing: answer the client with the consumer end of a fresh channel, and hand the
+// producer back to the serve loop to push entries into.
+//
+// Every answer here is BOUNDED. This function was the counterexample to the claim recorded in
+// M0139 that no unbounded send to a client remained in the service: the loop had been converted to
+// `reply_to` and this had not, so it still answered through three `send_blocking` calls. The
+// scenario that mattered is the one the deadline exists for - a client fills its reply queue, a
+// previous `reply_to` times out, the client is NOT dropped (one stalled reply is not proof of
+// death), and its next request is a listing. The service then blocked against the same full queue
+// with no deadline at all, and stopped serving anybody.
+fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, quiet: bool, request: &[u8], request_handle: &mut proto::codec::Handles) -> ListStart {
 	let mut reader = proto::codec::Reader::with_handle_list(request, request_handle);
 	let r = &mut reader;
 	let (corr, path): (u32, String) = match (|| Some((r.u16()?, r.u32()?, r.string_lp()?)))() {
 		Some((_op, corr, path)) => (corr, path),
-		None => return None,
+		// unreadable: nothing to correlate an answer with, so there is no answer to send.
+		None => return ListStart::Done,
 	};
 	if r.has_handle() {
-		return None;
+		return ListStart::Done;
 	}
 	request_handle.clear();
 	let corr_bytes: [u8; 4] = corr.to_le_bytes();
+	// A correlation id with no handle is the refusal form of this reply, and every path below that
+	// cannot produce a stream uses it - including the two that used to answer nothing at all,
+	// leaving the client waiting on a listing that was never going to come.
+	let refuse = |chan: u64| -> ListStart { if reply_to(chan, &corr_bytes, &[], !quiet) { ListStart::ClientStalled } else { ListStart::Done } };
 	if !scope.allows_path(vol.name(), &path) {
-		unsafe {
-			send_blocking(service, &corr_bytes, 0);
-		}
-		return None;
+		return refuse(service);
 	}
 	let items: Vec<FileInfo> = match vol.list_entries(&path) {
 		Ok(items) => items,
-		Err(_) => {
-			unsafe {
-				send_blocking(service, &corr_bytes, 0);
-			}
-			return None;
-		}
+		Err(_) => return refuse(service),
 	};
 	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
 		Some(pair) => pair,
-		None => return None,
+		None => return refuse(service),
 	};
-	// CHECKED. If the client closed the main channel just after asking, the consumer handle is
-	// never delivered - and it was previously never closed either, so it leaked AND left the
-	// producer with a live peer nobody would ever read. The next send then blocked forever, which
-	// is a permanent stop of the whole service caused by a client merely hanging up.
-	unsafe {
-		if !send_blocking(service, &corr_bytes, consumer) {
-			close(consumer);
-			close(producer);
-			return None;
+	// CHECKED, and it is the send that most needs checking, because it carries a capability. If the
+	// client closed the main channel just after asking, or simply will not read, the consumer
+	// handle is never delivered - `reply_to` closes what it could not hand over, and the producer
+	// is this function's to close. Leaving them open leaked the capability AND left the producer
+	// with a live peer nobody would ever read, so the next send blocked forever.
+	match reply_outcome(service, &corr_bytes, &[consumer], !quiet) {
+		SendOutcome::Delivered => {}
+		// The consumer is already closed by `reply_outcome`; the producer is this function's, and
+		// a producer whose peer is gone is a handle nobody will ever take back.
+		SendOutcome::Stalled => {
+			unsafe { close(producer) };
+			return ListStart::ClientStalled;
+		}
+		SendOutcome::Failed => {
+			unsafe { close(producer) };
+			return ListStart::Done;
 		}
 	}
 	// Handed back to the serve loop rather than produced here. Sending the entries in place is what
 	// let one unreading consumer stop the service; the loop pushes what fits between passes.
-	Some(PendingList { producer, items, seq: 0, expires: unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS) })
+	ListStart::Started(PendingList { producer, items, seq: 0, expires: unsafe { clock() }.saturating_add(STREAM_IDLE_TICKS) })
 }
 
 // The volume backing, behind the generated Storage.Volume contract: either a
@@ -1005,6 +1140,40 @@ enum WritePlan {
 // this number in `idl/*.lsidl` needs generator work. Until then a client learns it by being
 // refused, which is the honest description of where it lives.
 const STREAM_ACCUMULATION: usize = 64 * 1024 * 1024;
+
+// The most clients this service will hold at once, counting the root.
+//
+// There was no limit and no fallible allocation: every `CONNECT` did `clients.push(...)` and every
+// pass through the event loop built a fresh wait set with `Vec::with_capacity`. Any holder of the
+// service capability could grow both without bound - and the allocator's answer to running out is
+// to abort the process, so the service that has been hardened against one client's stalls all the
+// way through this milestone could still be killed by a client that simply asks a lot.
+//
+// Sixty-four, and the number was MEASURED rather than picked.
+//
+// It is far above what the system opens - a handful of services and one per directory grant - and
+// far below what exhausts a handle table, so the range of defensible values was wide. What narrowed
+// it is that this loop rebuilds and scans its wait set once per pass, so its cost grows with the
+// client count: forty-eight connections cost nothing measurable, and a ceiling of 256 could not be
+// REACHED by a test inside fifteen minutes of emulated time. A service that crawls under a
+// connection flood is bounded in the wrong sense, and a ceiling no test ever reaches is a comment.
+//
+// The scan itself is worth fixing on its own account, and is recorded in M0139 as such. Until it is,
+// the ceiling is set where the service is still brisk.
+const MAX_CLIENTS: usize = 64;
+
+// Admit a client into the table, or say why not. Fallible on both counts a `push` is not: the table
+// has a ceiling, and the growth that carries it there can be refused rather than abort.
+fn admit_client(clients: &mut Vec<Client>, client: Client) -> bool {
+	if clients.len() >= MAX_CLIENTS {
+		return false;
+	}
+	if clients.try_reserve(1).is_err() {
+		return false;
+	}
+	clients.push(client);
+	true
+}
 
 trait FileSystem {
 	// The vol:// volume name this backend answers to.
@@ -1337,8 +1506,35 @@ impl Volume {
 }
 
 // Build a listing entry from a raw name, byte length, and whether it is a directory.
-fn file_info(name: &[u8], size: u64, is_dir: bool, mtime: u64, ctime: u64) -> FileInfo {
-	FileInfo { name: String::from_utf8_lossy(name).into_owned(), size, r#type: if is_dir { FileType::Dir } else { FileType::File }, mtime, ctime }
+fn file_info(name: &[u8], size: u64, is_dir: bool, mtime: u64, ctime: u64) -> Result<FileInfo, Error> {
+	Ok(FileInfo { name: try_string(name)?, size, r#type: if is_dir { FileType::Dir } else { FileType::File }, mtime, ctime })
+}
+
+// A `String` from bytes, reporting rather than aborting when the machine will not give the room.
+//
+// `String::from_utf8_lossy(..).into_owned()` allocates infallibly, so a directory listing under
+// memory pressure took the service down through the allocator - on the DISK backends only, because
+// the memory one had already been taught to reserve fallibly and answer `Again`. The same operation
+// therefore reported on one volume and aborted on another.
+//
+// Lossy for the same reason it always was: a name off a foreign medium need not be UTF-8, and a
+// listing that omits such a file is worse than one that renders it approximately.
+fn try_string(bytes: &[u8]) -> Result<String, Error> {
+	let text = String::from_utf8_lossy(bytes);
+	let mut out = String::new();
+	out.try_reserve_exact(text.len()).map_err(|_| Error::Again)?;
+	out.push_str(&text);
+	Ok(out)
+}
+
+// Collect `items` into a vector whose room was reserved fallibly.
+fn try_collect(items: impl ExactSizeIterator<Item = Result<FileInfo, Error>>) -> Result<Vec<FileInfo>, Error> {
+	let mut out: Vec<FileInfo> = Vec::new();
+	out.try_reserve_exact(items.len()).map_err(|_| Error::Again)?;
+	for item in items {
+		out.push(item?);
+	}
+	Ok(out)
 }
 
 // The native LiberFS backend: the full read-write filesystem with snapshots, compression
@@ -1398,7 +1594,7 @@ impl FileSystem for DiskFs {
 	}
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
 		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.read_dir(dir) }.map_err(map_fs_err)?;
-		Ok(entries.into_iter().map(|(name, size, is_dir, mtime, ctime)| file_info(&name, size, is_dir, mtime, ctime)).collect())
+		try_collect(entries.into_iter().map(|(name, size, is_dir, mtime, ctime)| file_info(&name, size, is_dir, mtime, ctime)))
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
 		unsafe { block_capacity(self.fs.device().chan) }
@@ -1487,7 +1683,7 @@ impl FileSystem for FatBacking {
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
 		// the foreign backends do not surface timestamps yet: 0 renders as "-".
 		let entries = self.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
-		Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+		try_collect(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)))
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
 		unsafe { block_capacity(self.chan) }
@@ -1732,7 +1928,7 @@ impl FileSystem for IsoFs {
 	}
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
 		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.list_dir(dir) }.map_err(map_fs_err)?;
-		Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+		try_collect(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)))
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
 		unsafe { block_capacity(self.fs.device().chan) }
@@ -1756,7 +1952,7 @@ impl FileSystem for UdfFs {
 	}
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
 		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.list_dir(dir) }.map_err(map_fs_err)?;
-		Ok(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)).collect())
+		try_collect(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)))
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
 		unsafe { block_capacity(self.fs.device().chan) }
@@ -1801,11 +1997,12 @@ impl FileSystem for ArchiveFs {
 		}
 		let package = Package::parse(self.archive()).ok_or(Error::NotFound)?;
 		let mut files: Vec<FileInfo> = Vec::new();
+		files.try_reserve_exact(package.len()).map_err(|_| Error::Again)?;
 		for index in 0..package.len() {
 			if let Some(name) = package.name(index) {
 				let size: u64 = package.lookup(name).map(|b| b.len()).unwrap_or(0) as u64;
 				// the archive format carries no timestamps.
-				files.push(file_info(name, size, false, 0, 0));
+				files.push(file_info(name, size, false, 0, 0)?);
 			}
 		}
 		Ok(files)
@@ -2035,6 +2232,23 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 				print(b"storage: vol://system NOT mounted: the disk carries a filesystem written straight onto the medium (");
 				print(name.as_bytes());
 				print(b"), with no partition table. Nothing was changed - copy the data off before reusing this disk\n");
+			}
+			return None;
+		}
+		// The one that closes the hole this crate was written for and then left open by a
+		// hair: no table, nothing recognised, and bytes that are not zero. There is no
+		// complete list of filesystem signatures, so "I did not recognise it" was never
+		// evidence of an empty disk - and a raw ext4 begins one sector past where the probe
+		// used to stop looking.
+		partition::Disk::UnknownData => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: the disk carries data this build does not recognise, and no partition table. Nothing was changed - erase it deliberately if it really is scrap\n");
+			}
+			return None;
+		}
+		partition::Disk::NoMemory => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: this machine could not hold the disk's partition table while checking it. Nothing was changed - the disk may be perfectly fine\n");
 			}
 			return None;
 		}

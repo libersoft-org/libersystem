@@ -986,3 +986,48 @@ fn receiving_into_the_volume_costs_one_buffer_rather_than_two() {
 		assert_eq!(fs.used(), 48 * 1024, "the file holds what was received");
 	});
 }
+
+// M0139, fourth round: the residue of the reserved stream's commit.
+
+#[test]
+fn a_reserved_stream_commit_leaves_the_reservation_whole() {
+	// `stream_commit` takes the pending write out of the volume - which stops the PATH counting
+	// toward the footprint - and then has to keep that path alive while the store reads it. The
+	// resync therefore ran with those bytes held and unaccounted, and on a heap with no room to
+	// spare the regrow could fail over them. Nothing resynced afterwards, so a commit that
+	// SUCCEEDED could leave the volume no longer holding its capacity.
+	//
+	// Smaller than the version this replaced - that one competed with the whole file's buffer,
+	// this one with a name - which is why it survived: only a heap capped just past the volume
+	// makes the difference reachable at all.
+	//
+	// NOTHING is asserted inside the budgeted block. A failing assertion there panics, the panic
+	// machinery allocates, the cap refuses it and the process ABORTS - so the first version of this
+	// test turned an ordinary red into a dead harness, and did it only when run after its
+	// neighbours. Recording inside and judging outside costs one struct and cannot do that.
+	const CAPACITY: usize = 4096;
+	let name = alloc::vec![b'n'; 255];
+	let data = alloc::vec![0xA5u8; 512];
+	let mut committed: Result<(), FsError> = Err(FsError::Invalid);
+	let mut intact = false;
+	let mut held = (0u64, 0u64);
+	let mut volume: Option<LiberMemFs> = None;
+	within(CAPACITY + 512, || {
+		let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("a reserved volume mounts");
+		if fs.stream_begin(&name).is_err() || fs.stream_push(&data).is_err() {
+			return;
+		}
+		committed = fs.stream_commit();
+		intact = fs.reservation_intact();
+		held = (fs.footprint(), fs.reserved_bytes());
+		// The volume comes OUT of the block still holding what it holds. Reading the file inside
+		// would allocate the copy against the same cap and fail for a reason that has nothing to do
+		// with what is being tested.
+		volume = Some(fs);
+	});
+	let readback = volume.as_mut().and_then(|fs| fs.read_file(&name).ok());
+	assert_eq!(committed, Ok(()), "the commit lands");
+	assert!(intact, "and the volume still holds the capacity it promised (footprint {}, reserved {})", held.0, held.1);
+	assert_eq!(held.0 as usize + held.1 as usize, CAPACITY, "stored plus held is the capacity, as it always is");
+	assert_eq!(readback.as_deref(), Some(data.as_slice()), "the file is there and whole");
+}

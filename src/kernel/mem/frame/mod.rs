@@ -221,6 +221,7 @@ impl FrameAllocator {
 		// bad address cannot become free memory. Boot seeding passes this trivially - the
 		// record does not exist yet.
 		if !self.check_owned_free(base, pages) {
+			note_refused_free();
 			return;
 		}
 		self.mark_owned(base, pages, false);
@@ -234,6 +235,7 @@ impl FrameAllocator {
 		};
 		if overlaps_right || overlaps_left {
 			crate::serial_println!("frame: WARNING: double free refused - {} page(s) at {:#x} overlap the free pool", pages, base);
+			note_refused_free();
 			return;
 		}
 		let left_adjacent = at > 0 && {
@@ -420,6 +422,32 @@ pub fn totals() -> (usize, usize) {
 pub fn free_count() -> usize {
 	ALLOCATOR.lock().free_count
 }
+
+// How many frees this allocator has REFUSED, for tests only.
+//
+// The double-free test used to prove the refusal by watching the global free count not move, and
+// that count belongs to the whole machine: seven other cores are online while a test runs, and any
+// one of them freeing a frame in the window shifts it. The test failed twice on aarch64 with the
+// allocator working perfectly - once by one frame, once by four - which is the worst kind of red,
+// because an intermittently failing suite is how a real failure gets waved through.
+//
+// A counter of refusals is what the test actually wants to assert, and nothing else on the machine
+// touches it.
+#[cfg(test)]
+pub fn refused_frees() -> u64 {
+	REFUSED_FREES.load(core::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+static REFUSED_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn note_refused_free() {
+	REFUSED_FREES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+#[cfg(not(test))]
+fn note_refused_free() {}
 
 // Deterministic out-of-frames injection, for tests only.
 //

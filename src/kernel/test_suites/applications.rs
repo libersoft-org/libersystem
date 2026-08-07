@@ -458,6 +458,29 @@ fn the_memory_volumes_bound_and_answer_streams() {
 	let mut flood = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
 	assert!(flood.heartbeat_flood_from_silent_client(0x7c01, 2_000), "a client that never reads its heartbeat replies is dropped, not waited for");
 
+	// And the client that CANNOT be dropped, whose next request is a listing.
+	//
+	// Bounding each answer stopped the permanent stop and left starvation behind it: a client that
+	// stopped reading still has a queue full of requests, and each one cost the whole service
+	// another reply deadline. A subclient is dropped on its first stall and its backlog goes with
+	// it; the root is never dropped, because closing it ends the service - so a root that stopped
+	// listening held everyone up, one deadline per queued request. The waiting is what costs other
+	// people, so a client known not to be reading is answered once and abandoned.
+	let mut listing_flood = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	assert!(listing_flood.root_lists_after_filling_its_reply_queue(0x7c11, 2_000), "a client that stopped reading must cost its own progress and nobody else's");
+
+	// The client table has a ceiling, and reaching it is a refusal rather than an abort.
+	//
+	// There was neither: every `CONNECT` pushed into an unbounded `Vec` through an infallible
+	// allocation, so any holder of the service capability could grow it until the handle table or
+	// the heap gave out - and the allocator's answer to running out is to end the process. A
+	// service hardened against one client's stalls all the way through this milestone could still
+	// be killed by a client that simply asks a lot.
+	let mut crowd = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+	let granted = crowd.connect_until_refused(160).expect("the table has a ceiling and the service says so");
+	assert!(granted > 16, "the ceiling is far above what the system actually opens: {granted}");
+	assert!(crowd.write(b"vol://tmp/after-crowd", b"x", 0x7c21), "and the service is still serving after refusing");
+
 	// A stream handle the service cannot wait on is refused before it reaches the wait set.
 	//
 	// READ but no WAIT: every wait on it fails immediately, and a loop that retries on error spins

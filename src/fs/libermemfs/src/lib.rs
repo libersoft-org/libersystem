@@ -747,22 +747,25 @@ impl LiberMemFs {
 		// which is already satisfied - and the `extend_from_slice` below then grows the vector
 		// through the ordinary INFALLIBLE path. Under memory pressure that aborts the service,
 		// which is the single failure this filesystem exists to avoid.
-		// `chunk.len()`, NOT `want - capacity`.
-		//
-		// `try_reserve_exact(additional)` guarantees room for `len + additional`, not for
-		// `capacity + additional`. Reserving the difference from CAPACITY asks for too little
-		// whenever `len < capacity`, and the `extend_from_slice` below then grows the vector
-		// through the ordinary INFALLIBLE path - an abort where the volume should have reported
-		// NoSpace, which is the single failure this filesystem exists to avoid.
-		//
-		// Reachable only when the allocator returns more than was asked for: this path reserves
-		// exactly what it appends, so `len` and `capacity` move together otherwise. That makes it a
-		// latent defect rather than a reproducible one, and the reason no test here forces it.
 		if pending.data.try_reserve_exact(chunk.len()).is_err() {
 			self.stream_abort();
 			return Err(FsError::NoSpace);
 		}
 		pending.data.extend_from_slice(chunk);
+		// The check the preflight above cannot make: `try_reserve_exact` promises at least what was
+		// asked for and may give MORE, and the footprint counts what it actually gave. `stream_spare`
+		// has had this since over-allocation was first taken seriously; this path did not, so a
+		// generous allocator could carry a reserved volume past its own capacity through the public
+		// API. StorageService drives the memory filesystem through `stream_spare`, so production was
+		// covered and the hole was left exactly where a second caller would find it.
+		//
+		// Reachable only when the allocator returns more than was asked for: this path reserves
+		// exactly what it appends, so `len` and `capacity` move together otherwise. That makes it a
+		// latent defect rather than a reproducible one, and the reason no test here forces it.
+		if (self.footprint() as usize) > self.capacity {
+			self.stream_abort();
+			return Err(FsError::NoSpace);
+		}
 		self.resync_reservation();
 		Ok(())
 	}
@@ -825,20 +828,24 @@ impl LiberMemFs {
 	// volume never holds two versions of the contents at once.
 	pub fn stream_commit(&mut self) -> Result<(), FsError> {
 		let Some(pending) = self.pending.take() else { return Err(FsError::Invalid) };
-		// Adopt FIRST, resync once at the end.
+		// Adopt FIRST, resync ONCE, at the end - and the end is here, not inside the store.
 		//
-		// Resyncing here regrew the reservation while the data and the path were still alive in
-		// this local - memory the volume had just stopped counting and was about to hand to the
-		// file - so the regrow competed with itself. `write_file_owned` resyncs after the adoption,
-		// which is the only moment the volume's footprint is what it will be.
-		// ONE resync, and it is `write_file_owned`'s own.
+		// Resyncing before the adoption regrew the reservation while the data and the path were
+		// still alive in this local - memory the volume had just stopped counting and was about to
+		// hand to the file - so the regrow competed with itself. Moving it into the store fixed
+		// that and left a smaller version of the same shape behind.
 		//
-		// This used to resync again after dropping the path, which is where "resync once at the
-		// end" stopped being true. The second one could not be the only one either: the path has
-		// to stay alive while the store reads it, so whichever resync runs last still runs with it
-		// held. What matters is that it is now a path - a few hundred bytes at most - rather than
-		// the whole file's buffer, which is what the adopt-before-resync change removed.
-		self.write_file_owned(&pending.path, pending.data)
+		// The path has to stay alive while the store reads it, so a resync INSIDE the store runs
+		// with those bytes held and no longer counted - and could fail to regrow the reservation
+		// over them on a tight or fragmented heap, leaving it short after a commit that succeeded.
+		// A few hundred bytes rather than the whole file's buffer, and still not nothing.
+		//
+		// So the store does not resync: it adopts, the path drops when `pending` does, and the one
+		// resync happens here with the volume's footprint being exactly what it will be.
+		let stored = self.write_file_owned_unsynced(&pending.path, pending.data);
+		drop(pending.path);
+		self.resync_reservation();
+		stored
 	}
 
 	// Give up. The room goes back to the volume, and the destination is untouched - a stream that
@@ -854,6 +861,12 @@ impl LiberMemFs {
 	}
 
 	pub fn write_file_owned(&mut self, path: &[u8], data: Vec<u8>) -> Result<(), FsError> {
+		let stored = self.write_file_owned_unsynced(path, data);
+		self.resync_reservation();
+		stored
+	}
+
+	fn write_file_owned_unsynced(&mut self, path: &[u8], data: Vec<u8>) -> Result<(), FsError> {
 		if data.len() > MAX_FILE_BYTES {
 			return Err(FsError::TooLong);
 		}
@@ -891,9 +904,7 @@ impl LiberMemFs {
 		if self.policy == Policy::Reserved && is_new {
 			self.release_reservation();
 		}
-		let stored = self.adopt(parts, data, is_new);
-		self.resync_reservation();
-		stored
+		self.adopt(parts, data, is_new)
 	}
 
 	// Take ownership of `data` as the file at `parts`.

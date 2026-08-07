@@ -397,6 +397,55 @@ impl HandleTable {
 		self.insert(cap)
 	}
 
+	// Take a capability for a transfer that MIGHT fail, without killing the handle value yet.
+	//
+	// `take` retires the slot immediately, so a send that then fails leaves the capability with
+	// nowhere to go: `put_back` reissues it under a handle the caller has no way to learn, and the
+	// caller - following the only discipline available to it, closing what it could not send -
+	// closes a value that is already dead. The capability survives, unreachable and still charged.
+	// One leak per failed transfer, in userspace code doing exactly the right thing.
+	//
+	// So the slot is EMPTIED and RESERVED: its generation is untouched and its index does not go
+	// back to the free list, so nothing else can occupy it while the message is in flight. The
+	// handle names nothing until the outcome is known, which is the truth about it. Exactly one of
+	// [`commit_taken`] or [`restore_taken`] must follow.
+	pub fn take_for_transfer(&mut self, handle: Handle, rights: Rights) -> Result<Capability, HandleError> {
+		let index = handle.index() as usize;
+		{
+			let cap = self.live_cap_of(handle)?;
+			if !cap.rights.contains(rights) {
+				return Err(HandleError::AccessDenied);
+			}
+		}
+		let slot = self.slots.get_mut(index).ok_or(HandleError::BadHandle)?;
+		slot.cap.take().ok_or(HandleError::BadHandle)
+	}
+
+	// The transfer happened: the handle value dies now, and the quota is refunded.
+	pub fn commit_taken(&mut self, handle: Handle) {
+		let index = handle.index() as usize;
+		if let Some(slot) = self.slots.get_mut(index) {
+			retire_or_recycle(slot, &mut self.free, index);
+		}
+		if let Some(domain) = &self.domain {
+			domain.uncharge_handles(1);
+		}
+	}
+
+	// The transfer did not happen: the capability goes back to the handle it came from, still
+	// live, still the same value. A rejected send costs the caller nothing at all - not the
+	// capability, and not the handle it was named by.
+	pub fn restore_taken(&mut self, handle: Handle, cap: Capability) {
+		let index = handle.index() as usize;
+		if let Some(slot) = self.slots.get_mut(index) {
+			slot.cap = Some(cap);
+			return;
+		}
+		// The slot vanished under us, which nothing in this kernel does while a table is locked.
+		// Reissuing is still better than dropping the capability on the floor.
+		self.insert(cap);
+	}
+
 	pub fn close(&mut self, handle: Handle) -> Result<(), HandleError> {
 		let index = handle.index() as usize;
 		let slot = self.slots.get_mut(index).ok_or(HandleError::BadHandle)?;

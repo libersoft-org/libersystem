@@ -1586,20 +1586,35 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 		return ERR_INVALID;
 	}
 
-	// TAKE every capability, under one lock, or take none. The handles are gone from the
-	// sender's table when this block ends: a transfer moves a capability, and a move that
-	// leaves the source in place is a duplication however the bookkeeping is written.
+	// TAKE every capability, under one lock, or take none. A transfer moves a capability, and a
+	// move that leaves the source in place is a duplication however the bookkeeping is written.
+	//
+	// The handle VALUES stay alive until the message is actually delivered. They used to die at
+	// the take, so an undelivered send put the capabilities back under fresh handles the caller
+	// had no way to learn - and a caller doing the only sensible thing with a failed send, closing
+	// what it could not hand over, closed a value that was already dead and left the capability
+	// unreachable and still charged. One leaked capability per failed transfer, in userspace code
+	// that was correct. Nothing in the ABI could have told it otherwise.
+	//
+	// So the slots are emptied and RESERVED across the send: the handle names nothing while the
+	// message is in flight, which is the truth about it, and the outcome decides whether the value
+	// dies or comes back.
 	let mut caps: Vec<Capability> = Vec::with_capacity(count);
+	let mut taken: Vec<Handle> = Vec::with_capacity(count);
 	{
 		let mut table = thread.handles().lock();
-		for &handle in raw.iter().take(count) {
-			match table.take(Handle::from_raw(handle), Rights::TRANSFER) {
-				Ok(cap) => caps.push(cap),
+		for &raw_handle in raw.iter().take(count) {
+			let handle = Handle::from_raw(raw_handle);
+			match table.take_for_transfer(handle, Rights::TRANSFER) {
+				Ok(cap) => {
+					caps.push(cap);
+					taken.push(handle);
+				}
 				Err(err) => {
-					// put back whatever was taken before the refusal, so a rejected send
-					// costs the caller nothing but the handle VALUES, which are reissued.
-					for cap in caps {
-						table.put_back(cap);
+					// put back whatever was taken before the refusal, each to the handle it came
+					// from: a rejected send costs the caller nothing at all.
+					for (handle, cap) in taken.into_iter().zip(caps) {
+						table.restore_taken(handle, cap);
 					}
 					return match err {
 						HandleError::AccessDenied => ERR_ACCESS_DENIED,
@@ -1611,17 +1626,20 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 	}
 	match channel.send_charged_or_return(Message::new(bytes, caps, badge), thread.domain()) {
 		Ok(()) => {
+			// Delivered: the handle values die now, and their quota is refunded.
+			let mut table = thread.handles().lock();
+			for handle in taken {
+				table.commit_taken(handle);
+			}
 			thread.process().record_send();
 			0
 		}
 		Err(err) => {
-			// Undelivered: the capabilities come back. They arrive under new handles -
-			// their old slots died when they were taken - which is the honest outcome of
-			// a move that had to be undone, and better than the old behaviour of losing
-			// them or leaving two copies about.
+			// Undelivered: the capabilities go back to the handles they were named by, still live
+			// and still the same values, so the caller can close them or try again.
 			let mut table = thread.handles().lock();
-			for cap in err.1 {
-				table.put_back(cap);
+			for (handle, cap) in taken.into_iter().zip(err.1) {
+				table.restore_taken(handle, cap);
 			}
 			match err.0 {
 				ChannelError::PeerClosed => ERR_PEER_CLOSED,

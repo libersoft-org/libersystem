@@ -102,6 +102,19 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	while RAN_AT.load(Ordering::SeqCst) == 0 {
 		core::hint::spin_loop();
 	}
+	// The BEST of five trips, not every one of them.
+	//
+	// The property is "a queued thread does not wait for the next tick", and one trip cannot show it
+	// on a machine the test does not own: this suite runs under emulation on a shared host, and a
+	// single trip can lose milliseconds to the host's scheduler with the wake IPI working perfectly.
+	// It did exactly that on riscv64, where every guest instruction costs about twenty-five times
+	// what it does natively.
+	//
+	// Taking the minimum keeps the discrimination intact rather than widening the bound to hide the
+	// jitter. Without the IPI EVERY trip waits out a tick, so the fastest of five is still ~5 ms;
+	// with it, a trip is microseconds and only a host that stalls all five in a row could disguise
+	// that - and such a host has stopped being a place to measure anything at all.
+	let mut best = u64::MAX;
 	for _ in 0..5 {
 		RAN_AT.store(0, Ordering::SeqCst);
 		let start = arch::tsc::now();
@@ -110,8 +123,9 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 			core::hint::spin_loop();
 		}
 		let elapsed = arch::tsc::cycles_to_ns(RAN_AT.load(Ordering::SeqCst).wrapping_sub(start));
-		assert!(elapsed < TRIP_BOUND_NS, "a remote spawn waited out the tick: the wake IPI did not reach the halted core");
+		best = best.min(elapsed);
 	}
+	assert!(best < TRIP_BOUND_NS, "a remote spawn waited out the tick ({best} ns at best): the wake IPI did not reach the halted core");
 }
 
 crate::tagged_test!(scheduler_runs_across_cores, [Scheduler]);

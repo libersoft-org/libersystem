@@ -372,9 +372,19 @@ pub mod volume {
 		fn set_compression(&mut self, enabled: bool) -> Result<(), Error>;
 		fn fsck(&mut self) -> Result<FsckReport, Error>;
 		fn restore(&mut self, path: String, snapshot: String) -> Result<(), Error>;
-		/// The streaming write form (a file's size is bounded by the filesystem, never by
-		/// one transfer): the caller sends the file's bytes as plain messages on `data`
-		/// and closes it to mark the end; the reply comes once the whole file is written.
+		/// The streaming write form: the caller sends the file's bytes as plain messages on
+		/// `data` and closes it to mark the end; the reply comes once the whole file is
+		/// written. No single transfer bounds the file - that is what this form is for.
+		///
+		/// The RECEIVER may still bound it, and does. Where the filesystem states a ceiling of
+		/// its own (a memory volume knows its capacity) that ceiling applies; where it states
+		/// none (a disk volume knows only its free blocks, which is a lower bound rather than a
+		/// promise) the service applies a policy limit on what one stream may accumulate before
+		/// the write lands. Exceeding either is `again`, not `invalid`: it is a statement about
+		/// this moment, and a caller may retry or split the file.
+		///
+		/// This comment used to say a file was "bounded by the filesystem, never by one
+		/// transfer" and stop there, which reads as a promise the service does not make.
 		fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error>;
 	}
 
