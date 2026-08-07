@@ -2035,15 +2035,20 @@ pub unsafe fn interrupt_ack(handle: u64) {
 // Inject one byte into the kernel console input as a keystroke - used by the
 // virtio-input keyboard driver. The console service drops keystrokes while its display is
 // not focused. Returns 0 when the byte was taken, ERR_WOULD_BLOCK when it was not.
-pub unsafe fn console_feed(byte: u8) -> i64 {
-	unsafe { syscall(SYS_CONSOLE_FEED, byte as u64, 0, 0, 0) as i64 }
+//
+// `privilege` is a ConsoleInputSource capability, delegated down the boot chain to the one
+// component that should be able to type into a privileged console. Without it the call is
+// refused: typing at somebody else's shell is not something a process may do because it knows
+// the syscall number.
+pub unsafe fn console_feed(privilege: u64, byte: u8) -> i64 {
+	unsafe { syscall(SYS_CONSOLE_FEED, byte as u64, 0, privilege, 0) as i64 }
 }
 
 // `console_feed` on the serial arrival path, which the console service accepts whether or
 // not its display is focused - what a driven guest needs, since a runner typing into it
 // has no display to focus.
-pub unsafe fn console_feed_serial(byte: u8) -> i64 {
-	unsafe { syscall(SYS_CONSOLE_FEED, byte as u64, 1, 0, 0) as i64 }
+pub unsafe fn console_feed_serial(privilege: u64, byte: u8) -> i64 {
+	unsafe { syscall(SYS_CONSOLE_FEED, byte as u64, 1, privilege, 0) as i64 }
 }
 
 // Allocate a DmaBuffer of `size` bytes (pinned DMA memory charged to our Domain),
@@ -2072,8 +2077,8 @@ pub unsafe fn dma_buffer_phys(handle: u64) -> u64 {
 // returning the mapped virtual base (the raw pixel buffer pointer), or a negative
 // error. Hands the display to the caller - the kernel console stops drawing to it -
 // so only the ConsoleService should call it (once; a second call fails).
-pub unsafe fn framebuffer_map(fb: &mut Framebuffer) -> i64 {
-	unsafe { syscall(SYS_FRAMEBUFFER_MAP, fb as *mut Framebuffer as u64, core::mem::size_of::<Framebuffer>() as u64, 0, 0) as i64 }
+pub unsafe fn framebuffer_map(privilege: u64, fb: &mut Framebuffer) -> i64 {
+	unsafe { syscall(SYS_FRAMEBUFFER_MAP, fb as *mut Framebuffer as u64, core::mem::size_of::<Framebuffer>() as u64, privilege, 0) as i64 }
 }
 
 // Copy the kernel boot console's log text into `buf`, returning the number of bytes

@@ -309,6 +309,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	use object::channel::Message;
 	use object::handle::Capability;
 	use object::memory_object::MemoryObject;
+	use object::privilege::{Privilege, PrivilegeKind};
 	use object::rights::Rights;
 
 	let bytes = init_package_bytes().ok_or("init package module not found")?;
@@ -388,6 +389,18 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// so a production system never deliberately faults a process or stops a service.
 	let mode: u8 = if cfg!(test) { 1 } else { 0 };
 	kernel_ep.send(Message::new(alloc::vec![b'M', b'O', b'D', b'E', mode], alloc::vec::Vec::new(), 0)).map_err(|_| "failed to hand SystemManager the boot mode")?;
+
+	// Hand SystemManager the three console/display capabilities, in ONE message carrying three
+	// capabilities rather than three messages - the bootstrap is a strictly ordered sequence and
+	// every hop has to read it in the same order, so each message added is a place the chain can
+	// be got wrong. The order inside the message is the order every hop unpacks them:
+	// DisplayController, ConsoleInputSource, ConsoleSink.
+	//
+	// Like the power capability above, this process holds them only to pass them on. They are
+	// minted exactly here and nowhere else - no syscall creates one - so the three that exist
+	// after this line are the three that will ever exist.
+	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink].into_iter().map(|kind| Capability::new(Privilege::create(kind) as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
+	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges, 0)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
 	Ok((kernel_ep, sm_koid))
 }
 

@@ -220,6 +220,17 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 		}
 	};
 	let cpu_count = cpu_count.max(1);
+	// Svpbmt, before the first device is mapped. Without it `NO_CACHE` is dropped and MMIO gets
+	// whatever the platform's physical memory attributes say - which is right on QEMU virt and
+	// is not a general answer. With it, an uncacheable request becomes a PBMT=IO leaf and means
+	// what it says.
+	//
+	// Detected rather than assumed, and the default is off: bits 62:61 are RESERVED on a hart
+	// without the extension, so setting them where it is absent faults every mapping that uses
+	// them. A device tree that does not mention it leaves this port exactly where it was.
+	let svpbmt = super::dtb::has_isa_extension(dtb, b"svpbmt");
+	paging::set_svpbmt(svpbmt);
+	crate::serial_println!("riscv64: Svpbmt {} - uncacheable mappings {}", if svpbmt { "present" } else { "absent" }, if svpbmt { "use PBMT=IO" } else { "fall back to platform PMAs" });
 	let _ = _plic_base;
 
 	// Record the device-tree PCIe ECAM base (under 8 GiB, so the boot direct map already

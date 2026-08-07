@@ -1018,6 +1018,16 @@ fn memory_stats(request: u32, sink: &mut impl Sink) -> bool {
 	sink.send(OP_MEM_STATS_REPLY, request, 0, ST_OK, &reply)
 }
 
+// The ConsoleInputSource capability this agent was handed at bootstrap, which
+// `SYS_CONSOLE_FEED` requires. Typing into a live console on a driven guest is exactly the
+// authority that had no capability behind it, so the dev agent carries one like any other
+// holder rather than being exempt for being a development tool.
+//
+// Zero when the boot handed out none, in which case the feed is refused and a scenario that
+// tries to type gets ST_TERM_REFUSED - which is what a refusal should look like from the far
+// end of the wire.
+pub(crate) static CONSOLE_INPUT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn terminal_input(request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
 	if payload.is_empty() {
 		return sink.send(OP_ERROR, request, 0, ST_MALFORMED, &[]);
@@ -1026,8 +1036,9 @@ fn terminal_input(request: u32, payload: &[u8], sink: &mut impl Sink) -> bool {
 		return sink.send(OP_ERROR, request, 0, ST_OVERSIZED, &[]);
 	}
 	let mut accepted: u16 = 0;
+	let privilege = CONSOLE_INPUT.load(core::sync::atomic::Ordering::Relaxed);
 	for &byte in payload {
-		if unsafe { console_feed_serial(byte) } != 0 {
+		if unsafe { console_feed_serial(privilege, byte) } != 0 {
 			break;
 		}
 		accepted += 1;

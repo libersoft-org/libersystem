@@ -1273,3 +1273,125 @@ fn a_fuzzed_elf_header_is_refused_without_leaking() {
 	assert!(loaded < ITERATIONS, "every fuzzed image loaded: the fuzz is not reaching the checks");
 	crate::serial_println!("({loaded}/{ITERATIONS} fuzzed images still loaded) ");
 }
+
+tagged_test!(a_fuzzed_relocation_table_is_refused_without_leaking, [Dynamic, Memory, Process]);
+fn a_fuzzed_relocation_table_is_refused_without_leaking() {
+	// The other structure the loader walks on an image's say-so. A `.dynamic` array names where
+	// the relocations are, how many, and how wide; each relocation names an address to patch
+	// and a value to patch in. Every one of those numbers is the image's, and the loader writes
+	// through them into the address space it is building.
+	//
+	// Same two properties per iteration as the header fuzz: the call returns, and the frame
+	// pool afterwards is exactly what it was. Fixed-seed xorshift.
+	use crate::mem::frame;
+	use crate::object::address_space::AddressSpace;
+
+	fn put16(bytes: &mut [u8], offset: usize, value: u16) {
+		bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+	}
+	fn put32(bytes: &mut [u8], offset: usize, value: u32) {
+		bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+	}
+	fn put64(bytes: &mut [u8], offset: usize, value: u64) {
+		bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+	}
+	fn program_header(bytes: &mut [u8], index: usize, kind: u32, flags: u32, offset: u64, address: u64, file_size: u64, memory_size: u64) {
+		let at = 64 + index * 56;
+		put32(bytes, at, kind);
+		put32(bytes, at + 4, flags);
+		put64(bytes, at + 8, offset);
+		put64(bytes, at + 16, address);
+		put64(bytes, at + 24, 0);
+		put64(bytes, at + 32, file_size);
+		put64(bytes, at + 40, memory_size);
+		put64(bytes, at + 48, 1);
+	}
+
+	const CODE_OFFSET: usize = 0x200;
+	const DATA_OFFSET: usize = 0x300;
+	const DATA_ADDRESS: u64 = 0x2000;
+	const RELA_OFFSET: usize = 0x40;
+	const DYNAMIC_OFFSET: usize = 0x80;
+	const DATA_LEN: usize = 0x100;
+
+	// A relative-only ET_DYN that loads: one relocation adding the bias to a word in its data
+	// segment. Damage lands in the RELA and .dynamic bytes, which is what makes this a
+	// relocation fuzz rather than a header one.
+	fn well_formed() -> Vec<u8> {
+		let mut bytes = alloc::vec![0u8; DATA_OFFSET + DATA_LEN];
+		bytes[..4].copy_from_slice(b"\x7fELF");
+		bytes[4] = 2;
+		bytes[5] = 1;
+		put16(&mut bytes, 16, 3); // ET_DYN
+		put16(&mut bytes, 18, elf_machine());
+		put32(&mut bytes, 20, 1);
+		put64(&mut bytes, 24, 0);
+		put64(&mut bytes, 32, 64);
+		put16(&mut bytes, 52, 64);
+		put16(&mut bytes, 54, 56);
+		put16(&mut bytes, 56, 3);
+		program_header(&mut bytes, 0, 1, 5, CODE_OFFSET as u64, 0, 1, 1);
+		program_header(&mut bytes, 1, 1, 6, DATA_OFFSET as u64, DATA_ADDRESS, DATA_LEN as u64, DATA_LEN as u64);
+		program_header(&mut bytes, 2, 2, 6, (DATA_OFFSET + DYNAMIC_OFFSET) as u64, DATA_ADDRESS + DYNAMIC_OFFSET as u64, 5 * 16, 5 * 16);
+		bytes[CODE_OFFSET] = 0xc3;
+		let rela = DATA_OFFSET + RELA_OFFSET;
+		put64(&mut bytes, rela, DATA_ADDRESS);
+		put64(&mut bytes, rela + 8, relative_relocation_type() as u64);
+		put64(&mut bytes, rela + 16, 0x1234);
+		let dynamic = DATA_OFFSET + DYNAMIC_OFFSET;
+		for (index, (tag, value)) in [(7u64, DATA_ADDRESS + RELA_OFFSET as u64), (8, 24), (9, 24), (0x6fff_fff9, 1), (0, 0)].into_iter().enumerate() {
+			put64(&mut bytes, dynamic + index * 16, tag);
+			put64(&mut bytes, dynamic + index * 16 + 8, value);
+		}
+		bytes
+	}
+
+	// Prove the undamaged one loads, so a fuzz that refuses everything is visible as a bug in
+	// the fixture rather than as evidence about the loader.
+	{
+		let space = AddressSpace::create().expect("a scratch address space");
+		let mut frames = Vec::new();
+		let mut shared = Vec::new();
+		crate::elf::load_into(&well_formed(), &space, &mut frames, &mut shared).expect("the undamaged fixture must load");
+		// SAFETY: frames from this load, named by nothing else now that the space is going.
+		drop(space);
+		unsafe { frame::free_pages(&frames) };
+	}
+
+	let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+	let mut next = move || {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		state
+	};
+
+	const ITERATIONS: usize = 400;
+	// The RELA entries and the .dynamic array, and nothing else: [RELA_OFFSET, DYNAMIC_OFFSET +
+	// 5*16) inside the data segment.
+	let damage_lo = DATA_OFFSET + RELA_OFFSET;
+	let damage_hi = DATA_OFFSET + DYNAMIC_OFFSET + 5 * 16;
+	let mut loaded = 0;
+	let before = frame::free_count();
+	for iteration in 0..ITERATIONS {
+		let mut image = well_formed();
+		for _ in 0..(1 + next() % 4) {
+			let at = damage_lo + (next() as usize) % (damage_hi - damage_lo);
+			image[at] = next() as u8;
+		}
+		let space = AddressSpace::create().expect("a scratch address space");
+		let mut frames = Vec::new();
+		let mut shared = Vec::new();
+		if crate::elf::load_into(&image, &space, &mut frames, &mut shared).is_ok() {
+			loaded += 1;
+		}
+		drop(shared);
+		drop(space);
+		// SAFETY: every frame here came from this load; the space that mapped them is gone.
+		unsafe { frame::free_pages(&frames) };
+		assert_eq!(frame::free_count(), before, "iteration {iteration} left the frame pool short");
+	}
+	assert!(loaded > 0, "every fuzzed relocation table was refused: the fuzz is not producing loadable ones");
+	assert!(loaded < ITERATIONS, "every fuzzed relocation table loaded: the fuzz is not reaching the checks");
+	crate::serial_println!("({loaded}/{ITERATIONS} fuzzed relocation tables still loaded) ");
+}

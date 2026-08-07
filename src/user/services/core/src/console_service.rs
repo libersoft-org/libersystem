@@ -193,6 +193,18 @@ impl proto::codec::Transport for DeadlineTransport {
 
 // Mint a client connection from a serve_multi `factory` under the same bounded
 // wait; 0 when the factory does not answer in time.
+// The ConsoleSink capability this service was handed at bootstrap, which `SYS_CONSOLE_ATTACH`
+// requires. A static because the attach happens deep inside the VT bring-up rather than where
+// the bootstrap is read - the same shape as the keyboard driver's POWER handle.
+//
+// Zero when the boot handed out none, in which case the attach is refused and this service runs
+// without the kernel feeding it input, rather than failing to start.
+static CONSOLE_SINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn console_sink() -> u64 {
+	CONSOLE_SINK.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 unsafe fn connect_deadline(factory: u64, ticks: u64) -> u64 {
 	unsafe {
 		let req: [u8; 2] = CONNECT_OP.to_le_bytes();
@@ -314,6 +326,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    and InputService's pointer forward (absent on a headless / pointerless boot,
 		//    read as 0).
 		let mut caps: CapSet = recv_caps(bootstrap);
+		// The ConsoleSink capability, which `SYS_CONSOLE_ATTACH` requires: it is what makes this
+		// service, and not any process that knows the syscall number, the one the kernel feeds
+		// console input to.
+		CONSOLE_SINK.store(caps.take(b"CONSOLESINK"), core::sync::atomic::Ordering::Relaxed);
 		let required = |h: u64| -> u64 {
 			if h == 0 {
 				fail_bootstrap(bootstrap, b"capability", b"required console capability not granted")
@@ -397,7 +413,15 @@ unsafe fn run(console: &mut Console) -> ! {
 			Some(pair) => pair,
 			None => exit(),
 		};
-		if sys_is_err(syscall(SYS_CONSOLE_ATTACH, feed, 0, 0, 0)) {
+		// Attach only if we hold the ConsoleSink capability. Without one the kernel feeds this
+		// service nothing and it renders output with no keyboard - a degradation, and the same
+		// one the keyboard driver takes when it is handed no power capability.
+		//
+		// Exiting instead is what this did, and it is the wrong answer for a MISSING capability:
+		// it turns a console with no input into no console at all. A failed attach while
+		// holding one is still fatal, because that is a real error rather than an absent grant.
+		let sink: u64 = console_sink();
+		if sink != 0 && sys_is_err(syscall(SYS_CONSOLE_ATTACH, feed, sink, 0, 0)) {
 			exit();
 		}
 		console.input = input;

@@ -336,3 +336,60 @@ fn a_group_handle_becomes_waitable_only_once_every_stage_ends() {
 	crate::sched::run_until_idle();
 	assert!(READY.load(Ordering::SeqCst), "the group is ready once every stage has ended");
 }
+
+crate::tagged_test!(the_console_and_display_syscalls_refuse_a_caller_without_the_capability, [Object, Kernel, Syscall]);
+fn the_console_and_display_syscalls_refuse_a_caller_without_the_capability() {
+	use super::privilege::{Privilege, PrivilegeKind};
+	use core::sync::atomic::{AtomicI64, Ordering};
+
+	// Three syscalls that used to need nothing but their own number: `SYS_FRAMEBUFFER_MAP`
+	// took the display, `SYS_CONSOLE_ATTACH` redirected the console's input sink, and
+	// `SYS_CONSOLE_FEED` typed into a privileged console. Each now needs a Privilege of the
+	// matching kind.
+	//
+	// Three refusals are asserted per call, and the third is the one that matters: holding
+	// SOME privilege is not enough. If the kind were not checked, any component granted one of
+	// the three would hold all three - and the whole reason there are three is that feeding
+	// the console and owning the display are different authorities held by different
+	// components.
+	//
+	// The SUCCESS path is asserted only for `console_feed`, which is harmless: with no console
+	// attached it answers WOULD_BLOCK, which is a refusal by the console rather than by the
+	// gate. The other two succeed by taking the display and the input sink away from the
+	// running system, which would end the suite.
+	static NO_HANDLE: [AtomicI64; 3] = [AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)];
+	static WRONG_KIND: [AtomicI64; 3] = [AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)];
+	static RIGHT_KIND_FEED: AtomicI64 = AtomicI64::new(0);
+
+	extern "C" fn body(feed_privilege: u64) {
+		unsafe {
+			use crate::arch::syscall::invoke;
+			use crate::syscall::{SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_FRAMEBUFFER_MAP};
+			let mut fb = [0u8; 128];
+			// No capability at all.
+			NO_HANDLE[0].store(invoke(SYS_CONSOLE_FEED, b'x' as u64, 0, 0, 0) as i64, Ordering::SeqCst);
+			NO_HANDLE[1].store(invoke(SYS_CONSOLE_ATTACH, 0, 0, 0, 0) as i64, Ordering::SeqCst);
+			NO_HANDLE[2].store(invoke(SYS_FRAMEBUFFER_MAP, fb.as_mut_ptr() as u64, fb.len() as u64, 0, 0) as i64, Ordering::SeqCst);
+			// A real capability of the WRONG kind: this thread holds a ConsoleInputSource, so
+			// the two calls that want the other two kinds must still refuse it.
+			WRONG_KIND[0].store(invoke(SYS_CONSOLE_ATTACH, 0, feed_privilege, 0, 0) as i64, Ordering::SeqCst);
+			WRONG_KIND[1].store(invoke(SYS_FRAMEBUFFER_MAP, fb.as_mut_ptr() as u64, fb.len() as u64, feed_privilege, 0) as i64, Ordering::SeqCst);
+			// And the matching kind gets past the gate. WOULD_BLOCK (no console attached) is
+			// the console's answer, which means the capability check let it through.
+			RIGHT_KIND_FEED.store(invoke(SYS_CONSOLE_FEED, b'x' as u64, 0, feed_privilege, 0) as i64, Ordering::SeqCst);
+		}
+	}
+
+	let feed = Privilege::create(PrivilegeKind::ConsoleInputSource);
+	crate::sched::spawn_with_object(body, feed, Rights::ALL, 0);
+	crate::sched::run_until_idle();
+
+	for (index, name) in ["console_feed", "console_attach", "framebuffer_map"].iter().enumerate() {
+		assert!(crate::syscall::sys_is_err(NO_HANDLE[index].load(Ordering::SeqCst) as u64), "{name} must refuse a caller holding no capability");
+	}
+	for (index, name) in ["console_attach", "framebuffer_map"].iter().enumerate() {
+		assert_eq!(WRONG_KIND[index].load(Ordering::SeqCst), crate::syscall::ERR_ACCESS_DENIED, "{name} must refuse a capability of the wrong kind");
+	}
+	let allowed = RIGHT_KIND_FEED.load(Ordering::SeqCst);
+	assert!(allowed == 0 || allowed == crate::syscall::ERR_WOULD_BLOCK, "console_feed with the matching capability must get past the gate, not be refused by it (got {allowed})");
+}

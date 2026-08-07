@@ -19,7 +19,7 @@
 // the newer call. A starting process reports the version it was built against through
 // SYS_ABI_CHECK, and the kernel refuses a mismatch (ERR_ABI_MISMATCH) so a binary built
 // against a different revision is stopped at startup instead of misbehaving.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 // Control messages intercepted by the userspace runtime before typed LSIDL
 // dispatch. Typed interface opcodes must stay at or below TYPED_OP_MAX.

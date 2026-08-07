@@ -31,6 +31,7 @@ use crate::object::event::Event;
 use crate::object::handle::{Capability, Handle, HandleError};
 use crate::object::interrupt::Interrupt;
 use crate::object::memory_object::{MemoryError, MemoryObject};
+use crate::object::privilege::{Privilege, PrivilegeKind};
 use crate::object::process::Process;
 use crate::object::rights::Rights;
 use crate::object::thread::Thread;
@@ -230,6 +231,20 @@ pub(crate) fn alloc_kernel_vrange(len: u64) -> u64 {
 	KERNEL_VMAP.lock().alloc(len)
 }
 
+// Does the caller hold the named authority? The three console/display syscalls had nothing to
+// check at all - knowing the syscall number was the whole qualification - so any process could
+// take the display before DisplayService did, redirect the console's input sink, or type into a
+// privileged console. Each now takes a handle to a `Privilege` of the matching kind, minted once
+// at boot and delegated down the boot chain to the one component that should hold it.
+//
+// There is no ring-0 exemption. Nothing in the kernel calls these three, so exempting ring 0
+// would buy nothing and would leave the check untested - the suite drives syscalls from kernel
+// threads, and a gate every test walks around is a gate nobody has walked through.
+fn holds_privilege(handle: u64, kind: PrivilegeKind) -> Result<(), i64> {
+	let privilege = current_typed::<Privilege>(handle, ObjectType::Privilege, Rights::NONE)?;
+	if privilege.kind() != kind { Err(ERR_ACCESS_DENIED) } else { Ok(()) }
+}
+
 // The address space a mapping made by this syscall belongs to: the caller's own for a
 // ring-3 caller, the shared kernel space for a ring-0 one. Either way it wraps the page
 // tables that are active right now, which is why the map paths can go on using
@@ -383,8 +398,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0),
 		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
 		SYS_SYSTEM_POWER => sys_system_power(a0, a1),
-		SYS_CONSOLE_FEED => sys_console_feed(a0, a1),
-		SYS_FRAMEBUFFER_MAP => sys_framebuffer_map(a0, a1),
+		SYS_CONSOLE_FEED => sys_console_feed(a0, a1, a2),
+		SYS_FRAMEBUFFER_MAP => sys_framebuffer_map(a0, a1, a2),
 		SYS_CONSOLE_READLOG => sys_console_readlog(a0, a1),
 		SYS_OBJECT_PROPERTY_SET => sys_object_property_set(a0, a1, a2, a3),
 		SYS_PROCESS_CREATE => sys_process_create(a0),
@@ -398,7 +413,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_SIGNAL_TAKE => sys_signal_take(a0),
 		SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2, a3),
 		SYS_THREAD_START => sys_thread_start(a0),
-		SYS_CONSOLE_ATTACH => sys_console_attach(a0),
+		SYS_CONSOLE_ATTACH => sys_console_attach(a0, a1),
 		SYS_DEVICE_COUNT => device::count() as i64,
 		SYS_DEVICE_INFO => sys_device_info(a0, a1, a2),
 		SYS_DEVICE_ACQUIRE => sys_device_acquire(a0),
@@ -563,7 +578,13 @@ fn sys_dma_buffer_phys(handle: u64, offset: u64) -> i64 {
 // then stops drawing (the display belongs to the caller). Once-only: a second call
 // (after the display is handed out) returns ERR_INVALID. Intended for a single
 // userspace ConsoleService; capability-gating it is a later hardening.
-fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64) -> i64 {
+fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64, privilege: u64) -> i64 {
+	// `privilege` names a DisplayController. Without it, the display went to whoever asked
+	// first - and asking first is a race any process at boot could try to win, after which the
+	// kernel console is off and the screen belongs to the winner.
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::DisplayController) {
+		return error;
+	}
 	let size = core::mem::size_of::<abi::Framebuffer>() as u64;
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
@@ -956,7 +977,12 @@ fn sys_system_power(handle: u64, action: u64) -> i64 {
 // either a full input queue or no console service attached at all. The answer was always
 // computed here and always discarded; a caller driving the guest has to know whether what
 // it sent arrived.
-fn sys_console_feed(byte: u64, serial: u64) -> i64 {
+fn sys_console_feed(byte: u64, serial: u64, privilege: u64) -> i64 {
+	// `privilege` names a ConsoleInputSource. Without it any process could type into a
+	// privileged console - shell commands, a password, a confirmation - as if a person had.
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::ConsoleInputSource) {
+		return error;
+	}
 	let accepted = if serial != 0 { crate::console_input::feed_serial(byte as u8) } else { crate::console_input::feed(byte as u8) };
 	if accepted { 0 } else { ERR_WOULD_BLOCK }
 }
@@ -1276,7 +1302,13 @@ fn sys_signal_take(signal: u64) -> i64 {
 // Register the calling thread's channel as the kernel's console input sink: the
 // kernel reads serial bytes and sends them on it, and the userspace shell receives
 // them on the peer endpoint. The handle must name a Channel the caller can send on.
-fn sys_console_attach(handle: u64) -> i64 {
+fn sys_console_attach(handle: u64, privilege: u64) -> i64 {
+	// `privilege` names a ConsoleSink. Without it any process could take over the channel the
+	// kernel feeds console input to - reading every keystroke meant for the shell - and silence
+	// the kernel's own console on the way past.
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::ConsoleSink) {
+		return error;
+	}
 	let channel = match current_typed::<Channel>(handle, ObjectType::Channel, Rights::SEND) {
 		Ok(o) => o,
 		Err(e) => return e,

@@ -1452,3 +1452,216 @@ fn wait_any_on_only_a_timer_returns_when_it_fires() {
 	assert!(WOKE.load(Ordering::SeqCst), "wait_any over a lone timer must return when it is armed");
 	assert_eq!(RESULT.load(Ordering::SeqCst), 0, "it should report index 0 - the handle that became ready");
 }
+
+// A fixed-seed xorshift, so every fuzz below is reproducible from its iteration number.
+fn xorshift(state: &mut u64) -> u64 {
+	*state ^= *state << 13;
+	*state ^= *state >> 7;
+	*state ^= *state << 17;
+	*state
+}
+
+tagged_test!(a_fuzzed_capability_batch_never_mints_a_capability, [Syscall, Ipc, Process]);
+fn a_fuzzed_capability_batch_never_mints_a_capability() {
+	// The capability array is entirely the caller's: a count and a list of handle values, read
+	// out of its memory. Counts out of range, handles that name nothing, handles that name the
+	// wrong type, the same handle several times, the transport itself in its own batch.
+	//
+	// The invariant is one number and it is the right one: a transfer MOVES authority, so the
+	// number of capabilities the sender holds may fall or stay the same across any call, and may
+	// never rise. A batch that minted one would show up here whatever route it took.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let (transport, _peer) = channel_pair(8);
+			let mut pool = [0u64; 6];
+			for slot in pool.iter_mut() {
+				let (endpoint, _other) = channel_pair(2);
+				*slot = endpoint;
+			}
+			let payload = [0u8; 16];
+			let mut state: u64 = 0xDEAD_BEEF_C0FF_EE01;
+			for iteration in 0..600 {
+				// A count that is sometimes legal and sometimes not - zero, over
+				// MAX_MESSAGE_CAPS, absurd - because the count is a caller value too.
+				let count = match xorshift(&mut state) % 8 {
+					0 => 0,
+					1 => (abi::MAX_MESSAGE_CAPS + 1) as u64,
+					2 => u64::MAX,
+					n => n,
+				};
+				let mut request = [0u64; 9];
+				request[0] = count;
+				for slot in request[1..].iter_mut() {
+					*slot = match xorshift(&mut state) % 4 {
+						// a real handle, so batches that could succeed do
+						0 | 1 => pool[(xorshift(&mut state) as usize) % pool.len()],
+						// the transport itself, which would be sending the floor away
+						2 => transport,
+						// a value that names nothing
+						_ => xorshift(&mut state),
+					};
+				}
+				let before = live_handle_count();
+				let result = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS, transport, payload.as_ptr() as u64, payload.len() as u64, request.as_ptr() as u64);
+				let after = live_handle_count();
+				assert!(after <= before, "iteration {iteration} ended with MORE capabilities than it started with ({before} -> {after}): a transfer minted one");
+				// A refusal must cost nothing at all; only a success may move handles out.
+				if syscall::sys_is_err(result) {
+					assert_eq!(after, before, "iteration {iteration}: a refused batch took capabilities with it");
+				}
+				// Drain, so the transport's queue does not become the only reason for a
+				// refusal for the rest of the run.
+				let mut drain = [0u8; 16];
+				let mut caps_out = [0u64; abi::MAX_MESSAGE_CAPS + 1];
+				while !syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, transport, drain.as_mut_ptr() as u64, drain.len() as u64, caps_out.as_mut_ptr() as u64)) {
+					for index in 0..caps_out[0].min(abi::MAX_MESSAGE_CAPS as u64) as usize {
+						arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, caps_out[index + 1], 0, 0, 0);
+					}
+				}
+				// Replace anything the fuzz gave away, so later iterations still have real
+				// handles to name.
+				for slot in pool.iter_mut() {
+					if !handle_is_live(*slot) {
+						let (endpoint, _other) = channel_pair(2);
+						*slot = endpoint;
+					}
+				}
+			}
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the capability fuzz ran to completion");
+}
+
+tagged_test!(handle_churn_never_resurrects_a_closed_capability, [Syscall, Process]);
+fn handle_churn_never_resurrects_a_closed_capability() {
+	// A handle packs a generation above a slot index, and a closed slot goes back on the free
+	// list to be reissued. The generation is what keeps the old VALUE from naming the new
+	// occupant - a stale handle that comes back to life is authority resurrected, and the
+	// holder never asked for it.
+	//
+	// So: churn the table hard, remember every handle ever closed, and after every round demand
+	// that not one of them names anything.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let mut dead: Vec<u64> = Vec::new();
+			let mut live: Vec<u64> = Vec::new();
+			let mut state: u64 = 0x0123_4567_89AB_CDEF;
+			for round in 0..400 {
+				match xorshift(&mut state) % 3 {
+					// open
+					0 => {
+						let (endpoint, other) = channel_pair(2);
+						live.push(endpoint);
+						live.push(other);
+					}
+					// duplicate an existing one, which installs into a free slot
+					1 if !live.is_empty() => {
+						let source = live[(xorshift(&mut state) as usize) % live.len()];
+						let duplicate = arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, source, (abi::RIGHT_WAIT | abi::RIGHT_READ) as u64, 0, 0);
+						if !syscall::sys_is_err(duplicate) {
+							live.push(duplicate);
+						}
+					}
+					// close one
+					_ if !live.is_empty() => {
+						let index = (xorshift(&mut state) as usize) % live.len();
+						let handle = live.swap_remove(index);
+						assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0, "closing a live handle");
+						dead.push(handle);
+						// Closing it twice must be refused, not silently accepted.
+						assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0)), "round {round}: a handle closed twice was accepted the second time");
+					}
+					_ => {}
+				}
+				// Every handle ever closed, checked against the table as it is NOW - after
+				// whatever reissues have happened since.
+				for &handle in dead.iter() {
+					assert!(!handle_is_live(handle), "round {round}: handle {handle:#x} came back to life after being closed");
+				}
+			}
+			assert!(dead.len() > 16, "the churn closed only {} handles: it is not exercising reissue", dead.len());
+			for handle in live {
+				arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0);
+			}
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the handle churn ran to completion");
+}
+
+tagged_test!(fuzzed_map_and_unmap_sequences_round_trip_the_window, [Syscall, Memory]);
+fn fuzzed_map_and_unmap_sequences_round_trip_the_window() {
+	// Map and unmap in an order nobody wrote down: doubles, unmaps of things that were never
+	// mapped, unmaps repeated, interleaved across several objects. Each call must answer rather
+	// than act on a wrong assumption, and when it is all over and everything is unmapped, the
+	// virtual window and the frame pool must both be exactly where they started.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			const OBJECTS: usize = 5;
+			let page = mem::frame::PAGE_SIZE;
+			let mut handles = [0u64; OBJECTS];
+			let mut mapped = [false; OBJECTS];
+			let mut total_pages = 0u64;
+			for (index, slot) in handles.iter_mut().enumerate() {
+				let pages = 1 + index as u64 % 3;
+				let handle = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, pages * page, 0, 0, 0);
+				assert!(!syscall::sys_is_err(handle), "memory_object_create");
+				*slot = handle;
+				total_pages += pages;
+			}
+			let frames_before = mem::frame::free_count();
+			let mut state: u64 = 0xF00D_FACE_1357_9BDF;
+			for iteration in 0..600 {
+				let which = (xorshift(&mut state) as usize) % OBJECTS;
+				let handle = handles[which];
+				if xorshift(&mut state) % 2 == 0 {
+					let result = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, handle, 0, 0, 0);
+					if mapped[which] {
+						assert!(syscall::sys_is_err(result), "iteration {iteration}: mapping an already-mapped object must be refused");
+					} else {
+						assert!(!syscall::sys_is_err(result), "iteration {iteration}: mapping an unmapped object must succeed");
+						mapped[which] = true;
+					}
+				} else {
+					let result = arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, handle, 0, 0, 0) as i64;
+					if mapped[which] {
+						assert_eq!(result, 0, "iteration {iteration}: unmapping a mapped object must succeed");
+						mapped[which] = false;
+					} else {
+						assert!(syscall::sys_is_err(result as u64), "iteration {iteration}: unmapping something that is not mapped must be refused");
+					}
+				}
+			}
+			for (index, handle) in handles.iter().enumerate() {
+				if mapped[index] {
+					assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, *handle, 0, 0, 0) as i64, 0);
+				}
+			}
+			assert_eq!(mem::frame::free_count(), frames_before, "the churn moved the frame pool");
+			// And the window took every range back: a fresh map of the largest object still
+			// fits where the churn left off rather than climbing away from it.
+			let base = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, handles[2], 0, 0, 0);
+			assert!(!syscall::sys_is_err(base), "the window still has room after 600 map/unmap rounds");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, handles[2], 0, 0, 0) as i64, 0);
+			for handle in handles {
+				assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0);
+			}
+			assert_eq!(mem::frame::free_count() as u64, frames_before as u64 + total_pages, "closing every object must return every page of frames it held");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the map/unmap fuzz ran to completion");
+}

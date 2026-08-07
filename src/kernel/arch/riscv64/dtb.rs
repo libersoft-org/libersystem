@@ -38,3 +38,13 @@ fn locate(hint: u64) -> Option<u64> {
 pub fn parse(hint: u64) -> Option<BootInfo> {
 	at(locate(hint)?).parse()
 }
+
+// Does this machine's device tree advertise `want` (a lowercase ISA extension name) on its CPUs?
+// False when no FDT can be found, which is the safe direction: an undetected extension is one
+// this port does not use.
+pub fn has_isa_extension(hint: u64, want: &[u8]) -> bool {
+	match locate(hint) {
+		Some(base) => at(base).has_isa_extension(want),
+		None => false,
+	}
+}

@@ -43,6 +43,28 @@ const PTE_D: u64 = 1 << 7; // dirty
 // A leaf PTE has at least one of R/W/X set; a pointer (non-leaf) has R=W=X=0.
 const PTE_RWX: u64 = PTE_R | PTE_W | PTE_X;
 
+// Svpbmt page-based memory types, in bits 62:61 of a leaf PTE. 0 = PMA (whatever the platform
+// says), 1 = NC (non-cacheable, idempotent), 2 = IO (non-cacheable, non-idempotent, strongly
+// ordered) - which is what a device register file needs.
+const PTE_PBMT_IO: u64 = 2 << 61;
+
+// Whether this machine's harts implement Svpbmt, read from the device tree once at boot.
+//
+// Default FALSE, and it stays false unless a device tree says otherwise. That direction is not
+// a preference, it is a requirement: bits 62:61 are RESERVED on a hart without the extension,
+// and a PTE that sets them there faults. Guessing wrong costs every mapping that uses it.
+static SVPBMT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// Record whether Svpbmt is available. Called once during boot, after the device tree is
+// located and before the first device is mapped.
+pub fn set_svpbmt(available: bool) {
+	SVPBMT.store(available, core::sync::atomic::Ordering::Release);
+}
+
+fn svpbmt() -> bool {
+	SVPBMT.load(core::sync::atomic::Ordering::Acquire)
+}
+
 // Map a physical address to its kernel virtual address in the direct map.
 #[inline(always)]
 pub fn phys_to_virt(pa: u64) -> u64 {
@@ -97,13 +119,16 @@ fn flush_tlb() {
 // make the gap ASKABLE rather than implied - a caller or a test can find out - and to
 // leave the real answer (Svpbmt, or a platform PMA check) as work this port still owes.
 pub fn no_cache_supported() -> bool {
-	false
+	svpbmt()
 }
 
 fn leaf_bits(flags: u64) -> u64 {
-	// `NO_CACHE` is deliberately not translated: see `no_cache_supported`. The mapper
-	// refuses such a request rather than quietly dropping it.
+	// `NO_CACHE` becomes a PBMT=IO leaf where Svpbmt is available, and is dropped where it is
+	// not - see `no_cache_supported`, which is how a caller finds out which of the two it got.
 	let mut bits = PTE_V | PTE_A | PTE_D | PTE_R;
+	if flags & NO_CACHE != 0 && svpbmt() {
+		bits |= PTE_PBMT_IO;
+	}
 	if flags & WRITABLE != 0 {
 		bits |= PTE_W;
 	}

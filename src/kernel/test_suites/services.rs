@@ -405,6 +405,11 @@ fn display_service_restores_the_console_surface() {
 	let (display_admin, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("display admin bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	// The DisplayController capability is the last handoff. DisplayService tolerates handle 0
+	// (it takes no boot framebuffer and relies on the GPU scanout, which is what this test
+	// gives it) but it BLOCKS for the message, so a launcher that omits it wedges bring-up
+	// before the FB handshake below - which is what a positional bootstrap costs.
+	boot_kernel.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new(), 0)).expect("display capability bootstrap");
 
 	// Answer the driver's FB handshake with a 4x4 B8G8R8X8 DMA scanout.
 	sched::run_until_idle();

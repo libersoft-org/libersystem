@@ -203,6 +203,12 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// real root-Domain handle - the shape of the handoff is what bring-up needs, not the
 	// authority behind it.
 	kernel_ep.send(object::channel::Message::new(b"POWER".to_vec(), alloc::vec::Vec::new(), 0)).expect("the POWER handoff should send");
+	// And the console-input capability is the fifth, for exactly the same reason the two
+	// above spell out: the driver tolerates handle 0 (its keystrokes go nowhere) and blocks
+	// for the message. This is the cost of a positional bootstrap - every launcher owes every
+	// message - and it is why the capability was added at the END of the sequence, where it
+	// disturbs nothing that reads before it.
+	kernel_ep.send(object::channel::Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new(), 0)).expect("the CONSOLE handoff should send");
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the xhci driver should report in");

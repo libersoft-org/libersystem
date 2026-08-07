@@ -126,6 +126,24 @@ pub fn set_power(handle: u64) {
 	POWER.store(handle, core::sync::atomic::Ordering::Relaxed);
 }
 
+// The ConsoleInputSource capability, which `SYS_CONSOLE_FEED` requires. Same shape and same
+// reason as POWER above: set once at bootstrap, read from the key path.
+//
+// Zero until a driver is given one, and a feed with zero is refused rather than delivered - so
+// a keyboard on a boot that handed out no console capability types nothing, instead of typing
+// on an authority it does not hold.
+static CONSOLE_INPUT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Record the console-input capability this driver was handed at bootstrap.
+pub fn set_console_input(handle: u64) {
+	CONSOLE_INPUT.store(handle, core::sync::atomic::Ordering::Relaxed);
+}
+
+// Feed one byte to the console under this driver's capability.
+unsafe fn feed(byte: u8) -> i64 {
+	unsafe { console_feed(CONSOLE_INPUT.load(core::sync::atomic::Ordering::Relaxed), byte) }
+}
+
 // The system power keys: Power shuts the machine down (wired like the
 // Ctrl+Alt+Delete chord); Sleep / Wake are reserved until suspend exists.
 pub const KEY_POWER: u16 = 116;
@@ -341,11 +359,11 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// Copy = Ctrl+Shift+C or Ctrl+Insert; Paste = Ctrl+Shift+V or Shift+Insert. Caught here,
 		// before the layout would turn Ctrl+C into 0x03 or Insert into an escape sequence.
 		if (mods.ctrl && mods.shift && code == KEY_C) || (mods.ctrl && code == KEY_INSERT) {
-			console_feed(CHORD_COPY);
+			feed(CHORD_COPY);
 			return;
 		}
 		if (mods.ctrl && mods.shift && code == KEY_V) || (mods.shift && code == KEY_INSERT) {
-			console_feed(CHORD_PASTE);
+			feed(CHORD_PASTE);
 			return;
 		}
 		// PageUp / PageDown: Shift pages the console's own scrollback (a private control
@@ -353,11 +371,11 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// client. Collapsing the chord here means the console needs no input escape parser.
 		if code == KEY_PAGEUP || code == KEY_PAGEDOWN {
 			if mods.shift {
-				console_feed(if code == KEY_PAGEUP { 0x1e } else { 0x1f });
+				feed(if code == KEY_PAGEUP { 0x1e } else { 0x1f });
 			} else {
 				let seq: &[u8] = if code == KEY_PAGEUP { b"\x1b[5~" } else { b"\x1b[6~" };
 				for &b in seq {
-					console_feed(b);
+					feed(b);
 				}
 			}
 			return;
@@ -367,7 +385,7 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// the framebuffer keyboard and a serial terminal identically.
 		if let Some(seq) = escape_sequence(code) {
 			for &b in seq {
-				console_feed(b);
+				feed(b);
 			}
 			return;
 		}
@@ -376,12 +394,12 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// doubles as the navigation island (arrows / Home / PgUp / Ins / Del) while it is off.
 		let kp: u8 = keypad_char(code, mods.numlock ^ mods.shift);
 		if kp != 0 {
-			console_feed(kp);
+			feed(kp);
 			return;
 		}
 		if let Some(seq) = keypad_sequence(code) {
 			for &b in seq {
-				console_feed(b);
+				feed(b);
 			}
 			return;
 		}
@@ -398,9 +416,9 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 			// Alt makes the key a "meta" key: prefix the byte with ESC, the convention a
 			// serial terminal uses (Alt+x -> ESC x).
 			if mods.alt {
-				console_feed(0x1b);
+				feed(0x1b);
 			}
-			console_feed(ch);
+			feed(ch);
 		}
 	}
 }

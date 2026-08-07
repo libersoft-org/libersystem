@@ -227,6 +227,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1d. receive the three console/display capabilities, in the kernel's order:
+	//     DisplayController, ConsoleInputSource, ConsoleSink. This supervisor holds none of
+	//     them for itself; each goes to the one component that should have it - the display to
+	//     DisplayService, the sink to ConsoleService, the input source to DeviceManager for the
+	//     keyboard drivers.
+	//
+	//     LAST in the sequence, because the bootstrap is read positionally and anything
+	//     inserted in the middle shifts every read after it.
+	let mut console_caps: [u64; MAX_MESSAGE_CAPS] = [0; MAX_MESSAGE_CAPS];
+	let (display_ctl, console_input, console_sink): (u64, u64, u64) = match unsafe { recv_message_caps(bootstrap, &mut buf, &mut console_caps) } {
+		(len, 3) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => (console_caps[0], console_caps[1], console_caps[2]),
+		_ => (0, 0, 0),
+	};
+
 	// 2. bring the services up in dependency order. Each pass starts every pending
 	//    service whose dependencies are all Running; repeat until a pass makes no
 	//    progress (everything started, or what is left is blocked on a failed or
@@ -343,7 +357,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, display_ctl, console_input, console_sink, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;

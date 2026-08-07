@@ -373,6 +373,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			_ => 0,
 		};
 		keys::set_power(power);
+		// And the ConsoleInputSource capability, which `SYS_CONSOLE_FEED` requires. Same
+		// arrival, same reason: a keyboard that may not type is inert rather than privileged.
+		let console_input: u64 = match recv_blocking(bootstrap, &mut buf) {
+			Received::Message { len, handle } if len >= 7 && &buf[..7] == b"CONSOLE" => handle,
+			_ => 0,
+		};
+		keys::set_console_input(console_input);
 		KEY_SINK.store(key_sink, Ordering::Relaxed);
 		// map the controller's register file.
 		let base: u64 = syscall(SYS_DEVICE_MEMORY_MAP, device_handle, 0, 0, 0);

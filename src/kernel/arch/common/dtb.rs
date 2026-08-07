@@ -136,6 +136,83 @@ impl Fdt {
 
 	// Parse the device tree, returning the RAM geometry, CPU count and PCIe ECAM base,
 	// or None if it is not a valid FDT (or has no memory node).
+	// Does any CPU node advertise the ISA extension `want`?
+	//
+	// Two properties carry this and both are in the wild: the old `riscv,isa` string
+	// ("rv64imafdc_svpbmt_...", underscore-separated after the single-letter base) and the
+	// newer `riscv,isa-extensions` stringlist (NUL-separated). The search is a substring scan
+	// over the property bytes, which is enough for a name that cannot occur inside another -
+	// and deliberately conservative: a name it fails to find leaves the feature off.
+	//
+	// `want` must be lowercase; device trees are.
+	pub fn has_isa_extension(&self, want: &[u8]) -> bool {
+		if !self.is_valid() || want.is_empty() {
+			return false;
+		}
+		unsafe {
+			let off_struct = self.be32(self.base + 8) as u64;
+			let off_strings = self.be32(self.base + 12) as u64;
+			let strings = self.base + off_strings;
+			let mut p = self.base + off_struct;
+			let mut depth: i32 = -1;
+			let mut d1_cpus = false;
+			let mut in_cpu = false;
+			loop {
+				let token = self.be32(p);
+				p += 4;
+				match token {
+					FDT_BEGIN_NODE => {
+						depth += 1;
+						let name = p;
+						p += (self.str_len(name) + 1 + 3) & !3;
+						if depth == 1 {
+							d1_cpus = self.str_eq(name, "cpus");
+						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
+							in_cpu = true;
+						}
+					}
+					FDT_END_NODE => {
+						if depth == 2 {
+							in_cpu = false;
+						}
+						if depth == 1 {
+							d1_cpus = false;
+						}
+						depth -= 1;
+						if depth < 0 {
+							return false;
+						}
+					}
+					FDT_PROP => {
+						let len = self.be32(p) as u64;
+						let nameoff = self.be32(p + 4);
+						let val = p + 8;
+						p += 8 + ((len + 3) & !3);
+						if !in_cpu {
+							continue;
+						}
+						let pname = strings + nameoff as u64;
+						if !(self.str_eq(pname, "riscv,isa") || self.str_eq(pname, "riscv,isa-extensions")) {
+							continue;
+						}
+						// Substring scan over the property's bytes, bounded by its own length.
+						if len < want.len() as u64 {
+							continue;
+						}
+						for start in 0..=(len - want.len() as u64) {
+							if (0..want.len() as u64).all(|i| self.u8_at(val + start + i) == want[i as usize]) {
+								return true;
+							}
+						}
+					}
+					FDT_NOP => {}
+					FDT_END => return false,
+					_ => return false,
+				}
+			}
+		}
+	}
+
 	pub fn parse(&self) -> Option<BootInfo> {
 		if !self.is_valid() {
 			return None;

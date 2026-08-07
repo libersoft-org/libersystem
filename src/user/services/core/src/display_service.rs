@@ -506,7 +506,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			_ => fail_bootstrap(bootstrap, b"admin", b"display admin channel not delivered"),
 		};
 		let service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
-		let scanout: Scanout = init_scanout(gpu, &mut buf);
+		// The DisplayController capability, last in the sequence. `SYS_FRAMEBUFFER_MAP` requires
+		// it; without one this service falls back to whatever the GPU driver offers and takes no
+		// boot framebuffer, which is the same degradation as a machine with no framebuffer at
+		// all rather than a failure to start.
+		let display_ctl: u64 = recv_tagged(bootstrap, &mut buf, b"DISPLAYCTL").unwrap_or(0);
+		let scanout: Scanout = init_scanout(gpu, display_ctl, &mut buf);
 		if !scanout.available() {
 			fail_bootstrap(bootstrap, b"display", b"no framebuffer available");
 		}
@@ -515,7 +520,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 }
 
-unsafe fn init_scanout(gpu: u64, buf: &mut [u8]) -> Scanout {
+unsafe fn init_scanout(gpu: u64, display_ctl: u64, buf: &mut [u8]) -> Scanout {
 	unsafe {
 		if gpu != 0 {
 			send_blocking(gpu, b"FB", 0);
@@ -537,7 +542,7 @@ unsafe fn init_scanout(gpu: u64, buf: &mut [u8]) -> Scanout {
 			}
 		}
 		let mut fb: Framebuffer = Framebuffer::default();
-		let addr: i64 = framebuffer_map(&mut fb);
+		let addr: i64 = framebuffer_map(display_ctl, &mut fb);
 		if !sys_is_err(addr as u64) && valid_scanout(&fb, fb.width, fb.height) { Scanout { gpu: 0, handle: 0, addr: addr as u64, width: fb.width, height: fb.height, fb } } else { Scanout { gpu: 0, handle: 0, addr: 0, fb: Framebuffer::default(), width: 0, height: 0 } }
 	}
 }

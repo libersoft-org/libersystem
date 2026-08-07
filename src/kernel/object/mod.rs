@@ -16,6 +16,7 @@ pub mod event;
 pub mod handle;
 pub mod interrupt;
 pub mod memory_object;
+pub mod privilege;
 pub mod process;
 pub mod process_group;
 pub mod rights;
@@ -48,6 +49,9 @@ pub enum ObjectType {
 	DeviceMemory,
 	DmaBuffer,
 	ProcessGroup,
+	// A named authority with no object of its own - the display, the console's input
+	// sink, the console's input source. See `privilege`.
+	Privilege,
 }
 
 impl ObjectType {
@@ -66,6 +70,7 @@ impl ObjectType {
 			ObjectType::DeviceMemory => "DeviceMemory",
 			ObjectType::DmaBuffer => "DmaBuffer",
 			ObjectType::ProcessGroup => "ProcessGroup",
+			ObjectType::Privilege => "Privilege",
 		}
 	}
 
@@ -85,6 +90,7 @@ impl ObjectType {
 			ObjectType::DeviceMemory => 9,
 			ObjectType::DmaBuffer => 10,
 			ObjectType::ProcessGroup => 11,
+			ObjectType::Privilege => 12,
 		}
 	}
 }

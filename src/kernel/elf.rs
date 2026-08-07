@@ -420,7 +420,7 @@ fn align_up(value: u64) -> Option<u64> {
 mod tests {
 	use super::{ElfError, LoadedSegment, validate_segment};
 	use crate::memlayout::USER_VA_END;
-	use bootproto::elf::{PF_R, PF_W, PF_X, ProgramHeader, PT_LOAD};
+	use bootproto::elf::{PF_R, PF_W, PF_X, PT_LOAD, ProgramHeader};
 
 	// A page-aligned, otherwise well-formed loadable segment at `vaddr`.
 	fn segment(vaddr: u64, memsz: u64, flags: u32) -> ProgramHeader {

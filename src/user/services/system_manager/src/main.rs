@@ -74,6 +74,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => exit(),
 	};
 
+	// 1d. receive the three console/display capabilities in one message, in the kernel's order:
+	//     DisplayController, ConsoleInputSource, ConsoleSink. Like the power capability, this
+	//     process holds them only to pass them on.
+	//
+	//     LAST in the sequence, and every hop below adds its forward at the end of its own
+	//     sequence too. The bootstrap is read positionally - `recv_tagged` checks the tag of the
+	//     NEXT message rather than searching for it - so anything inserted in the middle shifts
+	//     every read after it and stops the boot chain where it stands.
+	let mut console_caps: [u64; MAX_MESSAGE_CAPS] = [0; MAX_MESSAGE_CAPS];
+	let console_cap_count: usize = match unsafe { recv_message_caps(bootstrap, &mut buf, &mut console_caps) } {
+		(len, count) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => count,
+		_ => 0,
+	};
+
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
 	//    fresh control channel as its bootstrap.
 	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
@@ -106,6 +120,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(sm_side, b"POWER", power);
 		let mode_msg: [u8; 5] = [b'M', b'O', b'D', b'E', mode];
 		send_blocking(sm_side, &mode_msg, 0);
+		// The three console/display capabilities, last, in the order they arrived.
+		if console_cap_count > 0 {
+			send_caps(sm_side, b"CONSOLECAPS", &console_caps[..console_cap_count]);
+		}
 	}
 
 	// 4. relay every report ServiceManager sends up to the kernel. ServiceManager's

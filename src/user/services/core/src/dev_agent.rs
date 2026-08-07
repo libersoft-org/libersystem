@@ -53,6 +53,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// whatever was published before it. Optional: without it every verdict is unknown,
 		// which is honest, where assuming compatibility would not be.
 		let storage: u64 = recv_tagged(bootstrap, &mut buf, b"STORAGE").unwrap_or(0);
+		// The ConsoleInputSource capability, last in the sequence. Without it this agent can
+		// still drive everything else and simply cannot type into the console.
+		crate::dev_protocol::CONSOLE_INPUT.store(recv_tagged(bootstrap, &mut buf, b"CONSOLE").unwrap_or(0), core::sync::atomic::Ordering::Relaxed);
 		send_blocking(bootstrap, b"agent.dev: online (registry)", 0);
 		serve(bytes, bootstrap, storage, nonce)
 	}

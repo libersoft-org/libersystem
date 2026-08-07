@@ -85,7 +85,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, power: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -117,7 +117,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		// DeviceManager also carries the power capability, because it is what starts the
 		// keyboard drivers and the Power key must keep working when this supervisor does not -
 		// that is the whole reason the key exists as a separate path from `!poweroff`.
-		if name == b"device_manager" && !(bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_power(manager_side, power)) {
+		if name == b"device_manager" && !(bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_power(manager_side, power) && send_privilege(manager_side, b"CONSOLE", console_input)) {
 			return State::Failed;
 		}
 		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, live_volume, storage_client, storage_admin) {
@@ -162,10 +162,10 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, *usb_pointer, *raw_keys, input_client, input_admin, input_focus, input_kill, pointer_console) {
 			return State::Failed;
 		}
-		if name == b"display_service" && !bootstrap_display_service(manager_side, *gpu_client, *input_focus, *input_kill, display_client, display_admin) {
+		if name == b"display_service" && !(bootstrap_display_service(manager_side, *gpu_client, *input_focus, *input_kill, display_client, display_admin) && send_privilege(manager_side, b"DISPLAYCTL", display_ctl)) {
 			return State::Failed;
 		}
-		if name == b"console_service" && !bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *display_client, *time_client, *audio_client, *session_client, *perm_client, *pointer_console, console_client, console_control) {
+		if name == b"console_service" && !(send_privilege(manager_side, b"CONSOLESINK", console_sink) && bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *display_client, *time_client, *audio_client, *session_client, *perm_client, *pointer_console, console_client, console_control)) {
 			return State::Failed;
 		}
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
@@ -1256,6 +1256,24 @@ pub(super) unsafe fn send_power(manager_side: u64, power: u64) -> bool {
 	unsafe {
 		let copy: i64 = duplicate(power, RIGHT_MANAGE | RIGHT_TRANSFER | RIGHT_DUPLICATE);
 		copy > 0 && send_blocking(manager_side, b"POWER", copy as u64)
+	}
+}
+
+// Delegate one of the three console/display capabilities. A duplicate, not the handle itself:
+// this supervisor keeps what it was handed so a restarted service can be given one again, and
+// DeviceManager needs DUPLICATE of its own to serve more than one keyboard.
+//
+// A zero capability sends nothing and reports success. A boot that handed out none - an older
+// kernel, a hand-built chain - then brings its services up without them, and the syscalls they
+// gate refuse rather than the service failing to start. That is the same posture the power
+// capability takes, and it keeps this from being a new way for the boot to stop.
+pub(super) unsafe fn send_privilege(manager_side: u64, tag: &[u8], privilege: u64) -> bool {
+	unsafe {
+		if privilege == 0 {
+			return true;
+		}
+		let copy: i64 = duplicate(privilege, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+		copy > 0 && send_blocking(manager_side, tag, copy as u64)
 	}
 }
 
