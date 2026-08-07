@@ -50,8 +50,8 @@ pub fn halt() -> ! {
 // id, exit boot services, turn paging off and enter the kernel's boot stub with the
 // hart id in a0 and the DTB in a1.
 pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
-	let entry = load_kernel(bs, kernel);
-	serial::write_str("loader: kernel ELF loaded at its physical link addresses\n");
+	let staged = stage_kernel(bs, kernel);
+	serial::write_str("loader: kernel ELF staged clear of the firmware\n");
 
 	// The boot hart id (a0) and the flattened device tree (a1) - the same pair OpenSBI
 	// hands the kernel on a `-kernel` boot. The kernel scans memory for the DTB if the
@@ -80,25 +80,22 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let volume_pkg = root.and_then(|root| crate::read_file(bs, root, crate::VOLUME_PKG_FILE));
 	let boot_info = build_boot_info(bs, dtb, init_pkg, volume_pkg);
 
+	// Everything the placement will overwrite has to be somewhere else FIRST - checked while
+	// the firmware can still print a diagnosis, because after the copy there is no firmware and
+	// a mistake is a machine that stops saying anything at all.
+	check_clear_of_destination(&staged, boot_info, dtb);
+
 	// ExitBootServices is the last firmware call; after it no service may be used.
 	exit_boot_services(bs, image_handle);
 
-	// Mirror the OpenSBI `-kernel` entry state and enter the kernel's boot stub: turn
-	// paging off (the stub builds Sv39 from scratch), fence, then jump to the entry
-	// with the hart id in a0 and the BootInfo pointer in a1. The loader ran under the
-	// firmware's identity map, so with paging off it keeps executing at the same
-	// (physical) addresses through the jump.
-	unsafe {
-		core::arch::asm!(
-			"csrw satp, zero",
-			"sfence.vma",
-			"jr {entry}",
-			entry = in(reg) entry,
-			in("a0") hartid,
-			in("a1") boot_info,
-			options(noreturn),
-		);
-	}
+	// Now, and only now, put the kernel at its link addresses and enter it. The loader ran
+	// under the firmware's identity map, so with paging off it keeps executing at the same
+	// (physical) addresses through the copy and the jump.
+	//
+	// SAFETY: boot services are gone, and `check_clear_of_destination` has established that
+	// this code, its stack, the staging table, the hand-off record and the device tree all lie
+	// outside the range about to be written.
+	unsafe { place_and_enter(&staged, hartid, boot_info) }
 }
 
 // Allocate and fill a `bootproto::BootInfo` (in retained LOADER_DATA) carrying the DTB
@@ -130,34 +127,138 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 	phys
 }
 
-// Load each PT_LOAD segment at its physical (link) address - the placement OpenSBI's
-// `-kernel` produces, which the kernel's higher-half boot stub relies on (its low
-// identity megapage maps physical 0x8000_0000). Returns the entry point (physical).
-fn load_kernel(bs: *mut BootServices, kernel: &[u8]) -> u64 {
+// A kernel image copied into scratch memory, waiting to be put where it belongs.
+//
+// ONE contiguous block covering the image's whole physical span, not one per segment. Per
+// segment was the first attempt and it had a hole: each scratch was checked against its own
+// destination and against nothing else, so a segment's scratch could sit inside a DIFFERENT
+// segment's destination and the copy would eat its own source. A bigger image makes that more
+// likely, which is why the ordinary kernel booted and the test kernel did not.
+struct Staged {
+	entry: u64,
+	scratch: u64,
+	dest_low: u64,
+	dest_high: u64,
+}
+
+// Copy the kernel into SCRATCH memory rather than to its link address, and record where it has
+// to go.
+//
+// This used to write straight to the link address, and on QEMU virt that address is where
+// U-Boot itself is running: U-Boot's image occupies 0x8020_0000..~0x802F_7818 and the kernel is
+// linked from 0x8020_0000. The two overlap almost exactly. `AllocateAddress` succeeded because
+// this U-Boot does not reserve its own image, so the loader cheerfully overwrote the firmware it
+// was still calling into - and the next firmware call, inside ExitBootServices, ran into
+// whatever the kernel had put there.
+//
+// The symptom was a boot that produced no kernel output at all, ever, on this path. The
+// loader's own prints kept working because they write to the UART directly and never enter
+// U-Boot, which is exactly what made it look like the kernel had failed to start rather than
+// like the firmware had been demolished underneath it.
+fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 	let image = crate::elf::Elf::parse(kernel).expect("loader: kernel is not a valid riscv64 ELF64 executable");
+
+	// The destination span first, from the headers alone - nothing is allocated until it is
+	// known what the allocation has to avoid.
+	let mut dest_low = u64::MAX;
+	let mut dest_high = 0u64;
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
 		if ph.p_type != crate::elf::PT_LOAD || ph.p_memsz == 0 {
 			continue;
 		}
-		// Reserve exactly the segment's physical span (page-aligned) so the firmware
-		// hands it back at its link address, then copy the file bytes and zero the
-		// tail (BSS).
-		let base = align_down(ph.p_paddr, PAGE_SIZE);
-		let pages = (ph.p_paddr - base + ph.p_memsz).div_ceil(PAGE_SIZE);
-		let mut addr = base;
-		let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ADDRESS, uefi::LOADER_DATA, pages as usize, &mut addr) };
-		if uefi::is_error(status) {
-			panic!("cannot place a kernel segment at its physical link address");
+		dest_low = dest_low.min(align_down(ph.p_paddr, PAGE_SIZE));
+		dest_high = dest_high.max(ph.p_paddr + ph.p_memsz);
+	}
+	if dest_low == u64::MAX {
+		panic!("loader: kernel image has no loadable segments");
+	}
+	dest_high = (dest_high + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+	let pages = ((dest_high - dest_low) / PAGE_SIZE) as usize;
+
+	// Scratch that does not overlap the destination. The firmware chooses where, so this asks
+	// until it gets an answer it can use - holding on to the rejects, which is what stops the
+	// next request returning the same block.
+	let mut rejects: [u64; 16] = [0; 16];
+	let mut reject_count = 0usize;
+	let scratch = loop {
+		let candidate = crate::alloc_pages(bs, pages).expect("loader: cannot allocate staging memory for the kernel");
+		if candidate + (pages as u64 * PAGE_SIZE) <= dest_low || candidate >= dest_high {
+			break candidate;
 		}
-		unsafe {
-			core::ptr::write_bytes(ph.p_paddr as *mut u8, 0, ph.p_memsz as usize);
-			if let Some(data) = image.segment_data(&ph) {
-				core::ptr::copy_nonoverlapping(data.as_ptr(), ph.p_paddr as *mut u8, data.len());
-			}
+		if reject_count == rejects.len() {
+			panic!("loader: every staging allocation landed on the kernel's destination");
+		}
+		rejects[reject_count] = candidate;
+		reject_count += 1;
+	};
+	// The rejects are deliberately NOT freed: freeing one invites the next request to return
+	// it. They are firmware pages and ExitBootServices reclaims the lot.
+
+	// Zero the whole block first, so every BSS tail and inter-segment gap is already zero when
+	// the single block copy places it.
+	unsafe { core::ptr::write_bytes(scratch as *mut u8, 0, pages * PAGE_SIZE as usize) };
+	for i in 0..image.segment_count() {
+		let Some(ph) = image.segment(i) else { continue };
+		if ph.p_type != crate::elf::PT_LOAD || ph.p_memsz == 0 {
+			continue;
+		}
+		let Some(data) = image.segment_data(&ph) else { continue };
+		unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), (scratch + (ph.p_paddr - dest_low)) as *mut u8, data.len()) };
+	}
+	Staged { entry: image.entry, scratch, dest_low, dest_high }
+}
+
+// Put the staged image where it belongs and enter the kernel. Nothing may call the firmware
+// after this is entered - it does not return, and by its second instruction the firmware's own
+// code may already be overwritten.
+//
+// # Safety
+//
+// ExitBootServices must have completed, and everything this needs - the stack it runs on, its
+// own code, the staging block, and what the kernel is handed - must lie outside
+// [dest_low, dest_high), which `check_clear_of_destination` establishes first.
+unsafe fn place_and_enter(staged: &Staged, hartid: u64, boot_info: u64) -> ! {
+	unsafe {
+		core::ptr::copy_nonoverlapping(staged.scratch as *const u8, staged.dest_low as *mut u8, (staged.dest_high - staged.dest_low) as usize);
+		// The kernel's text was just written as data; make the instruction fetch see it.
+		core::arch::asm!("fence rw, rw", "fence.i", options(nostack, preserves_flags));
+		// Mirror the OpenSBI `-kernel` entry state: paging off, hart id in a0, the hand-off
+		// pointer in a1.
+		core::arch::asm!(
+			"csrw satp, zero",
+			"sfence.vma",
+			"jr {entry}",
+			entry = in(reg) staged.entry,
+			in("a0") hartid,
+			in("a1") boot_info,
+			options(noreturn),
+		);
+	}
+}
+
+// Refuse to proceed if anything the final copy needs lives in the range that copy overwrites.
+// A wrong answer here is a machine that stops with no output, which is the failure this whole
+// change exists to remove - so it is said out loud instead.
+fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64) {
+	let inside = |address: u64| address >= staged.dest_low && address < staged.dest_high;
+	let sp: u64;
+	unsafe { core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+	for (address, what) in [
+		(place_and_enter as usize as u64, "the loader's own code"),
+		(sp, "the loader's stack"),
+		(staged as *const Staged as u64, "the staging descriptor"),
+		(staged.scratch, "the staged kernel image"),
+		(boot_info, "the hand-off record"),
+		(dtb, "the device tree"),
+	] {
+		if address != 0 && inside(address) {
+			serial::write_str("loader: FATAL - ");
+			serial::write_str(what);
+			serial::write_str(" lies where the kernel must be placed\n");
+			halt();
 		}
 	}
-	image.entry
 }
 
 // Ask the RISCV_EFI_BOOT_PROTOCOL for the boot hart id; fall back to 0 if the firmware

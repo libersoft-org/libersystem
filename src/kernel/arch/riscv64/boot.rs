@@ -247,6 +247,23 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	crate::serial_println!("riscv64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
 	crate::mem::heap::init();
 	crate::mem::frame::upgrade_to_heap();
+	// Reserve every top-level entry the kernel's two growing windows can ever need, while the
+	// kernel's is still the only address space in existence. This is what `mem::init` does on
+	// x86_64, and this port never did it.
+	//
+	// It matters here for the same reason it matters there and does NOT matter on aarch64: one
+	// Sv39 root covers both halves, so a new address space COPIES the kernel-half entries at
+	// creation and an entry created later is missing from every space made before it. aarch64
+	// keeps the kernel half in TTBR1, a single tree every space shares, so a late entry is
+	// visible everywhere by construction.
+	//
+	// Without this the first kernel-window mapping - a thread's kernel stack, which every
+	// process creates - added a root entry to whatever address space happened to be active,
+	// and the scheduler's guard then refused to switch into any other one:
+	// "address space ... diverges from the kernel mapping at PML4[384]". 384 is the Sv39 root
+	// index of KERNEL_MMAP_BASE.
+	crate::mem::heap::reserve_window();
+	crate::syscall::reserve_kernel_vmap();
 	// Bring up the early framebuffer console so the kernel draws the boot log to the
 	// display pixel-by-pixel like x86 - QEMU virt has no VGA, so without one the boot is
 	// serial-only. The UEFI loader hands a GOP framebuffer in the BootInfo (drawn to

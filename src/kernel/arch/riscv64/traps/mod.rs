@@ -258,6 +258,15 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 			// S-mode software interrupt: a cross-hart wake IPI. Clear the pending bit
 			// (SIP.SSIP); the hart is now awake and will re-check the run queue.
 			unsafe { core::arch::asm!("csrci sip, 2", options(nostack, preserves_flags)) };
+			// And service a TLB shootdown if one is what the IPI was for. The x86_64 and
+			// aarch64 handlers have always done this; this one did not, so a shootdown was
+			// only ever acted on when a hart happened to reach the idle loop - and a hart busy
+			// in kernel code kept its stale translations for as long as it stayed busy. That
+			// is the exact failure the shootdown exists to prevent, on the one port where
+			// nobody had run it: `a_shootdown_makes_another_core_stop_using_the_old_
+			// translation` reported "6/7 acknowledgements" and the reader still saw the old
+			// frame.
+			crate::mem::tlb::service_pending();
 		} else if code == 9 {
 			// S-mode external interrupt: an IMSIC-delivered device MSI. Claim each pending
 			// EID and wake its bound driver (all inside handle_external, edge-triggered).
