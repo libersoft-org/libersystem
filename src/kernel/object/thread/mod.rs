@@ -101,20 +101,24 @@ impl KernelStack {
 		if base == 0 {
 			return None;
 		}
-		let space = crate::object::address_space::AddressSpace::kernel();
 		let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE;
 		for page in 0..pages {
-			let Some(frame) = crate::mem::frame::allocate() else {
-				// Hand back the pages mapped so far and the range itself. Building the
-				// partial stack and dropping it would do the same thing, but only if it were
-				// a value yet - and it is not until every page is in.
-				let partial = KernelStack { base, pages: page };
-				drop(partial);
+			// one page above `base`, so `base` itself stays unmapped and is the guard. The
+			// mapping goes through the address-routing `try_map_page` rather than through an
+			// `AddressSpace`: this is a kernel-half range, and on aarch64 a named root is a
+			// TTBR0 value that a higher-half address does not live in. Routing by address is
+			// correct on every port by construction rather than by a rule applied underneath.
+			let at = base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
+			let mapped = crate::mem::frame::allocate().filter(|frame| arch::paging::try_map_page(at, *frame, flags).is_ok());
+			let Some(frame) = mapped else {
+				// Unwind by hand rather than by building a partial `KernelStack` and dropping
+				// it. Drop frees `(self.pages + 1)` pages of virtual range, which for a
+				// partial stack is SHORTER than what was reserved - so the tail of the
+				// reservation would be lost from the kernel window on every failed spawn.
+				rollback(base, page, len);
 				return None;
 			};
-			// one page above `base`, so `base` itself stays unmapped and is the guard.
-			let at = base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
-			space.map(at, frame, flags);
+			let _ = frame;
 		}
 		// zeroed through a raw write rather than through a slice taken from `&self`,
 		// which would be handing out a `&mut` from a shared borrow.
@@ -130,18 +134,26 @@ impl KernelStack {
 	}
 }
 
+// Take down `mapped` pages of a stack reservation at `base` and return the WHOLE `len`-byte
+// range to the kernel window. Shared by the failed-allocation path and by `Drop`, so the two
+// cannot disagree about how much was reserved.
+fn rollback(base: u64, mapped: usize, len: u64) {
+	for page in 0..mapped {
+		let at = base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
+		if let Some(frame) = arch::paging::unmap_page(at) {
+			// SAFETY: a page of this stack, owned by it, just unmapped from the only place it
+			// was ever mapped.
+			unsafe { crate::mem::frame::deallocate(frame) };
+		}
+	}
+	// No address space: a kernel-window range is routed by address, and there is no per-space
+	// pool it could belong to.
+	crate::syscall::free_vrange(None, base, len);
+}
+
 impl Drop for KernelStack {
 	fn drop(&mut self) {
-		let space = crate::object::address_space::AddressSpace::kernel();
-		for page in 0..self.pages {
-			let at = self.base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
-			if let Some(frame) = space.unmap(at) {
-				// SAFETY: a page of this stack, owned by it, just unmapped from the only
-				// address space it was ever in.
-				unsafe { crate::mem::frame::deallocate(frame) };
-			}
-		}
-		crate::syscall::free_vrange(Some(&space), self.base, (self.pages as u64 + 1) * crate::mem::frame::PAGE_SIZE);
+		rollback(self.base, self.pages, (self.pages as u64 + 1) * crate::mem::frame::PAGE_SIZE);
 	}
 }
 

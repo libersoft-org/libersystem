@@ -110,3 +110,95 @@ fn paging_map_unmap() {
 	assert_eq!(unmapped, phys);
 	unsafe { mem::frame::deallocate(phys) };
 }
+
+crate::tagged_test!(a_shootdown_makes_another_core_stop_using_the_old_translation, [Paging, Memory, Smp]);
+fn a_shootdown_makes_another_core_stop_using_the_old_translation() {
+	use core::sync::atomic::{AtomicU64, Ordering};
+	use mem::frame;
+
+	// The property the shootdown exists for, observed rather than inferred. Asking whether the
+	// translation is gone with `translate` proves nothing: it walks the page tables, which the
+	// unmap edited on this core - the question is what the OTHER core's translation buffer
+	// still answers. So the test reads THROUGH the address instead, with a different frame
+	// mapped at it, and looks at which frame's bytes come back.
+	//
+	// Without the shootdown, CPU 1 keeps its cached translation and reads the OLD frame's
+	// marker - the exact shape of the bug this milestone fixed, where a frame was returned to
+	// the allocator while another core still wrote through it.
+	//
+	// A kernel-half address, which every core shares, so a stale entry is the only thing that
+	// could differ between them.
+	#[cfg(not(target_arch = "riscv64"))]
+	const SHARED_VA: u64 = 0xffff_f000_0010_0000;
+	#[cfg(target_arch = "riscv64")]
+	const SHARED_VA: u64 = 0xffff_fff0_0010_0000;
+	const FIRST: u64 = 0x1111_1111_1111_1111;
+	const SECOND: u64 = 0x2222_2222_2222_2222;
+
+	static STAGE: AtomicU64 = AtomicU64::new(0);
+	static SAW_FIRST: AtomicU64 = AtomicU64::new(0);
+	static SAW_SECOND: AtomicU64 = AtomicU64::new(0);
+
+	extern "C" fn reader(_arg: u64) {
+		// Read once to load this core's translation buffer, wait for the remap and the
+		// shootdown, then read again.
+		while STAGE.load(Ordering::Acquire) < 1 {
+			core::hint::spin_loop();
+		}
+		SAW_FIRST.store(unsafe { (SHARED_VA as *const u64).read_volatile() }, Ordering::Release);
+		STAGE.store(2, Ordering::Release);
+		while STAGE.load(Ordering::Acquire) < 3 {
+			core::hint::spin_loop();
+		}
+		SAW_SECOND.store(unsafe { (SHARED_VA as *const u64).read_volatile() }, Ordering::Release);
+		STAGE.store(4, Ordering::Release);
+	}
+
+	if smp::cpu_count() < 2 {
+		return;
+	}
+	let first = frame::allocate().expect("the first frame");
+	let second = frame::allocate().expect("the second frame");
+	let hhdm = crate::mem::hhdm_offset();
+	unsafe {
+		((hhdm + first) as *mut u64).write_volatile(FIRST);
+		((hhdm + second) as *mut u64).write_volatile(SECOND);
+	}
+	STAGE.store(0, Ordering::Release);
+	paging::map_page(SHARED_VA, first, paging::WRITABLE);
+	sched::spawn_on(1, reader, 0);
+
+	// Let the reader cache a translation for the first frame.
+	STAGE.store(1, Ordering::Release);
+	let mut spins = 0u64;
+	while STAGE.load(Ordering::Acquire) < 2 {
+		core::hint::spin_loop();
+		spins += 1;
+		assert!(spins < 20_000_000_000, "the reader never took its first read");
+	}
+
+	// Remap the same address to the other frame and tell every other core to forget what it
+	// knew. This is the ordering the real callers use: the tables are edited first, the
+	// shootdown waits for acknowledgement, and only then is the old frame reusable.
+	assert_eq!(paging::unmap_page(SHARED_VA), Some(first), "the address was mapped to the first frame");
+	paging::map_page(SHARED_VA, second, paging::WRITABLE);
+	crate::mem::tlb::shootdown();
+
+	STAGE.store(3, Ordering::Release);
+	let mut spins = 0u64;
+	while STAGE.load(Ordering::Acquire) < 4 {
+		core::hint::spin_loop();
+		spins += 1;
+		assert!(spins < 20_000_000_000, "the reader never took its second read");
+	}
+
+	assert_eq!(SAW_FIRST.load(Ordering::Acquire), FIRST, "the reader's first read should see the first frame");
+	assert_eq!(SAW_SECOND.load(Ordering::Acquire), SECOND, "after the shootdown the reader must see the NEW frame, not the translation it had cached");
+
+	assert_eq!(paging::unmap_page(SHARED_VA), Some(second));
+	crate::mem::tlb::shootdown();
+	unsafe {
+		frame::deallocate(first);
+		frame::deallocate(second);
+	}
+}

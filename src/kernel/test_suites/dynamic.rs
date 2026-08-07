@@ -1176,3 +1176,100 @@ fn a_load_that_runs_out_of_frames_anywhere_gives_back_everything() {
 	assert!(refusals > 0, "the first budget already completed a load: nothing was injected");
 	crate::serial_println!("(load takes {succeeded_at} allocations; {refusals} refusals checked) ");
 }
+
+tagged_test!(a_fuzzed_elf_header_is_refused_without_leaking, [Dynamic, Memory, Process]);
+fn a_fuzzed_elf_header_is_refused_without_leaking() {
+	// Random damage to a well-formed image, in the two structures the loader parses before it
+	// trusts anything: the ELF header and the program headers. Every one of these is a byte an
+	// attacker chooses, and the loader reads sizes, counts, offsets and addresses out of them.
+	//
+	// Two properties, on every iteration: the call returns rather than panicking, and the frame
+	// pool afterwards is exactly what it was before. A refusal that leaked what it had already
+	// allocated is the failure mode that matters here - a hostile image would only have to be
+	// submitted repeatedly.
+	//
+	// Fixed-seed xorshift, so a failure is reproducible from the iteration number alone.
+	use crate::mem::frame;
+	use crate::object::address_space::AddressSpace;
+
+	fn put16(bytes: &mut [u8], offset: usize, value: u16) {
+		bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+	}
+	fn put32(bytes: &mut [u8], offset: usize, value: u32) {
+		bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+	}
+	fn put64(bytes: &mut [u8], offset: usize, value: u64) {
+		bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+	}
+
+	// The same minimal ET_EXEC the boundary tests use: one executable PT_LOAD at a low address.
+	fn well_formed() -> Vec<u8> {
+		const CODE_OFFSET: usize = 0x200;
+		let mut bytes = alloc::vec![0u8; CODE_OFFSET + 0x40];
+		bytes[..4].copy_from_slice(b"\x7fELF");
+		bytes[4] = 2;
+		bytes[5] = 1;
+		put16(&mut bytes, 16, 2);
+		put16(&mut bytes, 18, elf_machine());
+		put32(&mut bytes, 20, 1);
+		put64(&mut bytes, 24, 0x40_0000);
+		put64(&mut bytes, 32, 64);
+		put16(&mut bytes, 52, 64);
+		put16(&mut bytes, 54, 56);
+		put16(&mut bytes, 56, 1);
+		let base = 64;
+		put32(&mut bytes, base, 1);
+		put32(&mut bytes, base + 4, 5);
+		put64(&mut bytes, base + 8, CODE_OFFSET as u64);
+		put64(&mut bytes, base + 16, 0x40_0000);
+		put64(&mut bytes, base + 24, 0);
+		put64(&mut bytes, base + 32, 1);
+		put64(&mut bytes, base + 40, 1);
+		put64(&mut bytes, base + 48, 1);
+		bytes[CODE_OFFSET] = 0xc3;
+		bytes
+	}
+
+	let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+	let mut next = move || {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		state
+	};
+
+	const ITERATIONS: usize = 400;
+	// The header is 64 bytes and the one program header another 56; damage lands inside those
+	// 120, which is what makes this a header fuzz rather than a payload fuzz.
+	const HEADERS_END: usize = 120;
+	let mut loaded = 0;
+	let before = frame::free_count();
+	for iteration in 0..ITERATIONS {
+		let mut image = well_formed();
+		// One to four damaged bytes, so single-field corruption and multi-field corruption
+		// both get a turn.
+		for _ in 0..(1 + next() % 4) {
+			let at = (next() as usize) % HEADERS_END;
+			image[at] = next() as u8;
+		}
+		let space = AddressSpace::create().expect("a scratch address space");
+		let mut frames = Vec::new();
+		let mut shared = Vec::new();
+		// The call must RETURN. Reaching the next line at all is half the assertion.
+		if crate::elf::load_into(&image, &space, &mut frames, &mut shared).is_ok() {
+			loaded += 1;
+		}
+		// Whatever it did, the frames it took are the caller's to release - on the error path
+		// `load_parsed` has already unmapped them, and on the success path they are ours.
+		// SAFETY: every frame here came from this load and is named by nothing else now.
+		unsafe { frame::free_pages(&frames) };
+		drop(shared);
+		drop(space);
+		assert_eq!(frame::free_count(), before, "iteration {iteration} left the frame pool short");
+	}
+	// Some damage is harmless (padding, a reserved field), so a few must still load - otherwise
+	// this is fuzzing a parser that refuses everything and proving nothing.
+	assert!(loaded > 0, "every fuzzed image was refused: the fuzz is not producing loadable ones");
+	assert!(loaded < ITERATIONS, "every fuzzed image loaded: the fuzz is not reaching the checks");
+	crate::serial_println!("({loaded}/{ITERATIONS} fuzzed images still loaded) ");
+}
