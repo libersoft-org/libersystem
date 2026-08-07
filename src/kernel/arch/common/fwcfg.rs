@@ -187,7 +187,9 @@ pub fn setup_ramfb(fwcfg_base: u64, width: u32, height: u32, p2v: fn(u64) -> u64
 
 	// The scratch pages are only needed during setup.
 	for i in 0..SCRATCH_PAGES as u64 {
-		crate::mem::frame::deallocate(scratch + i * 4096);
+		// SAFETY: pages of the contiguous scratch span allocated for this setup and used
+		// by nothing else once `probe_and_program` has returned.
+		unsafe { crate::mem::frame::deallocate(scratch + i * 4096) };
 	}
 	result
 }
@@ -253,7 +255,9 @@ unsafe fn probe_and_program(fw: &FwCfg, dma_pa: u64, buf_pa: u64, buf_cap: u64, 
 		fw.put_be32(buf_pa + 20, height);
 		fw.put_be32(buf_pa + 24, stride);
 		if !fw.dma(dma_pa, (ramfb_sel as u32) << 16 | DMA_SELECT | DMA_WRITE, 28, buf_pa) {
-			crate::mem::frame::deallocate(fb_phys); // best effort; the run stays contiguous
+			// SAFETY: the framebuffer span this call allocated, never published - the DMA
+			// that would have handed it to the device is what just failed.
+			crate::mem::frame::deallocate(fb_phys); // the run stays contiguous
 			return None;
 		}
 

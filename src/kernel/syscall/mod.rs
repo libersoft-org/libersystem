@@ -206,86 +206,14 @@ fn sys_debug_write(arg: u64, len: u64) -> i64 {
 	crate::_print_bytes(&bytes) as i64
 }
 
-// A window's virtual-address pool: a bump cursor over [next, end) with a sorted,
-// coalesced free list of released ranges, so a long-lived process (or the shared
-// user window as a whole) that maps and unmaps forever reuses addresses instead
-// of walking off its span. Allocation is first-fit from the free list (splitting
-// a larger range), falling back to the bump; releasing a range merges it with
-// its neighbors, so churn cannot shatter the list into unusable slivers.
-struct VaPool {
-	next: u64,
-	end: u64,
-	free: alloc::vec::Vec<(u64, u64)>,
-}
-
-impl VaPool {
-	const fn new(base: u64, end: u64) -> VaPool {
-		VaPool { next: base, end, free: alloc::vec::Vec::new() }
-	}
-
-	// Hand out a page-aligned range of at least `len` bytes, or 0 when the window
-	// is exhausted (free list and bump both).
-	fn alloc(&mut self, len: u64) -> u64 {
-		let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-		if len == 0 {
-			return 0;
-		}
-		for i in 0..self.free.len() {
-			let (base, flen) = self.free[i];
-			if flen >= len {
-				if flen == len {
-					self.free.remove(i);
-				} else {
-					self.free[i] = (base + len, flen - len);
-				}
-				return base;
-			}
-		}
-		if self.next + len > self.end {
-			return 0;
-		}
-		let base = self.next;
-		self.next += len;
-		base
-	}
-
-	// Return a range to the pool, merging it with adjacent free ranges. A range
-	// ending at the bump cursor folds back into the bump instead.
-	fn free(&mut self, base: u64, len: u64) {
-		let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-		if len == 0 {
-			return;
-		}
-		let mut base = base;
-		let mut len = len;
-		// find the insert position in the sorted list and coalesce both neighbors.
-		let pos = self.free.partition_point(|&(b, _)| b < base);
-		if pos < self.free.len() && base + len == self.free[pos].0 {
-			len += self.free[pos].1;
-			self.free.remove(pos);
-		}
-		if pos > 0 && self.free[pos - 1].0 + self.free[pos - 1].1 == base {
-			base = self.free[pos - 1].0;
-			len += self.free[pos - 1].1;
-			self.free.remove(pos - 1);
-		}
-		if base + len == self.next {
-			self.next = base;
-			return;
-		}
-		let pos = self.free.partition_point(|&(b, _)| b < base);
-		self.free.insert(pos, (base, len));
-	}
-}
-
-// Kernel virtual-address window for syscall-mapped MemoryObjects, and its ring-3
-// counterpart. Each hands out non-overlapping ranges and reclaims released ones.
-// The user pool is global (not per-process): each process maps into its own page
-// tables, so a range is private per address space anyway, and a global pool keeps
-// every live mapping's range unique across processes - which also lets a shared
-// object's single `mapped_at` stay unambiguous.
-static KERNEL_VMAP: crate::sync::SpinLock<VaPool> = crate::sync::SpinLock::new(VaPool::new(KERNEL_MMAP_BASE, KERNEL_MMAP_BASE + MMAP_WINDOW));
-static USER_VMAP: crate::sync::SpinLock<VaPool> = crate::sync::SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END));
+// Kernel virtual-address window for syscall-mapped MemoryObjects. It is global because the
+// window itself is global: one kernel half, shared by every address space, so a range handed
+// out here has to be unique across the whole system.
+//
+// The ring-3 counterpart is NOT here. Each user address space carries its own `VaPool` over
+// `USER_MMAP_BASE..USER_VA_END` (see `AddressSpace::alloc_vrange`), because two address spaces
+// handing out the same user virtual address are not sharing anything.
+static KERNEL_VMAP: crate::sync::SpinLock<crate::mem::vapool::VaPool> = crate::sync::SpinLock::new(crate::mem::vapool::VaPool::new(KERNEL_MMAP_BASE, KERNEL_MMAP_BASE + MMAP_WINDOW));
 
 // How far the kernel mmap window extends (nothing else is laid out above it, but
 // an explicit bound turns a leak into a clean allocation failure, not a walk into
@@ -302,6 +230,20 @@ pub(crate) fn alloc_kernel_vrange(len: u64) -> u64 {
 	KERNEL_VMAP.lock().alloc(len)
 }
 
+// The address space a mapping made by this syscall belongs to: the caller's own for a
+// ring-3 caller, the shared kernel space for a ring-0 one. Either way it wraps the page
+// tables that are active right now, which is why the map paths can go on using
+// `map_page`. What the space adds is the pool a user range came from and must go back to.
+fn caller_address_space(user: bool, thread: &Arc<Thread>) -> Arc<crate::object::address_space::AddressSpace> {
+	if user { thread.process().address_space().clone() } else { crate::object::address_space::AddressSpace::kernel() }
+}
+
+// Take a range out of the window the caller maps into, in one place so the choice of
+// window and the choice of space cannot disagree.
+fn alloc_vrange_in(space: &crate::object::address_space::AddressSpace, user: bool, len: u64) -> u64 {
+	if user { space.alloc_vrange(len) } else { alloc_kernel_vrange(len) }
+}
+
 // Give the whole kernel mmap window its top-level page-table entries, so no later mapping into
 // it creates one. Called at boot, before any address space exists to be copied from the kernel's.
 //
@@ -313,18 +255,22 @@ pub(crate) fn reserve_kernel_vmap() {
 	crate::arch::paging::reserve_kernel_top_level(KERNEL_MMAP_BASE, MMAP_WINDOW);
 }
 
-fn alloc_user_vrange(len: u64) -> u64 {
-	USER_VMAP.lock().alloc(len)
-}
-
 // Return a previously handed-out range to its window's pool, picked by address.
 // The unmap paths call this - the explicit unmap syscall and the object Drops
 // that tear down a leftover mapping.
-pub(crate) fn free_vrange(base: u64, len: u64) {
+//
+// `space` is the address space the range was mapped in, and is what makes a user range
+// findable again now that the user pool is per-address-space. It is an Option because
+// `DeviceMemory` can hold a mapping made before it learned to record one; a user range with
+// no space to return it to is dropped rather than guessed at, which loses window space in
+// that one address space and cannot corrupt another's.
+pub(crate) fn free_vrange(space: Option<&crate::object::address_space::AddressSpace>, base: u64, len: u64) {
 	if base >= KERNEL_MMAP_BASE {
 		KERNEL_VMAP.lock().free(base, len);
 	} else if base >= USER_MMAP_BASE {
-		USER_VMAP.lock().free(base, len);
+		if let Some(space) = space {
+			space.free_vrange(base, len);
+		}
 	}
 }
 
@@ -556,12 +502,13 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let cr3 = arch::context::read_cr3();
+	let user = arch::percpu::in_user_syscall();
+	let space = caller_address_space(user, &thread);
+	let cr3 = space.cr3();
 	if !dma.reserve_mapping(cr3) {
 		return ERR_INVALID;
 	}
-	let user = arch::percpu::in_user_syscall();
-	let base = if user { alloc_user_vrange(dma.size() as u64) } else { alloc_kernel_vrange(dma.size() as u64) };
+	let base = alloc_vrange_in(&space, user, dma.size() as u64);
 	if base == 0 {
 		dma.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
@@ -569,7 +516,8 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
 	let frames = dma.frames();
 	if !map_pages_or_rollback(base, frames.len(), flags, |i| frames[i]) {
-		free_vrange(base, dma.size() as u64);
+		free_vrange(Some(&space), base, dma.size() as u64);
+		dma.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
 	dma.commit_mapping(cr3, base);
@@ -583,7 +531,8 @@ fn sys_dma_buffer_unmap(handle: u64) -> i64 {
 		Ok(dma) => dma,
 		Err(error) => return error,
 	};
-	if !dma.remove_mapping(arch::context::read_cr3()) {
+	let space = caller_address_space(arch::percpu::in_user_syscall(), &thread);
+	if !dma.remove_mapping(&space) {
 		return ERR_NOT_MAPPED;
 	}
 	thread.process().forget_dma_mapping(&dma);
@@ -633,7 +582,9 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64) -> i64 {
 	let total = geom.height as u64 * geom.pitch as u64;
 	let pages = total.div_ceil(PAGE_SIZE);
 	let user = arch::percpu::in_user_syscall();
-	let base = if user { alloc_user_vrange(total) } else { alloc_kernel_vrange(total) };
+	let thread = current_thread!();
+	let space = caller_address_space(user, &thread);
+	let base = alloc_vrange_in(&space, user, total);
 	if base == 0 {
 		return ERR_NO_MEMORY;
 	}
@@ -642,7 +593,7 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64) -> i64 {
 		flags |= arch::paging::USER;
 	}
 	if !map_pages_or_rollback(base, pages as usize, flags, |i| base_phys + i as u64 * PAGE_SIZE) {
-		free_vrange(base, total);
+		free_vrange(Some(&space), base, total);
 		return ERR_NO_MEMORY;
 	}
 	write_user(buf_ptr, geom);
@@ -804,9 +755,11 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let user = arch::percpu::in_user_syscall();
+	let thread = current_thread!();
+	let space = caller_address_space(user, &thread);
 	let pages = device.pages();
 	let len = pages as u64 * PAGE_SIZE;
-	let base = if user { alloc_user_vrange(len) } else { alloc_kernel_vrange(len) };
+	let base = alloc_vrange_in(&space, user, len);
 	if base == 0 {
 		return ERR_NO_MEMORY;
 	}
@@ -820,17 +773,9 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 	// wrong register.
 	let phys_base = device.aligned_phys_base();
 	if !map_pages_or_rollback(base, pages, flags, |i| phys_base + i as u64 * PAGE_SIZE) {
-		free_vrange(base, len);
+		free_vrange(Some(&space), base, len);
 		return ERR_NO_MEMORY;
 	}
-	let space = if user {
-		match crate::sched::current_thread() {
-			Some(thread) => thread.process().address_space().clone(),
-			None => return ERR_INVALID,
-		}
-	} else {
-		crate::object::address_space::AddressSpace::kernel()
-	};
 	device.set_mapped_in(base, space);
 	(base + device.page_offset()) as i64
 }
@@ -1365,19 +1310,20 @@ fn sys_memory_map(handle: u64) -> i64 {
 	// Reject a duplicate map within the SAME address space; mapping into a different
 	// address space is allowed, so an object can be shared (e.g. the init package
 	// mapped by both ServiceManager and DeviceManager).
-	let cr3 = arch::context::read_cr3();
+	// A ring-3 caller maps into its own (lower-half) user space with the USER bit
+	// so the program can reach the pages; a ring-0 caller maps into the shared
+	// kernel window. Either way the active page tables are the caller's, so a
+	// plain map_page lands in the right address space.
+	let user = arch::percpu::in_user_syscall();
+	let space = caller_address_space(user, &thread);
+	let cr3 = space.cr3();
 	// Claim it under one lock. Asking and then acting let two threads of one process both
 	// find the object unmapped and both map it - and the second mapping then left the
 	// process's cleanup list while staying in the page tables.
 	if !memory.reserve_mapping(cr3) {
 		return ERR_INVALID;
 	}
-	// A ring-3 caller maps into its own (lower-half) user space with the USER bit
-	// so the program can reach the pages; a ring-0 caller maps into the shared
-	// kernel window. Either way the active page tables are the caller's, so a
-	// plain map_page lands in the right address space.
-	let user = arch::percpu::in_user_syscall();
-	let base = if user { alloc_user_vrange(memory.size() as u64) } else { alloc_kernel_vrange(memory.size() as u64) };
+	let base = alloc_vrange_in(&space, user, memory.size() as u64);
 	if base == 0 {
 		memory.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
@@ -1385,7 +1331,7 @@ fn sys_memory_map(handle: u64) -> i64 {
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
 	let frames = memory.frames();
 	if !map_pages_or_rollback(base, frames.len(), flags, |i| frames[i]) {
-		free_vrange(base, memory.size() as u64);
+		free_vrange(Some(&space), base, memory.size() as u64);
 		memory.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
@@ -1401,8 +1347,8 @@ fn sys_memory_unmap(handle: u64) -> i64 {
 		Ok(memory) => memory,
 		Err(error) => return error,
 	};
-	let cr3 = arch::context::read_cr3();
-	if !memory.remove_mapping(cr3) {
+	let space = caller_address_space(arch::percpu::in_user_syscall(), &thread);
+	if !memory.remove_mapping(&space) {
 		return ERR_NOT_MAPPED;
 	}
 	thread.process().forget_memory_mapping(&memory);

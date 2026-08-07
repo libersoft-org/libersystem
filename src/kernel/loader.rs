@@ -245,6 +245,9 @@ fn free_frames(frames: Vec<u64>) {
 	// else - see `mem::tlb`.
 	crate::mem::tlb::shootdown();
 	for frame in frames {
-		frame::deallocate(frame);
+		// SAFETY: every frame here was allocated by this load and never adopted by a
+		// Process, so this call is its only owner; the shootdown above retired the
+		// translations that reached it.
+		unsafe { frame::deallocate(frame) };
 	}
 }

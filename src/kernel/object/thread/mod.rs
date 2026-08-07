@@ -8,7 +8,6 @@
 
 #![allow(dead_code)]
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -121,10 +120,12 @@ impl Drop for KernelStack {
 		for page in 0..self.pages {
 			let at = self.base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
 			if let Some(frame) = space.unmap(at) {
-				crate::mem::frame::deallocate(frame);
+				// SAFETY: a page of this stack, owned by it, just unmapped from the only
+				// address space it was ever in.
+				unsafe { crate::mem::frame::deallocate(frame) };
 			}
 		}
-		crate::syscall::free_vrange(self.base, (self.pages as u64 + 1) * crate::mem::frame::PAGE_SIZE);
+		crate::syscall::free_vrange(Some(&space), self.base, (self.pages as u64 + 1) * crate::mem::frame::PAGE_SIZE);
 	}
 }
 

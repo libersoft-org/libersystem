@@ -14,6 +14,9 @@ use core::any::Any;
 
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::arch;
+use crate::mem::vapool::VaPool;
+use crate::memlayout::{USER_MMAP_BASE, USER_VA_END};
+use crate::sync::SpinLock;
 
 pub struct AddressSpace {
 	header: ObjectHeader,
@@ -22,12 +25,22 @@ pub struct AddressSpace {
 	// Whether this object owns its page tables and must free them on drop. The
 	// kernel space wraps the bootloader's tables and does not own them.
 	owned: bool,
+	// This space's own user mmap window. Per address space rather than global: two
+	// address spaces may hand out the same user virtual address without sharing
+	// anything, so a global pool made unrelated processes contend for one lock, let
+	// any one of them exhaust the window for all of them, and gave a range a lifetime
+	// longer than the tables it was an address in. This one dies with the space.
+	//
+	// The kernel space's copy is never used - kernel ranges come from KERNEL_VMAP,
+	// selected by address - and it is empty rather than absent because `kernel()`
+	// hands out a fresh wrapper each call, so there is nothing durable to key on.
+	vmap: SpinLock<VaPool>,
 }
 
 impl AddressSpace {
 	// Capture the active address space (the kernel tables the bootloader built).
 	pub fn kernel() -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), cr3: arch::context::read_cr3(), owned: false })
+		Arc::new(Self { header: ObjectHeader::new(), cr3: arch::context::read_cr3(), owned: false, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)) })
 	}
 
 	// Create a new process address space with its own page tables. The user half
@@ -35,7 +48,17 @@ impl AddressSpace {
 	// no frame is available for the top-level table.
 	pub fn create() -> Option<Arc<Self>> {
 		let cr3 = arch::paging::new_address_space()?;
-		Some(Arc::new(Self { header: ObjectHeader::new(), cr3, owned: true }))
+		Some(Arc::new(Self { header: ObjectHeader::new(), cr3, owned: true, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)) }))
+	}
+
+	// Hand out a range of this space's user mmap window, or 0 when it is exhausted.
+	pub fn alloc_vrange(&self, len: u64) -> u64 {
+		self.vmap.lock().alloc(len)
+	}
+
+	// Give a range of this space's user mmap window back.
+	pub fn free_vrange(&self, base: u64, len: u64) {
+		self.vmap.lock().free(base, len);
 	}
 
 	// The page-table root to load into CR3 when this address space is active.

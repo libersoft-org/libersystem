@@ -123,7 +123,9 @@ fn unwind(base: u64, mapped: u64, end: u64) {
 	let mut virt = base;
 	while virt < mapped {
 		if let Some(phys) = paging::unmap_page(virt) {
-			frame::deallocate(phys);
+			// SAFETY: the frame came from this growth's own allocation and has just been
+			// unmapped from the only place it was ever mapped.
+			unsafe { frame::deallocate(phys) };
 		}
 		virt += PAGE_SIZE;
 	}

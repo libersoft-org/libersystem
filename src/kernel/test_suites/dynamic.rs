@@ -74,7 +74,7 @@ fn an_et_exec_may_not_name_the_kernel_half() {
 	let frame = crate::mem::frame::allocate().expect("a frame");
 	assert!(space.try_map(USER_VA_END, frame, crate::arch::paging::PRESENT | crate::arch::paging::USER).is_err(), "no USER mapping outside the user half");
 	assert!(space.try_map(USER_VA_END - 0x1000, frame, crate::arch::paging::PRESENT | crate::arch::paging::USER).is_ok(), "the last user page is still mappable");
-	crate::mem::frame::deallocate(frame);
+	unsafe { crate::mem::frame::deallocate(frame) };
 }
 
 tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Dynamic, DynamicReject, Memory, Process]);
@@ -209,7 +209,7 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	assert_eq!(relocated, 0x1000_1234);
 	drop(address_space);
 	for frame in frames {
-		mem::frame::deallocate(frame);
+		unsafe { mem::frame::deallocate(frame) };
 	}
 
 	let rejected_space = AddressSpace::create().expect("rejected ET_DYN address space");
@@ -220,7 +220,7 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	assert!(rejected_shared.is_empty());
 	drop(rejected_space);
 	for frame in rejected_frames {
-		mem::frame::deallocate(frame);
+		unsafe { mem::frame::deallocate(frame) };
 	}
 
 	let mut oversized = image(0);
@@ -231,7 +231,7 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	assert_eq!(crate::elf::load_module_into(&oversized, &oversized_space, &mut oversized_frames, &mut oversized_shared, 0x2000_0000, &|_| None), Err(ElfError::BadImage));
 	assert!(oversized_space.unmap(0x2000_0000).is_none(), "oversized provider cannot escape its 16 MiB slot");
 	for frame in oversized_frames {
-		mem::frame::deallocate(frame);
+		unsafe { mem::frame::deallocate(frame) };
 	}
 
 	let process = Process::new(AddressSpace::create().expect("dynamic module process address space"), sched::root_domain());

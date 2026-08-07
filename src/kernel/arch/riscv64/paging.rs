@@ -192,8 +192,14 @@ pub fn alloc_frame() -> Option<u64> {
 	Some(pa)
 }
 
-pub fn dealloc_frame(pa: u64) {
-	crate::mem::frame::deallocate(pa);
+// Return a frame to the portable pool.
+//
+// # Safety
+//
+// Same contract as `frame::deallocate`: `pa` must be a frame this caller owns, freed once,
+// and no longer reachable through any page table on any core.
+pub unsafe fn dealloc_frame(pa: u64) {
+	unsafe { crate::mem::frame::deallocate(pa) };
 }
 
 pub fn frames_free() -> u64 {

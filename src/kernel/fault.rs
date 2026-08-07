@@ -74,7 +74,9 @@ pub fn grow_user_stack(address: u64, error_code: u64) -> bool {
 	// Out of frames for an intermediate page table: hand the frame back and refuse
 	// the growth (the caller terminates the process) instead of panicking the kernel.
 	if process.address_space().try_map(page, new_frame, flags).is_err() {
-		frame::deallocate(new_frame);
+		// SAFETY: allocated a few lines above, never mapped (the map is what just failed),
+		// and not handed to the process.
+		unsafe { frame::deallocate(new_frame) };
 		return false;
 	}
 	process.adopt_frames(alloc::vec![new_frame]);

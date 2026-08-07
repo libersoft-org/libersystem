@@ -48,8 +48,8 @@ extern "C" fn user_thread_body(handle: u64) {
 	}
 	arch::paging::unmap_page(USER_CODE_VA);
 	arch::paging::unmap_page(USER_STACK_VA);
-	frame::deallocate(code);
-	frame::deallocate(stack);
+	unsafe { frame::deallocate(code) };
+	unsafe { frame::deallocate(stack) };
 }
 
 // Load the volume archive bytes and the parsed init package - the 'static modules
@@ -1074,8 +1074,8 @@ extern "C" fn user_fault_thread_body(_arg: u64) {
 	// process teardown is what frees it.
 	arch::paging::unmap_page(USER_CODE_VA);
 	arch::paging::unmap_page(USER_STACK_VA);
-	frame::deallocate(code);
-	frame::deallocate(stack);
+	unsafe { frame::deallocate(code) };
+	unsafe { frame::deallocate(stack) };
 }
 
 // A bindable test IRQ vector (33..47, distinct from the interrupt_bind test's) a
@@ -1125,7 +1125,7 @@ extern "C" fn user_stack_probe_thread_body(pages: u64) {
 		STACK_USED.store(thread.process().domain().account().stack().used(), Ordering::SeqCst);
 	}
 	arch::paging::unmap_page(USER_CODE_VA);
-	frame::deallocate(code);
+	unsafe { frame::deallocate(code) };
 	// Unmap whatever the probe grew (up to the whole requested span; pages past
 	// the kill point were never mapped and unmap is a no-op there).
 	for i in 1..=pages {
@@ -1157,8 +1157,8 @@ extern "C" fn user_nx_thread_body(_arg: u64) {
 	NX_CODE.store(info.error_code, Ordering::SeqCst);
 	arch::paging::unmap_page(USER_CODE_VA);
 	arch::paging::unmap_page(USER_STACK_VA);
-	frame::deallocate(code);
-	frame::deallocate(stack);
+	unsafe { frame::deallocate(code) };
+	unsafe { frame::deallocate(stack) };
 }
 
 // Kernel-thread body for the driver-crash test: it acquires real driver resources
@@ -1189,8 +1189,8 @@ extern "C" fn driver_crash_thread_body(_arg: u64) {
 	// stay open, so the kernel's process teardown is what releases them.
 	arch::paging::unmap_page(USER_CODE_VA);
 	arch::paging::unmap_page(USER_STACK_VA);
-	frame::deallocate(code);
-	frame::deallocate(stack);
+	unsafe { frame::deallocate(code) };
+	unsafe { frame::deallocate(stack) };
 }
 
 // A kernel thread that holds a resource and parks until its Domain is killed. It
@@ -3511,6 +3511,6 @@ extern "C" fn user_yield_thread_body(handle: u64) {
 	}
 	arch::paging::unmap_page(code_va);
 	arch::paging::unmap_page(stack_va);
-	frame::deallocate(code);
-	frame::deallocate(stack);
+	unsafe { frame::deallocate(code) };
+	unsafe { frame::deallocate(stack) };
 }

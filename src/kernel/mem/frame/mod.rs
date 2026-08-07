@@ -58,11 +58,96 @@ struct FrameAllocator {
 	heap: Option<Vec<Run>>,
 	free_count: usize,
 	total_count: usize,
+	// Debug-build ownership record: one bit per frame in [owned_base, owned_base + owned_frames),
+	// set while the frame is out on loan. See `check_owned_free`.
+	#[cfg(debug_assertions)]
+	owned: Option<Vec<u64>>,
+	#[cfg(debug_assertions)]
+	owned_base: u64,
+	#[cfg(debug_assertions)]
+	owned_frames: u64,
 }
 
 impl FrameAllocator {
 	const fn new() -> Self {
-		Self { seed: [Run { base: 0, pages: 0 }; SEED_RUNS], seed_len: 0, heap: None, free_count: 0, total_count: 0 }
+		Self {
+			seed: [Run { base: 0, pages: 0 }; SEED_RUNS],
+			seed_len: 0,
+			heap: None,
+			free_count: 0,
+			total_count: 0,
+			#[cfg(debug_assertions)]
+			owned: None,
+			#[cfg(debug_assertions)]
+			owned_base: 0,
+			#[cfg(debug_assertions)]
+			owned_frames: 0,
+		}
+	}
+
+	// Mark a span as out on loan. No-op until the bitmap exists (boot seeding runs before
+	// the heap) and in release builds.
+	#[cfg(debug_assertions)]
+	fn mark_owned(&mut self, base: u64, pages: u64, owned: bool) {
+		let (record_base, record_frames) = (self.owned_base, self.owned_frames);
+		let Some(bits) = self.owned.as_mut() else { return };
+		for page in 0..pages {
+			let phys = base + page * PAGE_SIZE;
+			if phys < record_base {
+				continue;
+			}
+			let index = (phys - record_base) / PAGE_SIZE;
+			if index >= record_frames {
+				continue;
+			}
+			let (word, bit) = ((index / 64) as usize, index % 64);
+			if owned {
+				bits[word] |= 1 << bit;
+			} else {
+				bits[word] &= !(1 << bit);
+			}
+		}
+	}
+
+	#[cfg(not(debug_assertions))]
+	fn mark_owned(&mut self, _base: u64, _pages: u64, _owned: bool) {}
+
+	// Is every frame of this span currently out on loan from THIS allocator?
+	//
+	// The overlap test in `insert` already refuses a span that overlaps the free pool, which
+	// catches the double free of a frame that is still free. It cannot catch the two cases
+	// this does: a frame that was never handed out at all (an MMIO address, a bootloader
+	// reservation, a number off the stack), which would quietly add non-RAM to the pool; and
+	// a frame freed twice with an allocation of it in between, where the second free lands
+	// while the frame is legitimately out on loan to someone else.
+	//
+	// Returns true when there is no record to consult - during boot seeding, and in release
+	// builds - so this is a check that can only ever refuse a free it is certain about.
+	#[cfg(debug_assertions)]
+	fn check_owned_free(&self, base: u64, pages: u64) -> bool {
+		let Some(bits) = self.owned.as_ref() else { return true };
+		if base % PAGE_SIZE != 0 {
+			crate::serial_println!("frame: WARNING: free refused - {base:#x} is not page-aligned");
+			return false;
+		}
+		for page in 0..pages {
+			let phys = base + page * PAGE_SIZE;
+			let index = phys.checked_sub(self.owned_base).map(|offset| offset / PAGE_SIZE);
+			let Some(index) = index.filter(|index| *index < self.owned_frames) else {
+				crate::serial_println!("frame: WARNING: free refused - {phys:#x} is not a frame this allocator owns");
+				return false;
+			};
+			if bits[(index / 64) as usize] & (1 << (index % 64)) == 0 {
+				crate::serial_println!("frame: WARNING: free refused - {phys:#x} is not currently allocated");
+				return false;
+			}
+		}
+		true
+	}
+
+	#[cfg(not(debug_assertions))]
+	fn check_owned_free(&self, _base: u64, _pages: u64) -> bool {
+		true
 	}
 
 	// The current run table, whichever backing it lives in.
@@ -132,6 +217,13 @@ impl FrameAllocator {
 		if pages == 0 {
 			return;
 		}
+		// Refuse a span this allocator did not hand out before touching the run table, so a
+		// bad address cannot become free memory. Boot seeding passes this trivially - the
+		// record does not exist yet.
+		if !self.check_owned_free(base, pages) {
+			return;
+		}
+		self.mark_owned(base, pages, false);
 		let at = self.position(base);
 		let end = base + pages * PAGE_SIZE;
 		let len = self.runs().len();
@@ -188,6 +280,7 @@ impl FrameAllocator {
 			self.remove_at(0);
 		}
 		self.free_count -= 1;
+		self.mark_owned(base, 1, true);
 		Some(base)
 	}
 
@@ -207,6 +300,7 @@ impl FrameAllocator {
 					self.remove_at(at);
 				}
 				self.free_count -= pages as usize;
+				self.mark_owned(base, pages, true);
 				return Some(base);
 			}
 		}
@@ -238,6 +332,20 @@ pub fn init(regions: &[MemRegion]) {
 	// Everything inserted so far is the machine's usable frame pool: fix the total
 	// here so `totals` can report used = total - free for the rest of the run.
 	allocator.total_count = allocator.free_count;
+	// And fix the pool's ADDRESS extent here too, while the free runs still are the whole
+	// pool. After the first allocation they are not, so this is the only moment the span
+	// the ownership record has to cover can be read off the table.
+	#[cfg(debug_assertions)]
+	{
+		let extent = {
+			let runs = allocator.runs();
+			runs.first().zip(runs.last()).map(|(first, last)| (first.base, last.base + last.pages * PAGE_SIZE))
+		};
+		if let Some((low, high)) = extent {
+			allocator.owned_base = low;
+			allocator.owned_frames = (high - low) / PAGE_SIZE;
+		}
+	}
 }
 
 // Move the run table onto the heap. Called by mem::init right after heap::init:
@@ -260,17 +368,46 @@ pub fn upgrade_to_heap() {
 	// pool splintered into more spans than this is one where something else has already
 	// gone wrong. `insert_at` refuses past it and says so, which loses a run rather than
 	// deadlocking the machine.
-	let mut allocator = ALLOCATOR.lock();
-	if allocator.heap.is_some() {
-		return;
-	}
+	// Both tables are reserved BEFORE the lock is taken, not under it. Reserving calls the
+	// global allocator, whose `grow` calls `frame::allocate` - straight back into this lock.
 	let mut runs = Vec::new();
 	if runs.try_reserve_exact(MAX_RUNS).is_err() {
 		crate::serial_println!("frame: could not reserve the run table; staying on the seed table");
 		return;
 	}
+	// The debug ownership record: one bit per frame of the pool, 128 KiB on a 4 GiB machine,
+	// in debug builds only. `owned_frames` was fixed at init and does not change, so sizing
+	// this outside the lock is sound.
+	#[cfg(debug_assertions)]
+	let bits = {
+		let words = (ALLOCATOR.lock().owned_frames as usize).div_ceil(64);
+		let mut bits: Vec<u64> = Vec::new();
+		if bits.try_reserve_exact(words).is_err() {
+			crate::serial_println!("frame: could not reserve the ownership record; frees will not be checked against it");
+			Vec::new()
+		} else {
+			// Start from "every frame is out on loan" and clear what is free below. That is
+			// exactly right: whatever is not free at this moment was handed out before the
+			// record existed - the heap window, the boot page tables - and freeing it later
+			// is legitimate, so it has to read as owned.
+			bits.resize(words, u64::MAX);
+			bits
+		}
+	};
+	let mut allocator = ALLOCATOR.lock();
+	if allocator.heap.is_some() {
+		return;
+	}
 	runs.extend_from_slice(&allocator.seed[..allocator.seed_len]);
 	allocator.heap = Some(runs);
+	#[cfg(debug_assertions)]
+	if !bits.is_empty() {
+		allocator.owned = Some(bits);
+		for index in 0..allocator.runs().len() {
+			let run = allocator.runs()[index];
+			allocator.mark_owned(run.base, run.pages, false);
+		}
+	}
 }
 
 // The frame pool's totals: (total usable frames fixed at init, frames currently free).
@@ -302,10 +439,20 @@ pub fn allocate_contiguous(pages: usize) -> Option<u64> {
 // Return a physical frame to the pool (re-coalescing with its neighbors, so
 // contiguous runs re-form as buffers are released).
 //
-// SAFETY: `phys` must be a frame previously obtained from `allocate` (or part of
-// an `allocate_contiguous` span) that is no longer in use (and no longer mapped
-// anywhere it could be written through).
-pub fn deallocate(phys: u64) {
+// This is the raw, un-owned form of a free: a bare integer with no proof attached that the
+// caller has the right to give it back. Getting it wrong does not go wrong here - it goes
+// wrong later, when the frame is handed out a second time and two owners write through the
+// same memory - which is exactly the shape `unsafe` exists to mark. In debug builds the
+// allocator checks the claim against its ownership record and refuses a free it can prove
+// is not the caller's; in release builds nothing checks it, and this signature is the only
+// thing standing between a wrong address and the free pool.
+//
+// # Safety
+//
+// `phys` must be a frame previously obtained from `allocate` (or a page of an
+// `allocate_contiguous` span), still owned by the caller, freed exactly once, and no longer
+// mapped anywhere it could be written through.
+pub unsafe fn deallocate(phys: u64) {
 	ALLOCATOR.lock().insert(phys, 1);
 }
 
@@ -326,7 +473,9 @@ pub fn allocate_pages(pages: usize) -> Option<Vec<u64>> {
 		match allocate() {
 			Some(phys) => frames.push(phys),
 			None => {
-				free_pages(&frames);
+				// SAFETY: every frame in `frames` came from `allocate` above, is owned by
+				// this call and has not been handed anywhere else.
+				unsafe { free_pages(&frames) };
 				return None;
 			}
 		}
@@ -336,9 +485,13 @@ pub fn allocate_pages(pages: usize) -> Option<Vec<u64>> {
 }
 
 // Return a set of frames to the pool.
-pub fn free_pages(frames: &[u64]) {
+//
+// # Safety
+//
+// Every address in `frames` must satisfy `deallocate`'s contract.
+pub unsafe fn free_pages(frames: &[u64]) {
 	for &phys in frames {
-		deallocate(phys);
+		unsafe { deallocate(phys) };
 	}
 }
 

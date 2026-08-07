@@ -268,7 +268,9 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	let xlate = paging::translate(TEST_VA);
 	crate::serial_println!("riscv64: map_page test - readback {readback:#x}, translate {xlate:#x?} (frame {frame:#x})");
 	paging::unmap_page(TEST_VA);
-	paging::dealloc_frame(frame);
+	// SAFETY: the frame this bring-up check allocated three lines up, just unmapped from
+	// the only address that ever reached it.
+	unsafe { paging::dealloc_frame(frame) };
 
 	// Increment 5: monotonic clock, per-CPU block, context switch, scheduler, timer.
 	super::tsc::init();

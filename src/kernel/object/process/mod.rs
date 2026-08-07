@@ -442,12 +442,11 @@ impl Process {
 	}
 
 	fn unmap_objects(&self) {
-		let cr3 = self.address_space.cr3();
 		for object in core::mem::take(&mut *self.mapped_memory.lock()) {
-			object.remove_mapping(cr3);
+			object.remove_mapping(&self.address_space);
 		}
 		for object in core::mem::take(&mut *self.mapped_dma.lock()) {
-			object.remove_mapping(cr3);
+			object.remove_mapping(&self.address_space);
 		}
 	}
 
@@ -486,7 +485,9 @@ impl Drop for Process {
 			crate::mem::tlb::shootdown();
 		}
 		for frame in frames {
-			crate::mem::frame::deallocate(frame);
+			// SAFETY: these are the frames the process adopted, taken out of its list above
+			// so nothing else can reach them, after a shootdown retired every translation.
+			unsafe { crate::mem::frame::deallocate(frame) };
 		}
 	}
 }

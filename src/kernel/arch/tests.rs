@@ -86,8 +86,8 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 	drop(space);
 	let reclaimed = frame::free_count() - before_drop;
 	assert!(reclaimed as u64 >= ROUNDS, "dropping the space reclaimed {reclaimed} frames, expected at least {ROUNDS} leaf tables - an intermediate table leaked");
-	frame::deallocate(FRAMES[0].load(Ordering::SeqCst));
-	frame::deallocate(FRAMES[1].load(Ordering::SeqCst));
+	unsafe { frame::deallocate(FRAMES[0].load(Ordering::SeqCst)) };
+	unsafe { frame::deallocate(FRAMES[1].load(Ordering::SeqCst)) };
 }
 
 crate::tagged_test!(paging_map_unmap, [Paging, Memory]);
@@ -108,5 +108,5 @@ fn paging_map_unmap() {
 	}
 	let unmapped = paging::unmap_page(virt).expect("was mapped");
 	assert_eq!(unmapped, phys);
-	mem::frame::deallocate(phys);
+	unsafe { mem::frame::deallocate(phys) };
 }

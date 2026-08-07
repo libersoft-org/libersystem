@@ -102,7 +102,10 @@ impl DmaBuffer {
 		self.mappings.lock().push((cr3, base));
 	}
 
-	pub fn remove_mapping(&self, cr3: u64) -> bool {
+	// Take this buffer's mapping out of `space`. The address space, not a bare cr3, because
+	// the virtual range goes back to a pool that lives inside it.
+	pub fn remove_mapping(&self, space: &crate::object::address_space::AddressSpace) -> bool {
+		let cr3 = space.cr3();
 		let base = {
 			let mut mappings = self.mappings.lock();
 			let Some(index) = mappings.iter().position(|(mapped_cr3, _)| *mapped_cr3 == cr3) else { return false };
@@ -111,7 +114,7 @@ impl DmaBuffer {
 		for page in 0..self.frames.len() {
 			paging::unmap_page_in(cr3, base + page as u64 * PAGE_SIZE);
 		}
-		crate::syscall::free_vrange(base, self.size as u64);
+		crate::syscall::free_vrange(Some(space), base, self.size as u64);
 		true
 	}
 }
@@ -121,7 +124,9 @@ impl_kernel_object!(DmaBuffer, DmaBuffer);
 impl Drop for DmaBuffer {
 	fn drop(&mut self) {
 		debug_assert!(self.mappings.lock().is_empty(), "process cleanup must remove every DmaBuffer mapping");
-		frame::free_pages(&self.frames);
+		// SAFETY: this buffer owns its frames, and the debug assert above has established
+		// that nothing is mapping them any more.
+		unsafe { frame::free_pages(&self.frames) };
 		// Refund the pinned DMA memory to the owning Domain.
 		self.domain.uncharge_dma(self.size as u64);
 	}

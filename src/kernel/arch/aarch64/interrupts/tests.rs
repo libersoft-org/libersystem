@@ -28,7 +28,7 @@ fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
 	// Unbinding frees the slot for re-use.
 	unbind(vector);
 	assert!(!is_bound(vector), "unbind drops the binding");
-	frame::deallocate(table);
+	unsafe { frame::deallocate(table) };
 }
 
 crate::tagged_test!(gicv2m_msi_inventory_reports_the_timer_and_msi_vectors, [Interrupt, Drivers, ArchAarch64]);
@@ -56,5 +56,5 @@ fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 	}
 	assert!(seen, "the acquired MSI vector appears in the inventory");
 	unbind(vector);
-	frame::deallocate(table);
+	unsafe { frame::deallocate(table) };
 }

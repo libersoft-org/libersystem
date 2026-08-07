@@ -32,7 +32,7 @@ fn device_memory_maps_mmio_region() {
 	assert!(DONE.load(Ordering::SeqCst), "device-memory mapping thread did not finish");
 	// The thread (and its handle table) is reaped by run_until_idle, dropping the
 	// DeviceMemory and tearing its mapping down, so the frame is free to reclaim.
-	mem::frame::deallocate(phys);
+	unsafe { mem::frame::deallocate(phys) };
 }
 
 tagged_test!(

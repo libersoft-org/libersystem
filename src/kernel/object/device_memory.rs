@@ -113,7 +113,7 @@ impl Drop for DeviceMemory {
 					None => {}
 				}
 			}
-			crate::syscall::free_vrange(base, self.pages() as u64 * PAGE_SIZE);
+			crate::syscall::free_vrange(space.as_deref(), base, self.pages() as u64 * PAGE_SIZE);
 		}
 	}
 }

@@ -32,7 +32,7 @@ fn a_translation_is_not_a_permission() {
 	assert!(translate_flags_in(&space, at).is_none(), "an unmapped address has no flags");
 	assert!(translate_flags(0x7fff_0000_0000).is_none(), "nor does one nothing ever mapped");
 
-	crate::mem::frame::deallocate(frame);
+	unsafe { crate::mem::frame::deallocate(frame) };
 }
 
 // `translate_flags` reads the ACTIVE tables, so a mapping made in another address space
@@ -129,8 +129,8 @@ fn mapping_over_a_live_page_is_refused_not_performed() {
 	assert!(space.try_map(at, second, PRESENT | USER | WRITABLE).is_ok(), "an unmapped address still maps");
 	assert_eq!(space.unmap(at), Some(second));
 
-	crate::mem::frame::deallocate(first);
-	crate::mem::frame::deallocate(second);
+	unsafe { crate::mem::frame::deallocate(first) };
+	unsafe { crate::mem::frame::deallocate(second) };
 }
 
 tagged_test!(duplicating_a_handle_is_charged_like_any_other_install, [Process, Syscall]);
@@ -254,9 +254,9 @@ fn a_cpu_bound_ring3_thread_is_preempted() {
 		arch::paging::unmap_page(USER_CODE_VA);
 		arch::paging::unmap_page(USER_STACK_VA);
 		arch::paging::unmap_page(SPIN_FLAG_VA);
-		frame::deallocate(code);
-		frame::deallocate(stack);
-		frame::deallocate(data);
+		unsafe { frame::deallocate(code) };
+		unsafe { frame::deallocate(stack) };
+		unsafe { frame::deallocate(data) };
 		SPIN_DONE.store(true, Ordering::SeqCst);
 	}
 	// The releaser waits until the spinner's counter demonstrably grows - proof the
@@ -357,8 +357,8 @@ fn process_isolation_and_per_process_tables() {
 	// tables, but these leaf frames are ours to release.
 	assert_eq!(p1.address_space().unmap(VA), Some(f1));
 	assert_eq!(p2.address_space().unmap(VA), Some(f2));
-	frame::deallocate(f1);
-	frame::deallocate(f2);
+	unsafe { frame::deallocate(f1) };
+	unsafe { frame::deallocate(f2) };
 }
 
 tagged_test!(syscall_object_and_handle_ops, [Syscall]);
@@ -990,7 +990,7 @@ fn kernel_access_to_user_memory_is_refused_outside_the_window() {
 	assert!(code & 0x10 != 0, "the SMEP refusal is an instruction fetch");
 	// The probe threads died mid-body: clean their mapping up here.
 	arch::paging::unmap_page(SMAP_PROBE_VA);
-	frame::deallocate(frame);
+	unsafe { frame::deallocate(frame) };
 }
 
 tagged_test!(a_user_stack_grows_on_demand_past_its_initial_pages, [Kernel, Memory]);

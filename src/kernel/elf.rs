@@ -40,7 +40,9 @@ impl SharedPage {
 
 impl Drop for SharedPage {
 	fn drop(&mut self) {
-		frame::deallocate(self.frame);
+		// SAFETY: this type owns the frame from creation to here, and the map that hands
+		// out `Weak` references to it is the only place it is reachable from.
+		unsafe { frame::deallocate(self.frame) };
 	}
 }
 
