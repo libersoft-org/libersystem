@@ -496,6 +496,26 @@ fn enqueue(thread: Arc<Thread>) {
 		core::hint::spin_loop();
 	}
 	thread.set_state(ThreadState::Ready);
+	// The WAKER's run queue, which means a woken thread can resume on a different core
+	// than it left. That is migration, and it is deliberate: it puts the thread where the
+	// data that woke it is warm, and it needs no balancer.
+	//
+	// It is written down here because parts of this kernel were built as though migration
+	// did not happen, and the difference matters for anything a thread carries per-CPU.
+	// What has been checked to survive it:
+	//
+	//   - the saved stack pointer, published with a release above and read with an
+	//     acquire, so a core resuming a thread sees a complete register frame;
+	//   - the kernel stack, which is the thread's own mapped range and not per-CPU;
+	//   - `KERNEL_RSP`, reloaded from the incoming thread on every switch rather than
+	//     being a property of the core;
+	//   - the interrupt state, restored by the guard that took it, which is now pinned to
+	//     one CPU so it cannot be dropped on another.
+	//
+	// What still does NOT survive it is the TLB: an address space live on two cores has
+	// no shootdown, so a thread migrating away from a core leaves translations behind it.
+	// That is the open item in Phase 2, and it is the reason migration is not yet safe for
+	// a process with threads on several cores rather than a reason to stop migrating.
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread);
 }
 

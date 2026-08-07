@@ -506,12 +506,13 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 		Err(e) => return e,
 	};
 	let cr3 = arch::context::read_cr3();
-	if dma.is_mapped_in(cr3) {
+	if !dma.reserve_mapping(cr3) {
 		return ERR_INVALID;
 	}
 	let user = arch::percpu::in_user_syscall();
 	let base = if user { alloc_user_vrange(dma.size() as u64) } else { alloc_kernel_vrange(dma.size() as u64) };
 	if base == 0 {
+		dma.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
@@ -520,7 +521,7 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 		free_vrange(base, dma.size() as u64);
 		return ERR_NO_MEMORY;
 	}
-	dma.add_mapping(cr3, base);
+	dma.commit_mapping(cr3, base);
 	thread.process().record_dma_mapping(dma);
 	base as i64
 }
@@ -1314,7 +1315,10 @@ fn sys_memory_map(handle: u64) -> i64 {
 	// address space is allowed, so an object can be shared (e.g. the init package
 	// mapped by both ServiceManager and DeviceManager).
 	let cr3 = arch::context::read_cr3();
-	if memory.is_mapped_in(cr3) {
+	// Claim it under one lock. Asking and then acting let two threads of one process both
+	// find the object unmapped and both map it - and the second mapping then left the
+	// process's cleanup list while staying in the page tables.
+	if !memory.reserve_mapping(cr3) {
 		return ERR_INVALID;
 	}
 	// A ring-3 caller maps into its own (lower-half) user space with the USER bit
@@ -1324,15 +1328,17 @@ fn sys_memory_map(handle: u64) -> i64 {
 	let user = arch::percpu::in_user_syscall();
 	let base = if user { alloc_user_vrange(memory.size() as u64) } else { alloc_kernel_vrange(memory.size() as u64) };
 	if base == 0 {
+		memory.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
 	let frames = memory.frames();
 	if !map_pages_or_rollback(base, frames.len(), flags, |i| frames[i]) {
 		free_vrange(base, memory.size() as u64);
+		memory.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
-	memory.add_mapping(cr3, base);
+	memory.commit_mapping(cr3, base);
 	thread.process().record_memory_mapping(memory.clone());
 	base as i64
 }

@@ -160,7 +160,7 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 // image load this does not map a stack or create a thread; providers are loaded in
 // dependency order and the main SYS_PROCESS_LOAD remains the transaction's final step.
 pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Result<(), LoadError> {
-	if !process.reserve_dynamic_module() {
+	if !process.reserve_dynamic_module_at(bias) {
 		return Err(LoadError::BadImage);
 	}
 	let mut frames: Vec<u64> = Vec::new();
@@ -168,13 +168,13 @@ pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Resul
 	let exports = match elf::load_module_into(elf_image, process.address_space(), &mut frames, &mut shared, bias, &|name| process.resolve_dynamic_symbol(name)) {
 		Ok(exports) => exports,
 		Err(err) => {
-			process.release_dynamic_module();
+			process.release_dynamic_module_at(bias);
 			free_frames(frames);
 			return Err(err.into());
 		}
 	};
 	if !process.register_dynamic_symbols(&exports) {
-		process.release_dynamic_module();
+		process.release_dynamic_module_at(bias);
 		elf::unmap_module(elf_image, process.address_space(), bias);
 		free_frames(frames);
 		return Err(LoadError::BadImage);

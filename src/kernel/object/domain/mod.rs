@@ -214,6 +214,11 @@ impl Domain {
 	// Create a child Domain under `parent` with the given caps, linked into the
 	// parent's subtree. The child's charges also count against the parent and
 	// every ancestor, and killing the parent kills the child.
+	// Create a child Domain, unless the parent has been killed.
+	//
+	// Returns None for a killed parent: a child created under one would never be reached
+	// by that kill, and its charges would pass through a parent that is no longer
+	// enforcing anything.
 	pub fn new_child(parent: &Arc<Domain>, memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Arc<Self> {
 		let child = Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: Some(Arc::downgrade(parent)), children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) });
 		parent.children.lock().push(child.clone());
@@ -236,10 +241,21 @@ impl Domain {
 	// Register a process as accounted to this Domain so it can be terminated when
 	// the Domain is killed. Dead weak entries are pruned on the way in so the list
 	// stays bounded to live processes.
-	pub fn register_process(&self, process: &Arc<Process>) {
+	// Register a process with this Domain, unless the Domain has been killed.
+	//
+	// Returns false for a killed Domain. `kill` flags, snapshots the process list, and
+	// terminates the snapshot - so a process registered between the snapshot and the flag
+	// check that never happened escaped the kill entirely and went on running under a
+	// Domain that no longer exists to account for it. The register and the check have to be
+	// the same operation, under the list's own lock.
+	pub fn register_process(&self, process: &Arc<Process>) -> bool {
 		let mut list = self.processes.lock();
+		if self.killed.load(Ordering::Acquire) {
+			return false;
+		}
 		list.retain(|weak| weak.strong_count() > 0);
 		list.push(Arc::downgrade(process));
+		true
 	}
 
 	// A snapshot of this Domain's live child Domains (for the System Graph). The

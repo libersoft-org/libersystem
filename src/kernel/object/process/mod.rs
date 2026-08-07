@@ -118,6 +118,9 @@ pub struct Process {
 	dynamic_symbols: SpinLock<BTreeMap<String, u64>>,
 	shared_image_pages: SpinLock<Vec<Arc<crate::elf::SharedPage>>>,
 	dynamic_modules: AtomicUsize,
+	// The biases dynamic modules are loaded at. `dynamic_modules` counts them; this says
+	// WHICH, which is what a second load at the same address has to be refused against.
+	dynamic_biases: SpinLock<Vec<u64>>,
 }
 
 impl Process {
@@ -127,9 +130,13 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), live_thread_count: AtomicUsize::new(0) });
-		// Register with the Domain so a Domain kill can reach and terminate it.
-		process.domain.register_process(&process);
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0) });
+		// Register with the Domain so a Domain kill can reach and terminate it. A killed
+		// Domain refuses, and the process is terminated at once rather than left running
+		// under an authority that no longer accounts for it.
+		if !process.domain.register_process(&process) {
+			process.terminate();
+		}
 		process
 	}
 
@@ -174,8 +181,20 @@ impl Process {
 	// path and item after it are stable. Intended for callers that know which export
 	// they mean but cannot know the hash; the tail must be specific enough to be
 	// unambiguous, so the first match wins.
+	// The address of the one symbol whose name ends with `suffix`, or None.
+	//
+	// None when there is no match AND when there is more than one. It returned the FIRST
+	// match while its own contract asked for uniqueness, so an ambiguous suffix silently
+	// resolved to whichever symbol the map happened to yield first - a different one after
+	// any change to the registry, with nothing to say the answer was a choice.
 	pub fn resolve_dynamic_symbol_by_suffix(&self, suffix: &str) -> Option<u64> {
-		self.dynamic_symbols.lock().iter().find(|(name, _)| name.ends_with(suffix)).map(|(_, address)| *address)
+		let registry = self.dynamic_symbols.lock();
+		let mut matches = registry.iter().filter(|(name, _)| name.ends_with(suffix));
+		let first = matches.next()?;
+		if matches.next().is_some() {
+			return None;
+		}
+		Some(*first.1)
 	}
 
 	pub fn register_dynamic_symbols(&self, symbols: &[(String, u64)]) -> bool {
@@ -189,8 +208,32 @@ impl Process {
 		true
 	}
 
-	pub fn reserve_dynamic_module(&self) -> bool {
-		self.dynamic_modules.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < 64).then_some(count + 1)).is_ok()
+	// Claim a module SLOT at `bias`, not merely a place in the count.
+	//
+	// The count alone let two loads at the same bias both pass: both mapped the same
+	// addresses, the second overwrote the first's page-table entries, and either one's
+	// rollback unmapped the other's. A count answers "how many"; it cannot answer "is this
+	// address already taken", and that is the question a loader is asking.
+	//
+	// The mapper refusing to overwrite a live leaf catches the collision now too, but as a
+	// mapping failure partway through rather than as a refusal up front - which leaves the
+	// first module's rollback and the second's interleaved. This refuses before either
+	// touches the address space.
+	pub fn reserve_dynamic_module_at(&self, bias: u64) -> bool {
+		let mut biases = self.dynamic_biases.lock();
+		if biases.len() >= 64 || biases.contains(&bias) {
+			return false;
+		}
+		biases.push(bias);
+		self.dynamic_modules.store(biases.len(), Ordering::Release);
+		true
+	}
+
+	// Give a claimed slot back, for a module load that did not complete.
+	pub fn release_dynamic_module_at(&self, bias: u64) {
+		let mut biases = self.dynamic_biases.lock();
+		biases.retain(|taken| *taken != bias);
+		self.dynamic_modules.store(biases.len(), Ordering::Release);
 	}
 
 	pub fn release_dynamic_module(&self) {

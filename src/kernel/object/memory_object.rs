@@ -83,6 +83,39 @@ impl MemoryObject {
 		self.mappings.lock().iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3)
 	}
 
+	// Claim the right to map this object into `cr3`, under one lock. Returns false if
+	// another caller already holds the claim or the mapping already exists.
+	//
+	// Asking `is_mapped_in` and then calling `add_mapping` is a check followed by an act,
+	// with the lock dropped in between: two threads of one process could both find the
+	// object unmapped and both map it, and the second mapping then vanished from the
+	// process's cleanup list while staying in the page tables. The claim and the answer
+	// have to be the same operation.
+	//
+	// A base of 0 marks the reservation - "being mapped, by someone" - and
+	// `commit_mapping` replaces it with the real address.
+	pub fn reserve_mapping(&self, cr3: u64) -> bool {
+		let mut mappings = self.mappings.lock();
+		if mappings.iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3) {
+			return false;
+		}
+		mappings.push((cr3, 0));
+		true
+	}
+
+	// Record where a reserved mapping ended up.
+	pub fn commit_mapping(&self, cr3: u64, base: u64) {
+		let mut mappings = self.mappings.lock();
+		if let Some(entry) = mappings.iter_mut().find(|(mapped_cr3, _)| *mapped_cr3 == cr3) {
+			entry.1 = base;
+		}
+	}
+
+	// Drop a reservation whose mapping never happened.
+	pub fn abandon_reservation(&self, cr3: u64) {
+		self.mappings.lock().retain(|(mapped_cr3, base)| !(*mapped_cr3 == cr3 && *base == 0));
+	}
+
 	pub fn add_mapping(&self, cr3: u64, base: u64) {
 		self.mappings.lock().push((cr3, base));
 	}

@@ -75,6 +75,29 @@ impl DmaBuffer {
 		self.mappings.lock().iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3)
 	}
 
+	// Claim the right to map this buffer into `cr3`, under one lock - see the note on
+	// `MemoryObject::reserve_mapping`. Asking and then acting is two operations, and two
+	// threads of one process fit between them.
+	pub fn reserve_mapping(&self, cr3: u64) -> bool {
+		let mut mappings = self.mappings.lock();
+		if mappings.iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3) {
+			return false;
+		}
+		mappings.push((cr3, 0));
+		true
+	}
+
+	pub fn commit_mapping(&self, cr3: u64, base: u64) {
+		let mut mappings = self.mappings.lock();
+		if let Some(entry) = mappings.iter_mut().find(|(mapped_cr3, _)| *mapped_cr3 == cr3) {
+			entry.1 = base;
+		}
+	}
+
+	pub fn abandon_reservation(&self, cr3: u64) {
+		self.mappings.lock().retain(|(mapped_cr3, base)| !(*mapped_cr3 == cr3 && *base == 0));
+	}
+
 	pub fn add_mapping(&self, cr3: u64, base: u64) {
 		self.mappings.lock().push((cr3, base));
 	}
