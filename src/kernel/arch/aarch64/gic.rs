@@ -105,6 +105,11 @@ fn init_cpu_local() {
 pub fn handle_irq(from_user: bool) {
 	let iar = unsafe { core::ptr::read_volatile(gicc(GICC_IAR)) };
 	let intid = iar & 0x3ff;
+	// SGI 0 is the wake IPI, and it now also carries the TLB shootdown - see
+	// `mem::tlb`. Servicing it before the dispatch below keeps the answer prompt.
+	if intid == 0 {
+		crate::mem::tlb::service_pending();
+	}
 	if intid == TIMER_INTID {
 		// Re-arm for the next tick (clears the timer's level-asserted condition).
 		arm_timer(INTERVAL.load(Ordering::Relaxed));

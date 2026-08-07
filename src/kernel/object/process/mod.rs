@@ -480,6 +480,11 @@ impl Drop for Process {
 		// Release the leaf data frames backing the user image and stack. The address
 		// space, dropped alongside, reclaims only the page-table structure.
 		let frames = core::mem::take(&mut *self.user_frames.lock());
+		if !frames.is_empty() {
+			// Every core that ever ran a thread of this process may still hold
+			// translations for these. They go back to the allocator only once nobody does.
+			crate::mem::tlb::shootdown();
+		}
 		for frame in frames {
 			crate::mem::frame::deallocate(frame);
 		}

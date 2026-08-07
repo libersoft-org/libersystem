@@ -602,6 +602,10 @@ pub fn run_until_idle() {
 pub fn cpu_idle_loop() -> ! {
 	loop {
 		reschedule(Disposition::Requeue);
+		// Answer any TLB shootdown before settling. The interrupt handlers service these
+		// too; this is the path for a core that was already awake and looping, and on
+		// RISC-V it is the only one - its wake IPI has no handler of its own.
+		crate::mem::tlb::service_pending();
 		// An idle core has nothing better to do than push the serial ring to the wire.
 		arch::serial::drain_tx();
 		// Lost-wakeup-safe idle: mask interrupts, re-check the run queue under the mask,

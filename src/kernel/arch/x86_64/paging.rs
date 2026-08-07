@@ -313,6 +313,18 @@ pub fn try_map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> Resu
 }
 
 // Unmap `virt` in the active address space, returning the frame it pointed at.
+// Flush this core's entire translation buffer.
+//
+// Reloading CR3 with its own value drops every non-global entry, which is what a
+// shootdown asks for: the requester does not know which addresses this core cached.
+pub fn flush_local_tlb() {
+	unsafe {
+		let cr3: u64;
+		core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+		core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+	}
+}
+
 pub fn unmap_page(virt: u64) -> Option<u64> {
 	unmap_page_in(active_pml4_phys(), virt)
 }

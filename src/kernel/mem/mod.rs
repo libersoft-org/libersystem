@@ -5,6 +5,7 @@
 
 pub mod frame;
 pub mod heap;
+pub mod tlb;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

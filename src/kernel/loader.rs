@@ -237,6 +237,13 @@ fn unmap_stack(address_space: &AddressSpace, mapped_pages: u64) {
 // Free frames accumulated on an error path, before any Process exists to adopt
 // them. The half-built address space frees its own page tables when it is dropped.
 fn free_frames(frames: Vec<u64>) {
+	if frames.is_empty() {
+		return;
+	}
+	// These frames were mapped into a live address space a moment ago. Every other core
+	// has to have dropped its translations before the allocator may hand them to anyone
+	// else - see `mem::tlb`.
+	crate::mem::tlb::shootdown();
 	for frame in frames {
 		frame::deallocate(frame);
 	}

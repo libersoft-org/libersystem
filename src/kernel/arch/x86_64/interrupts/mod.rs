@@ -277,6 +277,10 @@ extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {}
 // halted core out of HLT so its idle loop re-checks the run queue), so the handler
 // only acknowledges it.
 extern "x86-interrupt" fn wake_ipi(_frame: InterruptStackFrame) {
+	// The wake IPI carries two errands now: bounce a halted core into its run queue, and
+	// answer a TLB shootdown. Both are "look at something you were told about", and one
+	// interrupt is cheaper than two vectors.
+	crate::mem::tlb::service_pending();
 	apic::eoi();
 }
 

@@ -1,5 +1,27 @@
 use super::*;
 
+tagged_test!(a_shootdown_is_answered_by_every_other_core, [Memory, Scheduler, Smp]);
+fn a_shootdown_is_answered_by_every_other_core() {
+	// Every port invalidated its OWN translations and told nobody, so a frame could go
+	// back to the allocator while another core still held a translation for it - and that
+	// core went on writing through it into whatever the frame became next.
+	//
+	// What this asserts is the property that makes the frame safe to release: the request
+	// RETURNS, and it returns because every other core answered rather than because the
+	// wait gave up. A shootdown that times out prints; a shootdown that completes does
+	// not, so the run is silent when this passes.
+	let cores = crate::smp::cpu_count();
+	// Ten in a row, so a single lucky interleaving does not carry the test.
+	for _ in 0..10 {
+		crate::mem::tlb::shootdown();
+	}
+	assert!(cores >= 1, "the machine reports at least one core");
+	// and it is safe from a core with nothing else to do, which is the state most of the
+	// other cores are in when a process is torn down.
+	crate::sched::run_until_idle();
+	crate::mem::tlb::shootdown();
+}
+
 tagged_test!(a_capability_transfer_moves_it_exactly_once, [Process, Syscall, Ipc]);
 fn a_capability_transfer_moves_it_exactly_once() {
 	// A transfer was a clone under the lock, a send, and then a re-lookup and a `close`

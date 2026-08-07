@@ -328,6 +328,13 @@ unsafe fn unmap_page_root(root: u64, virt: u64) -> Option<u64> {
 	Some(desc & ADDR_MASK)
 }
 
+// Flush this core's entire translation buffer - see the x86_64 note.
+pub fn flush_local_tlb() {
+	unsafe {
+		core::arch::asm!("dsb ishst", "tlbi vmalle1", "dsb ish", "isb", options(nostack, preserves_flags));
+	}
+}
+
 pub fn unmap_page(virt: u64) -> Option<u64> {
 	// A top-bit-set virtual address lives in TTBR1 (higher half), a low address in the
 	// active TTBR0 tree - mirror map_page's routing so a high mapping is actually found.

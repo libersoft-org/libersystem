@@ -278,6 +278,13 @@ unsafe fn unmap_page_root(root: u64, virt: u64) -> Option<u64> {
 	Some(pte_pa(desc))
 }
 
+// Flush this hart's entire translation buffer - see the x86_64 note.
+pub fn flush_local_tlb() {
+	unsafe {
+		core::arch::asm!("sfence.vma", options(nostack, preserves_flags));
+	}
+}
+
 pub fn unmap_page(virt: u64) -> Option<u64> {
 	unsafe { unmap_page_root(current_satp_root(), virt) }
 }
