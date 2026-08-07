@@ -323,20 +323,36 @@ pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
 }
 
 pub fn map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) {
-	unsafe { map_page_root(ttbr & ADDR_MASK, virt, phys, flags).expect("aarch64 map_page: out of frames") }
+	unsafe { map_page_root(root_in(ttbr, virt), virt, phys, flags).expect("aarch64 map_page: out of frames") }
 }
 
 // Fallible counterpart of `map_page_in`: returns Err when an intermediate table
 // cannot be allocated, leaving nothing mapped so a userspace map can degrade to
 // ERR_NO_MEMORY.
 pub fn try_map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
-	unsafe { map_page_root(ttbr & ADDR_MASK, virt, phys, flags) }
+	unsafe { map_page_root(root_in(ttbr, virt), virt, phys, flags) }
 }
 
 // The page-table root a virtual address maps through: the higher-half (top bit
 // set) goes through TTBR1, a low address through the active TTBR0 tree.
 fn map_root_for(virt: u64) -> u64 {
 	if virt >> 63 == 1 { current_ttbr1() } else { current_ttbr0() }
+}
+
+// The root for an address in a NAMED address space. This port splits the two halves across
+// two registers, so a "page-table root" here is always a TTBR0 value - and a higher-half
+// address does not live in it, whoever passed it. The half decides the tree; the argument
+// only decides WHICH low tree.
+//
+// The portable layer above cannot know that. `AddressSpace::kernel()` captures
+// `read_cr3()`, which on this port reads TTBR0_EL1 - the active PROCESS's low-half root -
+// and then maps kernel-half addresses "into" it. A thread's kernel stack went there: the
+// range was reserved in the kernel window, the pages were written into a user tree where no
+// higher-half address can ever resolve, and the first byte of the zeroing memset took a
+// translation fault at the stack's own address. It did not show up on x86_64 or riscv64,
+// where one root covers both halves and the distinction does not exist.
+fn root_in(ttbr: u64, virt: u64) -> u64 {
+	if virt >> 63 == 1 { current_ttbr1() } else { ttbr & ADDR_MASK }
 }
 
 // Return the next-level table's physical address, or None if the entry is absent
@@ -391,7 +407,7 @@ pub fn unmap_pages(base: u64, count: usize) {
 	}
 }
 pub fn unmap_page_in(ttbr: u64, virt: u64) -> Option<u64> {
-	unsafe { unmap_page_root(ttbr & ADDR_MASK, virt) }
+	unsafe { unmap_page_root(root_in(ttbr, virt), virt) }
 }
 
 // Create a fresh address-space root (TTBR0 tree). The kernel runs in the higher
