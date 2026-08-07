@@ -1,5 +1,51 @@
 use super::*;
 
+tagged_test!(a_translation_is_not_a_permission, [Memory, Syscall]);
+fn a_translation_is_not_a_permission() {
+	// `user_buf_ok` asked only whether an address TRANSLATED. A ring-3 caller could
+	// therefore hand the kernel a pointer into a page it cannot itself reach - a
+	// kernel-only page in its own address space - and the kernel would read or write it on
+	// the caller's behalf. And a read-only page was accepted as the destination of a
+	// copy-out, where the write faults in ring 0, which this kernel stops on.
+	use crate::arch::paging::{PRESENT, USER, WRITABLE, translate_flags};
+	use crate::object::address_space::AddressSpace;
+
+	let space = AddressSpace::create().expect("address space");
+	let frame = crate::mem::frame::allocate().expect("a frame");
+	let at = 0x50_0000u64;
+
+	// kernel-only: present, not USER.
+	space.try_map(at, frame, PRESENT | WRITABLE).expect("a kernel mapping");
+	let flags = translate_flags_in(&space, at);
+	assert!(flags.is_some_and(|f| f & PRESENT != 0), "the page is mapped");
+	assert!(flags.is_some_and(|f| f & USER == 0), "and it is not reachable from ring 3");
+	assert_eq!(space.unmap(at), Some(frame));
+
+	// user, read-only: reachable, not writable.
+	space.try_map(at, frame, PRESENT | USER).expect("a read-only user mapping");
+	let flags = translate_flags_in(&space, at);
+	assert!(flags.is_some_and(|f| f & USER != 0), "a user page is reachable");
+	assert!(flags.is_some_and(|f| f & WRITABLE == 0), "and a read-only one is not a destination");
+	assert_eq!(space.unmap(at), Some(frame));
+
+	// and an unmapped address answers nothing at all.
+	assert!(translate_flags_in(&space, at).is_none(), "an unmapped address has no flags");
+	assert!(translate_flags(0x7fff_0000_0000).is_none(), "nor does one nothing ever mapped");
+
+	crate::mem::frame::deallocate(frame);
+}
+
+// `translate_flags` reads the ACTIVE tables, so a mapping made in another address space
+// has to be looked at with that space installed. Switching is what a real caller does
+// implicitly by being the thread that owns the space.
+fn translate_flags_in(space: &alloc::sync::Arc<crate::object::address_space::AddressSpace>, va: u64) -> Option<u64> {
+	let previous = crate::arch::context::read_cr3();
+	unsafe { crate::arch::context::write_cr3(space.cr3()) };
+	let flags = crate::arch::paging::translate_flags(va);
+	unsafe { crate::arch::context::write_cr3(previous) };
+	flags
+}
+
 tagged_test!(a_shootdown_is_answered_by_every_other_core, [Memory, Scheduler, Smp]);
 fn a_shootdown_is_answered_by_every_other_core() {
 	// Every port invalidated its OWN translations and told nobody, so a frame could go

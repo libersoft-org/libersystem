@@ -474,6 +474,50 @@ unsafe fn next_table_walk(table: *mut u64, index: usize) -> Option<u64> {
 // PDPT (1 GB) or PD (2 MB) level - the loader (or firmware) often maps the
 // framebuffer with 2 MB pages, so a 4 kB-only walk would misread it. The returned
 // phys carries the in-page offset.
+// The leaf flags governing `virt`, or None if it is not mapped.
+//
+// The permission bits, not just "is there a translation". `user_buf_ok` asked only
+// whether an address translated - so a ring-3 caller could hand the kernel a pointer into
+// a page it cannot itself reach, and a read-only page would be accepted as the
+// destination of a copy-OUT. Present-ness is not permission.
+//
+// On a hierarchy the effective permission is the AND of every level's bits, because a
+// cleared USER or WRITABLE anywhere above the leaf denies it. That is what this returns.
+pub fn translate_flags(virt: u64) -> Option<u64> {
+	const PS: u64 = 1 << 7;
+	unsafe {
+		let pml4 = table_ptr(active_pml4_phys());
+		let pml4_e = pml4.add(table_index(virt, 39)).read_volatile();
+		if pml4_e & PRESENT == 0 {
+			return None;
+		}
+		let pdpt = table_ptr(pml4_e & ADDR_MASK);
+		let pdpt_e = pdpt.add(table_index(virt, 30)).read_volatile();
+		if pdpt_e & PRESENT == 0 {
+			return None;
+		}
+		let mut acc = pml4_e & pdpt_e;
+		if pdpt_e & PS != 0 {
+			return Some(acc);
+		}
+		let pd = table_ptr(pdpt_e & ADDR_MASK);
+		let pd_e = pd.add(table_index(virt, 21)).read_volatile();
+		if pd_e & PRESENT == 0 {
+			return None;
+		}
+		acc &= pd_e;
+		if pd_e & PS != 0 {
+			return Some(acc);
+		}
+		let pt = table_ptr(pd_e & ADDR_MASK);
+		let pt_e = pt.add(table_index(virt, 12)).read_volatile();
+		if pt_e & PRESENT == 0 {
+			return None;
+		}
+		Some(acc & pt_e)
+	}
+}
+
 pub fn translate(virt: u64) -> Option<u64> {
 	const PS: u64 = 1 << 7;
 	unsafe {

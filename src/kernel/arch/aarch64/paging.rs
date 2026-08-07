@@ -62,6 +62,45 @@ static PT_LOCK: SpinLock<()> = SpinLock::new(());
 // Translate a virtual address to its physical address by walking the active
 // tables (4 kB granule, 48-bit, levels L0..L3, honoring block descriptors). A
 // top-bit-set VA walks TTBR1 (kernel/direct map), a low VA walks TTBR0.
+// The portable permission flags governing `va`, or None if it is unmapped. See the
+// x86_64 note: present-ness is not permission, and `user_buf_ok` asked only the former.
+//
+// The AP bits are per-leaf on this architecture (the table descriptors carry their own
+// restrictions in APTable, which this kernel does not set), so the leaf's bits are the
+// answer.
+pub fn translate_flags(va: u64) -> Option<u64> {
+	let ttbr: u64;
+	unsafe {
+		if va >> 63 == 1 {
+			asm!("mrs {}, ttbr1_el1", out(reg) ttbr, options(nomem, nostack, preserves_flags));
+		} else {
+			asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack, preserves_flags));
+		}
+	}
+	let mut table = phys_to_virt(ttbr & ADDR_MASK) as *const u64;
+	for level in 0..4u64 {
+		let shift = 39 - level * 9;
+		let idx = ((va >> shift) & 0x1ff) as usize;
+		let desc = unsafe { core::ptr::read_volatile(table.add(idx)) };
+		if desc & VALID == 0 {
+			return None;
+		}
+		if desc & TABLE == 0 || level == 3 {
+			// AP[1] (bit 6) set means EL0 may reach it; AP[2] (bit 7) set means read-only.
+			let mut flags = PRESENT;
+			if desc & (1 << 6) != 0 {
+				flags |= USER;
+			}
+			if desc & (1 << 7) == 0 {
+				flags |= WRITABLE;
+			}
+			return Some(flags);
+		}
+		table = phys_to_virt(desc & ADDR_MASK) as *const u64;
+	}
+	None
+}
+
 pub fn translate(va: u64) -> Option<u64> {
 	let ttbr: u64;
 	unsafe {

@@ -127,10 +127,48 @@ fn user_buf_ok(ptr: u64, len: u64) -> bool {
 	if end > USER_VA_END {
 		return false;
 	}
+	user_pages_ok(ptr, end, false)
+}
+
+// The same, for a buffer the kernel is about to WRITE. A page a ring-3 caller can only
+// read is not a destination, and accepting one meant the copy faulted in ring 0 - which
+// this kernel treats as its own bug and stops on.
+fn user_buf_writable(ptr: u64, len: u64) -> bool {
+	if !arch::percpu::in_user_syscall() {
+		return true;
+	}
+	if len == 0 {
+		return true;
+	}
+	if ptr == 0 {
+		return false;
+	}
+	let Some(end) = ptr.checked_add(len) else {
+		return false;
+	};
+	if end > USER_VA_END {
+		return false;
+	}
+	user_pages_ok(ptr, end, true)
+}
+
+// Every page of `[ptr, end)` mapped, reachable by ring 3, and writable if `write`.
+//
+// The permission bits are the point. This used to ask only whether an address
+// TRANSLATED, so a caller could hand the kernel a pointer into a page it cannot itself
+// reach - a kernel-only page in its own address space - and the kernel would read or
+// write it on the caller's behalf. Present-ness is not permission.
+fn user_pages_ok(ptr: u64, end: u64, write: bool) -> bool {
 	let mut page = ptr & !0xfff;
 	let last = (end - 1) & !0xfff;
 	loop {
-		if arch::paging::translate(page).is_none() {
+		let Some(flags) = arch::paging::translate_flags(page) else {
+			return false;
+		};
+		if flags & arch::paging::USER == 0 {
+			return false;
+		}
+		if write && flags & arch::paging::WRITABLE == 0 {
 			return false;
 		}
 		if page == last {
@@ -361,7 +399,20 @@ fn read_user<T>(ptr: u64) -> T {
 	unsafe { value.assume_init() }
 }
 
+// Write `value` at a userspace address, if the caller may be written to there.
+//
+// Silently does nothing when it may not, which is deliberate: every caller has already
+// validated its buffer with `user_buf_ok`, and this is the second line - a page that
+// became read-only or unmapped between that check and this write. Faulting in ring 0 is
+// what this kernel treats as its own bug and stops on, so the copy must not be attempted
+// against a page that cannot take it.
+//
+// It does NOT close the window entirely: the page can go away between the check here and
+// the store below. Closing that needs the fault-recovery table this milestone still owes.
 fn write_user<T>(ptr: u64, value: T) {
+	if !user_buf_writable(ptr, core::mem::size_of::<T>() as u64) {
+		return;
+	}
 	arch::paging::user_access(|| unsafe { (ptr as *mut T).write_unaligned(value) });
 }
 

@@ -118,6 +118,34 @@ fn leaf_bits(flags: u64) -> u64 {
 
 // Walk the active root and translate a virtual address to physical, honouring leaves
 // at any level (1 GiB / 2 MiB / 4 kB). Returns None if unmapped.
+// The portable permission flags governing `va`, or None if it is unmapped. See the
+// x86_64 note: present-ness is not permission.
+//
+// Sv39 leaf PTEs carry U and W directly, and intermediate entries have no permission bits
+// of their own (an entry with any of R/W/X set IS a leaf), so the leaf answers.
+pub fn translate_flags(va: u64) -> Option<u64> {
+	let mut table = phys_to_virt(current_satp_root()) as *const u64;
+	for level in (0..3).rev() {
+		let idx = ((va >> (12 + 9 * level)) & 0x1ff) as usize;
+		let desc = unsafe { read_volatile(table.add(idx)) };
+		if desc & PTE_V == 0 {
+			return None;
+		}
+		if desc & PTE_RWX != 0 {
+			let mut flags = PRESENT;
+			if desc & PTE_U != 0 {
+				flags |= USER;
+			}
+			if desc & PTE_W != 0 {
+				flags |= WRITABLE;
+			}
+			return Some(flags);
+		}
+		table = phys_to_virt(pte_pa(desc)) as *const u64;
+	}
+	None
+}
+
 pub fn translate(va: u64) -> Option<u64> {
 	let mut table = phys_to_virt(current_satp_root()) as *const u64;
 	for level in (0..3).rev() {
