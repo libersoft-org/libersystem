@@ -186,14 +186,14 @@ fn the_last_thread_out_is_decided_by_a_counter_not_a_snapshot() {
 	let process = Process::new(space, crate::object::domain::Domain::root());
 
 	// four threads registered, four exits, exactly one "you were the last".
-	let threads: alloc::vec::Vec<_> = (0..4).map(|_| crate::object::thread::Thread::new(nothing, 0, process.clone())).collect();
+	let threads: alloc::vec::Vec<_> = (0..4).map(|_| crate::object::thread::Thread::new(nothing, 0, process.clone()).expect("a thread")).collect();
 	assert_eq!(threads.len(), 4);
 	let lasts = (0..4).filter(|_| process.thread_exited()).count();
 	assert_eq!(lasts, 1, "exactly one thread may be told it was the last");
 
 	// and it is the final one, not whichever ran first.
 	let process2 = Process::new(AddressSpace::create().expect("address space"), crate::object::domain::Domain::root());
-	let _t: alloc::vec::Vec<_> = (0..2).map(|_| crate::object::thread::Thread::new(nothing, 0, process2.clone())).collect();
+	let _t: alloc::vec::Vec<_> = (0..2).map(|_| crate::object::thread::Thread::new(nothing, 0, process2.clone()).expect("a thread")).collect();
 	assert!(!process2.thread_exited(), "the first of two is not the last");
 	assert!(process2.thread_exited(), "the second of two is");
 }
@@ -407,40 +407,40 @@ tagged_test!(an_unmapped_va_range_is_reused_not_leaked, [Memory]);
 fn an_unmapped_va_range_is_reused_not_leaked() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
-	// The mmap window reclaims released ranges: an unmap returns its range to the
-	// window's pool and the next map of the same size gets it back (first-fit),
-	// so a map/unmap loop no longer walks off the window. Freeing two adjacent
-	// ranges coalesces them, so a larger mapping fits the merged hole - churn
-	// cannot shatter the window into unusable slivers.
+	// The mmap window reclaims released ranges: an unmap returns its range to the window's
+	// pool, so a map/unmap loop reuses addresses instead of walking off the window.
+	//
+	// What this asserts, and what it deliberately does NOT, is worth being exact about. It
+	// used to name the addresses - "the released range comes back", "two singles pack" - and
+	// that only held while this test was the only thing that had ever used the KERNEL window.
+	// It is not: every kernel thread stack comes out of the same pool, so a test that spawns
+	// processes ahead of this one leaves the free list with holes, and first-fit then answers
+	// truthfully with an earlier one. The exact reuse and coalescing rules are asserted where
+	// they can be asserted exactly, on a private pool, in `mem::vapool`. What belongs here is
+	// the property that survives a shared window: the window does not GROW under churn.
 	extern "C" fn body(_arg: u64) {
 		unsafe {
 			let page: u64 = mem::frame::PAGE_SIZE;
-			// reuse: map, unmap, map again - the same range comes back.
-			let a = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, page, 0, 0, 0);
-			assert!(!syscall::sys_is_err(a));
-			let first = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, a, 0, 0, 0);
+			let handle = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, page, 0, 0, 0);
+			assert!(!syscall::sys_is_err(handle));
+			let first = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, handle, 0, 0, 0);
 			assert!(!syscall::sys_is_err(first));
-			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, a, 0, 0, 0) as i64, 0);
-			let second = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, a, 0, 0, 0);
-			assert_eq!(second, first, "the released range should be handed out again");
-			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, a, 0, 0, 0) as i64, 0);
-			// coalescing: two adjacent single-page ranges released in either order
-			// merge, so a two-page mapping fits where they were.
-			let b = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, page, 0, 0, 0);
-			let c = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, page, 0, 0, 0);
-			let base_b = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, b, 0, 0, 0);
-			let base_c = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, c, 0, 0, 0);
-			assert_eq!(base_b, first, "the first-fit hole is the one just released");
-			assert_eq!(base_c, base_b + page, "adjacent allocations pack the window");
-			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, b, 0, 0, 0) as i64, 0);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, c, 0, 0, 0) as i64, 0);
-			let d = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 2 * page, 0, 0, 0);
-			let base_d = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, d, 0, 0, 0);
-			assert_eq!(base_d, base_b, "the merged hole should fit the larger mapping");
-			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, d, 0, 0, 0) as i64, 0);
-			for handle in [a, b, c, d] {
-				assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, handle, 0, 0, 0) as i64, 0);
+			// 64 map/unmap round trips. A window that leaked its ranges would hand out 64
+			// distinct addresses climbing away from the first; one that reclaims them cannot
+			// move further than the fragmentation that was already there.
+			const ROUNDS: u64 = 64;
+			let mut lowest = first;
+			let mut highest = first;
+			for _ in 0..ROUNDS {
+				let base = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, handle, 0, 0, 0);
+				assert!(!syscall::sys_is_err(base), "a map in the reuse loop failed");
+				lowest = lowest.min(base);
+				highest = highest.max(base);
+				assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, handle, 0, 0, 0) as i64, 0);
 			}
+			assert!(highest - lowest < ROUNDS * page, "the window grew by {} bytes over {ROUNDS} map/unmap rounds: ranges are not being reclaimed", highest - lowest);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0);
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}

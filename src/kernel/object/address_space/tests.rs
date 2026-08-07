@@ -1,6 +1,15 @@
 use super::AddressSpace;
 use crate::{arch, mem};
 
+// A user virtual address far enough from a low one to need its own intermediate page
+// tables, and inside the user half on every port - riscv64's Sv39 half ends at 256 GiB,
+// so this is 64 GiB rather than something comfortable on x86_64.
+const FAR_USER_VA: u64 = 0x0000_0010_0000_0000;
+
+fn user_flags() -> u64 {
+	arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER | arch::paging::NO_EXECUTE
+}
+
 crate::tagged_test!(map_degrades_to_error_when_out_of_frames, [Memory]);
 fn map_degrades_to_error_when_out_of_frames() {
 	use mem::frame;
@@ -55,4 +64,71 @@ fn each_address_space_has_its_own_user_window() {
 	assert_eq!(c, b + 4 * mem::frame::PAGE_SIZE, "a free in one space must not feed an allocation in another");
 	// And the first space did take its own range back.
 	assert_eq!(first.alloc_vrange(4 * mem::frame::PAGE_SIZE), a, "the released range returns to the space that released it");
+}
+
+crate::tagged_test!(a_page_table_oom_rolls_back_and_leaves_earlier_mappings_alone, [Memory]);
+fn a_page_table_oom_rolls_back_and_leaves_earlier_mappings_alone() {
+	// The rollback that matters is not the one at the first level. Draining the pool tests
+	// that: nothing can be allocated, so nothing is half-built. What has to hold is a failure
+	// PART WAY DOWN - two levels created, the third refused - leaving the space exactly as it
+	// was, including every mapping made before it.
+	//
+	// The number of levels differs by port (four on x86_64, four on aarch64, three on Sv39),
+	// so this walks the budget upward instead of naming a depth: fail after k allocations for
+	// k = 0, 1, 2, ... until the map finally succeeds, and after every refusal check that the
+	// page mapped first is still mapped, still to its own frame.
+	let space = AddressSpace::create().expect("a fresh address space");
+	let first_frame = mem::frame::allocate().expect("a frame for the low page");
+	let far_frame = mem::frame::allocate().expect("a frame for the far page");
+	const LOW: u64 = 0x1_0000;
+	space.try_map(LOW, first_frame, user_flags()).expect("the low page maps in an empty space");
+
+	let mut refusals = 0;
+	let mut budget = 0;
+	loop {
+		assert!(budget < 8, "no budget up to 8 let the far page map: the injection is not reaching the mapper");
+		mem::frame::fail_allocations_after(budget);
+		let result = space.try_map(FAR_USER_VA, far_frame, user_flags());
+		mem::frame::stop_failing_allocations();
+		if result.is_ok() {
+			break;
+		}
+		refusals += 1;
+		// Unmapping is how a mapping is read back here - there is no per-space translate - so
+		// the low page is checked by taking it out and putting it straight back. A rollback
+		// that freed a table it did not own would have taken this mapping with it.
+		let recovered = space.unmap(LOW);
+		assert_eq!(recovered, Some(first_frame), "a failed map at budget {budget} disturbed a mapping made before it");
+		space.try_map(LOW, first_frame, user_flags()).expect("restoring the low page needs no new table");
+		budget += 1;
+	}
+	assert!(refusals > 0, "the far page mapped with no allocations at all: nothing was injected");
+
+	space.unmap(FAR_USER_VA);
+	space.unmap(LOW);
+	// SAFETY: both frames were allocated by this test and have just been unmapped from the
+	// only address space they were ever in.
+	unsafe {
+		mem::frame::deallocate(first_frame);
+		mem::frame::deallocate(far_frame);
+	}
+}
+
+crate::tagged_test!(a_user_mapping_is_refused_outside_the_user_half, [Memory]);
+fn a_user_mapping_is_refused_outside_the_user_half() {
+	// The bound the ET_EXEC escalation ran through. A mapping carrying USER names memory
+	// ring 3 may reach, and the kernel half is not that - whoever computed the address.
+	let space = AddressSpace::create().expect("a fresh address space");
+	let frame = mem::frame::allocate().expect("one frame");
+	let above = crate::memlayout::USER_VA_END;
+	assert!(space.try_map(above, frame, user_flags()).is_err(), "a USER mapping AT the top of the user half must be refused");
+	assert!(space.try_map(above + 0x1000, frame, user_flags()).is_err(), "a USER mapping above the user half must be refused");
+	assert!(space.try_map(u64::MAX & !0xfff, frame, user_flags()).is_err(), "a USER mapping at the top of the address space must be refused");
+	// The last page that IS inside the half maps, so the bound is the boundary and not a
+	// blanket refusal that would pass this test by refusing everything.
+	let last = above - crate::mem::frame::PAGE_SIZE;
+	space.try_map(last, frame, user_flags()).expect("the last page of the user half is inside it");
+	assert_eq!(space.unmap(last), Some(frame));
+	// SAFETY: allocated here, unmapped above, held by nothing else.
+	unsafe { mem::frame::deallocate(frame) };
 }

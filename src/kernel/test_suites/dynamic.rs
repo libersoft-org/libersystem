@@ -1120,3 +1120,59 @@ fn dynamic_process_service_derives_provider_slots_independently_of_needed_order(
 		assert_eq!(reordered_frame, baseline_frame, "provider slot {provider_slot:#x} is independent of DT_NEEDED enumeration order");
 	}
 }
+
+tagged_test!(a_load_that_runs_out_of_frames_anywhere_gives_back_everything, [Dynamic, Memory, Process]);
+fn a_load_that_runs_out_of_frames_anywhere_gives_back_everything() {
+	// A real service image, loaded over and over with the frame allocator told to refuse the
+	// k-th allocation for k = 0, 1, 2, ... - so the failure walks through every allocation the
+	// load makes: the address space's own top-level table, each intermediate page-table frame,
+	// the first ELF data frame, the ones after it, the first stack frame, mid-stack.
+	//
+	// After every refusal the pool must be exactly what it was before the call. That single
+	// number covers what the rollback is for: a frame allocated and not recorded, a segment
+	// unmapped without its frames returned, a stack half-mapped and abandoned, page tables
+	// built for a load that never finished. Any of them shows up here as a pool that shrank.
+	//
+	// Draining the pool cannot reach any of this - it fails the first allocation, so the load
+	// gives up before it has anything to leak.
+	use crate::mem::frame;
+	use crate::object::rights::Rights;
+	use crate::{loader, sched};
+
+	let bytes = crate::init_package_bytes().expect("init package present");
+	let package = pkg::Package::parse(bytes).expect("init package parses");
+	let elf = package.lookup(b"log_service.lsexe").expect("log_service.lsexe image");
+
+	// How many allocations a whole load takes, measured rather than assumed - the image
+	// decides it and it differs per port.
+	let mut refusals = 0;
+	let mut succeeded_at = None;
+	for budget in 0..4096 {
+		let before = frame::free_count();
+		let (kernel_ep, user_ep) = crate::object::channel::Channel::create();
+		frame::fail_allocations_after(budget);
+		let result = loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL, 0);
+		frame::stop_failing_allocations();
+		match result {
+			Err(_) => {
+				refusals += 1;
+				// The channel endpoints are the test's, not the load's; dropping them here
+				// keeps the comparison to what the loader did.
+				drop(kernel_ep);
+				assert_eq!(frame::free_count(), before, "a load refused at allocation {budget} did not return every frame it took");
+			}
+			Ok(process) => {
+				// The load got all the way through. Take the process down again and stop:
+				// past this point the budget is larger than a whole load needs.
+				process.terminate();
+				drop(process);
+				drop(kernel_ep);
+				succeeded_at = Some(budget);
+				break;
+			}
+		}
+	}
+	let succeeded_at = succeeded_at.expect("no budget up to 4096 completed a load: the injection is not reaching the loader");
+	assert!(refusals > 0, "the first budget already completed a load: nothing was injected");
+	crate::serial_println!("(load takes {succeeded_at} allocations; {refusals} refusals checked) ");
+}

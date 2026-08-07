@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use crate::arch;
 use crate::mem::frame::{self, PAGE_SIZE};
 use crate::mem::hhdm_offset;
-use crate::memlayout::USER_VA_END;
+use crate::memlayout::{USER_MMAP_BASE, USER_STACK_PAGES, USER_STACK_TOP, USER_VA_END};
 use crate::object::address_space::AddressSpace;
 use crate::sync::SpinLock;
 
@@ -167,6 +167,17 @@ fn load_parsed(image: &bootproto::elf::Elf<'_>, addr_space: &AddressSpace, frame
 	result
 }
 
+// The bottom of the ring-3 stack the loader maps eagerly. Below it the stack is demand-grown
+// up to the Domain's own ceiling, which is not a compile-time range and is not bounded here: a
+// segment down there collides only if the stack actually grows into it, and the fault handler's
+// `try_map` refuses that and kills the process, which is the image's own doing.
+const STACK_BASE: u64 = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+
+// Do [a_start, a_end) and [b_start, b_end) share a byte?
+fn overlaps(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+	a_start < b_end && b_start < a_end
+}
+
 fn validate_segment(ph: &bootproto::elf::ProgramHeader, bias: u64, window: Option<(u64, u64)>, loaded: &[LoadedSegment]) -> Result<(), ElfError> {
 	if ph.p_memsz == 0 || ph.p_filesz > ph.p_memsz || ph.p_flags & bootproto::elf::PF_W != 0 && ph.p_flags & bootproto::elf::PF_X != 0 {
 		return Err(ElfError::BadImage);
@@ -187,6 +198,19 @@ fn validate_segment(ph: &bootproto::elf::ProgramHeader, bias: u64, window: Optio
 	// decides that way, and this refuses the premise as well. Two independent defences
 	// for one hole, deliberately.
 	if start >= USER_VA_END || end > USER_VA_END || end <= start {
+		return Err(ElfError::BadImage);
+	}
+	// And clear of the two ranges the kernel maps into this address space whether the image
+	// mentions them or not: the ring-3 stack, mapped right after the segments are, and the
+	// mmap window, whose pool hands out addresses in the belief that they are free.
+	//
+	// Nothing unsafe happened without this - `try_map` refuses to remap a live page, so the
+	// stack mapping failed and the load failed with it. What it failed WITH was
+	// `OutOfMemory`, for an image that is not large but malformed, and the image chose which
+	// of its own segments got mapped before that happened. Refusing here names the real
+	// problem and refuses it before a single frame is allocated for the segment.
+
+	if overlaps(start, end, STACK_BASE, USER_STACK_TOP) || overlaps(start, end, USER_MMAP_BASE, USER_VA_END) {
 		return Err(ElfError::BadImage);
 	}
 	if window.is_some_and(|(window_start, window_end)| start < window_start || end > window_end) {
@@ -390,4 +414,104 @@ const fn align_down(value: u64) -> u64 {
 
 fn align_up(value: u64) -> Option<u64> {
 	value.checked_add(PAGE_SIZE - 1).map(align_down)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ElfError, LoadedSegment, validate_segment};
+	use crate::memlayout::USER_VA_END;
+	use bootproto::elf::{PF_R, PF_W, PF_X, ProgramHeader, PT_LOAD};
+
+	// A page-aligned, otherwise well-formed loadable segment at `vaddr`.
+	fn segment(vaddr: u64, memsz: u64, flags: u32) -> ProgramHeader {
+		ProgramHeader { p_type: PT_LOAD, p_flags: flags, p_offset: 0, p_vaddr: vaddr, p_paddr: 0, p_filesz: 0, p_memsz: memsz, p_align: 0x1000 }
+	}
+
+	crate::tagged_test!(an_et_exec_segment_may_not_name_the_kernel_half, [Memory]);
+	fn an_et_exec_segment_may_not_name_the_kernel_half() {
+		// `window` is None for ET_EXEC - that is what the loader passes - and it used to be the
+		// ONLY bound, so an executable naming a higher-half address was mapped there with the
+		// USER bit set. Every one of these is a segment a hostile image can simply declare.
+		let none: &[LoadedSegment] = &[];
+		for (vaddr, what) in [
+			(USER_VA_END, "the first address above the user half"),
+			(USER_VA_END + 0x1000, "one page above the user half"),
+			(0xffff_8000_0000_0000, "the bottom of the x86_64 kernel half"),
+			(0xffff_ffff_8000_0000, "the kernel's own image range"),
+		] {
+			let header = segment(vaddr, 0x1000, PF_R | PF_X);
+			assert!(matches!(validate_segment(&header, 0, None, none), Err(ElfError::BadImage)), "an ET_EXEC segment at {what} ({vaddr:#x}) must be refused");
+		}
+		// A segment ENDING above the half is refused too: the start being legal is not enough,
+		// because the pages that follow it are what get mapped.
+		let straddling = segment(USER_VA_END - 0x1000, 0x4000, PF_R | PF_W);
+		assert!(matches!(validate_segment(&straddling, 0, None, none), Err(ElfError::BadImage)), "a segment starting inside the half and ending above it must be refused");
+		// And a legal one still loads, so the bound is a boundary rather than a blanket refusal.
+		let ok = segment(0x40_0000, 0x2000, PF_R | PF_X);
+		assert!(validate_segment(&ok, 0, None, none).is_ok(), "an ordinary low segment must still validate");
+	}
+
+	crate::tagged_test!(a_bias_may_not_carry_a_segment_out_of_the_user_half, [Memory]);
+	fn a_bias_may_not_carry_a_segment_out_of_the_user_half() {
+		// A dynamic image's addresses are its own plus a bias the loader picks, so the check has
+		// to be on the sum. An overflowing sum is refused rather than wrapped to something low.
+		let none: &[LoadedSegment] = &[];
+		let header = segment(0x1000, 0x1000, PF_R | PF_X);
+		assert!(matches!(validate_segment(&header, USER_VA_END, None, none), Err(ElfError::BadImage)), "a bias that lands the segment above the half must be refused");
+		assert!(matches!(validate_segment(&header, u64::MAX, None, none), Err(ElfError::BadImage)), "a bias that overflows the address must be refused, not wrapped");
+	}
+
+	crate::tagged_test!(a_segment_overlapping_one_already_loaded_is_refused, [Memory]);
+	fn a_segment_overlapping_one_already_loaded_is_refused() {
+		// Two segments over the same pages means the second's frames replace the first's in the
+		// page tables while the first's stay in the process's owned list - and the image decides
+		// the addresses, so this is a claim to check, not a property to assume.
+		let loaded = [LoadedSegment { start: 0x40_0000, end: 0x44_0000, writable: false, executable: true, first_frame: 0 }];
+		for (vaddr, memsz, what) in [
+			(0x40_0000u64, 0x1000u64, "starting exactly where a loaded segment starts"),
+			(0x43_f000, 0x2000, "straddling the end of a loaded segment"),
+			(0x3f_f000, 0x2000, "straddling the start of a loaded segment"),
+			(0x40_0000, 0x40_0000, "covering a loaded segment exactly"),
+		] {
+			let header = segment(vaddr, memsz, PF_R | PF_W);
+			assert!(matches!(validate_segment(&header, 0, None, &loaded), Err(ElfError::BadImage)), "a segment {what} must be refused");
+		}
+		// Abutting is not overlapping: a segment that begins where the last one ended is legal.
+		let abutting = segment(0x44_0000, 0x1000, PF_R | PF_W);
+		assert!(validate_segment(&abutting, 0, None, &loaded).is_ok(), "a segment starting where the previous one ended must validate");
+	}
+
+	crate::tagged_test!(a_segment_may_not_claim_the_stack_or_the_mmap_window, [Memory]);
+	fn a_segment_may_not_claim_the_stack_or_the_mmap_window() {
+		// Two ranges the kernel maps into every process whether the image mentions them or
+		// not. An image claiming either used to be caught only by `try_map` refusing to
+		// remap - after its earlier segments were already mapped, and reported as
+		// out-of-memory.
+		use crate::memlayout::{USER_MMAP_BASE, USER_STACK_TOP};
+		let none: &[LoadedSegment] = &[];
+		for (vaddr, memsz, what) in [
+			(USER_STACK_TOP - 0x1000, 0x1000u64, "the top page of the ring-3 stack"),
+			(super::STACK_BASE, 0x1000, "the bottom page of the ring-3 stack"),
+			(super::STACK_BASE - 0x1000, 0x4000, "straddling the bottom of the ring-3 stack"),
+			(USER_MMAP_BASE, 0x1000, "the base of the mmap window"),
+			(USER_MMAP_BASE + 0x10_0000, 0x1000, "inside the mmap window"),
+		] {
+			let header = segment(vaddr, memsz, PF_R | PF_W);
+			assert!(matches!(validate_segment(&header, 0, None, none), Err(ElfError::BadImage)), "a segment claiming {what} ({vaddr:#x}) must be refused");
+		}
+		// The page below the eagerly-mapped stack is NOT refused: that is the demand-grown
+		// region, whose extent is a Domain setting rather than a constant, and a collision
+		// there is the image's own problem when its stack reaches that far.
+		let below = segment(super::STACK_BASE - 0x1000, 0x1000, PF_R | PF_W);
+		assert!(validate_segment(&below, 0, None, none).is_ok(), "the page below the eager stack is not a range this refuses");
+	}
+
+	crate::tagged_test!(a_write_execute_segment_is_refused, [Memory]);
+	fn a_write_execute_segment_is_refused() {
+		// W^X, declared by the image rather than derived from it, so it is the image's claim
+		// that has to be refused.
+		let none: &[LoadedSegment] = &[];
+		let wx = segment(0x40_0000, 0x1000, PF_R | PF_W | PF_X);
+		assert!(matches!(validate_segment(&wx, 0, None, none), Err(ElfError::BadImage)), "a segment claiming both write and execute must be refused");
+	}
 }

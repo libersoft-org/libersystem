@@ -184,7 +184,11 @@ pub fn spawn(entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 // thread up immediately instead of on its next timer tick.
 pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain());
-	let thread = Thread::new(entry, arg, process);
+	// A KERNEL thread. Nothing here has a caller that could carry a refusal back to
+	// somebody who could act on it - these are boot-time and test-time spawns - so an
+	// out-of-frames says so and stops. The userspace-reachable path is `thread_create`
+	// below, and that one returns None.
+	let thread = Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack");
 	cpu_sched(cpu).inner.lock().run_queue.push_back(thread.clone());
 	if cpu != current_cpu_id() {
 		arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
@@ -207,7 +211,7 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain());
 	let arg = process.install(object, rights, badge);
-	Thread::new(entry, arg, process)
+	Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack")
 }
 
 // Release a prepared thread onto the run queue.
@@ -234,10 +238,10 @@ pub fn process_create(domain: Arc<Domain>) -> Option<Arc<Process>> {
 
 // Create a thread in an existing `process` on the current core's run queue. The
 // thread shares the process's address space and handle table with its siblings.
-pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
-	let thread = Thread::new(entry, arg, process);
+pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
+	let thread = Thread::new(entry, arg, process)?;
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
-	thread
+	Some(thread)
 }
 
 // Create a thread in `process` but leave it suspended - off every run queue - and

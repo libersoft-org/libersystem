@@ -104,7 +104,15 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	let handle = process.install(bootstrap, rights, badge);
 
 	let ctx = Box::new(UserEntry { entry, stack_top: USER_STACK_TOP, bootstrap: handle });
-	sched::thread_create(process.clone(), user_process_trampoline, Box::into_raw(ctx) as u64);
+	let raw_ctx = Box::into_raw(ctx);
+	if sched::thread_create(process.clone(), user_process_trampoline, raw_ctx as u64).is_none() {
+		// The last allocation of the load, and it used to be the one that panicked. Take
+		// the context box back (the trampoline that would have consumed it never runs) and
+		// let the process drop, which unmaps its segments and returns its frames.
+		drop(unsafe { Box::from_raw(raw_ctx) });
+		process.terminate();
+		return Err(LoadError::OutOfMemory);
+	}
 	Ok(process)
 }
 

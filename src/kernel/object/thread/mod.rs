@@ -87,15 +87,31 @@ pub struct KernelStack {
 }
 
 impl KernelStack {
-	fn allocate() -> Self {
+	// None when the frames or the kernel virtual range are not there, leaving nothing behind.
+	//
+	// It used to `expect` both. Thread creation is reachable from ring 3 - SYS_THREAD_CREATE,
+	// and every process spawn makes one - so a frame pool that has run low turned an ordinary
+	// userspace call into a kernel panic. The Domain thread quota does not help: it bounds how
+	// many threads ONE process may have, not whether there is memory for the next one, and the
+	// pressure can come from anywhere in the system.
+	fn allocate() -> Option<Self> {
 		let pages = KERNEL_STACK_SIZE.div_ceil(crate::mem::frame::PAGE_SIZE as usize);
 		let len = (pages as u64 + 1) * crate::mem::frame::PAGE_SIZE;
 		let base = crate::syscall::alloc_kernel_vrange(len);
-		assert!(base != 0, "out of kernel virtual address space for a thread stack");
+		if base == 0 {
+			return None;
+		}
 		let space = crate::object::address_space::AddressSpace::kernel();
 		let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE;
 		for page in 0..pages {
-			let frame = crate::mem::frame::allocate().expect("out of frames: kernel thread stack");
+			let Some(frame) = crate::mem::frame::allocate() else {
+				// Hand back the pages mapped so far and the range itself. Building the
+				// partial stack and dropping it would do the same thing, but only if it were
+				// a value yet - and it is not until every page is in.
+				let partial = KernelStack { base, pages: page };
+				drop(partial);
+				return None;
+			};
 			// one page above `base`, so `base` itself stays unmapped and is the guard.
 			let at = base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
 			space.map(at, frame, flags);
@@ -103,7 +119,7 @@ impl KernelStack {
 		// zeroed through a raw write rather than through a slice taken from `&self`,
 		// which would be handing out a `&mut` from a shared borrow.
 		unsafe { core::ptr::write_bytes((base + crate::mem::frame::PAGE_SIZE) as *mut u8, 0, pages * crate::mem::frame::PAGE_SIZE as usize) };
-		Self { base, pages }
+		Some(Self { base, pages })
 	}
 
 	// The stack bytes, above the guard page. `&mut self` because this hands out the only
@@ -133,9 +149,14 @@ impl Thread {
 	// Create a ready-to-run kernel thread in `process` that starts at `entry(arg)`,
 	// charging one thread slot to the process's Domain unconditionally (the
 	// infallible path used for the unlimited root Domain).
-	pub fn new(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
+	// None if the kernel stack cannot be allocated, with the thread charge refunded.
+	pub fn new(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
 		process.domain().charge_thread();
-		Self::build(entry, arg, process)
+		let thread = Self::build(entry, arg, process.clone());
+		if thread.is_none() {
+			process.domain().uncharge_thread();
+		}
+		thread
 	}
 
 	// Like `new`, but enforce the process Domain's thread quota: returns None
@@ -144,17 +165,21 @@ impl Thread {
 		if !process.domain().try_charge_thread() {
 			return None;
 		}
-		Some(Self::build(entry, arg, process))
+		let thread = Self::build(entry, arg, process.clone());
+		if thread.is_none() {
+			process.domain().uncharge_thread();
+		}
+		thread
 	}
 
 	// Shared constructor tail: fabricate the initial stack and assemble the Thread.
-	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Arc<Self> {
-		let mut stack = KernelStack::allocate();
+	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
+		let mut stack = KernelStack::allocate()?;
 		let sp = arch::context::init_thread_stack(stack.as_mut_slice(), entry, arg);
 		let thread = Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process });
 		// Forward-link the thread to its process so signal delivery can reach it.
 		thread.process.register_thread(&thread);
-		thread
+		Some(thread)
 	}
 
 	pub fn tid(&self) -> u64 {

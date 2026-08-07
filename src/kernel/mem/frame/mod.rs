@@ -421,8 +421,89 @@ pub fn free_count() -> usize {
 	ALLOCATOR.lock().free_count
 }
 
+// Deterministic out-of-frames injection, for tests only.
+//
+// Draining the pool to test an OOM path works and tests the wrong thing: it fails the FIRST
+// allocation, so every rollback that matters - the second page of a three-page map, the
+// intermediate table three levels down, the segment after the one that succeeded - is never
+// reached. What those paths need is a failure at a CHOSEN allocation with the pool otherwise
+// healthy, and that is what this does.
+//
+// Armed with a count: that many allocations succeed, and every one after returns None until
+// it is disarmed. `#[cfg(test)]` because a kernel that can be told to fail allocations is not
+// a kernel to ship.
+#[cfg(test)]
+mod inject {
+	use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+	// Whether any test has ever armed this. Checked FIRST, and the reason is boot: the frame
+	// allocator runs long before the per-CPU blocks exist, and asking which core we are on
+	// down there dereferences a null pointer. Nothing arms this until a test does, by which
+	// time every core is up, so the boot path pays one relaxed load and never asks.
+	static EVER_ARMED: AtomicBool = AtomicBool::new(false);
+
+	// Per CPU, not global. A global switch would fail allocations on every other core for as
+	// long as it was armed, and the other cores are running the rest of the system - so a test
+	// arming one would be injecting faults into the scheduler, the drivers and whatever else
+	// happened to allocate in that window. Armed on the core that arms it and nowhere else.
+	//
+	// A test thread migrating between arming and allocating would run un-injected. That shows
+	// up as "the failure never happened", which every test here asserts against, so it is a
+	// loud flake rather than a quiet pass.
+	#[allow(clippy::declare_interior_mutable_const)]
+	const DISARMED: AtomicUsize = AtomicUsize::new(usize::MAX);
+	static BUDGET: [AtomicUsize; crate::mem::tlb::MAX_CPUS] = [DISARMED; crate::mem::tlb::MAX_CPUS];
+
+	fn me() -> usize {
+		(crate::arch::percpu::this_cpu().cpu_id() as usize).min(crate::mem::tlb::MAX_CPUS - 1)
+	}
+
+	// Let `successes` more allocations through on THIS core, then fail every one until
+	// `disarm`.
+	pub fn fail_after(successes: usize) {
+		BUDGET[me()].store(successes, Ordering::Release);
+		EVER_ARMED.store(true, Ordering::Release);
+	}
+
+	pub fn disarm() {
+		BUDGET[me()].store(usize::MAX, Ordering::Release);
+	}
+
+	// True when this allocation is one to refuse. `usize::MAX` is the disarmed value and is
+	// never decremented, so an un-armed core pays one relaxed load and nothing else.
+	pub(super) fn should_fail() -> bool {
+		if !EVER_ARMED.load(Ordering::Acquire) {
+			return false;
+		}
+		let budget = &BUDGET[me()];
+		budget
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| match remaining {
+				usize::MAX => None,
+				0 => None,
+				n => Some(n - 1),
+			})
+			.is_err_and(|remaining| remaining == 0)
+	}
+}
+
+#[cfg(test)]
+pub use inject::{disarm as stop_failing_allocations, fail_after as fail_allocations_after};
+
+#[cfg(not(test))]
+fn injected_failure() -> bool {
+	false
+}
+
+#[cfg(test)]
+fn injected_failure() -> bool {
+	inject::should_fail()
+}
+
 // Allocate one physical frame, returning its physical address.
 pub fn allocate() -> Option<u64> {
+	if injected_failure() {
+		return None;
+	}
 	ALLOCATOR.lock().take_one()
 }
 
@@ -431,6 +512,9 @@ pub fn allocate() -> Option<u64> {
 // no free run is large enough.
 pub fn allocate_contiguous(pages: usize) -> Option<u64> {
 	if pages == 0 {
+		return None;
+	}
+	if injected_failure() {
 		return None;
 	}
 	ALLOCATOR.lock().take_contiguous(pages as u64)

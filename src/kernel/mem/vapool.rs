@@ -82,3 +82,83 @@ impl VaPool {
 		self.free.insert(pos, (base, len));
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::VaPool;
+	use crate::mem::frame::PAGE_SIZE;
+
+	crate::tagged_test!(a_released_range_is_reused_and_adjacent_ones_coalesce, [Memory]);
+	fn a_released_range_is_reused_and_adjacent_ones_coalesce() {
+		// On a pool of its own, so the addresses are the pool's rules and nothing else's.
+		// Asserting this through the kernel mmap window instead was what it used to do, and
+		// that window is shared with every kernel thread stack in the system - so the answers
+		// depended on what had run before.
+		const BASE: u64 = 0x1000_0000;
+		let mut pool = VaPool::new(BASE, BASE + 0x1_0000 * PAGE_SIZE);
+
+		// Reuse: a range released comes straight back.
+		let first = pool.alloc(PAGE_SIZE);
+		assert_eq!(first, BASE, "the first allocation starts the window");
+		pool.free(first, PAGE_SIZE);
+		assert_eq!(pool.alloc(PAGE_SIZE), first, "a released range is handed out again");
+		pool.free(first, PAGE_SIZE);
+
+		// Adjacency: consecutive allocations pack.
+		let a = pool.alloc(PAGE_SIZE);
+		let b = pool.alloc(PAGE_SIZE);
+		assert_eq!(b, a + PAGE_SIZE, "consecutive allocations are adjacent");
+
+		// Coalescing, released low-then-high: the merged hole takes a mapping neither half
+		// could have held.
+		pool.free(a, PAGE_SIZE);
+		pool.free(b, PAGE_SIZE);
+		let merged = pool.alloc(2 * PAGE_SIZE);
+		assert_eq!(merged, a, "two adjacent ranges released in order merge into one");
+		pool.free(merged, 2 * PAGE_SIZE);
+
+		// And released high-then-low, which is the case that needs the left neighbour
+		// checked as well as the right.
+		let a = pool.alloc(PAGE_SIZE);
+		let b = pool.alloc(PAGE_SIZE);
+		pool.free(b, PAGE_SIZE);
+		pool.free(a, PAGE_SIZE);
+		assert_eq!(pool.alloc(2 * PAGE_SIZE), a, "two adjacent ranges released in reverse merge too");
+		pool.free(a, 2 * PAGE_SIZE);
+
+		// A hole between two live ranges merges with BOTH when the middle comes back.
+		let one = pool.alloc(PAGE_SIZE);
+		let two = pool.alloc(PAGE_SIZE);
+		let three = pool.alloc(PAGE_SIZE);
+		pool.free(one, PAGE_SIZE);
+		pool.free(three, PAGE_SIZE);
+		pool.free(two, PAGE_SIZE);
+		assert_eq!(pool.alloc(3 * PAGE_SIZE), one, "a range closing the gap between two free ones folds all three together");
+		pool.free(one, 3 * PAGE_SIZE);
+	}
+
+	crate::tagged_test!(an_exhausted_window_refuses_rather_than_running_past_its_end, [Memory]);
+	fn an_exhausted_window_refuses_rather_than_running_past_its_end() {
+		// Four pages, and a fifth must be refused rather than handed out above the window -
+		// which would be an address in whatever lies beyond it.
+		const BASE: u64 = 0x2000_0000;
+		let mut pool = VaPool::new(BASE, BASE + 4 * PAGE_SIZE);
+		let mut taken = [0u64; 4];
+		for slot in taken.iter_mut() {
+			*slot = pool.alloc(PAGE_SIZE);
+			assert!(*slot >= BASE && *slot < BASE + 4 * PAGE_SIZE, "every allocation lies inside the window");
+		}
+		assert_eq!(pool.alloc(PAGE_SIZE), 0, "a fifth page must be refused");
+		assert_eq!(pool.alloc(64 * PAGE_SIZE), 0, "so must a request larger than the whole window");
+		// Giving one back makes exactly one available again.
+		pool.free(taken[1], PAGE_SIZE);
+		assert_eq!(pool.alloc(PAGE_SIZE), taken[1], "the released page is the one handed out");
+		assert_eq!(pool.alloc(PAGE_SIZE), 0, "and the window is full again");
+		// A request rounds up to whole pages: a byte still costs a page, and zero costs
+		// nothing at all rather than a zero-length range someone would have to free.
+		assert_eq!(VaPool::new(BASE, BASE + PAGE_SIZE).alloc(0), 0, "a zero-length request is refused");
+		let mut small = VaPool::new(BASE, BASE + PAGE_SIZE);
+		assert_eq!(small.alloc(1), BASE, "one byte takes one page");
+		assert_eq!(small.alloc(1), 0, "and the window is then empty");
+	}
+}
