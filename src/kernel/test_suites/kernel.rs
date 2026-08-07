@@ -1296,3 +1296,94 @@ fn a_batch_naming_one_handle_twice_is_refused_whole() {
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the batch thread ran to completion");
 }
+
+tagged_test!(starting_a_thread_twice_runs_it_once, [Process, Scheduler]);
+fn starting_a_thread_twice_runs_it_once() {
+	// The start gate. A thread built suspended and released twice must be enqueued once - the
+	// same thread on a run queue twice is two cores switching into one context, which is a
+	// corrupted stack rather than a slow thread. The gate is a compare-exchange on `started`,
+	// and the second caller has to learn it lost rather than be silently ignored.
+	use core::sync::atomic::{AtomicU64, Ordering};
+	static RUNS: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn body(_arg: u64) {
+		RUNS.fetch_add(1, Ordering::SeqCst);
+	}
+	RUNS.store(0, Ordering::SeqCst);
+	let process = object::process::Process::new(object::address_space::AddressSpace::kernel(), sched::root_domain());
+	let thread = sched::thread_create_suspended(process, body, 0).expect("a suspended thread");
+	assert!(sched::thread_start(thread.clone()), "the first release starts it");
+	assert!(!sched::thread_start(thread.clone()), "the second must report that it lost, not enqueue again");
+	assert!(!sched::thread_start(thread.clone()), "and so must every one after that");
+	sched::run_until_idle();
+	assert_eq!(RUNS.load(Ordering::SeqCst), 1, "the body ran more than once: the thread was enqueued twice");
+}
+
+tagged_test!(a_wake_can_only_be_claimed_once, [Process, Scheduler, Smp]);
+fn a_wake_can_only_be_claimed_once() {
+	// A blocked thread can be made ready by more than one source at the same instant - a
+	// message arriving as its deadline passes, two peers signalling one event - and exactly one
+	// of them may enqueue it. Two enqueues of one thread is two cores switching into one
+	// context, which is a corrupted stack rather than a slow thread.
+	//
+	// `try_claim_wake` is that decision. It is tested directly, not through `wake_thread`:
+	// enqueueing a thread that was never parked would put a context with no saved stack pointer
+	// on a run queue. The claim is the part that has to be exactly once.
+	//
+	// Sequentially, and deliberately so. The concurrent version of this - two cores in a
+	// rendezvous loop racing the same claim - was written first and is the reason this comment
+	// exists: it passed, and it made two unrelated timing-sensitive tests fail afterwards, by
+	// holding two cores in tight spin loops on a machine that has other work. What it bought
+	// over this was confidence that the claim is a compare-exchange, which is visible in the
+	// one line that implements it. What it cost was a suite that no longer meant anything.
+	extern "C" fn never_runs(_arg: u64) {}
+	let process = object::process::Process::new(object::address_space::AddressSpace::kernel(), sched::root_domain());
+	let subject = sched::thread_create_suspended(process, never_runs, 0).expect("a suspended subject");
+
+	for round in 0..8 {
+		subject.set_state(object::thread::ThreadState::Blocked);
+		assert!(subject.try_claim_wake(), "round {round}: the first claim on a blocked thread must win");
+		assert!(!subject.try_claim_wake(), "round {round}: a second claim must lose - the thread is already Ready");
+		assert!(!subject.try_claim_wake(), "round {round}: and so must every one after it");
+		assert_eq!(subject.state(), object::thread::ThreadState::Ready, "the winning claim leaves it Ready");
+	}
+	// A thread that is not blocked cannot be claimed at all, which is the same guarantee from
+	// the other side: a wake arriving for a thread that already woke changes nothing.
+	subject.set_state(object::thread::ThreadState::Running);
+	assert!(!subject.try_claim_wake(), "a running thread is not claimable");
+	subject.set_state(object::thread::ThreadState::Exited);
+	assert!(!subject.try_claim_wake(), "nor is an exited one");
+}
+
+tagged_test!(a_terminating_process_takes_no_new_mappings, [Process, Syscall, Memory]);
+fn a_terminating_process_takes_no_new_mappings() {
+	// Cleanup takes a snapshot of what to unmap. A mapping registered after that snapshot is
+	// one nothing will ever collect: the page tables keep it while the frames go back to the
+	// allocator. So the map syscalls have to refuse from the moment termination begins, not
+	// from the moment it finishes.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let page = mem::frame::PAGE_SIZE;
+			let object = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, page, 0, 0, 0);
+			assert!(!syscall::sys_is_err(object), "memory_object_create");
+			// It maps while the process is alive, so the refusal below is about termination.
+			let base = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, object, 0, 0, 0);
+			assert!(!syscall::sys_is_err(base), "the map succeeds before termination");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, object, 0, 0, 0) as i64, 0);
+
+			// Begin terminating without going through the kill path, which would also stop
+			// this thread - what is under test is the map syscall's own check.
+			let thread = sched::current_thread().expect("a current thread");
+			thread.process().begin_terminating_for_test();
+			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_MEMORY_MAP, object, 0, 0, 0)), "a map must be refused once the process is terminating");
+			// The handle is still good - the refusal is about the process, not the handle -
+			// which is what makes the assertion above mean something.
+			assert!(!syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, object, [0u8; 256].as_mut_ptr() as u64, 256, 0)), "the handle itself is still live");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the termination thread ran to completion");
+}

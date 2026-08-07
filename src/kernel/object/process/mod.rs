@@ -296,6 +296,14 @@ impl Process {
 		self.terminating.load(Ordering::Acquire)
 	}
 
+	// Set ONLY the terminating flag. For the test that checks the map syscalls refuse from the
+	// first moment of a kill: `terminate` would also close the handle table, and a map refused
+	// for a dead handle looks exactly like a map refused for a dying process.
+	#[cfg(test)]
+	pub fn begin_terminating_for_test(&self) {
+		self.terminating.store(true, Ordering::Release);
+	}
+
 	// Whether this process has been killed and its threads should exit.
 	pub fn is_killed(&self) -> bool {
 		self.killed.load(Ordering::Acquire)
