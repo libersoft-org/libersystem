@@ -1,0 +1,8 @@
+[package]
+name = "partition"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "partition - what a raw disk actually is, decided before anything is written to it"
+
+[dependencies]

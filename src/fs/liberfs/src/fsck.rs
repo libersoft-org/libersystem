@@ -301,6 +301,12 @@ impl<D: BlockDevice> LiberFs<D> {
 			for i in 0..=count {
 				let child_lower = if i == 0 { lower } else { Some(sep_key(&buf, i - 1)) };
 				let child_upper = if i == count { upper } else { Some(sep_key(&buf, i)) };
+				// same rule as the directory pass: a slot of an internal node that points
+				// nowhere is an impossible shape, not an empty corner.
+				if child_ptr(&buf, i) == 0 {
+					faults.push(alloc::format!("internal node {ptr} has no child in slot {i}, so a range of inode numbers routes nowhere").into_bytes());
+					continue;
+				}
 				if self.walk_inode_records_in(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, (child_lower, child_upper), inodes, seen, faults).is_err() {
 					faults.push(alloc::format!("subtree under {ptr} could not be walked").into_bytes());
 				}
@@ -316,7 +322,15 @@ impl<D: BlockDevice> LiberFs<D> {
 	// the format says they are, separators ascending - and the inode's `size` equal to
 	// the number of entries actually there.
 	fn check_dir_structure(&mut self, num: u32, inode: &Inode, faults: &mut Vec<Vec<u8>>) {
-		let Ok(mut visited) = try_zeroed(self.free.len()) else { return };
+		// a refused allocation used to `return`, so `fsck` checked nothing and reported
+		// nothing and the structural report came back CLEAN for a directory it never
+		// looked at. A report that cannot tell "checked and sound" from "not checked" is
+		// worse than one that admits the difference, so the inability to check is itself
+		// the fault - the same treatment the inode-tree pass above already gives it.
+		let Ok(mut visited) = try_zeroed(self.free.len()) else {
+			faults.push(alloc::format!("inode {num}: not enough memory to check this directory's structure").into_bytes());
+			return;
+		};
 		// (block, crc, depth remaining, the half-open key interval this subtree is routed
 		// for). `route_child` advances while `sep(i) <= key`, so child `i` holds keys in
 		// `[sep(i-1), sep(i))` - lower inclusive, upper exclusive, and `None` at either
@@ -370,8 +384,11 @@ impl<D: BlockDevice> LiberFs<D> {
 						if name_hash(&rec.name) != rec.hash {
 							faults.push(alloc::format!("inode {num}: a directory record whose stored hash is not its name's").into_bytes());
 						}
-						if core::str::from_utf8(&rec.name).is_err() || rec.name.is_empty() {
-							faults.push(alloc::format!("inode {num}: a directory record whose name is not the text the format requires").into_bytes());
+						// the SAME rule the path API enforces when it creates a name, so
+						// the two cannot drift: a record the API could never have written
+						// is a record no path can address afterwards.
+						if validate_name_segment(&rec.name).is_err() {
+							faults.push(alloc::format!("inode {num}: a directory record whose name is not one this format can address").into_bytes());
 						}
 						if let Some((lh, ln)) = &last {
 							if (rec.hash, &rec.name) <= (*lh, ln) {
@@ -400,6 +417,17 @@ impl<D: BlockDevice> LiberFs<D> {
 					for i in 0..=count {
 						let child_lower = if i == 0 { lower } else { Some(sep_key(&buf, i - 1)) };
 						let child_upper = if i == count { upper } else { Some(sep_key(&buf, i)) };
+						// A null child slot is not "nothing here". That reading is right for
+						// an empty directory root and for a sentinel outside the tree, and
+						// wrong for a slot of an internal node: the node routes a whole key
+						// interval into each of its `count + 1` slots, so a slot pointing
+						// nowhere makes every name in that interval resolve to nothing -
+						// while the entry counts still agree and the checksums still verify,
+						// which is exactly the shape a structural pass exists to catch.
+						if child_ptr(&buf, i) == 0 {
+							faults.push(alloc::format!("inode {num}: directory node {ptr} has no child in slot {i}, so a range of names routes nowhere").into_bytes());
+							continue;
+						}
 						stack.push((child_ptr(&buf, i), child_crc(&buf, i), left - 1, (child_lower, child_upper)));
 					}
 				}
@@ -481,18 +509,27 @@ impl<D: BlockDevice> LiberFs<D> {
 		// limit, which protects the stack and not the clock. A node with hundreds of
 		// children all pointing at the next level's single node - with CRCs that agree,
 		// which is buildable bottom-up and needs no cycle - is walked once per pointer per
-		// level: fanout raised to the depth. Verifying a block twice tells nobody anything
-		// the first pass did not, so the second visit is simply not made, and the walk is
+		// level: fanout raised to the depth. Walking a SUBTREE twice tells nobody anything
+		// the first pass did not, so the second descent is simply not made, and the walk is
 		// bounded by the pool.
+		//
+		// The LINK is a different question, and the skip used to answer it too. `read_node`
+		// verifies the block against the CRC32C recorded in the pointer that reached it, and
+		// it sat after the visited test - so where two snapshots shared a block, only the
+		// first snapshot's link was ever checked. A second snapshot pointing at the same
+		// block with a wrong expected CRC cannot be opened at all, and fsck reported
+		// nothing about it. Verifying first and skipping only the descent keeps the whole
+		// saving (each block is walked once) and costs one read per shared edge - which is
+		// linear in the tree's edges, never the exponential the bitmap was added to stop.
 		if ptr >= self.num_blocks {
 			return Err(FsError::Corrupt);
 		}
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
 		if test_bit(visited, ptr) {
 			return Ok(0);
 		}
 		set_bit(visited, ptr);
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		self.read_node(ptr, crc, &mut buf)?;
 		let mut bad = 0u32;
 		if node_type(&buf) == NODE_LEAF {
 			for i in 0..leaf_count(&buf, INODE_REC) {
@@ -534,17 +571,19 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Corrupt);
 		}
 		// same bound as the inode walk, sharing its map: a block is one node of one tree,
-		// so a directory node reached twice - however many names alias it - is verified
-		// once.
+		// so a directory node reached twice - however many names alias it - is DESCENDED
+		// into once. Its link is still verified every time, for the reason set out above:
+		// the block's contents having been scrubbed says nothing about whether this
+		// particular pointer records the right CRC for them.
 		if ptr >= self.num_blocks {
 			return Err(FsError::Corrupt);
 		}
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		self.read_node(ptr, crc, &mut buf)?;
 		if test_bit(visited, ptr) {
 			return Ok(0);
 		}
 		set_bit(visited, ptr);
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		self.read_node(ptr, crc, &mut buf)?;
 		let mut bad = 0u32;
 		if node_type(&buf) == NODE_INTERNAL {
 			for i in 0..=internal_count(&buf) {

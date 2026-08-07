@@ -16,6 +16,7 @@ declare -A GATES=(
 	["artifact-metadata"]="tools/check-artifact-metadata.sh"
 	["dynamic-report"]="tools/check-dynamic-report.sh --check"
 	["test-tags"]="boot/check-test-tags.sh"
+	["host-tests"]="tools/check-host-tests.sh"
 	["static-image"]="tools/check-static-injection.sh static"
 	["undeclared-edge"]="tools/check-static-injection.sh undeclared-edge"
 	["duplicate-edge"]="tools/check-static-injection.sh duplicate-edge"

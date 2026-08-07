@@ -234,6 +234,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		match fs.load_snapshot_table() {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => fs.read_only = true,
+			// a refused allocation is the MACHINE, not the medium - see `derive_free` below.
+			Err(FsError::NoSpace) => return Err(MountError::NoMemory),
 			Err(_) => return Err(MountError::Io),
 		}
 		// a generation walk that could not complete (an unreadable node, a broken spill
@@ -247,6 +249,13 @@ impl<D: BlockDevice> LiberFs<D> {
 		match fs.derive_free() {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => fs.read_only = true,
+			// the generation walk sizes its own maps, and `try_zeroed` reports a refused
+			// allocation as `NoSpace`. Folding that into `Io` told the operator the disk
+			// did not answer when the disk was fine and the MACHINE was short - a wrong
+			// diagnosis pointing at the wrong component. The process no longer aborting was
+			// the point of the fallible allocation; carrying the reason through is the rest
+			// of it, and `MountError::NoMemory` already existed to say exactly this.
+			Err(FsError::NoSpace) => return Err(MountError::NoMemory),
 			Err(_) => return Err(MountError::Io),
 		}
 		// the two superblock relations that need the tree to settle. Both are read-only
@@ -562,8 +571,16 @@ impl<D: BlockDevice> LiberFs<D> {
 	// non-zero despite the empty size the caller verified (damaged or hostile; a
 	// legitimate empty directory's root is 0). Shared by the delete and the
 	// rename-replace paths, so neither can leak what the other drops.
+	//
+	// "File-shaped unless it is a directory", which is the rule `Inode::parse` and the
+	// mark walk already use. The test was `== TYPE_FILE`, and an unknown type byte is
+	// neither that nor a directory with a root (`parse` fills `dir_root` only for
+	// TYPE_DIR, so it is zero) - so removing such an inode dropped NOTHING while the
+	// mark walk reserved its data, checksum and spill blocks. They then stayed marked
+	// used for the life of the mount, and the repair verb that cleared the record did
+	// not bring the space back with it.
 	pub(crate) fn drop_deleted_inode(&mut self, inode: &Inode) -> Result<(), FsError> {
-		if inode.r#type == TYPE_FILE {
+		if inode.r#type != TYPE_DIR {
 			self.drop_inode_blocks(inode)?;
 		} else if inode.dir_root != 0 {
 			// mark-then-scan is O(pool) per call - accepted: this path runs only for a
@@ -742,7 +759,16 @@ fn parse_checked(block: &[u8]) -> Option<Superblock> {
 	// side accepted anything, so a volume authored elsewhere produced a `label()` that was
 	// not what the record held. `name_in` is what `label()` returns, so that is what has
 	// to be text - the padding after it is not part of the name.
-	if core::str::from_utf8(name_in(&label)).is_err() {
+	let name = name_in(&label).len();
+	if core::str::from_utf8(&label[..name]).is_err() {
+		return None;
+	}
+	// and the field AFTER the terminator has to be the zero padding the writer lays down.
+	// Nothing reads those bytes, so this is not about what `label()` returns; it is that
+	// `system\0\xff\xffgarbage` is not something any writer of this format produces, and
+	// a field shaped like that is itself evidence the record was written by something
+	// else. Refusing costs nothing and turns a provably foreign image away at the door.
+	if label[name..].iter().any(|&b| b != 0) {
 		return None;
 	}
 	Some(Superblock { num_blocks, generation, inode_root, inode_root_crc: u32::from_le_bytes(block[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].try_into().ok()?), next_inode, root_inode, snap_root, snap_root_crc: u32::from_le_bytes(block[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].try_into().ok()?), uuid, label, compress: block[SB_COMPRESS_OFF] != 0 })

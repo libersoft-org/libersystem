@@ -1902,10 +1902,15 @@ fn forge_superblock(dev: &mut MemDevice, slot: usize, f: impl FnOnce(&mut [u8]))
 // it so the image is internally consistent - the point is always the CONTENT of the
 // record, never a checksum failure standing in for it.
 fn forge_snapshot_record(dev: &mut MemDevice, f: impl FnOnce(&mut [u8])) {
+	forge_snapshot_record_at(dev, 0, f)
+}
+
+// The same, for a chosen record of the live table's first block.
+fn forge_snapshot_record_at(dev: &mut MemDevice, index: usize, f: impl FnOnce(&mut [u8])) {
 	let slot = active_slot(dev);
 	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
 	let start = sb.snap_root as usize * BLOCK_SIZE;
-	let rec = start + SNAP_HDR;
+	let rec = start + SNAP_HDR + index * SNAP_REC;
 	f(&mut dev.blocks[rec..rec + SNAP_REC]);
 	let crc = crc32c(&dev.blocks[start..start + BLOCK_SIZE]);
 	forge_superblock(dev, slot, |sb| sb[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes()));
@@ -2125,25 +2130,60 @@ fn write_spilled_file(fs: &mut LiberFs<MemDevice>) -> Vec<u8> {
 	fs.read_file(b"frag.bin").unwrap()
 }
 
-#[test]
-fn a_forged_spill_count_cannot_panic_the_mount() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
-	let expected = write_spilled_file(&mut fs);
-	let mut dev = fs.into_device();
-	// stamp an impossible record count into the spill chain block and re-checksum the
-	// whole forgery chain (chain -> inode slot -> leaf -> superblock): the clamp must
-	// keep the parse inside the block, in every walk and on the read path.
+// Stamp `count` into the spill chain block of the spilled file and re-checksum the whole
+// forgery chain (chain -> inode slot -> leaf -> superblock), so the forged block is what
+// every walk and the read path actually see.
+fn forge_spill_count(dev: &mut MemDevice, count: u32) {
 	let mut spill = 0u64;
-	forge_inode_slot(&mut dev, |slot| {
+	forge_inode_slot(dev, |slot| {
 		spill = u64::from_le_bytes(slot[INO_MAP_OFF..INO_MAP_OFF + 8].try_into().unwrap());
 	});
 	let start = spill as usize * BLOCK_SIZE;
-	dev.blocks[start + CHAIN_COUNT_OFF..start + CHAIN_COUNT_OFF + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+	dev.blocks[start + CHAIN_COUNT_OFF..start + CHAIN_COUNT_OFF + 4].copy_from_slice(&count.to_le_bytes());
 	let chain_crc = crc32c(&dev.blocks[start..start + BLOCK_SIZE]);
-	forge_inode_slot(&mut dev, |slot| {
+	forge_inode_slot(dev, |slot| {
 		slot[INO_MAP_CRC_OFF..INO_MAP_CRC_OFF + 4].copy_from_slice(&chain_crc.to_le_bytes());
 	});
-	let mut fs = LiberFs::mount(dev).expect("the mount must survive the forged count");
+}
+
+#[test]
+fn a_forged_spill_count_is_refused_rather_than_trimmed() {
+	// An impossible record count in a chain block used to be CLAMPED - to what a block can
+	// hold and to what the inode was still missing - so a checksum-consistent forgery
+	// claiming more records than exist was quietly normalised into a possible one, and the
+	// structural pass had nothing left to disagree with. `Extent::parse` was given the
+	// other treatment (keep what is on the medium, refuse what cannot be true) and this
+	// half was not.
+	//
+	// Both directions of impossible are covered: more than fits in a block, and more than
+	// the inode says is still missing.
+	for count in [u32::MAX, (EXTENTS_PER_BLOCK + 1) as u32, 3] {
+		let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+		write_spilled_file(&mut fs);
+		let mut dev = fs.into_device();
+		forge_spill_count(&mut dev, count);
+		// the mount still SURVIVES - it degrades to read-only, because a generation walk
+		// that could not complete leaves the free map incomplete - and the file the forgery
+		// is attached to reads as the damage it is instead of as a shorter file.
+		let mut fs = LiberFs::mount(dev).expect("the mount must survive the forged count");
+		assert!(fs.is_read_only(), "a chain the walk could not read leaves the map incomplete: {count}");
+		assert_eq!(fs.read_file(b"frag.bin"), Err(FsError::Corrupt), "an impossible chain count is refused, not trimmed: {count}");
+		// and fsck says so rather than reporting a file that is simply shorter than it was.
+		let report = fs.fsck().unwrap();
+		assert!(mentions(&report.faults, b"spill chain could not be read"), "fsck names the chain: {:?}", report.faults);
+	}
+}
+
+#[test]
+fn an_honest_spill_count_still_reads() {
+	// the other side of the refusal above: the count `flush_extents` actually writes is
+	// left alone, so re-stamping it changes nothing and the file reads back whole.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let expected = write_spilled_file(&mut fs);
+	let mut dev = fs.into_device();
+	forge_spill_count(&mut dev, 2);
+	let mut fs = LiberFs::mount(dev).expect("an honest chain mounts");
+	assert!(!fs.is_read_only(), "nothing about this volume is damaged");
 	assert_eq!(fs.read_file(b"frag.bin").unwrap(), expected, "the real extents still read");
 }
 
@@ -3514,4 +3554,278 @@ fn overwriting_a_cached_entry_evicts_nothing() {
 	assert_eq!(fs.dcache.len(), DCACHE_MAX, "the overwrite evicted nothing");
 	assert_eq!(fs.dcache.get(&(0, b"name0000".to_vec())), Some(&999), "the overwrite landed");
 	assert!(fs.dcache.contains_key(&(0, format!("name{:04}", DCACHE_MAX - 1).as_bytes().to_vec())), "the largest key survived the overwrite");
+}
+
+// M0146: the third audit's follow-ups, and the three regressions M0144 opened.
+
+#[test]
+fn a_directory_that_splits_lists_in_key_order() {
+	// `collect_dir_entries` is documented as returning entries in key order, and M0144
+	// replaced its recursion with a LIFO stack that pushed children 0..=count and popped
+	// the last one FIRST. Records inside a leaf stayed sorted, so the reversal only shows
+	// once a directory is big enough to have an internal node - and every directory test
+	// there was fit in a single leaf, where LIFO and FIFO are the same thing.
+	//
+	// The tree routes by name hash, so "key order" is (hash, name) ascending, not
+	// alphabetical: the assertion is against the same comparison the leaves are sorted by.
+	let nblocks: u64 = 4_000;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.mkdir(b"many").unwrap();
+	// long names, so a leaf fills after a few dozen records and 400 of them force
+	// several leaves under an internal node.
+	let count = 400u32;
+	for i in 0..count {
+		fs.write_file(format!("many/entry-{i:04}-{}", "p".repeat(40)).as_bytes(), b"x").unwrap();
+	}
+
+	// the tree really did split - otherwise this test proves nothing at all.
+	let dir = fs.lookup(b"many").unwrap().unwrap();
+	let inode = fs.read_inode(dir).unwrap();
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	fs.read_node(inode.dir_root, inode.dir_root_crc, &mut buf).unwrap();
+	assert_eq!(node_type(&buf), NODE_INTERNAL, "400 long names must not fit in one leaf");
+
+	let listed: Vec<Vec<u8>> = fs.read_dir(b"many").unwrap().into_iter().map(|(name, ..)| name).collect();
+	assert_eq!(listed.len() as u32, count, "every entry is listed");
+	let mut sorted = listed.clone();
+	sorted.sort_by(|a, b| (name_hash(a), a).cmp(&(name_hash(b), b)));
+	assert_eq!(listed, sorted, "a directory with an internal node lists in key order like any other");
+}
+
+#[test]
+fn removing_an_unknown_type_inode_returns_its_blocks() {
+	// M0144 taught the mark walk to reserve an unknown-type inode's blocks - file-shaped,
+	// which is what `Inode::parse` builds it as - and did not follow that into the other
+	// end. `drop_deleted_inode` branched on `== TYPE_FILE`, and an unknown type is neither
+	// that nor a directory with a root, so removing the record dropped NOTHING: the blocks
+	// stayed marked used for the life of the mount, and the repair verb the operator ran
+	// to get them back did not get them back.
+	//
+	// The existing test asserts the record disappears. This one asserts the space does
+	// too, which is the whole difference between the fix and the regression.
+	//
+	// The measurement is the same experiment twice - once on the file as written, once on
+	// a byte-identical image with the type flipped to one no writer emits - because the
+	// unknown type parses file-shaped and must therefore cost and return exactly what the
+	// file does. A bare "free space went up" would pass on the day the numbers merely
+	// moved; the control says what the right number IS.
+	// The space has to come back WITHIN the mount. A remount, an fsck or a snapshot change
+	// each rederive the free map from the medium and would hide the whole thing, which is
+	// exactly why the regression could sit there: the blocks were never lost, only held
+	// until something walked the volume again.
+	let drain = |odd: bool| -> (Vec<u64>, Vec<u64>, u64) {
+		let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+		// a spilled extent map, so the chain block is in the accounting with the data.
+		write_spilled_file(&mut fs);
+		let mut dev = fs.into_device();
+		if odd {
+			forge_inode_slot(&mut dev, |slot| slot[INO_TYPE_OFF] = 7);
+		}
+		let mut fs = LiberFs::mount(dev).unwrap();
+		let num = fs.lookup(b"frag.bin").unwrap().unwrap();
+		let inode = fs.read_inode(num).unwrap();
+		assert_eq!(inode.r#type, if odd { 7 } else { TYPE_FILE }, "the forgery has to have landed");
+		assert!(inode.extents.len() > EXTENTS_INLINE, "the map must spill, or the chain is not under test");
+		let held: Vec<u64> = inode.extents.iter().flat_map(|e| [e.physical, e.csum]).chain([inode.spill]).collect();
+		for &b in held.iter() {
+			assert!(fs.is_alloc(b), "block {b} behind the record is reserved, as M0144 arranged");
+		}
+		fs.remove(b"frag.bin").unwrap();
+		// what a transaction drops is freed one commit later - the superseded generation
+		// still pins it until then. `set_compression` is the commit that allocates nothing
+		// of its own, so what comes back is the deletion's alone (and it has to CHANGE the
+		// setting, or the call is a no-op and no commit happens at all).
+		fs.set_compression(true).unwrap();
+		(held.clone(), held.into_iter().filter(|&b| fs.is_alloc(b)).collect(), fs.free_blocks())
+	};
+	let (plain_held, plain_stuck, plain_free) = drain(false);
+	let (odd_held, odd_stuck, odd_free) = drain(true);
+	assert_eq!(odd_held, plain_held, "the two images hold the same blocks to begin with");
+	assert_eq!(plain_stuck, Vec::<u64>::new(), "removing a file returns every block it held");
+	assert_eq!(odd_stuck, Vec::<u64>::new(), "and an unknown type is file-shaped, so removing it returns them too");
+	assert_eq!(odd_free, plain_free, "down to the same free count as the file it parses as");
+}
+
+#[test]
+fn a_null_child_slot_is_a_fault_not_an_empty_corner() {
+	// `ptr == 0` means "nothing here", which is right for an empty directory root and for
+	// a sentinel outside the tree - and wrong for a child slot of an internal node. Such a
+	// node routes a whole key interval into every one of its `count + 1` slots, so a slot
+	// pointing nowhere makes every name in that interval resolve to nothing while the
+	// checksums verify and the counts add up. Both walks took it for an empty corner.
+	let nblocks: u64 = 4_000;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.mkdir(b"many").unwrap();
+	for i in 0..400u32 {
+		fs.write_file(format!("many/entry-{i:04}-{}", "p".repeat(40)).as_bytes(), b"x").unwrap();
+	}
+	let dir = fs.lookup(b"many").unwrap().unwrap();
+	let mut inode = fs.read_inode(dir).unwrap();
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	fs.read_node(inode.dir_root, inode.dir_root_crc, &mut buf).unwrap();
+	assert_eq!(node_type(&buf), NODE_INTERNAL);
+
+	// knock out child slot 1 and re-seal the tree above it, so the image is internally
+	// consistent and the missing child is the only thing wrong with it.
+	set_child(&mut buf, 1, 0, 0);
+	let crc = fs.write_node_to(inode.dir_root, &buf).unwrap();
+	inode.dir_root_crc = crc;
+	fs.write_inode(dir, &mut inode).unwrap();
+	fs.commit().unwrap();
+
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"has no child in slot 1"), "fsck names the missing child: {:?}", report.faults);
+	// and the live walk refuses the shape rather than listing a directory short.
+	assert_eq!(fs.read_dir(b"many"), Err(FsError::Corrupt), "a listing may not silently drop a whole routed interval");
+}
+
+#[test]
+fn the_directory_checker_refuses_every_name_the_path_api_does() {
+	// Creating a path refuses invalid UTF-8, empty segments, `.` and `..`, control
+	// characters, the reserved punctuation set, NUL and over-long names. The structural
+	// checker knew two of those eight, so a record read off the medium named `..`, or
+	// `a/b`, or one carrying a control byte, passed an fsck that no path API could have
+	// produced and none can address afterwards.
+	for bad in [b"..".as_slice(), b"a/b".as_slice(), b"a\x01b".as_slice(), b"a:b".as_slice(), b".".as_slice()] {
+		let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+		fs.write_file(b"placeholder", b"x").unwrap();
+		let root = fs.root_inode;
+		let mut inode = fs.read_inode(root).unwrap();
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		fs.read_node(inode.dir_root, inode.dir_root_crc, &mut buf).unwrap();
+		// rewrite the single leaf with one record carrying the impossible name, hash and
+		// all, so nothing but the NAME is out of order.
+		let child = dir_leaf_parse(&buf)[0].child;
+		dir_leaf_write(&mut buf, &[DirRec { hash: name_hash(bad), name: bad.to_vec(), child }]);
+		let crc = fs.write_node_to(inode.dir_root, &buf).unwrap();
+		inode.dir_root_crc = crc;
+		inode.size = 1;
+		fs.write_inode(root, &mut inode).unwrap();
+		fs.commit().unwrap();
+
+		let report = fs.fsck().unwrap();
+		assert!(mentions(&report.faults, b"not one this format can address"), "fsck must refuse the name {bad:?}: {:?}", report.faults);
+	}
+}
+
+#[test]
+fn a_label_field_with_a_dirty_tail_is_not_ours() {
+	// `system\0\xff\xffgarbage` is not something any writer of this format produces: the
+	// field is laid down NUL-padded. Nothing reads past the terminator, so this is not
+	// about what `label()` returns - it is that a field shaped like that is itself proof
+	// the record was written by something else, and refusing costs nothing.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"keep", b"payload").unwrap();
+	let mut dev = fs.into_device();
+	for slot in 0..SUPER_SLOTS as usize {
+		forge_superblock(&mut dev, slot, |sb| {
+			sb[SB_LABEL_OFF + 8..SB_LABEL_OFF + 16].copy_from_slice(b"\xff\xffgarbag");
+		});
+	}
+	// Corrupt, not Unformatted, and the difference matters: the magic is there, so the
+	// volume is OURS and failed its own checks - which is the answer the storage service
+	// refuses to format over. "Unformatted" is the one word that licenses a format.
+	assert_eq!(LiberFs::mount(dev).err(), Some(MountError::Corrupt), "a field no writer produces is not a superblock this build accepts");
+}
+
+#[test]
+fn a_second_snapshots_bad_link_is_checked_too() {
+	// fsck walks every snapshot with ONE visited bitmap, which is what makes it
+	// affordable. The skip happened before the block was verified against the CRC recorded
+	// in the link that reached it - so where two snapshots share a block, only the first
+	// snapshot's link was ever checked. A second snapshot pointing at the same block with
+	// a wrong expected CRC cannot be opened at all, and fsck reported nothing about it.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"shared.txt", b"payload").unwrap();
+	// two snapshots taken back to back: nothing touched the inode tree between them, so
+	// both records name the SAME root block. That is the shape the audit describes and the
+	// one the shared bitmap cannot see past.
+	fs.create_snapshot(b"first").unwrap();
+	fs.create_snapshot(b"second").unwrap();
+	assert_eq!(fs.list_snapshots().unwrap().len(), 2);
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0, "both snapshots are sound to begin with");
+
+	// break the SECOND record's expected root CRC only. The block itself is untouched and
+	// the first snapshot still reaches it with the right CRC, so by the time the second
+	// record is walked the block is already marked visited.
+	let mut dev = fs.into_device();
+	let mut first_root = 0u64;
+	let mut second_root = 0u64;
+	forge_snapshot_record_at(&mut dev, 0, |rec| first_root = u64::from_le_bytes(rec[SNAP_ROOT_OFF..SNAP_ROOT_OFF + 8].try_into().unwrap()));
+	forge_snapshot_record_at(&mut dev, 1, |rec| {
+		second_root = u64::from_le_bytes(rec[SNAP_ROOT_OFF..SNAP_ROOT_OFF + 8].try_into().unwrap());
+		let crc = u32::from_le_bytes(rec[SNAP_ROOT_CRC_OFF..SNAP_ROOT_CRC_OFF + 4].try_into().unwrap());
+		rec[SNAP_ROOT_CRC_OFF..SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&(crc ^ 1).to_le_bytes());
+	});
+	assert_eq!(first_root, second_root, "the two snapshots must share the root, or this proves nothing");
+
+	let mut fs = LiberFs::mount(dev).expect("the volume still mounts");
+	let report = fs.fsck().unwrap();
+	assert!(report.checksum_failures > 0, "a link that cannot be believed is a failure however many other links reach the same block");
+	// and the snapshot really is unopenable, which is the harm the silence was hiding.
+	assert_eq!(fs.read_file_from_snapshot(b"second", b"shared.txt"), Err(FsError::Corrupt));
+	assert_eq!(fs.read_file_from_snapshot(b"first", b"shared.txt").unwrap(), b"payload");
+}
+
+// A guard that disarms the allocation injector however the test leaves - a panicking
+// assertion must not leave the switch armed for the next test on this thread.
+struct Injected;
+
+impl Drop for Injected {
+	fn drop(&mut self) {
+		inject::disarm();
+	}
+}
+
+fn fail_allocation_after(successes: usize) -> Injected {
+	inject::fail_after(successes);
+	Injected
+}
+
+#[test]
+fn a_check_that_could_not_run_is_a_fault_not_a_clean_report() {
+	// `check_dir_structure` began `let Ok(mut visited) = try_zeroed(..) else { return }`, so
+	// a refused allocation checked nothing and reported nothing - and fsck handed back a
+	// clean structural report for directories it never looked at. A report that cannot
+	// distinguish "checked and sound" from "not checked" is worse than one that admits the
+	// difference.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"d").unwrap();
+	fs.write_file(b"d/f.txt", b"payload").unwrap();
+	// clean first, so the fault below is the injection's and not the volume's.
+	let mut clean: Vec<Vec<u8>> = Vec::new();
+	fs.check_structure(&mut clean);
+	assert_eq!(clean.len(), 0, "the volume itself is sound: {clean:?}");
+
+	// the pass allocates its inode-tree map first and then one map per directory, so
+	// letting exactly one through puts the refusal inside `check_dir_structure`.
+	let mut faults: Vec<Vec<u8>> = Vec::new();
+	{
+		let _armed = fail_allocation_after(1);
+		fs.check_structure(&mut faults);
+	}
+	assert!(mentions(&faults, b"memory to check this directory"), "a check that could not run says so: {faults:?}");
+	// and the whole report carries it, so no caller reads a directory that was skipped as
+	// a directory that passed.
+	let report = {
+		let _armed = fail_allocation_after(6);
+		fs.fsck().unwrap()
+	};
+	assert!(report.structural_failures > 0, "the report counts what it could not check: {:?}", report.faults);
+}
+
+#[test]
+fn a_mount_short_of_memory_does_not_blame_the_disk() {
+	// `derive_free` sizes its own maps, and `try_zeroed` reports a refusal as `NoSpace`.
+	// The mount folded everything but `Corrupt` into `MountError::Io`, so StorageService
+	// told the operator the disk did not answer when the disk was fine and the machine was
+	// short. The process no longer aborting was the point of the fallible allocation;
+	// carrying the reason through is the rest of it.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"keep", b"payload").unwrap();
+	let dev = fs.into_device();
+	// the mount builds the two superblock-sized maps first (those already answer
+	// NoMemory), and `derive_free` is what allocates next.
+	let _armed = fail_allocation_after(2);
+	assert_eq!(LiberFs::mount(dev).err(), Some(MountError::NoMemory), "a refused allocation is the machine, not the medium");
 }

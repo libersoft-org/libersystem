@@ -128,6 +128,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "partition"
+version = "0.0.0"
+
+[[package]]
 name = "process-proto"
 version = "0.0.0"
 dependencies = [
@@ -206,6 +210,7 @@ dependencies = [
  "iso9660",
  "liberfs",
  "libermemfs",
+ "partition",
  "proto",
  "rt",
  "udf",

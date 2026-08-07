@@ -21,6 +21,10 @@ abi = { path = "../abi" }
 # package to make one from. Building the fixture with the same crate the service mounts means the
 # test cannot drift from the format it is testing against.
 liberfs = { path = "../fs/liberfs" }
+# The disk probe, for the test suite only: the storage scenarios build partition tables for
+# StorageService to read, and building them with the same crate that reads them is what keeps
+# the fixture and the format from drifting (the checksums especially).
+partition = { path = "../fs/partition" }
 fscore = { path = "../fs/core" }
 # The shared terminal stack (grid model + framebuffer renderer): the boot console and
 # the ConsoleService renderer are the same `term::Term`, so there is one renderer.

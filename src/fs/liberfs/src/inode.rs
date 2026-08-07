@@ -15,9 +15,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		match self.tree_lookup(self.inode_root, self.inode_root_crc, key, &probe, INODE_REC)? {
 			Some(rec) => {
 				let mut inode = Inode::parse(&rec[8..8 + INODE_SIZE]);
-				if inode.r#type == TYPE_FILE {
+				if inode.r#type != TYPE_DIR {
 					// complete the extent map from the overflow chain (a no-op for a
 					// file whose runs all fit inline).
+					//
+					// "File-shaped unless it is a directory" - the same rule `Inode::parse`,
+					// the mark walk and the structural pass use. The gate here read
+					// `== TYPE_FILE`, so an inode with an unknown type byte arrived with
+					// only its INLINE runs: the mark walk reserved its whole map (it loads
+					// the chain itself) and every OTHER caller saw a short one. The delete
+					// path is where that mattered - it can only drop the blocks it can see.
 					self.load_spill(&mut inode)?;
 				}
 				self.icache_put(num, inode.clone());
@@ -71,11 +78,18 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Err(FsError::Corrupt);
 			}
 			// the count is read off the medium (a checksum proves integrity, not
-			// sanity): clamp it to what one chain block can hold AND to what the inode
-			// says is still missing, so a forged chain cannot graft records the extent
-			// map never had (they would break its sort order).
+			// sanity), and a count that cannot be true is REFUSED rather than trimmed.
+			// Clamping produced a possible number out of an impossible one, so the
+			// structural pass then had nothing to disagree with: a chain block claiming
+			// more records than fit in a block, or more than the inode is still missing,
+			// read as a perfectly ordinary short block. This is the same treatment
+			// `Extent::parse` was given - keep what is on the medium, and say Corrupt
+			// when the medium says something this format cannot have written.
 			let want = (inode.extent_count as usize).saturating_sub(inode.extents.len());
-			let count = (u32::from_le_bytes(buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize).min(EXTENTS_PER_BLOCK).min(want);
+			let count = u32::from_le_bytes(buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize;
+			if count > EXTENTS_PER_BLOCK || count > want {
+				return Err(FsError::Corrupt);
+			}
 			for i in 0..count {
 				let off = CHAIN_HDR + i * EXTENT_SIZE;
 				inode.extents.push(Extent::parse(&buf[off..off + EXTENT_SIZE]));

@@ -331,10 +331,56 @@ pub const MAX_BLOCKS: u64 = 1 << 40;
 // through the allocator rather than returning a mount error. The format's ceiling and the
 // machine's are different numbers, and only one of them was being checked.
 pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
+	#[cfg(test)]
+	if inject::should_fail() {
+		return Err(FsError::NoSpace);
+	}
 	let mut v: Vec<u8> = Vec::new();
 	v.try_reserve_exact(len).map_err(|_| FsError::NoSpace)?;
 	v.resize(len, 0);
 	Ok(v)
+}
+
+// Deterministic refusal of the Nth `try_zeroed`, so the paths that must SURVIVE a refused
+// allocation can be exercised without exhausting the host.
+//
+// The genuine trigger - the machine running out between two allocations of the same size -
+// cannot be reached by a test that only chooses `num_blocks`: if the first map fits, so
+// does the second. So the paths that answer a refusal were unreachable, which is how one
+// of them came to answer it by returning silently and another by blaming the disk.
+//
+// The budget is a THREAD-LOCAL, because `cargo test` runs tests in parallel and a global
+// switch would inject into whichever test happened to be allocating at the time. That is
+// the same mistake as the kernel's per-CPU version of this, for the same reason.
+#[cfg(test)]
+pub(crate) mod inject {
+	use core::cell::Cell;
+
+	std::thread_local! {
+		// how many more `try_zeroed` calls succeed before one is refused; `None` is disarmed.
+		static BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+	}
+
+	// Let `successes` further allocations through, then refuse every one after that until
+	// `disarm`. Armed for the calling thread only, which is the test that armed it.
+	pub(crate) fn fail_after(successes: usize) {
+		BUDGET.with(|b| b.set(Some(successes)));
+	}
+
+	pub(crate) fn disarm() {
+		BUDGET.with(|b| b.set(None));
+	}
+
+	pub(super) fn should_fail() -> bool {
+		BUDGET.with(|b| match b.get() {
+			None => false,
+			Some(0) => true,
+			Some(n) => {
+				b.set(Some(n - 1));
+				false
+			}
+		})
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,9 +600,14 @@ impl Inode {
 	// A type byte that is neither TYPE_FILE nor TYPE_DIR (hostile authoring - the
 	// writer never emits one) parses file-shaped, by DECISION, and lands harmless
 	// end to end: reads and writes refuse it (their TYPE_FILE gates fail), a listing
-	// shows it inert, the mark walks reserve nothing for it (neither type branch),
-	// and `remove` can always clear it - the operator's repair verb works. A change
-	// to any `type` branching must keep that story consistent.
+	// shows it inert, the mark walks reserve its blocks as the file it parses as,
+	// `remove` clears it AND returns those blocks, and the structural pass names the
+	// type. A change to any `type` branching must keep that story consistent -
+	// "file-shaped unless it is a directory" is the rule, and the two ends of it
+	// (reserve, release) have to be read together or the space is held until the next
+	// remount. The one thing that stops a `remove` is a spill chain that cannot be
+	// read, which refuses rather than drop blocks it cannot enumerate - the same
+	// answer a TYPE_FILE inode with the same damage gets.
 	fn parse(buf: &[u8]) -> Inode {
 		let r#type = buf[INO_TYPE_OFF];
 		let mut owner_tag = [0u8; OWNER_TAG_LEN];

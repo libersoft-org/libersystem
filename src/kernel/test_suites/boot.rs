@@ -267,20 +267,11 @@ fn system_volume_lands_in_a_gpt_partition() {
 	const PART_BLOCKS: u64 = 4096; // 16 MB
 	const PART_LAST: u64 = PART_FIRST + PART_BLOCKS * 8 - 1;
 
+	// a complete GPT - protective MBR, primary and backup headers, a checksummed entry array
+	// - naming a LiberFS partition. The checksums are real: the probe verifies both of them
+	// now, and a hand-assembled header without them would be testing the refusal path.
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
-	// the GPT header at LBA 1: signature, entry-array LBA, entry count and size.
-	let mut header = alloc::vec![0u8; 512];
-	header[0..8].copy_from_slice(b"EFI PART");
-	header[72..80].copy_from_slice(&2u64.to_le_bytes());
-	header[80..84].copy_from_slice(&128u32.to_le_bytes());
-	header[84..88].copy_from_slice(&128u32.to_le_bytes());
-	disk.insert(1, header);
-	// entry 0 at LBA 2: the LiberFS type GUID (on-disk byte order) and the span.
-	let mut entries = alloc::vec![0u8; 512];
-	entries[0..16].copy_from_slice(&[0x53, 0x46, 0x42, 0x4C, 0x01, 0x00, 0x00, 0x40, 0x80, 0x00, 0x4C, 0x69, 0x62, 0x65, 0x72, 0x46]);
-	entries[32..40].copy_from_slice(&PART_FIRST.to_le_bytes());
-	entries[40..48].copy_from_slice(&PART_LAST.to_le_bytes());
-	disk.insert(2, entries);
+	lay_gpt(&mut disk, CAPACITY / 512, &[(partition::LIBERFS_TYPE_GUID, PART_FIRST, PART_LAST)]);
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
 	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
@@ -336,19 +327,11 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	let expected_pool: u64 = (CAPACITY - FALLBACK_START_SECTOR * 512) / 4096;
 
+	// a complete, correctly checksummed GPT whose only LiberFS-typed entry spans 8 sectors:
+	// syntactically valid, unusably small. The table itself is beyond reproach, so what the
+	// service refuses is the entry.
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
-	let mut header = alloc::vec![0u8; 512];
-	header[0..8].copy_from_slice(b"EFI PART");
-	header[72..80].copy_from_slice(&2u64.to_le_bytes());
-	header[80..84].copy_from_slice(&128u32.to_le_bytes());
-	header[84..88].copy_from_slice(&128u32.to_le_bytes());
-	disk.insert(1, header);
-	// a LiberFS-typed entry spanning 8 sectors: syntactically valid, unusably small.
-	let mut entries = alloc::vec![0u8; 512];
-	entries[0..16].copy_from_slice(&[0x53, 0x46, 0x42, 0x4C, 0x01, 0x00, 0x00, 0x40, 0x80, 0x00, 0x4C, 0x69, 0x62, 0x65, 0x72, 0x46]);
-	entries[32..40].copy_from_slice(&100u64.to_le_bytes());
-	entries[40..48].copy_from_slice(&107u64.to_le_bytes());
-	disk.insert(2, entries);
+	lay_gpt(&mut disk, CAPACITY / 512, &[(partition::LIBERFS_TYPE_GUID, 100, 107)]);
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
 	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
@@ -379,6 +362,102 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	assert_eq!(disk.get(&2), Some(&entries_before), "the partition entry array must be untouched");
 	assert!(disk.get(&FALLBACK_START_SECTOR).is_none_or(|s| &s[0..8] != b"LIBERFS1"), "no filesystem may be laid over a partition table");
 	let _ = expected_pool;
+}
+
+// Start StorageService on `disk` and report whether it came online, leaving `disk` as the
+// service left it. The shared body of the refusal cases below, which are all the same
+// experiment on different media: give the service a disk that is not blank, and look at what
+// the disk says afterwards.
+fn storage_on_disk(disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) -> bool {
+	use object::channel::Channel;
+	use object::rights::Rights;
+	let (_volume, package) = scenario_packages().expect("boot modules should be present");
+	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
+	let (boot_kernel, boot_user) = Channel::create();
+	let (blk_host, blk_child) = Channel::create();
+	let (serve_server, _serve_client) = Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
+	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
+	for _ in 0..100_000 {
+		sched::run_until_idle();
+		pump_block_stand_in(&blk_host, disk, capacity);
+		if let Ok(report) = boot_kernel.recv() {
+			assert_eq!(&report.bytes[..], b"StorageService: online", "if it reports at all it reports online");
+			return true;
+		}
+	}
+	false
+}
+
+tagged_test!(an_mbr_partitioned_disk_is_not_a_disk_to_format, [Service, Storage, Filesystem, Slow]);
+fn an_mbr_partitioned_disk_is_not_a_disk_to_format() {
+	use alloc::collections::BTreeMap;
+
+	// The headline case of the third audit. The probe answered "raw disk" for anything whose
+	// LBA 1 lacked the GPT signature, and LBA 1 of an MBR disk holds whatever the boot loader
+	// put there - so an ordinary MBR-partitioned disk was formatted from sector ZERO, over
+	// the partition table and every partition it named.
+	//
+	// LBA 1 is never even looked at here. The evidence is at LBA 0, which the old probe did
+	// not read.
+	const CAPACITY: u64 = 64 * 1024 * 1024;
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	let mut mbr = alloc::vec![0u8; 512];
+	mbr[446 + 4] = 0x83; // one Linux partition
+	mbr[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+	mbr[446 + 12..446 + 16].copy_from_slice(&100_000u32.to_le_bytes());
+	mbr[510] = 0x55;
+	mbr[511] = 0xAA;
+	disk.insert(0, mbr.clone());
+
+	assert!(!storage_on_disk(&mut disk, CAPACITY), "a disk with an MBR partition table is not a disk to format");
+	assert_eq!(disk.get(&0), Some(&mbr), "the partition table must be exactly as it was");
+	assert_eq!(disk.len(), 1, "nothing at all may be written to a disk that belongs to something else");
+}
+
+tagged_test!(a_foreign_superfloppy_is_not_a_disk_to_format, [Service, Storage, Filesystem, Slow]);
+fn a_foreign_superfloppy_is_not_a_disk_to_format() {
+	use alloc::collections::BTreeMap;
+
+	// A USB stick as most of the world ships them: FAT laid straight onto the medium at LBA
+	// 0, with no partition table anywhere. Every partition-table check passes, which is
+	// exactly why this one needs a filesystem recogniser behind it - the old probe found no
+	// GPT, called the disk raw, and formatted over somebody's files.
+	const CAPACITY: u64 = 64 * 1024 * 1024;
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	let mut boot = alloc::vec![0u8; 512];
+	boot[0] = 0xEB;
+	boot[1] = 0x3C;
+	boot[2] = 0x90;
+	boot[3..11].copy_from_slice(b"MSDOS5.0");
+	boot[54..59].copy_from_slice(b"FAT16");
+	boot[510] = 0x55;
+	boot[511] = 0xAA;
+	disk.insert(0, boot.clone());
+
+	assert!(!storage_on_disk(&mut disk, CAPACITY), "a disk carrying a filesystem is not a disk to format");
+	assert_eq!(disk.get(&0), Some(&boot), "the boot sector must be exactly as it was");
+	assert_eq!(disk.len(), 1, "nothing may be written over somebody else's filesystem");
+}
+
+tagged_test!(a_volume_on_the_whole_device_survives_a_remount, [Service, Storage, Filesystem, Slow]);
+fn a_volume_on_the_whole_device_survives_a_remount() {
+	use alloc::collections::BTreeMap;
+
+	// The other side of the recogniser above, and the one that would break every second boot
+	// if it were got wrong: the fixed whole-device layout puts this system's OWN superblock
+	// at LBA 0 with no partition table, which is precisely the shape a superfloppy has. It
+	// must be mounted, not refused as foreign and not formatted as blank.
+	const CAPACITY: u64 = 64 * 1024 * 1024;
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	assert!(storage_on_disk(&mut disk, CAPACITY), "a blank disk is formatted");
+	let volume = disk.clone();
+	assert_eq!(&volume.get(&0).expect("the format wrote superblock slot 0")[0..8], b"LIBERFS1");
+
+	// second boot, same disk.
+	assert!(storage_on_disk(&mut disk, CAPACITY), "and the volume it laid down mounts again");
+	assert_eq!(disk.get(&0), volume.get(&0), "a remount does not rewrite the volume it found");
 }
 
 tagged_test!(garbage_where_the_superblock_should_be_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);

@@ -36,6 +36,10 @@ liberfs = { path = "../../../fs/liberfs" }
 # LiberMemFS: the writable in-memory volumes (vol://ram, vol://tmp).
 libermemfs = { path = "../../../fs/libermemfs" }
 
+# What a raw disk actually IS, decided before anything is written to it. The one
+# answer that licenses formatting a whole device comes from here.
+partition = { path = "../../../fs/partition" }
+
 # The read-only FAT12/16/32 and exFAT backend StorageService mounts on a second
 # virtio-blk disk for the foreign-media volume.
 fat = { path = "../../../fs/fat" }

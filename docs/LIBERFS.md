@@ -249,8 +249,20 @@ feature-flag bit and update this section.
   is position-independent.
 - The **container** is either a GPT partition whose type GUID is
   `4C424653-0001-4000-8000-4C6962657246` (the LiberFS partition type), or - on a
-  LiberSystem factory disk without a GPT - the fixed region starting at
-  512-byte sector 32768 (16 MB in, past the boot archive).
+  disk with no partition table at all - the whole device, block 0 being 512-byte
+  sector 0. (It used to be sector 32768, clearing a factory archive at the start
+  of the disk; that archive was retired in M0138 and there is nothing in front of
+  the volume to skip.)
+- Which of those two applies is decided **before anything is written**, and only
+  one answer permits laying a filesystem over a whole device: LBA 0 and LBA 1
+  both read, carrying no MBR partition entry, no protective MBR, no GPT, and no
+  recognisable foreign filesystem. A GPT that IS present is verified rather than
+  believed - both CRC32s (the UEFI CRC-32, polynomial 0xEDB88320, *not* the
+  CRC32C above), every header LBA relation, and every span against the device's
+  real capacity - and a partition must lie wholly inside the declared usable
+  range. "I could not tell" is never "there is nothing here": an unreadable
+  sector, a damaged table, an MBR disk and a filesystem written straight onto the
+  medium each leave the disk untouched and say which they were.
 - The checksum everywhere is **CRC32C** (Castagnoli): polynomial 0x1EDC6F41
   (reflected 0x82F63B78), reflected input/output, initial value and final XOR
   0xFFFFFFFF. Test vector: `crc32c("123456789") = 0xE3069283`.

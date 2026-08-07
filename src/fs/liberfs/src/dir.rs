@@ -171,6 +171,14 @@ impl<D: BlockDevice> LiberFs<D> {
 	//
 	// `stop_early` lets a caller that only needs to know whether ANY entry exists stop at
 	// the first one instead of building the whole list.
+	//
+	// The stack is LIFO, so children are pushed in REVERSE and child 0 pops first. Pushing
+	// them forwards popped the last child first, which reverses the leaf GROUPS while
+	// leaving the records inside each leaf sorted - so a directory small enough to be one
+	// leaf listed correctly and any directory with an internal node listed backwards
+	// through `list` and `read_dir`, both of which this method documents as key-ordered.
+	// Every directory test fit in a single leaf, where LIFO and FIFO are the same thing,
+	// which is why nothing noticed.
 	pub(crate) fn collect_dir_entries_bounded(&mut self, root: u64, root_crc: u32, out: &mut Vec<(Vec<u8>, u32)>, depth: usize, stop_early: bool) -> Result<(), FsError> {
 		if root == 0 {
 			return Ok(());
@@ -180,8 +188,15 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut stack: Vec<(u64, u32, usize)> = vec![(root, root_crc, depth)];
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		while let Some((ptr, crc, left)) = stack.pop() {
+			// Only the ROOT may be absent, and it was handled above - so a zero reaching
+			// here came out of a child slot of an internal node, which is an impossible
+			// shape rather than an empty corner: a B+tree node routes a whole key interval
+			// into every one of its `count + 1` slots, and a slot pointing nowhere means
+			// every name in that interval resolves to nothing while the entry counts still
+			// add up. This used to `continue`, so such a directory listed short and looked
+			// healthy.
 			if ptr == 0 {
-				continue;
+				return Err(FsError::Corrupt);
 			}
 			if left == 0 || ptr >= self.num_blocks {
 				return Err(FsError::Corrupt);
@@ -199,7 +214,9 @@ impl<D: BlockDevice> LiberFs<D> {
 					}
 				}
 			} else {
-				for i in 0..=internal_count(&buf) {
+				// reverse, so the LIFO stack pops child 0 first and the walk is a
+				// left-to-right depth-first one - which is what "in key order" means.
+				for i in (0..=internal_count(&buf)).rev() {
 					stack.push((child_ptr(&buf, i), child_crc(&buf, i), left - 1));
 				}
 			}
@@ -606,21 +623,41 @@ pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 	}
 	let mut segs = Vec::new();
 	for seg in path.split(|&b| b == b'/') {
-		if seg.is_empty() || seg == b"." || seg == b".." {
-			return Err(FsError::BadName);
-		}
-		if seg.len() > NAME_MAX {
-			return Err(FsError::TooLong);
-		}
-		if core::str::from_utf8(seg).is_err() {
-			return Err(FsError::BadName);
-		}
-		if seg.iter().any(|&c| !is_portable_name_byte(c)) {
-			return Err(FsError::BadName);
-		}
+		validate_name_segment(seg)?;
 		segs.push(seg);
 	}
 	Ok(segs)
+}
+
+// Is `seg` a name this filesystem can address? The ONE answer, used both by
+// `split_segments` (the write side, deciding what may be created) and by the structural
+// pass (the read side, deciding what a record found on the medium may claim to be).
+//
+// They were two answers. The path API refused invalid UTF-8, empty segments, `.` and
+// `..`, control characters, the reserved punctuation set, NUL and over-long names; the
+// directory checker knew two of those eight. So a record named `..`, or `a/b`, or one
+// carrying a control byte, passed an `fsck` that reported the directory clean - and no
+// path the API can build ever reaches it afterwards, because the API refuses to spell it.
+// A checker weaker than the writer cannot notice an image the writer could not have
+// produced, which is most of what a checker is for.
+//
+// `/` is in the set even though `split_segments` can never hand it one (it splits on it):
+// a record READ off the medium can carry it, and a name with a separator inside it
+// resolves to a path that names something else entirely.
+pub(crate) fn validate_name_segment(seg: &[u8]) -> Result<(), FsError> {
+	if seg.is_empty() || seg == b"." || seg == b".." {
+		return Err(FsError::BadName);
+	}
+	if seg.len() > NAME_MAX {
+		return Err(FsError::TooLong);
+	}
+	if core::str::from_utf8(seg).is_err() {
+		return Err(FsError::BadName);
+	}
+	if seg.iter().any(|&c| c == b'/' || !is_portable_name_byte(c)) {
+		return Err(FsError::BadName);
+	}
+	Ok(())
 }
 
 // Is byte `c` allowed in a portable file name? Rejects NUL and control bytes (0x00..=0x1F

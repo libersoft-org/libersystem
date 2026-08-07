@@ -2213,6 +2213,62 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 // nothing in front of it to skip and it starts at the beginning of its container.
 const FALLBACK_START_SECTOR: u64 = 0;
 
+// Lay a complete, correctly checksummed GPT - protective MBR, primary header, entry array,
+// and the backup copy at the far end - into a sparse sector map, naming `entries` as
+// (type GUID, first LBA, last LBA).
+//
+// Real checksums, because the probe checks them now. A test that hand-assembles a header
+// without them is testing the refusal path whatever else it claims to be about, and the two
+// GPT tests here did exactly that until the probe grew teeth.
+fn lay_gpt(disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity_sectors: u64, entries: &[([u8; 16], u64, u64)]) {
+	const SECTOR: usize = 512;
+	const NUM_ENTRIES: u64 = 128;
+	const ENTRY_SIZE: usize = 128;
+	let array_sectors: u64 = NUM_ENTRIES * ENTRY_SIZE as u64 / SECTOR as u64;
+	let first_usable: u64 = 2 + array_sectors;
+	let last_usable: u64 = capacity_sectors - array_sectors - 2;
+
+	let mut mbr = alloc::vec![0u8; SECTOR];
+	mbr[446 + 4] = 0xEE;
+	mbr[446 + 12..446 + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+	mbr[510] = 0x55;
+	mbr[511] = 0xAA;
+	disk.insert(0, mbr);
+
+	let mut array = alloc::vec![0u8; (NUM_ENTRIES * ENTRY_SIZE as u64) as usize];
+	for (i, (guid, first, last)) in entries.iter().enumerate() {
+		let off = i * ENTRY_SIZE;
+		array[off..off + 16].copy_from_slice(guid);
+		array[off + 16..off + 24].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+		array[off + 32..off + 40].copy_from_slice(&first.to_le_bytes());
+		array[off + 40..off + 48].copy_from_slice(&last.to_le_bytes());
+	}
+	let array_crc = partition::crc32(&array);
+
+	let mut header = |header_lba: u64, backup_lba: u64, entries_lba: u64| {
+		for (i, chunk) in array.chunks(SECTOR).enumerate() {
+			disk.insert(entries_lba + i as u64, chunk.to_vec());
+		}
+		let mut hdr = alloc::vec![0u8; SECTOR];
+		hdr[0..8].copy_from_slice(b"EFI PART");
+		hdr[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+		hdr[12..16].copy_from_slice(&92u32.to_le_bytes());
+		hdr[24..32].copy_from_slice(&header_lba.to_le_bytes());
+		hdr[32..40].copy_from_slice(&backup_lba.to_le_bytes());
+		hdr[40..48].copy_from_slice(&first_usable.to_le_bytes());
+		hdr[48..56].copy_from_slice(&last_usable.to_le_bytes());
+		hdr[72..80].copy_from_slice(&entries_lba.to_le_bytes());
+		hdr[80..84].copy_from_slice(&(NUM_ENTRIES as u32).to_le_bytes());
+		hdr[84..88].copy_from_slice(&(ENTRY_SIZE as u32).to_le_bytes());
+		hdr[88..92].copy_from_slice(&array_crc.to_le_bytes());
+		let crc = partition::crc32(&hdr[..92]);
+		hdr[16..20].copy_from_slice(&crc.to_le_bytes());
+		disk.insert(header_lba, hdr);
+	};
+	header(1, capacity_sectors - 1, 2);
+	header(capacity_sectors - 1, 1, capacity_sectors - 1 - array_sectors);
+}
+
 // Serve pending raw-block-protocol requests (read/write/capacity/flush) over a sparse
 // in-memory sector map: the stand-in block driver behind the StorageService layout
 // tests.
