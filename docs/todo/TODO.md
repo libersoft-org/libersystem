@@ -193,7 +193,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0142 - Gates that stopped checking](M0142.md)
 - [x] [M0143 - LiberFS: what a mount may not do, and what a checksum does not prove](M0143.md)
 - [x] [M0144 - LiberFS: what a mount may still lose, and what a parser may not quietly repair](M0144.md)
-- [x] [M0145 - The kernel's lowest layers do not yet keep the promises the upper ones make](M0145.md)
+- [ ] [M0145 - The kernel's lowest layers do not yet keep the promises the upper ones make](M0145.md)
 - [ ] [M0146 - What M0144 left in the disk probe, and three gaps it opened itself](M0146.md)
 - [ ] [M0147 - A wait set the kernel keeps](M0147.md)
 
