@@ -203,24 +203,25 @@ trust)
 	;;
 esac
 
-# What changed.
+# What changed, asked of the model rather than parsed here.
 #
-# KNOWN GAP, tracked in M0148: porcelain reports a rename as `old -> new` and this keeps only the
-# NEW path. The old one is discarded, not - as this comment used to claim - handed to the model as
-# an unknown path. Moving a file OUT of a component therefore does not select that component, and a
-# rename into `docs/` can look like nothing changed at all. The fix is to move diff parsing into
-# `verify-model` (porcelain v2, both sides of a rename, deletions as the old path) so the regression
-# corpus and this script parse a change the same way instead of two ways.
+# It WAS parsed here, with two `sed` expressions, and it was wrong: porcelain reports a rename as
+# `old -> new` and the shell kept only the new path, so moving a file out of a component did not
+# select that component and a rename into `docs/` looked like nothing had changed. The regression
+# corpus used a third spelling - `git diff --name-only` - so it could not catch that either.
+#
+# One parser now, in `verify-model`, over the machine-readable formats, returning BOTH sides of a
+# rename. The corpus calls the same function.
 case "$mode" in
 for-change)
-	changed="$(git status --porcelain 2>/dev/null | sed 's/^...//' | sed 's/.* -> //' | grep -v '^$' || true)"
+	changed="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- changes)" || planner_failed "the planner could not read what changed"
 	[[ -n "$changed" ]] || die "--for-change: the working tree is clean (use --for PATH, or --release)"
 	;;
 for)
 	changed="$(printf '%s\n' "$paths" | tr ',' '\n' | grep -v '^$')"
 	;;
 for-range)
-	changed="$(git diff --name-only "$range" 2>/dev/null || true)"
+	changed="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- changes --range "$range")" || planner_failed "the planner could not read the range '$range'"
 	[[ -n "$changed" ]] || die "--for-range: '$range' touched no files (or is not a range git knows)"
 	;;
 esac
@@ -247,30 +248,35 @@ fi
 
 if [[ "$action" == shadow ]]; then
 	# DRY shadow: the scoped set is COMPUTED and never run. One boot serves both answers, which is
-	# the whole economy of it - the expensive version runs the selection and then the full suite,
-	# and against a 6104-second riscv64 sweep that second boot is not cosmetic.
+	# the whole economy of it - the expensive version runs the selection and then the full suite, and
+	# against a 6104-second riscv64 sweep that second boot is not cosmetic.
 	#
-	# What this cannot validate is the execution mechanism itself - test ordering, state leaking
-	# between selected tests, the selection plumbing. That needs a run of S, and it is sampled
-	# rather than routine.
-	digest_before="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
+	# Pinned to the SOURCE, not to the model hash. Comparing model hashes was the first attempt and it
+	# does not close the race: an ordinary edit to a `.rs` file changes what the sweep is testing and
+	# leaves the model's identity untouched, so a tree edited during a multi-hour emulated run passed
+	# the check. What has to hold still is the thing being tested.
+	source_before="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)" || planner_failed "could not digest the tree"
+	model_before="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
 	targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- booted --stdin)" || planner_failed "the planner could not name the targets"
 	[[ -n "$targets" ]] || planner_failed "the plan named no target to sweep"
 	note "shadow: full sweep on ${targets//$'\n'/ }, compared against a selection that is not run"
+	note "        pinned to source $source_before"
 	for target in $targets; do
 		./test.sh --arch "$target" || note "the $target sweep did not pass - the comparison below reads its log anyway, which is the point"
 		log="$(find "$BUILD_DIR/logs/test" -name "$target-*-guest.log" -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)"
 		[[ -n "$log" ]] || die "no $target guest log to compare against"
 		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --guest-log "../$log" --arch "$target") || shadow_failed=1
 	done
-	# A comparison across a tree that moved compares two different systems. The digest is the model's
-	# rather than the file set's because that is what the verdict is filed against.
-	digest_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
-	if [[ "$digest_before" != "$digest_after" ]]; then
-		die "the model changed while the sweep ran ($digest_before -> $digest_after); the comparison judged two different systems and is void"
+	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"
+	model_after="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
+	if [[ "$source_before" != "$source_after" || "$model_before" != "$model_after" ]]; then
+		die "the tree moved while the sweep ran, so the comparison judged two different systems and is void.
+    source: $source_before -> $source_after
+    model:  $model_before -> $model_after
+    Use ./verify.sh --sweep for a comparison that cannot be overtaken, or leave the tree alone while this runs."
 	fi
-	[[ -z "${shadow_failed:-}" ]] || die "shadow reported a candidate miss - confirm it before charging it to the selector"
-	note "shadow: no evidence against the selection"
+	[[ -z "${shadow_failed:-}" ]] || die "shadow did not come back Consistent - see the verdict above; a candidate miss must be confirmed before it is charged to the selector"
+	note "shadow: no evidence against the selection, over a tree that did not move"
 	exit 0
 fi
 
@@ -358,6 +364,38 @@ if ((${#failed[@]} > 0)); then
 	die "${#failed[@]} of $count step(s) failed: ${failed[*]}"
 fi
 note "all $count step(s) passed"
+
+# What that green is WORTH, said before anything else.
+#
+# The design's rule is that a scoped answer is not believed because it is plausible: until a
+# component has shadow evidence under the current model, a scoped run must not be the only thing
+# standing behind a green. That rule existed in prose while the runner executed its plan regardless
+# of any component's level, which is the gap between "we have a trust model" and "we use one".
+#
+# It reports rather than refuses, because refusing would make the tool unusable - nothing is TRUSTED
+# yet and nothing can be until shadow comparisons accumulate. Set VERIFY_REQUIRE_TRUST=1 to make an
+# unproven scoped run a failure instead, which is the strict contract for anyone who wants it.
+level_line="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- level --stdin 2>/dev/null || true)"
+level="${level_line%%$'\t'*}"
+case "$level" in
+FULL)
+	note "verification level: FULL - everything ran, this stands on its own"
+	;;
+TRUSTED)
+	note "verification level: TRUSTED - every changed component has shadow evidence under this model"
+	;;
+SHADOW)
+	note "verification level: SHADOW - ${level_line#*$'\t'} has no shadow evidence under this model yet."
+	note "     A scoped green is good evidence and NOT equivalent to a full verification."
+	note "     ./verify.sh --shadow  proves the selection for this change; ./verify.sh --sweep  sidesteps it."
+	if [[ "${VERIFY_REQUIRE_TRUST:-0}" == "1" ]]; then
+		die "VERIFY_REQUIRE_TRUST is set and this change touches components with no shadow evidence"
+	fi
+	;;
+*)
+	note "verification level: unknown - the planner could not judge it, so treat this as scoped-only"
+	;;
+esac
 
 # What this run did NOT cover, said out loud rather than left to be noticed.
 #

@@ -26,7 +26,9 @@ usage: verify-model <command> [options]
   owner PATH...                       which component owns each path, and why
   check                               the model's own gates: ownership, graph and catalog
   shadow --guest-log F --arch A       compare a full sweep against what a change would have scoped
+  level --stdin                       what a scoped answer about this change is worth
   trust [--grant COMPONENT]           what is TRUSTED under the current model, and why not
+  changes [--range A..B]              what changed, both sides of every rename, one path per line
   age                                 which keys have not run inside the window
   record --keys-file F [--failed]     record a step's outcome against the keys it discharged
   model-hash                          the hash TRUSTED evidence is bound to
@@ -64,6 +66,7 @@ fn run() -> Result<ExitCode, String> {
 	let mut guest_log: Option<String> = None;
 	let mut architecture: Option<String> = None;
 	let mut grant: Option<String> = None;
+	let mut range: Option<String> = None;
 	let mut passed = true;
 	let mut seconds = 0.0f64;
 	let mut positional: Vec<String> = Vec::new();
@@ -92,6 +95,10 @@ fn run() -> Result<ExitCode, String> {
 				index += 1;
 				architecture = Some(arguments.get(index).ok_or("--arch needs a value")?.clone());
 			}
+			"--range" => {
+				index += 1;
+				range = Some(arguments.get(index).ok_or("--range needs a value like A..B")?.clone());
+			}
 			"--grant" => {
 				index += 1;
 				grant = Some(arguments.get(index).ok_or("--grant needs a component")?.clone());
@@ -119,7 +126,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "booted" | "age" | "record" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "booted" | "changes" | "age" | "record" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
 	{
 		command = positional.remove(0);
 	}
@@ -133,6 +140,25 @@ fn run() -> Result<ExitCode, String> {
 	let model = Model::load(&repo_root)?;
 
 	match command.as_str() {
+		// The digest a shadow comparison is pinned to: HEAD plus the bytes of every dirty file.
+		// Separate from the model hash because they answer different questions - the model hash asks
+		// "would the selector decide differently", and this asks "is this still the same system".
+		// The directories whose content can end up in the system volume, DERIVED.
+		//
+		// `lib.sh` carries this as a hand-written list and it was wrong: CoreServices statically
+		// links `src/term` and the list did not contain it, so editing the terminal stack could
+		// compile a new CoreServices, skip packaging, and leave `test.sh`'s staleness check content
+		// that the volume was fresh - a guest booting the previous userspace and passing.
+		"volume-sources" => {
+			for directory in volume_sources(&model) {
+				println!("{directory}");
+			}
+			Ok(ExitCode::SUCCESS)
+		}
+		"source-digest" => {
+			println!("{}", verify_model::shadow::source_digest(&repo_root)?);
+			Ok(ExitCode::SUCCESS)
+		}
 		"model-hash" => {
 			println!("{}", model.model_hash());
 			Ok(ExitCode::SUCCESS)
@@ -186,12 +212,25 @@ fn run() -> Result<ExitCode, String> {
 			Ok(ExitCode::SUCCESS)
 		}
 		"check" => self_check(&model),
+		// The one diff parser. `verify.sh` and the regression corpus both come through here, which
+		// is the point: they used to parse a change two different ways, and the corpus therefore
+		// could not catch the defect in the way production did it.
+		"changes" => {
+			let changes = match &range {
+				Some(range) => verify_model::changes::range(&repo_root, range)?,
+				None => verify_model::changes::working_tree(&repo_root)?,
+			};
+			for path in verify_model::changes::paths(&changes) {
+				println!("{path}");
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		// Which targets a change must be booted on, one per line. A separate command because the
 		// shell should not be grepping architecture names out of JSON: every decision that needs the
 		// model belongs in the model, and a fragile parse in `verify.sh` is a decision made twice.
 		"booted" => {
 			let ownership = model.ownership();
-			let planner = Planner { registry: &model.registry, graph: &model.graph, ownership: &ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone() };
+			let planner = Planner::for_model(&model, &ownership);
 			let plan = if paths.is_empty() { planner.full_plan(Vec::new(), BTreeSet::new(), BTreeSet::new(), vec![String::from("no changed paths were given")], Vec::new()) } else { planner.plan(&paths) };
 			for architecture in &plan.architectures_booted {
 				println!("{architecture}");
@@ -209,7 +248,7 @@ fn run() -> Result<ExitCode, String> {
 			let text = std::fs::read_to_string(&guest_log).map_err(|error| format!("{guest_log}: {error}"))?;
 			let results = verify_model::shadow::parse_guest_log(&text);
 			let ownership = model.ownership();
-			let planner = Planner { registry: &model.registry, graph: &model.graph, ownership: &ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone() };
+			let planner = Planner::for_model(&model, &ownership);
 			let plan = planner.plan(&paths);
 			let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
 			let history = verify_model::history::History::load(&repo_root)?;
@@ -248,6 +287,32 @@ fn run() -> Result<ExitCode, String> {
 				verify_model::shadow::Verdict::Consistent => ExitCode::SUCCESS,
 				_ => ExitCode::FAILURE,
 			})
+		}
+		// The verification LEVEL of a change: what the scoped answer about it is worth.
+		//
+		// `SHADOW` means no evidence has been gathered that a scoped answer about this component can
+		// be trusted, so a scoped green is good evidence and not a substitute for a full run. That
+		// distinction existed only in prose - `verify.sh` computed a plan and executed it whatever
+		// the level - and this is what makes it consultable.
+		"level" => {
+			if paths.is_empty() {
+				return Err(String::from("level needs the change it is judging (--paths or --stdin)"));
+			}
+			let ownership = model.ownership();
+			let planner = Planner::for_model(&model, &ownership);
+			let plan = planner.plan(&paths);
+			let hash = model.model_hash();
+			let mut store = verify_model::trust::Store::load(&repo_root);
+			store.prune(&hash);
+			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| store.level(component, &hash) == verify_model::trust::Level::Shadow).collect();
+			if plan.full {
+				println!("FULL");
+			} else if untrusted.is_empty() {
+				println!("TRUSTED");
+			} else {
+				println!("SHADOW\t{}", untrusted.iter().map(|component| component.as_str()).collect::<Vec<_>>().join(","));
+			}
+			Ok(ExitCode::SUCCESS)
 		}
 		"trust" => {
 			let hash = model.model_hash();
@@ -350,7 +415,7 @@ fn run() -> Result<ExitCode, String> {
 		// every decision that needed the model is already made by the time it reads this.
 		"commands" => {
 			let ownership = model.ownership();
-			let planner = Planner { registry: &model.registry, graph: &model.graph, ownership: &ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone() };
+			let planner = Planner::for_model(&model, &ownership);
 			let plan = if paths.is_empty() { planner.full_plan(Vec::new(), BTreeSet::new(), BTreeSet::new(), vec![String::from("no changed paths were given")], Vec::new()) } else { planner.plan(&paths) };
 			let mut per_target: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
 			for test in &model.kernel_tests.tests {
@@ -379,7 +444,7 @@ fn run() -> Result<ExitCode, String> {
 			// No paths at all is not "nothing changed" - it is "nobody said what changed", and the
 			// only safe reading of that is everything.
 			let ownership = model.ownership();
-			let planner = Planner { registry: &model.registry, graph: &model.graph, ownership: &ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone() };
+			let planner = Planner::for_model(&model, &ownership);
 			let plan = if paths.is_empty() { planner.full_plan(Vec::new(), BTreeSet::new(), BTreeSet::new(), vec![String::from("no changed paths were given")], Vec::new()) } else { planner.plan(&paths) };
 			// Cost is reported, never used to widen the plan silently. Escalating on an ESTIMATE
 			// would let a bad estimate quietly cost hours; escalating on a measured ratio the reader
@@ -557,12 +622,43 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 		}
 	}
 
+	// `lib.sh`'s VOLUME_SOURCES against the derived answer. A literal list on a hot path is fine; a
+	// literal list nobody checks is how `src/term` and `src/volume` went missing from it, and a
+	// staleness check that cannot see a change lets a guest boot the previous userspace and pass.
+	match std::fs::read_to_string(model.repo_root.join("lib.sh")) {
+		Ok(text) => match text.split("VOLUME_SOURCES=(").nth(1).and_then(|rest| rest.split(')').next()) {
+			Some(list) => {
+				let declared: std::collections::BTreeSet<String> = list.split_whitespace().map(str::to_string).collect();
+				let derived = volume_sources(model);
+				for missing in derived.difference(&declared) {
+					failures.push(format!("lib.sh's VOLUME_SOURCES is missing '{missing}' - a change there can reach the system volume and the staleness check would not see it"));
+				}
+				for extra in declared.difference(&derived) {
+					failures.push(format!("lib.sh's VOLUME_SOURCES names '{extra}', which nothing staged in the volume reaches"));
+				}
+			}
+			None => failures.push(String::from("lib.sh has no VOLUME_SOURCES array to check")),
+		},
+		Err(error) => failures.push(format!("lib.sh: {error}")),
+	}
+
 	// A risk class naming a path that no longer exists is a plan for a tree that has moved on.
 	for rule in &model.registry.risk_classes {
 		if !model.repo_root.join(&rule.path).exists() {
 			failures.push(format!("risk class names '{}', which is not in the tree", rule.path));
 		}
 	}
+	let sensitive: Vec<(&String, &verify_model::archrisk::Risk)> = model.arch_risk.iter().filter(|(_, risk)| risk.any_target || !risk.targets.is_empty()).collect();
+	if !sensitive.is_empty() {
+		println!("verify-model: {} of {} components are architecture-sensitive by mechanical scan - a change to one boots more than the default target:", sensitive.len(), model.graph.components.len());
+		for (component, risk) in sensitive.iter().take(12) {
+			println!("    {:<34} {:<22} {}", component, if risk.any_target { String::from("all targets") } else { risk.targets.iter().cloned().collect::<Vec<_>>().join(",") }, risk.evidence.first().map(String::as_str).unwrap_or(""));
+		}
+		if sensitive.len() > 12 {
+			println!("    ... and {} more", sensitive.len() - 12);
+		}
+	}
+
 	if !model.registry.risk_classes.is_empty() {
 		println!("verify-model: {} kernel subsystem(s) are declared narrowable and NOT narrowed - they still select everything:", model.registry.risk_classes.len());
 		for rule in &model.registry.risk_classes {
@@ -598,6 +694,30 @@ fn universe(model: &Model) -> Vec<verify_model::plan::PlanItemKey> {
 		}
 	}
 	keys
+}
+
+// Everything the volume is assembled FROM: the closure of every staged program and library over the
+// edges that can change a shipped byte, mapped back to the directories those crates live in, plus
+// the factory files and the packager itself.
+//
+// Returned as top-level directories under `src/` rather than as crate paths, because that is what
+// the digest walks and because a new crate under an already-listed directory should not need this
+// to be recomputed by a person.
+fn volume_sources(model: &Model) -> BTreeSet<String> {
+	let mut directories: BTreeSet<String> = BTreeSet::new();
+	for component in verify_model::staged_components(&model.manifest, &model.crates, &model.graph) {
+		if let Some(entry) = model.crates.iter().find(|entry| entry.name == component)
+			&& let Some(top) = entry.dir.strip_prefix("src/").and_then(|rest| rest.split('/').next())
+		{
+			directories.insert(top.to_string());
+		}
+	}
+	// The factory files the volume ships, the interface definitions every protocol is generated
+	// from, and the program that writes the package. None is reached by a dependency edge.
+	directories.insert(String::from("volume"));
+	directories.insert(String::from("tools"));
+	directories.insert(String::from("idl"));
+	directories
 }
 
 fn find_repo_root() -> Result<PathBuf, String> {

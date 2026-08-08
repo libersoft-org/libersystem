@@ -5,7 +5,9 @@
 // regression corpus, the cost estimator, the age scheduler and the person at the terminal all
 // consult ONE selector rather than four that drift.
 
+pub mod archrisk;
 pub mod catalog;
+pub mod changes;
 pub mod commands;
 pub mod crates;
 pub mod graph;
@@ -43,6 +45,8 @@ pub struct Model {
 	pub graph: Graph,
 	pub catalog: Catalog,
 	pub kernel_tests: kerneltests::Discovery,
+	// Which components can behave differently per target, found by scanning rather than declared.
+	pub arch_risk: std::collections::BTreeMap<String, archrisk::Risk>,
 }
 
 impl Model {
@@ -53,9 +57,11 @@ impl Model {
 		let graph = Graph::build(&crates, &manifest, &registry);
 		graph.validate(&crates, &registry)?;
 		let kernel_tests = kerneltests::discover(repo_root, &registry::ARCHITECTURES)?;
-		let catalog = Catalog::build(&crates, &registry, &graph, &kernel_tests.tests);
+		let staged = staged_components(&manifest, &crates, &graph);
+		let catalog = Catalog::build(&crates, &registry, &graph, &staged, &kernel_tests.tests);
 		catalog.validate(&registry)?;
-		Ok(Model { repo_root: repo_root.to_path_buf(), registry, crates, manifest, graph, catalog, kernel_tests })
+		let arch_risk = archrisk::scan(repo_root, &Ownership::new(&registry, &crates))?;
+		Ok(Model { repo_root: repo_root.to_path_buf(), registry, crates, manifest, graph, catalog, kernel_tests, arch_risk })
 	}
 
 	pub fn ownership(&self) -> Ownership<'_> {
@@ -81,6 +87,10 @@ impl Model {
 		for edge in &self.graph.edges {
 			hasher.update(format!("{} {} {}\n", edge.from, edge.kind, edge.to).as_bytes());
 		}
+		hasher.update(b"\narch-risk\n");
+		for (component, risk) in &self.arch_risk {
+			hasher.update(format!("{component} {} {}\n", risk.any_target, risk.targets.iter().cloned().collect::<Vec<_>>().join("+")).as_bytes());
+		}
 		hasher.update(b"\ncatalog\n");
 		for check in &self.catalog.checks {
 			hasher.update(format!("{} {:?} covers={}\n", check.id, check.kind, check.covers.join("+")).as_bytes());
@@ -97,6 +107,31 @@ impl Model {
 		let tracked = tracked_files(&self.repo_root)?;
 		Ok(ownership.unowned(&tracked))
 	}
+}
+
+// Every component the system volume is assembled from: the closure of each staged program and
+// library over the edges that can change a shipped byte.
+//
+// One computation, used twice - by the catalog, so packaging and volume assembly declare their real
+// inputs, and by the VOLUME_SOURCES gate, so `lib.sh`'s staleness digest cannot fall behind it.
+pub fn staged_components(manifest: &system_manifest::Manifest, crates: &[Crate], graph: &Graph) -> std::collections::BTreeSet<String> {
+	let mut owners: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+	for program in manifest.programs.values() {
+		owners.insert(program.owner.as_str());
+	}
+	for library in manifest.libraries.values() {
+		owners.insert(library.owner.as_str());
+	}
+	let mut components = std::collections::BTreeSet::new();
+	for source in manifest.sources.values() {
+		if !owners.contains(source.owner.as_str()) {
+			continue;
+		}
+		let dir = format!("src/{}", source.path.as_str());
+		let Some(entry) = crates.iter().find(|entry| entry.dir == dir) else { continue };
+		components.extend(graph.reaches(&entry.name, &["link.static", "link.dynamic", "generation.build"]));
+	}
+	components
 }
 
 pub fn tracked_files(repo_root: &Path) -> Result<Vec<String>, String> {

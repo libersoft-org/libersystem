@@ -85,9 +85,22 @@ pub struct Planner<'a> {
 	// Targets whose kernel test list could not be read. They are booted whole rather than scoped,
 	// because an empty enumeration and a target with no affected tests look identical.
 	pub unenumerated_targets: Vec<String>,
+	// What the mechanical scan found. It only ever WIDENS the boot set the policy table produced -
+	// a component with no marker is a candidate for neutral, never a proof of it.
+	pub arch_risk: BTreeMap<String, crate::archrisk::Risk>,
 }
 
-impl Planner<'_> {
+impl<'a> Planner<'a> {
+	// One place builds a planner.
+	//
+	// It was constructed by hand at five call sites, each repeating the same five fields, which is
+	// how a sixth field gets added and one of them silently keeps the old behaviour. The ownership
+	// has to be passed in because it borrows the model's crates and cannot be created here without
+	// outliving the borrow.
+	pub fn for_model(model: &'a crate::Model, ownership: &'a Ownership<'a>) -> Self {
+		Planner { registry: &model.registry, graph: &model.graph, ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone(), arch_risk: model.arch_risk.clone() }
+	}
+
 	pub fn plan(&self, changed: &[String]) -> Plan {
 		let mut full = false;
 		let mut full_reasons: Vec<String> = Vec::new();
@@ -143,6 +156,8 @@ impl Planner<'_> {
 		// Architecture policy: the union over changed paths, because a change touching both an
 		// x86_64 tree and a riscv64 one has to answer for both.
 		let (mut built, mut booted) = (BTreeSet::new(), BTreeSet::new());
+		// Components whose architecture answer came from an explicit rule rather than the default.
+		let mut declared_architecture: BTreeSet<String> = BTreeSet::new();
 		if full || changed.is_empty() {
 			built.extend(ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()));
 			booted.extend(ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()));
@@ -151,11 +166,43 @@ impl Planner<'_> {
 				if verdict.outcome == "not code" {
 					continue;
 				}
-				let rule = self.architecture_rule(&verdict.path);
-				built.extend(rule.0);
-				booted.extend(rule.1);
+				let (rule_build, rule_boot, rule_path) = self.architecture_rule(&verdict.path);
+				built.extend(rule_build);
+				booted.extend(rule_boot);
+				if !rule_path.is_empty() {
+					// An explicit rule outranks the scan. `src/kernel/arch/aarch64` contains `asm!`
+					// on every line that matters, and the scan can only conclude "all targets" from
+					// that - while the policy table knows the precise answer is aarch64. Letting the
+					// scan widen here would spend 6104 s of riscv64 on an aarch64-only change, which
+					// is the cost this milestone exists to avoid rather than to incur.
+					declared_architecture.insert(verdict.outcome.clone());
+				}
 			}
 		}
+		// The mechanical classifier, applied to the components that actually CHANGED.
+		//
+		// A marker proves target-dependence; its absence proves nothing, so this can add targets and
+		// never remove them. `volume-client-provider` is the case it exists for: three `global_asm!`
+		// branches, ordinary-userspace policy, and a riscv64 branch that compiles everywhere and is
+		// only exercised on riscv64.
+		if !full {
+			for component in &seeds {
+				if declared_architecture.contains(component) {
+					continue;
+				}
+				let Some(risk) = self.arch_risk.get(component) else { continue };
+				let widen = risk.boot_targets();
+				let added: Vec<String> = widen.iter().filter(|target| !booted.contains(*target)).cloned().collect();
+				if added.is_empty() {
+					continue;
+				}
+				let why = risk.evidence.first().cloned().unwrap_or_else(|| String::from("a target-specific marker"));
+				warnings.push(format!("{component} is architecture-sensitive ({why}), so {} is booted as well", added.join(", ")));
+				booted.extend(widen.iter().cloned());
+				built.extend(widen);
+			}
+		}
+
 		// A target whose test binary could not be read has NO catalog variants for that target, and
 		// a check with no variants contributes no items - so the plan would quietly boot nothing
 		// there while its header claimed the target was in scope. A missing enumeration and an
@@ -225,7 +272,9 @@ impl Planner<'_> {
 		}
 	}
 
-	fn architecture_rule(&self, path: &str) -> (Vec<String>, Vec<String>) {
+	// Returns the matched rule's PATH as well, because an explicit rule is a more informed answer
+	// than the mechanical scan and must not be widened by it.
+	fn architecture_rule(&self, path: &str) -> (Vec<String>, Vec<String>, String) {
 		let mut best: Option<(usize, &crate::registry::ArchitectureRule)> = None;
 		for rule in &self.registry.architecture {
 			if let Some(len) = prefix_match(&rule.path, path)
@@ -235,10 +284,10 @@ impl Planner<'_> {
 			}
 		}
 		match best {
-			Some((_, rule)) => (rule.build.clone(), rule.boot.clone()),
+			Some((_, rule)) => (rule.build.clone(), rule.boot.clone(), rule.path.clone()),
 			// Unreachable while the registry validates a default rule exists, and still handled:
 			// the answer to "no architecture answer" is every architecture.
-			None => (ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()).collect(), ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()).collect()),
+			None => (ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()).collect(), ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()).collect(), String::new()),
 		}
 	}
 

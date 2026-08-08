@@ -76,6 +76,23 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> 
 		steps.push(Step { label: format!("kernel suite {architecture}"), command: format!("./test.sh --arch {architecture}"), keys: selected.clone(), note });
 	}
 
+	// Every booted architecture gets a guest step, whether or not the catalog has tests for it.
+	//
+	// Guest steps were derived purely from the kernel-test items in the plan, and a target whose test
+	// binary could not be enumerated contributes none - so a plan could report
+	// `booted: x86_64, aarch64, riscv64` and emit no aarch64 boot at all. The escalation that fires
+	// on a missing enumeration made the plan FULL without making the step appear, which is a plan
+	// claiming a target and a run silently skipping it. That is the whole failure mode.
+	//
+	// The added step carries no keys: nothing was enumerated, so there is nothing to record against,
+	// and pretending otherwise would file history for tests the model cannot name.
+	for architecture in &plan.architectures_booted {
+		if kernel_by_arch.contains_key(architecture.as_str()) {
+			continue;
+		}
+		steps.push(Step { label: format!("kernel suite {architecture} (unenumerated)"), command: format!("./test.sh --arch {architecture}"), keys: Vec::new(), note: Some(String::from("the model could not enumerate this target's tests, so the whole suite runs and nothing is recorded against individual keys")) });
+	}
+
 	// The development guest last: it needs an instance `just dev-up` left running, and qemu-run.sh
 	// refuses to combine DEV_PROFILE with TEST, so it can never share a boot with the suite above.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::DevCheck) {

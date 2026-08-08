@@ -107,7 +107,7 @@ fn build_dependencies_are_their_own_edge_kind() {
 
 fn plan_for(model: &Model, paths: &[&str]) -> crate::plan::Plan {
 	let ownership = model.ownership();
-	let planner = Planner { registry: &model.registry, graph: &model.graph, ownership: &ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone() };
+	let planner = Planner::for_model(&model, &ownership);
 	planner.plan(&paths.iter().map(|path| (*path).to_string()).collect::<Vec<_>>())
 }
 
@@ -370,7 +370,8 @@ fn a_catalog_naming_an_undefined_configuration_is_refused() {
 	let manifest = system_manifest::Manifest::load_workspace(&root.join("src")).expect("manifest");
 	let graph = Graph::build(&crates, &manifest, &registry);
 	let kernel_test = KernelTest { name: String::from("t"), architectures: vec![String::from("x86_64")], covers: vec![String::from("kernel")] };
-	let mut catalog = Catalog::build(&crates, &registry, &graph, &kernel_test_slice(&kernel_test));
+	let staged = crate::staged_components(&manifest, &crates, &graph);
+	let mut catalog = Catalog::build(&crates, &registry, &graph, &staged, &kernel_test_slice(&kernel_test));
 	catalog.checks[0].variants[0].configuration = String::from("a-configuration-nobody-defined");
 	let error = catalog.validate(&registry).expect_err("a variant in an undefined configuration cannot be run or keyed");
 	assert!(error.contains("a-configuration-nobody-defined"), "{error}");
@@ -383,7 +384,8 @@ fn a_duplicate_check_id_is_refused() {
 	let registry = Registry::load(&root.join("src/tools/verify-model/model")).expect("the real registry");
 	let manifest = system_manifest::Manifest::load_workspace(&root.join("src")).expect("manifest");
 	let graph = Graph::build(&crates, &manifest, &registry);
-	let mut catalog = Catalog::build(&crates, &registry, &graph, &[]);
+	let staged = crate::staged_components(&manifest, &crates, &graph);
+	let mut catalog = Catalog::build(&crates, &registry, &graph, &staged, &[]);
 	let duplicate = catalog.checks[0].clone();
 	catalog.checks.push(duplicate);
 	let error = catalog.validate(&registry).expect_err("an ID is what age, shadow, cost and regression history are keyed on; two checks sharing one merges four separate records");
@@ -504,9 +506,11 @@ struct Case {
 
 fn changed_paths_for(root: &Path, case: &Case) -> Vec<String> {
 	if let Some(range) = &case.range {
-		let output = std::process::Command::new("git").arg("-C").arg(root).arg("diff").arg("--name-only").arg(range).output().expect("git diff");
-		assert!(output.status.success(), "{}: git diff {range} failed", case.name);
-		let paths: Vec<String> = String::from_utf8_lossy(&output.stdout).lines().map(str::to_string).filter(|line| !line.is_empty()).collect();
+		// The SAME parser production uses. It used to be `git diff --name-only` here and two `sed`
+		// expressions in `verify.sh`, which is precisely why this corpus could not catch the rename
+		// defect in the shell: it was exercising a different reading of the same question.
+		let changes = crate::changes::range(root, range).unwrap_or_else(|error| panic!("{}: {error}", case.name));
+		let paths = crate::changes::paths(&changes);
 		assert!(!paths.is_empty(), "{}: the range {range} touched no files - a corpus case that feeds the planner nothing proves nothing", case.name);
 		return paths;
 	}
@@ -723,4 +727,227 @@ fn only_a_consistent_verdict_counts_as_clean_evidence() {
 	// The same target, cleanly this time, is what actually earns it.
 	log.records.push(record("riscv64", "Consistent"));
 	assert!(store.evaluate("audio", "hash-a", &log).is_ok());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Diff parsing
+//
+// The defect this replaced: `git status --porcelain` reports a rename as `old -> new`, the shell
+// kept only the new path with `sed 's/.* -> //'`, and the old one was discarded. Moving a file out
+// of a component did not select that component. The regression corpus could not catch it because it
+// parsed changes a different way - `git diff --name-only` - so there were two parsers for one
+// question and only one of them was wrong.
+
+use crate::changes::{Kind, parse_name_status, parse_status_v2, paths};
+
+fn nul(records: &[&str]) -> String {
+	let mut text = String::new();
+	for record in records {
+		text.push_str(record);
+		text.push('\0');
+	}
+	text
+}
+
+#[test]
+fn a_rename_is_a_change_to_both_of_its_paths() {
+	// porcelain v2 puts the destination in the record and the ORIGIN in the next NUL-terminated
+	// field, which is the part a naive split loses.
+	let text = nul(&["2 R. N... 100644 100644 100644 aaaa bbbb R100 docs/foo.rs", "src/kernel/foo.rs"]);
+	let changes = parse_status_v2(&text).expect("parses");
+	assert_eq!(changes.len(), 1);
+	assert_eq!(changes[0].kind, Kind::Renamed);
+	assert_eq!(changes[0].path, "docs/foo.rs");
+	assert_eq!(changes[0].origin.as_deref(), Some("src/kernel/foo.rs"));
+	assert_eq!(paths(&changes), vec![String::from("docs/foo.rs"), String::from("src/kernel/foo.rs")], "the old path is a change too - something used to live there and no longer does");
+}
+
+#[test]
+fn a_rename_out_of_a_component_still_selects_that_component() {
+	// The end-to-end version of the defect: a file moved from the kernel into `docs/`. With only the
+	// destination, the plan is "documentation, nothing to do".
+	let model = model();
+	let text = nul(&["2 R. N... 100644 100644 100644 aaaa bbbb R100 docs/moved.rs", "src/kernel/mem/frame/mod.rs"]);
+	let changes = parse_status_v2(&text).expect("parses");
+	let changed = paths(&changes);
+	let borrowed: Vec<&str> = changed.iter().map(String::as_str).collect();
+	let plan = plan_for(&model, &borrowed);
+	assert!(!plan.nothing_to_do, "a rename out of the kernel is not a documentation change");
+	assert!(plan.full, "the kernel is on the selects-everything list, and it lost a file");
+}
+
+#[test]
+fn a_deletion_is_the_path_that_was_deleted() {
+	let changes = parse_status_v2(&nul(&["1 .D N... 100644 100644 000000 aaaa bbbb src/user/libs/audio/flac/src/lib.rs"])).expect("parses");
+	assert_eq!(changes[0].kind, Kind::Deleted);
+	assert_eq!(changes[0].path, "src/user/libs/audio/flac/src/lib.rs");
+}
+
+#[test]
+fn a_path_with_spaces_survives_the_parse() {
+	// The reason for the field-count split and for `-z`: the human-readable formats quote and escape
+	// these, and both shell versions got that wrong.
+	let changes = parse_status_v2(&nul(&["1 .M N... 100644 100644 100644 aaaa bbbb src/a file with spaces.rs"])).expect("parses");
+	assert_eq!(changes[0].path, "src/a file with spaces.rs");
+}
+
+#[test]
+fn untracked_and_copied_and_unmerged_are_all_changes() {
+	let text = nul(&[
+		"? src/new.rs",
+		"2 C. N... 100644 100644 100644 aaaa bbbb C75 src/copy.rs",
+		"src/original.rs",
+		"u UU N... 100644 100644 100644 100644 aaaa bbbb cccc src/conflict.rs",
+		"! ignored.txt",
+	]);
+	let changes = parse_status_v2(&text).expect("parses");
+	assert_eq!(changes.len(), 3, "the ignored file is not a change; the other three are");
+	assert_eq!(paths(&changes), vec![String::from("src/conflict.rs"), String::from("src/copy.rs"), String::from("src/new.rs"), String::from("src/original.rs")]);
+}
+
+#[test]
+fn name_status_puts_the_origin_first_and_porcelain_puts_it_second() {
+	// The two formats disagree about the order, which is exactly the sort of thing one parser gets
+	// right once and two parsers get right at different times.
+	let changes = parse_name_status(&nul(&["R100", "src/kernel/foo.rs", "docs/foo.rs", "D", "src/gone.rs"])).expect("parses");
+	assert_eq!(changes[0].origin.as_deref(), Some("src/kernel/foo.rs"));
+	assert_eq!(changes[0].path, "docs/foo.rs");
+	assert_eq!(changes[1].kind, Kind::Deleted);
+	assert_eq!(changes[1].path, "src/gone.rs");
+}
+
+#[test]
+fn an_unparseable_record_is_an_error_rather_than_a_shrug() {
+	// Silently skipping what it cannot read is how a diff parser reports "nothing changed" over a
+	// change it did not understand.
+	assert!(parse_status_v2(&nul(&["9 something nobody has seen"])).is_err());
+	assert!(parse_status_v2(&nul(&["2 R. N... 100644 100644 100644 aaaa bbbb R100 docs/foo.rs"])).is_err(), "a rename record with no origin field must not be accepted");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The plan and the run must agree about which targets get booted
+
+fn guest_targets(plan: &crate::plan::Plan, per_target: &std::collections::BTreeMap<String, usize>) -> BTreeSet<String> {
+	crate::commands::steps(plan, per_target).iter().filter(|step| step.command.starts_with("./test.sh --arch ")).map(|step| step.command.trim_start_matches("./test.sh --arch ").to_string()).collect()
+}
+
+#[test]
+fn every_booted_architecture_gets_exactly_one_guest_step() {
+	let model = model();
+	let mut per_target: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+	for test in &model.kernel_tests.tests {
+		for architecture in &test.architectures {
+			*per_target.entry(architecture.clone()).or_default() += 1;
+		}
+	}
+	for paths in [vec!["src/user/libs/audio/flac/src/lib.rs"], vec!["src/kernel/arch/riscv64/traps/mod.rs"], vec!["src/boot/qemu-run.sh"]] {
+		let plan = plan_for(&model, &paths);
+		let booted: BTreeSet<String> = plan.architectures_booted.iter().cloned().collect();
+		let steps = crate::commands::steps(&plan, &per_target);
+		let guest: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.command.starts_with("./test.sh --arch ")).collect();
+		assert_eq!(guest_targets(&plan, &per_target), booted, "{paths:?}: the plan says it boots {booted:?} and the run would boot something else");
+		assert_eq!(guest.len(), booted.len(), "{paths:?}: one guest step per booted target, no more");
+	}
+}
+
+// The case the guarantee exists for: a target the model cannot enumerate. Its catalog has no
+// `kernel.*` variants for that target, so nothing derived from plan items can produce its boot.
+#[test]
+fn an_unenumerated_target_that_is_in_scope_is_still_booted() {
+	let model = model();
+	let ownership = model.ownership();
+	// As if `.build` had never held an x86_64 test binary - the state of a fresh checkout.
+	let planner = Planner { unenumerated_targets: vec![String::from("x86_64")], ..Planner::for_model(&model, &ownership) };
+	let plan = planner.plan(&[String::from("src/user/libs/audio/flac/src/lib.rs")]);
+	assert!(plan.full, "the one target this change would boot cannot be enumerated, so nothing scoped can be trusted");
+	let per_target = std::collections::BTreeMap::new();
+	let targets = guest_targets(&plan, &per_target);
+	assert_eq!(targets.len(), 3, "a FULL plan boots all three, and the RUN must do it too - not just the header");
+	for architecture in ["x86_64", "aarch64", "riscv64"] {
+		assert!(targets.contains(architecture), "{architecture} is in architectures_booted and must have a guest step; got {targets:?}");
+	}
+}
+
+// And the other direction, which matters just as much: a target that cannot be enumerated but is
+// NOT in scope changes nothing. Escalating on it would make every plan FULL on a machine that has
+// only ever built one target, which is most machines.
+#[test]
+fn an_unenumerated_target_out_of_scope_does_not_escalate() {
+	let model = model();
+	let ownership = model.ownership();
+	let planner = Planner { unenumerated_targets: vec![String::from("riscv64")], ..Planner::for_model(&model, &ownership) };
+	let plan = planner.plan(&[String::from("src/user/libs/audio/flac/src/lib.rs")]);
+	assert!(!plan.full, "an ordinary userspace change boots x86_64; riscv64 being unenumerable is irrelevant to it");
+	assert_eq!(plan.architectures_booted, vec!["x86_64"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The mechanical architecture classifier
+//
+// The design asked for it and the first implementation shipped without it: only the hand-written
+// path table existed, so a component the table did not anticipate got the ordinary-userspace answer
+// - cross-build everywhere, boot x86_64. Thirteen files under `src/user` contain `global_asm!`.
+
+#[test]
+fn a_userspace_component_with_per_target_assembly_boots_every_target() {
+	// `volume-client-provider` forwards through `global_asm!` with a different instruction per
+	// target - `jmp`, `b`, `tail`. All three compile everywhere; only one of them is ever exercised
+	// by an x86_64 boot.
+	let model = model();
+	let risk = model.arch_risk.get("volume-client-provider").expect("the scan must see it");
+	assert!(risk.any_target || risk.targets.len() > 1, "a component with three assembly branches is not target-neutral: {risk:?}");
+	let plan = plan_for(&model, &["src/user/libs/clients/volume-client-provider/src/lib.rs"]);
+	assert_eq!(plan.architectures_booted, vec!["aarch64", "riscv64", "x86_64"]);
+	assert!(plan.warnings.iter().any(|warning| warning.contains("architecture-sensitive")), "widening the boot set silently would be as bad as not widening it: {:?}", plan.warnings);
+}
+
+// The classifier is a risk signal, not an oracle, and it must never overrule a more informed answer.
+// Every line of `src/kernel/arch/aarch64` is target-specific, from which a scan can only conclude
+// "all targets" - while the policy table knows the precise answer is aarch64 alone. Letting the scan
+// win would spend 6104 s of riscv64 on an aarch64-only change.
+#[test]
+fn a_declared_architecture_rule_outranks_the_scan() {
+	let model = model();
+	let risk = model.arch_risk.get("kernel.arch.aarch64").expect("the arch tree is full of asm");
+	assert!(risk.any_target, "the scan does see it - that is the point");
+	let plan = plan_for(&model, &["src/kernel/arch/aarch64/virtio_blk.rs"]);
+	assert_eq!(plan.architectures_booted, vec!["aarch64"], "the declared rule is the informed answer");
+}
+
+// And a component the scan finds nothing in keeps the default. A classifier that widened everything
+// would be as useless as one that widened nothing, just more expensive.
+#[test]
+fn a_component_with_no_marker_keeps_the_default_target() {
+	let model = model();
+	let risk = model.arch_risk.get("flac");
+	assert!(risk.is_none_or(|risk| !risk.any_target && risk.targets.is_empty()), "a codec has no target-specific code: {risk:?}");
+	assert_eq!(plan_for(&model, &["src/user/libs/audio/flac/src/lib.rs"]).architectures_booted, vec!["x86_64"]);
+}
+
+// Absence of a marker is not proof of neutrality, and the classifier must never be read as saying it
+// is. The guard is structural: the scan can only ADD targets.
+#[test]
+fn the_classifier_only_ever_widens() {
+	let model = model();
+	for path in ["src/user/libs/audio/flac/src/lib.rs", "src/fs/udf/src/lib.rs", "src/user/apps/tools/src/echo.rs", "src/user/libs/clients/volume-client-provider/src/lib.rs"] {
+		let plan = plan_for(&model, &[path]);
+		assert!(plan.architectures_booted.contains(&String::from("x86_64")), "{path}: the default target can never be removed by the scan");
+	}
+}
+
+#[test]
+fn the_scan_finds_the_markers_the_design_names() {
+	let mut risk = crate::archrisk::Risk::default();
+	crate::archrisk::classify_rust_for_test("#[cfg(target_arch = \"riscv64\")]\nfn f() {}", "a.rs", &mut risk);
+	assert!(risk.targets.contains("riscv64"));
+	assert!(!risk.any_target, "naming one target is not a claim about the others");
+
+	let mut risk = crate::archrisk::Risk::default();
+	crate::archrisk::classify_rust_for_test("global_asm!(\".globl x\");", "a.rs", &mut risk);
+	assert!(risk.any_target, "assembly names no target and differs on all of them");
+	assert_eq!(risk.boot_targets().len(), 3);
+
+	let mut risk = crate::archrisk::Risk::default();
+	crate::archrisk::classify_rust_for_test("#[cfg(target_pointer_width = \"64\")]\nfn f() {}", "a.rs", &mut risk);
+	assert!(risk.any_target);
 }

@@ -122,7 +122,21 @@ WAVE_TAGS[5]='image,audio,service,process,storage'
 # services/manifest.toml's providers give the edges, and what remains is declared once in
 # src/tools/verify-model/model/registry.toml with a reason attached. See docs/todo/M0148.md.
 
-VOLUME_SOURCES=(user fs wire abi proto idl tools/mkpackages)
+# The directories whose content can end up in the system volume.
+#
+# DERIVED, and gated: `verify-model volume-sources` computes it from the manifest's staged programs
+# and libraries, closed over static links, dynamic providers and build-time generation, and
+# `verify-model check` fails if this list and that answer disagree. The list stays literal here
+# because `source_digest` is on the hot path of every build and test invocation.
+#
+# It used to be `(user fs wire abi proto idl tools/mkpackages)` and it was missing four entries, two
+# of which mattered a great deal. CoreServices statically links `src/term`, so editing the terminal
+# stack could compile a new CoreServices, skip packaging - `build.sh` deliberately does not chain
+# `user` into `packages` - and leave the staleness check content that the volume was current. The
+# guest then booted the PREVIOUS userspace and passed. `src/volume` is worse in its simplicity: it is
+# the factory files the volume literally ships, and changing one of them changed nothing the check
+# could see.
+VOLUME_SOURCES=(abi bootproto fs idl proto term tools user volume wasm wire)
 
 # A digest of every source file a build reads, so "has it changed" is answered by CONTENT.
 #

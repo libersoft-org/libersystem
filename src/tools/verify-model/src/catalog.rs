@@ -131,12 +131,12 @@ pub fn catalog_gate_names() -> BTreeSet<String> {
 }
 
 impl Catalog {
-	pub fn build(crates: &[Crate], registry: &Registry, graph: &Graph, kernel_tests: &[KernelTest]) -> Self {
+	pub fn build(crates: &[Crate], registry: &Registry, graph: &Graph, staged: &BTreeSet<String>, kernel_tests: &[KernelTest]) -> Self {
 		let mut catalog = Catalog::default();
 
 		// Builds. Every part on every target, in the configuration that ships.
 		for part in BUILD_PARTS {
-			catalog.checks.push(Check { id: format!("build.{part}"), kind: CheckKind::Build, covers: build_covers(part, crates), variants: ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::Host, configuration: String::from("shared-image") }).collect(), command: format!("./build.sh --arch {{arch}} --part {part}") });
+			catalog.checks.push(Check { id: format!("build.{part}"), kind: CheckKind::Build, covers: build_covers(part, crates, staged), variants: ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::Host, configuration: String::from("shared-image") }).collect(), command: format!("./build.sh --arch {{arch}} --part {part}") });
 		}
 
 		// Host suites. One per crate that has a `#[test]`, in every configuration that crate can
@@ -240,16 +240,28 @@ pub fn configuration_runnable(registry: &Registry, graph: &Graph, crate_name: &s
 }
 
 // What a build compiles, and therefore what a compile failure in it would be about.
-fn build_covers(part: &str, crates: &[Crate]) -> Vec<String> {
+fn build_covers(part: &str, crates: &[Crate], staged: &BTreeSet<String>) -> Vec<String> {
 	let prefix = match part {
 		"sdk" => "src/sdk",
 		"libs" => "src/user/libs",
 		"user" => "src/user",
 		"kernel" => "src/kernel",
 		"loader" => "src/loader",
-		// Packaging and volume assembly read the whole userspace and the manifest rather than
-		// compiling one subtree.
-		"packages" | "volume" => return vec![String::from("manifest"), String::from("harness.tools")],
+		// Packaging and volume assembly compile nothing; they ASSEMBLE, and their inputs are every
+		// artifact the manifest stages. Declaring only the manifest and the packager was the defect:
+		// `build.sh` deliberately does not chain `user` into `packages`, so a change that rebuilt
+		// CoreServices need not have re-packaged it, and the guest booted the previous userspace.
+		// The closure of everything staged is the honest input set, and it is deliberately wide -
+		// packaging is cheap and a stale volume is not.
+		"packages" | "volume" => {
+			let mut covers: Vec<String> = staged.iter().cloned().collect();
+			covers.push(String::from("manifest"));
+			covers.push(String::from("harness.tools"));
+			covers.push(String::from("volume.factory"));
+			covers.sort();
+			covers.dedup();
+			return covers;
+		}
 		_ => return Vec::new(),
 	};
 	crates.iter().filter(|entry| entry.dir == prefix || entry.dir.starts_with(&format!("{prefix}/"))).map(|entry| entry.name.clone()).collect()
