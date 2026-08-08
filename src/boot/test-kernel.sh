@@ -144,7 +144,11 @@ fi
 set +e
 (
 	cd "$ROOT/kernel"
-	TEST=1 TEST_TAGS="$TAGS" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" cargo "${TEST_ARGS[@]}"
+	# TEST_SELECTION is read by the runner ahead of TEST_TAGS: an exact list of stable IDs, which is
+	# what a selector's answer actually is. Both are `option_env!`, so they are compile-time - the
+	# kernel is rebuilt for a different selection, which is why the runner refuses an unknown ID
+	# rather than skipping it.
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" cargo "${TEST_ARGS[@]}"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

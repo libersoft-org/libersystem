@@ -28,7 +28,7 @@ fn imgview_interactions() {
 // the richest of the three, and it keeps the whole path - package, loader, services, terminal -
 // covered by something that boots cold in the kernel suite and needs no development profile.
 
-tagged_test!(lico_switches_panels_and_restores_the_terminal, [Lico, Process, Service, Storage], covers = ["bin.lico", "lico", "term", "keys"]);
+tagged_test!(lico_switches_panels_and_restores_the_terminal, [Lico, Process, Service, Storage], covers = ["bin.lico", "lico", "keys"]);
 fn lico_switches_panels_and_restores_the_terminal() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");

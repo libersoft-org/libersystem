@@ -328,7 +328,13 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	echo
 	note "[$step/$count] $label - $keys key(s)"
 	[[ -n "$note_text" ]] && note "        $note_text"
-	note "        $command"
+	# A selection of two hundred ids is a nine-kilobyte command line, and printing it whole buries
+	# the run it belongs to. The command that RUNS is untouched; only the echo is shortened.
+	if ((${#command} > 200)); then
+		note "        ${command:0:150}... [${#command} chars] ${command##* }"
+	else
+		note "        $command"
+	fi
 	started=$SECONDS
 	outcome=--passed
 	if ! eval "$command"; then

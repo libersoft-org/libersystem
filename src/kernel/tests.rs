@@ -1222,6 +1222,9 @@ extern "C" fn domain_parker(_arg: u64) {
 pub(crate) trait Testable {
 	fn run(&self);
 	fn tags(&self) -> &'static [TestTag];
+	// The stable identity an exact selection names. Defaults to the function name; `id = "..."`
+	// overrides it so a rename does not zero the test's history.
+	fn id(&self) -> &'static str;
 }
 
 macro_rules! define_test_tags {
@@ -1302,11 +1305,22 @@ define_test_tags! {
 
 pub(crate) struct TaggedTest {
 	pub(crate) name: &'static str,
+	// The identity everything OUTSIDE the guest keys on: age, cost, shadow and regression history.
+	//
+	// It defaults to the function name and can be overridden with `id = "..."`, and the difference
+	// matters the day a test is renamed - a name-derived identity zeroes all four records, silently,
+	// and the graph of what has been verified starts again from nothing. An explicit id survives the
+	// rename; changing one is then a deliberate act rather than a side effect of tidying.
+	pub(crate) id: &'static str,
 	pub(crate) tags: &'static [TestTag],
 	pub(crate) run: fn(),
 }
 
 impl Testable for TaggedTest {
+	fn id(&self) -> &'static str {
+		self.id
+	}
+
 	fn run(&self) {
 		serial_print!("{}...\t", self.name);
 		(self.run)();
@@ -1336,35 +1350,75 @@ impl Testable for TaggedTest {
 // instead of as one change to 209 call sites.
 #[macro_export]
 macro_rules! tagged_test {
-	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?]) => {
+	// One internal rule builds the descriptor and the four public shapes feed it, so there is
+	// exactly ONE `#[test_case]` in this file however many optional clauses exist. The alternative -
+	// an arm per combination - grows a descriptor per arm, and `check-test-tags.sh` exists precisely
+	// to notice a `#[test_case]` that the macro did not generate.
+	(@build $(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?], $id:expr, $covers:expr) => {
 		$(#[$attr])*
 		mod $name {
+			// Named and unused: it makes the covers literals part of the compile, so a malformed
+			// list is a build error here rather than a parse failure on the host.
+			#[allow(dead_code)]
+			const COVERS: &[&str] = $covers;
 			#[test_case]
 			static CASE: $crate::tests::TaggedTest = $crate::tests::TaggedTest {
 				name: stringify!($name),
+				id: $id,
 				tags: &[$crate::tests::TestTag::$first_tag $(, $crate::tests::TestTag::$tag)*],
 				run: super::$name,
 			};
 		}
 	};
+	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?]) => {
+		$crate::tagged_test!(@build $(#[$attr])* $name, [$first_tag $(, $tag)*], stringify!($name), &[]);
+	};
 	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?], covers = [$($covers:literal),* $(,)?]) => {
-		$(#[$attr])*
-		mod $name {
-			// Named and immediately discarded: it makes the literals part of the compile, so a
-			// malformed list is a build error here rather than a parse failure on the host.
-			#[allow(dead_code)]
-			const COVERS: &[&str] = &[$($covers),*];
-			#[test_case]
-			static CASE: $crate::tests::TaggedTest = $crate::tests::TaggedTest {
-				name: stringify!($name),
-				tags: &[$crate::tests::TestTag::$first_tag $(, $crate::tests::TestTag::$tag)*],
-				run: super::$name,
-			};
-		}
+		$crate::tagged_test!(@build $(#[$attr])* $name, [$first_tag $(, $tag)*], stringify!($name), &[$($covers),*]);
+	};
+	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?], id = $id:literal) => {
+		$crate::tagged_test!(@build $(#[$attr])* $name, [$first_tag $(, $tag)*], $id, &[]);
+	};
+	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?], id = $id:literal, covers = [$($covers:literal),* $(,)?]) => {
+		$crate::tagged_test!(@build $(#[$attr])* $name, [$first_tag $(, $tag)*], $id, &[$($covers),*]);
 	};
 }
 
 pub(crate) fn test_runner(tests: &[&dyn Testable]) {
+	// Exact selection first: a list of stable IDs, which is the machine's execution interface.
+	//
+	// Tags are the human one and they answer a different question - "everything to do with audio" -
+	// which is why they cannot express a selector's answer. `verify.sh` computes an exact set of
+	// PlanItemKeys and had no way to hand it over, so a scoped kernel selection ran the whole suite:
+	// safe, and the reason the selection dimension paid nothing.
+	//
+	// An unknown ID is a HARD FAILURE. Silently running fewer tests than were asked for is the same
+	// false green this whole mechanism exists against, and a renamed test is exactly how a selection
+	// comes to name something that no longer exists.
+	if let Some(list) = option_env!("TEST_SELECTION").filter(|value| !value.trim().is_empty()) {
+		let wanted: Vec<&str> = list.split(',').map(str::trim).filter(|value| !value.is_empty()).collect();
+		for name in &wanted {
+			if !tests.iter().any(|test| test.id() == *name) {
+				serial_println!("test selection error: no test with id '{name}'");
+				arch::exit_qemu(false);
+			}
+		}
+		let mut ran = 0usize;
+		serial_println!("running {} selected tests ({} total)", wanted.len(), tests.len());
+		for test in tests {
+			if wanted.contains(&test.id()) {
+				test.run();
+				ran += 1;
+			}
+		}
+		if ran != wanted.len() {
+			serial_println!("test selection error: asked for {} tests and ran {ran}", wanted.len());
+			arch::exit_qemu(false);
+		}
+		serial_println!("test suite complete: {ran} passed");
+		arch::exit_qemu(true);
+	}
+
 	let Some(filter) = option_env!("TEST_TAGS").filter(|value| !value.trim().is_empty()) else {
 		serial_println!("running {} tests (all tags)", tests.len());
 		for test in tests {

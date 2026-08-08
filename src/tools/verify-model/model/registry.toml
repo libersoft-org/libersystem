@@ -467,6 +467,16 @@ to = "manifest"
 kind = "generation"
 reason = "build.rs generates manifest.rs, library_paths.rs and program_paths.rs from it"
 
+# The SDK payload. `component_host` loads `components/liber_component/app.wasm` from the volume at
+# run time; the manifest declares it as a factory file and no linker sees the edge at all. Found by
+# the `covers` reachability gate, which reported that the scenario asserting on that component could
+# not reach the crate that produces it - correctly, because the edge did not exist.
+[[edge]]
+from = "bin.component_host"
+to = "liber_component"
+kind = "format"
+reason = "loads the SDK component payload the crate builds, staged as components/liber_component/app.wasm"
+
 # The version string every build stamps in through cargo:rustc-env.
 [[edge]]
 from = ["kernel", "services"]

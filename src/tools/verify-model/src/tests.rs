@@ -827,8 +827,11 @@ fn an_unparseable_record_is_an_error_rather_than_a_shrug() {
 // ---------------------------------------------------------------------------------------------
 // The plan and the run must agree about which targets get booted
 
+// A guest step is `[TEST_SELECTION=ids ]./test.sh --arch TARGET`, so it is recognised by the script
+// it runs rather than by a fixed prefix - a prefix match silently returned nothing the moment the
+// exact-selection form appeared, and the assertion below then compared two empty sets by accident.
 fn guest_targets(plan: &crate::plan::Plan, per_target: &std::collections::BTreeMap<String, usize>) -> BTreeSet<String> {
-	crate::commands::steps(plan, per_target).iter().filter(|step| step.command.starts_with("./test.sh --arch ")).map(|step| step.command.trim_start_matches("./test.sh --arch ").to_string()).collect()
+	crate::commands::steps(plan, per_target).iter().filter(|step| step.command.contains("./test.sh --arch ")).filter_map(|step| step.command.rsplit(" --arch ").next().map(str::to_string)).collect()
 }
 
 #[test]
@@ -844,7 +847,7 @@ fn every_booted_architecture_gets_exactly_one_guest_step() {
 		let plan = plan_for(&model, &paths);
 		let booted: BTreeSet<String> = plan.architectures_booted.iter().cloned().collect();
 		let steps = crate::commands::steps(&plan, &per_target);
-		let guest: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.command.starts_with("./test.sh --arch ")).collect();
+		let guest: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.command.contains("./test.sh --arch ")).collect();
 		assert_eq!(guest_targets(&plan, &per_target), booted, "{paths:?}: the plan says it boots {booted:?} and the run would boot something else");
 		assert_eq!(guest.len(), booted.len(), "{paths:?}: one guest step per booted target, no more");
 	}
@@ -950,4 +953,76 @@ fn the_scan_finds_the_markers_the_design_names() {
 	let mut risk = crate::archrisk::Risk::default();
 	crate::archrisk::classify_rust_for_test("#[cfg(target_pointer_width = \"64\")]\nfn f() {}", "a.rs", &mut risk);
 	assert!(risk.any_target);
+}
+
+// ---------------------------------------------------------------------------------------------
+// `covers` reachability
+//
+// The gate the design asked for and the first implementation shipped without: it checked only that
+// a covered component EXISTS. On its first run over the eleven annotations that existed it produced
+// eight findings - four of them defects in the scan itself, two a missing graph edge and an
+// over-reaching declaration of mine, which is a fair account of what such a gate is for.
+
+fn kernel_test(name: &str, covers: &[&str]) -> KernelTest {
+	KernelTest { name: name.to_string(), architectures: vec![String::from("x86_64")], covers: covers.iter().map(|component| (*component).to_string()).collect() }
+}
+
+#[test]
+fn covers_must_be_reachable_from_what_the_test_touches() {
+	let model = model();
+	let touched: BTreeSet<String> = [String::from("bin.audioconv")].into_iter().collect();
+	// Reached through the tool's own provider chain, without the test naming it.
+	let ok = kernel_test("t", &["flac", "audioconv"]);
+	assert!(crate::kerneltests::unreachable_covers(&ok, &touched, &model.graph).is_empty());
+	// Nothing leads from a codec tool to a filesystem.
+	let bad = kernel_test("t", &["liberfs"]);
+	assert_eq!(crate::kerneltests::unreachable_covers(&bad, &touched, &model.graph), vec![String::from("liberfs")]);
+}
+
+#[test]
+fn the_converse_is_reported_and_never_enforced() {
+	// Launching StorageService to get a volume is not asserting anything about StorageService.
+	let model = model();
+	let touched: BTreeSet<String> = [String::from("bin.audioconv"), String::from("bin.storage_service")].into_iter().collect();
+	let test = kernel_test("t", &["flac"]);
+	assert!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph).is_empty(), "the declaration is fine");
+	// Both launched programs are reported, including the one the test is actually about: a person
+	// reading this decides whether `bin.audioconv` belongs in the declaration. The tool does not.
+	assert_eq!(crate::kerneltests::launched_but_not_covered(&test, &touched, &model.graph), vec![String::from("bin.audioconv"), String::from("bin.storage_service")], "the omissions are reported rather than corrected");
+}
+
+// A dev-dependency is how a test BUILDS its fixture, not something the guest reaches. Including it
+// would let any test claim to cover all eleven codecs the kernel dev-depends on.
+#[test]
+fn a_dev_dependency_is_not_runtime_reach() {
+	assert!(!crate::kerneltests::RUNTIME_REACH.contains(&"link.static.dev"));
+	let model = model();
+	let touched: BTreeSet<String> = [String::from("kernel")].into_iter().collect();
+	let test = kernel_test("t", &["webp"]);
+	assert_eq!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph), vec![String::from("webp")], "the kernel dev-depends on webp; that is not the guest reaching it");
+}
+
+#[test]
+fn every_annotation_in_this_tree_is_reachable() {
+	let model = model();
+	let mut bad = Vec::new();
+	for test in &model.kernel_tests.tests {
+		let touched = model.kernel_tests.touches.get(&test.name).cloned().unwrap_or_default();
+		for component in crate::kerneltests::unreachable_covers(test, &touched, &model.graph) {
+			bad.push(format!("{} covers {component}", test.name));
+		}
+	}
+	assert!(bad.is_empty(), "unreachable covers declarations: {bad:#?}");
+}
+
+// The scan has to see through harness functions or the gate is unusable: most scenarios delegate
+// their setup, and a direct-only scan reports that a test covering `lico` cannot reach it.
+#[test]
+fn the_scan_follows_helper_functions() {
+	let source = "\nfn helper() {\n\tlet elf = program_elf(&package, volume, b\"audioconv\").unwrap();\n}\n\nfn a_test() {\n\thelper();\n}\n";
+	let parsed = crate::kerneltests::parse_touches(source);
+	let direct: BTreeSet<String> = parsed.iter().find(|(name, _, _)| name == "a_test").map(|(_, reached, _)| reached.clone()).unwrap_or_default();
+	assert!(direct.is_empty(), "the test itself launches nothing - that is the whole difficulty");
+	let called: BTreeSet<String> = parsed.iter().find(|(name, _, _)| name == "a_test").map(|(_, _, called)| called.clone()).unwrap_or_default();
+	assert!(called.contains("helper"), "and the call to the harness is what has to be followed");
 }

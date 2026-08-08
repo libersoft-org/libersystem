@@ -595,6 +595,38 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 		}
 	}
 
+	// `covers X` implies the test can REACH X - the enforceable half of the rule.
+	//
+	// The other half, "it reaches X therefore it covers X", is deliberately NOT enforced: a scenario
+	// that starts StorageService to test `component_host` asserts nothing about StorageService, and
+	// inferring coverage from a launch is the `touches = covers` collapse that would inflate every
+	// declaration back to the full suite. That direction is the report below, for a person.
+	//
+	// Reach is the forward closure from what the test's body was seen to touch, so a test that
+	// launches `bin.audioconv` legitimately covers `flac` without ever naming it.
+	let mut unreachable = Vec::new();
+	let mut uncovered: Vec<String> = Vec::new();
+	for test in &model.kernel_tests.tests {
+		let touched = model.kernel_tests.touches.get(&test.name).cloned().unwrap_or_default();
+		for component in verify_model::kerneltests::unreachable_covers(test, &touched, &model.graph) {
+			unreachable.push(format!("kernel.{} covers '{component}', which its body cannot reach - it launches nothing that leads there", test.name));
+		}
+		for component in verify_model::kerneltests::launched_but_not_covered(test, &touched, &model.graph) {
+			uncovered.push(format!("kernel.{} launches {component} and does not claim to cover it", test.name));
+		}
+	}
+	failures.extend(unreachable);
+	if !uncovered.is_empty() {
+		// A REPORT, never a failure. Launching something is not asserting anything about it.
+		println!("verify-model: {} test(s) reach a program they do not claim to cover - read, do not fix mechanically:", uncovered.len());
+		for line in uncovered.iter().take(8) {
+			println!("    {line}");
+		}
+		if uncovered.len() > 8 {
+			println!("    ... and {} more", uncovered.len() - 8);
+		}
+	}
+
 	// Every component named by the selects-everything list has to exist, or the escalation it
 	// promises never fires.
 	for rule in &model.registry.selects_everything {

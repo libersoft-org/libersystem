@@ -23,8 +23,9 @@ self_test() {
 			Smoke => "smoke",
 		}
 		macro_rules! tagged_test {
-			($name:ident, [$t:ident]) => { mod $name { #[test_case] static CASE: u8 = 0; } };
-			($name:ident, [$t:ident], covers = [$($c:literal),*]) => { mod $name { #[test_case] static CASE: u8 = 0; } };
+			(@build $name:ident, [$t:ident]) => { mod $name { #[test_case] static CASE: u8 = 0; } };
+			($name:ident, [$t:ident]) => { tagged_test!(@build $name, [$t]); };
+			($name:ident, [$t:ident], covers = [$($c:literal),*]) => { tagged_test!(@build $name, [$t]); };
 		}
 	FIXTURE
 	printf 'tagged_test!(a_test, [Smoke]);
@@ -68,16 +69,19 @@ mapfile -t TEST_FILES < <(find "$ROOT/kernel" -type f \( -name tests.rs -o -path
 #
 # The point is that the macro is the ONLY way a descriptor enters the suite - a hand-written
 # `#[test_case]` would run with no tags, so no filter could ever select or skip it. The count is two
-# because the macro has two arms: with and without a `covers` clause. Both arms live in
+# because the macro funnels its four public shapes - with and without `id`, with and without
+# `covers` - through ONE internal rule. That rule lives in
 # kernel/tests.rs, so the rule is checked there by count and everywhere else by absence.
-EXPECTED_IN_MACRO=2
-in_macro="$(grep -c '#\[test_case\]' "$ROOT_TESTS")"
+EXPECTED_IN_MACRO=1
+# Comment lines are excluded rather than the marker being anchored: this file explains the rule in
+# prose that names the attribute, and a line-start anchor also misses the one-line `mod` form.
+in_macro="$(grep '#\[test_case\]' "$ROOT_TESTS" | grep -vc '^[[:space:]]*//')"
 if [[ "$in_macro" -ne "$EXPECTED_IN_MACRO" ]]; then
 	echo "test tag check: expected $EXPECTED_IN_MACRO #[test_case] in tagged_test!, found $in_macro in kernel/tests.rs" >&2
 	grep -n '#\[test_case\]' "$ROOT_TESTS" >&2 || true
 	exit 1
 fi
-outside="$(grep -h '#\[test_case\]' "${TEST_FILES[@]}" | wc -l)"
+outside="$(grep -h '#\[test_case\]' "${TEST_FILES[@]}" | grep -vc '^[[:space:]]*//')"
 if [[ "$outside" -ne "$EXPECTED_IN_MACRO" ]]; then
 	echo "test tag check: a #[test_case] outside tagged_test! would run with no tags, so no filter could select or skip it" >&2
 	grep -n '#\[test_case\]' "${TEST_FILES[@]}" >&2 || true

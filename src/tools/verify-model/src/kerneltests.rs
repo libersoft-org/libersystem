@@ -18,6 +18,10 @@ use std::process::Command;
 
 pub struct Discovery {
 	pub tests: Vec<KernelTest>,
+	// What each test's body was SEEN to reach: programs it launches by name, crates it calls into.
+	// Observational, never a selection primitive - it exists to check `covers` declarations and to
+	// report the other direction for a person to read.
+	pub touches: BTreeMap<String, BTreeSet<String>>,
 	// Targets whose test binary was not found. The planner cannot scope what it cannot enumerate,
 	// so these fall open to the whole suite rather than to nothing.
 	pub missing_targets: Vec<String>,
@@ -54,6 +58,7 @@ pub fn discover(repo_root: &Path, architectures: &[&str]) -> Result<Discovery, S
 		}
 	}
 
+	let touches = scan_touches(repo_root)?;
 	let mut tests = Vec::new();
 	let mut unannotated = 0;
 	for (name, architectures) in per_test {
@@ -64,7 +69,7 @@ pub fn discover(repo_root: &Path, architectures: &[&str]) -> Result<Discovery, S
 		tests.push(KernelTest { name, architectures: architectures.into_iter().collect(), covers });
 	}
 	tests.sort();
-	Ok(Discovery { tests, missing_targets, unannotated })
+	Ok(Discovery { tests, touches, missing_targets, unannotated })
 }
 
 // Every plausible candidate, newest first. The caller takes the first that actually carries test
@@ -221,4 +226,191 @@ fn matching_paren(text: &str) -> Option<usize> {
 		}
 	}
 	None
+}
+
+// What each test's body reaches, read from the source.
+//
+// Two signals, both unambiguous: a program launched by name - `program_elf(.., b"audioconv")` or
+// `lookup(b"storage_service.lsexe")` - and a crate called into, `wav::encode::Encoder`. The kernel
+// dev-depends on eleven codecs precisely so its scenarios can build and check their own fixtures,
+// so the second signal is how a test that asserts on FLAC bytes is distinguished from one that
+// merely launches something.
+//
+// This is the OBSERVATIONAL half of the model and it is never a selection primitive. It answers
+// "could this test reach X", which is the enforceable direction of the `covers` rule; the other
+// direction - "it reaches X, therefore it covers X" - is the `touches = covers` collapse the whole
+// design exists to prevent, and it is emitted as a report for a person instead.
+fn scan_touches(repo_root: &Path) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+	let mut direct = BTreeMap::new();
+	let mut calls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+	touch_dir(&repo_root.join("src/kernel"), &mut direct, &mut calls)?;
+	Ok(close_over_helpers(direct, &calls))
+}
+
+// A test that launches nothing itself but calls `run_lico_harness` reaches whatever that reaches.
+//
+// Without this the gate is unusable: most scenarios delegate their setup to a harness function, so
+// the direct scan sees an empty body and reports that a test covering `lico` cannot reach it. That
+// was the first version's behaviour and it produced four false findings out of eight.
+//
+// A fixpoint rather than one hop, because harnesses call harnesses. It terminates because the set
+// only grows and the function set is finite; the iteration cap is a guard against a cycle making it
+// spin rather than a bound on legitimate depth.
+fn close_over_helpers(direct: BTreeMap<String, BTreeSet<String>>, calls: &BTreeMap<String, BTreeSet<String>>) -> BTreeMap<String, BTreeSet<String>> {
+	let mut touches = direct;
+	for _ in 0..8 {
+		let mut changed = false;
+		let names: Vec<String> = touches.keys().cloned().collect();
+		for name in names {
+			let Some(called) = calls.get(&name) else { continue };
+			let mut gained: BTreeSet<String> = BTreeSet::new();
+			for callee in called {
+				if callee == &name {
+					continue;
+				}
+				if let Some(reached) = touches.get(callee) {
+					gained.extend(reached.iter().cloned());
+				}
+			}
+			let entry = touches.entry(name).or_default();
+			let before = entry.len();
+			entry.extend(gained);
+			changed |= entry.len() != before;
+		}
+		if !changed {
+			break;
+		}
+	}
+	touches
+}
+
+fn touch_dir(dir: &Path, out: &mut BTreeMap<String, BTreeSet<String>>, calls: &mut BTreeMap<String, BTreeSet<String>>) -> Result<(), String> {
+	let Ok(entries) = fs::read_dir(dir) else { return Ok(()) };
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.is_dir() {
+			touch_dir(&path, out, calls)?;
+		} else if path.extension().is_some_and(|extension| extension == "rs") {
+			let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+			for (name, reached, called) in parse_touches(&text) {
+				out.entry(name.clone()).or_insert_with(BTreeSet::new).extend(reached);
+				calls.entry(name).or_insert_with(BTreeSet::new).extend(called);
+			}
+		}
+	}
+	Ok(())
+}
+
+// Split a file into function bodies and attribute what each one reaches to its own name. Split on
+// `\nfn ` at column zero, which is where every test function in this tree begins.
+pub fn parse_touches(text: &str) -> Vec<(String, BTreeSet<String>, BTreeSet<String>)> {
+	let mut found = Vec::new();
+	for chunk in text.split("\nfn ").skip(1) {
+		let Some(name) = chunk.split(['(', '<', ' ']).next() else { continue };
+		if name.is_empty() || !name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
+			continue;
+		}
+		found.push((name.to_string(), reached_in(chunk), called_in(chunk)));
+	}
+	found
+}
+
+// Plain function calls in a body: `run_lico_harness(...)`, `StorageHarness::start(...)`. Names only,
+// resolved later against the set of functions actually scanned - anything that is not one of those
+// simply never matches.
+fn called_in(body: &str) -> BTreeSet<String> {
+	let mut called = BTreeSet::new();
+	let bytes = body.as_bytes();
+	for (index, _) in body.match_indices('(') {
+		let start = body[..index].rfind(|character: char| !(character.is_ascii_alphanumeric() || character == '_')).map(|at| at + 1).unwrap_or(0);
+		if start >= index {
+			continue;
+		}
+		// `Type::method(` is a call too, and the method is what was scanned.
+		let name = &body[start..index];
+		if name.is_empty() || bytes.get(index.saturating_sub(name.len() + 1)) == Some(&b'.') {
+			continue;
+		}
+		called.insert(name.to_string());
+	}
+	called
+}
+
+fn push_program(name: &str, reached: &mut BTreeSet<String>) {
+	if !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
+		reached.insert(format!("bin.{name}"));
+	}
+}
+
+fn reached_in(body: &str) -> BTreeSet<String> {
+	let mut reached = BTreeSet::new();
+	// `program_elf(&package, volume, b"audioconv")` - the name is the byte string inside the call.
+	let mut rest = body;
+	while let Some(index) = rest.find("program_elf(") {
+		rest = &rest[index + "program_elf(".len()..];
+		let window = &rest[..rest.len().min(160)];
+		let Some(open) = window.find("b\"") else { continue };
+		let Some(close) = window[open + 2..].find('"') else { continue };
+		push_program(&window[open + 2..open + 2 + close], &mut reached);
+	}
+	// `lookup(b"storage_service.lsexe")` - the name starts immediately, so looking for a `b"` AFTER
+	// the marker finds the NEXT call's argument instead. That was the first version of this and it
+	// is why the reachability gate reported that a test launching StorageService could not reach it.
+	let mut rest = body;
+	while let Some(index) = rest.find("lookup(b\"") {
+		rest = &rest[index + "lookup(b\"".len()..];
+		let Some(close) = rest.find('"') else { continue };
+		if let Some(stem) = rest[..close].strip_suffix(".lsexe") {
+			push_program(stem, &mut reached);
+		}
+	}
+	// `wav::encode::Encoder` - a crate called into directly. Underscores are how Rust spells a
+	// hyphenated package name, so both forms are recorded and the caller matches whichever exists.
+	let bytes = body.as_bytes();
+	for (index, _) in body.match_indices("::") {
+		let start = body[..index].rfind(|character: char| !(character.is_ascii_alphanumeric() || character == '_')).map(|at| at + 1).unwrap_or(0);
+		if start >= index || (start > 0 && bytes[start - 1] == b':') {
+			continue;
+		}
+		let name = &body[start..index];
+		if name.is_empty() || name.chars().next().is_some_and(|first| first.is_ascii_uppercase()) {
+			continue;
+		}
+		reached.insert(name.to_string());
+		if name.contains('_') {
+			reached.insert(name.replace('_', "-"));
+		}
+	}
+	reached
+}
+
+// Edge kinds that mean "the guest can get from here to there" at run time.
+//
+// `link.static.dev` is deliberately absent: a dev-dependency is how a test BUILDS its fixture, not
+// something the running system reaches. Including it would let a test claim to cover any crate the
+// kernel dev-depends on, which is all eleven codecs, for every test in the suite.
+pub const RUNTIME_REACH: [&str; 7] = ["link.static", "link.dynamic", "format", "ipc", "syscall", "device", "generation"];
+
+// The enforceable half of the `covers` rule: what a test declares must be something it can reach.
+//
+// The other half - "it reaches X therefore it covers X" - is NOT enforced and never will be. A
+// scenario that starts StorageService in order to test `component_host` asserts nothing about
+// StorageService, and inferring coverage from a launch is the `touches = covers` collapse that would
+// inflate every declaration back to the full suite one honest-looking gate at a time.
+pub fn unreachable_covers(test: &KernelTest, touched: &BTreeSet<String>, graph: &crate::graph::Graph) -> Vec<String> {
+	let mut reachable: BTreeSet<String> = BTreeSet::new();
+	for component in touched {
+		if graph.contains(component) {
+			reachable.extend(graph.reaches(component, &RUNTIME_REACH));
+		}
+	}
+	test.covers.iter().filter(|component| !reachable.contains(*component)).cloned().collect()
+}
+
+// The report direction: launched and not claimed. For a person to read, never a failure.
+pub fn launched_but_not_covered(test: &KernelTest, touched: &BTreeSet<String>, graph: &crate::graph::Graph) -> Vec<String> {
+	if test.covers.is_empty() {
+		return Vec::new();
+	}
+	touched.iter().filter(|component| component.starts_with("bin.") && graph.contains(component) && !test.covers.contains(component)).cloned().collect()
 }

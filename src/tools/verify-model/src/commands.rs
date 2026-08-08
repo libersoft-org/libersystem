@@ -72,8 +72,31 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> 
 	}
 	for (architecture, selected) in &kernel_by_arch {
 		let total = kernel_tests_per_target.get(*architecture).copied().unwrap_or(selected.len());
-		let note = if selected.len() < total { Some(format!("{} of {total} tests are selected; the runner has no exact-selection mode yet, so the whole suite runs", selected.len())) } else { None };
-		steps.push(Step { label: format!("kernel suite {architecture}"), command: format!("./test.sh --arch {architecture}"), keys: selected.clone(), note });
+		// A strict subset is handed over EXACTLY, by stable ID. The runner refuses an ID it does not
+		// have, so a selection naming a renamed test fails loudly instead of quietly running less.
+		//
+		// Measured on an idle machine: 2 tests take 9 s, 20 take 12 s, 205 take 108 s - a fixed cost
+		// of about eight seconds and roughly half a second per test. An earlier note in M0148 put the
+		// fixed cost at ~100 s and concluded that selection was the smallest lever this milestone
+		// had; that arithmetic mixed a run made under load 115 with one made idle, and it was wrong.
+		// Selecting twenty tests out of two hundred is an 89% saving on the guest run.
+		// Hand over an exact list only when it BUYS something.
+		//
+		// 195 of 205 selected produced a nine-kilobyte command line and saved a few seconds, because
+		// the cost of a guest run is about eight seconds fixed plus half a second per test - the
+		// saving is proportional to the tests dropped, and dropping ten of them is not worth an
+		// environment variable nobody can read in a log. Below the threshold the list is worth it:
+		// twenty tests run in 12 s against 108 s for all of them.
+		let worth_selecting = total > 0 && selected.len() * 5 < total * 4;
+		let (command, note) = if worth_selecting {
+			let ids: Vec<&str> = selected.iter().map(|key| key.check.strip_prefix("kernel.").unwrap_or(&key.check)).collect();
+			(format!("TEST_SELECTION={} ./test.sh --arch {architecture}", ids.join(",")), Some(format!("{} of {total} tests, handed over by id", selected.len())))
+		} else if selected.len() < total {
+			(format!("./test.sh --arch {architecture}"), Some(format!("{} of {total} selected, close enough to all of them that handing over a list would cost more than it saves", selected.len())))
+		} else {
+			(format!("./test.sh --arch {architecture}"), None)
+		};
+		steps.push(Step { label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note });
 	}
 
 	// Every booted architecture gets a guest step, whether or not the catalog has tests for it.
