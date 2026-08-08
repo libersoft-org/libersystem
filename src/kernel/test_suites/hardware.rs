@@ -48,7 +48,7 @@ fn interrupt_bind_delivers_to_driver() {
 	const VECTOR: u64 = 0x2c;
 	extern "C" fn body(_arg: u64) {
 		unsafe {
-			let h = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, VECTOR, 0, 0, 0);
+			let h = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, VECTOR, device_privilege(), 0, 0);
 			assert!(!syscall::sys_is_err(h), "interrupt_bind failed");
 			// Simulate the device IRQ firing with a software interrupt; the dispatch
 			// path marks the bound Interrupt pending and wakes any waiter.
@@ -57,7 +57,7 @@ fn interrupt_bind_delivers_to_driver() {
 			let r = arch::syscall::invoke(syscall::SYS_WAIT, h, 0, 0, 0);
 			assert_eq!(r as i64, 0, "wait did not observe the delivered interrupt");
 			// Binding the same vector again while ours lives is refused.
-			let again = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, VECTOR, 0, 0, 0);
+			let again = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, VECTOR, device_privilege(), 0, 0);
 			assert_eq!(again as i64, syscall::ERR_RESOURCE_EXHAUSTED);
 		}
 		DONE.store(true, Ordering::SeqCst);
@@ -86,7 +86,7 @@ fn device_table_exposes_virtio_mmio() {
 				VTYPE.store(info.device_type as u64, Ordering::SeqCst);
 				BAR_LEN.store(info.bar_len, Ordering::SeqCst);
 			}
-			let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, 0, 0, 0);
+			let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, device_privilege(), 0, 0);
 			if !syscall::sys_is_err(handle) {
 				MAPPED.store(arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, handle, 0, 0, 0), Ordering::SeqCst);
 			}
@@ -123,7 +123,7 @@ fn device_table_exposes_the_xhci_controller() {
 					continue;
 				}
 				BAR_LEN.store(info.bar_len, Ordering::SeqCst);
-				let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, i, 0, 0, 0);
+				let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, i, device_privilege(), 0, 0);
 				if !syscall::sys_is_err(handle) {
 					MAPPED.store(arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, handle, 0, 0, 0), Ordering::SeqCst);
 				}
@@ -490,4 +490,47 @@ fn driver_survives_crash_and_restart() {
 	fault::clear_crash_notify();
 	assert!(survived, "the restarted driver should run without faulting");
 	assert!(restarts >= 1, "the supervisor should have restarted the crashed driver");
+}
+
+tagged_test!(taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it, [Pci, Drivers]);
+fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
+	// `SYS_DEVICE_ACQUIRE(index)` used to mint a `DeviceMemory` capability for anyone who named an
+	// index - so any ring-3 process could take the BAR of any PCI device, which contradicts
+	// `DeviceMemory`'s own documentation that a driver is handed only its device. On a DMA-capable
+	// device it is worse than an MMIO takeover: with no IOMMU, a process holding both DMA buffers
+	// and physical addresses reaches memory the page tables were meant to isolate.
+	//
+	// The same authority covers the MSI-X vectors and the legacy interrupt lines, which are the
+	// other two ways a device leaves the kernel.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			// No privilege at all.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "a device may not be acquired without the authority");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_MSIX_ACQUIRE, 0, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "nor its MSI-X vectors");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, 0x41, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "nor an interrupt line");
+
+			// A privilege of the WRONG kind is refused too: holding one authority is not holding
+			// another, which is the whole point of them being separate objects.
+			let wrong = {
+				use object::privilege::{Privilege, PrivilegeKind};
+				let thread = sched::current_thread().expect("a current thread");
+				let privilege = Privilege::create(PrivilegeKind::ConsoleSink);
+				thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL, 0).expect("installs").raw()
+			};
+			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, wrong, 0, 0) as i64, syscall::ERR_ACCESS_DENIED, "a console authority does not open a device");
+
+			// And with the right one it works, on a machine that has a device to give.
+			let count = arch::syscall::invoke(syscall::SYS_DEVICE_COUNT, 0, 0, 0, 0) as i64;
+			if count > 0 {
+				let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, device_privilege(), 0, 0) as i64;
+				assert!(handle > 0, "the authority is what makes it work");
+			}
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
 }

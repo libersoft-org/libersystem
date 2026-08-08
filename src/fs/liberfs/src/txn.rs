@@ -373,6 +373,54 @@ impl<D: BlockDevice> LiberFs<D> {
 						if marked.is_err() {
 							self.walk_damage = true;
 						}
+						// AND as a directory, because the flip could have gone the other way.
+						//
+						// `INO_MAP` is an overlay: `dir_root` for a directory, `spill` for
+						// everything else. Reserving only the file reading protects one
+						// bit-flip out of two - an inode that WAS a directory arrives with
+						// `extent_count` zero, so the file reading marks almost nothing, and
+						// its B+tree's internal and leaf nodes are left free for the allocator
+						// while the tree still references them. The mirror of the case this
+						// was written for: the child inodes and their data survive, and the
+						// index that named them is overwritten.
+						//
+						// So both readings are marked. They cost the same blocks when the file
+						// reading is the right one (`mark_dir_tree` refuses a block that is not
+						// a node and stops), and the union is the only answer that is safe
+						// whichever way the byte went. Over-reserving holds space until the
+						// record is removed; under-reserving loses data.
+						// SPECULATIVE, so what it finds is never reported as damage. One of the two
+						// readings is nonsense by definition - for a real file the overlay points at
+						// a spill chain block, which is not a tree node - and a walk that says so is
+						// telling the truth about the guess, not about the volume. Degrading the
+						// mount to read-only on it would take the repair verb away over a reading
+						// that was never expected to hold.
+						// Into its OWN map, then folded in.
+						//
+						// Three things go wrong if it marks straight into `map`. The root has
+						// already been marked by the file reading (the overlay is one field, so both
+						// readings start at the same block), and `mark_dir_tree` skips an
+						// already-marked node - so the walk would stop at the root and reserve none
+						// of the children, which is the entire point. Under `mark_strict` the
+						// overlap would also read as two owners in one generation, which is
+						// corruption, and the CRC check would refuse a guess for not verifying.
+						//
+						// A scratch map costs one allocation on a path that only runs for a damaged
+						// inode, and it lets the guess be a guess: it descends as far as the bytes
+						// allow, says nothing about what it finds, and its result is added to the
+						// reservation rather than compared with it.
+						let strict = self.mark_strict;
+						let damage = self.walk_damage;
+						self.mark_strict = false;
+						let speculative = try_zeroed(map.len()).ok();
+						if let Some(mut scratch) = speculative {
+							let _ = self.mark_dir_tree(inode.dir_root_from_overlay(), inode.dir_root_crc_from_overlay(), &mut scratch);
+							for (into, from) in map.iter_mut().zip(scratch.iter()) {
+								*into |= *from;
+							}
+						}
+						self.mark_strict = strict;
+						self.walk_damage = damage;
 					}
 				}
 			} else {

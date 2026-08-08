@@ -135,7 +135,7 @@ fn imgconv_governed_working_set_is_measured() {
 
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
-	let full_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);
+	let full_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
 	let (full_hd, full_hd_peak) = run_imgconv_harness_in(full_hd_domain, imgconv_elf, b"--resize 1920x1080 --compression 100 vol://media/SOURCE.BMP vol://media/FHD.PNG", &mut system, &mut media);
 	assert!(full_hd.starts_with(b"imgconv: BMP 2x2 -> PNG 1920x1080 compression=100 bytes="));
 	let full_hd_output = media.open(b"vol://media/FHD.PNG", 0xf1080).expect("1080p output opens");
@@ -144,7 +144,7 @@ fn imgconv_governed_working_set_is_measured() {
 
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
-	let ultra_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);
+	let ultra_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
 	let (ultra_hd, ultra_hd_peak) = run_imgconv_harness_in(ultra_hd_domain, imgconv_elf, b"--resize 3840x2160 --compression 100 vol://media/SOURCE.BMP vol://media/UHD.PNG", &mut system, &mut media);
 	assert!(ultra_hd.starts_with(b"imgconv: BMP 2x2 -> PNG 3840x2160 compression=100 bytes="));
 	let ultra_hd_output = media.open(b"vol://media/UHD.PNG", 0xf2160).expect("4K output opens");
@@ -154,7 +154,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let animation = include_bytes!("../../user/libs/image/webp/tests/data/external-animation.webp");
 	let media_image = fat16_image(&[(*b"ANIM    WEB", animation)], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
-	let animation_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED);
+	let animation_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
 	let (animation_line, animation_peak) = run_imgconv_harness_in(animation_domain, imgconv_elf, b"vol://media/ANIM.WEB vol://media/ANIM.GIF", &mut system, &mut media);
 	assert!(animation_line.starts_with(b"imgconv: WebP 23x15 -> GIF 23x15 quality=100 bytes="));
 	let animation_output = media.open(b"vol://media/ANIM.GIF", 0xa11).expect("animation output opens");
@@ -168,7 +168,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let previous = b"preserved after quota failure";
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice()), (*b"KEEP    PNG", previous)], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
-	let limited_domain = Domain::new_child(&sched::root_domain(), 80 * 1024 * 1024, UNLIMITED, UNLIMITED);
+	let limited_domain = Domain::new_child(&sched::root_domain(), 80 * 1024 * 1024, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
 	let (failure, limited_peak) = run_imgconv_harness_result(limited_domain, imgconv_elf, b"--force --resize 3840x2160 --compression 100 vol://media/SOURCE.BMP vol://media/KEEP.PNG", &mut system, &mut media);
 	assert_eq!(failure, Some(b"imgconv: out of memory\n".to_vec()), "quota failure reports a typed diagnostic");
 	assert_eq!(media.open(b"vol://media/KEEP.PNG", 0xfa17), Some(previous.to_vec()), "quota failure preserves the previous destination byte-for-byte");
@@ -192,7 +192,7 @@ fn imgconv_governed_working_set_is_measured() {
 	// looks like the same `cannot write output` and is not.
 	let media_image = fat16_image_with_clusters(&[], false, 30_000);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
-	let corpus_domain = Domain::new_child(&sched::root_domain(), MEASUREMENT_CEILING, UNLIMITED, UNLIMITED);
+	let corpus_domain = Domain::new_child(&sched::root_domain(), MEASUREMENT_CEILING, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
 	let (wallpaper, wallpaper_peak) = run_imgconv_harness_in(corpus_domain, imgconv_elf, b"vol://system/wallpapers/logo.webp vol://media/LOGO.PNG", &mut system, &mut media);
 	assert!(wallpaper.starts_with(b"imgconv: WebP 3840x2160 -> PNG 3840x2160"), "the shipped wallpaper converts, got {:?}", core::str::from_utf8(&wallpaper));
 	assert!(wallpaper_peak > ultra_hd_peak, "a 4K input costs more than a 4K output alone - decoded input and output are live together");

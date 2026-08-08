@@ -657,6 +657,20 @@ impl Inode {
 		}
 	}
 
+	// The overlay field read as a DIRECTORY root, whatever the type byte says.
+	//
+	// `INO_MAP` holds `dir_root` for a directory and `spill` for everything else, and `parse`
+	// commits to one reading from the type byte alone. For an unknown type the byte is the thing
+	// that cannot be trusted, so the mark walk has to reserve both readings - and for the file
+	// reading it already has `spill`, which is the same field.
+	fn dir_root_from_overlay(&self) -> u64 {
+		if self.r#type == TYPE_DIR { self.dir_root } else { self.spill }
+	}
+
+	fn dir_root_crc_from_overlay(&self) -> u32 {
+		if self.r#type == TYPE_DIR { self.dir_root_crc } else { self.spill_crc }
+	}
+
 	// Number of data blocks the file's `size` occupies. u64, so a 32-bit build never
 	// truncates a large file's block count.
 	fn nblocks(&self) -> u64 {

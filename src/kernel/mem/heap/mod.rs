@@ -297,6 +297,28 @@ unsafe impl GlobalAlloc for LockedHeap {
 			match found {
 				Some((region, alloc_start)) => {
 					let alloc_end = alloc_start.checked_add(size).expect("alloc overflow");
+					// BOTH sides go back, and the front one is the half that was being lost.
+					//
+					// `find_region` takes the whole region out of the free list and moves its start
+					// up for alignment; only the tail past the allocation was ever returned. The
+					// bytes between the region's start and the aligned start - up to `align - 1` of
+					// them, every time an aligned allocation lands in a region that was not already
+					// aligned - simply stopped existing. On a long-running kernel that is a leak
+					// that grows with every such allocation and is invisible to every counter,
+					// because nothing ever knew those bytes were free.
+					//
+					// The prefix goes back only if a free region can describe it: a run shorter than
+					// the free-list node itself cannot be recorded, and `add_free_region` is where
+					// that is decided.
+					let prefix = alloc_start - region.start_addr();
+					if prefix >= mem::size_of::<FreeRegion>() {
+						// The region's start came off the free list, so it is already aligned for a
+						// node; what it may not be is BIG enough to hold one. A run shorter than the
+						// node that would describe it cannot be recorded, and is lost as it always
+						// was - but that is now bounded by one node's size rather than by the
+						// alignment, and it is the answer `add_free_region` gives the tail too.
+						heap.add_free_region(region.start_addr(), prefix);
+					}
 					let excess = region.end_addr() - alloc_end;
 					if excess > 0 {
 						heap.add_free_region(alloc_end, excess);

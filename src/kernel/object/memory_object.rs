@@ -56,8 +56,17 @@ impl MemoryObject {
 	// the charge is held until the object is dropped, on failure nothing is
 	// charged or allocated.
 	pub fn create_in(domain: &Arc<Domain>, size: usize) -> Result<Arc<Self>, MemoryError> {
+		// The size is a caller's number, and everything after this line multiplies it. A ceiling
+		// first, then checked arithmetic: `pages as u64 * PAGE_SIZE` can wrap to a small value that
+		// the Domain quota then happily approves, after which `allocate_pages` is asked for an
+		// absurd count.
+		if size as u64 > abi::MAX_OBJECT_BYTES {
+			return Err(MemoryError::OutOfMemory);
+		}
 		let pages = frame::pages_for(size);
-		let bytes = pages as u64 * PAGE_SIZE;
+		let Some(bytes) = (pages as u64).checked_mul(PAGE_SIZE) else {
+			return Err(MemoryError::OutOfMemory);
+		};
 		if !domain.try_charge_memory(bytes) {
 			return Err(MemoryError::QuotaExceeded);
 		}
@@ -144,7 +153,10 @@ impl Drop for MemoryObject {
 		debug_assert!(self.mappings.lock().is_empty(), "process cleanup must remove every MemoryObject mapping");
 		// SAFETY: this object owns its frames, and the debug assert above has established
 		// that nothing is mapping them any more.
-		unsafe { frame::free_pages(&self.frames) };
+		// RETIRED, not freed: these frames were mapped, and a frame handed out again while another
+		// core still holds a stale translation is a physical use-after-free. `retire` is the one
+		// door back to the allocator for anything a page table ever pointed at.
+		unsafe { frame::retire(&self.frames) };
 		// Refund the physical memory to the owning Domain, if any.
 		if let Some(domain) = &self.domain {
 			domain.uncharge_memory(self.size as u64);

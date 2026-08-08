@@ -16,7 +16,7 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch;
 use crate::object::KernelObject;
@@ -97,6 +97,17 @@ struct BucketWaiter {
 	koid: u64,
 }
 
+// A PERSISTENT entry: this object's wakes are forwarded to that wait set.
+//
+// The difference from a `BucketWaiter` is its lifetime. A waiter is registered when a thread parks
+// and taken out when it wakes; an observer is registered when a member joins a set and taken out
+// when it leaves, so a service listening to sixty channels pays sixty registrations once rather
+// than sixty per pass. That per-pass cost is what `MAX_CLIENTS` in StorageService is set around.
+struct SetObserver {
+	member_koid: u64,
+	set_koid: u64,
+}
+
 // A blocked thread's deadline: an absolute LAPIC tick value. `periodic` marks a
 // housekeeping wake (WAIT_PERIODIC): still woken when due, but invisible to
 // min_deadline, so run_until_idle settles across it.
@@ -109,10 +120,46 @@ struct TimedWaiter {
 const WAIT_BUCKET_COUNT: usize = 64;
 
 static WAIT_BUCKETS: [SpinLock<Vec<BucketWaiter>>; WAIT_BUCKET_COUNT] = [const { SpinLock::new(Vec::new()) }; WAIT_BUCKET_COUNT];
+// Bucketed the same way and by the MEMBER's koid, so a wake looks in one place for both kinds.
+static SET_OBSERVERS: [SpinLock<Vec<SetObserver>>; WAIT_BUCKET_COUNT] = [const { SpinLock::new(Vec::new()) }; WAIT_BUCKET_COUNT];
+// How many observers exist at all, so a wake can skip the lock when no wait set is in use.
+//
+// `wake_object` is the hottest path in the scheduler - every channel send, every event, every
+// process transition goes through it - and taking a second bucket lock on all of them to look for
+// observers that a system with no wait sets does not have is a cost paid by everybody for a feature
+// nobody is using. It showed up as a cross-core wake taking milliseconds where it takes
+// microseconds, which is the one thing the wake IPI exists to prevent.
+static OBSERVER_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TIMED_WAITERS: SpinLock<Vec<TimedWaiter>> = SpinLock::new(Vec::new());
 
 fn bucket_of(koid: u64) -> &'static SpinLock<Vec<BucketWaiter>> {
 	&WAIT_BUCKETS[(koid % WAIT_BUCKET_COUNT as u64) as usize]
+}
+
+fn observers_of(koid: u64) -> &'static SpinLock<Vec<SetObserver>> {
+	&SET_OBSERVERS[(koid % WAIT_BUCKET_COUNT as u64) as usize]
+}
+
+// Forward `member`'s wakes to `set` until told otherwise. Called by `WaitSet::add`.
+pub fn register_set_observer(member: u64, set: u64) {
+	let mut observers = observers_of(member).lock();
+	if observers.try_reserve(1).is_err() {
+		// The set will still see the member on its readiness scan; what it loses is the WAKE, so a
+		// waiter parked with nothing else to rouse it sleeps until its deadline. Said out loud
+		// rather than silently, because a wait that only works when something else happens is the
+		// kind of fault that looks like a slow service.
+		crate::serial_println!("sched: WARNING: no room to observe object {member} for wait set {set}; its wakes will not reach the set");
+		return;
+	}
+	observers.push(SetObserver { member_koid: member, set_koid: set });
+	OBSERVER_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+pub fn unregister_set_observer(member: u64, set: u64) {
+	let mut observers = observers_of(member).lock();
+	let before = observers.len();
+	observers.retain(|o: &SetObserver| !(o.member_koid == member && o.set_koid == set));
+	OBSERVER_COUNT.fetch_sub(before - observers.len(), Ordering::AcqRel);
 }
 
 // No-deadline sentinel for `wait`.
@@ -430,6 +477,14 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 // remove the claimed entries, and enqueue the threads. Entries the thread left in
 // other buckets are removed by the thread itself when it resumes.
 pub fn wake_object(koid: u64) {
+	// The sets watching this object, collected before anything is woken and NOT removed - an
+	// observer outlives the wake, which is the whole difference between it and a waiter.
+	let sets: Vec<u64> = if OBSERVER_COUNT.load(Ordering::Acquire) == 0 {
+		Vec::new()
+	} else {
+		let observers = observers_of(koid).lock();
+		observers.iter().filter(|o| o.member_koid == koid).map(|o| o.set_koid).collect()
+	};
 	let woken = {
 		let mut bucket = bucket_of(koid).lock();
 		let mut woken: Vec<Arc<Thread>> = Vec::new();
@@ -444,6 +499,25 @@ pub fn wake_object(koid: u64) {
 	};
 	for thread in woken {
 		enqueue(thread);
+	}
+	// One level, never a chain: a set may not contain a set, so a set's own wake reaches threads
+	// only. `WaitSet::add` is where that is refused.
+	for set in sets {
+		let parked = {
+			let mut bucket = bucket_of(set).lock();
+			let mut parked: Vec<Arc<Thread>> = Vec::new();
+			bucket.retain(|w: &BucketWaiter| {
+				if w.koid == set && w.thread.try_claim_wake() {
+					parked.push(w.thread.clone());
+					return false;
+				}
+				true
+			});
+			parked
+		};
+		for thread in parked {
+			enqueue(thread);
+		}
 	}
 }
 

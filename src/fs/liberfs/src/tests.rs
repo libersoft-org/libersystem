@@ -2110,6 +2110,49 @@ fn fsck_reports_metadata_damage_instead_of_dying() {
 // Doctor inode-tree leaf record `rec` in a raw device image (assumes the tree is a
 // single leaf): apply `f` to the record's 256-byte inode slot, then re-checksum the
 // leaf into the active superblock - the full forgery chain a hostile author performs.
+// Forge the inode record for a CHOSEN inode number, wherever the tree keeps it. `forge_inode_slot`
+// reaches the second record of the root leaf, which is only the right slot while the tree is one
+// leaf and the volume holds one file.
+fn forge_inode_slot_of(dev: &mut MemDevice, num: u32, f: impl FnOnce(&mut [u8])) {
+	let slot = active_slot(dev);
+	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
+	// Walk the inode tree by hand to the leaf holding `num`, re-checksumming the path on the way
+	// back out - the point is always the CONTENT of the record, never a checksum failure standing in
+	// for it.
+	let mut path: Vec<(u64, usize)> = Vec::new();
+	let mut ptr = sb.inode_root;
+	let mut crc = sb.inode_root_crc;
+	loop {
+		let start = ptr as usize * BLOCK_SIZE;
+		let block = &dev.blocks[start..start + BLOCK_SIZE];
+		assert_eq!(crc32c(block), crc, "the tree path must be intact before it is forged");
+		if node_type(block) == NODE_LEAF {
+			let count = leaf_count(block, INODE_REC);
+			let index = (0..count).find(|i| u64::from_le_bytes(block[NODE_HDR + i * INODE_REC..NODE_HDR + i * INODE_REC + 8].try_into().unwrap()) == num as u64).expect("the inode is in the tree");
+			let off = start + NODE_HDR + index * INODE_REC + 8;
+			f(&mut dev.blocks[off..off + INODE_SIZE]);
+			break;
+		}
+		let ci = route_child(block, internal_count(block), num as u64);
+		path.push((ptr, ci));
+		let (next, next_crc) = (child_ptr(block, ci), child_crc(block, ci));
+		ptr = next;
+		crc = next_crc;
+	}
+	// re-checksum from the leaf up to the root, then the superblock.
+	let mut child_hash = {
+		let start = ptr as usize * BLOCK_SIZE;
+		crc32c(&dev.blocks[start..start + BLOCK_SIZE])
+	};
+	for &(node, ci) in path.iter().rev() {
+		let start = node as usize * BLOCK_SIZE;
+		let off = start + INTERNAL_CHILD_BASE + ci * CHILD_SIZE + 8;
+		dev.blocks[off..off + 4].copy_from_slice(&child_hash.to_le_bytes());
+		child_hash = crc32c(&dev.blocks[start..start + BLOCK_SIZE]);
+	}
+	forge_superblock(dev, slot, |sb| sb[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&child_hash.to_le_bytes()));
+}
+
 fn forge_inode_slot(dev: &mut MemDevice, f: impl FnOnce(&mut [u8])) {
 	let slot = active_slot(dev);
 	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
@@ -3828,4 +3871,118 @@ fn a_mount_short_of_memory_does_not_blame_the_disk() {
 	// NoMemory), and `derive_free` is what allocates next.
 	let _armed = fail_allocation_after(2);
 	assert_eq!(LiberFs::mount(dev).err(), Some(MountError::NoMemory), "a refused allocation is the machine, not the medium");
+}
+
+#[test]
+fn an_unknown_type_that_was_a_directory_keeps_its_tree_reserved() {
+	// The mirror of `removing_an_unknown_type_inode_returns_its_blocks`, and the direction that was
+	// not covered. `INO_MAP` is an overlay - `dir_root` for a directory, `spill` for everything
+	// else - and reserving only the FILE reading protects one bit-flip out of two.
+	//
+	// An inode that was a directory arrives with `extent_count` zero, so the file reading marks
+	// almost nothing: its B+tree's internal and leaf nodes are left free for the allocator while the
+	// tree still references them, and the mount stays writable. The child inodes and their data
+	// survive; the index that named them is overwritten. That is worse than the case that was fixed,
+	// because a lost directory takes a whole subtree's reachability with it.
+	let nblocks: u64 = 4_000;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	// A directory big enough to have an internal node, so there are children to lose.
+	fs.mkdir(b"many").unwrap();
+	for i in 0..400u32 {
+		fs.write_file(format!("many/entry-{i:04}-{}", "p".repeat(40)).as_bytes(), b"x").unwrap();
+	}
+	let dir = fs.lookup(b"many").unwrap().unwrap();
+	let inode = fs.read_inode(dir).unwrap();
+	let root = inode.dir_root;
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	fs.read_node(root, inode.dir_root_crc, &mut buf).unwrap();
+	assert_eq!(node_type(&buf), NODE_INTERNAL, "the directory must have an internal node, or there is nothing to lose");
+	// every child of the root: the blocks the file reading cannot see.
+	let children: Vec<u64> = (0..=internal_count(&buf)).map(|i| child_ptr(&buf, i)).collect();
+	assert!(children.len() > 1);
+
+	// flip the type byte of THIS inode to one no writer emits.
+	let mut dev = fs.into_device();
+	forge_inode_slot_of(&mut dev, dir, |slot| slot[INO_TYPE_OFF] = 7);
+	let mut fs = LiberFs::mount(dev).expect("the volume still mounts");
+	assert_eq!(fs.read_inode(dir).unwrap().r#type, 7, "the forgery has to have landed");
+
+	assert!(fs.is_alloc(root), "the directory's root node is reserved");
+	for &child in children.iter() {
+		assert!(fs.is_alloc(child), "child node {child} of a directory that lost its type byte may not be free for the allocator");
+	}
+}
+
+#[test]
+fn a_read_this_machine_cannot_hold_reports_rather_than_aborts() {
+	// The read path was the one place a number off the medium sized an allocation directly, and it
+	// used `Vec::with_capacity` - which answers an impossible request by ABORTING the process. The
+	// pool's byte count bounds it, and a volume can be larger than the machine it is mounted on.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"small", b"payload").unwrap();
+	let num = fs.lookup(b"small").unwrap().unwrap();
+	let inode = fs.read_inode(num).unwrap();
+
+	// Refuse the read's own buffer, and the read reports instead of dying.
+	{
+		let _armed = fail_allocation_after(0);
+		assert_eq!(fs.read_range(&inode, 0, 7), Err(FsError::NoSpace));
+	}
+	// and with the injector disarmed it reads as it always did.
+	assert_eq!(fs.read_file(b"small").unwrap(), b"payload");
+}
+
+#[test]
+fn a_truncated_directory_leaf_may_be_read_but_not_edited() {
+	// The structural pass calls a leaf holding fewer records than its header claims a truncated
+	// leaf, and it only runs when somebody asks for `fsck`. An ordinary writable mount went on
+	// inserting into it - rewriting the leaf compactly from what parsed, which makes the damage
+	// permanent and self-consistent and loses whatever the tail held.
+	//
+	// The forgery has to be a leaf that is nearly FULL: `dir_leaf_parse` breaks at a record whose
+	// declared name runs past the end of the block, and a record can only reach the end when the
+	// ones in front of it have filled the leaf. A short leaf with a raised count is not a truncated
+	// leaf - the zero padding parses as empty-named records and the count comes out right.
+	let nblocks: u64 = 2_000;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.mkdir(b"d").unwrap();
+	// SHORT names, many of them: the last record has to START within 255 bytes of the end of the
+	// block for its declared length - one byte - to be able to run past it, and short records are
+	// what pack a leaf that tightly. A three-byte name gives a 16-byte record, and 240 of them put
+	// the last one at 3832 of the 4096 available, which is inside the reach of a u8 length.
+	for i in 0..240u32 {
+		fs.write_file(format!("d/{}", (b'a' + (i / 100) as u8) as char).as_bytes().iter().copied().chain(format!("{:02}", i % 100).bytes()).collect::<Vec<u8>>().as_slice(), b"x").unwrap();
+	}
+	let dir = fs.lookup(b"d").unwrap().unwrap();
+	let mut inode = fs.read_inode(dir).unwrap();
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	fs.read_node(inode.dir_root, inode.dir_root_crc, &mut buf).unwrap();
+	assert_eq!(node_type(&buf), NODE_LEAF, "the names must still be one leaf");
+	let claimed = node_count(&buf);
+	assert_eq!(claimed, 240);
+
+	// Walk to the LAST record and make its declared name run past the end of the block: the shape a
+	// write cut short leaves behind.
+	let mut off = NODE_HDR;
+	for _ in 0..claimed - 1 {
+		off += DIR_REC_HDR + buf[off + 12] as usize;
+	}
+	// The smallest declared length that runs past the end of the block, computed rather than
+	// guessed: a record's length is one byte, so the last record has to START within 255 of the end
+	// for the overrun to be expressible at all.
+	let need = BLOCK_SIZE - off - DIR_REC_HDR + 1;
+	assert!(need <= 255, "the last record starts at {off}, which is {need} short of a length a byte can hold - the leaf is not full enough");
+	buf[off + 12] = need as u8;
+	let crc = fs.write_node_to(inode.dir_root, &buf).unwrap();
+	inode.dir_root_crc = crc;
+	fs.write_inode(dir, &mut inode).unwrap();
+	fs.commit().unwrap();
+
+	// A listing still works - it is what the operator has left, and refusing it takes the rescue
+	// away.
+	assert_eq!(fs.read_dir(b"d").unwrap().len(), 239, "a truncated leaf still lists what it holds");
+	// fsck names it.
+	assert!(mentions(&fs.fsck().unwrap().faults, b"records it claims"), "fsck reports the truncated leaf");
+	// and nothing edits it.
+	assert_eq!(fs.write_file(b"d/another", b"c"), Err(FsError::Corrupt), "an insert into a leaf that is not what it claims is refused");
 }

@@ -623,7 +623,7 @@ fn abandon_pending(vol: &mut Volume, pending: &mut Option<PendingWrite>, chan: u
 // a slower leak in its place: a subclient whose queue is full at exactly this moment stays in the
 // table holding its channel, and nothing ever revisits it. `reply_to` already reports a stall for
 // every other answer in the service; this one had its own.
-fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, reply: &mut [u8]) -> Option<u64> {
+fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, quiet: bool, reply: &mut [u8]) -> Option<u64> {
 	let result = match outcome {
 		Ok(()) => {
 			if p.incremental {
@@ -644,10 +644,15 @@ fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, 
 	};
 	unsafe { close(p.stream) };
 	if let Some(len) = write_stream_reply(p.corr, result, reply) {
-		// Bounded: a client that has stopped reading its replies must not hold the service on this
-		// one. The stream is finished either way; what a stall still decides is whether that client
-		// keeps its place in the table.
-		if matches!(unsafe { send_deadline(p.client, &reply[..len], 0, clock().saturating_add(REPLY_TICKS)) }, SendOutcome::Stalled) {
+		// The SAME answer path as every other reply, `quiet` and all.
+		//
+		// This used to call `send_deadline` directly, so it always waited out the full deadline even
+		// for a client already known not to be reading - and when that client was the root, which is
+		// never dropped, the flag was never set either. A root that first stalled here went on
+		// costing every other client one deadline per queued request, which is the starvation the
+		// flag exists to remove, reached through a different door. One answer path is what stops
+		// there being a next door.
+		if matches!(reply_outcome(p.client, &reply[..len], &[], !quiet), SendOutcome::Stalled) {
 			return Some(p.client);
 		}
 	}
@@ -662,6 +667,11 @@ fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, 
 fn drop_stalled(vol: &mut Volume, clients: &mut Vec<Client>, pending: &mut Option<PendingWrite>, chan: u64) {
 	let Some(index) = clients.iter().position(|c| c.chan == chan) else { return };
 	if index == 0 {
+		// The root is never dropped - closing it ends the service - so what it gets instead is the
+		// quiet flag, exactly as the request path gives it. Returning without setting it left the
+		// root paying full deadlines for the rest of its backlog and everybody else waiting behind
+		// them.
+		clients[0].quiet = true;
 		return;
 	}
 	abandon_pending(vol, pending, chan);
@@ -670,6 +680,14 @@ fn drop_stalled(vol: &mut Volume, clients: &mut Vec<Client>, pending: &mut Optio
 }
 
 fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
+	// The admin's own `quiet`, for the reason the clients have one.
+	//
+	// The admin channel is never dropped: there is one of it, it is the operator's way in, and
+	// closing it turns a slow console into a system that cannot be administered. That decision is
+	// right and it makes the flag MORE necessary rather than less - being undroppable is exactly the
+	// condition under which a backlog costs everyone else a deadline per request, which is what the
+	// root client demonstrated.
+	let mut admin_quiet = false;
 	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full, quiet: false }];
 	// Allocated ONCE and cleared each pass. It was rebuilt with `Vec::with_capacity` on every trip
 	// round the event loop, which is an infallible allocation on the hot path of a service whose
@@ -734,7 +752,10 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 			// up here, so a pending operation is given up on rather than retried.
 			if ready != ERR_TIMED_OUT {
 				if let Some(p) = pending.take() {
-					finish_stream(vol, p, Err(Error::Invalid), &mut reply);
+					let quiet = clients.iter().any(|c| c.chan == p.client && c.quiet);
+					if let Some(stalled) = finish_stream(vol, p, Err(Error::Invalid), quiet, &mut reply) {
+						drop_stalled(vol, &mut clients, &mut pending, stalled);
+					}
 				}
 				if let Some(l) = listing.take() {
 					unsafe { close(l.producer) };
@@ -744,7 +765,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 			if let Some(p) = pending.as_ref() {
 				if unsafe { clock() } >= p.deadline() {
 					let p = pending.take().expect("checked");
-					if let Some(stalled) = finish_stream(vol, p, Err(Error::Again), &mut reply) {
+					let quiet = clients.iter().any(|c| c.chan == p.client && c.quiet);
+					if let Some(stalled) = finish_stream(vol, p, Err(Error::Again), quiet, &mut reply) {
 						drop_stalled(vol, &mut clients, &mut pending, stalled);
 					}
 				}
@@ -760,7 +782,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				match take_chunk(vol, &mut p) {
 					StreamStep::More => pending = Some(p),
 					StreamStep::Done(result) => {
-						if let Some(stalled) = finish_stream(vol, p, result, &mut reply) {
+						let quiet = clients.iter().any(|c| c.chan == p.client && c.quiet);
+						if let Some(stalled) = finish_stream(vol, p, result, quiet, &mut reply) {
 							drop_stalled(vol, &mut clients, &mut pending, stalled);
 						}
 					}
@@ -784,7 +807,13 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						// A stall does NOT drop the admin channel: it is the operator's way in,
 						// there is only one of it, and closing it turns a slow console into a
 						// service that can no longer be administered at all.
-						reply_to(admin, &reply[..reply_len], reply_handle.as_slice(), true);
+						admin_quiet = match reply_outcome(admin, &reply[..reply_len], reply_handle.as_slice(), !admin_quiet) {
+							SendOutcome::Stalled => true,
+							// It took its answer, or the channel is gone and the `Received::Closed`
+							// branch will retire it. Either way it is not a channel to keep skipping
+							// the wait for.
+							_ => false,
+						};
 					} else {
 						for &leftover in reply_handle.as_slice() {
 							unsafe { close(leftover) };
@@ -1520,11 +1549,47 @@ fn file_info(name: &[u8], size: u64, is_dir: bool, mtime: u64, ctime: u64) -> Re
 // Lossy for the same reason it always was: a name off a foreign medium need not be UTF-8, and a
 // listing that omits such a file is worse than one that renders it approximately.
 fn try_string(bytes: &[u8]) -> Result<String, Error> {
-	let text = String::from_utf8_lossy(bytes);
+	// The clean case borrows and costs one reservation.
+	if let Ok(text) = core::str::from_utf8(bytes) {
+		let mut out = String::new();
+		out.try_reserve_exact(text.len()).map_err(|_| Error::Again)?;
+		out.push_str(text);
+		return Ok(out);
+	}
+	// And the case this helper exists for does NOT go through `String::from_utf8_lossy`.
+	//
+	// That call borrows when the input is clean and builds an owned `String` of replacement
+	// characters when it is not - through the infallible path. So the helper written to make disk
+	// listings fallible was infallible on the one input that makes it necessary, and a name that is
+	// not UTF-8 is precisely what a foreign FAT, ISO9660 or UDF medium produces.
+	//
+	// Reserved first, at the worst case: every byte of a malformed sequence becomes one U+FFFD,
+	// which is three bytes, and each replacement consumes at least one input byte. Nothing below can
+	// grow the string past that, so nothing below can allocate.
 	let mut out = String::new();
-	out.try_reserve_exact(text.len()).map_err(|_| Error::Again)?;
-	out.push_str(&text);
-	Ok(out)
+	let worst = bytes.len().checked_mul(3).ok_or(Error::Again)?;
+	out.try_reserve_exact(worst).map_err(|_| Error::Again)?;
+	let mut rest = bytes;
+	loop {
+		match core::str::from_utf8(rest) {
+			Ok(text) => {
+				out.push_str(text);
+				return Ok(out);
+			}
+			Err(e) => {
+				let (good, bad) = rest.split_at(e.valid_up_to());
+				// good is valid by construction - `valid_up_to` is where the error starts.
+				out.push_str(core::str::from_utf8(good).unwrap_or(""));
+				out.push('\u{FFFD}');
+				// `error_len` is None when the input simply ends mid-sequence, and then the rest of
+				// it is one bad tail rather than a byte to step over.
+				match e.error_len() {
+					Some(skip) => rest = &bad[skip..],
+					None => return Ok(out),
+				}
+			}
+		}
+	}
 }
 
 // Collect `items` into a vector whose room was reserved fallibly.
@@ -2243,6 +2308,12 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 		partition::Disk::UnknownData => {
 			unsafe {
 				print(b"storage: vol://system NOT mounted: the disk carries data this build does not recognise, and no partition table. Nothing was changed - erase it deliberately if it really is scrap\n");
+			}
+			return None;
+		}
+		partition::Disk::HybridMbrAndGpt => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: the disk carries BOTH an MBR partition table and a GPT. Nothing was changed - two tables describing one disk disagree by construction, and nothing here can say which you meant\n");
 			}
 			return None;
 		}

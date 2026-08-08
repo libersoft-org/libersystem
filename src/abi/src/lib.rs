@@ -209,6 +209,28 @@ pub const SYS_BOOT_PROFILE: u64 = 64;
 pub const SYS_CHANNEL_SEND_CAPS: u64 = 67;
 pub const SYS_CHANNEL_RECV_CAPS: u64 = 68;
 
+// A wait set the kernel keeps: create one, add and remove the objects it watches, and wait on the
+// set rather than on an array handed over afresh every time. `SYS_WAIT_ANY` registers a waiter on
+// every handle in its array on every call, so the cost of one pass grows with how many things a
+// service listens to; a set registers each member once.
+pub const SYS_WAITSET_CREATE: u64 = 69;
+pub const SYS_WAITSET_ADD: u64 = 70;
+pub const SYS_WAITSET_REMOVE: u64 = 71;
+pub const SYS_WAITSET_WAIT: u64 = 72;
+
+// Random bytes that are NOT cryptographic, asked for by that name.
+//
+// `SYS_RANDOM_GET` answers from a hardware source or refuses; this one always answers, from a
+// deterministic generator seeded by the clock, and a caller reaching for it is saying that guessable
+// is fine. Two syscalls rather than one that silently changes what it gives you: userspace sees one
+// answer and cannot tell a hardware draw from a formula, so the moment anything derives a key or a
+// token from it on a machine with no hardware source, the result is guessable and nothing says so.
+//
+// The name is the whole point. What is wrong with the single syscall is not the formula - a boot
+// identifier, a jitter, a hash seed all want exactly this - it is that the formula arrives under a
+// name that promises otherwise.
+pub const SYS_RANDOM_INSECURE: u64 = 73;
+
 // The most capabilities one message may carry: stdin, stdout, stderr and one spare. Bounded
 // like everything else here, so a sender cannot make the receiver allocate by asking.
 pub const MAX_MESSAGE_CAPS: usize = 4;
@@ -222,6 +244,19 @@ pub const MAX_MESSAGE_CAPS: usize = 4;
 // 1 MiB is far above what the services exchange (a launch context is capped at 64 KiB) and far
 // below anything that threatens the kernel heap.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+// The largest a MemoryObject or a DmaBuffer may be, in bytes.
+//
+// The same lesson one object over. IPC, ELF images and wait sets all had ceilings and these did
+// not: the size went from the syscall to `pages_for` to `pages as u64 * PAGE_SIZE` with no checked
+// arithmetic and then to `Vec::with_capacity(pages)`, which answers an impossible request by
+// ABORTING the kernel. The Domain's memory quota bounds what a caller may HOLD, and it is checked
+// after the arithmetic that can wrap - so it was never the thing standing between a number and the
+// allocator.
+//
+// 1 GiB is far above anything the system allocates in one object (the largest is a 4K framebuffer
+// at about 32 MiB) and far below what the arithmetic can lose.
+pub const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 
 // The most handles one `SYS_WAIT_ANY` may name. It was bounded by how many handles the caller
 // holds, which is a limit that another finding shows is itself reachable past its ceiling - so
@@ -553,6 +588,11 @@ pub const ERR_TIMED_OUT: i64 = -11;
 // (SYS_ABI_CHECK): the runtime refuses to run rather than issue calls against a
 // mismatched syscall table or struct layout.
 pub const ERR_ABI_MISMATCH: i64 = -12;
+
+// The machine cannot do this, and no retry or smaller request will change that. Distinct from
+// `ERR_INVALID` (the request was malformed) and from `ERR_RESOURCE_EXHAUSTED` (there was not enough
+// of something right now): the caller asked a reasonable question of a machine that has no answer.
+pub const ERR_UNSUPPORTED: i64 = -13;
 
 // True if a syscall return value encodes an error (the reserved band [-4095, -1]).
 // A higher-half kernel address has its top bit set and so is never mistaken for

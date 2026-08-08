@@ -318,10 +318,15 @@ impl Process {
 	// a supervisor or job table legitimately holds one long after the exit. Idempotent:
 	// the scheduler calls it as the final thread retires.
 	pub fn mark_exited(&self) {
-		// same order as `terminate`: going away, then the cleanup, then gone. A waiter that
-		// saw `exited` used to be able to observe a finished process whose handles were
-		// still open and whose mappings still existed.
+		// The same order as `terminate`, and now the same WORK: going away, the cleanup, then gone.
+		//
+		// It closed the handles and stopped there, so a clean exit left the process's MemoryObject
+		// and DmaBuffer mappings in place until the `Process` itself dropped - which a supervisor
+		// holding a handle can delay for as long as it likes. `Terminated` then meant "the threads
+		// are finished" rather than "the address space is frozen", and the two paths to the same
+		// state did different amounts of it.
 		self.terminating.store(true, Ordering::Release);
+		self.unmap_objects();
 		self.handles.lock().close_all();
 		self.exited.store(true, Ordering::Release);
 		sched::wake_object(self.header.koid());
@@ -487,15 +492,16 @@ impl Drop for Process {
 		// Release the leaf data frames backing the user image and stack. The address
 		// space, dropped alongside, reclaims only the page-table structure.
 		let frames = core::mem::take(&mut *self.user_frames.lock());
-		if !frames.is_empty() {
-			// Every core that ever ran a thread of this process may still hold
-			// translations for these. They go back to the allocator only once nobody does.
-			crate::mem::tlb::shootdown();
-		}
-		for frame in frames {
-			// SAFETY: these are the frames the process adopted, taken out of its list above
-			// so nothing else can reach them, after a shootdown retired every translation.
-			unsafe { crate::mem::frame::deallocate(frame) };
+		// Every core that ever ran a thread of this process may still hold translations for these,
+		// so they go back to the allocator only once nobody does - which `retire` is what decides.
+		//
+		// SAFETY: these are the frames the process adopted, taken out of its list above so nothing
+		// else can reach them.
+		unsafe {
+			crate::mem::frame::retire(&frames);
+			// A process going away frees its whole image; take the shootdown here rather than
+			// leaving a process's worth of memory quarantined until somebody else fills the queue.
+			crate::mem::frame::drain_quarantine();
 		}
 	}
 }

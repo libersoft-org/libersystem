@@ -1161,6 +1161,20 @@ extern "C" fn user_nx_thread_body(_arg: u64) {
 	unsafe { frame::deallocate(stack) };
 }
 
+// A DeviceManager privilege in the calling thread's handle table.
+//
+// `SYS_DEVICE_ACQUIRE`, `SYS_DEVICE_MSIX_ACQUIRE` and `SYS_INTERRUPT_BIND` require one: ungated,
+// they minted a capability to any device's BAR for any caller that named an index. The suite drives
+// syscalls from kernel threads and there is no ring-0 exemption - a gate every test walks around is
+// a gate nobody has walked through - so a test that means to acquire a device holds the authority
+// like the one program that legitimately does.
+fn device_privilege() -> u64 {
+	use object::privilege::{Privilege, PrivilegeKind};
+	let thread = sched::current_thread().expect("a current thread");
+	let privilege = Privilege::create(PrivilegeKind::DeviceManager);
+	thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL, 0).expect("the privilege installs").raw()
+}
+
 // Kernel-thread body for the driver-crash test: it acquires real driver resources
 // - a bound IRQ and a DMA buffer - then drops to ring 3 and faults, leaving both
 // open so the kernel's crash cleanup is what detaches the IRQ and refunds the DMA.
@@ -1170,7 +1184,7 @@ extern "C" fn user_nx_thread_body(_arg: u64) {
 extern "C" fn driver_crash_thread_body(_arg: u64) {
 	use mem::frame::{self, PAGE_SIZE};
 	unsafe {
-		let irq = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, DRIVER_IRQ_VECTOR, 0, 0, 0);
+		let irq = arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, DRIVER_IRQ_VECTOR, device_privilege(), 0, 0);
 		assert!((irq as i64) > 0, "driver should bind its IRQ");
 		let dma = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, PAGE_SIZE, 0, 0, 0);
 		assert!((dma as i64) > 0, "driver should create its DMA buffer");

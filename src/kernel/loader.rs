@@ -248,14 +248,18 @@ fn free_frames(frames: Vec<u64>) {
 	if frames.is_empty() {
 		return;
 	}
-	// These frames were mapped into a live address space a moment ago. Every other core
-	// has to have dropped its translations before the allocator may hand them to anyone
-	// else - see `mem::tlb`.
-	crate::mem::tlb::shootdown();
-	for frame in frames {
-		// SAFETY: every frame here was allocated by this load and never adopted by a
-		// Process, so this call is its only owner; the shootdown above retired the
-		// translations that reached it.
-		unsafe { frame::deallocate(frame) };
+	// These frames were mapped into a live address space a moment ago. Every other core has to
+	// have dropped its translations before the allocator may hand them to anyone else, and
+	// `frame::retire` is the one place that decides so - it does the shootdown, frees on success
+	// and quarantines when a core did not answer. This used to do the shootdown here and free
+	// regardless of the outcome.
+	//
+	// SAFETY: every frame here was allocated by this load and never adopted by a Process, so this
+	// call is its only owner.
+	unsafe {
+		frame::retire(&frames);
+		// A rollback frees a whole image at once, so it is worth the shootdown now rather than
+		// leaving it to whoever next crosses the drain threshold.
+		frame::drain_quarantine();
 	}
 }

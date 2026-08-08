@@ -185,6 +185,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//      nothing rather than typing on an authority it does not hold. Optional, like the
 		//      drivers' own handling of it, so a boot that granted none still starts.
 		let console_input: u64 = recv_tagged(bootstrap, &mut buf, b"CONSOLE").unwrap_or(0);
+		// 1b3. and the DeviceManager privilege, which is what `device_acquire`,
+		//      `device_msix_acquire` and `interrupt_bind` now require. Without it this program takes
+		//      no device out of the kernel and no driver is launched - which is the right failure:
+		//      ungated, those syscalls handed any process the BAR of any PCI device, and on a
+		//      machine with no IOMMU a DMA-capable one reaches memory the page tables were meant to
+		//      isolate.
+		let device_privilege: u64 = recv_tagged(bootstrap, &mut buf, b"DEVPRIV").unwrap_or(0);
 
 		// 2. phase 1: launch the bootstrap block driver (virtio_blk) for each disk it backs.
 		//    It hands back a block-read service channel, which we route up to ServiceManager
@@ -207,7 +214,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// launcher can be handed to it once PermissionManager exists - which is after this
 		// program has finished starting drivers - and so its death is noticed and answered.
 		let mut dev: DevAgent = DevAgent::default();
-		launch_boot_drivers(&package, power, console_input, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
+		launch_boot_drivers(&package, power, console_input, device_privilege, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
 		//    the boot chain, then the second/third/fourth block disks' service channels (the
@@ -234,7 +241,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
-					launch_volume_drivers(handle, power, console_input, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
+					launch_volume_drivers(handle, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
 					if handle != 0 {
 						close(handle);
 					}
@@ -273,7 +280,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // device's MMIO capability and info. Each disk's block-read service channel is routed up
 // (system / media / iso / udf, in discovery order). The non-bootstrap drivers are skipped
 // here - they load from the volume in phase 2, once it is mounted.
-unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64, buf: &mut [u8], block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64) {
+unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
 		let mut i: u64 = 0;
@@ -297,7 +304,7 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 			};
 			let mut handle: u64 = 0;
 			let mut dm_chan: u64 = 0;
-			if launch_one(i, &info, elf, driver_name, 0, power, console_input, buf, &mut handle, &mut dm_chan) {
+			if launch_one(i, &info, elf, driver_name, 0, power, console_input, device_privilege, buf, &mut handle, &mut dm_chan) {
 				// the first virtio-blk disk is the writable system volume; a second is routed
 				// up separately as the read-only FAT media volume, a third as the read-only
 				// ISO9660 volume, a fourth as the read-only UDF volume.
@@ -325,7 +332,7 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg_attr(not(feature = "development"), allow(unused_variables))] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg_attr(not(feature = "development"), allow(unused_variables))] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -370,7 +377,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, bu
 			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
 			let mut handle: u64 = 0;
 			let mut dm_chan: u64 = 0;
-			if launch_one(i, &info, elf, driver_name, key_producer, power, console_input, buf, &mut handle, &mut dm_chan) {
+			if launch_one(i, &info, elf, driver_name, key_producer, power, console_input, device_privilege, buf, &mut handle, &mut dm_chan) {
 				state[idx] = STATE_ONLINE;
 				if driver_name == b"virtio_net" {
 					*net_client = handle;
@@ -395,7 +402,11 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, bu
 					// through is closed as soon as this function returns.
 					dev.driver = dm_chan;
 					dev.storage = service_connect(storage).unwrap_or(0);
-					random_get(&mut dev.nonce);
+					// INSECURE by name, because that is what this is: an identifier that tells one
+					// boot from another, not a secret. Asking for the secure one would refuse on
+					// every machine with no hardware random source - which is two of the three
+					// architectures - for a number that never needed to be unguessable.
+					random_insecure(&mut dev.nonce);
 					dev.bootstrap = start_dev_agent(dev.storage, handle, &dev.nonce);
 					if dev.bootstrap == 0 {
 						print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
@@ -536,12 +547,12 @@ unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 // then re-acquires a fresh capability and respawns it, up to a few times - the
 // driver crash/restart cycle. Drivers do not crash in normal operation, so the
 // restart path is dormant on a healthy boot.
-unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, buf: &mut [u8], service_handle: &mut u64, control_out: &mut u64) -> bool {
+unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], service_handle: &mut u64, control_out: &mut u64) -> bool {
 	unsafe {
 		let info_size: usize = core::mem::size_of::<DeviceInfo>();
 		let mut attempt: u32 = 0;
 		loop {
-			let cap: i64 = device_acquire(i);
+			let cap: i64 = device_acquire(i, device_privilege);
 			let (dm_side, driver_side): (u64, u64) = match channel() {
 				Some(pair) => pair,
 				None => return false,
@@ -567,7 +578,7 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 			// silent.
 			let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel";
 			if use_msix {
-				let irq: i64 = device_msix_acquire(i);
+				let irq: i64 = device_msix_acquire(i, device_privilege);
 				if irq < 0 {
 					return false;
 				}

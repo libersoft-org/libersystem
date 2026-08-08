@@ -52,21 +52,29 @@ fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
 	}
 }
 
-crate::tagged_test!(random_get_fills_distinct_bytes, [Syscall]);
-fn random_get_fills_distinct_bytes() {
+crate::tagged_test!(random_fills_distinct_bytes_from_whichever_source_is_honest, [Syscall]);
+fn random_fills_distinct_bytes_from_whichever_source_is_honest() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
 	extern "C" fn body(_arg: u64) {
 		unsafe {
+			// WHICHEVER syscall this machine can honestly answer.
+			//
+			// The secure one refuses where there is no hardware source, which is two of the three
+			// architectures - so a test that only ever called it would be asserting the old
+			// contract, where one syscall answered from the formula under a name that promised a
+			// key. What is common to both is what this case is about: the buffer is filled, and two
+			// draws differ.
+			let call = if arch::random::secure_available() { SYS_RANDOM_GET } else { SYS_RANDOM_INSECURE };
 			let mut first = [0u8; 32];
 			let mut second = [0u8; 32];
-			let first_len = arch::syscall::invoke(SYS_RANDOM_GET, first.as_mut_ptr() as u64, first.len() as u64, 0, 0);
-			let second_len = arch::syscall::invoke(SYS_RANDOM_GET, second.as_mut_ptr() as u64, second.len() as u64, 0, 0);
-			assert_eq!(first_len as usize, first.len(), "random_get did not fill the whole buffer");
+			let first_len = arch::syscall::invoke(call, first.as_mut_ptr() as u64, first.len() as u64, 0, 0);
+			let second_len = arch::syscall::invoke(call, second.as_mut_ptr() as u64, second.len() as u64, 0, 0);
+			assert_eq!(first_len as usize, first.len(), "the source did not fill the whole buffer");
 			assert_eq!(second_len as usize, second.len());
 			// The buffer was actually written, and two draws differ (a false failure
 			// is a 1-in-2^256 event).
-			assert_ne!(first, [0u8; 32], "random_get left the buffer zeroed");
+			assert_ne!(first, [0u8; 32], "the source left the buffer zeroed");
 			assert_ne!(first, second, "two random draws were identical");
 		}
 		DONE.store(true, Ordering::SeqCst);

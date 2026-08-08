@@ -264,7 +264,7 @@ fn system_power_refuses_a_caller_without_the_root_domain() {
 		}
 	}
 
-	let child = Domain::new_child(&crate::sched::root_domain(), UNLIMITED, UNLIMITED, UNLIMITED);
+	let child = Domain::new_child(&crate::sched::root_domain(), UNLIMITED, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
 	crate::sched::spawn_with_object(body, child, Rights::ALL, 0);
 	crate::sched::run_until_idle();
 	assert!(NO_HANDLE.load(Ordering::SeqCst) < 0, "a caller holding no capability is refused");

@@ -145,7 +145,7 @@ fn duplicating_a_handle_is_charged_like_any_other_install() {
 	use crate::object::rights::Rights;
 
 	// a domain whose handle limit is four, so the quota is reached in a few steps.
-	let domain = Domain::new_child(&Domain::root(), u64::MAX, 4, u64::MAX);
+	let domain = Domain::new_child(&Domain::root(), u64::MAX, 4, u64::MAX).expect("a live parent takes a child");
 	let mut table = HandleTable::new();
 	table.set_domain(domain);
 	let (channel, _peer) = Channel::create();
@@ -1043,7 +1043,7 @@ fn domain_hierarchy_limit_is_enforced_through_memory_create() {
 	// The parent caps memory at two pages; the unbounded child may create two
 	// objects but the third is refused through the actual syscall path.
 	let parent = Domain::new(8192, UNLIMITED, UNLIMITED);
-	let child = Domain::new_child(&parent, UNLIMITED, UNLIMITED, UNLIMITED);
+	let child = Domain::new_child(&parent, UNLIMITED, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
 	extern "C" fn body(_arg: u64) {
 		unsafe {
 			assert!(!syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0)));
@@ -1076,7 +1076,7 @@ fn domain_kill_frees_subtree() {
 	// resources refunded and their threads reaped, leaving both Domains' accounts
 	// at zero. Killing a parent thus terminates every descendant process.
 	let parent = Domain::new(1 << 20, 16, 8);
-	let child = Domain::new_child(&parent, 1 << 20, 16, 8);
+	let child = Domain::new_child(&parent, 1 << 20, 16, 8).expect("a live parent takes a child");
 	// The killer runs in the root Domain (so it is not itself killed); it is
 	// seeded with a handle to the parent Domain and kills it.
 	extern "C" fn killer(domain_handle: u64) {
@@ -1672,6 +1672,12 @@ fn fuzzed_map_and_unmap_sequences_round_trip_the_window() {
 			for handle in handles {
 				assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0);
 			}
+			// The pages come back through the QUARANTINE now: a frame that was mapped is not handed
+			// to the allocator until a shootdown has retired every core's translation of it, and
+			// those are batched rather than taken one span at a time. Draining is what "wait for the
+			// shootdown" looks like from here; without it this measures the queue rather than the
+			// property.
+			unsafe { mem::frame::drain_quarantine() };
 			assert_eq!(mem::frame::free_count() as u64, frames_before as u64 + total_pages, "closing every object must return every page of frames it held");
 		}
 		DONE.store(true, Ordering::SeqCst);
@@ -1679,4 +1685,257 @@ fn fuzzed_map_and_unmap_sequences_round_trip_the_window() {
 	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the map/unmap fuzz ran to completion");
+}
+
+tagged_test!(a_refused_single_capability_send_leaves_the_handle_where_it_was, [Process, Syscall, Ipc]);
+fn a_refused_single_capability_send_leaves_the_handle_where_it_was() {
+	// The batch send was taught to MOVE a capability and this one was not: it looked the handle up,
+	// built a `Capability` from the result - a clone of the authority - sent that, and then closed
+	// the caller's handle with the result discarded. Two threads of one process naming the same
+	// handle could both look it up, both clone and both send, so one handle became two capabilities
+	// without `DUPLICATE`; the loser's close then failed and nobody was told.
+	//
+	// Two threads is not something this harness can arrange deterministically, so what is asserted
+	// here is the property the race exploited: the send is a MOVE, and a refused move costs nothing.
+	// A clone-then-close cannot have both halves of that.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			// a transport one message deep, filled, so the capability send onto it must fail.
+			let (transport, _peer) = channel_pair(1);
+			let payload = [0u8; 8];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, transport, payload.as_ptr() as u64, payload.len() as u64, 0) as i64, 0, "the first message fills the queue");
+
+			let (carried, _other) = channel_pair(4);
+			// The second transport is made BEFORE the count is taken: creating a channel pair costs
+			// two handles, and a count taken in between measures the test's own scaffolding.
+			let (drain, sink) = channel_pair(4);
+			let before = live_handle_count();
+			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, transport, payload.as_ptr() as u64, payload.len() as u64, carried)), "a send onto a full queue must be refused");
+			assert!(handle_is_live(carried), "a refused send gives the handle back, at the value it was named by");
+			assert_eq!(live_handle_count(), before, "and leaves the sender exactly the capabilities it had");
+
+			// and a send that SUCCEEDS consumes it - the other half of a move.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, drain, payload.as_ptr() as u64, payload.len() as u64, carried) as i64, 0, "the send succeeds");
+			assert!(!handle_is_live(carried), "a delivered transfer takes the handle with it");
+			assert_eq!(live_handle_count(), before - 1, "and exactly one capability left");
+			let _ = sink;
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the transfer thread ran to completion");
+}
+
+tagged_test!(a_receive_takes_a_message_only_if_it_fits, [Process, Syscall, Ipc]);
+fn a_receive_takes_a_message_only_if_it_fits() {
+	// `peek_shape` then `recv` were two operations under two separate locks, so a second receiver
+	// could take the peeked message in between - and the copy afterwards used the RECEIVED length.
+	// A receiver that declared a hundred bytes could be handed a megabyte and the kernel would write
+	// all of it into a buffer it had validated for a hundred.
+	//
+	// The property that closes it is asserted directly: a message that does not fit is REFUSED and
+	// LEFT IN THE QUEUE, so there is no window in which a decision about one message is applied to
+	// another.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let (tx, rx) = channel_pair(4);
+			let big = [0x5Au8; 512];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, tx, big.as_ptr() as u64, big.len() as u64, 0) as i64, 0, "the message is queued");
+
+			// A buffer far too small for it: refused, and nothing is consumed.
+			let mut small = [0u8; 16];
+			let mut caps = [0u64; abi::MAX_MESSAGE_CAPS + 1];
+			let result = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, rx, small.as_mut_ptr() as u64, small.len() as u64, caps.as_mut_ptr() as u64);
+			assert!(syscall::sys_is_err(result), "a message larger than the buffer must be refused");
+			assert_eq!(small, [0u8; 16], "and not one byte of it written");
+
+			// The message is still there, and a buffer that fits takes it.
+			let mut room = [0u8; 512];
+			let taken = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, rx, room.as_mut_ptr() as u64, room.len() as u64, caps.as_mut_ptr() as u64) as i64;
+			assert_eq!(taken, 512, "the refused message stayed in the queue for a caller that can hold it");
+			assert_eq!(room, big, "and arrived whole");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
+}
+
+tagged_test!(a_wait_set_registers_its_members_once_and_wakes_on_any_of_them, [Process, Syscall, Ipc]);
+fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
+	// `SYS_WAIT_ANY` takes a fresh array on every call, so the kernel registers a waiter on every
+	// object in it and takes them all out again - once per pass, for as long as the caller runs. A
+	// set registers each member when it JOINS, and a pass costs one registration and a readiness
+	// scan whatever the membership.
+	//
+	// What is asserted here is the behaviour, not the cost: that a set answers for any member, that
+	// membership survives between waits, and that removal takes effect. The cost is the reason the
+	// object exists and is measured by the service that uses it.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let set = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
+			assert!(!syscall::sys_is_err(set), "a wait set is created");
+
+			let (rx_a, tx_a) = channel_pair(4);
+			let (rx_b, tx_b) = channel_pair(4);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx_a, 0, 0) as i64, 0, "the first member joins");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx_b, 0, 0) as i64, 0, "the second member joins");
+			// A member joins once: registering it twice would wake the set twice for one event.
+			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx_a, 0, 0)), "a duplicate member is refused");
+			// And a set is not something to put in a set.
+			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, set, 0, 0)), "a set may not contain a set");
+
+			// Nothing ready yet: a wait with a deadline already past reports that rather than
+			// blocking, which is how this test asks "is anything ready" without parking.
+			let now = arch::apic::ticks();
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, now, 0, 0) as i64, syscall::ERR_TIMED_OUT, "an empty set of ready members times out");
+
+			// The SECOND member becomes readable, and the set answers with its index.
+			let payload = [7u8; 4];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, tx_b, payload.as_ptr() as u64, payload.len() as u64, 0) as i64, 0, "the message is sent");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, 1, "the set answers with the ready member's index");
+
+			// The membership SURVIVES the wait - which is the whole point of the object. A second
+			// wait finds the same member ready without anything being registered again.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, 1, "membership outlives a wait");
+
+			// Removing it takes effect, and the first member is still watched.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_REMOVE, set, rx_b, 0, 0) as i64, 0, "the member leaves");
+			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_WAITSET_REMOVE, set, rx_b, 0, 0)), "and leaving twice is refused");
+			let now = arch::apic::ticks();
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, now, 0, 0) as i64, syscall::ERR_TIMED_OUT, "with it gone, nothing in the set is ready");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, tx_a, payload.as_ptr() as u64, payload.len() as u64, 0) as i64, 0, "the other member gets a message");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, 0, "and the set answers for it");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the wait-set thread ran to completion");
+}
+
+tagged_test!(a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing, [Process, Syscall, Ipc]);
+fn a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing() {
+	// The registration-lifetime question, answered and asserted.
+	//
+	// Three answers were defensible - silent removal, a revocation event, or a stale registration
+	// that keeps reporting - and leaving it undefined was not. This kernel keeps the member: the set
+	// holds a reference, so a channel whose peer closes does not disappear from under a waiter. It
+	// becomes READY, which is what a closed peer is, and the waiter is told; leaving the set is
+	// explicit.
+	//
+	// The alternative would lose an edge. A member silently dropped at the moment it became
+	// interesting is a wake nobody gets.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let set = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
+			let (rx, tx) = channel_pair(4);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx, 0, 0) as i64, 0);
+			let now = arch::apic::ticks();
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, now, 0, 0) as i64, syscall::ERR_TIMED_OUT, "nothing is ready yet");
+
+			// The peer goes. The member stays, and says so.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, tx, 0, 0, 0) as i64, 0, "the peer closes");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, 0, "a closed peer is a ready member, not an absent one");
+
+			// And the set is exactly as large as it was.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_REMOVE, set, rx, 0, 0) as i64, 0, "the member is still there to remove");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the lifetime thread ran to completion");
+}
+
+tagged_test!(a_wait_set_has_a_ceiling_and_says_so, [Process, Syscall, Ipc]);
+fn a_wait_set_has_a_ceiling_and_says_so() {
+	// A set is kernel memory whose size a userspace caller decides, which is the shape of every
+	// quota in this kernel and gets the same treatment: a fixed ceiling first, then a fallible
+	// allocation, then a refusal rather than an abort.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let set = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
+			let mut admitted = 0usize;
+			let mut refused = false;
+			// One event object per slot: cheaper than a channel pair and waitable all the same.
+			for _ in 0..object::wait_set::MAX_WAIT_SET_MEMBERS + 4 {
+				let handle = {
+					let thread = sched::current_thread().expect("a current thread");
+					let event = object::event::Event::create();
+					match thread.handles().lock().try_insert_object(event, object::rights::Rights::ALL, 0) {
+						Some(h) => h.raw(),
+						None => break,
+					}
+				};
+				if syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, handle, 0, 0)) {
+					refused = true;
+					break;
+				}
+				admitted += 1;
+			}
+			assert!(refused, "the set refuses rather than growing without bound");
+			assert_eq!(admitted, object::wait_set::MAX_WAIT_SET_MEMBERS, "and it refuses at its stated ceiling");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the ceiling thread ran to completion");
+}
+
+tagged_test!(a_secure_random_syscall_refuses_rather_than_answering_from_a_formula, [Syscall, Process]);
+fn a_secure_random_syscall_refuses_rather_than_answering_from_a_formula() {
+	// There was ONE syscall. It answered from the CPU's hardware source where there was one and from
+	// a clock-seeded formula where there was not, and userspace saw one answer either way - so
+	// anything deriving a key or a token from it was guessable on any machine without the hardware,
+	// with nothing to say so.
+	//
+	// And that was not a corner case: two of this system's three architectures have no hardware
+	// source at all, so the formula was the ANSWER there rather than the fallback.
+	//
+	// Two syscalls now. `SYS_RANDOM_GET` gives hardware or refuses; `SYS_RANDOM_INSECURE` always
+	// answers and says in its name what it is. What was wrong was never the formula - a boot
+	// identifier wants exactly that - it was the formula arriving under a name that promised
+	// otherwise.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let mut buf = [0u8; 32];
+			let secure = arch::syscall::invoke(syscall::SYS_RANDOM_GET, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as i64;
+			if arch::random::secure_available() {
+				assert_eq!(secure, buf.len() as i64, "a machine with a hardware source answers from it");
+				assert!(buf.iter().any(|&b| b != 0), "and the answer is not zeros");
+			} else {
+				assert_eq!(secure, syscall::ERR_UNSUPPORTED, "a machine with no hardware source refuses rather than substituting");
+				assert_eq!(buf, [0u8; 32], "and writes nothing at all");
+			}
+
+			// The other one always answers, on every machine, and says what it is by its name.
+			let mut weak = [0u8; 32];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_RANDOM_INSECURE, weak.as_mut_ptr() as u64, weak.len() as u64, 0, 0) as i64, weak.len() as i64, "the insecure source always answers");
+			assert!(weak.iter().any(|&b| b != 0), "with something");
+			// Twice in a row differs, which is all a boot identifier ever wanted from it.
+			let mut again = [0u8; 32];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_RANDOM_INSECURE, again.as_mut_ptr() as u64, again.len() as u64, 0, 0) as i64, again.len() as i64);
+			assert_ne!(weak, again, "two draws differ, which is what 'distinguishable' means");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the random thread ran to completion");
 }

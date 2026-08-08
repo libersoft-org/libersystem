@@ -57,11 +57,42 @@ fn next_u64() -> u64 {
 	}
 }
 
-// Fill `buf` with random bytes.
-pub fn fill(buf: &mut [u8]) {
+// Whether this machine has a source fit for a key.
+pub fn secure_available() -> bool {
+	has_rdrand()
+}
+
+// Fill `buf` from the hardware source, or answer false if there is none.
+//
+// The two sources are now two FUNCTIONS, because they were one and userspace could not tell which
+// it had been given. A caller that needs a key gets hardware or an error; a caller that needs a
+// distinguishable number asks for `insecure` by that name.
+pub fn secure(buf: &mut [u8]) -> bool {
+	if !has_rdrand() {
+		return false;
+	}
 	let mut i = 0;
 	while i < buf.len() {
-		let bytes = next_u64().to_le_bytes();
+		// SAFETY: `has_rdrand` said the instruction is there.
+		let Some(value) = (unsafe { rdrand64() }) else {
+			// RDRAND signalling failure through every retry is a source that is not answering, and
+			// quietly finishing the buffer from the formula is exactly the substitution this split
+			// exists to prevent.
+			return false;
+		};
+		let bytes = value.to_le_bytes();
+		let n = (buf.len() - i).min(8);
+		buf[i..i + n].copy_from_slice(&bytes[..n]);
+		i += n;
+	}
+	true
+}
+
+// Fill `buf` from the deterministic generator. Always succeeds, never suitable for a secret.
+pub fn insecure(buf: &mut [u8]) {
+	let mut i = 0;
+	while i < buf.len() {
+		let bytes = fallback_u64().to_le_bytes();
 		let n = (buf.len() - i).min(8);
 		buf[i..i + n].copy_from_slice(&bytes[..n]);
 		i += n;

@@ -219,10 +219,18 @@ impl Domain {
 	// Returns None for a killed parent: a child created under one would never be reached
 	// by that kill, and its charges would pass through a parent that is no longer
 	// enforcing anything.
-	pub fn new_child(parent: &Arc<Domain>, memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Arc<Self> {
+	pub fn new_child(parent: &Arc<Domain>, memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Option<Arc<Self>> {
 		let child = Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: Some(Arc::downgrade(parent)), children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) });
-		parent.children.lock().push(child.clone());
-		child
+		// The check is UNDER the same lock as the push, which is what `register_process` was taught
+		// and this was not - the doc comment already claimed it. A kill takes a snapshot of the
+		// children and then walks it, so a child pushed after the snapshot and before the flag is
+		// read survives the kill it was created during, with a parent that is already gone.
+		let mut children = parent.children.lock();
+		if parent.killed.load(Ordering::Acquire) {
+			return None;
+		}
+		children.push(child.clone());
+		Some(child)
 	}
 
 	pub fn account(&self) -> &ResourceAccount {

@@ -143,7 +143,10 @@ fn rollback(base: u64, mapped: usize, len: u64) {
 		if let Some(frame) = arch::paging::unmap_page(at) {
 			// SAFETY: a page of this stack, owned by it, just unmapped from the only place it
 			// was ever mapped.
-			unsafe { crate::mem::frame::deallocate(frame) };
+			// The kernel stack's pages were mapped into the kernel window, which every address
+			// space shares - so a stale translation to one is reachable from every process on the
+			// machine until the shootdown completes.
+			unsafe { crate::mem::frame::retire(&[frame]) };
 		}
 	}
 	// No address space: a kernel-window range is routed by address, and there is no per-space
@@ -287,6 +290,19 @@ impl Drop for Thread {
 		// thread drops, the Arc to the Process drops with it, tearing down the
 		// process's handle table (refunding its handles) and address space.
 		self.process.domain().uncharge_thread();
+		// And the LIVE-THREAD counter, for a thread that never ran.
+		//
+		// `register_thread` increments it as the thread is built, and the scheduler decrements it
+		// when a thread exits - so a thread that is created and then dropped before it ever starts
+		// left the count permanently one high. `sys_thread_create` can do exactly that: it builds
+		// the thread and then fails to install a handle to it on the caller's quota. The process is
+		// then one short of "last thread exited" forever, and its finaliser never runs.
+		//
+		// Only for a thread that never started: one that ran has already been counted out on its
+		// way through `sched::exit`, and counting it again would take the process below zero.
+		if !self.started.load(Ordering::Acquire) && self.process.thread_exited() {
+			self.process.mark_exited();
+		}
 	}
 }
 

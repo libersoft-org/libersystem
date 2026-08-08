@@ -371,7 +371,22 @@ pub mod random {
 
 	static STATE: AtomicU64 = AtomicU64::new(0);
 
-	pub fn fill(buf: &mut [u8]) {
+	// No hardware source on this port yet.
+	//
+	// riscv64 has one in the architecture - the Zkr extension's seed CSR - and nothing here detects or uses it, so
+	// every draw comes from the formula below. That is why `SYS_RANDOM_GET` refuses on this
+	// architecture rather than answering: the alternative is a syscall named for a key handing out
+	// numbers derived from the boot clock, on every machine, always. The boot log says so out loud.
+	pub fn secure_available() -> bool {
+		false
+	}
+
+	pub fn secure(_buf: &mut [u8]) -> bool {
+		false
+	}
+
+	// Deterministic, seeded from the clock. Distinguishable, never secret.
+	pub fn insecure(buf: &mut [u8]) {
 		let mut s = STATE.load(Ordering::Relaxed) ^ super::tsc::now() ^ 0x9E37_79B9_7F4A_7C15;
 		for chunk in buf.chunks_mut(8) {
 			let z = crate::arch::common::rng::splitmix64(&mut s);

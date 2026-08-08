@@ -22,6 +22,7 @@ pub mod process_group;
 pub mod rights;
 pub mod thread;
 pub mod timer;
+pub mod wait_set;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -52,12 +53,15 @@ pub enum ObjectType {
 	// A named authority with no object of its own - the display, the console's input
 	// sink, the console's input source. See `privilege`.
 	Privilege,
+	// A set of objects registered once and waited on many times. See `wait_set`.
+	WaitSet,
 }
 
 impl ObjectType {
 	// A short, stable name for this type (used by introspection and the graph).
 	pub fn name(self) -> &'static str {
 		match self {
+			ObjectType::WaitSet => "WaitSet",
 			ObjectType::Domain => "Domain",
 			ObjectType::Process => "Process",
 			ObjectType::Thread => "Thread",
@@ -91,6 +95,7 @@ impl ObjectType {
 			ObjectType::DmaBuffer => 10,
 			ObjectType::ProcessGroup => 11,
 			ObjectType::Privilege => 12,
+			ObjectType::WaitSet => 13,
 		}
 	}
 }

@@ -457,11 +457,14 @@ fn a_device_that_does_not_answer_says_nothing_about_what_is_on_it() {
 		img.dead.insert(dead, ());
 		assert_eq!(probe(&mut img), Disk::Io, "LBA {dead} unreadable");
 	}
-	// and a failure while the entry array is read is the same claim.
+	// A failure while the entry array is read is the same claim about the DEVICE, and it used to be
+	// answered as `CorruptGpt` - which is a claim about the TABLE. Nothing was written either way,
+	// so it was diagnosis rather than safety, and the two send an operator to different places: one
+	// means repair the table, the other means check the cable.
 	let mut img = gpt_disk(&[liberfs_entry(2048, 40959)]);
 	img.dead.insert(ENTRIES_LBA, ());
 	img.dead.insert(CAPACITY - 1 - ARRAY_SECTORS, ());
-	assert_eq!(probe(&mut img), Disk::CorruptGpt, "an array that cannot be read cannot be verified");
+	assert_eq!(probe(&mut img), Disk::Io, "an array that cannot be READ is a device that did not answer");
 }
 
 #[test]
@@ -733,4 +736,110 @@ fn a_table_this_machine_cannot_hold_is_not_a_damaged_table() {
 	// component entirely.
 	assert!(try_zeroed(16 * 1024).is_ok(), "an ordinary entry array still allocates");
 	assert_eq!(try_zeroed(usize::MAX / 2).err(), Some(Fault::NoMemory), "and one this machine cannot hold reports");
+}
+
+// M0146, fifth audit: what ties a partition table to the medium it is on.
+
+#[test]
+fn a_header_that_lies_about_its_own_position_is_refused() {
+	// The audit's scenario, built exactly: a correctly-checksummed header sitting physically at LBA
+	// 1 that says it lives at 65000, names its backup at 65535, and declares LBA 1 usable. Every
+	// relation between its OWN fields holds - the header is not inside its declared usable range,
+	// nor is the backup, and the entry array is placed above `last_usable` so that clears too - and
+	// a LiberFS entry may then start at LBA 1, which is the sector the header is sitting in. The
+	// mount finds no superblock there and the service formats over the table.
+	//
+	// Nothing but the read POSITION distinguishes this from a legitimate table, which is why the
+	// header's account of where it lives has to be checked against where it was found.
+	let layout = Layout { header_lba: 1, backup_lba: CAPACITY - 1, first_usable: 1, last_usable: 60_000, entries_lba: 60_001, ..Layout::primary() };
+	let mut img = Image::new(CAPACITY);
+	img.put(0, &protective_mbr());
+	// laid at LBA 1 while claiming 65000 - `write_header` writes to the layout's `header_lba`, so
+	// the claim and the position are separated by hand.
+	let lying = Layout { header_lba: 65_000, ..layout };
+	write_header(&mut img, &lying, &[liberfs_entry(1, 40_959)]);
+	let stated = img.sectors.remove(&65_000).expect("the header was written where it claims to be");
+	img.sectors.insert(1, stated);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "a header has to sit where it says it sits");
+}
+
+#[test]
+fn a_header_that_misnames_its_counterpart_is_refused() {
+	// The other half of the same tie: the primary must name the last sector as its backup and the
+	// backup must name LBA 1. A table whose two copies do not point at each other describes a disk
+	// that does not exist, however well each copy checksums on its own.
+	let layout = Layout { backup_lba: CAPACITY - 2, ..Layout::primary() };
+	let mut img = primary_only(layout, &[liberfs_entry(2048, 40959)]);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "the primary has to name the last sector as its backup");
+
+	// and a device that will not say how large it is cannot answer the question at all, so it fails
+	// the relation rather than skipping it.
+	let mut img = gpt_disk(&[liberfs_entry(2048, 40959)]);
+	img.capacity = None;
+	assert_eq!(probe(&mut img), Disk::CorruptGpt);
+}
+
+#[test]
+fn a_real_hybrid_mbr_and_gpt_is_neither_answer() {
+	// A disk carrying BOTH: real MBR partition entries beside a protective one, and a complete
+	// valid GPT over the same medium. This build used to compute the MBR classification and then
+	// throw it away the moment LBA 1 carried a signature, so such a disk was decided entirely by
+	// its GPT - and a LiberFS entry sitting on top of an MBR partition's range would have been
+	// accepted, because neither table knows about the other.
+	//
+	// The existing hybrid test does not reach this: its image has no GPT header at all, so it
+	// exercises the no-GPT path.
+	let mut img = gpt_disk(&[liberfs_entry(2048, 40959)]);
+	img.edit(0, |mbr| {
+		// a real partition beside the protective entry the image already carries.
+		mbr[462 + 4] = 0x07; // NTFS
+		mbr[462 + 8..462 + 12].copy_from_slice(&2048u32.to_le_bytes());
+		mbr[462 + 12..462 + 16].copy_from_slice(&60_000u32.to_le_bytes());
+	});
+	assert_eq!(probe(&mut img), Disk::HybridMbrAndGpt, "two tables describing one disk is not an answer to act on");
+}
+
+#[test]
+fn a_table_whose_partitions_overlap_is_not_a_table_to_act_on() {
+	// A checksum-valid GPT naming a Linux partition at 2048..30000 and a LiberFS one at
+	// 10000..40000. Every check this build made was about the LiberFS entry alone - the usable
+	// range, both copies of the metadata, a minimum size - and none of them looks at the other
+	// partitions. Formatting the LiberFS span would have destroyed half the Linux one.
+	let linux = Entry { guid: [0x28; 16], first: 2048, last: 30_000 };
+	let mut img = gpt_disk(&[linux, liberfs_entry(10_000, 40_959)]);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "partitions that claim the same sectors describe a disk that cannot exist");
+
+	// and the ordinary table, where they do not overlap, is still found.
+	let linux = Entry { guid: [0x28; 16], first: 2048, last: 9_999 };
+	let mut img = gpt_disk(&[linux, liberfs_entry(10_000, 40_959)]);
+	assert_eq!(probe(&mut img), Disk::LiberFs { first: 10_000, last: 40_959 });
+}
+
+#[test]
+fn two_valid_tables_that_disagree_are_not_an_answer() {
+	// The primary verified, so the backup used never to be read at all - and two individually valid
+	// copies contradicting each other were therefore not an ambiguity. This answer authorises a
+	// format, so agreement between the copies is cheap evidence and its absence should stop the
+	// write.
+	let mut img = Image::new(CAPACITY);
+	img.put(0, &protective_mbr());
+	write_gpt(&mut img, &[liberfs_entry(2048, 40959)]);
+	// a backup that is correct in every internal respect and names a different partition.
+	write_header(&mut img, &Layout::backup(), &[liberfs_entry(4096, 20000)]);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "two tables that disagree about the disk are not a table to act on");
+
+	// and the ordinary case, where they agree, is unaffected.
+	let mut img = gpt_disk(&[liberfs_entry(2048, 40959)]);
+	assert_eq!(probe(&mut img), Disk::LiberFs { first: 2048, last: 40959 });
+}
+
+#[test]
+fn a_blank_disk_of_unknown_size_may_not_be_formatted() {
+	// The GPT path refuses a device that will not report its size, because every span in a table is
+	// bounded from outside by the medium alone. The blank path did not - and the asymmetry was the
+	// wrong way round, because the GPT case merely declines to mount while this one licenses writing
+	// over the whole device.
+	let mut img = Image::new(CAPACITY);
+	img.capacity = None;
+	assert_eq!(probe(&mut img), Disk::UnknownData, "a device that cannot say how big it is cannot be shown to be empty");
 }

@@ -273,6 +273,21 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.settle_root(outcome)
 	}
 
+	// A directory leaf is what it CLAIMS to be, or it is not one to edit.
+	//
+	// `dir_leaf_parse` is deliberately tolerant: it stops at a record it cannot complete and returns
+	// what it managed, so a damaged directory can still be listed and rescued. That is right for a
+	// read and wrong for a write. The structural pass calls a leaf holding fewer records than its
+	// header claims a truncated leaf and reports it - and it only runs when someone asks for `fsck`,
+	// so an ordinary writable mount would go on inserting into a list already out of order,
+	// rewriting the leaf compactly and making the damage permanent and consistent.
+	//
+	// Checked where the mutation happens rather than at mount: a whole structural pass at mount
+	// costs every boot, and this costs a comparison on a block that has just been read anyway.
+	fn leaf_is_whole(buf: &[u8], recs: &[DirRec]) -> Result<(), FsError> {
+		if recs.len() != node_count(buf) { Err(FsError::Corrupt) } else { Ok(()) }
+	}
+
 	pub(crate) fn dir_insert_node(&mut self, ptr: u64, crc: u32, name: &[u8], child: u32, depth: usize) -> Result<Ins, FsError> {
 		// bounded like the shared insert recursion: a deeper path is a hostile shape.
 		if depth == 0 {
@@ -283,6 +298,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
 			let mut recs = dir_leaf_parse(&buf);
+			Self::leaf_is_whole(&buf, &recs)?;
 			match dir_recs_search(&recs, hash, name) {
 				Ok(pos) => recs[pos].child = child,
 				Err(pos) => recs.insert(pos, DirRec { hash, name: name.to_vec(), child }),
@@ -351,6 +367,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
 			let mut recs = dir_leaf_parse(&buf);
+			Self::leaf_is_whole(&buf, &recs)?;
 			let pos = match dir_recs_search(&recs, hash, name) {
 				Ok(pos) => pos,
 				Err(_) => return Ok(Del::NotFound),

@@ -23,7 +23,7 @@ use crate::device;
 use crate::fault::FaultInfo;
 use crate::loader::{self, LoadError};
 use crate::mem::frame::PAGE_SIZE;
-use crate::object::channel::{Channel, ChannelError, Message};
+use crate::object::channel::{Channel, ChannelError, Message, RecvRefusal};
 use crate::object::device_memory::DeviceMemory;
 use crate::object::dma_buffer::DmaBuffer;
 use crate::object::domain::Domain;
@@ -36,6 +36,7 @@ use crate::object::process::Process;
 use crate::object::rights::Rights;
 use crate::object::thread::Thread;
 use crate::object::timer::Timer;
+use crate::object::wait_set::{WaitSet, WaitSetError};
 use crate::object::{KernelObject, ObjectType};
 use crate::sched;
 
@@ -43,7 +44,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -201,7 +202,9 @@ fn sys_debug_write(arg: u64, len: u64) -> i64 {
 	// Copy the caller's bytes into a kernel buffer through the sanctioned SMAP
 	// window, so the serial path below never touches user memory directly (it
 	// holds the TX lock while it writes, so a fault there would deadlock).
-	let bytes = read_bytes(arg, len as usize);
+	let Some(bytes) = read_bytes(arg, len as usize) else {
+		return ERR_NO_MEMORY;
+	};
 	// Report how many bytes the transmit ring accepted: a caller pacing a mirror
 	// backlog resumes from there on its next pass instead of losing the tail.
 	crate::_print_bytes(&bytes) as i64
@@ -311,6 +314,16 @@ fn map_pages_or_rollback(base: u64, count: usize, flags: u64, mut phys_of: impl 
 // the handlers that only need the looked-up object: a missing thread maps to
 // ERR_NO_THREAD, denied rights to ERR_ACCESS_DENIED, and a bad handle or wrong
 // type to ERR_BAD_HANDLE.
+// The object behind a handle without asking what type it is, for callers that do not care.
+fn untyped_object(handle: u64, rights: Rights) -> Result<Arc<dyn KernelObject>, i64> {
+	let thread = sched::current_thread().ok_or(ERR_NO_THREAD)?;
+	match thread.handles().lock().lookup(Handle::from_raw(handle), rights) {
+		Ok(object) => Ok(object),
+		Err(HandleError::AccessDenied) => Err(ERR_ACCESS_DENIED),
+		Err(_) => Err(ERR_BAD_HANDLE),
+	}
+}
+
 fn current_object(handle: u64, ty: ObjectType, rights: Rights) -> Result<Arc<dyn KernelObject>, i64> {
 	let thread = sched::current_thread().ok_or(ERR_NO_THREAD)?;
 	match thread.handles().lock().lookup_typed(Handle::from_raw(handle), ty, rights) {
@@ -394,8 +407,9 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_DMA_BUFFER_PHYS => sys_dma_buffer_phys(a0, a1),
 		SYS_DEVICE_MEMORY_MAP => sys_device_memory_map(a0),
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
-		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0),
-		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0),
+		SYS_RANDOM_INSECURE => sys_random_insecure(a0, a1),
+		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0, a1),
+		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0, a1),
 		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
 		SYS_SYSTEM_POWER => sys_system_power(a0, a1),
 		SYS_CONSOLE_FEED => sys_console_feed(a0, a1, a2),
@@ -416,7 +430,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_CONSOLE_ATTACH => sys_console_attach(a0, a1),
 		SYS_DEVICE_COUNT => device::count() as i64,
 		SYS_DEVICE_INFO => sys_device_info(a0, a1, a2),
-		SYS_DEVICE_ACQUIRE => sys_device_acquire(a0),
+		SYS_DEVICE_ACQUIRE => sys_device_acquire(a0, a1),
 		SYS_MEMORY_MAP => sys_memory_map(a0),
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
@@ -426,6 +440,10 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_CHANNEL_RECV => sys_channel_recv(a0, a1, a2, a3),
 		SYS_CHANNEL_SEND_CAPS => sys_channel_send_caps(a0, a1, a2, a3),
 		SYS_CHANNEL_RECV_CAPS => sys_channel_recv_caps(a0, a1, a2, a3),
+		SYS_WAITSET_CREATE => sys_waitset_create(),
+		SYS_WAITSET_ADD => sys_waitset_add(a0, a1),
+		SYS_WAITSET_REMOVE => sys_waitset_remove(a0, a1),
+		SYS_WAITSET_WAIT => sys_waitset_wait(a0, a1, a2),
 		SYS_EVENT_CREATE => sys_event_create(),
 		SYS_EVENT_SIGNAL => sys_event_signal(a0),
 		SYS_EVENT_POLL => sys_event_poll(a0),
@@ -772,7 +790,9 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	if device.mapped_at() != 0 {
+	// CLAIMED, not tested. Two threads both finding it unmapped and both mapping it is how a
+	// mapping outlived the capability that authorised it.
+	if !device.claim_mapping() {
 		return ERR_INVALID;
 	}
 	let user = arch::percpu::in_user_syscall();
@@ -782,6 +802,7 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 	let len = pages as u64 * PAGE_SIZE;
 	let base = alloc_vrange_in(&space, user, len);
 	if base == 0 {
+		device.release_claim();
 		return ERR_NO_MEMORY;
 	}
 	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_CACHE | arch::paging::NO_EXECUTE;
@@ -795,6 +816,7 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 	let phys_base = device.aligned_phys_base();
 	if !map_pages_or_rollback(base, pages, flags, |i| phys_base + i as u64 * PAGE_SIZE) {
 		free_vrange(Some(&space), base, len);
+		device.release_claim();
 		return ERR_NO_MEMORY;
 	}
 	device.set_mapped_in(base, space);
@@ -825,7 +847,13 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 // (DeviceManager) hands it to the matching driver, which maps it with
 // device_memory_map. Returns ERR_INVALID for an out-of-range index. (Gating this
 // to DeviceManager is a PermissionManager policy concern, deferred.)
-fn sys_device_acquire(index: u64) -> i64 {
+fn sys_device_acquire(index: u64, privilege: u64) -> i64 {
+	// `privilege` names a DeviceManager. Without it this minted a capability to any device's BAR for
+	// any caller that named an index - see `PrivilegeKind::DeviceManager` for why that is worse than
+	// it sounds on a machine with no IOMMU.
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::DeviceManager) {
+		return error;
+	}
 	let thread = current_thread!();
 	let memory = match device::with(index as usize, |d| DeviceMemory::new(d.bar_phys, d.bar_len as usize)) {
 		Some(m) => m,
@@ -838,11 +866,35 @@ fn sys_device_acquire(index: u64) -> i64 {
 // available). Returns the number of bytes written, or ERR_INVALID for an
 // out-of-range buffer.
 fn sys_random_get(buf_ptr: u64, len: u64) -> i64 {
+	random_into(buf_ptr, len, true)
+}
+
+// Random bytes that are NOT cryptographic, asked for by that name.
+//
+// The split is the fix. One syscall answered from a hardware source where there was one and from a
+// clock-seeded formula where there was not, and userspace saw one answer either way - so anything
+// deriving a key or a token from it was guessable on any machine without the hardware, with nothing
+// to say so. And that is not a corner: two of this system's three architectures have no hardware
+// source at all, so the formula was the ANSWER there rather than the fallback.
+//
+// What was wrong was never the formula. A boot identifier, a jitter, a hash seed all want exactly
+// this and none of them wants an error instead. It was that the formula arrived under a name that
+// promised otherwise, and a caller had no way to ask for one and be sure it had not got the other.
+fn sys_random_insecure(buf_ptr: u64, len: u64) -> i64 {
+	random_into(buf_ptr, len, false)
+}
+
+fn random_into(buf_ptr: u64, len: u64, must_be_secure: bool) -> i64 {
 	if len == 0 {
 		return 0;
 	}
 	if !user_buf_ok(buf_ptr, len) {
 		return ERR_INVALID;
+	}
+	if must_be_secure && !arch::random::secure_available() {
+		// No retry and no smaller request changes this, which is what `ERR_UNSUPPORTED` says and
+		// `ERR_RESOURCE_EXHAUSTED` would not.
+		return ERR_UNSUPPORTED;
 	}
 	// Generate into a kernel buffer in bounded chunks, then copy out to the caller.
 	const CHUNK: usize = 256;
@@ -850,7 +902,15 @@ fn sys_random_get(buf_ptr: u64, len: u64) -> i64 {
 	let mut filled: u64 = 0;
 	while filled < len {
 		let n = ((len - filled) as usize).min(CHUNK);
-		arch::random::fill(&mut scratch[..n]);
+		if must_be_secure {
+			if !arch::random::secure(&mut scratch[..n]) {
+				// The source stopped answering part-way. Refuse rather than finish the buffer from
+				// somewhere else: a half-hardware key is a key nobody can reason about.
+				return ERR_UNSUPPORTED;
+			}
+		} else {
+			arch::random::insecure(&mut scratch[..n]);
+		}
 		arch::paging::user_access(|| unsafe {
 			core::ptr::copy_nonoverlapping(scratch.as_ptr(), (buf_ptr + filled) as *mut u8, n);
 		});
@@ -863,7 +923,11 @@ fn sys_random_get(buf_ptr: u64, len: u64) -> i64 {
 // the caller's table. A driver waits on the handle; the kernel marks it pending
 // and wakes the driver when the vector fires. ERR_INVALID for a non-bindable
 // vector, ERR_RESOURCE_EXHAUSTED if the vector is already bound.
-fn sys_interrupt_bind(vector: u64) -> i64 {
+fn sys_interrupt_bind(vector: u64, privilege: u64) -> i64 {
+	// And a legacy interrupt line, for the same reason.
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::DeviceManager) {
+		return error;
+	}
 	let thread = current_thread!();
 	if vector > u8::MAX as u64 || !arch::interrupts::is_bindable(vector as u8) {
 		return ERR_INVALID;
@@ -884,7 +948,12 @@ fn sys_interrupt_bind(vector: u64) -> i64 {
 // Unlike the INTx path the device's legacy pin stays disabled (MSI-X replaces it), so
 // the driver gets its own edge-triggered vector with no INTx sharing. ERR_INVALID for
 // an out-of-range index or a device with no MSI-X capability.
-fn sys_device_msix_acquire(index: u64) -> i64 {
+fn sys_device_msix_acquire(index: u64, privilege: u64) -> i64 {
+	// The same authority as the BAR: an MSI-X vector is a line into this machine's interrupt
+	// delivery, and handing one out is DeviceManager's job or nobody's.
+	if let Err(error) = holds_privilege(privilege, PrivilegeKind::DeviceManager) {
+		return error;
+	}
 	let thread = current_thread!();
 	let (cap, table_phys, bus, dev, func) = match device::with(index as usize, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)) {
 		Some((cap, table_phys, bus, dev, func)) if cap != 0 => (cap, table_phys, bus, dev, func),
@@ -1113,32 +1182,51 @@ fn sys_process_load_module(process_handle: u64, elf_ptr: u64, elf_len: u64, bias
 // thread in rdi - the way a process is endowed with its initial capability.
 // Requires the MANAGE right on the process handle (and TRANSFER on the bootstrap).
 fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_handle: u64) -> i64 {
-	// A thread created into a process that is going away would never be reaped: the
-	// live-thread counter that decides the finaliser has already reached zero.
-	if let Some(thread) = crate::sched::current_thread() {
-		if thread.process().is_terminating() {
-			return ERR_INVALID;
-		}
-	}
 	let thread = current_thread!();
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
+	// The TARGET, not the caller.
+	//
+	// A thread created into a process that is going away would never be reaped - the live-thread
+	// counter that decides the finaliser has already reached zero - and the test for it read
+	// `thread.process()`, which is the process making the CALL. It was written before the target
+	// was even looked up, so a dying or dead child could still be given a new thread by a healthy
+	// parent, which is the case the check exists for.
+	if process.is_terminating() {
+		return ERR_INVALID;
+	}
 	// Move the bootstrap capability (if any) into the child, recording the handle
 	// value the child will see, so the kernel can wire it into the thread's rdi.
 	// TAKE the bootstrap - a transfer moves the capability, and the caller's handle dies
 	// with the take rather than being closed afterwards by a call whose failure was
 	// discarded.
+	// TAKEN FOR TRANSFER, so the caller's handle value survives every way this can fail.
+	//
+	// It used `take`, which kills the value as it takes the capability, and `put_back`, which
+	// reissues it under a handle the caller is never told - so a rollback left the capability alive
+	// in the caller's table and unreachable by it. And when the child's `try_insert` refused on
+	// quota, the capability was not put back at all: it was dropped where it stood, and neither
+	// party had it.
+	//
+	// The batch send learned this and this call did not. Same primitive, same three outcomes.
+	let bootstrap = Handle::from_raw(bootstrap_handle);
 	let child_bootstrap = if bootstrap_handle != 0 {
-		let cap = match thread.handles().lock().take(Handle::from_raw(bootstrap_handle), Rights::TRANSFER) {
+		let cap = match thread.handles().lock().take_for_transfer(bootstrap, Rights::TRANSFER) {
 			Ok(cap) => cap,
 			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
 			Err(_) => return ERR_BAD_HANDLE,
 		};
-		match process.handles().lock().try_insert(cap) {
-			Some(handle) => handle.raw(),
-			None => return ERR_RESOURCE_EXHAUSTED,
+		let inserted = process.handles().lock().try_insert_or_return(cap);
+		match inserted {
+			Ok(handle) => handle.raw(),
+			Err(cap) => {
+				// The child would not take it, so it goes back where it came from - at the same
+				// handle value, which is what makes the refusal cost the caller nothing.
+				thread.handles().lock().restore_taken(bootstrap, cap);
+				return ERR_RESOURCE_EXHAUSTED;
+			}
 		}
 	} else {
 		0
@@ -1152,9 +1240,13 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 	let new_thread = match loader::create_user_thread(&process, entry, stack_top, child_bootstrap) {
 		Some(t) => t,
 		None => {
+			// The thread could not be made: take the capability back out of the child and return it
+			// to the handle the caller named it by. `put_back` reissued it under a new value the
+			// caller was never told, which is the same unreachable-capability defect the batch send
+			// had.
 			if child_bootstrap != 0 {
 				if let Ok(cap) = process.handles().lock().take(Handle::from_raw(child_bootstrap), Rights::NONE) {
-					thread.handles().lock().put_back(cap);
+					thread.handles().lock().restore_taken(bootstrap, cap);
 				}
 			}
 			return ERR_RESOURCE_EXHAUSTED;
@@ -1415,17 +1507,22 @@ fn sys_handle_close(handle: u64) -> i64 {
 // Copy a byte payload out of a caller-supplied buffer through the sanctioned SMAP
 // window. Ring-0 self-calls pass kernel pointers, which the window does not
 // affect; a ring-3 caller's pointer has been validated by user_buf_ok.
-fn read_bytes(ptr: u64, len: usize) -> Vec<u8> {
+fn read_bytes(ptr: u64, len: usize) -> Option<Vec<u8>> {
 	if ptr == 0 || len == 0 {
-		return Vec::new();
+		return Some(Vec::new());
 	}
-	let Some(mut bytes) = try_zeroed_bytes(len) else {
-		return Vec::new();
-	};
+	// An allocation this kernel could not make is NOT an empty message.
+	//
+	// It used to answer one: the buffer failed, `Vec::new()` went out, and the send delivered a
+	// zero-byte message and reported success. For a protocol where an empty message means something
+	// - and this system has at least one, where it marks the end of a write stream - memory pressure
+	// silently changed what was said. The batch path already answered `ERR_NO_MEMORY` here; this one
+	// had its own helper and its own answer.
+	let mut bytes = try_zeroed_bytes(len)?;
 	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(ptr as *const u8, bytes.as_mut_ptr(), len);
 	});
-	bytes
+	Some(bytes)
 }
 
 // Create a connected channel pair, install a handle to each endpoint in the
@@ -1487,33 +1584,56 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 	if !user_buf_ok(bytes_ptr, bytes_len) {
 		return ERR_INVALID;
 	}
-	let bytes = read_bytes(bytes_ptr, bytes_len as usize);
-	// Build the capability to transfer, if any, without yet removing the handle.
+	let Some(bytes) = read_bytes(bytes_ptr, bytes_len as usize) else {
+		return ERR_NO_MEMORY;
+	};
+	// THE SAME transfer the batch path uses, and for the reason the batch path was given it.
+	//
+	// This built the capability with `Capability::new` from a LOOKUP - a clone of the authority -
+	// sent it, and then closed the caller's handle with the result discarded. Two threads of one
+	// process naming the same handle could both look it up, both clone, and both send: one handle
+	// became two capabilities without `DUPLICATE`, which is the one thing a capability system may
+	// not do. The close of the loser then failed and nobody was told.
+	//
+	// `take_for_transfer` empties the slot and reserves it, so a second thread finds nothing to
+	// take; `commit_taken` kills the handle value once delivery succeeds, and `restore_taken` gives
+	// the capability back at the SAME handle when it does not - so a refused send costs the caller
+	// nothing, not even the name it used.
+	let handle = Handle::from_raw(xfer);
 	let caps = if xfer != 0 {
-		let table = thread.handles().lock();
-		let xobject = match table.lookup(Handle::from_raw(xfer), Rights::TRANSFER) {
-			Ok(o) => o,
+		let mut table = thread.handles().lock();
+		match table.take_for_transfer(handle, Rights::TRANSFER) {
+			Ok(cap) => alloc::vec![cap],
 			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
 			Err(_) => return ERR_BAD_HANDLE,
-		};
-		let rights = table.rights_of(Handle::from_raw(xfer)).unwrap_or(Rights::NONE);
-		let xbadge = table.badge_of(Handle::from_raw(xfer)).unwrap_or(0);
-		alloc::vec![Capability::new(xobject, rights, xbadge)]
+		}
 	} else {
 		Vec::new()
 	};
-	match channel.send_charged(Message::new(bytes, caps, badge), thread.domain()) {
+	match channel.send_charged_or_return(Message::new(bytes, caps, badge), thread.domain()) {
 		Ok(()) => {
-			// Delivered: now consume the transferred handle.
+			// Delivered: the handle value dies now, and its quota is refunded.
 			if xfer != 0 {
-				let _ = thread.handles().lock().close(Handle::from_raw(xfer));
+				thread.handles().lock().commit_taken(handle);
 			}
 			thread.process().record_send();
 			0
 		}
-		Err(ChannelError::Full) => ERR_WOULD_BLOCK,
-		Err(ChannelError::PeerClosed) => ERR_PEER_CLOSED,
-		Err(_) => ERR_INVALID,
+		Err(err) => {
+			// Undelivered: the capability goes back to the handle it was named by, still live and
+			// still the same value.
+			if xfer != 0 {
+				let mut table = thread.handles().lock();
+				for cap in err.1 {
+					table.restore_taken(handle, cap);
+				}
+			}
+			match err.0 {
+				ChannelError::Full => ERR_WOULD_BLOCK,
+				ChannelError::PeerClosed => ERR_PEER_CLOSED,
+				_ => ERR_INVALID,
+			}
+		}
 	}
 }
 
@@ -1661,30 +1781,46 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 		Ok(c) => c,
 		Err(e) => return e,
 	};
-	// Look BEFORE taking. A message that cannot be delivered must stay in the queue, so
-	// the caller can come back with a bigger buffer or after closing some handles - taking
-	// it first and then reporting the problem destroyed a message nobody could retry.
-	let (payload, cap_count) = match channel.peek_shape() {
-		Ok(shape) => shape,
-		Err(ChannelError::PeerClosed) => return ERR_PEER_CLOSED,
-		Err(_) => return ERR_WOULD_BLOCK,
-	};
-	if payload > bytes_cap as usize {
-		return ERR_INVALID;
-	}
-	// And room for every capability it carries, reserved up front. Installing a prefix and
-	// dropping the rest is the same loss one message at a time.
+	// ONE decision, under ONE lock, and the message is taken only if it fits.
+	//
+	// This used to be three steps - `peek_shape`, `reserve`, `recv` - each taking the queue lock on
+	// its own. A second receiver on the same endpoint could take the peeked message in between, and
+	// what arrived was then a different message while the caller had already decided what it could
+	// hold. The copy below uses the RECEIVED length, so a receiver that declared a hundred bytes
+	// could be handed a megabyte and the kernel would write all of it into a buffer validated for a
+	// hundred: a kernel-to-userspace overrun reachable from ring 3 with two threads and no timing
+	// tricks. The capability half had the same shape, installing handles counted from one message
+	// against a reservation paid for another - and the reservation was never returned when the recv
+	// then failed, so the race leaked handle quota even when it delivered nothing.
+	//
+	// A message that does not fit is left in the queue, which is the property the old code had for
+	// the right reason and lost to the race: the caller can come back with a bigger buffer or after
+	// closing some handles, and nothing is destroyed that nobody can retry.
+	//
+	// The reservation is taken FIRST, for the largest a message may be, and the surplus released
+	// after: reserving `MAX_MESSAGE_CAPS` costs nothing to a table with room and refuses early on a
+	// table without, and it means the quota is never held for a message that was not taken.
 	{
 		let mut table = thread.handles().lock();
-		if !table.reserve(cap_count) {
+		if !table.reserve(abi::MAX_MESSAGE_CAPS) {
 			return ERR_RESOURCE_EXHAUSTED;
 		}
 	}
-	let message = match channel.recv() {
+	let message = match channel.recv_if_fits(bytes_cap as usize, abi::MAX_MESSAGE_CAPS) {
 		Ok(m) => m,
-		Err(ChannelError::PeerClosed) => return ERR_PEER_CLOSED,
-		Err(_) => return ERR_WOULD_BLOCK,
+		Err(refusal) => {
+			thread.handles().lock().release_reservation(abi::MAX_MESSAGE_CAPS);
+			return match refusal {
+				// The buffer or the slots are too small for the head of the queue. It stays there.
+				RecvRefusal::TooLarge(_) | RecvRefusal::TooManyCaps(_) => ERR_INVALID,
+				RecvRefusal::Gone(ChannelError::PeerClosed) => ERR_PEER_CLOSED,
+				RecvRefusal::Gone(_) => ERR_WOULD_BLOCK,
+			};
+		}
 	};
+	// what the message did not need goes straight back, before anything else can fail.
+	let carried = message.caps.len().min(abi::MAX_MESSAGE_CAPS);
+	thread.handles().lock().release_reservation(abi::MAX_MESSAGE_CAPS - carried);
 	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(message.bytes.as_ptr(), bytes_ptr as *mut u8, message.bytes.len());
 	});
@@ -1698,8 +1834,6 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 			write_user(caps_ptr + ((installed + 1) * 8) as u64, handle.raw());
 			installed += 1;
 		}
-		// give back whatever the reservation covered and the message did not use.
-		table.release_reservation(cap_count.saturating_sub(installed));
 	}
 	write_user(caps_ptr, installed as u64);
 	thread.process().record_recv();
@@ -1874,11 +2008,119 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 				}
 			}
 		}
-		let block_deadline = if deadline == 0 { sched::NO_DEADLINE } else { deadline };
+		// The EARLIEST of the caller's deadline and every armed timer in the set.
+		//
+		// Single `SYS_WAIT` has done this since timers learned to wake their waiters; this took the
+		// caller's deadline alone. Reaching a timer's deadline generates no wake of its own - the
+		// timer becomes ready, and nobody is told - so a wait on an armed timer with no deadline of
+		// its own slept past the expiry with nothing to bring it back. A driver waiting on its
+		// interrupt and a watchdog together is exactly this set.
+		let mut block_deadline = if deadline == 0 { sched::NO_DEADLINE } else { deadline };
+		for slot in objects.iter().take(n) {
+			if let Some(object) = slot {
+				block_deadline = core::cmp::min(block_deadline, wait_block_deadline(object, deadline));
+			}
+		}
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
 		}
 		sched::block_on_any(&koids[..n], block_deadline, periodic, || objects.iter().take(n).any(|slot| slot.as_ref().is_some_and(|o| object_ready(o))));
+	}
+}
+
+// Create a wait set: a set of objects the kernel KEEPS, registered once and waited on many times.
+//
+// `SYS_WAIT_ANY` takes a fresh array on every call and registers a waiter on every object in it, so
+// one pass costs the caller a lock and a list insertion per object it listens to - every pass, for
+// as long as it runs. A set pays that once per member, when the member joins.
+fn sys_waitset_create() -> i64 {
+	let thread = current_thread!();
+	install_object(&thread, WaitSet::create(), Rights::ALL, 0)
+}
+
+// Add the object behind `object_handle` to the set behind `set_handle`.
+//
+// Needs WAIT on the object - the same right waiting on it directly needs, because that is what this
+// is - and MANAGE on the set.
+fn sys_waitset_add(set_handle: u64, object_handle: u64) -> i64 {
+	let set = match current_typed::<WaitSet>(set_handle, ObjectType::WaitSet, Rights::MANAGE) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	// Untyped: a set watches whatever can be waited on, so the type check is `object_ready`'s job
+	// rather than a list of types kept here and drifting from it.
+	let object = match untyped_object(object_handle, Rights::WAIT) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	match set.add(object) {
+		Ok(()) => 0,
+		Err(WaitSetError::Full) => ERR_RESOURCE_EXHAUSTED,
+		Err(_) => ERR_INVALID,
+	}
+}
+
+// Take an object out of the set. Named by its handle, like everything else, and matched by koid -
+// so a caller may remove a member through any handle it holds to the same object.
+fn sys_waitset_remove(set_handle: u64, object_handle: u64) -> i64 {
+	let set = match current_typed::<WaitSet>(set_handle, ObjectType::WaitSet, Rights::MANAGE) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	let object = match untyped_object(object_handle, Rights::NONE) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	match set.remove(object.header().koid()) {
+		Ok(()) => 0,
+		Err(_) => ERR_INVALID,
+	}
+}
+
+// Block until any member of the set is ready, returning its INDEX in the set, or ERR_TIMED_OUT at
+// `deadline` (absolute ticks, 0 = none).
+//
+// The index is into the set's current membership, which the caller decides - so it is stable as long
+// as the caller does not add or remove, and a caller that does knows it did. The alternative, a
+// koid, would make every wake a lookup.
+fn sys_waitset_wait(set_handle: u64, deadline: u64, flags: u64) -> i64 {
+	let thread = current_thread!();
+	let set = match current_typed::<WaitSet>(set_handle, ObjectType::WaitSet, Rights::WAIT) {
+		Ok(o) => o,
+		Err(e) => return e,
+	};
+	let periodic = flags & abi::WAIT_PERIODIC != 0;
+	let set_koid = set.header().koid();
+	loop {
+		if thread.process().is_killed() {
+			sched::exit();
+		}
+		if thread.process().is_stopped() {
+			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
+			continue;
+		}
+		// The snapshot is taken outside the membership lock, because asking an object whether it is
+		// ready takes that object's own locks.
+		let members = set.snapshot();
+		for (i, object) in members.iter().enumerate() {
+			if object_ready(object) {
+				return i as i64;
+			}
+		}
+		// The earliest deadline in the set, the same rule `sys_wait_any` follows: a timer becoming
+		// ready generates no wake of its own, so a wait that did not account for one could sleep
+		// past it with nothing to bring it back.
+		let mut block_deadline = if deadline == 0 { sched::NO_DEADLINE } else { deadline };
+		for object in members.iter() {
+			block_deadline = core::cmp::min(block_deadline, wait_block_deadline(object, deadline));
+		}
+		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
+			return ERR_TIMED_OUT;
+		}
+		// ONE registration, on the set. What makes this the point of the whole object: a member's
+		// wake reaches the set through the observer registered when it joined, and the set's wake
+		// reaches whoever is parked here.
+		sched::block_on_flagged(set_koid, block_deadline, periodic, || set.snapshot().iter().any(object_ready));
 	}
 }
 
@@ -2025,7 +2267,11 @@ fn sys_process_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 // budget, never exceed it. a0/a1/a2 are the memory/handle/thread caps.
 fn sys_domain_create(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> i64 {
 	let thread = current_thread!();
-	let child = Domain::new_child(thread.domain(), memory_limit, handle_limit, thread_limit);
+	// A parent that is being killed does not get new children: the kill walks a snapshot, so one
+	// created after it was taken would outlive the domain it belongs to.
+	let Some(child) = Domain::new_child(thread.domain(), memory_limit, handle_limit, thread_limit) else {
+		return ERR_INVALID;
+	};
 	install_object(&thread, child, Rights::ALL, 0)
 }
 

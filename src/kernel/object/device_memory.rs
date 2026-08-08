@@ -62,8 +62,36 @@ impl DeviceMemory {
 		(self.page_offset() as usize + self.len).div_ceil(PAGE_SIZE as usize).max(1)
 	}
 
+	// The sentinel a claim holds between `claim_mapping` and `set_mapped_in`.
+	const RESERVED: u64 = 1;
+
 	pub fn mapped_at(&self) -> u64 {
-		self.mapped_at.load(Ordering::Acquire)
+		match self.mapped_at.load(Ordering::Acquire) {
+			// A claim in flight is not an address, and a teardown that saw it would unmap a
+			// mapping that does not exist yet.
+			Self::RESERVED => 0,
+			virt => virt,
+		}
+	}
+
+	// Claim the right to map this region, once.
+	//
+	// `mapped_at() != 0` was tested at the top of the map syscall and `set_mapped_in` ran
+	// twenty-five lines later, so two threads could both find it unmapped and both build an MMIO
+	// mapping - and the second `set_mapped_in` overwrote the record of the first. `Drop` then
+	// removed one of them, and the other outlived the capability that authorised it: a mapping of
+	// device registers left in a process with no handle to the device.
+	//
+	// The atomic claim is the same reserve-then-commit `MemoryObject` and `DmaBuffer` were given.
+	// `RESERVED` is a value no mapping can have - the windows this maps into never start at 1 - so
+	// it marks the claim without pretending to be an address.
+	pub fn claim_mapping(&self) -> bool {
+		self.mapped_at.compare_exchange(0, Self::RESERVED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+	}
+
+	// Give the claim back, for a map that could not be completed.
+	pub fn release_claim(&self) {
+		let _ = self.mapped_at.compare_exchange(Self::RESERVED, 0, Ordering::AcqRel, Ordering::Acquire);
 	}
 
 	// Record where this region is mapped AND in which address space, so the teardown can

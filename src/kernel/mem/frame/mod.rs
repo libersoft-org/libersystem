@@ -580,7 +580,14 @@ pub fn pages_for(bytes: usize) -> usize {
 // in ascending physical order so adjacent frames stay adjacent virtually (and a
 // device fed the layout can coalesce them into runs).
 pub fn allocate_pages(pages: usize) -> Option<Vec<u64>> {
-	let mut frames = Vec::with_capacity(pages);
+	// FALLIBLE. `Vec::with_capacity` answers a request the machine cannot meet by aborting, and
+	// `pages` comes from a syscall argument by way of `pages_for` - so the one place a caller's
+	// number reached an infallible allocation was the metadata for the frames, before a single
+	// frame had been taken.
+	let mut frames: Vec<u64> = Vec::new();
+	if frames.try_reserve_exact(pages).is_err() {
+		return None;
+	}
 	for _ in 0..pages {
 		match allocate() {
 			Some(phys) => frames.push(phys),
@@ -601,6 +608,90 @@ pub fn allocate_pages(pages: usize) -> Option<Vec<u64>> {
 // # Safety
 //
 // Every address in `frames` must satisfy `deallocate`'s contract.
+// Return frames that were MAPPED, once every core is known to have dropped its translation.
+//
+// The one door back to the allocator for anything a page table ever pointed at. It was not one
+// door: the loader's rollback and process teardown did a shootdown and then freed, while
+// `MemoryObject::drop`, `DmaBuffer::drop` and the kernel-stack teardown freed straight away. A
+// frame handed out again while another core still has a stale translation is a physical
+// use-after-free, and it does not need a hostile process to arrive - it needs two cores and a
+// mapping that outlived its unmap by a few microseconds.
+//
+// A shootdown that could not be completed does NOT free. The span goes into quarantine and the next
+// successful shootdown takes it out. Holding memory is a cost; handing out memory somebody else can
+// still read is not a cost, it is a defect.
+//
+// SAFETY: the caller owns every frame in `frames` and has removed every mapping of them.
+pub unsafe fn retire(frames: &[u64]) {
+	if frames.is_empty() {
+		return;
+	}
+	let drain = {
+		let mut quarantine = QUARANTINE.lock();
+		for &phys in frames {
+			// A quarantine that cannot grow drops the span rather than freeing it: the memory is
+			// lost to this boot, which is the same outcome as the run table filling up and is still
+			// better than handing out a frame another core can read.
+			if quarantine.try_reserve(1).is_err() {
+				crate::serial_println!("frame: WARNING: {phys:#x} retired with no room to quarantine it; the page is not being tracked");
+				continue;
+			}
+			quarantine.push(phys);
+		}
+		quarantine.len() >= QUARANTINE_DRAIN
+	};
+	if drain {
+		unsafe { drain_quarantine() };
+	}
+}
+
+// Shoot down once, and free everything the shootdown covered.
+//
+// BATCHED, and that is not an optimisation. The first version did a shootdown per retired span, and
+// a shootdown is an IPI to every other core and a spin until they all answer - which on an emulated
+// guest is frequently a core that does not answer at all, because `service_pending` runs from the
+// wake-IPI handler and the idle loop and a core grinding through a long computation reaches neither.
+// Every `MemoryObject` and `DmaBuffer` and kernel stack going away then paid a full timeout, and the
+// riscv64 suite went from finishing to not finishing.
+//
+// A flush is not per-address: one completed shootdown retires every translation every core holds, so
+// one covers the whole quarantine however it was filled. The cost is amortised over
+// `QUARANTINE_DRAIN` spans and the invariant is unchanged - nothing is freed without a completed
+// shootdown that covers it.
+//
+// SAFETY: every frame in the quarantine was owned by whoever retired it and had its mappings
+// removed before it got here.
+pub unsafe fn drain_quarantine() {
+	if QUARANTINE.lock().is_empty() {
+		return;
+	}
+	if !crate::mem::tlb::shootdown() {
+		// A core did not answer. The spans stay where they are and the next drain tries again;
+		// freeing them now is the physical use-after-free the whole mechanism exists to prevent.
+		return;
+	}
+	let held = core::mem::take(&mut *QUARANTINE.lock());
+	for phys in held {
+		unsafe { deallocate(phys) };
+	}
+}
+
+// How many frames may wait before a drain is worth its shootdown.
+//
+// Low enough that the quarantine is a queue rather than a leak, high enough that a service churning
+// buffers does not IPI every core for each one. The drain is also forced at the points where a
+// caller knows a lot has just been freed - process teardown and loader rollback.
+const QUARANTINE_DRAIN: usize = 64;
+
+// Frames whose shootdown did not complete. Drained by the next one that does.
+static QUARANTINE: crate::sync::SpinLock<Vec<u64>> = crate::sync::SpinLock::new(Vec::new());
+
+// How many frames are waiting on a shootdown that did not complete, for tests.
+#[cfg(test)]
+pub fn quarantined() -> usize {
+	QUARANTINE.lock().len()
+}
+
 pub unsafe fn free_pages(frames: &[u64]) {
 	for &phys in frames {
 		unsafe { deallocate(phys) };

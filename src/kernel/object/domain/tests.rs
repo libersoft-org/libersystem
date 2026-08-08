@@ -7,7 +7,7 @@ fn domain_hierarchy_charges_aggregate_and_refund() {
 	// caps memory at two pages; the unbounded child may charge two pages but not a
 	// third.
 	let parent = Domain::new(8192, UNLIMITED, UNLIMITED);
-	let child = Domain::new_child(&parent, UNLIMITED, UNLIMITED, UNLIMITED);
+	let child = Domain::new_child(&parent, UNLIMITED, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
 	assert!(child.try_charge_memory(4096));
 	assert_eq!(parent.account().memory().used(), 4096, "charge propagates to the parent");
 	assert!(child.try_charge_memory(4096));

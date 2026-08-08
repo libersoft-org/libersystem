@@ -190,6 +190,16 @@ fn init_smp() {
 #[cfg(not(test))]
 fn boot_main() {
 	serial_println!("arch: {}", arch::NAME);
+	// Said at BOOT, once, where an operator will see it - not left for whoever eventually derives a
+	// key from a number the clock could have told them.
+	//
+	// A machine with no hardware random source cannot answer `SYS_RANDOM_GET` at all: it refuses,
+	// rather than handing out a formula under a name that promises a key. Everything still runs -
+	// nothing in this system needs a secret yet - and the day something does, this line is what
+	// says the machine cannot provide one.
+	if !arch::random::secure_available() {
+		serial_println!("random: WARNING: no hardware random source on this machine - SYS_RANDOM_GET will refuse, and nothing here can produce a key or a token");
+	}
 	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
 	serial_println!("memory: {} physical frames free", mem::frame::free_count());
 	// Perf-trace anchor: publish the calibrated TSC frequency so the host trace tool can
@@ -394,12 +404,12 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// capabilities rather than three messages - the bootstrap is a strictly ordered sequence and
 	// every hop has to read it in the same order, so each message added is a place the chain can
 	// be got wrong. The order inside the message is the order every hop unpacks them:
-	// DisplayController, ConsoleInputSource, ConsoleSink.
+	// DisplayController, ConsoleInputSource, ConsoleSink, DeviceManager.
 	//
 	// Like the power capability above, this process holds them only to pass them on. They are
 	// minted exactly here and nowhere else - no syscall creates one - so the three that exist
-	// after this line are the three that will ever exist.
-	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink].into_iter().map(|kind| Capability::new(Privilege::create(kind) as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
+	// after this line are the four that will ever exist.
+	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind) as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
 	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges, 0)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
 	Ok((kernel_ep, sm_koid))
 }

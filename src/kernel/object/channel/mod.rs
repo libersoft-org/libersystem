@@ -209,6 +209,47 @@ impl Channel {
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
 	}
 
+	// Take the next message only if it fits what the caller has room for.
+	//
+	// `peek_shape` then `recv` is two operations under two separate locks, and a second receiver on
+	// the same endpoint can take the peeked message in between. What arrives is then a DIFFERENT
+	// message, and the caller has already decided what it can hold: the copy afterwards uses the
+	// received length, so a receiver that declared a hundred bytes could be handed a megabyte and
+	// the kernel would write all of it into a buffer it validated for a hundred. That is a
+	// kernel-to-userspace overrun reachable from ring 3 with two threads and no special timing.
+	//
+	// The reservation had the same shape: capabilities were counted from the peeked message and
+	// installed from the received one, so a receive could install more handles than the quota it
+	// paid for - and when the recv then failed, the reservation was never given back.
+	//
+	// One lock, one decision, one dequeue. A message that does not fit is left where it is and the
+	// caller is told what it would have needed, which is the same answer `peek_shape` was giving
+	// and now cannot go stale between the asking and the taking.
+	pub fn recv_if_fits(&self, bytes_cap: usize, cap_slots: usize) -> Result<Message, RecvRefusal> {
+		let popped = {
+			let mut inbox = self.inbox.lock();
+			match inbox.front() {
+				Some(msg) if msg.bytes.len() > bytes_cap => return Err(RecvRefusal::TooLarge(msg.bytes.len())),
+				Some(msg) if msg.caps.len() > cap_slots => return Err(RecvRefusal::TooManyCaps(msg.caps.len())),
+				Some(_) => {
+					let was_full = inbox.len() >= self.limit;
+					inbox.pop_front().map(|msg| (msg, was_full))
+				}
+				None => None,
+			}
+		};
+		if let Some((mut msg, was_full)) = popped {
+			msg.take_queue_charge();
+			if was_full {
+				if let Some(peer) = self.peer() {
+					sched::wake_object(peer.header.koid());
+				}
+			}
+			return Ok(msg);
+		}
+		if self.is_peer_closed() { Err(RecvRefusal::Gone(ChannelError::PeerClosed)) } else { Err(RecvRefusal::Gone(ChannelError::Empty)) }
+	}
+
 	// The byte length of the next pending message without dequeuing it, so a
 	// receiver can size its buffer exactly before the recv.
 	pub fn peek_len(&self) -> Result<usize, ChannelError> {
@@ -228,6 +269,15 @@ impl Channel {
 		}
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
 	}
+}
+
+// Why `recv_if_fits` did not take the message. `TooLarge` and `TooManyCaps` carry what the head of
+// the queue actually needs, so a caller can size a second attempt - and the message is still there
+// to be taken, which is what makes the answer worth carrying.
+pub enum RecvRefusal {
+	TooLarge(usize),
+	TooManyCaps(usize),
+	Gone(ChannelError),
 }
 
 impl_kernel_object!(Channel, Channel);

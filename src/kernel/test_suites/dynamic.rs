@@ -1159,6 +1159,11 @@ fn a_load_that_runs_out_of_frames_anywhere_gives_back_everything() {
 				// The channel endpoints are the test's, not the load's; dropping them here
 				// keeps the comparison to what the loader did.
 				drop(kernel_ep);
+				// The frames come back through the QUARANTINE: anything that was MAPPED waits for a
+				// shootdown that retires every core's translation of it, and those are batched
+				// rather than taken one span at a time. Draining is what "wait for the shootdown"
+				// looks like from here - without it this measures the queue rather than the load.
+				unsafe { frame::drain_quarantine() };
 				assert_eq!(frame::free_count(), before, "a load refused at allocation {budget} did not return every frame it took");
 			}
 			Ok(process) => {

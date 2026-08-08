@@ -353,12 +353,15 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 		}
 	}
 
-	// Clocks + entropy: the generic timer (monotonic), the PL031 RTC (wall clock),
-	// and the seeded RNG.
+	// Clocks, and a sample of the seeded generator beside them.
+	//
+	// `insecure` by name: this port has no hardware source - `FEAT_RNG` is not detected here - so
+	// the sample is from the formula, and a boot line printing it should say which it is rather than
+	// borrowing the word "random" from the syscall that refuses on this machine.
 	super::tsc::init();
 	let mut rnd = [0u8; 6];
-	super::random::fill(&mut rnd);
-	crate::serial_println!("aarch64: clocks - timer {} MHz, uptime {} ms, RTC unix {} | random {:02x?}", super::tsc::hz() / 1_000_000, super::tsc::cycles_to_ns(super::tsc::now()) / 1_000_000, super::rtc::read_unix(), rnd);
+	super::random::insecure(&mut rnd);
+	crate::serial_println!("aarch64: clocks - timer {} MHz, uptime {} ms, RTC unix {} | seeded {:02x?}", super::tsc::hz() / 1_000_000, super::tsc::cycles_to_ns(super::tsc::now()) / 1_000_000, super::rtc::read_unix(), rnd);
 
 	// Per-CPU block for the boot core, reachable through TPIDR_EL1.
 	let mpidr: u64;

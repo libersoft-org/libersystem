@@ -43,11 +43,11 @@ static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 // handed back. Returns when every core that had to flush has flushed, or when the wait
 // has gone on long enough that something is wrong - in which case it says so and returns
 // anyway, because a stuck core must not take the caller with it.
-pub fn shootdown() {
+pub fn shootdown() -> bool {
 	let cpus = crate::smp::cpu_count();
 	if cpus <= 1 {
 		// Single core: the local invalidation the mapper already did is the whole job.
-		return;
+		return true;
 	}
 	// One at a time. A second requester waits for the first rather than sharing its
 	// counter, which is cheaper to reason about than making the counter per-request.
@@ -72,16 +72,29 @@ pub fn shootdown() {
 	}
 	// Bounded wait. A core that never answers is a core that is wedged, and blocking here
 	// forever would spread that to the caller - which is on the path that frees memory.
+	// Bounded, and the OUTCOME is returned.
+	//
+	// It used to time out, print, and return as though the job were done - and the caller's next
+	// move is to hand the frame back to the allocator, so a core that never answered could still be
+	// reading through a translation to memory that had been handed to somebody else. That is the
+	// physical use-after-free the whole mechanism exists to prevent, reached by giving up on it.
+	//
+	// "Carry on regardless" is the one answer that cannot be right here. What the caller does with
+	// a false is its own business - `frame::retire` quarantines the span and tries again later -
+	// but it has to be told.
 	let mut spins: u64 = 0;
+	let mut complete = true;
 	while ACKED.load(Ordering::Acquire) < targets {
 		core::hint::spin_loop();
 		spins += 1;
 		if spins > 200_000_000 {
 			crate::serial_println!("tlb: shootdown timed out with {}/{} acknowledgements", ACKED.load(Ordering::Acquire), targets);
+			complete = false;
 			break;
 		}
 	}
 	IN_FLIGHT.store(false, Ordering::Release);
+	complete
 }
 
 // Act on a pending request for THIS core, if there is one. Called from the wake-IPI

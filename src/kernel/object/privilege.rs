@@ -34,6 +34,16 @@ pub enum PrivilegeKind {
 	// May register the channel the kernel feeds console input to, which also silences the
 	// kernel's own framebuffer console. ConsoleService.
 	ConsoleSink,
+	// May take a device's memory, its MSI-X vectors and its interrupt lines out of the kernel and
+	// hand them to a driver. DeviceManager, inside the core service.
+	//
+	// Ungated, this was the widest hole in the syscall surface: `SYS_DEVICE_ACQUIRE(index)` minted a
+	// `DeviceMemory` capability to any caller that named an index, so any ring-3 process could take
+	// the BAR of any PCI device - which contradicts `DeviceMemory`'s own documentation that a driver
+	// is handed only its device. On a DMA-capable device it is worse than an MMIO takeover: with no
+	// IOMMU, a process holding both DMA buffers and physical addresses reaches memory the page
+	// tables were meant to isolate.
+	DeviceManager,
 }
 
 impl PrivilegeKind {
@@ -42,6 +52,7 @@ impl PrivilegeKind {
 			PrivilegeKind::DisplayController => "DisplayController",
 			PrivilegeKind::ConsoleInputSource => "ConsoleInputSource",
 			PrivilegeKind::ConsoleSink => "ConsoleSink",
+			PrivilegeKind::DeviceManager => "DeviceManager",
 		}
 	}
 }

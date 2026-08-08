@@ -382,10 +382,19 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Vec::new());
 		}
 		let end = offset.saturating_add(len).min(inode.size);
-		let mut out = Vec::with_capacity((end - offset) as usize);
+		// FALLIBLE, both of them. The fallible-allocation discipline reached the free maps and the
+		// mount and stopped at the door of the read path, which is the one place a number off the
+		// medium decides the size directly: a checksum-consistent inode with an enormous sparse
+		// size makes `read_file` ask for that many bytes in one go, and `Vec::with_capacity` answers
+		// an impossible request by ABORTING the process. The volume's byte count bounds it, and a
+		// volume can be larger than the machine.
+		let mut out: Vec<u8> = Vec::new();
+		out.try_reserve_exact((end - offset) as usize).map_err(|_| FsError::NoSpace)?;
 		let first = offset / BLOCK_SIZE as u64;
 		let last = (end - 1) / BLOCK_SIZE as u64;
-		let mut buf = vec![0u8; (last - first + 1).min(RUN_BLOCKS) as usize * BLOCK_SIZE];
+		// The run buffer is bounded by RUN_BLOCKS (1 MB) rather than by the file, so it is small -
+		// and it is still a request the machine may refuse.
+		let mut buf = try_zeroed((last - first + 1).min(RUN_BLOCKS) as usize * BLOCK_SIZE)?;
 		let mut lb = first;
 		while lb <= last {
 			let want = (last - lb + 1).min(RUN_BLOCKS);

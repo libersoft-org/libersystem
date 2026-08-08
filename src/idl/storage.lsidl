@@ -132,11 +132,18 @@ interface volume {
 	/// its own (a memory volume knows its capacity) that ceiling applies; where it states
 	/// none (a disk volume knows only its free blocks, which is a lower bound rather than a
 	/// promise) the service applies a policy limit on what one stream may accumulate before
-	/// the write lands. Exceeding either is `again`, not `invalid`: it is a statement about
-	/// this moment, and a caller may retry or split the file.
+	/// the write lands.
+	///
+	/// The two ceilings answer DIFFERENTLY, and the difference is the honest one. Exceeding
+	/// what the filesystem has is `again`: free space is a statement about this moment, and a
+	/// caller may retry or make room. Exceeding the service's own accumulation policy is
+	/// `invalid`: that number does not change, so telling a caller to try again would be a
+	/// promise nothing will keep - the file has to be split or written another way.
 	///
 	/// This comment used to say a file was "bounded by the filesystem, never by one
-	/// transfer" and stop there, which reads as a promise the service does not make.
+	/// transfer" and stop there, which reads as a promise the service does not make; it then
+	/// said both ceilings answered `again`, which flattened a distinction the implementation
+	/// makes on purpose.
 	@op(16) write-stream:    func(path: string, data: handle<channel>) -> result<unit, error>;
 }
 

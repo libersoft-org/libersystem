@@ -42,8 +42,15 @@ impl DmaBuffer {
 	// taken, so an over-cap request fails cleanly (QuotaExceeded) with nothing
 	// allocated or charged, and an out-of-memory rolls the charge back.
 	pub fn create_in(domain: &Arc<Domain>, size: usize) -> Result<Arc<Self>, MemoryError> {
+		// A ceiling and checked arithmetic, for the reason `MemoryObject::create_in` has them: the
+		// size is a caller's number and the product below is what the quota is then checked against.
+		if size as u64 > abi::MAX_OBJECT_BYTES {
+			return Err(MemoryError::OutOfMemory);
+		}
 		let pages = frame::pages_for(size);
-		let bytes = pages as u64 * PAGE_SIZE;
+		let Some(bytes) = (pages as u64).checked_mul(PAGE_SIZE) else {
+			return Err(MemoryError::OutOfMemory);
+		};
 		if !domain.try_charge_dma(bytes) {
 			return Err(MemoryError::QuotaExceeded);
 		}
@@ -54,7 +61,18 @@ impl DmaBuffer {
 				return Err(MemoryError::OutOfMemory);
 			}
 		};
-		let frames: Vec<u64> = (0..pages as u64).map(|i| base + i * PAGE_SIZE).collect();
+		// fallible, like every other metadata allocation sized from a caller's number.
+		let mut frames: Vec<u64> = Vec::new();
+		if frames.try_reserve_exact(pages).is_err() {
+			// SAFETY: the span was allocated by this call and has never been mapped, so it goes
+			// straight back rather than through `retire`.
+			for i in 0..pages as u64 {
+				unsafe { frame::deallocate(base + i * PAGE_SIZE) };
+			}
+			domain.uncharge_dma(bytes);
+			return Err(MemoryError::OutOfMemory);
+		}
+		frames.extend((0..pages as u64).map(|i| base + i * PAGE_SIZE));
 		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: domain.clone() }))
 	}
 
@@ -126,7 +144,10 @@ impl Drop for DmaBuffer {
 		debug_assert!(self.mappings.lock().is_empty(), "process cleanup must remove every DmaBuffer mapping");
 		// SAFETY: this buffer owns its frames, and the debug assert above has established
 		// that nothing is mapping them any more.
-		unsafe { frame::free_pages(&self.frames) };
+		// Retired rather than freed, for the reason `MemoryObject` is: DMA memory is mapped into a
+		// driver's address space AND handed to a device, so a stale translation here is the worst
+		// version of the case.
+		unsafe { frame::retire(&self.frames) };
 		// Refund the pinned DMA memory to the owning Domain.
 		self.domain.uncharge_dma(self.size as u64);
 	}

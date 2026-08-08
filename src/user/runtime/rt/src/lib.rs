@@ -1751,6 +1751,20 @@ pub unsafe fn random_get(bytes: &mut [u8]) -> usize {
 	if written > 0 { written as usize } else { 0 }
 }
 
+// Random bytes that are NOT cryptographic, asked for by that name.
+//
+// Use this for anything that wants to be DISTINGUISHABLE rather than secret - a boot identifier, a
+// jitter, a hash seed. It always answers, from a clock-seeded formula, on every machine.
+//
+// `random_get` is the other one, and it REFUSES on a machine with no hardware source rather than
+// quietly handing this back under a name that promises a key. Two of this system's three
+// architectures have no such source today, so that refusal is the ordinary case rather than the
+// exotic one, and a caller that must have a secret has to be able to see it.
+pub unsafe fn random_insecure(bytes: &mut [u8]) -> usize {
+	let written: i64 = unsafe { syscall(SYS_RANDOM_INSECURE, bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0) as i64 };
+	if written > 0 { written as usize } else { 0 }
+}
+
 // Read the boot profile's name into `name`, returning the bytes written, or 0 when this boot
 // named none. A development-only facility asks this rather than inferring the profile from
 // what happens to be attached.
@@ -1855,8 +1869,35 @@ pub unsafe fn device_info(index: u64, info: &mut DeviceInfo) -> bool {
 
 // Acquire a DeviceMemory capability for device `index`'s MMIO BAR, returning the
 // handle, or a negative error. The driver maps it with device_memory_map.
-pub unsafe fn device_acquire(index: u64) -> i64 {
-	unsafe { syscall(SYS_DEVICE_ACQUIRE, index, 0, 0, 0) as i64 }
+// A wait set the kernel keeps: the objects are registered once and waited on many times.
+//
+// `wait_any` hands the kernel a fresh array on every call, so it registers a waiter on every handle
+// in it and takes them all out again - once per pass, for as long as the service runs. The cost of
+// one pass grows with how many peers a service listens to, which is why StorageService's client
+// ceiling was set where the service is still brisk rather than where a handle table runs out.
+pub unsafe fn waitset_create() -> i64 {
+	unsafe { syscall(SYS_WAITSET_CREATE, 0, 0, 0, 0) as i64 }
+}
+
+// Add an object to the set. Needs WAIT on the object and MANAGE on the set.
+pub unsafe fn waitset_add(set: u64, object: u64) -> i64 {
+	unsafe { syscall(SYS_WAITSET_ADD, set, object, 0, 0) as i64 }
+}
+
+// Take an object out of the set. A member whose peer has closed does NOT leave by itself: it
+// becomes ready and says so, and this is how a caller retires it once it has dealt with that.
+pub unsafe fn waitset_remove(set: u64, object: u64) -> i64 {
+	unsafe { syscall(SYS_WAITSET_REMOVE, set, object, 0, 0) as i64 }
+}
+
+// Block until any member is ready, returning its index in the set - stable as long as the caller
+// does not add or remove, which it knows when it does.
+pub unsafe fn waitset_wait(set: u64, deadline: u64, flags: u64) -> i64 {
+	unsafe { syscall(SYS_WAITSET_WAIT, set, deadline, flags, 0) as i64 }
+}
+
+pub unsafe fn device_acquire(index: u64, privilege: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_ACQUIRE, index, privilege, 0, 0) as i64 }
 }
 
 // Acquire an MSI-X Interrupt capability for device `index`: the kernel allocates a
@@ -1865,8 +1906,8 @@ pub unsafe fn device_acquire(index: u64) -> i64 {
 // handle, or a negative error. The driver `wait`s on the handle for its device, then
 // `interrupt_ack`s it (a no-op clear for MSI) and writes its MSI-X vector into the
 // virtio transport (set_msix_vector).
-pub unsafe fn device_msix_acquire(index: u64) -> i64 {
-	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, index, 0, 0, 0) as i64 }
+pub unsafe fn device_msix_acquire(index: u64, privilege: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, index, privilege, 0, 0) as i64 }
 }
 
 // Reboot or power off the machine: `action` is POWER_REBOOT or POWER_OFF. On success

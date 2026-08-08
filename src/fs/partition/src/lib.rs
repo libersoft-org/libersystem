@@ -143,6 +143,16 @@ pub enum Disk {
 	// An MBR partition table (or a protective MBR whose GPT did not verify - see
 	// `CorruptGpt` for the case where the signature was there). Not a blank disk.
 	MbrWithoutLiberFs,
+	// BOTH tables, both describing the disk: a hybrid, where a protective 0xEE entry sits beside
+	// real MBR partitions and a GPT covers the same medium. Some install media and some
+	// dual-booted disks are laid out this way.
+	//
+	// Its own answer rather than "read the GPT and ignore the rest", which is what this build did:
+	// two tables describing one disk disagree by construction, and nothing here can say which the
+	// owner meant. A LiberFS entry in the GPT may sit on top of an MBR partition's range and no
+	// check in either table would notice. This answer authorises a WRITE, so the honest response to
+	// two answers is to give neither.
+	HybridMbrAndGpt,
 	// A GPT signature, or a protective MBR, followed by a table this build cannot believe -
 	// neither the primary nor the backup verified. Emphatically not a blank disk: the
 	// partitions are probably all still there, and formatting is the one thing that would
@@ -173,16 +183,38 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 	}
 
 	let mbr = classify_mbr(&lba0);
+	// A real hybrid is decided BEFORE the GPT is read. `classify_mbr` used to be computed here and
+	// then thrown away whenever LBA 1 carried a signature, so a disk with real MBR partitions AND a
+	// valid GPT was decided entirely by the GPT.
+	if mbr == Mbr::Partitioned && &lba1[HDR_SIGNATURE..HDR_SIGNATURE + 8] == b"EFI PART" {
+		return Disk::HybridMbrAndGpt;
+	}
 	if &lba1[HDR_SIGNATURE..HDR_SIGNATURE + 8] == b"EFI PART" {
-		return match read_gpt(dev, &lba1) {
-			Ok(gpt) => find_liberfs(&gpt),
+		let counterpart = primary_counterpart(dev);
+		return match read_gpt(dev, &lba1, 1, counterpart) {
+			// The primary verified, and the backup is consulted anyway.
+			//
+			// It used not to be: a verified primary was acted on and the other copy never read. Two
+			// individually-valid tables that CONTRADICT each other were therefore not an ambiguity,
+			// and this answer authorises a format. Agreement between the copies is cheap evidence,
+			// and its absence is exactly the sort of thing that should stop a write.
+			Ok(gpt) => match backup_gpt(dev) {
+				Ok(backup) if backup.entries == gpt.entries => find_liberfs(&gpt),
+				// The backup is unreadable or damaged: the primary stands on its own, which is what
+				// a backup being a BACKUP means. Only a backup that verifies and disagrees is a
+				// reason to refuse.
+				Err(_) => find_liberfs(&gpt),
+				Ok(_) => Disk::CorruptGpt,
+			},
 			Err(Fault::NoMemory) => Disk::NoMemory,
+			Err(Fault::Io) => Disk::Io,
 			// the signature is there and the table is not believable. Consult the backup
 			// before condemning it: a damaged primary header with an intact backup is the
 			// case UEFI defines a backup FOR.
 			Err(Fault::Unusable) => match backup_gpt(dev) {
 				Ok(gpt) => find_liberfs(&gpt),
 				Err(Fault::NoMemory) => Disk::NoMemory,
+				Err(Fault::Io) => Disk::Io,
 				Err(Fault::Unusable) => Disk::CorruptGpt,
 			},
 		};
@@ -193,6 +225,7 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 		return match backup_gpt(dev) {
 			Ok(gpt) => find_liberfs(&gpt),
 			Err(Fault::NoMemory) => Disk::NoMemory,
+			Err(Fault::Io) => Disk::Io,
 			Err(Fault::Unusable) => Disk::CorruptGpt,
 		};
 	}
@@ -209,6 +242,15 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 	}
 	// Nothing was recognised, which is not the same claim as nothing being there. What decides
 	// it is whether the medium is ZERO where anything at all would announce itself.
+	// A whole-device format should know how large the device is.
+	//
+	// The GPT path already refuses a device that will not report its size, because every span in a
+	// table is bounded from outside by the medium alone. The blank path did not, and the asymmetry
+	// was the wrong way round: the GPT case merely declines to mount, and this one licenses writing
+	// over the whole disk. A device that cannot say how big it is cannot be shown to be empty.
+	if dev.capacity().is_none() {
+		return Disk::UnknownData;
+	}
 	match scanned_blank(dev, &lba0, &lba1) {
 		Some(true) => Disk::Blank,
 		Some(false) => Disk::UnknownData,
@@ -329,6 +371,11 @@ enum Fault {
 	Unusable,
 	// The table might be fine; the memory to verify it was not there.
 	NoMemory,
+	// The table might be fine; the DEVICE would not give it back. Kept apart from `Unusable`
+	// because the two send an operator to different places: one means repair the table, the other
+	// means check the cable. Nothing is written either way, so this is diagnosis rather than
+	// safety - which is the only reason it went unnoticed.
+	Io,
 }
 
 // A zeroed buffer of `len`, or `NoMemory` if the machine will not give it.
@@ -348,13 +395,21 @@ fn try_zeroed(len: usize) -> Result<Vec<u8>, Fault> {
 // Verify a GPT header block and the entry array it points at, or a `Fault` saying which kind of
 // answer this is.
 //
+// `at` is the LBA the header was actually READ FROM, and `counterpart` the LBA the other copy must
+// live at. Without them a header is only checked against itself, and a header's account of its own
+// position is exactly the field an attacker sets: a correctly-checksummed header physically at LBA
+// 1 claiming `current_lba = 65000` with a `first_usable` of 1 passes every relation between its own
+// fields, and a LiberFS entry may then start at LBA 1 - the sector the header is sitting in. The
+// mount finds no superblock there and the service formats over the table. That is the scenario this
+// crate was written to close, in a header that never told the truth about where it was.
+//
 // The old probe checked the signature, that `entry_size` was a power of two in range, that
 // `num_entries` was non-zero, and then trusted the rest. It checked NEITHER CRC, no header
 // LBA relation, and nothing against the device's capacity - so an entry with the LiberFS
 // type GUID, `first = 1` and `last = 100000` passed every test there was, and the mount then
 // targeted LBA 1, which is the primary GPT header itself. Finding no superblock there, the
 // service formatted on top of the partition table that had named the partition.
-fn read_gpt(dev: &mut impl Sectors, header: &[u8]) -> Result<Gpt, Fault> {
+fn read_gpt(dev: &mut impl Sectors, header: &[u8], at: u64, counterpart: u64) -> Result<Gpt, Fault> {
 	if &header[HDR_SIGNATURE..HDR_SIGNATURE + 8] != b"EFI PART" {
 		return Err(Fault::Unusable);
 	}
@@ -390,6 +445,12 @@ fn read_gpt(dev: &mut impl Sectors, header: &[u8]) -> Result<Gpt, Fault> {
 	// LBA 0 is the protective MBR's sector by spec, so neither copy of the header can be
 	// there, and the two copies cannot be the same sector.
 	if header_lba == backup_lba || header_lba == 0 || backup_lba == 0 {
+		return Err(Fault::Unusable);
+	}
+	// And the table has to agree with the medium about where it is. These four are what tie a
+	// header to a disk rather than to itself: it sits where it says it sits, and it names the other
+	// copy where the other copy actually is.
+	if header_lba != at || backup_lba != counterpart {
 		return Err(Fault::Unusable);
 	}
 	if first_usable == 0 || last_usable < first_usable {
@@ -440,7 +501,7 @@ fn read_gpt(dev: &mut impl Sectors, header: &[u8]) -> Result<Gpt, Fault> {
 	let mut sector = [0u8; SECTOR_SIZE];
 	for i in 0..array_sectors {
 		if !dev.read(entries_lba.checked_add(i).ok_or(Fault::Unusable)?, &mut sector) {
-			return Err(Fault::Unusable);
+			return Err(Fault::Io);
 		}
 		let start = (i * SECTOR_SIZE as u64) as usize;
 		let end = (start + SECTOR_SIZE).min(array.len());
@@ -460,11 +521,25 @@ fn read_gpt(dev: &mut impl Sectors, header: &[u8]) -> Result<Gpt, Fault> {
 // telling them their disk is blank.
 fn backup_gpt(dev: &mut impl Sectors) -> Result<Gpt, Fault> {
 	let capacity = dev.capacity().ok_or(Fault::Unusable)?;
+	let last = capacity.checked_sub(1).ok_or(Fault::Unusable)?;
 	let mut header = [0u8; SECTOR_SIZE];
-	if !dev.read(capacity.checked_sub(1).ok_or(Fault::Unusable)?, &mut header) {
-		return Err(Fault::Unusable);
+	if !dev.read(last, &mut header) {
+		return Err(Fault::Io);
 	}
-	read_gpt(dev, &header)
+	// The backup sits at the last sector and names LBA 1 as its counterpart - the mirror of what the
+	// primary must say.
+	read_gpt(dev, &header, last, 1)
+}
+
+// Where the PRIMARY header must say its backup lives: the last sector of the medium. A device that
+// will not report its size cannot answer that, and `u64::MAX` is a value no header can carry
+// legitimately - so such a device fails the relation rather than skipping it, which is the same
+// direction every other unbounded case takes here.
+fn primary_counterpart(dev: &mut impl Sectors) -> u64 {
+	match dev.capacity() {
+		Some(capacity) => capacity.saturating_sub(1),
+		None => u64::MAX,
+	}
 }
 
 // Walk a verified GPT's entry array for the first usable LiberFS partition.
@@ -475,6 +550,16 @@ fn backup_gpt(dev: &mut impl Sectors) -> Result<Gpt, Fault> {
 // may be the real volume - so what falls out the bottom is "this GPT names no LiberFS
 // partition", which is a complete answer about a disk that belongs to something else.
 fn find_liberfs(gpt: &Gpt) -> Disk {
+	// The whole table has to be consistent before any one entry of it is acted on.
+	//
+	// This used to look only at LiberFS-typed entries: each was checked against the usable range and
+	// against both copies of the metadata, and nothing compared it with the OTHER partitions. A
+	// checksum-valid table naming a Linux partition at 2048..30000 and a LiberFS one at
+	// 10000..40000 was accepted, and formatting the second destroyed half the first. A tool that
+	// only READS a table may reasonably trust it; this answer authorises a write.
+	if entries_overlap(gpt) {
+		return Disk::CorruptGpt;
+	}
 	for e in gpt.entries.chunks_exact(gpt.entry_size) {
 		if e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] == UNUSED_TYPE_GUID || e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] != LIBERFS_TYPE_GUID {
 			continue;
@@ -486,6 +571,40 @@ fn find_liberfs(gpt: &Gpt) -> Disk {
 		}
 	}
 	Disk::GptWithoutLiberFs
+}
+
+// Do any two used entries of this table claim the same sector?
+//
+// Quadratic in the entry count, which is capped at `MAX_ENTRIES` - 512 entries is 130,000 integer
+// comparisons, once, at boot, and the alternative is sorting a copy of the array to save a
+// microsecond nobody will notice.
+fn entries_overlap(gpt: &Gpt) -> bool {
+	let spans: Vec<(u64, u64)> = gpt
+		.entries
+		.chunks_exact(gpt.entry_size)
+		.filter(|e| e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] != UNUSED_TYPE_GUID)
+		.map(|e| {
+			let first = u64::from_le_bytes(e[ENT_FIRST_LBA..ENT_FIRST_LBA + 8].try_into().unwrap());
+			let last = u64::from_le_bytes(e[ENT_LAST_LBA..ENT_LAST_LBA + 8].try_into().unwrap());
+			(first, last)
+		})
+		.collect();
+	for (i, &(a_first, a_last)) in spans.iter().enumerate() {
+		// A span that runs backwards is not a span; `usable_span` refuses such an entry on its own
+		// account, and it cannot overlap anything here.
+		if a_last < a_first {
+			continue;
+		}
+		for &(b_first, b_last) in spans.iter().skip(i + 1) {
+			if b_last < b_first {
+				continue;
+			}
+			if a_first <= b_last && b_first <= a_last {
+				return true;
+			}
+		}
+	}
+	false
 }
 
 // Is `first..=last` a span this build may hand to a filesystem?

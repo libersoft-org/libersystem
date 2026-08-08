@@ -235,12 +235,23 @@ impl HandleTable {
 	}
 
 	pub fn try_insert(&mut self, cap: Capability) -> Option<Handle> {
+		self.try_insert_or_return(cap).ok()
+	}
+
+	// The same, GIVING THE CAPABILITY BACK when the quota refuses it.
+	//
+	// `try_insert` takes the capability by value and answers a refusal with `None`, so the
+	// capability is dropped where it stood. That is right for a caller that has just minted one and
+	// wrong for a caller in the middle of a TRANSFER: `sys_thread_create` moved a bootstrap
+	// capability out of the parent and into the child, and when the child's quota said no, neither
+	// party had it afterwards and nothing said so.
+	pub fn try_insert_or_return(&mut self, cap: Capability) -> Result<Handle, Capability> {
 		if let Some(domain) = &self.domain {
 			if !domain.try_charge_handle() {
-				return None;
+				return Err(cap);
 			}
 		}
-		Some(self.place(cap))
+		Ok(self.place(cap))
 	}
 
 	// Mint and install a fresh capability under the Domain's handle quota.
