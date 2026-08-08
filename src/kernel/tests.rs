@@ -3339,19 +3339,24 @@ fn spawn_dynamic_test_process(domain: alloc::sync::Arc<object::domain::Domain>, 
 	process
 }
 
-fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> (Option<alloc::vec::Vec<u8>>, u64) {
+// Run a tool that holds volumes and nothing else, and capture the one line it prints.
+//
+// Named for what it does rather than for its first caller: `imgconv` and `audioconv` are the same
+// shape of program - a bundle of volume capabilities, an argument string, a line of output, an exit
+// - and the harness was already generic when it was called `run_imgconv_harness`.
+fn run_volume_tool_result(domain: alloc::sync::Arc<object::domain::Domain>, tool_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> (Option<alloc::vec::Vec<u8>>, u64) {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 	let (bootstrap, child) = Channel::create();
 	let (stdout, child_stdout) = Channel::create();
-	let process = spawn_dynamic_test_process(domain.clone(), imgconv_elf, child);
-	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgconv stdout");
+	let process = spawn_dynamic_test_process(domain.clone(), tool_elf, child);
+	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the tool's stdout");
 	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-	bootstrap.send(Message::new(launch_context(args, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgconv args");
-	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgconv system volume");
-	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgconv media volume");
+	bootstrap.send(Message::new(launch_context(args, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("the tool's arguments");
+	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("the tool's system volume");
+	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("the tool's media volume");
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
-		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgconv absent volume");
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("an absent volume");
 	}
 	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
 	let mut line = None;
@@ -3367,17 +3372,17 @@ fn run_imgconv_harness_result(domain: alloc::sync::Arc<object::domain::Domain>, 
 			break;
 		}
 	}
-	assert!(process.is_terminated(), "imgconv harness exits");
+	assert!(process.is_terminated(), "the tool exits");
 	(line, domain.account().memory().peak())
 }
 
-fn run_imgconv_harness_in(domain: alloc::sync::Arc<object::domain::Domain>, imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> (alloc::vec::Vec<u8>, u64) {
-	let (line, peak) = run_imgconv_harness_result(domain, imgconv_elf, args, system, media);
-	(line.expect("imgconv harness prints a result"), peak)
+fn run_volume_tool_in(domain: alloc::sync::Arc<object::domain::Domain>, tool_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> (alloc::vec::Vec<u8>, u64) {
+	let (line, peak) = run_volume_tool_result(domain, tool_elf, args, system, media);
+	(line.expect("the tool prints a result"), peak)
 }
 
-fn run_imgconv_harness(imgconv_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> alloc::vec::Vec<u8> {
-	run_imgconv_harness_in(sched::root_domain(), imgconv_elf, args, system, media).0
+fn run_volume_tool(tool_elf: &[u8], args: &[u8], system: &mut StorageHarness, media: &mut StorageHarness) -> alloc::vec::Vec<u8> {
+	run_volume_tool_in(sched::root_domain(), tool_elf, args, system, media).0
 }
 
 fn viewer_surface(image: &pix::RgbaImage) -> alloc::vec::Vec<u8> {

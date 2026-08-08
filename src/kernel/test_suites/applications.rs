@@ -51,10 +51,10 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
-	let help = run_imgconv_harness(imgconv_elf, b"--help", &mut system, &mut media);
+	let help = run_volume_tool(imgconv_elf, b"--help", &mut system, &mut media);
 	assert!(help.starts_with(b"Usage: imgconv [options] <input> <output>\n\nOptions:\n"));
 	assert!(help.windows(b"WebP  options: quality compression lossless lossy animation; defaults: mode=lossless compression=100".len()).any(|window| window == b"WebP  options: quality compression lossless lossy animation; defaults: mode=lossless compression=100"));
-	let line = run_imgconv_harness(imgconv_elf, b"--quality 100 vol://media/SOURCE.BMP vol://system/CROSS.BMP", &mut system, &mut media);
+	let line = run_volume_tool(imgconv_elf, b"--quality 100 vol://media/SOURCE.BMP vol://system/CROSS.BMP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> BMP 2x2 quality=100 bytes="));
 	let converted = system.open(b"vol://system/CROSS.BMP", 0xc2055).expect("cross-volume BMP opens");
 	assert_eq!(bmp::decode_rgba(&converted).expect("cross-volume BMP decodes"), source);
@@ -76,22 +76,22 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	collision_tga.splice(18..18, *b"0123456789");
 	let classification_image = fat16_image(&[(*b"UNKNOWN BIN", b"not an image"), (*b"BAD     PNG", b"\x89PNG\r\n\x1a\n"), (*b"COLLIDE TGA", &collision_tga)], false);
 	let mut classification_media = StorageHarness::start(storage_elf, b"FATBLOCK", &classification_image, classification_image.len() as u64);
-	let unknown = run_imgconv_harness(imgconv_elf, b"vol://media/UNKNOWN.BIN vol://media/UNKNOWN.BMP", &mut system, &mut classification_media);
+	let unknown = run_volume_tool(imgconv_elf, b"vol://media/UNKNOWN.BIN vol://media/UNKNOWN.BMP", &mut system, &mut classification_media);
 	assert_eq!(unknown, b"imgconv: unsupported image format\n");
-	let corrupt = run_imgconv_harness(imgconv_elf, b"vol://media/BAD.PNG vol://media/BAD.BMP", &mut system, &mut classification_media);
+	let corrupt = run_volume_tool(imgconv_elf, b"vol://media/BAD.PNG vol://media/BAD.BMP", &mut system, &mut classification_media);
 	assert_eq!(corrupt, b"imgconv: invalid or corrupt image\n");
-	let collision = run_imgconv_harness(imgconv_elf, b"vol://media/COLLIDE.TGA vol://media/COLLIDE.BMP", &mut system, &mut classification_media);
+	let collision = run_volume_tool(imgconv_elf, b"vol://media/COLLIDE.TGA vol://media/COLLIDE.BMP", &mut system, &mut classification_media);
 	assert!(collision.starts_with(b"imgconv: TGA 1x1 -> BMP 1x1 bytes="));
 	let collision_output = classification_media.open(b"vol://media/COLLIDE.BMP", 0xc0111de).expect("collision output opens");
 	assert_eq!(bmp::decode_rgba(&collision_output).expect("collision output decodes"), collision_pixel);
 	run_imgview_harness(imgview_elf, b"vol://media/COLLIDE.TGA", &viewer_surface(&collision_pixel), &mut system, &mut classification_media);
 
-	let line = run_imgconv_harness(imgconv_elf, b"--lossless --compression 50 vol://media/SOURCE.BMP vol://system/CROSSL.WEBP", &mut system, &mut media);
+	let line = run_volume_tool(imgconv_elf, b"--lossless --compression 50 vol://media/SOURCE.BMP vol://system/CROSSL.WEBP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossless compression=50 bytes="));
 	let converted = system.open(b"vol://system/CROSSL.WEBP", 0xc2057).expect("cross-volume lossless WebP opens");
 	assert_eq!(webp::decode(&converted).expect("cross-volume lossless WebP decodes"), source);
 
-	let line = run_imgconv_harness(imgconv_elf, b"--lossy --quality 100 --compression 100 vol://media/SOURCE.BMP vol://system/CROSS.WEBP", &mut system, &mut media);
+	let line = run_volume_tool(imgconv_elf, b"--lossy --quality 100 --compression 100 vol://media/SOURCE.BMP vol://system/CROSS.WEBP", &mut system, &mut media);
 	assert!(line.starts_with(b"imgconv: BMP 2x2 -> WebP 2x2 mode=lossy quality=100 compression=100 bytes="));
 	let converted = system.open(b"vol://system/CROSS.WEBP", 0xc2056).expect("cross-volume WebP opens");
 	assert_eq!(&converted[..4], b"RIFF", "lossy WebP uses the canonical RIFF container");
@@ -112,9 +112,118 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	let previous = b"previous destination";
 	let full_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice()), (*b"KEEP    BMP", previous)], true);
 	let mut full_media = StorageHarness::start(storage_elf, b"FATBLOCK", &full_image, full_image.len() as u64);
-	let failure = run_imgconv_harness(imgconv_elf, b"--force --resize 64x64 vol://media/SOURCE.BMP vol://media/KEEP.BMP", &mut system, &mut full_media);
+	let failure = run_volume_tool(imgconv_elf, b"--force --resize 64x64 vol://media/SOURCE.BMP vol://media/KEEP.BMP", &mut system, &mut full_media);
 	assert_eq!(failure, b"imgconv: cannot write output\n");
 	assert_eq!(full_media.open(b"vol://media/KEEP.BMP", 0xfa11), Some(previous.to_vec()), "failed overwrite preserves the previous destination byte-for-byte");
+}
+
+tagged_test!(audioconv_converts_across_volumes_and_never_writes_a_failed_conversion, [Audio, Service, Storage, Process, Filesystem]);
+fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
+	// The real `audioconv.lsexe`, launched with a volume bundle and nothing else - no AudioService,
+	// no device authority - converting between two StorageService volumes. What makes this worth
+	// booting for is the last two cases: a conversion that cannot be written, and one that would
+	// replace a destination it was not told it could. Neither may leave the destination changed.
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let audioconv_elf = program_elf(&package, volume, b"audioconv").expect("audioconv tool");
+
+	// A quarter of a second of mono at 8 kHz, built here with the same encoder the tool uses, so
+	// the fixture is a real WAV rather than bytes that happen to parse.
+	let samples = governed_audio_fixture(2_000);
+	let source_wav = {
+		let format = pcm::Format::new(8_000, 1).expect("the fixture rate is one `Format` names");
+		let mut encoder = wav::encode::Encoder::new(pcm::encode::VecSink::new(1 << 20), format, wav::encode::Output::Pcm { bits: 16 }).expect("the fixture encoder starts");
+		encoder.push(&samples).expect("the fixture encodes");
+		encoder.finish().expect("the fixture closes").0.into_bytes()
+	};
+
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let media_image = fat16_image(&[(*b"SOURCE  WAV", source_wav.as_slice()), (*b"JUNK    BIN", b"not audio at all")], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+
+	let help = run_volume_tool(audioconv_elf, b"--help", &mut system, &mut media);
+	assert!(help.starts_with(b"usage: audioconv [options] <input> <output>\n"), "the help leads with its usage");
+	for profile in [b"FLAC".as_slice(), b"AIFF".as_slice(), b"WAV-IMA".as_slice(), b"Ogg Vorbis".as_slice()] {
+		assert!(help.windows(profile.len()).any(|window| window == profile), "the help omits a profile the table lists");
+	}
+
+	// Lossless, across volumes: media in, system out, and the samples must be the ones that went in.
+	let line = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.FLAC", &mut system, &mut media);
+	assert!(line.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> FLAC 8000Hz/1ch/2000fr duration=250ms bytes="), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&line));
+	assert!(line.ends_with(b" metadata=stripped\n"), "the report does not say what it dropped");
+	let written = system.open(b"vol://system/CROSS.FLAC", 0xaud10).expect("the cross-volume FLAC opens");
+	let decoded = decode_flac_samples(&written);
+	assert_eq!(decoded, samples, "the lossless conversion did not survive the round trip");
+
+	// And the other lossless container, resampled and remixed on the way, so the transforms are
+	// exercised through the real tool rather than only in the library's own tests.
+	let line = run_volume_tool(audioconv_elf, b"--rate 16000 --channels 2 vol://media/SOURCE.WAV vol://system/CROSS.AIFF", &mut system, &mut media);
+	assert!(line.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> AIFF 16000Hz/2ch/4000fr duration=250ms bytes="), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&line));
+	let written = system.open(b"vol://system/CROSS.AIFF", 0xaud11).expect("the cross-volume AIFF opens");
+	let converted = aiff::Aiff::parse(&written).expect("the AIFF parses");
+	assert_eq!(converted.metadata().rate, 16_000);
+	assert_eq!(converted.metadata().channels, 2);
+	assert_eq!(converted.metadata().frames, 4_000);
+
+	// A format nothing writes yet says so in those words, and does not create the destination.
+	let unwritten = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.OGG", &mut system, &mut media);
+	assert_eq!(unwritten, b"audioconv: writing that format is not implemented yet\n");
+	assert_eq!(system.open(b"vol://system/CROSS.OGG", 0xaud12), None, "a refused profile still created its destination");
+
+	// Not audio at all, and a destination whose suffix names nothing.
+	let junk = run_volume_tool(audioconv_elf, b"vol://media/JUNK.BIN vol://system/JUNK.FLAC", &mut system, &mut media);
+	assert_eq!(junk, b"audioconv: unsupported audio format\n");
+	let nameless = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/OUT.BIN", &mut system, &mut media);
+	assert_eq!(nameless, b"audioconv: unsupported audio format\n");
+
+	// An existing destination is left alone unless `--force` says otherwise.
+	let refused = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.FLAC", &mut system, &mut media);
+	assert_eq!(refused, b"audioconv: destination exists (use --force)\n");
+	assert_eq!(system.open(b"vol://system/CROSS.FLAC", 0xaud13).map(|bytes| decode_flac_samples(&bytes)), Some(samples.clone()), "a refused overwrite changed the destination");
+	let forced = run_volume_tool(audioconv_elf, b"--force --compression 100 vol://media/SOURCE.WAV vol://system/CROSS.FLAC", &mut system, &mut media);
+	assert!(forced.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> FLAC"), "--force did not convert");
+	assert_eq!(system.open(b"vol://system/CROSS.FLAC", 0xaud14).map(|bytes| decode_flac_samples(&bytes)), Some(samples.clone()), "the forced overwrite is not the same audio");
+
+	// A destination volume with no room. The conversion succeeds and the write does not, and what
+	// was already there must survive byte for byte - the whole reason the tool converts before it
+	// opens the destination.
+	let previous = b"previous destination";
+	let full_image = fat16_image(&[(*b"SOURCE  WAV", source_wav.as_slice()), (*b"KEEP    FLA", previous)], true);
+	let mut full_media = StorageHarness::start(storage_elf, b"FATBLOCK", &full_image, full_image.len() as u64);
+	let failure = run_volume_tool(audioconv_elf, b"--force vol://media/SOURCE.WAV vol://media/KEEP.FLA", &mut system, &mut full_media);
+	assert_eq!(failure, b"audioconv: cannot write output\n");
+	assert_eq!(full_media.open(b"vol://media/KEEP.FLA", 0xaud15), Some(previous.to_vec()), "a failed write did not preserve the previous destination");
+}
+
+// A deterministic quarter-second that a predictor can actually predict: a wandering tone rather
+// than noise, so a lossless conversion of it is a test of the coder and not of a memcpy.
+fn governed_audio_fixture(frames: usize) -> alloc::vec::Vec<i16> {
+	let mut samples = alloc::vec::Vec::with_capacity(frames);
+	let mut phase = 0i64;
+	let mut velocity = 900i64;
+	let mut state = 0x4f1b_a7c3u32;
+	for _ in 0..frames {
+		state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+		velocity -= phase / 48;
+		velocity += ((state >> 20) as i64 & 0x1f) - 16;
+		phase = (phase + velocity).clamp(-26_000, 26_000);
+		samples.push(phase as i16);
+	}
+	samples
+}
+
+fn decode_flac_samples(bytes: &[u8]) -> alloc::vec::Vec<i16> {
+	let file = flac::Flac::parse(bytes).expect("the written FLAC parses");
+	let mut decoder = file.decoder();
+	let mut samples = alloc::vec::Vec::new();
+	let mut chunk = alloc::vec::Vec::new();
+	while decoder.read_i16_le(512, &mut chunk).expect("the written FLAC decodes") != 0 {
+		for pair in chunk.chunks_exact(2) {
+			samples.push(i16::from_le_bytes([pair[0], pair[1]]));
+		}
+	}
+	samples
 }
 
 tagged_test!(imgconv_governed_working_set_is_measured, [Image, Memory, Process, Service, Storage]);
@@ -136,7 +245,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let full_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
-	let (full_hd, full_hd_peak) = run_imgconv_harness_in(full_hd_domain, imgconv_elf, b"--resize 1920x1080 --compression 100 vol://media/SOURCE.BMP vol://media/FHD.PNG", &mut system, &mut media);
+	let (full_hd, full_hd_peak) = run_volume_tool_in(full_hd_domain, imgconv_elf, b"--resize 1920x1080 --compression 100 vol://media/SOURCE.BMP vol://media/FHD.PNG", &mut system, &mut media);
 	assert!(full_hd.starts_with(b"imgconv: BMP 2x2 -> PNG 1920x1080 compression=100 bytes="));
 	let full_hd_output = media.open(b"vol://media/FHD.PNG", 0xf1080).expect("1080p output opens");
 	let full_hd_image = png::decode_rgba(&full_hd_output).expect("1080p output decodes");
@@ -145,7 +254,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice())], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let ultra_hd_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
-	let (ultra_hd, ultra_hd_peak) = run_imgconv_harness_in(ultra_hd_domain, imgconv_elf, b"--resize 3840x2160 --compression 100 vol://media/SOURCE.BMP vol://media/UHD.PNG", &mut system, &mut media);
+	let (ultra_hd, ultra_hd_peak) = run_volume_tool_in(ultra_hd_domain, imgconv_elf, b"--resize 3840x2160 --compression 100 vol://media/SOURCE.BMP vol://media/UHD.PNG", &mut system, &mut media);
 	assert!(ultra_hd.starts_with(b"imgconv: BMP 2x2 -> PNG 3840x2160 compression=100 bytes="));
 	let ultra_hd_output = media.open(b"vol://media/UHD.PNG", 0xf2160).expect("4K output opens");
 	let ultra_hd_image = png::decode_rgba(&ultra_hd_output).expect("4K output decodes");
@@ -155,7 +264,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let media_image = fat16_image(&[(*b"ANIM    WEB", animation)], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let animation_domain = Domain::new_child(&sched::root_domain(), IMGCONV_MEMORY_LIMIT, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
-	let (animation_line, animation_peak) = run_imgconv_harness_in(animation_domain, imgconv_elf, b"vol://media/ANIM.WEB vol://media/ANIM.GIF", &mut system, &mut media);
+	let (animation_line, animation_peak) = run_volume_tool_in(animation_domain, imgconv_elf, b"vol://media/ANIM.WEB vol://media/ANIM.GIF", &mut system, &mut media);
 	assert!(animation_line.starts_with(b"imgconv: WebP 23x15 -> GIF 23x15 quality=100 bytes="));
 	let animation_output = media.open(b"vol://media/ANIM.GIF", 0xa11).expect("animation output opens");
 	let converted_animation = gif::decode(&animation_output).expect("animation output decodes");
@@ -169,7 +278,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let media_image = fat16_image(&[(*b"SOURCE  BMP", source_bmp.as_slice()), (*b"KEEP    PNG", previous)], false);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let limited_domain = Domain::new_child(&sched::root_domain(), 80 * 1024 * 1024, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
-	let (failure, limited_peak) = run_imgconv_harness_result(limited_domain, imgconv_elf, b"--force --resize 3840x2160 --compression 100 vol://media/SOURCE.BMP vol://media/KEEP.PNG", &mut system, &mut media);
+	let (failure, limited_peak) = run_volume_tool_result(limited_domain, imgconv_elf, b"--force --resize 3840x2160 --compression 100 vol://media/SOURCE.BMP vol://media/KEEP.PNG", &mut system, &mut media);
 	assert_eq!(failure, Some(b"imgconv: out of memory\n".to_vec()), "quota failure reports a typed diagnostic");
 	assert_eq!(media.open(b"vol://media/KEEP.PNG", 0xfa17), Some(previous.to_vec()), "quota failure preserves the previous destination byte-for-byte");
 	assert!(limited_peak <= 80 * 1024 * 1024, "quota failure never exceeds its Domain limit");
@@ -193,7 +302,7 @@ fn imgconv_governed_working_set_is_measured() {
 	let media_image = fat16_image_with_clusters(&[], false, 30_000);
 	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
 	let corpus_domain = Domain::new_child(&sched::root_domain(), MEASUREMENT_CEILING, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
-	let (wallpaper, wallpaper_peak) = run_imgconv_harness_in(corpus_domain, imgconv_elf, b"vol://system/wallpapers/logo.webp vol://media/LOGO.PNG", &mut system, &mut media);
+	let (wallpaper, wallpaper_peak) = run_volume_tool_in(corpus_domain, imgconv_elf, b"vol://system/wallpapers/logo.webp vol://media/LOGO.PNG", &mut system, &mut media);
 	assert!(wallpaper.starts_with(b"imgconv: WebP 3840x2160 -> PNG 3840x2160"), "the shipped wallpaper converts, got {:?}", core::str::from_utf8(&wallpaper));
 	assert!(wallpaper_peak > ultra_hd_peak, "a 4K input costs more than a 4K output alone - decoded input and output are live together");
 	assert!(wallpaper_peak < IMGCONV_MEMORY_LIMIT, "the shipped corpus must fit the production quota: measured {} bytes against a {} byte limit", wallpaper_peak, IMGCONV_MEMORY_LIMIT);

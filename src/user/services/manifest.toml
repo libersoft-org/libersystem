@@ -804,6 +804,29 @@ destination = "bin/ping.lsexe"
 providers = ["base-proto", "network-client", "network-proto", "wire", "lsrt"]
 
 [[programs]]
+name = "audioconv"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/audioconv.lsexe"
+providers = [
+	"base-proto",
+	"adpcm",
+	"aiff",
+	"audioconv",
+	"flac",
+	"mp3",
+	"pcm",
+	"vorbis",
+	"wav",
+	"wavpack",
+	"volume-client",
+	"storage-proto",
+	"lsrt",
+]
+
+[[programs]]
 name = "play"
 owner = "tools"
 role = "tool"

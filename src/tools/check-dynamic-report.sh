@@ -54,7 +54,7 @@ for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln 
 for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do waves[$tool]=2; done
 for tool in date log config set lsdev lsusb lssvc usage ps run perm start stop beep; do waves[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss; do waves[$tool]=4; done
-for tool in imgview imgconv play graphics_probe lico licoedit licoview; do waves[$tool]=5; done
+for tool in imgview imgconv audioconv play graphics_probe lico licoedit licoview; do waves[$tool]=5; done
 tests[1]='./test.sh --tags service,process,storage'
 tests[2]='./test.sh --tags service,process,storage'
 tests[3]='./test.sh --tags service,process,storage'

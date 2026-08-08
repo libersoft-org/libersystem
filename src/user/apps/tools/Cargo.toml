@@ -116,6 +116,10 @@ name = "imgconv"
 path = "src/imgconv.rs"
 
 [[bin]]
+name = "audioconv"
+path = "src/audioconv.rs"
+
+[[bin]]
 name = "usage"
 path = "src/usage.rs"
 
@@ -300,6 +304,7 @@ bmp = { path = "../../libs/image/bmp" }
 keys = { path = "../../libs/input/keys" }
 lico = { path = "../../libs/terminal/lico" }
 imgconv = { path = "../../libs/image/imgconv" }
+audioconv = { path = "../../libs/audio/audioconv" }
 pix = { path = "../../libs/image/pix" }
 png = { path = "../../libs/image/png" }
 surface = { path = "../../libs/display/surface" }

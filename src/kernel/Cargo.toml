@@ -37,6 +37,14 @@ bootproto = { path = "../bootproto" }
 system-manifest = { path = "../tools/system-manifest" }
 
 [dev-dependencies]
+# The audio leaves, for the `audioconv` scenario: the test builds its own input with the WAV
+# encoder and decodes what came back with the decoder of whichever format was written, so the
+# assertion is against samples rather than against a byte count.
+aiff = { path = "../user/libs/audio/aiff" }
+flac = { path = "../user/libs/audio/flac" }
+pcm = { path = "../user/libs/audio/pcm" }
+wav = { path = "../user/libs/audio/wav" }
+
 bmp = { path = "../user/libs/image/bmp" }
 gif = { path = "../user/libs/image/gif" }
 pix = { path = "../user/libs/image/pix" }
