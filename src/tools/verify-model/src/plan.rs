@@ -163,7 +163,7 @@ impl Planner<'_> {
 		for target in &self.unenumerated_targets {
 			if booted.contains(target) {
 				full = true;
-				full_reasons.push(format!("the {target} kernel test list could not be read, so nothing scoped for it can be trusted - build it first: ./build.sh --arch {target}"));
+				full_reasons.push(format!("no {target} kernel test binary has been built, so the model cannot enumerate that target's tests and no scoped answer for it can be trusted. This is the expected state of a fresh checkout. Build once - ./build.sh --arch {target} - and plan again for a scoped answer; running this FULL plan works too and is simply the expensive way round."));
 			}
 		}
 		if full {

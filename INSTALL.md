@@ -107,6 +107,20 @@ sudo dd if=.build/boot/libersystem.img of=/dev/sdX bs=4M conv=fsync status=progr
 
 ## Test
 
+**Start here.** `verify.sh` works out what a change needs verified - builds, host suites, gates, conformance runs and guest runs on the targets that can be affected - and runs exactly that:
+
+```sh
+./verify.sh                                  # for everything the working tree changed
+./verify.sh --plan                           # print the plan, run nothing
+./verify.sh --explain                        # ...and say why each item is in it
+./verify.sh --for src/user/libs/audio/flac   # for a path instead of asking git
+./verify.sh --sweep                          # every target, whole suite, one revision
+```
+
+A scoped verification of a codec change is about 2% of a full one, because it skips the two emulated targets rather than because it runs fewer tests. See [**Testing**](./docs/TESTING.md) for the model behind it, and `docs/todo/M0148.md` for the measurements.
+
+The pieces it calls can be run directly when you already know what you want:
+
 ```sh
 ./test.sh                                    # x86_64, every test
 ./test.sh --arch all                         # all three, in turn
@@ -150,6 +164,7 @@ Every script is at the repository root and answers `--help`.
 | --- | --- |
 | `./build.sh [--arch A] [--part P]` | Build the system or the parts you name. Anything after `--` goes to cargo. |
 | `./run.sh [--arch A] [--image PATH] [--attach PATH] [--display D] [--smp N] [--mem S] [--serial SPEC] [--debug]` | Boot in QEMU. Builds nothing. |
+| `./verify.sh [--for PATH] [--for-range A..B] [--plan] [--explain] [--sweep] [--release]` | Work out what a change needs verified, and run it. |
 | `./test.sh [--arch A] [--tags T] [--fast] [--build-only] [--smp N] [--timeout S]` | Run the in-kernel test suites. |
 | `./image.sh [--format F] [--size S] [--strip L]` | Build bootable images (`iso`, `img`, `qcow2`). |
 | `./check.sh [--gate N] [--conformance F]` | Build gates and image conformance suites; no arguments means all. |

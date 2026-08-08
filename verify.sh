@@ -20,7 +20,7 @@ PLANNER_MANIFEST="$SRC_DIR/tools/verify-model/Cargo.toml"
 help() {
 	usage_and_exit <<EOF
 usage: verify.sh [--for-change | --for PATH[,PATH...] | --for-range A..B | --release | --sweep]
-                 [--plan] [--explain] [--json] [--shadow] [--catalog] [--model-hash] [--age]
+                 [--plan] [--explain] [--json] [--shadow] [--catalog] [--model-hash] [--age] [--trust]
 
 Works out what a change needs verified and runs exactly that. With no arguments: --for-change.
 
@@ -36,6 +36,7 @@ Works out what a change needs verified and runs exactly that. With no arguments:
   --catalog        every check the planner can emit and the variants it has
   --model-hash     the hash a component's TRUSTED evidence is bound to
   --age            which keys have not run inside the window, over the catalog's universe
+  --trust          which components are TRUSTED under the current model, and what is short
   -h, --help       this text
 
 examples:
@@ -112,6 +113,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--age)
 		action=age
+		shift
+		;;
+	--trust)
+		action=trust
 		shift
 		;;
 	*) die "unexpected argument '$1' (try --help)" ;;
@@ -192,6 +197,9 @@ model-hash)
 	;;
 age)
 	exec cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- age
+	;;
+trust)
+	exec cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- trust
 	;;
 esac
 

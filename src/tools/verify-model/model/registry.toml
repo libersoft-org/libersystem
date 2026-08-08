@@ -174,10 +174,6 @@ path = "docs"
 reason = "documentation; changes no byte of any artifact"
 
 [[non_code]]
-path = "AI"
-reason = "notes; not read by any build step"
-
-[[non_code]]
 path = "README.md"
 reason = "documentation"
 
