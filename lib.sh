@@ -145,9 +145,13 @@ declare -A COMPONENT_TAGS=(
 	["src/user/runtime"]="dynamic,component,service,process"
 	# Everything else that is not the kernel.
 	["src/fs"]="filesystem,storage,volume"
-	["src/volume"]="volume,storage,filesystem,boot"
 	["src/loader"]="boot,dynamic,volume"
-	["src/boot"]="boot,dynamic,volume"
+	# `src/boot` is the harness: the image builder, the QEMU runner, the test runner and the boot
+	# scenarios. A change there can alter what the guest is and how it is judged, so it is tested
+	# with everything - and so is anything that generates or packages what ships.
+	["src/boot"]=""
+	["src/tools"]=""
+	["src/volume"]=""
 	["src/term"]="console,shell,display,lico"
 	["src/sdk"]="component,service,process"
 	["src/wasm"]="component,service,process"
@@ -170,11 +174,21 @@ component_tags() {
 		local tool="${path##*/}"
 		tool_tags "${tool%.rs}" && return 0
 	fi
-	# Build tooling and documentation are checked by ./check.sh and by building, not by booting
-	# anything. The root scripts belong here for the same reason `src/tools` does - a mistake in them
-	# shows up as a build or a gate failure, and no amount of kernel testing would find it.
+	# What genuinely cannot change a built artifact, and so cannot be caught by booting one.
+	#
+	# This list was once `src/tools/* | docs/* | *.md | *.sh`, which was wrong in a way worth keeping
+	# written down: it excused `src/boot/mkimage.sh` (builds the image), `src/boot/qemu-run.sh` and
+	# `src/boot/test-kernel.sh` (boot and run the guest) and `src/tools/mkpackages` - which is in
+	# VOLUME_SOURCES, so its output IS the system volume. "Change the thing that builds the system,
+	# test nothing" is exactly the false green this whole mechanism exists to prevent, and it
+	# contradicted M0148's own invariant that build and image tooling select everything.
+	#
+	# What is left here is documentation and the gates themselves: a gate that breaks fails loudly on
+	# its own, and a Markdown file changes no byte of any artifact.
 	case "$path" in
-	src/tools/* | docs/* | *.md | *.sh) return 1 ;;
+	docs/* | *.md) return 1 ;;
+	src/tools/check-*.sh | src/boot/check-*.sh) return 1 ;;
+	commit.sh | git-commits.sh | fix-rights.sh | dev.sh) return 1 ;;
 	esac
 	for prefix in "${!COMPONENT_TAGS[@]}"; do
 		if [[ "$path" == "$prefix"/* || "$path" == "$prefix" ]] && ((${#prefix} > best_len)); then
