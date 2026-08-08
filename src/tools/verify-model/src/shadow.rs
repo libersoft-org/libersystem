@@ -200,8 +200,11 @@ impl Log {
 		self.records.iter().filter(|record| record.model_hash == model_hash && record.verdict == "Consistent" && record.changed_components.iter().any(|changed| changed == component)).count()
 	}
 
-	pub fn architectures_seen(&self, component: &str, model_hash: &str) -> BTreeSet<String> {
-		self.records.iter().filter(|record| record.model_hash == model_hash && record.changed_components.iter().any(|changed| changed == component)).map(|record| record.architecture.clone()).collect()
+	// Targets this component has CLEAN evidence on. Filtering on the verdict is the whole point and
+	// was missing: five clean x86_64 comparisons plus one riscv64 CandidateMiss counted as "evidence
+	// from two targets" and could earn a certificate on the strength of a run that found a fault.
+	pub fn clean_architectures_seen(&self, component: &str, model_hash: &str) -> BTreeSet<String> {
+		self.records.iter().filter(|record| record.model_hash == model_hash && record.verdict == "Consistent" && record.changed_components.iter().any(|changed| changed == component)).map(|record| record.architecture.clone()).collect()
 	}
 }
 

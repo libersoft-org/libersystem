@@ -203,8 +203,14 @@ trust)
 	;;
 esac
 
-# What changed. Renames are reported as `old -> new` by porcelain, and only the new path is a path
-# that exists; the old one is handled by the model as an unknown path, which selects everything.
+# What changed.
+#
+# KNOWN GAP, tracked in M0148: porcelain reports a rename as `old -> new` and this keeps only the
+# NEW path. The old one is discarded, not - as this comment used to claim - handed to the model as
+# an unknown path. Moving a file OUT of a component therefore does not select that component, and a
+# rename into `docs/` can look like nothing changed at all. The fix is to move diff parsing into
+# `verify-model` (porcelain v2, both sides of a rename, deletions as the old path) so the regression
+# corpus and this script parse a change the same way instead of two ways.
 case "$mode" in
 for-change)
 	changed="$(git status --porcelain 2>/dev/null | sed 's/^...//' | sed 's/.* -> //' | grep -v '^$' || true)"

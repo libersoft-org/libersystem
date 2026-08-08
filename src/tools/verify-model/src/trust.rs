@@ -92,7 +92,7 @@ impl Store {
 	// Whether the evidence on record would earn a certificate right now, and if not, what is short.
 	pub fn evaluate(&self, component: &str, model_hash: &str, log: &Log) -> Result<(usize, Vec<String>), String> {
 		let clean = log.clean_runs_for(component, model_hash);
-		let architectures: Vec<String> = log.architectures_seen(component, model_hash).into_iter().collect();
+		let architectures: Vec<String> = log.clean_architectures_seen(component, model_hash).into_iter().collect();
 		if clean < REQUIRED_CLEAN_RUNS {
 			return Err(format!("{clean} clean shadow comparison(s) under this model, {REQUIRED_CLEAN_RUNS} needed"));
 		}

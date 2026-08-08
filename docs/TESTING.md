@@ -137,7 +137,11 @@ gate.
 
 ## Shadow and trust
 
-A scoped answer is not believed because it is plausible.
+A scoped answer should not be believed because it is plausible - and the machinery that will enforce
+that is built but **not yet wired into the ordinary run**. Today `./verify.sh` executes its scoped
+plan without consulting the trust store; shadow comparison is something you invoke. Until that is
+closed (M0148 follow-ups), treat a scoped green as good evidence rather than as equivalent to a full
+verification, and use `--sweep` before anything that matters.
 
 ```sh
 ./verify.sh --shadow    # run the FULL suite and compare it against the selection that was NOT run

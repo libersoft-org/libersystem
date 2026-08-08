@@ -703,3 +703,24 @@ fn a_change_with_owned_paths_never_selects_nothing() {
 		assert!(!plan.nothing_to_do, "{path} is code");
 	}
 }
+
+// Found by an outside audit of the implementation rather than of the design, and both are the same
+// mistake in different places: a state that is not "clean" being counted as if it were.
+
+#[test]
+fn only_a_consistent_verdict_counts_as_clean_evidence() {
+	// Five clean comparisons on x86_64 and one riscv64 run that FOUND something used to satisfy
+	// "evidence from two targets", so a certificate could be earned on the strength of a failure.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	let record = |architecture: &str, verdict: &str| crate::shadow::Record { architecture: architecture.to_string(), verdict: verdict.to_string(), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 };
+	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
+		log.records.push(record("x86_64", "Consistent"));
+	}
+	log.records.push(record("riscv64", "CandidateMiss"));
+	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	let error = store.evaluate("audio", "hash-a", &log).expect_err("a run that found a candidate miss is not evidence that the selector is right");
+	assert!(error.contains("target(s)"), "{error}");
+	// The same target, cleanly this time, is what actually earns it.
+	log.records.push(record("riscv64", "Consistent"));
+	assert!(store.evaluate("audio", "hash-a", &log).is_ok());
+}

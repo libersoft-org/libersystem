@@ -239,7 +239,15 @@ fn run() -> Result<ExitCode, String> {
 			log.schema = 1;
 			log.records.push(verify_model::shadow::Record { architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
 			log.save(&repo_root)?;
-			Ok(if comparison.verdict == verify_model::shadow::Verdict::CandidateMiss { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+			// Only Consistent is green, and the other three are green in different wrong ways.
+			// CandidateMiss is the selector's problem; SelectionFailed is the code's and the sweep
+			// found it; Void means the comparison judged nothing at all. Returning 0 for the last
+			// two let `verify.sh` print "no evidence against the selection" over a run that had
+			// produced no evidence either way, which is the exact shape of false green.
+			Ok(match comparison.verdict {
+				verify_model::shadow::Verdict::Consistent => ExitCode::SUCCESS,
+				_ => ExitCode::FAILURE,
+			})
 		}
 		"trust" => {
 			let hash = model.model_hash();
