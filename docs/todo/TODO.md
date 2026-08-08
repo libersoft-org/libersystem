@@ -196,6 +196,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0145 - The kernel's lowest layers do not yet keep the promises the upper ones make](M0145.md)
 - [x] [M0146 - What M0144 left in the disk probe, and three gaps it opened itself](M0146.md)
 - [ ] [M0147 - A wait set the kernel keeps](M0147.md)
+- [ ] [M0148 - Testing that scales with the change, not with the tree](M0148.md)
 
 ### Definition of done (phase 2)
 
