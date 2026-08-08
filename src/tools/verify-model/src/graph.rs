@@ -107,7 +107,11 @@ impl Graph {
 		}
 
 		graph.edges.sort();
-		graph.edges.dedup();
+		// Deduplicated on (from, to, kind) rather than on the whole edge, because the REASON is a
+		// hint for a reader and not part of what the edge means. Two ownership rules can name one
+		// component - `src/kernel/arch/aarch64` and `src/kernel/linker/aarch64.ld` both do - and
+		// leaving both reasons in printed the same edge twice and counted it twice.
+		graph.edges.dedup_by(|left, right| left.from == right.from && left.to == right.to && left.kind == right.kind);
 		graph.reindex();
 		graph
 	}
