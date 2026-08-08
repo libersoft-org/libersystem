@@ -1,0 +1,555 @@
+# M0148: the part of the model that cannot be derived.
+#
+# Everything a tool can compute is computed: a crate's component is its package name, its
+# `link.static` / `link.static.dev` / `generation.build` edges are its Cargo dependency tables, and
+# its `link.dynamic` edges are services/manifest.toml's providers. What is left here is what no file
+# in the tree states: which component owns a path that is not inside a crate, which edges exist only
+# at run time or through a generator, which targets a change can affect, and what is not code.
+#
+# The rule for adding to this file: if the answer is written down somewhere else in the tree, read it
+# there instead. A second copy of a derivable fact is a second answer that can disagree with the
+# first, and the hand-written one is the one that gets consulted.
+
+schema = 1
+
+# ---------------------------------------------------------------------------------------------
+# Ownership
+#
+# Longest matching prefix wins, and these compete with crate containment on the same footing - so
+# `src/kernel/arch/x86_64` beats the `kernel` crate at `src/kernel` because it is longer, which is
+# exactly what the architecture policy needs. A path matching nothing is UNKNOWN, and unknown reach
+# selects everything.
+
+[[ownership]]
+path = "src/kernel/arch/x86_64"
+component = "kernel.arch.x86_64"
+
+[[ownership]]
+path = "src/kernel/arch/aarch64"
+component = "kernel.arch.aarch64"
+
+[[ownership]]
+path = "src/kernel/arch/riscv64"
+component = "kernel.arch.riscv64"
+
+[[ownership]]
+path = "src/kernel/linker/x86_64.ld"
+component = "kernel.arch.x86_64"
+
+[[ownership]]
+path = "src/kernel/linker/aarch64.ld"
+component = "kernel.arch.aarch64"
+
+[[ownership]]
+path = "src/kernel/linker/riscv64.ld"
+component = "kernel.arch.riscv64"
+
+# The three userspace linker scripts are per-target the same way, but the script that CHOOSES
+# between them is not - see the architecture policy below, where that distinction is the point.
+[[ownership]]
+path = "src/user/user.ld"
+component = "userspace.link.x86_64"
+
+[[ownership]]
+path = "src/user/user-aarch64.ld"
+component = "userspace.link.aarch64"
+
+[[ownership]]
+path = "src/user/user-riscv64.ld"
+component = "userspace.link.riscv64"
+
+[[ownership]]
+path = "src/user/x86_64-unknown-none.json"
+component = "userspace.link.x86_64"
+
+[[ownership]]
+path = "src/user/build.rs"
+component = "userspace.build"
+
+[[ownership]]
+path = "src/user/rust-toolchain.toml"
+component = "userspace.build"
+
+[[ownership]]
+path = "src/user/.cargo"
+component = "userspace.build"
+
+[[ownership]]
+path = "src/.cargo"
+component = "harness.tools"
+
+# The repository-root cargo configuration. It is not documentation: it decides where every build
+# output lands, which is the difference between a gate inspecting this build and the previous one.
+[[ownership]]
+path = ".cargo"
+component = "harness.tools"
+
+# The manifest is a build INPUT, not only the file the provider graph is read from: `system-manifest`
+# is a build-dependency of the kernel and of CoreServices, and their build scripts generate source
+# from it. Its `generation.build` edges are declared below.
+[[ownership]]
+path = "src/user/services/manifest.toml"
+component = "manifest"
+
+# The interface definitions every generated protocol crate is produced from. `just gen` passes
+# `idl/*.lsidl` to every one of the sixteen, so one .lsidl reaches all of them.
+[[ownership]]
+path = "src/idl"
+component = "idl"
+
+# The harness: what builds the image, what boots it, and what judges the guest. A change here can
+# alter what the system IS and how it is measured, so it is not a component that ships - it is a
+# component every guest run depends on. See the edges below.
+[[ownership]]
+path = "src/boot"
+component = "harness.boot"
+
+[[ownership]]
+path = "src/tools"
+component = "harness.tools"
+
+# The entry-point scripts and the shared library behind them.
+[[ownership]]
+path = "lib.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "build.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "check.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "test.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "verify.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "image.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "run.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "clean.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "format.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "setup.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "src/Justfile"
+component = "harness.scripts"
+
+# The factory files the system volume ships, and the version every build stamps into itself.
+[[ownership]]
+path = "src/volume"
+component = "volume.factory"
+
+[[ownership]]
+path = "product.conf"
+component = "product"
+
+# ---------------------------------------------------------------------------------------------
+# Not code
+#
+# A path here selects nothing at all, so each one needs a reason that survives being read a year
+# from now. "It is not source" is not a reason: `src/boot/mkimage.sh` is not source either and it
+# builds the image. The test is whether changing the file can change what an artifact DOES.
+
+[[non_code]]
+path = "docs"
+reason = "documentation; changes no byte of any artifact"
+
+[[non_code]]
+path = "AI"
+reason = "notes; not read by any build step"
+
+[[non_code]]
+path = "README.md"
+reason = "documentation"
+
+[[non_code]]
+path = "INSTALL.md"
+reason = "documentation"
+
+[[non_code]]
+path = "NOTES.md"
+reason = "documentation"
+
+[[non_code]]
+path = "LICENSE"
+reason = "documentation"
+
+[[non_code]]
+path = ".gitignore"
+reason = "version control configuration; no build step reads it"
+
+[[non_code]]
+path = ".editorconfig"
+reason = "editor configuration"
+
+[[non_code]]
+path = ".prettierrc"
+reason = "formatter configuration; format.sh reformats, it does not change behaviour"
+
+[[non_code]]
+path = ".vscode"
+reason = "editor configuration"
+
+[[non_code]]
+path = "taplo.toml"
+reason = "formatter configuration"
+
+[[non_code]]
+path = "rustfmt.toml"
+reason = "formatter configuration"
+
+[[non_code]]
+path = "commit.sh"
+reason = "version control helper; runs after everything this milestone plans"
+
+[[non_code]]
+path = "git-commits.sh"
+reason = "version control helper"
+
+[[non_code]]
+path = "git-stats.sh"
+reason = "version control reporting"
+
+[[non_code]]
+path = "fix-rights.sh"
+reason = "file mode repair; changes no content"
+
+[[non_code]]
+path = "dev.sh"
+reason = "a thin launcher over src/boot; the harness it launches is harness.boot"
+
+# ---------------------------------------------------------------------------------------------
+# Host suites that cannot run on the host
+#
+# A crate here declares `#[test]`s that `cargo test` genuinely cannot execute, and saying so is the
+# point: an inventory that silently omits a crate looks exactly like an inventory that covers it.
+# Each entry is a debt with a named cause, not an exemption.
+
+[[host_tests_unrunnable]]
+crate = "services"
+reason = "the crate links `rt`, which defines the `panic_impl` lang item, and `cargo test` links `std`, which defines it too - E0152 before a single test runs. Its four suites (shell_language, graph_limits, executable, service_lifecycle) are pure logic and would run today if that logic lived in a library crate the binaries depend on; until then the in-guest suite is their only cover."
+
+# A whole configuration that cannot be host-tested, stated once with its cause.
+#
+# Measured 2026-08-08: of the sixteen crates declaring `shared-image`, fifteen fail to build for
+# `cargo test` in it, all with the same error. Enabling the feature activates `ipc-client`, which
+# links `rt`, which defines `panic_impl` - and the test harness links `std`, which defines it too.
+# E0152, before a single test runs.
+#
+# So for those crates the shipping configuration is not merely untested, it is currently
+# UNTESTABLE on the host, and the dependency graph is where the configuration dimension pays off
+# rather than the suite. Splitting the codec/protocol logic from the freestanding runtime would
+# make these runnable; until then the in-guest suite is their only cover.
+[[host_configuration_unrunnable]]
+configuration = "shared-image"
+when_static_reach = "rt"
+reason = "the shipping feature set links rt, whose panic_impl collides with the std that `cargo test` needs (E0152)"
+
+# ---------------------------------------------------------------------------------------------
+# Components that select everything
+#
+# Fail open, as a written list rather than as a habit. A change to any of these makes the whole
+# plan FULL - not because the closure could not be computed, but because the thing that changed is
+# what the closure is computed WITH, or is reached by so much of the system that a narrower answer
+# would be a guess dressed as an inference.
+#
+# This applies to a CHANGED component, not to a merely affected one. `flac` reaching `kernel`
+# through a dev-dependency is a reason to rebuild the kernel's test binary; it is not a reason to
+# run every conformance suite.
+
+[[selects_everything]]
+component = "harness.boot"
+reason = "builds the image, boots the guest and judges it - it decides what every other answer means"
+
+[[selects_everything]]
+component = "harness.tools"
+reason = "the builders, packagers and gates; mkpackages' output IS the system volume"
+
+[[selects_everything]]
+component = "harness.scripts"
+reason = "the entry points and lib.sh, which is where the selection itself is spelled"
+
+[[selects_everything]]
+component = "verify-model"
+reason = "the selector; a selector cannot vouch for a change to itself"
+
+[[selects_everything]]
+component = "kernel"
+reason = "phase one keeps shared kernel subsystems whole - narrowing mem/sched/object/syscall is where a selector is most likely to be wrong, and M0148 defers it until there is shadow evidence per change class"
+
+[[selects_everything]]
+component = "abi"
+reason = "the kernel/userspace contract; every syscall and every right is defined here"
+
+[[selects_everything]]
+component = "bootproto"
+reason = "what the loader hands the kernel; a layout change is invisible until something boots"
+
+[[selects_everything]]
+component = "wire"
+reason = "the encoding every protocol message is carried in"
+
+[[selects_everything]]
+component = "manifest"
+reason = "declares every destination in the image and generates source into the kernel and CoreServices"
+
+[[selects_everything]]
+component = "idl"
+reason = "regenerates all sixteen protocol crates"
+
+[[selects_everything]]
+component = "rt"
+reason = "the shared runtime every dynamic executable starts through"
+
+[[selects_everything]]
+component = "product"
+reason = "stamped into every artifact through cargo:rustc-env"
+
+# ---------------------------------------------------------------------------------------------
+# Declared edges
+#
+# The ones a linker cannot see. Each is written ONCE between components rather than repeated in
+# every test's `covers`, because a change to something everything speaks - the IDL, the manifest,
+# the harness - would otherwise have to be written into every test file, which rebuilds the
+# hand-maintained table this whole model replaces.
+
+# Generation: every protocol crate is produced from the whole `idl/*.lsidl` set, so one interface
+# file reaches all sixteen. `just gen` passes the glob; this says the same thing to the planner.
+[[edge]]
+from = [
+	"base-proto",
+	"audio-proto",
+	"config-proto",
+	"device-proto",
+	"display-proto",
+	"input-proto",
+	"log-proto",
+	"network-proto",
+	"observability-proto",
+	"process-proto",
+	"resources-proto",
+	"security-proto",
+	"session-proto",
+	"storage-proto",
+	"time-proto",
+	"proto",
+]
+to = "idl"
+kind = "generation"
+reason = "generated by lsidl-gen from the whole idl/*.lsidl set"
+
+[[edge]]
+from = [
+	"base-proto",
+	"audio-proto",
+	"config-proto",
+	"device-proto",
+	"display-proto",
+	"input-proto",
+	"log-proto",
+	"network-proto",
+	"observability-proto",
+	"process-proto",
+	"resources-proto",
+	"security-proto",
+	"session-proto",
+	"storage-proto",
+	"time-proto",
+	"proto",
+]
+to = "lsidl-gen"
+kind = "generation"
+reason = "the generator itself; a change to it changes what every protocol crate contains"
+
+# The manifest generates source into the kernel and CoreServices through system-manifest, which is
+# a build-dependency of both. The `generation.build` edge to system-manifest is derived from Cargo;
+# this is the edge to the DATA that build script reads, which Cargo cannot see.
+[[edge]]
+from = ["kernel", "services"]
+to = "manifest"
+kind = "generation"
+reason = "build.rs generates manifest.rs, library_paths.rs and program_paths.rs from it"
+
+# The version string every build stamps in through cargo:rustc-env.
+[[edge]]
+from = ["kernel", "services"]
+to = "product"
+kind = "generation"
+reason = "build.rs emits cargo:rustc-env=PRODUCT_VERSION from product.conf"
+
+# The userspace build script and the linker scripts it selects. Cargo records `build = "../../build.rs"`
+# per crate but `cargo metadata` does not expose it as a dependency edge, so it is declared.
+[[edge]]
+from = ["userspace.build"]
+to = ["userspace.link.x86_64", "userspace.link.aarch64", "userspace.link.riscv64"]
+kind = "generation"
+reason = "build.rs maps target_arch to one of the three scripts and passes it via cargo:rustc-link-arg"
+
+# ---------------------------------------------------------------------------------------------
+# Architecture policy
+#
+# Per target, not per category. Longest matching prefix wins. The distinction that matters and is
+# easy to get wrong: a file that is PER TARGET selects its target, and a file that CHOOSES BETWEEN
+# targets selects all of them. `user-riscv64.ld` is the first kind; `src/user/build.rs`, which maps
+# target_arch to one of the three, is the second - a bug in its mapping is invisible on the target
+# it maps correctly.
+#
+# `build` is which targets must compile; `boot` is which guests must run. Cross-building all three
+# proves a branch compiles, not that it is right, so `build` is never the whole answer.
+
+[[architecture]]
+path = "src/kernel/arch/x86_64"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64"]
+
+[[architecture]]
+path = "src/kernel/arch/aarch64"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["aarch64"]
+
+[[architecture]]
+path = "src/kernel/arch/riscv64"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["riscv64"]
+
+[[architecture]]
+path = "src/kernel/linker/x86_64.ld"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64"]
+
+[[architecture]]
+path = "src/kernel/linker/aarch64.ld"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["aarch64"]
+
+[[architecture]]
+path = "src/kernel/linker/riscv64.ld"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["riscv64"]
+
+[[architecture]]
+path = "src/loader/src/arch/x86_64"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64"]
+
+[[architecture]]
+path = "src/loader/src/arch/aarch64"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["aarch64"]
+
+[[architecture]]
+path = "src/loader/src/arch/riscv64"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["riscv64"]
+
+[[architecture]]
+path = "src/user/user.ld"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64"]
+
+[[architecture]]
+path = "src/user/user-aarch64.ld"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["aarch64"]
+
+[[architecture]]
+path = "src/user/user-riscv64.ld"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["riscv64"]
+
+[[architecture]]
+path = "src/user/x86_64-unknown-none.json"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64"]
+
+# The choosers and the shared halves: all three, because a bug in the mapping or in shared code is
+# invisible on the target that happens to be right.
+[[architecture]]
+path = "src/user/build.rs"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+[[architecture]]
+path = "src/kernel/arch/mod.rs"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+[[architecture]]
+path = "src/kernel/arch/common"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+[[architecture]]
+path = "src/kernel/arch/tests.rs"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+[[architecture]]
+path = "src/loader/src/arch/mod.rs"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+# Shared loader source. The loader has both kinds of file in one crate, which is why it gets more
+# than one row: `main.rs` and `uefi.rs` are not per-target, and a fault in either shows on one
+# target and not the others.
+[[architecture]]
+path = "src/loader/src"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+# The harness carries thirteen architecture-specific branches in qemu-run.sh alone. A bug in its
+# riscv64 branch is not visible from an x86_64 run, which is exactly the half of the false-green
+# defect that path ownership alone did not close.
+[[architecture]]
+path = "src/boot"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+[[architecture]]
+path = "src/tools"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+# The ABI, the boot protocol and the wire formats are reached by everything and are where a layout
+# difference between targets would show.
+[[architecture]]
+path = "src/abi"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+[[architecture]]
+path = "src/bootproto"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+[[architecture]]
+path = "src/wire"
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64", "aarch64", "riscv64"]
+
+# The default: ordinary source, cross-built everywhere and booted on the cheap target. This is the
+# row that pays for the milestone, and the one a mechanical arch scan can only ever CLASSIFY as a
+# candidate - `usize`, repr(C) layout, alignment and atomics all differ without any marker.
+[[architecture]]
+path = ""
+build = ["x86_64", "aarch64", "riscv64"]
+boot = ["x86_64"]

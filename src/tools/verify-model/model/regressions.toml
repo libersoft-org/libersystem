@@ -1,0 +1,100 @@
+# A corpus of real regressions, stored as commit ranges.
+#
+# Not as path lists. Stored this way it exercises the whole pipeline - diff parsing, rename and
+# delete handling, path ownership, the closure, check selection, architecture choice and environment
+# choice - rather than only the last two steps. A fixture that hands the planner a list of paths is
+# testing the closure and calling it a test of the selector.
+#
+# Each case asserts three things, and the third is the one with teeth:
+#
+#   must_select      keys that MUST be in the plan. A regression that shipped is a regression
+#                    something failed to run; this is the run that would have caught it.
+#   must_boot        the exact architecture set. Getting this wrong in the cheap direction is an
+#                    untested target, and this is where the arch policy is worth 6104 seconds.
+#   must_not_select  what must NOT be in the plan. Without it every case passes trivially the day
+#                    somebody makes the selector return everything, and the corpus would be a
+#                    fixture that only ever agrees.
+#
+# `full = true` means the change is expected to escalate, and then `must_not_select` is skipped -
+# a FULL plan legitimately contains everything.
+
+schema = 1
+
+# M0145: the RECV_CAPS overrun and the clone-then-close capability duplication. A change inside the
+# kernel's own object and syscall layer, which phase one keeps whole and everywhere.
+[[case]]
+name = "capability-transfer-atomicity"
+range = "95c1572~1..95c1572"
+full = true
+must_boot = ["x86_64", "aarch64", "riscv64"]
+must_select = [
+	"gate.test-tags / host / host / default",
+	"build.kernel / riscv64 / host / shared-image",
+]
+reason = "kernel/object and kernel/syscall are on the selects-everything list; a capability rule is reached by every program that holds a handle"
+
+# The frame use-after-free and the ungated device acquire, in the same audit. It also touched
+# src/abi, which reaches everything by itself - the case is here because the plan must not be
+# narrowed by the fact that most of its 49 files were documentation.
+[[case]]
+name = "frame-retirement-and-device-gating"
+range = "fde6535~1..fde6535"
+full = true
+must_boot = ["x86_64", "aarch64", "riscv64"]
+must_select = ["build.kernel / aarch64 / host / shared-image"]
+reason = "src/abi is the kernel/userspace contract; documentation in the same commit cannot make the plan smaller"
+
+# The MS ADPCM block length: a pure codec defect, in a leaf nothing in the kernel links except as a
+# test fixture. This is the case the whole milestone is for, and the one where a wrong answer is
+# cheap rather than dangerous - so `must_not_select` is what matters here.
+[[case]]
+name = "adpcm-block-length"
+range = "33e7275~1..33e7275"
+full = true
+must_boot = ["x86_64", "aarch64", "riscv64"]
+must_select = ["host.adpcm / host / host / default", "host.wav / host / host / default"]
+reason = "the commit also changed kernel/mem/frame and kernel/sched, so it escalates - the codec half of it is still asserted"
+
+# The same defect isolated to its own leaf, which is what the planner would see if the codec fix had
+# been committed alone. This is the case that shows what the model is worth.
+[[case]]
+name = "adpcm-block-length-isolated"
+paths = ["src/user/libs/audio/adpcm/src/lib.rs"]
+full = false
+must_boot = ["x86_64"]
+must_select = ["host.adpcm / host / host / default", "host.audioconv / host / host / default"]
+must_not_select = [
+	"conformance.png / host / host / default",
+	"host.liberfs / host / host / default",
+	"gate.volume-layout / host / host / default",
+]
+reason = "a codec leaf: its own suite, the library above it, one target booted - and nothing about images or filesystems"
+
+# A per-target change, which is where the architecture policy earns the milestone.
+[[case]]
+name = "riscv64-trap-handling"
+paths = ["src/kernel/arch/riscv64/traps/mod.rs"]
+full = false
+must_boot = ["riscv64"]
+must_select = ["build.kernel / x86_64 / host / shared-image"]
+must_not_select = ["kernel.frame_alloc_distinct / x86_64 / test-guest / test"]
+reason = "boots the target it belongs to and cross-builds the other two, because a branch that stops compiling elsewhere is a regression as well"
+
+# The harness itself. This is the half of the false-green defect that path ownership alone did not
+# close: qemu-run.sh carries thirteen architecture-specific branches, and a fault in the riscv64 one
+# is invisible from an x86_64 run.
+[[case]]
+name = "harness-qemu-runner"
+paths = ["src/boot/qemu-run.sh"]
+full = true
+must_boot = ["x86_64", "aarch64", "riscv64"]
+must_select = ["kernel.frame_alloc_distinct / riscv64 / test-guest / test"]
+reason = "the thing that boots and judges the guest decides what every other answer means"
+
+# Documentation, which must select nothing at all - and must say so rather than silently producing
+# an empty plan, which is what `./test.sh --for-change` used to do with exit 0.
+[[case]]
+name = "documentation-only"
+paths = ["docs/todo/M0148.md", "README.md"]
+nothing_to_do = true
+reason = "declared not code, with a reason recorded per path"

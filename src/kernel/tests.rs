@@ -1318,11 +1318,42 @@ impl Testable for TaggedTest {
 	}
 }
 
+// `covers` says what a test would CATCH, and it is read on the host rather than in the guest.
+//
+// `covers: X` means the test contains an assertion able to detect a regression in X's contract. It
+// does NOT mean the execution path goes through X: every integration test here runs the scheduler,
+// the allocator, IPC and the loader, so if touching counted, every test would cover everything and
+// a selection would be the full suite wearing new metadata.
+//
+// The names are string literals because components are not Rust identifiers - `bin.audioconv`,
+// `base-proto`. Nothing in the guest reads them; `verify-model` parses them out of this source and
+// checks each one against the component graph, so a typo fails the model's gate rather than
+// silently narrowing a selection. They cost no image bytes.
+//
+// The clause is OPTIONAL, and that is the migration rather than an oversight: a test with no
+// `covers` is treated as covering everything and is therefore ALWAYS selected. Annotating a test
+// can only ever make the suite cheaper, never less safe, so this can be done a file at a time
+// instead of as one change to 209 call sites.
 #[macro_export]
 macro_rules! tagged_test {
 	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?]) => {
 		$(#[$attr])*
 		mod $name {
+			#[test_case]
+			static CASE: $crate::tests::TaggedTest = $crate::tests::TaggedTest {
+				name: stringify!($name),
+				tags: &[$crate::tests::TestTag::$first_tag $(, $crate::tests::TestTag::$tag)*],
+				run: super::$name,
+			};
+		}
+	};
+	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?], covers = [$($covers:literal),* $(,)?]) => {
+		$(#[$attr])*
+		mod $name {
+			// Named and immediately discarded: it makes the literals part of the compile, so a
+			// malformed list is a build error here rather than a parse failure on the host.
+			#[allow(dead_code)]
+			const COVERS: &[&str] = &[$($covers),*];
 			#[test_case]
 			static CASE: $crate::tests::TaggedTest = $crate::tests::TaggedTest {
 				name: stringify!($name),

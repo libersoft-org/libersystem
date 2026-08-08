@@ -47,7 +47,59 @@ name = "tool_service"
 program = "tool"
 restart = "escalate"
 dependencies = []
+
+# An image without a kernel or a loader does not boot, so `Manifest::parse` requires all four
+# kinds. This fixture predated that rule and had stopped parsing at all - which nothing noticed,
+# because no gate ran this crate's suite. That is the inventory defect M0148 was written about,
+# found by the gate that now runs all fifty-eight of them.
+#
+# One owner for all four: the rule under test is that each KIND is provided exactly once, and
+# spreading them over four sources would also change what `sources.len()` asserts below.
+[[boot_artifacts]]
+name = "kernel"
+owner = "tool"
+kind = "kernel"
+destination = "kernel"
+
+[[boot_artifacts]]
+name = "loader"
+owner = "tool"
+kind = "loader"
+destination = "EFI/BOOT/BOOTX64.EFI"
+
+[[boot_artifacts]]
+name = "init-package"
+owner = "tool"
+kind = "init-package"
+destination = "init.pkg"
+
+[[boot_artifacts]]
+name = "volume-package"
+owner = "tool"
+kind = "volume-package"
+destination = "volume.pkg"
 "#
+}
+
+#[test]
+fn every_boot_artifact_kind_is_required() {
+	// The rule the fixture above had silently stopped satisfying. Asserted directly so the next
+	// person to touch the fixture learns which four kinds are mandatory from a failure that says
+	// so, rather than from four unrelated tests going red at once.
+	let root = fixture_workspace();
+	for (name, kind, destination) in [
+		("kernel", "kernel", "kernel"),
+		("loader", "loader", "EFI/BOOT/BOOTX64.EFI"),
+		("init-package", "init-package", "init.pkg"),
+		("volume-package", "volume-package", "volume.pkg"),
+	] {
+		let stanza = format!("[[boot_artifacts]]\nname = \"{name}\"\nowner = \"tool\"\nkind = \"{kind}\"\ndestination = \"{destination}\"\n");
+		let without = valid_fixture().replace(&stanza, "");
+		assert_ne!(without, valid_fixture(), "the {kind} stanza must actually be removed, or this proves nothing");
+		let error = Manifest::parse(&without, &root).unwrap_err().to_string();
+		assert!(error.contains("no artifact provides"), "an image with no {kind} must be refused, got: {error}");
+	}
+	fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

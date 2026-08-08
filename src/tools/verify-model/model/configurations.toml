@@ -1,0 +1,49 @@
+# M0148: the configuration catalog.
+#
+# A `PlanItemKey` carries a configuration because the same check over the same crate on the same
+# target can verify two different systems. This is not hypothetical here: `tools` has twenty
+# optional client dependencies reachable only through `shared-image`, all fifteen protocol crates
+# reach `ipc-client` only through `channel-client-impl`, and `build-shared.sh` builds the image with
+# `--no-default-features --features shared-image`. Default and shipping are not the same build.
+#
+# Hashed BY CONTENT into `model_hash`, never by name. `shared-image` is a label whose meaning lives
+# in Cargo.toml; add a feature to it next month and the label does not move, so a model that now
+# tests something different would keep a hash saying it does not.
+
+schema = 1
+
+[[configuration]]
+name = "default"
+default_features = true
+features = []
+profile = "dev"
+build_mode = "host-test"
+description = "what `cargo test` does with no arguments"
+
+# The one that ships. Every crate declaring a `shared-image` feature gets this variant as well as
+# the default one, because for those crates the default configuration is the one that never ships.
+[[configuration]]
+name = "shared-image"
+default_features = false
+features = ["shared-image"]
+profile = "release"
+build_mode = "shipping"
+description = "the PIC provider/consumer build the system volume is assembled from"
+
+# The kernel test binary: built by `cargo test` against a bare-metal target and run inside a guest.
+[[configuration]]
+name = "test"
+default_features = true
+features = []
+profile = "dev"
+build_mode = "test-kernel"
+description = "the in-kernel suite's own build"
+
+# The persistent development instance, which qemu-run.sh refuses to combine with TEST=1.
+[[configuration]]
+name = "development"
+default_features = true
+features = []
+profile = "dev"
+build_mode = "dev-profile"
+description = "the guest `just dev-up` leaves running"

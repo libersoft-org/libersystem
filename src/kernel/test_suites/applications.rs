@@ -1,6 +1,6 @@
 use super::*;
 
-tagged_test!(imgview_interactions, [Imgview, Image, Display, Input, Process, Service, Storage]);
+tagged_test!(imgview_interactions, [Imgview, Image, Display, Input, Process, Service, Storage], covers = ["bin.imgview", "pix", "surface", "display-proto", "input-proto"]);
 fn imgview_interactions() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
@@ -28,7 +28,7 @@ fn imgview_interactions() {
 // the richest of the three, and it keeps the whole path - package, loader, services, terminal -
 // covered by something that boots cold in the kernel suite and needs no development profile.
 
-tagged_test!(lico_switches_panels_and_restores_the_terminal, [Lico, Process, Service, Storage]);
+tagged_test!(lico_switches_panels_and_restores_the_terminal, [Lico, Process, Service, Storage], covers = ["bin.lico", "lico", "term", "keys"]);
 fn lico_switches_panels_and_restores_the_terminal() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
@@ -38,7 +38,7 @@ fn lico_switches_panels_and_restores_the_terminal() {
 	run_lico_harness(lico_elf, &mut system);
 }
 
-tagged_test!(imgconv_cross_volume_and_failed_overwrite_preserve_destination, [Image, Service, Storage, Process, Filesystem]);
+tagged_test!(imgconv_cross_volume_and_failed_overwrite_preserve_destination, [Image, Service, Storage, Process, Filesystem], covers = ["bin.imgconv", "imgconv", "storage", "volume-client"]);
 fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
@@ -117,7 +117,7 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	assert_eq!(full_media.open(b"vol://media/KEEP.BMP", 0xfa11), Some(previous.to_vec()), "failed overwrite preserves the previous destination byte-for-byte");
 }
 
-tagged_test!(audioconv_converts_across_volumes_and_never_writes_a_failed_conversion, [Audio, Service, Storage, Process, Filesystem]);
+tagged_test!(audioconv_converts_across_volumes_and_never_writes_a_failed_conversion, [Audio, Service, Storage, Process, Filesystem], covers = ["bin.audioconv", "audioconv", "wav", "aiff", "flac", "wavpack", "pcm", "adpcm", "storage"]);
 fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
 	// The real `audioconv.lsexe`, launched with a volume bundle and nothing else - no AudioService,
 	// no device authority - converting between two StorageService volumes. What makes this worth
@@ -248,7 +248,7 @@ fn decode_flac_samples(bytes: &[u8]) -> alloc::vec::Vec<i16> {
 	samples
 }
 
-tagged_test!(imgconv_governed_working_set_is_measured, [Image, Memory, Process, Service, Storage]);
+tagged_test!(imgconv_governed_working_set_is_measured, [Image, Memory, Process, Service, Storage], covers = ["bin.imgconv", "imgconv", "webp", "png"]);
 fn imgconv_governed_working_set_is_measured() {
 	use object::domain::{Domain, UNLIMITED};
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
@@ -332,7 +332,7 @@ fn imgconv_governed_working_set_is_measured() {
 	serial_println!("imgconv governed memory: 1920x1080={} bytes, 3840x2160={} bytes, animation={} bytes, shipped 4K wallpaper={} bytes", full_hd_peak, ultra_hd_peak, animation_peak, wallpaper_peak);
 }
 
-tagged_test!(wasi_host_runs_a_component, [Component, Service]);
+tagged_test!(wasi_host_runs_a_component, [Component, Service], covers = ["bin.wasi_host", "wasm"]);
 fn wasi_host_runs_a_component() {
 	// The wasi_host (a ring-3 process) loads an embedded Wasm component and runs it
 	// on the `wasm` runtime. The component's only import, `liber.read`, is wired by
@@ -395,7 +395,7 @@ fn permission_manager_mints_scoped_application_grants() {
 	assert!(result.graphics_start_ns != 0, "the governed app cold-start path is measured");
 }
 
-tagged_test!(component_host_runs_an_sdk_component, [Component, Service, Slow]);
+tagged_test!(component_host_runs_an_sdk_component, [Component, Service, Slow], covers = ["bin.component_host", "wasm", "liber_component"]);
 fn component_host_runs_an_sdk_component() {
 	// component_host (a ring-3 process) loads a real Wasm component - built by the Rust
 	// SDK and served from storage as vol://system/components/liber_component/app.wasm, not embedded in the kernel
@@ -439,7 +439,7 @@ fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	assert!(!result.diagnostic_read.windows(8).any(|window| window == b"in> cat:"), "and it went to the terminal rather than down the pipe, where the consumer would have echoed it: {:?}", core::str::from_utf8(&result.diagnostic_read));
 }
 
-tagged_test!(a_fat_volume_accepts_a_write_as_its_first_operation, [Service, Storage, Filesystem]);
+tagged_test!(a_fat_volume_accepts_a_write_as_its_first_operation, [Service, Storage, Filesystem], covers = ["fat", "storage", "liberfs"]);
 fn a_fat_volume_accepts_a_write_as_its_first_operation() {
 	// The FAT backing mounts lazily, and the destination validation added with the write-stream
 	// work read `self.fs` directly instead of mounting - so `write vol://media/file` answered
@@ -459,7 +459,7 @@ fn a_fat_volume_accepts_a_write_as_its_first_operation() {
 	assert_eq!(media.open(b"vol://media/FIRST.TXT", 0x7f02), Some(b"written first".to_vec()), "and the bytes are there");
 }
 
-tagged_test!(the_memory_volumes_serve_files_and_keep_nothing_across_a_restart, [Service, Storage, Filesystem]);
+tagged_test!(the_memory_volumes_serve_files_and_keep_nothing_across_a_restart, [Service, Storage, Filesystem], covers = ["libermemfs", "storage"]);
 fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	let (_volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
@@ -541,7 +541,7 @@ fn the_memory_volumes_serve_files_and_keep_nothing_across_a_restart() {
 	// only move the same wall further away.
 }
 
-tagged_test!(the_memory_volumes_bound_and_answer_streams, [Service, Storage, Filesystem]);
+tagged_test!(the_memory_volumes_bound_and_answer_streams, [Service, Storage, Filesystem], covers = ["libermemfs", "storage"]);
 fn the_memory_volumes_bound_and_answer_streams() {
 	let (_volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
@@ -660,7 +660,7 @@ fn the_memory_volumes_bound_and_answer_streams() {
 // Splitting by COST rather than by subject is deliberate. The cheap half of these cases proves the
 // same properties on every architecture; the expensive half proves them again at a scale only a
 // fast target can afford.
-tagged_test!(the_memory_volumes_bound_expensive_streams, [Service, Storage, Filesystem, Slow]);
+tagged_test!(the_memory_volumes_bound_expensive_streams, [Service, Storage, Filesystem, Slow], covers = ["libermemfs", "storage"]);
 fn the_memory_volumes_bound_expensive_streams() {
 	let (_volume, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");

@@ -1,45 +1,62 @@
 #!/usr/bin/env bash
-# Run the host test suites of the crates that can be exercised without booting anything.
+# Run the host test suite of every crate that has one.
 #
-# LiberFS and the partition probe are pure over their input - a `Vec` of blocks, a map of
-# sectors - so their behaviour can be pinned down on the host far more finely than through a
-# QEMU boot: a forged superblock, a refused allocation, a partition table with one wrong
-# checksum. Those suites existed and nothing ran them, which is a suite in name only. This
-# gate is what makes them part of `./check.sh`.
+# It used to run nine, from a list kept by hand, while fifty-eight crates had suites - FAT, ISO9660,
+# UDF, LiberMemFS, every image codec, MP3, Vorbis, Ogg, both compression leaves, `abi`, `proto`,
+# `term`. Those suites are milliseconds each and pin behaviour far more finely than a boot can, and
+# nothing ran them. That is a suite in name only, and a hand-written inventory is how it stayed that
+# way: there was no moment at which anybody was told the list had fallen behind.
 #
-# The in-kernel suite (test.sh) is the other half and not a substitute: it answers what the
-# SYSTEM does with these crates, and this answers what the crates do.
+# So the list is DERIVED now. `verify-model host-suites` scans the tree for crates containing a
+# `#[test]` and prints one line per (crate, configuration) the catalog says is runnable. Adding a
+# crate with tests adds a line here on the next run, with nobody remembering to do anything.
+#
+# The in-kernel suite (test.sh) is the other half and not a substitute: it answers what the SYSTEM
+# does with these crates, and this answers what the crates do.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# crate directory -> what its host suite is for.
-CRATES=(
-	"fs/liberfs"
-	"fs/partition"
-	# The audio leaves. Their suites existed and nothing ran them either - the decoders were pinned
-	# down by tests no gate invoked, which is the same suite-in-name-only this script was written
-	# for. The encoders beside them are the reason it was noticed.
-	"user/libs/audio/pcm"
-	"user/libs/audio/adpcm"
-	"user/libs/audio/wav"
-	"user/libs/audio/aiff"
-	"user/libs/audio/flac"
-	"user/libs/audio/wavpack"
-	"user/libs/audio/audioconv"
-)
+# The floor. A scan that silently stops discovering crates returns success with an empty list, which
+# is indistinguishable from a tree that has no tests - and it is the exact shape of the failure this
+# script was rewritten to prevent. Measured 2026-08-08: 58 crates, 58 runnable (crate, configuration)
+# pairs. Raise it when the number grows; a drop is a defect until proven otherwise.
+MINIMUM_SUITES=55
 
+suites="$(cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- host-suites)" || {
+	echo "host-tests: the model could not enumerate the suites; refusing to report a pass over an unknown list" >&2
+	exit 1
+}
+
+count="$(printf '%s\n' "$suites" | grep -c . || true)"
+if ((count < MINIMUM_SUITES)); then
+	echo "host-tests: found only $count suite(s), expected at least $MINIMUM_SUITES" >&2
+	echo "host-tests: a shrinking inventory is a broken scanner until proven otherwise - check verify-model's discovery before lowering this floor" >&2
+	exit 1
+fi
+
+echo "host-tests: $count suite(s)"
 status=0
-for crate in "${CRATES[@]}"; do
-	echo "host-tests: $crate"
-	# Run from here rather than from inside the crate. `src/user/.cargo/config.toml` names a
+failed=()
+while IFS=$'\t' read -r dir crate configuration; do
+	[[ -n "$dir" ]] || continue
+	# Run from `src/` rather than from inside the crate. `src/user/.cargo/config.toml` names a
 	# bare-metal target and builds `core` from source, which is right for the volume and fatal for a
 	# host test: the harness needs `std` and `test`, and a second `core` collides with the one `std`
-	# already carries. Cargo picks its config up from the working directory, so staying out of that
+	# already carries. Cargo takes its config from the working directory, so staying out of that
 	# subtree is what selects the host.
-	if ! cargo test --quiet --manifest-path "$crate/Cargo.toml"; then
-		echo "host-tests: $crate FAILED" >&2
+	args=(--quiet --manifest-path "../$dir/Cargo.toml")
+	if [[ "$configuration" != default ]]; then
+		args+=(--no-default-features --features "$configuration")
+	fi
+	if ! cargo test "${args[@]}"; then
+		echo "host-tests: $crate ($configuration) FAILED" >&2
+		failed+=("$crate/$configuration")
 		status=1
 	fi
-done
+done <<<"$suites"
+
+if ((status != 0)); then
+	echo "host-tests: ${#failed[@]} of $count failed: ${failed[*]}" >&2
+fi
 exit "$status"

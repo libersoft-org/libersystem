@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.0.0"
+
+[[package]]
 name = "audio-proto"
 version = "0.0.0"
 dependencies = [
@@ -87,6 +91,7 @@ name = "process-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "resources-proto",
  "wire",
 ]
 
@@ -157,3 +162,6 @@ dependencies = [
 [[package]]
 name = "wire"
 version = "0.0.0"
+dependencies = [
+ "abi",
+]

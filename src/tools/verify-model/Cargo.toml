@@ -1,0 +1,24 @@
+[package]
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+name = "verify-model"
+edition = "2024"
+description = "The component graph, check catalog and change planner behind ./verify.sh"
+
+[[bin]]
+name = "verify-model"
+path = "src/main.rs"
+
+[lib]
+name = "verify_model"
+path = "src/lib.rs"
+
+[dependencies]
+# The provider graph: `link.dynamic` edges come from services/manifest.toml, and this
+# is the crate that already parses and validates it. Reading it a second time here
+# would be a second answer that can disagree with the first.
+system-manifest = { path = "../system-manifest" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+toml = "0.9.12"
+sha2 = "0.10.9"
