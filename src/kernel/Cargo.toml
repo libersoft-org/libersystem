@@ -44,6 +44,7 @@ aiff = { path = "../user/libs/audio/aiff" }
 flac = { path = "../user/libs/audio/flac" }
 pcm = { path = "../user/libs/audio/pcm" }
 wav = { path = "../user/libs/audio/wav" }
+wavpack = { path = "../user/libs/audio/wavpack" }
 
 bmp = { path = "../user/libs/image/bmp" }
 gif = { path = "../user/libs/image/gif" }

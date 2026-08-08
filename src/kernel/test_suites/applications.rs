@@ -152,7 +152,7 @@ fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
 	let line = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.FLAC", &mut system, &mut media);
 	assert!(line.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> FLAC 8000Hz/1ch/2000fr duration=250ms bytes="), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&line));
 	assert!(line.ends_with(b" metadata=stripped\n"), "the report does not say what it dropped");
-	let written = system.open(b"vol://system/CROSS.FLAC", 0xaud10).expect("the cross-volume FLAC opens");
+	let written = system.open(b"vol://system/CROSS.FLAC", 0xaad10).expect("the cross-volume FLAC opens");
 	let decoded = decode_flac_samples(&written);
 	assert_eq!(decoded, samples, "the lossless conversion did not survive the round trip");
 
@@ -160,16 +160,23 @@ fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
 	// exercised through the real tool rather than only in the library's own tests.
 	let line = run_volume_tool(audioconv_elf, b"--rate 16000 --channels 2 vol://media/SOURCE.WAV vol://system/CROSS.AIFF", &mut system, &mut media);
 	assert!(line.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> AIFF 16000Hz/2ch/4000fr duration=250ms bytes="), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&line));
-	let written = system.open(b"vol://system/CROSS.AIFF", 0xaud11).expect("the cross-volume AIFF opens");
+	let written = system.open(b"vol://system/CROSS.AIFF", 0xaad11).expect("the cross-volume AIFF opens");
 	let converted = aiff::Aiff::parse(&written).expect("the AIFF parses");
 	assert_eq!(converted.metadata().rate, 16_000);
 	assert_eq!(converted.metadata().channels, 2);
 	assert_eq!(converted.metadata().frames, 4_000);
 
+	// The other lossless codec, and the one whose header carries no size that is only known at the
+	// end - so it is the one this tool could stream to a pipe if it had one.
+	let line = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.WV", &mut system, &mut media);
+	assert!(line.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> WavPack 8000Hz/1ch/2000fr duration=250ms bytes="), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&line));
+	let written = system.open(b"vol://system/CROSS.WV", 0xaad16).expect("the cross-volume WavPack opens");
+	assert_eq!(decode_wavpack_samples(&written), samples, "the WavPack conversion was not lossless");
+
 	// A format nothing writes yet says so in those words, and does not create the destination.
 	let unwritten = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.OGG", &mut system, &mut media);
 	assert_eq!(unwritten, b"audioconv: writing that format is not implemented yet\n");
-	assert_eq!(system.open(b"vol://system/CROSS.OGG", 0xaud12), None, "a refused profile still created its destination");
+	assert_eq!(system.open(b"vol://system/CROSS.OGG", 0xaad12), None, "a refused profile still created its destination");
 
 	// Not audio at all, and a destination whose suffix names nothing.
 	let junk = run_volume_tool(audioconv_elf, b"vol://media/JUNK.BIN vol://system/JUNK.FLAC", &mut system, &mut media);
@@ -180,20 +187,22 @@ fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
 	// An existing destination is left alone unless `--force` says otherwise.
 	let refused = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.FLAC", &mut system, &mut media);
 	assert_eq!(refused, b"audioconv: destination exists (use --force)\n");
-	assert_eq!(system.open(b"vol://system/CROSS.FLAC", 0xaud13).map(|bytes| decode_flac_samples(&bytes)), Some(samples.clone()), "a refused overwrite changed the destination");
+	assert_eq!(system.open(b"vol://system/CROSS.FLAC", 0xaad13).map(|bytes| decode_flac_samples(&bytes)), Some(samples.clone()), "a refused overwrite changed the destination");
 	let forced = run_volume_tool(audioconv_elf, b"--force --compression 100 vol://media/SOURCE.WAV vol://system/CROSS.FLAC", &mut system, &mut media);
 	assert!(forced.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> FLAC"), "--force did not convert");
-	assert_eq!(system.open(b"vol://system/CROSS.FLAC", 0xaud14).map(|bytes| decode_flac_samples(&bytes)), Some(samples.clone()), "the forced overwrite is not the same audio");
+	assert_eq!(system.open(b"vol://system/CROSS.FLAC", 0xaad14).map(|bytes| decode_flac_samples(&bytes)), Some(samples.clone()), "the forced overwrite is not the same audio");
 
 	// A destination volume with no room. The conversion succeeds and the write does not, and what
 	// was already there must survive byte for byte - the whole reason the tool converts before it
 	// opens the destination.
+	// WavPack, because a FAT name has three characters of suffix and `.flac` needs four - the one
+	// place in this scenario where the medium decides which codec the case is written in.
 	let previous = b"previous destination";
-	let full_image = fat16_image(&[(*b"SOURCE  WAV", source_wav.as_slice()), (*b"KEEP    FLA", previous)], true);
+	let full_image = fat16_image(&[(*b"SOURCE  WAV", source_wav.as_slice()), (*b"KEEP    WV ", previous)], true);
 	let mut full_media = StorageHarness::start(storage_elf, b"FATBLOCK", &full_image, full_image.len() as u64);
-	let failure = run_volume_tool(audioconv_elf, b"--force vol://media/SOURCE.WAV vol://media/KEEP.FLA", &mut system, &mut full_media);
+	let failure = run_volume_tool(audioconv_elf, b"--force vol://media/SOURCE.WAV vol://media/KEEP.WV", &mut system, &mut full_media);
 	assert_eq!(failure, b"audioconv: cannot write output\n");
-	assert_eq!(full_media.open(b"vol://media/KEEP.FLA", 0xaud15), Some(previous.to_vec()), "a failed write did not preserve the previous destination");
+	assert_eq!(full_media.open(b"vol://media/KEEP.WV", 0xaad15), Some(previous.to_vec()), "a failed write did not preserve the previous destination");
 }
 
 // A deterministic quarter-second that a predictor can actually predict: a wandering tone rather
@@ -209,6 +218,19 @@ fn governed_audio_fixture(frames: usize) -> alloc::vec::Vec<i16> {
 		velocity += ((state >> 20) as i64 & 0x1f) - 16;
 		phase = (phase + velocity).clamp(-26_000, 26_000);
 		samples.push(phase as i16);
+	}
+	samples
+}
+
+fn decode_wavpack_samples(bytes: &[u8]) -> alloc::vec::Vec<i16> {
+	let file = wavpack::WavPack::parse(bytes).expect("the written WavPack parses");
+	let mut decoder = file.decoder();
+	let mut samples = alloc::vec::Vec::new();
+	let mut chunk = alloc::vec::Vec::new();
+	while decoder.read_i16_le(512, &mut chunk).expect("the written WavPack decodes") != 0 {
+		for pair in chunk.chunks_exact(2) {
+			samples.push(i16::from_le_bytes([pair[0], pair[1]]));
+		}
 	}
 	samples
 }

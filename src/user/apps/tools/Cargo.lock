@@ -89,6 +89,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "audioconv"
+version = "0.0.0"
+dependencies = [
+ "adpcm",
+ "aiff",
+ "flac",
+ "mp3",
+ "pcm",
+ "vorbis",
+ "wav",
+ "wavpack",
+]
+
+[[package]]
 name = "base-proto"
 version = "0.0.0"
 dependencies = [
@@ -665,6 +679,7 @@ dependencies = [
  "aiff",
  "audio-client",
  "audio-client-provider",
+ "audioconv",
  "bmp",
  "config-client",
  "config-client-provider",

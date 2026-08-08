@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+pub mod encode;
+
 use alloc::vec::Vec;
 use pcm::Format;
 
@@ -932,3 +934,6 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, Error> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod encode_tests;

@@ -107,7 +107,9 @@ pub const PROFILES: &[Capabilities] = &[
 	Capabilities { profile: Profile::Aiff, name: "AIFF", suffixes: &["aiff", "aif"], lossless: true, bits: &[8, 16, 24, 32], quality: false, compression: false, implemented: true },
 	Capabilities { profile: Profile::Aifc, name: "AIFC", suffixes: &["aifc"], lossless: true, bits: &[8, 16, 24, 32], quality: false, compression: false, implemented: true },
 	Capabilities { profile: Profile::Flac, name: "FLAC", suffixes: &["flac"], lossless: true, bits: &[], quality: false, compression: true, implemented: true },
-	Capabilities { profile: Profile::WavPack, name: "WavPack", suffixes: &["wv"], lossless: true, bits: &[], quality: false, compression: true, implemented: false },
+	// No `--compression`: the WavPack encoder has one mode and no effort to spend, and a table that
+	// offered a knob nothing reads would be the exact lie this table exists to prevent.
+	Capabilities { profile: Profile::WavPack, name: "WavPack", suffixes: &["wv"], lossless: true, bits: &[], quality: false, compression: false, implemented: true },
 	Capabilities { profile: Profile::Vorbis, name: "Ogg Vorbis", suffixes: &["ogg", "oga"], lossless: false, bits: &[], quality: true, compression: false, implemented: false },
 	Capabilities { profile: Profile::Mp3, name: "MP3", suffixes: &["mp3"], lossless: false, bits: &[], quality: true, compression: false, implemented: false },
 ];
@@ -368,6 +370,7 @@ enum Destination {
 	Wav(wav::encode::Encoder<VecSink>),
 	Aiff(aiff::encode::Encoder<VecSink>),
 	Flac(flac::encode::Encoder<VecSink>),
+	WavPack(wavpack::encode::Encoder<VecSink>),
 }
 
 impl Destination {
@@ -376,6 +379,7 @@ impl Destination {
 			Destination::Wav(encoder) => encoder.push(frames).map_err(wav_error),
 			Destination::Aiff(encoder) => encoder.push(frames).map_err(aiff_error),
 			Destination::Flac(encoder) => encoder.push(frames).map_err(flac_error),
+			Destination::WavPack(encoder) => encoder.push(frames).map_err(wavpack_error),
 		}
 	}
 
@@ -384,6 +388,7 @@ impl Destination {
 			Destination::Wav(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(wav_error),
 			Destination::Aiff(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(aiff_error),
 			Destination::Flac(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(flac_error),
+			Destination::WavPack(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(wavpack_error),
 		}
 	}
 }
@@ -409,6 +414,14 @@ fn flac_error(error: flac::encode::EncodeError) -> Error {
 		flac::encode::EncodeError::Unsupported => Error::UnsupportedOption,
 		flac::encode::EncodeError::TooLarge | flac::encode::EncodeError::Destination(_) => Error::TooLarge,
 		flac::encode::EncodeError::Invalid => Error::InvalidAudio,
+	}
+}
+
+fn wavpack_error(error: wavpack::encode::EncodeError) -> Error {
+	match error {
+		wavpack::encode::EncodeError::Unsupported => Error::UnsupportedOption,
+		wavpack::encode::EncodeError::TooLarge | wavpack::encode::EncodeError::Destination(_) => Error::TooLarge,
+		wavpack::encode::EncodeError::Invalid => Error::InvalidAudio,
 	}
 }
 
@@ -517,7 +530,10 @@ fn build(profile: Profile, sink: VecSink, format: Format, config: &Config) -> Re
 		// AIFC in the byte order the machine already has, which is the reason the profile exists.
 		Profile::Aifc => aiff::encode::Encoder::new(sink, format, aiff::encode::Output::Aifc { bits, little_endian: true }).map(Destination::Aiff).map_err(aiff_error),
 		Profile::Flac => flac::encode::Encoder::new(sink, format, effort).map(Destination::Flac).map_err(flac_error),
-		Profile::WavPack | Profile::Vorbis | Profile::Mp3 => Err(Error::NotImplemented),
+		// Joint stereo always: it costs nothing on material it does not suit and is most of the gain
+		// on material it does, which leaves nothing for a caller to decide.
+		Profile::WavPack => wavpack::encode::Encoder::new(sink, format, true).map(Destination::WavPack).map_err(wavpack_error),
+		Profile::Vorbis | Profile::Mp3 => Err(Error::NotImplemented),
 	}
 }
 

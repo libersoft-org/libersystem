@@ -3271,21 +3271,36 @@ fn fat16_image_with_clusters(files: &[([u8; 11], &[u8])], fill_free: bool, clust
 	image[fat_offset..fat_offset + 2].copy_from_slice(&0xfff8u16.to_le_bytes());
 	image[fat_offset + 2..fat_offset + 4].copy_from_slice(&0xffffu16.to_le_bytes());
 	let root_offset = (RESERVED + fat_sectors) * SECTOR;
+	// Files span as many clusters as they need, chained through the FAT. This used to be one cluster
+	// per file with an assertion that nothing exceeded 512 bytes, which was true of every image
+	// fixture and false of the first audio one: a quarter of a second of mono is eight clusters.
+	let mut next_free = 2usize;
 	for (index, (name, data)) in files.iter().enumerate() {
-		assert!(data.len() <= SECTOR && index < ROOT_ENTRIES);
-		let cluster = index + 2;
-		let fat = fat_offset + cluster * 2;
-		image[fat..fat + 2].copy_from_slice(&0xffffu16.to_le_bytes());
-		let data_offset = (first_data + cluster - 2) * SECTOR;
-		image[data_offset..data_offset + data.len()].copy_from_slice(data);
+		assert!(index < ROOT_ENTRIES, "the fixture has more files than the root directory holds");
+		let needed = data.len().div_ceil(SECTOR).max(1);
+		assert!(next_free - 2 + needed <= cluster_count, "the fixture image is too small for its files");
+		let first = next_free;
+		for step in 0..needed {
+			let cluster = first + step;
+			let fat = fat_offset + cluster * 2;
+			let link = if step + 1 == needed { 0xffffu16 } else { (cluster + 1) as u16 };
+			image[fat..fat + 2].copy_from_slice(&link.to_le_bytes());
+			let start = step * SECTOR;
+			let end = (start + SECTOR).min(data.len());
+			if start < end {
+				let data_offset = (first_data + cluster - 2) * SECTOR;
+				image[data_offset..data_offset + (end - start)].copy_from_slice(&data[start..end]);
+			}
+		}
+		next_free = first + needed;
 		let entry = root_offset + index * 32;
 		image[entry..entry + 11].copy_from_slice(name);
 		image[entry + 11] = 0x20;
-		image[entry + 26..entry + 28].copy_from_slice(&(cluster as u16).to_le_bytes());
+		image[entry + 26..entry + 28].copy_from_slice(&(first as u16).to_le_bytes());
 		image[entry + 28..entry + 32].copy_from_slice(&(data.len() as u32).to_le_bytes());
 	}
 	if fill_free {
-		for cluster in files.len() + 2..cluster_count + 2 {
+		for cluster in next_free..cluster_count + 2 {
 			let fat = fat_offset + cluster * 2;
 			image[fat..fat + 2].copy_from_slice(&0xffffu16.to_le_bytes());
 		}

@@ -105,6 +105,7 @@ fn options_are_judged_against_the_profile_they_are_given_with() {
 	// The point of one shared table. Each of these is a real option that means nothing here.
 	assert_eq!(parse_args(b"--quality 80 in.wav out.flac").err(), Some(Error::UnsupportedOption));
 	assert_eq!(parse_args(b"--compression 80 in.wav out.wav").err(), Some(Error::UnsupportedOption));
+	assert_eq!(parse_args(b"--compression 80 in.wav out.wv").err(), Some(Error::UnsupportedOption));
 	assert_eq!(parse_args(b"--bits 24 in.wav out.flac").err(), Some(Error::UnsupportedOption));
 	assert_eq!(parse_args(b"--bits 12 in.wav out.wav").err(), Some(Error::UnsupportedOption));
 	// And each of these is the same option where it does mean something.
@@ -213,6 +214,7 @@ fn every_written_profile_produces_a_file_this_tree_can_read_back() {
 		(b"in.wav out.aifc", Profile::Aifc),
 		(b"--compression 90 in.wav out.flac", Profile::Flac),
 		(b"--compression 10 in.wav out.flac", Profile::Flac),
+		(b"in.wav out.wv", Profile::WavPack),
 	] {
 		let config = parse_args(options).expect("these options parse");
 		let (bytes, info) = convert(&source, &config).unwrap_or_else(|error| panic!("{:?} failed: {error:?}", core::str::from_utf8(options)));
@@ -232,7 +234,7 @@ fn config_wav() -> Config {
 #[test]
 fn a_profile_with_no_encoder_yet_says_so_rather_than_writing_something_else() {
 	let source = wave(64, 1, 44_100);
-	for suffix in ["out.wv", "out.ogg", "out.mp3"] {
+	for suffix in ["out.ogg", "out.mp3"] {
 		assert_eq!(convert(&source, &config(suffix)).err(), Some(Error::NotImplemented), "{suffix} should not be written yet");
 	}
 	// And an input nothing here reads is refused before a destination is opened.

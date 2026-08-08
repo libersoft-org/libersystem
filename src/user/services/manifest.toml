@@ -810,21 +810,9 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/audioconv.lsexe"
-providers = [
-	"base-proto",
-	"adpcm",
-	"aiff",
-	"audioconv",
-	"flac",
-	"mp3",
-	"pcm",
-	"vorbis",
-	"wav",
-	"wavpack",
-	"volume-client",
-	"storage-proto",
-	"lsrt",
-]
+# What the BINARY imports, which is the library and the plumbing - the codecs are the library's
+# providers, not this one's. `play` lists them because `play` calls the decoders itself.
+providers = ["base-proto", "audioconv", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "play"
@@ -1505,6 +1493,13 @@ owner = "aiff"
 destination = "lib/audio/aiff.lslib"
 features = []
 providers = ["pcm", "lsrt"]
+
+[[libraries]]
+name = "audioconv"
+owner = "audioconv"
+destination = "lib/audio/audioconv.lslib"
+features = []
+providers = ["adpcm", "aiff", "flac", "mp3", "pcm", "vorbis", "wav", "wavpack", "lsrt"]
 
 [[libraries]]
 name = "apng"

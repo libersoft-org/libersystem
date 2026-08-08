@@ -25,6 +25,7 @@ CRATES=(
 	"user/libs/audio/wav"
 	"user/libs/audio/aiff"
 	"user/libs/audio/flac"
+	"user/libs/audio/wavpack"
 	"user/libs/audio/audioconv"
 )
 
