@@ -626,11 +626,11 @@ fn a_partial_sweep_is_refused_rather_than_believed() {
 #[test]
 fn trust_lapses_when_the_model_hash_moves() {
 	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
-	store.grant("audio", "hash-a", 9, vec![String::from("x86_64"), String::from("riscv64")], 1);
-	assert_eq!(store.level("audio", "hash-a"), crate::trust::Level::Trusted);
+	store.grant("audio", "hash-a", crate::shadow::Universe::TestGuest, 9, vec![String::from("x86_64"), String::from("riscv64")], 1);
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest), crate::trust::Level::Trusted);
 	// The graph changed, or the covers declarations did, or the selector did. The evidence was
 	// produced by a model that is no longer the one running.
-	assert_eq!(store.level("audio", "hash-b"), crate::trust::Level::Shadow);
+	assert_eq!(store.level("audio", "hash-b", crate::shadow::Universe::TestGuest), crate::trust::Level::Shadow);
 	let dropped = store.prune("hash-b");
 	assert_eq!(dropped, vec![String::from("audio")]);
 	assert!(store.certificates.is_empty());
@@ -642,23 +642,23 @@ fn trust_needs_evidence_from_more_than_one_target() {
 	// architecture policy makes exactly that the steady state.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
 	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
-		log.records.push(crate::shadow::Record { architecture: String::from("x86_64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: String::from("x86_64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
-	let error = store.evaluate("audio", "hash-a", &log).expect_err("one target is not enough");
+	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("one target is not enough");
 	assert!(error.contains("target(s)"), "{error}");
-	log.records.push(crate::shadow::Record { architecture: String::from("riscv64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
-	assert!(store.evaluate("audio", "hash-a", &log).is_ok());
+	log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: String::from("riscv64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
 }
 
 #[test]
 fn evidence_under_another_model_does_not_count() {
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
 	for architecture in ["x86_64", "riscv64", "aarch64", "x86_64", "riscv64", "aarch64"] {
-		log.records.push(crate::shadow::Record { architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("an-older-model"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("an-older-model"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
-	assert!(store.evaluate("audio", "the-current-model", &log).is_err(), "six clean runs under a model that is not the one running prove nothing about the one that is");
+	assert!(store.evaluate("audio", "the-current-model", crate::shadow::Universe::TestGuest, &log).is_err(), "six clean runs under a model that is not the one running prove nothing about the one that is");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -716,17 +716,17 @@ fn only_a_consistent_verdict_counts_as_clean_evidence() {
 	// Five clean comparisons on x86_64 and one riscv64 run that FOUND something used to satisfy
 	// "evidence from two targets", so a certificate could be earned on the strength of a failure.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
-	let record = |architecture: &str, verdict: &str| crate::shadow::Record { architecture: architecture.to_string(), verdict: verdict.to_string(), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 };
+	let record = |architecture: &str, verdict: &str| crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: verdict.to_string(), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 };
 	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
 		log.records.push(record("x86_64", "Consistent"));
 	}
 	log.records.push(record("riscv64", "CandidateMiss"));
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
-	let error = store.evaluate("audio", "hash-a", &log).expect_err("a run that found a candidate miss is not evidence that the selector is right");
+	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("a run that found a candidate miss is not evidence that the selector is right");
 	assert!(error.contains("target(s)"), "{error}");
 	// The same target, cleanly this time, is what actually earns it.
 	log.records.push(record("riscv64", "Consistent"));
-	assert!(store.evaluate("audio", "hash-a", &log).is_ok());
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1025,4 +1025,85 @@ fn the_scan_follows_helper_functions() {
 	assert!(direct.is_empty(), "the test itself launches nothing - that is the whole difficulty");
 	let called: BTreeSet<String> = parsed.iter().find(|(name, _, _)| name == "a_test").map(|(_, _, called)| called.clone()).unwrap_or_default();
 	assert!(called.contains("helper"), "and the call to the harness is what has to be followed");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Product reach versus test-build reach
+//
+// The edge kinds were typed from the start and the closure walked them identically, so a
+// dev-dependency reached exactly as far as a product one. The kernel dev-depends on eleven codecs to
+// build its scenario fixtures, so changing `flac` pulled the whole kernel into the closure - and
+// with it every check that covers the kernel, including a shipping build of it.
+
+#[test]
+fn a_dev_dependency_reaches_as_a_test_build_and_not_as_a_product() {
+	let model = model();
+	let seeds: BTreeSet<String> = [String::from("flac")].into_iter().collect();
+	let reach = model.graph.affected_by_reach(&seeds);
+	assert_eq!(reach.get("flac"), Some(&crate::graph::Reach::Product), "the thing that changed changed");
+	assert_eq!(reach.get("kernel"), Some(&crate::graph::Reach::TestBuild), "the kernel dev-depends on flac; nothing it SHIPS is different");
+	assert_eq!(reach.get("audioconv"), Some(&crate::graph::Reach::Product), "the library that lists flac as a provider does ship differently");
+}
+
+#[test]
+fn a_test_build_reach_does_not_order_a_shipping_build() {
+	let model = model();
+	let plan = plan_for(&model, &["src/user/libs/audio/flac/src/lib.rs"]);
+	let selected = keys(&plan);
+	assert!(!selected.iter().any(|key| key.starts_with("build.kernel /")), "the shipping kernel is byte-identical; compiling it again proves nothing");
+	assert!(selected.iter().any(|key| key.starts_with("build.user /")), "the userspace DOES change and the guest boots it");
+	assert!(selected.iter().any(|key| key.starts_with("host.flac /")), "and the crate's own suite runs");
+}
+
+// The direction that must not be lost: a real kernel change still reaches everything as a product.
+#[test]
+fn a_product_dependency_still_reaches_as_a_product() {
+	let model = model();
+	let seeds: BTreeSet<String> = [String::from("liberfs")].into_iter().collect();
+	let reach = model.graph.affected_by_reach(&seeds);
+	assert_eq!(reach.get("storage"), Some(&crate::graph::Reach::Product), "StorageService links LiberFS into what it ships");
+	assert_eq!(reach.get("kernel"), Some(&crate::graph::Reach::Product), "and the kernel links it as an ordinary dependency, not a dev one");
+}
+
+// Product wins wherever both paths exist, and a downgrade never upgrades back.
+#[test]
+fn product_reach_wins_over_test_build_reach() {
+	let model = model();
+	// `pcm` is a provider of the audioconv library AND a dev-dependency of the kernel.
+	let seeds: BTreeSet<String> = [String::from("pcm")].into_iter().collect();
+	let reach = model.graph.affected_by_reach(&seeds);
+	assert_eq!(reach.get("audioconv"), Some(&crate::graph::Reach::Product));
+	assert_eq!(reach.get("kernel"), Some(&crate::graph::Reach::TestBuild));
+}
+
+// Evidence is about a UNIVERSE, not about a component in general.
+//
+// Shadow examined only keys beginning `kernel.` while trust was granted per component, so a clean
+// record on the kernel suite silently vouched for host suites, gates and conformance runs that the
+// comparison had never looked at.
+#[test]
+fn evidence_in_one_universe_does_not_vouch_for_another() {
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	let record = |architecture: &str, universe: crate::shadow::Universe| crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 };
+	for architecture in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"] {
+		log.records.push(record(architecture, crate::shadow::Universe::TestGuest));
+	}
+	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	let (clean, architectures) = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect("the guest suite has been validated");
+	store.grant("audio", "hash-a", crate::shadow::Universe::TestGuest, clean, architectures, 0);
+
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest), crate::trust::Level::Trusted);
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::Host), crate::trust::Level::Shadow, "nothing has compared a host-suite selection for this component");
+	assert!(!store.trusted_everywhere("audio", "hash-a"), "and a scoped run therefore still has something unproven behind it");
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &log).is_err());
+}
+
+#[test]
+fn a_check_id_says_which_universe_judges_it() {
+	use crate::shadow::Universe;
+	assert_eq!(Universe::of("kernel.frame_alloc_distinct"), Universe::TestGuest);
+	assert_eq!(Universe::of("dev.selftest"), Universe::DevGuest);
+	for host in ["host.flac", "gate.volume-layout", "build.kernel", "conformance.png"] {
+		assert_eq!(Universe::of(host), Universe::Host, "{host} runs on the host");
+	}
 }

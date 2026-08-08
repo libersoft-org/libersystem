@@ -87,6 +87,16 @@ impl Model {
 		for edge in &self.graph.edges {
 			hasher.update(format!("{} {} {}\n", edge.from, edge.kind, edge.to).as_bytes());
 		}
+		// What every feature MEANS. The configuration catalog is hashed by content and says
+		// `features = ["shared-image"]`; what that name expands to lives in each Cargo.toml, and
+		// adding a member to it changes the shipping build while leaving the catalog, the graph and
+		// therefore the hash unmoved. Same failure as hashing a schema instead of its declarations.
+		hasher.update(b"\nfeatures\n");
+		for entry in &self.crates {
+			for (feature, members) in &entry.feature_definitions {
+				hasher.update(format!("{} {feature}={}\n", entry.name, members.join("+")).as_bytes());
+			}
+		}
 		hasher.update(b"\narch-risk\n");
 		for (component, risk) in &self.arch_risk {
 			hasher.update(format!("{component} {} {}\n", risk.any_target, risk.targets.iter().cloned().collect::<Vec<_>>().join("+")).as_bytes());

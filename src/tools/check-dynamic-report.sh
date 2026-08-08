@@ -8,6 +8,35 @@ report="$root/../docs/DYNAMIC_EXECUTABLES.tsv"
 wave_report="$root/../docs/DYNAMIC_WAVES.tsv"
 image_report="$root/../docs/DYNAMIC_IMAGE.tsv"
 source "$root/../lib.sh"
+# Prove the comparison REFUSES before trusting it to approve.
+#
+# `--check` regenerates the report and compares it against the stored TSVs, and its whole value is
+# that a difference fails. A `diff` that stopped comparing - a changed variable name, a redirection,
+# an `exit 0` - would report a clean tree just as convincingly, and nothing about a currently-valid
+# tree can tell the two apart. So the gate first corrupts a copy of what it compares against and
+# requires itself to notice.
+self_test() {
+	local scratch original
+	scratch="$(mktemp -d)"
+	original="$(dirname "$0")/../../docs/DYNAMIC_EXECUTABLES.tsv"
+	[[ -f "$original" ]] || return 0
+	cp "$original" "$scratch/backup"
+	# One byte of one row, in the last column, which is the command the report publishes.
+	sed -i '2s/$/ MUTATED/' "$original"
+	if DYNAMIC_REPORT_SELF_TEST=1 "$0" --check >/dev/null 2>&1; then
+		cp "$scratch/backup" "$original"
+		rm -rf "$scratch"
+		echo "dynamic-report: SELF-TEST FAILED - a mutated report was accepted, so this gate is comparing nothing" >&2
+		return 1
+	fi
+	cp "$scratch/backup" "$original"
+	rm -rf "$scratch"
+}
+
+if [[ "${DYNAMIC_REPORT_SELF_TEST:-}" != "1" ]]; then
+	self_test || exit 1
+fi
+
 mode="${1:---check}"
 
 case "$mode" in

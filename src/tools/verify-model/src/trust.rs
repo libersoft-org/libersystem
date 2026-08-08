@@ -28,6 +28,10 @@ pub enum Level {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Certificate {
 	pub component: String,
+	// Evidence about the kernel suite says nothing about whether a host suite or a gate would have
+	// been selected. Granting one certificate over all of them was the gap.
+	#[serde(default = "test_guest_universe")]
+	pub universe: crate::shadow::Universe,
 	pub model_hash: String,
 	pub clean_runs: usize,
 	pub architectures: Vec<String>,
@@ -46,6 +50,10 @@ pub struct Store {
 // Deliberately not "no failures for a month". A month that saw only audio changes proves nothing
 // about the driver edges, so the criterion is over EVIDENCE rather than over time: clean shadow
 // comparisons under the current model, on more than one target, with the regression corpus green.
+fn test_guest_universe() -> crate::shadow::Universe {
+	crate::shadow::Universe::TestGuest
+}
+
 pub const REQUIRED_CLEAN_RUNS: usize = 5;
 pub const REQUIRED_ARCHITECTURES: usize = 2;
 
@@ -70,11 +78,16 @@ impl Store {
 
 	// A certificate earned under a different model is not demoted so much as it stops applying: the
 	// thing it vouched for is not the thing that runs now.
-	pub fn level(&self, component: &str, model_hash: &str) -> Level {
-		match self.certificates.iter().find(|certificate| certificate.component == component) {
+	pub fn level(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe) -> Level {
+		match self.certificates.iter().find(|certificate| certificate.component == component && certificate.universe == universe) {
 			Some(certificate) if certificate.model_hash == model_hash => Level::Trusted,
 			_ => Level::Shadow,
 		}
+	}
+
+	// A component is only fully trusted when every universe that can judge it has said so.
+	pub fn trusted_everywhere(&self, component: &str, model_hash: &str) -> bool {
+		[crate::shadow::Universe::Host, crate::shadow::Universe::TestGuest].into_iter().all(|universe| self.level(component, model_hash, universe) == Level::Trusted)
 	}
 
 	pub fn stale(&self, model_hash: &str) -> Vec<&Certificate> {
@@ -90,9 +103,9 @@ impl Store {
 	}
 
 	// Whether the evidence on record would earn a certificate right now, and if not, what is short.
-	pub fn evaluate(&self, component: &str, model_hash: &str, log: &Log) -> Result<(usize, Vec<String>), String> {
-		let clean = log.clean_runs_for(component, model_hash);
-		let architectures: Vec<String> = log.clean_architectures_seen(component, model_hash).into_iter().collect();
+	pub fn evaluate(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe, log: &Log) -> Result<(usize, Vec<String>), String> {
+		let clean = log.clean_runs_for(component, model_hash, universe);
+		let architectures: Vec<String> = log.clean_architectures_seen(component, model_hash, universe).into_iter().collect();
 		if clean < REQUIRED_CLEAN_RUNS {
 			return Err(format!("{clean} clean shadow comparison(s) under this model, {REQUIRED_CLEAN_RUNS} needed"));
 		}
@@ -102,13 +115,13 @@ impl Store {
 		Ok((clean, architectures))
 	}
 
-	pub fn grant(&mut self, component: &str, model_hash: &str, clean_runs: usize, architectures: Vec<String>, at: u64) {
-		self.certificates.retain(|certificate| certificate.component != component);
-		self.certificates.push(Certificate { component: component.to_string(), model_hash: model_hash.to_string(), clean_runs, architectures, granted_at: at, note: String::from("earned by clean dry-shadow comparisons under this model hash; it lapses the moment the hash moves") });
-		self.certificates.sort_by(|left, right| left.component.cmp(&right.component));
+	pub fn grant(&mut self, component: &str, model_hash: &str, universe: crate::shadow::Universe, clean_runs: usize, architectures: Vec<String>, at: u64) {
+		self.certificates.retain(|certificate| !(certificate.component == component && certificate.universe == universe));
+		self.certificates.push(Certificate { component: component.to_string(), universe, model_hash: model_hash.to_string(), clean_runs, architectures, granted_at: at, note: String::from("earned by clean dry-shadow comparisons under this model hash, in this universe alone; it lapses the moment the hash moves") });
+		self.certificates.sort_by(|left, right| (&left.component, left.universe).cmp(&(&right.component, right.universe)));
 	}
 
 	pub fn summary(&self, model_hash: &str) -> BTreeMap<String, Level> {
-		self.certificates.iter().map(|certificate| (certificate.component.clone(), if certificate.model_hash == model_hash { Level::Trusted } else { Level::Shadow })).collect()
+		self.certificates.iter().map(|certificate| (format!("{} ({:?})", certificate.component, certificate.universe), if certificate.model_hash == model_hash { Level::Trusted } else { Level::Shadow })).collect()
 	}
 }

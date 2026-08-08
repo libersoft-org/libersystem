@@ -101,6 +101,35 @@ pub enum Verdict {
 	Void,
 }
 
+// Which part of the model a comparison is evidence ABOUT.
+//
+// Shadow used to look only at keys beginning `kernel.`, while trust was granted per component - so a
+// selector that dropped `host.flac`, `gate.volume-layout` or `build.volume` could not be caught by
+// it, and the certificate said nothing about which kind of check the evidence covered. A component
+// is trusted per universe now, and a universe with no evidence stays in shadow whatever the others
+// have shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Universe {
+	// Builds, crate suites, gates and conformance runs - everything that happens on the host.
+	Host,
+	// The tagged suite inside `qemu-run.sh TEST=1`.
+	TestGuest,
+	// `dev-selftest.py` and friends, inside a guest `DEV_PROFILE=1` left running.
+	DevGuest,
+}
+
+impl Universe {
+	pub fn of(check: &str) -> Self {
+		if check.starts_with("kernel.") {
+			Universe::TestGuest
+		} else if check.starts_with("dev.") {
+			Universe::DevGuest
+		} else {
+			Universe::Host
+		}
+	}
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Comparison {
 	pub verdict: Verdict,
@@ -157,8 +186,18 @@ pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &
 // minutes to hours, and the tree changes while it does. A comparison across a changed tree compares
 // two different systems, so the digests are recorded and a comparison whose digests moved is
 // refused rather than filed.
+// Records written before the universe field existed only ever compared the kernel suite, which is
+// what this says on their behalf.
+fn test_guest() -> Universe {
+	Universe::TestGuest
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Record {
+	// Which universe this comparison examined. Defaulted for records written before the field
+	// existed: they only ever compared the kernel suite, which is what they say.
+	#[serde(default = "test_guest")]
+	pub universe: Universe,
 	pub architecture: String,
 	pub verdict: String,
 	pub reason: String,
@@ -196,15 +235,15 @@ impl Log {
 
 	// Clean records for a component, under the CURRENT model. Evidence produced by a different
 	// selector over a different graph does not describe what runs today.
-	pub fn clean_runs_for(&self, component: &str, model_hash: &str) -> usize {
-		self.records.iter().filter(|record| record.model_hash == model_hash && record.verdict == "Consistent" && record.changed_components.iter().any(|changed| changed == component)).count()
+	pub fn clean_runs_for(&self, component: &str, model_hash: &str, universe: Universe) -> usize {
+		self.records.iter().filter(|record| record.model_hash == model_hash && record.universe == universe && record.verdict == "Consistent" && record.changed_components.iter().any(|changed| changed == component)).count()
 	}
 
 	// Targets this component has CLEAN evidence on. Filtering on the verdict is the whole point and
 	// was missing: five clean x86_64 comparisons plus one riscv64 CandidateMiss counted as "evidence
 	// from two targets" and could earn a certificate on the strength of a run that found a fault.
-	pub fn clean_architectures_seen(&self, component: &str, model_hash: &str) -> BTreeSet<String> {
-		self.records.iter().filter(|record| record.model_hash == model_hash && record.verdict == "Consistent" && record.changed_components.iter().any(|changed| changed == component)).map(|record| record.architecture.clone()).collect()
+	pub fn clean_architectures_seen(&self, component: &str, model_hash: &str, universe: Universe) -> BTreeSet<String> {
+		self.records.iter().filter(|record| record.model_hash == model_hash && record.universe == universe && record.verdict == "Consistent" && record.changed_components.iter().any(|changed| changed == component)).map(|record| record.architecture.clone()).collect()
 	}
 }
 

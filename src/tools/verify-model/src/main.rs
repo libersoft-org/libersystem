@@ -276,7 +276,7 @@ fn run() -> Result<ExitCode, String> {
 			// judged is a record that will be believed about a different system later.
 			let mut log = verify_model::shadow::Log::load(&repo_root);
 			log.schema = 1;
-			log.records.push(verify_model::shadow::Record { architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
+			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
 			log.save(&repo_root)?;
 			// Only Consistent is green, and the other three are green in different wrong ways.
 			// CandidateMiss is the selector's problem; SelectionFailed is the code's and the sweep
@@ -304,9 +304,25 @@ fn run() -> Result<ExitCode, String> {
 			let hash = model.model_hash();
 			let mut store = verify_model::trust::Store::load(&repo_root);
 			store.prune(&hash);
-			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| store.level(component, &hash) == verify_model::trust::Level::Shadow).collect();
+			// Trusted EVERYWHERE, not merely in the universe that happens to have evidence: a clean
+			// record on the kernel suite says nothing about whether a host suite or a gate would have
+			// been selected, and shadow only ever examined the kernel suite until now.
+			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| !store.trusted_everywhere(component, &hash)).collect();
+			// The age BOUND, which is the part that makes it a bound rather than a report.
+			//
+			// A key past its window has not been exercised within the period this tree is willing to
+			// go without exercising it, and a scoped run that does not cover it cannot be the only
+			// green standing behind the change. Reporting alone left `age(key) <= N` as an aspiration
+			// - a key could be two hundred days stale and the runner would keep mentioning it.
+			let history = verify_model::history::History::load(&repo_root)?;
+			let window: u64 = std::env::var("VERIFY_AGE_DAYS").ok().and_then(|value| value.parse().ok()).unwrap_or(30);
+			let selected: std::collections::BTreeSet<String> = plan.items.iter().map(|item| item.key.display()).collect();
+			let overdue = history.stale(&universe(&model), window).into_iter().filter(|(key, _)| !selected.contains(key)).count();
+
 			if plan.full {
 				println!("FULL");
+			} else if overdue > 0 {
+				println!("STALE\t{overdue}");
 			} else if untrusted.is_empty() {
 				println!("TRUSTED");
 			} else {
@@ -323,16 +339,22 @@ fn run() -> Result<ExitCode, String> {
 			}
 			let log = verify_model::shadow::Log::load(&repo_root);
 			if let Some(component) = grant {
-				match store.evaluate(&component, &hash, &log) {
-					Ok((clean, architectures)) => {
-						store.grant(&component, &hash, clean, architectures, verify_model::history::now());
-						println!("{component} is TRUSTED under model {hash}");
+				// Granted per universe. A component with kernel-suite evidence and no host evidence is
+				// trusted for one and not the other, which is the honest reading of what was proved.
+				let mut granted = 0usize;
+				for universe in [verify_model::shadow::Universe::Host, verify_model::shadow::Universe::TestGuest, verify_model::shadow::Universe::DevGuest] {
+					match store.evaluate(&component, &hash, universe, &log) {
+						Ok((clean, architectures)) => {
+							store.grant(&component, &hash, universe, clean, architectures, verify_model::history::now());
+							println!("{component} is TRUSTED for {universe:?} under model {hash}");
+							granted += 1;
+						}
+						Err(reason) => println!("{component} stays in SHADOW for {universe:?}: {reason}"),
 					}
-					Err(reason) => {
-						println!("{component} stays in SHADOW: {reason}");
-						store.save(&repo_root)?;
-						return Ok(ExitCode::FAILURE);
-					}
+				}
+				if granted == 0 {
+					store.save(&repo_root)?;
+					return Ok(ExitCode::FAILURE);
 				}
 			}
 			store.save(&repo_root)?;

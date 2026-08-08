@@ -21,6 +21,22 @@ pub struct Edge {
 	pub reason: String,
 }
 
+// How a component was reached, which decides what has to be re-run because of it.
+//
+// The edge kinds were typed from the start and the closure walked them all the same way, so a
+// dev-dependency reached exactly as far as a product one. That over-selects rather than
+// under-selects - safe, and the single largest remaining cost in a scoped codec plan: the kernel
+// dev-depends on eleven codecs to build its scenario fixtures, so changing `flac` dragged the whole
+// kernel into the closure and with it every check that covers the kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Reach {
+	// The change is in something this component SHIPS. Everything about it is in question.
+	Product,
+	// The change is only in something this component's TESTS are built from. Its test binary must be
+	// rebuilt and its own suite re-run; the artefact it ships is byte-identical.
+	TestBuild,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
 	pub components: BTreeSet<String>,
@@ -53,6 +69,14 @@ impl Graph {
 					_ => format!("{} Cargo.toml", entry.dir),
 				};
 				graph.push(&entry.name, &dependency.name, dependency.kind.edge_kind(), &reason);
+			}
+			// The build script Cargo names. `cargo metadata` does not expose it as a dependency, so
+			// every userspace crate's edge to `src/user/build.rs` - which emits the linker script via
+			// `cargo:rustc-link-arg` - simply did not exist in the model.
+			if let Some(script) = &entry.build_script
+				&& let Some(owner) = registry.ownership.iter().filter(|rule| crate::registry::prefix_match(&rule.path, script).is_some()).max_by_key(|rule| rule.path.len())
+			{
+				graph.push(&entry.name, &owner.component, "generation.build", &format!("{} declares build = {script}", entry.dir));
 			}
 			// A program is built from its crate's shared source, so changing that source reaches
 			// every program in it - while changing one program's own file reaches only that one.
@@ -139,14 +163,30 @@ impl Graph {
 	// occur here: a dev-dependency can point the opposite way to a normal one, which is exactly
 	// what the kernel's dependency on the audio codecs does.
 	pub fn affected(&self, seeds: &BTreeSet<String>) -> BTreeSet<String> {
-		let mut seen: BTreeSet<String> = seeds.clone();
+		self.affected_by_reach(seeds).into_keys().collect()
+	}
+
+	// The same walk, recording HOW each component was reached.
+	//
+	// A dev edge downgrades the reach to TestBuild, and TestBuild never upgrades back to Product:
+	// once the only path to something runs through "this is how a test is built", nothing further
+	// along that path ships because of the change either. Product wins wherever both paths exist.
+	pub fn affected_by_reach(&self, seeds: &BTreeSet<String>) -> BTreeMap<String, Reach> {
+		let mut seen: BTreeMap<String, Reach> = seeds.iter().map(|seed| (seed.clone(), Reach::Product)).collect();
 		let mut queue: VecDeque<String> = seeds.iter().cloned().collect();
 		while let Some(component) = queue.pop_front() {
+			let here = seen.get(&component).copied().unwrap_or(Reach::Product);
 			let Some(dependents) = self.dependents.get(&component) else { continue };
 			for dependent in dependents {
-				if seen.insert(dependent.clone()) {
-					queue.push_back(dependent.clone());
+				let dev_only = self.edges.iter().filter(|edge| &edge.from == dependent && edge.to == component).all(|edge| edge.kind == "link.static.dev");
+				let reach = if here == Reach::TestBuild || dev_only { Reach::TestBuild } else { Reach::Product };
+				match seen.get(dependent) {
+					Some(Reach::Product) => continue,
+					Some(Reach::TestBuild) if reach == Reach::TestBuild => continue,
+					_ => {}
 				}
+				seen.insert(dependent.clone(), reach);
+				queue.push_back(dependent.clone());
 			}
 		}
 		seen

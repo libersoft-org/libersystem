@@ -64,6 +64,9 @@ pub struct Binary {
 	pub name: String,
 	// Repository-relative path of the bin's root source file.
 	pub path: String,
+	// `required-features = ["development"]` - the bin exists only in some configurations, which is
+	// how `dev_agent` is built for the development profile and not for the shipping one.
+	pub required_features: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +77,16 @@ pub struct Crate {
 	pub dependencies: Vec<Dependency>,
 	pub binaries: Vec<Binary>,
 	pub features: BTreeSet<String>,
+	// What each feature MEANS, not merely that it exists. `shared-image = ["a", "b"]` becoming
+	// `["a", "b", "c"]` changes what ships while leaving the name, the feature set and often the
+	// unioned graph untouched - so a model hash over names alone would keep vouching for evidence
+	// gathered against a different build. That is the same mistake the configuration catalog was
+	// added to prevent, one level further down.
+	pub feature_definitions: Vec<(String, Vec<String>)>,
+	// The build script this crate names, repository-relative. Cargo states it as `build = "..."` and
+	// `cargo metadata` does not expose it as a dependency, so the edge to `src/user/build.rs` - the
+	// script that picks one of three linker scripts - was invisible to the model.
+	pub build_script: Option<String>,
 	// Whether anything here is a `#[test]`. The kernel's `#[test_case]` suite is NOT one: it runs
 	// inside a booted guest, is selected by tags, and cannot be run by `cargo test` on the host.
 	pub has_host_tests: bool,
@@ -140,7 +153,9 @@ fn parse(repo_root: &Path, manifest_path: &Path) -> Result<Crate, String> {
 	dependencies.sort_by(|left, right| (left.kind, &left.name).cmp(&(right.kind, &right.name)));
 	dependencies.dedup_by(|left, right| left.kind == right.kind && left.name == right.name);
 
-	let features = value.get("features").and_then(toml::Value::as_table).map(|table| table.keys().cloned().collect()).unwrap_or_default();
+	let feature_table = value.get("features").and_then(toml::Value::as_table);
+	let features: BTreeSet<String> = feature_table.map(|table| table.keys().cloned().collect()).unwrap_or_default();
+	let feature_definitions: Vec<(String, Vec<String>)> = feature_table.map(|table| table.iter().map(|(name, members)| (name.clone(), members.as_array().map(|values| values.iter().filter_map(toml::Value::as_str).map(str::to_string).collect()).unwrap_or_default())).collect()).unwrap_or_default();
 
 	let mut binaries = Vec::new();
 	if let Some(entries) = value.get("bin").and_then(toml::Value::as_array) {
@@ -149,12 +164,17 @@ fn parse(repo_root: &Path, manifest_path: &Path) -> Result<Crate, String> {
 			let Some(bin_path) = entry.get("path").and_then(toml::Value::as_str) else { continue };
 			// The path is relative to the manifest, and `..` is used in this tree (the shared
 			// userspace build script), so it has to be normalised rather than concatenated.
-			binaries.push(Binary { name: bin_name.to_string(), path: normalise(&format!("{dir}/{bin_path}")) });
+			// `required-features = ["development"]`: the bin exists only in some configurations, which
+			// is how `dev_agent` is built for the development profile and not for the shipping one.
+			let required_features = entry.get("required-features").and_then(toml::Value::as_array).map(|values| values.iter().filter_map(toml::Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+			binaries.push(Binary { name: bin_name.to_string(), path: normalise(&format!("{dir}/{bin_path}")), required_features });
 		}
 	}
 	binaries.sort_by(|left, right| left.name.cmp(&right.name));
 
-	Ok(Crate { name, dir, dependencies, binaries, features, has_host_tests: scan_for_host_tests(dir_path)? })
+	let build_script = value.get("package").and_then(|package| package.get("build")).and_then(toml::Value::as_str).map(|script| normalise(&format!("{dir}/{script}")));
+
+	Ok(Crate { name, dir, dependencies, binaries, features, feature_definitions, build_script, has_host_tests: scan_for_host_tests(dir_path)? })
 }
 
 // Collapse `a/b/../c` to `a/c`. Cargo paths are relative to the manifest and this tree uses `..`.

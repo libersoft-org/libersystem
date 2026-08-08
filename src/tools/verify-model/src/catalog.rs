@@ -176,12 +176,27 @@ impl Catalog {
 		// The development guest. qemu-run.sh refuses DEV_PROFILE together with TEST, so these can
 		// never share a boot with the kernel suite - which is why the environment is part of the
 		// key rather than a detail of the runner.
+		// What exists ONLY in the development configuration: a `[[bin]]` behind
+		// `required-features = ["development"]`, which the shipping build does not enable. Derived
+		// rather than listed, because the manifest already states it and `crates.rs` now reads it.
+		//
+		// `dev_agent` is the reason the dev guest exists, and the design's own worked example -
+		// change `dev_agent.rs`, plan a dev-guest run - did not hold, because no dev check claimed
+		// to cover it. It does now: `dev-selftest.py` drives publication, refusal and rollback
+		// through that agent, so it is exactly the check a regression in it would fail.
+		let development_only: Vec<String> = crates.iter().flat_map(|entry| entry.binaries.iter()).filter(|binary| binary.required_features.iter().any(|feature| feature == "development")).map(|binary| crate::graph::binary_component(&binary.name)).collect();
 		for (id, script, subject) in [
 			("dev.selftest", "boot/dev-selftest.py", "harness.boot"),
 			("dev.proto-test", "boot/proto-test.py", "proto"),
 			("dev.perf-gate", "boot/perf-gate.py", "harness.boot"),
 		] {
-			catalog.checks.push(Check { id: id.to_string(), kind: CheckKind::DevCheck, covers: vec![subject.to_string()], variants: vec![Variant { architecture: String::from("x86_64"), environment: Environment::DevGuest, configuration: String::from("development") }], command: format!("(cd src && {script})") });
+			let mut covers = vec![subject.to_string()];
+			if id == "dev.selftest" {
+				covers.extend(development_only.iter().cloned());
+				covers.sort();
+				covers.dedup();
+			}
+			catalog.checks.push(Check { id: id.to_string(), kind: CheckKind::DevCheck, covers, variants: vec![Variant { architecture: String::from("x86_64"), environment: Environment::DevGuest, configuration: String::from("development") }], command: format!("(cd src && {script})") });
 		}
 
 		catalog.checks.sort();

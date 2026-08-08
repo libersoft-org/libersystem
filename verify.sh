@@ -390,6 +390,14 @@ FULL)
 TRUSTED)
 	note "verification level: TRUSTED - every changed component has shadow evidence under this model"
 	;;
+STALE)
+	note "verification level: STALE - ${level_line#*$'\t'} key(s) this run did not cover are past the age window."
+	note "     The bound is what makes age a bound: a scoped run cannot be the only green while work"
+	note "     that old is uncovered. ./verify.sh --age  lists them, ./verify.sh --sweep  clears them."
+	if [[ "${VERIFY_REQUIRE_TRUST:-0}" == "1" ]]; then
+		die "VERIFY_REQUIRE_TRUST is set and this run left work past the age window uncovered"
+	fi
+	;;
 SHADOW)
 	note "verification level: SHADOW - ${level_line#*$'\t'} has no shadow evidence under this model yet."
 	note "     A scoped green is good evidence and NOT equivalent to a full verification."

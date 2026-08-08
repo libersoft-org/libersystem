@@ -152,6 +152,8 @@ impl<'a> Planner<'a> {
 		let nothing_to_do = !full && seeds.is_empty() && non_code == changed.len() && !changed.is_empty();
 		let reached = self.graph.affected_with_reasons(&seeds);
 		let affected: BTreeSet<String> = reached.keys().cloned().collect();
+		// How each one was reached, which decides what has to happen because of it.
+		let reach = self.graph.affected_by_reach(&seeds);
 
 		// Architecture policy: the union over changed paths, because a change touching both an
 		// x86_64 tree and a riscv64 one has to answer for both.
@@ -220,7 +222,7 @@ impl<'a> Planner<'a> {
 
 		let mut items = Vec::new();
 		for check in &self.catalog.checks {
-			let selection = self.select(check, &affected, &reached, full);
+			let selection = self.select(check, &affected, &reached, &reach, full);
 			let Some(reason) = selection else { continue };
 			for variant in &check.variants {
 				if !self.variant_applies(check, variant, &built, &booted) {
@@ -230,6 +232,22 @@ impl<'a> Planner<'a> {
 			}
 		}
 		items.sort_by(|left, right| left.key.cmp(&right.key));
+
+		// Escalate on measured cost, rather than only mentioning it.
+		//
+		// The threshold is about removing a BOOT, not about running fewer tests, and the measurement
+		// that sets it was corrected: a guest run costs ~8 s fixed and ~0.5 s per test on x86_64, not
+		// the ~100 s fixed an earlier reading of a loaded machine suggested. At 8 s fixed a selection
+		// worth 90% of the whole is bookkeeping for nothing, so it becomes the whole - which also
+		// gives the shadow record something complete to compare against.
+		if !full && !items.is_empty() {
+			let selected = items.len() as f64;
+			let whole: usize = self.catalog.checks.iter().map(|check| check.variants.len()).sum();
+			if whole > 0 && selected / whole as f64 > 0.9 {
+				warnings.push(format!("the selection is {} of {whole} keys - within a tenth of everything, so the bookkeeping is not worth the remainder", items.len()));
+				return self.full_plan(paths, seeds, affected, vec![format!("a scoped selection of {} of {whole} keys is not worth its bookkeeping", items.len())], warnings);
+			}
+		}
 
 		// The one outcome that must never happen quietly. Something was changed, it was understood,
 		// and the answer was to run nothing at all - that is a selector fault, not a clean bill.
@@ -242,7 +260,7 @@ impl<'a> Planner<'a> {
 	}
 
 	// Why this check is in the plan, or None for "it is not".
-	fn select(&self, check: &Check, affected: &BTreeSet<String>, reached: &BTreeMap<String, Vec<Edge>>, full: bool) -> Option<String> {
+	fn select(&self, check: &Check, affected: &BTreeSet<String>, reached: &BTreeMap<String, Vec<Edge>>, reach: &BTreeMap<String, crate::graph::Reach>, full: bool) -> Option<String> {
 		if full {
 			return Some(String::from("the plan is FULL"));
 		}
@@ -253,6 +271,15 @@ impl<'a> Planner<'a> {
 			return Some(String::from("no covers declaration, so its reach is unknown"));
 		}
 		let hit = check.covers.iter().find(|component| affected.contains(*component))?;
+		// A component reached ONLY through a dev-dependency has not changed what it ships - the
+		// change is in something its tests are built from. So its tests run and its shipping build
+		// does not, which is the difference between `flac` costing a codec suite and `flac` costing
+		// a kernel rebuild plus every gate that covers the kernel.
+		if reach.get(hit) == Some(&crate::graph::Reach::TestBuild) && !matches!(check.kind, CheckKind::HostSuite | CheckKind::KernelTest) {
+			// Unless something else it covers was reached properly.
+			let product = check.covers.iter().find(|component| reach.get(*component) == Some(&crate::graph::Reach::Product))?;
+			return Some(format!("covers {product}, which changed"));
+		}
 		Some(match reached.get(hit) {
 			Some(path) if !path.is_empty() => format!("covers {hit}, reached by {}", describe(path)),
 			_ => format!("covers {hit}, which changed"),
