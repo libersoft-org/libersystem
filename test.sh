@@ -10,7 +10,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 help() {
 	usage_and_exit <<EOF
-usage: test.sh [--arch ARCH[,ARCH...]] [--tags TAG[,TAG...]] [--fast] [--build-only]
+usage: test.sh [--arch ARCH[,ARCH...]] [--tags TAG[,TAG...]] [--for PATH] [--for-change]
+               [--for-tool NAME] [--fast] [--build-only]
 
 Runs the in-kernel test suite: a kernel is built, booted in QEMU, and the tests run INSIDE the
 running system. Host-side gates that inspect artifacts without booting anything live in check.sh.
@@ -18,6 +19,9 @@ running system. Host-side gates that inspect artifacts without booting anything 
 With no arguments: every test, x86_64.
 
   --arch ARCH    x86_64 | aarch64 | riscv64 | all   (default: x86_64)
+  --for PATH     the tags whatever lives at PATH is tested with (comma-separated for several)
+  --for-change   the same, for everything the working tree says was changed
+  --for-tool N   the tags that tool's layer is tested with, from the wave table in lib.sh
   --tags TAGS    run only these tags, plus the smoke set (--list-tags to see them)
   --list-tags    print the tags this kernel defines and exit
   --fast         reuse a content-verified userspace preflight instead of rebuilding it
@@ -31,14 +35,16 @@ examples:
   ./test.sh --arch all
   ./test.sh --arch riscv64 --tags filesystem,storage
   ./test.sh --fast --build-only
+  ./test.sh --for-change --arch all
+  ./test.sh --for src/user/libs/audio/flac
 
 The three suites share the disk images under .build/boot, so two runs at once fail with a QEMU
 write-lock error naming an image rather than the run that holds it. --arch all runs them in turn.
 
 x86_64 runs under KVM; aarch64 and riscv64 are emulated instruction by instruction, so a loaded
 host slows them by far more than it slows x86_64. Measured on 2026-08-08 with the machine at load
-115: the ten $(image) tests took 63 s on x86_64 and 1518 s on aarch64 - twenty-four times - and the
-default --timeout was not the problem it looked like. If an emulated run stops on a heavy test,
+115: the ten image-tagged tests took 63 s on x86_64 and 1518 s on aarch64 - twenty-four times -
+and the default --timeout was not the problem it looked like. If an emulated run stops on a heavy test,
 check the load average before the diff.
 EOF
 }
@@ -47,6 +53,28 @@ archs=()
 tags=""
 fast=0
 build_only=0
+for_paths=()
+
+# Turn a set of changed paths into the tags to test them with, or into nothing at all.
+#
+# Three outcomes, and each of them is said out loud: a tag set, the whole suite, or no kernel test
+# whatever - the last being build tooling and documentation, which `./check.sh` covers and booting
+# does not.
+resolve_for() {
+	local resolved
+	if resolved="$(tags_for_paths "$@")"; then
+		if [[ -n "$resolved" ]]; then
+			tags="$resolved"
+			note "for: tags $tags"
+		else
+			tags=""
+			note "for: this reaches everything - running the whole suite"
+		fi
+	else
+		note "for: nothing here is covered by the kernel suite; run ./check.sh"
+		exit 0
+	fi
+}
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -68,6 +96,37 @@ while [[ $# -gt 0 ]]; do
 		[[ $# -ge 2 ]] || die "--tags needs a value"
 		tags="$2"
 		shift 2
+		;;
+	# What to run after changing one tool, without having to know which tags its layer lives in.
+	#
+	# The mapping is `lib.sh`'s, and `check-dynamic-report.sh` prints the same command into the last
+	# column of docs/DYNAMIC_EXECUTABLES.tsv - so this is the documented answer made executable
+	# rather than a second copy of it. It exists because a scoped change was once verified with the
+	# whole suite on all three architectures, which cost two and a half hours and checked the wrong
+	# thing: the mistakes it was meant to catch had all surfaced in the build.
+	--for-tool)
+		[[ $# -ge 2 ]] || die "--for-tool needs a value"
+		tags="$(tool_tags "$2")" || die "no wave for tool '$2'
+    Tools with a wave:  $(printf '%s\n' "${!TOOL_WAVES[@]}" | sort | tr '\n' ' ')"
+		note "for-tool: $2 is wave ${TOOL_WAVES[$2]}, tags $tags"
+		shift 2
+		;;
+	# The same question for anything that is not a tool: a library, a service, a driver, the loader,
+	# the kernel. Answered from the component table in lib.sh, which errs wide - an unrecognised
+	# path is tested with everything, because the failure that matters here is testing too little.
+	--for)
+		[[ $# -ge 2 ]] || die "--for needs a path"
+		mapfile -t for_paths < <(printf '%s\n' "$2" | tr ',' '\n' | grep -v '^$')
+		resolve_for "${for_paths[@]}"
+		shift 2
+		;;
+	# What the working tree says was changed, so nothing has to be named at all.
+	--for-change)
+		mapfile -t for_paths < <(git status --porcelain | sed 's/^...//' | sed 's/.* -> //' | grep -v '^$')
+		((${#for_paths[@]})) || die "--for-change: the working tree is clean"
+		note "for-change: ${#for_paths[@]} changed path(s)"
+		resolve_for "${for_paths[@]}"
+		shift
 		;;
 	--fast)
 		fast=1

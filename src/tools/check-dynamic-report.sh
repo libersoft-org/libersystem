@@ -7,6 +7,7 @@ manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 report="$root/../docs/DYNAMIC_EXECUTABLES.tsv"
 wave_report="$root/../docs/DYNAMIC_WAVES.tsv"
 image_report="$root/../docs/DYNAMIC_IMAGE.tsv"
+source "$root/../lib.sh"
 mode="${1:---check}"
 
 case "$mode" in
@@ -27,8 +28,6 @@ source_path() {
 	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
 }
 
-declare -A waves=()
-declare -A tests=()
 declare -A wave_tools_count=()
 declare -A wave_object_bytes=()
 declare -A wave_pie_bytes=()
@@ -50,19 +49,9 @@ declare -A provider_size_cache=()
 declare -A provider_private_cache=()
 declare -A provider_shared_cache=()
 declare -A provider_exports=()
-for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln script; do waves[$tool]=1; done
-for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do waves[$tool]=2; done
-for tool in date log config set lsdev lsusb lssvc usage ps run perm start stop beep; do waves[$tool]=3; done
-for tool in ping ip nslookup tcp nc arp httpd ss; do waves[$tool]=4; done
-for tool in imgview imgconv audioconv play graphics_probe lico licoedit licoview; do waves[$tool]=5; done
-tests[1]='./test.sh --tags service,process,storage'
-tests[2]='./test.sh --tags service,process,storage'
-tests[3]='./test.sh --tags service,process,storage'
-tests[4]='./test.sh --tags service,process'
-tests[5]='./test.sh --tags image,audio,service,process,storage'
 
 manifest_tools="$(jq -r '.programs[] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | .name' <<<"$manifest_json" | sort)"
-wave_tools="$(printf '%s\n' "${!waves[@]}" | sort)"
+wave_tools="$(printf '%s\n' "${!TOOL_WAVES[@]}" | sort)"
 if [[ "$manifest_tools" != "$wave_tools" ]]; then
 	echo "dynamic-report: wave inventory differs from the manifest tools" >&2
 	diff -u <(printf '%s\n' "$manifest_tools") <(printf '%s\n' "$wave_tools") >&2 || true
@@ -320,7 +309,7 @@ generate_report() {
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
 		for wave in 1 2 3 4 5; do
 			key="$target|$wave"
-			for tool in $(for candidate in "${!waves[@]}"; do if [[ "${waves[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
+			for tool in $(for candidate in "${!TOOL_WAVES[@]}"; do if [[ "${TOOL_WAVES[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
 				row="$(jq -er --arg tool "$tool" '.programs[$tool] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | "dynamic \(.name) \(.owner) \(.stage) \(.providers | join(" "))"' <<<"$manifest_json")"
 				providers="$(cut -d' ' -f5- <<<"$row")"
 				destination="$(jq -er --arg tool "$tool" '.programs[$tool].destination | sub("\\.lsexe$"; "")' <<<"$manifest_json")"
@@ -382,7 +371,7 @@ generate_report() {
 				image_pie_bytes[$target]=$((${image_pie_bytes[$target]:-0} + pie_bytes))
 				image_private_bytes[$target]=$((${image_private_bytes[$target]:-0} + private_bytes))
 				image_shared_executable_bytes[$target]=$((${image_shared_executable_bytes[$target]:-0} + $(immutable_load_bytes "$artifact")))
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$wave" "$target" "$tool" "$imports" "$import_owners" "$generic_residuals" "$(join_lines <<<"$declared")" "$(join_lines <<<"$actual_needed")" "$(join_lines <<<"$transitive")" "$object_bytes" "$pie_bytes" "$provider_bytes" "$private_bytes" "$shared_bytes" "${tests[$wave]}"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$wave" "$target" "$tool" "$imports" "$import_owners" "$generic_residuals" "$(join_lines <<<"$declared")" "$(join_lines <<<"$actual_needed")" "$(join_lines <<<"$transitive")" "$object_bytes" "$pie_bytes" "$provider_bytes" "$private_bytes" "$shared_bytes" "./test.sh --tags ${WAVE_TAGS[$wave]}"
 			done
 		done
 	done
@@ -396,7 +385,7 @@ generate_wave_report() {
 		for wave in 1 2 3 4 5; do
 			key="$target|$wave"
 			shared_bytes=$((${wave_shared_executable_bytes[$key]} + ${wave_provider_shared_bytes[$key]}))
-			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "$wave" "${wave_tools_count[$key]}" "${wave_object_bytes[$key]}" "${wave_pie_bytes[$key]}" "${wave_provider_bytes[$key]}" "${wave_private_bytes[$key]}" "$shared_bytes" "${tests[$wave]}"
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "$wave" "${wave_tools_count[$key]}" "${wave_object_bytes[$key]}" "${wave_pie_bytes[$key]}" "${wave_provider_bytes[$key]}" "${wave_private_bytes[$key]}" "$shared_bytes" "./test.sh --tags ${WAVE_TAGS[$wave]}"
 		done
 	done
 }
