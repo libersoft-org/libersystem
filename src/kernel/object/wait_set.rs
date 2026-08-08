@@ -92,11 +92,21 @@ impl WaitSet {
 		Ok(())
 	}
 
-	// The members, as a snapshot. The readiness scan works from this rather than under the lock:
-	// asking an object whether it is ready can take that object's own locks, and holding the
-	// membership lock across that is how lock orders get invented by accident.
-	pub fn snapshot(&self) -> Vec<Arc<dyn KernelObject>> {
-		self.members.lock().clone()
+	// Run `f` over the membership, under the lock, without copying it.
+	//
+	// This was a `snapshot` returning a fresh `Vec` - one heap allocation and one atomic increment
+	// per member, twice per pass, on the path whose entire purpose is to be cheaper than the
+	// alternative. It was: `wait_any` answered a round trip in 189 us at sixty-two clients and the
+	// set took 434 us. The measurement is in M0147 and it is the reason this is written the way it
+	// is.
+	//
+	// Under the lock is safe here and worth stating, because it is the kind of thing that stops
+	// being safe quietly. Asking an object whether it is ready takes that object's own lock, so the
+	// order is set-membership then object. Nothing goes the other way: a wake takes the OBSERVER
+	// bucket, never this, and `add` takes this and then the observer bucket. No cycle, and any new
+	// caller has to keep it that way.
+	pub fn with_members<R>(&self, f: impl FnOnce(&[Arc<dyn KernelObject>]) -> R) -> R {
+		f(&self.members.lock())
 	}
 
 	pub fn len(&self) -> usize {

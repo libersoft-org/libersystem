@@ -34,6 +34,12 @@ examples:
 
 The three suites share the disk images under .build/boot, so two runs at once fail with a QEMU
 write-lock error naming an image rather than the run that holds it. --arch all runs them in turn.
+
+x86_64 runs under KVM; aarch64 and riscv64 are emulated instruction by instruction, so a loaded
+host slows them by far more than it slows x86_64. Measured on 2026-08-08 with the machine at load
+115: the ten $(image) tests took 63 s on x86_64 and 1518 s on aarch64 - twenty-four times - and the
+default --timeout was not the problem it looked like. If an emulated run stops on a heavy test,
+check the load average before the diff.
 EOF
 }
 

@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+pub mod encode;
+
 use alloc::vec::Vec;
 
 pub const OUTPUT_RATE: u32 = 48_000;
@@ -74,3 +76,6 @@ extern crate std;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod encode_tests;

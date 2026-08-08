@@ -766,6 +766,21 @@ fn process_service_canonicalizes_short_and_explicit_program_names() {
 
 tagged_test!(process_service_lists_every_started_program, [Service, Process, ProcessService]);
 fn process_service_lists_every_started_program() {
+	// SEEN TO FAIL ON riscv64, three times in a row, on 2026-08-08: two processes started and
+	// acknowledged with koids, and the list held one. It then passed twice - the tag alone and the
+	// full 197-test suite - with nothing changed that touches ProcessService, so it is INTERMITTENT
+	// and its cause is not known. Recorded here rather than in a milestone because this is where
+	// the next person to see it will be standing.
+	//
+	// The suspect, unproven: `Processes::record` reaps before it pushes, and `reap` drops any entry
+	// whose process is not PROC_STATE_RUNNING - which the kernel defines as "has live threads". A
+	// launch that has not yet had its entry thread started, or one whose thread has just ended,
+	// reads as STOPPED. The second START would then drop the first launch on its way in, and the
+	// count would be exactly what was seen. Whether riscv64's scheduling opens that window and the
+	// other two architectures' closes it is the thing to measure.
+	//
+	// The assertion below names the survivors for this reason: `1 != 2` says nothing about WHICH
+	// launch went missing, and that is the first fact the next attempt needs.
 	let (replies, list) = run_process_service_requests(&[(11, b"log_service"), (12, b"device_manager")], Some(13));
 	assert_process_start_reply(&replies[0], 11, b"log_service.lsexe");
 	assert_process_start_reply(&replies[1], 12, b"device_manager.lsexe");

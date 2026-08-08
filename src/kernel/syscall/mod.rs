@@ -2099,20 +2099,25 @@ fn sys_waitset_wait(set_handle: u64, deadline: u64, flags: u64) -> i64 {
 			sched::block_on(thread.process().header().koid(), sched::NO_DEADLINE);
 			continue;
 		}
-		// The snapshot is taken outside the membership lock, because asking an object whether it is
-		// ready takes that object's own locks.
-		let members = set.snapshot();
-		for (i, object) in members.iter().enumerate() {
-			if object_ready(object) {
-				return i as i64;
+		// One pass over the membership, under one lock, allocating nothing: the ready member if
+		// there is one, and the earliest deadline in the set either way.
+		//
+		// The earliest deadline is the same rule `sys_wait_any` follows - a timer becoming ready
+		// generates no wake of its own, so a wait that did not account for one could sleep past it
+		// with nothing to bring it back.
+		let (ready, block_deadline) = set.with_members(|members| {
+			let mut earliest = if deadline == 0 { sched::NO_DEADLINE } else { deadline };
+			let mut ready = None;
+			for (i, object) in members.iter().enumerate() {
+				if ready.is_none() && object_ready(object) {
+					ready = Some(i as i64);
+				}
+				earliest = core::cmp::min(earliest, wait_block_deadline(object, deadline));
 			}
-		}
-		// The earliest deadline in the set, the same rule `sys_wait_any` follows: a timer becoming
-		// ready generates no wake of its own, so a wait that did not account for one could sleep
-		// past it with nothing to bring it back.
-		let mut block_deadline = if deadline == 0 { sched::NO_DEADLINE } else { deadline };
-		for object in members.iter() {
-			block_deadline = core::cmp::min(block_deadline, wait_block_deadline(object, deadline));
+			(ready, earliest)
+		});
+		if let Some(index) = ready {
+			return index;
 		}
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
@@ -2120,7 +2125,7 @@ fn sys_waitset_wait(set_handle: u64, deadline: u64, flags: u64) -> i64 {
 		// ONE registration, on the set. What makes this the point of the whole object: a member's
 		// wake reaches the set through the observer registered when it joined, and the set's wake
 		// reaches whoever is parked here.
-		sched::block_on_flagged(set_koid, block_deadline, periodic, || set.snapshot().iter().any(object_ready));
+		sched::block_on_flagged(set_koid, block_deadline, periodic, || set.with_members(|members| members.iter().any(object_ready)));
 	}
 }
 

@@ -55,6 +55,10 @@ owner = "aiff"
 path = "user/libs/audio/aiff"
 
 [[sources]]
+owner = "audioconv"
+path = "user/libs/audio/audioconv"
+
+[[sources]]
 owner = "apng"
 path = "user/libs/image/apng"
 

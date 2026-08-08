@@ -698,6 +698,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		unsafe { print(b"storage: cannot allocate the wait set; the service cannot serve\n") };
 		unsafe { exit() };
 	}
+
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	// At most one at a time. The memory filesystem accumulates a stream in the volume itself and

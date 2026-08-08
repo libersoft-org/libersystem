@@ -626,20 +626,54 @@ pub unsafe fn retire(frames: &[u64]) {
 	if frames.is_empty() {
 		return;
 	}
+	// What the queue could not take, to be dealt with the expensive way rather than lost.
+	let mut unqueued: [u64; 8] = [0; 8];
+	let mut unqueued_len = 0usize;
 	let drain = {
 		let mut quarantine = QUARANTINE.lock();
 		for &phys in frames {
-			// A quarantine that cannot grow drops the span rather than freeing it: the memory is
-			// lost to this boot, which is the same outcome as the run table filling up and is still
-			// better than handing out a frame another core can read.
+			// The queue is a heap allocation, and the heap grows by taking FRAMES - so the one
+			// moment it cannot grow is when frames are short, which is exactly when this path runs.
+			// The first version answered that by dropping the page with a warning, and a test that
+			// refuses allocations found it at once: nine pages lost on one failed load, and the
+			// quarantine empty, so it was not even a deferral.
+			//
+			// Nothing is lost now. A page that cannot be queued is retired the expensive way below -
+			// one shootdown for the batch of them - which is slow and correct, and slow only when
+			// the machine is already out of memory.
 			if quarantine.try_reserve(1).is_err() {
-				crate::serial_println!("frame: WARNING: {phys:#x} retired with no room to quarantine it; the page is not being tracked");
+				if unqueued_len < unqueued.len() {
+					unqueued[unqueued_len] = phys;
+					unqueued_len += 1;
+				} else {
+					// More than the small batch below can hold, with a heap that will not grow.
+					// Freed after its own shootdown rather than queued or dropped.
+					drop(quarantine);
+					if crate::mem::tlb::shootdown() {
+						unsafe { deallocate(phys) };
+					} else {
+						crate::serial_println!("frame: WARNING: {phys:#x} could not be queued and its shootdown did not complete; the page is not being tracked");
+					}
+					quarantine = QUARANTINE.lock();
+				}
 				continue;
 			}
 			quarantine.push(phys);
 		}
 		quarantine.len() >= QUARANTINE_DRAIN
 	};
+	if unqueued_len > 0 {
+		// One shootdown for all of them, and it also covers whatever is queued - a flush is not
+		// per-address - so the drain below finds the queue already retired.
+		if crate::mem::tlb::shootdown() {
+			for &phys in unqueued.iter().take(unqueued_len) {
+				unsafe { deallocate(phys) };
+			}
+			unsafe { drain_quarantine() };
+			return;
+		}
+		crate::serial_println!("frame: WARNING: {unqueued_len} page(s) could not be queued and their shootdown did not complete; they are not being tracked");
+	}
 	if drain {
 		unsafe { drain_quarantine() };
 	}
@@ -690,6 +724,26 @@ static QUARANTINE: crate::sync::SpinLock<Vec<u64>> = crate::sync::SpinLock::new(
 #[cfg(test)]
 pub fn quarantined() -> usize {
 	QUARANTINE.lock().len()
+}
+
+// Drain until the quarantine is empty, or give up after `attempts`.
+//
+// What "wait for the shootdown" looks like from a test. One drain is not enough: a shootdown gives
+// up on a core that did not answer, and under a loaded host - three emulated guests on one
+// machine - that happens often enough to fail a test measuring frames that ARE coming back, just
+// not yet. Retrying is not hiding anything: the property under test is that the frames return, and
+// this is how a test waits for them.
+#[cfg(test)]
+pub fn drain_quarantine_fully(attempts: usize) -> bool {
+	for _ in 0..attempts {
+		if QUARANTINE.lock().is_empty() {
+			return true;
+		}
+		// SAFETY: every frame in the quarantine was owned by whoever retired it and had its
+		// mappings removed before it got there.
+		unsafe { drain_quarantine() };
+	}
+	QUARANTINE.lock().is_empty()
 }
 
 pub unsafe fn free_pages(frames: &[u64]) {

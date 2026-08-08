@@ -1,0 +1,14 @@
+[package]
+name = "audioconv"
+edition = "2024"
+description = "Bounded audio conversion orchestration and option validation"
+
+[dependencies]
+adpcm = { path = "../adpcm" }
+aiff = { path = "../aiff" }
+flac = { path = "../flac" }
+mp3 = { path = "../mp3" }
+pcm = { path = "../pcm" }
+vorbis = { path = "../vorbis" }
+wav = { path = "../wav" }
+wavpack = { path = "../wavpack" }

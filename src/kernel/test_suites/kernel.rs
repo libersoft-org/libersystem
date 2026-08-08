@@ -1677,7 +1677,7 @@ fn fuzzed_map_and_unmap_sequences_round_trip_the_window() {
 			// those are batched rather than taken one span at a time. Draining is what "wait for the
 			// shootdown" looks like from here; without it this measures the queue rather than the
 			// property.
-			unsafe { mem::frame::drain_quarantine() };
+			assert!(mem::frame::drain_quarantine_fully(64), "the shootdown never completed, so the pages could not come back");
 			assert_eq!(mem::frame::free_count() as u64, frames_before as u64 + total_pages, "closing every object must return every page of frames it held");
 		}
 		DONE.store(true, Ordering::SeqCst);

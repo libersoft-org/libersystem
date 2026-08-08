@@ -605,3 +605,27 @@ fn the_memory_volumes_bound_expensive_streams() {
 	// passed with the fix removed.
 	assert_eq!(hangup.handle_count(), before, "and leaks no handle when the client is gone");
 }
+
+tagged_test!(a_services_round_trip_against_its_client_count, [Service, Storage, Stress]);
+fn a_services_round_trip_against_its_client_count() {
+	// The measurement M0147 asked for FIRST, before anything touches the serve loop.
+	//
+	// What that milestone fixes is a slope: `wait_any` takes a fresh array of handles on every call,
+	// so the kernel registers a waiter on every channel in it and takes them all out again - once
+	// per pass, for as long as the service runs. The cost of answering one client therefore grows
+	// with how many others are connected.
+	//
+	// It was known by its symptom rather than its size: finding a client ceiling a test could reach
+	// took several attempts, and `MAX_CLIENTS` ended up at 64 because that is where the service is
+	// still brisk. This prints the number instead. It does not ASSERT a slope - a wall-clock figure
+	// on an emulated guest is not something to fail a build over, and this milestone has already
+	// retired three tests that asserted numbers they did not own - it puts the three figures in the
+	// log so a change to the loop can be judged against them rather than guessed at.
+	let (_volume, package) = scenario_packages().expect("boot modules should be present");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe");
+	for crowd in [4usize, 32, 62] {
+		let mut harness = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
+		let ns = harness.round_trip_ns_with_crowd(crowd, 20);
+		crate::serial_println!("storage-roundtrip-perf: clients={crowd} ns-per-round-trip={ns}");
+	}
+}

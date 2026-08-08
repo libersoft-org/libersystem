@@ -130,6 +130,10 @@ static SET_OBSERVERS: [SpinLock<Vec<SetObserver>>; WAIT_BUCKET_COUNT] = [const {
 // nobody is using. It showed up as a cross-core wake taking milliseconds where it takes
 // microseconds, which is the one thing the wake IPI exists to prevent.
 static OBSERVER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+// The most wait sets one object's wake will reach. Four is more than anything here needs - a channel
+// belongs to one service's set - and it keeps the forwarding on the stack.
+const MAX_SETS_PER_OBJECT: usize = 4;
 static TIMED_WAITERS: SpinLock<Vec<TimedWaiter>> = SpinLock::new(Vec::new());
 
 fn bucket_of(koid: u64) -> &'static SpinLock<Vec<BucketWaiter>> {
@@ -479,12 +483,30 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 pub fn wake_object(koid: u64) {
 	// The sets watching this object, collected before anything is woken and NOT removed - an
 	// observer outlives the wake, which is the whole difference between it and a waiter.
-	let sets: Vec<u64> = if OBSERVER_COUNT.load(Ordering::Acquire) == 0 {
-		Vec::new()
-	} else {
+	// Into a fixed array, allocating NOTHING.
+	//
+	// This collected into a `Vec` - a kernel heap allocation on the hottest path in the scheduler,
+	// taken on every wake the moment any wait set exists. It was measured rather than reasoned
+	// about: a storage service with sixty-two clients answered a round trip in 189 us with no set,
+	// and 425 us with a set merely POPULATED and the waiting still done the old way. The waiting
+	// mechanism was never the cost; this allocation was.
+	//
+	// An object in more sets than this array holds keeps the sets past the limit un-woken, which is
+	// a wait that only fires when something else happens - said out loud rather than silently,
+	// because that is a fault that looks like a slow service.
+	let mut sets: [u64; MAX_SETS_PER_OBJECT] = [0; MAX_SETS_PER_OBJECT];
+	let mut set_count = 0usize;
+	if OBSERVER_COUNT.load(Ordering::Acquire) != 0 {
 		let observers = observers_of(koid).lock();
-		observers.iter().filter(|o| o.member_koid == koid).map(|o| o.set_koid).collect()
-	};
+		for observer in observers.iter().filter(|o| o.member_koid == koid) {
+			if set_count == sets.len() {
+				crate::serial_println!("sched: WARNING: object {koid} is in more than {} wait sets; the rest will not be woken", sets.len());
+				break;
+			}
+			sets[set_count] = observer.set_koid;
+			set_count += 1;
+		}
+	}
 	let woken = {
 		let mut bucket = bucket_of(koid).lock();
 		let mut woken: Vec<Arc<Thread>> = Vec::new();
@@ -502,7 +524,7 @@ pub fn wake_object(koid: u64) {
 	}
 	// One level, never a chain: a set may not contain a set, so a set's own wake reaches threads
 	// only. `WaitSet::add` is where that is refused.
-	for set in sets {
+	for &set in sets.iter().take(set_count) {
 		let parked = {
 			let mut bucket = bucket_of(set).lock();
 			let mut parked: Vec<Arc<Thread>> = Vec::new();

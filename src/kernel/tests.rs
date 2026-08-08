@@ -3093,6 +3093,59 @@ impl StorageHarness {
 		false
 	}
 
+	// Time `rounds` heartbeat round-trips on one client, with `crowd` other clients connected and
+	// silent. Returns the nanoseconds per round trip.
+	//
+	// The measurement M0147 exists for. What is being fixed there is a SLOPE - the cost of a pass
+	// against the number of clients the service listens to - and there was no harness that reported
+	// it, so "it got faster" was a feeling and "it hung" was the whole signal a failure gave. Three
+	// numbers at three crowd sizes say in one run what a night of bisecting does not.
+	fn round_trip_ns_with_crowd(&mut self, crowd: usize, rounds: usize) -> u64 {
+		use object::channel::{Channel, Message};
+		let mut held: Vec<alloc::sync::Arc<Channel>> = alloc::vec::Vec::new();
+		// Connected in batches: a round trip per connection would cost more than the measurement.
+		const BATCH: usize = 16;
+		let mut asked = 0usize;
+		while asked < crowd {
+			let batch = BATCH.min(crowd - asked);
+			for _ in 0..batch {
+				self.client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("connect");
+			}
+			asked += batch;
+			let mut answered = 0usize;
+			for _ in 0..2_000 {
+				self.pump();
+				while let Ok(reply) = self.client.recv() {
+					answered += 1;
+					if let Some(cap) = reply.caps.first() {
+						held.push(cap.object().into_any_arc().downcast::<Channel>().expect("a connection is a channel"));
+					}
+				}
+				if answered == batch {
+					break;
+				}
+			}
+			assert_eq!(answered, batch, "the service answered every connect while building a crowd of {crowd}");
+		}
+		// The prober is one of the crowd, so what is timed is a client like any other.
+		let prober = held.last().cloned().unwrap_or_else(|| self.client.clone());
+		let started = arch::tsc::now();
+		for _ in 0..rounds {
+			prober.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("heartbeat");
+			let mut answered = false;
+			for _ in 0..10_000 {
+				self.pump();
+				if prober.recv().is_ok() {
+					answered = true;
+					break;
+				}
+			}
+			assert!(answered, "the service answered every heartbeat with a crowd of {crowd}");
+		}
+		let elapsed = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(started));
+		elapsed / rounds as u64
+	}
+
 	// Connect over and over until the service refuses, and report how many it granted.
 	//
 	// A refusal is an empty reply carrying no capability, which is what this call answers with when

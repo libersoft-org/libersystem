@@ -1163,8 +1163,39 @@ fn a_load_that_runs_out_of_frames_anywhere_gives_back_everything() {
 				// shootdown that retires every core's translation of it, and those are batched
 				// rather than taken one span at a time. Draining is what "wait for the shootdown"
 				// looks like from here - without it this measures the queue rather than the load.
-				unsafe { frame::drain_quarantine() };
-				assert_eq!(frame::free_count(), before, "a load refused at allocation {budget} did not return every frame it took");
+				// Settle, THEN compare.
+				//
+				// Two things stand between a frame being given up and the count showing it: the
+				// quarantine, which holds anything that was mapped until a shootdown retires it,
+				// and whatever teardown is still in flight elsewhere on the machine - a thread
+				// exiting on another core retires its kernel stack whenever it gets there, which
+				// can be inside this test's window.
+				//
+				// So the test settles rather than sampling once: run the machine down, drain, look,
+				// repeat. A straggler matches on the second or third turn; a genuine leak never
+				// matches, and the count is printed either way.
+				// NOT LOWER than it started, rather than equal to it.
+				//
+				// Equality was asserting a number this test does not own. The free count is the
+				// whole machine's: a thread exiting on another core returns its kernel stack
+				// whenever it gets there, and that lands inside this window in either direction -
+				// the first version of this settle loop reported nine frames SHORT in the full
+				// suite and two hundred and eighty-seven SPARE once it let the machine run down.
+				// Both were other people's work, and neither said anything about the load.
+				//
+				// What the load owes is that it kept nothing. A leak shows as a count that stays
+				// below where it started however long the machine is given; frames returned by
+				// somebody else only push it up.
+				let mut settled = false;
+				for _ in 0..16 {
+					crate::sched::run_until_idle();
+					assert!(frame::drain_quarantine_fully(64), "the shootdown never completed, so the frames could not come back");
+					if frame::free_count() >= before {
+						settled = true;
+						break;
+					}
+				}
+				assert!(settled, "a load refused at allocation {budget} kept {} frame(s) it took ({} still quarantined)", before as i64 - frame::free_count() as i64, frame::quarantined());
 			}
 			Ok(process) => {
 				// The load got all the way through. Take the process down again and stop:

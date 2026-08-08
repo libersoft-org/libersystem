@@ -114,8 +114,16 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	// jitter. Without the IPI EVERY trip waits out a tick, so the fastest of five is still ~5 ms;
 	// with it, a trip is microseconds and only a host that stalls all five in a row could disguise
 	// that - and such a host has stopped being a place to measure anything at all.
+	// TWENTY, not five.
+	//
+	// The best of five was enough on an idle host and not on this one: with three emulated guests
+	// and a fuzzer sharing the machine, five trips can all lose milliseconds to the host's scheduler
+	// and the best of them comes in at 4.06 ms against a 4 ms bound. Widening the BOUND would blunt
+	// the test - without the IPI a trip is a full tick, and the gap between 4 ms and 10 ms is the
+	// whole measurement. Widening the SAMPLE does not: a trip is microseconds when the host lets it
+	// run, and twenty of them cost nothing.
 	let mut best = u64::MAX;
-	for _ in 0..5 {
+	for _ in 0..20 {
 		RAN_AT.store(0, Ordering::SeqCst);
 		let start = arch::tsc::now();
 		sched::spawn_on(1, stamp, 0);

@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+pub mod encode;
+
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
