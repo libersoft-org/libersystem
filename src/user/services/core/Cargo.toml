@@ -129,6 +129,11 @@ ipc-client = { path = "../../libs/ipc/ipc-client" }
 # the syscall/IPC/volume helpers); it re-exports the abi constants.
 rt = { path = "../../runtime/rt" }
 
+# The pure decisions this service makes, in a crate that links no runtime - so `cargo test` can
+# build and run their suites on the host. The split is a testing one: everything in this crate links
+# `rt`, whose `panic_impl` collides with the `std` the test harness needs. See services/logic.
+service-logic = { path = "../logic" }
+
 # Generated LSIDL bindings (the proto codec, clients, and servers) - LogService
 # serves them and the shell + ServiceManager speak them over the log channel.
 proto = { path = "../../../proto" }

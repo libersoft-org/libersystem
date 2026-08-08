@@ -1,0 +1,21 @@
+[package]
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+name = "service-logic"
+edition = "2024"
+description = "The pure decisions CoreServices makes, split out so they can be tested on the host"
+
+# Split out of the `services` crate, and the reason is a testing one rather than an architectural
+# one. `services` builds twenty-odd service binaries, every one of which links `rt` - the
+# freestanding runtime that defines the `panic_impl` lang item. `cargo test` links `std`, which
+# defines it too, so the whole crate failed with E0152 before a single test ran: four suites of pure
+# logic that no host could execute, and whose only cover was a QEMU boot.
+#
+# Nothing here may depend on `rt`, on `ipc-client`, or on anything that reaches them. That is the
+# entire contract of this crate, and it is what makes the suites runnable.
+
+[dependencies]
+# Shared kernel/userspace ABI constants: the executable suffix, and nothing else.
+abi = { path = "../../../abi" }
+# The dynamic-loader bounds the module graph is checked against.
+bootproto = { path = "../../../bootproto" }

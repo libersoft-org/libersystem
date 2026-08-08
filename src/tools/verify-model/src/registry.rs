@@ -26,6 +26,8 @@ struct RawRegistry {
 	#[serde(default)]
 	selects_everything: Vec<RawSelectsEverything>,
 	#[serde(default)]
+	risk_class: Vec<RawRiskClass>,
+	#[serde(default)]
 	edge: Vec<RawEdge>,
 	#[serde(default)]
 	architecture: Vec<RawArchitecture>,
@@ -55,6 +57,17 @@ struct RawConfigurationUnrunnable {
 struct RawSelectsEverything {
 	component: String,
 	reason: String,
+}
+
+// A subsystem that COULD be narrowed once there is evidence, recorded so the debt is visible.
+// Parsed and validated rather than left as prose: a class naming a path that no longer exists is a
+// plan somebody made for a tree that has moved on.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRiskClass {
+	path: String,
+	class: String,
+	evidence: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -156,6 +169,13 @@ pub struct ArchitectureRule {
 }
 
 #[derive(Clone, Debug)]
+pub struct RiskClass {
+	pub path: String,
+	pub class: String,
+	pub evidence: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct Unrunnable {
 	pub crate_name: String,
 	pub reason: String,
@@ -179,6 +199,7 @@ pub struct Registry {
 	pub ownership: Vec<OwnershipRule>,
 	pub non_code: Vec<NonCodeRule>,
 	pub host_tests_unrunnable: Vec<Unrunnable>,
+	pub risk_classes: Vec<RiskClass>,
 	pub host_configuration_unrunnable: Vec<ConfigurationUnrunnable>,
 	pub selects_everything: Vec<SelectsEverything>,
 	pub edges: Vec<DeclaredEdge>,
@@ -218,7 +239,7 @@ impl Registry {
 			}
 		}
 
-		let registry = Registry { ownership: raw.ownership.into_iter().map(|rule| OwnershipRule { path: rule.path, component: rule.component }).collect(), non_code: raw.non_code.into_iter().map(|rule| NonCodeRule { path: rule.path, reason: rule.reason }).collect(), host_tests_unrunnable: raw.host_tests_unrunnable.into_iter().map(|rule| Unrunnable { crate_name: rule.crate_name, reason: rule.reason }).collect(), host_configuration_unrunnable: raw.host_configuration_unrunnable.into_iter().map(|rule| ConfigurationUnrunnable { configuration: rule.configuration, when_static_reach: rule.when_static_reach, reason: rule.reason }).collect(), selects_everything: raw.selects_everything.into_iter().map(|rule| SelectsEverything { component: rule.component, reason: rule.reason }).collect(), edges, architecture: raw.architecture.into_iter().map(|rule| ArchitectureRule { path: rule.path, build: rule.build, boot: rule.boot }).collect(), configurations: raw_configurations.configuration, registry_text, configurations_text };
+		let registry = Registry { ownership: raw.ownership.into_iter().map(|rule| OwnershipRule { path: rule.path, component: rule.component }).collect(), non_code: raw.non_code.into_iter().map(|rule| NonCodeRule { path: rule.path, reason: rule.reason }).collect(), risk_classes: raw.risk_class.into_iter().map(|rule| RiskClass { path: rule.path, class: rule.class, evidence: rule.evidence }).collect(), host_tests_unrunnable: raw.host_tests_unrunnable.into_iter().map(|rule| Unrunnable { crate_name: rule.crate_name, reason: rule.reason }).collect(), host_configuration_unrunnable: raw.host_configuration_unrunnable.into_iter().map(|rule| ConfigurationUnrunnable { configuration: rule.configuration, when_static_reach: rule.when_static_reach, reason: rule.reason }).collect(), selects_everything: raw.selects_everything.into_iter().map(|rule| SelectsEverything { component: rule.component, reason: rule.reason }).collect(), edges, architecture: raw.architecture.into_iter().map(|rule| ArchitectureRule { path: rule.path, build: rule.build, boot: rule.boot }).collect(), configurations: raw_configurations.configuration, registry_text, configurations_text };
 		registry.validate()?;
 		Ok(registry)
 	}
@@ -247,6 +268,14 @@ impl Registry {
 			}
 			if rule.build.is_empty() {
 				errors.push(format!("architecture rule '{}': builds nothing", rule.path));
+			}
+		}
+		for rule in &self.risk_classes {
+			if !["foundational", "contract", "narrowable"].contains(&rule.class.as_str()) {
+				errors.push(format!("risk class '{}': unknown class '{}'", rule.path, rule.class));
+			}
+			if rule.evidence.is_empty() {
+				errors.push(format!("risk class '{}': no evidence criterion, so nothing could ever discharge it", rule.path));
 			}
 		}
 		// The catch-all. Without it a path matching no rule has no architecture answer at all, and

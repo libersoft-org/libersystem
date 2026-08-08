@@ -23,7 +23,21 @@ cd "$(dirname "$0")/.."
 # pairs. Raise it when the number grows; a drop is a defect until proven otherwise.
 MINIMUM_SUITES=55
 
-suites="$(cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- host-suites)" || {
+# Prove the floor REFUSES before trusting it to approve.
+#
+# The floor below is the whole defence against a scanner that quietly stops discovering crates: a
+# shrunken inventory returns success over the handful it still finds, and looks exactly like a tree
+# with fewer tests. So the gate first hands itself an enumeration that is too short and requires
+# itself to reject it. A validator tested only over a currently-valid tree is not tested.
+if [[ "${HOST_TESTS_SELF_TEST:-}" != "1" ]]; then
+	if HOST_TESTS_SELF_TEST=1 HOST_TESTS_ENUMERATOR="printf 'src/abi\tabi\tdefault\n'" "$0" >/dev/null 2>&1; then
+		echo "host-tests: SELF-TEST FAILED - a one-crate inventory was accepted, so the floor is not guarding anything" >&2
+		exit 1
+	fi
+fi
+
+enumerate="${HOST_TESTS_ENUMERATOR:-cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- host-suites}"
+suites="$(eval "$enumerate")" || {
 	echo "host-tests: the model could not enumerate the suites; refusing to report a pass over an unknown list" >&2
 	exit 1
 }

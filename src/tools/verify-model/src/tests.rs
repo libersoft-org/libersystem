@@ -553,3 +553,153 @@ fn the_regression_corpus_replays() {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// Shadow validation
+//
+// The parser is the part with teeth here. It was wrong twice, in opposite directions, and both
+// failures are the kind this milestone is about: one manufactured a failure on every clean run, the
+// other silently paired half the tests with the wrong line.
+
+#[test]
+fn a_clean_sweep_parses_as_all_passed() {
+	let log = "running 3 tests (all tags)\nalpha...\t[ok]\nbeta...\t[ok]\ngamma...\t[ok]\ntest suite complete: 3 passed\n";
+	let results = crate::shadow::parse_guest_log(log);
+	assert_eq!(results.outcomes.len(), 3, "every test must be paired; the first version of this parser paired every second one");
+	assert!(results.outcomes.values().all(|outcome| *outcome == crate::shadow::Outcome::Passed));
+}
+
+#[test]
+fn a_test_that_prints_before_its_marker_still_passes() {
+	// The real case that broke the first parser: `[ok]` is not reliably on the name's line, because
+	// a test may print while it runs. Matching the line marked the last test of a clean 205-test
+	// sweep as failed.
+	let log = "running 2 tests (all tags)\nalpha...\t[ok]\nbeta...\tstorage: a note the test printed\n[ok]\n";
+	let results = crate::shadow::parse_guest_log(log);
+	assert_eq!(results.outcomes.get("beta"), Some(&crate::shadow::Outcome::Passed));
+}
+
+#[test]
+fn the_test_the_suite_died_under_is_the_one_that_failed() {
+	let log = "running 3 tests (all tags)\nalpha...\t[ok]\nbeta...\t";
+	let results = crate::shadow::parse_guest_log(log);
+	assert_eq!(results.outcomes.get("beta"), Some(&crate::shadow::Outcome::Failed));
+	assert_eq!(results.outcomes.get("alpha"), Some(&crate::shadow::Outcome::Passed));
+}
+
+fn kernel_key(name: &str) -> crate::plan::PlanItemKey {
+	crate::plan::PlanItemKey { check: format!("kernel.{name}"), architecture: String::from("x86_64"), environment: crate::catalog::Environment::TestGuest, configuration: String::from("test") }
+}
+
+#[test]
+fn a_failure_outside_the_selection_is_a_candidate_miss() {
+	let results = crate::shadow::parse_guest_log("running 2 tests (all tags)\nalpha...\t[ok]\nbeta...\t");
+	let comparison = crate::shadow::compare(&[kernel_key("alpha")], &results, "x86_64", &crate::history::History::default());
+	assert_eq!(comparison.verdict, crate::shadow::Verdict::CandidateMiss, "beta was not selected and it failed - that is the shape of a missed edge");
+	assert_eq!(comparison.outside_failures.len(), 1);
+}
+
+#[test]
+fn a_failure_inside_the_selection_is_not_the_selectors_fault() {
+	let results = crate::shadow::parse_guest_log("running 2 tests (all tags)\nalpha...\t[ok]\nbeta...\t");
+	let comparison = crate::shadow::compare(&[kernel_key("alpha"), kernel_key("beta")], &results, "x86_64", &crate::history::History::default());
+	assert_eq!(comparison.verdict, crate::shadow::Verdict::SelectionFailed, "the selector chose beta; beta broke. That is a defect in the code.");
+}
+
+// A partial log is the one way a dry shadow could lie quietly: a filtered run looks exactly like a
+// clean full one, and reporting Consistent over it would be evidence for nothing.
+#[test]
+fn a_partial_sweep_is_refused_rather_than_believed() {
+	let results = crate::shadow::parse_guest_log("running 2 tests (196 skipped, 198 total)\nalpha...\t[ok]\nbeta...\t[ok]\n");
+	let comparison = crate::shadow::compare(&[kernel_key("alpha")], &results, "x86_64", &crate::history::History::default());
+	assert_eq!(comparison.verdict, crate::shadow::Verdict::Void);
+	assert!(comparison.reason.contains("of 198"), "{}", comparison.reason);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Trust
+
+#[test]
+fn trust_lapses_when_the_model_hash_moves() {
+	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	store.grant("audio", "hash-a", 9, vec![String::from("x86_64"), String::from("riscv64")], 1);
+	assert_eq!(store.level("audio", "hash-a"), crate::trust::Level::Trusted);
+	// The graph changed, or the covers declarations did, or the selector did. The evidence was
+	// produced by a model that is no longer the one running.
+	assert_eq!(store.level("audio", "hash-b"), crate::trust::Level::Shadow);
+	let dropped = store.prune("hash-b");
+	assert_eq!(dropped, vec![String::from("audio")]);
+	assert!(store.certificates.is_empty());
+}
+
+#[test]
+fn trust_needs_evidence_from_more_than_one_target() {
+	// A month that only saw x86_64 changes says nothing about the emulated targets, and the
+	// architecture policy makes exactly that the steady state.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
+		log.records.push(crate::shadow::Record { architecture: String::from("x86_64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+	}
+	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	let error = store.evaluate("audio", "hash-a", &log).expect_err("one target is not enough");
+	assert!(error.contains("target(s)"), "{error}");
+	log.records.push(crate::shadow::Record { architecture: String::from("riscv64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+	assert!(store.evaluate("audio", "hash-a", &log).is_ok());
+}
+
+#[test]
+fn evidence_under_another_model_does_not_count() {
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for architecture in ["x86_64", "riscv64", "aarch64", "x86_64", "riscv64", "aarch64"] {
+		log.records.push(crate::shadow::Record { architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("an-older-model"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+	}
+	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	assert!(store.evaluate("audio", "the-current-model", &log).is_err(), "six clean runs under a model that is not the one running prove nothing about the one that is");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fail open, as a list rather than as a habit
+//
+// The behaviour existed before this test did; what was missing was the enumeration. A fail-open rule
+// that is only implemented is a rule that can be removed by an edit nobody reads as a removal - the
+// plan just gets smaller, and smaller is the direction no error message ever arrives from.
+
+#[test]
+fn every_fail_open_trigger_selects_everything() {
+	let model = model();
+	let triggers: [(&str, &str); 9] = [
+		("src/a-subtree-nobody-declared/thing.rs", "an unknown path: unknown reach is tested with everything"),
+		("src/tools/verify-model/src/plan.rs", "the selector itself: it cannot vouch for a change to its own selection"),
+		("src/kernel/tests.rs", "the test framework: what `tagged_test!` expands to decides what every tag means"),
+		("src/user/services/manifest.toml", "component metadata: it declares every destination in the image"),
+		("src/tools/mkpackages/src/main.rs", "the packager: its output IS the system volume"),
+		("src/boot/mkimage.sh", "the image builder"),
+		("src/boot/qemu-run.sh", "the thing that boots and judges the guest"),
+		("lib.sh", "the entry points"),
+		("src/abi/src/lib.rs", "the kernel/userspace contract"),
+	];
+	for (path, why) in triggers {
+		let plan = plan_for(&model, &[path]);
+		assert!(plan.full, "{path} must select everything - {why}");
+		assert_eq!(plan.architectures_booted, vec!["aarch64", "riscv64", "x86_64"], "{path} must also boot every target");
+		assert!(!plan.full_reasons.is_empty(), "{path} escalated without saying why, which makes the escalation impossible to audit");
+	}
+}
+
+// The one outcome that must be impossible: a change that is understood, is not documentation, and
+// selects nothing at all.
+#[test]
+fn a_change_with_owned_paths_never_selects_nothing() {
+	let model = model();
+	for path in [
+		"src/user/libs/audio/flac/src/lib.rs",
+		"src/fs/udf/src/lib.rs",
+		"src/user/apps/tools/src/echo.rs",
+		"src/kernel/arch/riscv64/traps/mod.rs",
+		"src/user/drivers/core/src/xhci.rs",
+	] {
+		let plan = plan_for(&model, &[path]);
+		assert!(!plan.items.is_empty(), "{path} produced an empty plan without being declared non-code");
+		assert!(!plan.nothing_to_do, "{path} is code");
+	}
+}

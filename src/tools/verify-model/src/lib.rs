@@ -14,6 +14,8 @@ pub mod kerneltests;
 pub mod ownership;
 pub mod plan;
 pub mod registry;
+pub mod shadow;
+pub mod trust;
 
 #[cfg(test)]
 mod tests;

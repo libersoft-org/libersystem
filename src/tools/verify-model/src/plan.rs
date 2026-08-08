@@ -110,9 +110,19 @@ impl Planner<'_> {
 					paths.push(PathVerdict { path: path.clone(), outcome: String::from("unknown"), detail: String::from("no ownership rule and no crate contains it") });
 				}
 				Owner::Component { component, rule } => {
-					if let Some(reason) = everything.get(component.as_str()) {
+					// The escalation applies to a program as well as to the crate it is built from.
+					//
+					// `bin.mkpackages` and `mkpackages` are one thing wearing two names here - the
+					// program's own source file is a longer prefix than its crate directory, so
+					// `src/tools/mkpackages/src/main.rs` resolves to the bin. Checking only the
+					// declared name let the packager whose output IS the system volume plan a scoped
+					// run, which is the exact defect an earlier review found in `lib.sh` and this
+					// model was supposed to have retired. Derived rather than declared twice: a bin
+					// is escalated by whatever escalates the crate it links.
+					let escalates = everything.get(component.as_str()).map(|reason| (component.clone(), (*reason).to_string())).or_else(|| self.graph.edges_from(&component).into_iter().filter(|edge| edge.kind == "link.static").find_map(|edge| everything.get(edge.to.as_str()).map(|reason| (edge.to.clone(), (*reason).to_string()))).filter(|_| component.starts_with("bin.")));
+					if let Some((named, reason)) = escalates {
 						full = true;
-						full_reasons.push(format!("'{path}' belongs to {component}: {reason}"));
+						full_reasons.push(if named == component { format!("'{path}' belongs to {component}: {reason}") } else { format!("'{path}' is {component}, built from {named}: {reason}") });
 					}
 					// A changed component the graph has never heard of is a rename that got half
 					// done. The closure would return the seed alone and quietly reach nothing.

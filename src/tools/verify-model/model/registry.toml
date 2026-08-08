@@ -244,25 +244,35 @@ reason = "a thin launcher over src/boot; the harness it launches is harness.boot
 # point: an inventory that silently omits a crate looks exactly like an inventory that covers it.
 # Each entry is a debt with a named cause, not an exemption.
 
-[[host_tests_unrunnable]]
-crate = "services"
-reason = "the crate links `rt`, which defines the `panic_impl` lang item, and `cargo test` links `std`, which defines it too - E0152 before a single test runs. Its four suites (shell_language, graph_limits, executable, service_lifecycle) are pure logic and would run today if that logic lived in a library crate the binaries depend on; until then the in-guest suite is their only cover."
-
-# A whole configuration that cannot be host-tested, stated once with its cause.
+# Nothing is excluded here any more.
 #
-# Measured 2026-08-08: of the sixteen crates declaring `shared-image`, fifteen fail to build for
-# `cargo test` in it, all with the same error. Enabling the feature activates `ipc-client`, which
-# links `rt`, which defines `panic_impl` - and the test harness links `std`, which defines it too.
-# E0152, before a single test runs.
+# There WAS one entry - `services`, whose four suites of pure logic could not be built for
+# `cargo test` because every binary in that crate links `rt`, and `rt`'s `panic_impl` collides with
+# the `std` the test harness needs. It was recorded here with its cause rather than left as a
+# silent gap, and then fixed the way the record said it should be: the logic moved to
+# `user/services/logic`, a crate that links no runtime, and its 24 tests now run on the host in
+# milliseconds. The section stays because the next such debt should be written down the same way.
+# A whole configuration that cannot be host-tested, stated once with its cause - and, measured, with
+# nothing lost by it.
 #
-# So for those crates the shipping configuration is not merely untested, it is currently
-# UNTESTABLE on the host, and the dependency graph is where the configuration dimension pays off
-# rather than the suite. Splitting the codec/protocol logic from the freestanding runtime would
-# make these runnable; until then the in-guest suite is their only cover.
+# Of the sixteen crates declaring `shared-image`, fifteen fail to build for `cargo test` in it, all
+# with the same error: the feature activates `ipc-client`, which links `rt`, whose `panic_impl`
+# collides with the `std` the harness needs. E0152, before a test runs.
+#
+# What that costs was then measured rather than assumed, and the answer is: nothing. All 94 tests in
+# those crates are wire-stability assertions over generated codec code, and NOT ONE of them is
+# behind `channel-client-impl` or any other feature. Running them again under `shared-image` would
+# execute the same assertions over the same bytes. The feature adds client method implementations,
+# and those carry no tests in any configuration - which is a coverage gap in the glue, not a
+# configuration that is going untested, and it belongs to whoever writes those tests rather than to
+# the selector.
+#
+# So this rule keeps fifteen permanently-red keys out of the catalog and loses no coverage doing it.
+# If a test is ever written that IS feature-gated, this entry becomes wrong and must go.
 [[host_configuration_unrunnable]]
 configuration = "shared-image"
 when_static_reach = "rt"
-reason = "the shipping feature set links rt, whose panic_impl collides with the std that `cargo test` needs (E0152)"
+reason = "the shipping feature set links rt, whose panic_impl collides with the std that `cargo test` needs (E0152) - and every test in the affected crates is configuration-independent, so the variant would assert nothing new"
 
 # ---------------------------------------------------------------------------------------------
 # Components that select everything
@@ -287,6 +297,26 @@ reason = "the builders, packagers and gates; mkpackages' output IS the system vo
 [[selects_everything]]
 component = "harness.scripts"
 reason = "the entry points and lib.sh, which is where the selection itself is spelled"
+
+# The host tool crates that produce or describe what ships. They live under `src/tools`, which is
+# already declared harness.tools - but each is its OWN crate, and crate containment is a longer
+# prefix than the directory rule, so containment wins and they would fall out of the escalation.
+#
+# That is not hypothetical: `src/tools/mkpackages/src/main.rs` resolved to the `mkpackages` crate and
+# planned a scoped run. It is the same defect an earlier review found in `lib.sh` - "change the thing
+# that builds the system, test nothing" - reappearing in the model that replaced it, and it was found
+# by the test that enumerates these triggers rather than by anybody noticing.
+[[selects_everything]]
+component = "mkpackages"
+reason = "its output IS the system volume; a change here changes every file the image ships"
+
+[[selects_everything]]
+component = "system-manifest"
+reason = "a build-dependency of the kernel and CoreServices whose build scripts generate their source from it"
+
+[[selects_everything]]
+component = "lsidl-gen"
+reason = "regenerates all sixteen protocol crates, so a change to it can change every wire message"
 
 [[selects_everything]]
 component = "verify-model"
@@ -323,6 +353,58 @@ reason = "the shared runtime every dynamic executable starts through"
 [[selects_everything]]
 component = "product"
 reason = "stamped into every artifact through cargo:rustc-env"
+
+# ---------------------------------------------------------------------------------------------
+# Risk classes: written now, applied later
+#
+# `src/kernel` is one bucket outside its per-target arch trees, and a timer change should not cost
+# 205 tests on three architectures forever. But narrowing a kernel subsystem is where a selector is
+# most likely to be WRONG - these are the layers every other layer stands on, and a missed edge here
+# does not show up as a slow suite, it shows up as a shipped fault.
+#
+# So the classes are written down and NOT applied. Each subsystem below still selects everything,
+# because `kernel` is on the list above and these paths are inside it. What changes when the
+# evidence exists is one line: give the subsystem an `[[ownership]]` rule of its own and take it off
+# the escalation. The `evidence` field says what has to be true first, and `verify-model check`
+# prints the table so the debt is visible rather than remembered.
+#
+# The driver crate needed the same treatment and did not need a rule: `[[bin]]` entries already make
+# every driver its own component, so a keyboard change reaches `bin.usb_hid` and boots one target.
+
+[[risk_class]]
+path = "src/kernel/mem"
+class = "foundational"
+evidence = "shadow-clean on all three targets for allocator and page-table changes; a missed edge here is a use-after-free that surfaces somewhere else entirely"
+
+[[risk_class]]
+path = "src/kernel/object"
+class = "foundational"
+evidence = "shadow-clean across capability, channel, handle and domain changes; every test in the suite holds handles, so the blast radius is genuinely wide"
+
+[[risk_class]]
+path = "src/kernel/sched"
+class = "foundational"
+evidence = "shadow-clean including SMP and preemption changes; scheduling faults present as unrelated timeouts"
+
+[[risk_class]]
+path = "src/kernel/syscall"
+class = "contract"
+evidence = "shadow-clean plus the ABI unchanged; this is the boundary every userspace test crosses"
+
+[[risk_class]]
+path = "src/kernel/elf.rs"
+class = "narrowable"
+evidence = "shadow-clean for loader changes; the loader is exercised by a nameable set of tests rather than by all of them"
+
+[[risk_class]]
+path = "src/kernel/smp"
+class = "narrowable"
+evidence = "shadow-clean for core-bring-up changes"
+
+[[risk_class]]
+path = "src/kernel/test_suites"
+class = "narrowable"
+evidence = "a test file reaches the tests in it; once `covers` is on every test this is derivable rather than declarable, and this row disappears"
 
 # ---------------------------------------------------------------------------------------------
 # Declared edges

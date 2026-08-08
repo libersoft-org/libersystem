@@ -279,6 +279,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-logic"
+version = "0.0.0"
+dependencies = [
+ "abi",
+ "bootproto",
+]
+
+[[package]]
 name = "services"
 version = "0.0.0"
 dependencies = [
@@ -290,6 +298,7 @@ dependencies = [
  "pix",
  "proto",
  "rt",
+ "service-logic",
  "storage-proto",
  "surface",
  "system-manifest",

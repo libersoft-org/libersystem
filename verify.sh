@@ -19,8 +19,8 @@ PLANNER_MANIFEST="$SRC_DIR/tools/verify-model/Cargo.toml"
 
 help() {
 	usage_and_exit <<EOF
-usage: verify.sh [--for-change | --for PATH[,PATH...] | --for-range A..B | --release]
-                 [--plan] [--explain] [--json] [--catalog] [--model-hash]
+usage: verify.sh [--for-change | --for PATH[,PATH...] | --for-range A..B | --release | --sweep]
+                 [--plan] [--explain] [--json] [--shadow] [--catalog] [--model-hash] [--age]
 
 Works out what a change needs verified and runs exactly that. With no arguments: --for-change.
 
@@ -28,6 +28,8 @@ Works out what a change needs verified and runs exactly that. With no arguments:
   --for PATH       plan for these paths instead of asking git
   --for-range A..B plan for the paths a commit range touched
   --release        the release gate: build all, check all, boot all three, no optimisation applied
+  --sweep          the whole suite on every target at one immutable revision, in a git worktree
+  --shadow         run the FULL suite and compare it against what this change would have scoped
   --plan           print the plan and run nothing
   --explain        print why every item is in the plan
   --json           the plan as JSON, for anything that is not a person
@@ -77,6 +79,14 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--release)
 		mode=release
+		shift
+		;;
+	--sweep)
+		mode=sweep
+		shift
+		;;
+	--shadow)
+		action=shadow
 		shift
 		;;
 	--plan)
@@ -146,6 +156,33 @@ if [[ "$mode" == release ]]; then
 	exit 0
 fi
 
+if [[ "$mode" == sweep ]]; then
+	# One revision, every target, the whole suite - and pinned, which is the part that needs a
+	# worktree rather than discipline. An emulated sweep here takes tens of minutes to hours and the
+	# tree changes while it does, so a sweep run in place judges a system that no longer exists by
+	# the time it answers.
+	#
+	# This is NOT what the age bound does, and the difference is the reason both exist. Stale keys
+	# joining the next manual run spreads coverage over many different trees: some tests on Monday's
+	# commit, others on Wednesday's. That satisfies a bound while never once establishing that ONE
+	# revision passes everything.
+	[[ -z "$(git status --porcelain 2>/dev/null)" ]] || die "--sweep needs a clean tree: it pins a REVISION, and a dirty one is not a revision"
+	revision="$(git rev-parse HEAD)"
+	worktree="$BUILD_DIR/sweep/$revision"
+	note "snapshot sweep at $revision"
+	rm -rf "$worktree"
+	git worktree add --detach "$worktree" "$revision" >/dev/null 2>&1 || die "could not create a worktree at $worktree"
+	# shellcheck disable=SC2064
+	trap "git worktree remove --force '$worktree' >/dev/null 2>&1 || true" EXIT
+	status=0
+	(cd "$worktree" && ./build.sh --arch all && ./check.sh && ./test.sh --arch all) || status=$?
+	if [[ "$status" -ne 0 ]]; then
+		die "the snapshot sweep of $revision failed (exit $status); the worktree is at $worktree until this shell exits"
+	fi
+	note "snapshot sweep passed: $revision, every target, whole suite"
+	exit 0
+fi
+
 case "$action" in
 catalog)
 	exec cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- catalog
@@ -191,6 +228,35 @@ if [[ "$action" == json || "$action" == plan ]]; then
 	fi
 	[[ -s "$rendered" ]] || planner_failed "the planner produced no output"
 	cat "$rendered"
+	exit 0
+fi
+
+if [[ "$action" == shadow ]]; then
+	# DRY shadow: the scoped set is COMPUTED and never run. One boot serves both answers, which is
+	# the whole economy of it - the expensive version runs the selection and then the full suite,
+	# and against a 6104-second riscv64 sweep that second boot is not cosmetic.
+	#
+	# What this cannot validate is the execution mechanism itself - test ordering, state leaking
+	# between selected tests, the selection plumbing. That needs a run of S, and it is sampled
+	# rather than routine.
+	digest_before="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
+	targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- booted --stdin)" || planner_failed "the planner could not name the targets"
+	[[ -n "$targets" ]] || planner_failed "the plan named no target to sweep"
+	note "shadow: full sweep on ${targets//$'\n'/ }, compared against a selection that is not run"
+	for target in $targets; do
+		./test.sh --arch "$target" || note "the $target sweep did not pass - the comparison below reads its log anyway, which is the point"
+		log="$(find "$BUILD_DIR/logs/test" -name "$target-*-guest.log" -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)"
+		[[ -n "$log" ]] || die "no $target guest log to compare against"
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --guest-log "../$log" --arch "$target") || shadow_failed=1
+	done
+	# A comparison across a tree that moved compares two different systems. The digest is the model's
+	# rather than the file set's because that is what the verdict is filed against.
+	digest_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
+	if [[ "$digest_before" != "$digest_after" ]]; then
+		die "the model changed while the sweep ran ($digest_before -> $digest_after); the comparison judged two different systems and is void"
+	fi
+	[[ -z "${shadow_failed:-}" ]] || die "shadow reported a candidate miss - confirm it before charging it to the selector"
+	note "shadow: no evidence against the selection"
 	exit 0
 fi
 
@@ -278,3 +344,16 @@ if ((${#failed[@]} > 0)); then
 	die "${#failed[@]} of $count step(s) failed: ${failed[*]}"
 fi
 note "all $count step(s) passed"
+
+# What this run did NOT cover, said out loud rather than left to be noticed.
+#
+# There is no CI, so "on a timer" schedules nothing. The alternative the milestone settles on is that
+# stale keys join the next manual run - but joining them silently would turn a two-minute scoped run
+# into a two-hour one without asking, and the same measurement that justifies the architecture policy
+# says an emulated boot is 2877 s. So the runner REPORTS, every time, and names the command; acting
+# on it is a decision with a price tag and belongs to whoever is at the terminal.
+stale="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- age 2>/dev/null | head -1 || true)"
+if [[ -n "$stale" ]]; then
+	note "age: $stale"
+	note "     ./verify.sh --age  to see them, ./verify.sh --sweep  to clear them at one revision"
+fi

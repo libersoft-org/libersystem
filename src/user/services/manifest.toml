@@ -47,6 +47,10 @@ owner = "kernel"
 path = "kernel"
 
 [[sources]]
+owner = "service-logic"
+path = "user/services/logic"
+
+[[sources]]
 owner = "loader"
 path = "loader"
 
@@ -1826,7 +1830,10 @@ providers = ["base-proto", "process-proto", "ipc-client", "wire", "lsrt"]
 
 [[libraries]]
 name = "service-util"
-owner = "services"
+# Built from `service-logic`, not from `services`. This .lslib IS those four pure modules - it
+# exports `executable::*` and `shell_language::*` to the shell, ConsoleService and ProcessService -
+# and they moved to a crate that links no runtime so their suites could run on the host at all.
+owner = "service-logic"
 destination = "lib/service/service-util.lslib"
 features = []
 providers = ["lsrt"]

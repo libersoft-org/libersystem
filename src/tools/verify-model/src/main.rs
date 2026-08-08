@@ -25,6 +25,8 @@ usage: verify-model <command> [options]
   graph [--component NAME]            the component graph, or one component's edges
   owner PATH...                       which component owns each path, and why
   check                               the model's own gates: ownership, graph and catalog
+  shadow --guest-log F --arch A       compare a full sweep against what a change would have scoped
+  trust [--grant COMPONENT]           what is TRUSTED under the current model, and why not
   age                                 which keys have not run inside the window
   record --keys-file F [--failed]     record a step's outcome against the keys it discharged
   model-hash                          the hash TRUSTED evidence is bound to
@@ -59,6 +61,9 @@ fn run() -> Result<ExitCode, String> {
 	let mut quiet = false;
 	let mut from_stdin = false;
 	let mut keys_file: Option<String> = None;
+	let mut guest_log: Option<String> = None;
+	let mut architecture: Option<String> = None;
+	let mut grant: Option<String> = None;
 	let mut passed = true;
 	let mut seconds = 0.0f64;
 	let mut positional: Vec<String> = Vec::new();
@@ -79,6 +84,18 @@ fn run() -> Result<ExitCode, String> {
 			// Accepted and redundant on purpose: the runner spells the outcome at the call site
 			// either way, so a step's result is readable there rather than implied by an absence.
 			"--passed" => passed = true,
+			"--guest-log" => {
+				index += 1;
+				guest_log = Some(arguments.get(index).ok_or("--guest-log needs a path")?.clone());
+			}
+			"--arch" => {
+				index += 1;
+				architecture = Some(arguments.get(index).ok_or("--arch needs a value")?.clone());
+			}
+			"--grant" => {
+				index += 1;
+				grant = Some(arguments.get(index).ok_or("--grant needs a component")?.clone());
+			}
 			"--keys-file" => {
 				index += 1;
 				keys_file = Some(arguments.get(index).ok_or("--keys-file needs a path")?.clone());
@@ -102,7 +119,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "age" | "record" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "booted" | "age" | "record" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
 	{
 		command = positional.remove(0);
 	}
@@ -169,6 +186,92 @@ fn run() -> Result<ExitCode, String> {
 			Ok(ExitCode::SUCCESS)
 		}
 		"check" => self_check(&model),
+		// Which targets a change must be booted on, one per line. A separate command because the
+		// shell should not be grepping architecture names out of JSON: every decision that needs the
+		// model belongs in the model, and a fragile parse in `verify.sh` is a decision made twice.
+		"booted" => {
+			let ownership = model.ownership();
+			let planner = Planner { registry: &model.registry, graph: &model.graph, ownership: &ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone() };
+			let plan = if paths.is_empty() { planner.full_plan(Vec::new(), BTreeSet::new(), BTreeSet::new(), vec![String::from("no changed paths were given")], Vec::new()) } else { planner.plan(&paths) };
+			for architecture in &plan.architectures_booted {
+				println!("{architecture}");
+			}
+			Ok(ExitCode::SUCCESS)
+		}
+		// DRY shadow: the scoped set is COMPUTED and never run; the full sweep that already
+		// happened is what it is compared against. One boot, two answers.
+		"shadow" => {
+			let guest_log = guest_log.ok_or("shadow needs --guest-log")?;
+			let architecture = architecture.ok_or("shadow needs --arch")?;
+			if paths.is_empty() {
+				return Err(String::from("shadow needs the change it is validating (--paths or --stdin); comparing against nothing proves nothing"));
+			}
+			let text = std::fs::read_to_string(&guest_log).map_err(|error| format!("{guest_log}: {error}"))?;
+			let results = verify_model::shadow::parse_guest_log(&text);
+			let ownership = model.ownership();
+			let planner = Planner { registry: &model.registry, graph: &model.graph, ownership: &ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone() };
+			let plan = planner.plan(&paths);
+			let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
+			let history = verify_model::history::History::load(&repo_root)?;
+			let comparison = verify_model::shadow::compare(&selected, &results, &architecture, &history);
+
+			println!("shadow ({architecture}): {:?}", comparison.verdict);
+			println!("  {}", comparison.reason);
+			println!("  {} test(s) ran; {} of them were in the scoped selection", comparison.ran, comparison.scoped);
+			for key in &comparison.inside_failures {
+				println!("  FAILED (selected): {key}");
+			}
+			for key in &comparison.outside_failures {
+				let flake = if comparison.previously_failed.contains(key) { "  <- has failed before; a flake candidate, not yet a missed edge" } else { "" };
+				println!("  FAILED (not selected): {key}{flake}");
+			}
+			if comparison.verdict == verify_model::shadow::Verdict::CandidateMiss {
+				println!();
+				println!("A candidate is not a finding. Before charging this to the selector:");
+				println!("  1. re-run the failing test on HEAD - this tree has one on record that failed three times and then passed twice with no change;");
+				println!("  2. if it fails again, run it on the BASE revision;");
+				println!("  3. only a reproducible HEAD-ONLY failure is a missed edge.");
+			}
+
+			// Filed with what it compared. A record that cannot say which tree and which model it
+			// judged is a record that will be believed about a different system later.
+			let mut log = verify_model::shadow::Log::load(&repo_root);
+			log.schema = 1;
+			log.records.push(verify_model::shadow::Record { architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
+			log.save(&repo_root)?;
+			Ok(if comparison.verdict == verify_model::shadow::Verdict::CandidateMiss { ExitCode::FAILURE } else { ExitCode::SUCCESS })
+		}
+		"trust" => {
+			let hash = model.model_hash();
+			let mut store = verify_model::trust::Store::load(&repo_root);
+			let dropped = store.prune(&hash);
+			for component in &dropped {
+				println!("demoted {component} to SHADOW: the model hash moved, so the evidence it held no longer describes what runs");
+			}
+			let log = verify_model::shadow::Log::load(&repo_root);
+			if let Some(component) = grant {
+				match store.evaluate(&component, &hash, &log) {
+					Ok((clean, architectures)) => {
+						store.grant(&component, &hash, clean, architectures, verify_model::history::now());
+						println!("{component} is TRUSTED under model {hash}");
+					}
+					Err(reason) => {
+						println!("{component} stays in SHADOW: {reason}");
+						store.save(&repo_root)?;
+						return Ok(ExitCode::FAILURE);
+					}
+				}
+			}
+			store.save(&repo_root)?;
+			println!("model {hash}");
+			if store.certificates.is_empty() {
+				println!("nothing is TRUSTED yet - every component's scoped answers are validated against a full sweep before they are believed");
+			}
+			for (component, level) in store.summary(&hash) {
+				println!("  {component}: {level:?}");
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		// What has run and what has gone stale, over the keys the catalog says exist.
 		"age" => {
 			let history = verify_model::history::History::load(&repo_root)?;
@@ -443,6 +546,19 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 			if *count * 2 < richest {
 				failures.push(format!("{architecture} enumerated only {count} kernel tests against {richest} elsewhere - that is a discovery failure, not a target with fewer tests"));
 			}
+		}
+	}
+
+	// A risk class naming a path that no longer exists is a plan for a tree that has moved on.
+	for rule in &model.registry.risk_classes {
+		if !model.repo_root.join(&rule.path).exists() {
+			failures.push(format!("risk class names '{}', which is not in the tree", rule.path));
+		}
+	}
+	if !model.registry.risk_classes.is_empty() {
+		println!("verify-model: {} kernel subsystem(s) are declared narrowable and NOT narrowed - they still select everything:", model.registry.risk_classes.len());
+		for rule in &model.registry.risk_classes {
+			println!("    {:<28} {:<14} needs: {}", rule.path, rule.class, rule.evidence);
 		}
 	}
 

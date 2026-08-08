@@ -565,7 +565,11 @@ fn library_category<'a>(name: &str, owner: &str, source: &'a str) -> Option<&'a 
 		("wire", "wire", "wire") => Some("ipc"),
 		("wasm", "wasm", "wasm") => Some("component"),
 		("term", "term", "term") => Some("terminal"),
-		("service-util", "services", "user/services/core") => Some("service"),
+		// Built from `service-logic` rather than from the service binaries. Those four modules -
+		// executable naming, shell parsing, graph bounds, shutdown ordering - are pure functions of
+		// their inputs, and they lived in a crate whose every binary links `rt`, so `cargo test`
+		// could not build them at all. Splitting them out is what put their 24 tests in a gate.
+		("service-util", "service-logic", "user/services/logic") => Some("service"),
 		_ => None,
 	}
 }
