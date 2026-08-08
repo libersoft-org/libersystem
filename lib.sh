@@ -183,8 +183,11 @@ component_tags() {
 	# test nothing" is exactly the false green this whole mechanism exists to prevent, and it
 	# contradicted M0148's own invariant that build and image tooling select everything.
 	#
-	# What is left here is documentation and the gates themselves: a gate that breaks fails loudly on
-	# its own, and a Markdown file changes no byte of any artifact.
+	# What is left here is documentation and the gates themselves. A Markdown file changes no byte of
+	# any artifact, and booting a guest is not how a validation script's correctness is judged - what
+	# judges it is a fixture it must REJECT. `exit 0` at the top of a checker breaks it
+	# catastrophically and silently, so M0148 owes each gate its negative fixtures; a QEMU run would
+	# not have caught that either.
 	case "$path" in
 	docs/* | *.md) return 1 ;;
 	src/tools/check-*.sh | src/boot/check-*.sh) return 1 ;;
