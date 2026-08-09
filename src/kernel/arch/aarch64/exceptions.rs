@@ -293,7 +293,7 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 	//
 	// Offset 240 holds x30 and 248 holds the saved ELR, as the `stp` pair above lays them out.
 	const FRAME_ELR: usize = 248 / 8;
-	if let Some(fixup) = crate::extable::fixup_for(elr) {
+	if let Some(fixup) = crate::extable::fixup_for(elr, far) {
 		unsafe { *frame.add(FRAME_ELR) = fixup };
 		return;
 	}

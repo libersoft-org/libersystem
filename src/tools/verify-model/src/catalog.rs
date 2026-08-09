@@ -89,7 +89,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 14] = [
+const GATES: [(&str, &str); 15] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -102,6 +102,9 @@ const GATES: [(&str, &str); 14] = [
 	("malformed-symbol-relocation", "harness.tools"),
 	("identity-note", "harness.tools"),
 	("volume-layout", "manifest"),
+	// Its subject is the documentation rather than any built thing, so it belongs to the harness -
+	// which also means every change selects it, and it costs milliseconds.
+	("milestone-index", "harness.tools"),
 	("verify-model", "verify-model"),
 	("verify-model-tests", "verify-model"),
 ];

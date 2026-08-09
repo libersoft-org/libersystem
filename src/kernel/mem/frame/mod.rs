@@ -10,12 +10,20 @@
 // The run table has two lives. Before the heap exists (the frame allocator is
 // what brings the heap up) it is a small fixed seed array holding the boot
 // memory-map regions. Right after heap::init, mem::init upgrades it to a
-// heap-backed Vec, so fragmentation is bounded by memory rather than by a
-// compile-time table. Growth is safe in every context the allocator runs in:
-// the exception paths (demand-paged stack growth) only ever allocate, which
-// never grows the table, and the kernel heap never allocates frames at runtime
-// (its window is mapped once at boot), so growing the Vec under the frame lock
-// cannot re-enter this allocator.
+// heap-backed Vec whose capacity is reserved ONCE, outside this lock, and never
+// grown again.
+//
+// Never grown, because growing it here would deadlock. This comment used to say
+// the opposite - that the kernel heap never allocates frames at runtime, so
+// growing the Vec under the frame lock was safe - and it was wrong: `heap::grow`
+// calls `frame::allocate` whenever a request does not fit its mapped window.
+// Every allocation this file performs therefore happens with the lock RELEASED,
+// and the rule has been broken twice since it was written, each time presenting
+// as a core spinning forever rather than as anything that names this file.
+//
+// From `upgrade_to_heap` onward the run table is empty and the buddy allocator
+// in `buddy.rs` answers everything; the table remains only as the fallback for a
+// machine whose bitmap could not be reserved.
 //
 // A free is checked against the pool: a span overlapping an existing free run is
 // a double free and is refused loudly, because honoring it would let the same
@@ -180,6 +188,36 @@ impl FrameAllocator {
 		true
 	}
 
+	// The mirror of `check_owned_free`, and the one the run table never needed: is this frame
+	// already out on loan at the moment we are about to hand it out AGAIN?
+	//
+	// The run table could not hand the same frame out twice - a frame was in exactly one run and
+	// leaving the run removed it. A bitmap allocator can, and the failure is silent: two owners
+	// write the same page, and whoever reads it second finds the other's bytes. That surfaces
+	// arbitrarily far away - as a corrupt ELF header, a filesystem that fails its own checksum, a
+	// hang - and none of those point back here.
+	//
+	// So the record answers it directly, in debug builds, at the instant it happens.
+	#[cfg(debug_assertions)]
+	fn check_not_owned(&self, base: u64, pages: u64) -> bool {
+		let Some(bits) = self.owned.as_ref() else { return true };
+		for page in 0..pages {
+			let phys = base + page * PAGE_SIZE;
+			let Some(index) = phys.checked_sub(self.owned_base).map(|offset| offset / PAGE_SIZE).filter(|index| *index < self.owned_frames) else {
+				continue;
+			};
+			if bits[(index / 64) as usize] & (1 << (index % 64)) != 0 {
+				return false;
+			}
+		}
+		true
+	}
+
+	#[cfg(not(debug_assertions))]
+	fn check_not_owned(&self, _base: u64, _pages: u64) -> bool {
+		true
+	}
+
 	// The current run table, whichever backing it lives in.
 	fn runs(&self) -> &[Run] {
 		match &self.heap {
@@ -272,8 +310,16 @@ impl FrameAllocator {
 				crate::serial_println!("frame: WARNING: double free refused - {pages} page(s) at {base:#x} are already free");
 				return;
 			}
-			self.buddy.as_mut().expect("checked").free_span(base, pages);
-			self.free_count += pages as usize;
+			let taken = self.buddy.as_mut().expect("checked").free_span(base, pages);
+			self.free_count += taken as usize;
+			if taken != pages {
+				// The buddy could not frame all of it - the span reaches outside its extent. The
+				// pages are gone: marked not-owned above and not free below. Counted and said,
+				// because `free_count` claiming memory the bitmap does not hold is how a pool comes
+				// to report free frames that no allocation can find.
+				LOST_PAGES.fetch_add(pages - taken, core::sync::atomic::Ordering::AcqRel);
+				crate::serial_println!("frame: WARNING: {} of {pages} page(s) at {base:#x} fell outside the buddy's extent and are LOST", pages - taken);
+			}
 			return;
 		}
 		// Refuse a span this allocator did not hand out before touching the run table, so a
@@ -332,7 +378,27 @@ impl FrameAllocator {
 	// Take one page off the head of the first run.
 	fn take_one(&mut self) -> Option<u64> {
 		if let Some(buddy) = self.buddy.as_mut() {
+			// The injection frees the block straight back, so the SAME address comes out of the
+			// next `alloc` while this one is still being handed to a caller. That is precisely the
+			// state a mis-set bit produces, reached without a mis-set bit.
+			//
+			// The credit below is not bookkeeping tidiness. Without it the injected free leaves the
+			// buddy holding one more page than `free_count` believes, forever - and the test that
+			// exhausts the pool then subtracts past zero, several tests later, in a place that has
+			// nothing to do with this. An injection that leaves the system inconsistent tests the
+			// inconsistency instead of the thing it was aimed at.
 			let base = buddy.alloc(0)?;
+			let duplicated = injected_duplicate();
+			if duplicated {
+				buddy.free(base, 0);
+			}
+			if duplicated {
+				self.free_count += 1;
+			}
+			if !self.check_not_owned(base, 1) {
+				crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {base:#x}, which is already on loan");
+				DOUBLE_ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+			}
 			self.free_count -= 1;
 			self.mark_owned(base, 1, true);
 			return Some(base);
@@ -360,6 +426,10 @@ impl FrameAllocator {
 	fn take_contiguous(&mut self, pages: u64) -> Option<u64> {
 		if let Some(buddy) = self.buddy.as_mut() {
 			let base = buddy.alloc_contiguous(pages)?;
+			if !self.check_not_owned(base, pages) {
+				crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {pages} page(s) at {base:#x}, part of which is already on loan");
+				DOUBLE_ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+			}
 			self.free_count -= pages as usize;
 			self.mark_owned(base, pages, true);
 			return Some(base);
@@ -431,35 +501,60 @@ pub fn init(regions: &[MemRegion]) {
 // while the frame lock is held cannot re-enter this allocator - the kernel heap
 // never allocates frames at runtime (its window is mapped once at boot).
 pub fn upgrade_to_heap() {
-	// The capacity is reserved ONCE, here, outside the allocator lock, and the table never
-	// grows again. That is what breaks the cycle: `insert_at` running under the frame lock
-	// used to be able to grow this `Vec`, which calls the global allocator, whose `grow`
-	// calls `frame::allocate` - straight back into the lock this thread already holds.
+	// THE BUDDY FIRST, and the run table only if the buddy cannot be built.
 	//
-	// The comment on this module said the heap "never allocates frames at runtime", and
-	// `heap::grow` is reached from `alloc` whenever a request does not fit, so it was not
-	// true. Rather than argue about when the heap grows, the table simply stops being able
-	// to ask.
+	// It used to be the other way round: reserve a worst-case run table, and if that reservation
+	// failed, print a line and return - before the buddy's metadata had been sized at all. The two
+	// are not the same size. On a 4 GiB machine the run table is `worst_case_runs` entries, about
+	// 8 MiB, and the buddy's bitmap is 383 KiB; so the one machine where the run table cannot be
+	// reserved is a machine where the buddy easily could be, and it was the one machine that never
+	// got one. It came up on the 128-run seed table instead - where a free CAN be silently lost,
+	// which is the defect this whole milestone exists to remove.
 	//
-	// Sized for the WORST CASE the pool can reach rather than for what a healthy one looks like,
-	// which is what makes a free unable to fail. See `worst_case_runs`.
+	// Reserving the buddy first also means the run table is never allocated on the path that
+	// succeeds, so the 8 MiB is not merely emptied afterwards, it is never taken.
 	//
-	// Both tables are reserved BEFORE the lock is taken, not under it. Reserving calls the
-	// global allocator, whose `grow` calls `frame::allocate` - straight back into this lock.
-	let wanted = worst_case_runs(ALLOCATOR.lock().total_count);
-	let mut runs = Vec::new();
-	if runs.try_reserve_exact(wanted).is_err() {
-		crate::serial_println!("frame: could not reserve a run table for {wanted} runs; staying on the seed table, where a free CAN be lost");
-		return;
+	// Every allocation here happens with the lock RELEASED. Reserving calls the global allocator,
+	// whose `grow` calls `frame::allocate`, which takes the lock this thread would be holding; on a
+	// SpinLock that is a core spinning forever. The rule has been broken twice.
+	//
+	// The extent can only SHRINK while the metadata is being reserved - reserving takes frames, it
+	// never adds them - so a buddy sized from this read still covers the pool that is seeded into it
+	// under the lock below.
+	let (extent, total, owned_words) = {
+		let allocator = ALLOCATOR.lock();
+		let runs = allocator.runs();
+		let extent = runs.first().zip(runs.last()).map(|(first, last)| (first.base, (last.base + last.pages * PAGE_SIZE - first.base) / PAGE_SIZE));
+		#[cfg(debug_assertions)]
+		let words = (allocator.owned_frames as usize).div_ceil(64);
+		#[cfg(not(debug_assertions))]
+		let words = 0usize;
+		(extent, allocator.total_count, words)
+	};
+	let buddy = extent.and_then(|(base, pages)| Buddy::new(base, pages));
+
+	// The run table, reserved ONLY as the fallback. Sized for the worst case the pool can reach
+	// rather than for what a healthy one looks like - see `worst_case_runs` - because that is what
+	// makes a free unable to fail on the path that has to use it.
+	let mut runs: Option<Vec<Run>> = None;
+	if buddy.is_none() {
+		let wanted = worst_case_runs(total);
+		let mut table = Vec::new();
+		if table.try_reserve_exact(wanted).is_err() {
+			crate::serial_println!("frame: could not size the buddy allocator's metadata NOR reserve a run table for {wanted} runs; staying on the seed table, where a free CAN be lost");
+			return;
+		}
+		crate::serial_println!("frame: could not size the buddy allocator's metadata; falling back to a worst-case run table of {wanted} runs");
+		runs = Some(table);
 	}
+
 	// The debug ownership record: one bit per frame of the pool, 128 KiB on a 4 GiB machine,
 	// in debug builds only. `owned_frames` was fixed at init and does not change, so sizing
 	// this outside the lock is sound.
 	#[cfg(debug_assertions)]
 	let bits = {
-		let words = (ALLOCATOR.lock().owned_frames as usize).div_ceil(64);
 		let mut bits: Vec<u64> = Vec::new();
-		if bits.try_reserve_exact(words).is_err() {
+		if bits.try_reserve_exact(owned_words).is_err() {
 			crate::serial_println!("frame: could not reserve the ownership record; frees will not be checked against it");
 			Vec::new()
 		} else {
@@ -467,31 +562,21 @@ pub fn upgrade_to_heap() {
 			// exactly right: whatever is not free at this moment was handed out before the
 			// record existed - the heap window, the boot page tables - and freeing it later
 			// is legitimate, so it has to read as owned.
-			bits.resize(words, u64::MAX);
+			bits.resize(owned_words, u64::MAX);
 			bits
 		}
 	};
-	// The buddy's metadata, sized from the pool the memory map described and reserved ONCE.
-	//
-	// Its extent spans from the lowest usable frame to the highest, holes included: a hole is
-	// simply never freed in, so it reads as allocated forever and no block can merge across it.
-	// That is what lets one buddy cover a memory map with gaps in it.
-	//
-	// Reserved outside the lock for the reason the run table is - reserving calls the global
-	// allocator, whose `grow` calls `frame::allocate`, straight back into this lock.
-	let extent = {
-		let allocator = ALLOCATOR.lock();
-		let runs = allocator.runs();
-		runs.first().zip(runs.last()).map(|(first, last)| (first.base, (last.base + last.pages * PAGE_SIZE - first.base) / PAGE_SIZE))
-	};
-	let buddy = extent.and_then(|(base, pages)| Buddy::new(base, pages));
+	#[cfg(not(debug_assertions))]
+	let _ = owned_words;
 
 	let mut allocator = ALLOCATOR.lock();
 	if allocator.heap.is_some() || allocator.buddy.is_some() {
 		return;
 	}
-	runs.extend_from_slice(&allocator.seed[..allocator.seed_len]);
-	allocator.heap = Some(runs);
+	if let Some(mut table) = runs {
+		table.extend_from_slice(&allocator.seed[..allocator.seed_len]);
+		allocator.heap = Some(table);
+	}
 	#[cfg(debug_assertions)]
 	if !bits.is_empty() {
 		allocator.owned = Some(bits);
@@ -501,30 +586,34 @@ pub fn upgrade_to_heap() {
 		}
 	}
 
-	// Move the pool into the buddy and empty the run table behind it. From here every allocation
+	// Move the pool into the buddy and empty the seed table behind it. From here every allocation
 	// and every free goes through the bitmap, and a free cannot be lost because there is no table
 	// to fill - which is the property M0150 exists for.
-	//
-	// A buddy that could not be built leaves the run table in place, worst-case sized, which is the
-	// weaker version of the same guarantee rather than no guarantee. Said out loud, because
-	// "quietly running the old allocator" is the kind of fallback nobody notices for a year.
-	match buddy {
-		Some(mut buddy) => {
-			let runs: Vec<Run> = allocator.runs().to_vec();
-			for run in &runs {
-				buddy.free_span(run.base, run.pages);
-			}
-			let free = buddy.free_pages();
-			let metadata = buddy.metadata_bytes();
-			allocator.buddy = Some(buddy);
-			allocator.free_count = free as usize;
-			if let Some(table) = allocator.heap.as_mut() {
-				table.clear();
-			}
-			allocator.seed_len = 0;
-			crate::serial_println!("memory: buddy allocator up - {free} free frames, {} KiB of metadata", metadata / 1024);
+	if let Some(mut buddy) = buddy {
+		// Seeded from the table as it stands NOW, under the lock that installs the result, with
+		// nothing allocating in between. `free_span` only writes bits that are already reserved,
+		// so this whole block is allocation-free - which is the property that makes it safe to do
+		// here rather than outside.
+		//
+		// A run that falls outside the extent cannot happen (the extent came from this same table
+		// and frames only leave it), but `free` refuses one rather than trusting the argument, and
+		// a refusal shows up as a shortfall in the count below.
+		let mut offered = 0u64;
+		let mut seeded = 0u64;
+		for index in 0..allocator.runs().len() {
+			let run = allocator.runs()[index];
+			seeded += buddy.free_span(run.base, run.pages);
+			offered += run.pages;
 		}
-		None => crate::serial_println!("frame: could not size the buddy allocator's metadata; staying on the run table"),
+		if seeded != offered {
+			crate::serial_println!("frame: the buddy took {seeded} of {offered} free frames; the rest fell outside its extent and are lost");
+		}
+		let free = buddy.free_pages();
+		let metadata = buddy.metadata_bytes();
+		allocator.buddy = Some(buddy);
+		allocator.free_count = free as usize;
+		allocator.seed_len = 0;
+		crate::serial_println!("memory: buddy allocator up - {free} free frames, {} KiB of metadata", metadata / 1024);
 	}
 }
 
@@ -597,6 +686,16 @@ pub fn lost_pages() -> u64 {
 
 static REFUSED_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LOST_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// Frames handed out while already on loan. Zero is the only acceptable value and a test says so.
+static DOUBLE_ALLOCATIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// How many times a frame was handed out to a second owner while the first still had it. The
+// allocator cannot repair this - by the time it is noticed both owners hold the address - so the
+// counter exists to make it VISIBLE rather than to recover, and the test that reads it is the only
+// thing between a bitmap bug and a corruption that surfaces somewhere else entirely.
+pub fn double_allocations() -> u64 {
+	DOUBLE_ALLOCATIONS.load(core::sync::atomic::Ordering::Acquire)
+}
 
 fn note_refused_free() {
 	REFUSED_FREES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -655,6 +754,32 @@ mod inject {
 		BUDGET[me()].store(usize::MAX, Ordering::Release);
 	}
 
+	// Make the NEXT allocation on this core hand out a frame that is already on loan.
+	//
+	// A bitmap allocator's worst failure is silent: nothing refuses, nothing warns, and two owners
+	// write the same page until one of them reads the other's bytes somewhere else entirely. The
+	// detector in `take_one` exists for exactly that, and a detector nothing ever triggers is a
+	// detector nobody knows is wired up - so this triggers it, deliberately, from one test.
+	//
+	// Per core and one-shot, for the same reason `fail_after` is: a global switch would be handing
+	// duplicate frames to the scheduler and the drivers for as long as it was armed.
+	#[allow(clippy::declare_interior_mutable_const)]
+	const NOT_DUPLICATING: AtomicBool = AtomicBool::new(false);
+	static DUPLICATE: [AtomicBool; crate::mem::tlb::MAX_CPUS] = [NOT_DUPLICATING; crate::mem::tlb::MAX_CPUS];
+
+	pub fn duplicate_next() {
+		DUPLICATE[me()].store(true, Ordering::Release);
+		EVER_ARMED.store(true, Ordering::Release);
+	}
+
+	// True once, for the core that armed it.
+	pub(super) fn should_duplicate() -> bool {
+		if !EVER_ARMED.load(Ordering::Acquire) {
+			return false;
+		}
+		DUPLICATE[me()].swap(false, Ordering::AcqRel)
+	}
+
 	// True when this allocation is one to refuse. `usize::MAX` is the disarmed value and is
 	// never decremented, so an un-armed core pays one relaxed load and nothing else.
 	pub(super) fn should_fail() -> bool {
@@ -673,7 +798,17 @@ mod inject {
 }
 
 #[cfg(test)]
-pub use inject::{disarm as stop_failing_allocations, fail_after as fail_allocations_after};
+pub use inject::{disarm as stop_failing_allocations, duplicate_next as duplicate_next_allocation, fail_after as fail_allocations_after};
+
+#[cfg(not(test))]
+fn injected_duplicate() -> bool {
+	false
+}
+
+#[cfg(test)]
+fn injected_duplicate() -> bool {
+	inject::should_duplicate()
+}
 
 #[cfg(not(test))]
 fn injected_failure() -> bool {
@@ -888,6 +1023,62 @@ const QUARANTINE_DRAIN: usize = 64;
 
 // Frames whose shootdown did not complete. Drained by the next one that does.
 static QUARANTINE: crate::sync::SpinLock<Vec<u64>> = crate::sync::SpinLock::new(Vec::new());
+
+// Compare the two views of the pool: every page the buddy calls free must be a page the ownership
+// record calls not-owned, and the other way round.
+//
+// They are built from the same run list and maintained by the same two functions, so a disagreement
+// is not a caller misbehaving - it is this file handing one page to two owners, or losing one to
+// nobody. Neither shows up where it happens. A bitmap allocator's worst failure is that both views
+// stay plausible while they drift apart, and the only cheap moment to notice is before anything has
+// been built on top of the drift.
+//
+// Returns the number of pages they disagree about and the first such address, or None when there is
+// nothing to compare - a release build, or a machine still on the run table.
+//
+// O(pages): 130k iterations on a 512 MB machine, a few milliseconds. Cheap enough for the test
+// runner to call after every test, which is what turns "something diverged during this boot" into
+// "this test diverged it".
+#[cfg(debug_assertions)]
+pub fn audit() -> Option<(u64, u64)> {
+	let allocator = ALLOCATOR.lock();
+	let buddy = allocator.buddy.as_ref()?;
+	let bits = allocator.owned.as_ref()?;
+	let (record_base, record_frames) = (allocator.owned_base, allocator.owned_frames);
+	// Counts first, and the walk only when they differ. The record's bits are a popcount over
+	// `record_frames / 64` words - 16k words on a 4 GiB machine - against a walk that asks
+	// `is_free_page` a million times and costs a second and a half per test. Every divergence this
+	// is looking for moves a page from one side to the other, so it moves the count too.
+	let mut owned_pages = 0u64;
+	for index in 0..record_frames {
+		if bits[(index / 64) as usize] & (1 << (index % 64)) != 0 {
+			owned_pages += 1;
+		}
+	}
+	let free_by_record = record_frames - owned_pages;
+	if free_by_record == buddy.free_pages() {
+		return None;
+	}
+	// They disagree. Now find WHERE, because the count alone names nothing.
+	let mut wrong = 0u64;
+	let mut first = 0u64;
+	for index in 0..record_frames {
+		let phys = record_base + index * PAGE_SIZE;
+		let owned = bits[(index / 64) as usize] & (1 << (index % 64)) != 0;
+		if buddy.is_free_page(phys) == owned {
+			if wrong == 0 {
+				first = phys;
+			}
+			wrong += 1;
+		}
+	}
+	(wrong > 0).then_some((wrong.max(1), first))
+}
+
+#[cfg(not(debug_assertions))]
+pub fn audit() -> Option<(u64, u64)> {
+	None
+}
 
 // How many frames are waiting on a shootdown that did not complete, for tests.
 #[cfg(test)]

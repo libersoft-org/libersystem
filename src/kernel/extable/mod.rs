@@ -72,7 +72,26 @@ fn entries() -> &'static [Entry] {
 // `None` means the fault is a genuine kernel bug and the caller must treat it as one. That is the
 // whole safety property: this must never turn an ordinary kernel fault into a silent resume, so it
 // matches the faulting address EXACTLY rather than by range.
-pub fn fixup_for(pc: u64) -> Option<u64> {
+// Recover only when the faulting ADDRESS is one userspace could have named.
+//
+// The PC match alone is not the guard this module claimed it was. The entries cover instructions
+// with a kernel operand as well as a user one - aarch64 and riscv64 declare both the load and the
+// store of their byte loop, and x86_64's `rep movsb` has source and destination in a single
+// instruction - so a kernel bug that hands `copy_to_user` a bad KERNEL pointer faults at a PC that
+// IS in the table, gets resumed, and is reported to the caller as "the user's page went away".
+// Silently, and with a plausible answer.
+//
+// One condition removes the whole class: a copy routine can only ever be rescued from a fault on
+// the side of it that userspace owns. Anything in the kernel half is this kernel's own bug, whoever
+// was executing.
+fn is_user_address(address: u64) -> bool {
+	address < crate::memlayout::USER_VA_END
+}
+
+pub fn fixup_for(pc: u64, fault_address: u64) -> Option<u64> {
+	if !is_user_address(fault_address) {
+		return None;
+	}
 	let found = entries().iter().find(|entry| entry.fault == pc).map(|entry| entry.fixup);
 	if found.is_some() {
 		CAUGHT.fetch_add(1, Ordering::AcqRel);
@@ -89,6 +108,13 @@ pub fn caught() -> u64 {
 // How many instructions this build declares may fault. Zero means the mechanism is not in the
 // binary at all, which is a thing a test should be able to notice.
 #[cfg_attr(not(test), allow(dead_code))]
+// The first declared faulting address, for the test that pins the user-address condition. It needs
+// a PC the table really contains, and which one is an accident of link order.
+#[cfg(test)]
+pub fn first_entry() -> Option<u64> {
+	entries().first().map(|entry| entry.fault)
+}
+
 pub fn declared() -> usize {
 	entries().len()
 }

@@ -187,7 +187,7 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, error_code:
 	// materialises the by-value parameter in place, so writing `instruction_pointer` here is what
 	// `iretq` will resume at. If that ever stopped being true the test would not merely fail, it
 	// would triple-fault - which is the loudest possible way to find out.
-	if let Some(fixup) = crate::extable::fixup_for(frame.instruction_pointer) {
+	if let Some(fixup) = crate::extable::fixup_for(frame.instruction_pointer, cr2) {
 		// VOLATILE, and the compiler is what proved it has to be. A plain
 		// `frame.instruction_pointer = fixup` drew "value assigned to `frame` is never read" -
 		// which is true of the local and false of the machine: nothing in this function reads it

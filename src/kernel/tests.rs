@@ -1324,6 +1324,17 @@ impl Testable for TaggedTest {
 	fn run(&self) {
 		serial_print!("{}...\t", self.name);
 		(self.run)();
+		// The frame allocator's two views of the pool, compared after every test.
+		//
+		// A bitmap allocator can hand one page to two owners, and the run table it replaced could
+		// not - so this is a class of defect the suite had never had to look for. It does not show
+		// up where it happens: it showed up once as an ELF header of sixteen zero bytes, in a
+		// different test, four hundred allocations later. Comparing here costs a few milliseconds
+		// and names the test that did it.
+		if let Some((pages, first)) = crate::mem::frame::audit() {
+			serial_println!("[failed]");
+			panic!("the frame allocator's bitmap and its ownership record disagree about {pages} page(s) after this test, first at {first:#x}");
+		}
 		serial_println!("[ok]");
 	}
 
@@ -2539,6 +2550,24 @@ fn prepared_volume(first_lba: u64, blocks: u64) -> alloc::collections::BTreeMap<
 	sectors.into_iter().map(|(lba, sector)| (lba + first_lba, sector)).collect()
 }
 
+// Spawn the storage harness, and if the image will not load, SAY WHAT THE BYTES WERE.
+//
+// `BadImage` from this call means the ELF failed to PARSE, and for a slice into the boot package
+// that means the bytes changed underneath it - but the panic alone says nothing about how. The
+// header is the evidence: zeros are a frame handed to somebody else and cleared, a different magic
+// is a second image written over this one, and an intact magic moves the fault out of memory and
+// into the loader. It costs nothing on the path that works, which is every path but one.
+fn spawn_harness(storage_elf: &[u8], boot_user: alloc::sync::Arc<dyn object::KernelObject>) -> alloc::sync::Arc<object::process::Process> {
+	match loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, object::rights::Rights::ALL, 0) {
+		Ok(process) => process,
+		Err(error) => {
+			let head = &storage_elf[..16.min(storage_elf.len())];
+			crate::serial_println!("harness: StorageService image will not load ({error:?}) - {} bytes, header {head:02x?}", storage_elf.len());
+			panic!("spawn StorageService harness");
+		}
+	}
+}
+
 impl StorageHarness {
 	// Start a StorageService over a disk carrying `image` verbatim: a FAT, ISO or UDF medium, or
 	// any other fixture that is already a filesystem image.
@@ -2668,7 +2697,7 @@ impl StorageHarness {
 		let (block, block_child) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
-		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		spawn_harness(storage_elf, boot_user);
 		send_cap(&boot, tag, block_child, Rights::ALL).expect("storage block bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
@@ -2694,7 +2723,7 @@ impl StorageHarness {
 		let (block, _unused) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
-		let process = loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		let process = spawn_harness(storage_elf, boot_user);
 		let mut request: alloc::vec::Vec<u8> = tag.to_vec();
 		request.extend_from_slice(alloc::format!("{bytes}").as_bytes());
 		boot.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("memory volume bootstrap");
@@ -2724,7 +2753,7 @@ impl StorageHarness {
 		let (block, _unused) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
-		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		spawn_harness(storage_elf, boot_user);
 		let ramdisk = MemoryObject::create(volume.len()).expect("no memory for the archive");
 		copy_into_object(&ramdisk, volume);
 		let mut request = alloc::vec::Vec::with_capacity(7 + 8);
@@ -2968,7 +2997,7 @@ impl StorageHarness {
 		let (block, _unused) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
-		loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, Rights::ALL, 0).expect("spawn StorageService harness");
+		spawn_harness(storage_elf, boot_user);
 		let buffer = MemoryObject::create(image.len().max(1)).expect("no memory for the live image");
 		copy_into_object(&buffer, image);
 		let mut request = alloc::vec::Vec::with_capacity(7 + 8);

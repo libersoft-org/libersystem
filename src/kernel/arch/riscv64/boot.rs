@@ -238,12 +238,18 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	super::pci::set_ecam_base(pcie_ecam);
 
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
-	// The pool runs to the top of RAM. It used to stop below a boot archive the runner had laid
-	// high in memory; nothing is laid there any more, and a clamp without the thing it protects
-	// only loses frames.
+	// The pool runs to the top of RAM, MINUS what the loader left in it. Same hand-off and same
+	// hazard as aarch64 - no memory map, packages read into RAM above the kernel and read for the
+	// life of the boot - so the same carve. See `arch::common::bootmem`.
 	let (region_base, region_len) = paging::usable_region(ram_top);
-	let regions = [bootproto::MemRegion { base: region_base, length: region_len, kind: bootproto::MEM_USABLE, _pad: 0 }];
-	crate::mem::frame::init(&regions);
+	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; 16];
+	let hole_count = unsafe { crate::arch::common::bootmem::loader_reservations(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys), &mut holes) };
+	let mut regions = [bootproto::MemRegion { base: 0, length: 0, kind: bootproto::MEM_USABLE, _pad: 0 }; 17];
+	let region_count = crate::arch::common::bootmem::carve(region_base, region_len, &mut holes[..hole_count], &mut regions);
+	for hole in &holes[..hole_count] {
+		crate::serial_println!("riscv64: reserved {:#x}..{:#x} ({} KiB) - handed over by the loader", hole.start, hole.end, (hole.end - hole.start) / 1024);
+	}
+	crate::mem::frame::init(&regions[..region_count]);
 	crate::serial_println!("riscv64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
 	crate::mem::heap::init();
 	crate::mem::frame::upgrade_to_heap();

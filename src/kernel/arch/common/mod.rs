@@ -23,6 +23,7 @@
 // `rng`: the SplitMix64 mixer the arch random fallbacks share (no arch guarantees a
 // hardware RNG on the bring-up core).
 
+pub mod bootmem;
 pub mod context;
 pub mod dtb;
 pub mod fwcfg;

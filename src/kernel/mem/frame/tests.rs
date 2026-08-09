@@ -241,5 +241,78 @@ fn the_run_table_is_reserved_for_the_worst_the_pool_can_reach() {
 	// the worst the pool can reach, because a table sized for a healthy pool is where the losing
 	// started. `worst_case_runs` is the arithmetic and nothing else pins it.
 	assert!(super::worst_case_runs(total) >= total.div_ceil(2), "the fallback reservation must cover every-other-page-free, which is {} runs", total.div_ceil(2));
-	assert!(super::on_heap(), "the fallback table is the heap-backed one, not the bounded seed table");
+
+	// The fallback is NOT allocated on the path that works, and that is worth an assertion because
+	// it was not always true. The bootstrap used to reserve the worst-case table FIRST and build the
+	// buddy after it, so a healthy machine paid for both: `worst_case_runs(total) * 16` bytes -
+	// about 8 MiB on 4 GiB - held for the life of the boot behind a boot line reporting 383 KiB.
+	// Emptying it later would not have helped; a cleared `Vec` keeps its capacity.
+	//
+	// Reversing the order also fixed the case that mattered more: the machine too short of memory
+	// to reserve 8 MiB is not too short to reserve 383 KiB, and it was the one machine that never
+	// got a buddy at all.
+	assert!(!super::on_heap(), "a run table was reserved even though the buddy was built - {} bytes of fallback nobody is going to use", super::run_capacity() * 16);
+}
+
+crate::tagged_test!(no_frame_is_ever_handed_to_two_owners_at_once, [Frame, Memory], covers = ["kernel"]);
+fn no_frame_is_ever_handed_to_two_owners_at_once() {
+	// The one thing a bitmap allocator can do that the run table could not.
+	//
+	// A frame lived in exactly one run, and leaving the run removed it, so the old allocator could
+	// not hand the same page to two owners even if its arithmetic was wrong. A bitmap can: one
+	// mis-set bit and two callers get the same address, both write it, and whoever reads second
+	// finds the other's bytes. The failure surfaces arbitrarily far away - a corrupt ELF header, a
+	// filesystem that fails its own checksum, a hang - and none of those point back at the
+	// allocator. So `take_one` and `take_contiguous` ask the ownership record before handing a
+	// frame out, and this reads the answer for the whole boot rather than for a workload of its
+	// own: every allocation every test has made so far is what it covers.
+	//
+	// Debug builds only, which is where the test suite runs; the record does not exist in release.
+	assert_eq!(super::double_allocations(), 0, "a frame was handed out while already on loan - see the DOUBLE ALLOCATION line in the boot log for the address");
+
+	// And a workload of its own, because the boot may simply never have hit the case: churn the
+	// pool hard enough that the buddy is splitting and merging, then check again.
+	let mut held: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	for round in 0..64 {
+		for _ in 0..32 {
+			if let Some(frame) = super::allocate() {
+				held.push(frame);
+			}
+		}
+		// Free every other one, so the pool fragments rather than unwinding cleanly.
+		let mut keep = alloc::vec::Vec::new();
+		for (index, frame) in held.drain(..).enumerate() {
+			if index % 2 == round % 2 {
+				unsafe { super::deallocate(frame) };
+			} else {
+				keep.push(frame);
+			}
+		}
+		held = keep;
+	}
+	// Every address handed out in that churn must be distinct - the record's answer, checked a
+	// second way, because a record that was never updated would also report zero.
+	let mut sorted = held.clone();
+	sorted.sort_unstable();
+	let before = sorted.len();
+	sorted.dedup();
+	assert_eq!(sorted.len(), before, "the same frame was handed out twice and is being held twice");
+	for frame in held {
+		unsafe { super::deallocate(frame) };
+	}
+	assert_eq!(super::double_allocations(), 0, "the churn handed a frame to a second owner");
+
+	// And the detector itself, armed deliberately, because the two assertions above pass on a
+	// kernel where `check_not_owned` was deleted. A counter that only ever reads zero proves the
+	// workload was clean OR that nothing is counting, and those are not the same claim.
+	let before = super::double_allocations();
+	super::duplicate_next_allocation();
+	let first = super::allocate().expect("a frame for the injected duplicate");
+	let second = super::allocate().expect("and the frame it is handed out as again");
+	assert_eq!(first, second, "the injection did not produce a duplicate, so what follows proves nothing");
+	assert_eq!(super::double_allocations(), before + 1, "the same frame went out twice and the detector said nothing");
+
+	// One free, not two: the frame is out on loan once however many times it was handed over, and
+	// freeing it twice is a different defect that `check_owned_free` refuses.
+	unsafe { super::deallocate(first) };
 }

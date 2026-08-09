@@ -329,7 +329,7 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 	// The resume is the saved SEPC in the trap frame - `sret` reloads it from there - which is an
 	// ordinary memory write rather than the volatile dance x86_64 needs, because the frame is a
 	// pointer the compiler cannot decide is dead.
-	if let Some(fixup) = crate::extable::fixup_for(sepc) {
+	if let Some(fixup) = crate::extable::fixup_for(sepc, stval) {
 		unsafe { *frame.add(FRAME_SEPC) = fixup };
 		return;
 	}

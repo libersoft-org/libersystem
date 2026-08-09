@@ -117,7 +117,14 @@ impl Buddy {
 		self.bits[word] & (1 << (index % 64)) != 0
 	}
 
+	// `set` and `clear` do NOT range-check the way `get` does, and the asymmetry is deliberate: a
+	// read of a block that does not exist has an obvious answer (it is not free), while a WRITE to
+	// one is a bug in this file - the index would land in the next order's bitmap and free memory
+	// that is already out on loan. Every caller derives its index from a block that fits inside the
+	// extent, which `free` enforces and the split loop preserves, so the assertion below states the
+	// invariant rather than defending against callers.
 	fn set(&mut self, order: usize, index: u64) {
+		debug_assert!(index < self.blocks_at(order), "set past the end of order {order}: block {index} of {}", self.blocks_at(order));
 		let word = self.offsets[order] + (index / 64) as usize;
 		if self.bits[word] & (1 << (index % 64)) == 0 {
 			self.bits[word] |= 1 << (index % 64);
@@ -130,6 +137,7 @@ impl Buddy {
 	}
 
 	fn clear(&mut self, order: usize, index: u64) {
+		debug_assert!(index < self.blocks_at(order), "clear past the end of order {order}: block {index} of {}", self.blocks_at(order));
 		let word = self.offsets[order] + (index / 64) as usize;
 		if self.bits[word] & (1 << (index % 64)) != 0 {
 			self.bits[word] &= !(1 << (index % 64));
@@ -235,9 +243,16 @@ impl Buddy {
 	// This is how the pool is seeded and how a multi-page allocation is returned: a span of 300
 	// pages is not a buddy block, but it is a handful of them. Freeing page by page would work and
 	// would cost 300 merge walks; framing costs one per block.
-	pub fn free_span(&mut self, phys: u64, pages: u64) {
+	// Returns how many pages the buddy actually TOOK. That is not always `pages`: a block whose
+	// address falls outside the extent, or which would run off the end of it, is refused, and the
+	// caller must not count those as free or the pool will report memory that no allocation can
+	// find. Silently returning nothing was the earlier shape and it made a divergence between
+	// `free_count` and the bitmap invisible.
+	#[must_use]
+	pub fn free_span(&mut self, phys: u64, pages: u64) -> u64 {
 		let mut at = phys;
 		let mut left = pages;
+		let mut taken_total = 0u64;
 		while left > 0 {
 			let page = (at - self.base) / PAGE_SIZE;
 			// The largest order whose alignment `page` satisfies and whose size fits in what is
@@ -245,11 +260,14 @@ impl Buddy {
 			let by_alignment = if page == 0 { MAX_ORDER } else { (page.trailing_zeros() as usize).min(MAX_ORDER) };
 			let by_size = (63 - left.leading_zeros() as usize).min(MAX_ORDER);
 			let order = by_alignment.min(by_size);
-			self.free(at, order);
 			let taken = 1u64 << order;
+			if self.free(at, order) {
+				taken_total += taken;
+			}
 			at += taken * PAGE_SIZE;
 			left -= taken;
 		}
+		taken_total
 	}
 
 	// Take `pages` CONTIGUOUS frames - the DMA allocation. Rounded up to a whole block, and the
@@ -267,7 +285,12 @@ impl Buddy {
 		// for as long as it lived, which on a fragmenting pool compounds.
 		let taken = 1u64 << order;
 		if taken > pages {
-			self.free_span(phys + pages * PAGE_SIZE, taken - pages);
+			// The remainder is the upper part of a block this allocator just handed itself, so it
+			// is aligned, inside the extent and framable by construction. If it were ever not,
+			// `alloc` would have debited the whole block and the return would credit back less,
+			// and the pool would shrink a little on every rounded request.
+			let handed_back = self.free_span(phys + pages * PAGE_SIZE, taken - pages);
+			debug_assert_eq!(handed_back, taken - pages, "the rounding remainder of a block must fit back into the pool it came from");
 		}
 		Some(phys)
 	}

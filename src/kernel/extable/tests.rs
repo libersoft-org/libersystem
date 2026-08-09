@@ -62,6 +62,33 @@ fn a_copy_to_a_page_that_is_not_there_reports_rather_than_kills_the_kernel() {
 	assert_eq!(ok, payload, "and copies the right bytes");
 }
 
+crate::tagged_test!(a_fault_on_a_kernel_address_is_never_rescued_however_the_pc_matches, [Kernel, Memory], covers = ["kernel"]);
+fn a_fault_on_a_kernel_address_is_never_rescued_however_the_pc_matches() {
+	// The condition that keeps a real kernel bug loud, which the PC match alone does not.
+	//
+	// The table's entries cover instructions that touch a KERNEL operand as well as a user one: the
+	// aarch64 and riscv64 byte loops declare both their load and their store, and x86_64's
+	// `rep movsb` reads and writes in one instruction. So a kernel bug that hands `copy_to_user` a
+	// bad kernel source pointer faults at a PC that is genuinely in the table. Recovering it would
+	// convert that bug into a short copy - a wrong answer, delivered quietly, to a caller with no
+	// way to tell.
+	//
+	// Asserted on the lookup rather than by faulting, because the failure mode of getting this
+	// wrong is a kernel that keeps running with a corrupted assumption, and there is no way to
+	// arrange the real fault without also arranging the bug.
+	let declared = declared();
+	assert!(declared > 0, "there is a table to ask about");
+
+	// Every address the table names is a real fixup, so a user-half fault at one is rescued.
+	let entry = first_entry().expect("the table has at least one entry");
+	assert!(fixup_for(entry, crate::memlayout::USER_VA_END / 2).is_some(), "a declared instruction faulting on a user address must be rescued - that is the whole mechanism");
+
+	// The SAME instruction faulting on a kernel address is not.
+	assert!(fixup_for(entry, crate::memlayout::USER_VA_END).is_none(), "the first address of the kernel half is not userspace's");
+	assert!(fixup_for(entry, u64::MAX & !0xFFF).is_none(), "nor is the top of the address space");
+	assert!(fixup_for(entry, 0xFFFF_8000_0000_0000).is_none(), "nor is a higher-half kernel pointer, which is what a kernel bug passes");
+}
+
 crate::tagged_test!(a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got, [Kernel, Memory, Syscall], covers = ["kernel"]);
 fn a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got() {
 	// The state a mid-copy unmap actually produces, arranged deterministically.

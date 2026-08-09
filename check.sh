@@ -26,6 +26,7 @@ declare -A GATES=(
 	["malformed-symbol-relocation"]="tools/check-static-injection.sh malformed-symbol-relocation"
 	["identity-note"]="tools/check-static-injection.sh identity-note"
 	["volume-layout"]="tools/check-volume-layout.sh ../.build/boot/volume-x86_64.pkg"
+	["milestone-index"]="tools/check-milestone-index.sh"
 )
 
 FORMATS=(bmp gif ico icns jpeg pcx png ppm qoi tga webp)
