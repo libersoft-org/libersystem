@@ -8,8 +8,9 @@
 //          path); or
 //        "BLOCK", with a channel capability to the virtio-blk driver's block
 //          service, on which a writable on-disk filesystem (LiberFS) is mounted - the
-//          boot path. A fresh or stale disk is formatted and seeded from the factory
-//          archive laid at LBA 0, so the volume always starts with its seed files; or
+//          boot path. The disk is MOUNTED, never formatted: the system volume is built as
+//          a filesystem by `mkpackages` and written to the medium, so a disk that carries
+//          no volume is a disk this service refuses and says why; or
 //        "FATBLOCK", with a channel capability to a second virtio-blk driver's block
 //          service, on which a writable FAT12/16/32 or exFAT volume is
 //          mounted as vol://media - a flash-drive / SD-card image through the same
@@ -41,7 +42,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use fat::FatFs;
 use iso9660::Iso9660;
-use liberfs::{BlockDevice, FormatOpts, FsError, LiberFs, MountError};
+use liberfs::{BlockDevice, FsError, LiberFs, MountError};
 use libermemfs::{LiberMemFs, Policy as MemPolicy};
 use proto::codec::Buffer;
 use proto::codec::{Sink, SliceWriter};
@@ -167,7 +168,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			Volume { fs: alloc::boxed::Box::new(ArchiveFs { base, len: length }) }
 		}
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => match unsafe { mount_or_format(handle) } {
+		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => match unsafe { mount_system_volume(handle) } {
 			Some(fs) => Volume { fs: alloc::boxed::Box::new(DiskFs { fs }) },
 			None => exit(),
 		},
@@ -2254,12 +2255,15 @@ impl udf::BlockDevice for UdfBlockDevice {
 	}
 }
 
-// Mount the LiberFS on the virtio-blk disk, or, on a disk that carries nothing at all,
-// format a new (empty) filesystem on it. The volume's container is a GPT partition
-// carrying the LiberFS type GUID when the disk has one (so a disk partitioned by another
-// system mounts the same volume), else the whole device; a fresh format spans the whole
-// container. The block channel stays open for the serve loop.
-unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
+// Mount the LiberFS on the virtio-blk disk. The volume's container is a GPT partition carrying the
+// LiberFS type GUID when the disk has one (so a disk partitioned by another system mounts the same
+// volume), else the whole device. The block channel stays open for the serve loop.
+//
+// It does not format, and the name used to say `mount_or_format` because it did. Laying a
+// filesystem over a disk is a decision a person makes with the disk in front of them; a service
+// deciding it at boot, from a sample of sectors, is how somebody else's data gets destroyed by a
+// machine that was only supposed to start up.
+unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
 	// What the disk IS, before deciding what may be written to it. Exactly two answers lead
 	// anywhere near a format, and the difference between them and the rest is the difference
 	// between a blank disk and somebody else's.
@@ -2276,7 +2280,29 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 		// this system's own volume at LBA 0 (which is what every system disk looks like on
 		// its second boot). The MOUNT is what keeps the second one safe - it formats only
 		// when the volume says `Unformatted`.
-		partition::Disk::Blank | partition::Disk::LiberFsWholeDevice => (FS_START_SECTOR, unsafe { disk_pool_blocks(block_client) }),
+		// A disk already carrying this system's own volume at LBA 0 - which is what every system
+		// disk looks like, because the volume is BUILT as a filesystem by `mkpackages` and written
+		// to the medium. Mounting it is not formatting it.
+		partition::Disk::LiberFsWholeDevice => (FS_START_SECTOR, unsafe { disk_pool_blocks(block_client) }),
+		// A disk that looks empty. This used to be the one answer that licensed laying a filesystem
+		// over the whole device, and it should never have been: formatting a disk is a decision
+		// somebody makes, not one a service infers at boot from the bytes in front of it.
+		//
+		// It was not even a feature by the end. The format existed to SEED - there was a factory
+		// archive at LBA 0 and a fresh disk was formatted and populated from it - and M0138 retired
+		// the seeding. What was left formatted an EMPTY volume and printed that it had done so,
+		// which is of no use to anybody: a machine whose system volume never arrived is not helped
+		// by being given a blank one, and a disk of somebody else's data is actively harmed.
+		//
+		// Provisioning a disk is `mkpackages` writing a verified volume image to it, on a machine
+		// where a person is standing. That is the manual step, it already exists, and it is the
+		// only one.
+		partition::Disk::Blank => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: the disk carries no filesystem. Nothing was changed - write a system volume image to it deliberately; this system does not format disks by itself\n");
+			}
+			return None;
+		}
 		// Everything below means the whole-device fallback is not available, because the
 		// fallback starts at sector ZERO - it would lay a filesystem over the protective
 		// MBR, the GPT header, the entry array and every partition the disk carries.
@@ -2350,7 +2376,16 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 	// this is the same rule for the rest.
 	let mounted = LiberFs::mount(ChannelBlockDevice { chan: block_client, base, limit: pool, max_sectors });
 	match mounted {
-		Err(MountError::Unformatted) => {}
+		// The probe said this container holds a LiberFS and the mount disagrees. That is a
+		// contradiction about a real volume, not an empty disk: something between the superblock
+		// and the probe is damaged. It used to fall through to a format, which destroyed exactly
+		// the volume the contradiction was about.
+		Err(MountError::Unformatted) => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: the container looks like a LiberFS volume and does not mount as one. Nothing was changed - this is damage, not an empty disk\n");
+			}
+			return None;
+		}
 		Err(reason) => {
 			unsafe {
 				print(match reason {
@@ -2391,42 +2426,9 @@ unsafe fn mount_or_format(block_client: u64) -> Option<LiberFs<ChannelBlockDevic
 		}
 		return Some(fs);
 	}
-	// otherwise lay down a fresh filesystem and copy in the factory seed files. The
-	// device is rebuilt from the (Copy) channel handle - the failed mount consumed the
-	// previous device value but left the channel open. The volume gets a uuid stirred
-	// from the clocks (unique enough to tell volumes apart; no RNG exists yet) and the
-	// "system" label; compression starts off, togglable later via `set-compression`.
-	let uuid: [u8; 16] = unsafe { stir_uuid() };
-	let opts: FormatOpts = FormatOpts { uuid, label: b"system".to_vec(), compress: false };
-	let mut fs: LiberFs<ChannelBlockDevice> = LiberFs::format_opts(ChannelBlockDevice { chan: block_client, base, limit: pool, max_sectors }, pool, opts).ok()?;
-	fs.set_clock(unsafe { clock_rtc() });
-	// Empty, and said out loud. There used to be a factory archive at LBA 0 to seed from, and
-	// with it gone (M0138) a disk carrying no filesystem carries no system volume either - the
-	// volume is built as a filesystem now, not made on the spot from a package beside it.
-	//
-	// Formatting rather than refusing keeps a genuinely fresh disk usable, but silence here would
-	// let a machine whose system volume never arrived look exactly like one that is merely new.
-	unsafe {
-		print(b"storage: vol://system had no filesystem; formatted an EMPTY volume (nothing was seeded - the disk carries no system volume)\n");
-	}
-	Some(fs)
-}
-
-// Sixteen uuid bytes stirred from the wall clock, the boot-relative nanosecond clock,
-// and a fixed tag, mixed through a splitmix64 round each - distinct across formats,
-// which is all the volume id needs (no RNG syscall exists yet).
-unsafe fn stir_uuid() -> [u8; 16] {
-	fn mix(mut x: u64) -> u64 {
-		x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-		x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-		x ^ (x >> 31)
-	}
-	let a: u64 = mix(unsafe { clock_rtc() } ^ 0x4C69_6265_7246_5321);
-	let b: u64 = mix(unsafe { clock_ns() } ^ a);
-	let mut uuid = [0u8; 16];
-	uuid[..8].copy_from_slice(&a.to_le_bytes());
-	uuid[8..].copy_from_slice(&b.to_le_bytes());
-	uuid
+	// Every path above either mounted or returned. There is no fallback, and that is the point:
+	// this function reads a disk and mounts what is on it. It does not create.
+	None
 }
 
 // The filesystem pool the disk's real capacity allows, in filesystem blocks - asked of the disk

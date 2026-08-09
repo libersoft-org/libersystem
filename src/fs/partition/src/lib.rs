@@ -107,22 +107,28 @@ pub trait Sectors {
 
 // What the disk turned out to be.
 //
-// Every variant except `Blank` means "do not format this whole device". They are kept
-// separate rather than collapsed into one refusal because the operator's next move differs
-// for each: a foreign filesystem is data to copy off, an MBR is a table to convert, a
-// corrupt GPT is a table to repair, and an I/O failure is a cable to check.
+// NONE of them authorises a write. They are kept separate rather than collapsed into one refusal
+// because the operator's next move differs for each: a foreign filesystem is data to copy off, an
+// MBR is a table to convert, a corrupt GPT is a table to repair, an I/O failure is a cable to
+// check, and a blank disk is one to write a volume image to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disk {
 	// The disk carries no partition table and every byte of it this build looked at is ZERO.
-	// The ONLY answer that licenses laying a filesystem over a whole device.
 	//
-	// Positive evidence, not the absence of a signature. The first version of this crate
-	// answered `Blank` whenever it recognised nothing, which is the mistake this whole
-	// milestone is about, one level in: a raw ext4 puts its superblock at byte 1024 - the
-	// third sector - so the probe decided before the filesystem began, and the service then
-	// formatted over it. There is no complete list of filesystem signatures and there never
-	// will be; there is a complete answer to "is this medium empty", and it is that the
-	// bytes are zero.
+	// A DIAGNOSIS, and nothing more. It used to be the one answer that licensed laying a
+	// filesystem over a whole device, and that is gone: StorageService mounts what is on a disk
+	// and never creates. Formatting is `mkpackages` writing a verified volume image, on a machine
+	// where somebody is standing.
+	//
+	// The distinction from `UnknownData` is still worth keeping, because the two send an operator
+	// somewhere different: one says "this disk is empty, you probably meant to write a volume to
+	// it", the other says "there is something here, find out what before you do".
+	//
+	// And it is still only as good as where it looked. There is no complete list of filesystem
+	// signatures and there never will be, so there is no complete list of PLACES either: a disk
+	// zero across every sector this build reads and full from LBA 2048 answers `Blank`. That was a
+	// data-loss hazard while it authorised a write. As a diagnosis it is a hint that can be wrong,
+	// which is all it now claims to be.
 	Blank,
 	// The disk carries no partition table, no filesystem this build recognises, and bytes
 	// that are not zero. Something is on it and this build cannot say what.

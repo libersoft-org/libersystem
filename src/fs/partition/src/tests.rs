@@ -924,7 +924,12 @@ fn the_two_copies_of_a_table_have_to_agree_about_more_than_their_entry_bytes() {
 
 #[test]
 fn a_disk_whose_data_begins_past_the_scan_is_still_called_blank() {
-	// KNOWN HOLE, asserted so it is visible in the suite rather than only in a document.
+	// The limit of the scan, pinned - and no longer a hazard.
+	//
+	// While `Blank` authorised a whole-device format this was a data-loss path: a disk zero
+	// everywhere the scanner looks and full from LBA 2048 got formatted. StorageService no longer
+	// formats anything, so `Blank` is now a diagnosis an operator reads, and a diagnosis that can
+	// be wrong about a disk nobody is about to write to costs nothing.
 	//
 	// `scanned_blank` reads LBA 0 through 128, then 512 and 1024 - the places the filesystems this
 	// build knows announce themselves. A disk that is zero across all 131 and carries data from
@@ -937,13 +942,12 @@ fn a_disk_whose_data_begins_past_the_scan_is_still_called_blank() {
 	// passing if the scan shrank to those six sectors.
 	//
 	// There is no list of offsets that fixes this: the reason there is no complete list of
-	// filesystem signatures is the reason there is no complete list of PLACES. The fix is that a
-	// whole-device format stops being deducible from the medium and becomes a permission the boot
-	// policy grants - M0152. This test asserts the CURRENT answer, which is the wrong one, and is
-	// the test that flips when the permission lands.
+	// filesystem signatures is the reason there is no complete list of PLACES. Which is why the
+	// answer was never to look harder - it was to stop deciding anything destructive from what the
+	// looking found.
 	let mut img = Image::new(CAPACITY);
 	img.edit(2048, |s| s[17] = 0x01);
-	assert_eq!(probe(&mut img), Disk::Blank, "data past the scan is invisible to it - this is the hole M0152 closes, not a property to rely on");
+	assert_eq!(probe(&mut img), Disk::Blank, "data past the scan is invisible to it - a hint, never a licence");
 
 	// And the boundary, so the scan's actual reach is pinned: one sector inside it IS seen.
 	let mut edge = Image::new(CAPACITY);
