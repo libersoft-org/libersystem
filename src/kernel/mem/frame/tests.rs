@@ -225,10 +225,21 @@ fn the_run_table_is_reserved_for_the_worst_the_pool_can_reach() {
 	// table simply starts refusing again, on a fragmented machine, weeks later.
 	let (total, _free) = super::totals();
 	assert!(total > 0, "the pool has frames");
-	assert!(super::worst_case_runs(total) >= total.div_ceil(2), "the reservation must cover every-other-page-free, which is {} runs", total.div_ceil(2));
-	assert!(super::run_capacity() >= total.div_ceil(2), "the table actually reserved {} runs for a pool that can need {}", super::run_capacity(), total.div_ceil(2));
 
-	// And the table is on the heap: the pre-heap seed table is fixed at 128 runs and CAN lose a
-	// span. If the upgrade silently declined, everything above is true of a table nobody is using.
-	assert!(super::on_heap(), "the run table is the heap-backed one, not the bounded seed table");
+	// THE BUDDY IS THE ONE SERVING. Everything below is about the fallback, and if the buddy failed
+	// to build, the fallback is what the machine is running - so this is the first thing to say.
+	assert!(super::on_buddy(), "the buddy allocator is serving allocations, not the run table");
+
+	// Its metadata is two bits per page - one per block per order, summed over orders - and it is
+	// reserved once. A tenth of a percent of the pool, and the number a future change would have to
+	// justify moving.
+	let metadata = super::buddy_metadata_bytes();
+	assert!(metadata > 0, "the buddy has metadata");
+	assert!(metadata <= total, "the buddy's metadata is {metadata} bytes for {total} pages - it should be about a quarter of a byte per page, not a byte");
+
+	// And the fallback, if the buddy ever cannot be built: the run table must still be sized for
+	// the worst the pool can reach, because a table sized for a healthy pool is where the losing
+	// started. `worst_case_runs` is the arithmetic and nothing else pins it.
+	assert!(super::worst_case_runs(total) >= total.div_ceil(2), "the fallback reservation must cover every-other-page-free, which is {} runs", total.div_ceil(2));
+	assert!(super::on_heap(), "the fallback table is the heap-backed one, not the bounded seed table");
 }

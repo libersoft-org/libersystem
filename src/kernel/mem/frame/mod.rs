@@ -32,6 +32,9 @@ use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
 
+mod buddy;
+use buddy::Buddy;
+
 // The table's floor, for a pool too small for the worst-case sizing below to matter. The real bound
 // is computed from the pool - see `worst_case_runs`.
 const MIN_RUNS: usize = 8192;
@@ -71,9 +74,16 @@ struct Run {
 
 struct FrameAllocator {
 	// The fixed pre-heap table (boot seeding only) and its live length.
+	//
+	// It exists for one reason: the frame allocator is what brings the heap up, so the first frames
+	// are handed out before there is anywhere to put a bitmap. A handful of runs is all boot needs.
 	seed: [Run; SEED_RUNS],
 	seed_len: usize,
-	// The heap-backed table that replaces the seed once the heap is up.
+	// The buddy allocator, built at `upgrade_to_heap` and the only allocator from then on. While
+	// this is `Some`, the run table above is empty and unused - every operation delegates here.
+	buddy: Option<Buddy>,
+	// The heap-backed run table. Kept for the window between the heap coming up and the buddy
+	// being built, and as the fallback if the buddy's metadata cannot be reserved.
 	heap: Option<Vec<Run>>,
 	free_count: usize,
 	total_count: usize,
@@ -92,6 +102,7 @@ impl FrameAllocator {
 		Self {
 			seed: [Run { base: 0, pages: 0 }; SEED_RUNS],
 			seed_len: 0,
+			buddy: None,
 			heap: None,
 			free_count: 0,
 			total_count: 0,
@@ -243,6 +254,28 @@ impl FrameAllocator {
 		if pages == 0 {
 			return;
 		}
+		if self.buddy.is_some() {
+			// Refuse a span this allocator did not hand out, exactly as the run table does: the
+			// ownership record is the check, and it is the same one either way.
+			if !self.check_owned_free(base, pages) {
+				note_refused_free();
+				return;
+			}
+			self.mark_owned(base, pages, false);
+			// A double free of a span that is still FREE is what the run table caught with its
+			// overlap test. The buddy has no overlap test - it has a bitmap - so the same question
+			// is asked directly, and asking it is what keeps a freed-twice page from being handed
+			// to two owners.
+			let already = (0..pages).any(|page| self.buddy.as_ref().is_some_and(|buddy| buddy.is_free_page(base + page * PAGE_SIZE)));
+			if already {
+				note_refused_free();
+				crate::serial_println!("frame: WARNING: double free refused - {pages} page(s) at {base:#x} are already free");
+				return;
+			}
+			self.buddy.as_mut().expect("checked").free_span(base, pages);
+			self.free_count += pages as usize;
+			return;
+		}
 		// Refuse a span this allocator did not hand out before touching the run table, so a
 		// bad address cannot become free memory. Boot seeding passes this trivially - the
 		// record does not exist yet.
@@ -298,6 +331,12 @@ impl FrameAllocator {
 
 	// Take one page off the head of the first run.
 	fn take_one(&mut self) -> Option<u64> {
+		if let Some(buddy) = self.buddy.as_mut() {
+			let base = buddy.alloc(0)?;
+			self.free_count -= 1;
+			self.mark_owned(base, 1, true);
+			return Some(base);
+		}
 		if self.runs().is_empty() {
 			return None;
 		}
@@ -319,6 +358,12 @@ impl FrameAllocator {
 	// First-fit a physically contiguous span of `pages`, taking it off the head
 	// of the first run large enough.
 	fn take_contiguous(&mut self, pages: u64) -> Option<u64> {
+		if let Some(buddy) = self.buddy.as_mut() {
+			let base = buddy.alloc_contiguous(pages)?;
+			self.free_count -= pages as usize;
+			self.mark_owned(base, pages, true);
+			return Some(base);
+		}
 		for at in 0..self.runs().len() {
 			if self.runs()[at].pages >= pages {
 				let base = {
@@ -426,8 +471,23 @@ pub fn upgrade_to_heap() {
 			bits
 		}
 	};
+	// The buddy's metadata, sized from the pool the memory map described and reserved ONCE.
+	//
+	// Its extent spans from the lowest usable frame to the highest, holes included: a hole is
+	// simply never freed in, so it reads as allocated forever and no block can merge across it.
+	// That is what lets one buddy cover a memory map with gaps in it.
+	//
+	// Reserved outside the lock for the reason the run table is - reserving calls the global
+	// allocator, whose `grow` calls `frame::allocate`, straight back into this lock.
+	let extent = {
+		let allocator = ALLOCATOR.lock();
+		let runs = allocator.runs();
+		runs.first().zip(runs.last()).map(|(first, last)| (first.base, (last.base + last.pages * PAGE_SIZE - first.base) / PAGE_SIZE))
+	};
+	let buddy = extent.and_then(|(base, pages)| Buddy::new(base, pages));
+
 	let mut allocator = ALLOCATOR.lock();
-	if allocator.heap.is_some() {
+	if allocator.heap.is_some() || allocator.buddy.is_some() {
 		return;
 	}
 	runs.extend_from_slice(&allocator.seed[..allocator.seed_len]);
@@ -439,6 +499,32 @@ pub fn upgrade_to_heap() {
 			let run = allocator.runs()[index];
 			allocator.mark_owned(run.base, run.pages, false);
 		}
+	}
+
+	// Move the pool into the buddy and empty the run table behind it. From here every allocation
+	// and every free goes through the bitmap, and a free cannot be lost because there is no table
+	// to fill - which is the property M0150 exists for.
+	//
+	// A buddy that could not be built leaves the run table in place, worst-case sized, which is the
+	// weaker version of the same guarantee rather than no guarantee. Said out loud, because
+	// "quietly running the old allocator" is the kind of fallback nobody notices for a year.
+	match buddy {
+		Some(mut buddy) => {
+			let runs: Vec<Run> = allocator.runs().to_vec();
+			for run in &runs {
+				buddy.free_span(run.base, run.pages);
+			}
+			let free = buddy.free_pages();
+			let metadata = buddy.metadata_bytes();
+			allocator.buddy = Some(buddy);
+			allocator.free_count = free as usize;
+			if let Some(table) = allocator.heap.as_mut() {
+				table.clear();
+			}
+			allocator.seed_len = 0;
+			crate::serial_println!("memory: buddy allocator up - {free} free frames, {} KiB of metadata", metadata / 1024);
+		}
+		None => crate::serial_println!("frame: could not size the buddy allocator's metadata; staying on the run table"),
 	}
 }
 
@@ -456,6 +542,19 @@ pub fn run_capacity() -> usize {
 #[cfg(test)]
 pub fn on_heap() -> bool {
 	ALLOCATOR.lock().heap.is_some()
+}
+
+// Is the buddy allocator the one serving allocations? For the test that says so; nothing else
+// needs to know, because every caller goes through the same four functions either way.
+#[cfg(test)]
+pub fn on_buddy() -> bool {
+	ALLOCATOR.lock().buddy.is_some()
+}
+
+// Bytes of buddy metadata, or 0 when the run table is still in charge.
+#[cfg(test)]
+pub fn buddy_metadata_bytes() -> usize {
+	ALLOCATOR.lock().buddy.as_ref().map(|buddy| buddy.metadata_bytes()).unwrap_or(0)
 }
 
 // The frame pool's totals: (total usable frames fixed at init, frames currently free).
