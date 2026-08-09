@@ -163,3 +163,49 @@ fn a_fragmenting_workload_loses_no_pages_and_says_so() {
 	}
 	assert_eq!(super::lost_pages(), lost_before, "including the pass that gave it all back one page at a time");
 }
+
+crate::tagged_test!(a_dma_buffer_still_gets_a_contiguous_span_after_the_pool_is_shredded, [Frame, Memory, Dma], covers = ["kernel"]);
+fn a_dma_buffer_still_gets_a_contiguous_span_after_the_pool_is_shredded() {
+	// Contiguous allocation exists FOR DMA - virtqueue rings, block data stages, jumbo frames - and
+	// the run table serves it by first-fitting a whole run. So the question that matters is not
+	// whether `allocate_contiguous` works on a fresh pool, which every boot already proves, but
+	// whether it still works once the pool has been cut to pieces and put back together.
+	//
+	// Through a REAL caller. `DmaBuffer::create_in` is what asks for these spans in production, and
+	// it does more than call the allocator: it charges a Domain, maps the pages and refuses cleanly
+	// when it cannot. A test that called `allocate_contiguous` directly would pass over a caller
+	// that had stopped being able to use the answer.
+	use crate::object::dma_buffer::DmaBuffer;
+
+	let lost_before = super::lost_pages();
+
+	// Shred: take a wide span, hand back every other page, then hand back the rest. The run table
+	// has to coalesce the second pass into the holes the first left.
+	let base = allocate_contiguous(FRAGMENTED_PAGES as usize).expect("a span to shred");
+	unsafe {
+		for index in (0..FRAGMENTED_PAGES).step_by(2) {
+			deallocate(base + index * PAGE_SIZE);
+		}
+	}
+	// A DMA buffer while the pool is at its most broken: every other page of that span is free and
+	// the odd ones are still out. Small enough to fit a surviving run, which is the point - a
+	// caller that needs four contiguous pages must not be refused because the pool is untidy.
+	let squeezed = DmaBuffer::create_in(&crate::sched::root_domain(), 4 * PAGE_SIZE as usize);
+	assert!(squeezed.is_ok(), "a small DMA buffer must be servable from a fragmented pool");
+	drop(squeezed);
+
+	unsafe {
+		for index in (1..FRAGMENTED_PAGES).step_by(2) {
+			deallocate(base + index * PAGE_SIZE);
+		}
+	}
+
+	// And once it is whole again, a buffer spanning the width that was just returned. This is the
+	// coalescing assertion: the pages came back as `FRAGMENTED_PAGES` separate frees and only a
+	// table that re-formed them into one run can answer this.
+	let whole = DmaBuffer::create_in(&crate::sched::root_domain(), (FRAGMENTED_PAGES * PAGE_SIZE) as usize);
+	assert!(whole.is_ok(), "the shredded span re-coalesced, so a DMA buffer of its full width is servable");
+	drop(whole);
+
+	assert_eq!(super::lost_pages(), lost_before, "and none of that churn lost a page");
+}

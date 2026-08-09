@@ -608,8 +608,12 @@ fn the_memory_volumes_bound_and_answer_streams() {
 	// service hardened against one client's stalls all the way through this milestone could still
 	// be killed by a client that simply asks a lot.
 	let mut crowd = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
-	let granted = crowd.connect_until_refused(160).expect("the table has a ceiling and the service says so");
+	// The attempt bound comes from the same stated limit the service derives its ceiling from, so
+	// the two cannot drift apart. It was 160, chosen when the ceiling was a hand-picked 64; the
+	// ceiling is now `MAX_WAIT_SET_MEMBERS - 2`, and a fixed 160 would simply never reach it.
+	let granted = crowd.connect_until_refused(abi::MAX_WAIT_SET_MEMBERS + 8).expect("the table has a ceiling and the service says so");
 	assert!(granted > 16, "the ceiling is far above what the system actually opens: {granted}");
+	assert!(granted <= abi::MAX_WAIT_SET_MEMBERS, "and no higher than the wait set can hold: {granted}");
 	assert!(crowd.write(b"vol://tmp/after-crowd", b"x", 0x7c21), "and the service is still serving after refusing");
 
 	// A stream handle the service cannot wait on is refused before it reaches the wait set.
@@ -754,7 +758,7 @@ fn a_services_round_trip_against_its_client_count() {
 	// log so a change to the loop can be judged against them rather than guessed at.
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe");
-	for crowd in [4usize, 32, 62] {
+	for crowd in [4usize, 32, 62, 254] {
 		let mut harness = StorageHarness::start_memory(storage_elf, b"TMPVOL", 4096);
 		let ns = harness.round_trip_ns_with_crowd(crowd, 20);
 		crate::serial_println!("storage-roundtrip-perf: clients={crowd} ns-per-round-trip={ns}");

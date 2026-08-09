@@ -2421,6 +2421,16 @@ fn pump_block_stand_in(blk_host: &object::channel::Channel, disk: &mut alloc::co
 	}
 }
 
+// What a harness was started over, so `restart` can start it the same way.
+#[derive(Clone)]
+enum Backing {
+	// A block device the harness itself serves out of its sector map. `tag` is the bootstrap word
+	// - BLOCK, FATBLOCK, ISOBLOCK, UDFBLOCK, USBBLOCK - because they are not interchangeable.
+	Disk { tag: alloc::vec::Vec<u8> },
+	// A volume that lives on the service's heap. There is no disk, which is the whole point.
+	Memory { tag: alloc::vec::Vec<u8>, bytes: usize },
+}
+
 struct StorageHarness {
 	boot: alloc::sync::Arc<object::channel::Channel>,
 	block: alloc::sync::Arc<object::channel::Channel>,
@@ -2428,6 +2438,15 @@ struct StorageHarness {
 	admin: alloc::sync::Arc<object::channel::Channel>,
 	disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>,
 	capacity: u64,
+	// How this harness was started, so `restart` can start it the same way.
+	//
+	// It could not, and restarted EVERYTHING as `BLOCK` over whatever was in `disk`. For a
+	// disk-backed harness that is right. For a memory-backed one `disk` is empty, so the service
+	// was handed a blank disk - and the only reason the test passed is that the service used to
+	// FORMAT one, producing an empty volume, which is what a restarted memory volume looks like.
+	// The assertion was true for a reason that had nothing to do with what it was testing, and the
+	// moment the service stopped formatting disks it failed.
+	backing: Backing,
 	// The service's own process, so a test can read its handle table. Handle leaks are invisible
 	// from the outside - the service keeps answering, one handle poorer each time - until the table
 	// is full and every later request fails for a reason unrelated to what caused it.
@@ -2476,6 +2495,48 @@ impl fscore::BlockDevice for FixtureDisk {
 		}
 		true
 	}
+}
+
+// A LiberFS volume laid straight onto a whole device, as a sector map: the fixed whole-device
+// layout, superblock at LBA 0, no partition table.
+//
+// This is what `mkpackages` produces and what gets written to a medium. Tests build it here rather
+// than asking StorageService for one, because the service reads disks and does not make them - it
+// used to format a blank disk at boot, and several tests got their volume that way without ever
+// saying so.
+fn whole_device_volume(bytes: usize) -> alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> {
+	prepared_volume(0, (bytes / liberfs::BLOCK_SIZE) as u64)
+}
+
+// The same, starting at `first_lba` - a volume inside a GPT partition rather than on the whole
+// device. The sector map is shifted, which is what a partition IS to the block layer.
+//
+// FORMATTED ONCE PER SIZE and cloned, for the reason `start_system` gives about its own fixture:
+// laying out a LiberFS volume is a B-tree walk and a transaction log, and under TCG that is minutes
+// rather than seconds when several tests each pay it. Copying the finished sector map is a memcpy.
+//
+// The first version had no cache and three tests asked for the same 64 MB volume. It cost riscv64
+// roughly half its throughput - 36 s per test against 22 - which is the exact trap the comment on
+// `start_system` was written to warn about, walked into three functions further down the same file.
+fn prepared_volume(first_lba: u64, blocks: u64) -> alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> {
+	static FORMATTED: crate::sync::SpinLock<Option<(u64, alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>)>> = crate::sync::SpinLock::new(None);
+	// Keyed by size alone: the shift is applied to the copy, so one cached map serves every offset.
+	let cached = FORMATTED.lock().as_ref().and_then(|(size, sectors)| (*size == blocks).then(|| sectors.clone()));
+	let sectors = match cached {
+		Some(sectors) => sectors,
+		None => {
+			let opts = liberfs::FormatOpts { uuid: *b"libersystem-who\0", label: b"system".to_vec(), compress: false };
+			let disk = FixtureDisk { sectors: alloc::collections::BTreeMap::new() };
+			let fs = liberfs::LiberFs::format_opts(disk, blocks, opts).expect("format the volume fixture");
+			let sectors = fs.into_device().sectors;
+			*FORMATTED.lock() = Some((blocks, sectors.clone()));
+			sectors
+		}
+	};
+	if first_lba == 0 {
+		return sectors;
+	}
+	sectors.into_iter().map(|(lba, sector)| (lba + first_lba, sector)).collect()
 }
 
 impl StorageHarness {
@@ -2611,7 +2672,7 @@ impl StorageHarness {
 		send_cap(&boot, tag, block_child, Rights::ALL).expect("storage block bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
-		let mut harness = Self { boot, block, client, admin, disk, capacity, process: None };
+		let mut harness = Self { boot, block, client, admin, disk, capacity, process: None, backing: Backing::Disk { tag: tag.to_vec() } };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -2639,7 +2700,7 @@ impl StorageHarness {
 		boot.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("memory volume bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
-		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: bytes as u64, process: Some(process) };
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: bytes as u64, process: Some(process), backing: Backing::Memory { tag: tag.to_vec(), bytes } };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -2673,7 +2734,10 @@ impl StorageHarness {
 		boot.send(Message::new(request, alloc::vec![cap], 0)).expect("archive volume bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
-		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: volume.len() as u64, process: None };
+		// Restarting this one is not expressible: the volume is a MemoryObject handed over at
+		// bootstrap, not a backing this harness can rebuild. No test asks, and `restart` would need
+		// the archive bytes to try.
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: volume.len() as u64, process: None, backing: Backing::Memory { tag: alloc::vec::Vec::new(), bytes: 0 } };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
@@ -2689,6 +2753,8 @@ impl StorageHarness {
 		self.process.as_ref().expect("this harness did not keep the service process").handle_count()
 	}
 
+	// Restart the service over the SAME backing, which is the only restart that means anything: a
+	// disk-backed volume must read its files back, and a memory-backed one must not.
 	fn restart(mut self, storage_elf: &[u8]) -> Self {
 		use object::channel::Message;
 		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("storage shutdown request");
@@ -2697,8 +2763,12 @@ impl StorageHarness {
 			if self.client.is_peer_closed() {
 				let disk = core::mem::take(&mut self.disk);
 				let capacity = self.capacity;
+				let backing = self.backing.clone();
 				drop(self);
-				return Self::start_disk(storage_elf, b"BLOCK", disk, capacity);
+				return match backing {
+					Backing::Disk { tag } => Self::start_disk(storage_elf, &tag, disk, capacity),
+					Backing::Memory { tag, bytes } => Self::start_memory(storage_elf, &tag, bytes),
+				};
 			}
 		}
 		panic!("StorageService harness did not shut down");
@@ -2908,7 +2978,8 @@ impl StorageHarness {
 		boot.send(Message::new(request, alloc::vec![cap], 0)).expect("live volume bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
-		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: image.len() as u64, process: None };
+		// As above: the live image arrives as a MemoryObject, so there is no backing to restart from.
+		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: image.len() as u64, process: None, backing: Backing::Memory { tag: alloc::vec::Vec::new(), bytes: 0 } };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {

@@ -236,6 +236,12 @@ enum Scope {
 
 struct Client {
 	chan: u64,
+	// The koid the wait set answers with when this client becomes ready.
+	//
+	// `waitset_wait` names the READY MEMBER, not a position: a caller that had to keep a list in
+	// the kernel's order was the whole reason the first two migration attempts failed, because this
+	// table uses `swap_remove` and permutes. A koid needs no mirror.
+	koid: u64,
 	scope: Scope,
 	// Set when this client would not take an answer within the bound, cleared the moment it takes
 	// one. While it is set, answers to this client are attempted ONCE and abandoned rather than
@@ -256,6 +262,9 @@ struct Client {
 struct AdminCall<'a> {
 	volume: &'a Volume,
 	clients: &'a mut Vec<Client>,
+	// The wait set the clients belong to. Handed in rather than reached for, because admitting a
+	// client is joining it - see `admit_client`.
+	set: u64,
 }
 
 impl volume_admin::Service for AdminCall<'_> {
@@ -265,7 +274,7 @@ impl volume_admin::Service for AdminCall<'_> {
 		// A refused admission closes BOTH ends: the grant did not happen, so neither handle has an
 		// owner. `Again` is what it is - the table is full or the machine is short, and both are
 		// conditions a caller can retry rather than a fault in the request.
-		if !admit_client(self.clients, Client { chan: server, scope, quiet: false }) {
+		if !admit_client(self.set, self.clients, Client { chan: server, koid: 0, scope, quiet: false }) {
 			unsafe {
 				close(server);
 				close(client);
@@ -606,7 +615,7 @@ fn reply_outcome(chan: u64, bytes: &[u8], handles: &[u64], wait: bool) -> SendOu
 	sent
 }
 
-fn abandon_pending(vol: &mut Volume, pending: &mut Option<PendingWrite>, chan: u64) {
+fn abandon_pending(set: u64, vol: &mut Volume, pending: &mut Option<PendingWrite>, chan: u64) {
 	if pending.as_ref().is_none_or(|p| p.client != chan) {
 		return;
 	}
@@ -614,7 +623,24 @@ fn abandon_pending(vol: &mut Volume, pending: &mut Option<PendingWrite>, chan: u
 	if p.incremental {
 		vol.fs.stream_abort();
 	}
-	unsafe { close(p.stream) };
+	leave_stream(set, p.stream);
+}
+
+// Take the stream out of the wait set and close it, in that order, and nowhere else.
+//
+// The ORDER is the whole function. `waitset_remove` names a member by the handle it joined under,
+// so closing first hands it a dead handle: the member stays in the set, its closed peer is
+// permanently READABLE, and the loop wakes for a koid no member owns - forever. A livelock, so it
+// shows up as a suite that never finishes rather than one that fails. A diagnostic counted 12,917
+// of those wakes in three minutes before this was found, at the same test that hung the FIRST
+// migration attempt in M0147 - which was reverted without a diagnosis, and may well have been this.
+//
+// The per-pass reconcile cannot do this job, and trying to make it was the mistake: by the time it
+// notices `pending` is gone, whoever took it has already closed the handle. Joining can be noticed
+// late. Leaving cannot.
+fn leave_stream(set: u64, stream: u64) {
+	let _ = unsafe { waitset_remove(set, stream) };
+	unsafe { close(stream) };
 }
 
 // Finish a write stream and answer the client that asked for it. Returns the client's channel when
@@ -624,7 +650,7 @@ fn abandon_pending(vol: &mut Volume, pending: &mut Option<PendingWrite>, chan: u
 // a slower leak in its place: a subclient whose queue is full at exactly this moment stays in the
 // table holding its channel, and nothing ever revisits it. `reply_to` already reports a stall for
 // every other answer in the service; this one had its own.
-fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, quiet: bool, reply: &mut [u8]) -> Option<u64> {
+fn finish_stream(set: u64, vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, quiet: bool, reply: &mut [u8]) -> Option<u64> {
 	let result = match outcome {
 		Ok(()) => {
 			if p.incremental {
@@ -643,7 +669,7 @@ fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, 
 			Err(e)
 		}
 	};
-	unsafe { close(p.stream) };
+	leave_stream(set, p.stream);
 	if let Some(len) = write_stream_reply(p.corr, result, reply) {
 		// The SAME answer path as every other reply, `quiet` and all.
 		//
@@ -665,7 +691,7 @@ fn finish_stream(vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, 
 // The root client is never dropped: it is the boot chain's channel, closing it ends the service,
 // and a root that has stopped reading is the boot chain's problem rather than something to resolve
 // by exiting. Index 0 is the root by construction - `serve_volume` seeds the table with it.
-fn drop_stalled(vol: &mut Volume, clients: &mut Vec<Client>, pending: &mut Option<PendingWrite>, chan: u64) {
+fn drop_stalled(set: u64, vol: &mut Volume, clients: &mut Vec<Client>, pending: &mut Option<PendingWrite>, chan: u64) {
 	let Some(index) = clients.iter().position(|c| c.chan == chan) else { return };
 	if index == 0 {
 		// The root is never dropped - closing it ends the service - so what it gets instead is the
@@ -675,9 +701,9 @@ fn drop_stalled(vol: &mut Volume, clients: &mut Vec<Client>, pending: &mut Optio
 		clients[0].quiet = true;
 		return;
 	}
-	abandon_pending(vol, pending, chan);
+	abandon_pending(set, vol, pending, chan);
+	release_client(set, clients, index);
 	unsafe { close(chan) };
-	clients.swap_remove(index);
 }
 
 fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
@@ -689,16 +715,47 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 	// condition under which a backlog costs everyone else a deadline per request, which is what the
 	// root client demonstrated.
 	let mut admin_quiet = false;
-	let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full, quiet: false }];
-	// Allocated ONCE and cleared each pass. It was rebuilt with `Vec::with_capacity` on every trip
-	// round the event loop, which is an infallible allocation on the hot path of a service whose
-	// whole design is that it reports rather than aborts. `MAX_CLIENTS + 2` is its final size (the
-	// admin channel and the write stream are the two), so after this it never grows again.
-	let mut waits: Vec<u64> = Vec::new();
-	if waits.try_reserve_exact(MAX_CLIENTS + 2).is_err() {
-		unsafe { print(b"storage: cannot allocate the wait set; the service cannot serve\n") };
+
+	// ONE registration per member, made when it joins, instead of one per member per pass.
+	//
+	// `wait_any` takes a fresh array of handles on every call, so the kernel registers a waiter on
+	// every channel in it and takes them all out again - once per pass, for as long as this service
+	// runs. Answering one client therefore costs more the more OTHER clients are connected, and
+	// none of them asked for anything. Measured on 2026-08-09: 56,974 ns per round trip at four
+	// clients, 133,811 at sixty-two - about 1,325 ns of tax per additional connection. That slope
+	// is why `MAX_CLIENTS` is 64.
+	let set: i64 = unsafe { waitset_create() };
+	if set < 0 {
+		unsafe { print(b"storage: cannot create the wait set; the service cannot serve\n") };
 		unsafe { exit() };
 	}
+	let set: u64 = set as u64;
+
+	let mut clients: Vec<Client> = Vec::new();
+	if !admit_client(set, &mut clients, Client { chan: root, koid: 0, scope: Scope::Full, quiet: false }) {
+		unsafe { print(b"storage: cannot admit the root client; the service cannot serve\n") };
+		unsafe { exit() };
+	}
+	// The admin joins once too, and leaves when its peer closes. Its koid is kept beside the handle
+	// because the wait answers with koids and this comparison happens every pass.
+	let mut admin_koid: u64 = 0;
+	if admin != 0 {
+		let koid = unsafe { waitset_add(set, admin) };
+		if koid <= 0 {
+			unsafe { print(b"storage: cannot watch the admin channel; the service cannot serve\n") };
+			unsafe { exit() };
+		}
+		admin_koid = koid as u64;
+	}
+	// The stream's handle and koid while one is in flight; 0 when none is.
+	//
+	// Reconciled once per pass against `pending`, which is the one thing here that is NOT edited
+	// where it changes: it is taken in four places and set in two, and threading a set handle
+	// through all six is exactly the "missed call site" M0147 warns about. Reconciling ONE member
+	// is two comparisons - it is the per-CLIENT reconcile that was quadratic and got the second
+	// migration attempt reverted, and this is not that.
+	let mut stream_chan: u64 = 0;
+	let mut stream_koid: u64 = 0;
 
 	let mut request: [u8; 1024] = [0u8; 1024];
 	let mut reply: [u8; 4096] = [0u8; 4096];
@@ -719,16 +776,27 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				listing = None;
 			}
 		}
-		waits.clear();
-		if admin != 0 {
-			waits.push(admin);
+		// The stream JOINS here and leaves in `leave_stream`, which is also the only place its
+		// handle is closed - the two have to happen together and in that order, so they live in one
+		// function. Joining is safe to notice late; leaving is not.
+		let want_stream: u64 = pending.as_ref().map(|p| p.stream).unwrap_or(0);
+		if want_stream != stream_chan {
+			stream_koid = 0;
+			if want_stream != 0 {
+				let koid = unsafe { waitset_add(set, want_stream) };
+				// A stream the set will not watch is one whose chunks would never wake this loop.
+				// The client is told by the deadline rather than left waiting on a promise.
+				if koid > 0 {
+					stream_koid = koid as u64;
+				}
+			}
+			stream_chan = want_stream;
 		}
-		waits.extend(clients.iter().map(|client| client.chan));
-		// The stream waits WITH everything else, so a chunk arriving and a new client asking for
-		// something are the same kind of event and neither excludes the other.
-		if let Some(p) = pending.as_ref() {
-			waits.push(p.stream);
-		}
+		// Nothing else to assemble. The membership is the set's, maintained where it CHANGES - a client
+		// joining or leaving, a stream beginning or ending - instead of restated on every pass.
+		// The stream is a member like everything else, so a chunk arriving and a new client asking
+		// for something are the same kind of event and neither excludes the other.
+		//
 		// Wake for the stream's deadline even if nothing arrives, so a silent sender is given up on
 		// rather than waited out.
 		// A stalled listing polls rather than sleeps: `wait_any` applies one readiness sense to the
@@ -746,7 +814,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		// empties. With a stream's deadline in the set, that means the peer which would SEND the
 		// next chunk cannot run - the service sleeps thirty seconds and gives up on a sender that
 		// was never given the chance to speak. This wait is a guard, not progress.
-		let ready: i64 = unsafe { wait_any_periodic(&waits, deadline) };
+		let ready: i64 = unsafe { waitset_wait(set, deadline, WAIT_PERIODIC) };
 		if ready < 0 {
 			// A wait that TIMED OUT is ordinary; one that could not be performed is not, and
 			// retrying it spins the loop at full speed until the deadline serving nobody. The
@@ -755,8 +823,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 			if ready != ERR_TIMED_OUT {
 				if let Some(p) = pending.take() {
 					let quiet = clients.iter().any(|c| c.chan == p.client && c.quiet);
-					if let Some(stalled) = finish_stream(vol, p, Err(Error::Invalid), quiet, &mut reply) {
-						drop_stalled(vol, &mut clients, &mut pending, stalled);
+					if let Some(stalled) = finish_stream(set, vol, p, Err(Error::Invalid), quiet, &mut reply) {
+						drop_stalled(set, vol, &mut clients, &mut pending, stalled);
 					}
 				}
 				if let Some(l) = listing.take() {
@@ -768,8 +836,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				if unsafe { clock() } >= p.deadline() {
 					let p = pending.take().expect("checked");
 					let quiet = clients.iter().any(|c| c.chan == p.client && c.quiet);
-					if let Some(stalled) = finish_stream(vol, p, Err(Error::Again), quiet, &mut reply) {
-						drop_stalled(vol, &mut clients, &mut pending, stalled);
+					if let Some(stalled) = finish_stream(set, vol, p, Err(Error::Again), quiet, &mut reply) {
+						drop_stalled(set, vol, &mut clients, &mut pending, stalled);
 					}
 				}
 			}
@@ -777,28 +845,31 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 			// A stalled listing needs no branch here: the push at the top of the loop retries it,
 			// and gives it up once its own deadline passes.
 		}
-		let chan: u64 = waits[ready as usize];
+		// `ready` is the KOID of whatever became ready, and the three things it can be are checked
+		// in the order they are cheapest to rule out.
+		let ready: u64 = ready as u64;
 		if let Some(p) = pending.as_ref() {
-			if chan == p.stream {
+			if stream_koid != 0 && ready == stream_koid {
+				let _ = p;
 				let mut p = pending.take().expect("checked");
 				match take_chunk(vol, &mut p) {
 					StreamStep::More => pending = Some(p),
 					StreamStep::Done(result) => {
 						let quiet = clients.iter().any(|c| c.chan == p.client && c.quiet);
-						if let Some(stalled) = finish_stream(vol, p, result, quiet, &mut reply) {
-							drop_stalled(vol, &mut clients, &mut pending, stalled);
+						if let Some(stalled) = finish_stream(set, vol, p, result, quiet, &mut reply) {
+							drop_stalled(set, vol, &mut clients, &mut pending, stalled);
 						}
 					}
 				}
 				continue;
 			}
 		}
-		if chan == admin {
+		if admin != 0 && ready == admin_koid {
 			match unsafe { recv_blocking(admin, &mut request) } {
 				Received::Message { len, handle } => {
 					let mut reply_handle = proto::codec::Handles::new();
 					let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
-					let mut call = AdminCall { volume: vol, clients: &mut clients };
+					let mut call = AdminCall { volume: vol, clients: &mut clients, set };
 					if let Some(reply_len) = volume_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
 						// Bounded like every other answer. Admin is privileged, so this is
 						// availability rather than exposure - but "no unbounded send to a client
@@ -825,11 +896,26 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						unsafe { close(unclaimed) };
 					}
 				}
-				Received::Closed => admin = 0,
+				Received::Closed => {
+					// Out of the set with it: a member whose handle is closed is a wake that can
+					// never be answered.
+					let _ = unsafe { waitset_remove(set, admin) };
+					admin = 0;
+					admin_koid = 0;
+				}
 			}
 			continue;
 		}
-		let Some(index) = clients.iter().position(|client| client.chan == chan) else { continue };
+		// By koid, which is what the wait answered with. The scan is the same one the channel
+		// lookup was, over the same table - what has gone is the kernel doing sixty-two
+		// registrations to tell us which entry to scan for.
+		// A wake for a koid no member owns is not expected and must not spin. It happened - 12,917
+		// times in three minutes - while a closed stream stayed in the set because its handle had
+		// been closed before `waitset_remove` could name it, and a closed peer is permanently
+		// readable. The loop is written so that cannot recur (`leave_stream`), and this stays a
+		// `continue` rather than an assertion because a service does not get to abort over one.
+		let Some(index) = clients.iter().position(|client| client.koid == ready) else { continue };
+		let chan: u64 = clients[index].chan;
 		let scope: Scope = clients[index].scope.clone();
 		let quiet: bool = clients[index].quiet;
 		match unsafe { recv_blocking(chan, &mut request) } {
@@ -837,9 +923,15 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				if index == 0 {
 					exit();
 				}
-				abandon_pending(vol, &mut pending, chan);
+				abandon_pending(set, vol, &mut pending, chan);
+				// The set FIRST, the handle after. `waitset_remove` names the member by the handle it joined
+				// under, so closing first hands it a dead handle: the member stays in the set, and a closed
+				// peer is permanently READABLE - the set wakes, no client matches the koid, the loop
+				// continues, and it wakes again at once. A livelock rather than a deadlock, which is why it
+				// presents as a test that never finishes instead of one that stops. Very likely what hung the
+				// first migration attempt, at this same test.
+				release_client(set, &mut clients, index);
 				unsafe { close(chan) };
-				clients.swap_remove(index);
 			}
 			Received::Message { len, handle } => {
 				let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
@@ -854,7 +946,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					// An empty reply with no handle is this call's refusal form, and a table that is
 					// full uses it like a channel that could not be created.
 					match unsafe { channel() } {
-						Some((server, client)) if admit_client(&mut clients, Client { chan: server, scope, quiet: false }) => {
+						Some((server, client)) if admit_client(set, &mut clients, Client { chan: server, koid: 0, scope, quiet: false }) => {
 							stalled = reply_to(chan, &[], &[client], !quiet);
 						}
 						Some((server, client)) => {
@@ -914,9 +1006,15 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					// gets instead is the quiet flag, so the REST of its backlog is answered without
 					// waiting and nobody else pays for it.
 					if index != 0 {
-						abandon_pending(vol, &mut pending, chan);
+						abandon_pending(set, vol, &mut pending, chan);
+						// The set FIRST, the handle after. `waitset_remove` names the member by the handle it joined
+						// under, so closing first hands it a dead handle: the member stays in the set, and a closed
+						// peer is permanently READABLE - the set wakes, no client matches the koid, the loop
+						// continues, and it wakes again at once. A livelock rather than a deadlock, which is why it
+						// presents as a test that never finishes instead of one that stops. Very likely what hung the
+						// first migration attempt, at this same test.
+						release_client(set, &mut clients, index);
 						unsafe { close(chan) };
-						clients.swap_remove(index);
 					} else {
 						clients[0].quiet = true;
 					}
@@ -935,9 +1033,15 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				if index == 0 {
 					exit();
 				}
-				abandon_pending(vol, &mut pending, chan);
+				abandon_pending(set, vol, &mut pending, chan);
+				// The set FIRST, the handle after. `waitset_remove` names the member by the handle it joined
+				// under, so closing first hands it a dead handle: the member stays in the set, and a closed
+				// peer is permanently READABLE - the set wakes, no client matches the koid, the loop
+				// continues, and it wakes again at once. A livelock rather than a deadlock, which is why it
+				// presents as a test that never finishes instead of one that stops. Very likely what hung the
+				// first migration attempt, at this same test.
+				release_client(set, &mut clients, index);
 				unsafe { close(chan) };
-				clients.swap_remove(index);
 			}
 		}
 	}
@@ -1180,30 +1284,49 @@ const STREAM_ACCUMULATION: usize = 64 * 1024 * 1024;
 // to abort the process, so the service that has been hardened against one client's stalls all the
 // way through this milestone could still be killed by a client that simply asks a lot.
 //
-// Sixty-four, and the number was MEASURED rather than picked.
+// DERIVED from the wait set's own limit, less the admin channel and the write stream.
 //
-// It is far above what the system opens - a handful of services and one per directory grant - and
-// far below what exhausts a handle table, so the range of defensible values was wide. What narrowed
-// it is that this loop rebuilds and scans its wait set once per pass, so its cost grows with the
-// client count: forty-eight connections cost nothing measurable, and a ceiling of 256 could not be
-// REACHED by a test inside fifteen minutes of emulated time. A service that crawls under a
-// connection flood is bounded in the wrong sense, and a ceiling no test ever reaches is a comment.
+// It was sixty-four, and that number was measured around a defect rather than chosen: `wait_any`
+// took a fresh array of handles on every pass, so the kernel registered a waiter on every channel
+// and removed them all again, and answering one client cost more the more OTHERS were connected.
+// Sixty-four is where the service was still brisk. M0147 removed that cost - one registration per
+// member, made when it joins - and the slope fell from 1,325 ns per additional client to 526.
 //
-// The scan itself is worth fixing on its own account, and is recorded in M0139 as such. Until it is,
-// the ceiling is set where the service is still brisk.
-const MAX_CLIENTS: usize = 64;
+// So the ceiling stops being a performance number and becomes a structural one: a client is a
+// member of the set, and the set holds `MAX_WAIT_SET_MEMBERS`. Two are spoken for.
+const MAX_CLIENTS: usize = rt::MAX_WAIT_SET_MEMBERS - 2;
 
-// Admit a client into the table, or say why not. Fallible on both counts a `push` is not: the table
-// has a ceiling, and the growth that carries it there can be refused rather than abort.
-fn admit_client(clients: &mut Vec<Client>, client: Client) -> bool {
+// Admit a client into the table AND into the wait set, or say why not.
+//
+// The two are ONE operation and this is the only place either happens. A client in the table the
+// set does not know about never gets served; a member of the set with no table entry is a wake
+// nobody can answer. Membership drifting apart is the failure M0147 warned about by name - "a
+// missed call site is a silently stale set that serves the WRONG client" - and the way to not miss
+// a call site is to have one.
+//
+// Fallible on three counts a `push` is not: the table has a ceiling, the growth that carries it
+// there can be refused, and the kernel can refuse the registration.
+fn admit_client(set: u64, clients: &mut Vec<Client>, mut client: Client) -> bool {
 	if clients.len() >= MAX_CLIENTS {
 		return false;
 	}
 	if clients.try_reserve(1).is_err() {
 		return false;
 	}
+	let koid = unsafe { waitset_add(set, client.chan) };
+	if koid <= 0 {
+		return false;
+	}
+	client.koid = koid as u64;
 	clients.push(client);
 	true
+}
+
+// Take a client out of both, in the order that cannot leave a wake for a member that is gone: the
+// set first, the table second, the handle last.
+fn release_client(set: u64, clients: &mut Vec<Client>, index: usize) -> Client {
+	let _ = unsafe { waitset_remove(set, clients[index].chan) };
+	clients.swap_remove(index)
 }
 
 trait FileSystem {

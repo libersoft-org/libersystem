@@ -263,6 +263,12 @@ pub const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 // this is the fixed one the audit asked for.
 pub const MAX_WAIT_HANDLES: usize = 256;
 
+// The most objects one wait SET may hold - the persistent form of the same question, and the same
+// number for the same reason. Stated here rather than only in the kernel because a service sizing
+// its client table against it needs to read it: StorageService's ceiling used to be a number picked
+// around a defect, and deriving it from the set's own limit is what replaced that.
+pub const MAX_WAIT_SET_MEMBERS: usize = 256;
+
 // The largest ELF image `SYS_PROCESS_LOAD` will read out of a caller's buffer. A program that
 // does not fit is refused rather than sized into a kernel allocation.
 pub const MAX_ELF_BYTES: usize = 64 * 1024 * 1024;

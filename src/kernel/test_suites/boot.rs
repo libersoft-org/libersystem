@@ -144,20 +144,22 @@ fn init_package_starts_system_manager() {
 	assert_eq!(actual_lifecycle_reports, expected_lifecycle_reports, "lifecycle drill reports must preserve their causal order");
 }
 
-tagged_test!(system_volume_formats_to_the_disks_capacity, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "partition", "storage"]);
-fn system_volume_formats_to_the_disks_capacity() {
+tagged_test!(system_volume_spans_the_disks_capacity, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "partition", "storage"]);
+fn system_volume_spans_the_disks_capacity() {
 	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
-	// A fresh system volume spans the whole disk - StorageService asks the block
-	// device for its capacity (the block protocol's op 2) and derives the pool from
-	// it, instead of formatting a fixed 32 MB. Here we stand in for the block driver
-	// with a sparse in-memory disk (a sector map; unwritten sectors read back as
-	// zeros) reporting a 64 MB capacity: the mount probe finds no superblock and the
-	// seed probe no archive, so the service formats fresh - and the superblock it
-	// lays down must record a pool spanning everything past the factory-archive
-	// region, not the old fixed constant.
+	// A system volume spans the whole disk - StorageService asks the block device for its capacity
+	// (the block protocol's op 2) and derives the container from it, instead of a fixed 32 MB.
+	// Here we stand in for the block driver with a sparse in-memory disk (a sector map; unwritten
+	// sectors read back as zeros) reporting a 64 MB capacity, carrying a volume that spans it.
+	//
+	// The volume is laid down HERE. This test used to get one by handing the service a blank disk
+	// and letting it format, which is a shape that no longer occurs - the service mounts disks and
+	// does not make them, and a volume is made by `mkpackages` on the build host. What the test is
+	// FOR survives unchanged: the service must mount the whole container the disk allows and report
+	// its size, rather than a constant.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	const SECTOR: usize = 512;
 	let expected_pool: u64 = (CAPACITY - FALLBACK_START_SECTOR * SECTOR as u64) / 4096;
@@ -173,24 +175,25 @@ fn system_volume_formats_to_the_disks_capacity() {
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
 
 	// serve the raw block protocol over the sparse disk until the service reports in.
-	let mut disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	let mut disk: alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>> = crate::tests::whole_device_volume((expected_pool * 4096) as usize);
 	let mut online = false;
 	'serve: for _ in 0..100_000 {
 		sched::run_until_idle();
 		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
 		if let Ok(report) = boot_kernel.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online", "the service should come up on the fresh disk");
+			assert_eq!(&report.bytes[..], b"StorageService: online", "the service should come up on the prepared disk");
 			online = true;
 			break 'serve;
 		}
 	}
-	assert!(online, "the service should format the disk and report in");
-	// the freshly laid superblock (filesystem block 0 = the first sector past the
-	// factory-archive region) must record the capacity-derived pool. num_blocks sits
-	// at bytes 16..24 of the superblock - its stable on-disk ABI.
-	let sb = disk.get(&FALLBACK_START_SECTOR).expect("the format should write superblock slot 0");
+	assert!(online, "the service should mount the disk and report in");
+	// The superblock records the capacity-derived pool. num_blocks sits at bytes 16..24 of the
+	// superblock - its stable on-disk ABI. The FIXTURE wrote it, which is the point: the service
+	// must mount a container of exactly this size and report it below, and a service that derived
+	// a different one would say so through `status`.
+	let sb = disk.get(&FALLBACK_START_SECTOR).expect("superblock slot 0");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
-	assert_eq!(num_blocks, expected_pool, "the pool should span everything past the archive region, derived from the reported capacity");
+	assert_eq!(num_blocks, expected_pool, "the volume spans everything past the start sector, derived from the reported capacity");
 
 	// The typed volume health/policy ops over the serve channel. Send a generated
 	// request ([op u16][corr u32][args]) and pump block traffic until the reply lands.
@@ -220,7 +223,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	let compression = reply[23 + label_len];
 	let read_only = reply[24 + label_len];
 	assert_eq!(compression, 0, "compression starts off by default");
-	assert_eq!(read_only, 0, "the fresh volume mounts read-write");
+	assert_eq!(read_only, 0, "the volume mounts read-write");
 
 	// set-compression on (op 13) flips the live volume; status reflects it.
 	let mut sc = alloc::vec::Vec::new();
@@ -240,7 +243,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	assert_eq!(reply[4], 1, "fsck should succeed");
 	let failures = u32::from_le_bytes(reply[5..9].try_into().unwrap());
 	let damaged = u16::from_le_bytes([reply[9], reply[10]]);
-	assert_eq!((failures, damaged), (0, 0), "a fresh volume is clean");
+	assert_eq!((failures, damaged), (0, 0), "a newly written volume is clean");
 }
 
 tagged_test!(storage_harness_mounts_seeded_fat16, [Storage, Filesystem], covers = ["fat", "kernel", "liberfs", "storage"]);
@@ -261,7 +264,11 @@ fn system_volume_lands_in_a_gpt_partition() {
 	// A disk partitioned by another system: a GPT whose entry array names a LiberFS
 	// partition (the type GUID 4C424653-0001-4000-8000-4C6962657246) starting at LBA
 	// 8192 - NOT the fixed factory layout's FALLBACK_START_SECTOR. StorageService must
-	// find the partition, format the volume INSIDE it, and size the pool to it.
+	// find the partition and mount the volume INSIDE it, sized to the partition.
+	//
+	// The volume is written into the partition HERE. The service used to format it, and the
+	// property that mattered was never the formatting - it was that the service finds the
+	// PARTITION and treats its span as the container, rather than reaching for LBA 0.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
 	const PART_FIRST: u64 = 8192;
 	const PART_BLOCKS: u64 = 4096; // 16 MB
@@ -272,6 +279,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 	// now, and a hand-assembled header without them would be testing the refusal path.
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
 	lay_gpt(&mut disk, CAPACITY / 512, &[(partition::LIBERFS_TYPE_GUID, PART_FIRST, PART_LAST)]);
+	disk.extend(crate::tests::prepared_volume(PART_FIRST, PART_BLOCKS));
 
 	let (_volume, package) = scenario_packages().expect("boot modules should be present");
 	let elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
@@ -292,10 +300,10 @@ fn system_volume_lands_in_a_gpt_partition() {
 			break 'serve;
 		}
 	}
-	assert!(online, "the service should format inside the partition and report in");
+	assert!(online, "the service should mount the volume inside the partition and report in");
 
-	// the superblock lands at the partition's first LBA, sized to the partition -
-	// and nothing was written at the fixed factory-layout offset.
+	// the superblock sits at the partition's first LBA, sized to the partition - and no volume was
+	// laid at the fixed factory-layout offset.
 	let sb = disk.get(&PART_FIRST).expect("superblock slot 0 should sit at the partition start");
 	assert_eq!(&sb[0..8], b"LIBERFS1", "the partition should carry a LiberFS superblock");
 	let num_blocks = u64::from_le_bytes(sb[16..24].try_into().unwrap());
@@ -448,16 +456,25 @@ fn a_volume_on_the_whole_device_survives_a_remount() {
 	// The other side of the recogniser above, and the one that would break every second boot
 	// if it were got wrong: the fixed whole-device layout puts this system's OWN superblock
 	// at LBA 0 with no partition table, which is precisely the shape a superfloppy has. It
-	// must be mounted, not refused as foreign and not formatted as blank.
+	// must be mounted, not refused as foreign and not rewritten.
+	//
+	// The volume is laid down HERE, the way a real one is: `mkpackages` formats a LiberFS image on
+	// the build host and it is written to the medium. This test used to get its volume by handing
+	// the service a blank disk and letting it format one, which stopped working the moment the
+	// service stopped formatting disks - and that is the right outcome twice over, because the
+	// shape it was exercising is not a shape that occurs. What it is FOR is the remount, and the
+	// remount is what it still tests.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
-	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
-	assert!(storage_on_disk(&mut disk, CAPACITY), "a blank disk is formatted");
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = crate::tests::whole_device_volume(CAPACITY as usize);
 	let volume = disk.clone();
-	assert_eq!(&volume.get(&0).expect("the format wrote superblock slot 0")[0..8], b"LIBERFS1");
+	assert_eq!(&volume.get(&0).expect("the fixture wrote superblock slot 0")[0..8], b"LIBERFS1");
+
+	assert!(storage_on_disk(&mut disk, CAPACITY), "a volume written straight onto the medium mounts");
+	assert_eq!(disk.get(&0), volume.get(&0), "and a mount does not rewrite the volume it found");
 
 	// second boot, same disk.
-	assert!(storage_on_disk(&mut disk, CAPACITY), "and the volume it laid down mounts again");
-	assert_eq!(disk.get(&0), volume.get(&0), "a remount does not rewrite the volume it found");
+	assert!(storage_on_disk(&mut disk, CAPACITY), "and it mounts again");
+	assert_eq!(disk.get(&0), volume.get(&0), "a remount does not rewrite it either");
 }
 
 tagged_test!(garbage_where_the_superblock_should_be_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "storage"]);

@@ -40,7 +40,7 @@ use crate::sync::SpinLock;
 // this kernel and gets the same treatment: a fixed ceiling first, then a fallible allocation. 256
 // matches `MAX_WAIT_HANDLES` - a set is the persistent form of the same question, and a service that
 // needed more from one wait would have needed more from the other.
-pub const MAX_WAIT_SET_MEMBERS: usize = 256;
+pub const MAX_WAIT_SET_MEMBERS: usize = abi::MAX_WAIT_SET_MEMBERS;
 
 pub struct WaitSet {
 	header: ObjectHeader,

@@ -1023,8 +1023,8 @@ fn config_set_survives_a_service_reboot() {
 	// ConfigService write-throughs its tree to `vol://system/libexec/config_service/config.tree`, so a NEW
 	// instance over the SAME volume loads it back - the reboot property (and what
 	// makes the transparent ConfigService restart stateless). Stand up a
-	// StorageService over a fresh writable disk (the sparse block stand-in formats
-	// an empty LiberFS), run a FIRST ConfigService wired to a minted volume
+	// StorageService over a writable disk carrying a prepared empty LiberFS volume, run a FIRST
+	// ConfigService wired to a minted volume
 	// connection, SET a key, end the instance, then run a SECOND instance over
 	// another minted connection: the set value AND the seeded defaults both serve.
 	const CAPACITY: u64 = 64 * 1024 * 1024;
@@ -1032,15 +1032,15 @@ fn config_set_survives_a_service_reboot() {
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe in the init package");
 	let config_elf = program_elf(&package, scenario_volume, b"config_service").expect("config_service in the package or volume");
 
-	// StorageService over the sparse in-memory disk: no superblock and no archive,
-	// so it formats a fresh writable volume.
+	// StorageService over a sparse in-memory disk carrying a prepared volume. It used to be a blank
+	// disk the service formatted for itself, which is a shape that no longer occurs.
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (storage_server, storage_client) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
 	send_cap(&storage_boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("BLOCK bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("SERVE bootstrap");
-	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = BTreeMap::new();
+	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = crate::tests::whole_device_volume(CAPACITY as usize);
 	let mut online = false;
 	for _ in 0..100_000 {
 		sched::run_until_idle();
@@ -1051,7 +1051,7 @@ fn config_set_survives_a_service_reboot() {
 			break;
 		}
 	}
-	assert!(online, "StorageService should format the fresh disk and report in");
+	assert!(online, "StorageService should mount the prepared disk and report in");
 
 	// Mint an independent volume connection off the storage root (the CONNECT_OP
 	// factory), pumping block traffic while the service answers.
