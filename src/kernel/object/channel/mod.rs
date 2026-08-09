@@ -18,6 +18,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::domain::Domain;
 use super::handle::Capability;
@@ -44,8 +45,22 @@ pub enum ChannelError {
 	Empty,
 }
 
+// The next message identity. Monotonic and global rather than per-channel: a receiver looks at the
+// head of one queue and then takes from that same queue, so per-channel would be enough - but an id
+// that is unique across the system cannot be confused with one from anywhere else, and the counter
+// costs one relaxed increment per send. It starts at 1 so that 0 is never a real message.
+static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
+
 // A unit of IPC: a byte payload, transferred capabilities, and a sender badge.
 pub struct Message {
+	// What makes "take THIS message" expressible.
+	//
+	// A receiver has to know a message's shape before it can take it - how many bytes it must have
+	// room for, how many handle slots it must reserve - and it cannot learn that without looking
+	// first. Between the looking and the taking, a second receiver on the same endpoint may take
+	// the message that was looked at, so what the first receiver then gets is a DIFFERENT message
+	// it never inspected. `recv_identified` closes that by naming the message it agreed to.
+	pub id: u64,
 	pub bytes: Vec<u8>,
 	pub caps: Vec<Capability>,
 	pub badge: u64,
@@ -57,7 +72,7 @@ pub struct Message {
 
 impl Message {
 	pub fn new(bytes: Vec<u8>, caps: Vec<Capability>, badge: u64) -> Self {
-		Self { bytes, caps, badge, queue_charge: None }
+		Self { id: NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed), bytes, caps, badge, queue_charge: None }
 	}
 
 	// Charge this message's byte length to `domain`'s in-transit IPC quota, to be
@@ -209,7 +224,7 @@ impl Channel {
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
 	}
 
-	// Take the next message only if it fits what the caller has room for.
+	// Take the head of the queue if it is still the message `id` names AND it fits.
 	//
 	// `peek_shape` then `recv` is two operations under two separate locks, and a second receiver on
 	// the same endpoint can take the peeked message in between. What arrives is then a DIFFERENT
@@ -225,10 +240,24 @@ impl Channel {
 	// One lock, one decision, one dequeue. A message that does not fit is left where it is and the
 	// caller is told what it would have needed, which is the same answer `peek_shape` was giving
 	// and now cannot go stale between the asking and the taking.
-	pub fn recv_if_fits(&self, bytes_cap: usize, cap_slots: usize) -> Result<Message, RecvRefusal> {
+	//
+	// `recv_if_fits` - what this replaces - closed the race that mattered and left one open. It
+	// refused a message that did not fit and took whatever was at the head otherwise, so a caller
+	// that had reserved room for the message it PEEKED could still be handed a different one, as
+	// long as that one also fitted. For the byte length that was harmless (the receiver's buffer
+	// was big enough either way); for the capability count it was not, because the reservation is
+	// exact and a message carrying fewer caps than reserved leaves quota held for nothing, while
+	// one carrying more cannot be installed at all.
+	//
+	// Naming the message removes the class rather than another instance of it: the caller inspects
+	// a message, decides about THAT message, and either gets it or is told it is gone.
+	pub fn recv_identified(&self, id: u64, bytes_cap: usize, cap_slots: usize) -> Result<Message, RecvRefusal> {
 		let popped = {
 			let mut inbox = self.inbox.lock();
 			match inbox.front() {
+				// Somebody else took it, or it was never the head. Not an error: the caller peeks
+				// again and decides about whatever is there now.
+				Some(msg) if msg.id != id => return Err(RecvRefusal::Superseded),
 				Some(msg) if msg.bytes.len() > bytes_cap => return Err(RecvRefusal::TooLarge(msg.bytes.len())),
 				Some(msg) if msg.caps.len() > cap_slots => return Err(RecvRefusal::TooManyCaps(msg.caps.len())),
 				Some(_) => {
@@ -264,19 +293,27 @@ impl Channel {
 	// cannot retry what no longer exists. Both numbers have to be knowable BEFORE the
 	// message leaves the queue.
 	pub fn peek_shape(&self) -> Result<(usize, usize), ChannelError> {
+		self.peek_identified().map(|(_, bytes, caps)| (bytes, caps))
+	}
+
+	// The same, plus the identity that lets a caller act on the message it just looked at.
+	pub fn peek_identified(&self) -> Result<(u64, usize, usize), ChannelError> {
 		if let Some(msg) = self.inbox.lock().front() {
-			return Ok((msg.bytes.len(), msg.caps.len()));
+			return Ok((msg.id, msg.bytes.len(), msg.caps.len()));
 		}
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
 	}
 }
 
-// Why `recv_if_fits` did not take the message. `TooLarge` and `TooManyCaps` carry what the head of
-// the queue actually needs, so a caller can size a second attempt - and the message is still there
-// to be taken, which is what makes the answer worth carrying.
+// Why `recv_identified` did not take the message. `TooLarge` and `TooManyCaps` carry what the head
+// of the queue actually needs, so a caller can size a second attempt - and the message is still
+// there to be taken, which is what makes the answer worth carrying.
 pub enum RecvRefusal {
 	TooLarge(usize),
 	TooManyCaps(usize),
+	// The message the caller inspected is no longer at the head: another receiver on this endpoint
+	// took it. Nothing is wrong and nothing was destroyed - look again.
+	Superseded,
 	Gone(ChannelError),
 }
 

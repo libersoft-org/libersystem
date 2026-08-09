@@ -31,6 +31,17 @@ pub const UNLIMITED: u64 = u64::MAX;
 // touched pages cost memory; a Domain policy (PROP_STACK_LIMIT) overrides it.
 pub const DEFAULT_STACK_CEILING: u64 = 8 * 1024 * 1024;
 
+// The default ceiling on wait-set registrations a Domain may hold.
+//
+// A registration is kernel memory a userspace caller decides the size of: one `Arc` reference in
+// the set plus one scheduler observer entry, per member, per set. The handle quota does not bound
+// it - a set holding 256 members costs the Domain ONE handle - so 256 members times the handle
+// limit is what the "bound" actually permitted. This counts the thing itself.
+//
+// 1024 is four full sets, which is more than any service here builds, and small enough that
+// reaching it means something has gone wrong rather than that the system grew.
+pub const DEFAULT_WAIT_REGISTRATIONS: u64 = 1024;
+
 // A single counted, capped resource. `used` and `limit` are in bytes or counts
 // depending on the resource. All operations are atomic so accounting stays
 // correct when several cores charge the same Domain concurrently.
@@ -135,6 +146,9 @@ pub struct ResourceAccount {
 	// the receiver takes each message. Uncapped by default; a cap bounds how much a
 	// sender can queue (anti-DoS backpressure).
 	ipc_queue: ResourceCounter,
+	// Wait-set memberships held by this Domain's sets: one per (set, member) pair, charged where
+	// the registration is made and given back on `remove` and on the set's `Drop`.
+	wait_registrations: ResourceCounter,
 	// User stack bytes. `used` counts the stack pages currently mapped across the
 	// Domain's processes (the initial top pages plus every demand-paged growth
 	// page); `limit` is the PER-THREAD stack ceiling - the VA span below
@@ -145,7 +159,7 @@ pub struct ResourceAccount {
 
 impl ResourceAccount {
 	const fn new(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Self {
-		Self { memory: ResourceCounter::new(memory_limit), handles: ResourceCounter::new(handle_limit), threads: ResourceCounter::new(thread_limit), dma: ResourceCounter::new(UNLIMITED), ipc_queue: ResourceCounter::new(UNLIMITED), stack: ResourceCounter::new(DEFAULT_STACK_CEILING) }
+		Self { memory: ResourceCounter::new(memory_limit), handles: ResourceCounter::new(handle_limit), threads: ResourceCounter::new(thread_limit), dma: ResourceCounter::new(UNLIMITED), ipc_queue: ResourceCounter::new(UNLIMITED), wait_registrations: ResourceCounter::new(DEFAULT_WAIT_REGISTRATIONS), stack: ResourceCounter::new(DEFAULT_STACK_CEILING) }
 	}
 
 	pub fn memory(&self) -> &ResourceCounter {
@@ -162,6 +176,10 @@ impl ResourceAccount {
 
 	pub fn handles(&self) -> &ResourceCounter {
 		&self.handles
+	}
+
+	pub fn wait_registrations(&self) -> &ResourceCounter {
+		&self.wait_registrations
 	}
 
 	pub fn threads(&self) -> &ResourceCounter {
@@ -364,6 +382,15 @@ impl Domain {
 
 	pub fn try_charge_handle(&self) -> bool {
 		self.try_charge_hier(1, &|a: &ResourceAccount| a.handles())
+	}
+
+	// One wait-set membership. Charged by `WaitSet::add`, given back by `remove` and by `Drop`.
+	pub fn try_charge_wait_registration(&self) -> bool {
+		self.try_charge_hier(1, &|a: &ResourceAccount| a.wait_registrations())
+	}
+
+	pub fn uncharge_wait_registrations(&self, count: u64) {
+		self.uncharge_hier(count, &|a: &ResourceAccount| a.wait_registrations());
 	}
 
 	pub fn charge_handle(&self) {

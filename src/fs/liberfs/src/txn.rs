@@ -409,15 +409,26 @@ impl<D: BlockDevice> LiberFs<D> {
 						// inode, and it lets the guess be a guess: it descends as far as the bytes
 						// allow, says nothing about what it finds, and its result is added to the
 						// reservation rather than compared with it.
+						//
+						// The map is allocated with `?`, and the distinction matters more than it
+						// looks. A failure to PARSE the guess is correctly ignored, for the reason
+						// above. A failure to ALLOCATE the scratch map is not the guess failing; it
+						// is the protection not happening. This was `try_zeroed(..).ok()` with an
+						// `if let` around it, so under memory pressure the whole speculative walk
+						// was skipped, `derive_free` returned Ok, the mount stayed writable, and
+						// none of the directory's tree blocks were reserved - which is exactly the
+						// loss this reading exists to prevent, disappearing without a word at the
+						// moment the machine is under strain. `NoMemory` at mount is an answer this
+						// crate carries everywhere else; it is the right one here too.
+						// Allocated before the walk state is touched, so the error path leaves
+						// nothing half-set behind it.
+						let mut scratch = try_zeroed(map.len())?;
 						let strict = self.mark_strict;
 						let damage = self.walk_damage;
 						self.mark_strict = false;
-						let speculative = try_zeroed(map.len()).ok();
-						if let Some(mut scratch) = speculative {
-							let _ = self.mark_dir_tree(inode.dir_root_from_overlay(), inode.dir_root_crc_from_overlay(), &mut scratch);
-							for (into, from) in map.iter_mut().zip(scratch.iter()) {
-								*into |= *from;
-							}
+						let _ = self.mark_dir_tree(inode.dir_root_from_overlay(), inode.dir_root_crc_from_overlay(), &mut scratch);
+						for (into, from) in map.iter_mut().zip(scratch.iter()) {
+							*into |= *from;
 						}
 						self.mark_strict = strict;
 						self.walk_damage = damage;
@@ -663,6 +674,10 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
+			// The search below is a binary search, so a leaf whose keys do not ascend answers
+			// arbitrarily and the insert acts on that answer. `leaf_count` clamps the count to what
+			// the block can hold, which keeps the loop in bounds and says nothing about the order.
+			validate_fixed_leaf(&buf, rec, keylen).map_err(|_| FsError::Corrupt)?;
 			let count = leaf_count(&buf, rec);
 			// find the insert position, or an exact match by the full key.
 			let (mut lo, mut hi) = (0usize, count);
@@ -728,6 +743,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Ins::Split(left_dest, lcrc, sep, right_dest, rcrc));
 		}
 		// internal: route to a child and recurse; the shared absorber takes the outcome.
+		validate_internal(&buf).map_err(|_| FsError::Corrupt)?;
 		let ci = route_child(&buf, internal_count(&buf), key);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
@@ -818,6 +834,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
+			validate_fixed_leaf(&buf, rec, keylen).map_err(|_| FsError::Corrupt)?;
 			let count = leaf_count(&buf, rec);
 			let (mut lo, mut hi) = (0usize, count);
 			let mut found = None;
@@ -851,12 +868,113 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(Del::Updated(dest, ncrc));
 		}
 		// internal: route and recurse; the shared absorber takes the outcome.
+		validate_internal(&buf).map_err(|_| FsError::Corrupt)?;
 		let ci = route_child(&buf, internal_count(&buf), key);
 		let cp = child_ptr(&buf, ci);
 		let cc = child_crc(&buf, ci);
 		let outcome = self.tree_delete_node(cp, cc, key, probe, rec, keylen, depth - 1)?;
 		self.internal_absorb_del(&mut buf, ptr, ci, outcome)
 	}
+}
+
+// What is wrong with a node, judged from the block alone.
+//
+// The write path and the structural pass ask the same question about a node and used to answer it
+// separately. `fsck` knew ten invariants; a writable mount checked ONE - that a directory leaf holds
+// as many records as its header claims - and edited whatever else it found. The reachable case is
+// ordering: `dir_recs_search` is a binary search, so a checksum-valid leaf holding hashes in the
+// order 900, 100, 500 answers arbitrarily, and `dir_insert_node` takes that answer as either "the
+// name is here, replace its child" or "insert at this position". It then writes the leaf back and
+// `write_node_to` computes a fresh CRC over it: a new generation, correctly checksummed, built on a
+// structure the format cannot produce, with nothing left to say which name was duplicated and which
+// became unreachable.
+//
+// So the rules live here, once, and both callers use them. `fsck` turns a fault into a sentence;
+// the write path turns it into `Corrupt` and refuses the mutation, leaving the damage where an
+// operator can still see it. Only the LOCAL invariants are here - those a single block answers.
+// Routing intervals, duplicate names across a whole directory and blocks appearing twice need the
+// walk, and stay in the structural pass.
+//
+// Refusing to mutate a damaged node takes a repair verb away, which is a real cost and the one this
+// trades against: `remove` on a directory holding a bad record now fails. That is the same trade
+// the truncated-leaf check already made, and the alternative is a mutation that makes the damage
+// authoritative and consistent, which no later pass can distinguish from a volume that was always
+// that way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NodeFault {
+	// The header's count is more than the block can physically hold.
+	CountAboveCapacity,
+	// The parse stopped early: fewer records are present than the header claims.
+	Truncated { held: usize, claimed: usize },
+	// Keys, or (hash, name) pairs, are not strictly ascending. Strictness is what also rules out a
+	// duplicate within the node.
+	OutOfOrder,
+	// A directory record's stored hash is not the hash of its name.
+	StoredHashMismatch,
+	// A directory record's name is not one this format can address.
+	NameNotAddressable,
+	// An internal node's separators are not strictly ascending.
+	SeparatorsOutOfOrder,
+	// An internal node routes a whole key interval into a slot pointing nowhere.
+	ChildMissing(usize),
+}
+
+impl NodeFault {
+	// The sentence `fsck` reports, given the block it is about. The write path never calls this.
+	pub(crate) fn describe(&self, at: u64) -> Vec<u8> {
+		match *self {
+			NodeFault::CountAboveCapacity => alloc::format!("node {at} claims more records than it can hold"),
+			NodeFault::Truncated { held, claimed } => alloc::format!("leaf {at} holds {held} of the {claimed} records it claims"),
+			NodeFault::OutOfOrder => alloc::format!("leaf {at} is not in ascending key order"),
+			NodeFault::StoredHashMismatch => alloc::format!("leaf {at} holds a record whose stored hash is not its name's"),
+			NodeFault::NameNotAddressable => alloc::format!("leaf {at} holds a record whose name is not one this format can address"),
+			NodeFault::SeparatorsOutOfOrder => alloc::format!("node {at} has separators out of order"),
+			NodeFault::ChildMissing(slot) => alloc::format!("node {at} has no child in slot {slot}, so a range of names routes nowhere"),
+		}
+		.into_bytes()
+	}
+}
+
+// The invariants an INTERNAL node must satisfy before anything descends through it or edits it.
+//
+// A descent picks a slot by comparing the key against the separators, so separators out of order
+// route to the wrong subtree, and a null child routes a whole interval into block 0.
+pub(crate) fn validate_internal(buf: &[u8]) -> Result<(), NodeFault> {
+	if node_count(buf) > INTERNAL_MAX - 1 {
+		return Err(NodeFault::CountAboveCapacity);
+	}
+	let count = internal_count(buf);
+	let mut last: Option<u64> = None;
+	for i in 0..count {
+		let sep = sep_key(buf, i);
+		if last.is_some_and(|previous| sep <= previous) {
+			return Err(NodeFault::SeparatorsOutOfOrder);
+		}
+		last = Some(sep);
+	}
+	for i in 0..=count {
+		if child_ptr(buf, i) == 0 {
+			return Err(NodeFault::ChildMissing(i));
+		}
+	}
+	Ok(())
+}
+
+// The same for a fixed-record LEAF of the generic tree - the inode tree today. `keylen` is the
+// prefix of a record that is its key, which is what `tree_insert_node`'s binary search compares.
+pub(crate) fn validate_fixed_leaf(buf: &[u8], rec: usize, keylen: usize) -> Result<(), NodeFault> {
+	if node_count(buf) > (BLOCK_SIZE - NODE_HDR) / rec {
+		return Err(NodeFault::CountAboveCapacity);
+	}
+	let count = leaf_count(buf, rec);
+	for i in 1..count {
+		let previous = NODE_HDR + (i - 1) * rec;
+		let current = NODE_HDR + i * rec;
+		if key_cmp(&buf[previous..previous + keylen], &buf[current..current + keylen]) != Ordering::Less {
+			return Err(NodeFault::OutOfOrder);
+		}
+	}
+	Ok(())
 }
 
 // B+tree node accessors. A node block begins with an 8-byte header: a type byte

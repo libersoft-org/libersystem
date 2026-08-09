@@ -1771,6 +1771,208 @@ fn a_receive_takes_a_message_only_if_it_fits() {
 	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
 }
 
+tagged_test!(a_receive_may_not_install_a_handle_past_the_domains_limit, [Process, Syscall, Ipc], covers = ["kernel"]);
+fn a_receive_may_not_install_a_handle_past_the_domains_limit() {
+	// The plain receive installed a transferred capability with `HandleTable::insert`, which charges
+	// the Domain and enforces nothing. So a Domain at its handle ceiling received one more, and one
+	// more after that: the limit that bounds every other way of acquiring a handle was bypassed by
+	// asking a peer to send one. It was not a rare path either - all four of the runtime's receive
+	// wrappers issue `SYS_CHANNEL_RECV`.
+	//
+	// The reason it was written that way is the second half of the property: the message is out of
+	// the queue before the install, so a refusal there would destroy a message nobody can retry.
+	// Both halves are asserted, because fixing one by breaking the other is the obvious wrong turn.
+	use core::sync::atomic::{AtomicI64, Ordering};
+	use object::domain::{Domain, UNLIMITED};
+	static REFUSED: AtomicI64 = AtomicI64::new(i64::MIN);
+	static RETRIED: AtomicI64 = AtomicI64::new(i64::MIN);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let (tx, rx) = channel_pair(4);
+			// A capability to transfer, moved out of this table by the send.
+			let payload = arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0);
+			assert!(!syscall::sys_is_err(payload), "an event to carry");
+			let note = [0xA5u8; 1];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, tx, note.as_ptr() as u64, note.len() as u64, payload) as i64, 0, "the capability is sent");
+
+			// Fill the table to the Domain's ceiling. Counted by the quota refusing rather than by
+			// arithmetic, so the test does not have to know what its own scaffolding cost.
+			while !syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0)) {}
+
+			let mut buf = [0u8; 8];
+			let mut handle = 0u64;
+			REFUSED.store(arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, rx, buf.as_mut_ptr() as u64, buf.len() as u64, &mut handle as *mut u64 as u64) as i64, Ordering::SeqCst);
+			assert_eq!(handle, 0, "a refused receive installs nothing");
+
+			// And the message was not destroyed by being refused: make room and it is still there.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, tx, 0, 0, 0) as i64, 0, "one handle closed makes room for one");
+			RETRIED.store(arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, rx, buf.as_mut_ptr() as u64, buf.len() as u64, &mut handle as *mut u64 as u64) as i64, Ordering::SeqCst);
+			assert_eq!(buf[0], 0xA5, "and it arrived whole");
+			assert!(handle != 0, "with its capability");
+		}
+	}
+	// A ceiling low enough to reach in a few syscalls and high enough for the scaffolding.
+	let domain = Domain::new_child(&Domain::root(), UNLIMITED, 16, UNLIMITED).expect("a live parent takes a child");
+	sched::spawn_in(domain, body, 0).expect("a thread in the bounded domain");
+	sched::run_until_idle();
+	assert_eq!(REFUSED.load(Ordering::SeqCst), syscall::ERR_RESOURCE_EXHAUSTED, "a receive that would put the Domain past its handle limit is refused");
+	assert_eq!(RETRIED.load(Ordering::SeqCst), 1, "and the message it refused was still in the queue");
+}
+
+tagged_test!(a_receive_reserves_what_the_message_needs_not_the_maximum, [Process, Syscall, Ipc], covers = ["kernel"]);
+fn a_receive_reserves_what_the_message_needs_not_the_maximum() {
+	// The first transactional receive booked `MAX_MESSAGE_CAPS` slots before it looked, because it
+	// had no way to name the message it had inspected: without an identity, a reservation taken
+	// after a peek could be spent on a different message. Booking the maximum closed the race and
+	// bought a false refusal - a Domain with one free slot could not receive a message carrying one
+	// capability. Safe direction, wrong answer.
+	//
+	// Asserted at exactly one free slot, which is where the two behaviours differ.
+	use core::sync::atomic::{AtomicI64, Ordering};
+	use object::domain::{Domain, UNLIMITED};
+	static ARRIVED: AtomicI64 = AtomicI64::new(i64::MIN);
+	static COUNT: AtomicI64 = AtomicI64::new(i64::MIN);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let (tx, rx) = channel_pair(4);
+			let payload = arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0);
+			let note = [0x3Cu8; 4];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, tx, note.as_ptr() as u64, note.len() as u64, payload) as i64, 0, "one capability is sent");
+			// Fill to the ceiling, then give back EXACTLY one slot: the message needs one and has
+			// one, and `MAX_MESSAGE_CAPS` is four.
+			while !syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_EVENT_CREATE, 0, 0, 0, 0)) {}
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, tx, 0, 0, 0) as i64, 0, "one slot freed");
+
+			let mut buf = [0u8; 8];
+			let mut caps = [0u64; abi::MAX_MESSAGE_CAPS + 1];
+			ARRIVED.store(arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, rx, buf.as_mut_ptr() as u64, buf.len() as u64, caps.as_mut_ptr() as u64) as i64, Ordering::SeqCst);
+			COUNT.store(caps[0] as i64, Ordering::SeqCst);
+		}
+	}
+	let domain = Domain::new_child(&Domain::root(), UNLIMITED, 16, UNLIMITED).expect("a live parent takes a child");
+	sched::spawn_in(domain, body, 0).expect("a thread in the bounded domain");
+	sched::run_until_idle();
+	assert_eq!(ARRIVED.load(Ordering::SeqCst), 4, "one free slot is enough for a message carrying one capability");
+	assert_eq!(COUNT.load(Ordering::SeqCst), 1, "and the capability came with it");
+}
+
+tagged_test!(a_handle_reservation_books_the_memory_and_not_only_the_quota, [Process, Memory], covers = ["kernel"]);
+fn a_handle_reservation_books_the_memory_and_not_only_the_quota() {
+	// `reserve` charged the Domain's quota and returned, and its comment said a later install
+	// therefore could not be refused for space. It could: `insert_reserved` ends in
+	// `self.slots.push(...)`, an infallible `Vec` growth. The quota had said the Domain was ALLOWED
+	// another handle; nothing had said the kernel heap could hold one.
+	//
+	// That sits under a caller whose whole reason for reserving is that it is about to destroy
+	// something it cannot get back. Quota granted, message dequeued, `slots` needs to grow, the heap
+	// is empty - an allocation abort in the kernel, reachable from ring 3.
+	//
+	// A reservation no heap could back is the deterministic form of it: no allocator state to
+	// arrange, and the answer must be a refusal rather than a success that aborts later.
+	use object::domain::{Domain, UNLIMITED};
+	use object::handle::HandleTable;
+
+	// Impossible by size alone. Divided down from `usize::MAX` so the byte count does not overflow
+	// on the way to the allocator, which would be a different refusal than the one being tested.
+	let beyond_any_heap = usize::MAX / 64;
+
+	// No Domain at all: the quota path returns early, so this is the memory half on its own.
+	let mut unbounded = HandleTable::new();
+	assert!(!unbounded.reserve(beyond_any_heap), "a reservation the heap cannot back must be refused, not granted");
+
+	// And with a Domain whose quota would allow it, nothing is charged for the refusal.
+	let domain = Domain::new_child(&Domain::root(), UNLIMITED, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
+	let mut table = HandleTable::new();
+	table.set_domain(domain.clone());
+	assert!(!table.reserve(beyond_any_heap), "an unlimited quota does not make the memory appear");
+	assert_eq!(domain.account().handles().used(), 0, "and a refused reservation leaves the account where it was");
+
+	// The ordinary case still works, and the slots it booked are real.
+	assert!(table.reserve(8), "a reservation the heap can back is granted");
+	table.release_reservation(8);
+	assert_eq!(domain.account().handles().used(), 0, "a released reservation gives the quota back");
+}
+
+tagged_test!(a_set_that_was_told_it_joined_is_a_set_that_will_be_woken, [Process, Syscall, Ipc], covers = ["kernel"]);
+fn a_set_that_was_told_it_joined_is_a_set_that_will_be_woken() {
+	// `wake_object` copies at most `MAX_SETS_PER_OBJECT` set koids into a stack array and warned
+	// that the rest would not be woken. `register_set_observer` never counted what was already
+	// registered for a member - so a fifth set could add the same channel, be told it worked, and
+	// wait forever.
+	//
+	// The limit is not the problem and raising it is not the fix: it is what keeps the forwarding
+	// off the heap, and the allocation it replaced measured 433,645 ns against a 188,821 ns
+	// baseline. What was wrong is that the ceiling was enforced where the wake is DELIVERED and not
+	// where the registration is MADE, so success meant something different at the two ends.
+	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+	static REFUSED: AtomicI64 = AtomicI64::new(i64::MIN);
+	static WOKEN: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let (rx, tx) = channel_pair(4);
+			let mut sets = [0u64; sched::MAX_SETS_PER_OBJECT];
+			for slot in sets.iter_mut() {
+				*slot = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
+				assert!(!syscall::sys_is_err(*slot), "a wait set is created");
+				assert!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, *slot, rx, 0, 0) as i64 > 0, "a set within the limit joins, answering the member's koid");
+			}
+			// One past the limit. It must be REFUSED rather than admitted and then ignored.
+			let extra = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
+			REFUSED.store(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, extra, rx, 0, 0) as i64, Ordering::SeqCst);
+
+			// And every set that WAS admitted is woken by the member, which is what makes the
+			// refusal above a limit rather than an off-by-one.
+			let note = [0u8; 4];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, tx, note.as_ptr() as u64, note.len() as u64, 0) as i64, 0, "the member becomes ready");
+			let all = sets.iter().all(|&set| arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 1, 0, 0) as i64 >= 0);
+			WOKEN.store(all, Ordering::SeqCst);
+		}
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert_eq!(REFUSED.load(Ordering::SeqCst), syscall::ERR_RESOURCE_EXHAUSTED, "a set past what a wake can reach must be refused at the ADD, not silently left unwoken");
+	assert!(WOKEN.load(Ordering::SeqCst), "and every set inside the limit still answers for the member");
+}
+
+tagged_test!(a_wait_set_registration_is_charged_to_the_domain_that_holds_it, [Process, Syscall, Memory], covers = ["kernel"]);
+fn a_wait_set_registration_is_charged_to_the_domain_that_holds_it() {
+	// M0147 listed "a per-Domain bound on registrations" as done and it was not. What existed was
+	// `MAX_WAIT_SET_MEMBERS` - a PER-SET ceiling - and the handle quota, which charges a Domain ONE
+	// handle for a set holding 256 members plus 256 scheduler observer entries. Neither bounds the
+	// registrations, which is where the memory is.
+	use core::sync::atomic::{AtomicI64, Ordering};
+	use object::domain::{Domain, UNLIMITED};
+	static ADDS: AtomicI64 = AtomicI64::new(0);
+	static REFUSED: AtomicI64 = AtomicI64::new(i64::MIN);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let set = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
+			assert!(!syscall::sys_is_err(set), "a wait set is created");
+			// Join members until something refuses. With a registration ceiling of four it is the
+			// registration quota; without one it would be `MAX_WAIT_SET_MEMBERS` at 256, and the
+			// count below is what tells the two apart.
+			loop {
+				let (rx, _tx) = channel_pair(1);
+				let joined = arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx, 0, 0) as i64;
+				if joined < 0 {
+					REFUSED.store(joined, Ordering::SeqCst);
+					return;
+				}
+				ADDS.fetch_add(1, Ordering::SeqCst);
+				assert!(ADDS.load(Ordering::SeqCst) < object::wait_set::MAX_WAIT_SET_MEMBERS as i64, "the registration quota must refuse before the per-set ceiling does, or it is not doing anything");
+			}
+		}
+	}
+	let domain = Domain::new_child(&Domain::root(), UNLIMITED, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
+	domain.account().wait_registrations().set_limit(4);
+	sched::spawn_in(domain.clone(), body, 0).expect("a thread in the bounded domain");
+	sched::run_until_idle();
+	assert_eq!(ADDS.load(Ordering::SeqCst), 4, "exactly the ceiling's worth of memberships were admitted");
+	assert_eq!(REFUSED.load(Ordering::SeqCst), syscall::ERR_RESOURCE_EXHAUSTED, "and the next one is refused");
+	// and dropping the set gives every registration back, or the ceiling is a one-way ratchet.
+	assert_eq!(domain.account().wait_registrations().used(), 0, "a set that is gone holds no registrations");
+}
+
 tagged_test!(a_wait_set_registers_its_members_once_and_wakes_on_any_of_them, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
 	// `SYS_WAIT_ANY` takes a fresh array on every call, so the kernel registers a waiter on every
@@ -1790,8 +1992,10 @@ fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
 
 			let (rx_a, tx_a) = channel_pair(4);
 			let (rx_b, tx_b) = channel_pair(4);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx_a, 0, 0) as i64, 0, "the first member joins");
-			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx_b, 0, 0) as i64, 0, "the second member joins");
+			let koid_a = arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx_a, 0, 0) as i64;
+			assert!(koid_a > 0, "the first member joins, and the add answers its koid");
+			let koid_b = arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx_b, 0, 0) as i64;
+			assert!(koid_b > 0 && koid_b != koid_a, "the second member joins under its own koid");
 			// A member joins once: registering it twice would wake the set twice for one event.
 			assert!(syscall::sys_is_err(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx_a, 0, 0)), "a duplicate member is refused");
 			// And a set is not something to put in a set.
@@ -1805,11 +2009,11 @@ fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
 			// The SECOND member becomes readable, and the set answers with its index.
 			let payload = [7u8; 4];
 			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, tx_b, payload.as_ptr() as u64, payload.len() as u64, 0) as i64, 0, "the message is sent");
-			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, 1, "the set answers with the ready member's index");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, koid_b, "the set answers with the ready member's KOID - the caller needs no mirror of the kernel's ordering");
 
 			// The membership SURVIVES the wait - which is the whole point of the object. A second
 			// wait finds the same member ready without anything being registered again.
-			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, 1, "membership outlives a wait");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, koid_b, "membership outlives a wait");
 
 			// Removing it takes effect, and the first member is still watched.
 			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_REMOVE, set, rx_b, 0, 0) as i64, 0, "the member leaves");
@@ -1817,7 +2021,7 @@ fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
 			let now = arch::apic::ticks();
 			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, now, 0, 0) as i64, syscall::ERR_TIMED_OUT, "with it gone, nothing in the set is ready");
 			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, tx_a, payload.as_ptr() as u64, payload.len() as u64, 0) as i64, 0, "the other member gets a message");
-			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, 0, "and the set answers for it");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, koid_a, "and the set answers for it");
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
@@ -1844,13 +2048,14 @@ fn a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing() {
 		unsafe {
 			let set = arch::syscall::invoke(syscall::SYS_WAITSET_CREATE, 0, 0, 0, 0);
 			let (rx, tx) = channel_pair(4);
-			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx, 0, 0) as i64, 0);
+			let member = arch::syscall::invoke(syscall::SYS_WAITSET_ADD, set, rx, 0, 0) as i64;
+			assert!(member > 0);
 			let now = arch::apic::ticks();
 			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, now, 0, 0) as i64, syscall::ERR_TIMED_OUT, "nothing is ready yet");
 
 			// The peer goes. The member stays, and says so.
 			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, tx, 0, 0, 0) as i64, 0, "the peer closes");
-			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, 0, "a closed peer is a ready member, not an absent one");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_WAIT, set, 0, 0, 0) as i64, member, "a closed peer is a ready member, not an absent one");
 
 			// And the set is exactly as large as it was.
 			assert_eq!(arch::syscall::invoke(syscall::SYS_WAITSET_REMOVE, set, rx, 0, 0) as i64, 0, "the member is still there to remove");

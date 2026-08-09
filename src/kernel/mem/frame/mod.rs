@@ -258,7 +258,11 @@ impl FrameAllocator {
 			}
 			(false, false) => {
 				if !self.insert_at(at, Run { base, pages }) {
-					crate::serial_println!("frame: WARNING: pre-heap free-run table full, leaking {} page(s) at {:#x}", pages, base);
+					// THE loss. Not a refusal - this span was this allocator's, it is being handed
+					// back correctly, and there is nowhere to record it. The frames are gone and
+					// nothing references them.
+					note_lost_pages(pages);
+					crate::serial_println!("frame: WARNING: pre-heap free-run table full, LOSING {} page(s) at {:#x} ({} lost so far)", pages, base, lost_pages());
 					return;
 				}
 			}
@@ -423,31 +427,44 @@ pub fn free_count() -> usize {
 	ALLOCATOR.lock().free_count
 }
 
-// How many frees this allocator has REFUSED, for tests only.
+// How many frees this allocator has REFUSED, and how many pages it has LOST.
 //
-// The double-free test used to prove the refusal by watching the global free count not move, and
-// that count belongs to the whole machine: seven other cores are online while a test runs, and any
-// one of them freeing a frame in the window shifts it. The test failed twice on aarch64 with the
-// allocator working perfectly - once by one frame, once by four - which is the worst kind of red,
-// because an intermittently failing suite is how a real failure gets waved through.
+// The two are different facts and were one, half of it compiled out. `refused_frees` counted a free
+// this allocator DECLINES - an address it never handed out, a span that overlaps the free pool -
+// which is a caller's bug and costs nothing: the frames were never the allocator's to lose. It was
+// `#[cfg(test)]` because a test needed it, and that was the whole reason it existed.
 //
-// A counter of refusals is what the test actually wants to assert, and nothing else on the machine
-// touches it.
-#[cfg(test)]
+// `lost_pages` counts the other thing, and it is the one this kernel actually has to know: a
+// perfectly good free that could not be RECORDED. The run table is bounded on purpose (it was
+// bounded to fix a deadlock) and `insert` says outright that a span which does not fit is not being
+// tracked; the quarantine drops a page whose shootdown cannot complete. Both paths print a warning
+// and move on, so under fragmentation the machine gets slowly smaller and nothing adds it up. The
+// symptom arrives weeks later as an allocation failure with no cause attached.
+//
+// So: counted always, not only under test, because a number nobody can read in production is not a
+// measurement. This is the cheap half of M0150 and the thing that says whether the buddy allocator
+// below it actually fixed anything - measure first, and be willing to record that it did not pay.
 pub fn refused_frees() -> u64 {
 	REFUSED_FREES.load(core::sync::atomic::Ordering::Acquire)
 }
 
-#[cfg(test)]
-static REFUSED_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// Pages this allocator was handed back and could not put anywhere. Memory the machine no longer
+// has, with nothing holding it.
+pub fn lost_pages() -> u64 {
+	LOST_PAGES.load(core::sync::atomic::Ordering::Acquire)
+}
 
-#[cfg(test)]
+static REFUSED_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static LOST_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn note_refused_free() {
 	REFUSED_FREES.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 }
 
-#[cfg(not(test))]
-fn note_refused_free() {}
+// A valid free that could not be tracked. `pages` is what the machine just lost.
+fn note_lost_pages(pages: u64) {
+	LOST_PAGES.fetch_add(pages, core::sync::atomic::Ordering::AcqRel);
+}
 
 // Deterministic out-of-frames injection, for tests only.
 //
@@ -652,7 +669,8 @@ pub unsafe fn retire(frames: &[u64]) {
 					if crate::mem::tlb::shootdown() {
 						unsafe { deallocate(phys) };
 					} else {
-						crate::serial_println!("frame: WARNING: {phys:#x} could not be queued and its shootdown did not complete; the page is not being tracked");
+						note_lost_pages(1);
+						crate::serial_println!("frame: WARNING: {phys:#x} could not be queued and its shootdown did not complete; the page is not being tracked ({} lost so far)", lost_pages());
 					}
 					quarantine = QUARANTINE.lock();
 				}
@@ -672,7 +690,8 @@ pub unsafe fn retire(frames: &[u64]) {
 			unsafe { drain_quarantine() };
 			return;
 		}
-		crate::serial_println!("frame: WARNING: {unqueued_len} page(s) could not be queued and their shootdown did not complete; they are not being tracked");
+		note_lost_pages(unqueued_len as u64);
+		crate::serial_println!("frame: WARNING: {unqueued_len} page(s) could not be queued and their shootdown did not complete; they are not being tracked ({} lost so far)", lost_pages());
 	}
 	if drain {
 		unsafe { drain_quarantine() };

@@ -202,6 +202,13 @@ fn boot_main() {
 	}
 	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
 	serial_println!("memory: {} physical frames free", mem::frame::free_count());
+	// The pages this boot has handed back and been unable to record. Zero here on any healthy
+	// machine, and the point is that it is PRINTED rather than only counted: the run table is
+	// bounded, so under fragmentation a free can be dropped, and the machine then gets slowly
+	// smaller with nothing adding it up. The symptom otherwise arrives weeks later as an
+	// allocation failure with no cause attached. Printed unconditionally so a boot log always
+	// carries the baseline, which is what makes a later non-zero one worth reading.
+	serial_println!("memory: {} page(s) lost to untrackable frees, {} free(s) refused", mem::frame::lost_pages(), mem::frame::refused_frees());
 	// Perf-trace anchor: publish the calibrated TSC frequency so the host trace tool can
 	// convert the ring-3 `\x1ePERF` cycle markers to wall-clock time.
 	serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());

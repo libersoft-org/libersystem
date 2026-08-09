@@ -776,8 +776,18 @@ fn process_service_lists_every_started_program() {
 	// whose process is not PROC_STATE_RUNNING - which the kernel defines as "has live threads". A
 	// launch that has not yet had its entry thread started, or one whose thread has just ended,
 	// reads as STOPPED. The second START would then drop the first launch on its way in, and the
-	// count would be exactly what was seen. Whether riscv64's scheduling opens that window and the
-	// other two architectures' closes it is the thing to measure.
+	// count would be exactly what was seen.
+	//
+	// **Seen on x86_64, 2026-08-09**, once in a run of 211 and not on the immediate re-run of the
+	// same binary. That answers the question this note used to end with - "whether riscv64's
+	// scheduling opens that window and the other two architectures' closes it" - and the answer is
+	// no: the window is general and x86_64 merely hits it less often. Whatever is done about this,
+	// it is not an architecture's problem.
+	//
+	// What the fix is NOT, so the next attempt does not start there: reaping only entries that were
+	// once seen RUNNING is one line and one field, and it leaks. A launch whose load fails is never
+	// seen running, so it would never be reaped and its handle never closed. Any fix has to keep
+	// both ends - a live process must not be dropped, and a dead one must not be kept forever.
 	//
 	// The assertion below names the survivors for this reason: `1 != 2` says nothing about WHICH
 	// launch went missing, and that is the first fact the next attempt needs.

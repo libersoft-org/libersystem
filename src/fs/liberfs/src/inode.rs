@@ -58,6 +58,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		if inode.extent_count as usize <= inode.extents.len() {
 			return Ok(());
 		}
+		// An extent names a run of blocks, so an inode cannot hold more extents than the pool holds
+		// blocks - a bound the VOLUME states, unlike the `u32` in the header, which is a width
+		// rather than a limit anybody chose. Reached from `derive_free` at mount, so this is not
+		// confined to reading a hostile file: one inode with a long spill chain costs the
+		// allocation before the mount finishes.
+		if inode.extent_count as u64 > self.num_blocks {
+			return Err(FsError::Corrupt);
+		}
 		let mut ptr = inode.spill;
 		let mut crc = inode.spill_crc;
 		let mut buf = vec![0u8; BLOCK_SIZE];
@@ -89,6 +97,12 @@ impl<D: BlockDevice> LiberFs<D> {
 			let count = u32::from_le_bytes(buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].try_into().unwrap()) as usize;
 			if count > EXTENTS_PER_BLOCK || count > want {
 				return Err(FsError::Corrupt);
+			}
+			// Fallible, because the count comes off the medium. `read_file` and `read_range` were
+			// given this discipline and the two metadata chain walks were not, which left the
+			// mount reachable through the one place the caller cannot decline.
+			if inode.extents.try_reserve(count).is_err() {
+				return Err(FsError::NoSpace);
 			}
 			for i in 0..count {
 				let off = CHAIN_HDR + i * EXTENT_SIZE;

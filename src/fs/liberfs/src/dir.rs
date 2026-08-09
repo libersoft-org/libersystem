@@ -283,9 +283,13 @@ impl<D: BlockDevice> LiberFs<D> {
 	// rewriting the leaf compactly and making the damage permanent and consistent.
 	//
 	// Checked where the mutation happens rather than at mount: a whole structural pass at mount
-	// costs every boot, and this costs a comparison on a block that has just been read anyway.
+	// costs every boot, and this costs a pass over a block that has just been read anyway.
+	//
+	// This checked the record COUNT and nothing else, which is one of the four invariants a single
+	// leaf can be judged against - and not the one the write path actually depends on. See
+	// `validate_dir_leaf`.
 	fn leaf_is_whole(buf: &[u8], recs: &[DirRec]) -> Result<(), FsError> {
-		if recs.len() != node_count(buf) { Err(FsError::Corrupt) } else { Ok(()) }
+		validate_dir_leaf(buf, recs).map_err(|_| FsError::Corrupt)
 	}
 
 	pub(crate) fn dir_insert_node(&mut self, ptr: u64, crc: u32, name: &[u8], child: u32, depth: usize) -> Result<Ins, FsError> {
@@ -334,6 +338,10 @@ impl<D: BlockDevice> LiberFs<D> {
 			let rcrc = self.write_node_to(right_dest, &rbuf)?;
 			return Ok(Ins::Split(left_dest, lcrc, recs[split].hash, right_dest, rcrc));
 		}
+		// The descent trusts the separators to route and the child links to point somewhere; a node
+		// that fails either is one this insert must not walk through, let alone rebuild on the way
+		// back up.
+		validate_internal(&buf).map_err(|_| FsError::Corrupt)?;
 		let count = internal_count(&buf);
 		let ci = route_child(&buf, count, hash);
 		let cp = child_ptr(&buf, ci);
@@ -383,6 +391,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			let ncrc = self.write_node_to(dest, &buf)?;
 			return Ok(Del::Updated(dest, ncrc));
 		}
+		validate_internal(&buf).map_err(|_| FsError::Corrupt)?;
 		let count = internal_count(&buf);
 		let ci = route_child(&buf, count, hash);
 		let cp = child_ptr(&buf, ci);
@@ -567,6 +576,43 @@ pub(crate) fn dir_leaf_write(buf: &mut [u8], recs: &[DirRec]) {
 }
 
 // Binary-search `recs` (sorted by (hash, name)) for the entry named `name`.
+// Everything one directory leaf can be judged on without walking the tree.
+//
+// `dir_recs_search` binary-searches these records, so ORDER is not a nicety here: over an unsorted
+// leaf a binary search answers arbitrarily, and the caller acts on that answer. The other three
+// come with it at no extra cost, and they are the same rules the structural pass applies - shared
+// rather than restated, so the two cannot drift apart the way they had.
+//
+// Strictly ascending also rules out a duplicate name, which is why there is no separate check for
+// one: two equal records cannot both be strictly greater than the record before them.
+pub(crate) fn validate_dir_leaf(buf: &[u8], recs: &[DirRec]) -> Result<(), NodeFault> {
+	// Truncation first, and it is the only count check a directory leaf needs. Records here are
+	// variable-width, so there is no fixed capacity to compare a header against - and a count above
+	// what the block could possibly hold shows up as a parse that stopped early, which is the more
+	// specific answer anyway: it says how many were actually there.
+	if recs.len() != node_count(buf) {
+		return Err(NodeFault::Truncated { held: recs.len(), claimed: node_count(buf) });
+	}
+	let mut last: Option<(u64, &[u8])> = None;
+	for rec in recs {
+		if name_hash(&rec.name) != rec.hash {
+			return Err(NodeFault::StoredHashMismatch);
+		}
+		// The SAME rule the path API enforces when it creates a name: a record the API could never
+		// have written is a record no path can address afterwards.
+		if validate_name_segment(&rec.name).is_err() {
+			return Err(NodeFault::NameNotAddressable);
+		}
+		if let Some((hash, name)) = last {
+			if (rec.hash, rec.name.as_slice()) <= (hash, name) {
+				return Err(NodeFault::OutOfOrder);
+			}
+		}
+		last = Some((rec.hash, rec.name.as_slice()));
+	}
+	Ok(())
+}
+
 pub(crate) fn dir_recs_search(recs: &[DirRec], hash: u64, name: &[u8]) -> Result<usize, usize> {
 	recs.binary_search_by(|r| match r.hash.cmp(&hash) {
 		Ordering::Equal => r.name.as_slice().cmp(name),

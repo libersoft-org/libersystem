@@ -132,8 +132,10 @@ static SET_OBSERVERS: [SpinLock<Vec<SetObserver>>; WAIT_BUCKET_COUNT] = [const {
 static OBSERVER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // The most wait sets one object's wake will reach. Four is more than anything here needs - a channel
-// belongs to one service's set - and it keeps the forwarding on the stack.
-const MAX_SETS_PER_OBJECT: usize = 4;
+// belongs to one service's set - and it keeps the forwarding on the stack. Enforced at REGISTRATION
+// (`register_set_observer`) as well as at delivery, so a set that was told it joined is a set that
+// will be woken.
+pub const MAX_SETS_PER_OBJECT: usize = 4;
 static TIMED_WAITERS: SpinLock<Vec<TimedWaiter>> = SpinLock::new(Vec::new());
 
 fn bucket_of(koid: u64) -> &'static SpinLock<Vec<BucketWaiter>> {
@@ -144,19 +146,44 @@ fn observers_of(koid: u64) -> &'static SpinLock<Vec<SetObserver>> {
 	&SET_OBSERVERS[(koid % WAIT_BUCKET_COUNT as u64) as usize]
 }
 
+// Why a member's wakes could not be forwarded to a set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObserveError {
+	// This object is already in `MAX_SETS_PER_OBJECT` sets.
+	TooManySets,
+	// No room to record the registration.
+	NoMemory,
+}
+
 // Forward `member`'s wakes to `set` until told otherwise. Called by `WaitSet::add`.
-pub fn register_set_observer(member: u64, set: u64) {
+//
+// Fallible, and the caller must roll back on failure. It used to return `()`: a refused allocation
+// printed a warning and returned, `WaitSet::add` - which called it after `members.push` - returned
+// `Ok(())`, and `SYS_WAITSET_ADD` answered SUCCESS for a member whose wakes would never reach the
+// set. A thread then calling `sys_waitset_wait` with no deadline parks on the set's koid with
+// nothing left to rouse it. The readiness scan the old warning appealed to does not rescue that:
+// the scan is what happens AFTER a wake, not instead of one.
+//
+// A warning plus success is the worst of the three answers - the caller cannot see it, cannot
+// retry, and the fault presents as a service that is merely slow.
+pub fn register_set_observer(member: u64, set: u64) -> Result<(), ObserveError> {
 	let mut observers = observers_of(member).lock();
+	// The ceiling is enforced HERE, where the registration is made, and not only where the wake is
+	// delivered. `wake_object` copies at most `MAX_SETS_PER_OBJECT` set koids into a stack array
+	// and warned that the rest would not be woken; nothing counted what was already registered for
+	// this member, so five sets could each add the same channel, each be told it worked, and the
+	// fifth wait forever. The limit exists for a good reason - it is what keeps the forwarding off
+	// the heap, and the allocation it replaced measured 433,645 ns against a 188,821 ns baseline -
+	// so the answer is to refuse the fifth `add`, not to raise the ceiling.
+	if observers.iter().filter(|observer| observer.member_koid == member).count() >= MAX_SETS_PER_OBJECT {
+		return Err(ObserveError::TooManySets);
+	}
 	if observers.try_reserve(1).is_err() {
-		// The set will still see the member on its readiness scan; what it loses is the WAKE, so a
-		// waiter parked with nothing else to rouse it sleeps until its deadline. Said out loud
-		// rather than silently, because a wait that only works when something else happens is the
-		// kind of fault that looks like a slow service.
-		crate::serial_println!("sched: WARNING: no room to observe object {member} for wait set {set}; its wakes will not reach the set");
-		return;
+		return Err(ObserveError::NoMemory);
 	}
 	observers.push(SetObserver { member_koid: member, set_koid: set });
 	OBSERVER_COUNT.fetch_add(1, Ordering::AcqRel);
+	Ok(())
 }
 
 pub fn unregister_set_observer(member: u64, set: u64) {

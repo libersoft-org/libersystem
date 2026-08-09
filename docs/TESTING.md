@@ -82,6 +82,24 @@ Every default errs toward running more, and the failures are loud:
 The only way out with nothing to run is that every changed path is declared not code, and the plan
 says so per path, with the reason.
 
+## Reading a guest run's logs
+
+`test.sh` writes two files per run and names both when it finishes:
+
+| | |
+|---|---|
+| `<stem>-run.log` | the harness's own output: the build, the runner, and on some targets the kernel's serial |
+| `<stem>-guest.log` | whatever the guest wrote to the serial device the harness attached |
+
+**Which one carries the test output depends on the architecture**, and the trap is worth naming
+because it costs half an hour the first time. On x86_64 and aarch64 the kernel's serial lands in the
+GUEST log. On riscv64 it lands in the RUN log, and the guest log holds only U-Boot and the loader -
+1359 bytes, identically, on every run, ending at `loader: no GOP framebuffer`. Read that file alone
+and a perfectly healthy riscv64 run looks like a kernel hung before its first line of output.
+
+The harness is not confused by this - it greps both - so this only bites someone inspecting the
+files by hand. Grep both, or grep the run log first.
+
 ## The lower-level entry points
 
 `verify.sh` calls these; reach for them directly when you already know what you want to run.
@@ -118,6 +136,23 @@ Two gates keep it honest, and both run in `./check.sh`:
 ./check.sh --gate verify-model         # ownership is total, the graph has no dangling names, the catalog is valid
 ./check.sh --gate verify-model-tests   # property tests, negative fixtures, the regression corpus
 ```
+
+## Gates prove they refuse before they approve
+
+Every gate in `./check.sh` starts by feeding itself inputs it must reject, and fails loudly if one
+is accepted. This is not belt-and-braces: a validator run only over a currently-valid tree passes,
+and would pass identically if it had stopped looking - an `exit 0` at the top, a `grep` whose
+pattern no longer matches, a `jq` selector that selects nothing. Several of these gates were found
+that way.
+
+Two rules if you add one:
+
+- **Never inject by editing a tracked file.** Copy it, damage the copy, or supply the input through
+  an environment override. A self-test killed between the damage and the repair leaves the working
+  tree corrupted, with the gate then failing on what looks like a real cause. That happened here.
+- **Assert the injection LANDED.** An injection that quietly changed nothing hands the gate a valid
+  input, the gate passes, and the self-test reads that pass as a correct refusal. That happened here
+  too, inside a self-test written to prevent exactly this class of thing.
 
 ### Narrowing the kernel suite
 

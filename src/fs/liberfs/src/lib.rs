@@ -359,22 +359,44 @@ pub(crate) mod inject {
 	std::thread_local! {
 		// how many more `try_zeroed` calls succeed before one is refused; `None` is disarmed.
 		static BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+		// Whether the refusal is a one-off: refuse the next call and disarm, rather than refuse
+		// everything from here on.
+		static ONCE: Cell<bool> = const { Cell::new(false) };
 	}
 
 	// Let `successes` further allocations through, then refuse every one after that until
 	// `disarm`. Armed for the calling thread only, which is the test that armed it.
 	pub(crate) fn fail_after(successes: usize) {
 		BUDGET.with(|b| b.set(Some(successes)));
+		ONCE.with(|o| o.set(false));
+	}
+
+	// Refuse exactly ONE allocation - the `successes + 1`th - and let everything after it through.
+	//
+	// `fail_after` cannot tell a swallowed refusal from a propagated one: every allocation after
+	// the target also fails, so a caller that ignored the target's failure hits the next one and
+	// answers `NoMemory` anyway. That is precisely the difference a test of "this refusal must not
+	// be discarded" has to be able to see.
+	pub(crate) fn fail_once_after(successes: usize) {
+		BUDGET.with(|b| b.set(Some(successes)));
+		ONCE.with(|o| o.set(true));
 	}
 
 	pub(crate) fn disarm() {
 		BUDGET.with(|b| b.set(None));
+		ONCE.with(|o| o.set(false));
 	}
 
 	pub(super) fn should_fail() -> bool {
 		BUDGET.with(|b| match b.get() {
 			None => false,
-			Some(0) => true,
+			Some(0) => {
+				if ONCE.with(|o| o.get()) {
+					b.set(None);
+					ONCE.with(|o| o.set(false));
+				}
+				true
+			}
 			Some(n) => {
 				b.set(Some(n - 1));
 				false
@@ -465,12 +487,26 @@ const SB_COMPRESS_OFF: usize = SB_CODEC_OFF + 1;
 // reclaimed. The snapshot table is a chain of blocks rooted at `snap_root`: each block
 // carries the shared chain header (below), then fixed records of a NUL-padded name,
 // the pinned inode-tree root and its CRC32C, and the generation - at the named record
-// offsets. (4096 - 16) / 84 = 48 records per block; the chain is unbounded, so there
-// is no cap on how many snapshots a volume holds.
+// offsets. (4096 - 16) / 84 = 48 records per block.
 const SNAP_NAME_MAX: usize = 64;
 const SNAP_HDR: usize = CHAIN_HDR;
 const SNAP_REC: usize = SNAP_NAME_MAX + 20;
 const SNAPS_PER_BLOCK: usize = (BLOCK_SIZE - SNAP_HDR) / SNAP_REC;
+
+// The most snapshots a volume may hold, and therefore the most a mount will read.
+//
+// The chain used to be unbounded and the table was built with an infallible `push` per record, so
+// the ceiling was whatever the medium allowed: the walk stops after `num_blocks` steps and each
+// block holds 48 records, which on a one-gigabyte volume is around twelve million names off a
+// forged but checksum-valid table. That is an allocation abort at mount where `NoMemory` is the
+// answer that exists for it.
+//
+// 256 is chosen on what a snapshot table is FOR - a system volume's named generations, each of
+// which pins a whole generation's blocks against reclamation - rather than on what memory allows.
+// A volume wanting more than that wants a log, which is a different structure. The number is
+// stated here so that the writer refuses the 257th and the reader refuses a medium claiming more,
+// which are the two halves of a format rule.
+pub const MAX_SNAPSHOTS: usize = 256;
 // field offsets within one snapshot record, after the name.
 const SNAP_ROOT_OFF: usize = SNAP_NAME_MAX;
 const SNAP_ROOT_CRC_OFF: usize = SNAP_NAME_MAX + 8;

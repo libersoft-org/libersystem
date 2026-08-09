@@ -1880,6 +1880,9 @@ pub unsafe fn waitset_create() -> i64 {
 }
 
 // Add an object to the set. Needs WAIT on the object and MANAGE on the set.
+// Add an object to the set. Answers the member's KOID - which is what `waitset_wait` will report
+// when it becomes ready - so a caller learns it at the moment it joins rather than paying
+// `SYS_OBJECT_INFO_GET` per member to find out.
 pub unsafe fn waitset_add(set: u64, object: u64) -> i64 {
 	unsafe { syscall(SYS_WAITSET_ADD, set, object, 0, 0) as i64 }
 }
@@ -1890,8 +1893,13 @@ pub unsafe fn waitset_remove(set: u64, object: u64) -> i64 {
 	unsafe { syscall(SYS_WAITSET_REMOVE, set, object, 0, 0) as i64 }
 }
 
-// Block until any member is ready, returning its index in the set - stable as long as the caller
-// does not add or remove, which it knows when it does.
+// Block until any member is ready, returning its KOID.
+//
+// Not its index. An index only means something to a caller keeping a list in exactly the kernel's
+// order, and a service's client table does not: it uses `swap_remove`, which permutes. That
+// mismatch is what forced the first migration attempt to reconcile membership every pass instead of
+// editing it where it changes, and the reconcile was measured as the entire cost of the change. A
+// koid needs no mirror - map it to a client however you already index them.
 pub unsafe fn waitset_wait(set: u64, deadline: u64, flags: u64) -> i64 {
 	unsafe { syscall(SYS_WAITSET_WAIT, set, deadline, flags, 0) as i64 }
 }

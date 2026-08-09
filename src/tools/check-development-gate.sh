@@ -9,13 +9,74 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-manifest_json="$(tools/system-manifest.sh export-json)"
+# The manifest, or an injected one when the self-test below is proving the checks refuse.
+manifest_json="${DEVELOPMENT_GATE_MANIFEST:-$(tools/system-manifest.sh export-json)}"
 
 status=0
 fail() {
 	echo "development-gate: $1" >&2
 	status=1
 }
+
+# Prove the gate REFUSES before letting it approve.
+#
+# The whole point of this gate is that a runtime refusal is not a boundary: the development agent
+# must be ABSENT from a shipped image, not present and declining to run. A gate asserting that is
+# worth exactly as much as its ability to notice when it stops being true, and running the current
+# version over a currently-correct tree demonstrates neither - the tree is correct, so it passes,
+# and it would pass identically if `jq` had stopped selecting and `gated` had become empty.
+#
+# (The vacuous case IS guarded, at the top of check 1 - and that guard is itself one of the things
+# below re-checks, because a guard nobody exercises is a comment.)
+#
+# `--manifest-only` runs checks 1 and 2 and stops: 3 and 4 build crates and read the built package,
+# neither of which an injected manifest describes. The manifest arrives through the environment
+# rather than by editing the tracked file, because a self-test killed between an edit and its repair
+# leaves the tree damaged - which happened here once, to a different gate.
+self_test() {
+	local real
+	real="$(tools/system-manifest.sh export-json)"
+
+	# The valid direction first, so each refusal below is known to be about what it changed.
+	if ! DEVELOPMENT_GATE_MANIFEST="$real" "$0" --manifest-only >/dev/null 2>&1; then
+		echo "development-gate: SELF-TEST FAILED - the real manifest was rejected by the manifest-only checks, so this gate is broken in the direction that blocks work" >&2
+		return 1
+	fi
+
+	# Nothing marked development-only. The gate would then have nothing to check and would say so
+	# by passing, which is the failure mode a table-driven check reaches by losing its selector.
+	local none
+	none="$(jq -c '(.programs[] | select(.development == true).development) = false' <<<"$real")"
+	if DEVELOPMENT_GATE_MANIFEST="$none" "$0" --manifest-only >/dev/null 2>&1; then
+		echo "development-gate: SELF-TEST FAILED - a manifest marking NO program development-only was accepted; the gate would pass vacuously" >&2
+		return 1
+	fi
+
+	# A program marked development-only whose crate does NOT gate it behind `required-features`.
+	# `cat` is an ordinary shipped program, so the crate check must refuse it.
+	#
+	# The injection is verified to have LANDED before its result is read. The first version named a
+	# program that does not exist in the manifest, so `jq` changed nothing, the gate was handed the
+	# real manifest, it passed - and the self-test read that pass as "the injection was correctly
+	# refused". A self-test that silently checks nothing is the precise failure these gates exist to
+	# prevent, arriving in the thing meant to prevent it.
+	local ungated before after
+	before="$(jq -r '[.programs[] | select(.development == true).name] | length' <<<"$real")"
+	ungated="$(jq -c '(.programs["cat"].development) = true' <<<"$real")"
+	after="$(jq -r '[.programs[] | select(.development == true).name] | length' <<<"$ungated")"
+	if [[ "$after" != "$((before + 1))" ]]; then
+		echo "development-gate: SELF-TEST FAILED - the injection did not land ($before -> $after development-only programs); it was proving nothing" >&2
+		return 1
+	fi
+	if DEVELOPMENT_GATE_MANIFEST="$ungated" "$0" --manifest-only >/dev/null 2>&1; then
+		echo "development-gate: SELF-TEST FAILED - a development-only program with no required-features gate was accepted" >&2
+		return 1
+	fi
+}
+
+if [[ "${DEVELOPMENT_GATE_MANIFEST:-}" == "" ]]; then
+	self_test || exit 1
+fi
 
 # 1. The manifest marks exactly the development-only programs, and every one of them is
 #    behind `required-features` in the crate that owns it.
@@ -40,6 +101,13 @@ for crate in "$(tools/source-path.sh services)/Cargo.toml" "$(tools/source-path.
 		fail "$crate enables development by default"
 	fi
 done
+
+# `--manifest-only` stops here: what follows builds crates and reads the built volume package, and
+# an injected manifest describes neither.
+if [[ "${1:-}" == "--manifest-only" ]]; then
+	((status == 0)) && echo "development-gate: manifest checks pass for ${#gated[@]} development-only program(s)"
+	exit "$status"
+fi
 
 # 3. The shipping configuration builds, and produces none of the gated binaries. Built into
 #    its own target directory so this check never disturbs, or is disturbed by, whatever

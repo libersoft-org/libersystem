@@ -114,3 +114,52 @@ fn the_allocator_refuses_a_frame_it_never_handed_out() {
 		unsafe { deallocate(again) };
 	}
 }
+
+crate::tagged_test!(a_fragmenting_workload_loses_no_pages_and_says_so, [Frame, Memory], covers = ["kernel"]);
+fn a_fragmenting_workload_loses_no_pages_and_says_so() {
+	// The run table is bounded on purpose - it was bounded to fix a deadlock, and `insert_at`
+	// refuses rather than allocating from the heap it feeds. So a free that does not fit is
+	// DROPPED: the frames are gone, nothing references them, and the only trace was a warning
+	// line. Under fragmentation the machine gets slowly smaller and nothing adds it up, so the
+	// symptom arrives weeks later as an allocation failure with no cause attached.
+	//
+	// `lost_pages` is that count, and it is compiled in rather than `#[cfg(test)]` - a number
+	// nobody can read in production is not a measurement. What is asserted here is the DELTA
+	// across this test's own work, never the absolute value: the counter belongs to the whole
+	// machine and seven other cores are running while this does. M0147 retired four tests that
+	// asserted numbers belonging to the machine rather than to themselves.
+	//
+	// This is the guard rather than the demonstration. Driving the table to its ceiling would mean
+	// deliberately losing real pages out of a live kernel, which is a poor trade for a test; what
+	// this catches is a change that starts dropping frees on an ORDINARY workload, which is how
+	// the quarantine defect arrived - nine pages per failed load, noticed only because something
+	// happened to print a count.
+	let lost_before = super::lost_pages();
+	let refused_before = super::refused_frees();
+
+	// Shred the address space: allocate a wide span, free it in two interleaved passes so every
+	// other page has to become its own run, then do it again on top of the holes.
+	for _ in 0..3 {
+		let base = allocate_contiguous(FRAGMENTED_PAGES as usize).expect("a fragmented frame span");
+		unsafe {
+			for index in (0..FRAGMENTED_PAGES).step_by(2) {
+				deallocate(base + index * PAGE_SIZE);
+			}
+			for index in (1..FRAGMENTED_PAGES).step_by(2) {
+				deallocate(base + index * PAGE_SIZE);
+			}
+		}
+	}
+
+	assert_eq!(super::lost_pages(), lost_before, "an ordinary fragmenting workload must not lose a single page");
+	assert_eq!(super::refused_frees(), refused_before, "and it frees nothing this allocator did not hand out");
+
+	// and the pool put it all back together, which is the other half of losing nothing.
+	let whole = allocate_contiguous(FRAGMENTED_PAGES as usize).expect("the span re-coalesces after the churn");
+	unsafe {
+		for index in 0..FRAGMENTED_PAGES {
+			deallocate(whole + index * PAGE_SIZE);
+		}
+	}
+	assert_eq!(super::lost_pages(), lost_before, "including the pass that gave it all back one page at a time");
+}

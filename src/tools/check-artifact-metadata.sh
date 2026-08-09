@@ -2,7 +2,8 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-manifest_json="$("$root/tools/system-manifest.sh" export-json)"
+# The manifest, or an injected one when the self-test below is proving the comparison refuses.
+manifest_json="${ARTIFACT_METADATA_MANIFEST:-$("$root/tools/system-manifest.sh" export-json)}"
 build_root="$root/../.build"
 image_root="$build_root/image/x86_64-unknown-none"
 
@@ -26,6 +27,51 @@ if [[ "$actual" != "$expected" ]]; then
 	echo "artifact-metadata: executable contracts differ from the manifest" >&2
 	diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
 	exit 1
+fi
+
+# `--contracts-only` stops here: the self-test below re-enters this script to prove the comparison
+# above refuses what it should, and the ELF checks after it are about staged artifacts that an
+# injected manifest does not describe.
+[[ "${1:-}" == "--contracts-only" ]] && {
+	echo "artifact-metadata: contracts match"
+	exit 0
+}
+
+# Prove the comparison REFUSES before letting it approve.
+#
+# The block above is a hand-written table of what each dynamic executable owns, stages and links
+# against, compared with what the manifest says. It passes because both are currently right, and it
+# would pass just as well if the `jq` selector had stopped matching and `actual` had become empty
+# against an `expected` that was also - no. That is exactly the case the third injection below
+# catches, and it is the one a table-versus-table check is most likely to reach: a selector that
+# matches nothing compares nothing.
+#
+# The manifest is injected through the environment rather than edited: this gate reads a tracked
+# file, and a self-test that edits a tracked file in place can leave the tree damaged if it is
+# killed between the edit and the repair. That happened here once, to a different gate.
+if [[ "${ARTIFACT_METADATA_MANIFEST:-}" == "" ]]; then
+	real="$("$root/tools/system-manifest.sh" export-json)"
+
+	# A provider removed from one program: the contract changed and the table did not.
+	dropped="$(jq -c '(.programs[] | select(.name == "du").providers) |= map(select(. != "wire"))' <<<"$real")"
+	if ARTIFACT_METADATA_MANIFEST="$dropped" "$0" --contracts-only >/dev/null 2>&1; then
+		echo "artifact-metadata: SELF-TEST FAILED - a program that lost a provider was accepted, so this gate is not comparing what it claims to" >&2
+		exit 1
+	fi
+
+	# An owner changed: same providers, different crate. The table pins both.
+	moved="$(jq -c '(.programs[] | select(.name == "free").owner) = "services"' <<<"$real")"
+	if ARTIFACT_METADATA_MANIFEST="$moved" "$0" --contracts-only >/dev/null 2>&1; then
+		echo "artifact-metadata: SELF-TEST FAILED - a program that changed owner was accepted" >&2
+		exit 1
+	fi
+
+	# And the empty comparison: a manifest naming none of these programs at all. `actual` is then
+	# empty, and a check that had lost its selector would produce exactly this and call it a match.
+	if ARTIFACT_METADATA_MANIFEST='{"programs":[],"libraries":[]}' "$0" --contracts-only >/dev/null 2>&1; then
+		echo "artifact-metadata: SELF-TEST FAILED - a manifest describing NO dynamic executables was accepted; a selector that matches nothing compares nothing" >&2
+		exit 1
+	fi
 fi
 
 command -v llvm-readelf >/dev/null

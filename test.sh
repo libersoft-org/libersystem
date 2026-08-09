@@ -47,6 +47,20 @@ host slows them by far more than it slows x86_64. Measured on 2026-08-08 with th
 115: the ten image-tagged tests took 63 s on x86_64 and 1518 s on aarch64 - twenty-four times -
 and the default --timeout was not the problem it looked like. If an emulated run stops on a heavy test,
 check the load average before the diff.
+
+Measured again 2026-08-09 with the host at load 11-18 and the full suite at 211 tests: x86_64 99 s,
+aarch64 2160 s, riscv64 **4464 s** - and riscv64 needed $(--timeout 5400) to get there. At the 45 m
+default it stopped at test 70 of 204, printing "tlb: shootdown timed out with 5/7 acknowledgements"
+on the way, and the identical binary then passed every one of those tests when given the clock.
+
+Both halves of that are worth keeping. The shootdown message is the shape a loaded host takes here -
+a core that never gets scheduled cannot answer the IPI - so it is not by itself evidence of anything
+in the diff. And a run that stops with zero failures is a run that ran out of time, not a run that
+found something: **check the clock and the load before the diff.**
+
+Where the test output GOES also differs: on x86_64 and aarch64 the kernel's serial lands in the
+guest log, and on riscv64 it lands in the RUN log while the guest log holds only U-Boot and the
+loader. Read the guest log alone on riscv64 and a healthy run looks hung before its first line.
 EOF
 }
 

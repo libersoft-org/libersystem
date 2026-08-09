@@ -3825,6 +3825,13 @@ fn fail_allocation_after(successes: usize) -> Injected {
 	Injected
 }
 
+// Refuse exactly one allocation, so a caller that discards the refusal is not rescued by the next
+// one failing too. See `a_directorys_speculative_reservation_is_not_skipped_when_memory_is_short`.
+fn fail_one_allocation_after(successes: usize) -> Injected {
+	inject::fail_once_after(successes);
+	Injected
+}
+
 #[test]
 fn a_check_that_could_not_run_is_a_fault_not_a_clean_report() {
 	// `check_dir_structure` began `let Ok(mut visited) = try_zeroed(..) else { return }`, so
@@ -3985,4 +3992,167 @@ fn a_truncated_directory_leaf_may_be_read_but_not_edited() {
 	assert!(mentions(&fs.fsck().unwrap().faults, b"records it claims"), "fsck reports the truncated leaf");
 	// and nothing edits it.
 	assert_eq!(fs.write_file(b"d/another", b"c"), Err(FsError::Corrupt), "an insert into a leaf that is not what it claims is refused");
+}
+
+#[test]
+fn an_unsorted_directory_leaf_may_be_read_but_not_edited() {
+	// `leaf_is_whole` checked ONE invariant - that a leaf holds as many records as its header
+	// claims - and the write path checked nothing else. `fsck` knew nine more, and the one the
+	// write path actually depends on was among them: `dir_recs_search` is a BINARY SEARCH over the
+	// records, so a checksum-valid leaf whose records do not ascend answers arbitrarily.
+	//
+	// `dir_insert_node` then takes that answer as either "the name is here, replace its child" or
+	// "insert at this position", writes the leaf back with `dir_leaf_write`, and `write_node_to`
+	// computes a fresh CRC over it. What lands is a new generation, correctly checksummed, built on
+	// a structure the format cannot produce - a name duplicated or one made unreachable, and
+	// nothing left afterwards to say which.
+	let nblocks: u64 = 2_000;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.mkdir(b"d").unwrap();
+	// Enough names to be a leaf with several records, few enough to stay ONE leaf.
+	for i in 0..8u32 {
+		fs.write_file(format!("d/name{i:02}").as_bytes(), b"x").unwrap();
+	}
+	let dir = fs.lookup(b"d").unwrap().unwrap();
+	let mut inode = fs.read_inode(dir).unwrap();
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	fs.read_node(inode.dir_root, inode.dir_root_crc, &mut buf).unwrap();
+	assert_eq!(node_type(&buf), NODE_LEAF, "the names must still be one leaf");
+	let recs = dir_leaf_parse(&buf);
+	assert_eq!(recs.len(), 8);
+
+	// Swap two records so the leaf is out of order and NOTHING else about it changes: every record
+	// is complete, the count matches, each stored hash is still its own name's, and the checksum is
+	// rewritten so the block verifies. The only thing wrong is the order.
+	let mut swapped: Vec<DirRec> = recs.iter().map(|r| DirRec { hash: r.hash, name: r.name.clone(), child: r.child }).collect();
+	swapped.swap(0, 7);
+	assert_ne!(swapped[0].hash, recs[0].hash, "the swap has to actually disorder the leaf");
+	dir_leaf_write(&mut buf, &swapped);
+	let crc = fs.write_node_to(inode.dir_root, &buf).unwrap();
+	inode.dir_root_crc = crc;
+	fs.write_inode(dir, &mut inode).unwrap();
+	fs.commit().unwrap();
+
+	// A listing still works: it is what the operator has left, and refusing it takes the rescue
+	// away. Every name is there, whatever order they come back in.
+	let listed = fs.read_dir(b"d").unwrap();
+	assert_eq!(listed.len(), 8, "an unsorted leaf still lists what it holds");
+	// fsck names it.
+	assert!(mentions(&fs.fsck().unwrap().faults, b"ascending"), "fsck reports the disordered leaf");
+	// And nothing edits it - neither an insert nor a delete may build a new generation on it.
+	assert_eq!(fs.write_file(b"d/another", b"c"), Err(FsError::Corrupt), "an insert into a leaf whose order cannot be trusted is refused");
+	assert_eq!(fs.remove(b"d/name03"), Err(FsError::Corrupt), "and so is a delete");
+}
+
+#[test]
+fn a_directorys_speculative_reservation_is_not_skipped_when_memory_is_short() {
+	// An inode with a type byte no writer emits is marked TWICE - once as a file, once as a
+	// directory - because the overlay field means the flip could have gone either way, and
+	// under-reserving loses data. The directory reading marks into its own scratch map.
+	//
+	// That map was `try_zeroed(map.len()).ok()` with an `if let` around it, so a refused allocation
+	// skipped the whole speculative walk: `derive_free` returned Ok, the mount stayed WRITABLE, and
+	// none of the directory's tree blocks were reserved. Exactly the loss the second reading exists
+	// to prevent, disappearing without a word at the moment the machine is under strain.
+	//
+	// A failure to PARSE the guess is still ignored - one of the two readings is nonsense by
+	// construction. A failure to ALLOCATE the protection is not the guess failing; it is the
+	// protection not happening.
+	let nblocks: u64 = 4_000;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.mkdir(b"many").unwrap();
+	for i in 0..400u32 {
+		fs.write_file(format!("many/entry-{i:04}-{}", "p".repeat(40)).as_bytes(), b"x").unwrap();
+	}
+	let dir = fs.lookup(b"many").unwrap().unwrap();
+	let mut dev = fs.into_device();
+	forge_inode_slot_of(&mut dev, dir, |slot| slot[INO_TYPE_OFF] = 7);
+
+	// Exactly ONE refusal, and it has to be the scratch map's. Three allocations precede it: the
+	// mount's two superblock-sized maps, then `derive_free`'s live map.
+	//
+	// A one-shot refusal is the whole point of the fixture. With `fail_after`, every allocation
+	// past the target fails too - so a walk that DISCARDED the scratch map's failure would hit the
+	// next allocation and answer `NoMemory` anyway, and the test would pass over the defect it was
+	// written for. Refusing one and letting the rest through is the only arrangement that can tell
+	// a propagated refusal from a swallowed one.
+	let _armed = fail_one_allocation_after(3);
+	assert_eq!(LiberFs::mount(dev).err(), Some(MountError::NoMemory), "a protection that could not be allocated is a refused mount, not a silent gap");
+}
+
+#[test]
+fn a_snapshot_table_has_a_ceiling_and_both_sides_of_it_agree() {
+	// The table was built with an infallible `push` per record and the walk admitted as many as the
+	// chain had room for - on a one-gigabyte volume, around twelve million names off a forged but
+	// checksum-valid table. The duplicate-name check made it worse rather than better: `out.iter()
+	// .any(..)` per record is quadratic, so the mount would not finish long before it ran out of
+	// memory, and a hang at mount is a system that does not boot with nothing said about why.
+	//
+	// The ceiling is a format rule, so it has two halves: the writer refuses to create past it and
+	// the reader refuses a medium claiming more. Only the writer's half can be reached from here
+	// without forging a chain; they share the constant, which is the point of stating it once.
+	let nblocks: u64 = 4_000;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.write_file(b"payload", b"x").unwrap();
+	for i in 0..MAX_SNAPSHOTS {
+		fs.create_snapshot(format!("snap{i:04}").as_bytes()).unwrap_or_else(|e| panic!("snapshot {i} of {MAX_SNAPSHOTS}: {e:?}"));
+	}
+	assert_eq!(fs.create_snapshot(b"one-too-many"), Err(FsError::NoSpace), "the writer refuses to create a table this build could not read back");
+	// and what it did create still reads back whole.
+	let dev = fs.into_device();
+	let mut fs = LiberFs::mount(dev).expect("a table at the ceiling still mounts");
+	assert_eq!(fs.list_snapshots().unwrap().len(), MAX_SNAPSHOTS);
+}
+
+#[test]
+fn a_snapshot_name_has_to_be_padded_the_way_a_writer_pads_it() {
+	// `read_superblock` was taught this for the volume label and the snapshot record was left with
+	// half the rule: `name_in` stops at the first NUL and looks no further, so
+	// `keep\0\xff\xffgarbage` read back as the snapshot "keep". Nothing consumes those bytes, which
+	// is why it went unnoticed - the argument is not about what the name resolves to but that no
+	// writer of this format produces a field shaped that way, so a field shaped that way is itself
+	// evidence the record came from somewhere else.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"payload", b"x").unwrap();
+	fs.create_snapshot(b"keep").unwrap();
+	let mut dev = fs.into_device();
+	// Past the terminator, inside the fixed field: bytes no writer ever leaves there.
+	forge_snapshot_record(&mut dev, |rec| {
+		rec[5] = 0xFF;
+		rec[6] = 0xFF;
+	});
+	assert!(matches!(LiberFs::mount(dev), Err(MountError::Corrupt) | Ok(_)), "the mount either refuses or degrades - it may not accept the record as written");
+	// Precisely: the table cannot be loaded, which is what degrades the volume.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"payload", b"x").unwrap();
+	fs.create_snapshot(b"keep").unwrap();
+	let mut dev = fs.into_device();
+	forge_snapshot_record(&mut dev, |rec| rec[5] = 0xFF);
+	let fs = LiberFs::mount(dev);
+	assert!(fs.as_ref().map(|f| f.is_read_only()).unwrap_or(true), "a snapshot record no writer produced may not leave the volume writable");
+}
+
+#[test]
+fn an_extent_count_above_the_pool_is_refused_before_it_is_allocated_for() {
+	// `load_spill` grew `inode.extents` with an infallible `push`, bounded by the inode's
+	// `extent_count` - a `u32` off the medium, which is a WIDTH rather than a limit anybody chose.
+	// It is reached from `derive_free` at mount, so this was not confined to reading a hostile file.
+	//
+	// An extent names a run of blocks, so an inode cannot hold more extents than the pool holds
+	// blocks. That is the bound the volume states, and a claim above it is a claim the format
+	// cannot have written.
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"file", b"payload").unwrap();
+	let num = fs.lookup(b"file").unwrap().unwrap();
+	let mut dev = fs.into_device();
+	forge_inode_slot_of(&mut dev, num, |slot| slot[INO_EXTENT_COUNT_OFF..INO_EXTENT_COUNT_OFF + 4].copy_from_slice(&u32::MAX.to_le_bytes()));
+	// The mount's own walk reaches it, and answers about the medium rather than aborting.
+	let mounted = LiberFs::mount(dev);
+	match mounted {
+		Err(MountError::Corrupt) => {}
+		Ok(mut fs) => {
+			assert_eq!(fs.read_file(b"file"), Err(FsError::Corrupt), "a count the pool cannot hold is refused rather than allocated for");
+		}
+		Err(other) => panic!("expected the medium to be blamed, got {other:?}"),
+	}
 }

@@ -164,7 +164,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		let (root, crc) = (self.snap_root, self.snap_root_crc);
 		match self.read_snapshot_table(root, crc, &mut |_| {}) {
 			Ok(disk) => {
-				if disk.len() != self.snapshots.len() || disk.iter().zip(self.snapshots.iter()).any(|(a, b)| a.name != b.name || a.inode_root != b.inode_root || a.generation != b.generation) {
+				// Every field of the record, `inode_root_crc` included. It was left out, and it is
+				// the one that decides whether the pinned root can be READ: a table whose stored
+				// CRC has drifted from the loaded one names a generation that will refuse to open,
+				// which is exactly the disagreement this comparison exists to find.
+				if disk.len() != self.snapshots.len() || disk.iter().zip(self.snapshots.iter()).any(|(a, b)| a.name != b.name || a.inode_root != b.inode_root || a.inode_root_crc != b.inode_root_crc || a.generation != b.generation) {
 					note("the snapshot table on disk differs from the mounted one", faults);
 				}
 			}
@@ -252,24 +256,22 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
-			// the record count is read off the medium, so a leaf claiming more records
-			// than fit is not a leaf this format can produce.
-			if node_count(&buf) > (BLOCK_SIZE - NODE_HDR) / INODE_REC {
-				faults.push(alloc::format!("inode leaf {ptr} claims more records than it can hold").into_bytes());
+			// The record count and the key order come from the function `tree_insert_node` and
+			// `tree_delete_node` call before they binary-search this leaf, so the pass and the
+			// write path cannot disagree about what a leaf has to be.
+			if let Err(fault) = validate_fixed_leaf(&buf, INODE_REC, 8) {
+				let mut message = b"inode ".to_vec();
+				message.extend_from_slice(&fault.describe(ptr));
+				faults.push(message);
 			}
-			let mut last: Option<u64> = None;
 			for i in 0..leaf_count(&buf, INODE_REC) {
 				let off = NODE_HDR + i * INODE_REC;
 				let key = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-				if last.is_some_and(|l| key <= l) {
-					faults.push(alloc::format!("inode leaf {ptr} is not in ascending key order").into_bytes());
-				}
-				// and inside the interval the separators above route to this leaf, or the
+				// inside the interval the separators above route to this leaf, or the
 				// record is on the medium and reachable by no lookup.
 				if lower.is_some_and(|l| key < l) || upper.is_some_and(|u| key >= u) {
 					faults.push(alloc::format!("inode leaf {ptr} holds a key routing will never reach").into_bytes());
 				}
-				last = Some(key);
 				if key > u32::MAX as u64 {
 					faults.push(alloc::format!("inode leaf {ptr} holds a key outside the inode number range").into_bytes());
 					continue;
@@ -286,25 +288,18 @@ impl<D: BlockDevice> LiberFs<D> {
 				}
 			}
 		} else {
-			if node_count(&buf) > INTERNAL_MAX - 1 {
-				faults.push(alloc::format!("internal node {ptr} claims more children than it can hold").into_bytes());
+			// Same shared rules the descent uses: counts, separator order, and a slot of an
+			// internal node that points nowhere - an impossible shape, not an empty corner.
+			if let Err(fault) = validate_internal(&buf) {
+				let mut message = b"internal ".to_vec();
+				message.extend_from_slice(&fault.describe(ptr));
+				faults.push(message);
 			}
 			let count = internal_count(&buf);
-			let mut last: Option<u64> = None;
-			for i in 0..count {
-				let sep = sep_key(&buf, i);
-				if last.is_some_and(|l| sep <= l) {
-					faults.push(alloc::format!("internal node {ptr} has separators out of order").into_bytes());
-				}
-				last = Some(sep);
-			}
 			for i in 0..=count {
 				let child_lower = if i == 0 { lower } else { Some(sep_key(&buf, i - 1)) };
 				let child_upper = if i == count { upper } else { Some(sep_key(&buf, i)) };
-				// same rule as the directory pass: a slot of an internal node that points
-				// nowhere is an impossible shape, not an empty corner.
 				if child_ptr(&buf, i) == 0 {
-					faults.push(alloc::format!("internal node {ptr} has no child in slot {i}, so a range of inode numbers routes nowhere").into_bytes());
 					continue;
 				}
 				if self.walk_inode_records_in(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, (child_lower, child_upper), inodes, seen, faults).is_err() {
@@ -369,51 +364,34 @@ impl<D: BlockDevice> LiberFs<D> {
 			match node_type(&buf) {
 				NODE_LEAF => {
 					let recs = dir_leaf_parse(&buf);
-					// `dir_leaf_parse` stops at a record it cannot complete, so a count
-					// short of the header's is a truncated leaf - the case that makes a
-					// directory list part of itself.
-					if recs.len() != node_count(&buf) {
-						faults.push(alloc::format!("inode {num}: directory leaf {ptr} holds {} of the {} records it claims", recs.len(), node_count(&buf)).into_bytes());
+					// The LOCAL invariants - truncation, ordering, the stored hash, the name
+					// policy - come from the same function the write path calls before it edits a
+					// leaf. Stated once and used twice, because they were stated twice and used
+					// once: `fsck` knew them all and a writable mount checked the record count.
+					if let Err(fault) = validate_dir_leaf(&buf, &recs) {
+						let mut message = alloc::format!("inode {num}: directory ").into_bytes();
+						message.extend_from_slice(&fault.describe(ptr));
+						faults.push(message);
 					}
-					let mut last: Option<(u64, Vec<u8>)> = None;
+					// and the ones only the WALK can answer: whether the separators above route
+					// here, and whether a name appears elsewhere in this directory.
 					for rec in recs {
 						entries += 1;
 						if lower.is_some_and(|l| rec.hash < l) || upper.is_some_and(|u| rec.hash >= u) {
 							faults.push(alloc::format!("inode {num}: directory leaf {ptr} holds a record routing will never reach").into_bytes());
 						}
-						if name_hash(&rec.name) != rec.hash {
-							faults.push(alloc::format!("inode {num}: a directory record whose stored hash is not its name's").into_bytes());
-						}
-						// the SAME rule the path API enforces when it creates a name, so
-						// the two cannot drift: a record the API could never have written
-						// is a record no path can address afterwards.
-						if validate_name_segment(&rec.name).is_err() {
-							faults.push(alloc::format!("inode {num}: a directory record whose name is not one this format can address").into_bytes());
-						}
-						if let Some((lh, ln)) = &last {
-							if (rec.hash, &rec.name) <= (*lh, ln) {
-								faults.push(alloc::format!("inode {num}: directory leaf {ptr} is not in ascending (hash, name) order").into_bytes());
-							}
-						}
 						if !names.insert(rec.name.clone()) {
 							faults.push(alloc::format!("inode {num}: a name appears twice in the directory").into_bytes());
 						}
-						last = Some((rec.hash, rec.name));
 					}
 				}
 				NODE_INTERNAL => {
-					if node_count(&buf) > INTERNAL_MAX - 1 {
-						faults.push(alloc::format!("inode {num}: directory node {ptr} claims more children than it can hold").into_bytes());
+					if let Err(fault) = validate_internal(&buf) {
+						let mut message = alloc::format!("inode {num}: directory ").into_bytes();
+						message.extend_from_slice(&fault.describe(ptr));
+						faults.push(message);
 					}
 					let count = internal_count(&buf);
-					let mut last: Option<u64> = None;
-					for i in 0..count {
-						let sep = sep_key(&buf, i);
-						if last.is_some_and(|l| sep <= l) {
-							faults.push(alloc::format!("inode {num}: directory node {ptr} has separators out of order").into_bytes());
-						}
-						last = Some(sep);
-					}
 					for i in 0..=count {
 						let child_lower = if i == 0 { lower } else { Some(sep_key(&buf, i - 1)) };
 						let child_upper = if i == count { upper } else { Some(sep_key(&buf, i)) };
@@ -424,8 +402,8 @@ impl<D: BlockDevice> LiberFs<D> {
 						// nowhere makes every name in that interval resolve to nothing -
 						// while the entry counts still agree and the checksums still verify,
 						// which is exactly the shape a structural pass exists to catch.
+						// `validate_internal` reports it; there is nothing below it to walk.
 						if child_ptr(&buf, i) == 0 {
-							faults.push(alloc::format!("inode {num}: directory node {ptr} has no child in slot {i}, so a range of names routes nowhere").into_bytes());
 							continue;
 						}
 						stack.push((child_ptr(&buf, i), child_crc(&buf, i), left - 1, (child_lower, child_upper)));

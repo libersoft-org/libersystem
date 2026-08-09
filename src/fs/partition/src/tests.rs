@@ -339,14 +339,22 @@ fn a_partition_entry_may_not_overlap_the_table_that_names_it() {
 	// probe had passed - and the mount then targeted LBA 1, which is the primary GPT header
 	// itself. Finding no superblock there, the service formatted on top of the partition
 	// table that had named the partition.
+	//
+	// The answer is now `CorruptGpt` rather than `GptWithoutLiberFs`, and the difference is the
+	// point of the later change: an entry that sits on top of the metadata naming it is not an
+	// entry to SKIP, it is evidence that the table was not written by anything that agrees with
+	// this build about what a table is. `GptWithoutLiberFs` says "this disk belongs to something
+	// else, and its table is fine"; that second half was a claim nothing had checked. Both answers
+	// refuse to write, so nothing was unsafe - what was wrong is what the operator is told to go
+	// and look at.
 	let mut img = gpt_disk(&[liberfs_entry(1, 40959)]);
-	assert_eq!(probe(&mut img), Disk::GptWithoutLiberFs, "a span covering the header is not a partition");
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "a span covering the header is not a partition, and a table holding one is not a table");
 
 	// the entry array, and the backup metadata at the far end, are equally out of bounds.
 	let mut img = gpt_disk(&[liberfs_entry(ENTRIES_LBA, 40959)]);
-	assert_eq!(probe(&mut img), Disk::GptWithoutLiberFs, "nor is one covering the entry array");
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "nor is one covering the entry array");
 	let mut img = gpt_disk(&[liberfs_entry(2048, CAPACITY - 1)]);
-	assert_eq!(probe(&mut img), Disk::GptWithoutLiberFs, "nor one covering the backup header");
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "nor one covering the backup header");
 
 	// And the one that ONLY the declared usable range refuses: a large span sitting entirely
 	// past `last_usable`, touching no metadata this build knows the position of. A probe
@@ -354,7 +362,34 @@ fn a_partition_entry_may_not_overlap_the_table_that_names_it() {
 	// where partitions may go, and that is the answer.
 	let layout = Layout { last_usable: 30_000, ..Layout::primary() };
 	let mut img = primary_only(layout, &[liberfs_entry(30_001, 40_959)]);
-	assert_eq!(probe(&mut img), Disk::GptWithoutLiberFs, "a partition has to lie inside the usable range the header declares");
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "a partition has to lie inside the usable range the header declares");
+}
+
+#[test]
+fn a_foreign_entry_that_could_not_have_been_written_condemns_the_whole_table() {
+	// `find_liberfs` says the whole table has to be consistent before any one entry of it is acted
+	// on, and only a third of that was implemented: used entries were compared with each other, and
+	// the span checks - inside the usable range, not on top of either copy of the metadata, first
+	// before last - ran for LiberFS-typed entries alone.
+	//
+	// So a checksum-valid table with a perfectly good LiberFS partition AND a foreign entry sitting
+	// on the GPT header, overlapping nothing else, answered `LiberFs` and authorised a write. The
+	// foreign entry is not this build's business to interpret; that a writer produced it at all is.
+	let foreign = |first: u64, last: u64| Entry { guid: [0x28; 16], first, last };
+
+	let mut img = gpt_disk(&[liberfs_entry(4096, 30_000), foreign(1, 1)]);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "a foreign entry on top of the primary header condemns the table");
+
+	let mut img = gpt_disk(&[liberfs_entry(4096, 30_000), foreign(9000, 3000)]);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "so does one that runs backwards");
+
+	let mut img = gpt_disk(&[liberfs_entry(4096, 30_000), foreign(0, 100)]);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "and one starting at LBA 0");
+
+	// The control: the same LiberFS partition beside an ordinary foreign one is found as before.
+	// A rule that condemned every table with a foreign partition in it would be useless.
+	let mut img = gpt_disk(&[liberfs_entry(4096, 30_000), foreign(31_000, 40_000)]);
+	assert_eq!(probe(&mut img), Disk::LiberFs { first: 4096, last: 30_000 }, "an ordinary foreign partition beside a LiberFS one changes nothing");
 }
 
 #[test]
@@ -386,10 +421,21 @@ fn a_device_that_will_not_say_its_size_bounds_nothing() {
 
 #[test]
 fn a_degenerate_span_is_skipped_and_the_real_one_still_found() {
-	// a too-small entry, an inverted one and an unused slot ahead of the real partition:
-	// the walk keeps going rather than taking the first LiberFS-typed entry it sees.
-	let mut img = gpt_disk(&[liberfs_entry(2048, 2055), liberfs_entry(9000, 3000), Entry { guid: [0; 16], first: 0, last: 0 }, liberfs_entry(4096, 40959)]);
+	// a too-small entry and an unused slot ahead of the real partition: the walk keeps going rather
+	// than taking the first LiberFS-typed entry it sees.
+	//
+	// The INVERTED entry that used to be in this list is gone, and deliberately. `first > last` is
+	// not a small partition, it is a span that cannot exist, and a table holding one is no longer
+	// something to walk past - see `a_foreign_entry_that_could_not_have_been_written_condemns_the
+	// _whole_table`. Too-small is the one degeneracy that stays skippable, because it is not
+	// impossible: `MIN_PARTITION_SECTORS` is this build's floor for holding a VOLUME, and a small
+	// partition is a perfectly ordinary thing for another system to have made.
+	let mut img = gpt_disk(&[liberfs_entry(2048, 2055), Entry { guid: [0; 16], first: 0, last: 0 }, liberfs_entry(4096, 40959)]);
 	assert_eq!(probe(&mut img), Disk::LiberFs { first: 4096, last: 40959 });
+
+	// and the inverted one on its own, so the change in answer is stated rather than implied.
+	let mut img = gpt_disk(&[liberfs_entry(9000, 3000), liberfs_entry(4096, 40959)]);
+	assert_eq!(probe(&mut img), Disk::CorruptGpt, "a span that runs backwards is not a degenerate partition, it is a broken table");
 }
 
 #[test]
@@ -842,4 +888,65 @@ fn a_blank_disk_of_unknown_size_may_not_be_formatted() {
 	let mut img = Image::new(CAPACITY);
 	img.capacity = None;
 	assert_eq!(probe(&mut img), Disk::UnknownData, "a device that cannot say how big it is cannot be shown to be empty");
+}
+
+#[test]
+fn the_two_copies_of_a_table_have_to_agree_about_more_than_their_entry_bytes() {
+	// The agreement check was `backup.entries == gpt.entries` - the raw array and nothing else. Two
+	// headers can carry byte-identical arrays and disagree about everything around them, each with
+	// a correct CRC over its own contradictory contents, and the comment above the check claimed
+	// that a verified backup which disagrees stops the write.
+	//
+	// `entry_size` is the sharpest of them, and the reason this is not pedantry: the same bytes
+	// read at a different stride are a different table, and `find_liberfs` walks
+	// `chunks_exact(entry_size)`.
+	let entries = [liberfs_entry(2048, 30_000)];
+
+	// The control: two copies that agree are acted on, as they always were.
+	let mut img = gpt_disk(&entries);
+	assert_eq!(probe(&mut img), Disk::LiberFs { first: 2048, last: 30_000 }, "two agreeing copies name the partition");
+
+	// Each of these changes ONE field of the backup header, leaving the entry array byte-identical
+	// and both CRCs correct. Every one of them used to pass.
+	let disagreements: [(&str, Layout); 3] = [
+		("a different usable range", Layout { last_usable: LAST_USABLE - 1, ..Layout::backup() }),
+		("a different first usable sector", Layout { first_usable: FIRST_USABLE + 1, ..Layout::backup() }),
+		("a different entry count", Layout { num_entries: NUM_ENTRIES - 1, ..Layout::backup() }),
+	];
+	for (what, backup) in disagreements {
+		let mut img = Image::new(CAPACITY);
+		img.put(0, &protective_mbr());
+		write_header(&mut img, &Layout::primary(), &entries);
+		write_header(&mut img, &backup, &entries);
+		assert_eq!(probe(&mut img), Disk::CorruptGpt, "two copies disagreeing about {what} are not two copies of one table");
+	}
+}
+
+#[test]
+fn a_disk_whose_data_begins_past_the_scan_is_still_called_blank() {
+	// KNOWN HOLE, asserted so it is visible in the suite rather than only in a document.
+	//
+	// `scanned_blank` reads LBA 0 through 128, then 512 and 1024 - the places the filesystems this
+	// build knows announce themselves. A disk that is zero across all 131 and carries data from
+	// LBA 2048 answers `Blank`, and `mount_or_format` then formats the whole device.
+	//
+	// The suite could not see this. `a_disk_of_arbitrary_bytes_is_not_a_blank_disk` iterates
+	// `[2, 7, 64, 128, BLANK_FAR_PROBES[0], BLANK_FAR_PROBES[1]]` - every one of them a sector the
+	// scanner reads, two of them named by the scanner's own constant. It is a test of the scan's
+	// coverage written in the scan's own terms, so it passes by construction and would go on
+	// passing if the scan shrank to those six sectors.
+	//
+	// There is no list of offsets that fixes this: the reason there is no complete list of
+	// filesystem signatures is the reason there is no complete list of PLACES. The fix is that a
+	// whole-device format stops being deducible from the medium and becomes a permission the boot
+	// policy grants - M0152. This test asserts the CURRENT answer, which is the wrong one, and is
+	// the test that flips when the permission lands.
+	let mut img = Image::new(CAPACITY);
+	img.edit(2048, |s| s[17] = 0x01);
+	assert_eq!(probe(&mut img), Disk::Blank, "data past the scan is invisible to it - this is the hole M0152 closes, not a property to rely on");
+
+	// And the boundary, so the scan's actual reach is pinned: one sector inside it IS seen.
+	let mut edge = Image::new(CAPACITY);
+	edge.edit(BLANK_SCAN_SECTORS - 1, |s| s[17] = 0x01);
+	assert_eq!(probe(&mut edge), Disk::UnknownData, "the last sector of the contiguous scan is read");
 }

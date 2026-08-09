@@ -204,10 +204,26 @@ impl HandleTable {
 
 	// Install a capability, enforcing the Domain's handle quota. Returns None
 	// (charging nothing) if the table's Domain is at its handle cap.
-	// Reserve room for `count` more handles, or refuse. Charges the quota up front so a
-	// later `insert` cannot be refused for space - which is what lets a receive know it can
-	// deliver a whole message before it takes it out of the queue.
+	// Reserve room for `count` more handles, or refuse. Both kinds of room.
+	//
+	// This charged the Domain's quota and nothing else, and its comment claimed that a later
+	// `insert` therefore could not be refused for space. It could: `insert_reserved` goes through
+	// `place`, which ends in `self.slots.push(...)`, an INFALLIBLE `Vec` growth. The quota said the
+	// Domain was allowed another handle; nothing had said the kernel heap could hold one.
+	//
+	// That gap sits under a caller whose whole reason for reserving is that it is about to destroy
+	// something it cannot get back - a receive takes the message out of the queue on the strength
+	// of this answer. Quota granted, message dequeued, `slots` needs to grow, the heap is empty:
+	// an allocation abort in the kernel, reachable from ring 3 by filling memory and receiving.
+	//
+	// So the physical slots are reserved first and the quota second. `free` holds indices of slots
+	// that already exist, so only the shortfall needs allocating; `try_reserve` may over-allocate,
+	// which is fine - it never under-allocates, and that is the direction that matters here.
 	pub fn reserve(&mut self, count: usize) -> bool {
+		let needed = count.saturating_sub(self.free.len());
+		if needed > 0 && self.slots.try_reserve(needed).is_err() {
+			return false;
+		}
 		let Some(domain) = &self.domain else {
 			return true;
 		};
@@ -222,7 +238,8 @@ impl HandleTable {
 
 	// Install a capability against a reservation already taken by `reserve`. Charges
 	// nothing: the quota for this handle was paid when the room was booked, and charging
-	// again here would bill twice for one handle.
+	// again here would bill twice for one handle. Cannot fail, and `reserve` is what makes
+	// that true of the memory as well as of the quota.
 	pub fn insert_reserved(&mut self, cap: Capability) -> Handle {
 		self.place(cap)
 	}

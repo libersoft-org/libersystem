@@ -68,6 +68,9 @@ const HDR_CURRENT_LBA: usize = 24;
 const HDR_BACKUP_LBA: usize = 32;
 const HDR_FIRST_USABLE: usize = 40;
 const HDR_LAST_USABLE: usize = 48;
+// The disk's own identity. Not consulted to decide anything about a partition - it is here so the
+// two copies of the table can be compared as descriptions of ONE disk.
+const HDR_DISK_GUID: usize = 56;
 const HDR_ENTRIES_LBA: usize = 72;
 const HDR_NUM_ENTRIES: usize = 80;
 const HDR_ENTRY_SIZE: usize = 84;
@@ -199,7 +202,7 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 			// and this answer authorises a format. Agreement between the copies is cheap evidence,
 			// and its absence is exactly the sort of thing that should stop a write.
 			Ok(gpt) => match backup_gpt(dev) {
-				Ok(backup) if backup.entries == gpt.entries => find_liberfs(&gpt),
+				Ok(backup) if copies_agree(&gpt, &backup) => find_liberfs(&gpt),
 				// The backup is unreadable or damaged: the primary stands on its own, which is what
 				// a backup being a BACKUP means. Only a backup that verifies and disagrees is a
 				// reason to refuse.
@@ -351,6 +354,10 @@ struct Gpt {
 	// verification proves nothing about what the walk below acts on.
 	entries: Vec<u8>,
 	entry_size: usize,
+	num_entries: u64,
+	// The disk this header says it describes. Compared between the primary and the backup and
+	// otherwise unused: two copies that disagree about which disk they are on are not two copies.
+	disk_guid: [u8; 16],
 	first_usable: u64,
 	last_usable: u64,
 	// the header's own sector and the entry array's span, so a partition entry that
@@ -512,7 +519,9 @@ fn read_gpt(dev: &mut impl Sectors, header: &[u8], at: u64, counterpart: u64) ->
 		return Err(Fault::Unusable);
 	}
 
-	Ok(Gpt { entries: array, entry_size, first_usable, last_usable, header_lba, backup_lba, entries_lba, entries_last_lba })
+	let mut disk_guid = [0u8; 16];
+	disk_guid.copy_from_slice(&header[HDR_DISK_GUID..HDR_DISK_GUID + 16]);
+	Ok(Gpt { entries: array, entry_size, num_entries, disk_guid, first_usable, last_usable, header_lba, backup_lba, entries_lba, entries_last_lba })
 }
 
 // The backup GPT: its header is the disk's LAST sector, and it describes the same partitions
@@ -542,6 +551,21 @@ fn primary_counterpart(dev: &mut impl Sectors) -> u64 {
 	}
 }
 
+// Do the two copies of the table describe the same disk, laid out the same way?
+//
+// This was `backup.entries == gpt.entries` - the raw entry array and nothing else. Two headers can
+// carry byte-identical arrays and still disagree about `first_usable`, `last_usable`, the entry
+// count, the entry size or which disk they are on, each with a correct CRC over its own
+// contradictory contents. `entry_size` is the sharpest of them: the same bytes read at a different
+// stride are a different table, and `find_liberfs` walks `chunks_exact(entry_size)`.
+//
+// The three fields that MUST differ are excluded by construction: `header_lba`, `backup_lba` and
+// `entries_lba` are each copy's own position, and a backup that agreed with the primary about them
+// would be the broken one.
+fn copies_agree(primary: &Gpt, backup: &Gpt) -> bool {
+	primary.entries == backup.entries && primary.entry_size == backup.entry_size && primary.num_entries == backup.num_entries && primary.disk_guid == backup.disk_guid && primary.first_usable == backup.first_usable && primary.last_usable == backup.last_usable
+}
+
 // Walk a verified GPT's entry array for the first usable LiberFS partition.
 //
 // "Usable" is the whole point: a span is only usable if it lies wholly inside the usable
@@ -557,7 +581,7 @@ fn find_liberfs(gpt: &Gpt) -> Disk {
 	// checksum-valid table naming a Linux partition at 2048..30000 and a LiberFS one at
 	// 10000..40000 was accepted, and formatting the second destroyed half the first. A tool that
 	// only READS a table may reasonably trust it; this answer authorises a write.
-	if entries_overlap(gpt) {
+	if table_is_inconsistent(gpt) {
 		return Disk::CorruptGpt;
 	}
 	for e in gpt.entries.chunks_exact(gpt.entry_size) {
@@ -573,32 +597,64 @@ fn find_liberfs(gpt: &Gpt) -> Disk {
 	Disk::GptWithoutLiberFs
 }
 
-// Do any two used entries of this table claim the same sector?
+// Is every used entry of this table one this build is willing to act on, and do any two of them
+// claim the same sector?
 //
 // Quadratic in the entry count, which is capped at `MAX_ENTRIES` - 512 entries is 130,000 integer
 // comparisons, once, at boot, and the alternative is sorting a copy of the array to save a
 // microsecond nobody will notice.
-fn entries_overlap(gpt: &Gpt) -> bool {
-	let spans: Vec<(u64, u64)> = gpt
-		.entries
-		.chunks_exact(gpt.entry_size)
-		.filter(|e| e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] != UNUSED_TYPE_GUID)
-		.map(|e| {
-			let first = u64::from_le_bytes(e[ENT_FIRST_LBA..ENT_FIRST_LBA + 8].try_into().unwrap());
-			let last = u64::from_le_bytes(e[ENT_LAST_LBA..ENT_LAST_LBA + 8].try_into().unwrap());
-			(first, last)
-		})
-		.collect();
-	for (i, &(a_first, a_last)) in spans.iter().enumerate() {
-		// A span that runs backwards is not a span; `usable_span` refuses such an entry on its own
-		// account, and it cannot overlap anything here.
-		if a_last < a_first {
-			continue;
+//
+// It ALLOCATES NOTHING. This collected the spans into a `Vec` first, which put an infallible
+// allocation back into a hostile-media path the surrounding parser had just been rewritten to keep
+// fallible throughout - and the crate is a dependency of both the kernel and the storage service,
+// so the failure is an allocation abort in ring 0 or the userspace allocation-error handler, in a
+// function whose enclosing answer already has a `NoMemory` variant. The algorithm was already
+// quadratic, so two nested iterators over the array do the same work with nothing to size.
+//
+// And it checks EVERY used entry, not only the LiberFS candidate. `find_liberfs` says the whole
+// table has to be consistent before any one entry of it is acted on, and this implemented a third
+// of that: entries were compared against each other and against nothing else, while `usable_span` -
+// which checks first <= last, containment in the declared usable range, and non-overlap with both
+// copies of the metadata - ran only for entries carrying the LiberFS type GUID. So a checksum-valid
+// table with a Linux entry at first = 1, last = 1, sitting on top of the GPT header itself and
+// overlapping no other partition, passed. A tool that only READS a table may reasonably shrug at
+// that; the answer here authorises a write.
+fn table_is_inconsistent(gpt: &Gpt) -> bool {
+	let used = |e: &[u8]| e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] != UNUSED_TYPE_GUID;
+	let span = |e: &[u8]| {
+		let first = u64::from_le_bytes(e[ENT_FIRST_LBA..ENT_FIRST_LBA + 8].try_into().unwrap());
+		let last = u64::from_le_bytes(e[ENT_LAST_LBA..ENT_LAST_LBA + 8].try_into().unwrap());
+		(first, last)
+	};
+	// Every used entry has to be a span this build could hand to a filesystem - whatever
+	// filesystem that is. A foreign partition that is structurally impossible says the table was
+	// not written by anything that agrees with this build about what a table is, and that is a
+	// reason to leave the whole disk alone rather than to pick the one entry that looks fine.
+	//
+	// `MIN_PARTITION_SECTORS` is the one rule NOT applied here: a small foreign partition is
+	// perfectly legitimate and only a LiberFS volume needs room for a volume.
+	for entry in gpt.entries.chunks_exact(gpt.entry_size).filter(|e| used(e)) {
+		let (first, last) = span(entry);
+		if first == 0 || last < first {
+			return true;
 		}
-		for &(b_first, b_last) in spans.iter().skip(i + 1) {
-			if b_last < b_first {
-				continue;
-			}
+		if first < gpt.first_usable || last > gpt.last_usable {
+			return true;
+		}
+		if first <= gpt.header_lba && gpt.header_lba <= last {
+			return true;
+		}
+		if first <= gpt.backup_lba && gpt.backup_lba <= last {
+			return true;
+		}
+		if first <= gpt.entries_last_lba && gpt.entries_lba <= last {
+			return true;
+		}
+	}
+	for (index, a) in gpt.entries.chunks_exact(gpt.entry_size).enumerate().filter(|(_, e)| used(e)) {
+		let (a_first, a_last) = span(a);
+		for b in gpt.entries.chunks_exact(gpt.entry_size).skip(index + 1).filter(|e| used(e)) {
+			let (b_first, b_last) = span(b);
 			if a_first <= b_last && b_first <= a_last {
 				return true;
 			}

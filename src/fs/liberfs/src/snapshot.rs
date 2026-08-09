@@ -17,6 +17,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		if self.snapshots.iter().any(|s| s.name == name) {
 			return Err(FsError::Exists);
 		}
+		// The writer's half of the format's ceiling: what a mount refuses to read, a write must
+		// refuse to create, or the volume becomes one this build cannot open.
+		if self.snapshots.len() >= MAX_SNAPSHOTS {
+			return Err(FsError::NoSpace);
+		}
 		self.mutate(|fs| fs.create_snapshot_inner(name))
 	}
 
@@ -109,7 +114,18 @@ impl<D: BlockDevice> LiberFs<D> {
 	// before this was separable. `seen` is handed every chain block as it is visited,
 	// which is what lets the free-map walk reserve the table's own blocks in one pass.
 	pub(crate) fn read_snapshot_table(&mut self, root: u64, root_crc: u32, seen: &mut dyn FnMut(u64)) -> Result<Vec<Snapshot>, FsError> {
-		let mut out = Vec::new();
+		let mut out: Vec<Snapshot> = Vec::new();
+		// Name hashes, kept sorted, so uniqueness costs a binary search instead of a scan.
+		//
+		// The check itself is right and was added for a good reason - a forged table could name two
+		// snapshots the same and the mount stayed writable. The SHAPE was the problem: `out.iter()
+		// .any(..)` per record is quadratic, and the walk admitted as many records as the chain had
+		// room for. On a one-gigabyte volume that is around twelve million records and something
+		// near 10^14 comparisons, so the mount would not finish long before it ran out of memory -
+		// and a hang at mount is a system that does not boot with nothing said about why.
+		//
+		// A hash collision is not a duplicate, so a match is confirmed against the names.
+		let mut hashes: Vec<(u64, usize)> = Vec::new();
 		let mut ptr = root;
 		let mut crc = root_crc;
 		let mut block = vec![0u8; BLOCK_SIZE];
@@ -153,8 +169,40 @@ impl<D: BlockDevice> LiberFs<D> {
 				if name.is_empty() || core::str::from_utf8(&name).is_err() {
 					return Err(FsError::Corrupt);
 				}
-				if out.iter().any(|s: &Snapshot| s.name == name) {
+				// And the field AFTER the terminator has to be the zero padding the writer lays
+				// down. `read_superblock` was taught this for the volume label and this record was
+				// left with half the rule: `name_in` stops at the first NUL and looks no further,
+				// so `backup\0\xff\xffgarbage` read as the snapshot "backup". Nothing consumes
+				// those bytes, which is why it went unnoticed - the point is that no writer of this
+				// format produces a field shaped that way, so a field shaped that way is itself
+				// evidence the record came from something else.
+				if block[off + name.len()..off + SNAP_NAME_MAX].iter().any(|&b| b != 0) {
 					return Err(FsError::Corrupt);
+				}
+				let hash = name_hash(&name);
+				match hashes.binary_search_by_key(&hash, |&(h, _)| h) {
+					// Some record already hashes here. Hashes are not identities, so the names are
+					// compared - only over the run that shares this hash, which is one entry in
+					// every case that is not a deliberate collision.
+					Ok(at) => {
+						let mut first = at;
+						while first > 0 && hashes[first - 1].0 == hash {
+							first -= 1;
+						}
+						if hashes[first..].iter().take_while(|&&(h, _)| h == hash).any(|&(_, i)| out[i].name == name) {
+							return Err(FsError::Corrupt);
+						}
+						if hashes.try_reserve(1).is_err() {
+							return Err(FsError::NoSpace);
+						}
+						hashes.insert(at, (hash, out.len()));
+					}
+					Err(at) => {
+						if hashes.try_reserve(1).is_err() {
+							return Err(FsError::NoSpace);
+						}
+						hashes.insert(at, (hash, out.len()));
+					}
 				}
 				// a root of 0 is the "no tree" sentinel and no generation has one - even a
 				// freshly formatted volume has a root leaf - and a root outside the pool
@@ -168,6 +216,14 @@ impl<D: BlockDevice> LiberFs<D> {
 				// impossible however it got there.
 				if generation > self.generation {
 					return Err(FsError::Corrupt);
+				}
+				// The ceiling, checked as the walk goes rather than after it: a table claiming more
+				// than the format permits is refused before the memory is spent on reading it.
+				if out.len() >= MAX_SNAPSHOTS {
+					return Err(FsError::Corrupt);
+				}
+				if out.try_reserve(1).is_err() {
+					return Err(FsError::NoSpace);
 				}
 				out.push(Snapshot { name, inode_root, inode_root_crc, generation });
 			}

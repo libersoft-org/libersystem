@@ -45,11 +45,21 @@ pub const MAX_WAIT_SET_MEMBERS: usize = 256;
 pub struct WaitSet {
 	header: ObjectHeader,
 	members: SpinLock<Vec<Arc<dyn KernelObject>>>,
+	// Who pays for the memberships. A registration is one `Arc` reference here plus one scheduler
+	// observer entry, and the Domain is charged one handle for the whole SET - so without this the
+	// quota that was supposed to bound the registrations bounded nothing resembling their cost.
+	// `None` for a set created inside the kernel, which is accounted nowhere else either.
+	domain: Option<Arc<super::domain::Domain>>,
 }
 
 impl WaitSet {
 	pub fn create() -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()) })
+		Arc::new(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: None })
+	}
+
+	// The same, charging its memberships to `domain`. What `sys_waitset_create` builds.
+	pub fn create_in(domain: Arc<super::domain::Domain>) -> Arc<Self> {
+		Arc::new(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: Some(domain) })
 	}
 
 	// Add `object` to the set, registering the set as a persistent observer of it.
@@ -73,10 +83,32 @@ impl WaitSet {
 		if members.try_reserve(1).is_err() {
 			return Err(WaitSetError::Full);
 		}
+		// The Domain's ceiling on registrations, charged before anything is recorded so a refusal
+		// leaves nothing to undo. `MAX_WAIT_SET_MEMBERS` bounds ONE set and the handle quota bounds
+		// how many sets exist; neither bounds the registrations, which is what the memory is.
+		if let Some(domain) = &self.domain {
+			if !domain.try_charge_wait_registration() {
+				return Err(WaitSetError::Full);
+			}
+		}
 		members.push(object);
 		// Registered while the membership lock is held, so a wake arriving now finds either both or
 		// neither - never a member the set does not know about.
-		crate::sched::register_set_observer(koid, self.header.koid());
+		//
+		// And rolled back when it cannot be. This ignored the result, so a refused registration
+		// left a member in the set whose wakes reach nobody, and answered `Ok`: a thread waiting on
+		// the set with no deadline then parks with nothing left to rouse it. Success has to mean
+		// the member will be woken, or it means nothing at all.
+		if let Err(reason) = crate::sched::register_set_observer(koid, self.header.koid()) {
+			members.pop();
+			if let Some(domain) = &self.domain {
+				domain.uncharge_wait_registrations(1);
+			}
+			return Err(match reason {
+				crate::sched::ObserveError::TooManySets => WaitSetError::TooManySets,
+				crate::sched::ObserveError::NoMemory => WaitSetError::Full,
+			});
+		}
 		Ok(())
 	}
 
@@ -89,6 +121,9 @@ impl WaitSet {
 			return Err(WaitSetError::NotPresent);
 		}
 		crate::sched::unregister_set_observer(koid, self.header.koid());
+		if let Some(domain) = &self.domain {
+			domain.uncharge_wait_registrations((before - members.len()) as u64);
+		}
 		Ok(())
 	}
 
@@ -123,8 +158,12 @@ impl Drop for WaitSet {
 		// Every registration this set made comes out with it. A bucket entry naming a set that no
 		// longer exists would be chased on every wake of that member, forever.
 		let koid = self.header.koid();
-		for member in self.members.lock().iter() {
+		let members = self.members.lock();
+		for member in members.iter() {
 			crate::sched::unregister_set_observer(member.header().koid(), koid);
+		}
+		if let Some(domain) = &self.domain {
+			domain.uncharge_wait_registrations(members.len() as u64);
 		}
 	}
 }
@@ -137,8 +176,14 @@ pub enum WaitSetError {
 	AlreadyPresent,
 	// Not a member, so there is nothing to remove.
 	NotPresent,
-	// At `MAX_WAIT_SET_MEMBERS`, or the machine would not give the room.
+	// At `MAX_WAIT_SET_MEMBERS`, at the Domain's registration ceiling, or the machine would not
+	// give the room.
 	Full,
+	// This object is already in as many sets as one object's wake can reach
+	// (`sched::MAX_SETS_PER_OBJECT`). Kept apart from `Full`, which is about THIS set: the caller's
+	// next move differs - one is "use a smaller set", the other is "something else is watching this
+	// object and one of us should stop".
+	TooManySets,
 }
 
 impl_kernel_object!(WaitSet, WaitSet);

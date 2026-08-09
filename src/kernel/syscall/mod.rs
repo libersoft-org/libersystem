@@ -1769,6 +1769,83 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 	}
 }
 
+// Take one message, having first made room for everything it carries. BOTH receives go through
+// this; that they did not is what this is here to fix.
+//
+// `sys_channel_recv_caps` was made transactional and `sys_channel_recv` was left as it was, and the
+// one left behind is the one nearly everything uses - all four of the runtime's receive wrappers
+// issue `SYS_CHANNEL_RECV`, and `SYS_CHANNEL_RECV_CAPS` is the exception for a receiver expecting
+// more than one capability. So the rare path got the treatment and the common path kept doing this:
+//
+//     let message = channel.recv()?;                       // dequeued. gone from the queue.
+//     ...
+//     thread.handles().lock().insert(cap)                  // charge_handle: accounting, no limit
+//
+// `HandleTable::insert` is the unbounded install, and its comment says why - it is used by paths
+// that must not fail. The install could not be allowed to fail BECAUSE the message was already
+// destroyed if it did, so the quota was dropped rather than the ordering fixed. The result was a
+// direct hole in resource-domain isolation: a Domain at its handle limit receives a transferred
+// capability and is over it, receives again and is further over. Every other way of acquiring a
+// handle is bounded - `try_insert`, `try_insert_or_return`, `duplicate` (bounded in M0145 for
+// exactly this reason) - and asking a peer to send one was not.
+//
+// Three steps, in this order, and the order is the whole thing:
+//
+//   1. LOOK at the head and learn its identity and its shape.
+//   2. RESERVE precisely what that message needs - quota and slot memory both.
+//   3. TAKE that message BY IDENTITY, or nothing.
+//
+// Reserving before looking is what the first version of the multi-cap fix did: it booked
+// `MAX_MESSAGE_CAPS` up front because it had no way to name the message it had inspected. That
+// refuses a Domain with one free handle slot a message carrying one capability, which is a false
+// refusal in the safe direction but a false refusal all the same - and for the plain receive it
+// would be worse than that, because reserving one handle for every message would stop a Domain at
+// its limit from receiving PLAIN BYTES.
+//
+// `install_caps_max` is how many capabilities the caller will actually install, which is where the
+// two receives differ: the plain one takes the first and drops the rest, so it reserves at most
+// one however many arrived. `refuse_above_bytes` is likewise the caller's contract - the plain
+// receive truncates to the buffer it was given and passes `usize::MAX` here, the multi-cap one
+// refuses and leaves the message where it is.
+fn receive_transactionally(thread: &crate::object::thread::Thread, channel: &Channel, refuse_above_bytes: usize, install_caps_max: usize) -> Result<crate::object::channel::Message, i64> {
+	// Bounded, because the only way to go round again is for another receiver on this endpoint to
+	// have taken the message in between - which is somebody making progress, not a stall. Bounded
+	// anyway: a caller told to try again can, and a loop with no ceiling inside a syscall is a
+	// place a contended endpoint could hold a core.
+	const ATTEMPTS: usize = 8;
+	for _ in 0..ATTEMPTS {
+		let (id, bytes, caps) = match channel.peek_identified() {
+			Ok(shape) => shape,
+			Err(ChannelError::PeerClosed) => return Err(ERR_PEER_CLOSED),
+			Err(_) => return Err(ERR_WOULD_BLOCK),
+		};
+		if bytes > refuse_above_bytes {
+			return Err(ERR_INVALID);
+		}
+		let reserved = caps.min(install_caps_max);
+		if !thread.handles().lock().reserve(reserved) {
+			return Err(ERR_RESOURCE_EXHAUSTED);
+		}
+		match channel.recv_identified(id, refuse_above_bytes, abi::MAX_MESSAGE_CAPS) {
+			Ok(message) => return Ok(message),
+			Err(refusal) => {
+				thread.handles().lock().release_reservation(reserved);
+				match refusal {
+					// The message went to another receiver between the look and the take. Nothing
+					// was destroyed and nothing is wrong: look at whatever is there now.
+					RecvRefusal::Superseded => continue,
+					RecvRefusal::TooLarge(_) | RecvRefusal::TooManyCaps(_) => return Err(ERR_INVALID),
+					RecvRefusal::Gone(ChannelError::PeerClosed) => return Err(ERR_PEER_CLOSED),
+					RecvRefusal::Gone(_) => return Err(ERR_WOULD_BLOCK),
+				}
+			}
+		}
+	}
+	// Eight receivers took eight messages out from under this one. Not an error about the channel,
+	// so the answer is the one that means "nothing for you right now, come back".
+	Err(ERR_WOULD_BLOCK)
+}
+
 // Receive a message and take EVERY capability it carried. `caps_ptr` is written as
 // `[count, handle0, ...]`. The ordinary `sys_channel_recv` takes the first and drops the rest,
 // which is right for a receiver expecting one and silent loss for a receiver expecting more.
@@ -1781,46 +1858,24 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 		Ok(c) => c,
 		Err(e) => return e,
 	};
-	// ONE decision, under ONE lock, and the message is taken only if it fits.
+	// Look, reserve exactly, take by identity. A message that does not fit is left in the queue -
+	// the caller can come back with a bigger buffer or after closing some handles, and nothing is
+	// destroyed that nobody can retry.
 	//
 	// This used to be three steps - `peek_shape`, `reserve`, `recv` - each taking the queue lock on
-	// its own. A second receiver on the same endpoint could take the peeked message in between, and
-	// what arrived was then a different message while the caller had already decided what it could
-	// hold. The copy below uses the RECEIVED length, so a receiver that declared a hundred bytes
-	// could be handed a megabyte and the kernel would write all of it into a buffer validated for a
-	// hundred: a kernel-to-userspace overrun reachable from ring 3 with two threads and no timing
-	// tricks. The capability half had the same shape, installing handles counted from one message
-	// against a reservation paid for another - and the reservation was never returned when the recv
-	// then failed, so the race leaked handle quota even when it delivered nothing.
-	//
-	// A message that does not fit is left in the queue, which is the property the old code had for
-	// the right reason and lost to the race: the caller can come back with a bigger buffer or after
-	// closing some handles, and nothing is destroyed that nobody can retry.
-	//
-	// The reservation is taken FIRST, for the largest a message may be, and the surplus released
-	// after: reserving `MAX_MESSAGE_CAPS` costs nothing to a table with room and refuses early on a
-	// table without, and it means the quota is never held for a message that was not taken.
-	{
-		let mut table = thread.handles().lock();
-		if !table.reserve(abi::MAX_MESSAGE_CAPS) {
-			return ERR_RESOURCE_EXHAUSTED;
-		}
-	}
-	let message = match channel.recv_if_fits(bytes_cap as usize, abi::MAX_MESSAGE_CAPS) {
-		Ok(m) => m,
-		Err(refusal) => {
-			thread.handles().lock().release_reservation(abi::MAX_MESSAGE_CAPS);
-			return match refusal {
-				// The buffer or the slots are too small for the head of the queue. It stays there.
-				RecvRefusal::TooLarge(_) | RecvRefusal::TooManyCaps(_) => ERR_INVALID,
-				RecvRefusal::Gone(ChannelError::PeerClosed) => ERR_PEER_CLOSED,
-				RecvRefusal::Gone(_) => ERR_WOULD_BLOCK,
-			};
-		}
+	// its own, with nothing tying the three to one message. A second receiver on the same endpoint
+	// could take the peeked message in between, and what arrived was then a different message while
+	// the caller had already decided what it could hold. The copy below uses the RECEIVED length,
+	// so a receiver that declared a hundred bytes could be handed a megabyte and the kernel would
+	// write all of it into a buffer validated for a hundred: a kernel-to-userspace overrun
+	// reachable from ring 3 with two threads and no timing tricks. The capability half had the same
+	// shape, installing handles counted from one message against a reservation paid for another -
+	// and the reservation was never returned when the recv then failed, so the race leaked handle
+	// quota even when it delivered nothing.
+	let message = match receive_transactionally(&thread, &channel, bytes_cap as usize, abi::MAX_MESSAGE_CAPS) {
+		Ok(message) => message,
+		Err(error) => return error,
 	};
-	// what the message did not need goes straight back, before anything else can fail.
-	let carried = message.caps.len().min(abi::MAX_MESSAGE_CAPS);
-	thread.handles().lock().release_reservation(abi::MAX_MESSAGE_CAPS - carried);
 	arch::paging::user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(message.bytes.as_ptr(), bytes_ptr as *mut u8, message.bytes.len());
 	});
@@ -1828,8 +1883,8 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 	{
 		let mut table = thread.handles().lock();
 		for cap in message.caps.into_iter().take(abi::MAX_MESSAGE_CAPS) {
-			// against the reservation taken above -  would charge the quota a
-			// second time for a handle already paid for.
+			// Against the reservation taken above. `insert` would charge the quota a second time
+			// for a handle already paid for, and could refuse a handle the caller was promised.
 			let handle = table.insert_reserved(cap);
 			write_user(caps_ptr + ((installed + 1) * 8) as u64, handle.raw());
 			installed += 1;
@@ -1854,11 +1909,17 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 		}
 	};
 	let channel = object.as_any().downcast_ref::<Channel>().expect("type checked by lookup_typed");
-	let message = match channel.recv() {
-		Ok(m) => m,
-		Err(ChannelError::Empty) => return ERR_WOULD_BLOCK,
-		Err(ChannelError::PeerClosed) => return ERR_PEER_CLOSED,
-		Err(_) => return ERR_INVALID,
+	// At most ONE capability is installed however many the message carried, so at most one is
+	// reserved. `usize::MAX` for the byte ceiling keeps this receive's contract exactly as it was:
+	// it truncates to the buffer it was given rather than refusing, which is what its callers are
+	// written against - the storage service's stream loop peeks the length, asks the filesystem
+	// for a buffer of that size, and treats a short read as a short read. Turning that into a
+	// refusal would convert a handled shortfall into an aborted stream. The multi-cap receive
+	// refuses instead, because its callers know the shape they are expecting and a message that
+	// does not fit is one they can come back for.
+	let message = match receive_transactionally(&thread, channel, usize::MAX, 1) {
+		Ok(message) => message,
+		Err(error) => return error,
 	};
 	thread.process().record_recv();
 	let n = core::cmp::min(message.bytes.len(), bytes_cap as usize);
@@ -1867,13 +1928,20 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 			core::ptr::copy_nonoverlapping(message.bytes.as_ptr(), bytes_ptr as *mut u8, n);
 		});
 	}
-	// Install the transferred capability (if any) and report its new handle.
+	// Install the transferred capability (if any) and report its new handle. Against the
+	// reservation taken above: `insert` is the UNBOUNDED install, and using it here is how a
+	// Domain at its handle limit went past it by receiving. The capabilities past the first are
+	// dropped, as they always were - they were never installed, so they cost no quota.
 	if out_handle_ptr != 0 {
 		let handle_value = match message.caps.into_iter().next() {
-			Some(cap) => thread.handles().lock().insert(cap).raw(),
+			Some(cap) => thread.handles().lock().insert_reserved(cap).raw(),
 			None => 0,
 		};
 		write_user(out_handle_ptr, handle_value);
+	} else {
+		// No out pointer: the caller is not taking the capability, so the slot booked for it goes
+		// back. Nothing is installed and the message's capabilities are dropped with it.
+		thread.handles().lock().release_reservation(message.caps.len().min(1));
 	}
 	n as i64
 }
@@ -2035,7 +2103,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 // as long as it runs. A set pays that once per member, when the member joins.
 fn sys_waitset_create() -> i64 {
 	let thread = current_thread!();
-	install_object(&thread, WaitSet::create(), Rights::ALL, 0)
+	install_object(&thread, WaitSet::create_in(thread.domain().clone()), Rights::ALL, 0)
 }
 
 // Add the object behind `object_handle` to the set behind `set_handle`.
@@ -2053,9 +2121,13 @@ fn sys_waitset_add(set_handle: u64, object_handle: u64) -> i64 {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
+	// The koid the member joined under, so a caller learns it here rather than paying
+	// `SYS_OBJECT_INFO_GET` per member to find out what `SYS_WAITSET_WAIT` will answer with.
+	// Userspace CAN ask - `ObjectInfo` carries `koid` - and should not have to.
+	let koid = object.header().koid();
 	match set.add(object) {
-		Ok(()) => 0,
-		Err(WaitSetError::Full) => ERR_RESOURCE_EXHAUSTED,
+		Ok(()) => koid as i64,
+		Err(WaitSetError::Full | WaitSetError::TooManySets) => ERR_RESOURCE_EXHAUSTED,
 		Err(_) => ERR_INVALID,
 	}
 }
@@ -2108,16 +2180,34 @@ fn sys_waitset_wait(set_handle: u64, deadline: u64, flags: u64) -> i64 {
 		let (ready, block_deadline) = set.with_members(|members| {
 			let mut earliest = if deadline == 0 { sched::NO_DEADLINE } else { deadline };
 			let mut ready = None;
-			for (i, object) in members.iter().enumerate() {
+			for object in members.iter() {
 				if ready.is_none() && object_ready(object) {
-					ready = Some(i as i64);
+					// The member's KOID, not its index in the set.
+					//
+					// An index only means something to a caller keeping a list in exactly the
+					// kernel's order - and the kernel removes a member by retaining the others,
+					// while a service's client table uses `swap_remove`, which permutes. That
+					// mismatch is what forced the first migration attempt to RECONCILE membership
+					// every pass instead of editing it where it changes, and the reconcile was
+					// measured as the whole cost: 433,645 ns at sixty-two clients against a
+					// 188,821 ns baseline, with the set populated but not waited on still costing
+					// 425,281. The kernel-side theory was fine; the userspace bookkeeping the index
+					// forced was quadratic.
+					//
+					// A koid needs no mirror at all: the caller maps it to a client however it
+					// already indexes them. Koids come from a counter that starts at 1 and only
+					// increases, so one always fits in the `i64` a syscall returns with negatives
+					// reserved for errors - worth saying because the index it replaces could not
+					// have collided with an error code either, and that property should not be
+					// assumed a second time.
+					ready = Some(object.header().koid() as i64);
 				}
 				earliest = core::cmp::min(earliest, wait_block_deadline(object, deadline));
 			}
 			(ready, earliest)
 		});
-		if let Some(index) = ready {
-			return index;
+		if let Some(koid) = ready {
+			return koid;
 		}
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
