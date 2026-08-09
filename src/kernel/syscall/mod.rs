@@ -105,13 +105,27 @@ fn try_zeroed_u64(len: usize) -> Option<Vec<u64>> {
 
 // Validate a caller-supplied buffer. Always accepts kernel self-calls; for a
 // ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space
-// and every page it touches to be mapped in the active address space. The bounds
-// check alone is not enough: a ring-3 caller can pass an in-bounds pointer to an
-// unmapped page, and a kernel read or write of it then takes a ring-0 page fault.
-// On the SYS_DEBUG_WRITE path that fault strikes while the serial TX lock is held,
-// so the fault handler's own logging deadlocks on that lock and the machine hangs.
-// There is no demand paging - any ring-3 fault terminates the process - so a valid
-// buffer is always fully mapped; reject anything that is not.
+// and every page it touches to be mapped in the active address space.
+//
+// WHAT THIS IS FOR HAS CHANGED, and saying so is the last item of M0149. It used to be the safety
+// mechanism: a ring-3 caller could pass an in-bounds pointer to an unmapped page, the kernel read
+// it, and the resulting ring-0 fault was fatal - on the SYS_DEBUG_WRITE path it struck while the
+// serial TX lock was held, so the fault handler's own logging deadlocked on that lock and the
+// machine hung. Every copy therefore had to be preceded by a check that could not be wrong.
+//
+// It could always be wrong, and that is the defect this milestone fixes rather than the one it
+// describes: the check and the copy are two moments, and another thread in the same process can
+// unmap the page in between. No amount of checking closes that.
+//
+// What makes a copy safe now is the copy: `arch::usercopy` marks every instruction that touches a
+// user address in the exception table, so a fault resumes at a fixup and reports how far it got.
+// This is an EARLY, CHEAP REFUSAL of obvious nonsense - a null pointer, a range that wraps, an
+// address past the user half, a page mapped read-only where a write is coming. Refusing here costs
+// a walk and answers the caller with a clean error instead of a short copy nobody asked how to
+// interpret.
+//
+// Both are worth having. What was not worth having is two mechanisms whose comments disagreed about
+// which one was load-bearing.
 fn user_buf_ok(ptr: u64, len: u64) -> bool {
 	if !arch::percpu::in_user_syscall() {
 		return true;
@@ -132,9 +146,10 @@ fn user_buf_ok(ptr: u64, len: u64) -> bool {
 	user_pages_ok(ptr, end, false)
 }
 
-// The same, for a buffer the kernel is about to WRITE. A page a ring-3 caller can only
-// read is not a destination, and accepting one meant the copy faulted in ring 0 - which
-// this kernel treats as its own bug and stops on.
+// The same, for a buffer the kernel is about to WRITE. A page a ring-3 caller can only read is not
+// a destination; before the exception table, accepting one meant the copy faulted in ring 0 and the
+// kernel stopped. Now it means a short write, and this refuses it up front so the caller gets an
+// error rather than a partial one - the same early-refusal argument as `user_buf_ok`.
 fn user_buf_writable(ptr: u64, len: u64) -> bool {
 	if !arch::percpu::in_user_syscall() {
 		return true;
@@ -369,7 +384,14 @@ fn current_typed<T: KernelObject>(handle: u64, ty: ObjectType, rights: Rights) -
 // the pointer with user_buf_ok.
 fn read_user<T>(ptr: u64) -> T {
 	let mut value = core::mem::MaybeUninit::<T>::uninit();
-	arch::paging::user_access(|| unsafe { value.write((ptr as *const T).read_unaligned()) });
+	// Through the faultable copy, so a page that goes away between `user_buf_ok` and here is a
+	// short read rather than a kernel fault. A short read leaves the tail of `value` as whatever
+	// the caller's buffer held, which is why the zero-fill below exists: a partially-read `T` must
+	// not carry stack residue into a decision.
+	let read = arch::paging::user_access(|| unsafe { arch::usercopy::copy_from_user(value.as_mut_ptr() as *mut u8, ptr, core::mem::size_of::<T>()) });
+	if read < core::mem::size_of::<T>() {
+		unsafe { core::ptr::write_bytes(value.as_mut_ptr() as *mut u8, 0, core::mem::size_of::<T>()) };
+	}
 	unsafe { value.assume_init() }
 }
 
@@ -387,7 +409,14 @@ fn write_user<T>(ptr: u64, value: T) {
 	if !user_buf_writable(ptr, core::mem::size_of::<T>() as u64) {
 		return;
 	}
-	arch::paging::user_access(|| unsafe { (ptr as *mut T).write_unaligned(value) });
+	// The check above stays, and its job has changed: it is no longer the safety mechanism but an
+	// early, cheap refusal of obvious nonsense - a null pointer, a range that wraps, an address in
+	// the kernel half. What makes the write SAFE is that it goes through the faultable copy, so the
+	// page disappearing between the two is a short write instead of a fault in ring 0.
+	let value = core::mem::ManuallyDrop::new(value);
+	arch::paging::user_access(|| unsafe {
+		arch::usercopy::copy_to_user(ptr, &value as *const core::mem::ManuallyDrop<T> as *const u8, core::mem::size_of::<T>());
+	});
 }
 
 // Entry point called by the architecture syscall stub. `num` selects the call;
@@ -657,7 +686,7 @@ fn sys_console_readlog(buf_ptr: u64, buf_len: u64) -> i64 {
 	};
 	let n = (text.len() as u64).min(buf_len) as usize;
 	arch::paging::user_access(|| unsafe {
-		core::ptr::copy_nonoverlapping(text.as_ptr(), buf_ptr as *mut u8, n);
+		arch::usercopy::copy_to_user(buf_ptr, text.as_ptr(), n);
 	});
 	n as i64
 }
@@ -676,7 +705,7 @@ fn sys_boot_profile(buf_ptr: u64, buf_len: u64) -> i64 {
 	}
 	let n = profile.len().min(buf_len as usize);
 	arch::paging::user_access(|| unsafe {
-		core::ptr::copy_nonoverlapping(profile.as_ptr(), buf_ptr as *mut u8, n);
+		arch::usercopy::copy_to_user(buf_ptr, profile.as_ptr(), n);
 	});
 	n as i64
 }
@@ -912,7 +941,7 @@ fn random_into(buf_ptr: u64, len: u64, must_be_secure: bool) -> i64 {
 			arch::random::insecure(&mut scratch[..n]);
 		}
 		arch::paging::user_access(|| unsafe {
-			core::ptr::copy_nonoverlapping(scratch.as_ptr(), (buf_ptr + filled) as *mut u8, n);
+			arch::usercopy::copy_to_user(buf_ptr + filled, scratch.as_ptr(), n);
 		});
 		filled += n as u64;
 	}
@@ -1078,7 +1107,7 @@ fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
 		};
 		let mut buf = [0u8; MAX_NAME as usize];
 		arch::paging::user_access(|| unsafe {
-			core::ptr::copy_nonoverlapping(ptr as *const u8, buf.as_mut_ptr(), len as usize);
+			arch::usercopy::copy_from_user(buf.as_mut_ptr(), ptr, len as usize);
 		});
 		let name = match core::str::from_utf8(&buf[..len as usize]) {
 			Ok(s) => s,
@@ -1301,7 +1330,7 @@ fn sys_process_group_create(handles_ptr: u64, count: u64) -> i64 {
 		return ERR_NO_MEMORY;
 	};
 	arch::paging::user_access(|| unsafe {
-		core::ptr::copy_nonoverlapping(handles_ptr as *const u64, raw.as_mut_ptr(), count as usize);
+		arch::usercopy::copy_from_user(raw.as_mut_ptr() as *mut u8, handles_ptr, (count as usize) * 8);
 	});
 	let mut members = alloc::vec::Vec::with_capacity(raw.len());
 	for handle in raw {
@@ -1520,7 +1549,7 @@ fn read_bytes(ptr: u64, len: usize) -> Option<Vec<u8>> {
 	// had its own helper and its own answer.
 	let mut bytes = try_zeroed_bytes(len)?;
 	arch::paging::user_access(|| unsafe {
-		core::ptr::copy_nonoverlapping(ptr as *const u8, bytes.as_mut_ptr(), len);
+		arch::usercopy::copy_from_user(bytes.as_mut_ptr(), ptr, len);
 	});
 	Some(bytes)
 }
@@ -1698,7 +1727,7 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 		return ERR_NO_MEMORY;
 	};
 	arch::paging::user_access(|| unsafe {
-		core::ptr::copy_nonoverlapping(bytes_ptr as *const u8, bytes.as_mut_ptr(), bytes_len as usize);
+		arch::usercopy::copy_from_user(bytes.as_mut_ptr(), bytes_ptr, bytes_len as usize);
 	});
 	let badge = thread.handles().lock().badge_of(Handle::from_raw(ch)).unwrap_or(0);
 
@@ -1877,7 +1906,7 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 		Err(error) => return error,
 	};
 	arch::paging::user_access(|| unsafe {
-		core::ptr::copy_nonoverlapping(message.bytes.as_ptr(), bytes_ptr as *mut u8, message.bytes.len());
+		arch::usercopy::copy_to_user(bytes_ptr, message.bytes.as_ptr(), message.bytes.len());
 	});
 	let mut installed = 0usize;
 	{
@@ -1925,7 +1954,7 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 	let n = core::cmp::min(message.bytes.len(), bytes_cap as usize);
 	if n > 0 && bytes_ptr != 0 {
 		arch::paging::user_access(|| unsafe {
-			core::ptr::copy_nonoverlapping(message.bytes.as_ptr(), bytes_ptr as *mut u8, n);
+			arch::usercopy::copy_to_user(bytes_ptr, message.bytes.as_ptr(), n);
 		});
 	}
 	// Install the transferred capability (if any) and report its new handle. Against the
@@ -2034,7 +2063,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 		return ERR_NO_MEMORY;
 	};
 	arch::paging::user_access(|| unsafe {
-		core::ptr::copy_nonoverlapping(handles_ptr as *const u64, raw.as_mut_ptr(), n);
+		arch::usercopy::copy_from_user(raw.as_mut_ptr() as *mut u8, handles_ptr, n * 8);
 	});
 	// Resolve every handle once up front, recording each object and its koid. The
 	// scratch tables are heap-allocated, sized by the actual set - `wait_any` is a

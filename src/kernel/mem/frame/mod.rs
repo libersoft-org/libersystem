@@ -32,9 +32,28 @@ use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
 
-// How many free runs the heap-backed table can hold. Reserved once and never grown - see
-// `upgrade_to_heap`. Sized well past what a healthy pool fragments into.
-const MAX_RUNS: usize = 8192;
+// The table's floor, for a pool too small for the worst-case sizing below to matter. The real bound
+// is computed from the pool - see `worst_case_runs`.
+const MIN_RUNS: usize = 8192;
+
+// How many disjoint free runs a pool of `pages` frames can possibly hold.
+//
+// Every other page free and the ones between them out on loan: that is the most fragmented a pool
+// can be, and it is `pages / 2` runs, rounded up. There is no arrangement with more, because two
+// free runs must have at least one allocated page between them.
+//
+// This is the number the run table has to be able to hold, and it used to be 8192 - "sized well past
+// what a healthy pool fragments into", which is a statement about healthy pools rather than about
+// what is possible. Past it, `insert_at` refused and the freed span was simply LOST: the machine got
+// smaller, a warning went by, and nothing added it up until an allocation failed weeks later with no
+// cause attached.
+//
+// Sizing for the worst case is what makes "a free cannot fail" true rather than usually true. It
+// costs 16 bytes per two pages - about 0.2% of the pool, one megabyte on a 512 MB machine - reserved
+// once at boot and never grown.
+fn worst_case_runs(pages: usize) -> usize {
+	pages.div_ceil(2).saturating_add(1).max(MIN_RUNS)
+}
 
 pub const PAGE_SIZE: u64 = 4096;
 
@@ -183,10 +202,17 @@ impl FrameAllocator {
 	fn insert_at(&mut self, at: usize, run: Run) -> bool {
 		match &mut self.heap {
 			Some(v) => {
-				// never grows: the capacity was reserved once, outside this lock. A table
-				// at capacity refuses rather than allocating from the heap it feeds.
+				// Never grows: the capacity was reserved once, outside this lock, because growing
+				// it here would call the global allocator, whose `grow` calls `frame::allocate` -
+				// straight back into the lock this thread already holds.
+				//
+				// UNREACHABLE, and kept anyway. The capacity is `worst_case_runs(total)`, which is
+				// more runs than a pool of that many pages can be split into, so a free cannot find
+				// this table full. That is an argument, and an argument is not a guarantee: if the
+				// sizing is ever wrong the alternative to this branch is writing past the end of a
+				// `Vec`. Losing a span and saying so loudly is the safe way to be wrong.
 				if v.len() == v.capacity() {
-					crate::serial_println!("frame: run table full ({} runs); a freed span is not being tracked", v.len());
+					crate::serial_println!("frame: run table full at {} runs, which the worst-case sizing says cannot happen - a freed span is being LOST", v.len());
 					return false;
 				}
 				v.insert(at, run);
@@ -370,15 +396,15 @@ pub fn upgrade_to_heap() {
 	// true. Rather than argue about when the heap grows, the table simply stops being able
 	// to ask.
 	//
-	// MAX_RUNS bounds fragmentation, not memory: a run is a contiguous free span, and a
-	// pool splintered into more spans than this is one where something else has already
-	// gone wrong. `insert_at` refuses past it and says so, which loses a run rather than
-	// deadlocking the machine.
+	// Sized for the WORST CASE the pool can reach rather than for what a healthy one looks like,
+	// which is what makes a free unable to fail. See `worst_case_runs`.
+	//
 	// Both tables are reserved BEFORE the lock is taken, not under it. Reserving calls the
 	// global allocator, whose `grow` calls `frame::allocate` - straight back into this lock.
+	let wanted = worst_case_runs(ALLOCATOR.lock().total_count);
 	let mut runs = Vec::new();
-	if runs.try_reserve_exact(MAX_RUNS).is_err() {
-		crate::serial_println!("frame: could not reserve the run table; staying on the seed table");
+	if runs.try_reserve_exact(wanted).is_err() {
+		crate::serial_println!("frame: could not reserve a run table for {wanted} runs; staying on the seed table, where a free CAN be lost");
 		return;
 	}
 	// The debug ownership record: one bit per frame of the pool, 128 KiB on a 4 GiB machine,
@@ -414,6 +440,22 @@ pub fn upgrade_to_heap() {
 			allocator.mark_owned(run.base, run.pages, false);
 		}
 	}
+}
+
+// How many runs the live table can hold, and whether it is the heap-backed one. For the test that
+// pins the worst-case sizing; nothing else needs to know.
+#[cfg(test)]
+pub fn run_capacity() -> usize {
+	let allocator = ALLOCATOR.lock();
+	match &allocator.heap {
+		Some(v) => v.capacity(),
+		None => SEED_RUNS,
+	}
+}
+
+#[cfg(test)]
+pub fn on_heap() -> bool {
+	ALLOCATOR.lock().heap.is_some()
 }
 
 // The frame pool's totals: (total usable frames fixed at init, frames currently free).
@@ -567,6 +609,15 @@ pub fn allocate_contiguous(pages: usize) -> Option<u64> {
 
 // Return a physical frame to the pool (re-coalescing with its neighbors, so
 // contiguous runs re-form as buffers are released).
+//
+// It CANNOT LOSE THE FRAME. The run table is reserved at boot for the most fragmented the pool can
+// ever be, so there is always room to record the span; a free that arrives is a free that is
+// tracked. That property is what `lost_pages()` counts and what
+// `a_fragmenting_workload_loses_no_pages_and_says_so` asserts.
+//
+// It can still REFUSE - a double free, or an address this allocator never handed out - and that is
+// a different thing entirely: those frames were never the allocator's to lose, and refusing them is
+// the point. `refused_frees()` counts those separately for exactly that reason.
 //
 // This is the raw, un-owned form of a free: a bare integer with no proof attached that the
 // caller has the right to give it back. Getting it wrong does not go wrong here - it goes

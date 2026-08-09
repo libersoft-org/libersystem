@@ -21,6 +21,7 @@ pub mod boot;
 pub mod dtb;
 pub mod serial;
 pub mod traps;
+pub mod usercopy;
 
 // halt the kernel forever (wait-for-interrupt)
 pub fn halt_loop() -> ! {

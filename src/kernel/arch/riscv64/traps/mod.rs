@@ -318,7 +318,23 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind, error_code: scause, address: stval, instruction_pointer: sepc });
 	}
 
-	// An S-mode fault reaching here is a kernel bug: report it and halt.
+	// An S-mode fault is a kernel bug, with ONE exception: an instruction the kernel declared may
+	// fault, because it is copying to or from a userspace address another thread can unmap
+	// underneath it. Those resume at their fixup with the copy reporting how far it got.
+	//
+	// Matched on the faulting instruction EXACTLY, never by range, so this can only rescue an
+	// address a copy routine put in the table itself; anything else still halts, which is what keeps
+	// a real kernel bug loud.
+	//
+	// The resume is the saved SEPC in the trap frame - `sret` reloads it from there - which is an
+	// ordinary memory write rather than the volatile dance x86_64 needs, because the frame is a
+	// pointer the compiler cannot decide is dead.
+	if let Some(fixup) = crate::extable::fixup_for(sepc) {
+		unsafe { *frame.add(FRAME_SEPC) = fixup };
+		return;
+	}
+
+	// Anything else reaching here is a kernel bug: report it and halt.
 	let cause = match code {
 		1 => "instruction access fault",
 		2 => "illegal instruction",

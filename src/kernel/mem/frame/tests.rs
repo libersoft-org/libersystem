@@ -209,3 +209,26 @@ fn a_dma_buffer_still_gets_a_contiguous_span_after_the_pool_is_shredded() {
 
 	assert_eq!(super::lost_pages(), lost_before, "and none of that churn lost a page");
 }
+
+crate::tagged_test!(the_run_table_is_reserved_for_the_worst_the_pool_can_reach, [Frame, Memory], covers = ["kernel"]);
+fn the_run_table_is_reserved_for_the_worst_the_pool_can_reach() {
+	// The invariant that makes a free unable to fail, asserted rather than argued.
+	//
+	// The run table used to hold 8192 runs - "sized well past what a healthy pool fragments into",
+	// which is a claim about healthy pools and not about what is possible. Past it, `insert_at`
+	// refused and the freed span was LOST. The bound is now computed from the pool, and the whole
+	// property rests on that computation being the real worst case.
+	//
+	// It is: two free runs must have an allocated page between them, so `pages / 2` rounded up is
+	// the most disjoint runs a pool of `pages` frames can be split into. There is no arrangement
+	// with more. This pins that arithmetic, because the day it drifts nothing else notices - the
+	// table simply starts refusing again, on a fragmented machine, weeks later.
+	let (total, _free) = super::totals();
+	assert!(total > 0, "the pool has frames");
+	assert!(super::worst_case_runs(total) >= total.div_ceil(2), "the reservation must cover every-other-page-free, which is {} runs", total.div_ceil(2));
+	assert!(super::run_capacity() >= total.div_ceil(2), "the table actually reserved {} runs for a pool that can need {}", super::run_capacity(), total.div_ceil(2));
+
+	// And the table is on the heap: the pre-heap seed table is fixed at 128 runs and CAN lose a
+	// span. If the upgrade silently declined, everything above is true of a table nobody is using.
+	assert!(super::on_heap(), "the run table is the heap-backed one, not the bounded seed table");
+}

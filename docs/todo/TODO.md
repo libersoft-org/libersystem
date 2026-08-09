@@ -197,7 +197,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0146 - What M0144 left in the disk probe, and three gaps it opened itself](M0146.md)
 - [ ] [M0147 - A wait set the kernel keeps](M0147.md)
 - [ ] [M0148 - Testing that scales with the change, not with the tree](M0148.md)
-- [ ] [M0149 - A fault in a user copy must be an error, not a dead kernel](M0149.md)
+- [x] [M0149 - A fault in a user copy must be an error, not a dead kernel](M0149.md)
 - [ ] [M0150 - A free must never lose the memory it frees](M0150.md)
 - [x] [M0151 - A receive that takes a message must be able to deliver it](M0151.md)
 - [x] [M0152 - What authorises a write to somebody's disk](M0152.md)

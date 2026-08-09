@@ -12,6 +12,7 @@ mod console;
 mod console_input;
 mod device;
 mod elf;
+mod extable;
 mod fault;
 mod graph;
 mod loader;

@@ -17,6 +17,7 @@ pub mod rtc;
 pub mod serial;
 pub mod syscall;
 pub mod tsc;
+pub mod usercopy;
 pub mod usermode;
 
 use core::arch::asm;

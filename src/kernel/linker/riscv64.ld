@@ -56,6 +56,19 @@ SECTIONS
 		*(.srodata .srodata.*)
 	} :rodata
 
+	/* Where a kernel instruction is allowed to fault, and where it resumes.
+	 *
+	 * Emitted by the user-copy routines themselves (see kernel/extable.rs), so a routine that is
+	 * compiled out takes its entries with it and nothing has to register anything at boot. Read-only
+	 * data: the table is generated at link time and never written.
+	 */
+	. = ALIGN(8);
+	.extable : AT(ADDR(.extable) - KOFF) {
+		__extable_start = .;
+		KEEP(*(.extable))
+		__extable_end = .;
+	} :rodata
+
 	. = ALIGN(4096);
 
 	.data : AT(ADDR(.data) - KOFF) {

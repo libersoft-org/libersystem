@@ -155,7 +155,7 @@ extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, e
 	super::halt_loop();
 }
 
-extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64) {
+extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, error_code: u64) {
 	// See general_protection_fault: the terminate path longjmps into a kernel
 	// thread, so any user-set EFLAGS.AC must not travel there.
 	super::paging::clac_on_entry();
@@ -175,9 +175,31 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, error_code: u64
 		// selector are the CPL.
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind: crate::fault::FAULT_PAGE, error_code, address: cr2, instruction_pointer: frame.instruction_pointer });
 	}
-	// In ring 0 it is a kernel bug; halt loudly. The one exception: the test suite
-	// arms a probe address to prove SMAP/SMEP refuse a kernel access to user
-	// memory - that expected fault retires the probing thread instead.
+	// In ring 0, one class of fault is NOT a kernel bug: an instruction the kernel declared may
+	// fault, because it is copying to or from a userspace address that another thread can unmap
+	// underneath it. Those resume at their fixup with the copy reporting how far it got.
+	//
+	// Matched on the faulting instruction EXACTLY, never by range, so this can only ever rescue an
+	// address some copy routine put in the table itself. Anything else still halts, which is the
+	// property that keeps a real kernel bug loud.
+	//
+	// `frame` is the CPU's own frame on the stack rather than a copy: rustc's `x86-interrupt` ABI
+	// materialises the by-value parameter in place, so writing `instruction_pointer` here is what
+	// `iretq` will resume at. If that ever stopped being true the test would not merely fail, it
+	// would triple-fault - which is the loudest possible way to find out.
+	if let Some(fixup) = crate::extable::fixup_for(frame.instruction_pointer) {
+		// VOLATILE, and the compiler is what proved it has to be. A plain
+		// `frame.instruction_pointer = fixup` drew "value assigned to `frame` is never read" -
+		// which is true of the local and false of the machine: nothing in this function reads it
+		// again, so the store is dead by every rule the optimiser knows, and it would have been
+		// deleted. The fixup would then never happen and the fault would fall through to the halt
+		// below, which is the failure this whole milestone is about, arriving through the fix for
+		// it. A volatile write is the statement that the store is the point.
+		unsafe { (&raw mut frame.instruction_pointer).write_volatile(fixup) };
+		return;
+	}
+	// The one other exception: the test suite arms a probe address to prove SMAP/SMEP refuse a
+	// kernel access to user memory - that expected fault retires the probing thread instead.
 	#[cfg(test)]
 	if crate::fault::smap_probe_trip(cr2, error_code) {
 		crate::sched::exit();

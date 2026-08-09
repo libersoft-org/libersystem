@@ -146,7 +146,6 @@ fn init_package_starts_system_manager() {
 
 tagged_test!(system_volume_spans_the_disks_capacity, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "partition", "storage"]);
 fn system_volume_spans_the_disks_capacity() {
-	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 

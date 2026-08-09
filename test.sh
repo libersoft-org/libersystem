@@ -48,10 +48,20 @@ host slows them by far more than it slows x86_64. Measured on 2026-08-08 with th
 and the default --timeout was not the problem it looked like. If an emulated run stops on a heavy test,
 check the load average before the diff.
 
-Measured again 2026-08-09 with the host at load 11-18 and the full suite at 211 tests: x86_64 99 s,
-aarch64 2160 s, riscv64 **4464 s** - and riscv64 needed $(--timeout 5400) to get there. At the 45 m
-default it stopped at test 70 of 204, printing "tlb: shootdown timed out with 5/7 acknowledgements"
-on the way, and the identical binary then passed every one of those tests when given the clock.
+Measured again 2026-08-09, full suite: x86_64 116 s, aarch64 2108 s, riscv64 **4229 s** - and
+riscv64 needs its --timeout raised well past the 45 m default to get there. At the default it
+stopped at test 70 of 205, printing "tlb: shootdown timed out with 5/7 acknowledgements" on the way,
+and the identical binary then passed every one of those tests when given the clock. It took four
+attempts across a day whose load ranged 5 to 18, and the ones that finished ran while the machine
+was quiet.
+
+No backtick may appear in this HELP TEXT. Its heredoc is unquoted, so bash substitutes what it
+finds: a backticked --timeout in the paragraph above became a command, printed
+"--timeout: command not found" on stderr, and left a hole in the sentence where the flag should be.
+Writing THAT warning with a backticked delimiter in it then opened a second heredoc inside the
+substitution and swallowed the rest of the file, which is the same mistake twice in four lines.
+Backticks elsewhere in this script are in shell comments, which bash never expands - the rule is
+about the heredoc, not about the file.
 
 Both halves of that are worth keeping. The shootdown message is the shape a loaded host takes here -
 a core that never gets scheduled cannot answer the IPI - so it is not by itself evidence of anything

@@ -274,7 +274,31 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind, error_code: esr, address: far, instruction_pointer: elr });
 	}
 
-	// A current-EL fault reaching here is a kernel bug: report it and halt.
+	// A current-EL fault is a kernel bug, with ONE exception: an instruction the kernel declared may
+	// fault, because it is copying to or from a userspace address another thread can unmap
+	// underneath it. Those resume at their fixup with the copy reporting how far it got.
+	//
+	// Matched on the faulting instruction EXACTLY, never by range, so this can only rescue an
+	// address a copy routine put in the table itself; anything else still halts, which is what keeps
+	// a real kernel bug loud.
+	//
+	// The resume is written into the SAVED ELR in the trap frame, not into ELR_EL1.
+	//
+	// Writing the register looks right and is not: the stub above saved ELR_EL1 to the frame on the
+	// way in (`stp x30, x2, [sp, #240]`) and `__trap_return` loads it back out before `eret`
+	// (`ldp x30, x0, [sp, #240]` then `msr elr_el1, x0`). An `msr` here is overwritten on the way
+	// out and the fault resumes at the faulting instruction - which faults again, forever. That is
+	// what it did: the aarch64 suite stopped dead on the fixup test with no diagnostic, because a
+	// livelock inside a fault handler produces no output at all.
+	//
+	// Offset 240 holds x30 and 248 holds the saved ELR, as the `stp` pair above lays them out.
+	const FRAME_ELR: usize = 248 / 8;
+	if let Some(fixup) = crate::extable::fixup_for(elr) {
+		unsafe { *frame.add(FRAME_ELR) = fixup };
+		return;
+	}
+
+	// Anything else reaching here is a kernel bug: report it and halt.
 	crate::serial_println!("aarch64 EXCEPTION [{source} {kind_str}] EC={ec:#x} ESR={esr:#x} FAR={far:#x} ELR={elr:#x}");
 	crate::serial_println!("aarch64: unhandled exception - halting");
 	super::halt_loop()
