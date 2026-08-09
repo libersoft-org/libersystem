@@ -88,7 +88,7 @@ mod tests {
 	use super::VaPool;
 	use crate::mem::frame::PAGE_SIZE;
 
-	crate::tagged_test!(a_released_range_is_reused_and_adjacent_ones_coalesce, [Memory]);
+	crate::tagged_test!(a_released_range_is_reused_and_adjacent_ones_coalesce, [Memory], covers = ["kernel"]);
 	fn a_released_range_is_reused_and_adjacent_ones_coalesce() {
 		// On a pool of its own, so the addresses are the pool's rules and nothing else's.
 		// Asserting this through the kernel mmap window instead was what it used to do, and
@@ -137,7 +137,7 @@ mod tests {
 		pool.free(one, 3 * PAGE_SIZE);
 	}
 
-	crate::tagged_test!(an_exhausted_window_refuses_rather_than_running_past_its_end, [Memory]);
+	crate::tagged_test!(an_exhausted_window_refuses_rather_than_running_past_its_end, [Memory], covers = ["kernel"]);
 	fn an_exhausted_window_refuses_rather_than_running_past_its_end() {
 		// Four pages, and a fifth must be refused rather than handed out above the window -
 		// which would be an address in whatever lies beyond it.

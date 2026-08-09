@@ -275,7 +275,12 @@ impl<'a> Planner<'a> {
 		// change is in something its tests are built from. So its tests run and its shipping build
 		// does not, which is the difference between `flac` costing a codec suite and `flac` costing
 		// a kernel rebuild plus every gate that covers the kernel.
-		if reach.get(hit) == Some(&crate::graph::Reach::TestBuild) && !matches!(check.kind, CheckKind::HostSuite | CheckKind::KernelTest) {
+		// A dev edge means "this component's tests are built from the changed thing", so its own host
+		// suite runs. It does NOT mean the guest behaves differently, so a kernel test covering the
+		// kernel stays out: the kernel dev-depends on eleven codecs, and `frame_alloc_distinct` has
+		// nothing to say about any of them. A kernel test that DOES assert on a codec names it in
+		// `covers`, and that codec is reached as a product.
+		if reach.get(hit) == Some(&crate::graph::Reach::TestBuild) && !matches!(check.kind, CheckKind::HostSuite) {
 			// Unless something else it covers was reached properly.
 			let product = check.covers.iter().find(|component| reach.get(*component) == Some(&crate::graph::Reach::Product))?;
 			return Some(format!("covers {product}, which changed"));

@@ -126,7 +126,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "booted" | "changes" | "age" | "record" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "booted" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
 	{
 		command = positional.remove(0);
 	}
@@ -212,6 +212,22 @@ fn run() -> Result<ExitCode, String> {
 			Ok(ExitCode::SUCCESS)
 		}
 		"check" => self_check(&model),
+		// What each kernel test can reach, one line per test. Written for the person annotating
+		// `covers`: a declaration has to be something the test can back up, and this is the set it
+		// has to choose from rather than guess at.
+		"reach" => {
+			for test in &model.kernel_tests.tests {
+				let touched = model.kernel_tests.touches.get(&test.name).cloned().unwrap_or_default();
+				let mut reachable: BTreeSet<String> = BTreeSet::new();
+				for component in &touched {
+					if model.graph.contains(component) {
+						reachable.extend(model.graph.reaches(component, &verify_model::kerneltests::RUNTIME_REACH));
+					}
+				}
+				println!("{}\t{}", test.name, reachable.into_iter().collect::<Vec<_>>().join(","));
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		// The one diff parser. `verify.sh` and the regression corpus both come through here, which
 		// is the point: they used to parse a change two different ways, and the corpus therefore
 		// could not catch the defect in the way production did it.

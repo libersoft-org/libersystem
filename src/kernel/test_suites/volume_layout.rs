@@ -125,7 +125,7 @@ fn query_previous_log_boot(storage: &mut StorageHarness, log_client: &object::ch
 	wait_message(storage, log_client, "LogService did not answer the previous-boot query")
 }
 
-tagged_test!(directory_scoped_storage_clients_cannot_escape_their_grant, [Filesystem, Storage, VolumeLayout, VolumeScope]);
+tagged_test!(directory_scoped_storage_clients_cannot_escape_their_grant, [Filesystem, Storage, VolumeLayout, VolumeScope], covers = ["liberfs", "storage"]);
 fn directory_scoped_storage_clients_cannot_escape_their_grant() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
@@ -153,7 +153,7 @@ fn directory_scoped_storage_clients_cannot_escape_their_grant() {
 	assert!(storage.open_from(&child, hello_uri.as_bytes(), 0xd104).is_none(), "a child minted by a directory scope cannot widen to the volume root");
 }
 
-tagged_test!(existing_system_volume_preserves_owned_state_across_a_restart, [Filesystem, Storage, VolumeLayout, VolumeScope]);
+tagged_test!(existing_system_volume_preserves_owned_state_across_a_restart, [Filesystem, Storage, VolumeLayout, VolumeScope], covers = ["liberfs", "storage"]);
 // This used to corrupt the factory archive between the two runs and assert that an existing
 // volume mounted as-is rather than being reformatted from the changed seed. There is no seed any
 // more (M0138) - and the bytes it used to corrupt are the superblock now - so what remains
@@ -178,7 +178,7 @@ fn existing_system_volume_preserves_owned_state_across_a_restart() {
 	assert_eq!(storage.open(hello_uri.as_bytes(), 0xd203), Some(expected_hello), "the volume's own files remain available after the restart");
 }
 
-tagged_test!(fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state, [Component, Config, Drivers, Filesystem, Process, ProcessService, Service, Storage, VolumeLayout, VolumeScope]);
+tagged_test!(fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state, [Component, Config, Drivers, Filesystem, Process, ProcessService, Service, Storage, VolumeLayout, VolumeScope], covers = ["liberfs", "services", "storage"]);
 fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;

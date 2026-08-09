@@ -2,7 +2,7 @@ use super::Process;
 use crate::object::address_space::AddressSpace;
 use crate::{elf, sched};
 
-crate::tagged_test!(dynamic_symbol_names_accept_rust_mangling_with_a_bound, [Dynamic, Memory, Process]);
+crate::tagged_test!(dynamic_symbol_names_accept_rust_mangling_with_a_bound, [Dynamic, Memory, Process], covers = ["kernel"]);
 fn dynamic_symbol_names_accept_rust_mangling_with_a_bound() {
 	let address_space = AddressSpace::create().expect("address space");
 	let process = Process::new(address_space, sched::root_domain());

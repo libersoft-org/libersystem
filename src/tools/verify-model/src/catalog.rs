@@ -279,7 +279,15 @@ fn build_covers(part: &str, crates: &[Crate], staged: &BTreeSet<String>) -> Vec<
 		}
 		_ => return Vec::new(),
 	};
-	crates.iter().filter(|entry| entry.dir == prefix || entry.dir.starts_with(&format!("{prefix}/"))).map(|entry| entry.name.clone()).collect()
+	// The crates under this part AND the programs they build.
+	//
+	// Crate names alone was a false-green path, and annotation is what exposed it: while every
+	// kernel test was selected regardless, a build was always in the plan for some other reason.
+	// Once `covers` narrowed the suite, a change to `src/user/apps/tools/src/audioconv.rs` - which
+	// resolves to `bin.audioconv`, a longer prefix than its crate - selected the audioconv scenario
+	// and NO build, so the guest would have booted the previous tool and passed. A change to
+	// `bin.xhci` selected nothing at all and only the empty-selection escalation caught it.
+	crates.iter().filter(|entry| entry.dir == prefix || entry.dir.starts_with(&format!("{prefix}/"))).flat_map(|entry| std::iter::once(entry.name.clone()).chain(entry.binaries.iter().map(|binary| crate::graph::binary_component(&binary.name)))).collect()
 }
 
 // One kernel test, as the compiled binaries report it.

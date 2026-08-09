@@ -1,6 +1,6 @@
 use super::Event;
 
-crate::tagged_test!(event_object_latches_and_clears, [Object, Kernel]);
+crate::tagged_test!(event_object_latches_and_clears, [Object, Kernel], covers = ["kernel"]);
 fn event_object_latches_and_clears() {
 	let event = Event::create();
 	assert!(!event.is_signaled());
@@ -10,7 +10,7 @@ fn event_object_latches_and_clears() {
 	assert!(!event.is_signaled());
 }
 
-crate::tagged_test!(event_syscall_latches_and_polls, [Object, Kernel, Syscall]);
+crate::tagged_test!(event_syscall_latches_and_polls, [Object, Kernel, Syscall], covers = ["kernel"]);
 fn event_syscall_latches_and_polls() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);

@@ -13,25 +13,32 @@ source "$root/../lib.sh"
 # `--check` regenerates the report and compares it against the stored TSVs, and its whole value is
 # that a difference fails. A `diff` that stopped comparing - a changed variable name, a redirection,
 # an `exit 0` - would report a clean tree just as convincingly, and nothing about a currently-valid
-# tree can tell the two apart. So the gate first corrupts a copy of what it compares against and
-# requires itself to notice.
+# tree can tell the two apart. So the gate hands itself a corrupted report and requires itself to
+# notice.
+#
+# It compares against a COPY. The first version of this mutated the tracked file in place and
+# restored it afterwards, which is fine until it is not: a kill, a crash or a concurrent run leaves
+# `docs/DYNAMIC_EXECUTABLES.tsv` corrupted in the working tree, and that happened once here. A
+# self-test that can damage the repository is a worse hazard than the defect it guards against.
 self_test() {
-	local scratch original
+	local scratch status=0
 	scratch="$(mktemp -d)"
-	original="$(dirname "$0")/../../docs/DYNAMIC_EXECUTABLES.tsv"
-	[[ -f "$original" ]] || return 0
-	cp "$original" "$scratch/backup"
-	# One byte of one row, in the last column, which is the command the report publishes.
-	sed -i '2s/$/ MUTATED/' "$original"
-	if DYNAMIC_REPORT_SELF_TEST=1 "$0" --check >/dev/null 2>&1; then
-		cp "$scratch/backup" "$original"
+	[[ -f "$report" ]] || {
 		rm -rf "$scratch"
+		return 0
+	}
+	sed '2s/$/ MUTATED/' "$report" >"$scratch/report.tsv"
+	if DYNAMIC_REPORT_SELF_TEST=1 DYNAMIC_REPORT_OVERRIDE="$scratch/report.tsv" "$0" --check >/dev/null 2>&1; then
 		echo "dynamic-report: SELF-TEST FAILED - a mutated report was accepted, so this gate is comparing nothing" >&2
-		return 1
+		status=1
 	fi
-	cp "$scratch/backup" "$original"
 	rm -rf "$scratch"
+	return "$status"
 }
+
+# The report this run compares against. Overridden only by the self-test, and only ever pointed at a
+# temporary copy - the tracked file is never written by a check.
+report="${DYNAMIC_REPORT_OVERRIDE:-$report}"
 
 if [[ "${DYNAMIC_REPORT_SELF_TEST:-}" != "1" ]]; then
 	self_test || exit 1

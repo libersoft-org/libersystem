@@ -1,4 +1,4 @@
-crate::tagged_test!(heap_box_vec, [Memory, Smoke]);
+crate::tagged_test!(heap_box_vec, [Memory, Smoke], covers = ["kernel"]);
 fn heap_box_vec() {
 	let boxed = alloc::boxed::Box::new(42u64);
 	assert_eq!(*boxed, 42);
@@ -10,7 +10,7 @@ fn heap_box_vec() {
 	assert_eq!(sum, 1000 * 999 / 2);
 }
 
-crate::tagged_test!(a_growth_that_runs_out_of_frames_gives_back_what_it_took, [Memory]);
+crate::tagged_test!(a_growth_that_runs_out_of_frames_gives_back_what_it_took, [Memory], covers = ["kernel"]);
 fn a_growth_that_runs_out_of_frames_gives_back_what_it_took() {
 	use super::{HEAP_REGION, NEXT_REGION, stats, unwind};
 	use crate::arch::paging;

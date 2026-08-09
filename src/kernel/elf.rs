@@ -427,7 +427,7 @@ mod tests {
 		ProgramHeader { p_type: PT_LOAD, p_flags: flags, p_offset: 0, p_vaddr: vaddr, p_paddr: 0, p_filesz: 0, p_memsz: memsz, p_align: 0x1000 }
 	}
 
-	crate::tagged_test!(an_et_exec_segment_may_not_name_the_kernel_half, [Memory]);
+	crate::tagged_test!(an_et_exec_segment_may_not_name_the_kernel_half, [Memory], covers = ["kernel"]);
 	fn an_et_exec_segment_may_not_name_the_kernel_half() {
 		// `window` is None for ET_EXEC - that is what the loader passes - and it used to be the
 		// ONLY bound, so an executable naming a higher-half address was mapped there with the
@@ -451,7 +451,7 @@ mod tests {
 		assert!(validate_segment(&ok, 0, None, none).is_ok(), "an ordinary low segment must still validate");
 	}
 
-	crate::tagged_test!(a_bias_may_not_carry_a_segment_out_of_the_user_half, [Memory]);
+	crate::tagged_test!(a_bias_may_not_carry_a_segment_out_of_the_user_half, [Memory], covers = ["kernel"]);
 	fn a_bias_may_not_carry_a_segment_out_of_the_user_half() {
 		// A dynamic image's addresses are its own plus a bias the loader picks, so the check has
 		// to be on the sum. An overflowing sum is refused rather than wrapped to something low.
@@ -461,7 +461,7 @@ mod tests {
 		assert!(matches!(validate_segment(&header, u64::MAX, None, none), Err(ElfError::BadImage)), "a bias that overflows the address must be refused, not wrapped");
 	}
 
-	crate::tagged_test!(a_segment_overlapping_one_already_loaded_is_refused, [Memory]);
+	crate::tagged_test!(a_segment_overlapping_one_already_loaded_is_refused, [Memory], covers = ["kernel"]);
 	fn a_segment_overlapping_one_already_loaded_is_refused() {
 		// Two segments over the same pages means the second's frames replace the first's in the
 		// page tables while the first's stay in the process's owned list - and the image decides
@@ -481,7 +481,7 @@ mod tests {
 		assert!(validate_segment(&abutting, 0, None, &loaded).is_ok(), "a segment starting where the previous one ended must validate");
 	}
 
-	crate::tagged_test!(a_segment_may_not_claim_the_stack_or_the_mmap_window, [Memory]);
+	crate::tagged_test!(a_segment_may_not_claim_the_stack_or_the_mmap_window, [Memory], covers = ["kernel"]);
 	fn a_segment_may_not_claim_the_stack_or_the_mmap_window() {
 		// Two ranges the kernel maps into every process whether the image mentions them or
 		// not. An image claiming either used to be caught only by `try_map` refusing to
@@ -506,7 +506,7 @@ mod tests {
 		assert!(validate_segment(&below, 0, None, none).is_ok(), "the page below the eager stack is not a range this refuses");
 	}
 
-	crate::tagged_test!(a_write_execute_segment_is_refused, [Memory]);
+	crate::tagged_test!(a_write_execute_segment_is_refused, [Memory], covers = ["kernel"]);
 	fn a_write_execute_segment_is_refused() {
 		// W^X, declared by the image rather than derived from it, so it is the image's claim
 		// that has to be refused.

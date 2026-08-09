@@ -1,6 +1,6 @@
 use super::{cpu_count, online_count};
 
-crate::tagged_test!(smp_all_cores_online, [Smp, Kernel, Smoke]);
+crate::tagged_test!(smp_all_cores_online, [Smp, Kernel, Smoke], covers = ["kernel"]);
 fn smp_all_cores_online() {
 	// init_smp ran before the tests and waited for every core to report in, so
 	// the online count must equal the managed core count (and exceed one when

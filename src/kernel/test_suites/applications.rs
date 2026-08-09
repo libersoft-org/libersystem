@@ -1,6 +1,6 @@
 use super::*;
 
-tagged_test!(imgview_interactions, [Imgview, Image, Display, Input, Process, Service, Storage], covers = ["bin.imgview", "pix", "surface", "display-proto", "input-proto"]);
+tagged_test!(imgview_interactions, [Imgview, Image, Display, Input, Process, Service, Storage], covers = ["bin.imgview", "display-proto", "input-proto", "pix", "surface"]);
 fn imgview_interactions() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
@@ -28,7 +28,7 @@ fn imgview_interactions() {
 // the richest of the three, and it keeps the whole path - package, loader, services, terminal -
 // covered by something that boots cold in the kernel suite and needs no development profile.
 
-tagged_test!(lico_switches_panels_and_restores_the_terminal, [Lico, Process, Service, Storage], covers = ["bin.lico", "lico", "keys"]);
+tagged_test!(lico_switches_panels_and_restores_the_terminal, [Lico, Process, Service, Storage], covers = ["bin.lico", "keys", "lico"]);
 fn lico_switches_panels_and_restores_the_terminal() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
 	let (volume, package) = scenario_packages().expect("scenario packages");
@@ -117,7 +117,7 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	assert_eq!(full_media.open(b"vol://media/KEEP.BMP", 0xfa11), Some(previous.to_vec()), "failed overwrite preserves the previous destination byte-for-byte");
 }
 
-tagged_test!(audioconv_converts_across_volumes_and_never_writes_a_failed_conversion, [Audio, Service, Storage, Process, Filesystem], covers = ["bin.audioconv", "audioconv", "wav", "aiff", "flac", "wavpack", "pcm", "adpcm", "storage"]);
+tagged_test!(audioconv_converts_across_volumes_and_never_writes_a_failed_conversion, [Audio, Service, Storage, Process, Filesystem], covers = ["adpcm", "aiff", "audioconv", "bin.audioconv", "flac", "pcm", "storage", "wav", "wavpack"]);
 fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
 	// The real `audioconv.lsexe`, launched with a volume bundle and nothing else - no AudioService,
 	// no device authority - converting between two StorageService volumes. What makes this worth
@@ -248,7 +248,7 @@ fn decode_flac_samples(bytes: &[u8]) -> alloc::vec::Vec<i16> {
 	samples
 }
 
-tagged_test!(imgconv_governed_working_set_is_measured, [Image, Memory, Process, Service, Storage], covers = ["bin.imgconv", "imgconv", "webp", "png"]);
+tagged_test!(imgconv_governed_working_set_is_measured, [Image, Memory, Process, Service, Storage], covers = ["bin.imgconv", "imgconv", "png", "webp"]);
 fn imgconv_governed_working_set_is_measured() {
 	use object::domain::{Domain, UNLIMITED};
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
@@ -347,7 +347,7 @@ fn wasi_host_runs_a_component() {
 	assert_eq!(actual, expected, "the component read the granted file's bytes through the host import");
 }
 
-tagged_test!(powerbox_grants_a_picked_file_to_a_component, [Component, Service]);
+tagged_test!(powerbox_grants_a_picked_file_to_a_component, [Component, Service], covers = ["kernel", "services"]);
 fn powerbox_grants_a_picked_file_to_a_component() {
 	// A Wasm component with NO filesystem access of its own runs under wasi_host,
 	// which holds only a FilePicker client. The component's read import goes through
@@ -361,7 +361,7 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 	assert_eq!(actual, expected, "the component read the user-picked file through the picker");
 }
 
-tagged_test!(permission_manager_enforces_static_and_dynamic_probe_policy, [Service, Process, PermissionService]);
+tagged_test!(permission_manager_enforces_static_and_dynamic_probe_policy, [Service, Process, PermissionService], covers = ["kernel", "services"]);
 fn permission_manager_enforces_static_and_dynamic_probe_policy() {
 	let result = run_permission_scenario(PermissionScenario::Probes).expect("the permission probe scenario should run");
 	assert!(!result.expected.is_empty(), "the granted file should not be empty");
@@ -371,7 +371,7 @@ fn permission_manager_enforces_static_and_dynamic_probe_policy() {
 	assert_eq!(result.request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny storage=deny(dynamic)", "request_probe's static grants and dynamic denial were recorded independently");
 }
 
-tagged_test!(permission_manager_runs_tools_with_minimal_grants, [Service, Process, PermissionService]);
+tagged_test!(permission_manager_runs_tools_with_minimal_grants, [Service, Process, PermissionService], covers = ["kernel", "services"]);
 fn permission_manager_runs_tools_with_minimal_grants() {
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	assert_eq!(result.date_read.len(), 21, "date rendered a 20-byte ISO-8601 UTC instant and newline");
@@ -388,14 +388,14 @@ fn permission_manager_runs_tools_with_minimal_grants() {
 	assert_eq!(result.ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny", "ip received only its network grant");
 }
 
-tagged_test!(permission_manager_mints_scoped_application_grants, [Service, Process, PermissionService]);
+tagged_test!(permission_manager_mints_scoped_application_grants, [Service, Process, PermissionService], covers = ["kernel", "services"]);
 fn permission_manager_mints_scoped_application_grants() {
 	let result = run_permission_scenario(PermissionScenario::ScopedGrants).expect("the scoped application grant scenario should run");
 	assert_eq!(result.graphics_read.as_slice(), b"graphics grants\n", "the graphics probe received process-bound display, key-only input and playback-only audio grants");
 	assert!(result.graphics_start_ns != 0, "the governed app cold-start path is measured");
 }
 
-tagged_test!(component_host_runs_an_sdk_component, [Component, Service, Slow], covers = ["bin.component_host", "wasm", "liber_component"]);
+tagged_test!(component_host_runs_an_sdk_component, [Component, Service, Slow], covers = ["bin.component_host", "liber_component", "wasm"]);
 fn component_host_runs_an_sdk_component() {
 	// component_host (a ring-3 process) loads a real Wasm component - built by the Rust
 	// SDK and served from storage as vol://system/components/liber_component/app.wasm, not embedded in the kernel
@@ -415,7 +415,7 @@ fn component_host_runs_an_sdk_component() {
 	assert_eq!(score, 17, "the component's float `score` export computed floor(10 * 1.5 + 2.0) on real toolchain output");
 }
 
-tagged_test!(a_governed_pipeline_starts_as_one_transaction_and_carries_data, [Service, Process, PermissionService]);
+tagged_test!(a_governed_pipeline_starts_as_one_transaction_and_carries_data, [Service, Process, PermissionService], covers = ["kernel", "services"]);
 fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	// `echo hello | readln` through PermissionManager: two stages, each authorized against
 	// its own manifest, the edge between them allocated by the broker, and both released
@@ -439,7 +439,7 @@ fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	assert!(!result.diagnostic_read.windows(8).any(|window| window == b"in> cat:"), "and it went to the terminal rather than down the pipe, where the consumer would have echoed it: {:?}", core::str::from_utf8(&result.diagnostic_read));
 }
 
-tagged_test!(a_fat_volume_accepts_a_write_as_its_first_operation, [Service, Storage, Filesystem], covers = ["fat", "storage", "liberfs"]);
+tagged_test!(a_fat_volume_accepts_a_write_as_its_first_operation, [Service, Storage, Filesystem], covers = ["fat", "liberfs", "storage"]);
 fn a_fat_volume_accepts_a_write_as_its_first_operation() {
 	// The FAT backing mounts lazily, and the destination validation added with the write-stream
 	// work read `self.fs` directly instead of mounting - so `write vol://media/file` answered
@@ -737,7 +737,7 @@ fn the_memory_volumes_bound_expensive_streams() {
 	assert_eq!(hangup.handle_count(), before, "and leaks no handle when the client is gone");
 }
 
-tagged_test!(a_services_round_trip_against_its_client_count, [Service, Storage, Stress]);
+tagged_test!(a_services_round_trip_against_its_client_count, [Service, Storage, Stress], covers = ["kernel"]);
 fn a_services_round_trip_against_its_client_count() {
 	// The measurement M0147 asked for FIRST, before anything touches the serve loop.
 	//

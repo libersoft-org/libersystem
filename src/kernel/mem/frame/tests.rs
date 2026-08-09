@@ -6,7 +6,7 @@ const FRAGMENTED_PAGES: u64 = (super::SEED_RUNS as u64 + 1) * 2;
 // the contract; the two calls that deliberately break it are in
 // `the_allocator_refuses_a_frame_it_never_handed_out`, which says so where it does it.
 
-crate::tagged_test!(frame_alloc_distinct, [Frame, Memory, Smoke]);
+crate::tagged_test!(frame_alloc_distinct, [Frame, Memory, Smoke], covers = ["kernel"]);
 fn frame_alloc_distinct() {
 	let first = allocate().expect("first frame");
 	let second = allocate().expect("second frame");
@@ -17,7 +17,7 @@ fn frame_alloc_distinct() {
 	}
 }
 
-crate::tagged_test!(the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free, [Frame, Memory]);
+crate::tagged_test!(the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free, [Frame, Memory], covers = ["kernel"]);
 fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 	// NOTHING here reads the global free count, and that is the point.
 	//
@@ -62,7 +62,7 @@ fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 	}
 }
 
-crate::tagged_test!(contiguous_frame_runs_recoalesce, [Frame, Memory]);
+crate::tagged_test!(contiguous_frame_runs_recoalesce, [Frame, Memory], covers = ["kernel"]);
 fn contiguous_frame_runs_recoalesce() {
 	let base = allocate_contiguous(64).expect("a 256 kB span");
 	unsafe {
@@ -78,7 +78,7 @@ fn contiguous_frame_runs_recoalesce() {
 	}
 }
 
-crate::tagged_test!(the_allocator_refuses_a_frame_it_never_handed_out, [Frame, Memory]);
+crate::tagged_test!(the_allocator_refuses_a_frame_it_never_handed_out, [Frame, Memory], covers = ["kernel"]);
 fn the_allocator_refuses_a_frame_it_never_handed_out() {
 	// The debug ownership record's job, and the one thing the overlap test in `insert`
 	// cannot do. Overlap catches a free that lands on memory the pool already calls free.

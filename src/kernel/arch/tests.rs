@@ -1,7 +1,7 @@
 use super::paging;
 use crate::{mem, object::address_space::AddressSpace, sched, smp};
 
-crate::tagged_test!(concurrent_maps_on_shared_tables_strand_nothing, [Paging, Memory, Stress]);
+crate::tagged_test!(concurrent_maps_on_shared_tables_strand_nothing, [Paging, Memory, Stress], covers = ["kernel"]);
 fn concurrent_maps_on_shared_tables_strand_nothing() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	use mem::frame;
@@ -90,7 +90,7 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 	unsafe { frame::deallocate(FRAMES[1].load(Ordering::SeqCst)) };
 }
 
-crate::tagged_test!(paging_map_unmap, [Paging, Memory]);
+crate::tagged_test!(paging_map_unmap, [Paging, Memory], covers = ["kernel"]);
 fn paging_map_unmap() {
 	let phys = mem::frame::allocate().expect("scratch frame");
 	// Sv39 (riscv64) only has a 39-bit canonical VA range, so the 48-bit x86/aarch64
@@ -111,7 +111,7 @@ fn paging_map_unmap() {
 	unsafe { mem::frame::deallocate(phys) };
 }
 
-crate::tagged_test!(a_shootdown_makes_another_core_stop_using_the_old_translation, [Paging, Memory, Smp]);
+crate::tagged_test!(a_shootdown_makes_another_core_stop_using_the_old_translation, [Paging, Memory, Smp], covers = ["kernel"]);
 fn a_shootdown_makes_another_core_stop_using_the_old_translation() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	use mem::frame;

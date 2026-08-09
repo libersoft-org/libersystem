@@ -1,6 +1,6 @@
 use super::*;
 
-tagged_test!(an_et_exec_may_not_name_the_kernel_half, [Dynamic, Memory, Process, Boot]);
+tagged_test!(an_et_exec_may_not_name_the_kernel_half, [Dynamic, Memory, Process, Boot], covers = ["kernel", "rt"]);
 fn an_et_exec_may_not_name_the_kernel_half() {
 	// The first link of a complete escalation chain on x86_64, and the only one that was
 	// a design decision rather than an oversight: segments were checked against a window
@@ -77,7 +77,7 @@ fn an_et_exec_may_not_name_the_kernel_half() {
 	unsafe { crate::mem::frame::deallocate(frame) };
 }
 
-tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Dynamic, DynamicReject, Memory, Process]);
+tagged_test!(elf_dyn_applies_relative_relocations_and_rejects_symbols, [Dynamic, DynamicReject, Memory, Process], covers = ["kernel", "rt"]);
 fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	use crate::elf::ElfError;
 	use crate::object::address_space::AddressSpace;
@@ -254,7 +254,7 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	assert_eq!(first_text, second_text, "two processes map one physical immutable provider page");
 }
 
-tagged_test!(dynamic_process_service_loads_probe, [Dynamic, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_loads_probe, [Dynamic, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_loads_probe() {
 	use object::channel::{Channel, Message};
 	use object::process::Process;
@@ -284,7 +284,7 @@ fn dynamic_process_service_loads_probe() {
 	sched::run_until_idle();
 }
 
-tagged_test!(lico_provider_loads_with_lsrt, [Lico, Dynamic, Process, Storage]);
+tagged_test!(lico_provider_loads_with_lsrt, [Lico, Dynamic, Process, Storage], covers = ["kernel", "rt"]);
 fn lico_provider_loads_with_lsrt() {
 	use object::address_space::AddressSpace;
 	use object::process::Process;
@@ -312,7 +312,7 @@ fn lico_provider_loads_with_lsrt() {
 	assert!(process.resolve_dynamic_symbol_by_suffix("4lico6detect16detect_file_type").is_some(), "lico registers its file-type detector for dynamic consumers");
 }
 
-tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [LicoLoad, Service, Process, ProcessService, Storage]);
+tagged_test!(dynamic_process_service_loads_programs_from_system_bin, [LicoLoad, Service, Process, ProcessService, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_loads_programs_from_system_bin() {
 	use object::channel::{Channel, Message};
 	use object::process::Process;
@@ -960,7 +960,7 @@ fn dynamic_process_service_loads_programs_from_system_bin() {
 	sched::run_until_idle();
 }
 
-tagged_test!(dynamic_wave_launch_metrics_are_structurally_sound, [Dynamic, Service, Process, Storage]);
+tagged_test!(dynamic_wave_launch_metrics_are_structurally_sound, [Dynamic, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let (process_boot_kernel, _storage_boot_kernel, process_client) = start_process_service_from_volume(volume);
@@ -980,7 +980,7 @@ fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	sched::run_until_idle();
 }
 
-tagged_test!(unrelated_dynamic_consumers_share_domain_and_codec_text, [Dynamic, Service, Process, Storage]);
+tagged_test!(unrelated_dynamic_consumers_share_domain_and_codec_text, [Dynamic, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn unrelated_dynamic_consumers_share_domain_and_codec_text() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let (process_boot_kernel, _storage_boot_kernel, process_client) = start_process_service_from_volume(volume);
@@ -992,7 +992,7 @@ fn unrelated_dynamic_consumers_share_domain_and_codec_text() {
 	sched::run_until_idle();
 }
 
-tagged_test!(dynamic_process_service_rejects_missing_provider, [Dynamic, DynamicReject, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_rejects_missing_provider, [Dynamic, DynamicReject, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_missing_provider() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
@@ -1003,7 +1003,7 @@ fn dynamic_process_service_rejects_missing_provider() {
 	assert!(reply.caps.is_empty(), "an absent provider creates no process capability");
 }
 
-tagged_test!(dynamic_process_service_rejects_undeclared_provider_edge, [Dynamic, DynamicReject, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_rejects_undeclared_provider_edge, [Dynamic, DynamicReject, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_undeclared_provider_edge() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
@@ -1014,7 +1014,7 @@ fn dynamic_process_service_rejects_undeclared_provider_edge() {
 	assert!(reply.caps.is_empty(), "an undeclared provider edge creates no process capability");
 }
 
-tagged_test!(dynamic_process_service_rejects_duplicate_provider_edge, [Dynamic, DynamicReject, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_rejects_duplicate_provider_edge, [Dynamic, DynamicReject, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_duplicate_provider_edge() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
@@ -1025,7 +1025,7 @@ fn dynamic_process_service_rejects_duplicate_provider_edge() {
 	assert!(reply.caps.is_empty(), "a duplicate provider edge creates no process capability");
 }
 
-tagged_test!(dynamic_process_service_rejects_malformed_dynamic_metadata, [Dynamic, DynamicReject, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_rejects_malformed_dynamic_metadata, [Dynamic, DynamicReject, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_malformed_dynamic_metadata() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	for (correlation, mutate) in [
@@ -1042,7 +1042,7 @@ fn dynamic_process_service_rejects_malformed_dynamic_metadata() {
 	}
 }
 
-tagged_test!(dynamic_process_service_rejects_malformed_symbol_and_relocation_metadata, [Dynamic, DynamicReject, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_rejects_malformed_symbol_and_relocation_metadata, [Dynamic, DynamicReject, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_malformed_symbol_and_relocation_metadata() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	for (correlation, mutate) in [
@@ -1059,7 +1059,7 @@ fn dynamic_process_service_rejects_malformed_symbol_and_relocation_metadata() {
 	}
 }
 
-tagged_test!(dynamic_process_service_rejects_provider_cycle, [Dynamic, DynamicReject, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_rejects_provider_cycle, [Dynamic, DynamicReject, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_provider_cycle() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut mutated_volume = volume.to_vec();
@@ -1070,7 +1070,7 @@ fn dynamic_process_service_rejects_provider_cycle() {
 	assert!(reply.caps.is_empty(), "a provider dependency cycle creates no process capability");
 }
 
-tagged_test!(dynamic_process_service_rejects_substituted_or_corrupted_identity_note, [Dynamic, DynamicReject, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_rejects_substituted_or_corrupted_identity_note, [Dynamic, DynamicReject, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_substituted_or_corrupted_identity_note() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut substituted_provider = volume.to_vec();
@@ -1088,7 +1088,7 @@ fn dynamic_process_service_rejects_substituted_or_corrupted_identity_note() {
 	assert!(reply.caps.is_empty(), "a corrupted embedded identity record creates no process capability");
 }
 
-tagged_test!(dynamic_process_service_rejects_duplicate_provider_export, [Dynamic, DynamicReject, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_rejects_duplicate_provider_export, [Dynamic, DynamicReject, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_rejects_duplicate_provider_export() {
 	let (volume, _) = scenario_packages().expect("scenario packages");
 	let mut duplicated_export = volume.to_vec();
@@ -1099,7 +1099,7 @@ fn dynamic_process_service_rejects_duplicate_provider_export() {
 	assert!(reply.caps.is_empty(), "a duplicate provider export creates no process capability");
 }
 
-tagged_test!(dynamic_process_service_derives_provider_slots_independently_of_needed_order, [Dynamic, Service, Process, Storage]);
+tagged_test!(dynamic_process_service_derives_provider_slots_independently_of_needed_order, [Dynamic, Service, Process, Storage], covers = ["kernel", "rt", "services"]);
 fn dynamic_process_service_derives_provider_slots_independently_of_needed_order() {
 	use object::process::Process;
 
@@ -1121,7 +1121,7 @@ fn dynamic_process_service_derives_provider_slots_independently_of_needed_order(
 	}
 }
 
-tagged_test!(a_load_that_runs_out_of_frames_anywhere_gives_back_everything, [Dynamic, Memory, Process]);
+tagged_test!(a_load_that_runs_out_of_frames_anywhere_gives_back_everything, [Dynamic, Memory, Process], covers = ["kernel", "rt", "services"]);
 fn a_load_that_runs_out_of_frames_anywhere_gives_back_everything() {
 	// A real service image, loaded over and over with the frame allocator told to refuse the
 	// k-th allocation for k = 0, 1, 2, ... - so the failure walks through every allocation the
@@ -1213,7 +1213,7 @@ fn a_load_that_runs_out_of_frames_anywhere_gives_back_everything() {
 	crate::serial_println!("(load takes {succeeded_at} allocations; {refusals} refusals checked) ");
 }
 
-tagged_test!(a_fuzzed_elf_header_is_refused_without_leaking, [Dynamic, Memory, Process]);
+tagged_test!(a_fuzzed_elf_header_is_refused_without_leaking, [Dynamic, Memory, Process], covers = ["kernel", "rt"]);
 fn a_fuzzed_elf_header_is_refused_without_leaking() {
 	// Random damage to a well-formed image, in the two structures the loader parses before it
 	// trusts anything: the ELF header and the program headers. Every one of these is a byte an
@@ -1310,7 +1310,7 @@ fn a_fuzzed_elf_header_is_refused_without_leaking() {
 	crate::serial_println!("({loaded}/{ITERATIONS} fuzzed images still loaded) ");
 }
 
-tagged_test!(a_fuzzed_relocation_table_is_refused_without_leaking, [Dynamic, Memory, Process]);
+tagged_test!(a_fuzzed_relocation_table_is_refused_without_leaking, [Dynamic, Memory, Process], covers = ["kernel", "rt"]);
 fn a_fuzzed_relocation_table_is_refused_without_leaking() {
 	// The other structure the loader walks on an image's say-so. A `.dynamic` array names where
 	// the relocations are, how many, and how wide; each relocation names an address to patch

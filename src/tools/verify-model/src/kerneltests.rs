@@ -58,7 +58,19 @@ pub fn discover(repo_root: &Path, architectures: &[&str]) -> Result<Discovery, S
 		}
 	}
 
-	let touches = scan_touches(repo_root)?;
+	let mut touches = scan_touches(repo_root)?;
+	// Every one of these runs INSIDE the kernel, which is a reach no launch expresses. Without it a
+	// unit test covering `kernel` fails the reachability gate for want of a `program_elf` call.
+	//
+	// It does not make the gate vacuous, because reach excludes `link.static.dev`: the kernel
+	// dev-depends on eleven codecs to build its scenario fixtures, and a test claiming to cover one
+	// of those still has to name it.
+	for reached in touches.values_mut() {
+		reached.insert(String::from("kernel"));
+	}
+	for name in per_test.keys() {
+		touches.entry(name.clone()).or_default().insert(String::from("kernel"));
+	}
 	let mut tests = Vec::new();
 	let mut unannotated = 0;
 	for (name, architectures) in per_test {
@@ -192,10 +204,22 @@ pub fn parse_declarations(text: &str) -> Vec<(String, Vec<String>)> {
 		let Some(end) = matching_paren(rest) else { break };
 		let arguments = &rest[..end];
 		rest = &rest[end..];
-		let Some(name) = arguments.split(',').next().map(str::trim) else { continue };
-		if name.is_empty() || !name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
+		// The name is the first ARGUMENT that is a plain identifier, and the declaration comes in two
+		// shapes: one line, or several with a `#[cfg(target_arch = "..")]` attribute first. Handling
+		// only the second broke the first and every single-line annotation vanished at once; handling
+		// only the first skipped the arch-gated tests. Both, then, and in that order.
+		let Some(name) = arguments
+			.split(',')
+			.map(str::trim)
+			.chain(arguments.lines().map(|line| line.trim().trim_end_matches(',')))
+			// Lowercase-first is what separates a test name from a TAG: names are snake_case and tags
+			// are CamelCase. Without it the attributed form resolved to `Process` - the second tag in
+			// the list, the first field that happened to be a bare identifier - and two real tests
+			// reported as undeclared while a test by that name was invented and never matched.
+			.find(|candidate| candidate.chars().next().is_some_and(|first| first.is_ascii_lowercase()) && candidate.chars().all(|character| character.is_ascii_alphanumeric() || character == '_'))
+		else {
 			continue;
-		}
+		};
 		let covers = match arguments.find("covers") {
 			Some(at) => {
 				let tail = &arguments[at..];
@@ -305,12 +329,31 @@ fn touch_dir(dir: &Path, out: &mut BTreeMap<String, BTreeSet<String>>, calls: &m
 // `\nfn ` at column zero, which is where every test function in this tree begins.
 pub fn parse_touches(text: &str) -> Vec<(String, BTreeSet<String>, BTreeSet<String>)> {
 	let mut found = Vec::new();
-	for chunk in text.split("\nfn ").skip(1) {
-		let Some(name) = chunk.split(['(', '<', ' ']).next() else { continue };
-		if name.is_empty() || !name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
+	// Function starts at ANY indentation. Splitting on a column-zero `\nfn ` missed every test
+	// written inside a `mod tests { ... }`, which is how the object, memory and scheduler suites are
+	// written - and those are most of the kernel's unit tests.
+	let mut current: Option<(String, String)> = None;
+	for line in text.lines() {
+		let trimmed = line.trim_start();
+		let declaration = trimmed.strip_prefix("pub fn ").or_else(|| trimmed.strip_prefix("fn "));
+		if let Some(rest) = declaration
+			&& let Some(name) = rest.split(['(', '<', ' ']).next()
+			&& !name.is_empty()
+			&& name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_')
+		{
+			if let Some((previous, body)) = current.take() {
+				found.push((previous, reached_in(&body), called_in(&body)));
+			}
+			current = Some((name.to_string(), String::new()));
 			continue;
 		}
-		found.push((name.to_string(), reached_in(chunk), called_in(chunk)));
+		if let Some((_, body)) = current.as_mut() {
+			body.push_str(line);
+			body.push('\n');
+		}
+	}
+	if let Some((name, body)) = current {
+		found.push((name, reached_in(&body), called_in(&body)));
 	}
 	found
 }

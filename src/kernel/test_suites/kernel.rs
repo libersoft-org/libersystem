@@ -1,6 +1,6 @@
 use super::*;
 
-tagged_test!(a_translation_is_not_a_permission, [Memory, Syscall]);
+tagged_test!(a_translation_is_not_a_permission, [Memory, Syscall], covers = ["kernel"]);
 fn a_translation_is_not_a_permission() {
 	// `user_buf_ok` asked only whether an address TRANSLATED. A ring-3 caller could
 	// therefore hand the kernel a pointer into a page it cannot itself reach - a
@@ -46,7 +46,7 @@ fn translate_flags_in(space: &alloc::sync::Arc<crate::object::address_space::Add
 	flags
 }
 
-tagged_test!(a_shootdown_is_answered_by_every_other_core, [Memory, Scheduler, Smp]);
+tagged_test!(a_shootdown_is_answered_by_every_other_core, [Memory, Scheduler, Smp], covers = ["kernel"]);
 fn a_shootdown_is_answered_by_every_other_core() {
 	// Every port invalidated its OWN translations and told nobody, so a frame could go
 	// back to the allocator while another core still held a translation for it - and that
@@ -68,7 +68,7 @@ fn a_shootdown_is_answered_by_every_other_core() {
 	crate::mem::tlb::shootdown();
 }
 
-tagged_test!(a_capability_transfer_moves_it_exactly_once, [Process, Syscall, Ipc]);
+tagged_test!(a_capability_transfer_moves_it_exactly_once, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_capability_transfer_moves_it_exactly_once() {
 	// A transfer was a clone under the lock, a send, and then a re-lookup and a `close`
 	// whose result was DISCARDED. Two ways that mints a capability without the
@@ -105,7 +105,7 @@ fn a_capability_transfer_moves_it_exactly_once() {
 	let _ = Handle::from_raw(returned.raw());
 }
 
-tagged_test!(mapping_over_a_live_page_is_refused_not_performed, [Memory, Process]);
+tagged_test!(mapping_over_a_live_page_is_refused_not_performed, [Memory, Process], covers = ["kernel"]);
 fn mapping_over_a_live_page_is_refused_not_performed() {
 	// The leaf write was unconditional, so mapping over an existing page silently
 	// replaced it and the frame that was there was simply lost - no owner, no error, no
@@ -133,7 +133,7 @@ fn mapping_over_a_live_page_is_refused_not_performed() {
 	unsafe { crate::mem::frame::deallocate(second) };
 }
 
-tagged_test!(duplicating_a_handle_is_charged_like_any_other_install, [Process, Syscall]);
+tagged_test!(duplicating_a_handle_is_charged_like_any_other_install, [Process, Syscall], covers = ["kernel"]);
 fn duplicating_a_handle_is_charged_like_any_other_install() {
 	// `duplicate` finished with the UNBOUNDED insert, so a process holding one duplicable
 	// handle could pass its handle limit indefinitely just by asking. Worse than the count
@@ -167,7 +167,7 @@ fn duplicating_a_handle_is_charged_like_any_other_install() {
 	let _ = table.close(Handle::from_raw(first.raw()));
 }
 
-tagged_test!(the_last_thread_out_is_decided_by_a_counter_not_a_snapshot, [Process, Scheduler]);
+tagged_test!(the_last_thread_out_is_decided_by_a_counter_not_a_snapshot, [Process, Scheduler], covers = ["kernel"]);
 fn the_last_thread_out_is_decided_by_a_counter_not_a_snapshot() {
 	// Whether a thread is the last one out was read from a snapshot of the OTHER live
 	// threads. Two threads exiting at the same time each saw the other, neither called
@@ -198,7 +198,7 @@ fn the_last_thread_out_is_decided_by_a_counter_not_a_snapshot() {
 	assert!(process2.thread_exited(), "the second of two is");
 }
 
-tagged_test!(a_syscall_may_not_ask_the_kernel_for_an_unbounded_allocation, [Syscall, Memory]);
+tagged_test!(a_syscall_may_not_ask_the_kernel_for_an_unbounded_allocation, [Syscall, Memory], covers = ["kernel"]);
 fn a_syscall_may_not_ask_the_kernel_for_an_unbounded_allocation() {
 	// Every allocation the kernel sizes from a userspace number used to be a plain `vec!`
 	// with no ceiling above it: one syscall could name a length and the kernel would try
@@ -220,7 +220,7 @@ fn a_syscall_may_not_ask_the_kernel_for_an_unbounded_allocation() {
 	// suite, which sends real messages through these same paths in every service test.
 }
 
-tagged_test!(a_cpu_bound_ring3_thread_is_preempted, [Scheduler, Process]);
+tagged_test!(a_cpu_bound_ring3_thread_is_preempted, [Scheduler, Process], covers = ["kernel"]);
 fn a_cpu_bound_ring3_thread_is_preempted() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	use mem::frame::{self, PAGE_SIZE};
@@ -289,7 +289,7 @@ fn a_cpu_bound_ring3_thread_is_preempted() {
 	assert!(SPIN_DONE.load(Ordering::SeqCst), "the ring-3 spinner never finished: ring 3 was not preempted");
 }
 
-tagged_test!(process_isolation_and_per_process_tables, [Process, Memory]);
+tagged_test!(process_isolation_and_per_process_tables, [Process, Memory], covers = ["kernel"]);
 fn process_isolation_and_per_process_tables() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	use mem::frame;
@@ -361,7 +361,7 @@ fn process_isolation_and_per_process_tables() {
 	unsafe { frame::deallocate(f2) };
 }
 
-tagged_test!(syscall_object_and_handle_ops, [Syscall]);
+tagged_test!(syscall_object_and_handle_ops, [Syscall], covers = ["kernel"]);
 fn syscall_object_and_handle_ops() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -403,7 +403,7 @@ fn syscall_object_and_handle_ops() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-tagged_test!(an_unmapped_va_range_is_reused_not_leaked, [Memory]);
+tagged_test!(an_unmapped_va_range_is_reused_not_leaked, [Memory], covers = ["kernel"]);
 fn an_unmapped_va_range_is_reused_not_leaked() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -449,7 +449,7 @@ fn an_unmapped_va_range_is_reused_not_leaked() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-tagged_test!(blocking_wait_times_out_on_deadline, [Scheduler]);
+tagged_test!(blocking_wait_times_out_on_deadline, [Scheduler], covers = ["kernel"]);
 fn blocking_wait_times_out_on_deadline() {
 	use core::sync::atomic::{AtomicI64, Ordering};
 	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
@@ -470,7 +470,7 @@ fn blocking_wait_times_out_on_deadline() {
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), syscall::ERR_TIMED_OUT);
 }
 
-tagged_test!(a_periodic_wait_ticks_but_never_holds_the_scheduler, [Scheduler]);
+tagged_test!(a_periodic_wait_ticks_but_never_holds_the_scheduler, [Scheduler], covers = ["kernel"]);
 fn a_periodic_wait_ticks_but_never_holds_the_scheduler() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -505,7 +505,7 @@ fn a_periodic_wait_ticks_but_never_holds_the_scheduler() {
 	assert!(TICKS.load(Ordering::SeqCst) >= target, "the periodic wait keeps ticking across settles");
 }
 
-tagged_test!(waiting_on_a_process_handle_wakes_when_it_exits, [Process]);
+tagged_test!(waiting_on_a_process_handle_wakes_when_it_exits, [Process], covers = ["kernel"]);
 fn waiting_on_a_process_handle_wakes_when_it_exits() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
@@ -547,7 +547,7 @@ fn waiting_on_a_process_handle_wakes_when_it_exits() {
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0, "the process handle became ready on exit");
 }
 
-tagged_test!(signal_terminate_wakes_a_blocked_thread, [Process]);
+tagged_test!(signal_terminate_wakes_a_blocked_thread, [Process], covers = ["kernel"]);
 fn signal_terminate_wakes_a_blocked_thread() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::thread::ThreadState;
@@ -583,7 +583,7 @@ fn signal_terminate_wakes_a_blocked_thread() {
 	assert_eq!(victim_thread.state(), ThreadState::Exited, "the victim thread has exited");
 }
 
-tagged_test!(a_clean_exit_releases_the_process_channel_endpoints, [Process]);
+tagged_test!(a_clean_exit_releases_the_process_channel_endpoints, [Process], covers = ["kernel"]);
 fn a_clean_exit_releases_the_process_channel_endpoints() {
 	use object::channel::Channel;
 	use object::process::Process;
@@ -614,7 +614,7 @@ fn a_clean_exit_releases_the_process_channel_endpoints() {
 	let _: &Process = &process;
 }
 
-tagged_test!(userspace_spawn_syscalls_start_a_second_process, [Process, Syscall]);
+tagged_test!(userspace_spawn_syscalls_start_a_second_process, [Process, Syscall], covers = ["kernel"]);
 fn userspace_spawn_syscalls_start_a_second_process() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	// A kernel thread drives the userspace spawn syscalls exactly as a ring-3
@@ -648,7 +648,7 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 	assert_eq!(&message.bytes[..], b"LogService: online");
 }
 
-tagged_test!(syscall_fuzz_rejects_invalid_calls, [Syscall]);
+tagged_test!(syscall_fuzz_rejects_invalid_calls, [Syscall], covers = ["kernel"]);
 fn syscall_fuzz_rejects_invalid_calls() {
 	// Syscall fuzzing: from a ring-0 thread (with its own, empty handle table), drive the
 	// syscall boundary with random unknown syscall numbers and random arguments, then known
@@ -690,7 +690,7 @@ fn syscall_fuzz_rejects_invalid_calls() {
 	assert!(DONE.load(Ordering::SeqCst), "the syscall fuzz thread did not finish - the kernel did not survive");
 }
 
-tagged_test!(object_info_get_reports_object, [Syscall]);
+tagged_test!(object_info_get_reports_object, [Syscall], covers = ["kernel"]);
 fn object_info_get_reports_object() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -725,7 +725,7 @@ fn object_info_get_reports_object() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-tagged_test!(system_graph_reflects_live_state, [Kernel]);
+tagged_test!(system_graph_reflects_live_state, [Kernel], covers = ["kernel"]);
 fn system_graph_reflects_live_state() {
 	use object::address_space::AddressSpace;
 	use object::channel::Channel;
@@ -761,7 +761,7 @@ fn system_graph_reflects_live_state() {
 	assert_eq!(after.processes.len(), 0, "the process is gone after it drops");
 }
 
-tagged_test!(process_counters_track_ipc_and_resources, [Process]);
+tagged_test!(process_counters_track_ipc_and_resources, [Process], covers = ["kernel"]);
 fn process_counters_track_ipc_and_resources() {
 	use object::address_space::AddressSpace;
 	use object::domain::Domain;
@@ -794,7 +794,7 @@ fn process_counters_track_ipc_and_resources() {
 	assert!(process.is_killed(), "a terminated process reports as failed");
 }
 
-tagged_test!(userspace_runs_and_ipcs, [Process]);
+tagged_test!(userspace_runs_and_ipcs, [Process], covers = ["kernel"]);
 fn userspace_runs_and_ipcs() {
 	use object::channel::Channel;
 	// Hand a fresh kernel thread one end of a channel and let it drop to ring 3
@@ -808,7 +808,7 @@ fn userspace_runs_and_ipcs() {
 	assert_eq!(&message.bytes[..], b"OK");
 }
 
-tagged_test!(userspace_yields_cooperatively, [Process, Scheduler]);
+tagged_test!(userspace_yields_cooperatively, [Process, Scheduler], covers = ["kernel"]);
 fn userspace_yields_cooperatively() {
 	use object::channel::Channel;
 	// Two ring-3 threads share one core and each call SYS_YIELD several times
@@ -826,7 +826,7 @@ fn userspace_yields_cooperatively() {
 	assert_eq!(&k1.recv().expect("second ring-3 thread sent a message").bytes[..], b"OK");
 }
 
-tagged_test!(fault_isolation_kills_only_process, [Kernel, Process]);
+tagged_test!(fault_isolation_kills_only_process, [Kernel, Process], covers = ["kernel"]);
 fn fault_isolation_kills_only_process() {
 	use core::sync::atomic::Ordering;
 	use object::domain::Domain;
@@ -851,7 +851,8 @@ fn fault_isolation_kills_only_process() {
 tagged_test!(
 	#[cfg(target_arch = "x86_64")]
 	writable_pages_are_not_executable,
-	[Kernel, ArchX86_64]
+	[Kernel, ArchX86_64],
+	covers = ["kernel"]
 );
 #[cfg(target_arch = "x86_64")]
 fn writable_pages_are_not_executable() {
@@ -880,7 +881,8 @@ fn writable_pages_are_not_executable() {
 tagged_test!(
 	#[cfg(target_arch = "aarch64")]
 	writable_pages_are_not_executable,
-	[Kernel, ArchAarch64]
+	[Kernel, ArchAarch64],
+	covers = ["kernel"]
 );
 #[cfg(target_arch = "aarch64")]
 fn writable_pages_are_not_executable() {
@@ -912,7 +914,8 @@ fn writable_pages_are_not_executable() {
 tagged_test!(
 	#[cfg(target_arch = "riscv64")]
 	writable_pages_are_not_executable,
-	[Kernel, ArchRiscv64]
+	[Kernel, ArchRiscv64],
+	covers = ["kernel"]
 );
 #[cfg(target_arch = "riscv64")]
 fn writable_pages_are_not_executable() {
@@ -939,7 +942,8 @@ fn writable_pages_are_not_executable() {
 tagged_test!(
 	#[cfg(target_arch = "x86_64")]
 	kernel_access_to_user_memory_is_refused_outside_the_window,
-	[Kernel, ArchX86_64]
+	[Kernel, ArchX86_64],
+	covers = ["kernel"]
 );
 #[cfg(target_arch = "x86_64")]
 fn kernel_access_to_user_memory_is_refused_outside_the_window() {
@@ -993,7 +997,7 @@ fn kernel_access_to_user_memory_is_refused_outside_the_window() {
 	unsafe { frame::deallocate(frame) };
 }
 
-tagged_test!(a_user_stack_grows_on_demand_past_its_initial_pages, [Kernel, Memory]);
+tagged_test!(a_user_stack_grows_on_demand_past_its_initial_pages, [Kernel, Memory], covers = ["kernel"]);
 fn a_user_stack_grows_on_demand_past_its_initial_pages() {
 	use core::sync::atomic::Ordering;
 	use object::domain::Domain;
@@ -1013,7 +1017,7 @@ fn a_user_stack_grows_on_demand_past_its_initial_pages() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
-tagged_test!(recursion_past_the_stack_floor_is_killed, [Kernel, Memory, Process]);
+tagged_test!(recursion_past_the_stack_floor_is_killed, [Kernel, Memory, Process], covers = ["kernel"]);
 fn recursion_past_the_stack_floor_is_killed() {
 	use core::sync::atomic::Ordering;
 	use mem::frame::PAGE_SIZE;
@@ -1034,7 +1038,7 @@ fn recursion_past_the_stack_floor_is_killed() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
-tagged_test!(domain_hierarchy_limit_is_enforced_through_memory_create, [Domain, Kernel]);
+tagged_test!(domain_hierarchy_limit_is_enforced_through_memory_create, [Domain, Kernel], covers = ["kernel"]);
 fn domain_hierarchy_limit_is_enforced_through_memory_create() {
 	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 	use object::domain::{Domain, UNLIMITED};
@@ -1064,7 +1068,7 @@ fn domain_hierarchy_limit_is_enforced_through_memory_create() {
 	assert_eq!(stats.memory_peak, 8192, "Domain stats preserves the observed memory high-water mark");
 }
 
-tagged_test!(domain_kill_frees_subtree, [Kernel, Process]);
+tagged_test!(domain_kill_frees_subtree, [Kernel, Process], covers = ["kernel"]);
 fn domain_kill_frees_subtree() {
 	use core::sync::atomic::{AtomicI64, Ordering};
 	use object::domain::Domain;
@@ -1101,7 +1105,7 @@ fn domain_kill_frees_subtree() {
 	assert_eq!(parent.account().threads().used(), 0, "parent aggregate threads refunded");
 }
 
-tagged_test!(channel_capability_transfer_is_zero_copy, [Ipc, Memory, Syscall]);
+tagged_test!(channel_capability_transfer_is_zero_copy, [Ipc, Memory, Syscall], covers = ["kernel"]);
 fn channel_capability_transfer_is_zero_copy() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	// Zero-copy: a 1 MB buffer is transferred as a capability, not copied. The
@@ -1184,7 +1188,7 @@ fn live_handle_count() -> u64 {
 	sched::current_thread().expect("a current thread").process().handle_count()
 }
 
-tagged_test!(a_refused_capability_send_leaves_every_handle_with_the_sender, [Process, Syscall, Ipc]);
+tagged_test!(a_refused_capability_send_leaves_every_handle_with_the_sender, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_refused_capability_send_leaves_every_handle_with_the_sender() {
 	// A batch transfer is all-or-nothing in BOTH directions, and the second direction is the
 	// one with nowhere to put a mistake. Taking every handle under one lock is the easy half;
@@ -1239,7 +1243,7 @@ fn a_refused_capability_send_leaves_every_handle_with_the_sender() {
 	assert!(DONE.load(Ordering::SeqCst), "the transfer thread ran to completion");
 }
 
-tagged_test!(a_receiver_too_small_for_a_message_keeps_it_queued, [Process, Syscall, Ipc]);
+tagged_test!(a_receiver_too_small_for_a_message_keeps_it_queued, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_receiver_too_small_for_a_message_keeps_it_queued() {
 	// A message that cannot be delivered has to stay deliverable. Taking it off the queue and
 	// then reporting that the buffer was too small destroys a message nobody can retry - and
@@ -1276,7 +1280,7 @@ fn a_receiver_too_small_for_a_message_keeps_it_queued() {
 	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
 }
 
-tagged_test!(a_batch_naming_one_handle_twice_is_refused_whole, [Process, Syscall, Ipc]);
+tagged_test!(a_batch_naming_one_handle_twice_is_refused_whole, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_batch_naming_one_handle_twice_is_refused_whole() {
 	// The duplication that needs no race: name the same handle twice in one batch, and a
 	// transfer that clones each entry independently mints a second capability without the
@@ -1312,7 +1316,7 @@ fn a_batch_naming_one_handle_twice_is_refused_whole() {
 	assert!(DONE.load(Ordering::SeqCst), "the batch thread ran to completion");
 }
 
-tagged_test!(starting_a_thread_twice_runs_it_once, [Process, Scheduler]);
+tagged_test!(starting_a_thread_twice_runs_it_once, [Process, Scheduler], covers = ["kernel"]);
 fn starting_a_thread_twice_runs_it_once() {
 	// The start gate. A thread built suspended and released twice must be enqueued once - the
 	// same thread on a run queue twice is two cores switching into one context, which is a
@@ -1333,7 +1337,7 @@ fn starting_a_thread_twice_runs_it_once() {
 	assert_eq!(RUNS.load(Ordering::SeqCst), 1, "the body ran more than once: the thread was enqueued twice");
 }
 
-tagged_test!(a_wake_can_only_be_claimed_once, [Process, Scheduler, Smp]);
+tagged_test!(a_wake_can_only_be_claimed_once, [Process, Scheduler, Smp], covers = ["kernel"]);
 fn a_wake_can_only_be_claimed_once() {
 	// A blocked thread can be made ready by more than one source at the same instant - a
 	// message arriving as its deadline passes, two peers signalling one event - and exactly one
@@ -1369,7 +1373,7 @@ fn a_wake_can_only_be_claimed_once() {
 	assert!(!subject.try_claim_wake(), "nor is an exited one");
 }
 
-tagged_test!(a_terminating_process_takes_no_new_mappings, [Process, Syscall, Memory]);
+tagged_test!(a_terminating_process_takes_no_new_mappings, [Process, Syscall, Memory], covers = ["kernel"]);
 fn a_terminating_process_takes_no_new_mappings() {
 	// Cleanup takes a snapshot of what to unmap. A mapping registered after that snapshot is
 	// one nothing will ever collect: the page tables keep it while the frames go back to the
@@ -1403,7 +1407,7 @@ fn a_terminating_process_takes_no_new_mappings() {
 	assert!(DONE.load(Ordering::SeqCst), "the termination thread ran to completion");
 }
 
-tagged_test!(a_timer_armed_after_the_wait_began_still_wakes_it, [Object, Scheduler, Syscall]);
+tagged_test!(a_timer_armed_after_the_wait_began_still_wakes_it, [Object, Scheduler, Syscall], covers = ["kernel"]);
 fn a_timer_armed_after_the_wait_began_still_wakes_it() {
 	// Waiting on a timer that is not armed yet is an ordinary thing to do - the waiter and the
 	// arming thread are two independent components - and the waiter has nothing to re-check
@@ -1438,7 +1442,7 @@ fn a_timer_armed_after_the_wait_began_still_wakes_it() {
 	assert_eq!(RESULT.load(Ordering::SeqCst), 0, "the wait should report readiness, not a timeout");
 }
 
-tagged_test!(wait_any_on_only_a_timer_returns_when_it_fires, [Object, Scheduler, Syscall]);
+tagged_test!(wait_any_on_only_a_timer_returns_when_it_fires, [Object, Scheduler, Syscall], covers = ["kernel"]);
 fn wait_any_on_only_a_timer_returns_when_it_fires() {
 	// The same case through `WAIT_ANY`, which derives its block deadline from the set rather
 	// than from one object. A set whose only member is an unarmed timer, with no external
@@ -1476,7 +1480,7 @@ fn xorshift(state: &mut u64) -> u64 {
 	*state
 }
 
-tagged_test!(a_fuzzed_capability_batch_never_mints_a_capability, [Syscall, Ipc, Process]);
+tagged_test!(a_fuzzed_capability_batch_never_mints_a_capability, [Syscall, Ipc, Process], covers = ["kernel"]);
 fn a_fuzzed_capability_batch_never_mints_a_capability() {
 	// The capability array is entirely the caller's: a count and a list of handle values, read
 	// out of its memory. Counts out of range, handles that name nothing, handles that name the
@@ -1552,7 +1556,7 @@ fn a_fuzzed_capability_batch_never_mints_a_capability() {
 	assert!(DONE.load(Ordering::SeqCst), "the capability fuzz ran to completion");
 }
 
-tagged_test!(handle_churn_never_resurrects_a_closed_capability, [Syscall, Process]);
+tagged_test!(handle_churn_never_resurrects_a_closed_capability, [Syscall, Process], covers = ["kernel"]);
 fn handle_churn_never_resurrects_a_closed_capability() {
 	// A handle packs a generation above a slot index, and a closed slot goes back on the free
 	// list to be reissued. The generation is what keeps the old VALUE from naming the new
@@ -1613,7 +1617,7 @@ fn handle_churn_never_resurrects_a_closed_capability() {
 	assert!(DONE.load(Ordering::SeqCst), "the handle churn ran to completion");
 }
 
-tagged_test!(fuzzed_map_and_unmap_sequences_round_trip_the_window, [Syscall, Memory]);
+tagged_test!(fuzzed_map_and_unmap_sequences_round_trip_the_window, [Syscall, Memory], covers = ["kernel"]);
 fn fuzzed_map_and_unmap_sequences_round_trip_the_window() {
 	// Map and unmap in an order nobody wrote down: doubles, unmaps of things that were never
 	// mapped, unmaps repeated, interleaved across several objects. Each call must answer rather
@@ -1687,7 +1691,7 @@ fn fuzzed_map_and_unmap_sequences_round_trip_the_window() {
 	assert!(DONE.load(Ordering::SeqCst), "the map/unmap fuzz ran to completion");
 }
 
-tagged_test!(a_refused_single_capability_send_leaves_the_handle_where_it_was, [Process, Syscall, Ipc]);
+tagged_test!(a_refused_single_capability_send_leaves_the_handle_where_it_was, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_refused_single_capability_send_leaves_the_handle_where_it_was() {
 	// The batch send was taught to MOVE a capability and this one was not: it looked the handle up,
 	// built a `Capability` from the result - a clone of the authority - sent that, and then closed
@@ -1729,7 +1733,7 @@ fn a_refused_single_capability_send_leaves_the_handle_where_it_was() {
 	assert!(DONE.load(Ordering::SeqCst), "the transfer thread ran to completion");
 }
 
-tagged_test!(a_receive_takes_a_message_only_if_it_fits, [Process, Syscall, Ipc]);
+tagged_test!(a_receive_takes_a_message_only_if_it_fits, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_receive_takes_a_message_only_if_it_fits() {
 	// `peek_shape` then `recv` were two operations under two separate locks, so a second receiver
 	// could take the peeked message in between - and the copy afterwards used the RECEIVED length.
@@ -1767,7 +1771,7 @@ fn a_receive_takes_a_message_only_if_it_fits() {
 	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
 }
 
-tagged_test!(a_wait_set_registers_its_members_once_and_wakes_on_any_of_them, [Process, Syscall, Ipc]);
+tagged_test!(a_wait_set_registers_its_members_once_and_wakes_on_any_of_them, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
 	// `SYS_WAIT_ANY` takes a fresh array on every call, so the kernel registers a waiter on every
 	// object in it and takes them all out again - once per pass, for as long as the caller runs. A
@@ -1822,7 +1826,7 @@ fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
 	assert!(DONE.load(Ordering::SeqCst), "the wait-set thread ran to completion");
 }
 
-tagged_test!(a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing, [Process, Syscall, Ipc]);
+tagged_test!(a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing() {
 	// The registration-lifetime question, answered and asserted.
 	//
@@ -1858,7 +1862,7 @@ fn a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing() {
 	assert!(DONE.load(Ordering::SeqCst), "the lifetime thread ran to completion");
 }
 
-tagged_test!(a_wait_set_has_a_ceiling_and_says_so, [Process, Syscall, Ipc]);
+tagged_test!(a_wait_set_has_a_ceiling_and_says_so, [Process, Syscall, Ipc], covers = ["kernel"]);
 fn a_wait_set_has_a_ceiling_and_says_so() {
 	// A set is kernel memory whose size a userspace caller decides, which is the shape of every
 	// quota in this kernel and gets the same treatment: a fixed ceiling first, then a fallible
@@ -1896,7 +1900,7 @@ fn a_wait_set_has_a_ceiling_and_says_so() {
 	assert!(DONE.load(Ordering::SeqCst), "the ceiling thread ran to completion");
 }
 
-tagged_test!(a_secure_random_syscall_refuses_rather_than_answering_from_a_formula, [Syscall, Process]);
+tagged_test!(a_secure_random_syscall_refuses_rather_than_answering_from_a_formula, [Syscall, Process], covers = ["kernel"]);
 fn a_secure_random_syscall_refuses_rather_than_answering_from_a_formula() {
 	// There was ONE syscall. It answered from the CPU's hardware source where there was one and from
 	// a clock-seeded formula where there was not, and userspace saw one answer either way - so

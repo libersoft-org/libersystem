@@ -1,7 +1,7 @@
 use super::register;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-crate::tagged_test!(handler_registration_dispatch, [Interrupt, Kernel, ArchX86_64]);
+crate::tagged_test!(handler_registration_dispatch, [Interrupt, Kernel, ArchX86_64], covers = ["kernel"]);
 fn handler_registration_dispatch() {
 	static FIRED: AtomicBool = AtomicBool::new(false);
 	fn handler(_vector: u8) {

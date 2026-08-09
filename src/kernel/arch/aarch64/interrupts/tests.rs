@@ -4,7 +4,7 @@ use crate::object::interrupt::Interrupt;
 
 // The AArch64 counterpart of the x86 INTx tests: every device interrupt is MSI-X
 // delivered through the GICv2m frame. There is no bindable wired vector.
-crate::tagged_test!(gicv2m_msi_binds_and_dispatch_signals_the_driver, [Interrupt, Drivers, ArchAarch64]);
+crate::tagged_test!(gicv2m_msi_binds_and_dispatch_signals_the_driver, [Interrupt, Drivers, ArchAarch64], covers = ["kernel"]);
 fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
 	// A frame stands in for a device's MSI-X table: acquire_msi programs entry 0 into it
 	// (message address = the GICv2m frame's MSI_SETSPI_NS, message data = the SPI).
@@ -31,7 +31,7 @@ fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
 	unsafe { frame::deallocate(table) };
 }
 
-crate::tagged_test!(gicv2m_msi_inventory_reports_the_timer_and_msi_vectors, [Interrupt, Drivers, ArchAarch64]);
+crate::tagged_test!(gicv2m_msi_inventory_reports_the_timer_and_msi_vectors, [Interrupt, Drivers, ArchAarch64], covers = ["kernel"]);
 fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 	// Index 0 of the AArch64 IRQ inventory (what `lsirq` reads) is the kernel's own EL1
 	// physical-timer PPI (INTID 30), always in use and reported as a fixed vector - the

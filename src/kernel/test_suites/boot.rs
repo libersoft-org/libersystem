@@ -1,6 +1,6 @@
 use super::*;
 
-tagged_test!(system_packages_use_canonical_executable_names, [Boot, Storage, VolumeLayout]);
+tagged_test!(system_packages_use_canonical_executable_names, [Boot, Storage, VolumeLayout], covers = ["kernel", "liberfs"]);
 fn system_packages_use_canonical_executable_names() {
 	let init = pkg::Package::parse(init_package_bytes().expect("init package present")).expect("init package parses");
 	let volume = pkg::Package::parse(volume_package_bytes().expect("volume package present")).expect("volume package parses");
@@ -39,7 +39,7 @@ fn system_packages_use_canonical_executable_names() {
 // failed to report in there - which turned out to be the riscv trap-frame register clobber
 // (a trap could corrupt the interrupted thread's t0/x5), not an interrupt-timing issue;
 // with that fixed the chain settles deterministically on riscv64 too.
-tagged_test!(init_package_starts_system_manager, [Boot, Service, VolumeLayout]);
+tagged_test!(init_package_starts_system_manager, [Boot, Service, VolumeLayout], covers = ["kernel", "liberfs"]);
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
@@ -144,7 +144,7 @@ fn init_package_starts_system_manager() {
 	assert_eq!(actual_lifecycle_reports, expected_lifecycle_reports, "lifecycle drill reports must preserve their causal order");
 }
 
-tagged_test!(system_volume_formats_to_the_disks_capacity, [Service, Storage, Filesystem, Slow]);
+tagged_test!(system_volume_formats_to_the_disks_capacity, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "partition", "storage"]);
 fn system_volume_formats_to_the_disks_capacity() {
 	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
@@ -243,7 +243,7 @@ fn system_volume_formats_to_the_disks_capacity() {
 	assert_eq!((failures, damaged), (0, 0), "a fresh volume is clean");
 }
 
-tagged_test!(storage_harness_mounts_seeded_fat16, [Storage, Filesystem]);
+tagged_test!(storage_harness_mounts_seeded_fat16, [Storage, Filesystem], covers = ["fat", "kernel", "liberfs", "storage"]);
 fn storage_harness_mounts_seeded_fat16() {
 	let (_, package) = scenario_packages().expect("scenario packages");
 	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
@@ -252,7 +252,7 @@ fn storage_harness_mounts_seeded_fat16() {
 	assert_eq!(storage.open(b"vol://media/HELLO.TXT", 0xfa16), Some(b"hello".to_vec()));
 }
 
-tagged_test!(system_volume_lands_in_a_gpt_partition, [Service, Storage, Filesystem, Slow]);
+tagged_test!(system_volume_lands_in_a_gpt_partition, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "partition", "storage"]);
 fn system_volume_lands_in_a_gpt_partition() {
 	use alloc::collections::BTreeMap;
 	use object::channel::Channel;
@@ -305,7 +305,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 	assert!(disk.get(&FALLBACK_START_SECTOR).is_none_or(|sector| &sector[0..8] != b"LIBERFS1"), "a GPT disk must carry its volume in the partition, not at LBA 0");
 }
 
-tagged_test!(a_degenerate_gpt_entry_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);
+tagged_test!(a_degenerate_gpt_entry_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "partition", "storage"]);
 fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	use alloc::collections::BTreeMap;
 	use object::channel::Channel;
@@ -390,7 +390,7 @@ fn storage_on_disk(disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<
 	false
 }
 
-tagged_test!(an_mbr_partitioned_disk_is_not_a_disk_to_format, [Service, Storage, Filesystem, Slow]);
+tagged_test!(an_mbr_partitioned_disk_is_not_a_disk_to_format, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "partition", "storage"]);
 fn an_mbr_partitioned_disk_is_not_a_disk_to_format() {
 	use alloc::collections::BTreeMap;
 
@@ -416,7 +416,7 @@ fn an_mbr_partitioned_disk_is_not_a_disk_to_format() {
 	assert_eq!(disk.len(), 1, "nothing at all may be written to a disk that belongs to something else");
 }
 
-tagged_test!(a_foreign_superfloppy_is_not_a_disk_to_format, [Service, Storage, Filesystem, Slow]);
+tagged_test!(a_foreign_superfloppy_is_not_a_disk_to_format, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "partition", "storage"]);
 fn a_foreign_superfloppy_is_not_a_disk_to_format() {
 	use alloc::collections::BTreeMap;
 
@@ -441,7 +441,7 @@ fn a_foreign_superfloppy_is_not_a_disk_to_format() {
 	assert_eq!(disk.len(), 1, "nothing may be written over somebody else's filesystem");
 }
 
-tagged_test!(a_volume_on_the_whole_device_survives_a_remount, [Service, Storage, Filesystem, Slow]);
+tagged_test!(a_volume_on_the_whole_device_survives_a_remount, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "storage"]);
 fn a_volume_on_the_whole_device_survives_a_remount() {
 	use alloc::collections::BTreeMap;
 
@@ -460,7 +460,7 @@ fn a_volume_on_the_whole_device_survives_a_remount() {
 	assert_eq!(disk.get(&0), volume.get(&0), "a remount does not rewrite the volume it found");
 }
 
-tagged_test!(garbage_where_the_superblock_should_be_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow]);
+tagged_test!(garbage_where_the_superblock_should_be_cannot_kill_the_storage_service, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "storage"]);
 fn garbage_where_the_superblock_should_be_cannot_kill_the_storage_service() {
 	use alloc::collections::BTreeMap;
 
@@ -489,7 +489,7 @@ fn garbage_where_the_superblock_should_be_cannot_kill_the_storage_service() {
 	assert_eq!(disk.len(), 1, "and nothing may be written anywhere else either");
 }
 
-tagged_test!(a_raw_foreign_filesystem_past_the_first_sector_is_not_formatted, [Service, Storage, Filesystem, Slow]);
+tagged_test!(a_raw_foreign_filesystem_past_the_first_sector_is_not_formatted, [Service, Storage, Filesystem, Slow], covers = ["kernel", "liberfs", "storage"]);
 fn a_raw_foreign_filesystem_past_the_first_sector_is_not_formatted() {
 	use alloc::collections::BTreeMap;
 
@@ -510,7 +510,7 @@ fn a_raw_foreign_filesystem_past_the_first_sector_is_not_formatted() {
 	assert_eq!(disk.len(), 1, "and nothing may be written over the rest of it");
 }
 
-tagged_test!(system_manager_recovery_escalates_after_repeated_crashes, [Process]);
+tagged_test!(system_manager_recovery_escalates_after_repeated_crashes, [Process], covers = ["kernel", "liberfs"]);
 fn system_manager_recovery_escalates_after_repeated_crashes() {
 	use object::KernelObject;
 	// The kernel supervises SystemManager: if it faults, the kernel starts a
@@ -528,7 +528,7 @@ fn system_manager_recovery_escalates_after_repeated_crashes() {
 	assert!(!up, "a SystemManager that faults on every attempt must exhaust recovery and escalate");
 }
 
-tagged_test!(system_manager_recovery_survives_a_clean_start, [Process]);
+tagged_test!(system_manager_recovery_survives_a_clean_start, [Process], covers = ["kernel", "liberfs"]);
 fn system_manager_recovery_survives_a_clean_start() {
 	use object::KernelObject;
 	// A SystemManager that does not fault must survive on the first attempt, so

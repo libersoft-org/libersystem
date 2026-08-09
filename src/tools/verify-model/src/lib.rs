@@ -140,6 +140,13 @@ pub fn staged_components(manifest: &system_manifest::Manifest, crates: &[Crate],
 		let dir = format!("src/{}", source.path.as_str());
 		let Some(entry) = crates.iter().find(|entry| entry.dir == dir) else { continue };
 		components.extend(graph.reaches(&entry.name, &["link.static", "link.dynamic", "generation.build"]));
+		// And the PROGRAMS that crate builds. A tool's own source file resolves to its `bin.`
+		// component, which is a longer prefix than the crate directory - so without this a change to
+		// `audioconv.rs` compiled the tool and never staged it, and the guest booted the previous
+		// one out of a volume the staleness check was happy with.
+		for binary in &entry.binaries {
+			components.extend(graph.reaches(&crate::graph::binary_component(&binary.name), &["link.static", "link.dynamic", "generation.build"]));
+		}
 	}
 	components
 }

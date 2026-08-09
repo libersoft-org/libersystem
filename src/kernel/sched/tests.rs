@@ -1,6 +1,6 @@
 use crate::{arch, sched, smp};
 
-crate::tagged_test!(scheduler_multiplexes_threads, [Scheduler, Smoke]);
+crate::tagged_test!(scheduler_multiplexes_threads, [Scheduler, Smoke], covers = ["kernel"]);
 fn scheduler_multiplexes_threads() {
 	use core::sync::atomic::{AtomicU32, Ordering};
 	static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -25,7 +25,7 @@ fn scheduler_multiplexes_threads() {
 }
 
 #[cfg(target_arch = "x86_64")]
-crate::tagged_test!(scheduler_preserves_xmm_state, [Scheduler]);
+crate::tagged_test!(scheduler_preserves_xmm_state, [Scheduler], covers = ["kernel"]);
 #[cfg(target_arch = "x86_64")]
 fn scheduler_preserves_xmm_state() {
 	use core::arch::asm;
@@ -53,7 +53,7 @@ fn scheduler_preserves_xmm_state() {
 	assert!(!FAILED.load(Ordering::SeqCst), "one thread observed another thread's XMM state");
 }
 
-crate::tagged_test!(preemption_preempts_a_cpu_bound_thread, [Scheduler]);
+crate::tagged_test!(preemption_preempts_a_cpu_bound_thread, [Scheduler], covers = ["kernel"]);
 fn preemption_preempts_a_cpu_bound_thread() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static STOP: AtomicBool = AtomicBool::new(false);
@@ -81,7 +81,7 @@ fn preemption_preempts_a_cpu_bound_thread() {
 	assert!(MATE_RAN.load(Ordering::SeqCst), "the cohabiting thread never ran: the never-yielding thread was not preempted");
 }
 
-crate::tagged_test!(a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick, [Scheduler]);
+crate::tagged_test!(a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick, [Scheduler], covers = ["kernel"]);
 fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	static RAN_AT: AtomicU64 = AtomicU64::new(0);
@@ -136,7 +136,7 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	assert!(best < TRIP_BOUND_NS, "a remote spawn waited out the tick ({best} ns at best): the wake IPI did not reach the halted core");
 }
 
-crate::tagged_test!(scheduler_runs_across_cores, [Scheduler]);
+crate::tagged_test!(scheduler_runs_across_cores, [Scheduler], covers = ["kernel"]);
 fn scheduler_runs_across_cores() {
 	use core::sync::atomic::{AtomicU32, Ordering};
 	static CROSS: AtomicU32 = AtomicU32::new(0);

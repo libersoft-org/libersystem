@@ -2,7 +2,7 @@ use super::{Handle, HandleError, HandleTable};
 use crate::object::rights::Rights;
 use crate::object::tests::TestObject;
 
-crate::tagged_test!(capability_grants_no_operation_beyond_rights, [Handle, Object, Kernel]);
+crate::tagged_test!(capability_grants_no_operation_beyond_rights, [Handle, Object, Kernel], covers = ["kernel"]);
 fn capability_grants_no_operation_beyond_rights() {
 	// Property: a handle grants no operation beyond the rights it carries. Across many random
 	// granted-rights sets and random probe rights, a rights-checked lookup succeeds exactly
@@ -25,7 +25,7 @@ fn capability_grants_no_operation_beyond_rights() {
 	}
 }
 
-crate::tagged_test!(capability_attenuation_only_narrows, [Handle, Object, Kernel]);
+crate::tagged_test!(capability_attenuation_only_narrows, [Handle, Object, Kernel], covers = ["kernel"]);
 fn capability_attenuation_only_narrows() {
 	// Property: duplicating a capability can only narrow it, never widen it. Across many
 	// random grants (carrying the DUPLICATE right) and random requests, duplication succeeds
@@ -63,7 +63,7 @@ fn capability_attenuation_only_narrows() {
 	}
 }
 
-crate::tagged_test!(no_ambient_authority_fresh_table_empty, [Handle, Object, Kernel]);
+crate::tagged_test!(no_ambient_authority_fresh_table_empty, [Handle, Object, Kernel], covers = ["kernel"]);
 fn no_ambient_authority_fresh_table_empty() {
 	// A newly created handle table holds nothing: a process begins with no ambient authority
 	// and can reach only capabilities explicitly handed to it. The table is empty, and every
