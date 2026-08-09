@@ -199,6 +199,8 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0148 - Testing that scales with the change, not with the tree](M0148.md)
 - [ ] [M0149 - A fault in a user copy must be an error, not a dead kernel](M0149.md)
 - [ ] [M0150 - A free must never lose the memory it frees](M0150.md)
+- [ ] [M0151 - A receive that takes a message must be able to deliver it](M0151.md)
+- [ ] [M0152 - What authorises a write to somebody's disk](M0152.md)
 
 ### Definition of done (phase 2)
 
