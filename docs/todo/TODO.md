@@ -201,6 +201,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0150 - A free must never lose the memory it frees](M0150.md)
 - [ ] [M0151 - A receive that takes a message must be able to deliver it](M0151.md)
 - [ ] [M0152 - What authorises a write to somebody's disk](M0152.md)
+- [ ] [M0153 - What a mount allocates, and what a write may assume about what it found](M0153.md)
 
 ### Definition of done (phase 2)
 
