@@ -193,6 +193,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0156 - What the ISO9660 backend accepts, and the threat model it states](M0156.md)
 - [ ] [M0157 - The ABI's own guarantee, which is the one thing it cannot get wrong](M0157.md)
 - [ ] [M0158 - The terminal's state machine, and the one safe function that is not safe](M0158.md)
+- [ ] [M0159 - What the loader assumes about the machine it is running on](M0159.md)
 
 ### Definition of done (phase 2)
 
