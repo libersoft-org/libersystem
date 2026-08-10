@@ -699,6 +699,13 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64, privilege: u64) -> i64 {
 		return ERR_NO_MEMORY;
 	}
 	if let Err(e) = write_user(buf_ptr, geom) {
+		// The reply did not reach the caller, so the mapping must not stay: the caller is told the
+		// call failed and would have no reason - or any way - to unmap a framebuffer it was never
+		// given the address of. Everything this call built comes back out, in reverse.
+		for i in 0..pages {
+			arch::paging::unmap_page(base + i * PAGE_SIZE);
+		}
+		free_vrange(Some(&space), base, total);
 		return e;
 	}
 	// Hand the display to the caller: the kernel console stops drawing to it.
@@ -1398,6 +1405,13 @@ fn sys_thread_start(thread_handle: u64) -> i64 {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
+	// The PROCESS, not only the thread. `try_start` answers "has this thread been started before",
+	// which says nothing about whether the process it belongs to is still alive - so a thread built
+	// through the race this milestone closes could be enqueued into a process that had already been
+	// killed, with its handles closed and its mappings gone.
+	if target.process().is_terminating() {
+		return ERR_INVALID;
+	}
 	if sched::thread_start(target) { 0 } else { ERR_INVALID }
 }
 
@@ -2032,7 +2046,7 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 	// shape, installing handles counted from one message against a reservation paid for another -
 	// and the reservation was never returned when the recv then failed, so the race leaked handle
 	// quota even when it delivered nothing.
-	let message = match receive_transactionally(&thread, &channel, bytes_cap as usize, abi::MAX_MESSAGE_CAPS) {
+	let mut message = match receive_transactionally(&thread, &channel, bytes_cap as usize, abi::MAX_MESSAGE_CAPS) {
 		Ok(message) => message,
 		Err(error) => return error,
 	};
@@ -2050,6 +2064,10 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 		channel.return_to_head(message);
 		return error;
 	}
+	// Delivery is committed here: the payload is in the caller's buffer and the message cannot go
+	// back to the queue, so this is where the sender's queued-bytes charge is released. Everything
+	// before this point can still `return_to_head`, and does so with the charge intact.
+	message.release_queue_charge();
 	let delivered = message.bytes.len();
 	let mut raws = [0u64; abi::MAX_MESSAGE_CAPS];
 	let mut installed = 0usize;
@@ -2105,7 +2123,7 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 	// refusal would convert a handled shortfall into an aborted stream. The multi-cap receive
 	// refuses instead, because its callers know the shape they are expecting and a message that
 	// does not fit is one they can come back for.
-	let message = match receive_transactionally(&thread, channel, usize::MAX, 1) {
+	let mut message = match receive_transactionally(&thread, channel, usize::MAX, 1) {
 		Ok(message) => message,
 		Err(error) => return error,
 	};
@@ -2123,6 +2141,8 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 			return error;
 		}
 	}
+	// Committed, for the same reason as the batch path: past here the message is the caller's.
+	message.release_queue_charge();
 	thread.process().record_recv();
 	// Install the transferred capability (if any) and report its new handle. Against the
 	// reservation taken above: `insert` is the UNBOUNDED install, and using it here is how a

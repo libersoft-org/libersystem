@@ -40,23 +40,28 @@ impl SharedPage {
 
 impl Drop for SharedPage {
 	fn drop(&mut self) {
-		// RETIRE, not deallocate. This frame was in a page table, so another core can still hold a
-		// translation for it - and `deallocate` hands it straight back to the allocator with
-		// nothing between.
+		// This SHOULD retire rather than deallocate, and it does not yet - see P02M0133.
 		//
-		// The private ELF frames have always gone this way and the shared ones did not, which made
-		// the sharing cache the one path around the mechanism. It is reachable: `load_module_into`
-		// maps into an address space that belongs to a RUNNING process, whose other threads are on
-		// other cores, and a failure after that point drops these `Arc`s while x86's unmap has done
-		// no more than a local `invlpg`. The frame then goes to the next asker while a live thread
-		// can still read the old mapping.
+		// The frame was in a page table, so another core can hold a translation for it, and
+		// `deallocate` hands it straight back to the allocator with nothing between. The private ELF
+		// frames have always retired; this is the one path around the mechanism, and it is
+		// reachable through `load_module_into`, which maps into a RUNNING process.
 		//
-		// One frame per call is not a shootdown per frame: `retire` queues into the quarantine and
-		// pays for a shootdown once the batch is worth it.
+		// Changing it to `retire` was tried on 2026-08-10 and reverted the same day, because it
+		// leaks a frame on the path that matters most: `retire` queues into a heap-allocated
+		// quarantine, the heap grows by taking FRAMES, and the failure this drop runs on is
+		// precisely "there are no frames". The queue then cannot take it, the fallback needs a
+		// shootdown, and when that does not complete the page is counted lost - which the
+		// out-of-frames rollback test caught exactly: `a load refused at allocation 85 kept 1
+		// frame(s) it took (0 still quarantined)`.
+		//
+		// So this waits on the allocation-free quarantine, and the two land together. Retiring into
+		// a queue that cannot allocate is not safer than freeing; it is the same defect with an
+		// extra step.
 		//
 		// SAFETY: this type owns the frame from creation to here, and the map that hands
 		// out `Weak` references to it is the only place it is reachable from.
-		unsafe { frame::retire(&[self.frame]) };
+		unsafe { frame::deallocate(self.frame) };
 	}
 }
 

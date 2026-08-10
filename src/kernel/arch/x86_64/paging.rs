@@ -181,6 +181,20 @@ fn table_ptr(phys: u64) -> *mut u64 {
 // is OR-ed into both new and pre-existing intermediate entries.
 //
 // SAFETY: `table` must point at a valid 512-entry page table.
+// `next_table_create`, plus whether this call is the one that CREATED the level.
+//
+// The fallible mapper needs to know which levels it brought into being so a failure further down
+// can take them back out; a level that was already there belongs to somebody else's mapping and
+// must survive.
+unsafe fn next_table_create_tracked(table: *mut u64, index: usize, parent_flags: u64) -> Option<(u64, bool)> {
+	unsafe {
+		let entry = table.add(index);
+		let existed = entry.read_volatile() & PRESENT != 0;
+		let phys = next_table_create(table, index, parent_flags)?;
+		Some((phys, !existed))
+	}
+}
+
 unsafe fn next_table_create(table: *mut u64, index: usize, parent_flags: u64) -> Option<u64> {
 	unsafe {
 		let entry = table.add(index);
@@ -290,10 +304,63 @@ pub fn try_map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> Resu
 	// stays leaf-only: an intermediate NX would blanket the whole subtree.
 	let parent_flags = flags & USER;
 	unsafe {
+		// The levels this call CREATES, so a failure further down can give them back.
+		//
+		// They used to stay: a walk that got two levels in and then could not allocate the third
+		// returned `Err` with two fresh page-table frames attached to the address space, while the
+		// comment above said nothing is left mapped on failure - true of the leaf, and not of the
+		// metadata. Repeated partial failures pinned frames the domain's memory quota never saw.
 		let pml4 = table_ptr(pml4_phys);
-		let pdpt = table_ptr(next_table_create(pml4, table_index(virt, 39), parent_flags).ok_or(())?);
-		let pd = table_ptr(next_table_create(pdpt, table_index(virt, 30), parent_flags).ok_or(())?);
-		let pt = table_ptr(next_table_create(pd, table_index(virt, 21), parent_flags).ok_or(())?);
+		// (the entry that points at it, the frame). BOTH are needed: freeing the frame without
+		// clearing the entry leaves a live page-table pointer to memory the allocator has given
+		// away, which is worse than the leak this replaces.
+		let mut created: [(*mut u64, u64); 3] = [(core::ptr::null_mut(), 0); 3];
+		let mut created_len = 0usize;
+		let mut level = |table: *mut u64, index: usize| -> Result<*mut u64, ()> {
+			let (phys, fresh) = next_table_create_tracked(table, index, parent_flags).ok_or(())?;
+			if fresh {
+				created[created_len] = (table.add(index), phys);
+				created_len += 1;
+			}
+			Ok(table_ptr(phys))
+		};
+		let unwind = |created: &[(*mut u64, u64); 3], len: usize| {
+			// In reverse, so no level is ever detached through a parent that has already gone: the
+			// entry is cleared FIRST, then the frame is retired, so nothing can reach it in between.
+			for &(entry, phys) in created.iter().take(len).rev() {
+				entry.write_volatile(0);
+				crate::mem::frame::retire(&[phys]);
+			}
+			// Drained here rather than left for the next batch. A level the CPU may have walked
+			// speculatively has to go through the shootdown, so `retire` is right - but this is the
+			// out-of-memory path, and the whole reason it is running is that somebody needs those
+			// frames back NOW. Leaving them in quarantine gives the caller an allocation failure
+			// while holding the memory that would have satisfied it.
+			if len > 0 {
+				crate::mem::frame::drain_quarantine();
+			}
+		};
+		let pdpt = match level(pml4, table_index(virt, 39)) {
+			Ok(table) => table,
+			Err(()) => {
+				unwind(&created, created_len);
+				return Err(());
+			}
+		};
+		let pd = match level(pdpt, table_index(virt, 30)) {
+			Ok(table) => table,
+			Err(()) => {
+				unwind(&created, created_len);
+				return Err(());
+			}
+		};
+		let pt = match level(pd, table_index(virt, 21)) {
+			Ok(table) => table,
+			Err(()) => {
+				unwind(&created, created_len);
+				return Err(());
+			}
+		};
 		let entry = pt.add(table_index(virt, 12));
 		// Refuse to replace a live mapping. The write was unconditional, so mapping over
 		// an existing page silently dropped the frame that was there: a second load

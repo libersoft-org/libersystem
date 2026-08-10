@@ -325,7 +325,7 @@ impl Process {
 		// holding a handle can delay for as long as it likes. `Terminated` then meant "the threads
 		// are finished" rather than "the address space is frozen", and the two paths to the same
 		// state did different amounts of it.
-		self.terminating.store(true, Ordering::Release);
+		self.begin_teardown();
 		self.unmap_objects();
 		self.handles.lock().close_all();
 		self.exited.store(true, Ordering::Release);
@@ -341,9 +341,35 @@ impl Process {
 
 	// Record a thread as belonging to this process (a weak forward link), so signal
 	// delivery can reach it. Called as the thread is built.
-	pub fn register_thread(&self, thread: &Arc<Thread>) {
+	// Take a new thread into this process, or refuse because the process is going away.
+	//
+	// The refusal is decided UNDER the `threads` lock, and `begin_teardown` sets the flag while
+	// holding the same lock - so the two orderings that used to race cannot interleave any more. A
+	// caller that read `is_terminating() == false` and then built a thread could previously register
+	// it after `close_all` had run: the process acquired a thread after its cleanup, with its
+	// handles gone and its mappings dropped.
+	//
+	// This is the contained half of the lifecycle barrier. The general shape - `Live | Terminating |
+	// Dead` with a guard every resource-extending syscall holds - is still worth having; what is
+	// closed here is the one path that demonstrably ends with a live thread inside a dead process.
+	#[must_use]
+	pub fn register_thread(&self, thread: &Arc<Thread>) -> bool {
+		let mut threads = self.threads.lock();
+		if self.terminating.load(Ordering::Acquire) {
+			return false;
+		}
 		self.live_thread_count.fetch_add(1, Ordering::AcqRel);
-		self.threads.lock().push(Arc::downgrade(thread));
+		threads.push(Arc::downgrade(thread));
+		true
+	}
+
+	// Publish "this process is going away" so no further thread can join it.
+	//
+	// Under the `threads` lock, which is what makes it a barrier rather than a second racing flag:
+	// a `register_thread` either sees the flag and refuses, or completes before this returns.
+	fn begin_teardown(&self) {
+		let _threads = self.threads.lock();
+		self.terminating.store(true, Ordering::Release);
 	}
 
 	// One thread of this process has finished. Returns true for the thread that was the
@@ -471,7 +497,11 @@ impl Process {
 		// Terminating FIRST, terminal last. Everything that could add to what has to be
 		// cleaned up refuses from here, so the cleanup below sees a set that cannot grow
 		// under it; `killed` is published at the end, when it is true.
-		self.terminating.store(true, Ordering::Release);
+		//
+		// Through `begin_teardown`, which publishes under the `threads` lock: the flag alone was a
+		// second racing atomic, and a `register_thread` that had already passed its check could
+		// still land after `close_all`.
+		self.begin_teardown();
 		self.unmap_objects();
 		self.handles.lock().close_all();
 		self.killed.store(true, Ordering::Release);

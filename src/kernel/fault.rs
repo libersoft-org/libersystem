@@ -77,6 +77,19 @@ pub fn grow_user_stack(address: u64, error_code: u64) -> bool {
 		// SAFETY: allocated a few lines above, never mapped (the map is what just failed),
 		// and not handed to the process.
 		unsafe { frame::deallocate(new_frame) };
+		// Unless somebody else already mapped it - which is the ordinary outcome when two threads
+		// of one process fault on the same stack page at once. The loser used to return false and
+		// the fault handler reads that as unhandled, so the process was killed for a page that had
+		// just been provided for it. Nothing was wrong except the order the two faults arrived in.
+		//
+		// The permissions are checked as well as the presence: a mapping that is there but not
+		// writable-user is not the growth this thread needed, and treating it as one would hand the
+		// thread straight back into the same fault.
+		// The fault is taken in the faulting thread's own address space, so this reads the
+		// mapping that matters without switching anything.
+		if arch::paging::translate_flags(page).is_some_and(|mapped| mapped & arch::paging::WRITABLE != 0 && mapped & arch::paging::USER != 0) {
+			return true;
+		}
 		return false;
 	}
 	process.adopt_frames(alloc::vec![new_frame]);

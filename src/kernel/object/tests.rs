@@ -449,3 +449,32 @@ fn a_table_torn_down_mid_transfer_does_not_hand_the_slot_out_twice() {
 	assert!(table.lookup(moving, Rights::READ).is_ok(), "the restored capability is reachable at its own handle");
 	assert!(table.lookup(keep, Rights::READ).is_err(), "everything else was closed");
 }
+
+crate::tagged_test!(a_returned_message_is_still_charged_to_the_sender, [Channel, Object, Kernel], id = "kernel.object.channel.a_returned_message_is_still_charged_to_the_sender", covers = ["kernel"]);
+fn a_returned_message_is_still_charged_to_the_sender() {
+	use crate::object::channel::{Channel, Message};
+	use crate::object::domain::Domain;
+	// The queued-bytes charge used to be refunded when a message left the queue, which made a
+	// receive that then failed its copy put an UNACCOUNTED message back through `return_to_head` -
+	// and past the limit. The charge now travels with the message and is released only when
+	// delivery commits, so a message that goes back is a message that was never uncounted.
+	let domain = Domain::root();
+	let (a, b) = Channel::create();
+	let payload = alloc::vec![7u8; 64];
+	let bytes = payload.len() as u64;
+	let before = domain.account().ipc_queue().used();
+	a.send_charged(Message::new(payload, alloc::vec::Vec::new(), 0), &domain).expect("the send is accepted and charged");
+	let charged = domain.account().ipc_queue().used();
+	assert_eq!(charged, before + bytes, "the sender is charged for what is queued");
+
+	// Take it off the queue the way a receive does, and put it back without committing.
+	let message = b.recv().expect("the message is there to take");
+	assert_eq!(domain.account().ipc_queue().used(), charged, "taking a message off the queue does not refund it - delivery has not committed");
+	b.return_to_head(message);
+	assert_eq!(domain.account().ipc_queue().used(), charged, "a returned message is still accounted for");
+
+	// And committing releases it exactly once.
+	let mut message = b.recv().expect("still there");
+	message.release_queue_charge();
+	assert_eq!(domain.account().ipc_queue().used(), before, "a committed delivery releases the charge");
+}

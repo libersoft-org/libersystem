@@ -31,7 +31,14 @@ impl VaPool {
 	// Hand out a page-aligned range of at least `len` bytes, or 0 when the window
 	// is exhausted (free list and bump both).
 	pub fn alloc(&mut self, len: u64) -> u64 {
-		let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+		// Checked, because an allocator's safety should not be a property of its callers.
+		//
+		// `len.div_ceil(PAGE_SIZE) * PAGE_SIZE` and `self.next + len` both wrap in release, and
+		// today's syscall limits happen to stop the values that would reach them. That is a
+		// guarantee held somewhere else, by code that has no idea it is holding it.
+		let Some(len) = len.checked_next_multiple_of(PAGE_SIZE) else {
+			return 0;
+		};
 		if len == 0 {
 			return 0;
 		}
@@ -46,7 +53,10 @@ impl VaPool {
 				return base;
 			}
 		}
-		if self.next + len > self.end {
+		let Some(after) = self.next.checked_add(len) else {
+			return 0;
+		};
+		if after > self.end {
 			return 0;
 		}
 		let base = self.next;
@@ -57,7 +67,13 @@ impl VaPool {
 	// Return a range to the pool, merging it with adjacent free ranges. A range
 	// ending at the bump cursor folds back into the bump instead.
 	pub fn free(&mut self, base: u64, len: u64) {
-		let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+		let Some(len) = len.checked_next_multiple_of(PAGE_SIZE) else {
+			return;
+		};
+		let Some(end) = base.checked_add(len) else {
+			return;
+		};
+		let _ = end;
 		if len == 0 {
 			return;
 		}

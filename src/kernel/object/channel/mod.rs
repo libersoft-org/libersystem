@@ -87,6 +87,15 @@ impl Message {
 		true
 	}
 
+	// Release the queued-bytes charge: delivery is committed, or the message is being destroyed.
+	//
+	// Public because the commit point is the SYSCALL's, not this module's: the message is off the
+	// queue and in hand well before the caller knows whether it can take it, and a message that goes
+	// back to the head must go back still accounted for.
+	pub fn release_queue_charge(&mut self) {
+		self.take_queue_charge();
+	}
+
 	// Refund and clear any queued-bytes charge. Called when the message leaves the
 	// queue: by recv on the way out, or when a closing endpoint drops its inbox.
 	fn take_queue_charge(&mut self) {
@@ -209,9 +218,15 @@ impl Channel {
 			let was_full = inbox.len() >= self.limit;
 			inbox.pop_front().map(|msg| (msg, was_full))
 		};
-		if let Some((mut msg, was_full)) = popped {
-			// The message has left the queue: refund the sender's queued-bytes charge.
-			msg.take_queue_charge();
+		if let Some((msg, was_full)) = popped {
+			// The charge STAYS with the message until delivery commits.
+			//
+			// It used to be refunded here, on the way out of the queue, and a receive that then
+			// failed its copy to userspace put the message back through `return_to_head` - uncharged,
+			// and past the limit. One receiver at a time that is "one over for an instant"; nothing
+			// serialises these, so N receivers failing their copies concurrently push N messages past
+			// the limit with none of them accounted. The refund belongs at the point of no return,
+			// which is where the caller now performs it.
 			// The queue just left its full state: the peer endpoint is writable again,
 			// so wake any sender blocked (WAIT_WRITABLE) waiting for room.
 			if was_full {
@@ -271,9 +286,9 @@ impl Channel {
 	// its own buffer. The cost is an accounting entry one message light until this one is read; the
 	// alternative is destroying a message the sender was told was delivered.
 	//
-	// It also goes back even when the queue is at its limit - `limit` messages must have arrived in
-	// the window between the take and this call - because one over for that instant costs a bounded
-	// amount of memory that the next receive gives back, and refusing would be the loss again.
+	// It goes back CHARGED, which is what makes the count honest: the queued-bytes charge is no
+	// longer refunded on the way out of the queue, so a message returned here was never unaccounted
+	// and the domain's `ipc_queue` figure never understated what is outstanding.
 	pub fn return_to_head(&self, message: Message) {
 		self.inbox.lock().push_front(message);
 		sched::wake_object(self.header.koid());
@@ -295,8 +310,8 @@ impl Channel {
 				None => None,
 			}
 		};
-		if let Some((mut msg, was_full)) = popped {
-			msg.take_queue_charge();
+		if let Some((msg, was_full)) = popped {
+			// As above: the charge travels with the message and is released when delivery commits.
 			if was_full {
 				if let Some(peer) = self.peer() {
 					sched::wake_object(peer.header.koid());

@@ -192,8 +192,13 @@ impl Thread {
 		let mut stack = KernelStack::allocate()?;
 		let sp = arch::context::init_thread_stack(stack.as_mut_slice(), entry, arg);
 		let thread = Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process });
-		// Forward-link the thread to its process so signal delivery can reach it.
-		thread.process.register_thread(&thread);
+		// Forward-link the thread to its process so signal delivery can reach it - and refuse to
+		// build the thread at all if the process is already tearing down. A thread that cannot be
+		// registered is a thread nothing can signal, reap or account, inside a process whose handles
+		// and mappings are already gone.
+		if !thread.process.register_thread(&thread) {
+			return None;
+		}
 		Some(thread)
 	}
 

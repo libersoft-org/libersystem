@@ -205,6 +205,15 @@ impl Buddy {
 		if order > MAX_ORDER || phys < self.base {
 			return false;
 		}
+		// The ADDRESS has to be page-aligned, not just the page index block-aligned.
+		//
+		// The check below tests `page % (1 << order)`, which for order 0 is vacuous - so
+		// `free(base + 1, 0)` divided down to page 0 and was accepted as a free of the first page.
+		// A frame allocator that accepts an address it never handed out is one whose ownership
+		// record can be made to disagree with reality by an ordinary caller bug.
+		if (phys - self.base) % PAGE_SIZE != 0 {
+			return false;
+		}
 		let page = (phys - self.base) / PAGE_SIZE;
 		if page % (1u64 << order) != 0 || page >= self.pages {
 			return false;
@@ -250,6 +259,11 @@ impl Buddy {
 	// `free_count` and the bitmap invisible.
 	#[must_use]
 	pub fn free_span(&mut self, phys: u64, pages: u64) -> u64 {
+		// `at - self.base` below is computed before anything establishes `at >= base`, which wraps
+		// in release and panics in debug. Bounded here, once, rather than trusted from every caller.
+		if phys < self.base || (phys - self.base) % PAGE_SIZE != 0 {
+			return 0;
+		}
 		let mut at = phys;
 		let mut left = pages;
 		let mut taken_total = 0u64;

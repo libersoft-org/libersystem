@@ -389,10 +389,20 @@ fn parse_madt(hhdm: u64, madt_phys: u64, out: &mut Vec<u32>) {
 	while off + 2 <= len {
 		let etype = unsafe { *base.add(off) };
 		let elen = unsafe { *base.add(off + 1) } as usize;
-		if elen == 0 {
+		// The entry has to fit inside the table it claims to be in, and be at least a header.
+		//
+		// The walk checked `elen == 0` and then trusted the rest: a length running past the table
+		// advanced `off` past the end (where the loop condition catches it, harmlessly) but a length
+		// that merely OVERLAPS the end let the type-0 read below run to `off + 8` on the strength of
+		// its own bound while `elen` said the entry was shorter. Checksum-valid firmware can be
+		// structurally wrong, and this is a boot path with no one to complain to.
+		if elen < 2 || off + elen > len {
 			break;
 		}
-		if etype == 0 && off + 8 <= len {
+		// A Local APIC entry is 8 bytes by the specification. Requiring the DECLARED length to be at
+		// least that - rather than only that the read fits in the table - is what makes the read
+		// consistent with the entry it belongs to.
+		if etype == 0 && elen >= 8 {
 			let apic_id = unsafe { *base.add(off + 3) } as u32;
 			let flags = unsafe { core::ptr::read_unaligned(base.add(off + 4) as *const u32) };
 			if flags & 1 != 0 {
