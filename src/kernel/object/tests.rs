@@ -393,3 +393,59 @@ fn the_console_and_display_syscalls_refuse_a_caller_without_the_capability() {
 	let allowed = RIGHT_KIND_FEED.load(Ordering::SeqCst);
 	assert!(allowed == 0 || allowed == crate::syscall::ERR_WOULD_BLOCK, "console_feed with the matching capability must get past the gate, not be refused by it (got {allowed})");
 }
+
+crate::tagged_test!(a_transfer_that_is_never_committed_is_a_leak_the_table_can_see, [Handle, Object, Kernel], id = "kernel.object.handle.a_transfer_that_is_never_committed_is_a_leak_the_table_can_see", covers = ["kernel"]);
+fn a_transfer_that_is_never_committed_is_a_leak_the_table_can_see() {
+	// `take_for_transfer` empties a slot and RESERVES it, and exactly one of `commit_taken` or
+	// `restore_taken` has to follow. `sys_thread_create`'s success path followed neither, so every
+	// spawn that passed a bootstrap capability left a slot that no longer named anything and could
+	// never be reused - and, through `uncharge_handles`, a unit of the domain's quota with it.
+	//
+	// Both endings are exercised here, because the defect was that one of them was missing.
+	let mut table = HandleTable::new();
+	let handle = table.insert_object(TestObject::new(7), Rights::ALL, 0);
+	assert_eq!(table.len(), 1);
+
+	// Taken: the slot holds nothing, and the handle names nothing.
+	let cap = table.take_for_transfer(handle, Rights::TRANSFER).expect("the capability may be taken for transfer");
+	assert_eq!(table.len(), 0, "a taken capability is not in the table");
+	assert!(table.lookup(handle, Rights::READ).is_err(), "the handle names nothing while the transfer is in flight");
+
+	// Committed: the slot goes back into circulation under a new generation, so the OLD handle
+	// value stays dead and the index is available again.
+	table.commit_taken(handle);
+	let reused = table.insert_object(TestObject::new(9), Rights::ALL, 0);
+	assert!(table.lookup(reused, Rights::READ).is_ok(), "the slot is usable again after a committed transfer");
+	assert!(table.lookup(handle, Rights::READ).is_err(), "the old handle value must not come back to life");
+
+	// Restored: the capability returns to the very handle it was named by, which is what makes a
+	// refused send cost the caller nothing.
+	let cap2 = table.take_for_transfer(reused, Rights::TRANSFER).expect("taken again");
+	table.restore_taken(reused, cap2);
+	assert!(table.lookup(reused, Rights::READ).is_ok(), "a restored capability answers to its original handle");
+	drop(cap);
+}
+
+crate::tagged_test!(a_table_torn_down_mid_transfer_does_not_hand_the_slot_out_twice, [Handle, Object, Kernel], id = "kernel.object.handle.a_table_torn_down_mid_transfer_does_not_hand_the_slot_out_twice", covers = ["kernel"]);
+fn a_table_torn_down_mid_transfer_does_not_hand_the_slot_out_twice() {
+	// `close_all` runs when a process terminates, and a transfer can be in flight when it does.
+	// It used to clear the free list and push EVERY index - including the one reserved for the
+	// transfer - so the `restore_taken` that followed wrote a live capability into a slot that was
+	// simultaneously free, and the next insert could hand the same index to somebody else.
+	let mut table = HandleTable::new();
+	let keep = table.insert_object(TestObject::new(1), Rights::ALL, 0);
+	let moving = table.insert_object(TestObject::new(2), Rights::ALL, 0);
+	let cap = table.take_for_transfer(moving, Rights::TRANSFER).expect("taken for transfer");
+
+	table.close_all();
+
+	// The reserved index is not in circulation, so a fresh insert cannot collide with it.
+	let fresh = table.insert_object(TestObject::new(3), Rights::ALL, 0);
+	assert_ne!(fresh.raw(), moving.raw(), "close_all must not hand out a slot with a transfer in flight");
+	assert!(table.lookup(fresh, Rights::READ).is_ok(), "the fresh handle is live");
+
+	// And the transfer can still end the way it promised to.
+	table.restore_taken(moving, cap);
+	assert!(table.lookup(moving, Rights::READ).is_ok(), "the restored capability is reachable at its own handle");
+	assert!(table.lookup(keep, Rights::READ).is_err(), "everything else was closed");
+}

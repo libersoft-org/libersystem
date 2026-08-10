@@ -18,23 +18,40 @@
 // from deadlocking: a core spinning for acknowledgement holds no lock that an
 // acknowledging core could need.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch;
 
 // The most cores this kernel tracks. Matches the scheduler's own ceiling.
 pub const MAX_CPUS: usize = 64;
 
-// Per-core "flush your translations" flags, set by the requester and cleared by the core
-// that acts on them.
+// Every request carries a GENERATION, and an acknowledgement names the generation it is for.
+//
+// It used to be a flag per core and one counter of acknowledgements, which cannot say WHICH request
+// an acknowledgement belongs to - and the timeout path opens exactly that gap. A requester that
+// gives up releases `IN_FLIGHT` while a slow core may still be between its flush and its increment;
+// the next requester zeroes the counter, the stale increment lands in the new count, and with three
+// or more cores the rest can reach the target while one core never flushed for this request. The
+// caller's next move is to hand the frame back to the allocator.
+//
+// That is not a theoretical window in this tree: the test logs hold 487 `shootdown timed out` lines
+// across all three architectures, so the path that opens it is ordinary rather than exotic.
+//
+// With generations a late acknowledgement carries an older number and simply does not satisfy the
+// newer wait. Nothing has to be reset between requests, which is the other half of the old bug.
 #[allow(clippy::declare_interior_mutable_const)]
-const NO_FLUSH: AtomicBool = AtomicBool::new(false);
-static PENDING: [AtomicBool; MAX_CPUS] = [NO_FLUSH; MAX_CPUS];
+const ZERO: AtomicU64 = AtomicU64::new(0);
 
-// How many cores have acknowledged the request in flight.
-static ACKED: AtomicUsize = AtomicUsize::new(0);
+// The last request number handed out. Requests start at 1, so a core that has acknowledged nothing
+// (0) is behind every real request.
+static REQUEST: AtomicU64 = AtomicU64::new(0);
 
-// Serializes requests: one shootdown at a time, so `ACKED` counts one thing.
+// What each core has been ASKED to flush for, and what it has flushed THROUGH.
+static PENDING_GENERATION: [AtomicU64; MAX_CPUS] = [ZERO; MAX_CPUS];
+static ACK_GENERATION: [AtomicU64; MAX_CPUS] = [ZERO; MAX_CPUS];
+
+// Serializes requests: one shootdown at a time. Kept even though generations no longer need it,
+// because it bounds how far the numbers can run ahead of each other and keeps the wait below simple.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 // Flush every other online core's translations and wait for them to confirm it.
@@ -55,13 +72,13 @@ pub fn shootdown() -> bool {
 		core::hint::spin_loop();
 	}
 	let me = arch::percpu::this_cpu().cpu_id() as usize;
+	let generation = REQUEST.fetch_add(1, Ordering::AcqRel) + 1;
 	let mut targets = 0usize;
-	ACKED.store(0, Ordering::Release);
 	for cpu in 0..cpus.min(MAX_CPUS) {
 		if cpu == me {
 			continue;
 		}
-		PENDING[cpu].store(true, Ordering::Release);
+		PENDING_GENERATION[cpu].store(generation, Ordering::Release);
 		targets += 1;
 	}
 	// The flags are published before the interrupts that tell anyone to look at them.
@@ -84,17 +101,35 @@ pub fn shootdown() -> bool {
 	// but it has to be told.
 	let mut spins: u64 = 0;
 	let mut complete = true;
-	while ACKED.load(Ordering::Acquire) < targets {
+	loop {
+		if acknowledged(cpus, me, generation) == targets {
+			break;
+		}
 		core::hint::spin_loop();
 		spins += 1;
 		if spins > 200_000_000 {
-			crate::serial_println!("tlb: shootdown timed out with {}/{} acknowledgements", ACKED.load(Ordering::Acquire), targets);
+			// Which cores, not how many. "2/7" says a number; the identity of the core that did not
+			// answer is what a person needs to look at next, and it costs one more loop to say.
+			crate::serial_println!("tlb: shootdown {generation} timed out with {}/{} acknowledgements", acknowledged(cpus, me, generation), targets);
+			for cpu in 0..cpus.min(MAX_CPUS) {
+				if cpu != me && ACK_GENERATION[cpu].load(Ordering::Acquire) < generation {
+					crate::serial_println!("tlb:   cpu {cpu} is at generation {} and was asked for {generation}", ACK_GENERATION[cpu].load(Ordering::Acquire));
+				}
+			}
 			complete = false;
 			break;
 		}
 	}
 	IN_FLIGHT.store(false, Ordering::Release);
 	complete
+}
+
+// How many of the other cores have flushed for `generation` or anything later.
+//
+// "Or later" matters: a core that has since served a newer request has necessarily flushed for this
+// one too, because a flush is whole-buffer and the generations are ordered.
+fn acknowledged(cpus: usize, me: usize, generation: u64) -> usize {
+	(0..cpus.min(MAX_CPUS)).filter(|&cpu| cpu != me).filter(|&cpu| ACK_GENERATION[cpu].load(Ordering::Acquire) >= generation).count()
 }
 
 // Act on a pending request for THIS core, if there is one. Called from the wake-IPI
@@ -105,8 +140,13 @@ pub fn service_pending() {
 	if me >= MAX_CPUS {
 		return;
 	}
-	if PENDING[me].swap(false, Ordering::AcqRel) {
+	let wanted = PENDING_GENERATION[me].load(Ordering::Acquire);
+	if wanted > ACK_GENERATION[me].load(Ordering::Acquire) {
 		arch::paging::flush_local_tlb();
-		ACKED.fetch_add(1, Ordering::AcqRel);
+		// `fetch_max`, not a store: this can be re-entered - the idle loop and the wake-IPI handler
+		// both call it - and a plain store could move a core's acknowledgement BACKWARDS if an
+		// outer call read an older `wanted` than an inner one already published. A requester
+		// waiting on the newer generation would then wait for a flush that has already happened.
+		ACK_GENERATION[me].fetch_max(wanted, Ordering::AcqRel);
 	}
 }

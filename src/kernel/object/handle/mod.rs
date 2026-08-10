@@ -121,6 +121,20 @@ impl HandleInfo {
 struct Slot {
 	cap: Option<Capability>,
 	generation: u32,
+	// A transfer is in flight over this slot: `take_for_transfer` emptied it and exactly one of
+	// `commit_taken` or `restore_taken` will follow.
+	//
+	// The state used to be implicit - cap `None` and the index absent from the free list - which no
+	// caller could test and `close_all` therefore could not respect. It cleared the free list and
+	// pushed EVERY index, so a termination racing a transfer put the reserved slot back in
+	// circulation: the following `restore_taken` wrote a live capability into a slot that was
+	// simultaneously free, and the next insert could hand the same index out again. On the other
+	// branch `commit_taken` pushed an index that was already there, and the free list held it twice.
+	//
+	// A `Free | Live | TransferReserved | Retired` enum is the shape this approximates; the flag
+	// carries the one state that was unrepresentable, and `Retired` stays as it was (a generation
+	// that can no longer be advanced), which `close_all` now also respects.
+	reserved: bool,
 }
 
 pub struct HandleTable {
@@ -181,7 +195,7 @@ impl HandleTable {
 			Handle::new(slot.generation, index)
 		} else {
 			let index = self.slots.len() as u32;
-			self.slots.push(Slot { cap: Some(cap), generation: 1 });
+			self.slots.push(Slot { cap: Some(cap), generation: 1, reserved: false });
 			Handle::new(1, index)
 		}
 	}
@@ -446,13 +460,16 @@ impl HandleTable {
 			}
 		}
 		let slot = self.slots.get_mut(index).ok_or(HandleError::BadHandle)?;
-		slot.cap.take().ok_or(HandleError::BadHandle)
+		let cap = slot.cap.take().ok_or(HandleError::BadHandle)?;
+		slot.reserved = true;
+		Ok(cap)
 	}
 
 	// The transfer happened: the handle value dies now, and the quota is refunded.
 	pub fn commit_taken(&mut self, handle: Handle) {
 		let index = handle.index() as usize;
 		if let Some(slot) = self.slots.get_mut(index) {
+			slot.reserved = false;
 			retire_or_recycle(slot, &mut self.free, index);
 		}
 		if let Some(domain) = &self.domain {
@@ -467,6 +484,7 @@ impl HandleTable {
 		let index = handle.index() as usize;
 		if let Some(slot) = self.slots.get_mut(index) {
 			slot.cap = Some(cap);
+			slot.reserved = false;
 			return;
 		}
 		// The slot vanished under us, which nothing in this kernel does while a table is locked.
@@ -498,12 +516,37 @@ impl HandleTable {
 		self.free.clear();
 		for index in 0..self.slots.len() {
 			let slot = &mut self.slots[index];
-			if slot.cap.is_some() {
-				slot.cap = None;
-				slot.generation = slot.generation.wrapping_add(1);
+			// A slot with a transfer in flight is not this function's to reclaim. Its capability is
+			// somewhere else and exactly one of `commit_taken`/`restore_taken` is still to come; put
+			// it on the free list and that call writes into a slot something else may already own.
+			if slot.reserved {
+				continue;
+			}
+			let had = slot.cap.take().is_some();
+			if had {
 				closed += 1;
 			}
-			self.free.push(index as u32);
+			// `wrapping_add` was the other half of it: `close` goes through `retire_or_recycle`
+			// precisely so a slot whose generation cannot advance is retired rather than reused, and
+			// wrapping here walked straight past that - and then pushed the retired slot too. The
+			// rule is one rule, so it is spelled the same way in both places.
+			let retired = if had {
+				match slot.generation.checked_add(1) {
+					Some(next) => {
+						slot.generation = next;
+						false
+					}
+					None => {
+						slot.generation = u32::MAX;
+						true
+					}
+				}
+			} else {
+				slot.generation == u32::MAX
+			};
+			if !retired {
+				self.free.push(index as u32);
+			}
 		}
 		if closed > 0 {
 			if let Some(domain) = &self.domain {

@@ -40,9 +40,23 @@ impl SharedPage {
 
 impl Drop for SharedPage {
 	fn drop(&mut self) {
+		// RETIRE, not deallocate. This frame was in a page table, so another core can still hold a
+		// translation for it - and `deallocate` hands it straight back to the allocator with
+		// nothing between.
+		//
+		// The private ELF frames have always gone this way and the shared ones did not, which made
+		// the sharing cache the one path around the mechanism. It is reachable: `load_module_into`
+		// maps into an address space that belongs to a RUNNING process, whose other threads are on
+		// other cores, and a failure after that point drops these `Arc`s while x86's unmap has done
+		// no more than a local `invlpg`. The frame then goes to the next asker while a live thread
+		// can still read the old mapping.
+		//
+		// One frame per call is not a shootdown per frame: `retire` queues into the quarantine and
+		// pays for a shootdown once the batch is worth it.
+		//
 		// SAFETY: this type owns the frame from creation to here, and the map that hands
 		// out `Weak` references to it is the only place it is reachable from.
-		unsafe { frame::deallocate(self.frame) };
+		unsafe { frame::retire(&[self.frame]) };
 	}
 }
 

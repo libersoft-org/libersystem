@@ -1361,7 +1361,33 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 			return ERR_RESOURCE_EXHAUSTED;
 		}
 	};
-	install_object(&thread, new_thread, Rights::ALL, 0)
+	// The thread's own handle, and only THEN the transfer is committed.
+	//
+	// `install_object` is the last thing that can fail, and it fails against the CALLER's table - so
+	// committing before it would leave the bootstrap capability gone from the caller and the
+	// caller told the call failed. Doing it after means a failure here still has somewhere to put
+	// everything back.
+	let installed = install_object(&thread, new_thread, Rights::ALL, 0);
+	if installed < 0 {
+		if child_bootstrap != 0
+			&& let Ok(cap) = process.handles().lock().take(Handle::from_raw(child_bootstrap), Rights::NONE)
+		{
+			thread.handles().lock().restore_taken(bootstrap, cap);
+		}
+		return installed;
+	}
+	// `take_for_transfer` states the contract in as many words - exactly one of `commit_taken` or
+	// `restore_taken` must follow - and the success path here followed neither.
+	//
+	// The cost was not abstract. `commit_taken` does two things: `retire_or_recycle`, which returns
+	// the slot to the free list under the generation rules, and `uncharge_handles(1)`. Neither
+	// happened, so every successful spawn that passed a bootstrap capability leaked one handle slot
+	// AND one unit of the caller's handle quota - on the ordinary success path of the ordinary spawn
+	// syscall. A supervisor spawning in a loop walks its own quota down until it cannot spawn.
+	if child_bootstrap != 0 {
+		thread.handles().lock().commit_taken(bootstrap);
+	}
+	installed
 }
 
 // Start a suspended thread created by thread_create, enqueueing it to run. Exactly
