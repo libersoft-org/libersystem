@@ -743,7 +743,7 @@ fn the_memory_volumes_bound_expensive_streams() {
 
 tagged_test!(a_services_round_trip_against_its_client_count, [Service, Storage, Stress], id = "kernel.applications.a_services_round_trip_against_its_client_count", covers = ["kernel"]);
 fn a_services_round_trip_against_its_client_count() {
-	// The measurement M0147 asked for FIRST, before anything touches the serve loop.
+	// The measurement P02M0117 asked for FIRST, before anything touches the serve loop.
 	//
 	// What that milestone fixes is a slope: `wait_any` takes a fresh array of handles on every call,
 	// so the kernel registers a waiter on every channel in it and takes them all out again - once

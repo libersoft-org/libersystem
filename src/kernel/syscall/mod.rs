@@ -107,7 +107,7 @@ fn try_zeroed_u64(len: usize) -> Option<Vec<u64>> {
 // ring-3 caller it requires the whole [ptr, ptr+len) range to lie in user space
 // and every page it touches to be mapped in the active address space.
 //
-// WHAT THIS IS FOR HAS CHANGED, and saying so is the last item of M0149. It used to be the safety
+// WHAT THIS IS FOR HAS CHANGED, and saying so is the last item of P02M0119. It used to be the safety
 // mechanism: a ring-3 caller could pass an in-bounds pointer to an unmapped page, the kernel read
 // it, and the resulting ring-0 fault was fatal - on the SYS_DEBUG_WRITE path it struck while the
 // serial TX lock was held, so the fault handler's own logging deadlocked on that lock and the
@@ -1237,7 +1237,7 @@ fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
 	// kernel takes a page fault in ring 0 at an instruction inside the ELF parser, which is not in
 	// `.extable` and cannot be, because it is ORDINARY CODE reading a slice. The machine halts.
 	//
-	// M0149 built the exception table for exactly this class and this path bypassed it. It needs no
+	// P02M0119 built the exception table for exactly this class and this path bypassed it. It needs no
 	// privilege: a process creates a child in its own Domain, holds MANAGE on it, calls load on a
 	// large image and unmaps the buffer from a second thread.
 	//
@@ -1920,7 +1920,7 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 // destroyed if it did, so the quota was dropped rather than the ordering fixed. The result was a
 // direct hole in resource-domain isolation: a Domain at its handle limit receives a transferred
 // capability and is over it, receives again and is further over. Every other way of acquiring a
-// handle is bounded - `try_insert`, `try_insert_or_return`, `duplicate` (bounded in M0145 for
+// handle is bounded - `try_insert`, `try_insert_or_return`, `duplicate` (bounded in P02M0115 for
 // exactly this reason) - and asking a peer to send one was not.
 //
 // Three steps, in this order, and the order is the whole thing:
@@ -2014,8 +2014,8 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 	//
 	// A short copy here used to be invisible: the count was discarded, the capabilities were
 	// installed anyway, and the syscall returned the message's full length. The message was off the
-	// queue, the caller had part of it, and nothing said so - which is precisely the invariant M0151
-	// is named for, broken at the boundary M0149 opened behind it.
+	// queue, the caller had part of it, and nothing said so - which is precisely the invariant P02M0121
+	// is named for, broken at the boundary P02M0119 opened behind it.
 	//
 	// The message is put back at the head rather than destroyed. A short copy means the caller
 	// unmapped its own buffer, and that is not a reason to lose what somebody else sent.

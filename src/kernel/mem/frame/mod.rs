@@ -599,7 +599,7 @@ pub fn upgrade_to_heap() {
 
 	// Move the pool into the buddy and empty the seed table behind it. From here every allocation
 	// and every free goes through the bitmap, and a free cannot be lost because there is no table
-	// to fill - which is the property M0150 exists for.
+	// to fill - which is the property P02M0120 exists for.
 	if let Some(mut buddy) = buddy {
 		// Seeded from the table as it stands NOW, under the lock that installs the result, with
 		// nothing allocating in between. `free_span` only writes bits that are already reserved,
@@ -683,7 +683,7 @@ pub fn free_count() -> usize {
 // symptom arrives weeks later as an allocation failure with no cause attached.
 //
 // So: counted always, not only under test, because a number nobody can read in production is not a
-// measurement. This is the cheap half of M0150 and the thing that says whether the buddy allocator
+// measurement. This is the cheap half of P02M0120 and the thing that says whether the buddy allocator
 // below it actually fixed anything - measure first, and be willing to record that it did not pay.
 pub fn refused_frees() -> u64 {
 	REFUSED_FREES.load(core::sync::atomic::Ordering::Acquire)

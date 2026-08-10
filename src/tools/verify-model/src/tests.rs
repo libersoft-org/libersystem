@@ -1,4 +1,4 @@
-// Two kinds of test, and the second kind is the one M0148 argues for at length.
+// Two kinds of test, and the second kind is the one P02M0118 argues for at length.
 //
 // The property tests pin the selector's shape: monotonicity, determinism, idempotence,
 // full-absorption, total ownership. The NEGATIVE fixtures pin what each validator must REJECT,
@@ -162,7 +162,7 @@ fn an_unknown_path_selects_everything() {
 #[test]
 fn documentation_selects_nothing_and_says_so() {
 	let model = model();
-	let plan = plan_for(&model, &["docs/todo/M0148.md"]);
+	let plan = plan_for(&model, &["docs/todo/P02M0118.md"]);
 	assert!(plan.nothing_to_do, "a documentation change has nothing to verify");
 	assert!(plan.items.is_empty());
 	assert!(!plan.full);

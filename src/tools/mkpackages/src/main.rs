@@ -104,7 +104,7 @@ impl fscore::BlockDevice for Image {
 // Build the system volume as a LiberFS image: the same files the archive carries, plus the
 // kernel and the pinned bootstrap set at real paths.
 //
-// This is the artifact M0138 is about. Until it existed there was no filesystem on the disk at
+// This is the artifact P02M0108 is about. Until it existed there was no filesystem on the disk at
 // the moment the loader ran - the disk carried an archive and the storage service formatted a
 // volume from it after boot - so the loader had nothing to read and no program that runs had a
 // file the user could look at.

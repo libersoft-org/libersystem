@@ -306,7 +306,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// in the other subtree and the volume now holds it twice, in a freshly checksummed
 		// generation, with every later read decided by which path it walks.
 		//
-		// `fsck` has carried this interval since M0144 and a writable mount did not run `fsck`.
+		// `fsck` has carried this interval since P02M0114 and a writable mount did not run `fsck`.
 		// Carrying it HERE costs no extra I/O: this walk already visits every live tree block to
 		// build the free map, so the range rides along and the answer becomes "the block is
 		// reserved AND it is where the tree says it should be".
@@ -490,7 +490,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// now has one name twice in one directory, in a freshly checksummed generation. Every local
 		// check passes on both leaves: ordering, the stored hash, the name policy, the CRC.
 		//
-		// `fsck` has found this since M0144 (`fsck_finds_a_record_routing_will_never_reach`) and a
+		// `fsck` has found this since P02M0114 (`fsck_finds_a_record_routing_will_never_reach`) and a
 		// writable mount did not run `fsck`.
 		let mut nodes: Vec<(u64, u32, Option<u64>, Option<u64>)> = Vec::new();
 		// same guards as `mark_inode_tree`: skip out-of-pool links and marked blocks,

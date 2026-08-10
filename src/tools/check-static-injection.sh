@@ -119,7 +119,7 @@ phase="ready"
 # Drive the step that reads the staged artifacts and refuses the malformed ones.
 #
 # That used to be the kernel's build.rs, so this gate rebuilt the kernel - with a `cargo clean -p
-# kernel` in front, because a build.rs only reruns when cargo thinks it must. M0137 split compiling
+# kernel` in front, because a build.rs only reruns when cargo thinks it must. P02M0107 split compiling
 # from packaging and moved every one of these rejections into `mkpackages`; the kernel's build.rs
 # now says so itself. From that commit until this one the gate compiled a kernel that reads no
 # artifacts, saw it succeed, and reported that an injection had been caught. Six gates in the

@@ -2339,7 +2339,7 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 // (src/user/services/storage/src/service.rs).
 //
 // It was 65536 (32 MiB in), clearing a factory archive at LBA 0 that the service seeded a fresh
-// volume from. The archive is retired (M0138): the volume is built as a filesystem, so there is
+// volume from. The archive is retired (P02M0108): the volume is built as a filesystem, so there is
 // nothing in front of it to skip and it starts at the beginning of its container.
 const FALLBACK_START_SECTOR: u64 = 0;
 
@@ -2606,7 +2606,7 @@ impl StorageHarness {
 	// archive.
 	//
 	// The archive used to be laid on the disk raw and the service formatted a volume and seeded
-	// itself from it. That seeding is gone (M0138) - the system volume is built as a filesystem
+	// itself from it. That seeding is gone (P02M0108) - the system volume is built as a filesystem
 	// now - so the fixture has to be a filesystem too. Formatting it here with the same crate the
 	// service mounts means the fixture cannot drift from the format under test.
 	//
@@ -3301,7 +3301,7 @@ impl StorageHarness {
 	// Time `rounds` heartbeat round-trips on one client, with `crowd` other clients connected and
 	// silent. Returns the nanoseconds per round trip.
 	//
-	// The measurement M0147 exists for. What is being fixed there is a SLOPE - the cost of a pass
+	// The measurement P02M0117 exists for. What is being fixed there is a SLOPE - the cost of a pass
 	// against the number of clients the service listens to - and there was no harness that reported
 	// it, so "it got faster" was a feeling and "it hung" was the whole signal a failure gave. Three
 	// numbers at three crowd sizes say in one run what a night of bisecting does not.

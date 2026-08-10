@@ -93,7 +93,7 @@ crate::tagged_test!(a_copy_that_loses_its_page_partway_reports_exactly_how_far_i
 fn a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got() {
 	// The state a mid-copy unmap actually produces, arranged deterministically.
 	//
-	// M0149 asks for a test that unmaps the page DURING the copy, on the grounds that the defect is
+	// P02M0119 asks for a test that unmaps the page DURING the copy, on the grounds that the defect is
 	// a race. The race is real and the interleaving is not reproducible on a cooperative single-core
 	// harness - this suite has retired tests that tried. What IS reproducible is the state the race
 	// leaves behind: a copy running into a page that is not there, partway through, with bytes
@@ -138,7 +138,7 @@ fn a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got() {
 
 crate::tagged_test!(a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel, [Kernel, Memory, Syscall, Process], id = "kernel.extable.a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel", covers = ["kernel"]);
 fn a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel() {
-	// The path M0149 was written for and did not cover.
+	// The path P02M0119 was written for and did not cover.
 	//
 	// `SYS_PROCESS_LOAD` used to hand the ELF loader a raw slice over the caller's memory and run
 	// the whole load inside a `user_access` window. Every read of that slice is ordinary code in the

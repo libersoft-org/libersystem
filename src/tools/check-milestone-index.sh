@@ -23,7 +23,7 @@ todo_dir="$(dirname "$index")"
 check_index() {
 	local index="$1" todo_dir="$2" failed=0
 	while IFS= read -r line; do
-		# `- [x] [M0150 - title](M0150.md)` - the file is the last parenthesised group.
+		# `- [x] [P02M0120 - title](P02M0120.md)` - the file is the last parenthesised group.
 		local mark file
 		mark="${line:3:1}"
 		file="${line##*\(}"
@@ -41,37 +41,37 @@ check_index() {
 			echo "milestone-index: the index marks $file done and it has $open unfinished task(s)" >&2
 			failed=1
 		fi
-	done < <(grep '^- \[.\] \[M' "$index" || true)
+	done < <(grep '^- \[.\] \[P' "$index" || true)
 	return "$failed"
 }
 
 # Prove the gate REFUSES before letting it approve. The tree is consistent right now, so a run over
 # the tree proves only that the tree is consistent - it would pass just as well if the `grep` above
-# had stopped matching, which is how the six gates of M0142 came to report success for a month.
+# had stopped matching, which is how the six gates of P02M0112 came to report success for a month.
 self_test() {
 	local scratch
 	scratch="$(mktemp -d)"
 	trap 'rm -rf "$scratch"' RETURN
 
-	printf '# M1\n\nStatus: DONE.\n\n- [x] finished\n' >"$scratch/M0001.md"
-	printf '# M2\n\nStatus: IN PROGRESS.\n\n- [x] finished\n- [ ] not finished\n' >"$scratch/M0002.md"
+	printf '# P99M0001\n\nStatus: DONE.\n\n- [x] finished\n' >"$scratch/P99M0001.md"
+	printf '# P99M0002\n\nStatus: IN PROGRESS.\n\n- [x] finished\n- [ ] not finished\n' >"$scratch/P99M0002.md"
 
 	# A consistent index is accepted.
-	printf -- '- [x] [M1 - a](M0001.md)\n- [ ] [M2 - b](M0002.md)\n' >"$scratch/ok.md"
+	printf -- '- [x] [P99M0001 - a](P99M0001.md)\n- [ ] [P99M0002 - b](P99M0002.md)\n' >"$scratch/ok.md"
 	if ! check_index "$scratch/ok.md" "$scratch" 2>/dev/null; then
 		echo "milestone-index: SELF-TEST FAILED - a consistent index was refused" >&2
 		exit 1
 	fi
 
 	# The defect this exists for: done in the index, unfinished in the document.
-	printf -- '- [x] [M1 - a](M0001.md)\n- [x] [M2 - b](M0002.md)\n' >"$scratch/bad.md"
+	printf -- '- [x] [P99M0001 - a](P99M0001.md)\n- [x] [P99M0002 - b](P99M0002.md)\n' >"$scratch/bad.md"
 	if check_index "$scratch/bad.md" "$scratch" 2>/dev/null; then
 		echo "milestone-index: SELF-TEST FAILED - a milestone marked done over an unfinished document was accepted, which is the one thing this gate is for" >&2
 		exit 1
 	fi
 
 	# And a named file that is not there, which is how a rename presents.
-	printf -- '- [x] [M9 - gone](M0009.md)\n' >"$scratch/missing.md"
+	printf -- '- [x] [P99M0009 - gone](P99M0009.md)\n' >"$scratch/missing.md"
 	if check_index "$scratch/missing.md" "$scratch" 2>/dev/null; then
 		echo "milestone-index: SELF-TEST FAILED - an index entry naming a file that does not exist was accepted" >&2
 		exit 1

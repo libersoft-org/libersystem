@@ -220,7 +220,7 @@ for arch in "${archs[@]}"; do
 	# The volume carries a kernel only when an IMAGE is being assembled, never as a side effect of
 	# building.
 	#
-	# A shipping medium wants its kernel on the volume - that is the point of M0138. A test run
+	# A shipping medium wants its kernel on the volume - that is the point of P02M0108. A test run
 	# wants it absent, because the suite boots a different kernel staged on the ESP and the loader
 	# prefers the volume's. Putting it there during an ordinary build made `./test.sh` boot the
 	# SHIPPING kernel into an interactive shell and time out after fifteen minutes.

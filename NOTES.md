@@ -6,7 +6,7 @@
 - find out how shared libraries work... if they are loaded in RAM just once for multiple apps using it or each app has its own instance
 - .build is a big mess, make it clean in well organized subdirectories
 - rename uname to sysver
-- M0042 is missing, find out what was there before - it was in TODO.md and the name was M42 back then
+- One milestone is missing: `M0042` under the OLD flat numbering, which the 2026-08-10 renumbering to `PxxMyyyy` could not carry over because it has no file and no index row. Find out what was there before - it was in TODO.md and the name was M42 back then
 - some services in src/users/services/core/src/ have it's own folder (like graph_limits), but there is only tests.rs file while graph_limits.rs resides outside of this directory - fix it... move it to the proper directory
 - testing CD image should be different from release CD image (release should not have testing volumes like UDF, ISO etc.)
 - cd bin -> lico.lsexe - says command not found, but this lsexe is present in this directory
@@ -76,9 +76,9 @@
 - web camera viewer / recorder
 - shell scripts
 - Rust Doom?
-- M0042 - app package format
-- M0035k - console login and lock
-- M0035f - non-US keyboard layout
+- M0042 (old numbering) - app package format
+- P02M0006k - console login and lock
+- P02M0006f - non-US keyboard layout
 - When phase 2 is done, check if all matches with CONCEPT_EN/CZ.md
 - Look for other FS compatibility (NTFS, ext4, xfs etc.)
 - check for necessary utilities - https://popcon.debian.org/by_inst

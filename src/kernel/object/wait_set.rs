@@ -5,7 +5,7 @@
 // service runs. The cost of one pass is linear in how many things the caller is listening to, and
 // nothing the caller can do makes it otherwise.
 //
-// That was measured rather than suspected. While bounding StorageService's replies (M0139) a test
+// That was measured rather than suspected. While bounding StorageService's replies (P02M0109) a test
 // was written to connect until the service refused, and finding a client ceiling the test could
 // actually REACH took several attempts: forty-eight connections cost nothing measurable, and a
 // ceiling of 256 could not be reached inside fifteen minutes of emulated time. `MAX_CLIENTS` is 64
@@ -132,7 +132,7 @@ impl WaitSet {
 	// This was a `snapshot` returning a fresh `Vec` - one heap allocation and one atomic increment
 	// per member, twice per pass, on the path whose entire purpose is to be cheaper than the
 	// alternative. It was: `wait_any` answered a round trip in 189 us at sixty-two clients and the
-	// set took 434 us. The measurement is in M0147 and it is the reason this is written the way it
+	// set took 434 us. The measurement is in P02M0117 and it is the reason this is written the way it
 	// is.
 	//
 	// Under the lock is safe here and worth stating, because it is the kind of thing that stops

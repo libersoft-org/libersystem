@@ -1,4 +1,4 @@
-# M0148: the configuration catalog.
+# P02M0118: the configuration catalog.
 #
 # A `PlanItemKey` carries a configuration because the same check over the same crate on the same
 # target can verify two different systems. This is not hypothetical here: `tools` has twenty

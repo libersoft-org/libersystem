@@ -764,7 +764,7 @@ struct StageRequest<'a> {
 //
 // Each stage's stdio goes over in ONE message carrying ordered capabilities - stdout first,
 // stdin second when it has one - because a receiver cannot tell a second message that was
-// never sent from the next handoff in its bootstrap sequence. That is what the M0120
+// never sent from the next handoff in its bootstrap sequence. That is what the P02M0090
 // multi-capability work exists for, and it is why this needs no "does this stage have
 // stdin?" agreement between the two sides.
 unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], environment: &[EnvVar], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<Vec<StartResult>> {

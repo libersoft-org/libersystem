@@ -357,7 +357,7 @@ pub mod volume {
 		/// entirely, replaced by a "bindings deferred" comment - so wrapping this return removes the
 		/// binding rather than improving it. Until the generator emits result-wrapped streams, the
 		/// service answers a listing it could not read with an empty one, which is the semantics this
-		/// contract otherwise spent a round removing. Recorded in M0139 and belonging to M0120.
+		/// contract otherwise spent a round removing. Recorded in P02M0109 and belonging to P02M0090.
 		fn list(&mut self, path: String) -> Vec<FileInfo>;
 		fn write(&mut self, path: String, data: crate::codec::Buffer) -> Result<(), Error>;
 		fn remove(&mut self, path: String) -> Result<(), Error>;

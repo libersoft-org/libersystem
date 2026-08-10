@@ -1,4 +1,4 @@
-# M0148: the part of the model that cannot be derived.
+# P02M0118: the part of the model that cannot be derived.
 #
 # Everything a tool can compute is computed: a crate's component is its package name, its
 # `link.static` / `link.static.dev` / `generation.build` edges are its Cargo dependency tables, and
@@ -320,7 +320,7 @@ reason = "the selector; a selector cannot vouch for a change to itself"
 
 [[selects_everything]]
 component = "kernel"
-reason = "phase one keeps shared kernel subsystems whole - narrowing mem/sched/object/syscall is where a selector is most likely to be wrong, and M0148 defers it until there is shadow evidence per change class"
+reason = "phase one keeps shared kernel subsystems whole - narrowing mem/sched/object/syscall is where a selector is most likely to be wrong, and P02M0118 defers it until there is shadow evidence per change class"
 
 [[selects_everything]]
 component = "abi"

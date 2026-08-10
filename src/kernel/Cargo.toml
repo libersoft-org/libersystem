@@ -17,7 +17,7 @@ bootproto = { path = "../bootproto" }
 # Shared kernel/userspace ABI constants (syscalls, errors, rights, package format).
 abi = { path = "../abi" }
 # LiberFS, for the test suite only: the storage scenarios hand StorageService a disk, and since
-# the factory archive was retired (M0138) that disk has to carry a real filesystem rather than a
+# the factory archive was retired (P02M0108) that disk has to carry a real filesystem rather than a
 # package to make one from. Building the fixture with the same crate the service mounts means the
 # test cannot drift from the format it is testing against.
 liberfs = { path = "../fs/liberfs" }

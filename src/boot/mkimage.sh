@@ -208,7 +208,7 @@ make_img() {
 	# The second partition is what makes this an installed system rather than a boot medium. The
 	# storage service finds it by the LiberFS type GUID rather than by device order, and the
 	# loader finds it by its superblock - firmware exposes a partition as its own block handle, so
-	# LBA 0 of that handle is the volume's own start (M0138).
+	# LBA 0 of that handle is the volume's own start (P02M0108).
 	#
 	# The ESP is fixed at 32 MiB: it needs the loader, the kernel and the init fallback, and every
 	# byte beyond that is a byte the system volume does not get.
@@ -242,7 +242,7 @@ make_img() {
 	# one job, and the only one of the two whose programs could not be replaced individually.
 	stage_bootstrap_files "$esp" x86_64
 	# No volume archive: the system volume is a filesystem in partition 2, and the archive exists
-	# only as the kernel test suite's fixture (M0138).
+	# only as the kernel test suite's fixture (P02M0108).
 
 	# splice the populated FAT filesystem into the ESP region of the disk
 	dd if="$esp" of="$out" bs=512 seek="$esp_start" conv=notrunc status=none

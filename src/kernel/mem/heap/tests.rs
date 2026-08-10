@@ -39,7 +39,7 @@ fn a_growth_that_runs_out_of_frames_gives_back_what_it_took() {
 	// at PML4[464]: a mapping that could not get its intermediate table while the pool was empty,
 	// appearing later than the address space that should have inherited it. A test that
 	// destabilises unrelated subsystems to reach its own precondition is not measuring what it
-	// claims. The exhaustion path itself is worth its own item; see M0107.
+	// claims. The exhaustion path itself is worth its own item; see P02M0077.
 	const PAGES: usize = 8;
 	let bytes: u64 = HEAP_REGION;
 

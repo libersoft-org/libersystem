@@ -698,7 +698,7 @@ fn a_real_table_with_its_primary_header_gone_comes_back_from_the_backup() {
 	assert_eq!(probe(&mut img), Disk::CorruptGpt);
 }
 
-// M0146 follow-up: the disks a probe that answers "I recognised nothing" with `Blank` formats.
+// P02M0116 follow-up: the disks a probe that answers "I recognised nothing" with `Blank` formats.
 
 #[test]
 fn a_raw_ext4_is_not_a_blank_disk() {
@@ -784,7 +784,7 @@ fn a_table_this_machine_cannot_hold_is_not_a_damaged_table() {
 	assert_eq!(try_zeroed(usize::MAX / 2).err(), Some(Fault::NoMemory), "and one this machine cannot hold reports");
 }
 
-// M0146, fifth audit: what ties a partition table to the medium it is on.
+// P02M0116, fifth audit: what ties a partition table to the medium it is on.
 
 #[test]
 fn a_header_that_lies_about_its_own_position_is_refused() {

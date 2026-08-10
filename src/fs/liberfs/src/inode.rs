@@ -134,7 +134,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// This used to be `inode.extents[EXTENTS_INLINE..].to_vec()`, and the copy was the last
 		// infallible allocation on the write side: an ordinary file makes it invisible, a heavily
 		// fragmented one makes it large, and an allocator that refuses aborts the service instead of
-		// returning `NoSpace`. M0153 applied that rule to the mount side; this is the other side of
+		// returning `NoSpace`. P02M0123 applied that rule to the mount side; this is the other side of
 		// the same structure. The copy was never needed - the chunks are read once, in order, and
 		// `Extent` is `Copy` - so the fix removes an allocation rather than making one fallible.
 		let spilled = inode.extents.len() - EXTENTS_INLINE;

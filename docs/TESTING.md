@@ -200,7 +200,7 @@ gate.
 A scoped answer should not be believed because it is plausible - and the machinery that will enforce
 that is built but **not yet wired into the ordinary run**. Today `./verify.sh` executes its scoped
 plan without consulting the trust store; shadow comparison is something you invoke. Until that is
-closed (M0148 follow-ups), treat a scoped green as good evidence rather than as equivalent to a full
+closed (P02M0118 follow-ups), treat a scoped green as good evidence rather than as equivalent to a full
 verification, and use `--sweep` before anything that matters.
 
 ```sh
@@ -221,6 +221,6 @@ model has no evidence yet however clean the old record looked.
 
 ## Where the reasoning lives
 
-`docs/todo/M0148.md` is the design and the measurements, including what did not pay and the defects
+`docs/todo/P02M0118.md` is the design and the measurements, including what did not pay and the defects
 found on the way in. The code comments carry the rest; every non-obvious rule in the model says why
 it exists next to what it does.

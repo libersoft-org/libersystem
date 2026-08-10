@@ -253,8 +253,8 @@ impl Channel {
 	// a message, decides about THAT message, and either gets it or is told it is gone.
 	// Put a taken message back at the head of the queue, because it could not be DELIVERED.
 	//
-	// M0151 made a receive transactional in its handle resources: peek, reserve, take the same
-	// message or none. M0149 then opened a second boundary behind it - the queue against the
+	// P02M0121 made a receive transactional in its handle resources: peek, reserve, take the same
+	// message or none. P02M0119 then opened a second boundary behind it - the queue against the
 	// caller's memory - and that one was not transactional at all: the message came off the queue,
 	// the copy into userspace was allowed to be short, and the syscall reported the length it had
 	// been asked for. The message was gone and the caller had part of it and no way to know.

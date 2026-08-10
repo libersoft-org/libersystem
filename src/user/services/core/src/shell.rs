@@ -275,7 +275,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			if multi_stage {
 				let parsed = pipeline.expect("checked by multi_stage");
 				if parsed.stages.iter().any(|stage| !stage.redirects.is_empty()) {
-					// Redirection inside a pipeline is not wired yet - it waits on M0131's
+					// Redirection inside a pipeline is not wired yet - it waits on P02M0101's
 					// streaming-read adapter and transactional writer. Refusing beats running
 					// the line with the part the user asked for silently dropped.
 					print(b"shell: redirection is not supported in a pipeline yet\n");

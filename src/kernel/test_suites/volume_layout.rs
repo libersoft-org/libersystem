@@ -156,7 +156,7 @@ fn directory_scoped_storage_clients_cannot_escape_their_grant() {
 tagged_test!(existing_system_volume_preserves_owned_state_across_a_restart, [Filesystem, Storage, VolumeLayout, VolumeScope], id = "kernel.volume_layout.existing_system_volume_preserves_owned_state_across_a_restart", covers = ["liberfs", "storage"]);
 // This used to corrupt the factory archive between the two runs and assert that an existing
 // volume mounted as-is rather than being reformatted from the changed seed. There is no seed any
-// more (M0138) - and the bytes it used to corrupt are the superblock now - so what remains
+// more (P02M0108) - and the bytes it used to corrupt are the superblock now - so what remains
 // testable, and still worth testing, is that an existing volume survives a restart with its
 // owner state intact.
 fn existing_system_volume_preserves_owned_state_across_a_restart() {

@@ -1940,7 +1940,7 @@ fn a_set_that_was_told_it_joined_is_a_set_that_will_be_woken() {
 
 tagged_test!(a_wait_set_registration_is_charged_to_the_domain_that_holds_it, [Process, Syscall, Memory], id = "kernel.kernel.a_wait_set_registration_is_charged_to_the_domain_that_holds_it", covers = ["kernel"]);
 fn a_wait_set_registration_is_charged_to_the_domain_that_holds_it() {
-	// M0147 listed "a per-Domain bound on registrations" as done and it was not. What existed was
+	// P02M0117 listed "a per-Domain bound on registrations" as done and it was not. What existed was
 	// `MAX_WAIT_SET_MEMBERS` - a PER-SET ceiling - and the handle quota, which charges a Domain ONE
 	// handle for a set holding 256 members plus 256 scheduler observer entries. Neither bounds the
 	// registrations, which is where the memory is.

@@ -63,7 +63,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		None => crate::read_boot_file(bs, root, INIT_PKG_FILE).expect("loader: cannot read init.pkg"),
 	};
 	// Optional. The system volume is a filesystem on the disk now, not an archive handed over at
-	// boot (M0138), so a shipping image carries no `volume.pkg` at all - it survives only as the
+	// boot (P02M0108), so a shipping image carries no `volume.pkg` at all - it survives only as the
 	// kernel test suite's fixture. A machine without one boots exactly as before; the module is
 	// simply absent, which is what the kernel's lookup already expects.
 	let volume_pkg = root.and_then(|root| read_file(bs, root, VOLUME_PKG_FILE));

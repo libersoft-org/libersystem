@@ -80,7 +80,7 @@ const OP_FLUSH: u32 = 3;
 // LiberFS layout on the disk: the filesystem starts at LBA 0 of its container.
 //
 // It used to start 32 MiB in, to clear a factory archive laid at LBA 0 that the service formatted
-// a fresh volume from. That archive is gone (M0138): the system volume is now built as a real
+// a fresh volume from. That archive is gone (P02M0108): the system volume is now built as a real
 // filesystem, so the disk carries a volume rather than a package to make one out of, and there is
 // nothing in front of it to skip. The container is a GPT partition with the LiberFS type GUID
 // when the disk has one, and otherwise the whole device - which is what the loader also assumes,
@@ -191,7 +191,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// wants written to - so the running system needs its own copy, and that copy disappears at
 		// power off, which is what makes it a live session.
 		//
-		// This is seeding, which M0138 retired for disks, and the distinction is the point: on a
+		// This is seeding, which P02M0108 retired for disks, and the distinction is the point: on a
 		// disk the archive was a SECOND copy of what the volume already held, and removing that
 		// duplication is what the milestone is for. On read-only media there is no first copy.
 		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => match unsafe { live_volume(handle) } {
@@ -637,7 +637,7 @@ fn abandon_pending(set: u64, vol: &mut Volume, pending: &mut Option<PendingWrite
 // in the set, its closed peer was permanently READABLE, and the loop woke for a koid no member owned
 // - forever. A livelock, so it showed up as a suite that never finished rather than one that failed.
 // A diagnostic counted 12,917 of those wakes in three minutes before it was found, at the same test
-// that hung the FIRST migration attempt in M0147 - which was reverted without a diagnosis, and may
+// that hung the FIRST migration attempt in P02M0117 - which was reverted without a diagnosis, and may
 // well have been this.
 //
 // Removal is by KOID now, which is the number `waitset_add` returned, so a closed handle cannot make
@@ -760,7 +760,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 	//
 	// Reconciled once per pass against `pending`, which is the one thing here that is NOT edited
 	// where it changes: it is taken in four places and set in two, and threading a set handle
-	// through all six is exactly the "missed call site" M0147 warns about. Reconciling ONE member
+	// through all six is exactly the "missed call site" P02M0117 warns about. Reconciling ONE member
 	// is two comparisons - it is the per-CLIENT reconcile that was quadratic and got the second
 	// migration attempt reverted, and this is not that.
 	let mut stream_chan: u64 = 0;
@@ -1152,7 +1152,7 @@ enum ListStart {
 // producer back to the serve loop to push entries into.
 //
 // Every answer here is BOUNDED. This function was the counterexample to the claim recorded in
-// M0139 that no unbounded send to a client remained in the service: the loop had been converted to
+// P02M0109 that no unbounded send to a client remained in the service: the loop had been converted to
 // `reply_to` and this had not, so it still answered through three `send_blocking` calls. The
 // scenario that mattered is the one the deadline exists for - a client fills its reply queue, a
 // previous `reply_to` times out, the client is NOT dropped (one stalled reply is not proof of
@@ -1300,7 +1300,7 @@ const STREAM_ACCUMULATION: usize = 64 * 1024 * 1024;
 // It was sixty-four, and that number was measured around a defect rather than chosen: `wait_any`
 // took a fresh array of handles on every pass, so the kernel registered a waiter on every channel
 // and removed them all again, and answering one client cost more the more OTHERS were connected.
-// Sixty-four is where the service was still brisk. M0147 removed that cost - one registration per
+// Sixty-four is where the service was still brisk. P02M0117 removed that cost - one registration per
 // member, made when it joins - and the slope fell from 1,325 ns per additional client to 526.
 //
 // So the ceiling stops being a performance number and becomes a structural one: a client is a
@@ -1311,7 +1311,7 @@ const MAX_CLIENTS: usize = rt::MAX_WAIT_SET_MEMBERS - 2;
 //
 // The two are ONE operation and this is the only place either happens. A client in the table the
 // set does not know about never gets served; a member of the set with no table entry is a wake
-// nobody can answer. Membership drifting apart is the failure M0147 warned about by name - "a
+// nobody can answer. Membership drifting apart is the failure P02M0117 warned about by name - "a
 // missed call site is a silently stale set that serves the WRONG client" - and the way to not miss
 // a call site is to have one.
 //
@@ -2423,7 +2423,7 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 		// somebody makes, not one a service infers at boot from the bytes in front of it.
 		//
 		// It was not even a feature by the end. The format existed to SEED - there was a factory
-		// archive at LBA 0 and a fresh disk was formatted and populated from it - and M0138 retired
+		// archive at LBA 0 and a fresh disk was formatted and populated from it - and P02M0108 retired
 		// the seeding. What was left formatted an EMPTY volume and printed that it had done so,
 		// which is of no use to anybody: a machine whose system volume never arrived is not helped
 		// by being given a blank one, and a disk of somebody else's data is actively harmed.

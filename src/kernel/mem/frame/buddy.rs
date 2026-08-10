@@ -1,6 +1,6 @@
 // A binary buddy allocator over a bitmap sized from the memory map, once.
 //
-// The run table it replaces answered three things badly, and M0150 names them:
+// The run table it replaces answered three things badly, and P02M0120 names them:
 //
 //   - its metadata grew with FRAGMENTATION rather than with memory, so the bound had to be
 //     guessed and a free past the guess was lost;

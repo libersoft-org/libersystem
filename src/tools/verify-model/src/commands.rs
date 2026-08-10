@@ -76,7 +76,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> 
 		// have, so a selection naming a renamed test fails loudly instead of quietly running less.
 		//
 		// Measured on an idle machine: 2 tests take 9 s, 20 take 12 s, 205 take 108 s - a fixed cost
-		// of about eight seconds and roughly half a second per test. An earlier note in M0148 put the
+		// of about eight seconds and roughly half a second per test. An earlier note in P02M0118 put the
 		// fixed cost at ~100 s and concluded that selection was the smallest lever this milestone
 		// had; that arithmetic mixed a run made under load 115 with one made idle, and it was wrong.
 		// Selecting twenty tests out of two hundred is an 89% saving on the guest run.

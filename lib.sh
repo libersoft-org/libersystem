@@ -89,7 +89,7 @@ ensure() {
 # organises docs/DYNAMIC_EXECUTABLES.tsv around: which tools were converted together, and what each
 # group's shared-object footprint is.
 #
-# They are NOT a scoping mechanism, and used as one they were the measured problem M0148 opens with:
+# They are NOT a scoping mechanism, and used as one they were the measured problem P02M0118 opens with:
 # wave 5 selects `image,audio,service,process,storage`, and because `service` and `process` are on a
 # third of the suite each, that is 109 of 205 tests for a one-tool change. `./verify.sh` answers that
 # question from the dependency graph instead.
@@ -120,7 +120,7 @@ WAVE_TAGS[5]='image,audio,service,process,storage'
 # `./verify.sh` answers the question now, from a model that is derived rather than written: crate
 # directories and `[[bin]]` entries give ownership, the three Cargo dependency kinds and
 # services/manifest.toml's providers give the edges, and what remains is declared once in
-# src/tools/verify-model/model/registry.toml with a reason attached. See docs/todo/M0148.md.
+# src/tools/verify-model/model/registry.toml with a reason attached. See docs/todo/P02M0118.md.
 
 # The directories whose content can end up in the system volume.
 #

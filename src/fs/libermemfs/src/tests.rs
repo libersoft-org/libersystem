@@ -987,7 +987,7 @@ fn receiving_into_the_volume_costs_one_buffer_rather_than_two() {
 	});
 }
 
-// M0139, fourth round: the residue of the reserved stream's commit.
+// P02M0109, fourth round: the residue of the reserved stream's commit.
 
 #[test]
 fn a_reserved_stream_commit_leaves_the_reservation_whole() {

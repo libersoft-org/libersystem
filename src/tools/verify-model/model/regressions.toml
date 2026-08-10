@@ -20,7 +20,7 @@
 
 schema = 1
 
-# M0145: the RECV_CAPS overrun and the clone-then-close capability duplication. A change inside the
+# P02M0115: the RECV_CAPS overrun and the clone-then-close capability duplication. A change inside the
 # kernel's own object and syscall layer, which phase one keeps whole and everywhere.
 [[case]]
 name = "capability-transfer-atomicity"
@@ -95,6 +95,6 @@ reason = "the thing that boots and judges the guest decides what every other ans
 # an empty plan, which is what `./test.sh --for-change` used to do with exit 0.
 [[case]]
 name = "documentation-only"
-paths = ["docs/todo/M0148.md", "README.md"]
+paths = ["docs/todo/P02M0118.md", "README.md"]
 nothing_to_do = true
 reason = "declared not code, with a reason recorded per path"
