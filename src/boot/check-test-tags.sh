@@ -64,7 +64,17 @@ else
 	self_test || exit 1
 fi
 ROOT_TESTS="$ROOT/kernel/tests.rs"
-mapfile -t TEST_FILES < <(find "$ROOT/kernel" -type f \( -name tests.rs -o -path "$ROOT/kernel/test_suites/*.rs" \) -print | sort)
+# EVERY `.rs` under the kernel, not `tests.rs` and `test_suites/` alone.
+#
+# The narrow `find` was a blind spot of exactly the shape this gate exists to remove: a
+# `tagged_test!` written beside the code it tests was invisible to it, and eleven of them were -
+# five in `elf.rs`, four in `mem/frame/buddy.rs`, two in `mem/vapool.rs`. All eleven were
+# well-formed, which is why nothing showed; the point is that the gate that checks descriptors was
+# not looking at them, and putting a test next to its subject is a habit this tree encourages.
+#
+# The arithmetic that found it: this gate counted 220 descriptors, the verification model knew 228,
+# and the tree held 231 invocations. Three counters over one macro, three answers.
+mapfile -t TEST_FILES < <(find "$ROOT/kernel" -type f -name '*.rs' -print | sort)
 # One #[test_case] per arm of `tagged_test!`, and nowhere else.
 #
 # The point is that the macro is the ONLY way a descriptor enters the suite - a hand-written

@@ -157,7 +157,13 @@ pub struct CostModel {
 impl Default for CostModel {
 	fn default() -> Self {
 		let mut fixed = BTreeMap::new();
-		for (architecture, environment, seconds) in [("x86_64", "test-guest", 100.0), ("aarch64", "test-guest", 1450.0), ("riscv64", "test-guest", 3000.0), ("x86_64", "dev-guest", 120.0), ("host", "host", 0.0)] {
+		// aarch64 measured 2300 s for 216 tests on 2026-08-10, so 1450 is now well under it. riscv64
+		// declared 217 tests and completed 82 in its 2700 s budget that same day - one of them alone
+		// took 707 s - and that run competed with concurrent builds, so its extrapolation is a
+		// pessimistic bound rather than a clean figure. 3200 is the clean-rate projection from the
+		// 2026-08-06 measurement (150 tests in 2161 s) carried to today's count; the gate in
+		// `self_check` compares it against the harness budget so neither can drift alone again.
+		for (architecture, environment, seconds) in [("x86_64", "test-guest", 100.0), ("aarch64", "test-guest", 2300.0), ("riscv64", "test-guest", 3200.0), ("x86_64", "dev-guest", 120.0), ("host", "host", 0.0)] {
 			fixed.insert((architecture.to_string(), environment.to_string()), seconds);
 		}
 		CostModel { fixed_seconds: fixed, default_variable: 0.5 }

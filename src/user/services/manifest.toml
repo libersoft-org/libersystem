@@ -1254,6 +1254,10 @@ destination = "hello.txt"
 [[factory_files]]
 name = "liber-component"
 kind = "sdk-component"
+# The crate that builds this payload. It is the only staged artifact with no source path, so
+# without an owner nothing tied `src/sdk` to the system volume - and the volume's staleness digest
+# is derived from what is staged into it. An SDK edit could then leave a built volume looking fresh.
+owner = "liber_component"
 destination = "components/liber_component/app.wasm"
 
 [[factory_files]]

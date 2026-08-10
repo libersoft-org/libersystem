@@ -61,6 +61,16 @@ struct RawFactoryFile {
 	kind: FactoryFileKind,
 	#[serde(default)]
 	source: Option<String>,
+	// Which component BUILDS this payload, for the kinds that have no source path.
+	//
+	// An `sdk-component` is a compiled artifact rather than a checked-in file, so it has no
+	// `source` - and dropping the question entirely meant the model had no way to learn that
+	// `src/sdk` reaches the system volume. The volume's staleness digest is derived from the
+	// components staged into it, so an unowned payload was a directory whose edits could not
+	// invalidate a built volume: change the SDK, rebuild nothing, and test against the old
+	// `app.wasm` with a digest that agreed.
+	#[serde(default)]
+	owner: Option<String>,
 	destination: String,
 }
 
@@ -237,6 +247,9 @@ pub struct FactoryFile {
 	pub name: Name,
 	pub kind: FactoryFileKind,
 	pub source: Option<RelativePath>,
+	// The component that builds a payload with no source path. Required for `sdk-component`,
+	// refused for `source` (whose provenance is the path itself).
+	pub owner: Option<Name>,
 	pub destination: RelativePath,
 }
 
@@ -414,11 +427,27 @@ impl Manifest {
 					None
 				}
 			};
+			// The owner: required exactly where `source` is absent, so every staged byte can be
+			// traced back to something that builds it. Without this the SDK payload was the one
+			// thing in the volume with no provenance at all, and the volume's freshness model is
+			// derived from provenance.
+			let owner = match (raw_factory_file.kind, raw_factory_file.owner.as_deref()) {
+				(FactoryFileKind::SdkComponent, None) => {
+					push_error(&mut errors, format!("{location}.owner"), "SDK component payloads require the component that builds them");
+					None
+				}
+				(FactoryFileKind::SdkComponent, Some(raw_owner)) => validate_name(raw_owner, &format!("{location}.owner"), &mut errors),
+				(FactoryFileKind::Source, Some(_)) => {
+					push_error(&mut errors, format!("{location}.owner"), "source factory files take their provenance from their source path");
+					None
+				}
+				(FactoryFileKind::Source, None) => None,
+			};
 			validate_factory_file_shape(raw_factory_file.kind, source.as_ref(), &destination, &location, &mut errors);
 			if !destinations.insert(destination.clone()) {
 				push_error(&mut errors, format!("{location}.destination"), "duplicate staged destination");
 			}
-			if factory_files.insert(name.clone(), FactoryFile { name, kind: raw_factory_file.kind, source, destination }).is_some() {
+			if factory_files.insert(name.clone(), FactoryFile { name, kind: raw_factory_file.kind, source, owner, destination }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate factory file name");
 			}
 		}

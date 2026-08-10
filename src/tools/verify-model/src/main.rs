@@ -26,6 +26,7 @@ usage: verify-model <command> [options]
   owner PATH...                       which component owns each path, and why
   check                               the model's own gates: ownership, graph and catalog
   shadow --guest-log F --arch A       compare a full sweep against what a change would have scoped
+  shadow --host-log F | --dev-log F   the same comparison for the host and dev-guest universes
   level --stdin                       what a scoped answer about this change is worth
   trust [--grant COMPONENT]           what is TRUSTED under the current model, and why not
   changes [--range A..B]              what changed, both sides of every rename, one path per line
@@ -65,6 +66,7 @@ fn run() -> Result<ExitCode, String> {
 	let mut keys_file: Option<String> = None;
 	let mut guest_log: Option<String> = None;
 	let mut host_log: Option<String> = None;
+	let mut dev_log: Option<String> = None;
 	let mut architecture: Option<String> = None;
 	let mut grant: Option<String> = None;
 	let mut range: Option<String> = None;
@@ -97,6 +99,12 @@ fn run() -> Result<ExitCode, String> {
 			"--host-log" => {
 				index += 1;
 				host_log = Some(arguments.get(index).ok_or("--host-log needs a path")?.clone());
+			}
+			// The DEV guest's results file, same format as the host's - a line per check and a
+			// `total` line, written by the runner rather than scraped.
+			"--dev-log" => {
+				index += 1;
+				dev_log = Some(arguments.get(index).ok_or("--dev-log needs a path")?.clone());
 			}
 			"--arch" => {
 				index += 1;
@@ -133,7 +141,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "booted" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "booted" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
 	{
 		command = positional.remove(0);
 	}
@@ -175,6 +183,24 @@ fn run() -> Result<ExitCode, String> {
 		// A command in the model rather than a `jq` filter in the shell, for the reason the `booted`
 		// command exists: every decision that needs the model belongs in the model, and a fragile
 		// parse in `verify.sh` is the same decision made twice and drifting.
+		// Every check that runs in the DEV guest, as `id<TAB>command`, for the third shadow producer.
+		//
+		// `DevGuest` was a declared universe with no producer: `Universe::of` routed `dev.*` checks
+		// to it, `required_architectures` answered 1 for it, and nothing ever wrote a record. So
+		// `trusted_everywhere` - which asks the catalog which universes may judge a component -
+		// could never be satisfied for `bin.dev_agent`, `bin.dev_channel`, `harness.boot` or
+		// `proto`, whatever evidence they accumulated elsewhere. A universe that cannot be fed is a
+		// universe that only ever answers no.
+		"dev-checks" => {
+			for check in &model.catalog.checks {
+				for variant in &check.variants {
+					if variant.environment == verify_model::catalog::Environment::DevGuest {
+						println!("{}\t{}\t{}", check.id, variant.architecture, check.command.replace("{arch}", &variant.architecture));
+					}
+				}
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		"host-checks" => {
 			for check in &model.catalog.checks {
 				// Builds are excluded. They run on the host and they can fail, but a shadow
@@ -254,7 +280,7 @@ fn run() -> Result<ExitCode, String> {
 						reachable.extend(model.graph.reaches(component, &verify_model::kerneltests::RUNTIME_REACH));
 					}
 				}
-				println!("{}\t{}", test.name, reachable.into_iter().collect::<Vec<_>>().join(","));
+				println!("{}\t{}", test.id, reachable.into_iter().collect::<Vec<_>>().join(","));
 			}
 			Ok(ExitCode::SUCCESS)
 		}
@@ -319,7 +345,35 @@ fn run() -> Result<ExitCode, String> {
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
-			let guest_log = guest_log.ok_or("shadow needs --guest-log or --host-log")?;
+			// The DEV guest universe. Same shape as the host branch: one results file, one record.
+			if let Some(path) = &dev_log {
+				if paths.is_empty() {
+					return Err(String::from("shadow needs the change it is validating (--paths or --stdin); comparing against nothing proves nothing"));
+				}
+				let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+				let results = verify_model::shadow::parse_host_log(&text);
+				let ownership = model.ownership();
+				let planner = Planner::for_model(&model, &ownership);
+				let plan = planner.plan(&paths);
+				let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
+				let history = verify_model::history::History::load(&repo_root)?;
+				let comparison = verify_model::shadow::compare_dev(&selected, &results, &history);
+				println!("shadow (dev-guest): {:?}", comparison.verdict);
+				println!("  {}", comparison.reason);
+				println!("  {} check(s) ran; {} of them were in the scoped selection", comparison.ran, comparison.scoped);
+				for key in &comparison.inside_failures {
+					println!("  FAILED (selected): {key}");
+				}
+				for key in &comparison.outside_failures {
+					println!("  FAILED (not selected): {key}");
+				}
+				let mut log = verify_model::shadow::Log::load(&repo_root);
+				log.schema = 1;
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
+				log.save(&repo_root)?;
+				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+			}
+			let guest_log = guest_log.ok_or("shadow needs --guest-log, --host-log or --dev-log")?;
 			let architecture = architecture.ok_or("shadow needs --arch")?;
 			if paths.is_empty() {
 				return Err(String::from("shadow needs the change it is validating (--paths or --stdin); comparing against nothing proves nothing"));
@@ -649,6 +703,73 @@ fn join_or_none(items: &[String]) -> String {
 fn self_check(model: &Model) -> Result<ExitCode, String> {
 	let mut failures = Vec::new();
 
+	// The one equality an exact selection rests on: the string the model puts in `TEST_SELECTION`
+	// is the string the guest runner matches. The runner compares against the declaration's `id`,
+	// so every kernel check id must BE a declared id - not derived from it, not prefixed, not
+	// stripped.
+	//
+	// This check exists because that equality broke silently. `id` used to default to the function
+	// name, so `kernel.{name}` and the runner's identity were the same string; making ids mandatory
+	// and namespacing them moved one side and nothing was watching the other. Every scoped kernel
+	// run then handed the guest names it could not find, and an unknown id is a hard failure - loud,
+	// but only for whoever ran one, and nothing scoped had run since.
+	{
+		let declared: BTreeSet<&str> = model.kernel_tests.tests.iter().map(|test| test.id.as_str()).collect();
+		let mut wrong: Vec<String> = Vec::new();
+		for check in model.catalog.checks.iter().filter(|check| check.kind == verify_model::catalog::CheckKind::KernelTest) {
+			if !declared.contains(check.id.as_str()) {
+				wrong.push(check.id.clone());
+			}
+		}
+		if !wrong.is_empty() {
+			failures.push(format!("{} kernel check id(s) are not a test's declared `id`, so an exact selection would name tests the guest cannot match:\n  {}", wrong.len(), wrong.join("\n  ")));
+		}
+		let mut empty: Vec<&str> = model.kernel_tests.tests.iter().filter(|test| test.id.is_empty()).map(|test| test.name.as_str()).collect();
+		empty.sort_unstable();
+		if !empty.is_empty() {
+			failures.push(format!("{} kernel test(s) carry no id: {}", empty.len(), empty.join(", ")));
+		}
+		if declared.len() != model.kernel_tests.tests.len() {
+			failures.push(format!("{} kernel tests share {} distinct ids - an id names exactly one test or it names nothing", model.kernel_tests.tests.len(), declared.len()));
+		}
+	}
+
+	// The suite's budget against the suite's measured cost.
+	//
+	// `test-kernel.sh` carries a per-architecture `FULL_TIMEOUT` and the model carries what a full
+	// run of that architecture costs. Nothing compared them, so the budget drifted behind the work
+	// twice: once before 2026-08-06 (fixed by raising the number) and again by 2026-08-10, when a
+	// suite grown from 150 tests to 217 met a number that had not moved. A run then fails at the
+	// wall - and a timeout that means "the suite got bigger" is indistinguishable from one that
+	// means "something hung", which is the confusion the per-test watchdog exists to end.
+	//
+	// Comparing them here makes outgrowing the budget a fact the model states in a second, rather
+	// than one discovered forty-five minutes into a sweep.
+	{
+		let script = model.repo_root.join("src/boot/test-kernel.sh");
+		match std::fs::read_to_string(&script) {
+			Ok(text) => {
+				let cost = verify_model::history::CostModel::default();
+				for architecture in ["x86_64", "aarch64", "riscv64"] {
+					let Some(budget) = full_timeout_seconds(&text, architecture) else {
+						failures.push(format!("test-kernel.sh names no FULL_TIMEOUT for {architecture}, so nothing bounds its suite"));
+						continue;
+					};
+					let estimate = cost.fixed_seconds.get(&(architecture.to_string(), String::from("test-guest"))).copied().unwrap_or(0.0);
+					if estimate <= 0.0 {
+						continue;
+					}
+					// A fifth over the estimate. Less is a run that fails on a slow day rather than
+					// on a defect, which is the same false signal from the other side.
+					if budget < estimate * 1.2 {
+						failures.push(format!("test-kernel.sh gives {architecture} {budget:.0} s and a full suite there is measured at {estimate:.0} s - a budget under {:.0} s fails at the wall and reads exactly like a hang", estimate * 1.2));
+					}
+				}
+			}
+			Err(error) => failures.push(format!("{}: {error}", script.display())),
+		}
+	}
+
 	let unowned = model.unowned_paths()?;
 	if !unowned.is_empty() {
 		failures.push(format!("{} tracked file(s) are owned by no component and are not declared non-code:\n  {}", unowned.len(), unowned.join("\n  ")));
@@ -710,10 +831,10 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 	for test in &model.kernel_tests.tests {
 		let touched = model.kernel_tests.touches.get(&test.name).cloned().unwrap_or_default();
 		for component in verify_model::kerneltests::unreachable_covers(test, &touched, &model.graph) {
-			unreachable.push(format!("kernel.{} covers '{component}', which its body cannot reach - it launches nothing that leads there", test.name));
+			unreachable.push(format!("{} covers '{component}', which its body cannot reach - it launches nothing that leads there", test.id));
 		}
 		for component in verify_model::kerneltests::launched_but_not_covered(test, &touched, &model.graph) {
-			uncovered.push(format!("kernel.{} launches {component} and does not claim to cover it", test.name));
+			uncovered.push(format!("{} launches {component} and does not claim to cover it", test.id));
 		}
 	}
 	failures.extend(unreachable);
@@ -808,6 +929,9 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 		println!("  {} crates, {} components, {} edges", model.crates.len(), model.graph.components.len(), model.graph.edges.len());
 		println!("  {} checks, {} runnable keys", model.catalog.checks.len(), model.catalog.checks.iter().map(|check| check.variants.len()).sum::<usize>());
 		println!("  {} kernel tests, {} without a covers declaration", model.kernel_tests.tests.len(), model.kernel_tests.unannotated);
+		if !model.kernel_tests.declared_not_built.is_empty() {
+			println!("  {} declared and in no built suite (so not selectable, and not running): {}", model.kernel_tests.declared_not_built.len(), model.kernel_tests.declared_not_built.join(", "));
+		}
 		println!("  model hash {}", model.model_hash());
 		return Ok(ExitCode::SUCCESS);
 	}
@@ -851,6 +975,44 @@ fn volume_sources(model: &Model) -> BTreeSet<String> {
 	directories.insert(String::from("tools"));
 	directories.insert(String::from("idl"));
 	directories
+}
+
+// `FULL_TIMEOUT=90m` for one architecture's branch of `test-kernel.sh`.
+//
+// A line walk with the current `case` label carried along, rather than a split on the label: the
+// script has more than one `case` over the same architecture names, and splitting found the first
+// of them and read a value out of the wrong block. The last assignment under a label wins, which is
+// what the shell itself does.
+fn full_timeout_seconds(text: &str, architecture: &str) -> Option<f64> {
+	let mut label: Option<&str> = None;
+	let mut found = None;
+	for line in text.lines() {
+		let trimmed = line.trim();
+		if let Some(name) = trimmed.strip_suffix(')')
+			&& !name.is_empty()
+			&& name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_')
+		{
+			label = Some(name);
+			continue;
+		}
+		// `;;` ends a branch. Without this the default `*)` arm - whose label the check above
+		// rejects, being punctuation - left the previous label standing, and the default's own
+		// 15-minute timeout was read as riscv64's.
+		if trimmed == ";;" {
+			label = None;
+			continue;
+		}
+		if label == Some(architecture)
+			&& let Some(value) = trimmed.strip_prefix("FULL_TIMEOUT=")
+		{
+			let (number, scale) = match value.strip_suffix('m') {
+				Some(minutes) => (minutes, 60.0),
+				None => (value.strip_suffix('s').unwrap_or(value), 1.0),
+			};
+			found = number.parse::<f64>().ok().map(|parsed| parsed * scale);
+		}
+	}
+	found
 }
 
 fn find_repo_root() -> Result<PathBuf, String> {

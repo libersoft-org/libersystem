@@ -1322,7 +1322,13 @@ impl Testable for TaggedTest {
 	}
 
 	fn run(&self) {
-		serial_print!("{}...\t", self.name);
+		// The ID, not the function name. Everything else that names a test - an exact selection, a
+		// plan key, a history record, a shadow comparison - uses the id, and a log that used the
+		// other name meant the shadow comparison had to STRIP a prefix to line the two up. That
+		// worked only while the two strings differed by exactly that prefix; the moment ids became
+		// namespaced it would have silently matched nothing, which is a comparison that reports
+		// agreement because it compared nothing.
+		serial_print!("{}...\t", self.id);
 		// The clock, read either side, so "slow" and "stuck" stop being a judgement call somebody
 		// makes by watching a log.
 		//

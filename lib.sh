@@ -136,7 +136,7 @@ WAVE_TAGS[5]='image,audio,service,process,storage'
 # guest then booted the PREVIOUS userspace and passed. `src/volume` is worse in its simplicity: it is
 # the factory files the volume literally ships, and changing one of them changed nothing the check
 # could see.
-VOLUME_SOURCES=(abi bootproto fs idl proto term tools user volume wasm wire)
+VOLUME_SOURCES=(abi bootproto fs idl proto sdk term tools user volume wasm wire)
 
 # A digest of every source file a build reads, so "has it changed" is answered by CONTENT.
 #

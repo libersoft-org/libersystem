@@ -197,7 +197,7 @@ impl Catalog {
 		// Kernel tests: derived per target from the compiled test binaries, so the variant list is
 		// the truth about where each test exists rather than a guess from its path.
 		for test in kernel_tests {
-			catalog.checks.push(Check { id: format!("kernel.{}", test.name), kind: CheckKind::KernelTest, covers: test.covers.clone(), variants: test.architectures.iter().map(|architecture| Variant { architecture: architecture.clone(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), command: String::from("./test.sh --arch {arch}") });
+			catalog.checks.push(Check { id: test.id.clone(), kind: CheckKind::KernelTest, covers: test.covers.clone(), variants: test.architectures.iter().map(|architecture| Variant { architecture: architecture.clone(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), command: String::from("./test.sh --arch {arch}") });
 		}
 
 		// The development guest. qemu-run.sh refuses DEV_PROFILE together with TEST, so these can
@@ -320,7 +320,20 @@ fn build_covers(part: &str, crates: &[Crate], staged: &BTreeSet<String>) -> Vec<
 // One kernel test, as the compiled binaries report it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct KernelTest {
+	// The Rust function name, which is what the compiled binary's symbols carry. Used to join the
+	// binary's per-architecture presence to the source declaration, and to say WHERE something is
+	// in a diagnostic - never as the test's identity.
 	pub name: String,
+	// The identity: the `id = ".."` literal the declaration is required to carry. This is the
+	// string the guest runner matches an exact selection against, so it is also the check id.
+	//
+	// It used to be `format!("kernel.{name}")`, which was the same string as the runner's identity
+	// only for as long as `id` defaulted to `stringify!($name)`. Making ids mandatory and
+	// namespacing them changed one side of that equality and nothing owned the other, so every
+	// scoped kernel selection handed the guest names it could not match - and an unmatched id is
+	// deliberately a hard failure. Taking the id from the declaration makes the two sides one
+	// string by construction rather than by coincidence.
+	pub id: String,
 	pub architectures: Vec<String>,
 	pub covers: Vec<String>,
 }

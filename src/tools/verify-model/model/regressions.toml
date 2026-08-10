@@ -77,7 +77,7 @@ paths = ["src/kernel/arch/riscv64/traps/mod.rs"]
 full = false
 must_boot = ["riscv64"]
 must_select = ["build.kernel / x86_64 / host / shared-image"]
-must_not_select = ["kernel.frame_alloc_distinct / x86_64 / test-guest / test"]
+must_not_select = ["kernel.mem.frame.frame_alloc_distinct / x86_64 / test-guest / test"]
 reason = "boots the target it belongs to and cross-builds the other two, because a branch that stops compiling elsewhere is a regression as well"
 
 # The harness itself. This is the half of the false-green defect that path ownership alone did not
@@ -88,7 +88,7 @@ name = "harness-qemu-runner"
 paths = ["src/boot/qemu-run.sh"]
 full = true
 must_boot = ["x86_64", "aarch64", "riscv64"]
-must_select = ["kernel.frame_alloc_distinct / riscv64 / test-guest / test"]
+must_select = ["kernel.mem.frame.frame_alloc_distinct / riscv64 / test-guest / test"]
 reason = "the thing that boots and judges the guest decides what every other answer means"
 
 # Documentation, which must select nothing at all - and must say so rather than silently producing

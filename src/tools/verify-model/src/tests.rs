@@ -369,7 +369,7 @@ fn a_catalog_naming_an_undefined_configuration_is_refused() {
 	let registry = fixture.load().expect("well formed");
 	let manifest = system_manifest::Manifest::load_workspace(&root.join("src")).expect("manifest");
 	let graph = Graph::build(&crates, &manifest, &registry);
-	let kernel_test = KernelTest { name: String::from("t"), architectures: vec![String::from("x86_64")], covers: vec![String::from("kernel")] };
+	let kernel_test = KernelTest { name: String::from("t"), id: String::from("kernel.t"), architectures: vec![String::from("x86_64")], covers: vec![String::from("kernel")] };
 	let staged = crate::staged_components(&manifest, &crates, &graph);
 	let mut catalog = Catalog::build(&crates, &registry, &graph, &staged, &kernel_test_slice(&kernel_test));
 	catalog.checks[0].variants[0].configuration = String::from("a-configuration-nobody-defined");
@@ -597,7 +597,7 @@ fn kernel_key(name: &str) -> crate::plan::PlanItemKey {
 
 #[test]
 fn a_failure_outside_the_selection_is_a_candidate_miss() {
-	let results = crate::shadow::parse_guest_log("running 2 tests (all tags)\nalpha...\t[ok]\nbeta...\t");
+	let results = crate::shadow::parse_guest_log("running 2 tests (all tags)\nkernel.alpha...\t[ok]\nkernel.beta...\t");
 	let comparison = crate::shadow::compare(&[kernel_key("alpha")], &results, "x86_64", &crate::history::History::default());
 	assert_eq!(comparison.verdict, crate::shadow::Verdict::CandidateMiss, "beta was not selected and it failed - that is the shape of a missed edge");
 	assert_eq!(comparison.outside_failures.len(), 1);
@@ -605,7 +605,7 @@ fn a_failure_outside_the_selection_is_a_candidate_miss() {
 
 #[test]
 fn a_failure_inside_the_selection_is_not_the_selectors_fault() {
-	let results = crate::shadow::parse_guest_log("running 2 tests (all tags)\nalpha...\t[ok]\nbeta...\t");
+	let results = crate::shadow::parse_guest_log("running 2 tests (all tags)\nkernel.alpha...\t[ok]\nkernel.beta...\t");
 	let comparison = crate::shadow::compare(&[kernel_key("alpha"), kernel_key("beta")], &results, "x86_64", &crate::history::History::default());
 	assert_eq!(comparison.verdict, crate::shadow::Verdict::SelectionFailed, "the selector chose beta; beta broke. That is a defect in the code.");
 }
@@ -614,7 +614,7 @@ fn a_failure_inside_the_selection_is_not_the_selectors_fault() {
 // clean full one, and reporting Consistent over it would be evidence for nothing.
 #[test]
 fn a_partial_sweep_is_refused_rather_than_believed() {
-	let results = crate::shadow::parse_guest_log("running 2 tests (196 skipped, 198 total)\nalpha...\t[ok]\nbeta...\t[ok]\n");
+	let results = crate::shadow::parse_guest_log("running 2 tests (196 skipped, 198 total)\nkernel.alpha...\t[ok]\nkernel.beta...\t[ok]\n");
 	let comparison = crate::shadow::compare(&[kernel_key("alpha")], &results, "x86_64", &crate::history::History::default());
 	assert_eq!(comparison.verdict, crate::shadow::Verdict::Void);
 	assert!(comparison.reason.contains("of 198"), "{}", comparison.reason);
@@ -964,7 +964,7 @@ fn the_scan_finds_the_markers_the_design_names() {
 // over-reaching declaration of mine, which is a fair account of what such a gate is for.
 
 fn kernel_test(name: &str, covers: &[&str]) -> KernelTest {
-	KernelTest { name: name.to_string(), architectures: vec![String::from("x86_64")], covers: covers.iter().map(|component| (*component).to_string()).collect() }
+	KernelTest { name: name.to_string(), id: format!("kernel.{name}"), architectures: vec![String::from("x86_64")], covers: covers.iter().map(|component| (*component).to_string()).collect() }
 }
 
 #[test]

@@ -40,6 +40,7 @@ providers = ["pcm"]
 [[factory_files]]
 name = "liber-component"
 kind = "sdk-component"
+owner = "liber_component"
 destination = "components/liber_component/app.wasm"
 
 [[services]]
@@ -141,6 +142,26 @@ fn unknown_fields_fail_during_deserialization() {
 }
 
 #[test]
+fn a_built_payload_must_name_what_builds_it() {
+	// The SDK payload is the one staged artifact with no source path, and its provenance is what
+	// puts `src/sdk` in the system volume's freshness model. Without an owner the volume's staleness
+	// digest could not see an SDK edit at all: change the SDK, rebuild nothing, and a guest ran the
+	// previous `app.wasm` against a digest that agreed the volume was current.
+	let root = fixture_workspace();
+	let without_owner = valid_fixture().replace("owner = \"liber_component\"\n", "");
+	let error = Manifest::parse(&without_owner, &root).expect_err("an sdk-component with no owner must be refused");
+	assert!(format!("{error:?}").contains("require the component that builds them"), "got {error:?}");
+
+	// And the converse: a checked-in source file takes its provenance from its path, so naming an
+	// owner there would be a second answer to a question that already has one.
+	fs::create_dir_all(root.join("volume")).unwrap();
+	fs::write(root.join("volume/hello.txt"), "hello").unwrap();
+	let source_with_owner = format!("{}\n[[factory_files]]\nname = \"hello\"\nkind = \"source\"\nsource = \"volume/hello.txt\"\nowner = \"liber_component\"\ndestination = \"hello.txt\"\n", valid_fixture());
+	let error = Manifest::parse(&source_with_owner, &root).expect_err("a source factory file with an owner must be refused");
+	assert!(format!("{error:?}").contains("take their provenance from their source path"), "got {error:?}");
+}
+
+#[test]
 fn factory_files_cover_the_source_tree_and_enforce_the_layout() {
 	let root = fixture_workspace();
 	fs::create_dir_all(root.join("volume/audio")).unwrap();
@@ -152,7 +173,7 @@ fn factory_files_cover_the_source_tree_and_enforce_the_layout() {
 	let invalid = fixture.replace("destination = \"audio/test.mp3\"", "destination = \"share/test.mp3\"");
 	let error = Manifest::parse(&invalid, &root).unwrap_err().to_string();
 	assert!(error.contains("expected audio/test.mp3"));
-	let without_component = fixture.replace("\n[[factory_files]]\nname = \"liber-component\"\nkind = \"sdk-component\"\ndestination = \"components/liber_component/app.wasm\"\n", "");
+	let without_component = fixture.replace("\n[[factory_files]]\nname = \"liber-component\"\nkind = \"sdk-component\"\nowner = \"liber_component\"\ndestination = \"components/liber_component/app.wasm\"\n", "");
 	let error = Manifest::parse(&without_component, &root).unwrap_err().to_string();
 	assert!(error.contains("no SDK component payload is declared"));
 	fs::remove_dir_all(root).unwrap();

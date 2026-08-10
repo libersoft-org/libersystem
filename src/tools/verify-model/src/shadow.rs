@@ -65,7 +65,12 @@ pub fn parse_guest_log(text: &str) -> GuestResults {
 		// reason this was cheap to find.
 		if let Some(index) = line.find("...") {
 			let name = line[..index].trim();
-			if !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_') {
+			// A dot is part of a name now: the guest names tests by their id
+			// (`kernel.object.channel.foo`) rather than by the bare function name, so that every
+			// layer - log, plan key, history, selection - spells a test the same way. Without the
+			// dot here the whole log parsed as nothing and the comparison returned Void, which is
+			// the guard doing its job and not an answer.
+			if !name.is_empty() && name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '.') {
 				if let Some(previous) = open.take() {
 					outcomes.insert(previous, Outcome::Unfinished);
 				}
@@ -174,7 +179,7 @@ pub fn parse_host_log(text: &str) -> GuestResults {
 
 // The guest comparison: kernel test names, one target, the test-guest environment.
 pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &str, history: &History) -> Comparison {
-	compare_in(selected, results, architecture, "test-guest", Some("kernel."), history)
+	compare_in(selected, results, architecture, "test-guest", "test", None, history)
 }
 
 // The HOST comparison, which had no producer at all.
@@ -186,10 +191,17 @@ pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &
 // The ids are the catalog's own (`gate.x`, `host.y`), so nothing is stripped; the architecture is
 // `host`, which is the only one this universe has.
 pub fn compare_host(selected: &[PlanItemKey], results: &GuestResults, history: &History) -> Comparison {
-	compare_in(selected, results, "host", "host", None, history)
+	compare_in(selected, results, "host", "host", "shared-image", None, history)
 }
 
-fn compare_in(selected: &[PlanItemKey], results: &GuestResults, architecture: &str, environment: &str, strip: Option<&str>, history: &History) -> Comparison {
+// The DEV guest: `dev-selftest.py` and its neighbours, inside a guest left running under
+// `DEV_PROFILE=1`. One target by construction - the development profile is built for x86_64 alone -
+// which is why `required_architectures` answers 1 for this universe.
+pub fn compare_dev(selected: &[PlanItemKey], results: &GuestResults, history: &History) -> Comparison {
+	compare_in(selected, results, "x86_64", "dev-guest", "development", None, history)
+}
+
+fn compare_in(selected: &[PlanItemKey], results: &GuestResults, architecture: &str, environment: &str, configuration: &str, strip: Option<&str>, history: &History) -> Comparison {
 	let scoped: BTreeSet<&str> = selected
 		.iter()
 		.filter(|key| key.architecture == architecture)
@@ -205,7 +217,7 @@ fn compare_in(selected: &[PlanItemKey], results: &GuestResults, architecture: &s
 		if *outcome != Outcome::Failed {
 			continue;
 		}
-		let key = format!("{}{name} / {architecture} / {environment} / test", strip.unwrap_or(""));
+		let key = format!("{}{name} / {architecture} / {environment} / {configuration}", strip.unwrap_or(""));
 		if history.get(&key).is_some_and(|record| record.failures > 0) {
 			previously_failed.push(key.clone());
 		}

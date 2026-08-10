@@ -180,6 +180,19 @@ pub fn staged_components(manifest: &system_manifest::Manifest, crates: &[Crate],
 			components.extend(graph.reaches(&crate::graph::binary_component(&binary.name), &["link.static", "link.dynamic", "generation.build"]));
 		}
 	}
+	// Factory payloads that are BUILT rather than checked in. An `sdk-component` has no source
+	// path, so the walk above cannot see it; its declared owner is the component that produces it,
+	// and everything that component reaches is staged with it.
+	//
+	// This is what puts `src/sdk` in the volume's source set. It was outside: `lib.sh`'s
+	// VOLUME_SOURCES had no `sdk`, this derivation had no way to add one, and the gate that
+	// compares the two therefore agreed with the omission. Editing the SDK could not move the
+	// volume's staleness digest, so a guest could run last build's `app.wasm` against a digest
+	// that said the volume was current - the exact false green this model exists to remove.
+	for factory_file in manifest.factory_files.values() {
+		let Some(owner) = &factory_file.owner else { continue };
+		components.extend(graph.reaches(owner.as_str(), &["link.static", "link.dynamic", "generation.build"]));
+	}
 	components
 }
 

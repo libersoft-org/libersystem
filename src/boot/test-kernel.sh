@@ -99,11 +99,21 @@ aarch64)
 	# 99.4% before the three tests that tipped it, which means any addition at all would have. The
 	# tests that tipped it were cheapened first and re-checked to still fail without their fixes;
 	# what is left is not a hot spot to split but a budget that stopped matching the work.
-	FULL_TIMEOUT=45m
+	FULL_TIMEOUT=60m
 	TAG_TIMEOUT=15m
 	;;
 riscv64)
-	FULL_TIMEOUT=45m
+	# 90m. Measured 2026-08-10: the suite declared 217 tests and 45 minutes bought 82 of them, with
+	# one test alone taking 707 s - so the previous budget could not finish the suite and the run
+	# ended at the wall, reporting a TIMEOUT that reads exactly like a hang. That run shared the
+	# machine with concurrent builds, so its rate is a pessimistic bound; the clean-rate projection
+	# from the 2026-08-06 measurement (150 tests in 2161 s) is about 52 minutes for today's count.
+	#
+	# 90m covers the clean projection with room and stays under the contended extrapolation. The
+	# number is no longer alone: `verify-model check` compares it against the model's measured cost
+	# for this target and fails when the budget falls under it, which is what stops the next drift
+	# from being discovered forty-five minutes into a sweep.
+	FULL_TIMEOUT=90m
 	TAG_TIMEOUT=15m
 	;;
 *)

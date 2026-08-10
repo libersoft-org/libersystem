@@ -29,6 +29,12 @@ pub struct Discovery {
 	// the migration path: annotating them is what makes the suite scopeable, and until a test is
 	// annotated the model refuses to guess that it can be skipped.
 	pub unannotated: usize,
+	// Ids the source declares that no built binary carries. Reported rather than refused: the
+	// ordinary cause is a binary older than the source, which is the state every edit passes
+	// through. The reason it is worth saying at all is that a test in this list cannot be selected
+	// and does not run - the model knows only what was built - so a declaration that stays here
+	// across a rebuild is a test nobody is running.
+	pub declared_not_built: Vec<String>,
 }
 
 pub fn discover(repo_root: &Path, architectures: &[&str]) -> Result<Discovery, String> {
@@ -74,14 +80,23 @@ pub fn discover(repo_root: &Path, architectures: &[&str]) -> Result<Discovery, S
 	let mut tests = Vec::new();
 	let mut unannotated = 0;
 	for (name, architectures) in per_test {
-		let covers = declarations.get(&name).cloned().unwrap_or_default();
-		if covers.is_empty() {
+		// A test in the built binary with no declaration in the source is a test whose identity the
+		// model does not know - so it cannot be named in an exact selection, and naming it by its
+		// function name is what this whole change exists to stop. Refuse rather than invent one.
+		let Some(declaration) = declarations.get(&name) else {
+			return Err(format!("kernel test `{name}` is in the built suite and has no `tagged_test!` declaration in `src/kernel` - the model cannot name what it cannot identify"));
+		};
+		if declaration.covers.is_empty() {
 			unannotated += 1;
 		}
-		tests.push(KernelTest { name, architectures: architectures.into_iter().collect(), covers });
+		tests.push(KernelTest { name, id: declaration.id.clone(), architectures: architectures.into_iter().collect(), covers: declaration.covers.clone() });
 	}
 	tests.sort();
-	Ok(Discovery { tests, touches, missing_targets, unannotated })
+	let built: BTreeSet<&str> = tests.iter().map(|test| test.id.as_str()).collect();
+	let mut declared_not_built: Vec<String> = declarations.values().map(|declaration| declaration.id.clone()).filter(|id| !built.contains(id.as_str())).collect();
+	declared_not_built.sort();
+	declared_not_built.dedup();
+	Ok(Discovery { tests, touches, missing_targets, unannotated, declared_not_built })
 }
 
 // Every plausible candidate, newest first. The caller takes the first that actually carries test
@@ -173,30 +188,58 @@ fn test_name_from_symbol(symbol: &str) -> Option<String> {
 // runs, and a test with no declaration is not skipped - it is always selected. That way the model
 // is correct from the first commit and gets cheaper as tests are annotated, rather than being
 // wrong until the last one is.
-fn scan_source(repo_root: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
+fn scan_source(repo_root: &Path) -> Result<BTreeMap<String, Declaration>, String> {
 	let mut declarations = BTreeMap::new();
-	scan_dir(&repo_root.join("src/kernel"), &mut declarations)?;
+	let mut seen = BTreeMap::new();
+	scan_dir(&repo_root.join("src/kernel"), &mut declarations, &mut seen)?;
 	Ok(declarations)
 }
 
-fn scan_dir(dir: &Path, out: &mut BTreeMap<String, Vec<String>>) -> Result<(), String> {
+fn scan_dir(dir: &Path, out: &mut BTreeMap<String, Declaration>, seen: &mut BTreeMap<String, String>) -> Result<(), String> {
 	let Ok(entries) = fs::read_dir(dir) else { return Ok(()) };
 	for entry in entries.flatten() {
 		let path = entry.path();
 		if path.is_dir() {
-			scan_dir(&path, out)?;
+			scan_dir(&path, out, seen)?;
 		} else if path.extension().is_some_and(|extension| extension == "rs") {
 			let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-			for (name, covers) in parse_declarations(&text) {
-				out.insert(name, covers);
+			for (name, id, covers) in parse_declarations(&text) {
+				if id.is_empty() {
+					return Err(format!("{}: `tagged_test!({name}, ..)` carries no `id = \"..\"`, and the identity of a test is not something this model may guess", path.display()));
+				}
+				// One name may be declared several times and MUST then carry one id: that is the
+				// arch-gated shape, where a `#[cfg(target_arch = "..")]` variant per target
+				// implements the same test three ways under one identity. Those merge, correctly.
+				//
+				// Two DIFFERENT ids under one function name is the other thing, and this model
+				// cannot tell those apart: per-architecture presence comes from the compiled
+				// binary's symbols, a symbol carries the function name, so the two would share
+				// architectures and covers and the id kept would be whichever file was read last.
+				//
+				// Not hypothetical: `breakpoint_exception_returns` was in both the x86_64 IDT and
+				// the riscv64 trap modules with different ids. Disambiguating costs a rename of the
+				// function - which is exactly what an explicit `id` exists to survive.
+				if let Some(first) = seen.insert(name.clone(), id.clone())
+					&& first != id
+				{
+					return Err(format!("{}: two tests share the Rust function name `{name}` under different ids (`{first}` and `{id}`), which this model cannot tell apart - rename one function; its `id` may stay as it is", path.display()));
+				}
+				out.insert(name, Declaration { id, covers });
 			}
 		}
 	}
 	Ok(())
 }
 
-// `tagged_test!(name, [Tags], covers = [alpha, beta])`, with the covers clause optional.
-pub fn parse_declarations(text: &str) -> Vec<(String, Vec<String>)> {
+// What the source says about one test: its identity and what it claims to cover.
+pub struct Declaration {
+	pub id: String,
+	pub covers: Vec<String>,
+}
+
+// `tagged_test!(name, [Tags], id = "..", covers = [alpha, beta])` -> (name, id, covers), with the
+// covers clause optional and `id` required (the macro has no arm without it).
+pub fn parse_declarations(text: &str) -> Vec<(String, String, Vec<String>)> {
 	let mut found = Vec::new();
 	let mut rest = text;
 	while let Some(index) = rest.find("tagged_test!(") {
@@ -230,7 +273,19 @@ pub fn parse_declarations(text: &str) -> Vec<(String, Vec<String>)> {
 			}
 			None => Vec::new(),
 		};
-		found.push((name.to_string(), covers));
+		// The `id = ".."` literal, which is the test's identity everywhere outside this parser.
+		//
+		// Taken from the text between the first quote after `id =` and the next one, rather than by
+		// splitting on commas: `covers` is a list and a future clause may be too, and an identity
+		// read out of the wrong clause is worse than no identity at all.
+		let id = arguments.find("id").and_then(|at| {
+			let tail = &arguments[at..];
+			let open = tail.find('"')?;
+			let rest = &tail[open + 1..];
+			let close = rest.find('"')?;
+			Some(rest[..close].to_string())
+		});
+		found.push((name.to_string(), id.unwrap_or_default(), covers));
 	}
 	found
 }

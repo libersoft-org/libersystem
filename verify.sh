@@ -300,6 +300,28 @@ if [[ "$action" == shadow ]]; then
 	printf 'total %s\n' "$host_total" >>"$host_log"
 	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --host-log "../$host_log") || shadow_failed=1
 
+	# The DEV GUEST universe, the third and last producer.
+	#
+	# It was declared and unfed: `Universe::of` routes `dev.*` checks to it and `trusted_everywhere`
+	# asks the catalog which universes may judge a component, so `bin.dev_agent`, `bin.dev_channel`,
+	# `harness.boot` and `proto` each required a certificate that no code path could grant. Two of
+	# those are ordinary components, not development curiosities.
+	dev_log="$BUILD_DIR/logs/verify-dev-shadow.txt"
+	: >"$dev_log"
+	dev_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- dev-checks)" || planner_failed "the planner could not list the dev-guest checks"
+	dev_total=0
+	while IFS=$'\t' read -r id arch command; do
+		[[ -n "$id" ]] || continue
+		dev_total=$((dev_total + 1))
+		if (cd "$SRC_DIR/.." && eval "$command") >/dev/null 2>&1; then
+			printf '%s PASS\n' "$id" >>"$dev_log"
+		else
+			printf '%s FAIL\n' "$id" >>"$dev_log"
+		fi
+	done <<<"$dev_ids"
+	printf 'total %s\n' "$dev_total" >>"$dev_log"
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --dev-log "../$dev_log") || shadow_failed=1
+
 	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"
 	model_after="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
 	if [[ "$source_before" != "$source_after" || "$model_before" != "$model_after" ]]; then

@@ -89,7 +89,11 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> 
 		// twenty tests run in 12 s against 108 s for all of them.
 		let worth_selecting = total > 0 && selected.len() * 5 < total * 4;
 		let (command, note) = if worth_selecting {
-			let ids: Vec<&str> = selected.iter().map(|key| key.check.strip_prefix("kernel.").unwrap_or(&key.check)).collect();
+			// The check id VERBATIM. It used to be stripped of its `kernel.` prefix, which matched
+			// the guest runner's identity only while that identity was `stringify!($name)`; the
+			// runner now matches the declaration's namespaced `id`, and an id it cannot find is a
+			// hard failure by design. The two strings have to be the same string.
+			let ids: Vec<&str> = selected.iter().map(|key| key.check.as_str()).collect();
 			(format!("TEST_SELECTION={} ./test.sh --arch {architecture}", ids.join(",")), Some(format!("{} of {total} tests, handed over by id", selected.len())))
 		} else if selected.len() < total {
 			(format!("./test.sh --arch {architecture}"), Some(format!("{} of {total} selected, close enough to all of them that handing over a list would cost more than it saves", selected.len())))

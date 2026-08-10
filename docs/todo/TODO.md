@@ -182,7 +182,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0115 - The kernel's lowest layers do not yet keep the promises the upper ones make](P02M0115.md)
 - [x] [P02M0116 - What P02M0114 left in the disk probe, and three gaps it opened itself](P02M0116.md)
 - [x] [P02M0117 - A wait set the kernel keeps](P02M0117.md)
-- [ ] [P02M0118 - Testing that scales with the change, not with the tree](P02M0118.md)
+- [x] [P02M0118 - Testing that scales with the change, not with the tree](P02M0118.md)
 - [x] [P02M0119 - A fault in a user copy must be an error, not a dead kernel](P02M0119.md)
 - [ ] [P02M0120 - A free must never lose the memory it frees](P02M0120.md)
 - [x] [P02M0121 - A receive that takes a message must be able to deliver it](P02M0121.md)
