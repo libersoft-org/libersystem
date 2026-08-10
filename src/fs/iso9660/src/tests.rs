@@ -99,9 +99,14 @@ fn build_iso(joliet: bool) -> Vec<u8> {
 		blk(17, &svd);
 		img[18 * SECTOR_SIZE] = 255;
 		img[18 * SECTOR_SIZE + 1..18 * SECTOR_SIZE + 6].copy_from_slice(b"CD001");
+		// The terminator carries a version too, and it is 1 like every other descriptor. The
+		// builder left it zero, which no mastering tool does - the parser now reads the field, so
+		// the fixture has to be a shape the format actually produces.
+		img[18 * SECTOR_SIZE + 6] = 1;
 	} else {
 		img[17 * SECTOR_SIZE] = 255;
 		img[17 * SECTOR_SIZE + 1..17 * SECTOR_SIZE + 6].copy_from_slice(b"CD001");
+		img[17 * SECTOR_SIZE + 6] = 1;
 	}
 	img
 }
@@ -303,4 +308,89 @@ fn listing_contract_and_dot_dot() {
 	let mut up: Vec<_> = fs.list_dir(b"SUB/..").unwrap().into_iter().map(|f| f.name).collect();
 	up.sort();
 	assert_eq!(up, ["HELLO.TXT", "SUB"]);
+}
+
+#[test]
+fn a_contradictory_both_endian_field_is_refused() {
+	// ECMA-119 records the critical numbers twice, once per byte order, and this reader took the
+	// little half of all of them. A volume whose two halves disagree is internally contradictory
+	// and used to mount.
+	let mut img = build_iso(false);
+	// The big half of the volume space size, made to disagree with the little half.
+	img[16 * SECTOR_SIZE + 84..16 * SECTOR_SIZE + 88].copy_from_slice(&999u32.to_be_bytes());
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a both-endian field whose halves disagree must not mount");
+
+	// And the same for the root record's extent, which is where a disagreement would point the
+	// whole namespace somewhere else.
+	let mut img = build_iso(false);
+	img[16 * SECTOR_SIZE + 156 + 6..16 * SECTOR_SIZE + 156 + 10].copy_from_slice(&99u32.to_be_bytes());
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a root extent whose halves disagree must not mount");
+}
+
+#[test]
+fn a_volume_with_no_primary_descriptor_is_refused() {
+	// A Joliet SVD supplies the namespace on top of a PVD; it is not a volume on its own. The
+	// match answered `(Some(joliet), _)`, so a recognised Joliet descriptor alone was enough.
+	let mut img = build_iso(true);
+	// Turn the PVD into a descriptor of no interest, leaving the Joliet SVD and the terminator.
+	img[16 * SECTOR_SIZE] = 3;
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a Joliet SVD without a PVD is not a mountable volume");
+}
+
+#[test]
+fn a_descriptor_set_with_no_terminator_is_refused() {
+	// Nothing recorded whether the terminator was ever seen, so a set that simply stopped mounted.
+	let mut img = build_iso(false);
+	img[17 * SECTOR_SIZE] = 3; // was 255
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a descriptor set with no terminator must not mount");
+}
+
+#[test]
+fn a_wrong_descriptor_version_is_refused() {
+	let mut img = build_iso(false);
+	img[16 * SECTOR_SIZE + 6] = 2;
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "the descriptor version is part of the format and is read");
+}
+
+#[test]
+fn a_root_record_that_is_not_a_directory_is_refused() {
+	// The root record was taken entirely on trust: two numbers read out of it and nothing checked.
+	let mut img = build_iso(false);
+	img[16 * SECTOR_SIZE + 156 + 25] = 0; // clear the directory flag
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a root record without the directory flag is not a root");
+
+	let mut img = build_iso(false);
+	img[16 * SECTOR_SIZE + 156] = 30; // a length no Directory Record has
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a root record of the wrong length is refused");
+}
+
+#[test]
+fn a_record_crossing_a_sector_boundary_is_corrupt() {
+	// ECMA-119: a Directory Record shall not cross a logical sector boundary. The walk knew half
+	// the rule - a zero length skips to the next sector - and never checked the other half.
+	let mut img = build_iso(false);
+	// The root extent declared as 200 bytes rather than a whole sector, so the boundary the walk
+	// must respect is close enough for one record to straddle it - a record's length is a single
+	// byte, so it cannot reach across a 2048-byte sector on its own.
+	let root_rec = 16 * SECTOR_SIZE + 156;
+	img[root_rec + 10..root_rec + 14].copy_from_slice(&200u32.to_le_bytes());
+	img[root_rec + 14..root_rec + 18].copy_from_slice(&200u32.to_be_bytes());
+	// A record at 148 claiming 100 bytes runs past the 200 the extent declares.
+	let at = 19 * SECTOR_SIZE + ROOT_FREE;
+	img[at] = 100;
+	img[at + 32] = 1;
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("the volume still mounts");
+	assert!(matches!(fs.list(), Err(FsError::Corrupt)), "a record that runs past its sector is corruption, not the end of the directory");
+}
+
+#[test]
+fn a_malformed_record_is_corrupt_rather_than_a_short_listing() {
+	// Both walks used to `break` on a record they could not use, so a damaged directory was
+	// indistinguishable from one that does not hold the name: `NotFound` from a lookup and an `Ok`
+	// with a short list from a read.
+	let mut img = build_iso(false);
+	let at = 19 * SECTOR_SIZE + ROOT_FREE;
+	img[at] = 8; // shorter than a Directory Record can be
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("the volume still mounts");
+	assert!(matches!(fs.list(), Err(FsError::Corrupt)), "a record too short to be one is corruption");
 }

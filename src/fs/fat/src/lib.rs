@@ -248,7 +248,21 @@ impl<D: BlockDevice> FatFs<D> {
 					}
 					u16::from_le_bytes([table[off], table[off + 1]]) as u32
 				}
-				Kind::Fat32 | Kind::ExFat => {
+				// exFAT is NOT FAT32 with a different name: its entries are a full 32 bits, its
+				// end-of-chain is 0xFFFFFFFF, and there is no reserved top nibble to preserve.
+				// Sharing this branch meant a volume this driver created carried 0x0FFF_FFFF as a
+				// terminator - readable here only because the reader shared the mistake - and, far
+				// worse, growing a correctly formatted volume read a real 0xFFFFFFFF and wrote back
+				// `(cur & 0xF000_0000) | val`, which for cluster 5 is 0xF0000005. That is not a
+				// cluster pointer at all.
+				Kind::ExFat => {
+					let off = c as usize * 4;
+					if off + 3 >= table.len() {
+						break;
+					}
+					u32::from_le_bytes([table[off], table[off + 1], table[off + 2], table[off + 3]])
+				}
+				Kind::Fat32 => {
 					let off = c as usize * 4;
 					if off + 3 >= table.len() {
 						break;
@@ -325,6 +339,13 @@ impl<D: BlockDevice> FatFs<D> {
 			let _ = self.free_chain(first);
 			return Err(e);
 		}
+		// 1b. BARRIER: the data and the FAT are durable before the entry that names them is issued.
+		//     Otherwise the device may write them back in either order and the entry can land
+		//     first - a directory pointing at clusters whose contents never arrived.
+		if let Err(e) = self.barrier() {
+			let _ = self.free_chain(first);
+			return Err(e);
+		}
 		// 2. swap the directory entry in ONE read-modify-write: mark the old entry deleted
 		//    in the in-memory copy (its slots become reusable for the new entry), place the
 		//    new entry set, and write the directory back once.
@@ -338,10 +359,14 @@ impl<D: BlockDevice> FatFs<D> {
 		// 3. only now is the old chain unreachable - free it, best-effort: the write is
 		//    durable at this point, so a failing device may cost lost clusters (the class
 		//    the free walks already accept), never a false failure of a finished write.
+		// 2b. BARRIER before the old chain is freed: the new entry has to be durable first, or a
+		//     crash can leave the OLD entry live with its clusters already back in the free pool.
+		self.barrier()?;
 		if let Some(old) = old_first {
 			let _ = self.free_chain(old);
 		}
-		Ok(())
+		// Durable when it returns, which is what a caller that reports a written file assumes.
+		self.barrier()
 	}
 
 	// Delete a file named by a `/`-separated path: free its cluster chain and clear its
@@ -555,7 +580,8 @@ impl<D: BlockDevice> FatFs<D> {
 				if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
 			}
 			Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
-			Kind::Fat32 | Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
+			Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]),
+			Kind::Fat32 => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
 		})
 	}
 
@@ -564,8 +590,27 @@ impl<D: BlockDevice> FatFs<D> {
 		match self.geo.kind {
 			Kind::Fat12 => cluster >= 0x0FF8,
 			Kind::Fat16 => cluster >= 0xFFF8,
-			Kind::Fat32 | Kind::ExFat => cluster >= 0x0FFF_FFF8,
+			// exFAT's only end-of-chain value is 0xFFFFFFFF; FAT32 reserves 0x0FFFFFF8 and up.
+			Kind::ExFat => cluster == 0xFFFF_FFFF,
+			Kind::Fat32 => cluster >= 0x0FFF_FFF8,
 		}
+	}
+
+	// The write BARRIER: everything issued so far is durable before anything after it is issued.
+	//
+	// `BlockDevice::flush` existed, is documented in fs-core as the barrier a commit protocol needs,
+	// and the USB backend implements it as SCSI SYNCHRONIZE CACHE(10) - and this crate never called
+	// it, not once. Without it "the data was written before the directory entry" describes the order
+	// the CPU issued the writes and not the order they become durable, so the ordering every
+	// crash-safety claim in this file rests on was never actually requested of the device.
+	fn barrier(&mut self) -> Result<(), FsError> {
+		if self.dev.flush() { Ok(()) } else { Err(FsError::Io) }
+	}
+
+	// The device, so a test can inspect what the driver actually asked it for.
+	#[cfg(test)]
+	pub(crate) fn device_for_test(&mut self) -> &mut D {
+		&mut self.dev
 	}
 
 	// Write `count` logical sectors of `buf` starting at fs sector `sec`, expanding each
@@ -604,6 +649,19 @@ impl<D: BlockDevice> FatFs<D> {
 	// nibble as the specification requires. An out-of-heap index is refused before it
 	// can become a table offset - on corrupt media that offset lands in the volume's
 	// own data.
+	// The FAT write and read, reachable from the tests. The exFAT/FAT32 split below is the kind of
+	// thing an internal round trip cannot see - both ends shared the mistake - so a test has to be
+	// able to write an entry and read back what actually landed.
+	#[cfg(test)]
+	pub(crate) fn set_fat_entry_for_test(&mut self, cluster: u32, val: u32) -> Result<(), FsError> {
+		self.set_fat_entry(cluster, val)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn fat_entry_for_test(&mut self, cluster: u32) -> u32 {
+		self.next_cluster(cluster).unwrap_or(0)
+	}
+
 	fn set_fat_entry(&mut self, cluster: u32, val: u32) -> Result<(), FsError> {
 		if cluster < 2 || cluster > self.max_cluster() {
 			return Err(FsError::Invalid);
@@ -631,8 +689,13 @@ impl<D: BlockDevice> FatFs<D> {
 					buf[within..within + 2].copy_from_slice(&next.to_le_bytes());
 				}
 				Kind::Fat16 => buf[within..within + 2].copy_from_slice(&(val as u16).to_le_bytes()),
-				Kind::Fat32 | Kind::ExFat => {
+				// A full 32-bit entry, written whole: exFAT has no reserved top nibble, and
+				// preserving one turned a real 0xFFFFFFFF terminator into 0xF0000005 when the chain
+				// was grown to cluster 5.
+				Kind::ExFat => buf[within..within + 4].copy_from_slice(&val.to_le_bytes()),
+				Kind::Fat32 => {
 					let cur = u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]);
+					// FAT32 entries are 28-bit: the top nibble belongs to the medium.
 					let next = (cur & 0xF000_0000) | (val & 0x0FFF_FFFF);
 					buf[within..within + 4].copy_from_slice(&next.to_le_bytes());
 				}
@@ -666,7 +729,13 @@ impl<D: BlockDevice> FatFs<D> {
 			}
 			c += 1;
 		}
-		let eoc = 0x0FFF_FFFF;
+		// The terminator the FORMAT defines, not one constant for both: exFAT's only end-of-chain
+		// value is 0xFFFFFFFF, and writing 0x0FFF_FFFF made every volume this driver created
+		// non-conforming - readable here only because the reader shared the mistake.
+		let eoc = match self.geo.kind {
+			Kind::ExFat => 0xFFFF_FFFF,
+			_ => 0x0FFF_FFFF,
+		};
 		for i in 0..chain.len() {
 			let val = if i + 1 < chain.len() { chain[i + 1] } else { eoc };
 			if let Err(e) = self.set_fat_entry(chain[i], val) {
@@ -983,6 +1052,11 @@ impl<D: BlockDevice> FatFs<D> {
 			let _ = self.exfat_free(first);
 			return Err(e);
 		}
+		// The same barriers as the classic path, for the same reason.
+		if let Err(e) = self.barrier() {
+			let _ = self.exfat_free(first);
+			return Err(e);
+		}
 		let old = match self.exfat_swap_entry(dir, name, first, data.len() as u64) {
 			Ok(old) => old,
 			Err(e) => {
@@ -992,10 +1066,11 @@ impl<D: BlockDevice> FatFs<D> {
 		};
 		// the write is durable once the entry set lands - the release of the replaced
 		// clusters is best-effort, like the classic path's.
+		self.barrier()?;
 		if let Some(old) = old {
 			let _ = self.exfat_release(&old);
 		}
-		Ok(())
+		self.barrier()
 	}
 
 	// Delete an exFAT file: clear its entry set's in-use bits and release its clusters.
@@ -1158,7 +1233,13 @@ impl<D: BlockDevice> FatFs<D> {
 			}
 			c += 1;
 		}
-		let eoc = 0x0FFF_FFFF;
+		// The terminator the FORMAT defines, not one constant for both: exFAT's only end-of-chain
+		// value is 0xFFFFFFFF, and writing 0x0FFF_FFFF made every volume this driver created
+		// non-conforming - readable here only because the reader shared the mistake.
+		let eoc = match self.geo.kind {
+			Kind::ExFat => 0xFFFF_FFFF,
+			_ => 0x0FFF_FFFF,
+		};
 		for i in 0..chain.len() {
 			let val = if i + 1 < chain.len() { chain[i + 1] } else { eoc };
 			if let Err(e) = self.set_fat_entry(chain[i], val) {

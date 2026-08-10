@@ -306,14 +306,16 @@ fn build_exfat_tree(files: &[File], nfc_files: &[File], dirs: &[&str]) -> Vec<u8
 	let mut next = 4;
 	let mut root: Vec<u8> = Vec::new();
 	// the allocation bitmap lives in cluster 2; the root in cluster 3; both stay allocated.
-	set_fat(&mut fat, 4, 2, 0x0FFF_FFFF);
-	set_fat(&mut fat, 4, 3, 0x0FFF_FFFF);
+	// exFAT's end-of-chain is 0xFFFFFFFF. These fixtures wrote FAT32's 0x0FFF_FFFF, which is
+	// precisely why an internal round trip could not see the driver writing the same wrong value.
+	set_fat(&mut fat, 4, 2, 0xFFFF_FFFF);
+	set_fat(&mut fat, 4, 3, 0xFFFF_FFFF);
 	bm[0] |= 0b11;
 	push_exfat_bitmap(&mut root, 2, clusters.div_ceil(8) as u64);
 	for f in files {
 		let cluster = next;
 		next += 1;
-		set_fat(&mut fat, 4, cluster, 0x0FFF_FFFF);
+		set_fat(&mut fat, 4, cluster, 0xFFFF_FFFF);
 		bm[0] |= 1 << (cluster - 2);
 		let off = (heap + cluster - 2) * bps;
 		img[off..off + f.data.len()].copy_from_slice(f.data);
@@ -334,7 +336,7 @@ fn build_exfat_tree(files: &[File], nfc_files: &[File], dirs: &[&str]) -> Vec<u8
 	for d in dirs {
 		let cluster = next;
 		next += 1;
-		set_fat(&mut fat, 4, cluster, 0x0FFF_FFFF);
+		set_fat(&mut fat, 4, cluster, 0xFFFF_FFFF);
 		let idx = cluster - 2;
 		bm[idx / 8] |= 1 << (idx % 8);
 		push_exfat_entry_ex(&mut root, d, bps as u64, cluster as u32, false, true);
@@ -1634,13 +1636,13 @@ fn a_non_mirrored_fat32_volume_uses_its_active_copy() {
 	img[511] = 0xAA;
 	// the ACTIVE copy 1: root = cluster 2, HELLO.TXT = clusters 3 -> 4.
 	let f1 = 4 * bps;
-	for (c, v) in [(2usize, 0x0FFF_FFFFu32), (3, 4), (4, 0x0FFF_FFFF)] {
+	for (c, v) in [(2usize, 0xFFFF_FFFFu32), (3, 4), (4, 0xFFFF_FFFF)] {
 		img[f1 + c * 4..f1 + c * 4 + 4].copy_from_slice(&v.to_le_bytes());
 	}
 	// the STALE copy 0 calls clusters 3 and 4 free - reading it would truncate the
 	// file and hand its clusters out again.
 	let f0 = 3 * bps;
-	img[f0 + 2 * 4..f0 + 2 * 4 + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+	img[f0 + 2 * 4..f0 + 2 * 4 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
 	let mut root: Vec<u8> = Vec::new();
 	push_entry(&mut root, "HELLO.TXT", false, 700, 3);
 	img[heap * bps..heap * bps + root.len()].copy_from_slice(&root);
@@ -1686,4 +1688,70 @@ fn an_overwrite_preserves_the_creation_stamp_and_name_case() {
 	assert_eq!(u32::from_le_bytes(e[8..12].try_into().unwrap()), (d1 as u32) << 16, "the exFAT create timestamp must carry over");
 	assert_eq!(u32::from_le_bytes(e[12..16].try_into().unwrap()), (d2 as u32) << 16, "the exFAT modify timestamp must be fresh");
 	assert_eq!(u16::from_le_bytes(e[2..4].try_into().unwrap()), exfat_set_checksum(&e[..96]), "the set checksum must cover the carried stamp");
+}
+
+#[test]
+fn growing_a_conforming_exfat_chain_writes_a_cluster_pointer() {
+	// The bad one. exFAT's FAT shared FAT32's branch everywhere, so a real 0xFFFFFFFF terminator was
+	// read as a 28-bit value and written back as `(cur & 0xF000_0000) | val` - which, extending a
+	// chain to cluster 5, is 0xF0000005. That is not a cluster pointer at all, and it is what this
+	// driver did to a volume some other implementation had formatted correctly.
+	let mut img = build_exfat(&[File { path: "A.TXT", data: b"a" }]);
+	let bps = 512usize;
+	// Where build_exfat puts the FAT, the same way the stale-copy test above locates it.
+	let fat0 = 3 * bps;
+	// A conforming terminator on cluster 2, as a real formatter writes it.
+	img[fat0 + 2 * 4..fat0 + 2 * 4 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("mount");
+	// Extend the chain: cluster 2 now points at cluster 5.
+	fs.set_fat_entry_for_test(2, 5).expect("the entry is writable");
+	let entry = fs.fat_entry_for_test(2);
+	assert_eq!(entry, 5, "an exFAT FAT entry is a full 32-bit cluster number, got {entry:#x}");
+	assert_ne!(entry & 0xF000_0000, 0xF000_0000, "no top nibble is preserved on exFAT");
+}
+
+// A device that counts barriers and records the order writes reached it, so a commit protocol can
+// be checked rather than described.
+struct OrderedDisk {
+	data: Vec<u8>,
+	flushes: usize,
+	// The LBA of every write, in issue order, with a marker for each barrier.
+	log: Vec<(u64, bool)>,
+}
+
+impl BlockDevice for OrderedDisk {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		let start = lba as usize * SECTOR_SIZE;
+		let Some(src) = self.data.get(start..start + SECTOR_SIZE) else { return false };
+		buf.copy_from_slice(src);
+		true
+	}
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
+		let start = lba as usize * SECTOR_SIZE;
+		let Some(dst) = self.data.get_mut(start..start + SECTOR_SIZE) else { return false };
+		dst.copy_from_slice(buf);
+		self.log.push((lba, false));
+		true
+	}
+	fn flush(&mut self) -> bool {
+		self.flushes += 1;
+		self.log.push((0, true));
+		true
+	}
+}
+
+#[test]
+fn a_write_asks_the_device_for_its_barriers() {
+	// `flush()` was never called in this crate - not once - so "the data was written before the
+	// directory entry" described the order the CPU issued the writes and not the order they become
+	// durable. A device may write back in either order, and the entry landing first is a directory
+	// pointing at clusters whose contents never arrived.
+	let mut fs = FatFs::mount(OrderedDisk { data: build_fat(Kind::Fat32, &[File { path: "A.TXT", data: b"a" }]), flushes: 0, log: Vec::new() }).expect("mount");
+	fs.write_file(b"B.TXT", b"bb").expect("the write succeeds");
+	let disk = fs.device_for_test();
+	assert!(disk.flushes >= 2, "a publish needs a barrier before the entry and one after it, got {}", disk.flushes);
+	// And the ORDER: at least one write, then a barrier, then at least one more write.
+	let first_flush = disk.log.iter().position(|(_, barrier)| *barrier).expect("a barrier was requested");
+	assert!(first_flush > 0, "the data is written before the first barrier");
+	assert!(disk.log[first_flush + 1..].iter().any(|(_, barrier)| !*barrier), "the directory entry is written after the barrier");
 }

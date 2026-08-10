@@ -87,6 +87,7 @@ impl<D: BlockDevice> Iso9660<D> {
 		let mut pvd_root: Option<((u32, u32), u32, u32)> = None;
 		let mut joliet_root: Option<((u32, u32), u32, u32)> = None;
 		let mut block = [0u8; SECTOR_SIZE];
+		let mut terminated = false;
 		for i in 0..32 {
 			if !dev.read_block(FIRST_DESCRIPTOR_LBA + i, &mut block) {
 				return None;
@@ -94,18 +95,48 @@ impl<D: BlockDevice> Iso9660<D> {
 			if &block[1..6] != b"CD001" {
 				return None;
 			}
-			let found = (root_extent(&block), le32(&block[80..84]), u16::from_le_bytes([block[128], block[129]]) as u32);
+			// The descriptor VERSION, which was read past entirely. It is 1 for every descriptor
+			// this format defines, and it matters most for the type-2 descriptors, where a few
+			// bytes decide that this is Joliet.
+			if block[6] != 1 {
+				return None;
+			}
+			// The TYPE first: a terminator carries none of the fields below, so reading them out of
+			// it and requiring them to be well-formed refuses the very descriptor that says the set
+			// is complete.
+			if block[0] == 255 {
+				terminated = true;
+				break;
+			}
+			if block[0] != 1 && block[0] != 2 {
+				continue;
+			}
+			// Both halves of the volume space size and of the logical block size, which were taken
+			// from their little ends alone.
+			let Some(blocks) = both32(&block[80..88]) else { return None };
+			let Some(block_size) = both16(&block[128..132]) else { return None };
+			let Some(root) = root_extent(&block) else { return None };
+			let found = (root, blocks, block_size as u32);
 			match block[0] {
 				1 => pvd_root = Some(found),
 				2 if is_joliet(&block) => joliet_root = Some(found),
-				255 => break,
 				_ => {}
 			}
 		}
-		let (joliet, ((root_lba, root_len), blocks, block_size)) = match (joliet_root, pvd_root) {
-			(Some(r), _) => (true, r),
-			(None, Some(r)) => (false, r),
-			(None, None) => return None,
+		// The Volume Descriptor Set Terminator is REQUIRED. Nothing recorded whether one was ever
+		// seen, so a set that simply stopped - or ran past the thirty-second sector this scan
+		// bounds itself with - mounted anyway. The limit is a good one and reaching it is now a
+		// refusal rather than a silent truncation of the search.
+		if !terminated {
+			return None;
+		}
+		// A Joliet SVD supplies the namespace, and only ON TOP of a valid Primary Volume Descriptor.
+		// The match answered `(Some(joliet), _)`, so a recognised Joliet descriptor alone was enough
+		// and `pvd_root` being None was not an obstacle - which ECMA-119 does not allow.
+		let Some(primary) = pvd_root else { return None };
+		let (joliet, ((root_lba, root_len), blocks, block_size)) = match joliet_root {
+			Some(r) => (true, r),
+			None => (false, primary),
 		};
 		// the logical block size is 2048 on real media and the unit this backend reads
 		// in - any other legal size would be read at wrong positions, so it refuses -
@@ -177,46 +208,29 @@ impl<D: BlockDevice> Iso9660<D> {
 	// The "." / ".." self/parent records match by those names, so paths through them
 	// resolve the way the other backends behind the volume API resolve them.
 	fn find_entry(&mut self, lba: u32, len: u32, name: &[u8]) -> Result<Entry, FsError> {
-		let data = self.read_extent(lba, len)?;
-		let mut off = 0usize;
-		while off < data.len() {
-			let rec_len = data[off] as usize;
-			if rec_len == 0 {
-				// Records never span a block; a zero length skips to the next block.
-				off = (off / SECTOR_SIZE + 1) * SECTOR_SIZE;
-				continue;
-			}
-			if off + rec_len > data.len() {
-				break;
-			}
-			let rec = &data[off..off + rec_len];
-			if let Some(e) = parse_record(rec, self.geo.joliet)
+		let joliet = self.geo.joliet;
+		let mut found = None;
+		self.for_each_record(lba, len, |rec| {
+			if let Some(e) = parse_record(rec, joliet)
 				&& !e.name.is_empty()
 				&& eq_ci(&e.name, name)
 			{
-				return Ok(e);
+				found = Some(e);
+				return Ok(false);
 			}
-			off += rec_len;
-		}
-		Err(FsError::NotFound)
+			Ok(true)
+		})?;
+		found.ok_or(FsError::NotFound)
 	}
 
 	// Read every record in a directory extent into FileInfos, skipping the "." / ".."
 	// self/parent entries.
 	fn read_dir(&mut self, lba: u32, len: u32) -> Result<Vec<FileInfo>, FsError> {
-		let data = self.read_extent(lba, len)?;
-		let mut out = Vec::new();
-		let mut off = 0usize;
-		while off < data.len() {
-			let rec_len = data[off] as usize;
-			if rec_len == 0 {
-				off = (off / SECTOR_SIZE + 1) * SECTOR_SIZE;
-				continue;
-			}
-			if off + rec_len > data.len() {
-				break;
-			}
-			if let Some(e) = parse_record(&data[off..off + rec_len], self.geo.joliet)
+		let joliet = self.geo.joliet;
+		let mut out: Vec<FileInfo> = Vec::new();
+		let mut failed = None;
+		self.for_each_record(lba, len, |rec| {
+			if let Some(e) = parse_record(rec, joliet)
 				&& !e.special
 				&& !e.name.is_empty()
 				// records order equal names adjacently with versions descending, so a
@@ -225,11 +239,72 @@ impl<D: BlockDevice> Iso9660<D> {
 			{
 				// a directory reports a length of zero - the FileInfo contract,
 				// uniform across the backends behind the volume API.
-				out.push(FileInfo { name: e.name, size: if e.is_dir { 0 } else { e.size as u64 }, is_dir: e.is_dir });
+				let info = FileInfo { name: e.name, size: if e.is_dir { 0 } else { e.size as u64 }, is_dir: e.is_dir };
+				if out.try_reserve(1).is_err() {
+					failed = Some(FsError::NoSpace);
+					return Ok(false);
+				}
+				out.push(info);
 			}
-			off += rec_len;
+			Ok(true)
+		})?;
+		match failed {
+			Some(error) => Err(error),
+			None => Ok(out),
 		}
-		Ok(out)
+	}
+
+	// Walk a directory extent one SECTOR at a time, handing each record to `visit`.
+	//
+	// The whole extent used to be read into one `Vec` first, and `size` is a `u32` taken from the
+	// medium - so a crafted disc made `ls` allocate close to four gigabytes before the caller had
+	// opened anything. A sector at a time removes that entirely, and the boundary rule falls out of
+	// the structure instead of being another check to remember: a record that starts in a sector
+	// must END in it, which ECMA-119 requires and the old walk never tested.
+	//
+	// A record this cannot use is `Corrupt` rather than a `break`. Breaking made a damaged
+	// directory indistinguishable from one that simply does not hold the name - `NotFound` from a
+	// lookup, a short listing with an `Ok` from a read.
+	//
+	// `visit` returns Ok(false) to stop early.
+	fn for_each_record<F>(&mut self, lba: u32, len: u32, mut visit: F) -> Result<(), FsError>
+	where
+		F: FnMut(&[u8]) -> Result<bool, FsError>,
+	{
+		if len == 0 {
+			return Ok(());
+		}
+		let sectors = (len as u64).div_ceil(SECTOR_SIZE as u64);
+		if lba as u64 + sectors > self.geo.blocks as u64 {
+			return Err(FsError::Invalid);
+		}
+		let mut block = [0u8; SECTOR_SIZE];
+		for index in 0..sectors {
+			if !self.dev.read_block(lba as u64 + index, &mut block) {
+				return Err(FsError::Io);
+			}
+			// The last sector may be partial: only the bytes the extent claims are records.
+			let valid = ((len as u64 - index * SECTOR_SIZE as u64) as usize).min(SECTOR_SIZE);
+			let mut off = 0usize;
+			while off < valid {
+				let rec_len = block[off] as usize;
+				// Zero length: the rest of THIS sector is padding, which is how ECMA-119 says a
+				// directory ends a sector early.
+				if rec_len == 0 {
+					break;
+				}
+				// A Directory Record is 33 bytes before its identifier, and it may not cross the
+				// sector boundary.
+				if rec_len < 33 || off + rec_len > valid {
+					return Err(FsError::Corrupt);
+				}
+				if !visit(&block[off..off + rec_len])? {
+					return Ok(());
+				}
+				off += rec_len;
+			}
+		}
+		Ok(())
 	}
 
 	// Read `size` bytes starting at logical block `lba`, one block at a time. The extent
@@ -273,9 +348,27 @@ struct Entry {
 // Take a volume descriptor's root directory record (fixed 34 bytes at offset 156): its
 // extent LBA and data length, both stored little-endian first. The root record can
 // carry an XAR length too - its data follows those blocks, like any record's.
-fn root_extent(desc: &[u8]) -> (u32, u32) {
+fn root_extent(desc: &[u8]) -> Option<(u32, u32)> {
 	let r = &desc[156..156 + 34];
-	(le32(&r[2..6]).saturating_add(r[1] as u32), le32(&r[10..14]))
+	// The Root Directory Record is an ordinary 34-byte Directory Record and was taken entirely on
+	// trust: two little-endian numbers read out of it and nothing else checked. A malformed
+	// descriptor could therefore nominate any region of the volume as the root, as long as the
+	// extent survived the bounds check further on.
+	//
+	// Checked now: its own length, the directory flag, the single-byte identifier `0` that names
+	// the root, and both halves of the extent and the size.
+	if r[0] as usize != 34 || r[32] != 1 || r[33] != 0 {
+		return None;
+	}
+	// Bit 1 of the file flags is the directory bit; the root is a directory or it is not the root.
+	if r[25] & 0x02 == 0 {
+		return None;
+	}
+	let extent = both32(&r[2..10])?;
+	let size = both32(&r[10..18])?;
+	// The XAR skip is added to the extent; `saturating_add` invented a value the medium did not
+	// give when the two overflowed, so a `checked_add` and a refusal.
+	Some((extent.checked_add(r[1] as u32)?, size))
 }
 
 // A type-2 descriptor is Joliet when its escape sequences select UCS-2 (%/@, %/C, %/E)
@@ -393,4 +486,24 @@ fn eq_ci(a: &str, b: &[u8]) -> bool {
 // A little-endian u32 from a 4-byte slice; both-endian fields store LE first.
 fn le32(b: &[u8]) -> u32 {
 	u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+// A both-endian 32-bit field: little half, then big half, and they must AGREE.
+//
+// ECMA-119 records the volume space size, the root extent, and each file's extent and length twice,
+// in one field, once per byte order. This reader took the little half of all of them and never
+// looked at the other - so a volume claiming a little-endian length of 1000 and a big-endian length
+// of 0xFFFFFFFF is internally contradictory and was accepted. Comparing them is the cheapest
+// structural check this format offers, and it is the one the format was designed for.
+fn both32(b: &[u8]) -> Option<u32> {
+	let little = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+	let big = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+	(little == big).then_some(little)
+}
+
+// The 16-bit counterpart: little half, big half, and they must agree.
+fn both16(b: &[u8]) -> Option<u16> {
+	let little = u16::from_le_bytes([b[0], b[1]]);
+	let big = u16::from_be_bytes([b[2], b[3]]);
+	(little == big).then_some(little)
 }
