@@ -142,7 +142,11 @@ pub enum Disk {
 	// Distinct from `Blank` on purpose. Both mean "the whole device is the container", so
 	// both reach the same mount - but only one of them describes a disk with nothing on it,
 	// and an answer that cannot tell those apart is how this went wrong the first time.
-	// What keeps the existing volume safe is the MOUNT, which formats only on `Unformatted`.
+	// What kept the existing volume safe USED TO BE the mount, which formatted only on
+	// `Unformatted`. Nothing formats at boot any more - the capability was removed rather than
+	// gated - so this answer no longer authorises a write at all. It is a description of what the
+	// medium looks like, and the distinction is kept because an answer that cannot tell an empty
+	// disk from a formatted one is how this went wrong the first time.
 	LiberFsWholeDevice,
 	// A GPT naming a usable LiberFS partition, as (first LBA, last LBA) inclusive.
 	LiberFs { first: u64, last: u64 },
@@ -425,8 +429,10 @@ fn try_zeroed(len: usize) -> Result<Vec<u8>, Fault> {
 // position is exactly the field an attacker sets: a correctly-checksummed header physically at LBA
 // 1 claiming `current_lba = 65000` with a `first_usable` of 1 passes every relation between its own
 // fields, and a LiberFS entry may then start at LBA 1 - the sector the header is sitting in. The
-// mount finds no superblock there and the service formats over the table. That is the scenario this
-// crate was written to close, in a header that never told the truth about where it was.
+// mount finds no superblock there and, in the system this was written against, the service formatted
+// over the table. Format-on-boot has since been removed, so the ending is now a refused mount rather
+// than a destroyed partition table - and the header is still lying about where it is, which is the
+// thing this crate was written to close.
 //
 // The old probe checked the signature, that `entry_size` was a power of two in range, that
 // `num_entries` was non-zero, and then trusted the rest. It checked NEITHER CRC, no header

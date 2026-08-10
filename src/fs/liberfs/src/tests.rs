@@ -2893,6 +2893,15 @@ fn fsck_finds_a_record_routing_will_never_reach() {
 	});
 
 	let mut fs = LiberFs::mount(dev).unwrap();
+	// The MOUNT refuses to write to it, before `fsck` is asked anything.
+	//
+	// This assertion is the second half of a fix that was recorded as whole when it was not. The
+	// routing interval went into `mark_inode_tree` and not into `mark_dir_tree`, and the directory
+	// tree is where the fault is dangerous: a record no lookup can reach means a create of that
+	// same name writes a SECOND one down the side routing does reach, and the volume then holds one
+	// name twice in one directory with nothing to say which is real. The inode-tree version had a
+	// test; this one did not, and the milestone was ticked anyway.
+	assert!(fs.is_read_only(), "a directory holding a record routing cannot reach must not be written to");
 	let report = fs.fsck().unwrap();
 	assert!(mentions(&report.faults, b"routing will never reach"), "a misrouted record must be named: {:?}", report.faults);
 	// and the ordering and hash checks stay quiet, so this is the range check speaking.

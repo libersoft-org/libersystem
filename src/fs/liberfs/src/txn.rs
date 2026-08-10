@@ -481,14 +481,25 @@ impl<D: BlockDevice> LiberFs<D> {
 	// inodes, which the inode-tree walk already covers, so only the nodes are marked.
 	// Iterative and damage-tolerant like `mark_inode_tree`.
 	pub(crate) fn mark_dir_tree(&mut self, root: u64, root_crc: u32, map: &mut [u8]) -> Result<(), FsError> {
-		let mut nodes: Vec<(u64, u32)> = Vec::new();
+		// The same routing interval `mark_inode_tree` carries, for the same reason, and it was left
+		// out when that one got it.
+		//
+		// The directory tree is where the defect actually bites. A record whose hash the separators
+		// above route to the OTHER child is unreachable by lookup - so a create of that same name
+		// goes down the side routing does reach and writes a SECOND record for it, and the volume
+		// now has one name twice in one directory, in a freshly checksummed generation. Every local
+		// check passes on both leaves: ordering, the stored hash, the name policy, the CRC.
+		//
+		// `fsck` has found this since M0144 (`fsck_finds_a_record_routing_will_never_reach`) and a
+		// writable mount did not run `fsck`.
+		let mut nodes: Vec<(u64, u32, Option<u64>, Option<u64>)> = Vec::new();
 		// same guards as `mark_inode_tree`: skip out-of-pool links and marked blocks,
 		// marking at push so the work list stays bounded by the pool.
 		if root != 0 && root < self.num_blocks && self.mark(map, root) {
-			nodes.push((root, root_crc));
+			nodes.push((root, root_crc, None, None));
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		while let Some((ptr, want)) = nodes.pop() {
+		while let Some((ptr, want, lower, upper)) = nodes.pop() {
 			if !self.dev.read_block(ptr, &mut buf) {
 				self.walk_damage = true;
 				continue;
@@ -502,10 +513,35 @@ impl<D: BlockDevice> LiberFs<D> {
 				continue;
 			}
 			if node_type(&buf) == NODE_INTERNAL {
-				for i in 0..=internal_count(&buf) {
+				let count = internal_count(&buf);
+				for i in 0..=count {
 					let child = child_ptr(&buf, i);
+					let child_lower = if i == 0 { lower } else { Some(sep_key(&buf, i - 1)) };
+					let child_upper = if i == count { upper } else { Some(sep_key(&buf, i)) };
 					if child < self.num_blocks && self.mark(map, child) {
-						nodes.push((child, child_crc(&buf, i)));
+						nodes.push((child, child_crc(&buf, i), child_lower, child_upper));
+					}
+				}
+			} else if self.mark_strict {
+				// ONLY the routing interval here, and NOT the local validators, which is a
+				// deliberate difference from what an audit asked for.
+				//
+				// A locally malformed leaf - unsorted, truncated, a stored hash that is not the
+				// name's - already has a considered answer in this tree: the listing still works,
+				// because it is what the operator has left, and every EDIT is refused as `Corrupt`.
+				// Two tests pin that (`an_unsorted_directory_leaf_may_be_read_but_not_edited` and
+				// its truncated twin), and running the same validators here would turn one damaged
+				// directory into a read-only volume and take the rescue away.
+				//
+				// A MISROUTED record is a different kind of fault and the write path cannot see it.
+				// Both leaves are locally perfect; what is wrong is that one of them is in the
+				// wrong place. Lookup goes where the separators point, does not find the name, and
+				// a create then writes a SECOND record for it - one name twice in one directory, in
+				// a freshly checksummed generation, with nothing afterwards to say which is real.
+				// That is worth the whole mount.
+				for rec in &crate::dir::dir_leaf_parse(&buf) {
+					if lower.is_some_and(|l| rec.hash < l) || upper.is_some_and(|u| rec.hash >= u) {
+						self.walk_damage = true;
 					}
 				}
 			}
