@@ -1,6 +1,6 @@
 use super::{scan, scan_xhci};
 
-crate::tagged_test!(pci_scan_finds_virtio_devices, [Pci, Drivers, ArchX86_64], covers = ["kernel"]);
+crate::tagged_test!(pci_scan_finds_virtio_devices, [Pci, Drivers, ArchX86_64], id = "kernel.arch.x86_64.pci.pci_scan_finds_virtio_devices", covers = ["kernel"]);
 fn pci_scan_finds_virtio_devices() {
 	// QEMU is launched (see qemu-run.sh) with virtio-blk, virtio-net, and a virtio
 	// serial device on the PCI bus. The kernel's PCI scan must find them: at least
@@ -14,7 +14,7 @@ fn pci_scan_finds_virtio_devices() {
 	}
 }
 
-crate::tagged_test!(pci_scan_finds_the_xhci_controller, [Pci, Drivers, Usb, ArchX86_64], covers = ["kernel"]);
+crate::tagged_test!(pci_scan_finds_the_xhci_controller, [Pci, Drivers, Usb, ArchX86_64], id = "kernel.arch.x86_64.pci.pci_scan_finds_the_xhci_controller", covers = ["kernel"]);
 fn pci_scan_finds_the_xhci_controller() {
 	// QEMU is launched (see qemu-run.sh) with a qemu-xhci USB host controller. The
 	// kernel's PCI scan must find it by its class triple (0x0C/0x03/0x30) and resolve

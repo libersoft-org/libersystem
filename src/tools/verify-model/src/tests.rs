@@ -1094,7 +1094,7 @@ fn evidence_in_one_universe_does_not_vouch_for_another() {
 
 	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest), crate::trust::Level::Trusted);
 	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::Host), crate::trust::Level::Shadow, "nothing has compared a host-suite selection for this component");
-	assert!(!store.trusted_everywhere("audio", "hash-a"), "and a scoped run therefore still has something unproven behind it");
+	assert!(!store.trusted_everywhere("audio", "hash-a", &[crate::shadow::Universe::Host, crate::shadow::Universe::TestGuest]), "and a scoped run therefore still has something unproven behind it");
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &log).is_err());
 }
 
@@ -1106,4 +1106,79 @@ fn a_check_id_says_which_universe_judges_it() {
 	for host in ["host.flac", "gate.volume-layout", "build.kernel", "conformance.png"] {
 		assert_eq!(Universe::of(host), Universe::Host, "{host} runs on the host");
 	}
+}
+
+#[test]
+fn the_cost_escalation_measures_seconds_and_not_keys() {
+	// It compared `selected / whole` over the key COUNT, which prices twenty host keys and twenty
+	// riscv64 guest keys the same when they differ by two orders of magnitude in wall-clock. The
+	// measurement to build it on already existed - `CostModel::estimate` - and nothing asked it.
+	let cost = crate::history::CostModel::default();
+	let history = crate::history::History::default();
+	let key = |architecture: &str, environment: crate::catalog::Environment, n: usize| -> Vec<crate::plan::PlanItemKey> { (0..n).map(|i| crate::plan::PlanItemKey { check: format!("k{i}"), architecture: architecture.to_string(), environment: environment.clone(), configuration: String::from("default") }).collect() };
+
+	// Twenty riscv64 guest keys against two hundred: the boot is paid once, so the difference is
+	// ninety seconds out of three thousand. Running all of them is within a tenth of running a
+	// tenth of them, which is the whole reason the rule exists.
+	let few = cost.estimate(&history, &key("riscv64", crate::catalog::Environment::TestGuest, 20));
+	let many = cost.estimate(&history, &key("riscv64", crate::catalog::Environment::TestGuest, 200));
+	assert!(few / many > 0.9, "20 of 200 riscv64 guest keys cost {few:.0} s against {many:.0} s - the boot dominates and the rule must see that");
+
+	// The same counts on the host, where there is no boot: twenty checks cost a tenth of two
+	// hundred, and widening would be pure extra work.
+	let few = cost.estimate(&history, &key("host", crate::catalog::Environment::Host, 20));
+	let many = cost.estimate(&history, &key("host", crate::catalog::Environment::Host, 200));
+	assert!(few / many < 0.2, "20 of 200 host keys cost {few:.0} s against {many:.0} s - there is nothing to amortise");
+
+	// And the count-based rule cannot tell those two apart, which is the defect stated as an
+	// assertion: identical ratios, opposite right answers.
+	assert_eq!(20.0 / 200.0, 20.0 / 200.0, "the ratio a key count sees is the same in both cases");
+}
+
+#[test]
+fn the_host_universe_has_a_producer_and_its_results_parse() {
+	// `trusted_everywhere` asks for Host AND TestGuest, and nothing ever wrote a Host record - so it
+	// could not return true for any component however much evidence accumulated. A universe the
+	// pipeline never feeds is not a gap in a trust model, it is a constant that reads like one.
+	//
+	// The host runner writes its results directly rather than being scraped out of a serial log: it
+	// knows each check's id and its exit status, and saying so is cheaper and less fragile than
+	// parsing prose.
+	let results = crate::shadow::parse_host_log("gate.test-tags PASS\nhost.flac FAIL\nconformance.png PASS\ntotal 3\n");
+	assert_eq!(results.total_declared, Some(3), "a run that covered fewer checks than exist did not compare what it claims to");
+	assert_eq!(results.outcomes.get("host.flac"), Some(&crate::shadow::Outcome::Failed));
+	assert_eq!(results.outcomes.get("gate.test-tags"), Some(&crate::shadow::Outcome::Passed));
+
+	// A failure INSIDE the selection is the selector working; one OUTSIDE it is the candidate miss
+	// the whole mechanism exists to find. The host ids are the catalog's own, with no prefix to
+	// strip - the guest's `kernel.` prefix is a property of that universe, not of comparison.
+	let history = crate::history::History::default();
+	let key = |check: &str| crate::plan::PlanItemKey { check: String::from(check), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from("default") };
+
+	let inside = crate::shadow::compare_host(&[key("host.flac")], &results, &history);
+	assert!(inside.outside_failures.is_empty(), "the only failure was selected: {:?}", inside.outside_failures);
+	assert!(!inside.inside_failures.is_empty(), "and it must be reported as selected");
+
+	let outside = crate::shadow::compare_host(&[key("gate.test-tags")], &results, &history);
+	assert_eq!(outside.verdict, crate::shadow::Verdict::CandidateMiss, "a failure the selection did not name is exactly what a shadow is for");
+}
+
+#[test]
+fn which_universes_may_judge_a_component_comes_from_its_checks() {
+	// Trust asked a fixed pair - Host and TestGuest - of every component, and that is wrong in both
+	// directions at once: it demands evidence from a universe that cannot reach the component, which
+	// can never be earned, and it ignores one that can, which makes the certificate mean less than
+	// it says.
+	let model = model();
+	let judges = |component: &str| crate::catalog::judging_universes(&model.catalog, component);
+
+	// A codec is judged on the host (its own suite) and in the guest (the image that ships it).
+	let flac = judges("flac");
+	assert!(flac.contains(&crate::shadow::Universe::Host), "flac has a host suite: {flac:?}");
+	assert!(!flac.is_empty(), "a component with checks has judges");
+
+	// A component nothing covers has NO judges, and `trusted_everywhere` must answer false rather
+	// than vacuously true - an empty `all()` is true, and that is the shape of the bug it would be.
+	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	assert!(!store.trusted_everywhere("a-component-no-check-covers", "hash", &[]), "no judge is not the same as every judge agreeing");
 }

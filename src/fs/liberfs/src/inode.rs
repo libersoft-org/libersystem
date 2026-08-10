@@ -129,12 +129,25 @@ impl<D: BlockDevice> LiberFs<D> {
 			inode.spill_crc = 0;
 			return Ok(());
 		}
-		let spilled: Vec<Extent> = inode.extents[EXTENTS_INLINE..].to_vec();
+		// Chunked over the extent map IN PLACE, with no copy of it.
+		//
+		// This used to be `inode.extents[EXTENTS_INLINE..].to_vec()`, and the copy was the last
+		// infallible allocation on the write side: an ordinary file makes it invisible, a heavily
+		// fragmented one makes it large, and an allocator that refuses aborts the service instead of
+		// returning `NoSpace`. M0153 applied that rule to the mount side; this is the other side of
+		// the same structure. The copy was never needed - the chunks are read once, in order, and
+		// `Extent` is `Copy` - so the fix removes an allocation rather than making one fallible.
+		let spilled = inode.extents.len() - EXTENTS_INLINE;
+		let blocks = spilled.div_ceil(EXTENTS_PER_BLOCK);
 		let mut next_ptr = 0u64;
 		let mut next_crc = 0u32;
-		for chunk in spilled.chunks(EXTENTS_PER_BLOCK).rev() {
+		// Back to front, so each block can carry the pointer and CRC of the one after it.
+		for block in (0..blocks).rev() {
+			let from = EXTENTS_INLINE + block * EXTENTS_PER_BLOCK;
+			let to = (from + EXTENTS_PER_BLOCK).min(inode.extents.len());
+			let chunk = &inode.extents[from..to];
 			let blk = self.alloc_meta()?;
-			let mut buf = vec![0u8; BLOCK_SIZE];
+			let mut buf = try_zeroed(BLOCK_SIZE)?;
 			buf[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].copy_from_slice(&next_ptr.to_le_bytes());
 			buf[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].copy_from_slice(&next_crc.to_le_bytes());
 			buf[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].copy_from_slice(&(chunk.len() as u32).to_le_bytes());

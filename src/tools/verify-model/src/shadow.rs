@@ -144,8 +144,60 @@ pub struct Comparison {
 	pub previously_failed: Vec<String>,
 }
 
+// A results file for the HOST universe: one `id PASS` or `id FAIL` per line, and a `total N` line.
+//
+// The guest gets its results by parsing a serial log, because that is the only channel a booted
+// kernel has. The host runner has no such constraint - it knows the id of every check it ran and
+// whether it passed - so it says so directly rather than being scraped.
+//
+// A `total` line is required for the same reason the guest's is: a run that covered fewer checks
+// than exist did not compare what it claims to, and a filtered run looks exactly like a clean one.
+pub fn parse_host_log(text: &str) -> GuestResults {
+	let mut outcomes = BTreeMap::new();
+	let mut total_declared = None;
+	for line in text.lines() {
+		let line = line.trim();
+		if let Some(rest) = line.strip_prefix("total ") {
+			total_declared = rest.trim().parse::<usize>().ok();
+			continue;
+		}
+		let Some((id, verdict)) = line.rsplit_once(' ') else { continue };
+		let outcome = match verdict.trim() {
+			"PASS" => Outcome::Passed,
+			"FAIL" => Outcome::Failed,
+			_ => continue,
+		};
+		outcomes.insert(id.trim().to_string(), outcome);
+	}
+	GuestResults { outcomes, total_declared }
+}
+
+// The guest comparison: kernel test names, one target, the test-guest environment.
 pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &str, history: &History) -> Comparison {
-	let scoped: BTreeSet<&str> = selected.iter().filter(|key| key.architecture == architecture).filter_map(|key| key.check.strip_prefix("kernel.")).collect();
+	compare_in(selected, results, architecture, "test-guest", Some("kernel."), history)
+}
+
+// The HOST comparison, which had no producer at all.
+//
+// `trusted_everywhere` asks for Host AND TestGuest, and nothing wrote a Host record - so it could
+// not return true for any component, ever. A trust model with a universe it never feeds is not a
+// model with a gap in it, it is a constant that reads like a model.
+//
+// The ids are the catalog's own (`gate.x`, `host.y`), so nothing is stripped; the architecture is
+// `host`, which is the only one this universe has.
+pub fn compare_host(selected: &[PlanItemKey], results: &GuestResults, history: &History) -> Comparison {
+	compare_in(selected, results, "host", "host", None, history)
+}
+
+fn compare_in(selected: &[PlanItemKey], results: &GuestResults, architecture: &str, environment: &str, strip: Option<&str>, history: &History) -> Comparison {
+	let scoped: BTreeSet<&str> = selected
+		.iter()
+		.filter(|key| key.architecture == architecture)
+		.filter_map(|key| match strip {
+			Some(prefix) => key.check.strip_prefix(prefix),
+			None => Some(key.check.as_str()),
+		})
+		.collect();
 	let mut outside = Vec::new();
 	let mut inside = Vec::new();
 	let mut previously_failed = Vec::new();
@@ -153,7 +205,7 @@ pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &
 		if *outcome != Outcome::Failed {
 			continue;
 		}
-		let key = format!("kernel.{name} / {architecture} / test-guest / test");
+		let key = format!("{}{name} / {architecture} / {environment} / test", strip.unwrap_or(""));
 		if history.get(&key).is_some_and(|record| record.failures > 0) {
 			previously_failed.push(key.clone());
 		}
@@ -251,21 +303,36 @@ impl Log {
 // CONTENT. The same question `lib.sh`'s `source_digest` answers for builds, asked here for
 // comparisons - and for the same reason: modification times cannot answer it.
 pub fn source_digest(repo_root: &Path) -> Result<String, String> {
-	let output = std::process::Command::new("git").arg("-C").arg(repo_root).arg("status").arg("--porcelain").output().map_err(|error| format!("git status: {error}"))?;
-	let dirty = String::from_utf8_lossy(&output.stdout);
+	// Through `changes.rs`, which is the ONE place in this tool that reads git.
+	//
+	// This parsed `git status --porcelain` by hand: it split each line on `" -> "` and kept the
+	// right-hand side, which is the exact rename defect `changes.rs` was written to fix, and it was
+	// not NUL-safe, so a path with a newline in it read as two files. Both of those change what this
+	// digest covers, and this digest is the thing that decides whether a shadow comparison is still
+	// about the tree that was compared.
+	//
+	// A second git parser in the tool whose subject is "the model must not quietly be wrong" is the
+	// kind of duplication that is only ever noticed after it has been wrong.
 	let head = std::process::Command::new("git").arg("-C").arg(repo_root).arg("rev-parse").arg("HEAD").output().map_err(|error| format!("git rev-parse: {error}"))?;
+	let changes = crate::changes::working_tree(repo_root)?;
 	let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
 	sha2::Digest::update(&mut hasher, head.stdout);
-	// The dirty set by NAME is not enough - a file edited twice has the same name and different
-	// content - so every changed file's bytes go in too.
-	for line in dirty.lines() {
-		let path = line.get(3..).unwrap_or("").rsplit(" -> ").next().unwrap_or("");
-		if path.is_empty() {
-			continue;
+	for change in &changes {
+		// The KIND as well as the paths: the same file deleted and re-added is not the same tree as
+		// the file left alone, and both would otherwise hash to whatever its bytes are now.
+		sha2::Digest::update(&mut hasher, format!("\n{:?} ", change.kind).as_bytes());
+		// BOTH sides of a rename. Keeping only the destination was how a rename out of a directory
+		// looked identical to a file appearing in one.
+		if let Some(origin) = &change.origin {
+			sha2::Digest::update(&mut hasher, origin.as_bytes());
+			sha2::Digest::update(&mut hasher, b" -> ");
 		}
-		sha2::Digest::update(&mut hasher, path.as_bytes());
-		if let Ok(bytes) = fs::read(repo_root.join(path)) {
-			sha2::Digest::update(&mut hasher, bytes);
+		sha2::Digest::update(&mut hasher, change.path.as_bytes());
+		// And the content, because a file edited twice has the same name and different bytes. A
+		// deletion has none, and its absence is part of what makes the digest differ.
+		match fs::read(repo_root.join(&change.path)) {
+			Ok(bytes) => sha2::Digest::update(&mut hasher, bytes),
+			Err(_) => sha2::Digest::update(&mut hasher, b"<absent>"),
 		}
 	}
 	Ok(format!("{:x}", sha2::Digest::finalize(hasher)))

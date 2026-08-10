@@ -1,6 +1,6 @@
 use super::*;
 
-tagged_test!(device_memory_maps_mmio_region, [Drivers], covers = ["kernel"]);
+tagged_test!(device_memory_maps_mmio_region, [Drivers], id = "kernel.hardware.device_memory_maps_mmio_region", covers = ["kernel"]);
 fn device_memory_maps_mmio_region() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	use object::device_memory::DeviceMemory;
@@ -39,6 +39,7 @@ tagged_test!(
 	#[cfg(target_arch = "x86_64")]
 	interrupt_bind_delivers_to_driver,
 	[Drivers, ArchX86_64],
+	id = "kernel.hardware.interrupt_bind_delivers_to_driver",
 	covers = ["kernel"]
 );
 #[cfg(target_arch = "x86_64")]
@@ -68,7 +69,7 @@ fn interrupt_bind_delivers_to_driver() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-tagged_test!(device_table_exposes_virtio_mmio, [Drivers], covers = ["kernel"]);
+tagged_test!(device_table_exposes_virtio_mmio, [Drivers], id = "kernel.hardware.device_table_exposes_virtio_mmio", covers = ["kernel"]);
 fn device_table_exposes_virtio_mmio() {
 	use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 	// device::init() populated the table at boot from the PCI scan. A driver-like
@@ -102,7 +103,7 @@ fn device_table_exposes_virtio_mmio() {
 	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the device MMIO should map to a valid address");
 }
 
-tagged_test!(device_table_exposes_the_xhci_controller, [Drivers, Usb], covers = ["kernel"]);
+tagged_test!(device_table_exposes_the_xhci_controller, [Drivers, Usb], id = "kernel.hardware.device_table_exposes_the_xhci_controller", covers = ["kernel"]);
 fn device_table_exposes_the_xhci_controller() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	// The xHCI controller joins the same device table the virtio devices live in. A
@@ -139,7 +140,7 @@ fn device_table_exposes_the_xhci_controller() {
 	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the xHCI register file should map to a valid address");
 }
 
-tagged_test!(xhci_driver_enumerates_the_usb_bus, [Drivers, Usb, Slow], covers = ["kernel"]);
+tagged_test!(xhci_driver_enumerates_the_usb_bus, [Drivers, Usb, Slow], id = "kernel.hardware.xhci_driver_enumerates_the_usb_bus", covers = ["kernel"]);
 fn xhci_driver_enumerates_the_usb_bus() {
 	use object::channel::{Channel, Message};
 	use object::device_memory::DeviceMemory;
@@ -306,7 +307,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	assert_eq!(read_from_object(file, size), expected, "vol://usb should serve the seeded file's bytes");
 }
 
-tagged_test!(dma_buffer_maps_and_reports_phys, [Drivers, Memory], covers = ["kernel"]);
+tagged_test!(dma_buffer_maps_and_reports_phys, [Drivers, Memory], id = "kernel.hardware.dma_buffer_maps_and_reports_phys", covers = ["kernel"]);
 fn dma_buffer_maps_and_reports_phys() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 	// A driver allocates a DMA buffer for its virtqueue, maps it, and programs its
@@ -347,7 +348,7 @@ fn dma_buffer_maps_and_reports_phys() {
 	assert_eq!(READBACK.load(Ordering::SeqCst), MARK, "the bytes written through the mapping must be visible at the physical base");
 }
 
-tagged_test!(device_service_lists_devices, [Service, Drivers], covers = ["kernel"]);
+tagged_test!(device_service_lists_devices, [Service, Drivers], id = "kernel.hardware.device_service_lists_devices", covers = ["kernel"]);
 fn device_service_lists_devices() {
 	use object::channel::Message;
 
@@ -389,6 +390,7 @@ tagged_test!(
 	#[cfg(target_arch = "x86_64")]
 	driver_crash_is_cleaned_up_and_notified,
 	[Drivers, Process, ArchX86_64],
+	id = "kernel.hardware.driver_crash_is_cleaned_up_and_notified",
 	covers = ["kernel"]
 );
 #[cfg(target_arch = "x86_64")]
@@ -427,6 +429,7 @@ tagged_test!(
 	#[cfg(target_arch = "x86_64")]
 	device_manager_reacts_to_a_driver_crash,
 	[Drivers, Process, ArchX86_64],
+	id = "kernel.hardware.device_manager_reacts_to_a_driver_crash",
 	covers = ["kernel"]
 );
 #[cfg(target_arch = "x86_64")]
@@ -462,7 +465,7 @@ fn device_manager_reacts_to_a_driver_crash() {
 	assert_eq!(device0, DeviceState::Offline, "DeviceManager should mark a crashed driver's device offline");
 }
 
-tagged_test!(driver_survives_crash_and_restart, [Process], covers = ["kernel"]);
+tagged_test!(driver_survives_crash_and_restart, [Process], id = "kernel.hardware.driver_survives_crash_and_restart", covers = ["kernel"]);
 fn driver_survives_crash_and_restart() {
 	use object::KernelObject;
 	// The driver crash/restart cycle: a driver that faults is respawned by its
@@ -495,7 +498,7 @@ fn driver_survives_crash_and_restart() {
 	assert!(restarts >= 1, "the supervisor should have restarted the crashed driver");
 }
 
-tagged_test!(taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it, [Pci, Drivers], covers = ["kernel"]);
+tagged_test!(taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it, [Pci, Drivers], id = "kernel.hardware.taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it", covers = ["kernel"]);
 fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 	// `SYS_DEVICE_ACQUIRE(index)` used to mint a `DeviceMemory` capability for anyone who named an
 	// index - so any ring-3 process could take the BAR of any PCI device, which contradicts

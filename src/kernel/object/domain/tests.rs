@@ -1,6 +1,6 @@
 use super::{Domain, UNLIMITED};
 
-crate::tagged_test!(domain_hierarchy_charges_aggregate_and_refund, [Domain, Kernel], covers = ["kernel"]);
+crate::tagged_test!(domain_hierarchy_charges_aggregate_and_refund, [Domain, Kernel], id = "kernel.object.domain.domain_hierarchy_charges_aggregate_and_refund", covers = ["kernel"]);
 fn domain_hierarchy_charges_aggregate_and_refund() {
 	// A child Domain's charges also count against its parent, and the parent's
 	// aggregate limit binds even when the child itself is unbounded. The parent
@@ -21,7 +21,7 @@ fn domain_hierarchy_charges_aggregate_and_refund() {
 	assert_eq!(parent.account().memory().peak(), 8192, "the high-water mark survives refunds");
 }
 
-crate::tagged_test!(object_property_set_bounds_a_domain, [Domain, Kernel, Syscall], covers = ["kernel"]);
+crate::tagged_test!(object_property_set_bounds_a_domain, [Domain, Kernel, Syscall], id = "kernel.object.domain.object_property_set_bounds_a_domain", covers = ["kernel"]);
 fn object_property_set_bounds_a_domain() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
@@ -40,7 +40,7 @@ fn object_property_set_bounds_a_domain() {
 	assert_eq!(domain.account().memory().limit(), 8192);
 }
 
-crate::tagged_test!(domain_quota_enforced_cleanly, [Domain, Kernel, Syscall], covers = ["kernel"]);
+crate::tagged_test!(domain_quota_enforced_cleanly, [Domain, Kernel, Syscall], id = "kernel.object.domain.domain_quota_enforced_cleanly", covers = ["kernel"]);
 fn domain_quota_enforced_cleanly() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);

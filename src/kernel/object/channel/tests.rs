@@ -5,7 +5,7 @@ use super::super::rights::Rights;
 use super::{Channel, ChannelError, Message};
 use crate::{arch, sched, syscall};
 
-crate::tagged_test!(channel_message_and_capability_transfer, [Channel, Ipc], covers = ["kernel"]);
+crate::tagged_test!(channel_message_and_capability_transfer, [Channel, Ipc], id = "kernel.object.channel.channel_message_and_capability_transfer", covers = ["kernel"]);
 fn channel_message_and_capability_transfer() {
 	static OK: AtomicBool = AtomicBool::new(false);
 	static MARKER: AtomicU64 = AtomicU64::new(0);
@@ -50,7 +50,7 @@ fn channel_message_and_capability_transfer() {
 	assert_eq!(MARKER.load(Ordering::SeqCst), 0x5151_5151);
 }
 
-crate::tagged_test!(a_sender_on_a_full_channel_blocks_and_wakes_on_drain, [Channel, Ipc], covers = ["kernel"]);
+crate::tagged_test!(a_sender_on_a_full_channel_blocks_and_wakes_on_drain, [Channel, Ipc], id = "kernel.object.channel.a_sender_on_a_full_channel_blocks_and_wakes_on_drain", covers = ["kernel"]);
 fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
 	static SENDER_REFUSED: AtomicBool = AtomicBool::new(false);
 	static SENDER_DONE: AtomicBool = AtomicBool::new(false);
@@ -98,7 +98,7 @@ fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
 	assert_eq!(RECEIVED.load(Ordering::SeqCst), 3, "every message was delivered");
 }
 
-crate::tagged_test!(channel_endpoint_semantics, [Channel, Ipc], covers = ["kernel"]);
+crate::tagged_test!(channel_endpoint_semantics, [Channel, Ipc], id = "kernel.object.channel.channel_endpoint_semantics", covers = ["kernel"]);
 fn channel_endpoint_semantics() {
 	let (sender, receiver) = Channel::create();
 	assert!(matches!(receiver.recv(), Err(ChannelError::Empty)));
@@ -111,7 +111,7 @@ fn channel_endpoint_semantics() {
 	assert!(matches!(receiver.recv(), Err(ChannelError::PeerClosed)));
 }
 
-crate::tagged_test!(channel_peek_reports_the_pending_length, [Channel, Ipc], covers = ["kernel"]);
+crate::tagged_test!(channel_peek_reports_the_pending_length, [Channel, Ipc], id = "kernel.object.channel.channel_peek_reports_the_pending_length", covers = ["kernel"]);
 fn channel_peek_reports_the_pending_length() {
 	let (sender, receiver) = Channel::create();
 	assert!(matches!(receiver.peek_len(), Err(ChannelError::Empty)));
@@ -129,7 +129,7 @@ fn channel_peek_reports_the_pending_length() {
 	assert!(matches!(receiver.peek_len(), Err(ChannelError::PeerClosed)));
 }
 
-crate::tagged_test!(blocking_wait_wakes_on_message, [Channel, Ipc], covers = ["kernel"]);
+crate::tagged_test!(blocking_wait_wakes_on_message, [Channel, Ipc], id = "kernel.object.channel.blocking_wait_wakes_on_message", covers = ["kernel"]);
 fn blocking_wait_wakes_on_message() {
 	static OK: AtomicBool = AtomicBool::new(false);
 	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
@@ -162,7 +162,7 @@ fn blocking_wait_wakes_on_message() {
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0);
 }
 
-crate::tagged_test!(wait_any_wakes_on_the_ready_handle, [Channel, Ipc], covers = ["kernel"]);
+crate::tagged_test!(wait_any_wakes_on_the_ready_handle, [Channel, Ipc], id = "kernel.object.channel.wait_any_wakes_on_the_ready_handle", covers = ["kernel"]);
 fn wait_any_wakes_on_the_ready_handle() {
 	static SECOND_HANDLE: AtomicU64 = AtomicU64::new(0);
 	static WAIT_RET: AtomicI64 = AtomicI64::new(-999);
@@ -203,7 +203,7 @@ fn wait_any_wakes_on_the_ready_handle() {
 	assert!(OK.load(Ordering::SeqCst));
 }
 
-crate::tagged_test!(channel_round_trip_delivers_request_and_reply, [Channel, Ipc], covers = ["kernel"]);
+crate::tagged_test!(channel_round_trip_delivers_request_and_reply, [Channel, Ipc], id = "kernel.object.channel.channel_round_trip_delivers_request_and_reply", covers = ["kernel"]);
 fn channel_round_trip_delivers_request_and_reply() {
 	// A request and a reply each deliver their exact bytes through the channel
 	// primitive, the path the latency benchmark times.
@@ -216,7 +216,7 @@ fn channel_round_trip_delivers_request_and_reply() {
 	assert_eq!(&reply.bytes[..], b"reply");
 }
 
-crate::tagged_test!(channel_queue_bytes_accounting_is_refunded_on_recv, [Channel, Domain, Ipc, Kernel, Syscall], covers = ["kernel"]);
+crate::tagged_test!(channel_queue_bytes_accounting_is_refunded_on_recv, [Channel, Domain, Ipc, Kernel, Syscall], id = "kernel.object.channel.channel_queue_bytes_accounting_is_refunded_on_recv", covers = ["kernel"]);
 fn channel_queue_bytes_accounting_is_refunded_on_recv() {
 	use crate::object::domain::{Domain, UNLIMITED};
 	static DONE: AtomicBool = AtomicBool::new(false);

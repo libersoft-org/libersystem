@@ -1,7 +1,7 @@
 use super::Timer;
 use crate::arch;
 
-crate::tagged_test!(timer_object_expires_and_cancels, [Object, Kernel], covers = ["kernel"]);
+crate::tagged_test!(timer_object_expires_and_cancels, [Object, Kernel], id = "kernel.object.timer.timer_object_expires_and_cancels", covers = ["kernel"]);
 fn timer_object_expires_and_cancels() {
 	let timer = Timer::create();
 	assert!(!timer.is_expired());
@@ -18,7 +18,7 @@ fn timer_object_expires_and_cancels() {
 	assert!(!timer.is_expired());
 }
 
-crate::tagged_test!(timer_syscall_arms_and_polls, [Object, Kernel, Syscall], covers = ["kernel"]);
+crate::tagged_test!(timer_syscall_arms_and_polls, [Object, Kernel, Syscall], id = "kernel.object.timer.timer_syscall_arms_and_polls", covers = ["kernel"]);
 fn timer_syscall_arms_and_polls() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);

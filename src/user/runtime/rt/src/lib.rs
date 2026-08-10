@@ -1887,10 +1887,16 @@ pub unsafe fn waitset_add(set: u64, object: u64) -> i64 {
 	unsafe { syscall(SYS_WAITSET_ADD, set, object, 0, 0) as i64 }
 }
 
-// Take an object out of the set. A member whose peer has closed does NOT leave by itself: it
-// becomes ready and says so, and this is how a caller retires it once it has dealt with that.
-pub unsafe fn waitset_remove(set: u64, object: u64) -> i64 {
-	unsafe { syscall(SYS_WAITSET_REMOVE, set, object, 0, 0) as i64 }
+// Take a member out of the set, BY KOID - the number `waitset_add` returned and `waitset_wait`
+// answers with. A member whose peer has closed does NOT leave by itself: it becomes ready and says
+// so, and this is how a caller retires it once it has dealt with that.
+//
+// It used to take the object's handle, which meant a caller had to still hold the handle to leave -
+// and the natural thing to do with a dead peer is close it. Closing first left the member behind,
+// and a closed peer is permanently readable, so the set woke on it forever. Taking the koid makes
+// that ordering impossible to get wrong rather than merely documented.
+pub unsafe fn waitset_remove(set: u64, koid: u64) -> i64 {
+	unsafe { syscall(SYS_WAITSET_REMOVE, set, koid, 0, 0) as i64 }
 }
 
 // Block until any member is ready, returning its KOID.

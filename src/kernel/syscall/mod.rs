@@ -217,8 +217,9 @@ fn sys_debug_write(arg: u64, len: u64) -> i64 {
 	// Copy the caller's bytes into a kernel buffer through the sanctioned SMAP
 	// window, so the serial path below never touches user memory directly (it
 	// holds the TX lock while it writes, so a fault there would deadlock).
-	let Some(bytes) = read_bytes(arg, len as usize) else {
-		return ERR_NO_MEMORY;
+	let bytes = match read_bytes(arg, len as usize) {
+		Ok(bytes) => bytes,
+		Err(error) => return error,
 	};
 	// Report how many bytes the transmit ring accepted: a caller pacing a mirror
 	// backlog resumes from there on its next pass instead of losing the tail.
@@ -395,28 +396,51 @@ fn read_user<T>(ptr: u64) -> T {
 	unsafe { value.assume_init() }
 }
 
-// Write `value` at a userspace address, if the caller may be written to there.
+// Copy `len` bytes to userspace, ALL of them, or say which syscall error it is.
 //
-// Silently does nothing when it may not, which is deliberate: every caller has already
-// validated its buffer with `user_buf_ok`, and this is the second line - a page that
-// became read-only or unmapped between that check and this write. Faulting in ring 0 is
-// what this kernel treats as its own bug and stops on, so the copy must not be attempted
-// against a page that cannot take it.
+// The faultable copies report how far they got, and for most callers "how far" is not a useful
+// answer - a syscall that filled 800 bytes of a 4096-byte result has not half-succeeded, it has
+// failed. Every call site used to discard the count, so a short copy was indistinguishable from a
+// complete one and the syscall returned success with the length it was ASKED for. This is the form
+// those callers should have had.
 //
-// It does NOT close the window entirely: the page can go away between the check here and
-// the store below. Closing that needs the fault-recovery table this milestone still owes.
-fn write_user<T>(ptr: u64, value: T) {
-	if !user_buf_writable(ptr, core::mem::size_of::<T>() as u64) {
-		return;
+// `ERR_NOT_MAPPED` rather than `ERR_INVALID`: the buffer was valid when it was checked, and what
+// happened since is that the caller's own address space changed under it.
+fn copy_to_user_exact(dst: u64, src: *const u8, len: usize) -> Result<(), i64> {
+	if len == 0 {
+		return Ok(());
 	}
-	// The check above stays, and its job has changed: it is no longer the safety mechanism but an
-	// early, cheap refusal of obvious nonsense - a null pointer, a range that wraps, an address in
-	// the kernel half. What makes the write SAFE is that it goes through the faultable copy, so the
-	// page disappearing between the two is a short write instead of a fault in ring 0.
+	let copied = arch::paging::user_access(|| unsafe { arch::usercopy::copy_to_user(dst, src, len) });
+	if copied == len { Ok(()) } else { Err(ERR_NOT_MAPPED) }
+}
+
+// The same in the other direction: every byte, or an error.
+fn copy_from_user_exact(dst: *mut u8, src: u64, len: usize) -> Result<(), i64> {
+	if len == 0 {
+		return Ok(());
+	}
+	let read = arch::paging::user_access(|| unsafe { arch::usercopy::copy_from_user(dst, src, len) });
+	if read == len { Ok(()) } else { Err(ERR_NOT_MAPPED) }
+}
+
+// Write `value` at a userspace address, or say why not.
+//
+// There is deliberately NO infallible form. This used to be one - it returned `()`, and a page that
+// went away between `user_buf_writable` and the store simply did not get written while the syscall
+// reported success. `SYS_CHANNEL_CREATE` is the sharpest example: it installs two handles, writes
+// their numbers out, and returned 0 whether or not the numbers arrived, so a caller could own two
+// handles it had never been told the names of - unclosable, and a success it could not act on.
+//
+// `user_buf_writable` stays and its job has changed: it is no longer the safety mechanism but an
+// early, cheap refusal of obvious nonsense - a null pointer, a range that wraps, an address in the
+// kernel half. What makes the write SAFE is the faultable copy underneath it.
+#[must_use]
+fn write_user<T>(ptr: u64, value: T) -> Result<(), i64> {
+	if !user_buf_writable(ptr, core::mem::size_of::<T>() as u64) {
+		return Err(ERR_NOT_MAPPED);
+	}
 	let value = core::mem::ManuallyDrop::new(value);
-	arch::paging::user_access(|| unsafe {
-		arch::usercopy::copy_to_user(ptr, &value as *const core::mem::ManuallyDrop<T> as *const u8, core::mem::size_of::<T>());
-	});
+	copy_to_user_exact(ptr, &value as *const core::mem::ManuallyDrop<T> as *const u8, core::mem::size_of::<T>())
 }
 
 // Entry point called by the architecture syscall stub. `num` selects the call;
@@ -664,7 +688,9 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64, privilege: u64) -> i64 {
 		free_vrange(Some(&space), base, total);
 		return ERR_NO_MEMORY;
 	}
-	write_user(buf_ptr, geom);
+	if let Err(e) = write_user(buf_ptr, geom) {
+		return e;
+	}
 	// Hand the display to the caller: the kernel console stops drawing to it.
 	crate::console::disable();
 	base as i64
@@ -685,9 +711,9 @@ fn sys_console_readlog(buf_ptr: u64, buf_len: u64) -> i64 {
 		None => return 0,
 	};
 	let n = (text.len() as u64).min(buf_len) as usize;
-	arch::paging::user_access(|| unsafe {
-		arch::usercopy::copy_to_user(buf_ptr, text.as_ptr(), n);
-	});
+	if let Err(error) = copy_to_user_exact(buf_ptr, text.as_ptr(), n) {
+		return error;
+	}
 	n as i64
 }
 
@@ -704,9 +730,9 @@ fn sys_boot_profile(buf_ptr: u64, buf_len: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let n = profile.len().min(buf_len as usize);
-	arch::paging::user_access(|| unsafe {
-		arch::usercopy::copy_to_user(buf_ptr, profile.as_ptr(), n);
-	});
+	if let Err(error) = copy_to_user_exact(buf_ptr, profile.as_ptr(), n) {
+		return error;
+	}
 	n as i64
 }
 
@@ -720,7 +746,11 @@ fn sys_cpu_info(buf_ptr: u64, buf_len: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	for cpu in 0..n {
-		write_user((buf_ptr as *mut u32).wrapping_add(cpu) as u64, crate::smp::lapic_id(cpu));
+		// A buffer that went away partway leaves the caller a list it cannot tell is short, so the
+		// loop stops and says so rather than reporting the full core count over a half-written array.
+		if let Err(e) = write_user((buf_ptr as *mut u32).wrapping_add(cpu) as u64, crate::smp::lapic_id(cpu)) {
+			return e;
+		}
 	}
 	count as i64
 }
@@ -738,7 +768,9 @@ fn sys_cpu_name(buf_ptr: u64, buf_len: u64) -> i64 {
 			return ERR_INVALID;
 		}
 		for (i, &b) in brand[..n].iter().enumerate() {
-			write_user((buf_ptr as *mut u8).wrapping_add(i) as u64, b);
+			if let Err(e) = write_user((buf_ptr as *mut u8).wrapping_add(i) as u64, b) {
+				return e;
+			}
 		}
 	}
 	n as i64
@@ -755,7 +787,9 @@ fn sys_memory_stats(buf_ptr: u64, buf_len: u64) -> i64 {
 	let (total_frames, free_frames) = crate::mem::frame::totals();
 	let (heap_total, heap_free) = crate::mem::heap::stats();
 	let out = MemoryStats { total_frames: total_frames as u64, free_frames: free_frames as u64, heap_total, heap_free };
-	write_user(buf_ptr, out);
+	if let Err(e) = write_user(buf_ptr, out) {
+		return e;
+	}
 	1
 }
 
@@ -772,7 +806,9 @@ fn sys_memmap_get(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	write_user(buf_ptr, region);
+	if let Err(e) = write_user(buf_ptr, region) {
+		return e;
+	}
 	crate::mem::memmap_len() as i64
 }
 
@@ -789,7 +825,9 @@ fn sys_irq_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	write_user(buf_ptr, info);
+	if let Err(e) = write_user(buf_ptr, info) {
+		return e;
+	}
 	arch::interrupts::irq_info_len() as i64
 }
 
@@ -806,7 +844,9 @@ fn sys_pci_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	write_user(buf_ptr, info);
+	if let Err(e) = write_user(buf_ptr, info) {
+		return e;
+	}
 	device::pci_count() as i64
 }
 
@@ -864,7 +904,9 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, bus: d.bus, dev: d.dev, func: d.func, _pad: 0 });
 	match info {
 		Some(info) => {
-			write_user(buf_ptr, info);
+			if let Err(e) = write_user(buf_ptr, info) {
+				return e;
+			}
 			0
 		}
 		None => ERR_INVALID,
@@ -940,9 +982,12 @@ fn random_into(buf_ptr: u64, len: u64, must_be_secure: bool) -> i64 {
 		} else {
 			arch::random::insecure(&mut scratch[..n]);
 		}
-		arch::paging::user_access(|| unsafe {
-			arch::usercopy::copy_to_user(buf_ptr + filled, scratch.as_ptr(), n);
-		});
+		// `filled` counted the chunk whether or not it landed, so a buffer that went away partway
+		// left the caller told it had `len` bytes of randomness over memory holding whatever was
+		// there before - the worst possible thing to be wrong about quietly.
+		if let Err(error) = copy_to_user_exact(buf_ptr + filled, scratch.as_ptr(), n) {
+			return error;
+		}
 		filled += n as u64;
 	}
 	filled as i64
@@ -1106,9 +1151,11 @@ fn sys_object_property_set(handle: u64, prop: u64, a2: u64, a3: u64) -> i64 {
 			}
 		};
 		let mut buf = [0u8; MAX_NAME as usize];
-		arch::paging::user_access(|| unsafe {
-			arch::usercopy::copy_from_user(buf.as_mut_ptr(), ptr, len as usize);
-		});
+		// A short read would leave zeros in the tail and the name would silently be a different
+		// name - one the caller never asked to set.
+		if let Err(error) = copy_from_user_exact(buf.as_mut_ptr(), ptr, len as usize) {
+			return error;
+		}
 		let name = match core::str::from_utf8(&buf[..len as usize]) {
 			Ok(s) => s,
 			Err(_) => return ERR_INVALID,
@@ -1171,17 +1218,33 @@ fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	// Read the image in place from the caller's (active) address space: the loader
-	// copies only the PT_LOAD segments into the child's fresh frames, so there is no
-	// need to buffer the whole ELF on the kernel heap. The caller's tables stay
-	// active across the load (the child is mapped through its own CR3, not switched
-	// to), so the slice remains valid. The whole load runs inside the sanctioned
-	// SMAP window: the loader reads the caller's mapped image throughout (buffering
-	// a multi-megabyte ELF on the kernel heap is exactly what this path avoids), so
-	// this is the one deliberately broad window - still a leaf operation that never
-	// yields or blocks.
-	let image = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len as usize) };
-	match arch::paging::user_access(|| loader::load_image_into(&process, image)) {
+	// BUFFERED, and this is the milestone's own defect closed.
+	//
+	// It used to read the image in place: `from_raw_parts(elf_ptr, elf_len)` and the whole loader
+	// running inside a `user_access` window. The reasoning was that the loader copies only the
+	// PT_LOAD segments, so buffering the whole ELF was a cost with no return - and that is true
+	// right up until another thread in the caller's process unmaps the buffer mid-load. Then the
+	// kernel takes a page fault in ring 0 at an instruction inside the ELF parser, which is not in
+	// `.extable` and cannot be, because it is ORDINARY CODE reading a slice. The machine halts.
+	//
+	// M0149 built the exception table for exactly this class and this path bypassed it. It needs no
+	// privilege: a process creates a child in its own Domain, holds MANAGE on it, calls load on a
+	// large image and unmaps the buffer from a second thread.
+	//
+	// One copy, bounded by `MAX_ELF_BYTES` and fallible, is what makes the loader read memory
+	// userspace cannot take away. It costs a copy of the file per spawn - about a megabyte for the
+	// programs this system actually has - against a spawn that already allocates and fills a frame
+	// per loaded page. If images ever reach the tens of megabytes the ceiling allows, the answer is
+	// to take a MemoryObject handle instead of a pointer, so the kernel holds a reference to the
+	// backing and reads its frames directly; that is an ABI change, and it is not worth making for
+	// a size this system does not have.
+	let Some(mut image) = try_zeroed_bytes(elf_len as usize) else {
+		return ERR_NO_MEMORY;
+	};
+	if let Err(error) = copy_from_user_exact(image.as_mut_ptr(), elf_ptr, elf_len as usize) {
+		return error;
+	}
+	match loader::load_image_into(&process, &image) {
 		Ok(entry) => entry as i64,
 		Err(LoadError::OutOfMemory) => ERR_NO_MEMORY,
 		Err(LoadError::BadImage) => ERR_INVALID,
@@ -1196,8 +1259,15 @@ fn sys_process_load_module(process_handle: u64, elf_ptr: u64, elf_len: u64, bias
 		Ok(process) => process,
 		Err(error) => return error,
 	};
-	let image = unsafe { core::slice::from_raw_parts(elf_ptr as *const u8, elf_len as usize) };
-	match arch::paging::user_access(|| loader::load_module_into(&process, image, bias)) {
+	// Buffered for the reason `sys_process_load` is, and it is the same defect: a module image read
+	// in place is read by ordinary loader code that no exception-table entry can rescue.
+	let Some(mut image) = try_zeroed_bytes(elf_len as usize) else {
+		return ERR_NO_MEMORY;
+	};
+	if let Err(error) = copy_from_user_exact(image.as_mut_ptr(), elf_ptr, elf_len as usize) {
+		return error;
+	}
+	match loader::load_module_into(&process, &image, bias) {
 		Ok(()) => 0,
 		Err(LoadError::OutOfMemory) => ERR_NO_MEMORY,
 		Err(LoadError::BadImage) => ERR_INVALID,
@@ -1329,9 +1399,11 @@ fn sys_process_group_create(handles_ptr: u64, count: u64) -> i64 {
 	let Some(mut raw) = try_zeroed_u64(count as usize) else {
 		return ERR_NO_MEMORY;
 	};
-	arch::paging::user_access(|| unsafe {
-		arch::usercopy::copy_from_user(raw.as_mut_ptr() as *mut u8, handles_ptr, (count as usize) * 8);
-	});
+	// A short read leaves zeros, and handle 0 is a handle: the group would be built from members
+	// the caller did not name.
+	if let Err(error) = copy_from_user_exact(raw.as_mut_ptr() as *mut u8, handles_ptr, (count as usize) * 8) {
+		return error;
+	}
 	let mut members = alloc::vec::Vec::with_capacity(raw.len());
 	for handle in raw {
 		match current_typed::<Process>(handle, ObjectType::Process, Rights::MANAGE) {
@@ -1536,9 +1608,9 @@ fn sys_handle_close(handle: u64) -> i64 {
 // Copy a byte payload out of a caller-supplied buffer through the sanctioned SMAP
 // window. Ring-0 self-calls pass kernel pointers, which the window does not
 // affect; a ring-3 caller's pointer has been validated by user_buf_ok.
-fn read_bytes(ptr: u64, len: usize) -> Option<Vec<u8>> {
+fn read_bytes(ptr: u64, len: usize) -> Result<Vec<u8>, i64> {
 	if ptr == 0 || len == 0 {
-		return Some(Vec::new());
+		return Ok(Vec::new());
 	}
 	// An allocation this kernel could not make is NOT an empty message.
 	//
@@ -1547,11 +1619,18 @@ fn read_bytes(ptr: u64, len: usize) -> Option<Vec<u8>> {
 	// - and this system has at least one, where it marks the end of a write stream - memory pressure
 	// silently changed what was said. The batch path already answered `ERR_NO_MEMORY` here; this one
 	// had its own helper and its own answer.
-	let mut bytes = try_zeroed_bytes(len)?;
-	arch::paging::user_access(|| unsafe {
-		arch::usercopy::copy_from_user(bytes.as_mut_ptr(), ptr, len);
-	});
-	Some(bytes)
+	// The two failures are told apart because they send an operator to different components: a
+	// refused allocation is this machine, a short read is the caller's own address space.
+	let Some(mut bytes) = try_zeroed_bytes(len) else {
+		return Err(ERR_NO_MEMORY);
+	};
+	// EVERY byte, or nothing. The buffer is zero-filled, so a short read used to produce the prefix
+	// the caller meant followed by zeros it did not - and `sys_channel_send` sent that and reported
+	// success. Zero-filling is right for a scalar (`read_user`), where a partly-read value must not
+	// carry stack residue into a decision; for a payload it turns a failed copy into a plausible
+	// message.
+	copy_from_user_exact(bytes.as_mut_ptr(), ptr, len)?;
+	Ok(bytes)
 }
 
 // Create a connected channel pair, install a handle to each endpoint in the
@@ -1584,8 +1663,22 @@ fn sys_channel_create(out0_ptr: u64, out1_ptr: u64, depth: u64) -> i64 {
 		};
 		(h0, h1)
 	};
-	write_user(out0_ptr, h0.raw());
-	write_user(out1_ptr, h1.raw());
+	// Both numbers out, or NEITHER handle stays.
+	//
+	// This returned 0 whatever happened to the writes. If the output page went away after
+	// `user_buf_ok` - the caller's own doing, from another thread - the caller then owned two
+	// endpoints whose numbers it had never been told: unclosable, uncloseable by anyone, and held
+	// against its Domain's handle quota until the process died. A success it could not act on and a
+	// leak it could not find.
+	//
+	// Rolling both back is the only answer that leaves the caller where it started. Rolling back
+	// just the second would leave one endpoint of a pair, which is not a thing to hand anybody.
+	if let Err(error) = write_user(out0_ptr, h0.raw()).and_then(|()| write_user(out1_ptr, h1.raw())) {
+		let mut table = thread.handles().lock();
+		let _ = table.close(h0);
+		let _ = table.close(h1);
+		return error;
+	}
 	0
 }
 
@@ -1613,8 +1706,9 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 	if !user_buf_ok(bytes_ptr, bytes_len) {
 		return ERR_INVALID;
 	}
-	let Some(bytes) = read_bytes(bytes_ptr, bytes_len as usize) else {
-		return ERR_NO_MEMORY;
+	let bytes = match read_bytes(bytes_ptr, bytes_len as usize) {
+		Ok(bytes) => bytes,
+		Err(error) => return error,
 	};
 	// THE SAME transfer the batch path uses, and for the reason the batch path was given it.
 	//
@@ -1726,9 +1820,10 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 	let Some(mut bytes) = try_zeroed_bytes(bytes_len as usize) else {
 		return ERR_NO_MEMORY;
 	};
-	arch::paging::user_access(|| unsafe {
-		arch::usercopy::copy_from_user(bytes.as_mut_ptr(), bytes_ptr, bytes_len as usize);
-	});
+	// The payload, all of it - see `read_bytes` for why a short read must not become a message.
+	if let Err(error) = copy_from_user_exact(bytes.as_mut_ptr(), bytes_ptr, bytes_len as usize) {
+		return error;
+	}
 	let badge = thread.handles().lock().badge_of(Handle::from_raw(ch)).unwrap_or(0);
 
 	if has_repeat(&raw[..count]) {
@@ -1905,23 +2000,51 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 		Ok(message) => message,
 		Err(error) => return error,
 	};
-	arch::paging::user_access(|| unsafe {
-		arch::usercopy::copy_to_user(bytes_ptr, message.bytes.as_ptr(), message.bytes.len());
-	});
+	// The payload BEFORE anything is installed, and the message goes back if it will not fit.
+	//
+	// A short copy here used to be invisible: the count was discarded, the capabilities were
+	// installed anyway, and the syscall returned the message's full length. The message was off the
+	// queue, the caller had part of it, and nothing said so - which is precisely the invariant M0151
+	// is named for, broken at the boundary M0149 opened behind it.
+	//
+	// The message is put back at the head rather than destroyed. A short copy means the caller
+	// unmapped its own buffer, and that is not a reason to lose what somebody else sent.
+	if let Err(error) = copy_to_user_exact(bytes_ptr, message.bytes.as_ptr(), message.bytes.len()) {
+		thread.handles().lock().release_reservation(message.caps.len().min(abi::MAX_MESSAGE_CAPS));
+		channel.return_to_head(message);
+		return error;
+	}
+	let delivered = message.bytes.len();
+	let mut raws = [0u64; abi::MAX_MESSAGE_CAPS];
 	let mut installed = 0usize;
 	{
 		let mut table = thread.handles().lock();
 		for cap in message.caps.into_iter().take(abi::MAX_MESSAGE_CAPS) {
 			// Against the reservation taken above. `insert` would charge the quota a second time
 			// for a handle already paid for, and could refuse a handle the caller was promised.
-			let handle = table.insert_reserved(cap);
-			write_user(caps_ptr + ((installed + 1) * 8) as u64, handle.raw());
+			raws[installed] = table.insert_reserved(cap).raw();
 			installed += 1;
 		}
 	}
-	write_user(caps_ptr, installed as u64);
+	// The array, then its count - and if any of it will not land, NONE of the handles stay.
+	//
+	// A caller that is not told a handle's number cannot close it, so a half-written array is a
+	// quota leak it can neither see nor repair. The writes used to be discarded outright, which made
+	// that the ordinary outcome of a caller unmapping its own buffer at the wrong moment.
+	//
+	// The message itself cannot be returned here the way the payload path returns it: the
+	// capabilities have left it and are in the handle table. What is recoverable is recovered - the
+	// handles are closed, so nothing leaks - and the caller gets an error instead of a length.
+	let out = (0..installed).try_for_each(|i| write_user(caps_ptr + ((i + 1) * 8) as u64, raws[i])).and_then(|()| write_user(caps_ptr, installed as u64));
+	if let Err(error) = out {
+		let mut table = thread.handles().lock();
+		for raw in raws.iter().take(installed) {
+			let _ = table.close(Handle::from_raw(*raw));
+		}
+		return error;
+	}
 	thread.process().record_recv();
-	message.bytes.len() as i64
+	delivered as i64
 }
 
 fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64) -> i64 {
@@ -1950,13 +2073,21 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 		Ok(message) => message,
 		Err(error) => return error,
 	};
-	thread.process().record_recv();
+	// The payload first, all of it, and the message goes back to the head if it will not land.
+	//
+	// `n` is a TRUNCATION to the caller's buffer and that is this receive's contract - see above. A
+	// short copy is a different thing: the caller's buffer stopped existing partway through, and
+	// discarding that count meant reporting `n` bytes delivered when fewer arrived. The message was
+	// already off the queue, so nothing could be retried and nothing said anything was wrong.
 	let n = core::cmp::min(message.bytes.len(), bytes_cap as usize);
 	if n > 0 && bytes_ptr != 0 {
-		arch::paging::user_access(|| unsafe {
-			arch::usercopy::copy_to_user(bytes_ptr, message.bytes.as_ptr(), n);
-		});
+		if let Err(error) = copy_to_user_exact(bytes_ptr, message.bytes.as_ptr(), n) {
+			thread.handles().lock().release_reservation(message.caps.len().min(1));
+			channel.return_to_head(message);
+			return error;
+		}
 	}
+	thread.process().record_recv();
 	// Install the transferred capability (if any) and report its new handle. Against the
 	// reservation taken above: `insert` is the UNBOUNDED install, and using it here is how a
 	// Domain at its handle limit went past it by receiving. The capabilities past the first are
@@ -1966,7 +2097,15 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 			Some(cap) => thread.handles().lock().insert_reserved(cap).raw(),
 			None => 0,
 		};
-		write_user(out_handle_ptr, handle_value);
+		// A handle whose number never reached the caller is a handle nobody can close. Closed here
+		// instead, and the error goes back in place of the length - the payload has already been
+		// delivered, so this is not a receive that can be retried, but it is one that does not leak.
+		if let Err(error) = write_user(out_handle_ptr, handle_value) {
+			if handle_value != 0 {
+				let _ = thread.handles().lock().close(Handle::from_raw(handle_value));
+			}
+			return error;
+		}
 	} else {
 		// No out pointer: the caller is not taking the capability, so the slot booked for it goes
 		// back. Nothing is installed and the message's capabilities are dropped with it.
@@ -2062,9 +2201,11 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 	let Some(mut raw) = try_zeroed_u64(n) else {
 		return ERR_NO_MEMORY;
 	};
-	arch::paging::user_access(|| unsafe {
-		arch::usercopy::copy_from_user(raw.as_mut_ptr() as *mut u8, handles_ptr, n * 8);
-	});
+	// All of it: a short read leaves zeros, and waiting on handle 0 is not what the caller asked
+	// for - it is waiting on something else entirely, or on nothing.
+	if let Err(error) = copy_from_user_exact(raw.as_mut_ptr() as *mut u8, handles_ptr, n * 8) {
+		return error;
+	}
 	// Resolve every handle once up front, recording each object and its koid. The
 	// scratch tables are heap-allocated, sized by the actual set - `wait_any` is a
 	// blocking call, so the allocation is never on a hot path.
@@ -2163,16 +2304,24 @@ fn sys_waitset_add(set_handle: u64, object_handle: u64) -> i64 {
 
 // Take an object out of the set. Named by its handle, like everything else, and matched by koid -
 // so a caller may remove a member through any handle it holds to the same object.
-fn sys_waitset_remove(set_handle: u64, object_handle: u64) -> i64 {
+fn sys_waitset_remove(set_handle: u64, koid: u64) -> i64 {
 	let set = match current_typed::<WaitSet>(set_handle, ObjectType::WaitSet, Rights::MANAGE) {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	let object = match untyped_object(object_handle, Rights::NONE) {
-		Ok(o) => o,
-		Err(e) => return e,
-	};
-	match set.remove(object.header().koid()) {
+	// BY KOID, which is what `add` returned and what `wait` answers with.
+	//
+	// It used to take the object's HANDLE and resolve it only to read the koid off it - so removing
+	// a member required still holding the handle it joined under, and the one thing a caller most
+	// wants to do with a dead peer is close it. Closing first left the member in the set, and a
+	// closed peer is permanently readable, so the set woke on it forever: 12,917 wakes in three
+	// minutes, which is how this was found. The answer was to order the two operations at four call
+	// sites, and ordering is a rule people follow rather than one the interface keeps.
+	//
+	// Naming a koid is not more authority than naming a handle. The set handle carries MANAGE, the
+	// koid can only match a member of THAT set, and joining it required a handle with WAIT in the
+	// first place. What is removed is a membership, not an object.
+	match set.remove(koid) {
 		Ok(()) => 0,
 		Err(_) => ERR_INVALID,
 	}
@@ -2315,7 +2464,9 @@ fn sys_fault_info_get(buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	write_user(buf_ptr, info);
+	if let Err(e) = write_user(buf_ptr, info) {
+		return e;
+	}
 	1
 }
 
@@ -2349,7 +2500,9 @@ fn sys_object_info_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 		_ => 0,
 	};
 	let out = ObjectInfo { koid: info.koid, object_type: info.object_type.code(), rights: info.rights.bits(), generation: info.generation, size: obj_size };
-	write_user(buf_ptr, out);
+	if let Err(e) = write_user(buf_ptr, out) {
+		return e;
+	}
 	1
 }
 
@@ -2381,7 +2534,9 @@ fn sys_process_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 		None => (0, 0),
 	};
 	let out = ProcessStats { messages_sent: process.messages_sent(), messages_received: process.messages_received(), handle_count: process.handle_count(), memory_bytes: process.memory_bytes(), state, completion, completion_valid };
-	write_user(buf_ptr, out);
+	if let Err(e) = write_user(buf_ptr, out) {
+		return e;
+	}
 	1
 }
 
@@ -2414,7 +2569,9 @@ fn sys_domain_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let out = domain_stats_snapshot(&domain);
-	write_user(buf_ptr, out);
+	if let Err(e) = write_user(buf_ptr, out) {
+		return e;
+	}
 	1
 }
 

@@ -331,7 +331,7 @@ mod tests {
 		Buddy::new(0x4000_0000, pages).expect("metadata for the fixture")
 	}
 
-	crate::tagged_test!(a_buddy_merges_back_to_one_block_however_it_is_freed, [Frame, Memory], covers = ["kernel"]);
+	crate::tagged_test!(a_buddy_merges_back_to_one_block_however_it_is_freed, [Frame, Memory], id = "kernel.mem.frame.buddy.a_buddy_merges_back_to_one_block_however_it_is_freed", covers = ["kernel"]);
 	fn a_buddy_merges_back_to_one_block_however_it_is_freed() {
 		// The property the run table could not give: coalescing that depends on arithmetic rather
 		// than on a table having room. Free every page of a span individually, in an order chosen
@@ -363,7 +363,7 @@ mod tests {
 		assert_eq!(again, 0x4000_0000);
 	}
 
-	crate::tagged_test!(a_buddy_hands_back_the_rounding_of_a_contiguous_request, [Frame, Memory], covers = ["kernel"]);
+	crate::tagged_test!(a_buddy_hands_back_the_rounding_of_a_contiguous_request, [Frame, Memory], id = "kernel.mem.frame.buddy.a_buddy_hands_back_the_rounding_of_a_contiguous_request", covers = ["kernel"]);
 	fn a_buddy_hands_back_the_rounding_of_a_contiguous_request() {
 		// A buddy allocates in powers of two, so a 3-page request takes a 4-page block. Keeping
 		// the fourth would be a quarter of that allocation lost for as long as it lives, and on a
@@ -380,7 +380,7 @@ mod tests {
 		assert_eq!(spare, base + 3 * PAGE_SIZE, "and it is the page immediately after the request");
 	}
 
-	crate::tagged_test!(a_pool_that_is_not_a_power_of_two_never_hands_out_the_gap, [Frame, Memory], covers = ["kernel"]);
+	crate::tagged_test!(a_pool_that_is_not_a_power_of_two_never_hands_out_the_gap, [Frame, Memory], id = "kernel.mem.frame.buddy.a_pool_that_is_not_a_power_of_two_never_hands_out_the_gap", covers = ["kernel"]);
 	fn a_pool_that_is_not_a_power_of_two_never_hands_out_the_gap() {
 		// Real memory maps are not powers of two, and the tail is where a buddy goes wrong: a block
 		// whose buddy would lie past the end of the extent has no buddy, and merging into one would
@@ -401,7 +401,7 @@ mod tests {
 		assert_eq!(buddy.free_pages(), 0);
 	}
 
-	crate::tagged_test!(a_buddy_refuses_a_free_it_cannot_frame, [Frame, Memory], covers = ["kernel"]);
+	crate::tagged_test!(a_buddy_refuses_a_free_it_cannot_frame, [Frame, Memory], id = "kernel.mem.frame.buddy.a_buddy_refuses_a_free_it_cannot_frame", covers = ["kernel"]);
 	fn a_buddy_refuses_a_free_it_cannot_frame() {
 		// `free` cannot fail for want of ROOM - that is the whole point - but it can refuse an
 		// argument that is not a block: an address below the extent, past it, or misaligned for the

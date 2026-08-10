@@ -251,6 +251,34 @@ impl Channel {
 	//
 	// Naming the message removes the class rather than another instance of it: the caller inspects
 	// a message, decides about THAT message, and either gets it or is told it is gone.
+	// Put a taken message back at the head of the queue, because it could not be DELIVERED.
+	//
+	// M0151 made a receive transactional in its handle resources: peek, reserve, take the same
+	// message or none. M0149 then opened a second boundary behind it - the queue against the
+	// caller's memory - and that one was not transactional at all: the message came off the queue,
+	// the copy into userspace was allowed to be short, and the syscall reported the length it had
+	// been asked for. The message was gone and the caller had part of it and no way to know.
+	//
+	// A short copy there means the caller unmapped its own buffer, which is the caller's doing and
+	// not a reason to destroy a message somebody else sent. So it goes back where it was: at the
+	// FRONT, because it was the front, which restores the order exactly unless another receiver has
+	// taken the new head in between - and that is a receiver making progress, not a reordering this
+	// endpoint promised not to have.
+	//
+	// The message goes back UNCHARGED. `recv_identified` refunded the sender's queued-bytes quota on
+	// the way out and the domain that paid it is no longer reachable from here, so re-taking the
+	// charge would mean threading the sender through a path that exists only for a caller that broke
+	// its own buffer. The cost is an accounting entry one message light until this one is read; the
+	// alternative is destroying a message the sender was told was delivered.
+	//
+	// It also goes back even when the queue is at its limit - `limit` messages must have arrived in
+	// the window between the take and this call - because one over for that instant costs a bounded
+	// amount of memory that the next receive gives back, and refusing would be the loss again.
+	pub fn return_to_head(&self, message: Message) {
+		self.inbox.lock().push_front(message);
+		sched::wake_object(self.header.koid());
+	}
+
 	pub fn recv_identified(&self, id: u64, bytes_cap: usize, cap_slots: usize) -> Result<Message, RecvRefusal> {
 		let popped = {
 			let mut inbox = self.inbox.lock();

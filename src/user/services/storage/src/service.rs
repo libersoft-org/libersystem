@@ -350,6 +350,10 @@ fn denied_reply(request: &[u8], reply: &mut [u8]) -> Option<usize> {
 struct PendingWrite {
 	// The client's end of the stream, and the channel its reply goes back on.
 	stream: u64,
+	// The koid the stream joined the wait set under, kept beside the handle because leaving is by
+	// koid: a member that has to be named by its handle cannot be retired after the handle is
+	// closed, and closing first is the natural thing to do with a dead peer.
+	stream_koid: u64,
 	client: u64,
 	corr: u32,
 	path: String,
@@ -452,7 +456,7 @@ fn begin_stream(vol: &mut Volume, client: u64, scope: &Scope, request: &[u8], re
 		None => false,
 	};
 	let now = unsafe { clock() };
-	Ok(PendingWrite { stream: data, client, corr, path, idle: now.saturating_add(STREAM_IDLE_TICKS), expires: now.saturating_add(STREAM_TOTAL_TICKS), incremental, bytes: Vec::new(), received: 0, chunks: 0, limit, limit_is_policy })
+	Ok(PendingWrite { stream: data, stream_koid: 0, client, corr, path, idle: now.saturating_add(STREAM_IDLE_TICKS), expires: now.saturating_add(STREAM_TOTAL_TICKS), incremental, bytes: Vec::new(), received: 0, chunks: 0, limit, limit_is_policy })
 }
 
 enum StreamStep {
@@ -623,23 +627,28 @@ fn abandon_pending(set: u64, vol: &mut Volume, pending: &mut Option<PendingWrite
 	if p.incremental {
 		vol.fs.stream_abort();
 	}
-	leave_stream(set, p.stream);
+	leave_stream(set, p.stream_koid, p.stream);
 }
 
 // Take the stream out of the wait set and close it, in that order, and nowhere else.
 //
-// The ORDER is the whole function. `waitset_remove` names a member by the handle it joined under,
-// so closing first hands it a dead handle: the member stays in the set, its closed peer is
-// permanently READABLE, and the loop wakes for a koid no member owns - forever. A livelock, so it
-// shows up as a suite that never finishes rather than one that fails. A diagnostic counted 12,917
-// of those wakes in three minutes before this was found, at the same test that hung the FIRST
-// migration attempt in M0147 - which was reverted without a diagnosis, and may well have been this.
+// The ORDER used to be the whole function, and the interface now keeps it instead. `waitset_remove`
+// took the HANDLE a member joined under, so closing first handed it a dead handle: the member stayed
+// in the set, its closed peer was permanently READABLE, and the loop woke for a koid no member owned
+// - forever. A livelock, so it showed up as a suite that never finished rather than one that failed.
+// A diagnostic counted 12,917 of those wakes in three minutes before it was found, at the same test
+// that hung the FIRST migration attempt in M0147 - which was reverted without a diagnosis, and may
+// well have been this.
+//
+// Removal is by KOID now, which is the number `waitset_add` returned, so a closed handle cannot make
+// a member unnameable. This function stays because there is still an order (leave, then close) and
+// one place to keep it is better than four.
 //
 // The per-pass reconcile cannot do this job, and trying to make it was the mistake: by the time it
 // notices `pending` is gone, whoever took it has already closed the handle. Joining can be noticed
 // late. Leaving cannot.
-fn leave_stream(set: u64, stream: u64) {
-	let _ = unsafe { waitset_remove(set, stream) };
+fn leave_stream(set: u64, koid: u64, stream: u64) {
+	let _ = unsafe { waitset_remove(set, koid) };
 	unsafe { close(stream) };
 }
 
@@ -669,7 +678,7 @@ fn finish_stream(set: u64, vol: &mut Volume, p: PendingWrite, outcome: Result<()
 			Err(e)
 		}
 	};
-	leave_stream(set, p.stream);
+	leave_stream(set, p.stream_koid, p.stream);
 	if let Some(len) = write_stream_reply(p.corr, result, reply) {
 		// The SAME answer path as every other reply, `quiet` and all.
 		//
@@ -788,6 +797,11 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				// The client is told by the deadline rather than left waiting on a promise.
 				if koid > 0 {
 					stream_koid = koid as u64;
+					// On the entry as well as in the loop, so whoever retires the stream can name it
+					// without the handle - see `leave_stream`.
+					if let Some(p) = pending.as_mut() {
+						p.stream_koid = stream_koid;
+					}
 				}
 			}
 			stream_chan = want_stream;
@@ -899,7 +913,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				Received::Closed => {
 					// Out of the set with it: a member whose handle is closed is a wake that can
 					// never be answered.
-					let _ = unsafe { waitset_remove(set, admin) };
+					let _ = unsafe { waitset_remove(set, admin_koid) };
 					admin = 0;
 					admin_koid = 0;
 				}
@@ -924,12 +938,12 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					exit();
 				}
 				abandon_pending(set, vol, &mut pending, chan);
-				// The set FIRST, the handle after. `waitset_remove` names the member by the handle it joined
-				// under, so closing first hands it a dead handle: the member stays in the set, and a closed
-				// peer is permanently READABLE - the set wakes, no client matches the koid, the loop
-				// continues, and it wakes again at once. A livelock rather than a deadlock, which is why it
-				// presents as a test that never finishes instead of one that stops. Very likely what hung the
-				// first migration attempt, at this same test.
+				// The set FIRST, the handle after - and `release_client` is the only place that knows it,
+				// because removal is by KOID and the koid lives in the client table beside the handle.
+				// When removal took the handle, closing first left the member in the set and a closed peer
+				// is permanently READABLE: the set woke, no client matched the koid, the loop continued, and
+				// it woke again at once. A livelock rather than a deadlock, which is why it presented as a
+				// test that never finished instead of one that stopped.
 				release_client(set, &mut clients, index);
 				unsafe { close(chan) };
 			}
@@ -1007,12 +1021,9 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					// waiting and nobody else pays for it.
 					if index != 0 {
 						abandon_pending(set, vol, &mut pending, chan);
-						// The set FIRST, the handle after. `waitset_remove` names the member by the handle it joined
-						// under, so closing first hands it a dead handle: the member stays in the set, and a closed
-						// peer is permanently READABLE - the set wakes, no client matches the koid, the loop
-						// continues, and it wakes again at once. A livelock rather than a deadlock, which is why it
-						// presents as a test that never finishes instead of one that stops. Very likely what hung the
-						// first migration attempt, at this same test.
+						// The set FIRST, the handle after - `release_client` keeps that order, and removal by
+						// koid means a closed handle can no longer make a member unnameable. See the note at
+						// the first of these.
 						release_client(set, &mut clients, index);
 						unsafe { close(chan) };
 					} else {
@@ -1034,12 +1045,12 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					exit();
 				}
 				abandon_pending(set, vol, &mut pending, chan);
-				// The set FIRST, the handle after. `waitset_remove` names the member by the handle it joined
-				// under, so closing first hands it a dead handle: the member stays in the set, and a closed
-				// peer is permanently READABLE - the set wakes, no client matches the koid, the loop
-				// continues, and it wakes again at once. A livelock rather than a deadlock, which is why it
-				// presents as a test that never finishes instead of one that stops. Very likely what hung the
-				// first migration attempt, at this same test.
+				// The set FIRST, the handle after - and `release_client` is the only place that knows it,
+				// because removal is by KOID and the koid lives in the client table beside the handle.
+				// When removal took the handle, closing first left the member in the set and a closed peer
+				// is permanently READABLE: the set woke, no client matched the koid, the loop continued, and
+				// it woke again at once. A livelock rather than a deadlock, which is why it presented as a
+				// test that never finished instead of one that stopped.
 				release_client(set, &mut clients, index);
 				unsafe { close(chan) };
 			}
@@ -1325,7 +1336,7 @@ fn admit_client(set: u64, clients: &mut Vec<Client>, mut client: Client) -> bool
 // Take a client out of both, in the order that cannot leave a wake for a member that is gone: the
 // set first, the table second, the handle last.
 fn release_client(set: u64, clients: &mut Vec<Client>, index: usize) -> Client {
-	let _ = unsafe { waitset_remove(set, clients[index].chan) };
+	let _ = unsafe { waitset_remove(set, clients[index].koid) };
 	clients.swap_remove(index)
 }
 

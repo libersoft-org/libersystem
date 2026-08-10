@@ -4156,3 +4156,198 @@ fn an_extent_count_above_the_pool_is_refused_before_it_is_allocated_for() {
 		Err(other) => panic!("expected the medium to be blamed, got {other:?}"),
 	}
 }
+
+// A write that cannot allocate the block buffer for a spilled extent map says so, and does not take
+// the process down.
+//
+// The mount side of this rule was M0153's work: `load_spill` bounds `extent_count` and reserves
+// fallibly. The WRITE side kept two infallible allocations - a `to_vec()` of the whole spilled map,
+// and a `vec![0u8; BLOCK_SIZE]` per chain block - and the first one scales with how fragmented the
+// file is, which is the case that reaches memory pressure in the first place.
+//
+// The copy is gone rather than made fallible: the chunks are read once, in order, and `Extent` is
+// `Copy`, so the chain is built from indexed slices of the map itself. What remains is the block
+// buffer, and this is the test that it reports rather than aborts.
+#[test]
+fn a_spilled_extent_map_that_cannot_allocate_its_block_says_so() {
+	let nblocks: u64 = 512;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let span = |i: u64| i * 16 * BLOCK_SIZE as u64;
+	// Two inline capacities' worth of sparse spans, so the map has to spill.
+	for i in 0..8u64 {
+		fs.write_at(b"sparse", span(i), format!("span-{i}").as_bytes()).unwrap();
+	}
+	let num = fs.lookup(b"sparse").unwrap().unwrap();
+	assert!(fs.read_inode(num).unwrap().extents.len() > EXTENTS_INLINE, "the fixture must spill or this proves nothing");
+
+	// Refuse ONE allocation, some way into the next write. Refusing every allocation from the first
+	// would fail somewhere earlier and prove nothing about the chain; refusing exactly one means the
+	// error has to be carried out rather than being re-raised by the next attempt.
+	//
+	// The budget is a search rather than a constant: which allocation belongs to `flush_extents`
+	// depends on what the write above did first, and pinning it would make this test a hostage to
+	// unrelated allocation counts.
+	let mut reported = false;
+	for budget in 0..64 {
+		// A fresh filesystem per budget: the injection is a count of allocations from the moment it
+		// is armed, so the state it is armed over has to be identical each time.
+		let mut attempt = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+		for i in 0..8u64 {
+			attempt.write_at(b"sparse", span(i), format!("span-{i}").as_bytes()).unwrap();
+		}
+		let guard = fail_one_allocation_after(budget);
+		let result = attempt.write_at(b"sparse", span(9), b"one more span");
+		drop(guard);
+		match result {
+			Err(FsError::NoSpace) => {
+				reported = true;
+				// And the filesystem is still answerable afterwards - a refused write is an error,
+				// not a corrupted map.
+				assert!(attempt.read_at(b"sparse", span(1), 6).is_ok(), "the earlier spans still read after a refused write");
+			}
+			Err(other) => panic!("a refused allocation must be NoSpace, not {other:?}"),
+			Ok(()) => continue,
+		}
+	}
+	assert!(reported, "no allocation budget in the search produced a refusal, so nothing here was exercised");
+}
+
+// A leaf holding a key the separators above it do not route to makes the mount READ-ONLY.
+//
+// The write path's structural validators are local: `validate_fixed_leaf` answers "are these records
+// ordered and the right size", `validate_internal` answers "are these separators ordered and the
+// children non-null". Neither can answer the question that matters here - does this node belong
+// where it was reached from - because neither is told where it was reached from.
+//
+// The consequence is a second copy of a record. Lookup for a misrouted key goes down the subtree the
+// separator names and does not find it, so an insert of the same key puts a record THERE, and the
+// mutation writes a fresh, correctly checksummed generation holding it twice. Every later read is
+// decided by which path it walks, and fsck's report arrives after the damage rather than before it.
+//
+// `fsck` has carried the routing interval since M0144; a writable mount never ran it. The interval
+// now rides along with the free-map walk, which visits these blocks anyway.
+#[test]
+fn an_inode_leaf_outside_the_range_that_routes_to_it_makes_the_mount_read_only() {
+	let nblocks: u64 = 512;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	// Enough inodes that the tree has an internal root to misroute from.
+	for i in 0..200u32 {
+		fs.write_file(format!("f{i:03}").as_bytes(), b"x").unwrap();
+	}
+	let mut dev = fs.into_device();
+	let slot = active_slot(&dev);
+	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
+	let root = sb.inode_root as usize;
+	let at = root * BLOCK_SIZE;
+	assert_eq!(node_type(&dev.blocks[at..at + BLOCK_SIZE]), NODE_INTERNAL, "200 files must give the inode tree an internal root");
+
+	// The forgery is ONE field: the first separator, lowered to 2. Child 0 then routes to keys
+	// below 2 and holds inode numbers far above it - every record in it is unreachable, and an
+	// insert of any of those numbers would land in child 1.
+	//
+	// Deliberately the separator rather than the leaf: the leaf stays byte-for-byte a leaf the write
+	// path accepts, which is the whole point. Nothing here is out of order, mis-hashed or the wrong
+	// size, and a local validator has nothing to say about it.
+	let before = sep_key(&dev.blocks[at..at + BLOCK_SIZE], 0);
+	assert!(before > 2, "the fixture's first separator must be above the value we lower it to (was {before})");
+	set_sep(&mut dev.blocks[at..at + BLOCK_SIZE], 0, 2);
+	let crc = crc32c(&dev.blocks[at..at + BLOCK_SIZE]);
+	forge_superblock(&mut dev, slot, |sb| sb[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes()));
+
+	// It mounts - every checksum is right and every node is well-formed on its own - and it mounts
+	// READ-ONLY, which is the answer that keeps both the data and the repair verb.
+	let mut fs = LiberFs::mount(dev).expect("a checksum-consistent volume still mounts");
+	assert!(fs.is_read_only(), "a tree whose leaves are not where routing sends them must not be written to");
+	// And the structural pass names it, so an operator is told what it is rather than only that the
+	// volume is read-only.
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"routing will never reach"), "fsck must name the misrouted records: {:?}", report.faults);
+}
+
+// A snapshot chain ON DISK carrying more records than the format permits is refused.
+//
+// `MAX_SNAPSHOTS` was covered from the writer's side - take 256 snapshots and the 257th is refused -
+// which proves the writer stops and says nothing about the reader. The reader is the side that faces
+// a hostile image, and before the cap it would build the whole table in memory: a checksum-valid
+// chain can name millions of records, and the mount allocated one per record before looking at any
+// of them.
+#[test]
+fn a_forged_chain_of_more_snapshots_than_the_format_allows_is_refused() {
+	let nblocks: u64 = 512;
+	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.write_file(b"a.txt", b"payload").unwrap();
+	let root = fs.inode_root;
+	let root_crc = fs.inode_root_crc;
+	let mut dev = fs.into_device();
+
+	// One record past the ceiling, laid by hand into blocks the fixture is not using. Every
+	// checksum is correct and every record is individually legal - a real root, a generation that
+	// already happened, a name with canonical padding - so the only thing wrong with this table is
+	// how long it is.
+	const FORGED: usize = MAX_SNAPSHOTS + 1;
+	let blocks = FORGED.div_ceil(SNAPS_PER_BLOCK);
+	let base = 200usize;
+	assert!(base + blocks < nblocks as usize, "the forged chain must fit in the fixture");
+	let mut next_ptr = 0u64;
+	let mut next_crc = 0u32;
+	let mut left = FORGED;
+	for i in (0..blocks).rev() {
+		let count = left.min(SNAPS_PER_BLOCK);
+		left -= count;
+		let at = (base + i) * BLOCK_SIZE;
+		dev.blocks[at..at + BLOCK_SIZE].fill(0);
+		dev.blocks[at + CHAIN_NEXT_OFF..at + CHAIN_NEXT_OFF + 8].copy_from_slice(&next_ptr.to_le_bytes());
+		dev.blocks[at + CHAIN_CRC_OFF..at + CHAIN_CRC_OFF + 4].copy_from_slice(&next_crc.to_le_bytes());
+		dev.blocks[at + CHAIN_COUNT_OFF..at + CHAIN_COUNT_OFF + 4].copy_from_slice(&(count as u32).to_le_bytes());
+		for r in 0..count {
+			let off = at + SNAP_HDR + r * SNAP_REC;
+			let name = format!("s{:05}", left + r);
+			dev.blocks[off..off + name.len()].copy_from_slice(name.as_bytes());
+			dev.blocks[off + SNAP_ROOT_OFF..off + SNAP_ROOT_OFF + 8].copy_from_slice(&root.to_le_bytes());
+			dev.blocks[off + SNAP_ROOT_CRC_OFF..off + SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&root_crc.to_le_bytes());
+			// generation 0 is at or below every live generation, so the record's own sanity checks
+			// pass and the length is the only thing left to refuse it for.
+			dev.blocks[off + SNAP_GEN_OFF..off + SNAP_GEN_OFF + 8].copy_from_slice(&0u64.to_le_bytes());
+		}
+		next_ptr = (base + i) as u64;
+		next_crc = crc32c(&dev.blocks[at..at + BLOCK_SIZE]);
+	}
+	let slot = active_slot(&dev);
+	forge_superblock(&mut dev, slot, |sb| {
+		sb[SB_SNAP_ROOT_OFF..SB_SNAP_ROOT_OFF + 8].copy_from_slice(&next_ptr.to_le_bytes());
+		sb[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&next_crc.to_le_bytes());
+	});
+
+	// The mount does not build the table and does not write to the volume.
+	let fs = LiberFs::mount(dev);
+	match fs {
+		Ok(fs) => assert!(fs.is_read_only(), "a table longer than the format allows must at least foreclose writing"),
+		Err(_) => {}
+	}
+}
+
+// `check_structure` compares every field of the on-disk snapshot table with the mounted one, and
+// `inode_root_crc` is the field that was missing.
+//
+// It is the one that decides whether the pinned generation can be READ: a record whose stored CRC
+// has drifted from the loaded one names a root that `read_node` will refuse, so the snapshot is
+// unopenable while every other field still looks right. Name, root and generation all agreeing is
+// exactly the case that hid it.
+//
+// The drift is introduced from the MOUNTED side rather than the disk, because a `MemDevice` moves
+// into the filesystem and cannot be edited underneath it from a test. The comparison is symmetric -
+// it reports the two tables differing, not which one moved - so this exercises the same branch a
+// disk that changed under a long-lived mount would.
+#[test]
+fn a_snapshot_whose_root_crc_drifted_from_the_disk_is_reported() {
+	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"a.txt", b"payload").unwrap();
+	fs.create_snapshot(b"before").unwrap();
+	fs.write_file(b"b.txt", b"more").unwrap();
+	assert_eq!(fs.fsck().unwrap().structural_failures, 0, "the volume is sound before the drift");
+
+	// One field, on the mounted side. Name, root and generation are untouched.
+	fs.snapshots[0].inode_root_crc ^= 1;
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"the snapshot table on disk differs from the mounted one"), "a drifted root CRC must be named: {:?}", report.faults);
+}

@@ -6,7 +6,7 @@ const FRAGMENTED_PAGES: u64 = (super::SEED_RUNS as u64 + 1) * 2;
 // the contract; the two calls that deliberately break it are in
 // `the_allocator_refuses_a_frame_it_never_handed_out`, which says so where it does it.
 
-crate::tagged_test!(frame_alloc_distinct, [Frame, Memory, Smoke], covers = ["kernel"]);
+crate::tagged_test!(frame_alloc_distinct, [Frame, Memory, Smoke], id = "kernel.mem.frame.frame_alloc_distinct", covers = ["kernel"]);
 fn frame_alloc_distinct() {
 	let first = allocate().expect("first frame");
 	let second = allocate().expect("second frame");
@@ -17,7 +17,7 @@ fn frame_alloc_distinct() {
 	}
 }
 
-crate::tagged_test!(the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free, [Frame, Memory], covers = ["kernel"]);
+crate::tagged_test!(the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free, [Frame, Memory], id = "kernel.mem.frame.the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free", covers = ["kernel"]);
 fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 	// NOTHING here reads the global free count, and that is the point.
 	//
@@ -62,7 +62,7 @@ fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 	}
 }
 
-crate::tagged_test!(contiguous_frame_runs_recoalesce, [Frame, Memory], covers = ["kernel"]);
+crate::tagged_test!(contiguous_frame_runs_recoalesce, [Frame, Memory], id = "kernel.mem.frame.contiguous_frame_runs_recoalesce", covers = ["kernel"]);
 fn contiguous_frame_runs_recoalesce() {
 	let base = allocate_contiguous(64).expect("a 256 kB span");
 	unsafe {
@@ -78,7 +78,7 @@ fn contiguous_frame_runs_recoalesce() {
 	}
 }
 
-crate::tagged_test!(the_allocator_refuses_a_frame_it_never_handed_out, [Frame, Memory], covers = ["kernel"]);
+crate::tagged_test!(the_allocator_refuses_a_frame_it_never_handed_out, [Frame, Memory], id = "kernel.mem.frame.the_allocator_refuses_a_frame_it_never_handed_out", covers = ["kernel"]);
 fn the_allocator_refuses_a_frame_it_never_handed_out() {
 	// The debug ownership record's job, and the one thing the overlap test in `insert`
 	// cannot do. Overlap catches a free that lands on memory the pool already calls free.
@@ -115,7 +115,7 @@ fn the_allocator_refuses_a_frame_it_never_handed_out() {
 	}
 }
 
-crate::tagged_test!(a_fragmenting_workload_loses_no_pages_and_says_so, [Frame, Memory], covers = ["kernel"]);
+crate::tagged_test!(a_fragmenting_workload_loses_no_pages_and_says_so, [Frame, Memory], id = "kernel.mem.frame.a_fragmenting_workload_loses_no_pages_and_says_so", covers = ["kernel"]);
 fn a_fragmenting_workload_loses_no_pages_and_says_so() {
 	// The run table is bounded on purpose - it was bounded to fix a deadlock, and `insert_at`
 	// refuses rather than allocating from the heap it feeds. So a free that does not fit is
@@ -164,7 +164,7 @@ fn a_fragmenting_workload_loses_no_pages_and_says_so() {
 	assert_eq!(super::lost_pages(), lost_before, "including the pass that gave it all back one page at a time");
 }
 
-crate::tagged_test!(a_dma_buffer_still_gets_a_contiguous_span_after_the_pool_is_shredded, [Frame, Memory, Dma], covers = ["kernel"]);
+crate::tagged_test!(a_dma_buffer_still_gets_a_contiguous_span_after_the_pool_is_shredded, [Frame, Memory, Dma], id = "kernel.mem.frame.a_dma_buffer_still_gets_a_contiguous_span_after_the_pool_is_shredded", covers = ["kernel"]);
 fn a_dma_buffer_still_gets_a_contiguous_span_after_the_pool_is_shredded() {
 	// Contiguous allocation exists FOR DMA - virtqueue rings, block data stages, jumbo frames - and
 	// the run table serves it by first-fitting a whole run. So the question that matters is not
@@ -210,7 +210,7 @@ fn a_dma_buffer_still_gets_a_contiguous_span_after_the_pool_is_shredded() {
 	assert_eq!(super::lost_pages(), lost_before, "and none of that churn lost a page");
 }
 
-crate::tagged_test!(the_run_table_is_reserved_for_the_worst_the_pool_can_reach, [Frame, Memory], covers = ["kernel"]);
+crate::tagged_test!(the_run_table_is_reserved_for_the_worst_the_pool_can_reach, [Frame, Memory], id = "kernel.mem.frame.the_run_table_is_reserved_for_the_worst_the_pool_can_reach", covers = ["kernel"]);
 fn the_run_table_is_reserved_for_the_worst_the_pool_can_reach() {
 	// The invariant that makes a free unable to fail, asserted rather than argued.
 	//
@@ -254,7 +254,7 @@ fn the_run_table_is_reserved_for_the_worst_the_pool_can_reach() {
 	assert!(!super::on_heap(), "a run table was reserved even though the buddy was built - {} bytes of fallback nobody is going to use", super::run_capacity() * 16);
 }
 
-crate::tagged_test!(no_frame_is_ever_handed_to_two_owners_at_once, [Frame, Memory], covers = ["kernel"]);
+crate::tagged_test!(no_frame_is_ever_handed_to_two_owners_at_once, [Frame, Memory], id = "kernel.mem.frame.no_frame_is_ever_handed_to_two_owners_at_once", covers = ["kernel"]);
 fn no_frame_is_ever_handed_to_two_owners_at_once() {
 	// The one thing a bitmap allocator can do that the run table could not.
 	//

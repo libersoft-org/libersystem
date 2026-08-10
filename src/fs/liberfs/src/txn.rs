@@ -297,7 +297,20 @@ impl<D: BlockDevice> LiberFs<D> {
 	// not cost the volume. Iterative (an explicit work list), so the depth of the trees
 	// never grows the call stack.
 	pub(crate) fn mark_inode_tree(&mut self, root: u64, root_crc: u32, map: &mut [u8]) -> Result<(), FsError> {
-		let mut nodes: Vec<(u64, u32)> = Vec::new();
+		// Each queued node carries the key interval the separators above it route to.
+		//
+		// Without it this walk could say a node was well-formed and not that it BELONGED where it
+		// was reached from. `validate_fixed_leaf` and `validate_internal` are local: a leaf holding
+		// keys 100, 200, 900 is perfectly ordered, and if the root separator sends 900 down the
+		// other child then no lookup will ever find that record - so an insert of the same key lands
+		// in the other subtree and the volume now holds it twice, in a freshly checksummed
+		// generation, with every later read decided by which path it walks.
+		//
+		// `fsck` has carried this interval since M0144 and a writable mount did not run `fsck`.
+		// Carrying it HERE costs no extra I/O: this walk already visits every live tree block to
+		// build the free map, so the range rides along and the answer becomes "the block is
+		// reserved AND it is where the tree says it should be".
+		let mut nodes: Vec<(u64, u32, Option<u64>, Option<u64>)> = Vec::new();
 		// a pointer outside the pool is a corrupt link (skipped, not followed into
 		// whatever lies past the volume); an already-marked node is either a corrupt
 		// cycle (which must not hang the walk) or a subtree shared with an earlier
@@ -306,10 +319,10 @@ impl<D: BlockDevice> LiberFs<D> {
 		// at one block queues it once, not once per link - the work list stays
 		// bounded by the pool.
 		if root != 0 && root < self.num_blocks && self.mark(map, root) {
-			nodes.push((root, root_crc));
+			nodes.push((root, root_crc, None, None));
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		while let Some((ptr, want)) = nodes.pop() {
+		while let Some((ptr, want, lower, upper)) = nodes.pop() {
 			if !self.dev.read_block(ptr, &mut buf) {
 				self.walk_damage = true;
 				continue;
@@ -339,6 +352,19 @@ impl<D: BlockDevice> LiberFs<D> {
 					if self.mark_strict {
 						let key = u64::from_le_bytes(buf[rec..rec + 8].try_into().unwrap());
 						self.mark_max_inode = self.mark_max_inode.max(key);
+						// Outside the interval routing sends here, so no lookup can reach it -
+						// which makes a later insert of the same key create a SECOND record in the
+						// subtree that lookup does reach. Damage, so the mount degrades to
+						// read-only: the data and the repair verb both survive, and nothing writes
+						// a new generation over a tree that already contradicts itself.
+						//
+						// Only under `mark_strict`. The snapshot and previous-generation walks are
+						// deliberately blind - there the job is to reserve what might still be
+						// referenced, and refusing to follow a wrong-looking subtree would
+						// under-reserve.
+						if lower.is_some_and(|l| key < l) || upper.is_some_and(|u| key >= u) {
+							self.walk_damage = true;
+						}
 					}
 					let off = rec + 8;
 					let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
@@ -435,10 +461,15 @@ impl<D: BlockDevice> LiberFs<D> {
 					}
 				}
 			} else {
-				for i in 0..=internal_count(&buf) {
+				let count = internal_count(&buf);
+				for i in 0..=count {
 					let child = child_ptr(&buf, i);
+					// The interval narrows by one separator on each side: child `i` holds keys at or
+					// above separator `i - 1` and below separator `i`, with the ends open.
+					let child_lower = if i == 0 { lower } else { Some(sep_key(&buf, i - 1)) };
+					let child_upper = if i == count { upper } else { Some(sep_key(&buf, i)) };
 					if child < self.num_blocks && self.mark(map, child) {
-						nodes.push((child, child_crc(&buf, i)));
+						nodes.push((child, child_crc(&buf, i), child_lower, child_upper));
 					}
 				}
 			}

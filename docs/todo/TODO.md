@@ -195,13 +195,13 @@ observability, persistent storage and multi-architecture support.
 - [x] [M0144 - LiberFS: what a mount may still lose, and what a parser may not quietly repair](M0144.md)
 - [x] [M0145 - The kernel's lowest layers do not yet keep the promises the upper ones make](M0145.md)
 - [x] [M0146 - What M0144 left in the disk probe, and three gaps it opened itself](M0146.md)
-- [ ] [M0147 - A wait set the kernel keeps](M0147.md)
-- [ ] [M0148 - Testing that scales with the change, not with the tree](M0148.md)
-- [ ] [M0149 - A fault in a user copy must be an error, not a dead kernel](M0149.md)
+- [x] [M0147 - A wait set the kernel keeps](M0147.md)
+- [x] [M0148 - Testing that scales with the change, not with the tree](M0148.md)
+- [x] [M0149 - A fault in a user copy must be an error, not a dead kernel](M0149.md)
 - [ ] [M0150 - A free must never lose the memory it frees](M0150.md)
 - [x] [M0151 - A receive that takes a message must be able to deliver it](M0151.md)
-- [ ] [M0152 - What authorises a write to somebody's disk](M0152.md)
-- [ ] [M0153 - What a mount allocates, and what a write may assume about what it found](M0153.md)
+- [x] [M0152 - What authorises a write to somebody's disk](M0152.md)
+- [x] [M0153 - What a mount allocates, and what a write may assume about what it found](M0153.md)
 
 ### Definition of done (phase 2)
 

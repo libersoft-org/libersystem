@@ -64,6 +64,7 @@ fn run() -> Result<ExitCode, String> {
 	let mut from_stdin = false;
 	let mut keys_file: Option<String> = None;
 	let mut guest_log: Option<String> = None;
+	let mut host_log: Option<String> = None;
 	let mut architecture: Option<String> = None;
 	let mut grant: Option<String> = None;
 	let mut range: Option<String> = None;
@@ -90,6 +91,12 @@ fn run() -> Result<ExitCode, String> {
 			"--guest-log" => {
 				index += 1;
 				guest_log = Some(arguments.get(index).ok_or("--guest-log needs a path")?.clone());
+			}
+			// The host universe's results file, which the runner writes directly rather than being
+			// scraped out of a serial log. See `parse_host_log`.
+			"--host-log" => {
+				index += 1;
+				host_log = Some(arguments.get(index).ok_or("--host-log needs a path")?.clone());
 			}
 			"--arch" => {
 				index += 1;
@@ -126,7 +133,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "booted" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "booted" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
 	{
 		command = positional.remove(0);
 	}
@@ -161,6 +168,29 @@ fn run() -> Result<ExitCode, String> {
 		}
 		"model-hash" => {
 			println!("{}", model.model_hash());
+			Ok(ExitCode::SUCCESS)
+		}
+		// Every check that runs on the HOST, as `id<TAB>command`, for the shadow producer.
+		//
+		// A command in the model rather than a `jq` filter in the shell, for the reason the `booted`
+		// command exists: every decision that needs the model belongs in the model, and a fragile
+		// parse in `verify.sh` is the same decision made twice and drifting.
+		"host-checks" => {
+			for check in &model.catalog.checks {
+				// Builds are excluded. They run on the host and they can fail, but a shadow
+				// comparison asks "did anything OUTSIDE the selection fail" - and re-running three
+				// architectures' builds to answer it would cost more than the sweep it is comparing
+				// against, over artifacts the sweep has already produced. What is left is the checks:
+				// gates, host suites, conformance.
+				if check.kind == verify_model::catalog::CheckKind::Build {
+					continue;
+				}
+				for variant in &check.variants {
+					if variant.environment == verify_model::catalog::Environment::Host {
+						println!("{}\t{}", check.id, check.command.replace("{arch}", &variant.architecture));
+					}
+				}
+			}
 			Ok(ExitCode::SUCCESS)
 		}
 		"catalog" => {
@@ -256,7 +286,40 @@ fn run() -> Result<ExitCode, String> {
 		// DRY shadow: the scoped set is COMPUTED and never run; the full sweep that already
 		// happened is what it is compared against. One boot, two answers.
 		"shadow" => {
-			let guest_log = guest_log.ok_or("shadow needs --guest-log")?;
+			// The HOST universe, when a host results file is what was given.
+			//
+			// One command, two universes, because the comparison is the same question asked of a
+			// different runner: what ran, what failed, and was the failure inside the selection.
+			// Nothing produced a Host record before this, which is why `trusted_everywhere` - Host
+			// AND TestGuest - could never be true for anything.
+			if let Some(path) = &host_log {
+				if paths.is_empty() {
+					return Err(String::from("shadow needs the change it is validating (--paths or --stdin); comparing against nothing proves nothing"));
+				}
+				let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+				let results = verify_model::shadow::parse_host_log(&text);
+				let ownership = model.ownership();
+				let planner = Planner::for_model(&model, &ownership);
+				let plan = planner.plan(&paths);
+				let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
+				let history = verify_model::history::History::load(&repo_root)?;
+				let comparison = verify_model::shadow::compare_host(&selected, &results, &history);
+				println!("shadow (host): {:?}", comparison.verdict);
+				println!("  {}", comparison.reason);
+				println!("  {} check(s) ran; {} of them were in the scoped selection", comparison.ran, comparison.scoped);
+				for key in &comparison.inside_failures {
+					println!("  FAILED (selected): {key}");
+				}
+				for key in &comparison.outside_failures {
+					println!("  FAILED (not selected): {key}");
+				}
+				let mut log = verify_model::shadow::Log::load(&repo_root);
+				log.schema = 1;
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
+				log.save(&repo_root)?;
+				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+			}
+			let guest_log = guest_log.ok_or("shadow needs --guest-log or --host-log")?;
 			let architecture = architecture.ok_or("shadow needs --arch")?;
 			if paths.is_empty() {
 				return Err(String::from("shadow needs the change it is validating (--paths or --stdin); comparing against nothing proves nothing"));
@@ -323,7 +386,7 @@ fn run() -> Result<ExitCode, String> {
 			// Trusted EVERYWHERE, not merely in the universe that happens to have evidence: a clean
 			// record on the kernel suite says nothing about whether a host suite or a gate would have
 			// been selected, and shadow only ever examined the kernel suite until now.
-			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| !store.trusted_everywhere(component, &hash)).collect();
+			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| !store.trusted_everywhere(component, &hash, &verify_model::catalog::judging_universes(&model.catalog, component))).collect();
 			// The age BOUND, which is the part that makes it a bound rather than a report.
 			//
 			// A key past its window has not been exercised within the period this tree is willing to

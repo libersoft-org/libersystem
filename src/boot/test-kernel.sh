@@ -141,6 +141,51 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
 	TEST_ARGS+=(--no-run)
 fi
 
+# A per-TEST watchdog, because the per-suite one cannot tell a slow run from a stopped one.
+#
+# `--timeout` bounds the whole suite, so a run that stops dead on test 83 of 228 burns the entire
+# remaining budget before saying anything, and what it then says is "TIMEOUT, last test: X" - which
+# is also what a genuinely slow run says. That ambiguity cost two hours: a riscv64 run was read as a
+# livelock and chased through four subsystems, and the region it was in really does take minutes per
+# test. Nothing on the line distinguished the two.
+#
+# This watches PROGRESS rather than wall-clock: as long as tests keep completing, it says nothing,
+# however long the suite takes. When none completes for `TEST_STALL` seconds it kills the guest and
+# names the test that was running, which is the answer somebody would otherwise get by staring at a
+# log for twenty minutes.
+#
+# The default is generous on purpose. The slowest single test on emulated riscv64 runs into minutes,
+# and a watchdog that fires on a slow test is worse than none: it would turn a passing run into a
+# failure and teach everyone to raise it until it never fires.
+STALL="${TEST_STALL:-900}"
+STALL_MARK="$RUN_LOG.stall"
+: >"$STALL_MARK"
+rm -f "$STALL_MARK.hit"
+progress_count() {
+	cat "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | grep -c '\[ok\]' || true
+}
+(
+	last=-1
+	quiet=0
+	while sleep 30; do
+		[[ -f "$STALL_MARK" ]] || break
+		now="$(progress_count)"
+		if [[ "$now" != "$last" ]]; then
+			last="$now"
+			quiet=0
+		else
+			quiet=$((quiet + 30))
+		fi
+		if ((quiet >= STALL)); then
+			stuck="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | tail -1 | sed -E 's/\.\.\..*$//' || true)"
+			printf '%s\t%s\n' "${stuck:-unknown}" "$quiet" >"$STALL_MARK.hit"
+			pkill -f "qemu-system-$ARCH" || true
+			break
+		fi
+	done
+) &
+STALL_WATCHER=$!
+
 set +e
 (
 	cd "$ROOT/kernel"
@@ -152,6 +197,18 @@ set +e
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e
+rm -f "$STALL_MARK"
+kill "$STALL_WATCHER" 2>/dev/null || true
+wait "$STALL_WATCHER" 2>/dev/null || true
+if [[ -f "$STALL_MARK.hit" ]]; then
+	stuck="$(cut -f1 "$STALL_MARK.hit")"
+	quiet="$(cut -f2 "$STALL_MARK.hit")"
+	rm -f "$STALL_MARK.hit"
+	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
+	echo "[test-$ARCH] NO PROGRESS in $stuck - no test completed for ${quiet}s, so the guest was stopped" >&2
+	echo "[test-$ARCH] What this knows is that nothing FINISHED in that window, not that anything is wedged - it cannot tell those apart and neither can a person reading the log. Two ways to find out: the [ok] (N s) figures above say what this target's slow tests actually cost, and TEST_STALL=<seconds> raises the window if one of them legitimately exceeds it." >&2
+	exit 125
+fi
 if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\ttest_driver\tend\n' "$(date +%s%N)" >>"$LIBER_TIMING_LOG"; fi
 elapsed=$((SECONDS - START_SECONDS))
 if [[ "$VERBOSE" == "1" ]]; then print_full_logs; fi

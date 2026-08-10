@@ -1,6 +1,6 @@
 use super::*;
 
-crate::tagged_test!(the_frame_pool_is_carved_around_what_the_boot_left_in_memory, [Kernel, Memory], covers = ["kernel"]);
+crate::tagged_test!(the_frame_pool_is_carved_around_what_the_boot_left_in_memory, [Kernel, Memory], id = "kernel.arch.common.bootmem.the_frame_pool_is_carved_around_what_the_boot_left_in_memory", covers = ["kernel"]);
 fn the_frame_pool_is_carved_around_what_the_boot_left_in_memory() {
 	// The shape that cost a milestone: one usable range with the boot packages sitting inside it.
 	//

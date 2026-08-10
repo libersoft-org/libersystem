@@ -20,7 +20,7 @@ PLANNER_MANIFEST="$SRC_DIR/tools/verify-model/Cargo.toml"
 help() {
 	usage_and_exit <<EOF
 usage: verify.sh [--for-change | --for PATH[,PATH...] | --for-range A..B | --release | --sweep]
-                 [--plan] [--explain] [--json] [--shadow] [--catalog] [--model-hash] [--age] [--trust]
+                 [--plan] [--explain] [--json] [--shadow] [--allow-shadow] [--catalog] [--model-hash] [--age] [--trust]
 
 Works out what a change needs verified and runs exactly that. With no arguments: --for-change.
 
@@ -30,6 +30,7 @@ Works out what a change needs verified and runs exactly that. With no arguments:
   --release        the release gate: build all, check all, boot all three, no optimisation applied
   --sweep          the whole suite on every target at one immutable revision, in a git worktree
   --shadow         run the FULL suite and compare it against what this change would have scoped
+  --allow-shadow   accept a scoped run with no shadow evidence (exit 0 instead of 4); --dev is an alias
   --plan           print the plan and run nothing
   --explain        print why every item is in the plan
   --json           the plan as JSON, for anything that is not a person
@@ -85,6 +86,11 @@ while [[ $# -gt 0 ]]; do
 	--sweep)
 		mode=sweep
 		shift
+		;;
+	# Accept a scoped run that has no shadow evidence behind it. The default refuses, because a
+	# machine reading an exit status cannot read the note that says what the green is worth.
+	--allow-shadow | --dev)
+		allow_shadow=1
 		;;
 	--shadow)
 		action=shadow
@@ -267,6 +273,32 @@ if [[ "$action" == shadow ]]; then
 		[[ -n "$log" ]] || die "no $target guest log to compare against"
 		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --guest-log "../$log" --arch "$target") || shadow_failed=1
 	done
+	# The HOST universe, from the same sweep.
+	#
+	# `trusted_everywhere` asks for Host AND TestGuest and only TestGuest was ever written, so no
+	# component could ever be fully trusted however much evidence it accumulated. The host suite is
+	# the cheap half of a sweep - no boot, no image - so producing its evidence costs almost nothing
+	# beyond running what a sweep runs anyway.
+	#
+	# Written by the runner rather than scraped: it knows each check's id and its exit status, and a
+	# `total` line so a partial run cannot look like a clean one.
+	host_log="$BUILD_DIR/logs/verify-host-shadow.txt"
+	mkdir -p "$(dirname "$host_log")"
+	: >"$host_log"
+	host_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- host-checks)" || planner_failed "the planner could not list the host checks"
+	host_total=0
+	while IFS=$'\t' read -r id command; do
+		[[ -n "$id" ]] || continue
+		host_total=$((host_total + 1))
+		if (cd "$SRC_DIR/.." && eval "$command") >/dev/null 2>&1; then
+			printf '%s PASS\n' "$id" >>"$host_log"
+		else
+			printf '%s FAIL\n' "$id" >>"$host_log"
+		fi
+	done <<<"$host_ids"
+	printf 'total %s\n' "$host_total" >>"$host_log"
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --host-log "../$host_log") || shadow_failed=1
+
 	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"
 	model_after="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
 	if [[ "$source_before" != "$source_after" || "$model_before" != "$model_after" ]]; then
@@ -378,9 +410,21 @@ note "all $count step(s) passed"
 # standing behind a green. That rule existed in prose while the runner executed its plan regardless
 # of any component's level, which is the gap between "we have a trust model" and "we use one".
 #
-# It reports rather than refuses, because refusing would make the tool unusable - nothing is TRUSTED
-# yet and nothing can be until shadow comparisons accumulate. Set VERIFY_REQUIRE_TRUST=1 to make an
-# unproven scoped run a failure instead, which is the strict contract for anyone who wants it.
+# SAFE IS THE DEFAULT AND PERMISSIVE IS THE OPT-OUT, which is the way round it was not.
+#
+# It used to report and exit 0, with `VERIFY_REQUIRE_TRUST=1` as the way in to the strict contract.
+# That is transparent and it is still the wrong default: `if ./verify.sh; then publish; fi` reads a
+# SHADOW run as done, and nothing in the exit status says otherwise. A green that means "good
+# evidence, not a verification" has to be distinguishable by a machine, not only by a person reading
+# the note above it.
+#
+# So SHADOW exits 4 and STALE exits 5 - their own statuses, distinct from 1, so a caller can tell a
+# failed step from an unproven one. `--allow-shadow` is how somebody says they know, and
+# `VERIFY_REQUIRE_TRUST=1` is still accepted and now redundant.
+#
+# This will fail runs that used to pass, and that is the point: nothing is TRUSTED yet, so the honest
+# answer for most changes today IS "scoped, unproven". `./verify.sh --shadow` produces the evidence
+# and `./verify.sh --allow-shadow` says it is not needed this time.
 level_line="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- level --stdin 2>/dev/null || true)"
 level="${level_line%%$'\t'*}"
 case "$level" in
@@ -394,16 +438,18 @@ STALE)
 	note "verification level: STALE - ${level_line#*$'\t'} key(s) this run did not cover are past the age window."
 	note "     The bound is what makes age a bound: a scoped run cannot be the only green while work"
 	note "     that old is uncovered. ./verify.sh --age  lists them, ./verify.sh --sweep  clears them."
-	if [[ "${VERIFY_REQUIRE_TRUST:-0}" == "1" ]]; then
-		die "VERIFY_REQUIRE_TRUST is set and this run left work past the age window uncovered"
+	if [[ "${allow_shadow:-0}" != "1" ]]; then
+		note "     --allow-shadow accepts this; exiting 5 so a caller can tell it from a failure."
+		exit 5
 	fi
 	;;
 SHADOW)
 	note "verification level: SHADOW - ${level_line#*$'\t'} has no shadow evidence under this model yet."
 	note "     A scoped green is good evidence and NOT equivalent to a full verification."
 	note "     ./verify.sh --shadow  proves the selection for this change; ./verify.sh --sweep  sidesteps it."
-	if [[ "${VERIFY_REQUIRE_TRUST:-0}" == "1" ]]; then
-		die "VERIFY_REQUIRE_TRUST is set and this change touches components with no shadow evidence"
+	if [[ "${allow_shadow:-0}" != "1" ]]; then
+		note "     --allow-shadow accepts this; exiting 4 so a caller can tell it from a failure."
+		exit 4
 	fi
 	;;
 *)

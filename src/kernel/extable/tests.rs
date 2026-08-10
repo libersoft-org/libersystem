@@ -1,6 +1,6 @@
 use super::*;
 
-crate::tagged_test!(the_exception_table_exists_and_is_small_enough_to_scan, [Kernel, Memory], covers = ["kernel"]);
+crate::tagged_test!(the_exception_table_exists_and_is_small_enough_to_scan, [Kernel, Memory], id = "kernel.extable.the_exception_table_exists_and_is_small_enough_to_scan", covers = ["kernel"]);
 fn the_exception_table_exists_and_is_small_enough_to_scan() {
 	// Two claims this module makes about itself, both of which stop being true silently.
 	//
@@ -18,7 +18,7 @@ fn the_exception_table_exists_and_is_small_enough_to_scan() {
 	assert!(declared() <= 64, "the exception table has grown to {} entries; a linear scan in the fault handler is no longer the right shape - sort it and binary-search", declared());
 }
 
-crate::tagged_test!(a_copy_to_a_page_that_is_not_there_reports_rather_than_kills_the_kernel, [Kernel, Memory, Syscall], covers = ["kernel"]);
+crate::tagged_test!(a_copy_to_a_page_that_is_not_there_reports_rather_than_kills_the_kernel, [Kernel, Memory, Syscall], id = "kernel.extable.a_copy_to_a_page_that_is_not_there_reports_rather_than_kills_the_kernel", covers = ["kernel"]);
 fn a_copy_to_a_page_that_is_not_there_reports_rather_than_kills_the_kernel() {
 	// The whole milestone in one assertion: a kernel copy to a user address that is NOT mapped must
 	// come back saying how far it got, and the machine must still be running to hear it.
@@ -62,7 +62,7 @@ fn a_copy_to_a_page_that_is_not_there_reports_rather_than_kills_the_kernel() {
 	assert_eq!(ok, payload, "and copies the right bytes");
 }
 
-crate::tagged_test!(a_fault_on_a_kernel_address_is_never_rescued_however_the_pc_matches, [Kernel, Memory], covers = ["kernel"]);
+crate::tagged_test!(a_fault_on_a_kernel_address_is_never_rescued_however_the_pc_matches, [Kernel, Memory], id = "kernel.extable.a_fault_on_a_kernel_address_is_never_rescued_however_the_pc_matches", covers = ["kernel"]);
 fn a_fault_on_a_kernel_address_is_never_rescued_however_the_pc_matches() {
 	// The condition that keeps a real kernel bug loud, which the PC match alone does not.
 	//
@@ -89,7 +89,7 @@ fn a_fault_on_a_kernel_address_is_never_rescued_however_the_pc_matches() {
 	assert!(fixup_for(entry, 0xFFFF_8000_0000_0000).is_none(), "nor is a higher-half kernel pointer, which is what a kernel bug passes");
 }
 
-crate::tagged_test!(a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got, [Kernel, Memory, Syscall], covers = ["kernel"]);
+crate::tagged_test!(a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got, [Kernel, Memory, Syscall], id = "kernel.extable.a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got", covers = ["kernel"]);
 fn a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got() {
 	// The state a mid-copy unmap actually produces, arranged deterministically.
 	//
@@ -131,6 +131,61 @@ fn a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got() {
 		all
 	});
 	assert!(landed, "every byte the copy counted must be on the page");
+
+	crate::arch::paging::unmap_page(AT);
+	unsafe { crate::mem::frame::deallocate(frame) };
+}
+
+crate::tagged_test!(a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel, [Kernel, Memory, Syscall, Process], id = "kernel.extable.a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel", covers = ["kernel"]);
+fn a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel() {
+	// The path M0149 was written for and did not cover.
+	//
+	// `SYS_PROCESS_LOAD` used to hand the ELF loader a raw slice over the caller's memory and run
+	// the whole load inside a `user_access` window. Every read of that slice is ordinary code in the
+	// ELF parser - a bounds check, a header field, a segment copy - and none of it is in `.extable`,
+	// nor can it be, because it is not a copy routine. A page that went away partway through
+	// faulted in ring 0 at an unrescuable PC and the machine halted. It needed no privilege: create
+	// a child in your own Domain, call load on a large image, unmap the buffer from another thread.
+	//
+	// The image is copied into the kernel first now, through the faultable copy, so the loader reads
+	// memory userspace cannot take away and the refusal happens at a declared instruction.
+	//
+	// Driven from a kernel thread through the real syscalls, because the load has to get past a
+	// process handle before it reaches the image at all - the shape `userspace_spawn_syscalls_...`
+	// uses. Like the other tests in this file, an unfixed kernel does not fail here, it HALTS.
+	use crate::arch::paging::{PRESENT, USER, WRITABLE};
+	use crate::mem::frame::PAGE_SIZE;
+	use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+	// Two user pages with only the first mapped. An ELF magic at the start, so the length and the
+	// header are plausible and the refusal has to come from the absent second page.
+	const AT: u64 = crate::memlayout::USER_VA_END / 2 - 4 * PAGE_SIZE;
+	static ANSWER: AtomicI64 = AtomicI64::new(0);
+	static CAUGHT_BEFORE: AtomicU64 = AtomicU64::new(0);
+
+	extern "C" fn spawner(_bootstrap: u64) {
+		unsafe {
+			let child = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_CREATE, 0, 0, 0, 0);
+			assert!((child as i64) > 0, "the child process is created");
+			CAUGHT_BEFORE.store(super::caught(), Ordering::SeqCst);
+			let answer = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_LOAD, child, AT, 2 * PAGE_SIZE, 0) as i64;
+			ANSWER.store(answer, Ordering::SeqCst);
+		}
+	}
+
+	let frame = crate::mem::frame::allocate().expect("a frame for the mapped half");
+	crate::arch::paging::map_page(AT, frame, PRESENT | WRITABLE | USER);
+	crate::arch::paging::user_access(|| unsafe {
+		core::ptr::write_bytes(AT as *mut u8, 0, PAGE_SIZE as usize);
+		core::ptr::copy_nonoverlapping(b"\x7fELF".as_ptr(), AT as *mut u8, 4);
+	});
+
+	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
+	crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL, 0);
+	crate::sched::run_until_idle();
+
+	assert!(ANSWER.load(Ordering::SeqCst) < 0, "a load whose image is half absent must answer with an error - and the kernel must still be running to answer");
+	assert!(caught() > CAUGHT_BEFORE.load(Ordering::SeqCst), "the absent page was reached through the faultable copy; if it were not, this line would not have been reached at all");
 
 	crate::arch::paging::unmap_page(AT);
 	unsafe { crate::mem::frame::deallocate(frame) };

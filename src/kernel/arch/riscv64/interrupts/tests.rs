@@ -5,7 +5,7 @@ use crate::object::interrupt::Interrupt;
 // The RISC-V counterpart of the x86 INTx and aarch64 GICv2m interrupt tests: on QEMU
 // virt with AIA/IMSIC, every device interrupt is an MSI-X-delivered EID pended in a
 // hart's IMSIC S-file. There is no bindable wired vector.
-crate::tagged_test!(imsic_msi_binds_and_dispatch_signals_the_driver, [Interrupt, Drivers, ArchRiscv64], covers = ["kernel"]);
+crate::tagged_test!(imsic_msi_binds_and_dispatch_signals_the_driver, [Interrupt, Drivers, ArchRiscv64], id = "kernel.arch.riscv64.interrupts.imsic_msi_binds_and_dispatch_signals_the_driver", covers = ["kernel"]);
 fn imsic_msi_binds_and_dispatch_signals_the_driver() {
 	// A frame stands in for a device's MSI-X table: acquire_msi programs entry 0 into it
 	// (message address = the acquiring hart's IMSIC S-file, message data = the EID).
@@ -32,7 +32,7 @@ fn imsic_msi_binds_and_dispatch_signals_the_driver() {
 	unsafe { frame::deallocate(table) };
 }
 
-crate::tagged_test!(imsic_msi_inventory_reports_the_timer_and_msi_vectors, [Interrupt, Drivers, ArchRiscv64], covers = ["kernel"]);
+crate::tagged_test!(imsic_msi_inventory_reports_the_timer_and_msi_vectors, [Interrupt, Drivers, ArchRiscv64], id = "kernel.arch.riscv64.interrupts.imsic_msi_inventory_reports_the_timer_and_msi_vectors", covers = ["kernel"]);
 fn imsic_msi_inventory_reports_the_timer_and_msi_vectors() {
 	// Index 0 of the RISC-V IRQ inventory (what `lsirq` reads) is the kernel's own S-mode
 	// timer interrupt (SCAUSE code 5), always in use and reported as a fixed vector - the

@@ -10,7 +10,7 @@ fn user_flags() -> u64 {
 	arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER | arch::paging::NO_EXECUTE
 }
 
-crate::tagged_test!(map_degrades_to_error_when_out_of_frames, [Memory], covers = ["kernel"]);
+crate::tagged_test!(map_degrades_to_error_when_out_of_frames, [Memory], id = "kernel.object.address_space.map_degrades_to_error_when_out_of_frames", covers = ["kernel"]);
 fn map_degrades_to_error_when_out_of_frames() {
 	use mem::frame;
 	// A userspace-triggered map must degrade, not panic, when the frame pool is
@@ -41,7 +41,7 @@ fn map_degrades_to_error_when_out_of_frames() {
 	unsafe { frame::deallocate(leaf) };
 }
 
-crate::tagged_test!(each_address_space_has_its_own_user_window, [Memory], covers = ["kernel"]);
+crate::tagged_test!(each_address_space_has_its_own_user_window, [Memory], id = "kernel.object.address_space.each_address_space_has_its_own_user_window", covers = ["kernel"]);
 fn each_address_space_has_its_own_user_window() {
 	// The user mmap window is per address space, and the sharpest way to say so is that
 	// two spaces hand out the SAME address. A global pool cannot: it would give the second
@@ -66,7 +66,7 @@ fn each_address_space_has_its_own_user_window() {
 	assert_eq!(first.alloc_vrange(4 * mem::frame::PAGE_SIZE), a, "the released range returns to the space that released it");
 }
 
-crate::tagged_test!(a_page_table_oom_rolls_back_and_leaves_earlier_mappings_alone, [Memory], covers = ["kernel"]);
+crate::tagged_test!(a_page_table_oom_rolls_back_and_leaves_earlier_mappings_alone, [Memory], id = "kernel.object.address_space.a_page_table_oom_rolls_back_and_leaves_earlier_mappings_alone", covers = ["kernel"]);
 fn a_page_table_oom_rolls_back_and_leaves_earlier_mappings_alone() {
 	// The rollback that matters is not the one at the first level. Draining the pool tests
 	// that: nothing can be allocated, so nothing is half-built. What has to hold is a failure
@@ -114,7 +114,7 @@ fn a_page_table_oom_rolls_back_and_leaves_earlier_mappings_alone() {
 	}
 }
 
-crate::tagged_test!(a_user_mapping_is_refused_outside_the_user_half, [Memory], covers = ["kernel"]);
+crate::tagged_test!(a_user_mapping_is_refused_outside_the_user_half, [Memory], id = "kernel.object.address_space.a_user_mapping_is_refused_outside_the_user_half", covers = ["kernel"]);
 fn a_user_mapping_is_refused_outside_the_user_half() {
 	// The bound the ET_EXEC escalation ran through. A mapping carrying USER names memory
 	// ring 3 may reach, and the kernel half is not that - whoever computed the address.

@@ -30,12 +30,37 @@ use registry::Registry;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-// Bumped deliberately when the selection ALGORITHM changes in a way that could alter a plan.
+// The selector's own SOURCE, hashed, so an algorithm change invalidates evidence by itself.
 //
-// Part of `model_hash`, so bumping it demotes every TRUSTED component back to SHADOW. That is the
-// point: evidence proves that a particular selector over a particular model did not miss anything,
-// and a new selector has no evidence yet no matter how clean the old record looked.
-pub const SELECTOR_VERSION: u32 = 1;
+// This was a hand-maintained `SELECTOR_VERSION: u32 = 1`, bumped by remembering to - and it had not
+// moved across `archrisk`, `Reach::TestBuild`, cost escalation and exact selection, four changes to
+// what the selector decides. Nothing broke, because those changes also moved the inputs the hash
+// already covered, and that is luck rather than design: a purely algorithmic change with identical
+// inputs would have left every certificate standing over a selector that now answers differently.
+//
+// Evidence proves that a particular selector over a particular model did not miss anything. Both
+// halves have to be in the hash, and only one of them was.
+//
+// Read at RUN TIME from the checkout rather than baked in with `include_str!`, because a binary
+// built before an edit would otherwise carry the old hash - and the thing being guarded against is
+// exactly a stale binary agreeing with itself. The files are the crate's own sources; if they
+// cannot be read, that is a broken checkout and the model refuses to produce a hash for it.
+fn selector_source_digest(repo_root: &Path) -> Result<String, String> {
+	let dir = repo_root.join("src/tools/verify-model/src");
+	let mut names: Vec<String> = std::fs::read_dir(&dir).map_err(|error| format!("{}: {error}", dir.display()))?.filter_map(|entry| entry.ok()).map(|entry| entry.file_name().to_string_lossy().into_owned()).filter(|name| name.ends_with(".rs")).collect();
+	if names.is_empty() {
+		return Err(format!("{}: no selector sources, so hashing them would pass vacuously", dir.display()));
+	}
+	names.sort();
+	let mut hasher = Sha256::new();
+	for name in &names {
+		let bytes = std::fs::read(dir.join(name)).map_err(|error| format!("{name}: {error}"))?;
+		hasher.update(name.as_bytes());
+		hasher.update(b"\n");
+		hasher.update(&bytes);
+	}
+	Ok(format!("{:x}", hasher.finalize()))
+}
 
 pub struct Model {
 	pub repo_root: PathBuf,
@@ -78,7 +103,14 @@ impl Model {
 	pub fn model_hash(&self) -> String {
 		let mut hasher = Sha256::new();
 		hasher.update(b"verify-model/1\n");
-		hasher.update(SELECTOR_VERSION.to_le_bytes());
+		hasher.update(b"\nselector\n");
+		// A checkout whose selector sources cannot be read has no model hash worth trusting, and a
+		// hash that silently skipped them would be the exact failure this replaced. The string says
+		// so rather than hashing nothing.
+		match selector_source_digest(&self.repo_root) {
+			Ok(digest) => hasher.update(digest.as_bytes()),
+			Err(error) => hasher.update(format!("UNREADABLE {error}").as_bytes()),
+		}
 		hasher.update(b"\nregistry\n");
 		hasher.update(self.registry.registry_text.as_bytes());
 		hasher.update(b"\nconfigurations\n");

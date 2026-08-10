@@ -1323,7 +1323,19 @@ impl Testable for TaggedTest {
 
 	fn run(&self) {
 		serial_print!("{}...\t", self.name);
+		// The clock, read either side, so "slow" and "stuck" stop being a judgement call somebody
+		// makes by watching a log.
+		//
+		// They were exactly that, and it cost two hours: a riscv64 run that stopped producing output
+		// for ten minutes was read as a livelock and chased through four subsystems, when the region
+		// it was in genuinely takes minutes per test. The evidence that would have settled it in one
+		// glance - how long the LAST test took - was never on the line.
+		//
+		// Printed only when it is worth reading. A suite where every line carries `(0.2 s)` is a
+		// suite nobody reads the timings in, and the emulated targets are where the question arises.
+		let started = crate::arch::tsc::now();
 		(self.run)();
+		let elapsed_ns = crate::arch::tsc::cycles_to_ns(crate::arch::tsc::now().wrapping_sub(started));
 		// The frame allocator's two views of the pool, compared after every test.
 		//
 		// A bitmap allocator can hand one page to two owners, and the run table it replaced could
@@ -1335,7 +1347,13 @@ impl Testable for TaggedTest {
 			serial_println!("[failed]");
 			panic!("the frame allocator's bitmap and its ownership record disagree about {pages} page(s) after this test, first at {first:#x}");
 		}
-		serial_println!("[ok]");
+		// One second is the threshold: below it the number is noise, above it the number is the
+		// reason the suite is taking as long as it is.
+		if elapsed_ns >= 1_000_000_000 {
+			serial_println!("[ok] ({} s)", elapsed_ns / 1_000_000_000);
+		} else {
+			serial_println!("[ok]");
+		}
 	}
 
 	fn tags(&self) -> &'static [TestTag] {
@@ -1381,12 +1399,14 @@ macro_rules! tagged_test {
 			};
 		}
 	};
-	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?]) => {
-		$crate::tagged_test!(@build $(#[$attr])* $name, [$first_tag $(, $tag)*], stringify!($name), &[]);
-	};
-	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?], covers = [$($covers:literal),* $(,)?]) => {
-		$crate::tagged_test!(@build $(#[$attr])* $name, [$first_tag $(, $tag)*], stringify!($name), &[$($covers),*]);
-	};
+	// There is deliberately NO arm without `id`. It used to default to `stringify!($name)`, and all
+	// 209 tests took the default - so a test's identity WAS its function name, and renaming one
+	// retired its history and started a fresh key with no evidence behind it. Not a false green: the
+	// loss is of trust rather than of coverage. But the design called for an identity that a rename
+	// cannot destroy, and a default nobody overrides is not one.
+	//
+	// A missing `id` is now a compile error naming the test, which is the only enforcement that
+	// cannot be forgotten.
 	($(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?], id = $id:literal) => {
 		$crate::tagged_test!(@build $(#[$attr])* $name, [$first_tag $(, $tag)*], $id, &[]);
 	};

@@ -541,8 +541,19 @@ pub fn upgrade_to_heap() {
 		let wanted = worst_case_runs(total);
 		let mut table = Vec::new();
 		if table.try_reserve_exact(wanted).is_err() {
-			crate::serial_println!("frame: could not size the buddy allocator's metadata NOR reserve a run table for {wanted} runs; staying on the seed table, where a free CAN be lost");
-			return;
+			// NEITHER allocator can be built, so the invariant this milestone is named for cannot be
+			// held: on the 128-run seed table a free that does not fit is DROPPED, the machine gets
+			// quietly smaller, and the first sign is an allocation failure weeks later with no cause
+			// attached.
+			//
+			// A kernel that knows it cannot keep that promise must not keep going as though it
+			// could. Printing a line and running anyway was the old answer, and a warning at boot on
+			// a machine nobody is watching is not an answer - it is the defect with a footnote.
+			//
+			// Reachable only on a machine too short of memory to reserve a few hundred kilobytes at
+			// boot, which is a machine that is not going to run this system anyway. Stopping here
+			// says so, in one place, instead of somewhere unrelated in an hour.
+			panic!("frame: neither the buddy allocator's metadata nor a worst-case run table of {wanted} runs could be reserved; this kernel cannot guarantee that a free is never lost, and will not run pretending it can");
 		}
 		crate::serial_println!("frame: could not size the buddy allocator's metadata; falling back to a worst-case run table of {wanted} runs");
 		runs = Some(table);
@@ -1049,11 +1060,21 @@ pub fn audit() -> Option<(u64, u64)> {
 	// `record_frames / 64` words - 16k words on a 4 GiB machine - against a walk that asks
 	// `is_free_page` a million times and costs a second and a half per test. Every divergence this
 	// is looking for moves a page from one side to the other, so it moves the count too.
-	let mut owned_pages = 0u64;
-	for index in 0..record_frames {
-		if bits[(index / 64) as usize] & (1 << (index % 64)) != 0 {
-			owned_pages += 1;
-		}
+	// A POPCOUNT over words, which is what the comment above always claimed and the first version
+	// did not do: it tested one bit at a time, 131,072 times on a 512 MB machine, with the allocator
+	// LOCK HELD - and this runs after every test. A core spinning on that lock cannot answer a TLB
+	// shootdown, so the cost did not stay inside the audit.
+	//
+	// The tail word is MASKED, and the first version of this was not - which cost the audit its
+	// fast path on every call. The record is created with `resize(words, u64::MAX)`, so every bit
+	// starts set and only real frames are ever cleared: the padding above `record_frames` stays 1
+	// forever. Counting it made the two views disagree every time, which sent the audit down the
+	// per-page walk it exists to avoid, on every test.
+	let words = (record_frames as usize).div_ceil(64);
+	let mut owned_pages: u64 = 0;
+	for (index, word) in bits.iter().take(words).enumerate() {
+		let value = if index + 1 == words && record_frames % 64 != 0 { word & ((1u64 << (record_frames % 64)) - 1) } else { *word };
+		owned_pages += value.count_ones() as u64;
 	}
 	let free_by_record = record_frames - owned_pages;
 	if free_by_record == buddy.free_pages() {

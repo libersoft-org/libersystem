@@ -430,6 +430,29 @@ impl<'a> Processes<'a> {
 			}
 			match unsafe { process_stats(entry.handle) } {
 				Some(stats) if stats.state == PROC_STATE_RUNNING => live.push(entry),
+				// STOPPED and never finished: it has not STARTED yet.
+				//
+				// `PROC_STATE_STOPPED` is `live_threads().is_empty()`, which is true of a process
+				// whose threads have all exited AND of one whose entry thread has been started but
+				// not yet picked up by a scheduler. Reaping on the state alone cannot tell those
+				// apart, so a launch recorded microseconds before the next one was dropped on the
+				// next one's way in - and `ps` showed one process where two had started.
+				//
+				// Seen twice: riscv64 2026-08-10 in a run of 208, x86_64 2026-08-09 once in 211 and
+				// not on the immediate re-run. The window is general; x86_64 merely hits it less.
+				//
+				// `completion_valid` is the discriminator the state does not carry: the kernel sets
+				// it from `exit_status()`, which exists only once the process has actually finished.
+				// So "not running and no exit status" means not started yet, and the entry stays.
+				//
+				// This does not leak, and the leak is the reason the obvious fix - remember whether
+				// an entry was ever seen RUNNING - was rejected. A launch that FAILS is never
+				// recorded at all (`record` runs after `spawn_program` succeeded), a killed process
+				// reads `PROC_STATE_FAILED` and is reaped, and a vanished one gives `None`. The only
+				// entry kept indefinitely would be a process that never runs and never exits, which
+				// is a kernel fault rather than a bookkeeping one - and keeping a live process is
+				// the direction this whole function is supposed to err in.
+				Some(stats) if stats.state == PROC_STATE_STOPPED && stats.completion_valid == 0 => live.push(entry),
 				_ => unsafe {
 					close(entry.handle);
 					// The Domain goes with the process it accounted. The kernel frees it once

@@ -954,3 +954,42 @@ fn a_disk_whose_data_begins_past_the_scan_is_still_called_blank() {
 	edge.edit(BLANK_SCAN_SECTORS - 1, |s| s[17] = 0x01);
 	assert_eq!(probe(&mut edge), Disk::UnknownData, "the last sector of the contiguous scan is read");
 }
+
+// A hostile table's `last_usable` reaches over the OTHER copy's entry array, and the partition it
+// names is refused for it.
+//
+// Every check on a partition ran against ONE array: the one belonging to the copy in front of it.
+// Validating the primary asked whether an entry overlapped the primary's array and never the
+// backup's; validating the backup asked the mirror question. A conforming table puts `last_usable`
+// below the backup metadata so the question never arises, which is exactly why nothing noticed.
+//
+// The consequence is not a mount that fails. It is a writable filesystem laid over the recovery copy
+// of the table that describes it, overwritten in the ordinary course of use, and discovered when
+// somebody needs the backup.
+#[test]
+fn a_partition_reaching_over_the_other_copys_entry_array_is_refused() {
+	// `last_usable` stretched to the sector below the backup HEADER, which swallows the backup
+	// entry array whole. The header still verifies: `last_usable` is a field it checksums, and a
+	// table is entitled to be wrong about where its usable range ends.
+	let over_backup = Layout { last_usable: CAPACITY - 2, ..Layout::primary() };
+	let partition = || liberfs_entry(FIRST_USABLE, CAPACITY - 2);
+
+	// Both copies present and agreeing, which is the path that would otherwise act on it. The
+	// backup's array span is then a FACT rather than an inference, and the partition covers it.
+	let mut both = Image::new(CAPACITY);
+	both.put(0, &protective_mbr());
+	write_header(&mut both, &over_backup, &[partition()]);
+	write_header(&mut both, &Layout { last_usable: CAPACITY - 2, ..Layout::backup() }, &[partition()]);
+	assert_eq!(probe(&mut both), Disk::CorruptGpt, "a partition covering the backup's entry array is not a table to write to");
+
+	// And with the backup unreadable, where the span has to be DERIVED from the primary's own
+	// numbers. The primary stands alone - that is what a backup being a backup means - but the
+	// region a recovery would need is still defended.
+	let mut alone = primary_only(over_backup, &[partition()]);
+	assert_eq!(probe(&mut alone), Disk::CorruptGpt, "the counterpart's array is defended even when the counterpart could not be read");
+
+	// The same table with `last_usable` where a conforming one puts it is accepted, so the refusals
+	// above are about the overlap and not about the partition or the layout.
+	let mut ok = gpt_disk(&[liberfs_entry(FIRST_USABLE, LAST_USABLE)]);
+	assert_eq!(probe(&mut ok), Disk::LiberFs { first: FIRST_USABLE, last: LAST_USABLE }, "a partition inside the usable range is still found");
+}

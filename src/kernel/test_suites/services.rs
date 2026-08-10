@@ -5,7 +5,7 @@ use super::*;
 // records why it went down instead of seeing an unexplained peer-close. DeviceManager
 // needs the init package before it reports in; hand it a plain message where the package
 // should be and it reports the failure honestly rather than dying silently.
-tagged_test!(a_service_reports_a_bootstrap_failure, [Service, Boot], covers = ["kernel", "services"]);
+tagged_test!(a_service_reports_a_bootstrap_failure, [Service, Boot], id = "kernel.services.a_service_reports_a_bootstrap_failure", covers = ["kernel", "services"]);
 fn a_service_reports_a_bootstrap_failure() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -26,7 +26,7 @@ fn a_service_reports_a_bootstrap_failure() {
 	assert!(report.bytes.windows(7).any(|w| w == b"package"), "the report names the failing step");
 }
 
-tagged_test!(log_service_speaks_generated_bindings, [Service], covers = ["kernel"]);
+tagged_test!(log_service_speaks_generated_bindings, [Service], id = "kernel.services.log_service_speaks_generated_bindings", covers = ["kernel"]);
 fn log_service_speaks_generated_bindings() {
 	use abi::log::{self, Severity};
 	use object::channel::Message;
@@ -85,7 +85,7 @@ fn log_service_speaks_generated_bindings() {
 	assert!(b.windows(b"device_manager".len()).any(|w: &[u8]| w == b"device_manager"), "second entry present");
 }
 
-tagged_test!(input_service_streams_pointer_events, [Service, Input, Mouse, Console], covers = ["kernel", "services"]);
+tagged_test!(input_service_streams_pointer_events, [Service, Input, Mouse, Console], id = "kernel.services.input_service_streams_pointer_events", covers = ["kernel", "services"]);
 fn input_service_streams_pointer_events() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -168,7 +168,7 @@ fn input_service_streams_pointer_events() {
 	assert_eq!(events[1], (0, 0, 0), "the corner event maps to column 0, row 0, no buttons");
 }
 
-tagged_test!(input_service_streams_keys_only_with_display_focus, [Service, Input, Display], covers = ["kernel"]);
+tagged_test!(input_service_streams_keys_only_with_display_focus, [Service, Input, Display], id = "kernel.services.input_service_streams_keys_only_with_display_focus", covers = ["kernel"]);
 fn input_service_streams_keys_only_with_display_focus() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -278,7 +278,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 	assert_eq!(frames, 6, "three key-down frames are followed by three synthetic releases");
 }
 
-tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display, Memory], covers = ["kernel", "term"]);
+tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display, Memory], id = "kernel.services.display_service_restores_the_console_surface", covers = ["kernel", "term"]);
 fn display_service_restores_the_console_surface() {
 	use object::address_space::AddressSpace;
 	use object::channel::{Channel, Message};
@@ -565,27 +565,27 @@ fn display_service_restores_the_console_surface() {
 	acknowledge_present(&gpu_kernel, Some((&benchmark, 76)));
 }
 
-tagged_test!(audio_service_enforces_scope_and_mixes_streams, [Service, Audio, AudioService], covers = ["kernel"]);
+tagged_test!(audio_service_enforces_scope_and_mixes_streams, [Service, Audio, AudioService], id = "kernel.services.audio_service_enforces_scope_and_mixes_streams", covers = ["kernel"]);
 fn audio_service_enforces_scope_and_mixes_streams() {
 	run_audio_service_scenario(AudioServiceScenario::ScopeAndMixing);
 }
 
-tagged_test!(audio_service_applies_bounded_backpressure, [Service, Audio, AudioService], covers = ["kernel"]);
+tagged_test!(audio_service_applies_bounded_backpressure, [Service, Audio, AudioService], id = "kernel.services.audio_service_applies_bounded_backpressure", covers = ["kernel"]);
 fn audio_service_applies_bounded_backpressure() {
 	run_audio_service_scenario(AudioServiceScenario::Backpressure);
 }
 
-tagged_test!(audio_service_keeps_mp3_playback_continuous, [Service, Audio, AudioService], covers = ["kernel"]);
+tagged_test!(audio_service_keeps_mp3_playback_continuous, [Service, Audio, AudioService], id = "kernel.services.audio_service_keeps_mp3_playback_continuous", covers = ["kernel"]);
 fn audio_service_keeps_mp3_playback_continuous() {
 	run_audio_service_scenario(AudioServiceScenario::Mp3Continuity);
 }
 
-tagged_test!(audio_service_closes_streams_after_driver_failure, [Service, Audio, AudioService], covers = ["kernel"]);
+tagged_test!(audio_service_closes_streams_after_driver_failure, [Service, Audio, AudioService], id = "kernel.services.audio_service_closes_streams_after_driver_failure", covers = ["kernel"]);
 fn audio_service_closes_streams_after_driver_failure() {
 	run_audio_service_scenario(AudioServiceScenario::DriverFailure);
 }
 
-tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow], covers = ["kernel", "services"]);
+tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow], id = "kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock", covers = ["kernel", "services"]);
 fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -753,7 +753,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	assert!(arch::apic::ticks() - acked_at >= 75, "the renewal came at the restarted T1, not the retransmit pace");
 }
 
-tagged_test!(process_service_canonicalizes_short_and_explicit_program_names, [Service, Process, ProcessService], covers = ["kernel"]);
+tagged_test!(process_service_canonicalizes_short_and_explicit_program_names, [Service, Process, ProcessService], id = "kernel.services.process_service_canonicalizes_short_and_explicit_program_names", covers = ["kernel"]);
 fn process_service_canonicalizes_short_and_explicit_program_names() {
 	// ProcessService falls back to the init package without a storage client. Both a
 	// short logical name and its explicit physical basename must report one identity.
@@ -764,7 +764,7 @@ fn process_service_canonicalizes_short_and_explicit_program_names() {
 	assert_process_start_reply(&replies[1], 2, artifact);
 }
 
-tagged_test!(process_service_lists_every_started_program, [Service, Process, ProcessService], covers = ["kernel"]);
+tagged_test!(process_service_lists_every_started_program, [Service, Process, ProcessService], id = "kernel.services.process_service_lists_every_started_program", covers = ["kernel"]);
 fn process_service_lists_every_started_program() {
 	// SEEN TO FAIL ON riscv64, three times in a row, on 2026-08-08: two processes started and
 	// acknowledged with koids, and the list held one. It then passed twice - the tag alone and the
@@ -791,6 +791,24 @@ fn process_service_lists_every_started_program() {
 	//
 	// The assertion below names the survivors for this reason: `1 != 2` says nothing about WHICH
 	// launch went missing, and that is the first fact the next attempt needs.
+	//
+	// **FIXED 2026-08-10**, and the suspect above was right. `PROC_STATE_STOPPED` is
+	// `live_threads().is_empty()`, which is true both of a process whose threads have exited and of
+	// one whose entry thread has been started and not yet picked up - so reaping on the state alone
+	// cannot tell them apart. `ProcessStats` carries the discriminator the state does not:
+	// `completion_valid`, set from `exit_status()`, which exists only once the process has really
+	// finished. `Processes::reap` now keeps an entry that is STOPPED with no exit status.
+	//
+	// Third sighting, riscv64, in a run of 208 - which is what finally paid for the fix.
+	//
+	// No deterministic regression test, and the reason is worth stating rather than leaving as an
+	// omission: the window needs a spawned thread to exist and NOT be scheduled, and this harness
+	// drives the service by queueing every request and then draining with one `run_until_idle`. It
+	// offers no way to hold one thread back. What the pair of tests DOES pin is both ends of the
+	// invariant - this one requires a live process to be listed, and
+	// `process_service_drops_a_terminated_process_from_the_list` requires a finished one to go. The
+	// second was watched failing with the new branch widened to keep everything (`left: 1, right:
+	// 0`), which is the direction this fix could plausibly have been wrong in.
 	let (replies, list) = run_process_service_requests(&[(11, b"log_service"), (12, b"device_manager")], Some(13));
 	assert_process_start_reply(&replies[0], 11, b"log_service.lsexe");
 	assert_process_start_reply(&replies[1], 12, b"device_manager.lsexe");
@@ -800,7 +818,7 @@ fn process_service_lists_every_started_program() {
 	assert_eq!(le_u16(&list, 5), 2, "both started processes are listed");
 }
 
-tagged_test!(process_service_drops_a_terminated_process_from_the_list, [Service, Process, ProcessService], covers = ["kernel"]);
+tagged_test!(process_service_drops_a_terminated_process_from_the_list, [Service, Process, ProcessService], id = "kernel.services.process_service_drops_a_terminated_process_from_the_list", covers = ["kernel"]);
 fn process_service_drops_a_terminated_process_from_the_list() {
 	use object::channel::Channel;
 	use object::process::Process;
@@ -836,7 +854,7 @@ fn process_service_drops_a_terminated_process_from_the_list() {
 	assert_eq!(process_service_list_len(service_client, 23), 0, "a terminated process leaves the list");
 }
 
-tagged_test!(process_service_accounts_a_bounded_launch, [Service, Process, ProcessService, Domain], covers = ["kernel"]);
+tagged_test!(process_service_accounts_a_bounded_launch, [Service, Process, ProcessService, Domain], id = "kernel.services.process_service_accounts_a_bounded_launch", covers = ["kernel"]);
 fn process_service_accounts_a_bounded_launch() {
 	use object::channel::Channel;
 	use object::rights::Rights;
@@ -887,7 +905,7 @@ fn process_service_accounts_a_bounded_launch() {
 	assert_eq!(*memory_limit, LIMIT, "the reported memory limit is the one the launch asked for");
 }
 
-tagged_test!(process_service_resolves_one_final_executable_suffix, [Service, Process], covers = ["kernel", "services"]);
+tagged_test!(process_service_resolves_one_final_executable_suffix, [Service, Process], id = "kernel.services.process_service_resolves_one_final_executable_suffix", covers = ["kernel", "services"]);
 fn process_service_resolves_one_final_executable_suffix() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -938,7 +956,7 @@ fn process_service_resolves_one_final_executable_suffix() {
 	}
 }
 
-tagged_test!(config_service_serves_the_tree, [Config, Service], covers = ["kernel"]);
+tagged_test!(config_service_serves_the_tree, [Config, Service], id = "kernel.services.config_service_serves_the_tree", covers = ["kernel"]);
 fn config_service_serves_the_tree() {
 	use object::channel::Message;
 
@@ -1013,7 +1031,7 @@ fn config_service_serves_the_tree() {
 	assert_eq!(&b[7..7 + vlen], b"hi", "the value just set reads back");
 }
 
-tagged_test!(config_set_survives_a_service_reboot, [Config, Service, Storage], covers = ["kernel", "services"]);
+tagged_test!(config_set_survives_a_service_reboot, [Config, Service, Storage], id = "kernel.services.config_set_survives_a_service_reboot", covers = ["kernel", "services"]);
 fn config_set_survives_a_service_reboot() {
 	use alloc::collections::BTreeMap;
 	use object::channel::{Channel, Message};
@@ -1144,7 +1162,7 @@ fn config_set_survives_a_service_reboot() {
 	sched::run_until_idle();
 }
 
-tagged_test!(pty_hosts_a_program, [Service, Shell, Console], covers = ["kernel", "services", "term"]);
+tagged_test!(pty_hosts_a_program, [Service, Shell, Console], id = "kernel.services.pty_hosts_a_program", covers = ["kernel", "services", "term"]);
 fn pty_hosts_a_program() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -1231,7 +1249,7 @@ fn pty_hosts_a_program() {
 	assert!(captured.windows(b"pty:hello".len()).any(|w| w == b"pty:hello"), "the slave's reply is forwarded back out the master");
 }
 
-tagged_test!(ps_live_view_drives_the_terminal_contract, [Service, Shell, Console], covers = ["kernel", "term"]);
+tagged_test!(ps_live_view_drives_the_terminal_contract, [Service, Shell, Console], id = "kernel.services.ps_live_view_drives_the_terminal_contract", covers = ["kernel", "term"]);
 fn ps_live_view_drives_the_terminal_contract() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -1282,7 +1300,7 @@ fn ps_live_view_drives_the_terminal_contract() {
 	assert!(contains(b"\x1b[?9001l") && contains(b"\x1b[?1049l"), "quitting on q should restore the tty and leave the alternate screen");
 }
 
-tagged_test!(storage_serves_volume_file_to_client, [Service, Storage], covers = ["kernel", "liberfs", "storage"]);
+tagged_test!(storage_serves_volume_file_to_client, [Service, Storage], id = "kernel.services.storage_serves_volume_file_to_client", covers = ["kernel", "liberfs", "storage"]);
 fn storage_serves_volume_file_to_client() {
 	// The StorageService (a ring-3 process) maps a ramdisk volume, and a client
 	// process opens vol://system/hello.txt through it, receives a shared-buffer
@@ -1295,7 +1313,7 @@ fn storage_serves_volume_file_to_client() {
 	assert_eq!(actual, expected);
 }
 
-tagged_test!(resource_manager_contains_a_domain, [Service, Domain], covers = ["kernel", "services"]);
+tagged_test!(resource_manager_contains_a_domain, [Service, Domain], id = "kernel.services.resource_manager_contains_a_domain", covers = ["kernel", "services"]);
 fn resource_manager_contains_a_domain() {
 	// The ResourceManager creates a bounded sub-Domain, launches resource_probe into it, and
 	// caps the Domain's memory at four one-page objects above the probe's baseline. It drives
@@ -1311,7 +1329,7 @@ fn resource_manager_contains_a_domain() {
 	assert_eq!(summary.as_slice(), b"granted=4 denied=1 regranted=4", "the kernel enforced the Domain's memory budget, contained the over-budget refusal, and honored the runtime raise");
 }
 
-tagged_test!(kernel_reads_file_through_storage_service, [Service, Storage], covers = ["kernel", "liberfs", "storage"]);
+tagged_test!(kernel_reads_file_through_storage_service, [Service, Storage], id = "kernel.services.kernel_reads_file_through_storage_service", covers = ["kernel", "liberfs", "storage"]);
 fn kernel_reads_file_through_storage_service() {
 	// The kernel drives the StorageService as its own client, sending one open request
 	// and a quit sentinel, then reads the returned shared buffer. The bytes must equal
@@ -1323,7 +1341,7 @@ fn kernel_reads_file_through_storage_service() {
 	assert_eq!(actual, expected);
 }
 
-tagged_test!(storage_serves_staged_tool_binary, [Service, Storage], covers = ["kernel", "liberfs", "storage"]);
+tagged_test!(storage_serves_staged_tool_binary, [Service, Storage], id = "kernel.services.storage_serves_staged_tool_binary", covers = ["kernel", "liberfs", "storage"]);
 fn storage_serves_staged_tool_binary() {
 	// The tool ELFs are staged onto the system volume under bin/ by the
 	// factory-seed pipeline (build.rs strips them into the volume archive, the boot runner

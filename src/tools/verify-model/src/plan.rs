@@ -88,6 +88,9 @@ pub struct Planner<'a> {
 	// What the mechanical scan found. It only ever WIDENS the boot set the policy table produced -
 	// a component with no marker is a candidate for neutral, never a proof of it.
 	pub arch_risk: BTreeMap<String, crate::archrisk::Risk>,
+	// Measured per-key durations, for the cost escalation. Empty on a checkout that has run nothing,
+	// which still leaves the fixed per-boot terms - and those are what dominate.
+	pub history: crate::history::History,
 }
 
 impl<'a> Planner<'a> {
@@ -98,7 +101,7 @@ impl<'a> Planner<'a> {
 	// has to be passed in because it borrows the model's crates and cannot be created here without
 	// outliving the borrow.
 	pub fn for_model(model: &'a crate::Model, ownership: &'a Ownership<'a>) -> Self {
-		Planner { registry: &model.registry, graph: &model.graph, ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone(), arch_risk: model.arch_risk.clone() }
+		Planner { registry: &model.registry, graph: &model.graph, ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone(), arch_risk: model.arch_risk.clone(), history: crate::history::History::load(&model.repo_root).unwrap_or_default() }
 	}
 
 	pub fn plan(&self, changed: &[String]) -> Plan {
@@ -233,19 +236,60 @@ impl<'a> Planner<'a> {
 		}
 		items.sort_by(|left, right| left.key.cmp(&right.key));
 
-		// Escalate on measured cost, rather than only mentioning it.
+		// Escalate on measured COST, per environment, rather than on a count of keys.
 		//
-		// The threshold is about removing a BOOT, not about running fewer tests, and the measurement
-		// that sets it was corrected: a guest run costs ~8 s fixed and ~0.5 s per test on x86_64, not
-		// the ~100 s fixed an earlier reading of a loaded machine suggested. At 8 s fixed a selection
-		// worth 90% of the whole is bookkeeping for nothing, so it becomes the whole - which also
-		// gives the shadow record something complete to compare against.
+		// It compared `selected / whole` over all keys, which treats twenty host keys and twenty
+		// riscv64 guest keys as the same quantity when they differ by two orders of magnitude in
+		// wall-clock. `CostModel::estimate` already answers the real question and nothing asked it.
+		//
+		// PER PAIR, and that is the substantive change. The fixed term is what dominates - a boot is
+		// paid once however many tests run in it - so the question is never "should the whole plan
+		// become FULL" but "having decided to boot riscv64 at all, is running its 4 selected tests
+		// meaningfully cheaper than running all 205". Usually it is not, and taking the rest costs
+		// almost nothing and gives the shadow record something complete to compare against. A global
+		// rule cannot express that: it would answer the riscv64 question by also booting the two
+		// targets nobody asked about.
 		if !full && !items.is_empty() {
-			let selected = items.len() as f64;
-			let whole: usize = self.catalog.checks.iter().map(|check| check.variants.len()).sum();
-			if whole > 0 && selected / whole as f64 > 0.9 {
-				warnings.push(format!("the selection is {} of {whole} keys - within a tenth of everything, so the bookkeeping is not worth the remainder", items.len()));
-				return self.full_plan(paths, seeds, affected, vec![format!("a scoped selection of {} of {whole} keys is not worth its bookkeeping", items.len())], warnings);
+			let cost = crate::history::CostModel::default();
+			let history = &self.history;
+			let mut pairs: BTreeSet<(String, crate::catalog::Environment)> = BTreeSet::new();
+			for item in &items {
+				pairs.insert((item.key.architecture.clone(), item.key.environment.clone()));
+			}
+			let mut widened: Vec<PlanItem> = Vec::new();
+			for (architecture, environment) in &pairs {
+				let mine: Vec<PlanItemKey> = items.iter().filter(|item| &item.key.architecture == architecture && &item.key.environment == environment).map(|item| item.key.clone()).collect();
+				let mut whole: Vec<PlanItem> = Vec::new();
+				for check in &self.catalog.checks {
+					for variant in &check.variants {
+						if &variant.architecture != architecture || &variant.environment != environment || !self.variant_applies(check, variant, &built, &booted) {
+							continue;
+						}
+						whole.push(PlanItem { key: PlanItemKey { check: check.id.clone(), architecture: variant.architecture.clone(), environment: variant.environment.clone(), configuration: variant.configuration.clone() }, kind: check.kind, command: check.command.replace("{arch}", &variant.architecture), reason: format!("this {architecture} {} run is within a tenth of the cost of all of it, so it runs all of it", environment.as_str()) });
+					}
+				}
+				if whole.len() <= mine.len() {
+					continue;
+				}
+				// Only where there is a BOOT to amortise. A host pair has no fixed term - nothing is
+				// started, nothing is imaged, each check is its own cost - so widening it buys no
+				// saving at all and simply runs more. The first version of this rule did not make
+				// that distinction and pulled a shipping kernel build into a codec change, which is
+				// the opposite of what the milestone is for.
+				if cost.fixed_seconds.get(&(architecture.clone(), environment.as_str().to_string())).copied().unwrap_or(0.0) <= 0.0 {
+					continue;
+				}
+				let scoped_cost = cost.estimate(history, &mine);
+				let whole_cost = cost.estimate(history, &whole.iter().map(|item| item.key.clone()).collect::<Vec<_>>());
+				if whole_cost > 0.0 && scoped_cost / whole_cost > 0.9 {
+					warnings.push(format!("the {architecture} {} selection costs an estimated {scoped_cost:.0} s against {whole_cost:.0} s for all {} of its keys, so it takes all of them", environment.as_str(), whole.len()));
+					widened.extend(whole);
+				}
+			}
+			if !widened.is_empty() {
+				let already: BTreeSet<PlanItemKey> = items.iter().map(|item| item.key.clone()).collect();
+				items.extend(widened.into_iter().filter(|item| !already.contains(&item.key)));
+				items.sort_by(|left, right| left.key.cmp(&right.key));
 			}
 		}
 

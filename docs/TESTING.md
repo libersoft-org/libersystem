@@ -82,6 +82,31 @@ Every default errs toward running more, and the failures are loud:
 The only way out with nothing to run is that every changed path is declared not code, and the plan
 says so per path, with the reason.
 
+## Slow, or stopped?
+
+Two things in the runner exist because that question cost two hours, and neither was answerable from
+a log:
+
+- **Every test over a second prints how long it took**: `name...  [ok] (24 s)`. Below a second the
+  number is noise and is left out. On the emulated targets this is what tells you a region of the
+  suite is expensive rather than broken.
+- **A per-TEST watchdog** stops a run when no test has COMPLETED for `TEST_STALL` seconds (default
+  900) and names the test that was running. `--timeout` bounds the whole suite, so a run that stops
+  on test 83 of 228 otherwise burns the entire remaining budget and then reports the same thing a
+  genuinely slow run reports.
+
+The watchdog does not claim more than it knows. "No test completed in fifteen minutes" is not "this
+is wedged" - a single riscv64 test can legitimately run into minutes, and if one exceeds the window
+the answer is `TEST_STALL=1800` and not a smaller suite. The `[ok] (N s)` figures are what tell you
+which it is.
+
+**The trap this replaces, written down because it will be tempting again:** a riscv64 run that
+produced no output for ten minutes, with QEMU at 400% CPU and `tlb: shootdown timed out` lines around
+it, looks exactly like a livelock. It was not. That target emits shootdown timeouts in every run
+including the passing ones, 400% CPU is eight emulated cores doing work, and the region really does
+take minutes per test. Check the clock and the load before the diff - and now, check the per-test
+timings, which is the line that would have settled it in one glance.
+
 ## Reading a guest run's logs
 
 `test.sh` writes two files per run and names both when it finishes:

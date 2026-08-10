@@ -208,11 +208,17 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 			// and this answer authorises a format. Agreement between the copies is cheap evidence,
 			// and its absence is exactly the sort of thing that should stop a write.
 			Ok(gpt) => match backup_gpt(dev) {
-				Ok(backup) if copies_agree(&gpt, &backup) => find_liberfs(&gpt),
+				Ok(backup) if copies_agree(&gpt, &backup) => {
+					let companion = companion_entries(&gpt, Some(&backup));
+					find_liberfs(&gpt, companion)
+				}
 				// The backup is unreadable or damaged: the primary stands on its own, which is what
 				// a backup being a BACKUP means. Only a backup that verifies and disagrees is a
 				// reason to refuse.
-				Err(_) => find_liberfs(&gpt),
+				Err(_) => {
+					let companion = companion_entries(&gpt, None);
+					find_liberfs(&gpt, companion)
+				}
 				Ok(_) => Disk::CorruptGpt,
 			},
 			Err(Fault::NoMemory) => Disk::NoMemory,
@@ -221,7 +227,10 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 			// before condemning it: a damaged primary header with an intact backup is the
 			// case UEFI defines a backup FOR.
 			Err(Fault::Unusable) => match backup_gpt(dev) {
-				Ok(gpt) => find_liberfs(&gpt),
+				Ok(gpt) => {
+					let companion = companion_entries(&gpt, None);
+					find_liberfs(&gpt, companion)
+				}
 				Err(Fault::NoMemory) => Disk::NoMemory,
 				Err(Fault::Io) => Disk::Io,
 				Err(Fault::Unusable) => Disk::CorruptGpt,
@@ -232,7 +241,10 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 	// absence is damage rather than a plain MBR disk - and the backup is where to look.
 	if mbr == Mbr::Protective {
 		return match backup_gpt(dev) {
-			Ok(gpt) => find_liberfs(&gpt),
+			Ok(gpt) => {
+				let companion = companion_entries(&gpt, None);
+				find_liberfs(&gpt, companion)
+			}
 			Err(Fault::NoMemory) => Disk::NoMemory,
 			Err(Fault::Io) => Disk::Io,
 			Err(Fault::Unusable) => Disk::CorruptGpt,
@@ -579,7 +591,48 @@ fn copies_agree(primary: &Gpt, backup: &Gpt) -> bool {
 // enough to hold a volume. A degenerate entry is skipped rather than fatal - another entry
 // may be the real volume - so what falls out the bottom is "this GPT names no LiberFS
 // partition", which is a complete answer about a disk that belongs to something else.
-fn find_liberfs(gpt: &Gpt) -> Disk {
+// Where the OTHER copy of the table keeps its entry array.
+//
+// A `Gpt` knows its own `entries_lba..=entries_last_lba` and nothing about its counterpart's, so a
+// partition was only ever checked against ONE of the two arrays: validating the primary never asked
+// whether an entry overlapped the backup's array, and validating the backup never asked about the
+// primary's. A conforming table puts `last_usable` below the backup metadata so the question does
+// not arise; a checksum-valid hostile one is what this parser is for, and there the two spans are
+// independent facts. A LiberFS partition selected over the backup array is a writable filesystem
+// sitting on the recovery copy of the table that describes it.
+//
+// `observed` is the counterpart when it was actually read - the only case that is a fact rather than
+// an inference. Otherwise the span is DERIVED from the layout the specification fixes: the array
+// sits immediately before the header at the end of the disk, and immediately after it at the start.
+// Derivation can be wrong about a table that puts its array somewhere unusual, and being wrong here
+// costs a refused partition rather than an overwritten one, which is the direction this file takes
+// everywhere else.
+fn companion_entries(gpt: &Gpt, observed: Option<&Gpt>) -> Option<(u64, u64)> {
+	if let Some(other) = observed {
+		return Some((other.entries_lba, other.entries_last_lba));
+	}
+	let array_bytes = gpt.num_entries.checked_mul(gpt.entry_size as u64)?;
+	let sectors = array_bytes.div_ceil(SECTOR_SIZE as u64);
+	if gpt.backup_lba > gpt.header_lba {
+		// This is the primary; the counterpart is the last sector and its array ends just below it.
+		let last = gpt.backup_lba.checked_sub(1)?;
+		Some((last.checked_sub(sectors.checked_sub(1)?)?, last))
+	} else {
+		// This is the backup; the primary's array follows the primary header.
+		let first = gpt.backup_lba.checked_add(1)?;
+		Some((first, first.checked_add(sectors.checked_sub(1)?)?))
+	}
+}
+
+// Does `first..=last` touch the counterpart's metadata?
+fn hits_companion(companion: Option<(u64, u64)>, first: u64, last: u64) -> bool {
+	match companion {
+		Some((c_first, c_last)) => first <= c_last && c_first <= last,
+		None => false,
+	}
+}
+
+fn find_liberfs(gpt: &Gpt, companion: Option<(u64, u64)>) -> Disk {
 	// The whole table has to be consistent before any one entry of it is acted on.
 	//
 	// This used to look only at LiberFS-typed entries: each was checked against the usable range and
@@ -587,7 +640,7 @@ fn find_liberfs(gpt: &Gpt) -> Disk {
 	// checksum-valid table naming a Linux partition at 2048..30000 and a LiberFS one at
 	// 10000..40000 was accepted, and formatting the second destroyed half the first. A tool that
 	// only READS a table may reasonably trust it; this answer authorises a write.
-	if table_is_inconsistent(gpt) {
+	if table_is_inconsistent(gpt, companion) {
 		return Disk::CorruptGpt;
 	}
 	for e in gpt.entries.chunks_exact(gpt.entry_size) {
@@ -596,7 +649,7 @@ fn find_liberfs(gpt: &Gpt) -> Disk {
 		}
 		let first = u64::from_le_bytes(e[ENT_FIRST_LBA..ENT_FIRST_LBA + 8].try_into().unwrap());
 		let last = u64::from_le_bytes(e[ENT_LAST_LBA..ENT_LAST_LBA + 8].try_into().unwrap());
-		if usable_span(gpt, first, last) {
+		if usable_span(gpt, companion, first, last) {
 			return Disk::LiberFs { first, last };
 		}
 	}
@@ -625,7 +678,7 @@ fn find_liberfs(gpt: &Gpt) -> Disk {
 // table with a Linux entry at first = 1, last = 1, sitting on top of the GPT header itself and
 // overlapping no other partition, passed. A tool that only READS a table may reasonably shrug at
 // that; the answer here authorises a write.
-fn table_is_inconsistent(gpt: &Gpt) -> bool {
+fn table_is_inconsistent(gpt: &Gpt, companion: Option<(u64, u64)>) -> bool {
 	let used = |e: &[u8]| e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] != UNUSED_TYPE_GUID;
 	let span = |e: &[u8]| {
 		let first = u64::from_le_bytes(e[ENT_FIRST_LBA..ENT_FIRST_LBA + 8].try_into().unwrap());
@@ -656,6 +709,9 @@ fn table_is_inconsistent(gpt: &Gpt) -> bool {
 		if first <= gpt.entries_last_lba && gpt.entries_lba <= last {
 			return true;
 		}
+		if hits_companion(companion, first, last) {
+			return true;
+		}
 	}
 	for (index, a) in gpt.entries.chunks_exact(gpt.entry_size).enumerate().filter(|(_, e)| used(e)) {
 		let (a_first, a_last) = span(a);
@@ -670,7 +726,7 @@ fn table_is_inconsistent(gpt: &Gpt) -> bool {
 }
 
 // Is `first..=last` a span this build may hand to a filesystem?
-fn usable_span(gpt: &Gpt, first: u64, last: u64) -> bool {
+fn usable_span(gpt: &Gpt, companion: Option<(u64, u64)>, first: u64, last: u64) -> bool {
 	if first == 0 || last < first {
 		return false;
 	}
@@ -689,6 +745,10 @@ fn usable_span(gpt: &Gpt, first: u64, last: u64) -> bool {
 		return false;
 	}
 	if first <= gpt.entries_last_lba && gpt.entries_lba <= last {
+		return false;
+	}
+	// and the OTHER copy's array, which this header does not describe - see `companion_entries`.
+	if hits_companion(companion, first, last) {
 		return false;
 	}
 	match last.checked_sub(first).and_then(|n| n.checked_add(1)) {

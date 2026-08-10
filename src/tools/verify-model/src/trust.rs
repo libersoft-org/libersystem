@@ -50,12 +50,35 @@ pub struct Store {
 // Deliberately not "no failures for a month". A month that saw only audio changes proves nothing
 // about the driver edges, so the criterion is over EVIDENCE rather than over time: clean shadow
 // comparisons under the current model, on more than one target, with the regression corpus green.
+// The universe a certificate written before universes existed belongs to. Serde needs a function.
 fn test_guest_universe() -> crate::shadow::Universe {
 	crate::shadow::Universe::TestGuest
 }
 
 pub const REQUIRED_CLEAN_RUNS: usize = 5;
-pub const REQUIRED_ARCHITECTURES: usize = 2;
+
+// How many distinct targets a universe has to show evidence from, per universe.
+//
+// It was one constant, 2, applied to all three - which is right for `TestGuest` and IMPOSSIBLE for
+// the other two. `Host` runs on the host and has exactly one target; `DevGuest` is built for x86_64
+// alone. A universal number therefore made both permanently unqualifiable for a reason that has
+// nothing to do with their evidence, and `trusted_everywhere` - which asks for Host AND TestGuest -
+// could never return true for anything, ever. A trust model that can only answer "not trusted" is
+// not a model, it is a constant.
+//
+// The number is a property of what the universe can REACH, so it lives beside the universe rather
+// than beside the caller.
+pub fn required_architectures(universe: crate::shadow::Universe) -> usize {
+	match universe {
+		// Guest suites run on all three targets, and a component validated on one says nothing about
+		// the others - the whole reason this field exists.
+		crate::shadow::Universe::TestGuest => 2,
+		// One target by construction: the host is the host.
+		crate::shadow::Universe::Host => 1,
+		// Built for x86_64 only, so asking for two is asking for a target that does not exist.
+		crate::shadow::Universe::DevGuest => 1,
+	}
+}
 
 impl Store {
 	pub fn path(repo_root: &Path) -> PathBuf {
@@ -85,9 +108,20 @@ impl Store {
 		}
 	}
 
-	// A component is only fully trusted when every universe that can judge it has said so.
-	pub fn trusted_everywhere(&self, component: &str, model_hash: &str) -> bool {
-		[crate::shadow::Universe::Host, crate::shadow::Universe::TestGuest].into_iter().all(|universe| self.level(component, model_hash, universe) == Level::Trusted)
+	// A component is only fully trusted when every universe that CAN judge it has said so.
+	//
+	// The pair was hard-coded, and one half of it had no producer, so this answered false for
+	// everything forever. Both halves are wrong in the same way: which universes can judge a
+	// component is a fact about the component, not a constant. A development-only binary is judged
+	// by `DevGuest` and by nothing else; a host tool that never enters an image is judged by `Host`.
+	//
+	// `universes` comes from the catalog - the environments the component's own checks run in - so a
+	// component acquires and loses judges as its checks do.
+	pub fn trusted_everywhere(&self, component: &str, model_hash: &str, universes: &[crate::shadow::Universe]) -> bool {
+		if universes.is_empty() {
+			return false;
+		}
+		universes.iter().all(|universe| self.level(component, model_hash, *universe) == Level::Trusted)
 	}
 
 	pub fn stale(&self, model_hash: &str) -> Vec<&Certificate> {
@@ -109,8 +143,9 @@ impl Store {
 		if clean < REQUIRED_CLEAN_RUNS {
 			return Err(format!("{clean} clean shadow comparison(s) under this model, {REQUIRED_CLEAN_RUNS} needed"));
 		}
-		if architectures.len() < REQUIRED_ARCHITECTURES {
-			return Err(format!("evidence from {} target(s) ({}), {REQUIRED_ARCHITECTURES} needed - a component validated on one target says nothing about the others", architectures.len(), architectures.join(", ")));
+		let needed = required_architectures(universe);
+		if architectures.len() < needed {
+			return Err(format!("evidence from {} target(s) ({}), {needed} needed in this universe - a component validated on one target says nothing about the others", architectures.len(), architectures.join(", ")));
 		}
 		Ok((clean, architectures))
 	}

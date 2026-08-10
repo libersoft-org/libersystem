@@ -38,7 +38,7 @@ impl KernelObject for TestObject {
 	}
 }
 
-crate::tagged_test!(handle_create_lookup_close, [Handle, Object, Kernel, Smoke], covers = ["kernel"]);
+crate::tagged_test!(handle_create_lookup_close, [Handle, Object, Kernel, Smoke], id = "kernel.object.handle_create_lookup_close", covers = ["kernel"]);
 fn handle_create_lookup_close() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(42);
@@ -51,7 +51,7 @@ fn handle_create_lookup_close() {
 	assert!(matches!(table.lookup(handle, Rights::READ), Err(HandleError::BadHandle)));
 }
 
-crate::tagged_test!(handle_rights_enforced, [Handle, Object, Kernel], covers = ["kernel"]);
+crate::tagged_test!(handle_rights_enforced, [Handle, Object, Kernel], id = "kernel.object.handle_rights_enforced", covers = ["kernel"]);
 fn handle_rights_enforced() {
 	let mut table = HandleTable::new();
 	let handle = table.insert_object(TestObject::new(7), Rights::READ, 0);
@@ -59,7 +59,7 @@ fn handle_rights_enforced() {
 	assert!(matches!(table.lookup(handle, Rights::WRITE), Err(HandleError::AccessDenied)));
 }
 
-crate::tagged_test!(handle_duplicate_attenuates, [Handle, Object, Kernel], covers = ["kernel"]);
+crate::tagged_test!(handle_duplicate_attenuates, [Handle, Object, Kernel], id = "kernel.object.handle_duplicate_attenuates", covers = ["kernel"]);
 fn handle_duplicate_attenuates() {
 	let mut table = HandleTable::new();
 	let handle = table.insert_object(TestObject::new(1), Rights::READ | Rights::WRITE | Rights::DUPLICATE, 0);
@@ -71,7 +71,7 @@ fn handle_duplicate_attenuates() {
 	assert!(matches!(table.duplicate(plain, Rights::READ), Err(HandleError::AccessDenied)));
 }
 
-crate::tagged_test!(handle_revocation_invalidates, [Handle, Object, Kernel], covers = ["kernel"]);
+crate::tagged_test!(handle_revocation_invalidates, [Handle, Object, Kernel], id = "kernel.object.handle_revocation_invalidates", covers = ["kernel"]);
 fn handle_revocation_invalidates() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(99);
@@ -81,7 +81,7 @@ fn handle_revocation_invalidates() {
 	assert!(matches!(table.lookup(handle, Rights::READ), Err(HandleError::Revoked)));
 }
 
-crate::tagged_test!(handle_type_sealing, [Handle, Object, Kernel], covers = ["kernel"]);
+crate::tagged_test!(handle_type_sealing, [Handle, Object, Kernel], id = "kernel.object.handle_type_sealing", covers = ["kernel"]);
 fn handle_type_sealing() {
 	let mut table = HandleTable::new();
 	let handle = table.insert_object(TestObject::new(5), Rights::READ, 0);
@@ -89,7 +89,7 @@ fn handle_type_sealing() {
 	assert!(matches!(table.lookup_typed(handle, ObjectType::Channel, Rights::READ), Err(HandleError::WrongType)));
 }
 
-crate::tagged_test!(handle_refcount_lifetime, [Handle, Object, Kernel], covers = ["kernel"]);
+crate::tagged_test!(handle_refcount_lifetime, [Handle, Object, Kernel], id = "kernel.object.handle_refcount_lifetime", covers = ["kernel"]);
 fn handle_refcount_lifetime() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(3);
@@ -104,7 +104,7 @@ fn handle_refcount_lifetime() {
 	assert_eq!(Arc::strong_count(&obj), 1);
 }
 
-crate::tagged_test!(a_message_carries_several_capabilities, [Object, Kernel, Syscall], covers = ["kernel"]);
+crate::tagged_test!(a_message_carries_several_capabilities, [Object, Kernel, Syscall], id = "kernel.object.a_message_carries_several_capabilities", covers = ["kernel"]);
 fn a_message_carries_several_capabilities() {
 	use super::channel::{Channel, Message};
 	use super::event::Event;
@@ -130,7 +130,7 @@ fn a_message_carries_several_capabilities() {
 	assert_eq!(message.caps[1].object().header().koid(), second_koid, "the second is the second, in order");
 }
 
-crate::tagged_test!(a_prepared_thread_does_not_run_until_released, [Object, Kernel, Process], covers = ["kernel"]);
+crate::tagged_test!(a_prepared_thread_does_not_run_until_released, [Object, Kernel, Process], id = "kernel.object.a_prepared_thread_does_not_run_until_released", covers = ["kernel"]);
 fn a_prepared_thread_does_not_run_until_released() {
 	use super::event::Event;
 	use core::sync::atomic::{AtomicBool, Ordering};
@@ -160,7 +160,7 @@ fn a_prepared_thread_does_not_run_until_released() {
 	assert!(RAN.load(Ordering::SeqCst), "releasing the thread runs it");
 }
 
-crate::tagged_test!(a_process_group_reaches_every_member, [Object, Kernel, Process], covers = ["kernel"]);
+crate::tagged_test!(a_process_group_reaches_every_member, [Object, Kernel, Process], id = "kernel.object.a_process_group_reaches_every_member", covers = ["kernel"]);
 fn a_process_group_reaches_every_member() {
 	use super::address_space::AddressSpace;
 	use super::process::Process;
@@ -199,7 +199,7 @@ fn a_process_group_reaches_every_member() {
 	assert!(ProcessGroup::create(&too_many).is_none(), "a group past the cap is refused rather than truncated");
 }
 
-crate::tagged_test!(a_clean_exit_reports_its_status, [Object, Kernel, Process], covers = ["kernel"]);
+crate::tagged_test!(a_clean_exit_reports_its_status, [Object, Kernel, Process], id = "kernel.object.a_clean_exit_reports_its_status", covers = ["kernel"]);
 fn a_clean_exit_reports_its_status() {
 	use super::process::Process;
 
@@ -238,7 +238,7 @@ fn a_clean_exit_reports_its_status() {
 	assert_eq!(clean.exit_status(), Some(0), "exiting 0 reports 0, not None");
 }
 
-crate::tagged_test!(system_power_refuses_a_caller_without_the_root_domain, [Object, Kernel, Syscall, Domain], covers = ["kernel"]);
+crate::tagged_test!(system_power_refuses_a_caller_without_the_root_domain, [Object, Kernel, Syscall, Domain], id = "kernel.object.system_power_refuses_a_caller_without_the_root_domain", covers = ["kernel"]);
 fn system_power_refuses_a_caller_without_the_root_domain() {
 	use super::domain::{Domain, UNLIMITED};
 	use core::sync::atomic::{AtomicI64, Ordering};
@@ -271,7 +271,7 @@ fn system_power_refuses_a_caller_without_the_root_domain() {
 	assert_eq!(WRONG_DOMAIN.load(Ordering::SeqCst), crate::syscall::ERR_ACCESS_DENIED, "a caller holding a non-root Domain is refused by identity, not merely by type");
 }
 
-crate::tagged_test!(object_property_set_names_an_object, [Object, Kernel, Syscall], covers = ["kernel"]);
+crate::tagged_test!(object_property_set_names_an_object, [Object, Kernel, Syscall], id = "kernel.object.object_property_set_names_an_object", covers = ["kernel"]);
 fn object_property_set_names_an_object() {
 	use super::event::Event;
 	use core::sync::atomic::{AtomicBool, Ordering};
@@ -293,7 +293,7 @@ fn object_property_set_names_an_object() {
 	assert_eq!(event.header().name().as_deref(), Some("irq-driver"));
 }
 
-crate::tagged_test!(a_group_handle_becomes_waitable_only_once_every_stage_ends, [Object, Kernel, Process, Syscall], covers = ["kernel"]);
+crate::tagged_test!(a_group_handle_becomes_waitable_only_once_every_stage_ends, [Object, Kernel, Process, Syscall], id = "kernel.object.a_group_handle_becomes_waitable_only_once_every_stage_ends", covers = ["kernel"]);
 fn a_group_handle_becomes_waitable_only_once_every_stage_ends() {
 	use super::address_space::AddressSpace;
 	use super::process::Process;
@@ -337,7 +337,7 @@ fn a_group_handle_becomes_waitable_only_once_every_stage_ends() {
 	assert!(READY.load(Ordering::SeqCst), "the group is ready once every stage has ended");
 }
 
-crate::tagged_test!(the_console_and_display_syscalls_refuse_a_caller_without_the_capability, [Object, Kernel, Syscall], covers = ["kernel"]);
+crate::tagged_test!(the_console_and_display_syscalls_refuse_a_caller_without_the_capability, [Object, Kernel, Syscall], id = "kernel.object.the_console_and_display_syscalls_refuse_a_caller_without_the_capability", covers = ["kernel"]);
 fn the_console_and_display_syscalls_refuse_a_caller_without_the_capability() {
 	use super::privilege::{Privilege, PrivilegeKind};
 	use core::sync::atomic::{AtomicI64, Ordering};

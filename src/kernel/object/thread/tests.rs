@@ -4,7 +4,7 @@ use super::super::{KernelObject, ObjectType};
 use super::{Thread, ThreadState};
 use crate::sched;
 
-crate::tagged_test!(thread_object_basics, [Object, Process, Smoke], covers = ["kernel"]);
+crate::tagged_test!(thread_object_basics, [Object, Process, Smoke], id = "kernel.object.thread.thread_object_basics", covers = ["kernel"]);
 fn thread_object_basics() {
 	extern "C" fn noop(_arg: u64) {}
 	let process = Process::new(AddressSpace::kernel(), sched::root_domain());

@@ -129,6 +129,30 @@ pub fn gates_declared_in_check_sh(repo_root: &std::path::Path) -> Result<BTreeSe
 	Ok(names)
 }
 
+// The universes that can judge `component`: the environments its own checks run in.
+//
+// Trust was asked of a fixed pair, Host and TestGuest, for every component - which is wrong in both
+// directions. A development-only binary is judged by the dev guest and by nothing else; a host tool
+// that never enters an image is judged on the host. Asking a universe that cannot reach a component
+// for evidence about it produces a certificate that can never be earned, and not asking one that
+// can produces a certificate that means less than it says.
+pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shadow::Universe> {
+	let mut seen: BTreeSet<crate::shadow::Universe> = BTreeSet::new();
+	for check in &catalog.checks {
+		if !check.covers.iter().any(|covered| covered == component) {
+			continue;
+		}
+		for variant in &check.variants {
+			seen.insert(match variant.environment {
+				Environment::Host => crate::shadow::Universe::Host,
+				Environment::TestGuest => crate::shadow::Universe::TestGuest,
+				Environment::DevGuest => crate::shadow::Universe::DevGuest,
+			});
+		}
+	}
+	seen.into_iter().collect()
+}
+
 pub fn catalog_gate_names() -> BTreeSet<String> {
 	GATES.iter().map(|(name, _)| (*name).to_string()).collect()
 }

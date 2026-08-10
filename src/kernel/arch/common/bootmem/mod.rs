@@ -128,7 +128,7 @@ pub unsafe fn loader_reservations(arg: u64, to_virt: impl Fn(u64) -> u64, out: &
 	let info = to_virt(arg) as *const bootproto::BootInfo;
 	let (modules_phys, modules_len) = unsafe { (core::ptr::read_volatile(&raw const (*info).modules), core::ptr::read_volatile(&raw const (*info).modules_len)) };
 	let mut written = 0usize;
-	let mut push = |start: u64, length: u64, out: &mut [Hole], written: &mut usize| {
+	let push = |start: u64, length: u64, out: &mut [Hole], written: &mut usize| {
 		if length > 0 && *written < out.len() {
 			out[*written] = Hole { start, end: start + length };
 			*written += 1;

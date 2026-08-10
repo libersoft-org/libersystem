@@ -1,7 +1,7 @@
 use super::*;
 use crate::arch;
 
-crate::tagged_test!(syscall_roundtrip_stateless, [Syscall, Smoke], covers = ["kernel"]);
+crate::tagged_test!(syscall_roundtrip_stateless, [Syscall, Smoke], id = "kernel.syscall.syscall_roundtrip_stateless", covers = ["kernel"]);
 fn syscall_roundtrip_stateless() {
 	// Stateless syscalls round-trip from the test (idle) context: there is no
 	// current thread, but these calls do not need one.
@@ -20,7 +20,7 @@ fn syscall_roundtrip_stateless() {
 	}
 }
 
-crate::tagged_test!(boot_profile_reports_nothing_when_the_boot_named_none, [Syscall], covers = ["kernel"]);
+crate::tagged_test!(boot_profile_reports_nothing_when_the_boot_named_none, [Syscall], id = "kernel.syscall.boot_profile_reports_nothing_when_the_boot_named_none", covers = ["kernel"]);
 fn boot_profile_reports_nothing_when_the_boot_named_none() {
 	// The development-only artifact registry gates itself on this answer, so the answer for
 	// an ordinary boot has to be dependable. A test boot never carries a profile - the
@@ -36,7 +36,7 @@ fn boot_profile_reports_nothing_when_the_boot_named_none() {
 	}
 }
 
-crate::tagged_test!(abi_check_accepts_the_matching_revision_and_refuses_a_mismatch, [Syscall], covers = ["kernel"]);
+crate::tagged_test!(abi_check_accepts_the_matching_revision_and_refuses_a_mismatch, [Syscall], id = "kernel.syscall.abi_check_accepts_the_matching_revision_and_refuses_a_mismatch", covers = ["kernel"]);
 fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
 	// SYS_ABI_CHECK is the runtime's first syscall: a starting binary reports the ABI
 	// revision it was built against, and the kernel refuses a mismatch so it never runs
@@ -52,7 +52,7 @@ fn abi_check_accepts_the_matching_revision_and_refuses_a_mismatch() {
 	}
 }
 
-crate::tagged_test!(random_fills_distinct_bytes_from_whichever_source_is_honest, [Syscall], covers = ["kernel"]);
+crate::tagged_test!(random_fills_distinct_bytes_from_whichever_source_is_honest, [Syscall], id = "kernel.syscall.random_fills_distinct_bytes_from_whichever_source_is_honest", covers = ["kernel"]);
 fn random_fills_distinct_bytes_from_whichever_source_is_honest() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);

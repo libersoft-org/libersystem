@@ -48,6 +48,7 @@ struct Entry {
 // How many kernel faults the table has caught. Not a diagnostic curiosity: a fixup that never fires
 // is a mechanism nobody has proved, and a fixup firing in ordinary operation is a userspace race
 // happening for real. The test asserts on it, and the boot report prints it.
+static REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static CAUGHT: AtomicU64 = AtomicU64::new(0);
 
 fn entries() -> &'static [Entry] {
@@ -90,6 +91,18 @@ fn is_user_address(address: u64) -> bool {
 
 pub fn fixup_for(pc: u64, fault_address: u64) -> Option<u64> {
 	if !is_user_address(fault_address) {
+		// A declared instruction faulting on a KERNEL address is this kernel's own bug, and it used
+		// to be recovered silently as though the user's page had gone away. Refusing it is the point
+		// of the condition - but refusing it turns a silent wrong answer into a halt, and a halt
+		// inside a trap handler on one core is a livelock on the others, with no output to say why.
+		//
+		// So it says why, once, before anything else can. The address is the evidence: which side of
+		// the copy was wrong, and where it pointed.
+		if entries().iter().any(|entry| entry.fault == pc) {
+			if REFUSED.fetch_add(1, Ordering::AcqRel) == 0 {
+				crate::serial_println!("extable: REFUSED a fixup at pc {pc:#x} - the faulting address {fault_address:#x} is in the kernel half, so this is a kernel bug and not a user page going away");
+			}
+		}
 		return None;
 	}
 	let found = entries().iter().find(|entry| entry.fault == pc).map(|entry| entry.fixup);
@@ -101,6 +114,11 @@ pub fn fixup_for(pc: u64, fault_address: u64) -> Option<u64> {
 
 // How many faults have been fixed up since boot.
 #[cfg_attr(not(test), allow(dead_code))]
+// Fixups refused because the fault address was not userspace's. Zero is the only healthy value.
+pub fn refused() -> u64 {
+	REFUSED.load(Ordering::Acquire)
+}
+
 pub fn caught() -> u64 {
 	CAUGHT.load(Ordering::Acquire)
 }

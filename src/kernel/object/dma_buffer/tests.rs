@@ -2,7 +2,7 @@ use super::DmaBuffer;
 use crate::mem::frame::PAGE_SIZE;
 use crate::object::domain::Domain;
 
-crate::tagged_test!(dma_buffer_uses_a_contiguous_span_and_refunds_its_charge, [Dma, Drivers, Memory], covers = ["kernel"]);
+crate::tagged_test!(dma_buffer_uses_a_contiguous_span_and_refunds_its_charge, [Dma, Drivers, Memory], id = "kernel.object.dma_buffer.dma_buffer_uses_a_contiguous_span_and_refunds_its_charge", covers = ["kernel"]);
 fn dma_buffer_uses_a_contiguous_span_and_refunds_its_charge() {
 	let domain = Domain::new(1 << 24, 8, 4);
 	let dma = match DmaBuffer::create_in(&domain, 6 * PAGE_SIZE as usize) {
@@ -19,7 +19,7 @@ fn dma_buffer_uses_a_contiguous_span_and_refunds_its_charge() {
 	assert_eq!(domain.account().dma().used(), 0, "the DMA charge is refunded");
 }
 
-crate::tagged_test!(dma_buffer_quota_enforced_cleanly, [Dma, Drivers, Kernel, Syscall], covers = ["kernel"]);
+crate::tagged_test!(dma_buffer_quota_enforced_cleanly, [Dma, Drivers, Kernel, Syscall], id = "kernel.object.dma_buffer.dma_buffer_quota_enforced_cleanly", covers = ["kernel"]);
 fn dma_buffer_quota_enforced_cleanly() {
 	use crate::object::domain::UNLIMITED;
 	use core::sync::atomic::{AtomicBool, Ordering};
