@@ -19,7 +19,23 @@
 // the newer call. A starting process reports the version it was built against through
 // SYS_ABI_CHECK, and the kernel refuses a mismatch (ERR_ABI_MISMATCH) so a binary built
 // against a different revision is stopped at startup instead of misbehaving.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 1;
+// ONE, and it stays one. Nothing in this system is versioned yet, because there has been no release.
+//
+// A version number is a promise to something already out there, and nothing is out there. Moving it
+// records compatibility with binaries nobody has, and costs a rebuild of every userspace artifact
+// and a rebuilt image to say it. The handshake below still does its job within a build: kernel and
+// userspace carry the same constant, so a stale artifact in the image is refused at startup rather
+// than misbehaving - which is what it caught the one time this number was moved.
+//
+// The rule above describes what to do AFTER the first final release, and the two changes worth
+// naming when that day comes are already in the tree: `SYS_WAITSET_WAIT` answers with the ready
+// member's koid rather than its index, and `SYS_WAITSET_REMOVE` takes that koid where it once took
+// the object's handle. Both change what a number MEANS rather than where an argument sits, which is
+// the shape the wording below reads past most easily.
+//
+// Until then: do not bump this. An audit that calls an unbumped breaking change a defect is applying
+// a rule that has not started.
 
 // Control messages intercepted by the userspace runtime before typed LSIDL
 // dispatch. Typed interface opcodes must stay at or below TYPED_OP_MAX.
@@ -391,6 +407,18 @@ pub const DEVICE_TYPE_XHCI: u32 = 0x100;
 pub struct DeviceInfo {
 	// device type (virtio net = 1, blk = 2, console = 3, ...; xHCI = 0x100).
 	pub device_type: u32,
+	// EXPLICIT, because the four bytes are there either way and the kernel copies this
+	// struct to userspace as raw bytes.
+	//
+	// `repr(C)` inserts them to align `bar_len`, and Rust does not promise that padding in an
+	// otherwise initialised value is initialised - so `write_user`, which copies `size_of::<T>()`
+	// bytes, was handing userspace four bytes of whatever the kernel stack held there. Naming the
+	// field and assigning it 0 makes them a value rather than a gap.
+	//
+	// This does NOT move anything: the padding occupied exactly these four bytes already, so
+	// `bar_len`'s offset, the size and the alignment are all unchanged. Every other struct in this
+	// file that needed one already had an explicit `_pad`; this one was missed.
+	pub _pad0: u32,
 	// length of the MMIO window the DeviceMemory capability covers.
 	pub bar_len: u64,
 	// byte offsets of the virtio structures within that window.

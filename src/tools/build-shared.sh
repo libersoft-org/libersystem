@@ -755,6 +755,22 @@ executable_source_digest() {
 	local artifact="$3"
 	if [[ "$package" == tools ]]; then
 		(
+			# The DEPENDENCY CLOSURE, first, and it was missing.
+			#
+			# This branch hashed only the tool's own files - its manifest, its lock, `lib.rs`, its own
+			# `.rs`, the linker scripts and the product config - so a change anywhere BELOW it was a
+			# cache hit and the previously staged binary stayed in the image. `rt` and `abi` are below
+			# every one of them.
+			#
+			# What that costs is not a stale timestamp. An `ABI_VERSION` bump rebuilt the kernel and
+			# the services and left nineteen tools untouched, so the image booted with binaries built
+			# against the old revision - and `rt`'s handshake did exactly what it is for and refused
+			# to run them. The failure surfaced as a governed pipeline producing nothing, three layers
+			# from anything that mentions a build.
+			#
+			# The other branch below has always had this line. This one is the same question asked of
+			# a different package, and it should have been the same answer.
+			printf 'dependency-closure=%s\n' "${package_source_digests[$package]:-$(local_dependency_source_digest "$crate_dir" "$package")}"
 			for source in "$crate_dir/Cargo.toml" "$crate_dir/Cargo.lock" "$crate_dir/src/lib.rs" "$crate_dir/src/$artifact.rs" user/build.rs user/user.ld user/user-aarch64.ld user/user-riscv64.ld ../product.conf; do
 				printf '%s\n' "$source"
 				if [[ "$source" == /* ]]; then

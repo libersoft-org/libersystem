@@ -544,7 +544,17 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 // misbehaving. New syscalls only append and old ones never renumber, so this call and
 // its number stay valid across every revision.
 fn sys_abi_check(claimed: u64) -> i64 {
-	if claimed == ABI_VERSION as u64 { 0 } else { ERR_ABI_MISMATCH }
+	if claimed == ABI_VERSION as u64 {
+		return 0;
+	}
+	// SAY BOTH NUMBERS.
+	//
+	// The refusal is correct and, on its own, almost useless to whoever has to act on it: `rt` prints
+	// "built against a different kernel ABI revision" and the caller is left to work out WHICH binary
+	// and which two revisions. That cost hours - the answer turned out to be a stale artifact in the
+	// image, and nothing in the message pointed at a build.
+	crate::serial_println!("abi: refusing a caller built against revision {claimed}; this kernel is {ABI_VERSION}");
+	ERR_ABI_MISMATCH
 }
 
 // Create a MemoryObject and install a handle to it in the caller's table.
@@ -901,7 +911,7 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, bus: d.bus, dev: d.dev, func: d.func, _pad: 0 });
+	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, bus: d.bus, dev: d.dev, func: d.func, _pad: 0, _pad0: 0 });
 	match info {
 		Some(info) => {
 			if let Err(e) = write_user(buf_ptr, info) {

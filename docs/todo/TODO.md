@@ -205,6 +205,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0154 - What the UDF backend claims to read, and what it actually does](M0154.md)
 - [ ] [M0155 - What the FAT backend writes, and what it says it wrote](M0155.md)
 - [ ] [M0156 - What the ISO9660 backend accepts, and the threat model it states](M0156.md)
+- [ ] [M0157 - The ABI's own guarantee, which is the one thing it cannot get wrong](M0157.md)
 
 ### Definition of done (phase 2)
 
