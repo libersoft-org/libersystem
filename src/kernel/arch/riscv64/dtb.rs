@@ -39,6 +39,11 @@ pub fn parse(hint: u64) -> Option<BootInfo> {
 	at(locate(hint)?).parse()
 }
 
+// `/cpus/timebase-frequency` in Hz, or None when this tree does not carry it.
+pub fn timebase_frequency(hint: u64) -> Option<u32> {
+	at(locate(hint)?).timebase_frequency()
+}
+
 // Does this machine's device tree advertise `want` (a lowercase ISA extension name) on its CPUs?
 // False when no FDT can be found, which is the safe direction: an undetected extension is one
 // this port does not use.

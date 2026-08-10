@@ -945,22 +945,21 @@ pub unsafe fn retire(frames: &[u64]) {
 	let drain = {
 		let mut quarantine = QUARANTINE.lock();
 		for &phys in frames {
-			// The queue is a heap allocation, and the heap grows by taking FRAMES - so the one
-			// moment it cannot grow is when frames are short, which is exactly when this path runs.
-			// The first version answered that by dropping the page with a warning, and a test that
-			// refuses allocations found it at once: nine pages lost on one failed load, and the
-			// quarantine empty, so it was not even a deferral.
+			// The queue allocates nothing, so the only reason it refuses is that it is FULL - which
+			// is a capacity decision rather than a memory shortage, and the answer to it is the
+			// expensive path below rather than a lost page.
 			//
-			// Nothing is lost now. A page that cannot be queued is retired the expensive way below -
-			// one shootdown for the batch of them - which is slow and correct, and slow only when
-			// the machine is already out of memory.
-			if quarantine.try_reserve(1).is_err() {
+			// It used to be a `Vec` behind a `try_reserve`: the queue grew by taking heap, the heap
+			// grew by taking frames, and the moment it was most needed was the moment it could not
+			// grow. That turned deferred memory into permanently lost memory on precisely the path
+			// that exists to avoid losing memory.
+			if !quarantine.push(phys) {
 				if unqueued_len < unqueued.len() {
 					unqueued[unqueued_len] = phys;
 					unqueued_len += 1;
 				} else {
-					// More than the small batch below can hold, with a heap that will not grow.
-					// Freed after its own shootdown rather than queued or dropped.
+					// More than the small batch below can hold. Freed after its own shootdown
+					// rather than queued or dropped.
 					drop(quarantine);
 					if crate::mem::tlb::shootdown() {
 						unsafe { deallocate(phys) };
@@ -972,7 +971,6 @@ pub unsafe fn retire(frames: &[u64]) {
 				}
 				continue;
 			}
-			quarantine.push(phys);
 		}
 		quarantine.len() >= QUARANTINE_DRAIN
 	};
@@ -1019,9 +1017,17 @@ pub unsafe fn drain_quarantine() {
 		// freeing them now is the physical use-after-free the whole mechanism exists to prevent.
 		return;
 	}
-	let held = core::mem::take(&mut *QUARANTINE.lock());
-	for phys in held {
-		unsafe { deallocate(phys) };
+	// Out in bounded batches, so a drain never needs a buffer proportional to the queue and never
+	// holds the lock across a free.
+	let mut batch: [u64; 64] = [0; 64];
+	loop {
+		let taken = QUARANTINE.lock().take_into(&mut batch);
+		if taken == 0 {
+			return;
+		}
+		for &phys in batch.iter().take(taken) {
+			unsafe { deallocate(phys) };
+		}
 	}
 }
 
@@ -1032,8 +1038,60 @@ pub unsafe fn drain_quarantine() {
 // caller knows a lot has just been freed - process teardown and loader rollback.
 const QUARANTINE_DRAIN: usize = 64;
 
+// How many frames the quarantine can hold at once. Past this a retirement pays for its own
+// shootdown rather than waiting for a batch.
+const QUARANTINE_CAPACITY: usize = 512;
+
 // Frames whose shootdown did not complete. Drained by the next one that does.
-static QUARANTINE: crate::sync::SpinLock<Vec<u64>> = crate::sync::SpinLock::new(Vec::new());
+//
+// A FIXED ARRAY, not a `Vec`, and that is the whole point of it: the queue grows by taking heap,
+// the heap grows by taking FRAMES, and the moment this queue is most needed is the moment frames
+// are short. The `Vec` version answered that with a `try_reserve` and, past a small stack fallback,
+// `note_lost_pages` - so a heap shortage turned deferred memory into permanently lost memory, and
+// the mechanism that exists to reclaim frames needed to allocate frames to work.
+//
+// 512 x 8 bytes of static memory buys an allocation-free reclaim path. Full is not lost either: the
+// caller shoots down for the frame it could not queue, which is slow and correct.
+struct Quarantine {
+	frames: [u64; QUARANTINE_CAPACITY],
+	len: usize,
+}
+
+impl Quarantine {
+	const fn new() -> Self {
+		Self { frames: [0; QUARANTINE_CAPACITY], len: 0 }
+	}
+
+	// Take one frame, or refuse because there is no room. Refusing is the caller's cue to pay for
+	// a shootdown itself rather than to drop the page.
+	fn push(&mut self, phys: u64) -> bool {
+		if self.len == QUARANTINE_CAPACITY {
+			return false;
+		}
+		self.frames[self.len] = phys;
+		self.len += 1;
+		true
+	}
+
+	// Move up to `out.len()` frames out, returning how many. Bounded so a drain never needs a
+	// buffer proportional to the queue.
+	fn take_into(&mut self, out: &mut [u64]) -> usize {
+		let n = self.len.min(out.len());
+		out[..n].copy_from_slice(&self.frames[self.len - n..self.len]);
+		self.len -= n;
+		n
+	}
+
+	fn len(&self) -> usize {
+		self.len
+	}
+
+	fn is_empty(&self) -> bool {
+		self.len == 0
+	}
+}
+
+static QUARANTINE: crate::sync::SpinLock<Quarantine> = crate::sync::SpinLock::new(Quarantine::new());
 
 // Compare the two views of the pool: every page the buddy calls free must be a page the ownership
 // record calls not-owned, and the other way round.

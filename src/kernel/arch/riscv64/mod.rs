@@ -327,9 +327,34 @@ pub mod tsc {
 		}
 		t
 	}
+	// Read `/cpus/timebase-frequency` from the device tree once, at clock init.
+	//
+	// It was the constant 10,000,000 with a comment naming QEMU's virt machine, and every timeout,
+	// tick conversion, timer and deadline is scaled by it - so on hardware that ticks at another
+	// rate all of them are wrong by that ratio, silently. The fallback stays, because a tree that
+	// does not carry the property leaves nothing else to go on, and it says so on the way past.
+	static HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+	const QEMU_VIRT_HZ: u64 = 10_000_000;
+
+	pub fn init_from_dtb(dtb: u64) {
+		match super::dtb::timebase_frequency(dtb) {
+			Some(hz) if hz > 0 => HZ.store(hz as u64, core::sync::atomic::Ordering::Release),
+			_ => {
+				crate::serial_println!("riscv64: no /cpus/timebase-frequency in the device tree; assuming {QEMU_VIRT_HZ} Hz (QEMU virt)");
+				HZ.store(QEMU_VIRT_HZ, core::sync::atomic::Ordering::Release);
+			}
+		}
+	}
+
+	// Kept so the existing `init()` call site still compiles; the tree is read by
+	// `init_from_dtb`, which boot calls with the pointer it already has.
 	pub fn init() {}
+
 	pub fn hz() -> u64 {
-		10_000_000 // QEMU virt CLINT timebase (aclint-mtimer @ 10 MHz)
+		match HZ.load(core::sync::atomic::Ordering::Acquire) {
+			0 => QEMU_VIRT_HZ,
+			hz => hz,
+		}
 	}
 	pub fn cycles_to_ns(cycles: u64) -> u64 {
 		crate::arch::common::time::cycles_to_ns(cycles, hz())

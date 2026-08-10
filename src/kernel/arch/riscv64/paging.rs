@@ -266,15 +266,43 @@ pub fn reserve_kernel_top_level(base: u64, len: u64) {
 
 // Map one 4 kB page `va -> pa` in the tree rooted at `root` (a physical Sv39 root),
 // allocating any missing intermediate tables, then flush the TLB.
+// Detach and retire the intermediate levels a failed walk created, newest first.
+//
+// SAFETY: every entry named here was written by this walk and nothing else can have reached the
+// frame it points at, because the leaf that would have made it reachable was never written.
+unsafe fn unwind_created(created: &[(*mut u64, u64); 2], len: usize) {
+	for &(entry, phys) in created.iter().take(len).rev() {
+		unsafe { write_volatile(entry, 0) };
+		unsafe { crate::mem::frame::retire(&[phys]) };
+	}
+	if len > 0 {
+		// Drained here: this is the out-of-memory path, and leaving the frames in quarantine holds
+		// the memory that would satisfy the caller's next attempt.
+		unsafe { crate::mem::frame::drain_quarantine() };
+	}
+}
+
 unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), ()> {
 	let _guard = PT_LOCK.lock();
 	let mut table = phys_to_virt(root) as *mut u64;
+	// The levels this call CREATES, so a failure further down can give them back - the same
+	// rollback the x86_64 mapper carries, and for the same reason: a walk that got one level in and
+	// could not allocate the next returned `Err` with a fresh page-table frame attached to the
+	// address space, and nothing counted it. The entry is cleared BEFORE the frame is retired, so
+	// nothing can reach it in between.
+	let mut created: [(*mut u64, u64); 2] = [(core::ptr::null_mut(), 0); 2];
+	let mut created_len = 0usize;
 	for level in (1..3).rev() {
 		let idx = ((va >> (12 + 9 * level)) & 0x1ff) as usize;
 		let desc = unsafe { read_volatile(table.add(idx)) };
 		let next = if desc & PTE_V == 0 {
-			let frame = alloc_frame().ok_or(())?;
+			let Some(frame) = alloc_frame() else {
+				unsafe { unwind_created(&created, created_len) };
+				return Err(());
+			};
 			unsafe { write_volatile(table.add(idx), pte_ppn(frame) | PTE_V) };
+			created[created_len] = (unsafe { table.add(idx) }, frame);
+			created_len += 1;
 			frame
 		} else {
 			pte_pa(desc)
@@ -285,6 +313,7 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), (
 	// see the note on the x86_64 port: replacing a live mapping loses the frame that was
 	// there, with nothing to report it.
 	if unsafe { read_volatile(table.add(idx)) } & PTE_V != 0 {
+		unsafe { unwind_created(&created, created_len) };
 		return Err(());
 	}
 	unsafe { write_volatile(table.add(idx), pte_ppn(pa) | leaf_bits(flags)) };

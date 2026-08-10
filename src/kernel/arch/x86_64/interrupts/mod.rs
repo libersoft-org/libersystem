@@ -64,6 +64,12 @@ static REGISTRY: MsiRegistry<MSI_COUNT> = MsiRegistry::new();
 // address space's shared kernel half.
 const MSIX_VIRT_BASE: u64 = 0xffff_f300_0000_0000;
 
+// Where each slot's MSI-X entry sits inside its mapped page, recorded when the entry is programmed
+// so the teardown masks the same words rather than guessing offset 0.
+#[allow(clippy::declare_interior_mutable_const)]
+const NO_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static MSIX_ENTRY_OFFSET: [core::sync::atomic::AtomicU32; MSI_COUNT] = [NO_OFFSET; MSI_COUNT];
+
 // Whether `vector` is a kernel MSI-X vector.
 fn is_msi(vector: u8) -> bool {
 	vector >= MSI_BASE && (vector as usize) < MSI_BASE as usize + MSI_COUNT
@@ -91,9 +97,17 @@ pub fn bind(vector: u8, intr: &Arc<Interrupt>) -> bool {
 // Remove any binding for `vector` (called from an Interrupt's Drop).
 pub fn unbind(vector: u8) {
 	if is_msi(vector) {
-		// MSI is edge-triggered and unshared: just drop the binding and free the slot
-		// (there is no source to mask). A gone driver's device simply stops being drained.
-		REGISTRY.free((vector - MSI_BASE) as usize);
+		// MASK the device's table entry, then unmap its page, and only then free the vector.
+		//
+		// "There is no source to mask" was true of the LAPIC and not of the DEVICE. The slot's
+		// MSI-X table page stayed mapped at a fixed kernel address, so re-acquiring the slot called
+		// `map_page` over a live leaf - which the paging layer deliberately refuses and the
+		// infallible entry point turns into a panic. And nothing stopped the departing device from
+		// raising the vector, so the next driver to be given it could be woken by the last one's
+		// hardware: ownership confusion with no way for either side to notice.
+		let slot = (vector - MSI_BASE) as usize;
+		mask_and_unmap_msix_entry(slot);
+		REGISTRY.free(slot);
 		return;
 	}
 	let index = vector.wrapping_sub(IRQ_BASE) as usize;
@@ -147,6 +161,10 @@ pub fn irq_info_len() -> usize {
 // never write its own MSI-X table; only the kernel programs it here.
 fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
 	let virt = MSIX_VIRT_BASE + slot as u64 * 0x1000;
+	// Where in the page this device's entry sits, kept so the teardown can mask the SAME words.
+	// The table is page-mapped but the entry need not be at offset 0, and a mask written at a
+	// guessed offset would corrupt whatever the device keeps there instead.
+	MSIX_ENTRY_OFFSET[slot].store((table_phys & 0xfff) as u32, Ordering::Release);
 	super::paging::map_page(virt, table_phys & !0xfff, super::paging::WRITABLE | super::paging::NO_CACHE | super::paging::NO_EXECUTE);
 	let entry = (virt + (table_phys & 0xfff)) as *mut u32;
 	let msg_addr: u32 = 0xFEE0_0000 | ((dest as u32) << 12);
@@ -155,6 +173,27 @@ fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
 		entry.add(1).write_volatile(0); // message address high
 		entry.add(2).write_volatile(vector as u32); // message data
 		entry.add(3).write_volatile(0); // vector control (unmasked)
+	}
+}
+
+// Mask the device's MSI-X entry and take its table page back out of the kernel window.
+//
+// The order is the point: the entry is masked (vector control bit 0) while the page is still
+// mapped, so the device stops raising the vector BEFORE the mapping that could stop it goes away.
+// Then the page is unmapped, which is what makes the slot reusable - `program_msix_entry` maps at a
+// fixed per-slot address and mapping over a live leaf is refused.
+fn mask_and_unmap_msix_entry(slot: usize) {
+	let virt = MSIX_VIRT_BASE + slot as u64 * 0x1000;
+	// Only if this slot actually has a page mapped: `free` can be reached for a slot that was
+	// acquired and never programmed.
+	if super::paging::translate(virt).is_some() {
+		let entry = (virt + MSIX_ENTRY_OFFSET[slot].load(Ordering::Acquire) as u64) as *mut u32;
+		unsafe {
+			// Vector control bit 0 = masked. The device may still have a message in flight; masking
+			// stops the next one, which is all this can promise without the driver's cooperation.
+			entry.add(3).write_volatile(1);
+		}
+		super::paging::unmap_page(virt);
 	}
 }
 

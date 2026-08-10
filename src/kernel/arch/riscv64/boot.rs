@@ -308,6 +308,9 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 
 	// Increment 5: monotonic clock, per-CPU block, context switch, scheduler, timer.
 	super::tsc::init();
+	// The timer rate comes from the device tree rather than from a constant naming QEMU. Done here
+	// because this is where the DTB pointer is in hand and before anything converts a tick.
+	super::tsc::init_from_dtb(dtb);
 	super::apic::set_boot_hart(hartid);
 	crate::serial_println!("riscv64: clock - timebase {} MHz, uptime {} ms", super::tsc::hz() / 1_000_000, super::tsc::cycles_to_ns(super::tsc::now()) / 1_000_000);
 

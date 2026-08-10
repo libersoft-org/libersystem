@@ -213,6 +213,70 @@ impl Fdt {
 		}
 	}
 
+	// `/cpus/timebase-frequency`, in Hz, or None when the tree does not carry it.
+	//
+	// RISC-V's `time` CSR counts at a rate the hardware chooses, and the kernel had it as the
+	// constant 10,000,000 with a comment naming QEMU's virt machine. Every timeout, tick
+	// conversion, timer and deadline is scaled by it, so on a machine that ticks at a different
+	// rate all of them are wrong by that ratio - silently, because nothing compares the two.
+	//
+	// A separate walk rather than a field on `BootInfo`: this is read at clock init, which happens
+	// before the boot info is built, and it is one property.
+	pub fn timebase_frequency(&self) -> Option<u32> {
+		if !self.is_valid() {
+			return None;
+		}
+		// SAFETY: the header was validated above, so the struct and strings blocks lie inside the
+		// tree this `Fdt` was built on - the same contract every other walk in this file relies on.
+		unsafe { self.timebase_frequency_inner() }
+	}
+
+	unsafe fn timebase_frequency_inner(&self) -> Option<u32> {
+		let strings = self.base + self.be32(self.base + 12) as u64;
+		let mut p = self.base + self.be32(self.base + 8) as u64;
+		let mut depth = 0i32;
+		let mut in_cpus = false;
+		loop {
+			let token = self.be32(p);
+			p += 4;
+			match token {
+				FDT_BEGIN_NODE => {
+					depth += 1;
+					let name = p;
+					p += (self.str_len(name) + 1 + 3) & !3;
+					if depth == 1 {
+						in_cpus = self.str_eq(name, "cpus");
+					}
+				}
+				FDT_END_NODE => {
+					if depth == 1 {
+						in_cpus = false;
+					}
+					depth -= 1;
+					if depth < 0 {
+						return None;
+					}
+				}
+				FDT_PROP => {
+					let len = self.be32(p);
+					let nameoff = self.be32(p + 4);
+					let val = p + 8;
+					p += 8 + ((len as u64 + 3) & !3);
+					// On `/cpus` itself, which is where the specification puts it. A per-cpu
+					// override exists in the binding and is not read here: a machine whose harts
+					// tick at different rates needs more than one number anyway, and inventing one
+					// from the first hart would be a guess wearing a measurement's clothes.
+					if depth == 1 && in_cpus && len == 4 && self.str_eq(strings + nameoff as u64, "timebase-frequency") {
+						return Some(self.be32(val));
+					}
+				}
+				FDT_NOP => {}
+				FDT_END => return None,
+				_ => return None,
+			}
+		}
+	}
+
 	pub fn parse(&self) -> Option<BootInfo> {
 		if !self.is_valid() {
 			return None;

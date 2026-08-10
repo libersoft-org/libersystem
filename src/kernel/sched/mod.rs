@@ -408,6 +408,21 @@ pub fn block_on(koid: u64, deadline: u64) {
 // re-checking once registered, a readiness change (and its wake) in that window is
 // caught here and the park is aborted. The periodic marker is a housekeeping deadline
 // that never counts as pending progress (see TimedWaiter::periodic).
+// Make room for one bucket registration, and one timed registration when there is a deadline.
+//
+// Answers false when the heap will not give it, which is the caller's cue to not park at all.
+// Reserving is not the same as pushing: the capacity stays with the vector, so the push that
+// follows - with interrupts masked - cannot allocate and cannot fail.
+fn reserve_wait_slots(koid: u64, deadline: u64) -> bool {
+	if bucket_of(koid).lock().try_reserve(1).is_err() {
+		return false;
+	}
+	if deadline != NO_DEADLINE && TIMED_WAITERS.lock().try_reserve(1).is_err() {
+		return false;
+	}
+	true
+}
+
 pub fn block_on_flagged<F: Fn() -> bool>(koid: u64, deadline: u64, periodic: bool, ready: F) {
 	let thread = match current_thread() {
 		Some(t) => t,
@@ -418,6 +433,16 @@ pub fn block_on_flagged<F: Fn() -> bool>(koid: u64, deadline: u64, periodic: boo
 	// waker's claim. reschedule re-disables and, having captured the masked state,
 	// leaves interrupts off when the thread resumes; the original state is restored
 	// after the cleanup below.
+	// Room for the registration BEFORE anything is committed, and before interrupts go off.
+	//
+	// The pushes below are on the path a `wait` syscall takes, with interrupts masked and a thread
+	// half-parked - and an infallible `push` on a short heap ABORTS the kernel. Reserving first
+	// turns that into an early return: the caller's condition loop re-checks and calls again, which
+	// is a spin rather than a dead machine. It also cannot fail later, because the capacity is
+	// already there.
+	if !reserve_wait_slots(koid, deadline) {
+		return;
+	}
 	let saved_if = arch::interrupts_enabled();
 	arch::disable_interrupts();
 	thread.begin_park();
@@ -465,6 +490,16 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 		Some(t) => t,
 		None => return,
 	};
+	// As in `block_on_flagged`: every bucket this will register in gets its room first, so no push
+	// below can meet a short heap with interrupts off and a half-parked thread.
+	for &koid in koids {
+		if !reserve_wait_slots(koid, NO_DEADLINE) {
+			return;
+		}
+	}
+	if deadline != NO_DEADLINE && !reserve_wait_slots(0, deadline) {
+		return;
+	}
 	let saved_if = arch::interrupts_enabled();
 	arch::disable_interrupts();
 	thread.begin_park();
@@ -507,6 +542,39 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 // several objects at once is enqueued exactly once even when they fire together),
 // remove the claimed entries, and enqueue the threads. Entries the thread left in
 // other buckets are removed by the thread itself when it resumes.
+// Claim and enqueue every thread waiting on `koid`, in bounded batches.
+//
+// The batch is what makes this allocation-free: waking is what a send, a close and a timer expiry
+// all do, and building a vector of the claimed threads meant a short heap could abort the kernel on
+// an ordinary event. Sixteen at a time also keeps the bucket lock held for a bounded stretch, which
+// the previous shape did not.
+fn drain_bucket_into_run_queue(koid: u64) {
+	loop {
+		let mut batch: [Option<Arc<Thread>>; 16] = [const { None }; 16];
+		let taken = {
+			let mut bucket = bucket_of(koid).lock();
+			let mut taken = 0usize;
+			bucket.retain(|w: &BucketWaiter| {
+				if taken < batch.len() && w.koid == koid && w.thread.try_claim_wake() {
+					batch[taken] = Some(w.thread.clone());
+					taken += 1;
+					return false;
+				}
+				true
+			});
+			taken
+		};
+		if taken == 0 {
+			return;
+		}
+		for slot in batch.iter_mut().take(taken) {
+			if let Some(thread) = slot.take() {
+				enqueue(thread);
+			}
+		}
+	}
+}
+
 pub fn wake_object(koid: u64) {
 	// The sets watching this object, collected before anything is woken and NOT removed - an
 	// observer outlives the wake, which is the whole difference between it and a waiter.
@@ -534,39 +602,19 @@ pub fn wake_object(koid: u64) {
 			set_count += 1;
 		}
 	}
-	let woken = {
-		let mut bucket = bucket_of(koid).lock();
-		let mut woken: Vec<Arc<Thread>> = Vec::new();
-		bucket.retain(|w: &BucketWaiter| {
-			if w.koid == koid && w.thread.try_claim_wake() {
-				woken.push(w.thread.clone());
-				return false;
-			}
-			true
-		});
-		woken
-	};
-	for thread in woken {
-		enqueue(thread);
-	}
+	// Bounded batches, and no allocation on a wake path.
+	//
+	// It built a `Vec` of the threads it had claimed, under the bucket lock, with an infallible
+	// `push`: waking is what a send, a close and a timer expiry all do, so a short heap turned an
+	// ordinary event into a kernel abort. A fixed batch takes what it can, drops the lock, enqueues,
+	// and comes back for more - which also shortens the time the bucket is held.
+	drain_bucket_into_run_queue(koid);
 	// One level, never a chain: a set may not contain a set, so a set's own wake reaches threads
 	// only. `WaitSet::add` is where that is refused.
 	for &set in sets.iter().take(set_count) {
-		let parked = {
-			let mut bucket = bucket_of(set).lock();
-			let mut parked: Vec<Arc<Thread>> = Vec::new();
-			bucket.retain(|w: &BucketWaiter| {
-				if w.koid == set && w.thread.try_claim_wake() {
-					parked.push(w.thread.clone());
-					return false;
-				}
-				true
-			});
-			parked
-		};
-		for thread in parked {
-			enqueue(thread);
-		}
+		// Same shape, same reason: a set's wake enqueues through the bounded drain rather than
+		// collecting into a vector under the lock.
+		drain_bucket_into_run_queue(set);
 	}
 }
 
@@ -587,20 +635,31 @@ pub fn wake_thread(thread: &Arc<Thread>) {
 // waits without a deadline (most service waits) never appear here.
 pub fn check_deadlines() {
 	let now = arch::apic::ticks();
-	let expired = {
-		let mut timed = TIMED_WAITERS.lock();
-		let mut expired: Vec<Arc<Thread>> = Vec::new();
-		timed.retain(|w: &TimedWaiter| {
-			if w.deadline <= now && w.thread.try_claim_wake() {
-				expired.push(w.thread.clone());
-				return false;
+	// Bounded batches, for the reason the bucket drain gives: this runs from the timer path, and a
+	// vector built there could meet a short heap and abort the kernel on a tick.
+	loop {
+		let mut batch: [Option<Arc<Thread>>; 16] = [const { None }; 16];
+		let taken = {
+			let mut timed = TIMED_WAITERS.lock();
+			let mut taken = 0usize;
+			timed.retain(|w: &TimedWaiter| {
+				if taken < batch.len() && w.deadline <= now && w.thread.try_claim_wake() {
+					batch[taken] = Some(w.thread.clone());
+					taken += 1;
+					return false;
+				}
+				true
+			});
+			taken
+		};
+		if taken == 0 {
+			return;
+		}
+		for slot in batch.iter_mut().take(taken) {
+			if let Some(thread) = slot.take() {
+				enqueue(thread);
 			}
-			true
-		});
-		expired
-	};
-	for thread in expired {
-		enqueue(thread);
+		}
 	}
 }
 
