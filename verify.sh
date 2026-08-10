@@ -91,6 +91,7 @@ while [[ $# -gt 0 ]]; do
 	# machine reading an exit status cannot read the note that says what the green is worth.
 	--allow-shadow | --dev)
 		allow_shadow=1
+		shift
 		;;
 	--shadow)
 		action=shadow
