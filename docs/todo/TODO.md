@@ -195,6 +195,9 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0158 - The terminal's state machine, and the one safe function that is not safe](M0158.md)
 - [ ] [M0159 - What the loader assumes about the machine it is running on](M0159.md)
 - [ ] [M0160 - What the component SDK is, and what its milestone says it is](M0160.md)
+- [ ] [M0161 - What LiberMemFS's capacity actually bounds](M0161.md)
+- [ ] [M0162 - The gap between what fsck can see and what a writable mount will accept](M0162.md)
+- [ ] [M0163 - The parts are right; the transactions between them are not](M0163.md)
 
 ### Definition of done (phase 2)
 

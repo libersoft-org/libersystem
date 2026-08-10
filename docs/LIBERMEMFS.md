@@ -90,7 +90,10 @@ entry, and the vector header inside it - on the order of fifty to a hundred byte
 charged. This is left uncharged deliberately rather than overlooked. A name is caller-controlled
 and unbounded per entry, which is why not charging it was a hole worth closing; per-entry overhead
 is a fixed implementation-defined cost already bounded by `MAX_ENTRIES`, so the worst case is a few
-hundred kilobytes whatever the capacity. Charging it would mean writing an allocator-internals
+hundred kilobytes whatever the capacity. (Corrected 2026-08-10: true of entries that EXIST, and not
+of the capacity a directory KEEPS. `Vec::remove` does not shrink, so an emptied directory holds its
+slots - 56 bytes each, measured - and repeating the cycle across directories retains hundreds of
+megabytes that no accounting here sees. See M0161.) Charging it would mean writing an allocator-internals
 guess into the capacity semantics - a 20-byte volume that can hold nothing - and the guess would be
 wrong on the next allocator. A caller sizing a reserved volume should treat the capacity as
 bounding stored bytes and names, not as the volume's total cost to the heap.
