@@ -13,6 +13,20 @@
 //! record, decoded as Joliet UCS-2, a Rock Ridge `NM` system-use entry, or plain 8.3 with
 //! the `;1` version suffix stripped.
 //!
+//! ## The subset this reads, stated as one
+//!
+//! ECMA-119 permits logical block sizes up to the logical sector size; this backend reads volumes
+//! whose block size is 2048 and refuses the rest. That is a product decision - every disc a
+//! mastering tool produces uses 2048 - and not an omission, so it is said here rather than
+//! discovered from a refusal.
+//!
+//! Also deliberately outside it: multi-volume sets (a record naming a volume other than 1 is
+//! refused rather than read at that LBA on whichever disc is present), multi-extent and interleaved
+//! files (refused, and left out of listings rather than described with a length that is neither the
+//! file's nor anything else's), and the Rock Ridge entries that continue or relocate - `CE`, `CL`,
+//! `PL`, `RE` and a continued `NM` - where the reader falls back to the ISO9660 identifier instead
+//! of serving a name that is half of one.
+//!
 //! The media is untrusted: every extent is bounded by the volume's own block count
 //! (whose last block is verified to exist on the device at mount) before a buffer is
 //! allocated, and a malformed record parses cleanly instead of panicking - a corrupt
@@ -66,6 +80,12 @@ struct Geometry {
 	root_len: u32,
 	blocks: u32,
 	joliet: bool,
+	// Whether SUSP is present at all and RRIP was announced in it, and SUSP's own offset into every
+	// System Use Area. Established once, from the root directory's first record, because that is
+	// where SUSP puts `SP`. Rock Ridge names are read only when this says the extension is actually
+	// in use - the alternative is believing `NM` wherever those two bytes happen to appear.
+	rrip: bool,
+	susp_skip: usize,
 }
 
 // A mounted ISO9660 volume: the device plus its geometry. Reads are on demand, so
@@ -151,7 +171,25 @@ impl<D: BlockDevice> Iso9660<D> {
 		if !dev.read_block(blocks as u64 - 1, &mut block) {
 			return None;
 		}
-		Some(Iso9660 { dev, geo: Geometry { root_lba, root_len, blocks, joliet } })
+		// SUSP, established once from the root directory's own first record - which is where the
+		// standard puts `SP`. Joliet volumes do not use Rock Ridge names, so the question is only
+		// asked for the ISO9660 namespace.
+		let mut rrip = false;
+		let mut susp_skip = 0usize;
+		if !joliet && dev.read_block(root_lba as u64, &mut block) && block[0] as usize >= 34 {
+			let id_len = block[32] as usize;
+			let sys_off = 33 + id_len + (id_len % 2 == 0) as usize;
+			if let Some(sys) = block.get(sys_off..block[0] as usize)
+				&& let Some(skip) = susp_skip_of(sys)
+			{
+				susp_skip = skip;
+				// `ER` in the same area is what says WHICH extension is in use. Without it SUSP is
+				// present and Rock Ridge is not announced, and reading `NM` would be the same guess
+				// as before with an extra step.
+				rrip = sys.windows(2).any(|w| w == b"ER");
+			}
+		}
+		Some(Iso9660 { dev, geo: Geometry { root_lba, root_len, blocks, joliet, rrip, susp_skip } })
 	}
 
 	// The volume's size in bytes - the space size the Primary Volume Descriptor
@@ -177,7 +215,9 @@ impl<D: BlockDevice> Iso9660<D> {
 		let (lba, len) = self.resolve_dir(parent)?;
 		let entry = self.find_entry(lba, len, name)?;
 		if entry.is_dir {
-			return Err(FsError::NotFound);
+			// `IsDir`, which fs-core has for exactly this. `NotFound` said the name does not exist,
+			// when what is true is that it names a directory - and a caller cannot tell those apart.
+			return Err(FsError::IsDir);
 		}
 		// a multi-extent or interleaved file (segments in further records, or gap blocks
 		// woven into the extent) is not assembled here - refuse it rather than serve a
@@ -196,7 +236,16 @@ impl<D: BlockDevice> Iso9660<D> {
 		for seg in path.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
 			let entry = self.find_entry(lba, len, seg)?;
 			if !entry.is_dir {
-				return Err(FsError::NotFound);
+				// `NotDir`, which is what fs-core has for this. Answering `NotFound` said the path
+				// does not exist when what is true is that a component of it is a file - two
+				// different repairs for the caller, reported as one.
+				return Err(FsError::NotDir);
+			}
+			// ECMA-119 is STRICTER for directories than for files: they may not be interleaved and
+			// are a single file section. `read_file` checked this flag and the descent did not, so
+			// a directory record carrying either was walked as though it were ordinary.
+			if entry.unsupported {
+				return Err(FsError::Corrupt);
 			}
 			lba = entry.lba;
 			len = entry.size;
@@ -208,12 +257,12 @@ impl<D: BlockDevice> Iso9660<D> {
 	// The "." / ".." self/parent records match by those names, so paths through them
 	// resolve the way the other backends behind the volume API resolve them.
 	fn find_entry(&mut self, lba: u32, len: u32, name: &[u8]) -> Result<Entry, FsError> {
-		let joliet = self.geo.joliet;
+		let (joliet, rrip, skip) = (self.geo.joliet, self.geo.rrip, self.geo.susp_skip);
 		let mut found = None;
 		self.for_each_record(lba, len, |rec| {
-			if let Some(e) = parse_record(rec, joliet)
+			if let Some(e) = parse_record(rec, joliet, rrip, skip)
 				&& !e.name.is_empty()
-				&& eq_ci(&e.name, name)
+				&& name_matches(&e, name)
 			{
 				found = Some(e);
 				return Ok(false);
@@ -226,13 +275,18 @@ impl<D: BlockDevice> Iso9660<D> {
 	// Read every record in a directory extent into FileInfos, skipping the "." / ".."
 	// self/parent entries.
 	fn read_dir(&mut self, lba: u32, len: u32) -> Result<Vec<FileInfo>, FsError> {
-		let joliet = self.geo.joliet;
+		let (joliet, rrip, skip) = (self.geo.joliet, self.geo.rrip, self.geo.susp_skip);
 		let mut out: Vec<FileInfo> = Vec::new();
 		let mut failed = None;
 		self.for_each_record(lba, len, |rec| {
-			if let Some(e) = parse_record(rec, joliet)
+			if let Some(e) = parse_record(rec, joliet, rrip, skip)
 				&& !e.special
 				&& !e.name.is_empty()
+				// A multi-extent or interleaved file is refused by `read_file`, and listing its
+				// FIRST section's size showed a number that is neither the file's nor anything
+				// else's - for a file this backend will not read. It is left out of the listing
+				// rather than described wrongly.
+				&& !e.unsupported
 				// records order equal names adjacently with versions descending, so a
 				// multi-version file lists once, as its highest version.
 				&& !out.last().is_some_and(|p: &FileInfo| p.name == e.name)
@@ -316,17 +370,23 @@ impl<D: BlockDevice> Iso9660<D> {
 			return Err(FsError::Invalid);
 		}
 		let mut out = vec![0u8; size as usize];
-		let mut block = [0u8; SECTOR_SIZE];
-		let mut done = 0usize;
-		let mut cur = lba as u64;
-		while done < out.len() {
-			if !self.dev.read_block(cur, &mut block) {
+		// The WHOLE contiguous run in one call. `fs-core` offers `read_blocks` precisely so a
+		// contiguous extent is one device round trip, and this looped a block at a time - which
+		// behind the IPC-backed block device the storage service hands over is a message per 2 KiB.
+		let whole = out.len() / SECTOR_SIZE;
+		if whole > 0 && !self.dev.read_blocks(lba as u64, whole as u64, &mut out[..whole * SECTOR_SIZE]) {
+			return Err(FsError::Io);
+		}
+		// The tail, when the size is not a whole number of sectors: one block read into a scratch
+		// sector, of which only the bytes the extent claims are kept.
+		let done = whole * SECTOR_SIZE;
+		if done < out.len() {
+			let mut block = [0u8; SECTOR_SIZE];
+			if !self.dev.read_block(lba as u64 + whole as u64, &mut block) {
 				return Err(FsError::Io);
 			}
-			let n = (out.len() - done).min(SECTOR_SIZE);
-			out[done..done + n].copy_from_slice(&block[..n]);
-			done += n;
-			cur += 1;
+			let n = out.len() - done;
+			out[done..].copy_from_slice(&block[..n]);
 		}
 		Ok(out)
 	}
@@ -343,6 +403,10 @@ struct Entry {
 	special: bool,
 	unsupported: bool,
 	name: String,
+	// Which namespace the name came from, because that decides how it compares. A Rock Ridge or
+	// Joliet name is preserved-case and matches exactly; a bare ISO9660 identifier is upper-case by
+	// construction and folds.
+	case_sensitive: bool,
 }
 
 // Take a volume descriptor's root directory record (fixed 34 bytes at offset 156): its
@@ -374,21 +438,36 @@ fn root_extent(desc: &[u8]) -> Option<(u32, u32)> {
 // A type-2 descriptor is Joliet when its escape sequences select UCS-2 (%/@, %/C, %/E)
 // anywhere in the field - a descriptor may list several and UCS-2 need not be first.
 fn is_joliet(desc: &[u8]) -> bool {
+	// The escape sequence is written at the START of the field, not somewhere inside it.
+	//
+	// This searched the whole 32-byte field with `windows(3)`, so any descriptor that happened to
+	// contain those three bytes anywhere - in a publisher string, in padding a mastering tool left
+	// behind - was read as Joliet, and its namespace was taken as the volume's. Joliet defines the
+	// three sequences for its UCS-2 levels and writes one of them first.
 	let esc = &desc[88..120];
-	[b"%/@".as_slice(), b"%/C", b"%/E"].iter().any(|s| esc.windows(3).any(|w| w == *s))
+	[b"%/@".as_slice(), b"%/C", b"%/E"].iter().any(|s| esc.starts_with(s))
 }
 
 // Parse a directory record: extent, length, dir flag, and the name (Joliet UCS-2, a Rock
 // Ridge NM entry, or plain 8.3 with the version suffix stripped). None on a short record.
-fn parse_record(rec: &[u8], joliet: bool) -> Option<Entry> {
+fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Option<Entry> {
 	if rec.len() < 33 {
 		return None;
 	}
 	// an Extended Attribute Record occupies rec[1] blocks at the extent's START - the
 	// data follows it, and serving the XAR as content would be a silent misread (the
 	// extent gate bounds the advanced LBA like any other).
-	let lba = le32(&rec[2..6]).saturating_add(rec[1] as u32);
-	let size = le32(&rec[10..14]);
+	// Both halves of the extent and the length, and a CHECKED skip past the Extended Attribute
+	// Record. `saturating_add` clamped to `u32::MAX`, which invents a value the medium never gave -
+	// the honest answer from a parser of untrusted media is a refusal.
+	let lba = both32(&rec[2..10])?.checked_add(rec[1] as u32)?;
+	let size = both32(&rec[10..18])?;
+	// The Volume Sequence Number names the volume this extent lives on. Multi-volume sets are not
+	// supported here, and with one `BlockDevice` behind this reader an extent belonging to volume 2
+	// would be read at that LBA on whichever disc is in the drive. Volume 1 or nothing.
+	if both16(&rec[28..32])? != 1 {
+		return None;
+	}
 	let is_dir = rec[25] & 0x02 != 0;
 	// an associated file (flag 0x04) is a secondary stream recorded BEFORE its
 	// same-named main file - it must neither list (a duplicate name) nor match a
@@ -405,31 +484,38 @@ fn parse_record(rec: &[u8], joliet: bool) -> Option<Entry> {
 	}
 	let id = &rec[33..33 + id_len];
 	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
-	let name = if special { String::from(if id[0] == 0 { "." } else { ".." }) } else { decode_name(id, rec, id_len, joliet) };
-	Some(Entry { lba, size, is_dir, special, unsupported, name })
+	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip)? };
+	Some(Entry { lba, size, is_dir, special, unsupported, name, case_sensitive })
 }
 
 // Decode an entry name. Joliet is big-endian UCS-2; otherwise a Rock Ridge NM entry in
 // the system-use area wins, falling back to plain ASCII 8.3 with ";version" dropped.
-fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool) -> String {
+fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, skip: usize) -> Option<(String, bool)> {
 	if joliet {
+		// An odd length is corruption and an invalid unit is corruption, and neither may become a
+		// NAME. `chunks_exact(2)` dropped a trailing odd byte and an unpaired surrogate became '?',
+		// so two distinct damaged identifiers could collide on one name - and that name is the
+		// lookup key.
+		if id.len() % 2 != 0 {
+			return None;
+		}
 		let mut s = String::new();
 		for c in id.chunks_exact(2) {
 			let u = u16::from_be_bytes([c[0], c[1]]);
 			if u == b';' as u16 {
 				break;
 			}
-			s.push(char::from_u32(u as u32).unwrap_or('?'));
+			s.push(char::from_u32(u as u32)?);
 		}
-		return s;
+		return Some((s, true));
 	}
 	let sys_off = 33 + id_len + (id_len % 2 == 0) as usize;
 	// a malformed record can end exactly after its identifier (the pad byte missing) -
 	// there is no system-use area to read then, never a slice past the record.
 	if let Some(sys) = rec.get(sys_off..)
-		&& let Some(n) = rock_ridge_name(sys)
+		&& let Some(n) = rock_ridge_name(sys, rrip, skip)
 	{
-		return n;
+		return Some((n, true));
 	}
 	let mut s = String::new();
 	for &b in id {
@@ -441,7 +527,7 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool) -> String {
 	if s.ends_with('.') {
 		s.pop();
 	}
-	s
+	Some((s, false))
 }
 
 // Find a Rock Ridge "NM" name in a record's system-use area: entries are sig(2), len,
@@ -451,7 +537,20 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool) -> String {
 // continuation degrades cleanly to the shorter NM prefix or the 8.3 form, and a tree
 // mastered deeper than eight levels shows its relocation artifacts where the mastering
 // tool placed them (everything stays reachable).
-fn rock_ridge_name(sys: &[u8]) -> Option<String> {
+// The Rock Ridge name in a System Use Area, when RRIP is actually in use and the entries this
+// parser can follow are the only ones present.
+//
+// SUSP is what makes the System Use Area shareable: independent extensions live there side by side,
+// and `SP` announces the area while `ER` says which extensions are in it. None of that was checked -
+// every non-Joliet record's system-use bytes were scanned for `NM`, so a valid non-Rock-Ridge volume
+// whose area happens to contain those two bytes had its filenames replaced by whatever followed.
+//
+// `skip` is SUSP's own offset into the area, from the root's `SP` entry.
+fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
+	if !rrip || skip > sys.len() {
+		return None;
+	}
+	let sys = &sys[skip..];
 	let mut off = 0usize;
 	let mut out = String::new();
 	while off + 4 <= sys.len() {
@@ -459,14 +558,47 @@ fn rock_ridge_name(sys: &[u8]) -> Option<String> {
 		if len < 4 || off + len > sys.len() {
 			break;
 		}
+		let sig = &sys[off..off + 2];
+		// FAIL CLOSED on what this parser cannot follow, rather than answering with a different
+		// name than the medium records.
+		//
+		// `CE` continues an entry into another block, so an `NM` split across one yields its PREFIX
+		// here - and two long names differing late become the same name. `CL`, `PL` and `RE` are how
+		// Rock Ridge relocates deep directories, so ignoring them dismantles the structure they
+		// exist to express. Falling back to the ISO9660 identifier is a name the medium really
+		// carries; a truncated `NM` is not.
+		if matches!(sig, b"CE" | b"CL" | b"PL" | b"RE") {
+			return None;
+		}
+		// `ST` ends the system use area: past it the bytes are not SUSP entries at all, and walking
+		// on into them is how an unrelated extension's data becomes a filename.
+		if sig == b"ST" {
+			break;
+		}
 		// an NM payload begins after sig, len, version, and flags - a shorter entry
 		// carries no name and must not build an inverted range.
-		if &sys[off..off + 2] == b"NM" && len >= 5 {
+		if sig == b"NM" && len >= 5 {
+			// The CONTINUE flag (bit 0) says this name runs into a further entry. Honouring only
+			// the part in hand is the same truncation `CE` causes.
+			if sys[off + 4] & 0x01 != 0 {
+				return None;
+			}
 			out.push_str(core::str::from_utf8(&sys[off + 5..off + len]).unwrap_or(""));
 		}
 		off += len;
 	}
 	if out.is_empty() { None } else { Some(out) }
+}
+
+// Does this System Use Area open with a SUSP `SP` entry, and if so what offset does it declare?
+//
+// Read from the ROOT directory's own record, which is where SUSP puts it. Without this the Rock
+// Ridge path was guesswork: `NM` was believed wherever it appeared.
+fn susp_skip_of(sys: &[u8]) -> Option<usize> {
+	if sys.len() >= 7 && &sys[0..2] == b"SP" && sys[2] as usize >= 7 && sys[4] == 0xBE && sys[5] == 0xEF {
+		return Some(sys[6] as usize);
+	}
+	None
 }
 
 // Split a `/`-separated path into (parent dir, final name); errors on an empty name.
@@ -479,8 +611,18 @@ fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), FsError> {
 }
 
 // Case-insensitive ASCII name compare (8.3 names are stored uppercase, queries may not be).
-fn eq_ci(a: &str, b: &[u8]) -> bool {
-	a.len() == b.len() && a.bytes().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
+// Compare a directory entry's name to a wanted one, by the rule of the namespace it came from.
+//
+// One ASCII-folding comparison used to be applied to everything, including Rock Ridge and Joliet
+// names. For a bare `FOO.TXT;1` that is the right convenience: ISO9660 identifiers are upper-case by
+// construction and callers type lower-case. Rock Ridge exists to express POSIX semantics, where
+// `Makefile` and `makefile` are two files - and `find_entry` returns the first match, so the second
+// was unreachable by its own name. Joliet is likewise a preserved-case namespace.
+fn name_matches(entry: &Entry, want: &[u8]) -> bool {
+	if entry.case_sensitive {
+		return entry.name.as_bytes() == want;
+	}
+	entry.name.len() == want.len() && entry.name.bytes().zip(want).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 // A little-endian u32 from a 4-byte slice; both-endian fields store LE first.
