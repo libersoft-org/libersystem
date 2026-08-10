@@ -32,13 +32,6 @@ Done when the SMP kernel provides the core object, capability, scheduling, IPC,
 accounting and isolation paths; boots SystemManager and ramdisk-backed storage;
 and exposes the CLI, basic System Graph and framebuffer console under QEMU tests.
 
-### Out of scope for phase 0 (against scope creep)
-
-Deferred are full services and drivers, IDL-generated APIs, Wasm, persistent
-storage, networking, security hardening, other architectures and real hardware.
-Blocking wait and preemption arrive in M0018-M0019; phase 0 uses cooperative polling
-and scheduling.
-
 ## Phase 1 - First usable userspace
 
 Phase 1 builds the first usable userspace: blocking wait and preemption, isolated
@@ -65,13 +58,6 @@ Authority remains capability-first and explicitly delegated.
 Done when the preemptive kernel and blocking wait support isolated virtio drivers,
 the supervised core services answer generated typed APIs, and a capability-scoped
 Wasm component receives a file handle through the powerbox under QEMU tests.
-
-### Out of scope for phase 1 (= phase 2, the appliance/edge platform)
-
-Deferred are networking, wall-clock time, rich observability, policy services,
-restart supervision, full Component Model support, persistent storage and local
-graphics/input. Server compatibility, package installation, real hardware and
-desktop work remain beyond phase 2.
 
 ## Phase 2 - Appliance/edge platform
 
@@ -206,6 +192,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [M0155 - What the FAT backend writes, and what it says it wrote](M0155.md)
 - [ ] [M0156 - What the ISO9660 backend accepts, and the threat model it states](M0156.md)
 - [ ] [M0157 - The ABI's own guarantee, which is the one thing it cannot get wrong](M0157.md)
+- [ ] [M0158 - The terminal's state machine, and the one safe function that is not safe](M0158.md)
 
 ### Definition of done (phase 2)
 
@@ -213,10 +200,3 @@ Done when the capability-scoped appliance provides networking, wall-clock time,
 interactive console and audio, policy and observability services, supervised
 components, writable persistent storage and the complete filesystem set. The
 kernel and UEFI loader must pass the QEMU suite on x86_64, aarch64 and riscv64.
-
-### Out of scope for phase 2 (= phase 3, the server platform)
-
-Deferred are POSIX compatibility, identities and remote administration,
-localization, wider networking and server workloads, multi-queue devices, signed
-A/B updates, encrypted volumes, advanced multi-device LiberFS, package management
-and AOT compilation. Real hardware and the desktop stack remain later phases.
