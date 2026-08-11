@@ -21,6 +21,14 @@ use crate::sync::SpinLock;
 
 pub struct DeviceMemory {
 	header: ObjectHeader,
+	// Which entry of the device table this capability is for, or None for a region that is not
+	// one of them (the tests mint bare MMIO windows).
+	//
+	// Carried because DMA reclamation is keyed on the DEVICE: a buffer names the device it was
+	// created for, and the frames of a driver that died holding one are not recycled until somebody
+	// proves that device has been stopped. Both ends of that are capabilities to this object, so
+	// the index it names belongs on it rather than in a number passed alongside.
+	index: Option<u32>,
 	// Physical base of the MMIO region.
 	phys_base: u64,
 	// Length of the region in bytes.
@@ -39,9 +47,19 @@ pub struct DeviceMemory {
 }
 
 impl DeviceMemory {
-	// A capability to the physical MMIO region [phys_base, phys_base + len).
+	// A capability to the physical MMIO region [phys_base, phys_base + len), naming no device.
 	pub fn new(phys_base: u64, len: usize) -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+		Arc::new(Self { header: ObjectHeader::new(), index: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+	}
+
+	// The same, for entry `index` of the device table - what `sys_device_acquire` mints.
+	pub fn for_device(index: u32, phys_base: u64, len: usize) -> Arc<Self> {
+		Arc::new(Self { header: ObjectHeader::new(), index: Some(index), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+	}
+
+	// The device-table entry this capability is for, if it is for one.
+	pub fn device_index(&self) -> Option<u32> {
+		self.index
 	}
 
 	pub fn phys_base(&self) -> u64 {

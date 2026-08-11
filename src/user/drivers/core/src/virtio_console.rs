@@ -39,7 +39,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // buffers are raw bytes, no header).
 unsafe fn write_console(tx: &Queue, bytes: &[u8]) -> bool {
 	unsafe {
-		let (_handle, virt, phys): (u64, u64, u64) = match dma_buffer(4096) {
+		let (_handle, virt, phys): (u64, u64, u64) = match dma_buffer_for(tx.capability, 4096) {
 			Some(t) => t,
 			None => return false,
 		};

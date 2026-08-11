@@ -109,7 +109,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// one event buffer per ring slot, so the pool is sized by the negotiated
 		// ring - the device fills any slot it likes.
 		let slots: u16 = eventq.size();
-		let (_pool, pool_virt, pool_phys): (u64, u64, u64) = match dma_buffer(slots as u64 * EVENT_SIZE) {
+		let (_pool, pool_virt, pool_phys): (u64, u64, u64) = match dma_buffer_for(device.capability, slots as u64 * EVENT_SIZE) {
 			Some(t) => t,
 			None => exit(),
 		};

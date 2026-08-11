@@ -77,11 +77,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		rx.enable_interrupts();
 		tx.enable_interrupts();
-		let (rxpool, rx_virt, _): (u64, u64, u64) = match dma_buffer(RX_SLOTS as u64 * RX_SLOT) {
+		let (rxpool, rx_virt, _): (u64, u64, u64) = match dma_buffer_for(device.capability, RX_SLOTS as u64 * RX_SLOT) {
 			Some(t) => t,
 			None => exit(),
 		};
-		let (_txbuf, tx_virt, tx_phys): (u64, u64, u64) = match dma_buffer(MAX_FRAME as u64) {
+		let (_txbuf, tx_virt, tx_phys): (u64, u64, u64) = match dma_buffer_for(device.capability, MAX_FRAME as u64) {
 			Some(t) => t,
 			None => exit(),
 		};

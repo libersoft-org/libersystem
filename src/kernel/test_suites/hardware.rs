@@ -541,7 +541,21 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
 }
 
-tagged_test!(pci_enumeration_reaches_a_bus_behind_a_bridge, [Drivers, Pci, ArchX86_64], id = "kernel.hardware.pci_enumeration_reaches_a_bus_behind_a_bridge", covers = ["kernel"]);
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	pci_enumeration_reaches_a_bus_behind_a_bridge,
+	[Drivers, Pci, ArchX86_64],
+	id = "kernel.hardware.pci_enumeration_reaches_a_bus_behind_a_bridge",
+	covers = ["kernel"]
+);
+// x86_64 ONLY, and the tag is not what does it - an `Arch*` tag selects, it does not exclude, so
+// this needs the `cfg` as well. Not because the walk is x86-specific (it is in `arch::common` and
+// every backend gets it) but because the OTHER TWO HAVE NO FIRMWARE. On QEMU `virt` nothing
+// assigns bridge bus numbers before the kernel runs - this port assigns its own BARs for the same
+// reason - so a bridge there forwards nothing, and a test asserting otherwise would be asserting
+// that the kernel programs bridges, which it does not. That is the honest next step for those two
+// and it is not this fix.
+#[cfg(target_arch = "x86_64")]
 fn pci_enumeration_reaches_a_bus_behind_a_bridge() {
 	// A device behind a bridge did not exist - not "was not driven", did not exist: the x86 walk
 	// read bus 0 and stopped, so a PCIe root port or a `pcie-pci-bridge` was an entry with nothing

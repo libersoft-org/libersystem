@@ -39,8 +39,9 @@ pub unsafe fn bringup_features(bootstrap: u64, want_word0: u32) -> Virtio {
 		if sys_is_err(base) {
 			exit();
 		}
-		// reset -> negotiate -> features-ok.
-		match virtio::negotiate_features(base, &info, want_word0) {
+		// reset -> negotiate -> features-ok, and the reset is also what says the frames a previous
+		// driver of this device left behind are safe to recycle (see `virtio::negotiate_for`).
+		match virtio::negotiate_for(device_handle, base, &info, want_word0) {
 			Some(device) => device,
 			None => exit(),
 		}

@@ -207,11 +207,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		device.driver_ok();
 
 		// 4. allocate the control command/response buffers and the transmit DMA page.
-		let (_cmd_h, cmd_virt, cmd_phys) = dma_buffer(PAGE).unwrap_or_else(|| exit());
-		let (_resp_h, resp_virt, resp_phys) = dma_buffer(PAGE).unwrap_or_else(|| exit());
+		let (_cmd_h, cmd_virt, cmd_phys) = dma_buffer_for(device.capability, PAGE).unwrap_or_else(|| exit());
+		let (_resp_h, resp_virt, resp_phys) = dma_buffer_for(device.capability, PAGE).unwrap_or_else(|| exit());
 		let ctl = Ctl { q: ctlq, cmd_virt, cmd_phys, resp_virt, resp_phys };
 		// one page: xfer header @0 (4B), status @8 (8B), PCM period @64 (PERIOD_BYTES).
-		let (_tx_h, tx_virt, tx_phys) = dma_buffer(PAGE).unwrap_or_else(|| exit());
+		let (_tx_h, tx_virt, tx_phys) = dma_buffer_for(device.capability, PAGE).unwrap_or_else(|| exit());
 		wr32(tx_virt, 0); // xfer header = stream id (filled below once known)
 		let mut tx = Tx { q: txq, xfer_phys: tx_phys, period_virt: tx_virt + 64, period_phys: tx_phys + 64, status_phys: tx_phys + 8 };
 

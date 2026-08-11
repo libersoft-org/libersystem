@@ -57,9 +57,17 @@ const MSIX_FUNCTION_MASK: u16 = 1 << 14;
 // primitives (`read32` / `write32`) and, where relevant, the BAR allocator; the
 // derived byte / word reads and every enumeration routine below are portable.
 pub trait ConfigAccess {
-	// How many buses to enumerate: legacy x86 CAM probes bus 0 only; an ECAM window
-	// exposes several (16 on QEMU `virt`).
+	// How many ROOT buses to sweep: legacy x86 CAM starts at bus 0 alone; an ECAM window
+	// exposes several (16 on QEMU `virt`). Buses behind a bridge are reached by the walk in `scan`
+	// rather than by this count.
 	const BUS_COUNT: u16;
+
+	// The highest bus number this access mechanism can address, which is NOT the same question.
+	// CF8/CFC carries eight bits of bus and reaches all 256 of them from one root; an ECAM window
+	// is a fixed span of memory and reaches exactly as many buses as it is wide - a read past it is
+	// a read of whatever the map holds next. So a bridge that claims to forward buses beyond this
+	// is not followed: the walk stops where the mechanism does.
+	const MAX_BUS: u8 = 255;
 
 	// The end of the low 32-bit MMIO window that `assign_bars` reassigns BARs into,
 	// used to decide whether a firmware-placed BAR sits outside the mapped window.
@@ -231,7 +239,7 @@ pub fn scan<A: ConfigAccess>() -> Vec<PciDevice> {
 		return out;
 	}
 	let mut seen = [false; 256];
-	for bus in 0..A::BUS_COUNT {
+	for bus in 0..A::BUS_COUNT.min(A::MAX_BUS as u16 + 1) {
 		scan_bus::<A>(bus as u8, &mut seen, &mut out, 0);
 	}
 	out
@@ -269,8 +277,8 @@ fn scan_bus<A: ConfigAccess>(bus: u8, seen: &mut [bool; 256], out: &mut Vec<PciD
 			// nothing and is not descended into - rather than being read as "bus 0", which is the
 			// bus the walk started on.
 			let secondary = A::read8(bus, dev, func, BRIDGE_SECONDARY_BUS);
-			let subordinate = A::read8(bus, dev, func, BRIDGE_SUBORDINATE_BUS);
-			if secondary <= bus || subordinate < secondary {
+			let subordinate = A::read8(bus, dev, func, BRIDGE_SUBORDINATE_BUS).min(A::MAX_BUS);
+			if secondary <= bus || subordinate < secondary || secondary > A::MAX_BUS {
 				continue;
 			}
 			for behind in secondary..=subordinate {

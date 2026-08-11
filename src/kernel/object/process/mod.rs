@@ -327,6 +327,7 @@ impl Process {
 		// state did different amounts of it.
 		self.begin_teardown();
 		self.unmap_objects();
+		self.orphan_dma_buffers();
 		self.handles.lock().close_all();
 		self.exited.store(true, Ordering::Release);
 		sched::wake_object(self.header.koid());
@@ -480,6 +481,25 @@ impl Process {
 		self.mapped_dma.lock().retain(|mapped| !Arc::ptr_eq(mapped, object));
 	}
 
+	// Mark every DmaBuffer this process still holds as one its owner never released.
+	//
+	// THIS PROCESS NEVER SAID ITS DEVICES WERE DONE - not on a kill, and not on an exit that left
+	// its handles for the kernel to close. Either way the buffer's physical address may be sitting
+	// in a live descriptor, so the drop that follows holds the frames for that device instead of
+	// returning them to circulation. A buffer the process closed ITSELF is never marked and is
+	// retired exactly as before: that difference is the whole rule, and it is the case a
+	// `submit`/`complete` pair cannot express, because the process that would call `complete` is
+	// the one that is gone.
+	//
+	// Before `close_all`, because after it there is nothing left to mark.
+	fn orphan_dma_buffers(&self) {
+		self.handles.lock().for_each_object(|object| {
+			if let Some(dma) = object.as_any().downcast_ref::<crate::object::dma_buffer::DmaBuffer>() {
+				dma.mark_orphaned();
+			}
+		});
+	}
+
 	fn unmap_objects(&self) {
 		for object in core::mem::take(&mut *self.mapped_memory.lock()) {
 			object.remove_mapping(&self.address_space);
@@ -503,6 +523,7 @@ impl Process {
 		// still land after `close_all`.
 		self.begin_teardown();
 		self.unmap_objects();
+		self.orphan_dma_buffers();
 		self.handles.lock().close_all();
 		self.killed.store(true, Ordering::Release);
 		// A kill is a terminal state, so wake anything blocked on this process handle to

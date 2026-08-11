@@ -100,7 +100,7 @@ impl Storage {
 			if bytes <= self.data_bytes {
 				return true;
 			}
-			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer(bytes) {
+			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer_for(crate::device(), bytes) {
 				Some(t) => t,
 				None => return false,
 			};

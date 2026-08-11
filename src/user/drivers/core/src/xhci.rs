@@ -193,12 +193,30 @@ unsafe fn w64(addr: u64, v: u64) {
 	}
 }
 
+// This controller's DeviceMemory capability, so every DMA page can name the device it is for.
+//
+// A STATIC because this process drives exactly one controller - DeviceManager launches one driver
+// per device - and threading it through the eight allocation sites below would say nothing the
+// program does not already guarantee. It is set once, before the first allocation.
+static DEVICE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// This controller's capability, for the storage half of this program (`usb_storage`), whose data
+// span is DMA the controller writes into exactly as the rings are.
+pub fn device() -> u64 {
+	DEVICE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // Allocate one zeroed DMA page. Zeroing matters: a freed page from an earlier
 // driver instance is recycled with its old ring contents intact, and a stale TRB
 // with the right cycle bit would read as a fresh event.
+//
+// The zeroing is also why the kernel holding these frames matters. "A freed page from an earlier
+// driver instance" is exactly the case: this driver can zero what it is given, and it cannot stop
+// the previous instance's controller from writing into it afterwards - only a reset can, which is
+// what `device_quiesced` below reports.
 unsafe fn dma_page() -> Option<(u64, u64, u64)> {
 	unsafe {
-		let (handle, virt, phys): (u64, u64, u64) = dma_buffer(4096)?;
+		let (handle, virt, phys): (u64, u64, u64) = dma_buffer_for(DEVICE.load(core::sync::atomic::Ordering::Relaxed), 4096)?;
 		core::ptr::write_bytes(virt as *mut u8, 0, 4096);
 		Some((handle, virt, phys))
 	}
@@ -357,6 +375,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		// receive "IRQ" + the controller's MSI-X Interrupt capability (the keyboard
 		// service loop blocks on it; bring-up itself polls).
+		DEVICE.store(device_handle, core::sync::atomic::Ordering::Relaxed);
 		let irq: u64 = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"IRQ" => handle,
 			_ => exit(),
@@ -470,6 +489,13 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 		wait_set(op + OP_USBSTS, STS_HCHALTED)?;
 		w32(op + OP_USBCMD, r32(op + OP_USBCMD) | CMD_HCRST);
 		wait_clear(op + OP_USBCMD, CMD_HCRST)?;
+		// The controller is stopped and has cleared its own reset: nothing a previous instance of
+		// this driver pointed it at is in flight any more, which is what releases the DMA frames the
+		// kernel has been holding for it. The xHCI half of what `virtio::negotiate_for` says.
+		let device: u64 = DEVICE.load(core::sync::atomic::Ordering::Relaxed);
+		if device != 0 {
+			device_quiesced(device);
+		}
 		wait_clear(op + OP_USBSTS, STS_CNR)?;
 
 		// the device context base address array; entry 0 points at the scratchpad

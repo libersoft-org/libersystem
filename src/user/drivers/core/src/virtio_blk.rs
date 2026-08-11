@@ -100,7 +100,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn verify_archive(queue: &Queue) -> bool {
 	unsafe {
 		// a DMA buffer for the control page and one data sector.
-		let handle: i64 = dma_buffer_create(4096);
+		let handle: i64 = dma_buffer_create_for(queue.capability, 4096);
 		if handle < 0 {
 			return false;
 		}
@@ -163,6 +163,9 @@ struct Span {
 	virt: u64,
 	phys: u64,
 	bytes: u64,
+	// The device this span's data is written by, carried so a reallocation can name it - the same
+	// reason `Queue` carries it.
+	capability: u64,
 }
 
 impl Span {
@@ -173,7 +176,7 @@ impl Span {
 			if bytes <= self.bytes {
 				return true;
 			}
-			let handle: i64 = dma_buffer_create(bytes);
+			let handle: i64 = dma_buffer_create_for(self.capability, bytes);
 			if handle < 0 {
 				return false;
 			}
@@ -212,7 +215,7 @@ impl Span {
 unsafe fn serve_blocks(queue: &Queue, blk_server: u64, capacity_sectors: u64, has_flush: bool, size_max: u64) -> ! {
 	unsafe {
 		// the fixed control page (header + status) and the growable data span.
-		let dma: i64 = dma_buffer_create(4096);
+		let dma: i64 = dma_buffer_create_for(queue.capability, 4096);
 		if dma < 0 {
 			exit();
 		}
@@ -222,7 +225,7 @@ unsafe fn serve_blocks(queue: &Queue, blk_server: u64, capacity_sectors: u64, ha
 		}
 		let virt: u64 = virt as u64;
 		let phys: u64 = dma_buffer_phys(dma as u64);
-		let mut span: Span = Span { handle: 0, virt: 0, phys: 0, bytes: 0 };
+		let mut span: Span = Span { handle: 0, virt: 0, phys: 0, bytes: 0, capability: queue.capability };
 		let max_sectors: u64 = (size_max / SECTOR as u64).max(1);
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {

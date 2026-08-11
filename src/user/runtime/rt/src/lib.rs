@@ -2137,9 +2137,25 @@ pub unsafe fn console_feed_serial(privilege: u64, byte: u8) -> i64 {
 }
 
 // Allocate a DmaBuffer of `size` bytes (pinned DMA memory charged to our Domain),
-// returning its handle, or a negative error.
+// returning its handle, or a negative error. The buffer names no device, so its frames are
+// recycled as soon as it is dropped - correct for memory that is never handed to hardware.
 pub unsafe fn dma_buffer_create(size: u64) -> i64 {
 	unsafe { syscall(SYS_DMA_BUFFER_CREATE, size, 0, 0, 0) as i64 }
+}
+
+// The same, for a buffer whose physical address is about to be given to `device` (its DeviceMemory
+// capability). NAME THE DEVICE for anything a device will write into: if this process dies still
+// holding the buffer, the kernel keeps those frames out of circulation until somebody resets that
+// device, instead of handing them to whoever allocates next while a descriptor still points at
+// them. There is no IOMMU, so nothing else stops that write.
+pub unsafe fn dma_buffer_create_for(device: u64, size: u64) -> i64 {
+	unsafe { syscall(SYS_DMA_BUFFER_CREATE, size, device, 0, 0) as i64 }
+}
+
+// "I have reset this device." Releases the DMA frames the kernel is holding for it - the frames of
+// a driver that died before this one. Call it once, straight after the reset that starts bring-up.
+pub unsafe fn device_quiesced(device: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_QUIESCED, device, 0, 0, 0) as i64 }
 }
 
 // Map a DmaBuffer into our address space, returning its virtual base (or a
@@ -2187,8 +2203,14 @@ pub unsafe fn dma_buffer_phys_at(handle: u64, offset: u64) -> u64 {
 // device at `phys`. None on allocation or mapping failure. The returned handle keeps
 // the pinned buffer alive for the life of the driver.
 pub unsafe fn dma_buffer(size: u64) -> Option<(u64, u64, u64)> {
+	unsafe { dma_buffer_for(0, size) }
+}
+
+// `dma_buffer`, naming the device the physical address is for - see `dma_buffer_create_for`.
+// `device` 0 means no device, which is what `dma_buffer` passes.
+pub unsafe fn dma_buffer_for(device: u64, size: u64) -> Option<(u64, u64, u64)> {
 	unsafe {
-		let handle: i64 = dma_buffer_create(size);
+		let handle: i64 = dma_buffer_create_for(device, size);
 		if handle < 0 {
 			return None;
 		}

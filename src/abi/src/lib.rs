@@ -266,6 +266,17 @@ pub const SYS_WAITSET_WAIT: u64 = 72;
 // name that promises otherwise.
 pub const SYS_RANDOM_INSECURE: u64 = 73;
 
+// "I have stopped this device." Called by a driver once it has reset the device its DeviceMemory
+// capability names - which is the first thing every virtio bring-up does and what `HCRST` is for
+// xHCI - and it releases the DMA frames the kernel is holding for that device.
+//
+// It exists because a device is not a process. When a driver dies with a descriptor live, the
+// kernel can close its handles, unmap its address space and refund its quota, and none of that
+// tells the device to stop writing: there is no IOMMU, and the physical address it was given is
+// still just an address. So those frames are held rather than recycled, and this is the one thing
+// that can say they are safe - because the caller has just reset the hardware.
+pub const SYS_DEVICE_QUIESCED: u64 = 74;
+
 // The most capabilities one message may carry: stdin, stdout, stderr and one spare. Bounded
 // like everything else here, so a sender cannot make the receiver allocate by asking.
 pub const MAX_MESSAGE_CAPS: usize = 4;

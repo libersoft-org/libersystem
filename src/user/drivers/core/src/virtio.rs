@@ -73,6 +73,11 @@ pub struct Virtio {
 	// The word-0 (device-specific) feature bits the negotiation accepted: the
 	// intersection of what the device offered and what the driver wanted.
 	features_word0: u32,
+	// This device's DeviceMemory capability, kept so every DMA buffer whose physical address is
+	// handed to it can NAME it (`dma_buffer_for`). That is what lets the kernel keep those frames
+	// out of circulation if this driver dies with a descriptor still live - there is no IOMMU, so
+	// nothing else stops the device writing into memory that has been handed to somebody else.
+	pub capability: u64,
 }
 
 // One set-up split virtqueue: its rings (in a DMA page) and the address/value used
@@ -89,6 +94,9 @@ pub struct Queue {
 	last_used: u16,
 	// Keeps the ring DMA buffer alive (the handle stays open).
 	handle: u64,
+	// The device this queue belongs to, so a driver holding only a `Queue` can still name the
+	// device its data buffers are for - see `Virtio::capability`.
+	pub capability: u64,
 }
 
 // The RX / event-queue flow: the device pushes to the driver. The driver posts a
@@ -160,6 +168,23 @@ pub unsafe fn negotiate(mmio_base: u64, info: &DeviceInfo) -> Option<Virtio> {
 	unsafe { negotiate_features(mmio_base, info, 0) }
 }
 
+// `negotiate_features`, told which capability names the device being reset.
+//
+// THE RESET IS THE PROOF. The handshake below starts by writing status 0 and waiting for the device
+// to read back 0 - a full stop, with nothing of the previous driver's in flight afterwards - so
+// this is the moment, and the only moment, at which the frames a dead driver left pointing into
+// this device are safe to recycle. `device_quiesced` is that statement, and it is made here rather
+// than in each driver because this is where the reset is.
+pub unsafe fn negotiate_for(capability: u64, mmio_base: u64, info: &DeviceInfo, want_word0: u32) -> Option<Virtio> {
+	let device = unsafe { negotiate_features(mmio_base, info, want_word0) };
+	let mut device = device?;
+	device.capability = capability;
+	if capability != 0 {
+		unsafe { device_quiesced(capability) };
+	}
+	Some(device)
+}
+
 // `negotiate`, additionally accepting the device-feature bits of word 0 (the
 // device-specific features) that `want_word0` names and the device offers. The
 // accepted set is kept on the returned device (`features_word0`), so the driver can
@@ -196,7 +221,7 @@ pub unsafe fn negotiate_features(mmio_base: u64, info: &DeviceInfo, want_word0: 
 			w8(common + CFG_DEVICE_STATUS, STATUS_FAILED);
 			return None;
 		}
-		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR, features_word0 })
+		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR, features_word0, capability: 0 })
 	}
 }
 
@@ -242,7 +267,7 @@ impl Virtio {
 			let avail_off: u64 = 16 * size as u64;
 			let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
 			let ring_bytes: u64 = used_off + 6 + 8 * size as u64;
-			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer(ring_bytes) {
+			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer_for(self.capability, ring_bytes) {
 				Some(t) => t,
 				None => return None,
 			};
@@ -257,7 +282,7 @@ impl Virtio {
 			let notify_off: u16 = r16(self.common + CFG_QUEUE_NOTIFY_OFF);
 			w16(self.common + CFG_QUEUE_ENABLE, 1);
 
-			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, last_used: 0, handle })
+			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, last_used: 0, handle, capability: self.capability })
 		}
 	}
 

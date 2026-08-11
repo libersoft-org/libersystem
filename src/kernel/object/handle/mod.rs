@@ -518,6 +518,18 @@ impl HandleTable {
 		self.free.clone()
 	}
 
+	// Every live capability in this table, for a caller that has to touch the objects themselves
+	// before they are closed. Used by process teardown, which has to tell a dying process's DMA
+	// buffers that their owner never said the device was done with them - a fact that exists only
+	// on this side of `close_all`.
+	pub fn for_each_object(&self, mut f: impl FnMut(Arc<dyn KernelObject>)) {
+		for slot in &self.slots {
+			if let Some(cap) = &slot.cap {
+				f(cap.object());
+			}
+		}
+	}
+
 	pub fn close_all(&mut self) {
 		let mut closed: u64 = 0;
 		self.free.clear();

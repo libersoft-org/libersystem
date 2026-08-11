@@ -47,6 +47,9 @@ struct Access;
 
 impl common::ConfigAccess for Access {
 	const BUS_COUNT: u16 = ECAM_BUSES;
+	// The window is `ECAM_BUSES` wide, so that is also as far as a bridge can be followed: past it
+	// the address is not config space at all, it is whatever the direct map holds next.
+	const MAX_BUS: u8 = (ECAM_BUSES - 1) as u8;
 	const MMIO_WINDOW_END: u64 = MMIO_WINDOW_END;
 
 	fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {

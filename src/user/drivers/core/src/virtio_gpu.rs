@@ -281,9 +281,11 @@ struct Dma {
 	virt: u64,
 }
 
-unsafe fn dma(size: u64) -> Option<Dma> {
+// `device` is the DeviceMemory capability this memory is for, so the kernel can keep the frames out
+// of circulation if this driver dies with the GPU still pointed at them.
+unsafe fn dma(device: u64, size: u64) -> Option<Dma> {
 	unsafe {
-		let (handle, virt, _phys) = dma_buffer(size)?;
+		let (handle, virt, _phys) = dma_buffer_for(device, size)?;
 		Some(Dma { handle, virt })
 	}
 }
@@ -310,12 +312,12 @@ unsafe fn create_backing(gpu: &Gpu, id: u32, w: u32, h: u32) -> Option<Backing> 
 	unsafe {
 		let fb_size = align_up(w as u64 * h as u64 * 4, PAGE);
 		let pages = fb_size / PAGE;
-		let handle: i64 = dma_buffer_create(fb_size);
+		let handle: i64 = dma_buffer_create_for(gpu.q.capability, fb_size);
 		if handle < 0 {
 			return None;
 		}
 		let handle = handle as u64;
-		let entries = match dma(align_up(pages * 16, PAGE)) {
+		let entries = match dma(gpu.q.capability, align_up(pages * 16, PAGE)) {
 			Some(d) => d,
 			None => {
 				close(handle);
@@ -364,11 +366,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		device.driver_ok();
 		// command + response buffers reused for every control request.
-		let cmd = match dma(PAGE) {
+		let cmd = match dma(q.capability, PAGE) {
 			Some(d) => d,
 			None => exit(),
 		};
-		let resp = match dma(PAGE) {
+		let resp = match dma(q.capability, PAGE) {
 			Some(d) => d,
 			None => exit(),
 		};

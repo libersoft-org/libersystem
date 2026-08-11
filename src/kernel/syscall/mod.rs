@@ -44,7 +44,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -454,7 +454,8 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_CLOCK_MONO_NS => arch::tsc::cycles_to_ns(arch::tsc::now()) as i64,
 		SYS_DEBUG_WRITE => sys_debug_write(a0, a1),
 		SYS_MEMORY_OBJECT_CREATE => sys_memory_object_create(a0),
-		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0),
+		SYS_DMA_BUFFER_CREATE => sys_dma_buffer_create(a0, a1),
+		SYS_DEVICE_QUIESCED => sys_device_quiesced(a0),
 		SYS_DMA_BUFFER_MAP => sys_dma_buffer_map(a0),
 		SYS_DMA_BUFFER_UNMAP => sys_dma_buffer_unmap(a0),
 		SYS_DMA_BUFFER_PHYS => sys_dma_buffer_phys(a0, a1),
@@ -572,9 +573,28 @@ fn sys_memory_object_create(size: u64) -> i64 {
 // Create a DmaBuffer - pinned DMA memory charged to the caller's Domain DMA quota
 // - and install a handle to it in the caller's table. A driver maps the buffer
 // and hands its physical address to its device.
-fn sys_dma_buffer_create(size: u64) -> i64 {
+// Allocate pinned, physically contiguous DMA memory.
+//
+// `device_handle` names the DeviceMemory capability for the device this buffer's physical address
+// is about to be handed to, or 0 for a buffer that is not going to a device (which is what every
+// caller passed before this argument existed, and what they still get). Naming the device is what
+// lets the kernel hold the frames back if this process dies still holding the buffer: see
+// `DmaBuffer::mark_orphaned` and `SYS_DEVICE_QUIESCED`.
+//
+// A capability rather than an index, because the two ends of the rule have to be the same
+// authority: the driver that names a device here is the one that will later claim to have stopped
+// it, and both are things only the holder of that device's capability may say.
+fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	let thread = current_thread!();
-	let object = match DmaBuffer::create_in(thread.domain(), size as usize) {
+	let device: Option<u32> = if device_handle == 0 {
+		None
+	} else {
+		match current_typed::<DeviceMemory>(device_handle, ObjectType::DeviceMemory, Rights::WRITE) {
+			Ok(memory) => memory.device_index(),
+			Err(e) => return e,
+		}
+	};
+	let object = match DmaBuffer::create_for(thread.domain(), size as usize, device) {
 		Ok(o) => o,
 		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
 		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,
@@ -943,11 +963,34 @@ fn sys_device_acquire(index: u64, privilege: u64) -> i64 {
 		return error;
 	}
 	let thread = current_thread!();
-	let memory = match device::with(index as usize, |d| DeviceMemory::new(d.bar_phys, d.bar_len as usize)) {
+	let memory = match device::with(index as usize, |d| DeviceMemory::for_device(index as u32, d.bar_phys, d.bar_len as usize)) {
 		Some(m) => m,
 		None => return ERR_INVALID,
 	};
 	install_object(&thread, memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER, 0)
+}
+
+// "I have stopped this device": release the DMA frames held for it.
+//
+// The caller must hold the device's own DeviceMemory capability with WRITE - the same authority the
+// reset itself needed, because that is what this is a claim about. Returns the number of frames
+// released, which is 0 in the ordinary case where no driver of this device ever died holding one.
+//
+// The kernel cannot check the claim, and could not on any machine without an IOMMU: it has no
+// per-class knowledge of what "reset" means for a device it does not drive. What it can do is
+// require the claim to come from the holder of the capability and to be made explicitly, so a
+// driver that never resets its device never releases anything - a leak rather than a use after
+// free, which is the direction this should lean.
+fn sys_device_quiesced(device_handle: u64) -> i64 {
+	let memory = match current_typed::<DeviceMemory>(device_handle, ObjectType::DeviceMemory, Rights::WRITE) {
+		Ok(m) => m,
+		Err(e) => return e,
+	};
+	match memory.device_index() {
+		Some(index) => crate::object::dma_buffer::release_for(index) as i64,
+		// A bare MMIO window is not a device-table entry, so nothing is keyed on it.
+		None => ERR_INVALID,
+	}
 }
 
 // Fill a caller buffer with `len` random bytes from the kernel CSPRNG (RDRAND when

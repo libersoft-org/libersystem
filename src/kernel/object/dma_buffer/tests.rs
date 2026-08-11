@@ -50,3 +50,54 @@ fn dma_buffer_quota_enforced_cleanly() {
 	// Every buffer was closed, so the pinned-DMA quota is back to zero.
 	assert_eq!(domain.account().dma().used(), 0);
 }
+
+crate::tagged_test!(a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset, [Dma, Drivers, Memory, Kernel], id = "kernel.object.dma_buffer.a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset", covers = ["kernel"]);
+fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
+	// A driver hands its device a REAL PHYSICAL ADDRESS and there is no IOMMU, so the moment the
+	// frames stop being the device's business is the moment the DEVICE stops - not the moment the
+	// driver's last handle closes. A driver that faults with a descriptor live never gets to say
+	// anything, and the kernel used to recycle its DMA frames immediately: the next allocation got
+	// memory a running device was still writing into.
+	//
+	// The two cases have to be told apart, and the difference is who closed the buffer. Both are
+	// exercised here, because holding the frames of a driver that shut down cleanly would be a leak
+	// on the ordinary path.
+	use crate::object::address_space::AddressSpace;
+	use crate::object::device_memory::DeviceMemory;
+	use crate::object::process::Process;
+	use crate::object::rights::Rights;
+	const DEVICE: u32 = 7;
+	let domain = crate::sched::root_domain();
+	assert_eq!(super::held_frames_for_test(DEVICE), 0, "nothing is held for this device to begin with");
+
+	// 1. A buffer whose owner CLOSED it: the frames go back at once, exactly as before.
+	let Ok(deliberate) = DmaBuffer::create_for(&domain, 2 * PAGE_SIZE as usize, Some(DEVICE)) else {
+		panic!("a 2-page DMA buffer should allocate");
+	};
+	drop(deliberate);
+	assert_eq!(super::held_frames_for_test(DEVICE), 0, "a buffer its owner released is not held - that would leak on the ordinary path");
+
+	// 2. A buffer whose owner was TERMINATED holding it. The process teardown marks it, so the drop
+	//    that follows keeps the frames out of circulation.
+	let process = Process::new(AddressSpace::create().expect("an address space"), domain.clone());
+	let Ok(orphan) = DmaBuffer::create_for(&domain, 3 * PAGE_SIZE as usize, Some(DEVICE)) else {
+		panic!("a 3-page DMA buffer should allocate");
+	};
+	let frames: alloc::vec::Vec<u64> = orphan.frames().to_vec();
+	assert!(process.install(orphan, Rights::ALL, 0) != 0, "the buffer is installed in the driver process");
+	process.terminate();
+	crate::sched::run_until_idle();
+	assert_eq!(super::held_frames_for_test(DEVICE), frames.len(), "the frames of a driver that died holding a buffer are held for its device, not handed to whoever allocates next");
+
+	// 3. And they come back when - and only when - somebody proves the device has been stopped.
+	//    That claim is a capability: the holder of the device's own DeviceMemory.
+	let other = DeviceMemory::for_device(DEVICE + 1, 0x1000_0000, PAGE_SIZE as usize);
+	assert_eq!(super::release_for(other.device_index().expect("a device-table entry")), 0, "resetting a different device releases nothing");
+	assert_eq!(super::held_frames_for_test(DEVICE), frames.len(), "still held");
+
+	let released = super::release_for(DEVICE);
+	assert_eq!(released, frames.len(), "resetting the device releases exactly its held frames");
+	assert_eq!(super::held_frames_for_test(DEVICE), 0, "and nothing is held for it any more");
+	drop(process);
+	crate::sched::run_until_idle();
+}

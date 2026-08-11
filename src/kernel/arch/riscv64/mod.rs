@@ -4,7 +4,7 @@
 // (Sv39 page tables via SATP in `paging`, the STVEC trap vector + FP save/restore in
 // `traps`, the SBI timer + AIA IMSIC MSI controller in `apic`/`imsic`/`interrupts`,
 // SBI HSM hart_start SMP wake in `smp`, the ECALL syscall path in `syscall`, the `tp`
-// per-CPU register in `percpu`, the 16550 / SBI console in `serial`, and DTB parsing
+// per-CPU register in `percpu`, the 16550 console in `serial`, and DTB parsing
 // in `dtb`). riscv64 boots directly on OpenSBI with no bootloader hand-off, so it does
 // not enter through the shared `main::kmain`; instead `boot::riscv64_main` is the S-mode
 // entry and drives the whole bring-up itself (memory, paging, per-CPU, SMP, scheduler,
