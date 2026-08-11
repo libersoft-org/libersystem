@@ -90,6 +90,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		0 => unsafe { fail_bootstrap(bootstrap, b"control", b"required capability not granted") },
 		h => h,
 	};
+	// Kept here as well as threaded through the call chain, because `send_stdout` needs it to hand
+	// a send-only dup to an interactive foreground job and is called from places that never had a
+	// reason to carry it. One shell, one terminal, one process - a global is what that is.
+	TTY_CONTROL.store(control, core::sync::atomic::Ordering::Relaxed);
 	drop(caps);
 
 	// 2. report in.
@@ -1276,6 +1280,13 @@ unsafe fn exec(jobs: &mut Jobs, procsvc: u64, name: &[u8], args: &[u8], cwd: &[u
 // `rt::inherit_stdout` adopts it as both stdout and stdin. A handle of 0 (no console)
 // leaves the child on serial with no input. Both dups carry WAIT so a child whose
 // output outruns the console relay blocks in `wait` for room instead of yield-spinning.
+// The VT control channel this shell owns, for the one caller that cannot be handed it.
+static TTY_CONTROL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn tty_control() -> u64 {
+	TTY_CONTROL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 unsafe fn send_stdout(parent: u64, interactive: bool) {
 	unsafe {
 		let so: u64 = stdout();
@@ -1290,6 +1301,25 @@ unsafe fn send_stdout(parent: u64, interactive: bool) {
 		// full duplex, so the child reads and writes the same channel - and names it rather than
 		// relying on its position. What it does not send simply does not arrive.
 		send_blocking(parent, CAP_STDOUT, dup);
+		// AND THE TERMINAL'S CONTROL CHANNEL, for an interactive foreground job only.
+		//
+		// This is what lets a full-screen program ask for raw mode without printing an escape
+		// sequence into its own output - where its data and its requests were the same bytes, so
+		// `cat` on a file containing them reconfigured the terminal. Send-only: the child asks, it
+		// does not listen in on what the shell and the console say to each other.
+		//
+		// A background job gets nothing, and neither does a pipeline stage: the tty belongs to
+		// whoever is in the foreground, and that is the shell's own bookkeeping (it is what sets
+		// SET_FG) rather than something the console has to infer.
+		if interactive {
+			let control: u64 = tty_control();
+			if control != 0 {
+				let sendable: i64 = duplicate(control, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+				if sendable > 0 {
+					send_blocking(parent, CAP_CONTROL, sendable as u64);
+				}
+			}
+		}
 		send_ready(parent);
 	}
 }

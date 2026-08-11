@@ -586,7 +586,37 @@ pub unsafe fn inherit_stdout(bootstrap: u64) {
 		// Absent leaves 0, and `eprint` then writes to stdout - today's behaviour for every
 		// launch, kept until something actually redirects one and not the other.
 		set_stderr(endpoints.take(CAP_STDERR));
+		// The terminal's CONTROL channel, when the launcher gave one. This is what makes a mode
+		// change a REQUEST rather than a byte in the output: `cat` writes data on stdout and has no
+		// way to reach this, whatever its file contains.
+		TTY_CONTROL.store(endpoints.take(CAP_CONTROL), Ordering::Relaxed);
 	}
+}
+
+// The controlling terminal's control channel, if this program was given one.
+static TTY_CONTROL: AtomicU64 = AtomicU64::new(0);
+
+// Ask the controlling terminal to change its line discipline: `raw` turns off line editing,
+// `echo` turns off echoing of what is typed. False when this program has no control channel -
+// which is the answer for anything that was not launched as an interactive foreground job.
+//
+// THIS EXISTS BECAUSE AN ESCAPE SEQUENCE WAS DOING IT. `ESC[?9001h` and `ESC[?9002l` in the OUTPUT
+// stream set the tty's raw and echo modes, so `cat` on a file containing those bytes reconfigured
+// the terminal: a program's data and a program's request were the same thing, and no filter on a
+// byte stream can separate them. A capability can: this channel is handed to the foreground job by
+// the shell, and a program that does not have it cannot ask.
+pub unsafe fn tty_set_mode(raw: bool, echo: bool) -> bool {
+	let control: u64 = TTY_CONTROL.load(Ordering::Relaxed);
+	if control == 0 {
+		return false;
+	}
+	// "SET_MODE" then one byte each: 0 off, 1 on. Two bytes rather than a bitmask because the
+	// message is read by a service that matches on a tag and then on fixed positions, and a mask
+	// would need a meaning for the bits nobody set.
+	let mut message: [u8; 10] = *b"SET_MODE\0\0";
+	message[8] = raw as u8;
+	message[9] = echo as u8;
+	unsafe { send_blocking(control, &message, 0) }
 }
 
 // The largest launch context a program will accept.

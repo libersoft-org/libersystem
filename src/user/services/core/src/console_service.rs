@@ -591,17 +591,12 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 	unsafe {
 		let fg: bool = vi == console.fg;
 		let input: u64 = console.input;
-		let mut raw_req: Option<bool> = None;
-		let mut echo_req: Option<bool> = None;
 		let mut clip_req: Option<Vec<u8>> = None;
 		let mut reply: Vec<u8> = Vec::new();
 		if let Some(t) = console.vts[vi].term.as_mut() {
 			for &b in bytes {
 				t.screen.put_byte(b);
 			}
-			// Pick up any tty mode change the program asked for in this output.
-			raw_req = t.screen.take_tty_raw_req();
-			echo_req = t.screen.take_tty_echo_req();
 			// Pick up an OSC 52 clipboard-set the program emitted in this output.
 			clip_req = t.screen.take_clipboard_set();
 			// And anything the terminal owes it in reply to a query - DSR, DA. There was no reply
@@ -621,13 +616,6 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 					t.flush();
 				}
 			}
-		}
-		// Apply the program's tty mode request to this VT's line discipline.
-		if let Some(raw) = raw_req {
-			console.vts[vi].ld.cooked = !raw;
-		}
-		if let Some(echo) = echo_req {
-			console.vts[vi].ld.echo = echo;
 		}
 		// Adopt an OSC 52 clipboard-set into the console-held clipboard (a program sets
 		// the selection, a later middle-click pastes it) - FROM THE FOREGROUND VT ONLY.
@@ -1051,6 +1039,19 @@ unsafe fn tty_fg_winsize(vt: &mut Vt, msg: &[u8], handle: u64) -> bool {
 			if let Some(p) = vt.fg_proc.take() {
 				close(p);
 			}
+		} else if msg.starts_with(b"SET_MODE") && msg.len() >= 10 {
+			// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED.
+			//
+			// `ESC[?9001h` / `ESC[?9002l` in the OUTPUT stream used to do this, so `cat` on a file
+			// containing those bytes reconfigured the terminal - a program's data and a program's
+			// request were the same bytes, and no filter on a byte stream can tell them apart.
+			// This arrives on the VT's control channel, which the shell hands only to an
+			// interactive foreground job, so having it IS the authority to ask.
+			//
+			// It touches this terminal's own line discipline and nothing else, which is why it
+			// belongs beside SET_FG rather than in the paths that repaint or resize.
+			vt.ld.cooked = msg[8] == 0;
+			vt.ld.echo = msg[9] != 0;
 		} else if msg.starts_with(b"GET_WINSIZE") {
 			let (rows, cols) = tty_dims(vt);
 			send_winsize(vt.control, b"WINSIZE", rows, cols);

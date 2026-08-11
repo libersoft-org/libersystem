@@ -30,11 +30,11 @@ fn terminal_session_enters_and_restores_the_complete_tui_contract() {
 	let mut session = TerminalSession::new(TerminalOptions::tui());
 	assert!(session.enter(&mut writer));
 	assert!(session.is_active());
-	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?9001h\x1b[?9002l\x1b[?1002h\x1b[?1006h\x1b[?2004h");
+	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h\x1b[?2004h");
 	assert!(session.enter(&mut writer));
 	assert!(session.restore(&mut writer));
 	assert!(!session.is_active());
-	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?9001h\x1b[?9002l\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?9001l\x1b[?9002h\x1b[?25h\x1b[?1049l");
+	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?1049l");
 	assert!(session.restore(&mut writer));
 }
 
@@ -44,8 +44,10 @@ fn terminal_session_attempts_cleanup_after_a_failed_enter() {
 	let mut session = TerminalSession::new(TerminalOptions::tui());
 	assert!(!session.enter(&mut writer));
 	assert!(!session.is_active());
-	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?9001l\x1b[?9002h\x1b[?25h\x1b[?1049l");
-	assert_eq!(writer.calls, 10);
+	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?1049l");
+	// Eight writes, not ten: the two mode escapes are gone from the stream - they are requests on
+	// the control channel now, which `fail_on_call` does not count and a file cannot forge.
+	assert_eq!(writer.calls, 8);
 }
 
 #[test]
@@ -56,7 +58,7 @@ fn terminal_guard_restores_modes_when_the_application_leaves_scope() {
 		assert!(terminal.is_active());
 		assert!(terminal.writer().write(b"frame"));
 	}
-	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?9001h\x1b[?9002l\x1b[?1002h\x1b[?1006h\x1b[?2004hframe\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?9001l\x1b[?9002h\x1b[?25h\x1b[?1049l");
+	assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h\x1b[?2004hframe\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?1049l");
 }
 
 #[test]

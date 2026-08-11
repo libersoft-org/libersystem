@@ -127,16 +127,14 @@ impl TerminalSession {
 				return false;
 			}
 		}
-		if self.options.raw_input {
-			if !writer.write(b"\x1b[?9001h") {
-				return false;
-			}
-		}
-		if self.options.disable_echo {
-			if !writer.write(b"\x1b[?9002l") {
-				return false;
-			}
-		}
+		// THE TTY'S MODES ARE NOT THIS LIBRARY'S BUSINESS ANY MORE.
+		//
+		// `raw_input` and `disable_echo` used to be `ESC[?9001h` / `ESC[?9002l` written into the
+		// output stream, where a program's data and a program's request are the same bytes - so
+		// `cat` on a file containing them reconfigured the terminal. They are a request on the
+		// terminal's control channel now (`rt::tty_set_mode`), made by the PROGRAM, which is what
+		// holds that capability. The options are still read here so a caller can see what it asked
+		// for; what this library emits is only ever the terminal's own screen state.
 		match self.options.mouse {
 			MouseTracking::Off => {}
 			MouseTracking::Press if !writer.write(b"\x1b[?1000h") => return false,
@@ -171,12 +169,7 @@ impl TerminalSession {
 				MouseTracking::AnyMotion => write(writer, b"\x1b[?1003l", &mut ok),
 			}
 		}
-		if self.options.raw_input {
-			write(writer, b"\x1b[?9001l", &mut ok);
-		}
-		if self.options.disable_echo {
-			write(writer, b"\x1b[?9002h", &mut ok);
-		}
+
 		if self.options.hide_cursor {
 			write(writer, b"\x1b[?25h", &mut ok);
 		}

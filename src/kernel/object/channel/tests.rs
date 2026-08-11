@@ -249,3 +249,78 @@ fn channel_queue_bytes_accounting_is_refunded_on_recv() {
 	// The thread and its channels are reaped, refunding every undelivered message.
 	assert_eq!(domain.account().ipc_queue().used(), 0);
 }
+
+crate::tagged_test!(receives_in_flight_never_let_the_queue_pass_its_limit, [Channel, Ipc, Kernel], id = "kernel.object.channel.receives_in_flight_never_let_the_queue_pass_its_limit", covers = ["kernel"]);
+fn receives_in_flight_never_let_the_queue_pass_its_limit() {
+	// N receivers whose copies to userspace fail, against one endpoint, with a sender running.
+	//
+	// The queue bound is what stops a fast sender from turning a slow reader into unbounded kernel
+	// memory. A receive takes its message off the queue BEFORE it knows whether it can deliver it,
+	// and puts it back if it cannot - so between the take and the put-back the queue looks like it
+	// has room it does not have. A sender that takes that room means the returned messages arrive
+	// on top of it, and the endpoint ends up holding more than its limit: one message deeper per
+	// failed copy, forever, because a receiver that keeps failing is a receiver passing a bad
+	// buffer - which userspace decides.
+	//
+	// EXERCISED THROUGH THE SYSCALL'S OWN SEQUENCE - `peek_identified`, `recv_identified`, then
+	// either `return_to_head` or the commit - with no test-only entry point, because a bound that
+	// only holds against a helper written next to the test is not a bound. The interleaving is
+	// deterministic rather than raced for: N concurrent receivers can produce this, and N receivers
+	// stopped between their take and their put-back always do.
+	use crate::object::channel::Channel;
+	const DEPTH: usize = 4;
+	let (a, b) = Channel::create_with_depth(DEPTH);
+	let limit = b.queue_limit();
+	assert_eq!(limit, DEPTH, "the endpoint has the depth it was created with");
+
+	let fill = |n: usize| {
+		let mut sent = 0;
+		while sent < n && a.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).is_ok() {
+			sent += 1;
+		}
+		sent
+	};
+	assert_eq!(fill(limit), limit, "the queue takes messages up to its limit");
+	assert_eq!(fill(1), 0, "and refuses the next one");
+
+	// Three rounds, because one message over the limit is a race and a round that grows the queue
+	// every time is the actual defect: the depth after each round is the number to watch.
+	for round in 1..=3 {
+		// Every receiver gets as far as having its message in hand - the point at which the copy
+		// to userspace is about to fail.
+		let mut in_flight = alloc::vec::Vec::new();
+		while let Ok((id, _, _)) = b.peek_identified() {
+			match b.recv_identified(id, usize::MAX, abi::MAX_MESSAGE_CAPS) {
+				Ok(message) => in_flight.push(message),
+				Err(_) => break,
+			}
+		}
+		assert!(!in_flight.is_empty(), "round {round}: there were messages to take");
+
+		// A sender runs while they are in flight. Whatever it is allowed to queue is room the
+		// endpoint promised it had.
+		let accepted = fill(limit);
+
+		// And now every copy fails, so every message goes back where it came from.
+		let returned = in_flight.len();
+		for message in in_flight {
+			b.return_to_head(message);
+		}
+
+		assert!(b.queued() <= limit, "round {round}: the queue is {} deep against a limit of {limit} ({returned} receives in flight, {accepted} sends accepted behind them)", b.queued());
+		assert_eq!(b.in_flight(), 0, "round {round}: every receive ended, so no slot is still held");
+	}
+
+	// And a receive that SUCCEEDS gives the slot back too - otherwise the bound would drift shut
+	// over a machine's uptime instead of open, which is the same defect wearing the other face.
+	let (id, _, _) = b.peek_identified().expect("the queue is not empty");
+	let Ok(mut delivered) = b.recv_identified(id, usize::MAX, abi::MAX_MESSAGE_CAPS) else {
+		panic!("the head is takeable");
+	};
+	assert_eq!(b.in_flight(), 1, "a receive in flight holds its slot");
+	b.commit_delivery(&mut delivered);
+	assert_eq!(b.in_flight(), 0, "a committed delivery gives it back");
+	assert_eq!(b.queued(), limit - 1, "and the message really left");
+	assert_eq!(fill(1), 1, "the freed slot is usable");
+	assert_eq!(fill(1), 0, "and it was exactly one");
+}

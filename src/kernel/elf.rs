@@ -69,6 +69,15 @@ impl Drop for SharedPage {
 
 static SHARED_PAGES: SpinLock<BTreeMap<u64, Vec<Weak<SharedPage>>>> = SpinLock::new(BTreeMap::new());
 
+// One shared page, owning a fresh frame and registered nowhere, so a test can drop it and watch
+// what its `Drop` does with the frame. Not `shared_page()`: that one hashes real image bytes and
+// may hand back an existing page, which is the opposite of what a lifetime test needs.
+#[cfg(test)]
+pub fn shared_page_for_test() -> Arc<SharedPage> {
+	let frame = frame::allocate().expect("a frame for the test's shared page");
+	Arc::new(SharedPage { frame })
+}
+
 #[derive(Clone, Copy)]
 struct LoadedSegment {
 	start: u64,

@@ -614,6 +614,16 @@ qemu_run_x86_64() {
 		# second port on every target is what lets a scenario runner drive a boot over
 		# identical framing, including where the persistent profile does not exist.
 		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-x86_64-test.sock" "disable-legacy=on"
+		# A BRIDGE WITH SOMETHING BEHIND IT, so the PCI walk has a second bus to find. The x86
+		# enumeration followed no bridges and the q35 default topology puts everything on bus 0,
+		# so recursive enumeration could be written and never executed - it is the topology, not
+		# the code, that decided the test passed. `pci-testdev` is inert: nothing in this kernel
+		# binds it, so what it proves is exactly that the walk reached a bus firmware did not
+		# place on the root.
+		qemu_args+=(
+			-device "pcie-pci-bridge,id=liberbr,bus=pcie.0,addr=0x1c"
+			-device "pci-testdev,bus=liberbr,addr=0x1"
+		)
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
 		set +e

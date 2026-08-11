@@ -540,3 +540,42 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
 }
+
+tagged_test!(pci_enumeration_reaches_a_bus_behind_a_bridge, [Drivers, Pci, ArchX86_64], id = "kernel.hardware.pci_enumeration_reaches_a_bus_behind_a_bridge", covers = ["kernel"]);
+fn pci_enumeration_reaches_a_bus_behind_a_bridge() {
+	// A device behind a bridge did not exist - not "was not driven", did not exist: the x86 walk
+	// read bus 0 and stopped, so a PCIe root port or a `pcie-pci-bridge` was an entry with nothing
+	// visible behind it. What the walk finds is what the whole device layer is built on, so the
+	// question is not whether the recursion is written but whether it runs.
+	//
+	// THE TOPOLOGY IS THE TEST. q35's default puts everything on bus 0, which is why this could be
+	// written and never executed; the test configuration adds a `pcie-pci-bridge` with an inert
+	// `pci-testdev` behind it (`src/boot/qemu-run.sh`), so there is a second bus to reach and
+	// nothing in this kernel binds what is on it.
+	let devices = arch::pci::scan();
+	assert!(!devices.is_empty(), "the scan found no PCI devices at all");
+
+	let bridge = devices.iter().find(|d| d.header_type & 0x7F == 0x01).expect("the test topology has a bridge on bus 0");
+	assert_eq!(bridge.bus, 0, "the bridge itself is on the root bus");
+
+	let behind: alloc::vec::Vec<_> = devices.iter().filter(|d| d.bus != 0).collect();
+	assert!(!behind.is_empty(), "the walk stopped at bus 0: {} devices found, and the bridge at {:02x}:{:02x}.{} was not descended into", devices.len(), bridge.bus, bridge.dev, bridge.func);
+
+	// Every bus is visited once, which is what keeps a firmware-written numbering loop from being
+	// an unbounded walk rather than a bounded one.
+	let mut buses: alloc::vec::Vec<u8> = devices.iter().map(|d| d.bus).collect();
+	buses.sort_unstable();
+	let unique = {
+		let mut seen = buses.clone();
+		seen.dedup();
+		seen
+	};
+	for bus in &unique {
+		let functions = devices.iter().filter(|d| d.bus == *bus).count();
+		let slots = devices.iter().filter(|d| d.bus == *bus).map(|d| (d.dev, d.func)).collect::<alloc::vec::Vec<_>>();
+		let mut deduped = slots.clone();
+		deduped.sort_unstable();
+		deduped.dedup();
+		assert_eq!(deduped.len(), functions, "bus {bus} was enumerated more than once");
+	}
+}

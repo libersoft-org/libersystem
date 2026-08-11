@@ -18,7 +18,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::domain::Domain;
 use super::handle::Capability;
@@ -68,11 +68,25 @@ pub struct Message {
 	// refunded when the message is taken (recv) or dropped (channel close). None when
 	// the send was not accounted (internal kernel IPC).
 	queue_charge: Option<(Arc<Domain>, u64)>,
+	// True while this message is OFF the queue but still counted against its depth: a receive that
+	// has taken it and not yet committed the delivery.
+	//
+	// The slot travels with the message exactly as the byte charge above does, and for the same
+	// reason. A receive takes the message before it knows whether it can deliver it, so between the
+	// take and the put-back the queue looks like it has room it does not have - and a sender that
+	// takes that room leaves the endpoint holding more than its limit once the message comes back.
+	// One message deeper per failed copy, and the copy fails when userspace passes a bad buffer,
+	// which makes the depth bound something ring 3 can walk past at will.
+	//
+	// Released by `Channel::commit_delivery` (the delivery happened, the slot is really free) or by
+	// `Channel::return_to_head` (the message is back on the queue, occupying the slot it never gave
+	// up). Every `recv_identified` must reach exactly one of the two; the drop below says so.
+	slot_reserved: bool,
 }
 
 impl Message {
 	pub fn new(bytes: Vec<u8>, caps: Vec<Capability>, badge: u64) -> Self {
-		Self { id: NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed), bytes, caps, badge, queue_charge: None }
+		Self { id: NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed), bytes, caps, badge, queue_charge: None, slot_reserved: false }
 	}
 
 	// Charge this message's byte length to `domain`'s in-transit IPC quota, to be
@@ -112,6 +126,14 @@ pub struct Channel {
 	// The bounded depth of this endpoint's inbox: a send to it reports Full at
 	// this many queued messages.
 	limit: usize,
+	// Messages taken from this inbox by a receive that has not committed its delivery yet. They are
+	// not in the deque and they still occupy their slots, so the depth a send is measured against is
+	// `inbox.len() + in_flight` - see `Message::slot_reserved`.
+	//
+	// ONLY EVER TOUCHED WHILE HOLDING `inbox`, which is what makes "look at the depth, then take a
+	// slot" one indivisible step. The atomic is for interior mutability, not for ordering: an
+	// ordinary `usize` would need a second lock, and a second lock is a second thing to get wrong.
+	in_flight: AtomicUsize,
 	// The peer endpoint, held weakly so the two ends do not form a reference
 	// cycle. Upgrading fails once the peer has been dropped (its handles closed).
 	peer: SpinLock<Option<Weak<Channel>>>,
@@ -127,11 +149,17 @@ impl Channel {
 	// (0 = the default depth; anything else is clamped to the sane band).
 	pub fn create_with_depth(depth: usize) -> (Arc<Channel>, Arc<Channel>) {
 		let limit = if depth == 0 { CHANNEL_QUEUE_DEFAULT } else { depth.clamp(1, CHANNEL_QUEUE_MAX) };
-		let a = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, peer: SpinLock::new(None) });
-		let b = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, peer: SpinLock::new(None) });
+		let a = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None) });
+		let b = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None) });
 		*a.peer.lock() = Some(Arc::downgrade(&b));
 		*b.peer.lock() = Some(Arc::downgrade(&a));
 		(a, b)
+	}
+
+	// This endpoint's depth against its limit: what is queued plus what a receive is holding but has
+	// not delivered. The caller must hold `inbox` - it passes it in to say so.
+	fn depth(&self, inbox: &VecDeque<Message>) -> usize {
+		inbox.len() + self.in_flight.load(Ordering::Relaxed)
 	}
 
 	fn peer(&self) -> Option<Arc<Channel>> {
@@ -156,8 +184,8 @@ impl Channel {
 	pub fn is_writable(&self) -> bool {
 		match self.peer() {
 			Some(peer) => {
-				let len = peer.inbox.lock().len();
-				len < peer.limit
+				let inbox = peer.inbox.lock();
+				peer.depth(&inbox) < peer.limit
 			}
 			None => true,
 		}
@@ -193,7 +221,7 @@ impl Channel {
 		};
 		{
 			let mut inbox = peer.inbox.lock();
-			if inbox.len() >= peer.limit {
+			if peer.depth(&inbox) >= peer.limit {
 				return Err((ChannelError::Full, msg.caps));
 			}
 			// Charge only once space is assured, so a refused message charges nothing.
@@ -209,13 +237,31 @@ impl Channel {
 		Ok(())
 	}
 
+	// This endpoint's queue bound and current depth, for the tests that are about the bound itself.
+	#[cfg(test)]
+	pub fn queue_limit(&self) -> usize {
+		self.limit
+	}
+
+	#[cfg(test)]
+	pub fn queued(&self) -> usize {
+		self.inbox.lock().len()
+	}
+
+	// Slots held by receives that have not committed. Zero once every receive has ended, which is
+	// the invariant that keeps the bound from drifting shut over a machine's uptime.
+	#[cfg(test)]
+	pub fn in_flight(&self) -> usize {
+		self.in_flight.load(Ordering::Relaxed)
+	}
+
 	// Take the next message from this endpoint's inbox. Non-blocking: Empty if
 	// nothing is queued (peer still open), PeerClosed once the peer is gone and
 	// the inbox has drained. Queued messages are always delivered first.
 	pub fn recv(&self) -> Result<Message, ChannelError> {
 		let popped = {
 			let mut inbox = self.inbox.lock();
-			let was_full = inbox.len() >= self.limit;
+			let was_full = self.depth(&inbox) >= self.limit;
 			inbox.pop_front().map(|msg| (msg, was_full))
 		};
 		if let Some((msg, was_full)) = popped {
@@ -289,9 +335,42 @@ impl Channel {
 	// It goes back CHARGED, which is what makes the count honest: the queued-bytes charge is no
 	// longer refunded on the way out of the queue, so a message returned here was never unaccounted
 	// and the domain's `ipc_queue` figure never understated what is outstanding.
-	pub fn return_to_head(&self, message: Message) {
-		self.inbox.lock().push_front(message);
+	pub fn return_to_head(&self, mut message: Message) {
+		{
+			let mut inbox = self.inbox.lock();
+			// Back into the slot it never gave up: the reservation becomes a queued message again,
+			// so the depth is what it was before the receive and never one more.
+			if core::mem::take(&mut message.slot_reserved) {
+				self.in_flight.fetch_sub(1, Ordering::Relaxed);
+			}
+			inbox.push_front(message);
+		}
 		sched::wake_object(self.header.koid());
+	}
+
+	// The delivery happened: release the sender's queued-bytes charge AND the queue slot the message
+	// was holding, and wake a sender that was waiting for the room this frees.
+	//
+	// THE COMMIT POINT, and it is the syscall's rather than this module's - the message is in hand
+	// well before the caller knows whether it can take it. Past here the message cannot go back, so
+	// this is the only place besides `return_to_head` where a receive ends.
+	pub fn commit_delivery(&self, message: &mut Message) {
+		message.release_queue_charge();
+		let freed = {
+			let inbox = self.inbox.lock();
+			if core::mem::take(&mut message.slot_reserved) {
+				let was = self.in_flight.fetch_sub(1, Ordering::Relaxed);
+				// The endpoint was at its limit and is not any more: the peer can send again.
+				inbox.len() + was >= self.limit
+			} else {
+				false
+			}
+		};
+		if freed {
+			if let Some(peer) = self.peer() {
+				sched::wake_object(peer.header.koid());
+			}
+		}
 	}
 
 	pub fn recv_identified(&self, id: u64, bytes_cap: usize, cap_slots: usize) -> Result<Message, RecvRefusal> {
@@ -303,20 +382,19 @@ impl Channel {
 				Some(msg) if msg.id != id => return Err(RecvRefusal::Superseded),
 				Some(msg) if msg.bytes.len() > bytes_cap => return Err(RecvRefusal::TooLarge(msg.bytes.len())),
 				Some(msg) if msg.caps.len() > cap_slots => return Err(RecvRefusal::TooManyCaps(msg.caps.len())),
-				Some(_) => {
-					let was_full = inbox.len() >= self.limit;
-					inbox.pop_front().map(|msg| (msg, was_full))
-				}
+				Some(_) => inbox.pop_front().map(|mut msg| {
+					// The slot goes with it. Nothing is announced as free here: the message can
+					// still come back, and a sender told there is room would be told the truth for
+					// exactly as long as it takes the delivery to fail.
+					self.in_flight.fetch_add(1, Ordering::Relaxed);
+					msg.slot_reserved = true;
+					msg
+				}),
 				None => None,
 			}
 		};
-		if let Some((msg, was_full)) = popped {
+		if let Some(msg) = popped {
 			// As above: the charge travels with the message and is released when delivery commits.
-			if was_full {
-				if let Some(peer) = self.peer() {
-					sched::wake_object(peer.header.koid());
-				}
-			}
 			return Ok(msg);
 		}
 		if self.is_peer_closed() { Err(RecvRefusal::Gone(ChannelError::PeerClosed)) } else { Err(RecvRefusal::Gone(ChannelError::Empty)) }

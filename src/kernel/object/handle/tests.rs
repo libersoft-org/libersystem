@@ -82,3 +82,39 @@ fn no_ambient_authority_fresh_table_empty() {
 		assert!(matches!(table.lookup(handle, Rights::NONE), Err(HandleError::BadHandle)), "an empty table must resolve no handle");
 	}
 }
+
+crate::tagged_test!(a_close_all_racing_a_transfer_never_frees_the_same_slot_twice, [Handle, Object, Kernel], id = "kernel.object.handle.a_close_all_racing_a_transfer_never_frees_the_same_slot_twice", covers = ["kernel"]);
+fn a_close_all_racing_a_transfer_never_frees_the_same_slot_twice() {
+	// A process torn down while one of its handles is mid-transfer.
+	//
+	// `close_all` used to push EVERY index onto the free list, including a slot whose capability
+	// was already taken for transfer and whose `commit_taken` / `restore_taken` had yet to run. The
+	// slot was then on the free list AND about to be written by the transfer's completion, so the
+	// next `insert` handed out an index that something else already owned - two handles, one slot,
+	// each believing it holds a different object.
+	//
+	// The property is exactly "no index appears twice", which is checkable without racing anything:
+	// take a capability for transfer, close the table underneath it, complete the transfer, and
+	// look at the free list.
+	let mut table = HandleTable::new();
+	let keep = table.insert_object(TestObject::new(1), Rights::ALL, 0);
+	let moving = table.insert_object(TestObject::new(2), Rights::ALL, 0);
+	assert!(table.lookup(keep, Rights::NONE).is_ok() && table.lookup(moving, Rights::NONE).is_ok(), "both handles are installed");
+
+	let taken = table.take_for_transfer(moving, Rights::ALL).expect("the capability is taken for transfer");
+	// The owner dies here, with the transfer still in flight.
+	table.close_all();
+	// And the transfer completes afterwards, as its contract requires exactly one of these to.
+	table.commit_taken(moving);
+	drop(taken);
+
+	let mut seen = alloc::vec::Vec::new();
+	for index in table.free_indices_for_test() {
+		assert!(!seen.contains(&index), "slot {index} is on the free list twice: a later insert would hand out one slot as two handles");
+		seen.push(index);
+	}
+	// And the slot really is reusable exactly once.
+	let reused = table.insert_object(TestObject::new(3), Rights::ALL, 0);
+	let again = table.insert_object(TestObject::new(4), Rights::ALL, 0);
+	assert!(reused != again, "two inserts must not answer with the same handle");
+}

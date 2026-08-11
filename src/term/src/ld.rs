@@ -83,10 +83,15 @@ pub struct Ld {
 	// `CSI 259~` wrapped to 3 and executed Delete - a key nobody pressed, from a sequence a
 	// terminal database or a mangled paste can produce.
 	csi_param: u16,
-	// false = raw mode (keystrokes pass through), true = cooked (line-edited). The
-	// program toggles it with ESC[?9001h/l in its output stream.
+	// false = raw mode (keystrokes pass through), true = cooked (line-edited).
+	//
+	// SET OUT OF BAND, over the VT's control channel (`SET_MODE`), by the foreground job holding a
+	// send-only control capability. It used to be `ESC[?9001h/l` in the program's own output, which
+	// made `cat` on a file containing those bytes a way to reconfigure the terminal: on a byte
+	// stream a program's data and a program's request are the same thing, and no filter on the
+	// output can tell them apart.
 	pub cooked: bool,
-	// whether keystrokes are echoed (ESC[?9002h/l).
+	// whether keystrokes are echoed. Set the same way, and for the same reason.
 	pub echo: bool,
 	// set when Ctrl+D ends input on an empty line: feed_key delivers a zero-byte read
 	// (EOF) to the program instead of a line.

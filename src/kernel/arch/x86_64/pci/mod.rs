@@ -33,8 +33,10 @@ fn address(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
 struct Access;
 
 impl common::ConfigAccess for Access {
-	// QEMU q35 exposes the virtio / xHCI endpoints on bus 0; recursive bridge
-	// enumeration is a later refinement.
+	// The ROOT bus, not the only bus. Legacy CF8/CFC has no way to know how many buses exist, so
+	// enumeration starts at 0 and follows every bridge it finds from there - which is how a device
+	// behind a PCIe root port or a `pcie-pci-bridge` is reached. It used to stop here, so anything
+	// not placed directly on bus 0 was never read.
 	const BUS_COUNT: u16 = 1;
 
 	fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
@@ -52,7 +54,7 @@ impl common::ConfigAccess for Access {
 	}
 }
 
-// Enumerate every present function on bus 0.
+// Enumerate every present function reachable from bus 0, following bridges.
 pub fn scan() -> Vec<PciDevice> {
 	common::scan::<Access>()
 }

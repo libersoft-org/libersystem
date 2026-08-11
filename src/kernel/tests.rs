@@ -3934,7 +3934,15 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	}
 	assert!(rendered, "lico renders both panels before waiting for input");
 	assert_eq!(output.get(0).map(Vec::as_slice), Some(b"\x1b[?1049h".as_slice()), "lico enters the alternate screen first");
-	assert_eq!(output.get(4).map(Vec::as_slice), Some(b"\x1b[?1000h".as_slice()), "lico requests pointer press reports");
+	// By CONTENT, not by position. This read message four, which was the mouse request only while
+	// two tty-mode escapes sat in front of it - and those are gone: raw and echo are a request on
+	// the terminal's control channel now, not bytes a file could also contain. A positional
+	// assertion on a byte stream breaks whenever the stream is one message shorter, which says
+	// nothing about what the program asked for.
+	assert!(output.iter().any(|line| line.as_slice() == b"\x1b[?1000h"), "lico requests pointer press reports");
+	// AND THE MODE ESCAPES ARE NOT THERE AT ALL. This is the property the change bought: no output
+	// a program can produce - and therefore no file it can print - sets the tty's modes.
+	assert!(!output.iter().any(|line| line.windows(4).any(|w| w == b"9001" || w == b"9002")), "the tty's modes are not settable from the output stream");
 	let initial: alloc::vec::Vec<u8> = output.iter().flat_map(|line| line.iter().copied()).collect();
 	assert!(initial.windows(b">vol://system".len()).any(|window| window == b">vol://system"), "left panel begins active");
 
@@ -3963,7 +3971,11 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 		}
 	}
 	assert!(process.is_terminated(), "lico exits after F10");
-	let restore = [b"\x1b[?1006l".as_slice(), b"\x1b[?1000l".as_slice(), b"\x1b[?9001l".as_slice(), b"\x1b[?9002h".as_slice(), b"\x1b[?25h".as_slice(), b"\x1b[?1049l".as_slice()];
+	// The tty's raw and echo modes are NOT in this list any more: they are requests on the
+	// terminal's control channel, not escapes in the output stream. What is left is the terminal's
+	// own state - mouse reporting, the cursor, the alternate screen - which a program may set for
+	// its own screen and which no file's contents can misuse.
+	let restore = [b"\x1b[?1006l".as_slice(), b"\x1b[?1000l".as_slice(), b"\x1b[?25h".as_slice(), b"\x1b[?1049l".as_slice()];
 	let mut cursor = 0;
 	for expected in restore {
 		let position = output[cursor..].iter().position(|line| line == expected).expect("lico restores every terminal mode in order");

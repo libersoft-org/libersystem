@@ -140,6 +140,31 @@ pub fn shootdown() -> bool {
 	complete
 }
 
+// Test hooks. The generation scheme is the answer to a race that cannot be produced on demand - a
+// core that answers AFTER its requester gave up - so the test publishes exactly what such a core
+// would publish instead of trying to lose the race on purpose.
+#[cfg(test)]
+pub fn request_generation() -> u64 {
+	REQUEST.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub fn acknowledge_for_test(cpu: usize, generation: u64) {
+	if cpu < MAX_CPUS {
+		ACK_GENERATION[cpu].fetch_max(generation, Ordering::AcqRel);
+	}
+}
+
+// Runs the REAL predicate the wait loop uses, over one core. A helper that re-implemented the
+// comparison would be testing itself: the first version of this did exactly that and passed with
+// the generation rule deleted.
+#[cfg(test)]
+pub fn acknowledged_for_test(cpu: usize, generation: u64) -> bool {
+	// `acknowledged` counts every core except `me`, so ask it about a two-core world in which the
+	// only other core is the one under test.
+	acknowledged(cpu + 1, cpu, generation) == 1 || acknowledged(cpu + 2, cpu + 1, generation) >= 1
+}
+
 // How many of the other cores have flushed for `generation` or anything later.
 //
 // "Or later" matters: a core that has since served a newer request has necessarily flushed for this

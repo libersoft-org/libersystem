@@ -2067,7 +2067,7 @@ fn sys_channel_recv_caps(ch: u64, bytes_ptr: u64, bytes_cap: u64, caps_ptr: u64)
 	// Delivery is committed here: the payload is in the caller's buffer and the message cannot go
 	// back to the queue, so this is where the sender's queued-bytes charge is released. Everything
 	// before this point can still `return_to_head`, and does so with the charge intact.
-	message.release_queue_charge();
+	channel.commit_delivery(&mut message);
 	let delivered = message.bytes.len();
 	let mut raws = [0u64; abi::MAX_MESSAGE_CAPS];
 	let mut installed = 0usize;
@@ -2142,7 +2142,7 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 		}
 	}
 	// Committed, for the same reason as the batch path: past here the message is the caller's.
-	message.release_queue_charge();
+	channel.commit_delivery(&mut message);
 	thread.process().record_recv();
 	// Install the transferred capability (if any) and report its new handle. Against the
 	// reservation taken above: `insert` is the UNBOUNDED install, and using it here is how a

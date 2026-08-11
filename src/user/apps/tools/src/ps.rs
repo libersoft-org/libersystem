@@ -5,7 +5,7 @@
 // the shell's stdout console and the argument string ("" or "-i"). Plain ps lists the
 // processes through its grant and prints each entry to the inherited stdout, then exits.
 // `ps -i` is the live view: the shell hands it the console itself (full duplex),
-// so it flips the tty raw (ESC[?9001h), enters the alternate screen, and redraws a
+// so it asks the tty for raw mode over its control channel, enters the alternate screen, and redraws a
 // process / resource snapshot in place about once a second - querying both grants each
 // frame - until `q` (or Ctrl+C, caught as a pending signal) quits, when it restores the
 // terminal and leaves the alternate screen. A standalone command, not a shell built-in:
@@ -107,6 +107,12 @@ unsafe fn live_view(procsvc: u64, ressvc: u64) {
 		catch_interrupt();
 		let mut output = ConsoleWriter::new(stdout());
 		let options = TerminalOptions { alternate_screen: true, raw_input: true, disable_echo: true, hide_cursor: true, mouse: MouseTracking::Off, bracketed_paste: false };
+		// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED. These were `ESC[?9001h` / `ESC[?9002l`
+		// in this program's own OUTPUT, where a program's data and its requests are the same bytes -
+		// so `cat` on a file holding them reconfigured the terminal. `tty_set_mode` goes over the
+		// control channel the shell hands to an interactive foreground job; false means there is no
+		// terminal to ask, and the program runs cooked rather than failing.
+		let owns_tty: bool = unsafe { tty_set_mode(true, false) };
 		let Some(_terminal) = TerminalGuard::enter(&mut output, options) else {
 			query_processes(procsvc, None);
 			return;

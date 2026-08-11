@@ -316,3 +316,104 @@ fn no_frame_is_ever_handed_to_two_owners_at_once() {
 	// freeing it twice is a different defect that `check_owned_free` refuses.
 	unsafe { super::deallocate(first) };
 }
+
+crate::tagged_test!(a_late_acknowledgement_does_not_count_for_the_next_request, [Frame, Memory, Smp], id = "kernel.mem.frame.a_late_acknowledgement_does_not_count_for_the_next_request", covers = ["kernel"]);
+fn a_late_acknowledgement_does_not_count_for_the_next_request() {
+	// The generation scheme's whole reason for existing, exercised rather than argued.
+	//
+	// It used to be a flag per core and one counter of acknowledgements, which cannot say WHICH
+	// request an acknowledgement belongs to. A requester that times out releases the lock while a
+	// slow core is still between its flush and its increment; the next requester zeroes the counter,
+	// the stale increment lands in the NEW count, and with three or more cores the rest can reach
+	// the target while one core never flushed for this request. The frame then goes back to the
+	// allocator with a live translation to it - the physical use-after-free the mechanism exists to
+	// prevent, reached by giving up on it.
+	//
+	// The late acknowledgement is injected rather than raced for: `acknowledge_for_test` publishes
+	// exactly what a core coming back from a stale request would publish - an ack for a generation
+	// that is already over.
+	let me = crate::arch::percpu::this_cpu().cpu_id() as usize;
+	let other = if me == 0 { 1 } else { 0 };
+	if crate::smp::cpu_count() < 2 {
+		return;
+	}
+	// A NONZERO generation, and one this machine has actually issued: on a quiet kernel the counter
+	// can still be 0, and every comparison against 0 is trivially true - which is how the first
+	// version of this test passed with the rule deleted.
+	crate::mem::tlb::shootdown();
+	let stale = crate::mem::tlb::request_generation();
+	assert!(stale > 0, "the machine has issued a shootdown, so generations are running");
+	// A core answering the request BEFORE the one about to be made.
+	crate::mem::tlb::acknowledge_for_test(other, stale);
+	// The next request must not be able to count that, whatever the number of cores that answer.
+	assert!(!crate::mem::tlb::acknowledged_for_test(other, stale + 1), "an acknowledgement for an older generation must not satisfy a newer request");
+	// And an acknowledgement for a LATER generation does satisfy an earlier one, because a flush is
+	// whole-buffer: a core that has served a newer request has necessarily flushed for this one.
+	crate::mem::tlb::acknowledge_for_test(other, stale + 2);
+	assert!(crate::mem::tlb::acknowledged_for_test(other, stale + 1), "a later flush covers an earlier request");
+}
+
+crate::tagged_test!(a_shared_page_goes_through_the_quarantine_rather_than_the_allocator, [Frame, Memory], id = "kernel.mem.frame.a_shared_page_goes_through_the_quarantine_rather_than_the_allocator", covers = ["kernel"]);
+fn a_shared_page_goes_through_the_quarantine_rather_than_the_allocator() {
+	// A shared ELF page was the ONE frame in this system that went straight back to the allocator
+	// when it was dropped - `SharedPage::drop` called `deallocate` while every private frame
+	// retired. It is reachable through `load_module_into`, which maps into a RUNNING process whose
+	// other threads are on other cores, and x86's `unmap_page_in` does a local `invlpg` only: a
+	// relocation failure in a module loaded into a live process could free a frame a running thread
+	// still reached.
+	//
+	// What this asserts is the DIFFERENCE that fix made: dropping the last reference must leave the
+	// frame in the quarantine (or already drained through a completed shootdown), never back in the
+	// allocator without one.
+	use crate::elf::shared_page_for_test;
+	let before_free = crate::mem::frame::free_count();
+	let page = shared_page_for_test();
+	let frame = page.frame();
+	assert!(frame != 0, "a shared page owns a frame");
+	// Drain first, so what the drop puts there is the only thing measured.
+	assert!(crate::mem::frame::drain_quarantine_fully(64), "the shootdown completes on a quiet machine");
+	let quarantined_before = crate::mem::frame::quarantined();
+	drop(page);
+	let quarantined_after = crate::mem::frame::quarantined();
+	// Either it is sitting in the quarantine, or a drain already ran and gave it back - both are
+	// "it went through the shootdown". What must never happen is the count going back up with
+	// nothing having been queued.
+	// QUEUED, full stop. The first version of this accepted "or the count came back up", which is
+	// exactly what `deallocate` does - so it passed with the defect reintroduced and said nothing.
+	// One frame cannot reach the drain threshold, so the queue must be one longer than it was.
+	assert_eq!(quarantined_after, quarantined_before + 1, "a dropped shared page must go through the quarantine, not straight back to the allocator");
+	assert!(crate::mem::frame::drain_quarantine_fully(64), "and the drain completes");
+	assert!(crate::mem::frame::free_count() >= before_free, "after the drain the frame is back");
+}
+
+crate::tagged_test!(a_spawn_that_passes_a_bootstrap_returns_the_slot_and_the_quota, [Frame, Memory, Process, Handle], id = "kernel.mem.frame.a_spawn_that_passes_a_bootstrap_returns_the_slot_and_the_quota", covers = ["kernel"]);
+fn a_spawn_that_passes_a_bootstrap_returns_the_slot_and_the_quota() {
+	// `sys_thread_create` took a bootstrap capability with `take_for_transfer`, whose contract is
+	// "exactly one of `commit_taken` or `restore_taken` must follow", and the SUCCESS path did
+	// neither. `commit_taken` returns the slot to the free list under the generation rules and
+	// uncharges one handle, so every successful spawn that passed a bootstrap leaked one slot and
+	// one unit of the parent's quota - on the ordinary path of the ordinary syscall. A supervisor
+	// that spawns in a loop walks its own quota down until it cannot spawn.
+	//
+	// A loop, because one leak is a number nobody notices and a hundred is a wall. The domain's
+	// accounting is the whole assertion: what goes up must come back down.
+	use crate::object::channel::Channel;
+	use crate::object::rights::Rights;
+	use crate::sched;
+
+	let domain = sched::root_domain();
+	let before = domain.account().handles().used();
+	for _ in 0..32 {
+		let (parent, child) = Channel::create();
+		let process = crate::object::process::Process::new(crate::object::address_space::AddressSpace::create().expect("an address space"), domain.clone());
+		let handle = process.install(child, Rights::ALL, 0);
+		assert!(handle != 0, "the bootstrap is installed in the child");
+		process.terminate();
+		drop(process);
+		drop(parent);
+		sched::run_until_idle();
+	}
+	sched::run_until_idle();
+	let after = domain.account().handles().used();
+	assert!(after <= before, "thirty-two spawns left {} handle(s) charged that nothing owns", after as i64 - before as i64);
+}

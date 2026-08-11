@@ -20,8 +20,6 @@ use storage_proto::path;
 use volume_client::VolumeClient;
 
 const USAGE: &[u8] = b"Usage: imgview <image>\nDisplays a still image or composited animation frame 0; animation playback is not supported.\nControls: +/= zoom in, - zoom out, hold arrows to pan, Esc/q quit.\n";
-const TTY_RAW_ON: &[u8] = b"\x1b[?9001h";
-const TTY_RAW_OFF: &[u8] = b"\x1b[?9001l";
 const ZOOM_MIN: u32 = 100;
 const ZOOM_MAX: u32 = 800;
 const ZOOM_STEP: u32 = 5;
@@ -420,9 +418,12 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 			return;
 		};
 		let stdin_channel = stdin();
-		if stdin_channel != 0 {
-			print(TTY_RAW_ON);
-		}
+		// THE TTY'S MODE, ASKED FOR RATHER THAN PRINTED. This was `ESC[?9001h` in this program's own
+		// OUTPUT, where a program's data and its requests are the same bytes - so `cat` on a file
+		// holding them reconfigured the terminal. `tty_set_mode` goes over the control channel the
+		// shell hands to an interactive foreground job; false means there is no terminal to ask, and
+		// the keys still arrive from the surface either way.
+		let owns_tty: bool = stdin_channel != 0 && unsafe { tty_set_mode(true, true) };
 		let mut key_frame: [u8; 32] = [0; 32];
 		let mut stdin_frame: [u8; 32] = [0; 32];
 		let mut held: u8 = 0;
@@ -519,7 +520,10 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 		}
 		close(key_stream);
 		if stdin_channel != 0 {
-			print(TTY_RAW_OFF);
+			// Back to line-edited input, through the same request path.
+			if owns_tty {
+				unsafe { tty_set_mode(false, true) };
+			}
 			set_stdin(0);
 		}
 		let _ = surface::release(&display);

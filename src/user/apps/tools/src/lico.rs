@@ -127,8 +127,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			catch_interrupt();
 			let mut output = ConsoleWriter::new(stdout());
 			let options = TerminalOptions { alternate_screen: true, raw_input: true, disable_echo: true, hide_cursor: true, mouse: MouseTracking::Press, bracketed_paste: false };
+			// THE TTY'S MODES, ASKED FOR RATHER THAN PRINTED. These were `ESC[?9001h` / `ESC[?9002l`
+			// in this program's own OUTPUT, where a program's data and its requests are the same bytes -
+			// so `cat` on a file holding them reconfigured the terminal. `tty_set_mode` goes over the
+			// control channel the shell hands to an interactive foreground job; false means there is no
+			// terminal to ask, and the program runs cooked rather than failing.
+			let owns_tty: bool = unsafe { tty_set_mode(true, false) };
 			if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
 				let _ = manage(terminal.writer(), &volumes, initial);
+			}
+			// And back to cooked input and echo, through the same request path.
+			if owns_tty {
+				unsafe { tty_set_mode(false, true) };
 			}
 		}
 	}

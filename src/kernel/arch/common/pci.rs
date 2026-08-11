@@ -205,31 +205,79 @@ fn read_function<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> PciDevice {
 	PciDevice { bus, dev, func, vendor: A::read16(bus, dev, func, 0x00), device_id: A::read16(bus, dev, func, 0x02), class: A::read8(bus, dev, func, 0x0b), subclass: A::read8(bus, dev, func, 0x0a), prog_if: A::read8(bus, dev, func, 0x09), header_type: A::read8(bus, dev, func, 0x0e), bars }
 }
 
-// Enumerate every present function across the backend's buses. Multi-function
-// devices (header-type bit 7) have all eight functions probed; absent slots
-// (vendor 0xFFFF) are skipped.
+// A PCI-to-PCI bridge's header type (bits 0-6 of the header-type byte), and the config offset of
+// its secondary bus number - the bus its downstream side is numbered as.
+const HEADER_TYPE_BRIDGE: u8 = 0x01;
+const BRIDGE_SECONDARY_BUS: u16 = 0x19;
+const BRIDGE_SUBORDINATE_BUS: u16 = 0x1a;
+
+// Enumerate every present function reachable from the backend's root buses, FOLLOWING BRIDGES.
+// Multi-function devices (header-type bit 7) have all eight functions probed; absent slots (vendor
+// 0xFFFF) are skipped.
+//
+// A flat loop over `BUS_COUNT` finds only what firmware happened to put on a root bus, so on x86
+// (`BUS_COUNT = 1`) anything behind a PCIe root port or a bridge did not exist - not "was not
+// driven", did not exist: it was never read. Every backend gets the walk, because a bus number is
+// only meaningful relative to the bridge that forwards it; a linear sweep of 256 buses happens to
+// find the same devices on ECAM, and happens to is not a rule.
+//
+// BOUNDED THREE WAYS, because bridge numbering comes from firmware and firmware is an input here.
+// A bus is visited at most once (`seen`), a bridge never descends to a bus at or below its own
+// (which is what a cycle would have to do), and the recursion carries an explicit depth limit -
+// deeper than any real topology and shallower than the kernel stack.
 pub fn scan<A: ConfigAccess>() -> Vec<PciDevice> {
 	let mut out: Vec<PciDevice> = Vec::new();
 	if !A::ready() {
 		return out;
 	}
+	let mut seen = [false; 256];
 	for bus in 0..A::BUS_COUNT {
-		let bus = bus as u8;
-		for dev in 0..32u8 {
-			if A::read16(bus, dev, 0, 0x00) == 0xFFFF {
+		scan_bus::<A>(bus as u8, &mut seen, &mut out, 0);
+	}
+	out
+}
+
+// The deepest chain of bridges this will follow. The PCI specification allows 256 buses in total,
+// so a chain that long is a numbering fault rather than a topology; the limit is here so a
+// malformed one costs a bounded number of frames instead of the kernel stack.
+const MAX_BRIDGE_DEPTH: u8 = 8;
+
+fn scan_bus<A: ConfigAccess>(bus: u8, seen: &mut [bool; 256], out: &mut Vec<PciDevice>, depth: u8) {
+	if seen[bus as usize] {
+		return;
+	}
+	seen[bus as usize] = true;
+	for dev in 0..32u8 {
+		if A::read16(bus, dev, 0, 0x00) == 0xFFFF {
+			continue;
+		}
+		let multifunction = A::read8(bus, dev, 0, 0x0e) & 0x80 != 0;
+		let func_count: u8 = if multifunction { 8 } else { 1 };
+		for func in 0..func_count {
+			if A::read16(bus, dev, func, 0x00) == 0xFFFF {
 				continue;
 			}
-			let multifunction = A::read8(bus, dev, 0, 0x0e) & 0x80 != 0;
-			let func_count: u8 = if multifunction { 8 } else { 1 };
-			for func in 0..func_count {
-				if A::read16(bus, dev, func, 0x00) == 0xFFFF {
-					continue;
-				}
-				out.push(read_function::<A>(bus, dev, func));
+			let function = read_function::<A>(bus, dev, func);
+			let is_bridge = function.header_type & 0x7F == HEADER_TYPE_BRIDGE;
+			out.push(function);
+			if !is_bridge || depth >= MAX_BRIDGE_DEPTH {
+				continue;
+			}
+			// Down the bridge, over the range it says it forwards. `secondary` is the bus
+			// immediately behind it and `subordinate` the highest bus below that, so a bridge whose
+			// downstream side is unconfigured (both zero, or subordinate below secondary) forwards
+			// nothing and is not descended into - rather than being read as "bus 0", which is the
+			// bus the walk started on.
+			let secondary = A::read8(bus, dev, func, BRIDGE_SECONDARY_BUS);
+			let subordinate = A::read8(bus, dev, func, BRIDGE_SUBORDINATE_BUS);
+			if secondary <= bus || subordinate < secondary {
+				continue;
+			}
+			for behind in secondary..=subordinate {
+				scan_bus::<A>(behind, seen, out, depth + 1);
 			}
 		}
 	}
-	out
 }
 
 // The human name of a virtio device type, for the boot log.

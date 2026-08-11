@@ -136,10 +136,6 @@ pub struct Screen {
 	osc_len: usize,
 	// Whether the control string in progress ran past the buffer - see `osc_byte`.
 	osc_overflow: bool,
-	// Pending tty mode changes requested by the program via ESC[?9001h/l (raw) and
-	// ESC[?9002h/l (echo); drained by the service into this VT's line discipline.
-	tty_raw_req: Option<bool>,
-	tty_echo_req: Option<bool>,
 	// Mouse tracking the foreground program enabled (DEC private modes): 0 off, 1 normal
 	// (?1000, button press/release), 2 button-event (?1002, + drag), 3 any-event (?1003, +
 	// motion). The console reads this to decide whether to deliver pointer events to the
@@ -225,7 +221,7 @@ impl Screen {
 		let row_bytes = cols * core::mem::size_of::<Cell>();
 		let scrollback = scrollback.min(MAX_SCROLLBACK_BYTES / row_bytes.max(1));
 		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, osc_overflow: false, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_press: false, mouse_button: false, mouse_any: false, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, reply: Vec::new(), selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], pending_wrap: false, wrap: alloc::vec![false; rows], alt_wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
+		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, osc_overflow: false, mouse_mode: 0, mouse_press: false, mouse_button: false, mouse_any: false, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, reply: Vec::new(), selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], pending_wrap: false, wrap: alloc::vec![false; rows], alt_wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
 	}
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
@@ -364,19 +360,6 @@ impl Screen {
 		self.scrolls.push(op);
 	}
 
-	// Drain a pending tty raw / echo mode change requested by the program (ESC[?9001/9002
-	// h/l); the service applies it to this VT's line discipline.
-	pub fn take_tty_raw_req(&mut self) -> Option<bool> {
-		self.tty_raw_req.take()
-	}
-
-	pub fn take_tty_echo_req(&mut self) -> Option<bool> {
-		self.tty_echo_req.take()
-	}
-
-	// Whether the foreground program enabled mouse tracking (DEC ?1000/?1002/?1003), and
-	// at what granularity - the console reads these to decide whether to deliver pointer
-	// events to the program as mouse reports or drive its own selection / scrollback.
 	pub fn mouse_tracking(&self) -> bool {
 		self.mouse_mode != 0
 	}
@@ -1461,8 +1444,12 @@ impl Screen {
 						self.restore_cursor();
 					}
 				}
-				9001 => self.tty_raw_req = Some(enable),
-				9002 => self.tty_echo_req = Some(enable),
+				// 9001 / 9002 ARE GONE. They set the tty's raw and echo modes from the OUTPUT
+				// stream, so `cat` on a file containing them reconfigured the terminal - a
+				// program's data and a program's request were the same bytes. Mode control is a
+				// request on the terminal's control channel now (`rt::tty_set_mode`), which only
+				// an interactive foreground job is given, and there is deliberately no second path
+				// to the same state.
 				// Disabling a HIGHER tracking mode falls back to whatever lower one is still on
 				// rather than turning tracking off: `?1002l` cancelled a `?1000` that the program
 				// never disabled and still believes it has.

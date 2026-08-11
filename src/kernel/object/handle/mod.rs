@@ -511,6 +511,13 @@ impl HandleTable {
 	// handles (and the memory those objects pinned) are released eagerly, without
 	// the cooperation of its threads. After this the table is empty, so the Drop
 	// refund finds nothing left to return - the two paths never double-count.
+	// The free list, for a test that has to look at it. The invariant it checks - no index twice -
+	// is not observable through the ordinary API until the damage has already been handed out.
+	#[cfg(test)]
+	pub fn free_indices_for_test(&self) -> alloc::vec::Vec<u32> {
+		self.free.clone()
+	}
+
 	pub fn close_all(&mut self) {
 		let mut closed: u64 = 0;
 		self.free.clear();

@@ -1256,7 +1256,7 @@ fn ps_live_view_drives_the_terminal_contract() {
 
 	// `ps -i`: the live process/resource view runs full-screen on its controlling
 	// terminal - it must enter the alternate screen, hide the cursor and flip the tty
-	// raw (the ESC[?1049h / ?25l / ?9001h private modes ConsoleService's terminal
+	// raw (the ESC[?1049h / ?25l private modes ConsoleService's terminal
 	// honours), redraw a snapshot in place, quit on a raw `q` keystroke, and restore
 	// every mode on the way out. Here we stand in for the terminal and both granted
 	// services: the service channels answer garbage (so each query degrades to its
@@ -1294,10 +1294,14 @@ fn ps_live_view_drives_the_terminal_contract() {
 		captured.extend_from_slice(&msg.bytes);
 	}
 	let contains = |needle: &[u8]| captured.windows(needle.len()).any(|w| w == needle);
-	assert!(contains(b"\x1b[?1049h\x1b[?25l\x1b[?9001h"), "the live view should enter the alternate screen, hide the cursor and flip the tty raw");
+	// The alternate screen and the cursor are STILL escapes - they are the terminal's own state and
+	// a program printing them affects only its own screen. The tty's raw and echo modes are not
+	// here any more: those went out over the control channel, because a program's data and a
+	// program's request were the same bytes and `cat` on the wrong file reconfigured the terminal.
+	assert!(contains(b"\x1b[?1049h\x1b[?25l"), "the live view should enter the alternate screen and hide the cursor");
 	assert!(contains(b"live process / resource view"), "the live view should render its header");
 	assert!(contains(b"unavailable"), "the degraded queries should render their unavailable rows");
-	assert!(contains(b"\x1b[?9001l") && contains(b"\x1b[?1049l"), "quitting on q should restore the tty and leave the alternate screen");
+	assert!(contains(b"\x1b[?1049l"), "quitting on q should leave the alternate screen");
 }
 
 tagged_test!(storage_serves_volume_file_to_client, [Service, Storage], id = "kernel.services.storage_serves_volume_file_to_client", covers = ["kernel", "liberfs", "storage"]);
