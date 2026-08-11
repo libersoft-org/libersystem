@@ -22,6 +22,10 @@ pub mod interp;
 pub mod module;
 pub mod parser;
 
+// The host side of the `liber:vfs@1` / `liber:log@1` world: which imports a component may have, and
+// how its `(ptr, len)` becomes a slice of its own memory.
+pub mod world;
+
 pub use interp::{Host, Instance, Trap, Value};
 pub use module::{Module, ValType};
 pub use parser::{ParseError, parse};

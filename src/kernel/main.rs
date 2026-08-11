@@ -299,6 +299,15 @@ fn module_bytes(name: &str) -> Option<&'static [u8]> {
 	for m in modules {
 		let end = m.name.iter().position(|&b| b == 0).unwrap_or(m.name.len());
 		if &m.name[..end] == name.as_bytes() {
+			// A MODULE WITH NO BYTES IS NOT A MODULE. A named entry of length zero is a slot that
+			// was filled in because the array had room, not something that was handed over - and
+			// every caller here treats `Some` as "this arrived". The live-volume lookup below is
+			// the one that showed it: an empty `system-volume.img` entry sent the storage bootstrap
+			// down the LIVEVOL path with nothing to mount, and the boot chain stopped after seven
+			// of its twenty-three services.
+			if m.size == 0 {
+				return None;
+			}
 			return Some(unsafe { core::slice::from_raw_parts(m.addr as *const u8, m.size as usize) });
 		}
 	}

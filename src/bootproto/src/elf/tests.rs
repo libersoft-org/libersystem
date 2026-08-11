@@ -351,7 +351,16 @@ fn a_malformed_pt_load_is_refused_by_the_parser_rather_than_by_each_loader() {
 		ph.p_filesz = 1 << 20;
 		ph.p_memsz = 1 << 20;
 	});
-	refused("a segment that is both writable and executable", &|ph| ph.p_flags = PF_R | PF_W | PF_X);
+	// NOT refused here, and the reason is worth keeping: this parser reads THIS PROJECT'S OWN
+	// kernels, and the aarch64 and riscv64 images link their boot stub - MMU off, then on - as a
+	// single `RWE` segment. Demanding W^X at parse refused both of them outright, before anything
+	// was loaded, on a claim ("the kernel does not have such a segment") that had only been
+	// measured on x86_64. W^X is a policy about what may be MAPPED: the kernel's userspace loader
+	// enforces it for every program it loads, and the x86_64 loader asserts it for the kernel
+	// image, whose mapper derives WRITABLE and NX independently.
+	let mut wx = ok;
+	wx.p_flags = PF_R | PF_W | PF_X;
+	assert!(Elf::parse(&image(ET_EXEC, &[wx], &payload)).is_some(), "a writable-executable segment is a mapping policy question, not a malformed image");
 	refused("a load address whose page offset does not match the file offset", &|ph| ph.p_vaddr = 0x1008);
 	refused("an alignment that is not a power of two", &|ph| ph.p_align = 3000);
 }

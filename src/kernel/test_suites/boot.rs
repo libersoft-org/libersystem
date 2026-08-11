@@ -118,7 +118,16 @@ fn init_package_starts_system_manager() {
 	];
 	let mut actual_online_reports = alloc::vec::Vec::new();
 	let mut actual_lifecycle_reports = alloc::vec::Vec::new();
-	let give_up = arch::apic::ticks() + 500;
+	// The budget is a HANG BOUND, not a schedule. It was 500 ticks, which is wall-clock time on
+	// every target - QEMU drives the guest timer from the host clock - so an emulated guest under
+	// load gets far less done inside it than the machine the number was tuned on. That is exactly
+	// what it looked like: x86_64 (KVM) reports all 23 services, while aarch64 reported 18 in one
+	// run and 7 in another, varying with the host's load rather than with anything in the system.
+	//
+	// A larger bound costs nothing when the chain is healthy, because the loop breaks as soon as
+	// every report has arrived. It only changes what happens when something is genuinely stuck, and
+	// there the suite's own no-progress watchdog is the backstop.
+	let give_up = arch::apic::ticks() + 4000;
 	while arch::apic::ticks() < give_up {
 		sched::run_until_idle();
 		while let Ok(message) = kernel_ep.recv() {

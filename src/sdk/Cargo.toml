@@ -1,21 +1,31 @@
 [package]
-name = "liber_component"
-# The product version lives only in /product.conf; Cargo's optional package
-# version is unused here and omitted. This crate is the LiberSystem component SDK
-# example: a guest built for wasm32-unknown-unknown against the `liber` world and
-# run on the kernel's WASI host (see src/user/services/core/src/component_host.rs).
+name = "liber-sdk"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted.
 edition = "2024"
-description = "LiberSystem component SDK: a Rust guest built against the liber world"
+description = "LiberSystem component SDK: the liber:vfs@1 / liber:log@1 world, for Rust guests"
 
-[lib]
-# A cdylib so the toolchain emits a WebAssembly module (imports + exports), not a
-# host archive. The build recipe (`just sdk`) compiles it for wasm32-unknown-unknown
-# and the package builder stages it directly from the repository build root.
-crate-type = ["cdylib"]
+# THE SDK IS THE LIBRARY, and the example is a member beside it.
+#
+# This was one `cdylib` holding the world bindings, the demo's buffer, the transform and both
+# exports - which is a demo, not an SDK. "SDK" describes an artifact somebody else can depend on,
+# and nobody can depend on a `cdylib` whose `lib.rs` is also the example. The split is also what
+# makes the SDK's own logic testable at all: a `cdylib` carrying a `#[panic_handler]` cannot be a
+# test target, so `src/sdk` had no tests and its whole coverage was one kernel end-to-end path.
+[workspace]
+members = ["examples/liber_component"]
+
+[features]
+# Panic diagnostics for DEVELOPMENT. Off by default, because a shipping sandbox should say nothing:
+# the guest has no unwinder and the host surfaces the trap either way. On, the panic handler writes
+# the file, line, column and message through the granted log before trapping - the difference
+# between an SDK somebody can use and one where every guest bug looks identical.
+dev-diagnostics = []
 
 [profile.release]
-# wasm32-unknown-unknown is not abort-by-default, so the component opts into abort
-# (no unwinder in a wasm guest) and is size-optimized into one small module.
+# wasm32-unknown-unknown is not abort-by-default, so the component opts into abort (no unwinder in a
+# wasm guest) and is size-optimized into one small module. Profiles are workspace-wide by
+# definition, so this covers the example too.
 panic = "abort"
 opt-level = "s"
 lto = true

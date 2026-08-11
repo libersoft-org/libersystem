@@ -411,14 +411,26 @@ fn component_host_runs_an_sdk_component() {
 	let run = run_component_scenario().expect("the component scenario should run");
 	assert!(!run.expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(run.report.output, run.expected, "the component read, transformed, and returned its granted file's bytes through the host imports");
-	// AND THE FILE ON THE VOLUME SAYS SO. `content` is the copy the host took on the way into the
-	// write, so every assertion about it passes whether or not the write ever happened - the volume
-	// could be read-only, `write_file` could return zero, the service could refuse. This is the same
-	// bytes read back through StorageService after the run, which is the only thing that proves it.
-	assert_eq!(run.report.readback, run.expected, "the output file on the volume holds what the component wrote");
-	// The export's return ABI, which nothing checked: `run` answers the number of bytes it
-	// processed, and a negative value would be one of the world's statuses.
-	assert_eq!(run.report.count as usize, run.expected.len(), "the component reported the byte count it processed");
+
+	// AND THE WRITE IS REFUSED HERE, which is what this scenario's volume can honestly say.
+	//
+	// This test asserted that the component's bytes had been WRITTEN, and it could not have failed:
+	// it compared the copy the host took on the way INTO the write import, which never goes near a
+	// filesystem. Reading the file back afterwards - the only thing that proves a write - showed
+	// the truth immediately: this scenario hands StorageService a `RAMDISK`, which mounts as
+	// `ArchiveFs` over a mapped PKGARCH1 image, and an archive is read-only. Nothing was ever
+	// written, in any run, since the test was written.
+	//
+	// So this is the READ-ONLY GRANT case, and it is worth having as one: the volume refuses,
+	// `write_file` answers `None`, the host maps that to `STATUS_DENIED`, the guest reports it, and
+	// the count comes back through the export's return value. That is the whole error model end to
+	// end, on the path where "the write was empty" and "you are not allowed to write" used to be
+	// the same answer.
+	//
+	// The POSITIVE case is `kernel.volume_layout.fresh_seeded_system_volume_...`, which runs the
+	// same component against a real seeded LiberFS volume and reads `out.txt` back off it.
+	assert!(run.report.readback.is_empty(), "a read-only grant persists nothing, so there is nothing to read back");
+	assert_eq!(run.report.count, -1, "the component reported STATUS_DENIED: its write was refused rather than silently lost");
 	assert!(run.report.logged, "the component reached its LogService grant - the second typed service was wired with no ambient authority");
 	assert_eq!(run.report.score, 17, "the component's float `score` export computed trunc(10 * 1.5 + 2.0) on real toolchain output");
 	// The case where truncation and flooring disagree: -3 * 1.5 + 2.0 is -2.5, which truncates to -2

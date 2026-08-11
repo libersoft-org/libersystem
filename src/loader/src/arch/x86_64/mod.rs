@@ -229,14 +229,26 @@ fn load_kernel(bs: *mut BootServices, kernel: &[u8], out: &mut [KernelSegment; M
 	// placed at its link addresses and jumped to unrelocated. Refused by name until a PIE kernel is
 	// wanted, which is a change here rather than to the parser.
 	assert!(image.image_type == crate::elf::ET_EXEC, "loader: the kernel image must be ET_EXEC");
-	// AND PAGE-ALIGNED LOAD ADDRESSES. This backend allocates from `p_memsz`, copies to the
-	// segment's own address and maps from `align_down(..)`, all of which are wrong by the page
-	// offset if a LOAD segment does not start on a page. The ELF format does not require it - it
-	// requires `p_vaddr = p_offset (mod p_align)`, which the parser checks for every image - so the
-	// stricter rule belongs to the kernel image, here, beside the code that depends on it.
+	// AND PAGE-ALIGNED, W^X LOAD SEGMENTS. Both are rules about THIS backend rather than about the
+	// format, which is why they are here and not in the parser.
+	//
+	// Alignment: this backend allocates from `p_memsz`, copies to the segment's own address and
+	// maps from `align_down(..)`, all of which are wrong by the page offset if a LOAD segment does
+	// not start on a page. ELF only requires `p_vaddr = p_offset (mod p_align)`, which the parser
+	// checks for every image.
+	//
+	// W^X: `map_kernel_segment` derives `WRITABLE` and `NX` from the flags independently, so a
+	// writable-and-executable segment would be mapped read-write-execute under a comment claiming
+	// W^X. The x86_64 kernel has no such segment - unlike the aarch64 and riscv64 kernels, whose
+	// boot stubs are one `RWE` segment by construction, which is why this assertion cannot live in
+	// the shared parser.
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
-		assert!(ph.p_type != crate::elf::PT_LOAD || ph.p_vaddr % PAGE_SIZE == 0, "loader: a kernel LOAD segment is not page-aligned");
+		if ph.p_type != crate::elf::PT_LOAD {
+			continue;
+		}
+		assert!(ph.p_vaddr % PAGE_SIZE == 0, "loader: a kernel LOAD segment is not page-aligned");
+		assert!(ph.p_flags & crate::elf::PF_W == 0 || ph.p_flags & crate::elf::PF_X == 0, "loader: a kernel LOAD segment is both writable and executable");
 	}
 	let mut count = 0usize;
 	for i in 0..image.segment_count() {

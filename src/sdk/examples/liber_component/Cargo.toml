@@ -1,0 +1,17 @@
+[package]
+name = "liber_component"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted. This crate is the SDK's EXAMPLE: a guest built for wasm32-unknown-unknown against the
+# `liber:vfs@1` / `liber:log@1` world and run on the kernel's component host (see
+# src/user/services/core/src/component_host.rs).
+edition = "2024"
+description = "LiberSystem component SDK example: a Rust guest built against the liber world"
+
+[lib]
+# A cdylib so the toolchain emits a WebAssembly module (imports + exports), not a host archive. The
+# build recipe compiles it for wasm32-unknown-unknown and the package builder stages it directly
+# from the repository build root.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+liber-sdk = { path = "../.." }

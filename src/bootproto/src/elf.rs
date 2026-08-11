@@ -292,12 +292,17 @@ impl<'a> Elf<'a> {
 			if ph.p_filesz > 0 && image.segment_data(&ph).is_none() {
 				return None;
 			}
-			// A segment that is both writable and executable. `map_kernel_segment` derives
-			// `WRITABLE` and `NX` from the flags independently, so this mapped read-write-execute
-			// under a comment claiming W^X. The kernel does not have such a segment.
-			if ph.p_flags & PF_W != 0 && ph.p_flags & PF_X != 0 {
-				return None;
-			}
+			// NOT W^X HERE. It was, and it refused two of this project's own kernels: the aarch64
+			// and riscv64 images link their boot stub - the code that runs with the MMU off and
+			// then turns it on - as a single `RWE` segment, so the loader panicked at `parse` on
+			// both architectures before it had loaded anything. The claim that "the kernel does not
+			// have such a segment" was measured on x86_64 alone.
+			//
+			// W^X is a policy about what may be MAPPED, not a property of a well-formed ELF, so it
+			// belongs where the mapping happens and where the image's provenance is known: the
+			// kernel's userspace loader refuses it for every program it loads (`elf.rs`), and the
+			// x86_64 loader asserts it for the kernel image, whose mapper derives `WRITABLE` and
+			// `NX` from the flags independently.
 			// THE ELF CONGRUENCE, which is what the format actually requires: a loadable segment
 			// must satisfy `p_vaddr = p_offset (mod p_align)`, so a single file mapping places the
 			// bytes at the right offset within their page.

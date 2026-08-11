@@ -145,7 +145,11 @@ abi = { path = "../../../abi" }
 # serialization that ConsoleService renders to the framebuffer.
 term = { path = "../../../term" }
 
-# The minimal WebAssembly runtime, used by the wasi_host component runner.
+# The minimal WebAssembly runtime, used by the wasi_host component runner - and `wasm::world`, the
+# host side of the component world (which imports are granted, and how a guest's `(ptr, len)`
+# becomes a slice of its own memory). That lives there rather than here because this binary is
+# built for `*-unknown-none` and cannot be tested on the host, and those two decisions are exactly
+# the ones worth testing.
 wasm = { path = "../../../wasm" }
 
 # Shared pixel vocabulary and direct/scaled blitters. Kept as a separate crate so

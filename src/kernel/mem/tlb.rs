@@ -68,7 +68,19 @@ pub fn shootdown() -> bool {
 	}
 	// One at a time. A second requester waits for the first rather than sharing its
 	// counter, which is cheaper to reason about than making the counter per-request.
+	//
+	// AND IT ANSWERS WHILE IT WAITS. This spun without servicing its own pending request, so two
+	// cores shooting down at once could each be the reason the other could not finish: the holder
+	// waits for an acknowledgement from a core that is spinning HERE and will not look at its flag
+	// until the holder gives up. That is a two-hundred-million-spin timeout per collision, and the
+	// aarch64 and riscv64 suites are full of them - `a_process_load_whose_image_goes_away...`
+	// unmaps a page, frees a frame and tears down a process, and stopped finishing at all.
+	//
+	// The interrupt path was supposed to cover this and cannot: the wake IPI is serviced by the
+	// handler only when the core takes it, and a core that masks interrupts for a lock, or is
+	// already inside this function, does not. Answering in the wait needs no interrupt at all.
 	while IN_FLIGHT.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+		service_pending();
 		core::hint::spin_loop();
 	}
 	let me = arch::percpu::this_cpu().cpu_id() as usize;
@@ -105,6 +117,10 @@ pub fn shootdown() -> bool {
 		if acknowledged(cpus, me, generation) == targets {
 			break;
 		}
+		// Answer here too. Nothing else can be requesting while we hold `IN_FLIGHT`, so this is
+		// almost always a no-op - but "almost always" is what the flag above was relying on, and a
+		// request published just before we took the flag is exactly the case that hangs.
+		service_pending();
 		core::hint::spin_loop();
 		spins += 1;
 		if spins > 200_000_000 {

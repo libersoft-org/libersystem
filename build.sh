@@ -50,7 +50,10 @@ target_flag() {
 
 step_sdk() {
 	note "sdk"
-	(cd "$SRC_DIR/sdk" && cargo build --release --target wasm32-unknown-unknown)
+	# `--workspace`, because `src/sdk` is the SDK LIBRARY now and the component is the example
+	# beside it. Without it cargo builds the root package only and the staged `.wasm` is whatever
+	# the last build left behind.
+	(cd "$SRC_DIR/sdk" && cargo build --release --target wasm32-unknown-unknown --workspace)
 }
 
 step_libs() {
