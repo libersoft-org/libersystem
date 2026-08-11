@@ -256,11 +256,14 @@ fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	send_cap(&component_boot, b"STORAGE", storage.connect(), Rights::ALL).expect("ComponentHost storage bootstrap");
 	send_cap(&component_boot, b"LOG", log_client.clone(), Rights::ALL).expect("ComponentHost log bootstrap");
 	let report = wait_message(&mut storage, &component_boot, "ComponentHost did not report its component result");
-	assert!(report.bytes.len() >= 5, "ComponentHost result has its log flag and score");
-	assert_ne!(report.bytes[0], 0, "the component reaches its LogService grant");
-	assert_eq!(i32::from_le_bytes([report.bytes[1], report.bytes[2], report.bytes[3], report.bytes[4]]), 17, "the staged component runs through ComponentHost");
+	// Through the SHARED parser. This read the report at fixed offsets and was left behind twice as
+	// the report grew, most recently comparing four bytes of score against the file's contents.
+	let report = crate::tests::parse_component_report(&report.bytes).expect("ComponentHost result is a well-formed report");
+	assert!(report.logged, "the component reaches its LogService grant");
+	assert_eq!(report.score, 17, "the staged component runs through ComponentHost");
 	let expected_component_output: alloc::vec::Vec<u8> = volume_file(volume, hello.as_bytes()).expect("hello factory file").iter().map(|byte| byte.to_ascii_uppercase()).collect();
-	assert_eq!(&report.bytes[5..], expected_component_output.as_slice(), "the component transforms its granted factory input");
+	assert_eq!(report.output, expected_component_output, "the component transforms its granted factory input");
+	assert_eq!(report.readback, expected_component_output, "and the file on the volume holds what it wrote");
 	wait_terminated(&mut storage, &component_process, "ComponentHost did not exit");
 	let component_output_uri = alloc::format!("vol://system/{component_output}");
 	assert_eq!(storage.open(component_output_uri.as_bytes(), 0xd341), Some(expected_component_output.clone()), "ComponentHost writes its runtime output beside the component payload");

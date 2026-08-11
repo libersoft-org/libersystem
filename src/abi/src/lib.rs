@@ -11,6 +11,8 @@
 #![no_std]
 #![allow(dead_code)]
 
+extern crate alloc;
+
 // The ABI revision this crate defines: the version the kernel and every userspace
 // binary agree on. Bump it whenever the ABI changes in a way an old binary would
 // misread - a grown or reordered struct, a changed argument meaning. New syscalls
@@ -864,6 +866,10 @@ impl<'a> Package<'a> {
 		None
 	}
 }
+
+// The bootstrap list and the archive built from it. Here rather than in the loader because the
+// loader is a UEFI binary and nothing in it can be tested on the host.
+pub mod bootstrap;
 
 #[cfg(test)]
 mod tests;

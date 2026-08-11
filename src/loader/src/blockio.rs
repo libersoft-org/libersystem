@@ -18,11 +18,22 @@ use fscore::BlockDevice;
 use crate::uefi::{self, BlockIo, BootServices, Handle};
 
 // One firmware block device, already checked for media.
+// The bounce buffer for a driver that demands an alignment the caller's buffer does not have: one
+// filesystem block plus the slack to line it up. 8 KiB covers every block size this tree reads.
+const BOUNCE_BYTES: usize = 8 * 1024;
+
+#[derive(Clone, Copy)]
 pub(crate) struct FirmwareDisk {
 	proto: *mut BlockIo,
 	media_id: u32,
 	block_size: u32,
 	last_block: u64,
+	// The buffer alignment this driver requires. `EFI_BLOCK_IO_MEDIA` carries it and this did not
+	// keep it, so `read_blocks` was handed whatever address the caller's slice happened to have -
+	// which the specification makes a REQUIREMENT, and which NVMe, SCSI and USB stacks on real
+	// firmware may answer with `EFI_INVALID_PARAMETER`. OVMF does not care, which is why nothing
+	// here has ever shown it.
+	io_align: u32,
 }
 
 impl BlockDevice for FirmwareDisk {
@@ -38,6 +49,27 @@ impl BlockDevice for FirmwareDisk {
 		let first = index * span;
 		if first + span > self.last_block + 1 {
 			return false;
+		}
+		// BOUNCE THROUGH AN ALIGNED BUFFER when the driver demands one and the caller's is not.
+		// `IoAlign` of 0 or 1 means no requirement, which is every case this tree has met.
+		if self.io_align > 1 && (buf.as_ptr() as usize) % self.io_align as usize != 0 {
+			let mut bounce = [0u8; BOUNCE_BYTES];
+			if buf.len() > bounce.len() {
+				return false;
+			}
+			// A stack array is aligned to its element, so line it up by hand inside a larger one.
+			let base = bounce.as_mut_ptr() as usize;
+			let offset = (self.io_align as usize - base % self.io_align as usize) % self.io_align as usize;
+			if offset + buf.len() > bounce.len() {
+				return false;
+			}
+			let aligned = unsafe { bounce.as_mut_ptr().add(offset) };
+			let status = unsafe { ((*self.proto).read_blocks)(self.proto, self.media_id, first, buf.len(), aligned as *mut c_void) };
+			if uefi::is_error(status) {
+				return false;
+			}
+			unsafe { core::ptr::copy_nonoverlapping(aligned, buf.as_mut_ptr(), buf.len()) };
+			return true;
 		}
 		let status = unsafe { ((*self.proto).read_blocks)(self.proto, self.media_id, first, buf.len(), buf.as_mut_ptr() as *mut c_void) };
 		!uefi::is_error(status)
@@ -96,11 +128,11 @@ pub(crate) fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDis
 		// A drive with no medium - an empty optical bay - answers every read with an error.
 		// Asking it is not harmful, but skipping it keeps the diagnostics honest about what
 		// was actually tried.
-		let (present, media_id, block_size, last_block) = unsafe { ((*media).media_present, (*media).media_id, (*media).block_size, (*media).last_block) };
+		let (present, media_id, block_size, last_block, io_align) = unsafe { ((*media).media_present, (*media).media_id, (*media).block_size, (*media).last_block, (*media).io_align) };
 		if !present || block_size == 0 {
 			continue;
 		}
-		if visit(FirmwareDisk { proto, media_id, block_size, last_block }) {
+		if visit(FirmwareDisk { proto, media_id, block_size, last_block, io_align }) {
 			break;
 		}
 	}
@@ -143,48 +175,22 @@ impl<D: BlockDevice> ReadsFiles for fat::FatFs<D> {
 }
 
 pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> Option<alloc::vec::Vec<u8>> {
-	use abi::{PKG_ENTRY_LEN as ENTRY_LEN, PKG_HEADER_LEN as HEADER_LEN, PKG_NAME_LEN as NAME_LEN};
 	use alloc::vec::Vec;
 
+	// The list parser and the archive builder live in `abi`, beside the format's reader: the loader
+	// is a UEFI binary, so nothing here can be tested on the host, and these two are exactly the
+	// parts that need a test. What stays here is the reading.
 	let list = fs.read(b"etc/bootstrap.list")?;
-	let mut entries: Vec<(&[u8], Vec<u8>)> = Vec::new();
-	for line in list.split(|&b| b == b'\n') {
-		if line.is_empty() {
-			continue;
-		}
-		let mut parts = line.splitn(2, |&b| b == b' ');
-		let name = parts.next()?;
-		let path = parts.next()?;
-		if name.len() > NAME_LEN {
-			return None;
-		}
+	let rows = abi::bootstrap::parse_list(&list)?;
+	let mut blobs: Vec<Vec<u8>> = Vec::new();
+	blobs.try_reserve_exact(rows.len()).ok()?;
+	for row in &rows {
 		// A named program that is not on the volume is fatal rather than skipped. The bootstrap
 		// set is exactly the programs the system needs before its volume is readable, so a
 		// missing one produces a machine that dies later and further away, with nothing to say
 		// which program it was.
-		let bytes = fs.read(path)?;
-		entries.push((name, bytes));
+		blobs.push(fs.read(row.path)?);
 	}
-	if entries.is_empty() {
-		return None;
-	}
-
-	let table = HEADER_LEN + ENTRY_LEN * entries.len();
-	let mut out: Vec<u8> = Vec::new();
-	out.extend_from_slice(abi::PKG_MAGIC);
-	out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-	out.extend_from_slice(&0u32.to_le_bytes());
-	let mut offset = table;
-	for (name, bytes) in &entries {
-		let mut field = [0u8; NAME_LEN];
-		field[..name.len()].copy_from_slice(name);
-		out.extend_from_slice(&field);
-		out.extend_from_slice(&(offset as u32).to_le_bytes());
-		out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-		offset += bytes.len();
-	}
-	for (_, bytes) in &entries {
-		out.extend_from_slice(bytes);
-	}
-	Some(out)
+	let entries: Vec<(&[u8], &[u8])> = rows.iter().zip(&blobs).map(|(row, blob)| (row.name, blob.as_slice())).collect();
+	abi::bootstrap::build_package(&entries)
 }

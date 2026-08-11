@@ -408,15 +408,23 @@ fn component_host_runs_an_sdk_component() {
 	// capability-gated filesystem read and transformed it on the interpreter), the log
 	// grant must have been reached (the second typed service was wired - no ambient
 	// authority), and score(10) must be 17 (the float path on genuine toolchain output).
-	let (expected, content, logged, score, score_negative) = run_component_scenario().expect("the component scenario should run");
-	assert!(!expected.is_empty(), "the granted file should not be empty");
-	assert_eq!(content, expected, "the component read, transformed, and returned its granted file's bytes through the host imports");
-	assert!(logged, "the component reached its LogService grant - the second typed service was wired with no ambient authority");
-	assert_eq!(score, 17, "the component's float `score` export computed trunc(10 * 1.5 + 2.0) on real toolchain output");
+	let run = run_component_scenario().expect("the component scenario should run");
+	assert!(!run.expected.is_empty(), "the granted file should not be empty");
+	assert_eq!(run.report.output, run.expected, "the component read, transformed, and returned its granted file's bytes through the host imports");
+	// AND THE FILE ON THE VOLUME SAYS SO. `content` is the copy the host took on the way into the
+	// write, so every assertion about it passes whether or not the write ever happened - the volume
+	// could be read-only, `write_file` could return zero, the service could refuse. This is the same
+	// bytes read back through StorageService after the run, which is the only thing that proves it.
+	assert_eq!(run.report.readback, run.expected, "the output file on the volume holds what the component wrote");
+	// The export's return ABI, which nothing checked: `run` answers the number of bytes it
+	// processed, and a negative value would be one of the world's statuses.
+	assert_eq!(run.report.count as usize, run.expected.len(), "the component reported the byte count it processed");
+	assert!(run.report.logged, "the component reached its LogService grant - the second typed service was wired with no ambient authority");
+	assert_eq!(run.report.score, 17, "the component's float `score` export computed trunc(10 * 1.5 + 2.0) on real toolchain output");
 	// The case where truncation and flooring disagree: -3 * 1.5 + 2.0 is -2.5, which truncates to -2
 	// and floors to -3. `score(10)` is 17 either way, so it could never have told them apart - and
 	// the export's comment said `floor` while the cast truncated, which is how that stayed unnoticed.
-	assert_eq!(score_negative, -2, "the float-to-int conversion rounds toward zero, as the cast does");
+	assert_eq!(run.report.score_negative, -2, "the float-to-int conversion rounds toward zero, as the cast does");
 }
 
 tagged_test!(a_governed_pipeline_starts_as_one_transaction_and_carries_data, [Service, Process, PermissionService], id = "kernel.applications.a_governed_pipeline_starts_as_one_transaction_and_carries_data", covers = ["kernel", "services"]);

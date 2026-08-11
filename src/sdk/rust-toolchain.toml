@@ -1,6 +1,16 @@
 [toolchain]
-# The component SDK builds for wasm32-unknown-unknown, whose rust-std ships on the
-# stable channel. Pinning it here (with the target) keeps the guest build
-# reproducible regardless of the workspace's default toolchain.
-channel = "stable"
+# The component SDK builds for wasm32-unknown-unknown, whose rust-std ships on the stable channel.
+# Pinning it here (with the target) keeps the guest build independent of the workspace's default
+# toolchain.
+#
+# PINNED TO AN EXACT RELEASE, not to `stable`.
+#
+# `stable` is whatever `rustup` last fetched. For most crates that is a reproducibility annoyance;
+# here the guest runs on THIS PROJECT'S OWN interpreter, so a new stable can legitimately emit an
+# instruction selection, a memory layout, a data segment or a float conversion the interpreter does
+# not implement - and the component that worked yesterday stops working with no change of ours.
+#
+# Moving it is a deliberate act: bump the version here, rebuild, and run the component suite, which
+# is what proves the interpreter still understands what the toolchain emits.
+channel = "1.93.1"
 targets = ["wasm32-unknown-unknown"]

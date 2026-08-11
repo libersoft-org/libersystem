@@ -17,5 +17,9 @@ fscore = { path = "../../fs/core" }
 abi = { path = "../../abi" }
 # ELF parsing for the identity records and the dynamic-linkage audit.
 bootproto = { path = "../../bootproto" }
+# The component parser, so a staged `.wasm` is validated with the SAME code that will have to run
+# it - a toolchain that emits something this interpreter cannot represent fails the BUILD rather
+# than the boot.
+wasm = { path = "../../wasm" }
 # The manifest that decides what is staged where.
 system-manifest = { path = "../system-manifest" }

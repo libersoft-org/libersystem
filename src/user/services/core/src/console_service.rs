@@ -594,6 +594,7 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 		let mut raw_req: Option<bool> = None;
 		let mut echo_req: Option<bool> = None;
 		let mut clip_req: Option<Vec<u8>> = None;
+		let mut reply: Vec<u8> = Vec::new();
 		if let Some(t) = console.vts[vi].term.as_mut() {
 			for &b in bytes {
 				t.screen.put_byte(b);
@@ -603,6 +604,9 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 			echo_req = t.screen.take_tty_echo_req();
 			// Pick up an OSC 52 clipboard-set the program emitted in this output.
 			clip_req = t.screen.take_clipboard_set();
+			// And anything the terminal owes it in reply to a query - DSR, DA. There was no reply
+			// path at all, so a program asking where the cursor is waited forever.
+			reply = t.screen.take_reply();
 			let bell: bool = t.screen.take_bell();
 			if fg {
 				t.flush();
@@ -626,9 +630,21 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 			console.vts[vi].ld.echo = echo;
 		}
 		// Adopt an OSC 52 clipboard-set into the console-held clipboard (a program sets
-		// the selection, a later middle-click pastes it).
-		if let Some(text) = clip_req {
+		// the selection, a later middle-click pastes it) - FROM THE FOREGROUND VT ONLY.
+		//
+		// This was outside the `if fg` guard, so a program on a terminal the user is not looking at
+		// replaced what their next paste would insert. The clipboard is the user's, and the VT they
+		// are watching is the only one they could have meant.
+		if fg && let Some(text) = clip_req {
 			console.clipboard = text;
+		}
+		// Deliver the reply as though the user had typed it: a query's answer arrives on the
+		// program's input, which is where it asked for it.
+		if !reply.is_empty() {
+			let client: u64 = console.vts[vi].client;
+			if client != 0 {
+				send_blocking(client, &reply, 0);
+			}
 		}
 		if fg {
 			// Tap the raw output stream (L1) into the serial mirror, alongside the L2 model above;

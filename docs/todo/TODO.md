@@ -76,7 +76,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0009 - Security hardening: app sandbox, permission manifests, PermissionManager](P02M0009.md)
 - [x] [P02M0010 - ResourceManager policy service](P02M0010.md)
 - [x] [P02M0011 - ServiceManager: restart policy and watchdog](P02M0011.md)
-- [x] [P02M0012 - Full Component Model + WASI preview 2 + an SDK](P02M0012.md)
+- [x] [P02M0012 - The Liber component ABI + a Rust component SDK](P02M0012.md)
 - [x] [P02M0013 - A simple persistent native filesystem](P02M0013.md)
 - [x] [P02M0014 - virtio-gpu driver + runtime mode-set (the resize source for the local console)](P02M0014.md)
 - [x] [P02M0015 - AudioService over virtio-sound (headless playback + capture)](P02M0015.md)

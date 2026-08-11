@@ -245,6 +245,13 @@ pub fn init() {
 // and a pointer to the saved register frame.
 #[unsafe(no_mangle)]
 extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
+	// CLOSE THE USER-ACCESS WINDOW for the duration of the handler. A trap taken inside a
+	// `user_access` window would otherwise run this whole function - and anything it schedules -
+	// with SSTATUS.SUM set, and a trap that context-switches would leak the window into the next
+	// thread. The frame saved SSTATUS before this ran and the return path restores it, so the
+	// interrupted code gets its window back untouched. x86 does the same thing at every entry
+	// point; this side had nothing to do it with until SUM stopped being permanent.
+	super::paging::clac_on_entry();
 	if scause & CAUSE_INTERRUPT != 0 {
 		let code = scause & 0xff;
 		// S-mode timer interrupt (code 5): advance the tick + re-arm, then let the

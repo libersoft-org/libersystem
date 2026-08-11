@@ -15,6 +15,30 @@ use alloc::vec::Vec;
 // within the rt 1 MB heap).
 pub const SCROLLBACK_ROWS: usize = 1000;
 
+// The ceilings `Screen::new` clamps to. 1024 columns is 8192 pixels at this cell size - past 8K -
+// and 512 rows is past 8192 pixels tall, so no real display reaches them; they exist so an
+// arithmetic overflow or a configuration typo cannot ask for an allocation the machine cannot make.
+pub const MAX_COLS: usize = 1024;
+pub const MAX_ROWS: usize = 512;
+
+// WHAT ONE VT MAY COST IN SCROLLBACK, in bytes, and the number that makes the per-VT figure
+// answerable rather than emergent.
+//
+// `SCROLLBACK_ROWS` is 1000 and a `Cell` is 16 bytes, so at 1024x768 (128 columns) the ring alone
+// was 1.95 MB and a VT cost 2.15 MB; at 1920x1080, 4.17 MB. VTs are created on demand with no cap,
+// so console memory grew with how many the operator opened, in a service whose heap starts at 1 MB.
+// The rows an operator configures are now clamped to what fits this budget at the current width -
+// so the cost per VT has a ceiling that does not depend on the display's resolution.
+pub const MAX_SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
+
+// How many bytes of unanswered query replies may queue before they are dropped - see `push_reply`.
+const MAX_REPLY_BYTES: usize = 256;
+
+// How many scroll operations may queue for the renderer before the queue stops being cheaper than
+// a full repaint. A frame's honest diff is a handful; anything past a screenful is a VT nobody has
+// flushed. See `record_scroll`.
+const MAX_PENDING_SCROLLS: usize = 64;
+
 // Light-grey on near-black, matching the kernel console's boot-log colours.
 const FG: (u8, u8, u8) = (0xc8, 0xc8, 0xc8);
 const BG: (u8, u8, u8) = (0x0a, 0x0a, 0x12);
@@ -55,9 +79,9 @@ pub enum Color {
 }
 
 // The caret shape selected by DECSCUSR (CSI Ps SP q): a steady underline by default, a
-// block, or a vertical bar. The blink flag is recorded but the caret is drawn solid (a
-// self-driven blink timer would keep the cooperative boot driver from settling - the
-// same reason blinking is not rendered).
+// block, or a vertical bar. The blink flag is honoured by `blink_caret`, which the console calls
+// on its own timer - the renderer never drives one itself, because a self-driven timer would keep
+// the cooperative boot driver from settling.
 #[derive(Clone, Copy, PartialEq)]
 pub enum CursorShape {
 	Block,
@@ -110,6 +134,8 @@ pub struct Screen {
 	bell: bool,
 	osc: [u8; 256],
 	osc_len: usize,
+	// Whether the control string in progress ran past the buffer - see `osc_byte`.
+	osc_overflow: bool,
 	// Pending tty mode changes requested by the program via ESC[?9001h/l (raw) and
 	// ESC[?9002h/l (echo); drained by the service into this VT's line discipline.
 	tty_raw_req: Option<bool>,
@@ -119,6 +145,11 @@ pub struct Screen {
 	// motion). The console reads this to decide whether to deliver pointer events to the
 	// program as mouse reports or drive its own selection / scrollback.
 	mouse_mode: u8,
+	// The three DEC tracking modes a program may enable independently; `mouse_mode` is the highest
+	// of them - see `refresh_mouse_mode`.
+	mouse_press: bool,
+	mouse_button: bool,
+	mouse_any: bool,
 	// Whether the program asked for SGR-encoded mouse reports (?1006: ESC[<b;x;yM/m).
 	mouse_sgr: bool,
 	// Bracketed paste (?2004): the console wraps a paste in ESC[200~ .. ESC[201~.
@@ -126,6 +157,9 @@ pub struct Screen {
 	// A clipboard write the program requested via OSC 52 (decoded to plain text); drained
 	// by the console into the clipboard it holds.
 	clipboard_set: Option<Vec<u8>>,
+	// Bytes this terminal owes the program: the answer to a query sequence, drained by the console
+	// into the program's input. See `take_reply`.
+	reply: Vec<u8>,
 	// The current mouse selection as inclusive (anchor row, anchor col, end row, end col)
 	// in global-row coordinates (scrollback rows first, then the live screen), or None.
 	// The renderer reverses the selected cells; `selection_text` extracts their glyphs.
@@ -175,9 +209,23 @@ pub struct Screen {
 }
 
 impl Screen {
+	// Build a grid.
+	//
+	// BOUNDED AND CLAMPED, because the callers' numbers come from a framebuffer geometry and a
+	// configuration tree. `cols * rows` and `scrollback * cols` were computed with no `checked_mul`,
+	// and `Term::new` divides the surface by the cell size - so a surface smaller than 8x16 produced
+	// a 0x0 `Screen` whose first `put_glyph` indexed an empty `wrap` vector. The kernel checks for
+	// 0x0 after constructing one; a public API should not require its callers to know that.
 	pub fn new(cols: usize, rows: usize, scrollback: usize) -> Screen {
+		// At least one cell, so there is always somewhere for the cursor to be.
+		let cols = cols.max(1).min(MAX_COLS);
+		let rows = rows.max(1).min(MAX_ROWS);
+		// And a scrollback bounded by BYTES rather than rows, so a wider display does not silently
+		// cost proportionally more - see `MAX_SCROLLBACK_BYTES`.
+		let row_bytes = cols * core::mem::size_of::<Cell>();
+		let scrollback = scrollback.min(MAX_SCROLLBACK_BYTES / row_bytes.max(1));
 		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], pending_wrap: false, wrap: alloc::vec![false; rows], alt_wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
+		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, osc_overflow: false, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_press: false, mouse_button: false, mouse_any: false, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, reply: Vec::new(), selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], pending_wrap: false, wrap: alloc::vec![false; rows], alt_wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
 	}
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
@@ -186,7 +234,13 @@ impl Screen {
 	}
 
 	// A snapshot of the live cell at (col, row): the renderer's read of the grid model.
+	// A blank cell outside the grid rather than a panic: this is public, `set_cell` already returns
+	// quietly for the same coordinates, and a renderer that asks for a cell that is not there is
+	// describing a stale geometry rather than a reason to end the process.
 	pub fn cell(&self, col: usize, row: usize) -> Cell {
+		if col >= self.cols || row >= self.rows {
+			return self.blank();
+		}
 		self.cells()[row * self.cols + col]
 	}
 
@@ -236,6 +290,14 @@ impl Screen {
 		self.cursor_shape
 	}
 
+	// Whether the caret should BLINK. DECSCUSR separates blinking from steady and this flag records
+	// which was asked for; there was no getter, so the renderer's blink timer toggled whenever the
+	// cursor was visible - `CSI 4 SP q` (steady underline) blinked, and so did the default cursor,
+	// whose flag is `false`.
+	pub fn cursor_blink(&self) -> bool {
+		self.cursor_blink
+	}
+
 	// The current scrollback view offset (0 == live screen): the renderer switches to a
 	// scrollback repaint while it is non-zero.
 	pub fn view_offset(&self) -> usize {
@@ -282,6 +344,26 @@ impl Screen {
 		core::mem::take(&mut self.scrolls)
 	}
 
+	// Record one scroll for the renderer to replay, BOUNDED.
+	//
+	// The only drain is `take_scrolls` inside the renderer's flush, and ConsoleService flushes the
+	// foreground VT only - so a program on VT 2 while the user watches VT 1 accumulated one
+	// `ScrollOp` per scrolled line, forever, and switching to it replayed every one of them as a
+	// bulk pixel copy before the full repaint that overwrote them all.
+	//
+	// Past the cap the queue is DROPPED and the whole grid marked dirty. That is the same answer
+	// `repaint` gives and a strictly cheaper one: a scroll diff longer than the screen has no
+	// information a full repaint does not, and keeping it costs memory that grows with how long
+	// nobody looked.
+	fn record_scroll(&mut self, op: ScrollOp) {
+		if self.scrolls.len() >= MAX_PENDING_SCROLLS {
+			self.scrolls.clear();
+			self.mark_all_dirty();
+			return;
+		}
+		self.scrolls.push(op);
+	}
+
 	// Drain a pending tty raw / echo mode change requested by the program (ESC[?9001/9002
 	// h/l); the service applies it to this VT's line discipline.
 	pub fn take_tty_raw_req(&mut self) -> Option<bool> {
@@ -323,6 +405,13 @@ impl Screen {
 	// console stores it in the clipboard it holds.
 	pub fn take_clipboard_set(&mut self) -> Option<Vec<u8>> {
 		self.clipboard_set.take()
+	}
+
+	// Drain what the terminal owes the program in reply to a query - the same shape
+	// `clipboard_set` and the tty mode requests already use: the model records what it owes, the
+	// console delivers it into the program's input.
+	pub fn take_reply(&mut self) -> Vec<u8> {
+		core::mem::take(&mut self.reply)
 	}
 
 	// Whether a mouse selection is active (so the console copies it on release).
@@ -512,39 +601,136 @@ impl Screen {
 		if new_cols == self.cols && new_rows == self.rows {
 			return false;
 		}
+		// REFLOW, which is what the comment always said and the code never did.
+		//
+		// It copied the overlapping `min(cols) x min(rows)` rectangle bottom-anchored and threw the
+		// rest away, so narrowing the window DESTROYED the text right of the new width instead of
+		// flowing it onto the next line - and in the same call emptied the scrollback, dropped the
+		// wrap metadata, reallocated the alternate screen and forced `alt_active` to false, so a
+		// full-screen program was thrown back into the primary buffer by a host window resize.
+		//
+		// The information needed is already here: the soft-wrap flags say which rows are
+		// continuations, so the scrollback and the screen together are a sequence of LOGICAL lines.
+		// Rebuild those, lay them out at the new width, and the screen is the tail.
 		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		let mut new_primary = alloc::vec![blank; new_cols * new_rows];
-		let copy_rows = self.rows.min(new_rows);
-		let copy_cols = self.cols.min(new_cols);
-		let src_row0 = self.rows - copy_rows; // keep the bottom rows
-		let dst_row0 = new_rows - copy_rows;
-		for r in 0..copy_rows {
-			for c in 0..copy_cols {
-				new_primary[(dst_row0 + r) * new_cols + c] = self.primary[(src_row0 + r) * self.cols + c];
+		let mut lines: Vec<Vec<Cell>> = Vec::new();
+		// Where the cursor is in logical terms, so it can be found again afterwards.
+		let mut cursor_at: Option<(usize, usize)> = None;
+		{
+			let mut current: Vec<Cell> = Vec::new();
+			let mut started = false;
+			let total = self.sb_len + self.rows;
+			for g in 0..total {
+				let (row_cells, wrapped): (&[Cell], bool) = if g < self.sb_len {
+					let ring = (self.sb_head + g) % self.sb_cap;
+					(&self.scrollback[ring * self.cols..ring * self.cols + self.cols], self.sb_wrap[ring])
+				} else {
+					let r = g - self.sb_len;
+					(&self.primary[r * self.cols..r * self.cols + self.cols], self.wrap.get(r).copied().unwrap_or(false))
+				};
+				if g >= self.sb_len && g - self.sb_len == self.row {
+					cursor_at = Some((lines.len(), current.len() + self.col));
+				}
+				current.extend_from_slice(row_cells);
+				started = true;
+				if !wrapped {
+					// A hard line end: trim the trailing blanks a fixed-width grid pads with, so a
+					// narrower screen does not re-wrap padding into rows of its own.
+					while current.last().is_some_and(|c| c.glyph == b' ' as u32 && c.bg == Color::Default && !c.reverse) {
+						current.pop();
+					}
+					lines.push(core::mem::take(&mut current));
+					started = false;
+				}
+			}
+			if started {
+				lines.push(current);
 			}
 		}
-		// Track the cursor with the content (bottom-anchored), clamped into the new grid.
-		let new_row = if self.row >= src_row0 { dst_row0 + (self.row - src_row0) } else { 0 };
-		self.col = self.col.min(new_cols - 1);
-		self.row = new_row.min(new_rows - 1);
+		// Lay the logical lines out at the new width. A line longer than the screen becomes several
+		// rows, all but the last marked as soft-wrapped, which is the same encoding this screen
+		// already uses - so the next resize can undo it.
+		let mut rows_out: Vec<(Vec<Cell>, bool)> = Vec::new();
+		let mut cursor_row_out: Option<(usize, usize)> = None;
+		for (index, line) in lines.iter().enumerate() {
+			let chunks = line.len().div_ceil(new_cols).max(1);
+			for chunk in 0..chunks {
+				let from = chunk * new_cols;
+				let to = (from + new_cols).min(line.len());
+				let mut row: Vec<Cell> = alloc::vec![blank; new_cols];
+				for (at, cell) in line[from..to].iter().enumerate() {
+					row[at] = *cell;
+				}
+				if let Some((line_index, column)) = cursor_at
+					&& line_index == index
+					&& (column >= from && column < from + new_cols)
+				{
+					cursor_row_out = Some((rows_out.len(), column - from));
+				}
+				rows_out.push((row, chunk + 1 < chunks));
+			}
+		}
+		if rows_out.is_empty() {
+			rows_out.push((alloc::vec![blank; new_cols], false));
+		}
+		// The last `new_rows` rows are the screen; everything before them is scrollback.
+		let screen_from = rows_out.len().saturating_sub(new_rows);
+		let mut new_primary = alloc::vec![blank; new_cols * new_rows];
+		let mut new_wrap = alloc::vec![false; new_rows];
+		for (r, (row, wrapped)) in rows_out[screen_from..].iter().enumerate() {
+			new_primary[r * new_cols..r * new_cols + new_cols].copy_from_slice(row);
+			new_wrap[r] = *wrapped;
+		}
+		let mut new_scrollback = alloc::vec![blank; self.sb_cap * new_cols];
+		let mut new_sb_wrap = alloc::vec![false; self.sb_cap];
+		let keep_from = screen_from.saturating_sub(self.sb_cap);
+		let mut sb_len = 0usize;
+		for (row, wrapped) in rows_out[keep_from..screen_from].iter() {
+			new_scrollback[sb_len * new_cols..sb_len * new_cols + new_cols].copy_from_slice(row);
+			new_sb_wrap[sb_len] = *wrapped;
+			sb_len += 1;
+		}
+		// The cursor follows its own cell. When the reflow lost it - an empty screen, or a cursor
+		// past the last written cell - it lands at the end of the content, which is where a shell
+		// prompt is.
+		let (mut cur_row, mut cur_col) = match cursor_row_out {
+			Some((r, c)) if r >= screen_from => (r - screen_from, c),
+			_ => (rows_out.len().saturating_sub(1).saturating_sub(screen_from), 0),
+		};
+		cur_row = cur_row.min(new_rows - 1);
+		cur_col = cur_col.min(new_cols - 1);
+
+		// THE ALTERNATE SCREEN SURVIVES. It is a rectangle by definition - a full-screen program
+		// redraws it on a resize - so it is copied as one rather than reflowed, and `alt_active`
+		// stays what it was instead of being forced back to the primary buffer.
+		let mut new_alt = alloc::vec![blank; new_cols * new_rows];
+		let copy_rows = self.rows.min(new_rows);
+		let copy_cols = self.cols.min(new_cols);
+		for r in 0..copy_rows {
+			for c in 0..copy_cols {
+				new_alt[r * new_cols + c] = self.alt[r * self.cols + c];
+			}
+		}
+
 		self.primary = new_primary;
-		self.alt = alloc::vec![blank; new_cols * new_rows];
-		self.dirty = alloc::vec![true; new_cols * new_rows];
-		self.wrap = alloc::vec![false; new_rows];
+		self.alt = new_alt;
+		self.wrap = new_wrap;
 		self.alt_wrap = alloc::vec![false; new_rows];
-		// Scrollback is reset on a resize (its fixed width changed)
-		self.scrollback = alloc::vec![blank; self.sb_cap * new_cols];
-		self.sb_wrap = alloc::vec![false; self.sb_cap];
+		self.dirty = alloc::vec![true; new_cols * new_rows];
+		self.scrollback = new_scrollback;
+		self.sb_wrap = new_sb_wrap;
 		self.sb_head = 0;
-		self.sb_len = 0;
+		self.sb_len = sb_len;
 		self.view_offset = 0;
 		self.selection = None;
 		self.mouse = None;
 		self.cols = new_cols;
 		self.rows = new_rows;
+		self.col = cur_col;
+		self.row = cur_row;
+		self.pending_wrap = false;
 		self.scroll_top = 0;
 		self.scroll_bottom = new_rows - 1;
-		self.alt_active = false;
 		true
 	}
 
@@ -665,7 +851,7 @@ impl Screen {
 			let src = row + n;
 			self.wrap[row] = if src <= bot { self.wrap[src] } else { false };
 		}
-		self.scrolls.push(ScrollOp { top, bot, n, down: false });
+		self.record_scroll(ScrollOp { top, bot, n, down: false });
 	}
 
 	// Scroll the rows [top, bot] down by n, filling the freed top rows with blanks - the
@@ -690,15 +876,21 @@ impl Screen {
 		for row in (top..=bot).rev() {
 			self.wrap[row] = if row >= top + n { self.wrap[row - n] } else { false };
 		}
-		self.scrolls.push(ScrollOp { top, bot, n, down: true });
+		self.record_scroll(ScrollOp { top, bot, n, down: true });
 	}
 
 	fn scroll_up(&mut self, n: usize) {
 		// Lines that scroll off the top of the full primary screen go to scrollback (not
 		// when a program set a scroll region, nor on the alternate screen). A held scroll
 		// view is nudged up by the same amount so its content stays anchored.
-		if !self.alt_active && self.scroll_top == 0 {
-			let n = n.min(self.rows);
+		// THE WHOLE SCREEN, not merely a region that starts at the top. This checked `scroll_top ==
+		// 0` and never `scroll_bottom == rows - 1`, though the comment above says a region scroll
+		// must not reach history - so `CSI 1;10r` filled the scrollback with the top ten rows of a
+		// status pane. And the count is clamped to the REGION, not to the screen: `CSI 999S` inside
+		// a small region used to push rows that were never in it.
+		let whole_screen = self.scroll_top == 0 && self.scroll_bottom + 1 == self.rows;
+		if !self.alt_active && whole_screen {
+			let n = n.min(self.scroll_bottom - self.scroll_top + 1);
 			for i in 0..n {
 				self.push_scrollback(i);
 			}
@@ -848,6 +1040,18 @@ impl Screen {
 			0x08 => {
 				if self.col > 0 {
 					self.col -= 1;
+				} else if self.row > 0 && self.wrap.get(self.row - 1).copied().unwrap_or(false) {
+					// REVERSE WRAP over a soft-wrapped row. Backspace stopped dead at column 0, so
+					// the line editor - which moves the cursor by repeating `\x08` - could not step
+					// back onto the previous row. On an 80-column terminal a command long enough to
+					// wrap left Home, Backspace and mid-line editing moving `Ld.cursor` while the
+					// caret stayed stuck on the last physical row: the buffer and the screen
+					// diverged and every later edit was drawn in the wrong place.
+					//
+					// Only over a row this screen itself marked as continuing into this one, so a
+					// backspace at the start of a REAL line still stops where the line starts.
+					self.row -= 1;
+					self.col = self.cols - 1;
 				}
 			}
 			b'\t' => {
@@ -919,6 +1123,12 @@ impl Screen {
 		} else if self.osc_len < self.osc.len() {
 			self.osc[self.osc_len] = byte;
 			self.osc_len += 1;
+		} else {
+			// TRUNCATION IS A REFUSAL. Bytes past the buffer were dropped and whatever had been
+			// kept was dispatched anyway - so an OSC 52 payload longer than 256 bytes set the
+			// clipboard to a PREFIX of the intended text. A control string that did not arrive
+			// whole was not received, and the flag is what `osc_dispatch` reads to say so.
+			self.osc_overflow = true;
 		}
 	}
 
@@ -977,6 +1187,25 @@ impl Screen {
 				self.row = (r - 1).min(self.rows.saturating_sub(1));
 				self.col = (c - 1).min(self.cols.saturating_sub(1));
 			}
+			// DSR - device status report. `CSI 5n` is "are you there" and `CSI 6n` asks for the
+			// cursor position, one-based; the reply goes back as though the user had typed it.
+			// There was no reply path at all, so a program asking where the cursor is waited
+			// forever.
+			b'n' if self.csi_private == 0 => match self.param(0, 0) {
+				5 => self.push_reply(b"\x1b[0n"),
+				6 => {
+					let mut out: Vec<u8> = alloc::vec![0x1b, b'['];
+					push_dec(&mut out, self.row + 1);
+					out.push(b';');
+					push_dec(&mut out, self.col + 1);
+					out.push(b'R');
+					self.push_reply(&out);
+				}
+				_ => {}
+			},
+			// DA - device attributes. The answer says VT102, which is what this feature set is
+			// closest to and what a program reads as "no extensions to negotiate".
+			b'c' if self.csi_private == 0 => self.push_reply(b"\x1b[?6c"),
 			b'J' => self.erase_display(self.param(0, 0)),
 			b'K' => self.erase_line(self.param(0, 0)),
 			b'L' => {
@@ -1196,18 +1425,62 @@ impl Screen {
 		for i in 0..=self.nparams {
 			match self.params[i] {
 				25 => self.cursor_visible = enable,
-				47 | 1047 | 1049 => {
+				// THE THREE ALTERNATE-SCREEN MODES ARE NOT ONE MODE, and ported full-screen
+				// programs depend on the difference.
+				//
+				//   ?47   switches buffers and nothing else - the program saves its own cursor.
+				//   ?1047 switches, and CLEARS the alternate screen when leaving, so the next
+				//         program that enters it does not inherit the last one's picture.
+				//   ?1049 saves the cursor on entry and restores it on leaving, as well as
+				//         clearing - the sequence a modern program uses precisely so it does not
+				//         have to do either by hand.
+				47 => {
 					if enable {
-						self.enter_alt();
+						self.enter_alt_buffer();
 					} else {
-						self.leave_alt();
+						self.leave_alt_buffer();
+					}
+				}
+				1047 => {
+					if enable {
+						self.enter_alt_buffer();
+					} else {
+						self.leave_alt_buffer();
+						self.clear_alt();
+					}
+				}
+				1049 => {
+					if enable {
+						self.save_cursor();
+						self.enter_alt_buffer();
+						// ...and blank it, which is the part that makes `?1049h` a clean slate.
+						self.clear_alt_active();
+					} else {
+						self.leave_alt_buffer();
+						self.clear_alt();
+						self.restore_cursor();
 					}
 				}
 				9001 => self.tty_raw_req = Some(enable),
 				9002 => self.tty_echo_req = Some(enable),
-				1000 => self.mouse_mode = if enable { 1 } else { 0 },
-				1002 => self.mouse_mode = if enable { 2 } else { 0 },
-				1003 => self.mouse_mode = if enable { 3 } else { 0 },
+				// Disabling a HIGHER tracking mode falls back to whatever lower one is still on
+				// rather than turning tracking off: `?1002l` cancelled a `?1000` that the program
+				// never disabled and still believes it has.
+				// THREE MODES, not one number. Disabling a higher one used to set `mouse_mode = 0`
+				// outright, cancelling a `?1000` the program never disabled and still believes it
+				// has. They are tracked separately and the effective mode is the highest enabled.
+				1000 => {
+					self.mouse_press = enable;
+					self.refresh_mouse_mode();
+				}
+				1002 => {
+					self.mouse_button = enable;
+					self.refresh_mouse_mode();
+				}
+				1003 => {
+					self.mouse_any = enable;
+					self.refresh_mouse_mode();
+				}
 				1006 => self.mouse_sgr = enable,
 				2004 => self.bracketed_paste = enable,
 				_ => {}
@@ -1215,11 +1488,12 @@ impl Screen {
 		}
 	}
 
-	fn enter_alt(&mut self) {
+	// Switch to the alternate buffer. The CURSOR POLICY is the caller's - see `set_mode`, where the
+	// three DEC modes differ in exactly that and used to share one path.
+	fn enter_alt_buffer(&mut self) {
 		if self.alt_active {
 			return;
 		}
-		self.save_cursor();
 		self.alt_active = true;
 		self.view_offset = 0;
 		// The metadata follows the buffer. The alternate screen starts blank, so its flags start
@@ -1228,26 +1502,70 @@ impl Screen {
 		for w in self.wrap.iter_mut() {
 			*w = false;
 		}
-		let blank = self.blank();
-		for c in self.alt.iter_mut() {
-			*c = blank;
-		}
+		// The buffer is NOT blanked here. Entry-clearing is `?1049`'s behaviour, not every mode's:
+		// `?47` and `?1047` switch to whatever the alternate buffer already holds, which is what
+		// lets a program leave and re-enter without redrawing.
 		self.mark_all_dirty();
 		self.col = 0;
 		self.row = 0;
 	}
 
-	fn leave_alt(&mut self) {
+	fn leave_alt_buffer(&mut self) {
 		if !self.alt_active {
 			return;
 		}
 		self.alt_active = false;
 		core::mem::swap(&mut self.wrap, &mut self.alt_wrap);
 		self.mark_all_dirty();
-		self.restore_cursor();
+	}
+
+	// Blank the alternate buffer, so the next program to enter it does not inherit the last one's
+	// picture. `?1047` and `?1049` do this on the way out; `?47` deliberately does not.
+	//
+	// Called AFTER `leave_alt_buffer`, because while the alternate screen is active `wrap` holds
+	// ITS flags and `alt_wrap` holds the primary's parked ones - clearing before the swap wiped the
+	// primary's, which is the thing the swap exists to protect.
+	// The effective tracking mode: the highest of the three the program has enabled.
+	fn refresh_mouse_mode(&mut self) {
+		self.mouse_mode = if self.mouse_any {
+			3
+		} else if self.mouse_button {
+			2
+		} else if self.mouse_press {
+			1
+		} else {
+			0
+		};
+	}
+
+	// Blank the alternate buffer WHILE IT IS ACTIVE, where `wrap` holds its flags.
+	fn clear_alt_active(&mut self) {
+		let blank = self.blank();
+		for cell in self.alt.iter_mut() {
+			*cell = blank;
+		}
+		for w in self.wrap.iter_mut() {
+			*w = false;
+		}
+	}
+
+	fn clear_alt(&mut self) {
+		let blank = self.blank();
+		for cell in self.alt.iter_mut() {
+			*cell = blank;
+		}
+		for w in self.alt_wrap.iter_mut() {
+			*w = false;
+		}
 	}
 
 	// RIS - reset to the initial state.
+	// RIS - reset to the initial state, which means INDISTINGUISHABLE FROM A FRESH `Screen`.
+	//
+	// It restored SGR, the cursor, the margins, the mouse modes and bracketed paste, and left the
+	// OSC-modified palette, the default colours, the DECSCUSR shape and blink and the saved-cursor
+	// state exactly as the previous program had them. That is the whole purpose of the sequence and
+	// the thing a shell relies on after a program crashes: a terminal it did not configure.
 	fn reset(&mut self) {
 		self.fg_color = Color::Default;
 		self.bg_color = Color::Default;
@@ -1255,6 +1573,8 @@ impl Screen {
 		self.underline = false;
 		self.reverse = false;
 		self.cursor_visible = true;
+		self.cursor_shape = CursorShape::Underline;
+		self.cursor_blink = false;
 		self.scroll_top = 0;
 		self.scroll_bottom = self.rows.saturating_sub(1);
 		self.alt_active = false;
@@ -1262,9 +1582,35 @@ impl Screen {
 		self.sb_head = 0;
 		self.sb_len = 0;
 		self.mouse_mode = 0;
+		self.mouse_press = false;
+		self.mouse_button = false;
+		self.mouse_any = false;
 		self.mouse_sgr = false;
 		self.bracketed_paste = false;
 		self.selection = None;
+		self.mouse = None;
+		self.pending_wrap = false;
+		// The palette and the default colours an OSC changed, which outlived the program that
+		// changed them.
+		self.palette = ANSI_PALETTE;
+		self.default_fg = FG;
+		self.default_bg = BG;
+		// The saved cursor, so a later DECRC cannot restore a position from before the reset.
+		self.saved_col = 0;
+		self.saved_row = 0;
+		self.saved_fg_color = Color::Default;
+		self.saved_bg_color = Color::Default;
+		self.saved_bold = false;
+		self.saved_underline = false;
+		self.saved_reverse = false;
+		// Any half-parsed sequence: a reset arriving mid-escape leaves no state behind it.
+		self.esc_state = 0;
+		self.csi_private = 0;
+		self.nparams = 0;
+		self.params = [0; 16];
+		self.osc_len = 0;
+		self.osc_overflow = false;
+		self.utf8_rem = 0;
 		self.clear();
 	}
 
@@ -1328,7 +1674,7 @@ impl Screen {
 
 	// DECSCUSR (CSI Ps SP q): select the cursor shape + blink. 0/1 blinking block, 2
 	// steady block, 3 blinking underline, 4 steady underline, 5 blinking bar, 6 steady
-	// bar. The blink flag is recorded but the caret is drawn solid.
+	// bar. The blink flag says which of the pair was asked for and `blink_caret` reads it.
 	fn set_cursor_style(&mut self, n: usize) {
 		let (shape, blink) = match n {
 			0 | 1 => (CursorShape::Block, true),
@@ -1353,7 +1699,23 @@ impl Screen {
 	// Act on a completed OSC string: OSC 4;n;spec sets palette entry n (0-15), OSC
 	// 10;spec / 11;spec the default fg / bg. OSC 0/1/2 (title) and 8 (hyperlink) are
 	// accepted and ignored - a bare VT console has no title bar or clickable links.
+	// Queue bytes for the program, bounded: a reply nobody drains must not grow without limit, and a
+	// program that queries faster than the console delivers is asking for the same answer twice.
+	fn push_reply(&mut self, bytes: &[u8]) {
+		if self.reply.len() + bytes.len() > MAX_REPLY_BYTES {
+			return;
+		}
+		self.reply.extend_from_slice(bytes);
+	}
+
 	fn osc_dispatch(&mut self) {
+		// A control string that ran past the buffer did not arrive, so nothing it might have said
+		// is acted on. See `osc_byte`.
+		if self.osc_overflow {
+			self.osc_overflow = false;
+			self.osc_len = 0;
+			return;
+		}
 		let len = self.osc_len;
 		let semi = match self.osc[..len].iter().position(|&b| b == b';') {
 			Some(i) => i,
@@ -1374,17 +1736,25 @@ impl Screen {
 				if let (Some(n), Some((r, g, b))) = (n, color) {
 					if n < 16 {
 						self.palette[n] = (r, g, b);
+						// EVERY CELL CHANGES. Cells hold `Color::Idx` and resolve to RGB at draw
+						// time - the right design - so repainting the palette repaints the screen,
+						// and nothing here dirtied it: the old colours stayed until something else
+						// happened to.
+						self.mark_all_dirty();
 					}
 				}
 			}
 			Some(10) => {
 				if let Some((r, g, b)) = parse_osc_color(&self.osc[rest_start..len]) {
 					self.default_fg = (r, g, b);
+					// Same reason as OSC 4: `Color::Default` is resolved at draw time.
+					self.mark_all_dirty();
 				}
 			}
 			Some(11) => {
 				if let Some((r, g, b)) = parse_osc_color(&self.osc[rest_start..len]) {
 					self.default_bg = (r, g, b);
+					self.mark_all_dirty();
 				}
 			}
 			Some(52) => {
@@ -1443,6 +1813,14 @@ pub(crate) fn push_utf8(out: &mut Vec<u8>, cp: u32) {
 }
 
 // Parse a decimal byte string to usize, or None if empty / non-numeric.
+// Append `v` as ASCII decimal - the reply sequences carry one-based coordinates.
+fn push_dec(out: &mut Vec<u8>, v: usize) {
+	if v >= 10 {
+		push_dec(out, v / 10);
+	}
+	out.push(b'0' + (v % 10) as u8);
+}
+
 fn parse_dec(s: &[u8]) -> Option<usize> {
 	if s.is_empty() {
 		return None;

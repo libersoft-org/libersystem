@@ -122,7 +122,23 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.dcache.remove(&(dir_num, name.to_vec()));
 		dir.dir_root = root;
 		dir.dir_root_crc = crc;
-		dir.size = dir.size.saturating_sub(1);
+		// THE TREE IS THE TRUTH, and `size` is a cache of it. `saturating_sub` meant a directory
+		// whose stored count was 0 while its tree held five entries lost a real entry and kept the
+		// count at 0 - and the inode was then re-checksummed and committed, so the removal made the
+		// lie permanent and internally consistent.
+		//
+		// Refusing is the wrong answer here even though the state is corrupt: removing the children
+		// is exactly how an operator repairs such a directory, and refusing closes the only route
+		// they have. So a count that cannot describe what was just removed is DERIVED from the tree
+		// that remains - the one operation that both survives the damage and ends it.
+		dir.size = match dir.size.checked_sub(1) {
+			Some(size) => size,
+			None => {
+				let mut entries = Vec::new();
+				self.collect_dir_entries(root, crc, &mut entries, TREE_DEPTH_MAX)?;
+				entries.len() as u64
+			}
+		};
 		dir.mtime = self.clock;
 		self.write_inode(dir_num, &mut dir)?;
 		Ok(())
@@ -183,7 +199,13 @@ impl<D: BlockDevice> LiberFs<D> {
 		if root == 0 {
 			return Ok(());
 		}
-		let mut visited = try_zeroed(self.free.len())?;
+		// The visited set is proportional to the TREE, not to the volume. `try_zeroed(self.free.len())`
+		// is one bit per block of the whole volume for the sake of walking one directory: 32 MiB at
+		// 1 TiB, 128 MiB at 4 TiB, half a gigabyte at 16 TiB - allocated and thrown away by every
+		// `read_dir`, every `rmdir`, and every `list`. A `BTreeSet` costs a node per block actually
+		// visited, which is what the walk reads anyway - the same shape the transaction's `fresh`
+		// and `dead` sets already use for block sets whose size follows the work.
+		let mut visited: BTreeSet<u64> = BTreeSet::new();
 		// (block, crc, depth remaining)
 		let mut stack: Vec<(u64, u32, usize)> = vec![(root, root_crc, depth)];
 		let mut buf = vec![0u8; BLOCK_SIZE];
@@ -201,10 +223,9 @@ impl<D: BlockDevice> LiberFs<D> {
 			if left == 0 || ptr >= self.num_blocks {
 				return Err(FsError::Corrupt);
 			}
-			if test_bit(&visited, ptr) {
+			if !visited.insert(ptr) {
 				return Err(FsError::Corrupt);
 			}
-			set_bit(&mut visited, ptr);
 			self.read_node(ptr, crc, &mut buf)?;
 			if node_type(&buf) == NODE_LEAF {
 				for rec in dir_leaf_parse(&buf) {
@@ -226,6 +247,81 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	pub(crate) fn collect_dir_entries(&mut self, ptr: u64, crc: u32, out: &mut Vec<(Vec<u8>, u32)>, depth: usize) -> Result<(), FsError> {
 		self.collect_dir_entries_bounded(ptr, crc, out, depth, false)
+	}
+
+	// One PAGE of a directory: at most `max` entries in key order, starting after `after`.
+	//
+	// The tree is built for millions of entries and the only way to enumerate it returned every one
+	// of them in a single `Vec`, with an inode read each. This walks the same tree and does the work
+	// of a page: internal nodes are entered at the child the cursor's hash routes to, so the
+	// subtrees entirely before the cursor are never read, and the walk stops as soon as the page is
+	// full. Ordering is the tree's own - by (name hash, name) - which is what `after` means.
+	pub(crate) fn collect_dir_page(&mut self, root: u64, root_crc: u32, after: Option<&[u8]>, max: usize, out: &mut Vec<(Vec<u8>, u32)>) -> Result<(), FsError> {
+		if root == 0 || max == 0 {
+			return Ok(());
+		}
+		let cursor = after.map(|name| (name_hash(name), name));
+		let mut visited: BTreeSet<u64> = BTreeSet::new();
+		let mut stack: Vec<(u64, u32, usize)> = vec![(root, root_crc, TREE_DEPTH_MAX)];
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		while let Some((ptr, crc, left)) = stack.pop() {
+			if ptr == 0 || left == 0 || ptr >= self.num_blocks {
+				return Err(FsError::Corrupt);
+			}
+			if !visited.insert(ptr) {
+				return Err(FsError::Corrupt);
+			}
+			self.read_node(ptr, crc, &mut buf)?;
+			if node_type(&buf) == NODE_LEAF {
+				for rec in dir_leaf_parse(&buf) {
+					// Strictly after the cursor, in the tree's own order. A leaf can hold the
+					// cursor itself and entries on both sides of it.
+					if let Some((hash, name)) = cursor
+						&& (name_hash(&rec.name), rec.name.as_slice()) <= (hash, name)
+					{
+						continue;
+					}
+					out.push((rec.name, rec.child));
+					if out.len() == max {
+						return Ok(());
+					}
+				}
+			} else {
+				let count = internal_count(&buf);
+				// Everything before this child is entirely below the cursor. For a node above the
+				// cursor `route_child` answers 0 and nothing is skipped, which is the same walk as
+				// before; for one below it, everything is skipped, which is also right.
+				let first = match cursor {
+					Some((hash, _)) => route_child(&buf, count, hash),
+					None => 0,
+				};
+				for i in (first..=count).rev() {
+					stack.push((child_ptr(&buf, i), child_crc(&buf, i), left - 1));
+				}
+			}
+		}
+		Ok(())
+	}
+
+	// A page of `read_dir`'s rows, with the same per-entry contract (a dangling or damaged entry is
+	// skipped; an I/O failure is not).
+	pub(crate) fn read_dir_page_inode(&mut self, dir_num: u32, after: Option<&[u8]>, max: usize) -> Result<Vec<(Vec<u8>, u64, bool, u64, u64)>, FsError> {
+		let dir = self.read_inode(dir_num)?;
+		if dir.r#type != TYPE_DIR {
+			return Err(FsError::NotDir);
+		}
+		let mut page = Vec::new();
+		self.collect_dir_page(dir.dir_root, dir.dir_root_crc, after, max, &mut page)?;
+		let mut out = Vec::new();
+		for (name, inode_num) in page {
+			match self.read_inode(inode_num) {
+				Ok(inode) => out.push((name, inode.size, inode.r#type == TYPE_DIR, inode.mtime, inode.ctime)),
+				Err(FsError::Io) => return Err(FsError::Io),
+				Err(FsError::Invalid | FsError::Corrupt) => {}
+				Err(e) => return Err(e),
+			}
+		}
+		Ok(out)
 	}
 
 	// directory B+tree operations over variable-length leaf records. Internal nodes
@@ -738,7 +834,3 @@ pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 pub(crate) fn validate_name_segment(seg: &[u8]) -> Result<(), FsError> {
 	fscore::validate_name_segment(seg, NAME_MAX)
 }
-
-// Re-exported so this crate's own call sites keep reading the same, and so there is exactly one
-// definition of what a portable name byte is for every writable backend.
-pub(crate) use fscore::is_portable_name_byte;

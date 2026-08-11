@@ -103,8 +103,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		// the structural pass: shapes that no checksum can object to.
 		let mut faults: Vec<Vec<u8>> = Vec::new();
-		self.check_structure(&mut faults);
-		Ok(FsckReport { checksum_failures, damaged, structural_failures: faults.len() as u32, faults })
+		// A compressed stream that does not decode is neither: every block came back exactly as
+		// written and the shape is legal, and yet the file cannot be read. Counted apart because
+		// the three send an operator to three different places - the medium, the metadata, or the
+		// writer that produced the stream.
+		let stream_failures = self.check_structure(&mut faults);
+		Ok(FsckReport { checksum_failures, damaged, structural_failures: faults.len() as u32 - stream_failures, stream_failures, faults })
 	}
 
 	// Read the whole file at `path` out of the named snapshot's pinned generation,
@@ -148,7 +152,8 @@ impl<D: BlockDevice> LiberFs<D> {
 	// This is deliberately separate from the checksum scrub above. The two answer
 	// different questions - "did the medium give back what was written" versus "can what
 	// was written be true" - and an operator needs to know which one failed.
-	pub(crate) fn check_structure(&mut self, faults: &mut Vec<Vec<u8>>) {
+	pub(crate) fn check_structure(&mut self, faults: &mut Vec<Vec<u8>>) -> u32 {
+		let mut stream_failures = 0u32;
 		let note = |what: &str, faults: &mut Vec<Vec<u8>>| faults.push(what.as_bytes().to_vec());
 
 		// the root of the namespace has to be a directory, or no path resolves.
@@ -180,9 +185,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut inodes: BTreeSet<u32> = BTreeSet::new();
 		let Ok(mut seen_blocks) = try_zeroed(self.free.len()) else {
 			note("not enough memory to check the inode tree's structure", faults);
-			return;
+			return stream_failures;
 		};
-		if self.walk_inode_records(self.inode_root, self.inode_root_crc, TREE_DEPTH_MAX, &mut inodes, &mut seen_blocks, faults).is_err() {
+		if self.walk_inode_records(self.inode_root, self.inode_root_crc, TREE_DEPTH_MAX, &mut inodes, &mut seen_blocks, faults, &mut stream_failures).is_err() {
 			note("the inode tree could not be walked to the end", faults);
 		}
 
@@ -211,8 +216,21 @@ impl<D: BlockDevice> LiberFs<D> {
 				Ok(entries) => entries,
 				Err(_) => continue,
 			};
-			for (_, child) in entries {
+			for (name, child) in entries {
+				// ONE INODE, ONE NAME. There is no hardlink API and no link count, so that is the
+				// format's rule - and nothing stated it. This `insert` was the cycle defence doing
+				// double duty: a second reference to an already-reached inode was skipped rather
+				// than reported, so an image with `/a` and `/b` both naming inode 7 passed `fsck`
+				// clean, and `remove("a")` then freed inode 7's blocks and deleted it from the
+				// inode tree while `/b` still pointed at it. On a directory it additionally makes
+				// the namespace a graph.
+				//
+				// Skipping is still what the walk does - descending twice is the loop this defends
+				// against - but it is now also a fault, which is the whole difference.
 				if !reached.insert(child) {
+					let mut fault = alloc::format!("inode {child} is named more than once; its second name is ").into_bytes();
+					fault.extend_from_slice(&name);
+					faults.push(fault);
 					continue;
 				}
 				if matches!(self.read_inode(child), Ok(i) if i.r#type == TYPE_DIR) {
@@ -230,17 +248,18 @@ impl<D: BlockDevice> LiberFs<D> {
 		if orphans != 0 {
 			faults.push(alloc::format!("{orphans} inode record(s) reachable from no name").into_bytes());
 		}
+		stream_failures
 	}
 
 	// Walk every leaf of the inode tree, checking the shape of each node and each record
 	// it holds. Keys must ascend strictly within a leaf, a block must appear once, and
 	// each file's extent map must be ordered, non-overlapping and as long as it claims.
-	fn walk_inode_records(&mut self, ptr: u64, crc: u32, depth: usize, inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>) -> Result<(), FsError> {
-		self.walk_inode_records_in(ptr, crc, depth, (None, None), inodes, seen, faults)
+	fn walk_inode_records(&mut self, ptr: u64, crc: u32, depth: usize, inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>, streams: &mut u32) -> Result<(), FsError> {
+		self.walk_inode_records_in(ptr, crc, depth, (None, None), inodes, seen, faults, streams)
 	}
 
 	#[allow(clippy::too_many_arguments)]
-	fn walk_inode_records_in(&mut self, ptr: u64, crc: u32, depth: usize, range: (Option<u64>, Option<u64>), inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>) -> Result<(), FsError> {
+	fn walk_inode_records_in(&mut self, ptr: u64, crc: u32, depth: usize, range: (Option<u64>, Option<u64>), inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>, streams: &mut u32) -> Result<(), FsError> {
 		let (lower, upper) = range;
 		if ptr == 0 {
 			return Ok(());
@@ -279,12 +298,12 @@ impl<D: BlockDevice> LiberFs<D> {
 				inodes.insert(key as u32);
 				let mut inode = Inode::parse(&buf[off + 8..off + 8 + INODE_SIZE]);
 				if inode.r#type == TYPE_FILE {
-					self.check_file_shape(key as u32, &mut inode, faults);
+					self.check_file_shape(key as u32, &mut inode, faults, streams);
 				} else if inode.r#type != TYPE_DIR {
 					// no writer emits one, so its presence is a fact worth naming even
 					// though the free-map walk reserves its blocks conservatively.
 					faults.push(alloc::format!("inode {key} has type {} which this build does not define", inode.r#type).into_bytes());
-					self.check_file_shape(key as u32, &mut inode, faults);
+					self.check_file_shape(key as u32, &mut inode, faults, streams);
 				}
 			}
 		} else {
@@ -302,7 +321,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				if child_ptr(&buf, i) == 0 {
 					continue;
 				}
-				if self.walk_inode_records_in(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, (child_lower, child_upper), inodes, seen, faults).is_err() {
+				if self.walk_inode_records_in(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, (child_lower, child_upper), inodes, seen, faults, streams).is_err() {
 					faults.push(alloc::format!("subtree under {ptr} could not be walked").into_bytes());
 				}
 			}
@@ -422,7 +441,7 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// One file's extent map: as long as the inode claims, ordered by logical offset,
 	// non-overlapping, and every run individually possible.
-	fn check_file_shape(&mut self, num: u32, inode: &mut Inode, faults: &mut Vec<Vec<u8>>) {
+	fn check_file_shape(&mut self, num: u32, inode: &mut Inode, faults: &mut Vec<Vec<u8>>, streams: &mut u32) {
 		if self.load_spill(inode).is_err() {
 			faults.push(alloc::format!("inode {num}: the extent spill chain could not be read").into_bytes());
 			return;
@@ -430,8 +449,10 @@ impl<D: BlockDevice> LiberFs<D> {
 		if inode.extents.len() != inode.extent_count as usize {
 			faults.push(alloc::format!("inode {num}: the spill chain ends before the declared extent count").into_bytes());
 		}
+		// How many blocks the file's size can account for. Zero-length files map nothing.
+		let blocks_in_file = inode.size.div_ceil(BLOCK_SIZE as u64);
 		let mut end: Option<u64> = None;
-		for ext in inode.extents.iter() {
+		for ext in inode.extents.clone().iter() {
 			if self.check_extent(ext).is_err() {
 				faults.push(alloc::format!("inode {num}: an extent that cannot be true").into_bytes());
 				continue;
@@ -447,6 +468,31 @@ impl<D: BlockDevice> LiberFs<D> {
 				faults.push(alloc::format!("inode {num}: an extent whose logical range leaves the address space").into_bytes());
 				continue;
 			};
+			// AGAINST THE FILE'S END. Structure, ordering and overlap were all checked and the
+			// extent was never compared with `inode.size`, so a file of 4096 bytes could carry an
+			// extent mapped at logical block 1000: allocated, invisible in the file's contents, and
+			// reserved for as long as the volume lives. No legitimate writer produces one. Sparse
+			// holes are unaffected - this is about MAPPED blocks past the end.
+			if next_end > blocks_in_file {
+				faults.push(alloc::format!("inode {num}: an extent mapped past the end of the file").into_bytes());
+			}
+			// AND THE STREAM DECODES. `fsck` verified the checksum block's CRC and each stored
+			// block's CRC and never ran the decoder, so an extent whose blocks all checksum
+			// correctly and whose LZ stream is syntactically invalid gave "0 failures" here and
+			// `Corrupt` on the first read. The decoded bytes are dropped immediately; one extent is
+			// at most `CRCS_PER_BLOCK` blocks, so this is bounded whatever the file's size.
+			if ext.clen != 0 {
+				match self.decompress_extent_detailed(ext) {
+					Ok(_) => {}
+					Err(crate::ExtentFault::Stream) => {
+						faults.push(alloc::format!("inode {num}: a compressed extent whose stream does not decode").into_bytes());
+						*streams += 1;
+					}
+					Err(crate::ExtentFault::Checksum) => faults.push(alloc::format!("inode {num}: a compressed extent whose stored blocks do not match their checksums").into_bytes()),
+					Err(crate::ExtentFault::Io) => faults.push(alloc::format!("inode {num}: a compressed extent that could not be read").into_bytes()),
+					Err(crate::ExtentFault::Shape(_)) => faults.push(alloc::format!("inode {num}: a compressed extent whose record cannot be true").into_bytes()),
+				}
+			}
 			end = Some(next_end);
 		}
 	}

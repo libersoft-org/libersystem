@@ -191,10 +191,14 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 
 	// Increment 2: install the S-mode trap vector (STVEC) and exercise it.
 	super::traps::init();
-	// Permit S-mode access to U-mapped pages (SSTATUS.SUM, bit 18) so the kernel can
-	// seed user pages later; and enable the FPU (SSTATUS.FS = Initial, bit 13) so the
-	// context switch's fsd/fld and any compiler-emitted FP do not trap.
-	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) (1u64 << 18) | (1u64 << 13), options(nostack, preserves_flags)) };
+	// Enable the FPU (SSTATUS.FS = Initial, bit 13) so the context switch's fsd/fld and any
+	// compiler-emitted FP do not trap.
+	//
+	// SSTATUS.SUM (bit 18) is NOT set here any more. It used to be, for the kernel's whole life, so
+	// every stray kernel pointer was a potential user-memory access - the class of bug x86's SMAP
+	// turns into a fault. `paging::user_access` opens the window around the copies that need it and
+	// closes it again, and `paging::clac_on_entry` closes it on trap entry.
+	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1u64 << 13, options(nostack, preserves_flags)) };
 	// Let U-mode read the cycle / time / instret counters (SCOUNTEREN CY|TM|IR) so the
 	// userspace runtime's rdcycle-based perf clock does not trap.
 	unsafe { core::arch::asm!("csrw scounteren, {}", in(reg) 0x7u64, options(nostack, preserves_flags)) };

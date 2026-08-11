@@ -634,6 +634,12 @@ impl FramebufferRenderer {
 		// carried down by the bulk copy to a cell the exposed-row repaint does not cover; erase
 		// it (a scroll into history is always upward, so it lands below the exposed top rows).
 		let ghost = self.last_caret.take();
+		// THE MOUSE BLOCK RODE THE SAME COPY. The live `flush` path tracks it and dirties both the
+		// smear and the cell the pointer is still on; this one repaired the caret's ghost and not
+		// the pointer's, so wheeling through history left inverted blocks scattered down the screen
+		// with nothing to repaint them. The pointer does not move while the view does, so its cell
+		// has to be redrawn in place as well as where its pixels landed.
+		let mouse = screen.mouse();
 		if up {
 			self.surface.scroll_pixels_down(0, rows - 1, delta);
 			for row in 0..delta {
@@ -642,7 +648,7 @@ impl FramebufferRenderer {
 					self.draw_cell_at(screen, col, row, cell);
 				}
 			}
-			if let Some((cc, cr)) = ghost {
+			for (cc, cr) in ghost.into_iter().chain(mouse) {
 				let gr = cr + delta;
 				if gr < rows {
 					let cell = screen.view_cell(cc, gr);
@@ -657,6 +663,19 @@ impl FramebufferRenderer {
 					self.draw_cell_at(screen, col, row, cell);
 				}
 			}
+			for (cc, cr) in ghost.into_iter().chain(mouse) {
+				let gr = cr.saturating_sub(delta);
+				if cr >= delta {
+					let cell = screen.view_cell(cc, gr);
+					self.draw_cell_at(screen, cc, gr, cell);
+				}
+			}
+		}
+		// And the pointer's own cell, which did not move: its block has to be drawn back where it
+		// still is, whichever direction the view went.
+		if let Some((mc, mr)) = mouse {
+			let cell = screen.view_cell(mc, mr);
+			self.draw_cell_at(screen, mc, mr, cell);
 		}
 		// The whole screen's pixels moved, so the present must carry all of it.
 		self.mark(0, 0, cols * CELL_W, rows * CELL_H);
@@ -680,6 +699,18 @@ impl FramebufferRenderer {
 	// cursor). Inert while scrolled back or while the cursor is hidden (?25l).
 	fn blink_caret(&mut self, screen: &Screen) -> bool {
 		if screen.view_offset() > 0 {
+			return false;
+		}
+		// A STEADY caret does not blink, which is the whole distinction DECSCUSR draws and this
+		// ignored: the flag was recorded and had no getter, so `CSI 4 SP q` blinked and so did the
+		// default cursor. A steady caret that is already painted stays painted.
+		if !screen.cursor_blink() {
+			if self.last_caret.is_none() && screen.cursor_visible() && screen.cursor_col() < screen.cols() && screen.cursor_row() < screen.rows() {
+				self.draw_caret(screen, screen.cursor_col(), screen.cursor_row());
+				self.mark_cell(screen.cursor_col(), screen.cursor_row());
+				self.last_caret = Some((screen.cursor_col(), screen.cursor_row()));
+				return true;
+			}
 			return false;
 		}
 		if let Some((c, r)) = self.last_caret.take() {

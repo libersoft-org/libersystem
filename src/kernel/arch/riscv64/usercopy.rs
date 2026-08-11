@@ -2,10 +2,11 @@
 // `crate::extable` for why they exist, and `arch/aarch64/usercopy.rs` for the same byte loop and
 // the same reason for choosing it.
 //
-// SSTATUS.SUM is set at boot here, so an S-mode load or store may reach a U-mapped page without
-// bracketing. What it does NOT do is make the access safe: the page can go away between the check
-// and the copy, and then the load faults in S-mode with no handler willing to resume it. That is
-// what the table entries below are for.
+// SSTATUS.SUM is opened by `paging::user_access` around these copies and closed again afterwards -
+// it used to be set for the kernel's whole life, which made every stray kernel pointer a potential
+// user-memory access. The window does NOT make the access safe: the page can go away between the
+// check and the copy, and then the load faults in S-mode with no handler willing to resume it. That
+// is what the table entries below are for.
 
 use core::arch::asm;
 

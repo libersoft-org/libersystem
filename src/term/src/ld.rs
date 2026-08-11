@@ -18,27 +18,31 @@ use crate::Term;
 const LD_LINE_MAX: usize = 4096;
 pub const LD_HIST_MAX: usize = 512;
 
-// A small fixed buffer the line discipline accumulates echo bytes in, mirrored to the
-// serial port after a keystroke is processed (the framebuffer is echoed live).
+// The buffer the line discipline accumulates echo bytes in, mirrored to the serial port or the PTY
+// master after a keystroke is processed (the framebuffer is echoed live).
+//
+// IT GROWS. This was a fixed 512 bytes whose `push` simply stopped, and a line is up to
+// `LD_LINE_MAX` = 4096: `replace_line` - Ctrl+U, and every history recall - echoes the tail, then
+// three bytes per column to erase it, then the new line, which is past 20 kB for a full line. The
+// framebuffer echo is live and stayed correct, so the local display looked right while the serial
+// mirror and the PTY master received a truncated ESCAPE STREAM and lost sync - a half-written
+// sequence is not a shorter update, it is a terminal in a state nobody chose.
+//
+// One keystroke's echo, drained immediately by the caller, so the allocation is short-lived and
+// bounded by what the editor can emit for one edit.
 pub struct EchoBuf {
-	buf: [u8; 512],
-	len: usize,
+	buf: Vec<u8>,
 }
 
 impl EchoBuf {
 	pub fn new() -> EchoBuf {
-		EchoBuf { buf: [0u8; 512], len: 0 }
+		EchoBuf { buf: Vec::new() }
 	}
 	fn push(&mut self, bytes: &[u8]) {
-		for &b in bytes {
-			if self.len < self.buf.len() {
-				self.buf[self.len] = b;
-				self.len += 1;
-			}
-		}
+		self.buf.extend_from_slice(bytes);
 	}
 	pub fn as_slice(&self) -> &[u8] {
-		&self.buf[..self.len]
+		&self.buf
 	}
 }
 
@@ -75,7 +79,10 @@ pub struct Ld {
 	hist_max: usize,
 	hist_pos: usize,
 	esc: u8,
-	csi_param: u8,
+	// WIDER THAN A BYTE. This was a `u8` accumulated with `wrapping_mul`/`wrapping_add`, so
+	// `CSI 259~` wrapped to 3 and executed Delete - a key nobody pressed, from a sequence a
+	// terminal database or a mangled paste can produce.
+	csi_param: u16,
 	// false = raw mode (keystrokes pass through), true = cooked (line-edited). The
 	// program toggles it with ESC[?9001h/l in its output stream.
 	pub cooked: bool,
@@ -95,7 +102,10 @@ pub struct Ld {
 
 impl Ld {
 	pub fn new(history_max: usize) -> Ld {
-		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_max: history_max, hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true, eof: false, last_tab: false, relist: false }
+		// AT LEAST ONE. `Ld::new(0)` is a legal public call, and its first `commit` then ran
+		// `history.remove(0)` on an empty vector. The configuration path filters zero today, which
+		// is protection by coincidence - the constructor is public and the panic is here.
+		Ld { line: [0u8; LD_LINE_MAX], len: 0, cursor: 0, history: Vec::new(), hist_max: history_max.max(1), hist_pos: 0, esc: 0, csi_param: 0, cooked: true, echo: true, eof: false, last_tab: false, relist: false }
 	}
 
 	// Feed one cooked-mode keystroke (`vocab` is the Tab-completion vocabulary). Returns
@@ -148,7 +158,15 @@ impl Ld {
 				self.cursor = 0;
 				return true;
 			}
+			// PRINTABLE ASCII AND EVERYTHING ABOVE 0x7F. Cooked mode took `0x20..=0x7e` and dropped
+			// the rest, so this terminal rendered Czech perfectly and could not accept one accented
+			// character as INPUT - and an unbracketed paste comes through the same path byte by
+			// byte, so `příliš žluťoučký kůň` silently lost every non-ASCII byte.
+			//
+			// The bytes are buffered as they arrive; what has to know about UTF-8 is the EDITOR,
+			// which is why `backspace` and `move_left` below count characters rather than bytes.
 			0x20..=0x7e => self.insert(b, e),
+			0x80..=0xff => self.insert(b, e),
 			b'\t' => {
 				self.last_tab = true;
 				return self.tab(again, vocab, e);
@@ -224,7 +242,9 @@ impl Ld {
 			b'H' => self.home(e),
 			b'F' => self.end(e),
 			b'0'..=b'9' => {
-				self.csi_param = self.csi_param.wrapping_mul(10).wrapping_add(b - b'0');
+				// SATURATING, not wrapping: a parameter this terminal cannot mean is clamped to one
+				// it will not match, rather than folded into a small number that it will.
+				self.csi_param = self.csi_param.saturating_mul(10).saturating_add((b - b'0') as u16);
 				return;
 			}
 			b'~' => match self.csi_param {
@@ -263,53 +283,95 @@ impl Ld {
 		if self.cursor == 0 {
 			return;
 		}
+		// A WHOLE CHARACTER, not a byte. With non-ASCII input admitted, deleting one byte of a
+		// multi-byte sequence leaves a fragment that is not text and that the screen renders as a
+		// replacement character - so Backspace over `ř` had to be pressed twice and left rubbish in
+		// between.
+		let start = self.char_start(self.cursor);
+		let removed = self.cursor - start;
 		let mut i = self.cursor;
 		while i < self.len {
-			self.line[i - 1] = self.line[i];
+			self.line[i - removed] = self.line[i];
 			i += 1;
 		}
-		self.cursor -= 1;
-		self.len -= 1;
+		self.cursor = start;
+		self.len -= removed;
 		if self.echo {
+			// The echo is in COLUMNS: one character is one cell however many bytes it took.
 			e.put(b"\x08");
 			e.put(&self.line[self.cursor..self.len]);
 			e.put(b" ");
-			self.move_left(self.len - self.cursor + 1, e);
+			self.move_left(self.columns(self.cursor, self.len) + 1, e);
 		}
+	}
+
+	// The byte index where the character ending at `at` begins: `at` itself unless the byte before
+	// it is a UTF-8 continuation, in which case walk back over them. A lone continuation byte -
+	// which the medium can produce and this buffer can hold - stops after four steps rather than
+	// walking off the front.
+	fn char_start(&self, at: usize) -> usize {
+		let mut start = at;
+		let mut steps = 0;
+		while start > 0 && steps < 4 {
+			start -= 1;
+			steps += 1;
+			if self.line[start] & 0xc0 != 0x80 {
+				break;
+			}
+		}
+		start
+	}
+
+	// How many CHARACTERS the bytes in `from..to` occupy, which is how many columns they printed.
+	fn columns(&self, from: usize, to: usize) -> usize {
+		self.line[from..to].iter().filter(|&&b| b & 0xc0 != 0x80).count()
 	}
 
 	fn delete(&mut self, e: &mut Echo) {
 		if self.cursor >= self.len {
 			return;
 		}
-		let mut i = self.cursor + 1;
+		// The whole character under the cursor, for the same reason as `backspace`.
+		let mut end = self.cursor + 1;
+		while end < self.len && self.line[end] & 0xc0 == 0x80 {
+			end += 1;
+		}
+		let removed = end - self.cursor;
+		let mut i = end;
 		while i < self.len {
-			self.line[i - 1] = self.line[i];
+			self.line[i - removed] = self.line[i];
 			i += 1;
 		}
-		self.len -= 1;
+		self.len -= removed;
 		if self.echo {
 			e.put(&self.line[self.cursor..self.len]);
 			e.put(b" ");
-			self.move_left(self.len - self.cursor + 1, e);
+			self.move_left(self.columns(self.cursor, self.len) + 1, e);
 		}
 	}
 
+	// One CHARACTER left, and one cell of echo - see `backspace`. Stepping one byte left over a
+	// multi-byte character put the cursor inside it, so the next insert or delete split it.
 	fn left(&mut self, e: &mut Echo) {
 		if self.cursor > 0 {
 			if self.echo {
 				e.put(b"\x08");
 			}
-			self.cursor -= 1;
+			self.cursor = self.char_start(self.cursor);
 		}
 	}
 
 	fn right(&mut self, e: &mut Echo) {
 		if self.cursor < self.len {
-			if self.echo {
-				e.put(&self.line[self.cursor..self.cursor + 1]);
+			// The whole character: its lead byte and every continuation after it.
+			let mut end = self.cursor + 1;
+			while end < self.len && self.line[end] & 0xc0 == 0x80 {
+				end += 1;
 			}
-			self.cursor += 1;
+			if self.echo {
+				e.put(&self.line[self.cursor..end]);
+			}
+			self.cursor = end;
 		}
 	}
 

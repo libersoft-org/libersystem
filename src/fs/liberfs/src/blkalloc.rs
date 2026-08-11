@@ -1,5 +1,15 @@
 use crate::*;
 
+// Why a compressed extent could not be produced. The medium, the metadata's shape, its checksums
+// and its LZ stream fail for different reasons and mean different things to whoever reads a report;
+// only `fsck` needs the difference, and everything else collapses them back into one `FsError`.
+pub(crate) enum ExtentFault {
+	Io,
+	Shape(FsError),
+	Checksum,
+	Stream,
+}
+
 impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn is_alloc(&self, block: u64) -> bool {
 		self.free[(block / 8) as usize] & (1 << (block % 8)) != 0
@@ -683,30 +693,44 @@ impl<D: BlockDevice> LiberFs<D> {
 	// CRC32C in the checksum block, so corruption of the compressed bytes surfaces as
 	// `FsError::Corrupt` rather than bad data.
 	pub(crate) fn decompress_extent(&mut self, ext: &Extent) -> Result<Vec<u8>, FsError> {
-		self.check_extent(ext)?;
+		self.decompress_extent_detailed(ext).map_err(|fault| match fault {
+			ExtentFault::Io => FsError::Io,
+			ExtentFault::Shape(error) => error,
+			ExtentFault::Checksum | ExtentFault::Stream => FsError::Corrupt,
+		})
+	}
+
+	// The same read, with WHY it failed kept apart.
+	//
+	// `fsck` needs the difference: a stored block that does not match its CRC says the medium is
+	// failing, and an LZ stream that does not decode says the metadata is wrong even though every
+	// block came back exactly as written. Reporting both as "corrupt" sends an operator to the
+	// wrong place. Everything above this line still gets one `FsError`.
+	pub(crate) fn decompress_extent_detailed(&mut self, ext: &Extent) -> Result<Vec<u8>, ExtentFault> {
+		self.check_extent(ext).map_err(ExtentFault::Shape)?;
 		let mut cbuf = vec![0u8; BLOCK_SIZE];
 		if !self.read_block_csum_aware(ext.csum, &mut cbuf) {
-			return Err(FsError::Io);
+			return Err(ExtentFault::Io);
 		}
 		if crc32c(&cbuf) != ext.csum_crc {
-			return Err(FsError::Corrupt);
+			return Err(ExtentFault::Checksum);
 		}
 		let mut comp = vec![0u8; ext.store_len as usize * BLOCK_SIZE];
 		for s in 0..ext.store_len as usize {
 			let dst = &mut comp[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE];
 			if !self.dev.read_block(ext.stored(s as u64), dst) {
-				return Err(FsError::Io);
+				return Err(ExtentFault::Io);
 			}
 			let stored = u32::from_le_bytes(cbuf[s * 4..s * 4 + 4].try_into().unwrap());
 			if crc32c(dst) != stored {
-				return Err(FsError::Corrupt);
+				return Err(ExtentFault::Checksum);
 			}
 		}
 		// clen is CRC-protected with the extent record, but bound it defensively anyway:
 		// a slice past the stored bytes must never panic. The decoder is bounded by the
 		// run's logical size, so a lying stream header cannot demand an absurd allocation.
 		let clen = (ext.clen as usize).min(comp.len());
-		lz_decompress(&comp[..clen], ext.length as usize * BLOCK_SIZE).ok_or(FsError::Corrupt)
+		lz_decompress(&comp[..clen], ext.length as usize * BLOCK_SIZE).ok_or(ExtentFault::Stream)
 	}
 
 	// Try to transparently compress each of a freshly written file's raw extents in
@@ -715,7 +739,19 @@ impl<D: BlockDevice> LiberFs<D> {
 	// block-by-block writer stays simple and partial updates keep working on raw runs.
 	pub(crate) fn compress_inode(&mut self, inode: &mut Inode) -> Result<(), FsError> {
 		for i in 0..inode.extents.len() {
-			self.compress_extent(inode, i)?;
+			match self.compress_extent(inode, i) {
+				Ok(()) => {}
+				// COMPRESSION IS AN OPTIMISATION, and this is what saying so has to mean. The
+				// temporary blocks a compression attempt needs are not the file's: the raw file is
+				// already written and committed-in-transaction by the time this runs, so failing
+				// the write for want of space to hold a SMALLER copy of it refused a file that fits
+				// - and rolled the whole transaction back. The attempt is discarded and the run
+				// stays raw, which is exactly what the documentation always said happens.
+				Err(FsError::NoSpace) => return Ok(()),
+				// A failing device or a corrupt source still propagates: those are not "this run
+				// stays raw", they are the write not having worked.
+				Err(error) => return Err(error),
+			}
 		}
 		Ok(())
 	}
@@ -758,7 +794,19 @@ impl<D: BlockDevice> LiberFs<D> {
 		let first = self.alloc_data()?;
 		let mut last = first;
 		for _ in 1..store_len {
-			let b = self.alloc_data()?;
+			// A failure here releases what was already claimed. It used to propagate with the
+			// claims still held, so a compression attempt that ran out of space left blocks
+			// reserved by nothing until the next commit rederived the map - and with the caller now
+			// treating `NoSpace` as "leave it raw", that would be a leak on an ordinary path.
+			let b = match self.alloc_data() {
+				Ok(b) => b,
+				Err(error) => {
+					for claimed in first..=last {
+						self.unclaim(claimed);
+					}
+					return Err(error);
+				}
+			};
 			if b != last + 1 {
 				for claimed in first..=last {
 					self.unclaim(claimed);
@@ -781,7 +829,15 @@ impl<D: BlockDevice> LiberFs<D> {
 			let crc = crc32c(&blk);
 			cbuf[s * 4..s * 4 + 4].copy_from_slice(&crc.to_le_bytes());
 		}
-		let csum = self.alloc_meta()?;
+		let csum = match self.alloc_meta() {
+			Ok(b) => b,
+			Err(error) => {
+				for claimed in first..=last {
+					self.unclaim(claimed);
+				}
+				return Err(error);
+			}
+		};
 		if !self.dev.write_block(csum, &cbuf) {
 			return Err(FsError::Io);
 		}

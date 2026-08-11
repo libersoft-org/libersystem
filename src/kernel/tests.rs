@@ -853,7 +853,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 // component's float `score` export. The kernel only brokers the initial capabilities.
 // Returns (expected, content, logged, score): the upper-cased granted file, the bytes
 // the component produced, whether the log grant was reached, and the float result.
-fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, bool, i32, i32), &'static str> {
+fn run_component_scenario() -> Result<ComponentRun, &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
@@ -886,16 +886,60 @@ fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>,
 
 	sched::run_until_idle();
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
-	let bytes: alloc::vec::Vec<u8> = result.bytes;
-	if bytes.len() < 9 {
+	let report = parse_component_report(&result.bytes)?;
+	Ok(ComponentRun { expected, report })
+}
+
+// What component_host sends back: a log-grant flag, the two scores, `run`'s return value, the
+// output file read back off the volume AFTER the run, and the copy the component handed to its
+// write import.
+//
+// ONE PARSER, because there are two readers - this scenario and the volume-layout suite - and the
+// report has grown three times. The second reader was left on a stale offset by the last growth and
+// compared four bytes of score against the file's contents; a positional tuple did the same thing
+// inside this function.
+pub struct ComponentReport {
+	pub logged: bool,
+	pub score: i32,
+	pub score_negative: i32,
+	pub count: i32,
+	pub readback: alloc::vec::Vec<u8>,
+	pub output: alloc::vec::Vec<u8>,
+}
+
+pub fn parse_component_report(bytes: &[u8]) -> Result<ComponentReport, &'static str> {
+	if bytes.len() < 17 {
 		return Err("the host report was too short");
 	}
-	let logged: bool = bytes[0] != 0;
-	let score: i32 = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-	// The negative case, where truncation and flooring differ - see the host, and `score`'s comment.
-	let score_negative: i32 = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
-	let content: alloc::vec::Vec<u8> = bytes[5..].to_vec();
-	Ok((expected, content, logged, score, score_negative))
+	let word = |at: usize| i32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+	let written: usize = word(13) as u32 as usize;
+	if bytes.len() < 17 + written {
+		return Err("the host report claimed more written bytes than it carried");
+	}
+	Ok(ComponentReport {
+		logged: bytes[0] != 0,
+		score: word(1),
+		// The negative case, where truncation and flooring differ - see the host, and `score`'s
+		// comment.
+		score_negative: word(5),
+		// What `run` returned: the byte count it processed, or one of the world's negative statuses.
+		// This was read into `_count` in the host and dropped, so nothing checked the export's
+		// return ABI on either side.
+		count: word(9),
+		// The FILE, read back through StorageService after the run - the only thing that can prove
+		// the write happened.
+		readback: bytes[17..17 + written].to_vec(),
+		// And the copy the component handed to its write import, which says the bytes reached the
+		// granted path at all.
+		output: bytes[17 + written..].to_vec(),
+	})
+}
+
+// What one run of the SDK component produced: the bytes the granted file should have become, and
+// everything the host reported.
+pub struct ComponentRun {
+	pub expected: alloc::vec::Vec<u8>,
+	pub report: ComponentReport,
 }
 
 // Build the resource topology and run it to completion. The resource_manager

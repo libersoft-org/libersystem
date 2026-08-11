@@ -40,28 +40,30 @@ impl SharedPage {
 
 impl Drop for SharedPage {
 	fn drop(&mut self) {
-		// This SHOULD retire rather than deallocate, and it does not yet - see P02M0133.
+		// RETIRE, like every other frame that was ever in a page table.
 		//
-		// The frame was in a page table, so another core can hold a translation for it, and
-		// `deallocate` hands it straight back to the allocator with nothing between. The private ELF
-		// frames have always retired; this is the one path around the mechanism, and it is
-		// reachable through `load_module_into`, which maps into a RUNNING process.
+		// This one path used to `deallocate`, handing the frame straight back to the allocator with
+		// nothing between - while another core could still hold a translation for it. It is
+		// reachable through `load_module_into`, which maps into a RUNNING process whose other
+		// threads are on other cores, and x86's `unmap_page_in` does a local `invlpg` only. So a
+		// relocation failure in a module loaded into a live process could free a frame a running
+		// thread still reached.
 		//
-		// Changing it to `retire` was tried on 2026-08-10 and reverted the same day, because it
-		// leaks a frame on the path that matters most: `retire` queues into a heap-allocated
-		// quarantine, the heap grows by taking FRAMES, and the failure this drop runs on is
-		// precisely "there are no frames". The queue then cannot take it, the fallback needs a
-		// shootdown, and when that does not complete the page is counted lost - which the
-		// out-of-frames rollback test caught exactly: `a load refused at allocation 85 kept 1
+		// It was tried once before, on 2026-08-10, and reverted the same day: `retire` queued into a
+		// HEAP-allocated quarantine, the heap grows by taking frames, and the failure this drop runs
+		// on is precisely "there are no frames" - so the queue could not take it, the fallback
+		// needed a shootdown, and when that did not complete the page was counted lost. The
+		// out-of-frames rollback test caught it exactly: `a load refused at allocation 85 kept 1
 		// frame(s) it took (0 still quarantined)`.
 		//
-		// So this waits on the allocation-free quarantine, and the two land together. Retiring into
-		// a queue that cannot allocate is not safer than freeing; it is the same defect with an
-		// extra step.
+		// The quarantine is now a fixed 512-entry array that allocates nothing, so the reason is
+		// gone: a push refuses only when it is FULL, and the caller then pays for its own shootdown
+		// - the path that already existed. The two findings landed together, which is what the
+		// milestone said they had to do.
 		//
 		// SAFETY: this type owns the frame from creation to here, and the map that hands
 		// out `Weak` references to it is the only place it is reachable from.
-		unsafe { frame::deallocate(self.frame) };
+		unsafe { frame::retire(&[self.frame]) };
 	}
 }
 

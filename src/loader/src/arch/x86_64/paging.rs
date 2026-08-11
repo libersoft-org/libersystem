@@ -117,6 +117,17 @@ impl PageTables {
 		let slot = unsafe { table_ptr(table).add(index) };
 		let entry = unsafe { slot.read_volatile() };
 		if entry & PRESENT != 0 {
+			// A HUGE LEAF IS NOT A TABLE. This returned `entry & ADDR_MASK` for any present entry,
+			// so a 4 KiB mapping whose address fell under one of the 2 MiB pages the HHDM and the
+			// identity map are built from took that leaf's FRAME address as a page table - and
+			// wrote page-table entries into ordinary physical memory, wherever the leaf pointed.
+			//
+			// Not reachable with the current linker script, because the kernel's virtual addresses
+			// do not collide with those maps. It is reachable from a malformed image, because the
+			// loader maps whatever `p_vaddr` the image declares.
+			if entry & HUGE != 0 {
+				return None;
+			}
 			return Some(entry & ADDR_MASK);
 		}
 		let new = alloc_table(self.bs)?;

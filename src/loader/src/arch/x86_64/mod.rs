@@ -42,6 +42,9 @@ const MAX_SEGMENTS: usize = 16;
 
 // Halt the core (panic path): interrupts off, hlt forever. panic=abort, no unwind.
 pub fn halt() -> ! {
+	// Interrupts really off, which the comment above has always claimed and the code did not do: a
+	// bare `hlt` wakes on the next interrupt and spins the loop forever.
+	unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
 	loop {
 		unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
 	}
@@ -148,6 +151,17 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		(*boot_info).dtb = 0; // x86 uses ACPI, not a device tree.
 	}
 
+	// GIVE THE HEAP BACK before the map is taken. Everything the kernel receives is in pages of
+	// its own by now; the arenas underneath are the loader's own working memory, and left alone
+	// they reach the kernel as `MEM_BOOTLOADER` - which its frame allocator never seeds, so they
+	// would be reserved for the system's whole life. The number is printed because it is the one
+	// this milestone asked to be measured.
+	{
+		let freed = crate::heap::release(bs) / 1024;
+		serial::write_str("loader: returned ");
+		crate::serial_write_usize(freed);
+		serial::write_str(" KiB of loader heap\n");
+	}
 	// Snapshot the memory map and exit boot services. GetMemoryMap must be the
 	// last firmware call before ExitBootServices, so the region translation (no
 	// allocation) happens inline and the whole thing retries if the map changed.
@@ -159,10 +173,28 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let boot_info_virt = HHDM_OFFSET + boot_info_phys;
 	unsafe {
 		asm!(
+			// INTERRUPTS OFF ACROSS THE HANDOFF. After `ExitBootServices` the firmware's handlers
+			// are gone and the kernel installs its IDT some way into `kmain`, so an interrupt in
+			// this window vectors through a table nobody owns. The window is small and real.
+			"cli",
 			"mov cr3, {cr3}",
 			"mov rsp, {stack}",
 			"mov rdi, {info}",
+			// THE SysV STACK ALIGNMENT the compiler built `kmain` for. `stack_top` is page-aligned,
+			// so `rsp % 16 == 0` here - but `kmain` is an ordinary `extern "C" fn` and the compiler
+			// emits it expecting the state a CALL leaves: `rsp % 16 == 8` at the first instruction,
+			// the return address accounting for the difference. Every aligned stack access it emits
+			// was off by eight, and it works today only because nothing on that path spills to an
+			// aligned slot.
+			//
+			// A pushed return address is what a `call` would have left, and it doubles as the
+			// honest answer to "what happens if the kernel returns": it cannot, and the address
+			// pushed is this `ud2`.
+			"lea rax, [rip + 2f]",
+			"push rax",
 			"jmp {entry}",
+			"2:",
+			"ud2",
 			cr3 = in(reg) tables.pml4,
 			stack = in(reg) stack_top,
 			info = in(reg) boot_info_virt,
@@ -197,6 +229,15 @@ fn load_kernel(bs: *mut BootServices, kernel: &[u8], out: &mut [KernelSegment; M
 	// placed at its link addresses and jumped to unrelocated. Refused by name until a PIE kernel is
 	// wanted, which is a change here rather than to the parser.
 	assert!(image.image_type == crate::elf::ET_EXEC, "loader: the kernel image must be ET_EXEC");
+	// AND PAGE-ALIGNED LOAD ADDRESSES. This backend allocates from `p_memsz`, copies to the
+	// segment's own address and maps from `align_down(..)`, all of which are wrong by the page
+	// offset if a LOAD segment does not start on a page. The ELF format does not require it - it
+	// requires `p_vaddr = p_offset (mod p_align)`, which the parser checks for every image - so the
+	// stricter rule belongs to the kernel image, here, beside the code that depends on it.
+	for i in 0..image.segment_count() {
+		let Some(ph) = image.segment(i) else { continue };
+		assert!(ph.p_type != crate::elf::PT_LOAD || ph.p_vaddr % PAGE_SIZE == 0, "loader: a kernel LOAD segment is not page-aligned");
+	}
 	let mut count = 0usize;
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
@@ -271,27 +312,47 @@ fn memory_top(bs: *mut BootServices) -> u64 {
 	let mut key = 0usize;
 	let mut desc_size = 0usize;
 	let mut desc_ver = 0u32;
-	// First call sizes the buffer.
-	unsafe { ((*bs).get_memory_map)(&mut map_size, core::ptr::null_mut(), &mut key, &mut desc_size, &mut desc_ver) };
+	// First call sizes the buffer - and its ANSWER MATTERS. It was ignored, so `desc_size` was
+	// whatever the firmware left there and `map_size / desc_size` below could divide by zero.
+	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, core::ptr::null_mut(), &mut key, &mut desc_size, &mut desc_ver) };
+	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
+		return 0;
+	}
 	map_size += desc_size * 8;
-	let buf = match alloc_pages(bs, map_size.div_ceil(PAGE_SIZE as usize)) {
+	// The page count is kept, because the second `GetMemoryMap` OVERWRITES `map_size` with the
+	// real size - and the free below used the new value, leaking the difference whenever the real
+	// map was smaller than the padded estimate.
+	let pages = map_size.div_ceil(PAGE_SIZE as usize);
+	let buf = match alloc_pages(bs, pages) {
 		Some(p) => p as *mut uefi::MemoryDescriptor,
 		None => return 0,
 	};
 	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, buf, &mut key, &mut desc_size, &mut desc_ver) };
 	if uefi::is_error(status) {
+		unsafe { ((*bs).free_pages)(buf as u64, pages) };
 		return 0;
 	}
+	// RAM ONLY. This took the maximum over EVERY descriptor, so a firmware that describes a PCI
+	// window or an MMIO aperture high in the address space made the HHDM and the identity map span
+	// the whole interval in 2 MiB pages - megabytes of page tables, seconds of boot time, a direct
+	// map laid over physical holes, and device memory mapped write-back, when only the framebuffer
+	// is given `PCD | PWT`. The kernel translates RAM through the HHDM; it reaches devices through
+	// its own mappings.
 	let mut top = 0u64;
 	let entries = map_size / desc_size;
 	for i in 0..entries {
 		let d = unsafe { &*((buf as *const u8).add(i * desc_size) as *const uefi::MemoryDescriptor) };
-		let end = d.phys_start + d.page_count * PAGE_SIZE;
+		if d.ty == uefi::MEMORY_MAPPED_IO || d.ty == uefi::MEMORY_MAPPED_IO_PORT_SPACE {
+			continue;
+		}
+		let Some(end) = d.page_count.checked_mul(PAGE_SIZE).and_then(|bytes| d.phys_start.checked_add(bytes)) else {
+			continue;
+		};
 		if end > top {
 			top = end;
 		}
 	}
-	unsafe { ((*bs).free_pages)(buf as u64, map_size.div_ceil(PAGE_SIZE as usize)) };
+	unsafe { ((*bs).free_pages)(buf as u64, pages) };
 	top
 }
 
@@ -305,7 +366,10 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 	let mut key = 0usize;
 	let mut desc_size = 0usize;
 	let mut desc_ver = 0u32;
-	unsafe { ((*bs).get_memory_map)(&mut map_size, core::ptr::null_mut(), &mut key, &mut desc_size, &mut desc_ver) };
+	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, core::ptr::null_mut(), &mut key, &mut desc_size, &mut desc_ver) };
+	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
+		panic!("loader: the firmware did not describe its memory map");
+	}
 	let cap = map_size + desc_size * 16;
 	let buf = alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 
@@ -320,9 +384,18 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 		// makes a later allocation fail loudly instead of handing out memory the loader no
 		// longer owns.
 		crate::heap::retire();
+		// And the firmware's console with it: after this call `ConOut` points at memory the loader
+		// no longer owns, so every later diagnostic goes to the built-in UART.
+		crate::console::release();
 		let status = unsafe { ((*bs).exit_boot_services)(image_handle, key) };
 		if !uefi::is_error(status) {
 			return count;
+		}
+		// ONLY a stale map key is worth retrying - the specification's `EFI_INVALID_PARAMETER`.
+		// This looped on every error forever, which is the least informative possible response to a
+		// firmware saying something else is wrong.
+		if status != uefi::STATUS_INVALID_PARAMETER {
+			panic!("loader: ExitBootServices refused");
 		}
 		// The map changed; retry without allocating.
 	}
@@ -334,8 +407,12 @@ fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_size:
 	let entries = map_size / desc_size;
 	let mut n = 0usize;
 	for i in 0..entries {
+		// FATAL, not silent. Breaking here handed the kernel a map that looked complete and was
+		// missing its tail - the worst available failure mode for the one structure that says which
+		// RAM exists, and one that would surface as memory corruption long afterwards.
 		if n >= MAX_REGIONS {
-			break;
+			serial::write_str("loader: FATAL - the firmware memory map has more regions than the boot protocol carries\n");
+			panic!("memory map larger than MAX_REGIONS");
 		}
 		let d = unsafe { &*((buf as *const u8).add(i * desc_size) as *const uefi::MemoryDescriptor) };
 		let kind = region_kind(d.ty);

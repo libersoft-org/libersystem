@@ -481,21 +481,48 @@ pub fn smep_enabled() -> bool {
 pub fn nx_enabled() -> bool {
 	false
 }
-pub fn clac_on_entry() {}
+// SSTATUS.SUM, the bit that lets S-mode touch a U-mapped page. x86 has SMAP and `stac`/`clac`;
+// this is the same window, and until now it was open for the whole life of the kernel.
+const SSTATUS_SUM: u64 = 1 << 18;
 
+// Clear SUM on trap entry, so a trap taken INSIDE a window does not run the handler with user
+// access - and a trap that context-switches does not leak the window into the next thread. The trap
+// frame saves SSTATUS and the return path restores it with `csrw sstatus, t1`, so clearing it here
+// is invisible to the interrupted code.
+pub fn clac_on_entry() {
+	unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) SSTATUS_SUM, options(nostack, preserves_flags)) };
+}
+
+// Run `f` with user access permitted, and close the window again.
+//
+// The kernel used to run with SUM set permanently, which made every stray kernel pointer a
+// potential user-memory access - the class of bug x86's SMAP exists to turn into a fault. Every
+// kernel access to user memory already goes through this function, so the window is exactly as wide
+// as the callers that need it.
+//
+// NESTING-SAFE: the previous value is read back from `csrrs`, and SUM is cleared afterwards only if
+// it was clear before - an inner window must not close an outer one. Interrupts need no masking
+// here because `clac_on_entry` closes the window on trap entry and the saved SSTATUS reopens it on
+// return.
 pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
-	f()
+	let previous: u64;
+	unsafe { core::arch::asm!("csrrs {0}, sstatus, {1}", out(reg) previous, in(reg) SSTATUS_SUM, options(nostack, preserves_flags)) };
+	let result = f();
+	if previous & SSTATUS_SUM == 0 {
+		unsafe { core::arch::asm!("csrc sstatus, {}", in(reg) SSTATUS_SUM, options(nostack, preserves_flags)) };
+	}
+	result
 }
 
 // Copy `bytes` into a USER-mapped page at `dst` (a VA in the active address space).
-// SSTATUS.SUM (set at boot) lets the S-mode kernel touch the U-mapped page; the page
-// holds U-mode code, so `fence.i` makes the freshly written bytes coherent with the
-// instruction fetch.
+// The copy runs inside a `user_access` window - SUM is no longer set for the kernel's whole life,
+// so this is where it opens - and the page holds U-mode code, so `fence.i` makes the freshly
+// written bytes coherent with the instruction fetch.
 pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
-	unsafe {
+	user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
 		asm!("fence.i", options(nostack, preserves_flags));
-	}
+	});
 }
 
 // The boot identity map (root[2]) is only used during the hand-off; the kernel runs

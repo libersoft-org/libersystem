@@ -298,13 +298,23 @@ impl<'a> Elf<'a> {
 			if ph.p_flags & PF_W != 0 && ph.p_flags & PF_X != 0 {
 				return None;
 			}
-			// A load address that is not 4 KiB-aligned. x86 allocates from `p_memsz`, copies to
-			// `phys + 0` and maps `align_down(p_vaddr)`, which is wrong by the page offset - and
-			// the image format is ours, so refusing is the answer rather than computing it. 4096 is
-			// written out because this crate is the boot protocol and has no page constant of its
-			// own; every target it loads for uses it as the smallest page.
-			if ph.p_vaddr % 4096 != 0 {
-				return None;
+			// THE ELF CONGRUENCE, which is what the format actually requires: a loadable segment
+			// must satisfy `p_vaddr = p_offset (mod p_align)`, so a single file mapping places the
+			// bytes at the right offset within their page.
+			//
+			// Absolute 4 KiB alignment was demanded here first, and it is not the rule. Every
+			// shared object in the tree is linked with `p_align = 0x10000` and non-page-aligned
+			// vaddrs (`0x3478c`), so this refused `lsrt.lslib` and the whole aarch64 image build
+			// stopped at "no valid target ELF". What the x86 kernel loader needs - a page-aligned
+			// LOAD address, because it copies to `phys + 0` and maps `align_down(p_vaddr)` - is a
+			// requirement of THAT loader and is asserted there, next to the code that assumes it.
+			if ph.p_align > 1 {
+				if !ph.p_align.is_power_of_two() {
+					return None;
+				}
+				if ph.p_vaddr % ph.p_align != ph.p_offset % ph.p_align {
+					return None;
+				}
 			}
 		}
 		Some(image)

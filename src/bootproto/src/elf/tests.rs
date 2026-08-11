@@ -352,5 +352,26 @@ fn a_malformed_pt_load_is_refused_by_the_parser_rather_than_by_each_loader() {
 		ph.p_memsz = 1 << 20;
 	});
 	refused("a segment that is both writable and executable", &|ph| ph.p_flags = PF_R | PF_W | PF_X);
-	refused("a load address that is not page-aligned", &|ph| ph.p_vaddr = 0x1008);
+	refused("a load address whose page offset does not match the file offset", &|ph| ph.p_vaddr = 0x1008);
+	refused("an alignment that is not a power of two", &|ph| ph.p_align = 3000);
+}
+
+#[test]
+fn a_shared_object_is_not_required_to_be_page_aligned() {
+	// The congruence `p_vaddr = p_offset (mod p_align)` is what ELF requires, and absolute 4 KiB
+	// alignment was demanded here first. Every shared object in this tree is linked with
+	// `p_align = 0x10000` and addresses like `0x3478c`, so that rule refused `lsrt.lslib` and the
+	// aarch64 image build stopped at "no valid target ELF" - a whole architecture, from one
+	// comparison that reads plausibly.
+	//
+	// The stricter rule the x86 kernel loader needs is asserted in the loader, beside the code that
+	// copies to `phys + 0` and maps from `align_down(p_vaddr)`.
+	let payload = vec![0xAAu8; 0x2000];
+	let congruent = ProgramHeader { p_type: PT_LOAD, p_flags: PF_R | PF_X, p_offset: 0x78c, p_vaddr: 0x1078c, p_paddr: 0x1078c, p_filesz: 0x100, p_memsz: 0x100, p_align: 0x10000 };
+	assert!(Elf::parse(&image(ET_DYN, &[congruent], &payload)).is_some(), "a real shared object's segment must parse");
+
+	let mut incongruent = congruent;
+	incongruent.p_vaddr = 0x10000;
+	incongruent.p_paddr = 0x10000;
+	assert!(Elf::parse(&image(ET_DYN, &[incongruent], &payload)).is_none(), "a segment that cannot be mapped from the file as-is");
 }

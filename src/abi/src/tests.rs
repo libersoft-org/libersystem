@@ -371,3 +371,65 @@ fn an_encode_that_does_not_fit_writes_nothing() {
 	assert!(encode(1, Severity::Info, b"a-source-that-does-not-fit", &fields, &mut out).is_none());
 	assert!(out.iter().all(|&b| b == 0xEE), "a refused encode left bytes behind: {out:?}");
 }
+
+// ---- The bootstrap list and the archive built from it -------------------------------------
+
+#[test]
+fn a_bootstrap_list_is_read_the_same_way_however_it_was_written() {
+	use crate::bootstrap::{Row, parse_list};
+
+	let named = |rows: &[Row<'_>]| -> alloc::vec::Vec<alloc::vec::Vec<u8>> { rows.iter().map(|row| [row.name, b" ", row.path].concat()).collect() };
+
+	// A CRLF file left `\r` on the end of every path, so every read of every program failed on a
+	// list edited on the wrong machine - a boot that dies with nothing to say which line did it.
+	let crlf = parse_list(b"init bin/init\r\nshell bin/shell\r\n").expect("a CRLF list is a list");
+	assert_eq!(named(&crlf), [b"init bin/init".to_vec(), b"shell bin/shell".to_vec()]);
+
+	// A tab is a separator, repeated spaces are not part of the path, and a blank or commented
+	// line is not a row.
+	let mixed = parse_list(b"# the bootstrap set\ninit\tbin/init\n\n  shell   bin/shell  \n").expect("tabs, comments and padding");
+	assert_eq!(named(&mixed), [b"init bin/init".to_vec(), b"shell bin/shell".to_vec()]);
+
+	// And the refusals: a row with no separator, an empty name, an empty path, a duplicate name,
+	// a name too long for the entry field, and a list with no rows at all.
+	assert!(parse_list(b"init\n").is_none(), "a row with no path");
+	assert!(parse_list(b" bin/init\n").is_none(), "an empty name");
+	assert!(parse_list(b"init \n").is_none(), "an empty path");
+	assert!(parse_list(b"init bin/init\ninit bin/other\n").is_none(), "a duplicate name");
+	assert!(parse_list(&[&[b'n'; crate::PKG_NAME_LEN + 1][..], b" bin/init\n"].concat()).is_none(), "a name that does not fit the entry");
+	assert!(parse_list(b"\n# nothing but a comment\n").is_none(), "a list with no rows");
+}
+
+#[test]
+fn a_built_package_reads_back_as_the_files_that_went_into_it() {
+	use crate::Package;
+	use crate::bootstrap::build_package;
+
+	let entries: [(&[u8], &[u8]); 2] = [(b"init", b"the init program"), (b"shell", b"the shell")];
+	let archive = build_package(&entries).expect("a package");
+	let parsed = Package::parse(&archive).expect("the writer and the reader agree");
+	assert_eq!(parsed.len(), 2);
+	assert_eq!(parsed.lookup(b"init"), Some(&b"the init program"[..]));
+	assert_eq!(parsed.lookup(b"shell"), Some(&b"the shell"[..]));
+}
+
+#[test]
+fn a_package_that_would_describe_itself_wrongly_is_not_built() {
+	use crate::bootstrap::{MAX_ENTRIES, build_package};
+
+	// The count, every offset and every length are `u32`. Unchecked `as u32` meant a large enough
+	// set produced an archive whose table pointed somewhere other than its data - and the kernel
+	// would then read whatever happened to be there as a program. None of these can be reached with
+	// real files on a real medium; that is exactly why the arithmetic was never noticed.
+	assert!(build_package(&[]).is_none(), "an empty package is not a package");
+	assert!(build_package(&[(b"", b"body")]).is_none(), "an entry with no name");
+	assert!(build_package(&[(&[b'n'; crate::PKG_NAME_LEN + 1], b"body")]).is_none(), "a name that does not fit the entry");
+
+	let many: alloc::vec::Vec<(&[u8], &[u8])> = (0..MAX_ENTRIES + 1).map(|_| (&b"name"[..], &b"body"[..])).collect();
+	assert!(build_package(&many).is_none(), "more entries than the format is allowed to carry");
+
+	// A blob larger than the per-file limit, without allocating one: the limit is checked from the
+	// slice's length, so a slice that claims the length is enough to prove the check runs.
+	let huge = unsafe { core::slice::from_raw_parts(1 as *const u8, crate::bootstrap::MAX_FILE_BYTES + 1) };
+	assert!(build_package(&[(b"init", huge)]).is_none(), "a file larger than the format's limit");
+}

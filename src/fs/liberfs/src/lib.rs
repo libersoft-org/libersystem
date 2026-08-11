@@ -425,6 +425,11 @@ pub struct FsckReport {
 	// Kept apart from `checksum_failures` because the two mean different things to an
 	// operator: one says the medium is failing, the other says the metadata is wrong.
 	pub structural_failures: u32,
+	// A compressed extent whose stored blocks all match their checksums and whose LZ stream still
+	// does not decode. Neither of the two above: the medium gave back what was written and the
+	// shape is legal, and yet the file cannot be read. `fsck` used to run no decoder at all, so
+	// this was a volume reporting zero failures and answering `Corrupt` to the first read.
+	pub stream_failures: u32,
 	// One line per structural fault, in the order found, naming what and where.
 	pub faults: Vec<Vec<u8>>,
 }
@@ -990,6 +995,11 @@ pub struct LiberFs<D: BlockDevice> {
 	// block seen twice, which `derive_free` turns into corruption.
 	mark_strict: bool,
 	mark_dup: Option<u64>,
+	// One bit per inode number for the live generation's namespace walk, and whether it found an
+	// inode named twice. The format has no hardlinks and no link count, so one name per inode is
+	// its rule; `derive_free` is where it can be checked without reading anything extra.
+	mark_names: Option<Vec<u8>>,
+	mark_alias: bool,
 	// The highest inode key the live walk saw. `next_inode` hands out numbers ABOVE
 	// everything in use, and checking only that `next_inode` itself is free is not that
 	// invariant: with inodes 1 and 3 live and 2 deleted, a counter of 2 passes - and the

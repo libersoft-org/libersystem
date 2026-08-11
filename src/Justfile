@@ -270,6 +270,12 @@ loader-riscv64:
     out="../../.build/cargo/loader/riscv64gc-unknown-none-elf/debug/libersystem-loader"
     end=$(llvm-readelf -s "$out" | awk '/ _pe_image_end$/{print "0x"$2; exit}' || true)
     [[ -n "$end" ]] || { echo "loader-riscv64: no _pe_image_end symbol in $out" >&2; exit 1; }
+    # EVERY RELOCATION MUST BE ONE THE STUB APPLIES. `_pe_entry` walks `.rela.dyn` and handles
+    # R_RISCV_RELATIVE; a type it does not know leaves those pointers unrelocated, and the failure
+    # then appears somewhere with no connection to the cause. A toolchain that starts emitting one
+    # fails HERE, at the build, with the type named.
+    bad=$(llvm-readelf -r "$out" | awk '$3 ~ /^R_/ {print $3}' | sort -u | grep -vx -e R_RISCV_RELATIVE -e R_RISCV_NONE || true)
+    [[ -z "$bad" ]] || { echo "loader-riscv64: the self-relocation stub cannot apply: $bad" >&2; exit 1; }
     llvm-objcopy -O binary --pad-to "$end" "$out" "$out.efi"
     echo "loader-riscv64: wrote $out.efi"
 

@@ -1301,7 +1301,19 @@ fn a_fuzzed_elf_header_is_refused_without_leaking() {
 		unsafe { frame::free_pages(&frames) };
 		drop(shared);
 		drop(space);
-		assert_eq!(frame::free_count(), before, "iteration {iteration} left the frame pool short");
+		// A SHARED PAGE RETIRES rather than deallocates - it was in a page table, so another core
+		// may hold a translation for it - which means it comes back through the quarantine after a
+		// shootdown rather than immediately. Draining here is what makes "the pool is whole again"
+		// the same statement it was before; without it this counts a frame that is not lost, only
+		// deferred.
+		assert!(frame::drain_quarantine_fully(64), "the shootdown never completed, so the retired frames could not come back");
+		// NOT LOWER than it started, rather than equal to it - the same rule the out-of-frames
+		// rollback test above settled on, and for the same reason. The drain releases the whole
+		// quarantine, including whatever earlier work put there, so the count can legitimately come
+		// back HIGHER than this loop's starting point. What the load owes is that it kept nothing:
+		// a leak shows as a count that stays below where it started, and frames returned by
+		// somebody else only push it up.
+		assert!(frame::free_count() >= before, "iteration {iteration} left the frame pool short by {}", before as i64 - frame::free_count() as i64);
 	}
 	// Some damage is harmless (padding, a reserved field), so a few must still load - otherwise
 	// this is fuzzing a parser that refuses everything and proving nothing.
@@ -1425,7 +1437,11 @@ fn a_fuzzed_relocation_table_is_refused_without_leaking() {
 		drop(space);
 		// SAFETY: every frame here came from this load; the space that mapped them is gone.
 		unsafe { frame::free_pages(&frames) };
-		assert_eq!(frame::free_count(), before, "iteration {iteration} left the frame pool short");
+		// A shared page RETIRES rather than deallocates - it was in a page table - so it comes back
+		// through the quarantine after a shootdown. Drained here, and compared as NOT LOWER for the
+		// same reason as its twin above: the drain releases whatever else was queued too.
+		assert!(frame::drain_quarantine_fully(64), "the shootdown never completed, so the retired frames could not come back");
+		assert!(frame::free_count() >= before, "iteration {iteration} left the frame pool short by {}", before as i64 - frame::free_count() as i64);
 	}
 	assert!(loaded > 0, "every fuzzed relocation table was refused: the fuzz is not producing loadable ones");
 	assert!(loaded < ITERATIONS, "every fuzzed relocation table loaded: the fuzz is not reaching the checks");

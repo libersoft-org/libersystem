@@ -18,7 +18,13 @@ fn reg(off: u64) -> *mut u32 {
 pub fn init() {}
 
 // Transmit one byte, waiting while the transmit FIFO is full.
+//
+// THE FIRMWARE'S CONSOLE FIRST. The address below is QEMU's, and UEFI promises nothing about a
+// device region at an address this loader made up - see `crate::console`.
 pub fn write_byte(byte: u8) {
+	if crate::console::write_byte(byte) {
+		return;
+	}
 	unsafe {
 		while core::ptr::read_volatile(reg(UARTFR)) & FR_TXFF != 0 {
 			core::hint::spin_loop();
@@ -29,6 +35,9 @@ pub fn write_byte(byte: u8) {
 
 // Write a string, expanding newlines to CRLF so serial terminals advance cleanly.
 pub fn write_str(s: &str) {
+	if crate::console::write_str(s) {
+		return;
+	}
 	for byte in s.bytes() {
 		if byte == b'\n' {
 			write_byte(b'\r');

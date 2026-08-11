@@ -525,7 +525,12 @@ fn publish_embedded_boot_info() {
 	// kernel reported a malformed init package while holding a perfectly good one.
 	let archive = boot_archive();
 	let (init, volume): (&[u8], &[u8]) = (archive, loader_module(b"volume.pkg").unwrap_or(&[]));
-	let modules: &'static mut [bootproto::Module; 2] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", init), module(b"volume.pkg", volume)]));
+	// AND THE LIVE VOLUME, when the loader handed one over. This kept exactly two modules, so a
+	// live medium's `system-volume.img` reached the kernel and was then dropped by the kernel's own
+	// republication - `main` looks the name up and found nothing, on the one architecture where
+	// that lookup is all there is.
+	let live = loader_module(crate::product::SYSTEM_VOLUME.as_bytes()).unwrap_or(&[]);
+	let modules: &'static mut [bootproto::Module; 3] = alloc::boxed::Box::leak(alloc::boxed::Box::new([module(b"init.pkg", init), module(b"volume.pkg", volume), module(crate::product::SYSTEM_VOLUME.as_bytes(), live)]));
 	// Hand the early framebuffer (if any) to a userspace consumer of the boot info.
 	let (framebuffer, fb_present) = match *BOOT_FB.lock() {
 		Some(f) => (bootproto::Framebuffer { addr: super::paging::phys_to_virt(f.phys), width: f.width, height: f.height, pitch: f.stride, bpp: 32, red_shift: f.red_shift, red_size: f.red_size, green_shift: f.green_shift, green_size: f.green_size, blue_shift: f.blue_shift, blue_size: f.blue_size, _pad: [0; 2] }, 1u32),

@@ -364,7 +364,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// system copies it into memory because the medium it booted from cannot be written. The tag
 	// says which of the two arrived, so the storage service knows whether to unpack an archive or
 	// mount a volume.
-	let (volume, tag): (&[u8], &[u8]) = match module_bytes("system-volume.img") {
+	let (volume, tag): (&[u8], &[u8]) = match module_bytes(crate::product::SYSTEM_VOLUME) {
 		Some(image) => (image, b"LIVEVOL"),
 		// An INSTALLED system has neither: its volume is a partition the storage service mounts
 		// off the disk, so there is no archive to seed from and no image to copy. The message is

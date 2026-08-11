@@ -689,7 +689,7 @@ fn a_previous_root_mounts_read_only_as_a_snapshot() {
 
 	// the generation one commit back is still reachable, holding the old contents - the
 	// groundwork a read-only snapshot is built on.
-	let mut snap = LiberFs::mount_snapshot(dev).unwrap();
+	let mut snap = LiberFs::mount_snapshot(dev).unwrap().unwrap();
 	assert_eq!(snap.read_file(b"f").unwrap(), b"version one");
 }
 
@@ -698,7 +698,7 @@ fn a_freshly_formatted_volume_has_no_snapshot() {
 	let fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let dev = fs.into_device();
 	// only generation 0 has ever been written: there is no older root to mount.
-	assert!(LiberFs::mount_snapshot(dev).is_none());
+	assert!(LiberFs::mount_snapshot(dev).unwrap().is_none());
 }
 
 // 64-bit addressing, large files and long names.
@@ -874,7 +874,7 @@ fn a_named_snapshot_reads_an_earlier_state() {
 	// the named snapshot reads the state captured when it was created - through a
 	// snapshot mount, and through the cheap in-place read the service's snap-open
 	// rides (no second mount, no volume walk).
-	let mut snap = LiberFs::mount_named_snapshot(dev.clone(), b"before").unwrap();
+	let mut snap = LiberFs::mount_named_snapshot(dev.clone(), b"before").unwrap().unwrap();
 	assert_eq!(snap.read_file(b"f").unwrap(), b"version one");
 	let mut live = LiberFs::mount(dev).unwrap();
 	assert_eq!(live.read_file_from_snapshot(b"before", b"f").unwrap(), b"version one");
@@ -920,7 +920,7 @@ fn a_snapshot_keeps_a_file_the_live_tree_deleted() {
 	assert_eq!(live.read_file(b"keep.txt"), Err(FsError::NotFound));
 
 	// the snapshot still holds it, blocks pinned against reclamation.
-	let mut snap = LiberFs::mount_named_snapshot(dev, b"backup").unwrap();
+	let mut snap = LiberFs::mount_named_snapshot(dev, b"backup").unwrap().unwrap();
 	assert_eq!(snap.read_file(b"keep.txt").unwrap(), b"original");
 }
 
@@ -943,9 +943,9 @@ fn the_free_map_honors_every_pinned_generation() {
 	let dev = fs.into_device();
 
 	// every pinned generation still reads its captured content after a remount.
-	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s1").unwrap().read_file(b"f").unwrap(), b"one");
-	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s2").unwrap().read_file(b"f").unwrap(), b"two");
-	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s3").unwrap().read_file(b"f").unwrap(), b"three");
+	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s1").unwrap().unwrap().read_file(b"f").unwrap(), b"one");
+	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s2").unwrap().unwrap().read_file(b"f").unwrap(), b"two");
+	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"s3").unwrap().unwrap().read_file(b"f").unwrap(), b"three");
 
 	// the live volume reads the newest content and verifies clean: fsck accounts for
 	// every pinned snapshot generation as well as the live tree.
@@ -1268,8 +1268,8 @@ fn snapshots_scale_past_a_single_table_block() {
 	fs.delete_snapshot(b"snap30").unwrap();
 	assert_eq!(fs.list_snapshots().unwrap().len(), 59);
 	let dev = fs.into_device();
-	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"snap00").unwrap().read_file(b"f").unwrap(), b"snap00");
-	assert_eq!(LiberFs::mount_named_snapshot(dev, b"snap59").unwrap().read_file(b"f").unwrap(), b"snap59");
+	assert_eq!(LiberFs::mount_named_snapshot(dev.clone(), b"snap00").unwrap().unwrap().read_file(b"f").unwrap(), b"snap00");
+	assert_eq!(LiberFs::mount_named_snapshot(dev, b"snap59").unwrap().unwrap().read_file(b"f").unwrap(), b"snap59");
 }
 
 // Correctness hardening (flush barriers, read-only mounts, corruption honesty).
@@ -1365,10 +1365,10 @@ fn snapshot_mounts_refuse_writes() {
 	let dev = fs.into_device();
 
 	// both snapshot mounts read fine and refuse every mutation.
-	let mut prev = LiberFs::mount_snapshot(dev.clone()).unwrap();
+	let mut prev = LiberFs::mount_snapshot(dev.clone()).unwrap().unwrap();
 	assert!(prev.is_read_only());
 	assert_eq!(prev.write_file(b"f", b"x"), Err(FsError::ReadOnly));
-	let mut named = LiberFs::mount_named_snapshot(dev.clone(), b"pin").unwrap();
+	let mut named = LiberFs::mount_named_snapshot(dev.clone(), b"pin").unwrap().unwrap();
 	assert!(named.is_read_only());
 	assert_eq!(named.read_file(b"f").unwrap(), b"one");
 	assert_eq!(named.write_at(b"f", 0, b"x"), Err(FsError::ReadOnly));
@@ -2159,6 +2159,16 @@ fn forge_inode_slot_of(dev: &mut MemDevice, num: u32, f: impl FnOnce(&mut [u8]))
 	forge_superblock(dev, slot, |sb| sb[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&child_hash.to_le_bytes()));
 }
 
+// The first extent record of the first file inode: its stored block and its checksum block.
+fn first_extent_of(dev: &MemDevice) -> (u64, u64) {
+	let slot = active_slot(dev);
+	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
+	let leaf_start = sb.inode_root as usize * BLOCK_SIZE;
+	let slot_off = leaf_start + NODE_HDR + INODE_REC + 8;
+	let ext = &dev.blocks[slot_off + EXTENT_OFF..slot_off + EXTENT_OFF + EXTENT_SIZE];
+	(u64::from_le_bytes(ext[8..16].try_into().unwrap()), u64::from_le_bytes(ext[24..32].try_into().unwrap()))
+}
+
 fn forge_inode_slot(dev: &mut MemDevice, f: impl FnOnce(&mut [u8])) {
 	let slot = active_slot(dev);
 	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
@@ -2566,7 +2576,11 @@ fn a_failed_durability_flush_adopts_the_commit_read_only() {
 	// blocks to the pool while the medium may name them, and a later transaction
 	// would overwrite a mountable generation's trees. The filesystem adopts the new
 	// generation and the failure costs writability instead.
-	assert_eq!(fs.write_file(b"new.txt", b"landed"), Err(FsError::Io));
+	//
+	// And it is reported as its own thing rather than as `Io`, because a caller told `Io` retries
+	// - which is the one response that must not happen against a volume whose generation may
+	// already have moved past what the caller read.
+	assert_eq!(fs.write_file(b"new.txt", b"landed"), Err(FsError::CommitUncertain));
 	assert!(fs.is_read_only(), "an uncertain commit degrades the volume to read-only");
 	assert_eq!(fs.read_file(b"new.txt").unwrap(), b"landed", "the in-memory state matches the attempted commit");
 	assert_eq!(fs.write_file(b"more.txt", b"nope"), Err(FsError::ReadOnly));
@@ -2766,7 +2780,7 @@ fn a_named_snapshot_mount_does_not_answer_from_the_live_generation() {
 	assert!(live.list().unwrap().is_empty(), "the live generation really has nothing");
 	drop(live);
 
-	let mut snap = LiberFs::mount_named_snapshot(dev, b"backup").expect("the snapshot mounts");
+	let mut snap = LiberFs::mount_named_snapshot(dev, b"backup").expect("the volume mounts").expect("the snapshot is there");
 	assert_eq!(snap.read_file(b"keep.txt").unwrap(), b"original", "the snapshot answers from its own tree");
 	assert_eq!(snap.list().unwrap().len(), 1, "and its own directory");
 }
@@ -3293,7 +3307,7 @@ fn a_deleted_snapshot_stays_reserved_while_the_older_superblock_names_it() {
 
 	// and the older generation genuinely still reads, which is what the reservation is for.
 	let dev = fs.into_device();
-	let mut prev = LiberFs::mount_snapshot(dev).expect("the previous generation must still mount");
+	let mut prev = LiberFs::mount_snapshot(dev).expect("the volume mounts").expect("the previous generation must still be there");
 	assert_eq!(prev.list_snapshots().unwrap().len(), 1, "it is the generation in which s1 was live");
 	assert_eq!(prev.read_file_from_snapshot(b"s1", b"keep.txt").unwrap(), b"payload");
 }
@@ -4611,4 +4625,319 @@ fn the_superblock_parser_is_as_strict_as_the_writer() {
 		let fs = LiberFs::mount(dev).expect("the other slot still carries a volume");
 		assert!(!fs.compression(), "a compression byte of {byte} must not be read as true");
 	}
+}
+
+#[test]
+fn fsck_reports_an_extent_mapped_past_the_end_of_its_file() {
+	// Structure, ordering and overlap were all checked and no extent was ever compared with the
+	// file's size. A 4096-byte file could carry a run mapped at logical block 1000: allocated,
+	// invisible in the file's contents, and reserved for as long as the volume lives. No writer
+	// this filesystem has produces one - which is exactly why nothing noticed.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f.bin", &noise(BLOCK_SIZE)).unwrap();
+	let (b0, cb) = (10u64, 11u64);
+	for b in [b0, cb] {
+		assert!(!fs.is_alloc(b), "block {b} must be free for this forgery to mean anything");
+	}
+	let mut dev = fs.into_device();
+
+	let mut cbuf = vec![0u8; BLOCK_SIZE];
+	let at = b0 as usize * BLOCK_SIZE;
+	cbuf[0..4].copy_from_slice(&crc32c(&dev.blocks[at..at + BLOCK_SIZE]).to_le_bytes());
+	let cbuf_crc = crc32c(&cbuf);
+	dev.blocks[cb as usize * BLOCK_SIZE..(cb as usize + 1) * BLOCK_SIZE].copy_from_slice(&cbuf);
+	forge_inode_slot(&mut dev, |slot| {
+		// one block of contents, and a run mapped a thousand blocks beyond it.
+		slot[INO_SIZE_OFF..INO_SIZE_OFF + 8].copy_from_slice(&(BLOCK_SIZE as u64).to_le_bytes());
+		slot[INO_EXTENT_COUNT_OFF..INO_EXTENT_COUNT_OFF + 4].copy_from_slice(&1u32.to_le_bytes());
+		let past = Extent { logical: 1000, physical: b0, length: 1, csum: cb, csum_crc: cbuf_crc, store_len: 1, clen: 0 };
+		past.write(&mut slot[EXTENT_OFF..EXTENT_OFF + EXTENT_SIZE]);
+	});
+
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"past the end of the file"), "the mapping past EOF must be named: {:?}", report.faults);
+}
+
+#[test]
+fn fsck_runs_the_decompressor_and_counts_a_bad_stream_apart() {
+	// Every stored block matching its CRC says the medium gave back what was written. It says
+	// nothing about whether what was written decodes, and `fsck` ran no decoder at all - so a
+	// volume with a syntactically invalid LZ stream reported zero failures and answered `Corrupt`
+	// to the first read of the file. The three kinds of failure are counted apart because they send
+	// an operator to three different places: the medium, the metadata, or the writer.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.set_compression(true).unwrap();
+	// Compressible enough to be stored compressed: the check only runs on `clen != 0`.
+	fs.write_file(b"c.bin", &vec![0x5Au8; 8 * BLOCK_SIZE]).unwrap();
+	assert_eq!(fs.fsck().unwrap().stream_failures, 0, "a healthy compressed file decodes");
+	let stored = fs.read_file(b"c.bin").unwrap();
+	assert_eq!(stored.len(), 8 * BLOCK_SIZE, "and reads back whole");
+
+	// Damage the STREAM, then re-stamp the checksums over the damage - which is what makes this
+	// invisible to every check that existed. A truncated length byte in the middle of the stream
+	// leaves the grammar unsatisfiable.
+	let mut dev = fs.into_device();
+	let (block, csum) = first_extent_of(&dev);
+	let at = block as usize * BLOCK_SIZE;
+	dev.blocks[at + 4..at + 16].copy_from_slice(&[0xFFu8; 12]);
+	let fresh = crc32c(&dev.blocks[at..at + BLOCK_SIZE]);
+	let cat = csum as usize * BLOCK_SIZE;
+	dev.blocks[cat..cat + 4].copy_from_slice(&fresh.to_le_bytes());
+	// And the checksum block's own CRC, which lives in the extent record - so nothing anywhere
+	// reports a checksum failure and the only thing wrong with this volume is the stream.
+	let fresh_csum_crc = crc32c(&dev.blocks[cat..cat + BLOCK_SIZE]);
+	forge_inode_slot(&mut dev, |slot| slot[EXTENT_OFF + 20..EXTENT_OFF + 24].copy_from_slice(&fresh_csum_crc.to_le_bytes()));
+
+	let mut fs = LiberFs::mount(dev).unwrap();
+	assert_eq!(fs.read_file(b"c.bin"), Err(FsError::Corrupt), "the file is unreadable, whatever fsck says");
+	let report = fs.fsck().unwrap();
+	assert_eq!(report.stream_failures, 1, "the stream failure is counted as one: {:?}", report.faults);
+	assert_eq!(report.checksum_failures, 0, "and not as a failing medium, because the medium is fine");
+	assert!(mentions(&report.faults, b"stream does not decode"), "named for what it is: {:?}", report.faults);
+}
+
+#[test]
+fn two_superblock_slots_from_unrelated_volumes_do_not_mount_as_a_pair() {
+	// Each slot validated alone and nothing ever compared them, so two checksum-valid slots from
+	// unrelated states mounted as current + previous. `derive_free` then reads the previous root
+	// under the CURRENT slot's geometry, and that rolling snapshot is part of what keeps the
+	// allocator honest - so the blocks one volume's older generation holds are read as if they
+	// belonged to another volume's.
+	//
+	// Four fields make two slots one volume: the uuid, the geometry, the namespace root, and
+	// consecutive generations, because a commit writes the other slot with generation + 1 and
+	// nothing else.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"a.bin", b"one").unwrap();
+	fs.write_file(b"b.bin", b"two").unwrap();
+	let dev = fs.into_device();
+	let sound = LiberFs::mount(dev.clone()).unwrap();
+	assert!(!sound.is_read_only(), "the volume is writable before the slots are made to disagree");
+	drop(sound);
+
+	// One field at a time, on the slot that is NOT current, so what changes is the pairing and
+	// nothing else.
+	let breaks = [
+		("a different volume's uuid", SB_UUID_OFF, alloc::vec![0xAAu8; 16]),
+		("a different geometry", SB_NUM_BLOCKS_OFF, (NBLOCKS - 1).to_le_bytes().to_vec()),
+		// A live inode number, because a root above `next_inode` is refused at parse and the
+		// slot would simply be invalid - which is a different thing being tested.
+		("a different namespace root", SB_ROOT_INODE_OFF, 1u32.to_le_bytes().to_vec()),
+		("generations that are not consecutive", SB_GENERATION_OFF, 0u64.to_le_bytes().to_vec()),
+	];
+	for (what, off, bytes) in breaks {
+		let mut dev = dev.clone();
+		let other = 1 - active_slot(&dev);
+		forge_superblock(&mut dev, other, |sb| sb[off..off + bytes.len()].copy_from_slice(&bytes));
+		let mut fs = LiberFs::mount(dev.clone()).expect("the newer slot still describes a mountable volume");
+		assert!(fs.is_read_only(), "{what}: a volume whose two slots disagree must not be written to");
+		assert_eq!(fs.read_file(b"a.bin").unwrap(), b"one", "{what}: and it still reads");
+		// The older slot is not a snapshot of this volume, so there is no snapshot to serve.
+		// A FAULT, not an absence: the older slot exists and is not this volume's snapshot, which is
+		// exactly the difference `Result<Option<..>>` was introduced to carry.
+		assert_eq!(LiberFs::mount_snapshot(dev).err(), Some(MountError::Corrupt), "{what}: the previous generation is not this volume's");
+	}
+}
+
+#[test]
+fn a_directory_count_that_disagrees_with_its_tree_is_repaired_not_ground_down() {
+	// `dir.size` is a cache of the tree, and `remove` did `saturating_sub(1)` on it. A directory
+	// whose stored count is 0 while its tree holds three entries lost a real entry and kept the
+	// count at 0 - and the inode was re-checksummed and committed, so the removal made the lie
+	// permanent and internally consistent. Refusing instead would close the only repair route there
+	// is, because removing the children is how such a directory gets fixed.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"d").unwrap();
+	for name in [b"d/a" as &[u8], b"d/b", b"d/c"] {
+		fs.write_file(name, b"x").unwrap();
+	}
+	let dir = fs.resolve(b"d").unwrap();
+	fs.mutate(|fs| {
+		let mut inode = fs.read_inode(dir)?;
+		inode.size = 0;
+		fs.write_inode(dir, &mut inode)
+	})
+	.unwrap();
+
+	// One removal, and the count is what the tree says rather than 0 again.
+	fs.remove(b"d/a").unwrap();
+	assert_eq!(fs.read_inode(dir).unwrap().size, 2, "the count is derived from the tree that remains");
+	assert_eq!(fs.read_dir(b"d").unwrap().len(), 2, "and it agrees with the listing");
+	// And from there it behaves like any other directory: it empties, and then it can go.
+	fs.remove(b"d/b").unwrap();
+	fs.remove(b"d/c").unwrap();
+	assert_eq!(fs.read_inode(dir).unwrap().size, 0);
+	fs.remove(b"d").unwrap();
+	assert_eq!(fs.read_dir(b"d").err(), Some(FsError::NotFound), "the repaired directory removes like any other");
+}
+
+#[test]
+fn a_compression_attempt_that_runs_out_of_space_keeps_the_raw_file() {
+	// Compression is documented as an optimisation: a run that cannot be stored compressed stays
+	// raw. `compress_inode` propagated `NoSpace` through `write_file_inner`'s `?`, so a file that
+	// FITS RAW - already written, in this very transaction - was refused and the whole transaction
+	// rolled back, because the optional step could not get temporary blocks for a smaller copy of
+	// what was already on the disk.
+	//
+	// The discriminator is the same volume with compression off: whatever the free map's exact
+	// layout, a file that fits with compression disabled must also fit with it enabled. Nothing
+	// about a margin has to be guessed, and the interesting case is the one where the two answers
+	// used to differ.
+	let nblocks: u64 = 48;
+	let filler = noise(BLOCK_SIZE);
+
+	let attempt = |files: u32, payload: &[u8], compress: bool| -> Result<(), FsError> {
+		let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
+		fs.set_compression(compress).unwrap();
+		for i in 0..files {
+			if fs.write_file(alloc::format!("fill{i}").as_bytes(), &filler).is_err() {
+				break;
+			}
+		}
+		fs.write_file(b"squeeze.bin", payload)?;
+		assert_eq!(fs.read_file(b"squeeze.bin").unwrap(), payload, "a file that was accepted reads back whole");
+		assert_eq!(fs.fsck().unwrap().structural_failures, 0, "and leaves the volume sound");
+		Ok(())
+	};
+
+	// Both dimensions, because the window is narrow: a compression attempt needs its stored blocks
+	// and a checksum block ON TOP of the raw run it is replacing, while a one-block filler consumes
+	// two blocks (data + checksum). Sweeping the payload size as well as the fill level walks the
+	// boundary rather than stepping over it.
+	let mut saw_raw_fit = false;
+	for blocks in 2..=6 {
+		let payload = alloc::vec![0x77u8; blocks * BLOCK_SIZE];
+		for files in 0..24 {
+			let raw = attempt(files, &payload, false).is_ok();
+			let compressed = attempt(files, &payload, true).is_ok();
+			saw_raw_fit |= raw;
+			assert!(!raw || compressed, "{blocks} block(s) after {files} file(s) of filler fit raw, so enabling compression must not refuse them");
+		}
+	}
+	assert!(saw_raw_fit, "the volume took the payload at some fill level, or this test measured nothing");
+	// HONEST LIMIT: this sweep does not diverge under the OLD behaviour either. A write that
+	// succeeds leaves at least the slack its own commit needed for metadata, which is more than the
+	// two blocks a compression attempt wants - so on this allocator the propagated `NoSpace` was
+	// unreachable rather than merely rare. The fix is by construction and this pins the property
+	// against the allocator changing shape, which is the point at which it would become reachable.
+}
+
+#[test]
+fn a_directory_can_be_read_a_page_at_a_time() {
+	// `read_dir` returns every entry in one `Vec`, with an inode read each, out of a tree built to
+	// hold millions. A cursor is what the tree was already shaped for: pages in the tree's own
+	// order, with the subtrees before the cursor never read.
+	let nblocks: u64 = 4096;
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
+	fs.mkdir(b"d").unwrap();
+	// Long names on purpose: a directory leaf holds bytes, not entries, so two hundred short names
+	// fit in ONE leaf and a tree with no internal node cannot show whether anything is pruned.
+	let name_of = |i: u32| alloc::format!("d/f{i:03}{}", "n".repeat(200));
+	for i in 0..200u32 {
+		fs.write_file(name_of(i).as_bytes(), b"x").unwrap();
+	}
+	let whole = fs.read_dir(b"d").unwrap();
+	assert_eq!(whole.len(), 200);
+
+	// Paged, seven at a time, and the pages concatenate to exactly what one call returns - same
+	// rows, same order.
+	let mut paged: Vec<(Vec<u8>, u64, bool, u64, u64)> = Vec::new();
+	let mut cursor: Option<Vec<u8>> = None;
+	loop {
+		let page = fs.read_dir_page(b"d", cursor.as_deref(), 7).unwrap();
+		if page.is_empty() {
+			break;
+		}
+		assert!(page.len() <= 7, "a page never exceeds its limit");
+		cursor = Some(page.last().unwrap().0.clone());
+		paged.extend(page);
+		assert!(paged.len() <= 200, "the cursor advances, or this loop would not end");
+	}
+	assert_eq!(paged, whole, "the pages are the whole listing, in the same order");
+
+	// And the work is a page's work. Counting block reads is the only honest way to say that: a
+	// page from the far end of the directory must not read the tree that comes before it.
+	struct Counting {
+		inner: MemDevice,
+		// A `Cell`, so the count can be read through the filesystem's shared `device()` borrow.
+		reads: core::cell::Cell<u64>,
+	}
+	impl BlockDevice for Counting {
+		fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+			self.reads.set(self.reads.get() + 1);
+			self.inner.read_block(index, buf)
+		}
+		fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+			self.inner.write_block(index, buf)
+		}
+		fn flush(&mut self) -> bool {
+			self.inner.flush()
+		}
+	}
+	let mut counted = LiberFs::mount(Counting { inner: fs.into_device(), reads: core::cell::Cell::new(0) }).unwrap();
+	let reads_for = |fs: &mut LiberFs<Counting>, after: Option<&[u8]>| -> u64 {
+		fs.device().reads.set(0);
+		let page = fs.read_dir_page(b"d", after, 7).unwrap();
+		assert_eq!(page.len(), 7, "both pages are full pages, so the counts compare like with like");
+		fs.device().reads.get()
+	};
+	let first_page = reads_for(&mut counted, None);
+	let late_page = reads_for(&mut counted, Some(&paged[paged.len() - 8].0));
+	// Each page reads seven inodes either way; what differs is the TREE walk. Without the cursor
+	// pruning the subtrees before it, a page from the far end walks every leaf that comes before it
+	// first - so this is the assertion that says the cursor does what it is for.
+	// A late page costs no more than the first. Without the pruning it costs half again as much on
+	// this directory (31 blocks against 19), because it walks every leaf before the cursor first.
+	assert!(late_page <= first_page, "a late page read {late_page} blocks against {first_page} for the first: the walk is not being pruned");
+
+	// The degenerate limits: nothing asked for, nothing returned; and a cursor past the end ends it.
+	assert!(counted.read_dir_page(b"d", None, 0).unwrap().is_empty());
+	assert!(counted.read_dir_page(b"d", Some(&paged.last().unwrap().0), 7).unwrap().is_empty());
+	// A file is not a directory, whichever way it is read.
+	assert_eq!(counted.read_dir_page(name_of(0).as_bytes(), None, 7).err(), Some(FsError::NotDir));
+}
+
+#[test]
+fn one_inode_with_two_names_is_refused_by_the_mount_and_named_by_fsck() {
+	// There is no hardlink API and no link count, so the format's rule is one inode, one name - and
+	// nothing said so. `fsck`'s namespace walk did `if !reached.insert(child) { continue; }`, which
+	// is the cycle defence doing double duty: a second reference to an already-reached inode was
+	// skipped rather than reported. So an image with `/a` and `/b` both naming inode 7 passed fsck
+	// clean, and `remove("a")` freed inode 7's blocks and deleted it from the inode tree while `/b`
+	// still pointed at it - a live name resolving to a record that is gone, and blocks the
+	// allocator will hand to something else.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"a.txt", b"shared").unwrap();
+	fs.write_file(b"b.txt", b"other").unwrap();
+	let root = fs.root_inode;
+	let mut inode = fs.read_inode(root).unwrap();
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	fs.read_node(inode.dir_root, inode.dir_root_crc, &mut buf).unwrap();
+	// Point the second record at the first one's inode: both names, one inode, everything else
+	// perfectly formed and checksummed.
+	let recs = dir_leaf_parse(&buf);
+	assert_eq!(recs.len(), 2, "the root directory is one leaf holding both names");
+	let shared = recs[0].child;
+	let aliased: Vec<DirRec> = alloc::vec![DirRec { hash: recs[0].hash, name: recs[0].name.clone(), child: shared }, DirRec { hash: recs[1].hash, name: recs[1].name.clone(), child: shared }];
+	dir_leaf_write(&mut buf, &aliased);
+	let crc = fs.write_node_to(inode.dir_root, &buf).unwrap();
+	inode.dir_root_crc = crc;
+	fs.write_inode(root, &mut inode).unwrap();
+	fs.commit().unwrap();
+
+	let report = fs.fsck().unwrap();
+	assert!(mentions(&report.faults, b"named more than once"), "fsck must name the alias: {:?}", report.faults);
+
+	// And a fresh mount refuses to write to it. The repair for an alias is to remove one of the two
+	// names, and that removal is exactly what destroys the shared inode - so read-only is the
+	// answer, with both names still readable and `fsck` naming them.
+	let mut remounted = LiberFs::mount(fs.into_device()).unwrap();
+	assert!(remounted.is_read_only(), "a volume with one inode under two names must not be written to");
+	// Both names resolve to the one inode, whichever of the two the leaf's (hash, name) order put
+	// first - which is the damage, visible.
+	let (under_a, under_b) = (remounted.read_file(b"a.txt").unwrap(), remounted.read_file(b"b.txt").unwrap());
+	assert_eq!(under_a, under_b, "two names, one inode, one set of bytes");
+	assert!(under_a == b"shared" || under_a == b"other", "and they are one of the two files that were written");
+	assert_eq!(remounted.remove(b"a.txt"), Err(FsError::ReadOnly), "and the removal that would free the shared inode is refused");
 }

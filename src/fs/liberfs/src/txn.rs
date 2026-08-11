@@ -117,8 +117,12 @@ impl<D: BlockDevice> LiberFs<D> {
 			// never consulted for another allocation, which makes the skipped reclaim
 			// below moot - and the in-memory state matches whichever superblock a
 			// remount finds, since both name only blocks the first barrier made durable.
+			//
+			// NOT `Io`. The superblock write was attempted, so this cannot say the commit did not
+			// happen - and a caller told `Io` retries, which is the one thing that must not happen
+			// against a volume whose generation may already have moved.
 			self.read_only = true;
-			return Err(FsError::Io);
+			return Err(FsError::CommitUncertain);
 		}
 		if self.snapshots_dirty {
 			// the pinned set changed: rebuild it (and the free map) by the full walk. The
@@ -129,9 +133,14 @@ impl<D: BlockDevice> LiberFs<D> {
 			self.dead.clear();
 			return match self.derive_free() {
 				Ok(()) => Ok(()),
-				Err(e) => {
+				Err(_) => {
+					// The superblock is PROVABLY on the disk here - this is the path after a
+					// successful publish - and the walk that rebuilds the free map failed. The
+					// commit happened; what is unknown is whether this mount can go on safely, and
+					// it cannot, so it is read-only and the caller is told not to retry the write
+					// it thinks it lost.
 					self.read_only = true;
-					Err(e)
+					Err(FsError::CommitUncertain)
 				}
 			};
 		}
@@ -223,6 +232,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		set_bit(&mut live, 0);
 		set_bit(&mut live, 1);
 		// the live generation is the one place where every block has exactly one owner.
+		//
+		// And the one place where every inode has exactly one name. The bitmap is sized by the
+		// inode numbers this volume has issued, not by the pool, and it is allocated fallibly like
+		// every other map here.
+		self.mark_names = Some(try_zeroed((self.next_inode as usize).div_ceil(8))?);
+		self.mark_alias = false;
 		self.mark_strict = true;
 		self.mark_inode_tree(self.inode_root, self.inode_root_crc, &mut live)?;
 		// every block of the snapshot chain and every pinned snapshot generation stay
@@ -243,6 +258,10 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		// everything past here spans generations, where sharing is legal by design.
 		let dup = self.mark_dup.take();
+		self.mark_names = None;
+		if self.mark_alias {
+			self.read_only = true;
+		}
 		self.mark_strict = false;
 		let mut pinned = try_zeroed(len)?;
 		for i in 0..self.snapshots.len() {
@@ -581,6 +600,29 @@ impl<D: BlockDevice> LiberFs<D> {
 				for rec in &crate::dir::dir_leaf_parse(&buf) {
 					if lower.is_some_and(|l| rec.hash < l) || upper.is_some_and(|u| rec.hash >= u) {
 						self.walk_damage = true;
+					}
+					// ONE INODE, ONE NAME - checked here because this walk is already reading every
+					// leaf of every directory in the live generation, so it costs a bit per inode
+					// and no extra I/O.
+					//
+					// There is no hardlink API and no link count, so that is the format's rule and
+					// nothing enforced it. An image with `/a` and `/b` both naming inode 7 mounted
+					// writable, and `remove("a")` then freed inode 7's blocks and deleted it from
+					// the inode tree while `/b` still pointed at it - a live name resolving to a
+					// record that is gone, and blocks the allocator will hand to something else.
+					//
+					// Read-only rather than a walk-damage flag: the repair for an alias is to
+					// remove one of the two names, and that removal is exactly the operation that
+					// destroys the shared inode. `fsck` names both.
+					if let Some(names) = self.mark_names.as_mut() {
+						let bit = rec.child as u64;
+						if (bit / 8) < names.len() as u64 {
+							if test_bit(names, bit) {
+								self.mark_alias = true;
+							} else {
+								set_bit(names, bit);
+							}
+						}
 					}
 				}
 			}

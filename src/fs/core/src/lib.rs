@@ -103,6 +103,16 @@ pub enum FsError {
 	// damaged volume, and reporting it as `Corrupt` sent a caller looking for a filesystem fault
 	// that is not there - a ranged read is the answer, not a repair.
 	TooLarge,
+	// A commit that MAY have landed. The superblock write was attempted or has provably been
+	// published, and something after it - the barrier, or the walk that rebuilds the free map -
+	// failed. Once the superblock has been offered to the device, a reported failure does not mean
+	// it did not reach the medium, so the new state is adopted and the volume goes read-only.
+	//
+	// This exists because `Io` cannot say it. A caller told `Io` reasonably retries; a caller told
+	// this one must not - the write it is holding may already be on the disk, and the volume it
+	// would retry against is a different generation from the one it read. Every mutation is refused
+	// from here on, so the only correct responses are to remount and look, or to repair.
+	CommitUncertain,
 }
 
 // Is byte `c` allowed in a portable file name?

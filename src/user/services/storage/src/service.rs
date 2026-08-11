@@ -2285,6 +2285,11 @@ fn map_fs_err(e: FsError) -> Error {
 		// on-disk corruption caught by a block checksum: the data cannot be trusted.
 		FsError::Corrupt => Error::Invalid,
 		FsError::Io => Error::Again,
+		// A commit that MAY have landed. NOT `Again`: retrying is exactly the wrong response - the
+		// write the caller thinks it lost may already be on the medium, and the volume is read-only
+		// from here on, so a retry can only fail or duplicate. `Denied` says "this mount will not
+		// take another write", which is the true statement this protocol can make today.
+		FsError::CommitUncertain => Error::Denied,
 		// a read-only mount (a snapshot, or a volume degraded by a corrupt snapshot
 		// table) refuses mutations, like any other read-only volume.
 		FsError::ReadOnly => Error::Denied,

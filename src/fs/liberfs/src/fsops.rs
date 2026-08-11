@@ -80,7 +80,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Io);
 		}
 
-		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_snap_root: 0, prev_snap_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: free_map, data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: pinned_map, snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, walk_damage: false, mark_strict: false, mark_dup: None, mark_max_inode: 0, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks, root_inode: ROOT_INODE, generation: 0, slot: 0, inode_root: leaf_block, inode_root_crc: leaf_crc, next_inode: ROOT_INODE + 1, prev_inode_root: 0, prev_inode_root_crc: 0, prev_snap_root: 0, prev_snap_root_crc: 0, prev_valid: false, snap_root: 0, snap_root_crc: 0, snapshots: Vec::new(), free: free_map, data_cursor: POOL_START, meta_cursor: num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: pinned_map, snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: false, walk_damage: false, mark_strict: false, mark_dup: None, mark_names: None, mark_alias: false, mark_max_inode: 0, uuid: opts.uuid, label, compress: opts.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		fs.derive_free()?;
 		Ok(fs)
 	}
@@ -100,23 +100,34 @@ impl<D: BlockDevice> LiberFs<D> {
 		Self::mount_at(dev, MountMode::Recovery)
 	}
 
-	// Mount the previous generation read-only: the consistent snapshot of the
-	// filesystem one commit ago. Returns None unless both superblock slots are valid (a
-	// freshly formatted or single-generation volume has no older snapshot). The handle
-	// is read-only: every mutation is refused, so the generations can never interleave.
-	pub fn mount_snapshot(dev: D) -> Option<LiberFs<D>> {
-		// An `Option` here on purpose: nothing formats on the strength of this answer, and "there
-		// is no older generation" is the ordinary case rather than a fault to report.
-		Self::mount_at(dev, MountMode::Previous).ok()
+	// Mount the previous generation read-only: the consistent snapshot of the filesystem one
+	// commit ago. `Ok(None)` when there is no older generation - a freshly formatted or
+	// single-generation volume. The handle is read-only: every mutation is refused, so the
+	// generations can never interleave.
+	//
+	// `Option` ALONE was the wrong shape, and the comment that argued for it only covered the
+	// absence. `.ok()` turned a corrupt volume, an I/O failure, an unsupported format and a memory
+	// shortage into the same answer as "there is no snapshot here" - which is exactly the
+	// conflation `MountError` was introduced to end on the main mount.
+	pub fn mount_snapshot(dev: D) -> Result<Option<LiberFs<D>>, MountError> {
+		match Self::mount_at(dev, MountMode::Previous) {
+			Ok(fs) => Ok(Some(fs)),
+			// The one ordinary absence. Everything else is a fault and says so.
+			Err(MountError::Unformatted) => Ok(None),
+			Err(error) => Err(error),
+		}
 	}
 
 	// Mount a named snapshot read-only: the consistent, pinned state captured when the
-	// snapshot was created. Returns None if the volume has no such snapshot. Like
-	// `mount_snapshot`, the handle refuses every mutation; the live free map (which
-	// already reserves the snapshot's blocks) is reused unchanged.
-	pub fn mount_named_snapshot(dev: D, name: &[u8]) -> Option<LiberFs<D>> {
-		let mut fs = Self::mount(dev).ok()?;
-		let snap = fs.snapshots.iter().find(|s| s.name == name)?.clone();
+	// snapshot was created. `Ok(None)` when the volume has no such snapshot; a volume that could
+	// not be mounted at all is an error, for the reason above. Like `mount_snapshot`, the handle
+	// refuses every mutation; the live free map (which already reserves the snapshot's blocks) is
+	// reused unchanged.
+	pub fn mount_named_snapshot(dev: D, name: &[u8]) -> Result<Option<LiberFs<D>>, MountError> {
+		let mut fs = Self::mount(dev)?;
+		let Some(snap) = fs.snapshots.iter().find(|s| s.name == name).cloned() else {
+			return Ok(None);
+		};
 		fs.inode_root = snap.inode_root;
 		fs.inode_root_crc = snap.inode_root_crc;
 		fs.generation = snap.generation;
@@ -131,7 +142,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		fs.icache.clear();
 		fs.dcache.clear();
 		fs.decomp.clear();
-		Some(fs)
+		Ok(Some(fs))
 	}
 
 	pub(crate) fn mount_at(mut dev: D, mode: MountMode) -> Result<LiberFs<D>, MountError> {
@@ -212,6 +223,28 @@ impl<D: BlockDevice> LiberFs<D> {
 			(valid[0].0, None)
 		};
 
+		// THE TWO SLOTS MUST DESCRIBE THE SAME VOLUME. Each was validated alone and nothing ever
+		// compared them, so two checksum-valid slots from unrelated states mounted as a pair - and
+		// `derive_free` then reads the previous root under the current slot's geometry, with that
+		// rolling snapshot being part of what keeps the allocator honest. The four fields that make
+		// them one volume are the identity, the geometry, the namespace root, and consecutive
+		// generations: a commit writes the other slot with generation + 1 and nothing else.
+		//
+		// A mismatch means one of the slots is not this volume's, and which one cannot be known
+		// from here - so the newer is used ALONE and the mount is read-only. That keeps both slots
+		// on the medium for repair instead of letting the next commit overwrite the evidence.
+		let mut unpaired = false;
+		if let (Some(a), Some(b)) = (slots[0], slots[1]) {
+			let (older, newer) = if a.generation <= b.generation { (a, b) } else { (b, a) };
+			unpaired = older.uuid != newer.uuid || older.num_blocks != newer.num_blocks || older.root_inode != newer.root_inode || older.generation + 1 != newer.generation;
+		}
+
+		// The snapshot mount is the older slot BECAUSE it is one commit behind this one. Unpaired,
+		// it is one commit behind nothing, so there is no snapshot to serve.
+		if unpaired && !newest {
+			return Err(MountError::Corrupt);
+		}
+
 		let sb = slots[cur_slot as usize].ok_or(MountError::Corrupt)?;
 		// the medium must actually cover the claimed pool: a checksummed superblock can
 		// still lie about `num_blocks` (hostile authoring), and sizing the free maps or
@@ -225,7 +258,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// and not an allocator abort taking the whole service with it.
 		let free_map = try_zeroed(map_len).map_err(|_| MountError::NoMemory)?;
 		let pinned_map = try_zeroed(map_len).map_err(|_| MountError::NoMemory)?;
-		let (prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid) = match prev_slot {
+		let (prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid) = match prev_slot.filter(|_| !unpaired) {
 			Some(ps) => {
 				let psb = slots[ps as usize].ok_or(MountError::Corrupt)?;
 				(psb.inode_root, psb.inode_root_crc, psb.snap_root, psb.snap_root_crc, true)
@@ -233,7 +266,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			None => (0, 0, 0, 0, false),
 		};
 
-		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: free_map, data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: pinned_map, snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest, walk_damage: false, mark_strict: false, mark_dup: None, mark_max_inode: 0, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
+		let mut fs = LiberFs { dev, num_blocks: sb.num_blocks, root_inode: sb.root_inode, generation: sb.generation, slot: cur_slot, inode_root: sb.inode_root, inode_root_crc: sb.inode_root_crc, next_inode: sb.next_inode, prev_inode_root, prev_inode_root_crc, prev_snap_root, prev_snap_root_crc, prev_valid, snap_root: sb.snap_root, snap_root_crc: sb.snap_root_crc, snapshots: Vec::new(), free: free_map, data_cursor: POOL_START, meta_cursor: sb.num_blocks - 1, run: None, fresh: BTreeSet::new(), dead: BTreeSet::new(), dead_prev: BTreeSet::new(), pinned: pinned_map, snapshots_dirty: false, txn: None, decomp: DecompCache::new(), wcsum: None, rcsum: None, icache: BTreeMap::new(), dcache: BTreeMap::new(), read_only: !newest || unpaired, walk_damage: false, mark_strict: false, mark_dup: None, mark_names: None, mark_alias: false, mark_max_inode: 0, uuid: sb.uuid, label: sb.label, compress: sb.compress, scratch: vec![0u8; BLOCK_SIZE], clock: 0 };
 		// a corrupt snapshot table degrades the mount to read-only instead of failing it:
 		// the pinned generations it named can no longer be reserved, so a commit could
 		// reuse their blocks - refusing every mutation keeps them (and the table block
@@ -454,6 +487,20 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::NotDir);
 		}
 		self.read_dir_inode(inode_num)
+	}
+
+	// One page of a directory listing: at most `max` rows in key order, starting after the name
+	// `after`. The last name of a page is the cursor for the next one, and `Vec::is_empty` ends the
+	// enumeration.
+	//
+	// `read_dir` materialises the whole directory - every entry, an inode read each - which is the
+	// wrong shape for a tree built to hold millions. This does the work of a page: the subtrees
+	// entirely before the cursor are never read and the walk stops when the page is full. `read_dir`
+	// stays for the callers that genuinely want everything at once (and for the ones that cannot
+	// hold a cursor across a call).
+	pub fn read_dir_page(&mut self, path: &[u8], after: Option<&[u8]>, max: usize) -> Result<Vec<(Vec<u8>, u64, bool, u64, u64)>, FsError> {
+		let inode_num = self.resolve(path)?;
+		self.read_dir_page_inode(inode_num, after, max)
 	}
 
 	// Create the directory at `path`, plus any missing parents (mkdir -p). Succeeds if

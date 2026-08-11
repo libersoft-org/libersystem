@@ -13,3 +13,5 @@ pub const VENDOR_URL: &str = env!("PRODUCT_VENDOR_URL");
 // locates the modules the bootloader handed it by matching these on the path.
 pub const INIT_PACKAGE: &str = env!("INIT_PACKAGE");
 pub const VOLUME_PACKAGE: &str = env!("VOLUME_PACKAGE");
+// The live medium's system volume image, handed over as a module by the loader.
+pub const SYSTEM_VOLUME: &str = env!("SYSTEM_VOLUME");

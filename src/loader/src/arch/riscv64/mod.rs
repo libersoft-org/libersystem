@@ -1,14 +1,14 @@
 // riscv64 loader backend: place the kernel and enter its own boot stub.
 //
-// Like aarch64 (and unlike x86, where the loader builds the kernel's page tables and
-// hands it a BootInfo), the riscv64 kernel carries a position-independent boot stub
-// that builds its Sv39 tables + higher half itself and reads its device inventory
-// from the device tree - exactly the entry state QEMU's `-kernel` load over OpenSBI
+// Like aarch64 (and unlike x86, where the loader also builds the kernel's page tables), the
+// riscv64 kernel carries a position-independent boot stub that builds its Sv39 tables + higher half
+// itself and reads its device inventory from the device tree - exactly the entry state QEMU's `-kernel` load over OpenSBI
 // produces (S-mode, paging off, a0 = boot hartid, a1 = DTB). So this backend mirrors
 // that state: it loads each PT_LOAD segment at its physical (link) address, finds the
 // firmware's flattened device tree and the boot hart id, exits boot services, turns
 // paging off (SATP = 0), and jumps to the kernel entry (`_start`) with the hart id in
-// a0 and the DTB pointer in a1. No page tables or BootInfo are built here.
+// a0 and the DTB pointer in a1. No PAGE TABLES are built here; a BootInfo is, because the modules
+// handed over with the kernel have nowhere else to be described.
 //
 // The kernel is linked higher-half with each segment's load address (LMA) equal to
 // its virtual address minus KERNEL_VA_OFFSET, so loading by physical address places
@@ -86,6 +86,17 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	check_clear_of_destination(&staged, boot_info, dtb);
 
 	// ExitBootServices is the last firmware call; after it no service may be used.
+	// GIVE THE HEAP BACK before the map is taken. Everything the kernel receives is in pages of
+	// its own by now; the arenas underneath are the loader's own working memory, and left alone
+	// they reach the kernel as `MEM_BOOTLOADER` - which its frame allocator never seeds, so they
+	// would be reserved for the system's whole life. The number is printed because it is the one
+	// this milestone asked to be measured.
+	{
+		let freed = crate::heap::release(bs) / 1024;
+		serial::write_str("loader: returned ");
+		crate::serial_write_usize(freed);
+		serial::write_str(" KiB of loader heap\n");
+	}
 	exit_boot_services(bs, image_handle);
 
 	// Now, and only now, put the kernel at its link addresses and enter it. The loader ran
@@ -104,19 +115,37 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 // builds no page tables). Only the fields the device-tree kernel path reads are set;
 // the memmap / modules / rsdp / trampoline are x86-only.
 fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u8]>, volume_pkg: Option<&'static [u8]>) -> u64 {
+	let live_volume = unsafe { crate::LIVE_VOLUME };
 	let fb = crate::locate_framebuffer(bs);
 	serial::write_str(if fb.present { "loader: GOP framebuffer found\n" } else { "loader: no GOP framebuffer (serial-only boot log)\n" });
 	let phys = crate::alloc_pages(bs, 1).expect("loader: cannot allocate BootInfo");
 	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: 32, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
 	unsafe {
-		let (modules, modules_len) = match (init_pkg, crate::alloc_pages(bs, 1)) {
+		// The page is allocated ONLY when there is a package to describe. `match (init_pkg,
+		// alloc_pages(..))` evaluated the allocation either way, so a boot with no package leaked a
+		// page - and the `(Some, None)` arm produced a `BootInfo` with `modules_len = 0`, which is
+		// a boot that will not work reported as one that will.
+		let module_page = init_pkg.and_then(|_| crate::alloc_pages(bs, 1));
+		if init_pkg.is_some() && module_page.is_none() {
+			panic!("loader: cannot allocate the module array for the bootstrap package");
+		}
+		let (modules, modules_len) = match (init_pkg, module_page) {
 			(Some(bytes), Some(array)) => {
 				let entries = array as *mut bootproto::Module;
 				*entries = crate::make_module(bytes, crate::INIT_PKG_FILE, 0);
 				let mut count = 1u64;
 				if let Some(volume) = volume_pkg {
-					*entries.add(1) = crate::make_module(volume, crate::VOLUME_PKG_FILE, 0);
-					count = 2;
+					*entries.add(count as usize) = crate::make_module(volume, crate::VOLUME_PKG_FILE, 0);
+					count += 1;
+				}
+				// AND THE LIVE VOLUME. `main` reads `system-volume.img` on every architecture and
+				// the kernel looks for it, but only x86 published it - so a live medium booted here
+				// with no volume at all, on the two architectures whose kernels then had nothing to
+				// mount. A page holds 4096/40 = 102 modules, so three fit with room over.
+				if let Some(volume) = live_volume {
+					serial::write_str("loader: live system volume handed over\n");
+					*entries.add(count as usize) = crate::make_module(volume, crate::LIVE_VOLUME_FILE, 0);
+					count += 1;
 				}
 				(array, count)
 			}
@@ -163,6 +192,15 @@ fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 	// placed at its link addresses and jumped to unrelocated. Refused by name until a PIE kernel is
 	// wanted, which is a change here rather than to the parser.
 	assert!(image.image_type == crate::elf::ET_EXEC, "loader: the kernel image must be ET_EXEC");
+	// AND PAGE-ALIGNED LOAD ADDRESSES. This backend allocates from `p_memsz`, copies to the
+	// segment's own address and maps from `align_down(..)`, all of which are wrong by the page
+	// offset if a LOAD segment does not start on a page. The ELF format does not require it - it
+	// requires `p_vaddr = p_offset (mod p_align)`, which the parser checks for every image - so the
+	// stricter rule belongs to the kernel image, here, beside the code that depends on it.
+	for i in 0..image.segment_count() {
+		let Some(ph) = image.segment(i) else { continue };
+		assert!(ph.p_type != crate::elf::PT_LOAD || ph.p_vaddr % PAGE_SIZE == 0, "loader: a kernel LOAD segment is not page-aligned");
+	}
 
 	// The destination span first, from the headers alone - nothing is allocated until it is
 	// known what the allocation has to avoid.
@@ -247,24 +285,68 @@ unsafe fn place_and_enter(staged: &Staged, hartid: u64, boot_info: u64) -> ! {
 // A wrong answer here is a machine that stops with no output, which is the failure this whole
 // change exists to remove - so it is said out loud instead.
 fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64) {
-	let inside = |address: u64| address >= staged.dest_low && address < staged.dest_high;
+	// RANGES, not addresses. Every one of these was checked by a single byte - the staged image by
+	// its first, while it is the largest object in play - so an object whose START was outside the
+	// destination and whose BODY was inside passed. U-Boot does not reserve its own image in the
+	// firmware memory map, so the pages `retain()` hands back can be inside the future kernel
+	// destination, and the post-EBS copy would then overwrite the bootstrap data before the kernel
+	// reads it.
+	let span = staged.dest_high - staged.dest_low;
+	let overlaps = |start: u64, len: u64| -> bool {
+		let end = start.saturating_add(len.max(1));
+		start < staged.dest_high && staged.dest_low < end
+	};
 	let sp: u64;
 	unsafe { core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
-	for (address, what) in [
-		(place_and_enter as usize as u64, "the loader's own code"),
-		(sp, "the loader's stack"),
-		(staged as *const Staged as u64, "the staging descriptor"),
-		(staged.scratch, "the staged kernel image"),
-		(boot_info, "the hand-off record"),
-		(dtb, "the device tree"),
-	] {
-		if address != 0 && inside(address) {
+	// The loader's stack, from the current pointer up to the page it lives on: the whole ACTIVE
+	// stack, not the one word `sp` names.
+	let stack_top = (sp | (crate::PAGE_SIZE - 1)) + 1;
+	let mut ranges: [(u64, u64, &str); 10] = [
+		(place_and_enter as usize as u64, crate::PAGE_SIZE, "the loader's own code"),
+		(sp, stack_top - sp, "the loader's stack"),
+		(staged as *const Staged as u64, core::mem::size_of::<Staged>() as u64, "the staging descriptor"),
+		// The staged image is `span` bytes - the same length the copy will move.
+		(staged.scratch, span, "the staged kernel image"),
+		(boot_info, core::mem::size_of::<bootproto::BootInfo>() as u64, "the hand-off record"),
+		// The device tree's real length, off its own header: bytes 4..8 are `totalsize`, big-endian.
+		(dtb, dtb_total_size(dtb), "the device tree"),
+		(0, 0, ""),
+		(0, 0, ""),
+		(0, 0, ""),
+		(0, 0, ""),
+	];
+	// And the objects the firmware handed back that the kernel has yet to read: the bootstrap
+	// archive, the two packages and a live volume image. These are the ones the comment above is
+	// about - `retain()` allocates them through `AllocateAnyPages`, which U-Boot may satisfy from
+	// inside the kernel's destination.
+	let mut extra = 6;
+	for (bytes, what) in [(unsafe { crate::BOOTSTRAP }, "the bootstrap archive"), (unsafe { crate::LIVE_VOLUME }, "the live volume image")] {
+		if let Some(bytes) = bytes {
+			ranges[extra] = (bytes.as_ptr() as u64, bytes.len() as u64, what);
+			extra += 1;
+		}
+	}
+	for (start, len, what) in ranges.iter().take(extra) {
+		if *start != 0 && overlaps(*start, *len) {
 			serial::write_str("loader: FATAL - ");
 			serial::write_str(what);
 			serial::write_str(" lies where the kernel must be placed\n");
 			halt();
 		}
 	}
+}
+
+// The device tree's own length, from its header (`totalsize`, big-endian at byte 4). One page when
+// the magic is not there, which is the safe answer for something that may not be a DTB at all.
+fn dtb_total_size(dtb: u64) -> u64 {
+	if dtb == 0 {
+		return 0;
+	}
+	let header = unsafe { core::slice::from_raw_parts(dtb as *const u8, 8) };
+	if header[..4] != [0xd0, 0x0d, 0xfe, 0xed] {
+		return crate::PAGE_SIZE;
+	}
+	u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as u64
 }
 
 // Ask the RISCV_EFI_BOOT_PROTOCOL for the boot hart id; fall back to 0 if the firmware
@@ -303,7 +385,13 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle) {
 	let mut key = 0usize;
 	let mut desc_size = 0usize;
 	let mut desc_ver = 0u32;
-	unsafe { ((*bs).get_memory_map)(&mut map_size, core::ptr::null_mut(), &mut key, &mut desc_size, &mut desc_ver) };
+	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, core::ptr::null_mut(), &mut key, &mut desc_size, &mut desc_ver) };
+	// THE SIZING CALL'S ANSWER MATTERS. It was ignored, so `desc_size` was whatever the firmware
+	// left there - and a zero divides a few lines later. The expected status is
+	// `EFI_BUFFER_TOO_SMALL`; anything else means the map was not described.
+	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
+		panic!("loader: the firmware did not describe its memory map");
+	}
 	let cap = map_size + desc_size * 16;
 	let buf = crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 	loop {
@@ -316,9 +404,17 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle) {
 		// makes a later allocation fail loudly instead of handing out memory the loader no
 		// longer owns.
 		crate::heap::retire();
+		// And the firmware's console with it: after this call `ConOut` points at memory the loader
+		// no longer owns, so every later diagnostic goes to the built-in UART.
+		crate::console::release();
 		let status = unsafe { ((*bs).exit_boot_services)(image_handle, key) };
 		if !uefi::is_error(status) {
 			return;
+		}
+		// ONLY a stale map key is worth retrying. This looped on every error forever, which is the
+		// least informative possible response to a firmware saying something else is wrong.
+		if status != uefi::STATUS_INVALID_PARAMETER {
+			panic!("loader: ExitBootServices refused");
 		}
 		// The map changed; retry without allocating.
 	}

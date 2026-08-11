@@ -39,16 +39,29 @@ use wasm::{Host, Instance, Module, Trap, Value};
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
 
-// The `liber` world: the imports the host recognizes, resolved by name. Anything
-// else is `Unknown` and traps when the component calls it - the component reaches
-// nothing the host did not explicitly wire to a granted service.
+// The `liber:vfs@1` / `liber:log@1` world: the imports the host recognizes, resolved by name AND
+// signature. Anything else is refused at instantiation - the component reaches nothing the host did
+// not explicitly wire to a granted service.
+//
+// NAMED AND VERSIONED, because this is a compatibility boundary. The world's whole identity used to
+// be the strings `liber.read`, `liber.write` and `liber.log`, so the day a signature changed an old
+// module and a new one would both import `liber.read` with nothing to tell them apart.
 #[derive(Clone, Copy)]
 enum WorldFn {
 	Read,
 	Write,
 	Log,
-	Unknown,
 }
+
+// The world's status codes, returned in place of a byte count. They are ABI: a guest built apart
+// from this host must agree on them, and `src/sdk/src/world.rs` carries the same four.
+//
+// This exists because every failure used to be `0`. "The file is empty", "the volume is read-only"
+// and "the service did not answer" were one answer, on the boundary where a capability system most
+// needs them apart.
+const STATUS_DENIED: i32 = -1;
+const STATUS_FAULT: i32 = -2;
+const STATUS_IO: i32 = -3;
 
 // Resolve one import to its world operation, BY NAME AND BY SIGNATURE. This is the whole authority
 // surface: only these three names are wired, and only with the types the world declares.
@@ -60,12 +73,12 @@ enum WorldFn {
 // taken for anything.
 fn resolve(module: &str, field: &str, signature: Option<&FuncType>) -> Option<WorldFn> {
 	let (op, params, results): (WorldFn, &[ValType], &[ValType]) = match (module, field) {
-		// read(ptr: i32, max: i32) -> i32
-		("liber", "read") => (WorldFn::Read, &[ValType::I32, ValType::I32], &[ValType::I32]),
-		// write(ptr: i32, len: i32) -> i32
-		("liber", "write") => (WorldFn::Write, &[ValType::I32, ValType::I32], &[ValType::I32]),
-		// log(ptr: i32, len: i32)
-		("liber", "log") => (WorldFn::Log, &[ValType::I32, ValType::I32], &[]),
+		// read(ptr: u32, max: u32) -> i32 (count, or a negative status)
+		("liber:vfs@1", "read") => (WorldFn::Read, &[ValType::I32, ValType::I32], &[ValType::I32]),
+		// write(ptr: u32, len: u32) -> i32 (count, or a negative status)
+		("liber:vfs@1", "write") => (WorldFn::Write, &[ValType::I32, ValType::I32], &[ValType::I32]),
+		// log(ptr: u32, len: u32) -> i32 (0, or a negative status)
+		("liber:log@1", "log") => (WorldFn::Log, &[ValType::I32, ValType::I32], &[ValType::I32]),
 		// AN UNKNOWN IMPORT IS REFUSED AT INSTANTIATION, not tolerated until it is called. For a
 		// capability system the import list IS the manifest of requested authority: a module asking
 		// for `liber.camera` is asking for a camera, and "the call site might be unreachable" is not
@@ -96,14 +109,28 @@ struct ComponentHost {
 
 impl Host for ComponentHost {
 	fn call_import(&mut self, import: u32, args: &[Value], memory: &mut [u8]) -> Result<Vec<Value>, Trap> {
-		match self.imports.get(import as usize).copied().unwrap_or(WorldFn::Unknown) {
+		// The dispatch table was built at instantiation from imports this world offers, so an index
+		// outside it is the interpreter contradicting itself rather than a component asking for
+		// something it was not granted.
+		let Some(op) = self.imports.get(import as usize).copied() else {
+			return Err(Trap("import index outside the resolved world"));
+		};
+		match op {
 			// liber.read(ptr, max) -> n: read the one granted input file through
 			// StorageService into the component's memory, return the byte count.
 			WorldFn::Read => {
-				let (ptr, end): (usize, usize) = window(args, memory.len())?;
+				let Some((ptr, end)) = window(args, memory.len()) else {
+					return Ok(alloc::vec![Value::I32(STATUS_FAULT)]);
+				};
 				let input_path = factory_path("hello").ok_or(Trap("missing manifest input path"))?;
-				let n: usize = unsafe { read_file(self.storage, input_path.as_bytes(), &mut memory[ptr..end]) }.ok_or(Trap("granted read failed"))?;
-				Ok(alloc::vec![Value::I32(n as i32)])
+				// A FAILED READ IS A STATUS, not a trap. The component asked a legitimate question
+				// and the answer is that the granted file could not be read; killing the instance
+				// tells it nothing and gives it no chance to say so to its caller.
+				let n: i32 = match unsafe { read_file(self.storage, input_path.as_bytes(), &mut memory[ptr..end]) } {
+					Some(n) => n as i32,
+					None => STATUS_IO,
+				};
+				Ok(alloc::vec![Value::I32(n)])
 			}
 			// liber.write(ptr, len) -> n: persist the component's bytes to the one
 			// granted output file through StorageService, return the byte count (zero
@@ -111,40 +138,55 @@ impl Host for ComponentHost {
 			// report either way - they are the component's output, seen through the
 			// granted write path, not a guess at where they sit in linear memory.
 			WorldFn::Write => {
-				let (ptr, end): (usize, usize) = window(args, memory.len())?;
+				let Some((ptr, end)) = window(args, memory.len()) else {
+					return Ok(alloc::vec![Value::I32(STATUS_FAULT)]);
+				};
 				self.output = memory[ptr..end].to_vec();
 				let output_path = runtime_path("liber-component-output").ok_or(Trap("missing manifest output path"))?;
-				let n: usize = unsafe { write_file(self.storage, output_path.as_bytes(), &memory[ptr..end]) };
-				Ok(alloc::vec![Value::I32(n as i32)])
+				// `Ok(0)` for a refused write and `Ok(0)` for an empty one were the same answer.
+				// A volume that says no is `Denied`, and the component can act on that.
+				let n: i32 = match unsafe { write_file(self.storage, output_path.as_bytes(), &memory[ptr..end]) } {
+					Some(n) => n as i32,
+					None => STATUS_DENIED,
+				};
+				Ok(alloc::vec![Value::I32(n)])
 			}
 			// liber.log(ptr, len): emit the component's bytes as one structured entry
 			// through LogService - the console/cli of the world.
 			WorldFn::Log => {
-				let (ptr, end): (usize, usize) = window(args, memory.len())?;
+				let Some((ptr, end)) = window(args, memory.len()) else {
+					return Ok(alloc::vec![Value::I32(STATUS_FAULT)]);
+				};
 				if unsafe { emit_log(self.logsvc, &memory[ptr..end]) } {
 					self.logged = true;
+					return Ok(alloc::vec![Value::I32(0)]);
 				}
-				Ok(Vec::new())
+				// The log used to return NOTHING, so a component could not tell whether its one
+				// diagnostic channel had worked.
+				Ok(alloc::vec![Value::I32(STATUS_IO)])
 			}
-			// any other import is outside the granted world.
-			WorldFn::Unknown => Err(Trap("import not granted")),
 		}
 	}
 }
 
 // Resolve a (ptr, len) argument pair into a bounds-checked [ptr, end) memory window.
-fn window(args: &[Value], mem_len: usize) -> Result<(usize, usize), Trap> {
+//
+// REFUSED RATHER THAN CLAMPED. `end` used to be `.min(mem_len)`, so a component asking to write
+// three hundred bytes from an address near the top of its memory silently wrote fewer - the caller
+// was told a count it could not distinguish from a short file. A window that does not fit is
+// `Fault`, and the guest can say so.
+fn window(args: &[Value], mem_len: usize) -> Option<(usize, usize)> {
 	// A wasm32 address is a 32-BIT PATTERN, not a signed integer. Reading it as `i32 as usize`
 	// sign-extends anything at or above 0x8000_0000 into an enormous `usize`, which the bound below
 	// then refuses - so the ABI was silently capped at the low 2 GiB. Today's module has a small
 	// memory and cannot reach it; the conversion is still the wrong one.
 	let ptr: usize = args.first().map(|v: &Value| v.as_i32() as u32 as usize).unwrap_or(0);
 	let len: usize = args.get(1).map(|v: &Value| v.as_i32() as u32 as usize).unwrap_or(0);
-	let end: usize = ptr.saturating_add(len).min(mem_len);
-	if ptr > end {
-		return Err(Trap("memory window out of bounds"));
+	let end: usize = ptr.checked_add(len)?;
+	if end > mem_len {
+		return None;
 	}
-	Ok((ptr, end))
+	Some((ptr, end))
 }
 
 // Load the component module from storage: open it over StorageService, map the
@@ -186,19 +228,19 @@ unsafe fn read_file(storage: u64, uri: &[u8], dst: &mut [u8]) -> Option<usize> {
 	}
 }
 
-// Write `bytes` to the granted output file over StorageService, returning the number
-// of bytes the service accepted (zero if the volume is read-only or the write fails).
-unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> usize {
+// Write `bytes` to the granted output file over StorageService, returning the number of bytes the
+// service accepted - or `None` when the volume refused the write.
+//
+// `None` RATHER THAN ZERO. A refused write and a zero-byte write returned the same `0`, so the
+// world above could not report the one distinction it exists to carry.
+unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> Option<usize> {
 	unsafe {
-		let data: proto::codec::Buffer = match make_buffer(bytes) {
-			Some(b) => b,
-			None => return 0,
-		};
+		let data: proto::codec::Buffer = make_buffer(bytes)?;
 		let path: String = String::from_utf8_lossy(uri).into_owned();
 		let mut client = volume::Client::new(ChannelTransport { chan: storage });
 		match client.write(&path, &data) {
-			Some(Ok(())) => bytes.len(),
-			_ => 0,
+			Some(Ok(())) => Some(bytes.len()),
+			_ => None,
 		}
 	}
 }
@@ -268,8 +310,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	};
 
 	// 3. resolve every import by name into the dispatch table, then instantiate.
-	//    An import outside the `liber` world resolves to `Unknown` and will trap if
-	//    the component ever calls it - no ambient authority.
 	// Every import resolved and checked BEFORE the instance exists. One the world does not offer -
 	// by name or by type - refuses the component here.
 	let mut imports: Vec<WorldFn> = Vec::new();
@@ -285,7 +325,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 4. run the component: `run` reads its granted file, transforms it, logs it, and
 	//    writes it back; `score` exercises the float path on real toolchain output.
-	let _count: i32 = match instance.invoke("run", &[], &mut host) {
+	// THE COUNT IS REPORTED. It was read into `_count` and dropped, so nothing on either side of
+	// the boundary checked the export's return ABI - and the guest threw its own write result away
+	// too, which meant a failed write was invisible from end to end. It is now the component's
+	// answer: how many bytes it processed, or one of the world's negative statuses.
+	let count: i32 = match instance.invoke("run", &[], &mut host) {
 		Ok(results) => results.first().map(|v: &Value| v.as_i32()).unwrap_or(0),
 		Err(_) => exit(),
 	};
@@ -296,14 +340,31 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let score: i32 = instance.invoke("score", &[Value::I32(10)], &mut host).ok().and_then(|r: Vec<Value>| r.first().map(|v: &Value| v.as_i32())).unwrap_or(0);
 	let score_negative: i32 = instance.invoke("score", &[Value::I32(-3)], &mut host).ok().and_then(|r: Vec<Value>| r.first().map(|v: &Value| v.as_i32())).unwrap_or(0);
 
-	// 5. report back over the bootstrap channel: a one-byte log-grant flag, the
-	//    score as a little-endian i32, then the bytes the component produced (those it
-	//    handed to its `write` import, captured through the granted write path). The
-	//    supervisor / test reads and checks these.
-	let mut report: Vec<u8> = Vec::with_capacity(9 + host.output.len());
+	// 5. report back over the bootstrap channel: a one-byte log-grant flag, the two scores and the
+	//    `run` count as little-endian i32s, then the bytes the component produced (those it handed
+	//    to its `write` import, captured through the granted write path). The supervisor / test
+	//    reads and checks these - and reads the OUTPUT FILE back through StorageService, which is
+	//    the only thing that can prove the write happened.
+	// WHAT IS ACTUALLY IN THE FILE, read back through StorageService after the run.
+	//
+	// The report used to carry `host.output` alone - the copy taken from the component's memory on
+	// the way INTO the write - and the test compared that. So `write_file` could return zero, the
+	// volume could be read-only, the service could refuse, and the assertion still passed, because
+	// the bytes it compared had never been near the filesystem. The host holds the storage grant, so
+	// it is the one that can open the file again; the test compares both.
+	let mut readback: [u8; 512] = [0u8; 512];
+	let written: usize = match runtime_path("liber-component-output") {
+		Some(path) => unsafe { read_file(storage, path.as_bytes(), &mut readback) }.unwrap_or(0),
+		None => 0,
+	};
+
+	let mut report: Vec<u8> = Vec::with_capacity(17 + written + host.output.len());
 	report.push(host.logged as u8);
 	report.extend_from_slice(&score.to_le_bytes());
 	report.extend_from_slice(&score_negative.to_le_bytes());
+	report.extend_from_slice(&count.to_le_bytes());
+	report.extend_from_slice(&(written as u32).to_le_bytes());
+	report.extend_from_slice(&readback[..written]);
 	report.extend_from_slice(&host.output);
 	unsafe {
 		send_blocking(bootstrap, &report, 0);

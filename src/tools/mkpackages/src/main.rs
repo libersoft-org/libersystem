@@ -464,6 +464,42 @@ fn user_dynamic_path(manifest: &Path, destination: &str) -> PathBuf {
 	manifest.join(format!("../../.build/image/{}/{}", user_target(), path))
 }
 
+// A staged component, checked against the runtime that will have to run it.
+//
+// The guest is built by an external toolchain against a pinned release, and the host is this
+// project's own interpreter - so a new compiler emitting an instruction selection, a memory layout
+// or an import shape the interpreter does not implement produces a component that builds cleanly and
+// cannot be hosted. That failure belonged to the boot; it belongs here.
+//
+// Three things, and each of them has been wrong at least once: it parses, its declared memory fits
+// what the host can give it, and its imports are exactly the world - by name AND by signature,
+// because `Value::as_i32` converts every numeric type and a wrongly typed import used to be a
+// silent conversion at call time.
+fn validate_component(path: &Path, bytes: &[u8]) {
+	use wasm::{ValType, parse};
+
+	let module = parse(bytes).unwrap_or_else(|error| panic!("{} is not a component this system can host: {error:?}", path.display()));
+
+	// The guest's linear memory is allocated whole at instantiation, out of the host process's
+	// heap. `-zstack-size=65536` in `src/sdk/.cargo/config.toml` is what keeps this small - the
+	// default 1 MB wasm stack forces an initial memory the host cannot hold - and cargo reads that
+	// file only when invoked from inside the directory. So the flag's EFFECT is asserted here
+	// rather than the flag's presence assumed.
+	const MAX_PAGES: u32 = 4;
+	assert!(module.memory_min_pages <= MAX_PAGES, "{} declares {} initial memory pages, more than the {MAX_PAGES} the host can hold - is the wasm stack size still set?", path.display(), module.memory_min_pages);
+
+	let world: [(&str, &str, &[ValType], &[ValType]); 3] = [
+		("liber:vfs@1", "read", &[ValType::I32, ValType::I32], &[ValType::I32]),
+		("liber:vfs@1", "write", &[ValType::I32, ValType::I32], &[ValType::I32]),
+		("liber:log@1", "log", &[ValType::I32, ValType::I32], &[ValType::I32]),
+	];
+	for import in module.imports.iter() {
+		let signature = module.types.get(import.type_index as usize).unwrap_or_else(|| panic!("{} imports {}.{} with no type", path.display(), import.module, import.field));
+		let known = world.iter().find(|(m, f, _, _)| *m == import.module && *f == import.field).unwrap_or_else(|| panic!("{} imports {}.{}, which is not in the world the host offers", path.display(), import.module, import.field));
+		assert!(signature.params == known.2 && signature.results == known.3, "{} imports {}.{} with the wrong signature", path.display(), import.module, import.field);
+	}
+}
+
 fn identity_record(artifact: &Path) -> Vec<u8> {
 	let bytes = fs::read(artifact).unwrap_or_else(|error| panic!("cannot read {}: {error}", artifact.display()));
 	let image = bootproto::elf::Elf::parse_for_machine(&bytes, user_elf_machine()).unwrap_or_else(|| panic!("{} has no valid target ELF", artifact.display()));
@@ -741,6 +777,9 @@ fn volume_files(conf: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
 			system_manifest::FactoryFileKind::SdkComponent => manifest.join("../../.build/cargo/sdk/wasm32-unknown-unknown/release/liber_component.wasm"),
 		};
 		let bytes = fs::read(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+		if file.kind == system_manifest::FactoryFileKind::SdkComponent {
+			validate_component(&path, &bytes);
+		}
 		files.push((file.destination.as_str().to_string(), bytes));
 	}
 

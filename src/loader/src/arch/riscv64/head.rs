@@ -130,8 +130,9 @@ _pe_entry:
 	bgeu  t1, t2, 2f
 	ld    t3, 0(t1)                   // r_offset
 	ld    t4, 8(t1)                   // r_info
+	beqz  t4, 3f                      // R_RISCV_NONE: nothing to apply
 	li    t5, 3                       // R_RISCV_RELATIVE
-	bne   t4, t5, 3f
+	bne   t4, t5, 5f                  // anything else: STOP, do not skip it
 	ld    t5, 16(t1)                  // r_addend
 	add   t6, t0, t3                  // where = base + r_offset
 	add   t5, t5, t0                  // value = base + r_addend
@@ -146,5 +147,11 @@ _pe_entry:
 4:
 	wfi
 	j     4b
+	// A relocation type this stub does not apply. Skipping it left some pointers unrelocated and
+	// the image running anyway, which fails later and somewhere else; the build now refuses such an
+	// image, and if one is ever produced by other means it stops here rather than pretending.
+5:
+	wfi
+	j     5b
 "#
 );

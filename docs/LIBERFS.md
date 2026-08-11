@@ -222,6 +222,30 @@ shared block has no second copy - restore heals what a pinned generation still
 holds intact. With copy-on-write a crash leaks no blocks and orphans no inode,
 so there is nothing for fsck to reclaim.
 
+### What a corruption found DURING a write does (a decision, not an accident)
+
+Compression re-reads the raw blocks it is about to re-encode and verifies them against their
+checksums. When they do not match, the run is left raw and the write goes on: the compressed form
+would carry a FRESH, VALID checksum over bytes already known to be wrong, which launders a device
+corruption into metadata that says the data is fine. A later read or `fsck` then reports it, as it
+would for any other damaged block.
+
+The alternative was weighed and rejected: at that moment the filesystem has proof the bytes it is
+about to publish are wrong, it still has a good previous generation, and the superblock is
+unpublished - so it could refuse the whole write instead. Two things decided against it. The
+mismatch is evidence about the MEDIUM, not about the write in hand: the caller's new data is fine,
+and failing their write neither repairs the old block nor tells them anything they can act on. And
+the check only exists on the compression path, so making it fatal would mean a volume with
+compression enabled refuses writes that the same volume with compression off accepts - a
+correctness property that depends on an optimisation, which is exactly the shape this filesystem
+avoids everywhere else.
+
+The generalisation, when it is wanted, is a verify-after-write policy independent of compression:
+every block read back and checked after it lands, with one answer for every path. That is a
+different feature with a real cost, and it is not in version 1.
+
+`compression_never_launders_a_corrupt_source_block` pins the behaviour above.
+
 ## Interfaces
 
 All I/O goes through the `BlockDevice` trait, one fixed 4 kB block at a time, so

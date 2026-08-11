@@ -89,9 +89,9 @@ static mut riscv64_sec_stacks_ptr: u64 = 0;
 // per-CPU block, trap vector, and local timer, records itself online, then idles.
 #[unsafe(no_mangle)]
 extern "C" fn riscv64_secondary_main(cpu_id: u64, hartid: u64) -> ! {
-	// Permit S-mode access to U-pages (SUM) and enable the FPU (FS = Initial) on this
-	// hart, matching the boot hart's setup before any context switch.
-	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) (1u64 << 18) | (1u64 << 13), options(nostack, preserves_flags)) };
+	// Enable the FPU (FS = Initial) on this hart, matching the boot hart's setup before any context
+	// switch. SUM stays CLEAR here too - see `boot.rs` and `paging::user_access`.
+	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1u64 << 13, options(nostack, preserves_flags)) };
 	unsafe { core::arch::asm!("csrw scounteren, {}", in(reg) 0x7u64, options(nostack, preserves_flags)) };
 	super::traps::init();
 	super::percpu::init(cpu_id as usize, hartid as u32);
