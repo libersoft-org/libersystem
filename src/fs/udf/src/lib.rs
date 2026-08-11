@@ -266,8 +266,20 @@ impl<D: BlockDevice> Udf<D> {
 					// resolved against the one physical partition, which is correct for this shape
 					// and silently wrong for any other - so anything else is refused by name rather
 					// than misread.
+					// The Map Table Length is at 264 and the map COUNT at 268 (ECMA-167 3/10.6:
+					// ... Logical Volume Contents Use 248..264, Map Table Length 264..268, Number
+					// of Partition Maps 268..272, Implementation Identifier 272..304).
+					//
+					// This read the length at 272, which is the first four bytes of the
+					// Implementation Identifier - on a volume `mkfs.udf` writes, the string
+					// "\0*Linux UDFFS", or 1766599168 as a little-endian u32. The bound below then
+					// refused it, `scan_sequence` returned None, and a perfectly good volume mounted
+					// as `Corrupt`.
+					//
+					// Every fixture in this crate was built to the same misreading, so all
+					// twenty-six tests agreed with it. `mkfs.udf` did not.
+					let map_len = le32(&block[264..268]) as usize;
 					let map_count = le32(&block[268..272]);
-					let map_len = le32(&block[272..276]) as usize;
 					if map_count != 1 || map_len < 2 || 440 + map_len > block.len() {
 						return None;
 					}

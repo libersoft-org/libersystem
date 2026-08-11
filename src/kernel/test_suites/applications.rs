@@ -408,11 +408,15 @@ fn component_host_runs_an_sdk_component() {
 	// capability-gated filesystem read and transformed it on the interpreter), the log
 	// grant must have been reached (the second typed service was wired - no ambient
 	// authority), and score(10) must be 17 (the float path on genuine toolchain output).
-	let (expected, content, logged, score) = run_component_scenario().expect("the component scenario should run");
+	let (expected, content, logged, score, score_negative) = run_component_scenario().expect("the component scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(content, expected, "the component read, transformed, and returned its granted file's bytes through the host imports");
 	assert!(logged, "the component reached its LogService grant - the second typed service was wired with no ambient authority");
-	assert_eq!(score, 17, "the component's float `score` export computed floor(10 * 1.5 + 2.0) on real toolchain output");
+	assert_eq!(score, 17, "the component's float `score` export computed trunc(10 * 1.5 + 2.0) on real toolchain output");
+	// The case where truncation and flooring disagree: -3 * 1.5 + 2.0 is -2.5, which truncates to -2
+	// and floors to -3. `score(10)` is 17 either way, so it could never have told them apart - and
+	// the export's comment said `floor` while the cast truncated, which is how that stayed unnoticed.
+	assert_eq!(score_negative, -2, "the float-to-int conversion rounds toward zero, as the cast does");
 }
 
 tagged_test!(a_governed_pipeline_starts_as_one_transaction_and_carries_data, [Service, Process, PermissionService], id = "kernel.applications.a_governed_pipeline_starts_as_one_transaction_and_carries_data", covers = ["kernel", "services"]);

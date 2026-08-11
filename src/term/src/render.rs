@@ -106,6 +106,7 @@ fn glyph_bitmap(cp: u32) -> &'static [u8] {
 // A linear framebuffer's geometry and pixel format, handed to a `Raster`. Decouples the
 // renderer from any particular framebuffer description (the kernel's boot framebuffer, the
 // userspace ABI `Framebuffer`): each caller fills this from its own source.
+#[derive(Clone)]
 pub struct Geometry {
 	pub width: usize,
 	pub height: usize,
@@ -138,8 +139,42 @@ pub struct Raster {
 }
 
 impl Raster {
-	pub fn new(addr: u64, g: &Geometry) -> Raster {
-		Raster { addr, width: g.width, height: g.height, pitch: g.pitch, bytes_per_pixel: g.bytes_per_pixel, red_shift: g.red_shift, red_size: g.red_size, green_shift: g.green_shift, green_size: g.green_size, blue_shift: g.blue_shift, blue_size: g.blue_size }
+	// Wrap a mapped linear framebuffer.
+	//
+	// UNSAFE, and it always was - the object's every method dereferences `addr`, and all of them
+	// are reachable through the safe `Surface` trait. Safe Rust could write `Raster::new(1, &g)`
+	// and then `fill()`. Both callers in this tree take the address from a real mapping, so this
+	// was never a live exploit; it was the one thing in this crate that broke a LANGUAGE guarantee
+	// rather than a terminal one, and the signature is where that gets said.
+	//
+	// # Safety
+	//
+	// `addr` must be the base of a readable and writable mapping of at least `g.pitch * g.height`
+	// bytes, valid for as long as this `Raster` lives, and not aliased by any Rust reference. The
+	// geometry must describe that mapping: `bytes_per_pixel` in `1..=4`, `pitch >= width *
+	// bytes_per_pixel`, and every channel's shift plus its size within 32 - which the constructor
+	// checks rather than trusts, because those three are the ones that turn a plausible mode line
+	// into an index panic or a shift overflow.
+	pub unsafe fn new(addr: u64, g: &Geometry) -> Option<Raster> {
+		// Validated ONCE, here, where the numbers arrive. `put_pixel` writes `bytes[i]` over a
+		// `[u8; 4]`, so a `bytes_per_pixel` of 5 was an index panic rather than a refusal, and
+		// `channel` shifts a `u32`, so a `red_shift` of 32 panicked in a debug build. Neither was
+		// checked anywhere, and both are ordinary values for a mode line to carry wrongly.
+		if !(1..=4).contains(&g.bytes_per_pixel) {
+			return None;
+		}
+		if g.pitch < g.width.checked_mul(g.bytes_per_pixel)? {
+			return None;
+		}
+		for (shift, size) in [(g.red_shift, g.red_size), (g.green_shift, g.green_size), (g.blue_shift, g.blue_size)] {
+			if size > 8 || shift as u32 + size.min(8) as u32 > 32 {
+				return None;
+			}
+		}
+		if g.pitch.checked_mul(g.height).is_none() {
+			return None;
+		}
+		Some(Raster { addr, width: g.width, height: g.height, pitch: g.pitch, bytes_per_pixel: g.bytes_per_pixel, red_shift: g.red_shift, red_size: g.red_size, green_shift: g.green_shift, green_size: g.green_size, blue_shift: g.blue_shift, blue_size: g.blue_size })
 	}
 
 	// Position one 8-bit colour channel into the framebuffer pixel value.
@@ -666,7 +701,10 @@ impl FramebufferRenderer {
 	// fold done at draw time (it used to be baked into the cell by `recompute_colors`).
 	fn cell_colors(&self, screen: &Screen, c: &Cell) -> (u32, u32) {
 		let fg = self.resolve(screen, c.fg, screen.default_fg(), c.bold);
-		let bg = self.resolve(screen, c.bg, screen.default_bg(), c.bold);
+		// INTENSITY IS A FOREGROUND PROPERTY. Passing `c.bold` here too moved bold text on ANSI
+		// background 40-47 to the bright palette entry 8-15 - so the same background changed colour
+		// depending on whether the text over it was bold.
+		let bg = self.resolve(screen, c.bg, screen.default_bg(), false);
 		if c.reverse { (bg, fg) } else { (fg, bg) }
 	}
 

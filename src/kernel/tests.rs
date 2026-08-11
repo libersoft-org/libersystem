@@ -853,7 +853,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 // component's float `score` export. The kernel only brokers the initial capabilities.
 // Returns (expected, content, logged, score): the upper-cased granted file, the bytes
 // the component produced, whether the log grant was reached, and the float result.
-fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, bool, i32), &'static str> {
+fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>, bool, i32, i32), &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
@@ -887,13 +887,15 @@ fn run_component_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>,
 	sched::run_until_idle();
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
 	let bytes: alloc::vec::Vec<u8> = result.bytes;
-	if bytes.len() < 5 {
+	if bytes.len() < 9 {
 		return Err("the host report was too short");
 	}
 	let logged: bool = bytes[0] != 0;
 	let score: i32 = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+	// The negative case, where truncation and flooring differ - see the host, and `score`'s comment.
+	let score_negative: i32 = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
 	let content: alloc::vec::Vec<u8> = bytes[5..].to_vec();
-	Ok((expected, content, logged, score))
+	Ok((expected, content, logged, score, score_negative))
 }
 
 // Build the resource topology and run it to completion. The resource_manager

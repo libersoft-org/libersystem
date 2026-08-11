@@ -158,8 +158,13 @@ fn build_udf() -> Vec<u8> {
 	lvd[217..236].copy_from_slice(b"*OSTA UDF Compliant"); // DomainIdentifier
 	w32(&mut lvd, 252, 259); // File Set at lb 259
 	w16(&mut lvd, 256, 0); // ...in partition reference 0
+	// The two fields in the order ECMA-167 3/10.6 puts them: MapTableLength at 264, then
+	// NumberOfPartitionMaps at 268. The fixture wrote the length at 272 - which is where the
+	// Implementation Identifier starts - and the parser read it from the same wrong place, so the
+	// two agreed with each other and with no volume any formatter produces.
+	w32(&mut lvd, 264, 6); // MapTableLength
 	w32(&mut lvd, 268, 1); // NumberOfPartitionMaps
-	w32(&mut lvd, 272, 6); // MapTableLength
+	lvd[272..285].copy_from_slice(b"\0*Linux UDFFS"); // ImplementationIdentifier, where 272 really is
 	lvd[440] = 1; // one Type-1 (physical) partition map
 	lvd[441] = 6; // its length
 	tag(&mut lvd, TAG_LOGICAL_VOLUME, 258);
@@ -635,4 +640,37 @@ fn a_stale_descriptor_does_not_win_over_a_newer_one() {
 	// The File Set moved to 259 in the fixture, so this test only proves the descriptor choice:
 	// with the stale one winning, the mount would resolve addresses against 9999 and fail.
 	assert!(Udf::mount(MemDisc { data: img }).is_some(), "the newer partition descriptor prevails over a later-but-older copy");
+}
+
+#[cfg(test)]
+fn udftools_available() -> bool {
+	let ok = std::process::Command::new("mkfs.udf").arg("--help").output().is_ok();
+	if !ok {
+		std::println!("SKIPPED: udftools (mkfs.udf) is not installed - the independent cross-check did not run");
+	}
+	ok
+}
+
+#[test]
+fn an_image_from_an_independent_formatter_mounts() {
+	// Every fixture in this file is built by this crate, so every check it turned on was checked
+	// against media this crate produced - which is how a validator and its fixtures come to agree
+	// with each other and with nothing else. `mkfs.udf` has no stake in either.
+	//
+	// This is also the medium the GUEST is given: `boot/qemu-run.sh` formats the test UDF disk with
+	// exactly this command, and a mount refused there takes `udf_storage` down with it.
+	if !udftools_available() {
+		return;
+	}
+	let dir = std::env::temp_dir().join("udf-gold");
+	let _ = std::fs::create_dir_all(&dir);
+	let path = dir.join("media.udf");
+	let _ = std::fs::remove_file(&path);
+	std::fs::write(&path, alloc::vec![0u8; 32 << 20]).expect("a blank image");
+	let made = std::process::Command::new("mkfs.udf").arg("--media-type=hd").arg("--blocksize=2048").arg(&path).output().expect("mkfs.udf");
+	assert!(made.status.success(), "mkfs.udf failed: {}", String::from_utf8_lossy(&made.stderr));
+
+	let image = std::fs::read(&path).expect("the formatted image");
+	let outcome = Udf::mount_checked(MemDisc { data: image });
+	assert!(outcome.is_ok(), "a volume from udftools must mount: {:?}", outcome.err());
 }

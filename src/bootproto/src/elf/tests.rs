@@ -323,3 +323,34 @@ fn plt_rela_metadata_is_complete_and_bounded() {
 	bad[kind_value..kind_value + 8].copy_from_slice(&17u64.to_le_bytes());
 	assert!(Elf::parse(&bad).unwrap().dynamic_info().is_none());
 }
+
+#[test]
+fn a_malformed_pt_load_is_refused_by_the_parser_rather_than_by_each_loader() {
+	// The parser bounded `p_offset .. p_offset + p_filesz` against the file and stopped there, so
+	// every backend sized its allocation from `p_memsz` and copied `p_filesz` bytes into it. A
+	// header declaring `p_memsz = 4096, p_filesz = 65536` reserved one page and wrote sixty-four
+	// kilobytes of firmware memory. The kernel's own loader clamps each per-page copy and was never
+	// exposed; the loader, reading the boot medium, was.
+	//
+	// Validated once here, so all four readers get it and none of them has to remember.
+	let payload = vec![0xAAu8; 8192];
+	let ok = ProgramHeader { p_type: PT_LOAD, p_flags: PF_R | PF_X, p_offset: 0, p_vaddr: 0x1000, p_paddr: 0x1000, p_filesz: 4096, p_memsz: 8192, p_align: 4096 };
+	assert!(Elf::parse(&image(ET_EXEC, &[ok], &payload)).is_some(), "the sane segment must parse, or nothing below means anything");
+
+	let refused = |what: &str, edit: &dyn Fn(&mut ProgramHeader)| {
+		let mut ph = ok;
+		edit(&mut ph);
+		assert!(Elf::parse(&image(ET_EXEC, &[ph], &payload)).is_none(), "{what}");
+	};
+	refused("more file bytes than memory to hold them", &|ph| {
+		ph.p_filesz = 8192;
+		ph.p_memsz = 4096;
+	});
+	refused("file bytes the file does not contain", &|ph| {
+		ph.p_offset = 4096;
+		ph.p_filesz = 1 << 20;
+		ph.p_memsz = 1 << 20;
+	});
+	refused("a segment that is both writable and executable", &|ph| ph.p_flags = PF_R | PF_W | PF_X);
+	refused("a load address that is not page-aligned", &|ph| ph.p_vaddr = 0x1008);
+}

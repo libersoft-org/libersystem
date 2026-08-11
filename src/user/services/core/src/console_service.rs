@@ -57,9 +57,13 @@ impl Surface for DisplaySurface {
 	}
 }
 
-fn make_surface(addr: u64, fb: &Framebuffer, client: &DisplayClient) -> Box<dyn Surface> {
-	let raster = Raster::new(addr, &geometry(fb));
-	Box::new(DisplaySurface { raster, client: client.clone() })
+fn make_surface(addr: u64, fb: &Framebuffer, client: &DisplayClient) -> Option<Box<dyn Surface>> {
+	// SAFETY: `addr` is the base of the framebuffer this service just mapped through the display
+	// protocol, and `fb` is the geometry the same call reported for it. The mapping outlives the
+	// surface. A geometry the renderer cannot address is refused here rather than panicking on the
+	// first pixel - which is what an out-of-range `bytes_per_pixel` or channel shift used to do.
+	let raster = unsafe { Raster::new(addr, &geometry(fb)) }?;
+	Some(Box::new(DisplaySurface { raster, client: client.clone() }))
 }
 
 // The renderer's `Geometry` for a mapped ABI `Framebuffer`: the pixel format the display
@@ -373,8 +377,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// the boot log across as text (SYS_CONSOLE_READLOG) and we replay it into the model:
 		// the boot log stays on screen - and in the scrollback - after the gpu and this
 		// renderer take over, with no second renderer and no pixel-level handoff.
-		let term: Option<Term> = if has_fb {
-			let mut t = Term::new(make_surface(addr, &fb, &display), vt_scrollback);
+		// A geometry the renderer cannot address means no terminal on this VT, not a panic on the
+		// first pixel: `has_fb` says a framebuffer was mapped, and this says it is one we can draw
+		// into.
+		let drawable: Option<Box<dyn Surface>> = if has_fb { make_surface(addr, &fb, &display) } else { None };
+		let term: Option<Term> = if let Some(drawable) = drawable {
+			let mut t = Term::new(drawable, vt_scrollback);
 			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 			let mut log: Vec<u8> = alloc::vec![0u8; 16384];
 			let n: i64 = console_readlog(&mut log);
@@ -1161,8 +1169,8 @@ unsafe fn handle_display_resize(console: &mut Console) {
 		let client: DisplayClient = console.display.clone();
 		let n: usize = console.vts.len();
 		for vi in 0..n {
-			if let Some(t) = console.vts[vi].term.as_mut() {
-				t.set_surface(make_surface(new_addr, &new_fb, &client));
+			if let (Some(t), Some(surface)) = (console.vts[vi].term.as_mut(), make_surface(new_addr, &new_fb, &client)) {
+				t.set_surface(surface);
 			}
 			resize_vt(console, vi, cols, rows);
 		}
@@ -1674,10 +1682,15 @@ unsafe fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: 
 		// the new VT's terminal policy, re-read from the config tree so a `set`
 		// applies here (the next VT) without restarting the console.
 		let (vt_scrollback, vt_history): (usize, usize) = term_policy(config_client);
-		let mut term: Term = Term::new(make_surface(addr, fb, display), vt_scrollback);
-		term.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
-		term.screen.clear();
-		Some(Vt { term: Some(term), client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") })
+		// No drawable surface means this VT has no terminal - the same answer boot gives when the
+		// geometry cannot be addressed, rather than a panic on the first pixel.
+		let term: Option<Term> = make_surface(addr, fb, display).map(|drawable| {
+			let mut t = Term::new(drawable, vt_scrollback);
+			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
+			t.screen.clear();
+			t
+		});
+		Some(Vt { term, client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") })
 	}
 }
 

@@ -66,6 +66,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		if inode.extent_count as u64 > self.num_blocks {
 			return Err(FsError::Corrupt);
 		}
+		// A count past the inline capacity with no chain to hold the rest is corrupt before a block
+		// is read: the inode declares extents it has nowhere to keep.
+		if inode.spill == 0 {
+			return Err(FsError::Corrupt);
+		}
 		let mut ptr = inode.spill;
 		let mut crc = inode.spill_crc;
 		let mut buf = vec![0u8; BLOCK_SIZE];
@@ -112,6 +117,17 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			ptr = u64::from_le_bytes(buf[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].try_into().unwrap());
 			crc = u32::from_le_bytes(buf[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].try_into().unwrap());
+		}
+		// THE TOTAL, which every per-block check above leaves open: each block's count was refused
+		// if it could not be true, and a chain that simply ENDS early - four inline extents, a
+		// declared seven, a null next pointer - satisfied all of them and returned `Ok`.
+		//
+		// `fsck` has the check and the message for it. The mount did not, and the rewrite is what
+		// makes the difference matter: `flush_extents` sets `extent_count = extents.len()`, so
+		// editing such an inode replaces an incomplete map with a self-consistent one and the
+		// missing extents become holes - permanently, in a valid generation nobody will question.
+		if inode.extents.len() != inode.extent_count as usize {
+			return Err(FsError::Corrupt);
 		}
 		Ok(())
 	}
@@ -172,6 +188,23 @@ impl<D: BlockDevice> LiberFs<D> {
 	// first (for a file) so the inode slot and chain agree. The insert copies every tree
 	// node on the path up to a fresh block and updates `inode_root`; the change is
 	// published by `commit`.
+	// Write an inode slot EXACTLY as given, without the extent flush that would repair it.
+	//
+	// `write_inode` rebuilds the spill chain and sets `extent_count = extents.len()`, which is
+	// precisely the behaviour the map-consistency check exists to catch - so a test that wants a
+	// self-consistent medium carrying an inconsistent map cannot go through it.
+	#[cfg(test)]
+	pub(crate) fn write_inode_slot_for_test(&mut self, num: u32, inode: &Inode) -> Result<(), FsError> {
+		let mut rec = vec![0u8; INODE_REC];
+		rec[0..8].copy_from_slice(&(num as u64).to_le_bytes());
+		inode.write(&mut rec[8..8 + INODE_SIZE]);
+		let (root, crc) = self.tree_insert(self.inode_root, self.inode_root_crc, num as u64, &rec, INODE_REC, INODE_LEAF_MAX, INODE_KEYLEN)?;
+		self.inode_root = root;
+		self.inode_root_crc = crc;
+		self.icache.remove(&num);
+		Ok(())
+	}
+
 	pub(crate) fn write_inode(&mut self, num: u32, inode: &mut Inode) -> Result<(), FsError> {
 		if inode.r#type == TYPE_FILE {
 			self.flush_extents(inode)?;

@@ -30,13 +30,23 @@ pub fn read_input(buf: &mut [u8]) -> usize {
 
 // Write `buf` to the granted output; returns how many bytes the host persisted (0
 // when the grant is read-only).
+//
+// CLAMPED, like `read_input` above. This returned whatever the host said, so a host regression
+// answering a million for a hundred-byte write handed a million straight to the application -
+// through the wrapper whose whole job is to be the safe side of that boundary. A count larger than
+// what was offered is not a count; the host cannot have written more than it was given.
 pub fn write_output(buf: &[u8]) -> usize {
 	let n: i32 = write(buf.as_ptr() as i32, buf.len() as i32);
-	if n < 0 { 0 } else { n as usize }
+	if n < 0 { 0 } else { (n as usize).min(buf.len()) }
 }
 
 // Emit `msg` as one structured log entry through the granted LogService.
-pub fn log_message(msg: &[u8]) {
+//
+// TEXT, and the signature says so. This took `&[u8]` while the host did `String::from_utf8_lossy`,
+// so bytes that were not text became replacement characters somewhere the caller could not see -
+// the wrong answer to either contract. A caller that really has bytes can decide for itself how to
+// render them.
+pub fn log_message(msg: &str) {
 	log(msg.as_ptr() as i32, msg.len() as i32);
 }
 

@@ -266,7 +266,48 @@ impl<'a> Elf<'a> {
 		if table_end > bytes.len() {
 			return None;
 		}
-		Some(Self { bytes, image_type: header.e_type, entry: header.e_entry, phoff: header.e_phoff, phentsize: header.e_phentsize, phnum: header.e_phnum, shoff: header.e_shoff, shentsize: header.e_shentsize, shnum: header.e_shnum, shstrndx: header.e_shstrndx })
+		let image = Self { bytes, image_type: header.e_type, entry: header.e_entry, phoff: header.e_phoff, phentsize: header.e_phentsize, phnum: header.e_phnum, shoff: header.e_shoff, shentsize: header.e_shentsize, shnum: header.e_shnum, shstrndx: header.e_shstrndx };
+		// EVERY PT_LOAD VALIDATED HERE, once, rather than at each of the four places that load one.
+		//
+		// The parser bounded `p_offset .. p_offset + p_filesz` against the file and stopped there,
+		// so each backend sized its allocation from `p_memsz` and copied `p_filesz` bytes into it -
+		// and a header declaring `p_memsz = 4096, p_filesz = 65536` reserved one page and wrote
+		// sixty-four kilobytes of firmware memory. The kernel's own loader is not exposed (it clamps
+		// every per-page copy), so this was the loader alone, reading the boot medium; that is still
+		// the wrong answer to a malformed image, and it is one comparison.
+		for i in 0..image.segment_count() {
+			let Some(ph) = image.segment(i) else {
+				return None;
+			};
+			if ph.p_type != PT_LOAD {
+				continue;
+			}
+			// More file bytes than memory to put them in.
+			if ph.p_filesz > ph.p_memsz {
+				return None;
+			}
+			// File bytes the file does not contain. Every backend treated this as an all-BSS
+			// segment and booted it; a segment that declares contents it has not got is a
+			// malformed executable, and the image is the thing to refuse.
+			if ph.p_filesz > 0 && image.segment_data(&ph).is_none() {
+				return None;
+			}
+			// A segment that is both writable and executable. `map_kernel_segment` derives
+			// `WRITABLE` and `NX` from the flags independently, so this mapped read-write-execute
+			// under a comment claiming W^X. The kernel does not have such a segment.
+			if ph.p_flags & PF_W != 0 && ph.p_flags & PF_X != 0 {
+				return None;
+			}
+			// A load address that is not 4 KiB-aligned. x86 allocates from `p_memsz`, copies to
+			// `phys + 0` and maps `align_down(p_vaddr)`, which is wrong by the page offset - and
+			// the image format is ours, so refusing is the answer rather than computing it. 4096 is
+			// written out because this crate is the boot protocol and has no page constant of its
+			// own; every target it loads for uses it as the smallest page.
+			if ph.p_vaddr % 4096 != 0 {
+				return None;
+			}
+		}
+		Some(image)
 	}
 
 	// The number of program headers.

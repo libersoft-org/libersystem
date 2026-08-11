@@ -34,6 +34,7 @@ use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::system::{Entry, Field, OpenOpts, Severity, log, volume};
 use rt::*;
+use wasm::module::{FuncType, ValType};
 use wasm::{Host, Instance, Module, Trap, Value};
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
@@ -49,15 +50,33 @@ enum WorldFn {
 	Unknown,
 }
 
-// Resolve one import's (module, field) name to its world operation. This is the
-// whole authority surface: only these three names are wired.
-fn resolve(module: &str, field: &str) -> WorldFn {
-	match (module, field) {
-		("liber", "read") => WorldFn::Read,
-		("liber", "write") => WorldFn::Write,
-		("liber", "log") => WorldFn::Log,
-		_ => WorldFn::Unknown,
+// Resolve one import to its world operation, BY NAME AND BY SIGNATURE. This is the whole authority
+// surface: only these three names are wired, and only with the types the world declares.
+//
+// The signature was never consulted, and it matters more here than it would elsewhere because
+// `Value::as_i32` converts `I64`, `F32` and `F64` as well as `I32` - so a module declaring
+// `liber.read` with the wrong type did not get "incompatible import", it got a silent conversion at
+// call time, on the boundary whose entire job is to be the place where the guest's word is not
+// taken for anything.
+fn resolve(module: &str, field: &str, signature: Option<&FuncType>) -> Option<WorldFn> {
+	let (op, params, results): (WorldFn, &[ValType], &[ValType]) = match (module, field) {
+		// read(ptr: i32, max: i32) -> i32
+		("liber", "read") => (WorldFn::Read, &[ValType::I32, ValType::I32], &[ValType::I32]),
+		// write(ptr: i32, len: i32) -> i32
+		("liber", "write") => (WorldFn::Write, &[ValType::I32, ValType::I32], &[ValType::I32]),
+		// log(ptr: i32, len: i32)
+		("liber", "log") => (WorldFn::Log, &[ValType::I32, ValType::I32], &[]),
+		// AN UNKNOWN IMPORT IS REFUSED AT INSTANTIATION, not tolerated until it is called. For a
+		// capability system the import list IS the manifest of requested authority: a module asking
+		// for `liber.camera` is asking for a camera, and "the call site might be unreachable" is not
+		// an answer to that.
+		_ => return None,
+	};
+	let signature = signature?;
+	if signature.params != params || signature.results != results {
+		return None;
 	}
+	Some(op)
 }
 
 // The host: the two typed-service capabilities it was granted (a StorageService
@@ -115,8 +134,12 @@ impl Host for ComponentHost {
 
 // Resolve a (ptr, len) argument pair into a bounds-checked [ptr, end) memory window.
 fn window(args: &[Value], mem_len: usize) -> Result<(usize, usize), Trap> {
-	let ptr: usize = args.first().map(|v: &Value| v.as_i32() as usize).unwrap_or(0);
-	let len: usize = args.get(1).map(|v: &Value| v.as_i32() as usize).unwrap_or(0);
+	// A wasm32 address is a 32-BIT PATTERN, not a signed integer. Reading it as `i32 as usize`
+	// sign-extends anything at or above 0x8000_0000 into an enormous `usize`, which the bound below
+	// then refuses - so the ABI was silently capped at the low 2 GiB. Today's module has a small
+	// memory and cannot reach it; the conversion is still the wrong one.
+	let ptr: usize = args.first().map(|v: &Value| v.as_i32() as u32 as usize).unwrap_or(0);
+	let len: usize = args.get(1).map(|v: &Value| v.as_i32() as u32 as usize).unwrap_or(0);
 	let end: usize = ptr.saturating_add(len).min(mem_len);
 	if ptr > end {
 		return Err(Trap("memory window out of bounds"));
@@ -182,8 +205,16 @@ unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> usize {
 
 // Emit `msg` as one structured log entry over LogService. Returns whether the
 // service accepted it - the host's proof the log grant is live.
+//
+// The guest's `log` takes TEXT and the SDK's signature now says so, so bytes that are not text are
+// a guest that broke its side of the world - refused here rather than turned into replacement
+// characters somewhere nobody can see. `String::from_utf8_lossy` was answering a question the
+// caller had not asked.
 unsafe fn emit_log(logsvc: u64, msg: &[u8]) -> bool {
-	let entry: Entry = Entry { timestamp: unsafe { clock() }, severity: Severity::Info, source: String::from("component"), fields: alloc::vec![Field { key: String::from("message"), value: String::from_utf8_lossy(msg).into_owned() }] };
+	let Ok(text) = core::str::from_utf8(msg) else {
+		return false;
+	};
+	let entry: Entry = Entry { timestamp: unsafe { clock() }, severity: Severity::Info, source: String::from("component"), fields: alloc::vec![Field { key: String::from("message"), value: String::from(text) }] };
 	let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 	matches!(client.emit(&entry), Some(Ok(())))
 }
@@ -239,7 +270,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. resolve every import by name into the dispatch table, then instantiate.
 	//    An import outside the `liber` world resolves to `Unknown` and will trap if
 	//    the component ever calls it - no ambient authority.
-	let imports: Vec<WorldFn> = module.imports.iter().map(|i: &wasm::module::Import| resolve(&i.module, &i.field)).collect();
+	// Every import resolved and checked BEFORE the instance exists. One the world does not offer -
+	// by name or by type - refuses the component here.
+	let mut imports: Vec<WorldFn> = Vec::new();
+	for i in module.imports.iter() {
+		let signature: Option<&FuncType> = module.types.get(i.type_index as usize);
+		match resolve(&i.module, &i.field, signature) {
+			Some(op) => imports.push(op),
+			None => exit(),
+		}
+	}
 	let mut instance: Instance = Instance::new(&module);
 	let mut host: ComponentHost = ComponentHost { storage, logsvc, imports, logged: false, output: Vec::new() };
 
@@ -249,15 +289,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Ok(results) => results.first().map(|v: &Value| v.as_i32()).unwrap_or(0),
 		Err(_) => exit(),
 	};
+	// Two values, because one of them was chosen where the truncation cannot show. `score(10)` is
+	// 17 whether the conversion rounds down or toward zero; `score(-3)` is -2 truncating and -3
+	// flooring, which is the only place the interpreter's float-to-int conversion can be seen to be
+	// the one the toolchain emitted.
 	let score: i32 = instance.invoke("score", &[Value::I32(10)], &mut host).ok().and_then(|r: Vec<Value>| r.first().map(|v: &Value| v.as_i32())).unwrap_or(0);
+	let score_negative: i32 = instance.invoke("score", &[Value::I32(-3)], &mut host).ok().and_then(|r: Vec<Value>| r.first().map(|v: &Value| v.as_i32())).unwrap_or(0);
 
 	// 5. report back over the bootstrap channel: a one-byte log-grant flag, the
 	//    score as a little-endian i32, then the bytes the component produced (those it
 	//    handed to its `write` import, captured through the granted write path). The
 	//    supervisor / test reads and checks these.
-	let mut report: Vec<u8> = Vec::with_capacity(5 + host.output.len());
+	let mut report: Vec<u8> = Vec::with_capacity(9 + host.output.len());
 	report.push(host.logged as u8);
 	report.extend_from_slice(&score.to_le_bytes());
+	report.extend_from_slice(&score_negative.to_le_bytes());
 	report.extend_from_slice(&host.output);
 	unsafe {
 		send_blocking(bootstrap, &report, 0);

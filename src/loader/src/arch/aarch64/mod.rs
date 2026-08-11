@@ -126,6 +126,12 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 // maps a high VA to its link physical address). Returns the entry point (physical).
 fn load_kernel(bs: *mut BootServices, kernel: &[u8]) -> u64 {
 	let image = crate::elf::Elf::parse(kernel).expect("loader: kernel is not a valid aarch64 ELF64 executable");
+	// ET_EXEC ONLY. The shared parser admits `ET_DYN` too, because the kernel loads position-
+	// independent userspace binaries with it and the compatibility checker reads shared libraries -
+	// but THIS loader computes no load bias and processes no relocations, so a PIE kernel would be
+	// placed at its link addresses and jumped to unrelocated. Refused by name until a PIE kernel is
+	// wanted, which is a change here rather than to the parser.
+	assert!(image.image_type == crate::elf::ET_EXEC, "loader: the kernel image must be ET_EXEC");
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
 		if ph.p_type != crate::elf::PT_LOAD || ph.p_memsz == 0 {

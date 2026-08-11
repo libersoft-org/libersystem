@@ -285,6 +285,18 @@ impl<D: BlockDevice> LiberFs<D> {
 			Err(FsError::Corrupt | FsError::Io) => fs.read_only = true,
 			Err(e) => return Err(map_mount_error(e)),
 		}
+		// THE ROOT IS INODE 0, which is what the format says and what `format` writes. The parser
+		// asked only that `next_inode > root_inode`, so an image could nominate any other directory
+		// inode as the root and mount over a subtree, with the rest of the inode tree present,
+		// checksummed and unreachable.
+		//
+		// Checked HERE and not in `parse_checked`, and the difference matters: refusing the
+		// superblock outright makes the mount fall back to the previous generation and mount it
+		// WRITABLE, so a hand-written root would silently discard the newest generation instead of
+		// being reported. Degrading is the answer that keeps what is there and says so.
+		if fs.root_inode != ROOT_INODE {
+			fs.read_only = true;
+		}
 		// and the root of the namespace has to be a directory, or every path resolution
 		// starts from something that cannot hold names.
 		match fs.read_inode(fs.root_inode) {
@@ -772,6 +784,12 @@ fn parse_checked(block: &[u8]) -> Option<Superblock> {
 	}
 	// the generation is incremented at every commit, and the increment is unchecked.
 	if generation == u64::MAX {
+		return None;
+	}
+	// The compression flag is written as 0 or 1 and was read as `!= 0`, so 2 and 255 were also
+	// true. Nothing goes wrong today; a byte the writer can never produce is a byte the parser
+	// should not accept, because the day it means something else it will already have been mounted.
+	if block[SB_COMPRESS_OFF] > 1 {
 		return None;
 	}
 	let mut uuid = [0u8; 16];

@@ -364,6 +364,27 @@ impl<D: BlockDevice> LiberFs<D> {
 				self.walk_damage = true;
 				continue;
 			}
+			// The LOCAL structure too, under `mark_strict`. The interval above proves a node
+			// belongs where it was reached from; these prove it is a node at all - keys ordered in
+			// a leaf, separators ordered and children present in an internal node.
+			//
+			// "Local and absent are different things": the comment above explains why the interval
+			// was added and reads as though the local checks were being relied on elsewhere.
+			// `fsck` runs them and `tree_insert_node` runs them before mutating; the mount did not.
+			// A CRC-valid leaf holding keys 0, 2, 1 is inside its interval and unordered, so it
+			// passed - and then `tree_lookup` binary-searches it, answers `None` for a key that is
+			// there, and `remove_inner` treats exactly that as a dangling directory entry and drops
+			// the only name of a live inode. On purpose, as the operator's repair verb, on a volume
+			// that was never broken in the way that verb assumes.
+			//
+			// It costs no I/O: the block is already read.
+			if self.mark_strict {
+				let local = if node_type(&buf) == NODE_LEAF { validate_fixed_leaf(&buf, INODE_REC, 8) } else { validate_internal(&buf) };
+				if local.is_err() {
+					self.walk_damage = true;
+					continue;
+				}
+			}
 			if node_type(&buf) == NODE_LEAF {
 				for i in 0..leaf_count(&buf, INODE_REC) {
 					let rec = NODE_HDR + i * INODE_REC;

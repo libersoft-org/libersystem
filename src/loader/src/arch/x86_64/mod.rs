@@ -191,6 +191,12 @@ impl KernelSegment {
 // file bytes, zero the tail (BSS), and record the mapping. Returns (entry, count).
 fn load_kernel(bs: *mut BootServices, kernel: &[u8], out: &mut [KernelSegment; MAX_SEGMENTS]) -> (u64, usize) {
 	let image = crate::elf::Elf::parse(kernel).expect("loader: kernel is not a valid ELF64 executable");
+	// ET_EXEC ONLY. The shared parser admits `ET_DYN` too, because the kernel loads position-
+	// independent userspace binaries with it and the compatibility checker reads shared libraries -
+	// but THIS loader computes no load bias and processes no relocations, so a PIE kernel would be
+	// placed at its link addresses and jumped to unrelocated. Refused by name until a PIE kernel is
+	// wanted, which is a change here rather than to the parser.
+	assert!(image.image_type == crate::elf::ET_EXEC, "loader: the kernel image must be ET_EXEC");
 	let mut count = 0usize;
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };

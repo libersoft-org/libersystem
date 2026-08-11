@@ -678,8 +678,9 @@ pub(crate) fn name_hash(name: &[u8]) -> u64 {
 // never escape the volume or name an invalid entry. Names must be valid UTF-8, so one
 // file has one name (no byte-soup aliases a rendering cannot distinguish); a
 // portable-name policy is enforced on top: the cross-platform-unsafe set
-// (`\ : * ? < > | "` and control bytes) is rejected beyond `/` and NUL, so a LiberFS
-// name moves cleanly to FAT / NTFS media and other systems.
+// (`\ : * ? < > | "` and control bytes) is rejected beyond `/` and NUL. That is the BYTE SET
+// those media share; whether a name is portable to them is a wider question, and
+// `fscore::is_portable_name` is where it is asked.
 pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 	if path.is_empty() {
 		return Err(FsError::BadName);
@@ -706,6 +707,19 @@ pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 	Ok(segs)
 }
 
+// PORTABILITY IS A SEPARATE QUESTION, and `fscore::is_portable_name` answers it.
+//
+// The comment below used to claim that this validator's byte set "makes names move cleanly onto
+// FAT and NTFS media and other systems", and it does not: `CON`, `NUL`, `COM1` resolve to hardware
+// there rather than to files, and a trailing dot or space is silently stripped, so two distinct
+// names here become one there and the second write destroys the first. Case folding and Unicode
+// normalisation are not covered by either and cannot be by a rule of this shape - `Foo` and `foo`
+// are two names here and one on a case-insensitive volume, which is a property of the destination.
+//
+// The filesystem is NOT tightened for it. A checker that refuses names a medium legitimately
+// carries is worse than one that accepts them, and a volume written elsewhere must stay readable.
+// What exists now is a question a caller can ask before it copies a tree.
+//
 // Is `seg` a name this filesystem can address? The ONE answer, used both by
 // `split_segments` (the write side, deciding what may be created) and by the structural
 // pass (the read side, deciding what a record found on the medium may claim to be).

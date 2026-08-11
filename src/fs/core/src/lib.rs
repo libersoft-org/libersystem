@@ -142,3 +142,40 @@ pub fn validate_name_segment(seg: &[u8], max: usize) -> Result<(), FsError> {
 	}
 	Ok(())
 }
+
+// Is `name` portable to FAT and NTFS media as well as legal here?
+//
+// A SEPARATE question from `validate_name_segment`, and the separation is the point. The filesystem
+// accepts what it can address; portability is a property a caller may want to require of names it
+// creates, and tightening the filesystem for it would make a volume written elsewhere unreadable
+// here - a checker that refuses names the medium legitimately carries is worse than one that
+// accepts them.
+//
+// What `validate_name_segment` already covers is the byte set. What this adds is the rest of what
+// "moves cleanly onto FAT and NTFS" actually requires, and what the comment claiming it did not:
+//
+//   * the reserved DEVICE names, which those systems resolve to hardware rather than to files -
+//     `CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, with or without an extension
+//   * a trailing dot or space, which they silently strip, so two distinct names here become one
+//     there and the second write destroys the first
+//
+// Case folding and Unicode normalisation are NOT covered and cannot be by a rule of this shape:
+// `Foo` and `foo` are two names here and one on a case-insensitive volume, and deciding that is a
+// property of the destination, not of the name. Whoever copies a tree has to answer it.
+pub fn is_portable_name(name: &[u8]) -> bool {
+	if validate_name_segment(name, 255).is_err() {
+		return false;
+	}
+	if name.last().is_some_and(|&c| c == b'.' || c == b' ') {
+		return false;
+	}
+	// The device name is what precedes the first dot, compared without case.
+	let stem = match name.iter().position(|&c| c == b'.') {
+		Some(at) => &name[..at],
+		None => name,
+	};
+	const RESERVED: [&[u8]; 4] = [b"CON", b"PRN", b"AUX", b"NUL"];
+	let reserved_stem = RESERVED.iter().any(|word| word.len() == stem.len() && word.iter().zip(stem).all(|(a, b)| *a == b.to_ascii_uppercase()));
+	let numbered = (stem.len() == 4) && matches!(stem[3], b'1'..=b'9') && (stem[..3].eq_ignore_ascii_case(b"COM") || stem[..3].eq_ignore_ascii_case(b"LPT"));
+	!(reserved_stem || numbered)
+}

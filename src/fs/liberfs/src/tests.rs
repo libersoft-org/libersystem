@@ -4476,3 +4476,139 @@ fn a_path_is_bounded_as_a_whole_and_not_only_per_segment() {
 	fs.write_file(b"a/b/c", b"ok").expect("an ordinary path");
 	assert_eq!(fs.read_file(b"a/b/c").expect("read"), b"ok");
 }
+
+#[test]
+fn an_unordered_live_inode_leaf_takes_the_mount_read_only() {
+	// `mark_inode_tree` checked the CRC, the node type and the routing interval, and its own
+	// comment explained that `validate_fixed_leaf` and `validate_internal` are "local" - which read
+	// as though the local checks were happening elsewhere. `fsck` runs them and `tree_insert_node`
+	// runs them before mutating; the mount did not.
+	//
+	// A CRC-valid leaf whose keys are out of order is inside its routing interval, so it passed.
+	// `tree_lookup` then binary-searches it and answers `None` for a key that is present, which
+	// surfaces as `Invalid` - and `remove_inner` treats exactly that as a dangling directory entry,
+	// deliberately, as the operator's repair verb. So `remove` drops the only name of a live inode
+	// whose blocks are still allocated, and commits it.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	for i in 0..6u32 {
+		fs.write_file(alloc::format!("f{i}").as_bytes(), b"x").unwrap();
+	}
+	let root = fs.inode_root;
+	let mut dev = fs.into_device();
+
+	// Swap two whole records in the live inode leaf, so nothing changes but the ORDER, and forge
+	// the CRC the superblock records for it - a hostile author checksums what they write.
+	let start = root as usize * BLOCK_SIZE;
+	let count = u16::from_le_bytes(dev.blocks[start + 2..start + 4].try_into().unwrap()) as usize;
+	assert!(count >= 3, "the fixture must hold enough records to disorder: {count}");
+	// Two records in the MIDDLE, so the leaf's lowest and highest keys are exactly what they were.
+	// Swapping the ends moves the min and max, which the routing interval and the max-inode
+	// bookkeeping already notice - and then the test would be measuring those instead of this.
+	let first = start + NODE_HDR + INODE_REC;
+	let last = start + NODE_HDR + 2 * INODE_REC;
+	let mut a = dev.blocks[first..first + INODE_REC].to_vec();
+	let mut b = dev.blocks[last..last + INODE_REC].to_vec();
+	assert_ne!(a[..8], b[..8], "the swap has to actually disorder the leaf");
+	core::mem::swap(&mut a, &mut b);
+	dev.blocks[first..first + INODE_REC].copy_from_slice(&a);
+	dev.blocks[last..last + INODE_REC].copy_from_slice(&b);
+	let crc = crc32c(&dev.blocks[start..start + BLOCK_SIZE]);
+	let slot = active_slot(&dev);
+	forge_superblock(&mut dev, slot, |sb| sb[SB_INODE_ROOT_CRC_OFF..SB_INODE_ROOT_CRC_OFF + 4].copy_from_slice(&crc.to_le_bytes()));
+
+	// It still mounts - refusing outright would take the rescue away - and it mounts READ-ONLY,
+	// which is what stops the repair verb from running on a volume it would destroy.
+	let mut fs = LiberFs::mount(dev).expect("a damaged volume still mounts for reading");
+	assert!(fs.is_read_only(), "a structurally impossible live inode tree must take the mount read-only");
+	assert_eq!(fs.remove(b"f0"), Err(FsError::ReadOnly), "and nothing may commit on top of it");
+	assert_eq!(fs.write_file(b"f9", b"x"), Err(FsError::ReadOnly));
+}
+
+#[test]
+fn an_extent_map_that_ends_before_its_declared_count_is_corrupt() {
+	// `load_spill` validated every chain block - the count, the CRC, the bounds, the walk length -
+	// and never the TOTAL. A declared seven extents with four inline and a null spill pointer
+	// satisfied all of them and returned `Ok`, and `fsck` had both the check and the message for it.
+	//
+	// The rewrite is what makes it destructive rather than merely wrong: `flush_extents` sets
+	// `extent_count = extents.len()`, so editing such an inode replaces an incomplete map with a
+	// self-consistent one and the missing extents become holes - permanently, in a generation that
+	// checksums perfectly and that nothing will ever question again.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"f", &[0xAB; 4096]).unwrap();
+	let ino = fs.resolve(b"f").unwrap();
+	let mut inode = fs.read_inode(ino).unwrap();
+	assert!(inode.extents.len() <= EXTENTS_INLINE, "the fixture's map must start inline");
+
+	// Declare more extents than the inode carries, with no chain to hold the rest. Written through
+	// the inode slot so the tree and its checksums stay consistent - the medium is self-consistent
+	// and only the map is a lie, which is the case that used to pass.
+	inode.extent_count = (EXTENTS_INLINE + 3) as u32;
+	inode.spill = 0;
+	fs.write_inode_slot_for_test(ino, &inode).unwrap();
+	fs.commit().unwrap();
+	let dev = fs.into_device();
+
+	let mut fs = LiberFs::mount(dev).expect("the volume still mounts");
+	assert_eq!(fs.read_file(b"f"), Err(FsError::Corrupt), "an extent map that ends before its own count");
+}
+
+#[test]
+fn portability_is_asked_about_rather_than_enforced() {
+	// The validator's comment claimed its byte set made names "move cleanly onto FAT and NTFS", and
+	// it did not: reserved device names resolve to hardware there, and a trailing dot or space is
+	// stripped - so two distinct names here become one there and the second write destroys the
+	// first. `fscore::is_portable_name` is the separate question; the filesystem is not tightened
+	// for it, because refusing names a medium legitimately carries is worse than accepting them.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	for hostile in [&b"CON"[..], b"con", b"NUL.txt", b"aux", b"COM1", b"lpt9", b"trailing.", b"trailing "] {
+		assert!(!fscore::is_portable_name(hostile), "{hostile:?} is not portable");
+		// ...and the filesystem still stores it, because it can address it.
+		if fs.write_file(hostile, b"x").is_ok() {
+			assert_eq!(fs.read_file(hostile).expect("readable"), b"x");
+		}
+	}
+	for fine in [&b"CONFIG"[..], b"com", b"COM10", b"notes.txt", "ěščř.txt".as_bytes(), b"a b c"] {
+		assert!(fscore::is_portable_name(fine), "{fine:?} is portable");
+	}
+	// And what the filesystem itself refuses is refused by both.
+	for illegal in [&b"a:b"[..], b"a*b", b"."[..].as_ref(), b".."] {
+		assert!(!fscore::is_portable_name(illegal), "{illegal:?}");
+		assert!(fs.write_file(illegal, b"x").is_err());
+	}
+}
+
+#[test]
+fn the_superblock_parser_is_as_strict_as_the_writer() {
+	// Two asymmetries in a filesystem that has made writer/parser symmetry a principle. Neither is
+	// dangerous today, which is exactly why the principle is worth keeping: the asymmetries that
+	// matter are indistinguishable from the ones that do not until somebody writes an image by hand.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// A DIRECTORY, so the nominated root below is a real one: with a file there the "root must be a
+	// directory" check fires instead and the test would be measuring that.
+	fs.write_file(b"d/f", b"x").unwrap();
+	let dir = fs.resolve(b"d").unwrap();
+	let good = fs.into_device();
+	assert!(!LiberFs::mount(good.clone()).unwrap().is_read_only(), "the untouched image must mount writable");
+
+	// A root that is not inode 0, and IS a directory - so the volume would mount over a subtree,
+	// with the rest of the inode tree present, checksummed and unreachable. It mounts READ-ONLY
+	// rather than being refused: refusing the superblock would make the mount fall back to the
+	// previous generation and mount that writable, discarding the newest instead of reporting it.
+	let mut dev = good.clone();
+	let slot = newest_super_slot(&dev) as usize;
+	forge_superblock(&mut dev, slot, |sb| sb[SB_ROOT_INODE_OFF..SB_ROOT_INODE_OFF + 4].copy_from_slice(&dir.to_le_bytes()));
+	assert!(LiberFs::mount(dev).unwrap().is_read_only(), "a namespace root that is not inode 0");
+
+	// A compression byte the writer can never produce. This one IS refused at parse - the slot is
+	// unreadable rather than the volume wrong, so the other slot is the answer - and what must not
+	// happen is `!= 0` reading 2 or 255 as "compression on", which would make every later write
+	// take a path the volume never asked for.
+	for byte in [2u8, 255] {
+		let mut dev = good.clone();
+		let slot = newest_super_slot(&dev) as usize;
+		forge_superblock(&mut dev, slot, |sb| sb[SB_COMPRESS_OFF] = byte);
+		let fs = LiberFs::mount(dev).expect("the other slot still carries a volume");
+		assert!(!fs.compression(), "a compression byte of {byte} must not be read as true");
+	}
+}

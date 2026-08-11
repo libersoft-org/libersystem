@@ -136,6 +136,8 @@ pub struct Screen {
 	nparams: usize,
 	utf8_acc: u32,
 	utf8_rem: u8,
+	// The smallest codepoint the sequence in progress may legally encode - see `begin_utf8`.
+	utf8_min: u32,
 	primary: Vec<Cell>,
 	alt: Vec<Cell>,
 	alt_active: bool,
@@ -145,7 +147,15 @@ pub struct Screen {
 	// rows are one logical line. A text consumer joins soft-wrapped rows and breaks only on
 	// hard newlines. It shifts with the grid on a scroll and is captured into `sb_wrap` when
 	// a row scrolls into the scrollback ring.
+	// Whether the next glyph wraps before it lands: set when one fills the last column, cleared by
+	// anything that moves the cursor. See `put_glyph`.
+	pending_wrap: bool,
 	wrap: Vec<bool>,
+	// The ALTERNATE screen's soft-wrap flags. One vector served both buffers, so a full-screen
+	// program edited the PRIMARY screen's wrap metadata - and after it exited, `TextSink` joined
+	// rows that had nothing to do with each other. The cell buffers were always two; the metadata
+	// describing them was one.
+	alt_wrap: Vec<bool>,
 	scrollback: Vec<Cell>,
 	// Per-row soft-wrap flag for the scrollback ring (parallel to `scrollback` rows).
 	sb_wrap: Vec<bool>,
@@ -167,7 +177,7 @@ pub struct Screen {
 impl Screen {
 	pub fn new(cols: usize, rows: usize, scrollback: usize) -> Screen {
 		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
+		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, tty_raw_req: None, tty_echo_req: None, mouse_mode: 0, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], pending_wrap: false, wrap: alloc::vec![false; rows], alt_wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
 	}
 
 	// The active cell buffer: the alternate screen while it is up, else the primary.
@@ -521,6 +531,7 @@ impl Screen {
 		self.alt = alloc::vec![blank; new_cols * new_rows];
 		self.dirty = alloc::vec![true; new_cols * new_rows];
 		self.wrap = alloc::vec![false; new_rows];
+		self.alt_wrap = alloc::vec![false; new_rows];
 		// Scrollback is reset on a resize (its fixed width changed)
 		self.scrollback = alloc::vec![blank; self.sb_cap * new_cols];
 		self.sb_wrap = alloc::vec![false; self.sb_cap];
@@ -721,15 +732,31 @@ impl Screen {
 	}
 
 	fn put_glyph(&mut self, glyph: u32) {
-		if self.col >= self.cols {
+		if self.pending_wrap {
 			// The previous glyph filled the last column: this row soft-wraps into the next.
 			self.wrap[self.row] = true;
 			self.col = 0;
+			self.pending_wrap = false;
 			self.line_feed();
 		}
 		let cell = Cell { glyph, fg: self.fg_color, bg: self.bg_color, bold: self.bold, underline: self.underline, reverse: self.reverse };
 		self.set_cell(self.col, self.row, cell);
-		self.col += 1;
+		// PENDING WRAP IS A FLAG, not a cursor one past the end.
+		//
+		// This did `self.col += 1` unconditionally, so a glyph in the last column left `col ==
+		// cols` and only the NEXT glyph read that as a wrap. Two things followed. The renderer
+		// draws the caret only where `cursor_col() < cols`, so filling a line exactly made the
+		// caret vanish. And a CSI that moves the row alone - `CSI B` - left `col == cols` intact,
+		// so the next glyph both wrapped and line-fed and landed a row below where it belonged.
+		//
+		// The cursor now always names a real cell, and the deferred wrap is the state it actually
+		// is. Every absolute or relative column move clears it, because a cursor that has been
+		// moved is not waiting to wrap.
+		if self.col + 1 >= self.cols {
+			self.pending_wrap = true;
+		} else {
+			self.col += 1;
+		}
 	}
 
 	// Render a decoded Unicode codepoint: the cell records the codepoint itself, and the
@@ -741,15 +768,22 @@ impl Screen {
 	// Begin a UTF-8 multi-byte sequence from its lead byte, recording how many
 	// continuation bytes follow. A stray continuation or invalid lead renders U+FFFD.
 	fn begin_utf8(&mut self, byte: u8) {
+		// `utf8_min` is the smallest codepoint this LENGTH is allowed to encode, which is what makes
+		// an overlong form detectable once the sequence completes: `\xc0\x80` is a two-byte
+		// encoding of U+0000, shaped perfectly and forbidden, and it is how a filter that looks for
+		// a byte sequence gets walked past.
 		if byte & 0xe0 == 0xc0 {
 			self.utf8_acc = (byte & 0x1f) as u32;
 			self.utf8_rem = 1;
+			self.utf8_min = 0x80;
 		} else if byte & 0xf0 == 0xe0 {
 			self.utf8_acc = (byte & 0x0f) as u32;
 			self.utf8_rem = 2;
+			self.utf8_min = 0x800;
 		} else if byte & 0xf8 == 0xf0 {
 			self.utf8_acc = (byte & 0x07) as u32;
 			self.utf8_rem = 3;
+			self.utf8_min = 0x1_0000;
 		} else {
 			self.put_codepoint(0xfffd);
 		}
@@ -763,12 +797,23 @@ impl Screen {
 				self.utf8_acc = (self.utf8_acc << 6) | (byte & 0x3f) as u32;
 				self.utf8_rem -= 1;
 				if self.utf8_rem == 0 {
-					self.put_codepoint(self.utf8_acc);
+					// The ENCODING, not just the shape. The bit patterns were all that was checked,
+					// so an overlong form, a surrogate and anything above U+10FFFF all reached a
+					// cell - and then rendered as `?`, because the font lookup rejected what the
+					// decoder had accepted. Every malformed sequence is one U+FFFD, which is what
+					// this crate's own comments already promised.
+					let cp = self.utf8_acc;
+					let valid = cp <= 0x10FFFF && !(0xD800..=0xDFFF).contains(&cp) && cp >= self.utf8_min;
+					self.put_codepoint(if valid { cp } else { 0xfffd });
 				}
 				return;
 			}
-			// A malformed sequence: drop it and reinterpret this byte below.
+			// A TRUNCATED sequence is one replacement character, and then this byte is reinterpreted
+			// on its own. It used to vanish: the partial was dropped silently, so `\xe2\x82A`
+			// printed `A` and nothing else, and a stream that lost a byte lost a character with no
+			// sign that it had.
 			self.utf8_rem = 0;
+			self.put_codepoint(0xfffd);
 		}
 		match self.esc_state {
 			1 => {
@@ -784,6 +829,13 @@ impl Screen {
 				return;
 			}
 			_ => {}
+		}
+		// A CONTROL byte moves the cursor or changes state, and a cursor that has been moved is not
+		// waiting to wrap. Cleared here and in `csi_dispatch` rather than at each of the eighteen
+		// places that assign `col`, so a new one cannot forget - and NOT for a printable byte,
+		// which is the glyph whose wrap this flag exists to defer.
+		if (byte < 0x20 && byte != 0x1b) || byte == 0x7f {
+			self.pending_wrap = false;
 		}
 		match byte {
 			0x1b => self.esc_state = 1,
@@ -902,6 +954,8 @@ impl Screen {
 	}
 
 	fn csi_dispatch(&mut self, byte: u8) {
+		// See `put_glyph`: a sequence that moves or repositions the cursor ends any deferred wrap.
+		self.pending_wrap = false;
 		match byte {
 			b'A' => self.row = self.row.saturating_sub(self.param(0, 1)),
 			b'B' => self.row = (self.row + self.param(0, 1)).min(self.rows.saturating_sub(1)),
@@ -971,7 +1025,20 @@ impl Screen {
 		let (start, end) = match mode {
 			0 => (cur, total),
 			1 => (0, (cur + 1).min(total)),
-			_ => (0, total),
+			2 => (0, total),
+			// `CSI 3 J` clears the SAVED lines - the scrollback - and leaves the display alone.
+			// This fell into the catch-all and wiped the screen instead, so the one sequence a
+			// program uses to drop history destroyed what the user was reading.
+			3 => {
+				self.sb_len = 0;
+				self.sb_head = 0;
+				self.view_offset = 0;
+				return;
+			}
+			// An erase mode this terminal does not implement erases NOTHING. It used to erase
+			// everything, so `CSI 99J` - a typo, a mangled sequence, a program written for another
+			// terminal - cleared the screen.
+			_ => return,
 		};
 		self.fill_cells(start, end);
 	}
@@ -982,7 +1049,9 @@ impl Screen {
 		let (start, end) = match mode {
 			0 => (row_start + self.col, row_start + self.cols),
 			1 => (row_start, row_start + self.col + 1),
-			_ => (row_start, row_start + self.cols),
+			2 => (row_start, row_start + self.cols),
+			// Same rule as `erase_display`: an unimplemented mode does nothing.
+			_ => return,
 		};
 		self.fill_cells(start, end);
 	}
@@ -995,6 +1064,24 @@ impl Screen {
 			let end = end.min(buf.len());
 			for cell in &mut buf[start.min(end)..end] {
 				*cell = blank;
+			}
+		}
+		// A row whose LAST cell was erased is not soft-wrapped into the next one any more.
+		//
+		// `CSI J` and `CSI K` both come through here, and they blanked the cells and left `wrap`
+		// alone - so a flag survived the complete erasure of the row it described, and `TextSink`
+		// went on joining an empty row to its successor. `clear()` does clear them, which is why
+		// this was easy to miss.
+		if self.cols > 0 {
+			let first = start / self.cols;
+			let last = end.saturating_sub(1) / self.cols;
+			for row in first..=last.min(self.rows.saturating_sub(1)) {
+				let row_end = (row + 1) * self.cols;
+				if start <= row_end.saturating_sub(1) && end >= row_end {
+					if let Some(flag) = self.wrap.get_mut(row) {
+						*flag = false;
+					}
+				}
 			}
 		}
 		let end = end.min(self.dirty.len());
@@ -1135,6 +1222,12 @@ impl Screen {
 		self.save_cursor();
 		self.alt_active = true;
 		self.view_offset = 0;
+		// The metadata follows the buffer. The alternate screen starts blank, so its flags start
+		// clear; the primary's are parked until it comes back.
+		core::mem::swap(&mut self.wrap, &mut self.alt_wrap);
+		for w in self.wrap.iter_mut() {
+			*w = false;
+		}
 		let blank = self.blank();
 		for c in self.alt.iter_mut() {
 			*c = blank;
@@ -1149,6 +1242,7 @@ impl Screen {
 			return;
 		}
 		self.alt_active = false;
+		core::mem::swap(&mut self.wrap, &mut self.alt_wrap);
 		self.mark_all_dirty();
 		self.restore_cursor();
 	}

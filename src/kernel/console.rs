@@ -89,7 +89,14 @@ pub fn init(info: FbInfo) {
 		return;
 	}
 	let geometry = Geometry { width: info.width, height: info.height, pitch: info.pitch, bytes_per_pixel: info.bytes_per_pixel, red_shift: info.red_shift, red_size: info.red_size, green_shift: info.green_shift, green_size: info.green_size, blue_shift: info.blue_shift, blue_size: info.blue_size };
-	let surface: Box<dyn Surface> = Box::new(KernelSurface { raster: Raster::new(info.addr as u64, &geometry) });
+	// SAFETY: `info` comes from the boot protocol's framebuffer record - a mapping the loader made
+	// and handed over, valid for the life of the kernel and touched by nothing else. The
+	// constructor checks the geometry it was given; a mode line this renderer cannot address is a
+	// console that does not start, not a panic on the first pixel.
+	let Some(raster) = (unsafe { Raster::new(info.addr as u64, &geometry) }) else {
+		return;
+	};
+	let surface: Box<dyn Surface> = Box::new(KernelSurface { raster });
 	let term = Term::new(surface, term::SCROLLBACK_ROWS);
 	if term.screen.cols() == 0 || term.screen.rows() == 0 {
 		return;

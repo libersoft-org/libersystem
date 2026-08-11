@@ -157,6 +157,12 @@ struct Staged {
 // like the firmware had been demolished underneath it.
 fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 	let image = crate::elf::Elf::parse(kernel).expect("loader: kernel is not a valid riscv64 ELF64 executable");
+	// ET_EXEC ONLY. The shared parser admits `ET_DYN` too, because the kernel loads position-
+	// independent userspace binaries with it and the compatibility checker reads shared libraries -
+	// but THIS loader computes no load bias and processes no relocations, so a PIE kernel would be
+	// placed at its link addresses and jumped to unrelocated. Refused by name until a PIE kernel is
+	// wanted, which is a change here rather than to the parser.
+	assert!(image.image_type == crate::elf::ET_EXEC, "loader: the kernel image must be ET_EXEC");
 
 	// The destination span first, from the headers alone - nothing is allocated until it is
 	// known what the allocation has to avoid.
