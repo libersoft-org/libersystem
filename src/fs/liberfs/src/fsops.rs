@@ -13,7 +13,14 @@ impl<D: BlockDevice> LiberFs<D> {
 	// single inode-tree leaf holding the root directory inode; everything else is the
 	// free pool. Inodes and directory nodes are allocated on demand thereafter, so a
 	// fresh volume reserves no fixed inode region.
-	pub fn format(dev: D, num_blocks: u64) -> Result<LiberFs<D>, FsError> {
+	// Format a volume with a ZERO uuid, for tests and scratch images.
+	//
+	// A `no_std` crate cannot invent randomness, so a real volume's identity has to come from the
+	// caller - and this entry point cannot supply one. `FormatOpts::default()` is sixteen zeros, so
+	// every volume made this way shares the id that `uuid()` documents as unique, which is exactly
+	// the thing an id is for. Named so a caller has to mean it, and `format_opts` is the way to
+	// make a volume anything else will identify.
+	pub fn format_scratch(dev: D, num_blocks: u64) -> Result<LiberFs<D>, FsError> {
 		Self::format_opts(dev, num_blocks, FormatOpts::default())
 	}
 
@@ -358,12 +365,14 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::IsDir);
 		}
 		let size = inode.size;
-		// a size the pool cannot hold is hostile or corrupt as a WHOLE-file read: the
-		// buffer could neither be allocated nor filled. (A sparse file legitimately
-		// sized past the pool's bytes stays readable through `read_at`, which takes an
-		// explicit length.)
+		// A size the pool cannot hold is refused as a WHOLE-file read: the buffer could neither be
+		// allocated nor filled. The refusal is right and the WORD was wrong - this said `Corrupt`,
+		// while acknowledging in the same breath that a sparse file may legitimately be sized past
+		// the pool's bytes and stays readable through `read_at`. So a caller was told the medium
+		// was inconsistent about a file that is fine, and sent looking for a fault that is not
+		// there. `TooLarge` says what it is: too big for one buffer, ask for a range.
 		if size > self.num_blocks.saturating_mul(BLOCK_SIZE as u64) {
-			return Err(FsError::Corrupt);
+			return Err(FsError::TooLarge);
 		}
 		self.read_range(&inode, 0, size)
 	}
@@ -389,7 +398,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		// an impossible request by ABORTING the process. The volume's byte count bounds it, and a
 		// volume can be larger than the machine.
 		let mut out: Vec<u8> = Vec::new();
-		out.try_reserve_exact((end - offset) as usize).map_err(|_| FsError::NoSpace)?;
+		// `usize::try_from`, because the comment above claims u64 end to end "so a 32-bit build never
+		// silently truncates a large file" and the next line used to be an `as usize`. On a 64-bit
+		// target the conversion cannot fail and the claim was true by accident; on the 32-bit one
+		// the comment was written for, it was false.
+		let want = usize::try_from(end - offset).map_err(|_| FsError::TooLarge)?;
+		out.try_reserve_exact(want).map_err(|_| FsError::NoMemory)?;
 		let first = offset / BLOCK_SIZE as u64;
 		let last = (end - 1) / BLOCK_SIZE as u64;
 		// The run buffer is bounded by RUN_BLOCKS (1 MB) rather than by the file, so it is small -

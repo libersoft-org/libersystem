@@ -684,8 +684,22 @@ pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 	if path.is_empty() {
 		return Err(FsError::BadName);
 	}
+	// Bounded BEFORE the walk, because the walk is what costs: a path is refused for being longer
+	// than any path this filesystem can hold, rather than parsed and then found to be too deep.
+	if path.len() > PATH_MAX {
+		return Err(FsError::TooLong);
+	}
 	let mut segs = Vec::new();
+	// Fallibly, and at a size the depth limit bounds. `Vec::push` aborts the process when memory is
+	// short, which turns a hostile path into a crash in a crate whose every other allocation is
+	// fallible.
+	if segs.try_reserve(path.split(|&b| b == b'/').count().min(PATH_DEPTH_MAX)).is_err() {
+		return Err(FsError::NoMemory);
+	}
 	for seg in path.split(|&b| b == b'/') {
+		if segs.len() == PATH_DEPTH_MAX {
+			return Err(FsError::TooLong);
+		}
 		validate_name_segment(seg)?;
 		segs.push(seg);
 	}
@@ -708,27 +722,9 @@ pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 // a record READ off the medium can carry it, and a name with a separator inside it
 // resolves to a path that names something else entirely.
 pub(crate) fn validate_name_segment(seg: &[u8]) -> Result<(), FsError> {
-	if seg.is_empty() || seg == b"." || seg == b".." {
-		return Err(FsError::BadName);
-	}
-	if seg.len() > NAME_MAX {
-		return Err(FsError::TooLong);
-	}
-	if core::str::from_utf8(seg).is_err() {
-		return Err(FsError::BadName);
-	}
-	if seg.iter().any(|&c| c == b'/' || !is_portable_name_byte(c)) {
-		return Err(FsError::BadName);
-	}
-	Ok(())
+	fscore::validate_name_segment(seg, NAME_MAX)
 }
 
-// Is byte `c` allowed in a portable file name? Rejects NUL and control bytes (0x00..=0x1F
-// and 0x7F) and the cross-platform-reserved set `\ : * ? < > | "`. (`/` never reaches
-// here - it is the path separator.)
-pub(crate) fn is_portable_name_byte(c: u8) -> bool {
-	if c < 0x20 || c == 0x7F {
-		return false;
-	}
-	!matches!(c, b'\\' | b':' | b'*' | b'?' | b'<' | b'>' | b'|' | b'"')
-}
+// Re-exported so this crate's own call sites keep reading the same, and so there is exactly one
+// definition of what a portable name byte is for every writable backend.
+pub(crate) use fscore::is_portable_name_byte;

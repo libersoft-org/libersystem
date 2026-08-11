@@ -237,6 +237,16 @@ const ROOT_INODE: u32 = 0;
 // sort by (hash, name), so the key portion compared in a leaf is the hash plus the name.
 // A full 255-byte name fills the whole name field with no terminator.
 const NAME_MAX: usize = 255;
+
+// The longest path this filesystem will parse, and the deepest.
+//
+// Each segment was bounded and the path as a whole was not, and the segments were collected with
+// an infallible `Vec::push` - so a caller handing the crate a megabyte of `a/a/a/...` got an
+// allocation proportional to its own buffer, and a shortage there aborts rather than refuses.
+// StorageService bounds paths from outside; a filesystem crate that depends on its caller for that
+// is a filesystem crate that is safe until someone else calls it.
+const PATH_MAX: usize = 4096;
+const PATH_DEPTH_MAX: usize = 64;
 // A directory leaf record is variable-length: the name hash (u64), the child inode
 // (u32), a length byte, then the name's bytes - 13 bytes plus the name, so a 4 kB
 // leaf holds a couple hundred typical entries instead of a fixed few. Records are
@@ -336,7 +346,7 @@ pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
 		return Err(FsError::NoSpace);
 	}
 	let mut v: Vec<u8> = Vec::new();
-	v.try_reserve_exact(len).map_err(|_| FsError::NoSpace)?;
+	v.try_reserve_exact(len).map_err(|_| FsError::NoMemory)?;
 	v.resize(len, 0);
 	Ok(v)
 }

@@ -57,7 +57,7 @@ every operation are identical. The only difference is WHEN the memory is charged
 | | `Reserved` (`vol://ram`) | `Capped` (`vol://tmp`) |
 | --- | --- | --- |
 | charged | at mount | at write |
-| guarantees | the space is there | the space may be there |
+| guarantees | the total is taken at mount | the total is a limit, not a holding |
 | when memory is short | the MOUNT fails | the WRITE fails |
 | unused space | held | not taken in the first place |
 | suits | state that must not fail because something else took the memory | scratch, where waste is worse than an occasional refusal |
@@ -246,7 +246,30 @@ doing it silently is how a caller loses more than it meant to.
 It takes the whole capacity at mount, so a mount fails when the memory is not available and
 nothing else in the process can take it afterwards. That much is a guarantee.
 
-What it cannot promise is that the memory comes BACK. The regrow is best effort: after deletes
+What it does NOT promise is that any particular allocation will succeed. The reservation bounds a
+byte TOTAL, and a write needs a contiguous block. Files are monolithic `Vec<u8>`, so growing one
+calls `try_reserve_exact` and the allocator may need the old block and the new one live at the same
+time - the crate's own `growing_past_a_files_high_water_mark_needs_both_blocks` exists to pin
+exactly that. A 64 MiB reserved volume holding a 32 MiB file that grows to 48 MiB ends inside its
+capacity and can still fail at the peak, and releasing the reservation first does not help: the old
+block is still there. `reservation_intact()` compares a sum, so a reservation held as several chunks
+satisfies it while no single run large enough for the next file exists. "Intact" means the
+arithmetic is right; it does not mean the next write can be served.
+
+Nor does it reserve the METADATA that must accompany the data. A volume of exactly C reserves C, and
+storing C bytes of files also needs their names, their nodes and their directory slots. Names are
+charged against the capacity, so they compete with the data rather than being reserved beside it;
+directory tables are on a separate budget (`MAX_METADATA_BYTES`) and are not reserved at all. On a
+heap with no slack the mount succeeds and a write can still fail on a slot the reservation never
+covered.
+
+Both of those want the same thing and it is not a patch: an arena the volume allocates everything
+from - files, names, nodes and tables - so that "reserved" means a region rather than a total, and
+chunked file storage so growth never needs a new monolithic block. Until that exists the word
+guarantee applies to one thing only, stated above: the memory is taken at mount and nothing else in
+the process can take it afterwards.
+
+What it also cannot promise is that released memory comes BACK. The regrow is best effort: after deletes
 fragment the heap, a chunk of the size wanted may not be there and the volume then holds less than
 its capacity. Holding it in several chunks makes that far less likely than one block would - a heap
 with no 33 MiB block very often has two of 16 - but it does not make it impossible.

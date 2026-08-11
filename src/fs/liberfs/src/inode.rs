@@ -102,7 +102,9 @@ impl<D: BlockDevice> LiberFs<D> {
 			// given this discipline and the two metadata chain walks were not, which left the
 			// mount reachable through the one place the caller cannot decline.
 			if inode.extents.try_reserve(count).is_err() {
-				return Err(FsError::NoSpace);
+				// The MEMORY, not the medium: this is a `Vec` that could not grow, and telling a
+				// caller the disk is full sends it deleting files that would not have helped.
+				return Err(FsError::NoMemory);
 			}
 			for i in 0..count {
 				let off = CHAIN_HDR + i * EXTENT_SIZE;

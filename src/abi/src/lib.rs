@@ -104,11 +104,16 @@ pub const SYS_DMA_BUFFER_PHYS: u64 = 38;
 // Acknowledge and re-arm a serviced device interrupt (39 retired: device interrupts
 // are MSI-X now, see SYS_DEVICE_MSIX_ACQUIRE).
 pub const SYS_INTERRUPT_ACK: u64 = 40;
-// Inject one byte into the kernel console input (a0 = the byte; a1 = 0 for a keystroke,
-// non-zero for serial input, which the console service accepts even unfocused). Returns 0
-// when the console took it and ERR_WOULD_BLOCK when its queue is full or no console
-// service is attached. No ABI bump: a1 was an ignored zero and the return an ignored zero,
-// so a binary built before this reads neither and behaves exactly as it did.
+// Inject one byte into the kernel console input.
+//   a0 = the byte
+//   a1 = 0 for a keystroke, non-zero for serial input (accepted even unfocused)
+//   a2 = a handle to a ConsoleInputSource privilege
+// Returns 0 when the console took it, ERR_WOULD_BLOCK when its queue is full or no console
+// service is attached, and ERR_ACCESS_DENIED without the privilege.
+//
+// The privilege argument was missing from this comment while the handler required it, in the file
+// whose reason for existing is to be the definition. Without it any process could type into a
+// privileged console - shell commands, a password, a confirmation - as if a person had.
 pub const SYS_CONSOLE_FEED: u64 = 41;
 // Block until ANY handle in a caller-supplied array is ready (or the deadline
 // passes), returning the ready handle's index - `wait` over a set, so a driver can
@@ -117,8 +122,13 @@ pub const SYS_WAIT_ANY: u64 = 42;
 // Read the hardware real-time clock as a Unix timestamp (seconds since the epoch,
 // UTC). Raw mechanism; the userspace TimeService is the wall-clock policy.
 pub const SYS_CLOCK_RTC: u64 = 43;
-// Map the boot framebuffer into the caller and report its geometry, handing the
-// display to a userspace ConsoleService (the kernel console stops drawing to it).
+// Map the boot framebuffer into the caller and report its geometry, handing the display to a
+// userspace ConsoleService (the kernel console stops drawing to it).
+//   a0 = pointer to a Framebuffer to fill
+//   a1 = its length in bytes
+//   a2 = a handle to a DisplayController privilege
+// Returns 0, or ERR_ACCESS_DENIED without the privilege. Without it the display went to whoever
+// asked first, and asking first is a race any process at boot could try to win.
 pub const SYS_FRAMEBUFFER_MAP: u64 = 44;
 // Deliver an asynchronous signal to a process (the typed, capability-gated equivalent
 // of POSIX kill): a holder of the process's MANAGE capability requests a default
@@ -128,9 +138,16 @@ pub const SYS_PROCESS_SIGNAL: u64 = 45;
 // a per-device LAPIC vector and programs the device's MSI-X table entry 0, so the
 // driver gets its own edge-triggered interrupt instead of sharing a legacy INTx line.
 pub const SYS_DEVICE_MSIX_ACQUIRE: u64 = 46;
-// Reboot or power the machine off (the argument is POWER_REBOOT or POWER_OFF). The
-// machine resets or enters ACPI soft-off; restricting it to an authorized component
-// is a future PermissionManager concern.
+// Reboot or power the machine off.
+//   a0 = a MANAGE-capable handle to the ROOT Domain
+//   a1 = POWER_REBOOT or POWER_OFF
+// Does not return on success; ERR_ACCESS_DENIED for a handle that is not the root domain's or
+// lacks MANAGE, ERR_INVALID for an unknown action.
+//
+// The comment here said the argument was the action and that restricting the call was "a future
+// PermissionManager concern". It has not been future since the handle argument landed - and
+// `ABI_VERSION` was correctly moved 1 -> 2 when it did, so the implementation was right and only
+// the definition beside it was wrong.
 pub const SYS_SYSTEM_POWER: u64 = 47;
 // Read the kernel boot console's content as logical text lines into the caller's
 // buffer, returning the byte count. The kernel hands its on-screen boot log across to
@@ -464,6 +481,27 @@ pub struct Framebuffer {
 // against the real object instead of a guessed cap. repr(C) with fixed-width
 // fields so it marshals cleanly across the syscall boundary; the kernel writes
 // it, userspace reads it.
+// The stable ABI codes `ObjectInfo::object_type` carries.
+//
+// The mapping lived in `ObjectType::code()` in `src/kernel/object/mod.rs`, so changing it there
+// moved nothing here and userspace had no way to find out at compile time - a value documented as
+// a stable ABI code whose definition was outside the ABI. The kernel's `code()` returns these now,
+// which makes the two the same fact rather than two facts that agree.
+pub const OBJECT_TYPE_DOMAIN: u64 = 0;
+pub const OBJECT_TYPE_PROCESS: u64 = 1;
+pub const OBJECT_TYPE_THREAD: u64 = 2;
+pub const OBJECT_TYPE_ADDRESS_SPACE: u64 = 3;
+pub const OBJECT_TYPE_MEMORY_OBJECT: u64 = 4;
+pub const OBJECT_TYPE_CHANNEL: u64 = 5;
+pub const OBJECT_TYPE_EVENT: u64 = 6;
+pub const OBJECT_TYPE_TIMER: u64 = 7;
+pub const OBJECT_TYPE_INTERRUPT: u64 = 8;
+pub const OBJECT_TYPE_DEVICE_MEMORY: u64 = 9;
+pub const OBJECT_TYPE_DMA_BUFFER: u64 = 10;
+pub const OBJECT_TYPE_PROCESS_GROUP: u64 = 11;
+pub const OBJECT_TYPE_PRIVILEGE: u64 = 12;
+pub const OBJECT_TYPE_WAIT_SET: u64 = 13;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ObjectInfo {
@@ -652,7 +690,10 @@ pub const RIGHT_GET_INFO: u32 = 1 << 9;
 pub const RIGHT_MANAGE: u32 = 1 << 10;
 pub const RIGHT_WAIT: u32 = 1 << 11;
 // Every currently defined right.
-pub const RIGHTS_ALL: u32 = 0xfff;
+// Every right, computed rather than written. `0xfff` was a hand-written literal beside twelve
+// individually defined bits, so the thirteenth right would have been silently absent from it -
+// a right that exists and that "all rights" does not grant.
+pub const RIGHTS_ALL: u32 = RIGHT_READ | RIGHT_WRITE | RIGHT_EXECUTE | RIGHT_MAP | RIGHT_SEND | RIGHT_RECEIVE | RIGHT_DUPLICATE | RIGHT_TRANSFER | RIGHT_REVOKE | RIGHT_GET_INFO | RIGHT_MANAGE | RIGHT_WAIT;
 
 pub const EXECUTABLE_SUFFIX: &str = ".lsexe";
 
@@ -683,8 +724,17 @@ pub struct Package<'a> {
 }
 
 impl<'a> Package<'a> {
-	// Parse and validate a package header. Returns None if the bytes are too
-	// short, the magic is wrong, or the entry table does not fit.
+	// Parse and validate the WHOLE archive, not just its header.
+	//
+	// The header checks and the checked arithmetic were right as far as they went, and they went to
+	// the end of the entry table: the reserved field was not examined, a blob offset could point
+	// into the header or into the table itself, blob ranges could overlap, two entries could share
+	// a name, a name could carry garbage after its first NUL, an empty name was accepted, and a bad
+	// offset on an entry nobody looked up was not found until somebody did.
+	//
+	// As a trusted build artifact that is survivable. As a parser reading bytes off a disk it is
+	// not, and this is the same crate either way - so every entry is walked here, once, and after
+	// `Some(Package)` a caller may treat the archive as well formed.
 	pub fn parse(bytes: &'a [u8]) -> Option<Self> {
 		if bytes.len() < PKG_HEADER_LEN {
 			return None;
@@ -697,7 +747,73 @@ impl<'a> Package<'a> {
 		if table_end > bytes.len() {
 			return None;
 		}
-		Some(Self { bytes, count })
+		let package = Self { bytes, count };
+		// Every entry: a canonical name, a blob inside the data region, and no two entries naming
+		// the same file or claiming the same bytes.
+		for index in 0..count {
+			let base = PKG_HEADER_LEN + index * PKG_ENTRY_LEN;
+			let stored = &bytes[base..base + PKG_NAME_LEN];
+			let name = match stored.iter().position(|&b| b == 0) {
+				Some(end) => {
+					// CANONICAL: everything past the terminator must be zero. Otherwise one archive
+					// has two byte-level spellings of the same name, and a checksum over the file
+					// says they are different while every reader says they are the same.
+					if stored[end..].iter().any(|&b| b != 0) {
+						return None;
+					}
+					&stored[..end]
+				}
+				None => stored,
+			};
+			if name.is_empty() {
+				return None;
+			}
+			let (offset, size) = package.extent(index)?;
+			// A blob may not start inside the header or the entry table - that would have an entry
+			// describing the structure that describes it - and must end inside the buffer.
+			if offset < table_end || offset.checked_add(size)? > bytes.len() {
+				return None;
+			}
+			for earlier in 0..index {
+				if package.name(earlier)? == name {
+					return None;
+				}
+				let (other_offset, other_size) = package.extent(earlier)?;
+				// Overlapping blobs mean two files share bytes: rewriting one silently rewrites the
+				// other, and no reader of either can tell.
+				if size != 0 && other_size != 0 && offset < other_offset + other_size && other_offset < offset + size {
+					return None;
+				}
+			}
+		}
+		Some(package)
+	}
+
+	// The (offset, size) of the `index`-th blob, straight off the entry table.
+	fn extent(&self, index: usize) -> Option<(usize, usize)> {
+		if index >= self.count {
+			return None;
+		}
+		let base = PKG_HEADER_LEN + index * PKG_ENTRY_LEN;
+		let entry = &self.bytes[base..base + PKG_ENTRY_LEN];
+		let offset = u32::from_le_bytes(entry[PKG_NAME_LEN..PKG_NAME_LEN + 4].try_into().ok()?) as usize;
+		let size = u32::from_le_bytes(entry[PKG_NAME_LEN + 4..PKG_NAME_LEN + 8].try_into().ok()?) as usize;
+		Some((offset, size))
+	}
+
+	// The `index`-th file's blob. Every extent was validated at parse time, so this cannot be out
+	// of bounds - which is what lets `entries()` yield without a second scan.
+	pub fn blob(&self, index: usize) -> Option<&'a [u8]> {
+		let (offset, size) = self.extent(index)?;
+		self.bytes.get(offset..offset + size)
+	}
+
+	// Every (name, blob) in order, without a lookup per entry.
+	//
+	// `lookup` scans from zero, so enumerate-plus-lookup is quadratic in the entry count. It does
+	// not matter for the init package and it is the shape that stops mattering only until it does.
+	pub fn entries(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> + '_ {
+		(0..self.count).filter_map(|index| Some((self.name(index)?, self.blob(index)?)))
 	}
 
 	// Number of files in the package.

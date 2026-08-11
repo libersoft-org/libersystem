@@ -464,7 +464,7 @@ fn exfat_first_set(img: &[u8], root_off: usize) -> usize {
 
 fn exfat_upcase_table() -> Vec<u8> {
 	let mut units: Vec<u16> = Vec::new();
-	let mut identity = |units: &mut Vec<u16>, n: u16| {
+	let identity = |units: &mut Vec<u16>, n: u16| {
 		units.push(0xFFFF);
 		units.push(n);
 	};
@@ -2858,5 +2858,22 @@ fn every_mutating_operation_survives_being_cut_at_any_write() {
 			assert_eq!(check.read_file(b"KEEP.TXT").unwrap(), b"untouched by any of this", "{note}: an uninvolved file was damaged by a later allocation");
 		}
 		assert!(cut_at_least_one, "{label}: no budget in the sweep interrupted it, so nothing was tested");
+	}
+}
+
+#[test]
+fn scanning_the_fat_does_not_cost_more_reads_than_reading_it_whole() {
+	// The whole-table read was justified by round trips: a per-candidate device read made allocation
+	// O(volume). The window has to keep that property or it trades a memory problem for an I/O one -
+	// each FAT sector read once, plus at most one extra where an entry straddles a boundary.
+	for (label, kind) in [("fat12", Kind::Fat12), ("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
+		let inner = MemDisk { data: build_fat(kind, ROOT) };
+		let mut fs = FatFs::mount(CountingDisk { inner, reads: 0 }).unwrap();
+		let fat_sectors = fs.geo.fat_size as usize;
+		fs.dev.reads = 0;
+		fs.free_bytes().unwrap();
+		let reads = fs.dev.reads;
+		assert!(reads <= fat_sectors * 2 + 4, "{label}: counting free space cost {reads} reads over a {fat_sectors}-sector FAT");
+		assert!(reads >= fat_sectors, "{label}: {reads} reads cannot have covered a {fat_sectors}-sector FAT");
 	}
 }

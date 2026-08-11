@@ -45,6 +45,24 @@ impl<D: BlockDevice> LiberFs<D> {
 		// before the barrier: the first returns claimed-but-unused blocks, the second
 		// is a transaction block write like any other.
 		self.release_run();
+		// A TRANSACTION THAT CHANGED NOTHING DOES NOT WRITE.
+		//
+		// `mutate` commits whenever the body returns `Ok`, so `rename("foo", "foo")` - which
+		// `rename_inner` short-circuits - wrote a superblock, advanced the generation, and rolled
+		// the previous one into a snapshot, for no change. Nothing was incorrect about it; it was a
+		// write, wear, and a generation step that a caller can repeat indefinitely.
+		//
+		// Unchanged means every field the superblock carries and every set the commit acts on: the
+		// two roots and their checksums, the inode counter, the compression flag, the snapshot
+		// table, and the fresh and dead block sets. If all of those are as `begin` found them,
+		// ending the transaction publishes exactly what is already published.
+		if let Some(txn) = &self.txn {
+			let same = self.inode_root == txn.inode_root && self.inode_root_crc == txn.inode_root_crc && self.next_inode == txn.next_inode && self.snap_root == txn.snap_root && self.snap_root_crc == txn.snap_root_crc && self.compress == txn.compress && !self.snapshots_dirty && self.fresh.is_empty() && self.dead.is_empty();
+			if same {
+				self.txn = None;
+				return Ok(());
+			}
+		}
 		// the generation numbers every commit and nothing refused the last one, so the
 		// increment below could wrap and produce a superblock that looks OLDER than the
 		// one it supersedes - which would make the volume mount at the wrong generation

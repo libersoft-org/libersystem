@@ -66,7 +66,12 @@ impl<D: BlockDevice> LiberFs<D> {
 	// downward and finishing with leading_zeros on the first byte with a free bit.
 	fn scan_down(&self, from: u64) -> Option<u64> {
 		let mut block = from.min(self.num_blocks - 1);
-		if block <= POOL_START {
+		// AT `POOL_START`, not past it. `POOL_START` is the first block of the pool - the data
+		// allocator hands it out - and the two comparisons here were `<=` and `>`, so the metadata
+		// side skipped it. A volume whose only free block was that one answered `NoSpace` to a
+		// metadata request while the block sat free, which is an off-by-one against the pool's own
+		// definition rather than a policy.
+		if block < POOL_START {
 			return None;
 		}
 		// finish the partial trailing byte first.
@@ -76,12 +81,15 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			block -= 1;
 		}
+		if block == POOL_START {
+			return if self.is_alloc(block) { None } else { Some(block) };
+		}
 		let mut byte = (block / 8) as isize;
 		let first = (POOL_START / 8) as isize;
 		while byte >= first {
 			if self.free[byte as usize] != 0xFF {
 				let candidate = byte as u64 * 8 + (7 - (!self.free[byte as usize]).leading_zeros() as u64);
-				if candidate > POOL_START {
+				if candidate >= POOL_START {
 					return Some(candidate);
 				}
 				return None;

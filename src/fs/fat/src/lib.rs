@@ -280,50 +280,12 @@ impl<D: BlockDevice> FatFs<D> {
 			}
 			return Ok(free * cluster_bytes);
 		}
-		let bps = self.geo.bytes_per_sector;
-		let mut table = vec![0u8; (self.geo.fat_size * bps) as usize];
-		let fat_base = self.geo.reserved_sectors + self.geo.active_fat * self.geo.fat_size;
-		self.read_fs_sectors(fat_base as u64, self.geo.fat_size, &mut table)?;
+		let bps = self.geo.bytes_per_sector as usize;
+		let mut window = vec![0u8; 2 * bps];
+		let mut loaded: Option<u32> = None;
 		for c in 2..=max {
-			let entry: u32 = match self.geo.kind {
-				Kind::Fat12 => {
-					let off = c as usize + c as usize / 2;
-					if off + 1 >= table.len() {
-						break;
-					}
-					let v = u16::from_le_bytes([table[off], table[off + 1]]);
-					if c & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
-				}
-				Kind::Fat16 => {
-					let off = c as usize * 2;
-					if off + 1 >= table.len() {
-						break;
-					}
-					u16::from_le_bytes([table[off], table[off + 1]]) as u32
-				}
-				// exFAT is NOT FAT32 with a different name: its entries are a full 32 bits, its
-				// end-of-chain is 0xFFFFFFFF, and there is no reserved top nibble to preserve.
-				// Sharing this branch meant a volume this driver created carried 0x0FFF_FFFF as a
-				// terminator - readable here only because the reader shared the mistake - and, far
-				// worse, growing a correctly formatted volume read a real 0xFFFFFFFF and wrote back
-				// `(cur & 0xF000_0000) | val`, which for cluster 5 is 0xF0000005. That is not a
-				// cluster pointer at all.
-				Kind::ExFat => {
-					let off = c as usize * 4;
-					if off + 3 >= table.len() {
-						break;
-					}
-					u32::from_le_bytes([table[off], table[off + 1], table[off + 2], table[off + 3]])
-				}
-				Kind::Fat32 => {
-					let off = c as usize * 4;
-					if off + 3 >= table.len() {
-						break;
-					}
-					u32::from_le_bytes([table[off], table[off + 1], table[off + 2], table[off + 3]]) & 0x0FFF_FFFF
-				}
-			};
-			if entry == 0 {
+			let within = self.fat_window(&mut window, &mut loaded, c)?;
+			if fat_entry_in(&window, within, self.geo.kind, c) == 0 {
 				free += 1;
 			}
 		}
@@ -582,6 +544,36 @@ impl<D: BlockDevice> FatFs<D> {
 	fn bitmap_cap(&self, bm_size: u64) -> usize {
 		let cluster_bytes = self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64;
 		bm_size.div_ceil(cluster_bytes).saturating_mul(cluster_bytes).min(usize::MAX as u64) as usize
+	}
+
+	// A two-sector sliding window over the active FAT, for the scans that used to read the whole
+	// table into memory.
+	//
+	// A 66000-cluster FAT32 table is 264 KiB and a 4 TiB volume's is a gigabyte; reading it whole to
+	// count zeros made the driver's memory a function of the medium's size, which is the one number
+	// a hostile volume controls. The window costs the same device reads - each FAT sector is still
+	// read once - and holds two sectors, because a FAT12 entry can straddle the boundary between
+	// them and half an entry is not an entry.
+	//
+	// Returns the offset of `cluster`'s first byte within the window.
+	fn fat_window(&mut self, window: &mut [u8], loaded: &mut Option<u32>, cluster: u32) -> Result<usize, FsError> {
+		let bps = self.geo.bytes_per_sector as u64;
+		let off = match self.geo.kind {
+			Kind::Fat12 => cluster as u64 + cluster as u64 / 2,
+			Kind::Fat16 => cluster as u64 * 2,
+			Kind::Fat32 | Kind::ExFat => cluster as u64 * 4,
+		};
+		let sector = (off / bps) as u32;
+		if *loaded != Some(sector) {
+			let fat_base = self.geo.reserved_sectors + self.geo.active_fat * self.geo.fat_size;
+			// Two sectors unless the second would be past the table, which is the last-entry case.
+			let count = if sector + 1 < self.geo.fat_size { 2 } else { 1 };
+			let bytes = count as usize * bps as usize;
+			self.read_fs_sectors((fat_base + sector) as u64, count, &mut window[..bytes])?;
+			window[bytes..].fill(0);
+			*loaded = Some(sector);
+		}
+		Ok((off % bps) as usize)
 	}
 
 	// Read `limit` bytes from contiguous clusters starting at `first` - the exFAT
@@ -857,9 +849,9 @@ impl<D: BlockDevice> FatFs<D> {
 		if n == 0 {
 			return Ok(Vec::new());
 		}
-		let mut fat = vec![0u8; (self.geo.fat_size as u64 * self.geo.bytes_per_sector as u64) as usize];
-		let fat_base = self.geo.reserved_sectors + self.geo.active_fat * self.geo.fat_size;
-		self.read_fs_sectors(fat_base as u64, self.geo.fat_size, &mut fat)?;
+		let bps = self.geo.bytes_per_sector as usize;
+		let mut window = vec![0u8; 2 * bps];
+		let mut loaded: Option<u32> = None;
 		let mut chain: Vec<u32> = Vec::with_capacity(n);
 		let mut c = 2u32;
 		let max = self.max_cluster();
@@ -867,7 +859,8 @@ impl<D: BlockDevice> FatFs<D> {
 			if c > max {
 				return Err(FsError::NoSpace);
 			}
-			if fat_entry_at(&fat, self.geo.kind, c) == 0 {
+			let within = self.fat_window(&mut window, &mut loaded, c)?;
+			if fat_entry_in(&window, within, self.geo.kind, c) == 0 {
 				chain.push(c);
 			}
 			c += 1;
@@ -1663,34 +1656,40 @@ impl<D: BlockDevice> FatFs<D> {
 
 // Read `cluster`'s entry from an in-memory image of the FAT, for the allocation scan
 // (an out-of-image offset reads as non-free, so it is never handed out).
-fn fat_entry_at(fat: &[u8], kind: Kind, cluster: u32) -> u32 {
-	let off = match kind {
-		Kind::Fat12 => cluster as usize + cluster as usize / 2,
-		Kind::Fat16 => cluster as usize * 2,
-		Kind::Fat32 | Kind::ExFat => cluster as usize * 4,
-	};
+// One FAT entry, read from a buffer at a known offset. This replaced a variant that indexed the
+// whole table, which was the only thing keeping the whole table in memory.
+fn fat_entry_in(buf: &[u8], within: usize, kind: Kind, cluster: u32) -> u32 {
 	match kind {
 		Kind::Fat12 => {
-			if off + 2 > fat.len() {
+			if within + 2 > buf.len() {
 				return 1;
 			}
-			let v = u16::from_le_bytes([fat[off], fat[off + 1]]);
+			let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
 			if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
 		}
 		Kind::Fat16 => {
-			if off + 2 > fat.len() {
+			if within + 2 > buf.len() {
 				return 1;
 			}
-			u16::from_le_bytes([fat[off], fat[off + 1]]) as u32
+			u16::from_le_bytes([buf[within], buf[within + 1]]) as u32
 		}
-		Kind::Fat32 | Kind::ExFat => {
-			if off + 4 > fat.len() {
+		// exFAT has no reserved top nibble: a terminator is all thirty-two bits, and masking it to
+		// twenty-eight would turn one into an ordinary cluster pointer.
+		Kind::ExFat => {
+			if within + 4 > buf.len() {
 				return 1;
 			}
-			u32::from_le_bytes([fat[off], fat[off + 1], fat[off + 2], fat[off + 3]]) & 0x0FFF_FFFF
+			u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]])
+		}
+		Kind::Fat32 => {
+			if within + 4 > buf.len() {
+				return 1;
+			}
+			u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF
 		}
 	}
 }
+
 impl Geometry {
 	// Parse a FAT12/16/32 BIOS Parameter Block and classify by cluster count. Every
 	// value comes off untrusted removable media, so the region arithmetic runs in u64

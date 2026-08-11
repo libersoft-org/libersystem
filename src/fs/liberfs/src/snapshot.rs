@@ -193,13 +193,13 @@ impl<D: BlockDevice> LiberFs<D> {
 							return Err(FsError::Corrupt);
 						}
 						if hashes.try_reserve(1).is_err() {
-							return Err(FsError::NoSpace);
+							return Err(FsError::NoMemory);
 						}
 						hashes.insert(at, (hash, out.len()));
 					}
 					Err(at) => {
 						if hashes.try_reserve(1).is_err() {
-							return Err(FsError::NoSpace);
+							return Err(FsError::NoMemory);
 						}
 						hashes.insert(at, (hash, out.len()));
 					}
@@ -223,7 +223,7 @@ impl<D: BlockDevice> LiberFs<D> {
 					return Err(FsError::Corrupt);
 				}
 				if out.try_reserve(1).is_err() {
-					return Err(FsError::NoSpace);
+					return Err(FsError::NoMemory);
 				}
 				out.push(Snapshot { name, inode_root, inode_root_crc, generation });
 			}

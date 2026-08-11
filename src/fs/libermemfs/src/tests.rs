@@ -78,11 +78,13 @@ fn files_and_directories_round_trip() {
 	assert_eq!(entries[0].size, 5);
 	assert!(!entries[0].is_dir);
 
-	// The root lists the directory, and a directory's reported size is what it contains.
+	// The root lists the directory, and A DIRECTORY REPORTS ZERO - which is what the generated
+	// `Storage` documentation says and what the adapter hands the client. This used to be the
+	// recursive size of the contents, a different quantity under the same name.
 	let root = fs.list_entries(b"").expect("list root");
 	assert_eq!(root.len(), 1);
 	assert!(root[0].is_dir);
-	assert_eq!(root[0].size, 5);
+	assert_eq!(root[0].size, 0, "a directory reports a length of zero");
 }
 
 #[test]
@@ -666,10 +668,12 @@ impl Model {
 		let name = core::str::from_utf8(path).expect("test paths are utf-8");
 		match kind {
 			// A file holds the largest size ever written to it until it is removed, because a
-			// cleared vector keeps its buffer. The model derives that from the sizes it asked
-			// for - it never reads a length back from the implementation it is checking.
+			// cleared vector keeps its buffer - EXCEPT a write of nothing, which drops the buffer
+			// outright: that shrink is free and cannot fail, so the volume gives it back. The model
+			// derives both from the sizes it asked for; it never reads a length back from the
+			// implementation it is checking.
 			0 | 1 => {
-				let held = self.files.get(name).copied().unwrap_or(0).max(wrote);
+				let held = if wrote == 0 { 0 } else { self.files.get(name).copied().unwrap_or(0).max(wrote) };
 				self.files.insert(alloc::string::String::from(name), held);
 			}
 			2 => {
@@ -698,26 +702,38 @@ impl Model {
 fn a_shrunk_file_keeps_its_allocation_and_the_volume_says_so() {
 	// The regression this stands for: rewriting in place stopped the transient second copy but
 	// `Vec::clear` keeps the buffer, so a file shrunk to nothing still owned its memory while the
-	// accounting counted `len` and reported the volume empty. That is worse than what it replaced
-	// - the old defect held two copies briefly and the numbers showed both; this one held one
-	// copy forever and the numbers showed neither.
+	// accounting counted `len` and reported the volume empty. That is worse than what it replaced -
+	// the old defect held two copies briefly and the numbers showed both; this one held one copy
+	// forever and the numbers showed neither.
 	//
-	// Measured against real memory, not accounting: 64 KiB volume, 80 KiB heap. If the shrink
-	// released the file's buffer, both writes fit one after the other. If it did not - and it does
-	// not - the volume must refuse the second write rather than accept it and run the heap out.
+	// The property is that the ACCOUNTING AND THE HEAP AGREE, and it is still the property. What
+	// changed is which way they agree at zero: a write of nothing now drops the buffer, because
+	// that shrink is free and cannot fail, so the volume reports the space free and it really is.
+	// A PARTIAL shrink still holds its allocation, and the volume still says so.
+	//
+	// Measured against real memory, not accounting: 64 KiB volume, 80 KiB heap.
 	let big = alloc::vec![b'x'; 60 * 1024];
+	let medium = alloc::vec![b'x'; 40 * 1024];
 	within(80 * 1024, || {
 		let mut fs = LiberMemFs::mount(Policy::Capped, 64 * 1024).expect("mount");
 		fs.write_file(b"a", &big).expect("write");
+
+		// A partial shrink: the buffer stays, and the volume must keep counting it - otherwise it
+		// would accept a second file into memory that is not there.
+		fs.write_file(b"a", &medium).expect("shrink to 40 KiB");
+		assert_eq!(fs.used(), 40 * 1024, "40 KiB is stored");
+		assert!(fs.free() < 8 * 1024, "the file still holds its 60 KiB buffer: free={}", fs.free());
+		assert_eq!(fs.write_file(b"b", &big), Err(FsError::NoSpace), "refused, rather than accepted into memory that is gone");
+
+		// Shrinking to nothing releases it, and the space is genuinely there.
 		fs.write_file(b"a", b"").expect("shrink to nothing");
 		assert_eq!(fs.used(), 0, "nothing is stored any more");
-		assert!(fs.free() < 8 * 1024, "but the volume still counts what the file holds: free={}", fs.free());
-		assert_eq!(fs.write_file(b"b", &big), Err(FsError::NoSpace), "a second large file is refused, not accepted into memory that is gone");
+		assert_eq!(fs.free(), 64 * 1024 - 1, "and the volume has it back, less the one-byte name");
+		fs.write_file(b"b", &big).expect("the returned space must be real memory, not an accounting entry");
 
-		// Removing the file is what actually releases it, and then the write fits.
+		// Removing the file gives the name back too.
 		fs.remove(b"a").expect("remove");
-		assert_eq!(fs.free(), 64 * 1024, "the name goes with the file");
-		fs.write_file(b"b", &big).expect("after the release the volume has the room it reports");
+		assert_eq!(fs.free(), 64 * 1024 - 60 * 1024 - 1, "the name goes with the file");
 	});
 }
 
@@ -981,7 +997,7 @@ fn receiving_into_the_volume_costs_one_buffer_rather_than_two() {
 		for (i, byte) in spare.iter_mut().enumerate() {
 			*byte = (i & 0xff) as u8;
 		}
-		fs.stream_advance(48 * 1024, 48 * 1024);
+		fs.stream_advance(48 * 1024, 48 * 1024).expect("the offer closes");
 		fs.stream_commit().expect("commit");
 		assert_eq!(fs.used(), 48 * 1024, "the file holds what was received");
 	});
@@ -1030,4 +1046,232 @@ fn a_reserved_stream_commit_leaves_the_reservation_whole() {
 	assert!(intact, "and the volume still holds the capacity it promised (footprint {}, reserved {})", held.0, held.1);
 	assert_eq!(held.0 as usize + held.1 as usize, CAPACITY, "stored plus held is the capacity, as it always is");
 	assert_eq!(readback.as_deref(), Some(data.as_slice()), "the file is there and whole");
+}
+
+#[test]
+fn a_directory_filled_and_emptied_gives_its_table_back() {
+	// The finding with a number in the hundreds of megabytes, and the only one reachable through
+	// the ordinary public API: `Vec::remove` never shrinks, so a directory that held four thousand
+	// entries and now holds none kept the backing store for four thousand slots - and no accounting
+	// the volume had could see it, because every walk visited the entries that EXIST.
+	//
+	// Fill, empty, leave it, make another. Without the shrink each cycle keeps its table forever.
+	let mut fs = capped(64 * 1024 * 1024);
+	let empty = fs.metadata_bytes();
+	for cycle in 0..8u32 {
+		let dir = alloc::format!("d{cycle}");
+		fs.mkdir(dir.as_bytes()).expect("a directory");
+		for i in 0..200u32 {
+			let path = alloc::format!("{dir}/f{i:03}");
+			fs.write_file(path.as_bytes(), b"x").expect("an entry");
+		}
+		let full = fs.metadata_bytes();
+		assert!(full >= 200 * SLOT_BYTES as u64, "cycle {cycle}: a filled directory must show its table: {full}");
+		for i in 0..200u32 {
+			let path = alloc::format!("{dir}/f{i:03}");
+			fs.remove(path.as_bytes()).expect("removed");
+		}
+		// The emptied directory keeps a table of nothing, which costs nothing.
+		let after = fs.metadata_bytes();
+		assert!(after < full / 4, "cycle {cycle}: the emptied directory kept {after} of {full}");
+	}
+	// Eight cycles later the volume holds eight empty directories and nothing else. Before the
+	// shrink this was eight retained tables; the whole point is that the number does not grow.
+	let end = fs.metadata_bytes();
+	assert!(end <= empty + 16 * SLOT_BYTES as u64, "eight fill-and-empty cycles retained {end} bytes of tables");
+}
+
+#[test]
+fn a_directory_that_shrinks_a_long_way_gives_most_of_its_table_back() {
+	// The general case of the same defect: not emptied, just far smaller than it was. The empty
+	// case can be given back for free; this one is a fallible move, and what it must guarantee is
+	// that the retained table stays proportional to the contents rather than to the high-water mark.
+	let mut fs = capped(64 * 1024 * 1024);
+	fs.mkdir(b"d").expect("a directory");
+	for i in 0..1000u32 {
+		fs.write_file(alloc::format!("d/f{i:04}").as_bytes(), b"x").expect("an entry");
+	}
+	let peak = fs.metadata_bytes();
+	for i in 0..990u32 {
+		fs.remove(alloc::format!("d/f{i:04}").as_bytes()).expect("removed");
+	}
+	let after = fs.metadata_bytes();
+	assert!(after * 8 < peak, "a directory down from 1000 entries to 10 kept {after} of {peak}");
+	// And the ten that remain are still there and still findable, which a botched move would break.
+	assert_eq!(fs.list_entries(b"d").expect("list").len(), 10);
+	for i in 990..1000u32 {
+		assert_eq!(fs.read_file(alloc::format!("d/f{i:04}").as_bytes()).expect("still readable"), b"x");
+	}
+}
+
+#[test]
+fn a_preflight_never_promises_what_the_next_call_refuses() {
+	// Three functions answering one question, and they disagreed in four places. A preflight that
+	// says yes to something the write then refuses is worse than no preflight: StorageService turns
+	// `Ok(0)` into `WritePlan::Allowed { max_len: Some(0) }`, documented as "this path may be
+	// written", and the caller then gets NoSpace.
+
+	// Ok(0) must mean an empty file can be created here - not "the name alone does not fit".
+	let mut fs = capped(6);
+	fs.write_file(b"a", b"1234").expect("four bytes and a one-byte name");
+	assert_eq!(fs.free(), 1);
+	assert_eq!(fs.writable_len(b"NAME5"), Err(FsError::NoSpace), "one free byte cannot hold a five-byte name");
+	// And where zero IS the honest answer, the write it promises must succeed.
+	let mut fs = capped(7);
+	fs.write_file(b"a", b"12345").expect("five bytes and a one-byte name");
+	assert_eq!(fs.free(), 1);
+	assert_eq!(fs.writable_len(b"b"), Ok(0), "the name fits exactly and an empty file can follow it");
+	fs.write_file(b"b", b"").expect("the preflight promised this");
+
+	// The two preflights must agree at the entry ceiling, and with the operation itself.
+	let mut fs = capped(64 * 1024 * 1024);
+	// The root counts as an entry, so the volume holds MAX_ENTRIES - 1 files.
+	for i in 0..MAX_ENTRIES - 1 {
+		fs.write_file(alloc::format!("f{i:05}").as_bytes(), b"").expect("an entry");
+	}
+	assert_eq!(fs.writable_len(b"one-more"), Err(FsError::NoSpace));
+	assert_eq!(fs.stream_len(b"one-more"), Err(FsError::NoSpace), "the two preflights must give one answer");
+	assert_eq!(fs.stream_begin(b"one-more"), Err(FsError::NoSpace), "and the operation must give the same one");
+}
+
+#[test]
+fn a_stream_over_an_existing_file_can_take_everything_it_was_promised() {
+	// The existing-file arm answered `free` while `stream_begin` charges the pending path against
+	// the capacity for a replace exactly as for a create. The promise was `free` and the stream
+	// could take `free - path.len()`.
+	let mut fs = capped(1000);
+	fs.write_file(b"abc", &[b'x'; 900]).expect("903 of 1000, data plus name");
+	let promised = fs.stream_len(b"abc").expect("a replace is allowed");
+	assert!(promised > 0, "the fixture must leave room to stream into");
+
+	fs.stream_begin(b"abc").expect("begin");
+	let mut left = promised;
+	while left > 0 {
+		let chunk = left.min(16);
+		let slice = fs.stream_spare(chunk).expect("the promised room must be available");
+		let take = slice.len().min(chunk);
+		slice[..take].fill(b'y');
+		fs.stream_advance(chunk, take).expect("the offer closes");
+		left -= take;
+	}
+	fs.stream_commit().expect("a stream that took exactly what it was promised must commit");
+	assert_eq!(fs.read_file(b"abc").expect("read").len(), promised);
+}
+
+#[test]
+fn a_stream_that_takes_its_whole_promise_commits() {
+	// The pending state holds the path plus everything the preflight allowed - the whole capacity -
+	// and the commit then had to allocate a fresh `String` for the destination's name. A transfer
+	// could accept one hundred per cent of what it was promised and fail on metadata, after the
+	// sender had done all the work. The name is taken at `stream_begin` now, so the refusal - if
+	// there is one - happens before anything is sent.
+	//
+	// Not run under a heap budget: an allocation failure inside one is a panic inside the harness,
+	// and the property here is an ACCOUNTING one - that what the preflight promises is what the
+	// commit accepts - which a capped volume states exactly.
+	const CAPACITY: usize = 4096;
+	let name = alloc::vec![b'n'; 200];
+	let mut fs = capped(CAPACITY);
+	let promised = fs.stream_len(&name).expect("a new file may be streamed");
+	assert_eq!(promised, CAPACITY - 400, "the promise must charge the path and the name it will hold");
+	fs.stream_begin(&name).expect("begin");
+	let mut left = promised;
+	while left > 0 {
+		let chunk = left.min(256);
+		let slice = fs.stream_spare(chunk).expect("the promised room must be there");
+		let take = slice.len().min(chunk);
+		assert!(take > 0, "a stream that cannot advance is a hang, not a failure");
+		slice[..take].fill(b'z');
+		fs.stream_advance(chunk, take).expect("the offer closes");
+		left -= take;
+	}
+	fs.stream_commit().expect("a stream that took its whole promise must commit");
+	assert_eq!(fs.read_file(&name).expect("read").len(), promised);
+	assert!(fs.footprint() as usize <= CAPACITY, "and the volume is not over its capacity afterwards");
+}
+
+#[test]
+fn both_writable_backends_refuse_the_same_names() {
+	// StorageService mounts LiberMemFS as the live `vol://system` and LiberFS as an installed one.
+	// Two policies meant the same application call succeeded on one and failed on the other: this
+	// backend rejected `.`, `..` and non-UTF-8 and had no portable-byte check at all, while
+	// `FsError::BadName` documents all four and LiberFS enforced all four.
+	//
+	// The policy lives in `fs/core` now, so this test is about the call reaching it.
+	let mut fs = capped(64 * 1024);
+	for bad in [&b"foo:bar"[..], b"a*b", b"a?b", b"a<b", b"a>b", b"a|b", b"a\"b", b"a\\b", b"a\x01b", b"a\x7fb"] {
+		assert_eq!(fs.write_file(bad, b"x"), Err(FsError::BadName), "a non-portable name was accepted: {bad:?}");
+		assert_eq!(fs.mkdir(bad), Err(FsError::BadName), "a non-portable directory name was accepted: {bad:?}");
+	}
+	// And the four the policy already covered, unchanged.
+	assert_eq!(fs.write_file(b"a/./b", b"x"), Err(FsError::BadName));
+	assert_eq!(fs.write_file(b"a/../b", b"x"), Err(FsError::BadName));
+	assert_eq!(fs.write_file(b"\xff\xfe", b"x"), Err(FsError::BadName));
+	// A name that is merely unusual is still fine - the policy refuses what is unportable, not
+	// what is unfamiliar.
+	fs.write_file("a file with spaces and ěščř.txt".as_bytes(), b"x").expect("a portable name");
+}
+
+#[test]
+fn the_streaming_pair_is_a_protocol_rather_than_a_convention() {
+	// `stream_spare` resizes the pending data to its new total - filling with zeros - before
+	// handing back the slice, and `stream_advance` truncates using numbers the CALLER supplies.
+	// StorageService uses them correctly, and the API is public: without an enforced protocol,
+	// `stream_spare(4096)` followed by `stream_commit()` stores four kilobytes of zeros nobody
+	// wrote, and an `offered` that does not match the last offer discards data that was valid.
+	let mut fs = capped(64 * 1024);
+
+	// A commit with an offer still open would store the zeros the offer was filled with.
+	fs.stream_begin(b"zeros").expect("begin");
+	let spare = fs.stream_spare(4096).expect("an offer");
+	assert_eq!(spare.len(), 4096);
+	assert_eq!(fs.stream_commit(), Err(FsError::Invalid), "committing over an open offer stores zeros nobody wrote");
+	// The offer is still open, so it can be closed properly and the stream finished.
+	fs.stream_advance(4096, 4).expect("the offer closes");
+	fs.stream_commit().expect("and then it commits");
+	assert_eq!(fs.read_file(b"zeros").expect("read").len(), 4, "only what was written survives");
+
+	// A second offer over an open one has no way to be accounted for.
+	fs.stream_begin(b"twice").expect("begin");
+	fs.stream_spare(64).expect("an offer");
+	assert_eq!(fs.stream_spare(64).map(|s| s.len()), Err(FsError::Invalid), "two open offers at once");
+	fs.stream_advance(64, 64).expect("the offer closes");
+	fs.stream_spare(64).expect("and then another may be opened");
+	fs.stream_advance(64, 0).expect("closed");
+	fs.stream_commit().expect("commit");
+	assert_eq!(fs.read_file(b"twice").expect("read").len(), 64);
+
+	// Numbers that describe some other offer are refused rather than believed.
+	fs.stream_begin(b"wrong").expect("begin");
+	fs.stream_spare(32).expect("an offer");
+	assert_eq!(fs.stream_advance(64, 0), Err(FsError::Invalid), "an offered length that was never offered");
+	assert_eq!(fs.stream_advance(32, 33), Err(FsError::Invalid), "more written than was offered");
+	fs.stream_advance(32, 32).expect("the real numbers close it");
+	// And closing an offer that is not open is refused too.
+	assert_eq!(fs.stream_advance(32, 0), Err(FsError::Invalid), "closing an offer that was never opened");
+	fs.stream_abort();
+}
+
+#[test]
+fn truncating_a_file_to_nothing_returns_its_quota() {
+	// A capped volume counts capacity rather than length, which is the rule that closed the
+	// grow-and-shrink hole and is worth keeping. But `vol://tmp` is exactly where a caller expects
+	// a truncate to return the space, and the zero-length case costs nothing to give back:
+	// assigning a fresh `Vec` frees the block and cannot fail.
+	let mut fs = capped(64 * 1024);
+	fs.write_file(b"big", &[b'x'; 32 * 1024]).expect("a large file");
+	let full = fs.free();
+	fs.write_file(b"big", b"").expect("truncate");
+	assert!(fs.free() > full + 30 * 1024, "a truncate to nothing kept the quota: {} then {}", full, fs.free());
+	// The file is still there, still empty, and the space is genuinely reusable.
+	assert_eq!(fs.read_file(b"big").expect("read"), b"");
+	fs.write_file(b"other", &[b'y'; 30 * 1024]).expect("the returned space must be usable");
+
+	// A partial shrink still holds its allocation, deliberately - the rule the audit calls
+	// defensible, and the one this must not quietly change.
+	let mut fs = capped(64 * 1024);
+	fs.write_file(b"big", &[b'x'; 32 * 1024]).expect("a large file");
+	let before = fs.free();
+	fs.write_file(b"big", &[b'x'; 1024]).expect("shrink");
+	assert_eq!(fs.free(), before, "a partial shrink must keep its allocation");
 }

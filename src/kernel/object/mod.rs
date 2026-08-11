@@ -81,21 +81,23 @@ impl ObjectType {
 	// A stable numeric code for this type, carried across the syscall boundary by
 	// object_info_get (the wire-stable index, distinct from the in-memory enum).
 	pub fn code(self) -> u64 {
+		// The values are `abi`'s, not this file's: they are documented as stable ABI codes that
+		// userspace reads out of `ObjectInfo`, so they belong where userspace can see them.
 		match self {
-			ObjectType::Domain => 0,
-			ObjectType::Process => 1,
-			ObjectType::Thread => 2,
-			ObjectType::AddressSpace => 3,
-			ObjectType::MemoryObject => 4,
-			ObjectType::Channel => 5,
-			ObjectType::Event => 6,
-			ObjectType::Timer => 7,
-			ObjectType::Interrupt => 8,
-			ObjectType::DeviceMemory => 9,
-			ObjectType::DmaBuffer => 10,
-			ObjectType::ProcessGroup => 11,
-			ObjectType::Privilege => 12,
-			ObjectType::WaitSet => 13,
+			ObjectType::Domain => abi::OBJECT_TYPE_DOMAIN,
+			ObjectType::Process => abi::OBJECT_TYPE_PROCESS,
+			ObjectType::Thread => abi::OBJECT_TYPE_THREAD,
+			ObjectType::AddressSpace => abi::OBJECT_TYPE_ADDRESS_SPACE,
+			ObjectType::MemoryObject => abi::OBJECT_TYPE_MEMORY_OBJECT,
+			ObjectType::Channel => abi::OBJECT_TYPE_CHANNEL,
+			ObjectType::Event => abi::OBJECT_TYPE_EVENT,
+			ObjectType::Timer => abi::OBJECT_TYPE_TIMER,
+			ObjectType::Interrupt => abi::OBJECT_TYPE_INTERRUPT,
+			ObjectType::DeviceMemory => abi::OBJECT_TYPE_DEVICE_MEMORY,
+			ObjectType::DmaBuffer => abi::OBJECT_TYPE_DMA_BUFFER,
+			ObjectType::ProcessGroup => abi::OBJECT_TYPE_PROCESS_GROUP,
+			ObjectType::Privilege => abi::OBJECT_TYPE_PRIVILEGE,
+			ObjectType::WaitSet => abi::OBJECT_TYPE_WAIT_SET,
 		}
 	}
 }

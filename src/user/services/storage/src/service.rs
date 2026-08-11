@@ -501,26 +501,40 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 			return StreamStep::Done(Err(if p.limit_is_policy { Error::Invalid } else { Error::Again }));
 		}
 		let offered = want;
+		// Whether an offer was actually opened. A backend that does not implement `stream_spare`
+		// returns `None`, and there is then nothing to close - calling `stream_advance` on it is
+		// closing an offer that was never opened, which the protocol now refuses and which used to
+		// be a silent no-op. Getting this wrong took every service that streams offline.
+		let mut opened = false;
 		let written = match vol.fs.stream_spare(want) {
-			Some(Ok(spare)) => match unsafe { recv_into(p.stream, spare) } {
-				RecvInto::Received(n) => n,
-				RecvInto::PeerClosed => {
-					vol.fs.stream_advance(offered, 0);
-					return StreamStep::Done(Ok(()));
+			Some(Ok(spare)) => {
+				opened = true;
+				match unsafe { recv_into(p.stream, spare) } {
+					RecvInto::Received(n) => n,
+					RecvInto::PeerClosed => {
+						if vol.fs.stream_advance(offered, 0).is_err() {
+							return StreamStep::Done(Err(Error::Invalid));
+						}
+						return StreamStep::Done(Ok(()));
+					}
+					RecvInto::Empty => {
+						if vol.fs.stream_advance(offered, 0).is_err() {
+							return StreamStep::Done(Err(Error::Invalid));
+						}
+						return StreamStep::More;
+					}
+					RecvInto::Failed => {
+						let _ = vol.fs.stream_advance(offered, 0);
+						return StreamStep::Done(Err(Error::Invalid));
+					}
 				}
-				RecvInto::Empty => {
-					vol.fs.stream_advance(offered, 0);
-					return StreamStep::More;
-				}
-				RecvInto::Failed => {
-					vol.fs.stream_advance(offered, 0);
-					return StreamStep::Done(Err(Error::Invalid));
-				}
-			},
+			}
 			Some(Err(e)) => return StreamStep::Done(Err(e)),
 			None => 0,
 		};
-		vol.fs.stream_advance(offered, written);
+		if opened && vol.fs.stream_advance(offered, written).is_err() {
+			return StreamStep::Done(Err(Error::Invalid));
+		}
 		p.received = p.received.saturating_add(written);
 		p.chunks += 1;
 		if p.chunks > STREAM_CHUNK_GRACE && p.received / p.chunks < STREAM_MIN_CHUNK {
@@ -1387,7 +1401,22 @@ trait FileSystem {
 	fn stream_spare(&mut self, _want: usize) -> Option<Result<&mut [u8], Error>> {
 		None
 	}
-	fn stream_advance(&mut self, _offered: usize, _written: usize) {}
+	// Closes the outstanding offer. `Err` means the protocol was broken - an offer closed that was
+	// never opened, or closed with a length that does not match the one handed out - which is a bug
+	// in this file rather than a condition the medium can produce, and is surfaced rather than
+	// dropped so it cannot become a file full of zeros nobody wrote.
+	// Closes the outstanding offer. `Err` means the protocol was broken - an offer closed with a
+	// length that does not match the one handed out - which is a bug in this file rather than a
+	// condition the medium can produce, and is surfaced rather than dropped so it cannot become a
+	// file full of zeros nobody wrote.
+	//
+	// The default is `Ok`, because a backend that does not implement `stream_spare` never opens an
+	// offer and so has none to close. Making the default an error took every service that streams
+	// offline at boot, which is the loudest possible way to learn that "no offer" and "a broken
+	// offer" are different answers.
+	fn stream_advance(&mut self, _offered: usize, _written: usize) -> Result<(), Error> {
+		Ok(())
+	}
 	fn stream_commit(&mut self) -> Result<(), Error> {
 		Err(Error::Invalid)
 	}
@@ -1961,8 +1990,8 @@ impl FileSystem for MemFs {
 	fn stream_spare(&mut self, want: usize) -> Option<Result<&mut [u8], Error>> {
 		Some(self.fs.stream_spare(want).map_err(map_fs_err))
 	}
-	fn stream_advance(&mut self, offered: usize, written: usize) {
-		self.fs.stream_advance(offered, written);
+	fn stream_advance(&mut self, offered: usize, written: usize) -> Result<(), Error> {
+		self.fs.stream_advance(offered, written).map_err(map_fs_err)
 	}
 	fn stream_commit(&mut self) -> Result<(), Error> {
 		self.fs.stream_commit().map_err(map_fs_err)
@@ -2241,6 +2270,15 @@ fn map_fs_err(e: FsError) -> Error {
 	match e {
 		FsError::NotFound => Error::NotFound,
 		FsError::NoSpace => Error::Again,
+		// The service is short of MEMORY, not the volume of space. Both are worth retrying and the
+		// caller's next move differs: `NoSpace` says free something on the volume, `NoMemory` says
+		// wait for this service. They arrive here as one `Again` because the Storage protocol has
+		// no finer word yet - what matters is that the filesystems no longer conflate them, so the
+		// distinction exists to be surfaced when the protocol grows one.
+		FsError::NoMemory => Error::Again,
+		// A file too large to return in one buffer, which is a ranged read away from working - not
+		// a damaged volume, which is what it used to be reported as.
+		FsError::TooLarge => Error::Invalid,
 		// the malformed-request family: bad or overlong names, wrong kinds, a non-empty
 		// directory, a duplicate snapshot name, an impossible operation.
 		FsError::TooLong | FsError::BadName | FsError::IsDir | FsError::NotDir | FsError::NotEmpty | FsError::Exists | FsError::Invalid => Error::Invalid,

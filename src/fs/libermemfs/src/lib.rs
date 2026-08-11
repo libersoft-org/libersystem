@@ -39,6 +39,22 @@ use fscore::FsError;
 // filesystem that can exhaust the kernel heap is a denial of service whatever it is called.
 pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_ENTRIES: usize = 4096;
+
+// What one directory slot costs: the name's `String` header plus the `Node` beside it. Measured
+// from the types rather than written down, so it cannot drift from what a slot actually is.
+pub const SLOT_BYTES: usize = core::mem::size_of::<(String, Node)>();
+
+// Tables at or below this many slots are left alone when they empty out - moving a handful of
+// entries to save a few hundred bytes costs more than it returns.
+const MIN_SLOTS: usize = 8;
+
+// The ceiling on directory tables, live and retained together. It is a SEPARATE budget from the
+// volume's capacity, deliberately: the capacity bounds what a caller stored, and a four-slot table
+// under a twelve-byte volume would make every small volume unusable while measuring nothing the
+// caller controls. What this bounds is the thing the caller CAN drive without limit - retained
+// slots - and `shrink_children` keeps a table within a factor of four of its contents, so reaching
+// this at all means something has gone wrong rather than merely gone large.
+pub const MAX_METADATA_BYTES: usize = 4 * MAX_ENTRIES * SLOT_BYTES;
 pub const MAX_NAME_BYTES: usize = 255;
 pub const MAX_PATH_DEPTH: usize = 16;
 // The longest path that can name anything: every segment at its limit, with a separator between
@@ -122,7 +138,48 @@ fn insert(children: &mut Children, name: String, node: Node) -> Result<(), FsErr
 
 fn remove(children: &mut Children, name: &str) -> Option<Node> {
 	let at = children.binary_search_by(|(key, _)| key.as_str().cmp(name)).ok()?;
-	Some(children.remove(at).1)
+	let node = children.remove(at).1;
+	shrink_children(children);
+	Some(node)
+}
+
+// Give a directory's table back when it is mostly empty.
+//
+// `Vec::remove` never shrinks, so without this a directory that held four thousand entries and now
+// holds none still owns the backing store for four thousand slots - and nothing in the volume's
+// accounting could see it, because `allocated()` and `names()` only ever walked the entries that
+// EXIST. Fill a directory, empty it, leave it, make another: at 56 bytes a slot, the sequence the
+// audit describes retains 447 MB through the ordinary public `remove`.
+//
+// MAX_ENTRIES bounds live nodes, which is what the documentation's "a few hundred kilobytes
+// whatever the capacity" is true of. It says nothing about capacity that was kept, and the
+// difference was three orders of magnitude.
+//
+// Two shrinks, and the difference between them matters:
+//
+//   * empty: assign a fresh `Vec`, which allocates nothing and CANNOT fail. Free in both senses.
+//   * mostly empty: build a right-sized table with `try_reserve_exact` and move into it. Fallible,
+//     and a failure simply keeps the oversized table - refusing a `remove` because the volume could
+//     not afford to shrink would be absurd.
+//
+// `shrink_to_fit` does neither: it aborts the process on allocation failure, which is the one thing
+// this crate is written not to do.
+fn shrink_children(children: &mut Children) {
+	if children.is_empty() {
+		*children = Children::new();
+		return;
+	}
+	// A small table is not worth moving, and a table within a factor of four of its contents is the
+	// slack a growing directory needs anyway.
+	if children.capacity() <= MIN_SLOTS || children.len() * 4 > children.capacity() {
+		return;
+	}
+	let mut smaller = Children::new();
+	if smaller.try_reserve_exact(children.len()).is_err() {
+		return;
+	}
+	smaller.extend(children.drain(..));
+	*children = smaller;
 }
 
 impl Node {
@@ -166,6 +223,16 @@ impl Node {
 		match self {
 			Node::File(_) => 0,
 			Node::Directory(children) => children.iter().map(|(name, node)| name.len() + node.names()).sum(),
+		}
+	}
+
+	// The bytes this subtree's directory TABLES hold, live slots and retained ones alike. Kept
+	// apart from `allocated()` because it is bounded separately - see MAX_METADATA_BYTES - but
+	// answered from the same walk, so the two cannot disagree about the shape of the tree.
+	fn table_bytes(&self) -> usize {
+		match self {
+			Node::File(_) => 0,
+			Node::Directory(children) => children.capacity() * SLOT_BYTES + children.iter().map(|(_, node)| node.table_bytes()).sum::<usize>(),
 		}
 	}
 
@@ -216,6 +283,25 @@ pub struct LiberMemFs {
 struct Pending {
 	path: Vec<u8>,
 	data: Vec<u8>,
+	// The destination's final name, ALLOCATED AT BEGIN and moved into the tree at commit.
+	//
+	// A stream is allowed roughly `capacity - path.len()`, and the pending state then holds the
+	// path plus that data - the whole capacity. `stream_commit` used to allocate a fresh `String`
+	// for the name at the very end, so a transfer could accept one hundred per cent of what it was
+	// promised and then fail on a few bytes of metadata, after the sender had done all the work.
+	// Allocating it up front turns that into a refusal at `stream_begin`, before anything is sent.
+	//
+	// `None` for a replace, where the name is already in the tree.
+	name: Option<String>,
+	// How many bytes the last `stream_spare` handed out and nobody has accounted for yet.
+	//
+	// Without it the pair is not a protocol, it is two functions that happen to be called in the
+	// right order: `stream_spare` resizes the pending data to its new total - filling with zeros -
+	// before handing back the slice, and `stream_advance` truncates using numbers the CALLER
+	// supplies. StorageService uses them correctly, and the API is public, so `stream_spare(4096)`
+	// followed by `stream_commit()` stored four kilobytes of zeros nobody wrote, and an `offered`
+	// that did not match the last offer truncated data that was already valid.
+	offered: Option<usize>,
 }
 
 impl LiberMemFs {
@@ -256,8 +342,21 @@ impl LiberMemFs {
 	pub fn footprint(&self) -> u64 {
 		// The pending stream counts. It is memory this volume has caused to be allocated, exactly
 		// like a file's, and leaving it out is what let the accounting disagree with the heap.
-		let pending = self.pending.as_ref().map_or(0, |p| p.data.capacity() + p.path.capacity());
+		// The prepared name counts too. It is memory this volume caused to be allocated exactly as
+		// the path and the data are, and leaving it out is what let the accounting disagree with
+		// the heap - the same defect the pending state was added to `footprint` to fix.
+		let pending = self.pending.as_ref().map_or(0, |p| p.data.capacity() + p.path.capacity() + p.name.as_ref().map_or(0, String::capacity));
 		(self.root.allocated() + self.root.names() + pending) as u64
+	}
+
+	// What the volume's directory tables hold, retained capacity included.
+	//
+	// This is the number that did not exist, and its absence is the whole finding: `footprint()`,
+	// `free()` and `reservation_intact()` all walked live entries only, so a directory that had been
+	// filled and emptied reported its retained table as absent - hundreds of megabytes of it, if a
+	// caller repeated the trick, all reachable through the ordinary public API.
+	pub fn metadata_bytes(&self) -> u64 {
+		self.root.table_bytes() as u64
 	}
 
 	// The bytes a reserved volume is holding but not yet storing. Zero for a capped volume,
@@ -291,20 +390,35 @@ impl LiberMemFs {
 			return Err(FsError::IsDir);
 		}
 		let free = self.capacity.saturating_sub(self.footprint() as usize);
+		// The WHOLE path, on BOTH arms, because `stream_begin` allocates the pending path for a
+		// replace exactly as it does for a create and charges `path.len()` against the capacity
+		// either way. The existing-file arm answered `free` and the stream could take `free -
+		// path.len()`: on a volume of 1000 bytes where `abc` and its name occupy 903, the preflight
+		// promised 97 and the stream accepted 94. Deterministic, not an allocator edge - and the
+		// test that pinned the property covered the nested-create case only.
+		//
+		// The two numbers have to be the same number, and refusing has to be the same refusal:
+		// `Ok(0)` here used to mean "no room for another entry", which `writable_len` answers with
+		// `Err(NoSpace)` and `stream_begin` answers with `Err(NoSpace)`. Three answers to one
+		// question in one file.
+		let pending = path.len();
 		match self.resolve(parts)? {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
-			// The old file stays where it is, so only what is genuinely free is available.
-			Some(Node::File(_)) => Ok(free.min(MAX_FILE_BYTES)),
-			None => {
-				if self.root.count() >= MAX_ENTRIES {
-					return Ok(0);
+			Some(Node::File(_)) => {
+				if free < pending {
+					return Err(FsError::NoSpace);
 				}
-				// The WHOLE path, not the final name. `stream_begin` charges `path.len()` against
-				// the capacity and keeps the whole path in the pending state, so subtracting only
-				// the last segment announced a limit a nested destination could not actually take -
-				// a stream accepted under its declared ceiling and refused with `NoSpace` before
-				// reaching it. The two numbers have to be the same number.
-				Ok(free.saturating_sub(path.len()).min(MAX_FILE_BYTES))
+				Ok((free - pending).min(MAX_FILE_BYTES))
+			}
+			None => {
+				// The path AND the name, because `stream_begin` takes both and holds both: the
+				// destination's metadata is prepared up front so a commit cannot fail on it after
+				// the whole transfer has been accepted. Whatever begin charges, this must promise.
+				let cost = pending + parts.last().map_or(0, |name| name.len());
+				if !self.room_for_an_entry() || free < cost {
+					return Err(FsError::NoSpace);
+				}
+				Ok((free - cost).min(MAX_FILE_BYTES))
 			}
 		}
 	}
@@ -322,11 +436,20 @@ impl LiberMemFs {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			// A new entry pays for its name out of the same free space.
 			None => {
-				if self.root.count() >= MAX_ENTRIES {
+				if !self.room_for_an_entry() {
 					return Err(FsError::NoSpace);
 				}
 				let name = parts.last().map_or(0, |name| name.len());
-				Ok(free.saturating_sub(name).min(MAX_FILE_BYTES))
+				// `Ok(0)` means an EMPTY FILE CAN BE CREATED HERE, and nothing weaker. With one
+				// free byte and a five-byte name it used to answer `Ok(0)`, which StorageService
+				// turns into `WritePlan::Allowed { max_len: Some(0) }` - documented as "this path
+				// may be written" - and the write then failed with `NoSpace` because the name alone
+				// did not fit. A preflight that says yes to something the next call refuses is
+				// worse than no preflight.
+				if free < name {
+					return Err(FsError::NoSpace);
+				}
+				Ok((free - name).min(MAX_FILE_BYTES))
 			}
 		}
 	}
@@ -341,6 +464,13 @@ impl LiberMemFs {
 	//
 	// Exposed because the promise is the only thing separating the two policies, and a volume
 	// that quietly stopped keeping it is indistinguishable from one that still does.
+	// Whether the volume still holds the byte total it promised.
+	//
+	// A SUM, and only a sum. A reservation held as several chunks satisfies this while no single
+	// contiguous run large enough for the next file exists, so "intact" means the arithmetic is
+	// right rather than that the next write can be served. Growing a monolithic file needs the old
+	// block and the new one at once, which no byte total can promise; see docs/LIBERMEMFS.md, and
+	// the arena recorded there as the thing that would make the word mean more than it does.
 	pub fn reservation_intact(&self) -> bool {
 		// The footprint must also be WITHIN the capacity. `try_reserve_exact` promises at least
 		// what was asked for and may give more, so a generous allocator can put the footprint over
@@ -398,12 +528,13 @@ impl LiberMemFs {
 				// `a/b` name the same thing, which is what every caller in this tree expects.
 				continue;
 			}
-			if segment == "." || segment == ".." {
-				return Err(FsError::BadName);
-			}
-			if segment.len() > MAX_NAME_BYTES {
-				return Err(FsError::TooLong);
-			}
+			// The SHARED policy, not this filesystem's own. Two writable backends were enforcing
+			// two different rules while StorageService mounted both, so an application could create
+			// `foo:bar` on the live `vol://system` and not on an installed LiberFS one - the same
+			// call answering differently depending on what happened to be underneath. `.` and `..`
+			// and non-UTF-8 were already refused here; the portable-byte check was not, and it is
+			// what `FsError::BadName` documents.
+			fscore::validate_name_segment(segment.as_bytes(), MAX_NAME_BYTES)?;
 			if count == MAX_PATH_DEPTH {
 				return Err(FsError::TooLong);
 			}
@@ -460,6 +591,18 @@ impl LiberMemFs {
 			Node::Directory(children) => Ok(children),
 			Node::File(_) => Err(FsError::NotDir),
 		}
+	}
+
+	// Whether the volume may take another entry, by BOTH limits: the count of live nodes and the
+	// bytes its directory tables hold. Two rules rather than one because they bound different
+	// things - MAX_ENTRIES bounds what exists, MAX_METADATA_BYTES bounds what was kept - and the
+	// second is the one a caller can drive without limit through fill-and-empty cycles.
+	//
+	// Reaching the metadata ceiling should not happen: `shrink_children` keeps every table within a
+	// factor of four of its contents. It is here so that "should not" is enforced rather than
+	// argued.
+	fn room_for_an_entry(&self) -> bool {
+		self.root.count() < MAX_ENTRIES && (self.metadata_bytes() as usize) < MAX_METADATA_BYTES
 	}
 
 	// Give up the whole reservation. The vector and the byte count move together and must never
@@ -615,7 +758,7 @@ impl LiberMemFs {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
 			Some(Node::File(existing)) => (existing.capacity(), existing.capacity().max(data.len()), false),
 			None => {
-				if self.root.count() >= MAX_ENTRIES {
+				if !self.room_for_an_entry() {
 					return Err(FsError::NoSpace);
 				}
 				(0, data.len(), true)
@@ -648,6 +791,22 @@ impl LiberMemFs {
 		// yourself for the memory: the regrow can fall short for exactly the allocation that is
 		// about to be thrown away.
 		let stored = self.store(parts, data, is_new);
+		// The same post-allocation check the streaming path has had, for the same reason:
+		// `try_reserve_exact` promises AT LEAST what was asked for, `footprint` counts what was
+		// actually given, and a generous allocator could leave a successful write with the volume
+		// over its own capacity. The streaming path undid its overshoot and this one computed its
+		// bound before `store` and never looked again.
+		//
+		// A new entry is undone completely - the file was not there a moment ago. In-place growth
+		// is not: the old contents are gone and putting the file back the way it was is not
+		// possible from here, so the overshoot is accepted and the volume records it rather than
+		// discarding a write that succeeded. That asymmetry is the monolithic `Vec` arguing for the
+		// chunked storage the reservation finding wants.
+		if stored.is_ok() && is_new && (self.footprint() as usize) > self.capacity {
+			let _ = self.remove(path);
+			self.resync_reservation();
+			return Err(FsError::NoSpace);
+		}
 		self.resync_reservation();
 		stored
 	}
@@ -672,19 +831,23 @@ impl LiberMemFs {
 		if parts.is_empty() {
 			return Err(FsError::IsDir);
 		}
-		match self.resolve(parts)? {
+		let is_new = match self.resolve(parts)? {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
-			Some(Node::File(_)) => {}
+			Some(Node::File(_)) => false,
 			None => {
-				if self.root.count() >= MAX_ENTRIES {
+				if !self.room_for_an_entry() {
 					return Err(FsError::NoSpace);
 				}
+				true
 			}
-		}
+		};
 		// The path counts against the volume, so opening a stream on a full one must be refused
 		// rather than quietly taking it over capacity. Nothing of the file has arrived yet; this is
 		// the entry's own cost.
-		if (self.footprint() as usize).saturating_add(path.len()) > self.capacity {
+		// The path AND the destination's name, because both are taken below and both are held for
+		// the stream's lifetime.
+		let entry_cost = path.len() + if is_new { parts.last().map_or(0, |name| name.len()) } else { 0 };
+		if (self.footprint() as usize).saturating_add(entry_cost) > self.capacity {
 			return Err(FsError::NoSpace);
 		}
 		// Release the reservation BEFORE allocating, the way the ordinary write does.
@@ -703,7 +866,29 @@ impl LiberMemFs {
 			return Err(FsError::NoSpace);
 		}
 		owned.extend_from_slice(path);
-		self.pending = Some(Pending { path: owned, data: Vec::new() });
+		// The destination's NAME, taken now rather than at commit - see `Pending::name`. It is the
+		// expensive half of the metadata (up to 255 bytes against a few dozen for a slot) and the
+		// half that is charged to the volume's capacity, so taking it here is what turns "the
+		// commit failed after accepting everything" into "the stream was refused before anything
+		// was sent".
+		//
+		// The parent's SLOT is deliberately not pre-reserved with it. A directory table is on the
+		// separate metadata budget, not the volume's capacity, and reserving one here would make a
+		// reserved volume's `reservation_intact` arithmetic count memory that budget does not -
+		// two budgets meeting in the one place they must not. `room_for_an_entry` has already said
+		// at begin that a slot is available.
+		let mut name = None;
+		if is_new {
+			let last = parts.last().copied().unwrap_or("");
+			let mut owned_name = String::new();
+			if owned_name.try_reserve_exact(last.len()).is_err() {
+				self.resync_reservation();
+				return Err(FsError::NoSpace);
+			}
+			owned_name.push_str(last);
+			name = Some(owned_name);
+		}
+		self.pending = Some(Pending { path: owned, data: Vec::new(), name, offered: None });
 		// The allocator may hand back more than was asked for, and `footprint` counts what it
 		// actually gave. A volume must not end up over its own capacity because it was given a
 		// generous answer, so the overshoot is undone here rather than merely noticed later by
@@ -784,6 +969,12 @@ impl LiberMemFs {
 	// that reads from untrusted peers.
 	pub fn stream_spare(&mut self, want: usize) -> Result<&mut [u8], FsError> {
 		let Some(pending) = self.pending.as_ref() else { return Err(FsError::Invalid) };
+		// One offer at a time. A second `stream_spare` over an open one would hand out a slice
+		// whose predecessor is still unaccounted for, and the truncation at the end could then only
+		// guess which of them the numbers described.
+		if pending.offered.is_some() {
+			return Err(FsError::Invalid);
+		}
 		let filled = pending.data.len();
 		let total = filled.saturating_add(want);
 		if total > MAX_FILE_BYTES {
@@ -812,21 +1003,39 @@ impl LiberMemFs {
 			return Err(FsError::NoSpace);
 		}
 		let pending = self.pending.as_mut().ok_or(FsError::Invalid)?;
+		pending.offered = Some(total - filled);
 		Ok(&mut pending.data[filled..])
 	}
 
 	// Keep `written` of the space handed out, discarding the rest.
-	pub fn stream_advance(&mut self, offered: usize, written: usize) {
-		if let Some(pending) = self.pending.as_mut() {
-			let keep = pending.data.len().saturating_sub(offered.saturating_sub(written.min(offered)));
-			pending.data.truncate(keep);
+	// Close the outstanding offer, keeping `written` of it.
+	//
+	// `offered` is checked against what was actually handed out rather than believed. A caller that
+	// passes a different number was describing some other offer, and truncating by it discards
+	// bytes that were already valid; a caller that closes an offer that was never opened has
+	// nothing to close. Both are refused, and the offer - if there is one - stays open.
+	pub fn stream_advance(&mut self, offered: usize, written: usize) -> Result<(), FsError> {
+		let Some(pending) = self.pending.as_mut() else { return Err(FsError::Invalid) };
+		let Some(outstanding) = pending.offered else { return Err(FsError::Invalid) };
+		if offered != outstanding || written > outstanding {
+			return Err(FsError::Invalid);
 		}
+		let keep = pending.data.len() - (outstanding - written);
+		pending.data.truncate(keep);
+		pending.offered = None;
 		self.resync_reservation();
+		Ok(())
 	}
 
 	// Store what arrived. The buffer becomes the file's own storage, so nothing is copied and the
 	// volume never holds two versions of the contents at once.
 	pub fn stream_commit(&mut self) -> Result<(), FsError> {
+		// An outstanding offer means the caller was handed a slice and never said how much of it it
+		// wrote. Committing would store the rest as the zeros `stream_spare` filled it with - bytes
+		// that were never written, in a file that reports itself complete.
+		if self.pending.as_ref().is_some_and(|p| p.offered.is_some()) {
+			return Err(FsError::Invalid);
+		}
 		let Some(pending) = self.pending.take() else { return Err(FsError::Invalid) };
 		// Adopt FIRST, resync ONCE, at the end - and the end is here, not inside the store.
 		//
@@ -842,7 +1051,7 @@ impl LiberMemFs {
 		//
 		// So the store does not resync: it adopts, the path drops when `pending` does, and the one
 		// resync happens here with the volume's footprint being exactly what it will be.
-		let stored = self.write_file_owned_unsynced(&pending.path, pending.data);
+		let stored = self.write_file_owned_unsynced_named(&pending.path, pending.data, pending.name);
 		drop(pending.path);
 		self.resync_reservation();
 		stored
@@ -867,6 +1076,10 @@ impl LiberMemFs {
 	}
 
 	fn write_file_owned_unsynced(&mut self, path: &[u8], data: Vec<u8>) -> Result<(), FsError> {
+		self.write_file_owned_unsynced_named(path, data, None)
+	}
+
+	fn write_file_owned_unsynced_named(&mut self, path: &[u8], data: Vec<u8>, prepared: Option<String>) -> Result<(), FsError> {
 		if data.len() > MAX_FILE_BYTES {
 			return Err(FsError::TooLong);
 		}
@@ -879,7 +1092,7 @@ impl LiberMemFs {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
 			Some(Node::File(existing)) => (existing.capacity(), false),
 			None => {
-				if self.root.count() >= MAX_ENTRIES {
+				if !self.room_for_an_entry() {
 					return Err(FsError::NoSpace);
 				}
 				(0, true)
@@ -904,18 +1117,22 @@ impl LiberMemFs {
 		if self.policy == Policy::Reserved && is_new {
 			self.release_reservation();
 		}
-		self.adopt(parts, data, is_new)
+		self.adopt(parts, data, is_new, prepared)
 	}
 
 	// Take ownership of `data` as the file at `parts`.
-	fn adopt(&mut self, parts: &[&str], data: Vec<u8>, is_new: bool) -> Result<(), FsError> {
+	fn adopt(&mut self, parts: &[&str], data: Vec<u8>, is_new: bool, prepared: Option<String>) -> Result<(), FsError> {
 		if !is_new {
 			// Reusing the file's existing buffer when the new contents fit, exactly as an ordinary
 			// rewrite does. Assigning the incoming vector instead would silently COMPACT the file
 			// - the same logical shrink accounting differently depending on which API the caller
 			// reached for - and the document says a file keeps its allocation until it is removed.
 			let file = self.file_mut(parts)?;
-			if data.len() <= file.capacity() {
+			// The same give-back as the ordinary rewrite: a stream that delivered nothing leaves
+			// the file holding nothing, not holding its old block.
+			if data.is_empty() {
+				*file = Vec::new();
+			} else if data.len() <= file.capacity() {
 				file.clear();
 				file.extend_from_slice(&data);
 			} else {
@@ -923,10 +1140,17 @@ impl LiberMemFs {
 			}
 			return Ok(());
 		}
-		let last = parts.last().copied().ok_or(FsError::BadName)?;
-		let mut name = String::new();
-		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
-		name.push_str(last);
+		// The name a stream prepared at `stream_begin`, or a fresh one for an ordinary write.
+		let name = match prepared {
+			Some(name) => name,
+			None => {
+				let last = parts.last().copied().ok_or(FsError::BadName)?;
+				let mut name = String::new();
+				name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
+				name.push_str(last);
+				name
+			}
+		};
 		let children = self.parent_mut(parts)?;
 		insert(children, name, Node::File(data))
 	}
@@ -942,6 +1166,17 @@ impl LiberMemFs {
 			// The reserve happens BEFORE the clear, so a refused rewrite leaves the file exactly
 			// as it was rather than truncated to nothing.
 			let file = self.file_mut(parts)?;
+			// TRUNCATION TO NOTHING GIVES THE BLOCK BACK. A capped volume otherwise keeps the
+			// quota - `allocated()` counts capacity, which is the rule that closed the
+			// grow-and-shrink hole and is worth keeping - but `vol://tmp` is exactly where a caller
+			// expects a truncate to return the space, and the empty case costs nothing to give:
+			// assigning a fresh `Vec` frees the block and cannot fail. Larger shrinks still hold
+			// their allocation, because compacting them is fallible and losing a write to it would
+			// be a worse trade.
+			if data.is_empty() {
+				*file = Vec::new();
+				return Ok(());
+			}
 			if data.len() > file.len() {
 				file.try_reserve_exact(data.len() - file.len()).map_err(|_| FsError::NoSpace)?;
 			}
@@ -986,7 +1221,14 @@ impl LiberMemFs {
 					let mut copy = String::new();
 					copy.try_reserve_exact(name.len()).map_err(|_| FsError::NoSpace)?;
 					copy.push_str(name);
-					out.push(Entry { name: copy, size: node.bytes() as u64, is_dir: node.is_dir() });
+					// A DIRECTORY REPORTS ZERO, which is what the generated `Storage` documentation
+					// says plainly and what the adapter passes straight to the client. This filled
+					// the field with `node.bytes()` - the recursive size of everything underneath -
+					// so a client reading the documented contract got a different quantity with no
+					// way to tell. An occupied-bytes figure is a fine thing to want and wants its
+					// own call.
+					let size = if node.is_dir() { 0 } else { node.bytes() as u64 };
+					out.push(Entry { name: copy, size, is_dir: node.is_dir() });
 				}
 				Ok(out)
 			}
@@ -1007,7 +1249,7 @@ impl LiberMemFs {
 		}
 		// A directory stores nothing but still costs its name, and that name is memory the caller
 		// asked for.
-		if self.root.count() >= MAX_ENTRIES || self.footprint() as usize + name.len() > self.capacity {
+		if !self.room_for_an_entry() || self.footprint() as usize + name.len() > self.capacity {
 			return Err(FsError::NoSpace);
 		}
 		if self.policy == Policy::Reserved {

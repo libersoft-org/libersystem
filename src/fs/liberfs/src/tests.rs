@@ -89,7 +89,7 @@ fn one_good_slot_beside_one_unknown_slot_is_not_a_writable_mount() {
 	// enough to destroy a newer, perfectly consistent generation.
 	//
 	// Two commits, so the two slots hold different generations and both are valid.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"one.txt", b"first").unwrap();
 	fs.write_file(b"two.txt", b"second").unwrap();
 	let good = fs.into_device();
@@ -129,7 +129,7 @@ fn a_mount_failure_says_which_failure_it_was() {
 	// Ours, and from a build this one cannot read: the magic matches and the version does not.
 	// `into_device` rather than a clone: formatting a COPY leaves the original blank, and the test
 	// then measures an unformatted disk while claiming to measure an unsupported one.
-	let mut dev = LiberFs::format(MemDevice::new(64), 64).expect("format").into_device();
+	let mut dev = LiberFs::format_scratch(MemDevice::new(64), 64).expect("format").into_device();
 	let mut block = vec![0u8; BLOCK_SIZE];
 	assert!(dev.read_block(0, &mut block), "read the superblock back");
 	let bumped = u32::from_le_bytes(block[SB_VERSION_OFF..SB_VERSION_OFF + 4].try_into().unwrap()) + 1;
@@ -142,7 +142,7 @@ fn a_mount_failure_says_which_failure_it_was() {
 #[test]
 fn format_then_mount_is_empty() {
 	let dev = MemDevice::new(NBLOCKS);
-	let fs = LiberFs::format(dev, NBLOCKS).unwrap();
+	let fs = LiberFs::format_scratch(dev, NBLOCKS).unwrap();
 	let dev = fs.into_device();
 	let mut fs = LiberFs::mount(dev).unwrap();
 	assert!(fs.list().unwrap().is_empty());
@@ -157,7 +157,7 @@ fn mount_rejects_unformatted_device() {
 
 #[test]
 fn write_then_read_round_trips() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"hello.txt", b"Hello, world!").unwrap();
 	assert_eq!(fs.read_file(b"hello.txt").unwrap(), b"Hello, world!");
 	let listing = fs.list().unwrap();
@@ -168,7 +168,7 @@ fn write_then_read_round_trips() {
 
 #[test]
 fn data_survives_a_remount() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"motd.txt", b"persist me").unwrap();
 	fs.write_file(b"a", b"first").unwrap();
 	let dev = fs.into_device();
@@ -182,7 +182,7 @@ fn data_survives_a_remount() {
 
 #[test]
 fn overwrite_replaces_contents() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"short").unwrap();
 	fs.write_file(b"f", b"a much longer replacement payload").unwrap();
 	assert_eq!(fs.read_file(b"f").unwrap(), b"a much longer replacement payload");
@@ -192,7 +192,7 @@ fn overwrite_replaces_contents() {
 
 #[test]
 fn remove_deletes_and_frees() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"gone.txt", b"temporary").unwrap();
 	fs.remove(b"gone.txt").unwrap();
 	assert_eq!(fs.lookup(b"gone.txt").unwrap(), None);
@@ -210,7 +210,7 @@ fn remove_deletes_and_frees() {
 
 #[test]
 fn multi_block_file_round_trips() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let big: Vec<u8> = (0..(BLOCK_SIZE * 3 + 7)).map(|i| (i % 251) as u8).collect();
 	fs.write_file(b"big.bin", &big).unwrap();
 	assert_eq!(fs.read_file(b"big.bin").unwrap(), big);
@@ -218,7 +218,7 @@ fn multi_block_file_round_trips() {
 
 #[test]
 fn empty_file_round_trips() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"empty", b"").unwrap();
 	assert_eq!(fs.read_file(b"empty").unwrap(), b"");
 	assert_eq!(fs.list().unwrap()[0].1, 0);
@@ -226,7 +226,7 @@ fn empty_file_round_trips() {
 
 #[test]
 fn rejects_too_long_a_name() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let long = vec![b'x'; NAME_MAX + 1];
 	assert_eq!(fs.write_file(&long, b"data"), Err(FsError::TooLong));
 }
@@ -235,14 +235,14 @@ fn rejects_too_long_a_name() {
 fn reports_out_of_space() {
 	// a tiny filesystem: too few data blocks for an oversized file.
 	let small: u64 = 6;
-	let mut fs = LiberFs::format(MemDevice::new(small), small).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(small), small).unwrap();
 	let payload = vec![b'z'; BLOCK_SIZE * 5];
 	assert_eq!(fs.write_file(b"toobig", &payload), Err(FsError::NoSpace));
 }
 
 #[test]
 fn many_small_files_fill_the_directory() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	for i in 0..10u8 {
 		let name = [b'f', b'0' + i];
 		fs.write_file(&name, b"x").unwrap();
@@ -292,7 +292,7 @@ impl BlockDevice for SparseDevice {
 
 #[test]
 fn nested_directories_resolve_and_list() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"a/b/c").unwrap();
 	fs.write_file(b"a/b/c/file.txt", b"deep").unwrap();
 	assert_eq!(fs.read_file(b"a/b/c/file.txt").unwrap(), b"deep");
@@ -316,7 +316,7 @@ fn nested_directories_resolve_and_list() {
 
 #[test]
 fn rmdir_removes_an_empty_directory_only() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"empty").unwrap();
 	fs.mkdir(b"full").unwrap();
 	fs.write_file(b"full/f", b"x").unwrap();
@@ -332,7 +332,7 @@ fn rmdir_removes_an_empty_directory_only() {
 
 #[test]
 fn write_creates_missing_parents() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	// no explicit mkdir: write auto-creates the parent chain.
 	fs.write_file(b"docs/notes/today.txt", b"hello").unwrap();
 	assert_eq!(fs.read_file(b"docs/notes/today.txt").unwrap(), b"hello");
@@ -341,7 +341,7 @@ fn write_creates_missing_parents() {
 
 #[test]
 fn nested_paths_survive_a_remount() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"etc/motd", b"welcome").unwrap();
 	fs.mkdir(b"var/log").unwrap();
 	let dev = fs.into_device();
@@ -352,7 +352,7 @@ fn nested_paths_survive_a_remount() {
 
 #[test]
 fn remove_rejects_a_nonempty_directory() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"dir/child", b"x").unwrap();
 	assert_eq!(fs.remove(b"dir"), Err(FsError::NotEmpty));
 	// removing the child then the now-empty directory works.
@@ -363,7 +363,7 @@ fn remove_rejects_a_nonempty_directory() {
 
 #[test]
 fn rejects_dot_and_dot_dot_segments() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	assert_eq!(fs.write_file(b"a/../b", b"x"), Err(FsError::BadName));
 	assert_eq!(fs.read_file(b"./x"), Err(FsError::BadName));
 	assert_eq!(fs.mkdir(b"x//y"), Err(FsError::BadName));
@@ -374,7 +374,7 @@ fn many_files_across_multiple_inode_blocks() {
 	// a volume holding far more files than one inode-tree leaf, so the inode B+tree grows
 	// past a single node.
 	let nblocks: u64 = 400;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	let count = 100u32;
 	for i in 0..count {
 		let name = format!("file{i}");
@@ -392,7 +392,7 @@ fn a_large_volume_formats_and_round_trips() {
 	// the free map is derived, so it scales to a large volume for free; a sparse device
 	// lets us format such a volume without allocating it whole.
 	let nblocks: u64 = 40_000;
-	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(SparseDevice::new(nblocks), nblocks).unwrap();
 	fs.write_file(b"f", b"on a big volume").unwrap();
 	assert_eq!(fs.read_file(b"f").unwrap(), b"on a big volume");
 	let dev = fs.into_device();
@@ -404,7 +404,7 @@ fn a_large_volume_formats_and_round_trips() {
 
 #[test]
 fn write_at_in_the_middle_keeps_the_rest() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"AAAAAAAAAA").unwrap();
 	fs.write_at(b"f", 3, b"BBB").unwrap();
 	assert_eq!(fs.read_file(b"f").unwrap(), b"AAABBBAAAA");
@@ -412,7 +412,7 @@ fn write_at_in_the_middle_keeps_the_rest() {
 
 #[test]
 fn write_at_can_extend_the_file() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"abc").unwrap();
 	fs.write_at(b"f", 3, b"defgh").unwrap();
 	assert_eq!(fs.read_file(b"f").unwrap(), b"abcdefgh");
@@ -421,14 +421,14 @@ fn write_at_can_extend_the_file() {
 
 #[test]
 fn write_at_creates_the_file() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_at(b"dir/new.txt", 0, b"fresh").unwrap();
 	assert_eq!(fs.read_file(b"dir/new.txt").unwrap(), b"fresh");
 }
 
 #[test]
 fn write_at_past_the_end_leaves_a_zero_hole() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"abc").unwrap();
 	// a gap larger than a block, so the skipped blocks are never allocated.
 	let off = (BLOCK_SIZE * 2 + 10) as u64;
@@ -446,7 +446,7 @@ fn write_at_past_the_end_leaves_a_zero_hole() {
 
 #[test]
 fn read_at_clamps_to_the_end() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"0123456789").unwrap();
 	assert_eq!(fs.read_at(b"f", 4, 3).unwrap(), b"456");
 	assert_eq!(fs.read_at(b"f", 8, 100).unwrap(), b"89");
@@ -455,7 +455,7 @@ fn read_at_clamps_to_the_end() {
 
 #[test]
 fn append_grows_across_block_boundaries() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let chunk = vec![b'x'; BLOCK_SIZE - 3];
 	fs.append(b"log", &chunk).unwrap();
 	fs.append(b"log", b"YYYYYY").unwrap();
@@ -466,7 +466,7 @@ fn append_grows_across_block_boundaries() {
 
 #[test]
 fn truncate_shrinks_and_grows() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let big: Vec<u8> = (0..BLOCK_SIZE * 3).map(|i| (i % 251) as u8).collect();
 	fs.write_file(b"f", &big).unwrap();
 	fs.truncate(b"f", 5).unwrap();
@@ -482,7 +482,7 @@ fn truncate_shrinks_and_grows() {
 #[test]
 fn truncate_frees_blocks_for_reuse() {
 	// a small volume: if the truncated tail were not freed it would run out of space.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let big: Vec<u8> = vec![7u8; BLOCK_SIZE * 8];
 	for _ in 0..30 {
 		fs.write_file(b"scratch", &big).unwrap();
@@ -495,7 +495,7 @@ fn truncate_frees_blocks_for_reuse() {
 
 #[test]
 fn stat_reports_type_size_and_timestamps() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.set_clock(100);
 	fs.write_file(b"f", b"hello").unwrap();
 	let st = fs.stat(b"f").unwrap();
@@ -518,7 +518,7 @@ fn stat_reports_type_size_and_timestamps() {
 
 #[test]
 fn rename_moves_a_file() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"payload").unwrap();
 	fs.rename(b"a.txt", b"sub/b.txt").unwrap();
 	assert_eq!(fs.lookup(b"a.txt").unwrap(), None);
@@ -527,7 +527,7 @@ fn rename_moves_a_file() {
 
 #[test]
 fn rename_replaces_an_existing_file() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"src", b"new").unwrap();
 	fs.write_file(b"dst", b"old").unwrap();
 	fs.rename(b"src", b"dst").unwrap();
@@ -542,7 +542,7 @@ fn rename_replaces_an_existing_file() {
 
 #[test]
 fn rename_moves_a_directory_subtree() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"old/inner/file", b"deep").unwrap();
 	fs.rename(b"old", b"new").unwrap();
 	assert_eq!(fs.lookup(b"old").unwrap(), None);
@@ -551,7 +551,7 @@ fn rename_moves_a_directory_subtree() {
 
 #[test]
 fn rename_rejects_a_directory_into_its_own_subtree() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"a/b/c").unwrap();
 	assert_eq!(fs.rename(b"a", b"a/b/inside"), Err(FsError::Invalid));
 	// the tree is untouched.
@@ -560,7 +560,7 @@ fn rename_rejects_a_directory_into_its_own_subtree() {
 
 #[test]
 fn rename_rejects_overwriting_a_nonempty_directory() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"src", b"x").unwrap();
 	fs.write_file(b"dst/keep", b"y").unwrap();
 	assert_eq!(fs.rename(b"src", b"dst"), Err(FsError::NotEmpty));
@@ -588,7 +588,7 @@ fn noise(n: usize) -> Vec<u8> {
 
 #[test]
 fn a_flipped_byte_is_caught_on_read() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"the quick brown fox").unwrap();
 	let mut dev = fs.into_device();
 	corrupt_bytes(&mut dev, b"the quick brown fox");
@@ -602,7 +602,7 @@ fn a_flipped_byte_in_an_extent_file_is_caught() {
 	// a multi-block file keeps a per-block CRC32C in its extent's checksum block;
 	// flipping a data byte far into the run is still caught on read.
 	let nblocks: u64 = 128;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	let size = BLOCK_SIZE * 6;
 	let marker = b"a needle near the end";
 	// incompressible payload so the run stays raw: a compressed extent would not hold the
@@ -619,7 +619,7 @@ fn a_flipped_byte_in_an_extent_file_is_caught() {
 
 #[test]
 fn fsck_reports_a_checksum_failure() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"integrity matters here").unwrap();
 	let mut dev = fs.into_device();
 	corrupt_bytes(&mut dev, b"integrity matters here");
@@ -632,7 +632,7 @@ fn fsck_reports_a_checksum_failure() {
 
 #[test]
 fn a_clean_file_survives_a_remount_with_checksums() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let payload: Vec<u8> = (0..(BLOCK_SIZE * 2 + 17)).map(|i| (i % 251) as u8).collect();
 	fs.write_file(b"data.bin", &payload).unwrap();
 	let dev = fs.into_device();
@@ -656,7 +656,7 @@ fn newest_super_slot(dev: &MemDevice) -> u32 {
 
 #[test]
 fn a_torn_commit_keeps_the_previous_file_whole() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"version one").unwrap();
 	fs.write_file(b"f", b"version two").unwrap();
 	let dev = fs.into_device();
@@ -678,7 +678,7 @@ fn a_torn_commit_keeps_the_previous_file_whole() {
 
 #[test]
 fn a_previous_root_mounts_read_only_as_a_snapshot() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"version one").unwrap();
 	fs.write_file(b"f", b"version two").unwrap();
 	let dev = fs.into_device();
@@ -695,7 +695,7 @@ fn a_previous_root_mounts_read_only_as_a_snapshot() {
 
 #[test]
 fn a_freshly_formatted_volume_has_no_snapshot() {
-	let fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let dev = fs.into_device();
 	// only generation 0 has ever been written: there is no older root to mount.
 	assert!(LiberFs::mount_snapshot(dev).is_none());
@@ -706,7 +706,7 @@ fn a_freshly_formatted_volume_has_no_snapshot() {
 #[test]
 fn a_long_name_round_trips() {
 	// a 255-byte name fills the whole record name field with no terminator.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let name = vec![b'n'; NAME_MAX];
 	fs.write_file(&name, b"long").unwrap();
 	assert_eq!(fs.read_file(&name).unwrap(), b"long");
@@ -719,9 +719,15 @@ fn a_long_name_round_trips() {
 
 #[test]
 fn rejects_unportable_name_characters() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	// the portable-name policy rejects the punctuation and control
 	// bytes, on top of the path separator and NUL the parser already forbids.
+	//
+	// The SAME list as LiberMemFS's `both_writable_backends_refuse_the_same_names`, deliberately:
+	// the policy is one function in `fs/core` now, and the thing worth pinning per backend is that
+	// each one reaches it. Two writable filesystems answering differently is what StorageService
+	// turned into the same application call succeeding on `vol://system` and failing on an
+	// installed volume.
 	let bad: [&[u8]; 10] = [b"a\\b", b"a:b", b"a*b", b"a?b", b"a<b", b"a>b", b"a|b", b"a\"b", b"a\x01b", b"a\x7fb"];
 	for name in bad {
 		assert_eq!(fs.write_file(name, b"x"), Err(FsError::BadName));
@@ -739,7 +745,7 @@ fn large_contiguous_file_uses_few_extents() {
 	// a big file written in one shot lands in a contiguous run of data blocks, so the
 	// whole thing collapses into a couple of extents instead of a pointer per block.
 	let nblocks: u64 = 4096;
-	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(SparseDevice::new(nblocks), nblocks).unwrap();
 	// 1501 blocks: past one extent's 1024-block (4 MB) checksum cap, so it needs two.
 	let size = BLOCK_SIZE * 1500 + 321;
 	let big: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
@@ -762,7 +768,7 @@ fn sparse_file_occupies_only_written_blocks() {
 	// a file can be far larger logically than the device is physically: writing two
 	// spans far apart allocates only those blocks, never the hole between them.
 	let nblocks: u64 = 4096;
-	let mut fs = LiberFs::format(SparseDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(SparseDevice::new(nblocks), nblocks).unwrap();
 	fs.write_at(b"sparse", 0, b"start").unwrap();
 	// half a million blocks past the start - the gap alone dwarfs the whole device.
 	let far = 500_000u64 * BLOCK_SIZE as u64;
@@ -789,7 +795,7 @@ fn a_directory_scales_to_thousands_of_entries() {
 	// so a couple of thousand files alone push it past two levels and exercise the
 	// internal-node split.
 	let nblocks: u64 = 12_000;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	let count = 2000u32;
 	for i in 0..count {
 		let name = format!("file{i:05}");
@@ -830,7 +836,7 @@ fn inodes_are_allocated_dynamically_without_a_fixed_cap() {
 	// a small volume creates as many files as its data blocks allow, not a preallocated
 	// inode count: inodes come from the B+tree on demand, so the only limit is space.
 	let nblocks: u64 = 256;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	let mut made = 0u32;
 	loop {
 		let name = format!("f{made}");
@@ -855,7 +861,7 @@ fn inodes_are_allocated_dynamically_without_a_fixed_cap() {
 
 #[test]
 fn a_named_snapshot_reads_an_earlier_state() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"version one").unwrap();
 	fs.create_snapshot(b"before").unwrap();
 	fs.write_file(b"f", b"version two").unwrap();
@@ -879,7 +885,7 @@ fn a_named_snapshot_reads_an_earlier_state() {
 
 #[test]
 fn snapshots_are_listed_and_survive_a_remount() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"v1").unwrap();
 	fs.create_snapshot(b"first").unwrap();
 	fs.write_file(b"f", b"v2").unwrap();
@@ -903,7 +909,7 @@ fn snapshots_are_listed_and_survive_a_remount() {
 
 #[test]
 fn a_snapshot_keeps_a_file_the_live_tree_deleted() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep.txt", b"original").unwrap();
 	fs.create_snapshot(b"backup").unwrap();
 	fs.remove(b"keep.txt").unwrap();
@@ -920,7 +926,7 @@ fn a_snapshot_keeps_a_file_the_live_tree_deleted() {
 
 #[test]
 fn the_free_map_honors_every_pinned_generation() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	// three named snapshots, each pinning a different version of the same file.
 	fs.write_file(b"f", b"one").unwrap();
 	fs.create_snapshot(b"s1").unwrap();
@@ -969,7 +975,7 @@ fn deleting_a_snapshot_releases_its_pinned_blocks() {
 
 	// pin a multi-block file in a snapshot, delete it from the live tree, then roll the
 	// previous-generation retention forward so ONLY the named snapshot pins its blocks.
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.write_file(b"big", &big).unwrap();
 	fs.create_snapshot(b"snap").unwrap();
 	fs.remove(b"big").unwrap();
@@ -979,7 +985,7 @@ fn deleting_a_snapshot_releases_its_pinned_blocks() {
 
 	// the same sequence, but delete the snapshot first: big's blocks are reclaimed, so
 	// the volume now accepts strictly more fill files.
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.write_file(b"big", &big).unwrap();
 	fs.create_snapshot(b"snap").unwrap();
 	fs.remove(b"big").unwrap();
@@ -993,7 +999,7 @@ fn deleting_a_snapshot_releases_its_pinned_blocks() {
 
 #[test]
 fn snapshot_name_rules_are_enforced() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"x").unwrap();
 	// an empty name is rejected.
 	assert_eq!(fs.create_snapshot(b""), Err(FsError::BadName));
@@ -1131,7 +1137,7 @@ fn compression_is_off_by_default_and_togglable() {
 	let compressible: Vec<u8> = b"toggle me on and off. ".iter().cycle().take(BLOCK_SIZE * 4).copied().collect();
 
 	// the default volume never compresses: the run stays raw.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	assert!(!fs.compression());
 	fs.write_file(b"raw", &compressible).unwrap();
 	let num = fs.lookup(b"raw").unwrap().unwrap();
@@ -1172,7 +1178,7 @@ fn the_volume_identity_survives_a_remount() {
 
 #[test]
 fn a_volume_with_foreign_feature_flags_does_not_mount() {
-	let fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let mut dev = fs.into_device();
 	// flip a feature bit in slot 0 and refresh its self-CRC: the flags are alien now,
 	// so the mount must reject the volume rather than mis-parse its layout.
@@ -1189,7 +1195,7 @@ fn a_volume_with_foreign_feature_flags_does_not_mount() {
 
 #[test]
 fn names_must_be_utf8() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	// a bare continuation byte is not UTF-8: rejected, so one file has one name.
 	assert_eq!(fs.write_file(b"bad\x80name", b"x"), Err(FsError::BadName));
 	// real multi-byte UTF-8 works.
@@ -1200,7 +1206,7 @@ fn names_must_be_utf8() {
 
 #[test]
 fn fsck_names_a_damaged_file_in_a_subdirectory() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"docs/inner/report.txt", b"the full path should be named").unwrap();
 	fs.write_file(b"clean.txt", b"untouched").unwrap();
 	let mut dev = fs.into_device();
@@ -1213,7 +1219,7 @@ fn fsck_names_a_damaged_file_in_a_subdirectory() {
 
 #[test]
 fn restore_from_a_snapshot_heals_a_damaged_file() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"version one - the good copy").unwrap();
 	fs.create_snapshot(b"backup").unwrap();
 	// the rewrite lands on fresh blocks, so the snapshot's copy stays independent.
@@ -1245,7 +1251,7 @@ fn restore_from_a_snapshot_heals_a_damaged_file() {
 fn snapshots_scale_past_a_single_table_block() {
 	// more snapshots than one chain block holds (48): the chained table has no cap.
 	let nblocks: u64 = 512;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.write_file(b"f", b"seed").unwrap();
 	for i in 0..60u32 {
 		let name = format!("snap{i:02}");
@@ -1302,7 +1308,7 @@ impl BlockDevice for FlushLogDevice {
 #[test]
 fn a_commit_brackets_the_superblock_write_with_flushes() {
 	let dev = FlushLogDevice { inner: MemDevice::new(NBLOCKS), log: Vec::new() };
-	let fs = LiberFs::format(dev, NBLOCKS).unwrap();
+	let fs = LiberFs::format_scratch(dev, NBLOCKS).unwrap();
 	// drop the format's own events, then observe one whole transaction (a mount only
 	// reads, so the log stays empty until the write).
 	let mut dev = fs.into_device();
@@ -1330,7 +1336,7 @@ fn a_commit_brackets_the_superblock_write_with_flushes() {
 
 #[test]
 fn a_corrupt_snapshot_table_degrades_the_mount_to_read_only() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"pinned").unwrap();
 	fs.create_snapshot(b"keep").unwrap();
 	let mut dev = fs.into_device();
@@ -1352,7 +1358,7 @@ fn a_corrupt_snapshot_table_degrades_the_mount_to_read_only() {
 
 #[test]
 fn snapshot_mounts_refuse_writes() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"one").unwrap();
 	fs.create_snapshot(b"pin").unwrap();
 	fs.write_file(b"f", b"two").unwrap();
@@ -1503,7 +1509,7 @@ fn the_incremental_free_map_matches_a_full_rederivation() {
 #[test]
 fn a_whole_file_write_lands_contiguously() {
 	let nblocks: u64 = 512;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	// checker the pool: many small files, then remove every other one.
 	for i in 0..24u32 {
 		let name = format!("frag{i}");
@@ -1557,7 +1563,7 @@ fn bench_scaling() {
 	// a 1 GB volume, sparse so only written blocks cost test memory.
 	let nblocks: u64 = 262_144;
 	let dev = CountingDevice { inner: SparseDevice::new(nblocks), reads: 0, writes: 0 };
-	let mut fs = LiberFs::format(dev, nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(dev, nblocks).unwrap();
 
 	// one 64 MB incompressible file.
 	let big = noise(64 * 1024 * 1024);
@@ -1641,7 +1647,7 @@ fn colliding_hashes_stay_searchable_and_never_straddle_a_split() {
 #[test]
 fn a_many_extent_file_round_trips_through_the_spill_chain() {
 	let nblocks: u64 = 512;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	// eight sparse spans, far enough apart that each is its own extent: twice the
 	// inline capacity, so the map spills.
 	let span = |i: u64| i * 16 * BLOCK_SIZE as u64;
@@ -1730,7 +1736,7 @@ impl BlockDevice for SwitchableCorruptDevice {
 fn fsck_verifies_the_disk_not_the_caches() {
 	let target = std::rc::Rc::new(core::cell::Cell::new(0u64));
 	let dev = SwitchableCorruptDevice { inner: MemDevice::new(512), target: target.clone() };
-	let mut fs = LiberFs::format(dev, 512).unwrap();
+	let mut fs = LiberFs::format_scratch(dev, 512).unwrap();
 	// a file with a spill chain (more extents than fit inline), then warm the inode
 	// cache by reading it back.
 	let span = |i: u64| i * 16 * BLOCK_SIZE as u64;
@@ -1927,7 +1933,7 @@ fn an_insane_pool_size_in_the_superblock_is_refused() {
 	// a checksummed superblock can still lie about the pool: a claim below the fixed
 	// layout is rejected outright, one past the device fails the mount's probe of the
 	// last claimed block - either way None, never a panic or an absurd allocation.
-	let fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let mut dev = fs.into_device();
 	forge_superblock(&mut dev, 0, |sb| sb[SB_NUM_BLOCKS_OFF..SB_NUM_BLOCKS_OFF + 8].copy_from_slice(&0u64.to_le_bytes()));
 	assert!(LiberFs::mount(dev.clone()).is_err());
@@ -1937,7 +1943,7 @@ fn an_insane_pool_size_in_the_superblock_is_refused() {
 
 #[test]
 fn a_corrupt_node_count_cannot_panic_the_mount() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"payload").unwrap();
 	let root = fs.inode_root;
 	let mut dev = fs.into_device();
@@ -1952,7 +1958,7 @@ fn a_corrupt_node_count_cannot_panic_the_mount() {
 
 #[test]
 fn a_checksummed_but_insane_node_count_cannot_panic_a_lookup() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"payload").unwrap();
 	let root = fs.inode_root;
 	let mut dev = fs.into_device();
@@ -1972,7 +1978,7 @@ fn a_checksummed_but_insane_node_count_cannot_panic_a_lookup() {
 
 #[test]
 fn a_looped_snapshot_chain_cannot_hang_the_mount() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep.txt", b"pinned").unwrap();
 	fs.create_snapshot(b"snap").unwrap();
 	let snap_root = fs.snap_root;
@@ -2085,7 +2091,7 @@ fn a_lying_compression_header_cannot_allocate_unbounded_memory() {
 
 #[test]
 fn a_write_past_the_addressable_end_is_refused() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	assert_eq!(fs.write_at(b"f", u64::MAX - 2, b"abc"), Err(FsError::Invalid));
 	// the failed transaction rolled back whole: not even the file was created.
 	assert_eq!(fs.lookup(b"f").unwrap(), None);
@@ -2093,7 +2099,7 @@ fn a_write_past_the_addressable_end_is_refused() {
 
 #[test]
 fn fsck_reports_metadata_damage_instead_of_dying() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"docs").unwrap();
 	fs.write_file(b"docs/a.txt", b"payload").unwrap();
 	let root = fs.inode_root;
@@ -2201,7 +2207,7 @@ fn a_forged_spill_count_is_refused_rather_than_trimmed() {
 	// Both directions of impossible are covered: more than fits in a block, and more than
 	// the inode says is still missing.
 	for count in [u32::MAX, (EXTENTS_PER_BLOCK + 1) as u32, 3] {
-		let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+		let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 		write_spilled_file(&mut fs);
 		let mut dev = fs.into_device();
 		forge_spill_count(&mut dev, count);
@@ -2221,7 +2227,7 @@ fn a_forged_spill_count_is_refused_rather_than_trimmed() {
 fn an_honest_spill_count_still_reads() {
 	// the other side of the refusal above: the count `flush_extents` actually writes is
 	// left alone, so re-stamping it changes nothing and the file reads back whole.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	let expected = write_spilled_file(&mut fs);
 	let mut dev = fs.into_device();
 	forge_spill_count(&mut dev, 2);
@@ -2232,19 +2238,23 @@ fn an_honest_spill_count_still_reads() {
 
 #[test]
 fn a_sparse_size_past_the_pool_cannot_demand_the_moon() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
-	// a legitimate sparse file sized past the pool's byte count: a whole-file read
-	// could neither allocate nor fill the buffer, so it is refused - while an
-	// explicit-length read of the written range still works.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// a LEGITIMATE sparse file sized past the pool's byte count: a whole-file read could neither
+	// allocate nor fill the buffer, so it is refused - while an explicit-length read of the written
+	// range still works.
+	//
+	// The refusal says TooLarge rather than Corrupt, which is the difference between "ask for a
+	// range" and "this volume is damaged". The test itself calls the file legitimate in the line
+	// above, and then asserted the medium was inconsistent about it.
 	let past_pool = NBLOCKS * BLOCK_SIZE as u64 + 40_000;
 	fs.write_at(b"sparse.bin", past_pool, b"tail").unwrap();
-	assert_eq!(fs.read_file(b"sparse.bin"), Err(FsError::Corrupt));
+	assert_eq!(fs.read_file(b"sparse.bin"), Err(FsError::TooLarge));
 	assert_eq!(fs.read_at(b"sparse.bin", past_pool, 4).unwrap(), b"tail");
 }
 
 #[test]
 fn a_looped_namespace_cannot_hang_the_walks() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"a/b").unwrap();
 	fs.write_file(b"a/b/f.txt", b"payload").unwrap();
 	// forge a namespace cycle through the crate's own machinery: an entry in a/b
@@ -2262,7 +2272,7 @@ fn a_looped_namespace_cannot_hang_the_walks() {
 #[test]
 fn a_pathologically_deep_tree_is_refused_not_overflowed() {
 	let pool = 256u64;
-	let mut fs = LiberFs::format(MemDevice::new(pool), pool).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(pool), pool).unwrap();
 	fs.write_file(b"a.txt", b"payload").unwrap();
 	let (real_root, real_crc) = (fs.inode_root, fs.inode_root_crc);
 	let mut dev = fs.into_device();
@@ -2293,7 +2303,7 @@ fn a_pathologically_deep_tree_is_refused_not_overflowed() {
 
 #[test]
 fn extent_fields_near_the_address_ceiling_cannot_overflow() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"payload").unwrap();
 	let mut dev = fs.into_device();
 	// forge the file's first inline extent to sit at the address ceiling: every
@@ -2318,7 +2328,7 @@ fn extent_fields_near_the_address_ceiling_cannot_overflow() {
 
 #[test]
 fn a_broken_spill_chain_degrades_the_mount_not_the_volume() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	// the fragmented file first, so it takes inode 1 - the record the forge helper
 	// targets; the healthy file follows as inode 2.
 	write_spilled_file(&mut fs);
@@ -2347,7 +2357,7 @@ fn a_broken_spill_chain_degrades_the_mount_not_the_volume() {
 
 #[test]
 fn snapshot_names_must_be_utf8() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f", b"x").unwrap();
 	// the on-disk snapshot record is specified as UTF-8, like file names: byte soup
 	// is refused at the crate boundary, not left for a foreign driver to choke on.
@@ -2362,7 +2372,7 @@ fn snapshot_names_must_be_utf8() {
 
 #[test]
 fn a_dangling_entry_is_reported_listable_around_and_removable() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"healthy.txt", b"ok").unwrap();
 	fs.write_file(b"ghost.txt", b"gone").unwrap();
 	let num = fs.lookup(b"ghost.txt").unwrap().unwrap();
@@ -2489,7 +2499,7 @@ fn one_byte_at_the_last_addressable_offset() {
 	//
 	// The existing ceiling test uses `u64::MAX - 2` with three bytes, so the FIRST guard
 	// refuses it and none of this arithmetic is ever reached.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_at(b"top.bin", u64::MAX - 1, b"Z").unwrap();
 	assert_eq!(fs.read_at(b"top.bin", u64::MAX - 1, 1).unwrap(), b"Z");
 	// the rest of the file is a hole, and in particular the byte did not wrap to zero.
@@ -2504,7 +2514,7 @@ fn a_rolled_back_compression_change_does_not_survive_in_memory() {
 	// record did not carry it - so a commit that failed at its first barrier told the
 	// caller `Io`, left the disk without the change, and left the filesystem in memory
 	// reporting it as made. The next unrelated commit then wrote it to the superblock.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep.txt", b"payload").unwrap();
 	assert!(!fs.compress, "this volume starts uncompressed");
 	let dev = FailOneFlushDevice { inner: fs.into_device(), fail_next: false };
@@ -2545,7 +2555,7 @@ impl BlockDevice for FailFlushDevice {
 
 #[test]
 fn a_failed_durability_flush_adopts_the_commit_read_only() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"old.txt", b"committed").unwrap();
 	let dev = FailFlushDevice { inner: fs.into_device(), sb_written: false };
 	let mut fs = LiberFs::mount(dev).unwrap();
@@ -2623,7 +2633,7 @@ fn crc_fixpoint(block: &mut [u8], off: usize) {
 
 #[test]
 fn a_crc_consistent_snapshot_chain_cycle_terminates() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep.txt", b"pinned").unwrap();
 	fs.create_snapshot(b"snap").unwrap();
 	let snap_root = fs.snap_root;
@@ -2650,7 +2660,7 @@ fn a_crc_consistent_snapshot_chain_cycle_terminates() {
 
 #[test]
 fn a_crc_consistent_spill_chain_cycle_terminates() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	write_spilled_file(&mut fs);
 	let mut dev = fs.into_device();
 
@@ -2682,7 +2692,7 @@ fn a_crc_consistent_spill_chain_cycle_terminates() {
 fn an_out_of_pool_pointer_reads_as_damage_not_foreign_bytes() {
 	// a 64-block pool on a 128-block device: the blocks past the pool stand in for
 	// another partition on a shared disk.
-	let mut fs = LiberFs::format(MemDevice::new(128), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(128), NBLOCKS).unwrap();
 	fs.write_file(b"f.bin", &noise(BLOCK_SIZE)).unwrap();
 	let mut dev = fs.into_device();
 
@@ -2744,7 +2754,7 @@ fn a_named_snapshot_mount_does_not_answer_from_the_live_generation() {
 	// It was latent only because nothing populated them between the mount and the swap;
 	// reading a single inode during the mount was enough to make the snapshot resolve
 	// every path through the LIVE root directory.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep.txt", b"original").unwrap();
 	fs.create_snapshot(b"backup").unwrap();
 	fs.remove(b"keep.txt").unwrap();
@@ -2791,7 +2801,7 @@ fn a_listing_does_not_report_an_unreadable_entry_as_gone() {
 	// that: the disk did not answer, so nothing is known about the entry, and omitting it
 	// says the file is GONE. A backup or sync tool downstream reads that as a deletion to
 	// propagate, and one transient read deletes the file at the other end.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"d").unwrap();
 	fs.write_file(b"d/keep.txt", b"payload").unwrap();
 	let dev = fs.into_device();
@@ -2820,7 +2830,7 @@ fn fsck_reports_shapes_no_checksum_can_object_to() {
 	// of key order, an extent map that overlaps itself, a spill chain shorter than the
 	// count it serves, an inode no name reaches - every one of them lives in blocks whose
 	// checksums are perfect.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"one").unwrap();
 	fs.mkdir(b"d").unwrap();
 	fs.write_file(b"d/b.txt", b"two").unwrap();
@@ -2854,7 +2864,7 @@ fn fsck_finds_a_record_routing_will_never_reach() {
 	//
 	// Two records with known hashes, a separator between them, and both put on the wrong
 	// side of it.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"d").unwrap();
 	fs.write_file(b"d/aaa", b"one").unwrap();
 	fs.write_file(b"d/zzz", b"two").unwrap();
@@ -2916,7 +2926,7 @@ fn fsck_checks_directory_trees_as_structures() {
 	// read. A truncated leaf therefore produced a directory that lists part of itself and
 	// a `lookup` that cannot find an entry which is on the medium - with `fsck` reporting
 	// no structural cause for any of it.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"d").unwrap();
 	for n in [b"a.txt".as_slice(), b"b.txt".as_slice(), b"c.txt".as_slice()] {
 		let mut path = b"d/".to_vec();
@@ -2962,7 +2972,7 @@ fn fsck_checks_directory_trees_as_structures() {
 fn fsck_reports_an_extent_map_that_overlaps_itself() {
 	// two runs of one file covering the same logical block. Each is individually
 	// possible - in the pool, right shape - and together they are not.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f.bin", &noise(BLOCK_SIZE)).unwrap();
 	let (b0, b1, cb) = (10u64, 11u64, 12u64);
 	for b in [b0, b1, cb] {
@@ -3019,10 +3029,14 @@ fn a_volume_this_machine_cannot_map_is_an_error_not_an_abort() {
 	//
 	// 2^39 blocks is half the format ceiling; its bitmap is 64 GiB, and the mount wants
 	// two before it walks anything.
+	//
+	// The answer is NoMemory, not NoSpace: the medium is not full, this machine cannot hold the
+	// map. They used to be the same error, and they drive opposite policies - one says delete
+	// something, the other says the service is under memory pressure.
 	let huge = MAX_BLOCKS / 2;
-	assert_eq!(LiberFs::format(MemDevice::new(8), huge).err(), Some(FsError::NoSpace), "the format path reports rather than aborts");
+	assert_eq!(LiberFs::format_scratch(MemDevice::new(8), huge).err(), Some(FsError::NoMemory), "the format path reports rather than aborts");
 	// and the helper itself, which is what every derived map goes through.
-	assert_eq!(try_zeroed((huge / 8) as usize).err(), Some(FsError::NoSpace));
+	assert_eq!(try_zeroed((huge / 8) as usize).err(), Some(FsError::NoMemory));
 	// while an ordinary size still succeeds, so the guard is not simply refusing.
 	assert!(try_zeroed(1024).is_ok());
 }
@@ -3033,8 +3047,8 @@ fn a_volume_larger_than_this_build_can_map_is_refused() {
 	// on a 32-bit target that truncates and produces a bitmap too small for the volume,
 	// so the allocator hands out blocks it never tracked. On a 64-bit one it is an
 	// enormous infallible allocation. Both are now a refusal against a documented bound.
-	assert_eq!(LiberFs::format(MemDevice::new(8), MAX_BLOCKS + 1).err(), Some(FsError::Invalid));
-	assert_eq!(LiberFs::format(MemDevice::new(8), u64::MAX).err(), Some(FsError::Invalid));
+	assert_eq!(LiberFs::format_scratch(MemDevice::new(8), MAX_BLOCKS + 1).err(), Some(FsError::Invalid));
+	assert_eq!(LiberFs::format_scratch(MemDevice::new(8), u64::MAX).err(), Some(FsError::Invalid));
 }
 
 #[test]
@@ -3042,7 +3056,7 @@ fn a_whole_file_overwrite_keeps_the_owner() {
 	// the partial-write and truncate paths edit the existing inode and so keep the tag;
 	// the whole-file path builds a fresh one and carried `ctime` across but not the
 	// owner. Overwriting a file's CONTENTS does not make it a different file.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f.txt", b"one").unwrap();
 	let num = fs.lookup(b"f.txt").unwrap().unwrap();
 	let tag = [7u8; OWNER_TAG_LEN];
@@ -3069,7 +3083,7 @@ fn a_superblock_may_not_contradict_itself() {
 	// hands out numbers above everything in use, so one at or below an inode that
 	// EXISTS means the next file created takes over that inode and every name pointing
 	// at it - which is why this one degrades the mount rather than being tidied up.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"one").unwrap();
 	fs.write_file(b"b.txt", b"two").unwrap();
 	let good = fs.into_device();
@@ -3100,7 +3114,7 @@ fn a_superblock_may_not_contradict_itself() {
 
 #[test]
 fn a_damaged_empty_directory_is_refused_not_emptied() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"victim").unwrap();
 	fs.write_file(b"victim/f.txt", b"entry").unwrap();
 	fs.write_file(b"src.txt", b"mover").unwrap();
@@ -3153,7 +3167,7 @@ fn a_forged_raw_length_does_not_read_past_the_pool() {
 	// forgery keeps every ADDRESS FIELD inside the pool and lies with the LENGTH:
 	// a raw extent claiming 2 logical blocks over a 1-block stored span, its
 	// physical start at the pool's last block, walks its second read past the pool.
-	let mut fs = LiberFs::format(MemDevice::new(128), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(128), NBLOCKS).unwrap();
 	fs.write_file(b"f.bin", &noise(BLOCK_SIZE)).unwrap();
 	let mut dev = fs.into_device();
 
@@ -3186,7 +3200,7 @@ fn a_raw_extent_may_not_read_more_blocks_than_it_stored() {
 	// `0..store_len` and marks one. The second block is reachable by this file and free
 	// according to the allocator - so the next write is handed a block someone is already
 	// reading, and overwrites it with no error anywhere.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f.bin", &noise(BLOCK_SIZE)).unwrap();
 	// three blocks the filesystem itself says are free, in the DATA half of the pool.
 	// Picking by eye put an earlier draft of this test on top of the inode table at the
@@ -3233,7 +3247,7 @@ fn a_snapshot_record_off_the_medium_is_checked_like_one_being_written() {
 	// computed. The loader demanded nothing: a table read off the medium could name a
 	// snapshot with no name at all, or a root outside the pool, or a generation that has
 	// not happened yet - and the mount stayed writable on the strength of it.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep.txt", b"payload").unwrap();
 	fs.create_snapshot(b"s1").unwrap();
 	let good = fs.into_device();
@@ -3262,7 +3276,7 @@ fn a_deleted_snapshot_stays_reserved_while_the_older_superblock_names_it() {
 	// slot stays mountable until the next commit overwrites it. If the delete frees the
 	// snapshot's blocks straight away, a crash in that window leaves a superblock which
 	// `mount_snapshot` will offer as a complete image of a generation whose data is gone.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep.txt", b"payload").unwrap();
 	fs.create_snapshot(b"s1").unwrap();
 	let snap_root = fs.snapshots[0].inode_root;
@@ -3290,7 +3304,7 @@ fn a_node_the_parent_would_reject_may_not_feed_the_free_map() {
 	// damage must not cost a volume its data. What it leaves is the block that reads
 	// CLEANLY and is wrong. Nothing fails, so the mount stays writable, and the map it
 	// derived can omit a live block - which the next allocation then hands out.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"one").unwrap();
 	fs.mkdir(b"d").unwrap();
 	let mut dev = fs.into_device();
@@ -3314,7 +3328,7 @@ fn two_owners_of_one_block_degrade_the_mount() {
 	// image where two extents point at one data block derives a free map that looks
 	// perfect. Nothing is wrong until one owner is deleted: the block joins `dead`, a
 	// commit hands it out, and the other owner is still reading it.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"f.bin", &noise(2 * BLOCK_SIZE)).unwrap();
 	let (b0, cb0, cb1) = (10u64, 11u64, 12u64);
 	for b in [b0, cb0, cb1] {
@@ -3349,7 +3363,7 @@ fn snapshots_may_share_every_block_they_like() {
 	// copy-on-write means a snapshot and the live tree share almost everything, and two
 	// snapshots share nearly all of each other. None of that is two owners, and a mount
 	// that called it corruption would refuse every volume that has ever been snapshotted.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep.txt", b"payload").unwrap();
 	fs.create_snapshot(b"one").unwrap();
 	fs.write_file(b"second.txt", b"more").unwrap();
@@ -3370,7 +3384,7 @@ fn a_compressed_extent_may_not_claim_more_bytes_than_it_stored() {
 	// the end of the buffer it was given, and `store_len >= length` is not a compressed
 	// run at all.
 	let pool = 128u64;
-	let fs = LiberFs::format(MemDevice::new(pool), pool).unwrap();
+	let fs = LiberFs::format_scratch(MemDevice::new(pool), pool).unwrap();
 
 	let ok = Extent { logical: 0, physical: 60, length: 4, csum: 50, csum_crc: 0, store_len: 2, clen: 2 * BLOCK_SIZE as u32 };
 	assert!(fs.check_extent(&ok).is_ok(), "a stream exactly filling its stored blocks is legal");
@@ -3427,7 +3441,7 @@ fn a_checksum_consistent_fan_cannot_make_a_listing_exponential() {
 	// each is twelve to the eighth visits over a tree of ten blocks.
 	//
 	// Read-only is no defence here - `list` and `read_dir` are reads.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"d").unwrap();
 	fs.write_file(b"d/keep.txt", b"payload").unwrap();
 	let mut dev = fs.into_device();
@@ -3483,7 +3497,7 @@ fn a_checksum_consistent_fan_cannot_make_fsck_exponential() {
 	// reaches `check_inode_tree` only for the pinned generations. A first version of this
 	// test forged the live inode root instead, so the walk under test was never called
 	// and it passed with the fix removed.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"one").unwrap();
 	fs.create_snapshot(b"s").unwrap();
 	let mut dev = fs.into_device();
@@ -3532,7 +3546,7 @@ fn a_self_fanning_internal_node_cannot_stall_the_mark_walk() {
 	// all point back at the node itself. The mark walks read it raw (no CRC), so the
 	// shape reaches them; marking at push queues the block once - the walk visits it,
 	// requeues nothing, and the mount completes with the rest of the volume intact.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"d").unwrap();
 	fs.write_file(b"keep.txt", b"payload").unwrap();
 	let mut dev = fs.into_device();
@@ -3565,7 +3579,7 @@ fn an_unknown_inode_type_is_inert_and_removable() {
 	// a type byte the writer never emits (hostile authoring): the record must land
 	// harmless - refused by reads and writes, shown inert by listings, and clearable
 	// by the operator's repair verb.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"odd", b"payload").unwrap();
 	let mut dev = fs.into_device();
 	forge_inode_slot(&mut dev, |slot| {
@@ -3597,7 +3611,7 @@ fn an_unknown_inode_type_is_inert_and_removable() {
 fn overwriting_a_cached_entry_evicts_nothing() {
 	// a full dentry cache: re-putting a key it already holds must not evict a
 	// different entry (the insert replaces in place, like the inode cache).
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	for i in 0..DCACHE_MAX as u32 {
 		fs.dcache_put(0, format!("name{i:04}").as_bytes(), i);
 	}
@@ -3621,7 +3635,7 @@ fn a_directory_that_splits_lists_in_key_order() {
 	// The tree routes by name hash, so "key order" is (hash, name) ascending, not
 	// alphabetical: the assertion is against the same comparison the leaves are sorted by.
 	let nblocks: u64 = 4_000;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.mkdir(b"many").unwrap();
 	// long names, so a leaf fills after a few dozen records and 400 of them force
 	// several leaves under an internal node.
@@ -3666,7 +3680,7 @@ fn removing_an_unknown_type_inode_returns_its_blocks() {
 	// exactly why the regression could sit there: the blocks were never lost, only held
 	// until something walked the volume again.
 	let drain = |odd: bool| -> (Vec<u64>, Vec<u64>, u64) {
-		let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+		let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 		// a spilled extent map, so the chain block is in the accounting with the data.
 		write_spilled_file(&mut fs);
 		let mut dev = fs.into_device();
@@ -3706,7 +3720,7 @@ fn a_null_child_slot_is_a_fault_not_an_empty_corner() {
 	// pointing nowhere makes every name in that interval resolve to nothing while the
 	// checksums verify and the counts add up. Both walks took it for an empty corner.
 	let nblocks: u64 = 4_000;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.mkdir(b"many").unwrap();
 	for i in 0..400u32 {
 		fs.write_file(format!("many/entry-{i:04}-{}", "p".repeat(40)).as_bytes(), b"x").unwrap();
@@ -3739,7 +3753,7 @@ fn the_directory_checker_refuses_every_name_the_path_api_does() {
 	// `a/b`, or one carrying a control byte, passed an fsck that no path API could have
 	// produced and none can address afterwards.
 	for bad in [b"..".as_slice(), b"a/b".as_slice(), b"a\x01b".as_slice(), b"a:b".as_slice(), b".".as_slice()] {
-		let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+		let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 		fs.write_file(b"placeholder", b"x").unwrap();
 		let root = fs.root_inode;
 		let mut inode = fs.read_inode(root).unwrap();
@@ -3766,7 +3780,7 @@ fn a_label_field_with_a_dirty_tail_is_not_ours() {
 	// field is laid down NUL-padded. Nothing reads past the terminator, so this is not
 	// about what `label()` returns - it is that a field shaped like that is itself proof
 	// the record was written by something else, and refusing costs nothing.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep", b"payload").unwrap();
 	let mut dev = fs.into_device();
 	for slot in 0..SUPER_SLOTS as usize {
@@ -3787,7 +3801,7 @@ fn a_second_snapshots_bad_link_is_checked_too() {
 	// in the link that reached it - so where two snapshots share a block, only the first
 	// snapshot's link was ever checked. A second snapshot pointing at the same block with
 	// a wrong expected CRC cannot be opened at all, and fsck reported nothing about it.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"shared.txt", b"payload").unwrap();
 	// two snapshots taken back to back: nothing touched the inode tree between them, so
 	// both records name the SAME root block. That is the shape the audit describes and the
@@ -3848,7 +3862,7 @@ fn a_check_that_could_not_run_is_a_fault_not_a_clean_report() {
 	// clean structural report for directories it never looked at. A report that cannot
 	// distinguish "checked and sound" from "not checked" is worse than one that admits the
 	// difference.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.mkdir(b"d").unwrap();
 	fs.write_file(b"d/f.txt", b"payload").unwrap();
 	// clean first, so the fault below is the injection's and not the volume's.
@@ -3880,7 +3894,7 @@ fn a_mount_short_of_memory_does_not_blame_the_disk() {
 	// told the operator the disk did not answer when the disk was fine and the machine was
 	// short. The process no longer aborting was the point of the fallible allocation;
 	// carrying the reason through is the rest of it.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"keep", b"payload").unwrap();
 	let dev = fs.into_device();
 	// the mount builds the two superblock-sized maps first (those already answer
@@ -3901,7 +3915,7 @@ fn an_unknown_type_that_was_a_directory_keeps_its_tree_reserved() {
 	// survive; the index that named them is overwritten. That is worse than the case that was fixed,
 	// because a lost directory takes a whole subtree's reachability with it.
 	let nblocks: u64 = 4_000;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	// A directory big enough to have an internal node, so there are children to lose.
 	fs.mkdir(b"many").unwrap();
 	for i in 0..400u32 {
@@ -3934,7 +3948,7 @@ fn a_read_this_machine_cannot_hold_reports_rather_than_aborts() {
 	// The read path was the one place a number off the medium sized an allocation directly, and it
 	// used `Vec::with_capacity` - which answers an impossible request by ABORTING the process. The
 	// pool's byte count bounds it, and a volume can be larger than the machine it is mounted on.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"small", b"payload").unwrap();
 	let num = fs.lookup(b"small").unwrap().unwrap();
 	let inode = fs.read_inode(num).unwrap();
@@ -3960,7 +3974,7 @@ fn a_truncated_directory_leaf_may_be_read_but_not_edited() {
 	// ones in front of it have filled the leaf. A short leaf with a raised count is not a truncated
 	// leaf - the zero padding parses as empty-named records and the count comes out right.
 	let nblocks: u64 = 2_000;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.mkdir(b"d").unwrap();
 	// SHORT names, many of them: the last record has to START within 255 bytes of the end of the
 	// block for its declared length - one byte - to be able to run past it, and short records are
@@ -4016,7 +4030,7 @@ fn an_unsorted_directory_leaf_may_be_read_but_not_edited() {
 	// a structure the format cannot produce - a name duplicated or one made unreachable, and
 	// nothing left afterwards to say which.
 	let nblocks: u64 = 2_000;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.mkdir(b"d").unwrap();
 	// Enough names to be a leaf with several records, few enough to stay ONE leaf.
 	for i in 0..8u32 {
@@ -4068,7 +4082,7 @@ fn a_directorys_speculative_reservation_is_not_skipped_when_memory_is_short() {
 	// construction. A failure to ALLOCATE the protection is not the guess failing; it is the
 	// protection not happening.
 	let nblocks: u64 = 4_000;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.mkdir(b"many").unwrap();
 	for i in 0..400u32 {
 		fs.write_file(format!("many/entry-{i:04}-{}", "p".repeat(40)).as_bytes(), b"x").unwrap();
@@ -4101,7 +4115,7 @@ fn a_snapshot_table_has_a_ceiling_and_both_sides_of_it_agree() {
 	// the reader refuses a medium claiming more. Only the writer's half can be reached from here
 	// without forging a chain; they share the constant, which is the point of stating it once.
 	let nblocks: u64 = 4_000;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.write_file(b"payload", b"x").unwrap();
 	for i in 0..MAX_SNAPSHOTS {
 		fs.create_snapshot(format!("snap{i:04}").as_bytes()).unwrap_or_else(|e| panic!("snapshot {i} of {MAX_SNAPSHOTS}: {e:?}"));
@@ -4121,7 +4135,7 @@ fn a_snapshot_name_has_to_be_padded_the_way_a_writer_pads_it() {
 	// is why it went unnoticed - the argument is not about what the name resolves to but that no
 	// writer of this format produces a field shaped that way, so a field shaped that way is itself
 	// evidence the record came from somewhere else.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"payload", b"x").unwrap();
 	fs.create_snapshot(b"keep").unwrap();
 	let mut dev = fs.into_device();
@@ -4132,7 +4146,7 @@ fn a_snapshot_name_has_to_be_padded_the_way_a_writer_pads_it() {
 	});
 	assert!(matches!(LiberFs::mount(dev), Err(MountError::Corrupt) | Ok(_)), "the mount either refuses or degrades - it may not accept the record as written");
 	// Precisely: the table cannot be loaded, which is what degrades the volume.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"payload", b"x").unwrap();
 	fs.create_snapshot(b"keep").unwrap();
 	let mut dev = fs.into_device();
@@ -4150,7 +4164,7 @@ fn an_extent_count_above_the_pool_is_refused_before_it_is_allocated_for() {
 	// An extent names a run of blocks, so an inode cannot hold more extents than the pool holds
 	// blocks. That is the bound the volume states, and a claim above it is a claim the format
 	// cannot have written.
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"file", b"payload").unwrap();
 	let num = fs.lookup(b"file").unwrap().unwrap();
 	let mut dev = fs.into_device();
@@ -4180,7 +4194,7 @@ fn an_extent_count_above_the_pool_is_refused_before_it_is_allocated_for() {
 #[test]
 fn a_spilled_extent_map_that_cannot_allocate_its_block_says_so() {
 	let nblocks: u64 = 512;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	let span = |i: u64| i * 16 * BLOCK_SIZE as u64;
 	// Two inline capacities' worth of sparse spans, so the map has to spill.
 	for i in 0..8u64 {
@@ -4200,7 +4214,7 @@ fn a_spilled_extent_map_that_cannot_allocate_its_block_says_so() {
 	for budget in 0..64 {
 		// A fresh filesystem per budget: the injection is a count of allocations from the moment it
 		// is armed, so the state it is armed over has to be identical each time.
-		let mut attempt = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+		let mut attempt = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 		for i in 0..8u64 {
 			attempt.write_at(b"sparse", span(i), format!("span-{i}").as_bytes()).unwrap();
 		}
@@ -4238,7 +4252,7 @@ fn a_spilled_extent_map_that_cannot_allocate_its_block_says_so() {
 #[test]
 fn an_inode_leaf_outside_the_range_that_routes_to_it_makes_the_mount_read_only() {
 	let nblocks: u64 = 512;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	// Enough inodes that the tree has an internal root to misroute from.
 	for i in 0..200u32 {
 		fs.write_file(format!("f{i:03}").as_bytes(), b"x").unwrap();
@@ -4283,7 +4297,7 @@ fn an_inode_leaf_outside_the_range_that_routes_to_it_makes_the_mount_read_only()
 #[test]
 fn a_forged_chain_of_more_snapshots_than_the_format_allows_is_refused() {
 	let nblocks: u64 = 512;
-	let mut fs = LiberFs::format(MemDevice::new(nblocks), nblocks).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 	fs.write_file(b"a.txt", b"payload").unwrap();
 	let root = fs.inode_root;
 	let root_crc = fs.inode_root_crc;
@@ -4349,7 +4363,7 @@ fn a_forged_chain_of_more_snapshots_than_the_format_allows_is_refused() {
 // disk that changed under a long-lived mount would.
 #[test]
 fn a_snapshot_whose_root_crc_drifted_from_the_disk_is_reported() {
-	let mut fs = LiberFs::format(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
 	fs.write_file(b"a.txt", b"payload").unwrap();
 	fs.create_snapshot(b"before").unwrap();
 	fs.write_file(b"b.txt", b"more").unwrap();
@@ -4359,4 +4373,106 @@ fn a_snapshot_whose_root_crc_drifted_from_the_disk_is_reported() {
 	fs.snapshots[0].inode_root_crc ^= 1;
 	let report = fs.fsck().unwrap();
 	assert!(mentions(&report.faults, b"the snapshot table on disk differs from the mounted one"), "a drifted root CRC must be named: {:?}", report.faults);
+}
+
+#[test]
+fn the_metadata_allocator_can_use_the_pools_first_block() {
+	// `POOL_START` is the first block of the pool - the data allocator hands it out - and the
+	// downward metadata scan tested `block <= POOL_START` and `candidate > POOL_START`, so it
+	// skipped it. A volume whose only free block is that one answered `NoSpace` to a metadata
+	// request while the block sat free. Nothing was permanently lost, because the data side could
+	// still use it, which is exactly why it went unnoticed.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	// Fill the volume until nothing is free, then free exactly one block and ask for it as
+	// metadata. Which block comes back last is the allocator's business; that a freed block can be
+	// re-used by either side is not.
+	let mut written = 0u32;
+	loop {
+		let name = alloc::format!("f{written:05}");
+		match fs.write_file(name.as_bytes(), &[0xAA; 4096]) {
+			Ok(()) => written += 1,
+			Err(FsError::NoSpace) => break,
+			Err(other) => panic!("unexpected {other:?}"),
+		}
+		assert!(written < 10_000, "the volume never filled");
+	}
+	assert!(written > 0, "the fixture must hold something");
+	// Removing one file frees its blocks; a metadata allocation must then succeed.
+	fs.remove(b"f00000").expect("remove");
+	fs.write_file(b"after", b"x").expect("a freed block must be usable again, by either allocator");
+	assert_eq!(fs.read_file(b"after").expect("read"), b"x");
+}
+
+#[test]
+fn a_memory_shortage_is_not_a_full_disk() {
+	// `NoSpace` means the medium is full and `NoMemory` means this machine is short, and they drive
+	// opposite policies: delete something, versus wait for the service. Inside the filesystem every
+	// fallible allocation answered `NoSpace`, so a caller under memory pressure was told to free
+	// disk space that was already free.
+	//
+	// `try_zeroed` is the helper every derived map goes through, and the size here is a legal
+	// superblock claim whose bitmap this machine cannot hold - the medium is not involved at all.
+	assert_eq!(try_zeroed((MAX_BLOCKS / 16) as usize).err(), Some(FsError::NoMemory));
+	assert!(try_zeroed(1024).is_ok(), "an ordinary size still succeeds, so the guard is not simply refusing");
+
+	// And a genuinely full volume still says so, which is the half that must not move.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let mut written = 0u32;
+	let full = loop {
+		let name = alloc::format!("f{written:05}");
+		match fs.write_file(name.as_bytes(), &[0xAA; 4096]) {
+			Ok(()) => written += 1,
+			Err(error) => break error,
+		}
+		assert!(written < 10_000, "the volume never filled");
+	};
+	assert_eq!(full, FsError::NoSpace, "a full medium is still a full medium");
+}
+
+#[test]
+fn a_transaction_that_changed_nothing_writes_nothing() {
+	// `mutate` committed whenever the body returned `Ok`, so a rename onto its own name - which
+	// `rename_inner` short-circuits - wrote a superblock, advanced the generation and rolled the
+	// previous one into a snapshot. Nothing incorrect; a write, wear, and a generation step a
+	// caller can repeat indefinitely, on a volume that did not change.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"foo", b"content").unwrap();
+	// The superblock slots are the medium's record of how many times it has been committed to:
+	// a commit writes the inactive one, so the pair changes on every real transaction.
+	let before = fs.into_device().blocks.clone();
+	let mut fs = LiberFs::mount(MemDevice { blocks: before.clone() }).expect("remount");
+
+	fs.rename(b"foo", b"foo").expect("a rename onto itself succeeds");
+	let after_noop = fs.into_device().blocks.clone();
+	assert_eq!(after_noop, before, "a no-op wrote to the medium");
+
+	// And a real change still commits, so the shortcut is not simply refusing to write.
+	let mut fs = LiberFs::mount(MemDevice { blocks: after_noop.clone() }).expect("remount");
+	fs.rename(b"foo", b"bar").expect("rename");
+	let after_real = fs.into_device().blocks.clone();
+	assert_ne!(after_real, after_noop, "a real change must still commit");
+	let mut fs = LiberFs::mount(MemDevice { blocks: after_real }).expect("remount");
+	assert_eq!(fs.read_file(b"bar").expect("read"), b"content");
+}
+
+#[test]
+fn a_path_is_bounded_as_a_whole_and_not_only_per_segment() {
+	// Each segment was limited to 255 bytes and the path was not, and the segments were collected
+	// with an infallible `Vec::push` - so a caller handing the crate a large buffer of short
+	// segments got an allocation proportional to it, and a shortage there aborts the process rather
+	// than refusing. StorageService bounds paths from outside; a filesystem crate that relies on
+	// its caller for that is safe until somebody else calls it.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	let long: Vec<u8> = b"a/".repeat(PATH_MAX);
+	assert_eq!(fs.read_file(&long), Err(FsError::TooLong), "a path longer than any this filesystem holds");
+	assert_eq!(fs.write_file(&long, b"x"), Err(FsError::TooLong));
+
+	// Depth, separately: a short path can still be deeper than the walk will go.
+	let deep: Vec<u8> = b"a/".repeat(PATH_DEPTH_MAX + 1);
+	assert!(deep.len() < PATH_MAX, "the fixture must test depth rather than length");
+	assert_eq!(fs.read_file(&deep), Err(FsError::TooLong), "a path deeper than the limit");
+
+	// And an ordinary path still resolves, so the bound is not simply refusing.
+	fs.write_file(b"a/b/c", b"ok").expect("an ordinary path");
+	assert_eq!(fs.read_file(b"a/b/c").expect("read"), b"ok");
 }

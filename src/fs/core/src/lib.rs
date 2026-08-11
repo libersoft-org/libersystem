@@ -92,4 +92,53 @@ pub enum FsError {
 	// The mount is read-only (an optical medium, a snapshot mount, or a volume degraded
 	// by corruption): every mutation is refused so the on-disk state stays intact.
 	ReadOnly,
+	// The filesystem could not get the MEMORY it needed, which is not the medium being full.
+	//
+	// They were the same answer, and they drive opposite policies: `NoSpace` says delete something
+	// or use another volume, `NoMemory` says the storage service is under pressure and the same
+	// request may well succeed in a moment. `MountError` had told them apart since it existed; the
+	// operations underneath it had not.
+	NoMemory,
+	// The answer does not fit in one buffer. A file larger than a caller's address space is not a
+	// damaged volume, and reporting it as `Corrupt` sent a caller looking for a filesystem fault
+	// that is not there - a ranged read is the answer, not a repair.
+	TooLarge,
+}
+
+// Is byte `c` allowed in a portable file name?
+//
+// Rejects NUL and the control bytes (0x00..=0x1F and 0x7F) and the cross-platform-reserved set
+// `\ : * ? < > | "`. `/` never reaches here - it is the path separator, and a name containing one
+// is a path, not a name.
+//
+// It lives HERE because two writable backends were enforcing two different policies while
+// StorageService mounted both: LiberFS checked it and LiberMemFS did not, so an application could
+// create `foo:bar` on the live `vol://system` and then fail to create it on an installed LiberFS
+// one - the same call, the same API, a different answer depending on which filesystem happened to
+// be underneath. A contract stated in one crate and enforced in one of its implementations is not
+// a contract.
+pub fn is_portable_name_byte(c: u8) -> bool {
+	if c < 0x20 || c == 0x7F {
+		return false;
+	}
+	!matches!(c, b'\\' | b':' | b'*' | b'?' | b'<' | b'>' | b'|' | b'"')
+}
+
+// The whole of what `FsError::BadName` documents, in one place: an empty segment, `.` or `..`, not
+// UTF-8, or a byte outside the portable-name policy. `max` is the backend's own name-length
+// ceiling, which is the one part of the rule that legitimately differs between filesystems.
+pub fn validate_name_segment(seg: &[u8], max: usize) -> Result<(), FsError> {
+	if seg.is_empty() || seg == b"." || seg == b".." {
+		return Err(FsError::BadName);
+	}
+	if seg.len() > max {
+		return Err(FsError::TooLong);
+	}
+	if core::str::from_utf8(seg).is_err() {
+		return Err(FsError::BadName);
+	}
+	if seg.iter().any(|&c| c == b'/' || !is_portable_name_byte(c)) {
+		return Err(FsError::BadName);
+	}
+	Ok(())
 }
