@@ -64,17 +64,6 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let boot_info = build_boot_info(bs, dtb, init_pkg, volume_pkg);
 
 	// ExitBootServices is the last firmware call; after it no service may be used.
-	// GIVE THE HEAP BACK before the map is taken. Everything the kernel receives is in pages of
-	// its own by now; the arenas underneath are the loader's own working memory, and left alone
-	// they reach the kernel as `MEM_BOOTLOADER` - which its frame allocator never seeds, so they
-	// would be reserved for the system's whole life. The number is printed because it is the one
-	// this milestone asked to be measured.
-	{
-		let freed = crate::heap::release(bs) / 1024;
-		serial::write_str("loader: returned ");
-		crate::serial_write_usize(freed);
-		serial::write_str(" KiB of loader heap\n");
-	}
 	exit_boot_services(bs, image_handle);
 
 	// Mirror the QEMU `-kernel` entry state and enter the kernel's boot stub: turn
@@ -313,6 +302,23 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle) {
 	}
 	let cap = map_size + desc_size * 16;
 	let buf = crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
+	// GIVE THE HEAP BACK, here and not before the buffer above.
+	//
+	// The arenas are the loader's own working memory and left alone they reach the kernel as
+	// `MEM_BOOTLOADER`, which its frame allocator never seeds - so they would be reserved for the
+	// system's whole life. Freeing them BEFORE this allocation hung riscv64: the firmware satisfies
+	// `AllocateAnyPages` out of whatever is free, sixteen megabytes had just become free, and the
+	// buffer it handed back landed where the kernel is placed after `ExitBootServices`. Freed after
+	// the buffer exists, the map still reports the arenas as usable - which is the point of
+	// returning them - and nothing allocated afterwards can land in the kernel's destination,
+	// because nothing is allocated afterwards.
+	{
+		let freed = crate::heap::release(bs) / 1024;
+		serial::write_str("loader: returned ");
+		crate::serial_write_usize(freed);
+		serial::write_str(" KiB of loader heap\n");
+	}
+
 	loop {
 		let mut size = cap;
 		let status = unsafe { ((*bs).get_memory_map)(&mut size, buf, &mut key, &mut desc_size, &mut desc_ver) };

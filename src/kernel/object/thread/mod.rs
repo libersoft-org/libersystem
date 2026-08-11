@@ -109,7 +109,23 @@ impl KernelStack {
 			// TTBR0 value that a higher-half address does not live in. Routing by address is
 			// correct on every port by construction rather than by a rule applied underneath.
 			let at = base + (page as u64 + 1) * crate::mem::frame::PAGE_SIZE;
-			let mapped = crate::mem::frame::allocate().filter(|frame| arch::paging::try_map_page(at, *frame, flags).is_ok());
+			// The frame and the mapping are two failures, not one, and `filter` made them one:
+			// a frame that was ALLOCATED and then could not be mapped - because the mapper ran out
+			// of frames for an intermediate table - was dropped on the floor by the combinator.
+			// `rollback` frees what is MAPPED, so nothing knew about it. That is the single frame
+			// `a_load_that_runs_out_of_frames_anywhere_gives_back_everything` reports as kept when
+			// a budget lands on the mapper's own allocation.
+			let allocated = crate::mem::frame::allocate();
+			let mapped = match allocated {
+				Some(frame) if arch::paging::try_map_page(at, frame, flags).is_ok() => Some(frame),
+				Some(frame) => {
+					// SAFETY: ours since `allocate` returned it, mapped nowhere - the mapping is
+					// exactly what failed - so nothing can reach it and it goes straight back.
+					unsafe { crate::mem::frame::deallocate(frame) };
+					None
+				}
+				None => None,
+			};
 			let Some(frame) = mapped else {
 				// Unwind by hand rather than by building a partial `KernelStack` and dropping
 				// it. Drop frees `(self.pages + 1)` pages of virtual range, which for a

@@ -1143,6 +1143,31 @@ fn a_load_that_runs_out_of_frames_anywhere_gives_back_everything() {
 	let package = pkg::Package::parse(bytes).expect("init package parses");
 	let elf = package.lookup(b"log_service.lsexe").expect("log_service.lsexe image");
 
+	// WARM THE HEAP FIRST, with one complete spawn that is then torn down.
+	//
+	// The sweep below compares the machine's free-frame count around each attempt, and the kernel
+	// heap GROWS BY TAKING FRAMES - `register_thread` pushes onto a `Vec`, the handle table grows,
+	// the object headers are boxed. A frame the heap took is not a frame the load kept, but it
+	// looks exactly like one here, and it never comes back inside the window.
+	//
+	// That is why this test could not be run alone: after two hundred other tests the heap is at
+	// its working size and takes nothing during the sweep, while on its own it grows mid-sweep and
+	// the count comes back short. It was blamed on the frame allocator, the quarantine, the
+	// page-table rollback and the shared-page cache in turn; it was none of them, and the giveaway
+	// was in the message all along - "0 still quarantined".
+	{
+		let (kernel_ep, user_ep) = crate::object::channel::Channel::create();
+		if let Ok(process) = loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL, 0) {
+			process.terminate();
+			drop(process);
+		}
+		drop(kernel_ep);
+		for _ in 0..16 {
+			sched::run_until_idle();
+			let _ = frame::drain_quarantine_fully(64);
+		}
+	}
+
 	// How many allocations a whole load takes, measured rather than assumed - the image
 	// decides it and it differs per port.
 	let mut refusals = 0;

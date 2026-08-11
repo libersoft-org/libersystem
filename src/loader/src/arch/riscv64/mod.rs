@@ -91,12 +91,6 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// they reach the kernel as `MEM_BOOTLOADER` - which its frame allocator never seeds, so they
 	// would be reserved for the system's whole life. The number is printed because it is the one
 	// this milestone asked to be measured.
-	{
-		let freed = crate::heap::release(bs) / 1024;
-		serial::write_str("loader: returned ");
-		crate::serial_write_usize(freed);
-		serial::write_str(" KiB of loader heap\n");
-	}
 	exit_boot_services(bs, image_handle);
 
 	// Now, and only now, put the kernel at its link addresses and enter it. The loader ran
@@ -385,6 +379,25 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle) {
 	}
 	let cap = map_size + desc_size * 16;
 	let buf = crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
+	// GIVE THE HEAP BACK, here and not a line earlier.
+	//
+	// The arenas are the loader's own working memory and left alone they reach the kernel as
+	// `MEM_BOOTLOADER`, which its frame allocator never seeds - so they would be reserved for the
+	// system's whole life. But freeing them BEFORE this allocation hung the machine: the firmware
+	// satisfies `AllocateAnyPages` out of whatever is free, sixteen megabytes had just become
+	// free, and the buffer it handed back landed where the post-ExitBootServices copy puts the
+	// kernel. The copy then wrote over the map the firmware was still reading, and the boot
+	// stopped with the loader's last line on the wire and nothing after it.
+	//
+	// Freed AFTER the buffer exists, the map still reports the arenas as usable - which is the
+	// whole point of returning them - and nothing allocated afterwards can land in the kernel's
+	// destination, because nothing is allocated afterwards.
+	{
+		let freed = crate::heap::release(bs) / 1024;
+		serial::write_str("loader: returned ");
+		crate::serial_write_usize(freed);
+		serial::write_str(" KiB of loader heap\n");
+	}
 	loop {
 		let mut size = cap;
 		let status = unsafe { ((*bs).get_memory_map)(&mut size, buf, &mut key, &mut desc_size, &mut desc_ver) };
