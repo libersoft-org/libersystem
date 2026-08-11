@@ -1,5 +1,12 @@
 use super::*;
 
+// The attribute bits both families keep in the same place: the classic byte 11 and the low half of
+// exFAT's FileAttributes.
+pub(super) const ATTR_READ_ONLY: u8 = 0x01;
+// Read-only, hidden and system: what an overwrite must carry across. Archive it sets itself.
+pub(super) const ATTR_CARRIED: u8 = 0x07;
+pub(super) const ATTR_ARCHIVE: u8 = 0x20;
+
 // A directory entry as parsed off disk, before it becomes a FileInfo: keeps the first
 // cluster so a file's bytes or a subdirectory can be read, the 8.3 short form (classic
 // families; empty on exFAT) so a lookup matches either name, the exFAT NoFatChain flag,
@@ -12,6 +19,10 @@ pub(super) struct Raw {
 	// is undefined there and reads as zeros (classic entries carry no VDL: equals size).
 	pub(super) valid_len: u64,
 	pub(super) is_dir: bool,
+	// The FAT attribute byte (read-only, hidden, system, archive), which both families store in
+	// the same low four bits. Carried so an overwrite can put it back: rewriting an entry with a
+	// fresh `0x20` silently cleared the read-only, hidden and system a user or another system set.
+	pub(super) attr: u8,
 	pub(super) first_cluster: u32,
 	pub(super) no_fat_chain: bool,
 	pub(super) set_off: usize,
@@ -20,8 +31,30 @@ pub(super) struct Raw {
 
 impl Raw {
 	// A lookup matches the long name, or its 8.3 short form as the fallback.
-	pub(super) fn matches(&self, name: &[u8]) -> bool {
-		eq_ignore_case(self.name.as_bytes(), name) || (!self.short.is_empty() && eq_ignore_case(self.short.as_bytes(), name))
+	//
+	// The fold is the VOLUME's, not this driver's: on exFAT that is the Up-case Table read at
+	// mount, so two names collide here exactly when they collide on the system that wrote the
+	// medium. The 8.3 alias stays an ASCII comparison, which is what that field is.
+	pub(super) fn matches(&self, name: &[u8], upcase: &Upcase) -> bool {
+		eq_upcased(&self.name, name, upcase) || (!self.short.is_empty() && eq_ignore_case(self.short.as_bytes(), name))
+	}
+}
+
+// Compare a stored name with a looked-up one, both folded through the volume's table. The
+// comparison is over UTF-16 units because that is what the table maps and what the medium stores -
+// folding UTF-8 bytes would fold nothing above ASCII however good the table was.
+fn eq_upcased(stored: &str, wanted: &[u8], upcase: &Upcase) -> bool {
+	let Ok(wanted) = core::str::from_utf8(wanted) else {
+		return false;
+	};
+	let mut a = stored.encode_utf16().map(|u| upcase.up(u));
+	let mut b = wanted.encode_utf16().map(|u| upcase.up(u));
+	loop {
+		match (a.next(), b.next()) {
+			(None, None) => return true,
+			(x, y) if x != y => return false,
+			_ => {}
+		}
 	}
 }
 
@@ -29,13 +62,20 @@ impl Raw {
 // record plus its long fragments - returning the parsed entry, or None if absent. The
 // caller writes the bytes back and frees the chain once the write is safe; a directory
 // cannot be unlinked this way.
-pub(super) fn mark_unlinked(bytes: &mut [u8], name: &[u8]) -> Result<Option<Raw>, FsError> {
+pub(super) fn mark_unlinked(bytes: &mut [u8], name: &[u8], upcase: &Upcase) -> Result<Option<Raw>, FsError> {
 	let entries = parse_fat_dir(bytes)?;
-	let Some(e) = entries.into_iter().find(|e| e.matches(name)) else {
+	let Some(e) = entries.into_iter().find(|e| e.matches(name, upcase)) else {
 		return Ok(None);
 	};
+	// A directory is not removed or overwritten through the file paths: the caller named the wrong
+	// kind of thing, which is what IsDir says and what Invalid did not.
 	if e.is_dir {
-		return Err(FsError::Invalid);
+		return Err(FsError::IsDir);
+	}
+	// Read-only means what it says on both families, and neither the write path nor the remove path
+	// honoured it - a flag every other system enforces was decoration here.
+	if e.attr & ATTR_READ_ONLY != 0 {
+		return Err(FsError::ReadOnly);
 	}
 	for off in (e.set_off..=e.ent_off).step_by(32) {
 		bytes[off] = 0xE5;
@@ -46,13 +86,20 @@ pub(super) fn mark_unlinked(bytes: &mut [u8], name: &[u8]) -> Result<Option<Raw>
 // The exFAT counterpart: clear the in-use bit of every record in the named entry set,
 // returning the parsed entry (first cluster, size, NoFatChain) so the caller can release
 // its clusters the right way once the directory write is safe.
-pub(super) fn exfat_mark_unlinked(bytes: &mut [u8], name: &[u8]) -> Result<Option<Raw>, FsError> {
-	let entries = parse_exfat_dir(bytes)?;
-	let Some(e) = entries.into_iter().find(|e| e.matches(name)) else {
+pub(super) fn exfat_mark_unlinked(bytes: &mut [u8], name: &[u8], upcase: &Upcase) -> Result<Option<Raw>, FsError> {
+	let entries = parse_exfat_dir(bytes, upcase)?;
+	let Some(e) = entries.into_iter().find(|e| e.matches(name, upcase)) else {
 		return Ok(None);
 	};
+	// A directory is not removed or overwritten through the file paths: the caller named the wrong
+	// kind of thing, which is what IsDir says and what Invalid did not.
 	if e.is_dir {
-		return Err(FsError::Invalid);
+		return Err(FsError::IsDir);
+	}
+	// Read-only means what it says on both families, and neither the write path nor the remove path
+	// honoured it - a flag every other system enforces was decoration here.
+	if e.attr & ATTR_READ_ONLY != 0 {
+		return Err(FsError::ReadOnly);
 	}
 	for off in (e.set_off..=e.ent_off).step_by(32) {
 		bytes[off] &= 0x7F;
@@ -94,12 +141,36 @@ pub(super) fn parse_fat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
 			// must count the sequence down carrying the same checksum.
 			let seq = e[0] & 0x1F;
 			let frag = lfn_fragment(e);
+			// The structural rules the sequence and checksum checks do not cover. A hostile or
+			// bit-rotted medium can satisfy both and still describe something impossible.
+			//
+			//   * 20 fragments of 13 units is 260, and the limit is 255 - a sequence number above
+			//     20 describes a name longer than the format can hold.
+			//   * byte 11 is the 0x0F attribute (already matched), byte 12 is reserved and zero,
+			//     and bytes 26-27 are a first-cluster field that must be zero: a fragment carrying
+			//     a cluster number is a record some other reader may follow.
+			if seq > 20 || e[12] != 0 || e[26] != 0 || e[27] != 0 {
+				lfn.clear();
+				set_start = None;
+				continue;
+			}
 			if e[0] & 0x40 != 0 && seq >= 1 {
+				// The LAST fragment is the only one allowed to be short, and the format says how:
+				// a 0x0000 terminator followed by 0xFFFF to the end of the record. Anything else -
+				// data after the terminator, a NUL in the middle of the padding - is a record no
+				// implementation writes, and reading it as name units invents characters.
+				if !padding_is_well_formed(&frag) {
+					lfn.clear();
+					set_start = None;
+					continue;
+				}
 				lfn = frag;
 				lfn_sum = e[13];
 				lfn_next = seq - 1;
 				set_start = Some(off);
-			} else if set_start.is_some() && seq >= 1 && seq == lfn_next && e[13] == lfn_sum {
+			} else if set_start.is_some() && seq >= 1 && seq == lfn_next && e[13] == lfn_sum && !frag.contains(&0) && !frag.contains(&0xFFFF) {
+				// A fragment that is not the last carries thirteen real units: a terminator or
+				// padding inside one means the sequence numbers and the content disagree.
 				let mut merged = frag;
 				merged.extend_from_slice(&lfn);
 				lfn = merged;
@@ -132,12 +203,22 @@ pub(super) fn parse_fat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
 		let is_dir = e[11] & 0x10 != 0;
 		let first_cluster = ((u16::from_le_bytes([e[20], e[21]]) as u32) << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
 		let size = u32::from_le_bytes([e[28], e[29], e[30], e[31]]) as u64;
-		out.push(Raw { name, short, size, valid_len: size, is_dir, first_cluster, no_fat_chain: false, set_off, ent_off: off });
+		out.push(Raw { name, short, size, valid_len: size, is_dir, attr: e[11], first_cluster, no_fat_chain: false, set_off, ent_off: off });
 	}
 	Ok(out)
 }
 
 // The 13 UTF-16 units of one VFAT long-name fragment (offsets 1, 14, 28).
+// Whether a final fragment's tail follows the format's rule: the units are the name, then at most
+// one 0x0000 terminator, then 0xFFFF to the end of the record.
+fn padding_is_well_formed(frag: &[u16]) -> bool {
+	let Some(end) = frag.iter().position(|&u| u == 0) else {
+		// no terminator: the fragment is full, which is legal when the name ends exactly here
+		return !frag.contains(&0xFFFF);
+	};
+	frag[end + 1..].iter().all(|&u| u == 0xFFFF)
+}
+
 fn lfn_fragment(e: &[u8]) -> Vec<u16> {
 	let mut part: Vec<u16> = Vec::new();
 	for &r in &[1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30] {
@@ -152,7 +233,7 @@ fn lfn_fragment(e: &[u8]) -> Vec<u16> {
 // set is skipped, never trusted. The stream's NoFatChain flag (bit 0x02) marks a
 // contiguous file with no FAT chain - the common form Windows writes - which must be
 // read and freed by length, never by following the FAT.
-pub(super) fn parse_exfat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
+pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>, FsError> {
 	let mut out: Vec<Raw> = Vec::new();
 	let mut i = 0;
 	while i + 32 <= bytes.len() {
@@ -173,41 +254,62 @@ pub(super) fn parse_exfat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
 			continue;
 		}
 		let is_dir = u16::from_le_bytes([e[4], e[5]]) & 0x10 != 0;
-		let mut name: Vec<u16> = Vec::new();
-		let mut size = 0u64;
-		let mut valid_len = 0u64;
-		let mut first_cluster = 0u32;
-		let mut name_len = 0usize;
-		let mut no_fat_chain = false;
-		let mut last = i;
-		for k in 1..=secondary {
-			let s = i + k * 32;
-			if s + 32 > bytes.len() {
-				break;
-			}
-			last = s;
-			let x = &bytes[s..s + 32];
-			if x[0] == 0xC0 {
-				no_fat_chain = x[1] & 0x02 != 0;
-				name_len = x[3] as usize;
-				valid_len = u64::from_le_bytes([x[8], x[9], x[10], x[11], x[12], x[13], x[14], x[15]]);
-				first_cluster = u32::from_le_bytes([x[20], x[21], x[22], x[23]]);
-				size = u64::from_le_bytes([x[24], x[25], x[26], x[27], x[28], x[29], x[30], x[31]]);
-			} else if x[0] == 0xC1 {
-				for c in 0..15 {
-					name.push(u16::from_le_bytes([x[2 + c * 2], x[3 + c * 2]]));
-				}
-			}
-		}
-		name.truncate(name_len);
-		// a degenerate set with no name (a bare 0x85 with no secondaries, or a forged
-		// zero name length) is noise, never a real file - skip it.
-		if name.is_empty() {
-			i += (secondary + 1) * 32;
+		// The GRAMMAR, not just the checksum. A checksum says the bytes are the ones that were
+		// written; it says nothing about whether they describe a file. The specification's order is
+		// File, then exactly one Stream Extension IMMEDIATELY after it, then the File Name entries -
+		// as many as the name length needs and no fewer.
+		//
+		// Taking any 0xC0 anywhere and any 0xC1 anywhere accepted sets no implementation would
+		// write: two streams where the second silently won, name fragments before the stream that
+		// declares their length, a NameLength unrelated to the fragments present. Each of those
+		// becomes a file in a listing, and then something frees the clusters it names.
+		if secondary < 2 || bytes[i + 32] != 0xC0 {
+			i += set_len;
 			continue;
 		}
-		out.push(Raw { name: decode_utf16(&name), short: String::new(), size, valid_len, is_dir, first_cluster, no_fat_chain, set_off: i, ent_off: last });
-		i += (secondary + 1) * 32;
+		let stream = &bytes[i + 32..i + 64];
+		let no_fat_chain = stream[1] & 0x02 != 0;
+		let name_len = stream[3] as usize;
+		let valid_len = u64::from_le_bytes([stream[8], stream[9], stream[10], stream[11], stream[12], stream[13], stream[14], stream[15]]);
+		let stored_hash = u16::from_le_bytes([stream[4], stream[5]]);
+		let first_cluster = u32::from_le_bytes([stream[20], stream[21], stream[22], stream[23]]);
+		let size = u64::from_le_bytes([stream[24], stream[25], stream[26], stream[27], stream[28], stream[29], stream[30], stream[31]]);
+		// A name of no units is not a file, and one of more than 255 cannot be stored.
+		// ValidDataLength past DataLength would make the zero-fill read past the file.
+		let fragments = name_len.div_ceil(15);
+		if name_len == 0 || name_len > 255 || valid_len > size || secondary < 1 + fragments {
+			i += set_len;
+			continue;
+		}
+		let mut name: Vec<u16> = Vec::new();
+		let mut malformed = false;
+		for f in 0..fragments {
+			let x = &bytes[i + 64 + f * 32..i + 96 + f * 32];
+			// The name entries are consecutive and start immediately after the stream. A vendor
+			// extension may follow them; one in the middle of them may not.
+			if x[0] != 0xC1 {
+				malformed = true;
+				break;
+			}
+			for c in 0..15 {
+				name.push(u16::from_le_bytes([x[2 + c * 2], x[3 + c * 2]]));
+			}
+		}
+		if malformed {
+			i += set_len;
+			continue;
+		}
+		name.truncate(name_len);
+		// The hash is the volume's own index of this name. A set whose hash does not match the name
+		// beside it is one the system that wrote the medium would skip on lookup, so surfacing it
+		// here means this driver can open a file no other driver can find - and delete it.
+		if exfat_name_hash(&name, upcase) != stored_hash {
+			i += set_len;
+			continue;
+		}
+		let last = i + 32 + (1 + fragments - 1) * 32;
+		out.push(Raw { name: decode_utf16(&name), short: String::new(), size, valid_len, is_dir, attr: e[4], first_cluster, no_fat_chain, set_off: i, ent_off: last });
+		i += set_len;
 	}
 	Ok(out)
 }
@@ -225,6 +327,21 @@ fn decode_utf16(units: &[u16]) -> String {
 // NT case flags (byte 12: 0x08 = lowercase base, 0x10 = lowercase extension) are
 // honored - the media's home systems store a short-only lowercase name this way
 // instead of a long-name set, and the listing must render what they display.
+//
+// THE 8.3 FIELD IS TREATED AS ASCII, AND THIS IS A STATED LIMIT RATHER THAN AN OVERSIGHT.
+//
+// The format says those eleven bytes are in an OEM code page - which one is not recorded on the
+// volume, so a byte of 0x81 is U+0081 here, U+00FC on code page 850 and U+0433 on 866, and no
+// amount of care in this function can tell which. The choices are to implement a code page and be
+// wrong on media formatted under a different one, or to be plainly ASCII-oriented and let the long
+// name carry everything else.
+//
+// This driver takes the second. Bytes above 0x7F are decoded as UTF-8 where they happen to form it
+// and replaced with U+FFFD where they do not, the generator writes ASCII and upper-cases ASCII, and
+// alias lookup compares ASCII. For any file with a long name - which is every file this driver
+// creates whose name is not already 8.3-clean, and nearly every file on modern media - the short
+// form is a fallback that is never displayed. What is genuinely not supported is a short-ONLY name
+// with bytes above 0x7F, written by a system whose code page this one cannot know.
 fn short_name(e: &[u8]) -> String {
 	let mut raw = [0u8; 11];
 	raw.copy_from_slice(&e[0..11]);
@@ -258,12 +375,27 @@ pub(super) fn trim_spaces(b: &[u8]) -> &[u8] {
 	&b[..end]
 }
 
-// Split a path into (parent dir, final name), rejecting an empty final name.
+// Split a path into (parent dir, final name).
+//
+// ONE parser, and it refuses what it cannot represent instead of quietly repairing it. It used to
+// strip a trailing `/`, so `write_file("foo/")` wrote the FILE `foo` - a path that says "directory"
+// answered by creating something else - and `resolve_dir` separately dropped empty segments, so
+// `foo//bar` resolved. Neither is a path this filesystem has; a caller that produced one has a bug
+// and is better told than accommodated.
 pub(super) fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), FsError> {
-	let trimmed = path.strip_suffix(b"/").unwrap_or(path);
-	match trimmed.iter().rposition(|&b| b == b'/') {
-		Some(p) => Ok((&trimmed[..p], &trimmed[p + 1..])),
-		None => Ok((b"", trimmed)),
+	if path.is_empty() {
+		return Err(FsError::BadName);
+	}
+	// An empty segment - a doubled separator or a trailing slash - is a malformed path, which is
+	// what `BadName` says. A single leading `/` is not one: it is an absolute path, and the root is
+	// where this filesystem starts anyway.
+	let body = path.strip_prefix(b"/").unwrap_or(path);
+	if body.is_empty() || body.split(|&b| b == b'/').any(|s| s.is_empty()) {
+		return Err(FsError::BadName);
+	}
+	match path.iter().rposition(|&b| b == b'/') {
+		Some(p) => Ok((&path[..p], &path[p + 1..])),
+		None => Ok((b"", path)),
 	}
 }
 
@@ -529,14 +661,14 @@ pub(super) fn free_run(bytes: &[u8], n: usize) -> Option<usize> {
 // Build an exFAT entry set for `name`: a 0x85 file entry, a 0xC0 stream extension (FAT
 // chain, length, first cluster), and 0xC1 name fragments, stamped with the set checksum
 // and `ts` (the exFAT 32-bit timestamp) as its create/modify/access time, marked UTC.
-pub(super) fn build_exfat_set(name: &[u8], first: u32, size: u64, ts: u32) -> Vec<u8> {
+pub(super) fn build_exfat_set(name: &[u8], first: u32, size: u64, ts: u32, attr: u8, upcase: &Upcase) -> Vec<u8> {
 	let units: Vec<u16> = String::from_utf8_lossy(name).encode_utf16().collect();
 	let frags = units.len().div_ceil(15);
 	let count = 1 + frags;
 	let mut set = vec![0u8; (count + 1) * 32];
 	set[0] = 0x85;
 	set[1] = count as u8;
-	set[4..6].copy_from_slice(&0x20u16.to_le_bytes());
+	set[4..6].copy_from_slice(&u16::from(attr).to_le_bytes());
 	for field in [8usize, 12, 16] {
 		set[field..field + 4].copy_from_slice(&ts.to_le_bytes());
 	}
@@ -547,7 +679,7 @@ pub(super) fn build_exfat_set(name: &[u8], first: u32, size: u64, ts: u32) -> Ve
 	set[32] = 0xC0;
 	set[33] = 0x01;
 	set[35] = units.len() as u8;
-	set[36..38].copy_from_slice(&exfat_name_hash(&units).to_le_bytes());
+	set[36..38].copy_from_slice(&exfat_name_hash(&units, upcase).to_le_bytes());
 	set[40..48].copy_from_slice(&size.to_le_bytes());
 	set[52..56].copy_from_slice(&first.to_le_bytes());
 	set[56..64].copy_from_slice(&size.to_le_bytes());
@@ -578,16 +710,97 @@ pub(super) fn exfat_set_checksum(set: &[u8]) -> u16 {
 	sum
 }
 
+// The volume's Up-case Table: the mapping exFAT defines case-insensitivity by.
+//
+// It is not a property of the driver, it is a property of the VOLUME - the formatter writes it and
+// every implementation must fold through the one it finds, or two drivers disagree about whether
+// two names are the same file. Folding `a-z` and passing everything else through, which is what
+// this did, gives a non-ASCII name a hash and a lookup key no other exFAT driver computes: the file
+// is written, listed, and then not found by the system that made the medium.
+//
+// Entries at or above `map.len()` fold to themselves, which is what the table's trailing identity
+// runs mean and keeps the common table well under its uncompressed 128 KiB.
+pub(super) struct Upcase {
+	map: Vec<u16>,
+}
+
+impl Upcase {
+	// The fallback the classic families use, where case folding is an ASCII rule rather than a
+	// table on the medium. Never used for exFAT: there the table is required and read at mount.
+	pub(super) fn ascii() -> Upcase {
+		let mut map: Vec<u16> = (0u16..0x80).collect();
+		for c in 0x61u16..=0x7A {
+			map[c as usize] = c - 0x20;
+		}
+		Upcase { map }
+	}
+
+	pub(super) fn up(&self, unit: u16) -> u16 {
+		self.map.get(unit as usize).copied().unwrap_or(unit)
+	}
+
+	// Decode the table as it is stored: a run of little-endian units where 0xFFFF is the escape and
+	// the unit after it counts how many characters map to themselves. A table that would describe
+	// more than the 65536 units that exist is malformed, not merely long.
+	pub(super) fn decode(raw: &[u8]) -> Option<Upcase> {
+		if raw.len() % 2 != 0 {
+			return None;
+		}
+		let mut map: Vec<u16> = Vec::new();
+		let mut i = 0;
+		while i + 2 <= raw.len() {
+			let unit = u16::from_le_bytes([raw[i], raw[i + 1]]);
+			i += 2;
+			// 0xFFFF is the escape - unless it is the LAST unit of the table, where there is no
+			// count after it and it is the ordinary mapping for U+FFFF. The standard table ends
+			// with exactly that: 0xFFF8, 0xFFF9 ... 0xFFFF written out one by one.
+			//
+			// Refusing it instead is what a decoder written from the compression rule alone does,
+			// and it refused every volume exfatprogs formats - which is the whole reason to check a
+			// driver against media it did not produce.
+			if unit == 0xFFFF && i + 2 <= raw.len() {
+				let count = u16::from_le_bytes([raw[i], raw[i + 1]]);
+				i += 2;
+				let from = map.len();
+				if from + count as usize > 0x1_0000 {
+					return None;
+				}
+				map.extend((0..count).map(|k| (from as u16).wrapping_add(k)));
+				continue;
+			}
+			if map.len() >= 0x1_0000 {
+				return None;
+			}
+			map.push(unit);
+		}
+		// Trailing identity entries carry no information and are what makes the standard table
+		// large; dropping them is why this holds kilobytes rather than the full 128 KiB.
+		while map.last().is_some_and(|&u| u as usize == map.len() - 1) {
+			map.pop();
+		}
+		Some(Upcase { map })
+	}
+
+	// The checksum the 0x82 entry records over the table's bytes: a 32-bit rotate-and-add. It is
+	// the only thing standing between a bit-rotted table and a volume whose two drivers disagree
+	// about which names collide.
+	pub(super) fn checksum(raw: &[u8]) -> u32 {
+		let mut sum: u32 = 0;
+		for &b in raw {
+			sum = sum.rotate_right(1).wrapping_add(b as u32);
+		}
+		sum
+	}
+}
+
 // The exFAT file-name hash, over the UTF-16LE bytes of the UP-CASED name as the
 // specification defines it: the media's home systems recompute it on lookup and skip a
 // set whose stored hash mismatches, so hashing the name as written would leave a
-// lowercase-named file listable but unopenable by name there. ASCII upcasing (a driver
-// without an upcase table); other units pass through.
-fn exfat_name_hash(units: &[u16]) -> u16 {
+// lowercase-named file listable but unopenable by name there.
+fn exfat_name_hash(units: &[u16], upcase: &Upcase) -> u16 {
 	let mut hash: u16 = 0;
 	for &u in units {
-		let up = if (0x61..=0x7A).contains(&u) { u - 0x20 } else { u };
-		for b in up.to_le_bytes() {
+		for b in upcase.up(u).to_le_bytes() {
 			hash = hash.rotate_right(1).wrapping_add(b as u16);
 		}
 	}

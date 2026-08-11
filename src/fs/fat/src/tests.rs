@@ -153,12 +153,25 @@ fn place_classic(img: &mut [u8], fat: &mut [u8], next: &mut usize, dir: &mut Vec
 		img[off..off + sub_dir.len()].copy_from_slice(&sub_dir);
 		push_entry(dir, sub, true, 0, dir_cluster as u32);
 	} else {
-		let cluster = *next;
-		*next += 1;
-		set_fat(fat, ent, cluster, end_marker(kind));
-		let off = (first_data + cluster - 2) * bps;
-		img[off..off + f.data.len()].copy_from_slice(f.data);
-		push_entry(dir, f.path, false, f.data.len() as u32, cluster as u32);
+		// AS MANY CLUSTERS AS THE DATA NEEDS, chained. This laid every file in one cluster and wrote
+		// the full length into the entry, so a 1536-byte file was a 512-byte chain claiming three
+		// times its size - media no formatter produces, and a shape the read path silently served
+		// as a short file until it started checking.
+		let first = *next;
+		let clusters = f.data.len().div_ceil(bps).max(1);
+		for k in 0..clusters {
+			let cluster = first + k;
+			let link = if k + 1 < clusters { (cluster + 1) as u32 } else { end_marker(kind) };
+			set_fat(fat, ent, cluster, link);
+			let off = (first_data + cluster - 2) * bps;
+			let from = k * bps;
+			let to = (from + bps).min(f.data.len());
+			if from < to {
+				img[off..off + (to - from)].copy_from_slice(&f.data[from..to]);
+			}
+		}
+		*next += clusters;
+		push_entry(dir, f.path, false, f.data.len() as u32, first as u32);
 	}
 }
 
@@ -326,15 +339,21 @@ fn build_exfat_tree(files: &[File], nfc_files: &[File], dirs: &[&str]) -> Vec<u8
 	let mut img = vec![0u8; total * bps];
 	let mut fat = vec![0u8; fat_size * bps];
 	let mut bm = vec![0u8; clusters.div_ceil(8)];
-	let mut next = 4;
+	let mut next = 5;
 	let mut root: Vec<u8> = Vec::new();
 	// the allocation bitmap lives in cluster 2; the root in cluster 3; both stay allocated.
 	// exFAT's end-of-chain is 0xFFFFFFFF. These fixtures wrote FAT32's 0x0FFF_FFFF, which is
 	// precisely why an internal round trip could not see the driver writing the same wrong value.
 	set_fat(&mut fat, 4, 2, 0xFFFF_FFFF);
 	set_fat(&mut fat, 4, 3, 0xFFFF_FFFF);
-	bm[0] |= 0b11;
+	set_fat(&mut fat, 4, 4, 0xFFFF_FFFF);
+	bm[0] |= 0b111;
 	push_exfat_bitmap(&mut root, 2, clusters.div_ceil(8) as u64);
+	// The Up-case Table in cluster 4, and its 0x82 entry right after the bitmap's - the order a
+	// formatter writes the two required entries in.
+	let upcase = exfat_upcase_table();
+	assert!(upcase.len() <= bps, "the fixture's table must fit the one cluster it is given");
+	push_exfat_upcase(&mut root, 4, &upcase);
 	for f in files {
 		let cluster = next;
 		next += 1;
@@ -366,6 +385,8 @@ fn build_exfat_tree(files: &[File], nfc_files: &[File], dirs: &[&str]) -> Vec<u8
 	}
 	let bm_off = heap * bps;
 	img[bm_off..bm_off + bm.len()].copy_from_slice(&bm);
+	let up_off = (heap + 2) * bps;
+	img[up_off..up_off + upcase.len()].copy_from_slice(&upcase);
 	let root_off = (heap + 1) * bps;
 	img[root_off..root_off + root.len()].copy_from_slice(&root);
 	img[reserved * bps..reserved * bps + fat.len()].copy_from_slice(&fat);
@@ -419,6 +440,60 @@ fn stamp_exfat_boot_checksum(img: &mut [u8], bps: usize) {
 }
 
 // A 0x81 allocation-bitmap entry: marks the bitmap's first cluster and byte length.
+// The Up-case Table a formatter writes, in the compressed form the specification defines: 0xFFFF
+// followed by a count means "this many characters map to themselves". This one folds ASCII and
+// U+00E0..U+00FE onto their capitals, so a fixture can prove the driver is reading the VOLUME's
+// table rather than applying its own ASCII rule.
+//
+// These images had no 0x82 entry at all, which is not a legal exFAT volume - the table is required
+// - and it meant every name decision the driver made was untested against a real one.
+// Where the first file entry set begins in an exFAT root, found rather than counted. Eight tests
+// wrote `root + 32` ("the set after the bitmap entry") and every one of them moved when the
+// fixtures gained the Up-case Table the format requires.
+fn exfat_first_set(img: &[u8], root_off: usize) -> usize {
+	let mut at = root_off;
+	while at + 32 <= img.len() {
+		match img[at] {
+			0x85 => return at,
+			0x00 => break,
+			_ => at += 32,
+		}
+	}
+	panic!("no entry set in the root at {root_off:#x}");
+}
+
+fn exfat_upcase_table() -> Vec<u8> {
+	let mut units: Vec<u16> = Vec::new();
+	let mut identity = |units: &mut Vec<u16>, n: u16| {
+		units.push(0xFFFF);
+		units.push(n);
+	};
+	identity(&mut units, 0x61); // 0x0000..0x0061 map to themselves
+	units.extend((0x61u16..=0x7A).map(|c| c - 0x20)); // a-z -> A-Z
+	identity(&mut units, 0xE0 - 0x7B); // 0x007B..0x00E0
+	units.extend((0xE0u16..=0xF6).map(|c| c - 0x20)); // latin-1 lowercase -> capitals
+	units.push(0xF7); // division sign, itself
+	units.extend((0xF8u16..=0xFE).map(|c| c - 0x20));
+	let mut out: Vec<u8> = Vec::new();
+	for u in units {
+		out.extend_from_slice(&u.to_le_bytes());
+	}
+	out
+}
+
+fn push_exfat_upcase(dir: &mut Vec<u8>, cluster: u32, table: &[u8]) {
+	let mut e = [0u8; 32];
+	e[0] = 0x82;
+	let mut sum: u32 = 0;
+	for &b in table {
+		sum = sum.rotate_right(1).wrapping_add(b as u32);
+	}
+	e[4..8].copy_from_slice(&sum.to_le_bytes());
+	e[20..24].copy_from_slice(&cluster.to_le_bytes());
+	e[24..32].copy_from_slice(&(table.len() as u64).to_le_bytes());
+	dir.extend_from_slice(&e);
+}
+
 fn push_exfat_bitmap(dir: &mut Vec<u8>, cluster: u32, size: u64) {
 	let mut e = [0u8; 32];
 	e[0] = 0x81;
@@ -429,6 +504,23 @@ fn push_exfat_bitmap(dir: &mut Vec<u8>, cluster: u32, size: u64) {
 
 fn push_exfat_entry(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, nfc: bool) {
 	push_exfat_entry_ex(dir, name, size, cluster, nfc, false);
+}
+
+// The hash over the name folded through the table `exfat_upcase_table` writes - ASCII and Latin-1.
+// Deliberately a separate implementation from the driver's, so the two can disagree.
+fn fixture_name_hash(units: &[u16]) -> u16 {
+	let mut hash: u16 = 0;
+	for &u in units {
+		let up = match u {
+			0x61..=0x7A => u - 0x20,
+			0xE0..=0xF6 | 0xF8..=0xFE => u - 0x20,
+			_ => u,
+		};
+		for b in up.to_le_bytes() {
+			hash = hash.rotate_right(1).wrapping_add(b as u16);
+		}
+	}
+	hash
 }
 
 fn push_exfat_entry_ex(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, nfc: bool, is_dir: bool) {
@@ -445,6 +537,10 @@ fn push_exfat_entry_ex(dir: &mut Vec<u8>, name: &str, size: u64, cluster: u32, n
 	stream[0] = 0xC0;
 	stream[1] = if nfc { 0x03 } else { 0x01 };
 	stream[3] = units.len() as u8;
+	// The NameHash, which these fixtures left at zero. It is the volume's index of the name: the
+	// system that wrote the medium recomputes it on every lookup and skips a set that disagrees, so
+	// an image full of zero hashes is one no implementation but this one could open by name.
+	stream[4..6].copy_from_slice(&fixture_name_hash(&units).to_le_bytes());
 	stream[8..16].copy_from_slice(&size.to_le_bytes());
 	stream[20..24].copy_from_slice(&cluster.to_le_bytes());
 	stream[24..32].copy_from_slice(&size.to_le_bytes());
@@ -677,8 +773,9 @@ fn reads_and_frees_a_nofatchain_exfat_file() {
 	assert_eq!(fs.read_file(b"backup.img").unwrap(), data);
 	fs.remove(b"backup.img").unwrap();
 	assert_eq!(fs.read_file(b"backup.img"), Err(FsError::NotFound));
-	// clusters 4, 5, 6 (bitmap bits 2..=4) freed; the bitmap + root (bits 0, 1) stay.
-	assert_eq!(fs.dev.data[heap * 512], 0b11, "the NoFatChain run's bitmap bits must be cleared");
+	// the file's run is freed; the three clusters the volume's own structures live in - bitmap,
+	// root and Up-case Table - stay allocated.
+	assert_eq!(fs.dev.data[heap * 512], 0b111, "the NoFatChain run's bitmap bits must be cleared");
 }
 
 #[test]
@@ -916,7 +1013,7 @@ fn a_forged_nofatchain_size_is_refused() {
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
 	// the root: the 0x81 bitmap entry, then the 0x85 file and its 0xC0 stream entry,
 	// whose data length lives at byte 24; restamp the set checksum after the forgery.
-	let set_at = (heap + 1) * 512 + 32;
+	let set_at = exfat_first_set(&fs.dev.data, (heap + 1) * 512);
 	let stream = set_at + 32;
 	fs.dev.data[stream + 24..stream + 32].copy_from_slice(&u64::MAX.to_le_bytes());
 	let count = fs.dev.data[set_at + 1] as usize + 1;
@@ -927,7 +1024,7 @@ fn a_forged_nofatchain_size_is_refused() {
 	// run: the clusters stay marked - a bounded leak, never a foreign free.
 	fs.remove(b"backup.img").unwrap();
 	assert_eq!(fs.read_file(b"backup.img"), Err(FsError::NotFound));
-	assert_eq!(fs.dev.data[heap * 512], 0b111, "no bitmap bit may change under a refused release");
+	assert_eq!(fs.dev.data[heap * 512], 0b1111, "no bitmap bit may change under a refused release");
 }
 
 #[test]
@@ -1071,13 +1168,13 @@ fn a_full_exfat_subdirectory_grows_and_updates_its_parent_record() {
 	// SUB's entry set sits right after the bitmap entry in the root: 0x85 at 32, the
 	// 0xC0 stream at 64. Both recorded lengths must now be two clusters, and the set
 	// checksum must match a recomputation.
-	let root_off = (heap + 1) * 512;
-	let stream = root_off + 64;
+	let root_off = exfat_first_set(&fs.dev.data, (heap + 1) * 512);
+	let stream = root_off + 32;
 	let valid = u64::from_le_bytes(fs.dev.data[stream + 8..stream + 16].try_into().unwrap());
 	let data = u64::from_le_bytes(fs.dev.data[stream + 24..stream + 32].try_into().unwrap());
 	assert_eq!((valid, data), (1024, 1024), "the parent record must grow with the directory");
-	let stored = u16::from_le_bytes(fs.dev.data[root_off + 34..root_off + 36].try_into().unwrap());
-	assert_eq!(stored, exfat_set_checksum(&fs.dev.data[root_off + 32..root_off + 128]), "the set checksum must be restamped");
+	let stored = u16::from_le_bytes(fs.dev.data[root_off + 2..root_off + 4].try_into().unwrap());
+	assert_eq!(stored, exfat_set_checksum(&fs.dev.data[root_off..root_off + 96]), "the set checksum must be restamped");
 }
 
 #[test]
@@ -1188,8 +1285,8 @@ fn written_entries_carry_the_volume_clock() {
 	ex.set_clock(946_684_800);
 	ex.write_file(b"S.TXT", b"stamped").unwrap();
 	let heap = 25usize;
-	let root_off = (heap + 1) * 512;
-	let e = &ex.dev.data[root_off + 32..root_off + 64]; // the set after the bitmap entry
+	let root_off = exfat_first_set(&ex.dev.data, (heap + 1) * 512);
+	let e = &ex.dev.data[root_off..root_off + 32];
 	assert_eq!(e[0], 0x85);
 	let ts = (date_2000 as u32) << 16;
 	assert_eq!(u32::from_le_bytes(e[8..12].try_into().unwrap()), ts, "the exFAT create timestamp");
@@ -1387,7 +1484,9 @@ fn an_all_spaces_classic_entry_is_skipped() {
 	img[slot + 11] = 0x20; // attributes: an ordinary file
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
 	assert!(names(&fs.list().unwrap()).iter().all(|n| !n.is_empty()));
-	assert_eq!(fs.read_file(b""), Err(FsError::NotFound));
+	// An empty path is malformed rather than absent - the parser refuses it before any directory is
+	// searched, which is the stronger answer: it cannot match an empty name however one got stored.
+	assert_eq!(fs.read_file(b""), Err(FsError::BadName));
 }
 
 #[test]
@@ -1398,11 +1497,9 @@ fn a_lowercase_exfat_name_carries_the_upcased_hash() {
 	let mut fs = FatFs::mount(MemDisk { data: build_exfat(&[]) }).unwrap();
 	fs.write_file(b"hello.txt", b"cased").unwrap();
 	let heap = 25usize; // 24 reserved + 1 FAT sector
-	let root_off = (heap + 1) * 512;
-	// the set follows the bitmap entry: 0x85 at 32, the 0xC0 stream at 64; the hash
-	// sits at stream bytes 4..6. Compare against an independent computation over the
-	// up-cased UTF-16LE name.
-	let stream = root_off + 64;
+	// the stream record follows the 0x85 that starts the set, and the hash sits at its bytes 4..6.
+	// Compare against an independent computation over the up-cased UTF-16LE name.
+	let stream = exfat_first_set(&fs.dev.data, (heap + 1) * 512) + 32;
 	assert_eq!(fs.dev.data[stream], 0xC0);
 	let stored = u16::from_le_bytes(fs.dev.data[stream + 4..stream + 6].try_into().unwrap());
 	let mut expect: u16 = 0;
@@ -1541,9 +1638,9 @@ fn a_preallocated_exfat_tail_reads_as_zeros() {
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
 	// HELLO.TXT's chained set follows the bitmap entry; backup.img's NoFatChain set
 	// follows it. Cut each VDL below the DataLength and restamp the checksums.
-	let root_off = (25 + 1) * 512;
-	restamp_vdl(&mut fs.dev.data, root_off + 32, 5);
-	restamp_vdl(&mut fs.dev.data, root_off + 32 + 96, 700);
+	let first = exfat_first_set(&fs.dev.data, (25 + 1) * 512);
+	restamp_vdl(&mut fs.dev.data, first, 5);
+	restamp_vdl(&mut fs.dev.data, first + 96, 700);
 	let hello = fs.read_file(b"HELLO.TXT").unwrap();
 	assert_eq!(hello.len(), 11);
 	assert_eq!(&hello[..5], b"Hello");
@@ -1747,7 +1844,8 @@ fn an_overwrite_preserves_the_creation_stamp_and_name_case() {
 	ex.set_clock(1_075_680_000);
 	ex.write_file(b"CASE.TXT", b"two").unwrap();
 	assert!(names(&ex.list().unwrap()).contains(&"Case.txt".to_string()));
-	let e = &ex.dev.data[(25 + 1) * 512 + 32..(25 + 1) * 512 + 128]; // the set after the bitmap entry
+	let set_at = exfat_first_set(&ex.dev.data, (25 + 1) * 512);
+	let e = &ex.dev.data[set_at..set_at + 96];
 	assert_eq!(e[0], 0x85);
 	assert_eq!(u32::from_le_bytes(e[8..12].try_into().unwrap()), (d1 as u32) << 16, "the exFAT create timestamp must carry over");
 	assert_eq!(u32::from_le_bytes(e[12..16].try_into().unwrap()), (d2 as u32) << 16, "the exFAT modify timestamp must be fresh");
@@ -2169,7 +2267,11 @@ fn an_exfat_boot_region_that_fails_its_own_checks_does_not_mount() {
 	// the overlap rule refuses the volume before the FAT count is ever considered. Moving the heap
 	// one sector out makes room, and the same layout with one FAT must still mount - otherwise this
 	// proves nothing about the count.
+	// Making room means moving the heap, and the heap has contents - the bitmap, the root and the
+	// Up-case Table, all of which mount now reads. Shifting the declaration alone leaves a volume
+	// that fails for the wrong reason, so the clusters move with it.
 	let with_room = |img: &mut Vec<u8>, fats: u8| {
+		img.copy_within(25 * 512..(25 + 64) * 512, 26 * 512);
 		img[88..92].copy_from_slice(&26u32.to_le_bytes());
 		img[110] = fats;
 		stamp_exfat_boot_checksum(img, 512);
@@ -2178,4 +2280,583 @@ fn an_exfat_boot_region_that_fails_its_own_checks_does_not_mount() {
 	with_room(&mut one, 1);
 	assert!(FatFs::mount(MemDisk { data: one }).is_some(), "the layout with room for a second FAT must mount when it declares one");
 	refused("a TexFAT volume declaring two FATs", &|img| with_room(img, 2));
+}
+
+#[test]
+fn an_exfat_name_folds_through_the_volumes_own_upcase_table() {
+	// exFAT does not define case-insensitivity - the VOLUME does, in the Up-case Table its
+	// formatter wrote. A driver that folds `a-z` and passes everything else through computes a
+	// different NameHash and a different collision set than the system the medium came from: a
+	// non-ASCII name is written, listed, and then not found there by the name it was given.
+	//
+	// The fixture's table folds Latin-1 as well as ASCII, so a name outside ASCII proves the table
+	// is being read rather than a rule being applied.
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(&[]) }).unwrap();
+	fs.write_file("café.txt".as_bytes(), b"one").unwrap();
+
+	// The hash the driver stored must be the one computed over the name folded through the table:
+	// é (U+00E9) upcases to É (U+00C9), which ASCII-only folding leaves alone.
+	let stream = exfat_first_set(&fs.dev.data, 26 * 512) + 32;
+	let stored = u16::from_le_bytes(fs.dev.data[stream + 4..stream + 6].try_into().unwrap());
+	let hash = |name: &str| {
+		let mut h: u16 = 0;
+		for u in name.encode_utf16() {
+			for b in u.to_le_bytes() {
+				h = h.rotate_right(1).wrapping_add(b as u16);
+			}
+		}
+		h
+	};
+	assert_eq!(stored, hash("CAFÉ.TXT"), "the NameHash must be over the name folded through the volume's table");
+	assert_ne!(hash("CAFÉ.TXT"), hash("CAFé.TXT"), "the two foldings must differ, or this test proves nothing");
+
+	// And the fold governs lookup the same way, in both directions.
+	assert_eq!(fs.read_file("CAFÉ.TXT".as_bytes()).unwrap(), b"one");
+	assert_eq!(fs.read_file("café.txt".as_bytes()).unwrap(), b"one");
+	// Which makes it a collision: the same name by the volume's rule is the same file.
+	fs.write_file("CAFÉ.TXT".as_bytes(), b"two").unwrap();
+	assert_eq!(fs.list().unwrap().len(), 1, "two spellings the volume's table folds together must be one file");
+	assert_eq!(fs.read_file("café.txt".as_bytes()).unwrap(), b"two");
+}
+
+#[test]
+fn an_exfat_volume_without_a_usable_upcase_table_does_not_mount() {
+	// The table is required, and a driver that shrugs and uses its own rule makes every name
+	// decision on the volume - lookup, collision, the hash it writes - its own opinion.
+	let good = build_exfat(ROOT);
+	let refused = |what: &str, edit: &dyn Fn(&mut Vec<u8>)| {
+		let mut img = good.clone();
+		edit(&mut img);
+		assert!(FatFs::mount(MemDisk { data: img }).is_none(), "{what}");
+	};
+	// No 0x82 entry at all: the root's second required entry, removed.
+	refused("a root with no Up-case Table entry", &|img| img[26 * 512 + 32] = 0x00);
+	// A table whose bytes no longer match the checksum recorded beside them.
+	refused("a table that fails its own checksum", &|img| img[27 * 512] ^= 0xFF);
+	// A DataLength describing more characters than exist.
+	refused("a table longer than the character set it maps", &|img| {
+		let at = 26 * 512 + 32;
+		img[at + 24..at + 32].copy_from_slice(&(4 * 0x1_0000u64).to_le_bytes());
+	});
+}
+
+#[test]
+fn a_checksum_valid_but_ungrammatical_entry_set_is_not_a_file() {
+	// The set checksum says the bytes are the ones that were written. It says nothing about whether
+	// they describe a file, and the parser used to take any 0xC0 anywhere among the secondaries and
+	// any 0xC1 anywhere. Each of these is checksum-valid and structurally impossible, and each one
+	// used to surface in a listing as a file whose clusters something could later free.
+	let restamp = |img: &mut Vec<u8>, at: usize| {
+		let count = img[at + 1] as usize + 1;
+		let sum = exfat_set_checksum(&img[at..at + count * 32]);
+		img[at + 2..at + 4].copy_from_slice(&sum.to_le_bytes());
+	};
+	let listed_after = |edit: &dyn Fn(&mut Vec<u8>, usize)| {
+		let mut img = build_exfat(&[File { path: "GOOD.TXT", data: b"g" }, File { path: "NEXT.TXT", data: b"n" }]);
+		let at = exfat_first_set(&img, 26 * 512);
+		edit(&mut img, at);
+		restamp(&mut img, at);
+		let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+		names(&fs.list().unwrap())
+	};
+
+	// A name fragment where the Stream Extension must be: the length that governs the name is not
+	// there, and the fragments are being read before anything declared how many there are.
+	let no_stream = listed_after(&|img, at| img[at + 32] = 0xC1);
+	assert_eq!(no_stream, ["NEXT.TXT"], "a set with no Stream Extension immediately after the File entry");
+
+	// A NameLength that does not match the fragments present. Truncating it silently renamed the
+	// file to a prefix of itself - a different name, with the same clusters.
+	let short_len = listed_after(&|img, at| img[at + 32 + 3] = 3);
+	assert_eq!(short_len, ["NEXT.TXT"], "a NameLength the fragments do not support");
+
+	// A hash that does not match the name beside it. The system that wrote the medium skips this
+	// set on lookup, so accepting it means opening - and deleting - a file nothing else can find.
+	let bad_hash = listed_after(&|img, at| img[at + 32 + 4] ^= 0xFF);
+	assert_eq!(bad_hash, ["NEXT.TXT"], "a set whose NameHash does not match its own name");
+
+	// ValidDataLength past DataLength, which would make the zero-fill read past the file.
+	let bad_vdl = listed_after(&|img, at| img[at + 32 + 8..at + 32 + 16].copy_from_slice(&u64::MAX.to_le_bytes()));
+	assert_eq!(bad_vdl, ["NEXT.TXT"], "a ValidDataLength past the DataLength");
+
+	// A bare File entry claiming secondaries it does not have room to describe.
+	// (the count alone - zeroing the leftover fragments would terminate the directory instead,
+	// which is a different refusal and would make the assertion below pass for the wrong reason)
+	let no_name = listed_after(&|img, at| img[at + 1] = 1);
+	assert_eq!(no_name, ["NEXT.TXT"], "a set with a stream and no name entries");
+
+	// A record where a name fragment must be. A vendor extension is legal AFTER the name entries
+	// and not in the middle of them, and reading one as a fragment invents fifteen units of name.
+	let vendor_fragment = listed_after(&|img, at| img[at + 64] = 0xE0);
+	assert_eq!(vendor_fragment, ["NEXT.TXT"], "a non-0xC1 record among the name entries");
+
+	// And the healthy fixture must list both, or every assertion above is vacuous.
+	let untouched = listed_after(&|_, _| {});
+	assert_eq!(untouched, ["GOOD.TXT", "NEXT.TXT"]);
+}
+
+#[test]
+fn an_overwrite_keeps_the_attributes_and_read_only_refuses_one() {
+	// The attribute byte is the file's, not the writer's. Rewriting an entry with a fresh 0x20
+	// cleared read-only, hidden and system - flags a user or another system set, silently dropped
+	// by a write that succeeded. And read-only was decoration: nothing on the write or remove path
+	// looked at it, so the one flag whose entire purpose is to refuse a write did not.
+	for (label, kind) in [("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
+		let mut fs = FatFs::mount(MemDisk { data: build_fat(kind, ROOT) }).unwrap();
+		fs.write_file(b"FLAGS.TXT", b"one").unwrap();
+		let root_off = classic_root_off(&fs.dev.data);
+		let at = (0..).map(|k| root_off + k * 32).find(|&at| &fs.dev.data[at..at + 11] == b"FLAGS   TXT").expect("the entry");
+
+		// hidden + system, set by whoever owns the medium.
+		fs.dev.data[at + 11] |= 0x02 | 0x04;
+		fs.write_file(b"FLAGS.TXT", b"two").unwrap();
+		let after = fs.dev.data[at + 11];
+		assert_eq!(after & 0x06, 0x06, "{label}: an overwrite dropped hidden/system");
+		assert_eq!(after & 0x20, 0x20, "{label}: an overwrite must still mark the file archived");
+
+		// and read-only refuses both mutations, without disturbing the file.
+		fs.dev.data[at + 11] |= 0x01;
+		assert_eq!(fs.write_file(b"FLAGS.TXT", b"three"), Err(FsError::ReadOnly), "{label}: a read-only file was overwritten");
+		assert_eq!(fs.remove(b"FLAGS.TXT"), Err(FsError::ReadOnly), "{label}: a read-only file was removed");
+		assert_eq!(fs.read_file(b"FLAGS.TXT").unwrap(), b"two");
+	}
+}
+
+#[test]
+fn an_exfat_overwrite_keeps_the_attributes_and_read_only_refuses_one() {
+	// The same rule on the other family, where the flags live in the File entry's FileAttributes.
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(&[]) }).unwrap();
+	fs.write_file(b"FLAGS.TXT", b"one").unwrap();
+	let at = exfat_first_set(&fs.dev.data, 26 * 512);
+	let restamp = |img: &mut Vec<u8>, at: usize| {
+		let count = img[at + 1] as usize + 1;
+		let sum = exfat_set_checksum(&img[at..at + count * 32]);
+		img[at + 2..at + 4].copy_from_slice(&sum.to_le_bytes());
+	};
+
+	fs.dev.data[at + 4] |= 0x02 | 0x04;
+	restamp(&mut fs.dev.data, at);
+	fs.write_file(b"FLAGS.TXT", b"two").unwrap();
+	let after = fs.dev.data[exfat_first_set(&fs.dev.data, 26 * 512) + 4];
+	assert_eq!(after & 0x06, 0x06, "an exFAT overwrite dropped hidden/system");
+	assert_eq!(after & 0x20, 0x20, "an exFAT overwrite must still mark the file archived");
+
+	let at = exfat_first_set(&fs.dev.data, 26 * 512);
+	fs.dev.data[at + 4] |= 0x01;
+	restamp(&mut fs.dev.data, at);
+	assert_eq!(fs.write_file(b"FLAGS.TXT", b"three"), Err(FsError::ReadOnly));
+	assert_eq!(fs.remove(b"FLAGS.TXT"), Err(FsError::ReadOnly));
+	assert_eq!(fs.read_file(b"FLAGS.TXT").unwrap(), b"two");
+}
+
+// A device that records the exFAT VolumeFlags of every boot-sector write, so the dirty flag's
+// lifetime across an operation can be observed rather than assumed.
+struct FlagLog {
+	inner: MemDisk,
+	flags: Vec<u16>,
+}
+
+impl BlockDevice for FlagLog {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		self.inner.read_block(lba, buf)
+	}
+
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
+		if lba == 0 {
+			self.flags.push(u16::from_le_bytes([buf[106], buf[107]]));
+		}
+		self.inner.write_block(lba, buf)
+	}
+}
+
+#[test]
+fn an_exfat_mutation_runs_between_a_raised_and_a_cleared_dirty_flag() {
+	// VolumeDirty is the recovery signal the format defines, and it was not maintained "to save
+	// sector writes". A volume that lost power mid-write then looked exactly like one that did not.
+	//
+	// The two fields sit in the three bytes the boot checksum skips, precisely so a running system
+	// can keep them current - maintaining them cannot invalidate the checksum, which is the reason
+	// the saving was not worth taking.
+	let inner = MemDisk { data: build_exfat(&[]) };
+	let mut fs = FatFs::mount(FlagLog { inner, flags: Vec::new() }).unwrap();
+	fs.write_file(b"A.TXT", b"one").unwrap();
+	assert_eq!(fs.dev.flags.first().map(|f| f & 0x02), Some(0x02), "the flag must be raised before the transaction");
+	assert_eq!(fs.dev.flags.last().map(|f| f & 0x02), Some(0), "and cleared after it");
+	assert_eq!(fs.dev.inner.data[112], 0xFF, "PercentInUse must say unknown rather than a stale number");
+
+	fs.dev.flags.clear();
+	fs.remove(b"A.TXT").unwrap();
+	assert_eq!(fs.dev.flags.first().map(|f| f & 0x02), Some(0x02), "a remove is a metadata transaction too");
+	assert_eq!(fs.dev.flags.last().map(|f| f & 0x02), Some(0));
+
+	// The boot checksum still holds, which is the whole reason these fields are exempt from it.
+	let image = core::mem::take(&mut fs.dev.inner.data);
+	assert!(FatFs::mount(MemDisk { data: image }).is_some(), "maintaining the flags must not invalidate the boot checksum");
+}
+
+#[test]
+fn a_volume_left_dirty_mounts_read_only() {
+	// A volume whose last writer never cleared the flag may be mid-transaction. Writing over it is
+	// how a recoverable inconsistency becomes an unrecoverable one, so the mount refuses mutations
+	// and leaves the repair to something that can do it.
+	let mut img = build_exfat(&[File { path: "A.TXT", data: b"a" }]);
+	img[106] |= 0x02;
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("a dirty volume still mounts - for reading");
+	assert_eq!(fs.read_file(b"A.TXT").unwrap(), b"a", "reading is exactly what a dirty mount is for");
+	assert_eq!(fs.write_file(b"B.TXT", b"b"), Err(FsError::ReadOnly));
+	assert_eq!(fs.remove(b"A.TXT"), Err(FsError::ReadOnly));
+}
+
+#[test]
+fn a_directory_write_touches_only_the_sectors_that_changed() {
+	// The old rule was "the span between the first and last differing byte", written cluster by
+	// cluster. Two changes at opposite ends of a directory therefore rewrote everything between
+	// them: write amplification on the medium whose writes are the scarce resource, and - because a
+	// directory swap is not atomic - a crash window as wide as the span where two sectors would do.
+	//
+	// Measured on the function itself. The two-phase publish added for the swap already keeps each
+	// of ITS two writes narrow by construction, so going through `write_file` would measure that
+	// fix rather than this one; `write_dir_dirty` is still reached with distant changes by the
+	// terminator scrub and by any caller that edits two places at once.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat32, &[]) }).unwrap();
+	for i in 0..100u32 {
+		let name = alloc::format!("F{i:03}.TXT");
+		fs.write_file(name.as_bytes(), b"x").unwrap();
+	}
+	let root = Dir::at(fs.geo.root_cluster);
+	let orig = fs.read_dir_bytes(&root).unwrap();
+	let spc = fs.geo.sectors_per_cluster as usize;
+	let bps = fs.geo.bytes_per_sector as usize;
+	assert!(orig.len() / (spc * bps) >= 4, "the fixture must span several clusters: {} bytes", orig.len());
+
+	// One byte changed near the front and one near the back, with everything between untouched.
+	let mut bytes = orig.clone();
+	bytes[8] = b'Z';
+	let last = bytes.len() - 1 - 24;
+	bytes[last] = 0x20;
+
+	let image = core::mem::take(&mut fs.dev.data);
+	let mut fs = FatFs::mount(WriteLog { inner: MemDisk { data: image }, writes: Vec::new() }).unwrap();
+	fs.write_dir_dirty(&root, &bytes, &orig).unwrap();
+	let touched = fs.dev.writes.len();
+	assert_eq!(touched, 2, "two changed sectors cost {touched} writes - the span between them, not the changes");
+
+	// Both changes actually landed: narrowing must not mean skipping.
+	let back = fs.read_dir_bytes(&root).unwrap();
+	assert_eq!(back[8], b'Z');
+	assert_eq!(back[last], 0x20);
+	assert_eq!(&back[9..last], &orig[9..last], "an untouched byte between the two changes must be untouched on the medium too");
+}
+
+#[test]
+fn a_path_is_parsed_once_and_an_error_says_which_kind_of_wrong() {
+	// Two parsers with different opinions and a vocabulary of one error. `resolve_dir` dropped
+	// empty segments so `foo//bar` resolved; `split_parent` stripped a trailing slash so
+	// `write_file("foo/")` created the FILE `foo`; reading a directory said NotFound and a path
+	// through a file said NotFound too, when `FsError` already distinguishes all of them.
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	assert!(fs.list_dir(b"DOCS").is_ok(), "the fixture must have the directory these assertions use");
+	assert_eq!(fs.read_file(b"DOCS/a.txt").unwrap(), b"in a subdir");
+
+	// Malformed paths, refused as malformed rather than repaired.
+	assert_eq!(fs.read_file(b"DOCS//a.txt"), Err(FsError::BadName), "a doubled separator is not a path");
+	assert_eq!(fs.write_file(b"NEW.TXT/", b"x"), Err(FsError::BadName), "a trailing slash names a directory, not a file to create");
+	assert_eq!(fs.read_file(b""), Err(FsError::BadName));
+
+	// The wrong kind of thing, named as such.
+	assert_eq!(fs.read_file(b"DOCS"), Err(FsError::IsDir), "reading a directory is not a missing file");
+	assert_eq!(fs.remove(b"DOCS"), Err(FsError::IsDir), "removing a directory is not an invalid argument");
+	assert_eq!(fs.read_file(b"HELLO.TXT/inner"), Err(FsError::NotDir), "a path through a file is not a missing file");
+	assert_eq!(fs.list_dir(b"HELLO.TXT"), Err(FsError::NotDir));
+	// And list_dir, which takes a path directly, is judged by the same rule rather than its own.
+	assert_eq!(fs.list_dir(b"DOCS//"), Err(FsError::BadName));
+	assert!(fs.list_dir(b"/DOCS").is_ok(), "a leading slash is an absolute path, not an empty segment");
+
+	// And what is genuinely absent still says so.
+	assert_eq!(fs.read_file(b"NOPE.TXT"), Err(FsError::NotFound));
+	assert_eq!(fs.read_file(b"NOPE/a.txt"), Err(FsError::NotFound));
+}
+
+#[test]
+fn a_structurally_impossible_long_name_falls_back_to_the_short_one() {
+	// The sequence numbers and the checksum are most of the value and they were already checked.
+	// What was not is the structural remainder: a fragment can satisfy both and still describe
+	// something the format cannot hold, and the parser then reads its bytes as name units.
+	//
+	// In every case the file is not lost - the 8.3 alias is right there and still names it. What
+	// must not happen is a name assembled out of padding, reserved fields or a sequence longer than
+	// 255 units, because that name is the one a caller then stores and looks up by.
+	let planted = |edit: &dyn Fn(&mut Vec<u8>, usize)| {
+		let mut img = build_fat(Kind::Fat16, &[]);
+		let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+		fs.write_file(b"Long name file.txt", b"x").unwrap();
+		img = core::mem::take(&mut fs.dev.data);
+		let root_off = classic_root_off(&img);
+		edit(&mut img, root_off);
+		let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+		names(&fs.list().unwrap())
+	};
+
+	// Untouched, the long name is what the listing shows - so every assertion below is a change.
+	assert_eq!(planted(&|_, _| {}), ["Long name file.txt"]);
+
+	// A sequence number past 20: twenty fragments of thirteen units is 260, and 255 is the limit.
+	let over_length = planted(&|img, at| img[at] = 0x40 | 21);
+	assert_eq!(over_length.len(), 1);
+	assert!(over_length[0].ends_with(".TXT") && over_length[0] != "Long name file.txt", "a sequence past the format's limit was still assembled: {over_length:?}");
+
+	// The reserved byte 12, and the first-cluster field a fragment must leave at zero: a fragment
+	// carrying a cluster number is a record something else may follow.
+	let reserved = planted(&|img, at| img[at + 12] = 1);
+	assert_ne!(reserved[0], "Long name file.txt", "a fragment with a non-zero reserved byte was trusted");
+	let cluster = planted(&|img, at| img[at + 26] = 2);
+	assert_ne!(cluster[0], "Long name file.txt", "a fragment carrying a first cluster was trusted");
+
+	// Data after the terminator in the final fragment: the units past a 0x0000 must all be 0xFFFF,
+	// and reading them as name invents characters that were never written.
+	let after_terminator = planted(&|img, at| {
+		// the final fragment's last two name slots are at bytes 28 and 30
+		img[at + 30..at + 32].copy_from_slice(&0x0041u16.to_le_bytes());
+	});
+	assert_ne!(after_terminator[0], "Long name file.txt", "a fragment with data past its terminator was trusted");
+}
+
+// Cross-checks against exfatprogs: read an image this tree did not build, and hand one this tree
+// wrote to an independent checker. The second direction is the one that catches a driver and its
+// fixtures agreeing with each other, which is exactly how the exFAT terminator stayed wrong.
+//
+// Skipped, loudly, when the tools are absent - a test that quietly passes on a machine without
+// them would be worse than no test.
+#[cfg(test)]
+fn exfatprogs_available() -> bool {
+	let ok = std::process::Command::new("mkfs.exfat").arg("-V").output().is_ok() && std::process::Command::new("fsck.exfat").arg("-V").output().is_ok();
+	if !ok {
+		std::println!("SKIPPED: exfatprogs (mkfs.exfat / fsck.exfat) is not installed - the independent cross-check did not run");
+	}
+	ok
+}
+
+#[test]
+fn an_image_from_an_independent_formatter_mounts_and_reads() {
+	if !exfatprogs_available() {
+		return;
+	}
+	let dir = std::env::temp_dir().join("fat-gold-read");
+	let _ = std::fs::create_dir_all(&dir);
+	let path = dir.join("gold.img");
+	let _ = std::fs::remove_file(&path);
+	std::fs::write(&path, alloc::vec![0u8; 8 << 20]).expect("a blank image");
+	let made = std::process::Command::new("mkfs.exfat").arg("-s").arg("512").arg("-c").arg("4096").arg(&path).output().expect("mkfs.exfat");
+	assert!(made.status.success(), "mkfs.exfat failed: {}", String::from_utf8_lossy(&made.stderr));
+
+	// Everything this driver validates at mount - the boot checksum, the revision, the FAT bounds,
+	// the Up-case Table and its checksum - is being checked against a volume nothing in this tree
+	// produced. A fixture cannot make this pass by sharing a mistake.
+	let image = std::fs::read(&path).expect("the formatted image");
+	let mut fs = FatFs::mount(MemDisk { data: image }).expect("an exfatprogs volume must mount");
+	assert_eq!(fs.kind_name(), "exfat");
+	assert!(fs.list().unwrap().is_empty(), "a fresh volume has no files");
+
+	// And it is writable: the write path's idea of the layout has to match the formatter's too.
+	fs.write_file(b"FROM-US.TXT", b"written by this driver").unwrap();
+	assert_eq!(fs.read_file(b"FROM-US.TXT").unwrap(), b"written by this driver");
+}
+
+#[test]
+fn what_this_driver_writes_passes_an_independent_checker() {
+	if !exfatprogs_available() {
+		return;
+	}
+	let dir = std::env::temp_dir().join("fat-gold-write");
+	let _ = std::fs::create_dir_all(&dir);
+	let path = dir.join("ours.img");
+	let _ = std::fs::remove_file(&path);
+	std::fs::write(&path, alloc::vec![0u8; 8 << 20]).expect("a blank image");
+	let made = std::process::Command::new("mkfs.exfat").arg("-s").arg("512").arg("-c").arg("4096").arg(&path).output().expect("mkfs.exfat");
+	assert!(made.status.success(), "mkfs.exfat failed: {}", String::from_utf8_lossy(&made.stderr));
+
+	let image = std::fs::read(&path).expect("the formatted image");
+	let mut fs = FatFs::mount(MemDisk { data: image }).expect("mount");
+	fs.write_file(b"SMALL.TXT", b"one cluster").unwrap();
+	fs.write_file(b"BIG.BIN", &alloc::vec![0xA5u8; 40 * 4096]).unwrap();
+	fs.write_file("dlouhé jméno.txt".as_bytes(), b"a name outside ASCII").unwrap();
+	fs.write_file(b"GONE.TXT", b"removed again").unwrap();
+	fs.remove(b"GONE.TXT").unwrap();
+	fs.write_file(b"SMALL.TXT", b"overwritten, which frees the old chain").unwrap();
+	std::fs::write(&path, &fs.dev.data).expect("write the volume back");
+
+	// The judgement that matters: an implementation with no stake in this one's assumptions.
+	let checked = std::process::Command::new("fsck.exfat").arg("-n").arg(&path).output().expect("fsck.exfat");
+	let report = alloc::format!("{}{}", String::from_utf8_lossy(&checked.stdout), String::from_utf8_lossy(&checked.stderr));
+	assert!(checked.status.success(), "fsck.exfat rejected a volume this driver wrote:\n{report}");
+	assert!(report.contains("clean"), "fsck.exfat did not call the volume clean:\n{report}");
+}
+
+#[cfg(test)]
+fn mtools_available() -> bool {
+	let ok = std::process::Command::new("mformat").arg("-v").output().is_ok() && std::process::Command::new("mdir").arg("-V").output().is_ok();
+	if !ok {
+		std::println!("SKIPPED: mtools (mformat / mdir / mtype) is not installed - the classic-family cross-check did not run");
+	}
+	ok
+}
+
+#[test]
+fn what_this_driver_writes_to_a_classic_volume_another_implementation_reads() {
+	// The same cross-check on the other family. mtools has no fsck, so the independent judgement is
+	// a read: an implementation with no stake in this one's assumptions has to find the files, see
+	// their long names, and get their bytes back.
+	//
+	// The volume is formatted by mformat, so the layout is not this tree's either - which is the
+	// half that catches a driver and its fixtures agreeing with each other.
+	if !mtools_available() {
+		return;
+	}
+	let dir = std::env::temp_dir().join("fat-gold-classic");
+	let _ = std::fs::create_dir_all(&dir);
+	let path = dir.join("classic.img");
+	let _ = std::fs::remove_file(&path);
+	std::fs::write(&path, alloc::vec![0u8; 8 << 20]).expect("a blank image");
+	let made = std::process::Command::new("mformat").arg("-i").arg(&path).arg("-F").arg("::").output().expect("mformat");
+	assert!(made.status.success(), "mformat failed: {}", String::from_utf8_lossy(&made.stderr));
+
+	let image = std::fs::read(&path).expect("the formatted image");
+	let mut fs = FatFs::mount(MemDisk { data: image }).expect("an mformat volume must mount");
+	fs.write_file(b"SHORT.TXT", b"eight point three").unwrap();
+	fs.write_file(b"A long name with spaces.txt", b"a VFAT long name set").unwrap();
+	fs.write_file(b"BIG.BIN", &alloc::vec![0x5Au8; 9000]).unwrap();
+	fs.write_file(b"GONE.TXT", b"removed").unwrap();
+	fs.remove(b"GONE.TXT").unwrap();
+	std::fs::write(&path, &fs.dev.data).expect("write the volume back");
+
+	let listed = std::process::Command::new("mdir").arg("-i").arg(&path).arg("-a").arg("::").output().expect("mdir");
+	let report = alloc::format!("{}{}", String::from_utf8_lossy(&listed.stdout), String::from_utf8_lossy(&listed.stderr));
+	assert!(listed.status.success(), "mdir could not read a directory this driver wrote:\n{report}");
+	assert!(report.contains("A long name with spaces.txt"), "the long name did not survive an independent reader:\n{report}");
+	assert!(report.contains("SHORT"), "{report}");
+	assert!(!report.contains("GONE"), "a removed file is still listed by an independent reader:\n{report}");
+
+	// And the bytes, not just the names.
+	let typed = std::process::Command::new("mtype").arg("-i").arg(&path).arg("::A long name with spaces.txt").output().expect("mtype");
+	assert_eq!(String::from_utf8_lossy(&typed.stdout).trim_end(), "a VFAT long name set", "an independent reader got different bytes back");
+	let big = std::process::Command::new("mtype").arg("-i").arg(&path).arg("::BIG.BIN").output().expect("mtype");
+	assert_eq!(big.stdout.len(), 9000, "a multi-cluster file read back at the wrong length");
+	assert!(big.stdout.iter().all(|&b| b == 0x5A), "a multi-cluster file read back with the wrong contents");
+}
+
+// Every cluster each live file names, and which file named it - the shape both cross-link
+// invariants are stated over. Only the classic families, where the root region can be parsed
+// without following a chain; the exFAT paths get their coverage from fsck.exfat above.
+#[cfg(test)]
+fn owned_clusters<D: BlockDevice>(fs: &mut FatFs<D>) -> Result<Vec<(String, Vec<u32>)>, String> {
+	let bytes = fs.read_dir_bytes(&Dir::at(0)).map_err(|e| alloc::format!("the root is unreadable: {e:?}"))?;
+	let entries = parse_fat_dir(&bytes).map_err(|e| alloc::format!("the root does not parse: {e:?}"))?;
+	let max = fs.max_cluster();
+	let mut out: Vec<(String, Vec<u32>)> = Vec::new();
+	for e in entries.iter().filter(|e| !e.is_dir && e.first_cluster != 0) {
+		let mut chain = Vec::new();
+		let mut c = e.first_cluster;
+		let mut guard = 0;
+		while c >= 2 && c <= max && !fs.is_end(c) {
+			chain.push(c);
+			c = fs.next_cluster(c).map_err(|err| alloc::format!("{}: unreadable chain: {err:?}", e.name))?;
+			guard += 1;
+			if guard > max {
+				return Err(alloc::format!("{}: a chain that never ends", e.name));
+			}
+		}
+		out.push((e.name.clone(), chain));
+	}
+	Ok(out)
+}
+
+// The invariants a volume must satisfy after ANY interrupted operation, whatever it was.
+#[cfg(test)]
+fn crash_invariants<D: BlockDevice>(fs: &mut FatFs<D>, note: &str) {
+	let owned = match owned_clusters(fs) {
+		Ok(owned) => owned,
+		Err(why) => panic!("{note}: {why}"),
+	};
+	let mut seen: Vec<(u32, String)> = Vec::new();
+	for (name, chain) in &owned {
+		for &c in chain {
+			// A live entry naming a cluster the FAT calls free is the cross-link waiting to happen:
+			// the next allocation hands it out and two files share it.
+			let link = fs.next_cluster(c).unwrap_or(0);
+			if link == 0 {
+				panic!("{note}: {name} names cluster {c}, which the FAT says is free");
+			}
+			if let Some((_, other)) = seen.iter().find(|(x, _)| *x == c) {
+				panic!("{note}: cluster {c} is named by both {other} and {name}");
+			}
+			seen.push((c, name.clone()));
+		}
+	}
+	// And every file the volume still lists must be readable: an entry that survives an interrupted
+	// write pointing at something unreadable is the same damage by another route.
+	for (name, _) in &owned {
+		if let Err(e) = fs.read_file(name.as_bytes()) {
+			panic!("{note}: {name} is listed and cannot be read: {e:?}");
+		}
+	}
+}
+
+#[test]
+fn every_mutating_operation_survives_being_cut_at_any_write() {
+	// The generic form of the harness that found the directory-swap defect. Each operation is run
+	// once per failure point, against a device whose Nth write fails and whose later writes
+	// succeed - the transient error, which is both the commoner one and the only one that lets a
+	// recovery path run and do its damage.
+	//
+	// After each cut the volume is remounted and asked the questions that do not depend on which
+	// operation was interrupted: does it still mount, does every live entry name clusters the FAT
+	// agrees are allocated, does any cluster have two owners, and does every listed file read.
+	// Then an allocation is forced, because that is what turns a freed-but-still-named cluster from
+	// latent damage into a cross-link.
+	// HOLE.TXT FIRST, and it is removed before each run. The order is the whole fixture: a
+	// replacement entry goes into the earliest free run, so with the hole after the file being
+	// replaced it lands back in that file's own vacated slots - one write, nothing to interrupt
+	// between. With the hole before it, the new entry and the old one's deletion are two separate
+	// ranges and the publish protocol has two writes to be cut between.
+	let seed: &[File] = &[
+		File { path: "HOLE.TXT", data: b"removed to make an early hole" },
+		File { path: "KEEP.TXT", data: b"untouched by any of this" },
+		File { path: "OLD.TXT", data: b"the file being replaced" },
+		File { path: "BIG.BIN", data: &[0x11u8; 3 * 512] },
+	];
+	type Op = (&'static str, fn(&mut FatFs<FailNthWrite>) -> Result<(), FsError>);
+	let operations: &[Op] = &[
+		("create", |fs| fs.write_file(b"NEW.TXT", b"a file that did not exist")),
+		("overwrite-smaller", |fs| fs.write_file(b"BIG.BIN", b"much shorter now")),
+		("overwrite-larger", |fs| fs.write_file(b"OLD.TXT", &[0x22u8; 4 * 512])),
+		("remove", |fs| fs.remove(b"BIG.BIN")),
+		("create-into-a-hole", |fs| fs.write_file(b"INTO.TXT", b"lands where HOLE.TXT was")),
+	];
+
+	for (label, operation) in operations {
+		let mut cut_at_least_one = false;
+		for budget in 1..40usize {
+			let base = build_fat(Kind::Fat16, seed);
+			let mut prep = FatFs::mount(MemDisk { data: base }).expect("mount");
+			prep.remove(b"HOLE.TXT").expect("the early hole");
+			let holed = core::mem::take(&mut prep.device_for_test().data);
+
+			let mut fs = FatFs::mount(FailNthWrite { data: holed, seen: 0, fail_at: budget }).expect("mount");
+			let outcome = operation(&mut fs);
+			cut_at_least_one |= outcome.is_err();
+			let image = core::mem::take(&mut fs.device_for_test().data);
+
+			let note = alloc::format!("{label} cut at write {budget}");
+			let mut check = FatFs::mount(MemDisk { data: image }).unwrap_or_else(|| panic!("{note}: the volume no longer mounts"));
+			crash_invariants(&mut check, &note);
+			// KEEP.TXT is never the subject of any operation: whatever happened, it is intact.
+			assert_eq!(check.read_file(b"KEEP.TXT").unwrap(), b"untouched by any of this", "{note}: an uninvolved file was damaged");
+
+			// Force an allocation, then ask again - this is what makes latent damage visible.
+			let _ = check.write_file(b"BAIT.BIN", &[0xCCu8; 4 * 512]);
+			crash_invariants(&mut check, &alloc::format!("{note}, after a later allocation"));
+			assert_eq!(check.read_file(b"KEEP.TXT").unwrap(), b"untouched by any of this", "{note}: an uninvolved file was damaged by a later allocation");
+		}
+		assert!(cut_at_least_one, "{label}: no budget in the sweep interrupted it, so nothing was tested");
+	}
 }

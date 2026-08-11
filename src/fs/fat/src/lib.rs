@@ -159,6 +159,10 @@ pub struct FatFs<D: BlockDevice> {
 	// entry becomes two files sharing a cluster. A mount that stops mutating keeps the damage at
 	// whatever the failed write left, where a repair tool can still see it.
 	degraded: bool,
+	// The volume's case-folding rule. exFAT keeps it on the medium as the Up-case Table and every
+	// implementation must use the one it finds; the classic families fold ASCII by rule, so they
+	// get a table that says exactly that.
+	upcase: dir::Upcase,
 }
 
 // Why a directory swap failed, and whether the new entry may already be on the medium.
@@ -212,7 +216,21 @@ impl<D: BlockDevice> FatFs<D> {
 		if !dev.read_block(heap_end * ratio - 1, &mut last) {
 			return None;
 		}
-		Some(FatFs { dev, geo, clock: 0, degraded: false })
+		let mut fs = FatFs { dev, geo, clock: 0, degraded: false, upcase: dir::Upcase::ascii() };
+		// An exFAT volume without a readable Up-case Table is refused rather than mounted with a
+		// guess: every name decision on it - lookup, collision, the hash written into an entry set -
+		// would be this driver's opinion instead of the volume's, and the damage is silent.
+		if fs.geo.kind == Kind::ExFat {
+			fs.upcase = fs.load_upcase().ok()?;
+			// VolumeDirty already set means the last writer never finished: the metadata may be
+			// mid-transaction. Mounting it read-only is what the flag is FOR - writing over a
+			// volume in that state is how a recoverable inconsistency becomes an unrecoverable one.
+			// A repair tool clears the flag; this driver does not.
+			if u16::from_le_bytes([boot[106], boot[107]]) & 0x02 != 0 {
+				fs.degraded = true;
+			}
+		}
+		Some(fs)
 	}
 
 	// Set the wall clock (Unix seconds, UTC) subsequent writes stamp their directory
@@ -324,7 +342,7 @@ impl<D: BlockDevice> FatFs<D> {
 		let dir = self.resolve_dir(parent)?;
 		let entry = self.find_entry(&dir, name)?;
 		if entry.is_dir {
-			return Err(FsError::NotFound);
+			return Err(FsError::IsDir);
 		}
 		// the bytes past the ValidDataLength are undefined on disk and the media's home
 		// systems serve them as zeros - a preallocated tail must never leak stale
@@ -354,11 +372,12 @@ impl<D: BlockDevice> FatFs<D> {
 	// data is fully on disk before the directory entry swaps over, and the old chain is
 	// freed only after the swap - so a failure part-way never costs the old file.
 	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
+		self.ensure_writable()?;
 		let (parent, name) = split_parent(path)?;
 		check_name(name)?;
 		let dir = self.resolve_dir(parent)?;
 		if self.geo.kind == Kind::ExFat {
-			return self.exfat_write(&dir, name, data);
+			return self.under_dirty_flag(|fs| fs.exfat_write(&dir, name, data));
 		}
 		// classic FAT records a 32-bit size; a larger buffer would silently truncate.
 		if data.len() > u32::MAX as usize {
@@ -412,10 +431,11 @@ impl<D: BlockDevice> FatFs<D> {
 	// Delete a file named by a `/`-separated path: free its cluster chain and clear its
 	// directory entry, for any of the four families.
 	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
+		self.ensure_writable()?;
 		let (parent, name) = split_parent(path)?;
 		let dir = self.resolve_dir(parent)?;
 		if self.geo.kind == Kind::ExFat {
-			return self.exfat_remove(&dir, name);
+			return self.under_dirty_flag(|fs| fs.exfat_remove(&dir, name));
 		}
 		if !self.unlink_in(&dir, name)? {
 			return Err(FsError::NotFound);
@@ -437,11 +457,20 @@ impl<D: BlockDevice> FatFs<D> {
 	// entry pointing at the root carries first cluster 0, which on FAT32/exFAT means the
 	// root cluster, not the FAT12/16 fixed region.
 	fn resolve_dir(&mut self, path: &[u8]) -> Result<Dir, FsError> {
+		// The same rule the name parser applies, because a path reaching here directly - `list_dir`
+		// takes one - must not be judged by a different one. An empty path is the root; an empty
+		// SEGMENT inside a path is malformed.
+		let body = path.strip_prefix(b"/").unwrap_or(path);
+		if !body.is_empty() && body.split(|&b| b == b'/').any(|s| s.is_empty()) {
+			return Err(FsError::BadName);
+		}
 		let mut dir = Dir::at(self.root_cluster());
-		for seg in path.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+		for seg in body.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
 			let e = self.find_entry(&dir, seg)?;
+			// A path component that names a file is not a missing directory, it is the wrong kind
+			// of thing - which `FsError` has a word for and this returned `NotFound` instead of.
 			if !e.is_dir {
-				return Err(FsError::NotFound);
+				return Err(FsError::NotDir);
 			}
 			let cluster = if e.first_cluster == 0 { self.root_cluster() } else { e.first_cluster };
 			let nfc_len = if e.no_fat_chain && e.first_cluster != 0 { Some(e.size) } else { None };
@@ -456,7 +485,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// short form) in `dir`, or NotFound. Reuses the same scan the listing does.
 	fn find_entry(&mut self, dir: &Dir, name: &[u8]) -> Result<Raw, FsError> {
 		let entries = self.scan_dir(dir)?;
-		entries.into_iter().find(|e| e.matches(name)).ok_or(FsError::NotFound)
+		entries.into_iter().find(|e| e.matches(name, &self.upcase)).ok_or(FsError::NotFound)
 	}
 
 	// The listing of a directory: name + size + is_dir, dropping the "." / ".." links.
@@ -472,7 +501,7 @@ impl<D: BlockDevice> FatFs<D> {
 	fn scan_dir(&mut self, dir: &Dir) -> Result<Vec<Raw>, FsError> {
 		let bytes = self.read_dir_bytes(dir)?;
 		match self.geo.kind {
-			Kind::ExFat => parse_exfat_dir(&bytes),
+			Kind::ExFat => parse_exfat_dir(&bytes, &self.upcase),
 			_ => parse_fat_dir(&bytes),
 		}
 	}
@@ -1014,47 +1043,74 @@ impl<D: BlockDevice> FatFs<D> {
 	// whole big directory: that amplifies every write, and a power cut mid-rewrite
 	// could tear entries unrelated to the operation.
 	fn write_dir_dirty(&mut self, dir: &Dir, bytes: &[u8], orig: &[u8]) -> Result<(), FsError> {
+		let bps = self.geo.bytes_per_sector as usize;
 		let at = |i: usize| orig.get(i).copied().unwrap_or(0);
-		let mut lo = 0usize;
-		while lo < bytes.len() && bytes[lo] == at(lo) {
-			lo += 1;
+		// WHICH SECTORS CHANGED, not the span between the first and last change.
+		//
+		// The span is one number and it is the wrong one: an overwrite that puts the new entry in
+		// an early hole and deletes the old one hundreds of clusters later rewrote every cluster
+		// between them. That is write amplification on a medium whose writes are the scarce thing,
+		// and - because a directory swap is not atomic - it is also a crash window hundreds of
+		// clusters wide where two sectors would do.
+		let count = bytes.len().div_ceil(bps);
+		let mut dirty = vec![false; count];
+		for (sector, flag) in dirty.iter_mut().enumerate() {
+			let from = sector * bps;
+			let to = (from + bps).min(bytes.len());
+			*flag = (from..to).any(|i| bytes[i] != at(i));
 		}
-		if lo == bytes.len() {
+		if !dirty.iter().any(|&d| d) {
 			return Ok(());
 		}
-		let mut hi = bytes.len();
-		while hi > lo && bytes[hi - 1] == at(hi - 1) {
-			hi -= 1;
-		}
 		if dir.cluster == 0 {
-			let bps = self.geo.bytes_per_sector as usize;
 			let start = (self.geo.reserved_sectors + self.geo.num_fats * self.geo.fat_size) as u64;
-			let (first, last) = (lo / bps, (hi - 1) / bps);
-			return self.write_fs_sectors(start + first as u64, (last - first + 1) as u32, &bytes[first * bps..(last + 1) * bps]);
+			return self.write_dirty_runs(start, &dirty, 0, count, bytes);
 		}
-		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
-		let (first, last) = (lo / cluster_bytes, (hi - 1) / cluster_bytes);
+		let spc = self.geo.sectors_per_cluster as usize;
+		let clusters = count.div_ceil(spc);
 		if dir.nfc_len.is_some() {
-			for k in first..=last {
-				let off = k * cluster_bytes;
-				if off + cluster_bytes <= bytes.len() {
-					self.write_fs_sectors(self.cluster_fs_sector(dir.cluster + k as u32), self.geo.sectors_per_cluster, &bytes[off..off + cluster_bytes])?;
-				}
+			for k in 0..clusters {
+				self.write_dirty_runs(self.cluster_fs_sector(dir.cluster + k as u32), &dirty, k * spc, spc, bytes)?;
 			}
 			return Ok(());
 		}
+		// The chain is still walked whole - a later cluster can be dirty when an earlier one is not
+		// - but a clean cluster costs a FAT lookup rather than a write.
 		let mut c = dir.cluster;
 		let mut k = 0usize;
-		while k <= last && c >= 2 && !self.is_end(c) {
+		while k < clusters && c >= 2 && !self.is_end(c) {
 			if c > self.max_cluster() {
 				return Err(FsError::Invalid);
 			}
-			let off = k * cluster_bytes;
-			if k >= first && off + cluster_bytes <= bytes.len() {
-				self.write_fs_sectors(self.cluster_fs_sector(c), self.geo.sectors_per_cluster, &bytes[off..off + cluster_bytes])?;
-			}
+			self.write_dirty_runs(self.cluster_fs_sector(c), &dirty, k * spc, spc, bytes)?;
 			c = self.next_cluster(c)?;
 			k += 1;
+		}
+		Ok(())
+	}
+
+	// Write the dirty sectors of one region as merged runs: `dirty[from..from + len]` describes the
+	// region's sectors, and `base` is where its first sector lives on the volume. Adjacent dirty
+	// sectors become one write, which is what keeps a multi-entry set from becoming one write per
+	// 512 bytes.
+	fn write_dirty_runs(&mut self, base: u64, dirty: &[bool], from: usize, len: usize, bytes: &[u8]) -> Result<(), FsError> {
+		let bps = self.geo.bytes_per_sector as usize;
+		let mut i = 0;
+		while i < len {
+			if !dirty.get(from + i).copied().unwrap_or(false) {
+				i += 1;
+				continue;
+			}
+			let start = i;
+			while i < len && dirty.get(from + i).copied().unwrap_or(false) {
+				i += 1;
+			}
+			let at = (from + start) * bps;
+			let end = (from + i) * bps;
+			if end > bytes.len() {
+				return Err(FsError::Invalid);
+			}
+			self.write_fs_sectors(base + start as u64, (i - start) as u32, &bytes[at..end])?;
 		}
 		Ok(())
 	}
@@ -1065,7 +1121,7 @@ impl<D: BlockDevice> FatFs<D> {
 	fn unlink_in(&mut self, dir: &Dir, name: &[u8]) -> Result<bool, FsError> {
 		let mut bytes = self.read_dir_bytes(dir)?;
 		let orig = bytes.clone();
-		match mark_unlinked(&mut bytes, name)? {
+		match mark_unlinked(&mut bytes, name, &self.upcase)? {
 			None => Ok(false),
 			Some(e) => {
 				self.write_dir_dirty(dir, &bytes, &orig)?;
@@ -1092,12 +1148,15 @@ impl<D: BlockDevice> FatFs<D> {
 		let mut bytes = self.read_dir_bytes(dir).map_err(fail)?;
 		let orig = bytes.clone();
 		scrub_after_terminator(&mut bytes);
-		let old = mark_unlinked(&mut bytes, name).map_err(fail)?;
+		let old = mark_unlinked(&mut bytes, name, &self.upcase).map_err(fail)?;
 		let name: &[u8] = match &old {
 			Some(o) if writable_name(o.name.as_bytes()) => o.name.as_bytes(),
 			_ => name,
 		};
-		let mut entries = build_entries(name, &bytes, first, size, 0x20, self.dos_stamp()).map_err(fail)?;
+		// The attributes of the file being replaced, plus archive - not a fresh 0x20, which is how
+		// an overwrite used to clear read-only, hidden and system.
+		let attr = old.as_ref().map_or(dir::ATTR_ARCHIVE, |o| (o.attr & dir::ATTR_CARRIED) | dir::ATTR_ARCHIVE);
+		let mut entries = build_entries(name, &bytes, first, size, attr, self.dos_stamp()).map_err(fail)?;
 		if let Some(o) = &old {
 			// the creation stamp (tenths + time + date) carries over from the replaced
 			// entry - only the byte 0 of its records was marked, the fields are intact.
@@ -1215,6 +1274,60 @@ impl<D: BlockDevice> FatFs<D> {
 	// bitmap and write them first, then swap the 0x85 / 0xC0 / 0xC1 entry set in one
 	// directory write, and only then release the replaced file's clusters - a failure
 	// part-way never costs the old file.
+	// Raise or clear exFAT's VolumeDirty, and mark PercentInUse unknown while allocation is moving.
+	//
+	// These are the two fields the specification asks a writer to maintain and this driver skipped
+	// "to save sector writes". VolumeDirty is the recovery signal: raised before a metadata
+	// transaction and cleared after it, so a volume that lost power mid-write says so instead of
+	// looking clean. PercentInUse is required to be kept current or set to FFh - unknown - and
+	// unknown is both honest and free, where recomputing a percentage would cost a bitmap scan on
+	// every allocation.
+	//
+	// Both fields sit in the three bytes the boot checksum deliberately skips, which is exactly
+	// because they are meant to be rewritten under a running system: maintaining them cannot
+	// invalidate the checksum.
+	// Every mutation passes through here. `set_fat_entry` refuses on its own, which covers most of
+	// them, but not a remove of a file with no clusters - and "most mutations" is not a read-only
+	// mount.
+	fn ensure_writable(&self) -> Result<(), FsError> {
+		if self.degraded {
+			return Err(FsError::ReadOnly);
+		}
+		Ok(())
+	}
+
+	fn set_volume_dirty(&mut self, dirty: bool) -> Result<(), FsError> {
+		if self.geo.kind != Kind::ExFat {
+			return Ok(());
+		}
+		let mut boot = [0u8; SECTOR_SIZE];
+		if !self.dev.read_block(0, &mut boot) {
+			return Err(FsError::Io);
+		}
+		let mut flags = u16::from_le_bytes([boot[106], boot[107]]);
+		if dirty {
+			flags |= 0x02;
+		} else {
+			flags &= !0x02;
+		}
+		boot[106..108].copy_from_slice(&flags.to_le_bytes());
+		boot[112] = 0xFF;
+		if !self.dev.write_block(0, &boot) {
+			return Err(FsError::Io);
+		}
+		Ok(())
+	}
+
+	// Run a metadata transaction between the two halves of the dirty flag. A failure to CLEAR it is
+	// not a failure of the operation - the data is written - but it does leave the volume looking
+	// unclean, which is the safe direction to fail in.
+	fn under_dirty_flag<R>(&mut self, body: impl FnOnce(&mut Self) -> Result<R, FsError>) -> Result<R, FsError> {
+		self.set_volume_dirty(true)?;
+		let outcome = body(self);
+		let _ = self.set_volume_dirty(false);
+		outcome
+	}
+
 	fn exfat_write(&mut self, dir: &Dir, name: &[u8], data: &[u8]) -> Result<(), FsError> {
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let need = data.len().div_ceil(cluster_bytes);
@@ -1249,7 +1362,7 @@ impl<D: BlockDevice> FatFs<D> {
 	fn exfat_remove(&mut self, dir: &Dir, name: &[u8]) -> Result<(), FsError> {
 		let mut bytes = self.read_dir_bytes(dir)?;
 		let orig = bytes.clone();
-		let Some(old) = exfat_mark_unlinked(&mut bytes, name)? else {
+		let Some(old) = exfat_mark_unlinked(&mut bytes, name, &self.upcase)? else {
 			return Err(FsError::NotFound);
 		};
 		self.write_dir_dirty(dir, &bytes, &orig)?;
@@ -1268,12 +1381,13 @@ impl<D: BlockDevice> FatFs<D> {
 		let mut bytes = self.read_dir_bytes(dir)?;
 		let orig = bytes.clone();
 		scrub_after_terminator(&mut bytes);
-		let old = exfat_mark_unlinked(&mut bytes, name)?;
+		let old = exfat_mark_unlinked(&mut bytes, name, &self.upcase)?;
 		let name: &[u8] = match &old {
 			Some(o) if writable_name(o.name.as_bytes()) => o.name.as_bytes(),
 			_ => name,
 		};
-		let mut set = build_exfat_set(name, first, size, self.exfat_stamp());
+		let attr = old.as_ref().map_or(dir::ATTR_ARCHIVE, |o| (o.attr & dir::ATTR_CARRIED) | dir::ATTR_ARCHIVE);
+		let mut set = build_exfat_set(name, first, size, self.exfat_stamp(), attr, &self.upcase);
 		if let Some(o) = &old {
 			// the creation stamp (timestamp + 10ms increment + UTC marker) carries over
 			// from the replaced set; the checksum is restamped over the final bytes.
@@ -1377,6 +1491,44 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Locate the allocation bitmap (the 0x81 entry in the root): its first cluster and its
 	// byte length. exFAT tracks free clusters as a bit per cluster, set when allocated.
+	// The volume's Up-case Table, read from the 0x82 entry in the root and checked against the
+	// checksum recorded beside it.
+	//
+	// This is required reading, not an optimisation. exFAT defines case-insensitivity by the table
+	// the FORMATTER wrote, so a driver that folds by its own rule computes different name hashes
+	// and different collisions than the system the medium came from - a file written here with a
+	// non-ASCII name is listable there and not openable by name.
+	fn load_upcase(&mut self) -> Result<dir::Upcase, FsError> {
+		let bytes = self.read_dir_bytes(&Dir::at(self.geo.root_cluster))?;
+		let mut i = 0;
+		while i + 32 <= bytes.len() {
+			let e = &bytes[i..i + 32];
+			if e[0] == 0x00 {
+				break;
+			}
+			if e[0] == 0x82 {
+				let stored = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+				let first = u32::from_le_bytes([e[20], e[21], e[22], e[23]]);
+				let size = u64::from_le_bytes([e[24], e[25], e[26], e[27], e[28], e[29], e[30], e[31]]);
+				// Two bytes per unit and 65536 units is every table there can be; a DataLength past
+				// that describes a table larger than the character set it maps.
+				if size == 0 || size > 2 * 0x1_0000 {
+					return Err(FsError::Invalid);
+				}
+				let cluster_bytes = self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64;
+				let cap = size.div_ceil(cluster_bytes).saturating_mul(cluster_bytes) as usize;
+				let mut table = self.read_chain(first, cap)?;
+				table.truncate(size as usize);
+				if dir::Upcase::checksum(&table) != stored {
+					return Err(FsError::Invalid);
+				}
+				return dir::Upcase::decode(&table).ok_or(FsError::Invalid);
+			}
+			i += 32;
+		}
+		Err(FsError::Invalid)
+	}
+
 	fn exfat_bitmap(&mut self) -> Result<(u32, u64), FsError> {
 		let bytes = self.read_dir_bytes(&Dir::at(self.geo.root_cluster))?;
 		let mut i = 0;
