@@ -197,7 +197,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0130 - What the component SDK is, and what its milestone says it is](P02M0130.md)
 - [x] [P02M0131 - What LiberMemFS's capacity actually bounds](P02M0131.md)
 - [x] [P02M0132 - The gap between what fsck can see and what a writable mount will accept](P02M0132.md)
-- [x] [P02M0133 - The parts are right; the transactions between them are not](P02M0133.md)
+- [ ] [P02M0133 - The parts are right; the transactions between them are not](P02M0133.md)
 
 ### Definition of done (phase 2)
 
