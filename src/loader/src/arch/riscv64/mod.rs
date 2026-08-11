@@ -379,19 +379,18 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle) {
 	}
 	let cap = map_size + desc_size * 16;
 	let buf = crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
-	// GIVE THE HEAP BACK, here and not a line earlier.
+	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
-	// The arenas are the loader's own working memory and left alone they reach the kernel as
-	// `MEM_BOOTLOADER`, which its frame allocator never seeds - so they would be reserved for the
-	// system's whole life. But freeing them BEFORE this allocation hung the machine: the firmware
-	// satisfies `AllocateAnyPages` out of whatever is free, sixteen megabytes had just become
-	// free, and the buffer it handed back landed where the post-ExitBootServices copy puts the
-	// kernel. The copy then wrote over the map the firmware was still reading, and the boot
-	// stopped with the loader's last line on the wire and nothing after it.
+	// The arenas are the loader's own working memory, and left alone they reach the kernel as
+	// `MEM_BOOTLOADER` - which its frame allocator never seeds, so they would be reserved for the
+	// system's whole life. The number is printed because it is the one this milestone asked to be
+	// measured.
 	//
-	// Freed AFTER the buffer exists, the map still reports the arenas as usable - which is the
-	// whole point of returning them - and nothing allocated afterwards can land in the kernel's
-	// destination, because nothing is allocated afterwards.
+	// The ORDER is a precaution rather than a fix for anything observed: freeing megabytes and then
+	// asking the firmware for a buffer invites `AllocateAnyPages` to hand back part of what was just
+	// freed, and on a port that copies the kernel over a fixed physical span after
+	// `ExitBootServices` that placement would matter. Freed after the last allocation, nothing the
+	// firmware places afterwards can be in freed memory, because it places nothing.
 	{
 		let freed = crate::heap::release(bs) / 1024;
 		serial::write_str("loader: returned ");

@@ -373,16 +373,18 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 	}
 	let cap = map_size + desc_size * 16;
 	let buf = alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
-	// GIVE THE HEAP BACK, here and not before the buffer above.
+	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
-	// The arenas are the loader's own working memory and left alone they reach the kernel as
-	// `MEM_BOOTLOADER`, which its frame allocator never seeds - so they would be reserved for the
-	// system's whole life. Freeing them BEFORE this allocation hung riscv64: the firmware satisfies
-	// `AllocateAnyPages` out of whatever is free, sixteen megabytes had just become free, and the
-	// buffer it handed back landed where that port places the kernel after `ExitBootServices`.
-	// x86_64 has never shown it - it maps the kernel rather than copying over a fixed physical
-	// span - and the ordering is the same on all three ports because the reason is the firmware's,
-	// not the port's.
+	// The arenas are the loader's own working memory, and left alone they reach the kernel as
+	// `MEM_BOOTLOADER` - which its frame allocator never seeds, so they would be reserved for the
+	// system's whole life. The number is printed because it is the one this milestone asked to be
+	// measured.
+	//
+	// The ORDER is a precaution rather than a fix for anything observed: freeing megabytes and then
+	// asking the firmware for a buffer invites `AllocateAnyPages` to hand back part of what was just
+	// freed, and on a port that copies the kernel over a fixed physical span after
+	// `ExitBootServices` that placement would matter. Freed after the last allocation, nothing the
+	// firmware places afterwards can be in freed memory, because it places nothing.
 	{
 		let freed = crate::heap::release(bs) / 1024;
 		serial::write_str("loader: returned ");
