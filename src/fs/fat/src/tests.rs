@@ -42,6 +42,20 @@ struct File {
 // Build a classic FAT image (12 / 16 / 32 chosen by `kind`) holding `files`. spc 1, one
 // FAT; clusters are handed out per file/dir, FAT chains and directory entries written so
 // the reader walks them exactly as it would a real disk. Subdirectories get "." / "..".
+// Where a classic volume's fixed root region starts, read off the BPB rather than restated as a
+// constant. Six tests carried `21 * 512 // reserved 1 + FAT 20 sectors` and every one of them broke
+// the moment the fixtures grew their second FAT - a comment describing the layout is not the layout.
+fn classic_root_off(img: &[u8]) -> usize {
+	let bps = u16::from_le_bytes([img[11], img[12]]) as usize;
+	let reserved = u16::from_le_bytes([img[14], img[15]]) as usize;
+	let fats = img[16] as usize;
+	let fat_size = u16::from_le_bytes([img[22], img[23]]) as usize;
+	(reserved + fats * fat_size) * bps
+}
+
+// How many FAT copies the fixtures carry. Every classic formatter writes two and mirrors them.
+const FATS: usize = 2;
+
 fn build_fat(kind: Kind, files: &[File]) -> Vec<u8> {
 	let clusters: usize = match kind {
 		Kind::Fat12 => 1000,
@@ -66,7 +80,10 @@ fn build_fat_sized(kind: Kind, files: &[File], clusters: usize) -> Vec<u8> {
 	};
 	let fat_size = (clusters * ent).div_ceil(bps);
 	let root_sectors = (root_entries * 32).div_ceil(bps);
-	let first_data = reserved + fat_size + root_sectors;
+	// TWO FATs, because that is what every formatter of this family writes and what the driver's
+	// mirroring path exists for. A one-FAT image is legal and nothing in the wild produces it, so
+	// building one meant the loop over copies had never run against the crate's own media.
+	let first_data = reserved + FATS * fat_size + root_sectors;
 	let total = first_data + clusters;
 	let mut img = vec![0u8; total * bps];
 	let mut fat = vec![0u8; fat_size * bps];
@@ -82,11 +99,14 @@ fn build_fat_sized(kind: Kind, files: &[File], clusters: usize) -> Vec<u8> {
 		img[lba..lba + root.len().min(bps)].copy_from_slice(&root[..root.len().min(bps)]);
 		set_fat(&mut fat, ent, root_cluster, 0x0FFF_FFFF);
 	} else {
-		let root_off = (reserved + fat_size) * bps;
+		let root_off = (reserved + FATS * fat_size) * bps;
 		img[root_off..root_off + root.len()].copy_from_slice(&root);
 	}
-	img[(reserved * bps)..(reserved * bps) + fat.len()].copy_from_slice(&fat);
-	write_bpb(&mut img, bps, spc, reserved, fat_size, root_entries, total, root_cluster);
+	for copy in 0..FATS {
+		let at = (reserved + copy * fat_size) * bps;
+		img[at..at + fat.len()].copy_from_slice(&fat);
+	}
+	write_bpb(&mut img, bps, spc, reserved, FATS, fat_size, root_entries, total, root_cluster);
 	img
 }
 
@@ -98,7 +118,7 @@ fn build_fat12(files: &[File], clusters: usize) -> Vec<u8> {
 	let root_entries: usize = 512;
 	let fat_size = (clusters * 3).div_ceil(2).div_ceil(bps);
 	let root_sectors = (root_entries * 32).div_ceil(bps);
-	let first_data = reserved + fat_size + root_sectors;
+	let first_data = reserved + FATS * fat_size + root_sectors;
 	let total = first_data + clusters;
 	let mut img = vec![0u8; total * bps];
 	let mut fat = vec![0u8; fat_size * bps];
@@ -107,10 +127,13 @@ fn build_fat12(files: &[File], clusters: usize) -> Vec<u8> {
 	for f in files {
 		place_classic(&mut img, &mut fat, &mut next, &mut root, f, first_data, 12, Kind::Fat12);
 	}
-	let root_off = (reserved + fat_size) * bps;
+	let root_off = (reserved + FATS * fat_size) * bps;
 	img[root_off..root_off + root.len()].copy_from_slice(&root);
-	img[(reserved * bps)..(reserved * bps) + fat.len()].copy_from_slice(&fat);
-	write_bpb(&mut img, bps, 1, reserved, fat_size, root_entries, total, 0);
+	for copy in 0..FATS {
+		let at = (reserved + copy * fat_size) * bps;
+		img[at..at + fat.len()].copy_from_slice(&fat);
+	}
+	write_bpb(&mut img, bps, 1, reserved, FATS, fat_size, root_entries, total, 0);
 	img
 }
 
@@ -246,11 +269,11 @@ fn trim_spaces83(s: &[u8; 11]) -> Vec<u8> {
 	out
 }
 
-fn write_bpb(img: &mut [u8], bps: usize, spc: usize, reserved: usize, fat_size: usize, root_entries: usize, total: usize, root_cluster: usize) {
+fn write_bpb(img: &mut [u8], bps: usize, spc: usize, reserved: usize, fats: usize, fat_size: usize, root_entries: usize, total: usize, root_cluster: usize) {
 	img[11..13].copy_from_slice(&(bps as u16).to_le_bytes());
 	img[13] = spc as u8;
 	img[14..16].copy_from_slice(&(reserved as u16).to_le_bytes());
-	img[16] = 1;
+	img[16] = fats as u8;
 	img[17..19].copy_from_slice(&(root_entries as u16).to_le_bytes());
 	if total < 0x10000 {
 		img[19..21].copy_from_slice(&(total as u16).to_le_bytes());
@@ -355,9 +378,44 @@ fn build_exfat_tree(files: &[File], nfc_files: &[File], dirs: &[&str]) -> Vec<u8
 	img[108] = 9;
 	img[109] = 0;
 	img[110] = 1;
+	// The fields a real formatter writes and these fixtures did not: the revision (major 1), the
+	// volume length, and the boot checksum in sector 11. Without them the images were exFAT only in
+	// the sense that they said so - and every validation the driver gained had to be turned off or
+	// the crate's own media would fail it.
+	img[104] = 0; // VersionMinor
+	img[105] = 1; // VersionMajor
+	// exFAT's floor is 2^20 bytes, so a 45 KiB image is not an exFAT volume however plausible its
+	// other fields are. The heap keeps its size and the volume is padded out to the floor - which
+	// is also what a formatter does when asked to make a filesystem smaller than it allows.
+	let volume_sectors = total.max((1 << 20) / bps);
+	img.resize(volume_sectors * bps, 0);
+	img[72..80].copy_from_slice(&(volume_sectors as u64).to_le_bytes());
 	img[510] = 0x55;
 	img[511] = 0xAA;
+	// Last, because it sums every byte before it - including the signature just written.
+	stamp_exfat_boot_checksum(&mut img, bps);
 	img
+}
+
+// Compute the exFAT boot checksum over sectors 0..11 and write it across sector 11, the way a
+// formatter finishes a volume. Sectors 1..9 are the extended boot sectors; each ends with the
+// 0xAA550000 signature, which is part of what is summed.
+fn stamp_exfat_boot_checksum(img: &mut [u8], bps: usize) {
+	for sector in 1..9 {
+		let end = (sector + 1) * bps;
+		img[end - 4..end].copy_from_slice(&0xAA55_0000u32.to_le_bytes());
+	}
+	let mut sum: u32 = 0;
+	for at in 0..11 * bps {
+		if at == 106 || at == 107 || at == 112 {
+			continue;
+		}
+		sum = (sum >> 1) | (sum << 31);
+		sum = sum.wrapping_add(img[at] as u32);
+	}
+	for chunk in img[11 * bps..12 * bps].chunks_exact_mut(4) {
+		chunk.copy_from_slice(&sum.to_le_bytes());
+	}
 }
 
 // A 0x81 allocation-bitmap entry: marks the bitmap's first cluster and byte length.
@@ -836,7 +894,7 @@ fn a_1024_byte_sector_volume_reads_and_writes() {
 	push_entry(&mut root, "HELLO.TXT", false, 11, 2);
 	let root_off = (1 + fat_size) * bps;
 	img[root_off..root_off + root.len()].copy_from_slice(&root);
-	write_bpb(&mut img, bps, 1, 1, fat_size, 512, total, 0);
+	write_bpb(&mut img, bps, 1, 1, 1, fat_size, 512, total, 0);
 	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
 	assert_eq!(fs.kind_name(), "fat16");
 	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"Hello, FAT!");
@@ -895,7 +953,7 @@ fn an_entry_never_lands_past_the_terminator() {
 	// garbage past it used to push a new entry set beyond the terminator - written
 	// where the parser (which stops there) never looks: a silently lost file.
 	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
-	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
+	let root_off = classic_root_off(&fs.dev.data);
 	// ROOT is four records, so slot 4 is the terminator - plant garbage in slot 5.
 	fs.dev.data[root_off + 5 * 32] = b'X';
 	fs.write_file(b"a long note.txt", b"visible").unwrap();
@@ -1083,9 +1141,12 @@ fn degenerate_boot_pointers_do_not_mount() {
 	let mut ex_active = build_exfat(ROOT);
 	ex_active[106] |= 0x01;
 	assert!(FatFs::mount(MemDisk { data: ex_active }).is_none(), "a TexFAT second-active-FAT volume");
-	// a FAT32 whose ExtFlags name an active copy past the copy count.
+	// a FAT32 whose ExtFlags name an active copy past the copy count. The fixtures carry two
+	// copies, so copy 1 is a legal choice and only copy 2 is past the end - the value has to be
+	// derived from what the image says, not from what one earlier fixture happened to have.
 	let mut bad_active = build_fat(Kind::Fat32, ROOT);
-	bad_active[40..42].copy_from_slice(&0x0081u16.to_le_bytes());
+	let past_end = 0x0080u16 | u16::from(bad_active[16]);
+	bad_active[40..42].copy_from_slice(&past_end.to_le_bytes());
 	assert!(FatFs::mount(MemDisk { data: bad_active }).is_none(), "an active FAT past the copy count");
 	// and a logical sector size the specification does not allow (not a power of two).
 	let mut odd_bps = build_fat(Kind::Fat16, ROOT);
@@ -1138,7 +1199,7 @@ fn written_entries_carry_the_volume_clock() {
 
 // The (create date, write date) of the fixed-root entry whose 8.3 field is `short`.
 fn root_entry_dates(img: &[u8], short: &[u8; 11]) -> (u16, u16) {
-	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
+	let root_off = classic_root_off(img);
 	let mut i = root_off;
 	while img[i] != 0x00 {
 		if &img[i..i + 11] == short {
@@ -1174,7 +1235,7 @@ fn orphan_lfn_fragments_never_corrupt_a_neighbors_name() {
 	fs.write_file(b"Alpha file.txt", b"alpha").unwrap();
 	// plant an orphan fragment (a mid-set sequence with a bogus checksum) in the free
 	// slot right after Alpha's set, then write Beta - its set lands after the orphan.
-	let root_off = 21 * 512; // reserved 1 + FAT 20 sectors
+	let root_off = classic_root_off(&fs.dev.data);
 	let slot = root_off + 3 * 32; // Alpha's set is 2 fragments + the 8.3 entry
 	fs.dev.data[slot] = 0x03;
 	fs.dev.data[slot + 11] = 0x0F;
@@ -1320,7 +1381,7 @@ fn an_all_spaces_classic_entry_is_skipped() {
 	// An 8.3 field of nothing but padding decodes to an empty name - noise on hostile
 	// media, and `read_file(b"")` used to match it.
 	let mut img = build_fat(Kind::Fat16, ROOT);
-	let root_off = 21 * 512;
+	let root_off = classic_root_off(&img);
 	let slot = root_off + 4 * 32; // the first free slot past ROOT's four records
 	img[slot..slot + 11].fill(0x20);
 	img[slot + 11] = 0x20; // attributes: an ordinary file
@@ -1392,11 +1453,14 @@ fn a_fat12_slot_write_touches_only_its_sectors() {
 	// the operation never meant to touch. One sector, unless the slot straddles.
 	let inner = MemDisk { data: build_fat_sized(Kind::Fat12, ROOT, 1000) };
 	let mut fs = FatFs::mount(WriteLog { inner, writes: Vec::new() }).unwrap();
-	fs.set_fat_entry(2, 0x123).unwrap(); // byte offset 3: wholly inside the first FAT sector
-	assert_eq!(fs.dev.writes, [1], "a non-straddling slot must touch one sector");
+	// The fixture is mirrored, so each copy is touched in turn: copy 0 starts at sector 1 and copy
+	// 1 at 1 + fat_size. What must not grow is the number of sectors touched WITHIN a copy.
+	let copy1 = (fs.geo.reserved_sectors + fs.geo.fat_size) as u64;
+	fs.set_fat_entry(2, 0x123).unwrap(); // byte offset 3: wholly inside each copy's first sector
+	assert_eq!(fs.dev.writes, [1, copy1], "a non-straddling slot must touch one sector per copy");
 	fs.dev.writes.clear();
-	fs.set_fat_entry(341, 0x456).unwrap(); // byte offset 511: straddles into the second
-	assert_eq!(fs.dev.writes, [1, 2], "a straddling slot needs exactly the pair");
+	fs.set_fat_entry(341, 0x456).unwrap(); // byte offset 511: straddles into the next sector
+	assert_eq!(fs.dev.writes, [1, 2, copy1, copy1 + 1], "a straddling slot needs exactly the pair, per copy");
 }
 
 #[test]
@@ -1520,7 +1584,7 @@ fn a_zero_length_read_reads_no_data_cluster() {
 	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
 	let mut fs = FatFs::mount(CountingDisk { inner, reads: 0 }).unwrap();
 	// HELLO.TXT is the first root entry: claim size 0, keep its first cluster.
-	let root_off = 21 * 512;
+	let root_off = classic_root_off(&fs.dev.inner.data);
 	fs.dev.inner.data[root_off + 28..root_off + 32].copy_from_slice(&0u32.to_le_bytes());
 	fs.dev.reads = 0;
 	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"");
@@ -1544,7 +1608,7 @@ fn nt_case_flags_render_a_lowercase_short_name() {
 	// uppercase 8.3 field plus the NT case flags (byte 12), not as a long-name set -
 	// the listing must render what they display.
 	let mut img = build_fat(Kind::Fat16, ROOT);
-	let root_off = 21 * 512;
+	let root_off = classic_root_off(&img);
 	let slot = root_off + 4 * 32; // the first free slot past ROOT's four records
 	img[slot..slot + 11].copy_from_slice(b"NOTES   TXT");
 	img[slot + 11] = 0x20;
@@ -1597,10 +1661,10 @@ fn a_failed_free_of_the_old_chain_does_not_fail_a_durable_write() {
 	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
 	let mut fs = FatFs::mount(FlakyDisk { inner, until_fail: usize::MAX, failed: true }).unwrap();
 	fs.write_file(b"OLD.BIN", &[0x22u8; 3 * 512]).unwrap();
-	// the overwrite writes the new FAT link, the data cluster, and the directory
-	// sector, then frees the old chain - fail that free's first FAT write.
+	// the overwrite writes the new FAT link (once per mirrored copy), the data cluster, and the
+	// directory sector, then frees the old chain - fail that free's first FAT write.
 	fs.dev.failed = false;
-	fs.dev.until_fail = 3;
+	fs.dev.until_fail = 4;
 	fs.write_file(b"OLD.BIN", b"new content").unwrap();
 	assert!(fs.dev.failed, "the injected failure must have fired");
 	assert_eq!(fs.read_file(b"OLD.BIN").unwrap(), b"new content");
@@ -1698,8 +1762,10 @@ fn growing_a_conforming_exfat_chain_writes_a_cluster_pointer() {
 	// driver did to a volume some other implementation had formatted correctly.
 	let mut img = build_exfat(&[File { path: "A.TXT", data: b"a" }]);
 	let bps = 512usize;
-	// Where build_exfat puts the FAT, the same way the stale-copy test above locates it.
-	let fat0 = 3 * bps;
+	// Where build_exfat puts the FAT, read off FatOffset rather than guessed. This said sector 3,
+	// which is inside the boot region and not the FAT at all - the edit did nothing and the test
+	// passed on the driver's own behaviour instead. Adding the boot checksum is what surfaced it.
+	let fat0 = u32::from_le_bytes(img[80..84].try_into().unwrap()) as usize * bps;
 	// A conforming terminator on cluster 2, as a real formatter writes it.
 	img[fat0 + 2 * 4..fat0 + 2 * 4 + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
 	let mut fs = FatFs::mount(MemDisk { data: img }).expect("mount");
@@ -1754,4 +1820,362 @@ fn a_write_asks_the_device_for_its_barriers() {
 	let first_flush = disk.log.iter().position(|(_, barrier)| *barrier).expect("a barrier was requested");
 	assert!(first_flush > 0, "the data is written before the first barrier");
 	assert!(disk.log[first_flush + 1..].iter().any(|(_, barrier)| !*barrier), "the directory entry is written after the barrier");
+}
+
+// A device whose Nth write fails and whose later writes succeed - one bad sector, not a dead disk.
+//
+// The distinction decides whether a rollback bug is observable at all. A device that fails
+// EVERYTHING after the Nth write also fails the rollback, so an erroneous free is refused by the
+// medium and the volume comes out looking correct; the harness then proves only that a dead disk
+// cannot be corrupted further. A transient error is both the more common failure and the one that
+// lets the recovery path run and do its damage.
+struct FailNthWrite {
+	data: Vec<u8>,
+	seen: usize,
+	fail_at: usize,
+}
+
+impl BlockDevice for FailNthWrite {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		let start = lba as usize * SECTOR_SIZE;
+		let Some(src) = self.data.get(start..start + SECTOR_SIZE) else { return false };
+		buf.copy_from_slice(src);
+		true
+	}
+	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
+		self.seen += 1;
+		if self.seen == self.fail_at {
+			return false;
+		}
+		let start = lba as usize * SECTOR_SIZE;
+		let Some(dst) = self.data.get_mut(start..start + SECTOR_SIZE) else { return false };
+		dst.copy_from_slice(buf);
+		true
+	}
+}
+
+#[test]
+fn an_interrupted_swap_never_frees_clusters_a_live_entry_names() {
+	// The defect: the sector holding the NEW directory entry lands, the later sector deleting the
+	// OLD entry fails, `swap_entry` returns `Err`, and the caller frees the new data chain - leaving
+	// a live entry pointing at clusters that are back in the free pool for the next allocation.
+	//
+	// Two conditions have to hold at once for the interleaving to exist at all, and finding them
+	// took three harnesses that proved nothing:
+	//
+	//   * the replacement must land in a DIFFERENT byte range from the entry it replaces. Left to
+	//     itself `free_run` reuses the slots the old entry just vacated, both images come out
+	//     identical, and the second write has nothing left to do. An earlier hole - here from a
+	//     removed file - is what sends the new entry somewhere else.
+	//   * every file must actually be ON the medium. `build_fat` fills one root sector and drops the
+	//     rest, so a fixture with fifty fillers has no A.TXT to replace and `write_file` quietly
+	//     becomes a create, which has no second phase and cannot be interrupted between two.
+	//
+	// And the failure has to be TRANSIENT. Against a device that refuses everything after the Nth
+	// write, the erroneous free is refused too, the volume comes out consistent, and the harness
+	// proves only that a dead disk cannot be corrupted further.
+	//
+	// Interrupting at every write count in turn is what finds the dangerous one; the property
+	// asserted after each is the same, and two live entries is NOT a violation of it - an
+	// interrupted swap may legitimately leave both, each naming its own intact clusters. What may
+	// never happen is a live entry reading back as somebody else's data.
+	const FILLERS: [&str; 8] = ["F0.TXT", "F1.TXT", "F2.TXT", "F3.TXT", "F4.TXT", "F5.TXT", "F6.TXT", "F7.TXT"];
+	for budget in 1..30 {
+		let mut files: Vec<File> = FILLERS.iter().map(|name| File { path: name, data: b"x" }).collect();
+		files.push(File { path: "A.TXT", data: b"aaaa" });
+		let base = build_fat(Kind::Fat32, &files);
+		let mut prep = FatFs::mount(MemDisk { data: base }).expect("mount");
+		prep.remove(b"F0.TXT").expect("an early hole for the replacement to land in");
+		let holed = core::mem::take(&mut prep.device_for_test().data);
+		let mut fs = FatFs::mount(FailNthWrite { data: holed, seen: 0, fail_at: budget }).expect("mount");
+		let _ = fs.write_file(b"A.TXT", b"bbbbbbbb");
+
+		// Whatever happened, re-read the volume - and then ALLOCATE, because that is what turns a
+		// freed-but-still-named cluster into a cross-link. Without this step the damage is latent:
+		// the entry names free clusters whose contents nobody has overwritten yet.
+		let image = core::mem::take(&mut fs.device_for_test().data);
+		let mut check = FatFs::mount(MemDisk { data: image }).expect("the volume still mounts");
+		let _ = check.write_file(b"C.TXT", &[0xCCu8; 4096]);
+		let Ok(bytes) = check.read_file(b"A.TXT") else { continue };
+		assert!(bytes == b"aaaa" || bytes == b"bbbbbbbb", "after failing at write {budget}, A.TXT reads as {:?} - a live entry naming clusters that were freed and handed out again", bytes);
+	}
+}
+
+#[test]
+fn a_refused_write_to_the_second_fat_copy_leaves_the_copies_identical() {
+	// A mirrored volume has more than one current FAT, and the specification lets a foreign driver
+	// believe any of them. Writing an entry copy by copy is therefore not one operation: land copy
+	// 0, fail copy 1, and the two tables disagree about whether a cluster is free - so whether the
+	// next allocation hands it out depends on which driver mounts the volume next.
+	//
+	// The write must be all-or-nothing across copies. Fail the second copy's sector and the first
+	// copy has to come back to what it was.
+	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
+	let mut fs = FatFs::mount(FailAt { inner, lba: 0, armed: false, skip: 0 }).unwrap();
+	assert!(fs.geo.mirror && fs.geo.num_fats >= 2, "the fixture must have mirrored copies for this to mean anything");
+	let copy_bytes = fs.geo.fat_size as usize * fs.geo.bytes_per_sector as usize;
+	let first_at = fs.geo.reserved_sectors as usize * fs.geo.bytes_per_sector as usize;
+	let second_at = first_at + copy_bytes;
+	let before = fs.dev.inner.data[first_at..first_at + copy_bytes].to_vec();
+
+	// The second copy's first sector, which is where cluster 2's entry lives.
+	fs.dev.lba = (fs.geo.reserved_sectors + fs.geo.fat_size) as u64;
+	fs.dev.armed = true;
+	assert_eq!(fs.write_file(b"NEW.TXT", b"z"), Err(FsError::Io), "the failing copy must fail the write");
+	fs.dev.armed = false;
+
+	let first = &fs.dev.inner.data[first_at..first_at + copy_bytes];
+	let second = &fs.dev.inner.data[second_at..second_at + copy_bytes];
+	assert_eq!(first, second, "the FAT copies disagree after a refused write - which one is believed decides whether a cluster is free");
+	assert_eq!(first, &before[..], "the surviving copy kept an allocation the volume never completed");
+}
+
+#[test]
+fn a_fat12_entry_across_a_sector_boundary_is_not_left_torn() {
+	// A FAT12 entry is twelve bits, so one entry can straddle two sectors - cluster 341 on a
+	// 512-byte sector ends at byte 511 and continues at byte 512. `write_fs_sectors` writes a
+	// sector at a time, so a failure between them leaves half the entry updated: four bits of the
+	// new value and eight of the old, which is a cluster number nobody wrote and the chain walks
+	// into whatever it names.
+	let inner = MemDisk { data: build_fat(Kind::Fat12, ROOT) };
+	let mut fs = FatFs::mount(FailAt { inner, lba: 0, armed: false, skip: 0 }).unwrap();
+	// The straddling cluster, derived rather than assumed: 12 bits means byte offset cluster*3/2.
+	let bps = fs.geo.bytes_per_sector as u64;
+	let straddler = (2..=fs.max_cluster()).find(|&c| {
+		let off = c as u64 + c as u64 / 2;
+		off % bps == bps - 1
+	});
+	let Some(cluster) = straddler else { return }; // a volume too small to have one proves nothing
+	let base = fs.geo.reserved_sectors as u64;
+	let off = cluster as u64 + cluster as u64 / 2;
+	let before = fs.dev.inner.data.clone();
+
+	// Fail the SECOND of the two sectors the entry spans: the first lands, the second does not.
+	fs.dev.lba = base + off / bps + 1;
+	fs.dev.armed = true;
+	assert_eq!(fs.set_fat_entry_for_test(cluster, 0x123), Err(FsError::Io));
+	fs.dev.armed = false;
+
+	assert_eq!(fs.fat_entry_for_test(cluster), 0, "the entry is torn: half the new value, half the old");
+	let start = (base * bps) as usize + off as usize;
+	assert_eq!(&fs.dev.inner.data[start..start + 2], &before[start..start + 2], "the landed half of a straddling entry was not put back");
+}
+
+#[test]
+fn a_grow_whose_parent_record_write_fails_gives_the_cluster_back() {
+	// Growing an exFAT subdirectory is two changes to the medium: the cluster is linked into the
+	// directory's chain, and the DataLength recorded in the parent's entry set is raised to match.
+	// If the second fails, the first is not just useless - the chain is now longer than its own
+	// recorded length, so the extra cluster is marked in use and no traversal from the parent ever
+	// reaches it. It leaks, permanently, and every retry leaks another.
+	//
+	// The grow must come back out: the terminator returns to the old tail and the cluster is freed.
+	let heap = 25u64; // 24 reserved + 1 FAT sector
+	let inner = MemDisk { data: build_exfat_tree(&[], &[], &["SUB"]) };
+	let mut fs = FatFs::mount(FailAt { inner, lba: 0, armed: false, skip: 0 }).unwrap();
+	// The parent of SUB is the root, the first heap cluster past the bitmap. Nothing else writes
+	// there while files are created inside SUB, so arming it now traps exactly the parent-record
+	// update - and which file triggers the grow is the fixture's business, not the test's.
+	fs.dev.lba = heap + 1;
+	fs.dev.armed = true;
+	let mut free_before = fs.free_bytes().unwrap();
+	let mut refused = None;
+	for i in 0..8u32 {
+		let name = alloc::format!("SUB/F{i}.TXT");
+		match fs.write_file(name.as_bytes(), b"in the subdir") {
+			Ok(()) => free_before = fs.free_bytes().unwrap(),
+			Err(error) => {
+				refused = Some((i, error));
+				break;
+			}
+		}
+	}
+	let Some((i, error)) = refused else { panic!("the injected failure never fired - the fixture no longer grows here") };
+	assert_eq!(error, FsError::Io);
+	assert!(!fs.dev.armed);
+
+	assert_eq!(fs.free_bytes().unwrap(), free_before, "the grow kept its cluster after the parent record refused to move");
+	// And the volume is still usable: the retry succeeds and finds the directory as it was.
+	let name = alloc::format!("SUB/F{i}.TXT");
+	fs.write_file(name.as_bytes(), b"second attempt").unwrap();
+	assert_eq!(fs.read_file(name.as_bytes()).unwrap(), b"second attempt");
+	assert_eq!(fs.list_dir(b"SUB").unwrap().len(), i as usize + 1);
+}
+
+#[test]
+fn a_directory_grown_by_a_failed_write_is_grown_at_most_once() {
+	// A classic directory is grown before the entry is written, so a failing entry write leaves the
+	// directory a cluster longer than it was. That is not corruption - the tail was zeroed before
+	// it was linked, so it parses as free slots - and the question worth answering is whether it
+	// COMPOUNDS: an operation that grows the directory on every failed retry turns a flaky device
+	// into a directory that eats the volume.
+	//
+	// It does not, and the reason is structural rather than lucky: a grow only happens when no free
+	// run exists, and the tail it leaves behind IS a free run. The next attempt finds it and
+	// writes into it. This pins that to one cluster, so a later change that grows unconditionally
+	// (or frees the tail on failure and re-grows on the retry) has to answer for it.
+	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
+	let mut fs = FatFs::mount(FailAt { inner, lba: 0, armed: false, skip: 0 }).unwrap();
+	for i in 0..12u32 {
+		let name = alloc::format!("DOCS/F{i}.TXT");
+		fs.write_file(name.as_bytes(), b"x").unwrap();
+	}
+	let full = fs.free_bytes().unwrap();
+
+	// Fail the directory content write that follows the grow.
+	let max = fs.max_cluster();
+	let free: Vec<u32> = (2..=max).filter(|&c| fs.next_cluster(c).unwrap() == 0).take(2).collect();
+	fs.dev.lba = fs.cluster_fs_sector(free[1]);
+	fs.dev.skip = 1; // let the grow's zeroing pass, fail the directory write after it
+	fs.dev.armed = true;
+	assert_eq!(fs.write_file(b"DOCS/G0.TXT", b"y"), Err(FsError::Io));
+	assert!(!fs.dev.armed, "the injected failure never fired");
+
+	let cluster_bytes = (fs.geo.sectors_per_cluster * fs.geo.bytes_per_sector) as u64;
+	assert_eq!(full - fs.free_bytes().unwrap(), cluster_bytes, "the failed write cost more than the one cluster the directory grew by");
+
+	// The retry: arm the same trap again, on the cluster a SECOND grow would take. It must never
+	// fire, because there is no second grow - the tail the first failure left is the free run the
+	// entry now goes into.
+	let free_now: Vec<u32> = (2..=max).filter(|&c| fs.next_cluster(c).unwrap() == 0).take(2).collect();
+	fs.dev.lba = fs.cluster_fs_sector(free_now[1]);
+	fs.dev.skip = 1;
+	fs.dev.armed = true;
+	fs.write_file(b"DOCS/G0.TXT", b"y").unwrap();
+	assert!(fs.dev.armed, "the retry grew the directory a second time - a flaky device would eat the volume");
+	fs.dev.armed = false;
+
+	assert_eq!(fs.read_file(b"DOCS/G0.TXT").unwrap(), b"y");
+	assert_eq!(fs.free_bytes().unwrap(), full - cluster_bytes * 2, "the successful write pays for its own data cluster and nothing else");
+}
+
+#[test]
+fn a_chain_shorter_than_its_entry_is_corruption_not_a_short_file() {
+	// The directory entry states the length; the FAT states where the bytes are. When they
+	// disagree the file is damaged, and the only wrong answer is to serve the prefix as though it
+	// were the whole file - a backup tool copying it writes a truncated file it believes is intact.
+	//
+	// Two shapes of the same lie: a chain that terminates early, and a first cluster of zero on an
+	// entry with a nonzero size.
+	let mut img = build_fat(Kind::Fat16, &[File { path: "BIG.BIN", data: &[0xABu8; 4 * 512] }]);
+	let fat_off = 512; // one reserved sector
+	let root_off = classic_root_off(&img);
+	let first = u16::from_le_bytes([img[root_off + 26], img[root_off + 27]]) as usize;
+	assert_eq!(&img[root_off..root_off + 3], b"BIG", "the fixture's first root entry must be the file under test");
+
+	// Terminate the chain after its first cluster while the entry still claims four.
+	let mut cut = img.clone();
+	img_set_fat16(&mut cut, fat_off, first, 0xFFFF);
+	let mut fs = FatFs::mount(MemDisk { data: cut }).unwrap();
+	assert_eq!(fs.read_file(b"BIG.BIN"), Err(FsError::Invalid), "a chain that ends early was served as a short file");
+
+	// And a chain that runs into a free entry, which is the same claim by another route.
+	let mut freed = img.clone();
+	img_set_fat16(&mut freed, fat_off, first, 0);
+	let mut fs = FatFs::mount(MemDisk { data: freed }).unwrap();
+	assert_eq!(fs.read_file(b"BIG.BIN"), Err(FsError::Invalid));
+
+	// A first cluster of zero with a size that says otherwise.
+	img[root_off + 26..root_off + 28].copy_from_slice(&0u16.to_le_bytes());
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"BIG.BIN"), Err(FsError::Invalid), "an entry with no clusters and a nonzero size read as an empty file");
+}
+
+#[test]
+fn a_cyclic_chain_is_refused_rather_than_repeated() {
+	// A cycle in the FAT does not look like corruption to a walk that counts steps: a cluster
+	// pointing at itself, read for a file twice its size, is two steps and returns the same 512
+	// bytes twice as `Ok`. Nothing about the result says it is not the file.
+	fn build(data: &'static [u8]) -> Vec<u8> {
+		build_fat(Kind::Fat16, &[File { path: "LOOP.BIN", data }])
+	}
+	let fat_off = 512;
+
+	// The self-loop, read for two clusters.
+	let mut img = build(&[0xABu8; 2 * 512]);
+	let root_off = classic_root_off(&img);
+	let first = u16::from_le_bytes([img[root_off + 26], img[root_off + 27]]) as usize;
+	img_set_fat16(&mut img, fat_off, first, first as u16);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"LOOP.BIN"), Err(FsError::Invalid), "a self-pointing cluster was read twice and returned as the file");
+
+	// And a two-cluster cycle, read for four - the shape a step budget is least able to see.
+	let mut img = build(&[0xABu8; 4 * 512]);
+	let first = u16::from_le_bytes([img[root_off + 26], img[root_off + 27]]) as usize;
+	img_set_fat16(&mut img, fat_off, first, first as u16 + 1);
+	img_set_fat16(&mut img, fat_off, first + 1, first as u16);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"LOOP.BIN"), Err(FsError::Invalid), "a two-cluster cycle was returned as A,B,A,B");
+}
+
+#[test]
+fn an_exfat_boot_region_that_fails_its_own_checks_does_not_mount() {
+	// The specification requires the boot checksum to be confirmed before any boot field is used,
+	// and this driver read all of them without ever computing it. Each of these is a single field
+	// changed on an otherwise plausible volume - the shape a forged or bit-rotted boot region takes.
+	let good = build_exfat(ROOT);
+	assert!(FatFs::mount(MemDisk { data: good.clone() }).is_some(), "the fixture itself must be a conforming volume");
+
+	let refused = |what: &str, edit: &dyn Fn(&mut Vec<u8>)| {
+		let mut img = good.clone();
+		edit(&mut img);
+		assert!(FatFs::mount(MemDisk { data: img }).is_none(), "{what}");
+	};
+
+	// The checksum itself: one byte of the boot region moved, nothing else.
+	refused("a boot region whose checksum no longer matches", &|img| img[100] ^= 0xFF);
+	// And a volume whose checksum sector does not even agree with itself.
+	refused("a checksum sector with mismatched copies", &|img| img[11 * 512 + 4] ^= 0x01);
+	// The boot signature, which was checked on the classic path only.
+	refused("an exFAT volume with no 0xAA55 signature", &|img| {
+		img[511] = 0;
+		stamp_exfat_boot_checksum(img, 512);
+	});
+	// MustBeZero: a region a formatter that thought it was writing a BPB would have filled.
+	refused("a volume with a classic BPB in its MustBeZero region", &|img| {
+		img[13] = 8;
+		stamp_exfat_boot_checksum(img, 512);
+	});
+	// A revision this driver has never seen: its fields may not mean what they mean here.
+	refused("a filesystem revision from the future", &|img| {
+		img[105] = 2;
+		stamp_exfat_boot_checksum(img, 512);
+	});
+	// A FAT starting inside the boot region - the concrete case the finding names, where the first
+	// FAT write would go through the backup boot sector.
+	refused("a FAT that starts inside the boot region", &|img| {
+		img[80..84].copy_from_slice(&1u32.to_le_bytes());
+		stamp_exfat_boot_checksum(img, 512);
+	});
+	// A FAT too short to address the heap the volume claims. It used to mount as a quietly smaller
+	// filesystem, because max_cluster takes the minimum of the two.
+	//
+	// The cluster count has to stay inside the image: raise it past the volume and the mount is
+	// refused because the device is too small, which proves the device check and nothing else. 2023
+	// clusters from sector 25 end exactly at the volume's last sector, and want a 16-sector FAT.
+	refused("a FAT too short for the declared cluster count", &|img| {
+		img[92..96].copy_from_slice(&2023u32.to_le_bytes());
+		stamp_exfat_boot_checksum(img, 512);
+	});
+	// A VolumeLength that does not contain the heap it describes.
+	refused("a volume shorter than its own cluster heap", &|img| {
+		img[72..80].copy_from_slice(&64u64.to_le_bytes());
+		stamp_exfat_boot_checksum(img, 512);
+	});
+	// TexFAT: two FATs with the first active mounted, and the geometry then recorded one - so the
+	// second was never maintained and the system that understands TexFAT would read a stale copy.
+	//
+	// The fixture's heap begins immediately after its single FAT, so a second one would not fit and
+	// the overlap rule refuses the volume before the FAT count is ever considered. Moving the heap
+	// one sector out makes room, and the same layout with one FAT must still mount - otherwise this
+	// proves nothing about the count.
+	let with_room = |img: &mut Vec<u8>, fats: u8| {
+		img[88..92].copy_from_slice(&26u32.to_le_bytes());
+		img[110] = fats;
+		stamp_exfat_boot_checksum(img, 512);
+	};
+	let mut one = good.clone();
+	with_room(&mut one, 1);
+	assert!(FatFs::mount(MemDisk { data: one }).is_some(), "the layout with room for a second FAT must mount when it declares one");
+	refused("a TexFAT volume declaring two FATs", &|img| with_room(img, 2));
 }

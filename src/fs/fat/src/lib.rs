@@ -140,12 +140,35 @@ struct Geometry {
 
 // A mounted FAT volume: the device plus its geometry. Reads are on demand, so nothing is
 // cached beyond the geometry; a directory or file is read by following clusters as asked.
+// exFAT's only end-of-chain value. Unlike the classic families it has no reserved top nibble, so a
+// terminator is all thirty-two bits set and nothing less.
+const EXFAT_EOC: u32 = 0xFFFF_FFFF;
+
 pub struct FatFs<D: BlockDevice> {
 	dev: D,
 	geo: Geometry,
 	// The wall clock (Unix seconds, UTC) new directory entries are stamped with; 0
 	// (unset) still yields the valid DOS epoch date 1980-01-01.
 	clock: u64,
+	// Set when a rollback could not be written, which means the FAT on the medium no longer
+	// describes its own contents: mirrored copies that disagree, an entry torn across two sectors,
+	// or clusters marked in use with nothing naming them. Every later mutation is refused with
+	// `ReadOnly` rather than layered on top of a table that cannot be trusted.
+	//
+	// The alternative is to carry on and hope the next write repairs it, which is how a torn FAT12
+	// entry becomes two files sharing a cluster. A mount that stops mutating keeps the damage at
+	// whatever the failed write left, where a repair tool can still see it.
+	degraded: bool,
+}
+
+// Why a directory swap failed, and whether the new entry may already be on the medium.
+//
+// `placed` is the only thing the caller needs to decide what it may free: before the new entry set
+// is written, nothing is published and the new chain is the caller's to release; after it, the
+// commit is ambiguous and freeing would hand out clusters a live entry names.
+struct SwapFailure {
+	error: FsError,
+	placed: bool,
 }
 
 impl<D: BlockDevice> FatFs<D> {
@@ -159,7 +182,19 @@ impl<D: BlockDevice> FatFs<D> {
 			return None;
 		}
 		let geo = if &boot[3..11] == b"EXFAT   " {
-			Geometry::exfat(&boot)?
+			let geo = Geometry::exfat(&boot)?;
+			// The specification requires the boot checksum to be confirmed before ANY field of the
+			// boot region is used, and this driver used all of them without ever computing it. The
+			// checksum covers the eleven sectors from the main boot sector to the OEM parameters,
+			// skipping the three bytes the running system rewrites (VolumeFlags and PercentInUse),
+			// and sector 11 holds nothing but that value repeated.
+			//
+			// It is the only check that catches a boot region edited in place - a plausible
+			// geometry with one field changed passes every bound but not the sum.
+			if !exfat_boot_checksum_ok(&mut dev, geo.bytes_per_sector) {
+				return None;
+			}
+			geo
 		} else {
 			if boot[510] != 0x55 || boot[511] != 0xAA {
 				return None;
@@ -177,7 +212,7 @@ impl<D: BlockDevice> FatFs<D> {
 		if !dev.read_block(heap_end * ratio - 1, &mut last) {
 			return None;
 		}
-		Some(FatFs { dev, geo, clock: 0 })
+		Some(FatFs { dev, geo, clock: 0, degraded: false })
 	}
 
 	// Set the wall clock (Unix seconds, UTC) subsequent writes stamp their directory
@@ -217,7 +252,7 @@ impl<D: BlockDevice> FatFs<D> {
 		let mut free: u64 = 0;
 		if self.geo.kind == Kind::ExFat {
 			let (bm_first, bm_size) = self.exfat_bitmap()?;
-			let bm = self.read_chain(bm_first, usize::MAX)?;
+			let bm = self.read_chain(bm_first, self.bitmap_cap(bm_size))?;
 			let bm_used = bm.len().min(bm_size as usize);
 			for c in 2..=max {
 				let idx = (c - 2) as usize;
@@ -351,9 +386,14 @@ impl<D: BlockDevice> FatFs<D> {
 		//    new entry set, and write the directory back once.
 		let old_first = match self.swap_entry(&dir, name, first, data.len() as u32) {
 			Ok(old) => old,
-			Err(e) => {
-				let _ = self.free_chain(first);
-				return Err(e);
+			// Freed only when nothing was published. Once the new entry set may be on the medium the
+			// commit is ambiguous, and freeing the chain it names is what hands live clusters back
+			// to the free pool for the next allocation to cross-link.
+			Err(SwapFailure { error, placed }) => {
+				if !placed {
+					let _ = self.free_chain(first);
+				}
+				return Err(error);
 			}
 		};
 		// 3. only now is the old chain unreachable - free it, best-effort: the write is
@@ -458,6 +498,17 @@ impl<D: BlockDevice> FatFs<D> {
 		let max = self.max_cluster();
 		let mut out: Vec<u8> = Vec::new();
 		let mut cluster = first;
+		// Floyd over the chain: `slow` follows one link for every two the read takes, so a chain
+		// that loops back on itself is caught in the length of the cycle.
+		//
+		// A step budget cannot do this job, which is why the one that was here did not. A cluster
+		// pointing at itself, read for a 1024-byte file with 512-byte clusters, is two steps and
+		// returns 1024 bytes of the same cluster twice as `Ok` - well inside any budget the volume
+		// could justify. The corruption is the repetition, not the length. The same cycle read with
+		// no limit at all (the exFAT root, the allocation bitmap) grew the buffer a cluster at a
+		// time until the budget tripped at `cluster_count`, which on a real volume is an enormous
+		// allocation performed on behalf of a medium the driver does not trust.
+		let mut slow = first;
 		let mut guard = 0u32;
 		while cluster >= 2 && !self.is_end(cluster) {
 			if cluster > max {
@@ -472,14 +523,36 @@ impl<D: BlockDevice> FatFs<D> {
 			}
 			cluster = self.next_cluster(cluster)?;
 			guard += 1;
+			if guard % 2 == 0 {
+				slow = self.next_cluster(slow)?;
+			}
+			if cluster >= 2 && cluster == slow {
+				return Err(FsError::Invalid);
+			}
 			if guard > max {
 				return Err(FsError::Invalid);
 			}
+		}
+		// A chain that ended before it produced the bytes it was read for is a truncated file, not
+		// a short one: the entry's own length says how much is there and the FAT does not have it.
+		// Returning the prefix as `Ok` made a 20 MiB entry backed by one cluster answer with 4 KiB
+		// of data and no indication that the rest was missing - and made `first_cluster = 0` with a
+		// nonzero size read as a perfectly good empty file.
+		if limit != usize::MAX && out.len() < limit {
+			return Err(FsError::Invalid);
 		}
 		if limit != usize::MAX {
 			out.truncate(limit);
 		}
 		Ok(out)
+	}
+
+	// How much of the allocation bitmap's chain may be read: its recorded size, rounded up to whole
+	// clusters. The bitmap is a structure that says how long it is, so reading it with no limit at
+	// all took the bound from the volume instead - the one place a hostile medium controls.
+	fn bitmap_cap(&self, bm_size: u64) -> usize {
+		let cluster_bytes = self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64;
+		bm_size.div_ceil(cluster_bytes).saturating_mul(cluster_bytes).min(usize::MAX as u64) as usize
 	}
 
 	// Read `limit` bytes from contiguous clusters starting at `first` - the exFAT
@@ -662,7 +735,21 @@ impl<D: BlockDevice> FatFs<D> {
 		self.next_cluster(cluster).unwrap_or(0)
 	}
 
+	// Write one FAT entry to every current copy, ALL OR NOTHING.
+	//
+	// The naive loop over copies is not atomic in two ways, and both leave a table that describes
+	// something other than the volume's contents. With mirroring it can write copy 0 and fail on
+	// copy 1, so the copies disagree and which one a foreign driver believes decides whether a
+	// cluster is free. On FAT12 an entry can straddle a sector boundary, `write_fs_sectors` writes
+	// 512 bytes at a time, and a failure between them tears the entry across its two nibbles.
+	//
+	// So every sector modified here is read back into an undo list first, and any failure puts the
+	// originals back - including the copy that failed, because its first sector may have landed.
+	// If a restore write fails too, the volume is past repairing from here and the mount degrades.
 	fn set_fat_entry(&mut self, cluster: u32, val: u32) -> Result<(), FsError> {
+		if self.degraded {
+			return Err(FsError::ReadOnly);
+		}
 		if cluster < 2 || cluster > self.max_cluster() {
 			return Err(FsError::Invalid);
 		}
@@ -676,12 +763,18 @@ impl<D: BlockDevice> FatFs<D> {
 		// with mirroring disabled only the active copy is current - the others are
 		// stale by specification and stay untouched.
 		let copies = if self.geo.mirror { 0..self.geo.num_fats } else { self.geo.active_fat..self.geo.active_fat + 1 };
+		// What was there before, per copy, in the order it was overwritten.
+		let mut undo: Vec<(u64, Vec<u8>)> = Vec::new();
 		for fat in copies {
 			let fat_base = self.geo.reserved_sectors + fat * self.geo.fat_size;
 			let sec = fat_base as u64 + byte_off / bps as u64;
 			let within = (byte_off % bps as u64) as usize;
 			let mut buf = vec![0u8; (bps * sectors) as usize];
-			self.read_fs_sectors(sec, sectors, &mut buf)?;
+			if let Err(error) = self.read_fs_sectors(sec, sectors, &mut buf) {
+				self.restore_fat_sectors(undo, sectors);
+				return Err(error);
+			}
+			let original = buf.clone();
 			match self.geo.kind {
 				Kind::Fat12 => {
 					let cur = u16::from_le_bytes([buf[within], buf[within + 1]]);
@@ -700,16 +793,37 @@ impl<D: BlockDevice> FatFs<D> {
 					buf[within..within + 4].copy_from_slice(&next.to_le_bytes());
 				}
 			}
-			self.write_fs_sectors(sec, sectors, &buf)?;
+			// Recorded BEFORE the write, not after: a write that fails may still have landed its
+			// first sector, and that is exactly the copy the undo list has to cover.
+			undo.push((sec, original));
+			if let Err(error) = self.write_fs_sectors(sec, sectors, &buf) {
+				self.restore_fat_sectors(undo, sectors);
+				return Err(error);
+			}
 		}
 		Ok(())
+	}
+
+	// Put back the sectors an interrupted `set_fat_entry` overwrote, newest first.
+	//
+	// A failure here is not recoverable and must not be swallowed: the caller asked to undo because
+	// the medium refused a write, and if it refuses the undo too there is no state left to return
+	// to. The mount degrades, every later mutation is refused, and what the medium holds stays
+	// whatever the failure left it - which a repair tool can read, unlike the result of continuing.
+	fn restore_fat_sectors(&mut self, undo: Vec<(u64, Vec<u8>)>, sectors: u32) {
+		for (sec, original) in undo.into_iter().rev() {
+			if self.write_fs_sectors(sec, sectors, &original).is_err() {
+				self.degraded = true;
+			}
+		}
 	}
 
 	// Allocate `n` free clusters into an end-terminated chain, returning them in order.
 	// Zero clusters is an empty file. NoSpace if the table runs out of free entries. The
 	// scan runs over ONE in-memory image of the ACTIVE FAT copy (a per-candidate device
 	// read made allocation O(volume) round-trips on slow media); a failure writing a
-	// link unwinds the slots already written, so nothing leaks.
+	// link unwinds the slots already written, so nothing leaks - and because `set_fat_entry`
+	// is itself all-or-nothing, the entry that failed is not among them.
 	fn alloc_chain(&mut self, n: usize) -> Result<Vec<u32>, FsError> {
 		if n == 0 {
 			return Ok(Vec::new());
@@ -733,14 +847,23 @@ impl<D: BlockDevice> FatFs<D> {
 		// value is 0xFFFFFFFF, and writing 0x0FFF_FFFF made every volume this driver created
 		// non-conforming - readable here only because the reader shared the mistake.
 		let eoc = match self.geo.kind {
-			Kind::ExFat => 0xFFFF_FFFF,
+			Kind::ExFat => EXFAT_EOC,
 			_ => 0x0FFF_FFFF,
 		};
 		for i in 0..chain.len() {
 			let val = if i + 1 < chain.len() { chain[i + 1] } else { eoc };
 			if let Err(e) = self.set_fat_entry(chain[i], val) {
+				// `chain[i]` needs no undo: `set_fat_entry` is all-or-nothing, so the entry that
+				// failed is back to what it was. Only the links already written have to go.
 				for &done in &chain[..i] {
-					let _ = self.set_fat_entry(done, 0);
+					if self.set_fat_entry(done, 0).is_err() {
+						// The medium refused the undo of an allocation it had accepted. Those
+						// clusters are now marked in use with no entry naming them - a leak the
+						// next mount cannot tell from a live file, and one that grows with every
+						// retry. Refusing further mutations keeps it at a leak.
+						self.degraded = true;
+						break;
+					}
 				}
 				return Err(e);
 			}
@@ -963,16 +1086,18 @@ impl<D: BlockDevice> FatFs<D> {
 	// on-disk name (a match through the 8.3 alias must not rename the file) and its
 	// creation stamp. Returns the replaced entry's first cluster, which only then is
 	// safe to free.
-	fn swap_entry(&mut self, dir: &Dir, name: &[u8], first: u32, size: u32) -> Result<Option<u32>, FsError> {
-		let mut bytes = self.read_dir_bytes(dir)?;
+	fn swap_entry(&mut self, dir: &Dir, name: &[u8], first: u32, size: u32) -> Result<Option<u32>, SwapFailure> {
+		// Everything before the first write publishes nothing, so its failures carry `placed: false`.
+		let fail = |error: FsError| SwapFailure { error, placed: false };
+		let mut bytes = self.read_dir_bytes(dir).map_err(fail)?;
 		let orig = bytes.clone();
 		scrub_after_terminator(&mut bytes);
-		let old = mark_unlinked(&mut bytes, name)?;
+		let old = mark_unlinked(&mut bytes, name).map_err(fail)?;
 		let name: &[u8] = match &old {
 			Some(o) if writable_name(o.name.as_bytes()) => o.name.as_bytes(),
 			_ => name,
 		};
-		let mut entries = build_entries(name, &bytes, first, size, 0x20, self.dos_stamp())?;
+		let mut entries = build_entries(name, &bytes, first, size, 0x20, self.dos_stamp()).map_err(fail)?;
 		if let Some(o) = &old {
 			// the creation stamp (tenths + time + date) carries over from the replaced
 			// entry - only the byte 0 of its records was marked, the fields are intact.
@@ -987,14 +1112,50 @@ impl<D: BlockDevice> FatFs<D> {
 			// the fixed FAT12/16 root region cannot grow, and an exFAT NoFatChain
 			// directory has no chain to extend.
 			if dir.cluster == 0 || dir.nfc_len.is_some() {
-				return Err(FsError::NoSpace);
+				return Err(fail(FsError::NoSpace));
 			}
-			self.grow_dir(dir.cluster, &mut bytes)?;
+			self.grow_dir(dir.cluster, &mut bytes).map_err(fail)?;
 		};
 		for (k, e) in entries.iter().enumerate() {
 			bytes[at + k * 32..at + k * 32 + 32].copy_from_slice(e);
 		}
-		self.write_dir_dirty(dir, &bytes, &orig)?;
+		// TWO ordered writes, not one, and the order is the whole protocol.
+		//
+		// It was one `write_dir_dirty` over the span between the lowest and highest change, written
+		// cluster by cluster - so the cluster holding the NEW entry could land while the later
+		// cluster holding the OLD entry's deletion failed. `swap_entry` then returned `Err`, the
+		// caller freed the new data chain, and the medium was left with a live directory entry
+		// pointing at clusters that were back in the free pool. The next allocation cross-links
+		// them. The comment above `write_file` says a failure part-way never costs the old file;
+		// that is the claim this broke.
+		//
+		// An I/O error means the commit is AMBIGUOUS - not that nothing was written - so the new
+		// chain cannot be freed once its entry may be live. The order below makes that decidable:
+		//
+		//   1. place the new entry set, with the old one still live. A failure here published
+		//      nothing, so the caller may free the new chain.
+		//   2. barrier.
+		//   3. retire the old entry set. A failure here leaves BOTH entries live - a duplicate name,
+		//      which `fsck` can resolve and which loses nobody's data - and the caller must not free
+		//      anything.
+		//
+		// `placed` is what tells the caller which side of that line it is on.
+		// The intermediate state: the new entry set placed, and everything else exactly as it was -
+		// including the old entry, still live. Built from `bytes` (which already has the right
+		// length, the directory may have grown) by restoring every byte outside the new set from
+		// `orig`; the grown tail has no `orig` and is zeros in both.
+		let new_span = at..at + entries.len() * 32;
+		let mut staged = bytes.clone();
+		for i in 0..staged.len() {
+			if !new_span.contains(&i) {
+				staged[i] = orig.get(i).copied().unwrap_or(0);
+			}
+		}
+		self.write_dir_dirty(dir, &staged, &orig).map_err(|error| SwapFailure { error, placed: false })?;
+		self.barrier().map_err(|error| SwapFailure { error, placed: false })?;
+		// Past here the new entry may be on the medium.
+		self.write_dir_dirty(dir, &bytes, &staged).map_err(|error| SwapFailure { error, placed: true })?;
+		self.barrier().map_err(|error| SwapFailure { error, placed: true })?;
 		Ok(old.map(|o| o.first_cluster))
 	}
 
@@ -1002,6 +1163,17 @@ impl<D: BlockDevice> FatFs<D> {
 	// (BEFORE linking - once linked, stale content would parse as directory entries if a
 	// later write fails), link it at the end of the chain, and extend the in-memory copy
 	// to match. A failure part-way frees the fresh cluster, so nothing leaks.
+	//
+	// A failure AFTER this returns is a different matter, and deliberately not undone: the caller
+	// writes the entry into the grown directory, and if that write fails the directory stays one
+	// cluster longer. The tail is zeroed and parses as free slots, so it costs space rather than
+	// correctness - and it does not compound, because a grow only happens when no free run exists
+	// and the tail it leaves IS one. The retry writes into it instead of growing again.
+	// `a_directory_grown_by_a_failed_write_is_grown_at_most_once` holds that bound.
+	//
+	// Rolling it back would trade a bounded cost for an unbounded risk: the entry write may have
+	// landed in the new cluster before failing, and freeing a cluster a directory entry lives in is
+	// how a directory loses files rather than space.
 	fn grow_dir(&mut self, cluster: u32, bytes: &mut Vec<u8>) -> Result<(), FsError> {
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let grow = self.alloc_chain(1)?[0];
@@ -1137,14 +1309,34 @@ impl<D: BlockDevice> FatFs<D> {
 	fn exfat_grow_dir(&mut self, dir: &Dir, bytes: &mut Vec<u8>) -> Result<(), FsError> {
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let grow = self.exfat_alloc(1)?[0];
-		let linked = self.write_fs_sectors(self.cluster_fs_sector(grow), self.geo.sectors_per_cluster, &vec![0u8; cluster_bytes]).and_then(|()| self.last_cluster(dir.cluster)).and_then(|last| self.set_fat_entry(last, grow));
-		if let Err(e) = linked {
+		// The tail is kept, not just walked: undoing the link needs to know which entry to put the
+		// end-of-chain marker back into, and recomputing it after a failure would walk a chain the
+		// failure may have left in a different shape.
+		let tail = self.write_fs_sectors(self.cluster_fs_sector(grow), self.geo.sectors_per_cluster, &vec![0u8; cluster_bytes]).and_then(|()| self.last_cluster(dir.cluster));
+		let last = match tail {
+			Ok(last) => last,
+			Err(e) => {
+				let _ = self.exfat_free(grow);
+				return Err(e);
+			}
+		};
+		if let Err(e) = self.set_fat_entry(last, grow) {
 			let _ = self.exfat_free(grow);
 			return Err(e);
 		}
 		bytes.resize(bytes.len() + cluster_bytes, 0);
 		if let Some(p) = dir.parent {
-			self.exfat_grow_parent_record(&p, cluster_bytes as u64)?;
+			if let Err(error) = self.exfat_grow_parent_record(&p, cluster_bytes as u64) {
+				// The cluster is linked and the parent's record still describes the shorter
+				// directory. Returning here would leave a chain longer than its own DataLength -
+				// a cluster marked in use that nothing reaches, which no later mount can tell from
+				// a live one. Put the terminator back and release it.
+				bytes.truncate(bytes.len() - cluster_bytes);
+				if self.set_fat_entry(last, EXFAT_EOC).is_err() || self.exfat_free(grow).is_err() {
+					self.degraded = true;
+				}
+				return Err(error);
+			}
 		}
 		Ok(())
 	}
@@ -1213,7 +1405,7 @@ impl<D: BlockDevice> FatFs<D> {
 		}
 		let (bm_first, bm_size) = self.exfat_bitmap()?;
 		let bm_dir = Dir::at(bm_first);
-		let mut bm = self.read_chain(bm_first, usize::MAX)?;
+		let mut bm = self.read_chain(bm_first, self.bitmap_cap(bm_size))?;
 		// the bitmap's declared byte length bounds the bits we may interpret; the buffer
 		// keeps its cluster granularity for the write-back.
 		let bm_used = bm.len().min(bm_size as usize);
@@ -1237,14 +1429,23 @@ impl<D: BlockDevice> FatFs<D> {
 		// value is 0xFFFFFFFF, and writing 0x0FFF_FFFF made every volume this driver created
 		// non-conforming - readable here only because the reader shared the mistake.
 		let eoc = match self.geo.kind {
-			Kind::ExFat => 0xFFFF_FFFF,
+			Kind::ExFat => EXFAT_EOC,
 			_ => 0x0FFF_FFFF,
 		};
 		for i in 0..chain.len() {
 			let val = if i + 1 < chain.len() { chain[i + 1] } else { eoc };
 			if let Err(e) = self.set_fat_entry(chain[i], val) {
+				// `chain[i]` needs no undo: `set_fat_entry` is all-or-nothing, so the entry that
+				// failed is back to what it was. Only the links already written have to go.
 				for &done in &chain[..i] {
-					let _ = self.set_fat_entry(done, 0);
+					if self.set_fat_entry(done, 0).is_err() {
+						// The medium refused the undo of an allocation it had accepted. Those
+						// clusters are now marked in use with no entry naming them - a leak the
+						// next mount cannot tell from a live file, and one that grows with every
+						// retry. Refusing further mutations keeps it at a leak.
+						self.degraded = true;
+						break;
+					}
 				}
 				return Err(e);
 			}
@@ -1261,7 +1462,7 @@ impl<D: BlockDevice> FatFs<D> {
 		}
 		let (bm_first, bm_size) = self.exfat_bitmap()?;
 		let bm_dir = Dir::at(bm_first);
-		let mut bm = self.read_chain(bm_first, usize::MAX)?;
+		let mut bm = self.read_chain(bm_first, self.bitmap_cap(bm_size))?;
 		let bm_used = bm.len().min(bm_size as usize);
 		let max = self.max_cluster();
 		let mut cluster = first;
@@ -1295,7 +1496,7 @@ impl<D: BlockDevice> FatFs<D> {
 		let count = self.nfc_run(first, size)?;
 		let (bm_first, bm_size) = self.exfat_bitmap()?;
 		let bm_dir = Dir::at(bm_first);
-		let mut bm = self.read_chain(bm_first, usize::MAX)?;
+		let mut bm = self.read_chain(bm_first, self.bitmap_cap(bm_size))?;
 		let bm_used = bm.len().min(bm_size as usize);
 		for i in 0..count {
 			let idx = (first + i - 2) as usize;
@@ -1424,6 +1625,21 @@ impl Geometry {
 	// (the spec's 512-4096 byte sectors and a 32 MB cluster ceiling), so a forged
 	// exponent can neither panic a debug build nor wrap into a plausible geometry.
 	fn exfat(b: &[u8]) -> Option<Geometry> {
+		// The boot signature, which exFAT requires exactly as the classic families do. It was
+		// checked on the BPB path only, so an exFAT volume reached the geometry on its name alone.
+		if b[510] != 0x55 || b[511] != 0xAA {
+			return None;
+		}
+		// MustBeZero: the fifty-three bytes a classic BPB would occupy. A volume with anything
+		// there was formatted by something that believed it was writing a different filesystem.
+		if b[11..64].iter().any(|&byte| byte != 0) {
+			return None;
+		}
+		// FileSystemRevision. A major version this driver has never seen means fields it reads may
+		// mean something else, and guessing is how a reader corrupts a volume it does not know.
+		if b[105] != 1 {
+			return None;
+		}
 		let bps_shift = b[108];
 		let spc_shift = b[109];
 		if !(9..=12).contains(&bps_shift) || spc_shift > 25 - bps_shift {
@@ -1448,11 +1664,72 @@ impl Geometry {
 		if fat_offset as u64 + num_fats as u64 * fat_size as u64 > cluster_heap_offset as u64 {
 			return None;
 		}
-		// TexFAT's second-FAT selection (VolumeFlags bit 0 = the second FAT is active)
-		// is out of scope - refuse rather than read the wrong table.
+		// The FAT cannot start inside the boot region. The specification's floor is 24 sectors -
+		// twelve for the main boot region and twelve for its backup - and without it a volume
+		// declaring `fat_offset = 1` passed every other bound here, after which the first FAT write
+		// would have gone through the backup boot sector.
+		if fat_offset < 24 {
+			return None;
+		}
+		// The FAT has to be able to address the heap the volume claims: one 32-bit entry per
+		// cluster plus the two reserved entries. A shorter one used to mount as a quietly smaller
+		// filesystem, because `max_cluster` takes the minimum of the two - which keeps writes in
+		// bounds and hides that the volume disagrees with itself.
+		let needed = (cluster_count as u64 + 2).saturating_mul(4).div_ceil(bytes_per_sector as u64);
+		if (fat_size as u64) < needed {
+			return None;
+		}
+		// VolumeLength must actually contain the heap it describes, and the specification's floor
+		// is 2^20 bytes' worth of sectors.
+		let volume_length = u64::from_le_bytes([b[72], b[73], b[74], b[75], b[76], b[77], b[78], b[79]]);
+		let heap_end = cluster_heap_offset as u64 + cluster_count as u64 * sectors_per_cluster as u64;
+		if volume_length < heap_end || volume_length < (1 << 20) / bytes_per_sector as u64 {
+			return None;
+		}
+		// TexFAT is out of scope, and refusing only its second-FAT-active flag was half a rule: a
+		// volume declaring two FATs with the first active mounted, and the geometry then recorded
+		// `num_fats: 1`, so the second was neither read nor maintained - this driver writing to a
+		// TexFAT volume would leave a stale copy behind for the system that does understand it.
+		if num_fats != 1 {
+			return None;
+		}
 		if u16::from_le_bytes([b[106], b[107]]) & 0x01 != 0 {
 			return None;
 		}
 		Some(Geometry { kind: Kind::ExFat, bytes_per_sector, sectors_per_cluster, reserved_sectors: fat_offset, num_fats: 1, fat_size, root_entries: 0, root_cluster, first_data_sector: cluster_heap_offset, cluster_count, fsinfo_sector: 0, active_fat: 0, mirror: true })
 	}
+}
+
+// The exFAT boot checksum: a rotating 32-bit sum over the eleven sectors from the main boot sector
+// through the OEM parameters, with VolumeFlags (bytes 106-107) and PercentInUse (byte 112) skipped
+// because the running system rewrites them without restamping the sum. Sector 11 holds that value
+// repeated for its whole length, and every copy must agree.
+fn exfat_boot_checksum_ok<D: BlockDevice>(dev: &mut D, bytes_per_sector: u32) -> bool {
+	let mut sum: u32 = 0;
+	let per_sector = bytes_per_sector as usize / SECTOR_SIZE;
+	let mut buf = [0u8; SECTOR_SIZE];
+	for block in 0..11 * per_sector {
+		if !dev.read_block(block as u64, &mut buf) {
+			return false;
+		}
+		for (i, &byte) in buf.iter().enumerate() {
+			let at = block * SECTOR_SIZE + i;
+			if at == 106 || at == 107 || at == 112 {
+				continue;
+			}
+			sum = (sum >> 1) | (sum << 31);
+			sum = sum.wrapping_add(byte as u32);
+		}
+	}
+	for block in 0..per_sector {
+		if !dev.read_block((11 * per_sector + block) as u64, &mut buf) {
+			return false;
+		}
+		for chunk in buf.chunks_exact(4) {
+			if u32::from_le_bytes(chunk.try_into().unwrap()) != sum {
+				return false;
+			}
+		}
+	}
+	true
 }
