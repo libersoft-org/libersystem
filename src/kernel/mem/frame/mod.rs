@@ -359,7 +359,6 @@ impl FrameAllocator {
 				note_refused_free();
 				return;
 			}
-			self.mark_owned(base, pages, false);
 			// A double free of a span that is still FREE is what the run table caught with its
 			// overlap test. The buddy has no overlap test - it has a bitmap - so the same question
 			// is asked directly, and asking it is what keeps a freed-twice page from being handed
@@ -370,6 +369,24 @@ impl FrameAllocator {
 				crate::serial_println!("frame: WARNING: double free refused - {pages} page(s) at {base:#x} are already free");
 				return;
 			}
+			// EVERY CHECK FIRST, AND ONLY THEN THE RECORD.
+			//
+			// `mark_owned(false)` used to run BEFORE the test above, and the refusal returned
+			// without putting the bits back - so a refused double free left the ownership record
+			// saying "not on loan" about pages that were still out on loan to their real owner.
+			// Three things follow, and all three are worse than the double free that was refused:
+			//
+			//   - the real owner's eventual free is then REFUSED by `check_owned_free`, because the
+			//     record no longer says those pages were ever handed out, and the pages leak;
+			//   - `frame::audit()` compares the record against the bitmap after every test and
+			//     fires, naming whichever test happened to be running rather than the free that
+			//     did it;
+			//   - `check_not_owned` - the double-ALLOCATION detector this milestone exists for - is
+			//     blinded for exactly those pages, because they now read as nobody's.
+			//
+			// A check that refuses an operation must leave the state it found. Nothing here mutates
+			// until the operation is known to be legal.
+			self.mark_owned(base, pages, false);
 			let taken = self.buddy.as_mut().expect("checked").free_span(base, pages);
 			self.free_count += taken as usize;
 			if taken != pages {
@@ -394,7 +411,6 @@ impl FrameAllocator {
 			note_refused_free();
 			return;
 		}
-		self.mark_owned(base, pages, false);
 		let at = self.position(base);
 		let end = base + pages * PAGE_SIZE;
 		let len = self.runs().len();
@@ -408,6 +424,9 @@ impl FrameAllocator {
 			note_refused_free();
 			return;
 		}
+		// After the checks, for the reason the buddy path above gives at length: the record was
+		// cleared before the overlap test and the refusal returned without putting it back.
+		self.mark_owned(base, pages, false);
 		let left_adjacent = at > 0 && {
 			let left = self.runs()[at - 1];
 			left.base + left.pages * PAGE_SIZE == base
@@ -1258,6 +1277,30 @@ static QUARANTINE: crate::sync::SpinLock<Quarantine> = crate::sync::SpinLock::ne
 // runner to call after every test, which is what turns "something diverged during this boot" into
 // "this test diverged it".
 #[cfg(debug_assertions)]
+// Read and write one page's bit in the debug ownership record, for the one test that has to make
+// the record and the bitmap disagree on purpose.
+//
+// The state it constructs cannot arise while the two views agree, and that is the point rather than
+// a caveat: the refusal path being tested only runs when something else has already diverged, so
+// there is no honest way to reach it except by putting the divergence there. What the test asserts
+// is that the refusal LEAVES the state it found - which is a property of that path alone.
+#[cfg(all(test, debug_assertions))]
+pub fn owned_bit_for_test(phys: u64) -> Option<bool> {
+	let allocator = ALLOCATOR.lock();
+	let bits = allocator.owned.as_ref()?;
+	let index = phys.checked_sub(allocator.owned_base)? / PAGE_SIZE;
+	if index >= allocator.owned_frames {
+		return None;
+	}
+	Some(bits[(index / 64) as usize] & (1 << (index % 64)) != 0)
+}
+
+#[cfg(all(test, debug_assertions))]
+pub fn set_owned_bit_for_test(phys: u64, owned: bool) {
+	let mut allocator = ALLOCATOR.lock();
+	allocator.mark_owned(phys, 1, owned);
+}
+
 pub fn audit() -> Option<(u64, u64)> {
 	let allocator = ALLOCATOR.lock();
 	let buddy = allocator.buddy.as_ref()?;

@@ -417,3 +417,48 @@ fn a_spawn_that_passes_a_bootstrap_returns_the_slot_and_the_quota() {
 	let after = domain.account().handles().used();
 	assert!(after <= before, "thirty-two spawns left {} handle(s) charged that nothing owns", after as i64 - before as i64);
 }
+
+crate::tagged_test!(a_refused_free_leaves_the_ownership_record_it_found, [Frame, Memory], id = "kernel.mem.frame.a_refused_free_leaves_the_ownership_record_it_found", covers = ["kernel"]);
+fn a_refused_free_leaves_the_ownership_record_it_found() {
+	// `insert` used to clear the ownership record BEFORE it had established that the free was
+	// legal, and both refusal paths - the buddy's "already free" test and the run table's overlap
+	// test - returned without putting the bits back. So a refused double free left the record
+	// saying "not on loan" about pages that were still out on loan to their real owner.
+	//
+	// Three things follow, and every one of them is worse than the free that was refused:
+	//
+	//   - the real owner's eventual free is REFUSED by `check_owned_free`, because the record no
+	//     longer says those pages were ever handed out, and the pages leak;
+	//   - `frame::audit()` compares the record against the bitmap after every test and fires,
+	//     naming whichever test happened to be running rather than the free that did it;
+	//   - `check_not_owned` - the double-ALLOCATION detector this milestone exists for - reads
+	//     those pages as nobody's, so the one instrument that would explain a double allocation is
+	//     blinded for exactly the pages a bad free just touched.
+	//
+	// THE STATE IS INJECTED, and that is the finding rather than a caveat about the test. The
+	// refusal only runs when the record and the bitmap already disagree, which cannot happen while
+	// the allocator is consistent - so there is no honest way to reach it except to put the
+	// disagreement there. What is asserted is a property of the refusal alone: it leaves the state
+	// it found.
+	#[cfg(debug_assertions)]
+	{
+		let frame = allocate().expect("one frame");
+		// Freed properly: the record is cleared and the buddy holds the page.
+		unsafe { deallocate(frame) };
+		// Now say it is on loan again while the buddy still calls it free - the disagreement.
+		super::set_owned_bit_for_test(frame, true);
+		assert_eq!(super::owned_bit_for_test(frame), Some(true), "the injected state is what the test is about");
+
+		let refused = super::refused_frees();
+		// SAFETY: violating `deallocate`'s contract is the point, and it is safe here precisely
+		// because the page is already free in the buddy - the refusal below is what stops the
+		// second free from reaching the bitmap, which is the assertion.
+		unsafe { deallocate(frame) };
+		assert_eq!(super::refused_frees(), refused + 1, "a free of a page the pool already calls free is refused");
+		assert_eq!(super::owned_bit_for_test(frame), Some(true), "and the refusal leaves the record exactly as it found it");
+
+		// Put the two views back in agreement, so the audit that runs after this test is auditing
+		// the allocator rather than the injection.
+		super::set_owned_bit_for_test(frame, false);
+	}
+}
