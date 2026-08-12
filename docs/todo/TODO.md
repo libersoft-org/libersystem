@@ -195,9 +195,10 @@ observability, persistent storage and multi-architecture support.
 - [ ] [P02M0128 - The terminal's state machine, and the one safe function that is not safe](P02M0128.md)
 - [ ] [P02M0129 - What the loader assumes about the machine it is running on](P02M0129.md)
 - [ ] [P02M0130 - What the component SDK is, and what its milestone says it is](P02M0130.md)
-- [x] [P02M0131 - What LiberMemFS's capacity actually bounds](P02M0131.md)
+- [ ] [P02M0131 - What LiberMemFS's capacity actually bounds](P02M0131.md)
 - [ ] [P02M0132 - The gap between what fsck can see and what a writable mount will accept](P02M0132.md)
 - [ ] [P02M0133 - The parts are right; the transactions between them are not](P02M0133.md)
+- [ ] [P02M0134 - The Wasm engine runs modules it has never validated](P02M0134.md)
 
 ### Definition of done (phase 2)
 
