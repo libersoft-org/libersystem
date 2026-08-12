@@ -152,10 +152,14 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// kernel's span, the placement failed and the boot panicked - on a machine whose firmware
 	// simply hands out pages in a different order.
 	//
-	// A failure here is not fatal: the span may already be reserved (the firmware's own image, or a
-	// second call), and the backend's placement is still the authority. This is a claim staked
-	// early, not a second loader.
-	reserve_kernel_span(bs, kernel);
+	// A failure here is not fatal AT THIS POINT, and the value says which spans were got: x86_64
+	// places its segments wherever the firmware likes and never writes to `p_paddr`, so a refused
+	// reservation costs it nothing, while the backends that DO write there refuse to place into a
+	// span this loader does not own. What is no longer possible is proceeding on the strength of a
+	// status nobody looked at.
+	let reserved = reserve_kernel(bs, kernel);
+	// And the source may not sit in the destination.
+	let kernel = stage_kernel_clear_of_destination(bs, kernel, &reserved);
 
 	// The BOOT medium as the last source, when no system volume answered. A machine whose volume is
 	// missing or unreadable still boots, and it boots the same way as every other machine - the
@@ -263,7 +267,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		// taking a slower path. The kernel is loaded and will say the same thing again.
 		None => arch::serial::write_str("loader: NO bootstrap list on the system volume, the live image or the boot medium\n"),
 	}
-	arch::hand_off(bs, image_handle, system_table, root, kernel);
+	arch::hand_off(bs, image_handle, system_table, root, kernel, &reserved);
 }
 
 // Find the LiberFS system volume among the firmware's block devices and read one file from it.
@@ -452,6 +456,28 @@ pub(crate) const VOLUME_PKG_FILE: &str = "volume.pkg";
 // Describe a loaded blob for the kernel. `bias` is added to the physical address: x86_64 hands
 // over higher-half addresses because it has already built the map, the device-tree architectures
 // hand over physical ones because the kernel builds its own.
+// The loader's OWN extent, from `EFI_LOADED_IMAGE_PROTOCOL`.
+//
+// The riscv64 overlap check stood one 4 KiB page around `place_and_enter` in for this. The loader
+// is larger than one page, and its size is available exactly - so the approximation was a hole in
+// the one check whose whole job is to notice that the loader is about to overwrite itself.
+// Only the riscv64 backend's overlap check needs this today; the other two never move themselves.
+#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+pub(crate) fn loader_image_extent(bs: *mut BootServices, image_handle: Handle) -> Option<(u64, u64)> {
+	let mut li: *mut core::ffi::c_void = core::ptr::null_mut();
+	let status = unsafe { ((*bs).handle_protocol)(image_handle, &uefi::LOADED_IMAGE_PROTOCOL_GUID, &mut li) };
+	if status != uefi::STATUS_SUCCESS || li.is_null() {
+		return None;
+	}
+	let image = li as *mut uefi::LoadedImage;
+	let base = unsafe { (*image).image_base } as u64;
+	let size = unsafe { (*image).image_size };
+	if base == 0 || size == 0 {
+		return None;
+	}
+	Some((base, size))
+}
+
 pub(crate) fn make_module(bytes: &[u8], name: &str, bias: u64) -> bootproto::Module {
 	let mut module = bootproto::Module { addr: bias + bytes.as_ptr() as u64, size: bytes.len() as u64, name: [0; 32] };
 	let n = name.len().min(module.name.len());
@@ -638,6 +664,13 @@ pub(crate) struct GopFb {
 	pub width: u32,
 	pub height: u32,
 	pub pitch: u32, // bytes per row
+	// Bits per pixel, DERIVED from the mode's own bitmask rather than assumed.
+	//
+	// The helper below already computed this to get the pitch right for a non-32 bpp mode, and then
+	// dropped it: `GopFb` had no field for it and all three backends published the constant `32`.
+	// The kernel derives bytes-per-pixel from what they publish, so such a mode got a correct pitch
+	// and a wrong pixel stride - the original finding surviving inside its own fix.
+	pub bpp: u32,
 	pub red_shift: u8,
 	pub red_size: u8,
 	pub green_shift: u8,
@@ -647,7 +680,7 @@ pub(crate) struct GopFb {
 }
 
 impl GopFb {
-	pub(crate) const NONE: Self = Self { present: false, phys: 0, size: 0, width: 0, height: 0, pitch: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0 };
+	pub(crate) const NONE: Self = Self { present: false, phys: 0, size: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0 };
 }
 
 // Query the Graphics Output Protocol for the active mode's linear framebuffer. Returns
@@ -709,7 +742,7 @@ pub(crate) fn locate_framebuffer(bs: *mut BootServices) -> GopFb {
 		}
 		_ => 32u32,
 	};
-	GopFb { present: true, phys: unsafe { (*mode).frame_buffer_base }, size: unsafe { (*mode).frame_buffer_size as u64 }, width, height, pitch: pitch_px * (bpp / 8), red_shift: rs, red_size: rz, green_shift: gs, green_size: gz, blue_shift: bs_shift, blue_size: bz }
+	GopFb { present: true, phys: unsafe { (*mode).frame_buffer_base }, size: unsafe { (*mode).frame_buffer_size as u64 }, width, height, pitch: pitch_px * (bpp / 8), bpp, red_shift: rs, red_size: rz, green_shift: gs, green_size: gz, blue_shift: bs_shift, blue_size: bz }
 }
 
 // Bit position of the lowest set bit of a channel mask.
@@ -724,9 +757,61 @@ fn mask_size(mask: u32) -> u8 {
 
 // Claim every `PT_LOAD`'s page span at its physical link address, so a later opportunistic
 // allocation cannot take it. Best effort by design - see the call site.
-fn reserve_kernel_span(bs: *mut uefi::BootServices, kernel: &[u8]) {
+// The kernel's physical spans THIS LOADER actually got, and nothing else.
+//
+// The reservation used to be a `fn(..)` returning nothing, ending in
+// `let _ = ((*bs).allocate_pages)(ALLOCATE_ADDRESS, ..)`, and the aarch64 backend then claimed the
+// same spans a second time and discarded that status too - on the reasoning that the error was
+// expected because the reservation already owned them. The reasoning is right about why the error
+// is usually harmless and wrong about what it proves: `NOT_FOUND`/`NOT_AVAILABLE` is the same
+// answer whether the owner is this loader or the firmware, a runtime service or a device, and the
+// code proceeded to `write_bytes` either way. Before that change the second claim panicked. A boot
+// that used to STOP could then write over whatever was there.
+//
+// So the reservation returns what it owns. A backend asks this value rather than re-asking the
+// firmware a question whose answer it cannot interpret, and a span that is not in here is fatal at
+// placement - the old panic, restored deliberately rather than by omission.
+pub struct ReservedKernel {
+	// (page-aligned base, page count) per PT_LOAD segment this loader reserved.
+	spans: [(u64, u64); MAX_KERNEL_SPANS],
+	count: usize,
+	// Whether every PT_LOAD was reserved. False when a claim failed OR when there were more
+	// segments than this table holds - both mean "do not trust this to answer for the whole image".
+	complete: bool,
+}
+
+// Sixteen, matching the x86 backend's `MAX_SEGMENTS`. A kernel with more LOAD segments than this is
+// refused at placement rather than partially reserved.
+const MAX_KERNEL_SPANS: usize = 16;
+
+impl ReservedKernel {
+	const EMPTY: Self = Self { spans: [(0, 0); MAX_KERNEL_SPANS], count: 0, complete: true };
+
+	// Did this loader reserve exactly this span?
+	pub fn owns(&self, base: u64, pages: u64) -> bool {
+		self.spans[..self.count].iter().any(|&(reserved_base, reserved_pages)| reserved_base == base && reserved_pages == pages)
+	}
+
+	// Does `[addr, addr+len)` fall inside any reserved span? For the source buffer, which must not
+	// sit in the destination it is about to be copied out of.
+	pub fn overlaps(&self, addr: u64, len: u64) -> bool {
+		let end = addr.saturating_add(len);
+		self.spans[..self.count].iter().any(|&(base, pages)| {
+			let span_end = base.saturating_add(pages.saturating_mul(PAGE_SIZE));
+			addr < span_end && base < end
+		})
+	}
+
+	pub fn is_complete(&self) -> bool {
+		self.complete
+	}
+}
+
+fn reserve_kernel(bs: *mut uefi::BootServices, kernel: &[u8]) -> ReservedKernel {
+	let mut reserved = ReservedKernel::EMPTY;
 	let Some(image) = elf::Elf::parse(kernel) else {
-		return;
+		reserved.complete = false;
+		return reserved;
 	};
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
@@ -735,7 +820,49 @@ fn reserve_kernel_span(bs: *mut uefi::BootServices, kernel: &[u8]) {
 		}
 		let base = align_down(ph.p_paddr, PAGE_SIZE);
 		let pages = (ph.p_paddr - base + ph.p_memsz).div_ceil(PAGE_SIZE);
+		if reserved.count == MAX_KERNEL_SPANS {
+			reserved.complete = false;
+			break;
+		}
 		let mut addr = base;
-		let _ = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ADDRESS, uefi::LOADER_DATA, pages as usize, &mut addr) };
+		let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ADDRESS, uefi::LOADER_DATA, pages as usize, &mut addr) };
+		if status != uefi::STATUS_SUCCESS {
+			// Recorded, not fatal HERE: x86_64 places its segments wherever the firmware likes and
+			// never touches `p_paddr`, so a failed reservation costs it nothing. The backend that
+			// does write to `p_paddr` is the one that must refuse, and it asks this value.
+			reserved.complete = false;
+			continue;
+		}
+		reserved.spans[reserved.count] = (base, pages);
+		reserved.count += 1;
+	}
+	reserved
+}
+
+// Move the kernel image out of its own destination, if the firmware put it there.
+//
+// The file is read with `AllocateAnyPages` BEFORE the reservation can be taken - the spans are in
+// its ELF header, so there is nothing to reserve until it has been read - and the firmware may
+// satisfy that buffer from inside the kernel's own destination. The placement then zeroes the
+// segment's source before copying out of it, which riscv64's staging already solves for its own
+// objects and the other two backends assumed away.
+//
+// A fresh allocation cannot land in the destination now, because the destination is reserved: this
+// is called after `reserve_kernel`. If it somehow still overlaps, the boot stops rather than
+// copying a buffer onto itself.
+fn stage_kernel_clear_of_destination(bs: *mut uefi::BootServices, kernel: &'static [u8], reserved: &ReservedKernel) -> &'static [u8] {
+	if !reserved.overlaps(kernel.as_ptr() as u64, kernel.len() as u64) {
+		return kernel;
+	}
+	arch::serial::write_str(
+		"loader: the kernel file was read into its own destination; staging it clear
+",
+	);
+	let pages = (kernel.len() as u64).div_ceil(PAGE_SIZE);
+	let staged = alloc_pages(bs, pages as usize).expect("loader: cannot stage the kernel clear of its destination");
+	assert!(!reserved.overlaps(staged, kernel.len() as u64), "loader: the staged kernel still overlaps its destination");
+	unsafe {
+		core::ptr::copy_nonoverlapping(kernel.as_ptr(), staged as *mut u8, kernel.len());
+		core::slice::from_raw_parts(staged as *const u8, kernel.len())
 	}
 }

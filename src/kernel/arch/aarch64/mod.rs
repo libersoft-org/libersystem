@@ -1,12 +1,23 @@
 // aarch64 (ARM64) architecture backend.
 //
-// STATUS: STUB. This module satisfies the same arch contract as `arch::x86_64`
-// (the set of `arch::*` symbols the portable kernel calls - see the contract
-// listed in `arch/mod.rs`) so that a cross-build for `aarch64-unknown-none`
-// links, but nothing here is implemented yet: the ARMv8-A mechanics (VMSAv8
-// page tables, the VBAR_EL1 vector table, the GIC + generic timer, PSCI SMP
-// wake, SVC syscall, TPIDR_EL1 per-CPU, PL011 UART, DTB parsing) are still to come.
-// Runtime entry points `todo!()`; a boot on this arch is not possible until then.
+// STATUS: BOOTS, and runs the whole test suite. The header here said `STUB` and "a boot on this
+// arch is not possible until then" while this target was passing 226 of 226 tests, which is worth
+// recording rather than quietly deleting: the comment could stay wrong for so long because what it
+// describes is REAL. The ARMv8-A mechanics are all implemented in the submodules below - VMSAv8
+// page tables in `paging`, the VBAR_EL1 vector table in `exceptions`, the GIC and the generic timer
+// in `gic`/`apic`/`interrupts`, PSCI SMP wake in `psci`/`smp`, the SVC syscall path in `syscall`,
+// TPIDR_EL1 per-CPU in `percpu`, the PL011 UART in `serial`, and device-tree parsing in `dtb`.
+//
+// What IS still `todo!()` is the portable init contract listed in `arch/mod.rs`: `init`,
+// `init_interrupts`, `init_syscalls`, `init_tsc`, `init_bsp_percpu` and `init_ap`, plus the shims
+// the x86 bring-up reaches them through. Seventeen stubs, and none of them is on a path this target
+// takes. aarch64 boots from firmware straight into `boot::aarch64_main`, which is the EL1 entry and
+// drives the whole bring-up itself - console, memory, paging, per-CPU, GIC, timer, SMP, scheduler,
+// then the userspace boot chain - so it never enters the bootloader-handoff `main::kmain` that
+// calls those hooks. They exist so the shared crate root type-checks for `aarch64-unknown-none`.
+//
+// The consequence, which `arch/mod.rs` states once for both device-tree targets: the HAL contract
+// is satisfied for everything after boot and bypassed for boot itself.
 
 mod boot;
 mod dtb;

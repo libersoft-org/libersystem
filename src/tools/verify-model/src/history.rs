@@ -36,6 +36,13 @@ pub struct Record {
 pub struct History {
 	pub schema: u32,
 	pub entries: BTreeMap<String, Record>,
+	// How far under its fixed term a run has come in, per `architecture/environment`. See
+	// `record_step`: this is the observation that used to be clamped away, and it is the only thing
+	// in this file that can say a constant in `CostModel::default` is wrong.
+	//
+	// `#[serde(default)]` so the histories already on disk load and read as "never overshot".
+	#[serde(default)]
+	pub fixed_overshoot: BTreeMap<String, f64>,
 }
 
 impl History {
@@ -46,13 +53,13 @@ impl History {
 	pub fn load(repo_root: &Path) -> Result<Self, String> {
 		let path = Self::path(repo_root);
 		if !path.is_file() {
-			return Ok(History { schema: 1, entries: BTreeMap::new() });
+			return Ok(History { schema: 1, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new() });
 		}
 		let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
 		// A history that cannot be read is an empty history, not a failure. It records what has run;
 		// losing it costs a wider next sweep, which is the safe direction, and refusing to plan
 		// because a cache is corrupt would be the unsafe one.
-		Ok(serde_json::from_str(&text).unwrap_or(History { schema: 1, entries: BTreeMap::new() }))
+		Ok(serde_json::from_str(&text).unwrap_or(History { schema: 1, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new() }))
 	}
 
 	pub fn save(&self, repo_root: &Path) -> Result<(), String> {
@@ -82,7 +89,33 @@ impl History {
 			pairs.insert((key.architecture.clone(), key.environment.as_str().to_string()));
 		}
 		let fixed: f64 = pairs.iter().map(|pair| cost.fixed_seconds.get(pair).copied().unwrap_or(0.0)).sum();
-		let share = ((step_seconds - fixed).max(0.0)) / keys.len() as f64;
+		// A NEGATIVE RESIDUAL IS A MEASUREMENT, and clamping it to zero is what stopped this history
+		// from ever contradicting the constant above it.
+		//
+		// The aarch64 suite measured 2069 s against a fixed term of 2300. The residual was negative,
+		// `.max(0.0)` made it zero, every key recorded zero seconds, and `estimate` then ignored the
+		// record because it requires `last_seconds > 0.0` and fell back to the 0.5 s default. So the
+		// two targets whose costs actually decide whether a selection stays scoped were the two the
+		// history could never learn anything about - and the one observation that would have said
+		// "the fixed term is too high" was the observation being discarded.
+		//
+		// It is recorded instead: the overshoot goes into `fixed_overshoot`, keyed by the pair it
+		// was measured for, and the per-key share stays zero because there is genuinely nothing left
+		// to distribute. `verify-model cost` reports it, which is how a constant that is wrong
+		// becomes visible rather than merely inert.
+		let residual = step_seconds - fixed;
+		if residual < 0.0 {
+			for pair in &pairs {
+				let seen = self.fixed_overshoot.entry(format!("{}/{}", pair.0, pair.1)).or_insert(0.0);
+				// The LARGEST overshoot seen, not the last: the fixed term is a floor on what a run
+				// costs, so the run that came in furthest under it is the strongest evidence about
+				// how far off the constant is.
+				if -residual > *seen {
+					*seen = -residual;
+				}
+			}
+		}
+		let share = residual.max(0.0) / keys.len() as f64;
 		for key in keys {
 			self.record(&key.display(), passed, share, model_hash);
 		}

@@ -17,11 +17,17 @@
 //! frees the old chain last, so a failure part-way never costs the old file. The media
 //! is untrusted: every value off the boot sector and the chains is bounded before use,
 //! so a malformed volume is refused or errors cleanly instead of panicking or hanging.
-//! The exFAT boot region is never rewritten: PercentInUse stays as the formatter left
-//! it and the volume-dirty flags (exFAT VolumeFlags, the classic FAT[1] clean-shutdown
-//! bits) stay untouched - the exFAT boot checksum excludes VolumeFlags and
-//! PercentInUse, so maintaining them would cost only extra sector writes per
-//! operation; the write path stays minimal and readers treat both as advisory.
+//! The exFAT boot region IS rewritten, in one place and for one reason: `set_volume_dirty` brackets
+//! every metadata transaction with the VolumeDirty flag and stamps PercentInUse to 0xFF - "unknown"
+//! - because this driver does not maintain the figure and a stale one is worse than none. Nothing
+//! else in the boot region is touched.
+//!
+//! (This header said the region was never rewritten and that the volume-dirty flags stayed
+//! untouched, a thousand lines above the code that writes them. In a filesystem driver the header
+//! is where somebody learns what the code promises about the medium, which makes a stale one worth
+//! more than an ordinary stale comment.)
+//!
+//! The classic FAT[1] clean-shutdown bits are still untouched, and readers treat them as advisory.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -43,6 +49,18 @@ use dir::{existing_shorts, short_char, trim_spaces};
 // always 512); the device reads physical 512-byte sectors and a larger logical sector is
 // read as a run of them.
 pub const SECTOR_SIZE: usize = 512;
+
+// What one directory read may allocate. The exFAT specification bounds a directory at 256 MiB, so a
+// chain past this is a volume outside its own format rather than a large one - which matters
+// because `read_dir_bytes` used `usize::MAX` for any directory that records no length, and every
+// exFAT root records none.
+pub const MAX_DIR_BYTES: usize = 256 * 1024 * 1024;
+
+// What `read_file` may allocate when the caller does not say. `read_file_bounded` takes the
+// caller's own ceiling; this is the default for the callers that have no opinion, and it is
+// deliberately generous - the point is that a number a hostile volume writes cannot name an
+// unbounded allocation, not that files must be small.
+pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 // A block device: foreign media is read and written one 512-byte sector at a time, by
 // absolute LBA (its block index). The trait is the shared fs-core one (a block is
@@ -300,6 +318,17 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Read a whole file named by a `/`-separated path into a Vec.
 	pub fn read_file(&mut self, path: &[u8]) -> Result<Vec<u8>, FsError> {
+		self.read_file_bounded(path, MAX_FILE_BYTES)
+	}
+
+	// The same read with the caller's OWN ceiling, which is what a caller needs to be able to say.
+	//
+	// `read_file` returned the whole file as a `Vec` sized from a length the medium supplies, and
+	// the caller had no way to state how much it was willing to take - so "what is bounded now is
+	// everything sized by a number a hostile volume writes" was true of the FAT and not of the
+	// files. A file past the ceiling is `TooLarge`, which `fs-core` documents as "the answer does
+	// not fit in one buffer; a ranged read is the solution".
+	pub fn read_file_bounded(&mut self, path: &[u8], limit: usize) -> Result<Vec<u8>, FsError> {
 		let (parent, name) = split_parent(path)?;
 		let dir = self.resolve_dir(parent)?;
 		let entry = self.find_entry(&dir, name)?;
@@ -309,6 +338,9 @@ impl<D: BlockDevice> FatFs<D> {
 		// the bytes past the ValidDataLength are undefined on disk and the media's home
 		// systems serve them as zeros - a preallocated tail must never leak stale
 		// cluster content (classic entries carry no VDL: theirs equals the size).
+		if entry.size > limit as u64 {
+			return Err(FsError::TooLarge);
+		}
 		let disk = entry.size.min(entry.valid_len) as usize;
 		let mut out = if entry.no_fat_chain {
 			// an exFAT NoFatChain file occupies contiguous clusters and its FAT entries
@@ -481,6 +513,20 @@ impl<D: BlockDevice> FatFs<D> {
 	// whole chain), following the allocation table. Returns the bytes read. The step
 	// guard is the volume's real cluster count - no legitimate chain can be longer -
 	// and a cluster VALUE outside the heap is corruption, never a sector address.
+	// Read the WHOLE chain, refusing past `cap` rather than sizing the allocation from the medium.
+	//
+	// `read_chain`'s `limit` is an exact length - a chain that ends early is `Invalid`, because the
+	// entry's own size says how much is there - and `usize::MAX` is its "read to the end" sentinel.
+	// A directory that records no length needs the second meaning WITH a ceiling, which is a third
+	// thing: read to the end, and refuse a volume whose end is past what its own format allows.
+	fn read_whole_chain(&mut self, first: u32, cap: usize) -> Result<Vec<u8>, FsError> {
+		let out = self.read_chain(first, usize::MAX)?;
+		if out.len() > cap {
+			return Err(FsError::TooLarge);
+		}
+		Ok(out)
+	}
+
 	fn read_chain(&mut self, first: u32, limit: usize) -> Result<Vec<u8>, FsError> {
 		if limit == 0 {
 			return Ok(Vec::new());
@@ -975,6 +1021,16 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Read a directory's raw bytes: the fixed root region for FAT12/16, a contiguous
 	// NoFatChain run for an exFAT directory carrying one, else its cluster chain.
+	#[cfg(test)]
+	pub(crate) fn read_dir_bytes_for_test(&mut self, dir: &Dir) -> Result<Vec<u8>, FsError> {
+		self.read_dir_bytes(dir)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn is_end_for_test(&self, cluster: u32) -> bool {
+		self.is_end(cluster)
+	}
+
 	fn read_dir_bytes(&mut self, dir: &Dir) -> Result<Vec<u8>, FsError> {
 		if dir.cluster == 0 {
 			return self.read_root_region();
@@ -992,7 +1048,17 @@ impl<D: BlockDevice> FatFs<D> {
 			let cap = len.div_ceil(cluster_bytes).saturating_mul(cluster_bytes).min(usize::MAX as u64) as usize;
 			return self.read_chain(dir.cluster, cap);
 		}
-		self.read_chain(dir.cluster, usize::MAX)
+		// A CEILING A LEGAL VOLUME CANNOT EXCEED, rather than `usize::MAX`.
+		//
+		// This reached `read_chain(dir.cluster, usize::MAX)` whenever a directory records no length,
+		// which is EVERY exFAT root - a root has no entry set of its own to record one. The chain
+		// checks are sound, so a long ACYCLIC chain is legal and forced an allocation as large as
+		// the volume allows. `load_upcase` reads the root at mount, so this ran before anything had
+		// vouched for the volume.
+		//
+		// The exFAT specification bounds a directory at 256 MiB, so a chain past `MAX_DIR_BYTES` is
+		// a volume outside its own format rather than a large one.
+		self.read_whole_chain(dir.cluster, MAX_DIR_BYTES)
 	}
 
 	// Write a directory's raw bytes back: to the fixed root region, over the contiguous
@@ -1118,9 +1184,15 @@ impl<D: BlockDevice> FatFs<D> {
 			None => Ok(false),
 			Some(e) => {
 				self.write_dir_dirty(dir, &bytes, &orig)?;
-				// the unlink is durable once the directory write lands - the free is
-				// best-effort (a failing device costs lost clusters, never a false
-				// failure of a finished remove).
+				// A BARRIER BEFORE THE FREE. "Durable once the directory write lands" is the
+				// assumption a barrier exists to stop making, and `write_file` beside this no longer
+				// makes it. The failure is the mirror of the publish one: the FAT free reaches the
+				// medium, the directory deletion does not, and after a crash a live entry names
+				// clusters the FAT calls free - which the next allocation cross-links.
+				//
+				// A failing barrier means the deletion is not known to be durable, so the clusters
+				// stay where they are. Lost space against a cross-link is not a close comparison.
+				self.barrier()?;
 				let _ = self.free_chain(e.first_cluster);
 				Ok(true)
 			}
@@ -1203,9 +1275,25 @@ impl<D: BlockDevice> FatFs<D> {
 				staged[i] = orig.get(i).copied().unwrap_or(0);
 			}
 		}
-		self.write_dir_dirty(dir, &staged, &orig).map_err(|error| SwapFailure { error, placed: false })?;
-		self.barrier().map_err(|error| SwapFailure { error, placed: false })?;
-		// Past here the new entry may be on the medium.
+		// Past the NEXT line the new entry may be on the medium, and the line after it cannot
+		// change that.
+		//
+		// The barrier used to carry `placed: false`, which reads the failure as "nothing was
+		// written". It is not: `write_dir_dirty` returning `Ok` means the device ACCEPTED those
+		// sectors, and a flush that then fails says the durability is unknown - not that the cache
+		// was thrown away. A device does not discard accepted writes because a flush reported an
+		// error; it is at least as likely to commit them a moment later. So the caller freed the new
+		// chain while its entry was live on the medium, which is the one outcome this protocol
+		// exists to prevent.
+		//
+		// `placed: true` gives the benign state the protocol already describes for its third step:
+		// both entries live, a duplicate name, no data lost, `fsck` resolves it.
+		//
+		// A PARTIAL write is the same question one step earlier, and it gets the same answer: an
+		// entry set can straddle a sector boundary, so a `write_dir_dirty` that fails part-way may
+		// also have published. Nothing here may assume otherwise.
+		self.write_dir_dirty(dir, &staged, &orig).map_err(|error| SwapFailure { error, placed: true })?;
+		self.barrier().map_err(|error| SwapFailure { error, placed: true })?;
 		self.write_dir_dirty(dir, &bytes, &staged).map_err(|error| SwapFailure { error, placed: true })?;
 		self.barrier().map_err(|error| SwapFailure { error, placed: true })?;
 		Ok(old.map(|o| o.first_cluster))
@@ -1315,9 +1403,32 @@ impl<D: BlockDevice> FatFs<D> {
 	// not a failure of the operation - the data is written - but it does leave the volume looking
 	// unclean, which is the safe direction to fail in.
 	fn under_dirty_flag<R>(&mut self, body: impl FnOnce(&mut Self) -> Result<R, FsError>) -> Result<R, FsError> {
+		// SET, FLUSH, RUN, FLUSH, CLEAR, FLUSH - and only clear on success.
+		//
+		// This cleared the flag unconditionally, which is precisely backwards: a `body` that fails
+		// is the case the flag exists for, because a metadata mutation may have landed part-way. The
+		// volume was told the next mount that it was consistent over exactly the state that is not.
+		//
+		// And the flushes are what make it a bracket rather than advice. Without them the flag and
+		// the metadata it brackets can reach the medium in any order, so a correctly-set flag can
+		// arrive after the damage it was meant to announce.
 		self.set_volume_dirty(true)?;
+		self.barrier()?;
 		let outcome = body(self);
+		if outcome.is_err() {
+			// LEFT UP, and that is all. The flag says "a metadata transaction on this volume did not
+			// complete", which the next mount and every other implementation can act on.
+			//
+			// Degrading the mount here as well was tried and reverted: most failures inside a
+			// transaction are ones the operation has already undone - a grow that gave its cluster
+			// back, an allocation that rolled its links back - and turning those into a read-only
+			// volume punishes a clean refusal. Degrading belongs where the UNDO failed, which is
+			// where `set_fat_entry` already does it.
+			return outcome;
+		}
+		self.barrier()?;
 		let _ = self.set_volume_dirty(false);
+		let _ = self.barrier();
 		outcome
 	}
 
@@ -1337,9 +1448,12 @@ impl<D: BlockDevice> FatFs<D> {
 		}
 		let old = match self.exfat_swap_entry(dir, name, first, data.len() as u64) {
 			Ok(old) => old,
-			Err(e) => {
-				let _ = self.exfat_free(first);
-				return Err(e);
+			// Freed only when nothing was published, exactly as the classic caller decides it.
+			Err(SwapFailure { error, placed }) => {
+				if !placed {
+					let _ = self.exfat_free(first);
+				}
+				return Err(error);
 			}
 		};
 		// the write is durable once the entry set lands - the release of the replaced
@@ -1359,7 +1473,10 @@ impl<D: BlockDevice> FatFs<D> {
 			return Err(FsError::NotFound);
 		};
 		self.write_dir_dirty(dir, &bytes, &orig)?;
-		// durable once the directory write lands - the release is best-effort.
+		// The same barrier as the classic path, for the same reason: the entry has to be durably
+		// gone before its clusters go back. It is also the ordering the exFAT specification
+		// recommends for a delete - directory, then FAT, then the allocation bitmap.
+		self.barrier()?;
 		let _ = self.exfat_release(&old);
 		Ok(())
 	}
@@ -1370,11 +1487,25 @@ impl<D: BlockDevice> FatFs<D> {
 	// overwrite preserves the replaced set's on-disk name and creation stamp, as the
 	// media's home systems do. Returns the replaced entry, whose clusters only then
 	// are safe to release.
-	fn exfat_swap_entry(&mut self, dir: &Dir, name: &[u8], first: u32, size: u64) -> Result<Option<Raw>, FsError> {
-		let mut bytes = self.read_dir_bytes(dir)?;
+	fn exfat_swap_entry(&mut self, dir: &Dir, name: &[u8], first: u32, size: u64) -> Result<Option<Raw>, SwapFailure> {
+		// THE SAME PROTOCOL THE CLASSIC PATH HAS, which this never got.
+		//
+		// This marked the old set unlinked AND placed the new one in the same buffer, wrote it once,
+		// and returned a bare `FsError` - so the caller could not tell which side of the publish a
+		// failure fell on and freed the new chain unconditionally. A `write_dir_dirty` that lands
+		// the sector holding the new entry and fails on a later one therefore left a live entry
+		// naming clusters that were back in the free pool, and the next allocation cross-linked
+		// them. Exactly the finding the classic path was fixed for.
+		//
+		// It is worse here than it was there, and the reason is the format: an exFAT entry set
+		// carries its in-use bit in the FILE entry, which is FIRST. A set that straddles a sector
+		// boundary and lands only partially leaves the live half on the medium. In a classic set the
+		// 8.3 entry is last, so the same partial write is likelier to leave nothing live.
+		let fail = |error: FsError| SwapFailure { error, placed: false };
+		let mut bytes = self.read_dir_bytes(dir).map_err(fail)?;
 		let orig = bytes.clone();
 		scrub_after_terminator(&mut bytes);
-		let old = exfat_mark_unlinked(&mut bytes, name, &self.upcase)?;
+		let old = exfat_mark_unlinked(&mut bytes, name, &self.upcase).map_err(fail)?;
 		let name: &[u8] = match &old {
 			Some(o) if writable_name(o.name.as_bytes()) => o.name.as_bytes(),
 			_ => name,
@@ -1398,12 +1529,33 @@ impl<D: BlockDevice> FatFs<D> {
 			// a NoFatChain directory occupies contiguous clusters - it cannot extend
 			// without relocation, so it refuses instead.
 			if dir.nfc_len.is_some() {
-				return Err(FsError::NoSpace);
+				return Err(fail(FsError::NoSpace));
 			}
-			self.exfat_grow_dir(dir, &mut bytes)?;
+			self.exfat_grow_dir(dir, &mut bytes).map_err(fail)?;
 		};
 		bytes[at..at + set.len()].copy_from_slice(&set);
-		self.write_dir_dirty(dir, &bytes, &orig)?;
+		// TWO ORDERED WRITES with a barrier between them, and the order is the protocol: place the
+		// new set while the old one is still IN USE, then retire the old one. A failure after the
+		// first write leaves both live - a duplicate name, which `fsck` resolves and which loses
+		// nobody's data - and the caller must not free anything.
+		//
+		// `staged` is `bytes` with everything outside the new set restored from `orig`, so the only
+		// difference from the medium is the new set itself.
+		let new_span = at..at + set.len();
+		let mut staged = bytes.clone();
+		for i in 0..staged.len() {
+			if !new_span.contains(&i) {
+				staged[i] = orig.get(i).copied().unwrap_or(0);
+			}
+		}
+		// Past here the new set may be on the medium, and neither the barrier nor a partial write
+		// can take that back - see the classic path for why a failing flush is not "nothing
+		// happened".
+		let placed = |error: FsError| SwapFailure { error, placed: true };
+		self.write_dir_dirty(dir, &staged, &orig).map_err(placed)?;
+		self.barrier().map_err(placed)?;
+		self.write_dir_dirty(dir, &bytes, &staged).map_err(placed)?;
+		self.barrier().map_err(placed)?;
 		Ok(old)
 	}
 
@@ -1595,7 +1747,25 @@ impl<D: BlockDevice> FatFs<D> {
 				return Err(e);
 			}
 		}
-		self.write_dir_bytes(&bm_dir, &bm)?;
+		// THE BITMAP IS PART OF THE SAME TRANSACTION AS THE LINKS, and it was not.
+		//
+		// The FAT links are written one at a time with a real rollback and a degrade when the undo
+		// fails - the fix from finding 11 doing its job - and then this wrote the whole bitmap in one
+		// call with no rollback at all. A failure here returned `Err` with the FAT already saying the
+		// clusters were chained, and for exFAT the bitmap is the AUTHORITY on whether a cluster is
+		// free, so the two disagreeing is not a cosmetic inconsistency.
+		if self.write_dir_bytes(&bm_dir, &bm).is_err() {
+			// Undo the links this call wrote, the same way a failed `set_fat_entry` undoes them -
+			// and degrade if the medium refuses the undo, because then the clusters are marked in
+			// use with nothing naming them and only refusing further mutations keeps it at a leak.
+			for &done in &chain {
+				if self.set_fat_entry(done, 0).is_err() {
+					self.degraded = true;
+					break;
+				}
+			}
+			return Err(FsError::Io);
+		}
 		Ok(chain)
 	}
 
@@ -1629,7 +1799,16 @@ impl<D: BlockDevice> FatFs<D> {
 				break;
 			}
 		}
-		self.write_dir_bytes(&bm_dir, &bm)
+		// The mirror of the allocation's transaction: here the FAT entries are cleared inside the
+		// walk and the bitmap is written once at the end, so a failed bitmap write leaves clusters
+		// the FAT calls free and the bitmap calls allocated. There is nothing to undo - the walk has
+		// already run - so the volume is degraded instead, which keeps it at a leak rather than
+		// letting the next allocation hand out a cluster the bitmap still claims.
+		if self.write_dir_bytes(&bm_dir, &bm).is_err() {
+			self.degraded = true;
+			return Err(FsError::Io);
+		}
+		Ok(())
 	}
 
 	// Free a NoFatChain file's contiguous cluster run: clear its bitmap bits. The FAT

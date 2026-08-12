@@ -75,9 +75,24 @@ pub fn required_architectures(universe: crate::shadow::Universe) -> usize {
 		crate::shadow::Universe::TestGuest => 2,
 		// One target by construction: the host is the host.
 		crate::shadow::Universe::Host => 1,
+		// Builds run for all three targets, so evidence about one says nothing about the others -
+		// the same argument as the guest suite. There is no producer for this universe yet, so the
+		// number is what it will need rather than what it currently gets.
+		crate::shadow::Universe::HostBuild => 2,
 		// Built for x86_64 only, so asking for two is asking for a target that does not exist.
 		crate::shadow::Universe::DevGuest => 1,
 	}
+}
+
+// Which universes have an execution mechanism a sample can be taken of.
+//
+// The guest suite has one: an exact `TEST_SELECTION` handed to a runner that can fail to match it.
+// The host and dev producers lower a selection into shell commands, and a sample of those is
+// exactly as valuable - but there is no producer for it yet, and requiring what nothing can supply
+// would make those universes permanently untrustable rather than honestly graded. Recorded here, in
+// one place, so adding a producer is one line rather than a search.
+fn exec_universes(universe: crate::shadow::Universe) -> bool {
+	matches!(universe, crate::shadow::Universe::TestGuest)
 }
 
 impl Store {
@@ -146,6 +161,24 @@ impl Store {
 		let needed = required_architectures(universe);
 		if architectures.len() < needed {
 			return Err(format!("evidence from {} target(s) ({}), {needed} needed in this universe - a component validated on one target says nothing about the others", architectures.len(), architectures.join(", ")));
+		}
+		// AND ONE RUN IN WHICH THE SELECTION WAS ACTUALLY EXECUTED.
+		//
+		// Every record above is a DRY comparison: the scoped set was computed and never run, so all
+		// of them together answer "did the selector choose the right set" and none of them answers
+		// "does running that set work". This milestone contains the proof that the second question
+		// is not theoretical - a planner emitting Rust function names against a runner using stable
+		// IDs computed every selection correctly, could execute none of them, and left every dry
+		// comparison clean. That was found by hand.
+		//
+		// One sample per universe is the requirement, not one per run: a sample costs a second full
+		// sweep, and what it establishes is a property of the execution mechanism rather than of the
+		// change. `verify.sh --shadow-exec` produces it.
+		if !exec_universes(universe) {
+			return Ok((clean, architectures));
+		}
+		if !log.has_exec_sample(component, model_hash, universe) {
+			return Err(String::from("no run has EXECUTED this selection - every comparison on record is dry, so they say the right set was chosen and nothing about whether running it works; ./verify.sh --shadow-exec produces the sample"));
 		}
 		Ok((clean, architectures))
 	}

@@ -54,7 +54,7 @@ pub fn halt() -> ! {
 // volume (the kernel gets them as boot-protocol modules), loads the kernel ELF,
 // gathers the framebuffer + RSDP, builds the page tables + BootInfo, snapshots the
 // memory map, exits boot services, and switches to the kernel's page tables.
-pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
+pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8], _reserved: &crate::ReservedKernel) -> ! {
 	// Already read in `main`, where it also supplied the bootstrap set: exactly one of the two is
 	// present - a test medium carries the archive, a live medium the volume, and an installed
 	// system neither, because its volume is on the disk.
@@ -123,6 +123,21 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let mut tables = PageTables::new(bs).expect("loader: cannot allocate PML4");
 	tables.map_hhdm(0, ram_top, false).expect("loader: HHDM map failed");
 	tables.map_identity(ram_top).expect("loader: identity map failed");
+	// ONE INTERVAL, AND THE ATTRIBUTES CORRECTED OVER IT.
+	//
+	// `map_hhdm(0, ram_top)` maps physical holes as if they were memory and takes no attributes
+	// from the descriptors it covers, which is the finding this addresses in part. Mapping a hole
+	// is inert - nothing reads an address the kernel's own memory map does not describe - but a
+	// WRITE-BACK mapping laid over device memory is not: a speculative fetch or an evicted line
+	// through it reaches a device, and this loader gives `PCD | PWT` only to the framebuffer.
+	//
+	// So the interval stays and the MMIO descriptors inside it are re-mapped uncacheable. That is
+	// deliberately not the redesign the finding describes - a per-descriptor map with per-type
+	// attributes and unmapped holes - and the reason is that the contiguous map is now load-bearing
+	// twice: the kernel derives its `DIRECT_MAP_LIMIT` from the top of the same memory map and
+	// bounds every firmware pointer against it (P02M0133), which a sparse map would make wrong
+	// rather than stricter. Making both sparse together is one change, and it is not this one.
+	map_mmio_uncacheable(bs, &mut tables, ram_top);
 	if fb.present {
 		let fb_base = align_down(fb.phys, PAGE_2MB);
 		let fb_end = align_up(fb.phys + fb.size, PAGE_2MB);
@@ -246,6 +261,10 @@ fn load_kernel(bs: *mut BootServices, kernel: &[u8], out: &mut [KernelSegment; M
 			continue;
 		}
 		let pages = ph.p_memsz.div_ceil(PAGE_SIZE);
+		// ANYWHERE THE FIRMWARE LIKES, which is why this backend takes no `ReservedKernel`: it maps
+		// `p_vaddr` to whatever physical pages it is given and never writes to `p_paddr`, so the
+		// reservation is a claim it neither needs nor can be hurt by. The two backends that place
+		// AT the link address are the ones that must refuse a span they do not own.
 		let phys = alloc_pages(bs, pages as usize).expect("loader: cannot allocate kernel segment");
 		unsafe {
 			core::ptr::write_bytes(phys as *mut u8, 0, (pages * PAGE_SIZE) as usize);
@@ -278,7 +297,7 @@ fn locate_framebuffer(bs: *mut BootServices) -> FbResult {
 	if !g.present {
 		return FbResult { info: unsafe { core::mem::zeroed() }, phys: 0, size: 0, present: false };
 	}
-	let info = Framebuffer { addr: HHDM_OFFSET + g.phys, width: g.width, height: g.height, pitch: g.pitch, bpp: 32, red_shift: g.red_shift, red_size: g.red_size, green_shift: g.green_shift, green_size: g.green_size, blue_shift: g.blue_shift, blue_size: g.blue_size, _pad: [0; 2] };
+	let info = Framebuffer { addr: HHDM_OFFSET + g.phys, width: g.width, height: g.height, pitch: g.pitch, bpp: g.bpp, red_shift: g.red_shift, red_size: g.red_size, green_shift: g.green_shift, green_size: g.green_size, blue_shift: g.blue_shift, blue_size: g.blue_size, _pad: [0; 2] };
 	FbResult { info, phys: g.phys, size: g.size, present: true }
 }
 
@@ -307,32 +326,68 @@ fn alloc_low_page(bs: *mut BootServices) -> u64 {
 	if uefi::is_error(status) { 0 } else { addr }
 }
 
-// The highest physical address any memory-map descriptor reaches.
-fn memory_top(bs: *mut BootServices) -> u64 {
+// Re-map every MMIO descriptor below `ram_top` as uncacheable, over the contiguous HHDM.
+//
+// Best effort by design: a failure here leaves the write-back mapping the HHDM already made, which
+// is what this boot had before, so it says so and carries on rather than refusing to boot over an
+// attribute.
+fn map_mmio_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top: u64) {
+	let Some((buf, pages, map_size, desc_size)) = memory_map_snapshot(bs) else {
+		serial::write_str("loader: WARNING - no memory map for the MMIO attributes; device ranges inside the direct map stay write-back\n");
+		return;
+	};
+	let entries = map_size / desc_size;
+	for i in 0..entries {
+		let d = unsafe { &*((buf as *const u8).add(i * desc_size) as *const uefi::MemoryDescriptor) };
+		if d.ty != uefi::MEMORY_MAPPED_IO && d.ty != uefi::MEMORY_MAPPED_IO_PORT_SPACE {
+			continue;
+		}
+		let Some(bytes) = d.page_count.checked_mul(PAGE_SIZE) else { continue };
+		let base = align_down(d.phys_start, PAGE_2MB);
+		let end = align_up(d.phys_start.saturating_add(bytes), PAGE_2MB);
+		// Only what the direct map actually covers. Anything above `ram_top` was never mapped.
+		if base >= ram_top || end <= base {
+			continue;
+		}
+		let end = end.min(ram_top);
+		if tables.map_hhdm(base, end - base, true).is_none() {
+			serial::write_str("loader: WARNING - could not mark an MMIO range uncacheable in the direct map\n");
+		}
+	}
+	unsafe { ((*bs).free_pages)(buf as u64, pages) };
+}
+
+// Take the firmware's memory map into fresh pages. Returns the buffer, its page count (for the
+// caller's `free_pages`), the map's byte size and the descriptor stride.
+//
+// Factored out because two callers need the same six-step dance - size, pad, allocate, fetch,
+// check, stride - and the first of them had a divide-by-zero in it until the sizing call's status
+// was checked. One copy, one set of checks.
+fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDescriptor, usize, usize, usize)> {
 	let mut map_size = 0usize;
 	let mut key = 0usize;
 	let mut desc_size = 0usize;
 	let mut desc_ver = 0u32;
-	// First call sizes the buffer - and its ANSWER MATTERS. It was ignored, so `desc_size` was
-	// whatever the firmware left there and `map_size / desc_size` below could divide by zero.
 	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, core::ptr::null_mut(), &mut key, &mut desc_size, &mut desc_ver) };
 	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
-		return 0;
+		return None;
 	}
 	map_size += desc_size * 8;
-	// The page count is kept, because the second `GetMemoryMap` OVERWRITES `map_size` with the
-	// real size - and the free below used the new value, leaking the difference whenever the real
-	// map was smaller than the padded estimate.
 	let pages = map_size.div_ceil(PAGE_SIZE as usize);
-	let buf = match alloc_pages(bs, pages) {
-		Some(p) => p as *mut uefi::MemoryDescriptor,
-		None => return 0,
-	};
+	let buf = alloc_pages(bs, pages)? as *mut uefi::MemoryDescriptor;
 	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, buf, &mut key, &mut desc_size, &mut desc_ver) };
 	if uefi::is_error(status) {
 		unsafe { ((*bs).free_pages)(buf as u64, pages) };
-		return 0;
+		return None;
 	}
+	Some((buf, pages, map_size, desc_size))
+}
+
+// The highest physical address any memory-map descriptor reaches.
+fn memory_top(bs: *mut BootServices) -> u64 {
+	let Some((buf, pages, map_size, desc_size)) = memory_map_snapshot(bs) else {
+		return 0;
+	};
 	// RAM ONLY. This took the maximum over EVERY descriptor, so a firmware that describes a PCI
 	// window or an MMIO aperture high in the address space made the HHDM and the identity map span
 	// the whole interval in 2 MiB pages - megabytes of page tables, seconds of boot time, a direct

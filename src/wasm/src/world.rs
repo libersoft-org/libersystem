@@ -85,13 +85,140 @@ pub fn resolve(module: &str, field: &str, signature: Option<&FuncType>) -> Optio
 // was told a count it could not distinguish from a short file. A window that does not fit is
 // `Fault`, and the guest can say so.
 pub fn window(args: &[Value], mem_len: usize) -> Option<(usize, usize)> {
-	let ptr: usize = args.first().map(|v: &Value| v.as_i32() as u32 as usize).unwrap_or(0);
-	let len: usize = args.get(1).map(|v: &Value| v.as_i32() as u32 as usize).unwrap_or(0);
+	// BOTH ARGUMENTS, and typed. Missing ones defaulted to zero, which is a guess about a call that
+	// should not have happened: the world's signature is `(i32, i32)` and `resolve` refuses an
+	// import that declares anything else, so an import reaching here with the wrong arity is a
+	// broken interpreter and `None` says so.
+	//
+	// And matched rather than converted. `Value::as_i32` turns `I64`, `F32` and `F64` into an `i32`
+	// too, and there is no type validator below this - so a module may declare `(param i32 i32)`
+	// correctly and push two `F64`s in a body nothing type-checked. Defence in depth, and it stays
+	// correct after the validator lands.
+	let [Value::I32(ptr), Value::I32(len)] = args[..] else { return None };
+	let ptr: usize = ptr as u32 as usize;
+	let len: usize = len as u32 as usize;
 	let end: usize = ptr.checked_add(len)?;
 	if end > mem_len {
 		return None;
 	}
 	Some((ptr, end))
+}
+
+// Why a write did not happen, rather than whether it did.
+//
+// An `Option<usize>` collapsed three different things into `None` and the world turned all of them
+// into `STATUS_DENIED`: a buffer the HOST could not create, a service that never answered, and a
+// service that answered and refused. So a guest was told to stop asking when the truth might be
+// that the host ran out of memory or that StorageService is gone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WriteOutcome {
+	Wrote(usize),
+	// The volume said no, and the component can act on that.
+	Refused,
+	// The host could not make the request, or the service did not answer it. Not the volume's
+	// doing, and not something the guest can fix by asking differently.
+	Failed,
+}
+
+// The two capabilities the world is wired to, as three operations over bytes.
+//
+// THE SEAM THIS EXISTS FOR: everything above it is a decision about a guest's bytes and can be
+// tested on a development machine; everything below it is IPC to a running service and cannot.
+// Before it existed the whole dispatch lived in `component_host`, a `*-unknown-none` binary, and
+// the only way to reach any of it was a kernel boot running the one real component - which by
+// construction takes the happy path. A write that is refused, a write that fails, a service that
+// never answers and a log grant that does not respond were four paths with no test between them.
+pub trait WorldServices {
+	// Read the one granted input file into `dst`, answering how many bytes were copied. `None` is
+	// any failure on the way: the guest gets `STATUS_IO` and may say so to its own caller.
+	fn read(&mut self, dst: &mut [u8]) -> Option<usize>;
+	// Write `bytes` to the one granted output file.
+	fn write(&mut self, bytes: &[u8]) -> WriteOutcome;
+	// Emit `text` as one entry through the granted log. `false` is the grant not answering.
+	fn log(&mut self, text: &str) -> bool;
+}
+
+// The host side of the world: the resolved import table, the services it dispatches to, and the two
+// facts the caller reports afterwards.
+//
+// A FAILED CALL IS A STATUS, NOT A TRAP, throughout. The component asked a legitimate question and
+// the answer is that it could not be served; killing the instance tells it nothing and gives it no
+// chance to say so to its caller. The one exception is an import index outside the resolved table,
+// which is the interpreter contradicting itself rather than anything the guest did.
+pub struct WorldHost<S: WorldServices> {
+	services: S,
+	imports: alloc::vec::Vec<WorldFn>,
+	// whether the log grant was reached and an entry accepted.
+	logged: bool,
+	// the bytes the component handed to its `write` import - its output, seen through the granted
+	// write path, rather than a guess at where they sit in linear memory.
+	output: alloc::vec::Vec<u8>,
+}
+
+impl<S: WorldServices> WorldHost<S> {
+	pub fn new(services: S, imports: alloc::vec::Vec<WorldFn>) -> Self {
+		WorldHost { services, imports, logged: false, output: alloc::vec::Vec::new() }
+	}
+
+	pub fn logged(&self) -> bool {
+		self.logged
+	}
+
+	pub fn output(&self) -> &[u8] {
+		&self.output
+	}
+
+	pub fn services_mut(&mut self) -> &mut S {
+		&mut self.services
+	}
+}
+
+impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
+	fn call_import(&mut self, import: u32, args: &[Value], memory: &mut [u8]) -> Result<alloc::vec::Vec<Value>, crate::interp::Trap> {
+		// The dispatch table was built at instantiation from imports this world offers, so an index
+		// outside it is the interpreter contradicting itself rather than a component asking for
+		// something it was not granted.
+		let Some(op) = self.imports.get(import as usize).copied() else {
+			return Err(crate::interp::Trap("import index outside the resolved world"));
+		};
+		let Some((ptr, end)) = window(args, memory.len()) else {
+			return Ok(alloc::vec![Value::I32(STATUS_FAULT)]);
+		};
+		let status: i32 = match op {
+			// read(ptr, max) -> n: the one granted input file into the component's memory.
+			WorldFn::Read => match self.services.read(&mut memory[ptr..end]) {
+				Some(n) => n as i32,
+				None => STATUS_IO,
+			},
+			// write(ptr, len) -> n: the component's bytes to the one granted output file.
+			WorldFn::Write => {
+				self.output = memory[ptr..end].to_vec();
+				match self.services.write(&memory[ptr..end]) {
+					WriteOutcome::Wrote(n) => n as i32,
+					WriteOutcome::Refused => STATUS_DENIED,
+					WriteOutcome::Failed => STATUS_IO,
+				}
+			}
+			// log(ptr, len) -> 0: the component's bytes as one structured entry.
+			WorldFn::Log => {
+				// UTF-8 is checked HERE rather than in the service, because the two failures are
+				// not the same failure. The world's `log` takes TEXT; bytes that are not text are a
+				// guest that broke its side of the contract, and reporting that as `STATUS_IO`
+				// blames the service for the component's mistake.
+				match core::str::from_utf8(&memory[ptr..end]) {
+					Err(_) => STATUS_UNSUPPORTED,
+					Ok(text) if self.services.log(text) => {
+						self.logged = true;
+						0
+					}
+					// The log used to return NOTHING, so a component could not tell whether its one
+					// diagnostic channel had worked.
+					Ok(_) => STATUS_IO,
+				}
+			}
+		};
+		Ok(alloc::vec![Value::I32(status)])
+	}
 }
 
 #[cfg(test)]

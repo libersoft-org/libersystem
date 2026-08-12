@@ -71,6 +71,19 @@ record fsck-report {
 	damaged:           list<string>,
 }
 
+/// PATHS. A `vol://` path is `/`-separated, and this contract states the rule its backends must
+/// agree on rather than leaving each filesystem to answer it: a MIDDLE segment may not be empty, so
+/// `a//b` is `bad-name` on every volume. A leading or trailing separator is TOLERATED and means the
+/// same path without it, because the two backends behind this API disagreed and tolerating is the
+/// answer that does not change what an existing `vol://` path means.
+///
+/// The distinction is deliberate. `a//b` had two spellings on a volume whose sibling backend
+/// refused one of them, which is a path that resolves or does not depending on which filesystem is
+/// mounted - the thing a shared ABI exists to prevent. `/a/b` versus `a/b` is one spelling of one
+/// path either way, so making the stricter of the two backends the rule would have changed every
+/// caller in the tree for no gain in agreement. LiberFS is stricter internally and normalises at
+/// this boundary.
+///
 /// The Storage volume contract: resolve a path on a volume and hand back the file's
 /// bytes as a shared-buffer capability. `open` returns the capability out-of-band
 /// (handle<file>) alongside its length - the capability-return case that
@@ -104,13 +117,18 @@ interface volume {
 	/// It is specific to this stream: the other `stream<...>` returns in this tree do not send a
 	/// terminal frame, and their consumers do not look for one.
 	///
-	/// What it does NOT have is an error arm, and it cannot have one yet. `result<stream<T>, error>`
-	/// parses, but the generator defers bindings for it - the method then vanishes from the trait
-	/// entirely, replaced by a "bindings deferred" comment - so wrapping this return removes the
-	/// binding rather than improving it. Until the generator emits result-wrapped streams, the
-	/// service answers a listing it could not read with an empty one, which is the semantics this
-	/// contract otherwise spent a round removing. Recorded in P02M0109 and belonging to P02M0090.
-	@op(2)  list:        func(path: string) -> stream<file-info>;
+	/// AND IT HAS AN ERROR ARM, which is what distinguishes a directory that is empty from one that
+	/// could not be read. Until 2026-08-12 it could not: `result<stream<T>, error>` parsed and the
+	/// generator emitted nothing for it, so wrapping this return removed the binding rather than
+	/// improving it, and the service answered a listing it could not read with an empty one - the
+	/// exact "a failure looks like an empty answer" semantics this contract spent a round removing
+	/// everywhere else. The generator emits the shape now (P02M0090), so the contract states it.
+	///
+	/// The two failures are DIFFERENT failures and a caller can tell them apart: `err` means the
+	/// stream never started - the path was refused, the directory is not there, the volume could
+	/// not be read - and no sub-channel was created. `ok` means the stream started, and the
+	/// terminal frame above is what says it finished.
+	@op(2)  list:        func(path: string) -> result<stream<file-info>, error>;
 	@op(3)  write:       func(path: string, data: buffer) -> result<unit, error>;
 	@op(4)  remove:      func(path: string) -> result<unit, error>;
 	@op(5)  snap-create: func(name: string) -> result<unit, error>;

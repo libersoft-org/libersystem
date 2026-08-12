@@ -34,6 +34,15 @@ version = "0.0.0"
 dependencies = [
  "base-proto",
  "ipc-client",
+ "resources-proto",
+ "wire",
+]
+
+[[package]]
+name = "resources-proto"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
  "wire",
 ]
 
@@ -42,8 +51,12 @@ name = "rt"
 version = "0.0.0"
 dependencies = [
  "abi",
+ "wire",
 ]
 
 [[package]]
 name = "wire"
 version = "0.0.0"
+dependencies = [
+ "abi",
+]

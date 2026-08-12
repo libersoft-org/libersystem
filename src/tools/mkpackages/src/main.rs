@@ -210,7 +210,10 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// metadata beyond the file bytes, so the slack is not decoration.
 	let payload: usize = staged.iter().map(|(name, bytes)| name.len() + bytes.len()).sum();
 	let size = ((payload * 2).max(16 * 1024 * 1024) + BLOCK - 1) / BLOCK * BLOCK;
-	let opts = liberfs::FormatOpts { uuid: *b"libersystem-vol\0", label: b"system".to_vec(), compress: false };
+	// THE ONE PLACE THE VOLUME'S IDENTITY IS DECIDED. The pairing file the loader reads is written
+	// from this same value below, so the two cannot be written to disagree.
+	let uuid: [u8; 16] = *b"libersystem-vol\0";
+	let opts = liberfs::FormatOpts { uuid, label: b"system".to_vec(), compress: false };
 	let mut fs_image = liberfs::LiberFs::format_opts(Image { bytes: vec![0u8; size], block: BLOCK }, (size / BLOCK) as u64, opts).unwrap_or_else(|error| panic!("mkpackages: cannot format a {size}-byte system volume: {error:?}"));
 
 	let mut made: BTreeSet<String> = BTreeSet::new();
@@ -243,6 +246,25 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	}
 
 	write_if_changed(&out_img, &image.bytes);
+
+	// AND THE PAIRING THE LOADER READS.
+	//
+	// The loader half of this shipped alone: a boot medium may name its volume in
+	// `etc/system-volume.uuid`, a volume with a different uuid is passed over, and the fallback
+	// drops what the volume contributed so no kernel is assembled from two sources. Nothing wrote
+	// the file, so every image this tree built took that fallback and said so in its boot log -
+	// which made the whole mechanism dead code that looked implemented.
+	//
+	// Written beside the image rather than into the ESP directly, because this tool builds the
+	// volume and `mkimage.sh` lays the ESP down; the sidecar is how the value crosses between them,
+	// and the image gate then asserts it against the superblock actually on the volume.
+	let mut hex = String::with_capacity(33);
+	for byte in uuid {
+		hex.push_str(&format!("{byte:02x}"));
+	}
+	hex.push('\n');
+	let out_uuid: PathBuf = out_dir.join(format!("{name}-{arch}.uuid"));
+	write_if_changed(&out_uuid, hex.as_bytes());
 }
 
 // `init.pkg` -> `init-riscv64.pkg`. Every architecture's build writes these, so an unqualified name

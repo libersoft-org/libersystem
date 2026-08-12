@@ -45,9 +45,19 @@ impl BlockDevice for FirmwareDisk {
 		if device_block == 0 || buf.len() as u64 % device_block != 0 {
 			return false;
 		}
+		// CHECKED, like `ImageDisk` beside it. `index` comes from a filesystem parser reading an
+		// image this loader is explicitly not trusting, and `index * span` then `first + span` are
+		// two multiplications and an addition that can wrap. This path only reads, so a wrap cannot
+		// corrupt memory - it hands the parser a block from the START of the device while reporting
+		// success, which is worse for a parser than an error is.
 		let span = buf.len() as u64 / device_block;
-		let first = index * span;
-		if first + span > self.last_block + 1 {
+		let Some(first) = index.checked_mul(span) else {
+			return false;
+		};
+		let Some(last) = first.checked_add(span) else {
+			return false;
+		};
+		if last > self.last_block.saturating_add(1) {
 			return false;
 		}
 		// BOUNCE THROUGH AN ALIGNED BUFFER when the driver demands one and the caller's is not.

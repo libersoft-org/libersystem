@@ -6,6 +6,11 @@ name = "services"
 # from the init package.
 edition = "2024"
 build = "build.rs"
+# EVERY BINARY IN THIS PACKAGE IS DECLARED BELOW, and cargo's auto-discovery is off so that stays
+# true. A stray empty `src/main.rs` turned into an undeclared `services` binary with no `main` and
+# no panic handler, and broke every `./build.sh` until it was found - a file nobody wrote being
+# compiled because of where it sat.
+autobins = false
 description = "Core userspace system services (ServiceManager, ...)"
 
 [features]

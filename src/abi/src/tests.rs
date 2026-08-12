@@ -127,7 +127,34 @@ const SYSCALLS: &[(u64, u64)] = &[
 	(SYS_WAITSET_REMOVE, 71),
 	(SYS_WAITSET_WAIT, 72),
 	(SYS_RANDOM_INSECURE, 73),
+	(SYS_DEVICE_QUIESCED, 74),
 ];
+
+// Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
+//
+// THE SNAPSHOT ABOVE CANNOT NOTICE WHAT IT WAS NEVER TOLD ABOUT, and that is not a hypothetical:
+// `SYS_DEVICE_QUIESCED = 74` was added by P02M0133, the table still ended at 73, and the guard meant
+// to catch exactly this - `assert_eq!(SYSCALLS.len(), 73)` - was comparing the list against its own
+// length. The suite stayed green over a syscall the kernel dispatches and the runtime wraps.
+//
+// So the two halves are now derived from different things on purpose. Correctness stays with the
+// hand-written snapshot, because a frozen copy is the only thing that can catch a number MOVING - a
+// list generated from the constants would move with them and prove nothing. COMPLETENESS comes from
+// the source text, which nobody has to remember to update because there is nothing to update.
+//
+// `include_str!` is compile-time and dependency-free, which is what makes this affordable in a crate
+// whose whole point is being small.
+fn declared_syscalls() -> alloc::vec::Vec<(alloc::string::String, u64)> {
+	const SOURCE: &str = include_str!("lib.rs");
+	let mut out: alloc::vec::Vec<(alloc::string::String, u64)> = alloc::vec::Vec::new();
+	for line in SOURCE.lines() {
+		let Some(rest) = line.strip_prefix("pub const SYS_") else { continue };
+		let Some((name, value)) = rest.split_once(": u64 = ") else { continue };
+		let Some(number) = value.trim().strip_suffix(';').and_then(|n| n.trim().parse::<u64>().ok()) else { continue };
+		out.push((alloc::format!("SYS_{name}"), number));
+	}
+	out
+}
 
 #[test]
 fn the_syscall_numbers_are_what_they_were() {
@@ -141,8 +168,18 @@ fn the_syscall_numbers_are_what_they_were() {
 		assert!(!seen[slot], "two syscalls share number {number}");
 		seen[slot] = true;
 	}
-	assert_eq!(SYSCALLS.len(), 73, "a syscall was added or removed without updating the snapshot");
 	assert!(!seen[39], "39 is a retired number and must stay retired");
+}
+
+#[test]
+fn the_snapshot_names_every_syscall_the_crate_declares() {
+	let mut declared: alloc::vec::Vec<u64> = declared_syscalls().into_iter().map(|(_, number)| number).collect();
+	declared.sort_unstable();
+	let mut snapshot: alloc::vec::Vec<u64> = SYSCALLS.iter().map(|&(number, _)| number).collect();
+	snapshot.sort_unstable();
+	// Declaration order is not numeric order - `SYS_DEVICE_QUIESCED` is declared two hundred lines
+	// above a syscall with a lower number - so both sides are sorted before they are compared.
+	assert_eq!(declared, snapshot, "the crate declares {} `pub const SYS_*` and the snapshot names {}; a syscall was added or removed without updating `SYSCALLS`", declared.len(), snapshot.len());
 }
 
 #[test]
@@ -197,65 +234,127 @@ fn the_error_codes_are_what_they_were() {
 	}
 }
 
+// The fields a `repr(C)` struct declares, in order, read out of the crate's own source.
+//
+// The layout test's comment promised "the offset of every field" and asserted seven of DeviceInfo's
+// twelve. `notify_offset`, `notify_multiplier` and `isr_offset` are three adjacent `u32`s and none
+// of them was named, so swapping any two passed the size check, the alignment check and every
+// offset the test made - and a driver would program the wrong virtio structure.
+//
+// Listing the missing ones would leave the same hole open for the next field somebody adds. The
+// list has to be checked against the struct instead, and the struct's own source is the only thing
+// that knows.
+fn declared_fields(name: &str) -> alloc::vec::Vec<alloc::string::String> {
+	const SOURCE: &str = include_str!("lib.rs");
+	let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+	let header = alloc::format!("pub struct {name} {{");
+	let Some((_, body)) = SOURCE.split_once(header.as_str()) else { return out };
+	for line in body.lines() {
+		let line = line.trim();
+		if line == "}" {
+			break;
+		}
+		let Some(rest) = line.strip_prefix("pub ") else { continue };
+		let Some((field, _)) = rest.split_once(':') else { continue };
+		out.push(alloc::string::String::from(field.trim()));
+	}
+	out
+}
+
+// Size, alignment, and the offset of every field IN DECLARATION ORDER - checked against the source,
+// so the list cannot quietly stop being every field.
+macro_rules! assert_layout {
+	($ty:ident, $size:expr, $align:expr, $($field:ident => $offset:expr),+ $(,)?) => {{
+		use core::mem::{align_of, offset_of, size_of};
+		assert_eq!((size_of::<$ty>(), align_of::<$ty>()), ($size, $align), concat!(stringify!($ty), " changed size or alignment"));
+		$(assert_eq!(offset_of!($ty, $field), $offset, concat!(stringify!($ty), ".", stringify!($field), " moved"));)+
+		let named: alloc::vec::Vec<alloc::string::String> = alloc::vec![$(alloc::string::String::from(stringify!($field))),+];
+		assert_eq!(declared_fields(stringify!($ty)), named, concat!(stringify!($ty), ": the assertions above are not every field in declaration order"));
+	}};
+}
+
 #[test]
 fn every_marshalled_struct_has_the_layout_it_had() {
-	// Size, alignment and the offset of every field. The offsets are the point: a size that happens
-	// to stay the same while two fields swap places is the change this catches and a size check
-	// does not.
-	use core::mem::{align_of, offset_of, size_of};
+	// The offsets are the point: a size that happens to stay the same while two fields swap places
+	// is the change this catches and a size check does not.
+	assert_layout!(
+		DeviceInfo, 40, 8,
+		device_type => 0,
+		// The explicit padding must stay where the implicit padding was.
+		_pad0 => 4,
+		bar_len => 8,
+		common_offset => 16,
+		notify_offset => 20,
+		notify_multiplier => 24,
+		isr_offset => 28,
 
-	assert_eq!((size_of::<DeviceInfo>(), align_of::<DeviceInfo>()), (40, 8));
-	assert_eq!(offset_of!(DeviceInfo, device_type), 0);
-	assert_eq!(offset_of!(DeviceInfo, _pad0), 4, "the explicit padding must stay where the implicit padding was");
-	assert_eq!(offset_of!(DeviceInfo, bar_len), 8);
-	assert_eq!(offset_of!(DeviceInfo, common_offset), 16);
-	assert_eq!(offset_of!(DeviceInfo, device_offset), 32);
-	assert_eq!(offset_of!(DeviceInfo, bus), 36);
-	assert_eq!(offset_of!(DeviceInfo, _pad), 39);
+		device_offset => 32,
+		bus => 36,
+		dev => 37,
+		func => 38,
+		_pad => 39,
+	);
 
-	assert_eq!((size_of::<Framebuffer>(), align_of::<Framebuffer>()), (24, 4));
-	assert_eq!(offset_of!(Framebuffer, width), 0);
-	assert_eq!(offset_of!(Framebuffer, bytes_per_pixel), 12);
-	assert_eq!(offset_of!(Framebuffer, red_shift), 16);
-	assert_eq!(offset_of!(Framebuffer, _pad), 22);
+	assert_layout!(
+		Framebuffer, 24, 4,
+		width => 0,
+		height => 4,
+		pitch => 8,
+		bytes_per_pixel => 12,
+		red_shift => 16,
+		red_size => 17,
+		green_shift => 18,
+		green_size => 19,
+		blue_shift => 20,
+		blue_size => 21,
+		_pad => 22,
+	);
 
-	assert_eq!((size_of::<ObjectInfo>(), align_of::<ObjectInfo>()), (32, 8));
-	assert_eq!(offset_of!(ObjectInfo, koid), 0);
-	assert_eq!(offset_of!(ObjectInfo, object_type), 8);
-	assert_eq!(offset_of!(ObjectInfo, rights), 16);
-	assert_eq!(offset_of!(ObjectInfo, generation), 20);
-	assert_eq!(offset_of!(ObjectInfo, size), 24);
+	assert_layout!(ObjectInfo, 32, 8, koid => 0, object_type => 8, rights => 16, generation => 20, size => 24);
 
-	assert_eq!((size_of::<ProcessStats>(), align_of::<ProcessStats>()), (56, 8));
-	assert_eq!(offset_of!(ProcessStats, messages_sent), 0);
-	assert_eq!(offset_of!(ProcessStats, state), 32);
-	assert_eq!(offset_of!(ProcessStats, completion), 40);
-	assert_eq!(offset_of!(ProcessStats, completion_valid), 48);
+	assert_layout!(
+		ProcessStats, 56, 8,
+		messages_sent => 0,
+		messages_received => 8,
+		handle_count => 16,
+		memory_bytes => 24,
+		state => 32,
+		completion => 40,
+		completion_valid => 48,
+	);
 
-	assert_eq!((size_of::<DomainStats>(), align_of::<DomainStats>()), (104, 8));
-	assert_eq!(offset_of!(DomainStats, memory_used), 0);
-	assert_eq!(offset_of!(DomainStats, stack_limit), 96);
+	assert_layout!(
+		DomainStats, 104, 8,
+		memory_used => 0,
+		memory_peak => 8,
+		memory_limit => 16,
+		handles_used => 24,
+		handles_limit => 32,
+		threads_used => 40,
+		threads_limit => 48,
+		ipc_used => 56,
+		ipc_limit => 64,
+		dma_used => 72,
+		dma_limit => 80,
+		stack_used => 88,
+		stack_limit => 96,
+	);
 
-	assert_eq!((size_of::<MemoryStats>(), align_of::<MemoryStats>()), (32, 8));
-	assert_eq!(offset_of!(MemoryStats, total_frames), 0);
-	assert_eq!(offset_of!(MemoryStats, heap_free), 24);
-
-	assert_eq!((size_of::<MemmapRegion>(), align_of::<MemmapRegion>()), (24, 8));
-	assert_eq!(offset_of!(MemmapRegion, base), 0);
-	assert_eq!(offset_of!(MemmapRegion, length), 8);
-	assert_eq!(offset_of!(MemmapRegion, kind), 16);
-	assert_eq!(offset_of!(MemmapRegion, _pad), 20);
-
-	assert_eq!((size_of::<IrqInfo>(), align_of::<IrqInfo>()), (16, 4));
-	assert_eq!(offset_of!(IrqInfo, vector), 0);
-	assert_eq!(offset_of!(IrqInfo, device), 12);
-
-	assert_eq!((size_of::<PciInfo>(), align_of::<PciInfo>()), (12, 2));
-	assert_eq!(offset_of!(PciInfo, vendor), 0);
-	assert_eq!(offset_of!(PciInfo, device), 2);
-	assert_eq!(offset_of!(PciInfo, class), 4);
-	assert_eq!(offset_of!(PciInfo, func), 9);
-	assert_eq!(offset_of!(PciInfo, _pad), 10);
+	assert_layout!(MemoryStats, 32, 8, total_frames => 0, free_frames => 8, heap_total => 16, heap_free => 24);
+	assert_layout!(MemmapRegion, 24, 8, base => 0, length => 8, kind => 16, _pad => 20);
+	assert_layout!(IrqInfo, 16, 4, vector => 0, kind => 4, bound => 8, device => 12);
+	assert_layout!(
+		PciInfo, 12, 2,
+		vendor => 0,
+		device => 2,
+		class => 4,
+		subclass => 5,
+		prog_if => 6,
+		bus => 7,
+		dev => 8,
+		func => 9,
+		_pad => 10,
+	);
 }
 
 #[test]
@@ -398,6 +497,37 @@ fn a_bootstrap_list_is_read_the_same_way_however_it_was_written() {
 	assert!(parse_list(b"init bin/init\ninit bin/other\n").is_none(), "a duplicate name");
 	assert!(parse_list(&[&[b'n'; crate::PKG_NAME_LEN + 1][..], b" bin/init\n"].concat()).is_none(), "a name that does not fit the entry");
 	assert!(parse_list(b"\n# nothing but a comment\n").is_none(), "a list with no rows");
+}
+
+#[test]
+fn the_writer_cannot_build_what_the_reader_calls_invalid() {
+	// The SSOT crate produced archives its own reader refused. `Package::parse` required a canonical
+	// name and `build_package` checked only `is_empty()` and a length, so two shapes got through:
+	// duplicate names, and a NUL inside one - where `b"foo\0bar"` was written as one thing and read
+	// back as `foo` with non-zero padding after it, and `b"foo\0"` was written as distinct from
+	// `b"foo"` and read as exactly that.
+	assert!(bootstrap::build_package(&[(b"foo", b"A"), (b"foo", b"B")]).is_none(), "two entries of one name");
+	assert!(bootstrap::build_package(&[(b"foo\0bar", b"A")]).is_none(), "a NUL inside a name");
+	assert!(bootstrap::build_package(&[(b"foo\0", b"A")]).is_none(), "a name the reader would parse as a different one");
+	assert!(bootstrap::build_package(&[(b"", b"A")]).is_none(), "no name at all");
+
+	// And whatever it DOES build, the reader accepts - which is the property the two halves owe
+	// each other.
+	let built = bootstrap::build_package(&[(b"a", b"one"), (b"b", b"two")]).expect("an ordinary archive");
+	assert!(Package::parse(&built).is_some(), "the writer's output is the reader's input");
+
+	// The reserved header word is reserved, which nothing checked - so a writer could fill it with
+	// anything and it would not be reserved at all.
+	let mut forged = built.clone();
+	forged[12] = 1;
+	assert!(Package::parse(&forged).is_none(), "a reserved field with something in it");
+
+	// And the reader has a ceiling of its OWN - not the bootstrap writer's, which is a different
+	// bound for a different archive. Conflating them refused the system volume package, which has
+	// 146 entries against the bootstrap set's handful, and the guest reported it as a missing file.
+	let mut oversized = built.clone();
+	oversized[8..12].copy_from_slice(&((MAX_PACKAGE_ENTRIES + 1) as u32).to_le_bytes());
+	assert!(Package::parse(&oversized).is_none(), "more entries than either half accepts");
 }
 
 #[test]

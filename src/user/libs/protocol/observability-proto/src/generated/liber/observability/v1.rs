@@ -30,10 +30,29 @@ impl ComponentType {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<ComponentType> {
-		ComponentType::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = ComponentType::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<ComponentType> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ComponentType::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
@@ -71,10 +90,29 @@ impl ComponentState {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<ComponentState> {
-		ComponentState::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = ComponentState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<ComponentState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ComponentState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u8(*self as u8)
@@ -118,10 +156,29 @@ impl Counters {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<Counters> {
-		Counters::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = Counters::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Counters> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = Counters::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u64(self.messages_sent)?;
@@ -167,10 +224,29 @@ impl Component {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<Component> {
-		Component::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = Component::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Component> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = Component::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
@@ -222,10 +298,29 @@ impl TraceSpan {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<TraceSpan> {
-		TraceSpan::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = TraceSpan::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<TraceSpan> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = TraceSpan::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
@@ -257,10 +352,29 @@ impl Graph {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<Graph> {
-		Graph::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = Graph::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Graph> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = Graph::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		if self.components.len() > u16::MAX as usize {
@@ -327,7 +441,10 @@ pub mod system_graph {
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:observability")?;
 			w.u32(1)?;
-			*reply_handles = Handles::from_slice(writer.handles());
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
 			return Some(writer.pos());
 		}
 		match op {
@@ -354,7 +471,10 @@ pub mod system_graph {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -368,7 +488,10 @@ pub mod system_graph {
 			}
 			_ => return None,
 		}
-		*reply_handles = Handles::from_slice(writer.handles());
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
 		Some(writer.pos())
 	}
 
@@ -417,7 +540,7 @@ pub mod system_graph {
 			let w = &mut writer;
 			w.u16(OP_SNAPSHOT)?;
 			w.u32(corr)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
@@ -470,10 +593,29 @@ impl SupervisorStat {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<SupervisorStat> {
-		SupervisorStat::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = SupervisorStat::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<SupervisorStat> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SupervisorStat::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
@@ -521,7 +663,10 @@ pub mod supervisor {
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:observability")?;
 			w.u32(1)?;
-			*reply_handles = Handles::from_slice(writer.handles());
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
 			return Some(writer.pos());
 		}
 		match op {
@@ -554,7 +699,10 @@ pub mod supervisor {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -568,7 +716,10 @@ pub mod supervisor {
 			}
 			_ => return None,
 		}
-		*reply_handles = Handles::from_slice(writer.handles());
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
 		Some(writer.pos())
 	}
 
@@ -617,7 +768,7 @@ pub mod supervisor {
 			let w = &mut writer;
 			w.u16(OP_STATUS)?;
 			w.u32(corr)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;

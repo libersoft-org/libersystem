@@ -7,8 +7,9 @@
 // later step. Imported functions are how a WASI-style component reaches native
 // services; the host services only the imports it was wired up to grant.
 
-use crate::decode::{Instr, decode};
+use crate::decode::Instr;
 use crate::module::{Module, ValType};
+use crate::validate::ValidatedModule;
 use alloc::vec::Vec;
 
 // A runtime value. The runtime handles 32/64-bit integers and floats.
@@ -76,7 +77,16 @@ pub trait Host {
 }
 
 // One page of linear memory.
-const PAGE: usize = 65536;
+pub const PAGE: usize = 65536;
+
+// The most linear memory ONE INSTANCE may hold, whatever it declares about itself.
+//
+// A module's own maximum is a statement by the module; this is the host's, and a component host in
+// a capability system needs both. wasm32 can address 65536 pages (4 GB) and nothing here comes near
+// it: the packaging gate refuses a component whose declared minimum is above four pages, and the
+// SDK's own example uses one. 1024 pages is 64 MB - room for a component that genuinely needs to
+// grow, and far below what would trouble the service running it.
+const MAX_MEMORY_PAGES: usize = 1024;
 
 // A runtime control frame: the value-stack base to unwind to on a branch, whether
 // it is a loop (a branch re-enters it), how many values a branch keeps, and the
@@ -92,30 +102,108 @@ struct Frame {
 // An instantiated module: the parsed module, its decoded function bodies, its
 // linear memory, its globals, and its function table (the array call_indirect
 // dispatches through).
+// THE EXECUTION BUDGET, and the call depth.
+//
+// `loop br 0 end` was an unbounded loop inside the interpreter with nothing that ended it, and
+// guest recursion was Rust recursion - so a deeply recursive module overflowed the HOST's stack
+// rather than trapping. A component host in a capability system may not have "the guest can decide
+// never to return" among its outcomes, and it certainly may not have "the guest can decide to
+// overflow the host".
+//
+// One instruction is one unit. The number is a wall rather than a schedule: an ordinary component
+// call is thousands of instructions, and anything reaching ten million is not computing, it is
+// spinning. A caller that wants a different wall calls `invoke_with_fuel`.
+pub const DEFAULT_FUEL: u64 = 10_000_000;
+
+// How deep guest calls may nest. Each level is a Rust frame in `exec`, so this is a statement about
+// the HOST's stack, which is why it is small and fixed rather than derived from the module.
+//
+// MEASURED, NOT CHOSEN. 256 still overflowed a 2 MB host thread - `exec`'s frame is large, because
+// it holds the control stack and the operand stack of one activation - so the depth was reduced
+// until the deliberately-infinite recursion in `unbounded_guest_recursion_traps_rather_than_
+// overflowing_the_host` trapped instead of aborting. Anything that raises `exec`'s frame size has
+// to re-run that test, which is why it exists rather than being replaced by an assertion here.
+pub const MAX_CALL_DEPTH: usize = 32;
+
+pub struct Budget {
+	fuel: u64,
+	depth: usize,
+}
+
+impl Budget {
+	pub fn new() -> Budget {
+		Budget { fuel: DEFAULT_FUEL, depth: 0 }
+	}
+
+	pub fn with_fuel(fuel: u64) -> Budget {
+		Budget { fuel, depth: 0 }
+	}
+
+	// Spend one instruction, or say the guest has run out.
+	fn step(&mut self) -> Result<(), Trap> {
+		match self.fuel.checked_sub(1) {
+			Some(left) => {
+				self.fuel = left;
+				Ok(())
+			}
+			None => Err(Trap("out of fuel: the guest ran for longer than the host allows")),
+		}
+	}
+
+	fn enter(&mut self) -> Result<(), Trap> {
+		if self.depth >= MAX_CALL_DEPTH {
+			return Err(Trap("call depth limit reached"));
+		}
+		self.depth += 1;
+		Ok(())
+	}
+
+	fn leave(&mut self) {
+		self.depth = self.depth.saturating_sub(1);
+	}
+}
+
+impl Default for Budget {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 pub struct Instance<'a> {
 	module: &'a Module,
-	code: Vec<Vec<Instr>>,
+	code: &'a [Vec<Instr>],
 	memory: Vec<u8>,
 	globals: Vec<Value>,
 	table: Vec<Option<u32>>,
-	error: Option<Trap>,
 }
 
 impl<'a> Instance<'a> {
-	// Instantiate `module`: allocate its declared minimum linear memory, copy in its
-	// active data segments, initialize its globals, and decode + validate every
-	// function body. A decode/validation error is held and surfaced on `invoke`.
-	pub fn new(module: &'a Module) -> Instance<'a> {
-		let mut memory: Vec<u8> = alloc::vec![0u8; module.memory_min_pages as usize * PAGE];
-		let mut error: Option<Trap> = None;
+	// Instantiate a VALIDATED module: allocate its declared minimum linear memory, copy in its
+	// active data segments, initialise its globals and build its function table.
+	//
+	// IT TAKES ONLY A `ValidatedModule`, which is the point of the type. This used to take a
+	// `Module`, decode every body itself, hold any decode error in a field and surface it on the
+	// first `invoke` - so a module could be instantiated, and its data segments and globals
+	// installed, before anything had established that its code was well formed.
+	//
+	// AND IT RETURNS `Result`. It could not report a module it was unable to instantiate, which is
+	// the other half of a validator: something has to be able to say no. The remaining failures
+	// after validation are the ones validation cannot see - a host that cannot allocate the
+	// declared memory - and those are now refusals rather than a panic or a deferred trap.
+	pub fn new(validated: &'a ValidatedModule) -> Result<Instance<'a>, Trap> {
+		let module: &Module = validated.module();
+		let mut memory: Vec<u8> = Vec::new();
+		let want: usize = module.memory_min_pages as usize * PAGE;
+		if memory.try_reserve_exact(want).is_err() {
+			return Err(Trap("the host cannot allocate the module's declared memory"));
+		}
+		memory.resize(want, 0);
 
+		// Validation has already established that every data segment is inside the declared
+		// memory, which is why this cannot fail any more.
 		for seg in &module.data {
 			let start: usize = seg.offset as usize;
-			let end: usize = start.saturating_add(seg.bytes.len());
-			if end > memory.len() {
-				error = Some(Trap("data segment out of bounds"));
-				break;
-			}
+			let end: usize = start + seg.bytes.len();
 			memory[start..end].copy_from_slice(&seg.bytes);
 		}
 
@@ -130,32 +218,23 @@ impl<'a> Instance<'a> {
 			})
 			.collect();
 
-		let mut code: Vec<Vec<Instr>> = Vec::with_capacity(module.funcs.len());
-		for i in 0..module.funcs.len() {
-			match decode(module, i) {
-				Ok(body) => code.push(body),
-				Err(reason) => {
-					error = error.or(Some(Trap(reason)));
-					code.push(Vec::new());
-				}
-			}
+		// The function table, at exactly the size the module DECLARED. It used to be sized to "the
+		// larger of the declared minimum and the highest write", so an element segment past the end
+		// silently extended the table beyond the module's own limits; validation now refuses such a
+		// segment, so the declared minimum is the whole answer.
+		let table_len: usize = module.table.as_ref().map(|t| t.min as usize).unwrap_or(0);
+		let mut table: Vec<Option<u32>> = Vec::new();
+		if table.try_reserve_exact(table_len).is_err() {
+			return Err(Trap("the host cannot allocate the module's declared table"));
 		}
-
-		// build the function table from its declared minimum and the active element
-		// segments: a Vec of function indices where None is a null entry (call_indirect
-		// traps on it). Sized to the larger of the declared minimum and the highest write.
-		let mut table_len: usize = module.table.as_ref().map(|t| t.min as usize).unwrap_or(0);
-		for e in &module.elements {
-			table_len = table_len.max(e.offset as usize + e.funcs.len());
-		}
-		let mut table: Vec<Option<u32>> = alloc::vec![None; table_len];
+		table.resize(table_len, None);
 		for e in &module.elements {
 			for (j, &f) in e.funcs.iter().enumerate() {
 				table[e.offset as usize + j] = Some(f);
 			}
 		}
 
-		Instance { module, code, memory, globals, table, error }
+		Ok(Instance { module, code: validated.code(), memory, globals, table })
 	}
 
 	// The instance's linear memory (e.g. to read back what a component wrote).
@@ -166,18 +245,26 @@ impl<'a> Instance<'a> {
 	// Invoke the exported function `name` with `args`, dispatching any imports to
 	// `host`, and return its result value(s).
 	pub fn invoke(&mut self, name: &str, args: &[Value], host: &mut dyn Host) -> Result<Vec<Value>, Trap> {
-		if let Some(t) = self.error {
-			return Err(t);
-		}
 		let index: u32 = self.module.export_func(name).ok_or(Trap("no such exported function"))?;
-		let Instance { module, code, memory, globals, table, .. } = self;
-		call(module, code, memory, globals, table, index, args, host)
+		let Instance { module, code, memory, globals, table } = self;
+		// A fresh budget per call, and a fresh depth. Both are per-INVOCATION rather than
+		// per-instance: a component that is called many times gets its budget each time, and one
+		// that never returns is stopped inside the call it never returned from.
+		let mut budget = Budget::new();
+		call(module, code, memory, globals, table, index, args, host, &mut budget)
 	}
 }
 
 // Call function `index` (in the combined imports-then-defined space). Imports go to
 // the host; defined functions run their decoded body on a fresh frame.
-fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], index: u32, args: &[Value], host: &mut dyn Host) -> Result<Vec<Value>, Trap> {
+fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], index: u32, args: &[Value], host: &mut dyn Host, budget: &mut Budget) -> Result<Vec<Value>, Trap> {
+	budget.enter()?;
+	let result = call_inner(module, code, memory, globals, table, index, args, host, budget);
+	budget.leave();
+	result
+}
+
+fn call_inner(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], index: u32, args: &[Value], host: &mut dyn Host, budget: &mut Budget) -> Result<Vec<Value>, Trap> {
 	if index < module.import_count() {
 		return host.call_import(index, args, memory);
 	}
@@ -200,7 +287,7 @@ fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 		});
 	}
 	let mut stack: Vec<Value> = Vec::new();
-	exec(module, code, memory, globals, table, body, &mut locals, &mut stack, host)?;
+	exec(module, code, memory, globals, table, body, &mut locals, &mut stack, host, budget)?;
 	let n: usize = ftype.results.len();
 	if stack.len() < n {
 		return Err(Trap("missing results at return"));
@@ -211,10 +298,13 @@ fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 // Execute a decoded function body, mutating `locals`, `stack`, `memory`, and
 // `globals`. Returns when the body falls off its end, hits `return`, or branches to
 // the function-level label; the caller takes the result values off the stack.
-fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], body: &[Instr], locals: &mut [Value], stack: &mut Vec<Value>, host: &mut dyn Host) -> Result<(), Trap> {
+fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], body: &[Instr], locals: &mut [Value], stack: &mut Vec<Value>, host: &mut dyn Host, budget: &mut Budget) -> Result<(), Trap> {
 	let mut ctrl: Vec<Frame> = Vec::new();
 	let mut pc: usize = 0;
 	while pc < body.len() {
+		// ONE UNIT PER INSTRUCTION, charged before the instruction runs, so a loop that branches
+		// to itself forever runs out rather than never returning.
+		budget.step()?;
 		let instr: &Instr = &body[pc];
 		pc += 1;
 		match instr {
@@ -271,7 +361,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 					return Err(Trap("stack underflow at call"));
 				}
 				let call_args: Vec<Value> = stack.split_off(stack.len() - nargs);
-				let results: Vec<Value> = call(module, code, memory, globals, table, *f, &call_args, host)?;
+				let results: Vec<Value> = call(module, code, memory, globals, table, *f, &call_args, host, budget)?;
 				stack.extend(results);
 			}
 			Instr::CallIndirect(type_idx) => {
@@ -293,7 +383,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 					return Err(Trap("stack underflow at call_indirect"));
 				}
 				let call_args: Vec<Value> = stack.split_off(stack.len() - nargs);
-				let results: Vec<Value> = call(module, code, memory, globals, table, target, &call_args, host)?;
+				let results: Vec<Value> = call(module, code, memory, globals, table, target, &call_args, host, budget)?;
 				stack.extend(results);
 			}
 			Instr::Drop => {
@@ -392,9 +482,42 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 			}
 			Instr::MemorySize => stack.push(Value::I32((memory.len() / PAGE) as i32)),
 			Instr::MemoryGrow => {
+				// BOUNDED, AND IT ANSWERS -1.
+				//
+				// This was `memory.resize(memory.len() + delta * PAGE, 0)` with `delta` off the
+				// guest's stack: the declared maximum was not consulted, the host imposed none, the
+				// multiplication was unchecked, and `resize` is infallible. So a module asking to
+				// grow by a large number of pages did not get the failure code WebAssembly defines
+				// for exactly this - it took the host process down with it. That is a denial of
+				// service reachable from any component, in a service that runs other people's code.
+				//
+				// The specification's answer to a refused grow is -1 and an unchanged memory, which
+				// is what a guest is written to handle. All four reasons to refuse give it:
+				// arithmetic that would wrap, the module's own maximum, the host's ceiling, and an
+				// allocation the host cannot make.
 				let delta: usize = pop(stack)?.as_i32() as u32 as usize;
 				let old_pages: usize = memory.len() / PAGE;
-				memory.resize(memory.len() + delta * PAGE, 0);
+				let refused = Value::I32(-1);
+				let Some(new_pages) = old_pages.checked_add(delta) else {
+					stack.push(refused);
+					continue;
+				};
+				let declared = module.memory_max_pages.unwrap_or(u32::MAX) as usize;
+				if new_pages > declared.min(MAX_MEMORY_PAGES) {
+					stack.push(refused);
+					continue;
+				}
+				let Some(new_bytes) = new_pages.checked_mul(PAGE) else {
+					stack.push(refused);
+					continue;
+				};
+				// `try_reserve` before `resize`, so a host that cannot find the memory answers the
+				// guest instead of aborting under it.
+				if memory.try_reserve(new_bytes.saturating_sub(memory.len())).is_err() {
+					stack.push(refused);
+					continue;
+				}
+				memory.resize(new_bytes, 0);
 				stack.push(Value::I32(old_pages as i32));
 			}
 			Instr::MemoryCopy => {
@@ -922,11 +1045,19 @@ fn copysign_f64(a: f64, b: f64) -> f64 {
 	f64::from_bits((a.to_bits() & 0x7fff_ffff_ffff_ffff) | (b.to_bits() & 0x8000_0000_0000_0000))
 }
 
-// Round toward zero. Exact: a finite value at or beyond 2^63 is already integral,
-// and below that the cast through i64 truncates toward zero.
+// Round toward zero. Exact: a finite value at or beyond 2^63 is already integral, and below that
+// the cast through i64 truncates toward zero.
+//
+// THE SIGN OF A ZERO RESULT IS THE INPUT'S. `(-0.5) as i64` is 0 and `0 as f64` is +0.0, so this
+// used to answer `trunc(-0.5) = +0.0` where the specification says `-0.0` - and the same for every
+// subnormal, whose truncation is a zero of its own sign. It is a one-bit difference that
+// `copysign`, `1.0/x` and any component comparing bit patterns can see.
 fn trunc_f64(x: f64) -> f64 {
 	let magnitude: f64 = f64::from_bits(x.to_bits() & 0x7fff_ffff_ffff_ffff);
-	if !x.is_finite() || magnitude >= 9_223_372_036_854_775_808.0 { x } else { (x as i64) as f64 }
+	if !x.is_finite() || magnitude >= 9_223_372_036_854_775_808.0 {
+		return x;
+	}
+	copysign_f64((x as i64) as f64, x)
 }
 
 fn floor_f64(x: f64) -> f64 {
@@ -934,6 +1065,9 @@ fn floor_f64(x: f64) -> f64 {
 	if t > x { t - 1.0 } else { t }
 }
 
+// `ceil(-0.5)` is `-0.0`, not `+0.0`: a negative input whose ceiling is zero keeps its sign. The
+// same `copysign` for the same reason as `trunc`, applied where `t - 1.0` / `t + 1.0` cannot
+// produce a zero.
 fn ceil_f64(x: f64) -> f64 {
 	let t: f64 = trunc_f64(x);
 	if t < x { t + 1.0 } else { t }
@@ -946,7 +1080,7 @@ fn nearest_f64(x: f64) -> f64 {
 	}
 	let t: f64 = trunc_f64(x);
 	let diff: f64 = x - t;
-	if diff > 0.5 {
+	let rounded: f64 = if diff > 0.5 {
 		t + 1.0
 	} else if diff < -0.5 {
 		t - 1.0
@@ -956,12 +1090,29 @@ fn nearest_f64(x: f64) -> f64 {
 		if (t as i64) % 2 == 0 { t } else { t - 1.0 }
 	} else {
 		t
-	}
+	};
+	// `nearest(-0.3)` is `-0.0`. The arithmetic above produces `+0.0` for every negative input that
+	// rounds to zero, which is the same signed-zero defect as `trunc`'s.
+	if rounded == 0.0 { copysign_f64(0.0, x) } else { rounded }
 }
 
-// Square root by Newton-Raphson from an exponent-halving seed. This is `no_std`-
-// and stable-friendly (no libm, no intrinsics); it converges to within ~1 ULP,
-// which the runtime accepts in exchange for being self-contained.
+// CORRECTLY ROUNDED square root, with no libm and no intrinsics.
+//
+// This was Newton-Raphson from an exponent-halving seed, six iterations, "within ~1 ULP, which the
+// runtime accepts in exchange for being self-contained". A component that computes a different last
+// bit here than everywhere else is a portability defect in an ABI that is supposed to be a
+// contract - and the accuracy was accepted for a reason that turns out not to hold: being
+// self-contained does not require being approximate.
+//
+// Newton still produces the estimate. What is new is the finish: the exact residual of a candidate
+// is computable in f64 arithmetic alone (Dekker's splitting gives an exact product as a pair of
+// doubles), so the estimate can be corrected to the true floor and the choice between it and its
+// successor decided by comparing the exact midpoint's square against the input. That is the
+// definition of correct rounding, evaluated rather than approached.
+//
+// `sqrt_is_correctly_rounded_against_the_host` checks every answer against the platform's own
+// `f64::sqrt` over a corpus that includes subnormals, powers of two and the values a Newton
+// iteration is worst at.
 fn sqrt_f64(x: f64) -> f64 {
 	if x.is_nan() || x < 0.0 {
 		return f64::NAN;
@@ -969,12 +1120,142 @@ fn sqrt_f64(x: f64) -> f64 {
 	if x == 0.0 || x.is_infinite() {
 		return x; // sqrt(+-0) = +-0, sqrt(+inf) = +inf
 	}
-	// seed: halve the biased exponent in the bit pattern for a ~10%-accurate guess
+	// SCALE A SUBNORMAL UP FIRST. The seed below reads the biased exponent, which a subnormal does
+	// not have, and every product in the correction would underflow. Scaling by 2^106 (an even
+	// power, so the square root scales by exactly 2^53) moves the whole computation into the normal
+	// range and back.
+	let (x, unscale): (f64, f64) = if x < f64::MIN_POSITIVE { (x * 81_129_638_414_606_681_695_789_005_144_064.0, 1.0 / 9_007_199_254_740_992.0) } else { (x, 1.0) };
+
+	// Seed: halve the biased exponent in the bit pattern for a ~10%-accurate guess.
 	let mut y: f64 = f64::from_bits((x.to_bits() + (1023u64 << 52)) >> 1);
 	for _ in 0..6 {
 		y = 0.5 * (y + x / y);
 	}
-	y
+
+	// STEP TO THE FLOOR. After Newton the estimate is within an ulp either way; at most a couple of
+	// steps put it on the largest float whose square does not exceed `x`.
+	while residual_sign(y, x) > 0 {
+		y = next_down(y);
+	}
+	while residual_sign(next_up(y), x) <= 0 {
+		y = next_up(y);
+	}
+	if residual_sign(y, x) == 0 {
+		return y * unscale; // exactly representable
+	}
+
+	// CHOOSE BETWEEN `y` AND ITS SUCCESSOR by the exact midpoint. `m = y + ulp/2` is not a double,
+	// but it is exactly the sum of two doubles - and `two_sum`/`two_prod` square such a pair
+	// exactly, so `m^2` can be compared with `x` with no rounding anywhere in the comparison.
+	let half_ulp: f64 = (next_up(y) - y) * 0.5;
+	match midpoint_square_cmp(y, half_ulp, x) {
+		// The midpoint's square is below `x`, so the true root is above the midpoint.
+		core::cmp::Ordering::Less => next_up(y) * unscale,
+		core::cmp::Ordering::Greater => y * unscale,
+		// A tie: the root is exactly halfway, so round to even.
+		core::cmp::Ordering::Equal => {
+			if y.to_bits() & 1 == 0 {
+				y * unscale
+			} else {
+				next_up(y) * unscale
+			}
+		}
+	}
+}
+
+// The float helpers, for the tests that compare them with the hardware.
+#[cfg(test)]
+pub fn sqrt_f64_for_test(x: f64) -> f64 {
+	sqrt_f64(x)
+}
+
+#[cfg(test)]
+pub fn trunc_f64_for_test(x: f64) -> f64 {
+	trunc_f64(x)
+}
+
+#[cfg(test)]
+pub fn ceil_f64_for_test(x: f64) -> f64 {
+	ceil_f64(x)
+}
+
+#[cfg(test)]
+pub fn nearest_f64_for_test(x: f64) -> f64 {
+	nearest_f64(x)
+}
+
+// Dekker's splitting: `v = hi + lo` exactly, with `hi` holding the top 26 bits.
+fn split(v: f64) -> (f64, f64) {
+	let c: f64 = 134_217_729.0 * v; // 2^27 + 1
+	let hi: f64 = c - (c - v);
+	(hi, v - hi)
+}
+
+// `a * b` as an exact pair: the rounded product and the error it dropped.
+fn two_prod(a: f64, b: f64) -> (f64, f64) {
+	let p: f64 = a * b;
+	let (ah, al) = split(a);
+	let (bh, bl) = split(b);
+	let e: f64 = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+	(p, e)
+}
+
+// `a + b` as an exact pair (Knuth's two-sum), for any two doubles.
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+	let s: f64 = a + b;
+	let bb: f64 = s - a;
+	let e: f64 = (a - (s - bb)) + (b - bb);
+	(s, e)
+}
+
+// The sign of `y*y - x`, computed exactly: negative, zero or positive.
+fn residual_sign(y: f64, x: f64) -> i32 {
+	let (p, e) = two_prod(y, y);
+	let (s, se) = two_sum(p - x, e);
+	if s > 0.0 || (s == 0.0 && se > 0.0) {
+		1
+	} else if s < 0.0 || (s == 0.0 && se < 0.0) {
+		-1
+	} else {
+		0
+	}
+}
+
+// Compare `(y + half_ulp)^2` with `x`, exactly.
+//
+// `m = y + half_ulp` is exact as a pair, so `m^2 = y^2 + 2*y*half_ulp + half_ulp^2` and each of the
+// three terms is an exact pair. Summing the six pieces against `-x` with `two_sum` keeps the whole
+// comparison free of rounding.
+fn midpoint_square_cmp(y: f64, half_ulp: f64, x: f64) -> core::cmp::Ordering {
+	let (p0, e0) = two_prod(y, y);
+	let (p1, e1) = two_prod(2.0 * y, half_ulp);
+	let (p2, e2) = two_prod(half_ulp, half_ulp);
+	// Accumulate as a running (sum, error) pair, largest term first so the errors stay small.
+	let mut sum: f64 = p0 - x;
+	let mut err: f64 = 0.0;
+	for term in [e0, p1, e1, p2, e2] {
+		let (s, e) = two_sum(sum, term);
+		sum = s;
+		err += e;
+	}
+	let (s, e) = two_sum(sum, err);
+	if s > 0.0 || (s == 0.0 && e > 0.0) {
+		core::cmp::Ordering::Greater
+	} else if s < 0.0 || (s == 0.0 && e < 0.0) {
+		core::cmp::Ordering::Less
+	} else {
+		core::cmp::Ordering::Equal
+	}
+}
+
+// The next representable double above / below a POSITIVE finite value. Only that case is needed:
+// every caller here has already handled zero, negatives, infinities and NaN.
+fn next_up(x: f64) -> f64 {
+	f64::from_bits(x.to_bits() + 1)
+}
+
+fn next_down(x: f64) -> f64 {
+	f64::from_bits(x.to_bits() - 1)
 }
 
 fn trunc_f32(x: f32) -> f32 {

@@ -30,6 +30,7 @@ Works out what a change needs verified and runs exactly that. With no arguments:
   --release        the release gate: build all, check all, boot all three, no optimisation applied
   --sweep          the whole suite on every target at one immutable revision, in a git worktree
   --shadow         run the FULL suite and compare it against what this change would have scoped
+  --shadow-exec    the same, but RUN the selection first and compare the two runs (one target)
   --allow-shadow   accept a scoped run with no shadow evidence (exit 0 instead of 4); --dev is an alias
   --plan           print the plan and run nothing
   --explain        print why every item is in the plan
@@ -95,6 +96,13 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--shadow)
 		action=shadow
+		shift
+		;;
+	# SHADOW-EXEC: run the selection, then the sweep, and compare. See the action below for why a
+	# dry comparison cannot answer the question this one asks.
+	--shadow-exec)
+		action=shadow
+		shadow_exec=1
 		shift
 		;;
 	--plan)
@@ -269,10 +277,32 @@ if [[ "$action" == shadow ]]; then
 	note "shadow: full sweep on ${targets//$'\n'/ }, compared against a selection that is not run"
 	note "        pinned to source $source_before"
 	for target in $targets; do
+		# THE SELECTION FIRST, when a sample was asked for.
+		#
+		# A dry shadow computes the scoped set and never runs it, so it answers "did the selector
+		# choose the right set S" and cannot answer "does running S work". Those are different
+		# questions and this milestone has the proof: a planner emitting Rust function names against
+		# a runner using stable IDs computed every selection correctly, could execute none of them,
+		# and left every dry comparison clean. It was found by hand.
+		#
+		# One target's worth of second boot, which is why it is a flag rather than the default.
+		scoped_arg=()
+		if [[ "${shadow_exec:-0}" == "1" ]]; then
+			selection="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- guest-selection --stdin --arch "$target")" || planner_failed "the planner could not name the guest selection"
+			if [[ -n "$selection" ]]; then
+				note "shadow-exec: running the selection on $target first (${selection//$'\n'/,})"
+				TEST_SELECTION="$(printf '%s' "$selection" | tr '\n' ',')" ./test.sh --arch "$target" || note "the $target scoped run did not pass - the comparison reads its log anyway"
+				scoped_log="$(find "$BUILD_DIR/logs/test" -name "$target-*-guest.log" -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)"
+				[[ -n "$scoped_log" ]] || die "no $target scoped guest log to compare against"
+				scoped_arg=(--scoped-log "../$scoped_log")
+			else
+				note "shadow-exec: the plan selects no guest test on $target, so there is nothing to execute"
+			fi
+		fi
 		./test.sh --arch "$target" || note "the $target sweep did not pass - the comparison below reads its log anyway, which is the point"
 		log="$(find "$BUILD_DIR/logs/test" -name "$target-*-guest.log" -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)"
 		[[ -n "$log" ]] || die "no $target guest log to compare against"
-		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --guest-log "../$log" --arch "$target") || shadow_failed=1
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --guest-log "../$log" --arch "$target" "${scoped_arg[@]}") || shadow_failed=1
 	done
 	# The HOST universe, from the same sweep.
 	#
@@ -287,14 +317,17 @@ if [[ "$action" == shadow ]]; then
 	mkdir -p "$(dirname "$host_log")"
 	: >"$host_log"
 	host_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- host-checks)" || planner_failed "the planner could not list the host checks"
+	# THE WHOLE KEY per line, not the check's name. Two variants of one check used to write two
+	# lines carrying the same id: the model's map kept the last and `total` counted both, so the
+	# declared total and the number of outcomes disagreed and nothing said so.
 	host_total=0
-	while IFS=$'\t' read -r id command; do
+	while IFS=$'\t' read -r id arch env config command; do
 		[[ -n "$id" ]] || continue
 		host_total=$((host_total + 1))
 		if (cd "$SRC_DIR/.." && eval "$command") >/dev/null 2>&1; then
-			printf '%s PASS\n' "$id" >>"$host_log"
+			printf '%s\t%s\t%s\t%s\tPASS\n' "$id" "$arch" "$env" "$config" >>"$host_log"
 		else
-			printf '%s FAIL\n' "$id" >>"$host_log"
+			printf '%s\t%s\t%s\t%s\tFAIL\n' "$id" "$arch" "$env" "$config" >>"$host_log"
 		fi
 	done <<<"$host_ids"
 	printf 'total %s\n' "$host_total" >>"$host_log"
@@ -310,13 +343,13 @@ if [[ "$action" == shadow ]]; then
 	: >"$dev_log"
 	dev_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- dev-checks)" || planner_failed "the planner could not list the dev-guest checks"
 	dev_total=0
-	while IFS=$'\t' read -r id arch command; do
+	while IFS=$'\t' read -r id arch env config command; do
 		[[ -n "$id" ]] || continue
 		dev_total=$((dev_total + 1))
 		if (cd "$SRC_DIR/.." && eval "$command") >/dev/null 2>&1; then
-			printf '%s PASS\n' "$id" >>"$dev_log"
+			printf '%s\t%s\t%s\t%s\tPASS\n' "$id" "$arch" "$env" "$config" >>"$dev_log"
 		else
-			printf '%s FAIL\n' "$id" >>"$dev_log"
+			printf '%s\t%s\t%s\t%s\tFAIL\n' "$id" "$arch" "$env" "$config" >>"$dev_log"
 		fi
 	done <<<"$dev_ids"
 	printf 'total %s\n' "$dev_total" >>"$dev_log"

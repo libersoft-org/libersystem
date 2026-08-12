@@ -236,7 +236,32 @@ impl<D: BlockDevice> LiberFs<D> {
 		// And the one place where every inode has exactly one name. The bitmap is sized by the
 		// inode numbers this volume has issued, not by the pool, and it is allocated fallibly like
 		// every other map here.
-		self.mark_names = Some(try_zeroed((self.next_inode as usize).div_ceil(8))?);
+		// SIZED BY WHAT IS REACHABLE, not by what was ever issued.
+		//
+		// This was `next_inode / 8` under a comment calling that "the inode numbers this volume has
+		// issued, not the pool" - presented as the smaller of the two, and on a long-lived volume it
+		// is the larger. Inode numbers are never recycled, so ten live files on a volume that has
+		// created four billion temporaries wanted half a gigabyte of bitmap to check ten names. It
+		// was fallible, so that is a mount that fails rather than one that corrupts; it is still the
+		// wrong size.
+		//
+		// A `BTreeSet` is bounded by the tree instead, and every operation it needs - "have I seen
+		// this inode" - is what a set is for.
+		let mut names: BTreeSet<u32> = BTreeSet::new();
+		// THE ROOT IS ALREADY SPOKEN FOR, and the map started saying it was not.
+		//
+		// A bit is set on an inode's first sighting and an alias is declared on its second, which is
+		// right for every inode that has one name. The root has NONE - nothing may name it - so its
+		// first sighting is already the alias. Over a zeroed map a directory record pointing at
+		// inode 0 merely set the bit and the walk carried on, and a volume with a namespace loop
+		// through the root mounted writable.
+		//
+		// `fsck` has always had this right, and for a reason worth copying rather than re-deriving:
+		// its `reached` set contains the root BEFORE the walk starts. Seeding the same way here is
+		// what makes the two checkers agree by construction instead of by coincidence, which is the
+		// gap this whole milestone is named after.
+		names.insert(ROOT_INODE);
+		self.mark_names = Some(names);
 		self.mark_alias = false;
 		self.mark_strict = true;
 		self.mark_inode_tree(self.inode_root, self.inode_root_crc, &mut live)?;
@@ -614,15 +639,10 @@ impl<D: BlockDevice> LiberFs<D> {
 					// Read-only rather than a walk-damage flag: the repair for an alias is to
 					// remove one of the two names, and that removal is exactly the operation that
 					// destroys the shared inode. `fsck` names both.
-					if let Some(names) = self.mark_names.as_mut() {
-						let bit = rec.child as u64;
-						if (bit / 8) < names.len() as u64 {
-							if test_bit(names, bit) {
-								self.mark_alias = true;
-							} else {
-								set_bit(names, bit);
-							}
-						}
+					if let Some(names) = self.mark_names.as_mut()
+						&& !names.insert(rec.child)
+					{
+						self.mark_alias = true;
 					}
 				}
 			}

@@ -318,8 +318,19 @@ fn listing_contract_and_dot_dot() {
 	e[0] = 34; // id_len 0: an empty name
 	img[root_off + ROOT_FREE..root_off + ROOT_FREE + 34].copy_from_slice(&e);
 	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
+	// REFUSED, not skipped, since 2026-08-12. A record with no identifier is a malformed record, and
+	// a listing that quietly omits it reports success over a directory it could not read - which is
+	// the "corrupt directory becomes a short listing" finding, in its smallest form.
+	assert_eq!(fs.list(), Err(FsError::Corrupt), "a record with no name is corruption, not an entry to pass over");
+
+	// The rest of this test is about a directory that is intact, so it gets one.
+	let mut img = build_iso(false);
+	let root_off = 19 * SECTOR_SIZE;
+	let _ = root_off;
+	let mut fs = Iso9660::mount(MemDisc { data: img.clone() }).unwrap();
 	let list = fs.list().unwrap();
 	assert!(list.iter().all(|f| !f.name.is_empty()), "{list:?}");
+	img.clear();
 	assert_eq!(fs.read_file(b""), Err(FsError::NotFound));
 	let sub = list.iter().find(|f| f.name == "SUB").unwrap();
 	assert_eq!((sub.is_dir, sub.size), (true, 0), "a directory must list with size zero");
@@ -416,13 +427,25 @@ fn a_malformed_record_is_corrupt_rather_than_a_short_listing() {
 // Build a root directory whose first record carries a SUSP `SP` (and optionally an `ER`), and one
 // ordinary record whose system-use area carries a Rock Ridge `NM`.
 fn iso_with_susp(announce_rrip: bool, nm: &[u8]) -> Vec<u8> {
+	iso_with_susp_id(if announce_rrip { Some(b"RRIP_1991A".as_slice()) } else { None }, nm)
+}
+
+// The same, with the `ER` identifier chosen: an extension this reader does not implement must not
+// switch the name source, because reading somebody else's `NM` is the guess the check removes.
+fn iso_with_susp_id(extension: Option<&[u8]>, nm: &[u8]) -> Vec<u8> {
 	// The root block is REBUILT rather than patched: growing the "." record in place would push it
 	// over the records that follow, and the walk would read the wreckage instead of the fixture.
 	let mut img = build_iso(false);
 	let mut dot = record(19, SECTOR_SIZE as u32, true, &[0]);
 	let mut sp: Vec<u8> = vec![b'S', b'P', 7, 1, 0xBE, 0xEF, 0];
-	if announce_rrip {
-		sp.extend_from_slice(&[b'E', b'R', 8, 1, 1, 0, 0, 0]);
+	if let Some(id) = extension {
+		// A REAL `ER`: sig, len, version, then LEN_ID, LEN_DES, LEN_SRC, EXT_VER and the identifier
+		// itself. The fixture used to be `[b'E', b'R', 8, 1, 1, 0, 0, 0]` - a declared identifier
+		// length of one inside a total length of eight, which is exactly the header, so the
+		// identifier it promised did not exist. It announced Rock Ridge anyway, because the parser
+		// was scanning for the two letters rather than reading the entry.
+		sp.extend_from_slice(&[b'E', b'R', (8 + id.len()) as u8, 1, id.len() as u8, 0, 0, 1]);
+		sp.extend_from_slice(id);
 	}
 	dot.extend_from_slice(&sp);
 	dot[0] = dot.len() as u8;
@@ -443,6 +466,28 @@ fn iso_with_susp(announce_rrip: bool, nm: &[u8]) -> Vec<u8> {
 	let root = dir_block(&[dot, record(19, SECTOR_SIZE as u32, true, &[1]), x]);
 	img[19 * SECTOR_SIZE..19 * SECTOR_SIZE + root.len()].copy_from_slice(&root);
 	img
+}
+
+#[test]
+fn an_er_this_reader_does_not_implement_does_not_turn_rock_ridge_on() {
+	// `ER` names WHICH extension is in the area, and that name was never read: the test was
+	// `sys.windows(2).any(|w| w == b"ER")`, satisfied by two bytes anywhere - inside another
+	// extension's payload, inside a name, inside padding.
+	//
+	// Announcing something else must leave the ISO identifier in place. Reading a foreign
+	// extension's `NM` is exactly the guess the SUSP negotiation was added to remove, one step
+	// further along.
+	let nm: Vec<u8> = [b"NM".as_slice(), &[9, 1, 0], b"real"].concat();
+	let mut fs = Iso9660::mount(MemDisc { data: iso_with_susp_id(Some(b"XA_SOMETHING"), &nm) }).expect("mount");
+	let names: Vec<String> = fs.list().expect("list").into_iter().map(|f| f.name).collect();
+	assert!(names.iter().any(|n| n.starts_with("X.TXT")), "the ISO identifier stands: {names:?}");
+	assert!(!names.iter().any(|n| n == "real"), "an extension this reader does not implement must not name the file: {names:?}");
+
+	// And a well-formed `ER` whose declared identifier length runs past the entry is not an
+	// announcement either - it is a malformed one.
+	let mut fs = Iso9660::mount(MemDisc { data: iso_with_susp_id(Some(b"RRIP_1991A_AND_MORE_THAN_FITS"), &nm) }).expect("mount");
+	let names: Vec<String> = fs.list().expect("list").into_iter().map(|f| f.name).collect();
+	assert!(!names.iter().any(|n| n == "real"), "an identifier this reader does not know is not this reader's: {names:?}");
 }
 
 #[test]
@@ -539,13 +584,35 @@ fn a_nonzero_susp_skip_is_honoured() {
 	// find nothing it recognises, rather than reporting a name from bytes it was told to skip.
 	let root = 19 * SECTOR_SIZE;
 	let dot_len = img[root] as usize;
-	// SP sits immediately after the fixed part of the "." record; its skip is the 7th byte.
-	let sp_at = root + dot_len - 15; // ER (8) + SP (7)
-	assert_eq!(&img[sp_at..sp_at + 2], b"SP", "the fixture's SP is where this test thinks it is");
+	// FOUND rather than computed. This was `root + dot_len - 15`, which encoded "ER is 8 bytes and
+	// SP is 7" - so making the fixture's `ER` a real one, with an identifier in it, moved the entry
+	// and broke a test that is not about either length.
+	let sp_at = img[root..root + dot_len].windows(2).position(|w| w == b"SP").map(|i| root + i).expect("the fixture's SP");
 	img[sp_at + 6] = 4;
 	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
 	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
 	assert!(!names.contains(&"real".to_string()), "a declared skip must be honoured, not read past: {names:?}");
+}
+
+#[test]
+fn a_multi_volume_set_is_refused_at_the_mount() {
+	// The header says multi-volume sets are outside this reader's subset and refused, and ONE line
+	// enforced it: a per-record sequence-number check, halfway through a listing. The Volume Set
+	// Size in the PVD - which says how many volumes the set has - was not read at all, and neither
+	// was the ROOT record's own sequence number, so the one record that decides where the whole
+	// namespace begins was exempt from the rule every other record obeyed.
+	let mut img = build_iso(false);
+	let pvd = 16 * SECTOR_SIZE;
+	img[pvd + 120..pvd + 122].copy_from_slice(&2u16.to_le_bytes());
+	img[pvd + 122..pvd + 124].copy_from_slice(&2u16.to_be_bytes());
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a set of two volumes is refused before anything is read");
+
+	// And the root record's own volume, which every other record is checked for.
+	let mut img = build_iso(false);
+	let root_rec = pvd + 156;
+	img[root_rec + 28..root_rec + 30].copy_from_slice(&2u16.to_le_bytes());
+	img[root_rec + 30..root_rec + 32].copy_from_slice(&2u16.to_be_bytes());
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a root record naming another volume is not this volume's root");
 }
 
 #[test]
@@ -557,6 +624,70 @@ fn a_volume_from_another_set_is_refused() {
 	img[hello + 28..hello + 30].copy_from_slice(&2u16.to_le_bytes());
 	img[hello + 30..hello + 32].copy_from_slice(&2u16.to_be_bytes());
 	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
-	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
-	assert!(!names.contains(&"HELLO.TXT".to_string()), "a record from another volume of a set is not this volume's: {names:?}");
+	// The record names volume 2 and this reader has one device, so reading its extent would read
+	// that LBA on whichever disc is in the drive. Omitting it from the listing was the old answer and
+	// it is the wrong shape: a directory this reader cannot represent is refused, rather than served
+	// with a hole in it that a caller cannot see.
+	assert_eq!(fs.list(), Err(FsError::Corrupt), "a record from another volume of a set makes the directory unreadable, not shorter");
+}
+
+// Whether this machine can master an ISO with a tool that has no stake in this parser's
+// assumptions. `xorriso` is the one in Debian; its absence skips the test LOUDLY, because a golden
+// test that quietly does not run is worse than one that is not written.
+fn xorriso_available() -> bool {
+	match std::process::Command::new("xorriso").arg("-version").output() {
+		Ok(out) => out.status.success(),
+		Err(_) => {
+			std::eprintln!("SKIPPED: xorriso is not installed, so the independent-mastering test cannot run");
+			false
+		}
+	}
+}
+
+// An ISO mastered by `xorriso` with Rock Ridge, carrying a long name, a nested directory and two
+// files, returned as the bytes of the disc.
+fn xorriso_image() -> Option<Vec<u8>> {
+	if !xorriso_available() {
+		return None;
+	}
+	let dir = std::env::temp_dir().join("iso-gold");
+	let _ = std::fs::remove_dir_all(&dir);
+	let tree = dir.join("tree");
+	std::fs::create_dir_all(tree.join("sub")).expect("a source tree");
+	// A name ECMA-119 cannot hold: lower case, longer than 8.3, and with a second dot. Rock Ridge
+	// is what carries it, which is the point of the test.
+	std::fs::write(tree.join("A-Long.Name.txt"), b"mastered by xorriso, not by this crate\n").expect("a file");
+	std::fs::write(tree.join("sub").join("nested.txt"), b"one level down\n").expect("a nested file");
+	let path = dir.join("gold.iso");
+	let made = std::process::Command::new("xorriso").arg("-as").arg("mkisofs").arg("-quiet").arg("-rational-rock").arg("-o").arg(&path).arg(&tree).output().expect("xorriso runs");
+	if !made.status.success() {
+		std::eprintln!("SKIPPED: xorriso could not master the image ({})", String::from_utf8_lossy(&made.stderr).trim());
+		return None;
+	}
+	std::fs::read(&path).ok()
+}
+
+#[test]
+fn an_image_from_an_independent_tool_lists_and_reads_back() {
+	// EVERY OTHER TEST IN THIS FILE USES A FIXTURE THIS CRATE BUILDS, and that is the shape which
+	// let the Rock Ridge negotiation be wrong for as long as it was: a synthetic image omits what
+	// the parser does not check, so both stay wrong together. `xorriso` has no stake in this
+	// parser's assumptions - it writes a real `ER` entry with a real identifier, real `NM` records
+	// and a real SUSP area, whatever this reader happens to look for.
+	let Some(bytes) = xorriso_image() else { return };
+	let mut fs = Iso9660::mount(MemDisc { data: bytes }).expect("an xorriso image mounts");
+
+	let root = fs.list().expect("the root lists");
+	let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
+	assert!(names.contains(&"A-Long.Name.txt"), "Rock Ridge carries the long name, got {names:?}");
+	assert!(names.contains(&"sub"), "and the subdirectory, got {names:?}");
+
+	assert_eq!(fs.read_file(b"A-Long.Name.txt").as_deref(), Ok(&b"mastered by xorriso, not by this crate\n"[..]));
+	assert_eq!(fs.read_file(b"sub/nested.txt").as_deref(), Ok(&b"one level down\n"[..]));
+
+	// And the ranged read over the same file, which is the reader a large file goes through.
+	let mut window = [0u8; 8];
+	let read = fs.read_file_into(b"A-Long.Name.txt", 9, &mut window).expect("a ranged read");
+	assert_eq!(&window[..read], b"by xorri", "byte 9 onwards, from a real disc");
+	assert_eq!(fs.read_file_into(b"sub/nested.txt", 1000, &mut window), Ok(0), "past the end reads nothing");
 }

@@ -72,11 +72,10 @@ pub(super) fn verify_shutdown_order(order: &[usize], state: &[State; N]) -> bool
 // gone, so the standing supervisor drops that channel from its wait set.
 pub(super) unsafe fn serve_stats_once(stats: u64, state: &[State; N], sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
 	unsafe {
-		let (len, incoming): (usize, u64) = match recv_blocking(stats, buf) {
-			Received::Message { len, handle } => (len, handle),
-			Received::Closed => return false,
+		let (len, mut handle) = match recv_caps_blocking(stats, buf) {
+			ReceivedCaps::Message { len, handles } => (len, handles),
+			ReceivedCaps::Closed => return false,
 		};
-		let mut handle = if incoming == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[incoming]) };
 		let mut api = StatsApi { state, sup, reason, canary_sup, drivers };
 		let mut reply: [u8; 4096] = [0u8; 4096];
 		let mut reply_handle = proto::codec::Handles::new();

@@ -49,6 +49,17 @@ impl Environment {
 			Environment::DevGuest => "dev-guest",
 		}
 	}
+
+	// The inverse, for reading a key back out of a shadow log. Exhaustive against `as_str` so the
+	// two cannot drift: a name this does not know is not silently mapped to a default.
+	pub fn from_str(text: &str) -> Option<Environment> {
+		match text {
+			"host" => Some(Environment::Host),
+			"test-guest" => Some(Environment::TestGuest),
+			"dev-guest" => Some(Environment::DevGuest),
+			_ => None,
+		}
+	}
 }
 
 // One runnable thing. `architecture` is "host" for work that is not per target.
@@ -144,6 +155,10 @@ pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shado
 		}
 		for variant in &check.variants {
 			seen.insert(match variant.environment {
+				// A BUILD IS ITS OWN UNIVERSE. Both run on the host, and only one of them has a
+				// shadow producer - so grouping them let a certificate earned over gates, suites and
+				// conformance stand for builds nothing had compared.
+				Environment::Host if check.kind == CheckKind::Build => crate::shadow::Universe::HostBuild,
 				Environment::Host => crate::shadow::Universe::Host,
 				Environment::TestGuest => crate::shadow::Universe::TestGuest,
 				Environment::DevGuest => crate::shadow::Universe::DevGuest,

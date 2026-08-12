@@ -14,7 +14,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lico::{Focus, InputDecoder, InputEvent, Key, MouseTracking, TerminalGuard, TerminalOptions, TerminalWriter};
-use proto::system::{FileInfo, FileType, LaunchContext};
+use proto::system::{Error, FileInfo, FileType, LaunchContext};
 use rt::*;
 use storage_proto::path;
 use tools::{ConsoleWriter, ListDirectoryError, VolumeSet, list_volume_directory};
@@ -359,6 +359,11 @@ fn parent_uri(uri: &str) -> String {
 fn list_error(error: ListDirectoryError) -> &'static [u8] {
 	match error {
 		ListDirectoryError::Unavailable => b"selected volume is unavailable",
+		// The volume said why, which it could not before the listing had an error arm.
+		ListDirectoryError::Refused(Error::Denied) => b"permission denied for that directory",
+		ListDirectoryError::Refused(Error::NotFound) => b"that directory is not there",
+		ListDirectoryError::Refused(Error::Again) => b"the volume is busy; try again",
+		ListDirectoryError::Refused(_) => b"the volume refused the listing",
 		ListDirectoryError::TooManyEntries => b"directory exceeds the 4096-entry panel bound",
 		ListDirectoryError::OutOfMemory => b"not enough memory for the directory listing",
 		ListDirectoryError::Malformed => b"the directory listing arrived damaged and was not shown in part",

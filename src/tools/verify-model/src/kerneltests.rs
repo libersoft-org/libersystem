@@ -237,6 +237,34 @@ pub struct Declaration {
 	pub covers: Vec<String>,
 }
 
+// Where a named CLAUSE starts inside a `tagged_test!` argument list, or None.
+//
+// A plain `arguments.find("covers")` finds the first occurrence of those six letters ANYWHERE, and a
+// test name is part of the argument list. `the_lifecycle_guard_covers_the_whole_operation_...`
+// therefore matched inside its own name, the search for the following `[` found the TAG list, and
+// the test was recorded as covering `Kernel`, `Memory` and `Dma` - three components it never
+// declared and cannot reach, which failed `every_annotation_in_this_tree_is_reachable` for a reason
+// that had nothing to do with the annotation.
+//
+// A clause is the word standing alone and followed by `=`: not preceded by an identifier character,
+// and the next non-space character is `=`. `id` is read the same way, because `valid`, `width` and
+// any other name containing those two letters is the same trap one letter smaller.
+fn clause_at(arguments: &str, clause: &str) -> Option<usize> {
+	let bytes = arguments.as_bytes();
+	let mut from = 0usize;
+	while let Some(offset) = arguments[from..].find(clause) {
+		let at = from + offset;
+		let before_ok = at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+		let after = &arguments[at + clause.len()..];
+		let follows_ok = after.trim_start().starts_with('=');
+		if before_ok && follows_ok {
+			return Some(at);
+		}
+		from = at + clause.len();
+	}
+	None
+}
+
 // `tagged_test!(name, [Tags], id = "..", covers = [alpha, beta])` -> (name, id, covers), with the
 // covers clause optional and `id` required (the macro has no arm without it).
 pub fn parse_declarations(text: &str) -> Vec<(String, String, Vec<String>)> {
@@ -263,7 +291,7 @@ pub fn parse_declarations(text: &str) -> Vec<(String, String, Vec<String>)> {
 		else {
 			continue;
 		};
-		let covers = match arguments.find("covers") {
+		let covers = match clause_at(arguments, "covers") {
 			Some(at) => {
 				let tail = &arguments[at..];
 				match (tail.find('['), tail.find(']')) {
@@ -278,7 +306,7 @@ pub fn parse_declarations(text: &str) -> Vec<(String, String, Vec<String>)> {
 		// Taken from the text between the first quote after `id =` and the next one, rather than by
 		// splitting on commas: `covers` is a list and a future clause may be too, and an identity
 		// read out of the wrong clause is worse than no identity at all.
-		let id = arguments.find("id").and_then(|at| {
+		let id = clause_at(arguments, "id").and_then(|at| {
 			let tail = &arguments[at..];
 			let open = tail.find('"')?;
 			let rest = &tail[open + 1..];

@@ -51,14 +51,15 @@ pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
 	false
 }
 
-// Remove any binding for `vector` (an EID; called from an Interrupt's Drop). MSI is
-// edge-triggered and unshared, so this just drops the binding and frees the slot; the
-// EID's IMSIC enable bit is cleared best-effort (a later stray MSI to a freed EID pends
-// but dispatches to no one).
+// Remove any binding for `vector` (an EID; called from an Interrupt's Drop). The EID's IMSIC enable
+// bit is cleared best-effort, so a later stray MSI to it pends and dispatches to no one - WHILE IT
+// STAYS UNOWNED. Reallocate the EID and that same stray message wakes its next owner, which is the
+// defect the x86 backend spells out; so the slot is retired rather than freed and waits for
+// `SYS_DEVICE_QUIESCED`.
 pub fn unbind(vector: u8) {
 	if let Some(slot) = eid_slot(vector as u32) {
 		super::imsic::disable_eid(vector as u32);
-		REGISTRY.free(slot);
+		REGISTRY.retire(slot);
 	}
 }
 
@@ -131,6 +132,12 @@ pub fn dispatch_msi(eid: u32) -> bool {
 // own timer - the S-mode timer interrupt (SCAUSE code 5) - shown as a fixed vector like
 // x86's LAPIC timer and aarch64's EL1 physical-timer PPI; the MSI window (each a device's
 // EID) follows.
+// Free every MSI vector that is masked and waiting for `device` to be confirmed stopped, and answer
+// how many. Reached from `SYS_DEVICE_QUIESCED`.
+pub fn release_msi_for_device(device: u32) -> usize {
+	REGISTRY.release_for_device(device)
+}
+
 pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 	const TIMER_VECTOR: u32 = 5; // supervisor timer interrupt (scause code 5)
 	if index == 0 {

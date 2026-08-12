@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lico::TerminalWriter;
-use proto::system::{FileInfo, OpenOpts, volume};
+use proto::system::{Error, FileInfo, OpenOpts, volume};
 use rt::{ReceivedVec, close, map_object, recv_tagged, recv_vec_blocking, send_blocking, unmap_object};
 use storage_proto::path;
 use volume_client::VolumeClient;
@@ -129,6 +129,10 @@ pub unsafe fn read_volume_file(storage: u64, path: &str, limit: usize) -> Result
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListDirectoryError {
 	Unavailable,
+	// The volume refused the listing before any stream existed, and said why. A directory that is
+	// not there, a path outside the grant and a volume that could not be read used to arrive here
+	// as `Unavailable` - the schema had no error arm, so "no stream" was the only signal.
+	Refused(Error),
 	TooManyEntries,
 	OutOfMemory,
 	// A frame arrived that would not decode. Its own ending rather than one of the above, because
@@ -146,7 +150,11 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 			return Err(ListDirectoryError::Unavailable);
 		}
 		let mut client = VolumeClient::new(storage);
-		let consumer = client.list(path).ok_or(ListDirectoryError::Unavailable)?;
+		let consumer = match client.list(path) {
+			Some(Ok(consumer)) => consumer,
+			Some(Err(e)) => return Err(ListDirectoryError::Refused(e)),
+			None => return Err(ListDirectoryError::Unavailable),
+		};
 		let mut entries = Vec::new();
 		loop {
 			match recv_vec_blocking(consumer) {

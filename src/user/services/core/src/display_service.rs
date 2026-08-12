@@ -610,10 +610,13 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 			}
 			let admin_index: usize = gpu_first as usize + kill_present as usize;
 			if ready as usize == admin_index {
-				match recv_blocking(admin, &mut request) {
-					Received::Message { len, handle } => {
+				match recv_caps_blocking(admin, &mut request) {
+					ReceivedCaps::Message { len, handles: mut caps } => {
 						let mut reply_handle = proto::codec::Handles::new();
-						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+						// over the single-handle receive, which keeps the first and drops the rest - so a
+						// client sending stdin, stdout and stderr had two destroyed before dispatch.
+						let mut handle = caps;
 						let mut call = AdminCall { clients: &mut clients, stats: &state.stats };
 						if let Some(n) = display_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
 							if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
@@ -630,16 +633,16 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 							close(unclaimed);
 						}
 					}
-					Received::Closed => exit(),
+					ReceivedCaps::Closed => exit(),
 				}
 				continue;
 			}
 			let client_index: usize = ready as usize - admin_index - 1;
 			let chan: u64 = clients[client_index].chan;
-			match recv_blocking(chan, &mut request) {
-				Received::Message { len, handle } if len == 0 => {
-					if handle != 0 {
-						close(handle);
+			match recv_caps_blocking(chan, &mut request) {
+				ReceivedCaps::Message { len, handles: mut caps } if len == 0 => {
+					for &leftover in caps.as_slice() {
+						close(leftover);
 					}
 					if client_index == 0 {
 						exit();
@@ -648,8 +651,11 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 					close(chan);
 					clients.swap_remove(client_index);
 				}
-				Received::Message { len, handle } => {
-					let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+				ReceivedCaps::Message { len, handles: mut caps } => {
+					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+					// over the single-handle receive, which keeps the first and drops the rest - so a
+					// client sending stdin, stdout and stderr had two destroyed before dispatch.
+					let mut handle = caps;
 					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 					if op == HEARTBEAT_OP {
 						send_blocking(chan, b"PONG", 0);
@@ -684,7 +690,7 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 						close(unclaimed);
 					}
 				}
-				Received::Closed => {
+				ReceivedCaps::Closed => {
 					if client_index == 0 {
 						exit();
 					}

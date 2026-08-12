@@ -37,7 +37,6 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 #[cfg(test)]
@@ -47,6 +46,22 @@ mod tests;
 // and that is the unit a `.iso` and an optical drive read in; the device reads one
 // 2048-byte block at a time, by absolute LBA.
 pub const SECTOR_SIZE: usize = 2048;
+
+// The most one `read_file` may allocate.
+//
+// A disc states a file's length and this reader believed it. 64 MB is far above anything an
+// optical image holds as a single file that a service is expected to buffer whole, and far below
+// what would trouble the service buffering it. A file past it is `TooLarge`, which `fs-core`
+// documents as "the answer does not fit in one buffer; a ranged read is the solution" - which is
+// exactly the state of affairs.
+const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
+
+// The most entries one directory listing may return.
+//
+// Far above what any disc this reader is aimed at holds in one directory, and far below what an
+// image can legally declare. A directory past it is `TooLarge` - "the answer does not fit in one
+// buffer" - rather than an allocation the service cannot make.
+const MAX_DIR_ENTRIES: usize = 65536;
 
 // The volume descriptors begin here; LBAs 0..16 are the boot/system area.
 const FIRST_DESCRIPTOR_LBA: u64 = 16;
@@ -138,7 +153,18 @@ impl<D: BlockDevice> Iso9660<D> {
 			let Some(root) = root_extent(&block) else { return None };
 			let found = (root, blocks, block_size as u32);
 			match block[0] {
-				1 => pvd_root = Some(found),
+				1 => {
+					// THE VOLUME SET, at the descriptor. The header states that multi-volume sets
+					// are outside this reader's subset and refused, and one line enforced it: a
+					// per-RECORD sequence number check, halfway through a listing. A set larger
+					// than one is refused here, which is where a reader that does not implement
+					// multi-volume should say so - at mount, before anything is read.
+					let Some(set_size) = both16(&block[120..124]) else { return None };
+					if set_size > 1 {
+						return None;
+					}
+					pvd_root = Some(found)
+				}
 				2 if is_joliet(&block) => joliet_root = Some(found),
 				_ => {}
 			}
@@ -183,10 +209,39 @@ impl<D: BlockDevice> Iso9660<D> {
 				&& let Some(skip) = susp_skip_of(sys)
 			{
 				susp_skip = skip;
-				// `ER` in the same area is what says WHICH extension is in use. Without it SUSP is
-				// present and Rock Ridge is not announced, and reading `NM` would be the same guess
-				// as before with an extra step.
-				rrip = sys.windows(2).any(|w| w == b"ER");
+				// `ER` says WHICH extension is in use. Without it SUSP is present and Rock Ridge is
+				// not announced, and reading `NM` would be the same guess as before with an extra
+				// step.
+				//
+				// AND IT MAY LIVE BEHIND A `CE`. A directory record's own system-use area is what
+				// is left of a 255-byte record, and `SP`, `PX` and `TF` fill most of it - so SUSP
+				// has a Continuation Entry pointing at a block where the rest goes, and that is
+				// where `xorriso` puts the `ER`. Scanning the record's own area alone found no
+				// announcement on any disc a real mastering tool produces, so every one of them
+				// fell back to 8.3 names: `A-Long.Name.txt` came back as `A_LONG_N.TXT`.
+				//
+				// Found by the first golden image from an independent tool, which is exactly what
+				// that test exists for.
+				let sys: alloc::vec::Vec<u8> = sys.to_vec();
+				rrip = announces_rockridge(&sys) || {
+					let mut found = false;
+					let mut area = sys.clone();
+					// Bounded: SUSP allows a chain, and a disc may name one that loops.
+					for _ in 0..4 {
+						let Some((next_lba, offset, len)) = continuation_of(&area) else { break };
+						let mut cont = [0u8; SECTOR_SIZE];
+						if next_lba as u64 >= blocks as u64 || !dev.read_block(next_lba as u64, &mut cont) {
+							break;
+						}
+						let Some(part) = cont.get(offset..offset.saturating_add(len)) else { break };
+						if announces_rockridge(part) {
+							found = true;
+							break;
+						}
+						area = part.to_vec();
+					}
+					found
+				};
 			}
 		}
 		Some(Iso9660 { dev, geo: Geometry { root_lba, root_len, blocks, joliet, rrip, susp_skip } })
@@ -228,6 +283,50 @@ impl<D: BlockDevice> Iso9660<D> {
 		self.read_extent(entry.lba, entry.size)
 	}
 
+	// A RANGED read: fill `buffer` from byte `offset` of the file, answering how much was read.
+	//
+	// The size of a file stops being the size of an allocation. `read_file` is the whole-file shape
+	// and keeps its ceiling, which is what makes "a hostile disc never exhausts the mounting
+	// service" true TODAY; this is what makes it true without a ceiling at all, and it is the same
+	// idea the directory half already proved - the caller says how much it is willing to take.
+	//
+	// A short answer means end of file, not an error: reading past the end returns 0.
+	pub fn read_file_into(&mut self, path: &[u8], offset: u64, buffer: &mut [u8]) -> Result<usize, FsError> {
+		let (parent, name) = split_parent(path)?;
+		let (lba, len) = self.resolve_dir(parent)?;
+		let entry = self.find_entry(lba, len, name)?;
+		if entry.is_dir {
+			return Err(FsError::IsDir);
+		}
+		if entry.unsupported {
+			return Err(FsError::Invalid);
+		}
+		if offset >= entry.size as u64 || buffer.is_empty() {
+			return Ok(0);
+		}
+		let want = ((entry.size as u64 - offset) as usize).min(buffer.len());
+		// The read is sector-aligned on the medium, so it starts at the sector holding `offset` and
+		// the wanted bytes are copied out of it. One scratch sector rather than the whole file,
+		// which is the entire point.
+		let mut done = 0usize;
+		let mut sector = [0u8; SECTOR_SIZE];
+		while done < want {
+			let at = offset + done as u64;
+			let block = entry.lba as u64 + at / SECTOR_SIZE as u64;
+			if block >= self.geo.blocks as u64 {
+				return Err(FsError::Invalid);
+			}
+			let within = (at % SECTOR_SIZE as u64) as usize;
+			let take = (SECTOR_SIZE - within).min(want - done);
+			if !self.dev.read_block(block, &mut sector) {
+				return Err(FsError::Io);
+			}
+			buffer[done..done + take].copy_from_slice(&sector[within..within + take]);
+			done += take;
+		}
+		Ok(done)
+	}
+
 	// Walk path segments from the root, descending into each named subdirectory, and
 	// return the final directory's extent. An empty path is the root.
 	fn resolve_dir(&mut self, path: &[u8]) -> Result<(u32, u32), FsError> {
@@ -260,7 +359,7 @@ impl<D: BlockDevice> Iso9660<D> {
 		let (joliet, rrip, skip) = (self.geo.joliet, self.geo.rrip, self.geo.susp_skip);
 		let mut found = None;
 		self.for_each_record(lba, len, |rec| {
-			if let Some(e) = parse_record(rec, joliet, rrip, skip)
+			if let Some(e) = parse_record(rec, joliet, rrip, skip)?
 				&& !e.name.is_empty()
 				&& name_matches(&e, name)
 			{
@@ -278,8 +377,14 @@ impl<D: BlockDevice> Iso9660<D> {
 		let (joliet, rrip, skip) = (self.geo.joliet, self.geo.rrip, self.geo.susp_skip);
 		let mut out: Vec<FileInfo> = Vec::new();
 		let mut failed = None;
+		// A CEILING ON THE LISTING. The extent is no longer read whole - `for_each_record` walks it
+		// a sector at a time - but the answer built from it still grows without a bound, one owned
+		// `String` per entry, from a directory whose size the medium chose. That is the same
+		// unbounded allocation one layer up, and a directory of a million entries is a legal
+		// ISO9660 image.
+		let mut listed = 0usize;
 		self.for_each_record(lba, len, |rec| {
-			if let Some(e) = parse_record(rec, joliet, rrip, skip)
+			if let Some(e) = parse_record(rec, joliet, rrip, skip)?
 				&& !e.special
 				&& !e.name.is_empty()
 				// A multi-extent or interleaved file is refused by `read_file`, and listing its
@@ -291,6 +396,10 @@ impl<D: BlockDevice> Iso9660<D> {
 				// multi-version file lists once, as its highest version.
 				&& !out.last().is_some_and(|p: &FileInfo| p.name == e.name)
 			{
+				listed += 1;
+				if listed > MAX_DIR_ENTRIES {
+					return Err(FsError::TooLarge);
+				}
 				// a directory reports a length of zero - the FileInfo contract,
 				// uniform across the backends behind the volume API.
 				let info = FileInfo { name: e.name, size: if e.is_dir { 0 } else { e.size as u64 }, is_dir: e.is_dir };
@@ -369,7 +478,24 @@ impl<D: BlockDevice> Iso9660<D> {
 		if lba as u64 + (size as u64).div_ceil(SECTOR_SIZE as u64) > self.geo.blocks as u64 {
 			return Err(FsError::Invalid);
 		}
-		let mut out = vec![0u8; size as usize];
+		// A CEILING AND A FALLIBLE ALLOCATION.
+		//
+		// `size` comes off the medium, up to `u32::MAX`, and the bound above proves only that the
+		// extent lies inside the declared volume - not that four gigabytes may be allocated to hold
+		// it. `vec![0u8; n]` is infallible, so a disc asking for more than the service has did not
+		// get an error: it took the service down, in a crate whose header says a hostile disc
+		// "never crashes or exhausts the mounting service".
+		//
+		// The ceiling is what makes that sentence true today; a ranged read is what makes it true
+		// without one, and that is the larger change recorded in the milestone.
+		if size as usize > MAX_READ_BYTES {
+			return Err(FsError::TooLarge);
+		}
+		let mut out: Vec<u8> = Vec::new();
+		if out.try_reserve_exact(size as usize).is_err() {
+			return Err(FsError::NoMemory);
+		}
+		out.resize(size as usize, 0);
 		// The WHOLE contiguous run in one call. `fs-core` offers `read_blocks` precisely so a
 		// contiguous extent is one device round trip, and this looped a block at a time - which
 		// behind the IPC-backed block device the storage service hands over is a message per 2 KiB.
@@ -424,6 +550,12 @@ fn root_extent(desc: &[u8]) -> Option<(u32, u32)> {
 	if r[0] as usize != 34 || r[32] != 1 || r[33] != 0 {
 		return None;
 	}
+	// AND THE ROOT'S OWN VOLUME SEQUENCE NUMBER. Every ordinary record is checked for it and the
+	// root was not, so the one record that decides where the whole namespace begins was exempt from
+	// the rule the header states.
+	if both16(&r[28..32])? != 1 {
+		return None;
+	}
 	// Bit 1 of the file flags is the directory bit; the root is a directory or it is not the root.
 	if r[25] & 0x02 == 0 {
 		return None;
@@ -435,8 +567,8 @@ fn root_extent(desc: &[u8]) -> Option<(u32, u32)> {
 	Some((extent.checked_add(r[1] as u32)?, size))
 }
 
-// A type-2 descriptor is Joliet when its escape sequences select UCS-2 (%/@, %/C, %/E)
-// anywhere in the field - a descriptor may list several and UCS-2 need not be first.
+// A type-2 descriptor is Joliet when its escape sequences select UCS-2 (%/@, %/C, %/E) at the START
+// of its escape field.
 fn is_joliet(desc: &[u8]) -> bool {
 	// The escape sequence is written at the START of the field, not somewhere inside it.
 	//
@@ -450,9 +582,21 @@ fn is_joliet(desc: &[u8]) -> bool {
 
 // Parse a directory record: extent, length, dir flag, and the name (Joliet UCS-2, a Rock
 // Ridge NM entry, or plain 8.3 with the version suffix stripped). None on a short record.
-fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Option<Entry> {
+// `Ok(None)` for a record this reader legitimately ignores, `Ok(Some)` for a valid one, and
+// `Err(Corrupt)` for metadata that does not hold together.
+//
+// It returned `Option`, and both callers wrote `if let Some(e)` - so every semantic failure inside a
+// record was indistinguishable from "not a record" and the entry was SKIPPED. Both-endian halves
+// disagreeing, the XAR skip overflowing, a Volume Sequence Number other than 1, a Joliet identifier
+// of odd length or carrying a surrogate: each produced `None`, so `list()` returned a short listing
+// and reported success, and `find_entry` answered `NotFound` for a file whose record was present and
+// damaged. That is the original finding - a corrupt directory becoming a missing file - closed for
+// the record's outer length and left open for everything inside it.
+fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Result<Option<Entry>, FsError> {
+	// Shorter than a record header: not a record at all, which the sector walk already treats as
+	// corruption before it gets here.
 	if rec.len() < 33 {
-		return None;
+		return Err(FsError::Corrupt);
 	}
 	// an Extended Attribute Record occupies rec[1] blocks at the extent's START - the
 	// data follows it, and serving the XAR as content would be a silent misread (the
@@ -460,32 +604,36 @@ fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Option<Ent
 	// Both halves of the extent and the length, and a CHECKED skip past the Extended Attribute
 	// Record. `saturating_add` clamped to `u32::MAX`, which invents a value the medium never gave -
 	// the honest answer from a parser of untrusted media is a refusal.
-	let lba = both32(&rec[2..10])?.checked_add(rec[1] as u32)?;
-	let size = both32(&rec[10..18])?;
+	let lba = both32(&rec[2..10]).and_then(|lba| lba.checked_add(rec[1] as u32)).ok_or(FsError::Corrupt)?;
+	let size = both32(&rec[10..18]).ok_or(FsError::Corrupt)?;
 	// The Volume Sequence Number names the volume this extent lives on. Multi-volume sets are not
 	// supported here, and with one `BlockDevice` behind this reader an extent belonging to volume 2
 	// would be read at that LBA on whichever disc is in the drive. Volume 1 or nothing.
-	if both16(&rec[28..32])? != 1 {
-		return None;
+	if both16(&rec[28..32]).ok_or(FsError::Corrupt)? != 1 {
+		return Err(FsError::Corrupt);
 	}
 	let is_dir = rec[25] & 0x02 != 0;
 	// an associated file (flag 0x04) is a secondary stream recorded BEFORE its
 	// same-named main file - it must neither list (a duplicate name) nor match a
-	// lookup (it would shadow the main content).
+	// lookup (it would shadow the main content). IGNORED rather than refused: it is a
+	// legal record this reader has no use for, which is what `Ok(None)` is for.
 	if rec[25] & 0x04 != 0 {
-		return None;
+		return Ok(None);
 	}
 	// multi-extent (segments in further records) and interleaving (gap blocks woven
 	// into the extent) are forms the reader refuses rather than misreads.
 	let unsupported = rec[25] & 0x80 != 0 || rec[26] != 0 || rec[27] != 0;
 	let id_len = rec[32] as usize;
-	if 33 + id_len > rec.len() {
-		return None;
+	// A zero-length identifier is a record with no name. It used to yield an empty name and fall out
+	// through the skip path; for a parser whose stated threat model is hostile media that is a
+	// malformed record, not one to pass over.
+	if id_len == 0 || 33 + id_len > rec.len() {
+		return Err(FsError::Corrupt);
 	}
 	let id = &rec[33..33 + id_len];
 	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
-	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip)? };
-	Some(Entry { lba, size, is_dir, special, unsupported, name, case_sensitive })
+	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip).ok_or(FsError::Corrupt)? };
+	Ok(Some(Entry { lba, size, is_dir, special, unsupported, name, case_sensitive }))
 }
 
 // Decode an entry name. Joliet is big-endian UCS-2; otherwise a Rock Ridge NM entry in
@@ -530,13 +678,6 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, s
 	Some((s, false))
 }
 
-// Find a Rock Ridge "NM" name in a record's system-use area: entries are sig(2), len,
-// version, then NM's flags byte and the name bytes. None if there is no NM entry.
-// Continuation areas (CE) are not followed, a SUSP skip offset (SP) is not applied, and
-// deep-directory relocation (CL / PL / RE) is not interpreted - a name kept in a
-// continuation degrades cleanly to the shorter NM prefix or the 8.3 form, and a tree
-// mastered deeper than eight levels shows its relocation artifacts where the mastering
-// tool placed them (everything stays reachable).
 // The Rock Ridge name in a System Use Area, when RRIP is actually in use and the entries this
 // parser can follow are the only ones present.
 //
@@ -601,6 +742,80 @@ fn susp_skip_of(sys: &[u8]) -> Option<usize> {
 	None
 }
 
+// Walk a System Use Area entry by entry, calling `f` with each `(signature, body)`.
+//
+// SUSP is what makes the area shareable: independent extensions live in it side by side, each as
+// `sig(2) len version body`. Reading it any other way is guessing, and this reader was: `ER` was
+// found by scanning the raw bytes for the letters, so anything that happened to contain them - a
+// name, another extension's payload, padding - announced Rock Ridge.
+//
+// `ST` ends the area. A length below the four-byte header, or one that runs past the end, stops the
+// walk rather than sliding: a malformed entry means nothing after it can be located.
+fn for_each_susp(sys: &[u8], mut f: impl FnMut(&[u8; 2], &[u8])) {
+	let mut at = 0usize;
+	while at + 4 <= sys.len() {
+		let sig = [sys[at], sys[at + 1]];
+		let len = sys[at + 2] as usize;
+		if &sig == b"ST" {
+			return;
+		}
+		if len < 4 || at + len > sys.len() {
+			return;
+		}
+		f(&sig, &sys[at + 4..at + len]);
+		at += len;
+	}
+}
+
+// The `CE` continuation this area points at, as (block, offset within it, length).
+//
+// SUSP splits a system-use area across blocks when a directory record cannot hold it, which is the
+// ordinary case rather than an exotic one: `SP`, `PX` and `TF` leave no room for an `ER` naming
+// `IEEE_P1282`. The fields are both-endian pairs; the little-endian half is read, like every other
+// both-endian field in this reader.
+fn continuation_of(sys: &[u8]) -> Option<(u32, usize, usize)> {
+	let mut found = None;
+	for_each_susp(sys, |sig, body| {
+		if sig != b"CE" || body.len() < 24 || found.is_some() {
+			return;
+		}
+		let le = |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+		let (block, offset, len) = (le(0), le(8) as usize, le(16) as usize);
+		// A continuation has to fit in the block it names, or it is describing something else.
+		if offset >= SECTOR_SIZE || len == 0 || offset + len > SECTOR_SIZE {
+			return;
+		}
+		found = Some((block, offset, len));
+	});
+	found
+}
+
+// Does this System Use Area announce a Rock Ridge extension THIS READER IMPLEMENTS?
+//
+// `ER` is `LEN_ID, LEN_DES, LEN_SRC, EXT_VER` and then the identifier - and it is the IDENTIFIER
+// that says which extension is present. None of that was read: the test was
+// `sys.windows(2).any(|w| w == b"ER")`, which is satisfied by two bytes anywhere in the area. The
+// fixture written to cover it declared `LEN_ID = 1` inside a total length of 8 - exactly the
+// header, so the identifier it promised did not exist - and the parser turned Rock Ridge on for it.
+fn announces_rockridge(sys: &[u8]) -> bool {
+	let mut announced = false;
+	for_each_susp(sys, |sig, body| {
+		if sig != b"ER" || body.len() < 4 {
+			return;
+		}
+		let id_len = body[0] as usize;
+		// The identifier has to BE there, not merely be declared.
+		let Some(id) = body.get(4..4 + id_len) else { return };
+		// The versions of Rock Ridge whose `NM`, `CE`, `CL`, `PL` and `RE` this reader understands.
+		// An extension it does not implement must not switch the name source: reading somebody
+		// else's `NM` is the guess this whole check exists to remove.
+		if id == b"RRIP_1991A" || id == b"IEEE_P1282" || id == b"IEEE_1282" {
+			announced = true;
+		}
+	});
+	announced
+}
+
 // Split a `/`-separated path into (parent dir, final name); errors on an empty name.
 fn split_parent(path: &[u8]) -> Result<(&[u8], &[u8]), FsError> {
 	let path = path.strip_prefix(b"/").unwrap_or(path);
@@ -623,11 +838,6 @@ fn name_matches(entry: &Entry, want: &[u8]) -> bool {
 		return entry.name.as_bytes() == want;
 	}
 	entry.name.len() == want.len() && entry.name.bytes().zip(want).all(|(x, y)| x.eq_ignore_ascii_case(y))
-}
-
-// A little-endian u32 from a 4-byte slice; both-endian fields store LE first.
-fn le32(b: &[u8]) -> u32 {
-	u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 // A both-endian 32-bit field: little half, then big half, and they must AGREE.

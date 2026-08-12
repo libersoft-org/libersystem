@@ -326,9 +326,12 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 				// socket, `listen` a listener; a closed channel is dropped from the set.
 				let slot: usize = slot_of[ready];
 				let chan: u64 = clients[slot];
-				match recv_blocking(chan, &mut req) {
-					Received::Message { len, handle } => {
-						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+				match recv_caps_blocking(chan, &mut req) {
+					ReceivedCaps::Message { len, handles: mut caps } => {
+						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+						// over the single-handle receive, which keeps the first and drops the rest - so a
+						// client sending stdin, stdout and stderr had two destroyed before dispatch.
+						let mut handle = caps;
 						let mut new_sock: u64 = 0;
 						let mut new_sock_ci: usize = 0;
 						let mut new_client: u64 = 0;
@@ -366,7 +369,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 							place_client(&mut clients, new_client);
 						}
 					}
-					Received::Closed => {
+					ReceivedCaps::Closed => {
 						close(chan);
 						clients[slot] = 0;
 					}
@@ -407,9 +410,12 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 	unsafe {
 		let chan: u64 = slot.chan;
 		let ci: usize = slot.ci;
-		match recv_blocking(chan, req) {
-			Received::Message { len, handle } => {
-				let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+		match recv_caps_blocking(chan, req) {
+			ReceivedCaps::Message { len, handles: mut caps } => {
+				// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+				// over the single-handle receive, which keeps the first and drops the rest - so a
+				// client sending stdin, stdout and stderr had two destroyed before dispatch.
+				let mut handle = caps;
 				let op: u16 = if len >= 2 { u16::from_le_bytes([req[0], req[1]]) } else { 0 };
 				let mut closing: bool = false;
 				{
@@ -456,7 +462,7 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 				}
 			}
 			// The client dropped its socket without calling close(): tear it down.
-			Received::Closed => {
+			ReceivedCaps::Closed => {
 				teardown_socket(slot, frames, stack, rx, tx);
 			}
 		}

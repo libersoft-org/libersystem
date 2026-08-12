@@ -1055,6 +1055,13 @@ impl proto::codec::Transport for DrillTransport<'_> {
 			}
 		}
 	}
+
+	// Same reason as `DeadlineTransport`: these came from the kernel, so nothing else closes them.
+	fn discard_handles(&mut self, handles: &[u64]) {
+		for &handle in handles {
+			unsafe { close(handle) };
+		}
+	}
 }
 
 // Sleep for `ticks` by waiting on the never-written `park` channel until the deadline

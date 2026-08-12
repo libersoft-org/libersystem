@@ -29,10 +29,29 @@ impl ProcessInfo {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<ProcessInfo> {
-		ProcessInfo::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = ProcessInfo::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<ProcessInfo> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProcessInfo::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u64(self.koid)?;
@@ -64,10 +83,29 @@ impl StartResult {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<StartResult> {
-		StartResult::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = StartResult::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<StartResult> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = StartResult::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.set_handle(self.task)?;
@@ -151,7 +189,10 @@ pub mod process {
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:process")?;
 			w.u32(1)?;
-			*reply_handles = Handles::from_slice(writer.handles());
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
 			return Some(writer.pos());
 		}
 		match op {
@@ -179,7 +220,10 @@ pub mod process {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -220,7 +264,10 @@ pub mod process {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -260,7 +307,10 @@ pub mod process {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -301,7 +351,10 @@ pub mod process {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -342,7 +395,10 @@ pub mod process {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -382,7 +438,10 @@ pub mod process {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -418,7 +477,10 @@ pub mod process {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -432,7 +494,10 @@ pub mod process {
 			}
 			_ => return None,
 		}
-		*reply_handles = Handles::from_slice(writer.handles());
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
 		Some(writer.pos())
 	}
 
@@ -482,7 +547,7 @@ pub mod process {
 			w.u16(OP_START)?;
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
@@ -506,7 +571,7 @@ pub mod process {
 			let w = &mut writer;
 			w.u16(OP_LIST)?;
 			w.u32(corr)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
@@ -544,7 +609,7 @@ pub mod process {
 			w.bytes_lp(name.as_bytes())?;
 			w.set_handle(*bootstrap)?;
 			w.u32(0)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
@@ -572,7 +637,7 @@ pub mod process {
 			w.u64(*memory_limit)?;
 			w.set_handle(*bootstrap)?;
 			w.u32(0)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
@@ -596,7 +661,7 @@ pub mod process {
 			let w = &mut writer;
 			w.u16(OP_ACCOUNTING)?;
 			w.u32(corr)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
@@ -634,7 +699,7 @@ pub mod process {
 			w.bytes_lp(name.as_bytes())?;
 			w.set_handle(*bootstrap)?;
 			w.u32(0)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
@@ -659,7 +724,7 @@ pub mod process {
 			w.u16(OP_RELEASE)?;
 			w.u32(corr)?;
 			w.u64(*koid)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;

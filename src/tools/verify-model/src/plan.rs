@@ -71,6 +71,15 @@ pub struct Plan {
 	pub architectures_built: Vec<String>,
 	pub architectures_booted: Vec<String>,
 	pub items: Vec<PlanItem>,
+	// WHICH EDGES the selection walked to reach what it selected.
+	//
+	// Recorded so a shadow record can say what it is evidence ABOUT. `Store::evaluate` counts clean
+	// runs and clean architectures and nothing else, because the criteria the design asked for -
+	// every change class exercised, every edge kind exercised - cannot be written before there are
+	// records to grade. That is a good reason not to write the policy yet and no reason to keep
+	// discarding the data: every run that happens before this lands is a record that can never be
+	// graded against those criteria when they are written.
+	pub edge_kinds: Vec<String>,
 	// Set when every changed path is declared non-code. Distinct from an empty plan for any other
 	// reason, which cannot happen: this is the only way out with nothing to run.
 	pub nothing_to_do: bool,
@@ -155,6 +164,10 @@ impl<'a> Planner<'a> {
 		let nothing_to_do = !full && seeds.is_empty() && non_code == changed.len() && !changed.is_empty();
 		let reached = self.graph.affected_with_reasons(&seeds);
 		let affected: BTreeSet<String> = reached.keys().cloned().collect();
+		// The edge kinds this walk actually traversed, so a shadow record can say which parts of the
+		// graph its evidence covers. A component reached through `link.dynamic` proves nothing about
+		// `generation.build`.
+		let edge_kinds: Vec<String> = reached.values().flatten().map(|edge| edge.kind.clone()).collect::<BTreeSet<String>>().into_iter().collect();
 		// How each one was reached, which decides what has to happen because of it.
 		let reach = self.graph.affected_by_reach(&seeds);
 
@@ -300,7 +313,7 @@ impl<'a> Planner<'a> {
 			return self.full_plan(paths, seeds, affected, vec![String::from("an empty selection for a change with owned paths")], warnings);
 		}
 
-		Plan { full, full_reasons, paths, changed_components: seeds.into_iter().collect(), affected_components: affected.into_iter().collect(), architectures_built: built.into_iter().collect(), architectures_booted: booted.into_iter().collect(), items, nothing_to_do, warnings }
+		Plan { full, full_reasons, paths, changed_components: seeds.into_iter().collect(), affected_components: affected.into_iter().collect(), architectures_built: built.into_iter().collect(), architectures_booted: booted.into_iter().collect(), items, edge_kinds, nothing_to_do, warnings }
 	}
 
 	// Why this check is in the plan, or None for "it is not".
@@ -376,7 +389,7 @@ impl<'a> Planner<'a> {
 			}
 		}
 		items.sort_by(|left, right| left.key.cmp(&right.key));
-		Plan { full: true, full_reasons: reasons, paths, changed_components: seeds.into_iter().collect(), affected_components: affected.into_iter().collect(), architectures_built: all.clone(), architectures_booted: all, items, nothing_to_do: false, warnings }
+		Plan { full: true, full_reasons: reasons, paths, changed_components: seeds.into_iter().collect(), affected_components: affected.into_iter().collect(), architectures_built: all.clone(), architectures_booted: all, items, edge_kinds: Vec::new(), nothing_to_do: false, warnings }
 	}
 }
 

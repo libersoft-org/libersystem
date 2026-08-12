@@ -95,7 +95,8 @@ pub struct Element {
 }
 
 // A parsed module. `memory_min_pages` is the declared minimum of the single memory
-// (0 if the module declares none); one page is 64 kB.
+// (0 if the module declares none) and `memory_max_pages` its declared maximum, if any; one page is
+// 64 kB.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Module {
 	pub types: Vec<FuncType>,
@@ -103,6 +104,9 @@ pub struct Module {
 	pub funcs: Vec<Func>,
 	pub exports: Vec<Export>,
 	pub memory_min_pages: u32,
+	// The declared maximum, when the module states one. Parsed and thrown away until 2026-08-12,
+	// which is why `memory.grow` could not honour it.
+	pub memory_max_pages: Option<u32>,
 	pub globals: Vec<Global>,
 	pub data: Vec<DataSegment>,
 	pub table: Option<Table>,

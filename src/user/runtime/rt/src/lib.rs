@@ -1070,6 +1070,39 @@ pub unsafe fn try_recv(channel: u64, buf: &mut [u8]) -> Polled {
 	}
 }
 
+// What a capability-aware POLL answers. The blocking sibling is `recv_caps_blocking`; this is for
+// the loops that poll several channels themselves rather than parking in one.
+pub enum PolledCaps {
+	Message { len: usize, handles: wire::Handles },
+	Empty,
+	Closed,
+}
+
+// `try_recv` that takes EVERY capability the message carried. Same reason as `recv_caps_blocking`:
+// a typed dispatch reached through the single-handle receive loses whatever the client sent past
+// the first.
+pub unsafe fn try_recv_caps(channel: u64, buf: &mut [u8]) -> PolledCaps {
+	unsafe {
+		let mut raw = [0u64; MAX_MESSAGE_CAPS];
+		let (len, count) = recv_message_caps(channel, buf, &mut raw);
+		if len == ERR_WOULD_BLOCK {
+			return PolledCaps::Empty;
+		}
+		if len < 0 {
+			return PolledCaps::Closed;
+		}
+		match wire::Handles::try_from_array(&raw, count) {
+			Some(handles) => PolledCaps::Message { len: len as usize, handles },
+			None => {
+				for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
+					close(handle);
+				}
+				PolledCaps::Closed
+			}
+		}
+	}
+}
+
 // Send `bytes` (and optionally one transferred handle) to the peer, blocking in
 // `wait` (WAIT_WRITABLE) while the queue is full - real backpressure, not a yield
 // spin. Returns true on delivery. A handle without the WAIT right (an attenuated
@@ -1425,9 +1458,12 @@ where
 {
 	unsafe {
 		loop {
-			match recv_blocking(service, request) {
-				Received::Message { len, .. } if len == 0 => break,
-				Received::Message { len, handle } => {
+			// THROUGH THE CAPABILITY-AWARE RECEIVE. See `recv_caps_blocking`: the single-handle
+			// syscall takes the first capability and drops the rest, so a client sending stdin,
+			// stdout and stderr had two destroyed before dispatch was reached.
+			match recv_caps_blocking(service, request) {
+				ReceivedCaps::Message { len, .. } if len == 0 => break,
+				ReceivedCaps::Message { len, mut handles } => {
 					// the reserved heartbeat probe: answer it uniformly without invoking the
 					// typed dispatch, so the supervisor's watchdog can prove this service is
 					// still responsive (a service wedged inside a request never returns here
@@ -1437,7 +1473,6 @@ where
 						continue;
 					}
 					let mut reply_handles = wire::Handles::new();
-					let mut handles = if handle == 0 { wire::Handles::new() } else { wire::Handles::from_slice(&[handle]) };
 					if let Some(n) = handle_request(&request[..len], &mut handles, reply, &mut reply_handles) {
 						if !send_caps_blocking(service, &reply[..n], reply_handles.as_slice()) {
 							for &leftover in reply_handles.as_slice() {
@@ -1455,7 +1490,7 @@ where
 						}
 					}
 				}
-				Received::Closed => break,
+				ReceivedCaps::Closed => break,
 			}
 		}
 	}
@@ -1533,16 +1568,18 @@ where
 			}
 			let idx: usize = ready as usize;
 			let chan: u64 = chans[idx];
-			match recv_blocking(chan, request) {
+			// The capability-aware receive here too - `serve_multi_ticked` had the same defect as
+			// `serve`, and for the same reason: `SYS_CHANNEL_RECV` keeps one and drops the rest.
+			match recv_caps_blocking(chan, request) {
 				// the empty quit sentinel: the root ends the service, a sub-client drops.
-				Received::Message { len, .. } if len == 0 => {
+				ReceivedCaps::Message { len, .. } if len == 0 => {
 					if idx == 0 {
 						break;
 					}
 					close(chan);
 					chans.swap_remove(idx);
 				}
-				Received::Message { len, handle } => {
+				ReceivedCaps::Message { len, mut handles } => {
 					if len >= 2 && u16::from_le_bytes([request[0], request[1]]) == HEARTBEAT_OP {
 						// the reserved heartbeat probe: answer uniformly, like serve (above).
 						send_blocking(chan, b"PONG", 0);
@@ -1562,7 +1599,6 @@ where
 						// The request's capabilities go in as a list and whatever the dispatch
 						// did NOT consume comes back in the same one, so a capability the
 						// schema never accounted for is closed here instead of leaking.
-						let mut handles = if handle == 0 { wire::Handles::new() } else { wire::Handles::from_slice(&[handle]) };
 						if let Some(n) = handle_request(chan, &request[..len], &mut handles, reply, &mut reply_handles) {
 							if !send_caps_blocking(chan, &reply[..n], reply_handles.as_slice()) {
 								for &leftover in reply_handles.as_slice() {
@@ -1581,7 +1617,7 @@ where
 						}
 					}
 				}
-				Received::Closed => {
+				ReceivedCaps::Closed => {
 					if idx == 0 {
 						break;
 					}
@@ -1997,6 +2033,49 @@ pub unsafe fn send_caps(channel: u64, bytes: &[u8], handles: &[u64]) -> i64 {
 	unsafe { syscall(SYS_CHANNEL_SEND_CAPS, channel, bytes.as_ptr() as u64, bytes.len() as u64, packed.as_ptr() as u64) as i64 }
 }
 
+// What a CAPABILITY-AWARE blocking receive answers: a message with its bytes and every capability
+// it carried, or Closed once the peer is gone.
+pub enum ReceivedCaps {
+	Message { len: usize, handles: wire::Handles },
+	Closed,
+}
+
+// Receive one message into `buf`, blocking while the channel is empty, and TAKE EVERY CAPABILITY.
+//
+// THE ONE PRIMITIVE EVERY TYPED SERVER USES. `serve` and `serve_multi_ticked` called
+// `recv_blocking` - `SYS_CHANNEL_RECV`, whose own kernel comment says it "takes the first and drops
+// the rest" - and then built `Handles::from_slice(&[handle])`. So a client that legitimately sent
+// stdin, stdout and stderr had two of them DESTROYED before the server's dispatch was reached: not
+// refused, destroyed. Eleven hand-written dispatch loops did the same thing for the same reason.
+//
+// The single-handle receive stays for bootstrap and stream messages, which carry at most one by
+// construction. A typed path may not use it, and `check-single-cap-receive.sh` is what keeps a new
+// one from appearing.
+pub unsafe fn recv_caps_blocking(channel: u64, buf: &mut [u8]) -> ReceivedCaps {
+	unsafe {
+		let mut raw = [0u64; MAX_MESSAGE_CAPS];
+		loop {
+			let (len, count) = recv_message_caps(channel, buf, &mut raw);
+			if len == ERR_WOULD_BLOCK {
+				wait(channel, 0);
+				continue;
+			}
+			if len < 0 {
+				return ReceivedCaps::Closed;
+			}
+			// The kernel cannot report more than it is allowed to transfer, so this cannot fail -
+			// and if it ever did, closing what arrived beats handing on a truncated list.
+			let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
+				for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
+					close(handle);
+				}
+				return ReceivedCaps::Closed;
+			};
+			return ReceivedCaps::Message { len: len as usize, handles };
+		}
+	}
+}
+
 // Receive one message and take every capability it carried, writing them into `handles` and
 // returning (bytes, count). The ordinary receive takes the first and drops the rest, which is
 // right for a receiver expecting one and silent loss for a receiver expecting more.
@@ -2103,7 +2182,15 @@ pub unsafe fn recv_vec_caps_blocking(channel: u64, out: &mut wire::Handles) -> R
 				return ReceivedVecCaps::Closed;
 			}
 			bytes.truncate(len as usize);
-			*out = wire::Handles::from_array(&handles, count);
+			// The kernel cannot report more than it may transfer, so this cannot fail; closing what
+			// arrived beats handing on a truncated list if it ever did.
+			let Some(taken) = wire::Handles::try_from_array(&handles, count) else {
+				for &handle in handles[..count.min(MAX_MESSAGE_CAPS)].iter() {
+					close(handle);
+				}
+				return ReceivedVecCaps::Closed;
+			};
+			*out = taken;
 			return ReceivedVecCaps::Message { bytes };
 		}
 	}

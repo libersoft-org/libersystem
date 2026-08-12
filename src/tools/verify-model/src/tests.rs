@@ -642,20 +642,51 @@ fn trust_needs_evidence_from_more_than_one_target() {
 	// architecture policy makes exactly that the steady state.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
 	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
-		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: String::from("x86_64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: String::from("x86_64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: true });
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("one target is not enough");
 	assert!(error.contains("target(s)"), "{error}");
-	log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: String::from("riscv64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+	log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: String::from("riscv64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: true, model_self_check: true });
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
+}
+
+#[test]
+fn every_comparison_on_record_being_dry_is_not_evidence_that_running_the_selection_works() {
+	// A dry shadow answers "did the selector choose the right set S" and never runs S. This
+	// milestone contains the proof that the second question is not theoretical: in an intermediate
+	// state the planner emitted Rust function names while the runner had moved to explicit stable
+	// IDs, so every selection was computed CORRECTLY and none of them could be executed - and every
+	// dry comparison stayed clean throughout. The defect was found by hand.
+	//
+	// One sample per universe, not one per run: a sample costs a second full sweep, and what it
+	// establishes is a property of the execution mechanism rather than of the change.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	let record = |architecture: &str, exec: bool| crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true };
+	for architecture in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"] {
+		log.records.push(record(architecture, false));
+	}
+	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("six dry comparisons are six answers to the other question");
+	assert!(error.contains("EXECUTED"), "{error}");
+	log.records.push(record("x86_64", true));
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok(), "one sample is the requirement");
+
+	// The Host universe has no execution producer, so requiring what nothing can supply would make
+	// it permanently untrustable rather than honestly graded. It is exempt, in one place, until it
+	// has one.
+	let mut host = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
+		host.records.push(crate::shadow::Record { universe: crate::shadow::Universe::Host, architecture: String::from("host"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: true });
+	}
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &host).is_ok());
 }
 
 #[test]
 fn evidence_under_another_model_does_not_count() {
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
 	for architecture in ["x86_64", "riscv64", "aarch64", "x86_64", "riscv64", "aarch64"] {
-		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("an-older-model"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 });
+		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("an-older-model"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: true });
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	assert!(store.evaluate("audio", "the-current-model", crate::shadow::Universe::TestGuest, &log).is_err(), "six clean runs under a model that is not the one running prove nothing about the one that is");
@@ -716,7 +747,9 @@ fn only_a_consistent_verdict_counts_as_clean_evidence() {
 	// Five clean comparisons on x86_64 and one riscv64 run that FOUND something used to satisfy
 	// "evidence from two targets", so a certificate could be earned on the strength of a failure.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
-	let record = |architecture: &str, verdict: &str| crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: verdict.to_string(), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 };
+	// `shadow_exec` on every record: this test is about the VERDICT filter, and leaving the
+	// execution-sample requirement unmet would make it pass for the wrong reason.
+	let record = |architecture: &str, verdict: &str| crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: verdict.to_string(), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: true, model_self_check: true };
 	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
 		log.records.push(record("x86_64", "Consistent"));
 	}
@@ -1003,6 +1036,59 @@ fn a_dev_dependency_is_not_runtime_reach() {
 }
 
 #[test]
+fn a_comparison_made_by_a_model_that_failed_its_own_checks_is_not_evidence() {
+	// The one criterion out of the design's list that needs no accumulated records to grade, because
+	// it is a property of each record on its own. A selection computed by a model that contradicts
+	// itself, compared against a sweep derived from the same model, says nothing about the tree -
+	// "the selection matched" is two wrong answers agreeing.
+	//
+	// Change classes, edge kinds, the regression corpus and SHADOW-EXEC stay uncounted, and for the
+	// stated reason: they need a log with entries in it and would be guesswork before that.
+	let mut log = crate::shadow::Log::default();
+	let record = |self_check: bool, architecture: &str| crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: self_check };
+	for architecture in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"] {
+		log.records.push(record(false, architecture));
+	}
+	let store = crate::trust::Store::default();
+	assert_eq!(log.clean_runs_for("audio", "hash-a", crate::shadow::Universe::TestGuest), 0, "six comparisons, none of them by a model entitled to make one");
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_err());
+
+	// The same six, made by a model that passed - and one of them carrying an execution sample,
+	// which `evaluate` also requires in this universe.
+	log.records.clear();
+	for architecture in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"] {
+		log.records.push(record(true, architecture));
+	}
+	log.records[0].shadow_exec = true;
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
+}
+
+#[test]
+fn a_clause_is_the_word_standing_alone_and_not_the_letters_inside_a_name() {
+	// A test name is part of the argument list, and `arguments.find("covers")` finds those six
+	// letters wherever they are. `the_lifecycle_guard_covers_the_whole_operation_...` matched inside
+	// its OWN NAME; the search for the following `[` then found the tag list, and the test was
+	// recorded as covering `Kernel`, `Memory` and `Dma` - three components it never declared and
+	// cannot reach. `every_annotation_in_this_tree_is_reachable` failed on it, correctly, for a
+	// reason that had nothing to do with the annotation.
+	let declaration = r#"crate::tagged_test!(the_lifecycle_guard_covers_the_whole_operation_and_not_just_its_first_line, [Kernel, Memory, Dma], id = "kernel.object.process.the_lifecycle_guard_covers", covers = ["kernel"]);"#;
+	let parsed = crate::kerneltests::parse_declarations(declaration);
+	assert_eq!(parsed.len(), 1);
+	let (name, id, covers) = &parsed[0];
+	assert_eq!(name, "the_lifecycle_guard_covers_the_whole_operation_and_not_just_its_first_line");
+	assert_eq!(id, "kernel.object.process.the_lifecycle_guard_covers");
+	assert_eq!(covers, &vec![String::from("kernel")], "the covers clause, not the tag list next to a name that contains the word");
+
+	// The same trap one letter smaller: `id` inside `valid`, `width`, `hidden`. And a declaration
+	// with no covers clause at all still reads as none rather than as the tags.
+	let declaration = r#"tagged_test!(a_hidden_field_is_still_valid, [Kernel, Storage], id = "kernel.hidden");"#;
+	let parsed = crate::kerneltests::parse_declarations(declaration);
+	assert_eq!(parsed.len(), 1);
+	assert_eq!(parsed[0].1, "kernel.hidden");
+	assert!(parsed[0].2.is_empty(), "no covers clause is no covers, not the tags");
+}
+
+#[test]
 fn every_annotation_in_this_tree_is_reachable() {
 	let model = model();
 	let mut bad = Vec::new();
@@ -1084,7 +1170,9 @@ fn product_reach_wins_over_test_build_reach() {
 #[test]
 fn evidence_in_one_universe_does_not_vouch_for_another() {
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
-	let record = |architecture: &str, universe: crate::shadow::Universe| crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0 };
+	// The execution sample is present, because this test is about the UNIVERSE dimension and an
+	// unmet requirement elsewhere would make it pass without exercising it.
+	let record = |architecture: &str, universe: crate::shadow::Universe| crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: true, model_self_check: true };
 	for architecture in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"] {
 		log.records.push(record(architecture, crate::shadow::Universe::TestGuest));
 	}
@@ -1103,9 +1191,19 @@ fn a_check_id_says_which_universe_judges_it() {
 	use crate::shadow::Universe;
 	assert_eq!(Universe::of("kernel.frame_alloc_distinct"), Universe::TestGuest);
 	assert_eq!(Universe::of("dev.selftest"), Universe::DevGuest);
-	for host in ["host.flac", "gate.volume-layout", "build.kernel", "conformance.png"] {
+	for host in ["host.flac", "gate.volume-layout", "conformance.png"] {
 		assert_eq!(Universe::of(host), Universe::Host, "{host} runs on the host");
 	}
+	// A BUILD IS ITS OWN UNIVERSE, and it used to be filed under `Host` with the rest.
+	//
+	// The Host producer deliberately excludes builds - re-running three architectures' builds to
+	// answer "did anything outside the selection fail" costs more than the sweep it is compared
+	// against - so its evidence covers gates, suites and conformance. Issuing that evidence's
+	// certificate for a universe that also contained builds meant a selector defect dropping
+	// `build.user` could not be observed, and five clean runs later the component was TRUSTED for it
+	// anyway. A universe's certificate may not be broader than the evidence behind it.
+	assert_eq!(Universe::of("build.kernel"), Universe::HostBuild, "a build is judged by evidence about builds, of which there is none yet");
+	assert_eq!(Universe::of("build.user"), Universe::HostBuild);
 }
 
 #[test]
@@ -1144,23 +1242,78 @@ fn the_host_universe_has_a_producer_and_its_results_parse() {
 	// The host runner writes its results directly rather than being scraped out of a serial log: it
 	// knows each check's id and its exit status, and saying so is cheaper and less fragile than
 	// parsing prose.
-	let results = crate::shadow::parse_host_log("gate.test-tags PASS\nhost.flac FAIL\nconformance.png PASS\ntotal 3\n");
+	// THE WHOLE KEY per line. `id PASS` collapsed two variants of one check into one entry while
+	// `total` counted both, so the declared total and the number of outcomes disagreed and nothing
+	// said so.
+	let log = "gate.test-tags\thost\thost\tdefault\tPASS\nhost.flac\thost\thost\tdefault\tFAIL\nconformance.png\thost\thost\tdefault\tPASS\ntotal 3\n";
+	let results = crate::shadow::parse_host_log(log);
 	assert_eq!(results.total_declared, Some(3), "a run that covered fewer checks than exist did not compare what it claims to");
-	assert_eq!(results.outcomes.get("host.flac"), Some(&crate::shadow::Outcome::Failed));
-	assert_eq!(results.outcomes.get("gate.test-tags"), Some(&crate::shadow::Outcome::Passed));
+	assert!(results.duplicates.is_empty(), "nothing in this log repeats a key");
+	let key = |check: &str, configuration: &str| crate::plan::PlanItemKey { check: String::from(check), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from(configuration) };
+	assert_eq!(results.outcomes.get(&key("host.flac", "default")), Some(&crate::shadow::Outcome::Failed));
+	assert_eq!(results.outcomes.get(&key("gate.test-tags", "default")), Some(&crate::shadow::Outcome::Passed));
 
 	// A failure INSIDE the selection is the selector working; one OUTSIDE it is the candidate miss
 	// the whole mechanism exists to find. The host ids are the catalog's own, with no prefix to
 	// strip - the guest's `kernel.` prefix is a property of that universe, not of comparison.
 	let history = crate::history::History::default();
-	let key = |check: &str| crate::plan::PlanItemKey { check: String::from(check), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from("default") };
 
-	let inside = crate::shadow::compare_host(&[key("host.flac")], &results, &history);
+	let inside = crate::shadow::compare_host(&[key("host.flac", "default")], &results, &history);
 	assert!(inside.outside_failures.is_empty(), "the only failure was selected: {:?}", inside.outside_failures);
 	assert!(!inside.inside_failures.is_empty(), "and it must be reported as selected");
 
-	let outside = crate::shadow::compare_host(&[key("gate.test-tags")], &results, &history);
+	let outside = crate::shadow::compare_host(&[key("gate.test-tags", "default")], &results, &history);
 	assert_eq!(outside.verdict, crate::shadow::Verdict::CandidateMiss, "a failure the selection did not name is exactly what a shadow is for");
+}
+
+#[test]
+fn a_shadow_record_says_what_it_is_evidence_about() {
+	// `Store::evaluate` counts clean runs and clean architectures, and the criteria the design asked
+	// for - every change class exercised, every edge kind exercised, a SHADOW-EXEC sample - cannot be
+	// written before there are records to grade. That is a reason not to write the policy yet and no
+	// reason to keep throwing the data away: a run recorded without these can never be graded against
+	// the criteria when they arrive.
+	let model = model();
+	let ownership = model.ownership();
+	let planner = Planner::for_model(&model, &ownership);
+	let plan = planner.plan(&[String::from("src/user/libs/audio/flac/src/lib.rs")]);
+	assert!(!plan.edge_kinds.is_empty(), "a change that reaches anything traversed at least one edge");
+	assert!(plan.edge_kinds.iter().all(|kind| !kind.is_empty()), "an edge kind is a name, not a blank");
+
+	// And a record written before the fields existed still loads, reading as "said nothing" rather
+	// than being dropped - there are records on disk from before today.
+	let old = r#"{"schema":1,"records":[{"universe":"TestGuest","architecture":"x86_64","verdict":"Consistent","reason":"","model_hash":"h","source_digest":"d","changed_components":["flac"],"outside_failures":[],"at":0}]}"#;
+	let log: crate::shadow::Log = serde_json::from_str(old).expect("a record from before the dimensions existed still parses");
+	assert_eq!(log.records.len(), 1);
+	assert!(log.records[0].change_kinds.is_empty(), "it said nothing about change classes, and says so");
+	assert!(!log.records[0].shadow_exec, "and no sample accompanied it");
+}
+
+#[test]
+fn two_configurations_of_one_check_are_two_results() {
+	// The defect this closes: `proto` is host-tested under default features AND under
+	// `shared-image`, because those two builds do not contain the same dependencies. Keyed on the
+	// check's name alone the second line overwrote the first - so a `shared-image` failure could be
+	// erased by a `default` pass, while `total` still counted two.
+	let log = "host.proto\thost\thost\tdefault\tPASS\nhost.proto\thost\thost\tshared-image\tFAIL\ntotal 2\n";
+	let results = crate::shadow::parse_host_log(log);
+	assert_eq!(results.outcomes.len(), 2, "two configurations of one check are two outcomes, not one");
+	assert_eq!(results.total_declared, Some(2));
+	assert!(results.duplicates.is_empty());
+	let key = |configuration: &str| crate::plan::PlanItemKey { check: String::from("host.proto"), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from(configuration) };
+	assert_eq!(results.outcomes.get(&key("default")), Some(&crate::shadow::Outcome::Passed));
+	assert_eq!(results.outcomes.get(&key("shared-image")), Some(&crate::shadow::Outcome::Failed), "the failing variant must survive the passing one");
+
+	// And selecting one configuration does not account for the other.
+	let history = crate::history::History::default();
+	let comparison = crate::shadow::compare_host(&[key("default")], &results, &history);
+	assert_eq!(comparison.verdict, crate::shadow::Verdict::CandidateMiss, "the shared-image failure was outside the selection");
+
+	// A producer that emitted one key twice compared something other than what it counted, and
+	// that is a void comparison rather than a quiet overwrite.
+	let repeated = crate::shadow::parse_host_log("host.proto\thost\thost\tdefault\tPASS\nhost.proto\thost\thost\tdefault\tFAIL\ntotal 2\n");
+	assert_eq!(repeated.duplicates.len(), 1, "a repeated key is reported, not absorbed");
+	assert_eq!(crate::shadow::compare_host(&[], &repeated, &history).verdict, crate::shadow::Verdict::Void);
 }
 
 #[test]

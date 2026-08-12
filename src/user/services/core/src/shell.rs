@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
-use proto::system::{Component, EnvVar, JobEntry, JobInfo, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{Component, EnvVar, Error, JobEntry, JobInfo, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
 use services::shell_language::{Pipeline, parse_and_expand, parse_assignment, parse_pipeline, trim};
@@ -1677,8 +1677,8 @@ fn bin_names(storage: u64) -> Vec<Vec<u8>> {
 	match client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
 		// Name completion: offering fewer names claims nothing, so an abnormal drain
 		// degrades to none rather than failing the shell.
-		Some(consumer) => unsafe { drain_stream_complete(consumer, volume::list_read) }.unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
-		None => Vec::new(),
+		Some(Ok(consumer)) => unsafe { drain_stream_complete(consumer, volume::list_read) }.unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect(),
+		Some(Err(_)) | None => Vec::new(),
 	}
 }
 
@@ -1711,7 +1711,7 @@ fn completion_dir_entries(cwd: &str, token: &[u8], storage: u64, media: u64, iso
 	let chan: u64 = path::volume_client(cwd, dir_arg, storage, media, iso, udf, usb);
 	let mut client = volume::Client::new(ChannelTransport { chan });
 	let mut names: Vec<Vec<u8>> = Vec::new();
-	if let Some(consumer) = client.list(&target) {
+	if let Some(Ok(consumer)) = client.list(&target) {
 		for f in unsafe { drain_stream_complete(consumer, volume::list_read) }.unwrap_or_default() {
 			let mut name: Vec<u8> = f.name.into_bytes();
 			if f.r#type == proto::system::FileType::Dir {
@@ -1756,7 +1756,7 @@ unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media
 		let chan: u64 = storage_for(target.as_bytes(), storage, media, iso, udf, usb);
 		let mut client = volume::Client::new(ChannelTransport { chan });
 		match client.list(&target) {
-			Some(consumer) => {
+			Some(Ok(consumer)) => {
 				// a valid directory is enough - drain the entry stream unused.
 				let _ = drain_stream_complete(consumer, volume::list_read);
 				cwd.clear();
@@ -1766,6 +1766,21 @@ unsafe fn cd_cmd(cwd: &mut String, arg: &[u8], session: u64, storage: u64, media
 				if session != 0 {
 					let _ = session::Client::new(ChannelTransport { chan: session }).chdir(&target);
 				}
+			}
+			// THE REASON, now that there is one. `cd` into a path outside the grant used to print
+			// "not a directory", which is what a client can say when its only signal is "no
+			// stream" - and it is the wrong thing to tell somebody whose path exists and is
+			// refused.
+			Some(Err(e)) => {
+				print(b"cd: ");
+				print(match e {
+					Error::Denied => b"permission denied: ".as_slice(),
+					Error::NotFound => b"no such directory: ".as_slice(),
+					Error::Again => b"volume busy: ".as_slice(),
+					_ => b"not a directory: ".as_slice(),
+				});
+				print(target.as_bytes());
+				print(b"\n");
 			}
 			None => {
 				print(b"cd: not a directory: ");

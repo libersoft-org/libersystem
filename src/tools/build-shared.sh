@@ -606,13 +606,61 @@ source_path() {
 	printf '%s\n' "${source_owners[$owner]}"
 }
 
+# The dirs file `local_dependency_source_digest` reads for a library crate. Named after the crate's
+# DIRECTORY rather than a package, because a library row carries kind/artifact/crate/stage/
+# destination/features/providers and no package column - which is what stopped this being written
+# the first time.
+closure_key() {
+	local crate_dir="$1"
+	printf 'closure-%s\n' "${crate_dir//\//_}"
+}
+
+# Every local crate a library compiles against, itself included.
+#
+# A SHARED LIBRARY'S CACHE KEY HAS TO INCLUDE ITS DEPENDENCIES, and it did not. `provider_source_sha`
+# was `source_digest "$crate_dir"` - the library's own directory alone - so changing `abi` left
+# `lsrt.lslib` a cache hit, every executable relinked against a runtime still compiled at the old
+# revision, and the guest refused them at startup. One missed invalidation silently reverted a change
+# for the whole userspace, and the only thing that noticed was a constant whose entire job is to
+# notice.
+#
+# ASKED OF CARGO, not walked. A hand-rolled walk over `path = "..."` was written first and measured
+# against cargo across all 111 crates in the tree: 40 disagreed. It could not tell a dependency from
+# a `[dev-dependencies]` or an `optional` one, and it does not follow workspace members. Cargo is
+# also what the EXECUTABLE closure already uses, so asking it here means the two halves of the build
+# answer the same question the same way rather than agreeing by coincidence.
+#
+# `--all-features`, deliberately. An optional dependency is a real compile input for any row that
+# enables its feature - `time-proto` reaches `ipc-client` and `rt` through `shared-image` - and this
+# runs before the rows are read, so one over-inclusive answer per crate serves all of them. Erring
+# wide costs a rebuild; erring narrow costs the defect this whole function exists to remove.
+#
+# The cost was measured rather than assumed, because it lands on the incremental path: one call is
+# 0.137 s and there are 62 library owners, which is 8 s in sequence and 0.48 s across `nproc`.
+library_closure_file() {
+	local dir="$1"
+	local out="$source_metadata_dir/$(closure_key "$dir").dirs"
+	(cd "$root" && cargo metadata --format-version 1 --all-features --manifest-path "$root/$dir/Cargo.toml") |
+		jq -r --arg root "$root" '.packages[] | select(.source == null) | .manifest_path | sub("/Cargo.toml$"; "") | sub("^" + $root + "/"; "")' |
+		sort -u >"$out"
+	# A crate always contains itself, so an empty answer means cargo failed. Said out loud, because
+	# the alternative is a closure digest over nothing - a constant, which is a cache that never
+	# invalidates: the exact defect this replaced, restored quietly.
+	if [[ ! -s "$out" ]]; then
+		echo "build-shared: could not read the dependency closure of $dir" >&2
+		return 1
+	fi
+}
+
 declare -A source_file_hashes=()
 declare -A build_file_hashes=()
+declare -A library_closure_digests=()
 timing_event source start
 source_inventory_started=$SECONDS
 source_inventory_file="$build_scratch/image-sources.$$.inventory"
 source_metadata_dir="$build_root/image-source-metadata.$$"
 source_roots_file="$source_metadata_dir/roots"
+library_closure_roots="$source_metadata_dir/library-closure-roots"
 mkdir -p "$(dirname "$source_inventory_file")"
 mkdir -p "$source_metadata_dir"
 
@@ -626,8 +674,22 @@ fi | while read -r crate; do
 		exit 1
 	}
 	printf '%s\n' "$crate_dir" >>"$source_roots_file"
-	if [[ "$crate" == *-client-provider ]]; then printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_roots_file"; fi
+	printf '%s\n' "$crate_dir" >>"$library_closure_roots"
+	if [[ "$crate" == *-client-provider ]]; then
+		printf '%s\n' "$(source_path "${crate%-provider}")" >>"$source_roots_file"
+		printf '%s\n' "$(source_path "${crate%-provider}")" >>"$library_closure_roots"
+	fi
 done
+
+# The closures, in parallel, before the inventory below - which has to cover the dependencies' files
+# or no key over them could be computed later even if someone asked for one.
+if [[ -s "$library_closure_roots" ]]; then
+	sort -u -o "$library_closure_roots" "$library_closure_roots"
+	export root source_metadata_dir
+	export -f closure_key library_closure_file
+	xargs -a "$library_closure_roots" -P "$(nproc)" -I{} bash -c 'library_closure_file "$1"' _ {}
+	cat "$source_metadata_dir"/closure-*.dirs >>"$source_roots_file"
+fi
 
 if [[ -n "$selected_artifact" ]]; then
 	for program in "${selected_programs[@]}"; do printf '%s\n' "${program_owners[$program]}"; done | sort -u
@@ -835,6 +897,13 @@ fi
 sort -u -o "$source_digest_roots" "$source_digest_roots"
 while IFS= read -r crate_dir; do
 	crate_source_digests[$crate_dir]="$(compute_source_digest "$crate_dir")"
+	# And the closure digest beside it, for the provider key below. Computed here, in a redirect
+	# rather than a pipeline, because this is where the map survives - the loops that built the
+	# dirs files are subshells and could only leave files behind.
+	closure_dirs_file="$source_metadata_dir/$(closure_key "$crate_dir").dirs"
+	if [[ -f "$closure_dirs_file" ]]; then
+		library_closure_digests[$crate_dir]="$(local_dependency_source_digest "$crate_dir" "$(closure_key "$crate_dir")")"
+	fi
 done <"$source_digest_roots"
 
 write_identity_record() {
@@ -1630,6 +1699,11 @@ for spec in "$@"; do
 		features=(--no-default-features --features "$row_features")
 	fi
 	provider_source_sha="${crate_source_digests[$crate_dir]:-$(source_digest "$crate_dir")}"
+	# THE CLOSURE, not the crate. `provider_source_sha` above is the library's own directory, which
+	# is what a cache hit used to be decided on - so `abi` could move underneath `lsrt.lslib` and the
+	# library was never rebuilt. `provider_closure_sha` covers every crate this one compiles against,
+	# which is the question a cache key is actually asking.
+	provider_closure_sha="${library_closure_digests[$crate_dir]:-$provider_source_sha}"
 	if [[ "$row_crate" == *-client-provider ]]; then
 		provider_api_dir="$(source_path "${row_crate%-provider}")"
 		provider_compile_source="${crate_source_digests[$provider_api_dir]:-$(source_digest "$provider_api_dir")}"
@@ -1637,7 +1711,7 @@ for spec in "$@"; do
 		provider_compile_source="$provider_source_sha"
 	fi
 	provider_state_key="library-$artifact"
-	provider_state_header="plan=$artifact_state_plan"$'\n'"row=$row"$'\n'"source=$provider_source_sha"$'\n'"compile-source=$provider_compile_source"$'\n'
+	provider_state_header="plan=$artifact_state_plan"$'\n'"row=$row"$'\n'"source=$provider_source_sha"$'\n'"closure=$provider_closure_sha"$'\n'"compile-source=$provider_compile_source"$'\n'
 	for provider in $row_providers; do
 		provider_state_header+="provider=$provider:${provider_identity_digests[$provider]:-}:${provider_compile_digests[$provider]:-}"$'\n'
 	done

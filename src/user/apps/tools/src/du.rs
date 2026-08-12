@@ -156,7 +156,10 @@ unsafe fn du(storage: u64, uri: String, summary_only: bool, human: bool, mode: O
 // unreadable directory contributes 0 rather than aborting the whole walk).
 unsafe fn walk(client: &mut VolumeClient, uri: &str, depth: u32, usage: &mut Vec<DirUsage>) -> Option<u64> {
 	unsafe {
-		let consumer: u64 = client.list(uri)?;
+		// A directory that cannot be listed contributes nothing and does not abort the walk, which
+		// is what the `?` has always meant here - a refusal is the same answer as an unreachable
+		// service, and the caller reports it for the root.
+		let consumer: u64 = client.list(uri)?.ok()?;
 		// Same as an unreadable directory: a total built from part of a listing is wrong,
 		// not merely small.
 		let entries: Vec<FileInfo> = drain_stream_complete(consumer, volume::list_read)?;

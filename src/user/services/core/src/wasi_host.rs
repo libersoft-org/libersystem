@@ -4,7 +4,7 @@
 // The kernel (or a supervisor) hands this program a bootstrap channel and, over it,
 // a StorageService client - the one capability the host is granted. The host loads
 // the embedded component, instantiates it on the `wasm` runtime, and runs its `run`
-// export. The component's only import, `liber.read`, is wired to read the host's
+// export. The component's only import, `liber:vfs@1 read`, is wired to read the host's
 // single granted file (`vol://system/hello.txt`) through StorageService into the
 // component's linear memory. The component has no `open` import and no other
 // capability, so it can reach nothing it was not explicitly given - a WASI "world"
@@ -29,7 +29,7 @@ const GRANTED: &[u8] = b"vol://system/hello.txt";
 
 // The first Wasm component, hand-encoded. In WAT:
 //   (module
-//     (import "liber" "read" (func $read (param i32 i32) (result i32)))
+//     (import "liber:vfs@1" "read" (func $read (param i32 i32) (result i32)))
 //     (memory 1)
 //     (func (export "run") (result i32)
 //       i32.const 0  i32.const 256  call $read))
@@ -58,21 +58,27 @@ const COMPONENT: &[u8] = &[
 	0x01,
 	0x7f, // types: (i32,i32)->i32, ()->i32
 	0x02,
-	0x0e,
+	0x14,
 	0x01,
-	0x05,
+	0x0b,
 	b'l',
 	b'i',
 	b'b',
 	b'e',
 	b'r',
+	b':',
+	b'v',
+	b'f',
+	b's',
+	b'@',
+	b'1',
 	0x04,
 	b'r',
 	b'e',
 	b'a',
 	b'd',
 	0x00,
-	0x00, // import liber.read : type 0
+	0x00, // import liber:vfs@1 read : type 0
 	0x03,
 	0x02,
 	0x01,
@@ -123,16 +129,25 @@ struct WasiHost {
 
 impl Host for WasiHost {
 	fn call_import(&mut self, import: u32, args: &[Value], memory: &mut [u8]) -> Result<alloc::vec::Vec<Value>, Trap> {
-		// import 0 is `liber.read(ptr, max) -> count`; nothing else is granted.
+		// import 0 is `liber:vfs@1 read(ptr, max) -> count`; nothing else is granted.
 		if import != 0 {
 			return Err(Trap("import not granted"));
 		}
-		let ptr: usize = args.first().map(|v: &Value| v.as_i32() as usize).unwrap_or(0);
-		let max: usize = args.get(1).map(|v: &Value| v.as_i32() as usize).unwrap_or(0);
-		let end: usize = ptr.saturating_add(max).min(memory.len());
-		if ptr > end {
+		// THE SHARED WINDOW, not a private one.
+		//
+		// This host kept the rules `component_host` was corrected out of: an unversioned import
+		// name, `as_i32 as usize` sign-extending any address at or above 0x8000_0000, and
+		// `.min(memory.len())` silently SHORTENING a window that does not fit - so a component
+		// asking for three hundred bytes near the top of its memory got fewer and a count it could
+		// not tell from a short file. Two demonstrations of the capability boundary with different
+		// safety rules is how one of them gets fixed and the other does not, and this one ships:
+		// it is in the manifest and two kernel tests boot it.
+		//
+		// `wasm::world::window` refuses rather than clamps and reads a wasm32 address as the 32-bit
+		// pattern it is. One set of rules, in one place, for both hosts.
+		let Some((ptr, end)) = wasm::world::window(args, memory.len()) else {
 			return Err(Trap("read pointer out of bounds"));
-		}
+		};
 		let dst: &mut [u8] = &mut memory[ptr..end];
 		let n: usize = match self.grant {
 			Grant::Storage(storage) => unsafe { read_fixed(storage, dst) },
@@ -193,11 +208,33 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 	// 2. load + instantiate the component and run it. `run` calls the read import,
 	//    which the host services from whatever it was granted.
+	// Parsed and then VALIDATED - see `component_host` for why the two are separate steps and why
+	// an instance can be built from nothing else.
 	let module = match wasm::parse(COMPONENT) {
 		Ok(m) => m,
 		Err(_) => exit(),
 	};
-	let mut instance: Instance = Instance::new(&module);
+	let validated = match wasm::validate(module) {
+		Ok(m) => m,
+		Err(_) => exit(),
+	};
+	let module = validated.module();
+	// EVERY IMPORT RESOLVED BEFORE THE INSTANCE EXISTS, by name AND by declared signature.
+	//
+	// This bound its one import by INDEX - "import 0 is read" - so a module declaring something
+	// else in that slot, or declaring `read` with a different type, was instantiated and refused at
+	// the call site if at all. The import list is the manifest of requested authority; a module
+	// asking for a camera is asking for a camera, whether or not the call is reachable.
+	for import in module.imports.iter() {
+		let signature = module.types.get(import.type_index as usize);
+		if wasm::world::resolve(&import.module, &import.field, signature) != Some(wasm::world::WorldFn::Read) {
+			exit();
+		}
+	}
+	let mut instance: Instance = match Instance::new(&validated) {
+		Ok(i) => i,
+		Err(_) => exit(),
+	};
 	let mut host: WasiHost = WasiHost { grant };
 	let count: i32 = match instance.invoke("run", &[], &mut host) {
 		Ok(results) => results.first().map(|v: &Value| v.as_i32()).unwrap_or(0),

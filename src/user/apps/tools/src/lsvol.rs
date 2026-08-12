@@ -195,10 +195,12 @@ unsafe fn volume_count(storage: u64, uri: &str) -> usize {
 	let mut client = VolumeClient::new(storage);
 	match client.list(uri) {
 		// A count is a claim about the whole directory; an abnormal drain cannot support one.
-		Some(consumer) => match unsafe { drain_stream_complete(consumer, volume::list_read) } {
+		Some(Ok(consumer)) => match unsafe { drain_stream_complete(consumer, volume::list_read) } {
 			Some(entries) => entries.len(),
 			None => 0,
 		},
-		None => 0,
+		// A refused listing and an unreachable service both mean this count cannot be made; it is
+		// an inventory column, and zero with no claim attached is what it has always shown.
+		Some(Err(_)) | None => 0,
 	}
 }

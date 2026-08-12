@@ -111,10 +111,17 @@ fn a_path_cannot_walk_out_of_the_volume() {
 	assert_eq!(fs.read_file(b"a/../b"), Err(FsError::BadName));
 	assert_eq!(fs.read_file(b"."), Err(FsError::BadName));
 
-	// Separator noise names the same thing rather than a different one.
+	// A separator at either END is a separator; one in the MIDDLE is a name that is not there.
+	//
+	// `a//b` was tolerated as another spelling of `a/b` until 2026-08-12, which is one path with two
+	// spellings on a filesystem whose sibling backend refuses one of them: `fscore` answers
+	// `BadName` for an empty segment and LiberFS passes every segment through it. Two writable
+	// volumes under one Storage API cannot mean different things by the same path.
 	fs.mkdir(b"d").expect("mkdir");
-	fs.write_file(b"/d//x/", b"v").expect("redundant separators are tolerated");
+	fs.write_file(b"/d/x/", b"v").expect("leading and trailing separators are tolerated");
 	assert_eq!(fs.read_file(b"d/x").expect("read"), b"v".to_vec());
+	assert_eq!(fs.read_file(b"d//x"), Err(FsError::BadName), "a doubled separator is a missing name");
+	assert_eq!(fs.write_file(b"d//y", b"v"), Err(FsError::BadName), "and it is refused on the way in, not normalised");
 }
 
 #[test]
@@ -949,6 +956,85 @@ fn what_the_stream_preflight_promises_a_nested_path_is_what_it_can_take() {
 }
 
 #[test]
+fn growing_a_file_never_takes_the_volume_over_its_capacity() {
+	// `write_file` undid an allocator's over-allocation only for a NEW entry. For in-place growth it
+	// accepted it, and said so: the old contents were already gone and putting the file back was not
+	// possible from there. So `write_file` could answer `Ok(())` on a volume whose footprint then
+	// exceeded its own capacity - the one number the whole type is about.
+	//
+	// Growing into a separate buffer makes the decision reversible, which is what lets the overshoot
+	// be refused instead of accepted.
+	const CAPACITY: usize = 4096;
+	let mut fs = capped(CAPACITY);
+	fs.write_file(b"f", &[0x11u8; 512]).expect("a file well inside the volume");
+	assert!(fs.footprint() as usize <= CAPACITY);
+
+	// Grow it, repeatedly, until the volume refuses - and check the invariant after every answer,
+	// because the defect was a SUCCESSFUL write leaving the volume over its bound.
+	let mut size = 1024usize;
+	loop {
+		let outcome = fs.write_file(b"f", &alloc::vec![0x22u8; size]);
+		assert!(fs.footprint() as usize <= CAPACITY, "the volume passed its own capacity while growing to {size}: footprint {}", fs.footprint());
+		if outcome.is_err() {
+			break;
+		}
+		assert_eq!(fs.read_file(b"f").expect("read").len(), size, "a write that succeeded stored what it was given");
+		size += 512;
+		assert!(size < CAPACITY * 4, "the volume never refused, so nothing here was tested");
+	}
+
+	// And the refusal left the file as it was rather than truncated.
+	assert!(fs.read_file(b"f").is_ok(), "a refused growth leaves the file readable");
+}
+
+#[test]
+fn an_open_stream_holds_its_destination() {
+	// `stream_begin` validated a destination and then held NOTHING. StorageService returns to its
+	// serve loop after every chunk - deliberately, so one large upload does not stall every other
+	// client - and that loop still serves `write`, `remove`, `mkdir` and `rmdir`. So a client could
+	// transfer an entire file into a path that had since been removed or turned into a directory,
+	// and learn about it at commit, with the work already done.
+	//
+	// The placeholder is the claim. It also prepays the parent's directory slot, which was the other
+	// half: `insert`'s `try_reserve(1)` was a fallible allocation at COMMIT, after the whole file
+	// had been accepted.
+	let mut fs = capped(64 * 1024);
+	fs.mkdir(b"dir").expect("a parent");
+	fs.stream_begin(b"dir/f").expect("begin");
+
+	// The name is taken from the moment the stream opens: nothing else may claim it.
+	assert_eq!(fs.mkdir(b"dir/f"), Err(FsError::Exists), "a directory may not take the name a stream is filling");
+
+	// And it is a real entry, so the destination cannot be removed out from under the transfer by
+	// removing its parent's contents unknowingly - the file is there to be seen.
+	assert!(fs.list_entries(b"dir").expect("list").iter().any(|e| e.name == "f"), "the claim is visible in the directory");
+
+	fs.stream_push(b"the payload").expect("push");
+	fs.stream_commit().expect("commit");
+	assert_eq!(fs.read_file(b"dir/f").expect("read"), b"the payload");
+}
+
+#[test]
+fn an_abandoned_stream_leaves_no_destination_behind() {
+	// The other side of the claim: a placeholder is a promise about a transfer, and an abandoned
+	// transfer must not leave a zero-byte file where the caller's data was going to be.
+	let mut fs = capped(64 * 1024);
+	fs.stream_begin(b"gone").expect("begin");
+	assert!(fs.list_entries(b"").expect("list").iter().any(|e| e.name == "gone"), "the claim exists while the stream does");
+	fs.stream_abort();
+	assert_eq!(fs.read_file(b"gone"), Err(FsError::NotFound), "and goes with it");
+	assert!(!fs.list_entries(b"").expect("list").iter().any(|e| e.name == "gone"), "leaving nothing in the directory");
+
+	// A stream that REPLACES an existing file leaves it alone when abandoned - there was no
+	// placeholder to take away, and the file was never the stream's to remove.
+	fs.write_file(b"kept", b"original").expect("write");
+	fs.stream_begin(b"kept").expect("begin");
+	fs.stream_push(b"replacement").expect("push");
+	fs.stream_abort();
+	assert_eq!(fs.read_file(b"kept").expect("read"), b"original", "an abandoned replacement leaves the original");
+}
+
+#[test]
 fn a_reserved_volume_opens_a_stream_out_of_its_own_reservation() {
 	// A reserved volume holds its whole free capacity, so allocating the pending path BESIDE the
 	// reservation competes with memory the volume is itself sitting on: the stream can be refused
@@ -969,7 +1055,11 @@ fn a_reserved_volume_opens_a_stream_out_of_its_own_reservation() {
 	// A long FLAT name: it costs real bytes without needing parent directories, which would have to
 	// be created first and would themselves be refused on a budget this tight.
 	let name = alloc::vec![b'n'; 255];
-	within(CAPACITY + 320, || {
+	// 320 -> 400 on 2026-08-12: `stream_begin` now also places a PLACEHOLDER entry, so the slack has
+	// to cover the directory slot as well as the name. Still far below the volume's own capacity, so
+	// the property this test is about - those bytes can only come from the reservation - is
+	// unchanged.
+	within(CAPACITY + 400, || {
 		let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("a reserved volume mounts");
 		assert!(fs.reserved_bytes() > 0, "the volume is holding its capacity");
 		assert_eq!(fs.stream_begin(&name), Ok(()), "a stream opens against the volume's own reservation");
@@ -1230,6 +1320,19 @@ fn the_streaming_pair_is_a_protocol_rather_than_a_convention() {
 	fs.stream_advance(4096, 4).expect("the offer closes");
 	fs.stream_commit().expect("and then it commits");
 	assert_eq!(fs.read_file(b"zeros").expect("read").len(), 4, "only what was written survives");
+
+	// AND A PUSH OVER AN OPEN OFFER, which is the door the commit guard does not watch. Without a
+	// refusal here `stream_advance` keeps `data.len() - (offered - written)` bytes from the FRONT -
+	// the offer's zeros - and throws away the ones that were pushed, so the file commits as zeros
+	// and reports itself whole. Exactly what `stream_commit`'s own comment says it exists to stop.
+	fs.stream_begin(b"mixed").expect("begin");
+	let spare = fs.stream_spare(100).expect("an offer");
+	assert_eq!(spare.len(), 100);
+	assert_eq!(fs.stream_push(b"abc"), Err(FsError::Invalid), "a push while an offer is open would be truncated away by the advance");
+	fs.stream_advance(100, 3).expect("the offer closes on what was written into it");
+	fs.stream_push(b"def").expect("and then a push is ordinary");
+	fs.stream_commit().expect("commit");
+	assert_eq!(fs.read_file(b"mixed").expect("read").len(), 6, "three from the offer and three pushed");
 
 	// A second offer over an open one has no way to be accounted for.
 	fs.stream_begin(b"twice").expect("begin");

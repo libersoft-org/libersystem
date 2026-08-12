@@ -594,11 +594,20 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 			Err(e) => return e,
 		}
 	};
+	// Under the lifecycle guard, so the buffer joins the creating process's DMA registry before a
+	// teardown can take its snapshot. A buffer created after the orphan pass would never be marked,
+	// and an unmarked buffer's frames go back into circulation while a device may still name them.
+	let Some(guard) = thread.process().begin_extend() else {
+		return ERR_INVALID;
+	};
 	let object = match DmaBuffer::create_for(thread.domain(), size as usize, device) {
 		Ok(o) => o,
 		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
 		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,
 	};
+	if !guard.record_dma_buffer(&object) {
+		return ERR_NO_MEMORY;
+	}
 	install_object(&thread, object, Rights::ALL, 0)
 }
 
@@ -608,12 +617,16 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 	// Nothing new once the process has begun going away: its cleanup has already taken
 	// its snapshot of what to unmap, and a mapping registered after that is one nothing
 	// will ever collect.
-	if let Some(thread) = crate::sched::current_thread() {
-		if thread.process().is_terminating() {
-			return ERR_INVALID;
-		}
-	}
+	//
+	// HELD ACROSS THE WHOLE OPERATION, not read at the top. Between the check and the record below
+	// there is a reservation, a virtual-range allocation and a page-table walk, and the teardown
+	// takes its snapshot in the middle of its own two steps - so a flag read here said nothing
+	// about the record down there. The guard is refused once teardown has begun and teardown waits
+	// for it to be released.
 	let thread = current_thread!();
+	let Some(guard) = thread.process().begin_extend() else {
+		return ERR_INVALID;
+	};
 	let dma = match current_typed::<DmaBuffer>(handle, ObjectType::DmaBuffer, Rights::MAP) {
 		Ok(o) => o,
 		Err(e) => return e,
@@ -637,7 +650,11 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 		return ERR_NO_MEMORY;
 	}
 	dma.commit_mapping(cr3, base);
-	thread.process().record_dma_mapping(dma);
+	// Rolled back the same way `sys_memory_map` does, and for the same reason.
+	if !guard.record_dma_mapping(dma.clone()) {
+		dma.remove_mapping(&space);
+		return ERR_NO_MEMORY;
+	}
 	base as i64
 }
 
@@ -987,7 +1004,17 @@ fn sys_device_quiesced(device_handle: u64) -> i64 {
 		Err(e) => return e,
 	};
 	match memory.device_index() {
-		Some(index) => crate::object::dma_buffer::release_for(index) as i64,
+		Some(index) => {
+			// The DMA frames AND the MSI vectors. Both were held for the same reason - a request to
+			// stop is not proof of stopping - and this is the one claim that answers it, so a
+			// quiesce that released only half of them would leave the other half waiting forever.
+			let vectors = crate::arch::interrupts::release_msi_for_device(index);
+			if vectors != 0 {
+				crate::serial_println!("irq: device {index} confirmed stopped - {vectors} masked MSI vector(s) released for re-use");
+			}
+			// The answer stays the FRAME count, which is what the syscall has always meant.
+			crate::object::dma_buffer::release_for(index) as i64
+		}
 		// A bare MMIO window is not a device-table entry, so nothing is keyed on it.
 		None => ERR_INVALID,
 	}
@@ -1614,13 +1641,12 @@ fn sys_console_attach(handle: u64, privilege: u64) -> i64 {
 fn sys_memory_map(handle: u64) -> i64 {
 	// Nothing new once the process has begun going away: its cleanup has already taken
 	// its snapshot of what to unmap, and a mapping registered after that is one nothing
-	// will ever collect.
-	if let Some(thread) = crate::sched::current_thread() {
-		if thread.process().is_terminating() {
-			return ERR_INVALID;
-		}
-	}
+	// will ever collect. Held for the whole operation - see `sys_dma_buffer_map` for why the flag
+	// read that used to be here was not the same thing.
 	let thread = current_thread!();
+	let Some(guard) = thread.process().begin_extend() else {
+		return ERR_INVALID;
+	};
 	let memory = match current_typed::<MemoryObject>(handle, ObjectType::MemoryObject, Rights::MAP) {
 		Ok(memory) => memory,
 		Err(error) => return error,
@@ -1654,7 +1680,13 @@ fn sys_memory_map(handle: u64) -> i64 {
 		return ERR_NO_MEMORY;
 	}
 	memory.commit_mapping(cr3, base);
-	thread.process().record_memory_mapping(memory.clone());
+	// `remove_mapping` unmaps the pages AND returns the virtual range, which is the whole rollback:
+	// a mapping the process's cleanup list does not know about is one nothing will ever collect, so
+	// a record that cannot be made has to undo the map rather than leave it.
+	if !guard.record_memory_mapping(memory.clone()) {
+		memory.remove_mapping(&space);
+		return ERR_NO_MEMORY;
+	}
 	base as i64
 }
 
@@ -2242,7 +2274,18 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 	// could stay parked while the group reported itself finished. Registering on the
 	// members as well as the group is the fix that needs no back-link from a process to
 	// the groups it belongs to: the wake it already sends is the one being listened for.
-	let group_koids: Vec<u64> = object.as_any().downcast_ref::<crate::object::process_group::ProcessGroup>().map(|group| core::iter::once(koid).chain(group.live().iter().map(|member| member.header().koid())).collect()).unwrap_or_default();
+	// FALLIBLY. `collect()` here is an infallible allocation sized by a process group's live
+	// membership, on a path a ring-3 caller decides to take - and an infallible allocation on a
+	// short heap ABORTS the kernel.
+	let mut group_koids: Vec<u64> = Vec::new();
+	if let Some(group) = object.as_any().downcast_ref::<crate::object::process_group::ProcessGroup>() {
+		let members = group.live();
+		if group_koids.try_reserve(members.len() + 1).is_err() {
+			return ERR_NO_MEMORY;
+		}
+		group_koids.push(koid);
+		group_koids.extend(members.iter().map(|member| member.header().koid()));
+	}
 	// Condition-variable loop: re-check readiness after each wake, so an early or
 	// spurious wake just re-blocks and a deadline is honored on re-check. A signal that
 	// arrives while blocked is honoured first: a kill retires the thread, a stop parks it.
@@ -2308,7 +2351,13 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 	// Resolve every handle once up front, recording each object and its koid. The
 	// scratch tables are heap-allocated, sized by the actual set - `wait_any` is a
 	// blocking call, so the allocation is never on a hot path.
+	// FALLIBLY, like every other buffer in this function - `try_zeroed_u64` is used twice below and
+	// this was the odd one out. `resize_with` aborts on a short heap, sized by `n` up to
+	// `MAX_WAIT_HANDLES`.
 	let mut objects: alloc::vec::Vec<Option<Arc<dyn KernelObject>>> = alloc::vec::Vec::new();
+	if objects.try_reserve_exact(n).is_err() {
+		return ERR_NO_MEMORY;
+	}
 	objects.resize_with(n, || None);
 	let Some(mut koids) = try_zeroed_u64(n) else {
 		return ERR_NO_MEMORY;

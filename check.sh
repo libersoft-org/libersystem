@@ -27,6 +27,7 @@ declare -A GATES=(
 	["identity-note"]="tools/check-static-injection.sh identity-note"
 	["volume-layout"]="tools/check-volume-layout.sh ../.build/boot/volume-x86_64.pkg"
 	["milestone-index"]="tools/check-milestone-index.sh"
+	["single-cap-receive"]="tools/check-single-cap-receive.sh"
 )
 
 FORMATS=(bmp gif ico icns jpeg pcx png ppm qoi tga webp)
@@ -77,6 +78,19 @@ run_gate() {
 		else
 			note "gate '$name' failed (exit $status)"
 		fi
+		# And whatever execution trace the gate left behind.
+		#
+		# The injection gates write one as they go, precisely because their unexplained deaths are the
+		# ones where nothing is left alive to report: a signal skips the gate's own EXIT trap, so the
+		# gate cannot print its own trace and the only thing that can is out here. Printed and then
+		# removed, so a later run is never read as this one's.
+		local trace
+		for trace in "${TMPDIR:-/tmp}"/liber-injection-trace.*.log; do
+			[[ -s "$trace" ]] || continue
+			note "the last commands '$name' ran, from $trace:"
+			tail -n 15 "$trace" | sed 's/^/    /' >&2
+			rm -f "$trace"
+		done
 		return "$status"
 	fi
 }

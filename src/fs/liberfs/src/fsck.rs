@@ -1,5 +1,23 @@
 use crate::*;
 
+// What a structure pass found, by KIND. The report separates checksum, structural and stream
+// failures on purpose - they send an operator to three different places, the medium, the metadata
+// or the writer that produced the stream - and a single count plus a subtraction could not keep
+// them apart.
+#[derive(Default)]
+pub(crate) struct StructureTally {
+	// Faults in the shape of the metadata: a record that cannot be true.
+	pub structural: u32,
+	// A compressed extent whose stored blocks do not match their checksums. Already counted by the
+	// scrub pass; named here so the operator learns which extent, and not added twice.
+	pub checksum: u32,
+	// The medium would not give the bytes back. Not a fault of the filesystem.
+	pub io: u32,
+	// Every block came back as written and the shape is legal, and the stream still does not
+	// decode.
+	pub stream: u32,
+}
+
 impl<D: BlockDevice> LiberFs<D> {
 	// Verify integrity. With copy-on-write a crash cannot leak blocks or orphan an
 	// inode (the free map is derived and a commit is atomic), so there is nothing to
@@ -107,8 +125,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		// written and the shape is legal, and yet the file cannot be read. Counted apart because
 		// the three send an operator to three different places - the medium, the metadata, or the
 		// writer that produced the stream.
-		let stream_failures = self.check_structure(&mut faults);
-		Ok(FsckReport { checksum_failures, damaged, structural_failures: faults.len() as u32 - stream_failures, stream_failures, faults })
+		let tally = self.check_structure(&mut faults);
+		// Every fault raised by the structure pass that is not one of the three named kinds IS a
+		// structural one; counting them as "the rest" here rather than at each `note` keeps the
+		// arithmetic in one place while the three that are NOT structural are counted where they
+		// are raised.
+		let named = tally.checksum + tally.io + tally.stream + tally.structural;
+		let structural_failures = (faults.len() as u32 - named) + tally.structural;
+		Ok(FsckReport { checksum_failures, damaged, structural_failures, stream_failures: tally.stream, faults })
 	}
 
 	// Read the whole file at `path` out of the named snapshot's pinned generation,
@@ -152,8 +176,17 @@ impl<D: BlockDevice> LiberFs<D> {
 	// This is deliberately separate from the checksum scrub above. The two answer
 	// different questions - "did the medium give back what was written" versus "can what
 	// was written be true" - and an operator needs to know which one failed.
-	pub(crate) fn check_structure(&mut self, faults: &mut Vec<Vec<u8>>) -> u32 {
-		let mut stream_failures = 0u32;
+	pub(crate) fn check_structure(&mut self, faults: &mut Vec<Vec<u8>>) -> StructureTally {
+		// COUNTED WHERE THE FAULT IS RAISED, not subtracted afterwards.
+		//
+		// This returned only the stream count and the report computed
+		// `structural_failures = faults.len() - stream_failures`, so every fault that was neither
+		// structural nor a stream landed in `structural_failures` anyway. A compressed extent whose
+		// blocks fail their checksums was therefore counted TWICE - once by the scrub pass into
+		// `checksum_failures`, and once again here - and an extent that could not be READ was
+		// reported as a structural fault of the filesystem. The subtraction is also what would make
+		// a fifth kind of fault silently wrong, which is the part worth removing.
+		let mut tally = StructureTally::default();
 		let note = |what: &str, faults: &mut Vec<Vec<u8>>| faults.push(what.as_bytes().to_vec());
 
 		// the root of the namespace has to be a directory, or no path resolves.
@@ -185,9 +218,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut inodes: BTreeSet<u32> = BTreeSet::new();
 		let Ok(mut seen_blocks) = try_zeroed(self.free.len()) else {
 			note("not enough memory to check the inode tree's structure", faults);
-			return stream_failures;
+			return tally;
 		};
-		if self.walk_inode_records(self.inode_root, self.inode_root_crc, TREE_DEPTH_MAX, &mut inodes, &mut seen_blocks, faults, &mut stream_failures).is_err() {
+		if self.walk_inode_records(self.inode_root, self.inode_root_crc, TREE_DEPTH_MAX, &mut inodes, &mut seen_blocks, faults, &mut tally).is_err() {
 			note("the inode tree could not be walked to the end", faults);
 		}
 
@@ -248,18 +281,18 @@ impl<D: BlockDevice> LiberFs<D> {
 		if orphans != 0 {
 			faults.push(alloc::format!("{orphans} inode record(s) reachable from no name").into_bytes());
 		}
-		stream_failures
+		tally
 	}
 
 	// Walk every leaf of the inode tree, checking the shape of each node and each record
 	// it holds. Keys must ascend strictly within a leaf, a block must appear once, and
 	// each file's extent map must be ordered, non-overlapping and as long as it claims.
-	fn walk_inode_records(&mut self, ptr: u64, crc: u32, depth: usize, inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>, streams: &mut u32) -> Result<(), FsError> {
-		self.walk_inode_records_in(ptr, crc, depth, (None, None), inodes, seen, faults, streams)
+	fn walk_inode_records(&mut self, ptr: u64, crc: u32, depth: usize, inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>, tally: &mut StructureTally) -> Result<(), FsError> {
+		self.walk_inode_records_in(ptr, crc, depth, (None, None), inodes, seen, faults, tally)
 	}
 
 	#[allow(clippy::too_many_arguments)]
-	fn walk_inode_records_in(&mut self, ptr: u64, crc: u32, depth: usize, range: (Option<u64>, Option<u64>), inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>, streams: &mut u32) -> Result<(), FsError> {
+	fn walk_inode_records_in(&mut self, ptr: u64, crc: u32, depth: usize, range: (Option<u64>, Option<u64>), inodes: &mut BTreeSet<u32>, seen: &mut [u8], faults: &mut Vec<Vec<u8>>, tally: &mut StructureTally) -> Result<(), FsError> {
 		let (lower, upper) = range;
 		if ptr == 0 {
 			return Ok(());
@@ -298,12 +331,12 @@ impl<D: BlockDevice> LiberFs<D> {
 				inodes.insert(key as u32);
 				let mut inode = Inode::parse(&buf[off + 8..off + 8 + INODE_SIZE]);
 				if inode.r#type == TYPE_FILE {
-					self.check_file_shape(key as u32, &mut inode, faults, streams);
+					self.check_file_shape(key as u32, &mut inode, faults, tally);
 				} else if inode.r#type != TYPE_DIR {
 					// no writer emits one, so its presence is a fact worth naming even
 					// though the free-map walk reserves its blocks conservatively.
 					faults.push(alloc::format!("inode {key} has type {} which this build does not define", inode.r#type).into_bytes());
-					self.check_file_shape(key as u32, &mut inode, faults, streams);
+					self.check_file_shape(key as u32, &mut inode, faults, tally);
 				}
 			}
 		} else {
@@ -321,7 +354,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				if child_ptr(&buf, i) == 0 {
 					continue;
 				}
-				if self.walk_inode_records_in(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, (child_lower, child_upper), inodes, seen, faults, streams).is_err() {
+				if self.walk_inode_records_in(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, (child_lower, child_upper), inodes, seen, faults, tally).is_err() {
 					faults.push(alloc::format!("subtree under {ptr} could not be walked").into_bytes());
 				}
 			}
@@ -441,7 +474,28 @@ impl<D: BlockDevice> LiberFs<D> {
 
 	// One file's extent map: as long as the inode claims, ordered by logical offset,
 	// non-overlapping, and every run individually possible.
-	fn check_file_shape(&mut self, num: u32, inode: &mut Inode, faults: &mut Vec<Vec<u8>>, streams: &mut u32) {
+	// How many of an inode's compressed extents do not decode.
+	//
+	// The live pass reports each one by name through `check_file_shape`; a snapshot generation has
+	// no per-inode reporting and only needs the count. Both go through
+	// `decompress_extent_detailed`, so whatever the live walk asks of an extent the snapshot walk
+	// asks too - the difference between the two is which tree is being walked, not which checks
+	// apply.
+	fn count_undecodable(&mut self, inode: &Inode) -> u32 {
+		let mut bad = 0u32;
+		for i in 0..inode.extents.len() {
+			let ext = &inode.extents[i];
+			if ext.clen == 0 {
+				continue;
+			}
+			if matches!(self.decompress_extent_detailed(ext), Err(crate::ExtentFault::Stream)) {
+				bad = bad.saturating_add(1);
+			}
+		}
+		bad
+	}
+
+	fn check_file_shape(&mut self, num: u32, inode: &mut Inode, faults: &mut Vec<Vec<u8>>, tally: &mut StructureTally) {
 		if self.load_spill(inode).is_err() {
 			faults.push(alloc::format!("inode {num}: the extent spill chain could not be read").into_bytes());
 			return;
@@ -452,7 +506,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		// How many blocks the file's size can account for. Zero-length files map nothing.
 		let blocks_in_file = inode.size.div_ceil(BLOCK_SIZE as u64);
 		let mut end: Option<u64> = None;
-		for ext in inode.extents.clone().iter() {
+		// INDEXED, not cloned. `inode.extents.clone()` is an infallible allocation sized by a
+		// fragmented file's extent count - a number that comes off the medium - on the check whose
+		// whole job is surviving a hostile image. `Extent` is `Copy`, so there was never a reason.
+		for i in 0..inode.extents.len() {
+			let ext = &inode.extents[i];
 			if self.check_extent(ext).is_err() {
 				faults.push(alloc::format!("inode {num}: an extent that cannot be true").into_bytes());
 				continue;
@@ -486,11 +544,23 @@ impl<D: BlockDevice> LiberFs<D> {
 					Ok(_) => {}
 					Err(crate::ExtentFault::Stream) => {
 						faults.push(alloc::format!("inode {num}: a compressed extent whose stream does not decode").into_bytes());
-						*streams += 1;
+						tally.stream += 1;
 					}
-					Err(crate::ExtentFault::Checksum) => faults.push(alloc::format!("inode {num}: a compressed extent whose stored blocks do not match their checksums").into_bytes()),
-					Err(crate::ExtentFault::Io) => faults.push(alloc::format!("inode {num}: a compressed extent that could not be read").into_bytes()),
-					Err(crate::ExtentFault::Shape(_)) => faults.push(alloc::format!("inode {num}: a compressed extent whose record cannot be true").into_bytes()),
+					// Already counted by the scrub pass. Reported here because the operator wants to
+					// know WHICH extent, and not counted again because it is one fault.
+					Err(crate::ExtentFault::Checksum) => {
+						faults.push(alloc::format!("inode {num}: a compressed extent whose stored blocks do not match their checksums").into_bytes());
+						tally.checksum += 1;
+					}
+					// The medium, not the filesystem.
+					Err(crate::ExtentFault::Io) => {
+						faults.push(alloc::format!("inode {num}: a compressed extent that could not be read").into_bytes());
+						tally.io += 1;
+					}
+					Err(crate::ExtentFault::Shape(_)) => {
+						faults.push(alloc::format!("inode {num}: a compressed extent whose record cannot be true").into_bytes());
+						tally.structural += 1;
+					}
 				}
 			}
 			end = Some(next_end);
@@ -560,7 +630,16 @@ impl<D: BlockDevice> LiberFs<D> {
 				let off = NODE_HDR + i * INODE_REC + 8;
 				let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
 				let checked = if inode.r#type == TYPE_FILE {
-					self.load_spill(&mut inode).and_then(|()| self.count_corrupt(&inode))
+					// THE SAME EXTENT VALIDATION THE LIVE PASS DOES.
+					//
+					// This ended at `count_corrupt`, which asks the medium whether it gave back what
+					// was written - physical checksums, nothing more. So a compressed extent held by
+					// a pinned snapshot could have every CRC correct and a stream that does not
+					// decode, and `fsck` called the volume clean while its own comment said the
+					// pinned generations were verified. The data is unreadable and nothing says so
+					// until somebody tries to read it, which for a snapshot may be after the live
+					// copy is gone.
+					self.load_spill(&mut inode).and_then(|()| self.count_corrupt(&inode)).map(|bad| bad.saturating_add(self.count_undecodable(&inode)))
 				} else if inode.r#type == TYPE_DIR {
 					self.check_dir_tree(inode.dir_root, inode.dir_root_crc, TREE_DEPTH_MAX, visited)
 				} else {

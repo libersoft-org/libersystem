@@ -109,6 +109,20 @@ impl<D: BlockDevice> LiberFs<D> {
 		Ok(())
 	}
 
+	// Is this directory tree empty? One node read, whatever the tree's size - which is what makes
+	// it affordable on every removal where a full walk is not.
+	fn dir_tree_is_empty(&mut self, root: u64, crc: u32) -> bool {
+		if root == 0 {
+			return true;
+		}
+		let mut buf = vec![0u8; BLOCK_SIZE];
+		if self.read_node(root, crc, &mut buf).is_err() {
+			// Unreadable is not empty, and a removal must not conclude anything from it.
+			return false;
+		}
+		node_type(&buf) == NODE_LEAF && node_count(&buf) == 0
+	}
+
 	// Remove entry `name` from directory `dir_num`. NotFound if it is not there.
 	pub(crate) fn dir_remove(&mut self, dir_num: u32, name: &[u8]) -> Result<(), FsError> {
 		let mut dir = self.read_inode(dir_num)?;
@@ -131,8 +145,26 @@ impl<D: BlockDevice> LiberFs<D> {
 		// is exactly how an operator repairs such a directory, and refusing closes the only route
 		// they have. So a count that cannot describe what was just removed is DERIVED from the tree
 		// that remains - the one operation that both survives the damage and ends it.
+		// UNDERFLOW IS THE DETECTABLE CASE, NOT THE ONLY ONE. A stored count of 100 over a tree of
+		// five decrements to 99 and is written back as though it were now correct - the same lie,
+		// made permanent by the same commit, and invisible to the arithmetic because subtracting one
+		// from 100 succeeds.
+		//
+		// Deriving on EVERY removal would close it and is refused deliberately: `collect_dir_entries`
+		// walks the whole tree, so `rm -rf` over a large directory would become quadratic. Paying
+		// O(n) per unlink to repair a count that is only ever wrong on a damaged volume is the wrong
+		// trade.
+		//
+		// So the count stays a cache and stops being trusted where it is cheap not to trust it: an
+		// EMPTY tree is the one shape a walk does not cost anything to confirm, and a non-zero count
+		// over it is exactly the disagreement that has been observed. `fsck` reports the general
+		// case - "size says N entries and the tree holds M" - which is where an operator can act on
+		// it, and the deeper answer is to stop recording the count at all. That is a format change
+		// and it is written up in the milestone rather than smuggled in here.
 		dir.size = match dir.size.checked_sub(1) {
-			Some(size) => size,
+			Some(size) if size == 0 || !self.dir_tree_is_empty(root, crc) => size,
+			// The count says entries remain and the tree says none do. Believe the tree.
+			Some(_) => 0,
 			None => {
 				let mut entries = Vec::new();
 				self.collect_dir_entries(root, crc, &mut entries, TREE_DEPTH_MAX)?;
@@ -793,7 +825,22 @@ pub(crate) fn split_segments(path: &[u8]) -> Result<Vec<&[u8]>, FsError> {
 	if segs.try_reserve(path.split(|&b| b == b'/').count().min(PATH_DEPTH_MAX)).is_err() {
 		return Err(FsError::NoMemory);
 	}
-	for seg in path.split(|&b| b == b'/') {
+	// A LEADING OR TRAILING SEPARATOR IS NORMALISED AWAY, which is the Storage ABI's rule stated in
+	// `storage.lsidl` and now implemented by both backends rather than answered differently by each.
+	//
+	// This passed EVERY segment to the validator, so `/a/b` was `BadName` here and an ordinary path
+	// on LiberMemFS - one spelling of one path that resolved or did not depending on which
+	// filesystem was mounted. A MIDDLE empty segment is still refused, because `a//b` genuinely has
+	// two readings and that is the disagreement worth removing.
+	let trimmed = {
+		let front = path.strip_prefix(b"/").unwrap_or(path);
+		let back = front.strip_suffix(b"/").unwrap_or(front);
+		back
+	};
+	if trimmed.is_empty() {
+		return Err(FsError::BadName);
+	}
+	for seg in trimmed.split(|&b| b == b'/') {
 		if segs.len() == PATH_DEPTH_MAX {
 			return Err(FsError::TooLong);
 		}

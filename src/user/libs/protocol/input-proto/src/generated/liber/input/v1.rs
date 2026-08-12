@@ -30,10 +30,29 @@ impl PointerEvent {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<PointerEvent> {
-		PointerEvent::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = PointerEvent::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<PointerEvent> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PointerEvent::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u16(self.col)?;
@@ -68,10 +87,29 @@ impl KeyEvent {
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
 		let mut w = VecWriter::new();
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
 		Some(w.into_inner())
 	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
 	pub fn decode(bytes: &[u8]) -> Option<KeyEvent> {
-		KeyEvent::read(&mut Reader::new(bytes))
+		let mut r = Reader::new(bytes);
+		let value = KeyEvent::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<KeyEvent> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = KeyEvent::read(&mut r)?;
+		r.finish()?;
+		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.u16(self.code)?;
@@ -244,13 +282,13 @@ pub mod input {
 			let w = &mut writer;
 			w.u16(OP_SUBSCRIBE)?;
 			w.u32(corr)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
 			let mut reader = Reader::new(&reply);
 			let r = &mut reader;
-			if r.u32()? != corr || reply_handles.is_empty() {
+			if r.u32()? != corr || reply_handles.len() != 1 {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -264,13 +302,13 @@ pub mod input {
 			w.u32(corr)?;
 			w.set_handle(*focus)?;
 			w.u32(0)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
 			let mut reader = Reader::new(&reply);
 			let r = &mut reader;
-			if r.u32()? != corr || reply_handles.is_empty() {
+			if r.u32()? != corr || reply_handles.len() != 1 {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -320,7 +358,10 @@ pub mod input_admin {
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:input")?;
 			w.u32(1)?;
-			*reply_handles = Handles::from_slice(writer.handles());
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
 			return Some(writer.pos());
 		}
 		match op {
@@ -348,7 +389,10 @@ pub mod input_admin {
 				})();
 				if encoded.is_none() {
 					if writer.has_handle() {
-						*reply_handles = Handles::from_slice(writer.handles());
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
 						return None;
 					}
 					// the reply outgrew the caller's buffer: replace it with a typed
@@ -362,7 +406,10 @@ pub mod input_admin {
 			}
 			_ => return None,
 		}
-		*reply_handles = Handles::from_slice(writer.handles());
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
 		Some(writer.pos())
 	}
 
@@ -411,7 +458,7 @@ pub mod input_admin {
 			let w = &mut writer;
 			w.u16(OP_OPEN_KEYS)?;
 			w.u32(corr)?;
-			let request_handles = Handles::from_slice(writer.handles());
+			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;

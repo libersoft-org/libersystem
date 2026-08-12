@@ -150,6 +150,32 @@ fn format_then_mount_is_empty() {
 }
 
 #[test]
+fn the_storage_abis_separator_rule_is_this_backends_rule_too() {
+	// THE RULE IS THE ABI'S, and it is stated in `src/idl/storage.lsidl` rather than answered
+	// differently by each filesystem: a MIDDLE segment may not be empty, so `a//b` is `BadName` on
+	// every volume; a leading or trailing separator is TOLERATED and means the same path without it.
+	//
+	// This backend used to pass EVERY segment to the validator, so `/a/b` was `BadName` here and an
+	// ordinary path on LiberMemFS - one spelling of one path that resolved or did not depending on
+	// which filesystem was mounted, which is the thing a shared ABI exists to prevent. The middle
+	// case is the one that genuinely has two readings, and it stays refused on both.
+	//
+	// `libermemfs`'s `a_path_that_tries_to_leave_the_volume_is_refused` asserts the same four
+	// answers against the other backend. Two tests rather than one because the point is that they
+	// AGREE, and a shared helper would only prove that one implementation calls itself twice.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.mkdir(b"d").expect("mkdir");
+	fs.write_file(b"/d/x/", b"v").expect("leading and trailing separators are tolerated");
+	assert_eq!(fs.read_file(b"d/x").expect("read"), b"v".to_vec());
+	assert_eq!(fs.read_file(b"d//x"), Err(FsError::BadName), "a doubled separator is a missing name");
+	assert_eq!(fs.write_file(b"d//y", b"v"), Err(FsError::BadName), "and it is refused on the way in, not normalised");
+	// The degenerate spellings of the root, which normalising a leading separator must not turn
+	// into a name.
+	assert_eq!(fs.write_file(b"/", b"v"), Err(FsError::BadName), "the root is not a file");
+	assert_eq!(fs.write_file(b"//", b"v"), Err(FsError::BadName), "nor is a path of separators");
+}
+
+#[test]
 fn mount_rejects_unformatted_device() {
 	let dev = MemDevice::new(NBLOCKS);
 	assert!(LiberFs::mount(dev).is_err());
@@ -952,6 +978,35 @@ fn the_free_map_honors_every_pinned_generation() {
 	let mut live = LiberFs::mount(dev).unwrap();
 	assert_eq!(live.read_file(b"f").unwrap(), b"live-7");
 	assert_eq!(live.fsck().unwrap().checksum_failures, 0);
+}
+
+#[test]
+fn a_pinned_snapshots_undecodable_stream_is_reported() {
+	// `check_inode_tree` ended at `count_corrupt`, which asks the medium whether it returned what
+	// was written. So a compressed extent held by a PINNED SNAPSHOT could have every checksum right
+	// and a stream that does not decode, and `fsck` reported the volume clean while its own comment
+	// said the pinned generations were verified. For a snapshot that matters more than for the live
+	// tree: the data may be needed after the live copy is gone.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.set_compression(true);
+	fs.write_file(b"c.bin", &[0x41u8; 4 * BLOCK_SIZE]).unwrap();
+	fs.create_snapshot(b"s1").unwrap();
+	// The live tree moves on, so the damaged extent below is reachable ONLY through the snapshot.
+	fs.write_file(b"c.bin", b"the live copy, uncompressed and fine").unwrap();
+	assert_eq!(fs.fsck().unwrap().stream_failures, 0, "clean before the damage");
+
+	// Damage the stream and re-stamp every checksum over it, so the medium looks perfect.
+	let mut dev = fs.into_device();
+	let (block, csum) = first_extent_of(&dev);
+	let at = block as usize * BLOCK_SIZE;
+	dev.blocks[at + 4..at + 16].copy_from_slice(&[0xFFu8; 12]);
+	let fresh = crc32c(&dev.blocks[at..at + BLOCK_SIZE]);
+	let cat = csum as usize * BLOCK_SIZE;
+	dev.blocks[cat..cat + 4].copy_from_slice(&fresh.to_le_bytes());
+
+	let mut live = LiberFs::mount(dev).unwrap();
+	let report = live.fsck().unwrap();
+	assert!(report.checksum_failures > 0 || report.structural_failures > 0, "the snapshot's damage is reported somewhere: {report:?}");
 }
 
 #[test]
@@ -2276,7 +2331,15 @@ fn a_looped_namespace_cannot_hang_the_walks() {
 	let report = fs.fsck().unwrap();
 	assert_eq!(report.checksum_failures, 0);
 	// ...and the rename cycle check terminates too, still refusing the move.
-	assert_eq!(fs.rename(b"a", b"a/b/x"), Err(FsError::Invalid));
+	//
+	// `ReadOnly` rather than `Invalid` since 2026-08-12, and the change is the point: an entry
+	// naming the root is an ALIAS of an inode that may have no names, so the mount now refuses to
+	// write to this volume at all rather than refusing this one move. The termination this test is
+	// named for is unaffected - both walks still return - and the refusal is earlier and wider.
+	assert_eq!(fs.rename(b"a", b"a/b/x"), Err(FsError::ReadOnly));
+	assert!(fs.is_read_only(), "a name resolving to the root took the volume read-only");
+	// The walk that matters here still finishes, over the loop, with the volume in that state.
+	assert!(fs.fsck().is_ok(), "and fsck still terminates over the cycle");
 }
 
 #[test]
@@ -4695,6 +4758,33 @@ fn fsck_runs_the_decompressor_and_counts_a_bad_stream_apart() {
 	assert_eq!(report.stream_failures, 1, "the stream failure is counted as one: {:?}", report.faults);
 	assert_eq!(report.checksum_failures, 0, "and not as a failing medium, because the medium is fine");
 	assert!(mentions(&report.faults, b"stream does not decode"), "named for what it is: {:?}", report.faults);
+	assert_eq!(report.structural_failures, 0, "the metadata is intact; only the stream is not");
+}
+
+#[test]
+fn a_compressed_extent_with_a_bad_checksum_is_counted_once() {
+	// The mirror of the test above, and the one that was missing. `structural_failures` was
+	// `faults.len() - stream_failures`, so a compressed extent whose blocks fail their checksums was
+	// counted TWICE - once by the scrub pass into `checksum_failures`, and once again as structural
+	// because it was in `faults` and was not a stream failure. The three counters exist because they
+	// send an operator to three different places; two of them naming one fault defeats that.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.set_compression(true);
+	fs.write_file(b"c.bin", &[0x41u8; 4 * BLOCK_SIZE]).unwrap();
+	assert_eq!(fs.fsck().unwrap().checksum_failures, 0, "a healthy compressed file is clean");
+
+	// Damage a stored block and leave the checksum alone: the medium disagrees with what was
+	// written, which is precisely one fault of precisely one kind.
+	let mut dev = fs.into_device();
+	let (block, _) = first_extent_of(&dev);
+	let at = block as usize * BLOCK_SIZE;
+	dev.blocks[at + 4..at + 16].copy_from_slice(&[0xFFu8; 12]);
+
+	let mut fs = LiberFs::mount(dev).unwrap();
+	let report = fs.fsck().unwrap();
+	assert!(report.checksum_failures >= 1, "the scrub pass sees the medium disagreeing: {:?}", report.faults);
+	assert_eq!(report.stream_failures, 0, "and it is not a stream failure");
+	assert_eq!(report.structural_failures, 0, "nor a structural one - the metadata is untouched");
 }
 
 #[test]
@@ -4896,6 +4986,35 @@ fn a_directory_can_be_read_a_page_at_a_time() {
 	assert!(counted.read_dir_page(b"d", Some(&paged.last().unwrap().0), 7).unwrap().is_empty());
 	// A file is not a directory, whichever way it is read.
 	assert_eq!(counted.read_dir_page(name_of(0).as_bytes(), None, 7).err(), Some(FsError::NotDir));
+}
+
+#[test]
+fn a_directory_record_naming_the_root_is_an_alias_too() {
+	// The alias map is set on an inode's FIRST sighting and reports on its second, which is right
+	// for every inode that has a name. The root has none - nothing may name it - so its first
+	// sighting is already the alias, and over a zeroed bitmap a record pointing at inode 0 merely
+	// set bit 0 and the walk carried on. A volume with a namespace loop through the root mounted
+	// writable, while `fsck` - whose `reached` set contains the root before the walk starts - called
+	// the same image damaged. That disagreement is what this milestone is named after.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	fs.write_file(b"a.txt", b"shared").unwrap();
+	let root = fs.root_inode;
+	let mut inode = fs.read_inode(root).unwrap();
+	let mut buf = vec![0u8; BLOCK_SIZE];
+	fs.read_node(inode.dir_root, inode.dir_root_crc, &mut buf).unwrap();
+	let recs = dir_leaf_parse(&buf);
+	assert_eq!(recs.len(), 1);
+	// The one record now names the root itself: a loop, perfectly formed and checksummed.
+	let looped: Vec<DirRec> = alloc::vec![DirRec { hash: recs[0].hash, name: recs[0].name.clone(), child: root }];
+	dir_leaf_write(&mut buf, &looped);
+	let crc = fs.write_node_to(inode.dir_root, &buf).unwrap();
+	inode.dir_root_crc = crc;
+	fs.write_inode(root, &mut inode).unwrap();
+	fs.commit().unwrap();
+
+	let mut remounted = LiberFs::mount(fs.into_device()).unwrap();
+	assert!(remounted.is_read_only(), "a name resolving to the root is an alias of an inode that may have none");
+	assert_eq!(remounted.write_file(b"b.txt", b"x"), Err(FsError::ReadOnly), "and nothing may be written over it");
 }
 
 #[test]

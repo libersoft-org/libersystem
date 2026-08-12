@@ -153,13 +153,38 @@ impl Cg {
 		self.line("\t\tself.write(&mut w)?;");
 		self.line("\t\tSome(w.pos())");
 		self.line("\t}");
+		// `encode_vec` REFUSES a type that carries a capability, and `encode_message` is the shape
+		// that carries both halves. The pair the generator advertised as a round trip was not one:
+		// `encode_vec` built a `VecWriter`, called `write` - which may call `set_handle` - and then
+		// returned `w.into_inner()`, which is `self.buf`, discarding the handles; `decode` mirrored
+		// it with no capabilities at all. Half a wire representation could be passed around by
+		// accident, and for a capability-bearing type the half that was dropped was the live one.
 		self.line("\tpub fn encode_vec(&self) -> Option<Vec<u8>> {");
 		self.line("\t\tlet mut w = VecWriter::new();");
 		self.line("\t\tself.write(&mut w)?;");
+		self.line("\t\t// A capability recorded here would be dropped by returning the bytes alone.");
+		self.line("\t\tif !w.handles().is_empty() { return None; }");
 		self.line("\t\tSome(w.into_inner())");
 		self.line("\t}");
+		self.line("\tpub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {");
+		self.line("\t\tlet mut w = VecWriter::new();");
+		self.line("\t\tself.write(&mut w)?;");
+		self.line("\t\tlet handles = Handles::try_from_slice(w.handles())?;");
+		self.line("\t\tSome((w.into_inner(), handles))");
+		self.line("\t}");
+		// `decode` requires the reader to have FINISHED: `01 02 03` and `01 02 03 DE AD BE EF` used
+		// to decode to the same value, because nothing asked whether the bytes were all consumed.
 		self.line(&format!("\tpub fn decode(bytes: &[u8]) -> Option<{ty}> {{"));
-		self.line(&format!("\t\t{ty}::read(&mut Reader::new(bytes))"));
+		self.line("\t\tlet mut r = Reader::new(bytes);");
+		self.line(&format!("\t\tlet value = {ty}::read(&mut r)?;"));
+		self.line("\t\tr.finish()?;");
+		self.line("\t\tSome(value)");
+		self.line("\t}");
+		self.line(&format!("\tpub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<{ty}> {{"));
+		self.line("\t\tlet mut r = Reader::with_handles(bytes, handles);");
+		self.line(&format!("\t\tlet value = {ty}::read(&mut r)?;"));
+		self.line("\t\tr.finish()?;");
+		self.line("\t\tSome(value)");
 		self.line("\t}");
 	}
 
@@ -395,9 +420,18 @@ impl Cg {
 				}
 			}
 			let params = trait_params(m)?;
-			if let Type::Stream(elem) = &m.ret {
+			if let Some((elem, err)) = stream_return(&m.ret) {
 				let et = rust_ty(elem).map_err(|e| Error::new(m.span, e))?;
-				self.line(&format!("\t\tfn {}(&mut self{params}) -> Vec<{et}>;", field_ident(&m.name)));
+				// A stream in a `result` gives the service a way to say the stream never starts.
+				// Without it the only refusal available is an empty stream, which a caller cannot
+				// tell from an empty directory.
+				match err {
+					Some(errty) => {
+						let ety = rust_ty(errty).map_err(|e| Error::new(m.span, e))?;
+						self.line(&format!("\t\tfn {}(&mut self{params}) -> Result<Vec<{et}>, {ety}>;", field_ident(&m.name)));
+					}
+					None => self.line(&format!("\t\tfn {}(&mut self{params}) -> Vec<{et}>;", field_ident(&m.name))),
+				}
 			} else {
 				let ret = rust_ty(&m.ret).map_err(|e| Error::new(m.span, e))?;
 				self.line(&format!("\t\tfn {}(&mut self{params}) -> {ret};", field_ident(&m.name)));
@@ -405,7 +439,7 @@ impl Cg {
 		}
 		self.line("\t}");
 		self.line("");
-		let has_non_stream: bool = supported.iter().any(|m| !matches!(&m.ret, Type::Stream(_)));
+		let has_non_stream: bool = supported.iter().any(|m| stream_return(&m.ret).is_none());
 		if has_non_stream {
 			self.line("\tpub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {");
 			self.line("\t\tlet mut reader = Reader::with_handle_list(request, request_handles);");
@@ -423,12 +457,12 @@ impl Cg {
 			self.line("\t\t\tw.u32(corr)?;");
 			self.line(&format!("\t\t\tw.bytes_lp(b\"{}\")?;", self.package_id));
 			self.line(&format!("\t\t\tw.u32({})?;", self.package_version));
-			self.line("\t\t\t*reply_handles = Handles::from_slice(writer.handles());");
+			self.line("\t\t\tmatch Handles::try_from_slice(writer.handles()) { Some(taken) => *reply_handles = taken, None => return None }");
 			self.line("\t\t\treturn Some(writer.pos());");
 			self.line("\t\t}");
 			self.line("\t\tmatch op {");
 			for m in &supported {
-				if matches!(&m.ret, Type::Stream(_)) {
+				if stream_return(&m.ret).is_some() {
 					continue;
 				}
 				self.line(&format!("\t\t\tOP_{} => {{", screaming(&m.name)));
@@ -461,7 +495,7 @@ impl Cg {
 					self.line("\t\t\t\t\tSome(())");
 					self.line("\t\t\t\t})();");
 					self.line("\t\t\t\tif encoded.is_none() {");
-					self.line("\t\t\t\t\tif writer.has_handle() { *reply_handles = Handles::from_slice(writer.handles()); return None; }");
+					self.line("\t\t\t\t\tif writer.has_handle() { match Handles::try_from_slice(writer.handles()) { Some(taken) => *reply_handles = taken, None => {} } return None; }");
 					self.line("\t\t\t\t\t// the reply outgrew the caller's buffer: replace it with a typed");
 					self.line("\t\t\t\t\t// error, so the client sees a failure instead of hanging.");
 					self.line("\t\t\t\t\twriter.reset();");
@@ -478,7 +512,7 @@ impl Cg {
 					self.line("\t\t\t\t\tSome(())");
 					self.line("\t\t\t\t})();");
 					self.line("\t\t\t\tif encoded.is_none() {");
-					self.line("\t\t\t\t\tif writer.has_handle() { *reply_handles = Handles::from_slice(writer.handles()); }");
+					self.line("\t\t\t\t\tif writer.has_handle() { match Handles::try_from_slice(writer.handles()) { Some(taken) => *reply_handles = taken, None => return None } }");
 					self.line("\t\t\t\t\treturn None;");
 					self.line("\t\t\t\t}");
 				}
@@ -486,7 +520,7 @@ impl Cg {
 			}
 			self.line("\t\t\t_ => return None,");
 			self.line("\t\t}");
-			self.line("\t\t*reply_handles = Handles::from_slice(writer.handles());");
+			self.line("\t\tmatch Handles::try_from_slice(writer.handles()) { Some(taken) => *reply_handles = taken, None => return None }");
 			self.line("\t\tSome(writer.pos())");
 			self.line("\t}");
 		} else {
@@ -503,10 +537,14 @@ impl Cg {
 		// onto the producer; the client drains the consumer with ordinary receives,
 		// decoding each element with `<m>_read`, until the producer closes.
 		for m in &supported {
-			if let Type::Stream(elem) = &m.ret {
+			if let Some((elem, err)) = stream_return(&m.ret) {
 				let mname = field_ident(&m.name);
 				let et = rust_ty(elem).map_err(|e| Error::new(m.span, e))?;
-				self.line(&format!("\tpub fn {mname}_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<{et}>)> {{"));
+				let opened = match err {
+					Some(errty) => format!("Result<Vec<{et}>, {}>", rust_ty(errty).map_err(|e| Error::new(m.span, e))?),
+					None => format!("Vec<{et}>"),
+				};
+				self.line(&format!("\tpub fn {mname}_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, {opened})> {{"));
 				self.line("\t\tlet mut reader = Reader::with_handle_list(request, request_handles);");
 				self.line("\t\tlet r = &mut reader;");
 				self.line("\t\tlet _op = r.u16()?;");
@@ -523,6 +561,36 @@ impl Cg {
 				self.line(&format!("\t\tlet items = service.{mname}({});", args.join(", ")));
 				self.line("\t\tSome((corr, items))");
 				self.line("\t}");
+				if let Some(errty) = err {
+					// THE TWO REPLY BODIES A RESULT-WRAPPED STREAM HAS, emitted here because the
+					// serve loop owns the sub-channel and cannot let the writer carry the handle.
+					//
+					// Ok is `corr`, the tag, and the handle's four-byte placeholder; the consumer
+					// end travels in the reply's handle list, which is where the loop puts it. Err
+					// is `corr`, the tag and the error - and NO handle, so a client that decodes an
+					// error is not also left holding a channel nobody will write to.
+					self.line(&format!("\tpub fn {mname}_reply_ok(corr: u32, out: &mut [u8]) -> Option<usize> {{"));
+					self.line("\t\tlet mut writer = SliceWriter::new(out);");
+					self.line("\t\tlet w = &mut writer;");
+					self.line("\t\tw.u32(corr)?;");
+					self.line("\t\tw.u8(1)?;");
+					self.line("\t\tw.u32(0)?;");
+					self.line("\t\tSome(writer.pos())");
+					self.line("\t}");
+					let ety = rust_ty(errty).map_err(|e| Error::new(m.span, e))?;
+					self.line(&format!("\tpub fn {mname}_reply_err(corr: u32, error: &{ety}, out: &mut [u8]) -> Option<usize> {{"));
+					self.line("\t\tlet mut writer = SliceWriter::new(out);");
+					self.line("\t\tlet w = &mut writer;");
+					self.line("\t\tw.u32(corr)?;");
+					self.line("\t\tw.u8(0)?;");
+					let code = self.write_place(errty, "error", true).map_err(|e| Error::new(m.span, e))?;
+					self.line(&format!("\t\t{code}"));
+					// An error that will not encode must not become a silent Ok: the caller checks
+					// for `None` and answers with nothing rather than with the wrong thing.
+					self.line("\t\tif writer.has_handle() { return None; }");
+					self.line("\t\tSome(writer.pos())");
+					self.line("\t}");
+				}
 				self.line(&format!("\tpub fn {mname}_frame(seq: u32, item: &{et}, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {{"));
 				self.line("\t\tlet mut writer = SliceWriter::new(out);");
 				self.line("\t\tlet encoded: Option<()> = (|| {");
@@ -597,8 +665,12 @@ impl Cg {
 		self.line("\t\t}");
 		for m in &supported {
 			let params = client_params(m)?;
-			if let Type::Stream(_) = &m.ret {
-				self.line(&format!("\t\tpub fn {}(&mut self{params}) -> Option<u64> {{", field_ident(&m.name)));
+			if let Some((_, err)) = stream_return(&m.ret) {
+				let ret = match err {
+					Some(errty) => format!("Result<u64, {}>", rust_ty(errty).map_err(|e| Error::new(m.span, e))?),
+					None => "u64".to_string(),
+				};
+				self.line(&format!("\t\tpub fn {}(&mut self{params}) -> Option<{ret}> {{", field_ident(&m.name)));
 				self.line("\t\t\tlet corr = self.next_corr();");
 				self.line("\t\t\tlet mut writer = VecWriter::new();");
 				self.line("\t\t\tlet w = &mut writer;");
@@ -608,17 +680,47 @@ impl Cg {
 					let code = self.write_place(&p.ty, &field_ident(&p.name), true).map_err(|e| Error::new(p.span, e))?;
 					self.line(&format!("\t\t\t{code}"));
 				}
-				self.line("\t\t\tlet request_handles = Handles::from_slice(writer.handles());");
+				self.line("\t\t\tlet request_handles = Handles::try_from_slice(writer.handles())?;");
 				self.line("\t\t\tlet request = writer.into_inner();");
 				self.line("\t\t\tlet mut reply_handles = Handles::new();");
 				self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;");
 				self.line("\t\t\tlet mut reader = Reader::new(&reply);");
 				self.line("\t\t\tlet r = &mut reader;");
-				self.line("\t\t\tif r.u32()? != corr || reply_handles.is_empty() {");
-				self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
-				self.line("\t\t\t\treturn None;");
-				self.line("\t\t\t}");
-				self.line("\t\t\tSome(reply_handles.first())");
+				// EXACTLY ONE, and the extras closed. This checked only that the list was NOT
+				// EMPTY and then used `first()`, so a reply carrying `[channel, cap2, cap3]`
+				// passed, one handle was used and the other two were never closed - `Handles` is
+				// not an owner, so dropping it closes nothing. The ordinary reply path already
+				// discards what the schema did not account for; this one did not.
+				match err {
+					None => {
+						self.line("\t\t\tif r.u32()? != corr || reply_handles.len() != 1 {");
+						self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
+						self.line("\t\t\t\treturn None;");
+						self.line("\t\t\t}");
+						self.line("\t\t\tSome(reply_handles.first())");
+					}
+					Some(errty) => {
+						// THE TAG DECIDES HOW MANY HANDLES THE REPLY MAY CARRY, and both arms are
+						// bounded. An `Ok` with anything but one handle, or an `Err` with any, is a
+						// reply this schema cannot have produced - and every one of those handles
+						// is a capability, so they are discarded rather than dropped.
+						self.line("\t\t\tlet decoded = (|| {");
+						self.line("\t\t\t\tif r.u32()? != corr { return None; }");
+						self.line("\t\t\t\tif r.u8()? != 0 {");
+						self.line("\t\t\t\t\tlet _ = r.u32()?;");
+						self.line("\t\t\t\t\tif reply_handles.len() != 1 { return None; }");
+						self.line("\t\t\t\t\treturn Some(Ok(reply_handles.first()));");
+						self.line("\t\t\t\t}");
+						self.line("\t\t\t\tif !reply_handles.is_empty() { return None; }");
+						let errexpr = self.read_value(errty).map_err(|e| Error::new(m.span, e))?;
+						self.line(&format!("\t\t\t\tSome(Err({errexpr}))"));
+						self.line("\t\t\t})();");
+						self.line("\t\t\tif !matches!(decoded, Some(Ok(_))) {");
+						self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
+						self.line("\t\t\t}");
+						self.line("\t\t\tdecoded");
+					}
+				}
 				self.line("\t\t}");
 				continue;
 			}
@@ -633,7 +735,7 @@ impl Cg {
 				let code = self.write_place(&p.ty, &field_ident(&p.name), true).map_err(|e| Error::new(p.span, e))?;
 				self.line(&format!("\t\t\t{code}"));
 			}
-			self.line("\t\t\tlet request_handles = Handles::from_slice(writer.handles());");
+			self.line("\t\t\tlet request_handles = Handles::try_from_slice(writer.handles())?;");
 			self.line("\t\t\tlet request = writer.into_inner();");
 			self.line("\t\t\tlet mut reply_handles = Handles::new();");
 			self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;");
@@ -656,7 +758,11 @@ impl Cg {
 		for m in &supported {
 			let params = client_params(m)?;
 			let args = m.params.iter().map(|param| field_ident(&param.name)).collect::<Vec<_>>().join(", ");
-			let ret = if matches!(m.ret, Type::Stream(_)) { "u64".to_string() } else { rust_ty(&m.ret).map_err(|error| Error::new(m.span, error))? };
+			let ret = match stream_return(&m.ret) {
+				Some((_, None)) => "u64".to_string(),
+				Some((_, Some(errty))) => format!("Result<u64, {}>", rust_ty(errty).map_err(|error| Error::new(m.span, error))?),
+				None => rust_ty(&m.ret).map_err(|error| Error::new(m.span, error))?,
+			};
 			let symbol = format!("liber_channel_impl_{}_{}_{}", symbol_ident(&self.package), symbol_ident(&i.name), symbol_ident(&m.name));
 			self.line("");
 			self.line("\t#[cfg(feature = \"channel-client-impl\")]");
@@ -1232,13 +1338,34 @@ fn flags_width(count: usize) -> &'static str {
 // `stream<T>` return is supported when its element type is (it is delivered over a
 // sub-channel, not inline); a `buffer` is carried zero-copy as an out-of-band handle
 // plus an in-stream length.
+// The stream a method returns, if it returns one: its element type, and the error arm when the
+// stream is wrapped in a `result`.
+//
+// `result<stream<T>, error>` PARSED AND GENERATED NOTHING. The generator matched `Type::Stream` on
+// the return position directly, so a stream inside a result never reached that arm and the
+// value-position paths refused it with "stream is not supported in a value position" - the method
+// vanished from the trait, every consumer stopped compiling, and the schema could not express "this
+// stream may fail before it starts". `Volume::list` therefore answered a directory it could not
+// read with an empty listing, which is exactly the semantics this project spent a milestone
+// removing everywhere else.
+fn stream_return(ret: &Type) -> Option<(&Type, Option<&Type>)> {
+	match ret {
+		Type::Stream(elem) => Some((elem.as_ref(), None)),
+		Type::Result(ok, err) => match ok.as_ref() {
+			Type::Stream(elem) => Some((elem.as_ref(), Some(err.as_ref()))),
+			_ => None,
+		},
+		_ => None,
+	}
+}
+
 fn method_supported(m: &Method) -> bool {
 	if !m.params.iter().all(|p| type_codec_ok(&p.ty)) {
 		return false;
 	}
-	match &m.ret {
-		Type::Stream(elem) => type_codec_ok(elem.as_ref()),
-		other => type_codec_ok(other),
+	match stream_return(&m.ret) {
+		Some((elem, err)) => type_codec_ok(elem) && err.is_none_or(type_codec_ok),
+		None => type_codec_ok(&m.ret),
 	}
 }
 

@@ -998,7 +998,7 @@ pub struct LiberFs<D: BlockDevice> {
 	// One bit per inode number for the live generation's namespace walk, and whether it found an
 	// inode named twice. The format has no hardlinks and no link count, so one name per inode is
 	// its rule; `derive_free` is where it can be checked without reading anything extra.
-	mark_names: Option<Vec<u8>>,
+	mark_names: Option<BTreeSet<u32>>,
 	mark_alias: bool,
 	// The highest inode key the live walk saw. `next_inode` hands out numbers ABOVE
 	// everything in use, and checking only that `next_inode` itself is free is not that

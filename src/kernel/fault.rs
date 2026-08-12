@@ -135,7 +135,13 @@ pub fn clear_crash_notify() {
 fn notify_crash(koid: u64, kind: u64) {
 	let channel = CRASH_NOTIFY.lock().clone();
 	if let Some(channel) = channel {
-		let mut bytes: Vec<u8> = Vec::with_capacity(16);
+		// FALLIBLY, on the FAULT path - which runs when a process has just died, a plausible moment
+		// for the heap to be short, and where this function has already promised it "must neither
+		// block nor fail". `Vec::with_capacity` aborts.
+		let mut bytes: Vec<u8> = Vec::new();
+		if bytes.try_reserve_exact(16).is_err() {
+			return;
+		}
 		bytes.extend_from_slice(&koid.to_le_bytes());
 		bytes.extend_from_slice(&kind.to_le_bytes());
 		let _ = channel.send(Message::new(bytes, Vec::new(), 0));

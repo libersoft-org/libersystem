@@ -224,6 +224,12 @@ impl Ld {
 			}
 			common = i;
 		}
+		// AND BACK OFF TO A CHARACTER BOUNDARY. The comparison above is over bytes, so two names
+		// whose first multi-byte character shares a lead byte produced a prefix ending INSIDE a
+		// code point - which is a broken glyph on the display and half a character in the buffer.
+		while common > 0 && common < first.len() && first[common] & 0xc0 == 0x80 {
+			common -= 1;
+		}
 		if common > prefix.len() {
 			for i in prefix.len()..common {
 				self.insert(first[i], e);
@@ -275,13 +281,41 @@ impl Ld {
 		}
 		self.line[self.cursor] = c;
 		self.len += 1;
-		if self.echo {
-			e.put(&self.line[self.cursor..self.len]);
-		}
 		self.cursor += 1;
-		if self.echo {
-			self.move_left(self.len - self.cursor, e);
+		// A CHARACTER REACHES THE SCREEN, NOT A BYTE.
+		//
+		// The echo used to happen per byte, so a multi-byte character mid-line put its lead byte on
+		// the display, then the whole suffix, and only then its continuation bytes - a valid line
+		// in the buffer and a replacement character on the screen. Nothing is echoed until the
+		// character under the cursor is complete.
+		if self.echo && self.char_is_complete() {
+			e.put(&self.line[self.char_start(self.cursor)..self.len]);
+			// And the step back is in CELLS, which is what the terminal moves in.
+			self.move_left(self.columns(self.cursor, self.len), e);
 		}
+	}
+
+	// Whether the bytes ending at the cursor form a complete UTF-8 character.
+	//
+	// A lead byte says how many continuation bytes follow it; until they have all arrived the
+	// character is half-typed and nothing should be drawn.
+	fn char_is_complete(&self) -> bool {
+		let start = self.char_start(self.cursor);
+		let lead = self.line[start];
+		let want = if lead < 0x80 {
+			1
+		} else if lead & 0xe0 == 0xc0 {
+			2
+		} else if lead & 0xf0 == 0xe0 {
+			3
+		} else if lead & 0xf8 == 0xf0 {
+			4
+		} else {
+			// A stray continuation byte is not the start of anything; treat it as complete so a
+			// malformed paste still shows something rather than swallowing the rest of the line.
+			1
+		};
+		self.cursor - start >= want
 	}
 
 	fn backspace(&mut self, e: &mut Echo) {
@@ -382,7 +416,10 @@ impl Ld {
 
 	fn home(&mut self, e: &mut Echo) {
 		if self.echo {
-			self.move_left(self.cursor, e);
+			// CELLS, NOT BYTES. `self.cursor` is a byte offset, so `cau` with an accent - four
+			// bytes, three cells - moved the cursor four columns and left the caret a column left
+			// of where the text starts, inside the prompt.
+			self.move_left(self.columns(0, self.cursor), e);
 		}
 		self.cursor = 0;
 	}
@@ -418,7 +455,10 @@ impl Ld {
 	fn replace_line(&mut self, new: &[u8], e: &mut Echo) {
 		if self.echo {
 			e.put(&self.line[self.cursor..self.len]);
-			for _ in 0..self.len {
+			// CELLS, NOT BYTES. This erased `self.len` times, so Ctrl+U or a history recall over a
+			// line containing any multi-byte character erased past the start of the line and into
+			// the prompt - one extra backspace-space-backspace per continuation byte.
+			for _ in 0..self.columns(0, self.len) {
 				e.put(b"\x08 \x08");
 			}
 		}

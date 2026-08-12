@@ -55,6 +55,20 @@ pub struct Process {
 	// checks is set, leaves something behind that nothing will ever collect. Refusing from
 	// here on closes the window at its start rather than at its end.
 	terminating: AtomicBool,
+	// How many resource-EXTENDING operations are inside their critical section right now, and the
+	// lock that publishes `terminating` against them.
+	//
+	// The flag alone was never enough for anything wider than one instruction. `sys_memory_map`
+	// read `is_terminating()` at its top and called `record_memory_mapping` at its bottom, with a
+	// VA reservation and a page-table walk in between; `terminate` publishes the flag and takes its
+	// `core::mem::take` snapshot in between those two. The check and the record were not one step
+	// and the teardown ran between them.
+	//
+	// So an extending operation takes a GUARD - `begin_extend` - which is refused once the flag is
+	// up and which `begin_teardown` waits out before its snapshot. "The process is live" is then
+	// true for the whole operation rather than at its first instruction, and the record methods
+	// live on the guard so there is no way to reach them without holding one.
+	extending: SpinLock<usize>,
 	// Set when the process's last thread has exited (a clean exit, no kill). Together
 	// with `killed` this is the terminal "process gone" condition a Process handle
 	// becomes waitable on - the kernel's equivalent of a process-terminated signal,
@@ -112,6 +126,15 @@ pub struct Process {
 	// until termination removes its PTEs and returns the virtual range.
 	mapped_memory: SpinLock<Vec<Arc<MemoryObject>>>,
 	mapped_dma: SpinLock<Vec<Arc<DmaBuffer>>>,
+	// Every DmaBuffer this process CREATED, weakly, whether or not it is mapped and whether or not
+	// it is still in the handle table.
+	//
+	// The orphan pass used to walk the handle table alone, and a buffer can be absent from that at
+	// the instant the pass runs: `take_for_transfer` empties the slot and leaves it reserved, so
+	// `for_each_object` sees nothing there. An unmarked buffer's frames go straight back into
+	// circulation on drop - the rule losing its own precondition. A registry joined at CREATION
+	// does not depend on the handle table being the only place a capability lives.
+	dma_buffers: SpinLock<Vec<alloc::sync::Weak<DmaBuffer>>>,
 	// Eager system-image dynamic symbols registered by successfully relocated
 	// provider modules. The registry is process-local: dependency order and symbol
 	// visibility cannot leak between security domains or launches.
@@ -130,7 +153,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
@@ -354,9 +377,14 @@ impl Process {
 	// Dead` with a guard every resource-extending syscall holds - is still worth having; what is
 	// closed here is the one path that demonstrably ends with a live thread inside a dead process.
 	#[must_use]
-	pub fn register_thread(&self, thread: &Arc<Thread>) -> bool {
+	fn register_thread(&self, thread: &Arc<Thread>) -> bool {
 		let mut threads = self.threads.lock();
 		if self.terminating.load(Ordering::Acquire) {
+			return false;
+		}
+		// FALLIBLY, and under the lock that makes this a barrier - which is precisely where an
+		// abort is least welcome and most necessary.
+		if threads.try_reserve(1).is_err() {
 			return false;
 		}
 		self.live_thread_count.fetch_add(1, Ordering::AcqRel);
@@ -364,13 +392,27 @@ impl Process {
 		true
 	}
 
-	// Publish "this process is going away" so no further thread can join it.
+	// Publish "this process is going away", and WAIT OUT everything already extending it.
 	//
-	// Under the `threads` lock, which is what makes it a barrier rather than a second racing flag:
-	// a `register_thread` either sees the flag and refuses, or completes before this returns.
+	// Two locks, because the flag has to be published against both things that read it. Under
+	// `threads`, a `register_thread` either sees the flag and refuses or completes before this
+	// returns. Under `extending`, the same holds for every other resource-extending operation -
+	// and those are not single instructions, so the flag being up is not enough: this then spins
+	// until the count reaches zero, which is what makes the caller's `core::mem::take` snapshot
+	// complete rather than merely late.
+	//
+	// The spin terminates because a guard is only ever held across a bounded syscall body, and it
+	// cannot deadlock against this: nothing takes a guard on a process it is tearing down. The
+	// lock is dropped between attempts so a holder on this core's queue can still make progress.
 	fn begin_teardown(&self) {
-		let _threads = self.threads.lock();
-		self.terminating.store(true, Ordering::Release);
+		{
+			let _threads = self.threads.lock();
+			let _extending = self.extending.lock();
+			self.terminating.store(true, Ordering::Release);
+		}
+		while *self.extending.lock() != 0 {
+			core::hint::spin_loop();
+		}
 	}
 
 	// One thread of this process has finished. Returns true for the thread that was the
@@ -465,16 +507,29 @@ impl Process {
 		self.handles.lock().len() as u64
 	}
 
-	pub fn record_memory_mapping(&self, object: Arc<MemoryObject>) {
-		self.mapped_memory.lock().push(object);
+	// Begin a resource-EXTENDING operation, or refuse because the process is going away.
+	//
+	// The refusal is decided under `extending`, and `begin_teardown` publishes the flag while
+	// holding the same lock and then waits for the count to reach zero - so an operation either
+	// sees the flag and refuses, or finishes before the teardown takes its snapshot. That is the
+	// difference between a barrier and a second racing flag, and it is the same shape
+	// `register_thread` already had against the `threads` lock, generalised.
+	pub fn begin_extend(&self) -> Option<ExtendGuard<'_>> {
+		let mut extending = self.extending.lock();
+		if self.terminating.load(Ordering::Acquire) {
+			return None;
+		}
+		*extending += 1;
+		drop(extending);
+		Some(ExtendGuard { process: self })
+	}
+
+	fn end_extend(&self) {
+		*self.extending.lock() -= 1;
 	}
 
 	pub fn forget_memory_mapping(&self, object: &Arc<MemoryObject>) {
 		self.mapped_memory.lock().retain(|mapped| !Arc::ptr_eq(mapped, object));
-	}
-
-	pub fn record_dma_mapping(&self, object: Arc<DmaBuffer>) {
-		self.mapped_dma.lock().push(object);
 	}
 
 	pub fn forget_dma_mapping(&self, object: &Arc<DmaBuffer>) {
@@ -492,12 +547,23 @@ impl Process {
 	// the one that is gone.
 	//
 	// Before `close_all`, because after it there is nothing left to mark.
+	// Runs AFTER `begin_teardown`, which is what makes "every buffer this process ever created" a
+	// closed set: a creation that had not joined the registry yet was inside a guard the teardown
+	// waited out, and a creation that starts later is refused the guard.
 	fn orphan_dma_buffers(&self) {
 		self.handles.lock().for_each_object(|object| {
 			if let Some(dma) = object.as_any().downcast_ref::<crate::object::dma_buffer::DmaBuffer>() {
 				dma.mark_orphaned();
 			}
 		});
+		// AND the registry, which is the half the handle table cannot answer for: a buffer in
+		// flight through `take_for_transfer` is in no table at all, and one whose handle was closed
+		// while another process still holds a reference is in someone else's.
+		for weak in self.dma_buffers.lock().iter() {
+			if let Some(dma) = weak.upgrade() {
+				dma.mark_orphaned();
+			}
+		}
 	}
 
 	fn unmap_objects(&self) {
@@ -554,6 +620,69 @@ impl Drop for Process {
 			// leaving a process's worth of memory quarantined until somebody else fills the queue.
 			crate::mem::frame::drain_quarantine();
 		}
+	}
+}
+
+// A resource-EXTENDING operation in progress, and the only way to reach the three records.
+//
+// The records are methods here rather than on `Process` so that "held the guard across the check
+// AND the record" is not a convention a caller can forget: without one there is nothing to call.
+// Each is fallible for the same reason every other syscall-reachable allocation in this kernel is -
+// a ring-3 caller decides how many of these exist, and a short heap must be a refusal rather than
+// an abort.
+pub struct ExtendGuard<'a> {
+	process: &'a Process,
+}
+
+impl ExtendGuard<'_> {
+	pub fn process(&self) -> &Process {
+		self.process
+	}
+
+	#[must_use]
+	pub fn record_memory_mapping(&self, object: Arc<MemoryObject>) -> bool {
+		let mut mapped = self.process.mapped_memory.lock();
+		if mapped.try_reserve(1).is_err() {
+			return false;
+		}
+		mapped.push(object);
+		true
+	}
+
+	#[must_use]
+	pub fn record_dma_mapping(&self, object: Arc<DmaBuffer>) -> bool {
+		let mut mapped = self.process.mapped_dma.lock();
+		if mapped.try_reserve(1).is_err() {
+			return false;
+		}
+		mapped.push(object);
+		true
+	}
+
+	// Join the process's DMA registry. Called where the buffer is CREATED, not where it is mapped:
+	// an unmapped buffer is still a physical address a device may have been given.
+	#[must_use]
+	pub fn record_dma_buffer(&self, object: &Arc<DmaBuffer>) -> bool {
+		let mut buffers = self.process.dma_buffers.lock();
+		// Dead entries first, so a driver that cycles buffers does not grow the list without bound
+		// and the reservation below is against a real length.
+		buffers.retain(|weak| weak.strong_count() != 0);
+		if buffers.try_reserve(1).is_err() {
+			return false;
+		}
+		buffers.push(Arc::downgrade(object));
+		true
+	}
+
+	#[must_use]
+	pub fn register_thread(&self, thread: &Arc<Thread>) -> bool {
+		self.process.register_thread(thread)
+	}
+}
+
+impl Drop for ExtendGuard<'_> {
+	fn drop(&mut self) {
+		self.process.end_extend();
 	}
 }
 

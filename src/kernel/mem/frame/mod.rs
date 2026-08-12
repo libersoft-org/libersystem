@@ -103,6 +103,24 @@ struct FrameAllocator {
 	owned_base: u64,
 	#[cfg(debug_assertions)]
 	owned_frames: u64,
+	// WHAT ORDER EACH OWNED FRAME WAS LAST HANDED OUT AT, and how many allocations had happened by
+	// then. One byte and four bytes per frame, debug builds only.
+	//
+	// This exists for one unexplained defect: eighty double allocations of one page, seen once on
+	// riscv64, on the last page of the first usable region, never reproduced. The detector below
+	// could say THAT it happened and nothing about the state that produced it - and the state is
+	// the whole question, because the buddy seeds by framing each region into blocks of falling
+	// order, so a region's tail lands in the small orders and is among the first memory ever handed
+	// out. "Which order did this page come out of, the first time and this time" is what turns that
+	// from a guess into a reconstruction.
+	//
+	// 0xFF means "never handed out".
+	#[cfg(debug_assertions)]
+	owned_order: Option<Vec<u8>>,
+	#[cfg(debug_assertions)]
+	owned_seq: Option<Vec<u32>>,
+	#[cfg(debug_assertions)]
+	allocations: u32,
 }
 
 impl FrameAllocator {
@@ -120,6 +138,12 @@ impl FrameAllocator {
 			owned_base: 0,
 			#[cfg(debug_assertions)]
 			owned_frames: 0,
+			#[cfg(debug_assertions)]
+			owned_order: None,
+			#[cfg(debug_assertions)]
+			owned_seq: None,
+			#[cfg(debug_assertions)]
+			allocations: 0,
 		}
 	}
 
@@ -149,6 +173,42 @@ impl FrameAllocator {
 
 	#[cfg(not(debug_assertions))]
 	fn mark_owned(&mut self, _base: u64, _pages: u64, _owned: bool) {}
+
+	// The record's index for a physical address, or None when the address is outside it.
+	#[cfg(debug_assertions)]
+	fn record_index(&self, phys: u64) -> Option<usize> {
+		let index = phys.checked_sub(self.owned_base)? / PAGE_SIZE;
+		(index < self.owned_frames).then_some(index as usize)
+	}
+
+	// Record what order a span was handed out at, and the allocation number it was.
+	#[cfg(debug_assertions)]
+	fn note_handout(&mut self, base: u64, pages: u64, order: u8) {
+		self.allocations = self.allocations.wrapping_add(1);
+		let (seq, frames) = (self.allocations, pages);
+		for page in 0..frames {
+			let Some(index) = self.record_index(base + page * PAGE_SIZE) else { continue };
+			if let Some(orders) = self.owned_order.as_mut() {
+				orders[index] = order;
+			}
+			if let Some(seqs) = self.owned_seq.as_mut() {
+				seqs[index] = seq;
+			}
+		}
+	}
+
+	#[cfg(not(debug_assertions))]
+	fn note_handout(&mut self, _base: u64, _pages: u64, _order: u8) {}
+
+	// What the record remembers about a frame: the order it was last handed out at (255 = never)
+	// and the allocation number that did it.
+	#[cfg(debug_assertions)]
+	fn previous_handout(&self, phys: u64) -> (u8, u32) {
+		let Some(index) = self.record_index(phys) else { return (u8::MAX, 0) };
+		let order = self.owned_order.as_ref().map_or(u8::MAX, |orders| orders[index]);
+		let seq = self.owned_seq.as_ref().map_or(0, |seqs| seqs[index]);
+		(order, seq)
+	}
 
 	// Is every frame of this span currently out on loan from THIS allocator?
 	//
@@ -317,8 +377,13 @@ impl FrameAllocator {
 				// pages are gone: marked not-owned above and not free below. Counted and said,
 				// because `free_count` claiming memory the bitmap does not hold is how a pool comes
 				// to report free frames that no allocation can find.
+				// RETIRED, not forgotten: `mark_owned` here rather than through `note_retired_pages`
+				// because this runs with the allocator already locked. The pages stay recorded as
+				// out on loan, which is what they are - out, and never coming back.
+				RETIRED_PAGES.fetch_add(pages - taken, core::sync::atomic::Ordering::AcqRel);
 				LOST_PAGES.fetch_add(pages - taken, core::sync::atomic::Ordering::AcqRel);
-				crate::serial_println!("frame: WARNING: {} of {pages} page(s) at {base:#x} fell outside the buddy's extent and are LOST", pages - taken);
+				self.mark_owned(base + taken * PAGE_SIZE, pages - taken, true);
+				crate::serial_println!("frame: WARNING: {} of {pages} page(s) at {base:#x} fell outside the buddy's extent and are RETIRED - out of circulation for good, and recorded as such", pages - taken);
 			}
 			return;
 		}
@@ -396,10 +461,16 @@ impl FrameAllocator {
 				self.free_count += 1;
 			}
 			if !self.check_not_owned(base, 1) {
-				crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {base:#x}, which is already on loan");
+				// THE ORDER AND THE ALLOCATION NUMBER, both times. "This page came out twice" is
+				// not a reconstruction; "it came out at order 0 as allocation 412 and again at
+				// order 0 as allocation 9310" is one, and it is what the one unexplained riscv64
+				// sighting needed and did not have.
+				let (order, seq) = self.previous_handout(base);
+				crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {base:#x} at order 0 as allocation {}, and it was already on loan from order {order} as allocation {seq}", self.allocations.wrapping_add(1));
 				DOUBLE_ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 			}
 			self.free_count -= 1;
+			self.note_handout(base, 1, 0);
 			self.mark_owned(base, 1, true);
 			return Some(base);
 		}
@@ -426,11 +497,22 @@ impl FrameAllocator {
 	fn take_contiguous(&mut self, pages: u64) -> Option<u64> {
 		if let Some(buddy) = self.buddy.as_mut() {
 			let base = buddy.alloc_contiguous(pages)?;
+			// The order a contiguous request is served from: `pages` rounded up to a power of two.
+			let order: u8 = pages.next_power_of_two().trailing_zeros() as u8;
 			if !self.check_not_owned(base, pages) {
-				crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {pages} page(s) at {base:#x}, part of which is already on loan");
+				let mut first = base;
+				for page in 0..pages {
+					if !self.check_not_owned(base + page * PAGE_SIZE, 1) {
+						first = base + page * PAGE_SIZE;
+						break;
+					}
+				}
+				let (was, seq) = self.previous_handout(first);
+				crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {pages} page(s) at {base:#x} at order {order} as allocation {}, and {first:#x} was already on loan from order {was} as allocation {seq}", self.allocations.wrapping_add(1));
 				DOUBLE_ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
 			}
 			self.free_count -= pages as usize;
+			self.note_handout(base, pages, order);
 			self.mark_owned(base, pages, true);
 			return Some(base);
 		}
@@ -521,7 +603,7 @@ pub fn upgrade_to_heap() {
 	// The extent can only SHRINK while the metadata is being reserved - reserving takes frames, it
 	// never adds them - so a buddy sized from this read still covers the pool that is seeded into it
 	// under the lock below.
-	let (extent, total, owned_words) = {
+	let (extent, total, owned_words, owned_frames) = {
 		let allocator = ALLOCATOR.lock();
 		let runs = allocator.runs();
 		let extent = runs.first().zip(runs.last()).map(|(first, last)| (first.base, (last.base + last.pages * PAGE_SIZE - first.base) / PAGE_SIZE));
@@ -529,7 +611,11 @@ pub fn upgrade_to_heap() {
 		let words = (allocator.owned_frames as usize).div_ceil(64);
 		#[cfg(not(debug_assertions))]
 		let words = 0usize;
-		(extent, allocator.total_count, words)
+		#[cfg(debug_assertions)]
+		let frames = allocator.owned_frames as usize;
+		#[cfg(not(debug_assertions))]
+		let frames = 0usize;
+		(extent, allocator.total_count, words, frames)
 	};
 	let buddy = extent.and_then(|(base, pages)| Buddy::new(base, pages));
 
@@ -577,8 +663,26 @@ pub fn upgrade_to_heap() {
 			bits
 		}
 	};
+	// THE ORDER AND SEQUENCE RECORD, beside the bitmap and reserved the same way: five bytes per
+	// frame, 5 MiB on a 4 GiB machine, in debug builds only. It exists to describe a double
+	// allocation rather than merely announce one, so a failure to reserve it is not a reason to
+	// give up the bitmap - the detector still fires, it just says less.
+	#[cfg(debug_assertions)]
+	let (orders, seqs) = {
+		let mut orders: Vec<u8> = Vec::new();
+		let mut seqs: Vec<u32> = Vec::new();
+		if orders.try_reserve_exact(owned_frames).is_err() || seqs.try_reserve_exact(owned_frames).is_err() {
+			crate::serial_println!("frame: could not reserve the allocation-order record; a double allocation will be reported without the order it came from");
+			(Vec::new(), Vec::new())
+		} else {
+			// 0xFF is "never handed out", which is what every frame is before the first allocation.
+			orders.resize(owned_frames, u8::MAX);
+			seqs.resize(owned_frames, 0);
+			(orders, seqs)
+		}
+	};
 	#[cfg(not(debug_assertions))]
-	let _ = owned_words;
+	let _ = (owned_words, owned_frames);
 
 	let mut allocator = ALLOCATOR.lock();
 	if allocator.heap.is_some() || allocator.buddy.is_some() {
@@ -587,6 +691,11 @@ pub fn upgrade_to_heap() {
 	if let Some(mut table) = runs {
 		table.extend_from_slice(&allocator.seed[..allocator.seed_len]);
 		allocator.heap = Some(table);
+	}
+	#[cfg(debug_assertions)]
+	if !orders.is_empty() {
+		allocator.owned_order = Some(orders);
+		allocator.owned_seq = Some(seqs);
 	}
 	#[cfg(debug_assertions)]
 	if !bits.is_empty() {
@@ -697,6 +806,21 @@ pub fn lost_pages() -> u64 {
 
 static REFUSED_FREES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static LOST_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Pages RETIRED FOREVER: taken out of circulation deliberately because a shootdown did not complete
+// or a span fell outside the buddy's extent, and marked as such rather than forgotten.
+//
+// A retired page is not free and not allocated, and until this existed it was in NEITHER view - so
+// `frame::audit()` reported the machine's own bookkeeping as diverged for the rest of the boot, and
+// the boot report could not tell "this kernel deliberately gave up on N pages" from "N pages went
+// missing". Those are different news: the first is a shootdown problem with a receipt, the second
+// is a memory problem.
+static RETIRED_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// How many pages this kernel has retired forever.
+pub fn retired_pages() -> u64 {
+	RETIRED_PAGES.load(core::sync::atomic::Ordering::Acquire)
+}
 // Frames handed out while already on loan. Zero is the only acceptable value and a test says so.
 static DOUBLE_ALLOCATIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -713,8 +837,31 @@ fn note_refused_free() {
 }
 
 // A valid free that could not be tracked. `pages` is what the machine just lost.
-fn note_lost_pages(pages: u64) {
+//
+// `pub(crate)` because the frame allocator is not the only place a page can leave circulation
+// without being freed: the DMA hold table leaks rather than hand a device's frames to the next
+// allocator, and a machine accumulating those has to be diagnosable from the same number as one
+// accumulating these. One counter, or the number means "some of the losses".
+pub(crate) fn note_lost_pages(pages: u64) {
 	LOST_PAGES.fetch_add(pages, core::sync::atomic::Ordering::AcqRel);
+}
+
+// The same page, RETIRED: counted, and marked in the ownership record as still out on loan.
+//
+// A retired page is not free and not allocated. The record's third state is "owned by nobody, for
+// ever", and the honest way to spell that with one bit is to leave the OWNED bit set - the page is
+// out and never coming back - so the record and the buddy agree again and `audit()` stops reporting
+// a divergence that is really a deliberate loss.
+//
+// The buddy's own bitmap does not carry the state, and that is the narrower thing this does than
+// the milestone asked. Adding a second bit per page to metadata carved at boot is a change to the
+// allocator's layout; recording it where the machine already keeps a per-frame view costs nothing
+// and answers the question the audit was asking. What is NOT recovered is the release build's view,
+// where the ownership record does not exist - there, the counter is all there is.
+fn note_retired_pages(base: u64, pages: u64) {
+	RETIRED_PAGES.fetch_add(pages, core::sync::atomic::Ordering::AcqRel);
+	LOST_PAGES.fetch_add(pages, core::sync::atomic::Ordering::AcqRel);
+	ALLOCATOR.lock().mark_owned(base, pages, true);
 }
 
 // Deterministic out-of-frames injection, for tests only.
@@ -964,8 +1111,8 @@ pub unsafe fn retire(frames: &[u64]) {
 					if crate::mem::tlb::shootdown() {
 						unsafe { deallocate(phys) };
 					} else {
-						note_lost_pages(1);
-						crate::serial_println!("frame: WARNING: {phys:#x} could not be queued and its shootdown did not complete; the page is not being tracked ({} lost so far)", lost_pages());
+						note_retired_pages(phys, 1);
+						crate::serial_println!("frame: WARNING: {phys:#x} could not be queued and its shootdown did not complete; the page is RETIRED - out of circulation for good, and recorded as such ({} retired, {} lost in all)", retired_pages(), lost_pages());
 					}
 					quarantine = QUARANTINE.lock();
 				}
@@ -984,8 +1131,10 @@ pub unsafe fn retire(frames: &[u64]) {
 			unsafe { drain_quarantine() };
 			return;
 		}
-		note_lost_pages(unqueued_len as u64);
-		crate::serial_println!("frame: WARNING: {unqueued_len} page(s) could not be queued and their shootdown did not complete; they are not being tracked ({} lost so far)", lost_pages());
+		for &phys in unqueued.iter().take(unqueued_len) {
+			note_retired_pages(phys, 1);
+		}
+		crate::serial_println!("frame: WARNING: {unqueued_len} page(s) could not be queued and their shootdown did not complete; they are RETIRED - out of circulation for good, and recorded as such ({} retired, {} lost in all)", retired_pages(), lost_pages());
 	}
 	if drain {
 		unsafe { drain_quarantine() };

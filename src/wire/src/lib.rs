@@ -3,8 +3,13 @@
 //! All integers are little-endian and there is no padding or alignment, so the
 //! byte layout is exactly as written. Encoding writes into a caller buffer and
 //! returns `None` on overflow; decoding returns `None` on a short or malformed
-//! buffer. Everything is heap-free except `string_lp`, which allocates the
-//! decoded `String`.
+//! buffer.
+//!
+//! THE FIXED-BUFFER BINARY PATH ALLOCATES NOTHING. That is the property worth having and it is
+//! narrower than "everything is heap-free except `string_lp`", which this header used to claim
+//! above a `VecWriter`, a JSON renderer returning `String` and a CBOR renderer building a `Vec`.
+//! The owned decoding and rendering helpers may allocate; `SliceWriter`, `Reader` over a borrowed
+//! buffer and `Handles` do not.
 
 #![no_std]
 
@@ -21,10 +26,19 @@ pub trait Sink {
 	// Append one byte, or return None if the sink is full.
 	fn put(&mut self, b: u8) -> Option<()>;
 
-	// Record the out-of-band handle to transfer with this message (at most one per
-	// message, matching the kernel channel's single-handle limit).
+	// Record one out-of-band handle to transfer with this message, refusing past `MAX_HANDLES`.
+	//
+	// THE KERNEL ALLOWS FOUR. This said "at most one per message, matching the kernel channel's
+	// single-handle limit", which was the opposite of true - the syscalls exist, `set_handle` itself
+	// accepts four, and a trait comment is the first thing a reader builds their model from.
 	fn set_handle(&mut self, h: u64) -> Option<()>;
 
+	// The default is byte at a time; the two concrete sinks below override it with a bulk copy.
+	//
+	// This is the codec's hot path - a multi-kilobyte string goes through it - and the default was
+	// the only implementation. It stays as the DEFAULT because a new sink should work before it is
+	// fast, and because `ipc-client` is checked against an exact list of runtime imports: the
+	// overrides are where a `memcpy` may appear, and they are the two sinks that already carry one.
 	fn raw(&mut self, s: &[u8]) -> Option<()> {
 		for &b in s {
 			self.put(b)?;
@@ -137,6 +151,14 @@ impl<'a> Sink for SliceWriter<'a> {
 		Some(())
 	}
 
+	// One bounds check and one copy, rather than one of each per byte.
+	fn raw(&mut self, s: &[u8]) -> Option<()> {
+		let end = self.pos.checked_add(s.len())?;
+		self.buf.get_mut(self.pos..end)?.copy_from_slice(s);
+		self.pos = end;
+		Some(())
+	}
+
 	// Append a handle to be transferred with this message. Refuses past the bound rather than
 	// dropping one, because a silently missing capability is a stage wired to nothing.
 	fn set_handle(&mut self, h: u64) -> Option<()> {
@@ -180,8 +202,20 @@ impl VecWriter {
 }
 
 impl Sink for VecWriter {
+	// FALLIBLE GROWTH. `Vec::push` aborts on an allocation failure, and everywhere else this
+	// runtime works to make attacker-sized allocations refusable - `Reader::string_lp` does exactly
+	// that. `None` here means the same thing it means for `SliceWriter`: the sink could not take
+	// the byte.
 	fn put(&mut self, b: u8) -> Option<()> {
+		self.buf.try_reserve(1).ok()?;
 		self.buf.push(b);
+		Some(())
+	}
+
+	// One reservation and one extend for the whole slice.
+	fn raw(&mut self, s: &[u8]) -> Option<()> {
+		self.buf.try_reserve(s.len()).ok()?;
+		self.buf.extend_from_slice(s);
 		Some(())
 	}
 
@@ -212,7 +246,12 @@ pub trait Transport {
 	// Host test transports need no action; the runtime closes them. Takes the whole list: a
 	// reply refused after decoding may carry more than one, and closing only the first leaks
 	// the rest.
-	fn discard_handles(&mut self, _handles: &[u64]) {}
+	//
+	// NO DEFAULT BODY. It had one - an empty method - so a future transport whose author simply did
+	// not implement it compiled silently and leaked every capability from every malformed reply.
+	// Resource ownership is not an opt-in; a test transport that genuinely needs no action writes
+	// the empty body itself and says so.
+	fn discard_handles(&mut self, handles: &[u64]);
 }
 
 // A cursor that reads from a borrowed buffer.
@@ -221,7 +260,12 @@ pub trait Transport {
 // admitted exactly one, which is what stopped a pipeline stage from being handed its stdin and
 // stdout together. Four is stdin, stdout, stderr and one spare: bounded, because everything
 // here is, and a fixed array keeps this no_std and allocation-free.
-pub const MAX_HANDLES: usize = 4;
+//
+// THE KERNEL'S NUMBER, not a copy of it. This was `pub const MAX_HANDLES: usize = 4` beside a
+// `pub use abi::{PROTOCOL_INFO_OP, TYPED_OP_MAX}` carrying a comment about not copying values -
+// the file did the right thing for two constants and the wrong thing for the third. The day
+// somebody raises the kernel's limit is the day that matters.
+pub use abi::MAX_MESSAGE_CAPS as MAX_HANDLES;
 
 // Re-exported so generated code, which reaches this crate as `crate::codec` but never `abi`,
 // names the SAME constant the runtime and the validator use rather than a copy of its value.
@@ -233,6 +277,16 @@ pub use abi::{PROTOCOL_INFO_OP, TYPED_OP_MAX};
 // `request_handle: &mut u64` and `reply_handle: &mut u64`, and widening those to a list as a
 // pair of parameters each (an array plus a count) would have doubled the parameter count at
 // every one of the 22 places that call a generated dispatch. One value carries both.
+//
+// NON-OWNING TRANSPORT METADATA, and `Copy` for that reason.
+//
+// Copying the numbers does not duplicate the capabilities, so two copies can each believe they own
+// them - which with handle reuse is the shape of an ABA bug. The alternative considered was a
+// move-only envelope with a `Drop` that closes; it was not taken, because this type is read by the
+// kernel-facing syscall wrappers, by the generated dispatch and by the serve loops, and a `Drop`
+// that closes would fire on every one of those borrows-by-value. What owns a capability in this
+// system is the code path, stated explicitly at each hand-off; this type carries the numbers
+// between them and says so here rather than implying otherwise by being move-only.
 #[derive(Clone, Copy)]
 pub struct Handles {
 	list: [u64; MAX_HANDLES],
@@ -251,35 +305,49 @@ impl Handles {
 		Handles { list: [0; MAX_HANDLES], count: 0 }
 	}
 
-	// Takes at most MAX_HANDLES, in the order given - which is encoding order, so a stage's
-	// stdin and stdout keep the positions their encoder gave them.
+	// Every handle given, in the order given - which is encoding order, so a stage's stdin and
+	// stdout keep the positions their encoder gave them. `None` past the bound.
+	//
+	// REFUSES RATHER THAN TRUNCATING. This was `handles.iter().take(MAX_HANDLES)`, and for ordinary
+	// data keeping the first four of five is a defensible API. For CAPABILITIES the fifth is not
+	// lost information - it is a live kernel object that nothing then closes. `set_handle` and
+	// `push` already refuse past the bound; these are the same question with the same answer.
 	#[inline]
-	pub fn from_slice(handles: &[u64]) -> Handles {
+	pub fn try_from_slice(handles: &[u64]) -> Option<Handles> {
+		if handles.len() > MAX_HANDLES {
+			return None;
+		}
 		let mut built = Handles::new();
 		// Copied element by element rather than with `copy_from_slice`, and read back through
 		// `get` rather than a range index, so this carries no call to `memcpy` and no slice
 		// bounds-check panic path. `ipc-client` is checked against an exact list of runtime
 		// imports, and a list this small should not add either.
-		for handle in handles.iter().take(MAX_HANDLES) {
+		for handle in handles.iter() {
 			built.list[built.count] = *handle;
 			built.count += 1;
 		}
-		built
+		Some(built)
 	}
 
 	// The first `count` of a raw array, for callers that receive one from a syscall. Takes a
 	// reference and copies element by element: passing the array by value is a 32-byte move
 	// that aarch64 codegen turns into a `memcpy` call, and `ipc-client` is checked against an
 	// exact list of runtime imports that should not have to grow for this.
+	//
+	// `None` for a count past the array, for the same reason `try_from_slice` refuses: the caller
+	// is reporting what a syscall said it received, and clamping it silently would lose a live
+	// capability.
 	#[inline]
-	pub fn from_array(list: &[u64; MAX_HANDLES], count: usize) -> Handles {
+	pub fn try_from_array(list: &[u64; MAX_HANDLES], count: usize) -> Option<Handles> {
+		if count > MAX_HANDLES {
+			return None;
+		}
 		let mut built = Handles::new();
-		let bounded = if count > MAX_HANDLES { MAX_HANDLES } else { count };
-		while built.count < bounded {
+		while built.count < count {
 			built.list[built.count] = list[built.count];
 			built.count += 1;
 		}
-		built
+		Some(built)
 	}
 
 	#[inline]
@@ -359,22 +427,29 @@ impl<'a> Reader<'a> {
 
 	// A reader for a message that arrived with one out-of-band transferred handle.
 	pub fn with_handle(buf: &'a [u8], handle: u64) -> Reader<'a> {
-		Reader::with_handles(buf, &[handle])
+		let mut handles = [0u64; MAX_HANDLES];
+		handles[0] = handle;
+		Reader { buf, pos: 0, handles, count: 1, taken: 0 }
 	}
 
 	// A reader for a message that arrived with several. They are taken in the order the
 	// encoder set them, which is the order the fields appear - so a stage's stdin and stdout
 	// cannot be swapped by a decoder reading them in a different order than they were written.
-	pub fn with_handles(buf: &'a [u8], transferred: &[u64]) -> Reader<'a> {
+	//
+	// TAKES A `Handles`, NOT AN ARBITRARY SLICE. It used to take a slice and clamp with
+	// `transferred.len().min(MAX_HANDLES)`, so handing it five capabilities silently dropped one -
+	// and a dropped capability is a live kernel object nothing then closes. A `Handles` is already
+	// bounded by construction, so the question cannot arise.
+	pub fn with_handles(buf: &'a [u8], transferred: &Handles) -> Reader<'a> {
 		let mut handles = [0u64; MAX_HANDLES];
-		let count = transferred.len().min(MAX_HANDLES);
-		handles[..count].copy_from_slice(&transferred[..count]);
-		Reader { buf, pos: 0, handles, count, taken: 0 }
+		let taken = transferred.as_slice();
+		handles[..taken.len()].copy_from_slice(taken);
+		Reader { buf, pos: 0, handles, count: taken.len(), taken: 0 }
 	}
 
-	// A reader for a message whose handles arrived as a bounded list.
+	// The name the generator emits. Kept as an alias so a regeneration is not needed to rename it.
 	pub fn with_handle_list(buf: &'a [u8], transferred: &Handles) -> Reader<'a> {
-		Reader::with_handles(buf, transferred.as_slice())
+		Reader::with_handles(buf, transferred)
 	}
 
 	// The next transferred handle, in the order they were encoded. None once they are spent,
@@ -406,8 +481,34 @@ impl<'a> Reader<'a> {
 		Some(s)
 	}
 
+	// ONE ENCODING PER VALUE. This was `Some(self.u8()? != 0)`, so 2 through 255 all decoded as
+	// `true` - one logical value with 255 spellings, against a stated contract that a malformed
+	// buffer answers `None`. Malleability with no purpose, and it starts costing the moment a frame
+	// is hashed, compared or replayed. The generated `option<T>` tag has the same shape and the
+	// same answer.
 	pub fn boolean(&mut self) -> Option<bool> {
-		Some(self.u8()? != 0)
+		match self.u8()? {
+			0 => Some(false),
+			1 => Some(true),
+			_ => None,
+		}
+	}
+
+	// EVERY BYTE AND EVERY CAPABILITY CONSUMED - called at the FRAMING boundary, not inside a
+	// nested `read`.
+	//
+	// `decode(bytes)` was `T::read(&mut Reader::new(bytes))` and never asked whether the reader had
+	// finished, so `01 02 03` and `01 02 03 DE AD BE EF` decoded to the same value. With extensible
+	// records deliberately deferred, the current format is fixed and a trailing byte is a message
+	// its writer and its reader disagree about.
+	//
+	// A nested `read` must NOT require the end of the buffer, which is why this is a separate call
+	// rather than a check inside `take`.
+	pub fn finish(&self) -> Option<()> {
+		if self.pos != self.buf.len() || self.taken != self.count {
+			return None;
+		}
+		Some(())
 	}
 
 	pub fn u8(&mut self) -> Option<u8> {
@@ -718,3 +819,6 @@ pub mod cbor {
 		head(out, 5, pairs as u64);
 	}
 }
+
+#[cfg(test)]
+mod tests;

@@ -231,7 +231,19 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 		// the listing arrives as a stream of entries (one frame each), so a big
 		// directory never has to fit one reply.
 		let consumer: u64 = match client.list(path) {
-			Some(c) => c,
+			Some(Ok(c)) => c,
+			// SAY WHICH FAILURE IT WAS. Every one of these arrived as "StorageService unavailable"
+			// while the listing had no error arm, so a path outside the grant and a service that
+			// was not running printed the same line.
+			Some(Err(e)) => {
+				eprint(match e {
+					proto::system::Error::Denied => b"ls: permission denied\n".as_slice(),
+					proto::system::Error::NotFound => b"ls: no such directory\n".as_slice(),
+					proto::system::Error::Again => b"ls: the volume is busy; try again\n".as_slice(),
+					_ => b"ls: the volume refused the listing\n".as_slice(),
+				});
+				return;
+			}
 			None => {
 				eprint(b"ls: StorageService unavailable\n");
 				return;

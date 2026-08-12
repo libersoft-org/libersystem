@@ -177,9 +177,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(fs) => Volume { fs: alloc::boxed::Box::new(IsoFs { fs }) },
 			None => exit(),
 		},
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"UDFBLOCK" => match Udf::mount(UdfBlockDevice { chan: handle }) {
-			Some(fs) => Volume { fs: alloc::boxed::Box::new(UdfFs { fs }) },
-			None => exit(),
+		// `mount_checked`, so a refusal says WHICH refusal. `mount` collapses "this is not UDF",
+		// "this UDF is damaged", "this UDF uses something the reader does not implement" and "the
+		// device would not answer" into one `None`, and a probe that tries backends in turn cannot
+		// tell "try the next one" from "this IS the format and it is broken, do not pretend
+		// otherwise". The distinction existed in the reader and stopped at this line.
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"UDFBLOCK" => match Udf::mount_checked(UdfBlockDevice { chan: handle }) {
+			Ok(fs) => Volume { fs: alloc::boxed::Box::new(UdfFs { fs }) },
+			Err(why) => {
+				unsafe { print(alloc::format!("storage: the UDF volume was refused: {why:?}\n").as_bytes()) };
+				exit()
+			}
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume { fs: alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None }) },
 		// The two memory volumes. They carry no handle - there is no block device to hand over,
@@ -893,10 +901,13 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 			}
 		}
 		if admin != 0 && ready == admin_koid {
-			match unsafe { recv_blocking(admin, &mut request) } {
-				Received::Message { len, handle } => {
+			match unsafe { recv_caps_blocking(admin, &mut request) } {
+				ReceivedCaps::Message { len, handles: mut caps } => {
 					let mut reply_handle = proto::codec::Handles::new();
-					let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+					// over the single-handle receive, which keeps the first and drops the rest - so a
+					// client sending stdin, stdout and stderr had two destroyed before dispatch.
+					let mut handle = caps;
 					let mut call = AdminCall { volume: vol, clients: &mut clients, set };
 					if let Some(reply_len) = volume_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
 						// Bounded like every other answer. Admin is privileged, so this is
@@ -910,7 +921,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						// service that can no longer be administered at all.
 						admin_quiet = match reply_outcome(admin, &reply[..reply_len], reply_handle.as_slice(), !admin_quiet) {
 							SendOutcome::Stalled => true,
-							// It took its answer, or the channel is gone and the `Received::Closed`
+							// It took its answer, or the channel is gone and the `ReceivedCaps::Closed`
 							// branch will retire it. Either way it is not a channel to keep skipping
 							// the wait for.
 							_ => false,
@@ -924,7 +935,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						unsafe { close(unclaimed) };
 					}
 				}
-				Received::Closed => {
+				ReceivedCaps::Closed => {
 					// Out of the set with it: a member whose handle is closed is a wake that can
 					// never be answered.
 					let _ = unsafe { waitset_remove(set, admin_koid) };
@@ -946,8 +957,8 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		let chan: u64 = clients[index].chan;
 		let scope: Scope = clients[index].scope.clone();
 		let quiet: bool = clients[index].quiet;
-		match unsafe { recv_blocking(chan, &mut request) } {
-			Received::Message { len, .. } if len == 0 => {
+		match unsafe { recv_caps_blocking(chan, &mut request) } {
+			ReceivedCaps::Message { len, .. } if len == 0 => {
 				if index == 0 {
 					exit();
 				}
@@ -961,8 +972,11 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				release_client(set, &mut clients, index);
 				unsafe { close(chan) };
 			}
-			Received::Message { len, handle } => {
-				let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+			ReceivedCaps::Message { len, handles: mut caps } => {
+				// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+				// over the single-handle receive, which keeps the first and drops the rest - so a
+				// client sending stdin, stdout and stderr had two destroyed before dispatch.
+				let mut handle = caps;
 				// Set when a client would not take its reply within the bound. It is dropped below:
 				// a client that has stopped reading is gone for every practical purpose, and the
 				// alternative is holding the whole service for it.
@@ -994,7 +1008,15 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 						// A second listing while one is in flight is refused, like a second stream.
 						if listing.is_some() {
 							let corr = if len >= 6 { u32::from_le_bytes([request[2], request[3], request[4], request[5]]) } else { 0 };
-							stalled = reply_to(chan, &corr.to_le_bytes(), &[], !quiet);
+							// `again`, and it now SAYS `again`: one listing at a time is a statement
+							// about this moment and the caller may retry. It used to be a bare
+							// correlation id, which the client could not tell from a directory that
+							// is not there.
+							let mut body: [u8; 32] = [0u8; 32];
+							stalled = match volume::list_reply_err(corr, &Error::Again, &mut body) {
+								Some(n) => reply_to(chan, &body[..n], &[], !quiet),
+								None => false,
+							};
 						} else {
 							match stream_list(vol, chan, &scope, quiet, &request[..len], &mut handle) {
 								ListStart::Started(started) => listing = Some(started),
@@ -1054,7 +1076,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 					unsafe { close(unclaimed) };
 				}
 			}
-			Received::Closed => {
+			ReceivedCaps::Closed => {
 				if index == 0 {
 					exit();
 				}
@@ -1184,28 +1206,54 @@ fn stream_list(vol: &mut Volume, service: u64, scope: &Scope, quiet: bool, reque
 		return ListStart::Done;
 	}
 	request_handle.clear();
-	let corr_bytes: [u8; 4] = corr.to_le_bytes();
-	// A correlation id with no handle is the refusal form of this reply, and every path below that
-	// cannot produce a stream uses it - including the two that used to answer nothing at all,
-	// leaving the client waiting on a listing that was never going to come.
-	let refuse = |chan: u64| -> ListStart { if reply_to(chan, &corr_bytes, &[], !quiet) { ListStart::ClientStalled } else { ListStart::Done } };
+	// THE REFUSAL SAYS WHY, which is what the schema's error arm is for. It used to be a
+	// correlation id and nothing else - a reply the client could only read as "no stream", with a
+	// directory that is not there, a path outside the grant and a volume that could not be read all
+	// looking identical. `list_reply_err` encodes the error the caller can act on.
+	//
+	// Every path below that cannot produce a stream goes through it, including the two that once
+	// answered nothing at all and left the client waiting on a listing that was never coming.
+	let refuse = |chan: u64, error: Error| -> ListStart {
+		let mut body: [u8; 32] = [0u8; 32];
+		match volume::list_reply_err(corr, &error, &mut body) {
+			// An error that will not encode is not a reason to send a malformed reply; the client's
+			// call fails, which is the same outcome by a coarser route.
+			None => ListStart::Done,
+			Some(n) => {
+				if reply_to(chan, &body[..n], &[], !quiet) {
+					ListStart::ClientStalled
+				} else {
+					ListStart::Done
+				}
+			}
+		}
+	};
 	if !scope.allows_path(vol.name(), &path) {
-		return refuse(service);
+		return refuse(service, Error::Denied);
 	}
 	let items: Vec<FileInfo> = match vol.list_entries(&path) {
 		Ok(items) => items,
-		Err(_) => return refuse(service),
+		Err(e) => return refuse(service, e),
 	};
 	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
 		Some(pair) => pair,
-		None => return refuse(service),
+		// No channel to give: the host is out of resources, not the volume.
+		None => return refuse(service, Error::Again),
+	};
+	// The Ok body: the correlation id, the tag, and the handle's placeholder - the consumer end
+	// itself travels in the reply's handle list below.
+	let mut ok_body: [u8; 16] = [0u8; 16];
+	let Some(ok_len) = volume::list_reply_ok(corr, &mut ok_body) else {
+		unsafe { close(producer) };
+		unsafe { close(consumer) };
+		return ListStart::Done;
 	};
 	// CHECKED, and it is the send that most needs checking, because it carries a capability. If the
 	// client closed the main channel just after asking, or simply will not read, the consumer
 	// handle is never delivered - `reply_to` closes what it could not hand over, and the producer
 	// is this function's to close. Leaving them open leaked the capability AND left the producer
 	// with a live peer nobody would ever read, so the next send blocked forever.
-	match reply_outcome(service, &corr_bytes, &[consumer], !quiet) {
+	match reply_outcome(service, &ok_body[..ok_len], &[consumer], !quiet) {
 		SendOutcome::Delivered => {}
 		// The consumer is already closed by `reply_outcome`; the producer is this function's, and
 		// a producer whose peer is gone is a handle nobody will ever take back.
@@ -1519,15 +1567,14 @@ impl volume::Service for Volume {
 	// List the directory named by a vol:// path (each entry as name + byte length +
 	// kind), for `ls`. An empty subdirectory names the volume root. Streamed entry by
 	// entry (the serve loop frames the vector onto a sub-channel), so a big directory
-	// never has to fit one reply; a bad path is an empty stream.
-	fn list(&mut self, path: String) -> Vec<FileInfo> {
-		// An empty listing for a path that could not be read is the semantics this milestone spent
-		// a round removing everywhere else. It survives here because the generated trait gives this
-		// method no way to fail - `list` returns `stream<file-info>` in the schema, with no error
-		// arm - and because the serve loop answers OP_LIST itself and never calls this. Dead today;
-		// wrong the day a generated dispatch does call it, and not fixable from this side. It goes
-		// with the schema change that gives the listing protocol its terminal frame.
-		self.list_entries(&path).unwrap_or_default()
+	// never has to fit one reply.
+	//
+	// A DIRECTORY THAT COULD NOT BE READ IS AN ERROR, not an empty listing. It was the latter for
+	// as long as the schema said `stream<file-info>` with no error arm, and that was the one
+	// "a failure looks like an empty answer" case this contract had left - kept alive by a
+	// generator that emitted nothing for `result<stream<T>, error>` rather than by anything here.
+	fn list(&mut self, path: String) -> Result<Vec<FileInfo>, Error> {
+		self.list_entries(&path)
 	}
 
 	// Create or overwrite a file from the zero-copy `data` buffer. The transferred
@@ -2415,6 +2462,10 @@ impl iso9660::BlockDevice for IsoBlockDevice {
 		let sector: u64 = lba * ISO_SECTORS;
 		unsafe { block_read(self.chan, sector, ISO_SECTORS as u32, buf.as_mut_ptr()) }
 	}
+
+	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
+		unsafe { read_blocks_chunked(self.chan, ISO_SECTORS, index, count, buf, ISO_SECTORS as usize * SECTOR_SIZE) }
+	}
 }
 
 // A fourth virtio-blk disk as a block device for the UDF backend: DVD / Blu-ray media is
@@ -2430,6 +2481,45 @@ impl udf::BlockDevice for UdfBlockDevice {
 		let sector: u64 = lba * UDF_SECTORS;
 		unsafe { block_read(self.chan, sector, UDF_SECTORS as u32, buf.as_mut_ptr()) }
 	}
+
+	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
+		unsafe { read_blocks_chunked(self.chan, UDF_SECTORS, index, count, buf, UDF_SECTORS as usize * SECTOR_SIZE) }
+	}
+}
+// How many 2048-byte logical blocks one request may carry.
+//
+// The reader asks for a whole contiguous extent and the DEFAULT `read_blocks` in `fs-core` is a
+// loop over `read_block`, so an extent of a thousand blocks was a thousand messages to the driver -
+// the batching the readers already ask for existed nowhere. Overriding it here is what makes the
+// call mean something.
+//
+// Chunked rather than passed straight through: the driver's `Span::fit` GROWS its DMA buffer to
+// whatever a request needs, so handing it a hundred-megabyte extent asks it to allocate one. 64
+// blocks is 128 kB per request - sixty-four times fewer round trips than a block at a time, and a
+// buffer size the driver was already sized for.
+const READ_BLOCKS_PER_REQUEST: u64 = 64;
+
+// One `read_blocks` for both optical backends: same shape, different sectors-per-block.
+unsafe fn read_blocks_chunked(chan: u64, sectors_per_block: u64, index: u64, count: u64, buf: &mut [u8], block_bytes: usize) -> bool {
+	if count == 0 {
+		return true;
+	}
+	if buf.len() < count as usize * block_bytes {
+		return false;
+	}
+	let mut done: u64 = 0;
+	while done < count {
+		let run: u64 = core::cmp::min(READ_BLOCKS_PER_REQUEST, count - done);
+		let at: usize = done as usize * block_bytes;
+		let bytes: usize = run as usize * block_bytes;
+		let Ok(sectors) = u32::try_from(run * sectors_per_block) else { return false };
+		// SAFETY: `buf` was checked above to hold `count` blocks, and this window is inside it.
+		if !unsafe { block_read(chan, (index + done) * sectors_per_block, sectors, buf[at..at + bytes].as_mut_ptr()) } {
+			return false;
+		}
+		done += run;
+	}
+	true
 }
 
 // Mount the LiberFS on the virtio-blk disk. The volume's container is a GPT partition carrying the

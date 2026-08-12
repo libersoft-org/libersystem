@@ -178,8 +178,18 @@ impl Raster {
 	}
 
 	// Position one 8-bit colour channel into the framebuffer pixel value.
+	//
+	// A ZERO-WIDTH CHANNEL CONTRIBUTES NOTHING AND SHIFTS NOTHING. The validation admits
+	// `size = 0` with `shift = 32`, because its test is `shift + size.min(8) > 32` and `32 + 0` is
+	// not greater than 32 - so this evaluated `x << 32` on a `u32`, which panics in debug and is
+	// meaningless in release. `Mapping::from_info` accepts only `B8g8r8x8` today so no caller
+	// reaches it, and that is not the standard for a function whose whole purpose in this milestone
+	// was to stop being unsound: a safety boundary holds for every argument it admits.
 	fn channel(&self, value: u8, size: u8, shift: u8) -> u32 {
 		let size = (size as u32).min(8);
+		if size == 0 || shift >= 32 {
+			return 0;
+		}
 		((value as u32) >> (8 - size)) << (shift as u32)
 	}
 

@@ -292,7 +292,9 @@ struct Pending {
 	// Allocating it up front turns that into a refusal at `stream_begin`, before anything is sent.
 	//
 	// `None` for a replace, where the name is already in the tree.
-	name: Option<String>,
+	// Whether `stream_begin` put an empty file at the path to hold the name and the slot. An abort
+	// takes it away again; a commit writes over it.
+	placeholder: bool,
 	// How many bytes the last `stream_spare` handed out and nobody has accounted for yet.
 	//
 	// Without it the pair is not a protocol, it is two functions that happen to be called in the
@@ -342,10 +344,11 @@ impl LiberMemFs {
 	pub fn footprint(&self) -> u64 {
 		// The pending stream counts. It is memory this volume has caused to be allocated, exactly
 		// like a file's, and leaving it out is what let the accounting disagree with the heap.
-		// The prepared name counts too. It is memory this volume caused to be allocated exactly as
-		// the path and the data are, and leaving it out is what let the accounting disagree with
-		// the heap - the same defect the pending state was added to `footprint` to fix.
-		let pending = self.pending.as_ref().map_or(0, |p| p.data.capacity() + p.path.capacity() + p.name.as_ref().map_or(0, String::capacity));
+		// The prepared name is no longer counted here and does not need to be: it is IN THE TREE
+		// now, as the placeholder entry `stream_begin` inserts, so `self.root.names()` below already
+		// has it. Counting it twice would be the accounting error this line exists to prevent, in
+		// the other direction.
+		let pending = self.pending.as_ref().map_or(0, |p| p.data.capacity() + p.path.capacity());
 		(self.root.allocated() + self.root.names() + pending) as u64
 	}
 
@@ -522,10 +525,28 @@ impl LiberMemFs {
 		// reached the fallible allocation it was supposed to refuse at.
 		let mut parts: Segments<'_> = [""; MAX_PATH_DEPTH];
 		let mut count = 0usize;
-		for segment in text.split('/') {
+		let last_index = text.split('/').count().saturating_sub(1);
+		for (index, segment) in text.split('/').enumerate() {
 			if segment.is_empty() {
-				// Leading, trailing and doubled separators are tolerated: `/a/b/`, `a//b` and
-				// `a/b` name the same thing, which is what every caller in this tree expects.
+				// A SEPARATOR AT EITHER END IS A SEPARATOR; ONE IN THE MIDDLE IS A MISSING NAME.
+				//
+				// This skipped every empty segment under a comment saying `/a/b/`, `a//b` and `a/b`
+				// named the same thing, "which is what every caller in this tree expects". They do
+				// not: `fscore::validate_name_segment` answers `BadName` for an empty segment, and
+				// the sentence claiming consensus was the part that was wrong.
+				//
+				// `a//b` is now refused, which removes the real ambiguity - two spellings of one
+				// path, on a filesystem whose sibling backend rejects one of them.
+				//
+				// Leading and trailing separators are still tolerated, and that is a DECISION
+				// rather than an oversight. LiberFS is stricter still - `split_segments` passes
+				// every segment to the validator, so `/a/b` is `BadName` there - and matching it
+				// would change what `vol://` paths mean for every caller in the tree. Which of the
+				// two rules the Storage ABI should state is a question for the ABI; what could not
+				// stand is a middle segment meaning different things on two volumes under it.
+				if index != 0 && index != last_index {
+					return Err(FsError::BadName);
+				}
 				continue;
 			}
 			// The SHARED policy, not this filesystem's own. Two writable backends were enforcing
@@ -846,7 +867,10 @@ impl LiberMemFs {
 		// the entry's own cost.
 		// The path AND the destination's name, because both are taken below and both are held for
 		// the stream's lifetime.
-		let entry_cost = path.len() + if is_new { parts.last().map_or(0, |name| name.len()) } else { 0 };
+		// The path, the destination's name, AND the slot the placeholder below takes - because
+		// `footprint` counts the directory table it goes into, so a check that leaves the slot out
+		// admits a stream the volume then cannot hold.
+		let entry_cost = path.len() + if is_new { parts.last().map_or(0, |name| name.len()) + SLOT_BYTES } else { 0 };
 		if (self.footprint() as usize).saturating_add(entry_cost) > self.capacity {
 			return Err(FsError::NoSpace);
 		}
@@ -872,12 +896,23 @@ impl LiberMemFs {
 		// commit failed after accepting everything" into "the stream was refused before anything
 		// was sent".
 		//
-		// The parent's SLOT is deliberately not pre-reserved with it. A directory table is on the
-		// separate metadata budget, not the volume's capacity, and reserving one here would make a
-		// reserved volume's `reservation_intact` arithmetic count memory that budget does not -
-		// two budgets meeting in the one place they must not. `room_for_an_entry` has already said
-		// at begin that a slot is available.
-		let mut name = None;
+		// AND THE SLOT, by putting an empty file there now.
+		//
+		// The name was prepaid and the slot was not, so `insert`'s `children.try_reserve(1)` was a
+		// fallible allocation at COMMIT - after the whole file had been accepted. "The stream
+		// promised to take this and the commit cannot fail" was therefore not true: it could fail,
+		// on one slot, at the end.
+		//
+		// A placeholder answers that and the namespace question together. `stream_begin` validated
+		// a destination and then held nothing, so another client could `rmdir` the parent or
+		// `mkdir` over the path while a large transfer was in flight and the commit would discover
+		// it - work already done, thrown away. An entry in the tree is a claim on the name.
+		//
+		// This is not the budget confusion that was refused before. RESERVING a slot inside the
+		// capacity arithmetic would make a reserved volume count memory the metadata budget does
+		// not; inserting an ordinary entry charges the metadata budget, which is where a directory
+		// entry has always been charged. `room_for_an_entry` has already said one is available.
+		let placeholder = is_new;
 		if is_new {
 			let last = parts.last().copied().unwrap_or("");
 			let mut owned_name = String::new();
@@ -886,9 +921,13 @@ impl LiberMemFs {
 				return Err(FsError::NoSpace);
 			}
 			owned_name.push_str(last);
-			name = Some(owned_name);
+			let placed = self.parent_mut(parts).and_then(|children| insert(children, owned_name, Node::File(Vec::new())));
+			if placed.is_err() {
+				self.resync_reservation();
+				return Err(FsError::NoSpace);
+			}
 		}
-		self.pending = Some(Pending { path: owned, data: Vec::new(), name, offered: None });
+		self.pending = Some(Pending { path: owned, data: Vec::new(), placeholder, offered: None });
 		// The allocator may hand back more than was asked for, and `footprint` counts what it
 		// actually gave. A volume must not end up over its own capacity because it was given a
 		// generous answer, so the overshoot is undone here rather than merely noticed later by
@@ -906,6 +945,18 @@ impl LiberMemFs {
 	// refused at the chunk that crosses the line rather than when the heap runs out.
 	pub fn stream_push(&mut self, chunk: &[u8]) -> Result<(), FsError> {
 		let Some(pending) = self.pending.as_ref() else { return Err(FsError::Invalid) };
+		// NOT WHILE AN OFFER IS OUTSTANDING. `stream_spare` hands the caller a zero-filled window
+		// and `stream_advance` truncates by `data.len() - (offered - written)` afterwards, so a push
+		// in between makes that arithmetic keep the WRONG BYTES: spare(100) then push("abc") then
+		// advance(100, 0) keeps the first three, which are the offer's zeros, and discards the three
+		// that were pushed. The volume then commits a three-byte file of zeros and reports it whole.
+		//
+		// Which is the sentence `stream_commit` already carries - "bytes that were never written, in
+		// a file that reports itself complete" - reached through the one entry point that was not
+		// asking. The question belongs at every door into the pending buffer, not at one of them.
+		if pending.offered.is_some() {
+			return Err(FsError::Invalid);
+		}
 		let want = pending.data.len().saturating_add(chunk.len());
 		if want > MAX_FILE_BYTES {
 			self.stream_abort();
@@ -1051,7 +1102,7 @@ impl LiberMemFs {
 		//
 		// So the store does not resync: it adopts, the path drops when `pending` does, and the one
 		// resync happens here with the volume's footprint being exactly what it will be.
-		let stored = self.write_file_owned_unsynced_named(&pending.path, pending.data, pending.name);
+		let stored = self.write_file_owned_unsynced(&pending.path, pending.data);
 		drop(pending.path);
 		self.resync_reservation();
 		stored
@@ -1060,6 +1111,16 @@ impl LiberMemFs {
 	// Give up. The room goes back to the volume, and the destination is untouched - a stream that
 	// cannot be completed leaves the file exactly as it was.
 	pub fn stream_abort(&mut self) {
+		// The placeholder goes with the stream that created it. A destination that was only ever a
+		// claim must not survive as a zero-byte file.
+		// MOVED, not cloned: `pending` is owned here, and a `clone()` of a 255-byte path is an
+		// infallible allocation on the path that runs when the volume is already out of room.
+		if let Some(pending) = self.pending.take()
+			&& pending.placeholder
+		{
+			let path = pending.path;
+			let _ = self.remove(&path);
+		}
 		self.pending = None;
 		self.resync_reservation();
 	}
@@ -1165,6 +1226,8 @@ impl LiberMemFs {
 			//
 			// The reserve happens BEFORE the clear, so a refused rewrite leaves the file exactly
 			// as it was rather than truncated to nothing.
+			// The file's current allocation, read before anything borrows it mutably.
+			let held = self.file_mut(parts)?.capacity();
 			let file = self.file_mut(parts)?;
 			// TRUNCATION TO NOTHING GIVES THE BLOCK BACK. A capped volume otherwise keeps the
 			// quota - `allocated()` counts capacity, which is the rule that closed the
@@ -1177,8 +1240,38 @@ impl LiberMemFs {
 				*file = Vec::new();
 				return Ok(());
 			}
-			if data.len() > file.len() {
-				file.try_reserve_exact(data.len() - file.len()).map_err(|_| FsError::NoSpace)?;
+			// Only when the bytes do not fit what the file ALREADY holds. `data.len() > file.len()`
+			// was the wrong test: a file of ten bytes in a forty-four byte buffer taking twenty new
+			// ones needs no allocation at all, and replacing the buffer there would quietly compact
+			// the file - the high-water rule this filesystem states, broken by the fix for something
+			// else.
+			if data.len() > file.capacity() {
+				// GROWN INTO A NEW BUFFER when the allocator would overshoot, so the overshoot is
+				// recoverable.
+				//
+				// `try_reserve_exact` promises AT LEAST what was asked for, and `write_file` undid a
+				// generous answer only for a NEW entry - for in-place growth it accepted it, because
+				// the old contents were already gone and putting the file back was not possible from
+				// there. So `write_file` could return `Ok(())` on a volume whose footprint then
+				// exceeded its own capacity.
+				//
+				// Reserving into a separate vector first makes the decision reversible: if the
+				// allocator gives more than the volume can hold, the new buffer is dropped and the
+				// file is untouched. The extra cost is one buffer of the new size, which is what the
+				// comment above says building a second vector would cost - and it is paid only on
+				// the growth path, where the file is getting bigger anyway.
+				let mut grown: Vec<u8> = Vec::new();
+				if grown.try_reserve_exact(data.len()).is_err() {
+					return Err(FsError::NoSpace);
+				}
+				let would_be = self.footprint() as usize - held + grown.capacity();
+				if would_be > self.capacity {
+					return Err(FsError::NoSpace);
+				}
+				grown.extend_from_slice(data);
+				let file = self.file_mut(parts)?;
+				*file = grown;
+				return Ok(());
 			}
 			file.clear();
 			file.extend_from_slice(data);

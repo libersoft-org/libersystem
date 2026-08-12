@@ -14,7 +14,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::domain::Domain;
 use super::memory_object::MemoryError;
@@ -61,20 +61,47 @@ struct Held {
 	frames: Vec<u64>,
 }
 
-// Bounded, because the entries come from processes dying and nothing else prunes them. Past the
-// bound the frames are retired as they were before this rule existed: a bounded lifetime bug is
-// better than an unbounded list, and the number is logged rather than silently absorbed.
+// Bounded, because the entries come from processes dying and nothing else prunes them.
+//
+// The `Vec` behind a `try_reserve` was the wrong shape for the same reason the frame quarantine's
+// was: metadata for dead drivers must not be able to fail for want of a heap, and a driver dying is
+// exactly when the heap is likely to be short. A fixed table allocates nothing.
 const MAX_HELD: usize = 64;
-static HELD: SpinLock<Vec<Held>> = SpinLock::new(Vec::new());
+static HELD: SpinLock<[Option<Held>; MAX_HELD]> = SpinLock::new([const { None }; MAX_HELD]);
 
-// Hold `frames` until `device` is stopped. Returns them if they cannot be held.
-fn hold(device: u32, frames: Vec<u64>) -> Option<Vec<u64>> {
+// How many frames the table could not hold and this kernel has therefore leaked ON PURPOSE, rather
+// than hand back to an allocator while a device may still be writing into them.
+static LEAKED: AtomicUsize = AtomicUsize::new(0);
+
+// Hold `frames` until `device` is stopped.
+//
+// LEAKS RATHER THAN RETIRES WHEN IT CANNOT. Past the bound this used to return the frames, and the
+// caller retired them - printing, to its credit, "frames of a terminated driver retired while
+// device may still write". That is the kernel saying out loud that it is handing physical memory a
+// device may be writing into to whoever allocates next: a use-after-free with somebody else's page
+// on the receiving end, and no bound on what it damages.
+//
+// A pinned frame is a bounded loss the machine survives. The count is reported beside the frame
+// allocator's other losses so a machine accumulating them is diagnosable, which is the whole
+// difference between a leak and a disappearance.
+fn hold(device: u32, frames: Vec<u64>) {
 	let mut held = HELD.lock();
-	if held.len() >= MAX_HELD || held.try_reserve(1).is_err() {
-		return Some(frames);
+	if let Some(slot) = held.iter_mut().find(|slot| slot.is_none()) {
+		*slot = Some(Held { device, frames });
+		return;
 	}
-	held.push(Held { device, frames });
-	None
+	LEAKED.fetch_add(frames.len(), Ordering::Relaxed);
+	// Counted in the frame allocator's LOST total as well, which is the number a machine losing
+	// memory is diagnosed from. A private counter here only would mean that total says "some of
+	// the losses".
+	frame::note_lost_pages(frames.len() as u64);
+	crate::serial_println!("dma: the hold table is full - {} frame(s) of a terminated driver are LEAKED rather than returned, because device {} was never confirmed stopped ({} leaked so far, {} pages lost in all)", frames.len(), device, LEAKED.load(Ordering::Relaxed), frame::lost_pages());
+	// Dropped here: the `Vec` goes, the frames stay out of circulation. Deliberately NOT retired.
+}
+
+// How many frames have been leaked because the hold table was full.
+pub fn leaked_frames() -> usize {
+	LEAKED.load(Ordering::Relaxed)
 }
 
 // A driver has reset `device`, so nothing it was pointed at is in flight any more: retire every
@@ -83,24 +110,20 @@ fn hold(device: u32, frames: Vec<u64>) -> Option<Vec<u64>> {
 // RETIRED RATHER THAN FREED, for the same reason the ordinary drop path retires: the frames were
 // mapped into an address space that other cores may still hold translations for.
 pub fn release_for(device: u32) -> usize {
-	let taken: Vec<Held> = {
-		let mut held = HELD.lock();
-		let mut taken: Vec<Held> = Vec::new();
-		let mut index = 0;
-		while index < held.len() {
-			if held[index].device == device {
-				if taken.try_reserve(1).is_err() {
-					break;
-				}
-				taken.push(held.swap_remove(index));
-			} else {
-				index += 1;
+	// Taken out of the fixed table one slot at a time, so this allocates nothing either - the
+	// vector it used to build was one more thing that could fail on the path that exists to keep
+	// memory from being lost.
+	let mut released = 0usize;
+	loop {
+		let entry = {
+			let mut held = HELD.lock();
+			let found = held.iter_mut().find(|slot| slot.as_ref().is_some_and(|held| held.device == device));
+			match found {
+				Some(slot) => slot.take(),
+				None => None,
 			}
-		}
-		taken
-	};
-	let mut released = 0;
-	for entry in &taken {
+		};
+		let Some(entry) = entry else { break };
 		released += entry.frames.len();
 		// SAFETY: these frames belonged to a DmaBuffer that has been dropped, so nothing owns them,
 		// and the device that could have been writing into them has been reset by the caller.
@@ -109,10 +132,32 @@ pub fn release_for(device: u32) -> usize {
 	released
 }
 
+// How many frames the hold table has leaked, and a way to empty it WITHOUT retiring - both for the
+// overflow test, which fills the table with frame numbers that were never allocated. Retiring those
+// would hand the frame allocator addresses it does not own, so the test cannot use `release_for`.
+#[cfg(test)]
+pub fn leaked_frames_for_test() -> usize {
+	LEAKED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn forget_for_test(device: u32) {
+	for slot in HELD.lock().iter_mut() {
+		if slot.as_ref().is_some_and(|held| held.device == device) {
+			*slot = None;
+		}
+	}
+}
+
+#[cfg(test)]
+pub fn hold_for_test(device: u32, frames: Vec<u64>) {
+	hold(device, frames);
+}
+
 // How many frames are being held for `device`, for the test that is about the holding itself.
 #[cfg(test)]
 pub fn held_frames_for_test(device: u32) -> usize {
-	HELD.lock().iter().filter(|entry| entry.device == device).map(|entry| entry.frames.len()).sum()
+	HELD.lock().iter().flatten().filter(|entry| entry.device == device).map(|entry| entry.frames.len()).sum()
 }
 
 impl DmaBuffer {
@@ -176,6 +221,11 @@ impl DmaBuffer {
 	// knows which of the two cases it is in.
 	pub fn mark_orphaned(&self) {
 		self.orphaned.store(true, Ordering::Release);
+	}
+
+	#[cfg(test)]
+	pub fn is_orphaned_for_test(&self) -> bool {
+		self.orphaned.load(Ordering::Acquire)
 	}
 
 	pub fn frames(&self) -> &[u64] {
@@ -251,16 +301,14 @@ impl Drop for DmaBuffer {
 		// descriptor may still name them. They wait for the device to be stopped instead.
 		let frames = core::mem::take(&mut self.frames);
 		let frames = match (self.device, self.orphaned.load(Ordering::Acquire)) {
-			(Some(device), true) => match hold(device, frames) {
-				// Held. Nothing to retire here; `release_for` does it when the device is reset.
-				None => Vec::new(),
-				// The hold table is full. Retiring is what this did before the rule existed, and
-				// saying so is better than an unbounded list.
-				Some(frames) => {
-					crate::serial_println!("dma: hold table full - {} frame(s) of a terminated driver retired while device {} may still write", frames.len(), device);
-					frames
-				}
-			},
+			// Held, or - if the table is full - leaked inside `hold`. Either way nothing to retire
+			// here; `release_for` retires the held ones when the device is reset, and the leaked
+			// ones are gone on purpose rather than handed to the next allocator under a live DMA
+			// descriptor. That is why `hold` has nothing to give back.
+			(Some(device), true) => {
+				hold(device, frames);
+				Vec::new()
+			}
 			_ => frames,
 		};
 		unsafe { frame::retire(&frames) };

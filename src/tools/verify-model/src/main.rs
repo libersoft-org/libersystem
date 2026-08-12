@@ -25,7 +25,9 @@ usage: verify-model <command> [options]
   graph [--component NAME]            the component graph, or one component's edges
   owner PATH...                       which component owns each path, and why
   check                               the model's own gates: ownership, graph and catalog
+  guest-selection --arch A            the guest test ids a change selects on one target
   shadow --guest-log F --arch A       compare a full sweep against what a change would have scoped
+                                      (add --scoped-log F to also EXECUTE the selection and compare)
   shadow --host-log F | --dev-log F   the same comparison for the host and dev-guest universes
   level --stdin                       what a scoped answer about this change is worth
   trust [--grant COMPONENT]           what is TRUSTED under the current model, and why not
@@ -64,6 +66,7 @@ fn run() -> Result<ExitCode, String> {
 	let mut quiet = false;
 	let mut from_stdin = false;
 	let mut keys_file: Option<String> = None;
+	let mut scoped_log: Option<String> = None;
 	let mut guest_log: Option<String> = None;
 	let mut host_log: Option<String> = None;
 	let mut dev_log: Option<String> = None;
@@ -90,6 +93,10 @@ fn run() -> Result<ExitCode, String> {
 			// Accepted and redundant on purpose: the runner spells the outcome at the call site
 			// either way, so a step's result is readable there rather than implied by an absence.
 			"--passed" => passed = true,
+			"--scoped-log" => {
+				index += 1;
+				scoped_log = Some(arguments.get(index).ok_or("--scoped-log needs a path")?.clone());
+			}
 			"--guest-log" => {
 				index += 1;
 				guest_log = Some(arguments.get(index).ok_or("--guest-log needs a path")?.clone());
@@ -141,7 +148,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "booted" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "booted" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
 	{
 		command = positional.remove(0);
 	}
@@ -195,7 +202,10 @@ fn run() -> Result<ExitCode, String> {
 			for check in &model.catalog.checks {
 				for variant in &check.variants {
 					if variant.environment == verify_model::catalog::Environment::DevGuest {
-						println!("{}\t{}\t{}", check.id, variant.architecture, check.command.replace("{arch}", &variant.architecture));
+						// The whole key, like the host producer beside it - one shape for both, so
+						// the model reads one format and the comparison rebuilds nothing.
+						let command = verify_model::commands::host_command(&check.command.replace("{arch}", &variant.architecture), &variant.configuration);
+						println!("{}\t{}\t{}\t{}\t{}", check.id, variant.architecture, variant.environment.as_str(), variant.configuration, command);
 					}
 				}
 			}
@@ -213,7 +223,16 @@ fn run() -> Result<ExitCode, String> {
 				}
 				for variant in &check.variants {
 					if variant.environment == verify_model::catalog::Environment::Host {
-						println!("{}\t{}", check.id, check.command.replace("{arch}", &variant.architecture));
+						// THE WHOLE KEY, not the check id. `(check, architecture, environment,
+						// configuration)` is what a `PlanItemKey` is, and emitting the id alone
+						// meant two variants of one check produced two lines carrying the same
+						// name: the parser's map kept the last and `total` counted both, so the
+						// declared total and the number of outcomes disagreed silently.
+						//
+						// And the command through the shared lowering, so a `shared-image` variant
+						// is actually run as one.
+						let command = verify_model::commands::host_command(&check.command.replace("{arch}", &variant.architecture), &variant.configuration);
+						println!("{}\t{}\t{}\t{}\t{}", check.id, variant.architecture, variant.environment.as_str(), variant.configuration, command);
 					}
 				}
 			}
@@ -309,6 +328,29 @@ fn run() -> Result<ExitCode, String> {
 			}
 			Ok(ExitCode::SUCCESS)
 		}
+		// The guest test IDS a change selects on one target, one per line - the exact list the
+		// runner takes as `TEST_SELECTION`.
+		//
+		// It exists for SHADOW-EXEC: the selection has to be RUN before a run of it can be compared
+		// with the sweep, and the ordinary plan lowers it into a shell command rather than handing
+		// the bare list out. The ids are the check ids VERBATIM - a kernel check's id IS the test's
+		// declared id, which is the equality `self_check` exists to hold, and those ids already
+		// begin with `kernel.`.
+		"guest-selection" => {
+			let architecture = architecture.ok_or("guest-selection needs --arch")?;
+			if paths.is_empty() {
+				return Err(String::from("guest-selection needs the change it is selecting for (--paths or --stdin)"));
+			}
+			let ownership = model.ownership();
+			let planner = Planner::for_model(&model, &ownership);
+			let plan = planner.plan(&paths);
+			for item in &plan.items {
+				if item.key.environment == verify_model::catalog::Environment::TestGuest && item.key.architecture == architecture {
+					println!("{}", item.key.check);
+				}
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		// DRY shadow: the scoped set is COMPUTED and never run; the full sweep that already
 		// happened is what it is compared against. One boot, two answers.
 		"shadow" => {
@@ -341,7 +383,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: false, model_self_check: self_check_failures(&model, false).is_empty() });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -369,7 +411,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: false, model_self_check: self_check_failures(&model, false).is_empty() });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -385,6 +427,35 @@ fn run() -> Result<ExitCode, String> {
 			let plan = planner.plan(&paths);
 			let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
 			let history = verify_model::history::History::load(&repo_root)?;
+
+			// SHADOW-EXEC, when a scoped run's log was given as well.
+			//
+			// A dry comparison answers "did the selector choose the right set S" and never runs S,
+			// so it cannot answer "does running S work" - and this milestone contains the proof that
+			// the second question is not theoretical: a planner emitting Rust function names against
+			// a runner that had moved to stable IDs computed every selection correctly and could
+			// execute none of them, and every dry comparison stayed clean throughout.
+			//
+			// With `--scoped-log` the two are compared, the run is marked as carrying an execution
+			// sample, and `evaluate` requires one before a certificate is granted.
+			let exec = match &scoped_log {
+				Some(path) => {
+					let scoped_text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+					let scoped_results = verify_model::shadow::parse_guest_log(&scoped_text);
+					let exec = verify_model::shadow::compare_exec(&selected, &scoped_results, &results, &architecture);
+					println!("shadow-exec ({architecture}): {:?}", exec.verdict);
+					println!("  {}", exec.reason);
+					for key in &exec.inside_failures {
+						println!("  SELECTED BUT DID NOT RUN: {key}");
+					}
+					Some(exec)
+				}
+				None => None,
+			};
+			// A sample that FAILED is not a sample: it is the finding the mechanism exists to make,
+			// and filing it as evidence would be the false green in its purest form.
+			let exec_clean = exec.as_ref().is_some_and(|exec| exec.verdict == verify_model::shadow::Verdict::Consistent);
+
 			let comparison = verify_model::shadow::compare(&selected, &results, &architecture, &history);
 
 			println!("shadow ({architecture}): {:?}", comparison.verdict);
@@ -409,13 +480,18 @@ fn run() -> Result<ExitCode, String> {
 			// judged is a record that will be believed about a different system later.
 			let mut log = verify_model::shadow::Log::load(&repo_root);
 			log.schema = 1;
-			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now() });
+			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty() });
 			log.save(&repo_root)?;
 			// Only Consistent is green, and the other three are green in different wrong ways.
 			// CandidateMiss is the selector's problem; SelectionFailed is the code's and the sweep
 			// found it; Void means the comparison judged nothing at all. Returning 0 for the last
 			// two let `verify.sh` print "no evidence against the selection" over a run that had
 			// produced no evidence either way, which is the exact shape of false green.
+			// An execution sample that failed fails the command, whatever the dry comparison said -
+			// they are different questions and only one of them can be answered by not running.
+			if exec.is_some() && !exec_clean {
+				return Ok(ExitCode::FAILURE);
+			}
 			Ok(match comparison.verdict {
 				verify_model::shadow::Verdict::Consistent => ExitCode::SUCCESS,
 				_ => ExitCode::FAILURE,
@@ -475,7 +551,12 @@ fn run() -> Result<ExitCode, String> {
 				// Granted per universe. A component with kernel-suite evidence and no host evidence is
 				// trusted for one and not the other, which is the honest reading of what was proved.
 				let mut granted = 0usize;
-				for universe in [verify_model::shadow::Universe::Host, verify_model::shadow::Universe::TestGuest, verify_model::shadow::Universe::DevGuest] {
+				for universe in [
+					verify_model::shadow::Universe::Host,
+					verify_model::shadow::Universe::HostBuild,
+					verify_model::shadow::Universe::TestGuest,
+					verify_model::shadow::Universe::DevGuest,
+				] {
 					match store.evaluate(&component, &hash, universe, &log) {
 						Ok((clean, architectures)) => {
 							store.grant(&component, &hash, universe, clean, architectures, verify_model::history::now());
@@ -700,7 +781,12 @@ fn join_or_none(items: &[String]) -> String {
 
 // The model's own gates. Each of these fails in the same silent direction if left unchecked: the
 // file still parses, the planner still runs, and the plan is quietly narrower than it should be.
-fn self_check(model: &Model) -> Result<ExitCode, String> {
+// The model's own gates, as a list rather than an exit status.
+//
+// Split out so a shadow record can say whether the model that made the comparison was consistent at
+// the time. A comparison produced by a model failing its own checks is not evidence about the tree,
+// and the record could not say which it was.
+fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 	let mut failures = Vec::new();
 
 	// The one equality an exact selection rests on: the string the model puts in `TEST_SELECTION`
@@ -770,9 +856,41 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 		}
 	}
 
-	let unowned = model.unowned_paths()?;
-	if !unowned.is_empty() {
-		failures.push(format!("{} tracked file(s) are owned by no component and are not declared non-code:\n  {}", unowned.len(), unowned.join("\n  ")));
+	// AND THE HISTORY'S OWN CONTRADICTION OF THOSE CONSTANTS.
+	//
+	// `record_step` used to clamp a negative residual to zero, so a run that came in UNDER its fixed
+	// term produced no evidence at all - the one observation that says "this constant is too high"
+	// was the one being thrown away, on exactly the two targets whose fixed terms decide whether a
+	// selection can stay scoped. The overshoot is recorded now, and this is where it becomes a
+	// statement rather than a number in a file.
+	//
+	// A tenth is the margin: a full suite is not a constant-time thing and a run that beats the
+	// estimate slightly is ordinary. A run that beats it by more than that means the term is a
+	// whole-suite figure sitting in a field that means startup cost, which is the defect.
+	{
+		let cost = verify_model::history::CostModel::default();
+		match verify_model::history::History::load(&model.repo_root) {
+			Ok(history) => {
+				for (pair, overshoot) in &history.fixed_overshoot {
+					let Some((architecture, environment)) = pair.split_once('/') else { continue };
+					let fixed = cost.fixed_seconds.get(&(architecture.to_string(), environment.to_string())).copied().unwrap_or(0.0);
+					if fixed > 0.0 && *overshoot > fixed * 0.1 {
+						failures.push(format!("the fixed cost for {pair} is {fixed:.0} s and a measured run came in {overshoot:.0} s under it - the term is a whole-suite figure in a field that means startup cost, so every scoped selection there widens to the full suite"));
+					}
+				}
+			}
+			// A history that will not load is not a reason to abandon the rest of the self-check,
+			// and an absent one is the ordinary state of a fresh tree.
+			Err(_) => {}
+		}
+	}
+
+	// Not `?`: this returns a failure list rather than a `Result`, and a check that cannot be made
+	// is itself a failure rather than a reason to abandon the rest of them.
+	match model.unowned_paths() {
+		Ok(unowned) if !unowned.is_empty() => failures.push(format!("{} tracked file(s) are owned by no component and are not declared non-code:\n  {}", unowned.len(), unowned.join("\n  "))),
+		Ok(_) => {}
+		Err(error) => failures.push(format!("could not check path ownership: {error}")),
 	}
 
 	// A crate with host tests and no catalog entry is the inventory defect this milestone was
@@ -787,7 +905,11 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 		match model.crates.iter().find(|entry| entry.name == rule.crate_name) {
 			None => failures.push(format!("host_tests_unrunnable names '{}', which is not a crate", rule.crate_name)),
 			Some(entry) if !entry.has_host_tests => failures.push(format!("host_tests_unrunnable names '{}', which has no host tests to exclude", rule.crate_name)),
-			Some(_) => println!("verify-model: host suite '{}' is excluded - {}", rule.crate_name, rule.reason),
+			Some(_) => {
+				if report {
+					println!("verify-model: host suite '{}' is excluded - {}", rule.crate_name, rule.reason);
+				}
+			}
 		}
 	}
 
@@ -840,12 +962,18 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 	failures.extend(unreachable);
 	if !uncovered.is_empty() {
 		// A REPORT, never a failure. Launching something is not asserting anything about it.
-		println!("verify-model: {} test(s) reach a program they do not claim to cover - read, do not fix mechanically:", uncovered.len());
+		if report {
+			println!("verify-model: {} test(s) reach a program they do not claim to cover - read, do not fix mechanically:", uncovered.len());
+		}
 		for line in uncovered.iter().take(8) {
-			println!("    {line}");
+			if report {
+				println!("    {line}");
+			}
 		}
 		if uncovered.len() > 8 {
-			println!("    ... and {} more", uncovered.len() - 8);
+			if report {
+				println!("    ... and {} more", uncovered.len() - 8);
+			}
 		}
 	}
 
@@ -904,26 +1032,43 @@ fn self_check(model: &Model) -> Result<ExitCode, String> {
 	}
 	let sensitive: Vec<(&String, &verify_model::archrisk::Risk)> = model.arch_risk.iter().filter(|(_, risk)| risk.any_target || !risk.targets.is_empty()).collect();
 	if !sensitive.is_empty() {
-		println!("verify-model: {} of {} components are architecture-sensitive by mechanical scan - a change to one boots more than the default target:", sensitive.len(), model.graph.components.len());
+		if report {
+			println!("verify-model: {} of {} components are architecture-sensitive by mechanical scan - a change to one boots more than the default target:", sensitive.len(), model.graph.components.len());
+		}
 		for (component, risk) in sensitive.iter().take(12) {
-			println!("    {:<34} {:<22} {}", component, if risk.any_target { String::from("all targets") } else { risk.targets.iter().cloned().collect::<Vec<_>>().join(",") }, risk.evidence.first().map(String::as_str).unwrap_or(""));
+			if report {
+				println!("    {:<34} {:<22} {}", component, if risk.any_target { String::from("all targets") } else { risk.targets.iter().cloned().collect::<Vec<_>>().join(",") }, risk.evidence.first().map(String::as_str).unwrap_or(""));
+			}
 		}
 		if sensitive.len() > 12 {
-			println!("    ... and {} more", sensitive.len() - 12);
+			if report {
+				println!("    ... and {} more", sensitive.len() - 12);
+			}
 		}
 	}
 
 	if !model.registry.risk_classes.is_empty() {
-		println!("verify-model: {} kernel subsystem(s) are declared narrowable and NOT narrowed - they still select everything:", model.registry.risk_classes.len());
+		if report {
+			println!("verify-model: {} kernel subsystem(s) are declared narrowable and NOT narrowed - they still select everything:", model.registry.risk_classes.len());
+		}
 		for rule in &model.registry.risk_classes {
-			println!("    {:<28} {:<14} needs: {}", rule.path, rule.class, rule.evidence);
+			if report {
+				println!("    {:<28} {:<14} needs: {}", rule.path, rule.class, rule.evidence);
+			}
 		}
 	}
 
 	if !model.kernel_tests.missing_targets.is_empty() {
-		println!("verify-model: no kernel test binary for {} - those targets cannot be scoped and will be booted whole", model.kernel_tests.missing_targets.join(", "));
+		if report {
+			println!("verify-model: no kernel test binary for {} - those targets cannot be scoped and will be booted whole", model.kernel_tests.missing_targets.join(", "));
+		}
 	}
 
+	failures
+}
+
+fn self_check(model: &Model) -> Result<ExitCode, String> {
+	let failures = self_check_failures(model, true);
 	if failures.is_empty() {
 		println!("verify-model: model is consistent");
 		println!("  {} crates, {} components, {} edges", model.crates.len(), model.graph.components.len(), model.graph.edges.len());

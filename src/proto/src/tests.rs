@@ -110,7 +110,7 @@ fn codec_bounds_handle_writes_and_reads_them_in_order() {
 
 	// Order is the contract: they come back exactly as they were encoded, so a decoder cannot
 	// swap a stage's stdin for its stdout by reading them in a different order.
-	let mut reader = crate::codec::Reader::with_handles(&[], &[33, 44]);
+	let mut reader = crate::codec::Reader::with_handles(&[], &crate::codec::Handles::try_from_slice(&[33, 44]).expect("two handles are within the bound"));
 	assert_eq!(reader.take_handle(), Some(33));
 	assert_eq!(reader.take_handle(), Some(44));
 	assert_eq!(reader.take_handle(), None);
@@ -123,7 +123,7 @@ fn codec_bounds_handle_writes_and_reads_them_in_order() {
 #[test]
 fn malformed_dispatch_leaves_the_request_handle_with_the_host() {
 	let mut service = MemLog::default();
-	let mut request_handles = crate::codec::Handles::from_slice(&[77]);
+	let mut request_handles = crate::codec::Handles::try_from_slice(&[77]).expect("one handle is within the bound");
 	let mut reply_handles = crate::codec::Handles::new();
 	let mut out = [0u8; 32];
 	assert_eq!(log::dispatch(&mut service, &[1], &mut request_handles, &mut out, &mut reply_handles), None);
@@ -138,9 +138,14 @@ struct Loopback<S: log::Service> {
 }
 
 impl<S: log::Service> crate::codec::Transport for Loopback<S> {
+	// Nothing to release: this loopback hands back handle NUMBERS it never opened, so there is no
+	// kernel object behind them. Written out rather than inherited from a default body, which is
+	// what let a real transport forget it and leak - see `Transport::discard_handles`.
+	fn discard_handles(&mut self, _handles: &[u64]) {}
+
 	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
 		let mut out = [0u8; 4096];
-		let mut request_handles = crate::codec::Handles::from_slice(request_handles);
+		let mut request_handles = crate::codec::Handles::try_from_slice(request_handles).expect("the fixture stays within the bound");
 		let n = log::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles)?;
 		assert!(request_handles.is_empty(), "the dispatch consumed every capability the request carried");
 		Some(out[..n].to_vec())
@@ -220,8 +225,11 @@ impl volume::Service for VolStub {
 		if o.path.is_empty() { Err(Error::NotFound) } else { Ok(OpenResult { file: 0xCAFE, size: 42 }) }
 	}
 
-	fn list(&mut self, _path: String) -> Vec<FileInfo> {
-		Vec::new()
+	fn list(&mut self, path: String) -> Result<Vec<FileInfo>, Error> {
+		// The error arm the schema gained in 2026-08-12: a directory that is not there is a
+		// refusal, not an empty listing. An empty PATH is the volume root, which is legitimately
+		// empty here - the two answers are different and the stub can now say so.
+		if path == "missing" { Err(Error::NotFound) } else { Ok(Vec::new()) }
 	}
 
 	fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error> {
@@ -291,9 +299,14 @@ struct VolLoopback<S: volume::Service> {
 }
 
 impl<S: volume::Service> crate::codec::Transport for VolLoopback<S> {
+	// Nothing to release: this loopback hands back handle NUMBERS it never opened, so there is no
+	// kernel object behind them. Written out rather than inherited from a default body, which is
+	// what let a real transport forget it and leak - see `Transport::discard_handles`.
+	fn discard_handles(&mut self, _handles: &[u64]) {}
+
 	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
 		let mut out = [0u8; 256];
-		let mut request_handles = crate::codec::Handles::from_slice(request_handles);
+		let mut request_handles = crate::codec::Handles::try_from_slice(request_handles).expect("the fixture stays within the bound");
 		let n = volume::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles)?;
 		assert!(request_handles.is_empty(), "the dispatch consumed every capability the request carried");
 		Some(out[..n].to_vec())
@@ -376,7 +389,7 @@ impl crate::codec::Transport for UnexpectedHandleTransport {
 		let mut reply = corr.to_le_bytes().to_vec();
 		reply.extend_from_slice(&[1, 0]); // Ok(()) for log.emit
 		{
-			*reply_handles = crate::codec::Handles::from_slice(&[0xBAD]);
+			*reply_handles = crate::codec::Handles::try_from_slice(&[0xBAD]).expect("one handle is within the bound");
 			Some(reply)
 		}
 	}

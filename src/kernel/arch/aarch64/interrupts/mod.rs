@@ -74,12 +74,14 @@ pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
 	false
 }
 
-// Remove any binding for `vector` (called from an Interrupt's Drop). MSI is
-// edge-triggered and unshared, so this just drops the binding and frees the slot -
-// there is no level source to mask.
+// Remove any binding for `vector` (called from an Interrupt's Drop).
+//
+// The SPI is retired rather than freed, for the reason the x86 backend spells out: the device's
+// MSI-X entry was programmed to write the GICv2m frame, and nothing here can prove a write already
+// on its way will not land. The SPI waits for `SYS_DEVICE_QUIESCED`.
 pub fn unbind(vector: u8) {
 	if let Some(slot) = spi_slot(vector as u32) {
-		REGISTRY.free(slot);
+		REGISTRY.retire(slot);
 	}
 }
 
@@ -158,6 +160,12 @@ pub fn dispatch_msi(intid: u32) -> bool {
 // 0 is the kernel's own timer - the EL1 physical-timer PPI (INTID 30 on QEMU virt),
 // always in use - so the inventory shows a fixed kernel vector like x86's; the MSI
 // window (each a device's per-device SPI) follows.
+// Free every MSI vector that is masked and waiting for `device` to be confirmed stopped, and answer
+// how many. Reached from `SYS_DEVICE_QUIESCED`.
+pub fn release_msi_for_device(device: u32) -> usize {
+	REGISTRY.release_for_device(device)
+}
+
 pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 	const TIMER_INTID: u32 = 30; // mirrors gic::TIMER_INTID (the EL1 physical-timer PPI)
 	if index == 0 {

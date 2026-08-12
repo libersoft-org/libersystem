@@ -34,6 +34,15 @@ pub struct GuestResults {
 	pub total_declared: Option<usize>,
 }
 
+// The host producer's results, keyed on the whole `PlanItemKey` rather than on a check's name. The
+// guest keeps `GuestResults`: a kernel test's identity IS its name, and the target and environment
+// are properties of the run rather than of the line.
+pub struct KeyedResults {
+	pub outcomes: BTreeMap<PlanItemKey, Outcome>,
+	pub total_declared: Option<usize>,
+	pub duplicates: Vec<String>,
+}
+
 // `name...\t[ok]` per test, from `impl Testable for TaggedTest`.
 //
 // A state machine rather than a line match, because `[ok]` is NOT reliably on the same line as the
@@ -115,8 +124,25 @@ pub enum Verdict {
 // have shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Universe {
-	// Builds, crate suites, gates and conformance runs - everything that happens on the host.
+	// Crate suites, gates and conformance runs. NOT builds - see `HostBuild`.
+	//
+	// It was "everything that happens on the host" until 2026-08-12, and that was a certificate
+	// broader than its evidence. The Host producer deliberately excludes builds, for a good reason
+	// it states in place: re-running three architectures' builds to answer "did anything outside the
+	// selection fail" costs more than the sweep it is compared against, over artifacts the sweep has
+	// already made. Sound about cost, and it left a universe whose evidence covered gates, suites
+	// and conformance issuing certificates for a universe that also contained builds - so a selector
+	// defect that drops `build.user` could not be observed by the producer, and five clean runs
+	// later the component was TRUSTED for it anyway.
+	//
+	// The serialized name stays `Host`, so the records already on disk keep meaning what they said:
+	// they were produced by that same producer, over that same evidence.
 	Host,
+	// Builds, which no shadow producer covers today. A separate universe so its certificate can only
+	// be earned by evidence about builds - which is to say, not yet - rather than inherited from a
+	// comparison that never looked at one. A universe's certificate may not be broader than the
+	// evidence behind it, and this is that rule made structural rather than remembered.
+	HostBuild,
 	// The tagged suite inside `qemu-run.sh TEST=1`.
 	TestGuest,
 	// `dev-selftest.py` and friends, inside a guest `DEV_PROFILE=1` left running.
@@ -129,6 +155,8 @@ impl Universe {
 			Universe::TestGuest
 		} else if check.starts_with("dev.") {
 			Universe::DevGuest
+		} else if check.starts_with("build.") {
+			Universe::HostBuild
 		} else {
 			Universe::Host
 		}
@@ -157,29 +185,98 @@ pub struct Comparison {
 //
 // A `total` line is required for the same reason the guest's is: a run that covered fewer checks
 // than exist did not compare what it claims to, and a filtered run looks exactly like a clean one.
-pub fn parse_host_log(text: &str) -> GuestResults {
-	let mut outcomes = BTreeMap::new();
+// `check<TAB>architecture<TAB>environment<TAB>configuration<TAB>PASS|FAIL` per line, then `total N`.
+//
+// KEYED ON THE WHOLE `PlanItemKey`. This read `id PASS` into a `BTreeMap<String, _>`, so a check
+// with two Host variants collapsed into one entry while `total` counted both - a disagreement
+// nothing reported. The frozen model has four fields in the key and evidence that discards one of
+// them cannot be evidence about it.
+pub fn parse_host_log(text: &str) -> KeyedResults {
+	let mut outcomes: BTreeMap<PlanItemKey, Outcome> = BTreeMap::new();
 	let mut total_declared = None;
+	let mut duplicates: Vec<String> = Vec::new();
 	for line in text.lines() {
 		let line = line.trim();
 		if let Some(rest) = line.strip_prefix("total ") {
 			total_declared = rest.trim().parse::<usize>().ok();
 			continue;
 		}
-		let Some((id, verdict)) = line.rsplit_once(' ') else { continue };
+		let fields: Vec<&str> = line.split('\t').collect();
+		let [check, architecture, environment, configuration, verdict] = fields[..] else { continue };
 		let outcome = match verdict.trim() {
 			"PASS" => Outcome::Passed,
 			"FAIL" => Outcome::Failed,
 			_ => continue,
 		};
-		outcomes.insert(id.trim().to_string(), outcome);
+		let Some(environment) = crate::catalog::Environment::from_str(environment.trim()) else { continue };
+		let key = PlanItemKey { check: check.trim().to_string(), architecture: architecture.trim().to_string(), environment, configuration: configuration.trim().to_string() };
+		// Said out loud rather than overwritten: two lines for one key means the producer emitted
+		// the same variant twice, and the old shape hid exactly that.
+		if outcomes.insert(key.clone(), outcome).is_some() {
+			duplicates.push(key.display());
+		}
 	}
-	GuestResults { outcomes, total_declared }
+	KeyedResults { outcomes, total_declared, duplicates }
 }
 
 // The guest comparison: kernel test names, one target, the test-guest environment.
 pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &str, history: &History) -> Comparison {
 	compare_in(selected, results, architecture, "test-guest", "test", None, history)
+}
+
+// SHADOW-EXEC: the selection is RUN, and the run is compared against the sweep.
+//
+// A dry shadow answers "did the selector choose the right set S". It never runs S, so it cannot
+// answer "does running S work" - and this milestone contains the proof that the second question is
+// not theoretical. In an intermediate state the planner emitted Rust function names while the runner
+// had moved to explicit stable IDs: the selection was computed CORRECTLY and could not be executed.
+// Every dry comparison in that state was clean. The defect was found by hand.
+//
+// So this asks three things a dry comparison cannot:
+//
+//   * EXECUTABLE - every key in S actually ran in the scoped log. A selection naming a test the
+//     runner cannot find is the defect above, and it is invisible to a comparison that never runs.
+//   * NOT WIDER - the scoped run ran nothing but S. A run that quietly widened to the whole suite
+//     is safe and it is also not a selection; measuring one and calling it the other is how the
+//     selection dimension comes to look like it pays.
+//   * AGREEING - every key in S has the same outcome in both runs. A test that passes alone and
+//     fails in the suite (or the reverse) means running S is not running that part of the sweep,
+//     whatever the selector chose.
+pub fn compare_exec(selected: &[PlanItemKey], scoped_run: &GuestResults, sweep: &GuestResults, architecture: &str) -> Comparison {
+	// THE WHOLE CHECK ID, unstripped. A kernel check's id IS the test's declared id - the model's
+	// own self-check asserts that equality, because it is what makes `TEST_SELECTION` work - and
+	// those ids already begin with `kernel.`. Stripping the prefix produced a selection the runner
+	// refused with `no test with id 'applications....'`.
+	//
+	// Recorded because it is this mechanism's own first finding, on its first run, and it is exactly
+	// the class of defect the mechanism exists for: a selection computed correctly and impossible to
+	// execute, invisible to every dry comparison.
+	let wanted: BTreeSet<String> = selected.iter().filter(|key| key.environment == crate::catalog::Environment::TestGuest && key.architecture == architecture).map(|key| key.check.clone()).collect();
+	let mut reasons: Vec<String> = Vec::new();
+	let missing: Vec<String> = wanted.iter().filter(|name| !scoped_run.outcomes.contains_key(*name)).cloned().collect();
+	let extra: Vec<String> = scoped_run.outcomes.keys().filter(|name| !wanted.contains(*name)).cloned().collect();
+	let mut disagreed: Vec<String> = Vec::new();
+	for name in &wanted {
+		match (scoped_run.outcomes.get(name), sweep.outcomes.get(name)) {
+			(Some(alone), Some(in_sweep)) if alone != in_sweep => disagreed.push(format!("{name} ({alone:?} alone, {in_sweep:?} in the sweep)")),
+			_ => {}
+		}
+	}
+	// NOTHING TO COMPARE IS NOT AGREEMENT. An empty selection, or a scoped log that parsed as
+	// nothing, would otherwise sail through all three checks and be filed as evidence.
+	if wanted.is_empty() || scoped_run.outcomes.is_empty() {
+		return Comparison { verdict: Verdict::Void, reason: format!("nothing to execute: the selection names {} guest test(s) on {architecture} and the scoped run parsed {} outcome(s)", wanted.len(), scoped_run.outcomes.len()), architecture: architecture.to_string(), scoped: wanted.len(), ran: scoped_run.outcomes.len(), outside_failures: Vec::new(), inside_failures: Vec::new(), previously_failed: Vec::new() };
+	}
+	if !missing.is_empty() {
+		reasons.push(format!("{} selected test(s) did not run when the selection was executed: {}", missing.len(), missing.join(", ")));
+	}
+	if !extra.is_empty() {
+		reasons.push(format!("the scoped run ran {} test(s) outside the selection - it widened rather than selecting: {}", extra.len(), extra.iter().take(8).cloned().collect::<Vec<_>>().join(", ")));
+	}
+	if !disagreed.is_empty() {
+		reasons.push(format!("{} test(s) answered differently alone than in the sweep: {}", disagreed.len(), disagreed.join(", ")));
+	}
+	Comparison { verdict: if reasons.is_empty() { Verdict::Consistent } else { Verdict::SelectionFailed }, reason: if reasons.is_empty() { format!("the selection ran, ran only itself, and agreed with the sweep on all {} test(s)", wanted.len()) } else { reasons.join("; ") }, architecture: architecture.to_string(), scoped: wanted.len(), ran: scoped_run.outcomes.len(), outside_failures: Vec::new(), inside_failures: missing, previously_failed: Vec::new() }
 }
 
 // The HOST comparison, which had no producer at all.
@@ -190,15 +287,60 @@ pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &
 //
 // The ids are the catalog's own (`gate.x`, `host.y`), so nothing is stripped; the architecture is
 // `host`, which is the only one this universe has.
-pub fn compare_host(selected: &[PlanItemKey], results: &GuestResults, history: &History) -> Comparison {
-	compare_in(selected, results, "host", "host", "shared-image", None, history)
+// The HOST universe, compared key against key.
+//
+// This used to hand `compare_in` a hardcoded architecture, environment and configuration and let it
+// REBUILD a key from the check's name - `"host" / "host" / "shared-image"` for everything. Gates,
+// conformance suites and the default host-suite variants are `default`, not `shared-image`, so the
+// key it rebuilt was the wrong one for most of them: the history lookup missed, and a `shared-image`
+// variant and a `default` variant of one crate were indistinguishable. The producer now emits the
+// real key, so nothing has to be reconstructed.
+pub fn compare_host(selected: &[PlanItemKey], results: &KeyedResults, history: &History) -> Comparison {
+	compare_keyed(selected, results, crate::catalog::Environment::Host, "host", history)
 }
 
-// The DEV guest: `dev-selftest.py` and its neighbours, inside a guest left running under
-// `DEV_PROFILE=1`. One target by construction - the development profile is built for x86_64 alone -
-// which is why `required_architectures` answers 1 for this universe.
-pub fn compare_dev(selected: &[PlanItemKey], results: &GuestResults, history: &History) -> Comparison {
-	compare_in(selected, results, "x86_64", "dev-guest", "development", None, history)
+// The DEV guest, through the same comparison. It hardcoded `x86_64 / dev-guest / development` and
+// rebuilt a key from the check's name for the same reason the host one did; one architecture makes
+// that less wrong rather than right, and there is no reason for two shapes here.
+pub fn compare_dev(selected: &[PlanItemKey], results: &KeyedResults, history: &History) -> Comparison {
+	compare_keyed(selected, results, crate::catalog::Environment::DevGuest, "x86_64", history)
+}
+
+fn compare_keyed(selected: &[PlanItemKey], results: &KeyedResults, environment: crate::catalog::Environment, architecture: &str, history: &History) -> Comparison {
+	let scoped: BTreeSet<&PlanItemKey> = selected.iter().filter(|key| key.environment == environment).collect();
+	let mut outside = Vec::new();
+	let mut inside = Vec::new();
+	let mut previously_failed = Vec::new();
+	for (key, outcome) in &results.outcomes {
+		if *outcome != Outcome::Failed {
+			continue;
+		}
+		let display = key.display();
+		if history.get(&display).is_some_and(|record| record.failures > 0) {
+			previously_failed.push(display.clone());
+		}
+		if scoped.contains(key) { inside.push(display) } else { outside.push(display) }
+	}
+	let ran = results.outcomes.len();
+	// A producer that emitted one key twice compared something other than what it counted.
+	if !results.duplicates.is_empty() {
+		return Comparison { verdict: Verdict::Void, reason: format!("the log carries {} duplicate key(s) ({}), so its outcomes and its total describe different runs", results.duplicates.len(), results.duplicates.join(", ")), architecture: architecture.to_string(), scoped: scoped.len(), ran, outside_failures: outside, inside_failures: inside, previously_failed };
+	}
+	if let Some(total) = results.total_declared
+		&& ran < total
+		&& inside.is_empty()
+		&& outside.is_empty()
+	{
+		return Comparison { verdict: Verdict::Void, reason: format!("the log records {ran} of {total} checks and no failure - a full sweep is what this compares against, so a partial one proves nothing"), architecture: architecture.to_string(), scoped: scoped.len(), ran, outside_failures: outside, inside_failures: inside, previously_failed };
+	}
+	let (verdict, reason) = if !inside.is_empty() {
+		(Verdict::SelectionFailed, format!("{} selected check(s) failed - the selector chose them, so this is a defect in the code and not in the selection", inside.len()))
+	} else if !outside.is_empty() {
+		(Verdict::CandidateMiss, format!("{} check(s) OUTSIDE the selection failed while every selected check passed - confirm before believing it", outside.len()))
+	} else {
+		(Verdict::Consistent, format!("{ran} checks ran, none failed; the selection of {} is not contradicted", scoped.len()))
+	};
+	Comparison { verdict, reason, architecture: architecture.to_string(), scoped: scoped.len(), ran, outside_failures: outside, inside_failures: inside, previously_failed }
 }
 
 fn compare_in(selected: &[PlanItemKey], results: &GuestResults, architecture: &str, environment: &str, configuration: &str, strip: Option<&str>, history: &History) -> Comparison {
@@ -270,6 +412,42 @@ pub struct Record {
 	pub changed_components: Vec<String>,
 	pub outside_failures: Vec<String>,
 	pub at: u64,
+	// WHAT THIS RECORD IS EVIDENCE ABOUT, beyond "a run happened".
+	//
+	// `Store::evaluate` counts clean runs and clean architectures. The design also asked for every
+	// change class exercised, every edge kind exercised, a regression corpus caught, property tests
+	// green and a SHADOW-EXEC sample - and those criteria cannot be written before there are records
+	// to grade them against. That is a fair reason not to write the POLICY yet. It is not a reason
+	// to keep discarding the DATA: a run recorded without these can never be graded against the
+	// criteria when they arrive, so the cost of waiting is paid in evidence that has to be re-earned.
+	//
+	// Defaulted, because records written before the fields existed carry none of it and should say
+	// so rather than be dropped.
+	#[serde(default)]
+	pub change_kinds: Vec<String>,
+	#[serde(default)]
+	pub edge_kinds: Vec<String>,
+	// Whether a SHADOW-EXEC sample accompanied this comparison - running the scoped selection and
+	// then the full suite, rather than computing the selection and only running the full one. False
+	// on every record today; the field exists so the day it is true is recorded rather than
+	// reconstructed.
+	#[serde(default)]
+	pub shadow_exec: bool,
+	// Whether the model's own `self_check` passed at the time. A comparison made by a model that
+	// fails its own checks is not evidence about the tree.
+	#[serde(default)]
+	pub model_self_check: bool,
+}
+
+// The kinds of change a set of paths represents, read from the working tree.
+//
+// Best effort by design: the regression corpus drives `shadow` with `--paths`, where there is no
+// working tree to ask and the answer is legitimately empty. A record that says nothing about its
+// change classes is better than one that invents them.
+pub fn change_kinds_for(repo_root: &Path, paths: &[String]) -> Vec<String> {
+	let Ok(changes) = crate::changes::working_tree(repo_root) else { return Vec::new() };
+	let wanted: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
+	changes.iter().filter(|change| wanted.contains(change.path.as_str()) || change.origin.as_deref().is_some_and(|origin| wanted.contains(origin))).map(|change| format!("{:?}", change.kind).to_lowercase()).collect::<BTreeSet<String>>().into_iter().collect()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -299,15 +477,44 @@ impl Log {
 
 	// Clean records for a component, under the CURRENT model. Evidence produced by a different
 	// selector over a different graph does not describe what runs today.
+	// A CLEAN RUN IS ALSO ONE THE MODEL WAS ENTITLED TO MAKE, which `model_self_check` records.
+	//
+	// A comparison produced by a model that failed its own gates is not evidence about the tree: the
+	// selection it computed came from a model that contradicts itself, and "the selection matched
+	// the sweep" says nothing when both sides were derived from it. This is the one criterion out of
+	// the design's list that needs no accumulated records to grade - it is a property of each record
+	// on its own - so it is consulted, while change classes, edge kinds, the regression corpus and
+	// SHADOW-EXEC stay uncounted until there is a log to grade them against.
+	//
+	// A record written before the field existed says nothing, and `#[serde(default)]` on a bool is
+	// `false` - so it does not count. That is FAILING CLOSED and it is the right direction here, by
+	// the same argument that makes an unresolved handle cardinality a refusal: a record that cannot
+	// say whether the model passed its own checks is not evidence that it did. The cost is evidence
+	// that has to be re-earned, which is what this milestone already says the cost of waiting is.
+	fn is_clean(record: &Record, component: &str, model_hash: &str, universe: Universe) -> bool {
+		record.model_hash == model_hash && record.universe == universe && record.verdict == "Consistent" && record.model_self_check && record.changed_components.iter().any(|changed| changed == component)
+	}
+
+	// Whether any clean record for this component carries an execution sample.
+	//
+	// One is enough and every run is too many: a SHADOW-EXEC sample costs a second full boot, and
+	// the question it answers - "can this selection be executed at all" - is a property of the
+	// mechanism rather than of the change. What it must not be is zero, which is what it was while
+	// a planner emitting Rust function names computed selections no runner could match and every dry
+	// comparison stayed clean.
+	pub fn has_exec_sample(&self, component: &str, model_hash: &str, universe: Universe) -> bool {
+		self.records.iter().any(|record| Self::is_clean(record, component, model_hash, universe) && record.shadow_exec)
+	}
+
 	pub fn clean_runs_for(&self, component: &str, model_hash: &str, universe: Universe) -> usize {
-		self.records.iter().filter(|record| record.model_hash == model_hash && record.universe == universe && record.verdict == "Consistent" && record.changed_components.iter().any(|changed| changed == component)).count()
+		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).count()
 	}
 
 	// Targets this component has CLEAN evidence on. Filtering on the verdict is the whole point and
 	// was missing: five clean x86_64 comparisons plus one riscv64 CandidateMiss counted as "evidence
 	// from two targets" and could earn a certificate on the strength of a run that found a fault.
 	pub fn clean_architectures_seen(&self, component: &str, model_hash: &str, universe: Universe) -> BTreeSet<String> {
-		self.records.iter().filter(|record| record.model_hash == model_hash && record.universe == universe && record.verdict == "Consistent" && record.changed_components.iter().any(|changed| changed == component)).map(|record| record.architecture.clone()).collect()
+		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).map(|record| record.architecture.clone()).collect()
 	}
 }
 

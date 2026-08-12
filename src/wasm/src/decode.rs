@@ -116,6 +116,12 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 				if !frame.is_if {
 					return Err("else without an if");
 				}
+				// A SECOND `else` FOR ONE `if`. The second overwrote the first's recorded jump, so
+				// the then-branch fell into the second arm and the first became unreachable code
+				// that nothing said was unreachable.
+				if frame.else_instr != usize::MAX {
+					return Err("a second else for one if");
+				}
 				frame.else_instr = out.len();
 				let if_index: usize = frame.instr_index;
 				let after_else: usize = out.len() + 1;
@@ -142,6 +148,12 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 					}
 				}
 				if ctrl.is_empty() {
+					// TRAILING BYTES AFTER THE FINAL `end` ARE A REFUSAL, not something to ignore.
+					// A body carrying instructions past its own terminator is a body whose author
+					// and whose reader disagree about what it contains.
+					if pc != body.len() {
+						return Err("bytes after the function body's final end");
+					}
 					break;
 				}
 			}
@@ -215,11 +227,11 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 			0x3d => out.push(store(body, &mut pc, 2)?),
 			0x3e => out.push(store(body, &mut pc, 4)?),
 			0x3f => {
-				read_byte(body, &mut pc)?; // memory index (reserved, must be 0)
+				memory_index(body, &mut pc)?;
 				out.push(Instr::MemorySize);
 			}
 			0x40 => {
-				read_byte(body, &mut pc)?; // memory index (reserved, must be 0)
+				memory_index(body, &mut pc)?;
 				out.push(Instr::MemoryGrow);
 			}
 			0x41 => out.push(Instr::I32Const(read_i64(body, &mut pc)? as i32)),
@@ -237,12 +249,12 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 				match sub {
 					0..=7 => out.push(Instr::TruncSat(sub as u8)),
 					10 => {
-						read_byte(body, &mut pc)?; // dst memory index
-						read_byte(body, &mut pc)?; // src memory index
+						memory_index(body, &mut pc)?; // destination
+						memory_index(body, &mut pc)?; // source
 						out.push(Instr::MemoryCopy);
 					}
 					11 => {
-						read_byte(body, &mut pc)?; // memory index
+						memory_index(body, &mut pc)?;
 						out.push(Instr::MemoryFill);
 					}
 					_ => return Err("unsupported 0xfc operation"),
@@ -260,32 +272,53 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 	Ok(out)
 }
 
+// Read a memarg and CHECK ITS ALIGNMENT against the access width.
+//
+// The alignment immediate is a hint - it does not change what the access does - but the
+// specification bounds it: 2^align may not exceed the width being accessed. An unbounded value was
+// read and dropped, so a module could claim a 2^255 alignment for a one-byte load and be run.
+fn memarg(body: &[u8], pc: &mut usize, width: u8) -> Result<u32, DecodeError> {
+	let align: u32 = read_u32(body, pc)?;
+	if align > 3 || (1u32 << align) > width as u32 {
+		return Err("a memarg whose declared alignment exceeds the access width");
+	}
+	read_u32(body, pc)
+}
+
 // Decode a load opcode's memarg (align, offset) into a `Load`.
 fn load(body: &[u8], pc: &mut usize, width: u8, signed: bool, wide: bool) -> Result<Instr, DecodeError> {
-	let _align: u32 = read_u32(body, pc)?;
-	let offset: u32 = read_u32(body, pc)?;
+	let offset: u32 = memarg(body, pc, width)?;
 	Ok(Instr::Load { width, signed, wide, offset })
 }
 
 // Decode a store opcode's memarg (align, offset) into a `Store`.
 fn store(body: &[u8], pc: &mut usize, width: u8) -> Result<Instr, DecodeError> {
-	let _align: u32 = read_u32(body, pc)?;
-	let offset: u32 = read_u32(body, pc)?;
+	let offset: u32 = memarg(body, pc, width)?;
 	Ok(Instr::Store { width, offset })
 }
 
 // Decode a float load opcode's memarg (align, offset) into an `FLoad`.
 fn fload(body: &[u8], pc: &mut usize, wide: bool) -> Result<Instr, DecodeError> {
-	let _align: u32 = read_u32(body, pc)?;
-	let offset: u32 = read_u32(body, pc)?;
+	let offset: u32 = memarg(body, pc, if wide { 8 } else { 4 })?;
 	Ok(Instr::FLoad { wide, offset })
 }
 
 // Decode a float store opcode's memarg (align, offset) into an `FStore`.
 fn fstore(body: &[u8], pc: &mut usize, wide: bool) -> Result<Instr, DecodeError> {
-	let _align: u32 = read_u32(body, pc)?;
-	let offset: u32 = read_u32(body, pc)?;
+	let offset: u32 = memarg(body, pc, if wide { 8 } else { 4 })?;
 	Ok(Instr::FStore { wide, offset })
+}
+
+// The memory index immediate, which must be 0 while there is one memory.
+//
+// It was read with `read_byte` and discarded. It is a LEB128 u32, not a byte, so a multi-byte
+// encoding left the reader short of the next opcode - and any non-zero value names a memory this
+// module does not have.
+fn memory_index(body: &[u8], pc: &mut usize) -> Result<(), DecodeError> {
+	if read_u32(body, pc)? != 0 {
+		return Err("a memory index other than 0, in a runtime with one memory");
+	}
+	Ok(())
 }
 
 // Read 4 little-endian bytes as f32 bits.

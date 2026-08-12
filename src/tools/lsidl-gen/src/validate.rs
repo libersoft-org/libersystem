@@ -391,11 +391,24 @@ fn type_cardinality(ty: &Type, cards: &HashMap<String, Cardinality>, names: &Has
 	}
 }
 
+// `Many` IS NOW ACCEPTED, and this is the last step of the 1 -> 4 handle migration rather than the
+// first.
+//
+// `wire` said four, the kernel said four and had `SYS_CHANNEL_SEND_CAPS`/`RECV_CAPS`, and the
+// generated client said four - while the typed server receive said ONE and this refusal was the
+// only reason that was not already losing capabilities in production. The order was safe by
+// accident: the schema could not express what the server would have dropped.
+//
+// It is relaxed in the SAME change as `rt::recv_caps_blocking` and the thirteen dispatch sites, so
+// the two cannot be separated by a rebase. `check-single-cap-receive.sh` is what stops a new
+// single-handle receive from appearing behind it.
+//
+// What is still refused is `Unknown` - an imported shape nothing has resolved - which fails closed
+// for the same reason it always did.
 fn report_cardinality(card: Cardinality, span: Span, what: &str, errs: &mut Vec<Error>) {
 	match card {
-		Cardinality::Many => errs.push(Error::new(span, format!("{what} can transfer more than one out-of-band handle"))),
 		Cardinality::Unknown => errs.push(Error::new(span, format!("{what} uses an imported wire shape that has not been resolved"))),
-		Cardinality::Zero | Cardinality::One => {}
+		Cardinality::Zero | Cardinality::One | Cardinality::Many => {}
 	}
 }
 

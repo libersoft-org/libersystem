@@ -107,7 +107,11 @@ pub fn unbind(vector: u8) {
 		// hardware: ownership confusion with no way for either side to notice.
 		let slot = (vector - MSI_BASE) as usize;
 		mask_and_unmap_msix_entry(slot);
-		REGISTRY.free(slot);
+		// RETIRED, NOT FREED. The mask stops the next message; it says nothing about one the device
+		// has already sent, so a vector reused now can wake its next owner with the last owner's
+		// hardware. It waits for `SYS_DEVICE_QUIESCED` - the device's own capability holder saying
+		// the device stopped - exactly as that driver's DMA frames do.
+		REGISTRY.retire(slot);
 		return;
 	}
 	let index = vector.wrapping_sub(IRQ_BASE) as usize;
@@ -148,6 +152,12 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 	}
 	let vector = MSI_BASE + slot as u8;
 	Some(abi::IrqInfo { vector: vector as u32, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector) as u32, device: REGISTRY.owner(slot) })
+}
+
+// Free every MSI vector that is masked and waiting for `device` to be confirmed stopped, and answer
+// how many. Reached from `SYS_DEVICE_QUIESCED`.
+pub fn release_msi_for_device(device: u32) -> usize {
+	REGISTRY.release_for_device(device)
 }
 
 // The number of vectors irq_info reports over.

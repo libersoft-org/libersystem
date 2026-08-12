@@ -49,9 +49,22 @@ pub fn halt() -> ! {
 // Place the kernel at its physical link addresses, find the device tree and boot hart
 // id, exit boot services, turn paging off and enter the kernel's boot stub with the
 // hart id in a0 and the DTB in a1.
-pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
+pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8], reserved: &crate::ReservedKernel) -> ! {
 	let staged = stage_kernel(bs, kernel);
 	serial::write_str("loader: kernel ELF staged clear of the firmware\n");
+
+	// REPORTED, NOT REFUSED, and the difference is the point.
+	//
+	// The other two backends write the kernel to `p_paddr` while the firmware is still up, so a
+	// span they do not own is somebody else's memory and the placement must stop. This backend
+	// stages the image and copies it AFTER `ExitBootServices`, when the firmware's allocator no
+	// longer has an opinion and `check_clear_of_destination` has established that nothing still
+	// needed lies in the way - which is the check that matters here. What an incomplete reservation
+	// tells this path is that the firmware handed some of the destination to something else
+	// earlier, which is worth knowing when a boot goes wrong on an unfamiliar machine.
+	if !reserved.is_complete() {
+		serial::write_str("loader: NOTE - part of the kernel's physical destination could not be reserved before staging; the post-EBS copy proceeds and the overlap check below is what guards it\n");
+	}
 
 	// The boot hart id (a0) and the flattened device tree (a1) - the same pair OpenSBI
 	// hands the kernel on a `-kernel` boot. The kernel scans memory for the DTB if the
@@ -83,7 +96,9 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// Everything the placement will overwrite has to be somewhere else FIRST - checked while
 	// the firmware can still print a diagnosis, because after the copy there is no firmware and
 	// a mistake is a machine that stops saying anything at all.
-	check_clear_of_destination(&staged, boot_info, dtb);
+	// The loader's own extent comes from the firmware while there is still firmware to ask.
+	let loader = crate::loader_image_extent(bs, image_handle);
+	check_clear_of_destination(&staged, boot_info, dtb, loader);
 
 	// ExitBootServices is the last firmware call; after it no service may be used.
 	// GIVE THE HEAP BACK before the map is taken. Everything the kernel receives is in pages of
@@ -113,7 +128,7 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 	let fb = crate::locate_framebuffer(bs);
 	serial::write_str(if fb.present { "loader: GOP framebuffer found\n" } else { "loader: no GOP framebuffer (serial-only boot log)\n" });
 	let phys = crate::alloc_pages(bs, 1).expect("loader: cannot allocate BootInfo");
-	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: 32, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
+	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: fb.bpp, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
 	unsafe {
 		// The page is allocated ONLY when there is a package to describe. `match (init_pkg,
 		// alloc_pages(..))` evaluated the allocation either way, so a boot with no package leaked a
@@ -266,10 +281,14 @@ unsafe fn place_and_enter(staged: &Staged, hartid: u64, boot_info: u64) -> ! {
 	}
 }
 
+// Six fixed objects plus the module array and its entries. A hand-off with more modules than this
+// stops rather than silently checking a prefix of them.
+const MAX_CHECKED_RANGES: usize = 16;
+
 // Refuse to proceed if anything the final copy needs lives in the range that copy overwrites.
 // A wrong answer here is a machine that stops with no output, which is the failure this whole
 // change exists to remove - so it is said out loud instead.
-fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64) {
+fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64, loader: Option<(u64, u64)>) {
 	// RANGES, not addresses. Every one of these was checked by a single byte - the staged image by
 	// its first, while it is the largest object in play - so an object whose START was outside the
 	// destination and whose BODY was inside passed. U-Boot does not reserve its own image in the
@@ -286,28 +305,47 @@ fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64) {
 	// The loader's stack, from the current pointer up to the page it lives on: the whole ACTIVE
 	// stack, not the one word `sp` names.
 	let stack_top = (sp | (crate::PAGE_SIZE - 1)) + 1;
-	let mut ranges: [(u64, u64, &str); 10] = [
-		(place_and_enter as usize as u64, crate::PAGE_SIZE, "the loader's own code"),
-		(sp, stack_top - sp, "the loader's stack"),
-		(staged as *const Staged as u64, core::mem::size_of::<Staged>() as u64, "the staging descriptor"),
-		// The staged image is `span` bytes - the same length the copy will move.
-		(staged.scratch, span, "the staged kernel image"),
-		(boot_info, core::mem::size_of::<bootproto::BootInfo>() as u64, "the hand-off record"),
-		// The device tree's real length, off its own header: bytes 4..8 are `totalsize`, big-endian.
-		(dtb, dtb_total_size(dtb), "the device tree"),
-		(0, 0, ""),
-		(0, 0, ""),
-		(0, 0, ""),
-		(0, 0, ""),
-	];
-	// And the objects the firmware handed back that the kernel has yet to read: the bootstrap
-	// archive, the two packages and a live volume image. These are the ones the comment above is
-	// about - `retain()` allocates them through `AllocateAnyPages`, which U-Boot may satisfy from
-	// inside the kernel's destination.
+	// THE LOADER'S REAL EXTENT, from `EFI_LOADED_IMAGE_PROTOCOL`. One page around
+	// `place_and_enter` stood in for this, and the loader is bigger than one page - so the check
+	// most directly about "the loader is about to overwrite itself" was the loosest of them all.
+	let (loader_base, loader_size) = loader.unwrap_or_else(|| {
+		serial::write_str("loader: WARNING - EFI_LOADED_IMAGE_PROTOCOL gave no extent; checking one page around the copy routine instead\n");
+		(place_and_enter as *const () as u64, crate::PAGE_SIZE)
+	});
+	let mut ranges: [(u64, u64, &str); MAX_CHECKED_RANGES] = [(0, 0, ""); MAX_CHECKED_RANGES];
+	ranges[0] = (loader_base, loader_size, "the loader's own image");
+	ranges[1] = (sp, stack_top - sp, "the loader's stack");
+	ranges[2] = (staged as *const Staged as u64, core::mem::size_of::<Staged>() as u64, "the staging descriptor");
+	// The staged image is `span` bytes - the same length the copy will move.
+	ranges[3] = (staged.scratch, span, "the staged kernel image");
+	ranges[4] = (boot_info, core::mem::size_of::<bootproto::BootInfo>() as u64, "the hand-off record");
+	// The device tree's real length, off its own header: bytes 4..8 are `totalsize`, big-endian.
+	ranges[5] = (dtb, dtb_total_size(dtb), "the device tree");
 	let mut extra = 6;
-	for (bytes, what) in [(unsafe { crate::BOOTSTRAP }, "the bootstrap archive"), (unsafe { crate::LIVE_VOLUME }, "the live volume image")] {
-		if let Some(bytes) = bytes {
-			ranges[extra] = (bytes.as_ptr() as u64, bytes.len() as u64, what);
+
+	// AND EVERYTHING `BootInfo` POINTS AT, rather than a list of globals somebody remembered.
+	//
+	// The list used to be `BOOTSTRAP` and `LIVE_VOLUME`, which are two of the objects `retain()`
+	// hands back through `AllocateAnyPages` - the allocations U-Boot may satisfy from inside the
+	// kernel's destination. It missed the MODULE DESCRIPTOR ARRAY, a separate retained page that
+	// `BootInfo.modules` points at and the kernel reads after the copy, and it would miss the next
+	// thing retained for the same reason: a remembered list is right until something is added.
+	//
+	// Being in `BootInfo` is what makes an object one the kernel still has to read, so that is what
+	// is walked: the record, the array over `modules_len` entries, and every module's own bytes -
+	// which covers the bootstrap archive, both packages and the live image without naming any.
+	let info = boot_info as *const bootproto::BootInfo;
+	let (modules, modules_len) = unsafe { ((*info).modules, (*info).modules_len) };
+	if modules != 0 && modules_len != 0 {
+		ranges[extra] = (modules, modules_len * core::mem::size_of::<bootproto::Module>() as u64, "the module descriptor array");
+		extra += 1;
+		for index in 0..modules_len {
+			if extra == MAX_CHECKED_RANGES {
+				serial::write_str("loader: FATAL - more hand-off modules than the overlap check can hold\n");
+				halt();
+			}
+			let module = unsafe { &*(modules as *const bootproto::Module).add(index as usize) };
+			ranges[extra] = (module.addr, module.size, "a hand-off module the kernel has yet to read");
 			extra += 1;
 		}
 	}

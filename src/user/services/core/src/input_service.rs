@@ -369,11 +369,14 @@ unsafe fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u6
 				continue;
 			}
 			if admin != 0 && ready_handle == admin {
-				match recv_blocking(admin, &mut req) {
-					Received::Message { len, handle } => {
+				match recv_caps_blocking(admin, &mut req) {
+					ReceivedCaps::Message { len, handles: mut caps } => {
 						let mut reply: [u8; 64] = [0; 64];
 						let mut reply_handle = proto::codec::Handles::new();
-						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+						// over the single-handle receive, which keeps the first and drops the rest - so a
+						// client sending stdin, stdout and stderr had two destroyed before dispatch.
+						let mut handle = caps;
 						let mut call = AdminCall { clients: &mut clients };
 						if let Some(n) = input_admin::dispatch(&mut call, &req[..len], &mut handle, &mut reply, &mut reply_handle) {
 							if !send_caps_blocking(admin, &reply[..n], reply_handle.as_slice()) {
@@ -390,7 +393,7 @@ unsafe fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u6
 							close(unclaimed);
 						}
 					}
-					Received::Closed => return,
+					ReceivedCaps::Closed => return,
 				}
 				continue;
 			}

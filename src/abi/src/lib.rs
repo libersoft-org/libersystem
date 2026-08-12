@@ -88,6 +88,14 @@ pub const SYS_DOMAIN_KILL: u64 = 20;
 pub const SYS_YIELD: u64 = 21;
 pub const SYS_OBJECT_INFO_GET: u64 = 22;
 pub const SYS_WAIT: u64 = 23;
+// Create a DMA buffer.
+//   a0 = size in bytes
+//   a1 = a DeviceMemory handle with WRITE, naming the device the buffer is for (0 = none)
+//
+// The second argument arrived with P02M0133's DMA lifetime rule - the kernel holds a dead driver's
+// frames until that device is confirmed stopped - and this line did not mention it. Three stale
+// syscall comments were corrected in this milestone and a fourth appeared within the day, which is
+// the argument for generating these definitions rather than for a fifth correction.
 pub const SYS_DMA_BUFFER_CREATE: u64 = 24;
 pub const SYS_DEVICE_MEMORY_MAP: u64 = 25;
 pub const SYS_RANDOM_GET: u64 = 26;
@@ -148,8 +156,9 @@ pub const SYS_DEVICE_MSIX_ACQUIRE: u64 = 46;
 //
 // The comment here said the argument was the action and that restricting the call was "a future
 // PermissionManager concern". It has not been future since the handle argument landed - and
-// `ABI_VERSION` was correctly moved 1 -> 2 when it did, so the implementation was right and only
-// the definition beside it was wrong.
+// the definition beside it was wrong. (`ABI_VERSION` was briefly moved for this and reverted:
+// nothing here is versioned until the first final release, so the constant is 1 and the two changes
+// worth naming when that day comes are recorded at it.)
 pub const SYS_SYSTEM_POWER: u64 = 47;
 // Read the kernel boot console's content as logical text lines into the caller's
 // buffer, returning the byte count. The kernel hands its on-screen boot log across to
@@ -736,6 +745,31 @@ pub struct Package<'a> {
 	count: usize,
 }
 
+// What a package entry's name may be, for the reader AND the writer.
+//
+// The two disagreed. `Package::parse` required a canonical name - non-empty, everything past the
+// terminator zero - and `build_package` checked only `is_empty()` and the length, so the SSOT crate
+// could produce archives its own reader called invalid: duplicate names, and a NUL inside a name,
+// where `b"foo\0bar"` was written as one thing and read back as `foo` with non-zero padding after
+// it. `b"foo\0"` was worse: a name the writer treated as distinct from `b"foo"` and the reader
+// parsed as exactly that.
+// The most entries any package may hold - the READER's bound, which is not the bootstrap writer's.
+//
+// These are two different limits and conflating them broke the guest immediately: the bootstrap set
+// is a handful of boot programs and `bootstrap::MAX_ENTRIES` bounds it at 64, while the system
+// VOLUME package is every program that ships and has 146 today. A reader ceiling of 64 refused it,
+// which the guest reported as "file missing from the volume package" - measured rather than
+// reasoned about, and the reason this number is generous.
+//
+// What it is for is the quadratic pass below: each entry is compared against every earlier one, so
+// an archive declaring an enormous table drove that work with only the buffer bounding it. 4096 is
+// far above anything this system packages and far below where n^2 costs anything.
+pub const MAX_PACKAGE_ENTRIES: usize = 4096;
+
+pub fn valid_package_name(name: &[u8]) -> bool {
+	!name.is_empty() && name.len() <= PKG_NAME_LEN && !name.contains(&0)
+}
+
 impl<'a> Package<'a> {
 	// Parse and validate the WHOLE archive, not just its header.
 	//
@@ -748,6 +782,7 @@ impl<'a> Package<'a> {
 	// As a trusted build artifact that is survivable. As a parser reading bytes off a disk it is
 	// not, and this is the same crate either way - so every entry is walked here, once, and after
 	// `Some(Package)` a caller may treat the archive as well formed.
+
 	pub fn parse(bytes: &'a [u8]) -> Option<Self> {
 		if bytes.len() < PKG_HEADER_LEN {
 			return None;
@@ -755,7 +790,19 @@ impl<'a> Package<'a> {
 		if &bytes[0..8] != PKG_MAGIC {
 			return None;
 		}
+		// The RESERVED word, which the format reserves and no reader looked at. A field nothing
+		// checks is a field a writer may fill with anything, and then it is not reserved.
+		if bytes[12..16] != [0, 0, 0, 0] {
+			return None;
+		}
 		let count = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+		// AND A CEILING ON THE READER. The strict pass compares each entry against every earlier
+		// one, which is O(n^2), and `bootstrap::MAX_ENTRIES` bounds the WRITER only - so a hostile
+		// archive with a large enough entry table drove quadratic work. The bound is the same one
+		// the writer keeps, stated once here for both.
+		if count > MAX_PACKAGE_ENTRIES {
+			return None;
+		}
 		let table_end = PKG_HEADER_LEN.checked_add(count.checked_mul(PKG_ENTRY_LEN)?)?;
 		if table_end > bytes.len() {
 			return None;
@@ -778,7 +825,7 @@ impl<'a> Package<'a> {
 				}
 				None => stored,
 			};
-			if name.is_empty() {
+			if !valid_package_name(name) {
 				return None;
 			}
 			let (offset, size) = package.extent(index)?;

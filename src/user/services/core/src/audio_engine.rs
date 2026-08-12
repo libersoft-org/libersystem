@@ -24,7 +24,8 @@ const REPLY_MAX: usize = 128;
 
 struct PendingWrite {
 	request: Vec<u8>,
-	handle: u64,
+	// The WHOLE capability list the deferred write carried, not its first handle.
+	caps: proto::codec::Handles,
 }
 
 struct Stream {
@@ -213,7 +214,9 @@ impl Audio {
 		self.tones.clear();
 		while let Some(mut stream) = self.streams.pop() {
 			if let Some(pending) = stream.pending.take() {
-				unsafe { close(pending.handle) };
+				for &handle in pending.caps.as_slice() {
+					unsafe { close(handle) };
+				}
 			}
 			if stream.chan != 0 {
 				unsafe { close(stream.chan) };
@@ -224,7 +227,9 @@ impl Audio {
 	fn remove_stream(&mut self, index: usize) {
 		let mut stream: Stream = self.streams.swap_remove(index);
 		if let Some(pending) = stream.pending.take() {
-			unsafe { close(pending.handle) };
+			for &handle in pending.caps.as_slice() {
+				unsafe { close(handle) };
+			}
 		}
 		if stream.chan != 0 {
 			unsafe { close(stream.chan) };
@@ -242,11 +247,12 @@ impl Audio {
 		}
 	}
 
-	fn dispatch_stream(&mut self, index: usize, request: &[u8], request_handle: u64) {
+	// Takes the whole capability list rather than one handle - see `rt::recv_caps_blocking`.
+	fn dispatch_stream(&mut self, index: usize, request: &[u8], caps: proto::codec::Handles) {
 		let chan: u64 = self.streams[index].chan;
 		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 		let mut reply_handle = proto::codec::Handles::new();
-		let mut request_handle = if request_handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[request_handle]) };
+		let mut request_handle = caps;
 		let mut call = StreamCall { stream: &mut self.streams[index] };
 		if let Some(len) = pcm_stream::dispatch(&mut call, request, &mut request_handle, &mut reply, &mut reply_handle) {
 			if !unsafe { send_caps_blocking(chan, &reply[..len], reply_handle.as_slice()) } {
@@ -270,7 +276,7 @@ impl Audio {
 			if self.streams[index].capacity() != 0
 				&& let Some(pending) = self.streams[index].pending.take()
 			{
-				self.dispatch_stream(index, &pending.request, pending.handle);
+				self.dispatch_stream(index, &pending.request, pending.caps);
 			}
 			index += 1;
 		}
@@ -285,18 +291,18 @@ impl Audio {
 				continue;
 			}
 			let chan: u64 = self.streams[index].chan;
-			match unsafe { try_recv(chan, &mut request) } {
-				Polled::Message { len, handle } => {
+			match unsafe { try_recv_caps(chan, &mut request) } {
+				PolledCaps::Message { len, handles } => {
 					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-					if op == pcm_stream::OP_WRITE && self.streams[index].capacity() == 0 && handle != 0 {
-						self.streams[index].pending = Some(PendingWrite { request: request[..len].to_vec(), handle });
+					if op == pcm_stream::OP_WRITE && self.streams[index].capacity() == 0 && !handles.is_empty() {
+						self.streams[index].pending = Some(PendingWrite { request: request[..len].to_vec(), caps: handles });
 					} else {
-						self.dispatch_stream(index, &request[..len], handle);
+						self.dispatch_stream(index, &request[..len], handles);
 					}
 					index += 1;
 				}
-				Polled::Empty => index += 1,
-				Polled::Closed => {
+				PolledCaps::Empty => index += 1,
+				PolledCaps::Closed => {
 					if self.streams[index].closing {
 						unsafe { close(chan) };
 						self.streams[index].chan = 0;
@@ -424,10 +430,13 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 				continue;
 			}
 			if ready_chan == admin {
-				match recv_blocking(admin, &mut request) {
-					Received::Message { len, handle } => {
+				match recv_caps_blocking(admin, &mut request) {
+					ReceivedCaps::Message { len, handles: mut caps } => {
 						let mut reply_handle = proto::codec::Handles::new();
-						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+						// over the single-handle receive, which keeps the first and drops the rest - so a
+						// client sending stdin, stdout and stderr had two destroyed before dispatch.
+						let mut handle = caps;
 						let mut call = AdminCall { clients: &mut clients };
 						if let Some(reply_len) = audio_admin::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle) {
 							if !send_caps_blocking(admin, &reply[..reply_len], reply_handle.as_slice()) {
@@ -444,15 +453,18 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 							close(unclaimed);
 						}
 					}
-					Received::Closed => exit(),
+					ReceivedCaps::Closed => exit(),
 				}
 				continue;
 			}
 			if let Some(index) = clients.iter().position(|client| client.chan == ready_chan) {
 				let scope: Scope = clients[index].scope;
-				match recv_blocking(ready_chan, &mut request) {
-					Received::Message { len, handle } => {
-						let mut handle = if handle == 0 { proto::codec::Handles::new() } else { proto::codec::Handles::from_slice(&[handle]) };
+				match recv_caps_blocking(ready_chan, &mut request) {
+					ReceivedCaps::Message { len, handles: mut caps } => {
+						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
+						// over the single-handle receive, which keeps the first and drops the rest - so a
+						// client sending stdin, stdout and stderr had two destroyed before dispatch.
+						let mut handle = caps;
 						let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 						if op == HEARTBEAT_OP {
 							send_blocking(ready_chan, b"PONG", 0);
@@ -480,7 +492,7 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 							close(unclaimed);
 						}
 					}
-					Received::Closed => {
+					ReceivedCaps::Closed => {
 						if index == 0 {
 							exit();
 						}
@@ -503,16 +515,16 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 				}
 				continue;
 			}
-			match recv_blocking(ready_chan, &mut request) {
-				Received::Message { len, handle } => {
+			match recv_caps_blocking(ready_chan, &mut request) {
+				ReceivedCaps::Message { len, handles } => {
 					let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-					if op == pcm_stream::OP_WRITE && state.streams[index].capacity() == 0 && handle != 0 {
-						state.streams[index].pending = Some(PendingWrite { request: request[..len].to_vec(), handle });
+					if op == pcm_stream::OP_WRITE && state.streams[index].capacity() == 0 && !handles.is_empty() {
+						state.streams[index].pending = Some(PendingWrite { request: request[..len].to_vec(), caps: handles });
 					} else {
-						state.dispatch_stream(index, &request[..len], handle);
+						state.dispatch_stream(index, &request[..len], handles);
 					}
 				}
-				Received::Closed => {
+				ReceivedCaps::Closed => {
 					if state.streams[index].closing {
 						close(ready_chan);
 						state.streams[index].chan = 0;

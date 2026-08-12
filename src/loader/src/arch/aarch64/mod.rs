@@ -29,8 +29,8 @@ pub fn halt() -> ! {
 
 // Place the kernel at its physical link addresses, find the device tree, exit boot
 // services, and enter the kernel's boot stub with the MMU off and the DTB in x0.
-pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
-	let entry = load_kernel(bs, kernel);
+pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8], reserved: &crate::ReservedKernel) -> ! {
+	let entry = load_kernel(kernel, reserved);
 	serial::write_str("loader: kernel ELF loaded at its physical link addresses\n");
 
 	// The flattened device tree (the kernel's device + memory inventory, replacing
@@ -80,6 +80,13 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// not executing under, left SCTLR_EL2 untouched, and branched to the kernel's boot stub - which
 	// sets up EL1 translation - with the CPU still at EL2. QEMU's virt machine starts the loader at
 	// EL1, which is why this has never been seen here.
+	//
+	// THE EL2 BRANCH BELOW HAS NEVER EXECUTED, ON ANY MACHINE THIS PROJECT HAS RUN ON, and that has
+	// to be said in the code rather than inferred from a milestone. "aarch64 passes 226 tests" is a
+	// statement about the EL1 branch: every one of those runs took the `else` path. The EL2 branch
+	// is written from the architecture reference manual and reviewed, which is not the same as
+	// tested - so a reader must treat a change to it as unverified, and anyone who acquires a part
+	// that boots UEFI at EL2 should treat running this once as a milestone in itself.
 	unsafe {
 		let current_el: u64;
 		core::arch::asm!("mrs {0}, CurrentEL", out(reg) current_el, options(nomem, nostack));
@@ -106,11 +113,35 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 				"ic iallu",
 				"dsb sy",
 				"isb",
+				// OPEN THE GENERIC TIMER TO EL1 BEFORE LEAVING EL2.
+				//
+				// `CNTHCTL_EL2.EL1PCTEN` (bit 0) and `EL1PCEN` (bit 1) are CLEAR out of reset, and
+				// while they are, an EL1 read of the physical counter or timer traps to EL2 - where
+				// this loader will have left no handler. This kernel's tick IS the EL1 generic
+				// timer, so a boot that dropped from EL2 would have taken an unhandled trap at its
+				// first tick. Nothing else configures these: once the loader has decided to change
+				// exception level, opening what the level below needs is the loader's job.
+				"mrs x9, cnthctl_el2",
+				"orr x9, x9, #0x3",
+				"msr cnthctl_el2, x9",
+				// And zero the virtual offset, so the virtual counter EL1 reads is the physical one
+				// rather than the physical one plus whatever CNTVOFF_EL2 held out of reset.
+				"msr cntvoff_el2, xzr",
+				"isb",
 				// Return to EL1h with interrupts masked, at the kernel's entry.
 				"mov x9, #0x3c5",
 				"msr spsr_el2, x9",
 				"msr elr_el2, x1",
-				"mov sp, x2",
+				// SP_EL1, NOT SP. `SPSR_EL2.M[3:0] = 0b0101` is EL1h, which selects SP_EL1 - and
+				// `mov sp, x2` writes the stack pointer of the level EXECUTING, which is EL2. So
+				// the value the comment calls "the stack the kernel starts on" went into a register
+				// the kernel never reads, and EL1 would have started on whatever SP_EL1 held.
+				//
+				// It is dead either way in this tree - the kernel's `_start` sets SP from
+				// `__boot_stack_top` before anything touches it - which is exactly why a wrong
+				// register could sit here unnoticed, and why it is worth correcting while nothing
+				// depends on the contract this code states.
+				"msr sp_el1, x2",
 				"eret",
 				in("x0") boot_info,
 				in("x1") entry,
@@ -157,7 +188,7 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 	let fb = crate::locate_framebuffer(bs);
 	serial::write_str(if fb.present { "loader: GOP framebuffer found\n" } else { "loader: no GOP framebuffer (serial-only boot log)\n" });
 	let phys = crate::alloc_pages(bs, 1).expect("loader: cannot allocate BootInfo");
-	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: 32, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
+	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: fb.bpp, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
 	unsafe {
 		// The page is allocated ONLY when there is a package to describe. `match (init_pkg,
 		// alloc_pages(..))` evaluated the allocation either way, so a boot with no package leaked a
@@ -197,7 +228,10 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 // Load each PT_LOAD segment at its physical (link) address - the placement QEMU's
 // `-kernel` produces, which the kernel's higher-half boot stub relies on (its TTBR1
 // maps a high VA to its link physical address). Returns the entry point (physical).
-fn load_kernel(bs: *mut BootServices, kernel: &[u8]) -> u64 {
+// `bs` is gone from the signature deliberately: this backend no longer allocates here. The spans
+// were staked by `reserve_kernel` and the only question left is whether this loader owns them,
+// which `ReservedKernel` answers without asking the firmware anything.
+fn load_kernel(kernel: &[u8], reserved: &crate::ReservedKernel) -> u64 {
 	let image = crate::elf::Elf::parse(kernel).expect("loader: kernel is not a valid aarch64 ELF64 executable");
 	// ET_EXEC ONLY. The shared parser admits `ET_DYN` too, because the kernel loads position-
 	// independent userspace binaries with it and the compatibility checker reads shared libraries -
@@ -210,18 +244,17 @@ fn load_kernel(bs: *mut BootServices, kernel: &[u8]) -> u64 {
 		if ph.p_type != crate::elf::PT_LOAD || ph.p_memsz == 0 {
 			continue;
 		}
-		// Reserve exactly the segment's physical span (page-aligned) so the firmware
-		// hands it back at its link address, then copy the file bytes and zero the
-		// tail (BSS).
+		// The segment's physical span (page-aligned), which `reserve_kernel` staked before any of
+		// the opportunistic allocations so the firmware would still have it here.
 		let base = align_down(ph.p_paddr, PAGE_SIZE);
 		let pages = (ph.p_paddr - base + ph.p_memsz).div_ceil(PAGE_SIZE);
-		let mut addr = base;
-		let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ADDRESS, uefi::LOADER_DATA, pages as usize, &mut addr) };
-		// An error here is expected on the second claim: `reserve_kernel_span` already staked this
-		// span before the opportunistic allocations, precisely so nothing else could take it. What
-		// would be fatal is the span belonging to something else, and that is what the reservation
-		// prevents rather than what this call detects.
-		let _ = status;
+		// ASK THE RESERVATION, NOT THE FIRMWARE. A second `AllocateAddress` here returns the same
+		// `NOT_FOUND`/`NOT_AVAILABLE` whether the owner is this loader or the firmware, a runtime
+		// service or a device - so its status could not be interpreted, was discarded, and the
+		// write below happened either way. `ReservedKernel` is the answer to the question that call
+		// was trying to ask, and a span this loader does not own is fatal: the boot stops rather
+		// than writing over whatever is there.
+		assert!(reserved.owns(base, pages), "loader: the kernel's physical span at {base:#x} was not reserved by this loader - something else owns it, and placing the kernel there would overwrite it");
 		unsafe {
 			core::ptr::write_bytes(ph.p_paddr as *mut u8, 0, ph.p_memsz as usize);
 			if let Some(data) = image.segment_data(&ph) {

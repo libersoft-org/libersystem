@@ -101,3 +101,38 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	drop(process);
 	crate::sched::run_until_idle();
 }
+
+crate::tagged_test!(a_full_hold_table_leaks_a_dead_drivers_frames_rather_than_recycling_them, [Dma, Drivers, Memory, Kernel], id = "kernel.object.dma_buffer.a_full_hold_table_leaks_a_dead_drivers_frames_rather_than_recycling_them", covers = ["kernel"]);
+fn a_full_hold_table_leaks_a_dead_drivers_frames_rather_than_recycling_them() {
+	// Past 64 held entries the overflow used to hand the frames back to its caller, which RETIRED
+	// them - the kernel announcing, out loud, that it was returning memory a device may still be
+	// writing into to whoever allocated next. The rule this table exists for has no exception, so
+	// the overflow leaks instead: the pages leave circulation permanently and are counted.
+	//
+	// FRAME NUMBERS THAT WERE NEVER ALLOCATED. The table only records them, and the assertions are
+	// about what it does with the record - so a real allocation of 65 buffers would be 65 slower
+	// ways to test the same branch. It does mean the test may not `release_for`, which retires;
+	// `forget_for_test` drops the records the way this test made them.
+	const DEVICE: u32 = 0xD1;
+	const FAKE_BASE: u64 = 0xDEAD_0000_0000;
+	super::forget_for_test(DEVICE);
+	assert_eq!(super::held_frames_for_test(DEVICE), 0, "nothing is held for this device to begin with");
+	let leaked_before = super::leaked_frames_for_test();
+	let lost_before = crate::mem::frame::lost_pages();
+
+	// Fill it exactly. Every one of these is held, none is lost.
+	for index in 0..super::MAX_HELD {
+		super::hold_for_test(DEVICE, alloc::vec![FAKE_BASE + index as u64 * PAGE_SIZE]);
+	}
+	assert_eq!(super::held_frames_for_test(DEVICE), super::MAX_HELD, "a table with room holds every entry");
+	assert_eq!(super::leaked_frames_for_test(), leaked_before, "and loses nothing while it has room");
+
+	// One past it. The frames do not come back and they are not retired - they are counted lost.
+	super::hold_for_test(DEVICE, alloc::vec![FAKE_BASE + 0x1_0000, FAKE_BASE + 0x2_0000, FAKE_BASE + 0x3_0000]);
+	assert_eq!(super::held_frames_for_test(DEVICE), super::MAX_HELD, "the table did not grow");
+	assert_eq!(super::leaked_frames_for_test(), leaked_before + 3, "the three frames it could not hold are counted as leaked");
+	assert_eq!(crate::mem::frame::lost_pages(), lost_before + 3, "and counted in the machine-wide lost total, which is where a leak is diagnosed from");
+
+	super::forget_for_test(DEVICE);
+	assert_eq!(super::held_frames_for_test(DEVICE), 0, "the test leaves the table as it found it");
+}

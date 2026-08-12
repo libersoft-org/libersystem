@@ -2166,3 +2166,76 @@ fn a_secure_random_syscall_refuses_rather_than_answering_from_a_formula() {
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the random thread ran to completion");
 }
+
+tagged_test!(a_typed_receive_keeps_every_capability_a_client_sent, [Ipc, Channel, Handle, Kernel], id = "kernel.kernel.a_typed_receive_keeps_every_capability_a_client_sent", covers = ["kernel"]);
+fn a_typed_receive_keeps_every_capability_a_client_sent() {
+	// THE ONE THAT WOULD HAVE FOUND IT ON ITS OWN.
+	//
+	// `wire` said four capabilities per message, the kernel said four and had the syscalls, and the
+	// generated client said four - while `serve` and eleven hand-written dispatch loops received
+	// through `SYS_CHANNEL_RECV`, which keeps the first and DROPS THE REST. A client sending stdin,
+	// stdout and stderr had two of them destroyed before the dispatch was reached, and the only
+	// reason that was not happening in production was that the LSIDL validator refused to let a
+	// schema ask for more than one.
+	//
+	// Both halves are asserted here: the capability-aware receive keeps all of them, and the
+	// single-handle receive does not - because the second is the reason the first has to exist, and
+	// a test that only proves the good path does not say why it is the good path.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let payload = [0xABu8; 4];
+			// Two, three and four - the pipeline shapes an interface actually asks for.
+			for count in 2..=4usize {
+				let (sender, receiver) = channel_pair(8);
+				let mut sent = [0u64; 4];
+				for slot in sent.iter_mut().take(count) {
+					let (carried, _peer) = channel_pair(2);
+					*slot = carried;
+				}
+				let mut request = [0u64; 5];
+				request[0] = count as u64;
+				request[1..=count].copy_from_slice(&sent[..count]);
+				assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS, sender, payload.as_ptr() as u64, payload.len() as u64, request.as_ptr() as u64) as i64, 0, "a {count}-capability send goes through");
+
+				let mut buf = [0u8; 64];
+				let mut caps_out = [0u64; 5];
+				let len = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, receiver, buf.as_mut_ptr() as u64, buf.len() as u64, caps_out.as_mut_ptr() as u64) as i64;
+				assert_eq!(len, payload.len() as i64, "the payload arrives whole");
+				assert_eq!(caps_out[0], count as u64, "and so does every capability: {count} sent, {} received", caps_out[0]);
+				for index in 0..count {
+					assert!(caps_out[1 + index] != 0, "capability {index} of {count} is a live handle");
+					assert!(handle_is_live(caps_out[1 + index]), "capability {index} of {count} works");
+				}
+			}
+
+			// AND THE PRIMITIVE THAT MADE THE MIGRATION NECESSARY. Three sent, one delivered - not
+			// refused, delivered short. This is the documented behaviour of `SYS_CHANNEL_RECV` and
+			// it is exactly right for a bootstrap handshake or a stream frame, which carry one by
+			// construction. A typed dispatch is neither.
+			let (sender, receiver) = channel_pair(8);
+			let mut sent = [0u64; 3];
+			for slot in sent.iter_mut() {
+				let (carried, _peer) = channel_pair(2);
+				*slot = carried;
+			}
+			let request = [3u64, sent[0], sent[1], sent[2]];
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_CAPS, sender, payload.as_ptr() as u64, payload.len() as u64, request.as_ptr() as u64) as i64, 0);
+			let mut buf = [0u8; 64];
+			let mut one: u64 = 0;
+			let len = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, receiver, buf.as_mut_ptr() as u64, buf.len() as u64, &mut one as *mut u64 as u64) as i64;
+			assert_eq!(len, payload.len() as i64);
+			assert!(one != 0, "the single-handle receive delivers the first");
+			// The other two are gone. The point of the assertion is that this is a REAL loss the
+			// receiver cannot detect, which is why nothing typed may go through this call.
+			let mut second = [0u64; 5];
+			let again = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV_CAPS, receiver, buf.as_mut_ptr() as u64, buf.len() as u64, second.as_mut_ptr() as u64) as i64;
+			assert!(syscall::sys_is_err(again as u64), "there is no second message holding the other two - they were dropped with the first receive");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the capability-count thread ran to completion");
+}

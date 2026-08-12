@@ -34,6 +34,7 @@ impl BlockDevice for MemDisk {
 
 // One file to lay into a synthesized image: a path and its bytes. A trailing "/" path is
 // an empty directory.
+#[derive(Clone)]
 struct File {
 	path: &'static str,
 	data: &'static [u8],
@@ -347,21 +348,41 @@ fn build_exfat_tree(files: &[File], nfc_files: &[File], dirs: &[&str]) -> Vec<u8
 	set_fat(&mut fat, 4, 2, 0xFFFF_FFFF);
 	set_fat(&mut fat, 4, 3, 0xFFFF_FFFF);
 	set_fat(&mut fat, 4, 4, 0xFFFF_FFFF);
-	bm[0] |= 0b111;
+	// A BITMAP, not a byte. `bm[0] |= 1 << (cluster - 2)` shifted past a `u8` the moment a fixture
+	// had more than eight clusters, which is a limit of the builder that read as a limit of the
+	// driver: the crash sweep could not use an exFAT directory large enough to span two sectors, so
+	// the interleaving its publish protocol is about never happened.
+	let mark = |bm: &mut Vec<u8>, cluster: usize| {
+		let bit = cluster - 2;
+		bm[bit / 8] |= 1 << (bit % 8);
+	};
+	mark(&mut bm, 2);
+	mark(&mut bm, 3);
+	mark(&mut bm, 4);
 	push_exfat_bitmap(&mut root, 2, clusters.div_ceil(8) as u64);
 	// The Up-case Table in cluster 4, and its 0x82 entry right after the bitmap's - the order a
 	// formatter writes the two required entries in.
 	let upcase = exfat_upcase_table();
 	assert!(upcase.len() <= bps, "the fixture's table must fit the one cluster it is given");
 	push_exfat_upcase(&mut root, 4, &upcase);
+	// ONE CLUSTER PER FILE was the assumption, and it is not one this builder may make. A file
+	// larger than a cluster was written past its own and over whatever came next, while its FAT
+	// chain still said it ended at the first - so the file did not read back and the files after it
+	// were corrupted. The `nfc_files` branch below already spanned clusters; this one did not, and
+	// every fixture that used it happened to be small enough not to notice.
 	for f in files {
-		let cluster = next;
-		next += 1;
-		set_fat(&mut fat, 4, cluster, 0xFFFF_FFFF);
-		bm[0] |= 1 << (cluster - 2);
-		let off = (heap + cluster - 2) * bps;
+		let first = next;
+		let span = f.data.len().div_ceil(bps).max(1);
+		next += span;
+		for i in 0..span {
+			let cluster = first + i;
+			let link: u32 = if i + 1 < span { (cluster + 1) as u32 } else { 0xFFFF_FFFF };
+			set_fat(&mut fat, 4, cluster, link);
+			mark(&mut bm, cluster);
+		}
+		let off = (heap + first - 2) * bps;
 		img[off..off + f.data.len()].copy_from_slice(f.data);
-		push_exfat_entry(&mut root, f.path, f.data.len() as u64, cluster as u32, false);
+		push_exfat_entry(&mut root, f.path, f.data.len() as u64, first as u32, false);
 	}
 	for f in nfc_files {
 		let cluster = next;
@@ -383,12 +404,42 @@ fn build_exfat_tree(files: &[File], nfc_files: &[File], dirs: &[&str]) -> Vec<u8
 		bm[idx / 8] |= 1 << (idx % 8);
 		push_exfat_entry_ex(&mut root, d, bps as u64, cluster as u32, false, true);
 	}
-	let bm_off = heap * bps;
-	img[bm_off..bm_off + bm.len()].copy_from_slice(&bm);
 	let up_off = (heap + 2) * bps;
 	img[up_off..up_off + upcase.len()].copy_from_slice(&upcase);
-	let root_off = (heap + 1) * bps;
-	img[root_off..root_off + root.len()].copy_from_slice(&root);
+	// THE ROOT MAY NEED MORE THAN ONE CLUSTER, and this wrote it as if it never could: one
+	// `copy_from_slice` at cluster 3, which for a directory larger than a cluster ran straight over
+	// the upcase table beside it and produced an image that would not mount. A fixture that cannot
+	// hold a directory bigger than one sector cannot exercise a publish protocol, because the
+	// interleaving only exists across two.
+	let root_clusters = root.len().div_ceil(bps).max(1);
+	let mut root_chain: Vec<usize> = alloc::vec![3];
+	for _ in 1..root_clusters {
+		root_chain.push(next);
+		next += 1;
+	}
+	for (i, &cluster) in root_chain.iter().enumerate() {
+		let link: u32 = if i + 1 < root_chain.len() { root_chain[i + 1] as u32 } else { 0xFFFF_FFFF };
+		set_fat(&mut fat, 4, cluster, link);
+		mark(&mut bm, cluster);
+		let at = i * bps;
+		if at >= root.len() {
+			break;
+		}
+		let end = (at + bps).min(root.len());
+		let off = (heap + cluster - 2) * bps;
+		img[off..off + (end - at)].copy_from_slice(&root[at..end]);
+	}
+	// THE BITMAP IS WRITTEN LAST, and that is the whole of the three-cluster defect.
+	//
+	// It used to be copied into the image before the root's chain was built, so every cluster the
+	// root needed beyond its first was marked in `bm` after the copy and stayed FREE on the medium.
+	// The driver then did exactly what a driver must: it allocated the first cluster the bitmap
+	// offered, which was the root's own second one, wrote the new file's data over the entries
+	// living there, and the terminator that data left behind scrubbed the third cluster away.
+	// A directory of three clusters therefore "lost its tail" on an ordinary write - on an image
+	// whose bitmap said two of those clusters belonged to nobody.
+	let bm_off = heap * bps;
+	img[bm_off..bm_off + bm.len()].copy_from_slice(&bm);
 	img[reserved * bps..reserved * bps + fat.len()].copy_from_slice(&fat);
 	img[3..11].copy_from_slice(b"EXFAT   ");
 	img[80..84].copy_from_slice(&(reserved as u32).to_le_bytes());
@@ -569,6 +620,76 @@ fn names(list: &[FileInfo]) -> Vec<String> {
 }
 
 const ROOT: &[File] = &[File { path: "HELLO.TXT", data: b"Hello, FAT!" }, File { path: "readme.md", data: b"long name file" }, File { path: "DOCS/a.txt", data: b"in a subdir" }];
+
+// EVERY BUILDER IN THIS FILE, ASKED WHETHER ITS IMAGE HOLDS WHAT IT SAYS IT HOLDS.
+//
+// This milestone recorded five harnesses that proved nothing, and every one of them for the same
+// reason: the fixture did not contain the thing the assertions were about, so they passed without
+// reaching the code. The fifth - `an_exfat_directory_spanning_three_clusters_survives_an_ordinary_write`
+// - was read as a driver defect for a day, and it was an allocation bitmap copied into the image
+// before the root's own clusters were marked in it.
+//
+// So the check that stops the sixth is a test rather than a habit: mount what each builder
+// produces, list it, and read every seed file back. A builder that grows a new limit fails HERE,
+// named, instead of making some unrelated assertion vacuous.
+#[test]
+fn every_fixture_this_suite_builds_holds_what_it_claims() {
+	// Deliberately past the shapes the builders' first callers used: names that need long-name
+	// entries, a file larger than one cluster, a directory, and enough entries that the root spans
+	// more than one sector on every format.
+	let seed: &[File] = &[
+		File { path: "HELLO.TXT", data: b"Hello, FAT!" },
+		File { path: "readme.md", data: b"a long name, so the entry needs LFN fragments" },
+		File { path: "DOCS/a.txt", data: b"in a subdir" },
+		File { path: "BIG.BIN", data: &[0x5Au8; 3 * 512] },
+		File { path: "P0.TXT", data: b"padding, so the root needs a second sector" },
+		File { path: "P1.TXT", data: b"padding, so the root needs a second sector" },
+		File { path: "P2.TXT", data: b"padding, so the root needs a second sector" },
+		File { path: "P3.TXT", data: b"padding, so the root needs a second sector" },
+	];
+	// exFAT has no subdirectory-with-a-file form in these builders, so its seed is the flat one.
+	let flat: Vec<File> = seed.iter().filter(|f| !f.path.contains('/')).cloned().collect();
+	let mut cases: Vec<(String, Vec<u8>, Vec<File>)> = Vec::new();
+	for (label, kind) in [("fat12", Kind::Fat12), ("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
+		cases.push((label.into(), build_fat(kind, seed), seed.to_vec()));
+	}
+	cases.push(("fat12-sized".into(), build_fat12(seed, 1000), seed.to_vec()));
+	cases.push(("fat32-small".into(), build_fat_sized(Kind::Fat32, seed, 4000), seed.to_vec()));
+	cases.push(("exfat".into(), build_exfat(&flat), flat.clone()));
+	// The NoFatChain leg: contiguous clusters and no FAT entries at all, which is how Windows
+	// commonly writes a file - a builder limit here made every NFC assertion vacuous.
+	let nfc: Vec<File> = alloc::vec![File { path: "NFC.BIN", data: &[0x77u8; 2 * 512] }];
+	let mut with_nfc = flat.clone();
+	with_nfc.extend(nfc.iter().cloned());
+	cases.push(("exfat-nfc".into(), build_exfat_nfc(&flat, &nfc), with_nfc));
+	cases.push(("exfat-tree".into(), build_exfat_tree(&flat, &[], &["SUB"]), flat.clone()));
+
+	for (label, image, expect) in cases {
+		let mut fs = FatFs::mount(MemDisk { data: image }).unwrap_or_else(|| panic!("{label}: the fixture does not mount"));
+		let listed = fs.list().unwrap_or_else(|e| panic!("{label}: the fixture does not list ({e:?})"));
+		assert!(!listed.is_empty(), "{label}: the fixture lists nothing");
+		for f in &expect {
+			let got = fs.read_file(f.path.as_bytes()).unwrap_or_else(|e| panic!("{label}: {} is not in the image this builder produced ({e:?})", f.path));
+			assert_eq!(got, f.data, "{label}: {} reads back as different bytes than were put in it", f.path);
+		}
+		// And the free-space model has to agree the image is a volume.
+		let (total, free) = (fs.total_bytes(), fs.free_bytes().unwrap_or_else(|e| panic!("{label}: free space is unreadable ({e:?})")));
+		assert!(free <= total, "{label}: {free} bytes free on a {total}-byte volume");
+		// THEN ONE ORDINARY WRITE, and everything read again.
+		//
+		// A fixture whose allocation record disagrees with its own layout reads back perfectly
+		// until something allocates: the driver takes the first cluster the record offers, which is
+		// a cluster the image is already using, and the damage looks like a driver defect. That is
+		// exactly what the three-cluster case cost, so the check is not "does it read" but "does it
+		// still read after the volume has been asked for space".
+		fs.write_file(b"FIXCHK.BIN", &[0xA3u8; 2 * 512]).unwrap_or_else(|e| panic!("{label}: the fixture will not accept a write ({e:?})"));
+		for f in &expect {
+			let got = fs.read_file(f.path.as_bytes()).unwrap_or_else(|e| panic!("{label}: {} is gone after one ordinary write - the image's allocation record does not describe the image ({e:?})", f.path));
+			assert_eq!(got, f.data, "{label}: {} changed under an unrelated write", f.path);
+		}
+		assert_eq!(fs.read_file(b"FIXCHK.BIN").unwrap_or_else(|e| panic!("{label}: the file just written is unreadable ({e:?})")), &[0xA3u8; 2 * 512]);
+	}
+}
 
 #[test]
 fn mounts_and_lists_fat12() {
@@ -1015,11 +1136,29 @@ fn a_forged_nofatchain_size_is_refused() {
 	// whose data length lives at byte 24; restamp the set checksum after the forgery.
 	let set_at = exfat_first_set(&fs.dev.data, (heap + 1) * 512);
 	let stream = set_at + 32;
-	fs.dev.data[stream + 24..stream + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+	// UNDER the read ceiling and far past the volume, so the RUN check is what refuses it.
+	//
+	// This forged `u64::MAX`, which `read_file`'s ceiling now catches first as `TooLarge` - a
+	// perfectly good refusal, and one that would have left the run validation below untested. Both
+	// answers are asserted: this size exercises the run, and the ceiling gets its own case.
+	const FORGED: u64 = 200 * 1024 * 1024;
+	fs.dev.data[stream + 24..stream + 32].copy_from_slice(&FORGED.to_le_bytes());
 	let count = fs.dev.data[set_at + 1] as usize + 1;
 	let sum = exfat_set_checksum(&fs.dev.data[set_at..set_at + count * 32]);
 	fs.dev.data[set_at + 2..set_at + 4].copy_from_slice(&sum.to_le_bytes());
-	assert_eq!(fs.read_file(b"backup.img"), Err(FsError::Invalid));
+	assert_eq!(fs.read_file(b"backup.img"), Err(FsError::Invalid), "a run the heap cannot hold");
+	// And a size past what this reader will allocate at all is `TooLarge`, which is the bound the
+	// caller can raise or lower with `read_file_bounded` - the point being that a number the medium
+	// writes no longer names the size of an allocation.
+	fs.dev.data[stream + 24..stream + 32].copy_from_slice(&u64::MAX.to_le_bytes());
+	let sum = exfat_set_checksum(&fs.dev.data[set_at..set_at + count * 32]);
+	fs.dev.data[set_at + 2..set_at + 4].copy_from_slice(&sum.to_le_bytes());
+	assert_eq!(fs.read_file(b"backup.img"), Err(FsError::TooLarge), "a length past the reader's ceiling");
+	assert_eq!(fs.read_file_bounded(b"backup.img", 4096), Err(FsError::TooLarge), "and a caller may set its own");
+	// Back to the forged-but-plausible size for the removal below, which is about the release path.
+	fs.dev.data[stream + 24..stream + 32].copy_from_slice(&FORGED.to_le_bytes());
+	let sum = exfat_set_checksum(&fs.dev.data[set_at..set_at + count * 32]);
+	fs.dev.data[set_at + 2..set_at + 4].copy_from_slice(&sum.to_le_bytes());
 	// the remove is durable (the entry clears) but its release refuses the forged
 	// run: the clusters stay marked - a bounded leak, never a foreign free.
 	fs.remove(b"backup.img").unwrap();
@@ -1931,6 +2070,24 @@ struct FailNthWrite {
 	data: Vec<u8>,
 	seen: usize,
 	fail_at: usize,
+	// A FAILING FLUSH is the other half, and there was no way to ask for one.
+	//
+	// `flush` defaulted to `true` here and in `OrderedDisk`, so every barrier in this driver
+	// succeeded in every test - and the branch a barrier failure takes was unreachable. That is
+	// where the publish protocol decides what the caller may free, so it is exactly the branch the
+	// crash work is about. 0 = never fail one.
+	flushes: usize,
+	fail_flush_at: usize,
+}
+
+impl FailNthWrite {
+	fn cut_write(data: Vec<u8>, at: usize) -> Self {
+		FailNthWrite { data, seen: 0, fail_at: at, flushes: 0, fail_flush_at: 0 }
+	}
+
+	fn cut_flush(data: Vec<u8>, at: usize) -> Self {
+		FailNthWrite { data, seen: 0, fail_at: 0, flushes: 0, fail_flush_at: at }
+	}
 }
 
 impl BlockDevice for FailNthWrite {
@@ -1949,6 +2106,12 @@ impl BlockDevice for FailNthWrite {
 		let Some(dst) = self.data.get_mut(start..start + SECTOR_SIZE) else { return false };
 		dst.copy_from_slice(buf);
 		true
+	}
+	// A flush that fails does NOT undo the writes before it. The bytes are in the image either way,
+	// which is the whole reason a failed barrier leaves the commit ambiguous rather than absent.
+	fn flush(&mut self) -> bool {
+		self.flushes += 1;
+		self.flushes != self.fail_flush_at
 	}
 }
 
@@ -1985,7 +2148,7 @@ fn an_interrupted_swap_never_frees_clusters_a_live_entry_names() {
 		let mut prep = FatFs::mount(MemDisk { data: base }).expect("mount");
 		prep.remove(b"F0.TXT").expect("an early hole for the replacement to land in");
 		let holed = core::mem::take(&mut prep.device_for_test().data);
-		let mut fs = FatFs::mount(FailNthWrite { data: holed, seen: 0, fail_at: budget }).expect("mount");
+		let mut fs = FatFs::mount(FailNthWrite::cut_write(holed, budget)).expect("mount");
 		let _ = fs.write_file(b"A.TXT", b"bbbbbbbb");
 
 		// Whatever happened, re-read the volume - and then ALLOCATE, because that is what turns a
@@ -2129,8 +2292,18 @@ fn a_directory_grown_by_a_failed_write_is_grown_at_most_once() {
 	assert_eq!(fs.write_file(b"DOCS/G0.TXT", b"y"), Err(FsError::Io));
 	assert!(!fs.dev.armed, "the injected failure never fired");
 
+	// TWO clusters, not one, since 2026-08-12, and the extra one is the publish protocol working.
+	//
+	// The failing write is the FIRST of the swap's two, and its failure now carries `placed: true`:
+	// an entry set can straddle a sector boundary, so a write that fails part-way may already have
+	// put the live half on the medium. The caller therefore does not free the new data chain, and
+	// the cost of the failure is the directory's grown cluster PLUS that chain.
+	//
+	// A leaked cluster against a cross-linked one is not a close comparison, and the bound this test
+	// exists for still holds: it is a fixed cost per failure, and the retry below pays for nothing
+	// further.
 	let cluster_bytes = (fs.geo.sectors_per_cluster * fs.geo.bytes_per_sector) as u64;
-	assert_eq!(full - fs.free_bytes().unwrap(), cluster_bytes, "the failed write cost more than the one cluster the directory grew by");
+	assert_eq!(full - fs.free_bytes().unwrap(), cluster_bytes * 2, "a failed publish costs the grown cluster and the chain it may already have named");
 
 	// The retry: arm the same trap again, on the cluster a SECOND grow would take. It must never
 	// fire, because there is no second grow - the tail the first failure left is the free run the
@@ -2144,7 +2317,7 @@ fn a_directory_grown_by_a_failed_write_is_grown_at_most_once() {
 	fs.dev.armed = false;
 
 	assert_eq!(fs.read_file(b"DOCS/G0.TXT").unwrap(), b"y");
-	assert_eq!(fs.free_bytes().unwrap(), full - cluster_bytes * 2, "the successful write pays for its own data cluster and nothing else");
+	assert_eq!(fs.free_bytes().unwrap(), full - cluster_bytes * 3, "the successful write pays for its own data cluster and nothing else");
 }
 
 #[test]
@@ -2749,12 +2922,35 @@ fn what_this_driver_writes_to_a_classic_volume_another_implementation_reads() {
 // without following a chain; the exFAT paths get their coverage from fsck.exfat above.
 #[cfg(test)]
 fn owned_clusters<D: BlockDevice>(fs: &mut FatFs<D>) -> Result<Vec<(String, Vec<u32>)>, String> {
-	let bytes = fs.read_dir_bytes(&Dir::at(0)).map_err(|e| alloc::format!("the root is unreadable: {e:?}"))?;
-	let entries = parse_fat_dir(&bytes).map_err(|e| alloc::format!("the root does not parse: {e:?}"))?;
+	// THE ROOT OF THE VOLUME IN FRONT OF IT, and by the parser that format uses.
+	//
+	// This read `Dir::at(0)` and parsed it with `parse_fat_dir` whatever the volume was. On exFAT
+	// cluster 0 is not the root - it is the fixed root REGION, which exFAT does not have - and the
+	// classic parser cannot read an entry set in any case. So every exFAT leg of the crash sweep
+	// examined an empty list of files and found nothing wrong with it: the invariants were checked
+	// against no entries at all. Watched: with the exFAT publish protocol's `placed` flag inverted,
+	// the sweep still passed.
+	let root = Dir::at(fs.root_cluster());
+	let bytes = fs.read_dir_bytes(&root).map_err(|e| alloc::format!("the root is unreadable: {e:?}"))?;
+	let entries = match fs.geo.kind {
+		Kind::ExFat => parse_exfat_dir(&bytes, &fs.upcase).map_err(|e| alloc::format!("the root does not parse: {e:?}"))?,
+		_ => parse_fat_dir(&bytes).map_err(|e| alloc::format!("the root does not parse: {e:?}"))?,
+	};
 	let max = fs.max_cluster();
 	let mut out: Vec<(String, Vec<u32>)> = Vec::new();
 	for e in entries.iter().filter(|e| !e.is_dir && e.first_cluster != 0) {
 		let mut chain = Vec::new();
+		// A NoFatChain extent has no FAT entries by design, so walking one would report every
+		// cluster of it as free. Its clusters are the contiguous run its recorded size implies.
+		if e.no_fat_chain {
+			let cluster_bytes = fs.geo.sectors_per_cluster as u64 * fs.geo.bytes_per_sector as u64;
+			let count = e.size.div_ceil(cluster_bytes.max(1)).max(1) as u32;
+			for i in 0..count {
+				chain.push(e.first_cluster + i);
+			}
+			out.push((e.name.clone(), chain));
+			continue;
+		}
 		let mut c = e.first_cluster;
 		let mut guard = 0;
 		while c >= 2 && c <= max && !fs.is_end(c) {
@@ -2802,6 +2998,46 @@ fn crash_invariants<D: BlockDevice>(fs: &mut FatFs<D>, note: &str) {
 }
 
 #[test]
+fn an_exfat_directory_spanning_three_clusters_survives_an_ordinary_write() {
+	// FOUND BY WIDENING THE CRASH SWEEP, and it is not a crash defect at all - there is no
+	// interruption anywhere in this test. A root directory large enough to need three clusters
+	// lost the entries in its last one the first time anything was written into it.
+	//
+	// It surfaced because the sweep's fixture had to grow: exFAT entry sets are ~96 bytes, so the
+	// old four-file fixture sat inside ONE sector and the publish protocol's two-write interleaving
+	// could not occur. Widening it to twelve files reached this instead, which is worth more than
+	// what was being looked for.
+	//
+	// AND THE DEFECT WAS THE FIXTURE'S, which is why it is worth keeping this test after the fix:
+	// `build_exfat_tree` copied its allocation bitmap into the image before it built the root's
+	// cluster chain, so every cluster the root needed beyond its first was marked free on the
+	// medium. The driver allocated the root's own second cluster for the new file's data, and the
+	// terminator that data left behind scrubbed the third away. The driver behaved correctly on an
+	// image that lied to it - the fifth harness in this milestone to prove nothing for a reason
+	// that had nothing to do with the code under test.
+	//
+	// It stays as a regression test for the fixture: it fails the moment the bitmap stops
+	// describing the image it is written into.
+	let seed: &[File] = &[
+		File { path: "P0.TXT", data: b"padding" },
+		File { path: "P1.TXT", data: b"padding" },
+		File { path: "P2.TXT", data: b"padding" },
+		File { path: "P3.TXT", data: b"padding" },
+		File { path: "P4.TXT", data: b"padding" },
+		File { path: "P5.TXT", data: b"padding" },
+		File { path: "P6.TXT", data: b"padding" },
+		File { path: "P7.TXT", data: b"padding" },
+		File { path: "P8.TXT", data: b"padding" },
+		File { path: "P9.TXT", data: b"padding" },
+		File { path: "KEEP.TXT", data: b"the entry in the last cluster" },
+	];
+	let mut fs = FatFs::mount(MemDisk { data: build_exfat(seed) }).expect("mount");
+	assert_eq!(fs.read_file(b"KEEP.TXT").expect("the fixture holds it"), b"the entry in the last cluster");
+	fs.write_file(b"NEW.TXT", b"an ordinary write, nothing interrupted").expect("write");
+	assert_eq!(fs.read_file(b"KEEP.TXT").expect("and it is still there afterwards"), b"the entry in the last cluster");
+}
+
+#[test]
 fn every_mutating_operation_survives_being_cut_at_any_write() {
 	// The generic form of the harness that found the directory-swap defect. Each operation is run
 	// once per failure point, against a device whose Nth write fails and whose later writes
@@ -2818,8 +3054,24 @@ fn every_mutating_operation_survives_being_cut_at_any_write() {
 	// replaced it lands back in that file's own vacated slots - one write, nothing to interrupt
 	// between. With the hole before it, the new entry and the old one's deletion are two separate
 	// ranges and the publish protocol has two writes to be cut between.
+	//
+	// AND THE DIRECTORY HAS TO SPAN MORE THAN ONE SECTOR, which the four-file fixture did not. A
+	// publish that fits in one write has no second sector to fail on, so the interleaving the
+	// protocol exists for never occurs and every format passes for the same empty reason. That is
+	// the fixture-shape trap this milestone already recorded once, met again on the format that had
+	// no protocol at all: exFAT's entry sets are ~96 bytes, so four files sat inside one sector and
+	// its missing two-phase publish could not be reached.
+	//
+	// The padding sits BETWEEN the hole and the files being replaced, which is the point of it: the
+	// new entry goes into the earliest free run - the hole, in the first sector - and the old
+	// entry's deletion is in a later one, so the two writes of the publish protocol land in
+	// different sectors and there is something to interrupt between them.
 	let seed: &[File] = &[
 		File { path: "HOLE.TXT", data: b"removed to make an early hole" },
+		File { path: "P0.TXT", data: b"padding, so the directory needs a second sector" },
+		File { path: "P1.TXT", data: b"padding, so the directory needs a second sector" },
+		File { path: "P2.TXT", data: b"padding, so the directory needs a second sector" },
+		File { path: "P3.TXT", data: b"padding, so the directory needs a second sector" },
 		File { path: "KEEP.TXT", data: b"untouched by any of this" },
 		File { path: "OLD.TXT", data: b"the file being replaced" },
 		File { path: "BIG.BIN", data: &[0x11u8; 3 * 512] },
@@ -2833,31 +3085,74 @@ fn every_mutating_operation_survives_being_cut_at_any_write() {
 		("create-into-a-hole", |fs| fs.write_file(b"INTO.TXT", b"lands where HOLE.TXT was")),
 	];
 
-	for (label, operation) in operations {
-		let mut cut_at_least_one = false;
-		for budget in 1..40usize {
-			let base = build_fat(Kind::Fat16, seed);
-			let mut prep = FatFs::mount(MemDisk { data: base }).expect("mount");
-			prep.remove(b"HOLE.TXT").expect("the early hole");
-			let holed = core::mem::take(&mut prep.device_for_test().data);
+	// EVERY FORMAT, and both ways of being cut.
+	//
+	// The sweep built `Kind::Fat16` and injected `write_block` failures, and the two defects the
+	// re-audit found sit on precisely the axes it did not cover: exFAT never got the two-phase
+	// publish at all, and the classic path's `placed` flag is wrong on a failing BARRIER. Neither
+	// could be caught by a harness that crashes one format one way, which is why the axes come
+	// before the fixes.
+	type Build = (&'static str, fn(&[File]) -> Vec<u8>);
+	let formats: &[Build] = &[
+		("fat12", |files| build_fat(Kind::Fat12, files)),
+		("fat16", |files| build_fat(Kind::Fat16, files)),
+		("fat32", |files| build_fat(Kind::Fat32, files)),
+		// exFAT is swept with the SAME fixture as the rest, which it was not while the
+		// three-cluster defect stood. That defect turned out to be the fixture's own bitmap and is
+		// fixed, so the narrowing it forced is gone: every format here now has a root spanning
+		// more than one sector, which is the only shape in which the two-phase publish has an
+		// interleaving to be cut between.
+		("exfat", build_exfat),
+	];
+	// A flush failure is scarcer than a write failure - a write per sector, a barrier per phase -
+	// so its budgets are counted separately and stop sooner.
+	enum Cut {
+		Write(usize),
+		Flush(usize),
+	}
+	let cuts: Vec<Cut> = (1..40usize).map(Cut::Write).chain((1..8usize).map(Cut::Flush)).collect();
 
-			let mut fs = FatFs::mount(FailNthWrite { data: holed, seen: 0, fail_at: budget }).expect("mount");
-			let outcome = operation(&mut fs);
-			cut_at_least_one |= outcome.is_err();
-			let image = core::mem::take(&mut fs.device_for_test().data);
-
-			let note = alloc::format!("{label} cut at write {budget}");
-			let mut check = FatFs::mount(MemDisk { data: image }).unwrap_or_else(|| panic!("{note}: the volume no longer mounts"));
-			crash_invariants(&mut check, &note);
-			// KEEP.TXT is never the subject of any operation: whatever happened, it is intact.
-			assert_eq!(check.read_file(b"KEEP.TXT").unwrap(), b"untouched by any of this", "{note}: an uninvolved file was damaged");
-
-			// Force an allocation, then ask again - this is what makes latent damage visible.
-			let _ = check.write_file(b"BAIT.BIN", &[0xCCu8; 4 * 512]);
-			crash_invariants(&mut check, &alloc::format!("{note}, after a later allocation"));
-			assert_eq!(check.read_file(b"KEEP.TXT").unwrap(), b"untouched by any of this", "{note}: an uninvolved file was damaged by a later allocation");
+	// THE FIXTURE FIRST. A harness whose image does not already hold what it is about to check is
+	// the trap this milestone met four times: every assertion afterwards passes for a reason that
+	// has nothing to do with the code.
+	for (format, build) in formats {
+		let mut check = FatFs::mount(MemDisk { data: build(seed) }).unwrap_or_else(|| panic!("{format}: the fixture does not mount"));
+		for file in seed {
+			assert!(check.read_file(file.path.as_bytes()).is_ok(), "{format}: the fixture does not contain {}, so nothing below is about it", file.path);
 		}
-		assert!(cut_at_least_one, "{label}: no budget in the sweep interrupted it, so nothing was tested");
+	}
+
+	for (format, build) in formats {
+		for (label, operation) in operations {
+			let mut cut_at_least_one = false;
+			for cut in &cuts {
+				let base = build(seed);
+				let mut prep = FatFs::mount(MemDisk { data: base }).unwrap_or_else(|| panic!("{format}: the fixture this test just built does not mount"));
+				prep.remove(b"HOLE.TXT").unwrap_or_else(|_| panic!("{format}: the early hole"));
+				let holed = core::mem::take(&mut prep.device_for_test().data);
+
+				let (device, how) = match cut {
+					Cut::Write(at) => (FailNthWrite::cut_write(holed, *at), alloc::format!("write {at}")),
+					Cut::Flush(at) => (FailNthWrite::cut_flush(holed, *at), alloc::format!("flush {at}")),
+				};
+				let mut fs = FatFs::mount(device).expect("mount");
+				let outcome = operation(&mut fs);
+				cut_at_least_one |= outcome.is_err();
+				let image = core::mem::take(&mut fs.device_for_test().data);
+
+				let note = alloc::format!("{format} {label} cut at {how}");
+				let mut check = FatFs::mount(MemDisk { data: image }).unwrap_or_else(|| panic!("{note}: the volume no longer mounts"));
+				crash_invariants(&mut check, &note);
+				// KEEP.TXT is never the subject of any operation: whatever happened, it is intact.
+				assert_eq!(check.read_file(b"KEEP.TXT").unwrap_or_else(|e| panic!("{note}: KEEP.TXT is gone ({e:?})")), b"untouched by any of this", "{note}: an uninvolved file was damaged");
+
+				// Force an allocation, then ask again - this is what makes latent damage visible.
+				let _ = check.write_file(b"BAIT.BIN", &[0xCCu8; 4 * 512]);
+				crash_invariants(&mut check, &alloc::format!("{note}, after a later allocation"));
+				assert_eq!(check.read_file(b"KEEP.TXT").unwrap_or_else(|e| panic!("{note}: KEEP.TXT is gone after a later allocation ({e:?})")), b"untouched by any of this", "{note}: an uninvolved file was damaged by a later allocation");
+			}
+			assert!(cut_at_least_one, "{format} {label}: no budget in the sweep interrupted it, so nothing was tested");
+		}
 	}
 }
 

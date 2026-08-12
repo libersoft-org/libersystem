@@ -182,15 +182,25 @@ impl proto::codec::Transport for DeadlineTransport {
 				return None;
 			}
 			let mut reply: [u8; 4096] = [0u8; 4096];
-			match try_recv(self.chan, &mut reply) {
-				Polled::Message { len, handle } => {
-					if handle != 0 {
-						*reply_handles = proto::codec::Handles::from_slice(&[handle]);
-					}
+			// EVERY CAPABILITY THE REPLY CARRIED. This took the first and dropped the rest, which
+			// for a client transport means the schema's second and third out-of-band handles were
+			// destroyed on the way in.
+			match try_recv_caps(self.chan, &mut reply) {
+				PolledCaps::Message { len, handles } => {
+					*reply_handles = handles;
 					Some(reply[..len].to_vec())
 				}
 				_ => None,
 			}
+		}
+	}
+
+	// A reply this transport could not decode carries capabilities that are REAL: it received them
+	// from the kernel, so nothing else will close them. Written out because the trait no longer has
+	// a default body - a transport whose author forgot this used to compile silently and leak.
+	fn discard_handles(&mut self, handles: &[u64]) {
+		for &handle in handles {
+			unsafe { close(handle) };
 		}
 	}
 }
@@ -774,7 +784,7 @@ unsafe fn command_vocab(console: &mut Console) -> Vec<Vec<u8>> {
 			let mut names: Vec<Vec<u8>> = Vec::new();
 			if let Some(storage) = service_connect(console.facs.storage) {
 				let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
-				if let Some(consumer) = client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
+				if let Some(Ok(consumer)) = client.list(runtime_path("command-directory").expect("manifest command-directory path")) {
 					// Completion again: fewer names, no false claim.
 					names = drain_stream_complete(consumer, proto::system::volume::list_read).unwrap_or_default().into_iter().filter_map(|f| executable::logical_name(&f.name).map(|name| name.as_bytes().to_vec())).collect();
 				}
@@ -817,7 +827,7 @@ unsafe fn path_vocab(console: &mut Console, fg: usize, tok_start: usize) -> Vec<
 		let mut names: Vec<Vec<u8>> = Vec::new();
 		if let Some(storage) = service_connect(console.facs.storage) {
 			let mut client = proto::system::volume::Client::new(ChannelTransport { chan: storage });
-			if let Some(consumer) = client.list(&target) {
+			if let Some(Ok(consumer)) = client.list(&target) {
 				for f in drain_stream_complete(consumer, proto::system::volume::list_read).unwrap_or_default() {
 					let mut name: Vec<u8> = f.name.into_bytes();
 					if f.r#type == proto::system::FileType::Dir {
@@ -1366,15 +1376,18 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 // that is not draining its input drops them rather than stalling the console loop.
 unsafe fn pointer_report(console: &mut Console, fg: usize, col: usize, row: usize, buttons: u8, prev: u8, wheel: i8, sgr: bool, motion: bool, anymotion: bool) {
 	unsafe {
-		if !sgr {
-			return;
-		}
+		// `?1000` WITHOUT `?1006` IS ANSWERED, in the legacy X10/normal encoding.
+		//
+		// This opened with `if !sgr { return; }`, so a program that enabled the standard tracking
+		// mode and not the SGR extension received no mouse events at all - the terminal accepted
+		// the mode and then reported nothing, which is the worst of the three possible answers. A
+		// program that is refused can fall back; one that is silently ignored cannot tell.
 		let client: u64 = console.vts[fg].client;
 		let cx: usize = col + 1;
 		let cy: usize = row + 1;
 		if wheel != 0 {
 			let cb: usize = if wheel > 0 { 64 } else { 65 };
-			send_sgr(client, cb, cx, cy, true);
+			send_report(client, cb, cx, cy, true, sgr);
 			return;
 		}
 		// Button edges (bit 0 left -> Cb 0, bit 1 right -> Cb 2, bit 2 middle -> Cb 1).
@@ -1382,9 +1395,9 @@ unsafe fn pointer_report(console: &mut Console, fg: usize, col: usize, row: usiz
 			let now: bool = buttons & bit != 0;
 			let was: bool = prev & bit != 0;
 			if now && !was {
-				send_sgr(client, code, cx, cy, true);
+				send_report(client, code, cx, cy, true, sgr);
 			} else if !now && was {
-				send_sgr(client, code, cx, cy, false);
+				send_report(client, code, cx, cy, false, sgr);
 			}
 		}
 		// Motion (no button change this event): a drag under ?1002, any motion under ?1003.
@@ -1400,9 +1413,34 @@ unsafe fn pointer_report(console: &mut Console, fg: usize, col: usize, row: usiz
 				} else {
 					3
 				};
-				send_sgr(client, 32 + base, cx, cy, true);
+				send_report(client, 32 + base, cx, cy, true, sgr);
 			}
 		}
+	}
+}
+
+// Send one mouse report in whichever encoding the program asked for.
+//
+// SGR (`?1006`) when it enabled that, and the legacy X10/normal encoding otherwise. The legacy form
+// is `ESC [ M Cb Cx Cy` with each field a single byte biased by 32, which is why it cannot express
+// a coordinate past 223 - that limit is the reason SGR exists, and it is not a reason to answer
+// nothing on the mode every program still starts with.
+unsafe fn send_report(client: u64, cb: usize, cx: usize, cy: usize, press: bool, sgr: bool) {
+	unsafe {
+		if sgr {
+			send_sgr(client, cb, cx, cy, press);
+			return;
+		}
+		// A release in the legacy encoding is button 3 rather than a distinct terminator, so the
+		// program cannot tell WHICH button was released - that is the encoding, not a shortcut.
+		let button: usize = if press { cb } else { 3 };
+		// Past 223 columns or rows the byte would wrap into the control range. Dropping the report
+		// is what every terminal does here; a wrapped coordinate would be a lie.
+		if cx > 223 || cy > 223 {
+			return;
+		}
+		let buf: [u8; 6] = [0x1b, b'[', b'M', (32 + button) as u8, (32 + cx) as u8, (32 + cy) as u8];
+		try_send(client, &buf, 0);
 	}
 }
 

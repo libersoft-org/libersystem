@@ -106,6 +106,27 @@ pub struct ScrollOp {
 // ring. It holds no pixels and no framebuffer address - the renderer packs its logical
 // colours and draws its cells onto the surface. So a non-graphical consumer (a "screen as
 // text" snapshot, ssh/telnet) can read this model without any rendering.
+// One screen: its cells and the per-row soft-wrap flags that describe them.
+//
+// `wrap[r]` is true when row r ended by auto-wrapping into row r+1 - a glyph overflowed its last
+// column - so the two rows are one logical line. A text consumer joins soft-wrapped rows and breaks
+// only on hard newlines. The flags shift with the grid on a scroll and are captured into `sb_wrap`
+// when a row scrolls into the scrollback ring.
+//
+// The pairing is the point: cells and their line structure describe the same screen, so they belong
+// to the same value and cannot be read from different ones.
+#[derive(Clone)]
+struct ScreenBuffer {
+	cells: Vec<Cell>,
+	wrap: Vec<bool>,
+}
+
+impl ScreenBuffer {
+	fn new(cols: usize, rows: usize, blank: Cell) -> ScreenBuffer {
+		ScreenBuffer { cells: alloc::vec![blank; cols * rows], wrap: alloc::vec![false; rows] }
+	}
+}
+
 pub struct Screen {
 	cols: usize,
 	rows: usize,
@@ -153,6 +174,9 @@ pub struct Screen {
 	// A clipboard write the program requested via OSC 52 (decoded to plain text); drained
 	// by the console into the clipboard it holds.
 	clipboard_set: Option<Vec<u8>>,
+	// A clipboard READ the program requested via `OSC 52 ; Pc ; ?`, holding the selection byte it
+	// named. Drained by the console, which owns the clipboard and answers with `answer_clipboard`.
+	clipboard_query: Option<u8>,
 	// Bytes this terminal owes the program: the answer to a query sequence, drained by the console
 	// into the program's input. See `take_reply`.
 	reply: Vec<u8>,
@@ -168,24 +192,32 @@ pub struct Screen {
 	utf8_rem: u8,
 	// The smallest codepoint the sequence in progress may legally encode - see `begin_utf8`.
 	utf8_min: u32,
-	primary: Vec<Cell>,
-	alt: Vec<Cell>,
+	// THE TWO SCREENS ARE TWO OBJECTS, and `alt_active` says which is live.
+	//
+	// They used to be four parallel fields - `primary`, `alt`, `wrap`, `alt_wrap` - with the wrap
+	// vectors SWAPPED by hand on entry and exit, and that produced one defect with four symptoms,
+	// all of them the same missing question: which screen is this?
+	//
+	//  - `global_glyph` read `primary` and `global_wrap` read `wrap`, so during alt they described
+	//    different screens. A selection over a full-screen program highlighted the alternate cells
+	//    and copied the shell text underneath them.
+	//  - `resize` reflowed the primary buffer using the ALTERNATE screen's line structure, then
+	//    assigned both vectors unconditionally, leaving them swapped afterwards.
+	//  - RIS set `alt_active = false` directly rather than through `leave_alt_buffer`, which is the
+	//    only place that swapped back - so a reset during alt left the primary live with the
+	//    alternate's wrap flags.
+	//  - `?47` preserved the alternate CELLS across leave and re-enter while clearing its wrap
+	//    flags on every entry, so a program got its characters back without their line structure.
+	//
+	// One type answers the question once: a buffer owns its cells AND its wrap flags, `screen()`
+	// picks the live one, and nothing swaps anything.
+	primary: ScreenBuffer,
+	alt: ScreenBuffer,
 	alt_active: bool,
 	dirty: Vec<bool>,
-	// Per-row soft-wrap flag (parallel to the live grid rows): wrap[r] is true when row r
-	// ended by auto-wrapping into row r+1 (a glyph overflowed its last column), so the two
-	// rows are one logical line. A text consumer joins soft-wrapped rows and breaks only on
-	// hard newlines. It shifts with the grid on a scroll and is captured into `sb_wrap` when
-	// a row scrolls into the scrollback ring.
 	// Whether the next glyph wraps before it lands: set when one fills the last column, cleared by
 	// anything that moves the cursor. See `put_glyph`.
 	pending_wrap: bool,
-	wrap: Vec<bool>,
-	// The ALTERNATE screen's soft-wrap flags. One vector served both buffers, so a full-screen
-	// program edited the PRIMARY screen's wrap metadata - and after it exited, `TextSink` joined
-	// rows that had nothing to do with each other. The cell buffers were always two; the metadata
-	// describing them was one.
-	alt_wrap: Vec<bool>,
 	scrollback: Vec<Cell>,
 	// Per-row soft-wrap flag for the scrollback ring (parallel to `scrollback` rows).
 	sb_wrap: Vec<bool>,
@@ -204,6 +236,23 @@ pub struct Screen {
 	mouse: Option<(usize, usize)>,
 }
 
+// The one place a terminal's geometry and its scrollback budget are decided.
+//
+// At least one cell, so there is always somewhere for the cursor to be; the module's own maximums
+// on top of whatever the caller asks for; and a scrollback bounded by BYTES rather than rows, so a
+// wider display does not silently cost proportionally more - see `MAX_SCROLLBACK_BYTES`.
+//
+// Shared by `Screen::new` and `Screen::resize`, which is the point: the constructor enforced all
+// three and the resize enforced only the caller's two, so every rule here stopped applying the
+// moment a window changed size.
+fn geometry(cols: usize, rows: usize, scrollback: usize, max_cols: usize, max_rows: usize) -> (usize, usize, usize) {
+	let cols = cols.clamp(1, max_cols.max(1));
+	let rows = rows.clamp(1, max_rows.max(1));
+	let row_bytes = cols * core::mem::size_of::<Cell>();
+	let scrollback = scrollback.min(MAX_SCROLLBACK_BYTES / row_bytes.max(1));
+	(cols, rows, scrollback)
+}
+
 impl Screen {
 	// Build a grid.
 	//
@@ -213,20 +262,25 @@ impl Screen {
 	// a 0x0 `Screen` whose first `put_glyph` indexed an empty `wrap` vector. The kernel checks for
 	// 0x0 after constructing one; a public API should not require its callers to know that.
 	pub fn new(cols: usize, rows: usize, scrollback: usize) -> Screen {
-		// At least one cell, so there is always somewhere for the cursor to be.
-		let cols = cols.max(1).min(MAX_COLS);
-		let rows = rows.max(1).min(MAX_ROWS);
-		// And a scrollback bounded by BYTES rather than rows, so a wider display does not silently
-		// cost proportionally more - see `MAX_SCROLLBACK_BYTES`.
-		let row_bytes = cols * core::mem::size_of::<Cell>();
-		let scrollback = scrollback.min(MAX_SCROLLBACK_BYTES / row_bytes.max(1));
+		let (cols, rows, scrollback) = geometry(cols, rows, scrollback, MAX_COLS, MAX_ROWS);
 		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, osc_overflow: false, mouse_mode: 0, mouse_press: false, mouse_button: false, mouse_any: false, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, reply: Vec::new(), selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: alloc::vec![blank; cols * rows], alt: alloc::vec![blank; cols * rows], alt_active: false, dirty: alloc::vec![true; cols * rows], pending_wrap: false, wrap: alloc::vec![false; rows], alt_wrap: alloc::vec![false; rows], scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
+		Screen { cols, rows, col: 0, row: 0, saved_col: 0, saved_row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, saved_fg_color: Color::Default, saved_bg_color: Color::Default, saved_bold: false, saved_underline: false, saved_reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, osc_overflow: false, mouse_mode: 0, mouse_press: false, mouse_button: false, mouse_any: false, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, clipboard_query: None, reply: Vec::new(), selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: ScreenBuffer::new(cols, rows, blank), alt: ScreenBuffer::new(cols, rows, blank), alt_active: false, dirty: alloc::vec![true; cols * rows], pending_wrap: false, scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
 	}
 
-	// The active cell buffer: the alternate screen while it is up, else the primary.
-	fn cells(&self) -> &[Cell] {
+	// The LIVE screen: the alternate while it is up, else the primary. Every read and write of a
+	// live cell or a live wrap flag goes through one of these two, which is what makes "which
+	// screen is this?" a question with one answer.
+	fn screen(&self) -> &ScreenBuffer {
 		if self.alt_active { &self.alt } else { &self.primary }
+	}
+
+	fn screen_mut(&mut self) -> &mut ScreenBuffer {
+		if self.alt_active { &mut self.alt } else { &mut self.primary }
+	}
+
+	// The active cell buffer.
+	fn cells(&self) -> &[Cell] {
+		&self.screen().cells
 	}
 
 	// A snapshot of the live cell at (col, row): the renderer's read of the grid model.
@@ -390,6 +444,23 @@ impl Screen {
 		self.clipboard_set.take()
 	}
 
+	// Drain an OSC 52 clipboard QUERY, returning the selection byte the program named.
+	pub fn take_clipboard_query(&mut self) -> Option<u8> {
+		self.clipboard_query.take()
+	}
+
+	// Answer a clipboard query: `OSC 52 ; Pc ; <base64> ST`, into the same reply buffer DSR and DA
+	// use, so the console does not need a second write-back path to the program.
+	pub fn answer_clipboard(&mut self, selection: u8, text: &[u8]) {
+		let mut out: Vec<u8> = alloc::vec![0x1b, b']', b'5', b'2', b';', selection, b';'];
+		base64_encode(text, &mut out);
+		// ST rather than BEL: both terminate an OSC and `ESC \` is what a program that sent a
+		// query is most likely to be scanning for.
+		out.push(0x1b);
+		out.push(b'\\');
+		self.push_reply(&out);
+	}
+
 	// Drain what the terminal owes the program in reply to a query - the same shape
 	// `clipboard_set` and the tty mode requests already use: the model records what it owes, the
 	// console delivers it into the program's input.
@@ -543,7 +614,7 @@ impl Screen {
 		}
 		let idx = row * self.cols + col;
 		let changed = {
-			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
+			let buf = &mut self.screen_mut().cells;
 			if buf[idx] != cell {
 				buf[idx] = cell;
 				true
@@ -559,13 +630,13 @@ impl Screen {
 	pub fn clear(&mut self) {
 		let blank = self.blank();
 		{
-			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
-			for c in buf.iter_mut() {
+			let screen = self.screen_mut();
+			for c in screen.cells.iter_mut() {
 				*c = blank;
 			}
-		}
-		for w in self.wrap.iter_mut() {
-			*w = false;
+			for w in screen.wrap.iter_mut() {
+				*w = false;
+			}
 		}
 		self.mark_all_dirty();
 		self.col = 0;
@@ -579,9 +650,17 @@ impl Screen {
 	// stand-in for a virtio-gpu mode-set; the same path runs on a real resolution
 	// change once that driver lands.
 	pub fn resize(&mut self, new_cols: usize, new_rows: usize, max_cols: usize, max_rows: usize) -> bool {
-		let new_cols = new_cols.clamp(1, max_cols);
-		let new_rows = new_rows.clamp(1, max_rows);
-		if new_cols == self.cols && new_rows == self.rows {
+		// THE SAME FUNCTION THE CONSTRUCTOR USES, so the declared maximums mean the same thing at
+		// both ends of a terminal's life.
+		//
+		// This clamped only to the caller's `max_cols`/`max_rows` - which `Term::resize` derives
+		// from the surface geometry - so after a resize the ceiling was whatever the framebuffer
+		// was rather than what the module declares. And `sb_cap` was carried over unchanged while
+		// the scrollback was reallocated as `sb_cap * new_cols`, so the BYTE budget computed once
+		// at construction stopped holding the moment the width changed: a terminal created narrow
+		// kept its generous row count and multiplied it by a much larger width.
+		let (new_cols, new_rows, new_sb_cap) = geometry(new_cols, new_rows, self.sb_cap, max_cols.min(MAX_COLS), max_rows.min(MAX_ROWS));
+		if new_cols == self.cols && new_rows == self.rows && new_sb_cap == self.sb_cap {
 			return false;
 		}
 		// REFLOW, which is what the comment always said and the code never did.
@@ -609,9 +688,16 @@ impl Screen {
 					(&self.scrollback[ring * self.cols..ring * self.cols + self.cols], self.sb_wrap[ring])
 				} else {
 					let r = g - self.sb_len;
-					(&self.primary[r * self.cols..r * self.cols + self.cols], self.wrap.get(r).copied().unwrap_or(false))
+					// THE PRIMARY BUFFER WITH THE PRIMARY FLAGS, whichever screen is showing. This
+					// read `self.wrap`, which during alt holds the ALTERNATE screen's line
+					// structure - so a resize while a full-screen program was up reflowed the
+					// shell's scrollback according to the program's line breaks.
+					(&self.primary.cells[r * self.cols..r * self.cols + self.cols], self.primary.wrap.get(r).copied().unwrap_or(false))
 				};
-				if g >= self.sb_len && g - self.sb_len == self.row {
+				// The cursor is mapped onto primary logical lines only when it IS the primary
+				// screen's cursor. During alt it belongs to the full-screen program, and mapping
+				// it here put the shell's prompt wherever that program's cursor happened to be.
+				if !self.alt_active && g >= self.sb_len && g - self.sb_len == self.row {
 					cursor_at = Some((lines.len(), current.len() + self.col));
 				}
 				current.extend_from_slice(row_cells);
@@ -664,9 +750,9 @@ impl Screen {
 			new_primary[r * new_cols..r * new_cols + new_cols].copy_from_slice(row);
 			new_wrap[r] = *wrapped;
 		}
-		let mut new_scrollback = alloc::vec![blank; self.sb_cap * new_cols];
-		let mut new_sb_wrap = alloc::vec![false; self.sb_cap];
-		let keep_from = screen_from.saturating_sub(self.sb_cap);
+		let mut new_scrollback = alloc::vec![blank; new_sb_cap * new_cols];
+		let mut new_sb_wrap = alloc::vec![false; new_sb_cap];
+		let keep_from = screen_from.saturating_sub(new_sb_cap);
 		let mut sb_len = 0usize;
 		for (row, wrapped) in rows_out[keep_from..screen_from].iter() {
 			new_scrollback[sb_len * new_cols..sb_len * new_cols + new_cols].copy_from_slice(row);
@@ -691,17 +777,18 @@ impl Screen {
 		let copy_cols = self.cols.min(new_cols);
 		for r in 0..copy_rows {
 			for c in 0..copy_cols {
-				new_alt[r * new_cols + c] = self.alt[r * self.cols + c];
+				new_alt[r * new_cols + c] = self.alt.cells[r * self.cols + c];
 			}
 		}
 
-		self.primary = new_primary;
-		self.alt = new_alt;
-		self.wrap = new_wrap;
-		self.alt_wrap = alloc::vec![false; new_rows];
+		self.primary = ScreenBuffer { cells: new_primary, wrap: new_wrap };
+		// The alternate screen's flags start clear because a full-screen program redraws on a
+		// resize; its CELLS are copied so it does not go blank underneath one that has not yet.
+		self.alt = ScreenBuffer { cells: new_alt, wrap: alloc::vec![false; new_rows] };
 		self.dirty = alloc::vec![true; new_cols * new_rows];
 		self.scrollback = new_scrollback;
 		self.sb_wrap = new_sb_wrap;
+		self.sb_cap = new_sb_cap;
 		self.sb_head = 0;
 		self.sb_len = sb_len;
 		self.view_offset = 0;
@@ -728,9 +815,9 @@ impl Screen {
 		let dst = ring * cols;
 		let src = screen_row * cols;
 		for col in 0..cols {
-			self.scrollback[dst + col] = self.primary[src + col];
+			self.scrollback[dst + col] = self.primary.cells[src + col];
 		}
-		self.sb_wrap[ring] = self.wrap[screen_row];
+		self.sb_wrap[ring] = self.primary.wrap[screen_row];
 		if self.sb_len < self.sb_cap {
 			self.sb_len += 1;
 		} else {
@@ -747,7 +834,7 @@ impl Screen {
 			let ring = (self.sb_head + g) % self.sb_cap;
 			self.scrollback[ring * self.cols + col]
 		} else {
-			self.primary[(g - self.sb_len) * self.cols + col]
+			self.screen().cells[(g - self.sb_len) * self.cols + col]
 		};
 		if self.is_selected(g, col) {
 			cell.reverse = !cell.reverse;
@@ -812,7 +899,7 @@ impl Screen {
 		let cols = self.cols;
 		let blank = self.blank();
 		{
-			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
+			let buf = &mut self.screen_mut().cells;
 			for row in top..=bot {
 				let src = row + n;
 				for col in 0..cols {
@@ -832,7 +919,7 @@ impl Screen {
 		// Soft-wrap flags follow the same shift; the vacated rows are no longer continued.
 		for row in top..=bot {
 			let src = row + n;
-			self.wrap[row] = if src <= bot { self.wrap[src] } else { false };
+			self.screen_mut().wrap[row] = if src <= bot { self.screen().wrap[src] } else { false };
 		}
 		self.record_scroll(ScrollOp { top, bot, n, down: false });
 	}
@@ -844,7 +931,7 @@ impl Screen {
 		let cols = self.cols;
 		let blank = self.blank();
 		{
-			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
+			let buf = &mut self.screen_mut().cells;
 			for row in (top..=bot).rev() {
 				for col in 0..cols {
 					buf[row * cols + col] = if row >= top + n { buf[(row - n) * cols + col] } else { blank };
@@ -857,7 +944,7 @@ impl Screen {
 			}
 		}
 		for row in (top..=bot).rev() {
-			self.wrap[row] = if row >= top + n { self.wrap[row - n] } else { false };
+			self.screen_mut().wrap[row] = if row >= top + n { self.screen().wrap[row - n] } else { false };
 		}
 		self.record_scroll(ScrollOp { top, bot, n, down: true });
 	}
@@ -889,12 +976,21 @@ impl Screen {
 	}
 
 	// Line feed (IND): move down one line, scrolling the region if at the bottom.
+	//
+	// THIS MOVES THE CURSOR, so it ends a deferred wrap - which it did not, and that was the other
+	// half of the `pending_wrap` defect. A full line followed by `ESC D` followed by a glyph fed
+	// twice: once for the ESC and once for the wrap the ESC had not cleared, so the character
+	// landed two rows down. `ESC M` and `ESC E` had the same shape.
+	//
+	// `put_glyph`'s own wrap path clears the flag BEFORE calling this, so the clear here is not
+	// double work - it is the same rule reaching the paths that were not going through it.
 	fn line_feed(&mut self) {
 		if self.row == self.scroll_bottom {
 			self.scroll_up(1);
 		} else if self.row + 1 < self.rows {
 			self.row += 1;
 		}
+		self.cursor_moved();
 	}
 
 	// Reverse line feed (RI): move up one line, scrolling down if at the top.
@@ -904,12 +1000,14 @@ impl Screen {
 		} else if self.row > 0 {
 			self.row -= 1;
 		}
+		self.cursor_moved();
 	}
 
 	fn put_glyph(&mut self, glyph: u32) {
 		if self.pending_wrap {
 			// The previous glyph filled the last column: this row soft-wraps into the next.
-			self.wrap[self.row] = true;
+			let row = self.row;
+			self.screen_mut().wrap[row] = true;
 			self.col = 0;
 			self.pending_wrap = false;
 			self.line_feed();
@@ -1023,7 +1121,7 @@ impl Screen {
 			0x08 => {
 				if self.col > 0 {
 					self.col -= 1;
-				} else if self.row > 0 && self.wrap.get(self.row - 1).copied().unwrap_or(false) {
+				} else if self.row > 0 && self.screen().wrap.get(self.row - 1).copied().unwrap_or(false) {
 					// REVERSE WRAP over a soft-wrapped row. Backspace stopped dead at column 0, so
 					// the line editor - which moves the cursor by repeating `\x08` - could not step
 					// back onto the previous row. On an 80-column terminal a command long enough to
@@ -1068,6 +1166,7 @@ impl Screen {
 			}
 			b'8' => {
 				self.restore_cursor();
+				self.cursor_moved();
 				self.esc_state = 0;
 			}
 			b'D' => {
@@ -1146,29 +1245,62 @@ impl Screen {
 		}
 	}
 
-	fn csi_dispatch(&mut self, byte: u8) {
-		// See `put_glyph`: a sequence that moves or repositions the cursor ends any deferred wrap.
+	// THE RULE, IN ONE PLACE: moving the cursor ends a deferred wrap; not moving it does not.
+	//
+	// `csi_dispatch` used to clear `pending_wrap` unconditionally at its entry, under a comment
+	// saying "a sequence that moves or repositions the cursor ends any deferred wrap" - and most
+	// CSI sequences do not move the cursor. SGR, DSR, DA, the cursor style and every mode set went
+	// through it, so on an eight-column screen `12345678` `ESC[31m` `X` put the X over the 8
+	// instead of at the start of the next row. A colour change between a full line and the next
+	// character is what a prompt does.
+	//
+	// So every path that actually assigns `row` or `col` calls this, and nothing else does.
+	fn cursor_moved(&mut self) {
 		self.pending_wrap = false;
+	}
+
+	fn csi_dispatch(&mut self, byte: u8) {
 		match byte {
-			b'A' => self.row = self.row.saturating_sub(self.param(0, 1)),
-			b'B' => self.row = (self.row + self.param(0, 1)).min(self.rows.saturating_sub(1)),
-			b'C' => self.col = (self.col + self.param(0, 1)).min(self.cols.saturating_sub(1)),
-			b'D' => self.col = self.col.saturating_sub(self.param(0, 1)),
+			b'A' => {
+				self.row = self.row.saturating_sub(self.param(0, 1));
+				self.cursor_moved();
+			}
+			b'B' => {
+				self.row = (self.row + self.param(0, 1)).min(self.rows.saturating_sub(1));
+				self.cursor_moved();
+			}
+			b'C' => {
+				self.col = (self.col + self.param(0, 1)).min(self.cols.saturating_sub(1));
+				self.cursor_moved();
+			}
+			b'D' => {
+				self.col = self.col.saturating_sub(self.param(0, 1));
+				self.cursor_moved();
+			}
 			b'E' => {
 				self.col = 0;
 				self.row = (self.row + self.param(0, 1)).min(self.rows.saturating_sub(1));
+				self.cursor_moved();
 			}
 			b'F' => {
 				self.col = 0;
 				self.row = self.row.saturating_sub(self.param(0, 1));
+				self.cursor_moved();
 			}
-			b'G' => self.col = (self.param(0, 1) - 1).min(self.cols.saturating_sub(1)),
-			b'd' => self.row = (self.param(0, 1) - 1).min(self.rows.saturating_sub(1)),
+			b'G' => {
+				self.col = (self.param(0, 1) - 1).min(self.cols.saturating_sub(1));
+				self.cursor_moved();
+			}
+			b'd' => {
+				self.row = (self.param(0, 1) - 1).min(self.rows.saturating_sub(1));
+				self.cursor_moved();
+			}
 			b'H' | b'f' => {
 				let r = self.param(0, 1);
 				let c = self.param(1, 1);
 				self.row = (r - 1).min(self.rows.saturating_sub(1));
 				self.col = (c - 1).min(self.cols.saturating_sub(1));
+				self.cursor_moved();
 			}
 			// DSR - device status report. `CSI 5n` is "are you there" and `CSI 6n` asks for the
 			// cursor position, one-based; the reply goes back as though the user had typed it.
@@ -1221,7 +1353,10 @@ impl Screen {
 			}
 			b'r' => self.set_scroll_region(),
 			b's' => self.save_cursor(),
-			b'u' => self.restore_cursor(),
+			b'u' => {
+				self.restore_cursor();
+				self.cursor_moved();
+			}
 			b'h' => self.set_mode(true),
 			b'l' => self.set_mode(false),
 			b'm' => self.apply_sgr(),
@@ -1244,7 +1379,15 @@ impl Screen {
 			3 => {
 				self.sb_len = 0;
 				self.sb_head = 0;
-				self.view_offset = 0;
+				// AND REPAINT, through the same helper `snap_live` uses. This assigned
+				// `view_offset = 0` and returned with no `mark_all_dirty`, so a user reading
+				// history when a program sent `CSI 3J` got the model switched to the live screen
+				// while the renderer still believed the visible cells were clean - and the
+				// framebuffer went on showing pieces of the scrollback view.
+				//
+				// Leaving history is what requires the repaint, wherever it happens, which is the
+				// argument for one helper rather than three assignments open-coded twice.
+				self.snap_live();
 				return;
 			}
 			// An erase mode this terminal does not implement erases NOTHING. It used to erase
@@ -1272,7 +1415,7 @@ impl Screen {
 	fn fill_cells(&mut self, start: usize, end: usize) {
 		let blank = self.blank();
 		{
-			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
+			let buf = &mut self.screen_mut().cells;
 			let end = end.min(buf.len());
 			for cell in &mut buf[start.min(end)..end] {
 				*cell = blank;
@@ -1290,7 +1433,7 @@ impl Screen {
 			for row in first..=last.min(self.rows.saturating_sub(1)) {
 				let row_end = (row + 1) * self.cols;
 				if start <= row_end.saturating_sub(1) && end >= row_end {
-					if let Some(flag) = self.wrap.get_mut(row) {
+					if let Some(flag) = self.screen_mut().wrap.get_mut(row) {
 						*flag = false;
 					}
 				}
@@ -1327,7 +1470,7 @@ impl Screen {
 		let blank = self.blank();
 		let row_start = row * cols;
 		{
-			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
+			let buf = &mut self.screen_mut().cells;
 			for c in (col..cols).rev() {
 				buf[row_start + c] = if c >= col + n { buf[row_start + c - n] } else { blank };
 			}
@@ -1348,7 +1491,7 @@ impl Screen {
 		let blank = self.blank();
 		let row_start = row * cols;
 		{
-			let buf = if self.alt_active { &mut self.alt } else { &mut self.primary };
+			let buf = &mut self.screen_mut().cells;
 			for c in col..cols {
 				buf[row_start + c] = if c + n < cols { buf[row_start + c + n] } else { blank };
 			}
@@ -1437,7 +1580,7 @@ impl Screen {
 						self.save_cursor();
 						self.enter_alt_buffer();
 						// ...and blank it, which is the part that makes `?1049h` a clean slate.
-						self.clear_alt_active();
+						self.clear_alt();
 					} else {
 						self.leave_alt_buffer();
 						self.clear_alt();
@@ -1483,18 +1626,16 @@ impl Screen {
 		}
 		self.alt_active = true;
 		self.view_offset = 0;
-		// The metadata follows the buffer. The alternate screen starts blank, so its flags start
-		// clear; the primary's are parked until it comes back.
-		core::mem::swap(&mut self.wrap, &mut self.alt_wrap);
-		for w in self.wrap.iter_mut() {
-			*w = false;
-		}
-		// The buffer is NOT blanked here. Entry-clearing is `?1049`'s behaviour, not every mode's:
-		// `?47` and `?1047` switch to whatever the alternate buffer already holds, which is what
-		// lets a program leave and re-enter without redrawing.
+		// NOTHING IS SWAPPED AND NOTHING IS CLEARED. Each buffer owns its own flags, so the
+		// primary's are simply not the live ones any more - and the alternate's are whatever it
+		// had, which is the fix for `?47`: the cells were deliberately preserved across leave and
+		// re-enter while their wrap flags were wiped on every entry, so a program got its
+		// characters back without their line structure. Entry-clearing belongs to `?1049`, and it
+		// clears the whole buffer through `clear_alt`.
 		self.mark_all_dirty();
 		self.col = 0;
 		self.row = 0;
+		self.cursor_moved();
 	}
 
 	fn leave_alt_buffer(&mut self) {
@@ -1502,7 +1643,6 @@ impl Screen {
 			return;
 		}
 		self.alt_active = false;
-		core::mem::swap(&mut self.wrap, &mut self.alt_wrap);
 		self.mark_all_dirty();
 	}
 
@@ -1525,23 +1665,16 @@ impl Screen {
 		};
 	}
 
-	// Blank the alternate buffer WHILE IT IS ACTIVE, where `wrap` holds its flags.
-	fn clear_alt_active(&mut self) {
-		let blank = self.blank();
-		for cell in self.alt.iter_mut() {
-			*cell = blank;
-		}
-		for w in self.wrap.iter_mut() {
-			*w = false;
-		}
-	}
-
+	// Blank the alternate buffer. ONE FUNCTION NOW, because there is no longer a "while it is
+	// active" case: the flags live in the buffer they describe, so clearing it does not depend on
+	// which screen is showing. The two that existed - `clear_alt_active` and `clear_alt` - differed
+	// only in which vector they reached through the swap, and that swap is gone.
 	fn clear_alt(&mut self) {
 		let blank = self.blank();
-		for cell in self.alt.iter_mut() {
+		for cell in self.alt.cells.iter_mut() {
 			*cell = blank;
 		}
-		for w in self.alt_wrap.iter_mut() {
+		for w in self.alt.wrap.iter_mut() {
 			*w = false;
 		}
 	}
@@ -1564,7 +1697,16 @@ impl Screen {
 		self.cursor_blink = false;
 		self.scroll_top = 0;
 		self.scroll_bottom = self.rows.saturating_sub(1);
-		self.alt_active = false;
+		// THROUGH `leave_alt_buffer`, and the alternate screen is blanked as well as the primary.
+		//
+		// This assigned `alt_active = false` directly, which was the only correct thing to do while
+		// the two screens shared a swapped wrap vector - and it was not correct: it skipped the
+		// swap, so a RIS during alt left the primary live with the alternate's line structure, and
+		// the `clear()` below then ran against it. With each buffer owning its own flags the direct
+		// assignment is merely inconsistent rather than wrong, and going through the one function
+		// that leaves the alternate screen is what keeps it that way.
+		self.leave_alt_buffer();
+		self.clear_alt();
 		self.view_offset = 0;
 		self.sb_head = 0;
 		self.sb_len = 0;
@@ -1745,15 +1887,22 @@ impl Screen {
 				}
 			}
 			Some(52) => {
-				// OSC 52 ; Pc ; Pd - set the clipboard. Pd is base64-encoded text (or "?"
-				// to query, which needs a write-back path the console owns, not this model).
+				// OSC 52 ; Pc ; Pd - set the clipboard, or QUERY it when Pd is "?".
+				//
+				// The query used to do nothing, under a comment saying it "needs a write-back path
+				// the console owns, not this model". That path is `reply`, three hundred lines
+				// above, and it is what DSR and DA already answer through. What the model does not
+				// own is the clipboard CONTENT, so it records the request the same way it records
+				// `clipboard_set` - the console drains it and calls `answer_clipboard`, which puts
+				// the reply where every other reply goes.
 				let rest = &self.osc[rest_start..len];
 				if let Some(semi2) = rest.iter().position(|&b| b == b';') {
+					let selection: u8 = rest.first().copied().filter(|&b| b != b';').unwrap_or(b'c');
 					let data = &rest[semi2 + 1..];
-					if data != b"?" {
-						if let Some(text) = base64_decode(data) {
-							self.clipboard_set = Some(text);
-						}
+					if data == b"?" {
+						self.clipboard_query = Some(selection);
+					} else if let Some(text) = base64_decode(data) {
+						self.clipboard_set = Some(text);
 					}
 				}
 			}
@@ -1775,7 +1924,7 @@ impl Screen {
 			let ring = (self.sb_head + g) % self.sb_cap;
 			self.scrollback[ring * self.cols + col].glyph
 		} else {
-			self.primary[(g - self.sb_len) * self.cols + col].glyph
+			self.screen().cells[(g - self.sb_len) * self.cols + col].glyph
 		}
 	}
 
@@ -1785,7 +1934,7 @@ impl Screen {
 			let ring = (self.sb_head + g) % self.sb_cap;
 			self.sb_wrap[ring]
 		} else {
-			self.wrap[g - self.sb_len]
+			self.screen().wrap[g - self.sb_len]
 		}
 	}
 }
@@ -1824,6 +1973,21 @@ fn parse_dec(s: &[u8]) -> Option<usize> {
 
 // Decode a standard-alphabet base64 byte string (the OSC 52 clipboard payload) to its
 // bytes; `=` ends the data and any non-alphabet byte fails the decode.
+// Base64 into `out`, for the OSC 52 query answer. The decoder below is its opposite.
+fn base64_encode(data: &[u8], out: &mut Vec<u8>) {
+	const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	for chunk in data.chunks(3) {
+		let b0 = chunk[0] as u32;
+		let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+		let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+		let triple = (b0 << 16) | (b1 << 8) | b2;
+		out.push(ALPHABET[(triple >> 18) as usize & 0x3f]);
+		out.push(ALPHABET[(triple >> 12) as usize & 0x3f]);
+		out.push(if chunk.len() > 1 { ALPHABET[(triple >> 6) as usize & 0x3f] } else { b'=' });
+		out.push(if chunk.len() > 2 { ALPHABET[triple as usize & 0x3f] } else { b'=' });
+	}
+}
+
 fn base64_decode(s: &[u8]) -> Option<Vec<u8>> {
 	fn sextet(b: u8) -> Option<u32> {
 		match b {

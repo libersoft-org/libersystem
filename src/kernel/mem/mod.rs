@@ -28,6 +28,43 @@ pub fn hhdm_offset() -> u64 {
 	HHDM_OFFSET.load(Ordering::Relaxed)
 }
 
+// The end of the direct map: the highest physical address `virt = phys + HHDM_OFFSET` translates.
+//
+// The loader maps the HHDM over `align_up(memory_top(), 2 MiB)` and hands the kernel the SAME
+// memory map it computed that from, reserved and ACPI regions included - so the top of the retained
+// map, rounded the same way, is the extent rather than an estimate of it. Zero until `init` has run.
+static DIRECT_MAP_LIMIT: AtomicU64 = AtomicU64::new(0);
+
+// Is `[phys, phys + len)` inside the direct map?
+//
+// FOR FIRMWARE POINTERS. Everything the kernel allocates is inside by construction; what is not is
+// an address ACPI or a device tree handed over, and those were dereferenced on the strength of a
+// signature match. A pointer past the end of the HHDM is a wild read in early boot, before there is
+// a fault handler worth the name - and refusing it costs one comparison.
+pub fn within_direct_map(phys: u64, len: u64) -> bool {
+	let limit = DIRECT_MAP_LIMIT.load(Ordering::Relaxed);
+	if phys == 0 || limit == 0 {
+		return false;
+	}
+	match phys.checked_add(len) {
+		Some(end) => end <= limit,
+		None => false,
+	}
+}
+
+// Publish the direct map's extent from the retained memory map. Idempotent, and takes the highest
+// answer it is ever given: the two boot paths retain their maps at different points.
+fn publish_direct_map_limit(regions: &[MemRegion]) {
+	let mut top = 0u64;
+	for region in regions {
+		top = top.max(region.base.saturating_add(region.length));
+	}
+	// Rounded up the way the loader rounds its map, so a table in the last partial 2 MiB of the
+	// last region is inside the bound rather than one byte outside it.
+	let top = top.next_multiple_of(2 * 1024 * 1024);
+	DIRECT_MAP_LIMIT.fetch_max(top, Ordering::Relaxed);
+}
+
 // Publish the higher-half direct-map offset from the arch backend. aarch64 and
 // riscv64 build their own boot page tables (a direct map at KERNEL_VA_OFFSET) rather
 // than taking an HHDM from a bootloader, so they set the offset here before seeding
@@ -46,6 +83,7 @@ pub fn retain_memmap(regions: &[MemRegion]) {
 	for region in regions {
 		retained.push(abi::MemmapRegion { base: region.base, length: region.length, kind: region.kind, _pad: 0 });
 	}
+	publish_direct_map_limit(regions);
 }
 
 // The number of retained boot memory-map regions.
@@ -80,4 +118,5 @@ pub fn init(regions: &[MemRegion], hhdm: u64) {
 	for region in regions {
 		retained.push(abi::MemmapRegion { base: region.base, length: region.length, kind: region.kind, _pad: 0 });
 	}
+	publish_direct_map_limit(regions);
 }

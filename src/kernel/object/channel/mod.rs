@@ -445,8 +445,13 @@ impl Drop for Channel {
 		// Refund the sender's queued-bytes charge for every message left undelivered
 		// in this endpoint's inbox. Drain under the lock, then refund (the refund
 		// touches Domain counters, not this inbox).
-		let leftover: Vec<Message> = self.inbox.lock().drain(..).collect();
-		for mut msg in leftover {
+		// NO VECTOR AT ALL. This collected the inbox into one - an infallible allocation sized by
+		// whatever the peer had queued, on every channel close - to avoid holding the lock across
+		// the refund. Popping one at a time and releasing the lock between does the same thing and
+		// allocates nothing.
+		loop {
+			let next = self.inbox.lock().pop_front();
+			let Some(mut msg) = next else { break };
 			msg.take_queue_charge();
 		}
 		// This endpoint is closing; wake any thread blocked waiting on the peer so

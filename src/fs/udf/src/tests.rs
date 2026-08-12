@@ -45,6 +45,9 @@ fn w64(b: &mut [u8], off: usize, v: u64) {
 // Callers must fill the body BEFORE calling this, which is the ordering a real formatter has too.
 fn tag(b: &mut [u8], id: u16, loc: u32) {
 	w16(b, 0, id);
+	// THE DESCRIPTOR VERSION, which this never wrote and the parser never read - the two agreeing
+	// with each other rather than with the format, which is the shape this whole milestone is about.
+	w16(b, 2, 2);
 	w32(b, 12, loc);
 	// DescriptorCRCLength covers everything after the 16-byte tag.
 	let crc_len = b.len() - 16;
@@ -118,7 +121,10 @@ fn file_entry(lb: u32, is_dir: bool, fids: &[Vec<u8>], data: &[u8]) -> Vec<u8> {
 	// The ICB Strategy Type. A real File Entry carries 4 (direct), which is what this reader
 	// implements; the fixture left it zero, so the parser could not have read the field without
 	// refusing its own images - the same shape as the missing CRC.
-	w16(&mut b, 28, 4);
+	// The ICB tag's StrategyType is at 20 - the fixture wrote it at 28, which is the low half of
+	// ParentICBLocation, and the parser read it from there too. The two agreed with each other and
+	// with no real medium.
+	w16(&mut b, 20, 4);
 	w16(&mut b, 34, 3); // embedded alloc
 	let mut body = Vec::new();
 	for f in fids {
@@ -147,6 +153,7 @@ fn build_udf() -> Vec<u8> {
 	let mut pd = vec![0u8; SECTOR_SIZE];
 	w32(&mut pd, 188, 0); // partition starts at LBA 0
 	w32(&mut pd, 192, 264); // and spans the whole 264-block image
+	w16(&mut pd, 22, 0); // PartitionNumber, which the LVD's map has to name
 	tag(&mut pd, TAG_PARTITION, 257);
 	blk(257, &pd);
 	let mut lvd = vec![0u8; SECTOR_SIZE];
@@ -156,6 +163,9 @@ fn build_udf() -> Vec<u8> {
 	// image agreed with the parser rather than with the format.
 	w32(&mut lvd, 212, SECTOR_SIZE as u32); // LogicalBlockSize
 	lvd[217..236].copy_from_slice(b"*OSTA UDF Compliant"); // DomainIdentifier
+	// The revision, in the identifier's suffix - which the fixture did not write and the parser did
+	// not read, so the two agreed with each other rather than with the format.
+	w16(&mut lvd, 240, 0x0201); // UDF 2.01
 	w32(&mut lvd, 252, 259); // File Set at lb 259
 	w16(&mut lvd, 256, 0); // ...in partition reference 0
 	// The two fields in the order ECMA-167 3/10.6 puts them: MapTableLength at 264, then
@@ -165,7 +175,14 @@ fn build_udf() -> Vec<u8> {
 	w32(&mut lvd, 264, 6); // MapTableLength
 	w32(&mut lvd, 268, 1); // NumberOfPartitionMaps
 	lvd[272..285].copy_from_slice(b"\0*Linux UDFFS"); // ImplementationIdentifier, where 272 really is
+	// A CONFORMING Type-1 map: type, length, volume sequence number, partition number. The fixture
+	// wrote the type byte alone and left the rest zero, so the parser could not have checked the map
+	// coherently even if it had wanted to - the same shape as the missing descriptor CRC and the
+	// missing descriptor version, and the reason each of those went unchecked for so long.
 	lvd[440] = 1; // one Type-1 (physical) partition map
+	lvd[441] = 6; // its length
+	w16(&mut lvd, 442, 1); // volume 1 of the set
+	w16(&mut lvd, 444, 0); // partition 0, which is what the partition descriptor below numbers
 	lvd[441] = 6; // its length
 	tag(&mut lvd, TAG_LOGICAL_VOLUME, 258);
 	blk(258, &lvd);
@@ -238,8 +255,11 @@ fn forged_lengths_do_not_allocate_or_read_foreign_blocks() {
 	let fe = 262 * SECTOR_SIZE;
 	img[fe + 34] = 0; // short_ad: the embedded path caps by the block, extents allocate
 	w64(&mut img[fe..], 56, u64::MAX);
+	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
-	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+	// `TooLarge` - the answer does not fit in one buffer - which is what a length of `u64::MAX`
+	// means and what this test could not see while the CRC was refusing the descriptor first.
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::TooLarge));
 	let mut img2 = build_udf();
 	let fe2 = 263 * SECTOR_SIZE;
 	img2[fe2 + 34] = 0; // short_ad
@@ -247,8 +267,9 @@ fn forged_lengths_do_not_allocate_or_read_foreign_blocks() {
 	w32(&mut img2[fe2..], 172, 8); // one descriptor
 	w32(&mut img2[fe2..], 176, 2048); // recorded extent, 2048 bytes
 	w32(&mut img2[fe2..], 180, 5000); // past the 264-block partition
+	refresh(&mut img2, 263, TAG_FILE_ENTRY, 263);
 	let mut fs2 = Udf::mount(MemDisc { data: img2 }).unwrap();
-	assert_eq!(fs2.read_file(b"SUB/WORLD.TXT"), Err(FsError::Invalid));
+	assert_eq!(fs2.read_file(b"SUB/WORLD.TXT"), Err(FsError::Invalid), "an extent outside the partition, reached because the descriptor itself validates");
 	let mut img3 = build_udf();
 	w32(&mut img3[257 * SECTOR_SIZE..], 192, 100_000);
 	assert!(Udf::mount(MemDisc { data: img3 }).is_none(), "a partition past the device");
@@ -287,8 +308,9 @@ fn an_unrecorded_extent_reads_as_zeros_and_a_chain_ad_refuses() {
 	w64(&mut img2[fe2..], 56, 5);
 	w32(&mut img2[fe2..], 172, 8);
 	w32(&mut img2[fe2..], 176, (3u32 << 30) | 8); // a chain to further descriptors
+	refresh(&mut img2, 262, TAG_FILE_ENTRY, 262);
 	let mut fs2 = Udf::mount(MemDisc { data: img2 }).unwrap();
-	assert_eq!(fs2.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+	assert_eq!(fs2.read_file(b"HELLO.TXT"), Err(FsError::Invalid), "a type-3 chain, reached because the descriptor itself validates");
 }
 
 #[test]
@@ -298,7 +320,7 @@ fn an_unchecksummed_descriptor_is_not_trusted() {
 	let mut img = build_udf();
 	img[262 * SECTOR_SIZE + 4] ^= 0x55;
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
-	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Corrupt), "a descriptor that does not validate is corrupt, and says so distinctly");
 }
 
 #[test]
@@ -328,7 +350,7 @@ fn a_multi_extent_file_reads_every_extent() {
 	{
 		let b = &mut img[fe..fe + SECTOR_SIZE];
 		b[27] = 5; // a file ICB
-		w16(b, 28, 4); // ICB strategy 4, which a real File Entry carries
+		w16(b, 20, 4); // ICB strategy 4, at the offset the ICB tag actually puts it
 		w16(b, 34, 0); // short_ad
 		w64(b, 56, 2053);
 		w32(b, 172, 16); // two descriptors
@@ -367,7 +389,10 @@ fn a_misplaced_file_entry_is_refused() {
 	// HELLO.TXT's ICB field sits at 176 + 84 + 24.
 	w32(&mut img[260 * SECTOR_SIZE..], 176 + 84 + 24, 20);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
-	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
+	// `Corrupt` since 2026-08-12: a descriptor that fails validation answers differently from a
+	// descriptor whose CONTENT this reader refuses, so a forgotten CRC refresh cannot be mistaken
+	// for the branch under test.
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Corrupt));
 }
 
 #[test]
@@ -377,6 +402,10 @@ fn an_unknown_compression_id_does_not_decode() {
 	let mut img = build_udf();
 	let mut noise = fid("AB", false, false, 262);
 	noise[38] = 254; // the compression id byte
+	// AND RE-TAG IT. Mutating a descriptor and leaving its CRC behind makes the parser refuse the
+	// record for the CHECKSUM, so the branch this test is about - an unknown compression id - is
+	// never reached and the assertion passes for a reason that has nothing to do with it.
+	tag(&mut noise, TAG_FILE_ID, 0);
 	let sub = file_entry(261, true, &[fid("", true, true, 260), fid("WORLD.TXT", false, false, 263), noise], b"");
 	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&sub);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
@@ -390,6 +419,9 @@ fn an_extended_ad_form_is_refused_not_misparsed() {
 	// garbage extents; the form is refused instead.
 	let mut img = build_udf();
 	w16(&mut img[262 * SECTOR_SIZE..], 34, 2);
+	// REFRESHED: without it the CRC refuses the descriptor and the extended_ad branch never runs -
+	// which is how this test passed for years while asserting nothing about extended_ad.
+	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
 	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
 }
@@ -400,6 +432,8 @@ fn a_symlink_file_entry_is_refused() {
 	// semantics, so serving the path bytes as content would only mislead.
 	let mut img = build_udf();
 	img[262 * SECTOR_SIZE + 27] = 12;
+	// REFRESHED, or the descriptor is refused for its checksum and the symlink branch never runs.
+	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
 	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid));
 }
@@ -644,33 +678,284 @@ fn a_stale_descriptor_does_not_win_over_a_newer_one() {
 
 #[cfg(test)]
 fn udftools_available() -> bool {
-	let ok = std::process::Command::new("mkfs.udf").arg("--help").output().is_ok();
-	if !ok {
-		std::println!("SKIPPED: udftools (mkfs.udf) is not installed - the independent cross-check did not run");
-	}
-	ok
+	std::process::Command::new("mkfs.udf").arg("--help").output().is_ok()
 }
 
-#[test]
-fn an_image_from_an_independent_formatter_mounts() {
-	// Every fixture in this file is built by this crate, so every check it turned on was checked
-	// against media this crate produced - which is how a validator and its fixtures come to agree
-	// with each other and with nothing else. `mkfs.udf` has no stake in either.
-	//
-	// This is also the medium the GUEST is given: `boot/qemu-run.sh` formats the test UDF disk with
-	// exactly this command, and a mount refused there takes `udf_storage` down with it.
+// A blank image formatted by `mkfs.udf`, or None when udftools is not installed.
+fn udftools_image(name: &str) -> Option<std::path::PathBuf> {
 	if !udftools_available() {
-		return;
+		return None;
 	}
+	// NAMED PER CALLER. Both independent-formatter tests shared one path and cargo runs them in
+	// parallel, so one truncated the image while the other was formatting it - a failure that
+	// appeared only when the suite ran whole and vanished on every attempt to reproduce it alone.
 	let dir = std::env::temp_dir().join("udf-gold");
 	let _ = std::fs::create_dir_all(&dir);
-	let path = dir.join("media.udf");
+	let path = dir.join(name);
 	let _ = std::fs::remove_file(&path);
 	std::fs::write(&path, alloc::vec![0u8; 32 << 20]).expect("a blank image");
 	let made = std::process::Command::new("mkfs.udf").arg("--media-type=hd").arg("--blocksize=2048").arg(&path).output().expect("mkfs.udf");
 	assert!(made.status.success(), "mkfs.udf failed: {}", String::from_utf8_lossy(&made.stderr));
+	Some(path)
+}
 
+// The same, with a file, a subdirectory and a nested file written onto it by a tool that has no
+// stake in this parser's assumptions.
+//
+// `mkfs.udf` formats and does not populate, so the files go on through a loop mount when this
+// machine can do one. That needs privilege, so the whole test skips - loudly - when it cannot.
+fn udftools_image_with_files() -> Option<std::path::PathBuf> {
+	let path = udftools_image("populated.udf")?;
+	let mount = std::env::temp_dir().join("udf-gold-mnt");
+	let _ = std::fs::create_dir_all(&mount);
+	let attached = std::process::Command::new("mount").arg("-t").arg("udf").arg("-o").arg("loop").arg(&path).arg(&mount).output().ok()?;
+	if !attached.status.success() {
+		std::eprintln!("SKIPPED: this machine cannot loop-mount a UDF image ({})", String::from_utf8_lossy(&attached.stderr).trim());
+		return None;
+	}
+	let write = || -> std::io::Result<()> {
+		std::fs::write(mount.join("hello.txt"), b"written by udftools, not by this crate\n")?;
+		std::fs::create_dir_all(mount.join("sub"))?;
+		std::fs::write(mount.join("sub").join("world.txt"), b"one level down\n")
+	};
+	let wrote = write();
+	let _ = std::process::Command::new("umount").arg(&mount).output();
+	wrote.ok()?;
+	Some(path)
+}
+
+#[test]
+fn a_fid_lying_about_a_type_is_caught_on_the_read_path_too() {
+	// `icb_size` compares the File Entry's own type byte against what the FID claimed, and it runs
+	// when a directory is LISTED. `read_file` took `is_dir` from the FID, refused a directory, and
+	// then read the ICB without ever asking the File Entry whether it agreed - so a crafted FID
+	// claiming "regular file" over a directory served the directory's bytes as file content.
+	let mut img = build_udf();
+	// SUB's FID says directory; make it say file, and the File Entry still says directory.
+	let root_dir = 260 * SECTOR_SIZE;
+	let name = dstring("SUB");
+	let fid_at = img[root_dir..root_dir + SECTOR_SIZE].windows(name.len()).position(|w| w == name.as_slice()).map(|i| root_dir + i - 38).expect("the fixture's SUB FID");
+	img[fid_at + 18] &= !0x02; // clear the directory bit the FID carries
+	tag(&mut img[fid_at..fid_at + 44], TAG_FILE_ID, 0);
+	let mut fs = Udf::mount(MemDisc { data: img }).expect("mount");
+	assert_eq!(fs.read_file(b"SUB"), Err(FsError::Corrupt), "the File Entry says directory and the FID says file; one of them is lying and the read must not pick");
+}
+
+#[test]
+fn a_mount_says_why_it_refused_in_all_four_ways() {
+	// `MountError` had four variants and two of them could never be built: everything the scan
+	// refused - a 4096-byte block size, a Type-2 map, more than one map - came back as `Corrupt`,
+	// blaming the medium for a shape this reader does not implement, and a failed device read came
+	// back the same way, blaming the medium for the device.
+	let blank = alloc::vec![0u8; SECTOR_SIZE * 300];
+	assert!(matches!(Udf::mount_checked(MemDisc { data: blank }), Err(MountError::NotUdf)), "a blank disc is not UDF");
+
+	// A volume that IS UDF and whose descriptors do not hold together.
+	let mut img = build_udf();
+	img[257 * SECTOR_SIZE..257 * SECTOR_SIZE + 64].fill(0xAA);
+	img[258 * SECTOR_SIZE..258 * SECTOR_SIZE + 64].fill(0xAA);
+	assert!(matches!(Udf::mount_checked(MemDisc { data: img }), Err(MountError::Corrupt)), "a damaged UDF volume is not not-UDF");
+
+	// UNSUPPORTED: a block size this reader does not implement, in a descriptor that is otherwise
+	// perfect. It used to be indistinguishable from damage.
+	let mut img = build_udf();
+	let lvd = 258 * SECTOR_SIZE;
+	w32(&mut img[lvd..], 212, 4096);
+	tag(&mut img[lvd..lvd + SECTOR_SIZE], TAG_LOGICAL_VOLUME, 258);
+	assert!(matches!(Udf::mount_checked(MemDisc { data: img }), Err(MountError::Unsupported)), "a 4096-byte block size is a shape this reader does not implement, not damage");
+
+	// A revision outside the range whose structures this reader assumes.
+	let mut img = build_udf();
+	w16(&mut img[lvd..], 240, 0x0300);
+	tag(&mut img[lvd..lvd + SECTOR_SIZE], TAG_LOGICAL_VOLUME, 258);
+	assert!(matches!(Udf::mount_checked(MemDisc { data: img }), Err(MountError::Unsupported)), "UDF 3.00 is not a revision this reader implements");
+
+	// IO: a device that cannot read its anchors. This answered `NotUdf` - one bad sector reporting
+	// a perfectly good disc as not being UDF at all.
+	struct Unreadable;
+	impl BlockDevice for Unreadable {
+		fn read_block(&mut self, _lba: u64, _buf: &mut [u8]) -> bool {
+			false
+		}
+	}
+	assert!(matches!(Udf::mount_checked(Unreadable), Err(MountError::Io)), "a device that will not read is not a disc that is not UDF");
+}
+
+#[test]
+fn a_child_icb_in_another_partition_is_refused() {
+	// `Geometry::physical` takes a partition reference and every caller passed the literal `0`,
+	// because the references the medium carries were dropped before they reached it: the File Set's
+	// root ICB, a FID's child ICB and a `long_ad` extent each had only their block number read. So a
+	// crafted volume naming partition 1 was read as partition 0 - the same misinterpretation the
+	// resolver exists to refuse, three places along.
+	let mut img = build_udf();
+	// HELLO.TXT's FID sits in the root directory; its child ICB is a `long_ad` at offset 20, whose
+	// partition reference is the two bytes after the block number.
+	// Found by its identifier rather than by a hardcoded offset, so a fixture change does not
+	// silently move this test off the record it is about.
+	let root_dir = 260 * SECTOR_SIZE;
+	let name = dstring("HELLO.TXT");
+	let fid_at = img[root_dir..root_dir + SECTOR_SIZE].windows(name.len()).position(|w| w == name.as_slice()).map(|i| root_dir + i - 38).expect("the fixture's HELLO.TXT FID");
+	w16(&mut img[fid_at..], 28, 1); // the child ICB's partition reference: partition 1
+	tag(&mut img[fid_at..fid_at + 40], TAG_FILE_ID, 0);
+	let mut fs = Udf::mount(MemDisc { data: img }).expect("mount");
+	assert!(matches!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid | FsError::Corrupt)), "an ICB in a partition this reader cannot resolve is refused, not read as partition 0");
+}
+
+#[test]
+fn an_image_from_an_independent_formatter_mounts() {
+	// Every other fixture in this file is built by this crate, so every check it turned on was
+	// checked against media this crate produced - which is how a validator and its fixtures come to
+	// agree with each other and with nothing else. `mkfs.udf` has no stake in either.
+	//
+	// This is also the medium the GUEST is given: `boot/qemu-run.sh` formats the test UDF disk with
+	// exactly this command, and a mount refused there takes `udf_storage` down with it.
+	//
+	// It earned its place the day it was extended: the CRC-coverage minimums added in 2026-08-12
+	// were derived from the specification and one of them was wrong - a real Logical Volume
+	// Descriptor covers to 446, not 448 - and this test was what said so, immediately.
+	let Some(dir) = udftools_image("blank.udf") else {
+		// SAID OUT LOUD. A skipped conformance test that looks identical to a passing one is how a
+		// gate stops checking, which is the whole subject of P02M0112.
+		std::eprintln!("SKIPPED an_image_from_an_independent_formatter_mounts: udftools is not installed");
+		return;
+	};
+	let image = std::fs::read(&dir).expect("the formatted image");
+	let mut fs = Udf::mount_checked(MemDisc { data: image }).unwrap_or_else(|e| panic!("a volume from udftools must mount: {e:?}"));
+	// And its root must LIST. Mounting proves the anchor, the VDS and the File Set Descriptor and
+	// stops before the ICB and directory code, which is where the findings are.
+	let listed = fs.list();
+	assert!(listed.is_ok(), "an empty udftools volume lists its root: {:?}", listed.err());
+}
+
+#[test]
+fn an_independent_image_lists_and_reads_the_files_a_tool_put_on_it() {
+	// Mounting an independent image proves the anchor, the VDS and the File Set Descriptor, and
+	// stops exactly before the FID, ICB and addressing code where every remaining finding lives.
+	// Files put there by a tool that has no stake in this parser's assumptions are what exercise it.
+	let Some(path) = udftools_image_with_files() else {
+		std::eprintln!("SKIPPED an_independent_image_lists_and_reads_the_files_a_tool_put_on_it: udftools is not installed");
+		return;
+	};
 	let image = std::fs::read(&path).expect("the formatted image");
-	let outcome = Udf::mount_checked(MemDisc { data: image });
-	assert!(outcome.is_ok(), "a volume from udftools must mount: {:?}", outcome.err());
+	let mut fs = Udf::mount_checked(MemDisc { data: image }).expect("a volume from udftools mounts");
+
+	let names: Vec<String> = fs.list().expect("the root lists").into_iter().map(|f| f.name).collect();
+	assert!(names.iter().any(|n| n.eq_ignore_ascii_case("hello.txt")), "the file the tool wrote is in the listing: {names:?}");
+	assert!(names.iter().any(|n| n.eq_ignore_ascii_case("sub")), "and the directory it made: {names:?}");
+
+	let hello = fs.read_file(b"hello.txt").expect("the file reads");
+	assert_eq!(hello, b"written by udftools, not by this crate\n", "and the bytes are the ones the tool wrote");
+
+	let nested = fs.list_dir(b"sub").expect("the subdirectory lists");
+	assert!(nested.iter().any(|f| f.name.eq_ignore_ascii_case("world.txt")), "a file one level down: {nested:?}");
+	assert_eq!(fs.read_file(b"sub/world.txt").expect("nested read"), b"one level down\n");
+}
+
+// A `mkfs.udf` image formatted with `flags`, or None when udftools is not installed.
+//
+// The matrix version of `udftools_image`: the format's variability is not in WHO wrote the volume
+// so much as in WHICH of its forms they chose, and mkfs.udf can be asked for most of them.
+fn udftools_variant(name: &str, flags: &[&str]) -> Option<std::path::PathBuf> {
+	if !udftools_available() {
+		return None;
+	}
+	let dir = std::env::temp_dir().join("udf-gold");
+	let _ = std::fs::create_dir_all(&dir);
+	let path = dir.join(name);
+	let _ = std::fs::remove_file(&path);
+	std::fs::write(&path, alloc::vec![0u8; 32 << 20]).expect("a blank image");
+	let mut cmd = std::process::Command::new("mkfs.udf");
+	cmd.arg("--blocksize=2048");
+	for flag in flags {
+		cmd.arg(flag);
+	}
+	let made = cmd.arg(&path).output().expect("mkfs.udf");
+	if !made.status.success() {
+		// A form this build of udftools will not produce is not a finding about the parser.
+		std::eprintln!("SKIPPED variant {name}: mkfs.udf refused it ({})", String::from_utf8_lossy(&made.stderr).trim());
+		let _ = std::fs::remove_file(&path);
+		return None;
+	}
+	Some(path)
+}
+
+#[test]
+fn media_beyond_one_shape_of_one_formatter() {
+	// "Real media beyond one formatter" - and what a second formatter would actually buy is not a
+	// second author, it is a second set of FORMAT CHOICES. The revision, whether file data sits
+	// inside the ICB or behind short or long allocation descriptors, whether File Entries are the
+	// extended kind, what the media type implies about the boot area and the strategy, and which
+	// free-space form the volume carries are the axes on which two implementations differ.
+	// `mkfs.udf` can be asked for each of them by name, and asking is what turns "one formatter"
+	// into coverage of the format.
+	//
+	// The tool is still one tool, and this says so rather than implying otherwise: `xorriso` on
+	// this machine refuses `-udf` outright and no other UDF writer is installed. A second author is
+	// worth having and is not blocking.
+	//
+	// EVERY VARIANT CARRIES ITS EXPECTED ANSWER, including the refusal. A conformance matrix whose
+	// unsupported shapes are skipped is a matrix that cannot tell "we refuse this deliberately"
+	// from "we no longer notice it".
+	#[derive(PartialEq, Debug)]
+	enum Expect {
+		// mounts, and its freshly formatted root lists as empty.
+		Mounts,
+		// refused by name. A rewritable medium is formatted with a SPARABLE partition map (type 2)
+		// and a Sparing Table that remaps defective blocks; this reader resolves every logical
+		// address against one physical partition, which for that map is silently wrong rather than
+		// merely incomplete. Refusing it is the answer, and it must stay the answer.
+		Unsupported,
+	}
+	let variants: &[(&str, &[&str], Expect)] = &[
+		// Every revision this build offers, including the pre-2.00 ones, whose File Entries are the
+		// plain kind rather than Extended - a different descriptor tag on the path that reads them.
+		("rev102.udf", &["--media-type=hd", "--udfrev=1.02"], Expect::Mounts),
+		("rev150.udf", &["--media-type=hd", "--udfrev=1.50"], Expect::Mounts),
+		("rev200.udf", &["--media-type=hd", "--udfrev=2.00"], Expect::Mounts),
+		("rev201.udf", &["--media-type=hd", "--udfrev=2.01"], Expect::Mounts),
+		// The three allocation forms, which is the axis this milestone named: data inside the ICB,
+		// and data addressed by short or by long descriptors.
+		("ad-inicb.udf", &["--media-type=hd", "--ad=inicb"], Expect::Mounts),
+		("ad-short.udf", &["--media-type=hd", "--ad=short"], Expect::Mounts),
+		("ad-long.udf", &["--media-type=hd", "--ad=long"], Expect::Mounts),
+		// Plain File Entries on a revision that would otherwise use Extended ones.
+		("noefe.udf", &["--media-type=hd", "--udfrev=2.01", "--noefe"], Expect::Mounts),
+		// A different medium: a different boot area, a different strategy, a different packet
+		// length - all of which move where the descriptors land.
+		("dvd.udf", &["--media-type=dvd"], Expect::Mounts),
+		// The two free-space forms, which are what a mount reads to answer "how much is left".
+		("space-table.udf", &["--media-type=hd", "--space=unalloctable"], Expect::Mounts),
+		("space-bitmap.udf", &["--media-type=hd", "--space=unallocbitmap"], Expect::Mounts),
+		// And the one this reader does not implement, asserted as a refusal.
+		("dvdrw.udf", &["--media-type=dvdrw"], Expect::Unsupported),
+	];
+	let mut ran = 0usize;
+	for (name, flags, expect) in variants {
+		let Some(path) = udftools_variant(name, flags) else { continue };
+		ran += 1;
+		let image = std::fs::read(&path).expect("the formatted image");
+		let mounted = Udf::mount_checked(MemDisc { data: image });
+		let _ = std::fs::remove_file(&path);
+		match expect {
+			Expect::Unsupported => {
+				assert_eq!(mounted.err(), Some(MountError::Unsupported), "{name} ({flags:?}) must be refused BY NAME, not mounted and misread");
+			}
+			Expect::Mounts => {
+				let mut fs = mounted.unwrap_or_else(|e| panic!("{name} ({flags:?}) must mount: {e:?}"));
+				let listed = fs.list().unwrap_or_else(|e| panic!("{name} ({flags:?}) must list its root: {e:?}"));
+				// A freshly formatted volume's root is empty, and an empty listing is the correct
+				// answer - what must not happen is a refusal, or entries that are not there.
+				assert!(listed.is_empty(), "{name}: a blank volume lists {listed:?}");
+			}
+		}
+	}
+	if !udftools_available() {
+		std::eprintln!("SKIPPED media_beyond_one_shape_of_one_formatter: udftools is not installed");
+		return;
+	}
+	// EVERY VARIANT, or the matrix is smaller than it reads. A form this build of udftools will not
+	// produce is skipped with a line, and a skip that nobody counts is how a table of thirteen rows
+	// silently becomes a table of one.
+	assert_eq!(ran, variants.len(), "{} of {} variants were formatted; the rest printed a SKIPPED line above", ran, variants.len());
 }

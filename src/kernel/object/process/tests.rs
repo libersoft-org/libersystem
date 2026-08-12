@@ -69,3 +69,49 @@ fn a_process_that_has_torn_down_never_gains_a_thread() {
 	drop(process);
 	sched::run_until_idle();
 }
+
+crate::tagged_test!(the_lifecycle_guard_covers_the_whole_operation_and_not_just_its_first_line, [Kernel, Memory, Dma], id = "kernel.object.process.the_lifecycle_guard_covers_the_whole_operation_and_not_just_its_first_line", covers = ["kernel"]);
+fn the_lifecycle_guard_covers_the_whole_operation_and_not_just_its_first_line() {
+	// A resource-extending syscall used to read `is_terminating()` at its top and record its result
+	// at its bottom, with a reservation and a page-table walk in between - and `terminate` publishes
+	// the flag and takes its snapshot in between ITS two steps. Both halves of that are tested here,
+	// because a flag read and a barrier look identical until they are raced:
+	//
+	//   1. A guard taken before teardown keeps "the process is live" true for as long as it is held.
+	//   2. A guard cannot be taken once teardown has begun.
+	//   3. A DmaBuffer that joined the registry is marked orphaned even though it is in NO handle
+	//      table - which is the case `take_for_transfer` produces and the handle-table pass misses.
+	use crate::mem::frame::PAGE_SIZE;
+	use crate::object::dma_buffer::DmaBuffer;
+
+	let process = Process::new(AddressSpace::create().expect("address space"), sched::root_domain());
+
+	// 1 and 3. A buffer created under the guard, held only by this test - no handle table anywhere
+	//    names it - and registered while the process is live.
+	const DEVICE: u32 = 0xD2;
+	let buffer = {
+		let guard = process.begin_extend().expect("a live process gives out the guard");
+		let Ok(buffer) = DmaBuffer::create_for(&sched::root_domain(), 2 * PAGE_SIZE as usize, Some(DEVICE)) else {
+			panic!("a 2-page DMA buffer should allocate");
+		};
+		assert!(guard.record_dma_buffer(&buffer), "the buffer joins the creating process's registry");
+		buffer
+	};
+	assert!(!buffer.is_orphaned_for_test(), "a live process's buffer is not orphaned");
+
+	// 2. Teardown refuses new guards.
+	process.terminate();
+	assert!(process.begin_extend().is_none(), "an operation starting after teardown is refused the guard");
+
+	// 3. And the pass reached the buffer through the registry, which is the only place it was.
+	assert!(buffer.is_orphaned_for_test(), "a buffer the handle table never held is still marked - the registry is what the orphan rule now depends on, not the table");
+
+	// Its frames are therefore held rather than recycled, which is the point of marking it.
+	let frames = buffer.frames().len();
+	drop(buffer);
+	assert_eq!(crate::object::dma_buffer::held_frames_for_test(DEVICE), frames, "and so its frames wait for the device to be reset");
+	crate::object::dma_buffer::forget_for_test(DEVICE);
+
+	drop(process);
+	sched::run_until_idle();
+}

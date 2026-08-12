@@ -13,6 +13,8 @@ use crate::{PKG_ENTRY_LEN, PKG_HEADER_LEN, PKG_MAGIC, PKG_NAME_LEN};
 // What one archive may hold. Not a guess about the format - the offsets are `u32`, so these keep a
 // large set from producing a package that describes itself wrongly, and they are far above any
 // bootstrap set that would still be a bootstrap set.
+// The BOOTSTRAP set's bound, which is not the reader's. A handful of boot programs; the volume
+// package is a different archive with a different limit (`crate::MAX_PACKAGE_ENTRIES`).
 pub const MAX_ENTRIES: usize = 64;
 pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_TOTAL_BYTES: usize = 256 * 1024 * 1024;
@@ -61,7 +63,7 @@ pub fn parse_list(bytes: &[u8]) -> Option<Vec<Row<'_>>> {
 		let split = line.iter().position(|&b| b == b' ' || b == b'\t')?;
 		let name = trim(&line[..split]);
 		let path = trim(&line[split + 1..]);
-		if name.is_empty() || path.is_empty() || name.len() > PKG_NAME_LEN {
+		if !crate::valid_package_name(name) || path.is_empty() {
 			return None;
 		}
 		if rows.iter().any(|row| row.name == name) {
@@ -86,8 +88,14 @@ pub fn build_package(entries: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
 		return None;
 	}
 	let mut total: usize = 0;
-	for (name, bytes) in entries {
-		if name.is_empty() || name.len() > PKG_NAME_LEN {
+	for (index, (name, bytes)) in entries.iter().enumerate() {
+		// THE READER'S RULE, not a second one. `is_empty()` and a length was all this checked, so
+		// the writer produced archives `Package::parse` refuses: a NUL inside a name, and duplicate
+		// names.
+		if !crate::valid_package_name(name) {
+			return None;
+		}
+		if entries[..index].iter().any(|(earlier, _)| earlier == name) {
 			return None;
 		}
 		if bytes.len() > MAX_FILE_BYTES {

@@ -126,11 +126,14 @@ impl Disk {
 			// weaker than they look: reporting "no boots" makes the next boot REUSE a number and
 			// overwrite an existing journal. That hazard predates this change and is recorded
 			// separately; what matters here is that a SHORT listing no longer looks complete.
-			Some(consumer) => match unsafe { drain_stream_complete(consumer, volume::list_read) } {
+			Some(Ok(consumer)) => match unsafe { drain_stream_complete(consumer, volume::list_read) } {
 				Some(entries) => entries.iter().filter_map(|e| e.name.strip_prefix("boot-").and_then(|n| n.parse::<u32>().ok())).collect(),
 				None => return 0,
 			},
-			None => return 0,
+			// A listing that was refused and one the transport lost are the same answer here: there
+			// are no boots to prune. The error arm is new and this caller does not act on WHICH
+			// failure it was - it is a prune, and not pruning is the safe outcome either way.
+			Some(Err(_)) | None => return 0,
 		};
 		boots.sort_unstable();
 		while boots.len() > keep as usize {

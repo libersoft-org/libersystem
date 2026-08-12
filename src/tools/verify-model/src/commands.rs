@@ -19,6 +19,21 @@ pub struct Step {
 	pub note: Option<String>,
 }
 
+// The command that runs one host check in one configuration. `command` already has `{arch}`
+// substituted; what this adds is the configuration's features.
+//
+// ONE LOWERING, because there were two. The shadow producer emitted `check.command` raw, so a
+// `shared-image` variant was run as though it were the default one and its result was filed under
+// an id that did not say which variant it was. A comparison between the run and the shadow is only
+// a comparison if both sides lowered the key the same way, and the only way to be sure of that is
+// for there to be one place that does it.
+pub fn host_command(command: &str, configuration: &str) -> String {
+	match configuration {
+		"default" => command.to_string(),
+		other => format!("{command} --no-default-features --features {other}"),
+	}
+}
+
 pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> Vec<Step> {
 	let mut steps = Vec::new();
 
@@ -40,11 +55,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> 
 	// the one that never ships, and running only that one is what this model exists to stop.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::HostSuite) {
 		let crate_name = item.key.check.strip_prefix("host.").unwrap_or(&item.key.check);
-		let command = match item.key.configuration.as_str() {
-			"default" => item.command.clone(),
-			other => format!("{} --no-default-features --features {other}", item.command),
-		};
-		steps.push(Step { label: format!("host suite {crate_name} ({})", item.key.configuration), command, keys: vec![item.key.clone()], note: None });
+		steps.push(Step { label: format!("host suite {crate_name} ({})", item.key.configuration), command: host_command(&item.command, &item.key.configuration), keys: vec![item.key.clone()], note: None });
 	}
 
 	// Gates and conformance suites each collapse into one call, because check.sh takes a list.

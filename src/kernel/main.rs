@@ -209,7 +209,14 @@ fn boot_main() {
 	// smaller with nothing adding it up. The symptom otherwise arrives weeks later as an
 	// allocation failure with no cause attached. Printed unconditionally so a boot log always
 	// carries the baseline, which is what makes a later non-zero one worth reading.
-	serial_println!("memory: {} page(s) lost to untrackable frees, {} free(s) refused", mem::frame::lost_pages(), mem::frame::refused_frees());
+	// RETIRED AND LOST ARE DIFFERENT NEWS, so they are reported apart.
+	//
+	// A retired page is one this kernel deliberately took out of circulation - a shootdown that did
+	// not complete, a span outside the buddy's extent - and marked as such: the machine knows it is
+	// not using it. A lost page is that plus anything else that left circulation without a record.
+	// A machine accumulating retirements is reporting a SHOOTDOWN problem, and losing the page is
+	// only its receipt; one number for both said "memory problem" for either.
+	serial_println!("memory: {} page(s) retired for good, {} page(s) lost in all, {} free(s) refused", mem::frame::retired_pages(), mem::frame::lost_pages(), mem::frame::refused_frees());
 	// Perf-trace anchor: publish the calibrated TSC frequency so the host trace tool can
 	// convert the ring-3 `\x1ePERF` cycle markers to wall-clock time.
 	serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());

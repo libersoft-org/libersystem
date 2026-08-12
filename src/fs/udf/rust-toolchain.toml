@@ -1,3 +1,15 @@
 [toolchain]
-channel = "nightly"
+# PINNED TO AN EXACT NIGHTLY, not to the floating channel.
+#
+# For most crates that is a taste question. Here the hand-written PE header, `build-std`,
+# `llvm-objcopy` and a RISC-V PIE whose exact relocation output the loader's stub depends on all
+# ride on the compiler - so "whatever rustup last fetched" is an input to a bootloader's correctness.
+#
+# `nightly-2026-06-16` IS `1.98.0-nightly (01dfd7924 2026-06-15)`, the toolchain every measurement
+# in phase 2 was taken with. The dated channel published on a day carries the previous day's commit,
+# which is why the two dates differ; the version string is what was checked.
+#
+# Moving it is a deliberate act: change it here and in the other fifteen `rust-toolchain.toml`
+# files together, rebuild all three architectures, and run the guest suites.
+channel = "nightly-2026-06-16"
 components = ["rust-src", "rustfmt"]

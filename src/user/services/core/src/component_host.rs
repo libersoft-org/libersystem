@@ -32,10 +32,10 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{Entry, Field, OpenOpts, Severity, log, volume};
+use proto::system::{Entry, Error, Field, OpenOpts, Severity, log, volume};
 use rt::*;
 use wasm::module::FuncType;
-use wasm::{Host, Instance, Module, Trap, Value};
+use wasm::{Instance, Module, ValidatedModule, Value};
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
 
@@ -43,82 +43,39 @@ include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
 // lives in `component-world`, beside its tests. This binary is built for `*-unknown-none`, so
 // nothing in it can run on the host: the only coverage those two decisions had was one kernel
 // end-to-end path, which needs a boot per assertion and only ever takes the happy one.
-use wasm::world::{STATUS_DENIED, STATUS_FAULT, STATUS_IO, WorldFn, resolve, window};
+use wasm::world::{WorldFn, WorldHost, WorldServices, WriteOutcome, resolve};
 
-// The host: the two typed-service capabilities it was granted (a StorageService
-// client and a LogService client) and the per-import dispatch table resolved at
-// instantiation. It holds no ambient authority - only these two channels, reachable
-// only through the three wired imports.
-struct ComponentHost {
+// The IPC half of the world: the two typed-service capabilities this host was granted (a
+// StorageService client and a LogService client) and the two paths it may use them on. It holds no
+// ambient authority - only these two channels, reachable only through the three wired imports.
+//
+// THE DISPATCH ITSELF IS NOT HERE ANY MORE. It is `wasm::world::WorldHost`, which is in a crate
+// that builds for the development machine, so a write refused, a write that fails, a service that
+// never answers and a log grant that does not respond are ordinary tests instead of paths only a
+// kernel boot could reach - and a boot only ever takes the happy one. What is left below is exactly
+// the part that needs a running service.
+//
+// The two paths are resolved ONCE, before the instance exists. They used to be looked up per call
+// and a missing one was a trap mid-run, which is a startup misconfiguration reported as a guest
+// fault at whatever moment the guest happened to ask.
+struct ComponentServices {
 	storage: u64,
 	logsvc: u64,
-	imports: Vec<WorldFn>,
-	// for the report: whether the log grant was reached and the entry accepted, and
-	// the bytes the component handed to its `write` import (its output, captured
-	// through the granted write path regardless of whether the volume persisted it).
-	logged: bool,
-	output: Vec<u8>,
+	input_path: &'static str,
+	output_path: &'static str,
 }
 
-impl Host for ComponentHost {
-	fn call_import(&mut self, import: u32, args: &[Value], memory: &mut [u8]) -> Result<Vec<Value>, Trap> {
-		// The dispatch table was built at instantiation from imports this world offers, so an index
-		// outside it is the interpreter contradicting itself rather than a component asking for
-		// something it was not granted.
-		let Some(op) = self.imports.get(import as usize).copied() else {
-			return Err(Trap("import index outside the resolved world"));
-		};
-		match op {
-			// liber.read(ptr, max) -> n: read the one granted input file through
-			// StorageService into the component's memory, return the byte count.
-			WorldFn::Read => {
-				let Some((ptr, end)) = window(args, memory.len()) else {
-					return Ok(alloc::vec![Value::I32(STATUS_FAULT)]);
-				};
-				let input_path = factory_path("hello").ok_or(Trap("missing manifest input path"))?;
-				// A FAILED READ IS A STATUS, not a trap. The component asked a legitimate question
-				// and the answer is that the granted file could not be read; killing the instance
-				// tells it nothing and gives it no chance to say so to its caller.
-				let n: i32 = match unsafe { read_file(self.storage, input_path.as_bytes(), &mut memory[ptr..end]) } {
-					Some(n) => n as i32,
-					None => STATUS_IO,
-				};
-				Ok(alloc::vec![Value::I32(n)])
-			}
-			// liber.write(ptr, len) -> n: persist the component's bytes to the one
-			// granted output file through StorageService, return the byte count (zero
-			// when the granted volume is read-only). The bytes are captured for the
-			// report either way - they are the component's output, seen through the
-			// granted write path, not a guess at where they sit in linear memory.
-			WorldFn::Write => {
-				let Some((ptr, end)) = window(args, memory.len()) else {
-					return Ok(alloc::vec![Value::I32(STATUS_FAULT)]);
-				};
-				self.output = memory[ptr..end].to_vec();
-				let output_path = runtime_path("liber-component-output").ok_or(Trap("missing manifest output path"))?;
-				// `Ok(0)` for a refused write and `Ok(0)` for an empty one were the same answer.
-				// A volume that says no is `Denied`, and the component can act on that.
-				let n: i32 = match unsafe { write_file(self.storage, output_path.as_bytes(), &memory[ptr..end]) } {
-					Some(n) => n as i32,
-					None => STATUS_DENIED,
-				};
-				Ok(alloc::vec![Value::I32(n)])
-			}
-			// liber.log(ptr, len): emit the component's bytes as one structured entry
-			// through LogService - the console/cli of the world.
-			WorldFn::Log => {
-				let Some((ptr, end)) = window(args, memory.len()) else {
-					return Ok(alloc::vec![Value::I32(STATUS_FAULT)]);
-				};
-				if unsafe { emit_log(self.logsvc, &memory[ptr..end]) } {
-					self.logged = true;
-					return Ok(alloc::vec![Value::I32(0)]);
-				}
-				// The log used to return NOTHING, so a component could not tell whether its one
-				// diagnostic channel had worked.
-				Ok(alloc::vec![Value::I32(STATUS_IO)])
-			}
-		}
+impl WorldServices for ComponentServices {
+	fn read(&mut self, dst: &mut [u8]) -> Option<usize> {
+		unsafe { read_file(self.storage, self.input_path.as_bytes(), dst) }
+	}
+
+	fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
+		unsafe { write_file(self.storage, self.output_path.as_bytes(), bytes) }
+	}
+
+	fn log(&mut self, text: &str) -> bool {
+		unsafe { emit_log(self.logsvc, text.as_bytes()) }
 	}
 }
 
@@ -161,19 +118,21 @@ unsafe fn read_file(storage: u64, uri: &[u8], dst: &mut [u8]) -> Option<usize> {
 	}
 }
 
-// Write `bytes` to the granted output file over StorageService, returning the number of bytes the
-// service accepted - or `None` when the volume refused the write.
-//
-// `None` RATHER THAN ZERO. A refused write and a zero-byte write returned the same `0`, so the
-// world above could not report the one distinction it exists to carry.
-unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> Option<usize> {
+// Write `bytes` to the granted output file over StorageService, answering WHY it did not happen
+// rather than whether it did. `WriteOutcome` is the world's - it is the distinction the guest is
+// told, so it belongs beside the status codes that carry it.
+unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> WriteOutcome {
 	unsafe {
-		let data: proto::codec::Buffer = make_buffer(bytes)?;
+		let Some(data) = make_buffer(bytes) else { return WriteOutcome::Failed };
 		let path: String = String::from_utf8_lossy(uri).into_owned();
 		let mut client = volume::Client::new(ChannelTransport { chan: storage });
 		match client.write(&path, &data) {
-			Some(Ok(())) => Some(bytes.len()),
-			_ => None,
+			Some(Ok(())) => WriteOutcome::Wrote(bytes.len()),
+			// `Denied` is the volume refusing; every other answer is a fault on the way there.
+			// `NotFound` and `Invalid` are the host having asked wrongly, `Again` and `Closed` are
+			// the service - none of them is "you may not", which is the only thing `Denied` means.
+			Some(Err(Error::Denied)) => WriteOutcome::Refused,
+			_ => WriteOutcome::Failed,
 		}
 	}
 }
@@ -237,10 +196,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    artifact, not embedded in the kernel image.
 	let component_path = factory_path("liber-component").unwrap_or_else(|| exit());
 	let bytes: Vec<u8> = unsafe { load_component(storage, component_path.as_bytes()) }.unwrap_or_else(|| exit());
+	// PARSED AND THEN VALIDATED, before anything about it is believed.
+	//
+	// `Instance::new` used to take a `Module` and decode the bodies itself, holding any error until
+	// the first `invoke` - so a component's data segments and globals were installed before
+	// anything had established that its code was well formed. `ValidatedModule` is the only thing
+	// an instance can be built from now, and the import resolution below reads it through
+	// `.module()`.
 	let module: Module = match wasm::parse(&bytes) {
 		Ok(m) => m,
 		Err(_) => exit(),
 	};
+	let validated: ValidatedModule = match wasm::validate(module) {
+		Ok(m) => m,
+		Err(_) => exit(),
+	};
+	let module: &Module = validated.module();
 
 	// 3. resolve every import by name into the dispatch table, then instantiate.
 	// Every import resolved and checked BEFORE the instance exists. One the world does not offer -
@@ -253,8 +224,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		}
 	}
-	let mut instance: Instance = Instance::new(&module);
-	let mut host: ComponentHost = ComponentHost { storage, logsvc, imports, logged: false, output: Vec::new() };
+	let mut instance: Instance = match Instance::new(&validated) {
+		Ok(i) => i,
+		Err(_) => exit(),
+	};
+	// THE TWO PATHS BEFORE THE INSTANCE, not per call. A manifest without one of them is a
+	// misconfigured host and it says so here, rather than trapping the guest at whichever moment it
+	// happened to ask.
+	let input_path = factory_path("hello").unwrap_or_else(|| exit());
+	let output_path = runtime_path("liber-component-output").unwrap_or_else(|| exit());
+	let services = ComponentServices { storage, logsvc, input_path, output_path };
+	let mut host: WorldHost<ComponentServices> = WorldHost::new(services, imports);
 
 	// 4. run the component: `run` reads its granted file, transforms it, logs it, and
 	//    writes it back; `score` exercises the float path on real toolchain output.
@@ -286,19 +266,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// the bytes it compared had never been near the filesystem. The host holds the storage grant, so
 	// it is the one that can open the file again; the test compares both.
 	let mut readback: [u8; 512] = [0u8; 512];
-	let written: usize = match runtime_path("liber-component-output") {
-		Some(path) => unsafe { read_file(storage, path.as_bytes(), &mut readback) }.unwrap_or(0),
-		None => 0,
-	};
+	let written: usize = unsafe { read_file(storage, output_path.as_bytes(), &mut readback) }.unwrap_or(0);
 
-	let mut report: Vec<u8> = Vec::with_capacity(17 + written + host.output.len());
-	report.push(host.logged as u8);
+	let mut report: Vec<u8> = Vec::with_capacity(17 + written + host.output().len());
+	report.push(host.logged() as u8);
 	report.extend_from_slice(&score.to_le_bytes());
 	report.extend_from_slice(&score_negative.to_le_bytes());
 	report.extend_from_slice(&count.to_le_bytes());
 	report.extend_from_slice(&(written as u32).to_le_bytes());
 	report.extend_from_slice(&readback[..written]);
-	report.extend_from_slice(&host.output);
+	report.extend_from_slice(host.output());
 	unsafe {
 		send_blocking(bootstrap, &report, 0);
 	}

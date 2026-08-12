@@ -78,10 +78,15 @@ mapfile -t TEST_FILES < <(find "$ROOT/kernel" -type f -name '*.rs' -print | sort
 # One #[test_case] per arm of `tagged_test!`, and nowhere else.
 #
 # The point is that the macro is the ONLY way a descriptor enters the suite - a hand-written
-# `#[test_case]` would run with no tags, so no filter could ever select or skip it. The count is two
-# because the macro funnels its four public shapes - with and without `id`, with and without
-# `covers` - through ONE internal rule. That rule lives in
-# kernel/tests.rs, so the rule is checked there by count and everywhere else by absence.
+# `#[test_case]` would run with no tags, so no filter could ever select or skip it. The count is ONE
+# because the macro funnels its two public shapes - with and without `covers`, both requiring
+# `id` - through ONE internal rule. That rule lives in kernel/tests.rs, so the rule is checked there
+# by count and everywhere else by absence.
+#
+# This comment said "four public shapes - with and without `id`" until 2026-08-12, describing the
+# macro as it was before `id` became mandatory. That was this milestone's own fix and the gate's
+# prose predated it - a gate whose explanation names shapes the tree does not have is a gate nobody
+# can check against the tree.
 EXPECTED_IN_MACRO=1
 # Comment lines are excluded rather than the marker being anchored: this file explains the rule in
 # prose that names the attribute, and a line-start anchor also misses the one-line `mod` form.

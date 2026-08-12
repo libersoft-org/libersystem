@@ -38,8 +38,30 @@
 //   apboot:     trampoline_len, install, set_stack   (SMP secondary bring-up)
 //   rtc:        read_unix           random: fill
 //
-// x86_64 is the reference implementation; aarch64 / riscv64 are compiling stubs
-// still to be filled in.
+// THE CONTRACT IS THE x86_64 BOOT PATH, AND SAYING SO IS THE POINT OF THIS PARAGRAPH.
+//
+// The six `init_*` entries above are the hooks the bootloader-handoff `main::kmain` calls, and only
+// x86_64 arrives through it. aarch64 enters at `aarch64::boot::aarch64_main` and riscv64 at
+// `riscv64::boot::riscv64_main`; each brings up its own console, page tables, per-CPU register,
+// interrupt controller, timer, syscall vector and secondary cores INLINE, and never calls
+// `arch::init`, `arch::init_interrupts` or `arch::init_syscalls`. Those remain `todo!()` on both -
+// seventeen such stubs in aarch64's `mod.rs`, twelve in riscv64's - and both targets run the whole
+// test suite regardless.
+//
+// So a list of required symbols that two of three backends satisfy with `todo!()` is not yet a
+// contract for boot; it is a contract for everything AFTER boot, which the same two backends do
+// implement in full. That is a deliberate position rather than an unfinished one: bringing a
+// machine up is the least portable thing a kernel does, and the shape of the hand-off differs
+// (UEFI + a loader on x86_64, a device tree and firmware already in supervisor mode on the other
+// two). What a fourth architecture would copy is therefore `boot.rs`, not `kmain`.
+//
+// What that costs, written down because it is the reason to revisit this: nothing type-checks the
+// per-arch boot sequences against each other, so a step added to one - `remove_bootstrap_identity`,
+// a percpu field, a reserved kernel window - is silently absent from the others until a test
+// notices. The two candidates are a `BootSequence` trait each backend implements, or moving the
+// portable half of the three bring-ups back into `kmain` and leaving only the machine-specific
+// prologue per arch. Neither is scheduled; the position is recorded so the next person reads a
+// decision instead of a gap.
 
 // Architecture-independent HAL helpers shared by every backend (compiled for all
 // targets): the portable PCI enumeration each arch's `pci` shim builds on.

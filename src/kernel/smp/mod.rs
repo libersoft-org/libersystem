@@ -288,11 +288,16 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 		return out;
 	}
 	let hhdm = mem::hhdm_offset();
+	// THE RSDP ITSELF IS A FIRMWARE POINTER. The loader passes it through; nothing between there
+	// and here has asked whether it is somewhere this kernel can read. The extended structure is 36
+	// bytes, so that is what has to be inside the map before any of it is touched.
+	if !mem::within_direct_map(rsdp_phys, 36) {
+		crate::serial_println!("smp: the ACPI RSDP at {rsdp_phys:#x} is outside the direct map; running single-core");
+		return out;
+	}
 	let rsdp = (hhdm + rsdp_phys) as *const u8;
 	// RSDP: revision at offset 15; RSDT (u32) at 16 for revision 0/1, XSDT (u64) at
 	// 24 for revision 2+.
-	// The RSDP has its own checksum over its first 20 bytes (and revision 2+ extends it,
-	// which is not checked here - the first 20 cover the pointers this code reads).
 	let mut sum: u8 = 0;
 	for i in 0..20 {
 		sum = sum.wrapping_add(unsafe { *rsdp.add(i) });
@@ -302,7 +307,28 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 		return out;
 	}
 	let revision = unsafe { *rsdp.add(15) };
-	let madt = if revision >= 2 {
+	// THE FIRST 20 BYTES DO NOT COVER THE XSDT POINTER, and the comment that used to sit here said
+	// they did - "the first 20 cover the pointers this code reads". For revision 0 and 1 that is
+	// true, because the RSDT pointer is at 16. For revision 2 the pointer is at 24, four bytes past
+	// the end of what was summed, and the extended checksum that does cover it - over the first 36 -
+	// was never asked for. The code's own justification was the thing that was wrong, which is why
+	// it read as finished.
+	//
+	// A revision-2 RSDP whose extended checksum fails is not treated as fatal: the first 20 bytes
+	// passed, so the RSDT pointer inside them is as vouched-for as it ever was, and falling back to
+	// it finds the same MADT on every machine that has both. Refusing to follow a pointer nothing
+	// has vouched for does not have to mean refusing to boot SMP.
+	let extended_ok = revision < 2 || {
+		let mut sum: u8 = 0;
+		for i in 0..36 {
+			sum = sum.wrapping_add(unsafe { *rsdp.add(i) });
+		}
+		if sum != 0 {
+			crate::serial_println!("smp: the ACPI RSDP's v2 extended checksum failed; ignoring the XSDT and using the RSDT the checked bytes cover");
+		}
+		sum == 0
+	};
+	let madt = if revision >= 2 && extended_ok {
 		let xsdt = unsafe { core::ptr::read_unaligned(rsdp.add(24) as *const u64) };
 		find_table(hhdm, xsdt, 8)
 	} else {
@@ -326,14 +352,20 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 // This does not make firmware trustworthy; it makes a corrupt table fail as a corrupt
 // table rather than as a wild read.
 fn table_ok(hhdm: u64, phys: u64) -> bool {
-	if phys == 0 {
+	let Some(len) = table_length(hhdm, phys) else {
 		return false;
-	}
-	let len = table_length(hhdm, phys) as usize;
+	};
+	let len = len as usize;
 	// The header alone is 36 bytes; a table claiming less is not one. The ceiling is a
 	// sanity bound - no real ACPI table is megabytes - and it is what stops a bad length
 	// turning into a long walk through unmapped memory.
 	if !(36..=1024 * 1024).contains(&len) {
+		return false;
+	}
+	// AND THE TABLE'S OWN LENGTH HAS TO BE INSIDE THE MAP TOO. A megabyte ceiling bounds how far a
+	// bad length can walk; it does not say the walk stays somewhere readable, and the sum below
+	// touches every byte of it.
+	if !mem::within_direct_map(phys, len as u64) {
 		return false;
 	}
 	let base = (hhdm + phys) as *const u8;
@@ -344,15 +376,27 @@ fn table_ok(hhdm: u64, phys: u64) -> bool {
 	sum == 0
 }
 
-// The 4-byte signature of the ACPI table at physical `phys` (read via the HHDM).
-fn table_signature(hhdm: u64, phys: u64) -> [u8; 4] {
+// The 4-byte signature of the ACPI table at physical `phys`, or `None` if `phys` is not somewhere
+// this kernel can read.
+//
+// BOUNDED, because `find_table` evaluates this BEFORE `table_ok` - `&&` is left to right - so the
+// checksum that was meant to be the gate came second and the wild read came first. `table_ok`
+// existed because this code had already decided not to take the firmware's word; the gap was an
+// inconsistency rather than a policy.
+fn table_signature(hhdm: u64, phys: u64) -> Option<[u8; 4]> {
+	if !mem::within_direct_map(phys, 36) {
+		return None;
+	}
 	let p = (hhdm + phys) as *const u8;
-	unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] }
+	Some(unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] })
 }
 
 // The `length` field (offset 4) of the ACPI table header at physical `phys`.
-fn table_length(hhdm: u64, phys: u64) -> u32 {
-	unsafe { core::ptr::read_unaligned((hhdm + phys + 4) as *const u32) }
+fn table_length(hhdm: u64, phys: u64) -> Option<u32> {
+	if !mem::within_direct_map(phys, 36) {
+		return None;
+	}
+	Some(unsafe { core::ptr::read_unaligned((hhdm + phys + 4) as *const u32) })
 }
 
 // Scan an RSDT/XSDT (entry pointers are `ptr_size` bytes each, after the 36-byte
@@ -365,14 +409,17 @@ fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize) -> Option<u64> {
 		crate::serial_println!("smp: the ACPI root table failed its own checksum; not walking it");
 		return None;
 	}
-	let len = table_length(hhdm, sdt_phys) as usize;
+	// `table_ok` passed, so the length is present, sane and inside the map.
+	let len = table_length(hhdm, sdt_phys).unwrap_or(0) as usize;
 	let base = (hhdm + sdt_phys + 36) as *const u8;
 	let count = (len - 36) / ptr_size;
 	for i in 0..count {
 		let entry = unsafe { base.add(i * ptr_size) };
 		let phys = if ptr_size == 8 { unsafe { core::ptr::read_unaligned(entry as *const u64) } } else { unsafe { core::ptr::read_unaligned(entry as *const u32) as u64 } };
-		// the signature says what it claims to be; the checksum says whether to believe it.
-		if phys != 0 && table_signature(hhdm, phys) == *b"APIC" && table_ok(hhdm, phys) {
+		// The bound says the pointer is somewhere readable, the signature says what it claims to
+		// be, and the checksum says whether to believe it - in that order, because the first two
+		// are reads of the thing the third is about.
+		if table_signature(hhdm, phys) == Some(*b"APIC") && table_ok(hhdm, phys) {
 			return Some(phys);
 		}
 	}
@@ -383,7 +430,9 @@ fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize) -> Option<u64> {
 // enabled Processor Local APIC (type 0, flags bit 0). Entries start at offset 44
 // (36-byte header + 4-byte local APIC address + 4-byte flags).
 fn parse_madt(hhdm: u64, madt_phys: u64, out: &mut Vec<u32>) {
-	let len = table_length(hhdm, madt_phys) as usize;
+	// `table_ok` has passed for this table, so the length is readable and the table is inside the
+	// direct map for the whole of it.
+	let len = table_length(hhdm, madt_phys).unwrap_or(0) as usize;
 	let base = (hhdm + madt_phys) as *const u8;
 	let mut off = 44usize;
 	while off + 2 <= len {

@@ -192,14 +192,30 @@ fn accepts_one_handle_per_alternative() {
 }
 
 #[test]
-fn rejects_multiple_handles_in_records_and_requests() {
-	assert_err_contains(&wrap("resource file;\nrecord pair { a: handle<file>, b: buffer }"), "record `pair` can transfer more than one");
-	assert_err_contains(&wrap("resource file;\ninterface i { @op(1) m: func(a: handle<file>, b: buffer) -> unit; }"), "request for `i.m` can transfer more than one");
+fn a_schema_may_now_ask_for_more_than_one_handle() {
+	// THIS TEST USED TO ASSERT THE OPPOSITE, and it was the last pin holding the 1 -> 4 handle
+	// migration still: the validator refused `Many` because the typed SERVER receive took one
+	// handle and the kernel dropped the rest, so a schema that could ask for three would have lost
+	// two. `rt::recv_caps_blocking` and the thirteen converted call sites removed that reason, and
+	// the refusal went with them - but these assertions stayed, red, describing a rule the tree no
+	// longer has.
+	//
+	// What replaces it is not "no bound": the bound is `wire::MAX_HANDLES`, enforced where the
+	// handles actually are - the writer refuses the fifth, the reader tracks occupied and consumed
+	// slots, and the failure paths return every capability to its owner. A schema is not the place
+	// to count them, because a `list<T>` of handle-bearing values has a length nobody knows until
+	// the message is built.
+	parse_ok(&wrap("resource file;\nrecord pair { a: handle<file>, b: buffer }"));
+	parse_ok(&wrap("resource file;\ninterface i { @op(1) m: func(a: handle<file>, b: buffer) -> unit; }"));
+	parse_ok(&wrap("resource file;\ninterface i { @op(1) m: func() -> tuple<handle<file>, handle<file>>; }"));
 }
 
 #[test]
-fn rejects_lists_of_handle_bearing_values() {
-	assert_err_contains(&wrap("resource file;\nrecord item { file: handle<file> }\nrecord batch { items: list<item> }"), "record `batch` can transfer more than one");
+fn a_list_of_handle_bearing_values_is_a_shape_and_not_a_refusal() {
+	// The `Many` case reached through a list, which is the one the old refusal was really about: a
+	// `list<item>` where `item` carries a handle has a count the schema cannot know. It is accepted
+	// here and bounded at the wire, where the count exists.
+	parse_ok(&wrap("resource file;\nrecord item { file: handle<file> }\nrecord batch { items: list<item> }"));
 }
 
 #[test]
@@ -286,7 +302,13 @@ fn imported_handle_cardinality_is_checked_after_resolution() {
 	let packages = resolve::resolve(&files).expect("resolve");
 	let app = packages.iter().find(|package| package.id.display() == "liber:app@1").unwrap();
 	let errors = validate::validate_resolved(&files[app.file], &app.imports);
-	assert!(errors.iter().any(|error| error.msg.contains("record `batch` can transfer more than one")));
+	// RESOLVED, so its cardinality is known - `Many`, which is a shape rather than a refusal since
+	// the handle migration finished. What must still fail is the UNRESOLVED case below: a schema
+	// whose imported wire shape nobody has established cannot be reasoned about at all, and that
+	// one fails closed.
+	assert!(errors.is_empty(), "a resolved list of handle-bearing values is a legal shape: {errors:?}");
+	let unresolved = validate::validate(&files[app.file]);
+	assert!(unresolved.iter().any(|error| error.msg.contains("has not been resolved")), "an unresolved imported shape still fails closed: {unresolved:?}");
 }
 
 #[test]
@@ -316,6 +338,58 @@ fn stream_helpers_carry_handles_per_open_and_frame() {
 	assert!(rust.contains("frame_handle: &mut u64"));
 	assert!(rust.contains("*frame_handle = writer.handle();"));
 	assert!(rust.contains("Reader::with_handle(msg, *frame_handle)"));
+}
+
+#[test]
+fn a_stream_may_fail_before_it_starts() {
+	// `result<stream<T>, error>` PARSED AND GENERATED NOTHING. The generator matched `Type::Stream`
+	// on the return position directly, so a stream inside a result never reached that arm and the
+	// value-position paths refused it with "stream is not supported in a value position" - codegen
+	// then emitted `// tail (op 3) uses handle/buffer/stream; bindings deferred.` where the method
+	// should be, the method vanished from the trait, and every consumer stopped compiling.
+	//
+	// The cost was not hypothetical: `Volume::list` answered a directory it could not read with an
+	// EMPTY LISTING, which is the exact "a failure looks like an empty answer" semantics this
+	// project spent a milestone removing everywhere else, and it could not be fixed from the
+	// storage side while this shape emitted nothing.
+	//
+	// The wire shape is the ordinary result's: `corr`, a one-byte tag, and then either the
+	// sub-channel handle (Ok) or the encoded error (Err). What is generated for it is a trait
+	// method returning `Result<Vec<T>, E>`, an `_open` that carries that result out to the serve
+	// loop, the two reply bodies the loop needs, and a client answering `Option<Result<u64, E>>`.
+	let file = parse_only(LOG);
+	let rust = crate::codegen::rust(&file, "log.lsidl", &std::collections::HashMap::new()).unwrap();
+	assert!(!rust.contains("bindings deferred"), "nothing about this schema is deferred any more");
+
+	// The service side: the result reaches the implementor, and `_open` hands it to the loop.
+	assert!(rust.contains("fn tail(&mut self, q: Query) -> Result<Vec<Entry>, Error>;"), "the trait carries the error arm");
+	assert!(rust.contains("pub fn tail_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Result<Vec<Entry>, Error>)>"));
+
+	// The two reply bodies. The serve loop owns the sub-channel, so the Ok body is `corr`, the tag
+	// and the handle's placeholder with the capability travelling in the reply's handle list; the
+	// Err body carries the error and NO handle, so a client that decodes a failure is not also left
+	// holding a channel nobody will ever write to.
+	assert!(rust.contains("pub fn tail_reply_ok(corr: u32, out: &mut [u8]) -> Option<usize>"));
+	assert!(rust.contains("pub fn tail_reply_err(corr: u32, error: &Error, out: &mut [u8]) -> Option<usize>"));
+
+	// The client side, and the handle accounting on both arms of the tag. An `Ok` with anything but
+	// one handle, or an `Err` with any at all, is a reply this schema cannot have produced - and
+	// every one of those handles is a capability, so they are discarded rather than dropped.
+	assert!(rust.contains("pub fn tail(&mut self, q: &Query) -> Option<Result<u64, Error>>"));
+	assert!(rust.contains("if reply_handles.len() != 1 { return None; }"));
+	assert!(rust.contains("if !reply_handles.is_empty() { return None; }"));
+	assert!(rust.contains("if !matches!(decoded, Some(Ok(_))) {"));
+
+	// The per-element framing is unchanged - the error arm is about whether the stream STARTS.
+	assert!(rust.contains("pub fn tail_frame(seq: u32, item: &Entry, out: &mut [u8], frame_handle: &mut u64) -> Option<usize>"));
+	assert!(rust.contains("pub fn tail_read(msg: &[u8], frame_handle: &mut u64) -> Option<Entry>"));
+
+	// And the bare `stream<T>` form still generates what it did: no tag, no error, the handle alone.
+	let bare = parse_only("package liber:stream@1; record item { n: u32 } interface feed { @op(1) open: func() -> stream<item>; }");
+	let rust = crate::codegen::rust(&bare, "stream.lsidl", &std::collections::HashMap::new()).unwrap();
+	assert!(rust.contains("fn open(&mut self) -> Vec<Item>;"));
+	assert!(rust.contains("pub fn open(&mut self) -> Option<u64>"));
+	assert!(!rust.contains("open_reply_ok"), "a stream with no error arm has no refusal body to emit");
 }
 
 #[test]

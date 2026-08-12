@@ -17,7 +17,7 @@ unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_storage_volume_rmdir"]
 	fn volume_rmdir(chan: u64, path: &str) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_storage_volume_list"]
-	fn volume_list(chan: u64, path: &str) -> Option<u64>;
+	fn volume_list(chan: u64, path: &str) -> Option<Result<u64, Error>>;
 	#[link_name = "liber_channel_liber_storage_volume_write"]
 	fn volume_write(chan: u64, path: &str, data: &Buffer) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_storage_volume_snap_create"]
@@ -77,7 +77,7 @@ impl VolumeClient {
 	}
 
 	#[inline(always)]
-	pub fn list(&mut self, path: &str) -> Option<u64> {
+	pub fn list(&mut self, path: &str) -> Option<Result<u64, Error>> {
 		unsafe { volume_list(self.chan, path) }
 	}
 

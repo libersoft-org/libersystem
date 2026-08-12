@@ -414,11 +414,30 @@ pub fn block_on(koid: u64, deadline: u64) {
 // Reserving is not the same as pushing: the capacity stays with the vector, so the push that
 // follows - with interrupts masked - cannot allocate and cannot fail.
 fn reserve_wait_slots(koid: u64, deadline: u64) -> bool {
-	if bucket_of(koid).lock().try_reserve(1).is_err() {
-		return false;
+	reserve_buckets(&[koid]) && (deadline == NO_DEADLINE || TIMED_WAITERS.lock().try_reserve(1).is_ok())
+}
+
+// Room for one registration per koid, counted PER BUCKET.
+//
+// `try_reserve(n)` is measured against the vector's own length, not against the calls before it: it
+// means "have room for n more than you hold", so asking for one four times asks for the same one
+// place four times. `block_on_any` did exactly that - one `try_reserve(1)` per koid - and then
+// pushed once per koid, and `bucket_of` is `koid % WAIT_BUCKET_COUNT`. Two koids in one bucket and
+// the second push allocates.
+//
+// Where it allocates is the point: after `disable_interrupts` and after `begin_park`, on the heap
+// the reservation exists to keep out. And it is not contrived to reach - koids are handed out in
+// sequence and there are 64 buckets, so a set of eight collides by accident about a third of the
+// time.
+fn reserve_buckets(koids: &[u64]) -> bool {
+	let mut wanted: [usize; WAIT_BUCKET_COUNT] = [0; WAIT_BUCKET_COUNT];
+	for &koid in koids {
+		wanted[(koid % WAIT_BUCKET_COUNT as u64) as usize] += 1;
 	}
-	if deadline != NO_DEADLINE && TIMED_WAITERS.lock().try_reserve(1).is_err() {
-		return false;
+	for (index, &count) in wanted.iter().enumerate() {
+		if count != 0 && WAIT_BUCKETS[index].lock().try_reserve(count).is_err() {
+			return false;
+		}
 	}
 	true
 }
@@ -492,12 +511,10 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 	};
 	// As in `block_on_flagged`: every bucket this will register in gets its room first, so no push
 	// below can meet a short heap with interrupts off and a half-parked thread.
-	for &koid in koids {
-		if !reserve_wait_slots(koid, NO_DEADLINE) {
-			return;
-		}
+	if !reserve_buckets(koids) {
+		return;
 	}
-	if deadline != NO_DEADLINE && !reserve_wait_slots(0, deadline) {
+	if deadline != NO_DEADLINE && TIMED_WAITERS.lock().try_reserve(1).is_err() {
 		return;
 	}
 	let saved_if = arch::interrupts_enabled();

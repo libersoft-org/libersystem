@@ -59,10 +59,43 @@ cleanup() {
 	rm -f "$backup" "$baseline_log" "$failure_log" "$restore_log"
 	if [[ "$status" -ne 0 ]]; then
 		echo "image-injection-check: exiting $status (phase=$phase kind=$kind mode=$mode mutation=${mutation:-none})" >&2
+		# THE LAST COMMAND, off the disk rather than out of a trap.
+		#
+		# `on_error` names a command whose FAILURE ended the script, and that covers the case where
+		# bash is still alive to report. It cannot cover the two that have actually been seen: a
+		# signal, and the shell itself going - and the third, an exit with no output at all, which
+		# happened while the traps were installed sixty-nine lines in and could not fire. The trace
+		# is written as it goes, so it survives all three.
+		if [[ -s "$trace_log" ]]; then
+			echo "image-injection-check: the last commands it ran, from $trace_log:" >&2
+			tail -n 15 "$trace_log" | sed 's/^/  /' >&2
+		fi
+	else
+		rm -f "$trace_log"
 	fi
 	exit "$status"
 }
 trap cleanup EXIT
+
+# An execution trace, to a file, from here on.
+#
+# The milestone's own next step, and the reason it is a FILE: every diagnostic this gate has is
+# something bash prints when it notices, and the failures worth chasing are the ones where nothing
+# noticed. A trace written as each command runs is on disk before the death, whatever the death was.
+#
+# Kept only when the run fails - a passing gate leaves nothing behind - and never used to decide
+# anything, so it cannot make a gate pass. Deliberately NOT a retry and NOT a longer timeout: both
+# would hide a gate that has stopped checking, which is what this milestone is about.
+#
+# In `TMPDIR` and not under `.build`, because this is armed BEFORE the source root is resolved -
+# that resolution is itself one of the lines that has died wordlessly, so nothing here may depend on
+# it having succeeded.
+trace_log="${TMPDIR:-/tmp}/liber-injection-trace.$$.log"
+if exec {trace_fd}>"$trace_log"; then
+	BASH_XTRACEFD="$trace_fd"
+	PS4='+ $(date +%H:%M:%S.%3N) ${BASH_SOURCE##*/}:${LINENO}: '
+	set -x
+fi
 
 phase="resolving the source root"
 root="$(cd "$(dirname "$0")/.." && pwd)"

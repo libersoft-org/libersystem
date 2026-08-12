@@ -112,6 +112,46 @@ stage_bootstrap_files() {
 	mcopy -i "$image" "$root"/libexec/* ::/libexec/
 }
 
+# WHICH volume this boot medium is paired with.
+#
+# The loader has read `etc/system-volume.uuid` since P02M0129 and nothing ever wrote it, so every
+# image this tree built took the "the boot medium names no system volume" fallback and said so in
+# its own boot log - a mechanism that looked implemented and was dead. Two LiberSystem disks in one
+# machine then let the firmware's block-handle order decide which one booted.
+#
+# The value comes from the sidecar `mkpackages` writes from the same `FormatOpts.uuid` the
+# superblock got, and `assert_pairing_matches_volume` checks it against the superblock actually on
+# the image - because a pairing file naming a volume the image does not contain is WORSE than none:
+# the loader then declines the volume that is really there.
+stage_volume_pairing() {
+	local image="$1" arch="${2:-x86_64}"
+	local uuid_file="$BUILD/system-volume-${arch}.uuid"
+	if [[ ! -f "$uuid_file" ]]; then
+		echo "mkimage: no volume uuid at $uuid_file; the medium will name no system volume" >&2
+		return 0
+	fi
+	assert_pairing_matches_volume "$uuid_file" "$BUILD/system-volume-${arch}.img"
+	# `::/etc` already exists when the bootstrap set was staged; the shipping ISO stages no set.
+	mmd -i "$image" ::/etc 2>/dev/null || true
+	mcopy -i "$image" "$uuid_file" ::/etc/system-volume.uuid
+}
+
+# The pairing file and the volume's own superblock must agree. Checked HERE, in the image gate,
+# rather than at boot: at boot the only thing the loader can do about a mismatch is decline the
+# volume, which is the failure this is meant to prevent.
+#
+# The uuid is 16 raw bytes at offset 80 of the LiberFS superblock, which is block 0 of the image.
+assert_pairing_matches_volume() {
+	local uuid_file="$1" volume="$2"
+	[[ -f "$volume" ]] || return 0
+	local declared actual
+	declared="$(tr -d '[:space:]-' <"$uuid_file" | tr 'A-F' 'a-f')"
+	actual="$(dd if="$volume" bs=1 skip=80 count=16 status=none | od -An -tx1 | tr -d ' \n')"
+	if [[ "$declared" != "$actual" ]]; then
+		die "the pairing file names volume $declared but the system volume's superblock says $actual - the loader would decline the volume that is actually on this image"
+	fi
+}
+
 make_iso() {
 	local kernel="$1" test_medium="${2:-0}"
 	local final="$BUILD/$SLUG.iso" out="$BUILD/$SLUG.iso.$$.candidate"
@@ -174,6 +214,13 @@ make_iso() {
 	# names its own programs, and a medium whose volume is unreadable has nothing else to boot.
 	if [[ "$test_medium" == "1" ]]; then
 		stage_bootstrap_files "$efi_img" x86_64
+	else
+		# THE SHIPPING MEDIUM ONLY. It carries the system volume as a file on this same filesystem,
+		# so naming that volume is true of it. The TEST medium carries the factory archive and no
+		# volume at all - a pairing file there would name a volume the medium does not have, which
+		# is the one case worse than no pairing: the loader would decline whatever volume it did
+		# find rather than fall back cleanly.
+		stage_volume_pairing "$efi_img" x86_64
 	fi
 	mcopy -i "$efi_img" "$payload" "::/$payload_name"
 
@@ -241,6 +288,7 @@ make_img() {
 	# `libexec/`, assembled by the same loader code. `init.pkg` was the second mechanism for this
 	# one job, and the only one of the two whose programs could not be replaced individually.
 	stage_bootstrap_files "$esp" x86_64
+	stage_volume_pairing "$esp" x86_64
 	# No volume archive: the system volume is a filesystem in partition 2, and the archive exists
 	# only as the kernel test suite's fixture (P02M0108).
 

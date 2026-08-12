@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 use super::port::{inl, outl};
 use crate::arch::common::pci as common;
+use crate::sync::SpinLock;
 
 // The PCI surface every backend re-exports (the HAL contract); not every type is
 // named directly in this backend's code.
@@ -21,6 +22,27 @@ pub use common::{PciDevice, VirtioCap, VirtioDevice, XhciDevice, virtio_type_nam
 // The PCI configuration mechanism #1 ports.
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
+
+// Mechanism #1 is a TRANSACTION, and it was being issued as two independent accesses.
+//
+// `CONFIG_ADDRESS` selects the register and `CONFIG_DATA` transfers it, so the pair is only one
+// operation while nothing runs between them. Two cores interleaving means one reads or writes the
+// other's device:
+//
+//     CPU0: out CF8 = device A
+//     CPU1: out CF8 = device B
+//     CPU0: in  CFC        -> device B's register
+//
+// The boot scan never showed it because the scan is serial on one core. Runtime does: `msix_enable`
+// is reached from `SYS_INTERRUPT_CREATE_MSI` and `set_intx_disabled` from device acquisition, so
+// ring 3 on any core issues this pair - and a write landing on the wrong function is a command
+// register written into somebody else's device.
+//
+// x86 only, and the reason belongs here rather than in a commit message: ECAM puts the register in
+// the ADDRESS, so the same read on aarch64 and riscv64 is a single `read_volatile` with nothing to
+// interleave. Mechanism #1 puts it in a side register, and that is what makes it a transaction
+// rather than an access.
+static CONFIG_PORTS: SpinLock<()> = SpinLock::new(());
 
 // Build the CONFIG_ADDRESS value selecting a device's config dword. `offset` is
 // rounded down to a 4-byte boundary (the dword the field lives in).
@@ -40,6 +62,7 @@ impl common::ConfigAccess for Access {
 	const BUS_COUNT: u16 = 1;
 
 	fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
+		let _serialised = CONFIG_PORTS.lock();
 		unsafe {
 			outl(CONFIG_ADDRESS, address(bus, dev, func, off));
 			inl(CONFIG_DATA)
@@ -47,6 +70,7 @@ impl common::ConfigAccess for Access {
 	}
 
 	fn write32(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
+		let _serialised = CONFIG_PORTS.lock();
 		unsafe {
 			outl(CONFIG_ADDRESS, address(bus, dev, func, off));
 			outl(CONFIG_DATA, val);

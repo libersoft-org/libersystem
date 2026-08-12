@@ -212,7 +212,15 @@ impl Thread {
 		// build the thread at all if the process is already tearing down. A thread that cannot be
 		// registered is a thread nothing can signal, reap or account, inside a process whose handles
 		// and mappings are already gone.
-		if !thread.process.register_thread(&thread) {
+		//
+		// Through the lifecycle guard, which is the only way to reach the registration: the check
+		// and the record are then one step against a teardown, rather than two with a `terminating`
+		// flag read between them.
+		let registered = match thread.process.begin_extend() {
+			Some(guard) => guard.register_thread(&thread),
+			None => false,
+		};
+		if !registered {
 			return None;
 		}
 		Some(thread)

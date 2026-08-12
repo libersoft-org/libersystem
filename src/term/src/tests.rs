@@ -719,3 +719,179 @@ fn backspace_steps_back_over_a_soft_wrap() {
 	feed(&mut screen, b"\x08\x08\x08\x08");
 	assert_eq!((screen.cursor_col(), screen.cursor_row()), (0, 1), "and must not cross a hard newline");
 }
+
+#[test]
+fn a_sequence_that_moves_nothing_does_not_end_a_deferred_wrap() {
+	// `csi_dispatch` cleared `pending_wrap` at its ENTRY, under a comment saying "a sequence that
+	// moves or repositions the cursor ends any deferred wrap" - and most CSI sequences do not move
+	// the cursor. SGR, DSR, DA, the cursor style and every mode set went through it.
+	//
+	// On an eight-column screen a full line, a colour change and one more character is what a
+	// prompt does, and the character landed over the `8` instead of starting the next row.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"12345678\x1b[31mX");
+	assert_eq!(dump(&screen), b"12345678X", "the X begins the next row, joined to the first by the soft wrap");
+	assert_eq!(screen.cell(7, 0).glyph, '8' as u32, "and it did not land on the 8");
+	assert_eq!(screen.cell(0, 1).glyph, 'X' as u32, "it is at the start of row 1");
+
+	// The same for the other non-moving sequences the entry-clear used to catch.
+	for sequence in [&b"\x1b[0m"[..], b"\x1b[5n", b"\x1b[c", b"\x1b[1 q", b"\x1b[?25h"] {
+		let mut screen = Screen::new(8, 4, 0);
+		feed(&mut screen, b"12345678");
+		feed(&mut screen, sequence);
+		feed(&mut screen, b"X");
+		assert_eq!(screen.cell(0, 1).glyph, 'X' as u32, "{sequence:?} moves nothing, so the deferred wrap survives it");
+	}
+}
+
+#[test]
+fn an_esc_cursor_move_after_a_full_line_feeds_once() {
+	// The other direction. `ESC D` calls `line_feed`, which did not touch `pending_wrap` - so a
+	// full line followed by `ESC D` followed by a glyph fed TWICE and the character landed two rows
+	// down. `ESC M` and `ESC E` had the same shape.
+	// IND keeps the COLUMN - it is a line feed, not a new line - so the X belongs at (7, 1). What
+	// the defect produced was (7, 2): the ESC fed once and the surviving deferred wrap fed again.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"12345678\x1bDX");
+	assert_eq!(screen.cursor_row(), 1, "ESC D moved down one row, and the wrap it ended did not move another");
+	assert_eq!(screen.cell(7, 1).glyph, 'X' as u32, "the X is one row down, not two");
+	assert_eq!(screen.cell(0, 2).glyph, ' ' as u32, "and row 2 was never reached");
+
+	// ESC E: carriage return plus line feed, so the same single move.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"12345678\x1bEX");
+	assert_eq!(screen.cell(0, 1).glyph, 'X' as u32, "ESC E feeds once");
+
+	// ESC M on row 1 goes back to row 0, and the deferred wrap must not then feed forward again.
+	// RI keeps the column too, so this is (7, 0) rather than (7, 1) - which is where the surviving
+	// wrap would have put it by feeding forward again after the ESC had moved back.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"\r\n12345678\x1bMX");
+	assert_eq!(screen.cell(7, 0).glyph, 'X' as u32, "ESC M moved up, and the wrap did not survive it");
+}
+
+#[test]
+fn a_resize_during_the_alternate_screen_leaves_the_primary_intact() {
+	// `resize`'s reflow read the primary CELLS with the ALTERNATE screen's wrap flags, so it
+	// reflowed the shell's scrollback according to a full-screen program's line breaks - and then
+	// assigned both vectors unconditionally, leaving them swapped afterwards.
+	let mut screen = Screen::new(8, 4, 8);
+	feed(&mut screen, b"aaaaaaaabbbb\r\nsecond");
+	let before = dump(&screen);
+	assert_eq!(before, b"aaaaaaaabbbb\nsecond", "the fixture soft-wraps and then breaks hard");
+
+	// The full-screen program's line structure is DELIBERATELY DIFFERENT from the primary's: two
+	// short hard-broken lines against one soft-wrapped one. A reflow reading the wrong screen's
+	// flags then breaks the primary's wrapped line in two, which is a difference the dump shows.
+	feed(&mut screen, b"\x1b[?1049h");
+	feed(&mut screen, b"xx\r\nyy");
+	// A resize while the full-screen program is up, then the program exits.
+	screen.resize(8, 6, 8, 6);
+	feed(&mut screen, b"\x1b[?1049l");
+	assert_eq!(dump(&screen), before, "the primary screen comes back as it was, with its own line structure");
+}
+
+#[test]
+fn a_reset_during_the_alternate_screen_returns_a_clean_primary_and_a_clean_alternate() {
+	// RIS set `alt_active = false` directly rather than through `leave_alt_buffer`, which was the
+	// only place that swapped the wrap vectors back - so a reset during alt left the primary live
+	// with the alternate's flags, and the `clear()` that follows ran against them.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"aaaaaaaabbbb");
+	feed(&mut screen, b"\x1b[?1049h");
+	feed(&mut screen, b"xxxxxxxxyyyy");
+	feed(&mut screen, b"\x1bc");
+	assert_eq!(dump(&screen), b"", "a reset leaves nothing on the primary screen");
+
+	// And nothing on the alternate either: entering it again shows a blank screen rather than the
+	// last program's picture.
+	feed(&mut screen, b"\x1b[?47h");
+	assert_eq!(dump(&screen), b"", "nor on the alternate screen the reset also cleared");
+	feed(&mut screen, b"one\r\ntwo");
+	assert_eq!(dump(&screen), b"one\ntwo", "and the alternate screen works normally afterwards");
+}
+
+#[test]
+fn mode_47_preserves_wrap_flags_along_with_cells() {
+	// `?47` deliberately preserves the alternate CELLS across leave and re-enter - that is what
+	// lets a program leave and return without redrawing - while `enter_alt_buffer` cleared its wrap
+	// flags on every entry. So the program got its characters back without their line structure,
+	// and the serializer broke a soft-wrapped line in two.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"\x1b[?47h");
+	feed(&mut screen, b"xxxxxxxxyyyy");
+	let inside = dump(&screen);
+	assert_eq!(inside, b"xxxxxxxxyyyy", "the alternate screen soft-wrapped");
+	feed(&mut screen, b"\x1b[?47l");
+	feed(&mut screen, b"\x1b[?47h");
+	assert_eq!(dump(&screen), inside, "re-entering ?47 returns the cells AND the line structure");
+}
+
+#[test]
+fn a_selection_over_the_alternate_screen_copies_what_is_shown() {
+	// `global_glyph` read `self.primary` for live rows while `global_wrap` read the active flags,
+	// so during alt they described different screens: a selection over a full-screen program
+	// highlighted the alternate cells and copied the shell text underneath them. What is seen and
+	// what is copied were different things.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"shelltxt");
+	feed(&mut screen, b"\x1b[?1049h");
+	feed(&mut screen, b"program!");
+	screen.selection_begin(0, 0);
+	screen.selection_extend(7, 0);
+	assert_eq!(screen.selection_text(), b"program!", "the selection copies the screen that is showing");
+}
+
+// Drive the editor and return what it echoed since the last call.
+fn echoed(ld: &mut Ld, echo: &mut Echo, bytes: &[u8]) -> Vec<u8> {
+	let before = echo.ser.as_slice().len();
+	for &b in bytes {
+		ld.feed(b, &[], echo);
+	}
+	echo.ser.as_slice()[before..].to_vec()
+}
+
+#[test]
+fn the_line_editor_measures_in_cells_not_bytes() {
+	// The decoder half was done - bytes at or above 0x80 reach the line, and Backspace, Delete,
+	// Left and Right respect UTF-8 boundaries. The cursor ARITHMETIC did not follow: Home moved
+	// left by a byte count and `replace_line` erased by one, so on a line containing any multi-byte
+	// character both walked past the start of the line and into the prompt.
+	//
+	// Three characters, four bytes.
+	let text: Vec<u8> = "\u{10d}aj".as_bytes().to_vec();
+	assert_eq!(text.len(), 4, "the fixture must be multi-byte, or nothing below means anything");
+
+	// Home from the end emits one backspace per CELL, which is three, not four.
+	let mut ld = Ld::new(8);
+	let mut echo = Echo { term: None, ser: EchoBuf::new() };
+	echoed(&mut ld, &mut echo, &text);
+	assert_eq!(echoed(&mut ld, &mut echo, b"\x1b[H"), b"\x08\x08\x08", "Home steps back three cells for three characters");
+
+	// Ctrl+U erases three cells, not four.
+	let mut ld = Ld::new(8);
+	let mut echo = Echo { term: None, ser: EchoBuf::new() };
+	echoed(&mut ld, &mut echo, &text);
+	assert_eq!(echoed(&mut ld, &mut echo, b"\x15"), b"\x08 \x08\x08 \x08\x08 \x08", "Ctrl+U erases three cells, not four");
+}
+
+#[test]
+fn a_multi_byte_character_reaches_the_screen_whole() {
+	// The echo happened per BYTE, so inserting a multi-byte character in the middle of a line put
+	// its lead byte on the display, then the whole suffix, and only then its continuation bytes - a
+	// valid line in the editor's buffer and a replacement character on the screen.
+	let mut ld = Ld::new(8);
+	let mut echo = Echo { term: None, ser: EchoBuf::new() };
+	echoed(&mut ld, &mut echo, b"ab");
+	// Left once, so the insertion is mid-line.
+	echoed(&mut ld, &mut echo, b"\x1b[D");
+	let ch: Vec<u8> = "\u{10d}".as_bytes().to_vec();
+	assert_eq!(ch.len(), 2);
+	assert_eq!(echoed(&mut ld, &mut echo, &ch[..1]), b"", "a lead byte alone draws nothing - the character is not there yet");
+	// Now the whole character, then the suffix, then one backspace per suffix CELL.
+	let mut expected: Vec<u8> = Vec::new();
+	expected.extend_from_slice(&ch);
+	expected.push(b'b');
+	expected.extend_from_slice(b"\x08");
+	assert_eq!(echoed(&mut ld, &mut echo, &ch[1..]), expected, "the completed character and the suffix arrive together");
+}
