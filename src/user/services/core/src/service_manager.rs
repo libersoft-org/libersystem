@@ -76,6 +76,8 @@ enum Restart {
 // resolver derives the real order (proving it is driven by declared deps, not position).
 // (A fixed size keeps the state arrays on the stack.)
 include!(concat!(env!("OUT_DIR"), "/manifest.rs"));
+// The driver names, from the same manifest rows DeviceManager binds from. See `build.rs`.
+include!(concat!(env!("OUT_DIR"), "/driver_names.rs"));
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -421,18 +423,36 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 
-	// The drivers' online facts, snapshotted after bring-up: a non-zero client channel
-	// means the driver came up and handed its channel over (DeviceManager launched it and
-	// it reported in). Folded into the supervisor's status view, so `lssvc` lists the
-	// drivers alongside the managed services - drivers are services too.
-	let driver_state: [(&'static [u8], bool); 6] = [
-		(b"driver.virtio_blk", block_client != 0),
-		(b"driver.virtio_net", net_frames != 0),
-		(b"driver.virtio_gpu", gpu_client != 0),
-		(b"driver.virtio_snd", snd_client != 0),
-		(b"driver.virtio_input", input_raw != 0),
-		(b"driver.xhci", block5_client != 0),
-	];
+	// The drivers' online facts, snapshotted after bring-up: a non-zero client channel means the
+	// driver came up and handed its channel over (DeviceManager launched it and it reported in).
+	// Folded into the supervisor's status view, so `lssvc` lists the drivers alongside the managed
+	// services - drivers are services too.
+	//
+	// THE LIST COMES FROM THE MANIFEST, not from a literal here. It was a
+	// `[(&'static [u8], bool); 6]` written in Rust, with an arity to edit when a driver was added -
+	// and it was already wrong: `virtio_console` and `dev_channel` are drivers in the image and were
+	// missing from it, which nothing could detect because the list and the image had no common
+	// source. `DRIVER_NAMES` is generated from the same manifest rows DeviceManager binds from, so
+	// a driver cannot be in the image and absent from the status view.
+	//
+	// The online FACT is still per-driver, and honestly so: each is a different channel handed over
+	// by a different service, which is the provider-routing item and not this one. A driver whose
+	// fact nothing here knows reads as offline rather than being silently dropped from the list.
+	let driver_state: Vec<(&'static [u8], bool)> = DRIVER_NAMES
+		.iter()
+		.map(|name| {
+			let online = match *name {
+				b"driver.virtio_blk" => block_client != 0,
+				b"driver.virtio_net" => net_frames != 0,
+				b"driver.virtio_gpu" => gpu_client != 0,
+				b"driver.virtio_snd" => snd_client != 0,
+				b"driver.virtio_input" => input_raw != 0,
+				b"driver.xhci" => block5_client != 0,
+				_ => false,
+			};
+			(*name, online)
+		})
+		.collect();
 
 	// 3. in a test boot, exercise the stop path on a leaf service. DeviceManager is the
 	//    safe choice: nothing depends on it, so stopping it does not tear down the running

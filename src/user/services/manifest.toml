@@ -1129,6 +1129,10 @@ stage = "pinned"
 destination = "virtio_blk.lsexe"
 providers = []
 
+[programs.driver]
+lifecycle = "boot-critical"
+match = [{ device-type = 2 }]
+
 [[programs]]
 name = "virtio_console"
 owner = "drivers"
@@ -1137,6 +1141,10 @@ linkage = "static"
 stage = "volume"
 destination = "drivers/virtio_console.lsexe"
 providers = []
+
+[programs.driver]
+lifecycle = "controller"
+match = [{ device-type = 3 }]
 
 [[programs]]
 name = "dev_channel"
@@ -1147,6 +1155,16 @@ stage = "volume"
 destination = "drivers/dev_channel.lsexe"
 providers = []
 development = true
+
+# Where the host pins the development channel's virtio-serial device. It is a second device of a
+# type that already has a driver, so an ADDRESS is what separates them - the only rule in the
+# registry that names a location rather than a kind, and `quirk` because it must outrank the generic
+# virtio-console entry that also matches this device. The runner sets the same address on every
+# target, and nothing above the port depends on it.
+[programs.driver]
+lifecycle = "controller"
+match = [{ device-type = 3, pci-address = { bus = 0, dev = 30, func = 0 } }]
+priority = "quirk"
 
 [[programs]]
 name = "dev_agent"
@@ -1167,6 +1185,10 @@ stage = "volume"
 destination = "drivers/virtio_gpu.lsexe"
 providers = []
 
+[programs.driver]
+lifecycle = "controller"
+match = [{ device-type = 16 }]
+
 [[programs]]
 name = "virtio_input"
 owner = "drivers"
@@ -1175,6 +1197,10 @@ linkage = "static"
 stage = "volume"
 destination = "drivers/virtio_input.lsexe"
 providers = []
+
+[programs.driver]
+lifecycle = "controller"
+match = [{ device-type = 18 }]
 
 [[programs]]
 name = "virtio_net"
@@ -1185,6 +1211,10 @@ stage = "volume"
 destination = "drivers/virtio_net.lsexe"
 providers = []
 
+[programs.driver]
+lifecycle = "controller"
+match = [{ device-type = 1 }]
+
 [[programs]]
 name = "virtio_snd"
 owner = "drivers"
@@ -1193,6 +1223,10 @@ linkage = "static"
 stage = "volume"
 destination = "drivers/virtio_snd.lsexe"
 providers = []
+
+[programs.driver]
+lifecycle = "controller"
+match = [{ device-type = 25 }]
 
 [[programs]]
 name = "volume"
@@ -1238,6 +1272,10 @@ linkage = "static"
 stage = "volume"
 destination = "drivers/xhci.lsexe"
 providers = []
+
+[programs.driver]
+lifecycle = "controller"
+match = [{ device-type = 256 }]
 
 [[factory_files]]
 name = "audio-demo"

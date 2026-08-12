@@ -52,6 +52,76 @@ struct RawProgram {
 	// configurations.
 	#[serde(default)]
 	development: bool,
+	// The binding rules, for `role = "driver"` and for nothing else.
+	//
+	// REQUIRED on a driver and refused on anything else, because both halves are errors that would
+	// otherwise be discovered at runtime as silence: a driver with no rules is a driver DeviceManager
+	// can never select, and rules on a service are rules nothing will ever consult.
+	#[serde(default)]
+	driver: Option<RawDriver>,
+}
+
+// The driver registry's per-entry declaration, as it is written in the manifest.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawDriver {
+	lifecycle: DriverLifecycle,
+	#[serde(rename = "match")]
+	rules: Vec<RawMatchRule>,
+	#[serde(default)]
+	priority: MatchPriority,
+}
+
+// A match rule, as a CLOSED tagged set rather than free-form key/value pairs.
+//
+// The point of the closure is that a rule discovery cannot answer fails when the registry is built
+// instead of never matching when the machine boots. `deny_unknown_fields` plus one variant per rule
+// is what enforces it: a rule naming a field this system does not discover is not a rule that binds
+// nothing, it is a manifest that does not parse.
+// ONE RULE IS A CONJUNCTION OF PREDICATES; a driver's `match` list is a disjunction of rules.
+//
+// It started as a tagged enum with one variant per question, and that was wrong in a way the tree
+// showed immediately: the development console's old selection was `device_type == VIRTIO_TYPE_CONSOLE
+// AND the pinned PCI address`, and an enum of single questions can only OR them. A rule where every
+// declared field must hold expresses both - `{ pci-address = {...}, virtio-type = 3 }` is the AND,
+// two entries in `match` are the OR - and it stays closed, because `deny_unknown_fields` means a
+// field this system does not discover fails to parse rather than never matching.
+//
+// Every field is optional and at least one must be present; an empty rule would select everything.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawMatchRule {
+	// The device type the kernel reports. ONE predicate, because it is one field: `DeviceInfo`
+	// carries a single `device_type` and the virtio kinds (net 1, blk 2, console 3, gpu 16,
+	// input 18, sound 25) share its number space with the rest (xHCI 0x100). It was two -
+	// `virtio-type` and `device-type` - and the ambiguity check refused the whole manifest on its
+	// first run, correctly: two names for one field cannot be compared, so `virtio-type = 2` and
+	// `device-type = 256` looked like predicates about different things and therefore compatible.
+	// A vocabulary that claims two questions where the system asks one cannot be reasoned about.
+	#[serde(default)]
+	device_type: Option<u32>,
+	// The standards path: how a driver claims a FAMILY of hardware rather than one vendor-defined
+	// model number. `DeviceInfo` carries class, subclass and programming interface since
+	// 2026-08-12; the kernel had resolved all three since the first PCI scan and kept them for
+	// `lspci` alone.
+	#[serde(default)]
+	pci_class: Option<u8>,
+	#[serde(default)]
+	pci_subclass: Option<u8>,
+	#[serde(default)]
+	pci_interface: Option<u8>,
+	// The one predicate that names a LOCATION rather than a kind, for a second device of a type
+	// that already has a driver.
+	#[serde(default)]
+	pci_address: Option<RawPciAddress>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RawPciAddress {
+	bus: u8,
+	dev: u8,
+	func: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -152,6 +222,39 @@ pub enum ProgramRole {
 	Helper,
 }
 
+// What kind of thing a driver binds to, which decides how it is supervised and when it is started.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DriverLifecycle {
+	// Needed to mount the system volume, so it is staged in `init.pkg` and started before there is
+	// a volume to load anything from.
+	BootCritical,
+	// Owns a bus or controller: it discovers children and stays online with none.
+	Controller,
+	// One PCI function or standalone platform device.
+	Function,
+	// One mediated interface of a composite device - a USB class driver on its own interface.
+	Interface,
+}
+
+// How specific a match is, as a KIND rather than a number.
+//
+// The milestone's arbitration rule is about kind: an exact standardised match beats a broader class
+// match, and an explicit tested quirk beats the generic path only where it matches at all. A numeric
+// priority invites tie-breaks nobody can justify, and the registry refuses ties anyway.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum MatchPriority {
+	// A broader class match: correct for a whole family, and the one anything else outranks.
+	#[default]
+	Generic,
+	// An exact standardised compatible/class revision.
+	Exact,
+	// An explicit, tested compliance quirk for one device. Outranks both, and is the only place a
+	// vendor/product pair may appear - never as the primary binding mechanism.
+	Quirk,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Linkage {
@@ -223,6 +326,73 @@ pub struct Program {
 	pub providers: Vec<Name>,
 	// Built and staged only in the development configuration; see RawProgram.
 	pub development: bool,
+	// The binding rules, present exactly on drivers. `Some` for every `role = "driver"` entry that
+	// validated, `None` for every other role - which the shape check enforces both ways.
+	pub driver: Option<Driver>,
+}
+
+// One driver registry entry: what it binds to, how it is supervised, and how specific its claim is.
+#[derive(Clone, Debug, Serialize)]
+pub struct Driver {
+	pub lifecycle: DriverLifecycle,
+	pub rules: Vec<MatchRule>,
+	pub priority: MatchPriority,
+}
+
+// A match rule the generated registry can evaluate against a discovered node: every predicate that
+// is present must hold. `None` is "do not ask", not "must be absent".
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Default)]
+pub struct MatchRule {
+	pub device_type: Option<u32>,
+	pub pci_class: Option<u8>,
+	pub pci_subclass: Option<u8>,
+	pub pci_interface: Option<u8>,
+	pub pci_address: Option<PciAddress>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+pub struct PciAddress {
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+}
+
+impl MatchRule {
+	pub fn is_empty(self) -> bool {
+		self == MatchRule::default()
+	}
+
+	// Whether two rules can both match one node - that is, whether a node satisfying both could
+	// exist.
+	//
+	// Field by field: two predicates conflict only when both are present and differ. Everything
+	// else leaves a node that satisfies both, so the rules overlap. Decidable because the predicate
+	// set is closed, which is what lets `validate_references` refuse an ambiguous registry when it
+	// is BUILT rather than discover it on a machine that happens to have the device.
+	pub fn overlaps(self, other: MatchRule) -> bool {
+		optional_overlaps32(self.device_type, other.device_type)
+			&& optional_overlaps(self.pci_class, other.pci_class)
+			&& optional_overlaps(self.pci_subclass, other.pci_subclass)
+			&& optional_overlaps(self.pci_interface, other.pci_interface)
+			&& match (self.pci_address, other.pci_address) {
+				(Some(left), Some(right)) => left == right,
+				_ => true,
+			}
+	}
+}
+
+fn optional_overlaps32(left: Option<u32>, right: Option<u32>) -> bool {
+	match (left, right) {
+		(Some(l), Some(r)) => l == r,
+		_ => true,
+	}
+}
+
+fn optional_overlaps(left: Option<u8>, right: Option<u8>) -> bool {
+	match (left, right) {
+		(Some(l), Some(r)) => l == r,
+		_ => true,
+	}
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -391,7 +561,8 @@ impl Manifest {
 			if !destinations.insert(destination.clone()) {
 				push_error(&mut errors, format!("{location}.destination"), "duplicate staged destination");
 			}
-			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers, development: raw_program.development }).is_some() {
+			let driver = raw_program.driver.as_ref().map(|raw| Driver { lifecycle: raw.lifecycle, priority: raw.priority, rules: raw.rules.iter().map(|rule| MatchRule { device_type: rule.device_type, pci_class: rule.pci_class, pci_subclass: rule.pci_subclass, pci_interface: rule.pci_interface, pci_address: rule.pci_address.map(|address| PciAddress { bus: address.bus, dev: address.dev, func: address.func }) }).collect() });
+			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers, development: raw_program.development, driver }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate program name");
 			}
 		}
@@ -604,6 +775,42 @@ fn library_category<'a>(name: &str, owner: &str, source: &'a str) -> Option<&'a 
 }
 
 fn validate_program_shape(raw: &RawProgram, name: &Name, destination: &RelativePath, location: &str, errors: &mut Vec<ValidationError>) {
+	// A DRIVER HAS BINDING RULES AND NOTHING ELSE DOES, both directions.
+	//
+	// A driver with no rules is one DeviceManager can never select - it would be staged, cost image
+	// space, and never bind, which reads exactly like a driver whose hardware is absent. Rules on a
+	// service are rules nothing consults. Both are silent at runtime and loud here.
+	match (&raw.driver, raw.role) {
+		(None, ProgramRole::Driver) => push_error(errors, format!("{location}.driver"), "a driver must declare its binding rules; without them DeviceManager can never select it"),
+		(Some(_), role) if role != ProgramRole::Driver => push_error(errors, format!("{location}.driver"), format!("binding rules on a {role:?} program are rules nothing will consult")),
+		_ => {}
+	}
+	if let Some(driver) = &raw.driver {
+		if driver.rules.is_empty() {
+			push_error(errors, format!("{location}.driver.match"), "an empty match list selects nothing");
+		}
+		if driver.rules.iter().any(|rule| *rule == RawMatchRule::default()) {
+			push_error(errors, format!("{location}.driver.match"), "a rule with no predicates selects EVERY device");
+		}
+		// A BOOT-CRITICAL DRIVER MUST BE IN `init.pkg`, which is the self-hosting cycle stated as a
+		// rule rather than checked by one special case: a driver needed to reach the system volume
+		// cannot be loaded from the system volume.
+		if driver.lifecycle == DriverLifecycle::BootCritical && raw.stage != Stage::Pinned {
+			push_error(errors, format!("{location}.driver.lifecycle"), "a boot-critical driver is needed to mount the system volume, so it cannot be staged on it - pin it into init.pkg");
+		}
+		if driver.lifecycle != DriverLifecycle::BootCritical && raw.stage == Stage::Pinned {
+			push_error(errors, format!("{location}.stage"), "only a boot-critical driver belongs in init.pkg; everything else loads from the system volume");
+		}
+		// Two rules in ONE entry that overlap are a declaration written twice, which is harmless at
+		// runtime and a sign the author meant two different things.
+		for (index, rule) in driver.rules.iter().enumerate() {
+			for other in &driver.rules[index + 1..] {
+				if rule == other {
+					push_error(errors, format!("{location}.driver.match"), "the same rule is declared twice");
+				}
+			}
+		}
+	}
 	if raw.linkage == Linkage::Dynamic && raw.stage != Stage::Volume {
 		push_error(errors, format!("{location}.stage"), "dynamic programs must be volume staged");
 	}
@@ -675,6 +882,30 @@ fn validate_references(libraries: &BTreeMap<Name, Library>, programs: &BTreeMap<
 				push_error(errors, format!("libraries.{name}.providers"), "self provider edge");
 			} else if !libraries.contains_key(provider) {
 				push_error(errors, format!("libraries.{name}.providers"), format!("unknown library {provider}"));
+			}
+		}
+	}
+	// THE AMBIGUOUS MATCH, refused where it can be decided: at registry-build time.
+	//
+	// Two entries whose rules can both match one node at the same priority means the selection
+	// depends on enumeration order, which the milestone forbids by name. It is decidable because the
+	// rule set is closed - see `MatchRule::overlaps` - so this is a real check rather than a
+	// best-effort one, and the assertion in the selector downstream rests on it.
+	//
+	// Different priorities are not ambiguous: that is what a priority is for. A quirk beating a
+	// generic entry on the same device is the mechanism working.
+	let drivers: Vec<(&Name, &Driver)> = programs.iter().filter_map(|(name, program)| program.driver.as_ref().map(|driver| (name, driver))).collect();
+	for (index, (name, driver)) in drivers.iter().enumerate() {
+		for (other_name, other) in &drivers[index + 1..] {
+			if driver.priority != other.priority {
+				continue;
+			}
+			for rule in &driver.rules {
+				for other_rule in &other.rules {
+					if rule.overlaps(*other_rule) {
+						push_error(errors, format!("programs.{name}.driver.match"), format!("{rule:?} can also match {other_name}, at the same priority - a device would be bound by enumeration order"));
+					}
+				}
 			}
 		}
 	}

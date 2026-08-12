@@ -5,7 +5,7 @@ mod common;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use system_manifest::{Manifest, Restart, Stage};
+use system_manifest::{DriverLifecycle, Manifest, MatchPriority, Restart, Stage};
 
 fn main() {
 	common::configure();
@@ -16,6 +16,102 @@ fn main() {
 	generate_services(&manifest);
 	generate_library_paths(&manifest);
 	generate_program_paths(&manifest);
+	generate_driver_registry(&manifest);
+}
+
+// The driver registry, from the manifest, as a table DeviceManager walks instead of a `match`.
+//
+// It replaces `driver_for(&DeviceInfo)` - seven arms of virtio type numbers and one hardcoded PCI
+// address - which is the milestone's third item and the completion gate's first clause. The table
+// carries what a name could not: the lifecycle class, how specific the match is, and the rules
+// themselves, which is what everything attached to a binding downstream needs.
+//
+// Generated rather than written because the manifest already knows every driver, and a second
+// hand-maintained list is exactly what this milestone exists to delete. `system-manifest` refuses
+// the ambiguous and impossible cases before this runs, so the emitted table needs no defence.
+fn generate_driver_registry(manifest: &Manifest) {
+	// A DEVELOPMENT-ONLY DRIVER IS NOT IN A SHIPPING REGISTRY, which is what the `#[cfg(feature =
+	// "development")]` around the old `dev_channel` arm did and what a generated table would
+	// otherwise lose. Without this a shipping image would match the second virtio-console at its
+	// pinned address to a driver the image does not contain - a device left unbound by a rule that
+	// should not be there rather than by hardware that is not there.
+	let development = env::var_os("CARGO_FEATURE_DEVELOPMENT").is_some();
+	let mut entries = String::new();
+	let mut count = 0usize;
+	for program in manifest.programs.values() {
+		let Some(driver) = &program.driver else { continue };
+		if program.development && !development {
+			continue;
+		}
+		let lifecycle = match driver.lifecycle {
+			DriverLifecycle::BootCritical => "Lifecycle::BootCritical",
+			DriverLifecycle::Controller => "Lifecycle::Controller",
+			DriverLifecycle::Function => "Lifecycle::Function",
+			DriverLifecycle::Interface => "Lifecycle::Interface",
+		};
+		let priority = match driver.priority {
+			MatchPriority::Generic => "Priority::Generic",
+			MatchPriority::Exact => "Priority::Exact",
+			MatchPriority::Quirk => "Priority::Quirk",
+		};
+		let rules = driver
+			.rules
+			.iter()
+			.map(|rule| {
+				let address = match rule.pci_address {
+					Some(address) => format!("Some(Address {{ bus: {}, dev: {}, func: {} }})", address.bus, address.dev, address.func),
+					None => String::from("None"),
+				};
+				format!("Rule {{ device_type: {}, pci_class: {}, pci_subclass: {}, pci_interface: {}, pci_address: {address} }}", option32(rule.device_type), option(rule.pci_class), option(rule.pci_subclass), option(rule.pci_interface),)
+			})
+			.collect::<Vec<_>>()
+			.join(", ");
+		entries.push_str(&format!(
+			"\tEntry {{ name: b\"{}\", artifact: b\"{}\", lifecycle: {lifecycle}, priority: {priority}, rules: &[{rules}] }},\n",
+			program.name,
+			// The staged file name. A pinned driver is looked up in `init.pkg` by this rather than
+			// by its program name, and deriving one from the other is how the two come to disagree.
+			program.destination.as_str().rsplit('/').next().unwrap_or(program.destination.as_str()),
+		));
+		count += 1;
+	}
+	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst DRIVER_REGISTRY: [Entry; {count}] = [\n{entries}];\n");
+	write_generated("driver_registry.rs", &generated);
+
+	// The names alone, for ServiceManager's status view.
+	//
+	// It held a `[(&'static [u8], bool); 6]` literal - six driver names written in Rust, with an
+	// arity that had to be edited to add a seventh. Two of the eight drivers in the image were
+	// missing from it and nothing could say so, because the list and the image had no common
+	// source. They have one now, and it is the same one DeviceManager binds from.
+	let names = registry_names(manifest, development).join(", ");
+	let name_count = registry_names(manifest, development).len();
+	write_generated("driver_names.rs", &format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst DRIVER_NAMES: [&[u8]; {name_count}] = [{names}];\n"));
+}
+
+fn registry_names(manifest: &Manifest, development: bool) -> Vec<String> {
+	manifest
+		.programs
+		.values()
+		.filter(|program| program.driver.is_some() && (development || !program.development))
+		// The `driver.` prefix is the status view's naming convention - `lssvc` filters on it - so
+		// the generated list carries it rather than every consumer re-adding it.
+		.map(|program| format!("b\"driver.{}\"", program.name))
+		.collect()
+}
+
+fn option(value: Option<u8>) -> String {
+	match value {
+		Some(value) => format!("Some({value})"),
+		None => String::from("None"),
+	}
+}
+
+fn option32(value: Option<u32>) -> String {
+	match value {
+		Some(value) => format!("Some({value})"),
+		None => String::from("None"),
+	}
 }
 
 fn generate_services(manifest: &Manifest) {

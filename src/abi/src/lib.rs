@@ -472,7 +472,19 @@ pub struct DeviceInfo {
 	pub bus: u8,
 	pub dev: u8,
 	pub func: u8,
-	pub _pad: u8,
+	// THE STANDARDS IDENTITY, which discovery already had and did not pass on.
+	//
+	// The kernel's PCI scan resolves class, subclass and programming interface for every function
+	// and retains them for `lspci` - so the bytes existed, and the one consumer that most needs
+	// them could not see them. Binding by `device_type` alone means every driver is selected by a
+	// vendor-defined number, which is what P02M0098 exists to stop: standard class/subclass/
+	// interface is how a driver claims a FAMILY of hardware rather than one model.
+	//
+	// These three occupy the byte that was `_pad` plus the two the struct's tail alignment already
+	// held, so nothing before them moves.
+	pub class: u8,
+	pub subclass: u8,
+	pub prog_if: u8,
 }
 
 // The framebuffer geometry framebuffer_map writes into the caller's buffer (the

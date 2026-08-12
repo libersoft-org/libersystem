@@ -22,21 +22,27 @@ use rt::*;
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
 
 // The state DeviceManager tracks per discovered device.
+// PRESENCE IS NOT ACTIVATION, and the states say which is which.
+//
+// It was three values and two of them answered different questions with the same silence: a device
+// no driver binds and a device whose driver could not be loaded were both simply absent from the
+// summary, so "this system does not support that card" and "the image is missing a file" looked
+// identical to anyone reading it. The milestone's second item is that distinction, and these are
+// the names it asks for.
 const STATE_UNKNOWN: u8 = 0;
 const STATE_ONLINE: u8 = 1;
 const STATE_FAILED: u8 = 2;
+// Present, and no registry entry matches it. The system does not support this device; nothing is
+// missing and nothing is wrong. It costs no process, no mapped ELF and no capability.
+const STATE_UNBOUND: u8 = 3;
+// Present, matched, and the artifact the registry names could not be read off the volume. The image
+// is inconsistent with its own registry - a different fault from an unsupported device, and the one
+// an operator can act on.
+const STATE_DRIVER_MISSING: u8 = 4;
 
 // How many times DeviceManager restarts a driver that crashes during bring-up
 // before giving up on its device.
 const MAX_DRIVER_RESTARTS: u32 = 3;
-
-// Where the host pins the development channel's virtio-serial device. It is a second
-// device of a type that already has a driver, so an address is what separates them; the
-// runner sets the same address on every target, and nothing above the port depends on it.
-#[cfg(feature = "development")]
-const DEV_CHANNEL_BUS: u8 = 0;
-#[cfg(feature = "development")]
-const DEV_CHANNEL_DEV: u8 = 0x1e;
 
 // Everything this program holds on behalf of the development agent, so supervising it is one
 // value rather than five more out-parameters threaded through driver launching.
@@ -290,12 +296,20 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 				i += 1;
 				continue;
 			}
-			let driver_name: &[u8] = driver_for(&info);
-			if driver_name != b"virtio_blk" {
+			// PHASE ONE IS THE BOOT-CRITICAL LIFECYCLE, declared in the manifest, rather than the
+			// name `virtio_blk` written here. That is the milestone's bootstrap exception stated as
+			// a rule: only a driver needed to mount the system volume lives in `init.pkg`, and
+			// `system-manifest` refuses a boot-critical driver staged anywhere else.
+			let Some(entry) = registry_entry(&info) else {
+				i += 1;
+				continue;
+			};
+			if entry.lifecycle != Lifecycle::BootCritical {
 				i += 1;
 				continue;
 			}
-			let elf: &[u8] = match package.lookup(b"virtio_blk.lsexe") {
+			let driver_name: &[u8] = entry.name;
+			let elf: &[u8] = match package.lookup(entry.artifact) {
 				Some(e) => e,
 				None => {
 					i += 1;
@@ -351,95 +365,120 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 				i += 1;
 				continue;
 			}
-			let driver_name: &[u8] = driver_for(&info);
-			if driver_name.is_empty() {
-				// a device with no userspace driver yet (e.g. the xHCI controller until
-				// its driver lands): skip it, leaving it out of the online summary.
+			let candidates = registry_candidates(&info);
+			if candidates.is_empty() {
+				// Present and unsupported. Recorded rather than skipped: an unbound device is a
+				// fact about this system, and leaving it out of the summary is what made it
+				// indistinguishable from a driver that failed to load.
+				state[idx] = STATE_UNBOUND;
 				i += 1;
 				continue;
 			}
-			if driver_name == b"virtio_blk" {
-				// the disks are bound in phase 1; count them as online in the summary.
+			if candidates[0].lifecycle == Lifecycle::BootCritical {
+				// bound in phase 1, before there was a volume to load from; count them as online.
 				state[idx] = STATE_ONLINE;
 				i += 1;
 				continue;
 			}
-			state[idx] = STATE_FAILED;
-			// load the driver's ELF off the volume, keep it mapped while we spawn from it.
-			let loaded: Option<(u64, u64, usize)> = read_driver(storage, driver_name);
-			let (file, mapped, size): (u64, u64, usize) = match loaded {
-				Some(t) => t,
-				None => {
-					i += 1;
-					continue;
-				}
-			};
-			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
-			let mut handle: u64 = 0;
-			let mut dm_chan: u64 = 0;
-			if launch_one(i, &info, elf, driver_name, key_producer, power, console_input, device_privilege, buf, &mut handle, &mut dm_chan) {
-				state[idx] = STATE_ONLINE;
-				if driver_name == b"virtio_net" {
-					*net_client = handle;
-				}
-				if driver_name == b"virtio_gpu" {
-					*gpu_client = handle;
-				}
-				if driver_name == b"virtio_snd" {
-					*snd_client = handle;
-				}
-				// The development channel driver hands up a raw byte channel, and the agent
-				// that speaks the protocol over it is started here rather than by
-				// ServiceManager. It exists exactly when the device does, it has no other
-				// client, and its whole reason to be a separate process is to keep the
-				// artifact registry out of the address space that holds a device capability -
-				// so it is started where that device is bound, and nowhere else.
-				#[cfg(feature = "development")]
-				if driver_name == b"dev_channel" && handle != 0 {
-					// The driver's bootstrap is kept rather than left to leak, because a
-					// replacement agent's wire is handed down over it; and a volume connection of
-					// this program's own is opened, because the one these drivers were read
-					// through is closed as soon as this function returns.
-					dev.driver = dm_chan;
-					dev.storage = service_connect(storage).unwrap_or(0);
-					// INSECURE by name, because that is what this is: an identifier that tells one
-					// boot from another, not a secret. Asking for the secure one would refuse on
-					// every machine with no hardware random source - which is two of the three
-					// architectures - for a number that never needed to be unguessable.
-					random_insecure(&mut dev.nonce);
-					dev.bootstrap = start_dev_agent(dev.storage, handle, &dev.nonce);
-					if dev.bootstrap == 0 {
-						print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
+			// EACH CANDIDATE IN TURN, most specific first, and the next one only after the last is
+			// gone. The ELF is unmapped and its handle closed at the bottom of every attempt
+			// whatever the outcome, so a fallback never runs beside the process it replaces.
+			//
+			// Every rejection is said: which driver, and why. A fallback that quietly succeeds hides
+			// the fact that the preferred driver did not, which is how a machine comes to run on its
+			// second choice for months with nobody aware of it.
+			for entry in candidates {
+				let driver_name: &[u8] = entry.name;
+				state[idx] = STATE_FAILED;
+				// load the driver's ELF off the volume, keep it mapped while we spawn from it.
+				let loaded: Option<(u64, u64, usize)> = read_driver(storage, driver_name);
+				let (file, mapped, size): (u64, u64, usize) = match loaded {
+					Some(t) => t,
+					None => {
+						// The registry names an artifact the volume does not have. That is the image
+						// disagreeing with itself, not a driver that ran and failed, and the two are
+						// worth telling apart: one is a packaging fault and the other is a bug.
+						state[idx] = STATE_DRIVER_MISSING;
+						print(b"devmgr: ");
+						print(driver_name);
+						print(b" is named by the registry and not on the volume; trying the next candidate\n");
+						continue;
+					}
+				};
+				let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
+				let mut handle: u64 = 0;
+				let mut dm_chan: u64 = 0;
+				if launch_one(i, &info, elf, driver_name, key_producer, power, console_input, device_privilege, buf, &mut handle, &mut dm_chan) {
+					state[idx] = STATE_ONLINE;
+					if driver_name == b"virtio_net" {
+						*net_client = handle;
+					}
+					if driver_name == b"virtio_gpu" {
+						*gpu_client = handle;
+					}
+					if driver_name == b"virtio_snd" {
+						*snd_client = handle;
+					}
+					// The development channel driver hands up a raw byte channel, and the agent
+					// that speaks the protocol over it is started here rather than by
+					// ServiceManager. It exists exactly when the device does, it has no other
+					// client, and its whole reason to be a separate process is to keep the
+					// artifact registry out of the address space that holds a device capability -
+					// so it is started where that device is bound, and nowhere else.
+					#[cfg(feature = "development")]
+					if driver_name == b"dev_channel" && handle != 0 {
+						// The driver's bootstrap is kept rather than left to leak, because a
+						// replacement agent's wire is handed down over it; and a volume connection of
+						// this program's own is opened, because the one these drivers were read
+						// through is closed as soon as this function returns.
+						dev.driver = dm_chan;
+						dev.storage = service_connect(storage).unwrap_or(0);
+						// INSECURE by name, because that is what this is: an identifier that tells one
+						// boot from another, not a secret. Asking for the secure one would refuse on
+						// every machine with no hardware random source - which is two of the three
+						// architectures - for a number that never needed to be unguessable.
+						random_insecure(&mut dev.nonce);
+						dev.bootstrap = start_dev_agent(dev.storage, handle, &dev.nonce);
+						if dev.bootstrap == 0 {
+							print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
+						}
+					}
+					// The pointer flavour of virtio_input hands up an event channel (non-zero
+					// handle); the keyboard flavour hands up nothing (handle 0), so a non-zero
+					// virtio_input handle is the pointer's INPUT channel for InputService.
+					if driver_name == b"virtio_input" && handle != 0 {
+						*input_client = handle;
+					}
+					// The xhci driver hands up the USB stick's block-service channel (handle 0
+					// when no mass-storage device is attached), routed to the usb StorageService,
+					// then its USB bus query channel under "USBBUS" (the `lsusb` inventory) and
+					// its pointer-event channel under "POINTER" (a USB pointing device).
+					if driver_name == b"xhci" {
+						if handle != 0 {
+							*usb_client = handle;
+						}
+						if let Received::Message { len, handle: usbq } = recv_blocking(dm_chan, buf)
+							&& len >= 6 && &buf[..6] == b"USBBUS"
+						{
+							*usbq_client = usbq;
+						}
+						if let Received::Message { len, handle: ptr } = recv_blocking(dm_chan, buf)
+							&& len >= 7 && &buf[..7] == b"POINTER"
+						{
+							*usb_pointer = ptr;
+						}
 					}
 				}
-				// The pointer flavour of virtio_input hands up an event channel (non-zero
-				// handle); the keyboard flavour hands up nothing (handle 0), so a non-zero
-				// virtio_input handle is the pointer's INPUT channel for InputService.
-				if driver_name == b"virtio_input" && handle != 0 {
-					*input_client = handle;
+				unmap_object(file);
+				close(file);
+				// Bound. Nothing below this candidate is tried.
+				if state[idx] == STATE_ONLINE {
+					break;
 				}
-				// The xhci driver hands up the USB stick's block-service channel (handle 0
-				// when no mass-storage device is attached), routed to the usb StorageService,
-				// then its USB bus query channel under "USBBUS" (the `lsusb` inventory) and
-				// its pointer-event channel under "POINTER" (a USB pointing device).
-				if driver_name == b"xhci" {
-					if handle != 0 {
-						*usb_client = handle;
-					}
-					if let Received::Message { len, handle: usbq } = recv_blocking(dm_chan, buf)
-						&& len >= 6 && &buf[..6] == b"USBBUS"
-					{
-						*usbq_client = usbq;
-					}
-					if let Received::Message { len, handle: ptr } = recv_blocking(dm_chan, buf)
-						&& len >= 7 && &buf[..7] == b"POINTER"
-					{
-						*usb_pointer = ptr;
-					}
-				}
+				print(b"devmgr: ");
+				print(driver_name);
+				print(b" did not bind; its resources are released and the next candidate follows\n");
 			}
-			unmap_object(file);
-			close(file);
 			i += 1;
 		}
 		close(key_producer);
@@ -638,19 +677,42 @@ unsafe fn report_state(state: &[u8]) {
 	unsafe {
 		let mut online: u32 = 0;
 		let mut tracked: u32 = 0;
+		let mut unbound: u32 = 0;
+		let mut missing: u32 = 0;
 		for &s in state {
-			if s != STATE_UNKNOWN {
-				tracked += 1;
-			}
-			if s == STATE_ONLINE {
-				online += 1;
+			match s {
+				STATE_UNKNOWN => {}
+				STATE_UNBOUND => unbound += 1,
+				STATE_DRIVER_MISSING => {
+					missing += 1;
+					tracked += 1;
+				}
+				STATE_ONLINE => {
+					online += 1;
+					tracked += 1;
+				}
+				_ => tracked += 1,
 			}
 		}
 		print(b"DeviceManager: ");
 		print_count(online);
 		print(b" of ");
 		print_count(tracked);
-		print(b" device(s) online\n");
+		print(b" device(s) online");
+		// SAID, not counted into the same number. An unsupported device is not a failure and a
+		// missing artifact is not an unsupported device; folding either into "online out of
+		// tracked" is what made both invisible.
+		if unbound > 0 {
+			print(b", ");
+			print_count(unbound);
+			print(b" unbound");
+		}
+		if missing > 0 {
+			print(b", ");
+			print_count(missing);
+			print(b" driver-missing");
+		}
+		print(b"\n");
 	}
 }
 
@@ -665,27 +727,129 @@ unsafe fn print_count(n: u32) {
 	}
 }
 
-// The binary name of the driver for a device type; empty when no userspace driver
-// exists for it yet.
-fn driver_for(info: &DeviceInfo) -> &'static [u8] {
-	// The development channel is a second virtio-console device pinned to a fixed PCI
-	// address. Matching the address rather than the enumeration order keeps the real
-	// console bound to the console driver whatever order the bus is walked in, and keeps
-	// the two ports independent: either can fail without taking the other with it.
-	// Without the development feature there is no such driver in the image, so the device is
-	// left unbound rather than bound to something absent.
-	#[cfg(feature = "development")]
-	if info.device_type == VIRTIO_TYPE_CONSOLE && info.bus == DEV_CHANNEL_BUS && info.dev == DEV_CHANNEL_DEV && info.func == 0 {
-		return b"dev_channel";
+// THE DRIVER REGISTRY, generated from the manifest. See `build.rs`.
+//
+// It replaces `driver_for(&DeviceInfo)`, which was seven `match` arms of virtio type numbers plus
+// one hardcoded PCI address for the development console - driver selection written in Rust rather
+// than declared, so adding a driver meant editing this file, and nothing could check that the
+// image's drivers and the code's list agreed. `system-manifest` refuses a duplicate identity, an
+// ambiguous equal-priority match, an empty rule set, a rule naming something discovery cannot
+// answer, and a boot-critical driver staged on the volume it exists to mount, all before this table
+// is emitted.
+
+// What kind of thing an entry binds to. Carried through selection because supervision and start
+// order depend on it, which a `&'static [u8]` name could not express.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+	BootCritical,
+	Controller,
+	Function,
+	Interface,
+}
+
+// How specific a match is. Ordered: a quirk outranks an exact match, which outranks the generic
+// path. The registry refuses two entries that tie, so ordering is total where it is consulted.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Priority {
+	Generic,
+	Exact,
+	Quirk,
+}
+
+// ONE RULE IS A CONJUNCTION: every predicate that is present must hold, and `None` means "do not
+// ask" rather than "must be absent". A driver's rule list is the disjunction.
+//
+// Both halves are needed and the tree proved it: the development console is selected by its virtio
+// type AND its pinned address, which a set of single-question rules could only OR together - and
+// OR-ing them would bind any device at that address to the console driver.
+#[derive(Clone, Copy)]
+struct Address {
+	bus: u8,
+	dev: u8,
+	func: u8,
+}
+
+#[derive(Clone, Copy)]
+struct Rule {
+	// One field, because `DeviceInfo` has one: the virtio kinds and xHCI share a number space.
+	device_type: Option<u32>,
+	// The standards identity, which discovery now carries. It was declarable and never satisfied
+	// while `DeviceInfo` had no class byte; the kernel had resolved all three for every function
+	// since the first PCI scan and kept them for `lspci` alone.
+	pci_class: Option<u8>,
+	pci_subclass: Option<u8>,
+	pci_interface: Option<u8>,
+	pci_address: Option<Address>,
+}
+
+impl Rule {
+	fn matches(self, info: &DeviceInfo) -> bool {
+		if self.pci_class.is_some_and(|class| info.class != class) {
+			return false;
+		}
+		if self.pci_subclass.is_some_and(|subclass| info.subclass != subclass) {
+			return false;
+		}
+		if self.pci_interface.is_some_and(|interface| info.prog_if != interface) {
+			return false;
+		}
+		if self.device_type.is_some_and(|kind| info.device_type != kind) {
+			return false;
+		}
+		if let Some(address) = self.pci_address
+			&& (info.bus != address.bus || info.dev != address.dev || info.func != address.func)
+		{
+			return false;
+		}
+		true
 	}
-	match info.device_type {
-		VIRTIO_TYPE_NET => b"virtio_net",
-		VIRTIO_TYPE_BLOCK => b"virtio_blk",
-		VIRTIO_TYPE_CONSOLE => b"virtio_console",
-		VIRTIO_TYPE_INPUT => b"virtio_input",
-		VIRTIO_TYPE_GPU => b"virtio_gpu",
-		VIRTIO_TYPE_SOUND => b"virtio_snd",
-		DEVICE_TYPE_XHCI => b"xhci",
-		_ => b"",
+}
+
+struct Entry {
+	name: &'static [u8],
+	// The staged file, which is what the loader asks for - not derived from the name, because the
+	// two differ for a pinned driver and deriving it is how they drift.
+	artifact: &'static [u8],
+	lifecycle: Lifecycle,
+	priority: Priority,
+	rules: &'static [Rule],
+}
+
+include!(concat!(env!("OUT_DIR"), "/driver_registry.rs"));
+
+// The registry entry that binds `info`, or None when nothing in the image does.
+//
+// EVERY candidate is collected and the most specific wins, rather than the first that matches -
+// "never choose by enumeration order" is the milestone's rule and a first-match loop is exactly
+// that. A tie cannot happen: `system-manifest` refuses two entries whose rules overlap at one
+// priority, which is decidable because the rule set is closed. The assertion here is what keeps
+// that proof honest if the check is ever weakened.
+fn registry_entry(info: &DeviceInfo) -> Option<&'static Entry> {
+	registry_candidates(info).first().copied()
+}
+
+// Every entry that matches `info`, most specific first.
+//
+// The ORDER is the arbitration and the LIST is the fallback. A bind that fails may try the next
+// compatible candidate - but only after the first attempt's resources are gone, which the caller
+// enforces by unmapping and closing before it comes back here. Trying them in parallel, or trying
+// the next while the first still holds the device, is how two drivers come to own one controller.
+//
+// Nothing is launched to find out whether it fits: the choice is made from metadata alone, which is
+// the item's "probe metadata before process creation rather than launching every possible driver to
+// see which one succeeds".
+//
+// A tie is refused rather than broken. `system-manifest` proves at registry-build time that two
+// entries cannot overlap at one priority, so this cannot fire - and it stays here because a proof
+// that nothing checks is a comment.
+fn registry_candidates(info: &DeviceInfo) -> Vec<&'static Entry> {
+	let mut candidates: Vec<&'static Entry> = DRIVER_REGISTRY.iter().filter(|entry| entry.rules.iter().any(|rule| rule.matches(info))).collect();
+	candidates.sort_by(|left, right| right.priority.cmp(&left.priority));
+	for pair in candidates.windows(2) {
+		if pair[0].priority == pair[1].priority {
+			unsafe { print(b"devmgr: two registry entries match one device at the same priority; leaving it unbound\n") };
+			return Vec::new();
+		}
 	}
+	candidates
 }
