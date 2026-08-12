@@ -1215,18 +1215,32 @@ fn the_cost_escalation_measures_seconds_and_not_keys() {
 	let history = crate::history::History::default();
 	let key = |architecture: &str, environment: crate::catalog::Environment, n: usize| -> Vec<crate::plan::PlanItemKey> { (0..n).map(|i| crate::plan::PlanItemKey { check: format!("k{i}"), architecture: architecture.to_string(), environment: environment.clone(), configuration: String::from("default") }).collect() };
 
-	// Twenty riscv64 guest keys against two hundred: the boot is paid once, so the difference is
-	// ninety seconds out of three thousand. Running all of them is within a tenth of running a
-	// tenth of them, which is the whole reason the rule exists.
+	// Twenty riscv64 guest keys against two hundred. The boot is paid ONCE, so a selection is
+	// cheaper than the whole set by less than its key count suggests - and by MORE than nothing,
+	// which is the pair of facts a count cannot represent.
+	//
+	// THIS ASSERTION USED TO BE `> 0.9`, and it was the defect written down as an expectation. It
+	// held because `fixed_seconds` for riscv64 was 3200 s - a whole-suite figure sitting in the
+	// field that means startup cost - so a boot appeared to dominate any selection and the planner
+	// widened every scoped riscv64 run to the full suite. The 2026-08-12 measurement (2 tests 537 s,
+	// 20 tests 587 s, 226 tests 2600 s) puts the real startup cost at 461 s against 9.44 s per test,
+	// and with those the same selection is 650 s against 2349 s. Scoping pays, which is what the
+	// selection dimension exists for.
 	let few = cost.estimate(&history, &key("riscv64", crate::catalog::Environment::TestGuest, 20));
 	let many = cost.estimate(&history, &key("riscv64", crate::catalog::Environment::TestGuest, 200));
-	assert!(few / many > 0.9, "20 of 200 riscv64 guest keys cost {few:.0} s against {many:.0} s - the boot dominates and the rule must see that");
+	let emulated = few / many;
+	assert!(emulated < 0.9, "20 of 200 riscv64 guest keys cost {few:.0} s against {many:.0} s - a ratio of {emulated:.3} widens every scoped run to the whole suite");
+	assert!(emulated > 0.2, "and the boot is still real: {emulated:.3} must stay well above the no-boot case below, or the model has stopped amortising it");
 
 	// The same counts on the host, where there is no boot: twenty checks cost a tenth of two
 	// hundred, and widening would be pure extra work.
 	let few = cost.estimate(&history, &key("host", crate::catalog::Environment::Host, 20));
 	let many = cost.estimate(&history, &key("host", crate::catalog::Environment::Host, 200));
-	assert!(few / many < 0.2, "20 of 200 host keys cost {few:.0} s against {many:.0} s - there is nothing to amortise");
+	let native = few / many;
+	assert!(native < 0.2, "20 of 200 host keys cost {few:.0} s against {many:.0} s - there is nothing to amortise");
+	// The two ratios are what the whole rule is about: same key counts, costs that differ by a
+	// factor the count cannot see.
+	assert!(emulated > native * 2.0, "an emulated boot must move the ratio: {emulated:.3} against {native:.3}");
 
 	// And the count-based rule cannot tell those two apart, which is the defect stated as an
 	// assertion: identical ratios, opposite right answers.

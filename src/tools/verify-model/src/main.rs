@@ -841,7 +841,15 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 						failures.push(format!("test-kernel.sh names no FULL_TIMEOUT for {architecture}, so nothing bounds its suite"));
 						continue;
 					};
-					let estimate = cost.fixed_seconds.get(&(architecture.to_string(), String::from("test-guest"))).copied().unwrap_or(0.0);
+					// FIXED PLUS THE TESTS, which is what a whole suite costs.
+					//
+					// This read `fixed_seconds` alone, and that was right only while the fixed term
+					// WAS a whole-suite figure - the defect the 2026-08-12 measurement removed. With
+					// it meaning startup cost, reading it alone compares a fifteen-minute budget
+					// against a ten-minute boot and concludes the suite fits however far it has
+					// outgrown its wall.
+					let tests = model.kernel_tests.tests.iter().filter(|test| test.architectures.iter().any(|declared| declared == architecture)).count();
+					let estimate = cost.full_suite_seconds(architecture, "test-guest", tests);
 					if estimate <= 0.0 {
 						continue;
 					}

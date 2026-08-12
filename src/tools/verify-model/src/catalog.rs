@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 15] = [
+const GATES: [(&str, &str); 16] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -118,6 +118,11 @@ const GATES: [(&str, &str); 15] = [
 	("milestone-index", "harness.tools"),
 	("verify-model", "verify-model"),
 	("verify-model-tests", "verify-model"),
+	// The 1 -> 4 handle migration's gate (P02M0090f): building a capability list from ONE received
+	// handle is banned outside the runtime primitive. It was added to `check.sh` and not here, so
+	// `verify-model check` reported a gate nothing would ever select - which is the same class of
+	// drift the two lists exist to catch, caught by them.
+	("single-cap-receive", "harness.tools"),
 ];
 
 // check.sh's gate names, read from the script. Parsing a shell array is crude and correct here:

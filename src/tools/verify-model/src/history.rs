@@ -184,26 +184,67 @@ pub fn now() -> u64 {
 // not learned from a single sample.
 pub struct CostModel {
 	pub fixed_seconds: BTreeMap<(String, String), f64>,
+	// PER TARGET, because the per-test cost is not a property of a test - it is a property of how
+	// fast the machine running it goes. One global 0.5 s said an emulated test costs what a native
+	// one costs, and it is fifteen to twenty times more.
+	pub variable_seconds: BTreeMap<(String, String), f64>,
+	// The fallback for a pair nothing was measured for.
 	pub default_variable: f64,
 }
 
 impl Default for CostModel {
 	fn default() -> Self {
+		// MEASURED, 2026-08-12, nine runs: 2 tests, 20 tests and the whole suite on each target,
+		// with `fixed` and `per-test` taken from the least-squares line through the three points.
+		//
+		//   x86_64    23 s /  26 s /  131 s (240 tests) -> fixed  19.5 s, per-test 0.46 s
+		//   aarch64  695 s / 723 s / 2256 s (226 tests) -> fixed 632.3 s, per-test 7.17 s
+		//   riscv64  537 s / 587 s / 2600 s (226 tests) -> fixed 460.6 s, per-test 9.44 s
+		//
+		// Every one of the old numbers was a whole-suite time sitting in a field that means STARTUP
+		// cost, and the milestone's own arithmetic is why that mattered: the planner widens a
+		// selection to the whole set when `scoped / whole > 0.9`, and with a fixed term that large
+		// the ratio was 0.953 on aarch64 and 0.966 on riscv64 for a selection of ONE test. Every
+		// scoped selection on the two targets where scoping is worth most therefore ran everything.
+		// With these, the same one-test ratio is 0.284 and 0.181.
+		//
+		// The other half was hidden by the same mistake: one global 0.5 s per test. An emulated test
+		// costs fifteen to twenty times a native one, so the model priced the thing that actually
+		// differs between targets as if it did not differ at all.
+		//
+		// The three points per target are NOT collinear, and the residuals say why rather than
+		// hiding it: the twenty-test sample overshoots its fit by 53 s on aarch64 and 63 s on
+		// riscv64 because a stride sample of twenty happens to miss the handful of tests that
+		// dominate the suite. `per-test` is therefore an average over the whole suite and not a
+		// prediction for any one test, which is exactly what an estimator summing over a selection
+		// needs - and what `record_step` refines per key from real runs.
 		let mut fixed = BTreeMap::new();
-		// aarch64 measured 2300 s for 216 tests on 2026-08-10, so 1450 is now well under it. riscv64
-		// declared 217 tests and completed 82 in its 2700 s budget that same day - one of them alone
-		// took 707 s - and that run competed with concurrent builds, so its extrapolation is a
-		// pessimistic bound rather than a clean figure. 3200 is the clean-rate projection from the
-		// 2026-08-06 measurement (150 tests in 2161 s) carried to today's count; the gate in
-		// `self_check` compares it against the harness budget so neither can drift alone again.
-		for (architecture, environment, seconds) in [("x86_64", "test-guest", 100.0), ("aarch64", "test-guest", 2300.0), ("riscv64", "test-guest", 3200.0), ("x86_64", "dev-guest", 120.0), ("host", "host", 0.0)] {
+		for (architecture, environment, seconds) in [("x86_64", "test-guest", 19.5), ("aarch64", "test-guest", 632.0), ("riscv64", "test-guest", 461.0), ("x86_64", "dev-guest", 120.0), ("host", "host", 0.0)] {
 			fixed.insert((architecture.to_string(), environment.to_string()), seconds);
 		}
-		CostModel { fixed_seconds: fixed, default_variable: 0.5 }
+		let mut variable = BTreeMap::new();
+		for (architecture, environment, seconds) in [("x86_64", "test-guest", 0.46), ("aarch64", "test-guest", 7.17), ("riscv64", "test-guest", 9.44)] {
+			variable.insert((architecture.to_string(), environment.to_string()), seconds);
+		}
+		CostModel { fixed_seconds: fixed, variable_seconds: variable, default_variable: 0.5 }
 	}
 }
 
 impl CostModel {
+	// What a WHOLE suite of `tests` costs on one target: the startup cost once, plus the per-test
+	// cost for each.
+	//
+	// The budget gate used to read `fixed_seconds` alone and call it the suite's cost, which was
+	// true only while the fixed term WAS a whole-suite figure. Now that it means what it says, the
+	// gate has to add the tests back or it compares a fifteen-minute budget against a ten-minute
+	// boot and concludes the suite fits.
+	pub fn full_suite_seconds(&self, architecture: &str, environment: &str, tests: usize) -> f64 {
+		let pair = (architecture.to_string(), environment.to_string());
+		let fixed = self.fixed_seconds.get(&pair).copied().unwrap_or(0.0);
+		let variable = self.variable_seconds.get(&pair).copied().unwrap_or(self.default_variable);
+		fixed + variable * tests as f64
+	}
+
 	// `cost(architecture, environment, selection) = fixed(architecture, environment) + sum(items)`.
 	//
 	// The fixed term is charged ONCE per (architecture, environment) pair that appears, which is the
@@ -216,7 +257,8 @@ impl CostModel {
 			pairs.insert((key.architecture.clone(), key.environment.as_str().to_string()));
 			variable += match history.get(&key.display()) {
 				Some(record) if record.last_seconds > 0.0 => record.last_seconds,
-				_ => self.default_variable,
+				// The measured per-test cost for THIS target, not one number for all of them.
+				_ => self.variable_seconds.get(&(key.architecture.clone(), key.environment.as_str().to_string())).copied().unwrap_or(self.default_variable),
 			};
 		}
 		let fixed: f64 = pairs.iter().map(|pair| self.fixed_seconds.get(pair).copied().unwrap_or(0.0)).sum();
