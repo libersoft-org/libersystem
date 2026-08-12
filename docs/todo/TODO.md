@@ -154,7 +154,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0087 - riscv64 (RISC-V) kernel + loader port](P02M0087.md)
 - [x] [P02M0088 - Multi-arch track follow-ups (the P02M0085-P02M0087 loose ends)](P02M0088.md)
 - [x] [P02M0089 - Pre-phase-3 hardening (finish before the server platform)](P02M0089.md)
-- [x] [P02M0090 - LSIDL package imports, modular generation, and language hardening](P02M0090.md)
+- [ ] [P02M0090 - LSIDL package imports, modular generation, and language hardening](P02M0090.md)
 - [x] [P02M0091 - Application graphics, raw input, and PCM audio (the app-platform layer)](P02M0091.md)
 - [x] [P02M0092 - Image viewer (the first graphical application)](P02M0092.md)
 - [x] [P02M0093 - Shared system libraries (dynamic linking)](P02M0093.md)
