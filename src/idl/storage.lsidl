@@ -163,6 +163,33 @@ interface volume {
 	/// said both ceilings answered `again`, which flattened a distinction the implementation
 	/// makes on purpose.
 	@op(16) write-stream:    func(path: string, data: handle<channel>) -> result<unit, error>;
+	/// ONE FILE'S FACTS, without listing the directory that holds it.
+	///
+	/// Every caller that wanted a file's size or type had to `list` its parent and search - which
+	/// reads a whole directory to answer a question about one entry, and cannot answer it at all for
+	/// a path whose parent it may not list. The `name` in the reply is the final component of the
+	/// path asked about, so a caller that already knows it can ignore it and one that resolved a
+	/// path can check it.
+	@op(17) stat:            func(path: string) -> result<file-info, error>;
+	/// ATOMIC WITHIN ONE VOLUME, and only there.
+	///
+	/// The directory entry moves; the file's contents are never copied, so nothing can observe a
+	/// half-moved file. A backend that cannot do it atomically answers `invalid` rather than doing
+	/// it in two steps behind the caller's back - a cross-volume move is copy, verify, publish,
+	/// delete, and it belongs to the client that can report each stage.
+	///
+	/// `to` is refused when it exists: replacing a file is a decision the caller makes explicitly
+	/// with `remove` first, because a rename that silently destroys is a rename nobody can undo.
+	@op(18) rename:          func(from: string, to: string) -> result<unit, error>;
+	/// Set a file's length - shorter drops the tail, longer zero-extends.
+	///
+	/// The zero-extension is a PROMISE about the bytes: a file grown this way reads as zeros, not
+	/// as whatever the blocks last held. A backend that cannot promise that answers `invalid`.
+	@op(19) truncate:        func(path: string, length: u64) -> result<unit, error>;
+	/// Update a file's modification time to now, and create it empty when `create` is set and it is
+	/// not there. `create` false over a missing file is `not-found` rather than a silent creation -
+	/// the two callers want different things and a flag is how they say which.
+	@op(20) touch:           func(path: string, create: bool) -> result<unit, error>;
 }
 
 /// Privileged StorageService boundary that mints a client restricted to one directory

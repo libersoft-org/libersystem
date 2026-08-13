@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 16] = [
+const GATES: [(&str, &str); 18] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -123,6 +123,16 @@ const GATES: [(&str, &str); 16] = [
 	// `verify-model check` reported a gate nothing would ever select - which is the same class of
 	// drift the two lists exist to catch, caught by them.
 	("single-cap-receive", "harness.tools"),
+	// P02M0133's gate: an infallible allocation on a kernel path ring 3 can drive. Its subject is
+	// the kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
+	// It arrived in `check.sh` before it arrived here, and `verify-model check` said so on the next
+	// run, which is the drift these two lists exist to catch.
+	("kernel-allocations", "kernel"),
+	// P02M0127's gate: the `--artifact` fast path must know a library's dependency closure, or it
+	// reports an artifact current after a crate it compiles against changed - which makes every test
+	// result taken on that artifact meaningless. Registered in `check.sh` on 2026-08-12 and not
+	// here, so `verify-model check` had been reporting it as unselectable ever since.
+	("targeted-cache", "harness.tools"),
 ];
 
 // check.sh's gate names, read from the script. Parsing a shell array is crude and correct here:
@@ -152,6 +162,27 @@ pub fn gates_declared_in_check_sh(repo_root: &std::path::Path) -> Result<BTreeSe
 // that never enters an image is judged on the host. Asking a universe that cannot reach a component
 // for evidence about it produces a certificate that can never be earned, and not asking one that
 // can produces a certificate that means less than it says.
+// Every universe that judges ANY component, which is what the model self-check asks against the
+// producers: a universe nothing can answer for makes every component it judges permanently
+// untrustable.
+pub fn all_judging_universes(catalog: &Catalog) -> BTreeSet<crate::shadow::Universe> {
+	let mut seen: BTreeSet<crate::shadow::Universe> = BTreeSet::new();
+	for check in &catalog.checks {
+		if check.covers.is_empty() {
+			continue;
+		}
+		for variant in &check.variants {
+			seen.insert(match variant.environment {
+				Environment::Host if check.kind == CheckKind::Build => crate::shadow::Universe::HostBuild,
+				Environment::Host => crate::shadow::Universe::Host,
+				Environment::TestGuest => crate::shadow::Universe::TestGuest,
+				Environment::DevGuest => crate::shadow::Universe::DevGuest,
+			});
+		}
+	}
+	seen
+}
+
 pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shadow::Universe> {
 	let mut seen: BTreeSet<crate::shadow::Universe> = BTreeSet::new();
 	for check in &catalog.checks {

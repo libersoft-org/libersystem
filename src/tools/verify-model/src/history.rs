@@ -92,7 +92,9 @@ impl History {
 		// A NEGATIVE RESIDUAL IS A MEASUREMENT, and clamping it to zero is what stopped this history
 		// from ever contradicting the constant above it.
 		//
-		// The aarch64 suite measured 2069 s against a fixed term of 2300. The residual was negative,
+		// The aarch64 suite measured 2069 s against the fixed term OF THE TIME, 2300 - a figure the
+		// nine-run calibration has since replaced, kept here because it is what the defect below
+		// happened to. The residual was negative,
 		// `.max(0.0)` made it zero, every key recorded zero seconds, and `estimate` then ignored the
 		// record because it requires `last_seconds > 0.0` and fell back to the 0.5 s default. So the
 		// two targets whose costs actually decide whether a selection stays scoped were the two the
@@ -174,14 +176,19 @@ pub fn now() -> u64 {
 
 // What a selection is expected to cost, as fixed plus variable.
 //
-// A plain sum of test durations is badly wrong here. Measured on this tree: the fixed term is ~100 s
-// on x86_64 and ~1450 s on aarch64, against ~0.2 s and ~7 s per test - so a selection that is 90%
-// smaller is a run that is 15% cheaper. Escalating on a COUNT would conclude that scoping the x86_64
-// suite is worth the bookkeeping, and it is not; what is worth it is removing a boot.
+// A plain sum of test durations is badly wrong here, and the reason survives every revision of the
+// numbers: a run has a fixed cost - a build, a boot - that a smaller selection does not reduce. So a
+// selection that is 90% smaller can be a run that is barely cheaper, and escalating on a COUNT would
+// conclude that scoping is worth the bookkeeping when what is worth it is removing a boot.
 //
-// These are the starting constants, measured under load 115. Every recorded run refines the variable
-// term; the fixed term is what is left when the variable one is subtracted, and it is deliberately
-// not learned from a single sample.
+// THE NUMBERS ARE IN `Default`, MEASURED. They are not repeated here, and that is the point: an
+// earlier version of this comment carried "~100 s on x86_64 and ~1450 s on aarch64, against ~0.2 s
+// and ~7 s per test" - true before the nine-run calibration and contradicting the constants twenty
+// lines below it afterwards. A careful reader of the milestone came away with a wrong conclusion
+// about the state of the work, and the only thing that misled them was this comment.
+//
+// Every recorded run refines the variable term; the fixed term is what is left when the variable one
+// is subtracted, and it is deliberately not learned from a single sample.
 pub struct CostModel {
 	pub fixed_seconds: BTreeMap<(String, String), f64>,
 	// PER TARGET, because the per-test cost is not a property of a test - it is a property of how

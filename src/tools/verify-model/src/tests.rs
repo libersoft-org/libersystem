@@ -672,14 +672,32 @@ fn every_comparison_on_record_being_dry_is_not_evidence_that_running_the_selecti
 	log.records.push(record("x86_64", true));
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok(), "one sample is the requirement");
 
-	// The Host universe has no execution producer, so requiring what nothing can supply would make
-	// it permanently untrustable rather than honestly graded. It is exempt, in one place, until it
-	// has one.
+	// THE HOST UNIVERSE ASKS FOR ONE TOO, since 2026-08-13. It was exempt while nothing could run a
+	// host selection separately from the sweep - requiring what nothing can supply makes a universe
+	// permanently untrustable rather than honestly graded - and `verify.sh` runs one now, so the
+	// exemption is gone.
+	//
+	// It is also the exemption that hid a real defect for a round: the dev producer, one universe
+	// over and exempt for the same reason, emitted a command bash could not parse. A selection
+	// computed correctly and impossible to execute is invisible to every dry comparison.
 	let mut host = crate::shadow::Log { schema: 1, records: Vec::new() };
+	let host_record = |exec: bool| crate::shadow::Record { universe: crate::shadow::Universe::Host, architecture: String::from("host"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true };
 	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
-		host.records.push(crate::shadow::Record { universe: crate::shadow::Universe::Host, architecture: String::from("host"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: true });
+		host.records.push(host_record(false));
 	}
-	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &host).is_ok());
+	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &host).expect_err("dry host comparisons answer the other question too");
+	assert!(error.contains("EXECUTED"), "{error}");
+	host.records.push(host_record(true));
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &host).is_ok(), "one sample is the requirement here as well");
+
+	// `HostBuild` stays exempt, and for a reason rather than by omission: executing a build
+	// selection means building those parts, and the sweep builds every part anyway - so the sample
+	// would be a second full build of evidence the sweep has already taken.
+	let mut builds = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for architecture in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"] {
+		builds.records.push(crate::shadow::Record { universe: crate::shadow::Universe::HostBuild, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: true });
+	}
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::HostBuild, &builds).is_ok(), "a build universe grants on dry comparisons, by decision");
 }
 
 #[test]
@@ -864,7 +882,7 @@ fn an_unparseable_record_is_an_error_rather_than_a_shrug() {
 // it runs rather than by a fixed prefix - a prefix match silently returned nothing the moment the
 // exact-selection form appeared, and the assertion below then compared two empty sets by accident.
 fn guest_targets(plan: &crate::plan::Plan, per_target: &std::collections::BTreeMap<String, usize>) -> BTreeSet<String> {
-	crate::commands::steps(plan, per_target).iter().filter(|step| step.command.contains("./test.sh --arch ")).filter_map(|step| step.command.rsplit(" --arch ").next().map(str::to_string)).collect()
+	crate::commands::steps(plan, per_target, &model().registry).iter().filter(|step| step.command.contains("./test.sh --arch ")).filter_map(|step| step.command.rsplit(" --arch ").next().map(str::to_string)).collect()
 }
 
 #[test]
@@ -879,7 +897,7 @@ fn every_booted_architecture_gets_exactly_one_guest_step() {
 	for paths in [vec!["src/user/libs/audio/flac/src/lib.rs"], vec!["src/kernel/arch/riscv64/traps/mod.rs"], vec!["src/boot/qemu-run.sh"]] {
 		let plan = plan_for(&model, &paths);
 		let booted: BTreeSet<String> = plan.architectures_booted.iter().cloned().collect();
-		let steps = crate::commands::steps(&plan, &per_target);
+		let steps = crate::commands::steps(&plan, &per_target, &model.registry);
 		let guest: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.command.contains("./test.sh --arch ")).collect();
 		assert_eq!(guest_targets(&plan, &per_target), booted, "{paths:?}: the plan says it boots {booted:?} and the run would boot something else");
 		assert_eq!(guest.len(), booted.len(), "{paths:?}: one guest step per booted target, no more");
@@ -1202,8 +1220,105 @@ fn a_check_id_says_which_universe_judges_it() {
 	// certificate for a universe that also contained builds meant a selector defect dropping
 	// `build.user` could not be observed, and five clean runs later the component was TRUSTED for it
 	// anyway. A universe's certificate may not be broader than the evidence behind it.
-	assert_eq!(Universe::of("build.kernel"), Universe::HostBuild, "a build is judged by evidence about builds, of which there is none yet");
+	assert_eq!(Universe::of("build.kernel"), Universe::HostBuild, "a build is judged by evidence about builds");
 	assert_eq!(Universe::of("build.user"), Universe::HostBuild);
+}
+
+#[test]
+fn every_check_kind_and_configuration_lowers_to_a_runnable_command() {
+	// FOUR CONFIGURATIONS AND SIX CHECK KINDS is a small table, and it is exactly the table that
+	// would have caught the defect it exists for.
+	//
+	// The lowering took a configuration's NAME and treated anything that was not `"default"` as a
+	// Cargo feature list. That is right for exactly one of the four: `shared-image` really does want
+	// `--no-default-features --features shared-image`, `default` is right by luck, and `test` and
+	// `development` both declare `default_features = true` and no features - so both halves of what
+	// it emitted contradicted the record.
+	//
+	// And it was not a wrong flag. A dev check's command is a shell pipeline, so the producer emitted
+	// `(cd src && boot/dev-selftest.py) --no-default-features --features development`, which bash
+	// refuses to parse. Every dev-guest shadow line failed before it started.
+	use crate::catalog::CheckKind;
+	let model = model();
+	let configuration = |name: &str| model.registry.configuration(name).unwrap_or_else(|| panic!("the registry defines '{name}'")).clone();
+
+	// A HOST SUITE is the only kind a feature selection means anything to.
+	let cargo = "cargo test --manifest-path src/term/Cargo.toml";
+	assert_eq!(crate::commands::lower(CheckKind::HostSuite, cargo, &configuration("default")), cargo, "the crate's own manifest is spelled by saying nothing");
+	assert_eq!(crate::commands::lower(CheckKind::HostSuite, cargo, &configuration("shared-image")), format!("{cargo} --no-default-features --features shared-image"), "the shipping configuration turns default features off and names its own");
+	// The two the name-matching version got wrong: both declare `default_features = true` and no
+	// features, so both must lower to the bare command.
+	for name in ["test", "development"] {
+		assert_eq!(crate::commands::lower(CheckKind::HostSuite, cargo, &configuration(name)), cargo, "'{name}' declares default features and no features of its own");
+	}
+
+	// EVERY OTHER KIND carries its own command and means it, in every configuration.
+	let pipeline = "(cd src && boot/dev-selftest.py)";
+	for kind in [CheckKind::Gate, CheckKind::Conformance, CheckKind::Build, CheckKind::DevCheck, CheckKind::KernelTest] {
+		for name in ["default", "shared-image", "test", "development"] {
+			let lowered = crate::commands::lower(kind.clone(), pipeline, &configuration(name));
+			assert_eq!(lowered, pipeline, "{kind:?} in '{name}' must be the command the runner runs");
+			// The specific breakage, asserted by shape rather than by equality: appending cargo
+			// flags to a shell pipeline produces something bash cannot parse.
+			assert!(!lowered.contains("--features"), "{kind:?} in '{name}' must not have cargo flags appended to it");
+		}
+	}
+}
+
+#[test]
+fn every_universe_that_judges_anything_has_an_evidence_producer() {
+	// A UNIVERSE WITH NO PRODUCER IS A WALL, NOT A BAR. `trusted_everywhere` requires `Trusted` in
+	// every judging universe, so a universe nothing can answer for makes every component it judges
+	// permanently untrustable however much evidence they accumulate elsewhere.
+	//
+	// That was `HostBuild`'s state from the split that created it until the `build-checks` producer:
+	// `build.libs`, `build.user`, `build.kernel` and the rest cover every crate and every program
+	// under their prefix, so 189 of the catalog's 192 components were judged by it - 98% of the tree,
+	// unable to reach a steady state this milestone's whole thesis rests on.
+	//
+	// The assertion is not "HostBuild has one": it is that NONE is missing, so the next universe
+	// added without a producer fails here rather than after five clean runs.
+	let model = model();
+	let producers = crate::shadow::universes_with_producers();
+	let walled: Vec<&'static str> = crate::catalog::all_judging_universes(&model.catalog).into_iter().filter(|universe| !producers.contains(universe)).map(|universe| universe.as_str()).collect();
+	assert!(walled.is_empty(), "these universes judge components and nothing can answer for them: {walled:?}");
+
+	// And the number that made it worth measuring: a component covered by a build check is judged by
+	// `HostBuild`, and there are many of them.
+	let judged: usize = model.crates.iter().filter(|entry| crate::catalog::judging_universes(&model.catalog, &entry.name).contains(&crate::shadow::Universe::HostBuild)).count();
+	assert!(judged > 0, "build checks cover components, so something is judged by HostBuild");
+}
+
+#[test]
+fn a_build_covered_component_can_reach_trusted() {
+	// The other half of the wall: with a producer in place, the evidence a full sweep already
+	// produces can carry a component all the way. `HostBuild` needs two architectures, for the same
+	// reason the guest suite does - a build of x86_64 says nothing about aarch64.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	let record = |architecture: &str| crate::shadow::Record {
+		universe: crate::shadow::Universe::HostBuild,
+		architecture: architecture.to_string(),
+		verdict: String::from("Consistent"),
+		reason: String::new(),
+		model_hash: String::from("hash-a"),
+		source_digest: String::new(),
+		changed_components: vec![String::from("term")],
+		outside_failures: Vec::new(),
+		at: 0,
+		change_kinds: Vec::new(),
+		edge_kinds: Vec::new(),
+		// Builds have no execution sample to take - `exec_universes` says which universes do - so
+		// this is false and must not be what stands in the way.
+		shadow_exec: false,
+		model_self_check: true,
+	};
+	for architecture in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"] {
+		log.records.push(record(architecture));
+	}
+	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	let (clean, architectures) = store.evaluate("term", "hash-a", crate::shadow::Universe::HostBuild, &log).expect("six clean build comparisons over two architectures");
+	store.grant("term", "hash-a", crate::shadow::Universe::HostBuild, clean, architectures, 0);
+	assert_eq!(store.level("term", "hash-a", crate::shadow::Universe::HostBuild), crate::trust::Level::Trusted, "a build-covered component can now arrive");
 }
 
 #[test]

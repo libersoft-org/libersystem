@@ -211,6 +211,82 @@ fn a_schema_may_now_ask_for_more_than_one_handle() {
 }
 
 #[test]
+fn the_documented_opcode_range_is_the_one_the_validator_enforces() {
+	// `docs/LSIDL.md` gave the range as `1..=65531` with `0xfffc..=0xffff` reserved, and `65531` IS
+	// `PROTOCOL_INFO_OP`. A schema author following the specification would have been refused by a
+	// validator reading `TYPED_OP_MAX`, with a diagnostic contradicting the document they had just
+	// read - the specification handing out an opcode that collides.
+	//
+	// So the document's number is checked against the constant rather than trusted. This is the
+	// cheap half of "make the range a generated fact": the fact stays written, and a test refuses to
+	// let it drift.
+	let doc = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/LSIDL.md")).expect("the specification is beside the generator");
+	let stated = format!("`1..=abi::TYPED_OP_MAX`, which is `1..={}` (`{:#06x}`)", abi::TYPED_OP_MAX, abi::TYPED_OP_MAX);
+	assert!(doc.contains(&stated), "the specification must state the constant's value: expected {stated:?}");
+	// And every reserved opcode by name, so a reader does not have to remember a range.
+	for (name, value) in [
+		("PROTOCOL_INFO_OP", abi::PROTOCOL_INFO_OP),
+		("GOODBYE_OP", abi::GOODBYE_OP),
+		("RESOLVE_OP", abi::RESOLVE_OP),
+		("HEARTBEAT_OP", abi::HEARTBEAT_OP),
+		("CONNECT_OP", abi::CONNECT_OP),
+	] {
+		assert!(doc.contains(&format!("`{name}` (`{value:#06x}`")), "the specification must name {name} and its value {value:#06x}");
+	}
+
+	// The validator's own boundary, so the two are pinned to each other rather than each to a
+	// number: the largest legal opcode is accepted and the first reserved one is refused.
+	let legal = format!("resource r; interface i {{ @op({}) m: func() -> unit; }}", abi::TYPED_OP_MAX);
+	assert!(errors(&wrap(&legal)).is_empty(), "the largest documented opcode is legal: {:?}", errors(&wrap(&legal)));
+	let reserved = format!("resource r; interface i {{ @op({}) m: func() -> unit; }}", abi::PROTOCOL_INFO_OP);
+	assert_err_contains(&wrap(&reserved), &format!("must be in 1..={}", abi::TYPED_OP_MAX));
+}
+
+#[test]
+fn the_fixed_buffer_encode_refuses_to_drop_a_capability() {
+	// `encode_vec` was corrected for this and `encode` was not, so the pair the generator advertises
+	// as a round trip had one half that still lost the live part of a value: `encode` returns a
+	// LENGTH, so a capability recorded during `write` stayed in a writer the caller drops, and
+	// `OpenResult { file: 123, .. }.encode(&mut buf)` answered `Some(n)` with the handle gone.
+	let file = parse_only("package liber:enc@1; resource file; record held { file: handle<file>, size: u64 } record plain { size: u64 } interface i { @op(1) m: func() -> held; }");
+	assert!(validate::validate(&file).is_empty());
+	let rust = crate::codegen::rust(&file, "enc.lsidl", &std::collections::HashMap::new()).unwrap();
+	assert!(rust.contains("// A capability recorded here would be dropped by returning the length alone."), "the fixed-buffer encode refuses too: {rust}");
+	assert!(rust.contains("if w.has_handle() { return None; }"), "and refuses by asking the writer");
+	// Both halves of the pair, so neither can be corrected alone again.
+	assert!(rust.contains("if !w.handles().is_empty() { return None; }"), "encode_vec still refuses");
+	assert!(rust.contains("pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)>"), "and the shape that carries both halves is still generated");
+}
+
+#[test]
+fn the_validator_counts_capabilities_and_names_the_limit() {
+	// `Many` COULD NOT TELL FOUR FROM FIVE. It meant "more than one", so a five-capability record
+	// validated and the writer - which refuses past `MAX_HANDLES` - answered `None` on the fifth: a
+	// schema expressing what the wire cannot carry, which is this milestone's own defect at the other
+	// end of the same road. The cardinality is a NUMBER now, so the refusal can print both sides.
+	let four = "resource chan; record quad { a: handle<chan>, b: handle<chan>, c: handle<chan>, d: handle<chan> } interface i { @op(1) m: func() -> quad; }";
+	assert!(errors(&wrap(four)).is_empty(), "four is what a message carries: {:?}", errors(&wrap(four)));
+
+	let five = "resource chan; record quint { a: handle<chan>, b: handle<chan>, c: handle<chan>, d: handle<chan>, e: handle<chan> } interface i { @op(1) m: func() -> quint; }";
+	assert_err_contains(&wrap(five), "carries 5 capabilities and a message carries at most 4");
+
+	// COMPOSED, not just declared side by side: two records of two are four, and three are six. The
+	// count has to add up through nesting or it is a check on one shape rather than on the message.
+	let pair = "resource chan; record pair { a: handle<chan>, b: handle<chan> }";
+	assert!(errors(&wrap(&format!("{pair} record two {{ x: pair, y: pair }} interface i {{ @op(1) m: func() -> two; }}"))).is_empty(), "two pairs are four");
+	assert_err_contains(&wrap(&format!("{pair} record three {{ x: pair, y: pair, z: pair }} interface i {{ @op(1) m: func() -> three; }}")), "carries 6 capabilities");
+
+	// A RESULT'S ARMS ARE ALTERNATIVES, so the worst case is what has to fit rather than the sum.
+	// Summing them would refuse a shape the wire carries fine.
+	let arms = format!("{pair} record other {{ c: handle<chan>, d: handle<chan> }} interface i {{ @op(1) m: func() -> result<pair, other>; }}");
+	assert!(errors(&wrap(&arms)).is_empty(), "one arm arrives, not both: {:?}", errors(&wrap(&arms)));
+
+	// And the REQUEST is counted the same way as the reply - a method's parameters are side by side
+	// in one message.
+	assert_err_contains(&wrap("resource chan; interface i { @op(1) m: func(a: handle<chan>, b: handle<chan>, c: handle<chan>, d: handle<chan>, e: handle<chan>) -> unit; }"), "carries 5 capabilities and a message carries at most 4");
+}
+
+#[test]
 fn a_list_of_handle_bearing_values_is_a_shape_and_not_a_refusal() {
 	// The `Many` case reached through a list, which is the one the old refusal was really about: a
 	// `list<item>` where `item` carries a handle has a count the schema cannot know. It is accepted

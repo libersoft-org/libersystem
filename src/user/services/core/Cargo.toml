@@ -113,6 +113,10 @@ name = "resource_probe"
 path = "src/resource_probe.rs"
 
 [[bin]]
+name = "holdopen"
+path = "src/holdopen.rs"
+
+[[bin]]
 name = "wasi_host"
 path = "src/wasi_host.rs"
 

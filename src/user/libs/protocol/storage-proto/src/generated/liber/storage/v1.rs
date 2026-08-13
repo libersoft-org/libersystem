@@ -22,6 +22,10 @@ impl OpenOpts {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -78,6 +82,10 @@ impl OpenResult {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -136,6 +144,10 @@ impl FileType {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -194,6 +206,10 @@ impl FileInfo {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -253,6 +269,10 @@ impl SnapshotInfo {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -314,6 +334,10 @@ impl VolumeStatus {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -375,6 +399,10 @@ impl FsckReport {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -483,6 +511,10 @@ pub mod volume {
 	pub const OP_FSCK: u16 = 14;
 	pub const OP_RESTORE: u16 = 15;
 	pub const OP_WRITE_STREAM: u16 = 16;
+	pub const OP_STAT: u16 = 17;
+	pub const OP_RENAME: u16 = 18;
+	pub const OP_TRUNCATE: u16 = 19;
+	pub const OP_TOUCH: u16 = 20;
 
 	pub trait Service {
 		fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error>;
@@ -545,6 +577,33 @@ pub mod volume {
 		/// said both ceilings answered `again`, which flattened a distinction the implementation
 		/// makes on purpose.
 		fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error>;
+		/// ONE FILE'S FACTS, without listing the directory that holds it.
+		///
+		/// Every caller that wanted a file's size or type had to `list` its parent and search - which
+		/// reads a whole directory to answer a question about one entry, and cannot answer it at all for
+		/// a path whose parent it may not list. The `name` in the reply is the final component of the
+		/// path asked about, so a caller that already knows it can ignore it and one that resolved a
+		/// path can check it.
+		fn stat(&mut self, path: String) -> Result<FileInfo, Error>;
+		/// ATOMIC WITHIN ONE VOLUME, and only there.
+		///
+		/// The directory entry moves; the file's contents are never copied, so nothing can observe a
+		/// half-moved file. A backend that cannot do it atomically answers `invalid` rather than doing
+		/// it in two steps behind the caller's back - a cross-volume move is copy, verify, publish,
+		/// delete, and it belongs to the client that can report each stage.
+		///
+		/// `to` is refused when it exists: replacing a file is a decision the caller makes explicitly
+		/// with `remove` first, because a rename that silently destroys is a rename nobody can undo.
+		fn rename(&mut self, from: String, to: String) -> Result<(), Error>;
+		/// Set a file's length - shorter drops the tail, longer zero-extends.
+		///
+		/// The zero-extension is a PROMISE about the bytes: a file grown this way reads as zeros, not
+		/// as whatever the blocks last held. A backend that cannot promise that answers `invalid`.
+		fn truncate(&mut self, path: String, length: u64) -> Result<(), Error>;
+		/// Update a file's modification time to now, and create it empty when `create` is set and it is
+		/// not there. `create` false over a missing file is `not-found` rather than a silent creation -
+		/// the two callers want different things and a flag is how they say which.
+		fn touch(&mut self, path: String, create: bool) -> Result<(), Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1124,6 +1183,154 @@ pub mod volume {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_STAT => {
+				let path = r.string_lp()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.stat(path);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v34) => {
+							w.u8(1)?;
+							v34.write(w)?;
+						}
+						Err(v35) => {
+							w.u8(0)?;
+							v35.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_RENAME => {
+				let from = r.string_lp()?;
+				let to = r.string_lp()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.rename(from, to);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v36) => {
+							w.u8(1)?;
+						}
+						Err(v37) => {
+							w.u8(0)?;
+							v37.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_TRUNCATE => {
+				let path = r.string_lp()?;
+				let length = r.u64()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.truncate(path, length);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v38) => {
+							w.u8(1)?;
+						}
+						Err(v39) => {
+							w.u8(0)?;
+							v39.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_TOUCH => {
+				let path = r.string_lp()?;
+				let create = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.touch(path, create);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v40) => {
+							w.u8(1)?;
+						}
+						Err(v41) => {
+							w.u8(0)?;
+							v41.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -1390,13 +1597,13 @@ pub mod volume {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v34 = r.u16()? as usize;
-						let mut v35 = Vec::new();
-						v35.try_reserve_exact(v34).ok()?;
-						for _ in 0..v34 {
-							v35.push(SnapshotInfo::read(r)?);
+						let v42 = r.u16()? as usize;
+						let mut v43 = Vec::new();
+						v43.try_reserve_exact(v42).ok()?;
+						for _ in 0..v42 {
+							v43.push(SnapshotInfo::read(r)?);
 						}
-						v35
+						v43
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1681,6 +1888,117 @@ pub mod volume {
 			}
 			decoded
 		}
+		pub fn stat(&mut self, path: &str) -> Option<Result<FileInfo, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_STAT)?;
+			w.u32(corr)?;
+			w.bytes_lp(path.as_bytes())?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(FileInfo::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn rename(&mut self, from: &str, to: &str) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RENAME)?;
+			w.u32(corr)?;
+			w.bytes_lp(from.as_bytes())?;
+			w.bytes_lp(to.as_bytes())?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn truncate(&mut self, path: &str, length: &u64) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_TRUNCATE)?;
+			w.u32(corr)?;
+			w.bytes_lp(path.as_bytes())?;
+			w.u64(*length)?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn touch(&mut self, path: &str, create: &bool) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_TOUCH)?;
+			w.u32(corr)?;
+			w.bytes_lp(path.as_bytes())?;
+			w.boolean(*create)?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1810,6 +2128,38 @@ pub mod volume {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.write_stream(path, data)
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_stat")]
+	fn channel_invoke_stat(chan: u64, path: &str) -> Option<Result<FileInfo, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.stat(path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_rename")]
+	fn channel_invoke_rename(chan: u64, from: &str, to: &str) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.rename(from, to)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_truncate")]
+	fn channel_invoke_truncate(chan: u64, path: &str, length: &u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.truncate(path, length)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_touch")]
+	fn channel_invoke_touch(chan: u64, path: &str, create: &bool) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.touch(path, create)
+	}
 }
 
 /// Privileged StorageService boundary that mints a client restricted to one directory
@@ -1854,14 +2204,14 @@ pub mod volume_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v36) => {
+						Ok(v44) => {
 							w.u8(1)?;
-							w.set_handle(*v36)?;
+							w.set_handle(*v44)?;
 							w.u32(0)?;
 						}
-						Err(v37) => {
+						Err(v45) => {
 							w.u8(0)?;
-							v37.write(w)?;
+							v45.write(w)?;
 						}
 					}
 					Some(())
@@ -2346,13 +2696,13 @@ impl FsckReport {
 		out.push(',');
 		out.push_str("\"damaged\":");
 		out.push('[');
-		let mut v39 = true;
-		for v38 in self.damaged.iter() {
-			if !v39 {
+		let mut v47 = true;
+		for v46 in self.damaged.iter() {
+			if !v47 {
 				out.push(',');
 			}
-			v39 = false;
-			crate::codec::json_escape(v38, out);
+			v47 = false;
+			crate::codec::json_escape(v46, out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2364,13 +2714,13 @@ impl FsckReport {
 		out.push_str(", ");
 		out.push_str("damaged=");
 		out.push('[');
-		let mut v41 = true;
-		for v40 in self.damaged.iter() {
-			if !v41 {
+		let mut v49 = true;
+		for v48 in self.damaged.iter() {
+			if !v49 {
 				out.push_str(", ");
 			}
-			v41 = false;
-			out.push_str(v40);
+			v49 = false;
+			out.push_str(v48);
 		}
 		out.push(']');
 		out.push('}');
@@ -2381,8 +2731,8 @@ impl FsckReport {
 		crate::codec::cbor::uint(out, self.checksum_failures as u64);
 		crate::codec::cbor::text(out, "damaged");
 		crate::codec::cbor::array(out, self.damaged.len());
-		for v42 in self.damaged.iter() {
-			crate::codec::cbor::text(out, v42);
+		for v50 in self.damaged.iter() {
+			crate::codec::cbor::text(out, v50);
 		}
 	}
 }

@@ -149,7 +149,27 @@ pub enum Universe {
 	DevGuest,
 }
 
+// The universes that have a shadow evidence producer.
+//
+// ONE PLACE, so the model can ask - a universe with no producer is a wall rather than a bar, because
+// `trusted_everywhere` requires every JUDGING universe to answer and nothing can answer for it.
+// `HostBuild` was in exactly that state between the split that created it and the `build-checks`
+// producer, and 189 of the catalog's 192 components are judged by it.
+pub fn universes_with_producers() -> std::collections::BTreeSet<Universe> {
+	[Universe::Host, Universe::HostBuild, Universe::DevGuest, Universe::TestGuest].into_iter().collect()
+}
+
 impl Universe {
+	// The serialized name, which is also what a diagnostic prints.
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			Universe::Host => "Host",
+			Universe::HostBuild => "HostBuild",
+			Universe::TestGuest => "TestGuest",
+			Universe::DevGuest => "DevGuest",
+		}
+	}
+
 	pub fn of(check: &str) -> Self {
 		if check.starts_with("kernel.") {
 			Universe::TestGuest
@@ -242,6 +262,53 @@ pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &
 //   * AGREEING - every key in S has the same outcome in both runs. A test that passes alone and
 //     fails in the suite (or the reverse) means running S is not running that part of the sweep,
 //     whatever the selector chose.
+// THE SAME EXECUTION SAMPLE FOR THE KEYED UNIVERSES - host checks and dev checks.
+//
+// SHADOW-EXEC was `TestGuest`-only, and the exemption was honest at the time: the host and dev
+// producers had no way to run a SELECTION separately from the sweep, so requiring a sample would have
+// made those universes permanently untrustable rather than honestly graded.
+//
+// It is also the exemption that hid a real defect for a round. The dev producer lowered
+// `(cd src && boot/dev-selftest.py)` through a rule that appends cargo flags to anything not called
+// `default`, and emitted a bash syntax error - a selection computed correctly and impossible to
+// execute, which is precisely what an execution sample detects and exactly the class of defect this
+// mechanism exists for.
+//
+// The three questions are the guest's three: did every selected key RUN, did anything run that was
+// not selected, and did any key disagree between the scoped run and the sweep.
+pub fn compare_exec_keyed(selected: &[PlanItemKey], scoped_run: &KeyedResults, sweep: &KeyedResults, universe: &str, in_universe: impl Fn(&PlanItemKey) -> bool) -> Comparison {
+	let wanted: BTreeSet<&PlanItemKey> = selected.iter().filter(|key| in_universe(key)).collect();
+	let ran: BTreeSet<&PlanItemKey> = scoped_run.outcomes.keys().collect();
+	let mut reasons: Vec<String> = Vec::new();
+	let missing: Vec<String> = wanted.iter().filter(|key| !ran.contains(**key)).map(|key| key.display()).collect();
+	let extra: Vec<String> = ran.iter().filter(|key| !wanted.contains(**key)).map(|key| key.display()).collect();
+	let mut disagreed: Vec<String> = Vec::new();
+	for key in &wanted {
+		match (scoped_run.outcomes.get(*key), sweep.outcomes.get(*key)) {
+			(Some(alone), Some(in_sweep)) if alone != in_sweep => disagreed.push(format!("{} ({alone:?} alone, {in_sweep:?} in the sweep)", key.display())),
+			_ => {}
+		}
+	}
+	// NOTHING TO COMPARE IS NOT AGREEMENT - the same rule the guest sample states.
+	if wanted.is_empty() || scoped_run.outcomes.is_empty() {
+		return Comparison { verdict: Verdict::Void, reason: format!("nothing to execute: the selection names {} {universe} check(s) and the scoped run parsed {} outcome(s)", wanted.len(), scoped_run.outcomes.len()), architecture: universe.to_string(), scoped: wanted.len(), ran: scoped_run.outcomes.len(), outside_failures: Vec::new(), inside_failures: Vec::new(), previously_failed: Vec::new() };
+	}
+	if !missing.is_empty() {
+		reasons.push(format!("{} selected check(s) did not run when the selection was executed: {}", missing.len(), missing.join(", ")));
+	}
+	if !extra.is_empty() {
+		reasons.push(format!("{} check(s) ran that the selection did not name: {}", extra.len(), extra.join(", ")));
+	}
+	if !disagreed.is_empty() {
+		reasons.push(format!("{} check(s) answered differently alone than in the sweep: {}", disagreed.len(), disagreed.join(", ")));
+	}
+	// `SelectionFailed` for the same reason the guest sample uses it: a selection that cannot be
+	// executed is the selector's finding, not the code's.
+	let verdict = if reasons.is_empty() { Verdict::Consistent } else { Verdict::SelectionFailed };
+	let reason = if reasons.is_empty() { format!("every {universe} check the selection named ran, nothing else did, and each agreed with the sweep") } else { reasons.join("; ") };
+	Comparison { verdict, reason, architecture: universe.to_string(), scoped: wanted.len(), ran: scoped_run.outcomes.len(), outside_failures: extra, inside_failures: missing, previously_failed: Vec::new() }
+}
+
 pub fn compare_exec(selected: &[PlanItemKey], scoped_run: &GuestResults, sweep: &GuestResults, architecture: &str) -> Comparison {
 	// THE WHOLE CHECK ID, unstripped. A kernel check's id IS the test's declared id - the model's
 	// own self-check asserts that equality, because it is what makes `TEST_SELECTION` work - and
@@ -306,8 +373,28 @@ pub fn compare_dev(selected: &[PlanItemKey], results: &KeyedResults, history: &H
 	compare_keyed(selected, results, crate::catalog::Environment::DevGuest, "x86_64", history)
 }
 
+// BUILDS, through the same comparison, against the catalog rather than against a name.
+//
+// `HostBuild` and `Host` share an `Environment` - the split is in the UNIVERSE, which the catalog
+// derives from the check's KIND - so a comparison filtering on environment alone would put every
+// build key in the host universe and vice versa. The catalog is passed rather than a
+// `check.starts_with("build.")` test, because deciding from a name is the mistake this milestone has
+// now recorded three times.
+pub fn compare_build(selected: &[PlanItemKey], results: &KeyedResults, history: &History, catalog: &crate::catalog::Catalog, architecture: &str) -> Comparison {
+	compare_with(selected, results, history, architecture, |key| key.environment == crate::catalog::Environment::Host && is_build(catalog, &key.check) && key.architecture == architecture)
+}
+
+// Whether a check id names a build, asked of the catalog.
+fn is_build(catalog: &crate::catalog::Catalog, check: &str) -> bool {
+	catalog.checks.iter().any(|entry| entry.id == check && entry.kind == crate::catalog::CheckKind::Build)
+}
+
 fn compare_keyed(selected: &[PlanItemKey], results: &KeyedResults, environment: crate::catalog::Environment, architecture: &str, history: &History) -> Comparison {
-	let scoped: BTreeSet<&PlanItemKey> = selected.iter().filter(|key| key.environment == environment).collect();
+	compare_with(selected, results, history, architecture, |key| key.environment == environment)
+}
+
+fn compare_with(selected: &[PlanItemKey], results: &KeyedResults, history: &History, architecture: &str, in_universe: impl Fn(&PlanItemKey) -> bool) -> Comparison {
+	let scoped: BTreeSet<&PlanItemKey> = selected.iter().filter(|key| in_universe(key)).collect();
 	let mut outside = Vec::new();
 	let mut inside = Vec::new();
 	let mut previously_failed = Vec::new();

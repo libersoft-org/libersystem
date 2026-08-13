@@ -294,14 +294,30 @@ receiver's handle space. This is the same split between data and handles that
 Binder, Mach ports, and FIDL use, and it is how a capability keeps its unforgeable
 authority across the boundary.
 
-The generator implements `handle<R>` today, with one restriction set by the
-kernel channel: **at most one handle travels per message** (the channel's single
-out-of-band slot). Encoding a `handle<R>` calls `set_handle` on the writer and
-writes the `u32` placeholder; the dispatch/client glue threads that single handle
-through `Transport::call(request, request_handle) -> (reply, reply_handle)`, and
-decoding recovers it with `take_handle` (ignoring the placeholder). A future
-multi-handle message would reintroduce the index-table form; the placeholder is
-already a `u32` so that change is wire-compatible.
+The generator implements `handle<R>` today. A message carries a **bounded list** of
+capabilities - `abi::MAX_MESSAGE_CAPS`, four - which is the kernel's own limit rather
+than a copy of it: `wire::MAX_HANDLES` re-exports the constant, `SliceWriter::set_handle`
+refuses past it, and the validator counts a shape's capabilities and refuses a schema
+that asks for more, naming both numbers.
+
+Four is stdin, stdout, stderr and one spare. It was ONE until 2026-08-01, and that is
+why the older text here described a "single out-of-band slot": the kernel had always
+allowed a list, and this layer admitted one - which is what stopped a pipeline stage
+from being handed its stdin and its stdout together.
+
+Encoding a `handle<R>` calls `set_handle` on the writer and writes the `u32` placeholder;
+the glue threads the list through
+`Transport::call(request, request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>>`,
+and decoding recovers each with `take_handle` (ignoring the placeholder), in the order
+they were written.
+
+**Past the limit, nothing is dropped.** A schema whose shape carries five is refused at
+generation. A `list<handle<T>>` is accepted, because its count is a property of the value
+rather than of the schema - and there the writer answers: `set_handle` returns `Option`,
+every generated `write` propagates it with `?`, so the WHOLE message fails to encode
+rather than losing its fifth capability. `encode` and `encode_vec` refuse outright for a
+type that records one, because both return only the bytes; `encode_message` is the shape
+that carries both halves.
 
 ```lsidl
 interface volume {
@@ -349,7 +365,18 @@ interface log {
   conventionally a `result<T, error>`.
 - A method that returns nothing meaningful uses `result<unit, error>`.
 - The opcode `@op(n)` is **mandatory**, must be unique within the interface, and
-	must be in `1..=65531` (`0xfffc..=0xffff` are runtime control messages).
+	must be in `1..=abi::TYPED_OP_MAX`, which is `1..=65530` (`0xfffa`). Above it are
+	the reserved opcodes, by name from `abi` rather than as a range to remember:
+	`PROTOCOL_INFO_OP` (`0xfffb`, answered by the generated dispatch),
+	`GOODBYE_OP` (`0xfffc`),
+	`RESOLVE_OP` (`0xfffd`),
+	`HEARTBEAT_OP` (`0xfffe`) and
+	`CONNECT_OP` (`0xffff`), all intercepted by the runtime before typed dispatch.
+
+	This said `1..=65531` with `0xfffc..=0xffff` reserved, which handed out `65531` -
+	`PROTOCOL_INFO_OP`. A schema author following it would have been refused by a
+	validator that reads `TYPED_OP_MAX`, with a diagnostic contradicting the
+	specification they had just read.
   Opcodes are declared, never derived from position, so reordering or inserting
   methods never shifts the wire (see [Versioning](#8-versioning-and-compatibility)).
 

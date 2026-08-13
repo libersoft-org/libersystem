@@ -1402,6 +1402,16 @@ fn release_client(set: u64, clients: &mut Vec<Client>, index: usize) -> Client {
 	clients.swap_remove(index)
 }
 
+// A path split into the directory that holds it and its final component - the two halves `stat`
+// needs to answer from a listing. An empty directory is the volume root, which is the same
+// convention `list` uses.
+fn split_parent(name: &[u8]) -> (&[u8], &[u8]) {
+	match name.iter().rposition(|&byte| byte == b'/') {
+		Some(at) => (&name[..at], &name[at + 1..]),
+		None => (&[], name),
+	}
+}
+
 trait FileSystem {
 	// The vol:// volume name this backend answers to.
 	fn volume_name(&self) -> &'static [u8];
@@ -1514,6 +1524,33 @@ trait FileSystem {
 		Err(Error::Invalid)
 	}
 	fn restore(&mut self, _name: &[u8], _snapshot: &[u8]) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+
+	// ONE FILE'S FACTS, without reading the directory that holds it.
+	//
+	// The default answers from `list_entries`, which is what every caller had to do by hand: read
+	// the parent and search it. That is correct on any backend and wrong only in cost, so it is the
+	// DEFAULT rather than the answer - a backend that can look one entry up directly overrides it,
+	// and the native filesystem does.
+	fn stat_entry(&mut self, name: &[u8]) -> Result<FileInfo, Error> {
+		let (dir, base) = split_parent(name);
+		let entries = self.list_entries(dir)?;
+		entries.into_iter().find(|entry| entry.name.as_bytes() == base).ok_or(Error::NotFound)
+	}
+
+	// The mutations a read-only or incapable backend refuses BY NAME rather than by silence.
+	//
+	// `Invalid` and not `Denied`: denied is "you may not", and these backends would refuse the same
+	// operation from anybody. An ISO9660 volume cannot rename a file because the medium has no way
+	// to express it, which is a statement about the backend rather than about the caller.
+	fn rename(&mut self, _from: &[u8], _to: &[u8]) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn truncate(&mut self, _name: &[u8], _length: u64) -> Result<(), Error> {
+		Err(Error::Invalid)
+	}
+	fn touch(&mut self, _name: &[u8], _create: bool) -> Result<(), Error> {
 		Err(Error::Invalid)
 	}
 
@@ -1708,6 +1745,35 @@ impl volume::Service for Volume {
 		let name: &[u8] = self.writable_name(&path)?;
 		self.fs.restore(name, snapshot.as_bytes())
 	}
+
+	// One file's facts. Read-only like `open` and `list`, so it takes the reading path rather than
+	// `writable_name` - a client that may read a volume may ask how big a file on it is.
+	fn stat(&mut self, path: String) -> Result<FileInfo, Error> {
+		let target: VolumePath = VolumePath::parse(path.as_bytes()).ok_or(Error::NotFound)?;
+		if target.volume != self.name() {
+			return Err(Error::NotFound);
+		}
+		self.fs.stat_entry(target.path.as_bytes())
+	}
+
+	// BOTH PATHS ARE CHECKED, and both against the same volume. A rename whose destination was
+	// checked less carefully than its source is a way out of a granted directory, which is what
+	// `writable_name` exists to prevent - so it is asked twice rather than once.
+	fn rename(&mut self, from: String, to: String) -> Result<(), Error> {
+		let source: Vec<u8> = self.writable_name(&from)?.to_vec();
+		let destination: &[u8] = self.writable_name(&to)?;
+		self.fs.rename(&source, destination)
+	}
+
+	fn truncate(&mut self, path: String, length: u64) -> Result<(), Error> {
+		let name: &[u8] = self.writable_name(&path)?;
+		self.fs.truncate(name, length)
+	}
+
+	fn touch(&mut self, path: String, create: bool) -> Result<(), Error> {
+		let name: &[u8] = self.writable_name(&path)?;
+		self.fs.touch(name, create)
+	}
 }
 
 impl Volume {
@@ -1899,6 +1965,35 @@ impl FileSystem for DiskFs {
 		let report = self.fs.fsck().map_err(map_fs_err)?;
 		Ok(FsckReport { checksum_failures: report.checksum_failures, damaged: report.damaged.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect() })
 	}
+	// THE NATIVE FILESYSTEM ANSWERS ALL FOUR, because LiberFS already implements them: `stat`
+	// reads the inode, `rename` moves the directory entry without touching the contents, and
+	// `truncate` drops or zero-extends. They were unreachable from a client only because the
+	// contract did not name them.
+	fn stat_entry(&mut self, name: &[u8]) -> Result<FileInfo, Error> {
+		let stat = self.fs.stat(name).map_err(map_fs_err)?;
+		let (_, base) = split_parent(name);
+		Ok(FileInfo { name: String::from_utf8_lossy(base).into_owned(), size: stat.size, r#type: if stat.is_dir { FileType::Dir } else { FileType::File }, mtime: stat.mtime, ctime: stat.ctime })
+	}
+
+	fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), Error> {
+		self.fs.rename(from, to).map_err(map_fs_err)
+	}
+
+	fn truncate(&mut self, name: &[u8], length: u64) -> Result<(), Error> {
+		self.fs.truncate(name, length).map_err(map_fs_err)
+	}
+
+	// `touch` is the one of the four LiberFS does not have as a verb, and it is two it does: a file
+	// that exists is truncated to its own length, which is the mutation that stamps its mtime
+	// without changing a byte; a missing one is created empty when the caller asked for it.
+	fn touch(&mut self, name: &[u8], create: bool) -> Result<(), Error> {
+		match self.fs.stat(name) {
+			Ok(stat) => self.fs.truncate(name, stat.size).map_err(map_fs_err),
+			Err(_) if create => self.fs.write_file(name, &[]).map_err(map_fs_err),
+			Err(error) => Err(map_fs_err(error)),
+		}
+	}
+
 	fn restore(&mut self, name: &[u8], snapshot: &[u8]) -> Result<(), Error> {
 		self.fs.restore_file(name, snapshot).map_err(map_fs_err)
 	}

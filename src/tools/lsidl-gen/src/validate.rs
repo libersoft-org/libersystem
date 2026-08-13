@@ -260,30 +260,62 @@ fn check_type(ty: &Type, span: Span, names: &HashMap<String, Kind>, errs: &mut V
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cardinality {
-	Zero,
-	One,
-	Many,
+	// A KNOWN COUNT. `Many` said "more than one" and could not tell four from five, so a five-handle
+	// record validated and then lost its fifth capability at the writer, which refuses past
+	// `MAX_HANDLES` - a schema expressing what the wire drops, which is the defect this whole
+	// milestone is named for. A number can be compared against the limit and can be PRINTED, so the
+	// diagnostic says five and says four.
+	Exact(usize),
+	// More than the wire carries, with the count, so the refusal can name it.
+	OverLimit(usize),
+	// A `list<handle<T>>`: the count is a property of the VALUE, not of the schema, so no
+	// generation-time check can bound it. ACCEPTED, and `report_cardinality` states why in one
+	// place - separate from `Exact` because the two are answered differently and folding them into
+	// one word is what made five indistinguishable from four.
+	Unbounded,
+	// An imported shape nothing has resolved. Fails closed, as it always did.
 	Unknown,
 }
 
+// The wire's limit, from the wire rather than as a copy of its value - the same constant
+// `SliceWriter::set_handle` refuses past and the kernel's `MAX_MESSAGE_CAPS`.
+const MAX_HANDLES: usize = abi::MAX_MESSAGE_CAPS;
+
 impl Cardinality {
+	// Two shapes SIDE BY SIDE in one message - a record's fields, a tuple's items.
 	fn sum(self, other: Cardinality) -> Cardinality {
 		use Cardinality::*;
 		match (self, other) {
-			(Many, _) | (_, Many) | (One, One) => Many,
 			(Unknown, _) | (_, Unknown) => Unknown,
-			(One, Zero) | (Zero, One) => One,
-			(Zero, Zero) => Zero,
+			(Unbounded, _) | (_, Unbounded) => Unbounded,
+			(OverLimit(a), OverLimit(b)) => OverLimit(a + b),
+			(OverLimit(a), Exact(b)) | (Exact(b), OverLimit(a)) => OverLimit(a + b),
+			(Exact(a), Exact(b)) => {
+				let total = a + b;
+				if total > MAX_HANDLES { OverLimit(total) } else { Exact(total) }
+			}
 		}
 	}
 
+	// Two shapes that are ALTERNATIVES - a result's arms. The message carries whichever arrives, so
+	// the worst case is what has to fit.
 	fn max(self, other: Cardinality) -> Cardinality {
 		use Cardinality::*;
 		match (self, other) {
-			(Many, _) | (_, Many) => Many,
 			(Unknown, _) | (_, Unknown) => Unknown,
-			(One, _) | (_, One) => One,
-			(Zero, Zero) => Zero,
+			(Unbounded, _) | (_, Unbounded) => Unbounded,
+			(OverLimit(a), OverLimit(b)) => OverLimit(a.max(b)),
+			(OverLimit(a), Exact(_)) | (Exact(_), OverLimit(a)) => OverLimit(a),
+			(Exact(a), Exact(b)) => Exact(a.max(b)),
+		}
+	}
+
+	// How many capabilities this shape carries, for a caller that needs a number.
+	fn count(self) -> Option<usize> {
+		match self {
+			Cardinality::Exact(n) => Some(n),
+			Cardinality::OverLimit(n) => Some(n),
+			Cardinality::Unbounded | Cardinality::Unknown => None,
 		}
 	}
 }
@@ -293,19 +325,19 @@ fn check_wire_shapes(file: &File, names: &HashMap<String, Kind>, imports: Option
 	for item in &file.items {
 		match item {
 			Item::Alias(a) => {
-				cards.insert(a.name.clone(), Cardinality::Zero);
+				cards.insert(a.name.clone(), Cardinality::Exact(0));
 			}
 			Item::Record(r) => {
-				cards.insert(r.name.clone(), Cardinality::Zero);
+				cards.insert(r.name.clone(), Cardinality::Exact(0));
 			}
 			Item::Enum(e) => {
-				cards.insert(e.name.clone(), Cardinality::Zero);
+				cards.insert(e.name.clone(), Cardinality::Exact(0));
 			}
 			Item::Variant(v) => {
-				cards.insert(v.name.clone(), Cardinality::Zero);
+				cards.insert(v.name.clone(), Cardinality::Exact(0));
 			}
 			Item::Flags(f) => {
-				cards.insert(f.name.clone(), Cardinality::Zero);
+				cards.insert(f.name.clone(), Cardinality::Exact(0));
 			}
 			Item::Resource(_) | Item::Interface(_) => {}
 		}
@@ -321,15 +353,15 @@ fn check_wire_shapes(file: &File, names: &HashMap<String, Kind>, imports: Option
 			let (name, next) = match item {
 				Item::Alias(a) => (&a.name, type_cardinality(&a.ty, &cards, names, imports)),
 				Item::Record(r) => {
-					let next = r.fields.iter().fold(Cardinality::Zero, |acc, field| acc.sum(type_cardinality(&field.ty, &cards, names, imports)));
+					let next = r.fields.iter().fold(Cardinality::Exact(0), |acc, field| acc.sum(type_cardinality(&field.ty, &cards, names, imports)));
 					(&r.name, next)
 				}
 				Item::Variant(v) => {
-					let next = v.cases.iter().filter_map(|case| case.payload.as_ref()).fold(Cardinality::Zero, |acc, ty| acc.max(type_cardinality(ty, &cards, names, imports)));
+					let next = v.cases.iter().filter_map(|case| case.payload.as_ref()).fold(Cardinality::Exact(0), |acc, ty| acc.max(type_cardinality(ty, &cards, names, imports)));
 					(&v.name, next)
 				}
-				Item::Enum(e) => (&e.name, Cardinality::Zero),
-				Item::Flags(f) => (&f.name, Cardinality::Zero),
+				Item::Enum(e) => (&e.name, Cardinality::Exact(0)),
+				Item::Flags(f) => (&f.name, Cardinality::Exact(0)),
 				Item::Resource(_) | Item::Interface(_) => continue,
 			};
 			if cards.get(name) != Some(&next) {
@@ -349,7 +381,7 @@ fn check_wire_shapes(file: &File, names: &HashMap<String, Kind>, imports: Option
 			Item::Variant(v) => report_cardinality(cards[&v.name], v.span, &format!("variant `{}`", v.name), errs),
 			Item::Interface(i) => {
 				for method in &i.methods {
-					let request = method.params.iter().fold(Cardinality::Zero, |acc, param| acc.sum(type_cardinality(&param.ty, &cards, names, imports)));
+					let request = method.params.iter().fold(Cardinality::Exact(0), |acc, param| acc.sum(type_cardinality(&param.ty, &cards, names, imports)));
 					report_cardinality(request, method.span, &format!("request for `{}.{}`", i.name, method.name), errs);
 					let reply = type_cardinality(&method.ret, &cards, names, imports);
 					report_cardinality(reply, method.span, &format!("reply for `{}.{}`", i.name, method.name), errs);
@@ -363,14 +395,18 @@ fn check_wire_shapes(file: &File, names: &HashMap<String, Kind>, imports: Option
 
 fn type_cardinality(ty: &Type, cards: &HashMap<String, Cardinality>, names: &HashMap<String, Kind>, imports: Option<&HashMap<String, ResolvedSymbol>>) -> Cardinality {
 	match ty {
-		Type::Handle(_) | Type::Buffer | Type::Stream(_) => Cardinality::One,
+		Type::Handle(_) | Type::Buffer | Type::Stream(_) => Cardinality::Exact(1),
 		Type::Option(inner) => type_cardinality(inner, cards, names, imports),
+		// A LIST OF CAPABILITIES HAS NO GENERATION-TIME COUNT. `list<handle<T>>` collapsed to `Many`
+		// and was accepted, so a schema could ask for as many capabilities as the value happened to
+		// hold and the writer would refuse past four - at run time, on the fifth element, with the
+		// first four already written. A list of things that carry NONE is still zero.
 		Type::List(inner) => match type_cardinality(inner, cards, names, imports) {
-			Cardinality::Zero => Cardinality::Zero,
+			Cardinality::Exact(0) => Cardinality::Exact(0),
 			Cardinality::Unknown => Cardinality::Unknown,
-			Cardinality::One | Cardinality::Many => Cardinality::Many,
+			_ => Cardinality::Unbounded,
 		},
-		Type::Tuple(items) => items.iter().fold(Cardinality::Zero, |acc, item| acc.sum(type_cardinality(item, cards, names, imports))),
+		Type::Tuple(items) => items.iter().fold(Cardinality::Exact(0), |acc, item| acc.sum(type_cardinality(item, cards, names, imports))),
 		Type::Result(ok, err) => type_cardinality(ok, cards, names, imports).max(type_cardinality(err, cards, names, imports)),
 		Type::Named(name) => match names.get(name) {
 			Some(Kind::External) => Cardinality::Unknown,
@@ -379,15 +415,18 @@ fn type_cardinality(ty: &Type, cards: &HashMap<String, Cardinality>, names: &Has
 				.copied()
 				.or_else(|| {
 					imports.and_then(|resolved| resolved.get(name)).map(|symbol| match symbol.cardinality {
-						HandleCardinality::Zero => Cardinality::Zero,
-						HandleCardinality::One => Cardinality::One,
-						HandleCardinality::Many => Cardinality::Many,
+						HandleCardinality::Zero => Cardinality::Exact(0),
+						HandleCardinality::One => Cardinality::Exact(1),
+						// An import's summary says "more than one" without a number, so the
+						// conservative reading is the most it could be. Two such records side by
+						// side then exceed the limit - which is TRUE, they could.
+						HandleCardinality::Many => Cardinality::Exact(MAX_HANDLES),
 					})
 				})
 				.unwrap_or(Cardinality::Unknown),
 			_ => Cardinality::Unknown,
 		},
-		_ => Cardinality::Zero,
+		_ => Cardinality::Exact(0),
 	}
 }
 
@@ -403,12 +442,30 @@ fn type_cardinality(ty: &Type, cards: &HashMap<String, Cardinality>, names: &Has
 // the two cannot be separated by a rebase. `check-single-cap-receive.sh` is what stops a new
 // single-handle receive from appearing behind it.
 //
-// What is still refused is `Unknown` - an imported shape nothing has resolved - which fails closed
-// for the same reason it always did.
+// WHAT IS REFUSED IS WHAT THE WIRE CANNOT CARRY, and it is now a number rather than a word.
+//
+// `Many` could not tell four from five. So a five-capability record validated, and the writer -
+// which refuses past `MAX_HANDLES` - dropped the fifth: a schema expressing what the wire discards,
+// which is the defect this milestone is named for, at the other end of the same road. `Exact(n)`
+// compares against the limit and PRINTS, so the diagnostic says five and says four.
+//
+// `Unbounded` is a `list<handle<T>>`, and it is ACCEPTED. That is the policy this milestone asked to
+// have written down, and it is the one the tree already implements rather than a new decision.
+//
+// The count is a property of the VALUE, so no generation-time check can bound it - and the wire
+// bounds it where the count exists: `SliceWriter::set_handle` refuses past `MAX_HANDLES` and returns
+// `Option`, and every generated `write` propagates that with `?`. So a five-element list does not
+// lose its fifth capability; the WHOLE message fails to encode, and `encode`/`encode_vec` answer
+// `None`. A refusal at generation time would be the stricter reading, and it would refuse shapes
+// that are legal whenever the list is short - which is most of them.
+//
+// `Unknown` - an imported shape nothing has resolved - fails closed for the same reason it always
+// did.
 fn report_cardinality(card: Cardinality, span: Span, what: &str, errs: &mut Vec<Error>) {
 	match card {
 		Cardinality::Unknown => errs.push(Error::new(span, format!("{what} uses an imported wire shape that has not been resolved"))),
-		Cardinality::Zero | Cardinality::One | Cardinality::Many => {}
+		Cardinality::OverLimit(n) => errs.push(Error::new(span, format!("{what} carries {n} capabilities and a message carries at most {MAX_HANDLES}"))),
+		Cardinality::Exact(_) | Cardinality::Unbounded => {}
 	}
 }
 

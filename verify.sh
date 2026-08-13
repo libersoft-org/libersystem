@@ -331,7 +331,32 @@ if [[ "$action" == shadow ]]; then
 		fi
 	done <<<"$host_ids"
 	printf 'total %s\n' "$host_total" >>"$host_log"
-	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --host-log "../$host_log") || shadow_failed=1
+	# THE EXECUTION SAMPLE, when one was asked for: run the SCOPED host selection on its own first,
+	# so the comparison can ask whether that selection is executable at all. A dry comparison answers
+	# "did the selector choose the right set" and cannot answer "does running it work" - and the dev
+	# producer next door is the proof that the second question is not theoretical: it emitted a
+	# command bash could not parse and every dry comparison stayed clean.
+	host_scoped_arg=()
+	if [[ "${shadow_exec:-0}" == "1" ]]; then
+		host_scoped_log="$BUILD_DIR/logs/verify-host-scoped.txt"
+		: >"$host_scoped_log"
+		host_scoped_total=0
+		# The selection's own keys, lowered the same way the sweep lowers them - `commands` is what
+		# both read, so the two sides cannot drift.
+		host_scoped_ids="$(printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- host-checks --stdin --scoped))" || planner_failed "the planner could not list the scoped host checks"
+		while IFS=$'\t' read -r id arch env config command; do
+			[[ -n "$id" ]] || continue
+			host_scoped_total=$((host_scoped_total + 1))
+			if (cd "$SRC_DIR/.." && eval "$command") >/dev/null 2>&1; then
+				printf '%s\t%s\t%s\t%s\tPASS\n' "$id" "$arch" "$env" "$config" >>"$host_scoped_log"
+			else
+				printf '%s\t%s\t%s\t%s\tFAIL\n' "$id" "$arch" "$env" "$config" >>"$host_scoped_log"
+			fi
+		done <<<"$host_scoped_ids"
+		printf 'total %s\n' "$host_scoped_total" >>"$host_scoped_log"
+		host_scoped_arg=(--host-scoped-log "../$host_scoped_log")
+	fi
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --host-log "../$host_log" "${host_scoped_arg[@]}") || shadow_failed=1
 
 	# The DEV GUEST universe, the third and last producer.
 	#
@@ -353,7 +378,58 @@ if [[ "$action" == shadow ]]; then
 		fi
 	done <<<"$dev_ids"
 	printf 'total %s\n' "$dev_total" >>"$dev_log"
-	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --dev-log "../$dev_log") || shadow_failed=1
+	# The same sample on the dev path, and this is the universe it would have caught first.
+	dev_scoped_arg=()
+	if [[ "${shadow_exec:-0}" == "1" ]]; then
+		dev_scoped_log="$BUILD_DIR/logs/verify-dev-scoped.txt"
+		: >"$dev_scoped_log"
+		dev_scoped_total=0
+		dev_scoped_ids="$(printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- dev-checks --stdin --scoped))" || planner_failed "the planner could not list the scoped dev checks"
+		while IFS=$'\t' read -r id arch env config command; do
+			[[ -n "$id" ]] || continue
+			dev_scoped_total=$((dev_scoped_total + 1))
+			if (cd "$SRC_DIR/.." && eval "$command") >/dev/null 2>&1; then
+				printf '%s\t%s\t%s\t%s\tPASS\n' "$id" "$arch" "$env" "$config" >>"$dev_scoped_log"
+			else
+				printf '%s\t%s\t%s\t%s\tFAIL\n' "$id" "$arch" "$env" "$config" >>"$dev_scoped_log"
+			fi
+		done <<<"$dev_scoped_ids"
+		printf 'total %s\n' "$dev_scoped_total" >>"$dev_scoped_log"
+		dev_scoped_arg=(--dev-scoped-log "../$dev_scoped_log")
+	fi
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --dev-log "../$dev_log" "${dev_scoped_arg[@]}") || shadow_failed=1
+
+	# The BUILD universe, and it costs the sweep nothing it was not already paying.
+	#
+	# `HostBuild` was split out of `Host` because a certificate earned over gates, suites and
+	# conformance was standing for builds nothing had compared - right, and it left a universe with
+	# no producer. `trusted_everywhere` asks every judging universe, and `build.libs`, `build.user`,
+	# `build.kernel` and the rest cover every crate and every program under their prefix: 189 of the
+	# catalog's 192 components were judged by a universe that could never answer, so 98% of the tree
+	# could accumulate any evidence and never reach TRUSTED.
+	#
+	# A full sweep has already built every part on every architecture by the time it gets here, so
+	# each command below is a no-op re-run against a warm cache - it reports whether that part builds
+	# rather than building it again. PER ARCHITECTURE, because a build of x86_64 says nothing about
+	# aarch64, which is what `required_architectures` asks for.
+	for build_arch in $targets; do
+		build_log="$BUILD_DIR/logs/verify-build-shadow-$build_arch.txt"
+		: >"$build_log"
+		build_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- build-checks)" || planner_failed "the planner could not list the build checks"
+		build_total=0
+		while IFS=$'\t' read -r id arch env config command; do
+			[[ -n "$id" ]] || continue
+			[[ "$arch" == "$build_arch" ]] || continue
+			build_total=$((build_total + 1))
+			if (cd "$SRC_DIR/.." && eval "$command") >/dev/null 2>&1; then
+				printf '%s\t%s\t%s\t%s\tPASS\n' "$id" "$arch" "$env" "$config" >>"$build_log"
+			else
+				printf '%s\t%s\t%s\t%s\tFAIL\n' "$id" "$arch" "$env" "$config" >>"$build_log"
+			fi
+		done <<<"$build_ids"
+		printf 'total %s\n' "$build_total" >>"$build_log"
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --build-log "../$build_log" --build-arch "$build_arch") || shadow_failed=1
+	done
 
 	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"
 	model_after="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"

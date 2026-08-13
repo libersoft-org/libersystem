@@ -7,6 +7,7 @@
 
 use crate::catalog::{CheckKind, Environment};
 use crate::plan::Plan;
+use crate::registry::Configuration;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct Step {
@@ -19,22 +20,59 @@ pub struct Step {
 	pub note: Option<String>,
 }
 
-// The command that runs one host check in one configuration. `command` already has `{arch}`
-// substituted; what this adds is the configuration's features.
+// The command that runs one check of `kind` in one configuration. `command` already has `{arch}`
+// substituted; what this adds is whatever the CONFIGURATION RECORD says.
 //
 // ONE LOWERING, because there were two. The shadow producer emitted `check.command` raw, so a
-// `shared-image` variant was run as though it were the default one and its result was filed under
-// an id that did not say which variant it was. A comparison between the run and the shadow is only
-// a comparison if both sides lowered the key the same way, and the only way to be sure of that is
-// for there to be one place that does it.
-pub fn host_command(command: &str, configuration: &str) -> String {
-	match configuration {
-		"default" => command.to_string(),
-		other => format!("{command} --no-default-features --features {other}"),
+// `shared-image` variant was run as though it were the default one and its result was filed under an
+// id that did not say which variant it was. A comparison between the run and the shadow is only a
+// comparison if both sides lowered the key the same way.
+//
+// FROM THE RECORD, NOT THE NAME, and that is the second half of the same lesson. The name-matching
+// version treated everything that was not `"default"` as a Cargo feature list, which is right for
+// exactly one of the four configurations: `shared-image` really does want
+// `--no-default-features --features shared-image`, `default` is right by luck, and `test` and
+// `development` both declare `default_features = true` and no features at all - so both halves of
+// what it emitted contradicted the record.
+//
+// It was not a wrong flag. A dev check's command is `(cd src && boot/dev-selftest.py)`, so the
+// producer emitted `(cd src && boot/dev-selftest.py) --no-default-features --features development` -
+// a bash SYNTAX ERROR, which every dev-guest shadow line then failed on before it started, making
+// clean `DevGuest` evidence unobtainable for `bin.dev_agent`, `bin.dev_channel`, `harness.boot` and
+// `proto`. The shared lowering removed a divergence on the host path and created one on the dev path.
+pub fn lower(kind: CheckKind, command: &str, configuration: &Configuration) -> String {
+	match kind {
+		// A cargo invocation is the only kind a feature selection means anything to. `default` is
+		// the crate's own manifest, so it is spelled by saying nothing.
+		CheckKind::HostSuite => {
+			if configuration.default_features && configuration.features.is_empty() {
+				return command.to_string();
+			}
+			let mut lowered = String::from(command);
+			if !configuration.default_features {
+				lowered.push_str(" --no-default-features");
+			}
+			if !configuration.features.is_empty() {
+				lowered.push_str(" --features ");
+				lowered.push_str(&configuration.features.join(","));
+			}
+			lowered
+		}
+		// Everything else carries its own command and means it: a gate is a script, a conformance
+		// run is a script, a build takes `--arch` and `--part`, a dev check is a shell pipeline, and
+		// a kernel test is selected by tag rather than by feature. Appending cargo flags to any of
+		// them produces something that is not the command the runner runs - and for the dev check,
+		// something that is not a command at all.
+		CheckKind::Gate | CheckKind::Conformance | CheckKind::Build | CheckKind::DevCheck | CheckKind::KernelTest => command.to_string(),
 	}
 }
 
-pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> Vec<Step> {
+// The fallback when a key names a configuration the registry does not define, which the model's own
+// check refuses - a `default`-shaped record rather than a panic, so a malformed model produces a
+// wrong command rather than no output at all.
+static DEFAULT_CONFIGURATION: std::sync::LazyLock<Configuration> = std::sync::LazyLock::new(|| Configuration { name: String::from("default"), default_features: true, features: Vec::new(), profile: String::from("dev"), build_mode: String::from("host-test"), description: String::from("the crate's own manifest") });
+
+pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, registry: &crate::registry::Registry) -> Vec<Step> {
 	let mut steps = Vec::new();
 
 	// Builds first, and per architecture rather than per part: build.sh takes a part list, and
@@ -55,7 +93,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> 
 	// the one that never ships, and running only that one is what this model exists to stop.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::HostSuite) {
 		let crate_name = item.key.check.strip_prefix("host.").unwrap_or(&item.key.check);
-		steps.push(Step { label: format!("host suite {crate_name} ({})", item.key.configuration), command: host_command(&item.command, &item.key.configuration), keys: vec![item.key.clone()], note: None });
+		steps.push(Step { label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None });
 	}
 
 	// Gates and conformance suites each collapse into one call, because check.sh takes a list.
@@ -74,9 +112,9 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> 
 	//
 	// The note is the honest part. The runner cannot yet be handed an exact test list, so a strict
 	// subset is run as the whole suite - which over-runs rather than under-runs, and says so. This
-	// is also where the milestone's own measurement lands: the fixed cost of a boot is ~100 s on
-	// x86_64 against ~0.2 s per test, so selecting fewer tests inside a boot that is happening
-	// anyway was never where the saving was.
+	// is also where the milestone's own measurement lands: a boot has a fixed cost that dwarfs the
+	// per-test one - see `CostModel::default` for the current figures - so selecting fewer tests
+	// inside a boot that is happening anyway was never where the saving was.
 	let mut kernel_by_arch: BTreeMap<&str, Vec<crate::plan::PlanItemKey>> = BTreeMap::new();
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::KernelTest) {
 		kernel_by_arch.entry(&item.key.architecture).or_default().push(item.key.clone());
@@ -87,9 +125,10 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>) -> 
 		// have, so a selection naming a renamed test fails loudly instead of quietly running less.
 		//
 		// Measured on an idle machine: 2 tests take 9 s, 20 take 12 s, 205 take 108 s - a fixed cost
-		// of about eight seconds and roughly half a second per test. An earlier note in P02M0118 put the
-		// fixed cost at ~100 s and concluded that selection was the smallest lever this milestone
-		// had; that arithmetic mixed a run made under load 115 with one made idle, and it was wrong.
+		// of about eight seconds and roughly half a second per test. An earlier note in P02M0118 put
+		// the fixed cost two orders higher and concluded that selection was the smallest lever this
+		// milestone had; that arithmetic mixed a run made under load 115 with one made idle, and it
+		// was wrong. The nine-run calibration in `CostModel::default` is what the model uses now.
 		// Selecting twenty tests out of two hundred is an 89% saving on the guest run.
 		// Hand over an exact list only when it BUYS something.
 		//

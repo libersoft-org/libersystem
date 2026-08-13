@@ -7,6 +7,32 @@
 use super::*;
 
 #[test]
+fn a_length_prefixed_string_round_trips_at_the_prefix_boundary_and_is_refused_past_it() {
+	// THE ONLY LENGTH WHERE THE PREFIX AND THE BUFFER DISAGREE, and the suite's note claimed it was
+	// covered by `Reader::new(&[0xff, 0xff]).string_lp() == None` - which is a two-byte prefix
+	// declaring 65535 bytes with nothing behind it. That is a truncation test, and a good one; it is
+	// not a bound test. No 65535-byte string was built anywhere.
+	use crate::Sink;
+	let max = "x".repeat(u16::MAX as usize);
+	let mut out = alloc::vec![0u8; u16::MAX as usize + 64];
+	let mut w = SliceWriter::new(&mut out);
+	w.bytes_lp(max.as_bytes()).expect("65535 bytes is what a u16 prefix can describe");
+	let n = w.pos();
+	assert_eq!(n, u16::MAX as usize + 2, "the prefix plus the bytes");
+	let decoded = Reader::new(&out[..n]).string_lp().expect("and it reads back");
+	assert_eq!(decoded.len(), u16::MAX as usize, "every byte of it");
+	assert_eq!(decoded, max);
+
+	// One more byte cannot be DESCRIBED by the prefix, so the writer refuses rather than truncating
+	// the length into `u16` - which would encode a string one byte long claiming 65535.
+	let over = "x".repeat(u16::MAX as usize + 1);
+	let mut out = alloc::vec![0u8; u16::MAX as usize + 64];
+	let mut w = SliceWriter::new(&mut out);
+	assert!(w.bytes_lp(over.as_bytes()).is_none(), "65536 bytes has no u16 prefix");
+	assert_eq!(w.pos(), 0, "and nothing was written before the refusal");
+}
+
+#[test]
 fn a_boolean_has_one_encoding_per_value() {
 	// `Some(self.u8()? != 0)` accepted 2 through 255 as `true`, against a stated contract that a
 	// malformed buffer answers `None`. One logical value with 255 spellings is malleability with no

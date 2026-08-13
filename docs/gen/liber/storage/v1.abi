@@ -24,5 +24,9 @@ method volume.set-compression op=13 (enabled:bool:rights=) -> result<unit, liber
 method volume.fsck op=14 () -> result<fsck-report, liber:base@1::error>
 method volume.restore op=15 (path:string:rights=,snapshot:string:rights=) -> result<unit, liber:base@1::error>
 method volume.write-stream op=16 (path:string:rights=,data:handle<channel>:rights=) -> result<unit, liber:base@1::error>
+method volume.stat op=17 (path:string:rights=) -> result<file-info, liber:base@1::error>
+method volume.rename op=18 (from:string:rights=,to:string:rights=) -> result<unit, liber:base@1::error>
+method volume.truncate op=19 (path:string:rights=,length:u64:rights=) -> result<unit, liber:base@1::error>
+method volume.touch op=20 (path:string:rights=,create:bool:rights=) -> result<unit, liber:base@1::error>
 interface volume-admin
 method volume-admin.open-directory op=1 (path:string:rights=) -> result<handle<channel>, liber:base@1::error>

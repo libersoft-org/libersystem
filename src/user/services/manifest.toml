@@ -874,6 +874,21 @@ stage = "volume"
 destination = "bin/ptyecho.lsexe"
 providers = ["lsrt"]
 
+# A program that blocks on its bootstrap channel forever, so a test that needs a live process can
+# have one that does not exit on its own. See `holdopen.rs`.
+#
+# PINNED, not staged to the volume, because the test that needs it drives ProcessService with no
+# storage client - a harness that loads programs from the init package - and a tool the package does
+# not carry cannot be launched there at all. It is a few hundred bytes.
+[[programs]]
+name = "holdopen"
+owner = "services"
+role = "probe"
+linkage = "static"
+stage = "pinned"
+destination = "holdopen.lsexe"
+providers = []
+
 [[programs]]
 name = "readln"
 owner = "tools"

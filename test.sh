@@ -21,6 +21,9 @@ With no arguments: every test, x86_64.
   --tags TAGS    run only these tags, plus the smoke set (--list-tags to see them)
   --list-tags    print the tags this kernel defines and exit
   --fast         reuse a content-verified userspace preflight instead of rebuilding it
+  EL2=1          aarch64 only: after the ordinary run, boot once more at EL2
+                 ($(virtualization=on)) over the smoke tag. That is where the loader drops an
+                 exception level, and the branch that does it had never executed until 2026-08-13.
   --build-only   compile the test kernel without booting QEMU
   --smp N        cores given to the guest
   --timeout SEC  per-suite wall-clock limit
@@ -234,6 +237,22 @@ run_arch() {
 		(cd "$SRC_DIR" && boot/test-kernel.sh "${args[@]}")
 	else
 		(cd "$SRC_DIR" && UEFI="${UEFI:-1}" boot/test-kernel.sh "${args[@]}")
+	fi
+	# AND ONCE MORE AT EL2, on aarch64, over the smoke tag only.
+	#
+	# The loader's EL2 branch - the drop to EL1, the generic timer opened to it, the PSCI conduit
+	# it leaves behind - had never executed on any machine this project has run on until 2026-08-13,
+	# because QEMU's `virt` starts a guest at EL1 and the UEFI specification puts AArch64 firmware at
+	# EL2 on most server-class parts. Running it once found that PSCI does not survive the drop.
+	#
+	# THE SMOKE TAG, not the suite. A single-core emulated aarch64 run of two hundred tests costs a
+	# sweep more than the evidence is worth; `boot` pins what this path is actually about - the drop,
+	# the timer, the conduit and the single-core bring-up - and everything above that is the same
+	# kernel the EL1 run already tested. Off by default for the same reason `--shadow-exec` is: it is
+	# a second boot, and the person who wants it says so.
+	if [[ "$arch" == aarch64 && "${EL2:-0}" == "1" ]]; then
+		echo "[test-$arch] and again at EL2 (virtualization=on), smoke tag only"
+		(cd "$SRC_DIR" && UEFI=1 EL2=1 boot/test-kernel.sh "$arch" boot)
 	fi
 }
 

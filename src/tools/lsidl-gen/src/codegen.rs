@@ -148,9 +148,23 @@ impl Cg {
 
 	// Emit the encode / encode_vec / decode methods shared by every codec type.
 	fn codec_methods(&mut self, ty: &str) {
+		// THE SAME REFUSAL AS `encode_vec`, and it was missing here for as long as that one existed.
+		//
+		// `encode` returns a LENGTH, so a value that recorded a capability produced a byte count and
+		// left the capability in a writer the caller then drops: `OpenResult { file: 123, .. }
+		// .encode(&mut buf)` answered `Some(n)` and the handle was gone. `encode_vec` was corrected
+		// for exactly this - "half a wire representation could be passed around by accident, and for
+		// a capability-bearing type the half that was dropped was the live one" - and its twin was
+		// left carrying the other half of the same defect.
+		//
+		// Refusing rather than not generating it: the signature stays, so a caller that reaches for
+		// the wrong function is told at the call rather than at the type. `encode_message` is the one
+		// that carries both halves.
 		self.line("\tpub fn encode(&self, out: &mut [u8]) -> Option<usize> {");
 		self.line("\t\tlet mut w = SliceWriter::new(out);");
 		self.line("\t\tself.write(&mut w)?;");
+		self.line("\t\t// A capability recorded here would be dropped by returning the length alone.");
+		self.line("\t\tif w.has_handle() { return None; }");
 		self.line("\t\tSome(w.pos())");
 		self.line("\t}");
 		// `encode_vec` REFUSES a type that carries a capability, and `encode_message` is the shape

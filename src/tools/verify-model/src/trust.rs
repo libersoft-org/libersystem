@@ -87,12 +87,17 @@ pub fn required_architectures(universe: crate::shadow::Universe) -> usize {
 // Which universes have an execution mechanism a sample can be taken of.
 //
 // The guest suite has one: an exact `TEST_SELECTION` handed to a runner that can fail to match it.
-// The host and dev producers lower a selection into shell commands, and a sample of those is
-// exactly as valuable - but there is no producer for it yet, and requiring what nothing can supply
-// would make those universes permanently untrustable rather than honestly graded. Recorded here, in
-// one place, so adding a producer is one line rather than a search.
+// The host and dev producers lower a selection into shell commands, and a sample of those is exactly
+// as valuable - `verify.sh` now runs the scoped selection on both before the sweep, so they are here
+// too. The exemption they used to have is what hid a real defect for a round: the dev producer
+// emitted a command bash could not parse, which is precisely what an execution sample detects.
+//
+// `HostBuild` stays exempt, and this is the reason rather than an omission: "executing the
+// selection" there means building those parts, and the sweep builds every part anyway - so a scoped
+// build run would be a second full build for a sample the sweep has already effectively taken. The
+// day that stops being true, this is one line.
 fn exec_universes(universe: crate::shadow::Universe) -> bool {
-	matches!(universe, crate::shadow::Universe::TestGuest)
+	matches!(universe, crate::shadow::Universe::TestGuest | crate::shadow::Universe::Host | crate::shadow::Universe::DevGuest)
 }
 
 impl Store {

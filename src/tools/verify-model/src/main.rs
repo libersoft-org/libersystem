@@ -67,9 +67,21 @@ fn run() -> Result<ExitCode, String> {
 	let mut from_stdin = false;
 	let mut keys_file: Option<String> = None;
 	let mut scoped_log: Option<String> = None;
+	// The SCOPED run's log for the keyed universes - the selection executed on its own, before the
+	// sweep, so the comparison can ask whether it is executable at all rather than only whether the
+	// selector chose the right set.
+	let mut host_scoped_log: Option<String> = None;
+	let mut dev_scoped_log: Option<String> = None;
 	let mut guest_log: Option<String> = None;
 	let mut host_log: Option<String> = None;
 	let mut dev_log: Option<String> = None;
+	// The build universe's log. A full sweep's builds ARE its evidence; this is where they are read
+	// back from, and until it existed 189 of the catalog's 192 components could never reach TRUSTED.
+	let mut build_log: Option<String> = None;
+	let mut build_arch: String = String::from("x86_64");
+	// `--scoped` narrows a producer to the keys the SELECTION names, which is what an execution
+	// sample runs. Without it a producer emits the whole universe, which is the sweep.
+	let mut scoped_only = false;
 	let mut architecture: Option<String> = None;
 	let mut grant: Option<String> = None;
 	let mut range: Option<String> = None;
@@ -113,6 +125,27 @@ fn run() -> Result<ExitCode, String> {
 				index += 1;
 				dev_log = Some(arguments.get(index).ok_or("--dev-log needs a path")?.clone());
 			}
+			// The BUILD universe's results file, and the architecture it describes. Builds run per
+			// target, so one log is one target's evidence - `required_architectures` asks for two.
+			"--scoped" => {
+				scoped_only = true;
+			}
+			"--host-scoped-log" => {
+				index += 1;
+				host_scoped_log = Some(arguments.get(index).ok_or("--host-scoped-log needs a path")?.clone());
+			}
+			"--dev-scoped-log" => {
+				index += 1;
+				dev_scoped_log = Some(arguments.get(index).ok_or("--dev-scoped-log needs a path")?.clone());
+			}
+			"--build-log" => {
+				index += 1;
+				build_log = Some(arguments.get(index).ok_or("--build-log needs a path")?.clone());
+			}
+			"--build-arch" => {
+				index += 1;
+				build_arch = arguments.get(index).ok_or("--build-arch needs an architecture")?.clone();
+			}
 			"--arch" => {
 				index += 1;
 				architecture = Some(arguments.get(index).ok_or("--arch needs a value")?.clone());
@@ -148,7 +181,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "booted" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "booted" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
 	{
 		command = positional.remove(0);
 	}
@@ -199,19 +232,76 @@ fn run() -> Result<ExitCode, String> {
 		// `proto`, whatever evidence they accumulated elsewhere. A universe that cannot be fed is a
 		// universe that only ever answers no.
 		"dev-checks" => {
+			// The SELECTION's keys when `--scoped` is given: that is what an execution sample runs,
+			// and running the whole universe would be the sweep rather than a sample of it.
+			let scoped: Option<std::collections::BTreeSet<verify_model::plan::PlanItemKey>> = if scoped_only {
+				let ownership = model.ownership();
+				let planner = Planner::for_model(&model, &ownership);
+				Some(planner.plan(&paths).items.iter().map(|item| item.key.clone()).collect())
+			} else {
+				None
+			};
 			for check in &model.catalog.checks {
 				for variant in &check.variants {
 					if variant.environment == verify_model::catalog::Environment::DevGuest {
+						if let Some(scoped) = &scoped
+							&& !scoped.iter().any(|key| key.check == check.id && key.architecture == variant.architecture && key.configuration == variant.configuration)
+						{
+							continue;
+						}
 						// The whole key, like the host producer beside it - one shape for both, so
 						// the model reads one format and the comparison rebuilds nothing.
-						let command = verify_model::commands::host_command(&check.command.replace("{arch}", &variant.architecture), &variant.configuration);
+						//
+						// THROUGH THE RECORD, not the configuration's name. This ran a dev check's
+						// command - `(cd src && boot/dev-selftest.py)` - through a lowering that
+						// appends cargo flags to anything not called `default`, and emitted
+						// `(cd src && boot/dev-selftest.py) --no-default-features --features
+						// development`: a bash syntax error, so every dev-guest shadow line failed
+						// before it started and clean `DevGuest` evidence was unobtainable.
+						let configuration = model.registry.configuration(&variant.configuration).ok_or_else(|| format!("the dev check '{}' names configuration '{}', which the registry does not define", check.id, variant.configuration))?;
+						let command = verify_model::commands::lower(check.kind.clone(), &check.command.replace("{arch}", &variant.architecture), configuration);
 						println!("{}\t{}\t{}\t{}\t{}", check.id, variant.architecture, variant.environment.as_str(), variant.configuration, command);
 					}
 				}
 			}
 			Ok(ExitCode::SUCCESS)
 		}
+		// THE THIRD PRODUCER, and the one whose absence made 98% of the tree permanently untrustable.
+		//
+		// `HostBuild` was split out of `Host` because a certificate earned over gates, suites and
+		// conformance was standing for builds nothing had compared - the right change, and it left a
+		// universe with no evidence producer at all. `trusted_everywhere` requires `Trusted` in every
+		// judging universe, and `build.libs`, `build.user`, `build.kernel` and the rest cover every
+		// crate and every program under their prefix: 189 of the catalog's 192 components are judged
+		// by `HostBuild`, so 189 of them could accumulate any amount of evidence elsewhere and never
+		// arrive. Fail-closed, and a steady state 98% of the tree cannot enter is not a steady state.
+		//
+		// It costs no extra run. A full sweep already builds every part on every architecture; this
+		// says which keys those runs discharge, in the same shape the other two producers emit, so
+		// `compare_keyed` is pointed at it unchanged.
+		"build-checks" => {
+			for check in &model.catalog.checks {
+				if check.kind != verify_model::catalog::CheckKind::Build {
+					continue;
+				}
+				for variant in &check.variants {
+					// The whole key, like the two producers beside it: `(check, architecture,
+					// environment, configuration)` is what a `PlanItemKey` is, and emitting the id
+					// alone made two variants of one check produce two lines carrying one name.
+					let command = check.command.replace("{arch}", &variant.architecture);
+					println!("{}\t{}\t{}\t{}\t{}", check.id, variant.architecture, variant.environment.as_str(), variant.configuration, command);
+				}
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		"host-checks" => {
+			let host_scoped: Option<std::collections::BTreeSet<verify_model::plan::PlanItemKey>> = if scoped_only {
+				let ownership = model.ownership();
+				let planner = Planner::for_model(&model, &ownership);
+				Some(planner.plan(&paths).items.iter().map(|item| item.key.clone()).collect())
+			} else {
+				None
+			};
 			for check in &model.catalog.checks {
 				// Builds are excluded. They run on the host and they can fail, but a shadow
 				// comparison asks "did anything OUTSIDE the selection fail" - and re-running three
@@ -223,6 +313,11 @@ fn run() -> Result<ExitCode, String> {
 				}
 				for variant in &check.variants {
 					if variant.environment == verify_model::catalog::Environment::Host {
+						if let Some(scoped) = &host_scoped
+							&& !scoped.iter().any(|key| key.check == check.id && key.architecture == variant.architecture && key.configuration == variant.configuration)
+						{
+							continue;
+						}
 						// THE WHOLE KEY, not the check id. `(check, architecture, environment,
 						// configuration)` is what a `PlanItemKey` is, and emitting the id alone
 						// meant two variants of one check produced two lines carrying the same
@@ -230,8 +325,10 @@ fn run() -> Result<ExitCode, String> {
 						// declared total and the number of outcomes disagreed silently.
 						//
 						// And the command through the shared lowering, so a `shared-image` variant
-						// is actually run as one.
-						let command = verify_model::commands::host_command(&check.command.replace("{arch}", &variant.architecture), &variant.configuration);
+						// is actually run as one - from the configuration RECORD, which is what says
+						// whether a feature selection means anything to this kind of check at all.
+						let configuration = model.registry.configuration(&variant.configuration).ok_or_else(|| format!("the check '{}' names configuration '{}', which the registry does not define", check.id, variant.configuration))?;
+						let command = verify_model::commands::lower(check.kind.clone(), &check.command.replace("{arch}", &variant.architecture), configuration);
 						println!("{}\t{}\t{}\t{}\t{}", check.id, variant.architecture, variant.environment.as_str(), variant.configuration, command);
 					}
 				}
@@ -371,6 +468,27 @@ fn run() -> Result<ExitCode, String> {
 				let plan = planner.plan(&paths);
 				let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
 				let history = verify_model::history::History::load(&repo_root)?;
+				// THE EXECUTION SAMPLE, when one was taken. A dry comparison answers "did the
+				// selector choose the right set" and cannot answer "does running that set work" -
+				// and this universe has the proof that the second question is not theoretical: the
+				// dev producer next door emitted a command bash could not parse, and every dry
+				// comparison stayed clean.
+				let host_exec = match &host_scoped_log {
+					Some(path) => {
+						let scoped_text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+						let scoped_results = verify_model::shadow::parse_host_log(&scoped_text);
+						let exec = verify_model::shadow::compare_exec_keyed(&selected, &scoped_results, &results, "host", |key| key.environment == verify_model::catalog::Environment::Host && !model.catalog.checks.iter().any(|check| check.id == key.check && check.kind == verify_model::catalog::CheckKind::Build));
+						println!("shadow-exec (host): {:?}", exec.verdict);
+						println!("  {}", exec.reason);
+						for key in &exec.inside_failures {
+							println!("  SELECTED BUT DID NOT RUN: {key}");
+						}
+						Some(exec)
+					}
+					None => None,
+				};
+				// A sample that FAILED is not a sample.
+				let host_exec_clean = host_exec.as_ref().is_some_and(|exec| exec.verdict == verify_model::shadow::Verdict::Consistent);
 				let comparison = verify_model::shadow::compare_host(&selected, &results, &history);
 				println!("shadow (host): {:?}", comparison.verdict);
 				println!("  {}", comparison.reason);
@@ -383,7 +501,41 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: false, model_self_check: self_check_failures(&model, false).is_empty() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty() });
+				log.save(&repo_root)?;
+				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+			}
+			// THE BUILD UNIVERSE. Same shape as the two branches around it, and the reason it exists
+			// is that without it `HostBuild` had no producer at all: every component a build check
+			// covers - 189 of 192 - was permanently untrustable, because `trusted_everywhere` asks
+			// every judging universe and one of them could never answer.
+			//
+			// Per architecture, because a build of x86_64 says nothing about aarch64: that is what
+			// `required_architectures` asks for and what the record has to be able to supply.
+			if let Some(path) = &build_log {
+				if paths.is_empty() {
+					return Err(String::from("shadow needs the change it is validating (--paths or --stdin); comparing against nothing proves nothing"));
+				}
+				let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+				let results = verify_model::shadow::parse_host_log(&text);
+				let ownership = model.ownership();
+				let planner = Planner::for_model(&model, &ownership);
+				let plan = planner.plan(&paths);
+				let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
+				let history = verify_model::history::History::load(&repo_root)?;
+				let comparison = verify_model::shadow::compare_build(&selected, &results, &history, &model.catalog, &build_arch);
+				println!("shadow (host-build, {build_arch}): {:?}", comparison.verdict);
+				println!("  {}", comparison.reason);
+				println!("  {} build(s) ran; {} of them were in the scoped selection", comparison.ran, comparison.scoped);
+				for key in &comparison.inside_failures {
+					println!("  FAILED (selected): {key}");
+				}
+				for key in &comparison.outside_failures {
+					println!("  FAILED (not selected): {key}");
+				}
+				let mut log = verify_model::shadow::Log::load(&repo_root);
+				log.schema = 1;
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: false, model_self_check: self_check_failures(&model, false).is_empty() });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -399,6 +551,25 @@ fn run() -> Result<ExitCode, String> {
 				let plan = planner.plan(&paths);
 				let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
 				let history = verify_model::history::History::load(&repo_root)?;
+				// The same execution sample, and the universe whose producer the mechanism would
+				// have caught: `(cd src && boot/dev-selftest.py) --no-default-features --features
+				// development` is a bash syntax error, so every dev shadow line failed before it
+				// started and no dry comparison could see it.
+				let dev_exec = match &dev_scoped_log {
+					Some(path) => {
+						let scoped_text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+						let scoped_results = verify_model::shadow::parse_host_log(&scoped_text);
+						let exec = verify_model::shadow::compare_exec_keyed(&selected, &scoped_results, &results, "dev-guest", |key| key.environment == verify_model::catalog::Environment::DevGuest);
+						println!("shadow-exec (dev-guest): {:?}", exec.verdict);
+						println!("  {}", exec.reason);
+						for key in &exec.inside_failures {
+							println!("  SELECTED BUT DID NOT RUN: {key}");
+						}
+						Some(exec)
+					}
+					None => None,
+				};
+				let dev_exec_clean = dev_exec.as_ref().is_some_and(|exec| exec.verdict == verify_model::shadow::Verdict::Consistent);
 				let comparison = verify_model::shadow::compare_dev(&selected, &results, &history);
 				println!("shadow (dev-guest): {:?}", comparison.verdict);
 				println!("  {}", comparison.reason);
@@ -411,7 +582,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: false, model_self_check: self_check_failures(&model, false).is_empty() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty() });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -668,7 +839,7 @@ fn run() -> Result<ExitCode, String> {
 			// are emitted separately rather than crammed into the STEP line because a kernel-suite
 			// step carries two hundred of them, and a line the runner has to split on two different
 			// separators is a line somebody will parse wrong.
-			for (index, step) in verify_model::commands::steps(&plan, &per_target).into_iter().enumerate() {
+			for (index, step) in verify_model::commands::steps(&plan, &per_target, &model.registry).into_iter().enumerate() {
 				println!("STEP\t{}\t{}\t{}\t{}\t{}", index, step.keys.len(), step.label, step.command, step.note.unwrap_or_default());
 				for key in &step.keys {
 					println!("KEY\t{index}\t{}", key.display());
@@ -695,8 +866,10 @@ fn run() -> Result<ExitCode, String> {
 				let share = if whole > 0.0 { scoped / whole * 100.0 } else { 100.0 };
 				println!("estimated {scoped:.0} s against {whole:.0} s for everything - {share:.0}% of a full run.");
 				// The threshold is about removing a BOOT, not about running fewer tests. The fixed
-				// cost of a run dominates so heavily here (~100 s on x86_64 against ~0.2 s per test)
-				// that a selection worth 80% of the whole is bookkeeping for nothing.
+				// cost of a run dominates so heavily - `CostModel::default` carries the measured
+				// terms, and the per-test one is a fraction of a second against tens of seconds of
+				// fixed cost on every target - that a selection worth 80% of the whole is
+				// bookkeeping for nothing.
 				if !plan.full && share > 80.0 {
 					println!("that is within 80% of everything, so the scoping is not paying for itself here - consider ./verify.sh --release or a full sweep.");
 				}
@@ -788,6 +961,26 @@ fn join_or_none(items: &[String]) -> String {
 // and the record could not say which it was.
 fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 	let mut failures = Vec::new();
+
+	// EVERY JUDGING UNIVERSE HAS AN EVIDENCE PRODUCER, or the components it judges can never be
+	// trusted whatever they accumulate elsewhere.
+	//
+	// `trusted_everywhere` requires `Trusted` in every universe that judges a component, so a
+	// universe with no producer is a wall rather than a bar. That is exactly what `HostBuild` was
+	// between the split that created it and the producer that answers it: 189 of the catalog's 192
+	// components are judged by a build check, so 98% of the tree could accumulate any amount of
+	// evidence and never arrive. Fail-closed, and not a steady state.
+	//
+	// Written as a self-check rather than fixed once, because the next universe added without a
+	// producer arrives the same way this one did - as the right shape, with the other half missing.
+	{
+		let producers = verify_model::shadow::universes_with_producers();
+		let mut walled: Vec<&'static str> = verify_model::catalog::all_judging_universes(&model.catalog).into_iter().filter(|universe| !producers.contains(universe)).map(|universe| universe.as_str()).collect();
+		walled.sort_unstable();
+		if !walled.is_empty() {
+			failures.push(format!("{} universe(s) judge components and have no shadow producer, so nothing they judge can ever be TRUSTED:\n  {}", walled.len(), walled.join("\n  ")));
+		}
+	}
 
 	// The one equality an exact selection rests on: the string the model puts in `TEST_SELECTION`
 	// is the string the guest runner matches. The runner compares against the declaration's `id`,

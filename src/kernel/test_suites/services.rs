@@ -809,9 +809,15 @@ fn process_service_lists_every_started_program() {
 	// `process_service_drops_a_terminated_process_from_the_list` requires a finished one to go. The
 	// second was watched failing with the new branch widened to keep everything (`left: 1, right:
 	// 0`), which is the direction this fix could plausibly have been wrong in.
-	let (replies, list) = run_process_service_requests(&[(11, b"log_service"), (12, b"device_manager")], Some(13));
-	assert_process_start_reply(&replies[0], 11, b"log_service.lsexe");
-	assert_process_start_reply(&replies[1], 12, b"device_manager.lsexe");
+	// TWO PROGRAMS THAT CANNOT EXIT ON THEIR OWN, which is what makes this an assertion rather than
+	// a hope. It used to start `log_service` and `device_manager`, and a program whose bootstrap
+	// channel is finished with is entitled to exit: one of the two was reaped before the list request
+	// was drained twice - riscv64 2026-08-10, x86_64 2026-08-13, both in runs of two hundred - which
+	// reads exactly like a ProcessService bookkeeping defect and is not one. `holdopen` blocks on its
+	// bootstrap channel forever, so it is alive for precisely as long as this test keeps it.
+	let (replies, list) = run_process_service_requests(&[(11, b"holdopen"), (12, b"holdopen")], Some(13));
+	assert_process_start_reply(&replies[0], 11, b"holdopen.lsexe");
+	assert_process_start_reply(&replies[1], 12, b"holdopen.lsexe");
 	let list = list.expect("list reply");
 	assert_eq!(le_u32(&list, 0), 13, "list reply echoes the correlation id");
 	assert_eq!(list[4], 1, "list succeeded");

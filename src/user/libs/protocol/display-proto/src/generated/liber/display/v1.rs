@@ -23,6 +23,10 @@ impl PixelFormat {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -81,6 +85,10 @@ impl SurfaceInfo {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -146,6 +154,10 @@ impl DisplayEvent {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
@@ -207,6 +219,10 @@ impl PresentationStats {
 	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
 		let mut w = SliceWriter::new(out);
 		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
 		Some(w.pos())
 	}
 	pub fn encode_vec(&self) -> Option<Vec<u8>> {
