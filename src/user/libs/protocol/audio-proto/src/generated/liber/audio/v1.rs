@@ -51,9 +51,7 @@ pub mod audio {
 			OP_BEEP => {
 				let freq = r.u16()?;
 				let millis = r.u32()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.beep(freq, millis);
 				let encoded: Option<()> = (|| {
@@ -90,9 +88,7 @@ pub mod audio {
 			OP_OPEN_STREAM => {
 				let rate = r.u32()?;
 				let channels = r.u8()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.open_stream(rate, channels);
 				let encoded: Option<()> = (|| {
@@ -194,9 +190,11 @@ pub mod audio {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -220,16 +218,18 @@ pub mod audio {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -297,9 +297,7 @@ pub mod pcm_stream {
 					let handle = r.take_handle()?;
 					crate::codec::Buffer { handle, len }
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.write(data);
 				let encoded: Option<()> = (|| {
@@ -335,9 +333,7 @@ pub mod pcm_stream {
 				}
 			}
 			OP_CLOSE => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.close();
 				let encoded: Option<()> = (|| {
@@ -437,9 +433,11 @@ pub mod pcm_stream {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.u32()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -461,9 +459,11 @@ pub mod pcm_stream {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -521,9 +521,7 @@ pub mod audio_admin {
 		}
 		match op {
 			OP_OPEN_STREAMS => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.open_streams();
 				let encoded: Option<()> = (|| {
@@ -623,16 +621,18 @@ pub mod audio_admin {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

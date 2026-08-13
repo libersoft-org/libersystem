@@ -478,10 +478,12 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 				break;
 			}
 			if ready == 0 {
-				match recv_blocking(key_stream, &mut key_frame) {
-					Received::Message { len, handle } => {
-						let mut frame_handle = handle;
-						if let Some(event) = input::subscribe_keys_read(&key_frame[..len], &mut frame_handle) {
+				// THE MULTI-CAPABILITY RECEIVE, because a frame now carries what its element type
+				// declares rather than exactly one. `recv_blocking` takes the first and drops the
+				// rest, which is the defect this milestone is named for wearing its consumer face.
+				match recv_caps_blocking(key_stream, &mut key_frame) {
+					ReceivedCaps::Message { len, handles: frame_handles } => {
+						if let Some(event) = input::subscribe_keys_read(&key_frame[..len], &frame_handles) {
 							let action = handle_code(event.code, event.pressed, &mut viewport, framebuffer, &mut held);
 							if action == ViewAction::Exit {
 								exit_requested = true;
@@ -490,11 +492,11 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 								let _ = present_view(&display, &surface, framebuffer, target_len, &image, &viewport);
 							}
 						}
-						if frame_handle != 0 {
-							close(frame_handle);
+						for handle in frame_handles.as_slice() {
+							close(*handle);
 						}
 					}
-					Received::Closed => break,
+					ReceivedCaps::Closed => break,
 				}
 			} else if stdin_channel != 0 {
 				match recv_blocking(stdin_channel, &mut stdin_frame) {

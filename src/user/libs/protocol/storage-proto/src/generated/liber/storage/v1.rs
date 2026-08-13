@@ -567,9 +567,7 @@ pub mod volume {
 		match op {
 			OP_OPEN => {
 				let o = OpenOpts::read(r)?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.open(o);
 				let encoded: Option<()> = (|| {
@@ -611,9 +609,7 @@ pub mod volume {
 					let handle = r.take_handle()?;
 					crate::codec::Buffer { handle, len }
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.write(path, data);
 				let encoded: Option<()> = (|| {
@@ -649,9 +645,7 @@ pub mod volume {
 			}
 			OP_REMOVE => {
 				let path = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.remove(path);
 				let encoded: Option<()> = (|| {
@@ -687,9 +681,7 @@ pub mod volume {
 			}
 			OP_SNAP_CREATE => {
 				let name = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.snap_create(name);
 				let encoded: Option<()> = (|| {
@@ -724,9 +716,7 @@ pub mod volume {
 				}
 			}
 			OP_SNAP_LIST => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.snap_list();
 				let encoded: Option<()> = (|| {
@@ -769,9 +759,7 @@ pub mod volume {
 			}
 			OP_SNAP_DELETE => {
 				let name = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.snap_delete(name);
 				let encoded: Option<()> = (|| {
@@ -808,9 +796,7 @@ pub mod volume {
 			OP_SNAP_OPEN => {
 				let snapshot = r.string_lp()?;
 				let path = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.snap_open(snapshot, path);
 				let encoded: Option<()> = (|| {
@@ -847,9 +833,7 @@ pub mod volume {
 			}
 			OP_MKDIR => {
 				let path = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.mkdir(path);
 				let encoded: Option<()> = (|| {
@@ -885,9 +869,7 @@ pub mod volume {
 			}
 			OP_RMDIR => {
 				let path = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.rmdir(path);
 				let encoded: Option<()> = (|| {
@@ -922,9 +904,7 @@ pub mod volume {
 				}
 			}
 			OP_CAPACITY => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.capacity();
 				let encoded: Option<()> = (|| {
@@ -960,9 +940,7 @@ pub mod volume {
 				}
 			}
 			OP_STATUS => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.status();
 				let encoded: Option<()> = (|| {
@@ -999,9 +977,7 @@ pub mod volume {
 			}
 			OP_SET_COMPRESSION => {
 				let enabled = r.boolean()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.set_compression(enabled);
 				let encoded: Option<()> = (|| {
@@ -1036,9 +1012,7 @@ pub mod volume {
 				}
 			}
 			OP_FSCK => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.fsck();
 				let encoded: Option<()> = (|| {
@@ -1076,9 +1050,7 @@ pub mod volume {
 			OP_RESTORE => {
 				let path = r.string_lp()?;
 				let snapshot = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.restore(path, snapshot);
 				let encoded: Option<()> = (|| {
@@ -1118,9 +1090,7 @@ pub mod volume {
 					let _ = r.u32()?;
 					r.take_handle()?
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.write_stream(path, data);
 				let encoded: Option<()> = (|| {
@@ -1169,9 +1139,7 @@ pub mod volume {
 		let _op = r.u16()?;
 		let corr = r.u32()?;
 		let path = r.string_lp()?;
-		if r.has_handle() {
-			return None;
-		}
+		r.finish()?;
 		request_handles.clear();
 		let items = service.list(path);
 		Some((corr, items))
@@ -1195,7 +1163,7 @@ pub mod volume {
 		}
 		Some(writer.pos())
 	}
-	pub fn list_frame(seq: u32, item: &FileInfo, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+	pub fn list_frame(seq: u32, item: &FileInfo, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
 		let mut writer = SliceWriter::new(out);
 		let encoded: Option<()> = (|| {
 			let w = &mut writer;
@@ -1204,23 +1172,20 @@ pub mod volume {
 			Some(())
 		})();
 		if encoded.is_none() {
-			if writer.has_handle() {
-				*frame_handle = writer.handle();
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
 			}
 			return None;
 		}
-		*frame_handle = writer.handle();
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn list_read(msg: &[u8], frame_handle: &mut u64) -> Option<FileInfo> {
-		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+	pub fn list_read(msg: &[u8], frame_handles: &Handles) -> Option<FileInfo> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = FileInfo::read(r)?;
-		if reader.has_handle() {
-			return None;
-		}
-		*frame_handle = 0;
+		reader.finish()?;
 		Some(value)
 	}
 
@@ -1280,9 +1245,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(OpenResult::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(OpenResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1305,7 +1272,7 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				if r.u8()? != 0 {
+				if r.tag()? {
 					let _ = r.u32()?;
 					if reply_handles.len() != 1 {
 						return None;
@@ -1341,9 +1308,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1366,9 +1335,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1391,9 +1362,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1415,7 +1388,7 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v34 = r.u16()? as usize;
 						let mut v35 = Vec::new();
@@ -1427,9 +1400,11 @@ pub mod volume {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1452,9 +1427,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1478,9 +1455,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(OpenResult::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(OpenResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1503,9 +1482,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1528,9 +1509,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1552,9 +1535,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.u64()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.u64()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1576,9 +1561,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(VolumeStatus::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(VolumeStatus::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1601,9 +1588,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1625,9 +1614,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(FsckReport::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(FsckReport::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1651,9 +1642,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1678,9 +1671,11 @@ pub mod volume {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1852,9 +1847,7 @@ pub mod volume_admin {
 		match op {
 			OP_OPEN_DIRECTORY => {
 				let path = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.open_directory(path);
 				let encoded: Option<()> = (|| {
@@ -1955,16 +1948,18 @@ pub mod volume_admin {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

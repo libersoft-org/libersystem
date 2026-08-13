@@ -240,9 +240,7 @@ pub mod resources {
 		}
 		match op {
 			OP_USAGE => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.usage();
 				let encoded: Option<()> = (|| {
@@ -287,9 +285,7 @@ pub mod resources {
 				let name = r.string_lp()?;
 				let r#type = ResourceType::read(r)?;
 				let limit = r.u64()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.set_limit(name, r#type, limit);
 				let encoded: Option<()> = (|| {
@@ -388,7 +384,7 @@ pub mod resources {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v8 = r.u16()? as usize;
 						let mut v9 = Vec::new();
@@ -400,9 +396,11 @@ pub mod resources {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -427,9 +425,11 @@ pub mod resources {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(Budget::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(Budget::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

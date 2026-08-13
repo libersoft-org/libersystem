@@ -128,9 +128,9 @@ unsafe fn tail_log(logsvc: u64, timesvc: u64, mode: Option<JsonMode>) {
 		};
 		let mut frame: [u8; 1024] = [0u8; 1024];
 		loop {
-			match recv_blocking(consumer, &mut frame) {
-				Received::Message { len, mut handle } => {
-					if let Some(entry) = log::tail_read(&frame[..len], &mut handle) {
+			match recv_caps_blocking(consumer, &mut frame) {
+				ReceivedCaps::Message { len, handles: frame_handles } => {
+					if let Some(entry) = log::tail_read(&frame[..len], &frame_handles) {
 						if let Some(mode) = mode {
 							print(mode.render(entry.to_json()).as_bytes());
 							print(b"\n");
@@ -139,11 +139,11 @@ unsafe fn tail_log(logsvc: u64, timesvc: u64, mode: Option<JsonMode>) {
 							print(b"\n");
 						}
 					}
-					if handle != 0 {
-						close(handle);
+					for handle in frame_handles.as_slice() {
+						close(*handle);
 					}
 				}
-				Received::Closed => break,
+				ReceivedCaps::Closed => break,
 			}
 		}
 		close(consumer);

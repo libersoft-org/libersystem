@@ -1228,16 +1228,17 @@ unsafe fn close_pty(console: &mut Console, pj: usize) {
 unsafe fn handle_display_resize(console: &mut Console) {
 	unsafe {
 		let mut frame: [u8; 32] = [0u8; 32];
-		let (len, mut handle): (usize, u64) = match recv_blocking(console.display_events, &mut frame) {
-			Received::Message { len, handle } => (len, handle),
-			Received::Closed => {
+		// The multi-capability receive, because a frame carries what its element type declares.
+		let (len, frame_handles) = match recv_caps_blocking(console.display_events, &mut frame) {
+			ReceivedCaps::Message { len, handles } => (len, handles),
+			ReceivedCaps::Closed => {
 				console.display_events = 0;
 				return;
 			}
 		};
-		if surface::read_event(&frame[..len], &mut handle).is_none() {
-			if handle != 0 {
-				close(handle);
+		if surface::read_event(&frame[..len], &frame_handles).is_none() {
+			for handle in frame_handles.as_slice() {
+				close(*handle);
 			}
 			return;
 		}

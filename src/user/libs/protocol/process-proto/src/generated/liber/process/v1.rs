@@ -198,9 +198,7 @@ pub mod process {
 		match op {
 			OP_START => {
 				let name = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.start(name);
 				let encoded: Option<()> = (|| {
@@ -236,9 +234,7 @@ pub mod process {
 				}
 			}
 			OP_LIST => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.list();
 				let encoded: Option<()> = (|| {
@@ -285,9 +281,7 @@ pub mod process {
 					let _ = r.u32()?;
 					r.take_handle()?
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.launch(name, bootstrap);
 				let encoded: Option<()> = (|| {
@@ -329,9 +323,7 @@ pub mod process {
 					let _ = r.u32()?;
 					r.take_handle()?
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.launch_bounded(name, memory_limit, bootstrap);
 				let encoded: Option<()> = (|| {
@@ -367,9 +359,7 @@ pub mod process {
 				}
 			}
 			OP_ACCOUNTING => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.accounting();
 				let encoded: Option<()> = (|| {
@@ -416,9 +406,7 @@ pub mod process {
 					let _ = r.u32()?;
 					r.take_handle()?
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.launch_prepared(name, bootstrap);
 				let encoded: Option<()> = (|| {
@@ -455,9 +443,7 @@ pub mod process {
 			}
 			OP_RELEASE => {
 				let koid = r.u64()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.release(koid);
 				let encoded: Option<()> = (|| {
@@ -557,9 +543,11 @@ pub mod process {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(ProcessInfo::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(ProcessInfo::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -581,7 +569,7 @@ pub mod process {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v16 = r.u16()? as usize;
 						let mut v17 = Vec::new();
@@ -593,9 +581,11 @@ pub mod process {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -620,9 +610,11 @@ pub mod process {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -648,9 +640,11 @@ pub mod process {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -672,7 +666,7 @@ pub mod process {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v18 = r.u16()? as usize;
 						let mut v19 = Vec::new();
@@ -684,9 +678,11 @@ pub mod process {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -711,9 +707,11 @@ pub mod process {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(StartResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -736,9 +734,11 @@ pub mod process {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.boolean()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.boolean()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

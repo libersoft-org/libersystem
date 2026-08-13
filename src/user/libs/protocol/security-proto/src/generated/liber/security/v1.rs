@@ -428,9 +428,7 @@ pub mod permission {
 		match op {
 			OP_LOOKUP => {
 				let component = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.lookup(component);
 				let encoded: Option<()> = (|| {
@@ -482,9 +480,7 @@ pub mod permission {
 					let _ = r.u32()?;
 					r.take_handle()?
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.run(name, args, cwd, environment, stdout);
 				let encoded: Option<()> = (|| {
@@ -543,9 +539,7 @@ pub mod permission {
 					let _ = r.u32()?;
 					r.take_handle()?
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.run_pipeline(stages, cwd, environment, stdout);
 				let encoded: Option<()> = (|| {
@@ -594,14 +588,12 @@ pub mod permission {
 		let r = &mut reader;
 		let _op = r.u16()?;
 		let corr = r.u32()?;
-		if r.has_handle() {
-			return None;
-		}
+		r.finish()?;
 		request_handles.clear();
 		let items = service.audit();
 		Some((corr, items))
 	}
-	pub fn audit_frame(seq: u32, item: &AuditEntry, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+	pub fn audit_frame(seq: u32, item: &AuditEntry, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
 		let mut writer = SliceWriter::new(out);
 		let encoded: Option<()> = (|| {
 			let w = &mut writer;
@@ -610,23 +602,20 @@ pub mod permission {
 			Some(())
 		})();
 		if encoded.is_none() {
-			if writer.has_handle() {
-				*frame_handle = writer.handle();
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
 			}
 			return None;
 		}
-		*frame_handle = writer.handle();
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn audit_read(msg: &[u8], frame_handle: &mut u64) -> Option<AuditEntry> {
-		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+	pub fn audit_read(msg: &[u8], frame_handles: &Handles) -> Option<AuditEntry> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = AuditEntry::read(r)?;
-		if reader.has_handle() {
-			return None;
-		}
-		*frame_handle = 0;
+		reader.finish()?;
 		Some(value)
 	}
 
@@ -686,9 +675,11 @@ pub mod permission {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(Manifest::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(Manifest::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -740,9 +731,11 @@ pub mod permission {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(ProcessStartResult::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(ProcessStartResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -781,9 +774,11 @@ pub mod permission {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(PipelineResult::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(PipelineResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

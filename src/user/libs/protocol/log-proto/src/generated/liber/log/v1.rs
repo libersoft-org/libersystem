@@ -282,10 +282,10 @@ impl Query {
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<Query> {
-		let since = if r.u8()? != 0 { Some(r.u64()?) } else { None };
-		let min_severity = if r.u8()? != 0 { Some(Severity::read(r)?) } else { None };
-		let source = if r.u8()? != 0 { Some(r.string_lp()?) } else { None };
-		let boot = if r.u8()? != 0 { Some(r.u32()?) } else { None };
+		let since = if r.tag()? { Some(r.u64()?) } else { None };
+		let min_severity = if r.tag()? { Some(Severity::read(r)?) } else { None };
+		let source = if r.tag()? { Some(r.string_lp()?) } else { None };
+		let boot = if r.tag()? { Some(r.u32()?) } else { None };
 		let limit = r.u32()?;
 		Some(Query { since, min_severity, source, boot, limit })
 	}
@@ -328,9 +328,7 @@ pub mod log {
 		match op {
 			OP_EMIT => {
 				let e = Entry::read(r)?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.emit(e);
 				let encoded: Option<()> = (|| {
@@ -366,9 +364,7 @@ pub mod log {
 			}
 			OP_QUERY => {
 				let q = Query::read(r)?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.query(q);
 				let encoded: Option<()> = (|| {
@@ -424,14 +420,12 @@ pub mod log {
 		let _op = r.u16()?;
 		let corr = r.u32()?;
 		let q = Query::read(r)?;
-		if r.has_handle() {
-			return None;
-		}
+		r.finish()?;
 		request_handles.clear();
 		let items = service.tail(q);
 		Some((corr, items))
 	}
-	pub fn tail_frame(seq: u32, item: &Entry, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+	pub fn tail_frame(seq: u32, item: &Entry, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
 		let mut writer = SliceWriter::new(out);
 		let encoded: Option<()> = (|| {
 			let w = &mut writer;
@@ -440,23 +434,20 @@ pub mod log {
 			Some(())
 		})();
 		if encoded.is_none() {
-			if writer.has_handle() {
-				*frame_handle = writer.handle();
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
 			}
 			return None;
 		}
-		*frame_handle = writer.handle();
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn tail_read(msg: &[u8], frame_handle: &mut u64) -> Option<Entry> {
-		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+	pub fn tail_read(msg: &[u8], frame_handles: &Handles) -> Option<Entry> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = Entry::read(r)?;
-		if reader.has_handle() {
-			return None;
-		}
-		*frame_handle = 0;
+		reader.finish()?;
 		Some(value)
 	}
 
@@ -516,9 +507,11 @@ pub mod log {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -541,7 +534,7 @@ pub mod log {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v12 = r.u16()? as usize;
 						let mut v13 = Vec::new();
@@ -553,9 +546,11 @@ pub mod log {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

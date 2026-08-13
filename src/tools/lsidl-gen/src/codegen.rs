@@ -473,7 +473,12 @@ impl Cg {
 					self.line(&format!("\t\t\t\tlet {pn} = {expr};"));
 					args.push(pn);
 				}
-				self.line("\t\t\t\tif r.has_handle() { return None; }");
+				// `finish`, NOT `has_handle`. The handle half was checked and the BYTE half was
+				// not, so `[OP][corr]` and `[OP][corr][DE AD BE EF]` were the same request: a
+				// message its writer and its reader disagree about, accepted. `Reader::finish`
+				// answers both halves and is the primitive `decode` has always used - it was
+				// called at the codec boundary and at none of the framing boundaries.
+				self.line("\t\t\t\tr.finish()?;");
 				self.line("\t\t\t\trequest_handles.clear();");
 				self.line(&format!("\t\t\t\tlet result = service.{}({});", field_ident(&m.name), args.join(", ")));
 				let code = self.write_place(&m.ret, "result", false).map_err(|e| Error::new(m.span, e))?;
@@ -556,7 +561,8 @@ impl Cg {
 					self.line(&format!("\t\tlet {pn} = {expr};"));
 					args.push(pn);
 				}
-				self.line("\t\tif r.has_handle() { return None; }");
+				// The same framing boundary as the dispatch above, and the same primitive.
+				self.line("\t\tr.finish()?;");
 				self.line("\t\trequest_handles.clear();");
 				self.line(&format!("\t\tlet items = service.{mname}({});", args.join(", ")));
 				self.line("\t\tSome((corr, items))");
@@ -591,7 +597,19 @@ impl Cg {
 					self.line("\t\tSome(writer.pos())");
 					self.line("\t}");
 				}
-				self.line(&format!("\tpub fn {mname}_frame(seq: u32, item: &{et}, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {{"));
+				// A FRAME CARRIES A BOUNDED LIST, like every other message on this wire.
+				//
+				// It carried exactly one: `*frame_handle = writer.handle()` took the FIRST and
+				// discarded the rest, and the reader was `Reader::with_handle`. When the validator
+				// was relaxed to let a record carry several capabilities, a stream element could
+				// declare two - and the second would be created, written into the writer, dropped
+				// by the encoder, and decoded by the client as a placeholder. The refusal in
+				// `check_stream_frames` held that gap shut; this is what lets it be lifted.
+				//
+				// The out-parameter stays an out-parameter for the reason the reply's does: the
+				// caller owns the capabilities either way, and on a failed encode it has to be able
+				// to close what was already recorded.
+				self.line(&format!("\tpub fn {mname}_frame(seq: u32, item: &{et}, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {{"));
 				self.line("\t\tlet mut writer = SliceWriter::new(out);");
 				self.line("\t\tlet encoded: Option<()> = (|| {");
 				self.line("\t\t\tlet w = &mut writer;");
@@ -601,20 +619,25 @@ impl Cg {
 				self.line("\t\t\tSome(())");
 				self.line("\t\t})();");
 				self.line("\t\tif encoded.is_none() {");
-				self.line("\t\t\tif writer.has_handle() { *frame_handle = writer.handle(); }");
+				// Whatever the half-written frame recorded goes back to the caller, which is the
+				// only party that can close it. `try_from_slice` cannot fail here - the writer is
+				// bounded by the same `MAX_HANDLES` - and a failure is answered by leaving the
+				// caller's list untouched rather than by inventing one.
+				self.line("\t\t\tif let Some(taken) = Handles::try_from_slice(writer.handles()) { *frame_handles = taken; }");
 				self.line("\t\t\treturn None;");
 				self.line("\t\t}");
-				self.line("\t\t*frame_handle = writer.handle();");
+				self.line("\t\t*frame_handles = Handles::try_from_slice(writer.handles())?;");
 				self.line("\t\tSome(writer.pos())");
 				self.line("\t}");
-				self.line(&format!("\tpub fn {mname}_read(msg: &[u8], frame_handle: &mut u64) -> Option<{et}> {{"));
-				self.line("\t\tlet mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };");
+				self.line(&format!("\tpub fn {mname}_read(msg: &[u8], frame_handles: &Handles) -> Option<{et}> {{"));
+				self.line("\t\tlet mut reader = Reader::with_handles(msg, frame_handles);");
 				self.line("\t\tlet r = &mut reader;");
 				self.line("\t\tlet _seq = r.u32()?;");
 				let expr = self.read_value(elem).map_err(|e| Error::new(m.span, e))?;
 				self.line(&format!("\t\tlet value = {expr};"));
-				self.line("\t\tif reader.has_handle() { return None; }");
-				self.line("\t\t*frame_handle = 0;");
+				// A frame is a message too: trailing bytes after the item are a frame its writer
+				// and its reader disagree about.
+				self.line("\t\treader.finish()?;");
 				self.line("\t\tSome(value)");
 				self.line("\t}");
 				self.line("");
@@ -706,7 +729,9 @@ impl Cg {
 						// is a capability, so they are discarded rather than dropped.
 						self.line("\t\t\tlet decoded = (|| {");
 						self.line("\t\t\t\tif r.u32()? != corr { return None; }");
-						self.line("\t\t\t\tif r.u8()? != 0 {");
+						// `r.tag()?`, not `r.u8()? != 0`: one encoding per value, the same rule
+						// `Reader::boolean` states. This spelling decoded `0xff` as `Ok`.
+						self.line("\t\t\t\tif r.tag()? {");
 						self.line("\t\t\t\t\tlet _ = r.u32()?;");
 						self.line("\t\t\t\t\tif reply_handles.len() != 1 { return None; }");
 						self.line("\t\t\t\t\treturn Some(Ok(reply_handles.first()));");
@@ -744,9 +769,14 @@ impl Cg {
 			self.line("\t\t\tlet decoded = (|| {");
 			self.line("\t\t\t\tlet r = &mut reader;");
 			self.line("\t\t\t\tif r.u32()? != corr { return None; }");
-			self.line(&format!("\t\t\t\tSome({retexpr})"));
+			self.line(&format!("\t\t\t\tlet value = {retexpr};"));
+			// The reply's framing boundary. `has_handle` below caught an untaken capability and
+			// nothing caught a trailing byte, so a reply could carry anything after its value and
+			// decode as though it had not.
+			self.line("\t\t\t\tr.finish()?;");
+			self.line("\t\t\t\tSome(value)");
 			self.line("\t\t\t})();");
-			self.line("\t\t\tif decoded.is_none() || reader.has_handle() {");
+			self.line("\t\t\tif decoded.is_none() {");
 			self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
 			self.line("\t\t\t\treturn None;");
 			self.line("\t\t\t}");
@@ -854,7 +884,9 @@ impl Cg {
 				Some(alias) => self.read_value(&alias)?,
 				None => format!("{}::read(r)?", camel(n)),
 			},
-			Type::Option(inner) => format!("if r.u8()? != 0 {{ Some({}) }} else {{ None }}", self.read_value(inner)?),
+			// `r.tag()?` - the strict discriminant. This was `r.u8()? != 0`, so every byte from 2 to
+			// 255 decoded as `Some`, in a generator whose `bool` had been fixed for exactly that.
+			Type::Option(inner) => format!("if r.tag()? {{ Some({}) }} else {{ None }}", self.read_value(inner)?),
 			Type::List(inner) => {
 				let n = self.fresh();
 				let acc = self.fresh();
@@ -873,7 +905,9 @@ impl Cg {
 				}
 				format!("({})", parts.join(", "))
 			}
-			Type::Result(okty, errty) => format!("if r.u8()? != 0 {{ Ok({}) }} else {{ Err({}) }}", self.read_value(okty)?, self.read_value(errty)?),
+			// The same strict tag: `0xff` used to decode as `Ok`, which is the malleability a reply
+			// can least afford - it turns an error into a success with a garbage payload.
+			Type::Result(okty, errty) => format!("if r.tag()? {{ Ok({}) }} else {{ Err({}) }}", self.read_value(okty)?, self.read_value(errty)?),
 			Type::Handle(_) => "{ let _ = r.u32()?; r.take_handle()? }".into(),
 			Type::Buffer => "{ let len = r.u64()?; let handle = r.take_handle()?; crate::codec::Buffer { handle, len } }".into(),
 			Type::Stream(_) => return Err("stream is not supported in a value position".into()),

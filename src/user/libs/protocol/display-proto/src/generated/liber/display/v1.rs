@@ -313,9 +313,7 @@ pub mod display {
 			OP_ACQUIRE => {
 				let width = r.u32()?;
 				let height = r.u32()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.acquire(width, height);
 				let encoded: Option<()> = (|| {
@@ -355,9 +353,7 @@ pub mod display {
 				let y = r.u32()?;
 				let width = r.u32()?;
 				let height = r.u32()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.present(x, y, width, height);
 				let encoded: Option<()> = (|| {
@@ -392,9 +388,7 @@ pub mod display {
 				}
 			}
 			OP_RELEASE => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.release();
 				let encoded: Option<()> = (|| {
@@ -429,9 +423,7 @@ pub mod display {
 				}
 			}
 			OP_INPUT_FOCUS => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.input_focus();
 				let encoded: Option<()> = (|| {
@@ -481,14 +473,12 @@ pub mod display {
 		let r = &mut reader;
 		let _op = r.u16()?;
 		let corr = r.u32()?;
-		if r.has_handle() {
-			return None;
-		}
+		r.finish()?;
 		request_handles.clear();
 		let items = service.events();
 		Some((corr, items))
 	}
-	pub fn events_frame(seq: u32, item: &DisplayEvent, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+	pub fn events_frame(seq: u32, item: &DisplayEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
 		let mut writer = SliceWriter::new(out);
 		let encoded: Option<()> = (|| {
 			let w = &mut writer;
@@ -497,23 +487,20 @@ pub mod display {
 			Some(())
 		})();
 		if encoded.is_none() {
-			if writer.has_handle() {
-				*frame_handle = writer.handle();
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
 			}
 			return None;
 		}
-		*frame_handle = writer.handle();
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn events_read(msg: &[u8], frame_handle: &mut u64) -> Option<DisplayEvent> {
-		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+	pub fn events_read(msg: &[u8], frame_handles: &Handles) -> Option<DisplayEvent> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = DisplayEvent::read(r)?;
-		if reader.has_handle() {
-			return None;
-		}
-		*frame_handle = 0;
+		reader.finish()?;
 		Some(value)
 	}
 
@@ -574,9 +561,11 @@ pub mod display {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(SurfaceInfo::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(SurfaceInfo::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -602,9 +591,11 @@ pub mod display {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -626,9 +617,11 @@ pub mod display {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -668,16 +661,18 @@ pub mod display {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -767,9 +762,7 @@ pub mod display_admin {
 					let _ = r.u32()?;
 					r.take_handle()?
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.bind(task);
 				let encoded: Option<()> = (|| {
@@ -806,9 +799,7 @@ pub mod display_admin {
 				}
 			}
 			OP_STATS => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.stats();
 				let encoded: Option<()> = (|| {
@@ -893,16 +884,18 @@ pub mod display_admin {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -924,9 +917,11 @@ pub mod display_admin {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(PresentationStats::read(r)?)
+				let value = PresentationStats::read(r)?;
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

@@ -161,9 +161,7 @@ pub mod device {
 		}
 		match op {
 			OP_LIST => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.list();
 				let encoded: Option<()> = (|| {
@@ -206,9 +204,7 @@ pub mod device {
 			}
 			OP_GET => {
 				let index = r.u32()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.get(index);
 				let encoded: Option<()> = (|| {
@@ -307,7 +303,7 @@ pub mod device {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v5 = r.u16()? as usize;
 						let mut v6 = Vec::new();
@@ -319,9 +315,11 @@ pub mod device {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -344,9 +342,11 @@ pub mod device {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(DeviceEntry::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(DeviceEntry::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -472,9 +472,7 @@ pub mod usb {
 		}
 		match op {
 			OP_LIST => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.list();
 				let encoded: Option<()> = (|| {
@@ -579,7 +577,7 @@ pub mod usb {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v10 = r.u16()? as usize;
 						let mut v11 = Vec::new();
@@ -591,9 +589,11 @@ pub mod usb {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

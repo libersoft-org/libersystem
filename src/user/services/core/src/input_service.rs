@@ -24,6 +24,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use keys::KeyState;
+use proto::codec::Handles;
 use proto::system::input;
 use proto::system::input_admin::{self, Service as AdminService};
 use proto::system::{Error, KeyEvent, PointerEvent};
@@ -114,17 +115,17 @@ impl Input {
 	fn send_key(&mut self, event: KeyEvent) -> bool {
 		let Some(stream) = self.key_stream.as_mut() else { return false };
 		let mut frame: [u8; 32] = [0; 32];
-		let mut frame_handle: u64 = 0;
-		let sent: bool = match input::subscribe_keys_frame(stream.seq, &event, &mut frame, &mut frame_handle) {
-			Some(len) => unsafe { try_send(stream.producer, &frame[..len], frame_handle) },
+		let mut frame_handles = Handles::new();
+		let sent: bool = match input::subscribe_keys_frame(stream.seq, &event, &mut frame, &mut frame_handles) {
+			Some(len) => unsafe { try_send_caps(stream.producer, &frame[..len], frame_handles.as_slice()) },
 			None => false,
 		};
 		if sent {
 			stream.seq = stream.seq.wrapping_add(1);
 			true
 		} else {
-			if frame_handle != 0 {
-				unsafe { close(frame_handle) };
+			for handle in frame_handles.as_slice() {
+				unsafe { close(*handle) };
 			}
 			let dead: KeyStream = self.key_stream.take().unwrap();
 			unsafe { close(dead.producer) };
@@ -484,15 +485,19 @@ fn stream_subscribe(service: u64, request: &[u8], state: &mut Input) {
 	}
 	let mut frame: [u8; 32] = [0u8; 32];
 	for (seq, item) in items.iter().enumerate() {
-		let mut frame_handle: u64 = 0;
-		if let Some(n) = input::subscribe_frame(seq as u32, item, &mut frame, &mut frame_handle) {
+		let mut frame_handles = Handles::new();
+		if let Some(n) = input::subscribe_frame(seq as u32, item, &mut frame, &mut frame_handles) {
 			unsafe {
-				if !send_blocking(producer, &frame[..n], frame_handle) && frame_handle != 0 {
-					close(frame_handle);
+				if !send_caps_blocking(producer, &frame[..n], frame_handles.as_slice()) {
+					for handle in frame_handles.as_slice() {
+						close(*handle);
+					}
 				}
 			}
-		} else if frame_handle != 0 {
-			unsafe { close(frame_handle) };
+		} else {
+			for handle in frame_handles.as_slice() {
+				unsafe { close(*handle) };
+			}
 		}
 	}
 	unsafe {

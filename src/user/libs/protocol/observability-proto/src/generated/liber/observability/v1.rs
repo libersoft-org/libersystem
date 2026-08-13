@@ -452,9 +452,7 @@ pub mod system_graph {
 		}
 		match op {
 			OP_SNAPSHOT => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.snapshot();
 				let encoded: Option<()> = (|| {
@@ -553,9 +551,11 @@ pub mod system_graph {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(Graph::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(Graph::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -674,9 +674,7 @@ pub mod supervisor {
 		}
 		match op {
 			OP_STATUS => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.status();
 				let encoded: Option<()> = (|| {
@@ -781,7 +779,7 @@ pub mod supervisor {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v14 = r.u16()? as usize;
 						let mut v15 = Vec::new();
@@ -793,9 +791,11 @@ pub mod supervisor {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

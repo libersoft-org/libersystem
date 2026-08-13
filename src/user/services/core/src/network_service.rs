@@ -25,7 +25,7 @@ use ipc_client::ChannelTransport;
 use rt::*;
 
 use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack, TCP_SEGMENT_OVERHEAD};
-use proto::codec::Buffer;
+use proto::codec::{Buffer, Handles};
 use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetCapacity, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, config, listener, network, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
@@ -430,14 +430,18 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 								send_blocking(chan, &corr.to_le_bytes(), consumer);
 								slot.stream_seq = 0;
 								for item in &items {
-									let mut frame_handle: u64 = 0;
-									if let Some(fl) = socket::recv_frame(slot.stream_seq, item, out, &mut frame_handle) {
-										if !send_blocking(producer, &out[..fl], frame_handle) && frame_handle != 0 {
-											close(frame_handle);
+									let mut frame_handles = Handles::new();
+									if let Some(fl) = socket::recv_frame(slot.stream_seq, item, out, &mut frame_handles) {
+										if !send_caps_blocking(producer, &out[..fl], frame_handles.as_slice()) {
+											for handle in frame_handles.as_slice() {
+												close(*handle);
+											}
 										}
 										slot.stream_seq += 1;
-									} else if frame_handle != 0 {
-										close(frame_handle);
+									} else {
+										for handle in frame_handles.as_slice() {
+											close(*handle);
+										}
 									}
 								}
 								slot.stream_prod = producer;
@@ -1259,12 +1263,12 @@ unsafe fn stream_pump(ci: usize, frames: u64, stack: &mut Stack, tx: &mut [u8], 
 			// the frame grows with the chunk: encoded exactly, sent as one message
 			// (the consumer receives it exactly-sized via the peek).
 			let mut frame: Vec<u8> = alloc::vec![0u8; 8 + chunk.data.len() + 16];
-			let mut frame_handle: u64 = 0;
-			match socket::recv_frame(*seq, &chunk, &mut frame, &mut frame_handle) {
+			let mut frame_handles = Handles::new();
+			match socket::recv_frame(*seq, &chunk, &mut frame, &mut frame_handles) {
 				Some(fl) => {
-					if !send_blocking(producer, &frame[..fl], frame_handle) {
-						if frame_handle != 0 {
-							close(frame_handle);
+					if !send_caps_blocking(producer, &frame[..fl], frame_handles.as_slice()) {
+						for handle in frame_handles.as_slice() {
+							close(*handle);
 						}
 						close(producer);
 						return 0;
@@ -1272,8 +1276,8 @@ unsafe fn stream_pump(ci: usize, frames: u64, stack: &mut Stack, tx: &mut [u8], 
 					*seq += 1;
 				}
 				None => {
-					if frame_handle != 0 {
-						close(frame_handle);
+					for handle in frame_handles.as_slice() {
+						close(*handle);
 					}
 					return producer;
 				}

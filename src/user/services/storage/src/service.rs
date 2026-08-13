@@ -45,7 +45,7 @@ use iso9660::Iso9660;
 use liberfs::{BlockDevice, FsError, LiberFs, MountError};
 use libermemfs::{LiberMemFs, Policy as MemPolicy};
 use proto::codec::Buffer;
-use proto::codec::{Sink, SliceWriter};
+use proto::codec::{Handles, Sink, SliceWriter};
 use proto::system::{Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume, volume_admin};
 use rt::*;
 use udf::Udf;
@@ -1135,18 +1135,18 @@ fn pump_list(p: &mut PendingList) -> bool {
 				SendOutcome::Stalled => (unsafe { clock() }) >= p.expires,
 			};
 		}
-		let mut frame_handle: u64 = 0;
-		let Some(n) = volume::list_frame(p.seq as u32, &p.items[p.seq], &mut frame, &mut frame_handle) else {
+		let mut frame_handles = Handles::new();
+		let Some(n) = volume::list_frame(p.seq as u32, &p.items[p.seq], &mut frame, &mut frame_handles) else {
 			// An entry that will not encode ENDS the listing, without the terminal frame, so the
 			// client is told the answer is incomplete. Skipping it produced a directory listing
 			// that silently lacked a name - the same defect as a truncated one, one entry at a
 			// time, and the reader cannot see the gap because it ignores the sequence number.
-			if frame_handle != 0 {
-				unsafe { close(frame_handle) };
+			for handle in frame_handles.as_slice() {
+				unsafe { close(*handle) };
 			}
 			return true;
 		};
-		match unsafe { try_send_outcome(p.producer, &frame[..n], frame_handle) } {
+		match unsafe { try_send_caps_outcome(p.producer, &frame[..n], frame_handles.as_slice()) } {
 			SendOutcome::Delivered => {
 				p.seq += 1;
 				continue;
@@ -1154,16 +1154,16 @@ fn pump_list(p: &mut PendingList) -> bool {
 			// Nobody is there. Waiting out the deadline for a consumer that has closed wakes the
 			// loop every tick and refuses the next listing, for nothing.
 			SendOutcome::Failed => {
-				if frame_handle != 0 {
-					unsafe { close(frame_handle) };
+				for handle in frame_handles.as_slice() {
+					unsafe { close(*handle) };
 				}
 				return true;
 			}
 			// The queue is full. Give up only once the consumer has had long enough; otherwise
 			// come back on the next pass.
 			SendOutcome::Stalled => {
-				if frame_handle != 0 {
-					unsafe { close(frame_handle) };
+				for handle in frame_handles.as_slice() {
+					unsafe { close(*handle) };
 				}
 				return unsafe { clock() } >= p.expires;
 			}

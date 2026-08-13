@@ -1581,9 +1581,11 @@ unsafe fn mouse_cmd(inputsvc: u64) {
 		let mut buf: [u8; 32] = [0u8; 32];
 		let mut count: usize = 0;
 		loop {
-			match recv_blocking(consumer, &mut buf) {
-				Received::Message { len, mut handle } => {
-					if let Some(event) = input::subscribe_read(&buf[..len], &mut handle) {
+			// The multi-capability receive: a frame carries what its element type declares, and
+			// `recv_blocking` takes the first and drops the rest.
+			match recv_caps_blocking(consumer, &mut buf) {
+				ReceivedCaps::Message { len, handles: frame_handles } => {
+					if let Some(event) = input::subscribe_read(&buf[..len], &frame_handles) {
 						print(b"  (");
 						print_usize(event.col as usize);
 						print(b", ");
@@ -1593,11 +1595,11 @@ unsafe fn mouse_cmd(inputsvc: u64) {
 						print(b"\n");
 						count += 1;
 					}
-					if handle != 0 {
-						close(handle);
+					for handle in frame_handles.as_slice() {
+						close(*handle);
 					}
 				}
-				Received::Closed => break,
+				ReceivedCaps::Closed => break,
 			}
 		}
 		close(consumer);

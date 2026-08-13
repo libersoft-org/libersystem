@@ -13,7 +13,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use pix::{Image, Rect, Target};
-use proto::codec::Buffer;
+use proto::codec::{Buffer, Handles};
 use proto::system::display::{self, Service};
 use proto::system::display_admin::{self, Service as AdminService};
 use proto::system::{DisplayEvent, Error, PixelFormat, PresentationStats, SurfaceInfo};
@@ -297,17 +297,17 @@ impl DisplayState {
 		let mut frame: [u8; 32] = [0; 32];
 		let mut i: usize = 0;
 		while i < self.events.len() {
-			let mut frame_handle: u64 = 0;
-			let sent: bool = match display::events_frame(self.events[i].seq, &event, &mut frame, &mut frame_handle) {
-				Some(n) => unsafe { send_blocking(self.events[i].producer, &frame[..n], frame_handle) },
+			let mut frame_handles = Handles::new();
+			let sent: bool = match display::events_frame(self.events[i].seq, &event, &mut frame, &mut frame_handles) {
+				Some(n) => unsafe { send_caps_blocking(self.events[i].producer, &frame[..n], frame_handles.as_slice()) },
 				None => false,
 			};
 			if sent {
 				self.events[i].seq = self.events[i].seq.wrapping_add(1);
 				i += 1;
 			} else {
-				if frame_handle != 0 {
-					unsafe { close(frame_handle) };
+				for handle in frame_handles.as_slice() {
+					unsafe { close(*handle) };
 				}
 				let dead: EventStream = self.events.swap_remove(i);
 				unsafe { close(dead.producer) };

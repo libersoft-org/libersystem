@@ -960,31 +960,37 @@ pub unsafe fn recv_vec_deadline(channel: u64, max: usize, deadline: u64) -> Boun
 // which a plain close cannot express: "the channel closed" is what a finished stream looks like
 // too, so a consumer had no way to tell the whole of a directory from the first sixty-four entries
 // of it. Producers that do not send the marker should use `drain_stream`.
-pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
+pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
 	unsafe {
 		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
 		loop {
-			match recv_vec_blocking(consumer) {
-				ReceivedVec::Message { bytes, mut handle } => {
+			// EVERY CAPABILITY THE FRAME CARRIED. This took the first and dropped the rest, which
+			// was true to a frame transport that sent exactly one - and that transport now sends
+			// what the element type declares. A drainer that keeps one of three is the defect this
+			// milestone is named for wearing its consumer face.
+			let mut handles = wire::Handles::new();
+			match recv_vec_caps_blocking(consumer, &mut handles) {
+				ReceivedVecCaps::Message { bytes } => {
 					// The terminal frame: everything before it was the whole answer.
 					if bytes.is_empty() {
-						if handle != 0 {
-							close(handle);
+						for handle in handles.as_slice() {
+							close(*handle);
 						}
 						close(consumer);
 						return Some(items);
 					}
 					// DECODE first, then close what the decoder did not claim - the order
-					// `drain_stream` already uses. Closing first and then handing the same
-					// still-non-zero number to `read` gave the decoder a handle that was already
-					// gone. Harmless for `FileInfo`, which carries none, and wrong for the generic
-					// helper this is.
-					let decoded = read(&bytes, &mut handle);
-					// Whatever the decoder left behind is ours to close, on both paths.
-					if handle != 0 {
-						close(handle);
-					}
+					// `drain_stream` already uses. Closing first and then handing the same numbers
+					// to `read` gave the decoder handles that were already gone.
+					let decoded = read(&bytes, &handles);
+					// Whatever the decoder left behind is ours to close, on both paths. The reader
+					// takes what it wants out of a copy, so the list here still names them all;
+					// closing a handle the decoded value kept is what `Handles` ownership rules
+					// out, and the frame's capabilities belong to the decoded item.
 					let Some(item) = decoded else {
+						for handle in handles.as_slice() {
+							close(*handle);
+						}
 						close(consumer);
 						return None;
 					};
@@ -994,9 +1000,13 @@ pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &mut u64) -> Option<T>>(cons
 					}
 					items.push(item);
 				}
-				// Closed WITHOUT the terminal frame: the producer stopped early, and what arrived is
-				// a prefix rather than an answer.
-				ReceivedVec::Closed | ReceivedVec::Failed => {
+				ReceivedVecCaps::Closed => {
+					// A stream that ended before its terminal frame is an INCOMPLETE answer, which
+					// is what this variant of the drainer refuses to hand back as a whole one.
+					close(consumer);
+					return None;
+				}
+				ReceivedVecCaps::Failed => {
 					close(consumer);
 					return None;
 				}
@@ -1005,20 +1015,21 @@ pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &mut u64) -> Option<T>>(cons
 	}
 }
 
-pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
+pub unsafe fn drain_stream<T, F: Fn(&[u8], &wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
 	unsafe {
 		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
 		loop {
-			match recv_vec_blocking(consumer) {
-				ReceivedVec::Message { bytes, mut handle } => {
-					let decoded = read(&bytes, &mut handle);
-					if handle != 0 {
-						close(handle);
-					}
+			let mut handles = wire::Handles::new();
+			match recv_vec_caps_blocking(consumer, &mut handles) {
+				ReceivedVecCaps::Message { bytes } => {
+					let decoded = read(&bytes, &handles);
 					// A frame that will not decode ENDS the stream. Skipping it and carrying on
 					// returned a short list as a complete one - the same defect the transport was
 					// just fixed for, one layer down in the decoder.
 					let Some(item) = decoded else {
+						for handle in handles.as_slice() {
+							close(*handle);
+						}
 						close(consumer);
 						return None;
 					};
@@ -1031,8 +1042,8 @@ pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut u64) -> Option<T>>(consumer: u64
 					}
 					items.push(item);
 				}
-				ReceivedVec::Closed => break,
-				ReceivedVec::Failed => {
+				ReceivedVecCaps::Closed => break,
+				ReceivedVecCaps::Failed => {
 					close(consumer);
 					return None;
 				}
@@ -2048,16 +2059,15 @@ pub enum ReceivedCaps {
 // stdin, stdout and stderr had two of them DESTROYED before the server's dispatch was reached: not
 // refused, destroyed. Eleven hand-written dispatch loops did the same thing for the same reason.
 //
-// The single-handle receive stays for bootstrap and stream messages, which carry at most one
-// BECAUSE THE VALIDATOR REFUSES ANYTHING ELSE - `check_stream_frames` in `lsidl-gen` rejects a stream
-// whose element type carries several capabilities, with a diagnostic saying the transport sends
-// exactly one. "By construction" is what this said, and it stopped being true the moment
-// `report_cardinality` was relaxed to accept `Many` for replies: the schema could then express a
-// two-capability frame that `{method}_frame` would silently drop the second half of. A claim about a
-// rule somewhere else has to name the rule, or nobody notices when the rule moves.
+// The single-handle receive stays for BOOTSTRAP, which is a hand-written protocol that carries one
+// capability per message by its own design. Stream frames used to be the other exemption, on the
+// grounds that they carry at most one "by construction" - a claim about a rule somewhere else, which
+// stopped being true the moment `report_cardinality` was relaxed to accept several capabilities for
+// replies. The frame transport carries a bounded list now, so a frame consumer uses this like every
+// other typed path.
 //
-// A typed path may not use it, and `check-single-cap-receive.sh` is what keeps a new one from
-// appearing.
+// A typed path may not use the single-handle receive, and `check-single-cap-receive.sh` is what keeps
+// a new one from appearing.
 pub unsafe fn recv_caps_blocking(channel: u64, buf: &mut [u8]) -> ReceivedCaps {
 	unsafe {
 		let mut raw = [0u64; MAX_MESSAGE_CAPS];
@@ -2135,6 +2145,31 @@ pub unsafe fn send_caps_deadline(channel: u64, bytes: &[u8], handles: &[u64], de
 	}
 }
 
+// `try_send` for a message that carries a bounded LIST of capabilities.
+//
+// The frame path needs it: a stream producer must not block on a consumer that has stopped reading -
+// that is what `try_send` was for - and a frame now carries what its element type declares rather
+// than exactly one. Empty is the ordinary case and goes through `try_send`, because `send_caps`
+// refuses an empty list by contract.
+pub unsafe fn try_send_caps(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {
+	unsafe { matches!(try_send_caps_outcome(channel, bytes, handles), SendOutcome::Delivered) }
+}
+
+// The same, saying WHY it did not send - `Stalled` is "no room now" and `Failed` is "there is nobody
+// there", which the storage service's stream pump acts on differently.
+pub unsafe fn try_send_caps_outcome(channel: u64, bytes: &[u8], handles: &[u64]) -> SendOutcome {
+	unsafe {
+		if handles.is_empty() {
+			return try_send_outcome(channel, bytes, 0);
+		}
+		match send_caps(channel, bytes, handles) {
+			0 => SendOutcome::Delivered,
+			ERR_WOULD_BLOCK => SendOutcome::Stalled,
+			_ => SendOutcome::Failed,
+		}
+	}
+}
+
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
 pub unsafe fn send_caps_blocking(channel: u64, bytes: &[u8], handles: &[u64]) -> bool {
@@ -2161,7 +2196,15 @@ pub unsafe fn send_caps_blocking(channel: u64, bytes: &[u8], handles: &[u64]) ->
 // this function's caller - is checked against an exact list of runtime imports.
 pub enum ReceivedVecCaps {
 	Message { bytes: alloc::vec::Vec<u8> },
+	// The sender is done. THE ONLY ending that means end-of-file.
 	Closed,
+	// The receive itself failed - out of memory for the message, or the kernel refused it.
+	//
+	// SEPARATE FROM `Closed` for the reason `ReceivedVec::Failed` is separate: a consumer
+	// accumulating a stream reads a failure as "that is all of it" and returns a SHORT answer as a
+	// complete one. This enum folded the two together until the frame transport moved onto it, and
+	// folding them would have undone that fix on every consumer the move touched.
+	Failed,
 }
 
 // `recv_vec_blocking` that keeps EVERY capability the message carried instead of the first.
@@ -2179,14 +2222,21 @@ pub unsafe fn recv_vec_caps_blocking(channel: u64, out: &mut wire::Handles) -> R
 			if pending < 0 {
 				return ReceivedVecCaps::Closed;
 			}
-			let mut bytes: alloc::vec::Vec<u8> = alloc::vec![0u8; pending as usize];
+			// Fallibly: a message size the peer chose must not be able to abort this process
+			// through the allocation error handler.
+			let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+			if bytes.try_reserve_exact(pending as usize).is_err() {
+				return ReceivedVecCaps::Failed;
+			}
+			bytes.resize(pending as usize, 0);
 			let mut handles = [0u64; MAX_MESSAGE_CAPS];
 			let (len, count) = recv_message_caps(channel, &mut bytes, &mut handles);
 			if len == ERR_WOULD_BLOCK {
 				continue;
 			}
 			if len < 0 {
-				return ReceivedVecCaps::Closed;
+				// A refused receive is not an end-of-stream: the peer may still be there.
+				return ReceivedVecCaps::Failed;
 			}
 			bytes.truncate(len as usize);
 			// The kernel cannot report more than it may transfer, so this cannot fail; closing what
@@ -2195,7 +2245,7 @@ pub unsafe fn recv_vec_caps_blocking(channel: u64, out: &mut wire::Handles) -> R
 				for &handle in handles[..count.min(MAX_MESSAGE_CAPS)].iter() {
 					close(handle);
 				}
-				return ReceivedVecCaps::Closed;
+				return ReceivedVecCaps::Failed;
 			};
 			*out = taken;
 			return ReceivedVecCaps::Message { bytes };

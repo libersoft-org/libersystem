@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use lico::TerminalWriter;
 use proto::system::{Error, FileInfo, OpenOpts, volume};
-use rt::{ReceivedVec, close, map_object, recv_tagged, recv_vec_blocking, send_blocking, unmap_object};
+use rt::{ReceivedVecCaps, close, map_object, recv_tagged, recv_vec_caps_blocking, send_blocking, unmap_object};
 use storage_proto::path;
 use volume_client::VolumeClient;
 
@@ -157,16 +157,17 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 		};
 		let mut entries = Vec::new();
 		loop {
-			match recv_vec_blocking(consumer) {
-				ReceivedVec::Message { bytes, mut handle } => {
+			let mut frame_handles = proto::codec::Handles::new();
+			match recv_vec_caps_blocking(consumer, &mut frame_handles) {
+				ReceivedVecCaps::Message { bytes } => {
 					// The terminal frame: everything before it was the whole directory.
 					if bytes.is_empty() {
 						close(consumer);
 						return Ok(entries);
 					}
-					let entry = volume::list_read(&bytes, &mut handle);
-					if handle != 0 {
-						close(handle);
+					let entry = volume::list_read(&bytes, &frame_handles);
+					for handle in frame_handles.as_slice() {
+						close(*handle);
 					}
 					// A frame that will not decode ends the listing rather than being dropped from
 					// it: the caller asked what is in a directory and must not be handed a shorter
@@ -189,14 +190,14 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 				}
 				// Closed WITHOUT the terminal frame: the producer gave up part way, so what arrived
 				// is a prefix. Returning it as the directory is the defect this marker exists for.
-				ReceivedVec::Closed => {
+				ReceivedVecCaps::Closed => {
 					close(consumer);
 					return Err(ListDirectoryError::Malformed);
 				}
 				// The caller asked for a directory's contents and gets an error instead of a
 				// prefix. `OutOfMemory` already exists for exactly this and is what an abnormal
 				// ending means here.
-				ReceivedVec::Failed => {
+				ReceivedVecCaps::Failed => {
 					close(consumer);
 					return Err(ListDirectoryError::OutOfMemory);
 				}

@@ -175,16 +175,16 @@ unsafe fn drain(sock: &mut SocketClient) {
 		if let Some(rxstream) = sock.recv() {
 			let mut frame: [u8; 1024] = [0u8; 1024];
 			loop {
-				match recv_blocking(rxstream, &mut frame) {
-					Received::Message { len, mut handle } => {
-						if let Some(chunk) = socket::recv_read(&frame[..len], &mut handle) {
+				match recv_caps_blocking(rxstream, &mut frame) {
+					ReceivedCaps::Message { len, handles: frame_handles } => {
+						if let Some(chunk) = socket::recv_read(&frame[..len], &frame_handles) {
 							print(&chunk.data);
 						}
-						if handle != 0 {
-							close(handle);
+						for handle in frame_handles.as_slice() {
+							close(*handle);
 						}
 					}
-					Received::Closed => break,
+					ReceivedCaps::Closed => break,
 				}
 			}
 			close(rxstream);

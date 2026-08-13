@@ -484,9 +484,23 @@ impl<'a> Reader<'a> {
 	// ONE ENCODING PER VALUE. This was `Some(self.u8()? != 0)`, so 2 through 255 all decoded as
 	// `true` - one logical value with 255 spellings, against a stated contract that a malformed
 	// buffer answers `None`. Malleability with no purpose, and it starts costing the moment a frame
-	// is hashed, compared or replayed. The generated `option<T>` tag has the same shape and the
-	// same answer.
+	// is hashed, compared or replayed.
 	pub fn boolean(&mut self) -> Option<bool> {
+		self.tag()
+	}
+
+	// THE DISCRIMINANT BYTE OF AN `option` OR A `result`, and the same rule as `boolean` because it
+	// is the same rule.
+	//
+	// It was fixed for `bool` and left in three other spellings: the generator emitted
+	// `if r.u8()? != 0 { Some(..) } else { None }` for `option`, the same shape for `result`, and a
+	// third copy beside them. So a reply whose result tag was `0xff` decoded as `Ok` and the same
+	// byte in an option decoded as `Some` - after the finding that named this exact malleability had
+	// been closed. A rule that lives in four places is a rule that gets fixed in one of them.
+	//
+	// `false` is the zero tag - `None` / `Err`; `true` is one - `Some` / `Ok`. The names stay at the
+	// call site, where they mean something.
+	pub fn tag(&mut self) -> Option<bool> {
 		match self.u8()? {
 			0 => Some(false),
 			1 => Some(true),

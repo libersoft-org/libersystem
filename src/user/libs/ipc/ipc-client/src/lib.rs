@@ -43,7 +43,10 @@ impl Transport for ChannelTransport {
 			}
 			match recv_vec_caps_blocking(self.chan, reply_handles) {
 				ReceivedVecCaps::Message { bytes } => Some(bytes),
-				ReceivedVecCaps::Closed => None,
+				// A refused receive and a departed peer are both "no reply" to a caller waiting for
+				// one; they are told apart at the drainer, where a short answer would otherwise
+				// look complete.
+				ReceivedVecCaps::Closed | ReceivedVecCaps::Failed => None,
 			}
 		}
 	}
@@ -100,6 +103,7 @@ impl Transport for SvcTransport {
 			}
 			match recv_vec_caps_blocking(self.chan, reply_handles) {
 				ReceivedVecCaps::Message { bytes } => Some(bytes),
+				ReceivedVecCaps::Failed => None,
 				ReceivedVecCaps::Closed => {
 					let _ = self.reconnect();
 					None

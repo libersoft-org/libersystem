@@ -103,9 +103,7 @@ pub mod config {
 		match op {
 			OP_GET => {
 				let key = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.get(key);
 				let encoded: Option<()> = (|| {
@@ -141,9 +139,7 @@ pub mod config {
 				}
 			}
 			OP_LIST => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.list();
 				let encoded: Option<()> = (|| {
@@ -186,9 +182,7 @@ pub mod config {
 			}
 			OP_SET => {
 				let entry = ConfigEntry::read(r)?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.set(entry);
 				let encoded: Option<()> = (|| {
@@ -287,9 +281,11 @@ pub mod config {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.string_lp()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.string_lp()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -311,7 +307,7 @@ pub mod config {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v7 = r.u16()? as usize;
 						let mut v8 = Vec::new();
@@ -323,9 +319,11 @@ pub mod config {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -348,9 +346,11 @@ pub mod config {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -479,9 +479,7 @@ pub mod picker {
 		}
 		match op {
 			OP_PICK => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.pick();
 				let encoded: Option<()> = (|| {
@@ -580,9 +578,11 @@ pub mod picker {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(Picked::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(Picked::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

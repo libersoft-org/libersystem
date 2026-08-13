@@ -5,6 +5,7 @@ extern crate alloc;
 use alloc::rc::Rc;
 use base_proto::generated::liber::base::v1::Error;
 use core::cell::RefCell;
+use display_proto::codec::Handles;
 use display_proto::generated::liber::display::v1::{DisplayEvent, PixelFormat, SurfaceInfo, display};
 use input_proto::generated::liber::input::v1::input;
 use ipc_client::ChannelTransport;
@@ -82,8 +83,11 @@ pub fn events(client: &Client) -> Option<u64> {
 	client.borrow_mut().events()
 }
 
-pub fn read_event(message: &[u8], handle: &mut u64) -> Option<DisplayEvent> {
-	display::events_read(message, handle)
+// A display event frame and whatever capabilities it carried. The frame transport takes a bounded
+// list now, like every other message on this wire - it used to take exactly one handle, and a frame
+// whose element type declared two would have had the second dropped by the encoder.
+pub fn read_event(message: &[u8], handles: &Handles) -> Option<DisplayEvent> {
+	display::events_read(message, handles)
 }
 
 pub fn input_focus(client: &Client) -> Option<Result<u64, Error>> {

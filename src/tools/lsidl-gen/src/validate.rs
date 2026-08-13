@@ -412,29 +412,20 @@ fn report_cardinality(card: Cardinality, span: Span, what: &str, errs: &mut Vec<
 	}
 }
 
-// A STREAM FRAME MAY CARRY AT MOST ONE CAPABILITY, and this is where that is enforced rather than
-// assumed.
+// A STREAM FRAME CARRIES WHAT A REPLY CARRIES, and it does now.
 //
-// `report_cardinality` was relaxed to accept `Many` in the same change that migrated the RECEIVE side
-// to four handles, and this call site went with it - but the generated frame TRANSPORT did not.
-// `{method}_frame` ends with `*frame_handle = writer.handle()`, the first handle, and the reader is
-// `Reader::with_handle`: so a two-capability frame would have its second capability created, written
-// into the writer, dropped on the floor by the encoder, and decoded by the client as a placeholder.
-// That is the defect this milestone is named for, one layer down, introduced by the fix for it.
+// This refused `Many` between 2026-08-13 and the migration on the same day, and the refusal is worth
+// remembering rather than deleting: `report_cardinality` was relaxed to accept several capabilities
+// for REPLIES, this call site went with it, and the generated frame transport did not - it ended with
+// `*frame_handle = writer.handle()`, the first handle, and read with `Reader::with_handle`. So a
+// two-capability frame would have had its second capability created, written into the writer, dropped
+// by the encoder, and decoded by the client as a placeholder.
 //
-// So a stream frame is refused on `Many` while the transport carries one. The refusal is the small
-// half; migrating `{method}_frame` to `Handles` is what lifts it, and until that happens the schema
-// must not be able to express what the wire will drop.
+// The transport takes a bounded `Handles` now, so the schema and the wire agree again and the refusal
+// is gone. What stays is `Unknown` - an imported shape nothing has resolved - which fails closed.
 fn check_stream_frames(ty: &Type, span: Span, cards: &HashMap<String, Cardinality>, names: &HashMap<String, Kind>, imports: Option<&HashMap<String, ResolvedSymbol>>, errs: &mut Vec<Error>) {
 	match ty {
-		Type::Stream(item) => {
-			let card = type_cardinality(item, cards, names, imports);
-			if card == Cardinality::Many {
-				errs.push(Error::new(span, String::from("a stream frame may carry at most one capability; this element type carries several, and the frame transport sends exactly one")));
-				return;
-			}
-			report_cardinality(card, span, "stream frame", errs);
-		}
+		Type::Stream(item) => report_cardinality(type_cardinality(item, cards, names, imports), span, "stream frame", errs),
 		Type::Option(inner) | Type::List(inner) => check_stream_frames(inner, span, cards, names, imports, errs),
 		Type::Tuple(items) => {
 			for item in items {

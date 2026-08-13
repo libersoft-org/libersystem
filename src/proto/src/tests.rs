@@ -65,6 +65,34 @@ fn query_options_round_trip() {
 }
 
 #[test]
+fn a_malformed_option_or_result_tag_does_not_decode() {
+	// THE GENERATOR'S TAG, THROUGH A REAL GENERATED CODEC. `Reader::boolean` was made strict after a
+	// finding about exactly this - one encoding per value - and the generator kept comparing bytes:
+	// `if r.u8()? != 0` for `option`, the same for `result`, and a third copy in the reply path. So
+	// `0xff` decoded as `Some`, and in a result it decoded as `Ok`, which turns an error into a
+	// success carrying whatever the error's bytes happened to be.
+	//
+	// The generator's own test asserts it emits `r.tag()?`; this asserts what that produces.
+	let q = Query { since: Some(100), min_severity: None, source: None, boot: None, limit: 50 };
+	let mut buf = [0u8; 128];
+	let n = q.encode(&mut buf).unwrap();
+	assert!(Query::decode(&buf[..n]).is_some(), "the well-formed message decodes");
+
+	// The first byte is `since`'s presence tag, written as 1. Every other non-zero spelling of
+	// "present" must be refused rather than accepted as another way of saying the same thing.
+	assert_eq!(buf[0], 1, "the encoder writes the canonical present tag");
+	for byte in 2..=255u8 {
+		buf[0] = byte;
+		assert!(Query::decode(&buf[..n]).is_none(), "{byte} is not a presence tag");
+	}
+	// And zero is a real value: absent, with no payload following it - which is a DIFFERENT message
+	// length, so this one is expected not to decode either. The point of the sweep above is that
+	// nothing between 2 and 255 is quietly folded into 1.
+	buf[0] = 1;
+	assert!(Query::decode(&buf[..n]).is_some(), "the canonical tag still decodes after the sweep");
+}
+
+#[test]
 fn error_round_trips() {
 	for e in [Error::Denied, Error::NotFound, Error::Invalid, Error::Again, Error::Closed] {
 		let mut buf = [0u8; 4];
@@ -129,6 +157,76 @@ fn malformed_dispatch_leaves_the_request_handle_with_the_host() {
 	assert_eq!(log::dispatch(&mut service, &[1], &mut request_handles, &mut out, &mut reply_handles), None);
 	assert_eq!(request_handles.as_slice(), &[77], "a refused dispatch leaves the capability with the host to close");
 	assert!(reply_handles.is_empty());
+}
+
+#[test]
+fn a_request_with_trailing_bytes_is_not_the_same_request() {
+	// `Reader::finish` checks BOTH halves - every byte consumed and every capability taken - and it
+	// was called at the codec boundary (`decode`) and at none of the FRAMING boundaries. Generated
+	// dispatch read the opcode, the correlation id and the arguments and then asked only
+	// `if r.has_handle()`, so `[OP][corr][args]` and `[OP][corr][args][DE AD BE EF]` were the same
+	// request: a message its writer and its reader disagree about, accepted.
+	//
+	// That is the trailing-garbage finding closed for a standalone value and open for every message
+	// this system actually sends.
+	let entry = Entry { timestamp: 1, severity: Severity::Info, source: String::from("t"), fields: Vec::new() };
+	let mut body = [0u8; 256];
+	let mut w = crate::codec::SliceWriter::new(&mut body);
+	{
+		use crate::codec::Sink;
+		w.u16(log::OP_EMIT).expect("opcode");
+		w.u32(7).expect("correlation id");
+	}
+	entry.write(&mut w).expect("the entry encodes");
+	let n = w.pos();
+
+	let mut service = MemLog::default();
+	let mut out = [0u8; 256];
+	let well_formed = {
+		let mut request_handles = crate::codec::Handles::new();
+		let mut reply_handles = crate::codec::Handles::new();
+		log::dispatch(&mut service, &body[..n], &mut request_handles, &mut out, &mut reply_handles)
+	};
+	assert!(well_formed.is_some(), "the well-formed request dispatches");
+
+	for trailing in [1usize, 4] {
+		let mut request_handles = crate::codec::Handles::new();
+		let mut reply_handles = crate::codec::Handles::new();
+		let refused = log::dispatch(&mut service, &body[..n + trailing], &mut request_handles, &mut out, &mut reply_handles);
+		assert!(refused.is_none(), "{trailing} trailing byte(s) make a different request, and it is refused");
+	}
+	assert_eq!(service.entries.len(), 1, "and the refused requests never reached the service");
+}
+
+#[test]
+fn a_reply_with_trailing_bytes_is_not_the_same_reply() {
+	// The client half of the same boundary: the reply path checked `has_handle` and not the bytes,
+	// so a reply could carry anything after its value and decode as though it had not.
+	let mut client = log::Client::new(TrailingLoopback { service: MemLog::default(), trailing: 0 });
+	assert!(client.emit(&Entry { timestamp: 1, severity: Severity::Info, source: String::from("t"), fields: Vec::new() }).is_some(), "the ordinary reply decodes");
+
+	let mut client = log::Client::new(TrailingLoopback { service: MemLog::default(), trailing: 3 });
+	assert!(client.emit(&Entry { timestamp: 1, severity: Severity::Info, source: String::from("t"), fields: Vec::new() }).is_none(), "a reply with three bytes after its value is refused");
+}
+
+// The loopback above, with `trailing` bytes appended to every reply - a server whose framing does
+// not agree with its schema, which is what the reply-side `finish` exists to catch.
+struct TrailingLoopback<S: log::Service> {
+	service: S,
+	trailing: usize,
+}
+
+impl<S: log::Service> crate::codec::Transport for TrailingLoopback<S> {
+	fn discard_handles(&mut self, _handles: &[u64]) {}
+
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
+		let mut out = [0u8; 4096];
+		let mut request_handles = crate::codec::Handles::try_from_slice(request_handles).expect("the fixture stays within the bound");
+		let n = log::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles)?;
+		let mut reply = out[..n].to_vec();
+		reply.extend(core::iter::repeat_n(0xdd, self.trailing));
+		Some(reply)
+	}
 }
 
 // An in-memory loopback transport that dispatches a request straight into a
@@ -208,10 +306,13 @@ fn tail_stream_round_trip() {
 
 	let mut frame = [0u8; 256];
 	for (seq, item) in items.iter().enumerate() {
-		let mut frame_handle = 0;
-		let n = log::tail_frame(seq as u32, item, &mut frame, &mut frame_handle).unwrap();
-		assert_eq!(log::tail_read(&frame[..n], &mut frame_handle), Some(item.clone()));
-		assert_eq!(frame_handle, 0);
+		// The frame carries a bounded LIST of capabilities, like every other message on this wire -
+		// it carried exactly one until 2026-08-13, which is why a two-capability element would have
+		// had its second dropped by the encoder.
+		let mut frame_handles = crate::codec::Handles::new();
+		let n = log::tail_frame(seq as u32, item, &mut frame, &mut frame_handles).unwrap();
+		assert_eq!(log::tail_read(&frame[..n], &frame_handles), Some(item.clone()));
+		assert!(frame_handles.is_empty(), "an entry carries no capabilities, so the frame carries none");
 	}
 }
 
@@ -741,16 +842,16 @@ fn a_listing_frame_that_will_not_decode_is_refused_rather_than_read_as_an_entry(
 	// a time, invisible because the reader ignores the sequence number and cannot see the gap. The
 	// producer now ends the listing instead, and this is the half that says the reader agrees:
 	// a damaged frame is `None`, not a guess.
-	let mut handle: u64 = 0;
+	let handles = crate::codec::Handles::new();
 
 	// Truncated after the sequence number, with no record behind it.
-	assert!(volume::list_read(&[1, 0, 0, 0], &mut handle).is_none(), "a frame with a sequence and nothing else is not an entry");
+	assert!(volume::list_read(&[1, 0, 0, 0], &handles).is_none(), "a frame with a sequence and nothing else is not an entry");
 
 	// Empty: the terminal marker, which is not an entry either and must not decode as one.
-	assert!(volume::list_read(&[], &mut handle).is_none(), "the terminal frame is not an entry");
+	assert!(volume::list_read(&[], &handles).is_none(), "the terminal frame is not an entry");
 
 	// A length prefix that promises more than the frame carries.
-	assert!(volume::list_read(&[1, 0, 0, 0, 0xff, 0xff], &mut handle).is_none(), "a name longer than the frame is refused");
+	assert!(volume::list_read(&[1, 0, 0, 0, 0xff, 0xff], &handles).is_none(), "a name longer than the frame is refused");
 
 	// A positive case belongs here and is missing on purpose: `FileInfo` and `FileType` are not
 	// visible from this module, so a well-formed frame cannot be constructed to prove the reader

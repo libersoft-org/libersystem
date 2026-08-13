@@ -58,9 +58,10 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 		let mut out = String::from("[");
 		let mut first: bool = true;
 		loop {
-			match recv_vec_blocking(consumer) {
-				ReceivedVec::Message { bytes, mut handle } => {
-					if let Some(e) = permission::audit_read(&bytes, &mut handle) {
+			let mut frame_handles = proto::codec::Handles::new();
+			match recv_vec_caps_blocking(consumer, &mut frame_handles) {
+				ReceivedVecCaps::Message { bytes } => {
+					if let Some(e) = permission::audit_read(&bytes, &frame_handles) {
 						if mode.is_some() {
 							if !first {
 								out.push(',');
@@ -72,12 +73,12 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 							print(b"\n");
 						}
 					}
-					if handle != 0 {
-						close(handle);
+					for handle in frame_handles.as_slice() {
+						close(*handle);
 					}
 				}
-				ReceivedVec::Closed => break,
-				ReceivedVec::Failed => {
+				ReceivedVecCaps::Closed => break,
+				ReceivedVecCaps::Failed => {
 					eprint(b"perm: the audit stream ended abnormally; what is shown above is incomplete\n");
 					break;
 				}

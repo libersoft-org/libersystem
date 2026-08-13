@@ -328,41 +328,61 @@ fn aliases_expand_through_codecs_and_reject_cycles() {
 fn stream_helpers_carry_handles_per_open_and_frame() {
 	// This asserted the SINGLE-handle shape (`call(&request, request_handle)`) until 2026-08-01.
 	// A message now carries a bounded LIST, so the call takes the request's handles as a slice
-	// and receives the reply's through an out-parameter. The per-frame helpers stay singular on
-	// purpose: one stream element transfers at most one capability, which is a property of the
-	// frame protocol rather than a limit of the transport.
+	// and receives the reply's through an out-parameter.
+	//
+	// AND SO DO THE PER-FRAME HELPERS, since 2026-08-13. They stayed singular on the argument that
+	// "one stream element transfers at most one capability, a property of the frame protocol rather
+	// than a limit of the transport" - which was true until the validator was relaxed and a stream
+	// element could declare two. The transport carrying what the schema can express is what makes
+	// that argument true again.
 	let file = parse_only("package liber:stream@1; resource file; record held { file: handle<file> } interface feed { @op(1) open: func(source: handle<file>) -> stream<held>; }");
 	assert!(validate::validate(&file).is_empty());
 	let rust = crate::codegen::rust(&file, "stream.lsidl", &std::collections::HashMap::new()).unwrap();
 	assert!(rust.contains("self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?"));
-	assert!(rust.contains("frame_handle: &mut u64"));
-	assert!(rust.contains("*frame_handle = writer.handle();"));
-	assert!(rust.contains("Reader::with_handle(msg, *frame_handle)"));
+	assert!(rust.contains("frame_handles: &mut Handles"), "the frame writer takes the bounded list");
+	assert!(rust.contains("*frame_handles = Handles::try_from_slice(writer.handles())?;"), "and hands back every handle the element wrote");
+	assert!(rust.contains("Reader::with_handles(msg, frame_handles)"), "and the reader takes the list too");
+	assert!(!rust.contains("frame_handle: &mut u64"), "no singular frame handle survives");
 }
 
 #[test]
-fn a_stream_frame_that_would_carry_two_capabilities_is_refused() {
-	// THE SCHEMA MUST NOT BE ABLE TO EXPRESS WHAT THE WIRE WILL DROP, which is what this milestone is
-	// named for and what the fix for it reintroduced one layer down. `report_cardinality` was relaxed
-	// to accept `Many` in the change that migrated the RECEIVE side to four handles, and this call
-	// site went with it - while the generated frame transport stayed singular: `{method}_frame` ends
-	// with `*frame_handle = writer.handle()` and the reader is `Reader::with_handle`.
+fn a_generated_option_and_result_use_the_strict_tag() {
+	// `Reader::boolean` was made strict - 0, 1, and `None` for everything else - after a finding
+	// about exactly this malleability, and a wire test sweeps all 254 invalid values. The GENERATOR
+	// did not learn it: `option` emitted `if r.u8()? != 0 { Some(..) }`, `result` the same shape, and
+	// there was a third copy in the reply path. So a reply whose result tag was `0xff` decoded as
+	// `Ok` - an error turned into a success with a garbage payload - in a tree that had just closed
+	// the finding that names it.
 	//
-	// So a two-capability frame would have had its second capability created, written into the
-	// writer, dropped by the encoder, and decoded by the client as a placeholder - with nothing in
-	// the schema, the generator or the runtime saying so.
-	assert_err_contains("package liber:stream@1; resource chan; record pipe { input: handle<chan>, output: handle<chan> } interface feed { @op(1) frames: func() -> stream<pipe>; }", "a stream frame may carry at most one capability");
+	// One rule in four spellings gets fixed in one of them. There is one now, `Reader::tag`, and this
+	// asserts the generator reaches for it rather than comparing bytes itself.
+	let file = parse_only("package liber:tag@1; record maybe { a: option<u32> } record either { b: result<u32, u32> } interface t { @op(1) go: func(m: maybe) -> either; }");
+	assert!(validate::validate(&file).is_empty());
+	let rust = crate::codegen::rust(&file, "tag.lsidl", &std::collections::HashMap::new()).unwrap();
+	assert!(rust.contains("if r.tag()? { Some("), "the option tag is strict: {rust}");
+	assert!(rust.contains("if r.tag()? { Ok("), "and so is the result tag");
+	assert!(!rust.contains("r.u8()? != 0"), "no byte comparison survives anywhere in the generated codec");
+}
 
-	// A REPLY may carry several - that is exactly what the migration was for - so the refusal has to
-	// be the stream's own and not a return to the old blanket rule.
-	assert!(errors("package liber:stream@1; resource chan; record pipe { input: handle<chan>, output: handle<chan> } interface feed { @op(1) once: func() -> pipe; }").is_empty(), "a multi-capability reply is what the four-handle wire exists for");
-
-	// And one capability per frame still validates, which is every stream in this tree.
-	assert!(errors("package liber:stream@1; resource file; record held { file: handle<file> } interface feed { @op(1) open: func() -> stream<held>; }").is_empty(), "a single-capability frame is what the transport carries");
-
-	// Nested the same way `check_stream_frames` walks: inside a result, which is how a stream that
-	// can fail before it starts is written.
-	assert_err_contains("package liber:stream@1; resource chan; record pipe { input: handle<chan>, output: handle<chan> } record oops { code: u32 } interface feed { @op(1) frames: func() -> result<stream<pipe>, oops>; }", "a stream frame may carry at most one capability");
+#[test]
+fn a_stream_frame_carries_every_capability_its_element_declares() {
+	// THE SCHEMA AND THE WIRE MUST AGREE, which is what this milestone is named for and what the fix
+	// for it broke one layer down. `report_cardinality` was relaxed to accept several capabilities
+	// for replies and this call site went with it, while `{method}_frame` still ended with
+	// `*frame_handle = writer.handle()` - the FIRST handle - and read with `Reader::with_handle`. A
+	// two-capability frame would have had its second capability created, written into the writer,
+	// dropped by the encoder, and decoded by the client as a placeholder.
+	//
+	// It was refused for a few hours and then made to work, which is the right order: close the gap,
+	// then remove the reason for it.
+	let file = parse_only("package liber:stream@1; resource chan; record pipe { input: handle<chan>, output: handle<chan> } interface feed { @op(1) frames: func() -> stream<pipe>; }");
+	assert!(validate::validate(&file).is_empty(), "a two-capability frame is expressible now");
+	let rust = crate::codegen::rust(&file, "stream.lsidl", &std::collections::HashMap::new()).unwrap();
+	assert!(rust.contains("frame_handles: &mut Handles"), "and the writer takes the whole list");
+	assert!(rust.contains("Reader::with_handles(msg, frame_handles)"), "and so does the reader");
+	// Both capabilities are written, which is the property the placeholder used to replace.
+	assert!(rust.contains("w.set_handle(self.input)?"), "the first is written");
+	assert!(rust.contains("w.set_handle(self.output)?"), "and so is the second");
 }
 
 #[test]
@@ -406,8 +426,8 @@ fn a_stream_may_fail_before_it_starts() {
 	assert!(rust.contains("if !matches!(decoded, Some(Ok(_))) {"));
 
 	// The per-element framing is unchanged - the error arm is about whether the stream STARTS.
-	assert!(rust.contains("pub fn tail_frame(seq: u32, item: &Entry, out: &mut [u8], frame_handle: &mut u64) -> Option<usize>"));
-	assert!(rust.contains("pub fn tail_read(msg: &[u8], frame_handle: &mut u64) -> Option<Entry>"));
+	assert!(rust.contains("pub fn tail_frame(seq: u32, item: &Entry, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize>"));
+	assert!(rust.contains("pub fn tail_read(msg: &[u8], frame_handles: &Handles) -> Option<Entry>"));
 
 	// And the bare `stream<T>` form still generates what it did: no tag, no error, the handle alone.
 	let bare = parse_only("package liber:stream@1; record item { n: u32 } interface feed { @op(1) open: func() -> stream<item>; }");

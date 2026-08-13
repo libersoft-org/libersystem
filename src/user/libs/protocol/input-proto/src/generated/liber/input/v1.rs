@@ -156,14 +156,12 @@ pub mod input {
 		let r = &mut reader;
 		let _op = r.u16()?;
 		let corr = r.u32()?;
-		if r.has_handle() {
-			return None;
-		}
+		r.finish()?;
 		request_handles.clear();
 		let items = service.subscribe();
 		Some((corr, items))
 	}
-	pub fn subscribe_frame(seq: u32, item: &PointerEvent, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+	pub fn subscribe_frame(seq: u32, item: &PointerEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
 		let mut writer = SliceWriter::new(out);
 		let encoded: Option<()> = (|| {
 			let w = &mut writer;
@@ -172,23 +170,20 @@ pub mod input {
 			Some(())
 		})();
 		if encoded.is_none() {
-			if writer.has_handle() {
-				*frame_handle = writer.handle();
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
 			}
 			return None;
 		}
-		*frame_handle = writer.handle();
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn subscribe_read(msg: &[u8], frame_handle: &mut u64) -> Option<PointerEvent> {
-		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+	pub fn subscribe_read(msg: &[u8], frame_handles: &Handles) -> Option<PointerEvent> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = PointerEvent::read(r)?;
-		if reader.has_handle() {
-			return None;
-		}
-		*frame_handle = 0;
+		reader.finish()?;
 		Some(value)
 	}
 
@@ -201,14 +196,12 @@ pub mod input {
 			let _ = r.u32()?;
 			r.take_handle()?
 		};
-		if r.has_handle() {
-			return None;
-		}
+		r.finish()?;
 		request_handles.clear();
 		let items = service.subscribe_keys(focus);
 		Some((corr, items))
 	}
-	pub fn subscribe_keys_frame(seq: u32, item: &KeyEvent, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+	pub fn subscribe_keys_frame(seq: u32, item: &KeyEvent, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
 		let mut writer = SliceWriter::new(out);
 		let encoded: Option<()> = (|| {
 			let w = &mut writer;
@@ -217,23 +210,20 @@ pub mod input {
 			Some(())
 		})();
 		if encoded.is_none() {
-			if writer.has_handle() {
-				*frame_handle = writer.handle();
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
 			}
 			return None;
 		}
-		*frame_handle = writer.handle();
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn subscribe_keys_read(msg: &[u8], frame_handle: &mut u64) -> Option<KeyEvent> {
-		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+	pub fn subscribe_keys_read(msg: &[u8], frame_handles: &Handles) -> Option<KeyEvent> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = KeyEvent::read(r)?;
-		if reader.has_handle() {
-			return None;
-		}
-		*frame_handle = 0;
+		reader.finish()?;
 		Some(value)
 	}
 
@@ -366,9 +356,7 @@ pub mod input_admin {
 		}
 		match op {
 			OP_OPEN_KEYS => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.open_keys();
 				let encoded: Option<()> = (|| {
@@ -468,16 +456,18 @@ pub mod input_admin {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

@@ -1068,7 +1068,7 @@ impl proto::codec::Transport for DrillTransport<'_> {
 					}
 					0 => match recv_vec_caps_blocking(self.perm, reply_handles) {
 						ReceivedVecCaps::Message { bytes } => return Some(bytes),
-						ReceivedVecCaps::Closed => return None,
+						ReceivedVecCaps::Closed | ReceivedVecCaps::Failed => return None,
 					},
 					_ => return None,
 				}

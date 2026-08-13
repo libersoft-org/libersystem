@@ -208,9 +208,7 @@ pub mod session {
 		}
 		match op {
 			OP_CWD => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.cwd();
 				let encoded: Option<()> = (|| {
@@ -247,9 +245,7 @@ pub mod session {
 			}
 			OP_CHDIR => {
 				let path = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.chdir(path);
 				let encoded: Option<()> = (|| {
@@ -291,9 +287,7 @@ pub mod session {
 					let _ = r.u32()?;
 					r.take_handle()?
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.job_register(name, stopped, group, proc);
 				let encoded: Option<()> = (|| {
@@ -330,9 +324,7 @@ pub mod session {
 			}
 			OP_JOB_TAKE => {
 				let id = r.u32()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.job_take(id);
 				let encoded: Option<()> = (|| {
@@ -368,9 +360,7 @@ pub mod session {
 				}
 			}
 			OP_JOB_LIST => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.job_list();
 				let encoded: Option<()> = (|| {
@@ -412,9 +402,7 @@ pub mod session {
 				}
 			}
 			OP_JOB_REAP => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.job_reap();
 				let encoded: Option<()> = (|| {
@@ -457,9 +445,7 @@ pub mod session {
 			}
 			OP_JOB_RESUME => {
 				let id = r.u32()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.job_resume(id);
 				let encoded: Option<()> = (|| {
@@ -496,9 +482,7 @@ pub mod session {
 			}
 			OP_ENV_GET => {
 				let name = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.env_get(name);
 				let encoded: Option<()> = (|| {
@@ -536,9 +520,7 @@ pub mod session {
 			OP_ENV_SET => {
 				let name = r.string_lp()?;
 				let value = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.env_set(name, value);
 				let encoded: Option<()> = (|| {
@@ -574,9 +556,7 @@ pub mod session {
 			}
 			OP_ENV_UNSET => {
 				let name = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.env_unset(name);
 				let encoded: Option<()> = (|| {
@@ -611,9 +591,7 @@ pub mod session {
 				}
 			}
 			OP_ENV_LIST => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.env_list();
 				let encoded: Option<()> = (|| {
@@ -718,9 +696,11 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.string_lp()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.string_lp()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -743,9 +723,11 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -772,9 +754,11 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.u32()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -797,9 +781,11 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(JobEntry::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(JobEntry::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -821,7 +807,7 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v25 = r.u16()? as usize;
 						let mut v26 = Vec::new();
@@ -833,9 +819,11 @@ pub mod session {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -857,7 +845,7 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v27 = r.u16()? as usize;
 						let mut v28 = Vec::new();
@@ -869,9 +857,11 @@ pub mod session {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -894,9 +884,11 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(JobInfo::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(JobInfo::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -919,9 +911,11 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.string_lp()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.string_lp()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -945,9 +939,11 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -970,9 +966,11 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -994,7 +992,7 @@ pub mod session {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v29 = r.u16()? as usize;
 						let mut v30 = Vec::new();
@@ -1006,9 +1004,11 @@ pub mod session {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

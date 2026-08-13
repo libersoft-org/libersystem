@@ -29,6 +29,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::{ChannelTransport, make_buffer};
+use proto::codec::Handles;
 use proto::system::log::{self, Service};
 use proto::system::{Entry, Error, OpenOpts, Query, Severity, config, volume};
 use rt::*;
@@ -410,15 +411,19 @@ fn stream_tail(journal: &mut Journal, service: u64, request: &[u8], request_hand
 	}
 	let mut frame: [u8; 1024] = [0u8; 1024];
 	for (seq, item) in items.iter().enumerate() {
-		let mut frame_handle: u64 = 0;
-		if let Some(n) = log::tail_frame(seq as u32, item, &mut frame, &mut frame_handle) {
+		let mut frame_handles = Handles::new();
+		if let Some(n) = log::tail_frame(seq as u32, item, &mut frame, &mut frame_handles) {
 			unsafe {
-				if !send_blocking(producer, &frame[..n], frame_handle) && frame_handle != 0 {
-					close(frame_handle);
+				if !send_caps_blocking(producer, &frame[..n], frame_handles.as_slice()) {
+					for handle in frame_handles.as_slice() {
+						close(*handle);
+					}
 				}
 			}
-		} else if frame_handle != 0 {
-			unsafe { close(frame_handle) };
+		} else {
+			for handle in frame_handles.as_slice() {
+				unsafe { close(*handle) };
+			}
 		}
 	}
 	unsafe {

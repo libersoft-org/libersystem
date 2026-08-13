@@ -282,18 +282,19 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 			let mut plain: usize = 0;
 			let mut total: u64 = 0;
 			loop {
-				match recv_vec_blocking(consumer) {
-					ReceivedVec::Message { bytes, mut handle } => {
-						if let Some(f) = volume::list_read(&bytes, &mut handle) {
+				let mut frame_handles = proto::codec::Handles::new();
+				match recv_vec_caps_blocking(consumer, &mut frame_handles) {
+					ReceivedVecCaps::Message { bytes } => {
+						if let Some(f) = volume::list_read(&bytes, &frame_handles) {
 							let shown: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
 							row(&f, shown, size_text(&f, unit).len(), unit, &mut dirs, &mut plain, &mut total);
 						}
-						if handle != 0 {
-							close(handle);
+						for handle in frame_handles.as_slice() {
+							close(*handle);
 						}
 					}
-					ReceivedVec::Closed => break,
-					ReceivedVec::Failed => {
+					ReceivedVecCaps::Closed => break,
+					ReceivedVecCaps::Failed => {
 						eprint(b"ls: listing failed partway through; what is shown above is incomplete\n");
 						break;
 					}

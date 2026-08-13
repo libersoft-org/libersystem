@@ -693,9 +693,7 @@ pub mod network {
 		}
 		match op {
 			OP_INFO => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.info();
 				let encoded: Option<()> = (|| {
@@ -732,9 +730,7 @@ pub mod network {
 			}
 			OP_RESOLVE => {
 				let name = r.string_lp()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.resolve(name);
 				let encoded: Option<()> = (|| {
@@ -771,9 +767,7 @@ pub mod network {
 			}
 			OP_PING => {
 				let addr = Ipv4Addr::read(r)?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.ping(addr);
 				let encoded: Option<()> = (|| {
@@ -810,9 +804,7 @@ pub mod network {
 			}
 			OP_FETCH => {
 				let req = TcpRequest::read(r)?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.fetch(req);
 				let encoded: Option<()> = (|| {
@@ -855,9 +847,7 @@ pub mod network {
 			}
 			OP_CONNECT => {
 				let ep = Endpoint::read(r)?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.connect(ep);
 				let encoded: Option<()> = (|| {
@@ -894,9 +884,7 @@ pub mod network {
 				}
 			}
 			OP_OPEN => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.open();
 				let encoded: Option<()> = (|| {
@@ -934,9 +922,7 @@ pub mod network {
 			}
 			OP_LISTEN => {
 				let port = r.u16()?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.listen(port);
 				let encoded: Option<()> = (|| {
@@ -973,9 +959,7 @@ pub mod network {
 				}
 			}
 			OP_SOCKETS => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.sockets();
 				let encoded: Option<()> = (|| {
@@ -1018,9 +1002,7 @@ pub mod network {
 			}
 			OP_SNTP => {
 				let server = Ipv4Addr::read(r)?;
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.sntp(server);
 				let encoded: Option<()> = (|| {
@@ -1056,9 +1038,7 @@ pub mod network {
 				}
 			}
 			OP_CAPACITY => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.capacity();
 				let encoded: Option<()> = (|| {
@@ -1157,9 +1137,11 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(NetInfo::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(NetInfo::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1182,9 +1164,11 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(Ipv4Addr::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(Ipv4Addr::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1207,9 +1191,11 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(PingReply::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(PingReply::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1232,7 +1218,7 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v34 = r.u16()? as usize;
 						let mut v35 = Vec::new();
@@ -1244,9 +1230,11 @@ pub mod network {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1269,16 +1257,18 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1300,16 +1290,18 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1332,16 +1324,18 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1363,7 +1357,7 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let v36 = r.u16()? as usize;
 						let mut v37 = Vec::new();
@@ -1375,9 +1369,11 @@ pub mod network {
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1400,9 +1396,11 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.u64()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.u64()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1424,9 +1422,11 @@ pub mod network {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(NetCapacity::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(NetCapacity::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1561,9 +1561,7 @@ pub mod socket {
 					let handle = r.take_handle()?;
 					crate::codec::Buffer { handle, len }
 				};
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.send(data);
 				let encoded: Option<()> = (|| {
@@ -1599,9 +1597,7 @@ pub mod socket {
 				}
 			}
 			OP_CLOSE => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.close();
 				let encoded: Option<()> = (|| {
@@ -1649,14 +1645,12 @@ pub mod socket {
 		let r = &mut reader;
 		let _op = r.u16()?;
 		let corr = r.u32()?;
-		if r.has_handle() {
-			return None;
-		}
+		r.finish()?;
 		request_handles.clear();
 		let items = service.recv();
 		Some((corr, items))
 	}
-	pub fn recv_frame(seq: u32, item: &Chunk, out: &mut [u8], frame_handle: &mut u64) -> Option<usize> {
+	pub fn recv_frame(seq: u32, item: &Chunk, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
 		let mut writer = SliceWriter::new(out);
 		let encoded: Option<()> = (|| {
 			let w = &mut writer;
@@ -1665,23 +1659,20 @@ pub mod socket {
 			Some(())
 		})();
 		if encoded.is_none() {
-			if writer.has_handle() {
-				*frame_handle = writer.handle();
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
 			}
 			return None;
 		}
-		*frame_handle = writer.handle();
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn recv_read(msg: &[u8], frame_handle: &mut u64) -> Option<Chunk> {
-		let mut reader = if *frame_handle == 0 { Reader::new(msg) } else { Reader::with_handle(msg, *frame_handle) };
+	pub fn recv_read(msg: &[u8], frame_handles: &Handles) -> Option<Chunk> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = Chunk::read(r)?;
-		if reader.has_handle() {
-			return None;
-		}
-		*frame_handle = 0;
+		reader.finish()?;
 		Some(value)
 	}
 
@@ -1742,9 +1733,11 @@ pub mod socket {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(r.u32()?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(r.u32()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1784,9 +1777,11 @@ pub mod socket {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(()) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1918,9 +1913,7 @@ pub mod listener {
 		}
 		match op {
 			OP_ACCEPT => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.accept();
 				let encoded: Option<()> = (|| {
@@ -2020,16 +2013,18 @@ pub mod listener {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 {
+				let value = if r.tag()? {
 					Ok({
 						let _ = r.u32()?;
 						r.take_handle()?
 					})
 				} else {
 					Err(Error::read(r)?)
-				})
+				};
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}

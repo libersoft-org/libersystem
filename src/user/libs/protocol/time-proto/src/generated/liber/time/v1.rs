@@ -97,9 +97,7 @@ pub mod time {
 		}
 		match op {
 			OP_NOW => {
-				if r.has_handle() {
-					return None;
-				}
+				r.finish()?;
 				request_handles.clear();
 				let result = service.now();
 				let encoded: Option<()> = (|| {
@@ -198,9 +196,11 @@ pub mod time {
 				if r.u32()? != corr {
 					return None;
 				}
-				Some(if r.u8()? != 0 { Ok(Timestamp::read(r)?) } else { Err(Error::read(r)?) })
+				let value = if r.tag()? { Ok(Timestamp::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
 			})();
-			if decoded.is_none() || reader.has_handle() {
+			if decoded.is_none() {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
