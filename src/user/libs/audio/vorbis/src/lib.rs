@@ -38,6 +38,7 @@ macro_rules! record_post_mdct {
 mod audio;
 #[path = "core/bitpacking.rs"]
 mod bitpacking;
+pub mod encode;
 #[path = "core/header.rs"]
 #[allow(dead_code)]
 mod header;
