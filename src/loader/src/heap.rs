@@ -19,7 +19,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr;
 
-use crate::uefi::BootServices;
+use uefi::BootServices;
 
 // Each arena taken from the firmware. Large enough that reading a kernel does not chain dozens of
 // them, small enough not to fail on a machine with modest firmware memory.
@@ -73,7 +73,7 @@ pub(crate) fn release(services: *mut BootServices) -> usize {
 	unsafe {
 		for i in 0..(*bump).arena_count {
 			let (addr, pages) = (*bump).arenas[i];
-			if addr != 0 && ((*services).free_pages)(addr, pages) == crate::uefi::STATUS_SUCCESS {
+			if addr != 0 && ((*services).free_pages)(addr, pages) == uefi::STATUS_SUCCESS {
 				bytes += pages * crate::PAGE_SIZE as usize;
 			}
 		}

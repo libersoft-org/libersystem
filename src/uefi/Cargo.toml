@@ -1,0 +1,17 @@
+[package]
+name = "uefi"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "UEFI bindings and the firmware-facing algorithms the loader drives them with"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The memory map is translated into the boot protocol's region array, which is the one structure
+# that crosses from firmware into the kernel.
+bootproto = { path = "../bootproto" }
+# The block-device trait the firmware's Block I/O protocol is presented as, so the filesystem crates
+# above it are the same code before and after `ExitBootServices`.
+fscore = { path = "../fs/core" }

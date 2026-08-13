@@ -25,8 +25,8 @@ pub mod serial;
 
 use bootproto::{BootInfo, Framebuffer};
 
-use crate::uefi::{self, BootServices, Guid, Handle, SystemTable};
 use crate::{PAGE_SIZE, align_down};
+use uefi::{self, BootServices, Guid, Handle, SystemTable};
 
 // RISCV_EFI_BOOT_PROTOCOL: U-Boot (and EDK2) expose the id of the hart that entered
 // the firmware through this protocol, so the loader can hand it to the kernel in a0 -
@@ -228,26 +228,12 @@ fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 	let dest_high = dest_high.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1)).expect("a page-rounded destination that wraps - the parser bounds the end that feeds this");
 	let pages = ((dest_high - dest_low) / PAGE_SIZE) as usize;
 
-	// Scratch that does not overlap the destination. The firmware chooses where, so this asks
-	// until it gets an answer it can use - holding on to the rejects, which is what stops the
-	// next request returning the same block.
-	let mut rejects: [u64; 16] = [0; 16];
-	let mut reject_count = 0usize;
-	let scratch = loop {
-		let candidate = crate::alloc_pages(bs, pages).expect("loader: cannot allocate staging memory for the kernel");
-		let Some(span) = (pages as u64).checked_mul(PAGE_SIZE).and_then(|b| candidate.checked_add(b)) else { continue };
-		if span <= dest_low || candidate >= dest_high {
-			break candidate;
-		}
-		if reject_count == rejects.len() {
-			panic!("loader: every staging allocation landed on the kernel's destination");
-		}
-		rejects[reject_count] = candidate;
-		reject_count += 1;
-	};
-	// The rejects are deliberately NOT freed: freeing one invites the next request to return
-	// it. They are firmware pages and ExitBootServices reclaims the lot.
+	// Scratch that does not overlap the destination - `uefi::memory::staging_clear_of`, which is
+	// where the rule and its reason now live, and where a mock firmware handing back addresses
+	// INSIDE the destination can be made to test it. That case is this file's whole reason for
+	// existing and no machine here produces it on demand.
 
+	let scratch = uefi::memory::staging_clear_of(bs, pages, dest_low, dest_high).expect("loader: every staging allocation landed on the kernel's destination");
 	// Zero the whole block first, so every BSS tail and inter-segment gap is already zero when
 	// the single block copy places it.
 	unsafe { core::ptr::write_bytes(scratch as *mut u8, 0, pages * PAGE_SIZE as usize) };

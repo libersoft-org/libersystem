@@ -17,8 +17,8 @@ pub mod serial;
 
 use bootproto::{BootInfo, Framebuffer};
 
-use crate::uefi::{self, BootServices, Handle, SystemTable};
 use crate::{PAGE_SIZE, align_down};
+use uefi::{self, BootServices, Handle, SystemTable};
 
 // Halt the core (panic path): wait for an event forever. panic=abort, no unwind.
 pub fn halt() -> ! {
@@ -127,6 +127,24 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 				// And zero the virtual offset, so the virtual counter EL1 reads is the physical one
 				// rather than the physical one plus whatever CNTVOFF_EL2 held out of reset.
 				"msr cntvoff_el2, xzr",
+				// OPEN FP/SIMD AND DEBUG TO EL1. REASONED, NOT MEASURED - said plainly, because the
+				// first version of this comment claimed the opposite.
+				//
+				// `CPTR_EL2.TFP` (bit 10) traps every FP/SIMD instruction at EL1 to EL2 and its reset
+				// value is architecturally UNKNOWN (QEMU's is 0x33ff, with TFP SET); `MDCR_EL2` does
+				// the same for debug and performance-monitor accesses. A loader that has just decided
+				// to change exception level has to open what the level below needs, because nothing
+				// else will and no handler is left up here - the same argument the generic timer
+				// above is opened by.
+				//
+				// What the first EL2 boot proved is NOT this. It died at the kernel's `hvc #0`, and
+				// so did the boot with these two writes in place - identical fault address. So they
+				// are here on the architecture manual's word and Linux's `init_el2`, and the trap
+				// they prevent has not been observed. 0x33ff is the canonical value: RES1 bits set,
+				// TCPAC / TTA / TFP clear.
+				"mov x9, #0x33ff",
+				"msr cptr_el2, x9",
+				"msr mdcr_el2, xzr",
 				"isb",
 				// Return to EL1h with interrupts masked, at the kernel's entry.
 				"mov x9, #0x3c5",

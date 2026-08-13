@@ -1,14 +1,40 @@
-// Minimal hand-rolled UEFI FFI: exactly the types, protocols, and boot-service
-// calls the loader needs - nothing more. No external crate; the layouts and GUIDs
-// come straight from the UEFI specification. Every firmware entry point uses the
-// `efiapi` calling convention.
-//
-// The loader touches only: memory allocation (AllocatePages / AllocatePool), the
-// memory map (GetMemoryMap), the loaded-image + simple-file-system protocols (to
-// read the kernel and packages off the boot medium), the Graphics Output Protocol
-// (the framebuffer), the ACPI configuration table (the RSDP), and ExitBootServices.
+//! The UEFI bindings, and the firmware-facing algorithms built on them.
+//!
+//! SEPARATE FROM THE LOADER SO IT CAN BE TESTED. The loader is a UEFI binary - it builds for
+//! `x86_64-unknown-uefi` with `build-std`, has no `std`, and cannot run on a host - so everything it
+//! did through the firmware was argued in code and never exercised. The hostile-firmware cases the
+//! loader's milestone lists are exactly the ones QEMU's OVMF never produces: a Block I/O driver
+//! demanding 4096-byte buffer alignment, a `FileProtocol` that short-reads, six hundred memory
+//! descriptors, a stale `MapKey`, two system volumes in either handle order, a 16-bit
+//! `PixelBitMask` mode.
+//!
+//! Here they are ordinary tests. The firmware is a set of function pointers, so a mock is a set of
+//! Rust functions with the same signatures - and the code under test is the code that ships, not a
+//! second copy of it. `mock` is behind `cfg(test)` and never reaches the loader.
+//!
+//! Minimal and hand-rolled: exactly the types, protocols, and boot-service calls the loader needs -
+//! no external crate; the layouts and GUIDs come straight from the UEFI specification. Every
+//! firmware entry point uses the `efiapi` calling convention.
+//!
+//! The loader touches only: memory allocation (AllocatePages / AllocatePool), the memory map
+//! (GetMemoryMap), the loaded-image + simple-file-system protocols (to read the kernel and packages
+//! off the boot medium), the Graphics Output Protocol (the framebuffer), the ACPI configuration
+//! table (the RSDP), and ExitBootServices.
 
+#![cfg_attr(not(test), no_std)]
 #![allow(dead_code)]
+
+extern crate alloc;
+
+pub mod disk;
+pub mod file;
+pub mod gop;
+pub mod memory;
+
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
 
 use core::ffi::c_void;
 
@@ -305,6 +331,7 @@ pub const PIXEL_BIT_MASK: u32 = 2;
 pub const PIXEL_BLT_ONLY: u32 = 3;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct PixelBitmask {
 	pub red: u32,
 	pub green: u32,

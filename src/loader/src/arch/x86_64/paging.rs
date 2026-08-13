@@ -13,7 +13,7 @@
 // boot services physical == virtual, so each freshly allocated table is written
 // straight at its physical address.
 
-use crate::uefi::{self, BootServices, PhysicalAddress};
+use uefi::{self, BootServices, PhysicalAddress};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_2MB: u64 = 2 * 1024 * 1024;

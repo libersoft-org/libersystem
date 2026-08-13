@@ -25,6 +25,10 @@
 #   QEMU_EXTRA= extra QEMU arguments
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
 #   UEFI=1    boot through own UEFI loader (aarch64/riscv64 only)
+#   EL2=1     aarch64: start the guest at EL2 (`virtualization=on`), which is where the UEFI
+#             specification puts AArch64 firmware on most server-class parts - and which the
+#             loader's EL2 branch had never once executed under, because QEMU's `virt` starts at
+#             EL1 by default. Only meaningful with UEFI=1: the branch is in the loader.
 #   OVMF_*, AAVMF_*, BIOS=, UBOOT=, LOADER_EFI=, DTB_ADDR= arch-specific firmware
 
 set -euo pipefail
@@ -699,6 +703,12 @@ qemu_run_aarch64() {
 	qemu_parse_displays qemu-run
 
 	local machine="virt,gic-version=2"
+	# EL2, the level the specification says AArch64 firmware runs at. The loader reads `CurrentEL`
+	# and drops to EL1 before entering the kernel; that path is written from the architecture manual
+	# and, until this switch existed, had never been executed on any machine this project has run on.
+	if [[ "${EL2:-0}" == "1" ]]; then
+		machine="$machine,virtualization=on"
+	fi
 	local qemu_args=()
 	local cpu_args=()
 	qemu_select_cpu cpu_args aarch64 cortex-a72

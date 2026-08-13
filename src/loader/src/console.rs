@@ -13,7 +13,7 @@
 
 use core::ptr;
 
-use crate::uefi::{self, SimpleTextOutput};
+use uefi::{self, SimpleTextOutput};
 
 // The firmware's console, or null before it is known and after boot services end.
 static mut CON_OUT: *mut SimpleTextOutput = ptr::null_mut();

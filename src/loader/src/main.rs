@@ -30,11 +30,17 @@ mod blockio;
 mod console;
 mod elf;
 mod heap;
-mod uefi;
 
 use core::ffi::c_void;
 
 use uefi::{BootServices, Handle, Status, SystemTable};
+// The firmware-facing work the loader drives - moved into the `uefi` crate, where a mock firmware
+// can exercise it. The loader is a UEFI binary and cannot run a test; the algorithms it used to
+// hold could not either, which is why the hostile-firmware cases in this milestone were argued in
+// code and never run.
+use uefi::file::read_file;
+pub(crate) use uefi::gop::locate_framebuffer;
+use uefi::memory::alloc_pages;
 
 // The kernel filename on the boot volume's root (mkimage lays it there). Both
 // architectures read the kernel; the init/volume package filenames are x86-only (the
@@ -305,26 +311,10 @@ static mut PAIRED_UUID: Option<[u8; 16]> = None;
 // Read `etc/system-volume.uuid` off the boot medium: 32 hex digits, dashes and surrounding
 // whitespace ignored, so the file can be written in either of the two spellings people use.
 fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> Option<[u8; 16]> {
-	let bytes = read_boot_file(bs, root, "etc/system-volume.uuid")?;
-	let mut out = [0u8; 16];
-	let mut nibbles = 0usize;
-	for &b in bytes {
-		if b == b'-' || b.is_ascii_whitespace() {
-			continue;
-		}
-		let v = match b {
-			b'0'..=b'9' => b - b'0',
-			b'a'..=b'f' => b - b'a' + 10,
-			b'A'..=b'F' => b - b'A' + 10,
-			_ => return None,
-		};
-		if nibbles >= 32 {
-			return None;
-		}
-		out[nibbles / 2] |= if nibbles % 2 == 0 { v << 4 } else { v };
-		nibbles += 1;
-	}
-	if nibbles == 32 { Some(out) } else { None }
+	// The parse lives with the rule it feeds - `uefi::disk::parse_pairing`, beside `choose_volume` -
+	// so both halves of the pairing mechanism are in one place and both are tested. What stays here
+	// is the reading.
+	uefi::disk::parse_pairing(read_boot_file(bs, root, "etc/system-volume.uuid")?)
 }
 
 // The live medium's system volume, read once. It is needed twice - to assemble the bootstrap set
@@ -355,38 +345,41 @@ pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) 
 }
 
 pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> VolumeRead {
-	let mut outcome = VolumeRead::NoVolume;
-	blockio::each_disk(bs, |disk| {
-		let Ok(mut fs) = liberfs::LiberFs::mount(disk) else { return false };
-		// A LiberFS volume that is not the one this medium is paired with is somebody else's
-		// system. Keep looking; on a machine with one volume there is nothing to skip.
-		if let Some(want) = unsafe { PAIRED_UUID }
-			&& fs.uuid() != want
-		{
-			return false;
+	// THE PAIRING RULE HAS ONE HOME NOW - `uefi::disk::choose_volume` - and it is tested there,
+	// against two volumes presented in either handle order. It used to be an `if` inside this
+	// closure, in a UEFI binary nothing could run: the mechanism that decides which of two
+	// LiberSystem disks in one machine is this one's was the only part of this milestone with no
+	// way to be exercised.
+	//
+	// A LiberFS volume that is not the one this medium is paired with is somebody else's system.
+	// Keep looking; on a machine with one volume there is nothing to skip.
+	let want = unsafe { PAIRED_UUID };
+	let Some(mut fs) = uefi::disk::choose_volume(bs, want, |disk| {
+		let fs = liberfs::LiberFs::mount(disk).ok()?;
+		let uuid = fs.uuid();
+		Some((uuid, fs))
+	}) else {
+		return VolumeRead::NoVolume;
+	};
+	// The bootstrap set, packed into the archive format the kernel already unpacks. This is
+	// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from
+	// files that exist on the volume rather than from a package built beside it.
+	if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
+		unsafe {
+			BOOTSTRAP = retain(bs, &archive);
+			BOOTSTRAP_SOURCE = SOURCE_SYSTEM_VOLUME;
 		}
-		// The bootstrap set, packed into the archive format the kernel already unpacks. This is
-		// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from
-		// files that exist on the volume rather than from a package built beside it.
-		if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
-			unsafe {
-				BOOTSTRAP = retain(bs, &archive);
-				BOOTSTRAP_SOURCE = SOURCE_SYSTEM_VOLUME;
-			}
-		}
-		// A LiberFS volume without this file is still the system volume; a second one is not
-		// going to be more right. Stop rather than read the same name off another disk, which
-		// is how a machine boots half of one system and half of another.
-		outcome = match fs.read_file(path) {
-			Ok(bytes) => match retain(bs, &bytes) {
-				Some(retained) => VolumeRead::Read(retained),
-				None => VolumeRead::NotOnVolume,
-			},
-			Err(_) => VolumeRead::NotOnVolume,
-		};
-		true
-	});
-	outcome
+	}
+	// A LiberFS volume without this file is still the system volume; a second one is not going to
+	// be more right. Stop rather than read the same name off another disk, which is how a machine
+	// boots half of one system and half of another.
+	match fs.read_file(path) {
+		Ok(bytes) => match retain(bs, &bytes) {
+			Some(retained) => VolumeRead::Read(retained),
+			None => VolumeRead::NotOnVolume,
+		},
+		Err(_) => VolumeRead::NotOnVolume,
+	}
 }
 
 // Read a file from the boot medium: through the firmware when it mounted the volume, and through
@@ -519,106 +512,6 @@ pub(crate) fn open_boot_volume(bs: *mut BootServices, image_handle: Handle) -> O
 	Some(root)
 }
 
-// Read an entire file from the boot volume into fresh LOADER_DATA pages and return it
-// as a 'static slice (the memory is retained across the hand-off).
-pub(crate) fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> Option<&'static [u8]> {
-	let mut wname = [0u16; 64];
-	// A name that does not fit is not this name: opening a truncated path would open a different
-	// file, which is worse than not opening one.
-	if !to_utf16(name, &mut wname) {
-		return None;
-	}
-
-	let mut file: *mut uefi::FileProtocol = core::ptr::null_mut();
-	let status = unsafe { ((*root).open)(root, &mut file, wname.as_ptr(), uefi::FILE_MODE_READ, 0) };
-	if uefi::is_error(status) || file.is_null() {
-		return None;
-	}
-	// EVERY PATH BELOW CLOSES THE FILE. Two of them used to return without doing so, and a handle
-	// left open is a firmware object that can still move the memory map - the one thing that must
-	// hold still between the sizing `GetMemoryMap` and `ExitBootServices`.
-	let guard = OpenFile { file };
-	let file = guard.file;
-
-	// File size via GetInfo. The structure ends in a variable-length name, so the specified
-	// pattern is: call, and when the firmware answers BUFFER_TOO_SMALL with a required size, call
-	// again with that size. The 512-byte stack buffer holds every name this loader opens today;
-	// the heap path is what makes the helper correct for a name that is longer.
-	let mut info_buf = [0u8; 512];
-	let mut info_size = info_buf.len();
-	let mut heap_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-	let mut info = info_buf.as_mut_ptr();
-	let status = unsafe { ((*file).get_info)(file, &uefi::FILE_INFO_GUID, &mut info_size, info as *mut c_void) };
-	let status = if status == uefi::STATUS_BUFFER_TOO_SMALL {
-		if info_size > 64 * 1024 {
-			return None;
-		}
-		heap_buf.try_reserve_exact(info_size).ok()?;
-		heap_buf.resize(info_size, 0);
-		info = heap_buf.as_mut_ptr();
-		unsafe { ((*file).get_info)(file, &uefi::FILE_INFO_GUID, &mut info_size, info as *mut c_void) }
-	} else {
-		status
-	};
-	if uefi::is_error(status) || info_size < core::mem::size_of::<uefi::FileInfo>() {
-		return None;
-	}
-	let file_size = unsafe { (*(info as *const uefi::FileInfo)).file_size } as usize;
-
-	let pages = file_size.div_ceil(PAGE_SIZE as usize).max(1);
-	let phys = alloc_pages(bs, pages)?;
-
-	// Read the whole file (loop until the firmware stops handing back bytes).
-	let mut read_total = 0usize;
-	while read_total < file_size {
-		let mut chunk = file_size - read_total;
-		let status = unsafe { ((*file).read)(file, &mut chunk, (phys as *mut u8).add(read_total) as *mut c_void) };
-		if uefi::is_error(status) || chunk == 0 {
-			break;
-		}
-		read_total += chunk;
-	}
-	// A SHORT READ IS NOT A FILE. This returned `from_raw_parts(phys, file_size)` however much had
-	// arrived, so a file whose `FileInfo` said one megabyte and whose second read failed became a
-	// one-megabyte slice whose tail was whatever those freshly allocated pages held - handed on as
-	// a kernel image, a bootstrap package or a volume. The pages go back and the answer is None.
-	if read_total != file_size {
-		unsafe { ((*bs).free_pages)(phys, pages) };
-		return None;
-	}
-	Some(unsafe { core::slice::from_raw_parts(phys as *const u8, file_size) })
-}
-
-// Closes its handle however the scope ends.
-struct OpenFile {
-	file: *mut uefi::FileProtocol,
-}
-
-impl Drop for OpenFile {
-	fn drop(&mut self) {
-		unsafe { ((*self.file).close)(self.file) };
-	}
-}
-
-// Encode `s` as NUL-terminated UTF-16 into `out`. False when it does not fit.
-//
-// This widened BYTES: `out[i] = b as u16` turned the two UTF-8 bytes of `č` into two separate
-// UTF-16 units, so a name with any non-ASCII character named something else. And it `break`s when
-// full, so a path longer than the buffer opened a DIFFERENT, SHORTER path rather than failing -
-// with `FirmwareVolume` accepting up to 128 bytes before handing them here.
-pub(crate) fn to_utf16(s: &str, out: &mut [u16]) -> bool {
-	let mut i = 0;
-	for unit in s.encode_utf16() {
-		if i + 1 >= out.len() {
-			return false;
-		}
-		out[i] = unit;
-		i += 1;
-	}
-	out[i] = 0;
-	true
-}
-
 // A decimal number on the boot console. There is no formatting machinery in this binary and there
 // is no reason to link one for a diagnostic.
 pub(crate) fn serial_write_usize(mut value: usize) {
@@ -638,132 +531,8 @@ pub(crate) fn serial_write_usize(mut value: usize) {
 	}
 }
 
-// Allocate `pages` 4 KiB pages of retained LOADER_DATA and return the physical base
-// (0-checked None on failure).
-pub(crate) fn alloc_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
-	let mut addr: u64 = 0;
-	let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ANY_PAGES, uefi::LOADER_DATA, pages, &mut addr) };
-	if uefi::is_error(status) { None } else { Some(addr) }
-}
-
 pub(crate) fn align_down(v: u64, align: u64) -> u64 {
 	v & !(align - 1)
-}
-
-// The active linear framebuffer the firmware's Graphics Output Protocol reports: its
-// physical base + byte size and the pixel geometry/format. Architecture-neutral - each
-// backend turns it into a `bootproto::Framebuffer` (x86 stores an HHDM virtual `addr`
-// it mapped; the device-tree arches store the physical base and let the kernel map it).
-pub(crate) struct GopFb {
-	pub present: bool,
-	pub phys: u64,
-	// Read only by the x86 backend (to map the framebuffer into the HHDM); the
-	// device-tree arches pass the physical base straight through and never map it.
-	#[allow(dead_code)]
-	pub size: u64,
-	pub width: u32,
-	pub height: u32,
-	pub pitch: u32, // bytes per row
-	// Bits per pixel, DERIVED from the mode's own bitmask rather than assumed.
-	//
-	// The helper below already computed this to get the pitch right for a non-32 bpp mode, and then
-	// dropped it: `GopFb` had no field for it and all three backends published the constant `32`.
-	// The kernel derives bytes-per-pixel from what they publish, so such a mode got a correct pitch
-	// and a wrong pixel stride - the original finding surviving inside its own fix.
-	pub bpp: u32,
-	pub red_shift: u8,
-	pub red_size: u8,
-	pub green_shift: u8,
-	pub green_size: u8,
-	pub blue_shift: u8,
-	pub blue_size: u8,
-}
-
-impl GopFb {
-	pub(crate) const NONE: Self = Self { present: false, phys: 0, size: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0 };
-}
-
-// Query the Graphics Output Protocol for the active mode's linear framebuffer. Returns
-// `GopFb::NONE` on a headless boot (no GOP / no active mode / an unsupported format).
-pub(crate) fn locate_framebuffer(bs: *mut BootServices) -> GopFb {
-	let mut gop: *mut c_void = core::ptr::null_mut();
-	let status = unsafe { ((*bs).locate_protocol)(&uefi::GRAPHICS_OUTPUT_PROTOCOL_GUID, core::ptr::null_mut(), &mut gop) };
-	if uefi::is_error(status) || gop.is_null() {
-		return GopFb::NONE;
-	}
-	let gop = gop as *mut uefi::GraphicsOutput;
-	let mode = unsafe { (*gop).mode };
-	if mode.is_null() {
-		return GopFb::NONE;
-	}
-	let info = unsafe { (*mode).info };
-	if info.is_null() {
-		return GopFb::NONE;
-	}
-	let (width, height, pitch_px, format, mask) = unsafe { ((*info).horizontal_resolution, (*info).vertical_resolution, (*info).pixels_per_scan_line, (*info).pixel_format, &(*info).pixel_information) };
-	// Channel shifts/sizes: the common 32-bpp RGB/BGR modes are fixed layouts; a
-	// bit-mask mode is decoded from the reported channel masks.
-	let (rs, gs, bs_shift) = match format {
-		uefi::PIXEL_RGB => (0u8, 8u8, 16u8),
-		uefi::PIXEL_BGR => (16u8, 8u8, 0u8),
-		uefi::PIXEL_BIT_MASK => (mask_shift(mask.red), mask_shift(mask.green), mask_shift(mask.blue)),
-		_ => return GopFb::NONE,
-	};
-	let (rz, gz, bz) = match format {
-		uefi::PIXEL_BIT_MASK => (mask_size(mask.red), mask_size(mask.green), mask_size(mask.blue)),
-		_ => (8u8, 8u8, 8u8),
-	};
-	// THE PIXEL SIZE COMES FROM THE MASKS in a bit-mask mode, which is what the masks are for. It
-	// was the literal 32, and the pitch `pixels_per_scan_line * 4` with it - so a firmware
-	// describing a 24- or 16-bit layout got a renderer writing four bytes per pixel into a
-	// framebuffer with a different stride, which is a diagonal smear rather than a picture.
-	//
-	// And the masks are CHECKED rather than assumed contiguous and disjoint: `mask_size` counts
-	// the run of ones above the lowest set bit, so a split mask reads as a short one, and two
-	// channels claiming the same bits produce a colour neither of them asked for.
-	let bpp = match format {
-		uefi::PIXEL_BIT_MASK => {
-			let all = mask.red | mask.green | mask.blue | mask.reserved;
-			if all == 0 {
-				return GopFb::NONE;
-			}
-			// Contiguous: each channel's mask must be exactly the run its shift and size describe.
-			//
-			// RESERVED IS ONE OF THEM. It contributes to `all` and therefore to the pixel size below,
-			// and it was the one mask nothing checked - so a firmware whose reserved mask is split,
-			// or overlaps a colour channel, produced an element size derived from a mask that had
-			// been through no validation at all. The original defect here was a literal 32; this is
-			// the last quarter of the check that replaced it.
-			let reserved_shift = mask_shift(mask.reserved);
-			let reserved_size = mask_size(mask.reserved);
-			for (m, shift, size) in [(mask.red, rs, rz), (mask.green, gs, gz), (mask.blue, bs_shift, bz), (mask.reserved, reserved_shift, reserved_size)] {
-				if m != 0 && m != (((1u64 << size) - 1) as u32) << shift {
-					return GopFb::NONE;
-				}
-			}
-			// Disjoint: no two channels may claim a bit, reserved included.
-			if (mask.red & mask.green) | (mask.green & mask.blue) | (mask.red & mask.blue) != 0 {
-				return GopFb::NONE;
-			}
-			if (mask.reserved & (mask.red | mask.green | mask.blue)) != 0 {
-				return GopFb::NONE;
-			}
-			// The element size is the highest set bit across all four, rounded up to whole bytes.
-			(32 - all.leading_zeros()).div_ceil(8) * 8
-		}
-		_ => 32u32,
-	};
-	GopFb { present: true, phys: unsafe { (*mode).frame_buffer_base }, size: unsafe { (*mode).frame_buffer_size as u64 }, width, height, pitch: pitch_px * (bpp / 8), bpp, red_shift: rs, red_size: rz, green_shift: gs, green_size: gz, blue_shift: bs_shift, blue_size: bz }
-}
-
-// Bit position of the lowest set bit of a channel mask.
-fn mask_shift(mask: u32) -> u8 {
-	if mask == 0 { 0 } else { mask.trailing_zeros() as u8 }
-}
-
-// Width in bits of a contiguous channel mask.
-fn mask_size(mask: u32) -> u8 {
-	(mask >> mask_shift(mask)).trailing_ones() as u8
 }
 
 // Claim every `PT_LOAD`'s page span at its physical link address, so a later opportunistic
@@ -782,7 +551,7 @@ fn mask_size(mask: u32) -> u8 {
 // So the reservation returns what it owns. A backend asks this value rather than re-asking the
 // firmware a question whose answer it cannot interpret, and a span that is not in here is fatal at
 // placement - the old panic, restored deliberately rather than by omission.
-pub struct ReservedKernel {
+struct ReservedKernel {
 	// (page-aligned base, page count) per PT_LOAD segment this loader reserved.
 	spans: [(u64, u64); MAX_KERNEL_SPANS],
 	count: usize,

@@ -14,9 +14,9 @@ use core::arch::asm;
 
 use bootproto::{BootInfo, Framebuffer, MemRegion, Module};
 
-use crate::uefi::{self, BootServices, Handle, SystemTable};
 use crate::{align_down, alloc_pages, read_file};
 use paging::{HHDM_OFFSET, PAGE_2MB, PAGE_SIZE, PageTables};
+use uefi::{self, BootServices, Handle, SystemTable};
 
 // The init/volume package filenames on the boot volume (the x86 loader reads them and
 // hands the kernel their bytes as boot-protocol modules; the aarch64 kernel embeds them).
@@ -35,7 +35,8 @@ fn align_up(v: u64, align: u64) -> u64 {
 const STACK_PAGES: usize = 32;
 
 // Upper bound on memory-map regions translated into the boot protocol.
-const MAX_REGIONS: usize = 512;
+// The boot protocol's region ceiling, which lives with the translation that enforces it.
+use uefi::memory::MAX_REGIONS;
 
 // Upper bound on kernel PT_LOAD segments.
 const MAX_SEGMENTS: usize = 16;
@@ -116,7 +117,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	}
 
 	// The highest physical address the HHDM and identity map must cover.
-	let ram_top = align_up(memory_top(bs), PAGE_2MB);
+	let ram_top = align_up(uefi::memory::memory_top(bs), PAGE_2MB);
 
 	// Build the page hierarchy: HHDM over all RAM, the framebuffer uncacheable,
 	// a low identity map for the CR3 switch, and the kernel's segments.
@@ -332,7 +333,7 @@ fn alloc_low_page(bs: *mut BootServices) -> u64 {
 // is what this boot had before, so it says so and carries on rather than refusing to boot over an
 // attribute.
 fn map_mmio_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top: u64) {
-	let Some((buf, pages, map_size, desc_size)) = memory_map_snapshot(bs) else {
+	let Some((buf, pages, map_size, desc_size)) = uefi::memory::memory_map_snapshot(bs) else {
 		// NO MAP AT ALL IS A REFUSAL. The loader knows it is about to hand the kernel a direct map
 		// it could not check, and "no worse than the bug" is a reason not to panic over a cosmetic
 		// attribute - MMIO mapped write-back is not cosmetic. It is a device seeing stale writes and
@@ -368,61 +369,6 @@ fn map_mmio_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top:
 		}
 	}
 	unsafe { ((*bs).free_pages)(buf as u64, pages) };
-}
-
-// Take the firmware's memory map into fresh pages. Returns the buffer, its page count (for the
-// caller's `free_pages`), the map's byte size and the descriptor stride.
-//
-// Factored out because two callers need the same six-step dance - size, pad, allocate, fetch,
-// check, stride - and the first of them had a divide-by-zero in it until the sizing call's status
-// was checked. One copy, one set of checks.
-fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDescriptor, usize, usize, usize)> {
-	let mut map_size = 0usize;
-	let mut key = 0usize;
-	let mut desc_size = 0usize;
-	let mut desc_ver = 0u32;
-	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, core::ptr::null_mut(), &mut key, &mut desc_size, &mut desc_ver) };
-	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
-		return None;
-	}
-	map_size += desc_size * 8;
-	let pages = map_size.div_ceil(PAGE_SIZE as usize);
-	let buf = alloc_pages(bs, pages)? as *mut uefi::MemoryDescriptor;
-	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, buf, &mut key, &mut desc_size, &mut desc_ver) };
-	if uefi::is_error(status) {
-		unsafe { ((*bs).free_pages)(buf as u64, pages) };
-		return None;
-	}
-	Some((buf, pages, map_size, desc_size))
-}
-
-// The highest physical address any memory-map descriptor reaches.
-fn memory_top(bs: *mut BootServices) -> u64 {
-	let Some((buf, pages, map_size, desc_size)) = memory_map_snapshot(bs) else {
-		return 0;
-	};
-	// RAM ONLY. This took the maximum over EVERY descriptor, so a firmware that describes a PCI
-	// window or an MMIO aperture high in the address space made the HHDM and the identity map span
-	// the whole interval in 2 MiB pages - megabytes of page tables, seconds of boot time, a direct
-	// map laid over physical holes, and device memory mapped write-back, when only the framebuffer
-	// is given `PCD | PWT`. The kernel translates RAM through the HHDM; it reaches devices through
-	// its own mappings.
-	let mut top = 0u64;
-	let entries = map_size / desc_size;
-	for i in 0..entries {
-		let d = unsafe { &*((buf as *const u8).add(i * desc_size) as *const uefi::MemoryDescriptor) };
-		if d.ty == uefi::MEMORY_MAPPED_IO || d.ty == uefi::MEMORY_MAPPED_IO_PORT_SPACE {
-			continue;
-		}
-		let Some(end) = d.page_count.checked_mul(PAGE_SIZE).and_then(|bytes| d.phys_start.checked_add(bytes)) else {
-			continue;
-		};
-		if end > top {
-			top = end;
-		}
-	}
-	unsafe { ((*bs).free_pages)(buf as u64, pages) };
-	top
 }
 
 // Get the final memory map, translate it into the region array, then exit boot
@@ -466,7 +412,13 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 		if uefi::is_error(status) {
 			panic!("get_memory_map failed");
 		}
-		let count = translate_map(buf, size, desc_size, regions);
+		// FATAL, not silent, and said HERE because this is where there is a serial port to say it
+		// on: `translate_map` refuses a map with more regions than the boot protocol carries rather
+		// than truncating it.
+		let Some(count) = uefi::memory::translate_map(buf, size, desc_size, regions) else {
+			serial::write_str("loader: FATAL - the firmware memory map has more regions than the boot protocol carries\n");
+			panic!("memory map larger than MAX_REGIONS");
+		};
 		// The heap lives on firmware pages, so it stops being usable exactly here. Retiring it
 		// makes a later allocation fail loudly instead of handing out memory the loader no
 		// longer owns.
@@ -481,78 +433,9 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 		// ONLY a stale map key is worth retrying - the specification's `EFI_INVALID_PARAMETER`.
 		// This looped on every error forever, which is the least informative possible response to a
 		// firmware saying something else is wrong.
-		if status != uefi::STATUS_INVALID_PARAMETER {
+		if !uefi::memory::exit_retryable(status) {
 			panic!("loader: ExitBootServices refused");
 		}
 		// The map changed; retry without allocating.
-	}
-}
-
-// Translate the EFI memory map into the boot protocol's region array (sorted
-// ascending by base and coalesced). Returns the region count.
-fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_size: usize, regions: *mut MemRegion) -> usize {
-	let entries = map_size / desc_size;
-	let mut n = 0usize;
-	for i in 0..entries {
-		// FATAL, not silent. Breaking here handed the kernel a map that looked complete and was
-		// missing its tail - the worst available failure mode for the one structure that says which
-		// RAM exists, and one that would surface as memory corruption long afterwards.
-		if n >= MAX_REGIONS {
-			serial::write_str("loader: FATAL - the firmware memory map has more regions than the boot protocol carries\n");
-			panic!("memory map larger than MAX_REGIONS");
-		}
-		let d = unsafe { &*((buf as *const u8).add(i * desc_size) as *const uefi::MemoryDescriptor) };
-		let kind = region_kind(d.ty);
-		unsafe {
-			*regions.add(n) = MemRegion { base: d.phys_start, length: d.page_count * PAGE_SIZE, kind, _pad: 0 };
-		}
-		n += 1;
-	}
-	// Insertion sort ascending by base (region counts are small).
-	for i in 1..n {
-		let mut j = i;
-		while j > 0 {
-			let a = unsafe { *regions.add(j - 1) };
-			let b = unsafe { *regions.add(j) };
-			if a.base <= b.base {
-				break;
-			}
-			unsafe {
-				*regions.add(j - 1) = b;
-				*regions.add(j) = a;
-			}
-			j -= 1;
-		}
-	}
-	// Coalesce adjacent same-kind runs in place.
-	if n == 0 {
-		return 0;
-	}
-	let mut w = 0usize;
-	for r in 1..n {
-		let cur = unsafe { *regions.add(r) };
-		let last = unsafe { &mut *regions.add(w) };
-		if cur.kind == last.kind && last.base + last.length == cur.base {
-			last.length += cur.length;
-		} else {
-			w += 1;
-			unsafe { *regions.add(w) = cur };
-		}
-	}
-	w + 1
-}
-
-// Map an EFI memory type onto a boot-protocol region kind. Conventional and
-// boot-services memory become usable (free after exit); loader memory is retained
-// (it holds the kernel image, packages, page tables, BootInfo, stack, and
-// trampoline); everything else is reserved / ACPI / bad as reported.
-fn region_kind(ty: u32) -> u32 {
-	match ty {
-		uefi::CONVENTIONAL_MEMORY | uefi::BOOT_SERVICES_CODE | uefi::BOOT_SERVICES_DATA => bootproto::MEM_USABLE,
-		uefi::LOADER_CODE | uefi::LOADER_DATA => bootproto::MEM_BOOTLOADER,
-		uefi::ACPI_RECLAIM_MEMORY => bootproto::MEM_ACPI_RECLAIMABLE,
-		uefi::ACPI_MEMORY_NVS => bootproto::MEM_ACPI_NVS,
-		uefi::UNUSABLE_MEMORY => bootproto::MEM_BAD,
-		_ => bootproto::MEM_RESERVED,
 	}
 }

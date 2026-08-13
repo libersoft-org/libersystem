@@ -37,4 +37,13 @@ dependencies = [
  "fat",
  "fscore",
  "liberfs",
+ "uefi",
+]
+
+[[package]]
+name = "uefi"
+version = "0.0.0"
+dependencies = [
+ "bootproto",
+ "fscore",
 ]
