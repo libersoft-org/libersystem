@@ -59,6 +59,28 @@ timing_event() {
 	if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\t%s\t%s\n' "$(date +%s%N)" "$1" "$2" >>"$LIBER_TIMING_LOG"; fi
 }
 
+# THE PREREQUISITES, NAMED, AND BEFORE ANYTHING USES THEM.
+#
+# Each of these was a bare `command -v tool >/dev/null` further down, which under `set -e` exits
+# with status 1 and prints NOTHING - so a build on a machine without `jq` produced one line,
+# "status=1", and nothing else. That reads as "the build is broken" when it means "this machine is
+# missing a package", and the two want completely different answers.
+#
+# They are checked TOGETHER and reported together, because a machine missing one of them is usually
+# missing several from the same package, and finding them one build at a time is the shape of the
+# problem this replaces. And they are checked FIRST, before the manifest is read, because the
+# manifest is read with `jq` and `find`: a check that runs after the tools are used reports the
+# missing tool underneath the errors of everything that already tried to use it.
+missing_tools=""
+for tool in awk find flock jq sed sha256sum stat xxd llvm-ar llvm-mc llvm-objcopy llvm-readelf llvm-strip; do
+	command -v "$tool" >/dev/null 2>&1 || missing_tools+=" $tool"
+done
+if [[ -n "$missing_tools" ]]; then
+	echo "build-shared: required tools not found:$missing_tools" >&2
+	echo "build-shared: the llvm-* tools come with LLVM (Debian/Ubuntu: llvm), xxd with vim-common, jq with jq" >&2
+	exit 1
+fi
+
 target="$1"
 shift
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -279,7 +301,6 @@ if [[ "$force_rebuild" != 0 && "$force_rebuild" != 1 ]]; then
 	exit 2
 fi
 
-command -v flock >/dev/null
 # The shape of `.build` is created here rather than assumed: every group has a directory whose
 # name says what it is for, so a sweep can be written against a place instead of a list of
 # filename patterns. `state` holds what the next build reads, `logs` what the last one wrote,
@@ -320,13 +341,6 @@ if [[ -z "$lld" ]]; then
 	echo "build-shared: rust-lld not found in the pinned toolchain" >&2
 	exit 1
 fi
-command -v llvm-ar >/dev/null
-command -v llvm-readelf >/dev/null
-command -v llvm-strip >/dev/null
-command -v jq >/dev/null
-command -v sha256sum >/dev/null
-command -v stat >/dev/null
-command -v xxd >/dev/null
 
 targeted_plan_record() {
 	local library_names program_names

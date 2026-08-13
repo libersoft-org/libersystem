@@ -11,8 +11,17 @@ binary="$target_dir/debug/system-manifest"
 key_file="$build_root/state/manifest-tool.key"
 lock_file="$build_root/state/manifest-tool.lock"
 
-command -v flock >/dev/null
-command -v sha256sum >/dev/null
+# NAMED, for the reason build-shared gives at its own check: a bare `command -v` under `set -e`
+# exits with status 1 and prints nothing, and this script runs before build-shared says anything -
+# so a machine without `flock` failed a build with no output at all.
+missing_tools=""
+for tool in flock sha256sum find; do
+	command -v "$tool" >/dev/null 2>&1 || missing_tools+=" $tool"
+done
+if [[ -n "$missing_tools" ]]; then
+	echo "system-manifest: required tools not found:$missing_tools" >&2
+	exit 1
+fi
 mkdir -p "$build_root"
 exec 9>"$lock_file"
 flock 9
