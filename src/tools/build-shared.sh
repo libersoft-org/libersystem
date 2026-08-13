@@ -72,12 +72,12 @@ timing_event() {
 # manifest is read with `jq` and `find`: a check that runs after the tools are used reports the
 # missing tool underneath the errors of everything that already tried to use it.
 missing_tools=""
-for tool in awk find flock jq sed sha256sum stat xxd llvm-ar llvm-mc llvm-objcopy llvm-readelf llvm-strip; do
+for tool in awk find flock jq sed sha256sum stat llvm-ar llvm-mc llvm-objcopy llvm-readelf llvm-strip; do
 	command -v "$tool" >/dev/null 2>&1 || missing_tools+=" $tool"
 done
 if [[ -n "$missing_tools" ]]; then
 	echo "build-shared: required tools not found:$missing_tools" >&2
-	echo "build-shared: the llvm-* tools come with LLVM (Debian/Ubuntu: llvm), xxd with vim-common, jq with jq" >&2
+	echo "build-shared: the llvm-* tools come with LLVM (Debian/Ubuntu: llvm); everything else is coreutils, jq or util-linux" >&2
 	exit 1
 fi
 
@@ -984,16 +984,25 @@ write_identity_record() {
 write_identity_note() {
 	local record="$1"
 	local note="$2"
-	local record_len padding record_len_le
+	local record_len padding escaped
 	record_len="$(stat -c %s "$record")"
 	if ((record_len == 0 || record_len > 8192)); then
 		echo "build-shared: identity record has invalid length $record_len" >&2
 		return 1
 	fi
-	record_len_le="$(printf '%08x' "$record_len" | sed -E 's/(..)(..)(..)(..)/\4\3\2\1/')"
-	{
-		printf '06000000%s010000004c49424552000000' "$record_len_le"
-	} | xxd -r -p >"$note"
+	# The note header, written with the shell's own printf rather than through `xxd -r -p`.
+	#
+	# `xxd` is not in coreutils - it ships with vim - and it was this build's ONLY use of it, for
+	# twenty fixed bytes. A machine without vim installed could not build the system, which is a
+	# dependency nobody would guess from what the note is for.
+	#
+	# The bytes are an ELF note: namesz (6, for "LIBER\0"), descsz (the record's length, little
+	# endian), type (1), then the name padded to four bytes. The inner printf builds the ESCAPES as
+	# text - a command substitution cannot carry the NUL bytes themselves - and `%b` turns them into
+	# the bytes on the way to the file.
+	escaped="$(printf '\\x06\\x00\\x00\\x00\\x%02x\\x%02x\\x%02x\\x%02x\\x01\\x00\\x00\\x00LIBER\\x00\\x00\\x00' \
+		"$((record_len & 0xff))" "$(((record_len >> 8) & 0xff))" "$(((record_len >> 16) & 0xff))" "$(((record_len >> 24) & 0xff))")"
+	printf '%b' "$escaped" >"$note"
 	cat "$record" >>"$note"
 	padding=$(((4 - record_len % 4) % 4))
 	if ((padding != 0)); then head -c "$padding" /dev/zero >>"$note"; fi
