@@ -309,15 +309,6 @@ impl Cardinality {
 			(Exact(a), Exact(b)) => Exact(a.max(b)),
 		}
 	}
-
-	// How many capabilities this shape carries, for a caller that needs a number.
-	fn count(self) -> Option<usize> {
-		match self {
-			Cardinality::Exact(n) => Some(n),
-			Cardinality::OverLimit(n) => Some(n),
-			Cardinality::Unbounded | Cardinality::Unknown => None,
-		}
-	}
 }
 
 fn check_wire_shapes(file: &File, names: &HashMap<String, Kind>, imports: Option<&HashMap<String, ResolvedSymbol>>, errs: &mut Vec<Error>) {
