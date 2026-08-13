@@ -28,6 +28,14 @@ declare -A GATES=(
 	["volume-layout"]="tools/check-volume-layout.sh ../.build/boot/volume-x86_64.pkg"
 	["milestone-index"]="tools/check-milestone-index.sh"
 	["single-cap-receive"]="tools/check-single-cap-receive.sh"
+	# A kernel allocation ring 3 can trigger must be able to refuse. Three audits closed that class
+	# by enumeration and a fourth would have found the next member; this is the rule instead.
+	["kernel-allocations"]="tools/check-kernel-allocations.sh"
+	# The `--artifact` fast path knows a library's DEPENDENCIES, or it reports an artifact as
+	# current after a crate it compiles against changed - which makes every test result taken on
+	# that artifact meaningless. Its own family's `quick` and `provider` modes are not gates because
+	# they rebuild the whole graph; this one is two targeted builds.
+	["targeted-cache"]="tools/check-shared-cache.sh targeted"
 )
 
 FORMATS=(bmp gif ico icns jpeg pcx png ppm qoi tga webp)

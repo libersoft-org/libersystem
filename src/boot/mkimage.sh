@@ -126,8 +126,21 @@ stage_bootstrap_files() {
 stage_volume_pairing() {
 	local image="$1" arch="${2:-x86_64}"
 	local uuid_file="$BUILD/system-volume-${arch}.uuid"
+	local volume="$BUILD/system-volume-${arch}.img"
 	if [[ ! -f "$uuid_file" ]]; then
-		echo "mkimage: no volume uuid at $uuid_file; the medium will name no system volume" >&2
+		# A MEDIUM CARRYING A VOLUME AND NO PAIRING IS A BUILD ERROR, not a warning.
+		#
+		# That combination is the one the loader cannot resolve safely: it finds a LiberFS volume, has
+		# nothing naming which one it should be, and falls back to the firmware's block-handle order -
+		# which is the defect this whole mechanism exists to remove. Advisory was the wrong strength
+		# for the one case it was written for.
+		#
+		# A medium that deliberately names nothing - the shipping ISO stages no set - has no volume
+		# either, and that stays permitted and says so.
+		if [[ -f "$volume" ]]; then
+			die "the medium carries $volume and no pairing file at $uuid_file - the loader would fall back to firmware enumeration order, which is what the pairing exists to stop"
+		fi
+		echo "mkimage: no system volume on this medium, so it names none" >&2
 		return 0
 	fi
 	assert_pairing_matches_volume "$uuid_file" "$BUILD/system-volume-${arch}.img"
@@ -143,6 +156,10 @@ stage_volume_pairing() {
 # The uuid is 16 raw bytes at offset 80 of the LiberFS superblock, which is block 0 of the image.
 assert_pairing_matches_volume() {
 	local uuid_file="$1" volume="$2"
+	# A pairing naming a volume that is not on THIS medium is legitimate - that is the multi-disk
+	# case the mechanism is for, an ESP naming a volume on another disk - so there is nothing to
+	# compare and nothing wrong. Said out loud rather than left as a bare `return 0`, which reads as
+	# neither a decision nor an oversight.
 	[[ -f "$volume" ]] || return 0
 	local declared actual
 	declared="$(tr -d '[:space:]-' <"$uuid_file" | tr 'A-F' 'a-f')"

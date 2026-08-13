@@ -73,6 +73,29 @@ impl<const N: usize> MsiRegistry<N> {
 		None
 	}
 
+	// Whether `owner` already holds a LIVE slot - `used` and not `pending`.
+	//
+	// ONE LIVE VECTOR PER DEVICE, and this is where the question is answered rather than where it is
+	// enforced: the policy belongs at `sys_device_msix_acquire`, the userspace path whose one caller
+	// is DeviceManager, and not in this mechanism, which the kernel's own bring-up test calls
+	// directly to stand in for DeviceManager on a device the booted system has already claimed.
+	//
+	// Why the question matters at all: every backend programs the device's MSI-X table ENTRY 0 for
+	// whatever slot it was given, so two live slots for one device would both be programmed into one
+	// entry - the second overwriting the first, and the first's `unbind` later masking the entry the
+	// second is live on. An old handle silently disabling a new one.
+	//
+	// A PENDING slot does not count. Its `Interrupt` is already gone; what the pending state protects
+	// is that no new owner is given that VECTOR while a message for it may still be in flight, which
+	// is a fact about the slot rather than about the device. A restarting driver reprogramming its
+	// own device's entry 0 is exactly what should happen.
+	pub fn has_live(&self, owner: u32) -> bool {
+		if owner == u32::MAX {
+			return false;
+		}
+		(0..N).any(|slot| self.used[slot].load(Ordering::Acquire) && !self.pending[slot].load(Ordering::Acquire) && self.owner[slot].load(Ordering::Acquire) == owner)
+	}
+
 	// Reserve one SPECIFIC slot for device `owner`, for a backend whose slot is fixed by
 	// the hardware rather than freely chosen: on riscv a device's PLIC INTx source is
 	// determined by its PCI slot + pin, so the source id IS the slot and the caller
@@ -199,7 +222,11 @@ mod tests {
 		// And the device's own capability holder saying it stopped is what frees it.
 		assert_eq!(registry.release_for_device(DEVICE), 1, "the quiesce releases exactly this device's pending vectors");
 		assert!(!registry.is_pending(first), "no longer pending");
-		assert_eq!(registry.acquire(OTHER, 2), Some(first), "and the vector is available again");
+		// A THIRD device asks for it, because `OTHER` already holds one: a device may hold one live
+		// slot, since every backend programs its MSI-X table entry 0 and two slots for one device
+		// would alias there. `OTHER` was used here as a convenience and the rule made it wrong.
+		const THIRD: u32 = 5;
+		assert_eq!(registry.acquire(THIRD, 2), Some(first), "and the vector is available again");
 
 		// A slot with no device behind it has nothing to wait for and is freed outright.
 		registry.free(second);

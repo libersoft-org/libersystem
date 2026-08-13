@@ -111,11 +111,21 @@ impl<D: BlockDevice> LiberFs<D> {
 		// subtrees with each other is the normal case, so this is also most of the work
 		// saved on a healthy volume.
 		let mut visited = try_zeroed(self.free.len())?;
+		// ONE TALLY FOR THE SNAPSHOT PASS, reported into the same three counters the live pass uses.
+		// `check_inode_tree` returned a bare `u32` and the caller added it to `checksum_failures`,
+		// so every fault a snapshot could have - a medium that would not answer, a shape that cannot
+		// be true, a stream that does not decode - was reported as the medium.
+		let mut snapshot_tally = StructureTally::default();
 		for i in 0..self.snapshots.len() {
 			let (root, crc) = (self.snapshots[i].inode_root, self.snapshots[i].inode_root_crc);
-			checksum_failures = checksum_failures.saturating_add(match self.check_inode_tree(root, crc, TREE_DEPTH_MAX, &mut visited) {
+			checksum_failures = checksum_failures.saturating_add(match self.check_inode_tree(root, crc, TREE_DEPTH_MAX, &mut visited, &mut snapshot_tally) {
 				Ok(bad) => bad,
-				Err(FsError::Corrupt | FsError::Io) => 1,
+				// The ROOT's own damage, which the walk cannot classify from inside.
+				Err(FsError::Io) => {
+					snapshot_tally.io = snapshot_tally.io.saturating_add(1);
+					0
+				}
+				Err(FsError::Corrupt) => 1,
 				Err(e) => return Err(e),
 			});
 		}
@@ -131,8 +141,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		// arithmetic in one place while the three that are NOT structural are counted where they
 		// are raised.
 		let named = tally.checksum + tally.io + tally.stream + tally.structural;
-		let structural_failures = (faults.len() as u32 - named) + tally.structural;
-		Ok(FsckReport { checksum_failures, damaged, structural_failures, stream_failures: tally.stream, faults })
+		let structural_failures = (faults.len() as u32 - named) + tally.structural + snapshot_tally.structural;
+		Ok(FsckReport { checksum_failures, damaged, structural_failures, stream_failures: tally.stream + snapshot_tally.stream, faults })
 	}
 
 	// Read the whole file at `path` out of the named snapshot's pinned generation,
@@ -592,7 +602,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// failure and the walk continues; only the root's own damage surfaces as the error
 	// (the caller counts it). The depth budget bounds the recursion against a hostile
 	// chain of one-child internals.
-	pub(crate) fn check_inode_tree(&mut self, ptr: u64, crc: u32, depth: usize, visited: &mut [u8]) -> Result<u32, FsError> {
+	pub(crate) fn check_inode_tree(&mut self, ptr: u64, crc: u32, depth: usize, visited: &mut [u8], tally: &mut StructureTally) -> Result<u32, FsError> {
 		if ptr == 0 {
 			return Ok(0);
 		}
@@ -639,7 +649,21 @@ impl<D: BlockDevice> LiberFs<D> {
 					// pinned generations were verified. The data is unreadable and nothing says so
 					// until somebody tries to read it, which for a snapshot may be after the live
 					// copy is gone.
-					self.load_spill(&mut inode).and_then(|()| self.count_corrupt(&inode)).map(|bad| bad.saturating_add(self.count_undecodable(&inode)))
+					// AND THE TWO ARE COUNTED APART, which folding them into one `u32` here undid.
+					//
+					// `count_undecodable` was added into the same number `count_corrupt` returns,
+					// and the caller adds that number to `checksum_failures` - so a pinned snapshot
+					// whose blocks all match their checksums and whose LZ stream does not decode was
+					// reported as a MEDIUM fault. The report's whole purpose is keeping those three
+					// causes apart, the live pass keeps them apart through `StructureTally`, and
+					// `count_undecodable`'s own comment says the difference between the two walks is
+					// which tree is being walked and not which checks apply. Then so is the
+					// category.
+					self.load_spill(&mut inode).and_then(|()| self.count_corrupt(&inode)).map(|bad| {
+						let undecodable = self.count_undecodable(&inode);
+						tally.stream = tally.stream.saturating_add(undecodable);
+						bad
+					})
 				} else if inode.r#type == TYPE_DIR {
 					self.check_dir_tree(inode.dir_root, inode.dir_root_crc, TREE_DEPTH_MAX, visited)
 				} else {
@@ -647,13 +671,29 @@ impl<D: BlockDevice> LiberFs<D> {
 				};
 				bad = bad.saturating_add(match checked {
 					Ok(b) => b,
-					Err(FsError::Corrupt | FsError::Io) => 1,
+					// An unreadable node is the MEDIUM and a broken shape is the METADATA, and the
+					// tally has a counter for each. `bad` keeps counting so the caller's existing
+					// arithmetic is unchanged; what is new is that the reason is recorded.
+					// `Corrupt` STAYS a checksum failure. It is tempting to read it as "a broken
+					// shape" and file it under `structural`, and `fs-core` says otherwise in as
+					// many words: `Corrupt` is "a block read back whose checksum did not match the
+					// one stored beside its pointer". That is the medium, which is what
+					// `checksum_failures` counts - so it goes on being counted through `bad`.
+					//
+					// `Io` is the one that was miscounted: the medium would not answer AT ALL,
+					// which is not the same as answering wrongly, and the tally has a counter for
+					// it.
+					Err(FsError::Io) => {
+						tally.io = tally.io.saturating_add(1);
+						0
+					}
+					Err(FsError::Corrupt) => 1,
 					Err(e) => return Err(e),
 				});
 			}
 		} else {
 			for i in 0..=internal_count(&buf) {
-				bad = bad.saturating_add(match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, visited) {
+				bad = bad.saturating_add(match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, visited, tally) {
 					Ok(b) => b,
 					Err(FsError::Corrupt | FsError::Io) => 1,
 					Err(e) => return Err(e),

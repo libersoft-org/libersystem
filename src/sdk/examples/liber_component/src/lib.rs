@@ -21,6 +21,19 @@
 #![cfg_attr(target_arch = "wasm32", no_std)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
+// THE PANIC POLICY, declared by the program rather than by the SDK it depends on.
+//
+// `liber-sdk` used to carry the `#[panic_handler]`, which meant every consumer inherited it and no
+// consumer could declare its own - there is one per program. The behaviour is still the SDK's
+// (`report_panic` writes file, line, column and message through the already-granted log under
+// `dev-diagnostics`, then traps); the DECLARATION is this line, and a component author copies it
+// with the rest of this file.
+#[cfg(target_arch = "wasm32")]
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+	liber_sdk::report_panic(info)
+}
+
 // Read the granted input, upper-case its ASCII letters in place, log the result,
 // write it back, and return the number of bytes processed.
 #[cfg(target_arch = "wasm32")]
@@ -90,4 +103,20 @@ mod tests {
 		assert_eq!(super::score(1), 3, "3.5 truncates to 3");
 		assert_eq!(super::score(-2), -1, "-1.0 is exact, so both roundings agree");
 	}
+}
+
+// A guest that PANICS, exported so a test can run the real thing.
+//
+// The host-side panic test hand-assembles `call log; drop; unreachable` and places a
+// "panic at <file>:<line>:<col>: ..." string in memory - "in the shape `dev-diagnostics` produces",
+// as its own comment says. Nothing connected that shape to `liber_sdk::report_panic`: change the
+// handler's format, or make it call `write` instead of `log`, or drop the trap, and that test still
+// passes.
+//
+// This is the other half. It is built by the toolchain, links the SDK's real handler, and panics for
+// real - so what a test observes is what a guest actually does.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+pub extern "C" fn panic_now() -> i32 {
+	panic!("the input was not what the component expected");
 }

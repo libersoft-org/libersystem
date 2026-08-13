@@ -63,14 +63,30 @@ impl common::ConfigAccess for Access {
 
 	fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
 		let _serialised = CONFIG_PORTS.lock();
+		Self::read32_raw(bus, dev, func, off)
+	}
+
+	fn write32(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
+		let _serialised = CONFIG_PORTS.lock();
+		Self::write32_raw(bus, dev, func, off, val);
+	}
+
+	// The lock held across a whole read-modify-write rather than across each half of it. It is not
+	// reentrant, which is why the `_raw` forms exist and why they are the only accesses allowed
+	// inside.
+	fn with_config<R>(f: impl FnOnce() -> R) -> R {
+		let _serialised = CONFIG_PORTS.lock();
+		f()
+	}
+
+	fn read32_raw(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
 		unsafe {
 			outl(CONFIG_ADDRESS, address(bus, dev, func, off));
 			inl(CONFIG_DATA)
 		}
 	}
 
-	fn write32(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
-		let _serialised = CONFIG_PORTS.lock();
+	fn write32_raw(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
 		unsafe {
 			outl(CONFIG_ADDRESS, address(bus, dev, func, off));
 			outl(CONFIG_DATA, val);

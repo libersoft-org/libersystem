@@ -306,11 +306,23 @@ fn no_frame_is_ever_handed_to_two_owners_at_once() {
 	// kernel where `check_not_owned` was deleted. A counter that only ever reads zero proves the
 	// workload was clean OR that nothing is counting, and those are not the same claim.
 	let before = super::double_allocations();
+	let retired_before = super::retired_pages();
 	super::duplicate_next_allocation();
 	let first = super::allocate().expect("a frame for the injected duplicate");
-	let second = super::allocate().expect("and the frame it is handed out as again");
-	assert_eq!(first, second, "the injection did not produce a duplicate, so what follows proves nothing");
+	// THE REFUSAL, not the survival of the duplicate.
+	//
+	// The detector used to report the double allocation and then hand the frame over anyway, which
+	// guarantees the run after the sighting is unreadable: the ownership record is wrong for that
+	// page in a second way, the audit after the next test fires and names an innocent test, and the
+	// log is a cascade with the real event at the top of it.
+	//
+	// So the allocation FAILS - which every caller already handles, because an allocator can be
+	// empty - and the page is retired rather than returned to the buddy, because a page the two
+	// views disagree about is exactly a page nothing should hand out again.
+	let second = super::allocate();
+	assert!(second.is_none() || second != Some(first), "the frame the detector refused was handed out anyway");
 	assert_eq!(super::double_allocations(), before + 1, "the same frame went out twice and the detector said nothing");
+	assert_eq!(super::retired_pages(), retired_before + 1, "the refused frame was not retired, so the buddy may hand it out again");
 
 	// One free, not two: the frame is out on loan once however many times it was handed over, and
 	// freeing it twice is a different defect that `check_owned_free` refuses.

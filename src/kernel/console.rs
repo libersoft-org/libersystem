@@ -96,6 +96,7 @@ pub fn init(info: FbInfo) {
 	let Some(raster) = (unsafe { Raster::new(info.addr as u64, &geometry) }) else {
 		return;
 	};
+	// ALLOC-OK: boot, the kernel's own console surface, built once during bring-up
 	let surface: Box<dyn Surface> = Box::new(KernelSurface { raster });
 	let term = Term::new(surface, term::SCROLLBACK_ROWS);
 	if term.screen.cols() == 0 || term.screen.rows() == 0 {

@@ -728,13 +728,24 @@ pub(crate) fn locate_framebuffer(bs: *mut BootServices) -> GopFb {
 				return GopFb::NONE;
 			}
 			// Contiguous: each channel's mask must be exactly the run its shift and size describe.
-			for (m, shift, size) in [(mask.red, rs, rz), (mask.green, gs, gz), (mask.blue, bs_shift, bz)] {
-				if m != (((1u64 << size) - 1) as u32) << shift {
+			//
+			// RESERVED IS ONE OF THEM. It contributes to `all` and therefore to the pixel size below,
+			// and it was the one mask nothing checked - so a firmware whose reserved mask is split,
+			// or overlaps a colour channel, produced an element size derived from a mask that had
+			// been through no validation at all. The original defect here was a literal 32; this is
+			// the last quarter of the check that replaced it.
+			let reserved_shift = mask_shift(mask.reserved);
+			let reserved_size = mask_size(mask.reserved);
+			for (m, shift, size) in [(mask.red, rs, rz), (mask.green, gs, gz), (mask.blue, bs_shift, bz), (mask.reserved, reserved_shift, reserved_size)] {
+				if m != 0 && m != (((1u64 << size) - 1) as u32) << shift {
 					return GopFb::NONE;
 				}
 			}
-			// Disjoint: no two channels may claim a bit.
+			// Disjoint: no two channels may claim a bit, reserved included.
 			if (mask.red & mask.green) | (mask.green & mask.blue) | (mask.red & mask.blue) != 0 {
+				return GopFb::NONE;
+			}
+			if (mask.reserved & (mask.red | mask.green | mask.blue)) != 0 {
 				return GopFb::NONE;
 			}
 			// The element size is the highest set bit across all four, rounded up to whole bytes.
@@ -819,7 +830,9 @@ fn reserve_kernel(bs: *mut uefi::BootServices, kernel: &[u8]) -> ReservedKernel 
 			continue;
 		}
 		let base = align_down(ph.p_paddr, PAGE_SIZE);
-		let pages = (ph.p_paddr - base + ph.p_memsz).div_ceil(PAGE_SIZE);
+		// The shared parser refuses a header whose physical end wraps, so this cannot; the `expect`
+		// is what says so rather than leaving the reader to find the guarantee two crates away.
+		let pages = (ph.p_paddr - base).checked_add(ph.p_memsz).expect("a segment whose physical end wraps is refused by the parser").div_ceil(PAGE_SIZE);
 		if reserved.count == MAX_KERNEL_SPANS {
 			reserved.complete = false;
 			break;
@@ -851,18 +864,59 @@ fn reserve_kernel(bs: *mut uefi::BootServices, kernel: &[u8]) -> ReservedKernel 
 // is called after `reserve_kernel`. If it somehow still overlaps, the boot stops rather than
 // copying a buffer onto itself.
 fn stage_kernel_clear_of_destination(bs: *mut uefi::BootServices, kernel: &'static [u8], reserved: &ReservedKernel) -> &'static [u8] {
-	if !reserved.overlaps(kernel.as_ptr() as u64, kernel.len() as u64) {
+	// THE DESTINATION SPANS, not the reserved ones.
+	//
+	// This asked `reserved.overlaps(...)`, and `ReservedKernel` holds only spans whose
+	// `AllocateAddress` SUCCEEDED - so in the exact scenario this function documents, the source
+	// buffer already owns those pages, the reservation of that span fails, the span is never
+	// recorded, `overlaps` answers false, and the staging is skipped. The recovery path was
+	// unreachable from its own premise.
+	//
+	// The destinations come from the ELF header and are known whether or not any allocation
+	// succeeded, which is the question being asked: not "what did this loader get" but "where is
+	// the kernel going".
+	if !destination_overlaps(kernel) {
 		return kernel;
 	}
+	let _ = reserved;
 	arch::serial::write_str(
 		"loader: the kernel file was read into its own destination; staging it clear
 ",
 	);
 	let pages = (kernel.len() as u64).div_ceil(PAGE_SIZE);
 	let staged = alloc_pages(bs, pages as usize).expect("loader: cannot stage the kernel clear of its destination");
-	assert!(!reserved.overlaps(staged, kernel.len() as u64), "loader: the staged kernel still overlaps its destination");
 	unsafe {
+		let moved = core::slice::from_raw_parts(staged as *const u8, kernel.len());
 		core::ptr::copy_nonoverlapping(kernel.as_ptr(), staged as *mut u8, kernel.len());
-		core::slice::from_raw_parts(staged as *const u8, kernel.len())
+		assert!(!destination_overlaps(moved), "loader: the staged kernel still overlaps its destination");
+		moved
 	}
+}
+
+// Does this buffer sit inside any PT_LOAD's physical span?
+//
+// Reads the spans out of the ELF header, which is what makes it answerable before - and regardless
+// of - any allocation. `ReservedKernel` answers a different question, and asking it this one is why
+// the recovery above could not trigger in the case it was written for.
+fn destination_overlaps(buffer: &[u8]) -> bool {
+	let Some(image) = elf::Elf::parse(buffer) else { return false };
+	let start = buffer.as_ptr() as u64;
+	let finish = start.saturating_add(buffer.len() as u64);
+	for i in 0..image.segment_count() {
+		let Some(ph) = image.segment(i) else { continue };
+		if ph.p_type != elf::PT_LOAD || ph.p_memsz == 0 {
+			continue;
+		}
+		let base = align_down(ph.p_paddr, PAGE_SIZE);
+		let Some(end) = ph.p_paddr.checked_add(ph.p_memsz) else { return true };
+		let end = align_up_page(end);
+		if start < end && base < finish {
+			return true;
+		}
+	}
+	false
+}
+
+fn align_up_page(v: u64) -> u64 {
+	v.checked_add(PAGE_SIZE - 1).map_or(u64::MAX, |x| x & !(PAGE_SIZE - 1))
 }

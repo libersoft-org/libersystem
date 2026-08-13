@@ -333,8 +333,11 @@ fn alloc_low_page(bs: *mut BootServices) -> u64 {
 // attribute.
 fn map_mmio_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top: u64) {
 	let Some((buf, pages, map_size, desc_size)) = memory_map_snapshot(bs) else {
-		serial::write_str("loader: WARNING - no memory map for the MMIO attributes; device ranges inside the direct map stay write-back\n");
-		return;
+		// NO MAP AT ALL IS A REFUSAL. The loader knows it is about to hand the kernel a direct map
+		// it could not check, and "no worse than the bug" is a reason not to panic over a cosmetic
+		// attribute - MMIO mapped write-back is not cosmetic. It is a device seeing stale writes and
+		// a CPU seeing stale reads, at a point where nothing can report it.
+		panic!("loader: the firmware would not give a memory map, so the MMIO ranges inside the direct map cannot be checked");
 	};
 	let entries = map_size / desc_size;
 	for i in 0..entries {
@@ -351,7 +354,17 @@ fn map_mmio_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top:
 		}
 		let end = end.min(ram_top);
 		if tables.map_hhdm(base, end - base, true).is_none() {
-			serial::write_str("loader: WARNING - could not mark an MMIO range uncacheable in the direct map\n");
+			// AND NAME THE RANGE. A warning that does not say which physical range failed cannot be
+			// acted on by the person reading the boot log, which is the only reader it has.
+			//
+			// A single range that cannot be re-mapped stays a warning rather than a refusal: the
+			// loader knows exactly which range is wrong and can say so, and refusing the whole boot
+			// over one device window is a worse trade than a machine that boots and reports it.
+			serial::write_str("loader: WARNING - could not mark MMIO ");
+			serial::write_hex(base);
+			serial::write_str("..");
+			serial::write_hex(end);
+			serial::write_str(" uncacheable in the direct map; it stays write-back\n");
 		}
 	}
 	unsafe { ((*bs).free_pages)(buf as u64, pages) };

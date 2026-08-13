@@ -120,12 +120,45 @@ pub fn unbind(vector: u8) {
 	}
 }
 
-// Allocate a free MSI vector and program a device's MSI-X table entry 0 so the device
+// Give back a vector whose Interrupt NEVER REACHED ITS OWNER: mask the entry, unmap the table page
+// and free the slot outright rather than retiring it as pending.
+//
+// `unbind` retires, because a device that has been running may already have sent a message the mask
+// cannot recall - so the slot waits for `SYS_DEVICE_QUIESCED`. That reasoning does not apply to a
+// vector acquired by a syscall that then failed before the driver existed: MSI-X was never enabled
+// on the device, nothing can have been sent, and there is no owner to quiesce it. Retiring those
+// left the slot waiting for a message from a driver that was never created - repeatable, one slot
+// of a fixed table per failed acquire.
+pub fn release_unused_msi(vector: u8) {
+	if !is_msi(vector) {
+		return;
+	}
+	let slot = (vector - MSI_BASE) as usize;
+	mask_and_unmap_msix_entry(slot);
+	REGISTRY.free(slot);
+}
+
+// Whether this device already holds a LIVE MSI vector - see `MsiRegistry::has_live`. The policy it
+// serves lives in `sys_device_msix_acquire`.
+pub fn device_has_live_msi(owner: u32) -> bool {
+	REGISTRY.has_live(owner)
+}
+
+// Allocate a free MSI vector and program a device's MSI-X table ENTRY 0 so the device
 // delivers it to LAPIC `dest` (edge-triggered, fixed delivery, unmasked). `table_phys`
-// is the physical address of the device's MSI-X table. Returns the vector (None if
-// every MSI slot is taken); the caller enables MSI-X on the device and binds an
-// Interrupt to the returned vector with bind_msi. `owner` is the discovered-device
-// index the vector is acquired for, retained for the `lsirq` inventory.
+// is the physical address of the device's MSI-X table.
+//
+// ENTRY 0 IS THE ONLY ENTRY THIS KERNEL PROGRAMS, and that is now a stated limit rather than an
+// assumption. A device may hold ONE live vector: `MsiRegistry::acquire` refuses a second while the
+// first is held or pending, because two slots for one device would both be programmed into this one
+// entry - the second overwriting the first, and the first's `unbind` later masking the entry the
+// second is live on. Wanting more than one vector per device means programming the entry index the
+// slot owns (the table's size is in the MSI-X capability and the backends already map the table
+// page), and the refusal is what makes that a change rather than a bug fix.
+//
+// Returns the vector; None if every MSI slot is taken OR this device already holds one. The caller
+// enables MSI-X on the device and binds an Interrupt to the returned vector with bind_msi. `owner`
+// is the discovered-device index the vector is acquired for, retained for the `lsirq` inventory.
 pub fn acquire_msi(table_phys: u64, dest: u8, owner: u32) -> Option<u8> {
 	let slot = REGISTRY.acquire(owner, MSI_COUNT)?;
 	let vector = MSI_BASE + slot as u8;

@@ -366,10 +366,12 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// from it) without giving up its own handle.
 	let package_obj = MemoryObject::create(bytes.len()).ok_or("no memory for the init package")?;
 	copy_into_object(&package_obj, bytes);
+	// ALLOC-OK: boot, handing SystemManager its bootstrap; nothing else is running
 	let mut msg = alloc::vec::Vec::with_capacity(7 + 8);
 	msg.extend_from_slice(b"PACKAGE");
 	msg.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
 	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER | Rights::DUPLICATE, 0);
+	// ALLOC-OK: boot, as above
 	kernel_ep.send(Message::new(msg, alloc::vec![cap], 0)).map_err(|_| "failed to hand SystemManager the init package")?;
 
 	// Hand SystemManager the ramdisk volume the same way, so it can be delegated
@@ -395,10 +397,12 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	};
 	let ramdisk = MemoryObject::create(volume.len().max(1)).ok_or("no memory for the ramdisk")?;
 	copy_into_object(&ramdisk, volume);
+	// ALLOC-OK: boot, as above
 	let mut rdmsg = alloc::vec::Vec::with_capacity(7 + 8);
 	rdmsg.extend_from_slice(tag);
 	rdmsg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
 	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
+	// ALLOC-OK: boot, as above
 	kernel_ep.send(Message::new(rdmsg, alloc::vec![rdcap], 0)).map_err(|_| "failed to hand SystemManager the ramdisk")?;
 
 	// Hand SystemManager the power capability: a handle to the root Domain carrying MANAGE,
@@ -415,6 +419,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// and a bootstrap read consumes whatever arrived: out of order, its RAMDISK read takes
 	// this message instead and the whole boot chain stops before the first service starts.
 	let power_cap = Capability::new(sched::root_domain() as Arc<dyn KernelObject>, Rights::MANAGE | Rights::TRANSFER | Rights::DUPLICATE, 0);
+	// ALLOC-OK: boot, as above
 	kernel_ep.send(Message::new(b"POWER".to_vec(), alloc::vec![power_cap], 0)).map_err(|_| "failed to hand SystemManager the power capability")?;
 
 	// Tell the boot chain which kind of boot this is: "MODE" + one byte, 1 in a test
@@ -422,6 +427,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// (the stop-path exercise and the canary crash / hang drills) only in a test boot,
 	// so a production system never deliberately faults a process or stops a service.
 	let mode: u8 = if cfg!(test) { 1 } else { 0 };
+	// ALLOC-OK: boot, as above
 	kernel_ep.send(Message::new(alloc::vec![b'M', b'O', b'D', b'E', mode], alloc::vec::Vec::new(), 0)).map_err(|_| "failed to hand SystemManager the boot mode")?;
 
 	// Hand SystemManager the three console/display capabilities, in ONE message carrying three

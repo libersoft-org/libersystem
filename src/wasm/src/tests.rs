@@ -207,7 +207,7 @@ fn memory_grow_is_bounded_and_answers_minus_one() {
 	let at = wasm.windows(plain.len()).position(|w| w == plain.as_slice()).expect("the memory section this test just built");
 	wasm.splice(at..at + plain.len(), capped);
 	let m: ValidatedModule = validate(parse(&wasm).unwrap()).expect("the fixture module validates");
-	assert_eq!(m.module().memory_max_pages, Some(2), "the declared maximum is kept rather than skipped");
+	assert_eq!(m.module().memory.and_then(|mem| mem.max_pages), Some(2), "the declared maximum is kept rather than skipped");
 	let mut inst: Instance = Instance::new(&m).expect("the validated module instantiates");
 	assert_eq!(inst.invoke("run", &[], &mut NoHost).unwrap()[0], Value::I32(-1), "one page plus two is past the module's own maximum of two");
 }
@@ -860,17 +860,38 @@ fn bytes_after_the_final_end_are_refused() {
 }
 
 #[test]
-fn a_non_canonical_leb128_is_refused() {
-	// A type-section count of 1 encoded as `0x81 0x00` - two spellings of one module, which matters
-	// the moment anything hashes or signs one. RAN BEFORE: widths were not checked.
+fn a_leb128_with_a_trailing_zero_is_well_formed_and_an_over_wide_one_is_not() {
+	// INVERTED, because the rule it pinned is not the specification's.
+	//
+	// It asserted that a type-section count of 1 written as `0x81 0x00` is refused, under a comment
+	// saying "the specification requires the shortest encoding". It does not: the binary format's
+	// integer grammar restricts the encoding's LENGTH, and its own note gives this exact example -
+	// `0x03` and `0x83 0x00` are both well-formed encodings of 3. So the parser was refusing
+	// conforming modules and a test was holding it there.
+	//
+	// The motivation - two byte-level spellings of one module - is a real concern for anything that
+	// hashes or signs, and it belongs to a packaging policy over an image this system will ship,
+	// not to the core parser's idea of well-formed.
 	let mut wasm: Vec<u8> = alloc::vec![];
 	wasm.extend_from_slice(b"\0asm");
 	wasm.extend_from_slice(&[1, 0, 0, 0]);
-	// section 1, content = [count=0x81 0x00, 0x60, 0 params, 0 results]
+	// section 1, content = [count = 1 as `0x81 0x00`, 0x60, 0 params, 0 results]
 	let content: Vec<u8> = alloc::vec![0x81, 0x00, 0x60, 0x00, 0x00];
 	wasm.extend_from_slice(&section(1, &content));
-	let reason = refuse(&wasm, "a redundant LEB128 byte");
-	assert!(reason.contains("canonical") || reason.contains("LEB128"), "got: {reason}");
+	let module = parse(&wasm).expect("a trailing zero is within the width bound, so the module is well-formed");
+	assert_eq!(module.types.len(), 1, "and it decodes to the value it spells");
+
+	// The bound that IS the specification's: a `u32` past five bytes, or a fifth byte carrying bits
+	// above the 32nd.
+	for (label, count) in [("six bytes", alloc::vec![0x80u8, 0x80, 0x80, 0x80, 0x80, 0x00]), ("bits above 32", alloc::vec![0x80u8, 0x80, 0x80, 0x80, 0x70])] {
+		let mut wasm: Vec<u8> = alloc::vec![];
+		wasm.extend_from_slice(b"\0asm");
+		wasm.extend_from_slice(&[1, 0, 0, 0]);
+		let mut content: Vec<u8> = count;
+		content.extend_from_slice(&[0x60, 0x00, 0x00]);
+		wasm.extend_from_slice(&section(1, &content));
+		assert!(parse(&wasm).is_err(), "{label}: past the width the specification allows");
+	}
 }
 
 #[test]
@@ -995,4 +1016,434 @@ fn unbounded_guest_recursion_traps_rather_than_overflowing_the_host() {
 	let m: ValidatedModule = validate(parse(&wasm).unwrap()).expect("infinite recursion is well typed");
 	let mut inst: Instance = Instance::new(&m).expect("and it instantiates");
 	assert_eq!(inst.invoke("run", &[], &mut NoHost), Err(Trap("call depth limit reached")));
+}
+
+#[test]
+fn the_narrow_i64_stores_take_an_i64() {
+	// The decoder folds all seven integer stores into one `Store`, and the validator typed the value
+	// by the STORAGE WIDTH: `if width == 8 { I64 } else { I32 }`. `i64.store8`, `i64.store16` and
+	// `i64.store32` all take an `i64` and narrow it on the way to memory, so all three were refused
+	// when written correctly and accepted when given an `i32` - the validator wrong in both
+	// directions at once, which is worse than not checking.
+	//
+	// Six cases: each narrow `i64` store correct and incorrect. Three of them failed before.
+	for (label, opcode, correct_is_i64) in [
+		("i64.store8", 0x3cu8, true),
+		("i64.store16", 0x3d, true),
+		("i64.store32", 0x3e, true),
+		("i32.store8", 0x3a, false),
+		("i32.store16", 0x3b, false),
+		("i32.store", 0x36, false),
+	] {
+		for value_is_i64 in [false, true] {
+			let mut body: Vec<u8> = Vec::new();
+			body.push(0x41); // i32.const 0 - the address
+			body.extend_from_slice(&sleb(0));
+			if value_is_i64 {
+				body.push(0x42); // i64.const 1
+				body.extend_from_slice(&sleb(1));
+			} else {
+				body.push(0x41); // i32.const 1
+				body.extend_from_slice(&sleb(1));
+			}
+			body.push(opcode);
+			body.extend_from_slice(&leb(0)); // align
+			body.extend_from_slice(&leb(0)); // offset
+			body.push(0x0b);
+			let spec = Spec { types: &[(&[], &[])], imports: &[], funcs: &[0], mem_pages: 1, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], &body)] };
+			let module = parse(&build(&spec)).expect("parses");
+			let validated = validate(module);
+			assert_eq!(validated.is_ok(), value_is_i64 == correct_is_i64, "{label} with an {} value: validation said {:?}", if value_is_i64 { "i64" } else { "i32" }, validated.err());
+		}
+	}
+}
+
+#[test]
+fn a_memory_of_zero_pages_is_a_memory() {
+	// `memory_min_pages` was documented as "0 if module declares none" and existence was derived
+	// from `min > 0 || max.is_some()` - so `(memory 0)` with a `memory.size` was told it had no
+	// memory, while `(memory 0 10)` worked by accident because the maximum made the disjunction
+	// true. A sentinel cannot express a legal value that equals it.
+	//
+	// Built by hand, because `Spec`'s `mem_pages: 0` means "emit no memory section" - the same
+	// sentinel one layer up, in the fixture.
+	let mut wasm: Vec<u8> = alloc::vec![];
+	wasm.extend_from_slice(b"\0asm");
+	wasm.extend_from_slice(&[1, 0, 0, 0]);
+	wasm.extend_from_slice(&section(1, &[1, 0x60, 0x00, 0x01, 0x7f]));
+	wasm.extend_from_slice(&section(3, &[1, 0]));
+	wasm.extend_from_slice(&section(5, &[1, 0x00, 0x00]));
+	let mut exports: Vec<u8> = alloc::vec![1, 3];
+	exports.extend_from_slice(b"run");
+	exports.extend_from_slice(&[0x00, 0]);
+	wasm.extend_from_slice(&section(7, &exports));
+	wasm.extend_from_slice(&section(10, &[1, 4, 0x00, 0x3f, 0x00, 0x0b]));
+
+	let module = parse(&wasm).expect("parses");
+	assert_eq!(module.memory, Some(crate::module::MemoryType { min_pages: 0, max_pages: None }), "a declared memory of zero pages is a declared memory");
+	let validated = validate(module).expect("a memory instruction in a module that declares a memory");
+	let mut instance = Instance::new(&validated).expect("instantiates");
+	let mut host = NoHost;
+	assert_eq!(instance.invoke("run", &[], &mut host).expect("runs"), alloc::vec![Value::I32(0)], "and it has zero pages");
+}
+
+#[test]
+fn a_module_declaring_more_memory_than_the_host_allows_is_refused() {
+	// `MAX_MEMORY_PAGES` appeared at its definition and in `memory.grow` and nowhere else, so a
+	// six-byte declaration - `(memory 100000)` - asked the host for six gigabytes before an
+	// instruction ran. The milestone's own policy is that a limit the module declares is not a
+	// limit the host imposed; here the module's declaration WAS the limit.
+	let over = (crate::interp::MAX_MEMORY_PAGES + 1) as u32;
+	let mut memory: Vec<u8> = alloc::vec![1, 0x00];
+	memory.extend_from_slice(&leb(over));
+	let mut wasm: Vec<u8> = alloc::vec![];
+	wasm.extend_from_slice(b"\0asm");
+	wasm.extend_from_slice(&[1, 0, 0, 0]);
+	wasm.extend_from_slice(&section(1, &[1, 0x60, 0x00, 0x00]));
+	wasm.extend_from_slice(&section(3, &[1, 0]));
+	wasm.extend_from_slice(&section(5, &memory));
+	let mut exports: Vec<u8> = alloc::vec![1, 3];
+	exports.extend_from_slice(b"run");
+	exports.extend_from_slice(&[0x00, 0]);
+	wasm.extend_from_slice(&section(7, &exports));
+	wasm.extend_from_slice(&section(10, &[1, 2, 0x00, 0x0b]));
+
+	let module = parse(&wasm).expect("a declaration is not a parse error");
+	let error = validate(module).expect_err("but it is a validation error");
+	assert!(format!("{error:?}").contains("host limit"), "named for the rule: {error:?}");
+}
+
+#[test]
+fn a_typed_select_is_checked_against_the_type_it_declares() {
+	// The annotation was read and thrown away, so the validator could only require the two operands
+	// to agree with each other - never with the type the instruction states. An annotation asking
+	// for an `i64` over two `i32`s was accepted, and the declaration checked against nothing.
+	for (label, annotation, operands_i64, ok) in [("i32 over i32s", 0x7fu8, false, true), ("i64 over i64s", 0x7e, true, true), ("i64 over i32s", 0x7e, false, false), ("i32 over i64s", 0x7f, true, false)] {
+		let mut body: Vec<u8> = alloc::vec![0x00]; // no locals
+		for _ in 0..2 {
+			if operands_i64 {
+				body.push(0x42);
+				body.extend_from_slice(&sleb(1));
+			} else {
+				body.push(0x41);
+				body.extend_from_slice(&sleb(1));
+			}
+		}
+		body.push(0x41); // the condition
+		body.extend_from_slice(&sleb(0));
+		body.extend_from_slice(&[0x1c, 0x01, annotation]); // select with one declared type
+		body.push(0x1a); // drop it - the function returns nothing
+		body.push(0x0b);
+		let mut wasm: Vec<u8> = alloc::vec![];
+		wasm.extend_from_slice(b"\0asm");
+		wasm.extend_from_slice(&[1, 0, 0, 0]);
+		wasm.extend_from_slice(&section(1, &[1, 0x60, 0x00, 0x00]));
+		wasm.extend_from_slice(&section(3, &[1, 0]));
+		let mut exports: Vec<u8> = alloc::vec![1, 3];
+		exports.extend_from_slice(b"run");
+		exports.extend_from_slice(&[0x00, 0]);
+		wasm.extend_from_slice(&section(7, &exports));
+		let mut code: Vec<u8> = alloc::vec![1];
+		code.extend_from_slice(&leb(body.len() as u32));
+		code.extend_from_slice(&body);
+		wasm.extend_from_slice(&section(10, &code));
+		let parsed = parse(&wasm).expect("parses");
+		assert_eq!(validate(parsed).is_ok(), ok, "{label}");
+	}
+}
+
+#[test]
+fn a_declared_count_is_bounded_by_the_input_before_it_is_allocated() {
+	// A few bytes of body declaring `0xffffffff` `br_table` labels asked for sixteen gigabytes, in
+	// an INFALLIBLE `Vec::with_capacity` - so the failure was an abort in the host process rather
+	// than a refusal. And it happened during decode, which is before fuel, before the host limits
+	// and before everything else the engine bounds.
+	//
+	// Two changes, and this test proves the second: `try_reserve` makes the failure a REFUSAL rather
+	// than an abort, and the input bound - a label is at least one byte, so `n` of them cannot be
+	// present in fewer than `n` bytes of what is left - makes the refusal arrive without asking the
+	// allocator for sixteen gigabytes first.
+	//
+	// Said plainly because the test cannot tell them apart: with the bound removed the `try_reserve`
+	// still refuses and this still passes. What it pins is that a hostile count is answered rather
+	// than aborted on; the bound above it is the cheaper path to the same answer.
+	let mut body: Vec<u8> = alloc::vec![0x00, 0x02, 0x40, 0x41, 0x00, 0x0e]; // block; i32.const 0; br_table
+	body.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x0f]); // count = 0xffffffff
+	body.extend_from_slice(&[0x00, 0x0b, 0x0b]);
+	let mut wasm: Vec<u8> = alloc::vec![];
+	wasm.extend_from_slice(b"\0asm");
+	wasm.extend_from_slice(&[1, 0, 0, 0]);
+	wasm.extend_from_slice(&section(1, &[1, 0x60, 0x00, 0x00]));
+	wasm.extend_from_slice(&section(3, &[1, 0]));
+	let mut exports: Vec<u8> = alloc::vec![1, 3];
+	exports.extend_from_slice(b"run");
+	exports.extend_from_slice(&[0x00, 0]);
+	wasm.extend_from_slice(&section(7, &exports));
+	let mut code: Vec<u8> = alloc::vec![1];
+	code.extend_from_slice(&leb(body.len() as u32));
+	code.extend_from_slice(&body);
+	wasm.extend_from_slice(&section(10, &code));
+	let parsed = parse(&wasm).expect("the count is a body matter, not a section one");
+	assert!(validate(parsed).is_err(), "a count the body cannot hold is refused rather than allocated");
+}
+
+#[test]
+fn call_indirect_naming_another_table_is_refused() {
+	// The table index was read and DISCARDED, and the validator checked only that some table exists
+	// - so a module could name table 1 and have the call executed against table 0. This engine
+	// supports one table, so the rule is that the index is zero.
+	for (label, table, ok) in [("table 0", 0u8, true), ("table 1", 1, false)] {
+		let body: Vec<u8> = alloc::vec![0x00, 0x41, 0x00, 0x11, 0x00, table, 0x0b];
+		let mut wasm: Vec<u8> = alloc::vec![];
+		wasm.extend_from_slice(b"\0asm");
+		wasm.extend_from_slice(&[1, 0, 0, 0]);
+		wasm.extend_from_slice(&section(1, &[1, 0x60, 0x00, 0x00]));
+		wasm.extend_from_slice(&section(3, &[1, 0]));
+		wasm.extend_from_slice(&section(4, &[1, 0x70, 0x00, 0x01])); // one funcref table, min 1
+		let mut exports: Vec<u8> = alloc::vec![1, 3];
+		exports.extend_from_slice(b"run");
+		exports.extend_from_slice(&[0x00, 0]);
+		wasm.extend_from_slice(&section(7, &exports));
+		let mut code: Vec<u8> = alloc::vec![1];
+		code.extend_from_slice(&leb(body.len() as u32));
+		code.extend_from_slice(&body);
+		wasm.extend_from_slice(&section(10, &code));
+		let parsed = parse(&wasm).expect("parses");
+		assert_eq!(validate(parsed).is_ok(), ok, "{label}");
+	}
+}
+
+#[test]
+fn the_body_decoder_bounds_a_u32_to_thirty_two_bits() {
+	// The parser's reader refused a fifth byte carrying bits above the 32nd and the BODY decoder had
+	// no width check at all - it read the fifth byte at shift 28 and silently dropped the rest. So
+	// the two readers in this crate disagreed about what a `u32` is, and the permissive one is the
+	// one used for instruction immediates.
+	let mut body: Vec<u8> = alloc::vec![0x00, 0x20]; // no locals; local.get
+	body.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x70]); // an index with bits above 32
+	body.push(0x0b);
+	let mut wasm: Vec<u8> = alloc::vec![];
+	wasm.extend_from_slice(b"\0asm");
+	wasm.extend_from_slice(&[1, 0, 0, 0]);
+	wasm.extend_from_slice(&section(1, &[1, 0x60, 0x00, 0x00]));
+	wasm.extend_from_slice(&section(3, &[1, 0]));
+	let mut exports: Vec<u8> = alloc::vec![1, 3];
+	exports.extend_from_slice(b"run");
+	exports.extend_from_slice(&[0x00, 0]);
+	wasm.extend_from_slice(&section(7, &exports));
+	let mut code: Vec<u8> = alloc::vec![1];
+	code.extend_from_slice(&leb(body.len() as u32));
+	code.extend_from_slice(&body);
+	wasm.extend_from_slice(&section(10, &code));
+	let parsed = parse(&wasm).expect("the section parses; the body is the decoder's business");
+	let error = validate(parsed).expect_err("an over-wide immediate is refused");
+	assert!(format!("{error:?}").contains("32 bits"), "named for the rule: {error:?}");
+}
+
+#[test]
+fn a_body_that_pushes_without_popping_is_bounded() {
+	// The per-instance limits item named a "maximum operand stack depth" and the DONE note listed
+	// four constants, none of which is one. Call depth was bounded, which covers recursion; a single
+	// body pushing without popping was not, and it grows both the validator's `Vec<Type>` and the
+	// interpreter's `Vec<Value>` with it.
+	let mut body: Vec<u8> = alloc::vec![0x00]; // no locals
+	for _ in 0..(crate::validate::MAX_STACK_DEPTH + 8) {
+		body.push(0x41);
+		body.extend_from_slice(&sleb(1));
+	}
+	body.push(0x0b);
+	let mut wasm: Vec<u8> = alloc::vec![];
+	wasm.extend_from_slice(b"\0asm");
+	wasm.extend_from_slice(&[1, 0, 0, 0]);
+	wasm.extend_from_slice(&section(1, &[1, 0x60, 0x00, 0x00]));
+	wasm.extend_from_slice(&section(3, &[1, 0]));
+	let mut exports: Vec<u8> = alloc::vec![1, 3];
+	exports.extend_from_slice(b"run");
+	exports.extend_from_slice(&[0x00, 0]);
+	wasm.extend_from_slice(&section(7, &exports));
+	let mut code: Vec<u8> = alloc::vec![1];
+	code.extend_from_slice(&leb(body.len() as u32));
+	code.extend_from_slice(&body);
+	wasm.extend_from_slice(&section(10, &code));
+	let parsed = parse(&wasm).expect("parses");
+	let error = validate(parsed).expect_err("a body past the depth ceiling is refused");
+	assert!(format!("{error:?}").contains("operand stack"), "named for the rule: {error:?}");
+}
+
+#[test]
+fn the_embedder_boundary_checks_types_and_not_only_counts() {
+	// Validation proved the BODY consistent with its declared signature. A host calling with the
+	// wrong types is the caller breaking that signature from outside, which validation cannot see -
+	// and only the COUNT was checked, so an `F64` sat in a local the body reads as an `i32` and
+	// `Value::as_i32` converted it rather than reporting anything.
+	let body: Vec<u8> = alloc::vec![0x00, 0x20, 0x00, 0x0b]; // local.get 0; end
+	let spec = Spec { types: &[(&[I32], &[I32])], imports: &[], funcs: &[0], mem_pages: 1, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], &body[1..])] };
+	let module = parse(&build(&spec)).expect("parses");
+	let validated = validate(module).expect("validates");
+	let mut instance = Instance::new(&validated).expect("instantiates");
+	let mut host = NoHost;
+	assert_eq!(instance.invoke("run", &[Value::I32(7)], &mut host).expect("the declared type runs"), alloc::vec![Value::I32(7)]);
+	assert!(instance.invoke("run", &[Value::F64(1.0)], &mut host).is_err(), "an argument of the wrong type is refused rather than converted");
+	assert!(instance.invoke("run", &[Value::I64(7)], &mut host).is_err(), "and so is one of a different integer width");
+}
+
+#[test]
+fn a_block_is_checked_against_the_type_it_declares() {
+	// The decoder recorded ARITIES, so everything else about a block type was gone by the time
+	// validation ran. `block_signature` then reconstructed one: `i32` for a single result, and for
+	// anything larger the FIRST declared type with matching counts. Both directions wrong at once -
+	// `(block (result i64) i64.const 7)` refused, `(block (result i64) i32.const 7)` accepted - and a
+	// block naming type 3 got type 0 if type 0 had the same shape.
+	//
+	// Three shapes, and the third is the one no arity-based check can pass.
+	// The FUNCTION's type is always the last one, so the earlier ones exist only to be named by a
+	// block - which is what makes "the first with matching counts" a wrong answer rather than an
+	// accidentally right one.
+	fn module_with(body: Vec<u8>, types: &[(&[u8], &[u8])]) -> Vec<u8> {
+		let last = (types.len() - 1) as u32;
+		let spec = Spec { types, imports: &[], funcs: &[last], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], &body)] };
+		build(&spec)
+	}
+
+	// (block (result i64) i64.const 7 end) drop - correct, and it must pass.
+	let ok: Vec<u8> = alloc::vec![0x02, 0x7e, 0x42, 0x07, 0x0b, 0x1a, 0x0b];
+	assert!(validate(parse(&module_with(ok, &[(&[], &[])])).expect("parses")).is_ok(), "a declared i64 result filled with an i64");
+
+	// The same block filled with an i32 - and it must NOT.
+	let bad: Vec<u8> = alloc::vec![0x02, 0x7e, 0x41, 0x07, 0x0b, 0x1a, 0x0b];
+	assert!(validate(parse(&module_with(bad, &[(&[], &[])])).expect("parses")).is_err(), "a declared i64 result filled with an i32");
+
+	// A block naming TYPE 1 while type 0 has the same arity: the named one is what counts. Type 2 is
+	// the function's own, so both (0,1) types are there only to be chosen between.
+	let named: Vec<u8> = alloc::vec![0x02, 0x01, 0x42, 0x07, 0x0b, 0x1a, 0x0b];
+	let types: &[(&[u8], &[u8])] = &[(&[], &[I32]), (&[], &[I64]), (&[], &[])];
+	assert!(validate(parse(&module_with(named, types)).expect("parses")).is_ok(), "the block's own type index is used, not the first with matching counts");
+	// And the same block pushing an i32, which type 0 would have accepted.
+	let named_bad: Vec<u8> = alloc::vec![0x02, 0x01, 0x41, 0x07, 0x0b, 0x1a, 0x0b];
+	assert!(validate(parse(&module_with(named_bad, types)).expect("parses")).is_err(), "type 0's shape does not stand in for type 1's");
+}
+
+// The WebAssembly specification's own binary-form cases, as an OUTSIDE authority.
+//
+// Everything else in this file is hand-written, and a hand-written corpus can prove a rule is
+// ENFORCED and cannot prove the rule is RIGHT - the same reading of the specification writes both
+// the rule and the test. That is not hypothetical here: `a_non_canonical_leb128_is_refused` was
+// well-built, watched failing, and pinning behaviour the specification contradicts. It took an
+// outside reading to notice, which is exactly the cost this test exists to remove.
+//
+// `src/wasm/tests/spec-binary-cases.tsv` is extracted by `src/tools/extract-wasm-spec-cases.py` from
+// the specification's `test/core` suite: every case written as `(module binary "...")` - raw bytes
+// with a stated outcome - which is most of what the binary-format and validation suites are made of.
+// The `.wast` text-format modules are not covered; parsing that language is a project of its own.
+mod spec {
+	use super::*;
+
+	struct Case<'a> {
+		kind: &'a str,
+		file: &'a str,
+		bytes: Vec<u8>,
+		reason: &'a str,
+	}
+
+	fn hex(b: &[u8]) -> alloc::string::String {
+		b.iter().map(|x| alloc::format!("{x:02x}")).collect()
+	}
+
+	fn cases() -> Vec<Case<'static>> {
+		const TSV: &str = include_str!("../tests/spec-binary-cases.tsv");
+		let mut out: Vec<Case<'static>> = Vec::new();
+		for line in TSV.lines() {
+			let mut parts = line.splitn(4, '\t');
+			let (Some(kind), Some(file), Some(hex)) = (parts.next(), parts.next(), parts.next()) else { continue };
+			let reason = parts.next().unwrap_or("");
+			let bytes: Vec<u8> = (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex")).collect();
+			out.push(Case { kind, file, bytes, reason });
+		}
+		out
+	}
+
+	#[test]
+	fn the_specifications_malformed_modules_are_refused_and_the_gap_is_measured() {
+		// A module the specification calls MALFORMED must not parse. This engine implements a
+		// subset, so refusing MORE than the specification requires is allowed - which makes this the
+		// direction that can be held in full, and the number below is what "in full" costs today.
+		//
+		// MEASURED, 2026-08-12: 205 of 707 accepted when this suite was first pointed at the engine,
+		// and the breakdown named the fixes. Two of them closed 180 cases between them:
+		//
+		//   176  malformed UTF-8         - custom-section NAMES were never read. The section was
+		//                                  skipped by its declared size, so the name a module must
+		//                                  encode as UTF-8 was never looked at.
+		//     8  integer too large       - the signed reader bounded its WIDTH and not its final
+		//                                  byte's unused bits, so an over-wide `s33`/`s64` decoded.
+		//                                  Writing that check found its own defect immediately: read
+		//                                  from the running VALUE it refused `i64.const -1` written
+		//                                  in full, which the suite calls well-formed.
+		//     1  malformed limits flags  - a flags byte above 1 is a feature this engine does not
+		//                                  have, read as though bit 0 were the only one that counts.
+		//
+		// Twenty remain, and they are named rather than hidden: integer-width forms this parser
+		// reaches by other paths, two memop flags, one limits flags, an END-opcode case and an
+		// illegal-opcode one. Each is a real conformance gap and none of them is a way to run
+		// something dangerous - those modules are refused later, at decode or at validation, rather
+		// than not at all.
+		//
+		// The ceiling is a RATCHET: it may go down and must not go up, so a change that starts
+		// accepting a module the specification calls malformed has to move this number and say why.
+		const ACCEPTED_CEILING: usize = 20;
+		let all = cases();
+		let malformed: Vec<&Case<'_>> = all.iter().filter(|c| c.kind == "malformed").collect();
+		assert!(malformed.len() > 600, "only {} malformed cases were extracted - the fixture is not what it was", malformed.len());
+		let accepted: Vec<&&Case<'_>> = malformed.iter().filter(|c| parse(&c.bytes).is_ok()).collect();
+		assert!(accepted.len() <= ACCEPTED_CEILING, "{} of {} specification-malformed modules parse, past the recorded {ACCEPTED_CEILING}: {:?}", accepted.len(), malformed.len(), accepted.iter().map(|c| (c.file, c.reason)).take(8).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn every_invalid_module_the_specification_names_fails_validation() {
+		// A module the specification calls INVALID is well-formed and must not validate. Parsing it
+		// is allowed to fail too - this engine's parser refuses some shapes the specification defers
+		// to validation - so what is asserted is that it never reaches a `ValidatedModule`.
+		let all = cases();
+		let mut checked = 0u32;
+		for case in all.iter().filter(|c| c.kind == "invalid") {
+			let reached = parse(&case.bytes).map(validate).is_ok_and(|v| v.is_ok());
+			assert!(!reached, "{}: the specification calls this invalid ({}), and it validated", case.file, case.reason);
+			checked += 1;
+		}
+		assert!(checked >= 11, "only {checked} invalid cases were extracted - the fixture is not what it was");
+	}
+
+	#[test]
+	fn the_specifications_valid_modules_are_accepted_or_refused_for_a_stated_reason() {
+		// The other direction, as a RATCHET rather than an assertion.
+		//
+		// A module the specification calls valid may still be refused here, because this engine is a
+		// subset - multi-memory, reference types, SIMD and the rest are all legitimately absent. So
+		// "every valid module parses" is not true and should not be asserted.
+		//
+		// What can be held is the COUNT: the number this engine accepts today, which may go up and
+		// must not go down. A change that starts refusing a module the specification calls valid has
+		// to move this number and say why.
+		let all = cases();
+		let valid: Vec<&Case<'_>> = all.iter().filter(|c| c.kind == "valid").collect();
+		let accepted = valid.iter().filter(|c| parse(&c.bytes).is_ok()).count();
+		assert!(valid.len() >= 70, "only {} valid cases were extracted - the fixture is not what it was", valid.len());
+		assert!(accepted >= 40, "this engine accepts {accepted} of {} specification-valid modules, down from 40 - a subset got smaller and the reason belongs here", valid.len());
+	}
+
+	#[test]
+	fn the_specification_agrees_that_a_trailing_zero_leb128_is_well_formed() {
+		// THE CASE THAT STARTED THIS. `binary-leb128.wast` opens with "Unsigned LEB128 can have
+		// non-minimal length" and a bare module whose memory minimum is written `\82\00` - two bytes
+		// for a value that fits in one. This parser refused exactly that, and a test held it there.
+		//
+		// Named separately from the sweep above because it is the specific claim, and a count that
+		// happens to pass is not the same as the claim being checked.
+		let all = cases();
+		let from_leb = all.iter().filter(|c| c.file == "binary-leb128.wast" && c.kind == "valid").count();
+		assert!(from_leb >= 10, "the LEB128 file contributed {from_leb} valid modules");
+		let refused: Vec<&str> = all.iter().filter(|c| c.file == "binary-leb128.wast" && c.kind == "valid" && parse(&c.bytes).is_err()).map(|c| c.reason).collect();
+		let detail: Vec<String> = all.iter().filter(|c| c.file == "binary-leb128.wast" && c.kind == "valid").filter_map(|c| parse(&c.bytes).err().map(|e| alloc::format!("{:?} over {}", e, hex(&c.bytes)))).collect();
+		assert!(refused.is_empty(), "{} of the LEB128 file's valid modules are refused: {detail:?}", refused.len());
+	}
 }

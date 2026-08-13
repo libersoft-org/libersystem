@@ -95,6 +95,44 @@ const CHORD_PASTE: u8 = 0xc1;
 // ~100 ms) before restoring it.
 const BELL_FLASH_TICKS: u64 = 10;
 
+// THE CONSOLE'S ONE RULE FOR WRITING TO A CLIENT.
+//
+// A client is a program holding a VT. It may stop reading its own input at any moment - it is a
+// program, and nothing obliges it to - and the console drives every VT, the input path, the pointer
+// path, the display and resize handling from one loop. So the loop must never be stoppable by a
+// client that is not reading. It was: `send_blocking` (no deadline, no give-up) delivered query
+// replies and typed lines alike, and the reply path is one a PROGRAM can trigger at will, with no
+// user action at all - a DSR emitted by a program that never drains its channel hung the console for
+// every VT.
+//
+// The rule splits on WHO PRODUCED THE BYTES, which is the line that matters:
+//
+//   - Bytes the console generated on the program's behalf - a DSR/DA/OSC-52 answer, a pointer
+//     report - are DROPPABLE. A program that will not read its own answer has already broken the
+//     exchange, and dropping it costs nothing that was not already lost. One attempt, no wait.
+//
+//   - Bytes the USER produced - a typed line, a pasted selection, an interrupt echo - get a BOUNDED
+//     wait. They cost human time to make and arrive at human rate, so waiting briefly for a program
+//     that is merely behind is worth it, and the worst case is bounded per keystroke rather than per
+//     frame. Past the bound they are dropped too: a program that has not drained its input in half a
+//     second is not going to be helped by holding every other VT hostage.
+//
+// Writes to SERVICES (the factory, the display, a PTY master, a shell's control channel) are not
+// covered by this: those peers are ours, they are known to drain, and a failure there is a broken
+// system rather than a misbehaving client.
+const CLIENT_SEND_TICKS: u64 = 50;
+
+// Deliver bytes the CONSOLE generated to a client - see the rule above. One attempt; a full queue
+// drops it.
+unsafe fn reply_client(client: u64, bytes: &[u8]) -> bool {
+	unsafe { try_send(client, bytes, 0) }
+}
+
+// Deliver bytes the USER produced to a client - see the rule above. Bounded wait, then dropped.
+unsafe fn input_client(client: u64, bytes: &[u8]) -> bool {
+	unsafe { matches!(send_deadline(client, bytes, 0, clock() + CLIENT_SEND_TICKS), SendOutcome::Delivered) }
+}
+
 // The caret blink phase (in 100 Hz ticks): the run loop's periodic wake toggles the
 // foreground caret every ~400 ms while the console idles - the classic terminal rate.
 const BLINK_PHASE_TICKS: u64 = 40;
@@ -609,8 +647,30 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 			}
 			// Pick up an OSC 52 clipboard-set the program emitted in this output.
 			clip_req = t.screen.take_clipboard_set();
-			// And anything the terminal owes it in reply to a query - DSR, DA. There was no reply
-			// path at all, so a program asking where the cursor is waited forever.
+			// AND AN OSC 52 QUERY, which nothing drained.
+			//
+			// The model half was built - `take_clipboard_query` records the selection byte and
+			// `answer_clipboard` writes `OSC 52 ; Pc ; <base64> ST` into the same reply buffer DSR
+			// and DA use - and the milestone item was ticked with a note describing this call. This
+			// call did not exist: `grep clipboard_query` found the model, the model's tests, and the
+			// document. A program sending `OSC 52 ; c ; ?` set a field nobody read.
+			//
+			// FOREGROUND ONLY, and that is the stronger half of the rule rather than a copy of the
+			// SET's. A background program replacing the user's clipboard is a nuisance; a background
+			// program READING it is exfiltration - any component with a terminal could ask for
+			// whatever the user last copied. A background VT is answered with an empty selection,
+			// which is a valid answer meaning "nothing you can have" and tells the program the
+			// exchange completed rather than leaving it waiting.
+			if let Some(selection) = t.screen.take_clipboard_query() {
+				if fg {
+					let held: Vec<u8> = console.clipboard.clone();
+					t.screen.answer_clipboard(selection, &held);
+				} else {
+					t.screen.answer_clipboard(selection, &[]);
+				}
+			}
+			// And anything the terminal owes it in reply to a query - DSR, DA, and the clipboard
+			// answer above. Taken AFTER it, or the answer would wait for the next output.
 			reply = t.screen.take_reply();
 			let bell: bool = t.screen.take_bell();
 			if fg {
@@ -641,7 +701,8 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 		if !reply.is_empty() {
 			let client: u64 = console.vts[vi].client;
 			if client != 0 {
-				send_blocking(client, &reply, 0);
+				// Console-generated: droppable, and never worth stalling every other VT for.
+				reply_client(client, &reply);
 			}
 		}
 		if fg {
@@ -886,7 +947,7 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8, vocab: &[Vec<u8>]) {
 			}
 		}
 		if !vt.ld.cooked {
-			send_blocking(client, &[b], 0);
+			input_client(client, &[b]);
 			return;
 		}
 		let submitted: bool;
@@ -919,13 +980,13 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8, vocab: &[Vec<u8>]) {
 					let mut out: Vec<u8> = Vec::with_capacity(n + 1);
 					out.push(b'\t');
 					out.extend_from_slice(&vt.ld.line[..n]);
-					send_blocking(client, &out, 0);
+					input_client(client, &out);
 				}
 			} else if vt.ld.eof {
 				// Ctrl+D on an empty line: deliver a zero-byte read (EOF) so the shell
 				// logs out, the way a tty signals end-of-input.
 				vt.ld.commit();
-				send_blocking(client, &[], 0);
+				input_client(client, &[]);
 			} else {
 				let n: usize = vt.ld.len;
 				// build the line + newline on the heap: up to LD_LINE_MAX + 1 (4 kB),
@@ -934,7 +995,7 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8, vocab: &[Vec<u8>]) {
 				out.extend_from_slice(&vt.ld.line[..n]);
 				out.push(b'\n');
 				vt.ld.commit();
-				send_blocking(client, &out, 0);
+				input_client(client, &out);
 			}
 		}
 	}
@@ -1368,12 +1429,13 @@ unsafe fn handle_pointer(console: &mut Console, msg: &[u8]) {
 	}
 }
 
-// Translate a pointer event into SGR mouse reports for a tracking program. Only the SGR
-// encoding (?1006) is produced; without it the report is dropped (the legacy X10 byte
-// encoding is not emitted). The button press / release edges are always reported; a wheel
-// tick reports as button 64 (up) / 65 (down); a drag (button held) reports under ?1002 and
-// any bare motion under ?1003 (Cb + 32). Reports are best-effort (try_send), so a program
-// that is not draining its input drops them rather than stalling the console loop.
+// Translate a pointer event into mouse reports for a tracking program, in the SGR encoding (?1006)
+// when the program asked for it and in the legacy X10 byte encoding when it did not - see the note
+// inside, which is where the stale half of this header used to contradict the code beneath it. The
+// button press / release edges are always reported; a wheel tick reports as button 64 (up) / 65
+// (down); a drag (button held) reports under ?1002 and any bare motion under ?1003 (Cb + 32).
+// Reports are console-generated, so they follow the client-write rule at `CLIENT_SEND_TICKS`: one
+// attempt, and a program that is not draining its input drops them rather than stalling the loop.
 unsafe fn pointer_report(console: &mut Console, fg: usize, col: usize, row: usize, buttons: u8, prev: u8, wheel: i8, sgr: bool, motion: bool, anymotion: bool) {
 	unsafe {
 		// `?1000` WITHOUT `?1006` IS ANSWERED, in the legacy X10/normal encoding.
@@ -1440,7 +1502,7 @@ unsafe fn send_report(client: u64, cb: usize, cx: usize, cy: usize, press: bool,
 			return;
 		}
 		let buf: [u8; 6] = [0x1b, b'[', b'M', (32 + button) as u8, (32 + cx) as u8, (32 + cy) as u8];
-		try_send(client, &buf, 0);
+		reply_client(client, &buf);
 	}
 }
 
@@ -1466,7 +1528,7 @@ unsafe fn send_sgr(client: u64, cb: usize, cx: usize, cy: usize, press: bool) {
 		n += write_dec(&mut buf[n..], cy);
 		buf[n] = if press { b'M' } else { b'm' };
 		n += 1;
-		try_send(client, &buf[..n], 0);
+		reply_client(client, &buf[..n]);
 	}
 }
 
@@ -1504,9 +1566,11 @@ unsafe fn paste_clipboard(console: &mut Console, bracketed: bool) {
 		let fg: usize = console.fg;
 		if bracketed {
 			let client: u64 = console.vts[fg].client;
-			send_blocking(client, b"\x1b[200~", 0);
-			send_blocking(client, &console.clipboard, 0);
-			send_blocking(client, b"\x1b[201~", 0);
+			// A paste is the user's bytes: bounded wait, and the brackets follow the payload only
+			// if it landed, so a program never sees an opening bracket with no close.
+			if input_client(client, b"\x1b[200~") && input_client(client, &console.clipboard) {
+				input_client(client, b"\x1b[201~");
+			}
 		} else {
 			let clip: Vec<u8> = console.clipboard.clone();
 			for &b in &clip {

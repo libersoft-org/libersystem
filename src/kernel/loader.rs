@@ -27,6 +27,10 @@ use crate::sched;
 pub enum LoadError {
 	OutOfMemory,
 	BadImage,
+	// The target is terminating, so it may not be extended - see the guard in `load_image_into`.
+	// Separate from `BadImage` because the image is fine and the caller's mistake is a race, not a
+	// malformed file; both refuse with `ERR_INVALID` at the syscall boundary.
+	Terminating,
 }
 
 impl From<ElfError> for LoadError {
@@ -103,7 +107,11 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
 	let handle = process.install(bootstrap, rights, badge);
 
-	let ctx = Box::new(UserEntry { entry, stack_top: USER_STACK_TOP, bootstrap: handle });
+	// FALLIBLY: this is the last allocation of a spawn and `Box::new` made a short heap a halt.
+	let Some(ctx) = crate::mem::heap::try_box(UserEntry { entry, stack_top: USER_STACK_TOP, bootstrap: handle }) else {
+		process.terminate();
+		return Err(LoadError::OutOfMemory);
+	};
 	let raw_ctx = Box::into_raw(ctx);
 	if sched::thread_create(process.clone(), user_process_trampoline, raw_ctx as u64).is_none() {
 		// The last allocation of the load, and it used to be the one that panicked. Take
@@ -123,6 +131,28 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 // starts a thread: the userspace spawn path (process_create / process_load /
 // thread_create / thread_start) drives those as separate, capability-gated steps.
 pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadError> {
+	// THE GUARD LIVES WITH THE OPERATION, not with one of its callers.
+	//
+	// These are the largest resource-extending operations the kernel has - a frame per page of
+	// every PT_LOAD segment, a ring-3 stack, then `adopt_frames`, `adopt_shared_pages` and
+	// `charge_stack` - and neither took `begin_extend`. `SYS_PROCESS_LOAD` did not even read
+	// `is_terminating`: it looked the process up with MANAGE and loaded into it. So a load that
+	// began before a `terminate()` and adopted after it handed a dead process a page table full of
+	// live mappings and a frame list the teardown snapshot never saw.
+	//
+	// Say what that is and is not. `Drop for Process` unmaps and frees adopted frames when the last
+	// reference goes, so it is not the physical use-after-free the first audit of this area found -
+	// it is a resource set that grows after the barrier that exists to close it, and holds until the
+	// last handle to a dead process is dropped. The invariant "after `begin_teardown` a process's
+	// resource set cannot grow" was simply not true.
+	//
+	// Here rather than in the syscall because the boot path loads too, and a rule that travels with
+	// the operation cannot be forgotten by a new caller. Boot takes it without noticing: a process
+	// it has just created is not terminating. The guard is held to the end, which is after the
+	// adopts and after every rollback.
+	let Some(_extend) = process.begin_extend() else {
+		return Err(LoadError::Terminating);
+	};
 	if process.has_dynamic_modules() && bootproto::elf::Elf::parse(elf_image).is_none_or(|image| image.image_type != bootproto::elf::ET_DYN) {
 		return Err(LoadError::BadImage);
 	}
@@ -142,13 +172,15 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 		// owner of those frames shared them with a live address space. A use-after-free of
 		// physical memory, reachable by nothing more than running out of memory at the
 		// wrong moment.
-		for (start, end) in elf::loaded_ranges(elf_image) {
+		// Walked rather than collected: this is the cleanup for an allocation failure, and it used
+		// to ask the heap for a `Vec` of ranges before it could give any memory back.
+		elf::for_each_loaded_range(elf_image, |start, end| {
 			let mut address = start;
 			while address < end {
 				let _ = process.address_space().unmap(address);
 				address += PAGE_SIZE;
 			}
-		}
+		});
 		free_frames(frames);
 		return Err(err);
 	}
@@ -168,6 +200,12 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 // image load this does not map a stack or create a thread; providers are loaded in
 // dependency order and the main SYS_PROCESS_LOAD remains the transaction's final step.
 pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Result<(), LoadError> {
+	// The same guard, and this one is by definition an operation on a process that already exists
+	// and may already be dying. It also claims a module slot and registers dynamic symbols, both of
+	// which are records the teardown snapshot has to see.
+	let Some(_extend) = process.begin_extend() else {
+		return Err(LoadError::Terminating);
+	};
 	if !process.reserve_dynamic_module_at(bias) {
 		return Err(LoadError::BadImage);
 	}
@@ -197,7 +235,9 @@ pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Resul
 // `bootstrap` delivered in rdi. Returns None if the process Domain is at its
 // thread cap, reclaiming the boxed entry context. thread_start later enqueues it.
 pub fn create_user_thread(process: &Arc<Process>, entry: u64, stack_top: u64, bootstrap: u64) -> Option<Arc<Thread>> {
-	let ctx = Box::new(UserEntry { entry, stack_top, bootstrap });
+	// FALLIBLY: `SYS_THREAD_CREATE` reaches here, so a short heap must be the `None` this function
+	// already returns rather than a kernel abort.
+	let ctx = crate::mem::heap::try_box(UserEntry { entry, stack_top, bootstrap })?;
 	let raw = Box::into_raw(ctx) as u64;
 	match sched::thread_create_suspended(process.clone(), user_process_trampoline, raw) {
 		Some(thread) => Some(thread),
@@ -215,6 +255,11 @@ fn map_stack(address_space: &AddressSpace, frames: &mut Vec<u64>) -> Result<(), 
 	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER | arch::paging::NO_EXECUTE;
 	let hhdm = hhdm_offset();
 	let base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+	// The whole stack's worth of records booked once, before the first frame is taken: the same
+	// rule as the segment loop, and cheaper here because the count is known.
+	if frames.try_reserve(USER_STACK_PAGES as usize).is_err() {
+		return Err(LoadError::OutOfMemory);
+	}
 	for page in 0..USER_STACK_PAGES {
 		let Some(frame) = frame::allocate() else {
 			unmap_stack(address_space, page);

@@ -247,7 +247,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		//
 		// A `BTreeSet` is bounded by the tree instead, and every operation it needs - "have I seen
 		// this inode" - is what a set is for.
-		let mut names: BTreeSet<u32> = BTreeSet::new();
+		let mut names: Vec<u32> = Vec::new();
 		// THE ROOT IS ALREADY SPOKEN FOR, and the map started saying it was not.
 		//
 		// A bit is set on an inode's first sighting and an alias is declared on its second, which is
@@ -260,7 +260,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		// its `reached` set contains the root BEFORE the walk starts. Seeding the same way here is
 		// what makes the two checkers agree by construction instead of by coincidence, which is the
 		// gap this whole milestone is named after.
-		names.insert(ROOT_INODE);
+		names.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+		names.push(ROOT_INODE);
 		self.mark_names = Some(names);
 		self.mark_alias = false;
 		self.mark_strict = true;
@@ -639,10 +640,19 @@ impl<D: BlockDevice> LiberFs<D> {
 					// Read-only rather than a walk-damage flag: the repair for an alias is to
 					// remove one of the two names, and that removal is exactly the operation that
 					// destroys the shared inode. `fsck` names both.
-					if let Some(names) = self.mark_names.as_mut()
-						&& !names.insert(rec.child)
-					{
-						self.mark_alias = true;
+					if let Some(names) = self.mark_names.as_mut() {
+						match names.binary_search(&rec.child) {
+							// Seen before: this inode has a second name.
+							Ok(_) => self.mark_alias = true,
+							// FALLIBLY, which is the whole reason this is a `Vec`. A mount that
+							// cannot hold one more inode number answers `NoMemory` and is refused;
+							// it does not take the process down, and it does not carry on with an
+							// alias check that has silently stopped recording.
+							Err(at) => {
+								names.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+								names.insert(at, rec.child);
+							}
+						}
 					}
 				}
 			}

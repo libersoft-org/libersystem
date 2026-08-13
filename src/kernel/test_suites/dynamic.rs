@@ -1238,6 +1238,37 @@ fn a_load_that_runs_out_of_frames_anywhere_gives_back_everything() {
 	crate::serial_println!("(load takes {succeeded_at} allocations; {refusals} refusals checked) ");
 }
 
+tagged_test!(a_load_into_a_terminating_process_is_refused, [Dynamic, Memory, Process], id = "kernel.dynamic.a_load_into_a_terminating_process_is_refused", covers = ["kernel"]);
+fn a_load_into_a_terminating_process_is_refused() {
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+	// The two largest resource-extending operations the kernel has - a frame per page of every
+	// PT_LOAD segment, a ring-3 stack, a module slot, dynamic symbols - took no lifecycle guard at
+	// all. `SYS_PROCESS_LOAD` did not even read `is_terminating`: it looked the process up with
+	// MANAGE and loaded into it. So a load that began before a `terminate()` and adopted after it
+	// handed a dead process a page table full of live mappings and a frame list the teardown
+	// snapshot never saw - a resource set that grows after the barrier that exists to close it.
+	//
+	// THE SAME INPUT, TWO DIFFERENT REFUSALS, which is what separates the guard from the parser: a
+	// live process refuses this image because it is not an image, and a terminating one refuses it
+	// before looking. `Terminating` exists as its own variant for exactly this reason - the image is
+	// not the caller's mistake, the race is.
+	let not_an_image: alloc::vec::Vec<u8> = alloc::vec![0u8; 256];
+
+	let live = Process::new(AddressSpace::create().expect("live address space"), sched::root_domain());
+	assert!(matches!(crate::loader::load_image_into(&live, &not_an_image), Err(crate::loader::LoadError::BadImage)), "a live process gets as far as parsing");
+	assert!(matches!(crate::loader::load_module_into(&live, &not_an_image, 0x2000_0000), Err(crate::loader::LoadError::BadImage)), "and so does a module load");
+
+	let dying = Process::new(AddressSpace::create().expect("dying address space"), sched::root_domain());
+	dying.terminate();
+	assert!(matches!(crate::loader::load_image_into(&dying, &not_an_image), Err(crate::loader::LoadError::Terminating)), "a terminating process refuses before it parses anything");
+	assert!(matches!(crate::loader::load_module_into(&dying, &not_an_image, 0x2000_0000), Err(crate::loader::LoadError::Terminating)), "and refuses the module load the same way");
+	// Nothing was mapped and no module slot was claimed, which is the resource set that used to be
+	// able to grow after the barrier.
+	assert!(dying.address_space().unmap(0x2000_0000).is_none(), "a refused load maps nothing");
+	assert!(!dying.has_dynamic_modules(), "and claims no module slot");
+}
+
 tagged_test!(a_fuzzed_elf_header_is_refused_without_leaking, [Dynamic, Memory, Process], id = "kernel.dynamic.a_fuzzed_elf_header_is_refused_without_leaking", covers = ["kernel", "rt"]);
 fn a_fuzzed_elf_header_is_refused_without_leaking() {
 	// Random damage to a well-formed image, in the two structures the loader parses before it

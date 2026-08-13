@@ -1133,20 +1133,60 @@ fn sys_device_msix_acquire(index: u64, privilege: u64) -> i64 {
 			None => return ERR_RESOURCE_EXHAUSTED,
 		}
 	};
+	// ONE LIVE VECTOR PER DEVICE, refused rather than discovered by aliasing.
+	//
+	// Every backend programs the device's MSI-X table ENTRY 0 for whatever slot it was given, so two
+	// live acquisitions for one device produce two vectors, two registry slots and two `Interrupt`
+	// objects all pointing at one hardware entry - which then carries the second vector. The first
+	// `Interrupt` is bound to a vector the device will never raise, and when it drops, `unbind` masks
+	// and unmaps entry 0, which is the entry the SECOND interrupt is live on. An old handle silently
+	// disabling a new one.
+	//
+	// HERE AND NOT IN THE REGISTRY, which is the mechanism: this syscall is the userspace path whose
+	// one caller is DeviceManager, and the kernel's own xHCI bring-up test calls `acquire_msi`
+	// directly to stand in for DeviceManager on a device the booted system has already claimed. A
+	// rule inside the registry made that test fail - correctly, and for a reason that has nothing to
+	// do with what it is testing.
+	//
+	// A PENDING slot does not count: its `Interrupt` is gone, and a restarting driver reprogramming
+	// its own device's entry 0 is exactly what should happen. `ERR_RESOURCE_EXHAUSTED` because that
+	// is what the caller can act on - the device's vector is spoken for.
+	if arch::interrupts::device_has_live_msi(index as u32) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	// THE HANDLE SLOT IS BOOKED BEFORE THE HARDWARE IS TOUCHED.
+	//
+	// This programmed the device's table, bound the `Interrupt`, enabled MSI-X and only then tried
+	// to install the handle - which fails if the caller's table is full or its Domain is at quota.
+	// The `Interrupt` then dropped, `unbind` masked the entry and the slot went PENDING, waiting for
+	// a `SYS_DEVICE_QUIESCED` that will never come for a driver that was never created. MSI slots
+	// are a fixed table and each failed acquire cost one, repeatably.
+	//
+	// Reserving first is what `HandleTable::reserve`/`insert_reserved` exist for, and the receive
+	// path already uses them this way: book the room, touch the hardware, install against the
+	// booking - which cannot fail - and give the booking back on any earlier refusal.
+	if !thread.handles().lock().reserve(1) {
+		return ERR_RESOURCE_EXHAUSTED;
+	}
 	let vector = match arch::interrupts::acquire_msi(table_phys, dest, index as u32) {
 		Some(v) => v,
-		None => return ERR_RESOURCE_EXHAUSTED,
+		None => {
+			thread.handles().lock().release_reservation(1);
+			return ERR_RESOURCE_EXHAUSTED;
+		}
 	};
 	let interrupt = Interrupt::new(vector);
 	if !arch::interrupts::bind_msi(vector, &interrupt) {
-		// The vector raced to another binder; release the slot we reserved.
-		arch::interrupts::unbind(vector);
+		// The vector raced to another binder. FREED, not retired: MSI-X has not been enabled on the
+		// device yet, so nothing can have been sent and there is no owner to quiesce it.
+		arch::interrupts::release_unused_msi(vector);
+		thread.handles().lock().release_reservation(1);
 		return ERR_RESOURCE_EXHAUSTED;
 	}
 	// Turn on MSI-X now that its table entry is programmed; the device's INTx pin stays
 	// disabled (MSI-X is its interrupt source from here on).
 	arch::pci::msix_enable(bus, dev, func, cap);
-	install_object(&thread, interrupt, Rights::ALL, 0)
+	thread.handles().lock().insert_reserved(Capability::new(interrupt, Rights::ALL, 0)).raw() as i64
 }
 
 // Acknowledge a serviced interrupt: clear the Interrupt's pending flag so the driver's
@@ -1334,7 +1374,7 @@ fn sys_process_load(process_handle: u64, elf_ptr: u64, elf_len: u64) -> i64 {
 	match loader::load_image_into(&process, &image) {
 		Ok(entry) => entry as i64,
 		Err(LoadError::OutOfMemory) => ERR_NO_MEMORY,
-		Err(LoadError::BadImage) => ERR_INVALID,
+		Err(LoadError::BadImage | LoadError::Terminating) => ERR_INVALID,
 	}
 }
 
@@ -1357,7 +1397,7 @@ fn sys_process_load_module(process_handle: u64, elf_ptr: u64, elf_len: u64, bias
 	match loader::load_module_into(&process, &image, bias) {
 		Ok(()) => 0,
 		Err(LoadError::OutOfMemory) => ERR_NO_MEMORY,
-		Err(LoadError::BadImage) => ERR_INVALID,
+		Err(LoadError::BadImage | LoadError::Terminating) => ERR_INVALID,
 	}
 }
 
@@ -1373,16 +1413,31 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 		Ok(o) => o,
 		Err(e) => return e,
 	};
-	// The TARGET, not the caller.
+	// THE TARGET'S GUARD, NOT A READ OF ITS FLAG, and held to the end of the transaction.
 	//
-	// A thread created into a process that is going away would never be reaped - the live-thread
-	// counter that decides the finaliser has already reached zero - and the test for it read
-	// `thread.process()`, which is the process making the CALL. It was written before the target
-	// was even looked up, so a dying or dead child could still be given a new thread by a healthy
-	// parent, which is the case the check exists for.
-	if process.is_terminating() {
+	// This was `if process.is_terminating() { return ERR_INVALID; }`. A flag read answers a question
+	// about a moment that has passed by the time the answer is used, and what follows is a
+	// four-step transaction on the target: take from the caller, insert into the child, build the
+	// thread, install the handle, commit the take. The guard that makes the answer hold was taken
+	// three calls later inside `Thread::build`, by which time the capability is already in the
+	// child.
+	//
+	// The window was exact and what it left behind was permanent. The child's bootstrap capability
+	// is inserted ORDINARILY, so a `terminate()` racing in here reached `close_all`, which skips
+	// reserved slots and took this one. `create_user_thread` then failed - `begin_extend` refuses on
+	// a terminating process - and the rollback's `take` out of the child returned `Err`, so
+	// `restore_taken` never ran. The caller was left with a slot that is `reserved: true` and
+	// `cap: None`: not on the free list, never committed, skipped by `close_all` forever, and one
+	// unit of handle quota short. A supervisor racing spawns against kills loses one of each per
+	// attempt until it cannot spawn at all.
+	//
+	// One guard over the whole transaction closes it: the target cannot begin terminating while it
+	// is held, so every rollback below can still reach the capability it needs to put back.
+	// `Thread::build` takes its own - guards nest by counting - so this one does not have to be
+	// threaded down.
+	let Some(extend) = process.begin_extend() else {
 		return ERR_INVALID;
-	}
+	};
 	// Move the bootstrap capability (if any) into the child, recording the handle
 	// value the child will see, so the kernel can wire it into the thread's rdi.
 	// TAKE the bootstrap - a transfer moves the capability, and the caller's handle dies
@@ -1414,6 +1469,10 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 				return ERR_RESOURCE_EXHAUSTED;
 			}
 		}
+		// Every path from here on either commits the take or restores it, and the two rollbacks
+		// below can no longer fail to find the capability: the guard above stops the target
+		// terminating, so nothing else can take it out of the child. `abandon_taken` is what answers
+		// for the case that is still theoretically reachable - see the rollbacks.
 	} else {
 		0
 	};
@@ -1431,8 +1490,14 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 			// caller was never told, which is the same unreachable-capability defect the batch send
 			// had.
 			if child_bootstrap != 0 {
-				if let Ok(cap) = process.handles().lock().take(Handle::from_raw(child_bootstrap), Rights::NONE) {
-					thread.handles().lock().restore_taken(bootstrap, cap);
+				match process.handles().lock().take(Handle::from_raw(child_bootstrap), Rights::NONE) {
+					Ok(cap) => thread.handles().lock().restore_taken(bootstrap, cap),
+					// The capability is not in the child any more and it is not here: it cannot be
+					// restored, so the reservation is ABANDONED rather than left standing. That
+					// costs the caller the capability and the handle value, which is the truth
+					// about what happened; leaving the slot reserved cost it those AND the slot
+					// AND a unit of quota, permanently.
+					Err(_) => thread.handles().lock().abandon_taken(bootstrap),
 				}
 			}
 			return ERR_RESOURCE_EXHAUSTED;
@@ -1446,10 +1511,11 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 	// everything back.
 	let installed = install_object(&thread, new_thread, Rights::ALL, 0);
 	if installed < 0 {
-		if child_bootstrap != 0
-			&& let Ok(cap) = process.handles().lock().take(Handle::from_raw(child_bootstrap), Rights::NONE)
-		{
-			thread.handles().lock().restore_taken(bootstrap, cap);
+		if child_bootstrap != 0 {
+			match process.handles().lock().take(Handle::from_raw(child_bootstrap), Rights::NONE) {
+				Ok(cap) => thread.handles().lock().restore_taken(bootstrap, cap),
+				Err(_) => thread.handles().lock().abandon_taken(bootstrap),
+			}
 		}
 		return installed;
 	}
@@ -1464,6 +1530,8 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 	if child_bootstrap != 0 {
 		thread.handles().lock().commit_taken(bootstrap);
 	}
+	// The transaction is over, so the target may terminate again.
+	drop(extend);
 	installed
 }
 
@@ -1524,7 +1592,13 @@ fn sys_process_group_create(handles_ptr: u64, count: u64) -> i64 {
 	if let Err(error) = copy_from_user_exact(raw.as_mut_ptr() as *mut u8, handles_ptr, (count as usize) * 8) {
 		return error;
 	}
-	let mut members = alloc::vec::Vec::with_capacity(raw.len());
+	// FALLIBLE, like the `try_zeroed_u64` three lines above it: the odd one out in its own function,
+	// exactly as `sys_wait_any`'s was. The count is bounded by the ABI, which makes this not a
+	// denial of service and still not a reason to abort the kernel on a short heap.
+	let mut members: alloc::vec::Vec<Arc<Process>> = alloc::vec::Vec::new();
+	if members.try_reserve(raw.len()).is_err() {
+		return ERR_NO_MEMORY;
+	}
 	for handle in raw {
 		match current_typed::<Process>(handle, ObjectType::Process, Rights::MANAGE) {
 			Ok(process) => members.push(process),
@@ -1848,16 +1922,25 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 	// the capability back at the SAME handle when it does not - so a refused send costs the caller
 	// nothing, not even the name it used.
 	let handle = Handle::from_raw(xfer);
-	let caps = if xfer != 0 {
+	// THE ROOM FOR THE CAPABILITY IS BOOKED BEFORE THE CAPABILITY MOVES.
+	//
+	// This was `alloc::vec![cap]` immediately after `take_for_transfer` had emptied and reserved the
+	// caller's slot - the worst available ordering, with the allocation failure landing between the
+	// two halves of a transaction, where the only answers left are to abort or to leave a
+	// reservation nobody can resolve. Reserving first means a short heap refuses before anything has
+	// moved.
+	let mut caps: Vec<Capability> = Vec::new();
+	if xfer != 0 {
+		if caps.try_reserve(1).is_err() {
+			return ERR_NO_MEMORY;
+		}
 		let mut table = thread.handles().lock();
 		match table.take_for_transfer(handle, Rights::TRANSFER) {
-			Ok(cap) => alloc::vec![cap],
+			Ok(cap) => caps.push(cap),
 			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
 			Err(_) => return ERR_BAD_HANDLE,
 		}
-	} else {
-		Vec::new()
-	};
+	}
 	match channel.send_charged_or_return(Message::new(bytes, caps, badge), thread.domain()) {
 		Ok(()) => {
 			// Delivered: the handle value dies now, and its quota is refunded.
@@ -1968,8 +2051,15 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 	// So the slots are emptied and RESERVED across the send: the handle names nothing while the
 	// message is in flight, which is the truth about it, and the outcome decides whether the value
 	// dies or comes back.
-	let mut caps: Vec<Capability> = Vec::with_capacity(count);
-	let mut taken: Vec<Handle> = Vec::with_capacity(count);
+	// Both reserved before the first take, for the reason the single send gives: an allocation that
+	// fails between the two halves of a transaction has no good answer, and one that fails before it
+	// is an ordinary refusal. `count` is bounded by the ABI, so this is not a denial of service -
+	// it is the abort-on-short-heap that a bounded size does not excuse.
+	let mut caps: Vec<Capability> = Vec::new();
+	let mut taken: Vec<Handle> = Vec::new();
+	if caps.try_reserve(count).is_err() || taken.try_reserve(count).is_err() {
+		return ERR_NO_MEMORY;
+	}
 	{
 		let mut table = thread.handles().lock();
 		for &raw_handle in raw.iter().take(count) {

@@ -108,7 +108,36 @@ type Children = Vec<(String, Node)>;
 // One entry in a directory. Files own their bytes; directories own their children.
 enum Node {
 	File(Vec<u8>),
+	// A file an open stream is filling, holding whatever the destination held when the stream
+	// opened: empty for a new file, the previous contents for a replacement.
+	//
+	// THE CLAIM HAS TO BE IN THE TREE, not only in `Pending`. `stream_begin` inserted an ordinary
+	// `Node::File` and recorded `placeholder: true` beside it - so nothing another caller could
+	// reach knew the entry was spoken for, `write_file` and `remove` operated on it as an ordinary
+	// file, and `stream_abort` then removed the path unconditionally. Two clients and no timing
+	// subtlety:
+	//
+	//     A: stream_begin("x")           the claim
+	//     B: write_file("x", important)  Ok - B is told the write succeeded
+	//     A: stream_abort()              remove("x") - B's file is gone
+	//
+	// A completed write, reported as completed, destroyed by an unrelated abort. So the node
+	// carries the claim, every mutator refuses it, and the abort restores exactly what the stream
+	// found: nothing for a new destination, the previous bytes for a replaced one.
+	//
+	// Reads are NOT refused. A replacement stream must leave the file exactly as it was until it
+	// commits, which is this milestone's own rule - so reading a claimed entry answers the bytes it
+	// is holding, which are the file's current contents.
+	Claimed(Vec<u8>),
 	Directory(Children),
+}
+
+impl Node {
+	// Is a stream holding this entry? Every mutator asks, because a claim nothing enforces is not a
+	// claim.
+	fn is_claimed(&self) -> bool {
+		matches!(self, Node::Claimed(_))
+	}
 }
 
 // Find `name` among sorted children.
@@ -192,7 +221,10 @@ impl Node {
 	// make the reported usage depend on how deeply a caller happened to nest its files.
 	fn bytes(&self) -> usize {
 		match self {
-			Node::File(data) => data.len(),
+			// A claimed entry counts as what it holds. It is a file another caller can read and the
+			// stream may yet restore, so leaving it out would report memory the volume is holding
+			// as free - the accounting error the retained-table finding was about, in miniature.
+			Node::File(data) | Node::Claimed(data) => data.len(),
 			Node::Directory(children) => children.iter().map(|(_, node)| node.bytes()).sum(),
 		}
 	}
@@ -208,7 +240,7 @@ impl Node {
 	// that is what the word means to a caller.
 	fn allocated(&self) -> usize {
 		match self {
-			Node::File(data) => data.capacity(),
+			Node::File(data) | Node::Claimed(data) => data.capacity(),
 			Node::Directory(children) => children.iter().map(|(_, node)| node.allocated()).sum(),
 		}
 	}
@@ -221,7 +253,7 @@ impl Node {
 	// A node does not count its own name; the parent holding the key does.
 	fn names(&self) -> usize {
 		match self {
-			Node::File(_) => 0,
+			Node::File(_) | Node::Claimed(_) => 0,
 			Node::Directory(children) => children.iter().map(|(name, node)| name.len() + node.names()).sum(),
 		}
 	}
@@ -231,14 +263,14 @@ impl Node {
 	// answered from the same walk, so the two cannot disagree about the shape of the tree.
 	fn table_bytes(&self) -> usize {
 		match self {
-			Node::File(_) => 0,
+			Node::File(_) | Node::Claimed(_) => 0,
 			Node::Directory(children) => children.capacity() * SLOT_BYTES + children.iter().map(|(_, node)| node.table_bytes()).sum::<usize>(),
 		}
 	}
 
 	fn count(&self) -> usize {
 		match self {
-			Node::File(_) => 1,
+			Node::File(_) | Node::Claimed(_) => 1,
 			Node::Directory(children) => 1 + children.iter().map(|(_, node)| node.count()).sum::<usize>(),
 		}
 	}
@@ -407,7 +439,7 @@ impl LiberMemFs {
 		let pending = path.len();
 		match self.resolve(parts)? {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
-			Some(Node::File(_)) => {
+			Some(Node::File(_)) | Some(Node::Claimed(_)) => {
 				if free < pending {
 					return Err(FsError::NoSpace);
 				}
@@ -435,7 +467,7 @@ impl LiberMemFs {
 		let free = self.capacity.saturating_sub(self.footprint() as usize);
 		match self.resolve(parts)? {
 			// A rewrite may use what the file already holds, plus whatever is still free.
-			Some(Node::File(existing)) => Ok(existing.capacity().saturating_add(free).min(MAX_FILE_BYTES)),
+			Some(Node::File(existing)) | Some(Node::Claimed(existing)) => Ok(existing.capacity().saturating_add(free).min(MAX_FILE_BYTES)),
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			// A new entry pays for its name out of the same free space.
 			None => {
@@ -592,7 +624,7 @@ impl LiberMemFs {
 		}
 		match node {
 			Node::Directory(children) => Ok(children),
-			Node::File(_) => Err(FsError::NotDir),
+			Node::File(_) | Node::Claimed(_) => Err(FsError::NotDir),
 		}
 	}
 
@@ -610,7 +642,7 @@ impl LiberMemFs {
 		}
 		match node {
 			Node::Directory(children) => Ok(children),
-			Node::File(_) => Err(FsError::NotDir),
+			Node::File(_) | Node::Claimed(_) => Err(FsError::NotDir),
 		}
 	}
 
@@ -742,7 +774,12 @@ impl LiberMemFs {
 		let (parts, count) = Self::segments(path)?;
 		let parts = &parts[..count];
 		match self.resolve(parts)? {
-			Some(Node::File(data)) => {
+			// A CLAIMED entry reads. A stream that is abandoned must leave the file exactly as it
+			// was, so until it commits the bytes it is holding ARE the file's contents - empty for
+			// a destination that did not exist, the previous contents for one being replaced.
+			// Refusing the read would make an open stream change what other callers see, which is
+			// the opposite of what the claim is for.
+			Some(Node::File(data)) | Some(Node::Claimed(data)) => {
 				let mut out: Vec<u8> = Vec::new();
 				out.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
 				out.extend_from_slice(data);
@@ -777,6 +814,9 @@ impl LiberMemFs {
 		// allocation costs nothing; one that does not grows it to exactly the new length.
 		let (previous, becomes, is_new) = match self.resolve(parts)? {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
+			// A destination an open stream is filling is not available to be written. `Exists` is
+			// the answer `mkdir` already gives for the same condition: the name is taken.
+			Some(Node::Claimed(_)) => return Err(FsError::Exists),
 			Some(Node::File(existing)) => (existing.capacity(), existing.capacity().max(data.len()), false),
 			None => {
 				if !self.room_for_an_entry() {
@@ -854,6 +894,9 @@ impl LiberMemFs {
 		}
 		let is_new = match self.resolve(parts)? {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
+			// Unreachable while `self.pending.is_some()` is refused above - one stream at a time,
+			// and a claim only exists while its stream does. Refused rather than assumed away.
+			Some(Node::Claimed(_)) => return Err(FsError::Exists),
 			Some(Node::File(_)) => false,
 			None => {
 				if !self.room_for_an_entry() {
@@ -867,10 +910,21 @@ impl LiberMemFs {
 		// the entry's own cost.
 		// The path AND the destination's name, because both are taken below and both are held for
 		// the stream's lifetime.
-		// The path, the destination's name, AND the slot the placeholder below takes - because
-		// `footprint` counts the directory table it goes into, so a check that leaves the slot out
-		// admits a stream the volume then cannot hold.
-		let entry_cost = path.len() + if is_new { parts.last().map_or(0, |name| name.len()) + SLOT_BYTES } else { 0 };
+		//
+		// AND NOT THE SLOT, which this briefly added under a comment saying "`footprint` counts the
+		// directory table it goes into". It does not: `footprint` is `allocated + names + pending`
+		// and the tables are `metadata_bytes`, a separate budget under `MAX_METADATA_BYTES` - which
+		// is the whole point of the retained-table finding this milestone opened with. The comment
+		// forty lines below said so correctly at the same time, and the arithmetic followed the
+		// wrong one.
+		//
+		// It had a consequence past the tidiness. `stream_len` costs a new destination at
+		// `path + name`; charging `+ SLOT_BYTES` here made a volume with room for one and not the
+		// other answer `Ok(0)` to the preflight and `NoSpace` to the begin - the same
+		// preflight/execute disagreement `writable_len` was fixed for. The slot is bounded where a
+		// directory entry has always been bounded: `room_for_an_entry` above, and the fallible
+		// `insert` below.
+		let entry_cost = path.len() + if is_new { parts.last().map_or(0, |name| name.len()) } else { 0 };
 		if (self.footprint() as usize).saturating_add(entry_cost) > self.capacity {
 			return Err(FsError::NoSpace);
 		}
@@ -912,6 +966,13 @@ impl LiberMemFs {
 		// capacity arithmetic would make a reserved volume count memory the metadata budget does
 		// not; inserting an ordinary entry charges the metadata budget, which is where a directory
 		// entry has always been charged. `room_for_an_entry` has already said one is available.
+		//
+		// BOTH CASES ARE CLAIMED, which the first version of this did not do: `let placeholder =
+		// is_new` meant a stream REPLACING a file held nothing at all, so the sequence the claim
+		// exists to prevent still worked - remove the destination mid-transfer and the commit
+		// re-resolved to nothing and took the create path, allocating the name and the slot at the
+		// end after all. A replacement claims the node it found, keeping the previous contents
+		// inside the claim so an abort can put them back untouched.
 		let placeholder = is_new;
 		if is_new {
 			let last = parts.last().copied().unwrap_or("");
@@ -921,10 +982,21 @@ impl LiberMemFs {
 				return Err(FsError::NoSpace);
 			}
 			owned_name.push_str(last);
-			let placed = self.parent_mut(parts).and_then(|children| insert(children, owned_name, Node::File(Vec::new())));
+			let placed = self.parent_mut(parts).and_then(|children| insert(children, owned_name, Node::Claimed(Vec::new())));
 			if placed.is_err() {
 				self.resync_reservation();
 				return Err(FsError::NoSpace);
+			}
+		} else {
+			// Claim in place. No allocation: the existing buffer moves into the claim and back out
+			// of it, so this cannot fail and a replacement stream cannot be refused for memory
+			// after its destination has been checked.
+			let last = *parts.last().unwrap_or(&"");
+			if let Ok(children) = self.parent_mut(parts)
+				&& let Some(node) = find_mut(children, last)
+				&& let Node::File(data) = node
+			{
+				*node = Node::Claimed(core::mem::take(data));
 			}
 		}
 		self.pending = Some(Pending { path: owned, data: Vec::new(), placeholder, offered: None });
@@ -1103,23 +1175,76 @@ impl LiberMemFs {
 		// So the store does not resync: it adopts, the path drops when `pending` does, and the one
 		// resync happens here with the volume's footprint being exactly what it will be.
 		let stored = self.write_file_owned_unsynced(&pending.path, pending.data);
+		// THE CLAIM ENDS HERE, whichever way the store went.
+		//
+		// The store has two paths: `insert` replaces the node outright, which already leaves a
+		// `Node::File`, and ADOPT rewrites the existing buffer through `file_mut` - which leaves
+		// the node exactly as it found it, claimed. So a committed stream whose data fitted the
+		// destination's existing allocation would have left a claim nobody could ever release, and
+		// the file would have been permanently unwritable and unremovable.
+		//
+		// Unconditional, because a FAILED commit must not leave one either: the stream is over
+		// either way, and a claim outlives its stream in no case.
+		self.release_claim(&pending.path);
 		drop(pending.path);
 		self.resync_reservation();
 		stored
 	}
 
+	// Turn a claimed entry back into an ordinary file, wherever the stream that claimed it ended.
+	fn release_claim(&mut self, path: &[u8]) {
+		let Ok((parts, count)) = Self::segments(path) else { return };
+		let parts = &parts[..count];
+		let Some(&last) = parts.last() else { return };
+		let Ok(children) = self.parent_mut(parts) else { return };
+		if let Some(node) = find_mut(children, last)
+			&& let Node::Claimed(data) = node
+		{
+			*node = Node::File(core::mem::take(data));
+		}
+	}
+
 	// Give up. The room goes back to the volume, and the destination is untouched - a stream that
 	// cannot be completed leaves the file exactly as it was.
 	pub fn stream_abort(&mut self) {
-		// The placeholder goes with the stream that created it. A destination that was only ever a
-		// claim must not survive as a zero-byte file.
+		// RELEASE THE CLAIM, and release only the claim.
+		//
+		// This used to be `if pending.placeholder { self.remove(&path) }` - an unconditional remove
+		// of whatever was at that path. Nothing checked that the node there was still the entry
+		// this stream inserted, and nothing stopped another caller replacing it, so:
+		//
+		//     A: stream_begin("x")           the placeholder
+		//     B: write_file("x", important)  accepted, because the placeholder was an ordinary file
+		//     A: stream_abort()              remove("x") - B's completed write, gone
+		//
+		// Both halves are closed: `Node::Claimed` makes the mutators refuse, so B cannot get in;
+		// and this looks at the node before touching it, so even a path that changed underneath a
+		// future caller is left alone rather than removed on the strength of a flag.
+		//
 		// MOVED, not cloned: `pending` is owned here, and a `clone()` of a 255-byte path is an
 		// infallible allocation on the path that runs when the volume is already out of room.
-		if let Some(pending) = self.pending.take()
-			&& pending.placeholder
-		{
+		if let Some(pending) = self.pending.take() {
+			let placeholder = pending.placeholder;
 			let path = pending.path;
-			let _ = self.remove(&path);
+			if let Ok((parts, count)) = Self::segments(&path) {
+				let parts = &parts[..count];
+				if let Some(&last) = parts.last()
+					&& let Ok(children) = self.parent_mut(parts)
+					&& find(children, last).is_some_and(Node::is_claimed)
+				{
+					if placeholder {
+						// It existed only as this stream's claim: it goes with the stream.
+						remove(children, last);
+					} else if let Some(node) = find_mut(children, last)
+						&& let Node::Claimed(data) = node
+					{
+						// It existed before the stream did. The bytes the claim was holding ARE
+						// the file, so putting them back leaves it exactly as it was found - which
+						// is what this function's own contract says.
+						*node = Node::File(core::mem::take(data));
+					}
+				}
+			}
 		}
 		self.pending = None;
 		self.resync_reservation();
@@ -1131,9 +1256,21 @@ impl LiberMemFs {
 	}
 
 	pub fn write_file_owned(&mut self, path: &[u8], data: Vec<u8>) -> Result<(), FsError> {
+		// The claim refusal lives in the PUBLIC entry points and not in `_unsynced`, because
+		// `stream_commit` reaches `_unsynced` to replace the claim it made itself. A caller that
+		// arrives here is somebody else.
+		if self.is_claimed(path) {
+			return Err(FsError::Exists);
+		}
 		let stored = self.write_file_owned_unsynced(path, data);
 		self.resync_reservation();
 		stored
+	}
+
+	// Is an open stream holding this path? The public mutators ask before they touch it.
+	fn is_claimed(&self, path: &[u8]) -> bool {
+		let Ok((parts, count)) = Self::segments(path) else { return false };
+		matches!(self.resolve(&parts[..count]), Ok(Some(node)) if node.is_claimed())
 	}
 
 	fn write_file_owned_unsynced(&mut self, path: &[u8], data: Vec<u8>) -> Result<(), FsError> {
@@ -1151,7 +1288,7 @@ impl LiberMemFs {
 		}
 		let (previous, is_new) = match self.resolve(parts)? {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
-			Some(Node::File(existing)) => (existing.capacity(), false),
+			Some(Node::File(existing)) | Some(Node::Claimed(existing)) => (existing.capacity(), false),
 			None => {
 				if !self.room_for_an_entry() {
 					return Err(FsError::NoSpace);
@@ -1295,7 +1432,7 @@ impl LiberMemFs {
 		let name = *parts.last().ok_or(FsError::BadName)?;
 		let children = self.parent_mut(parts)?;
 		match find_mut(children, name) {
-			Some(Node::File(data)) => Ok(data),
+			Some(Node::File(data)) | Some(Node::Claimed(data)) => Ok(data),
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			None => Err(FsError::NotFound),
 		}
@@ -1325,7 +1462,7 @@ impl LiberMemFs {
 				}
 				Ok(out)
 			}
-			Some(Node::File(_)) => Err(FsError::NotDir),
+			Some(Node::File(_)) | Some(Node::Claimed(_)) => Err(FsError::NotDir),
 			None => Err(FsError::NotFound),
 		}
 	}
@@ -1370,6 +1507,10 @@ impl LiberMemFs {
 		let children = self.parent_mut(parts)?;
 		match find(children, name) {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
+			// The name is held by an open stream. Removing it was how an abort came to delete
+			// another client's file: the entry went away, the next writer recreated it, and the
+			// abort then removed THAT.
+			Some(Node::Claimed(_)) => Err(FsError::Exists),
 			Some(Node::File(_)) => {
 				remove(children, name);
 				self.resync_reservation();
@@ -1396,7 +1537,7 @@ impl LiberMemFs {
 				Ok(())
 			}
 			Some(Node::Directory(_)) => Err(FsError::NotEmpty),
-			Some(Node::File(_)) => Err(FsError::NotDir),
+			Some(Node::File(_)) | Some(Node::Claimed(_)) => Err(FsError::NotDir),
 			None => Err(FsError::NotFound),
 		}
 	}

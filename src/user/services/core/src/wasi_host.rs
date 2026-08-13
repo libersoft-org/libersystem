@@ -121,40 +121,49 @@ enum Grant {
 	Picker(u64),
 }
 
-// The WASI host: services the component's `read` import from whatever it was
-// granted, copying the resulting bytes into the component's linear memory.
-struct WasiHost {
+// The WASI host's SERVICES, behind the shared world seam.
+//
+// This used to be a private `Host` implementation with its own dispatch, and it answered a failed
+// read with `Trap` while `WorldHost` answered the same import on the same versioned ABI with
+// `STATUS_IO`. Two hosts of one interface with two error semantics, both shipping in one image, and
+// which a component got depended on which host launched it - which is the thing a version on an
+// interface exists to make impossible.
+//
+// So the dispatch, the window rules and the status mapping come from `WorldHost` and what is left
+// here is the part that is genuinely this host's: which grant the bytes come from. The comment
+// beside the window fix already said the rule - "One set of rules, in one place, for both hosts" -
+// and this is the rest of it.
+struct WasiServices {
 	grant: Grant,
 }
 
-impl Host for WasiHost {
-	fn call_import(&mut self, import: u32, args: &[Value], memory: &mut [u8]) -> Result<alloc::vec::Vec<Value>, Trap> {
-		// import 0 is `liber:vfs@1 read(ptr, max) -> count`; nothing else is granted.
-		if import != 0 {
-			return Err(Trap("import not granted"));
-		}
-		// THE SHARED WINDOW, not a private one.
-		//
-		// This host kept the rules `component_host` was corrected out of: an unversioned import
-		// name, `as_i32 as usize` sign-extending any address at or above 0x8000_0000, and
-		// `.min(memory.len())` silently SHORTENING a window that does not fit - so a component
-		// asking for three hundred bytes near the top of its memory got fewer and a count it could
-		// not tell from a short file. Two demonstrations of the capability boundary with different
-		// safety rules is how one of them gets fixed and the other does not, and this one ships:
-		// it is in the manifest and two kernel tests boot it.
-		//
-		// `wasm::world::window` refuses rather than clamps and reads a wasm32 address as the 32-bit
-		// pattern it is. One set of rules, in one place, for both hosts.
-		let Some((ptr, end)) = wasm::world::window(args, memory.len()) else {
-			return Err(Trap("read pointer out of bounds"));
-		};
-		let dst: &mut [u8] = &mut memory[ptr..end];
-		let n: usize = match self.grant {
+impl wasm::world::WorldServices for WasiServices {
+	fn read(&mut self, dst: &mut [u8]) -> wasm::world::ReadOutcome {
+		let read = match self.grant {
 			Grant::Storage(storage) => unsafe { read_fixed(storage, dst) },
 			Grant::Picker(picker) => unsafe { read_picked(picker, dst) },
+		};
+		// `Failed` rather than `Refused`: these two helpers answer `None` for a service that did not
+		// reply as well as for an open that was refused, and telling the guest `DENIED` when the
+		// truth may be "the service is gone" is the conflation the typed outcomes exist to end.
+		// Separating them properly means the helpers reporting which, which is work for the day
+		// this host's grants grow past two.
+		match read {
+			Some(n) => wasm::world::ReadOutcome::Read(n),
+			None => wasm::world::ReadOutcome::Failed,
 		}
-		.ok_or(Trap("granted read failed"))?;
-		Ok(alloc::vec![Value::I32(n as i32)])
+	}
+
+	// Neither is granted here: this host demonstrates the READ half of the world - a fixed file, or
+	// one the user picked through the powerbox - and a component asking for either is refused at
+	// instantiation by the import resolution below, not at the call. These exist because the trait
+	// does, and answering them by refusing is more honest than a panic on a path that cannot run.
+	fn write(&mut self, _bytes: &[u8]) -> wasm::world::WriteOutcome {
+		wasm::world::WriteOutcome::Refused
+	}
+
+	fn log(&mut self, _text: &str) -> wasm::world::LogOutcome {
+		wasm::world::LogOutcome::Refused
 	}
 }
 
@@ -235,7 +244,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Ok(i) => i,
 		Err(_) => exit(),
 	};
-	let mut host: WasiHost = WasiHost { grant };
+	// The imports, in the order the module declares them - which is the order `WorldHost` dispatches
+	// by. Only `Read` resolves here; the loop above has already refused anything else.
+	let imports: alloc::vec::Vec<wasm::world::WorldFn> = alloc::vec![wasm::world::WorldFn::Read; module.imports.len()];
+	let mut host = wasm::world::WorldHost::new(WasiServices { grant }, imports);
 	let count: i32 = match instance.invoke("run", &[], &mut host) {
 		Ok(results) => results.first().map(|v: &Value| v.as_i32()).unwrap_or(0),
 		Err(_) => exit(),

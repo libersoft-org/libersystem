@@ -281,6 +281,26 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>,
 			i += set_len;
 			continue;
 		}
+		// EVERY RECORD AFTER THE NAMES, classified rather than ignored.
+		//
+		// The loop below reads the Stream and the File Name entries and stopped there, so a set
+		// carrying anything else was surfaced as an ordinary file - listed, opened, overwritten and
+		// removed, with the extra records left behind. The format's rule is stronger than "ignore
+		// what you do not know": an unrecognised CRITICAL secondary (type code with bit 5 clear)
+		// makes the whole entry set unrecognised, and an implementation may not modify it normally.
+		//
+		// A benign one (bit 5 set - the vendor extensions) is preserved by being left alone, which
+		// is what happens anyway; a critical one marks the entry read-only, so it lists and reads
+		// and refuses overwrite and remove. That is the one answer that cannot damage a volume whose
+		// owner understands more of the format than this driver does.
+		let mut unrecognised = false;
+		for r in (1 + fragments)..secondary {
+			let kind = bytes[i + 32 + r * 32];
+			// In use (bit 7), secondary (bit 6 clear), and BENIGN is bit 5.
+			if kind & 0x80 != 0 && kind & 0x20 == 0 {
+				unrecognised = true;
+			}
+		}
 		let mut name: Vec<u16> = Vec::new();
 		let mut malformed = false;
 		for f in 0..fragments {
@@ -307,8 +327,21 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>,
 			i += set_len;
 			continue;
 		}
-		let last = i + 32 + (1 + fragments - 1) * 32;
-		out.push(Raw { name: decode_utf16(&name), short: String::new(), size, valid_len, is_dir, attr: e[4], first_cluster, no_fat_chain, set_off: i, ent_off: last });
+		// THE END OF THE SET, not the end of the NAME.
+		//
+		// This was the last File Name entry, and `exfat_mark_unlinked` clears the in-use bit over
+		// `set_off..=ent_off` - so any record after the names, which the comment above anticipates
+		// ("A vendor extension may follow them"), stayed in use inside a set whose primary was not.
+		// A Vendor Allocation entry carries its own `FirstCluster`/`DataLength`, and nothing
+		// released it.
+		//
+		// `set_len` is the checksum's own extent: every record it covered is a record the unlink
+		// clears.
+		let last = i + set_len - 32;
+		// A set this reader does not fully understand is READ-ONLY, expressed through the attribute
+		// every write path already honours rather than through a second flag nothing checks.
+		let attr = if unrecognised { e[4] | ATTR_READ_ONLY } else { e[4] };
+		out.push(Raw { name: decode_utf16(&name), short: String::new(), size, valid_len, is_dir, attr, first_cluster, no_fat_chain, set_off: i, ent_off: last });
 		i += set_len;
 	}
 	Ok(out)
@@ -797,6 +830,11 @@ impl Upcase {
 // specification defines it: the media's home systems recompute it on lookup and skip a
 // set whose stored hash mismatches, so hashing the name as written would leave a
 // lowercase-named file listable but unopenable by name there.
+#[cfg(test)]
+pub(super) fn exfat_name_hash_for_test(units: &[u16], upcase: &Upcase) -> u16 {
+	exfat_name_hash(units, upcase)
+}
+
 fn exfat_name_hash(units: &[u16], upcase: &Upcase) -> u16 {
 	let mut hash: u16 = 0;
 	for &u in units {

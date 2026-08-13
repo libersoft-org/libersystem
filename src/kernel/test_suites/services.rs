@@ -1249,6 +1249,167 @@ fn pty_hosts_a_program() {
 	assert!(captured.windows(b"pty:hello".len()).any(|w| w == b"pty:hello"), "the slave's reply is forwarded back out the master");
 }
 
+tagged_test!(the_console_answers_a_program_through_its_own_channel, [Service, Console, Display], id = "kernel.services.the_console_answers_a_program_through_its_own_channel", covers = ["kernel", "term"]);
+fn the_console_answers_a_program_through_its_own_channel() {
+	use object::channel::{Channel, Message};
+	use object::dma_buffer::DmaBuffer;
+	use object::rights::Rights;
+
+	// THE HARNESS THE TERMINAL'S TESTS DID NOT HAVE.
+	//
+	// Every regression test for the terminal model calls `Screen` directly, which is why an item
+	// could be checked off with a note describing a call site the console did not have: the OSC 52
+	// clipboard query was finished in the model, tested in the model, and never wired. So was the
+	// question of what happens when the program does not read its answers - the console delivered
+	// them with an unbounded blocking send, which one program could use to stop every VT.
+	//
+	// Neither is visible from inside `Screen`. Both are visible from here: a real ConsoleService
+	// with a real display behind it, and the test holding the channel a PROGRAM would hold - the
+	// same end VT 1's shell is given. Bytes in are what a program prints; messages out are what it
+	// reads on its input.
+	let init = init_package_bytes().expect("init package module not found");
+	let volume = volume_package_bytes().expect("volume package module not found");
+	let package = pkg::Package::parse(init).expect("init package parses");
+	let display_elf = program_elf(&package, volume, b"display_service").expect("display_service in the package or volume");
+	let console_elf = program_elf(&package, volume, b"console_service").expect("console_service in the package or volume");
+
+	// A DisplayService over a stand-in scanout, so VT 1 has a grid: a terminal with no framebuffer
+	// has no `Screen` at all, and the whole escape-sequence path is skipped.
+	let (display_boot_kernel, display_boot_user) = Channel::create();
+	let (display_server, display_client) = Channel::create();
+	let (gpu_kernel, gpu_user) = Channel::create();
+	let (focus_input, focus_display) = Channel::create();
+	let (kill_input, kill_display) = Channel::create();
+	let _display_service = spawn_dynamic_test_process(sched::root_domain(), display_elf, display_boot_user);
+	send_cap(&display_boot_kernel, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
+	send_cap(&display_boot_kernel, b"FOCUS", focus_display, Rights::ALL).expect("focus bootstrap");
+	send_cap(&display_boot_kernel, b"KILL", kill_display, Rights::ALL).expect("kill bootstrap");
+	let (_display_admin, admin) = Channel::create();
+	send_cap(&display_boot_kernel, b"ADMIN", admin, Rights::ALL).expect("display admin bootstrap");
+	send_cap(&display_boot_kernel, b"SERVE", display_server, Rights::ALL).expect("serve bootstrap");
+	display_boot_kernel.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new(), 0)).expect("display capability bootstrap");
+
+	// 160x64 B8G8R8X8: 20 columns by 4 rows at this font, which is a grid a query can be asked on.
+	const FB_W: u32 = 160;
+	const FB_H: u32 = 64;
+	sched::run_until_idle();
+	let fb_request = gpu_kernel.recv().expect("framebuffer request");
+	assert_eq!(&fb_request.bytes[..], b"FB", "DisplayService requests the scanout");
+	let scanout = match DmaBuffer::create_in(&sched::root_domain(), (FB_W * FB_H * 4) as usize) {
+		Ok(scanout) => scanout,
+		Err(_) => panic!("stand-in scanout"),
+	};
+	let fb = abi::Framebuffer { width: FB_W, height: FB_H, pitch: FB_W * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
+	let mut fb_reply = unsafe { core::slice::from_raw_parts(&fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) }.to_vec();
+	fb_reply.extend_from_slice(&FB_W.to_le_bytes());
+	fb_reply.extend_from_slice(&FB_H.to_le_bytes());
+	send_cap(&gpu_kernel, &fb_reply, scanout, Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
+	sched::run_until_idle();
+	let online = display_boot_kernel.recv().expect("DisplayService online report");
+	assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
+
+	// Every synchronous present the console makes goes to the gpu and waits for the acknowledgement,
+	// so the stand-in gpu has to answer them or the console parks mid-frame. Drains whatever is
+	// pending; the console presents once per output batch and not at all when nothing changed.
+	let ack_presents = |gpu: &Channel| {
+		while let Ok(message) = gpu.recv() {
+			if message.bytes.starts_with(b"PRESENT") {
+				gpu.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("present acknowledgement");
+			}
+			sched::run_until_idle();
+		}
+	};
+	// AND THE FOCUS HANDSHAKE, which is what an acquire actually blocks on: DisplayService tells
+	// InputService which surface owns the keyboard and waits for the acknowledgement before it
+	// answers the client. Nothing here is InputService, so the test is - and without this the console
+	// never finished bring-up and never reported in, which is a hang in the harness rather than
+	// anything the console did.
+	let ack_focus = |focus: &Channel| {
+		while let Ok(_command) = focus.recv() {
+			focus.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("focus acknowledgement");
+			sched::run_until_idle();
+		}
+	};
+
+	// ConsoleService, with VT 1's data channel held HERE - the end a program reads its input on.
+	let (console_boot_kernel, console_boot_user) = Channel::create();
+	let (vt1_console, vt1_program) = Channel::create();
+	let (ctl_console, _ctl_program) = Channel::create();
+	let (dummy, _dummy_far) = Channel::create();
+	let _console_service = spawn_dynamic_test_process(sched::root_domain(), console_elf, console_boot_user);
+	send_cap(&console_boot_kernel, b"CLIENT", vt1_console, Rights::ALL).expect("CLIENT bootstrap");
+	send_cap(&console_boot_kernel, b"CONTROL", ctl_console, Rights::ALL).expect("CONTROL bootstrap");
+	for tag in [&b"FSTORAGE"[..], &b"FLOG"[..], &b"FDEVICE"[..], &b"FPROCESS"[..], &b"FCONFIG"[..], &b"FTIME"[..], &b"FAUDIO"[..], &b"FSESSION"[..], &b"FPERM"[..], &b"FNET"[..]] {
+		send_cap(&console_boot_kernel, tag, dummy.clone(), Rights::ALL).expect("factory bootstrap");
+	}
+	send_cap(&console_boot_kernel, b"DISPLAY", display_client, Rights::ALL).expect("DISPLAY bootstrap");
+	console_boot_kernel.send(Message::new(b"POINTER".to_vec(), alloc::vec::Vec::new(), 0)).expect("POINTER bootstrap");
+	console_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("READY bootstrap");
+	// SEVERAL SETTLES, not one. `run_until_idle` returns when nothing is RUNNABLE, and bring-up
+	// crosses timed waits - the bounded wait for a ConfigService that is not there, and the display
+	// round trips - so a thread parked on a deadline leaves the loop with the work unfinished. The
+	// pty harness gets away with one because it drives the console again afterwards.
+	let settle = |gpu: &Channel, focus: &Channel| {
+		for _ in 0..8 {
+			sched::run_until_idle();
+			ack_focus(focus);
+			ack_presents(gpu);
+		}
+	};
+	settle(&gpu_kernel, &focus_input);
+	// The console reports in when it is up, and it does that AFTER acquiring its surface - so this
+	// also proves VT 1 has a grid to parse escape sequences into. Without a display the terminal is
+	// `None` and the whole escape path is skipped, which would make every assertion below fail for a
+	// reason that has nothing to do with what they are testing.
+	let online = console_boot_kernel.recv().expect("ConsoleService online report");
+	assert_eq!(&online.bytes[..], b"ConsoleService: online", "ConsoleService reports in");
+
+	// Print bytes as a program would, then read what the console owes it back.
+	let print = |bytes: &[u8]| {
+		vt1_program.send(Message::new(bytes.to_vec(), alloc::vec::Vec::new(), 0)).expect("program output");
+		settle(&gpu_kernel, &focus_input);
+	};
+	let read_input = || -> alloc::vec::Vec<u8> {
+		let mut out = alloc::vec::Vec::new();
+		while let Ok(message) = vt1_program.recv() {
+			out.extend_from_slice(&message.bytes);
+		}
+		out
+	};
+
+	// A cursor-position report, which is the reply path that already worked - asserted here so the
+	// harness itself is proved before it is used on the path that did not.
+	print(b"\x1b[6n");
+	let answer = read_input();
+	assert!(answer.starts_with(b"\x1b["), "the console answers DSR on the program's own channel: {answer:?}");
+	assert!(answer.ends_with(b"R"), "and it is a cursor position report: {answer:?}");
+
+	// THE CLIPBOARD QUERY, END TO END. The model recorded the query and could produce the answer;
+	// nothing drained it, so a program asking for the selection was answered with silence.
+	print(b"\x1b]52;c;aGVsbG8=\x07"); // the program sets the selection to "hello"
+	let _ = read_input();
+	print(b"\x1b]52;c;?\x07"); // and asks for it back
+	let answer = read_input();
+	assert_eq!(answer, b"\x1b]52;c;aGVsbG8=\x1b\\".to_vec(), "the console answers the clipboard query with the selection it holds");
+
+	// A PROGRAM THAT NEVER READS MUST NOT STOP THE CONSOLE. The reply was delivered with an
+	// unbounded blocking send, so a program emitting queries and not draining its input filled its
+	// channel and the console then waited inside the render of one VT - stopping every other VT,
+	// the input path, the pointer path and the display. Nothing here drains `vt1_program` while the
+	// queries are sent, so the channel fills; the console must carry on regardless.
+	for _ in 0..300 {
+		print(b"\x1b[6n");
+	}
+	let flooded = read_input();
+	assert!(!flooded.is_empty(), "the answers that fitted were delivered");
+	// And the console is still running: a fresh query on a drained channel is still answered.
+	print(b"\x1b[6n");
+	let after = read_input();
+	assert!(after.ends_with(b"R"), "the console still answers after a client stopped reading: {after:?}");
+
+	core::mem::drop(kill_input);
+}
+
 tagged_test!(ps_live_view_drives_the_terminal_contract, [Service, Shell, Console], id = "kernel.services.ps_live_view_drives_the_terminal_contract", covers = ["kernel", "term"]);
 fn ps_live_view_drives_the_terminal_contract() {
 	use object::channel::{Channel, Message};

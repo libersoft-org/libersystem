@@ -94,19 +94,32 @@ pub struct Element {
 	pub funcs: Vec<u32>,
 }
 
-// A parsed module. `memory_min_pages` is the declared minimum of the single memory
-// (0 if the module declares none) and `memory_max_pages` its declared maximum, if any; one page is
-// 64 kB.
+// A declared linear memory: its initial size, and the maximum it may grow to. One page is 64 kB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryType {
+	pub min_pages: u32,
+	pub max_pages: Option<u32>,
+}
+
+// A parsed module.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Module {
 	pub types: Vec<FuncType>,
 	pub imports: Vec<Import>,
 	pub funcs: Vec<Func>,
 	pub exports: Vec<Export>,
-	pub memory_min_pages: u32,
+	// `(memory 0)` IS A MEMORY, and this could not say so.
+	//
+	// The field was documented as "0 if module declares none", and the validator derived existence
+	// from `memory_min_pages > 0 || memory_max_pages.is_some()` - so a module declaring an initial
+	// size of zero and calling `memory.size` was told it had no memory, while `(memory 0 10)` worked
+	// by accident because the maximum made the second half of the disjunction true.
+	//
+	// `module.table` is an `Option` and answers "is there one" without a sentinel; memory is spelled
+	// the same way now, and the two existence checks became one field access.
+	pub memory: Option<MemoryType>,
 	// The declared maximum, when the module states one. Parsed and thrown away until 2026-08-12,
 	// which is why `memory.grow` could not honour it.
-	pub memory_max_pages: Option<u32>,
 	pub globals: Vec<Global>,
 	pub data: Vec<DataSegment>,
 	pub table: Option<Table>,
@@ -129,5 +142,19 @@ impl Module {
 	// The combined index of an exported function, by name.
 	pub fn export_func(&self, name: &str) -> Option<u32> {
 		self.exports.iter().find(|e: &&Export| e.kind == ExportKind::Func && e.name == name).map(|e: &Export| e.index)
+	}
+}
+
+// One value type from its binary byte, shared by the section parser and the body decoder.
+//
+// The decoder needed it for the typed `select`'s annotation, which it had been reading and throwing
+// away - and a second copy of this table is how the two come to disagree about what `0x7c` is.
+pub fn val_type_of(b: u8) -> Option<ValType> {
+	match b {
+		0x7f => Some(ValType::I32),
+		0x7e => Some(ValType::I64),
+		0x7d => Some(ValType::F32),
+		0x7c => Some(ValType::F64),
+		_ => None,
 	}
 }

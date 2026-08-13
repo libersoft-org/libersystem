@@ -46,6 +46,26 @@ impl EchoBuf {
 	}
 }
 
+// Write `value` as decimal digits at the front of `out`, returning how many bytes it took. The
+// caller sizes `out` for the largest value it can pass; a screen coordinate needs five.
+fn write_decimal(out: &mut [u8], mut value: usize) -> usize {
+	let mut digits: [u8; 20] = [0; 20];
+	let mut len: usize = 0;
+	loop {
+		digits[len] = b'0' + (value % 10) as u8;
+		len += 1;
+		value /= 10;
+		if value == 0 || len == digits.len() {
+			break;
+		}
+	}
+	let n: usize = len.min(out.len());
+	for i in 0..n {
+		out[i] = digits[len - 1 - i];
+	}
+	n
+}
+
 // The echo sink: line-edit feedback renders live to the VT's cell grid (if any) and is
 // collected for the serial mirror.
 pub struct Echo<'a> {
@@ -61,6 +81,88 @@ impl Echo<'_> {
 			}
 		}
 		self.ser.push(bytes);
+	}
+
+	// Bytes for the LOCAL GRID ONLY - an absolute cursor address, which is meaningful against a
+	// screen whose geometry and contents we can read and meaningless on the mirror, where the far
+	// end has its own size and its own idea of what is on it.
+	fn put_screen(&mut self, bytes: &[u8]) {
+		if let Some(t) = &mut self.term {
+			for &b in bytes {
+				t.screen.put_byte(b);
+			}
+		}
+	}
+
+	// Address a cell on the local grid (one-based CUP, as the wire encodes it).
+	fn cup(&mut self, row: usize, col: usize) {
+		let mut out: [u8; 16] = [0; 16];
+		let mut n: usize = 0;
+		out[n] = 0x1b;
+		n += 1;
+		out[n] = b'[';
+		n += 1;
+		n += write_decimal(&mut out[n..], row + 1);
+		out[n] = b';';
+		n += 1;
+		n += write_decimal(&mut out[n..], col + 1);
+		out[n] = b'H';
+		n += 1;
+		let seq: [u8; 16] = out;
+		self.put_screen(&seq[..n]);
+	}
+
+	// Move the caret `n` columns left. Returns false when the local grid could not go that far
+	// because the target is above the top of the screen - the caller then repaints instead.
+	//
+	// THE MIRROR ALWAYS GETS `n` BACKSPACES, which is the encoding it has always got and the only
+	// one that makes sense to a terminal we cannot see. The local grid gets an ABSOLUTE address: it
+	// is the half where "a backspace always moves" was false. Once the first row of a long command
+	// line has scrolled into the scrollback, the reverse-wrap backspace has no row above it to step
+	// onto and stops - and the editor, which counts the backspaces it emits, carried on believing
+	// the caret had moved. From then on `Ld.cursor` and the caret disagreed and every later edit was
+	// drawn in the wrong place.
+	// Erase `n` columns to the left of the caret, leaving the caret where they started.
+	//
+	// THE MIRROR GETS THE CLASSIC `BS SP BS` PER COLUMN and the local grid gets one absolute move
+	// plus an erase-to-end-of-display, for the same reason `move_left` splits: walking backwards
+	// works only while there is a row above to walk onto. Returns false when the local grid could
+	// not walk that far, and the caller repaints.
+	fn erase_left(&mut self, n: usize) -> bool {
+		for _ in 0..n {
+			self.ser.push(b"\x08 \x08");
+		}
+		if self.term.is_none() {
+			return true;
+		}
+		let moved: bool = self.move_left_screen(n);
+		if moved {
+			self.put_screen(b"\x1b[J");
+		}
+		moved
+	}
+
+	// The local-grid half of `move_left`, with no mirror bytes.
+	fn move_left_screen(&mut self, n: usize) -> bool {
+		let Some(t) = &mut self.term else {
+			return true;
+		};
+		let cols: usize = t.screen.cols().max(1);
+		let here: usize = t.screen.caret_index();
+		if n > here {
+			return false;
+		}
+		let target: usize = here - n;
+		self.cup(target / cols, target % cols);
+		true
+	}
+
+	fn move_left(&mut self, n: usize) -> bool {
+		for _ in 0..n {
+			self.ser.push(b"\x08");
+		}
+		// No local grid: nothing to contradict the count, and the far end owns the outcome.
+		self.move_left_screen(n)
 	}
 }
 
@@ -415,13 +517,16 @@ impl Ld {
 	}
 
 	fn home(&mut self, e: &mut Echo) {
-		if self.echo {
-			// CELLS, NOT BYTES. `self.cursor` is a byte offset, so `cau` with an accent - four
-			// bytes, three cells - moved the cursor four columns and left the caret a column left
-			// of where the text starts, inside the prompt.
-			self.move_left(self.columns(0, self.cursor), e);
-		}
+		// CELLS, NOT BYTES. `self.cursor` is a byte offset, so `cau` with an accent - four bytes,
+		// three cells - moved the cursor four columns and left the caret a column left of where the
+		// text starts, inside the prompt.
+		let columns: usize = self.columns(0, self.cursor);
+		// THE BUFFER MOVES FIRST. `move_left` may end in a repaint, and the repaint prints the line
+		// from the cursor - so the cursor has to be where the caret is going before it runs.
 		self.cursor = 0;
+		if self.echo {
+			self.move_left(columns, e);
+		}
 	}
 
 	fn end(&mut self, e: &mut Echo) {
@@ -431,10 +536,65 @@ impl Ld {
 		self.cursor = self.len;
 	}
 
+	// Move the caret `n` columns left, and REPAINT when the terminal cannot go that far.
+	//
+	// The reverse-wrap backspace steps onto the previous physical row only while there IS one:
+	// once a command line is long enough that its first row has scrolled into the scrollback, the
+	// caret reaches the top-left and stops. This walked it backwards anyway and set `self.cursor`
+	// regardless, so the buffer and the screen diverged by however many backspaces the screen
+	// swallowed and every later edit was drawn in the wrong place.
 	fn move_left(&self, n: usize, e: &mut Echo) {
-		for _ in 0..n {
-			e.put(b"\x08");
+		if e.move_left(n) {
+			return;
 		}
+		self.repaint(e);
+	}
+
+	// Reprint the line from the cursor at the top-left of the screen.
+	//
+	// Reached only when a leftward move ran off the top, which means the line is longer than the
+	// viewport and has ALREADY filled it - so this overwrites the line's own cells rather than
+	// anybody else's. The caret ends where the buffer cursor is, which is the property the walking
+	// version could not hold, and the text after it follows down the screen for as far as there is
+	// screen. It is the same answer `replace_line` gives for Ctrl+U - reprint rather than seek -
+	// applied to the case where seeking is not possible at all.
+	fn repaint(&self, e: &mut Echo) {
+		let Some(t) = &e.term else {
+			// No local grid: the far end owns its own caret and there is nothing here to repaint.
+			return;
+		};
+		let cols: usize = t.screen.cols().max(1);
+		let fits: usize = cols * t.screen.rows().max(1);
+		// ONE ROW OF CONTEXT BEFORE THE CURSOR when there is any, so the window does not open
+		// exactly on the caret and hide the character just typed. The caret then lands at the start
+		// of the second row rather than the top-left, which is also where a naturally scrolled line
+		// would have put it.
+		let back: usize = self.columns(0, self.cursor).min(cols);
+		let mut start: usize = self.cursor;
+		for _ in 0..back {
+			start = self.char_start(start.saturating_sub(1));
+		}
+		e.cup(0, 0);
+		// Clear first, from the top-left, so nothing of the old rendering survives below the
+		// reprint - and so the reprint may fill the screen exactly without the erase eating its
+		// last cell.
+		e.put_screen(b"\x1b[J");
+		let mut end: usize = start;
+		let mut columns: usize = 0;
+		while end < self.len && columns < fits {
+			end += 1;
+			while end < self.len && self.line[end] & 0xc0 == 0x80 {
+				end += 1;
+			}
+			columns += 1;
+		}
+		let tail: &[u8] = &self.line[start..end];
+		if let Some(t) = &mut e.term {
+			for &b in tail {
+				t.screen.put_byte(b);
+			}
+		}
+		e.cup(back / cols, back % cols);
 	}
 
 	// Ctrl+U: erase the whole line.
@@ -453,22 +613,30 @@ impl Ld {
 	}
 
 	fn replace_line(&mut self, new: &[u8], e: &mut Echo) {
+		let mut repaint: bool = false;
 		if self.echo {
 			e.put(&self.line[self.cursor..self.len]);
 			// CELLS, NOT BYTES. This erased `self.len` times, so Ctrl+U or a history recall over a
 			// line containing any multi-byte character erased past the start of the line and into
 			// the prompt - one extra backspace-space-backspace per continuation byte.
-			for _ in 0..self.columns(0, self.len) {
-				e.put(b"\x08 \x08");
-			}
+			//
+			// And it walked backwards, which a line longer than the viewport cannot do: the caret
+			// stops at the top-left and the erase then chewed through whatever was there instead.
+			repaint = !e.erase_left(self.columns(0, self.len));
 		}
 		let n = new.len().min(LD_LINE_MAX);
 		self.line[..n].copy_from_slice(&new[..n]);
 		self.len = n;
-		self.cursor = n;
+		self.cursor = 0;
 		if self.echo {
+			if repaint {
+				// The old line ran off the top of the screen, so there is no start of it to erase
+				// back to: put the new one at the top-left and start again from there.
+				self.repaint(e);
+			}
 			e.put(&self.line[..n]);
 		}
+		self.cursor = n;
 	}
 
 	fn history_prev(&mut self, e: &mut Echo) {

@@ -232,6 +232,25 @@ while IFS=$'\t' read -r owner path; do
 	fi
 done <"$source_rows"
 
+# A SLICE OVER A LITERAL ADDRESS, which is undefined behaviour however carefully it is unread.
+#
+# `src/abi`'s own test built one to prove the package writer refuses an oversized file:
+#
+#     let huge = unsafe { core::slice::from_raw_parts(1 as *const u8, MAX_FILE_BYTES + 1) };
+#
+# under a comment reasoning that a slice whose length is all anybody reads needs no memory behind it.
+# Constructing the reference IS the contract - the whole range must be valid, initialised and owned
+# for its lifetime - so the block had already broken it before the callee ran. It was in the suite
+# whose subject is what the ABI guarantees, which is the worst place in the tree for one.
+#
+# The fix was to make the rule callable (`bootstrap::entry_fits`) and test it by calling it. This
+# stops the shape coming back, which is the half a fix cannot do for itself.
+if git grep --untracked -nE '^[^/*]*[^/*[:space:]].*from_raw_parts(_mut)?\(\s*[0-9]' -- '*.rs' >/dev/null; then
+	echo "source-hygiene: a slice constructed over a literal address - the range must be valid memory, not merely unread:" >&2
+	git grep --untracked -nE '^[^/*]*[^/*[:space:]].*from_raw_parts(_mut)?\(\s*[0-9]' -- '*.rs' >&2
+	exit 1
+fi
+
 if [[ "$mode" == --history ]]; then
 	historical="$(git rev-list --objects HEAD | awk 'NF > 1 {sub(/^[^ ]+ /, ""); print}' | grep -E "$path_pattern" | sort -u || true)"
 	if [[ -n "$historical" ]]; then

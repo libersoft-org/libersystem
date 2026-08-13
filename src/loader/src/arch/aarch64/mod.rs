@@ -247,7 +247,10 @@ fn load_kernel(kernel: &[u8], reserved: &crate::ReservedKernel) -> u64 {
 		// The segment's physical span (page-aligned), which `reserve_kernel` staked before any of
 		// the opportunistic allocations so the firmware would still have it here.
 		let base = align_down(ph.p_paddr, PAGE_SIZE);
-		let pages = (ph.p_paddr - base + ph.p_memsz).div_ceil(PAGE_SIZE);
+		// The SAME expression `reserve_kernel` uses, and it has to be: `owns` below compares this
+		// against what that recorded, so a difference between the two - including a difference in
+		// how they overflow - would make the ownership check compare two wrong numbers and agree.
+		let pages = (ph.p_paddr - base).checked_add(ph.p_memsz).expect("a segment whose physical end wraps is refused by the parser").div_ceil(PAGE_SIZE);
 		// ASK THE RESERVATION, NOT THE FIRMWARE. A second `AllocateAddress` here returns the same
 		// `NOT_FOUND`/`NOT_AVAILABLE` whether the owner is this loader or the firmware, a runtime
 		// service or a device - so its status could not be interpreted, was discarded, and the

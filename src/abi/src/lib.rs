@@ -480,8 +480,19 @@ pub struct DeviceInfo {
 	// vendor-defined number, which is what P02M0098 exists to stop: standard class/subclass/
 	// interface is how a driver claims a FAMILY of hardware rather than one model.
 	//
-	// These three occupy the byte that was `_pad` plus the two the struct's tail alignment already
-	// held, so nothing before them moves.
+	// THE STRUCT GREW: 40 bytes to 48, and the comment here used to say it did not.
+	//
+	// It claimed these three "occupy the byte that was `_pad` plus the two the struct's tail
+	// alignment already held". There was no tail padding to use - 40 is already 8-aligned, so the
+	// old layout ended exactly at `_pad` - and three bytes past `func` take the struct to 42, which
+	// rounds to 48. Nothing BEFORE them moves, which is the half that was true.
+	//
+	// The layout assertion is what caught it, by failing on the size rather than on the offsets:
+	// this is the test doing the job it was reopened to do, on the change that landed next.
+	//
+	// It is an ABI change and it is permitted here for the reason the whole file states: nothing is
+	// versioned before the first final release, and kernel and userspace are built and shipped
+	// together, with `ABI_VERSION` refusing a stale artifact at startup if they ever are not.
 	pub class: u8,
 	pub subclass: u8,
 	pub prog_if: u8,

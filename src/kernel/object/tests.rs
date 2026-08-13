@@ -444,10 +444,81 @@ fn a_table_torn_down_mid_transfer_does_not_hand_the_slot_out_twice() {
 	assert_ne!(fresh.raw(), moving.raw(), "close_all must not hand out a slot with a transfer in flight");
 	assert!(table.lookup(fresh, Rights::READ).is_ok(), "the fresh handle is live");
 
-	// And the transfer can still end the way it promised to.
+	// And the transfer ends, WITHOUT reviving a handle in a table that has been torn down.
+	//
+	// This used to assert the opposite - that the capability came back reachable at its own handle -
+	// and that was `close_all` failing to be the terminal barrier its name implies: the process had
+	// finished tearing down, and an object was then put back into its table and held alive there
+	// until the last reference to the `Process` went. A delayed release rather than a leak, and
+	// still not what "closed" should mean.
 	table.restore_taken(moving, cap);
-	assert!(table.lookup(moving, Rights::READ).is_ok(), "the restored capability is reachable at its own handle");
+	assert!(table.lookup(moving, Rights::READ).is_err(), "a closed table takes nothing back");
 	assert!(table.lookup(keep, Rights::READ).is_err(), "everything else was closed");
+
+	// The reservation is resolved either way, so the slot is not left in the state that has no exit:
+	// reserved, empty, and skipped by everything.
+	let after = table.insert_object(TestObject::new(4), Rights::ALL, 0);
+	assert!(table.lookup(after, Rights::READ).is_ok(), "the table still works after the transfer ended");
+}
+
+crate::tagged_test!(a_transfer_that_can_no_longer_be_resolved_gives_the_slot_back, [Handle, Object, Kernel], id = "kernel.object.handle.a_transfer_that_can_no_longer_be_resolved_gives_the_slot_back", covers = ["kernel"]);
+fn a_transfer_that_can_no_longer_be_resolved_gives_the_slot_back() {
+	// `take_for_transfer` promises that exactly one of `commit_taken`/`restore_taken` follows, and
+	// `sys_thread_create` had a path that could reach NEITHER: the capability was destroyed inside
+	// the child by a racing `terminate`, so there was nothing to restore, and the slot stayed
+	// `reserved: true` with `cap: None` - not on the free list, never committed, skipped by
+	// `close_all` forever, and one unit of handle quota short. `abandon_taken` is the third outcome.
+	let domain = crate::object::domain::Domain::root();
+	let mut table = HandleTable::new();
+	table.set_domain(domain.clone());
+	let before = domain.account().handles().used();
+	let moving = table.insert_object(TestObject::new(1), Rights::ALL, 0);
+	assert_eq!(domain.account().handles().used(), before + 1, "the handle is charged");
+	let cap = table.take_for_transfer(moving, Rights::TRANSFER).expect("taken for transfer");
+	drop(cap); // the capability is gone: neither party has it, which is the case with no outcome
+
+	table.abandon_taken(moving);
+	assert_eq!(domain.account().handles().used(), before, "the quota comes back");
+	assert!(table.lookup(moving, Rights::READ).is_err(), "and the handle value is dead");
+	// The slot is back in circulation rather than stranded - the whole cost of the missing outcome.
+	let reused = table.insert_object(TestObject::new(2), Rights::ALL, 0);
+	assert_eq!(reused.raw() as u32, moving.raw() as u32, "the slot is reusable again");
+	assert_ne!(reused.raw(), moving.raw(), "under a new generation, so the old value stays dead");
+}
+
+crate::tagged_test!(one_device_holds_one_msi_slot, [Object, Kernel], id = "kernel.object.one_device_holds_one_msi_slot", covers = ["kernel"]);
+fn one_device_holds_one_msi_slot() {
+	use crate::arch::common::msi::MsiRegistry;
+	// The registry answered "is this SLOT free" and never "does this owner already hold one". Every
+	// backend programs the device's MSI-X table ENTRY 0 for whatever slot it was given, so two live
+	// acquisitions for one device produce two vectors and two registry slots pointing at one hardware
+	// entry - which then carries the second vector, leaving the first `Interrupt` bound to a vector
+	// the device will never raise and its later `unbind` masking the entry the second is live on.
+	//
+	// `has_live` is the question; `sys_device_msix_acquire` is where it is asked, because the
+	// registry is the mechanism and the kernel's own bring-up test uses it directly on a device the
+	// booted system has already claimed.
+	let registry: MsiRegistry<4> = MsiRegistry::new();
+	assert!(!registry.has_live(7), "a fresh registry holds nothing for anybody");
+	let first = registry.acquire(7, 4).expect("a free slot for device 7");
+	assert!(registry.has_live(7), "and the device holds one now");
+	assert!(!registry.has_live(8), "which says nothing about another device");
+
+	// A RETIRED slot does not count. Its `Interrupt` is gone; what the pending state protects is that
+	// no NEW owner is given that VECTOR while a message for it may still be in flight - a fact about
+	// the slot, not about the device. A driver restarting on the same device reprograms its own
+	// entry 0, which is what should happen, and refusing that broke the xHCI bring-up path when this
+	// rule was first written into the registry.
+	registry.retire(first);
+	assert!(!registry.has_live(7), "a pending slot is not a live claim");
+	let restarted = registry.acquire(7, 4).expect("a restarting driver takes a fresh slot");
+	assert_ne!(restarted, first, "a different slot: the retired one is still waiting for its quiesce");
+	assert!(registry.has_live(7), "and that one is live");
+
+	// And the quiesce is what puts the retired slot back.
+	assert_eq!(registry.release_for_device(7), 1, "the device's quiesce releases its pending vector");
+	registry.free(restarted);
+	assert!(!registry.has_live(7), "with nothing left, the device holds nothing");
 }
 
 crate::tagged_test!(a_returned_message_is_still_charged_to_the_sender, [Channel, Object, Kernel], id = "kernel.object.channel.a_returned_message_is_still_charged_to_the_sender", covers = ["kernel"]);
@@ -467,14 +538,60 @@ fn a_returned_message_is_still_charged_to_the_sender() {
 	let charged = domain.account().ipc_queue().used();
 	assert_eq!(charged, before + bytes, "the sender is charged for what is queued");
 
-	// Take it off the queue the way a receive does, and put it back without committing.
-	let message = b.recv().expect("the message is there to take");
+	// Take it off the queue the way the TRANSACTIONAL receive does - the one the syscall uses, and
+	// the only one `return_to_head` is ever paired with - and put it back without committing.
+	//
+	// It used to be written with `Channel::recv`, which reads the same and is not the same call:
+	// that one has no rollback and no put-back, so it commits as it dequeues. Testing the rule
+	// through the wrong receive is what let the other one keep a charge nobody released.
+	let (id, _, _) = b.peek_identified().expect("the message is there to peek at");
+	let Ok(message) = b.recv_identified(id, usize::MAX, abi::MAX_MESSAGE_CAPS) else {
+		panic!("the message is there to take");
+	};
 	assert_eq!(domain.account().ipc_queue().used(), charged, "taking a message off the queue does not refund it - delivery has not committed");
 	b.return_to_head(message);
 	assert_eq!(domain.account().ipc_queue().used(), charged, "a returned message is still accounted for");
 
 	// And committing releases it exactly once.
-	let mut message = b.recv().expect("still there");
-	message.release_queue_charge();
+	let (id, _, _) = b.peek_identified().expect("still there to peek at");
+	let Ok(mut message) = b.recv_identified(id, usize::MAX, abi::MAX_MESSAGE_CAPS) else {
+		panic!("still there");
+	};
+	b.commit_delivery(&mut message);
 	assert_eq!(domain.account().ipc_queue().used(), before, "a committed delivery releases the charge");
+	drop(message);
+	assert_eq!(domain.account().ipc_queue().used(), before, "and dropping it afterwards does not refund it twice");
+}
+
+crate::tagged_test!(the_committed_receive_refunds_what_it_takes, [Channel, Object, Kernel], id = "kernel.object.channel.the_committed_receive_refunds_what_it_takes", covers = ["kernel"]);
+fn the_committed_receive_refunds_what_it_takes() {
+	use crate::object::channel::{Channel, Message};
+	use crate::object::domain::Domain;
+	// `Channel::recv` has no rollback and no put-back: the message leaves with the caller, so the
+	// dequeue IS the point of no return. When the charge moved to the delivery commit, this path
+	// was left with no commit at all - so every message the kernel read this way left its sender's
+	// Domain charged for bytes queued nowhere. The kernel reads the boot-chain reports and the
+	// crash channel exactly like this, in a loop.
+	let domain = Domain::root();
+	let (a, b) = Channel::create();
+	let before = domain.account().ipc_queue().used();
+	for _ in 0..16 {
+		a.send_charged(Message::new(alloc::vec![7u8; 64], alloc::vec::Vec::new(), 0), &domain).expect("the send is accepted and charged");
+	}
+	assert_eq!(domain.account().ipc_queue().used(), before + 16 * 64, "the sender is charged for what is queued");
+	while let Ok(message) = b.recv() {
+		drop(message);
+	}
+	assert_eq!(domain.account().ipc_queue().used(), before, "a kernel-side drain returns the quota it consumed");
+
+	// And the structural half: a message dropped without any explicit release refunds itself, so no
+	// future path can lose a charge by returning early.
+	a.send_charged(Message::new(alloc::vec![7u8; 64], alloc::vec::Vec::new(), 0), &domain).expect("charged again");
+	let (id, _, _) = b.peek_identified().expect("queued");
+	let Ok(taken) = b.recv_identified(id, usize::MAX, abi::MAX_MESSAGE_CAPS) else {
+		panic!("taken transactionally, and never committed");
+	};
+	assert_eq!(domain.account().ipc_queue().used(), before + 64, "still charged while it is in flight");
+	drop(taken);
+	assert_eq!(domain.account().ipc_queue().used(), before, "and refunded when it dies uncommitted");
 }

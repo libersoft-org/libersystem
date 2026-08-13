@@ -283,6 +283,19 @@ impl<'a> Elf<'a> {
 				continue;
 			}
 			// More file bytes than memory to put them in.
+			// THE PHYSICAL END, bounded once here rather than at each of the three places that
+			// compute it.
+			//
+			// `p_filesz > p_memsz` was checked and every FILE offset was `checked_add`, and nothing
+			// bounded `p_paddr + p_memsz` - which `reserve_kernel`, the aarch64 placement and the
+			// riscv64 staging all compute, in release builds, silently. `p_paddr =
+			// 0xffff_ffff_ffff_f000` with `p_memsz = 0x3000` wraps in all three.
+			//
+			// Here, before any backend sees the header, is the only version of this that a fourth
+			// backend cannot forget.
+			if ph.p_paddr.checked_add(ph.p_memsz).is_none() {
+				return None;
+			}
 			if ph.p_filesz > ph.p_memsz {
 				return None;
 			}

@@ -83,6 +83,25 @@ pub fn parse_list(bytes: &[u8]) -> Option<Vec<Row<'_>>> {
 // `as u32` plus unchecked offset arithmetic meant a large enough set produced an archive whose
 // table pointed somewhere other than its data, which the kernel would then read as whatever
 // happened to be there. Anything that would not describe itself correctly is refused instead.
+// Would an entry of these two sizes fit the format? The size half of `build_package`'s rule, split
+// out so it can be TESTED by calling it.
+//
+// The test for the per-file ceiling used to build the oversized argument out of thin air:
+//
+//     let huge = unsafe { core::slice::from_raw_parts(1 as *const u8, MAX_FILE_BYTES + 1) };
+//
+// under a comment saying "the limit is checked from the slice's length, so a slice that claims the
+// length is enough to prove the check runs". That is the part that is wrong. A `&[u8]` requires its
+// whole range to be valid, initialised memory owned by the program for the reference's lifetime -
+// not merely to go unread - so the `unsafe` block had already broken its contract before
+// `build_package` was entered, whatever the callee then did. Undefined behaviour inside the suite
+// whose subject is what the ABI guarantees.
+//
+// A function that takes two lengths is provable by calling it, which is what a limit wants.
+pub fn entry_fits(name_len: usize, data_len: usize, total_so_far: usize) -> bool {
+	name_len <= crate::PKG_NAME_LEN && data_len <= MAX_FILE_BYTES && total_so_far.checked_add(data_len).is_some_and(|total| total <= MAX_TOTAL_BYTES)
+}
+
 pub fn build_package(entries: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
 	if entries.is_empty() || entries.len() > MAX_ENTRIES {
 		return None;
@@ -98,13 +117,10 @@ pub fn build_package(entries: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
 		if entries[..index].iter().any(|(earlier, _)| earlier == name) {
 			return None;
 		}
-		if bytes.len() > MAX_FILE_BYTES {
+		if !entry_fits(name.len(), bytes.len(), total) {
 			return None;
 		}
 		total = total.checked_add(bytes.len())?;
-		if total > MAX_TOTAL_BYTES {
-			return None;
-		}
 	}
 	let table = PKG_ENTRY_LEN.checked_mul(entries.len())?.checked_add(PKG_HEADER_LEN)?;
 	let mut out: Vec<u8> = Vec::new();

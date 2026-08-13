@@ -23,6 +23,11 @@ impl BlockDevice for MemDisc {
 }
 
 // Write a both-endian u32 (LE then BE) at `off`, as ISO9660 stores its extent fields.
+fn both16(buf: &mut [u8], off: usize, v: u16) {
+	buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+	buf[off + 2..off + 4].copy_from_slice(&v.to_be_bytes());
+}
+
 fn both32(buf: &mut [u8], off: usize, v: u32) {
 	buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 	buf[off + 4..off + 8].copy_from_slice(&v.to_be_bytes());
@@ -88,6 +93,15 @@ fn build_iso(joliet: bool) -> Vec<u8> {
 	pvd[1..6].copy_from_slice(b"CD001");
 	pvd[6] = 1;
 	both32(&mut pvd, 80, 23); // volume space size: the whole 23-block image
+	// THE VOLUME SET, which the builder left as zeros - and zero is not a legal set size or
+	// sequence number. The parser now reads both, so the fixture has to be a shape a mastering tool
+	// actually produces: a set of one, and this volume is the first of it.
+	//
+	// The same lesson this milestone is named for, one field further on: a builder that writes media
+	// nothing produces lets an internal round trip agree with itself while the format says
+	// otherwise.
+	both16(&mut pvd, 120, 1); // volume set size
+	both16(&mut pvd, 124, 1); // volume sequence number
 	pvd[128..130].copy_from_slice(&2048u16.to_le_bytes());
 	pvd[130..132].copy_from_slice(&2048u16.to_be_bytes());
 	pvd[156..156 + record(root_lba, SECTOR_SIZE as u32, true, &[0]).len()].copy_from_slice(&record(root_lba, SECTOR_SIZE as u32, true, &[0]));
@@ -432,6 +446,46 @@ fn iso_with_susp(announce_rrip: bool, nm: &[u8]) -> Vec<u8> {
 
 // The same, with the `ER` identifier chosen: an extension this reader does not implement must not
 // switch the name source, because reading somebody else's `NM` is the guess the check removes.
+// A SUSP area whose `ER` lives BEHIND a Continuation Entry, which is what `xorriso` writes: `SP`,
+// `PX` and `TF` fill the 255-byte record, so the `ER` naming the extension goes into a continuation
+// block. The parser has to follow the `CE` to find it.
+fn iso_with_susp_behind_ce(nm: &[u8]) -> Vec<u8> {
+	let mut img = build_iso(false);
+	// Block 22 is WORLD.TXT's data in the base image and nothing in this fixture reads it, so it is
+	// free to be the continuation area.
+	let ce_block = 22u32;
+	let mut dot = record(19, SECTOR_SIZE as u32, true, &[0]);
+	let mut sys: Vec<u8> = alloc::vec![b'S', b'P', 7, 1, 0xBE, 0xEF, 0];
+	let mut ce = alloc::vec![b'C', b'E', 28, 1];
+	for (lo, hi) in [(ce_block, ce_block), (0, 0), (32, 32)] {
+		ce.extend_from_slice(&lo.to_le_bytes());
+		ce.extend_from_slice(&hi.to_be_bytes());
+	}
+	sys.extend_from_slice(&ce);
+	dot.extend_from_slice(&sys);
+	dot[0] = dot.len() as u8;
+
+	// The continuation area itself: the `ER` this reader is looking for.
+	let id: &[u8] = b"RRIP_1991A";
+	let mut area = alloc::vec![b'E', b'R', (8 + id.len()) as u8, 1, id.len() as u8, 0, 0, 1];
+	area.extend_from_slice(id);
+	let at = ce_block as usize * SECTOR_SIZE;
+	img[at..at + area.len()].copy_from_slice(&area);
+
+	// An ordinary record whose system-use area carries the NM under test.
+	let file_id: &[u8] = b"X.TXT;1";
+	let mut file = record(21, 9, false, file_id);
+	file.extend_from_slice(nm);
+	if file.len() % 2 == 1 {
+		file.push(0);
+	}
+	file[0] = file.len() as u8;
+
+	let root = dir_block(&[dot, record(19, SECTOR_SIZE as u32, true, &[1]), file]);
+	img[19 * SECTOR_SIZE..19 * SECTOR_SIZE + root.len()].copy_from_slice(&root);
+	img
+}
+
 fn iso_with_susp_id(extension: Option<&[u8]>, nm: &[u8]) -> Vec<u8> {
 	// The root block is REBUILT rather than patched: growing the "." record in place would push it
 	// over the records that follow, and the walk would read the wreckage instead of the fixture.
@@ -690,4 +744,150 @@ fn an_image_from_an_independent_tool_lists_and_reads_back() {
 	let read = fs.read_file_into(b"A-Long.Name.txt", 9, &mut window).expect("a ranged read");
 	assert_eq!(&window[..read], b"by xorri", "byte 9 onwards, from a real disc");
 	assert_eq!(fs.read_file_into(b"sub/nested.txt", 1000, &mut window), Ok(0), "past the end reads nothing");
+}
+
+#[test]
+fn a_volume_set_of_zero_is_refused_and_so_is_the_descriptors_own_sequence() {
+	// `> 1` admitted zero, which is not a legal set size: a volume belongs to a set of at least
+	// itself. And the DESCRIPTOR's own sequence number - which says which volume of the set this is
+	// - was the one sequence number nothing read, while the root record's and every ordinary
+	// record's were checked.
+	for (name, off, value) in [("a set of no volumes", 120usize, 0u16), ("a set of two", 120, 2), ("the second volume of the set", 124, 2), ("volume zero", 124, 0)] {
+		let mut img = build_iso(false);
+		let pvd = 16 * SECTOR_SIZE;
+		img[pvd + off..pvd + off + 2].copy_from_slice(&value.to_le_bytes());
+		img[pvd + off + 2..pvd + off + 4].copy_from_slice(&value.to_be_bytes());
+		assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "{name} is refused before anything is read");
+	}
+}
+
+#[test]
+fn the_ranged_read_refuses_the_extent_the_whole_file_read_refuses() {
+	// One record, two APIs, two answers. `read_extent` bounded the whole extent against the volume;
+	// `read_file_into` checked only the block it was about to read, so a file whose extent runs off
+	// the end of the volume was refused by `read_file` and partly readable through the ranged
+	// reader - which is the API a caller reaches for precisely when the file is large.
+	let mut img = build_iso(false);
+	// HELLO.TXT sits at LBA 21 in a 23-block image. Declare a size that needs blocks 21..24.
+	let root = 19 * SECTOR_SIZE;
+	let mut at = root;
+	while at < root + SECTOR_SIZE {
+		let len = img[at] as usize;
+		if len == 0 {
+			break;
+		}
+		let lba = u32::from_le_bytes(img[at + 2..at + 6].try_into().unwrap());
+		if lba == 21 {
+			let huge = (3 * SECTOR_SIZE) as u32;
+			img[at + 10..at + 14].copy_from_slice(&huge.to_le_bytes());
+			img[at + 14..at + 18].copy_from_slice(&huge.to_be_bytes());
+			break;
+		}
+		at += len;
+	}
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("the volume still mounts");
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Invalid), "the whole-file read refuses an extent past the volume");
+	let mut one = [0u8; 1];
+	assert_eq!(fs.read_file_into(b"HELLO.TXT", 0, &mut one), Err(FsError::Invalid), "and so does the ranged read, for the same record");
+}
+
+#[test]
+fn a_continuation_entry_whose_halves_disagree_is_not_followed() {
+	// `CE` carries three both-endian pairs and this reader read the little half of each, under a
+	// comment saying that is what it does everywhere. It is what it does nowhere else: `both32` and
+	// `both16` refuse unless the halves agree, at eight other sites. The pointer decides where Rock
+	// Ridge is looked for, so a disc whose two copies disagree gets to choose what every file on it
+	// is called.
+	//
+	// The fixture puts the `ER` behind a `CE`, which is what a real mastering tool does and what the
+	// xorriso image found - then breaks the CE's big half. With the continuation not followed, no
+	// `ER` is seen, Rock Ridge is not announced, and the 8.3 name stands.
+	let nm: Vec<u8> = [b"NM".as_slice(), &[9, 1, 0], b"real"].concat();
+	let mut img = iso_with_susp_behind_ce(&nm);
+	let root = 19 * SECTOR_SIZE;
+	let dot_len = img[root] as usize;
+	let ce_at = img[root..root + dot_len].windows(2).position(|w| w == b"CE").map(|i| root + i).expect("the fixture's CE");
+	// Both halves agree in the fixture; break the BIG one, which is the half that was never read.
+	img[ce_at + 8..ce_at + 12].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(!names.contains(&"real".to_string()), "a continuation whose halves disagree is not followed: {names:?}");
+	assert!(names.iter().any(|n| n == "X.TXT"), "and the 8.3 name stands instead: {names:?}");
+
+	// The same fixture UNBROKEN still finds the name, or the assertion above proves nothing.
+	let mut fs = Iso9660::mount(MemDisc { data: iso_with_susp_behind_ce(&nm) }).expect("mount");
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(names.contains(&"real".to_string()), "the intact fixture announces Rock Ridge through the CE: {names:?}");
+}
+
+#[test]
+fn a_rock_ridge_name_that_cannot_be_trusted_falls_back_rather_than_being_assembled() {
+	// `rock_ridge_name` makes the fail-closed argument itself - "Falling back to the ISO9660
+	// identifier is a name the medium really carries; a truncated `NM` is not" - and returns `None`
+	// for `CE`, `CL`, `PL`, `RE` and a continued `NM` for exactly that reason. Two paths through the
+	// same function produced the truncated name anyway.
+	//
+	// A malformed entry mid-walk used to `break`, so whatever `NM` fragments had been collected were
+	// returned as the name. And an `NM` whose payload is not UTF-8 went through `unwrap_or("")`,
+	// contributing nothing and leaving the rest - a name assembled out of the parts that happened to
+	// decode.
+	for (label, nm) in [
+		// A valid NM followed by an entry whose declared length runs past the area.
+		("a truncated entry after a valid name", [b"NM".as_slice(), &[9, 1, 0], b"real", b"XX", &[200, 1]].concat()),
+		// A VALID FRAGMENT AND A BAD ONE, which is what makes this reach the decode's answer.
+		//
+		// A name made entirely of bad bytes decoded to "" under the old `unwrap_or("")` and then hit
+		// `if out.is_empty() { None }` - so it fell back anyway and the two versions agreed. The
+		// difference shows only where something valid has already been accumulated, which is exactly
+		// the partial name the function refuses `CE` for.
+		("a name assembled from the fragments that happened to decode", [b"NM".as_slice(), &[9u8, 1, 0], b"real", b"NM".as_slice(), &[9u8, 1, 0], &[0xff, 0xfe, 0xfd, 0xfc]].concat()),
+	] {
+		let mut fs = Iso9660::mount(MemDisc { data: iso_with_susp(true, &nm) }).expect("mount");
+		let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+		assert!(!names.contains(&"real".to_string()), "{label}: a prefix must not become the name: {names:?}");
+		assert!(names.iter().any(|n| n == "X.TXT"), "{label}: the 8.3 identifier stands instead: {names:?}");
+	}
+
+	// And the same fixture with an intact NM still reads it, or the assertions above prove only that
+	// the fixture is broken.
+	let good: Vec<u8> = [b"NM".as_slice(), &[9, 1, 0], b"real"].concat();
+	let mut fs = Iso9660::mount(MemDisc { data: iso_with_susp(true, &good) }).expect("mount");
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(names.contains(&"real".to_string()), "an intact NM is still read: {names:?}");
+}
+
+#[test]
+fn a_susp_entry_at_another_version_is_not_read_as_this_one() {
+	// Every SUSP entry carries a version and every entry this reader implements is version 1. The
+	// walker handed out `(signature, body)` and skipped the version byte entirely, so an entry with
+	// the same two letters and a different structure was read as though it were this one - which is
+	// what the `ST` check exists to stop, one field in.
+	let nm: Vec<u8> = [b"NM".as_slice(), &[9, 1, 0], b"real"].concat();
+	let mut img = iso_with_susp(true, &nm);
+	let root = 19 * SECTOR_SIZE;
+	let dot_len = img[root] as usize;
+	let er_at = img[root..root + dot_len].windows(2).position(|w| w == b"ER").map(|i| root + i).expect("the fixture's ER");
+	// The ER announces Rock Ridge; at another version it is a different structure and announces
+	// nothing, so the 8.3 name stands.
+	img[er_at + 3] = 2;
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(!names.contains(&"real".to_string()), "an ER at an unknown version announces nothing: {names:?}");
+}
+
+#[test]
+fn an_er_whose_declared_lengths_do_not_fit_announces_nothing() {
+	// `ER` is `LEN_ID, LEN_DES, LEN_SRC, EXT_VER` and then three variable fields. Only `LEN_ID` was
+	// read, so an entry carrying a real identifier and nonsense in the rest switched the whole
+	// disc's name source.
+	let nm: Vec<u8> = [b"NM".as_slice(), &[9, 1, 0], b"real"].concat();
+	let mut img = iso_with_susp(true, &nm);
+	let root = 19 * SECTOR_SIZE;
+	let dot_len = img[root] as usize;
+	let er_at = img[root..root + dot_len].windows(2).position(|w| w == b"ER").map(|i| root + i).expect("the fixture's ER");
+	// A description longer than the entry: the identifier is still there and still right.
+	img[er_at + 5] = 200;
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(!names.contains(&"real".to_string()), "an ER whose lengths do not fit its own entry announces nothing: {names:?}");
 }

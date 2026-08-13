@@ -74,6 +74,7 @@ pub fn set_cpu_count(count: usize) {
 	// (cortex-a72) the MPIDR affinity is the linear core index and the GICv2 SGI
 	// target list addresses CPU interface N for core N, so the id is the index.
 	if LAPIC_IDS.load(Ordering::Acquire).is_null() && count > 0 {
+		// ALLOC-OK: boot, the core id table, built during SMP bring-up
 		let mut ids: Vec<AtomicU32> = Vec::with_capacity(count);
 		for i in 0..count {
 			ids.push(AtomicU32::new(i as u32));
@@ -135,6 +136,7 @@ pub fn init(boot_info: &BootInfo) {
 	// BSP included - initializes its slot. Extra slots for any AP that fails to
 	// come online stay unused; ids are handed out contiguously as APs report in.
 	let total = lapics.len();
+	// ALLOC-OK: boot, as above
 	let mut ids: Vec<AtomicU32> = Vec::with_capacity(total);
 	ids.resize_with(total, || AtomicU32::new(0));
 	LAPIC_IDS.store(Vec::leak(ids).as_mut_ptr(), Ordering::Release);
@@ -274,6 +276,7 @@ fn udelay(us: u64) {
 // Allocate one application processor's kernel stack (16-aligned, leaked for the
 // lifetime of the system) and return its top.
 fn alloc_ap_stack() -> u64 {
+	// ALLOC-OK: boot, an AP's stack, allocated before that core starts
 	let stack: Box<[u128]> = vec![0u128; AP_STACK_WORDS].into_boxed_slice();
 	let base = Box::leak(stack).as_mut_ptr() as u64;
 	base + (AP_STACK_WORDS as u64 * 16)

@@ -42,12 +42,20 @@ impl<'a> Reader<'a> {
 		Ok(s)
 	}
 
-	// Unsigned LEB128, capped at 32 bits, and CANONICAL.
+	// Unsigned LEB128, capped at 32 bits - the WIDTH bound the specification states, and no more.
 	//
-	// The width was not checked, so a value could be encoded with redundant continuation bytes -
-	// two byte-level spellings of the same module, which matters the moment anything hashes or
-	// signs one. The specification requires the shortest encoding, so the final byte must carry a
-	// bit that a shorter encoding could not have held, and the bits above 32 must be zero.
+	// This refused a redundant trailing byte, under a comment saying "the specification requires the
+	// shortest encoding". It does not. The binary format's integer grammar restricts the encoding's
+	// LENGTH and nothing else, and its own note gives the example: `0x03` and `0x83 0x00` are both
+	// well-formed encodings of 3, as `0x7e` and `0xFE 0x7F` are both well-formed encodings of -2.
+	// Trailing zeros within the width bound are legal WebAssembly, and a test had been written to
+	// hold this parser to the opposite.
+	//
+	// The motivation was sound and survives elsewhere: two byte-level spellings of one module is a
+	// real problem for anything that hashes or signs. That is a LiberSystem packaging policy about
+	// which encodings this system will SHIP - a check over an image about to be signed - and not a
+	// fact about which modules are well-formed. Stating it here as the specification's rule is how a
+	// conformance defect acquired a regression test.
 	fn u32(&mut self) -> Result<u32, ParseError> {
 		let mut result: u32 = 0;
 		let mut shift: u32 = 0;
@@ -58,10 +66,6 @@ impl<'a> Reader<'a> {
 			}
 			result |= ((b & 0x7f) as u32) << shift;
 			if b & 0x80 == 0 {
-				// A continuation whose payload is zero is a longer spelling of a shorter value.
-				if shift > 0 && b == 0 {
-					return Err(ParseError("non-canonical LEB128: a redundant trailing byte"));
-				}
 				return Ok(result);
 			}
 			shift += 7;
@@ -71,7 +75,8 @@ impl<'a> Reader<'a> {
 		}
 	}
 
-	// Signed LEB128, sign-extended into 64 bits, and CANONICAL.
+	// Signed LEB128, sign-extended into 64 bits, bounded by WIDTH - see `u32` above for why a
+	// redundant sign byte is legal here.
 	//
 	// The signed case's redundant byte is `0x00` after a non-negative value or `0x7f` after a
 	// negative one: both re-state the sign bit the previous byte already carried.
@@ -80,12 +85,31 @@ impl<'a> Reader<'a> {
 		let mut shift: u32 = 0;
 		loop {
 			let b: u8 = self.byte()?;
+			// THE FINAL BYTE'S UNUSED BITS, which the width bound alone does not cover.
+			//
+			// A signed value of `n` bits has `ceil(n/7)` bytes, and the last one contributes only
+			// `n - 7*(ceil(n/7)-1)` meaningful bits - the rest must all be the sign. `s33` (a block
+			// type) and `s64` both end mid-byte, so a final byte whose top bits are neither all 0
+			// nor all 1 is an over-wide encoding rather than a large value. The specification calls
+			// these "integer too large" and "integer representation too long", and its own suite is
+			// what named them here.
+			if shift == 63 {
+				// Only ONE bit of the tenth byte is inside 64, so its seven payload bits must be
+				// all-zero (a positive value) or all-one (a negative one). Anything between carries
+				// bits past the width, which the specification calls "integer too large".
+				//
+				// Derived from the FINAL BYTE and not from the value so far: nine bytes of ones
+				// build a positive `i64` and the tenth is what makes it -1, so reading the running
+				// value here refused `i64.const -1` written in full - which the specification's own
+				// suite says is well-formed. The check is about the byte, not about what has been
+				// accumulated, and the suite is what said so.
+				if (b & 0x7f) != 0x00 && (b & 0x7f) != 0x7f {
+					return Err(ParseError("LEB128 signed value does not fit in 64 bits"));
+				}
+			}
 			result |= ((b & 0x7f) as i64) << shift;
 			shift += 7;
 			if b & 0x80 == 0 {
-				if shift > 7 && ((b == 0x00 && result >= 0) || (b == 0x7f && result < 0)) {
-					return Err(ParseError("non-canonical LEB128: a redundant sign byte"));
-				}
 				if shift < 64 && (b & 0x40) != 0 {
 					result |= -1i64 << shift;
 				}
@@ -106,13 +130,7 @@ impl<'a> Reader<'a> {
 }
 
 fn val_type(b: u8) -> Result<ValType, ParseError> {
-	match b {
-		0x7f => Ok(ValType::I32),
-		0x7e => Ok(ValType::I64),
-		0x7d => Ok(ValType::F32),
-		0x7c => Ok(ValType::F64),
-		_ => Err(ParseError("unsupported value type")),
-	}
+	crate::module::val_type_of(b).ok_or(ParseError("unsupported value type"))
 }
 
 // Parse a module's bytes into a [`Module`], or fail with the first error.
@@ -131,7 +149,17 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 	// have it SKIPPED by its declared size - which is correct for a custom section and wrong for
 	// every other kind, because skipping one means running a module whose declared contents were
 	// never read.
-	let mut last_id: u8 = 0;
+	// THE SPECIFICATION'S ORDER, which is not the numeric one.
+	//
+	// The check was `id <= last_id`, and the data-count section has id 12 while its PLACE is between
+	// element (9) and code (10). So a conforming module carrying one was refused as "out of order",
+	// and `code(10) data(11) datacount(12)` - which is not a legal module - was accepted. Section
+	// ids do not correspond to section order and this is the one place it shows.
+	//
+	// A table of the ids in their real sequence and an index into it costs the same few lines and is
+	// right for all twelve.
+	const ORDER: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 10, 11];
+	let mut last_place: Option<usize> = None;
 	while !r.done() {
 		let id: u8 = r.byte()?;
 		let size: usize = r.u32()? as usize;
@@ -140,15 +168,28 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 			return Err(ParseError("section runs past end of module"));
 		}
 		// Section 0 is CUSTOM: it may appear anywhere, any number of times, and its content is not
-		// this parser's business.
-		if id != 0 {
-			if id > 12 {
-				return Err(ParseError("a section this parser does not know, which it may not skip"));
+		// this parser's business - but its NAME is, and this read past it entirely.
+		//
+		// A custom section is `name` then arbitrary bytes, and a name that is not valid UTF-8 makes
+		// the module malformed. Skipping the whole section by its declared size meant the name was
+		// never read, so a module the specification refuses parsed here - 176 of the specification's
+		// own malformed cases, which is most of the gap that suite found.
+		if id == 0 {
+			let start = r.pos;
+			let _ = r.name()?;
+			if r.pos > end {
+				return Err(ParseError("a custom section whose name runs past its own length"));
 			}
-			if id <= last_id {
+			let _ = start;
+		}
+		if id != 0 {
+			let Some(place) = ORDER.iter().position(|&known| known == id) else {
+				return Err(ParseError("a section this parser does not know, which it may not skip"));
+			};
+			if last_place.is_some_and(|last| place <= last) {
 				return Err(ParseError("a section out of order or repeated"));
 			}
-			last_id = id;
+			last_place = Some(place);
 		}
 		match id {
 			1 => parse_types(&mut r, &mut m)?,
@@ -170,9 +211,19 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 			9 => parse_elements(&mut r, &mut m)?,
 			10 => parse_code(&mut r, &mut m)?,
 			11 => parse_data(&mut r, &mut m)?,
-			// 12 is the data-count section: a hint for validating memory.init/data.drop, neither of
-			// which this engine supports. Skipping it is correct because it declares no content the
-			// module depends on.
+			// REFUSED, not skipped - the same answer the start section already gives, for the same
+			// reason.
+			//
+			// The data-count section exists to validate `memory.init` and `data.drop`, neither of
+			// which this engine implements, and its content is a CLAIM about the module: how many
+			// data segments there are. Skipping it meant never comparing that claim with the data
+			// section, which the format requires - so a module could state one thing and carry
+			// another and this reader would notice neither.
+			//
+			// A module that carries this section is using a feature this engine does not have, and
+			// saying so is more honest than reading past it. The alternative - read it and compare -
+			// is the right answer the day `memory.init` exists.
+			12 => return Err(ParseError("a data-count section, which this engine's bulk-memory support does not include")),
 			_ => r.pos = end,
 		}
 		if r.pos != end {
@@ -242,7 +293,14 @@ fn parse_memory(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 	}
 	if count == 1 {
 		let flags: u8 = r.byte()?;
+		// ONLY 0 AND 1 ARE DEFINED. Anything else is a limits encoding from a feature this engine
+		// does not implement - shared memories, 64-bit indices - and reading past it as though bit 0
+		// were the only one that mattered is how a module for a different engine parses here.
+		if flags > 1 {
+			return Err(ParseError("a memory limits flag byte this engine does not know"));
+		}
 		let min: u32 = r.u32()?;
+		let mut max_pages: Option<u32> = None;
 		// KEPT, not skipped. This read the maximum and dropped it on the floor, so `memory.grow`
 		// had nothing to honour and grew past whatever the module said about itself.
 		if flags & 0x01 != 0 {
@@ -250,9 +308,9 @@ fn parse_memory(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 			if max < min {
 				return Err(ParseError("a memory whose maximum is below its minimum"));
 			}
-			m.memory_max_pages = Some(max);
+			max_pages = Some(max);
 		}
-		m.memory_min_pages = min;
+		m.memory = Some(crate::module::MemoryType { min_pages: min, max_pages });
 	}
 	Ok(())
 }
@@ -289,11 +347,7 @@ fn parse_elements(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 			0 => {
 				// active, table 0: an offset expression, then a vector of function indices.
 				let offset: u32 = const_offset(r)?;
-				let n: usize = r.u32()? as usize;
-				let mut funcs: Vec<u32> = Vec::with_capacity(n);
-				for _ in 0..n {
-					funcs.push(r.u32()?);
-				}
+				let funcs = read_function_indices(r)?;
 				m.elements.push(Element { offset, funcs });
 			}
 			2 => {
@@ -305,11 +359,7 @@ fn parse_elements(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 				if r.byte()? != 0x00 {
 					return Err(ParseError("only the funcref element kind is supported"));
 				}
-				let n: usize = r.u32()? as usize;
-				let mut funcs: Vec<u32> = Vec::with_capacity(n);
-				for _ in 0..n {
-					funcs.push(r.u32()?);
-				}
+				let funcs = read_function_indices(r)?;
 				m.elements.push(Element { offset, funcs });
 			}
 			_ => return Err(ParseError("only active element segments into table 0 are supported")),
@@ -350,6 +400,29 @@ fn const_expr(r: &mut Reader) -> Result<(i64, ValType), ParseError> {
 }
 
 // A constant expression that must be an `i32` - every OFFSET in the format is one.
+// A declared count, read and BOUNDED BY THE INPUT before anything is sized from it.
+//
+// `Vec::with_capacity(r.u32()?)` is an infallible allocation whose size a hostile module chooses: a
+// few bytes declaring four billion element indices asked for sixteen gigabytes, and the failure was
+// an abort in the host process rather than a refusal. It happens during PARSE, which is before fuel,
+// before the host limits and before everything else the engine bounds - so the whole resource story
+// started one step too late.
+//
+// An index is at least one byte, so `n` of them cannot be present in fewer than `n` bytes of what is
+// left. The check needs nothing but the reader's own position.
+fn read_function_indices(r: &mut Reader) -> Result<Vec<u32>, ParseError> {
+	let n: usize = r.u32()? as usize;
+	if n > r.buf.len().saturating_sub(r.pos) {
+		return Err(ParseError("an element segment declares more entries than the section can hold"));
+	}
+	let mut funcs: Vec<u32> = Vec::new();
+	funcs.try_reserve(n).map_err(|_| ParseError("an element segment's index table does not fit"))?;
+	for _ in 0..n {
+		funcs.push(r.u32()?);
+	}
+	Ok(funcs)
+}
+
 fn const_offset(r: &mut Reader) -> Result<u32, ParseError> {
 	let (value, ty) = const_expr(r)?;
 	if ty != ValType::I32 {

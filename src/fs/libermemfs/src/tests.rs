@@ -1002,16 +1002,104 @@ fn an_open_stream_holds_its_destination() {
 	fs.mkdir(b"dir").expect("a parent");
 	fs.stream_begin(b"dir/f").expect("begin");
 
-	// The name is taken from the moment the stream opens: nothing else may claim it.
+	// ALL FOUR, because the comment above names four and the first version of this test asserted
+	// one. `write` and `remove` are the two that were actually permitted, and they are what made
+	// the claim a claim in name only.
 	assert_eq!(fs.mkdir(b"dir/f"), Err(FsError::Exists), "a directory may not take the name a stream is filling");
+	assert_eq!(fs.write_file(b"dir/f", b"someone else"), Err(FsError::Exists), "a write may not take the name a stream is filling");
+	assert_eq!(fs.write_file_owned(b"dir/f", alloc::vec![b'x'; 4]), Err(FsError::Exists), "nor may the owned form of it");
+	assert_eq!(fs.remove(b"dir/f"), Err(FsError::Exists), "a remove may not take the name a stream is filling");
+	assert_eq!(fs.rmdir(b"dir/f"), Err(FsError::NotDir), "and it is not a directory to remove");
 
 	// And it is a real entry, so the destination cannot be removed out from under the transfer by
 	// removing its parent's contents unknowingly - the file is there to be seen.
 	assert!(fs.list_entries(b"dir").expect("list").iter().any(|e| e.name == "f"), "the claim is visible in the directory");
+	// It READS, as the empty file it currently is: a claim holds the name, it does not hide it.
+	assert_eq!(fs.read_file(b"dir/f").expect("a claimed entry reads"), b"");
+
+	// THE PARENT, which is the same question one level up and was answered by whatever the
+	// placeholder file happened to make `rmdir` do. A claimed entry is an entry, so the parent is
+	// not empty - and the transfer cannot have its directory removed from under it.
+	assert_eq!(fs.rmdir(b"dir"), Err(FsError::NotEmpty), "a directory holding a claim is not empty");
 
 	fs.stream_push(b"the payload").expect("push");
 	fs.stream_commit().expect("commit");
 	assert_eq!(fs.read_file(b"dir/f").expect("read"), b"the payload");
+	// The claim is GONE once the stream is: the file is an ordinary file again.
+	fs.write_file(b"dir/f", b"after").expect("a committed destination is writable again");
+	fs.remove(b"dir/f").expect("and removable");
+}
+
+#[test]
+fn an_abort_cannot_delete_a_write_another_caller_completed() {
+	// THE DATA-LOSS SEQUENCE, and it needed no timing at all.
+	//
+	// `stream_begin` inserted an ordinary `Node::File` and remembered `placeholder: true` beside
+	// it, so nothing another caller could reach knew the entry was spoken for. `write_file`
+	// replaced it and reported success; `stream_abort` then ran `remove(path)` on the strength of
+	// the flag and took the other caller's file with it.
+	//
+	// A completed write, reported as completed, destroyed by an unrelated abort - the only finding
+	// in this milestone that loses data rather than accounting for it wrongly.
+	let mut fs = capped(64 * 1024);
+	fs.stream_begin(b"x").expect("begin");
+	// The write is refused now, which is the first half of the fix.
+	assert_eq!(fs.write_file(b"x", b"important"), Err(FsError::Exists), "the claim refuses the write");
+	fs.stream_abort();
+	// And after the abort the name is free, because the claim was this stream's own.
+	assert_eq!(fs.read_file(b"x"), Err(FsError::NotFound), "an abandoned claim leaves nothing behind");
+
+	// The same shape with the write FIRST: it lands, and a later stream cannot claim over it.
+	fs.write_file(b"x", b"important").expect("write");
+	fs.stream_begin(b"x").expect("a replacing stream may claim an existing file");
+	fs.stream_abort();
+	assert_eq!(fs.read_file(b"x").expect("still there"), b"important", "an aborted replacement leaves the file exactly as it was");
+}
+
+#[test]
+fn a_replacing_stream_holds_its_destination_too() {
+	// `let placeholder = is_new` meant a stream replacing an existing file claimed NOTHING, so the
+	// sequence the claim exists to prevent still worked: remove the destination mid-transfer, and
+	// the commit re-resolved to nothing and took the create path - allocating the name and the slot
+	// at the end, after the whole file had been accepted, which is the failure the claim closes.
+	let mut fs = capped(64 * 1024);
+	fs.write_file(b"file", b"before").expect("the destination");
+	fs.stream_begin(b"file").expect("begin over an existing file");
+
+	assert_eq!(fs.remove(b"file"), Err(FsError::Exists), "a replacement's destination is held too");
+	assert_eq!(fs.write_file(b"file", b"other"), Err(FsError::Exists), "and not writable by anyone else");
+	// The previous contents are what a reader sees until the stream commits.
+	assert_eq!(fs.read_file(b"file").expect("read"), b"before", "a replacement leaves the file as it was until it commits");
+
+	fs.stream_push(b"after").expect("push");
+	fs.stream_commit().expect("commit");
+	assert_eq!(fs.read_file(b"file").expect("read"), b"after");
+	// The claim did not survive the commit. The adopt path rewrites the buffer in place and leaves
+	// the node exactly as it found it, so a commit that fitted the existing allocation would have
+	// left a claim nobody could release - a permanently unwritable file.
+	fs.write_file(b"file", b"again").expect("a committed destination is writable again");
+	assert_eq!(fs.read_file(b"file").expect("read"), b"again");
+}
+
+#[test]
+fn stream_len_and_stream_begin_agree_about_a_new_destination() {
+	// The preflight costs a new destination at `path + name`; `stream_begin` briefly costed it at
+	// `path + name + SLOT_BYTES`, under a comment claiming `footprint` counts the directory table.
+	// It does not - tables are `metadata_bytes`, a separate budget - so a volume with room for one
+	// and not the other answered `Ok` to the preflight and `NoSpace` to the begin.
+	//
+	// Swept rather than aimed: the boundary depends on the allocator's answers, so every capacity
+	// across the region where the two could disagree is checked.
+	for capacity in 32..320usize {
+		let mut fs = capped(capacity);
+		let told = fs.stream_len(b"f");
+		let began = fs.stream_begin(b"f");
+		match (told, began) {
+			(Ok(_), Ok(())) => fs.stream_abort(),
+			(Err(a), Err(b)) => assert_eq!(a, b, "capacity {capacity}: the preflight and the begin refuse differently"),
+			(told, began) => panic!("capacity {capacity}: stream_len said {told:?} and stream_begin said {began:?}"),
+		}
+	}
 }
 
 #[test]

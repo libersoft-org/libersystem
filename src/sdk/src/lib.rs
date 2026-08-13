@@ -40,6 +40,10 @@ pub use world::{log_message, read_input, write_output};
 
 #[cfg(target_arch = "wasm32")]
 mod panic;
+// The BEHAVIOUR, exported. The `#[panic_handler]` that calls it belongs to the component - see
+// `panic.rs` for why a library may not declare one.
+#[cfg(target_arch = "wasm32")]
+pub use panic::report_panic;
 
 #[cfg(test)]
 mod tests;

@@ -13,7 +13,6 @@
 
 #![allow(dead_code)]
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
@@ -138,7 +137,15 @@ pub struct Process {
 	// Eager system-image dynamic symbols registered by successfully relocated
 	// provider modules. The registry is process-local: dependency order and symbol
 	// visibility cannot leak between security domains or launches.
-	dynamic_symbols: SpinLock<BTreeMap<String, u64>>,
+	// A SORTED VECTOR, not a `BTreeMap`, so registering a module's exports is FALLIBLE.
+	//
+	// The map's `insert` allocates a node and the name is cloned into it, both infallibly, bounded
+	// at 65,536 entries and reachable from `PROCESS_LOAD_MODULE` - a kernel abort on a short heap,
+	// triggered by loading a module. `Vec` has `try_reserve` and `String` has one too, so both the
+	// storage and the clone can refuse; the map has neither. Lookup stays logarithmic through
+	// `binary_search_by`, and registration is a bulk operation per module load rather than a hot
+	// path, so the insert shift costs nothing that matters.
+	dynamic_symbols: SpinLock<Vec<(String, u64)>>,
 	shared_image_pages: SpinLock<Vec<Arc<crate::elf::SharedPage>>>,
 	dynamic_modules: AtomicUsize,
 	// The biases dynamic modules are loaded at. `dynamic_modules` counts them; this says
@@ -153,7 +160,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(BTreeMap::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0) });
+		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0) });
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
@@ -185,6 +192,20 @@ impl Process {
 
 	// Take ownership of the physical frames backing this process's user image and
 	// stack, so they are freed when the process is dropped.
+	// Take ownership of ONE frame, fallibly.
+	//
+	// The stack-growth fault handler adopted with `adopt_frames(vec![frame])` - an infallible
+	// allocation on a path ring 3 reaches by touching a guard page. This asks the allocator instead:
+	// false means the frame was not adopted and the caller still owns it.
+	pub fn try_adopt_frame(&self, frame: u64) -> bool {
+		let mut frames = self.user_frames.lock();
+		if frames.try_reserve(1).is_err() {
+			return false;
+		}
+		frames.push(frame);
+		true
+	}
+
 	pub fn adopt_frames(&self, frames: Vec<u64>) {
 		self.user_frames.lock().extend(frames);
 	}
@@ -194,7 +215,9 @@ impl Process {
 	}
 
 	pub fn resolve_dynamic_symbol(&self, name: &str) -> Option<u64> {
-		self.dynamic_symbols.lock().get(name).copied()
+		let registry = self.dynamic_symbols.lock();
+		let at = registry.binary_search_by(|(known, _)| known.as_str().cmp(name)).ok()?;
+		Some(registry[at].1)
 	}
 
 	// Resolve a registered export by the tail of its mangled name. A Rust v0 symbol
@@ -213,20 +236,45 @@ impl Process {
 	pub fn resolve_dynamic_symbol_by_suffix(&self, suffix: &str) -> Option<u64> {
 		let registry = self.dynamic_symbols.lock();
 		let mut matches = registry.iter().filter(|(name, _)| name.ends_with(suffix));
-		let first = matches.next()?;
+		let first = *matches.next().map(|(_, address)| address)?;
 		if matches.next().is_some() {
 			return None;
 		}
-		Some(*first.1)
+		Some(first)
 	}
 
 	pub fn register_dynamic_symbols(&self, symbols: &[(String, u64)]) -> bool {
 		let mut registry = self.dynamic_symbols.lock();
-		if registry.len().checked_add(symbols.len()).is_none_or(|len| len > 65_536) || symbols.iter().any(|(name, _)| name.is_empty() || name.len() > crate::elf::MAX_DYNAMIC_SYMBOL_NAME || registry.contains_key(name)) {
+		let known = |registry: &Vec<(String, u64)>, name: &String| registry.binary_search_by(|(known, _)| known.cmp(name)).is_ok();
+		if registry.len().checked_add(symbols.len()).is_none_or(|len| len > 65_536) || symbols.iter().any(|(name, _)| name.is_empty() || name.len() > crate::elf::MAX_DYNAMIC_SYMBOL_NAME || known(&registry, name)) {
+			return false;
+		}
+		// ROOM FIRST, FOR ALL OF THEM, and the names cloned fallibly - so a short heap refuses the
+		// registration whole rather than aborting partway through it. All-or-nothing matters here:
+		// a module whose exports are half registered resolves some of its own symbols and not
+		// others, which is worse than not loading.
+		if registry.try_reserve(symbols.len()).is_err() {
+			return false;
+		}
+		let mut cloned: Vec<(String, u64)> = Vec::new();
+		if cloned.try_reserve(symbols.len()).is_err() {
 			return false;
 		}
 		for (name, address) in symbols {
-			registry.insert(name.clone(), *address);
+			let mut copy = String::new();
+			if copy.try_reserve(name.len()).is_err() {
+				return false;
+			}
+			copy.push_str(name);
+			cloned.push((copy, *address));
+		}
+		for entry in cloned {
+			match registry.binary_search_by(|(known, _)| known.cmp(&entry.0)) {
+				// Refused above, so this is unreachable; overwriting is what the map did and is the
+				// harmless answer if the check above is ever changed.
+				Ok(at) => registry[at] = entry,
+				Err(at) => registry.insert(at, entry),
+			}
 		}
 		true
 	}

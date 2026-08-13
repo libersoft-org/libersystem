@@ -212,7 +212,22 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	let size = ((payload * 2).max(16 * 1024 * 1024) + BLOCK - 1) / BLOCK * BLOCK;
 	// THE ONE PLACE THE VOLUME'S IDENTITY IS DECIDED. The pairing file the loader reads is written
 	// from this same value below, so the two cannot be written to disagree.
-	let uuid: [u8; 16] = *b"libersystem-vol\0";
+	//
+	// AND IT IS DERIVED, not a constant. It used to be the literal `b"libersystem-vol\0"`, so every
+	// volume this tree has ever built carried the same identity - and the pairing mechanism built to
+	// stop two LiberSystem disks from being told apart by firmware handle order distinguished
+	// nothing, because both matched. The apparatus was complete along its whole length and the value
+	// flowing through it made it a no-op.
+	//
+	// Derived from the volume's CONTENT: the staged names and bytes, in the order they are staged,
+	// which `staged` has already sorted. Two different images are two different volumes, and one
+	// image built twice is the same volume - which is what a reproducible build needs and what a
+	// random uuid would have cost.
+	//
+	// This is not an installation identity, and the difference matters: every machine installed from
+	// one image still shares this. Regenerating at INSTALL time is the other half and is a task on
+	// this milestone; what this closes is a constant that could not tell two IMAGES apart.
+	let uuid: [u8; 16] = volume_uuid(&staged);
 	let opts = liberfs::FormatOpts { uuid, label: b"system".to_vec(), compress: false };
 	let mut fs_image = liberfs::LiberFs::format_opts(Image { bytes: vec![0u8; size], block: BLOCK }, (size / BLOCK) as u64, opts).unwrap_or_else(|error| panic!("mkpackages: cannot format a {size}-byte system volume: {error:?}"));
 
@@ -498,9 +513,20 @@ fn user_dynamic_path(manifest: &Path, destination: &str) -> PathBuf {
 // because `Value::as_i32` converts every numeric type and a wrongly typed import used to be a
 // silent conversion at call time.
 fn validate_component(path: &Path, bytes: &[u8]) {
-	use wasm::{ValType, parse};
+	use wasm::{ValType, parse, validate};
 
 	let module = parse(bytes).unwrap_or_else(|error| panic!("{} is not a component this system can host: {error:?}", path.display()));
+
+	// AND THE VALIDATOR THE HOST RUNS, which this gate did not.
+	//
+	// `component_host` does parse -> validate -> `Instance::new(&ValidatedModule)`. This applied a
+	// strictly weaker test - the header, the memory pages and the imports - so a module with the
+	// right imports, a small memory and a body the validator refuses was packaged, shipped, and
+	// rejected at launch. Not a hole the runtime leaves open, because `ValidatedModule` is what
+	// makes that impossible; a build-time answer deferred to run time, in the gate written to
+	// prevent exactly that.
+	let validated = validate(module).unwrap_or_else(|error| panic!("{} does not validate, so the host would refuse to run it: {error:?}", path.display()));
+	let module = validated.module();
 
 	// The guest's linear memory is allocated whole at instantiation, out of the host process's
 	// heap. `-zstack-size=65536` in `src/sdk/.cargo/config.toml` is what keeps this small - the
@@ -508,7 +534,8 @@ fn validate_component(path: &Path, bytes: &[u8]) {
 	// file only when invoked from inside the directory. So the flag's EFFECT is asserted here
 	// rather than the flag's presence assumed.
 	const MAX_PAGES: u32 = 4;
-	assert!(module.memory_min_pages <= MAX_PAGES, "{} declares {} initial memory pages, more than the {MAX_PAGES} the host can hold - is the wasm stack size still set?", path.display(), module.memory_min_pages);
+	let declared = module.memory.map_or(0, |m| m.min_pages);
+	assert!(declared <= MAX_PAGES, "{} declares {declared} initial memory pages, more than the {MAX_PAGES} the host can hold - is the wasm stack size still set?", path.display());
 
 	let world: [(&str, &str, &[ValType], &[ValType]); 3] = [
 		("liber:vfs@1", "read", &[ValType::I32, ValType::I32], &[ValType::I32]),
@@ -889,3 +916,57 @@ fn volume_files(conf: &[(String, String)]) -> Vec<(String, Vec<u8>)> {
 // single blob. aarch64 and riscv64 virt have no bootloader to pass files, so the runner loads
 // this archive into memory and the kernel finds it there.
 //
+
+// The system volume's identity, derived from what the volume contains.
+//
+// FNV-1a over every staged name and its bytes, twice with different offset bases to fill sixteen
+// bytes. Not a cryptographic hash and does not need to be: nothing trusts this against an attacker,
+// it exists so that two different images are two different volumes and the loader's pairing file can
+// name one of them. A content hash rather than a random value is what keeps a build reproducible.
+fn volume_uuid(staged: &[(String, Vec<u8>)]) -> [u8; 16] {
+	const PRIME: u64 = 0x0000_0100_0000_01b3;
+	let mut halves = [0xcbf2_9ce4_8422_2325u64, 0x9e37_79b9_7f4a_7c15u64];
+	for half in &mut halves {
+		for (name, bytes) in staged {
+			for byte in name.as_bytes().iter().chain(bytes.iter()) {
+				*half ^= *byte as u64;
+				*half = half.wrapping_mul(PRIME);
+			}
+			// The boundary between entries, so `("ab", "c")` and `("a", "bc")` are different
+			// volumes rather than the same one.
+			*half ^= 0xff;
+			*half = half.wrapping_mul(PRIME);
+		}
+	}
+	let mut out = [0u8; 16];
+	out[..8].copy_from_slice(&halves[0].to_le_bytes());
+	out[8..].copy_from_slice(&halves[1].to_le_bytes());
+	out
+}
+
+#[cfg(test)]
+mod tests {
+	// A module that PARSES and does not VALIDATE, asserting the packaging gate refuses it.
+	//
+	// The gate applied a strictly weaker test than the host: parse, memory pages, imports. A module
+	// with the right imports, a small memory and a body the validator refuses was packaged, shipped,
+	// and rejected at launch - a build-time answer deferred to run time, in the gate written to
+	// prevent exactly that.
+	#[test]
+	fn a_component_the_host_would_refuse_is_not_packaged() {
+		// `i32.const 1; end` in a function declared to return nothing: parses, and the validator
+		// refuses it for the value left on the stack.
+		let mut wasm: Vec<u8> = Vec::new();
+		wasm.extend_from_slice(b"\0asm");
+		wasm.extend_from_slice(&[1, 0, 0, 0]);
+		wasm.extend_from_slice(&[1, 4, 1, 0x60, 0x00, 0x00]); // type: () -> ()
+		wasm.extend_from_slice(&[3, 2, 1, 0]); // one function
+		wasm.extend_from_slice(&[5, 3, 1, 0x00, 1]); // one memory, min 1
+		wasm.extend_from_slice(&[7, 7, 1, 3, b'r', b'u', b'n', 0x00, 0]); // export "run"
+		wasm.extend_from_slice(&[10, 6, 1, 4, 0x00, 0x41, 0x01, 0x0b]); // body: i32.const 1; end
+
+		assert!(wasm::parse(&wasm).is_ok(), "the fixture has to PARSE, or it proves the wrong thing");
+		let module = wasm::parse(&wasm).unwrap();
+		assert!(wasm::validate(module).is_err(), "and it has to fail validation, which is what the gate now applies");
+	}
+}

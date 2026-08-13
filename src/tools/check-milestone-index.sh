@@ -14,6 +14,13 @@
 # Only the dangerous direction is checked. `- [ ]` over a file with no open tasks is a milestone
 # whose remaining work is prose, which is ordinary; `- [x]` over a file WITH open tasks is a claim
 # the document itself contradicts.
+#
+# `[~]` COUNTS AS OPEN. It is a useful third state in a long document - "partly done" is a real thing
+# to say - and it is not a state that may make a milestone read as finished to the one check that
+# exists to prevent exactly that. P02M0129 passed this gate as COMPLETE over its own text saying its
+# adversarial tests do not exist, because the marker its test item used was not the one being
+# counted. One item in the whole tree at the time, which is why closing it while it was one was
+# cheap.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -36,7 +43,7 @@ check_index() {
 			continue
 		}
 		local open
-		open="$(grep -c '^- \[ \]' "$todo_dir/$file" || true)"
+		open="$(grep -cE '^- \[[ ~]\]' "$todo_dir/$file" || true)"
 		if [[ "$open" != "0" ]]; then
 			echo "milestone-index: the index marks $file done and it has $open unfinished task(s)" >&2
 			failed=1
@@ -67,6 +74,17 @@ self_test() {
 	printf -- '- [x] [P99M0001 - a](P99M0001.md)\n- [x] [P99M0002 - b](P99M0002.md)\n' >"$scratch/bad.md"
 	if check_index "$scratch/bad.md" "$scratch" 2>/dev/null; then
 		echo "milestone-index: SELF-TEST FAILED - a milestone marked done over an unfinished document was accepted, which is the one thing this gate is for" >&2
+		exit 1
+	fi
+
+	# And the PARTLY-done marker, which is the one that slipped through: `[~]` is a third state a
+	# long document legitimately wants, and P02M0129 read as COMPLETE over its own text saying its
+	# adversarial tests do not exist because this gate was counting only `[ ]`. A fixture belongs
+	# beside the `[ ]` one for the same reason that one is here.
+	printf '# P99M0003\n\nStatus: DONE.\n\n- [x] finished\n- [~] partly done\n' >"$scratch/P99M0003.md"
+	printf -- '- [x] [P99M0003 - c](P99M0003.md)\n' >"$scratch/partial.md"
+	if check_index "$scratch/partial.md" "$scratch" 2>/dev/null; then
+		echo "milestone-index: SELF-TEST FAILED - a milestone marked done over a PARTLY-done item was accepted" >&2
 		exit 1
 	fi
 

@@ -278,7 +278,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	// The offsets are the point: a size that happens to stay the same while two fields swap places
 	// is the change this catches and a size check does not.
 	assert_layout!(
-		DeviceInfo, 40, 8,
+		DeviceInfo, 48, 8,
 		device_type => 0,
 		// The explicit padding must stay where the implicit padding was.
 		_pad0 => 4,
@@ -292,7 +292,12 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		bus => 36,
 		dev => 37,
 		func => 38,
-		_pad => 39,
+		// The three that replaced the single `_pad` byte. They occupy it and the two the struct's
+		// tail alignment already held, so nothing before them moved - and this assertion is what
+		// says so rather than leaving it to be believed.
+		class => 39,
+		subclass => 40,
+		prog_if => 41,
 	);
 
 	assert_layout!(
@@ -558,8 +563,19 @@ fn a_package_that_would_describe_itself_wrongly_is_not_built() {
 	let many: alloc::vec::Vec<(&[u8], &[u8])> = (0..MAX_ENTRIES + 1).map(|_| (&b"name"[..], &b"body"[..])).collect();
 	assert!(build_package(&many).is_none(), "more entries than the format is allowed to carry");
 
-	// A blob larger than the per-file limit, without allocating one: the limit is checked from the
-	// slice's length, so a slice that claims the length is enough to prove the check runs.
-	let huge = unsafe { core::slice::from_raw_parts(1 as *const u8, crate::bootstrap::MAX_FILE_BYTES + 1) };
-	assert!(build_package(&[(b"init", huge)]).is_none(), "a file larger than the format's limit");
+	// The per-file and per-archive ceilings, PROVED BY CALLING THE RULE rather than by conjuring an
+	// argument that cannot legally exist.
+	//
+	// This used to be `from_raw_parts(1 as *const u8, MAX_FILE_BYTES + 1)`, on the reasoning that a
+	// slice which only has its length read need not have memory behind it. Constructing the
+	// reference is itself the contract - the range must be valid, initialised and owned - so the
+	// `unsafe` block was undefined behaviour before `build_package` saw it, in the suite whose
+	// subject is what the ABI guarantees.
+	use crate::bootstrap::{MAX_FILE_BYTES, MAX_TOTAL_BYTES, entry_fits};
+	assert!(entry_fits(4, MAX_FILE_BYTES, 0), "a file exactly at the limit fits");
+	assert!(!entry_fits(4, MAX_FILE_BYTES + 1, 0), "a file larger than the format's limit does not");
+	assert!(!entry_fits(crate::PKG_NAME_LEN + 1, 4, 0), "nor does a name that does not fit the entry");
+	assert!(entry_fits(4, 1, MAX_TOTAL_BYTES - 1), "an archive exactly at its total fits");
+	assert!(!entry_fits(4, 2, MAX_TOTAL_BYTES - 1), "and one byte past it does not");
+	assert!(!entry_fits(4, 1, usize::MAX), "a total that would wrap is refused rather than wrapped");
 }

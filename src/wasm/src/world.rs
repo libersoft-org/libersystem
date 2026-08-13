@@ -120,6 +120,31 @@ pub enum WriteOutcome {
 	Failed,
 }
 
+// Why a read did not happen, rather than whether it did.
+//
+// THE SAME ARGUMENT `WriteOutcome` IS MADE OF, applied to the other two operations. The comment
+// above it says an `Option<usize>` "collapsed three different things into `None`" - a buffer the
+// host could not create, a service that never answered, and a service that answered and refused -
+// and `read` and `log` in the same trait went on being `Option<usize>` and `bool`. The argument is
+// about the trait, not about one method of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadOutcome {
+	Read(usize),
+	// The volume said no: the grant does not cover this, or the file is not there. The component
+	// can act on that and should not retry.
+	Refused,
+	// The host could not make the request, or the service did not answer it.
+	Failed,
+}
+
+// The same for the log, which has no count to report.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogOutcome {
+	Logged,
+	Refused,
+	Failed,
+}
+
 // The two capabilities the world is wired to, as three operations over bytes.
 //
 // THE SEAM THIS EXISTS FOR: everything above it is a decision about a guest's bytes and can be
@@ -129,13 +154,13 @@ pub enum WriteOutcome {
 // construction takes the happy path. A write that is refused, a write that fails, a service that
 // never answers and a log grant that does not respond were four paths with no test between them.
 pub trait WorldServices {
-	// Read the one granted input file into `dst`, answering how many bytes were copied. `None` is
-	// any failure on the way: the guest gets `STATUS_IO` and may say so to its own caller.
-	fn read(&mut self, dst: &mut [u8]) -> Option<usize>;
+	// Read the one granted input file into `dst`, answering how many bytes were copied - or which
+	// kind of failure stopped it, which the guest gets as `STATUS_DENIED` or `STATUS_IO`.
+	fn read(&mut self, dst: &mut [u8]) -> ReadOutcome;
 	// Write `bytes` to the one granted output file.
 	fn write(&mut self, bytes: &[u8]) -> WriteOutcome;
-	// Emit `text` as one entry through the granted log. `false` is the grant not answering.
-	fn log(&mut self, text: &str) -> bool;
+	// Emit `text` as one entry through the granted log.
+	fn log(&mut self, text: &str) -> LogOutcome;
 }
 
 // The host side of the world: the resolved import table, the services it dispatches to, and the two
@@ -187,8 +212,9 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 		let status: i32 = match op {
 			// read(ptr, max) -> n: the one granted input file into the component's memory.
 			WorldFn::Read => match self.services.read(&mut memory[ptr..end]) {
-				Some(n) => n as i32,
-				None => STATUS_IO,
+				ReadOutcome::Read(n) => n as i32,
+				ReadOutcome::Refused => STATUS_DENIED,
+				ReadOutcome::Failed => STATUS_IO,
 			},
 			// write(ptr, len) -> n: the component's bytes to the one granted output file.
 			WorldFn::Write => {
@@ -207,13 +233,16 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 				// blames the service for the component's mistake.
 				match core::str::from_utf8(&memory[ptr..end]) {
 					Err(_) => STATUS_UNSUPPORTED,
-					Ok(text) if self.services.log(text) => {
-						self.logged = true;
-						0
-					}
-					// The log used to return NOTHING, so a component could not tell whether its one
-					// diagnostic channel had worked.
-					Ok(_) => STATUS_IO,
+					Ok(text) => match self.services.log(text) {
+						LogOutcome::Logged => {
+							self.logged = true;
+							0
+						}
+						LogOutcome::Refused => STATUS_DENIED,
+						// The log used to return NOTHING, so a component could not tell whether its
+						// one diagnostic channel had worked.
+						LogOutcome::Failed => STATUS_IO,
+					},
 				}
 			}
 		};

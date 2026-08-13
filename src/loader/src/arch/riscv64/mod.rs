@@ -212,12 +212,20 @@ fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 			continue;
 		}
 		dest_low = dest_low.min(align_down(ph.p_paddr, PAGE_SIZE));
-		dest_high = dest_high.max(ph.p_paddr + ph.p_memsz);
+		// Checked here too, even though the shared parser has already refused a header that would
+		// wrap: a guarantee that is not visible at the arithmetic is one the next reader has to go
+		// and find, and this file is the one that then rounds and multiplies it.
+		// Checked here too, even though the shared parser has already refused a header that would
+		// wrap: a guarantee that is not visible at the arithmetic is one the next reader has to go
+		// and find, and this file is the one that then rounds and multiplies it. The parser is what
+		// makes this branch unreachable; the panic is what says so if it ever is not.
+		let end = ph.p_paddr.checked_add(ph.p_memsz).expect("the shared parser refuses a segment whose physical end wraps");
+		dest_high = dest_high.max(end);
 	}
 	if dest_low == u64::MAX {
 		panic!("loader: kernel image has no loadable segments");
 	}
-	dest_high = (dest_high + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+	let dest_high = dest_high.checked_add(PAGE_SIZE - 1).map(|v| v & !(PAGE_SIZE - 1)).expect("a page-rounded destination that wraps - the parser bounds the end that feeds this");
 	let pages = ((dest_high - dest_low) / PAGE_SIZE) as usize;
 
 	// Scratch that does not overlap the destination. The firmware chooses where, so this asks
@@ -227,7 +235,8 @@ fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 	let mut reject_count = 0usize;
 	let scratch = loop {
 		let candidate = crate::alloc_pages(bs, pages).expect("loader: cannot allocate staging memory for the kernel");
-		if candidate + (pages as u64 * PAGE_SIZE) <= dest_low || candidate >= dest_high {
+		let Some(span) = (pages as u64).checked_mul(PAGE_SIZE).and_then(|b| candidate.checked_add(b)) else { continue };
+		if span <= dest_low || candidate >= dest_high {
 			break candidate;
 		}
 		if reject_count == rejects.len() {

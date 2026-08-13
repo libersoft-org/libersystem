@@ -357,3 +357,24 @@ pub fn dealloc(pointer: *mut u8, layout: Layout) {
 
 #[cfg(test)]
 mod tests;
+
+// Box a value FALLIBLY.
+//
+// `Box::new` aborts the kernel when the heap is short and `Box::try_new` is unstable, so the one
+// stable way to ask the allocator a question instead of telling it something is through `Vec`'s
+// `try_reserve`. Used by the paths reachable from ring 3 - the thread-entry context of every spawn,
+// and anything else that boxes on a userspace-triggered path - where a short heap must be a refusal
+// and not a halt.
+pub fn try_box<T>(value: T) -> Option<alloc::boxed::Box<T>> {
+	let mut room: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+	room.try_reserve_exact(1).ok()?;
+	room.push(value);
+	// One element, so the boxed slice IS the boxed value: take its pointer and rebuild the `Box<T>`
+	// over it. `into_boxed_slice` does not reallocate at exact capacity, which `try_reserve_exact`
+	// asked for.
+	let slice: alloc::boxed::Box<[T]> = room.into_boxed_slice();
+	let raw: *mut T = alloc::boxed::Box::into_raw(slice) as *mut T;
+	// SAFETY: `raw` is the allocation of a one-element boxed slice, which has the layout of one `T`,
+	// and nothing else owns it - `into_raw` gave up the slice's ownership.
+	Some(unsafe { alloc::boxed::Box::from_raw(raw) })
+}

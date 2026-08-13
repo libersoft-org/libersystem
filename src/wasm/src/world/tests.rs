@@ -158,9 +158,10 @@ use alloc::string::{String, ToString};
 // What each of the three operations should answer. Scripted rather than simulated: the point is to
 // pin what the guest is TOLD, and every one of these is a real service outcome.
 struct Stub {
-	read: Option<&'static [u8]>,
+	read: ReadOutcome,
+	read_bytes: &'static [u8],
 	write: WriteOutcome,
-	log: bool,
+	log: LogOutcome,
 	// what the stub was actually asked to do, so a test can tell "refused" from "never called".
 	wrote: Vec<u8>,
 	logged: Vec<String>,
@@ -168,16 +169,21 @@ struct Stub {
 
 impl Stub {
 	fn working() -> Stub {
-		Stub { read: Some(b"input"), write: WriteOutcome::Wrote(0), log: true, wrote: Vec::new(), logged: Vec::new() }
+		Stub { read: ReadOutcome::Read(0), read_bytes: b"input", write: WriteOutcome::Wrote(0), log: LogOutcome::Logged, wrote: Vec::new(), logged: Vec::new() }
 	}
 }
 
 impl WorldServices for Stub {
-	fn read(&mut self, dst: &mut [u8]) -> Option<usize> {
-		let src = self.read?;
-		let n = src.len().min(dst.len());
-		dst[..n].copy_from_slice(&src[..n]);
-		Some(n)
+	fn read(&mut self, dst: &mut [u8]) -> ReadOutcome {
+		match self.read {
+			// the count a real service reports is what it copied, which is what fits.
+			ReadOutcome::Read(_) => {
+				let n = self.read_bytes.len().min(dst.len());
+				dst[..n].copy_from_slice(&self.read_bytes[..n]);
+				ReadOutcome::Read(n)
+			}
+			other => other,
+		}
 	}
 
 	fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
@@ -189,7 +195,7 @@ impl WorldServices for Stub {
 		}
 	}
 
-	fn log(&mut self, text: &str) -> bool {
+	fn log(&mut self, text: &str) -> LogOutcome {
 		self.logged.push(text.to_string());
 		self.log
 	}
@@ -258,7 +264,7 @@ fn a_log_grant_that_does_not_respond_is_reported_to_the_guest() {
 
 	// The log used to return NOTHING, so a component could not tell whether its one diagnostic
 	// channel had worked - and the host reported the grant as live either way.
-	let dead = Stub { log: false, ..Stub::working() };
+	let dead = Stub { log: LogOutcome::Failed, ..Stub::working() };
 	let (out, host) = run(module, imports, dead);
 	assert_eq!(out.expect("a dead log service is not a trap"), alloc::vec![Value::I32(STATUS_IO)]);
 	assert!(!host.logged(), "a grant that did not answer must not be reported as reached");
@@ -283,7 +289,7 @@ fn a_read_the_granted_volume_cannot_serve_is_a_status_not_a_trap() {
 	let (out, _) = run(module.clone(), imports.clone(), Stub::working());
 	assert_eq!(out.expect("not a trap"), alloc::vec![Value::I32(5)], "the count the volume served");
 
-	let gone = Stub { read: None, ..Stub::working() };
+	let gone = Stub { read: ReadOutcome::Failed, ..Stub::working() };
 	let (out, _) = run(module, imports, gone);
 	assert_eq!(out.expect("a dead storage service is not a trap"), alloc::vec![Value::I32(STATUS_IO)]);
 }
@@ -333,8 +339,109 @@ fn a_guest_that_panics_reaches_the_host_as_a_trap_with_its_diagnostic_already_lo
 	// AND WITH THE GRANT NOT ANSWERING, the trap still happens. The diagnostic is best-effort - the
 	// trap is the real report - so a log service that is gone must not turn a guest panic into
 	// something else, and must not be reported as reached.
-	let dead = Stub { log: false, ..Stub::working() };
+	let dead = Stub { log: LogOutcome::Failed, ..Stub::working() };
 	let (out, host) = run(build(&spec), imports, dead);
 	assert!(out.is_err(), "the trap does not depend on the log grant");
 	assert!(!host.logged());
+}
+
+#[test]
+fn a_refused_read_and_a_refused_log_are_denied_rather_than_io() {
+	// The symmetry `WriteOutcome` had and the other two did not. `read` was `Option<usize>` and
+	// `log` was `bool`, so a grant that REFUSED and a service that was gone were one answer -
+	// `STATUS_IO` - and the component was told to retry something it may not do. That is the same
+	// argument the comment above `WriteOutcome` makes, and it is an argument about the trait.
+	let (module, imports) = caller(0, 0, 8, b"");
+	let (out, _) = run(module, imports, Stub { read: ReadOutcome::Refused, ..Stub::working() });
+	assert_eq!(out.expect("the guest returns a status"), alloc::vec![Value::I32(STATUS_DENIED)], "a refused read is DENIED, not IO");
+
+	let (module, imports) = caller(0, 0, 8, b"");
+	let (out, _) = run(module, imports, Stub { read: ReadOutcome::Failed, ..Stub::working() });
+	assert_eq!(out.expect("status"), alloc::vec![Value::I32(STATUS_IO)], "and a service that did not answer is IO");
+
+	let (module, imports) = caller(2, 0, 2, b"hi");
+	let (out, host) = run(module, imports, Stub { log: LogOutcome::Refused, ..Stub::working() });
+	assert_eq!(out.expect("status"), alloc::vec![Value::I32(STATUS_DENIED)], "a refused log is DENIED, not IO");
+	assert!(!host.logged(), "and nothing was recorded as logged");
+
+	let (module, imports) = caller(2, 0, 2, b"hi");
+	let (out, _) = run(module, imports, Stub { log: LogOutcome::Failed, ..Stub::working() });
+	assert_eq!(out.expect("status"), alloc::vec![Value::I32(STATUS_IO)], "and a log grant that did not answer is IO");
+}
+
+#[test]
+fn both_hosts_answer_a_dead_service_the_same_way() {
+	// ONE ABI, ONE ANSWER. `wasi_host` and `component_host` are two hosts of `liber:vfs@1` in one
+	// image, and a failed read used to end the instance in one and return `STATUS_IO` in the other -
+	// so which semantics a component got depended on which host launched it, which is what a version
+	// on an interface exists to make impossible.
+	//
+	// Both are `WorldHost<S>` now, so the assertion is that the SEAM answers one way: whatever a
+	// `WorldServices` reports, the status the guest sees is the world's and not the host's.
+	let (module, imports) = caller(0, 0, 8, b"");
+	let (out, _) = run(module, imports, Stub { read: ReadOutcome::Failed, ..Stub::working() });
+	assert_eq!(out.expect("the guest gets a status, not a trap"), vec![Value::I32(STATUS_IO)], "a service that did not answer is IO, whichever host is behind the seam");
+
+	// And the trap is reserved for what it is for: a guest that broke the contract, not a service
+	// that failed. A window outside memory is the guest's mistake and answers `STATUS_FAULT`.
+	let (module, imports) = caller(0, 0x7fff_0000u32 as i32, 8, b"");
+	let (out, _) = run(module, imports, Stub::working());
+	assert_eq!(out.expect("still a status"), vec![Value::I32(STATUS_FAULT)], "an out-of-bounds window is the guest's error and is reported as one");
+}
+
+#[test]
+fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() {
+	// THE OTHER HALF of `a_guest_that_panics_...`, which hand-assembles the shape
+	// `dev-diagnostics` is assumed to produce. Nothing tied that shape to `liber_sdk::report_panic`:
+	// change the handler's format, make it call `write` instead of `log`, or drop the trap, and that
+	// test still passes.
+	//
+	// This runs the real thing - the toolchain's own output, linking the SDK's handler, panicking
+	// for real - so what is observed is what a guest actually does.
+	//
+	// SKIPPED LOUDLY rather than failing when the artifact is not there: it is built by
+	// `just sdk` / the image build, and a unit test that requires a wasm32 toolchain run would make
+	// `cargo test` in this crate depend on one. Its absence is said, not passed over in silence.
+	// ANCHORED TO THE CRATE, not to whatever directory `cargo test` happened to be run from - which
+	// is how this skipped silently the first time it ran from the repository root, and a test that
+	// reports a skip nobody reads is the shape this tree has a gate against elsewhere.
+	let built = alloc::format!("{}/../../.build/cargo/sdk/wasm32-unknown-unknown/release/liber_component.wasm", env!("CARGO_MANIFEST_DIR"));
+	let Ok(bytes) = std::fs::read(&built) else {
+		std::eprintln!("SKIPPED: {built} is not built, so the SDK's own panic handler is not exercised");
+		return;
+	};
+	// TWO ASSERTIONS WITH DIFFERENT PRECONDITIONS, said apart rather than skipped together.
+	//
+	// The TRAP is unconditional: `report_panic` ends in `unreachable()` whether or not
+	// `dev-diagnostics` is on, so a toolchain-built guest that panics must reach the host as a trap
+	// in every build. The LOG is the feature's, and the shipping build does not enable it - a
+	// component should not narrate its own failures to a log it does not own.
+	//
+	// The first version of this checked the binary for the diagnostic string and skipped when it was
+	// absent, which made "built without the feature" indistinguishable from "the handler stopped
+	// logging" - it reported SKIPPED for a handler that had been bypassed entirely. A precondition
+	// that hides the regression it guards is worse than no test.
+	let diagnostics_on = bytes.windows(8).any(|w| w == b"panic at");
+	let module = crate::parse(&bytes).expect("the toolchain's own component parses");
+	let validated = crate::validate(module).expect("and validates");
+	let mut instance = Instance::new(&validated).expect("and instantiates");
+	// The imports in the order the module declares them, resolved through the same `resolve` the
+	// real host uses - so this test cannot pass over a component whose world has drifted.
+	let imports: Vec<WorldFn> = validated
+		.module()
+		.imports
+		.iter()
+		.map(|import| {
+			let signature = validated.module().types.get(import.type_index as usize);
+			resolve(&import.module, &import.field, signature).expect("every import resolves in the world the host offers")
+		})
+		.collect();
+	let mut host = WorldHost::new(Stub::working(), imports);
+	let out = instance.invoke("panic_now", &[], &mut host);
+	assert!(out.is_err(), "a panicking guest reaches the host as a trap, not as a result - whatever the diagnostics feature is set to");
+	if diagnostics_on {
+		assert!(host.logged(), "with dev-diagnostics its line went through the log the component already had");
+	} else {
+		assert!(!host.logged(), "without dev-diagnostics a shipping component says nothing on its way down");
+	}
 }

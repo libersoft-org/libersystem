@@ -160,7 +160,16 @@ impl<D: BlockDevice> Iso9660<D> {
 					// than one is refused here, which is where a reader that does not implement
 					// multi-volume should say so - at mount, before anything is read.
 					let Some(set_size) = both16(&block[120..124]) else { return None };
-					if set_size > 1 {
+					// EXACTLY one. `> 1` admitted zero, which is not a legal set size - a volume
+					// belongs to a set of at least itself.
+					if set_size != 1 {
+						return None;
+					}
+					// And this volume's own sequence number within that set. The root record's and
+					// every ordinary record's were checked and the DESCRIPTOR's was not, which is
+					// the one that says which volume of the set this is.
+					let Some(sequence) = both16(&block[124..128]) else { return None };
+					if sequence != 1 {
 						return None;
 					}
 					pvd_root = Some(found)
@@ -301,6 +310,9 @@ impl<D: BlockDevice> Iso9660<D> {
 		if entry.unsupported {
 			return Err(FsError::Invalid);
 		}
+		// The whole extent, before a byte of it is read - the same question `read_extent` asks, from
+		// the same helper, so the two APIs cannot disagree about whether a record is valid.
+		self.validate_extent(entry.lba, entry.size)?;
 		if offset >= entry.size as u64 || buffer.is_empty() {
 			return Ok(0);
 		}
@@ -474,10 +486,25 @@ impl<D: BlockDevice> Iso9660<D> {
 	// is the medium's own claim: one that would leave the volume is refused BEFORE the
 	// buffer is allocated - a forged length can neither allocate without bound nor read
 	// past the volume.
-	fn read_extent(&mut self, lba: u32, size: u32) -> Result<Vec<u8>, FsError> {
+	// Does this extent lie inside the volume? ONE ANSWER, for every path that trusts one.
+	//
+	// `read_extent` had it and `read_file_into` did not: the ranged reader checked the block it was
+	// about to read and nothing about the extent as a whole, so one record was invalid through one
+	// API and partly valid through the other. A volume of blocks `0..22` with a file at LBA 22
+	// declaring 4096 bytes needs 22 and 23; `read_file` refused it and
+	// `read_file_into(path, 0, &mut [0u8; 1])` returned the first byte as success.
+	//
+	// The rule this reader states is that a record describing something outside the volume is
+	// corrupt, decided once, before anything is read. Deciding it per block is a different rule.
+	fn validate_extent(&self, lba: u32, size: u32) -> Result<(), FsError> {
 		if lba as u64 + (size as u64).div_ceil(SECTOR_SIZE as u64) > self.geo.blocks as u64 {
 			return Err(FsError::Invalid);
 		}
+		Ok(())
+	}
+
+	fn read_extent(&mut self, lba: u32, size: u32) -> Result<Vec<u8>, FsError> {
+		self.validate_extent(lba, size)?;
 		// A CEILING AND A FALLIBLE ALLOCATION.
 		//
 		// `size` comes off the medium, up to `u32::MAX`, and the bound above proves only that the
@@ -696,8 +723,15 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 	let mut out = String::new();
 	while off + 4 <= sys.len() {
 		let len = sys[off + 2] as usize;
+		// A MALFORMED ENTRY IS NOT AN END, it is a reason to distrust everything after it - and
+		// everything before it, because what has been accumulated so far is a PREFIX.
+		//
+		// This used to `break`, and the function then returned whatever `NM` fragments it had
+		// collected. That is the truncated name the comment below refuses `CE` for, arriving by the
+		// other door: a structurally broken area produced a name the medium does not carry, and it
+		// became a lookup key.
 		if len < 4 || off + len > sys.len() {
-			break;
+			return None;
 		}
 		let sig = &sys[off..off + 2];
 		// FAIL CLOSED on what this parser cannot follow, rather than answering with a different
@@ -724,7 +758,13 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 			if sys[off + 4] & 0x01 != 0 {
 				return None;
 			}
-			out.push_str(core::str::from_utf8(&sys[off + 5..off + len]).unwrap_or(""));
+			// NON-UTF-8 IS A REFUSAL, not an empty fragment. `unwrap_or("")` contributed nothing
+			// and left whatever the other fragments held, which is a name assembled out of the
+			// parts that happened to decode - the same partial answer, one layer down.
+			let Ok(fragment) = core::str::from_utf8(&sys[off + 5..off + len]) else {
+				return None;
+			};
+			out.push_str(fragment);
 		}
 		off += len;
 	}
@@ -736,7 +776,9 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 // Read from the ROOT directory's own record, which is where SUSP puts it. Without this the Rock
 // Ridge path was guesswork: `NM` was believed wherever it appeared.
 fn susp_skip_of(sys: &[u8]) -> Option<usize> {
-	if sys.len() >= 7 && &sys[0..2] == b"SP" && sys[2] as usize >= 7 && sys[4] == 0xBE && sys[5] == 0xEF {
+	// The VERSION too, which this read past - `SP` is version 1 and an entry claiming another is a
+	// structure with the same two letters and different contents.
+	if sys.len() >= 7 && &sys[0..2] == b"SP" && sys[2] as usize >= 7 && sys[3] == 1 && sys[4] == 0xBE && sys[5] == 0xEF {
 		return Some(sys[6] as usize);
 	}
 	None
@@ -751,7 +793,7 @@ fn susp_skip_of(sys: &[u8]) -> Option<usize> {
 //
 // `ST` ends the area. A length below the four-byte header, or one that runs past the end, stops the
 // walk rather than sliding: a malformed entry means nothing after it can be located.
-fn for_each_susp(sys: &[u8], mut f: impl FnMut(&[u8; 2], &[u8])) {
+fn for_each_susp(sys: &[u8], mut f: impl FnMut(&SuspEntry<'_>)) {
 	let mut at = 0usize;
 	while at + 4 <= sys.len() {
 		let sig = [sys[at], sys[at + 1]];
@@ -762,9 +804,30 @@ fn for_each_susp(sys: &[u8], mut f: impl FnMut(&[u8; 2], &[u8])) {
 		if len < 4 || at + len > sys.len() {
 			return;
 		}
-		f(&sig, &sys[at + 4..at + len]);
+		// THE VERSION, which this handed out as part of a slice nobody looked at.
+		//
+		// Every SUSP entry carries one and every entry this reader implements is version 1. An entry
+		// at some other version is a structure with the same signature and different contents, and
+		// reading its body as though it were the version this code knows is how another extension's
+		// bytes become a filename - the thing the `ST` check above exists to stop, one field in.
+		let entry = SuspEntry { signature: sig, version: sys[at + 3], body: &sys[at + 4..at + len] };
+		if entry.version != 1 {
+			return;
+		}
+		f(&entry);
 		at += len;
 	}
+}
+
+// One SUSP entry, with the fields the format defines rather than a signature and a slice.
+//
+// The walker used to hand out `(&[u8; 2], &[u8])` - the signature and everything after the header -
+// so the VERSION was skipped rather than validated, for `SP`, `ER`, `CE` and `NM` alike, and each
+// consumer re-derived whatever else it needed from the body by hand.
+struct SuspEntry<'a> {
+	signature: [u8; 2],
+	version: u8,
+	body: &'a [u8],
 }
 
 // The `CE` continuation this area points at, as (block, offset within it, length).
@@ -775,12 +838,25 @@ fn for_each_susp(sys: &[u8], mut f: impl FnMut(&[u8; 2], &[u8])) {
 // both-endian field in this reader.
 fn continuation_of(sys: &[u8]) -> Option<(u32, usize, usize)> {
 	let mut found = None;
-	for_each_susp(sys, |sig, body| {
-		if sig != b"CE" || body.len() < 24 || found.is_some() {
+	for_each_susp(sys, |entry| {
+		let body = entry.body;
+		if &entry.signature != b"CE" || body.len() < 24 || found.is_some() {
 			return;
 		}
-		let le = |at: usize| u32::from_le_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
-		let (block, offset, len) = (le(0), le(8) as usize, le(16) as usize);
+		// BOTH HALVES, like every other both-endian field in this reader - which is what the comment
+		// above used to claim this did while reading one.
+		//
+		// `both32` refuses unless the little and big copies agree, and it is used at eight sites: the
+		// volume block count, the logical block size, the volume set size, the root extent and size,
+		// the root's sequence number, and an ordinary record's extent, size and sequence number.
+		// Reading one half is what this reader does NOWHERE else.
+		//
+		// It matters more here than at most of them: the pointer decides where Rock Ridge is looked
+		// for, and therefore what every file on the disc is called.
+		let (Some(block), Some(offset), Some(len)) = (both32(&body[0..8]), both32(&body[8..16]), both32(&body[16..24])) else {
+			return;
+		};
+		let (offset, len) = (offset as usize, len as usize);
 		// A continuation has to fit in the block it names, or it is describing something else.
 		if offset >= SECTOR_SIZE || len == 0 || offset + len > SECTOR_SIZE {
 			return;
@@ -799,11 +875,21 @@ fn continuation_of(sys: &[u8]) -> Option<(u32, usize, usize)> {
 // header, so the identifier it promised did not exist - and the parser turned Rock Ridge on for it.
 fn announces_rockridge(sys: &[u8]) -> bool {
 	let mut announced = false;
-	for_each_susp(sys, |sig, body| {
-		if sig != b"ER" || body.len() < 4 {
+	for_each_susp(sys, |entry| {
+		let body = entry.body;
+		if &entry.signature != b"ER" || body.len() < 4 {
 			return;
 		}
-		let id_len = body[0] as usize;
+		// EVERY DECLARED LENGTH, against the entry's own size.
+		//
+		// `ER` is `LEN_ID, LEN_DES, LEN_SRC, EXT_VER` and then the identifier, the description and
+		// the source in that order. Only `LEN_ID` was read, so an `ER` carrying `RRIP_1991A` and
+		// nonsense in every other field switched the whole disc's name source.
+		let (id_len, des_len, src_len) = (body[0] as usize, body[1] as usize, body[2] as usize);
+		let Some(declared) = id_len.checked_add(des_len).and_then(|n| n.checked_add(src_len)) else { return };
+		if 4 + declared > body.len() + 4 || declared > body.len().saturating_sub(4) {
+			return;
+		}
 		// The identifier has to BE there, not merely be declared.
 		let Some(id) = body.get(4..4 + id_len) else { return };
 		// The versions of Rock Ridge whose `NM`, `CE`, `CL`, `PL` and `RE` this reader understands.

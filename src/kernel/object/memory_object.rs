@@ -108,6 +108,13 @@ impl MemoryObject {
 		if mappings.iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3) {
 			return false;
 		}
+		// FALLIBLE, because the refusal channel is already here and this was the one allocation
+		// using it for nothing. Reachable from `SYS_MEMORY_MAP` / `SYS_DMA_BUFFER_MAP`: a caller
+		// that maps objects until the heap is short turned a `false` this function already knows
+		// how to say into a kernel abort.
+		if mappings.try_reserve(1).is_err() {
+			return false;
+		}
 		mappings.push((cr3, 0));
 		true
 	}

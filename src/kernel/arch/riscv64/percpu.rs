@@ -50,6 +50,7 @@ static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 // Allocate the per-CPU blocks for `count` harts, sized by the machine. Called once by
 // the BSP before any hart initializes its slot (the heap is up by then).
 pub fn allocate(count: usize) {
+	// ALLOC-OK: boot, one block per core before any process runs
 	let mut blocks: Vec<PerCpu> = Vec::with_capacity(count);
 	blocks.resize_with(count, PerCpu::empty);
 	let leaked: &'static mut [PerCpu] = Vec::leak(blocks);

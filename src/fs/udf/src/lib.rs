@@ -145,6 +145,35 @@ impl Geometry {
 	}
 }
 
+// A file's bytes with the logical block each of them came from.
+//
+// The runs are `(byte_offset, first_logical_block)`, one per extent, in offset order; inside a run
+// the block advances every `SECTOR_SIZE` bytes. That is enough to turn any offset in the flattened
+// buffer back into the block it was read from, which is what a FID's Descriptor Tag location has to
+// be checked against.
+struct Flattened {
+	data: Vec<u8>,
+	runs: Vec<(usize, u32)>,
+}
+
+impl Flattened {
+	// The logical block holding the byte at `offset`, or None when the offset is past everything
+	// that was read (which the callers treat as corruption, since a FID must lie in the data).
+	fn block_at(&self, offset: usize) -> Option<u32> {
+		let mut found: Option<(usize, u32)> = None;
+		for &(start, lb) in &self.runs {
+			if start <= offset {
+				found = Some((start, lb));
+			} else {
+				break;
+			}
+		}
+		let (start, lb) = found?;
+		let blocks = ((offset - start) / SECTOR_SIZE) as u32;
+		lb.checked_add(blocks)
+	}
+}
+
 impl<D: BlockDevice> Udf<D> {
 	// The block device this filesystem reads through.
 	pub fn device(&self) -> &D {
@@ -220,7 +249,7 @@ impl<D: BlockDevice> Udf<D> {
 		let Some((part_start, part_len, fileset_lb)) = found else {
 			return Err(refusal);
 		};
-		Self::finish_mount(dev, part_start, part_len, fileset_lb).ok_or(MountError::Corrupt)
+		Self::finish_mount(dev, part_start, part_len, fileset_lb)
 	}
 
 	// One volume descriptor sequence: the partition and the File Set it names, or None when this
@@ -239,7 +268,7 @@ impl<D: BlockDevice> Udf<D> {
 		// The parser kept one global partition and assumed the two referred to each other.
 		let mut map_partition: Option<u16> = None;
 		let mut part_number: Option<u16> = None;
-		let mut lvd_seen: Option<u32> = None;
+		let mut lvd: Option<(u32, [u8; SECTOR_SIZE])> = None;
 		let mut fileset_lb: Option<(u32, u32)> = None;
 		// the sequence length is the medium's claim - a real MVDS is a handful of
 		// descriptors, so the scan is clamped rather than driven megablocks far.
@@ -289,86 +318,76 @@ impl<D: BlockDevice> Udf<D> {
 				// OLDER logical volume descriptor describing something this reader refuses ended the
 				// scan before the newer, supported one was seen. On exactly the rewritable media the
 				// prevailing-descriptor rule exists for.
-				TAG_LOGICAL_VOLUME if lvd_seen.is_none_or(|seen| vdsn >= seen) => {
-					lvd_seen = Some(vdsn);
-					// What UDF is this, and can this reader address it at all?
-					//
-					// None of these three was read. The parser assumed 2048-byte blocks throughout
-					// and had no way to say whether it was looking at 1.02 or 2.60 - and the header
-					// claimed a metadata-partition volume would "refuse to mount rather than being
-					// misread", which no code could produce. What happened instead was that the
-					// File Set reference resolved against the physical partition and landed on
-					// something that was not a File Set Descriptor, so the mount failed by accident.
-					if le32(&block[212..216]) != SECTOR_SIZE as u32 {
-						return Err(MountError::Unsupported);
-					}
-					// The Domain Identifier, which says this is a UDF volume and not merely an
-					// ECMA-167 one this reader has no business interpreting.
-					if &block[217..236] != b"*OSTA UDF Compliant" {
-						return Err(MountError::Unsupported);
-					}
-					// AND WHICH UDF THIS IS. The revision lives in the domain identifier's suffix -
-					// two bytes, BCD, little-endian - and was not read at all, so this reader could
-					// not say whether it was looking at 1.02 or 2.60 while implementing a subset of
-					// specific revisions. 1.02 through 2.60 is what the structures below assume.
-					let revision = le16(&block[240..242]);
-					if !(0x0102..=0x0260).contains(&revision) {
-						return Err(MountError::Unsupported);
-					}
-					// EXACTLY one Type-1 (physical) partition map. Every logical address here is
-					// resolved against the one physical partition, which is correct for this shape
-					// and silently wrong for any other - so anything else is refused by name rather
-					// than misread.
-					// The Map Table Length is at 264 and the map COUNT at 268 (ECMA-167 3/10.6:
-					// ... Logical Volume Contents Use 248..264, Map Table Length 264..268, Number
-					// of Partition Maps 268..272, Implementation Identifier 272..304).
-					//
-					// This read the length at 272, which is the first four bytes of the
-					// Implementation Identifier - on a volume `mkfs.udf` writes, the string
-					// "\0*Linux UDFFS", or 1766599168 as a little-endian u32. The bound below then
-					// refused it, `scan_sequence` returned None, and a perfectly good volume mounted
-					// as `Corrupt`.
-					//
-					// Every fixture in this crate was built to the same misreading, so all
-					// twenty-six tests agreed with it. `mkfs.udf` did not.
-					let map_len = le32(&block[264..268]) as usize;
-					let map_count = le32(&block[268..272]);
-					if map_count != 1 || map_len < 2 || 440 + map_len > block.len() {
-						return Err(MountError::Unsupported);
-					}
-					// AND THE CRC HAS TO COVER THE MAP. `crc_must_cover` bounds the LVD to 440 -
-					// where the map table starts - because the map's length is declared rather than
-					// fixed, so the rest of the bound belongs here, where the declared length is
-					// known. Without it the one structure that decides how every logical address is
-					// resolved sits outside the checksum that vouches for the descriptor.
-					if 16 + (le16(&block[10..12]) as usize) < 440 + map_len {
-						return Err(MountError::Corrupt);
-					}
-					// A TYPE-1 MAP IS SIX BYTES: type, length, volume sequence number, partition
-					// number. Accepting anything that merely BEGINS with a 1 admitted a map whose
-					// remaining bytes say nothing coherent - and the partition number it names was
-					// never compared with the partition descriptor the scan selected, so the two
-					// were assumed to refer to each other.
-					if block[440] != 1 || block[441] as usize != 6 || map_len != 6 {
-						return Err(MountError::Unsupported);
-					}
-					// Volume 1 of the set, and the partition this reader is about to use.
-					if le16(&block[442..444]) != 1 {
-						return Err(MountError::Unsupported);
-					}
-					map_partition = Some(le16(&block[444..446]));
-					if fileset_lb.is_none_or(|(seen, _)| vdsn >= seen) {
-						fileset_lb = Some((vdsn, le32(&block[252..256])));
-					}
-					// The File Set's partition reference, which was discarded. With one map it can
-					// only be partition 0, and requiring that is what makes the discard safe.
-					if le16(&block[256..258]) != 0 {
-						return Err(MountError::Unsupported);
-					}
+				// COLLECTED, then judged - which the guard above this could not do.
+				//
+				// The comment that guard carries names the defect exactly: an older logical volume
+				// descriptor describing something this reader refuses "ended the scan before the
+				// newer, supported one was seen". It does not fix it. `vdsn >= seen` stops an older
+				// descriptor OVERWRITING a newer one's data; the `return Err` inside the arm stops
+				// the scan, and it runs before any higher VDSN can appear.
+				//
+				// So nothing is refused from in here. The candidate with the highest VDSN is kept
+				// and the refusals happen after the sequence has been walked, where "is there a
+				// better one" is a question with an answer.
+				TAG_LOGICAL_VOLUME if lvd.is_none_or(|(seen, _): (u32, [u8; SECTOR_SIZE])| vdsn >= seen) => {
+					lvd = Some((vdsn, block));
 				}
 				TAG_TERMINATING => break,
 				_ => {}
 			}
+		}
+		// THE PREVAILING LVD, judged now that no higher VDSN can appear.
+		let Some((_, block)) = lvd else {
+			return Err(MountError::Corrupt);
+		};
+		// What UDF is this, and can this reader address it at all? None of these three was read
+		// before this milestone: the parser assumed 2048-byte blocks throughout and had no way to
+		// say whether it was looking at 1.02 or 2.60.
+		if le32(&block[212..216]) != SECTOR_SIZE as u32 {
+			return Err(MountError::Unsupported);
+		}
+		// The Domain Identifier, which says this is a UDF volume and not merely an ECMA-167 one this
+		// reader has no business interpreting.
+		if &block[217..236] != b"*OSTA UDF Compliant" {
+			return Err(MountError::Unsupported);
+		}
+		// AND WHICH UDF THIS IS. The revision lives in the domain identifier's suffix - two bytes,
+		// BCD, little-endian.
+		//
+		// AN EXACT LIST, not a range. `0x0102..=0x0260` admits 1.03, 1.49, 2.02, 2.37 and every
+		// other value in between, none of which is a revision that exists. The published ones are
+		// what this accepts, which is also the list a reader can check against the specification
+		// rather than take on trust.
+		let revision = le16(&block[240..242]);
+		if !matches!(revision, 0x0102 | 0x0150 | 0x0200 | 0x0201 | 0x0250 | 0x0260) {
+			return Err(MountError::Unsupported);
+		}
+		// EXACTLY one Type-1 (physical) partition map. Every logical address here is resolved
+		// against the one physical partition, which is correct for this shape and silently wrong for
+		// any other.
+		let map_len = le32(&block[264..268]) as usize;
+		let map_count = le32(&block[268..272]);
+		if map_count != 1 || map_len < 2 || 440 + map_len > block.len() {
+			return Err(MountError::Unsupported);
+		}
+		// AND THE CRC HAS TO COVER THE MAP: its length is declared rather than fixed, so the bound
+		// belongs where the declared length is known.
+		if 16 + (le16(&block[10..12]) as usize) < 440 + map_len {
+			return Err(MountError::Corrupt);
+		}
+		// A TYPE-1 MAP IS SIX BYTES: type, length, volume sequence number, partition number.
+		if block[440] != 1 || block[441] as usize != 6 || map_len != 6 {
+			return Err(MountError::Unsupported);
+		}
+		if le16(&block[442..444]) != 1 {
+			return Err(MountError::Unsupported);
+		}
+		let map_partition = Some(le16(&block[444..446]));
+		let fileset_lb = Some((0u32, le32(&block[252..256])));
+		// The File Set's partition reference, which was discarded. With one map it can only be
+		// partition 0, and requiring that is what makes the discard safe.
+		if le16(&block[256..258]) != 0 {
+			return Err(MountError::Unsupported);
 		}
 		let (Some((_, part_start, part_len)), Some((_, fileset_lb))) = (part, fileset_lb) else {
 			return Err(MountError::Corrupt);
@@ -386,7 +405,13 @@ impl<D: BlockDevice> Udf<D> {
 	}
 
 	// The checks that do not depend on which sequence supplied the answer.
-	fn finish_mount(mut dev: D, part_start: u32, part_len: u32, fileset_lb: u32) -> Option<Udf<D>> {
+	// `Result`, not `Option` - so the two device reads below stay `Io`.
+	//
+	// The caller did `.ok_or(MountError::Corrupt)`, and this function performs the last two reads of
+	// a mount: the partition-end probe and the File Set. A device that failed either was reported as
+	// a corrupt volume, which is the exact conflation `MountError` was introduced to end and the one
+	// StorageService now depends on to decide between `Again` and a refusal.
+	fn finish_mount(mut dev: D, part_start: u32, part_len: u32, fileset_lb: u32) -> Result<Udf<D>, MountError> {
 		let mut block = [0u8; SECTOR_SIZE];
 		// the partition length bounds every partition-relative address; a zero length or
 		// a File Set outside it cannot form a volume, and the partition's last block must
@@ -394,22 +419,27 @@ impl<D: BlockDevice> Udf<D> {
 		// allocates without bound, inside a later read (the real media size then bounds
 		// every extent).
 		if part_len == 0 || fileset_lb >= part_len {
-			return None;
+			return Err(MountError::Corrupt);
 		}
 		if !dev.read_block(part_start as u64 + part_len as u64 - 1, &mut block) {
-			return None;
+			return Err(MountError::Io);
 		}
-		if !dev.read_block(part_start as u64 + fileset_lb as u64, &mut block) || !validate_descriptor(&block, TAG_FILE_SET, fileset_lb) {
-			return None;
+		if !dev.read_block(part_start as u64 + fileset_lb as u64, &mut block) {
+			return Err(MountError::Io);
+		}
+		if !validate_descriptor(&block, TAG_FILE_SET, fileset_lb) {
+			return Err(MountError::Corrupt);
 		}
 		// The root ICB is a `long_ad`, and its PARTITION was thrown away here - only the block
 		// number was read. Kept now, so a File Set naming another partition is refused by the
 		// resolver rather than read as partition 0.
-		let root_icb = LogicalAddress::from_long_ad(&block, 400)?;
+		let Some(root_icb) = LogicalAddress::from_long_ad(&block, 400) else {
+			return Err(MountError::Corrupt);
+		};
 		if root_icb.lb >= part_len {
-			return None;
+			return Err(MountError::Corrupt);
 		}
-		Some(Udf { dev, geo: Geometry { part_start, part_len, root_icb } })
+		Ok(Udf { dev, geo: Geometry { part_start, part_len, root_icb } })
 	}
 
 	// The partition's size in bytes - the length the Main Volume Descriptor Sequence
@@ -459,7 +489,8 @@ impl<D: BlockDevice> Udf<D> {
 	// returning its ICB block and whether it is a directory. The parent entry matches
 	// the name "..", so paths through it resolve as on the other backends.
 	fn find_entry(&mut self, dir_icb: LogicalAddress, name: &[u8]) -> Result<(LogicalAddress, bool), FsError> {
-		let data = self.read_icb(dir_icb, Some(true))?;
+		let dir = self.read_icb_mapped(dir_icb, Some(true))?;
+		let data = &dir.data;
 		let mut off = 0usize;
 		// An EXACT match wins outright; a case-folded one is a fallback, and an ambiguous fallback
 		// is an error rather than whichever record came first. `README`, `Readme` and `readme` can
@@ -467,6 +498,10 @@ impl<D: BlockDevice> Udf<D> {
 		// others unreachable by their own names.
 		let mut folded: Option<(LogicalAddress, bool)> = None;
 		let mut folded_ambiguous = false;
+		// A DIRECTORY'S RECORDS TILE ITS EXTENT. Anything from one to thirty-seven bytes after the
+		// last FID ends this walk and the listing returns `Ok`, so a directory whose records do not
+		// tile its extent exactly reads as a healthy one that is simply missing a file. The check
+		// after the loop is what says otherwise.
 		while off + 38 <= data.len() {
 			let fid = &data[off..];
 			// A record that is not a File Identifier Descriptor, or one that runs past the
@@ -492,14 +527,33 @@ impl<D: BlockDevice> Udf<D> {
 			//
 			// A FID's length is its own, not the buffer's, which is why this takes an end - and the
 			// end is the PADDED length, because that is the record a writer computed its CRC over.
-			if !validate_descriptor_within(fid, TAG_FILE_ID, None, (total + 3) & !3) {
+			//
+			// AND THE COVERAGE IS `38 + l_iu + l_fi`, not the constant 38. The name is read from
+			// `fid[38 + l_iu .. 38 + l_iu + l_fi]`, so a forged `DescriptorCRCLength` of 22 covers
+			// bytes 16..38 - the whole fixed part, including the child ICB at 20 - passes, and
+			// leaves every byte of the file identifier outside the range the CRC was computed over.
+			// The name can then be edited freely and the CRC still matches, which is the finding
+			// this milestone opened with, one field further in.
+			// THE FID'S OWN BLOCK, which used to be `None` under a comment saying a FID has no
+			// address to check. It has: the Descriptor Tag location is the logical block the
+			// descriptor's first byte is in, and `Flattened` kept that through the flattening. A FID
+			// copied from another directory - the exact forgery this field exists to catch - now
+			// fails here instead of listing as a file.
+			let Some(here) = dir.block_at(off) else {
+				return Err(FsError::Corrupt);
+			};
+			if !validate_descriptor_covering(fid, TAG_FILE_ID, Some(here), (total + 3) & !3, total) {
 				return Err(FsError::Corrupt);
 			}
 			let chars = fid[18];
 			let parent = chars & 0x08 != 0;
 			let deleted = chars & 0x04 != 0;
 			let is_dir = chars & 0x02 != 0;
-			let id = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]);
+			// A name that does not decode is a CORRUPT record, not one to pass over: skipping it
+			// listed a damaged directory as a tidy one.
+			let Some(id) = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]) else {
+				return Err(FsError::Corrupt);
+			};
 			if parent {
 				if name == b".." {
 					return Ok((LogicalAddress::from_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
@@ -518,6 +572,12 @@ impl<D: BlockDevice> Udf<D> {
 			}
 			off += (total + 3) & !3;
 		}
+		// The records have to tile the extent exactly: a tail too short to be a record is a
+		// directory whose structure does not add up, and reading it as one that simply ends there
+		// is the same silent-shortening this reader refuses everywhere else.
+		if off != data.len() {
+			return Err(FsError::Corrupt);
+		}
 		if folded_ambiguous {
 			return Err(FsError::BadName);
 		}
@@ -528,9 +588,14 @@ impl<D: BlockDevice> Udf<D> {
 	// entry, deleted records, and empty names. The size column comes from the child's
 	// File Entry HEADER - a listing never pulls file contents through the device.
 	fn read_dir(&mut self, dir_icb: LogicalAddress) -> Result<Vec<FileInfo>, FsError> {
-		let data = self.read_icb(dir_icb, Some(true))?;
+		let dir = self.read_icb_mapped(dir_icb, Some(true))?;
+		let data = &dir.data;
 		let mut out = Vec::new();
 		let mut off = 0usize;
+		// A DIRECTORY'S RECORDS TILE ITS EXTENT. Anything from one to thirty-seven bytes after the
+		// last FID ends this walk and the listing returns `Ok`, so a directory whose records do not
+		// tile its extent exactly reads as a healthy one that is simply missing a file. The check
+		// after the loop is what says otherwise.
 		while off + 38 <= data.len() {
 			let fid = &data[off..];
 			// Corruption, not the end: a listing that stopped at the damage and returned `Ok`
@@ -554,13 +619,30 @@ impl<D: BlockDevice> Udf<D> {
 			//
 			// A FID's length is its own, not the buffer's, which is why this takes an end - and the
 			// end is the PADDED length, because that is the record a writer computed its CRC over.
-			if !validate_descriptor_within(fid, TAG_FILE_ID, None, (total + 3) & !3) {
+			//
+			// AND THE COVERAGE IS `38 + l_iu + l_fi`, not the constant 38. The name is read from
+			// `fid[38 + l_iu .. 38 + l_iu + l_fi]`, so a forged `DescriptorCRCLength` of 22 covers
+			// bytes 16..38 - the whole fixed part, including the child ICB at 20 - passes, and
+			// leaves every byte of the file identifier outside the range the CRC was computed over.
+			// The name can then be edited freely and the CRC still matches, which is the finding
+			// this milestone opened with, one field further in.
+			// THE FID'S OWN BLOCK, which used to be `None` under a comment saying a FID has no
+			// address to check. It has: the Descriptor Tag location is the logical block the
+			// descriptor's first byte is in, and `Flattened` kept that through the flattening. A FID
+			// copied from another directory - the exact forgery this field exists to catch - now
+			// fails here instead of listing as a file.
+			let Some(here) = dir.block_at(off) else {
+				return Err(FsError::Corrupt);
+			};
+			if !validate_descriptor_covering(fid, TAG_FILE_ID, Some(here), (total + 3) & !3, total) {
 				return Err(FsError::Corrupt);
 			}
 			let chars = fid[18];
 			if chars & 0x08 == 0 && chars & 0x04 == 0 {
 				let is_dir = chars & 0x02 != 0;
-				let id = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]);
+				let Some(id) = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]) else {
+					return Err(FsError::Corrupt);
+				};
 				// an unreadable child header lists as size 0 by decision - the listing
 				// stays best-effort, the file's own read reports the error honestly.
 				// A child whose File Entry cannot be read is not a zero-byte file.
@@ -581,6 +663,9 @@ impl<D: BlockDevice> Udf<D> {
 				}
 			}
 			off += (total + 3) & !3;
+		}
+		if off != data.len() {
+			return Err(FsError::Corrupt);
 		}
 		Ok(out)
 	}
@@ -631,6 +716,19 @@ impl<D: BlockDevice> Udf<D> {
 	// are bounded by the partition before a buffer is allocated or a block read; an
 	// unrecorded (sparse) extent reads as zeros, never as stale disk content.
 	fn read_icb(&mut self, at: LogicalAddress, expect_dir: Option<bool>) -> Result<Vec<u8>, FsError> {
+		Ok(self.read_icb_mapped(at, expect_dir)?.data)
+	}
+
+	// A directory's bytes AND where each of them came from.
+	//
+	// `read_icb` flattens a file's extents into one buffer and throws away which logical block each
+	// byte came from - which is why the FID walkers passed `None` as the expected tag location and
+	// said in a comment that "a FID does not have an address of its own to check". It has one: a
+	// Descriptor Tag's location is the logical block holding the descriptor's first byte, and a FID
+	// lives in a block of the directory extent it was read from. The number was not unavailable, it
+	// was DISCARDED - and with it unchecked, a FID copied from one directory into another passes
+	// every test this parser makes, which is precisely the class the location field exists to catch.
+	fn read_icb_mapped(&mut self, at: LogicalAddress, expect_dir: Option<bool>) -> Result<Flattened, FsError> {
 		let Some(block_at) = self.geo.physical(at) else {
 			return Err(FsError::Invalid);
 		};
@@ -709,6 +807,25 @@ impl<D: BlockDevice> Udf<D> {
 		if ad_off > block.len() {
 			return Err(FsError::Invalid);
 		}
+		// AND THE CRC HAS TO COVER THE ALLOCATION AREA. `crc_must_cover` bounds a File Entry to 216
+		// - `InformationLength` at 56, the ICB tag through 212, `l_ad` at 172 - and the allocation
+		// descriptors are not at a constant offset: they are at `header + l_ea`, and each one gives
+		// an extent length, an extent type, a logical block and a partition that this reader then
+		// FOLLOWS to read data.
+		//
+		// With a large `l_ea`, or simply enough descriptors, those bytes are past 216 and a declared
+		// `DescriptorCRCLength` of 200 leaves them unvouched. This is the more serious of the two:
+		// a forged FID name misnames a file, a forged allocation descriptor redirects a read.
+		//
+		// The embedded case is the same expression, and for the reason it is the same: for ICB
+		// strategy with embedded data the bytes this reader RETURNS are `ad_off..ad_off + info_len`,
+		// bounded by `l_ad`, so the coverage requirement is `header + l_ea + l_ad` there too.
+		let Some(alloc_end) = ad_off.checked_add(l_ad) else {
+			return Err(FsError::Invalid);
+		};
+		if 16 + (le16(&block[10..12]) as usize) < alloc_end.min(block.len()) {
+			return Err(FsError::Corrupt);
+		}
 		// What ONE read may allocate, which is not what the partition could hold.
 		//
 		// `info_len` was checked against the partition's byte size and then allocated whole, so a
@@ -743,7 +860,9 @@ impl<D: BlockDevice> Udf<D> {
 			if end > block.len() || info_len > l_ad {
 				return Err(FsError::Corrupt);
 			}
-			return Ok(block[ad_off..end].to_vec());
+			// The embedded bytes live in the File Entry's own block, so every offset in them maps
+			// to `at.lb` - one run, and the data is shorter than a block by construction.
+			return Ok(Flattened { data: block[ad_off..end].to_vec(), runs: alloc::vec![(0usize, at.lb)] });
 		}
 		// only short_ad, long_ad, and embedded forms exist on real media - extended_ad
 		// (20-byte records) and the reserved values are refused rather than misparsed
@@ -770,6 +889,10 @@ impl<D: BlockDevice> Udf<D> {
 			return Err(FsError::NoMemory);
 		}
 		out.resize(info_len, 0);
+		// One entry per extent: the byte offset the extent starts at, and the logical block that
+		// byte is in. Within a run the block advances every `SECTOR_SIZE` bytes, which is what
+		// `Flattened::block_at` reconstructs.
+		let mut runs: Vec<(usize, u32)> = Vec::new();
 		let mut done = 0usize;
 		let mut ad = ad_off;
 		while done < info_len && ad + step <= ad_end {
@@ -800,6 +923,12 @@ impl<D: BlockDevice> Udf<D> {
 				return Err(FsError::Invalid);
 			}
 			let take = len.min(info_len - done);
+			if runs.try_reserve(1).is_err() {
+				return Err(FsError::NoMemory);
+			}
+			// The run is recorded for an unrecorded extent too: it reads as zeros, and a FID in it
+			// is nonsense, but the offsets after it must still map to the right blocks.
+			runs.push((done, extent.lb));
 			if ext_type != 0 {
 				// an unrecorded extent (allocated or not) has no written data - it
 				// reads as zeros, never as whatever the disk blocks hold.
@@ -852,7 +981,7 @@ impl<D: BlockDevice> Udf<D> {
 		if done != info_len {
 			return Err(FsError::Corrupt);
 		}
-		Ok(out)
+		Ok(Flattened { data: out, runs })
 	}
 }
 
@@ -922,6 +1051,17 @@ impl LogicalAddress {
 	// The `long_ad` at `at`: length(4), block(4), partition(2), implementation use(6).
 	fn from_long_ad(bytes: &[u8], at: usize) -> Option<LogicalAddress> {
 		let block = bytes.get(at..at + 16)?;
+		// THE EXTENT LENGTH, which this read past.
+		//
+		// A `long_ad` is extent length, logical block address, implementation use - and the length's
+		// top two bits are the extent TYPE: 0 recorded and allocated, 1 not recorded but allocated,
+		// 2 not recorded and not allocated, 3 the next extent of allocation descriptors. Only the
+		// address was read, so an ICB reference recorded as UNALLOCATED, or of zero length, was
+		// followed as though it named data.
+		let length = le32(&block[0..4]);
+		if length >> 30 != 0 || length & 0x3fff_ffff == 0 {
+			return None;
+		}
 		Some(LogicalAddress { lb: le32(&block[4..8]), partition: le16(&block[8..10]) })
 	}
 }
@@ -955,6 +1095,24 @@ fn validate_descriptor(block: &[u8], expected_tag: u16, expected_location: u32) 
 
 // The same, over a descriptor that does not own the whole buffer - a FID inside a directory's
 // bytes, where `end` is the record's own length rather than the block's.
+// The same, with a coverage requirement the CALLER computes from the descriptor's own declared
+// lengths - which is what a variable-length descriptor needs and what `crc_must_cover`'s constants
+// cannot give.
+//
+// `crc_must_cover` says of the LVD's partition map that its "length is declared rather than fixed,
+// so its coverage is checked where the map is read - a constant here would be a guess", and that
+// dynamic check exists. A FID's name and a File Entry's allocation descriptors have exactly the same
+// property and were left on `38` and `216`: a forged `DescriptorCRCLength` could cover the fixed part
+// and leave the name, or the descriptors this reader then follows to read data, outside the range the
+// CRC vouches for.
+#[cfg_attr(test, allow(dead_code))]
+fn validate_descriptor_covering(block: &[u8], expected_tag: u16, expected_location: Option<u32>, end: usize, must_cover: usize) -> bool {
+	if !validate_descriptor_within(block, expected_tag, expected_location, end) {
+		return false;
+	}
+	16 + (le16(&block[10..12]) as usize) >= must_cover
+}
+
 fn validate_descriptor_within(block: &[u8], expected_tag: u16, expected_location: Option<u32>, end: usize) -> bool {
 	if block.len() < 16 || end > block.len() || !tag_ok(block) {
 		return false;
@@ -994,9 +1152,19 @@ fn validate_descriptor_within(block: &[u8], expected_tag: u16, expected_location
 // Decode a UDF d-string file identifier: the first byte is the compression id (8 =
 // 8-bit Latin-1, 16 = 16-bit UCS-2 big-endian); the rest are the characters. An unknown
 // id yields an empty name (the record is then skipped), never noise decoded as text.
-fn decode_name(id: &[u8]) -> String {
+// Decode a CS0 d-string into a name, or NONE when it is not a name.
+//
+// It returned `String::new()` for every malformed form - an unknown compression id, an odd UTF-16
+// length, an invalid scalar - and both directory walkers skipped a record whose name came back
+// empty. So a damaged directory listed as a healthy one that was simply missing a file, which is the
+// silent-shortening this reader refuses everywhere else. The refusal has to be a value the caller
+// cannot mistake for "no name here", and `Option` is that value.
+//
+// `Some("")` means the field was genuinely empty, which is what a parent record carries and the only
+// place an empty name is legal.
+fn decode_name(id: &[u8]) -> Option<String> {
 	if id.is_empty() {
-		return String::new();
+		return Some(String::new());
 	}
 	let mut s = String::new();
 	if id[0] == 16 {
@@ -1004,20 +1172,21 @@ fn decode_name(id: &[u8]) -> String {
 		// name. `unwrap_or('?')` mapped every bad unit to one character, so two different malformed
 		// names collided - and `chunks_exact(2)` dropped a trailing odd byte on the way.
 		if id[1..].len() % 2 != 0 {
-			return String::new();
+			return None;
 		}
 		for c in id[1..].chunks_exact(2) {
-			let Some(ch) = char::from_u32(u16::from_be_bytes([c[0], c[1]]) as u32) else {
-				return String::new();
-			};
+			let ch = char::from_u32(u16::from_be_bytes([c[0], c[1]]) as u32)?;
 			s.push(ch);
 		}
 	} else if id[0] == 8 {
 		for &b in &id[1..] {
 			s.push(b as char);
 		}
+	} else {
+		// An unknown compression id: the bytes are not text in any encoding this reader knows.
+		return None;
 	}
-	s
+	Some(s)
 }
 
 // Split a `/`-separated path into (parent dir, final name); errors on an empty name.
@@ -1050,4 +1219,20 @@ fn le32(b: &[u8]) -> u32 {
 // A little-endian u64 from an 8-byte slice.
 fn le64(b: &[u8]) -> u64 {
 	u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+// The coverage rule, reachable from a test without reverse-engineering a whole volume image.
+//
+// The two call sites compute `must_cover` from lengths a fixture would have to be built around -
+// `38 + l_iu + l_fi` inside a directory's bytes, `header + l_ea + l_ad` inside a File Entry - and a
+// test that builds those to reach one comparison is testing the fixture. The rule is one line and
+// this is what asserts it.
+#[cfg(test)]
+pub(crate) fn coverage_for_test(block: &[u8], tag: u16, end: usize, must_cover: usize) -> bool {
+	validate_descriptor_covering(block, tag, None, end, must_cover)
+}
+
+#[cfg(test)]
+pub(crate) fn validate_descriptor_within_for_test(block: &[u8], tag: u16, end: usize) -> bool {
+	validate_descriptor_within(block, tag, None, end)
 }

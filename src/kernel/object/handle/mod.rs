@@ -140,6 +140,17 @@ struct Slot {
 pub struct HandleTable {
 	slots: Vec<Slot>,
 	free: Vec<u32>,
+	// CLOSED once `close_all` has run: this table is a dead process's and takes nothing new.
+	//
+	// `close_all` skips reserved slots, which is right - their capability is elsewhere and one of
+	// the transfer's outcomes is still to come. `restore_taken` then put the capability back
+	// unconditionally, into a table whose process had finished tearing down. Accounting stayed
+	// consistent (the take never refunded, and `Drop for HandleTable` refunds what is live), so what
+	// actually happened was that an object stayed alive in a dead process's table until the last
+	// reference to the `Process` went - a delayed release rather than a leak. It was still true that
+	// `close_all` was not the terminal barrier its name and its use imply, and that is what this
+	// makes it.
+	closed: bool,
 	// The Domain whose handle quota this table charges. None for tables not tied
 	// to a Domain (e.g. unit-test tables), which skip accounting entirely.
 	domain: Option<Arc<Domain>>,
@@ -168,7 +179,7 @@ fn retire_or_recycle(slot: &mut Slot, free: &mut Vec<u32>, index: usize) {
 
 impl HandleTable {
 	pub const fn new() -> Self {
-		Self { slots: Vec::new(), free: Vec::new(), domain: None }
+		Self { slots: Vec::new(), free: Vec::new(), closed: false, domain: None }
 	}
 
 	// Bind this table to a Domain so inserts/closes charge its handle quota.
@@ -186,17 +197,44 @@ impl HandleTable {
 		self.len() == 0
 	}
 
-	// Place a capability into a free or fresh slot and return its handle. Does not
-	// touch accounting; the public insert paths charge before calling this.
-	fn place(&mut self, cap: Capability) -> Handle {
+	// Place a capability into a free or fresh slot and return its handle, or give it back when
+	// there is no room in the SLOT VECTOR for it.
+	//
+	// The quota and the memory are two different resources and this is the one that was not
+	// checked. `reserve` was taught to book physical slots as well as quota - its comment says
+	// exactly why - but `insert` and `try_insert_or_return` reached the vector through the
+	// infallible form of this function, so the ordinary "create an object and install a handle"
+	// syscall still had quota-granted-heap-empty as a kernel abort. A short heap is a userspace
+	// -reachable state; aborting on it is a denial of service with no privilege required.
+	//
+	// Every path into a slot goes through here now, and the two that must not fail
+	// (`insert_reserved`, and `restore_taken`'s fallback) reuse a slot that already exists rather
+	// than growing the vector - which is what makes their infallibility true rather than assumed.
+	fn try_place(&mut self, cap: Capability) -> Result<Handle, Capability> {
 		if let Some(index) = self.free.pop() {
 			let slot = &mut self.slots[index as usize];
 			slot.cap = Some(cap);
-			Handle::new(slot.generation, index)
-		} else {
-			let index = self.slots.len() as u32;
-			self.slots.push(Slot { cap: Some(cap), generation: 1, reserved: false });
-			Handle::new(1, index)
+			return Ok(Handle::new(slot.generation, index));
+		}
+		if self.slots.try_reserve(1).is_err() {
+			return Err(cap);
+		}
+		let index = self.slots.len() as u32;
+		self.slots.push(Slot { cap: Some(cap), generation: 1, reserved: false });
+		Ok(Handle::new(1, index))
+	}
+
+	// `try_place` for a caller that has already booked the room - see `reserve`, which reserves the
+	// slots and the quota together, and `insert`, which is documented as unable to fail. The
+	// `try_reserve` inside cannot fail for a booked slot, and if it somehow did there is nowhere to
+	// report it, so the capability is dropped where it stands rather than left in a slot that does
+	// not exist.
+	fn place(&mut self, cap: Capability) -> Handle {
+		match self.try_place(cap) {
+			Ok(handle) => handle,
+			// A handle value that names nothing: the caller's next use of it fails as a bad handle,
+			// which is a refusal rather than a corrupt table.
+			Err(_) => Handle::new(0, 0),
 		}
 	}
 
@@ -208,6 +246,11 @@ impl HandleTable {
 		if let Some(domain) = &self.domain {
 			domain.charge_handle();
 		}
+		// GROWING THE VECTOR IS FALLIBLE even here, and here there is nowhere to report it: this is
+		// the "must not fail" form, used to seed a bootstrap capability into a process being built
+		// and to reissue one whose slot vanished. The failure is therefore made into a handle value
+		// that names nothing, which the holder discovers as a bad handle on first use - a refusal,
+		// where the infallible push was a kernel abort reachable from ring 3 by exhausting the heap.
 		self.place(cap)
 	}
 
@@ -282,7 +325,17 @@ impl HandleTable {
 				return Err(cap);
 			}
 		}
-		Ok(self.place(cap))
+		match self.try_place(cap) {
+			Ok(handle) => Ok(handle),
+			Err(cap) => {
+				// The quota was charged and the memory was not there: give the quota back with the
+				// capability, or the refusal costs the caller a permanent unit of it.
+				if let Some(domain) = &self.domain {
+					domain.uncharge_handles(1);
+				}
+				Err(cap)
+			}
+		}
 	}
 
 	// Mint and install a fresh capability under the Domain's handle quota.
@@ -477,10 +530,43 @@ impl HandleTable {
 		}
 	}
 
+	// The transfer can no longer be resolved either way: the capability is GONE, and the slot that
+	// was holding its place must not hold it forever.
+	//
+	// The third outcome, and it exists because a call site reached it. `sys_thread_create` inserted
+	// the taken capability into the child ORDINARILY, so a `terminate()` racing the spawn reached
+	// `close_all`, which skipped the caller's reserved slot and destroyed the child's copy; the
+	// rollback's `take` out of the child then returned `Err` and `restore_taken` was never called.
+	// What was left was a slot with `reserved: true` and `cap: None` - not on the free list, never
+	// committed, skipped by `close_all` for the life of the process, and one unit of handle quota
+	// short. Nothing in the table cleared it, because until now nothing could.
+	//
+	// The costs are identical to `commit_taken`'s, which is what makes this the right shape rather
+	// than a special case: the handle value dies, the slot goes back under the generation rules,
+	// and the quota is refunded. What differs is only where the capability went - to the peer on a
+	// commit, nowhere at all here.
+	pub fn abandon_taken(&mut self, handle: Handle) {
+		self.commit_taken(handle);
+	}
+
 	// The transfer did not happen: the capability goes back to the handle it came from, still
 	// live, still the same value. A rejected send costs the caller nothing at all - not the
 	// capability, and not the handle it was named by.
+	//
+	// UNLESS THE TABLE IS CLOSED, in which case there is nobody to give it back to: the capability
+	// is dropped here and the quota refunded, which is what `close_all` would have done to it had it
+	// been present at the time.
 	pub fn restore_taken(&mut self, handle: Handle, cap: Capability) {
+		if self.closed {
+			drop(cap);
+			if let Some(index) = self.slots.get_mut(handle.index() as usize) {
+				index.reserved = false;
+			}
+			if let Some(domain) = &self.domain {
+				domain.uncharge_handles(1);
+			}
+			return;
+		}
 		let index = handle.index() as usize;
 		if let Some(slot) = self.slots.get_mut(index) {
 			slot.cap = Some(cap);
@@ -531,6 +617,9 @@ impl HandleTable {
 	}
 
 	pub fn close_all(&mut self) {
+		// From here the table takes nothing new: a transfer that has not resolved yet has no owner
+		// left to restore to. See `closed`.
+		self.closed = true;
 		let mut closed: u64 = 0;
 		self.free.clear();
 		for index in 0..self.slots.len() {

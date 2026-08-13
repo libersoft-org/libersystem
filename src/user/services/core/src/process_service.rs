@@ -441,6 +441,15 @@ impl<'a> Processes<'a> {
 				// Seen twice: riscv64 2026-08-10 in a run of 208, x86_64 2026-08-09 once in 211 and
 				// not on the immediate re-run. The window is general; x86_64 merely hits it less.
 				//
+				// SEEN AGAIN, x86_64 2026-08-13, and this branch cannot be the reason: it keeps a
+				// STOPPED entry, so the one that disappeared reported either an exit status or no
+				// stats at all - it had really finished. The immediate re-run of the same tree
+				// passed. What that points at is the HARNESS rather than the reap: the child's only
+				// reason to live is its bootstrap channel, and whether it has reached the end of it
+				// by the time the list request is drained is not something the test controls. The
+				// discriminator this branch adds is still right; it is not the whole race, and
+				// P02M0120 records the sighting.
+				//
 				// `completion_valid` is the discriminator the state does not carry: the kernel sets
 				// it from `exit_status()`, which exists only once the process has actually finished.
 				// So "not running and no exit status" means not started yet, and the entry stays.

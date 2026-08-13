@@ -1570,7 +1570,11 @@ fn a_grow_cluster_reaches_the_chain_only_zeroed() {
 	fs.dev.lba = fs.cluster_fs_sector(free[1]);
 	fs.dev.skip = 1;
 	fs.dev.armed = true;
-	assert_eq!(fs.write_file(b"DOCS/F12.TXT", b"y"), Err(FsError::Io));
+	// `CommitUncertain`, not `Io`. The write failed AFTER the swap's first directory write, so the
+	// new entry set may be on the medium - and `Io` reaches a caller as "try again", which is the
+	// one thing that must not happen when the first attempt may have landed. This asserted the
+	// device's error where the contract's is what the caller acts on.
+	assert_eq!(fs.write_file(b"DOCS/F12.TXT", b"y"), Err(FsError::CommitUncertain));
 	fs.dev.armed = false;
 	// the tail cluster is linked but zeroed - the listing shows only the real entries.
 	let listed = names(&fs.list_dir(b"DOCS").unwrap());
@@ -2289,7 +2293,13 @@ fn a_directory_grown_by_a_failed_write_is_grown_at_most_once() {
 	fs.dev.lba = fs.cluster_fs_sector(free[1]);
 	fs.dev.skip = 1; // let the grow's zeroing pass, fail the directory write after it
 	fs.dev.armed = true;
-	assert_eq!(fs.write_file(b"DOCS/G0.TXT", b"y"), Err(FsError::Io));
+	// `CommitUncertain`, and the mount stops accepting mutations with it.
+	//
+	// The failure is the FIRST of the swap's two writes, so the new entry set may be on the medium.
+	// `Io` told the caller to retry, and a retry may allocate over clusters a live entry already
+	// names - so the answer is the one `fs-core` defines for a commit that may have landed, and the
+	// volume goes read-only, which is what makes the refusal stick past this call.
+	assert_eq!(fs.write_file(b"DOCS/G0.TXT", b"y"), Err(FsError::CommitUncertain));
 	assert!(!fs.dev.armed, "the injected failure never fired");
 
 	// TWO clusters, not one, since 2026-08-12, and the extra one is the publish protocol working.
@@ -2305,19 +2315,21 @@ fn a_directory_grown_by_a_failed_write_is_grown_at_most_once() {
 	let cluster_bytes = (fs.geo.sectors_per_cluster * fs.geo.bytes_per_sector) as u64;
 	assert_eq!(full - fs.free_bytes().unwrap(), cluster_bytes * 2, "a failed publish costs the grown cluster and the chain it may already have named");
 
-	// The retry: arm the same trap again, on the cluster a SECOND grow would take. It must never
-	// fire, because there is no second grow - the tail the first failure left is the free run the
-	// entry now goes into.
-	let free_now: Vec<u32> = (2..=max).filter(|&c| fs.next_cluster(c).unwrap() == 0).take(2).collect();
-	fs.dev.lba = fs.cluster_fs_sector(free_now[1]);
-	fs.dev.skip = 1;
-	fs.dev.armed = true;
-	fs.write_file(b"DOCS/G0.TXT", b"y").unwrap();
-	assert!(fs.dev.armed, "the retry grew the directory a second time - a flaky device would eat the volume");
-	fs.dev.armed = false;
+	// THERE IS NO RETRY, and that is the change. This test used to arm the trap again and assert
+	// that a second attempt grew the directory no further - a bound worth having while a retry was
+	// the expected response. It is not the expected response any more: the first attempt may have
+	// published, so a second one is exactly what `CommitUncertain` exists to prevent, and the
+	// degraded mount refuses it.
+	//
+	// The bound the test was written for survives in a stronger form: the cost of an uncertain
+	// commit is fixed at what the failure already spent, because nothing further is permitted.
+	assert_eq!(fs.write_file(b"DOCS/G0.TXT", b"y"), Err(FsError::ReadOnly), "an uncertain commit refuses every later mutation");
+	assert_eq!(fs.remove(b"DOCS/A.TXT"), Err(FsError::ReadOnly), "and not only a retry of the same write");
+	assert_eq!(fs.free_bytes().unwrap(), full - cluster_bytes * 2, "and it costs nothing further");
 
-	assert_eq!(fs.read_file(b"DOCS/G0.TXT").unwrap(), b"y");
-	assert_eq!(fs.free_bytes().unwrap(), full - cluster_bytes * 3, "the successful write pays for its own data cluster and nothing else");
+	// Reads still answer: the volume's data is intact, and refusing them would lose the operator
+	// the thing they most need after an uncertain commit - a look at what is actually there.
+	assert!(fs.list_dir(b"DOCS").is_ok(), "a degraded mount still reads");
 }
 
 #[test]
@@ -3171,4 +3183,161 @@ fn scanning_the_fat_does_not_cost_more_reads_than_reading_it_whole() {
 		assert!(reads <= fat_sectors * 2 + 4, "{label}: counting free space cost {reads} reads over a {fat_sectors}-sector FAT");
 		assert!(reads >= fat_sectors, "{label}: {reads} reads cannot have covered a {fat_sectors}-sector FAT");
 	}
+}
+
+#[test]
+fn an_ambiguous_commit_is_not_a_retryable_error() {
+	// `FsError::CommitUncertain` existed in `fs-core`, StorageService already mapped it to a refusal
+	// rather than to `Again`, and LiberFS already raised it - and this backend, which has the
+	// clearest case for it in the tree, had zero occurrences. After `SwapFailure { placed: true }`
+	// it answered `Io`, which reaches a caller as "try again": repeat a create whose first attempt
+	// may already be on the medium.
+	//
+	// The dangerous half was already closed - a placed failure does not free the new chain, so a
+	// retry cannot cross-link against clusters handed back to the free pool. What was left is that
+	// the caller was told the opposite of the truth and the mount stayed writable.
+	//
+	// SWEPT over the write count rather than aimed at one, because which write of the swap a given
+	// geometry fails on is not a number worth encoding in a test: every budget either completes, or
+	// fails before publishing (an ordinary error), or fails after it (uncertain). What is asserted
+	// is that the third case never answers anything else and never leaves the mount writable.
+	let mut uncertain = 0u32;
+	for until_fail in 0..24usize {
+		let inner = MemDisk { data: build_fat(Kind::Fat16, &[File { path: "A.TXT", data: b"a" }]) };
+		let mut fs = FatFs::mount(FlakyDisk { inner, until_fail, failed: false }).expect("mount");
+		match fs.write_file(b"B.TXT", b"b") {
+			Ok(()) => {}
+			Err(FsError::CommitUncertain) => {
+				uncertain += 1;
+				assert_eq!(fs.write_file(b"C.TXT", b"c"), Err(FsError::ReadOnly), "budget {until_fail}: an uncertain commit refuses every later mutation");
+				assert!(fs.list_dir(b"").is_ok(), "budget {until_fail}: and a degraded mount still reads");
+			}
+			// Failures before anything is published stay ordinary errors: the caller may retry, and
+			// the chain it allocated has been given back.
+			Err(FsError::Io) => {}
+			Err(other) => panic!("budget {until_fail}: unexpected {other:?}"),
+		}
+	}
+	assert!(uncertain > 0, "no budget in the sweep reached a published-then-failed write, so nothing here was exercised");
+}
+
+#[test]
+fn an_oversized_directory_chain_is_refused_before_it_is_allocated() {
+	// `MAX_DIR_BYTES` is the specification's own 256 MiB bound on an exFAT directory, and it was
+	// checked on the RESULT: `read_chain(first, usize::MAX)` walked the whole chain and the length
+	// was compared afterwards. A long acyclic chain therefore allocated all of it and was then
+	// refused - the limit existed logically and not resource-wise, which is the difference between
+	// a ceiling and a receipt.
+	//
+	// The observable is how many clusters were READ, not how long the refusal took: a bounded walk
+	// stops at the ceiling, an unbounded one runs to the chain's end. `CountingDisk` is what makes
+	// that visible.
+	let img = build_fat(Kind::Fat16, &[File { path: "A.TXT", data: b"a" }]);
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("mount");
+	// A chain of every free cluster, linked head to tail: far more than a small ceiling allows and
+	// far fewer than the real one, so the refusal is the ceiling's rather than the medium's.
+	let max = fs.max_cluster();
+	let free: Vec<u32> = (2..=max).filter(|&c| fs.next_cluster(c).unwrap() == 0).collect();
+	assert!(free.len() > 8, "the fixture needs a chain to walk");
+	for pair in free.windows(2) {
+		fs.set_fat_entry_for_test(pair[0], pair[1]).expect("link");
+	}
+	fs.set_fat_entry_for_test(*free.last().unwrap(), 0xFFFF).expect("terminate");
+
+	let cluster_bytes = (fs.geo.sectors_per_cluster * fs.geo.bytes_per_sector) as usize;
+	// A ceiling of two clusters over a chain of many: refused, and refused as TooLarge rather than
+	// as a corrupt volume - the chain is legal, it is this reader that will not hold it.
+	assert_eq!(fs.read_chain_to_end_for_test(free[0], cluster_bytes * 2), Err(FsError::TooLarge));
+	// And a ceiling that covers the chain still reads it, or the assertion above proves only that
+	// the fixture is broken.
+	let whole = fs.read_chain_to_end_for_test(free[0], cluster_bytes * free.len()).expect("a chain inside the ceiling reads");
+	assert_eq!(whole.len(), cluster_bytes * free.len());
+}
+
+#[test]
+fn an_exfat_set_with_a_trailing_vendor_entry_is_handled_whole() {
+	// The parser anticipated records after the File Name entries - "A vendor extension may follow
+	// them" - accepted sets containing them, and then handed the caller an `ent_off` that stopped
+	// before them. `exfat_mark_unlinked` clears the in-use bit over `set_off..=ent_off`, so a remove
+	// left those records in use inside a set whose primary was not; a Vendor Allocation entry owns
+	// its own clusters and nothing released them.
+	//
+	// Tested at the PARSER, which is where the decision is: building a patched image to reach it
+	// would prove the same thing through three more layers of fixture.
+	//
+	// Two cases, answered differently. A BENIGN vendor entry (type bit 5 set) is a set this reader
+	// understands well enough to modify, so its records are inside the range unlink clears. An
+	// unrecognised CRITICAL one makes the whole set unrecognised, and the answer is read-only.
+	for (label, kind, read_only) in [("benign vendor extension", 0xE0u8, false), ("unknown critical secondary", 0x9Au8, true)] {
+		let name: Vec<u16> = "A".encode_utf16().collect();
+		let upcase = crate::dir::Upcase::ascii();
+		let mut set: Vec<u8> = alloc::vec![0u8; 32 * 4];
+		set[0] = 0x85; // File
+		set[1] = 3; // stream + one name + the extra record
+		set[4] = 0x20; // attributes: archive
+		set[32] = 0xC0; // Stream Extension
+		set[32 + 1] = 0; // flags: FAT chain
+		set[32 + 3] = name.len() as u8;
+		let hash = crate::dir::exfat_name_hash_for_test(&name, &upcase);
+		set[32 + 4..32 + 6].copy_from_slice(&hash.to_le_bytes());
+		set[32 + 20..32 + 24].copy_from_slice(&5u32.to_le_bytes());
+		set[32 + 24..32 + 32].copy_from_slice(&1u64.to_le_bytes());
+		set[32 + 8..32 + 16].copy_from_slice(&1u64.to_le_bytes());
+		set[64] = 0xC1; // File Name
+		set[64 + 2..64 + 4].copy_from_slice(&name[0].to_le_bytes());
+		set[96] = kind; // the record the old parser stopped before
+		let sum = crate::dir::exfat_set_checksum(&set);
+		set[2..4].copy_from_slice(&sum.to_le_bytes());
+
+		let entries = crate::dir::parse_exfat_dir(&set, &upcase).expect("the set parses");
+		assert_eq!(entries.len(), 1, "{label}: one file");
+		let e = &entries[0];
+		assert_eq!(e.name, "A", "{label}: the name still reads");
+		// THE WHOLE SET, so an unlink clears every record the checksum covered.
+		assert_eq!(e.ent_off, 96, "{label}: the entry's range reaches the last record of the set");
+		assert_eq!(e.attr & crate::dir::ATTR_READ_ONLY != 0, read_only, "{label}: whether this reader may modify the set");
+	}
+}
+
+#[test]
+fn a_ranged_read_answers_what_the_whole_file_read_refuses() {
+	// `fs-core` documents `TooLarge` as the error whose answer is a ranged read, and this crate had
+	// none - so a file past `MAX_FILE_BYTES` was unreadable by any means it offered, which for
+	// removable media is a size an ordinary disc carries.
+	//
+	// Swept over every offset and length across a multi-cluster file, on all four filesystems and on
+	// both exFAT allocation forms, because the interesting cases are the boundaries: a read starting
+	// mid-cluster, one ending mid-cluster, one spanning several, and one past the end.
+	static DATA: [u8; 3000] = {
+		let mut d = [0u8; 3000];
+		let mut i = 0;
+		while i < 3000 {
+			d[i] = (i % 251) as u8;
+			i += 1;
+		}
+		d
+	};
+	let data: &'static [u8] = &DATA;
+	let mut swept = 0u32;
+	for (label, kind) in [("fat12", Kind::Fat12), ("fat16", Kind::Fat16), ("fat32", Kind::Fat32), ("exfat", Kind::ExFat)] {
+		let img = build_fat(kind, &[File { path: "BIG.BIN", data }]);
+		let Some(mut fs) = FatFs::mount(MemDisk { data: img }) else {
+			// A geometry this fixture cannot hold the file in. Skipping is honest; asserting over
+			// a volume that does not exist is not.
+			continue;
+		};
+		assert_eq!(fs.read_file(b"BIG.BIN").expect("whole"), data, "{label}: the whole-file read still answers");
+		swept += 1;
+		for offset in [0u64, 1, 511, 512, 513, 1023, 1024, 2999, 3000, 4096] {
+			for len in [1usize, 7, 512, 1000, 4096] {
+				let mut buf = alloc::vec![0xAAu8; len];
+				let n = fs.read_file_range(b"BIG.BIN", offset, &mut buf).expect("ranged");
+				let start = (offset as usize).min(data.len());
+				let expect = &data[start..(start + len).min(data.len())];
+				assert_eq!(n, expect.len(), "{label}: offset {offset} len {len} count");
+				assert_eq!(&buf[..n], expect, "{label}: offset {offset} len {len} bytes");
+			}
+		}
+	}
+	assert!(swept >= 2, "the sweep reached only {swept} filesystems");
 }

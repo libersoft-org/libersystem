@@ -43,7 +43,7 @@ include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
 // lives in `component-world`, beside its tests. This binary is built for `*-unknown-none`, so
 // nothing in it can run on the host: the only coverage those two decisions had was one kernel
 // end-to-end path, which needs a boot per assertion and only ever takes the happy one.
-use wasm::world::{WorldFn, WorldHost, WorldServices, WriteOutcome, resolve};
+use wasm::world::{LogOutcome, ReadOutcome, WorldFn, WorldHost, WorldServices, WriteOutcome, resolve};
 
 // The IPC half of the world: the two typed-service capabilities this host was granted (a
 // StorageService client and a LogService client) and the two paths it may use them on. It holds no
@@ -66,7 +66,7 @@ struct ComponentServices {
 }
 
 impl WorldServices for ComponentServices {
-	fn read(&mut self, dst: &mut [u8]) -> Option<usize> {
+	fn read(&mut self, dst: &mut [u8]) -> ReadOutcome {
 		unsafe { read_file(self.storage, self.input_path.as_bytes(), dst) }
 	}
 
@@ -74,7 +74,7 @@ impl WorldServices for ComponentServices {
 		unsafe { write_file(self.storage, self.output_path.as_bytes(), bytes) }
 	}
 
-	fn log(&mut self, text: &str) -> bool {
+	fn log(&mut self, text: &str) -> LogOutcome {
 		unsafe { emit_log(self.logsvc, text.as_bytes()) }
 	}
 }
@@ -103,18 +103,31 @@ unsafe fn load_component(storage: u64, uri: &[u8]) -> Option<Vec<u8>> {
 
 // Read the granted input file over StorageService into `dst`, returning the number
 // of bytes copied. None on any failure.
-unsafe fn read_file(storage: u64, uri: &[u8], dst: &mut [u8]) -> Option<usize> {
+// Read the granted input file, answering WHY it did not happen rather than whether it did - the
+// same distinction `write_file` already made, applied to the operation beside it.
+//
+// A volume that ANSWERED and refused is `Refused`, and the component should not retry it; a service
+// that did not answer, or a read that failed once the file was open, is `Failed`. Both used to be
+// `None` and both reached the guest as `STATUS_IO`, so a component told to try again was sometimes
+// being told to try something it may not do.
+unsafe fn read_file(storage: u64, uri: &[u8], dst: &mut [u8]) -> ReadOutcome {
 	unsafe {
 		let opts: OpenOpts = OpenOpts { path: String::from_utf8_lossy(uri).into_owned(), write: false, create: false };
 		let mut client = volume::Client::new(ChannelTransport { chan: storage });
 		let result = match client.open(&opts) {
 			Some(Ok(r)) => r,
-			_ => return None,
+			// The volume answered and said no: that is the grant, not the machine.
+			Some(Err(_)) => return ReadOutcome::Refused,
+			// Nothing came back at all.
+			None => return ReadOutcome::Failed,
 		};
 		if result.file == 0 {
-			return None;
+			return ReadOutcome::Failed;
 		}
-		read_into(result.file, result.size, dst)
+		match read_into(result.file, result.size, dst) {
+			Some(n) => ReadOutcome::Read(n),
+			None => ReadOutcome::Failed,
+		}
 	}
 }
 
@@ -144,13 +157,19 @@ unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> WriteOutcome {
 // a guest that broke its side of the world - refused here rather than turned into replacement
 // characters somewhere nobody can see. `String::from_utf8_lossy` was answering a question the
 // caller had not asked.
-unsafe fn emit_log(logsvc: u64, msg: &[u8]) -> bool {
+unsafe fn emit_log(logsvc: u64, msg: &[u8]) -> LogOutcome {
 	let Ok(text) = core::str::from_utf8(msg) else {
-		return false;
+		// The world's `log` takes TEXT, and the host has already checked this - reaching here means
+		// the two disagree, which is this host's fault rather than the grant's.
+		return LogOutcome::Failed;
 	};
 	let entry: Entry = Entry { timestamp: unsafe { clock() }, severity: Severity::Info, source: String::from("component"), fields: alloc::vec![Field { key: String::from("message"), value: String::from(text) }] };
 	let mut client = log::Client::new(ChannelTransport { chan: logsvc });
-	matches!(client.emit(&entry), Some(Ok(())))
+	match client.emit(&entry) {
+		Some(Ok(())) => LogOutcome::Logged,
+		Some(Err(_)) => LogOutcome::Refused,
+		None => LogOutcome::Failed,
+	}
 }
 
 // Stage `bytes` in a fresh MemoryObject and return a transferable read-only buffer
@@ -266,7 +285,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// the bytes it compared had never been near the filesystem. The host holds the storage grant, so
 	// it is the one that can open the file again; the test compares both.
 	let mut readback: [u8; 512] = [0u8; 512];
-	let written: usize = unsafe { read_file(storage, output_path.as_bytes(), &mut readback) }.unwrap_or(0);
+	let written: usize = match unsafe { read_file(storage, output_path.as_bytes(), &mut readback) } {
+		ReadOutcome::Read(n) => n,
+		// The readback is the test's evidence that the write landed; a refusal and a failure are
+		// both "nothing to report", and the assertion on the other side is what says so.
+		ReadOutcome::Refused | ReadOutcome::Failed => 0,
+	};
 
 	let mut report: Vec<u8> = Vec::with_capacity(17 + written + host.output().len());
 	report.push(host.logged() as u8);

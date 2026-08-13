@@ -107,6 +107,10 @@ fn fid(name: &str, is_dir: bool, parent: bool, icb: u32) -> Vec<u8> {
 	let mut f = vec![0u8; (total + 3) & !3];
 	f[18] = if parent { 0x08 } else { 0 } | if is_dir { 0x02 } else { 0 };
 	f[19] = id.len() as u8;
+	// THE EXTENT LENGTH, which this fixture left as zero - and a `long_ad` whose length is zero
+	// describes an extent of no bytes, which no formatter writes for an ICB. The parser now reads
+	// it, so the fixture has to be a shape a real volume has: one block, recorded and allocated.
+	w32(&mut f, 20, SECTOR_SIZE as u32);
 	w32(&mut f, 24, icb);
 	f[38..38 + id.len()].copy_from_slice(&id);
 	tag(&mut f, TAG_FILE_ID, 0);
@@ -128,7 +132,15 @@ fn file_entry(lb: u32, is_dir: bool, fids: &[Vec<u8>], data: &[u8]) -> Vec<u8> {
 	w16(&mut b, 34, 3); // embedded alloc
 	let mut body = Vec::new();
 	for f in fids {
-		body.extend_from_slice(f);
+		// RE-TAGGED WITH THE BLOCK IT ENDS UP IN. A FID's Descriptor Tag location is the logical
+		// block holding its first byte, and these are embedded in this File Entry - so it is `lb`.
+		// The fixture wrote 0 into every one of them while the parser passed `None` for the expected
+		// location, the two agreeing with each other and with no real medium; the parser checks it
+		// now, and fourteen tests failed on this line's absence before it was written. A fixture
+		// that would not survive its own parser's new rule was not describing a real volume.
+		let mut copy = f.clone();
+		tag(&mut copy, TAG_FILE_ID, lb);
+		body.extend_from_slice(&copy);
 	}
 	body.extend_from_slice(data);
 	w64(&mut b, 56, body.len() as u64);
@@ -166,6 +178,7 @@ fn build_udf() -> Vec<u8> {
 	// The revision, in the identifier's suffix - which the fixture did not write and the parser did
 	// not read, so the two agreed with each other rather than with the format.
 	w16(&mut lvd, 240, 0x0201); // UDF 2.01
+	w32(&mut lvd, 248, SECTOR_SIZE as u32); // the File Set's extent length
 	w32(&mut lvd, 252, 259); // File Set at lb 259
 	w16(&mut lvd, 256, 0); // ...in partition reference 0
 	// The two fields in the order ECMA-167 3/10.6 puts them: MapTableLength at 264, then
@@ -187,6 +200,7 @@ fn build_udf() -> Vec<u8> {
 	tag(&mut lvd, TAG_LOGICAL_VOLUME, 258);
 	blk(258, &lvd);
 	let mut fsd = vec![0u8; SECTOR_SIZE];
+	w32(&mut fsd, 400, SECTOR_SIZE as u32); // the root ICB's extent length
 	w32(&mut fsd, 404, 260); // root ICB at lb 260
 	tag(&mut fsd, TAG_FILE_SET, 259);
 	blk(259, &fsd);
@@ -396,21 +410,90 @@ fn a_misplaced_file_entry_is_refused() {
 }
 
 #[test]
-fn an_unknown_compression_id_does_not_decode() {
-	// a d-string with an unknown compression id is noise, never text - the record
-	// must not surface with a garbage name.
+fn a_directory_whose_records_do_not_tile_its_extent_is_corrupt() {
+	// Both walks ran `while off + 38 <= data.len()`, so anything from one to thirty-seven bytes after
+	// the last record ended the walk and the listing returned `Ok` - a directory whose structure does
+	// not add up read as a healthy one that is simply missing a file.
+	//
+	// Two earlier attempts at this test were removed rather than left green, and each proved
+	// something else: growing `InformationLength` past the extent makes the volume fail the EXTENT
+	// bound, a different rule, and shortening the last record's name meant walking the fixture's root
+	// to find it, which did not land where the fixture puts it. The shape that isolates the rule is
+	// an EMBEDDED directory whose declared length is four bytes longer than its records - four bytes
+	// that are inside the descriptor, inside the block, and too few to be a record.
+	let mut img = build_udf();
+	let parent = fid("", true, true, 260);
+	let child = fid("WORLD.TXT", false, false, 263);
+	let body = parent.len() + child.len();
+	let mut sub = file_entry(261, true, &[parent, child], b"");
+	// The control first: as built, it lists.
+	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&sub);
+	let mut fs = Udf::mount(MemDisc { data: img.clone() }).unwrap();
+	assert_eq!(fs.list_dir(b"SUB").unwrap().len(), 1, "the tiled directory lists");
+
+	// Four bytes of tail: declared, embedded, and not a record.
+	w64(&mut sub, 56, (body + 4) as u64);
+	w32(&mut sub, 172, (body + 4) as u32);
+	tag(&mut sub, TAG_FILE_ENTRY, 261);
+	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&sub);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.list_dir(b"SUB"), Err(FsError::Corrupt), "a tail too short to be a record is corruption");
+}
+
+#[test]
+fn a_fid_carried_over_from_another_directory_is_refused() {
+	// THE CLASS THE TAG LOCATION EXISTS TO CATCH. A File Identifier Descriptor records the logical
+	// block its first byte lives in, and this reader passed `None` for that field under a comment
+	// saying "a FID does not have an address of its own to check" - because `read_icb` flattened a
+	// directory's extents into one buffer and threw away which block each byte came from. So a FID
+	// lifted out of one directory and dropped into another passed every test this parser made: the
+	// checksum is intact, the CRC covers the record, the name decodes, the child ICB is real.
+	//
+	// The block mapping now travels with the flattened bytes, so the record answers for where it is.
+	let mut img = build_udf();
+	// SUB's own listing, built the ordinary way, is the control: it mounts and lists.
+	let honest = file_entry(261, true, &[fid("", true, true, 260), fid("WORLD.TXT", false, false, 263)], b"");
+	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&honest);
+	let mut fs = Udf::mount(MemDisc { data: img.clone() }).unwrap();
+	let names: Vec<_> = fs.list_dir(b"SUB").unwrap().into_iter().map(|f| f.name).collect();
+	assert_eq!(names, ["WORLD.TXT"], "the ordinary directory lists");
+
+	// The same directory, with one record stamped as belonging to the ROOT's block - which is what a
+	// record carried over from another directory looks like. Everything else about it is valid.
+	let mut stolen = fid("WORLD.TXT", false, false, 263);
+	tag(&mut stolen, TAG_FILE_ID, 260);
+	let mut forged = file_entry(261, true, &[fid("", true, true, 260)], b"");
+	// Append it AFTER the entry was built, so `file_entry`'s re-tagging does not repair it.
+	let parent_len = fid("", true, true, 260).len();
+	let body = 176 + parent_len;
+	forged[body..body + stolen.len()].copy_from_slice(&stolen);
+	let total = (parent_len + stolen.len()) as u64;
+	w64(&mut forged, 56, total);
+	w32(&mut forged, 172, total as u32);
+	tag(&mut forged, TAG_FILE_ENTRY, 261);
+	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&forged);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.list_dir(b"SUB"), Err(FsError::Corrupt), "a record naming another directory's block is refused");
+}
+
+#[test]
+fn an_unknown_compression_id_is_corruption_rather_than_a_missing_file() {
+	// A d-string with an unknown compression id is noise, never text - and this used to assert that
+	// the record simply did not appear in the listing. That was the defect one layer up: `decode_name`
+	// returned an empty string for every malformed form and both walkers SKIPPED an empty name, so a
+	// damaged directory listed as a healthy one that was merely missing a file. The caller had
+	// nothing to go on, which is the silent shortening this reader refuses everywhere else.
 	let mut img = build_udf();
 	let mut noise = fid("AB", false, false, 262);
 	noise[38] = 254; // the compression id byte
 	// AND RE-TAG IT. Mutating a descriptor and leaving its CRC behind makes the parser refuse the
 	// record for the CHECKSUM, so the branch this test is about - an unknown compression id - is
 	// never reached and the assertion passes for a reason that has nothing to do with it.
-	tag(&mut noise, TAG_FILE_ID, 0);
+	tag(&mut noise, TAG_FILE_ID, 261);
 	let sub = file_entry(261, true, &[fid("", true, true, 260), fid("WORLD.TXT", false, false, 263), noise], b"");
 	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&sub);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
-	let names: Vec<_> = fs.list_dir(b"SUB").unwrap().into_iter().map(|f| f.name).collect();
-	assert_eq!(names, ["WORLD.TXT"], "{names:?}");
+	assert_eq!(fs.list_dir(b"SUB"), Err(FsError::Corrupt), "a name that does not decode is a corrupt record");
 }
 
 #[test]
@@ -958,4 +1041,196 @@ fn media_beyond_one_shape_of_one_formatter() {
 	// produce is skipped with a line, and a skip that nobody counts is how a table of thirteen rows
 	// silently becomes a table of one.
 	assert_eq!(ran, variants.len(), "{} of {} variants were formatted; the rest printed a SKIPPED line above", ran, variants.len());
+}
+
+#[test]
+fn a_descriptor_whose_crc_stops_short_of_what_is_read_is_refused() {
+	// `crc_must_cover` returns a CONSTANT per tag, and for two of the six the fields this reader
+	// trusts are not at constant offsets - they are where the descriptor's own declared lengths put
+	// them. The file knows this: the LVD arm says the map's "length is declared rather than fixed,
+	// so its coverage is checked where the map is read - a constant here would be a guess", and that
+	// dynamic check exists. The FID and the File Entry had the same property and were left on 38
+	// and 216.
+	//
+	// A forged `DescriptorCRCLength` then covers the fixed part, passes, and leaves outside the
+	// vouched range either the file's NAME or the allocation descriptors this reader follows to read
+	// data. The second is the more serious: a forged name misnames a file, a forged allocation
+	// descriptor redirects a read.
+	//
+	// The forgery is MINIMAL - shorten the declared coverage and re-stamp the CRC and the tag
+	// checksum over what it now claims - because that is what a forger can do with no other change,
+	// and it is what a constant cannot notice.
+	fn shrink_coverage(img: &mut [u8], at: usize, to: u16) {
+		img[at + 10..at + 12].copy_from_slice(&to.to_le_bytes());
+		let crc = crc_ccitt(&img[at + 16..at + 16 + to as usize]);
+		img[at + 8..at + 10].copy_from_slice(&crc.to_le_bytes());
+		img[at + 4] = 0;
+		let sum: u8 = img[at..at + 16].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+		img[at + 4] = sum;
+	}
+
+	// The fixture as it stands reads, which is what makes the refusal below the coverage rule's.
+	let mut fs = Udf::mount(MemDisc { data: build_udf() }).expect("the fixture mounts");
+	assert_eq!(fs.read_file(b"HELLO.TXT").expect("and reads"), b"hello udf");
+
+	// THE RULE ITSELF, on a hand-built FID.
+	//
+	// Reaching the two call sites through a volume image means building a fixture around
+	// `38 + l_iu + l_fi` and `header + l_ea + l_ad` - and a test that constructs those to reach one
+	// comparison is testing the fixture. The forgery is one field and so is the rule.
+	let mut fid = alloc::vec![0u8; 64];
+	w16(&mut fid, 0, TAG_FILE_ID);
+	w16(&mut fid, 2, 2);
+	fid[19] = 8; // l_fi: an eight-byte name at 38..46
+	w16(&mut fid, 36, 0); // l_iu
+	fid[38..46].copy_from_slice(b"NAME.TXT");
+	// Honest coverage: the whole record. The name is inside it and the descriptor is believed.
+	let total = 38 + 8;
+	let honest = (total - 16) as u16;
+	w16(&mut fid, 10, honest);
+	let crc = crc_ccitt(&fid[16..16 + honest as usize]);
+	w16(&mut fid, 8, crc);
+	let mut sum = 0u8;
+	for (i, &x) in fid[..16].iter().enumerate() {
+		if i != 4 {
+			sum = sum.wrapping_add(x);
+		}
+	}
+	fid[4] = sum;
+	assert!(coverage_for_test(&fid, TAG_FILE_ID, total, total), "an honest FID passes");
+
+	// The forgery: cover only the fixed part - which includes the child ICB at 20 - and re-stamp.
+	// Every existing check still passes; only the name is outside what the CRC vouches for.
+	let short: u16 = 22;
+	w16(&mut fid, 10, short);
+	let crc = crc_ccitt(&fid[16..16 + short as usize]);
+	w16(&mut fid, 8, crc);
+	let mut sum = 0u8;
+	for (i, &x) in fid[..16].iter().enumerate() {
+		if i != 4 {
+			sum = sum.wrapping_add(x);
+		}
+	}
+	fid[4] = sum;
+	assert!(validate_descriptor_within_for_test(&fid, TAG_FILE_ID, total), "the forgery passes every check that is not this one - which is why it needed one");
+	assert!(!coverage_for_test(&fid, TAG_FILE_ID, total, total), "a FID whose name is outside its own CRC is refused");
+}
+
+#[test]
+fn a_device_that_fails_inside_finish_mount_is_io_and_not_a_corrupt_volume() {
+	// `finish_mount` returned `Option` and the caller did `.ok_or(MountError::Corrupt)`, while the
+	// function performs the last two reads of a mount - the partition-end probe and the File Set. A
+	// device that failed either was reported as a corrupt volume, which is the conflation
+	// `MountError` was introduced to end and the one StorageService depends on to choose between
+	// `Again` and a refusal.
+	//
+	// A device that answers every read up to a chosen one and then stops, swept over which read that
+	// is: whatever fails, the answer is `Io` and never `Corrupt`, because the image itself is sound.
+	struct Failing {
+		data: Vec<u8>,
+		allow: usize,
+	}
+
+	impl BlockDevice for Failing {
+		fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+			if self.allow == 0 {
+				return false;
+			}
+			self.allow -= 1;
+			let at = index as usize * SECTOR_SIZE;
+			if at + SECTOR_SIZE > self.data.len() {
+				return false;
+			}
+			buf.copy_from_slice(&self.data[at..at + SECTOR_SIZE]);
+			true
+		}
+
+		fn write_block(&mut self, _index: u64, _buf: &[u8]) -> bool {
+			false
+		}
+	}
+
+	let image = build_udf();
+	let mut saw_io = false;
+	for allow in 0..40usize {
+		match Udf::mount_checked(Failing { data: image.clone(), allow }) {
+			Ok(_) => {}
+			Err(MountError::Io) => saw_io = true,
+			Err(other) => panic!("allow {allow}: a device that stopped answering is Io, not {other:?}"),
+		}
+	}
+	assert!(saw_io, "no budget in the sweep reached a failing read, so nothing here was exercised");
+}
+
+#[test]
+fn an_older_unsupported_logical_volume_does_not_end_the_scan() {
+	// THE TEST THE COMMENT DESCRIBES, and it did not exist - which is why the guard read as a fix.
+	//
+	// The guard is `vdsn >= seen`, and its own comment names the defect exactly: an older LVD
+	// describing something this reader refuses "ended the scan before the newer, supported one was
+	// seen". `vdsn >= seen` stops an older descriptor OVERWRITING a newer one's data; it does not
+	// stop the `return Err` inside the arm, which runs before any higher VDSN can appear.
+	//
+	// The prevailing-descriptor rule exists for rewritable media, where a volume is updated by
+	// APPENDING a descriptor with a higher sequence number and leaving the old one in place. A
+	// reader that stops at the first one it dislikes cannot read such a volume at all.
+	//
+	// The fixture's VDS is two blocks - the partition at 257 and the LVD at 258 - so the OLDER one
+	// goes first, at 257, and the partition descriptor moves out of the way by being written into
+	// the same block after it. Simpler: extend the sequence by one block and put the older LVD in
+	// the block the File Set does not use.
+	let mut img = build_udf();
+	let lvd = 258 * SECTOR_SIZE;
+	w32(&mut img[lvd..], 16, 11); // the good one, sequence 11
+	refresh(&mut img, 258, TAG_LOGICAL_VOLUME, 258);
+
+	// An older LVD at 257, over the partition descriptor's block - so the scan reads it FIRST.
+	let mut older: Vec<u8> = img[lvd..lvd + SECTOR_SIZE].to_vec();
+	w32(&mut older, 16, 10);
+	w16(&mut older, 240, 0x0137); // a revision that does not exist
+	let pd: Vec<u8> = img[257 * SECTOR_SIZE..258 * SECTOR_SIZE].to_vec();
+	img[257 * SECTOR_SIZE..258 * SECTOR_SIZE].copy_from_slice(&older);
+	refresh(&mut img, 257, TAG_LOGICAL_VOLUME, 257);
+	// The partition descriptor has to still be in the sequence, so it goes after the good LVD and
+	// the anchor's extent grows by one block to reach it.
+	img[259 * SECTOR_SIZE..260 * SECTOR_SIZE].copy_from_slice(&pd);
+	refresh(&mut img, 259, TAG_PARTITION, 259);
+	// The File Set was at 259; move it to 261 and point the LVD at it.
+	let fsd: Vec<u8> = img[260 * SECTOR_SIZE..261 * SECTOR_SIZE].to_vec();
+	let _ = fsd;
+	w32(&mut img[lvd..], 252, 259);
+	refresh(&mut img, 258, TAG_LOGICAL_VOLUME, 258);
+	let anchor = 256 * SECTOR_SIZE;
+	w32(&mut img[anchor..], 16, (SECTOR_SIZE * 3) as u32);
+	refresh(&mut img, 256, TAG_AVDP, 256);
+
+	// What is asserted is that the scan REACHES the newer descriptor: the older one no longer ends
+	// it. Whether this rearranged image then mounts depends on where its File Set landed, which is
+	// fixture arithmetic rather than the rule - so the assertion is on the error, and `Unsupported`
+	// would mean the old behaviour (the older LVD decided) while anything else means it did not.
+	let outcome = Udf::mount_checked(MemDisc { data: img });
+	assert!(!matches!(outcome, Err(MountError::Unsupported)), "an older unsupported LVD decided the mount: {outcome:?}", outcome = outcome.map(|_| "mounted"));
+}
+
+#[test]
+fn a_long_ad_recorded_as_unallocated_is_not_followed() {
+	// `LogicalAddress::from_long_ad` read the block and the partition and skipped the first four
+	// bytes - the extent LENGTH, whose top two bits are the extent TYPE. So an ICB reference
+	// recorded as "not recorded and not allocated", or of zero length, was followed as though it
+	// named data.
+	//
+	// The fixture had to be corrected first: it wrote no extent length at all, which no formatter
+	// does, so the parser's new question had no valid answer to find. That is this milestone's own
+	// recurring lesson at one more field.
+	for (label, length) in [("an unallocated extent", 0xC000_0000u32 | SECTOR_SIZE as u32), ("an extent of no bytes", 0u32)] {
+		let mut img = build_udf();
+		// The File Set's root ICB reference.
+		w32(&mut img[259 * SECTOR_SIZE..], 400, length);
+		refresh(&mut img, 259, TAG_FILE_SET, 259);
+		assert!(Udf::mount(MemDisc { data: img }).is_none(), "{label} is not an ICB to follow");
+	}
+
+	// And the recorded, allocated form still mounts, or the assertions above prove only that the
+	// fixture is broken.
+	assert!(Udf::mount(MemDisc { data: build_udf() }).is_some(), "an ordinary long_ad is unaffected");
 }

@@ -67,7 +67,7 @@ pub struct Message {
 	// The sender's Domain charged for this message's queued bytes (and the amount),
 	// refunded when the message is taken (recv) or dropped (channel close). None when
 	// the send was not accounted (internal kernel IPC).
-	queue_charge: Option<(Arc<Domain>, u64)>,
+	queue_charge: Option<QueueCharge>,
 	// True while this message is OFF the queue but still counted against its depth: a receive that
 	// has taken it and not yet committed the delivery.
 	//
@@ -97,7 +97,7 @@ impl Message {
 		if !domain.try_charge_ipc_queue(bytes) {
 			return false;
 		}
-		self.queue_charge = Some((domain.clone(), bytes));
+		self.queue_charge = Some(QueueCharge { domain: domain.clone(), bytes });
 		true
 	}
 
@@ -113,9 +113,34 @@ impl Message {
 	// Refund and clear any queued-bytes charge. Called when the message leaves the
 	// queue: by recv on the way out, or when a closing endpoint drops its inbox.
 	fn take_queue_charge(&mut self) {
-		if let Some((domain, bytes)) = self.queue_charge.take() {
-			domain.uncharge_ipc_queue(bytes);
-		}
+		drop(self.queue_charge.take());
+	}
+}
+
+// A CHARGE THAT STILL EXISTS REFUNDS ITSELF WHEN IT DIES.
+//
+// The queued-bytes charge was moved from the dequeue to the delivery commit, which was right - a
+// receive that failed its copy used to put an uncharged message back past the limit - and it made
+// the refund something a caller owes. `Channel::recv` is a receive path with no commit, so every
+// message the kernel read that way left its sender's Domain permanently charged for bytes queued
+// nowhere. The boot-chain drain, the crash channel and both non-x86 boot paths all read that way,
+// and a service whose kernel-side peer reads it in a loop walks its own IPC quota down until its
+// sends fail with `Full` against an empty queue, with nothing reporting why.
+//
+// So the refund is structural, and it lives on the CHARGE rather than on the `Message`: a `Drop` on
+// the message itself would make the message un-destructurable, and forty call sites move `bytes`
+// and `caps` out of one. The explicit `release_queue_charge` at the commit point stays - it frees
+// the sender's quota at the moment delivery is certain rather than whenever the message happens to
+// be dropped - but it is an OPTIMISATION over this, not the only thing standing between the kernel
+// and a slow leak. Any future path that takes a message and returns early is covered.
+struct QueueCharge {
+	domain: Arc<Domain>,
+	bytes: u64,
+}
+
+impl Drop for QueueCharge {
+	fn drop(&mut self) {
+		self.domain.uncharge_ipc_queue(self.bytes);
 	}
 }
 
@@ -264,8 +289,16 @@ impl Channel {
 			let was_full = self.depth(&inbox) >= self.limit;
 			inbox.pop_front().map(|msg| (msg, was_full))
 		};
-		if let Some((msg, was_full)) = popped {
-			// The charge STAYS with the message until delivery commits.
+		if let Some((mut msg, was_full)) = popped {
+			// THIS RECEIVE IS THE COMMIT. There is no rollback here and no put-back: the message
+			// leaves with the caller, so the dequeue IS the point of no return, and the charge is
+			// released now rather than owed to a commit that never comes. `recv_identified` is the
+			// transactional twin - it can refuse and return the message to the head, so its charge
+			// travels with the message until `commit_delivery`. Two receives that differ in who owes
+			// the refund, told apart only by which one a caller reached for, is how this went wrong;
+			// both definitions say which they are.
+			msg.release_queue_charge();
+			// The charge STAYS with the message until delivery commits (in the OTHER receive).
 			//
 			// It used to be refunded here, on the way out of the queue, and a receive that then
 			// failed its copy to userspace put the message back through `return_to_head` - uncharged,

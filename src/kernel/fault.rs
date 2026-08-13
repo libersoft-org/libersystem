@@ -92,7 +92,16 @@ pub fn grow_user_stack(address: u64, error_code: u64) -> bool {
 		}
 		return false;
 	}
-	process.adopt_frames(alloc::vec![new_frame]);
+	// FALLIBLY, and this is a page fault: `adopt_frames(alloc::vec![new_frame])` allocated a
+	// one-element vector to record the frame, so a short heap aborted the kernel on a path ring 3
+	// reaches by touching a guard page.
+	if !process.try_adopt_frame(new_frame) {
+		// Unmap what was just mapped and give the frame back, then report the fault unhandled: the
+		// process is killed for a stack it cannot grow, which is a refusal rather than a halt.
+		let _ = process.address_space().unmap(page);
+		unsafe { frame::deallocate(new_frame) };
+		return false;
+	}
 	process.charge_stack(PAGE_SIZE);
 	true
 }

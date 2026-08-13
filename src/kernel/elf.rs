@@ -114,12 +114,17 @@ pub fn load_into(elf: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>, s
 // allocator, and the next thing to be handed one of them shared physical memory with a
 // live address space. `load_parsed` unmaps its own segments when IT fails; this is for the
 // failure that happens after it has succeeded.
-pub fn loaded_ranges(elf: &[u8]) -> Vec<(u64, u64)> {
+// Walk the loaded ranges of an image, in header order.
+//
+// A WALK RATHER THAN A `Vec`, because its only caller is the loader's out-of-memory rollback: it
+// used to call a `loaded_ranges` that collected them, so the cleanup for heap exhaustion began by
+// asking the heap for metadata. The ranges are in the ELF header and nothing needs to own a list of
+// them to unmap them in order.
+pub fn for_each_loaded_range(elf: &[u8], mut f: impl FnMut(u64, u64)) {
 	let Some(image) = bootproto::elf::Elf::parse(elf) else {
-		return Vec::new();
+		return;
 	};
 	let bias = if image.image_type == bootproto::elf::ET_DYN { DYNAMIC_MAIN_BASE } else { 0 };
-	let mut out = Vec::new();
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
 		if ph.p_type != bootproto::elf::PT_LOAD {
@@ -127,9 +132,8 @@ pub fn loaded_ranges(elf: &[u8]) -> Vec<(u64, u64)> {
 		}
 		let Some(start) = ph.p_vaddr.checked_add(bias).map(align_down) else { continue };
 		let Some(end) = ph.p_vaddr.checked_add(bias).and_then(|v| v.checked_add(ph.p_memsz)).and_then(align_up) else { continue };
-		out.push((start, end));
+		f(start, end);
 	}
-	out
 }
 
 pub fn load_resolved_into(elf: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>, shared: &mut Vec<Arc<SharedPage>>, resolve: &impl Fn(&str) -> Option<u64>) -> Result<u64, ElfError> {
@@ -285,6 +289,14 @@ fn map_segment(data: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>, sh
 			let page = shared_page(data, source_offset, destination_offset, copy)?;
 			(page.frame(), Some(page))
 		} else {
+			// ROOM FOR THE RECORD BEFORE THE FRAME IT RECORDS. This vector grows one entry per
+			// mapped page while a frame is allocated per page, so it grows precisely as memory
+			// runs out - and an infallible `push` there is a kernel abort at the exact moment the
+			// loader is best placed to refuse. The frame is allocated only once there is somewhere
+			// to write it down, so no path can lose one it has already taken.
+			if frames.try_reserve(1).is_err() {
+				return Err(ElfError::OutOfMemory);
+			}
 			let frame = frame::allocate().ok_or(ElfError::OutOfMemory)?;
 			initialize_page(frame, data, source_offset, destination_offset, copy);
 			frames.push(frame);
@@ -297,8 +309,19 @@ fn map_segment(data: &[u8], addr_space: &AddressSpace, frames: &mut Vec<u64>, sh
 			shared.truncate(first_shared);
 			return Err(ElfError::OutOfMemory);
 		}
-		if let Some(page) = shared_page {
-			shared.push(page);
+		// Reserved before the page is kept, for the reason the frame push above gives. The page
+		// itself is shared and already exists; what can fail is the room to record that this image
+		// holds a reference to it - and the rollback is the mapping failure's, one page longer,
+		// because this page is mapped by the time we get here.
+		if shared_page.is_some() && shared.try_reserve(1).is_err() {
+			for mapped in 0..=page {
+				let _ = addr_space.unmap(start + mapped * PAGE_SIZE);
+			}
+			shared.truncate(first_shared);
+			return Err(ElfError::OutOfMemory);
+		}
+		if let Some(shared_page) = shared_page {
+			shared.push(shared_page);
 		}
 	}
 	Ok(LoadedSegment { start, end, writable: ph.p_flags & bootproto::elf::PF_W != 0, executable: ph.p_flags & bootproto::elf::PF_X != 0, first_frame })

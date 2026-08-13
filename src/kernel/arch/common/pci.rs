@@ -78,6 +78,40 @@ pub trait ConfigAccess {
 	fn read32(bus: u8, dev: u8, func: u8, off: u16) -> u32;
 	fn write32(bus: u8, dev: u8, func: u8, off: u16, val: u32);
 
+	// Run `f` with the backend's config access serialised, if it serialises at all.
+	//
+	// The x86 CF8/CFC pair is a two-register protocol - an address write then a data transfer - so
+	// its backend takes a lock per ACCESS. That closes the interleaving of two accesses and does
+	// nothing for the operations built on them: a read-modify-write of the command register is two
+	// separately-locked accesses, and a concurrent writer between them loses one of the two updates.
+	// No such writer exists today (the INTx disable happens during the serial boot scan, and MSI-X
+	// enable is DeviceManager's, one device at a time), so this is hardening - recorded because the
+	// lock is there and looks as though it covers this.
+	//
+	// The backend's own lock is not reentrant, so everything inside `f` must use the `_raw` forms.
+	fn with_config<R>(f: impl FnOnce() -> R) -> R {
+		f()
+	}
+
+	// The raw accesses, WITHOUT the backend's serialisation: only for use inside `with_config`,
+	// which is holding it. A backend that does not serialise leaves these as they are.
+	fn read32_raw(bus: u8, dev: u8, func: u8, off: u16) -> u32 {
+		Self::read32(bus, dev, func, off)
+	}
+
+	fn write32_raw(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
+		Self::write32(bus, dev, func, off, val);
+	}
+
+	// Read-modify-write a config dword as ONE operation, so a future concurrent writer cannot land
+	// between the halves. Every read-modify-write of config space goes through here.
+	fn update32(bus: u8, dev: u8, func: u8, off: u16, f: impl FnOnce(u32) -> u32) {
+		Self::with_config(|| {
+			let value = Self::read32_raw(bus, dev, func, off);
+			Self::write32_raw(bus, dev, func, off, f(value));
+		});
+	}
+
 	// A 16-bit config field, extracted from its enclosing dword. Works for both an
 	// ECAM MMIO window and legacy port CAM (which only reads whole dwords), so no
 	// backend needs its own sub-dword read.
@@ -352,8 +386,7 @@ pub fn bar_size<A: ConfigAccess>(d: &PciDevice, bar_idx: usize) -> Option<u64> {
 // of how the kernel was booted. Memory decode is turned off while the BARs move.
 pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 	// Disable memory-space decoding while the BARs move (the firmware may have enabled it).
-	let cmd0 = A::read16(d.bus, d.dev, d.func, 0x04);
-	write_command::<A>(d.bus, d.dev, d.func, cmd0 & !CMD_MEMORY_SPACE);
+	A::update32(d.bus, d.dev, d.func, 0x04, |dword| ((dword as u16) & !CMD_MEMORY_SPACE) as u32);
 	let mut i = 0usize;
 	while i < 6 {
 		let off = 0x10 + (i as u16) * 4;
@@ -393,15 +426,7 @@ pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 		i += step;
 	}
 	// Enable memory space (bit 1) + bus master (bit 2) for the device to respond + DMA.
-	let cmd = A::read16(d.bus, d.dev, d.func, 0x04);
-	write_command::<A>(d.bus, d.dev, d.func, cmd | CMD_MEMORY_SPACE | CMD_BUS_MASTER);
-}
-
-// Write the 16-bit command register (config offset 0x04) as a full dword with the
-// status half (write-1-to-clear bits) forced to 0, so updating the command never
-// clears a status bit. Shared by every command-register update below.
-fn write_command<A: ConfigAccess>(bus: u8, dev: u8, func: u8, command: u16) {
-	A::write32(bus, dev, func, 0x04, command as u32);
+	A::update32(d.bus, d.dev, d.func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
 }
 
 // Walk a device's PCI capability list and resolve its MSI-X capability: the
@@ -519,9 +544,13 @@ pub fn scan_xhci<A: ConfigAccess>() -> Vec<XhciDevice> {
 // line (the kernel takes every device interrupt via per-device MSI-X). The status half
 // is written as 0, so no write-1-to-clear status bit is touched.
 pub fn set_intx_disabled<A: ConfigAccess>(bus: u8, dev: u8, func: u8, disabled: bool) {
-	let command = A::read16(bus, dev, func, 0x04);
-	let new_command = if disabled { command | CMD_INTX_DISABLE } else { command & !CMD_INTX_DISABLE };
-	write_command::<A>(bus, dev, func, new_command);
+	A::update32(bus, dev, func, 0x04, |dword| {
+		let command = dword as u16;
+		let new_command = if disabled { command | CMD_INTX_DISABLE } else { command & !CMD_INTX_DISABLE };
+		// The status half is written as 0, so no write-1-to-clear status bit is touched - which is
+		// what `write_command` did and is preserved here rather than carried over from the read.
+		new_command as u32
+	});
 }
 
 // Enable MSI-X on a device (set the MSI-X Enable bit, clear the Function Mask) and
@@ -530,13 +559,13 @@ pub fn set_intx_disabled<A: ConfigAccess>(bus: u8, dev: u8, func: u8, disabled: 
 // once the kernel has programmed the device's table entry. `cap` is the MSI-X
 // capability's config-space offset (from VirtioDevice::msix_cap).
 pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
-	let command = A::read16(bus, dev, func, 0x04);
-	write_command::<A>(bus, dev, func, command | CMD_MEMORY_SPACE | CMD_BUS_MASTER);
+	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
 	// Message Control is the upper 16 bits of the dword at `cap` (cap_id/next are the
 	// low 16): enable MSI-X, clear the function mask.
-	let dword = A::read32(bus, dev, func, cap);
-	let mc = (((dword >> 16) as u16) | MSIX_ENABLE) & !MSIX_FUNCTION_MASK;
-	A::write32(bus, dev, func, cap, (dword & 0x0000_ffff) | ((mc as u32) << 16));
+	A::update32(bus, dev, func, cap, |dword| {
+		let mc = (((dword >> 16) as u16) | MSIX_ENABLE) & !MSIX_FUNCTION_MASK;
+		(dword & 0x0000_ffff) | ((mc as u32) << 16)
+	});
 }
 
 // Ensure a function decodes memory space and masters the bus without touching its
@@ -546,6 +575,5 @@ pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 // a message nothing receives. This keeps the device on its INTx pin.
 #[allow(dead_code)] // only the riscv INTx-over-PLIC backend keeps devices off MSI-X
 pub fn enable_mem_and_master<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
-	let command = A::read16(bus, dev, func, 0x04);
-	write_command::<A>(bus, dev, func, command | CMD_MEMORY_SPACE | CMD_BUS_MASTER);
+	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
 }

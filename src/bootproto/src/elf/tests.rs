@@ -384,3 +384,24 @@ fn a_shared_object_is_not_required_to_be_page_aligned() {
 	incongruent.p_paddr = 0x10000;
 	assert!(Elf::parse(&image(ET_DYN, &[incongruent], &payload)).is_none(), "a segment that cannot be mapped from the file as-is");
 }
+
+#[test]
+fn a_segment_whose_physical_end_wraps_is_refused() {
+	// `p_filesz > p_memsz` was checked and every FILE offset went through `checked_add`, and nothing
+	// bounded `p_paddr + p_memsz` - which `reserve_kernel`, the aarch64 placement and the riscv64
+	// staging all compute, in release builds, silently.
+	//
+	// It matters more than "an arithmetic slip". The aarch64 placement asserts `reserved.owns(base,
+	// pages)` before it writes, and both sides compute `pages` with the same expression - so in the
+	// overflow case both wrap identically, `owns` agrees, and the `write_bytes` below it uses the
+	// FULL declared `p_memsz`. The check that looks like it stands in for this one cannot.
+	let payload = vec![0xAAu8; 0x2000];
+	let wrapping = ProgramHeader { p_type: PT_LOAD, p_flags: PF_R | PF_X, p_offset: 0x1000, p_vaddr: 0x1000, p_paddr: 0xffff_ffff_ffff_f000, p_filesz: 0x100, p_memsz: 0x3000, p_align: 0x1000 };
+	assert!(Elf::parse(&image(ET_EXEC, &[wrapping], &payload)).is_none(), "a segment whose physical end wraps is not a loadable image");
+
+	// And the same segment at an address that does not wrap still parses, or the assertion above
+	// proves only that something else about it is wrong.
+	let mut fits = wrapping;
+	fits.p_paddr = 0x10_0000;
+	assert!(Elf::parse(&image(ET_EXEC, &[fits], &payload)).is_some(), "an ordinary physical address is unaffected");
+}

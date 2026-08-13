@@ -94,6 +94,22 @@ pub fn unbind(vector: u8) {
 // index, retained for the `lsirq` inventory. `dest` (the x86 LAPIC target) is unused:
 // GICv2m MSIs route through the distributor, which enable_msi_spi points at the boot
 // core.
+// Give back a vector whose Interrupt never reached its owner - see the x86_64 `release_unused_msi`
+// for why this is a free rather than a retire.
+pub fn release_unused_msi(vector: u8) {
+	if let Some(slot) = spi_slot(vector as u32) {
+		REGISTRY.free(slot);
+	}
+}
+
+// Whether this device already holds a LIVE MSI vector - see `MsiRegistry::has_live`. The policy it
+// serves lives in `sys_device_msix_acquire`.
+pub fn device_has_live_msi(owner: u32) -> bool {
+	REGISTRY.has_live(owner)
+}
+
+// One vector per device, entry 0 - see the x86_64 `acquire_msi`, which states the limit and why
+// `MsiRegistry::acquire` refuses a device that already holds a slot.
 pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
 	let len = MSI_LEN.load(Ordering::Relaxed);
 	let slot = REGISTRY.acquire(owner, len)?;

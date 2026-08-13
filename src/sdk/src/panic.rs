@@ -1,4 +1,4 @@
-// The guest's panic handler.
+// What a guest's panic handler should DO - not the handler itself.
 //
 // A guest has no unwinder: a panic aborts the instance. The host surfaces the trap to its caller,
 // so the component never spins here in practice.
@@ -9,9 +9,20 @@
 // between an SDK somebody can use and one they can only guess at. So the diagnostic is a feature,
 // off by default, and it goes through the SAME granted log the component already has: no new
 // capability, nothing to strip from a release build.
+//
+// THE `#[panic_handler]` ITSELF BELONGS TO THE PROGRAM, and it used to live here. A panic handler is
+// a policy of the final binary, and there may be exactly one per program - so a library that
+// declares one takes the choice away from every consumer that depends on it, and a component author
+// wanting their own diagnostics, a different trap, or a linked-in handler could not have it while
+// depending on this crate. That is not what a crate describing itself as "what somebody else's
+// component depends on" may do.
+//
+// So `liber-sdk` provides the behaviour and `examples/liber_component` declares the policy, in one
+// line that a component author copies along with the rest of the example.
 
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
+// Report a panic through the granted log and trap, for a component whose `#[panic_handler]` calls
+// this. Diverging, so a handler can be one expression.
+pub fn report_panic(info: &core::panic::PanicInfo) -> ! {
 	#[cfg(feature = "dev-diagnostics")]
 	report(info);
 	#[cfg(not(feature = "dev-diagnostics"))]

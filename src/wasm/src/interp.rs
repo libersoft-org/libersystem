@@ -22,6 +22,17 @@ pub enum Value {
 }
 
 impl Value {
+	// Which value type this is, for the two boundary checks validation cannot make: the arguments a
+	// host passes to `invoke`, and the results a `Host` returns from an import.
+	pub fn val_type(self) -> crate::module::ValType {
+		match self {
+			Value::I32(_) => crate::module::ValType::I32,
+			Value::I64(_) => crate::module::ValType::I64,
+			Value::F32(_) => crate::module::ValType::F32,
+			Value::F64(_) => crate::module::ValType::F64,
+		}
+	}
+
 	// The value as an i32 (an i64 is truncated, matching wasm wrapping semantics).
 	pub fn as_i32(self) -> i32 {
 		match self {
@@ -86,7 +97,7 @@ pub const PAGE: usize = 65536;
 // it: the packaging gate refuses a component whose declared minimum is above four pages, and the
 // SDK's own example uses one. 1024 pages is 64 MB - room for a component that genuinely needs to
 // grow, and far below what would trouble the service running it.
-const MAX_MEMORY_PAGES: usize = 1024;
+pub const MAX_MEMORY_PAGES: usize = 1024;
 
 // A runtime control frame: the value-stack base to unwind to on a branch, whether
 // it is a loop (a branch re-enters it), how many values a branch keeps, and the
@@ -141,7 +152,25 @@ impl Budget {
 
 	// Spend one instruction, or say the guest has run out.
 	fn step(&mut self) -> Result<(), Trap> {
-		match self.fuel.checked_sub(1) {
+		self.spend(1)
+	}
+
+	// Spend what a BULK operation costs, which is not one.
+	//
+	// `memory.copy` and `memory.fill` each cost one unit while touching up to sixty-four megabytes,
+	// so a loop of bulk copies spent fuel at a millionth of the rate the budget assumes. The wall
+	// stopped `loop br 0 end` - which was the item - and it was not a work budget, which is what the
+	// DONE note said in its own words ("a wall rather than a schedule").
+	//
+	// A byte is far cheaper than an instruction, so the rate is per kilobyte rather than per byte:
+	// a whole 64 MiB memory costs about 65,000 units against a ten-million budget, which bounds a
+	// runaway without pricing an ordinary component's one large copy out of existence.
+	fn charge_bulk(&mut self, bytes: usize) -> Result<(), Trap> {
+		self.spend(1 + (bytes as u64 / 1024))
+	}
+
+	fn spend(&mut self, units: u64) -> Result<(), Trap> {
+		match self.fuel.checked_sub(units) {
 			Some(left) => {
 				self.fuel = left;
 				Ok(())
@@ -193,7 +222,7 @@ impl<'a> Instance<'a> {
 	pub fn new(validated: &'a ValidatedModule) -> Result<Instance<'a>, Trap> {
 		let module: &Module = validated.module();
 		let mut memory: Vec<u8> = Vec::new();
-		let want: usize = module.memory_min_pages as usize * PAGE;
+		let want: usize = module.memory.map_or(0, |m| m.min_pages as usize) * PAGE;
 		if memory.try_reserve_exact(want).is_err() {
 			return Err(Trap("the host cannot allocate the module's declared memory"));
 		}
@@ -266,13 +295,46 @@ fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 
 fn call_inner(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], index: u32, args: &[Value], host: &mut dyn Host, budget: &mut Budget) -> Result<Vec<Value>, Trap> {
 	if index < module.import_count() {
-		return host.call_import(index, args, memory);
+		let results = host.call_import(index, args, memory)?;
+		// WHAT THE HOST RETURNED, against what the import declared.
+		//
+		// The vector went straight onto the operand stack with neither its length nor its types
+		// checked, so a mistake in a host implementation became a mistyped value inside a body
+		// validation had proved consistent - the one place the guarantee could be broken from
+		// outside, and the only one not checked.
+		let declared = module.imports.get(index as usize).and_then(|import| module.types.get(import.type_index as usize));
+		if let Some(ftype) = declared {
+			if results.len() != ftype.results.len() {
+				return Err(Trap("a host import returned the wrong number of results"));
+			}
+			for (value, expected) in results.iter().zip(ftype.results.iter()) {
+				if value.val_type() != *expected {
+					return Err(Trap("a host import returned a result of the wrong type"));
+				}
+			}
+		}
+		return Ok(results);
 	}
 	let defined: usize = (index - module.import_count()) as usize;
 	let func = module.funcs.get(defined).ok_or(Trap("function index out of range"))?;
 	let ftype = module.types.get(func.type_index as usize).ok_or(Trap("function type out of range"))?;
 	if args.len() != ftype.params.len() {
 		return Err(Trap("wrong argument count"));
+	}
+	// AND THEIR TYPES, which only the count was checked against.
+	//
+	// Validation proved the BODY consistent with its declared signature; a host calling
+	// `invoke("takes_i32", &[Value::F64(1.0)])` is the caller breaking that signature from outside,
+	// which validation cannot see. The value then sat in a local the body reads as an `i32`, and
+	// `Value::as_i32` converts every variant, so it did not even surface as a wrong answer.
+	//
+	// The two hosts in this tree destructure their arguments exactly and are not at risk; what was
+	// unsafe is the generic API, which is what a third caller reaches for.
+	for (index, (arg, declared)) in args.iter().zip(ftype.params.iter()).enumerate() {
+		if arg.val_type() != *declared {
+			let _ = index;
+			return Err(Trap("an argument's type does not match the function's signature"));
+		}
 	}
 	let body: &[Instr] = code.get(defined).ok_or(Trap("missing function code"))?;
 	// locals are the parameters followed by the declared locals (zero-initialized)
@@ -310,18 +372,23 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 		match instr {
 			Instr::Unreachable => return Err(Trap("unreachable")),
 			Instr::Nop => {}
-			Instr::Block { result_arity, end_pc } => {
-				ctrl.push(Frame { base: stack.len(), is_loop: false, arity: *result_arity, target: *end_pc + 1 });
+			// The interpreter needs only HOW MANY values a frame keeps, which the block type answers -
+			// so the arities it used to be handed are derived here rather than carried, and the
+			// validator gets the types it needs from the same field.
+			Instr::Block { ty, end_pc } => {
+				ctrl.push(Frame { base: stack.len(), is_loop: false, arity: block_results(module, ty), target: *end_pc + 1 });
 			}
-			Instr::Loop { param_arity } => {
-				ctrl.push(Frame { base: stack.len().saturating_sub(*param_arity as usize), is_loop: true, arity: *param_arity, target: pc });
+			Instr::Loop { ty } => {
+				let params = block_params(module, ty);
+				ctrl.push(Frame { base: stack.len().saturating_sub(params as usize), is_loop: true, arity: params, target: pc });
 			}
-			Instr::If { result_arity, has_else, else_pc, end_pc } => {
+			Instr::If { ty, has_else, else_pc, end_pc } => {
 				let cond: i32 = pop(stack)?.as_i32();
+				let arity = block_results(module, ty);
 				if cond != 0 {
-					ctrl.push(Frame { base: stack.len(), is_loop: false, arity: *result_arity, target: *end_pc + 1 });
+					ctrl.push(Frame { base: stack.len(), is_loop: false, arity, target: *end_pc + 1 });
 				} else if *has_else {
-					ctrl.push(Frame { base: stack.len(), is_loop: false, arity: *result_arity, target: *end_pc + 1 });
+					ctrl.push(Frame { base: stack.len(), is_loop: false, arity, target: *end_pc + 1 });
 					pc = *else_pc;
 				} else {
 					pc = *end_pc + 1;
@@ -395,6 +462,14 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				let a: Value = pop(stack)?;
 				stack.push(if c != 0 { a } else { b });
 			}
+			// The typed form runs exactly as the untyped one does: validation has already proved the
+			// operands are the declared type, so there is nothing left for execution to check.
+			Instr::SelectTyped(_) => {
+				let c: i32 = pop(stack)?.as_i32();
+				let b: Value = pop(stack)?;
+				let a: Value = pop(stack)?;
+				stack.push(if c != 0 { a } else { b });
+			}
 			Instr::LocalGet(i) => {
 				let v: Value = *locals.get(*i as usize).ok_or(Trap("local out of range"))?;
 				stack.push(v);
@@ -442,7 +517,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				};
 				stack.push(value);
 			}
-			Instr::Store { width, offset } => {
+			Instr::Store { width, offset, .. } => {
 				let v: Value = pop(stack)?;
 				let addr: usize = mem_addr(stack, *offset)?;
 				let w: usize = *width as usize;
@@ -502,7 +577,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 					stack.push(refused);
 					continue;
 				};
-				let declared = module.memory_max_pages.unwrap_or(u32::MAX) as usize;
+				let declared = module.memory.and_then(|m| m.max_pages).unwrap_or(u32::MAX) as usize;
 				if new_pages > declared.min(MAX_MEMORY_PAGES) {
 					stack.push(refused);
 					continue;
@@ -520,6 +595,11 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				memory.resize(new_bytes, 0);
 				stack.push(Value::I32(old_pages as i32));
 			}
+			// CHARGED FOR WHAT THEY TOUCH. `Budget::charge` takes one unit per instruction, and a
+			// `memory.copy` or `memory.fill` over sixty-four megabytes cost the same one unit as a
+			// `nop` - so a loop of bulk copies spent its fuel at a millionth of the rate the budget
+			// assumes. The wall still stopped `loop br 0 end`, which was the item; it was not a
+			// work budget, and anything whose cost is bounded by an OPERAND belongs in this class.
 			Instr::MemoryCopy => {
 				let n: usize = pop(stack)?.as_i32() as u32 as usize;
 				let s: usize = pop(stack)?.as_i32() as u32 as usize;
@@ -527,6 +607,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				if s.saturating_add(n) > memory.len() || d.saturating_add(n) > memory.len() {
 					return Err(Trap("memory.copy out of bounds"));
 				}
+				budget.charge_bulk(n)?;
 				memory.copy_within(s..s + n, d);
 			}
 			Instr::MemoryFill => {
@@ -536,6 +617,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				if d.saturating_add(n) > memory.len() {
 					return Err(Trap("memory.fill out of bounds"));
 				}
+				budget.charge_bulk(n)?;
 				for byte in &mut memory[d..d + n] {
 					*byte = val;
 				}
@@ -1346,4 +1428,24 @@ fn trunc_sat(sub: u8, stack: &mut Vec<Value>) -> Result<(), Trap> {
 	};
 	stack.push(out);
 	Ok(())
+}
+
+// How many values a block's type leaves on the stack, and how many it takes.
+//
+// The decoder used to answer these two numbers and nothing else; it now carries the TYPE and these
+// derive the counts, so the interpreter is unchanged in what it needs while the validator gains what
+// it could not reconstruct.
+fn block_results(module: &Module, ty: &crate::decode::BlockType) -> u8 {
+	match ty {
+		crate::decode::BlockType::Empty => 0,
+		crate::decode::BlockType::Value(_) => 1,
+		crate::decode::BlockType::TypeIndex(i) => module.types.get(*i as usize).map_or(0, |t| t.results.len() as u8),
+	}
+}
+
+fn block_params(module: &Module, ty: &crate::decode::BlockType) -> u8 {
+	match ty {
+		crate::decode::BlockType::Empty | crate::decode::BlockType::Value(_) => 0,
+		crate::decode::BlockType::TypeIndex(i) => module.types.get(*i as usize).map_or(0, |t| t.params.len() as u8),
+	}
 }

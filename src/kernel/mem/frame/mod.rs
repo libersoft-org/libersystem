@@ -201,6 +201,55 @@ impl FrameAllocator {
 	fn note_handout(&mut self, _base: u64, _pages: u64, _order: u8) {}
 
 	// What the record remembers about a frame: the order it was last handed out at (255 = never)
+	// A frame the two views disagree about is RETIRED, not handed out.
+	//
+	// The detector reported the double allocation, incremented its counter, and then returned the
+	// frame to the second caller anyway. That is the wrong end of the trade for this check in
+	// particular. Every other detector in this milestone reports something that has ALREADY finished
+	// happening - a lost page, a refused free, a divergence between two views - where continuing
+	// costs nothing. This one reports something about to happen, and the thing about to happen is
+	// two live page tables naming one physical page: past that point every memory-safety property
+	// above it is void and the symptom arrives somewhere else entirely, which is the argument the
+	// comment above `check_not_owned` makes for the detector existing at all.
+	//
+	// So the allocation fails - which every caller already handles, because an allocator can be
+	// empty - and the page is retired rather than returned to the buddy, since a page the two views
+	// disagree about is exactly a page nothing should hand out again.
+	//
+	// `credited` says whether the injection put the page back into the buddy and credited
+	// `free_count` for it; the accounting has to be undone the same way it was done, or the pool
+	// ends one page out of step and something several tests later subtracts past zero. That is the
+	// lesson this milestone already recorded from the other side.
+	#[cfg(debug_assertions)]
+	fn refuse_duplicate(&mut self, base: u64, pages: u64, credited: bool) {
+		// AND IN THE TEST KERNEL, STOP.
+		//
+		// Under the suite a double allocation is not a condition to survive - it is the answer this
+		// milestone has been waiting for since the one unexplained riscv64 sighting, and the most
+		// useful thing the kernel can do is halt with the diagnostic as the last line rather than
+		// bury it under two hundred subsequent tests. The refusal above keeps a RELEASE build safe;
+		// this makes a test run legible, and a release build does not compile the check at all so it
+		// costs a shipping system nothing.
+		//
+		// The injection is the exception, because its whole purpose is to produce this state on
+		// demand and watch the detector answer: it says so by having credited the free.
+		#[cfg(test)]
+		if !credited && !inject::ever_armed() {
+			crate::serial_println!("frame: halting - a double allocation under the suite is the diagnostic this milestone exists for, and burying it under the tests that follow is how the last one was lost");
+			crate::arch::halt_loop();
+		}
+		if credited {
+			self.free_count -= 1;
+		}
+		self.free_count -= pages as usize;
+		RETIRED_PAGES.fetch_add(pages, core::sync::atomic::Ordering::AcqRel);
+		LOST_PAGES.fetch_add(pages, core::sync::atomic::Ordering::AcqRel);
+		let _ = base;
+	}
+
+	#[cfg(not(debug_assertions))]
+	fn refuse_duplicate(&mut self, _base: u64, _pages: u64, _credited: bool) {}
+
 	// and the allocation number that did it.
 	#[cfg(debug_assertions)]
 	fn previous_handout(&self, phys: u64) -> (u8, u32) {
@@ -487,6 +536,10 @@ impl FrameAllocator {
 				let (order, seq) = self.previous_handout(base);
 				crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {base:#x} at order 0 as allocation {}, and it was already on loan from order {order} as allocation {seq}", self.allocations.wrapping_add(1));
 				DOUBLE_ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+				// AND THE FRAME IS NOT HANDED OUT. See `refuse_duplicate` for why this detector, of
+				// all of them, must not let its subject through.
+				self.refuse_duplicate(base, 1, duplicated);
+				return None;
 			}
 			self.free_count -= 1;
 			self.note_handout(base, 1, 0);
@@ -529,6 +582,8 @@ impl FrameAllocator {
 				let (was, seq) = self.previous_handout(first);
 				crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {pages} page(s) at {base:#x} at order {order} as allocation {}, and {first:#x} was already on loan from order {was} as allocation {seq}", self.allocations.wrapping_add(1));
 				DOUBLE_ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+				self.refuse_duplicate(base, pages, false);
+				return None;
 			}
 			self.free_count -= pages as usize;
 			self.note_handout(base, pages, order);
@@ -929,6 +984,21 @@ mod inject {
 
 	pub fn disarm() {
 		BUDGET[me()].store(usize::MAX, Ordering::Release);
+	}
+
+	// Has any test ever armed this injector on this boot?
+	//
+	// The halt below needs to tell a duplicate the SUITE produced from one the allocator produced,
+	// and `duplicate_next` is a two-step thing: the injection frees the block back, so the first
+	// handout is marked and the SECOND - the one the detector fires on - is not. Marking only the
+	// first made the halt fire on the injection test itself.
+	//
+	// Whether an injector has ever been armed is the honest question. It is false for every boot
+	// that has not run an injection test, which is every boot outside the suite and every suite run
+	// up to that test - and a real sighting after it would be missed by the halt while still being
+	// reported and refused, which is the safe direction to be wrong in.
+	pub(super) fn ever_armed() -> bool {
+		EVER_ARMED.load(Ordering::Acquire)
 	}
 
 	// Make the NEXT allocation on this core hand out a frame that is already on loan.

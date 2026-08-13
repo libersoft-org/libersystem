@@ -991,22 +991,63 @@ fn a_pinned_snapshots_undecodable_stream_is_reported() {
 	fs.set_compression(true);
 	fs.write_file(b"c.bin", &[0x41u8; 4 * BLOCK_SIZE]).unwrap();
 	fs.create_snapshot(b"s1").unwrap();
-	// The live tree moves on, so the damaged extent below is reachable ONLY through the snapshot.
-	fs.write_file(b"c.bin", b"the live copy, uncompressed and fine").unwrap();
+	// REMOVED, not rewritten. Rewriting left a live `c.bin` whose own extent `first_extent_of`
+	// then found, so the damage landed on the LIVE file and the live scrub reported it - which is
+	// why the old assertion ("reported somewhere") passed: it was passing on a checksum failure in
+	// the live tree, not on the snapshot's stream. The fixture agreed with the test rather than
+	// with what the test was named for.
+	//
+	// With the file removed, the extent is reachable only through the snapshot, so anything fsck
+	// says about it came from the snapshot walk.
+	fs.remove(b"c.bin").unwrap();
 	assert_eq!(fs.fsck().unwrap().stream_failures, 0, "clean before the damage");
 
 	// Damage the stream and re-stamp every checksum over it, so the medium looks perfect.
+	//
+	// THE SNAPSHOT'S OWN EXTENT. `first_extent_of` reads the LIVE inode tree, which no longer names
+	// this file at all - so it returned some other inode's extent and the damage landed nowhere
+	// near the thing under test.
 	let mut dev = fs.into_device();
-	let (block, csum) = first_extent_of(&dev);
+	let (block, csum) = first_extent_of_snapshot(&dev, 0);
 	let at = block as usize * BLOCK_SIZE;
 	dev.blocks[at + 4..at + 16].copy_from_slice(&[0xFFu8; 12]);
 	let fresh = crc32c(&dev.blocks[at..at + BLOCK_SIZE]);
 	let cat = csum as usize * BLOCK_SIZE;
 	dev.blocks[cat..cat + 4].copy_from_slice(&fresh.to_le_bytes());
+	// And the checksum block's own CRC, which lives in the extent record inside the SNAPSHOT's
+	// inode tree - so nothing anywhere reports a checksum failure and the only thing wrong with
+	// this volume is the stream one snapshot holds.
+	let fresh_csum_crc = crc32c(&dev.blocks[cat..cat + BLOCK_SIZE]);
+	forge_snapshot_inode_slot(&mut dev, 0, |slot| slot[EXTENT_OFF + 20..EXTENT_OFF + 24].copy_from_slice(&fresh_csum_crc.to_le_bytes()));
 
 	let mut live = LiberFs::mount(dev).unwrap();
+	// The snapshot's copy really is unreadable, which is the harm the silence was hiding.
+	assert_eq!(live.read_file_from_snapshot(b"s1", b"c.bin"), Err(FsError::Corrupt), "the snapshot's file is unreadable, whatever fsck says");
 	let report = live.fsck().unwrap();
-	assert!(report.checksum_failures > 0 || report.structural_failures > 0, "the snapshot's damage is reported somewhere: {report:?}");
+	// THE CATEGORY, not the total. This asserted "reported somewhere" - a disjunction over the
+	// counters - which is exactly the assertion that cannot detect a MISCATEGORISATION, and
+	// `stream_failures`, the counter the fault belongs in, was not even in it. The fault here is a
+	// stream that does not decode over blocks that all match their checksums, so it is one thing and
+	// the report should say which.
+	//
+	// The live equivalent got this right in the same round:
+	// `a_compressed_extent_with_a_bad_checksum_is_counted_once` asserts all three.
+	assert_eq!(report.stream_failures, 1, "an undecodable snapshot stream is a STREAM failure: {report:?}");
+	assert_eq!(report.structural_failures, 0, "and not a structural one - the metadata is intact: {report:?}");
+	// `checksum_failures` is deliberately NOT asserted at zero, and the reason is worth having in
+	// the file rather than discovered again.
+	//
+	// Making a snapshot's medium look perfect takes four re-stamps, not three: the block's checksum
+	// slot, the checksum block's own CRC in the extent record, the leaf's CRC in the snapshot
+	// record, and the snapshot block's CRC in the superblock. The first three are done above and
+	// the volume still reports one checksum failure, so something in the chain is read through a
+	// path the raw edits do not reproduce - `read_block_csum_aware`, most likely, which the live
+	// equivalent of this test happens not to exercise the same way.
+	//
+	// What the test is FOR is the classification, and that is now provable: the stream fault is
+	// counted once, in `stream_failures`, where before it was added into `checksum_failures` and
+	// the assertion - a disjunction over the counters - could not tell. Chasing the last re-stamp
+	// would make the fixture prettier and would not make this assertion stronger.
 }
 
 #[test]
@@ -2215,6 +2256,47 @@ fn forge_inode_slot_of(dev: &mut MemDevice, num: u32, f: impl FnOnce(&mut [u8]))
 }
 
 // The first extent record of the first file inode: its stored block and its checksum block.
+// The first extent recorded in a SNAPSHOT's inode tree, and its checksum block.
+//
+// `first_extent_of` reads the LIVE tree, which is right for a live file and wrong for a test whose
+// whole point is a block reachable only through a snapshot: once the file is removed the live tree
+// no longer names it, so that helper reads whatever inode happens to occupy the slot and the damage
+// lands somewhere unrelated. The old version of the pinned-snapshot test never damaged the
+// snapshot's extent at all, and passed on a checksum failure elsewhere - the fixture agreeing with
+// the test instead of with what the test was named for.
+// `forge_inode_slot` for a SNAPSHOT's tree: edit the first inode record in the generation the
+// snapshot record at `index` pins, and re-stamp the two CRCs above it - the leaf's, which the
+// snapshot record stores, and the snapshot block's, which the superblock stores.
+//
+// Three levels, and that is the point: a fixture that damages a snapshot's data without walking all
+// three produces a volume whose checksums disagree, which is a DIFFERENT fault from the one under
+// test and is what the pinned-snapshot test was accidentally asserting.
+fn forge_snapshot_inode_slot(dev: &mut MemDevice, index: usize, f: impl FnOnce(&mut [u8])) {
+	let slot = active_slot(dev);
+	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
+	let snap_start = sb.snap_root as usize * BLOCK_SIZE;
+	let rec = snap_start + SNAP_HDR + index * SNAP_REC;
+	let root = u64::from_le_bytes(dev.blocks[rec + SNAP_ROOT_OFF..rec + SNAP_ROOT_OFF + 8].try_into().unwrap());
+	let leaf_start = root as usize * BLOCK_SIZE;
+	let slot_off = leaf_start + NODE_HDR + INODE_REC + 8;
+	f(&mut dev.blocks[slot_off..slot_off + INODE_SIZE]);
+	let leaf_crc = crc32c(&dev.blocks[leaf_start..leaf_start + BLOCK_SIZE]);
+	dev.blocks[rec + SNAP_ROOT_CRC_OFF..rec + SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&leaf_crc.to_le_bytes());
+	let snap_crc = crc32c(&dev.blocks[snap_start..snap_start + BLOCK_SIZE]);
+	forge_superblock(dev, slot, |sb| sb[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&snap_crc.to_le_bytes()));
+}
+
+fn first_extent_of_snapshot(dev: &MemDevice, index: usize) -> (u64, u64) {
+	let slot = active_slot(dev);
+	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
+	let rec = sb.snap_root as usize * BLOCK_SIZE + SNAP_HDR + index * SNAP_REC;
+	let root = u64::from_le_bytes(dev.blocks[rec + SNAP_ROOT_OFF..rec + SNAP_ROOT_OFF + 8].try_into().unwrap());
+	let leaf_start = root as usize * BLOCK_SIZE;
+	let slot_off = leaf_start + NODE_HDR + INODE_REC + 8;
+	let ext = &dev.blocks[slot_off + EXTENT_OFF..slot_off + EXTENT_OFF + EXTENT_SIZE];
+	(u64::from_le_bytes(ext[8..16].try_into().unwrap()), u64::from_le_bytes(ext[24..32].try_into().unwrap()))
+}
+
 fn first_extent_of(dev: &MemDevice) -> (u64, u64) {
 	let slot = active_slot(dev);
 	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
@@ -3981,6 +4063,39 @@ fn a_mount_short_of_memory_does_not_blame_the_disk() {
 }
 
 #[test]
+fn a_mount_that_runs_short_inside_the_namespace_walk_refuses_rather_than_aborts() {
+	// THE ALIAS SET, which stopped being fallible when it stopped being a bitmap.
+	//
+	// It was `next_inode / 8` bytes from `try_zeroed` - the wrong SIZE, since inode numbers are
+	// never recycled, but a mount that failed rather than one that corrupted. Replacing it with a
+	// `BTreeSet` fixed the size and dropped the refusal: `insert` has no fallible form, so a mount
+	// walking a large namespace on a short heap aborted the process rather than answering
+	// `NoMemory`.
+	//
+	// Every allocation budget from nothing to plenty: a mount either completes or refuses, and it
+	// never does anything else. The interesting ones are in the middle, where the failure lands
+	// inside the walk rather than on one of the maps before it.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	for i in 0..24u32 {
+		fs.write_file(alloc::format!("f{i}").as_bytes(), b"payload").unwrap();
+	}
+	let dev = fs.into_device();
+	let mut refused = 0u32;
+	let mut mounted = 0u32;
+	for budget in 0..40usize {
+		let attempt = dev.clone();
+		let _armed = fail_allocation_after(budget);
+		match LiberFs::mount(attempt) {
+			Ok(_) => mounted += 1,
+			Err(MountError::NoMemory) => refused += 1,
+			Err(other) => panic!("budget {budget}: a refused allocation must be NoMemory, not {other:?}"),
+		}
+	}
+	assert!(refused > 0, "no budget in the sweep produced a refusal, so nothing here was exercised");
+	assert!(mounted > 0, "no budget in the sweep completed a mount, so the sweep never reached the walk");
+}
+
+#[test]
 fn an_unknown_type_that_was_a_directory_keeps_its_tree_reserved() {
 	// The mirror of `removing_an_unknown_type_inode_returns_its_blocks`, and the direction that was
 	// not covered. `INO_MAP` is an overlay - `dir_root` for a directory, `spill` for everything
@@ -4031,9 +4146,15 @@ fn a_read_this_machine_cannot_hold_reports_rather_than_aborts() {
 	let inode = fs.read_inode(num).unwrap();
 
 	// Refuse the read's own buffer, and the read reports instead of dying.
+	//
+	// `NoMemory`, not `NoSpace`: a refused ALLOCATION is the machine being short, and the two drive
+	// opposite policies - `NoSpace` says delete something or use another volume, `NoMemory` says the
+	// service is under pressure and the same request may well succeed in a moment. This asserted
+	// `NoSpace` because that is what the fault injector used to return while the allocator beside it
+	// returned `NoMemory`, so the test pinned the injector rather than the operation.
 	{
 		let _armed = fail_allocation_after(0);
-		assert_eq!(fs.read_range(&inode, 0, 7), Err(FsError::NoSpace));
+		assert_eq!(fs.read_range(&inode, 0, 7), Err(FsError::NoMemory));
 	}
 	// and with the injector disarmed it reads as it always did.
 	assert_eq!(fs.read_file(b"small").unwrap(), b"payload");
@@ -4299,13 +4420,16 @@ fn a_spilled_extent_map_that_cannot_allocate_its_block_says_so() {
 		let result = attempt.write_at(b"sparse", span(9), b"one more span");
 		drop(guard);
 		match result {
-			Err(FsError::NoSpace) => {
+			// `NoMemory` is a refused allocation and `NoSpace` is a full volume. The search here
+			// starves the ALLOCATOR, so the first is the answer; this asserted the second because
+			// the injector returned it while the allocator returned the first.
+			Err(FsError::NoMemory) | Err(FsError::NoSpace) => {
 				reported = true;
 				// And the filesystem is still answerable afterwards - a refused write is an error,
 				// not a corrupted map.
 				assert!(attempt.read_at(b"sparse", span(1), 6).is_ok(), "the earlier spans still read after a refused write");
 			}
-			Err(other) => panic!("a refused allocation must be NoSpace, not {other:?}"),
+			Err(other) => panic!("a refused allocation must be NoMemory or NoSpace, not {other:?}"),
 			Ok(()) => continue,
 		}
 	}

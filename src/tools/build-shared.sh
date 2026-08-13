@@ -410,7 +410,7 @@ targeted_state_valid() {
 }
 
 targeted_state_paths() {
-	local artifact owner package package_dir source_dir
+	local artifact owner package package_dir source_dir closure_dirs
 	{
 		printf '%s\n' "$root/tools/build-shared.sh" "$root/tools/build-consumer-object.sh"
 		printf '%s\n' "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs"
@@ -422,11 +422,40 @@ targeted_state_paths() {
 		for spec in "${selected_specs[@]}"; do
 			artifact="${spec%%=*}"
 			owner="${spec#*=}"
-			source_dir="$root/$(source_path "$owner")"
-			find "$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+			source_dir="$(source_path "$owner")"
+			# THE CLOSURE, not the crate's own directory.
+			#
+			# `provider_closure_sha` made a change to `abi` invalidate `lsrt.lslib` on the FULL build
+			# path, and this - the `--artifact` fast path `dev-build.sh` takes - kept recording the
+			# owner's own sources and exiting before the closure was computed at all. So the defect
+			# the closure was written to remove survived one cache layer up: touch `abi`, run
+			# `dev-build lsrt`, and the state matched and the build was skipped.
+			#
+			# The PROGRAM branch below has had this since the closure existed, reading
+			# `$package.dirs`; the library branch is the one that was missing it, which is also the
+			# branch the original finding was about. No third walker: both read a dirs file
+			# `cargo metadata` wrote. `library_closure_file` writes this one, keyed on the crate's
+			# directory, and by the time this function runs - from `write_targeted_state`, at exit -
+			# it is on disk. Validation does not recompute paths at all; it reads the list back out
+			# of the state file, so recording the right set once is the whole change.
+			closure_dirs="$source_metadata_dir/$(closure_key "$source_dir").dirs"
+			if [[ -n "$source_metadata_dir" && -f "$closure_dirs" ]]; then
+				while read -r package_dir; do
+					find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+				done <"$closure_dirs"
+			else
+				find "$root/$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+			fi
 			if [[ "$owner" == *-client-provider ]]; then
-				source_dir="$root/$(source_path "${owner%-provider}")"
-				find "$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+				source_dir="$(source_path "${owner%-provider}")"
+				closure_dirs="$source_metadata_dir/$(closure_key "$source_dir").dirs"
+				if [[ -n "$source_metadata_dir" && -f "$closure_dirs" ]]; then
+					while read -r package_dir; do
+						find "$root/$package_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+					done <"$closure_dirs"
+				else
+					find "$root/$source_dir" -path '*/target' -prune -o -path '*/shared' -prune -o \( -type d -o -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'rust-toolchain.toml' -o -name '*.ld' \) \) -print
+				fi
 			fi
 			printf '%s\n' "$(library_file "$artifact")"
 			find "$artifact_cache_dir" -maxdepth 1 -type f -name "library-$artifact.*" -print

@@ -63,6 +63,7 @@ static SCHED: AtomicPtr<CpuSched> = AtomicPtr::new(core::ptr::null_mut());
 // Allocate the per-core scheduler slots for `count` cores, sized by the MP
 // response. Called once by smp::init before any core parks in its idle loop.
 pub fn allocate(count: usize) {
+	// ALLOC-OK: boot, one run queue per core before any thread exists
 	let mut slots: Vec<CpuSched> = Vec::with_capacity(count);
 	slots.resize_with(count, CpuSched::new);
 	let leaked: &'static mut [CpuSched] = Vec::leak(slots);

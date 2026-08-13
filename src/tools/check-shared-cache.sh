@@ -9,6 +9,8 @@ output="$(mktemp)"
 backup=""
 source=""
 stale_output=""
+artifact=""
+decision=""
 
 source_path() {
 	jq -er --arg owner "$1" '.sources[$owner].path' <<<"$manifest_json"
@@ -168,8 +170,68 @@ provider)
 		exit 1
 	fi
 	;;
+targeted)
+	# THE `--artifact` FAST PATH, and the one thing it has to know: a library's dependencies.
+	#
+	# `provider_closure_sha` made a change to `abi` invalidate `lsrt.lslib` on the full build path,
+	# and `targeted_state_paths` recorded the owner's own sources only - then `build-shared.sh`
+	# exits at the targeted state check, two hundred lines before the closure is computed. So
+	# `dev-build lsrt` reported an artifact as current after a crate it compiles against had
+	# changed, which makes every test result taken on that artifact meaningless.
+	#
+	# The full path had this asserted by measurement when it was written; the targeted path had
+	# nothing, which is how it came to disagree. This is the assertion.
+	targeted_decision() {
+		(cd "$root" && LIBER_IMAGE_LOCK_HELD=1 tools/dev-build.sh --explain "$1" x86_64) >"$output" 2>&1 || {
+			echo "shared-cache-check: dev-build $1 failed" >&2
+			cat "$output" >&2
+			exit 1
+		}
+		sed -n 's/^dev-build: explain decision=\([a-z]*\).*/\1/p' "$output" | tail -n1
+	}
+
+	artifact="${2:-lsrt}"
+	# Two runs to reach a state: the first builds, the second must find it unchanged.
+	targeted_decision "$artifact" >/dev/null
+	decision="$(targeted_decision "$artifact")"
+	if [[ "$decision" != "hit" ]]; then
+		echo "shared-cache-check: an unchanged $artifact did not hit its targeted state (decision=$decision)" >&2
+		cat "$output" >&2
+		exit 1
+	fi
+
+	# A crate the artifact COMPILES AGAINST and does not contain. `abi` is under every library in
+	# the tree and under none of their directories, which is exactly the relationship the owner's
+	# own `find` could not see.
+	#
+	# Named literally rather than through `source_path`: `abi` is not a manifest SOURCE - it owns no
+	# staged artifact - so the lookup returns `null`, and under `set -e` that killed this mode
+	# silently with a zero exit. A guard that cannot fail is not a guard, so it is asserted here.
+	source="$root/abi/src/lib.rs"
+	[[ -f "$source" ]] || {
+		echo "shared-cache-check: $source is not there - this mode needs a crate the artifact depends on and does not contain" >&2
+		exit 1
+	}
+	backup="$(mktemp)"
+	cp "$source" "$backup"
+	printf '\n// shared-cache-check-%s\n' "$$" >>"$source"
+	decision="$(targeted_decision "$artifact")"
+	cp "$backup" "$source"
+	if [[ "$decision" != "miss" ]]; then
+		echo "shared-cache-check: $artifact hit its targeted state after a dependency changed - the closure is not in it" >&2
+		exit 1
+	fi
+	# And back: the restored dependency must return the artifact to a hit rather than leaving it
+	# permanently dirty.
+	targeted_decision "$artifact" >/dev/null
+	decision="$(targeted_decision "$artifact")"
+	if [[ "$decision" != "hit" ]]; then
+		echo "shared-cache-check: $artifact did not return to a targeted hit after the dependency was restored (decision=$decision)" >&2
+		exit 1
+	fi
+	;;
 *)
-	echo "usage: $0 [quick|provider]" >&2
+	echo "usage: $0 [quick|provider|targeted [ARTIFACT]]" >&2
 	exit 2
 	;;
 esac

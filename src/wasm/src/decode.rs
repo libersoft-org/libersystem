@@ -12,19 +12,27 @@ use alloc::vec::Vec;
 // One decoded instruction. Control-flow instructions carry resolved instruction
 // indices; numeric ALU operations keep their raw opcode (executed by a match in the
 // interpreter) to keep this enum compact.
+// A block's declared type: nothing, one value, or one of the module's function types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockType {
+	Empty,
+	Value(crate::module::ValType),
+	TypeIndex(u32),
+}
+
 #[derive(Clone, Debug)]
 pub enum Instr {
 	Unreachable,
 	Nop,
 	// A `block`: on a branch to it, control resumes at `end_pc + 1` (past its `End`),
 	// keeping `result_arity` values.
-	Block { result_arity: u8, end_pc: usize },
+	Block { ty: BlockType, end_pc: usize },
 	// A `loop`: a branch to it resumes at the loop body start (the instruction after
 	// this one), keeping `param_arity` values.
-	Loop { param_arity: u8 },
+	Loop { ty: BlockType },
 	// An `if`: pops a condition; on false jumps to `else_pc` (if `has_else`) or past
 	// `end_pc`. Keeps `result_arity` values at its end.
-	If { result_arity: u8, has_else: bool, else_pc: usize, end_pc: usize },
+	If { ty: BlockType, has_else: bool, else_pc: usize, end_pc: usize },
 	// The `else` of an `if`: when reached by falling through the then-branch, jumps to
 	// the matching `End` at `end_pc`.
 	Else { end_pc: usize },
@@ -37,6 +45,9 @@ pub enum Instr {
 	CallIndirect(u32),
 	Drop,
 	Select,
+	// `select` with an explicit result type. The untyped form takes its type from its operands;
+	// this one states it, and the operands must match what it states.
+	SelectTyped(crate::module::ValType),
 	LocalGet(u32),
 	LocalSet(u32),
 	LocalTee(u32),
@@ -50,7 +61,11 @@ pub enum Instr {
 	// zero-extend per `signed` into a 32- or 64-bit value (`wide`).
 	Load { width: u8, signed: bool, wide: bool, offset: u32 },
 	// A memory store: write the low `width` bytes of the popped value.
-	Store { width: u8, offset: u32 },
+	// The value's TYPE as well as its storage width. `width` alone cannot tell `i32.store` from
+	// `i64.store32` or `i32.store8` from `i64.store8`, and the validator was typing by width - so
+	// `i64.store8/16/32` were refused when written correctly and accepted with an `i32`. `FStore`
+	// next door already carried `wide` for exactly this reason.
+	Store { width: u8, wide: bool, offset: u32 },
 	// A float load: read 4 (`wide` false, f32) or 8 (`wide` true, f64) bytes.
 	FLoad { wide: bool, offset: u32 },
 	// A float store: write 4 (f32) or 8 (f64) bytes of the popped float.
@@ -97,19 +112,19 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 			0x00 => out.push(Instr::Unreachable),
 			0x01 => out.push(Instr::Nop),
 			0x02 => {
-				let (_p, r): (u8, u8) = block_type(module, body, &mut pc)?;
+				let ty = block_type(module, body, &mut pc)?;
 				ctrl.push(Ctrl { is_if: false, instr_index: out.len(), else_instr: usize::MAX });
-				out.push(Instr::Block { result_arity: r, end_pc: 0 });
+				out.push(Instr::Block { ty, end_pc: 0 });
 			}
 			0x03 => {
-				let (p, _r): (u8, u8) = block_type(module, body, &mut pc)?;
+				let ty = block_type(module, body, &mut pc)?;
 				ctrl.push(Ctrl { is_if: false, instr_index: out.len(), else_instr: usize::MAX });
-				out.push(Instr::Loop { param_arity: p });
+				out.push(Instr::Loop { ty });
 			}
 			0x04 => {
-				let (_p, r): (u8, u8) = block_type(module, body, &mut pc)?;
+				let ty = block_type(module, body, &mut pc)?;
 				ctrl.push(Ctrl { is_if: true, instr_index: out.len(), else_instr: usize::MAX });
-				out.push(Instr::If { result_arity: r, has_else: false, else_pc: 0, end_pc: 0 });
+				out.push(Instr::If { ty, has_else: false, else_pc: 0, end_pc: 0 });
 			}
 			0x05 => {
 				let frame: &mut Ctrl = ctrl.last_mut().ok_or("else without a block")?;
@@ -169,7 +184,25 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 			}
 			0x0e => {
 				let n: u32 = read_u32(body, &mut pc)?;
-				let mut labels: Vec<u32> = Vec::with_capacity(n as usize);
+				// BOUNDED BY THE INPUT, then allocated fallibly.
+				//
+				// `Vec::with_capacity(n)` with `n` off the medium is a few bytes of body asking for
+				// sixteen gigabytes: `br_table` declaring `0xffffffff` labels need not contain four
+				// billion of them, and the allocation happened before the decoder found out. It is
+				// an infallible allocation, so the failure was an abort in the host process rather
+				// than a refusal - and it is BEFORE fuel, before the host limits, and before
+				// everything else this milestone added, which is the whole point.
+				//
+				// A label is at least one byte, so `n` labels cannot be present in fewer than `n`
+				// bytes of remaining body. That check needs nothing but the reader's own position
+				// and it makes the count self-limiting.
+				if n as usize > body.len().saturating_sub(pc) {
+					return Err("br_table declares more labels than the body can hold");
+				}
+				let mut labels: Vec<u32> = Vec::new();
+				if labels.try_reserve(n as usize).is_err() {
+					return Err("br_table label table does not fit");
+				}
 				for _ in 0..n {
 					let l: u32 = read_u32(body, &mut pc)?;
 					check_label(l, &ctrl)?;
@@ -186,17 +219,37 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 			}
 			0x11 => {
 				let t: u32 = read_u32(body, &mut pc)?;
-				let _table: u32 = read_u32(body, &mut pc)?;
+				// THE TABLE INDEX, read and REFUSED rather than read and discarded.
+				//
+				// The validator then checked only that some table exists, so a module could name
+				// table 1 and have the call executed against table 0. This engine supports one
+				// table, so the rule is `tableidx == 0` - which is the class of static index check
+				// this milestone's items claim to have closed.
+				let table: u32 = read_u32(body, &mut pc)?;
+				if table != 0 {
+					return Err("call_indirect names a table other than 0");
+				}
 				out.push(Instr::CallIndirect(t));
 			}
 			0x1a => out.push(Instr::Drop),
 			0x1b => out.push(Instr::Select),
 			0x1c => {
+				// TYPED SELECT, whose annotation was read and thrown away - so the validator could
+				// only require the two operands to agree with each other, never with the type the
+				// instruction declared.
+				//
+				// The vector holds exactly one value type in every form this engine accepts; a
+				// longer one is multi-value, which it does not implement and must refuse rather
+				// than ignore.
 				let n: u32 = read_u32(body, &mut pc)?;
-				for _ in 0..n {
-					read_byte(body, &mut pc)?;
+				if n != 1 {
+					return Err("a typed select must annotate exactly one value type");
 				}
-				out.push(Instr::Select);
+				let ty = read_byte(body, &mut pc)?;
+				let Some(declared) = crate::module::val_type_of(ty) else {
+					return Err("a typed select annotates a type this engine does not know");
+				};
+				out.push(Instr::SelectTyped(declared));
 			}
 			0x20 => out.push(Instr::LocalGet(read_u32(body, &mut pc)?)),
 			0x21 => out.push(Instr::LocalSet(read_u32(body, &mut pc)?)),
@@ -217,15 +270,15 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 			0x33 => out.push(load(body, &mut pc, 2, false, true)?),
 			0x34 => out.push(load(body, &mut pc, 4, true, true)?),
 			0x35 => out.push(load(body, &mut pc, 4, false, true)?),
-			0x36 => out.push(store(body, &mut pc, 4)?),
-			0x37 => out.push(store(body, &mut pc, 8)?),
+			0x36 => out.push(store(body, &mut pc, 4, false)?),
+			0x37 => out.push(store(body, &mut pc, 8, true)?),
 			0x38 => out.push(fstore(body, &mut pc, false)?),
 			0x39 => out.push(fstore(body, &mut pc, true)?),
-			0x3a => out.push(store(body, &mut pc, 1)?),
-			0x3b => out.push(store(body, &mut pc, 2)?),
-			0x3c => out.push(store(body, &mut pc, 1)?),
-			0x3d => out.push(store(body, &mut pc, 2)?),
-			0x3e => out.push(store(body, &mut pc, 4)?),
+			0x3a => out.push(store(body, &mut pc, 1, false)?),
+			0x3b => out.push(store(body, &mut pc, 2, false)?),
+			0x3c => out.push(store(body, &mut pc, 1, true)?),
+			0x3d => out.push(store(body, &mut pc, 2, true)?),
+			0x3e => out.push(store(body, &mut pc, 4, true)?),
 			0x3f => {
 				memory_index(body, &mut pc)?;
 				out.push(Instr::MemorySize);
@@ -292,9 +345,9 @@ fn load(body: &[u8], pc: &mut usize, width: u8, signed: bool, wide: bool) -> Res
 }
 
 // Decode a store opcode's memarg (align, offset) into a `Store`.
-fn store(body: &[u8], pc: &mut usize, width: u8) -> Result<Instr, DecodeError> {
+fn store(body: &[u8], pc: &mut usize, width: u8, wide: bool) -> Result<Instr, DecodeError> {
 	let offset: u32 = memarg(body, pc, width)?;
-	Ok(Instr::Store { width, offset })
+	Ok(Instr::Store { width, wide, offset })
 }
 
 // Decode a float load opcode's memarg (align, offset) into an `FLoad`.
@@ -342,16 +395,32 @@ fn read_f64_bits(body: &[u8], pc: &mut usize) -> Result<u64, DecodeError> {
 // Read a block type: `0x40` (empty) -> (0, 0); a single value type -> (0, 1); a type
 // index -> that type's (param count, result count). Returns (param arity, result
 // arity) for the block.
-fn block_type(module: &Module, body: &[u8], pc: &mut usize) -> Result<(u8, u8), DecodeError> {
+// A block's type, KEPT rather than reduced to two counts.
+//
+// This answered `(params, results)` as arities, so everything else about the type was gone by the
+// time validation ran: the value type of a single-result block, the parameter types of an indexed
+// one, and which type index it named. `block_signature` then reconstructed a signature it did not
+// have - `i32` for a one-result block, and for anything larger the FIRST declared type with matching
+// counts, so a block naming type 3 got type 0 if type 0 had the same shape.
+//
+// A blocktype is a negative value type, a positive type index, or `0x40` for empty. All three are
+// representable and none of them is an arity.
+fn block_type(module: &Module, body: &[u8], pc: &mut usize) -> Result<BlockType, DecodeError> {
 	let v: i64 = read_i64(body, pc)?;
 	if v == -64 {
-		return Ok((0, 0)); // 0x40, the empty block type
+		return Ok(BlockType::Empty); // 0x40
 	}
 	if v < 0 {
-		return Ok((0, 1)); // a single value type result
+		// The value types encode as small negative numbers: -1 is `0x7f` (i32) and so on down.
+		let byte = (v & 0x7f) as u8;
+		let ty = crate::module::val_type_of(byte).ok_or("a block type this engine does not know")?;
+		return Ok(BlockType::Value(ty));
 	}
-	let t = module.types.get(v as usize).ok_or("block type index out of range")?;
-	Ok((t.params.len() as u8, t.results.len() as u8))
+	let index = u32::try_from(v).map_err(|_| "block type index out of range")?;
+	if module.types.get(index as usize).is_none() {
+		return Err("block type index out of range");
+	}
+	Ok(BlockType::TypeIndex(index))
 }
 
 // A branch label must name a control frame in scope (0 = innermost, up to and
@@ -372,6 +441,14 @@ fn read_u32(body: &[u8], pc: &mut usize) -> Result<u32, DecodeError> {
 	let mut shift: u32 = 0;
 	loop {
 		let b: u8 = read_byte(body, pc)?;
+		// THE WIDTH BOUND, which this reader did not have while the parser's did.
+		//
+		// The fifth byte contributes at shift 28, so only its low four bits fit in 32 - and the
+		// rest were silently dropped. So the two readers in this crate disagreed about what a `u32`
+		// is, and the permissive one is the one used for instruction immediates.
+		if shift == 28 && (b >> 4) != 0 {
+			return Err("LEB128 value does not fit in 32 bits");
+		}
 		result |= ((b & 0x7f) as u32) << shift;
 		if b & 0x80 == 0 {
 			return Ok(result);

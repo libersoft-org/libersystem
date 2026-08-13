@@ -57,6 +57,17 @@ impl core::fmt::Display for ValidationError {
 // A maximum a module declares is a statement about itself; these are what this engine will run
 // whatever the module says. They live here rather than in the interpreter because a limit is only
 // meaningful once something refuses a module for exceeding it.
+// The deepest the operand stack may go inside one body.
+//
+// The per-instance limits item NAMED this - "maximum operand stack depth" - and its DONE note listed
+// four constants, none of which is one. Call depth is bounded, which covers the recursive case; what
+// was not bounded is one body that pushes without popping, and the two vectors that grow with it are
+// the validator's `Vec<Type>` and the interpreter's `Vec<Value>`.
+//
+// Checked HERE, where the maximum depth of a body is a static property, so execution needs no check
+// of its own. It is deliberately generous: a body reaching this has thousands of live operands,
+// which no compiler emits and a hand-written module has to mean.
+pub const MAX_STACK_DEPTH: usize = 8192;
 pub const MAX_LOCALS: usize = 4096;
 pub const MAX_TABLE_ENTRIES: usize = 65536;
 pub const MAX_FUNCTIONS: usize = 65536;
@@ -123,6 +134,27 @@ pub fn validate(module: Module) -> Result<ValidatedModule, ValidationError> {
 	if module.funcs.len() > MAX_FUNCTIONS {
 		return Err(ValidationError::module(format!("a module with {} defined functions exceeds the host limit of {MAX_FUNCTIONS}", module.funcs.len())));
 	}
+	// THE HOST'S MEMORY CEILING, ON THE DECLARED MINIMUM.
+	//
+	// `MAX_MEMORY_PAGES` appeared exactly twice - its definition and `memory.grow` - so a module
+	// declaring `(memory 100000)` was a six-byte declaration asking the host for six gigabytes
+	// before a single instruction ran. `try_reserve_exact` turned a failure into a refusal rather
+	// than an abort, which is why this is a resource-policy hole and not a crash; the policy this
+	// milestone states is "a limit the module declares is not a limit the host imposed", and there
+	// the module's declaration WAS the limit.
+	//
+	// Checked here rather than at instantiation so the refusal arrives with the module and carries a
+	// `ValidationError` naming the rule.
+	if let Some(memory) = module.memory {
+		if memory.min_pages as usize > crate::interp::MAX_MEMORY_PAGES {
+			return Err(ValidationError::module(format!("a module declaring {} initial memory pages exceeds the host limit of {}", memory.min_pages, crate::interp::MAX_MEMORY_PAGES)));
+		}
+		if let Some(max) = memory.max_pages
+			&& max as usize > crate::interp::MAX_MEMORY_PAGES
+		{
+			return Err(ValidationError::module(format!("a module declaring a maximum of {max} memory pages exceeds the host limit of {}", crate::interp::MAX_MEMORY_PAGES)));
+		}
+	}
 	if module.globals.len() > MAX_GLOBALS {
 		return Err(ValidationError::module(format!("a module with {} globals exceeds the host limit of {MAX_GLOBALS}", module.globals.len())));
 	}
@@ -139,7 +171,7 @@ pub fn validate(module: Module) -> Result<ValidatedModule, ValidationError> {
 		}
 	}
 	let total_funcs = module.imports.len() + module.funcs.len();
-	let has_memory = module.memory_min_pages > 0 || module.memory_max_pages.is_some();
+	let has_memory = module.memory.is_some();
 	for export in &module.exports {
 		match export.kind {
 			ExportKind::Func if export.index as usize >= total_funcs => {
@@ -180,7 +212,13 @@ pub fn validate(module: Module) -> Result<ValidatedModule, ValidationError> {
 
 	// The data segments, against the memory the module DECLARES rather than the memory that happens
 	// to exist at instantiation.
-	let memory_bytes = (module.memory_min_pages as usize).saturating_mul(crate::interp::PAGE);
+	// A DATA SEGMENT NAMES A MEMORY, and a module with none has no memory 0 for it to name. The
+	// bound below is a byte comparison, so a module with no memory and a zero-length segment at
+	// offset 0 passed it - which the specification calls "unknown memory 0".
+	if !module.data.is_empty() && module.memory.is_none() {
+		return Err(ValidationError::module(String::from("a data segment in a module that declares no memory")));
+	}
+	let memory_bytes = module.memory.map_or(0, |m| m.min_pages as usize).saturating_mul(crate::interp::PAGE);
 	for (index, seg) in module.data.iter().enumerate() {
 		let end = (seg.offset as usize).saturating_add(seg.bytes.len());
 		if end > memory_bytes {
@@ -218,10 +256,17 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 	frames.push(Frame { label_types: ftype.results.clone(), end_types: ftype.results.clone(), height: 0, unreachable: false, is_if: false, had_else: false });
 
 	let total_funcs = module.imports.len() + module.funcs.len();
-	let has_memory = module.memory_min_pages > 0 || module.memory_max_pages.is_some();
+	let has_memory = module.memory.is_some();
 
 	for (pc, instr) in body.iter().enumerate() {
 		let at = |reason: String| ValidationError { func: Some(func_index as u32), instr: Some(pc), reason };
+		// ONE CHECK, AFTER each instruction rather than at each of the twenty places that push: an
+		// instruction adds a bounded number of operands, so testing the depth once per instruction
+		// bounds it within one instruction's worth - which is what a ceiling needs to do and is a
+		// rule a new opcode cannot forget.
+		if stack.len() > MAX_STACK_DEPTH {
+			return Err(at(format!("the operand stack reaches {}, past the host limit of {MAX_STACK_DEPTH}", stack.len())));
+		}
 		match instr {
 			Instr::Unreachable => mark_unreachable(&mut stack, &mut frames),
 			Instr::Nop => {}
@@ -348,6 +393,14 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 				};
 				stack.push(result);
 			}
+			// TYPED SELECT: the operands must match the type the instruction DECLARES, not merely
+			// each other. The annotation used to be read and discarded, so an annotation asking for
+			// an `i64` over two `i32`s was accepted - the declaration checked against nothing.
+			Instr::SelectTyped(declared) => {
+				pop_expect(&mut stack, &frames, &[ValType::I32]).map_err(&at)?;
+				pop_expect(&mut stack, &frames, &[*declared, *declared]).map_err(&at)?;
+				stack.push(Type::Val(*declared));
+			}
 			Instr::LocalGet(index) => {
 				let ty = *locals.get(*index as usize).ok_or_else(|| at(format!("local.get {index} of {} locals", locals.len())))?;
 				stack.push(Type::Val(ty));
@@ -384,11 +437,20 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 				pop_expect(&mut stack, &frames, &[ValType::I32]).map_err(&at)?;
 				stack.push(Type::Val(if *wide { ValType::I64 } else { ValType::I32 }));
 			}
-			Instr::Store { width, .. } => {
+			Instr::Store { wide, .. } => {
 				require_memory(has_memory).map_err(&at)?;
-				// The decoder folds `i64.store32` and `i32.store` into one `Store`, so the value
-				// type is decided by the recorded width: only a full 8-byte store takes an i64.
-				let value = if *width == 8 { ValType::I64 } else { ValType::I32 };
+				// THE OPCODE'S VALUE TYPE, not its storage width.
+				//
+				// This was `if width == 8 { I64 } else { I32 }`, under a comment observing that the
+				// decoder folds `i64.store32` and `i32.store` into one `Store` - and then typing
+				// them the same anyway. `i64.store8`, `i64.store16` and `i64.store32` all take an
+				// `i64` and narrow it on the way to memory, so all three were refused when written
+				// correctly and accepted when given an `i32`.
+				//
+				// Not a memory-safety defect: the interpreter takes the low `w` bytes of whatever is
+				// on the stack and bounds-checks the slice. A validator that refuses valid modules
+				// and accepts invalid ones is its own problem.
+				let value = if *wide { ValType::I64 } else { ValType::I32 };
 				pop_expect(&mut stack, &frames, &[ValType::I32, value]).map_err(&at)?;
 			}
 			Instr::FLoad { wide, .. } => {
@@ -435,40 +497,29 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 	Ok(())
 }
 
-// A block / loop / if's (parameters, results).
+// A block / loop / if's (parameters, results), READ FROM ITS TYPE.
 //
-// The decoder records ARITIES rather than types, because the interpreter needs only how many values
-// to keep. A validator needs the types, and the only shape whose types are recoverable from the
-// decoded stream is the indexed one - so an arity above one is looked up in the type section, and
-// the (0,0) and (0,1) shapes are the empty and single-value block types.
+// This used to reconstruct a signature it did not have, because the decoder recorded arities. A
+// one-result block got `i32` - so `(block (result i64) i64.const 7 end)` was refused and
+// `(block (result i64) i32.const 7 end)` was accepted, the validator wrong in both directions at
+// once. And an arity above one searched `module.types` for the FIRST candidate with matching counts,
+// so a block naming type 3 got type 0 if type 0 had the same shape: the index was present in the
+// binary, discarded by the decoder, and re-derived here by a rule that cannot be right.
 //
-// A single anonymous result is `i32` in every module this engine runs, and guessing is exactly what
-// a validator must not do - so a one-result block is checked for its COUNT and its type is left to
-// unify, which `expect_at` does through `Type::Unknown`. Recovering the exact type means the
-// decoder keeping it, which is a change to the `Instr` encoding rather than to this pass.
+// The decoder carries `BlockType` now, so there is nothing to reconstruct.
 fn block_signature(module: &Module, instr: &Instr) -> Result<(Vec<ValType>, Vec<ValType>), String> {
-	let (params, results) = match instr {
-		Instr::Block { result_arity, .. } | Instr::If { result_arity, .. } => (0u8, *result_arity),
-		Instr::Loop { param_arity } => (*param_arity, 0u8),
+	let ty = match instr {
+		Instr::Block { ty, .. } | Instr::If { ty, .. } | Instr::Loop { ty } => ty,
 		_ => return Err(String::from("not a block")),
 	};
-	if params > 1 || results > 1 {
-		for candidate in &module.types {
-			if candidate.params.len() == params as usize && candidate.results.len() == results as usize {
-				return Ok((candidate.params.clone(), candidate.results.clone()));
-			}
+	match ty {
+		crate::decode::BlockType::Empty => Ok((Vec::new(), Vec::new())),
+		crate::decode::BlockType::Value(v) => Ok((Vec::new(), alloc::vec![*v])),
+		crate::decode::BlockType::TypeIndex(index) => {
+			let t = module.types.get(*index as usize).ok_or_else(|| format!("a block naming type {index} of {}", module.types.len()))?;
+			Ok((t.params.clone(), t.results.clone()))
 		}
-		return Err(String::from("a block type no declared type matches"));
 	}
-	let mut p = Vec::new();
-	let mut r = Vec::new();
-	for _ in 0..params {
-		p.push(ValType::I32);
-	}
-	for _ in 0..results {
-		r.push(ValType::I32);
-	}
-	Ok((p, r))
 }
 
 // The types a branch to `label` must carry (0 = innermost).

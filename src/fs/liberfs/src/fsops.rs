@@ -275,7 +275,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => fs.read_only = true,
 			// a refused allocation is the MACHINE, not the medium - see `derive_free` below.
-			Err(FsError::NoSpace) => return Err(MountError::NoMemory),
+			Err(FsError::NoMemory) => return Err(MountError::NoMemory),
 			Err(_) => return Err(MountError::Io),
 		}
 		// a generation walk that could not complete (an unreadable node, a broken spill
@@ -289,13 +289,18 @@ impl<D: BlockDevice> LiberFs<D> {
 		match fs.derive_free() {
 			Ok(()) => {}
 			Err(FsError::Corrupt) => fs.read_only = true,
-			// the generation walk sizes its own maps, and `try_zeroed` reports a refused
-			// allocation as `NoSpace`. Folding that into `Io` told the operator the disk
-			// did not answer when the disk was fine and the MACHINE was short - a wrong
-			// diagnosis pointing at the wrong component. The process no longer aborting was
-			// the point of the fallible allocation; carrying the reason through is the rest
-			// of it, and `MountError::NoMemory` already existed to say exactly this.
-			Err(FsError::NoSpace) => return Err(MountError::NoMemory),
+			// the generation walk sizes its own maps, and a refused allocation is `NoMemory`.
+			// Folding that into `Io` told the operator the disk did not answer when the disk was
+			// fine and the MACHINE was short - a wrong diagnosis pointing at the wrong component.
+			// The process no longer aborting was the point of the fallible allocation; carrying the
+			// reason through is the rest of it, and `MountError::NoMemory` already existed to say
+			// exactly this.
+			//
+			// It matched `NoSpace` until 2026-08-12, which is what the TEST injector returned while
+			// the allocator returned `NoMemory` - so the arm existed for the test and for nothing
+			// else, and production took the catch-all. Nothing at mount allocates disk space, so
+			// `NoSpace` cannot arise here at all and the arm is gone rather than doubled.
+			Err(FsError::NoMemory) => return Err(MountError::NoMemory),
 			Err(_) => return Err(MountError::Io),
 		}
 		// the two superblock relations that need the tree to settle. Both are read-only
@@ -723,6 +728,13 @@ fn free_map_len(num_blocks: u64) -> Result<usize, FsError> {
 fn map_mount_error(e: FsError) -> MountError {
 	match e {
 		FsError::Io => MountError::Io,
+		// A refused allocation is the MACHINE, and reporting it as a corrupt volume is a worse
+		// diagnosis than `Io` was: it sends the operator to look for damage on a disk that is fine,
+		// and a caller that believes it may reasonably decide the volume needs repairing.
+		//
+		// The two named arms above `derive_free` and `load_snapshot_table` carried this and this
+		// function - the answer for everything they do not handle by name - did not.
+		FsError::NoMemory => MountError::NoMemory,
 		_ => MountError::Corrupt,
 	}
 }

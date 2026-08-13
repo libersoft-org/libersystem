@@ -144,6 +144,7 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_hartid: u64) {
 	// hart count, no compile-time cap. Publish the higher-half base to the boot stub
 	// through the shared data word before any secondary reads it.
 	let words = cpu_count as usize * (SEC_STACK_SIZE / 16);
+	// ALLOC-OK: boot, the AP stacks, allocated once before the APs start
 	let stacks: Vec<u128> = alloc::vec![0u128; words];
 	let base = Vec::leak(stacks).as_mut_ptr() as u64;
 	unsafe {

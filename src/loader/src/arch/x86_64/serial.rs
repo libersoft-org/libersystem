@@ -57,3 +57,21 @@ pub fn write_str(s: &str) {
 		write_byte(byte);
 	}
 }
+
+// A 64-bit value as `0x...` hex, for a diagnostic that has to name an ADDRESS.
+//
+// The loader has no formatter - it is pre-ExitBootServices code with no allocator - so a warning
+// that wanted to say which physical range failed had no way to say it, and said "an MMIO range"
+// instead. A warning nobody can act on is a warning that costs the reader time and gives nothing.
+pub fn write_hex(value: u64) {
+	write_str("0x");
+	let mut started = false;
+	for shift in (0..16).rev() {
+		let nibble = ((value >> (shift * 4)) & 0xf) as u8;
+		if nibble == 0 && !started && shift != 0 {
+			continue;
+		}
+		started = true;
+		write_byte(if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 });
+	}
+}

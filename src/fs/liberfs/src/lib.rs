@@ -341,9 +341,19 @@ pub const MAX_BLOCKS: u64 = 1 << 40;
 // through the allocator rather than returning a mount error. The format's ceiling and the
 // machine's are different numbers, and only one of them was being checked.
 pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
+	// THE ERROR THE REAL ALLOCATOR RETURNS, which this used to disagree with.
+	//
+	// The injector answered `NoSpace` and the line below answers `NoMemory`, and the mount matched
+	// on the injector's: `Err(FsError::NoSpace) => MountError::NoMemory, Err(_) => MountError::Io`.
+	// So a fault-injected mount was diagnosed correctly and a REAL one short of memory was reported
+	// as the disk not answering - the exact wrong diagnosis the comment at that match was written to
+	// prevent, produced only on the path no test took.
+	//
+	// `a_mount_short_of_memory_does_not_blame_the_disk` passed over the injector's error and could
+	// not see it. One word here makes that test a test of production.
 	#[cfg(test)]
 	if inject::should_fail() {
-		return Err(FsError::NoSpace);
+		return Err(FsError::NoMemory);
 	}
 	let mut v: Vec<u8> = Vec::new();
 	v.try_reserve_exact(len).map_err(|_| FsError::NoMemory)?;
@@ -998,7 +1008,19 @@ pub struct LiberFs<D: BlockDevice> {
 	// One bit per inode number for the live generation's namespace walk, and whether it found an
 	// inode named twice. The format has no hardlinks and no link count, so one name per inode is
 	// its rule; `derive_free` is where it can be checked without reading anything extra.
-	mark_names: Option<BTreeSet<u32>>,
+	// A SORTED VEC, not a `BTreeSet`, because its growth has to be able to say no.
+	//
+	// The set replaced a `next_inode`-sized bitmap and that was the right change - inode numbers are
+	// never recycled, so ten live files on a volume that has created four billion temporaries wanted
+	// half a gigabyte of bitmap to check ten names. What it gave up is the property the bitmap had
+	// and the comment beside it recorded: "It was FALLIBLE, so that is a mount that fails rather
+	// than one that corrupts". `BTreeSet::insert` has no fallible form, so a mount walking a large
+	// namespace on a short heap aborted the process - which is the one thing this filesystem is
+	// written not to do, and the reason every other structure here reserves before it commits.
+	//
+	// A sorted `Vec` answers the same question - "have I seen this inode" - through a binary search,
+	// grows through `try_reserve`, and is smaller per element than a tree node.
+	mark_names: Option<Vec<u32>>,
 	mark_alias: bool,
 	// The highest inode key the live walk saw. `next_inode` hands out numbers ABOVE
 	// everything in use, and checking only that `next_inode` itself is free is not that

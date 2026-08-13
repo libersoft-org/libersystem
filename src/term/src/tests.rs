@@ -4,7 +4,7 @@
 //! the expected logical text - the model is exercised with no renderer, proving it is
 //! graphics-independent.
 
-use crate::screen::SCROLLBACK_ROWS;
+use crate::screen::{MAX_SCROLLBACK_BYTES, SCROLLBACK_ROWS};
 use crate::{Echo, EchoBuf, Ld, RawSink, Screen, TextSink};
 use alloc::vec::Vec;
 
@@ -116,6 +116,27 @@ fn raw_sink_consume_drops_only_the_oldest_bytes() {
 	assert_eq!(raw.as_bytes(), b"world!");
 	raw.consume(100);
 	assert!(raw.is_empty());
+
+	// A PARTIAL DRAIN REPEATED MANY TIMES, which is how the console uses it: the serial mirror is
+	// drained in transmit-ring-sized pieces every frame. `drain(..n)` memmoved the remainder on each
+	// one; a read offset does not. This asserts the visible half of that - the bytes stay correct
+	// across hundreds of partial drains with feeds interleaved - since the copying itself is not
+	// observable from a test.
+	let mut raw = RawSink::new();
+	let mut expected: Vec<u8> = Vec::new();
+	for i in 0..500u32 {
+		let chunk = [b'a' + (i % 26) as u8; 32];
+		raw.feed(&chunk);
+		expected.extend_from_slice(&chunk);
+		raw.consume(16);
+		expected.drain(..16);
+		assert_eq!(raw.as_bytes(), &expected[..], "the stream survives a partial drain");
+	}
+	// And the front is actually reclaimed rather than accumulating for the life of the sink.
+	raw.consume(expected.len());
+	assert!(raw.is_empty());
+	raw.feed(b"after");
+	assert_eq!(raw.as_bytes(), b"after");
 }
 
 // The DEC private mouse-tracking modes (?1000 normal, ?1002 button-event, ?1003 any-event)
@@ -352,6 +373,233 @@ fn a_full_line_keeps_its_caret_and_a_row_move_does_not_wrap() {
 	assert_eq!(screen.cursor_row(), 1, "a glyph after a row move must land on that row");
 	// Column 7, which is where the move left it - the row moved and the column did not.
 	assert_eq!(dump(&screen), b"aaaaaaaa\n       X", "and in the column the move left it in");
+}
+
+#[test]
+fn a_control_byte_that_moves_nothing_leaves_the_deferred_wrap_alone() {
+	// `put_byte` cleared `pending_wrap` for EVERY control byte under 0x20 that was not ESC, plus
+	// DEL, before dispatching it - hoisted "so a new one cannot forget". BEL moves nothing:
+	// `0x07 => self.bell = true` and that is all. So the flag was cleared for a cursor that had not
+	// moved, and the glyph waiting to wrap overwrote the last column instead.
+	//
+	// A shell that rings the bell on a completion miss at the end of a full line hits this.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"12345678");
+	feed(&mut screen, b"\x07");
+	assert!(screen.take_bell(), "BEL still rings");
+	feed(&mut screen, b"X");
+	assert_eq!(screen.cursor_row(), 1, "the glyph after BEL wraps to the next row");
+	assert_eq!(dump(&screen), b"12345678X", "and continues the soft-wrapped line");
+
+	// The control bytes that DO assign the cursor still clear it, now from their own handlers
+	// rather than from a blanket above them.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"12345678\rX");
+	assert_eq!(dump(&screen), b"X2345678", "CR moves the cursor, so no wrap is pending after it");
+
+	// Backspace steps off the cell the last glyph filled, so the X lands one to its left - which is
+	// the point: it lands somewhere, rather than being deferred to the next row.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"12345678\x08X");
+	assert_eq!(dump(&screen), b"123456X8", "and backspace does too");
+}
+
+#[test]
+fn setting_the_scroll_region_clears_the_deferred_wrap_it_homed_away_from() {
+	// DECSTBM ends with `col = 0; row = 0` and did not say so. `csi_dispatch` no longer clears the
+	// flag on entry - that shortcut was removed so a non-moving CSI could not cancel a wrap - so
+	// DECSTBM homed the cursor and left a wrap deferred against the column it had just left.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"12345678");
+	feed(&mut screen, b"\x1b[1;4r"); // scroll region, whole screen: homes the cursor
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (0, 0), "DECSTBM homes the cursor");
+	feed(&mut screen, b"X");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (1, 0), "and the glyph lands at home");
+	assert_eq!(dump(&screen), b"X2345678", "not a row below it");
+}
+
+#[test]
+fn a_deferred_wrap_does_not_survive_a_buffer_switch() {
+	// The flag describes a glyph in the last column of the LIVE buffer's current row. Switching
+	// buffers changes which buffer that is, so it describes nothing afterwards. `enter_alt_buffer`
+	// got this for free by homing; `leave_alt_buffer` only flipped the flag and marked the screen
+	// dirty, so a wrap deferred against the alternate's last column carried into the primary and
+	// fired at whatever column the primary's cursor was parked in.
+	// The LIVE cursor is shared between the buffers, which is xterm and which the `?47` case in
+	// `the_three_alternate_screen_modes_are_not_one_mode` pins deliberately - so this asserts what
+	// the flag does, not where the cursor ends up.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"ab");
+	feed(&mut screen, b"\x1b[?47h");
+	feed(&mut screen, b"12345678"); // fill the alternate's first row: a wrap is now deferred
+	feed(&mut screen, b"\x1b[?47l");
+	assert_eq!(screen.cursor_row(), 0, "back on the primary, on its first row");
+	feed(&mut screen, b"X");
+	assert_eq!(screen.cursor_row(), 0, "the next glyph stays on it");
+	assert_eq!(dump(&screen), b"ab     X", "the alternate's deferred wrap did not follow it here");
+
+	// The other direction, which the homing already covered - asserted so the rule is pinned on
+	// both sides rather than on the side that happened to be broken.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"12345678");
+	feed(&mut screen, b"\x1b[?47h");
+	feed(&mut screen, b"X");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (1, 0), "entering homes and cancels the wrap");
+}
+
+#[test]
+fn a_resize_during_the_alternate_screen_leaves_the_program_its_own_cursor() {
+	// The cell half of this was fixed - the reflow reads the primary explicitly and copies the
+	// alternate as the rectangle it is - and the cursor half was not. `cursor_at` was recorded only
+	// when the primary was live, which is right; nothing took the other branch, so the reflow lost
+	// the position, the "end of the content" fallback fired, and the result was assigned to `row`
+	// and `col`, which DURING ALT ARE THE PROGRAM'S CURSOR. A window resize therefore teleported a
+	// full-screen program's cursor to a position computed from the shell's scrollback.
+	let mut screen = Screen::new(16, 6, 8);
+	// Give the primary enough content that the fallback would land somewhere obviously wrong.
+	feed(&mut screen, b"one\r\ntwo\r\nthree\r\nfour\r\n");
+	feed(&mut screen, b"\x1b[?47h");
+	feed(&mut screen, b"\x1b[3;9H"); // the program puts its cursor at row 2, column 8
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (8, 2));
+	screen.resize(12, 6, 64, 64);
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (8, 2), "the program keeps its own cursor across a resize");
+
+	// And it is CLAMPED when the new geometry cannot hold it, rather than left out of range.
+	screen.resize(6, 3, 64, 64);
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (5, 2), "clamped into the smaller screen");
+	assert!(screen.cursor_col() < screen.cols() && screen.cursor_row() < screen.rows());
+}
+
+#[test]
+fn the_saved_cursor_is_remapped_by_a_resize_and_belongs_to_its_own_buffer() {
+	// Two defects in one place. `?1049h` saved the primary's cursor, a resize reflowed the primary
+	// and did not touch the save, and `restore_cursor` only clamped - so after a width change the
+	// shell came back to a cell that was no longer where its prompt was. And the save was ONE field
+	// shared by both buffers, so a full-screen program's own DECSC overwrote what `?1049h` stored.
+	let mut screen = Screen::new(16, 6, 8);
+	// A logical line long enough that a narrower screen re-wraps it: the saved position must travel
+	// with its own cell, exactly as the live cursor does.
+	feed(&mut screen, b"0123456789abcdef0123");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (4, 1), "the live cursor after a wrap");
+	// Park the shell's cursor ON a written cell - the nineteenth character, row 1 column 2 - so the
+	// reflow has a cell to follow. A position one past the last written cell is not remapped by any
+	// of this; it takes the documented "end of the content" fallback, the same as the live cursor.
+	feed(&mut screen, b"\x1b[2;3H");
+	feed(&mut screen, b"\x1b[?1049h");
+	// The program moves about and saves ITS cursor: a different slot, so the shell's is untouched.
+	feed(&mut screen, b"\x1b[5;3H");
+	feed(&mut screen, b"\x1b7");
+	feed(&mut screen, b"\x1b[1;1H");
+	screen.resize(10, 6, 64, 64);
+	feed(&mut screen, b"\x1b8");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (2, 4), "the program's own save, clamped not reflowed");
+	feed(&mut screen, b"\x1b[?1049l");
+	// The saved cell is offset 18 of a 20-character logical line. At 16 columns that is row 1
+	// column 2; at 10 columns it is row 1 column 8. The save followed the character, which is what
+	// the live cursor has always done and what the save never did.
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (8, 1), "the shell's saved cursor followed its own cell through the reflow");
+}
+
+#[test]
+fn each_buffer_keeps_its_own_saved_cursor() {
+	// The save was one field. A program entering the alternate screen and issuing DECSC overwrote
+	// whatever the shell had saved with ESC 7 before it started, so the shell's later DECRC landed
+	// wherever the program had been.
+	let mut screen = Screen::new(16, 6, 0);
+	feed(&mut screen, b"\x1b[2;3H");
+	feed(&mut screen, b"\x1b7"); // the shell saves its own cursor
+	feed(&mut screen, b"\x1b[?47h");
+	feed(&mut screen, b"\x1b[5;9H");
+	feed(&mut screen, b"\x1b7"); // the program saves ITS cursor - a different slot
+	feed(&mut screen, b"\x1b[?47l");
+	feed(&mut screen, b"\x1b8");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (2, 1), "the shell restores what the shell saved");
+}
+
+#[test]
+fn the_scrollback_depth_returns_to_the_configured_one_after_a_widen() {
+	// `resize` passed the CURRENT capacity back into `geometry` as the request, and `geometry`
+	// clamps a request to what the byte budget allows at the new width. That made the clamp monotone
+	// over a terminal's life: widen once and the depth was permanently reduced, because narrowing
+	// again re-clamped the already-reduced value.
+	//
+	// A `Cell` is a few bytes, so the budget bites at a scrollback of tens of thousands of rows -
+	// which is what this asks for, rather than a plausible one, so the clamp is actually reached.
+	let deep: usize = MAX_SCROLLBACK_BYTES; // certain to exceed the budget at any width
+	let mut screen = Screen::new(80, 24, deep);
+	let narrow: usize = screen.scrollback_capacity();
+
+	screen.resize(400, 24, 1024, 1024);
+	let wide: usize = screen.scrollback_capacity();
+	assert!(wide < narrow, "a wider row costs more per line, so fewer lines fit the byte budget");
+
+	screen.resize(80, 24, 1024, 1024);
+	assert_eq!(screen.scrollback_capacity(), narrow, "and the depth comes back when the width does");
+}
+
+// A `Term` over a heap-backed framebuffer, so a test can drive the editor against a REAL local
+// grid. Every line-editor test before this one passed `term: None`, which is exactly the half of
+// the echo path where "a backspace always moves the caret" was false.
+struct TestSurface {
+	raster: crate::render::Raster,
+	// The pixels the raster writes into. Held so the mapping outlives the raster.
+	_pixels: Vec<u8>,
+}
+
+impl crate::render::Surface for TestSurface {
+	fn raster(&self) -> &crate::render::Raster {
+		&self.raster
+	}
+	fn present(&self, _x: u32, _y: u32, _w: u32, _h: u32) {}
+}
+
+fn test_term(cols: usize, rows: usize, scrollback: usize) -> crate::Term {
+	use crate::render::{CELL_H, CELL_W, Geometry};
+	let g = Geometry { width: cols * CELL_W, height: rows * CELL_H, pitch: cols * CELL_W * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8 };
+	let mut pixels: Vec<u8> = alloc::vec![0u8; g.pitch * g.height];
+	// SAFETY: the mapping is this vector, it is big enough for the geometry, and it is moved into
+	// the surface below so it outlives the raster and nothing else references it.
+	let raster = unsafe { crate::render::Raster::new(pixels.as_mut_ptr() as u64, &g) }.expect("test geometry");
+	crate::Term::new(alloc::boxed::Box::new(TestSurface { raster, _pixels: pixels }), scrollback)
+}
+
+#[test]
+fn home_on_a_line_longer_than_the_screen_leaves_the_caret_at_the_text() {
+	// The reverse-wrap backspace steps onto the previous physical row only while there IS one.
+	// Once a command line is long enough that its first row has scrolled into the scrollback, the
+	// caret reaches the top-left and stops - and `Ld::home` emitted `columns(0, cursor)` backspaces
+	// and set `cursor = 0` regardless. From then on the buffer and the caret disagreed by however
+	// many backspaces the screen swallowed, and every later edit was drawn in the wrong place.
+	//
+	// 8x4 is 32 cells; the line is 50 characters, so its first rows are gone.
+	let mut term = test_term(8, 4, 16);
+	let mut ld = Ld::new(8);
+	let vocab: Vec<Vec<u8>> = Vec::new();
+	let line: Vec<u8> = (0..50u8).map(|i| b'a' + i % 26).collect();
+	{
+		let mut echo = Echo { term: Some(&mut term), ser: EchoBuf::new() };
+		for &b in &line {
+			ld.feed(b, &vocab, &mut echo);
+		}
+	}
+	assert!(term.screen.caret_index() > 0, "the line filled the screen and scrolled it");
+
+	// Home.
+	{
+		let mut echo = Echo { term: Some(&mut term), ser: EchoBuf::new() };
+		ld.feed(0x01, &vocab, &mut echo); // Ctrl+A
+	}
+	assert_eq!((term.screen.cursor_col(), term.screen.cursor_row()), (0, 0), "the caret is at the start of the text, which is as far back as the screen goes");
+	assert_eq!(term.screen.cell(0, 0).glyph, line[0] as u32, "and the text under it is the line's first character");
+
+	// And the next insertion lands there rather than wherever the caret was left stranded.
+	{
+		let mut echo = Echo { term: Some(&mut term), ser: EchoBuf::new() };
+		ld.feed(b'#', &vocab, &mut echo);
+	}
+	assert_eq!(term.screen.cell(0, 0).glyph, b'#' as u32, "the inserted character is drawn at the caret");
+	assert_eq!(&ld.line[..ld.len][..3], b"#ab", "and it went in at the start of the buffer");
+	assert_eq!((term.screen.cursor_col(), term.screen.cursor_row()), (1, 0), "with the caret just past it");
 }
 
 #[test]
@@ -692,10 +940,13 @@ fn a_query_sequence_is_answered_instead_of_ignored() {
 	assert_eq!(screen.take_reply(), b"\x1b[?6c", "DA identifies the terminal");
 
 	// A program that queries faster than the console drains must not grow the queue without limit.
-	for _ in 0..1000 {
+	// Against the constant, not against a copy of it: the bound was raised to fit the clipboard
+	// answer and a hard-coded 256 here would have had to be edited to match, which is how a test
+	// stops pinning the property and starts pinning the number.
+	for _ in 0..4000 {
 		feed(&mut screen, b"\x1b[6n");
 	}
-	assert!(screen.take_reply().len() <= 256, "an undrained reply queue is bounded");
+	assert!(screen.take_reply().len() <= crate::screen::MAX_REPLY_BYTES, "an undrained reply queue is bounded");
 }
 
 #[test]
