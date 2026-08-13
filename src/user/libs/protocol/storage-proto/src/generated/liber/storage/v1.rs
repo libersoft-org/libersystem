@@ -420,6 +420,7 @@ impl FsckReport {
 		let damaged = {
 			let v1 = r.u16()? as usize;
 			let mut v2 = Vec::new();
+			v2.try_reserve_exact(v1).ok()?;
 			for _ in 0..v1 {
 				v2.push(r.string_lp()?);
 			}
@@ -1418,6 +1419,7 @@ pub mod volume {
 					Ok({
 						let v34 = r.u16()? as usize;
 						let mut v35 = Vec::new();
+						v35.try_reserve_exact(v34).ok()?;
 						for _ in 0..v34 {
 							v35.push(SnapshotInfo::read(r)?);
 						}

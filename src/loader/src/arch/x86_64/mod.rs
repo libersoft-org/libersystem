@@ -161,7 +161,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		(*boot_info).modules_len = module_count as u64;
 		(*boot_info).framebuffer = fb.info;
 		(*boot_info).fb_present = fb.present as u32;
-		(*boot_info)._pad1 = 0;
+		(*boot_info).psci_conduit = bootproto::PSCI_NONE;
 		(*boot_info).rsdp = rsdp;
 		(*boot_info).smp_trampoline = trampoline;
 		(*boot_info).dtb = 0; // x86 uses ACPI, not a device tree.

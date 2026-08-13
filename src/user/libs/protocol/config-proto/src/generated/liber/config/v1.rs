@@ -315,6 +315,7 @@ pub mod config {
 					Ok({
 						let v7 = r.u16()? as usize;
 						let mut v8 = Vec::new();
+						v8.try_reserve_exact(v7).ok()?;
 						for _ in 0..v7 {
 							v8.push(ConfigEntry::read(r)?);
 						}

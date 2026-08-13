@@ -173,6 +173,7 @@ impl Manifest {
 		let requested = {
 			let v2 = r.u16()? as usize;
 			let mut v3 = Vec::new();
+			v3.try_reserve_exact(v2).ok()?;
 			for _ in 0..v2 {
 				v3.push(Capability::read(r)?);
 			}
@@ -181,6 +182,7 @@ impl Manifest {
 		let grants = {
 			let v4 = r.u16()? as usize;
 			let mut v5 = Vec::new();
+			v5.try_reserve_exact(v4).ok()?;
 			for _ in 0..v4 {
 				v5.push(Capability::read(r)?);
 			}
@@ -470,6 +472,7 @@ pub mod permission {
 				let environment = {
 					let v8 = r.u16()? as usize;
 					let mut v9 = Vec::new();
+					v9.try_reserve_exact(v8).ok()?;
 					for _ in 0..v8 {
 						v9.push(EnvVar::read(r)?);
 					}
@@ -520,6 +523,7 @@ pub mod permission {
 				let stages = {
 					let v12 = r.u16()? as usize;
 					let mut v13 = Vec::new();
+					v13.try_reserve_exact(v12).ok()?;
 					for _ in 0..v12 {
 						v13.push(PipelineStage::read(r)?);
 					}
@@ -529,6 +533,7 @@ pub mod permission {
 				let environment = {
 					let v14 = r.u16()? as usize;
 					let mut v15 = Vec::new();
+					v15.try_reserve_exact(v14).ok()?;
 					for _ in 0..v14 {
 						v15.push(EnvVar::read(r)?);
 					}

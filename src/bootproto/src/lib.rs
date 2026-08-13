@@ -92,6 +92,19 @@ pub struct Module {
 	pub name: [u8; 32],
 }
 
+// PSCI conduits - see `BootInfo::psci_conduit`.
+//
+// NOTHING ANSWERS. Either the architecture has no PSCI at all (x86), or whoever would have answered
+// is gone - which is what dropping from EL2 to EL1 does when the firmware's EL2 was the only thing
+// below.
+pub const PSCI_NONE: u32 = 0;
+// `hvc #0`: the conduit for a kernel running at EL1 under something at EL2 that serves it - QEMU's
+// `virt` without `virtualization=on`, and any hypervisor.
+pub const PSCI_HVC: u32 = 1;
+// `smc #0`: the conduit for a machine with secure firmware at EL3. Carried so the field can express
+// it; no path in this tree sets it yet, and the kernel refuses it by name rather than guessing.
+pub const PSCI_SMC: u32 = 2;
+
 // The root hand-off structure. The loader fills one of these and passes its
 // address to the kernel entry point in `rdi` (SysV C ABI first argument).
 #[repr(C)]
@@ -115,7 +128,22 @@ pub struct BootInfo {
 	// The boot framebuffer; valid only when `fb_present` is non-zero.
 	pub framebuffer: Framebuffer,
 	pub fb_present: u32,
-	pub _pad1: u32,
+
+	// WHICH PSCI CONDUIT, IF ANY, ANSWERS THIS KERNEL - `PSCI_NONE`, `PSCI_HVC` or `PSCI_SMC`.
+	//
+	// This was `_pad1`, and the field it became exists because the loader's aarch64 EL2 branch was
+	// run for the first time. PSCI is not a property of the architecture: it is a service provided
+	// by whatever runs BELOW the kernel, and dropping an exception level changes who that is. QEMU's
+	// `virt` implements PSCI at HVC for a guest that starts at EL1; with `virtualization=on` the
+	// guest owns EL2, so an `hvc` from EL1 lands in the guest's own EL2 vectors - the firmware's,
+	// which outlive `ExitBootServices` - and nothing below answers at all. The kernel hardcoded HVC
+	// and faulted bringing up its secondaries, fifteen lines into an otherwise working boot.
+	//
+	// So the entity that decided the exception level says what it left behind. `PSCI_NONE` is the
+	// honest answer for a kernel that must then run on one core, and it is x86's answer too.
+	//
+	// The struct's LAYOUT is unchanged: this is the padding word that was already here, named.
+	pub psci_conduit: u32,
 
 	// ACPI RSDP physical address (0 if the firmware exposed none). The kernel
 	// parses the MADT from here to enumerate LAPICs and wake the APs itself.

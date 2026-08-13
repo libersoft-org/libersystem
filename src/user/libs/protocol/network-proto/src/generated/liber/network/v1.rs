@@ -178,6 +178,7 @@ impl Neighbor {
 		let mac = {
 			let v1 = r.u16()? as usize;
 			let mut v2 = Vec::new();
+			v2.try_reserve_exact(v1).ok()?;
 			for _ in 0..v1 {
 				v2.push(r.u8()?);
 			}
@@ -257,6 +258,7 @@ impl NetInfo {
 		let mac = {
 			let v5 = r.u16()? as usize;
 			let mut v6 = Vec::new();
+			v6.try_reserve_exact(v5).ok()?;
 			for _ in 0..v5 {
 				v6.push(r.u8()?);
 			}
@@ -267,6 +269,7 @@ impl NetInfo {
 		let neighbors = {
 			let v7 = r.u16()? as usize;
 			let mut v8 = Vec::new();
+			v8.try_reserve_exact(v7).ok()?;
 			for _ in 0..v7 {
 				v8.push(Neighbor::read(r)?);
 			}
@@ -506,6 +509,7 @@ impl TcpRequest {
 		let request = {
 			let v10 = r.u16()? as usize;
 			let mut v11 = Vec::new();
+			v11.try_reserve_exact(v10).ok()?;
 			for _ in 0..v10 {
 				v11.push(r.u8()?);
 			}
@@ -1232,6 +1236,7 @@ pub mod network {
 					Ok({
 						let v34 = r.u16()? as usize;
 						let mut v35 = Vec::new();
+						v35.try_reserve_exact(v34).ok()?;
 						for _ in 0..v34 {
 							v35.push(r.u8()?);
 						}
@@ -1362,6 +1367,7 @@ pub mod network {
 					Ok({
 						let v36 = r.u16()? as usize;
 						let mut v37 = Vec::new();
+						v37.try_reserve_exact(v36).ok()?;
 						for _ in 0..v36 {
 							v37.push(SockInfo::read(r)?);
 						}
@@ -1866,6 +1872,7 @@ impl Chunk {
 		let data = {
 			let v43 = r.u16()? as usize;
 			let mut v44 = Vec::new();
+			v44.try_reserve_exact(v43).ok()?;
 			for _ in 0..v43 {
 				v44.push(r.u8()?);
 			}

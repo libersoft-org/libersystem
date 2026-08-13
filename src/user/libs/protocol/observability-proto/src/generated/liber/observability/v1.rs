@@ -269,6 +269,7 @@ impl Component {
 		let deps = {
 			let v1 = r.u16()? as usize;
 			let mut v2 = Vec::new();
+			v2.try_reserve_exact(v1).ok()?;
 			for _ in 0..v1 {
 				v2.push(r.string_lp()?);
 			}
@@ -397,6 +398,7 @@ impl Graph {
 		let components = {
 			let v5 = r.u16()? as usize;
 			let mut v6 = Vec::new();
+			v6.try_reserve_exact(v5).ok()?;
 			for _ in 0..v5 {
 				v6.push(Component::read(r)?);
 			}
@@ -405,6 +407,7 @@ impl Graph {
 		let spans = {
 			let v7 = r.u16()? as usize;
 			let mut v8 = Vec::new();
+			v8.try_reserve_exact(v7).ok()?;
 			for _ in 0..v7 {
 				v8.push(TraceSpan::read(r)?);
 			}
@@ -782,6 +785,7 @@ pub mod supervisor {
 					Ok({
 						let v14 = r.u16()? as usize;
 						let mut v15 = Vec::new();
+						v15.try_reserve_exact(v14).ok()?;
 						for _ in 0..v14 {
 							v15.push(SupervisorStat::read(r)?);
 						}

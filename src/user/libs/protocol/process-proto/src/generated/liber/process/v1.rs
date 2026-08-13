@@ -585,6 +585,7 @@ pub mod process {
 					Ok({
 						let v16 = r.u16()? as usize;
 						let mut v17 = Vec::new();
+						v17.try_reserve_exact(v16).ok()?;
 						for _ in 0..v16 {
 							v17.push(ProcessInfo::read(r)?);
 						}
@@ -675,6 +676,7 @@ pub mod process {
 					Ok({
 						let v18 = r.u16()? as usize;
 						let mut v19 = Vec::new();
+						v19.try_reserve_exact(v18).ok()?;
 						for _ in 0..v18 {
 							v19.push(Budget::read(r)?);
 						}

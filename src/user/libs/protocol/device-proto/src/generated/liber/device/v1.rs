@@ -311,6 +311,7 @@ pub mod device {
 					Ok({
 						let v5 = r.u16()? as usize;
 						let mut v6 = Vec::new();
+						v6.try_reserve_exact(v5).ok()?;
 						for _ in 0..v5 {
 							v6.push(DeviceEntry::read(r)?);
 						}
@@ -582,6 +583,7 @@ pub mod usb {
 					Ok({
 						let v10 = r.u16()? as usize;
 						let mut v11 = Vec::new();
+						v11.try_reserve_exact(v10).ok()?;
 						for _ in 0..v10 {
 							v11.push(UsbDevice::read(r)?);
 						}

@@ -2048,9 +2048,16 @@ pub enum ReceivedCaps {
 // stdin, stdout and stderr had two of them DESTROYED before the server's dispatch was reached: not
 // refused, destroyed. Eleven hand-written dispatch loops did the same thing for the same reason.
 //
-// The single-handle receive stays for bootstrap and stream messages, which carry at most one by
-// construction. A typed path may not use it, and `check-single-cap-receive.sh` is what keeps a new
-// one from appearing.
+// The single-handle receive stays for bootstrap and stream messages, which carry at most one
+// BECAUSE THE VALIDATOR REFUSES ANYTHING ELSE - `check_stream_frames` in `lsidl-gen` rejects a stream
+// whose element type carries several capabilities, with a diagnostic saying the transport sends
+// exactly one. "By construction" is what this said, and it stopped being true the moment
+// `report_cardinality` was relaxed to accept `Many` for replies: the schema could then express a
+// two-capability frame that `{method}_frame` would silently drop the second half of. A claim about a
+// rule somewhere else has to name the rule, or nobody notices when the rule moves.
+//
+// A typed path may not use it, and `check-single-cap-receive.sh` is what keeps a new one from
+// appearing.
 pub unsafe fn recv_caps_blocking(channel: u64, buf: &mut [u8]) -> ReceivedCaps {
 	unsafe {
 		let mut raw = [0u64; MAX_MESSAGE_CAPS];

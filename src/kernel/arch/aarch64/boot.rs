@@ -388,7 +388,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 
 	// Wake the secondary cores via PSCI CPU_ON (each brings up its own per-CPU
 	// block + local GIC/timer, then idles).
-	super::psci::bring_up_secondaries(cpu_count);
+	super::psci::bring_up_secondaries(cpu_count, arg);
 
 	// The portable scheduler on top of the arch context/percpu contract, sized for
 	// every online core so a secondary's timer tick indexes its own (empty) run queue
@@ -538,7 +538,7 @@ fn publish_embedded_boot_info() {
 		None => (bootproto::Framebuffer { addr: 0, width: 0, height: 0, pitch: 0, bpp: 0, red_shift: 0, red_size: 0, green_shift: 0, green_size: 0, blue_shift: 0, blue_size: 0, _pad: [0; 2] }, 0u32),
 	};
 	// ALLOC-OK: boot, as above
-	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, _pad1: 0, rsdp: 0, smp_trampoline: 0, dtb: 0 }));
+	let bi: &'static bootproto::BootInfo = alloc::boxed::Box::leak(alloc::boxed::Box::new(bootproto::BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: super::paging::KERNEL_VA_OFFSET, memmap: 0, memmap_len: 0, modules: modules.as_ptr() as u64, modules_len: modules.len() as u64, framebuffer, fb_present, psci_conduit: bootproto::PSCI_HVC, rsdp: 0, smp_trampoline: 0, dtb: 0 }));
 	crate::publish_boot_info(bi);
 }
 

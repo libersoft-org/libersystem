@@ -825,6 +825,7 @@ pub mod session {
 					Ok({
 						let v25 = r.u16()? as usize;
 						let mut v26 = Vec::new();
+						v26.try_reserve_exact(v25).ok()?;
 						for _ in 0..v25 {
 							v26.push(JobInfo::read(r)?);
 						}
@@ -860,6 +861,7 @@ pub mod session {
 					Ok({
 						let v27 = r.u16()? as usize;
 						let mut v28 = Vec::new();
+						v28.try_reserve_exact(v27).ok()?;
 						for _ in 0..v27 {
 							v28.push(JobInfo::read(r)?);
 						}
@@ -996,6 +998,7 @@ pub mod session {
 					Ok({
 						let v29 = r.u16()? as usize;
 						let mut v30 = Vec::new();
+						v30.try_reserve_exact(v29).ok()?;
 						for _ in 0..v29 {
 							v30.push(EnvVar::read(r)?);
 						}

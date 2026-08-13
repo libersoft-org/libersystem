@@ -858,7 +858,13 @@ impl Cg {
 			Type::List(inner) => {
 				let n = self.fresh();
 				let acc = self.fresh();
-				format!("{{ let {n} = r.u16()? as usize; let mut {acc} = Vec::new(); for _ in 0..{n} {{ {acc}.push({}); }} {acc} }}", self.read_value(inner)?)
+				// `try_reserve_exact` before the loop, the same rule `string_lp` next door was taught
+				// and this was not. The count is bounded by `u16` and by the message size, so this
+				// is not the unbounded-allocation class - it is the same model applied
+				// inconsistently, in the file the fix was written for, and a decoder that aborts
+				// rather than refuses is a decoder that hands a hostile message a way to end the
+				// process reading it.
+				format!("{{ let {n} = r.u16()? as usize; let mut {acc} = Vec::new(); {acc}.try_reserve_exact({n}).ok()?; for _ in 0..{n} {{ {acc}.push({}); }} {acc} }}", self.read_value(inner)?)
 			}
 			Type::Tuple(elems) => {
 				let mut parts = Vec::new();

@@ -191,6 +191,7 @@ impl Budget {
 		let usage = {
 			let v1 = r.u16()? as usize;
 			let mut v2 = Vec::new();
+			v2.try_reserve_exact(v1).ok()?;
 			for _ in 0..v1 {
 				v2.push(ResourceUsage::read(r)?);
 			}
@@ -391,6 +392,7 @@ pub mod resources {
 					Ok({
 						let v8 = r.u16()? as usize;
 						let mut v9 = Vec::new();
+						v9.try_reserve_exact(v8).ok()?;
 						for _ in 0..v8 {
 							v9.push(Budget::read(r)?);
 						}

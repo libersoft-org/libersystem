@@ -87,7 +87,35 @@ aarch64_secondary_entry:
 "#
 );
 
-// Issue a PSCI CPU_ON via HVC. Returns the PSCI status (0 = SUCCESS).
+// Which conduit, if any, answers a PSCI call on this machine - what the loader recorded in the
+// hand-off. `PSCI_NONE` for a kernel that was dropped from EL2 with nothing left below it.
+//
+// READ FROM THE HAND-OFF DIRECTLY, not from the published `BootInfo`, for the reason
+// `loader_module_at` gives one file over: the secondaries are brought up BEFORE the kernel publishes
+// one, and reading it there panics with "boot info read before it was published" - which is what the
+// first version of this did.
+//
+// No hand-off (QEMU's `-kernel`, which enters with a raw DTB pointer) means the guest started at EL1
+// under QEMU's own PSCI, which is HVC. That is the path every aarch64 test in this tree takes.
+pub(crate) fn conduit(arg: u64) -> u32 {
+	if arg == 0 {
+		return bootproto::PSCI_HVC;
+	}
+	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return bootproto::PSCI_HVC;
+	}
+	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
+	unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).psci_conduit)) }
+}
+
+// Issue a PSCI CPU_ON on the conduit the loader said exists. Returns the PSCI status (0 = SUCCESS).
+//
+// THE CONDUIT IS NOT A PROPERTY OF THE ARCHITECTURE. It is a fact about whatever runs below this
+// kernel, and this issued a bare `hvc #0` on the assumption that something always does. Under
+// `virtualization=on` the guest owns EL2, so the `hvc` landed in the firmware's EL2 vectors - which
+// outlive `ExitBootServices` - and the boot died there with fifteen lines of kernel output behind it
+// and no explanation. `BootInfo::psci_conduit` is the loader saying what it left behind.
 fn cpu_on(target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
 	let ret: i64;
 	unsafe {
@@ -134,9 +162,26 @@ extern "C" fn aarch64_secondary_main(cpu_id: u64) -> ! {
 
 // Wake every secondary core (cpu ids 1..cpu_count) via PSCI CPU_ON and wait for
 // them to report in. On QEMU virt the MPIDR affinity of cpu N is simply N.
-pub fn bring_up_secondaries(cpu_count: u32) {
+pub fn bring_up_secondaries(cpu_count: u32, boot_arg: u64) {
 	if cpu_count <= 1 {
 		return;
+	}
+	// NO CONDUIT, NO SECONDARIES - and a line saying so, rather than a fault into somebody else's
+	// exception vectors. A single-core boot is a working system; a machine that dies bringing up its
+	// second core is not, and the difference used to be one instruction the kernel had no way to know
+	// was unanswered.
+	match conduit(boot_arg) {
+		bootproto::PSCI_HVC => {}
+		bootproto::PSCI_SMC => {
+			// Nothing in this tree sets it, and guessing at an `smc` here would be the same mistake
+			// one instruction over: refused by name.
+			crate::serial_println!("aarch64: SMP - the SMC conduit is not implemented; running on one core");
+			return;
+		}
+		_ => {
+			crate::serial_println!("aarch64: SMP - no PSCI conduit below this kernel; running on one core");
+			return;
+		}
 	}
 
 	// The secondary entry is the low, physical `.text.boot` stub address; PSCI

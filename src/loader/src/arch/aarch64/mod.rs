@@ -238,7 +238,20 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 			}
 			_ => (0, 0),
 		};
-		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: 0, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, _pad1: 0, rsdp: 0, smp_trampoline: 0, dtb };
+		// WHAT WILL BE LEFT BELOW THE KERNEL, decided here because this is the code that decides it.
+		//
+		// If the firmware entered this loader at EL1, something at EL2 is serving it and will go on
+		// serving the kernel: that is QEMU's `virt`, whose PSCI is at HVC. If it entered at EL2, this
+		// loader is about to drop to EL1 and the only thing that was at EL2 is the firmware it is
+		// about to leave - so after the `eret` an `hvc` reaches nobody. Saying `PSCI_NONE` is what
+		// turns the kernel's secondary bring-up from a fault into a single-core boot with a reason.
+		//
+		// `CurrentEL` is read here rather than remembered from `hand_off`, so the two answers cannot
+		// drift apart.
+		let current_el: u64;
+		core::arch::asm!("mrs {0}, CurrentEL", out(reg) current_el, options(nomem, nostack));
+		let psci_conduit = if (current_el >> 2) & 0b11 == 2 { bootproto::PSCI_NONE } else { bootproto::PSCI_HVC };
+		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: 0, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit, rsdp: 0, smp_trampoline: 0, dtb };
 	}
 	phys
 }

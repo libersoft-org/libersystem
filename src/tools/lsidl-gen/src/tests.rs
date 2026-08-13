@@ -341,6 +341,31 @@ fn stream_helpers_carry_handles_per_open_and_frame() {
 }
 
 #[test]
+fn a_stream_frame_that_would_carry_two_capabilities_is_refused() {
+	// THE SCHEMA MUST NOT BE ABLE TO EXPRESS WHAT THE WIRE WILL DROP, which is what this milestone is
+	// named for and what the fix for it reintroduced one layer down. `report_cardinality` was relaxed
+	// to accept `Many` in the change that migrated the RECEIVE side to four handles, and this call
+	// site went with it - while the generated frame transport stayed singular: `{method}_frame` ends
+	// with `*frame_handle = writer.handle()` and the reader is `Reader::with_handle`.
+	//
+	// So a two-capability frame would have had its second capability created, written into the
+	// writer, dropped by the encoder, and decoded by the client as a placeholder - with nothing in
+	// the schema, the generator or the runtime saying so.
+	assert_err_contains("package liber:stream@1; resource chan; record pipe { input: handle<chan>, output: handle<chan> } interface feed { @op(1) frames: func() -> stream<pipe>; }", "a stream frame may carry at most one capability");
+
+	// A REPLY may carry several - that is exactly what the migration was for - so the refusal has to
+	// be the stream's own and not a return to the old blanket rule.
+	assert!(errors("package liber:stream@1; resource chan; record pipe { input: handle<chan>, output: handle<chan> } interface feed { @op(1) once: func() -> pipe; }").is_empty(), "a multi-capability reply is what the four-handle wire exists for");
+
+	// And one capability per frame still validates, which is every stream in this tree.
+	assert!(errors("package liber:stream@1; resource file; record held { file: handle<file> } interface feed { @op(1) open: func() -> stream<held>; }").is_empty(), "a single-capability frame is what the transport carries");
+
+	// Nested the same way `check_stream_frames` walks: inside a result, which is how a stream that
+	// can fail before it starts is written.
+	assert_err_contains("package liber:stream@1; resource chan; record pipe { input: handle<chan>, output: handle<chan> } record oops { code: u32 } interface feed { @op(1) frames: func() -> result<stream<pipe>, oops>; }", "a stream frame may carry at most one capability");
+}
+
+#[test]
 fn a_stream_may_fail_before_it_starts() {
 	// `result<stream<T>, error>` PARSED AND GENERATED NOTHING. The generator matched `Type::Stream`
 	// on the return position directly, so a stream inside a result never reached that arm and the
