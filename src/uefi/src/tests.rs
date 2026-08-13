@@ -9,7 +9,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::mock::{self, add_disk, descriptor, guard, state};
-use crate::{disk, file, gop, memory};
+use crate::{acpi, disk, file, gop, memory};
 
 // A device whose driver demands 4096-byte buffer alignment.
 //
@@ -523,4 +523,196 @@ fn a_blt_only_mode_has_no_framebuffer_to_hand_over() {
 	state().gop = Some(mock::GopConfig { width: 800, height: 600, stride: 800, format: crate::PIXEL_BLT_ONLY, mask: crate::PixelBitmask { red: 0, green: 0, blue: 0, reserved: 0 }, base: 0, size: 0 });
 	let fb = gop::locate_framebuffer(mock::boot_services());
 	assert!(!fb.present, "a blt-only mode is not a linear framebuffer");
+}
+
+// ---------------------------------------------------------------------------------------------
+// SPCR: where a machine that has no device tree says its console is.
+// ---------------------------------------------------------------------------------------------
+
+// ACPI's older pointers are THIRTY-TWO BITS WIDE, and a host's heap address is not - so these
+// tests cannot hand the reader raw `&[u8]` addresses the way the device-tree tests do. They publish
+// each blob at a made-up physical address low enough to fit in a `u32` and translate on the way in,
+// which is exactly what the loader's identity map and the kernel's direct map each do.
+//
+// It also stops a test from passing for the wrong reason: an RSDT test that quietly truncated its
+// own pointer would read a wild address and crash, which is what the first version of this did.
+static REGIONS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn publish_at(real: u64, len: u64) -> u64 {
+	let mut regions = REGIONS.lock().expect("the region table");
+	let fake = 0x1000_0000u64 + regions.len() as u64 * 0x10_0000;
+	regions.push((fake, real, len));
+	fake
+}
+
+fn publish(bytes: &'static [u8]) -> u64 {
+	publish_at(bytes.as_ptr() as u64, bytes.len() as u64)
+}
+
+fn here(address: u64) -> u64 {
+	let regions = REGIONS.lock().expect("the region table");
+	for (fake, real, len) in regions.iter() {
+		if address >= *fake && address < fake + len {
+			return real + (address - fake);
+		}
+	}
+	// A read outside every published blob is a reader following a pointer it invented, and the
+	// useful answer is a diagnosable panic rather than a segmentation fault.
+	panic!("the reader followed {address:#x}, which is not inside any table this test published");
+}
+
+// An ACPI table with a correct header: signature, length, revision, and a checksum over the whole
+// of it. Real firmware writes one; a reader that skipped the checksum would accept anything.
+fn table(signature: &[u8; 4], revision: u8, body: &[u8]) -> Vec<u8> {
+	let mut out = Vec::new();
+	out.extend_from_slice(signature);
+	out.extend_from_slice(&((36 + body.len()) as u32).to_le_bytes());
+	out.push(revision);
+	out.push(0); // checksum, filled below
+	out.extend_from_slice(b"LIBER "); // OEM id
+	out.extend_from_slice(b"LIBERSYS"); // OEM table id
+	out.extend_from_slice(&1u32.to_le_bytes()); // OEM revision
+	out.extend_from_slice(b"LIBE"); // creator id
+	out.extend_from_slice(&1u32.to_le_bytes()); // creator revision
+	out.extend_from_slice(body);
+	let sum = out.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+	out[9] = (!sum).wrapping_add(1);
+	out
+}
+
+// An SPCR body: interface type, three reserved bytes, then the Generic Address Structure.
+fn spcr_body(interface: u8, space: u8, access: u8, base: u64) -> Vec<u8> {
+	let mut body = vec![interface, 0, 0, 0];
+	body.push(space);
+	body.push(8); // bit width
+	body.push(0); // bit offset
+	body.push(access);
+	body.extend_from_slice(&base.to_le_bytes());
+	// Revision 1 SPCR runs to 80 bytes; the rest is interrupt and baud description this does not
+	// read, and a table that stopped at the GAS would be a table real firmware does not write.
+	body.resize(80 - 36, 0);
+	body
+}
+
+// An RSDP, an XSDT and one table, laid out in one buffer and leaked so the addresses inside it
+// stay valid - which is the shape the firmware's tables have.
+fn machine(tables: &[Vec<u8>], revision: u8) -> u64 {
+	let mut blob: Vec<u8> = Vec::new();
+	// Reserve the RSDP (36 bytes) and the XSDT header plus one pointer per table.
+	let rsdp_len = 36usize;
+	let xsdt_len = 36 + 8 * tables.len();
+	blob.resize(rsdp_len + xsdt_len, 0);
+	let mut addresses = Vec::new();
+	for entry in tables {
+		addresses.push(blob.len());
+		blob.extend_from_slice(entry);
+	}
+	let leaked: &'static mut [u8] = Vec::leak(blob);
+	let origin = publish_at(leaked.as_ptr() as u64, leaked.len() as u64);
+
+	// The XSDT, with its own header and checksum.
+	let xsdt_at = rsdp_len;
+	leaked[xsdt_at..xsdt_at + 4].copy_from_slice(b"XSDT");
+	leaked[xsdt_at + 4..xsdt_at + 8].copy_from_slice(&(xsdt_len as u32).to_le_bytes());
+	leaked[xsdt_at + 8] = 1;
+	for (index, offset) in addresses.iter().enumerate() {
+		let at = xsdt_at + 36 + index * 8;
+		leaked[at..at + 8].copy_from_slice(&(origin + *offset as u64).to_le_bytes());
+	}
+
+	// The RSDP: signature, checksum over the first twenty bytes, revision, then the XSDT pointer.
+	leaked[0..8].copy_from_slice(b"RSD PTR ");
+	leaked[15] = revision;
+	leaked[24..32].copy_from_slice(&(origin + xsdt_at as u64).to_le_bytes());
+	let sum = leaked[0..20].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+	leaked[9] = (!sum).wrapping_add(1);
+	origin
+}
+
+#[test]
+fn spcr_names_the_console_of_an_acpi_machine() {
+	// The case the whole change is for: server-class aarch64 has no device tree, so the console
+	// address the loader used to store to after `ExitBootServices` was a literal from QEMU's virt
+	// machine. SPCR is where such a machine says it.
+	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x0e, 0, 1, 0xffff_0000_0000_9000))], 2);
+	let acpi = acpi::Acpi::new(rsdp, here);
+	assert!(acpi.is_valid(), "a well-formed RSDP is accepted");
+	assert_eq!(acpi.console(), Some(acpi::Console { uart: acpi::Uart::Pl011, base: 0xffff_0000_0000_9000, reg_shift: 0 }), "an SBSA generic UART is a PL011 for the two registers this drives");
+}
+
+#[test]
+fn a_sixteen_five_fifty_with_dword_access_is_four_bytes_between_registers() {
+	// The 16550 half, and the field that is easy to ignore: a table describing 32-bit accesses is
+	// describing registers four bytes apart. Writing the character at +5 instead of +20 puts it in
+	// the modem-control register.
+	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 0, 3, 0x1000_0000))], 2);
+	assert_eq!(acpi::Acpi::new(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 2 }));
+}
+
+#[test]
+fn a_console_that_is_not_in_memory_or_not_a_uart_we_drive_is_refused() {
+	// Three ways SPCR describes something this loader must not store to, each of which a reader
+	// that only looked at the address would accept.
+	let ports = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 1, 1, 0x3f8))], 2);
+	assert_eq!(acpi::Acpi::new(ports, here).console(), None, "an I/O-port console is not a store away");
+
+	let unknown = machine(&[table(b"SPCR", 2, &spcr_body(0x05, 0, 1, 0x1000_0000))], 2);
+	assert_eq!(acpi::Acpi::new(unknown, here).console(), None, "a UART family with no driver here is not guessed at");
+
+	let nowhere = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0))], 2);
+	assert_eq!(acpi::Acpi::new(nowhere, here).console(), None, "and address zero is not an address");
+}
+
+#[test]
+fn a_machine_with_no_spcr_answers_none_rather_than_the_first_table_it_finds() {
+	let rsdp = machine(&[table(b"FACP", 2, &[0u8; 200]), table(b"APIC", 2, &[0u8; 100])], 2);
+	let acpi = acpi::Acpi::new(rsdp, here);
+	assert!(acpi.table(b"APIC").is_some(), "the walk finds the tables that are there");
+	assert_eq!(acpi.table(b"SPCR"), None);
+	assert_eq!(acpi.console(), None);
+}
+
+#[test]
+fn a_configuration_table_entry_that_is_not_an_rsdp_is_not_walked() {
+	// The loader hands this whatever the firmware's configuration table held under the ACPI GUID.
+	// An entry that points at something else is a pointer into arbitrary memory, and the checksum
+	// is what tells the difference - a signature alone can occur by accident in a data table.
+	let rubbish: &'static [u8] = Vec::leak(vec![0x41u8; 4096]);
+	let acpi = acpi::Acpi::new(publish(rubbish), here);
+	assert!(!acpi.is_valid());
+	assert_eq!(acpi.console(), None);
+
+	// A correct signature with a wrong checksum is the case that matters, because it is what a
+	// stale or half-written table looks like.
+	let mut bytes = vec![0u8; 64];
+	bytes[0..8].copy_from_slice(b"RSD PTR ");
+	bytes[15] = 2;
+	let leaked: &'static [u8] = Vec::leak(bytes);
+	assert!(!acpi::Acpi::new(publish(leaked), here).is_valid(), "the signature is right and the checksum is not");
+}
+
+#[test]
+fn an_acpi_one_point_zero_machine_is_read_through_its_rsdt() {
+	// Revision 0 has no XSDT, and a reader that always took the 64-bit pointer at offset 24 would
+	// read two words of the OEM id as an address. Older aarch64 firmware is rare; older x86
+	// firmware is not.
+	let spcr = table(b"SPCR", 1, &spcr_body(0x03, 0, 1, 0x9000_0000));
+	let mut blob: Vec<u8> = vec![0u8; 36];
+	let rsdt_at = blob.len();
+	blob.resize(rsdt_at + 36 + 4, 0);
+	let spcr_at = blob.len();
+	blob.extend_from_slice(&spcr);
+	let leaked: &'static mut [u8] = Vec::leak(blob);
+	let origin = publish_at(leaked.as_ptr() as u64, leaked.len() as u64);
+	leaked[rsdt_at..rsdt_at + 4].copy_from_slice(b"RSDT");
+	leaked[rsdt_at + 4..rsdt_at + 8].copy_from_slice(&40u32.to_le_bytes());
+	leaked[rsdt_at + 36..rsdt_at + 40].copy_from_slice(&((origin + spcr_at as u64) as u32).to_le_bytes());
+	leaked[0..8].copy_from_slice(b"RSD PTR ");
+	leaked[15] = 0;
+	leaked[16..20].copy_from_slice(&((origin + rsdt_at as u64) as u32).to_le_bytes());
+	let sum = leaked[0..20].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+	leaked[9] = (!sum).wrapping_add(1);
+
+	let console = acpi::Acpi::new(origin, here).console().expect("revision 0 is read through the RSDT");
+	assert_eq!(console.base, 0x9000_0000);
 }

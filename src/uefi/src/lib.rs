@@ -26,6 +26,7 @@
 
 extern crate alloc;
 
+pub mod acpi;
 pub mod disk;
 pub mod file;
 pub mod gop;

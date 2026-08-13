@@ -22,8 +22,8 @@
 // as a core spinning forever rather than as anything that names this file.
 //
 // From `upgrade_to_heap` onward the run table is empty and the buddy allocator
-// in `buddy.rs` answers everything; the table remains only as the fallback for a
-// machine whose bitmap could not be reserved.
+// in the `buddy` crate answers everything; the table remains only as the fallback
+// for a machine whose bitmap could not be reserved.
 //
 // A free is checked against the pool: a span overlapping an existing free run is
 // a double free and is refused loudly, because honoring it would let the same
@@ -40,7 +40,10 @@ use alloc::vec::Vec;
 
 use crate::sync::SpinLock;
 
-mod buddy;
+// The buddy allocator lives in its own crate so a HOST can drive it: the bitmap arithmetic is
+// pure, and inside the kernel the only way to exercise it was to boot a guest a few thousand
+// allocations at a time. See `src/buddy` - and P02M0120, which is open on a defect that was seen
+// once in exactly that setting.
 use buddy::Buddy;
 
 // The table's floor, for a pool too small for the worst-case sizing below to matter. The real bound
@@ -412,7 +415,9 @@ impl FrameAllocator {
 			// overlap test. The buddy has no overlap test - it has a bitmap - so the same question
 			// is asked directly, and asking it is what keeps a freed-twice page from being handed
 			// to two owners.
-			let already = (0..pages).any(|page| self.buddy.as_ref().is_some_and(|buddy| buddy.is_free_page(base + page * PAGE_SIZE)));
+			// The question belongs to the allocator's representation - "already free" means free at
+			// any order covering the page - so it is asked THERE rather than reconstructed here.
+			let already = self.buddy.as_ref().is_some_and(|buddy| buddy.any_free(base, pages));
 			if already {
 				note_refused_free();
 				crate::serial_println!("frame: WARNING: double free refused - {pages} page(s) at {base:#x} are already free");

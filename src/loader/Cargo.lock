@@ -18,6 +18,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdt"
+version = "0.0.0"
+
+[[package]]
 name = "fscore"
 version = "0.0.0"
 
@@ -35,6 +39,7 @@ dependencies = [
  "abi",
  "bootproto",
  "fat",
+ "fdt",
  "fscore",
  "liberfs",
  "uefi",

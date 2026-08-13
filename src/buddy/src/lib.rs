@@ -1,40 +1,59 @@
-// A binary buddy allocator over a bitmap sized from the memory map, once.
-//
-// The run table it replaces answered three things badly, and P02M0120 names them:
-//
-//   - its metadata grew with FRAGMENTATION rather than with memory, so the bound had to be
-//     guessed and a free past the guess was lost;
-//   - coalescing depended on that table having room, so the one operation that must never
-//     fail could;
-//   - a contiguous multi-page allocation walked the run list, so a DMA buffer cost a scan
-//     proportional to how splintered the pool had become.
-//
-// A buddy answers all three with arithmetic. A block of 2^k pages at index `i` has exactly one
-// buddy, `i ^ 1` at that order, found by xor rather than by searching; merging is testing one bit
-// and clearing it. There is no table to fill, so a free cannot fail - which is the property the
-// whole milestone exists for.
-//
-// WHY BITMAPS AND NOT FREE LISTS. The textbook buddy keeps a list per order so allocation is O(1)
-// instead of a scan. Two ways to build one here and both cost more than they return:
-//
-//   - Intrusive lists, threading `next` through the free pages themselves, are what a general
-//     kernel does. They need every free page reachable through the direct map at the moment it is
-//     freed, on all three architectures, forever. That is a correctness dependency on something
-//     this allocator currently does not care about at all.
-//   - Side arrays cost 8 bytes per block per order - about 16 bytes per page once summed - which
-//     is twice what the run table cost, to remove a scan that is already small.
-//
-// Because the scan is small. Allocation at order k reads the order-k bitmap, which holds
-// `pages >> k` bits: a 64-page DMA buffer on a 512 MB machine scans 32 words, against a run list
-// that could hold 65536 entries. The thing the milestone asked to remove is removed; what is left
-// is not a linear scan over the pool, it is a handful of `u64` loads with a hint in front of them.
-//
-// Metadata is one bit per block per order, summed over orders: 2 bits per page, `pages / 4` bytes.
-// 128 KiB on a 4 GiB machine, reserved once and never grown.
+//! A binary buddy allocator over a bitmap sized from the memory map, once.
+//!
+//! SEPARATE FROM THE KERNEL SO IT CAN BE DRIVEN HARD. This is the kernel's physical frame
+//! allocator and it used to live inside `kernel::mem::frame`, where the only way to exercise it was
+//! to boot a guest: a few thousand allocations per architecture, in whatever order that boot
+//! happened to produce, at up to ninety minutes a run on riscv64. P02M0120 is open on a defect seen
+//! ONCE in exactly that setting - eighty double allocations of one page, on the last page of the
+//! first usable region, never reproduced in fourteen full runs since - and "run the suite again and
+//! hope" is not a way to find it.
+//!
+//! Here the same code takes tens of millions of operations in under a second, against a reference
+//! model that knows where every page is, over pool shapes chosen to be the shape of the sighting.
+//! Nothing about the allocator changed in the move; what changed is how many times it can be asked.
+//!
+//! The run table it replaces answered three things badly, and P02M0120 names them:
+//!
+//!   - its metadata grew with FRAGMENTATION rather than with memory, so the bound had to be
+//!     guessed and a free past the guess was lost;
+//!   - coalescing depended on that table having room, so the one operation that must never
+//!     fail could;
+//!   - a contiguous multi-page allocation walked the run list, so a DMA buffer cost a scan
+//!     proportional to how splintered the pool had become.
+//!
+//! A buddy answers all three with arithmetic. A block of 2^k pages at index `i` has exactly one
+//! buddy, `i ^ 1`, found by xor rather than by searching; merging is testing one bit and clearing
+//! it. There is no table to fill, so a free cannot fail - which is the property the whole milestone
+//! exists for.
+//!
+//! WHY BITMAPS AND NOT FREE LISTS. The textbook buddy keeps a list per order so allocation is O(1)
+//! instead of a scan. Two ways to build one here and both cost more than they return:
+//!
+//!   - Intrusive lists, threading `next` through the free pages themselves, are what a general
+//!     kernel does. They need every free page reachable through the direct map at the moment it is
+//!     freed, on all three architectures, forever. That is a correctness dependency on something
+//!     this allocator currently does not care about at all.
+//!   - Side arrays cost 8 bytes per block per order - about 16 bytes per page once summed - which
+//!     is twice what the run table cost, to remove a scan that is already small.
+//!
+//! Because the scan is small. Allocation at order k reads the order-k bitmap, which holds
+//! `pages >> k` bits: a 64-page DMA buffer on a 512 MB machine scans 32 words, against a run list
+//! that could hold 65536 entries. The thing the milestone asked to remove is removed; what is left
+//! is not a linear scan over the pool, it is a handful of `u64` loads with a hint in front of them.
+//!
+//! Metadata is one bit per block per order, summed over orders: 2 bits per page, `pages / 4` bytes.
+//! 128 KiB on a 4 GiB machine, reserved once and never grown.
+
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 
-use super::PAGE_SIZE;
+// The page size the addresses in this file are in. The kernel's `frame::PAGE_SIZE` is the same
+// number; it is repeated here rather than imported because this crate is the arithmetic and has no
+// reason to depend on the kernel it serves.
+pub const PAGE_SIZE: u64 = 4096;
 
 // The largest block the allocator tracks: 2^18 pages, one gigabyte. Well past any DMA request in
 // this system, and the metadata for the higher orders is a geometric tail that costs nothing - the
@@ -99,6 +118,12 @@ impl Buddy {
 		self.free_pages
 	}
 
+	// The extent this allocator frames, as (first physical address, pages). The kernel's audit and
+	// the tests both want to walk it, and both were reaching for the private fields.
+	pub fn extent(&self) -> (u64, u64) {
+		(self.base, self.pages)
+	}
+
 	// How many bytes of metadata this allocator holds. For the boot report and the test that
 	// pins the sizing.
 	pub fn metadata_bytes(&self) -> usize {
@@ -143,6 +168,45 @@ impl Buddy {
 			self.bits[word] &= !(1 << (index % 64));
 			self.counts[order] -= 1;
 		}
+	}
+
+	// Is any bit in `[start, start + count)` of this order's bitmap set? Word at a time with the
+	// ends masked, because the range can be the whole of a low order's bitmap when a large block is
+	// being freed and asking bit by bit would make a seed of a 512 MB pool read a million bits.
+	fn any_bit_in_range(&self, order: usize, start: u64, count: u64) -> bool {
+		let end = (start + count).min(self.blocks_at(order));
+		if start >= end {
+			return false;
+		}
+		let (first_word, last_word) = ((start / 64) as usize, ((end - 1) / 64) as usize);
+		for word in first_word..=last_word {
+			let mut value = self.bits[self.offsets[order] + word];
+			if word == first_word {
+				value &= u64::MAX << (start % 64);
+			}
+			if word == last_word && (end % 64) != 0 {
+				value &= u64::MAX >> (64 - end % 64);
+			}
+			if value != 0 {
+				return true;
+			}
+		}
+		false
+	}
+
+	// Does the block of 2^order pages at page index `page` overlap anything already free?
+	//
+	// Three ways it can, and a check that asks only one of them is a check that lets the other two
+	// through: the block itself may be free; a LARGER block may cover it; or a smaller free block
+	// may sit INSIDE it, which is the one a per-page `is_free_page` on the first page misses
+	// entirely. All three end the same way - a page in the free set twice.
+	fn block_touches_free(&self, page: u64, order: usize) -> bool {
+		// This order and every larger one: exactly one block covers `page` at each.
+		if (order..=MAX_ORDER).any(|at| self.get(at, page >> at)) {
+			return true;
+		}
+		// And every smaller order, where the block spans many.
+		(0..order).any(|at| self.any_bit_in_range(at, page >> at, 1u64 << (order - at)))
 	}
 
 	// The first free block at `order`, if there is one. Scans from the hint and moves it forward
@@ -200,8 +264,41 @@ impl Buddy {
 	// The caller must hand back a block it got from `alloc` at the same order, or a span it framed
 	// itself with `free_span`. A misaligned index is refused rather than corrupting the tree -
 	// which is a check about this allocator's own invariants, not about the caller's ownership;
-	// that is `check_owned_free`'s job one level up.
+	// that is the frame allocator's `check_owned_free` one level up.
+	//
+	// A FREE OF SOMETHING ALREADY FREE IS REFUSED HERE, not only by the caller. It used to be left
+	// entirely to the frame allocator above, which asks `any_free` before it touches its ownership
+	// record - and that is still the right place for the DECISION, because the caller has state to
+	// keep consistent and this does not. But the two outcomes of forgetting it are both silent and
+	// both are this file's own invariant coming apart:
+	//
+	//   - freeing a page that a LARGER free block already covers sets a bit under that block, so the
+	//     page is in the free set twice and the next two allocations that reach it both get it. That
+	//     is a double allocation, arriving with nothing to point at;
+	//   - freeing the same block at the SAME order sets a bit that is already set, which `set` folds
+	//     into nothing while `free_pages` still counts it - a pool that reports memory no allocation
+	//     can find;
+	//   - and freeing a block with a SMALLER free block inside it does the first of those from the
+	//     other direction, which is the case a check on the block's first page misses entirely.
+	//
+	// None of them is a caller's business to survive, and refusing costs a bounded scan rather than
+	// a walk of the pool: one bit per order for the blocks that could cover this one, and a masked
+	// word scan for the smaller ones it could contain. So the rule lives where it cannot be
+	// forgotten. `a_double_free_is_refused_and_this_is_what_it_prevents` is the demonstration,
+	// through the test-only door below.
 	pub fn free(&mut self, phys: u64, order: usize) -> bool {
+		self.free_inner(phys, order, true)
+	}
+
+	// `free` with the already-free refusal removed, so one test can show the state that refusal
+	// prevents. Crate-private and test-only: there is no legitimate caller, and the whole point of
+	// the rule above is that there is no way to ask for it by accident.
+	#[cfg(test)]
+	pub(crate) fn free_ignoring_double(&mut self, phys: u64, order: usize) -> bool {
+		self.free_inner(phys, order, false)
+	}
+
+	fn free_inner(&mut self, phys: u64, order: usize, refuse_double: bool) -> bool {
 		if order > MAX_ORDER || phys < self.base {
 			return false;
 		}
@@ -222,6 +319,12 @@ impl Buddy {
 		// count is not a power of two has a tail where the higher orders do not fit, and setting a
 		// bit for a block that runs off the end would hand out memory that is not there.
 		if page + (1u64 << order) > self.pages {
+			return false;
+		}
+		// Already free - as a whole, under a larger block that covers it, or in part. See `free`'s
+		// comment: every one of those is silent and every one is this allocator's own invariant
+		// coming apart.
+		if refuse_double && self.block_touches_free(page, order) {
 			return false;
 		}
 		let mut index = page >> order;
@@ -321,6 +424,42 @@ impl Buddy {
 		// A page is free if it is the head of a free block at any order that covers it.
 		(0..=MAX_ORDER).any(|order| self.get(order, page >> order))
 	}
+
+	// Is ANY page of this span already free? The double-free question, asked before the free.
+	//
+	// It lives here rather than at the call site because it is a statement about this allocator's
+	// representation - "already free" means free at ANY order covering the page, which only this
+	// file knows - and because it is the guard the whole milestone rests on. The run table caught a
+	// double free with an overlap test it could not avoid making; a bitmap has no such test built
+	// in, so this is the one that has to be remembered, and a rule that has to be remembered belongs
+	// next to the code that would otherwise forget it.
+	pub fn any_free(&self, phys: u64, pages: u64) -> bool {
+		(0..pages).any(|page| self.is_free_page(phys + page * PAGE_SIZE))
+	}
+
+	// Every free block, as (order, first physical address). Walks the bitmaps rather than
+	// reconstructing anything, so it sees exactly what the allocator will hand out next.
+	//
+	// This is what makes the one invariant a bitmap allocator can violate CHECKABLE: a page must be
+	// covered by at most one free block. Two free blocks over one page is two allocations of that
+	// page, and it is invisible to `free_pages()`, to `is_free_page` and to every existing test,
+	// because each of them answers about one page or one total rather than about the whole set.
+	pub fn for_each_free_block(&self, mut visit: impl FnMut(usize, u64)) {
+		for order in 0..=MAX_ORDER {
+			let blocks = self.blocks_at(order);
+			for word in 0..self.words[order] {
+				let mut value = self.bits[self.offsets[order] + word];
+				while value != 0 {
+					let bit = value.trailing_zeros() as u64;
+					value &= value - 1;
+					let index = (word as u64) * 64 + bit;
+					if index < blocks {
+						visit(order, self.base + index * (1u64 << order) * PAGE_SIZE);
+					}
+				}
+			}
+		}
+	}
 }
 
 // The smallest order whose block holds `pages`.
@@ -336,96 +475,4 @@ pub fn order_for(pages: u64) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-	use super::*;
-
-	// A buddy over a made-up extent, so the arithmetic can be exercised without touching the
-	// machine's own pool. `base` is a plausible physical address and nothing is ever dereferenced.
-	fn fixture(pages: u64) -> Buddy {
-		Buddy::new(0x4000_0000, pages).expect("metadata for the fixture")
-	}
-
-	crate::tagged_test!(a_buddy_merges_back_to_one_block_however_it_is_freed, [Frame, Memory], id = "kernel.mem.frame.buddy.a_buddy_merges_back_to_one_block_however_it_is_freed", covers = ["kernel"]);
-	fn a_buddy_merges_back_to_one_block_however_it_is_freed() {
-		// The property the run table could not give: coalescing that depends on arithmetic rather
-		// than on a table having room. Free every page of a span individually, in an order chosen
-		// to be awkward, and the whole span must come back as ONE block - which is only observable
-		// by then allocating it whole.
-		const PAGES: u64 = 64;
-		let mut buddy = fixture(PAGES);
-		buddy.free_span(0x4000_0000, PAGES);
-		assert_eq!(buddy.free_pages(), PAGES);
-
-		// Take it all as one block, to prove the seed coalesced.
-		let whole = buddy.alloc_contiguous(PAGES).expect("a freshly seeded extent is one block");
-		assert_eq!(whole, 0x4000_0000);
-		assert_eq!(buddy.free_pages(), 0);
-
-		// Now hand it back one page at a time, odd pages first - the order that defeats a
-		// neighbour-merging run table until the very last insert.
-		for page in (1..PAGES).step_by(2) {
-			assert!(buddy.free(0x4000_0000 + page * PAGE_SIZE, 0), "page {page} is a legitimate free");
-		}
-		for page in (0..PAGES).step_by(2) {
-			assert!(buddy.free(0x4000_0000 + page * PAGE_SIZE, 0), "page {page} is a legitimate free");
-		}
-		assert_eq!(buddy.free_pages(), PAGES, "every page came back");
-
-		// And the merge really happened: the span allocates whole again. A pool that had kept 64
-		// separate one-page blocks would refuse this.
-		let again = buddy.alloc_contiguous(PAGES).expect("the pages merged back into one block");
-		assert_eq!(again, 0x4000_0000);
-	}
-
-	crate::tagged_test!(a_buddy_hands_back_the_rounding_of_a_contiguous_request, [Frame, Memory], id = "kernel.mem.frame.buddy.a_buddy_hands_back_the_rounding_of_a_contiguous_request", covers = ["kernel"]);
-	fn a_buddy_hands_back_the_rounding_of_a_contiguous_request() {
-		// A buddy allocates in powers of two, so a 3-page request takes a 4-page block. Keeping
-		// the fourth would be a quarter of that allocation lost for as long as it lives, and on a
-		// pool that churns DMA buffers it compounds into memory nobody can account for.
-		const PAGES: u64 = 64;
-		let mut buddy = fixture(PAGES);
-		buddy.free_span(0x4000_0000, PAGES);
-
-		let base = buddy.alloc_contiguous(3).expect("three pages");
-		assert_eq!(buddy.free_pages(), PAGES - 3, "the request costs THREE pages, not the four its block holds");
-
-		// The spare page is genuinely available: ask for it.
-		let spare = buddy.alloc_contiguous(1).expect("the rounded-off page is back in the pool");
-		assert_eq!(spare, base + 3 * PAGE_SIZE, "and it is the page immediately after the request");
-	}
-
-	crate::tagged_test!(a_pool_that_is_not_a_power_of_two_never_hands_out_the_gap, [Frame, Memory], id = "kernel.mem.frame.buddy.a_pool_that_is_not_a_power_of_two_never_hands_out_the_gap", covers = ["kernel"]);
-	fn a_pool_that_is_not_a_power_of_two_never_hands_out_the_gap() {
-		// Real memory maps are not powers of two, and the tail is where a buddy goes wrong: a block
-		// whose buddy would lie past the end of the extent has no buddy, and merging into one would
-		// hand out memory the machine does not have.
-		const PAGES: u64 = 100;
-		let mut buddy = fixture(PAGES);
-		buddy.free_span(0x4000_0000, PAGES);
-		assert_eq!(buddy.free_pages(), PAGES, "a hundred pages is a hundred pages");
-
-		// Drain it completely, one page at a time, and count. If the tail merged into a block that
-		// runs off the end, this hands out more than there is.
-		let mut taken = 0u64;
-		while buddy.alloc(0).is_some() {
-			taken += 1;
-			assert!(taken <= PAGES, "the allocator handed out more pages than the extent holds");
-		}
-		assert_eq!(taken, PAGES, "and it handed out every page it was given");
-		assert_eq!(buddy.free_pages(), 0);
-	}
-
-	crate::tagged_test!(a_buddy_refuses_a_free_it_cannot_frame, [Frame, Memory], id = "kernel.mem.frame.buddy.a_buddy_refuses_a_free_it_cannot_frame", covers = ["kernel"]);
-	fn a_buddy_refuses_a_free_it_cannot_frame() {
-		// `free` cannot fail for want of ROOM - that is the whole point - but it can refuse an
-		// argument that is not a block: an address below the extent, past it, or misaligned for the
-		// order claimed. Those are broken callers rather than a full table, and silently accepting
-		// one corrupts the tree.
-		const PAGES: u64 = 64;
-		let mut buddy = fixture(PAGES);
-		assert!(!buddy.free(0x3fff_f000, 0), "below the extent");
-		assert!(!buddy.free(0x4000_0000 + PAGES * PAGE_SIZE, 0), "past the extent");
-		assert!(!buddy.free(0x4000_0000 + PAGE_SIZE, 1), "a two-page block must be two-page aligned");
-		assert_eq!(buddy.free_pages(), 0, "and none of them added anything to the pool");
-	}
-}
+mod tests;

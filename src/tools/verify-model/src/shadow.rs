@@ -597,6 +597,22 @@ impl Log {
 		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).count()
 	}
 
+	// How many DISTINCT selection inputs the clean records cover.
+	//
+	// `clean_runs_for` counts runs, and five runs are not five pieces of evidence when they are the
+	// same run five times. The selector is deterministic - there is a property test asserting
+	// exactly that - so re-running one comparison against one tree produces the same selection and
+	// the same sweep result every time. Counting those five would grant a certificate on the
+	// strength of one comparison, which is the precise shape of the false confidence this milestone
+	// exists to prevent, arriving inside its own trust criteria.
+	//
+	// The unit is the SELECTION INPUT - the tree's content digest and the change set - because that
+	// is what determines the answer being validated. Two changes compared against one tree are two
+	// pieces of evidence; one change compared twice is one.
+	pub fn distinct_evidence_for(&self, component: &str, model_hash: &str, universe: Universe) -> usize {
+		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).map(|record| (record.source_digest.clone(), record.changed_components.join(","))).collect::<BTreeSet<(String, String)>>().len()
+	}
+
 	// Targets this component has CLEAN evidence on. Filtering on the verdict is the whole point and
 	// was missing: five clean x86_64 comparisons plus one riscv64 CandidateMiss counted as "evidence
 	// from two targets" and could earn a certificate on the strength of a run that found a fault.

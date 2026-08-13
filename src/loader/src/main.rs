@@ -92,8 +92,15 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// `console`: the UART addresses are QEMU's, and nothing about them is promised on a machine
 	// that is not `virt`.
 	console::adopt(system_table);
+	// And ask the machine where its console is, while the configuration table is still readable.
+	// What comes out of this is what the loader prints to AFTER `ExitBootServices` - or nothing,
+	// on a machine that names no console this loader can drive.
+	console::discover(system_table);
 	arch::serial::init();
 	arch::serial::write_str("\nLiberSystem UEFI loader\n");
+	// AFTER the banner, because it is a line about this loader rather than a line from the
+	// firmware, and a diagnostic printed before the program names itself reads as stray output.
+	console::report();
 
 	let bs = unsafe { (*system_table).boot_services };
 	// The heap has to exist before the filesystem crates are used, and cannot outlive boot

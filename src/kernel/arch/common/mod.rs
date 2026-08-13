@@ -15,9 +15,11 @@
 // shared by every interrupt-controller backend.
 // `context`: the portable thread bootstrap each backend's context-switch trampoline
 // lands in.
-// `dtb`: the flattened-device-tree (FDT) parser shared by the device-tree-booted
-// backends (aarch64 now, riscv64 next); only phys_to_virt + the fallback scan window
-// are arch-specific.
+// The flattened-device-tree parser used to live here and is now the `fdt` CRATE: the
+// loader needs the same reader (it takes the post-ExitBootServices console out of the
+// tree rather than guessing an address), and nothing inside the kernel can be run on a
+// host. Each backend's `dtb` shim still supplies phys_to_virt and the fallback scan
+// window, which are the only arch-specific parts.
 // `time`: the shared scheduler-tick rate (TICK_HZ) + the cycles->ns conversion each
 // backend's cycle clock reports through.
 // `rng`: the SplitMix64 mixer the arch random fallbacks share (no arch guarantees a
@@ -25,7 +27,6 @@
 
 pub mod bootmem;
 pub mod context;
-pub mod dtb;
 pub mod fwcfg;
 pub mod msi;
 pub mod paging;

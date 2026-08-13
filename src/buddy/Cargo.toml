@@ -1,0 +1,14 @@
+[package]
+name = "buddy"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "The physical-frame buddy allocator, in a crate a host can drive millions of operations through"
+
+[lib]
+path = "src/lib.rs"
+
+# The differential tests run tens of millions of bitmap operations. Unoptimized they are the
+# whole cost of the host suite; at opt-level 2 the longest of them is well under a second.
+[profile.test]
+opt-level = 2

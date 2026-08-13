@@ -636,18 +636,61 @@ fn trust_lapses_when_the_model_hash_moves() {
 	assert!(store.certificates.is_empty());
 }
 
+// One shadow record, with everything the trust criteria read set to "clean" and the SELECTION INPUT
+// varied by `tree`.
+//
+// Every one of these tests used to leave `source_digest` empty, which made their five records five
+// copies of one comparison - and `evaluate` counted them as five. That is exactly the defect the
+// criteria now refuse, so the fixtures have to be honest about it: five pieces of evidence means
+// five different trees.
+fn evidence(universe: crate::shadow::Universe, architecture: &str, exec: bool, tree: &str) -> crate::shadow::Record {
+	crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: tree.to_string(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true }
+}
+
+#[test]
+fn five_comparisons_of_one_change_are_one_piece_of_evidence() {
+	// FOUND WHILE TRYING TO EARN THE FIRST REAL CERTIFICATE THIS TOOL HAS EVER GRANTED, 2026-08-14.
+	// Nothing was TRUSTED, the criterion was five clean comparisons on two targets, and the cheapest
+	// way to satisfy it was to run one shadow comparison five times - which would have worked.
+	//
+	// It should not. The selector is deterministic and `selection_is_deterministic` says so, so the
+	// same change against the same tree produces the same selection and the same sweep verdict every
+	// time. Five of those is one comparison wearing the number five, and a certificate earned that
+	// way says a scoped run can be believed on the strength of a single answer.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for architecture in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"] {
+		log.records.push(evidence(crate::shadow::Universe::TestGuest, architecture, true, "one-tree"));
+	}
+	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	assert_eq!(log.clean_runs_for("audio", "hash-a", crate::shadow::Universe::TestGuest), 6, "six records, all of them clean");
+	assert_eq!(log.distinct_evidence_for("audio", "hash-a", crate::shadow::Universe::TestGuest), 1, "and all of them the same comparison");
+	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("six repetitions of one answer are one answer");
+	assert!(error.contains("distinct"), "{error}");
+
+	// Two changes compared against ONE tree are two pieces of evidence, because the selection input
+	// is the pair rather than the tree: the selector is being asked a different question.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for (index, architecture) in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"].into_iter().enumerate() {
+		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, true, "one-tree");
+		record.changed_components = vec![String::from("audio"), format!("neighbour-{}", index / 2)];
+		log.records.push(record);
+	}
+	assert_eq!(log.distinct_evidence_for("audio", "hash-a", crate::shadow::Universe::TestGuest), 5);
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok(), "five different changes are five pieces of evidence, whatever tree they were made against");
+}
+
 #[test]
 fn trust_needs_evidence_from_more_than_one_target() {
 	// A month that only saw x86_64 changes says nothing about the emulated targets, and the
 	// architecture policy makes exactly that the steady state.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
-	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
-		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: String::from("x86_64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: true });
+	for tree in 0..crate::trust::REQUIRED_CLEAN_RUNS {
+		log.records.push(evidence(crate::shadow::Universe::TestGuest, "x86_64", false, &format!("tree-{tree}")));
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("one target is not enough");
 	assert!(error.contains("target(s)"), "{error}");
-	log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: String::from("riscv64"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: true, model_self_check: true });
+	log.records.push(evidence(crate::shadow::Universe::TestGuest, "riscv64", true, "tree-5"));
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
 }
 
@@ -662,14 +705,14 @@ fn every_comparison_on_record_being_dry_is_not_evidence_that_running_the_selecti
 	// One sample per universe, not one per run: a sample costs a second full sweep, and what it
 	// establishes is a property of the execution mechanism rather than of the change.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
-	let record = |architecture: &str, exec: bool| crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true };
-	for architecture in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"] {
-		log.records.push(record(architecture, false));
+	let record = |architecture: &str, exec: bool, tree: &str| evidence(crate::shadow::Universe::TestGuest, architecture, exec, tree);
+	for (tree, architecture) in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"].into_iter().enumerate() {
+		log.records.push(record(architecture, false, &format!("tree-{tree}")));
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("six dry comparisons are six answers to the other question");
 	assert!(error.contains("EXECUTED"), "{error}");
-	log.records.push(record("x86_64", true));
+	log.records.push(record("x86_64", true, "tree-6"));
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok(), "one sample is the requirement");
 
 	// THE HOST UNIVERSE ASKS FOR ONE TOO, since 2026-08-13. It was exempt while nothing could run a
@@ -681,21 +724,21 @@ fn every_comparison_on_record_being_dry_is_not_evidence_that_running_the_selecti
 	// over and exempt for the same reason, emitted a command bash could not parse. A selection
 	// computed correctly and impossible to execute is invisible to every dry comparison.
 	let mut host = crate::shadow::Log { schema: 1, records: Vec::new() };
-	let host_record = |exec: bool| crate::shadow::Record { universe: crate::shadow::Universe::Host, architecture: String::from("host"), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true };
-	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
-		host.records.push(host_record(false));
+	let host_record = |exec: bool, tree: &str| evidence(crate::shadow::Universe::Host, "host", exec, tree);
+	for tree in 0..crate::trust::REQUIRED_CLEAN_RUNS {
+		host.records.push(host_record(false, &format!("tree-{tree}")));
 	}
 	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &host).expect_err("dry host comparisons answer the other question too");
 	assert!(error.contains("EXECUTED"), "{error}");
-	host.records.push(host_record(true));
+	host.records.push(host_record(true, "tree-5"));
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &host).is_ok(), "one sample is the requirement here as well");
 
 	// `HostBuild` stays exempt, and for a reason rather than by omission: executing a build
 	// selection means building those parts, and the sweep builds every part anyway - so the sample
 	// would be a second full build of evidence the sweep has already taken.
 	let mut builds = crate::shadow::Log { schema: 1, records: Vec::new() };
-	for architecture in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"] {
-		builds.records.push(crate::shadow::Record { universe: crate::shadow::Universe::HostBuild, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: true });
+	for (tree, architecture) in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"].into_iter().enumerate() {
+		builds.records.push(evidence(crate::shadow::Universe::HostBuild, architecture, false, &format!("tree-{tree}")));
 	}
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::HostBuild, &builds).is_ok(), "a build universe grants on dry comparisons, by decision");
 }
@@ -703,8 +746,10 @@ fn every_comparison_on_record_being_dry_is_not_evidence_that_running_the_selecti
 #[test]
 fn evidence_under_another_model_does_not_count() {
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
-	for architecture in ["x86_64", "riscv64", "aarch64", "x86_64", "riscv64", "aarch64"] {
-		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("an-older-model"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: true });
+	for (tree, architecture) in ["x86_64", "riscv64", "aarch64", "x86_64", "riscv64", "aarch64"].into_iter().enumerate() {
+		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, false, &format!("tree-{tree}"));
+		record.model_hash = String::from("an-older-model");
+		log.records.push(record);
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	assert!(store.evaluate("audio", "the-current-model", crate::shadow::Universe::TestGuest, &log).is_err(), "six clean runs under a model that is not the one running prove nothing about the one that is");
@@ -767,16 +812,20 @@ fn only_a_consistent_verdict_counts_as_clean_evidence() {
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
 	// `shadow_exec` on every record: this test is about the VERDICT filter, and leaving the
 	// execution-sample requirement unmet would make it pass for the wrong reason.
-	let record = |architecture: &str, verdict: &str| crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: verdict.to_string(), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: true, model_self_check: true };
-	for _ in 0..crate::trust::REQUIRED_CLEAN_RUNS {
-		log.records.push(record("x86_64", "Consistent"));
+	let record = |architecture: &str, verdict: &str, tree: &str| {
+		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, true, tree);
+		record.verdict = verdict.to_string();
+		record
+	};
+	for tree in 0..crate::trust::REQUIRED_CLEAN_RUNS {
+		log.records.push(record("x86_64", "Consistent", &format!("tree-{tree}")));
 	}
-	log.records.push(record("riscv64", "CandidateMiss"));
+	log.records.push(record("riscv64", "CandidateMiss", "tree-5"));
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("a run that found a candidate miss is not evidence that the selector is right");
 	assert!(error.contains("target(s)"), "{error}");
 	// The same target, cleanly this time, is what actually earns it.
-	log.records.push(record("riscv64", "Consistent"));
+	log.records.push(record("riscv64", "Consistent", "tree-6"));
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
 }
 
@@ -1063,9 +1112,13 @@ fn a_comparison_made_by_a_model_that_failed_its_own_checks_is_not_evidence() {
 	// Change classes, edge kinds, the regression corpus and SHADOW-EXEC stay uncounted, and for the
 	// stated reason: they need a log with entries in it and would be guesswork before that.
 	let mut log = crate::shadow::Log::default();
-	let record = |self_check: bool, architecture: &str| crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: false, model_self_check: self_check };
-	for architecture in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"] {
-		log.records.push(record(false, architecture));
+	let record = |self_check: bool, architecture: &str, tree: &str| {
+		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, false, tree);
+		record.model_self_check = self_check;
+		record
+	};
+	for (tree, architecture) in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"].into_iter().enumerate() {
+		log.records.push(record(false, architecture, &format!("tree-{tree}")));
 	}
 	let store = crate::trust::Store::default();
 	assert_eq!(log.clean_runs_for("audio", "hash-a", crate::shadow::Universe::TestGuest), 0, "six comparisons, none of them by a model entitled to make one");
@@ -1074,8 +1127,8 @@ fn a_comparison_made_by_a_model_that_failed_its_own_checks_is_not_evidence() {
 	// The same six, made by a model that passed - and one of them carrying an execution sample,
 	// which `evaluate` also requires in this universe.
 	log.records.clear();
-	for architecture in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"] {
-		log.records.push(record(true, architecture));
+	for (tree, architecture) in ["x86_64", "x86_64", "x86_64", "riscv64", "riscv64", "riscv64"].into_iter().enumerate() {
+		log.records.push(record(true, architecture, &format!("tree-{tree}")));
 	}
 	log.records[0].shadow_exec = true;
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
@@ -1190,9 +1243,9 @@ fn evidence_in_one_universe_does_not_vouch_for_another() {
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
 	// The execution sample is present, because this test is about the UNIVERSE dimension and an
 	// unmet requirement elsewhere would make it pass without exercising it.
-	let record = |architecture: &str, universe: crate::shadow::Universe| crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: String::new(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: true, model_self_check: true };
-	for architecture in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"] {
-		log.records.push(record(architecture, crate::shadow::Universe::TestGuest));
+	let record = |architecture: &str, universe: crate::shadow::Universe, tree: &str| evidence(universe, architecture, true, tree);
+	for (tree, architecture) in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"].into_iter().enumerate() {
+		log.records.push(record(architecture, crate::shadow::Universe::TestGuest, &format!("tree-{tree}")));
 	}
 	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	let (clean, architectures) = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect("the guest suite has been validated");
@@ -1295,25 +1348,15 @@ fn a_build_covered_component_can_reach_trusted() {
 	// produces can carry a component all the way. `HostBuild` needs two architectures, for the same
 	// reason the guest suite does - a build of x86_64 says nothing about aarch64.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
-	let record = |architecture: &str| crate::shadow::Record {
-		universe: crate::shadow::Universe::HostBuild,
-		architecture: architecture.to_string(),
-		verdict: String::from("Consistent"),
-		reason: String::new(),
-		model_hash: String::from("hash-a"),
-		source_digest: String::new(),
-		changed_components: vec![String::from("term")],
-		outside_failures: Vec::new(),
-		at: 0,
-		change_kinds: Vec::new(),
-		edge_kinds: Vec::new(),
-		// Builds have no execution sample to take - `exec_universes` says which universes do - so
-		// this is false and must not be what stands in the way.
-		shadow_exec: false,
-		model_self_check: true,
+	// Builds have no execution sample to take - `exec_universes` says which universes do - so
+	// `shadow_exec` is false throughout and must not be what stands in the way.
+	let record = |architecture: &str, tree: &str| {
+		let mut record = evidence(crate::shadow::Universe::HostBuild, architecture, false, tree);
+		record.changed_components = vec![String::from("term")];
+		record
 	};
-	for architecture in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"] {
-		log.records.push(record(architecture));
+	for (tree, architecture) in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"].into_iter().enumerate() {
+		log.records.push(record(architecture, &format!("tree-{tree}")));
 	}
 	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	let (clean, architectures) = store.evaluate("term", "hash-a", crate::shadow::Universe::HostBuild, &log).expect("six clean build comparisons over two architectures");

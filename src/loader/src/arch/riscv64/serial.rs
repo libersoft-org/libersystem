@@ -1,37 +1,27 @@
-// NS16550A UART output for loader diagnostics on riscv64. QEMU's `virt` machine puts
-// the 16550 UART at 0x1000_0000; U-Boot (which boots the loader as an EFI application)
-// identity-maps device memory, so the loader reaches the transmit-holding and
-// line-status registers directly at their physical addresses. Output only - the
-// loader never reads a character.
+// Loader diagnostics on riscv64.
+//
+// THE FIRMWARE'S CONSOLE FIRST, and after `ExitBootServices` the console the MACHINE named.
+//
+// This file used to carry a fixed physical address - a 16550 at 0x1000_0000, QEMU's `virt` - and store to it
+// directly. UEFI promises an identity map for RAM and nothing at all about a device region at an
+// address the loader made up, so on a machine that is not `virt` every post-`ExitBootServices` line
+// went into whatever lives there. P02M0129 carried that as an open finding for three rounds because
+// closing it needed a device-tree reader the loader did not have.
+//
+// It has one now (`fdt`), and an SPCR reader for machines with no device tree (`uefi::acpi`), and
+// `crate::console` drives whichever they named. A machine that names neither gets SILENCE here,
+// which is the answer this file could not give before.
 
-const UART_BASE: u64 = 0x1000_0000;
-const THR: u64 = 0x00; // transmit holding register (write)
-const LSR: u64 = 0x05; // line status register
-const LSR_THRE: u8 = 1 << 5; // transmit holding register empty
-
-#[inline]
-fn reg(off: u64) -> *mut u8 {
-	(UART_BASE + off) as *mut u8
-}
-
-// U-Boot left the UART initialised (it printed its own banner over it), so no
-// baud / line-control programming is needed to transmit.
+// The firmware console while it exists; nothing to initialise afterwards, because the driver and
+// its address both come from the machine.
 pub fn init() {}
 
-// Transmit one byte, waiting while the transmit holding register is not yet empty.
-//
-// THE FIRMWARE'S CONSOLE FIRST. The address below is QEMU's, and UEFI promises nothing about a
-// device region at an address this loader made up - see `crate::console`.
+// Transmit one byte: the firmware console, then the discovered one, then nothing.
 pub fn write_byte(byte: u8) {
 	if crate::console::write_byte(byte) {
 		return;
 	}
-	unsafe {
-		while core::ptr::read_volatile(reg(LSR)) & LSR_THRE == 0 {
-			core::hint::spin_loop();
-		}
-		core::ptr::write_volatile(reg(THR), byte);
-	}
+	let _ = crate::console::write_byte_post_ebs(byte);
 }
 
 // Write a string, expanding newlines to CRLF so serial terminals advance cleanly.

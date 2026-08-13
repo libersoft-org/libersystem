@@ -1,0 +1,9 @@
+[package]
+name = "fdt"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "A flattened device tree reader, shared by the kernel's device-tree backends and the loader"
+
+[lib]
+path = "src/lib.rs"

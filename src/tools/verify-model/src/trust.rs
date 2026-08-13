@@ -76,8 +76,10 @@ pub fn required_architectures(universe: crate::shadow::Universe) -> usize {
 		// One target by construction: the host is the host.
 		crate::shadow::Universe::Host => 1,
 		// Builds run for all three targets, so evidence about one says nothing about the others -
-		// the same argument as the guest suite. There is no producer for this universe yet, so the
-		// number is what it will need rather than what it currently gets.
+		// the same argument as the guest suite. (This said "there is no producer for this universe
+		// yet" until 2026-08-14, which stopped being true when `build-checks` became the third
+		// producer in the seventh round. A comment describing a previous state as a current one is
+		// the defect this milestone has now recorded four times.)
 		crate::shadow::Universe::HostBuild => 2,
 		// Built for x86_64 only, so asking for two is asking for a target that does not exist.
 		crate::shadow::Universe::DevGuest => 1,
@@ -162,6 +164,21 @@ impl Store {
 		let architectures: Vec<String> = log.clean_architectures_seen(component, model_hash, universe).into_iter().collect();
 		if clean < REQUIRED_CLEAN_RUNS {
 			return Err(format!("{clean} clean shadow comparison(s) under this model, {REQUIRED_CLEAN_RUNS} needed"));
+		}
+		// AND THEY HAVE TO BE FIVE DIFFERENT COMPARISONS, not one comparison five times.
+		//
+		// The selector is deterministic and there is a property test that says so, so running the
+		// same change against the same tree five times produces the same selection and the same
+		// sweep result five times over. Counting those as five would let a certificate be earned by
+		// repetition - a green worth exactly one comparison, wearing the number five - which is the
+		// failure this whole milestone is about, appearing inside its own trust criteria.
+		//
+		// Found 2026-08-14, working out how the first real certificate this tool would ever grant
+		// could be earned: the cheapest way to get one was to run a single shadow comparison five
+		// times over, and it would have worked.
+		let distinct = log.distinct_evidence_for(component, model_hash, universe);
+		if distinct < REQUIRED_CLEAN_RUNS {
+			return Err(format!("{clean} clean comparison(s) but only {distinct} distinct one(s) - {REQUIRED_CLEAN_RUNS} different (tree, change) pairs are needed, because the selector is deterministic and the same comparison repeated is one piece of evidence"));
 		}
 		let needed = required_architectures(universe);
 		if architectures.len() < needed {

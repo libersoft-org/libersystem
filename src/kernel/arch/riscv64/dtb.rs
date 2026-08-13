@@ -1,13 +1,14 @@
 // riscv64 device-tree location.
 //
-// The FDT PARSING is the shared `arch::common::dtb::Fdt` (the format is a standard,
-// the same on every device-tree-booted arch). This shim only supplies the two
+// The FDT PARSING is the shared `fdt::Fdt` crate (the format is a standard, the same
+// on every device-tree-booted arch, and the loader reads the same trees this does).
+// This shim only supplies the two
 // riscv64 specifics: where to find the blob (OpenSBI passes the DTB pointer in a1, so
 // the hint is normally valid; a low-DRAM scan is the fallback) and how to read
 // physical memory (the higher-half direct map, `paging::phys_to_virt`).
 
-pub use crate::arch::common::dtb::BootInfo;
-use crate::arch::common::dtb::Fdt;
+pub use fdt::BootInfo;
+use fdt::Fdt;
 
 // The low DRAM window scanned for the FDT header when no pointer is supplied.
 const SCAN_START: u64 = 0x8000_0000;
