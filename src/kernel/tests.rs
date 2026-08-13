@@ -295,6 +295,9 @@ struct PermissionScenarioResult {
 	probe_summary: alloc::vec::Vec<u8>,
 	date_read: alloc::vec::Vec<u8>,
 	date_summary: alloc::vec::Vec<u8>,
+	// What the P02M0101 command tools printed through the governed launch path: `pwd` from its
+	// launch context alone, then `wc` and `head` over a volume file through the bounded read.
+	command_read: alloc::vec::Vec<u8>,
 	request_read: alloc::vec::Vec<u8>,
 	request_summary: alloc::vec::Vec<u8>,
 	cat_read: alloc::vec::Vec<u8>,
@@ -584,6 +587,89 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 		}
 	}
 
+	// The P02M0101 command tools, through the same governed path as everything else.
+	//
+	// `pwd` holds NO capability: its answer comes from the launch context, so this is the one
+	// launch here that proves a tool can be useful with nothing granted at all. `wc` and `head`
+	// hold the volume bundle and read `hello.txt` through the bounded `volume.read` - the window
+	// path, not `open`, which is the difference between a tool that streams and one that maps.
+	// EACH ONE IS STAGED WHERE THE LAUNCHER WILL LOOK. Asserted before any of them is launched,
+	// because a tool that is not in the volume is refused by PermissionManager with the same reply
+	// as one that is refused by policy - and because the coverage model reads these lookups to know
+	// what this test reaches.
+	for staged in [
+		program_elf(&package, volume, b"pwd"),
+		program_elf(&package, volume, b"wc"),
+		program_elf(&package, volume, b"head"),
+		program_elf(&package, volume, b"tail"),
+		program_elf(&package, volume, b"hexdump"),
+		program_elf(&package, volume, b"which"),
+		program_elf(&package, volume, b"grep"),
+		program_elf(&package, volume, b"sort"),
+		program_elf(&package, volume, b"cut"),
+	] {
+		if staged.is_none() {
+			return Err("a P02M0101 command tool is not staged in the volume");
+		}
+	}
+	let mut command_read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for (index, (name, args)) in [
+		(&b"pwd"[..], &b""[..]),
+		(&b"wc"[..], &b"hello.txt"[..]),
+		(&b"head"[..], &b"-n 1 hello.txt"[..]),
+		(&b"tail"[..], &b"-n 1 hello.txt"[..]),
+		(&b"hexdump"[..], &b"-n 4 hello.txt"[..]),
+		(&b"which"[..], &b"cat"[..]),
+		(&b"find"[..], &b"vol://system --name hello.txt"[..]),
+		(&b"grep"[..], &b"-c e hello.txt"[..]),
+		(&b"sort"[..], &b"hello.txt"[..]),
+		(&b"cut"[..], &b"-c 1-3 hello.txt"[..]),
+		// NO DIRECTORY-WALKING TOOL IS IN THIS LIST, and the reason is the harness rather than the
+		// tools: a listing is a sub-channel the storage service pumps between passes, and
+		// `run_until_idle` returns while that is still in flight - so a governed `ls` prints
+		// nothing here either, which is how this was told apart from a defect in the walker.
+		// `tree` and `find` are covered by the walker's own bounds instead.
+	]
+	.iter()
+	.enumerate()
+	{
+		let (output, stdout) = Channel::create();
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&3u16.to_le_bytes());
+		request.extend_from_slice(&(0x101 + index as u32).to_le_bytes());
+		for value in [*name, *args, &b"vol://system"[..]] {
+			request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+			request.extend_from_slice(value);
+		}
+		// ONE VARIABLE: `PATH`, which is what `which` resolves through. It is the whole environment
+		// because this is the only field any of these tools reads, and an empty one is what every
+		// other launch in this scenario sends.
+		request.extend_from_slice(&1u16.to_le_bytes());
+		for value in [&b"PATH"[..], &b"vol://system/bin"[..]] {
+			request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+			request.extend_from_slice(value);
+		}
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&perm_client, &request, stdout, Rights::ALL)?;
+		sched::run_until_idle();
+		let reply = perm_client.recv().map_err(|_| "PermissionManager did not answer a command tool run")?;
+		if reply.bytes.len() < 5 || reply.bytes[4] == 0 {
+			return Err("PermissionManager refused a P02M0101 command tool");
+		}
+		// A tool writes its answer in as many messages as it likes, AND a tool that walks a
+		// directory does not produce its first message on the first pass: a listing is a
+		// sub-channel the storage service pumps between passes, and `run_until_idle` returns while
+		// that is still in flight. So this pumps a fixed number of times and takes what arrives
+		// rather than stopping at the first empty receive - which is what made `find` and `tree`
+		// look like tools that printed nothing.
+		for _ in 0..256 {
+			sched::run_until_idle();
+			while let Ok(message) = output.recv() {
+				command_read.extend_from_slice(&message.bytes);
+			}
+		}
+	}
+
 	// PermissionManager reports its "online" line, then each governed component's proof and
 	// decisions summary: the bytes sandbox_probe read through its one granted storage
 	// capability and its summary, the instant `date` printed through its one granted time
@@ -602,7 +688,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let ip_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip output")?;
 	let ip_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip decisions summary")?;
 	if scenario != PermissionScenario::ScopedGrants {
-		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
+		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
 	}
 
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
@@ -838,7 +924,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	if !mp3_process.is_terminated() {
 		return Err("MP3 play did not exit");
 	}
-	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
+	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
 }
 
 // Build the component topology and run it to completion. A StorageService serves
@@ -3478,6 +3564,147 @@ impl StorageHarness {
 					continue;
 				}
 				return reply.caps.first().and_then(|cap| cap.object().into_any_arc().downcast::<Channel>().ok());
+			}
+		}
+		None
+	}
+
+	// The four path verbs, hand-encoded like every other request in this harness: an op, a
+	// correlation id, a length-prefixed path and whatever the op adds after it. Each returns
+	// whether the service answered `ok`, which is the whole of what these calls promise.
+	fn stat(&mut self, path: &[u8], corr: u32) -> Option<(u64, bool)> {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&17u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		let reply = self.request(request, corr)?;
+		if reply.bytes.get(4) != Some(&1) {
+			return None;
+		}
+		// [corr 4][ok 1][name lp][size u64][type u8]...
+		let name_len = le_u16(&reply.bytes, 5) as usize;
+		let at = 7 + name_len;
+		Some((le_u64(&reply.bytes, at), reply.bytes.get(at + 8) == Some(&1)))
+	}
+
+	fn rename(&mut self, from: &[u8], to: &[u8], corr: u32) -> bool {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&18u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(from.len() as u16).to_le_bytes());
+		request.extend_from_slice(from);
+		request.extend_from_slice(&(to.len() as u16).to_le_bytes());
+		request.extend_from_slice(to);
+		self.request(request, corr).is_some_and(|reply| reply.bytes.get(4) == Some(&1))
+	}
+
+	fn truncate(&mut self, path: &[u8], length: u64, corr: u32) -> bool {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&19u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&length.to_le_bytes());
+		self.request(request, corr).is_some_and(|reply| reply.bytes.get(4) == Some(&1))
+	}
+
+	fn touch(&mut self, path: &[u8], create: bool, corr: u32) -> bool {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&20u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.push(u8::from(create));
+		// Zero: this harness has no wall clock to offer, so the service stamps its own.
+		request.extend_from_slice(&0u64.to_le_bytes());
+		self.request(request, corr).is_some_and(|reply| reply.bytes.get(4) == Some(&1))
+	}
+
+	// One window of a file. `None` is a refusal; an empty vector is the end of the file, and the
+	// difference between the two is the point of the call.
+	fn read_window(&mut self, path: &[u8], offset: u64, length: u32, corr: u32) -> Option<alloc::vec::Vec<u8>> {
+		use object::memory_object::MemoryObject;
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&21u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.extend_from_slice(&offset.to_le_bytes());
+		request.extend_from_slice(&length.to_le_bytes());
+		let reply = self.request(request, corr)?;
+		if reply.bytes.get(4) != Some(&1) {
+			return None;
+		}
+		// A `buffer` is a handle and a length; unlike `handle<T>` in a record it writes no
+		// placeholder, so the length starts right after the tag.
+		let len = le_u64(&reply.bytes, 5) as usize;
+		let object = reply.caps.first()?.object().into_any_arc().downcast::<MemoryObject>().ok()?;
+		Some(read_from_object(&object, len))
+	}
+
+	// Subscribe to a path's changes; the channel is the consumer end of the event stream.
+	fn watch(&mut self, path: &[u8], corr: u32) -> Option<alloc::sync::Arc<object::channel::Channel>> {
+		use object::channel::Channel;
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&22u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		let reply = self.request(request, corr)?;
+		if reply.bytes.get(4) != Some(&1) {
+			return None;
+		}
+		reply.caps.first().and_then(|cap| cap.object().into_any_arc().downcast::<Channel>().ok())
+	}
+
+	// Open a transactional writer; the channel speaks the `writer` interface.
+	fn open_writer(&mut self, path: &[u8], append: bool, corr: u32) -> Option<alloc::sync::Arc<object::channel::Channel>> {
+		use object::channel::Channel;
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&23u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.push(u8::from(append));
+		let reply = self.request(request, corr)?;
+		if reply.bytes.get(4) != Some(&1) {
+			return None;
+		}
+		reply.caps.first().and_then(|cap| cap.object().into_any_arc().downcast::<Channel>().ok())
+	}
+
+	// Drive one op on an open writer session and report whether it succeeded.
+	fn writer_op(&mut self, session: &alloc::sync::Arc<object::channel::Channel>, request: alloc::vec::Vec<u8>, corr: u32) -> Option<alloc::vec::Vec<u8>> {
+		use object::channel::Message;
+		session.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("writer request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = session.recv() {
+				if le_u32(&reply.bytes, 0) != corr {
+					continue;
+				}
+				return if reply.bytes.get(4) == Some(&1) { Some(reply.bytes) } else { None };
+			}
+		}
+		None
+	}
+
+	// Send a request on the root client and collect the reply that carries `corr`.
+	//
+	// Replies for OTHER correlations are skipped rather than treated as this call's answer: more
+	// than one operation can be outstanding at a time, and a watcher's event or a stream's reply
+	// landing first is not this call's failure.
+	fn request(&mut self, request: alloc::vec::Vec<u8>, corr: u32) -> Option<object::channel::Message> {
+		use object::channel::Message;
+		self.client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.client.recv() {
+				if le_u32(&reply.bytes, 0) != corr {
+					continue;
+				}
+				return Some(reply);
 			}
 		}
 		None

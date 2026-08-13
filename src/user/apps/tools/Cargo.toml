@@ -40,6 +40,74 @@ name = "write"
 path = "src/write.rs"
 
 [[bin]]
+name = "tree"
+path = "src/tree.rs"
+
+[[bin]]
+name = "find"
+path = "src/find.rs"
+
+[[bin]]
+name = "grep"
+path = "src/grep.rs"
+
+[[bin]]
+name = "cp"
+path = "src/cp.rs"
+
+[[bin]]
+name = "mv"
+path = "src/mv.rs"
+
+[[bin]]
+name = "sort"
+path = "src/sort.rs"
+
+[[bin]]
+name = "cut"
+path = "src/cut.rs"
+
+[[bin]]
+name = "kill"
+path = "src/kill.rs"
+
+[[bin]]
+name = "pwd"
+path = "src/pwd.rs"
+
+[[bin]]
+name = "clear"
+path = "src/clear.rs"
+
+[[bin]]
+name = "which"
+path = "src/which.rs"
+
+[[bin]]
+name = "wc"
+path = "src/wc.rs"
+
+[[bin]]
+name = "head"
+path = "src/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
+
+[[bin]]
+name = "hexdump"
+path = "src/hexdump.rs"
+
+[[bin]]
+name = "truncate"
+path = "src/truncate.rs"
+
+[[bin]]
+name = "touch"
+path = "src/touch.rs"
+
+[[bin]]
 name = "rm"
 path = "src/rm.rs"
 
@@ -257,6 +325,8 @@ shared-image = [
 	"resources-client-provider/shared-image",
 	"security-client/shared-image",
 	"security-client-provider/shared-image",
+	"session-client/shared-image",
+	"session-client-provider/shared-image",
 	"time-client/shared-image",
 	"time-client-provider/shared-image",
 	"volume-client/shared-image",
@@ -268,6 +338,16 @@ shared-image = [
 ]
 
 [dependencies]
+# The bounded command-line primitives: argument, size and range parsing, the glob matcher and the
+# chunk-at-a-time streaming vocabulary. Pure, so it is host-tested; see `user/libs/cli`.
+cli = { path = "../../libs/command/cli" }
+# The executable-name rules `which` resolves with, shared with the shell and the launcher so the
+# three cannot disagree about what artifact a command word names.
+service-logic = { path = "../../services/logic" }
+# The session client `kill` asks to signal a job through - the narrow one, which cannot take a
+# job's Process handle.
+session-client = { path = "../../libs/clients/session-client" }
+session-client-provider = { path = "../../libs/clients/session-client-provider" }
 ipc-client = { path = "../../libs/ipc/ipc-client" }
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC helpers); it re-exports the abi constants.

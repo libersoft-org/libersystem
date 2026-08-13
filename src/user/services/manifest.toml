@@ -87,6 +87,18 @@ owner = "bmp"
 path = "user/libs/image/bmp"
 
 [[sources]]
+owner = "cli"
+path = "user/libs/command/cli"
+
+[[sources]]
+owner = "session-client"
+path = "user/libs/clients/session-client"
+
+[[sources]]
+owner = "session-client-provider"
+path = "user/libs/clients/session-client-provider"
+
+[[sources]]
 owner = "config-client"
 path = "user/libs/clients/config-client"
 
@@ -935,6 +947,159 @@ destination = "bin/rm.lsexe"
 providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
+name = "tree"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/tree.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "wire", "lsrt"]
+
+[[programs]]
+name = "find"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/find.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "grep"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/grep.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "cp"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/cp.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "mv"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/mv.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "sort"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/sort.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "cut"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/cut.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "kill"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/kill.lsexe"
+providers = ["base-proto", "cli", "session-client", "lsrt"]
+
+[[programs]]
+name = "pwd"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/pwd.lsexe"
+providers = ["base-proto", "wire", "lsrt"]
+
+[[programs]]
+name = "clear"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/clear.lsexe"
+providers = ["base-proto", "lsrt"]
+
+[[programs]]
+name = "which"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/which.lsexe"
+providers = ["base-proto", "volume-client", "storage-proto", "service-util", "lsrt"]
+
+[[programs]]
+name = "wc"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/wc.lsexe"
+providers = ["base-proto", "volume-client", "storage-proto", "wire", "lsrt"]
+
+[[programs]]
+name = "head"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/head.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "tail"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/tail.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "hexdump"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/hexdump.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "truncate"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/truncate.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "touch"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/touch.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "time-client", "lsrt"]
+
+[[programs]]
 name = "rmdir"
 owner = "tools"
 role = "tool"
@@ -1596,6 +1761,20 @@ owner = "bmp"
 destination = "lib/image/bmp.lslib"
 features = []
 providers = ["quantize", "pix", "lsrt"]
+
+[[libraries]]
+name = "session-client"
+owner = "session-client-provider"
+destination = "lib/clients/session-client.lslib"
+features = ["shared-image"]
+providers = ["session-proto"]
+
+[[libraries]]
+name = "cli"
+owner = "cli"
+destination = "lib/command/cli.lslib"
+features = []
+providers = ["lsrt"]
 
 [[libraries]]
 name = "config-client"

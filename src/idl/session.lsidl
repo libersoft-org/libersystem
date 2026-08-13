@@ -51,6 +51,25 @@ record job-entry {
 /// `env-unset` removes one, and `env-list` enumerates them all. `PATH` is seeded with a
 /// default. The shell manages these on the user's behalf (`name=value`, `env`, `unset`,
 /// `$name` expansion) and the values persist in the session across a shell restart.
+/// The signals a session will deliver to a job it owns.
+///
+/// A NAMED SET, not a number: `kill -9` is a number whose meaning is a convention, and a caller
+/// that mistypes it signals something else. These five are the dispositions the kernel implements -
+/// terminate, terminate immediately, interrupt, suspend, resume - and a session refuses anything
+/// else because there is nothing else it could honestly do with it.
+enum job-signal-kind {
+	/// Ask the job to stop. The kernel's default disposition terminates it.
+	term = 0,
+	/// Terminate it without asking.
+	kill = 1,
+	/// The interrupt Ctrl+C sends.
+	interrupt = 2,
+	/// Suspend it, as Ctrl+Z does.
+	stop = 3,
+	/// Resume a suspended one.
+	cont = 4,
+}
+
 interface session {
 	@op(1)  cwd:          func() -> result<string, error>;
 	@op(2)  chdir:        func(path: string) -> result<unit, error>;
@@ -63,4 +82,19 @@ interface session {
 	@op(9)  env-set:      func(name: string, value: string) -> result<unit, error>;
 	@op(10) env-unset:    func(name: string) -> result<unit, error>;
 	@op(11) env-list:     func() -> result<list<env-var>, error>;
+	/// Signal a job this session owns, BY ID rather than by handle.
+	///
+	/// The point of the op is what it does NOT do: the caller never receives the Process handle, so
+	/// a tool that may ask for a job to be stopped is not thereby a tool that may do anything else
+	/// to it. `job-take` hands the handle over and is how a shell foregrounds a job; this asks the
+	/// owner to act and keeps the authority where the handle is.
+	///
+	/// A job that is not this session's is `not-found` - the same answer as one that never existed,
+	/// because "there is a job with that id and it is not yours" is a fact about someone else's
+	/// session that this one has no business confirming.
+	///
+	/// The reply says what the job LOOKS LIKE AFTERWARDS, so a caller can tell a suspension from a
+	/// termination without polling: a stopped job reports `stopped`, and a job that has exited is
+	/// reaped by the next `job-reap` like any other.
+	@op(12) job-signal:   func(id: u32, signal: job-signal-kind) -> result<job-info, error>;
 }

@@ -1,4 +1,4 @@
-use super::{explicit_path, launch_candidates, logical_name, lookup_identity};
+use super::{explicit_path, launch_candidates, logical_name, lookup_identity, path_entries};
 
 fn names(command: &str) -> alloc::vec::Vec<alloc::string::String> {
 	launch_candidates(command).unwrap()
@@ -41,4 +41,23 @@ fn manifest_lookup_accepts_short_full_and_explicit_spellings() {
 	assert_eq!(lookup_identity("cat"), Some("cat"));
 	assert_eq!(lookup_identity("cat.lsexe"), Some("cat"));
 	assert_eq!(lookup_identity("vol://system/bin/cat.lsexe"), Some("cat"));
+}
+
+#[test]
+fn a_search_path_is_separated_by_semicolons_because_its_entries_carry_colons() {
+	// The defect this exists for: `vol://system/bin` split on a colon is `vol` and `//system/bin`,
+	// and a `which` written against the Unix convention searched exactly those two and found
+	// nothing. The entries are URIs, so the separator cannot be a colon.
+	let entries: alloc::vec::Vec<&str> = path_entries("vol://system/bin").collect();
+	assert_eq!(entries, ["vol://system/bin"]);
+	let entries: alloc::vec::Vec<&str> = path_entries("vol://system/bin;vol://media/bin").collect();
+	assert_eq!(entries, ["vol://system/bin", "vol://media/bin"]);
+	// Whitespace around an entry is the caller's formatting, not part of the path.
+	let entries: alloc::vec::Vec<&str> = path_entries(" vol://system/bin ; vol://ram/bin ").collect();
+	assert_eq!(entries, ["vol://system/bin", "vol://ram/bin"]);
+	// An EMPTY entry is dropped rather than meaning the working directory - that convention is how
+	// a path picks up a program nobody meant to run.
+	let entries: alloc::vec::Vec<&str> = path_entries(";;vol://system/bin;;").collect();
+	assert_eq!(entries, ["vol://system/bin"]);
+	assert_eq!(path_entries("").count(), 0);
 }

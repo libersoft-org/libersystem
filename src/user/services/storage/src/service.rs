@@ -46,7 +46,7 @@ use liberfs::{BlockDevice, FsError, LiberFs, MountError};
 use libermemfs::{LiberMemFs, Policy as MemPolicy};
 use proto::codec::Buffer;
 use proto::codec::{Handles, Sink, SliceWriter};
-use proto::system::{Error, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, volume, volume_admin};
+use proto::system::{Error, FileEvent, FileEventKind, FileInfo, FileType, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, WriterMode, volume, volume_admin, writer};
 use rt::*;
 use udf::Udf;
 
@@ -166,15 +166,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			if sys_is_err(base) {
 				exit();
 			}
-			Volume { fs: alloc::boxed::Box::new(ArchiveFs { base, len: length }) }
+			Volume::new(alloc::boxed::Box::new(ArchiveFs { base, len: length }))
 		}
 		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => match unsafe { mount_system_volume(handle) } {
-			Some(fs) => Volume { fs: alloc::boxed::Box::new(DiskFs { fs }) },
+			Some(fs) => Volume::new(alloc::boxed::Box::new(DiskFs { fs })),
 			None => exit(),
 		},
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume { fs: alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None }) },
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None })),
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"ISOBLOCK" => match Iso9660::mount(IsoBlockDevice { chan: handle }) {
-			Some(fs) => Volume { fs: alloc::boxed::Box::new(IsoFs { fs }) },
+			Some(fs) => Volume::new(alloc::boxed::Box::new(IsoFs { fs })),
 			None => exit(),
 		},
 		// `mount_checked`, so a refusal says WHICH refusal. `mount` collapses "this is not UDF",
@@ -183,13 +183,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// tell "try the next one" from "this IS the format and it is broken, do not pretend
 		// otherwise". The distinction existed in the reader and stopped at this line.
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"UDFBLOCK" => match Udf::mount_checked(UdfBlockDevice { chan: handle }) {
-			Ok(fs) => Volume { fs: alloc::boxed::Box::new(UdfFs { fs }) },
+			Ok(fs) => Volume::new(alloc::boxed::Box::new(UdfFs { fs })),
 			Err(why) => {
 				unsafe { print(alloc::format!("storage: the UDF volume was refused: {why:?}\n").as_bytes()) };
 				exit()
 			}
 		},
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume { fs: alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None }) },
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None })),
 		// The two memory volumes. They carry no handle - there is no block device to hand over,
 		// which is the whole point - and the capacity follows the tag as a decimal byte count.
 		// A reserved volume takes its memory here, so a mount that cannot get it fails HERE
@@ -203,15 +203,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// disk the archive was a SECOND copy of what the volume already held, and removing that
 		// duplication is what the milestone is for. On read-only media there is no first copy.
 		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => match unsafe { live_volume(handle) } {
-			Some(fs) => Volume { fs: alloc::boxed::Box::new(MemFs { fs, name: SYSTEM_VOLUME }) },
+			Some(fs) => Volume::new(alloc::boxed::Box::new(MemFs { fs, name: SYSTEM_VOLUME })),
 			None => exit(),
 		},
 		Received::Message { len, .. } if len >= 6 && &buf[..6] == b"RAMVOL" => match LiberMemFs::mount(MemPolicy::Reserved, mem_capacity(&buf[6..len])) {
-			Ok(fs) => Volume { fs: alloc::boxed::Box::new(MemFs { fs, name: RAM_VOLUME }) },
+			Ok(fs) => Volume::new(alloc::boxed::Box::new(MemFs { fs, name: RAM_VOLUME })),
 			Err(_) => exit(),
 		},
 		Received::Message { len, .. } if len >= 6 && &buf[..6] == b"TMPVOL" => match LiberMemFs::mount(MemPolicy::Capped, mem_capacity(&buf[6..len])) {
-			Ok(fs) => Volume { fs: alloc::boxed::Box::new(MemFs { fs, name: TMP_VOLUME }) },
+			Ok(fs) => Volume::new(alloc::boxed::Box::new(MemFs { fs, name: TMP_VOLUME })),
 			Err(_) => exit(),
 		},
 		_ => exit(),
@@ -265,6 +265,129 @@ struct Client {
 	//
 	// Waiting is the part that costs other people. Attempting is not.
 	quiet: bool,
+	// Set when this client is a transactional writer session rather than a volume client, in which
+	// case it speaks the `writer` interface and nothing else.
+	//
+	// The session lives HERE, in the client entry, because that is what makes closing the channel
+	// an abort: a client that goes away takes its staged bytes with it, and there is no other table
+	// to forget to clean up. `scope` is what admitted it and is not consulted again - the path was
+	// checked once, when the session opened, and the session can only ever write to that path.
+	writer: Option<WriterSession>,
+}
+
+// A transactional writer session: the bytes staged for one path, published only by `commit`.
+struct WriterSession {
+	// The in-volume name, resolved and checked when the session opened. Keeping the RESOLVED name
+	// is what makes a commit land where the open was allowed to: re-resolving it at commit time
+	// would ask the scope question again, later, against a volume that may have changed.
+	name: String,
+	// The vol:// path, for the event a commit publishes.
+	path: String,
+	staged: Vec<u8>,
+	cursor: u64,
+	// The most this session may stage, and whether that number came from this service's policy or
+	// from the filesystem - the same distinction `write-stream` draws, and for the same reason: a
+	// filesystem's ceiling is about this moment (`again`), a policy's is not (`invalid`).
+	limit: usize,
+	limit_is_policy: bool,
+	// Set by `commit` or `abort`. The channel stays open afterwards and every op on it fails,
+	// because answering as though a new session had begun would publish a second time.
+	closed: bool,
+}
+
+impl WriterSession {
+	// Grow the staged file to `len` with zeros, refusing rather than growing past the ceiling.
+	fn reserve_to(&mut self, len: usize) -> Result<(), Error> {
+		if len > self.limit {
+			return Err(if self.limit_is_policy { Error::Invalid } else { Error::Again });
+		}
+		if len > self.staged.len() {
+			self.staged.try_reserve(len - self.staged.len()).map_err(|_| Error::Again)?;
+			self.staged.resize(len, 0);
+		}
+		Ok(())
+	}
+}
+
+// A writer session AS THE SERVE LOOP CALLS IT: the session's staged bytes plus the volume they
+// will be published to. The two are separate because a session is one client's and the volume is
+// everyone's, and only `commit` needs both.
+struct WriterCall<'a> {
+	vol: &'a mut Volume,
+	session: &'a mut WriterSession,
+}
+
+impl writer::Service for WriterCall<'_> {
+	fn write(&mut self, data: Vec<u8>) -> Result<u64, Error> {
+		if self.session.closed {
+			return Err(Error::Invalid);
+		}
+		let at: usize = self.session.cursor as usize;
+		let end: usize = at.checked_add(data.len()).ok_or(Error::Invalid)?;
+		self.session.reserve_to(end)?;
+		self.session.staged[at..end].copy_from_slice(&data);
+		self.session.cursor = end as u64;
+		Ok(self.session.staged.len() as u64)
+	}
+
+	fn write_at(&mut self, offset: u64, data: Vec<u8>) -> Result<(), Error> {
+		if self.session.closed {
+			return Err(Error::Invalid);
+		}
+		let at: usize = usize::try_from(offset).map_err(|_| Error::Invalid)?;
+		let end: usize = at.checked_add(data.len()).ok_or(Error::Invalid)?;
+		// The zero-extension is here rather than in the backend: `reserve_to` grows with zeros, so
+		// a write past the end leaves a gap of zeros instead of whatever the allocation held.
+		self.session.reserve_to(end)?;
+		self.session.staged[at..end].copy_from_slice(&data);
+		self.session.cursor = end as u64;
+		Ok(())
+	}
+
+	fn truncate(&mut self, length: u64) -> Result<(), Error> {
+		if self.session.closed {
+			return Err(Error::Invalid);
+		}
+		let len: usize = usize::try_from(length).map_err(|_| Error::Invalid)?;
+		self.session.reserve_to(len)?;
+		self.session.staged.truncate(len);
+		self.session.cursor = core::cmp::min(self.session.cursor, length);
+		Ok(())
+	}
+
+	fn flush(&mut self) -> Result<u64, Error> {
+		if self.session.closed {
+			return Err(Error::Invalid);
+		}
+		Ok(self.session.staged.len() as u64)
+	}
+
+	fn commit(&mut self) -> Result<u64, Error> {
+		if self.session.closed {
+			return Err(Error::Invalid);
+		}
+		let published: u64 = self.session.staged.len() as u64;
+		let existed: bool = self.vol.exists(self.session.name.as_bytes());
+		// CLOSED FIRST, before the publish can fail. A commit that failed has still ended the
+		// transaction: the staged bytes are gone from the caller's point of view, and letting it
+		// retry on the same session would publish whatever the failed attempt left behind.
+		self.session.closed = true;
+		let staged: Vec<u8> = core::mem::take(&mut self.session.staged);
+		self.vol.fs.write_file_owned(self.session.name.as_bytes(), staged)?;
+		let kind = if existed { FileEventKind::Modified } else { FileEventKind::Created };
+		let path = core::mem::take(&mut self.session.path);
+		self.vol.note(kind, &path, published);
+		Ok(published)
+	}
+
+	fn abort(&mut self) -> Result<(), Error> {
+		if self.session.closed {
+			return Err(Error::Invalid);
+		}
+		self.session.closed = true;
+		self.session.staged = Vec::new();
+		Ok(())
+	}
 }
 
 struct AdminCall<'a> {
@@ -282,7 +405,7 @@ impl volume_admin::Service for AdminCall<'_> {
 		// A refused admission closes BOTH ends: the grant did not happen, so neither handle has an
 		// owner. `Again` is what it is - the table is full or the machine is short, and both are
 		// conditions a caller can retry rather than a fault in the request.
-		if !admit_client(self.set, self.clients, Client { chan: server, koid: 0, scope, quiet: false }) {
+		if !admit_client(self.set, self.clients, Client { chan: server, koid: 0, scope, quiet: false, writer: None }) {
 			unsafe {
 				close(server);
 				close(client);
@@ -291,6 +414,155 @@ impl volume_admin::Service for AdminCall<'_> {
 		}
 		Ok(client)
 	}
+}
+
+// The volume interface AS THE SERVE LOOP CALLS IT: the volume, plus the client table.
+//
+// `open-writer` is the one volume op whose answer is a new CLIENT rather than a value, and the
+// generated dispatch is handed exactly one service object - so either every op can reach the table
+// or none can. This is the shape `AdminCall` already has for `open-directory`, for the same reason.
+// Every other op forwards to the volume unchanged; the forwarding is dull on purpose, because the
+// alternative - two dispatch sites, one with the table and one without - is how an op ends up
+// meaning different things depending on which client asked.
+struct VolumeCall<'a> {
+	vol: &'a mut Volume,
+	clients: &'a mut Vec<Client>,
+	set: u64,
+	// The scope of the client that asked. `open-writer` is the only op that consults it here (the
+	// loop checks every other one before dispatching), because the session it creates outlives the
+	// request and has to carry the same restriction the request was under.
+	scope: Scope,
+}
+
+impl volume::Service for VolumeCall<'_> {
+	fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error> {
+		self.vol.open(o)
+	}
+	fn list(&mut self, path: String) -> Result<Vec<FileInfo>, Error> {
+		self.vol.list(path)
+	}
+	fn write(&mut self, path: String, data: Buffer) -> Result<(), Error> {
+		self.vol.write(path, data)
+	}
+	fn remove(&mut self, path: String) -> Result<(), Error> {
+		self.vol.remove(path)
+	}
+	fn snap_create(&mut self, name: String) -> Result<(), Error> {
+		self.vol.snap_create(name)
+	}
+	fn snap_list(&mut self) -> Result<Vec<SnapshotInfo>, Error> {
+		self.vol.snap_list()
+	}
+	fn snap_delete(&mut self, name: String) -> Result<(), Error> {
+		self.vol.snap_delete(name)
+	}
+	fn snap_open(&mut self, snapshot: String, path: String) -> Result<OpenResult, Error> {
+		self.vol.snap_open(snapshot, path)
+	}
+	fn mkdir(&mut self, path: String) -> Result<(), Error> {
+		self.vol.mkdir(path)
+	}
+	fn rmdir(&mut self, path: String) -> Result<(), Error> {
+		self.vol.rmdir(path)
+	}
+	fn capacity(&mut self) -> Result<u64, Error> {
+		self.vol.capacity()
+	}
+	fn status(&mut self) -> Result<VolumeStatus, Error> {
+		self.vol.status()
+	}
+	fn set_compression(&mut self, enabled: bool) -> Result<(), Error> {
+		self.vol.set_compression(enabled)
+	}
+	fn fsck(&mut self) -> Result<FsckReport, Error> {
+		self.vol.fsck()
+	}
+	fn restore(&mut self, path: String, snapshot: String) -> Result<(), Error> {
+		self.vol.restore(path, snapshot)
+	}
+	fn write_stream(&mut self, path: String, data: u64) -> Result<(), Error> {
+		self.vol.write_stream(path, data)
+	}
+	fn stat(&mut self, path: String) -> Result<FileInfo, Error> {
+		self.vol.stat(path)
+	}
+	fn rename(&mut self, from: String, to: String) -> Result<(), Error> {
+		self.vol.rename(from, to)
+	}
+	fn truncate(&mut self, path: String, length: u64) -> Result<(), Error> {
+		self.vol.truncate(path, length)
+	}
+	fn touch(&mut self, path: String, create: bool, at: u64) -> Result<(), Error> {
+		self.vol.touch(path, create, at)
+	}
+	fn read(&mut self, path: String, offset: u64, length: u32) -> Result<Buffer, Error> {
+		self.vol.read(path, offset, length)
+	}
+	fn watch(&mut self, path: String) -> Result<Vec<FileEvent>, Error> {
+		self.vol.watch(path)
+	}
+
+	// Open a transactional writer over one path: a channel speaking `writer`, admitted as a client
+	// of this service so its session is pumped by the same loop as everything else.
+	fn open_writer(&mut self, path: String, mode: WriterMode) -> Result<u64, Error> {
+		if !self.scope.allows_path(self.vol.name(), &path) {
+			return Err(Error::Denied);
+		}
+		let name: &[u8] = self.vol.writable_name(&path)?;
+		// REFUSED BEFORE A CHANNEL EXISTS, so a session over a read-only volume costs a parse
+		// rather than a handle pair and a client slot.
+		let (limit, limit_is_policy): (usize, bool) = match self.vol.fs.write_plan(name) {
+			WritePlan::Refused(e) => return Err(e),
+			WritePlan::Allowed { max_len: Some(max) } => (max, false),
+			WritePlan::Allowed { max_len: None } => (STREAM_ACCUMULATION, true),
+		};
+		// ONE SESSION PER PATH. Two transactions over one file publish in an order neither chose,
+		// and the loser's work disappears at the moment it reported success - so the second is told
+		// `again`, which is true: the first one ends.
+		if self.clients.iter().any(|client| client.writer.as_ref().is_some_and(|session| !session.closed && session.name.as_bytes() == name)) {
+			return Err(Error::Again);
+		}
+		let mut staged: Vec<u8> = Vec::new();
+		let mut cursor: u64 = 0;
+		if matches!(mode, WriterMode::Append) {
+			// A missing file appends to nothing, which is what an append to a file that is not
+			// there means - the session creates it. Any other failure is the volume's answer and
+			// is passed on rather than turned into an empty file.
+			match self.vol.fs.read_file(name) {
+				Ok(existing) => {
+					cursor = existing.len() as u64;
+					staged = existing;
+				}
+				Err(Error::NotFound) => {}
+				Err(e) => return Err(e),
+			}
+			if staged.len() > limit {
+				return Err(if limit_is_policy { Error::Invalid } else { Error::Again });
+			}
+		}
+		let session = WriterSession { name: to_string(core::str::from_utf8(name).map_err(|_| Error::Invalid)?)?, path: to_string(&path)?, staged, cursor, limit, limit_is_policy, closed: false };
+		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		if !admit_client(self.set, self.clients, Client { chan: server, koid: 0, scope: self.scope.clone(), quiet: false, writer: Some(session) }) {
+			unsafe {
+				close(server);
+				close(client);
+			}
+			return Err(Error::Again);
+		}
+		Ok(client)
+	}
+}
+
+// A `String` that says it could not be allocated instead of aborting the service.
+//
+// `String::from` calls the infallible allocator, whose answer to a full heap is to end the
+// process; a service that a client can end by asking for enough sessions is not bounded, whatever
+// its other ceilings say.
+fn to_string(from: &str) -> Result<String, Error> {
+	let mut owned = String::new();
+	owned.try_reserve_exact(from.len()).map_err(|_| Error::Again)?;
+	owned.push_str(from);
+	Ok(owned)
 }
 
 impl Scope {
@@ -322,7 +594,11 @@ impl Scope {
 		}
 		let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 		match op {
-			volume::OP_OPEN | volume::OP_LIST | volume::OP_WRITE | volume::OP_REMOVE | volume::OP_MKDIR | volume::OP_RMDIR | volume::OP_WRITE_STREAM => request_path(request).is_some_and(|path| self.allows_path(volume, path)),
+			// Every op whose FIRST field is the path it acts on, which is what `request_path`
+			// reads. `rename` is deliberately absent: it carries two paths, this helper sees one,
+			// and a scoped client allowed to rename by its source alone could move a file out of
+			// the directory it was granted. It is refused until the check can read both.
+			volume::OP_OPEN | volume::OP_LIST | volume::OP_WRITE | volume::OP_REMOVE | volume::OP_MKDIR | volume::OP_RMDIR | volume::OP_WRITE_STREAM | volume::OP_STAT | volume::OP_TRUNCATE | volume::OP_TOUCH | volume::OP_READ | volume::OP_WATCH | volume::OP_OPEN_WRITER => request_path(request).is_some_and(|path| self.allows_path(volume, path)),
 			_ => false,
 		}
 	}
@@ -684,14 +960,24 @@ fn leave_stream(set: u64, koid: u64, stream: u64) {
 fn finish_stream(set: u64, vol: &mut Volume, p: PendingWrite, outcome: Result<(), Error>, quiet: bool, reply: &mut [u8]) -> Option<u64> {
 	let result = match outcome {
 		Ok(()) => {
-			if p.incremental {
+			// The length BEFORE the bytes are handed over, because `write_file_owned` takes them.
+			let published: u64 = p.received as u64;
+			let existed: bool = match vol.writable_name(&p.path) {
+				Ok(name) => vol.exists(name),
+				Err(_) => false,
+			};
+			let landed = if p.incremental {
 				vol.fs.stream_commit()
 			} else {
 				match vol.writable_name(&p.path) {
 					Ok(name) => vol.fs.write_file_owned(name, p.bytes),
 					Err(e) => Err(e),
 				}
+			};
+			if landed.is_ok() {
+				vol.note(if existed { FileEventKind::Modified } else { FileEventKind::Created }, &p.path, published);
 			}
+			landed
 		}
 		Err(e) => {
 			if p.incremental {
@@ -763,7 +1049,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 	let set: u64 = set as u64;
 
 	let mut clients: Vec<Client> = Vec::new();
-	if !admit_client(set, &mut clients, Client { chan: root, koid: 0, scope: Scope::Full, quiet: false }) {
+	if !admit_client(set, &mut clients, Client { chan: root, koid: 0, scope: Scope::Full, quiet: false, writer: None }) {
 		unsafe { print(b"storage: cannot admit the root client; the service cannot serve\n") };
 		unsafe { exit() };
 	}
@@ -798,7 +1084,16 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 	// One listing in flight, for the same reason as the write: the service produces it between
 	// passes, and a second would need its own slot and its own bound for no gain today.
 	let mut listing: Option<PendingList> = None;
+	// The watchers, which unlike the listing and the stream are MANY and long-lived: a watch lasts
+	// until one side closes it, so there is no single slot to hold one in. They are not members of
+	// the wait set - this service only ever SENDS on them, and a watcher that closed its end is
+	// discovered by the send that fails rather than by a wake nobody would answer.
+	let mut watchers: Vec<Watcher> = Vec::new();
 	loop {
+		// Hand out what the last pass produced. Here rather than at each mutation, because a
+		// mutation happens behind the generated dispatch and this is the first point afterwards
+		// that can see both the volume's outbox and the watcher table.
+		deliver_events(&mut watchers, &mut vol.events);
 		// Push what the consumer will take right now. Nothing here blocks, so a consumer that has
 		// stopped reading costs this pass and nothing else.
 		if let Some(l) = listing.as_mut() {
@@ -982,13 +1277,36 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				// alternative is holding the whole service for it.
 				let mut stalled = false;
 				let op: u16 = if len >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
-				if op == HEARTBEAT_OP {
+				// A WRITER SESSION SPEAKS `writer` AND NOTHING ELSE, and it is asked first because
+				// the two interfaces number their ops from one: `writer.write-at` is 2 and so is
+				// `volume.list`, so a session's positioned write was being answered by the
+				// directory streamer. Deciding by the CLIENT rather than by the op is the only
+				// arrangement that cannot collide, and it is what the contract says anyway - the
+				// channel `open-writer` returns speaks one interface.
+				//
+				// Its path was checked when the session opened, so `scope` is not consulted again:
+				// there is one path this client can write to and it cannot name another.
+				if clients[index].writer.is_some() {
+					let mut reply_handle = proto::codec::Handles::new();
+					let reply_len: Option<usize> = {
+						let session = clients[index].writer.as_mut().expect("checked");
+						let mut call = WriterCall { vol, session };
+						writer::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle)
+					};
+					if let Some(reply_len) = reply_len {
+						stalled = reply_to(chan, &reply[..reply_len], reply_handle.as_slice(), !quiet);
+					} else {
+						for &leftover in reply_handle.as_slice() {
+							unsafe { close(leftover) };
+						}
+					}
+				} else if op == HEARTBEAT_OP {
 					stalled = reply_to(chan, b"PONG", &[], !quiet);
 				} else if op == CONNECT_OP {
 					// An empty reply with no handle is this call's refusal form, and a table that is
 					// full uses it like a channel that could not be created.
 					match unsafe { channel() } {
-						Some((server, client)) if admit_client(set, &mut clients, Client { chan: server, koid: 0, scope, quiet: false }) => {
+						Some((server, client)) if admit_client(set, &mut clients, Client { chan: server, koid: 0, scope, quiet: false, writer: None }) => {
 							stalled = reply_to(chan, &[], &[client], !quiet);
 						}
 						Some((server, client)) => {
@@ -1036,9 +1354,19 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 								}
 							}
 						}
+					} else if op == volume::OP_WATCH {
+						match start_watch(vol, chan, &scope, quiet, &request[..len], &mut handle, &mut watchers) {
+							ListStart::ClientStalled => stalled = true,
+							ListStart::Started(_) | ListStart::Done => {}
+						}
 					} else {
 						let mut reply_handle = proto::codec::Handles::new();
-						let reply_len: Option<usize> = if scope.allows_request(vol.name(), &request[..len]) { volume::dispatch(vol, &request[..len], &mut handle, &mut reply, &mut reply_handle) } else { denied_reply(&request[..len], &mut reply) };
+						let reply_len: Option<usize> = if scope.allows_request(vol.name(), &request[..len]) {
+							let mut call = VolumeCall { vol, clients: &mut clients, set, scope: scope.clone() };
+							volume::dispatch(&mut call, &request[..len], &mut handle, &mut reply, &mut reply_handle)
+						} else {
+							denied_reply(&request[..len], &mut reply)
+						};
 						if let Some(reply_len) = reply_len {
 							// Bounded, and a client that will not take its answer is dropped below
 							// rather than waited for.
@@ -1170,6 +1498,164 @@ fn pump_list(p: &mut PendingList) -> bool {
 		}
 	}
 	true
+}
+
+// A live watcher: the producer end of its event stream and the path it asked about.
+struct Watcher {
+	producer: u64,
+	// The vol:// path. A watch on a file matches that file; a watch on a directory matches the
+	// entries directly below it and the directory itself.
+	path: String,
+	seq: u32,
+}
+
+// The most watchers this service will hold at once.
+//
+// Small on purpose. A watcher costs a channel, a path and a send per event to every one of them,
+// so the cost of a mutation grows with this number - and nothing in the system needs many. A
+// client refused here is told `again`, which is true: watchers end.
+const MAX_WATCHERS: usize = 16;
+
+impl Watcher {
+	// Whether this watcher asked about `path`: the path itself, or an entry directly below it.
+	//
+	// DIRECTLY below, not anywhere below. A subtree watch would report a change three directories
+	// down to a watcher of the root, which is the shape that makes an event stream unbounded in a
+	// way its consumer cannot predict - and `tail -f` and a directory listing both want exactly
+	// this. A client that wants a subtree watches the directories it cares about.
+	fn matches(&self, path: &str) -> bool {
+		if self.path == path {
+			return true;
+		}
+		match path.strip_prefix(self.path.as_str()).and_then(|rest| rest.strip_prefix('/')) {
+			Some(entry) => !entry.contains('/'),
+			None => false,
+		}
+	}
+}
+
+// Hand every pending event to the watchers that asked for it, dropping the ones that cannot take
+// it. Returns nothing: there is no caller that could do anything about a watcher that has gone.
+//
+// A watcher that will not read is DROPPED rather than waited for or buffered. Waiting is the defect
+// this service spent a milestone removing from every other send; buffering is unbounded growth
+// driven by a client that stopped listening. Its end of the stream closing is how it learns, and
+// the contract says what to do about it: re-read, rather than reconstruct from the events.
+fn deliver_events(watchers: &mut Vec<Watcher>, events: &mut Vec<FileEvent>) {
+	if watchers.is_empty() {
+		events.clear();
+		return;
+	}
+	let mut frame: [u8; 1024] = [0u8; 1024];
+	for event in events.drain(..) {
+		let mut at: usize = 0;
+		while at < watchers.len() {
+			if !watchers[at].matches(&event.path) {
+				at += 1;
+				continue;
+			}
+			let mut frame_handles = Handles::new();
+			let delivered: bool = match volume::watch_frame(watchers[at].seq, &event, &mut frame, &mut frame_handles) {
+				Some(n) => {
+					for handle in frame_handles.as_slice() {
+						unsafe { close(*handle) };
+					}
+					matches!(unsafe { try_send_outcome(watchers[at].producer, &frame[..n], 0) }, SendOutcome::Delivered)
+				}
+				// An event that will not encode ends the watch rather than being skipped: a
+				// consumer that ignores the sequence number cannot see a gap, so a silently
+				// dropped event is a watcher that believes it is up to date and is not.
+				None => {
+					for handle in frame_handles.as_slice() {
+						unsafe { close(*handle) };
+					}
+					false
+				}
+			};
+			if delivered {
+				watchers[at].seq = watchers[at].seq.saturating_add(1);
+				at += 1;
+			} else {
+				let gone = watchers.swap_remove(at);
+				unsafe { close(gone.producer) };
+			}
+		}
+	}
+}
+
+// Start a watch, or refuse it. Shaped like `stream_list`, which is the other op that answers with a
+// sub-channel: the reply carries the consumer end and the producer stays here.
+fn start_watch(vol: &mut Volume, service: u64, scope: &Scope, quiet: bool, request: &[u8], request_handle: &mut proto::codec::Handles, watchers: &mut Vec<Watcher>) -> ListStart {
+	let mut reader = proto::codec::Reader::with_handle_list(request, request_handle);
+	let r = &mut reader;
+	let (corr, path): (u32, String) = match (|| Some((r.u16()?, r.u32()?, r.string_lp()?)))() {
+		Some((_op, corr, path)) => (corr, path),
+		None => return ListStart::Done,
+	};
+	if r.has_handle() {
+		return ListStart::Done;
+	}
+	request_handle.clear();
+	let refuse = |chan: u64, error: Error| -> ListStart {
+		let mut body: [u8; 32] = [0u8; 32];
+		match volume::watch_reply_err(corr, &error, &mut body) {
+			None => ListStart::Done,
+			Some(n) => {
+				if reply_to(chan, &body[..n], &[], !quiet) {
+					ListStart::ClientStalled
+				} else {
+					ListStart::Done
+				}
+			}
+		}
+	};
+	if !scope.allows_path(vol.name(), &path) {
+		return refuse(service, Error::Denied);
+	}
+	// THE PATH HAS TO EXIST. A watch on a name that is not there would otherwise be the way to
+	// watch for a creation, and it is not: the events for a creation carry the parent's listing, so
+	// the answer to "tell me when this appears" is to watch the directory. Accepting it here would
+	// hold a slot for a typo forever.
+	let target: VolumePath = match VolumePath::parse(path.as_bytes()) {
+		Some(target) if target.volume == vol.name() => target,
+		_ => return refuse(service, Error::NotFound),
+	};
+	let is_root: bool = target.path.as_bytes().is_empty();
+	if !is_root && vol.fs.stat_entry(target.path.as_bytes()).is_err() {
+		return refuse(service, Error::NotFound);
+	}
+	if watchers.len() >= MAX_WATCHERS || watchers.try_reserve(1).is_err() {
+		return refuse(service, Error::Again);
+	}
+	let owned = match to_string(&path) {
+		Ok(owned) => owned,
+		Err(e) => return refuse(service, e),
+	};
+	let (producer, consumer): (u64, u64) = match unsafe { channel() } {
+		Some(pair) => pair,
+		None => return refuse(service, Error::Again),
+	};
+	let mut ok_body: [u8; 16] = [0u8; 16];
+	let Some(ok_len) = volume::watch_reply_ok(corr, &mut ok_body) else {
+		unsafe {
+			close(producer);
+			close(consumer);
+		}
+		return ListStart::Done;
+	};
+	match reply_outcome(service, &ok_body[..ok_len], &[consumer], !quiet) {
+		SendOutcome::Delivered => {}
+		SendOutcome::Stalled => {
+			unsafe { close(producer) };
+			return ListStart::ClientStalled;
+		}
+		SendOutcome::Failed => {
+			unsafe { close(producer) };
+			return ListStart::Done;
+		}
+	}
+	watchers.push(Watcher { producer, path: owned, seq: 0 });
+	ListStart::Done
 }
 
 // How a listing request ended. Three outcomes rather than `Option`, because bounding the answer
@@ -1349,6 +1835,14 @@ enum WritePlan {
 // refused, which is the honest description of where it lives.
 const STREAM_ACCUMULATION: usize = 64 * 1024 * 1024;
 
+// The most one `read` window may deliver.
+//
+// A ceiling and not a refusal: `volume.read` clamps rather than refusing, so this number is a
+// property of the service that a client never has to know. It is one megabyte because the window
+// is copied once into the service's heap and once into the buffer it hands back, and a client that
+// wants more asks again - which is the loop it is already writing.
+const READ_WINDOW_MAX: usize = 1024 * 1024;
+
 // The most clients this service will hold at once, counting the root.
 //
 // There was no limit and no fallible allocation: every `CONNECT` did `clients.push(...)` and every
@@ -1420,6 +1914,24 @@ trait FileSystem {
 	fn set_clock(&mut self, _unix_secs: u64) {}
 	// Read a whole file by its in-volume path.
 	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error>;
+	// Read at most `len` bytes from `offset`, for a client reading a file in windows.
+	//
+	// The DEFAULT reads the whole file and slices it, which is correct on every backend and
+	// bounded by nothing - so it is the default rather than the answer. A backend that can seek
+	// overrides it, and the two that carry the large files (LiberFS and FAT) do; the archive and
+	// memory backends hold their bytes in memory already, so slicing them costs a copy of the
+	// window rather than a read of the file.
+	//
+	// A window past the end is EMPTY rather than an error: see the contract at `volume.read`.
+	fn read_window(&mut self, name: &[u8], offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+		let file: Vec<u8> = self.read_file(name)?;
+		let start: usize = core::cmp::min(offset, file.len() as u64) as usize;
+		let end: usize = core::cmp::min(start.saturating_add(len), file.len());
+		let mut window: Vec<u8> = Vec::new();
+		window.try_reserve_exact(end - start).map_err(|_| Error::Again)?;
+		window.extend_from_slice(&file[start..end]);
+		Ok(window)
+	}
 	// List a directory (an empty name is the volume root) as name + length + kind + times.
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error>;
 	// The byte size of the backing block device (for the `lsblk` inventory).
@@ -1573,16 +2085,58 @@ trait FileSystem {
 // The volume the service serves: one boxed filesystem backend behind the trait above.
 struct Volume {
 	fs: alloc::boxed::Box<dyn FileSystem>,
+	// Mutations this service has performed and not yet handed to the watchers.
+	//
+	// An OUTBOX rather than a push, because a mutation happens behind the generated `Service`
+	// trait, which is handed the volume and nothing else - the watcher table belongs to the serve
+	// loop. The loop drains this after every request, so an event's life here is one dispatch long.
+	//
+	// Bounded like everything else: one request produces at most two events, and one that would
+	// pass the bound is DROPPED rather than grown. That is the honest failure for this contract -
+	// a watcher is told to re-read rather than to reconstruct state from the sequence - and it is
+	// the reason `watch` does not promise every event, only the ones it delivers.
+	events: Vec<FileEvent>,
 }
 
+// The most events one request may leave behind. Two is what the largest mutation (a rename)
+// produces; the rest is headroom for a request that mutates more than once, and the ceiling
+// exists so a backend that started emitting per-block events could not grow this without bound.
+const MAX_PENDING_EVENTS: usize = 8;
+
 impl Volume {
+	fn new(fs: alloc::boxed::Box<dyn FileSystem>) -> Volume {
+		Volume { fs, events: Vec::new() }
+	}
+
 	// The vol:// name this backing answers to (its backend's).
 	fn name(&self) -> &'static [u8] {
 		self.fs.volume_name()
 	}
-}
 
-impl Volume {}
+	// Record a change for the watchers, or drop it if the outbox is full.
+	//
+	// Dropping is deliberate and is why this returns nothing: the alternative is failing a
+	// mutation that has already happened because nobody could be told about it, which would make
+	// watching a way to make writes fail.
+	fn note(&mut self, kind: FileEventKind, path: &str, size: u64) {
+		if self.events.len() >= MAX_PENDING_EVENTS || self.events.try_reserve(1).is_err() {
+			return;
+		}
+		let mut owned = String::new();
+		if owned.try_reserve_exact(path.len()).is_err() {
+			return;
+		}
+		owned.push_str(path);
+		self.events.push(FileEvent { path: owned, kind, size });
+	}
+
+	// Whether a path exists now, asked before a mutation so the event it produces can say whether
+	// the file was created or changed. A backend that cannot answer is treated as "not there",
+	// which reports a modification as a creation - the direction that tells a watcher to look.
+	fn exists(&mut self, name: &[u8]) -> bool {
+		self.fs.stat_entry(name).is_ok()
+	}
+}
 
 impl volume::Service for Volume {
 	// Resolve a vol:// path and hand back the file's bytes as a read-only shared
@@ -1644,7 +2198,12 @@ impl volume::Service for Volume {
 		}
 		let buffer = unsafe { map_buffer(&Buffer { handle: owned.release(), len: data.len }) }.ok_or(Error::Invalid)?;
 		let name: &[u8] = self.writable_name(&path)?;
-		self.fs.write_file(name, buffer.as_slice())
+		// Asked BEFORE the write, because afterwards every path exists and the answer would always
+		// be `modified` - a watcher waiting for a file to appear would never hear that it had.
+		let existed: bool = self.exists(name);
+		self.fs.write_file(name, buffer.as_slice())?;
+		self.note(if existed { FileEventKind::Modified } else { FileEventKind::Created }, &path, data.len);
+		Ok(())
 	}
 
 	// UNREACHABLE. The serve loop intercepts `OP_WRITE_STREAM` and registers a pending write, so
@@ -1665,7 +2224,9 @@ impl volume::Service for Volume {
 	// Delete a file. A read-only volume refuses with `denied`.
 	fn remove(&mut self, path: String) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		self.fs.remove(name)
+		self.fs.remove(name)?;
+		self.note(FileEventKind::Removed, &path, 0);
+		Ok(())
 	}
 
 	// Create a named read-only snapshot of the volume, pinning the current generation
@@ -1701,7 +2262,9 @@ impl volume::Service for Volume {
 	// `denied`, the other backends with `invalid` (no directory writes implemented).
 	fn mkdir(&mut self, path: String) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		self.fs.mkdir(name)
+		self.fs.mkdir(name)?;
+		self.note(FileEventKind::Created, &path, 0);
+		Ok(())
 	}
 
 	// Remove the empty directory at a vol:// path. Only the writable LiberFS volume
@@ -1709,7 +2272,9 @@ impl volume::Service for Volume {
 	// `invalid`.
 	fn rmdir(&mut self, path: String) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		self.fs.rmdir(name)
+		self.fs.rmdir(name)?;
+		self.note(FileEventKind::Removed, &path, 0);
+		Ok(())
 	}
 
 	// The size in bytes of the block device backing this volume - asked of the disk
@@ -1762,17 +2327,66 @@ impl volume::Service for Volume {
 	fn rename(&mut self, from: String, to: String) -> Result<(), Error> {
 		let source: Vec<u8> = self.writable_name(&from)?.to_vec();
 		let destination: &[u8] = self.writable_name(&to)?;
-		self.fs.rename(&source, destination)
+		let size: u64 = self.fs.stat_entry(&source).map(|entry| entry.size).unwrap_or(0);
+		self.fs.rename(&source, destination)?;
+		// TWO events, because a rename is two changes to two paths and a watcher holds one of them.
+		// Reporting it once, on either path, is the shape that tells half the watchers nothing.
+		self.note(FileEventKind::Removed, &from, 0);
+		self.note(FileEventKind::Created, &to, size);
+		Ok(())
 	}
 
 	fn truncate(&mut self, path: String, length: u64) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		self.fs.truncate(name, length)
+		self.fs.truncate(name, length)?;
+		self.note(FileEventKind::Modified, &path, length);
+		Ok(())
 	}
 
-	fn touch(&mut self, path: String, create: bool) -> Result<(), Error> {
+	fn touch(&mut self, path: String, create: bool, at: u64) -> Result<(), Error> {
 		let name: &[u8] = self.writable_name(&path)?;
-		self.fs.touch(name, create)
+		// The caller's time, when it gave one. The serve loop already stamped the service's own
+		// clock before dispatching, so zero simply leaves that in place - there is no second
+		// meaning to give it and no clock to fall back to.
+		if at != 0 {
+			self.fs.set_clock(at);
+		}
+		let existed: bool = self.exists(name);
+		self.fs.touch(name, create)?;
+		let size: u64 = self.fs.stat_entry(name).map(|entry| entry.size).unwrap_or(0);
+		self.note(if existed { FileEventKind::Modified } else { FileEventKind::Created }, &path, size);
+		Ok(())
+	}
+
+	// A WINDOW of a file, as a shared buffer of exactly the bytes delivered.
+	//
+	// The window is clamped to what one reply may carry rather than refused, so a client that
+	// streams a file by repeating this call cannot pick a chunk size that stops it working. A
+	// window past the end is not an error: it delivers nothing and says so by its length, which is
+	// how a sequential reader learns it has reached the end without asking a second question.
+	fn read(&mut self, path: String, offset: u64, length: u32) -> Result<Buffer, Error> {
+		let want: usize = core::cmp::min(length as usize, READ_WINDOW_MAX);
+		let target: VolumePath = VolumePath::parse(path.as_bytes()).ok_or(Error::NotFound)?;
+		if target.volume != self.name() {
+			return Err(Error::NotFound);
+		}
+		let window: Vec<u8> = self.fs.read_window(target.path.as_bytes(), offset, want)?;
+		let handle: u64 = unsafe { make_file_buffer(&window) }.ok_or(Error::Again)?;
+		Ok(Buffer { handle, len: window.len() as u64 })
+	}
+
+	// UNREACHABLE, for the reason `write_stream` is: the serve loop intercepts `OP_WATCH` and
+	// registers a watcher, because a watch outlives the call that asked for it and this trait
+	// answers within one. The method exists because the generated trait requires it.
+	fn watch(&mut self, _path: String) -> Result<Vec<FileEvent>, Error> {
+		Err(Error::Invalid)
+	}
+
+	// UNREACHABLE for a third reason: opening a writer creates a CLIENT, and the client table
+	// belongs to the serve loop. `VolumeCall` is what the loop dispatches through, and its
+	// implementation of this op is the real one.
+	fn open_writer(&mut self, _path: String, _mode: WriterMode) -> Result<u64, Error> {
+		Err(Error::Invalid)
 	}
 }
 
@@ -1965,6 +2579,13 @@ impl FileSystem for DiskFs {
 		let report = self.fs.fsck().map_err(map_fs_err)?;
 		Ok(FsckReport { checksum_failures: report.checksum_failures, damaged: report.damaged.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect() })
 	}
+	// STRAIGHT OFF THE MEDIUM. The default reads the whole file to hand back a window of it, which
+	// on the disk means reading a gigabyte to answer a question about sixty-four kilobytes of it -
+	// so the one backend that carries files that size seeks instead.
+	fn read_window(&mut self, name: &[u8], offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+		self.fs.read_at(name, offset, len).map_err(map_fs_err)
+	}
+
 	// THE NATIVE FILESYSTEM ANSWERS ALL FOUR, because LiberFS already implements them: `stat`
 	// reads the inode, `rename` moves the directory entry without touching the contents, and
 	// `truncate` drops or zero-extends. They were unreachable from a client only because the
@@ -2155,6 +2776,18 @@ impl FileSystem for MemFs {
 	}
 	fn rmdir(&mut self, name: &[u8]) -> Result<(), Error> {
 		self.fs.rmdir(name).map_err(map_fs_err)
+	}
+	// The memory volumes answer three of the four. `stat_entry` stays the default - a listing of
+	// an in-memory directory is a walk of a sorted vector, so looking one name up directly would
+	// save nothing worth a second implementation of the lookup.
+	fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), Error> {
+		self.fs.rename(from, to).map_err(map_fs_err)
+	}
+	fn truncate(&mut self, name: &[u8], length: u64) -> Result<(), Error> {
+		self.fs.truncate(name, length).map_err(map_fs_err)
+	}
+	fn touch(&mut self, name: &[u8], create: bool) -> Result<(), Error> {
+		self.fs.touch(name, create).map_err(map_fs_err)
 	}
 }
 
@@ -2361,6 +2994,19 @@ impl FileSystem for ArchiveFs {
 	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
 		let file: &[u8] = Package::parse(self.archive()).and_then(|p| p.lookup(name)).ok_or(Error::NotFound)?;
 		Ok(file.to_vec())
+	}
+	// ONE NAME, WITHOUT A LISTING - which is the only way to answer this on a flat archive.
+	//
+	// The default `stat_entry` reads the parent directory and searches it, and this backend has no
+	// directories: a package key is a whole path, so `bin/cat.lsexe` is one entry and `bin` is not
+	// an entry at all. `read_file` has always looked names up directly; before this, `stat` of a
+	// staged artifact failed on the volume that holds every staged artifact, which is how `which`
+	// found nothing on an archive-backed system volume.
+	fn stat_entry(&mut self, name: &[u8]) -> Result<FileInfo, Error> {
+		let package = Package::parse(self.archive()).ok_or(Error::NotFound)?;
+		let size: u64 = package.lookup(name).ok_or(Error::NotFound)?.len() as u64;
+		let (_, base) = split_parent(name);
+		file_info(base, size, false, 0, 0)
 	}
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
 		// the test archive is a flat package - it has no subdirectories.

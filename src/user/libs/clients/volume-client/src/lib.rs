@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
 use storage_proto::codec::Buffer;
-use storage_proto::generated::liber::storage::v1::{FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus};
+use storage_proto::generated::liber::storage::v1::{FileInfo, FsckReport, OpenOpts, OpenResult, SnapshotInfo, VolumeStatus, WriterMode};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_storage_volume_open"]
@@ -42,6 +42,32 @@ unsafe extern "Rust" {
 	fn volume_write_stream_begin(chan: u64, correlation: u32, path: &str, data: u64) -> bool;
 	#[link_name = "liber_channel_liber_storage_volume_write_stream_finish"]
 	fn volume_write_stream_finish(chan: u64, correlation: u32) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_storage_volume_stat"]
+	fn volume_stat(chan: u64, path: &str) -> Option<Result<FileInfo, Error>>;
+	#[link_name = "liber_channel_liber_storage_volume_rename"]
+	fn volume_rename(chan: u64, from: &str, to: &str) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_storage_volume_truncate"]
+	fn volume_truncate(chan: u64, path: &str, length: &u64) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_storage_volume_touch"]
+	fn volume_touch(chan: u64, path: &str, create: &bool, at: &u64) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_storage_volume_read"]
+	fn volume_read(chan: u64, path: &str, offset: &u64, length: &u32) -> Option<Result<Buffer, Error>>;
+	#[link_name = "liber_channel_liber_storage_volume_watch"]
+	fn volume_watch(chan: u64, path: &str) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_storage_volume_open_writer"]
+	fn volume_open_writer(chan: u64, path: &str, mode: &WriterMode) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_storage_writer_write"]
+	fn writer_write(chan: u64, data: &[u8]) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_storage_writer_write_at"]
+	fn writer_write_at(chan: u64, offset: &u64, data: &[u8]) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_storage_writer_truncate"]
+	fn writer_truncate(chan: u64, length: &u64) -> Option<Result<(), Error>>;
+	#[link_name = "liber_channel_liber_storage_writer_flush"]
+	fn writer_flush(chan: u64) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_storage_writer_commit"]
+	fn writer_commit(chan: u64) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_storage_writer_abort"]
+	fn writer_abort(chan: u64) -> Option<Result<(), Error>>;
 }
 
 #[derive(Clone, Copy)]
@@ -132,6 +158,54 @@ impl VolumeClient {
 	}
 
 	#[inline(always)]
+	pub fn stat(&mut self, path: &str) -> Option<Result<FileInfo, Error>> {
+		unsafe { volume_stat(self.chan, path) }
+	}
+
+	#[inline(always)]
+	pub fn rename(&mut self, from: &str, to: &str) -> Option<Result<(), Error>> {
+		unsafe { volume_rename(self.chan, from, to) }
+	}
+
+	#[inline(always)]
+	pub fn truncate(&mut self, path: &str, length: u64) -> Option<Result<(), Error>> {
+		unsafe { volume_truncate(self.chan, path, &length) }
+	}
+
+	#[inline(always)]
+	/// Stamp `path`'s modification time to `at` (Unix seconds, UTC), creating it when asked to.
+	/// Zero leaves the service's own clock in place.
+	pub fn touch(&mut self, path: &str, create: bool, at: u64) -> Option<Result<(), Error>> {
+		unsafe { volume_touch(self.chan, path, &create, &at) }
+	}
+
+	/// One window of a file, as a shared buffer of exactly the bytes delivered. A short answer is
+	/// the end of the file; see the contract at `volume.read`.
+	#[inline(always)]
+	pub fn read(&mut self, path: &str, offset: u64, length: u32) -> Option<Result<Buffer, Error>> {
+		unsafe { volume_read(self.chan, path, &offset, &length) }
+	}
+
+	/// Subscribe to changes to a path. The handle is the consumer end of an event stream; each
+	/// message on it decodes with `volume::watch_read`, and the stream ends when either side
+	/// closes it.
+	#[inline(always)]
+	pub fn watch(&mut self, path: &str) -> Option<Result<u64, Error>> {
+		unsafe { volume_watch(self.chan, path) }
+	}
+
+	/// Open a transactional writer over one path. Nothing the session writes is visible until
+	/// `commit`; dropping the client aborts it.
+	#[inline(always)]
+	pub fn open_writer(&mut self, path: &str, mode: WriterMode) -> Option<Result<WriterClient, Error>> {
+		match unsafe { volume_open_writer(self.chan, path, &mode) } {
+			Some(Ok(chan)) => Some(Ok(WriterClient { chan })),
+			Some(Err(e)) => Some(Err(e)),
+			None => None,
+		}
+	}
+
+	#[inline(always)]
 	pub fn begin_write_stream(self, path: &str, data: u64) -> Option<PendingWrite> {
 		const CORRELATION: u32 = 0;
 		if unsafe { volume_write_stream_begin(self.chan, CORRELATION, path, data) } { Some(PendingWrite { chan: self.chan, correlation: CORRELATION }) } else { None }
@@ -147,5 +221,63 @@ impl PendingWrite {
 	#[inline(always)]
 	pub fn finish(self) -> Option<Result<(), Error>> {
 		unsafe { volume_write_stream_finish(self.chan, self.correlation) }
+	}
+}
+
+/// A transactional writer session over one path, from `VolumeClient::open_writer`.
+///
+/// The session stages bytes in StorageService and publishes them only on `commit`, so a client
+/// that dies half way leaves the file exactly as it was. The channel is NOT closed by this type:
+/// its owner closes it, and closing an uncommitted session is an abort.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct WriterClient {
+	chan: u64,
+}
+
+impl WriterClient {
+	#[inline(always)]
+	pub const fn new(chan: u64) -> Self {
+		Self { chan }
+	}
+
+	/// The session's channel, for the owner that has to close it.
+	#[inline(always)]
+	pub const fn handle(&self) -> u64 {
+		self.chan
+	}
+
+	/// Append at the cursor, returning the staged length. One call carries at most 65535 bytes -
+	/// the wire's list length - so a large file is written by repeating it.
+	#[inline(always)]
+	pub fn write(&mut self, data: &[u8]) -> Option<Result<u64, Error>> {
+		unsafe { writer_write(self.chan, data) }
+	}
+
+	#[inline(always)]
+	pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Option<Result<(), Error>> {
+		unsafe { writer_write_at(self.chan, &offset, data) }
+	}
+
+	#[inline(always)]
+	pub fn truncate(&mut self, length: u64) -> Option<Result<(), Error>> {
+		unsafe { writer_truncate(self.chan, &length) }
+	}
+
+	#[inline(always)]
+	pub fn flush(&mut self) -> Option<Result<u64, Error>> {
+		unsafe { writer_flush(self.chan) }
+	}
+
+	/// Publish the staged bytes and end the session, returning the published length.
+	#[inline(always)]
+	pub fn commit(&mut self) -> Option<Result<u64, Error>> {
+		unsafe { writer_commit(self.chan) }
+	}
+
+	/// Discard everything staged and end the session.
+	#[inline(always)]
+	pub fn abort(&mut self) -> Option<Result<(), Error>> {
+		unsafe { writer_abort(self.chan) }
 	}
 }

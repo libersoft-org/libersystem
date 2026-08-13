@@ -1,0 +1,14 @@
+[package]
+name = "session-client-provider"
+edition = "2024"
+description = "ELF trampoline provider for concrete LiberSystem session channel clients"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+shared-image = ["session-proto/shared-image"]
+
+[dependencies]
+session-proto = { path = "../../protocol/session-proto" }

@@ -174,7 +174,7 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, perm_client, admin_server2, stats_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, *process_client, pkg_handle, pkg_len, buf) {
@@ -560,7 +560,7 @@ pub(super) unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, usbq_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, usbq_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -594,6 +594,23 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 			None => return false,
 		};
 		if !send_blocking(manager_side, CAP_TIME, time_conn) {
+			return false;
+		}
+		// VT 1's SESSION, duplicated for the manager to grant to the governed `kill` command.
+		//
+		// The SAME session the shell holds, minted once and kept for the life of the system - so
+		// `kill 2` names the job `jobs` printed. When a second VT session exists this becomes
+		// wrong in a specific way: the launcher would have to pass the CALLER's session rather
+		// than this one, because a job table belongs to a session and not to the machine. There is
+		// one session today, and this comment is where that assumption is written down.
+		if *session1 == 0 {
+			*session1 = match service_connect(*session_client) {
+				Some(h) => h,
+				None => return false,
+			};
+		}
+		let session_dup: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if session_dup < 0 || !send_blocking(manager_side, CAP_SESSION, session_dup as u64) {
 			return false;
 		}
 		// A fresh ConfigService connection the manager grants to the governed `config` / `set`

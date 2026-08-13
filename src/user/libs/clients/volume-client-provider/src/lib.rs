@@ -90,3 +90,16 @@ forward!("liber_channel_liber_storage_volume_status", "liber_channel_impl_liber_
 forward!("liber_channel_liber_storage_volume_set_compression", "liber_channel_impl_liber_storage_volume_set_compression");
 forward!("liber_channel_liber_storage_volume_fsck", "liber_channel_impl_liber_storage_volume_fsck");
 forward!("liber_channel_liber_storage_volume_restore", "liber_channel_impl_liber_storage_volume_restore");
+forward!("liber_channel_liber_storage_volume_stat", "liber_channel_impl_liber_storage_volume_stat");
+forward!("liber_channel_liber_storage_volume_rename", "liber_channel_impl_liber_storage_volume_rename");
+forward!("liber_channel_liber_storage_volume_truncate", "liber_channel_impl_liber_storage_volume_truncate");
+forward!("liber_channel_liber_storage_volume_touch", "liber_channel_impl_liber_storage_volume_touch");
+forward!("liber_channel_liber_storage_volume_read", "liber_channel_impl_liber_storage_volume_read");
+forward!("liber_channel_liber_storage_volume_watch", "liber_channel_impl_liber_storage_volume_watch");
+forward!("liber_channel_liber_storage_volume_open_writer", "liber_channel_impl_liber_storage_volume_open_writer");
+forward!("liber_channel_liber_storage_writer_write", "liber_channel_impl_liber_storage_writer_write");
+forward!("liber_channel_liber_storage_writer_write_at", "liber_channel_impl_liber_storage_writer_write_at");
+forward!("liber_channel_liber_storage_writer_truncate", "liber_channel_impl_liber_storage_writer_truncate");
+forward!("liber_channel_liber_storage_writer_flush", "liber_channel_impl_liber_storage_writer_flush");
+forward!("liber_channel_liber_storage_writer_commit", "liber_channel_impl_liber_storage_writer_commit");
+forward!("liber_channel_liber_storage_writer_abort", "liber_channel_impl_liber_storage_writer_abort");

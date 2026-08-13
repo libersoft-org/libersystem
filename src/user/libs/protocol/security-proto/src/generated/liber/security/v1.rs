@@ -38,6 +38,10 @@ pub enum Capability {
 	Display = 16,
 	InputKeys = 17,
 	AudioStream = 18,
+	/// The caller's SessionService client: its jobs, and the right to ask the session to signal
+	/// one. It does NOT carry the session's Process handles - `job-signal` acts on the session's
+	/// behalf precisely so a tool granted this cannot take them.
+	Session = 19,
 }
 
 impl Capability {
@@ -101,6 +105,7 @@ impl Capability {
 			16 => Some(Capability::Display),
 			17 => Some(Capability::InputKeys),
 			18 => Some(Capability::AudioStream),
+			19 => Some(Capability::Session),
 			_ => None,
 		}
 	}
@@ -876,6 +881,7 @@ impl Capability {
 			Capability::Display => out.push_str("\"display\""),
 			Capability::InputKeys => out.push_str("\"input-keys\""),
 			Capability::AudioStream => out.push_str("\"audio-stream\""),
+			Capability::Session => out.push_str("\"session\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -899,6 +905,7 @@ impl Capability {
 			Capability::Display => out.push_str("display"),
 			Capability::InputKeys => out.push_str("input-keys"),
 			Capability::AudioStream => out.push_str("audio-stream"),
+			Capability::Session => out.push_str("session"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -922,6 +929,7 @@ impl Capability {
 			Capability::Display => crate::codec::cbor::text(out, "display"),
 			Capability::InputKeys => crate::codec::cbor::text(out, "input-keys"),
 			Capability::AudioStream => crate::codec::cbor::text(out, "audio-stream"),
+			Capability::Session => crate::codec::cbor::text(out, "session"),
 		}
 	}
 }

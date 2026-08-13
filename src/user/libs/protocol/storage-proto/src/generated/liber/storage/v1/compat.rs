@@ -26,6 +26,30 @@ fn file_info_wire_is_stable() {
 	assert_eq!(FileInfo::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn file_event_kind_wire_is_stable() {
+	let sample = FileEventKind::Created;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(FileEventKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn file_event_wire_is_stable() {
+	let sample = FileEvent { path: String::from("x"), kind: FileEventKind::Created, size: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 0, 7, 0, 0, 0, 0, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(FileEvent::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn writer_mode_wire_is_stable() {
+	let sample = WriterMode::Replace;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(WriterMode::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn snapshot_info_wire_is_stable() {
 	let sample = SnapshotInfo { name: String::from("x"), generation: 7 };
 	let bytes = sample.encode_vec().expect("encode");

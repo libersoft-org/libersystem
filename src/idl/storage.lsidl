@@ -42,6 +42,35 @@ record file-info {
 	ctime: u64,
 }
 
+/// What happened to a watched path. A RENAME is reported as the two events it is - `removed` at
+/// the old name and `created` at the new one - rather than as a fourth kind, because a watcher of
+/// one of the two names must be told about it and only one of them can carry the other's path.
+enum file-event-kind {
+	created  = 0,
+	modified = 1,
+	removed  = 2,
+}
+
+/// One change to a watched path: which path changed, how, and the file's length afterwards (zero
+/// for `removed`). The path is the full `vol://` form, so a watcher of a directory can tell its
+/// entries apart without rebuilding it.
+record file-event {
+	path: string,
+	kind: file-event-kind,
+	size: u64,
+}
+
+/// How a writer session starts: from nothing, or from what the file already holds.
+///
+/// `append` is a statement about the SESSION, not about each write: the file's current bytes are
+/// staged first and the cursor starts after them. It is not the POSIX O_APPEND promise that
+/// concurrent writers interleave at the end - one writer at a time holds a path here, so there is
+/// no interleaving to promise.
+enum writer-mode {
+	replace = 0,
+	append  = 1,
+}
+
 /// One named snapshot of a volume: its name and the generation it pinned, so a client
 /// can present an ordered, identifiable list of restore points.
 record snapshot-info {
@@ -186,10 +215,93 @@ interface volume {
 	/// The zero-extension is a PROMISE about the bytes: a file grown this way reads as zeros, not
 	/// as whatever the blocks last held. A backend that cannot promise that answers `invalid`.
 	@op(19) truncate:        func(path: string, length: u64) -> result<unit, error>;
-	/// Update a file's modification time to now, and create it empty when `create` is set and it is
-	/// not there. `create` false over a missing file is `not-found` rather than a silent creation -
-	/// the two callers want different things and a flag is how they say which.
-	@op(20) touch:           func(path: string, create: bool) -> result<unit, error>;
+	/// Stamp a file's modification time, and create it empty when `create` is set and it is not
+	/// there. `create` false over a missing file is `not-found` rather than a silent creation - the
+	/// two callers want different things and a flag is how they say which.
+	///
+	/// `at` IS THE CALLER'S, in seconds since the Unix epoch, UTC. The service does hold a clock
+	/// and every other mutation is stamped from it, but a timestamp is the one thing `touch`
+	/// exists to set - so a caller that wants a file dated when its content was made, rather than
+	/// when it was copied, says so, and a caller that just wants "now" asks the clock it was
+	/// granted. Zero means the service's own clock, which is what a caller with no clock has.
+	@op(20) touch:           func(path: string, create: bool, at: u64) -> result<unit, error>;
+	/// A WINDOW of a file, rather than all of it.
+	///
+	/// `open` hands back the whole file as one shared buffer, which is the right shape for a file
+	/// that fits and no shape at all for one that does not: a client that wants the first forty
+	/// lines of a log has to map the log. This returns the bytes from `offset`, at most `length` of
+	/// them, as a buffer capability of exactly the size delivered.
+	///
+	/// A SHORT ANSWER IS THE END OF THE FILE, not a failure and not something to retry: fewer bytes
+	/// than asked for means `offset + delivered` is the length. An offset at or past the end
+	/// delivers zero bytes and succeeds - `not-found` is about the path, never about the window.
+	///
+	/// The service caps `length` at what one reply may carry; asking for more is answered with what
+	/// fits rather than refused, so a caller that streams by repeating this call cannot be stopped
+	/// by picking too large a chunk.
+	@op(21) read:            func(path: string, offset: u64, length: u32) -> result<buffer, error>;
+	/// Changes to a path, as they happen, until the caller closes the stream.
+	///
+	/// WHAT IT SEES is every mutation that passes through THIS service for the volume: writes,
+	/// removals, renames, truncations and timestamp updates, whether they arrive from this client
+	/// or another. What it does not see is a change made behind the service's back - a disk edited
+	/// by another system, a media swap - because nothing tells the service those happened. A
+	/// watcher is a notification of work this service did, not a promise about the medium.
+	///
+	/// The path may name a file or a directory. A directory watch reports the entries directly
+	/// below it, not the whole subtree, and reports the directory itself when it is removed.
+	///
+	/// Unlike `list` there is NO TERMINAL FRAME: a watch has no last event, so the stream ends when
+	/// one side closes it. A watcher that cannot keep up is dropped rather than buffered without
+	/// bound, and it learns that by its end of the stream closing - which is why an event stream
+	/// is a hint to re-read rather than a log to reconstruct state from.
+	@op(22) watch:           func(path: string) -> result<stream<file-event>, error>;
+	/// Open a transactional writer over one path, returned as a channel speaking `writer`.
+	///
+	/// NOTHING THE SESSION WRITES IS VISIBLE UNTIL `commit`. That is what makes it transactional
+	/// and what every safe-save, header-patching and `tee` client needs: a session that dies
+	/// halfway leaves the file exactly as it was, rather than truncated or half-written, because
+	/// the bytes were never published. Closing the channel without committing is an abort.
+	///
+	/// The staged file is held by the service and therefore BOUNDED by the same accumulation policy
+	/// a streamed write is - a session that grows past it fails on the write that crosses the line,
+	/// not silently at commit. A file too large for that is written with `write-stream`, which
+	/// gives up the transaction in exchange for having no ceiling of its own.
+	///
+	/// ONE SESSION PER PATH, and a second one is refused with `again`: two transactions over one
+	/// file publish in an order neither of them chose, and the loser's work disappears at the
+	/// moment it reports success.
+	@op(23) open-writer:     func(path: string, mode: writer-mode) -> result<handle<channel>, error>;
+}
+
+/// A transactional writer session over one path, reached through `volume.open-writer`.
+///
+/// The session stages bytes; `commit` publishes them as the file's whole contents and ends the
+/// session. Every op answers about the STAGED file, so a length reported here is what `commit`
+/// would publish, never what a reader would see now.
+interface writer {
+	/// Append `data` at the cursor and return the staged length. The cursor starts at zero for a
+	/// `replace` session and at the file's current length for an `append` one.
+	@op(1) write:    func(data: list<u8>) -> result<u64, error>;
+	/// Write `data` at `offset`, extending the staged file with zeros if it starts beyond the end -
+	/// the same zero-extension promise `volume.truncate` makes, for the same reason: a gap that
+	/// reads as whatever memory held is a leak with a length. The cursor is left after the bytes
+	/// written, so a positioned write followed by sequential ones continues from there.
+	@op(2) write-at: func(offset: u64, data: list<u8>) -> result<unit, error>;
+	/// Set the staged length - shorter drops the tail, longer zero-extends - and move the cursor
+	/// back if it is now past the end.
+	@op(3) truncate: func(length: u64) -> result<unit, error>;
+	/// Confirm what is staged, returning its length. It publishes NOTHING: there is no half-commit
+	/// in a transaction, and a client that wants its bytes on the medium commits. It exists so a
+	/// long session can check that the service still holds what the client thinks it wrote.
+	@op(4) flush:    func() -> result<u64, error>;
+	/// Publish the staged bytes as the file's contents and END the session. The channel stays open
+	/// and every later op on it fails: the transaction is over, and answering as though a new one
+	/// had begun would publish twice.
+	@op(5) commit:   func() -> result<u64, error>;
+	/// Discard everything staged and end the session, leaving the file untouched. Closing the
+	/// channel does the same; this exists so a client can say it meant to.
+	@op(6) abort:    func() -> result<unit, error>;
 }
 
 /// Privileged StorageService boundary that mints a client restricted to one directory

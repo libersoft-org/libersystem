@@ -29,6 +29,10 @@ enum capability {
 	display,
 	input-keys,
 	audio-stream,
+	/// The caller's SessionService client: its jobs, and the right to ask the session to signal
+	/// one. It does NOT carry the session's Process handles - `job-signal` acts on the session's
+	/// behalf precisely so a tool granted this cannot take them.
+	session,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

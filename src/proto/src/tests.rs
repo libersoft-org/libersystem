@@ -349,6 +349,45 @@ impl volume::Service for VolStub {
 		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 
+	// The seven P02M0101 ops. Each answers from its arguments alone, because what this stub proves
+	// is the CODEC: that the values a client sent arrive as themselves, and that a handle travelled
+	// out-of-band rather than through the byte stream.
+	fn stat(&mut self, path: String) -> Result<FileInfo, Error> {
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(FileInfo { name: String::from("stat"), size: 11, r#type: FileType::File, mtime: 3, ctime: 4 }) }
+	}
+
+	fn rename(&mut self, from: String, to: String) -> Result<(), Error> {
+		if from.is_empty() || to.is_empty() || from == to { Err(Error::Invalid) } else { Ok(()) }
+	}
+
+	fn truncate(&mut self, path: String, length: u64) -> Result<(), Error> {
+		if path.is_empty() || length > 1024 { Err(Error::Invalid) } else { Ok(()) }
+	}
+
+	fn touch(&mut self, path: String, create: bool, at: u64) -> Result<(), Error> {
+		if path.is_empty() || (!create && at == 0) { Err(Error::NotFound) } else { Ok(()) }
+	}
+
+	fn read(&mut self, path: String, offset: u64, length: u32) -> Result<crate::codec::Buffer, Error> {
+		// The window's length is echoed back as the buffer's, so a client that decodes a different
+		// number is decoding the wrong field; the handle proves the out-of-band path.
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(crate::codec::Buffer { handle: 0xCAFE, len: offset + length as u64 }) }
+	}
+
+	fn watch(&mut self, path: String) -> Result<Vec<FileEvent>, Error> {
+		if path.is_empty() { Err(Error::NotFound) } else { Ok(alloc::vec![FileEvent { path, kind: FileEventKind::Modified, size: 9 }]) }
+	}
+
+	fn open_writer(&mut self, path: String, mode: WriterMode) -> Result<u64, Error> {
+		// The mode is a value the caller chose, and answering with a different handle for each is
+		// what proves it survived the wire.
+		match (path.is_empty(), mode) {
+			(true, _) => Err(Error::NotFound),
+			(false, WriterMode::Replace) => Ok(0x0BAD_0001),
+			(false, WriterMode::Append) => Ok(0x0BAD_0002),
+		}
+	}
+
 	fn snap_create(&mut self, name: String) -> Result<(), Error> {
 		if name.is_empty() { Err(Error::Invalid) } else { Ok(()) }
 	}

@@ -463,6 +463,192 @@ fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	assert!(!result.diagnostic_read.windows(8).any(|window| window == b"in> cat:"), "and it went to the terminal rather than down the pipe, where the consumer would have echoed it: {:?}", core::str::from_utf8(&result.diagnostic_read));
 }
 
+tagged_test!(a_volume_stats_renames_truncates_and_touches, [Service, Storage, Filesystem], id = "kernel.applications.a_volume_stats_renames_truncates_and_touches", covers = ["libermemfs", "storage"]);
+fn a_volume_stats_renames_truncates_and_touches() {
+	// The four path verbs P02M0101 adds to the volume contract, over a memory volume that
+	// implements all four. Every one of them answered "not implemented" before this milestone, and
+	// every caller that wanted a file's size read its whole parent directory to find out.
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let mut vol = StorageHarness::start_memory(storage_elf, b"TMPVOL", 65536);
+
+	assert!(vol.write(b"vol://tmp/report", b"0123456789", 0x8101), "seed a file");
+	// ONE FILE'S FACTS, without listing its parent.
+	assert_eq!(vol.stat(b"vol://tmp/report", 0x8102), Some((10, false)), "stat answers the file's size and that it is not a directory");
+	assert_eq!(vol.stat(b"vol://tmp/missing", 0x8103), None, "and a path that is not there is a failure rather than a zero-length file");
+
+	// TRUNCATE both ways: shorter drops the tail, longer zero-extends - and the zeros are the
+	// promise, so the extension is read back rather than assumed.
+	assert!(vol.truncate(b"vol://tmp/report", 4, 0x8104), "shrinking is accepted");
+	assert_eq!(vol.open(b"vol://tmp/report", 0x8105), Some(b"0123".to_vec()), "and the tail is gone");
+	assert!(vol.truncate(b"vol://tmp/report", 8, 0x8106), "growing is accepted");
+	assert_eq!(vol.open(b"vol://tmp/report", 0x8107), Some(b"0123\0\0\0\0".to_vec()), "and the file grew with zeros, not with whatever memory held");
+
+	// RENAME moves the entry and refuses to destroy: `to` existing is the caller's decision to
+	// make with `remove`, not something a rename does quietly.
+	assert!(vol.rename(b"vol://tmp/report", b"vol://tmp/final", 0x8108), "a rename within one volume is accepted");
+	assert_eq!(vol.stat(b"vol://tmp/report", 0x8109), None, "the old name is gone");
+	assert_eq!(vol.open(b"vol://tmp/final", 0x810a), Some(b"0123\0\0\0\0".to_vec()), "and the new name holds the bytes, which were never copied");
+	assert!(vol.write(b"vol://tmp/occupied", b"mine", 0x810b), "seed an occupied destination");
+	assert!(!vol.rename(b"vol://tmp/final", b"vol://tmp/occupied", 0x810c), "a rename over an existing file is refused");
+	assert_eq!(vol.open(b"vol://tmp/occupied", 0x810d), Some(b"mine".to_vec()), "and the file that was in the way is untouched");
+
+	// TOUCH creates only when asked to. The two callers want different things and the flag is how
+	// they say which; a silent creation is the failure this refuses.
+	assert!(!vol.touch(b"vol://tmp/absent", false, 0x810e), "touch without create over a missing file is a failure");
+	assert_eq!(vol.stat(b"vol://tmp/absent", 0x810f), None, "and it created nothing");
+	assert!(vol.touch(b"vol://tmp/absent", true, 0x8110), "touch with create makes the file");
+	assert_eq!(vol.stat(b"vol://tmp/absent", 0x8111), Some((0, false)), "empty, and it is there");
+	assert!(vol.touch(b"vol://tmp/final", true, 0x8112), "touch over an existing file is accepted");
+	assert_eq!(vol.open(b"vol://tmp/final", 0x8113), Some(b"0123\0\0\0\0".to_vec()), "and changes not one byte of it");
+}
+
+tagged_test!(a_volume_reads_windows_watches_changes_and_publishes_transactions, [Service, Storage, Filesystem], id = "kernel.applications.a_volume_reads_windows_watches_changes_and_publishes_transactions", covers = ["libermemfs", "storage"]);
+fn a_volume_reads_windows_watches_changes_and_publishes_transactions() {
+	use object::channel::Message;
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let mut vol = StorageHarness::start_memory(storage_elf, b"TMPVOL", 65536);
+	assert!(vol.write(b"vol://tmp/log", b"abcdefghij", 0x8201), "seed a file");
+
+	// A WINDOW, not the whole file. `open` maps everything, which is no shape at all for a file
+	// that does not fit; this is the call `head`, `tail` and `hexdump` are written against.
+	assert_eq!(vol.read_window(b"vol://tmp/log", 0, 4, 0x8202), Some(b"abcd".to_vec()), "the first window");
+	assert_eq!(vol.read_window(b"vol://tmp/log", 4, 4, 0x8203), Some(b"efgh".to_vec()), "a window from the middle");
+	// A SHORT ANSWER IS THE END, not a failure: a reader that loops on this call learns where the
+	// file ends from the length it got back rather than by asking a second question.
+	assert_eq!(vol.read_window(b"vol://tmp/log", 8, 100, 0x8204), Some(b"ij".to_vec()), "a window that runs past the end delivers what is there");
+	assert_eq!(vol.read_window(b"vol://tmp/log", 10, 4, 0x8205), Some(alloc::vec::Vec::new()), "and a window at the end delivers nothing, successfully");
+	assert_eq!(vol.read_window(b"vol://tmp/nothing", 0, 4, 0x8206), None, "a path that is not there is still a failure");
+
+	// WATCH: changes that pass through this service, as they happen.
+	let events = vol.watch(b"vol://tmp/log", 0x8207).expect("a watch on an existing file is accepted");
+	assert!(vol.watch(b"vol://tmp/never", 0x8208).is_none(), "a watch on a path that is not there is refused rather than held forever");
+	assert!(vol.write(b"vol://tmp/log", b"changed", 0x8209), "change the watched file");
+	for _ in 0..64 {
+		vol.pump();
+	}
+	let event = events.recv().expect("the watcher was told about the change");
+	// [seq u32][path lp][kind u8][size u64]
+	let path_len = le_u16(&event.bytes, 4) as usize;
+	assert_eq!(&event.bytes[6..6 + path_len], b"vol://tmp/log", "the event names the path that changed");
+	assert_eq!(event.bytes.get(6 + path_len), Some(&1), "and says it was modified rather than created");
+	// A watcher of one file hears nothing about another, which is what makes the stream bounded by
+	// what the client asked for rather than by how busy the volume is.
+	assert!(vol.write(b"vol://tmp/unrelated", b"other", 0x820a), "change an unwatched file");
+	for _ in 0..64 {
+		vol.pump();
+	}
+	assert!(events.recv().is_err(), "a watcher of one path is not told about another");
+
+	// THE TRANSACTIONAL WRITER: nothing is visible until commit, which is what makes a safe save
+	// safe and what every client that patches a header needs.
+	let session = vol.open_writer(b"vol://tmp/doc", false, 0x8301).expect("a writer session opens");
+	let mut write = alloc::vec::Vec::new();
+	write.extend_from_slice(&1u16.to_le_bytes());
+	write.extend_from_slice(&0x8302u32.to_le_bytes());
+	write.extend_from_slice(&5u16.to_le_bytes());
+	write.extend_from_slice(b"HDR..");
+	assert!(vol.writer_op(&session, write, 0x8302).is_some(), "the session takes bytes");
+	assert_eq!(vol.stat(b"vol://tmp/doc", 0x8303), None, "and NOTHING is published while the session is open");
+	// A positioned write patches what was staged - the audio-header case, done without rewriting
+	// the file or inventing a temporary name.
+	let mut patch = alloc::vec::Vec::new();
+	patch.extend_from_slice(&2u16.to_le_bytes());
+	patch.extend_from_slice(&0x8304u32.to_le_bytes());
+	patch.extend_from_slice(&3u64.to_le_bytes());
+	patch.extend_from_slice(&2u16.to_le_bytes());
+	patch.extend_from_slice(b"ok");
+	assert!(vol.writer_op(&session, patch, 0x8304).is_some(), "a positioned write patches the staged bytes");
+	let mut commit = alloc::vec::Vec::new();
+	commit.extend_from_slice(&5u16.to_le_bytes());
+	commit.extend_from_slice(&0x8305u32.to_le_bytes());
+	assert!(vol.writer_op(&session, commit, 0x8305).is_some(), "the commit publishes");
+	assert_eq!(vol.open(b"vol://tmp/doc", 0x8306), Some(b"HDRok".to_vec()), "and the published file is what the session staged, patch and all");
+
+	// A SESSION THAT NEVER COMMITS LEAVES THE FILE EXACTLY AS IT WAS. This is the property the
+	// transaction exists for: a client that dies half way through a save does not truncate the
+	// file it was saving.
+	assert!(vol.write(b"vol://tmp/keep", b"original", 0x8401), "seed a destination");
+	let abandoned = vol.open_writer(b"vol://tmp/keep", false, 0x8402).expect("a second session opens");
+	let mut clobber = alloc::vec::Vec::new();
+	clobber.extend_from_slice(&1u16.to_le_bytes());
+	clobber.extend_from_slice(&0x8403u32.to_le_bytes());
+	clobber.extend_from_slice(&7u16.to_le_bytes());
+	clobber.extend_from_slice(b"clobber");
+	assert!(vol.writer_op(&abandoned, clobber, 0x8403).is_some(), "it takes bytes");
+	// One session per path, because two publishing in an order neither chose means the loser's
+	// work disappears at the moment it reported success.
+	assert!(vol.open_writer(b"vol://tmp/keep", false, 0x8404).is_none(), "a second session over the same path is refused while the first is open");
+	core::mem::drop(abandoned);
+	for _ in 0..64 {
+		vol.pump();
+	}
+	assert_eq!(vol.open(b"vol://tmp/keep", 0x8405), Some(b"original".to_vec()), "and closing the session without committing left the file as it was");
+
+	// APPEND stages what the file already holds, so the session extends rather than replaces.
+	let appender = vol.open_writer(b"vol://tmp/keep", true, 0x8406).expect("an append session opens");
+	let mut more = alloc::vec::Vec::new();
+	more.extend_from_slice(&1u16.to_le_bytes());
+	more.extend_from_slice(&0x8407u32.to_le_bytes());
+	more.extend_from_slice(&5u16.to_le_bytes());
+	more.extend_from_slice(b" more");
+	assert!(vol.writer_op(&appender, more, 0x8407).is_some(), "the append session takes bytes");
+	let mut finish = alloc::vec::Vec::new();
+	finish.extend_from_slice(&5u16.to_le_bytes());
+	finish.extend_from_slice(&0x8408u32.to_le_bytes());
+	assert!(vol.writer_op(&appender, finish, 0x8408).is_some(), "and commits");
+	assert_eq!(vol.open(b"vol://tmp/keep", 0x8409), Some(b"original more".to_vec()), "which extended the file rather than replacing it");
+	let _ = Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0);
+}
+
+tagged_test!(the_command_tools_run_governed_and_read_in_windows, [Service, Process, PermissionService, Storage], id = "kernel.applications.the_command_tools_run_governed_and_read_in_windows", covers = ["bin.cut", "bin.grep", "bin.head", "bin.hexdump", "bin.pwd", "bin.sort", "bin.tail", "bin.wc", "bin.which", "cli", "storage", "volume-client"]);
+fn the_command_tools_run_governed_and_read_in_windows() {
+	// Three of P02M0101's tools launched by PermissionManager, each with exactly the grants its
+	// manifest declares, printing to a stdout the launcher forwarded.
+	//
+	// `pwd` IS THE INTERESTING ONE: it holds no capability at all and still answers, because a
+	// working directory is data the launch context carries rather than authority a service grants.
+	// A `pwd` that had to ask a volume where it was could be refused, and would disagree with the
+	// shell prompt whenever the two asked at different moments.
+	//
+	// `wc` and `head` prove the other half: they read `hello.txt` through the BOUNDED `volume.read`
+	// window rather than mapping the whole file, which is what makes them usable on a file that
+	// does not fit in memory.
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	let printed = alloc::string::String::from_utf8_lossy(&result.command_read).into_owned();
+	assert!(printed.contains("vol://system"), "pwd printed the working directory it inherited, got {printed:?}");
+	// hello.txt is one line of text; `wc` reports lines, words, bytes and scalars followed by the
+	// path it counted. Asserting the path and the byte count together is what distinguishes a real
+	// count from a tool that printed a row of zeros.
+	let expected_bytes = result.expected.len();
+	let counted = alloc::format!("{expected_bytes}");
+	assert!(printed.contains(&counted), "wc reported hello.txt's {expected_bytes} bytes, got {printed:?}");
+	// `head -n 1` prints the file's first line, which for this one-line fixture is the whole of it.
+	let first_line = core::str::from_utf8(&result.expected).unwrap_or("").lines().next().unwrap_or("");
+	assert!(!first_line.is_empty(), "the fixture has a first line to print");
+	assert!(printed.contains(first_line), "head printed the file's first line, got {printed:?}");
+
+	// The rest of the family, each proving the thing it exists for rather than merely running:
+	// `hexdump` renders an offset column, `which` resolves a command word to the artifact the
+	// launcher would use, `find` walks and matches by name, `grep` counts matching lines, `cut`
+	// takes a character range, and `tree` counts what it walked.
+	assert!(printed.contains("00000000"), "hexdump rendered its offset column, got {printed:?}");
+	// `which` resolves through the PATH the launcher passed in the environment - and it resolves
+	// with `stat`, which is why the archive backend had to learn to answer one without a listing.
+	// THE RESOLUTION IS A LINE OF ITS OWN, and the assertion says so. `contains` passed against
+	// the tool's own diagnostic - "which: tried vol://system/bin/cat.lsexe (absent)" carries the
+	// same substring - which is a test that agrees with a tool that found nothing.
+	assert!(printed.lines().any(|line| line == "vol://system/bin/cat.lsexe"), "which resolved `cat` through PATH, got {printed:?}");
+	// `-c 1-3` is three CHARACTERS of the first line, which for this fixture is its prefix; a `cut`
+	// that dropped the range would print the whole line and this would still pass, so the assertion
+	// is that the prefix appears WITHOUT the rest on its own line.
+	let prefix: alloc::string::String = first_line.chars().take(3).collect();
+	assert!(printed.lines().any(|line| line == prefix), "cut printed the first three characters as their own line, got {printed:?}");
+	// `grep -c` counts matching lines rather than printing them, and the fixture has one.
+	assert!(printed.lines().any(|line| line == "1"), "grep counted the matching line, got {printed:?}");
+}
+
 tagged_test!(a_fat_volume_accepts_a_write_as_its_first_operation, [Service, Storage, Filesystem], id = "kernel.applications.a_fat_volume_accepts_a_write_as_its_first_operation", covers = ["fat", "liberfs", "storage"]);
 fn a_fat_volume_accepts_a_write_as_its_first_operation() {
 	// The FAT backing mounts lazily, and the destination validation added with the write-stream

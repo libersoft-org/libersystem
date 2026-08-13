@@ -54,6 +54,20 @@ pub fn launch_candidates(command: &str) -> Option<Vec<String>> {
 	(!candidates.is_empty()).then_some(candidates)
 }
 
+/// The directories a search path names, in order.
+///
+/// SEMICOLONS, not colons. A `vol://` URI contains a colon, so a colon-separated PATH cannot
+/// express one directory - `vol://system/bin` splits into `vol` and `//system/bin`, and a `which`
+/// written against the Unix convention searched exactly those two. The separator is a property of
+/// what the entries look like, and here they look like URIs.
+///
+/// Empty entries are dropped rather than treated as "the current directory": a working directory
+/// is not a place to find programs, and the empty-means-cwd convention is how a path picked up a
+/// program nobody meant to run.
+pub fn path_entries(search: &str) -> impl Iterator<Item = &str> {
+	search.split(';').map(str::trim).filter(|entry| !entry.is_empty())
+}
+
 pub fn lookup_identity(command: &str) -> Option<&str> {
 	if let Some((_, basename)) = explicit_path(command) {
 		return logical_name(basename);

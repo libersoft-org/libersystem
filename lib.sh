@@ -99,6 +99,11 @@ for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do TOOL_WAVE
 for tool in date log config set lsdev lsusb lssvc usage ps run perm start stop beep; do TOOL_WAVES[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss; do TOOL_WAVES[$tool]=4; done
 for tool in imgview imgconv audioconv play graphics_probe lico licoedit licoview; do TOOL_WAVES[$tool]=5; done
+# Wave 6: the P02M0101 command family. They are their own wave because they share a shape - the
+# bounded window read, the shared parsers, the volume bundle - so a regression in that shape shows
+# as a wave rather than as one tool, and because measuring them beside the image and audio tools
+# would mix a kilobyte of argument parsing with a megabyte of codec.
+for tool in pwd clear which wc head tail hexdump touch truncate tree find grep cp mv sort cut kill; do TOOL_WAVES[$tool]=6; done
 unset tool
 
 declare -A WAVE_TAGS=()
@@ -107,6 +112,7 @@ WAVE_TAGS[2]='service,process,storage'
 WAVE_TAGS[3]='service,process,storage'
 WAVE_TAGS[4]='service,process'
 WAVE_TAGS[5]='image,audio,service,process,storage'
+WAVE_TAGS[6]='service,process,storage,permission-service'
 
 # Which part of the tree a change is verified with is NOT answered here any more.
 #

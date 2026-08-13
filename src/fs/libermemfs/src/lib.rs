@@ -1500,6 +1500,120 @@ impl LiberMemFs {
 		insert(children, name, Node::Directory(Children::new()))
 	}
 
+	// Move a file's entry from one name to another, contents and all.
+	//
+	// THE BYTES NEVER MOVE: the node is taken out of one directory and put into another, so a
+	// rename costs the two names and nothing else. That is what makes it atomic here as well as on
+	// the disk - there is no window in which the file exists half-way, because the only mutation is
+	// one table's entries.
+	//
+	// An EXISTING destination is refused, and a CLAIMED source or destination with it: a name an
+	// open stream is filling is spoken for, and moving it out from under the stream is the same
+	// defect `remove` refuses.
+	pub fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), FsError> {
+		let (source_parts, source_count) = Self::segments(from)?;
+		let source_parts = &source_parts[..source_count];
+		let source_name = *source_parts.last().ok_or(FsError::BadName)?;
+		let (destination_parts, destination_count) = Self::segments(to)?;
+		let destination_parts = &destination_parts[..destination_count];
+		let destination_name = *destination_parts.last().ok_or(FsError::BadName)?;
+		if source_parts == destination_parts {
+			return Ok(());
+		}
+		// EVERYTHING THAT CAN REFUSE, FIRST. The source has to be an ordinary file, the
+		// destination has to be free, and the destination's parent has to exist - all asked
+		// before the entry is taken out of the tree, because putting it back is a second failure
+		// with nowhere to report it.
+		match self.resolve(source_parts)? {
+			Some(Node::File(_)) => {}
+			Some(Node::Directory(_)) => return Err(FsError::IsDir),
+			Some(Node::Claimed(_)) => return Err(FsError::Exists),
+			None => return Err(FsError::NotFound),
+		}
+		if self.resolve(destination_parts)?.is_some() {
+			return Err(FsError::Exists);
+		}
+		let mut owned = String::new();
+		owned.try_reserve_exact(destination_name.len()).map_err(|_| FsError::NoSpace)?;
+		owned.push_str(destination_name);
+		// The destination's table may have to grow by one, and that growth can be refused - so it
+		// is done while the file is still where it was. `insert` reserves before it inserts, and
+		// the entry it would displace was ruled out above.
+		{
+			let children = self.parent_mut(destination_parts)?;
+			children.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+		}
+		let node = {
+			let children = self.parent_mut(source_parts)?;
+			remove(children, source_name).ok_or(FsError::NotFound)?
+		};
+		let children = self.parent_mut(destination_parts)?;
+		insert(children, owned, node)?;
+		self.resync_reservation();
+		Ok(())
+	}
+
+	// Set a file's length: shorter drops the tail, longer extends with ZEROS.
+	//
+	// The zeros are the promise, not a side effect of how the buffer grows: a file extended this
+	// way reads as zeros rather than as whatever the allocator last held there.
+	pub fn truncate(&mut self, path: &[u8], length: u64) -> Result<(), FsError> {
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		let name = *parts.last().ok_or(FsError::BadName)?;
+		let want = usize::try_from(length).map_err(|_| FsError::NoSpace)?;
+		let have: usize = match self.resolve(parts)? {
+			Some(Node::File(bytes)) => bytes.len(),
+			Some(Node::Directory(_)) => return Err(FsError::IsDir),
+			Some(Node::Claimed(_)) => return Err(FsError::Exists),
+			None => return Err(FsError::NotFound),
+		};
+		// GROWING IS AN ALLOCATION and is charged like one: a volume with no room for the
+		// zero-extension refuses it rather than growing past its capacity.
+		if want > have {
+			if self.footprint() as usize + (want - have) > self.capacity {
+				return Err(FsError::NoSpace);
+			}
+			if self.policy == Policy::Reserved {
+				self.release_reservation();
+			}
+		}
+		{
+			let children = self.parent_mut(parts)?;
+			match find_mut(children, name) {
+				Some(Node::File(bytes)) => {
+					if want > bytes.len() {
+						bytes.try_reserve_exact(want - bytes.len()).map_err(|_| FsError::NoSpace)?;
+					}
+					bytes.resize(want, 0);
+					if want < have {
+						bytes.shrink_to_fit();
+					}
+				}
+				_ => return Err(FsError::NotFound),
+			}
+		}
+		self.resync_reservation();
+		Ok(())
+	}
+
+	// Create an empty file when asked and it is missing; otherwise leave the contents alone.
+	//
+	// This volume reports no timestamps - nothing here outlives the boot that made it - so there is
+	// no mtime to stamp and `touch` over an existing file is a no-op that says the file is there.
+	// Answering `invalid` instead would tell a caller the volume cannot do it, which is not true.
+	pub fn touch(&mut self, path: &[u8], create: bool) -> Result<(), FsError> {
+		let (parts, count) = Self::segments(path)?;
+		let parts = &parts[..count];
+		match self.resolve(parts)? {
+			Some(Node::File(_)) => Ok(()),
+			Some(Node::Directory(_)) => Err(FsError::IsDir),
+			Some(Node::Claimed(_)) => Err(FsError::Exists),
+			None if create => self.write_file(path, &[]),
+			None => Err(FsError::NotFound),
+		}
+	}
+
 	pub fn remove(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let (parts, count) = Self::segments(path)?;
 		let parts = &parts[..count];

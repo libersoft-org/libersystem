@@ -9,3 +9,11 @@ fn job_info_wire_is_stable() {
 	assert_eq!(bytes, golden);
 	assert_eq!(JobInfo::decode(&bytes).unwrap(), sample);
 }
+#[test]
+fn job_signal_kind_wire_is_stable() {
+	let sample = JobSignalKind::Term;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(JobSignalKind::decode(&bytes).unwrap(), sample);
+}

@@ -1,0 +1,4 @@
+[package]
+name = "cli"
+edition = "2024"
+description = "Bounded argument, glob and streaming primitives shared by the command-line tools"

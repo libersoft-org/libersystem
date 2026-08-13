@@ -31,7 +31,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::session::{self, Service};
-use proto::system::{EnvVar, Error, JobEntry, JobInfo};
+use proto::system::{EnvVar, Error, JobEntry, JobInfo, JobSignalKind};
 use rt::*;
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
@@ -148,6 +148,48 @@ impl Service for Session {
 				}
 			}
 			self.jobs[pos].stopped = false;
+		}
+		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped, group: self.jobs[pos].group })
+	}
+
+	// Signal a job this session owns, without handing its Process handle to the caller.
+	//
+	// THE HANDLE NEVER LEAVES. `job-take` exists for the shell that is foregrounding a job and
+	// needs to drive it; a tool that wants a job stopped does not need that authority, and this op
+	// is what lets it ask without being given it.
+	//
+	// The job is left in the table whatever the signal does. A terminated one is removed by the
+	// next `job-reap`, which is where every other exit is noticed too - discovering it here would
+	// give termination two paths and let them disagree about when a job is gone.
+	fn job_signal(&mut self, id: u32, signal: JobSignalKind) -> Result<JobInfo, Error> {
+		let pos: usize = self.jobs.iter().position(|j: &Job| j.id == id).ok_or(Error::NotFound)?;
+		let number: u64 = match signal {
+			JobSignalKind::Term => SIG_TERM,
+			JobSignalKind::Kill => SIG_KILL,
+			JobSignalKind::Interrupt => SIG_INT,
+			JobSignalKind::Stop => SIG_STOP,
+			JobSignalKind::Cont => SIG_CONT,
+		};
+		// `signal` names the runtime call below as well as this op's argument, and the argument
+		// wins inside the function - so the call is named through the crate root rather than
+		// renaming the parameter, which is what the schema calls it.
+		use rt::signal as send_signal;
+		// A group signals every live stage; a single process signals itself. Sending the process
+		// signal to a group handle is refused, which is how `job-resume` learned the difference.
+		unsafe {
+			if self.jobs[pos].group {
+				process_group_signal(self.jobs[pos].proc, number);
+			} else {
+				send_signal(self.jobs[pos].proc, number);
+			}
+		}
+		// The session's idea of the job's state, updated to what the signal asked for: a stop
+		// suspends it and a continue resumes it, and the two terminating signals leave the flag
+		// alone because the job is about to be reaped rather than suspended.
+		match signal {
+			JobSignalKind::Stop => self.jobs[pos].stopped = true,
+			JobSignalKind::Cont => self.jobs[pos].stopped = false,
+			_ => {}
 		}
 		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped, group: self.jobs[pos].group })
 	}

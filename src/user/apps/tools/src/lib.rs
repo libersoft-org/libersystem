@@ -15,7 +15,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lico::TerminalWriter;
-use proto::system::{Error, FileInfo, OpenOpts, volume};
+use proto::system::{Error, FileInfo, FileType, OpenOpts, volume};
 use rt::{ReceivedVecCaps, close, map_object, recv_tagged, recv_vec_caps_blocking, send_blocking, unmap_object};
 use storage_proto::path;
 use volume_client::VolumeClient;
@@ -206,7 +206,195 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 	}
 }
 
+/// Read one bounded window of a file through a granted volume client.
+///
+/// The window is what makes a tool bounded: `read_volume_file` maps the whole file, which is right
+/// for a configuration file and wrong for a log. A short answer is the end of the file - see the
+/// contract at `volume.read` - so a caller streams by repeating this until it gets nothing.
+#[inline(always)]
+pub unsafe fn read_volume_window(storage: u64, path: &str, offset: u64, length: u32) -> Result<Vec<u8>, ReadFileError> {
+	unsafe {
+		if storage == 0 {
+			return Err(ReadFileError::Unavailable);
+		}
+		let mut client = VolumeClient::new(storage);
+		let buffer = match client.read(path, offset, length) {
+			Some(Ok(buffer)) => buffer,
+			_ => return Err(ReadFileError::NotFound),
+		};
+		let length = match usize::try_from(buffer.len) {
+			Ok(length) => length,
+			Err(_) => {
+				close(buffer.handle);
+				return Err(ReadFileError::TooLarge);
+			}
+		};
+		if length == 0 {
+			// A zero-length window still carries a capability, and closing it is the caller's only
+			// chance to: nothing else knows it exists.
+			if buffer.handle != 0 {
+				close(buffer.handle);
+			}
+			return Ok(Vec::new());
+		}
+		let address = match map_object(buffer.handle) {
+			Some(address) => address,
+			None => {
+				close(buffer.handle);
+				return Err(ReadFileError::MapFailed);
+			}
+		};
+		let mut bytes = Vec::new();
+		if bytes.try_reserve_exact(length).is_err() {
+			unmap_object(buffer.handle);
+			close(buffer.handle);
+			return Err(ReadFileError::OutOfMemory);
+		}
+		bytes.extend_from_slice(core::slice::from_raw_parts(address as *const u8, length));
+		unmap_object(buffer.handle);
+		close(buffer.handle);
+		Ok(bytes)
+	}
+}
+
+/// A file on a volume, read a window at a time - the `ChunkSource` every streaming tool consumes.
+///
+/// It holds ONE chunk, so the memory a tool spends on its input is the chunk size whatever the
+/// file's size is. That is the whole difference between `wc` on a log and `wc` on a log that does
+/// not fit.
+pub struct VolumeSource {
+	storage: u64,
+	path: String,
+	offset: u64,
+	chunk: u32,
+	held: Vec<u8>,
+}
+
+impl VolumeSource {
+	#[inline(always)]
+	pub fn new(storage: u64, path: &str, chunk: u32) -> VolumeSource {
+		VolumeSource { storage, path: String::from(path), offset: 0, chunk: chunk.max(1), held: Vec::new() }
+	}
+
+	/// Start reading from `offset` rather than from the beginning - what `tail` and `hexdump` do
+	/// once they know where the part they want begins.
+	#[inline(always)]
+	pub fn seek(&mut self, offset: u64) {
+		self.offset = offset;
+	}
+
+	/// How far the source has read, which is where the next window starts.
+	#[inline(always)]
+	pub fn position(&self) -> u64 {
+		self.offset
+	}
+}
+
+impl cli::ChunkSource for VolumeSource {
+	#[inline(always)]
+	fn next_chunk(&mut self) -> Result<&[u8], cli::ChunkError> {
+		match unsafe { read_volume_window(self.storage, &self.path, self.offset, self.chunk) } {
+			Ok(bytes) => {
+				self.offset = self.offset.saturating_add(bytes.len() as u64);
+				self.held = bytes;
+				Ok(&self.held)
+			}
+			Err(ReadFileError::Unavailable) => Err(cli::ChunkError::Unavailable),
+			Err(ReadFileError::OutOfMemory) => Err(cli::ChunkError::OutOfMemory),
+			Err(_) => Err(cli::ChunkError::Unavailable),
+		}
+	}
+}
+
+/// One entry a walk visited: its full `vol://` path, its facts, and how deep below the root it is.
+pub struct Visit<'a> {
+	pub path: &'a str,
+	pub entry: &'a FileInfo,
+	pub depth: usize,
+}
+
+/// What a walk's visitor decides about a directory it was shown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Step {
+	/// Keep walking, descending into this entry if it is a directory.
+	Continue,
+	/// Do not descend into this directory, but keep walking the rest.
+	Skip,
+	/// Stop the walk. What has been visited stays visited.
+	Stop,
+}
+
+/// Why a walk ended other than by finishing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WalkError {
+	/// A directory could not be listed. The walk goes on - one unreadable directory in a tree is
+	/// not a reason to abandon the tree - and this is what the caller is told at the end.
+	Unreadable,
+	/// The tree is deeper or wider than the bounds allowed.
+	Bounded,
+	OutOfMemory,
+}
+
+/// Walk a directory tree ITERATIVELY, one listing at a time, calling `visit` for every entry.
+///
+/// ITERATIVE and not recursive, with an explicit frontier: a recursive walker's depth is the
+/// tree's depth, and a tree's depth is decided by whoever made the directories. `max_depth` bounds
+/// how far it descends and `max_pending` bounds how many directories it may owe itself - so a wide
+/// tree costs memory proportional to one level rather than to the whole of it.
+///
+/// The visitor is called for EVERY entry, files and directories alike, before the directory is
+/// descended into - so a caller can print a tree as it is discovered rather than after.
+#[inline(always)]
+pub unsafe fn walk<F: FnMut(Visit<'_>) -> Step>(storage: u64, root: &str, max_depth: usize, max_pending: usize, limit: usize, mut visit: F) -> Result<(), WalkError> {
+	let mut pending: Vec<(String, usize)> = Vec::new();
+	if pending.try_reserve(1).is_err() {
+		return Err(WalkError::OutOfMemory);
+	}
+	pending.push((String::from(root), 0));
+	let mut unreadable = false;
+	while let Some((directory, depth)) = pending.pop() {
+		let entries = match unsafe { list_volume_directory(storage, &directory, limit) } {
+			Ok(entries) => entries,
+			// One directory that cannot be read does not end the walk: a tree with a permission
+			// hole in it is still worth walking, and the hole is reported once at the end.
+			Err(ListDirectoryError::OutOfMemory) => return Err(WalkError::OutOfMemory),
+			Err(_) => {
+				unreadable = true;
+				continue;
+			}
+		};
+		for entry in &entries {
+			let mut child = String::new();
+			if child.try_reserve_exact(directory.len() + 1 + entry.name.len()).is_err() {
+				return Err(WalkError::OutOfMemory);
+			}
+			child.push_str(&directory);
+			if !child.ends_with('/') {
+				child.push('/');
+			}
+			child.push_str(&entry.name);
+			match visit(Visit { path: &child, entry, depth }) {
+				Step::Stop => return if unreadable { Err(WalkError::Unreadable) } else { Ok(()) },
+				Step::Skip => continue,
+				Step::Continue => {}
+			}
+			if entry.r#type != FileType::Dir || depth + 1 > max_depth {
+				continue;
+			}
+			if pending.len() >= max_pending {
+				return Err(WalkError::Bounded);
+			}
+			if pending.try_reserve(1).is_err() {
+				return Err(WalkError::OutOfMemory);
+			}
+			pending.push((child, depth + 1));
+		}
+	}
+	if unreadable { Err(WalkError::Unreadable) } else { Ok(()) }
+}
+
 // Drop leading and trailing ASCII whitespace from a byte slice.
+#[inline(always)]
 pub fn trim(s: &[u8]) -> &[u8] {
 	let mut start: usize = 0;
 	let mut end: usize = s.len();
@@ -221,11 +409,13 @@ pub fn trim(s: &[u8]) -> &[u8] {
 
 // Iterate the space-separated, non-empty words of an argument string - the shared
 // tokenizer behind the tools that scan their arguments word by word.
+#[inline(always)]
 pub fn split_args(s: &[u8]) -> impl Iterator<Item = &[u8]> {
 	s.split(|&b| b == b' ').filter(|t: &&[u8]| !t.is_empty())
 }
 
 // Parse an unsigned decimal integer, or None if empty, non-digit, or it overflows u64.
+#[inline(always)]
 pub fn parse_u64(s: &[u8]) -> Option<u64> {
 	if s.is_empty() {
 		return None;
@@ -241,6 +431,7 @@ pub fn parse_u64(s: &[u8]) -> Option<u64> {
 }
 
 // Parse a decimal port number (0-65535), or None if malformed or out of range.
+#[inline(always)]
 pub fn parse_port(s: &[u8]) -> Option<u16> {
 	if s.len() > 5 {
 		return None;
@@ -253,6 +444,7 @@ pub fn parse_port(s: &[u8]) -> Option<u16> {
 
 // Append a decimal number to `out` - the digit formatter the tools use when building
 // JSON documents and human-readable sizes.
+#[inline(always)]
 pub fn push_decimal(out: &mut String, value: u64) {
 	let mut digits: [u8; 20] = [0u8; 20];
 	let mut v: u64 = value;

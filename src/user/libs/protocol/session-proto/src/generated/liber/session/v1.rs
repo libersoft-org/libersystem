@@ -165,6 +165,79 @@ impl JobEntry {
 /// `env-unset` removes one, and `env-list` enumerates them all. `PATH` is seeded with a
 /// default. The shell manages these on the user's behalf (`name=value`, `env`, `unset`,
 /// `$name` expansion) and the values persist in the session across a shell restart.
+/// The signals a session will deliver to a job it owns.
+///
+/// A NAMED SET, not a number: `kill -9` is a number whose meaning is a convention, and a caller
+/// that mistypes it signals something else. These five are the dispositions the kernel implements -
+/// terminate, terminate immediately, interrupt, suspend, resume - and a session refuses anything
+/// else because there is nothing else it could honestly do with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JobSignalKind {
+	/// Ask the job to stop. The kernel's default disposition terminates it.
+	Term = 0,
+	/// Terminate it without asking.
+	Kill = 1,
+	/// The interrupt Ctrl+C sends.
+	Interrupt = 2,
+	/// Suspend it, as Ctrl+Z does.
+	Stop = 3,
+	/// Resume a suspended one.
+	Cont = 4,
+}
+
+impl JobSignalKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
+		Some(w.into_inner())
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
+	pub fn decode(bytes: &[u8]) -> Option<JobSignalKind> {
+		let mut r = Reader::new(bytes);
+		let value = JobSignalKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<JobSignalKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = JobSignalKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<JobSignalKind> {
+		match r.u8()? {
+			0 => Some(JobSignalKind::Term),
+			1 => Some(JobSignalKind::Kill),
+			2 => Some(JobSignalKind::Interrupt),
+			3 => Some(JobSignalKind::Stop),
+			4 => Some(JobSignalKind::Cont),
+			_ => None,
+		}
+	}
+}
+
 // interface `session` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod session {
 	use super::*;
@@ -182,6 +255,7 @@ pub mod session {
 	pub const OP_ENV_SET: u16 = 9;
 	pub const OP_ENV_UNSET: u16 = 10;
 	pub const OP_ENV_LIST: u16 = 11;
+	pub const OP_JOB_SIGNAL: u16 = 12;
 
 	pub trait Service {
 		fn cwd(&mut self) -> Result<String, Error>;
@@ -195,6 +269,21 @@ pub mod session {
 		fn env_set(&mut self, name: String, value: String) -> Result<(), Error>;
 		fn env_unset(&mut self, name: String) -> Result<(), Error>;
 		fn env_list(&mut self) -> Result<Vec<EnvVar>, Error>;
+		/// Signal a job this session owns, BY ID rather than by handle.
+		///
+		/// The point of the op is what it does NOT do: the caller never receives the Process handle, so
+		/// a tool that may ask for a job to be stopped is not thereby a tool that may do anything else
+		/// to it. `job-take` hands the handle over and is how a shell foregrounds a job; this asks the
+		/// owner to act and keeps the authority where the handle is.
+		///
+		/// A job that is not this session's is `not-found` - the same answer as one that never existed,
+		/// because "there is a job with that id and it is not yours" is a fact about someone else's
+		/// session that this one has no business confirming.
+		///
+		/// The reply says what the job LOOKS LIKE AFTERWARDS, so a caller can tell a suspension from a
+		/// termination without polling: a stopped job reports `stopped`, and a job that has exited is
+		/// reaped by the next `job-reap` like any other.
+		fn job_signal(&mut self, id: u32, signal: JobSignalKind) -> Result<JobInfo, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -640,6 +729,44 @@ pub mod session {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_JOB_SIGNAL => {
+				let id = r.u32()?;
+				let signal = JobSignalKind::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.job_signal(id, signal);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v25) => {
+							w.u8(1)?;
+							v25.write(w)?;
+						}
+						Err(v26) => {
+							w.u8(0)?;
+							v26.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -817,13 +944,13 @@ pub mod session {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v25 = r.u16()? as usize;
-						let mut v26 = Vec::new();
-						v26.try_reserve_exact(v25).ok()?;
-						for _ in 0..v25 {
-							v26.push(JobInfo::read(r)?);
+						let v27 = r.u16()? as usize;
+						let mut v28 = Vec::new();
+						v28.try_reserve_exact(v27).ok()?;
+						for _ in 0..v27 {
+							v28.push(JobInfo::read(r)?);
 						}
-						v26
+						v28
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -855,13 +982,13 @@ pub mod session {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v27 = r.u16()? as usize;
-						let mut v28 = Vec::new();
-						v28.try_reserve_exact(v27).ok()?;
-						for _ in 0..v27 {
-							v28.push(JobInfo::read(r)?);
+						let v29 = r.u16()? as usize;
+						let mut v30 = Vec::new();
+						v30.try_reserve_exact(v29).ok()?;
+						for _ in 0..v29 {
+							v30.push(JobInfo::read(r)?);
 						}
-						v28
+						v30
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1002,17 +1129,45 @@ pub mod session {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v29 = r.u16()? as usize;
-						let mut v30 = Vec::new();
-						v30.try_reserve_exact(v29).ok()?;
-						for _ in 0..v29 {
-							v30.push(EnvVar::read(r)?);
+						let v31 = r.u16()? as usize;
+						let mut v32 = Vec::new();
+						v32.try_reserve_exact(v31).ok()?;
+						for _ in 0..v31 {
+							v32.push(EnvVar::read(r)?);
 						}
-						v30
+						v32
 					})
 				} else {
 					Err(Error::read(r)?)
 				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn job_signal(&mut self, id: &u32, signal: &JobSignalKind) -> Option<Result<JobInfo, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_JOB_SIGNAL)?;
+			w.u32(corr)?;
+			w.u32(*id)?;
+			signal.write(w)?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(JobInfo::read(r)?) } else { Err(Error::read(r)?) };
 				r.finish()?;
 				Some(value)
 			})();
@@ -1110,6 +1265,14 @@ pub mod session {
 	fn channel_invoke_env_list(chan: u64) -> Option<Result<Vec<EnvVar>, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.env_list()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_session_session_job_signal")]
+	fn channel_invoke_job_signal(chan: u64, id: &u32, signal: &JobSignalKind) -> Option<Result<JobInfo, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.job_signal(id, signal)
 	}
 }
 
@@ -1228,6 +1391,51 @@ impl JobEntry {
 		self.info.to_cbor_into(out);
 		crate::codec::cbor::text(out, "proc");
 		crate::codec::cbor::uint(out, self.proc as u64);
+	}
+}
+
+impl JobSignalKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			JobSignalKind::Term => out.push_str("\"term\""),
+			JobSignalKind::Kill => out.push_str("\"kill\""),
+			JobSignalKind::Interrupt => out.push_str("\"interrupt\""),
+			JobSignalKind::Stop => out.push_str("\"stop\""),
+			JobSignalKind::Cont => out.push_str("\"cont\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			JobSignalKind::Term => out.push_str("term"),
+			JobSignalKind::Kill => out.push_str("kill"),
+			JobSignalKind::Interrupt => out.push_str("interrupt"),
+			JobSignalKind::Stop => out.push_str("stop"),
+			JobSignalKind::Cont => out.push_str("cont"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			JobSignalKind::Term => crate::codec::cbor::text(out, "term"),
+			JobSignalKind::Kill => crate::codec::cbor::text(out, "kill"),
+			JobSignalKind::Interrupt => crate::codec::cbor::text(out, "interrupt"),
+			JobSignalKind::Stop => crate::codec::cbor::text(out, "stop"),
+			JobSignalKind::Cont => crate::codec::cbor::text(out, "cont"),
+		}
 	}
 }
 

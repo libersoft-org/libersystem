@@ -4,6 +4,9 @@ record open-opts(path:string,write:bool,create:bool)
 record open-result(file:handle<file>,size:u64)
 enum file-type(file=0,dir=1)
 record file-info(name:string,size:u64,type:file-type,mtime:u64,ctime:u64)
+enum file-event-kind(created=0,modified=1,removed=2)
+record file-event(path:string,kind:file-event-kind,size:u64)
+enum writer-mode(replace=0,append=1)
 record snapshot-info(name:string,generation:u64)
 record volume-status(label:string,total-bytes:u64,free-bytes:u64,compression:bool,read-only:bool,filesystem:string)
 record fsck-report(checksum-failures:u32,damaged:list<string>)
@@ -27,6 +30,16 @@ method volume.write-stream op=16 (path:string:rights=,data:handle<channel>:right
 method volume.stat op=17 (path:string:rights=) -> result<file-info, liber:base@1::error>
 method volume.rename op=18 (from:string:rights=,to:string:rights=) -> result<unit, liber:base@1::error>
 method volume.truncate op=19 (path:string:rights=,length:u64:rights=) -> result<unit, liber:base@1::error>
-method volume.touch op=20 (path:string:rights=,create:bool:rights=) -> result<unit, liber:base@1::error>
+method volume.touch op=20 (path:string:rights=,create:bool:rights=,at:u64:rights=) -> result<unit, liber:base@1::error>
+method volume.read op=21 (path:string:rights=,offset:u64:rights=,length:u32:rights=) -> result<buffer, liber:base@1::error>
+method volume.watch op=22 (path:string:rights=) -> result<stream<file-event>, liber:base@1::error>
+method volume.open-writer op=23 (path:string:rights=,mode:writer-mode:rights=) -> result<handle<channel>, liber:base@1::error>
+interface writer
+method writer.write op=1 (data:list<u8>:rights=) -> result<u64, liber:base@1::error>
+method writer.write-at op=2 (offset:u64:rights=,data:list<u8>:rights=) -> result<unit, liber:base@1::error>
+method writer.truncate op=3 (length:u64:rights=) -> result<unit, liber:base@1::error>
+method writer.flush op=4 () -> result<u64, liber:base@1::error>
+method writer.commit op=5 () -> result<u64, liber:base@1::error>
+method writer.abort op=6 () -> result<unit, liber:base@1::error>
 interface volume-admin
 method volume-admin.open-directory op=1 (path:string:rights=) -> result<handle<channel>, liber:base@1::error>

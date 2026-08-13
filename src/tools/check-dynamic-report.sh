@@ -343,7 +343,7 @@ generate_report() {
 	printf 'wave\ttarget\ttool\tundefined_imports\timport_owners\tgeneric_residuals\tdeclared_providers\tdt_needed\ttransitive_providers\tobject_bytes\tpie_bytes\tprovider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
 	local target wave key provider_key image_provider_key tool candidate row providers artifact imports import_owners generic_residuals owner_record actual_needed declared transitive reversed_roots reversed_transitive object_bytes pie_bytes provider_bytes private_bytes shared_bytes provider provider_size provider_private provider_shared
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
-		for wave in 1 2 3 4 5; do
+		for wave in 1 2 3 4 5 6; do
 			key="$target|$wave"
 			for tool in $(for candidate in "${!TOOL_WAVES[@]}"; do if [[ "${TOOL_WAVES[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
 				row="$(jq -er --arg tool "$tool" '.programs[$tool] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | "dynamic \(.name) \(.owner) \(.stage) \(.providers | join(" "))"' <<<"$manifest_json")"
@@ -418,7 +418,7 @@ generate_wave_report() {
 	printf 'target\twave\ttools\tobject_bytes\tpie_bytes\tunique_provider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
 	local target wave key shared_bytes
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
-		for wave in 1 2 3 4 5; do
+		for wave in 1 2 3 4 5 6; do
 			key="$target|$wave"
 			shared_bytes=$((${wave_shared_executable_bytes[$key]} + ${wave_provider_shared_bytes[$key]}))
 			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "$wave" "${wave_tools_count[$key]}" "${wave_object_bytes[$key]}" "${wave_pie_bytes[$key]}" "${wave_provider_bytes[$key]}" "${wave_private_bytes[$key]}" "$shared_bytes" "./test.sh --tags ${WAVE_TAGS[$wave]}"
@@ -452,8 +452,8 @@ if [[ "$(wc -l <"$temporary")" != "$expected_report_lines" ]]; then
 	echo "dynamic-report: expected format, header and $((tool_count * target_count)) target/tool rows" >&2
 	exit 1
 fi
-if [[ "$(wc -l <"$wave_temporary")" != 17 ]]; then
-	echo "dynamic-report: expected format, header and 15 target/wave rows" >&2
+if [[ "$(wc -l <"$wave_temporary")" != 20 ]]; then
+	echo "dynamic-report: expected format, header and 18 target/wave rows" >&2
 	exit 1
 fi
 if [[ "$(wc -l <"$image_temporary")" != 5 ]]; then

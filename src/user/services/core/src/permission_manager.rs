@@ -165,6 +165,23 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"cat" => Some(granted("cat", alloc::vec![Capability::Volumes])),
 		b"write" => Some(granted("write", alloc::vec![Capability::Volumes])),
 		b"rm" => Some(granted("rm", alloc::vec![Capability::Volumes])),
+		b"pwd" => Some(granted("pwd", alloc::vec![])),
+		b"kill" => Some(granted("kill", alloc::vec![Capability::Session])),
+		b"sort" => Some(granted("sort", alloc::vec![Capability::Volumes])),
+		b"cut" => Some(granted("cut", alloc::vec![Capability::Volumes])),
+		b"tree" => Some(granted("tree", alloc::vec![Capability::Volumes])),
+		b"find" => Some(granted("find", alloc::vec![Capability::Volumes])),
+		b"grep" => Some(granted("grep", alloc::vec![Capability::Volumes])),
+		b"cp" => Some(granted("cp", alloc::vec![Capability::Volumes])),
+		b"mv" => Some(granted("mv", alloc::vec![Capability::Volumes])),
+		b"clear" => Some(granted("clear", alloc::vec![])),
+		b"which" => Some(granted("which", alloc::vec![Capability::Volumes])),
+		b"wc" => Some(granted("wc", alloc::vec![Capability::Volumes])),
+		b"head" => Some(granted("head", alloc::vec![Capability::Volumes])),
+		b"tail" => Some(granted("tail", alloc::vec![Capability::Volumes])),
+		b"hexdump" => Some(granted("hexdump", alloc::vec![Capability::Volumes])),
+		b"truncate" => Some(granted("truncate", alloc::vec![Capability::Volumes])),
+		b"touch" => Some(granted("touch", alloc::vec![Capability::Volumes, Capability::Time])),
 		b"ls" => Some(granted("ls", alloc::vec![Capability::Volumes])),
 		b"du" => Some(granted("du", alloc::vec![Capability::Volumes])),
 		b"mkdir" => Some(granted("mkdir", alloc::vec![Capability::Volumes])),
@@ -263,6 +280,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Display => b"DISPLAY",
 		Capability::InputKeys => b"INPUT_KEYS",
 		Capability::AudioStream => b"AUDIO_STREAM",
+		Capability::Session => b"SESSION",
 	}
 }
 
@@ -306,6 +324,9 @@ struct Clients {
 	display_admin: u64,
 	input_admin: u64,
 	audio_admin: u64,
+	// VT 1's SessionService client, granted to the governed `kill` command so it can ask the
+	// session to signal a job without ever holding the job's Process handle.
+	session: u64,
 }
 
 impl Clients {
@@ -318,6 +339,7 @@ impl Clients {
 			Capability::Device => self.device,
 			Capability::Config => self.config,
 			Capability::Time => self.time,
+			Capability::Session => self.session,
 			Capability::Audio => self.audio,
 			Capability::Input => self.input,
 			Capability::Graph => self.graph,
@@ -1054,6 +1076,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let log: u64 = caps.take(CAP_LOG);
 	let network: u64 = caps.take(CAP_NETWORK);
 	let time: u64 = caps.take(CAP_TIME);
+	// VT 1's SessionService client, for the governed `kill` command. Absent (0) in the harnesses
+	// that run no session service, where `kill` is simply not grantable.
+	let session: u64 = caps.take(CAP_SESSION);
 	let config: u64 = caps.take(CAP_CONFIG);
 	let device: u64 = caps.take(CAP_DEVICE);
 	let audio: u64 = caps.take(CAP_AUDIO);
@@ -1093,7 +1118,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, broker: bootstrap };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, broker: bootstrap };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") },
 		handle => handle,

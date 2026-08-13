@@ -118,10 +118,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bootproto"
+version = "0.0.0"
+
+[[package]]
 name = "bytemuck"
 version = "1.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6aedf8ae72766347502cf3cb4f41cf5e9cc37d28bee90f1fdaaae15f9cf9424"
+
+[[package]]
+name = "cli"
+version = "0.0.0"
 
 [[package]]
 name = "config-client"
@@ -596,6 +604,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "service-logic"
+version = "0.0.0"
+dependencies = [
+ "abi",
+ "bootproto",
+]
+
+[[package]]
+name = "session-client"
+version = "0.0.0"
+dependencies = [
+ "base-proto",
+ "session-proto",
+]
+
+[[package]]
+name = "session-client-provider"
+version = "0.0.0"
+dependencies = [
+ "session-proto",
+]
+
+[[package]]
 name = "session-proto"
 version = "0.0.0"
 dependencies = [
@@ -681,6 +712,7 @@ dependencies = [
  "audio-client-provider",
  "audioconv",
  "bmp",
+ "cli",
  "config-client",
  "config-client-provider",
  "device-client",
@@ -707,6 +739,9 @@ dependencies = [
  "rt",
  "security-client",
  "security-client-provider",
+ "service-logic",
+ "session-client",
+ "session-client-provider",
  "storage-proto",
  "surface",
  "time-client",
