@@ -367,6 +367,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
+				// A SERVICE THAT DID NOT START SAYS SO, on the console, by name.
+				//
+				// It was silent: the boot printed every service that came up and nothing at all
+				// for one that did not, so a failed PermissionManager showed as a gap between two
+				// lines nobody counts - and the first visible symptom was the shell never
+				// appearing, four services later. The journal had the event; the console, which is
+				// what a person is watching while a machine boots, did not.
+				if started == State::Failed {
+					unsafe {
+						print(b"ServiceManager: ");
+						print(MANIFEST[i].name);
+						print(b": FAILED to start\n");
+						if !failure_reason[i].is_empty() {
+							print(b"ServiceManager: ");
+							print(MANIFEST[i].name);
+							print(b": ");
+							print(failure_reason[i].as_bytes());
+							print(b"\n");
+						}
+					}
+				}
 				if MANIFEST[i].name == b"process_service" && started == State::Running {
 					broker_process = unsafe { service_connect(process_client) }.unwrap_or(0);
 				}
@@ -420,6 +441,36 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		if !progress {
 			break;
+		}
+	}
+
+	// WHAT NEVER STARTED, AND WHY. The loop above stops when no service can make progress, and a
+	// service still Pending at that point is one whose dependency never came up - it is not
+	// failed, it was never attempted, and until now that was completely silent.
+	//
+	// The pair matters more than either line alone: a boot that ends without a shell shows one
+	// service that FAILED and four that were WAITING FOR IT, which points at the first rather than
+	// leaving an operator to guess which of the five is the cause.
+	{
+		let mut i: usize = 0;
+		while i < N {
+			if state[i] == State::Pending {
+				unsafe {
+					print(b"ServiceManager: ");
+					print(MANIFEST[i].name);
+					print(b": never started - waiting for");
+					for dependency in MANIFEST[i].deps {
+						if let Some(idx) = index_of(dependency) {
+							if state[idx] != State::Running {
+								print(b" ");
+								print(dependency);
+							}
+						}
+					}
+					print(b"\n");
+				}
+			}
+			i += 1;
 		}
 	}
 

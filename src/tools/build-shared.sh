@@ -6,6 +6,17 @@ if [[ "${1:-}" == "--verbose" ]]; then
 	verbose=1
 	shift
 fi
+# The rebuild switch, as a FLAG as well as an environment variable.
+#
+# It is read from the environment because three scripts and two `just` recipes pass it down a
+# process tree, which is what an environment variable is for. It is also a flag because a person
+# typing a command should not have to know that: `--rebuild` is discoverable from the usage line,
+# and `LIBER_IMAGE_REBUILD=1` in front of a command is not.
+force_rebuild_flag=0
+if [[ "${1:-}" == "--rebuild" ]]; then
+	force_rebuild_flag=1
+	shift
+fi
 explain=0
 if [[ "${1:-}" == "--explain" ]]; then
 	explain=1
@@ -16,7 +27,7 @@ selected_kind=""
 if [[ "${1:-}" == "--artifact" ]]; then
 	selected_artifact="${2:-}"
 	if [[ -z "$selected_artifact" ]]; then
-		echo "usage: $0 [--verbose] [--explain] [--artifact <artifact>] <target> <crate>..." >&2
+		echo "usage: $0 [--verbose] [--explain] [--rebuild] [--artifact <artifact>] <target> <crate>..." >&2
 		exit 2
 	fi
 	shift 2
@@ -32,7 +43,7 @@ if [[ "${1:-}" == "--artifact" ]]; then
 	esac
 fi
 if [[ -z "$selected_artifact" && $# -lt 2 ]] || [[ -n "$selected_artifact" && $# -lt 1 ]]; then
-	echo "usage: $0 [--verbose] [--explain] [--artifact <artifact>] <target> <crate>..." >&2
+	echo "usage: $0 [--verbose] [--explain] [--rebuild] [--artifact <artifact>] <target> <crate>..." >&2
 	exit 2
 fi
 if [[ "$verbose" != 0 && "$verbose" != 1 ]]; then
@@ -179,6 +190,13 @@ provider_output_dir="$artifact_output_root"
 artifact_log_dir="$artifact_output_root/logs"
 rust_min_stack="${RUST_MIN_STACK:-67108864}"
 force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
+if [[ "$force_rebuild_flag" == 1 ]]; then
+	force_rebuild=1
+	# EXPORTED, so the scripts this one calls rebuild too. `build-exe-start.sh` reads the same
+	# variable, and a rebuild that skipped it would leave one cached object in an otherwise fresh
+	# image - which is the kind of half-rebuild that makes the next failure impossible to place.
+	export LIBER_IMAGE_REBUILD=1
+fi
 artifact_cache_dir="$build_root/cache/$target"
 # One place for every scratch file a build makes. Apart from the outputs, so a leak shows up as
 # a directory that should have been empty rather than as litter among the artifacts, and so a

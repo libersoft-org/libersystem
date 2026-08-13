@@ -137,6 +137,10 @@ Builds the system. With no arguments: every part, for x86_64.
                 put the kernel on the system volume - what ./image.sh does for shipping media. A
                 test run needs it absent, because the suite boots its own kernel from the ESP and
                 the loader prefers the volume's. Off by default.
+  --rebuild     ignore every build cache and produce each artifact again. The caches are keyed on
+                sources, tools and manifest, so this is for when the KEY is what you doubt - a
+                changed compiler that reports the same version, a half-written cache entry - and
+                not something a normal build needs.
   -h, --help    this text
 
 parts, in the order they are built:
@@ -154,6 +158,7 @@ examples:
   ./build.sh --part kernel            # just the kernel
   ./build.sh --arch riscv64 --part user,packages
   ./build.sh --part user -- -p imgconv
+  ./build.sh --rebuild                # ignore the caches and build every artifact again
 
 The volume carries the kernel only when 'kernel' and 'volume' are both built, so a partial build
 never replaces a shipping volume's kernel with a stale one.
@@ -184,6 +189,13 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--kernel-on-volume)
 		kernel_on_volume=1
+		shift
+		;;
+	--rebuild)
+		# EXPORTED rather than passed along: `build-shared.sh` and `build-exe-start.sh` both read
+		# it, and the parts below call them through several layers. The flag is what a person
+		# types; the variable is how it travels.
+		export LIBER_IMAGE_REBUILD=1
 		shift
 		;;
 	--)

@@ -603,14 +603,33 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_client: u64, m
 		// wrong in a specific way: the launcher would have to pass the CALLER's session rather
 		// than this one, because a job table belongs to a session and not to the machine. There is
 		// one session today, and this comment is where that assumption is written down.
+		//
+		// OPTIONAL, and this is the important part. Every other grant here is one PermissionManager
+		// cannot work without; this one is needed by a single governed command. Making it fatal
+		// made the whole console chain depend on SessionService answering a connect at this
+		// instant - PermissionManager fails, `perm_client` stays zero, and ConsoleService, the
+		// system graph and the shell all fail after it, so the system boots to "no interactive
+		// shell attached" because `kill` could not have been granted. A capability the manager can
+		// live without must not be able to stop it starting.
+		//
+		// Absent is SAID rather than implied: the tag is sent with no handle (the form the
+		// manager already reads as "not granted"), and the line below is what tells an operator
+		// why `kill` refuses instead of leaving them to find out by running it.
 		if *session1 == 0 {
-			*session1 = match service_connect(*session_client) {
-				Some(h) => h,
-				None => return false,
-			};
+			*session1 = service_connect(*session_client).unwrap_or(0);
 		}
-		let session_dup: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if session_dup < 0 || !send_blocking(manager_side, CAP_SESSION, session_dup as u64) {
+		let session_dup: u64 = if *session1 == 0 {
+			0
+		} else {
+			match duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER) {
+				handle if handle >= 0 => handle as u64,
+				_ => 0,
+			}
+		};
+		if session_dup == 0 {
+			print(b"ServiceManager: no session client for PermissionManager; the `kill` command will not be grantable\n");
+		}
+		if !send_blocking(manager_side, CAP_SESSION, session_dup) {
 			return false;
 		}
 		// A fresh ConfigService connection the manager grants to the governed `config` / `set`

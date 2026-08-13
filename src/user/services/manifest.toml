@@ -1589,6 +1589,10 @@ dependencies = ["log_service", "device_manager", "process_service", "config_serv
 name = "permission_manager"
 program = "permission_manager"
 restart = "escalate"
+# Every service whose client this manager holds and grants onward. `session_service` is here
+# because the manager mints a session client for the governed `kill` command, and a dependency that
+# is not declared is a start order that happens to work: on one machine the session was up first
+# and on another it was not, and the difference was a system that booted to no shell at all.
 dependencies = [
 	"log_service",
 	"storage_service",
@@ -1603,6 +1607,7 @@ dependencies = [
 	"audio_service",
 	"process_service",
 	"resource_manager",
+	"session_service",
 ]
 
 [[services]]
