@@ -269,15 +269,21 @@ where
 	(min_idx + offset, max_neighbor)
 }
 
-fn low_neighbor(v: &[u32], x: usize) -> (usize, u32) {
+// SHARED WITH THE ENCODER rather than copied into it. Floor 1 is a codec where the two sides have
+// to agree exactly: the coded value is a DELTA against a prediction the decoder computes from the
+// neighbours it has already fixed, so an encoder that predicts even slightly differently writes a
+// number that decodes to a different curve - and the residues, which are the spectrum divided by
+// that curve, then decode into noise. Reading these four out of the decoder is what makes the
+// disagreement impossible rather than merely tested for.
+pub(crate) fn low_neighbor(v: &[u32], x: usize) -> (usize, u32) {
 	extr_neighbor(v, x, |a, b| a.cmp(&b), "smaller")
 }
 
-fn high_neighbor(v: &[u32], x: usize) -> (usize, u32) {
+pub(crate) fn high_neighbor(v: &[u32], x: usize) -> (usize, u32) {
 	extr_neighbor(v, x, |a, b| b.cmp(&a), "bigger")
 }
 
-fn render_point(x0: u32, y0: u32, x1: u32, y1: u32, x: u32) -> u32 {
+pub(crate) fn render_point(x0: u32, y0: u32, x1: u32, y1: u32, x: u32) -> u32 {
 	// TODO find out whether the type choices in this method are okay
 	// (esp. the i32 choice).
 	let dy = y1 as i32 - y0 as i32;
@@ -327,7 +333,7 @@ fn floor_one_curve_compute_amplitude(floor1_y: &[u32], fl: &FloorTypeOne) -> (Ve
 	return (floor1_final_y, floor1_step2_flag);
 }
 
-static FLOOR1_INVERSE_DB_TABLE: &[f32] = &[
+pub(crate) static FLOOR1_INVERSE_DB_TABLE: &[f32] = &[
 	1.0649863e-07,
 	1.1341951e-07,
 	1.2079015e-07,
@@ -586,7 +592,7 @@ static FLOOR1_INVERSE_DB_TABLE: &[f32] = &[
 	1.,
 ];
 
-fn render_line(x0: u32, y0: u32, x1: u32, y1: u32, v: &mut Vec<u32>) {
+pub(crate) fn render_line(x0: u32, y0: u32, x1: u32, y1: u32, v: &mut Vec<u32>) {
 	// TODO find out whether the type choices in this method are okay
 	let dy = y1 as i32 - y0 as i32;
 	let adx = x1 as i32 - x0 as i32;

@@ -299,3 +299,104 @@ fn two_overlapping_blocks_reconstruct_the_signal() {
 	}
 	assert!(worst < 0.02, "two windowed, overlapped blocks reconstruct the signal between them: worst error {worst}");
 }
+
+// A spectrum with a peak of `height` at `at`, decaying either side - the shape a floor fit has to
+// follow, and the shape a straight line between two distant posts fails to cover if the fit does
+// not check its own work.
+fn peaked(n: usize, at: usize, height: f32) -> Vec<f32> {
+	(0..n)
+		.map(|bin| {
+			let distance = if bin > at { bin - at } else { at - bin } as f32;
+			height / (1.0 + distance * distance * 0.05)
+		})
+		.collect()
+}
+
+#[test]
+fn the_floor_this_encoder_writes_is_the_curve_the_decoder_draws() {
+	// THE ONE PROPERTY EVERYTHING ELSE RESTS ON. Floor 1 codes each post as a correction to a
+	// prediction the decoder computes from posts it has already fixed, so `code_floor` is an
+	// inverse of a function in the decoder and either it is exact or the curve is wrong from the
+	// first post that disagrees - and the residues, which are the spectrum divided by that curve,
+	// then decode into noise with nothing before that point looking wrong.
+	//
+	// Asserted as a round trip through both stages rather than against a table of expected
+	// codewords: a table would be this code's own answer written down twice.
+	let blocksize_log2: u8 = 11;
+	let posts = floor_x_list(blocksize_log2).len();
+	for wanted in [
+		alloc::vec![40u32; 16],
+		// Rising, falling, and a value at each end of the range - the corrections that take the
+		// large branch, where the room on one side runs out and the decoder measures from the other.
+		(0..posts as u32).map(|index| 8 + index * 6).collect::<Vec<u32>>(),
+		(0..posts as u32).map(|index| 120 - index * 6).collect::<Vec<u32>>(),
+		{
+			let mut v = alloc::vec![64u32; posts];
+			v[0] = 1;
+			v[1] = 126;
+			v[posts - 1] = 2;
+			v
+		},
+	] {
+		let coded = code_floor(&wanted, blocksize_log2).expect("every one of these is a curve floor 1 can draw");
+		let curve = render_floor(&coded, blocksize_log2).expect("renders");
+		// The curve passes THROUGH each post at the value that was asked for. Checked at the posts
+		// rather than everywhere, because between them the curve is a line and that is the point.
+		let x_list = floor_x_list(blocksize_log2);
+		let n: usize = 1 << (blocksize_log2 - 1);
+		for (index, &x) in x_list.iter().enumerate() {
+			if x as usize >= n {
+				continue;
+			}
+			let expected = crate::audio::FLOOR1_INVERSE_DB_TABLE[(wanted[index] * 2) as usize];
+			assert!((curve[x as usize] - expected).abs() < 1e-6, "post {index} at x={x} wanted {expected} and the decoder draws {}", curve[x as usize]);
+		}
+	}
+}
+
+#[test]
+fn a_fitted_floor_is_never_under_the_spectrum_it_was_fitted_to() {
+	// WHY "NEVER UNDER" IS THE REQUIREMENT AND NOT "CLOSE". The residue is the spectrum divided by
+	// this curve and it is coded by a book covering -1 .. +0.97, so a bin above its own floor
+	// cannot be represented at all - it comes back clipped, which is audible as a crushed peak
+	// exactly where the signal is loudest. Fitting over rather than through is what makes every
+	// residue in range by construction.
+	let blocksize_log2: u8 = 11;
+	let n: usize = 1 << (blocksize_log2 - 1);
+	for magnitude in [
+		alloc::vec![0.5f32; n],
+		// A peak in the middle of the WIDEST segment this post list has - between 768 and 1024 -
+		// which is the case a first-pass fit gets wrong: both posts are far away, so the straight
+		// line between them passes under the peak.
+		peaked(n, 900, 0.9),
+		peaked(n, 6, 0.93),
+		peaked(n, 300, 0.4),
+		// Silence, where every post lands on the bottom of the table and the corrections are zero.
+		alloc::vec![0.0f32; n],
+	] {
+		let coded = fit_floor(&magnitude, blocksize_log2).expect("this encoder can fit these");
+		let curve = render_floor(&coded, blocksize_log2).expect("renders");
+		for (bin, &value) in magnitude.iter().enumerate() {
+			assert!(curve[bin] >= value, "bin {bin}: the floor is {} and the spectrum is {value}", curve[bin]);
+		}
+		// AND NOT ABSURDLY ABOVE IT. A floor of 1.0 everywhere would pass the assertion above and
+		// spend every bit of the residue coding silence. The loudest bin must be within a factor of
+		// the curve over it - the table's step at multiplier 2 is about 2 dB, and a fit that lands
+		// within a few steps of the peak is doing its job.
+		let peak = magnitude.iter().fold(0.0f32, |a, &b| if b > a { b } else { a });
+		if peak > 0.01 {
+			let over = curve.iter().zip(magnitude.iter()).filter(|pair| *pair.1 >= peak * 0.99).map(|pair| *pair.0 / *pair.1).fold(0.0f32, |a, b| if b > a { b } else { a });
+			assert!(over < 2.0, "the floor sits {over} times over the loudest bin, which is bits spent on nothing");
+		}
+	}
+
+	// AND A SPECTRUM IT CANNOT SIT ABOVE IS REFUSED. At multiplier 2 the highest coded Y lands one
+	// table entry short of 1.0, so a bin above that has no floor - and the two things an encoder
+	// could do instead are both silent lies: fitting as high as it can clips that bin's residue,
+	// and scaling the spectrum changes the output level with no field in the format to record it.
+	let mut past = alloc::vec![0.1f32; n];
+	past[10] = floor_ceiling() * 1.01;
+	assert_eq!(fit_floor(&past, blocksize_log2), None, "a bin above the reachable ceiling is refused rather than clipped");
+	past[10] = floor_ceiling();
+	assert!(fit_floor(&past, blocksize_log2).is_some(), "and a bin exactly at it still fits");
+}

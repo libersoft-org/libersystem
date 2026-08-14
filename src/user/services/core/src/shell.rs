@@ -19,7 +19,7 @@ use proto::codec::JsonMode;
 use proto::system::{Component, EnvVar, Error, JobEntry, JobInfo, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
-use services::shell_language::{ExpandedStage, Expansion, RedirectError, expand_redirects, parse_and_expand, parse_assignment, parse_pipeline, trim};
+use services::shell_language::{ExpandedStage, Expansion, ParseError, RedirectError, expand_redirects, parse_and_expand, parse_assignment, parse_pipeline, trim};
 use storage_proto::path;
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
@@ -286,6 +286,28 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// So "does this need the broker" is a question about the EXPANDED line: a single command
 			// with a redirection needs it, and a single command without one still takes today's
 			// path, where the builtins live.
+			// A LINE THE GRAMMAR REFUSED IS NOT RUN AS AN ORDINARY COMMAND.
+			//
+			// Every parse failure fell through to `dispatch`, which knows nothing about operators -
+			// so `cat 3>&1` ran `cat` with two literal arguments, and `cd x | grep y` ran `cd` with
+			// four. The parser had already decided the line could not mean what it looks like, and
+			// the answer to that was to run something else instead of saying so.
+			//
+			// TWO ERRORS STILL FALL THROUGH, and they are the two where falling through is what the
+			// person meant. An empty line is not a mistake. And an unterminated quote is most often
+			// an apostrophe in ordinary text - `echo it's fine` - where refusing would be correct
+			// about the grammar and wrong about the sentence; bash asks for more input there, which
+			// this shell has no continuation state for, so it runs the line as typed.
+			if let Err(reason) = &pipeline
+				&& !matches!(reason, ParseError::Empty | ParseError::UnterminatedQuote)
+			{
+				print(parse_refusal(reason));
+				jobs.reap();
+				print(b"\x1b[1;32m");
+				print(cwd.as_bytes());
+				print(b"> \x1b[0m");
+				continue;
+			}
 			let expanded: Option<Result<Expansion, RedirectError>> = pipeline.as_ref().ok().map(expand_redirects);
 			let needs_broker: bool = match &expanded {
 				// `2>&1` ON A LINE OF ONE STAGE IS NOT A REASON TO GO THROUGH THE BROKER. It asks
@@ -1463,6 +1485,24 @@ unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(
 // NAMED RATHER THAN "UNSUPPORTED". Somebody who typed `a > f | b` wants to be told that the file
 // would have taken the output and `b` would have got nothing - which is a thing about their line -
 // rather than that redirection is unavailable, which is a thing about the shell and is not true.
+// Why a line could not be parsed as a pipeline, as the sentence the person typing sees.
+//
+// NAMED, for `redirect_refusal`'s reason: the useful half of a refusal is which part of the line
+// the shell could not read. "syntax error" sends somebody back to stare at a line they have already
+// stared at.
+fn parse_refusal(reason: &ParseError) -> &'static [u8] {
+	match reason {
+		ParseError::Empty => b"",
+		ParseError::EmptyStage => b"shell: a stage of a pipeline has no command; `a | | b` and `| b` name nothing to run\n",
+		ParseError::DanglingOperator => b"shell: an operator at the end of the line has nothing to apply to\n",
+		ParseError::UnterminatedQuote => b"shell: a quote is never closed\n",
+		ParseError::TooLarge => b"shell: the line is past one of this shell's bounds - length, stages, or words in a stage\n",
+		ParseError::UnsupportedDescriptor => b"shell: only descriptors 1 and 2 exist here; `3>&1` is refused rather than read as a redirection of stdout\n",
+		ParseError::BuiltinNotAStage => b"shell: `cd`, `unset`, `export`, `fg` and `bg` change THIS shell; in a pipeline, a redirection or the background they would run somewhere whose state is thrown away\n",
+		ParseError::EmptyRedirectTarget => b"shell: a redirection target expanded to nothing - an unset variable leaves the operator with no destination\n",
+	}
+}
+
 fn redirect_refusal(reason: &RedirectError) -> &'static [u8] {
 	match reason {
 		RedirectError::InputNotFirst => b"shell: `< path` belongs to the first command of a pipeline; a later stage already has a producer\n",

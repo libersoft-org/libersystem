@@ -165,6 +165,10 @@ pub enum ParseError {
 	// A descriptor this grammar does not implement, so `3>&1` is refused rather than
 	// silently treated as something else.
 	UnsupportedDescriptor,
+	// A redirection whose target expanded to nothing: `> $UNSET`. Distinct from a dangling
+	// operator, which has no word after it at all - here there is a word and it is empty, and the
+	// difference is what the user has to be told to fix it.
+	EmptyRedirectTarget,
 	// A builtin that mutates the shell's own state, used anywhere but as a lone foreground
 	// command. `cd x | grep y` would run `cd` in a CHILD whose state dies with it, so the
 	// directory silently does not change - refusing is the only honest answer.
@@ -314,8 +318,19 @@ pub fn parse_pipeline(raw: &[u8], vars: &[(String, String)]) -> Result<Pipeline,
 
 	// Take the path a redirection operator applies to. A redirection with no target is a
 	// dangling operator, not an empty path.
+	//
+	// AND A TARGET THAT EXPANDED TO NOTHING IS NEITHER. `< $HOME/notes` where `HOME` is unset
+	// leaves a word that is present in the token stream and empty in content, so the operator is
+	// not dangling - it simply has no destination. Found by the parser fuzz, which produced
+	// `a < $b` with `b` undefined and got a redirection whose path was zero bytes.
+	//
+	// Refusing here rather than letting it through matters because of WHERE it would have surfaced:
+	// the expansion turns it into `redirect_in` with no argument, that tool refuses, and the user
+	// is told a program they never typed could not find a path they never wrote. The line is
+	// ambiguous, the shell is the layer that knows it, and this is where it says so.
 	fn path(iter: &mut core::iter::Peekable<alloc::vec::IntoIter<Token>>) -> Result<Vec<u8>, ParseError> {
 		match iter.next() {
+			Some(Token::Word(w)) if w.is_empty() => Err(ParseError::EmptyRedirectTarget),
 			Some(Token::Word(w)) => Ok(w),
 			_ => Err(ParseError::DanglingOperator),
 		}

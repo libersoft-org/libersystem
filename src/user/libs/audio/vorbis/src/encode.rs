@@ -426,6 +426,273 @@ pub fn window_for(blocksize_log2: u8) -> Vec<f32> {
 	window
 }
 
+/// The floor's X positions, in the order floor 1 codes them.
+///
+/// The first two are not in `FLOOR_POSTS` and are not optional: floor 1 always begins with position
+/// 0 and position `1 << rangebits`, and their Y values are written literally rather than as deltas.
+/// Every other post is coded against a prediction from its neighbours, which is why the order here
+/// is the CODING order and not the sorted one.
+pub fn floor_x_list(blocksize_log2: u8) -> Vec<u32> {
+	let range: u32 = 1 << (blocksize_log2 - 1);
+	let mut list: Vec<u32> = Vec::with_capacity(FLOOR_POSTS.len() + 2);
+	list.push(0);
+	list.push(range);
+	list.extend_from_slice(&FLOOR_POSTS);
+	list
+}
+
+/// Turn the Y values this encoder WANTS into the values it must write.
+///
+/// THE PACKET DOES NOT CARRY THE CURVE, it carries corrections to a prediction. For every post
+/// after the first two the decoder draws a line between that post's already-fixed neighbours, reads
+/// the point at this X, and adds the coded value to it under a rule with two branches: a small
+/// correction is a zig-zag around the prediction (even up, odd down), and a large one is measured
+/// from whichever side has more room. This inverts that, branch for branch.
+///
+/// A post whose wanted value IS the prediction codes as zero, which the decoder reads as "no
+/// correction" and marks as not needing its own line segment. That costs nothing and changes no
+/// sample: the prediction is the line, so skipping the post draws the same curve.
+///
+/// Returns `None` when a wanted value cannot be reached at all - the correction would not fit in
+/// the range the codebook covers. The caller's fit is what keeps that from happening; answering
+/// `None` rather than clamping means a fit that drifts is a failure here and not a quiet
+/// half-octave of error in the output.
+pub fn code_floor(final_y: &[u32], blocksize_log2: u8) -> Option<Vec<u32>> {
+	let x_list = floor_x_list(blocksize_log2);
+	if final_y.len() != x_list.len() {
+		return None;
+	}
+	let range: i32 = FLOOR_RANGE as i32;
+	let mut coded: Vec<u32> = Vec::with_capacity(final_y.len());
+	// The decoder's own view, rebuilt as we go: a prediction is made against the values the decoder
+	// will HAVE, which for the first two posts is what was written literally.
+	let mut fixed: Vec<i32> = Vec::with_capacity(final_y.len());
+	for index in 0..2 {
+		let value = final_y[index] as i32;
+		if value >= range {
+			return None;
+		}
+		coded.push(value as u32);
+		fixed.push(value);
+	}
+	for index in 2..x_list.len() {
+		let low = crate::audio::low_neighbor(&x_list, index);
+		let high = crate::audio::high_neighbor(&x_list, index);
+		let predicted: i32 = crate::audio::render_point(low.1, fixed[low.0] as u32, high.1, fixed[high.0] as u32, x_list[index]) as i32;
+		let wanted: i32 = final_y[index] as i32;
+		let error: i32 = wanted - predicted;
+		if error == 0 {
+			coded.push(0);
+			fixed.push(predicted);
+			continue;
+		}
+		let highroom: i32 = range - predicted;
+		let lowroom: i32 = predicted;
+		let room: i32 = core::cmp::min(highroom, lowroom) * 2;
+		// The zig-zag branch, which is the cheap one: an even value steps up by half of it and an
+		// odd value steps down by half of one more. Only usable while the result stays under `room`,
+		// because that is the boundary the decoder itself tests.
+		let small: i32 = if error > 0 { 2 * error } else { -2 * error - 1 };
+		let value: i32 = if small < room {
+			small
+		} else if highroom > lowroom {
+			error + lowroom
+		} else {
+			highroom - 1 - error
+		};
+		if value <= 0 || value >= range {
+			// Zero would mean "no correction" and this post wanted one; past the range there is no
+			// codeword. Either way the caller asked for a curve this floor cannot draw.
+			return None;
+		}
+		coded.push(value as u32);
+		fixed.push(wanted);
+	}
+	Some(coded)
+}
+
+/// The curve the decoder will draw from `coded`, in linear amplitude, one value per spectral bin.
+///
+/// Runs the decoder's own two stages - the amplitude fixup and the line synthesis - so this is what
+/// the decoder WILL do rather than what the encoder hopes it does. The fit below uses it to check
+/// its own work, which is the only way to be sure a straight line between two posts did not dip
+/// under the spectrum somewhere in the middle.
+pub fn render_floor(coded: &[u32], blocksize_log2: u8) -> Option<Vec<f32>> {
+	let x_list = floor_x_list(blocksize_log2);
+	if coded.len() != x_list.len() {
+		return None;
+	}
+	let n: usize = 1 << (blocksize_log2 - 1);
+	let range: i32 = FLOOR_RANGE as i32;
+	// Stage one: the fixup, exactly as `floor_one_curve_compute_amplitude` runs it.
+	let mut final_y: Vec<i32> = alloc::vec![coded[0] as i32, coded[1] as i32];
+	let mut step2: Vec<bool> = alloc::vec![true, true];
+	for index in 2..x_list.len() {
+		let low = crate::audio::low_neighbor(&x_list, index);
+		let high = crate::audio::high_neighbor(&x_list, index);
+		let predicted: i32 = crate::audio::render_point(low.1, final_y[low.0] as u32, high.1, final_y[high.0] as u32, x_list[index]) as i32;
+		let value: i32 = coded[index] as i32;
+		let highroom: i32 = range - predicted;
+		let lowroom: i32 = predicted;
+		let room: i32 = core::cmp::min(highroom, lowroom) * 2;
+		if value > 0 {
+			step2[low.0] = true;
+			step2[high.0] = true;
+			step2.push(true);
+			final_y.push(if value >= room { if highroom > lowroom { predicted + value - lowroom } else { predicted - value + highroom - 1 } } else { predicted + (if value % 2 == 1 { -value - 1 } else { value } >> 1) });
+		} else {
+			final_y.push(predicted);
+			step2.push(false);
+		}
+	}
+	for value in &mut final_y {
+		*value = core::cmp::min(range - 1, *value);
+	}
+	// Stage two: the synthesis, over the posts in X order.
+	let mut order: Vec<usize> = (0..x_list.len()).collect();
+	order.sort_by_key(|&index| x_list[index]);
+	let mut indices: Vec<u32> = Vec::with_capacity(n);
+	let (mut hx, mut hy, mut lx, mut ly): (u32, u32, u32, u32) = (0, 0, 0, final_y[order[0]] as u32 * FLOOR_MULTIPLIER as u32);
+	for &index in order.iter().skip(1) {
+		if !step2[index] {
+			continue;
+		}
+		hy = final_y[index] as u32 * FLOOR_MULTIPLIER as u32;
+		hx = x_list[index];
+		crate::audio::render_line(lx, ly, hx, hy, &mut indices);
+		lx = hx;
+		ly = hy;
+	}
+	if hx < n as u32 {
+		crate::audio::render_line(hx, hy, n as u32, hy, &mut indices);
+	} else if hx > n as u32 {
+		indices.truncate(n);
+	}
+	if indices.len() != n {
+		return None;
+	}
+	Some(indices.into_iter().map(|index| crate::audio::FLOOR1_INVERSE_DB_TABLE[index as usize]).collect())
+}
+
+/// Choose the floor for one channel's spectrum: the coded Y values whose curve sits AT OR ABOVE
+/// every magnitude in it.
+///
+/// ABOVE, NOT THROUGH. The residue this floor divides out is coded by a book covering -1 .. +0.97,
+/// so a bin whose magnitude exceeds its floor cannot be represented and would come back clipped.
+/// Fitting the envelope over the spectrum rather than through it is what keeps every residue in
+/// range by construction, and it is why the loop below only ever raises.
+///
+/// The first pass takes, for each post, the loudest bin in the half-segments either side of it -
+/// so a peak between two posts lifts both. That is not enough on its own: the curve between two
+/// posts is a straight line in the dB domain, and a peak in the middle of a long segment can still
+/// stand above it. So the fit is checked against the rendered curve and any post whose segment is
+/// short gets raised, up to a bounded number of passes. It converges because every pass strictly
+/// raises at least one post and the range is finite; the bound is there so that a spectrum it
+/// cannot fit ends as a refusal rather than a loop.
+pub fn fit_floor(magnitude: &[f32], blocksize_log2: u8) -> Option<Vec<u32>> {
+	let n: usize = 1 << (blocksize_log2 - 1);
+	if magnitude.len() != n {
+		return None;
+	}
+	// A CEILING THIS CONFIGURATION CANNOT REACH IS A REFUSAL, not a quiet attenuation.
+	//
+	// The multiplier is 2, so a coded Y of `y` lands on table entry `2y` and the largest one this
+	// floor can name is entry 254 - just under the table's top of 1.0. A spectrum with a bin above
+	// that has no floor to sit under, and the alternatives are both worse than saying so: fitting
+	// as high as possible clips that bin's residue, and there is no gain field in the format to
+	// record the scaling with, so an encoder that scaled here would change the output level and
+	// nothing in the stream would say it had. Normalising is the caller's decision to make and to
+	// be seen making.
+	let ceiling: f32 = crate::audio::FLOOR1_INVERSE_DB_TABLE[((FLOOR_RANGE - 1) * FLOOR_MULTIPLIER as u32) as usize];
+	if magnitude.iter().any(|value| (if *value < 0.0 { -*value } else { *value }) > ceiling) {
+		return None;
+	}
+	let x_list = floor_x_list(blocksize_log2);
+	let mut order: Vec<usize> = (0..x_list.len()).collect();
+	order.sort_by_key(|&index| x_list[index]);
+	// The first pass: each post covers the bins halfway to its neighbours on either side.
+	let mut final_y: Vec<u32> = alloc::vec![0; x_list.len()];
+	for (position, &index) in order.iter().enumerate() {
+		let x = x_list[index] as usize;
+		let previous = if position == 0 { 0 } else { x_list[order[position - 1]] as usize };
+		let next = if position + 1 == order.len() { n } else { x_list[order[position + 1]] as usize };
+		let from = (previous + x) / 2;
+		let to = core::cmp::min((x + next) / 2 + 1, n);
+		let mut peak = 0.0f32;
+		for &value in magnitude.iter().take(to).skip(from) {
+			let magnitude = if value < 0.0 { -value } else { value };
+			if magnitude > peak {
+				peak = magnitude;
+			}
+		}
+		final_y[index] = y_for(peak);
+	}
+	// The repair passes.
+	for _ in 0..8 {
+		let coded = code_floor(&final_y, blocksize_log2)?;
+		let curve = render_floor(&coded, blocksize_log2)?;
+		let mut raised = false;
+		for (bin, &value) in magnitude.iter().enumerate() {
+			let magnitude = if value < 0.0 { -value } else { value };
+			if magnitude <= curve[bin] {
+				continue;
+			}
+			// The bin stands above its floor. Raise the two posts the segment it falls in is drawn
+			// between - both, because raising only the nearer one tilts the line and can leave the
+			// far half of the segment as short as it was.
+			let wanted = y_for(magnitude);
+			let mut low = 0usize;
+			let mut high = order.len() - 1;
+			for (position, &index) in order.iter().enumerate() {
+				if (x_list[index] as usize) <= bin {
+					low = position;
+				}
+				if x_list[index] as usize >= bin && position < high {
+					high = position;
+				}
+			}
+			for &position in &[low, high] {
+				let index = order[position];
+				if final_y[index] < wanted {
+					final_y[index] = wanted;
+					raised = true;
+				}
+			}
+		}
+		if !raised {
+			return Some(coded);
+		}
+	}
+	None
+}
+
+/// The smallest floor Y value whose curve is at least `magnitude`.
+///
+/// The table the decoder indexes runs from a value too small to hear up to exactly 1.0, and the
+/// multiplier means a coded Y of `y` lands on table entry `y * 2`. So this is a search over the
+/// entries this configuration can actually reach; `fit_floor` has already refused anything above
+/// the top of that range, so the saturation here is only ever the exact top.
+
+/// The largest magnitude this floor configuration can sit above. A caller scales its spectrum to
+/// this before fitting, and does so where the decision is visible.
+pub fn floor_ceiling() -> f32 {
+	crate::audio::FLOOR1_INVERSE_DB_TABLE[((FLOOR_RANGE - 1) * FLOOR_MULTIPLIER as u32) as usize]
+}
+
+fn y_for(magnitude: f32) -> u32 {
+	let mut low: u32 = 0;
+	let mut high: u32 = FLOOR_RANGE - 1;
+	while low < high {
+		let middle = (low + high) / 2;
+		if crate::audio::FLOOR1_INVERSE_DB_TABLE[(middle * FLOOR_MULTIPLIER as u32) as usize] >= magnitude {
+			high = middle;
+		} else {
+			low = middle + 1;
+		}
+	}
+	low
+}
+
 #[cfg(test)]
 #[path = "encode_tests.rs"]
 mod tests;

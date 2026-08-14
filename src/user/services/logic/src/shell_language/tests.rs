@@ -280,3 +280,146 @@ fn merging_the_error_stream_is_a_property_of_a_stage_and_not_a_stage_of_its_own(
 	assert_eq!(expansion.stages[0].merge_errors, true);
 	assert_eq!(expansion.stages[1].merge_errors, false, "the writer's own diagnostics still reach the terminal - they are about the file");
 }
+
+// A DETERMINISTIC BYTE SOURCE, because a fuzz that is not reproducible reports a failure nobody
+// can look at twice. Xorshift64*, seeded by the caller, so a failing case is `seed` plus an index.
+struct Bytes(u64);
+
+impl Bytes {
+	fn next(&mut self) -> u8 {
+		let mut x = self.0;
+		x ^= x >> 12;
+		x ^= x << 25;
+		x ^= x >> 27;
+		self.0 = x;
+		(x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) as u8
+	}
+}
+
+#[test]
+fn the_parser_answers_every_line_a_person_could_type_including_the_ones_they_could_not_mean() {
+	// THE PROPERTY IS "ANSWERS", NOT "ACCEPTS". Every one of these lines is nonsense; what this
+	// asserts is that the parser returns an answer for each rather than panicking, looping, or
+	// growing - and that whatever it accepts satisfies the bounds it advertises. A shell that can
+	// be made to fault by a paste from a chat window is a shell that stops being a shell.
+	//
+	// The alphabet is the metacharacters plus a few ordinary bytes: random bytes over the whole
+	// range would spend almost every draw on characters the lexer treats identically, so the
+	// interesting collisions - a quote inside a redirection inside a pipe - would essentially
+	// never come up.
+	const ALPHABET: &[u8] = b"|<>&2;'\"\\ \t\nabc=$\0";
+	let vars: Vec<(String, String)> = alloc::vec![(String::from("HOME"), String::from("vol://system"))];
+	let mut source = Bytes(0x0102_0304_0506_0708);
+	for case in 0..4000 {
+		let length: usize = (source.next() as usize % 24) + 1;
+		let mut line: Vec<u8> = Vec::with_capacity(length);
+		for _ in 0..length {
+			line.push(ALPHABET[source.next() as usize % ALPHABET.len()]);
+		}
+		let Ok(pipeline) = parse_pipeline(&line, &vars) else { continue };
+		// WHAT AN ACCEPTED LINE MUST SATISFY. These are the bounds the launcher trusts: it sizes a
+		// transaction from `stages.len()` and reads `words[0]` as a program name, so a pipeline
+		// that got past the parser with no words in a stage is a launcher indexing an empty vector.
+		assert!(!pipeline.stages.is_empty(), "case {case}: an accepted line has at least one stage: {:?}", line);
+		assert!(pipeline.stages.len() <= MAX_STAGES, "case {case}: within the stage bound: {:?}", line);
+		for stage in &pipeline.stages {
+			assert!(!stage.words.is_empty(), "case {case}: every accepted stage has a command word: {:?}", line);
+			assert!(stage.words.len() <= MAX_WORDS_PER_STAGE, "case {case}: within the word bound: {:?}", line);
+			for redirect in &stage.redirects {
+				// A redirection with an empty target is a dangling operator the parser is supposed
+				// to have refused. Accepting one hands `redirect_out` no destination, and the check
+				// for that would then live in the tool rather than in the grammar.
+				match redirect {
+					Redirect::In(path) => assert!(!path.is_empty(), "case {case}: `<` has a target: {:?}", line),
+					Redirect::Out { path, .. } => assert!(!path.is_empty(), "case {case}: `>` has a target: {:?}", line),
+					Redirect::ErrToOut => {}
+				}
+			}
+		}
+		// And the expansion answers too. It is the half that runs after the parser has approved a
+		// line, so it is reached by exactly these inputs and by nothing else.
+		let Ok(expansion) = expand_redirects(&pipeline) else { continue };
+		assert!(!expansion.stages.is_empty(), "case {case}: an expansion has stages: {:?}", line);
+		for stage in &expansion.stages {
+			assert!(!stage.words.is_empty(), "case {case}: every expanded stage has a command word: {:?}", line);
+		}
+	}
+}
+
+#[test]
+fn a_line_that_asks_for_something_the_grammar_does_not_mean_is_refused_by_name() {
+	// THE ADVERSARIAL CASES, each one a shape somebody could reasonably type and each refused for
+	// a stated reason rather than reinterpreted. A shell that guesses is a shell that runs a
+	// different command from the one on the screen.
+	let vars: Vec<(String, String)> = Vec::new();
+
+	// A descriptor this grammar does not implement. `3>&1` must NOT be read as `>` with a stray
+	// `3`, which is what a lexer that skipped unknown digits would do - and that reading silently
+	// redirects stdout on a line that asked about a descriptor the shell has never heard of.
+	assert_eq!(parse_pipeline(b"a 3>&1\n", &vars), Err(ParseError::UnsupportedDescriptor));
+
+	// A state-mutating builtin anywhere its state would be discarded. `cd x | grep y` runs `cd` in
+	// a child, so the directory does not change and nothing says so.
+	assert_eq!(parse_pipeline(b"cd x | grep y\n", &vars), Err(ParseError::BuiltinNotAStage));
+
+	// Dangling operators, in both directions.
+	assert_eq!(parse_pipeline(b"a >\n", &vars), Err(ParseError::DanglingOperator));
+	assert_eq!(parse_pipeline(b"a <\n", &vars), Err(ParseError::DanglingOperator));
+	assert_eq!(parse_pipeline(b"a |\n", &vars), Err(ParseError::EmptyStage));
+	assert_eq!(parse_pipeline(b"| b\n", &vars), Err(ParseError::EmptyStage));
+	assert_eq!(parse_pipeline(b"a | | b\n", &vars), Err(ParseError::EmptyStage));
+
+	// A quote that never closes. Accepting it would swallow the rest of the line into one word,
+	// which is a different command that happens to parse.
+	assert_eq!(parse_pipeline(b"a 'unterminated\n", &vars), Err(ParseError::UnterminatedQuote));
+
+	// PAST THE BOUNDS, which is where a shell either refuses or starts sizing allocations from
+	// input. A line longer than the maximum, and more stages than the transaction can carry.
+	let long: Vec<u8> = alloc::vec![b'a'; MAX_LINE_BYTES + 1];
+	assert_eq!(parse_pipeline(&long, &vars), Err(ParseError::TooLarge));
+	let mut many: Vec<u8> = Vec::new();
+	for index in 0..MAX_STAGES + 4 {
+		if index > 0 {
+			many.extend_from_slice(b" | ");
+		}
+		many.push(b'a');
+	}
+	assert_eq!(parse_pipeline(&many, &vars), Err(ParseError::TooLarge));
+
+	// A REDIRECTION WHOSE TARGET EXPANDED TO NOTHING. Found by the fuzz above as `a < $b` with `b`
+	// unset: the operator is not dangling - there IS a word after it - and the word is empty, so
+	// the redirection has no destination. Distinct from `DanglingOperator` because the two need
+	// different sentences to fix.
+	assert_eq!(parse_pipeline(b"a < $b\n", &vars), Err(ParseError::EmptyRedirectTarget));
+	assert_eq!(parse_pipeline(b"a > $b\n", &vars), Err(ParseError::EmptyRedirectTarget));
+
+	// AND THE ONE THAT IS NOT A REFUSAL. A NUL byte is an ordinary byte in a word: paths on this
+	// system are byte strings and the volume decides what it will accept, so the grammar has no
+	// business rejecting one - it would be refusing on behalf of a layer that can answer for
+	// itself. Asserted so that a later "sanitize the input" change has to argue with this line.
+	let pipeline = parse_pipeline(b"cat a\0b\n", &vars).expect("a NUL is a byte in a word");
+	assert_eq!(pipeline.stages[0].words[1], b"a\0b".to_vec());
+}
+
+#[test]
+fn expanding_a_redirection_never_hands_the_command_a_path() {
+	// THE CAPABILITY CLAIM, at the only layer that can be checked without a machine: the command
+	// the user typed keeps exactly the words the user typed. A path that leaked into its argument
+	// list would be a path it might open - and the point of expanding `<` into a stage is that the
+	// command receives a STREAM and no authority over the file behind it.
+	let vars: Vec<(String, String)> = Vec::new();
+	for line in [&b"cat < in.txt\n"[..], &b"cat > out.txt\n"[..], &b"cat >> out.txt\n"[..], &b"cat < in.txt | grep x > out.txt\n"[..]] {
+		let pipeline = parse_pipeline(line, &vars).expect("parses");
+		let expansion = expand_redirects(&pipeline).expect("expands");
+		for stage in &expansion.stages {
+			let name: &[u8] = &stage.words[0];
+			if name == REDIRECT_IN || name == REDIRECT_OUT {
+				continue;
+			}
+			for word in &stage.words {
+				assert!(word != b"in.txt", "the command never sees the source path: {:?}", line);
+				assert!(word != b"out.txt", "the command never sees the destination path: {:?}", line);
+			}
+		}
+	}
+}

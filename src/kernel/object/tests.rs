@@ -363,6 +363,21 @@ fn signalling_a_job_reaches_a_group_the_same_way_it_reaches_a_process() {
 	let stages = alloc::vec![make(), make(), make()];
 	let group = ProcessGroup::create(&stages).expect("a three-stage group");
 
+	// THE REFUSAL FIRST, while nothing is stopped yet - so "no stage was stopped" is a statement
+	// about this signal rather than about the order the assertions happen to be in.
+	//
+	// A stage of a pipeline is given its stdio endpoints and its manifest's capabilities; it is
+	// never given the group, precisely so it cannot signal its siblings. This pins the RIGHT rather
+	// than the absence: the fallback above must not have widened what a group handle can be used
+	// for, and the way to be sure is to hold one without the authority and be refused. A handle
+	// with READ can be asked what the job did and cannot end it.
+	crate::sched::spawn_with_object(stop_the_group, group.clone(), Rights::READ | Rights::WAIT, 0);
+	crate::sched::run_until_idle();
+	assert_eq!(RESULT.load(Ordering::SeqCst), crate::syscall::ERR_ACCESS_DENIED, "a group handle without MANAGE cannot signal the job");
+	for (index, stage) in stages.iter().enumerate() {
+		assert!(!stage.is_stopped(), "stage {index} was not stopped by the refused signal");
+	}
+
 	crate::sched::spawn_with_object(stop_the_group, group.clone(), Rights::ALL, 0);
 	crate::sched::run_until_idle();
 	assert_eq!(RESULT.load(Ordering::SeqCst), 0, "the process-signal syscall accepted a group handle");
