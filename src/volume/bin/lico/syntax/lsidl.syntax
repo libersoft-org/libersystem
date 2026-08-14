@@ -1,0 +1,54 @@
+# LSIDL, the interface description language this system's protocols are written in.
+lico-syntax 1
+name lsidl
+glob *.lsidl
+max-nesting 2
+
+style text
+style keyword
+style comment
+style string
+
+context root text
+context doc-comment comment
+context line-comment comment
+context string string
+
+# LSIDL's doc comments are `///` and carry the contract, so they are their own context rather than
+# sharing one with an ordinary comment: a reader scanning for the rules wants them to stand out.
+open root /// doc-comment comment
+line doc-comment \n text
+open root // line-comment comment
+line line-comment \n text
+
+open root " string string
+escape string \\
+close string "
+
+keyword root interface keyword
+keyword root record keyword
+keyword root enum keyword
+keyword root variant keyword
+keyword root flags keyword
+keyword root resource keyword
+keyword root alias keyword
+keyword root func keyword
+keyword root result keyword
+keyword root option keyword
+keyword root list keyword
+keyword root stream keyword
+keyword root handle keyword
+keyword root string keyword
+keyword root bool keyword
+keyword root unit keyword
+keyword root u8 keyword
+keyword root u16 keyword
+keyword root u32 keyword
+keyword root u64 keyword
+keyword root s8 keyword
+keyword root s16 keyword
+keyword root s32 keyword
+keyword root s64 keyword
+keyword root f32 keyword
+keyword root f64 keyword
+keyword root char keyword

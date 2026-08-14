@@ -1,0 +1,28 @@
+# Markdown.
+
+# A prose format highlighted by structure rather than by vocabulary: what a reader wants to see is
+# where the headings and the code are, not which words are keywords.
+lico-syntax 1
+name markdown
+glob *.md
+glob *.markdown
+max-nesting 1
+
+style text
+style heading
+style code
+style emphasis
+
+context root text
+context heading heading
+context fenced-code code
+context inline-code code
+
+# A fence opens and closes with the same literal, which the nesting bound keeps finite.
+open root ``` fenced-code code
+close fenced-code ```
+open root ` inline-code code
+close inline-code `
+
+open root # heading heading
+line heading \n text

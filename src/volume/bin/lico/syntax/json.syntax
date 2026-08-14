@@ -1,0 +1,20 @@
+# JSON.
+lico-syntax 1
+name json
+glob *.json
+max-nesting 1
+
+style text
+style string
+style keyword
+
+context root text
+context string string
+
+open root " string string
+escape string \\
+close string "
+
+keyword root true keyword
+keyword root false keyword
+keyword root null keyword

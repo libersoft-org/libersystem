@@ -914,6 +914,12 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 			&b"cat 3>&1\n"[..],
 			&b"cd x | grep y\n"[..],
 			&b"cat < $NOTHING\n"[..],
+			// THE TOOLS ADDED FOR P02M0101, at the layer a person reaches them. `watch` and `less`
+			// own the terminal while they run, so they are not typed here - a test that took the
+			// alternate screen would be reading its own redraws. `tee` is the one of the three that
+			// composes, and this is it in the shape it is for: a producer, a copy to a file, and a
+			// consumer that still sees the stream.
+			&b"redirect_in motd.txt | tee teed.txt | wc\n"[..],
 		] {
 			terminal.send(Message::new(line.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not type at the shell")?;
 			for _ in 0..24 {

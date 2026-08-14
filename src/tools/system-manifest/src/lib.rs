@@ -847,7 +847,16 @@ fn validate_factory_file_shape(kind: FactoryFileKind, source: Option<&RelativePa
 			if source_destination != destination.as_str() {
 				push_error(errors, format!("{location}.destination"), format!("expected {source_destination}"));
 			}
-			let valid = matches!(destination.as_str(), "hello.txt" | "motd.txt" | "audio/test.mp3") || destination.as_str().strip_prefix("wallpapers/").is_some_and(|name| !name.is_empty() && !name.contains('/') && name.ends_with(".webp"));
+			// The factory files a source tree may install, by SHAPE rather than by a growing list of
+			// names: a greeting, a test tone, a wallpaper, and a LiberCommander syntax descriptor.
+			//
+			// The descriptors are data the applications read and never execute - the format carries
+			// literals and contexts, no commands and no paths - which is why a new language is one
+			// more file here rather than a change to either application. Bounding them to
+			// `bin/lico/syntax/*.syntax` with no deeper nesting is what keeps "install another
+			// descriptor" from becoming "install anything anywhere under bin".
+			let descriptor = destination.as_str().strip_prefix("bin/lico/syntax/").is_some_and(|name| !name.is_empty() && !name.contains('/') && name.ends_with(".syntax"));
+			let valid = matches!(destination.as_str(), "hello.txt" | "motd.txt" | "audio/test.mp3") || descriptor || destination.as_str().strip_prefix("wallpapers/").is_some_and(|name| !name.is_empty() && !name.contains('/') && name.ends_with(".webp"));
 			if !valid {
 				push_error(errors, format!("{location}.destination"), "factory source files must be hello.txt, motd.txt, audio/test.mp3, or a wallpapers/*.webp file");
 			}

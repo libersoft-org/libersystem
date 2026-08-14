@@ -565,6 +565,11 @@ fn a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline() {
 	// `cat < motd.txt > copied.txt` on a READ-ONLY archive: the destination cannot be opened, and
 	// what this pins is that the refusal reaches the person rather than the pipe.
 	assert!(says(b"cannot open for writing"), "an unwritable destination is reported: {:?}", core::str::from_utf8(out));
+	// `redirect_in motd.txt | tee teed.txt | wc` TYPED AT THE PROMPT: a three-stage line whose
+	// middle stage is the tool P02M0101 asks for, on a volume where its destination cannot be
+	// opened. Both halves of `tee`'s documented policy are visible in one row - the destination is
+	// named as refused, and the stream carries on to the far end.
+	assert!(says(b"2 13 83 83"), "tee passed the stream on through a typed line: {:?}", core::str::from_utf8(out));
 }
 
 tagged_test!(merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge, [Service, Process, PermissionService], id = "kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge", covers = ["kernel", "services"]);

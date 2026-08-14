@@ -1,0 +1,53 @@
+# Shell and configuration text: the scripts this system builds itself with, and the plain
+# `key=value` files beside them.
+lico-syntax 1
+name shell
+glob *.sh
+glob *.conf
+glob .profile
+first-line #!/bin/sh
+first-line #!/bin/bash
+first-line #!/usr/bin/env
+max-nesting 1
+
+style text
+style keyword
+style comment
+style string
+
+context root text
+context comment comment
+context string string
+context literal-string string
+
+open root # comment comment
+line comment \n text
+
+open root " string string
+escape string \\
+close string "
+# Single quotes in a shell take no escapes - not even a backslash - so this context has no escape
+# rule, and that absence is the behaviour rather than an omission.
+open root ' literal-string string
+close literal-string '
+
+keyword root if keyword
+keyword root then keyword
+keyword root else keyword
+keyword root elif keyword
+keyword root fi keyword
+keyword root for keyword
+keyword root while keyword
+keyword root until keyword
+keyword root do keyword
+keyword root done keyword
+keyword root case keyword
+keyword root esac keyword
+keyword root in keyword
+keyword root function keyword
+keyword root return keyword
+keyword root local keyword
+keyword root export keyword
+keyword root readonly keyword
+keyword root shift keyword
+keyword root exit keyword

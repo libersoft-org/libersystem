@@ -255,3 +255,71 @@ fn syntax_descriptor_rejects_hostile_or_ambiguous_rules_before_highlighting() {
 	assert!(matches!(parse_descriptor(b"lico-syntax 1\nname bad\nglob *.bad\nstyle plain\nmax-nesting 1\ncontext root plain\nopen missing /* root plain\n"), Err(SyntaxError::UnknownContext)));
 	assert!(matches!(parse_descriptor(b"lico-syntax 1\n\xff"), Err(SyntaxError::InvalidUtf8)));
 }
+
+// THE DESCRIPTORS THIS SYSTEM SHIPS, read by the parser that will read them at runtime.
+//
+// `include_bytes!` rather than a copy: a test written against a transcription of the asset proves
+// the transcription parses, which is not the question. These are the exact bytes installed under
+// `bin/lico/syntax/`, so a descriptor edited into an invalid state fails here rather than in a
+// viewer that silently falls back to plain text.
+const INSTALLED: [(&str, &[u8]); 6] = [
+	("rust", include_bytes!("../../../../../volume/bin/lico/syntax/rust.syntax")),
+	("lsidl", include_bytes!("../../../../../volume/bin/lico/syntax/lsidl.syntax")),
+	("toml", include_bytes!("../../../../../volume/bin/lico/syntax/toml.syntax")),
+	("json", include_bytes!("../../../../../volume/bin/lico/syntax/json.syntax")),
+	("markdown", include_bytes!("../../../../../volume/bin/lico/syntax/markdown.syntax")),
+	("shell", include_bytes!("../../../../../volume/bin/lico/syntax/shell.syntax")),
+];
+
+#[test]
+fn every_installed_descriptor_parses_and_names_itself() {
+	for (name, bytes) in INSTALLED {
+		let descriptor = parse_descriptor(bytes).unwrap_or_else(|error| panic!("{name}.syntax does not parse: {error:?}"));
+		assert_eq!(descriptor.name(), name, "the descriptor's `name` matches the file it is installed as");
+		assert!(descriptor.rule_count() > 0, "{name} carries rules rather than only declarations");
+		assert!(descriptor.context_count() > 0, "{name} declares at least a root context");
+		// AND IT HIGHLIGHTS SOMETHING. A descriptor that parses and produces no spans is the
+		// failure a person writing one actually reaches - a rule in the wrong context, a literal
+		// with a typo - and it looks exactly like a file with nothing to highlight. Feeding it its
+		// own bytes is the cheapest source of text guaranteed to contain what it describes: every
+		// one of these begins with a comment.
+		let mut state = descriptor.initial_state();
+		let mut spans = [TokenSpan { start: 0, end: 0, style: 0 }; 32];
+		let mut styled = 0;
+		for line in bytes.split(|byte| *byte == b'\n') {
+			let result = descriptor.highlight_line(&mut state, line, &mut spans);
+			styled += result.spans;
+		}
+		assert!(styled > 0, "{name} produced no spans over its own text");
+	}
+}
+
+#[test]
+fn the_installed_set_selects_one_descriptor_per_kind_of_file() {
+	// SELECTION IS THE HALF A BAD DESCRIPTOR BREAKS QUIETLY. A glob that is too greedy does not
+	// fail to parse - it steals files from another language, and the reader sees Rust keywords
+	// highlighted in a JSON file rather than an error. So this asserts what each name resolves to
+	// across the whole installed set rather than one descriptor at a time.
+	let descriptors: Vec<SyntaxDescriptor> = INSTALLED.iter().map(|(_, bytes)| parse_descriptor(bytes).expect("parses")).collect();
+	for (file, expected) in [
+		("main.rs", "rust"),
+		("storage.lsidl", "lsidl"),
+		("Cargo.toml", "toml"),
+		("Cargo.lock", "toml"),
+		("package.json", "json"),
+		("README.md", "markdown"),
+		("build.sh", "shell"),
+		("product.conf", "shell"),
+	] {
+		let selected = select_descriptor(&descriptors, file.as_bytes(), b"").unwrap_or_else(|| panic!("{file} selects nothing"));
+		assert_eq!(selected.descriptor.name(), expected, "{file}");
+		assert_eq!(selected.kind, SyntaxMatchKind::Filename, "{file} is recognised by its name");
+	}
+	// A FILE WITH NO EXTENSION FALLS TO ITS FIRST LINE, which is what a shell script without one
+	// has. And a file that matches neither selects NOTHING rather than something arbitrary: the
+	// caller's fallback is plain text, and a wrong language is worse than none.
+	let selected = select_descriptor(&descriptors, b"install", b"#!/bin/sh\n").expect("the shebang is recognised");
+	assert_eq!(selected.descriptor.name(), "shell");
+	assert_eq!(selected.kind, SyntaxMatchKind::FirstLine);
+	assert!(select_descriptor(&descriptors, b"notes", b"nothing in particular").is_none(), "an unrecognised file selects no descriptor at all");
+}

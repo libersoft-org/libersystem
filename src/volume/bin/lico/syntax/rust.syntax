@@ -1,0 +1,79 @@
+# Rust, for LiberCommander's viewer and editor.
+
+# A DESCRIPTOR IS DATA, and this file is the proof of it: no commands, no paths, no capability
+# requests - literals and the contexts they switch between. A language is added by installing
+# another one of these, never by recompiling either application.
+
+# The rules are LITERAL matches rather than patterns on purpose. A regular expression engine is
+# where a highlighter turns into an interpreter running input somebody else wrote, and a viewer
+# that can be made to loop by opening a file is a viewer with a denial of service in it. Literals
+# always make progress.
+lico-syntax 1
+name rust
+glob *.rs
+max-nesting 4
+
+style text
+style keyword
+style comment
+style string
+style character
+
+context root text
+context line-comment comment
+context block-comment comment
+context string string
+context character character
+
+# Comments. The block form nests in Rust, which is what `max-nesting` is for: an inner `/*` opens
+# another level and the outer `*/` does not close the whole thing.
+open root /* block-comment comment
+open block-comment /* block-comment comment
+close block-comment */
+open root // line-comment comment
+line line-comment \n text
+
+# Strings and characters. The escape rule is what stops `"\""` from ending the string at the second
+# quote - the pair is consumed before the close is looked for.
+open root " string string
+escape string \\
+close string "
+open root ' character character
+escape character \\
+close character '
+
+keyword root fn keyword
+keyword root let keyword
+keyword root mut keyword
+keyword root const keyword
+keyword root static keyword
+keyword root struct keyword
+keyword root enum keyword
+keyword root trait keyword
+keyword root impl keyword
+keyword root for keyword
+keyword root while keyword
+keyword root loop keyword
+keyword root if keyword
+keyword root else keyword
+keyword root match keyword
+keyword root return keyword
+keyword root break keyword
+keyword root continue keyword
+keyword root pub keyword
+keyword root use keyword
+keyword root mod keyword
+keyword root crate keyword
+keyword root self keyword
+keyword root Self keyword
+keyword root where keyword
+keyword root unsafe keyword
+keyword root async keyword
+keyword root await keyword
+keyword root move keyword
+keyword root ref keyword
+keyword root type keyword
+keyword root as keyword
+keyword root dyn keyword
+keyword root true keyword
+keyword root false keyword

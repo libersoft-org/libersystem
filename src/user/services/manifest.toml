@@ -1548,6 +1548,42 @@ kind = "source"
 source = "volume/wallpapers/logo.webp"
 destination = "wallpapers/logo.webp"
 
+[[factory_files]]
+name = "lico-syntax-rust"
+kind = "source"
+source = "volume/bin/lico/syntax/rust.syntax"
+destination = "bin/lico/syntax/rust.syntax"
+
+[[factory_files]]
+name = "lico-syntax-lsidl"
+kind = "source"
+source = "volume/bin/lico/syntax/lsidl.syntax"
+destination = "bin/lico/syntax/lsidl.syntax"
+
+[[factory_files]]
+name = "lico-syntax-toml"
+kind = "source"
+source = "volume/bin/lico/syntax/toml.syntax"
+destination = "bin/lico/syntax/toml.syntax"
+
+[[factory_files]]
+name = "lico-syntax-json"
+kind = "source"
+source = "volume/bin/lico/syntax/json.syntax"
+destination = "bin/lico/syntax/json.syntax"
+
+[[factory_files]]
+name = "lico-syntax-markdown"
+kind = "source"
+source = "volume/bin/lico/syntax/markdown.syntax"
+destination = "bin/lico/syntax/markdown.syntax"
+
+[[factory_files]]
+name = "lico-syntax-shell"
+kind = "source"
+source = "volume/bin/lico/syntax/shell.syntax"
+destination = "bin/lico/syntax/shell.syntax"
+
 [[runtime_paths]]
 name = "command-directory"
 owner = "shell"

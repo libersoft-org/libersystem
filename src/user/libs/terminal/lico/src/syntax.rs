@@ -316,7 +316,12 @@ pub fn parse_descriptor(bytes: &[u8]) -> Result<SyntaxDescriptor, SyntaxError> {
 	let mut max_nesting = None;
 	for raw in source.split('\n') {
 		let line = raw.strip_suffix('\r').unwrap_or(raw).trim();
-		if line.is_empty() || line.starts_with("# ") {
+		// A COMMENT IS `#` WITH OR WITHOUT TEXT AFTER IT. The rule required the space, so a bare
+		// `#` - the line every multi-paragraph comment uses to separate its paragraphs - fell
+		// through to the header check and the file was refused as `InvalidHeader`, naming a line
+		// that was right there and correct. A format whose comment syntax has a trap in it is a
+		// format people write invalid files in.
+		if line.is_empty() || line == "#" || line.starts_with("# ") {
 			continue;
 		}
 		lines += 1;
