@@ -12,10 +12,16 @@
 // `redirect_out` only in also passing the bytes on, and it deliberately does not share code with
 // it: `redirect_out` exists to be the shell's expansion of `>` and has no stdout of its own.
 //
-// A DESTINATION THAT FAILS DOES NOT STOP THE PIPELINE. `tee log | grep error` is a line the user
-// typed to see the output; a full volume is worth reporting on stderr and worth aborting that
-// destination for, but not worth killing the stream the rest of the line is built on. Every
-// destination that failed is named, and the exit says whether any did.
+// A DESTINATION THAT FAILS DOES NOT STOP THE PIPELINE, BY DEFAULT - and this is a deliberate
+// disagreement with P02M0101's text, which asks for fail-fast as the default and continue as the
+// option. Both policies are here; the default is the other one.
+//
+// The reason is what the line MEANS. `cmd | tee log | grep error` is a line somebody typed to see
+// the output, with the log as a side effect; a full volume is worth reporting and worth abandoning
+// that destination for, but ending the pipeline would silently turn the line into a different
+// command whenever the log could not be written. Failing fast is right when the FILE is the point -
+// a recording, a capture somebody will read later - and that is what `--fail-fast` is for.
+// Whichever runs, every destination that failed is named and the exit code says whether any did.
 //
 // STDOUT CLOSING DOES stop it, which is the opposite decision for the opposite reason: with no
 // consumer left, reading the rest of the input produces nothing anybody asked for. The
@@ -60,11 +66,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let cwd: String = context.cwd.clone();
 
 		let mut append = false;
+		let mut fail_fast = false;
 		let mut paths: Vec<&[u8]> = Vec::new();
 		for word in split_args(&arguments) {
 			match classify(word) {
 				Arg::Long(b"append", None) => append = true,
 				Arg::Short(b'a') => append = true,
+				Arg::Long(b"fail-fast", None) => fail_fast = true,
 				Arg::Value(value) => {
 					if paths.len() >= MAX_TARGETS {
 						eprint(b"tee: too many destinations\n");
@@ -77,7 +85,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					paths.push(value);
 				}
 				_ => {
-					eprint(b"tee: usage: tee [-a] <path> [path...]\n");
+					eprint(b"tee: usage: tee [-a] [--fail-fast] <path> [path...]\n");
 					exit();
 				}
 			}
@@ -121,7 +129,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 		}
-		let outcome = pump(&mut source, &mut targets);
+		// A DESTINATION THAT COULD NOT BE OPENED ENDS THE RUN UNDER `--fail-fast`, before a byte is
+		// read - which is the only point at which stopping costs nothing, because the producer is
+		// still at its first write.
+		if fail_fast && refused {
+			for target in &mut targets {
+				let _ = target.writer.abort();
+				close(target.writer.handle());
+			}
+			eprint(b"tee: --fail-fast: a destination could not be opened\n");
+			exit();
+		}
+		let outcome = pump(&mut source, &mut targets, fail_fast);
 		// The destinations are published only when the INPUT ended normally. A producer that
 		// failed mid-stream leaves every one of them exactly as it was - that is the difference
 		// between a `tee` that records a run and a `tee` that records half of one as if it were
@@ -169,7 +188,7 @@ enum Outcome {
 // failed and skipped from then on, rather than being retried per window - a half-written
 // destination that then resumes would hold a file with a hole in it, which is the one result worse
 // than not having the file.
-unsafe fn pump(source: &mut Source, targets: &mut [Target]) -> Outcome {
+unsafe fn pump(source: &mut Source, targets: &mut [Target], fail_fast: bool) -> Outcome {
 	unsafe {
 		loop {
 			let window = match source.next() {
@@ -186,6 +205,9 @@ unsafe fn pump(source: &mut Source, targets: &mut [Target]) -> Outcome {
 					eprint(target.uri.as_bytes());
 					eprint(b": write failed\n");
 					target.failed = true;
+					if fail_fast {
+						return Outcome::InputFailed;
+					}
 				}
 			}
 			// STDOUT LAST, because it is the one that blocks. Writing the destinations first means

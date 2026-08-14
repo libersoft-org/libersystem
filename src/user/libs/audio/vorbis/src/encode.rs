@@ -693,6 +693,232 @@ fn y_for(magnitude: f32) -> u32 {
 	low
 }
 
+/// The codeword for one entry: `(code, bits)`, most significant bit first.
+impl Codebook {
+	pub fn codeword(&self, entry: usize) -> Option<(u32, u8)> {
+		Some((*self.codes.get(entry)?, *self.lengths.get(entry)?))
+	}
+}
+
+/// One audio packet: the floor and the residue for every channel.
+///
+/// `spectra` is one MDCT spectrum per channel, each `1 << (blocksize_log2 - 1)` long and already
+/// scaled into the range `floor_ceiling` allows - see `fit_floor` for why that scaling is the
+/// caller's to make and to be seen making.
+///
+/// THE PACKET IS THE FLOOR AND WHAT IS LEFT AFTER IT. A floor is fitted over each channel's
+/// spectrum, the spectrum is divided by the curve the decoder will draw - not by the curve that was
+/// fitted, which is the same thing only because `render_floor` runs the decoder's own two stages -
+/// and the quotient is quantized against the residue book. That quotient sits around one by
+/// construction, which is the whole reason a floor exists: coding the spectrum directly would spend
+/// the same bits saying how loud each band is over and over.
+pub fn encode_audio_packet(spectra: &[Vec<f32>], blocksize_log2: u8) -> Option<Vec<u8>> {
+	let channels = spectra.len();
+	if channels == 0 || channels > 255 {
+		return None;
+	}
+	let n: usize = 1 << (blocksize_log2 - 1);
+	if spectra.iter().any(|spectrum| spectrum.len() != n) {
+		return None;
+	}
+	let floor_book = Codebook::flat(FLOOR_RANGE as usize, None)?;
+	let class_book = Codebook::flat(2, None)?;
+	let residue_book = Codebook::flat(RESIDUE_ENTRIES, Some((RESIDUE_MINIMUM, RESIDUE_DELTA, 6)))?;
+	let mut out = BitWriter::new();
+	// The packet type: 0 for audio. Then the mode number, in `ilog(modes - 1)` bits - which for the
+	// one mode this encoder configures is ZERO bits, so nothing is written. Writing a zero here
+	// instead would shift every field after it by one bit, which is a packet that decodes into
+	// noise with nothing in it wrong.
+	out.write(0, 1)?;
+
+	// THE FLOORS, ALL CHANNELS FIRST, because that is the order the decoder reads them: every
+	// channel's floor, then one residue vector covering all of them.
+	let mut curves: Vec<Vec<f32>> = Vec::new();
+	curves.try_reserve_exact(channels).ok()?;
+	for spectrum in spectra {
+		let magnitude: Vec<f32> = spectrum.iter().map(|value| if *value < 0.0 { -*value } else { *value }).collect();
+		let coded = fit_floor(&magnitude, blocksize_log2)?;
+		curves.push(render_floor(&coded, blocksize_log2)?);
+		// Non-zero: this channel has a floor. A zero here says the whole channel is silent and the
+		// decoder skips its residue, which is a different packet shape.
+		out.write(1, 1)?;
+		// The two literal posts, in `ilog(range - 1)` bits.
+		let bits: u8 = ilog(FLOOR_RANGE - 1);
+		out.write(coded[0], bits)?;
+		out.write(coded[1], bits)?;
+		// Then the rest, coded with the floor book. Two partitions of one class with no subclasses,
+		// so there is no class codeword at all and the posts follow in order.
+		for &value in coded.iter().skip(2) {
+			let (code, length) = floor_book.codeword(value as usize)?;
+			out.write_codeword(code, length)?;
+		}
+	}
+
+	// THE RESIDUE, INTERLEAVED. Residue format 2 codes one vector of every channel's values taken
+	// in turn - `c0[0], c1[0], c0[1], c1[1], ...` - and the decoder de-interleaves it afterwards.
+	// Interleaving is not an implementation detail here: it is what makes a stereo partition cover
+	// the same band in both channels, so one classification decides for both.
+	let mut interleaved: Vec<f32> = Vec::new();
+	interleaved.try_reserve_exact(n * channels).ok()?;
+	for bin in 0..n {
+		for channel in 0..channels {
+			// The floor is never zero - the table's smallest entry is a value too small to hear but
+			// not zero - so this division is always defined.
+			interleaved.push(spectra[channel][bin] / curves[channel][bin]);
+		}
+	}
+	let partitions: usize = interleaved.len() / RESIDUE_PARTITION as usize;
+	// The class codeword for one partition. One classification means every partition is class 0,
+	// and the classbook has two entries so it costs one bit - the smallest legal book.
+	let (class_code, class_bits) = class_book.codeword(0)?;
+	for partition in 0..partitions {
+		// PASS ZERO ONLY, and the class codeword comes first because the decoder reads all the
+		// classifications for a group of `classwords_per_codeword` partitions before the values.
+		// Every book here has one dimension, so that group is one partition and the two interleave
+		// perfectly.
+		out.write_codeword(class_code, class_bits)?;
+		for index in 0..RESIDUE_PARTITION as usize {
+			let value = interleaved[partition * RESIDUE_PARTITION as usize + index];
+			let (code, length) = residue_book.codeword(quantize_residue(value))?;
+			out.write_codeword(code, length)?;
+		}
+	}
+	Some(out.finish())
+}
+
+/// The residue book entry closest to `value`.
+///
+/// SATURATING RATHER THAN WRAPPING, and the saturation should never be reached: `fit_floor` puts
+/// the curve at or above every magnitude, so the quotient is within -1 .. +1 by construction. It is
+/// clamped anyway because the alternative to a clamp here is an index out of the book - a panic in
+/// an encoder, on input that is merely unusual.
+fn quantize_residue(value: f32) -> usize {
+	let scaled = (value - RESIDUE_MINIMUM) / RESIDUE_DELTA;
+	let rounded = libm::floorf(scaled + 0.5);
+	if rounded < 0.0 {
+		0
+	} else if rounded >= (RESIDUE_ENTRIES - 1) as f32 {
+		RESIDUE_ENTRIES - 1
+	} else {
+		rounded as usize
+	}
+}
+
+/// The number of bits needed to hold `value` - the format's own `ilog`, which is zero for zero.
+fn ilog(value: u32) -> u8 {
+	(32 - value.leading_zeros()) as u8
+}
+
 #[cfg(test)]
 #[path = "encode_tests.rs"]
 mod tests;
+
+/// Encode interleaved-by-channel PCM into a complete Ogg Vorbis stream.
+///
+/// `pcm` is one vector of samples per channel, each the same length, in -1.0 .. 1.0. The result is
+/// a stream this tree's own player reads.
+///
+/// THE BLOCKS OVERLAP BY HALF, which is not a choice - it is what the MDCT is. Each packet
+/// transforms `2n` windowed samples and the decoder recovers `n` of them by adding the second half
+/// of one block's inverse to the first half of the next. So a run of `m` samples needs `m/n + 1`
+/// packets, the first of which decodes to nothing (it has no predecessor to overlap with) and the
+/// last of which is the tail.
+///
+/// THE SPECTRUM IS SCALED INTO THE FLOOR'S REACH, here, where the decision is visible. `fit_floor`
+/// refuses a spectrum it cannot sit above rather than clipping it or scaling it silently, because
+/// there is no gain field in the format to record a scaling with - so the scaling has to be one the
+/// caller can see, and it is applied uniformly across the whole stream so it cannot be heard as
+/// anything but level.
+pub fn encode(pcm: &[Vec<f32>], rate: u32, blocksize_log2: u8, serial: u32) -> Option<Vec<u8>> {
+	let channels = pcm.len();
+	if channels == 0 || channels > 255 || rate == 0 || !(6..=13).contains(&blocksize_log2) {
+		return None;
+	}
+	let frames = pcm[0].len();
+	if pcm.iter().any(|channel| channel.len() != frames) {
+		return None;
+	}
+	let n: usize = 1 << (blocksize_log2 - 1);
+	let window = window_for(blocksize_log2);
+	let mut writer = ogg::PageWriter::new(serial);
+	// The identification header, ALONE ON THE FIRST PAGE, which the format requires: a reader that
+	// finds anything beside it is entitled to refuse the stream.
+	writer.write_packet(&write_ident(channels as u8, rate, blocksize_log2)?, None).ok()?;
+	writer.flush().ok()?;
+	writer.write_packet(&write_comment("LiberSystem")?, None).ok()?;
+	writer.write_packet(&write_setup(channels as u8, blocksize_log2)?, None).ok()?;
+	writer.flush().ok()?;
+
+	// TWO PASSES OVER THE SIGNAL, and the second is not avoidable by being clever.
+	//
+	// The floor must sit above every spectral magnitude and the highest floor this configuration
+	// can name is just under 1.0, so the spectrum has to be scaled into that reach - and the scale
+	// has to be ONE NUMBER FOR THE WHOLE STREAM, because a scale that changed between packets would
+	// be a gain nothing in the stream records, which is audible as pumping.
+	//
+	// So the peak has to be known before the first packet is written, and the peak of a SPECTRUM is
+	// not a function of the peak of the samples: the transform's gain depends on how the signal
+	// lines up with the window and the bins. A bound computed from the samples alone is correct and
+	// costs about twelve decibels of headroom on every file to cover a case most files do not hit.
+	// Measuring is one more pass of a transform that runs once per file.
+	//
+	// The spectra are NOT kept between the passes. Holding them would make the encoder's memory a
+	// function of the file's length, which is the property the block structure exists to avoid.
+	let mut block: Vec<f32> = Vec::new();
+	block.try_reserve_exact(n * 2).ok()?;
+	// `+ 2`, and both are boundaries rather than slack. The FIRST packet decodes to nothing - it is
+	// the left half of the first overlap, with no predecessor to add to - and the LAST block of
+	// signal needs a packet after it to complete its own overlap, or its second half never comes
+	// out. A stream one packet short ends a full block early, which is a tail nobody hears going
+	// missing until they compare lengths.
+	let packets = frames.div_ceil(n) + 2;
+	let mut spectrum_of = |index: usize, channel: &Vec<f32>, block: &mut Vec<f32>| -> Option<Vec<f32>> {
+		let start: isize = index as isize * n as isize - n as isize;
+		block.clear();
+		for offset in 0..n * 2 {
+			let at: isize = start + offset as isize;
+			// Outside the signal is silence, which is what the overlap of the first and last blocks
+			// is made of - and it is why the first packet decodes to nothing.
+			let sample: f32 = if at < 0 || at as usize >= frames { 0.0 } else { channel[at as usize] };
+			block.push(sample * window[offset]);
+		}
+		forward_mdct(block)
+	};
+	let mut peak: f32 = 0.0;
+	for index in 0..packets {
+		for channel in pcm {
+			for value in spectrum_of(index, channel, &mut block)? {
+				let magnitude = if value < 0.0 { -value } else { value };
+				if magnitude > peak {
+					peak = magnitude;
+				}
+			}
+		}
+	}
+	// A little under the reach rather than exactly at it: `fit_floor` refuses a magnitude above the
+	// highest floor it can name, and equality with a float that has been through a transform is not
+	// something to rely on.
+	let scale: f32 = if peak > 0.0 { floor_ceiling() * 0.98 / peak } else { 1.0 };
+
+	let mut granule: u64 = 0;
+	for index in 0..packets {
+		let mut spectra: Vec<Vec<f32>> = Vec::new();
+		spectra.try_reserve_exact(channels).ok()?;
+		for channel in pcm {
+			let mut spectrum = spectrum_of(index, channel, &mut block)?;
+			for value in &mut spectrum {
+				*value *= scale;
+			}
+			spectra.push(spectrum);
+		}
+		let packet = encode_audio_packet(&spectra, blocksize_log2)?;
+		// The granule of a packet is how many samples the stream can produce once it has been
+		// decoded. The first produces none; every one after it completes one block's overlap.
+		if index > 0 {
+			granule = granule.saturating_add(n as u64);
+		}
+		let position = core::cmp::min(granule, frames as u64);
+		writer.write_packet(&packet, Some(position)).ok()?;
+	}
+	writer.finish().ok()
+}

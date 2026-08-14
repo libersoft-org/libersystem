@@ -234,6 +234,20 @@ impl PageWriter {
 		Ok(())
 	}
 
+	/// End the current page here, whatever is on it.
+	///
+	/// A PACKET BOUNDARY IS NOT ALWAYS A PAGE BOUNDARY, and sometimes a format demands one. Vorbis
+	/// requires its identification header to be alone on the first page - a reader that finds
+	/// anything else beside it is entitled to refuse the stream - and the writer packs as much into
+	/// a page as fits, so without this the ident and the comment share one. Emitting nothing when
+	/// there is nothing held, so calling it twice costs nothing and cannot produce an empty page.
+	pub fn flush(&mut self) -> Result<(), Error> {
+		if self.segments.is_empty() {
+			return Ok(());
+		}
+		self.flush_page(false)
+	}
+
 	/// Emit the page being built, if it holds anything. A stream that ends mid-packet is a
 	/// truncated stream, so `finish` is what says the last packet was the last one.
 	pub fn finish(mut self) -> Result<Vec<u8>, Error> {

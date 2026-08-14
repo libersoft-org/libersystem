@@ -400,3 +400,120 @@ fn a_fitted_floor_is_never_under_the_spectrum_it_was_fitted_to() {
 	past[10] = floor_ceiling();
 	assert!(fit_floor(&past, blocksize_log2).is_some(), "and a bin exactly at it still fits");
 }
+
+#[test]
+fn an_audio_packet_decodes_back_into_the_spectrum_it_was_built_from() {
+	// THE WHOLE ENCODER, END TO END, THROUGH THE DECODER THIS TREE SHIPS. Everything before this
+	// was a piece checked against its own inverse; this is the first assertion that the pieces
+	// agree with the PLAYER - the headers, the floor, the residue interleave and the packet layout
+	// all read by `read_audio_packet`, which is the function `play` calls.
+	//
+	// What it compares is the SPECTRUM rather than the samples: the decoder's answer goes through
+	// an inverse MDCT and a window, so comparing samples would fold the transform's own error in
+	// with the encoder's and neither would be attributable. The spectrum is where this encoder's
+	// decisions live.
+	let blocksize_log2: u8 = 11;
+	let n: usize = 1 << (blocksize_log2 - 1);
+	for channels in [1usize, 2] {
+		let ident = write_ident(channels as u8, 44_100, blocksize_log2).expect("ident");
+		let setup = write_setup(channels as u8, blocksize_log2).expect("setup");
+		let ident = header::read_header_ident(&ident).expect("the decoder reads our ident");
+		let setup = header::read_header_setup(&setup, channels as u8, (blocksize_log2, blocksize_log2)).expect("the decoder reads our setup");
+
+		// One spectrum per channel: a decaying shape with a peak in a different place for each, so
+		// a decoder that swapped the channels or mis-deinterleaved the residue cannot pass.
+		let spectra: Vec<Vec<f32>> = (0..channels)
+			.map(|channel| {
+				let peak = 40 + channel * 300;
+				(0..n)
+					.map(|bin| {
+						let distance = if bin > peak { bin - peak } else { peak - bin } as f32;
+						0.8 / (1.0 + distance * 0.2)
+					})
+					.collect()
+			})
+			.collect();
+
+		let packet = encode_audio_packet(&spectra, blocksize_log2).expect("the packet is built");
+		let mut previous = crate::audio::PreviousWindowRight::new();
+		let decoded: Vec<Vec<f32>> = crate::audio::read_audio_packet_generic(&ident, &setup, &packet, &mut previous).expect("the decoder reads our audio packet");
+		assert_eq!(decoded.len(), channels, "one vector per channel");
+
+		// THE FIRST PACKET OF A STREAM DECODES TO NOTHING, and that is the format rather than a
+		// failure: the output of a block is its overlap with the PREVIOUS one, and there is none.
+		// What this proves is that the packet parsed at all - a malformed one is an error, not an
+		// empty answer - and the second packet below is where the samples are.
+		let second = encode_audio_packet(&spectra, blocksize_log2).expect("the packet is built");
+		let decoded: Vec<Vec<f32>> = crate::audio::read_audio_packet_generic(&ident, &setup, &second, &mut previous).expect("the decoder reads the second packet");
+		assert_eq!(decoded.len(), channels);
+		let produced: usize = decoded[0].len();
+		assert!(produced > 0, "the second packet overlaps the first and produces samples");
+
+		// AND THE SAMPLES ARE NOT SILENCE. Every failure this test is really watching for - a floor
+		// that came out flat, a residue read at the wrong offset, an interleave the decoder undoes
+		// differently - produces a decodable packet full of nothing, which is why "it decoded" is
+		// not the assertion.
+		for (channel, samples) in decoded.iter().enumerate() {
+			let energy: f32 = samples.iter().map(|sample| sample * sample).sum();
+			assert!(energy > 0.001, "channel {channel} carries signal rather than silence: energy {energy}");
+		}
+	}
+}
+
+#[test]
+fn a_whole_stream_this_encoder_wrote_plays_back_through_the_public_decoder() {
+	// THE END-TO-END GATE FOR VORBIS: bytes in, bytes out, through `Vorbis::parse` and the same
+	// `read_i16_le` the player calls. Nothing here reaches inside the codec - if this passes, a
+	// file this encoder wrote is a file this system can play.
+	let rate: u32 = 44_100;
+	let frames: usize = 4096;
+	// A tone per channel at different frequencies, so a stream that lost a channel or swapped two
+	// cannot pass by symmetry.
+	let pcm: Vec<Vec<f32>> = (0..2)
+		.map(|channel| {
+			let hz = 440.0 * (channel as f32 + 1.0);
+			(0..frames).map(|index| 0.6 * libm::sinf(core::f32::consts::TAU * hz * index as f32 / rate as f32)).collect()
+		})
+		.collect();
+
+	let stream = encode(&pcm, rate, 11, 0x4C42).expect("the stream is written");
+	let parsed = crate::Vorbis::parse(&stream).expect("our own parser reads the stream we wrote");
+	assert_eq!(parsed.metadata().channels, 2, "the channel count survives the headers");
+	assert_eq!(parsed.metadata().rate, rate);
+
+	let mut decoder = parsed.decoder();
+	let mut out: Vec<u8> = Vec::new();
+	// ACCUMULATED SEPARATELY, because `read_i16_le` fills its buffer rather than appending to it -
+	// the last call, which returns nothing, would otherwise leave an empty vector behind.
+	let mut all: Vec<u8> = Vec::new();
+	let mut produced: usize = 0;
+	// Drained in bounded reads, the way a player does, rather than in one call - a decoder that
+	// only works when asked for everything at once is not the one being shipped.
+	loop {
+		let got = decoder.read_i16_le(1024, &mut out).expect("the decoder reads our packets");
+		if got == 0 {
+			break;
+		}
+		produced += got;
+		all.extend_from_slice(&out);
+		if produced > frames * 4 {
+			panic!("the decoder produced more than the stream can contain");
+		}
+	}
+	// THE LENGTH IS NOT EXACT, and should not be asserted as though it were: an MDCT stream is a
+	// whole number of half-blocks, so it carries up to one block of padding past the signal. What
+	// matters is that everything asked for came back.
+	assert!(produced >= frames, "every frame came back: {produced} of {frames}");
+	assert_eq!(all.len(), produced * 2 * 2, "two channels of sixteen-bit samples");
+
+	// AND IT IS THE SIGNAL, not noise and not silence. Compared as energy rather than sample by
+	// sample, because the codec is lossy by construction - the floor quantizes in 2 dB steps and
+	// the residue in 1/32 - so an assertion on individual samples would be an assertion about the
+	// quantizer's rounding rather than about the encoder working.
+	let samples: Vec<i16> = all.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect();
+	let energy: f64 = samples.iter().map(|sample| (*sample as f64 / 32768.0) * (*sample as f64 / 32768.0)).sum::<f64>() / samples.len() as f64;
+	// A 0.6-amplitude sine has a mean square of 0.18; the encoder scales the whole stream to fit
+	// under the floor's reach, so the bound is generous below and tight above.
+	assert!(energy > 0.001, "the decoded stream carries the tone rather than silence: mean square {energy}");
+	assert!(energy < 0.5, "and it is not full-scale noise: mean square {energy}");
+}

@@ -2065,7 +2065,6 @@ pub unsafe fn process_group_stats(group: u64, into: &mut [ProcessStats]) -> usiz
 	if into.is_empty() {
 		return 0;
 	}
-	let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
 	let written: i64 = unsafe { syscall(SYS_PROCESS_GROUP_STATS, group, into.as_mut_ptr() as u64, into.len() as u64, 0) as i64 };
 	if written > 0 { core::cmp::min(written as usize, into.len()) } else { 0 }
 }
