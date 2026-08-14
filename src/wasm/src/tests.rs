@@ -1382,20 +1382,41 @@ mod spec {
 		//     1  malformed limits flags  - a flags byte above 1 is a feature this engine does not
 		//                                  have, read as though bit 0 were the only one that counts.
 		//
-		// Twenty remain, and they are named rather than hidden: integer-width forms this parser
-		// reaches by other paths, two memop flags, one limits flags, an END-opcode case and an
-		// illegal-opcode one. Each is a real conformance gap and none of them is a way to run
-		// something dangerous - those modules are refused later, at decode or at validation, rather
-		// than not at all.
+		// RE-MEASURED, 2026-08-14: thirteen. Seven more closed when the signed LEB readers were split
+		// by width - `s32` for `i32.const`, `s33` for a block type, `s64` for `i64.const`, each
+		// bounded by its own length and its own last-byte rule - and one when the table parser was
+		// given the flags rule the memory parser already stated.
+		//
+		// Thirteen remain, and they are named rather than hidden: two memop flags, an END-opcode
+		// case, an illegal-opcode one, and integer-width forms this parser reaches by other paths.
+		// Each is a real conformance gap and none of them is a way to run something dangerous - see
+		// the assertion below, which is the one that says so rather than assuming it.
 		//
 		// The ceiling is a RATCHET: it may go down and must not go up, so a change that starts
 		// accepting a module the specification calls malformed has to move this number and say why.
-		const ACCEPTED_CEILING: usize = 20;
+		const ACCEPTED_CEILING: usize = 13;
 		let all = cases();
 		let malformed: Vec<&Case<'_>> = all.iter().filter(|c| c.kind == "malformed").collect();
 		assert!(malformed.len() > 600, "only {} malformed cases were extracted - the fixture is not what it was", malformed.len());
 		let accepted: Vec<&&Case<'_>> = malformed.iter().filter(|c| parse(&c.bytes).is_ok()).collect();
 		assert!(accepted.len() <= ACCEPTED_CEILING, "{} of {} specification-malformed modules parse, past the recorded {ACCEPTED_CEILING}: {:?}", accepted.len(), malformed.len(), accepted.iter().map(|c| (c.file, c.reason)).take(8).collect::<Vec<_>>());
+
+		// AND NONE OF THEM REACHES AN INSTANCE, which is the claim the ceiling above only gestures
+		// at. `parse` does not decode function bodies - it stores them - so a malformed body is
+		// invisible to that count and the thirteen above are a statement about section structure
+		// alone. The layer that decides behaviour is `parse -> validate -> Instance::new`, and this
+		// is an ASSERTION rather than a ratchet: zero, and it may not become anything else.
+		let reached: Vec<&&Case<'_>> = malformed.iter().filter(|c| instantiates(&c.bytes)).collect();
+		assert!(reached.is_empty(), "{} specification-malformed modules reach a running instance: {:?}", reached.len(), reached.iter().map(|c| (c.file, c.reason)).take(8).collect::<Vec<_>>());
+	}
+
+	// Does this module get all the way to something that can be executed?
+	//
+	// The corpus assertions were written over `parse` alone, which is the first rung and was the
+	// only one: a module that parses, validates, instantiates and then computes the wrong answer
+	// passed every one of them. This engine's own worst defect to date was exactly such a module.
+	fn instantiates(bytes: &[u8]) -> bool {
+		parse(bytes).ok().and_then(|m| validate(m).ok()).is_some_and(|v| crate::interp::Instance::new(&v).is_ok())
 	}
 
 	#[test]
@@ -1424,11 +1445,22 @@ mod spec {
 		// What can be held is the COUNT: the number this engine accepts today, which may go up and
 		// must not go down. A change that starts refusing a module the specification calls valid has
 		// to move this number and say why.
+		//
+		// RE-MEASURED, 2026-08-14: 55 of 76, raised from a floor of 40 that no longer described the
+		// engine. A ratchet left below what is actually true stops being a ratchet - it approves
+		// fifteen regressions before it notices one.
 		let all = cases();
 		let valid: Vec<&Case<'_>> = all.iter().filter(|c| c.kind == "valid").collect();
 		let accepted = valid.iter().filter(|c| parse(&c.bytes).is_ok()).count();
 		assert!(valid.len() >= 70, "only {} valid cases were extracted - the fixture is not what it was", valid.len());
-		assert!(accepted >= 40, "this engine accepts {accepted} of {} specification-valid modules, down from 40 - a subset got smaller and the reason belongs here", valid.len());
+		assert!(accepted >= 55, "this engine accepts {accepted} of {} specification-valid modules, down from 55 - a subset got smaller and the reason belongs here", valid.len());
+
+		// AND EVERY ONE OF THEM GETS TO AN INSTANCE. The count above is about the parser; a module
+		// the specification calls valid that parses and is then refused by this engine's validator
+		// or instantiation is a subset boundary somewhere nobody wrote down. Measured 2026-08-14: 55
+		// of 55, so the two numbers are the same number and this asserts they stay that way.
+		let instantiated = valid.iter().filter(|c| instantiates(&c.bytes)).count();
+		assert_eq!(instantiated, accepted, "{accepted} specification-valid modules parse and {instantiated} reach an instance - the gap is a refusal past the parser that nothing names");
 	}
 
 	#[test]
@@ -1446,4 +1478,335 @@ mod spec {
 		let detail: Vec<String> = all.iter().filter(|c| c.file == "binary-leb128.wast" && c.kind == "valid").filter_map(|c| parse(&c.bytes).err().map(|e| alloc::format!("{:?} over {}", e, hex(&c.bytes)))).collect();
 		assert!(refused.is_empty(), "{} of the LEB128 file's valid modules are refused: {detail:?}", refused.len());
 	}
+}
+
+// The specification's own EXECUTABLE assertions: what a module returns, not whether it is accepted.
+//
+// `spec` above answers "does this engine agree about which modules are well-formed", which is the
+// first rung and was for a long time the only one - and a module that parses, validates,
+// instantiates and then computes the WRONG ANSWER passes every assertion in it. That is not a
+// hypothetical: this engine recorded a parameterised block's label below its parameters in the
+// validator and above them in the interpreter, so `(block (param i32) (result i32) ... br 0)`
+// returned 50 where the specification says 40, with the whole binary corpus green.
+//
+// `src/wasm/tests/spec-run-cases.tsv` is produced by `src/tools/extract-wasm-spec-runs.py` from
+// `spec/test/core`, via `wasm-tools json-from-wast` - the text format is a project to parse and this
+// does not parse it. Integer assertions only; the float cases carry comparison rules
+// (`nan:canonical`, `nan:arithmetic`) that a flattened bit pattern would misstate. Regenerated
+// 2026-08-14: 150 modules, 2692 assertions.
+#[cfg(test)]
+mod spec_run {
+	use super::*;
+	use alloc::collections::BTreeMap;
+
+	struct Run<'a> {
+		module: usize,
+		file: &'a str,
+		export: &'a str,
+		args: &'a str,
+		expected: &'a str,
+	}
+
+	const TSV: &str = include_str!("../tests/spec-run-cases.tsv");
+
+	fn fixture() -> (BTreeMap<usize, Vec<u8>>, Vec<Run<'static>>) {
+		let mut modules: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+		let mut runs: Vec<Run<'static>> = Vec::new();
+		for line in TSV.lines() {
+			let f: Vec<&str> = line.split('\t').collect();
+			match f.first() {
+				Some(&"M") if f.len() == 3 => {
+					let index: usize = f[1].parse().expect("module index");
+					let hex = f[2];
+					modules.insert(index, (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex")).collect());
+				}
+				Some(&"R") if f.len() == 6 => {
+					runs.push(Run { module: f[1].parse().expect("module index"), file: f[2], export: f[3], args: f[4], expected: f[5] });
+				}
+				_ => {}
+			}
+		}
+		(modules, runs)
+	}
+
+	// `i32:4294967295` - the type and the UNSIGNED bit pattern, which is how the specification's own
+	// JSON writes it. Reinterpreting as signed is this reader's job precisely so the fixture does not
+	// have to decide.
+	fn parse_values(list: &str) -> Option<Vec<Value>> {
+		if list.is_empty() {
+			return Some(Vec::new());
+		}
+		list.split(',')
+			.map(|item| {
+				let (ty, raw) = item.split_once(':')?;
+				match ty {
+					"i32" => Some(Value::I32(raw.parse::<u32>().ok()? as i32)),
+					"i64" => Some(Value::I64(raw.parse::<u64>().ok()? as i64)),
+					_ => None,
+				}
+			})
+			.collect()
+	}
+
+	// Bit-pattern equality, and the TYPE as well as the bits: `Value::as_i32` converts every numeric
+	// type, so comparing through it would call an `i64` result equal to the `i32` the specification
+	// asked for.
+	fn same(got: &[Value], want: &[Value]) -> bool {
+		got.len() == want.len()
+			&& got.iter().zip(want).all(|(a, b)| match (a, b) {
+				(Value::I32(x), Value::I32(y)) => x == y,
+				(Value::I64(x), Value::I64(y)) => x == y,
+				_ => false,
+			})
+	}
+
+	#[test]
+	fn the_specifications_own_answers_are_this_engines_answers() {
+		let (modules, runs) = fixture();
+		assert!(modules.len() >= 140, "only {} modules in the run fixture - it is not what it was", modules.len());
+		assert!(runs.len() >= 2700, "only {} assertions in the run fixture - it is not what it was", runs.len());
+
+		// A module this engine refuses is a SUBSET boundary and not a failure: reference types, SIMD,
+		// multi-memory and the rest are legitimately absent, and their assertions cannot be run. What
+		// may not happen is a module that runs and disagrees.
+		let mut ran = 0usize;
+		let mut skipped = 0usize;
+		let mut wrong: Vec<alloc::string::String> = Vec::new();
+		// GROUPED BY MODULE, because an `Instance` borrows the `ValidatedModule` it came from - and
+		// because instantiating once per assertion would re-run every data segment 2692 times.
+		let mut by_module: BTreeMap<usize, Vec<&Run<'_>>> = BTreeMap::new();
+		for run in &runs {
+			by_module.entry(run.module).or_default().push(run);
+		}
+		for (index, group) in &by_module {
+			let bytes = modules.get(index).expect("every run names a module in the fixture");
+			let Some(validated) = parse(bytes).ok().and_then(|m| validate(m).ok()) else {
+				skipped += group.len();
+				continue;
+			};
+			let Ok(mut instance) = crate::interp::Instance::new(&validated) else {
+				skipped += group.len();
+				continue;
+			};
+			for run in group {
+				let Some(args) = parse_values(run.args) else {
+					skipped += 1;
+					continue;
+				};
+				// A FRESH START PER ASSERTION would need re-instantiation, and the suite's
+				// assertions are written to be independent of each other on one instance - which is
+				// what the reference interpreter does too.
+				let outcome = instance.invoke(run.export, &args, &mut NoHost);
+				// A bare `(invoke ...)` from the suite: no assertion, replayed for its EFFECT. The
+				// assertions after it are written against the state it leaves - `float_memory.wast`
+				// resets its memory before every check, and dropping those made thirteen of its
+				// loads read a memory the specification had cleared.
+				if run.expected == "effect" {
+					continue;
+				}
+				if run.expected == "trap" {
+					ran += 1;
+					if outcome.is_ok() {
+						wrong.push(alloc::format!("{}: {}({}) returned {:?} where the specification says it traps", run.file, run.export, run.args, outcome.ok()));
+					}
+					continue;
+				}
+				let Some(want) = parse_values(run.expected) else {
+					skipped += 1;
+					continue;
+				};
+				match outcome {
+					// An export this engine cannot reach at all - an unsupported instruction in its
+					// body - is the subset again rather than a wrong answer. The floor below is what
+					// keeps that from swallowing everything.
+					Err(_) => skipped += 1,
+					Ok(got) => {
+						ran += 1;
+						if !same(&got, &want) {
+							wrong.push(alloc::format!("{}: {}({}) = {got:?}, and the specification says {want:?}", run.file, run.export, run.args));
+						}
+					}
+				}
+			}
+		}
+
+		assert!(wrong.is_empty(), "{} of {ran} executed specification assertions disagree with this engine: {:?}", wrong.len(), wrong.iter().take(12).collect::<Vec<_>>());
+		// THE FLOOR, so "everything was skipped" cannot pass as "nothing disagreed". A ratchet: it
+		// may go up and must not go down. Measured 2026-08-14: 2137 executed, 562 skipped as outside this
+		// engine's subset.
+		assert!(ran >= 2137, "only {ran} of {} specification assertions were executed ({skipped} skipped) - a subset got smaller and the reason belongs here", runs.len());
+	}
+}
+
+#[test]
+fn a_parameterised_block_leaves_its_label_below_its_parameters() {
+	// THE DEFECT THAT NEEDED THIS WHOLE ROUND, stated as the one module that distinguishes the two
+	// answers. Everything the corpus tests had asked until now was "is this module accepted"; this
+	// one is accepted either way and the two engines return different numbers.
+	//
+	//   (type $t (func (param i32) (result i32)))
+	//   (func (result i32)
+	//     i32.const 10
+	//     i32.const 20
+	//     block (type $t)     ;; consumes 20; its label sits at height 1
+	//       i32.const 30
+	//       br 0              ;; carries 30 out, truncating to the label's height
+	//     end
+	//     i32.add)            ;; 10 + 30
+	//
+	// Correct: `[10, 30]`, and the function answers 40. With the label recorded ABOVE the parameters
+	// - `base: stack.len()` before the block's own operands are accounted for - the truncation leaves
+	// the 20 behind, the stack is `[10, 20, 30]`, and `i32.add` answers 50.
+	//
+	// `Loop` had the arithmetic right and `Block` and `If` did not, which is the shape of the whole
+	// finding: the validator was taught what block parameters mean and the interpreter was not.
+	let body: &[u8] = &[
+		0x41,
+		10, // i32.const 10
+		0x41,
+		20, // i32.const 20
+		0x02,
+		0x00, // block (type 0)
+		0x41,
+		30, // i32.const 30
+		0x0c,
+		0x00, // br 0
+		0x0b, // end
+		0x6a, // i32.add
+		0x0b, // end
+	];
+	let spec = Spec { types: &[(&[I32], &[I32]), (&[], &[I32])], imports: &[], funcs: &[1], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], body)] };
+	let module = parse(&build(&spec)).expect("a parameterised block parses");
+	let validated = validate(module).expect("and validates - the validator has always handled this");
+	let mut instance = Instance::new(&validated).expect("and instantiates");
+	let out = instance.invoke("run", &[], &mut NoHost).expect("and runs");
+	assert_eq!(out, alloc::vec![Value::I32(40)], "a branch out of a parameterised block carries the block's results and leaves nothing of its parameters behind");
+}
+
+#[test]
+fn an_if_with_parameters_gives_them_to_both_arms() {
+	// The `else` half of the same rule, and the one the VALIDATOR had wrong: it truncated to the
+	// frame's height at `else` and stopped, so the then arm saw the block's parameters and the else
+	// arm did not - a valid module refused for an underflow it does not have.
+	//
+	//   (type $t (func (param i32 i32) (result i32)))
+	//   (func (param i32) (result i32)
+	//     i32.const 7  i32.const 3
+	//     local.get 0
+	//     if (type $t)  i32.sub  else  i32.add  end)
+	//
+	// `f(1)` takes the then arm: 7 - 3 = 4. `f(0)` takes the else arm: 7 + 3 = 10.
+	let body: &[u8] = &[
+		0x41,
+		7, // i32.const 7
+		0x41,
+		3, // i32.const 3
+		0x20,
+		0x00, // local.get 0
+		0x04,
+		0x00, // if (type 0)
+		0x6b, // i32.sub
+		0x05, // else
+		0x6a, // i32.add
+		0x0b, // end
+		0x0b, // end
+	];
+	let spec = Spec { types: &[(&[I32, I32], &[I32]), (&[I32], &[I32])], imports: &[], funcs: &[1], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], body)] };
+	let module = parse(&build(&spec)).expect("a parameterised if parses");
+	let validated = validate(module).expect("and validates - both arms are entered with the parameters");
+	let mut instance = Instance::new(&validated).expect("and instantiates");
+	assert_eq!(instance.invoke("run", &[Value::I32(1)], &mut NoHost).expect("then"), alloc::vec![Value::I32(4)], "the then arm gets the parameters");
+	assert_eq!(instance.invoke("run", &[Value::I32(0)], &mut NoHost).expect("else"), alloc::vec![Value::I32(10)], "and so does the else arm");
+}
+
+#[test]
+fn an_if_with_no_else_is_legal_when_its_empty_branch_typechecks() {
+	// `[i32] -> [i32]`: the missing arm produces what it was entered with, so there is nothing for an
+	// `else` to say. The rule was `!end_types.is_empty()`, which is the same rule only for blocks
+	// with no parameters, and it refused this module.
+	//
+	//   (func (param i32) (result i32)
+	//     i32.const 5
+	//     local.get 0
+	//     if (type $t) drop i32.const 9 end)   ;; $t = [i32] -> [i32]
+	let body: &[u8] = &[
+		0x41,
+		5, // i32.const 5
+		0x20,
+		0x00, // local.get 0
+		0x04,
+		0x00, // if (type 0): [i32] -> [i32]
+		0x1a, // drop
+		0x41,
+		9,    // i32.const 9
+		0x0b, // end
+		0x0b, // end
+	];
+	let spec = Spec { types: &[(&[I32], &[I32]), (&[I32], &[I32])], imports: &[], funcs: &[1], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], body)] };
+	let module = parse(&build(&spec)).expect("parses");
+	let validated = validate(module).expect("an if whose missing else arm typechecks is legal without one");
+	let mut instance = Instance::new(&validated).expect("and instantiates");
+	assert_eq!(instance.invoke("run", &[Value::I32(1)], &mut NoHost).expect("then"), alloc::vec![Value::I32(9)], "the then arm ran");
+	assert_eq!(instance.invoke("run", &[Value::I32(0)], &mut NoHost).expect("no else"), alloc::vec![Value::I32(5)], "and the absent arm left the parameter, which is the result");
+
+	// And the case the old rule was written for is still refused: `[] -> [i32]` has no legal empty
+	// branch, because the missing arm would produce nothing where the block promises an `i32`.
+	let body: &[u8] = &[
+		0x20,
+		0x00, // local.get 0
+		0x04,
+		0x7f, // if (result i32)
+		0x41,
+		9,    // i32.const 9
+		0x0b, // end
+		0x0b, // end
+	];
+	let spec = Spec { types: &[(&[I32], &[I32])], imports: &[], funcs: &[0], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], body)] };
+	let module = parse(&build(&spec)).expect("parses");
+	assert!(validate(module).is_err(), "an if that promises a result its missing else arm cannot produce is still refused");
+}
+
+#[test]
+fn an_over_wide_signed_leb_is_refused_at_the_width_it_belongs_to() {
+	// `i32.const` is `s32`, `i64.const` is `s64` and a block type is `s33`, and one `s64` reader
+	// served all three - so `i32.const 0` written in six bytes decoded and was truncated by `as i32`,
+	// which is a different, well-formed module than the one on disk.
+	//
+	// The specification's own suite named these: seven of its malformed cases stopped parsing when
+	// the readers were split, and none of the 707 reaches a running instance any more.
+	let over_wide: &[u8] = &[
+		0x41,
+		0x80,
+		0x80,
+		0x80,
+		0x80,
+		0x80,
+		0x00, // i32.const 0 in six bytes, one past what `s32` holds
+		0x0b,
+	];
+	let spec = Spec { types: &[(&[], &[I32])], imports: &[], funcs: &[0], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], over_wide)] };
+	// Refused at VALIDATION rather than at parse: `parse` stores a function body and does not read
+	// it, and the validator is the first pass that decodes the instruction stream. Which layer says
+	// no is not the point; that one of them does, before anything runs, is.
+	let module = parse(&build(&spec)).expect("the section structure is well-formed; the body is not");
+	assert!(validate(module).is_err(), "an `i32.const` written wider than `s32` allows is malformed, not a truncated value");
+
+	// The width bound is not a length bound alone: five bytes are legal for `s32`, and the fifth
+	// byte's unused payload bits have to repeat the SIGN. `... 0x7f` is `-1` written in full and
+	// well-formed; `... 0x0f` is the same five bytes with those bits zeroed, which the specification
+	// calls "integer too large" - and its own suite is what said so, four of its malformed cases
+	// being exactly that.
+	let legal: &[u8] = &[
+		0x41,
+		0xff,
+		0xff,
+		0xff,
+		0xff,
+		0x7f, // i32.const -1, fully written
+		0x0b,
+	];
+	let spec = Spec { types: &[(&[], &[I32])], imports: &[], funcs: &[0], mem_pages: 0, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], legal)] };
+	let validated = validate(parse(&build(&spec)).expect("parses")).expect("validates");
+	let mut instance = Instance::new(&validated).expect("and a five-byte `i32.const -1` is well-formed");
+	assert_eq!(instance.invoke("run", &[], &mut NoHost).expect("runs"), alloc::vec![Value::I32(-1)]);
 }

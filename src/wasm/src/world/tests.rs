@@ -16,20 +16,26 @@ fn world() -> FuncType {
 
 #[test]
 fn only_the_world_is_granted() {
-	assert_eq!(resolve("liber:vfs@1", "read", Some(&world())), Some(WorldFn::Read));
-	assert_eq!(resolve("liber:vfs@1", "write", Some(&world())), Some(WorldFn::Write));
-	assert_eq!(resolve("liber:log@1", "log", Some(&world())), Some(WorldFn::Log));
+	assert_eq!(resolve("liber:vfs@1", "read", Some(&world())), Ok(WorldFn::Read));
+	assert_eq!(resolve("liber:vfs@1", "write", Some(&world())), Ok(WorldFn::Write));
+	assert_eq!(resolve("liber:log@1", "log", Some(&world())), Ok(WorldFn::Log));
 
 	// The import list IS the manifest of requested authority. A module asking for a camera is
 	// refused when it is instantiated, not tolerated because the call site might be unreachable.
-	assert_eq!(resolve("liber:camera@1", "capture", Some(&world())), None, "a capability the world does not offer");
-	assert_eq!(resolve("liber:vfs@1", "unlink", Some(&world())), None, "an operation the world does not offer");
-	assert_eq!(resolve("wasi_snapshot_preview1", "fd_read", Some(&world())), None, "somebody else's world");
+	//
+	// AND THE REFUSAL SAYS WHICH KIND IT IS. These were all `None`, together with the wrongly-typed
+	// imports below, so a caller that had to report which of the two happened - the build-time
+	// packaging gate does - could only find out by keeping its own copy of the world.
+	assert_eq!(resolve("liber:camera@1", "capture", Some(&world())), Err(ImportError::Unknown), "a capability the world does not offer");
+	assert_eq!(resolve("liber:vfs@1", "unlink", Some(&world())), Err(ImportError::Unknown), "an operation the world does not offer");
+	assert_eq!(resolve("wasi_snapshot_preview1", "fd_read", Some(&world())), Err(ImportError::Unknown), "somebody else's world");
 
 	// AND THE VERSION IS PART OF THE NAME. The world was three unversioned strings, so an old
-	// module and a new one would both import `liber.read` with nothing to tell them apart.
-	assert_eq!(resolve("liber", "read", Some(&world())), None, "the unversioned name is not this world");
-	assert_eq!(resolve("liber:vfs@2", "read", Some(&world())), None, "a version this host does not implement");
+	// module and a new one would both import `liber.read` with nothing to tell them apart. An
+	// unknown VERSION is an unknown import and not a signature mismatch - `liber:vfs@2 read` may
+	// have any shape at all, and this host does not know which.
+	assert_eq!(resolve("liber", "read", Some(&world())), Err(ImportError::Unknown), "the unversioned name is not this world");
+	assert_eq!(resolve("liber:vfs@2", "read", Some(&world())), Err(ImportError::Unknown), "a version this host does not implement");
 }
 
 #[test]
@@ -47,14 +53,19 @@ fn an_import_with_the_wrong_signature_is_not_the_import() {
 		("a 64-bit result", signature(&[ValType::I32, ValType::I32], &[ValType::I64])),
 		("two results", signature(&[ValType::I32, ValType::I32], &[ValType::I32, ValType::I32])),
 	];
+	// The world's own declaration, carried back so a caller can report what was EXPECTED and not
+	// only that something was wrong - which is what lets the packaging gate keep both of its
+	// messages without keeping a second copy of the world to write them from.
+	let declared = ImportError::Signature { params: &[ValType::I32, ValType::I32], results: &[ValType::I32] };
 	for (what, bad) in &wrong {
-		assert_eq!(resolve("liber:vfs@1", "read", Some(bad)), None, "{what}");
-		assert_eq!(resolve("liber:log@1", "log", Some(bad)), None, "{what}");
+		assert_eq!(resolve("liber:vfs@1", "read", Some(bad)), Err(declared), "{what}");
+		assert_eq!(resolve("liber:log@1", "log", Some(bad)), Err(declared), "{what}");
 	}
 
 	// A module whose type index points nowhere has no signature to check, which is not a reason to
-	// admit it.
-	assert_eq!(resolve("liber:vfs@1", "read", None), None, "an import with no type is not resolvable");
+	// admit it. A SIGNATURE failure rather than an unknown name, because the name was found: the
+	// world offers this operation and this module never said what shape of it it wanted.
+	assert_eq!(resolve("liber:vfs@1", "read", None), Err(declared), "an import with no type is not resolvable");
 }
 
 #[test]
@@ -390,6 +401,41 @@ fn both_hosts_answer_a_dead_service_the_same_way() {
 }
 
 #[test]
+fn both_hosts_answer_a_refused_service_the_same_way() {
+	// THE SECOND HALF OF THE ONE ABOVE, and the half that was actually broken.
+	//
+	// A dead service is `Failed` in both adapters, which is why the dead-service test passed while
+	// the two disagreed underneath it: `component_host` answered a volume's `Err(_)` with `Refused`
+	// and `wasi_host` threw the error away and answered `Failed`, so the same `Error::Denied` on the
+	// same versioned import reached the guest as `STATUS_DENIED` under one host and `STATUS_IO`
+	// under the other.
+	//
+	// This asserts the seam's half of the invariant - a `Refused` is `STATUS_DENIED` for all three
+	// operations, and nothing about which host produced it. The adapters' half, where the defect
+	// lived, is `src/user/services/logic/src/world_errors/tests.rs`: it cannot be asserted here
+	// because both hosts are `*-unknown-none` binaries linking `rt`, which is why the classification
+	// moved out of them into a crate a host test can reach.
+	for which in 0..3u32 {
+		let (module, imports) = caller(which, 0, 2, b"hi");
+		let stub = Stub { read: ReadOutcome::Refused, write: WriteOutcome::Refused, log: LogOutcome::Refused, ..Stub::working() };
+		let (out, host) = run(module, imports, stub);
+		assert_eq!(out.expect("the guest gets a status, not a trap"), vec![Value::I32(STATUS_DENIED)], "import {which}: a service that answered and refused is DENIED, whichever host is behind the seam");
+		assert!(!host.logged(), "import {which}: a refused log is not a logged one");
+	}
+
+	// AND "THIS HOST DOES NOT DO THIS" IS NOT "YOU MAY NOT". `wasi_host` grants only the read half
+	// of the world and answered `Refused` for the other two, which reads as a grant it could have
+	// been given and was not - there is no write path behind that host for any grant. The world has
+	// a status for exactly that, and until these variants existed there was nothing to map to it.
+	for which in 0..3u32 {
+		let (module, imports) = caller(which, 0, 2, b"hi");
+		let stub = Stub { read: ReadOutcome::Unsupported, write: WriteOutcome::Unsupported, log: LogOutcome::Unsupported, ..Stub::working() };
+		let (out, _) = run(module, imports, stub);
+		assert_eq!(out.expect("still a status"), vec![Value::I32(STATUS_UNSUPPORTED)], "import {which}: an operation the host does not offer is UNSUPPORTED, not DENIED");
+	}
+}
+
+#[test]
 fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() {
 	// THE OTHER HALF of `a_guest_that_panics_...`, which hand-assembles the shape
 	// `dev-diagnostics` is assumed to produce. Nothing tied that shape to `liber_sdk::report_panic`:
@@ -405,23 +451,68 @@ fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() 
 	// ANCHORED TO THE CRATE, not to whatever directory `cargo test` happened to be run from - which
 	// is how this skipped silently the first time it ran from the repository root, and a test that
 	// reports a skip nobody reads is the shape this tree has a gate against elsewhere.
-	let built = alloc::format!("{}/../../.build/cargo/sdk/wasm32-unknown-unknown/release/liber_component.wasm", env!("CARGO_MANIFEST_DIR"));
-	let Ok(bytes) = std::fs::read(&built) else {
-		std::eprintln!("SKIPPED: {built} is not built, so the SDK's own panic handler is not exercised");
-		return;
-	};
+	let Some((trapped, logged, bytes)) = panic_the_real_guest("sdk") else { return };
 	// TWO ASSERTIONS WITH DIFFERENT PRECONDITIONS, said apart rather than skipped together.
 	//
 	// The TRAP is unconditional: `report_panic` ends in `unreachable()` whether or not
 	// `dev-diagnostics` is on, so a toolchain-built guest that panics must reach the host as a trap
-	// in every build. The LOG is the feature's, and the shipping build does not enable it - a
-	// component should not narrate its own failures to a log it does not own.
+	// in every build. The LOG is the feature's, and THIS artifact is the shipping build, which does
+	// not enable it - a component should not narrate its own failures to a log it does not own.
 	//
 	// The first version of this checked the binary for the diagnostic string and skipped when it was
 	// absent, which made "built without the feature" indistinguishable from "the handler stopped
 	// logging" - it reported SKIPPED for a handler that had been bypassed entirely. A precondition
 	// that hides the regression it guards is worse than no test.
+	//
+	// The branch is KEPT rather than made unconditional, and it is deliberately the negative one
+	// that runs: `build.sh` stages this artifact with no `--features`, so "a shipping build says
+	// nothing on its way down" is what this file is here to prove. The positive half has its own
+	// artifact and its own test below, so neither half depends on how the other happened to be
+	// built.
+	assert!(trapped, "a panicking guest reaches the host as a trap, not as a result - whatever the diagnostics feature is set to");
 	let diagnostics_on = bytes.windows(8).any(|w| w == b"panic at");
+	if diagnostics_on {
+		assert!(logged, "with dev-diagnostics its line went through the log the component already had");
+	} else {
+		assert!(!logged, "without dev-diagnostics a shipping component says nothing on its way down");
+	}
+}
+
+#[test]
+fn with_dev_diagnostics_the_real_guests_panic_reaches_the_log_it_was_granted() {
+	// THE OTHER HALF OF THE FEATURE, against its own artifact, with no condition on the assertion.
+	//
+	// Everything under `#[cfg(feature = "dev-diagnostics")]` in `src/sdk/src/panic.rs` - the
+	// formatting of file, line, column and message, the character-boundary truncation, the call
+	// through the granted log - had no automatic coverage against a real guest at all. Nothing in
+	// the tree passed `--features`, so the branch above always took the silent path, and the only
+	// thing exercising the diagnostic half was a hand-assembled module asserting a shape the real
+	// handler is merely ASSUMED to produce. One artifact can only be one of the two builds, so
+	// `build.sh` now produces both and each is asserted for what it is.
+	let Some((trapped, logged, _)) = panic_the_real_guest("sdk-dev") else { return };
+	assert!(trapped, "the trap is unconditional: `report_panic` ends in `unreachable()` in both builds");
+	assert!(logged, "with dev-diagnostics a real panic goes through the granted log before it traps");
+}
+
+// Load a toolchain-built `liber_component.wasm` from one of the two target directories, invoke its
+// `panic_now` export, and report whether it trapped and whether it logged - plus the bytes, for the
+// caller that inspects them.
+//
+// SKIPPED LOUDLY rather than failing when the artifact is not there: it is built by `just sdk` / the
+// image build, and a unit test that requires a wasm32 toolchain run would make `cargo test` in this
+// crate depend on one. Its absence is said, not passed over in silence. ANCHORED TO THE CRATE, not
+// to whatever directory `cargo test` happened to be run from - which is how this skipped silently
+// the first time it ran from the repository root, and a test that reports a skip nobody reads is the
+// shape this tree has a gate against elsewhere.
+fn panic_the_real_guest(target_dir: &str) -> Option<(bool, bool, Vec<u8>)> {
+	let built = alloc::format!("{}/../../.build/cargo/{target_dir}/wasm32-unknown-unknown/release/liber_component.wasm", env!("CARGO_MANIFEST_DIR"));
+	let bytes = match std::fs::read(&built) {
+		Ok(bytes) => bytes,
+		Err(_) => {
+			std::eprintln!("SKIPPED: {built} is not built, so the SDK's own panic handler is not exercised");
+			return None;
+		}
+	};
 	let module = crate::parse(&bytes).expect("the toolchain's own component parses");
 	let validated = crate::validate(module).expect("and validates");
 	let mut instance = Instance::new(&validated).expect("and instantiates");
@@ -438,10 +529,5 @@ fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() 
 		.collect();
 	let mut host = WorldHost::new(Stub::working(), imports);
 	let out = instance.invoke("panic_now", &[], &mut host);
-	assert!(out.is_err(), "a panicking guest reaches the host as a trap, not as a result - whatever the diagnostics feature is set to");
-	if diagnostics_on {
-		assert!(host.logged(), "with dev-diagnostics its line went through the log the component already had");
-	} else {
-		assert!(!host.logged(), "without dev-diagnostics a shipping component says nothing on its way down");
-	}
+	Some((out.is_err(), host.logged(), bytes))
 }

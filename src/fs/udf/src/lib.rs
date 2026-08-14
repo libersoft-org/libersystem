@@ -263,13 +263,20 @@ impl<D: BlockDevice> Udf<D> {
 	// came back the same way, blaming the medium for the device.
 	fn scan_sequence(dev: &mut D, vds_len: u32, vds_loc: u32) -> Result<(u32, u32, u32), MountError> {
 		let mut block = [0u8; SECTOR_SIZE];
-		let mut part: Option<(u32, u32, u32)> = None;
-		// The partition number the LVD's map names, and the number the partition descriptor carries.
-		// The parser kept one global partition and assumed the two referred to each other.
-		let mut map_partition: Option<u16> = None;
-		let mut part_number: Option<u16> = None;
+		// THE PREVAILING DESCRIPTOR PER PARTITION NUMBER, which is what the rule is.
+		//
+		// This kept ONE candidate and took the highest sequence number it saw, recording that
+		// descriptor's `PartitionNumber` beside it - so a volume carrying a descriptor for partition
+		// 0 at VDSN 10 and one for partition 1 at VDSN 20, with a Type-1 map naming partition 0, was
+		// left holding partition 1's. The comparison at the end then refused a volume it should have
+		// mounted, reading the right rule off the wrong pair. Safe, since it refuses rather than
+		// reading the wrong partition's extent, and the single-partition media this reader is aimed
+		// at do not produce it - and the code stated a rule it did not implement.
+		//
+		// `Vec` rather than a map, because a real Main VDS is a handful of descriptors and the scan
+		// is already clamped at 64 blocks: the lookup below is over at most that many entries.
+		let mut partitions: Vec<(u16, u32, u32, u32)> = Vec::new();
 		let mut lvd: Option<(u32, [u8; SECTOR_SIZE])> = None;
-		let mut fileset_lb: Option<(u32, u32)> = None;
 		// the sequence length is the medium's claim - a real MVDS is a handful of
 		// descriptors, so the scan is clamped rather than driven megablocks far.
 		// The sequence length, rounded UP and not floored, and a zero length refused rather than
@@ -305,11 +312,22 @@ impl<D: BlockDevice> Udf<D> {
 			// ECMA-167 provides to order them.
 			let vdsn = le32(&block[16..20]);
 			match le16(&block[0..2]) {
-				TAG_PARTITION if part.is_none_or(|(seen, _, _)| vdsn >= seen) => {
+				TAG_PARTITION => {
 					// PartitionNumber at 22, which nothing read - so the map could name partition 3
 					// and the descriptor be partition 0 and the two were used together anyway.
-					part_number = Some(le16(&block[22..24]));
-					part = Some((vdsn, le32(&block[188..192]), le32(&block[192..196])));
+					let number = le16(&block[22..24]);
+					let entry = (number, vdsn, le32(&block[188..192]), le32(&block[192..196]));
+					match partitions.iter_mut().find(|(seen, _, _, _)| *seen == number) {
+						// Prevailing WITHIN this partition number, which is where the rule lives.
+						Some(existing) if vdsn >= existing.1 => *existing = entry,
+						Some(_) => {}
+						None => {
+							if partitions.try_reserve(1).is_err() {
+								return Err(MountError::Corrupt);
+							}
+							partitions.push(entry);
+						}
+					}
 				}
 				// GUARDED BY THE SEQUENCE NUMBER, like the partition descriptor beside it.
 				//
@@ -382,25 +400,22 @@ impl<D: BlockDevice> Udf<D> {
 		if le16(&block[442..444]) != 1 {
 			return Err(MountError::Unsupported);
 		}
-		let map_partition = Some(le16(&block[444..446]));
-		let fileset_lb = Some((0u32, le32(&block[252..256])));
+		let map_partition = le16(&block[444..446]);
+		let fileset_lb = le32(&block[252..256]);
 		// The File Set's partition reference, which was discarded. With one map it can only be
 		// partition 0, and requiring that is what makes the discard safe.
 		if le16(&block[256..258]) != 0 {
 			return Err(MountError::Unsupported);
 		}
-		let (Some((_, part_start, part_len)), Some((_, fileset_lb))) = (part, fileset_lb) else {
-			return Err(MountError::Corrupt);
+		// THE DESCRIPTOR FOR THE PARTITION THE MAP NAMES. The question used to be "does the one
+		// descriptor we kept happen to be the one the map wants", which is a different question with
+		// the same answer only on media that carry one partition.
+		let Some(&(_, _, part_start, part_len)) = partitions.iter().find(|(number, _, _, _)| *number == map_partition) else {
+			// The map names a partition this volume carries no descriptor for. `Unsupported` rather
+			// than `Corrupt`: a volume may legitimately describe partitions this reader's one-map
+			// rule cannot reach, and refusing is not the same as calling the medium broken.
+			return Err(if partitions.is_empty() { MountError::Corrupt } else { MountError::Unsupported });
 		};
-		// THE MAP AND THE DESCRIPTOR MUST BE TALKING ABOUT THE SAME PARTITION. Both numbers are read
-		// now; before, neither was, and the reader used the one partition descriptor it had found
-		// for whatever the map referred to.
-		let (Some(map_partition), Some(part_number)) = (map_partition, part_number) else {
-			return Err(MountError::Corrupt);
-		};
-		if map_partition != part_number {
-			return Err(MountError::Unsupported);
-		}
 		Ok((part_start, part_len, fileset_lb))
 	}
 
@@ -433,7 +448,7 @@ impl<D: BlockDevice> Udf<D> {
 		// The root ICB is a `long_ad`, and its PARTITION was thrown away here - only the block
 		// number was read. Kept now, so a File Set naming another partition is refused by the
 		// resolver rather than read as partition 0.
-		let Some(root_icb) = LogicalAddress::from_long_ad(&block, 400) else {
+		let Some(root_icb) = LogicalAddress::from_icb_long_ad(&block, 400) else {
 			return Err(MountError::Corrupt);
 		};
 		if root_icb.lb >= part_len {
@@ -556,17 +571,17 @@ impl<D: BlockDevice> Udf<D> {
 			};
 			if parent {
 				if name == b".." {
-					return Ok((LogicalAddress::from_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
+					return Ok((LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
 				}
 			} else if !deleted && !id.is_empty() {
 				if id.as_bytes() == name {
-					return Ok((LogicalAddress::from_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
+					return Ok((LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
 				}
 				if eq_ci(&id, name) {
 					if folded.is_some() {
 						folded_ambiguous = true;
 					}
-					let child = LogicalAddress::from_long_ad(fid, 20).ok_or(FsError::Corrupt)?;
+					let child = LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?;
 					folded = Some((child, is_dir));
 				}
 			}
@@ -653,7 +668,7 @@ impl<D: BlockDevice> Udf<D> {
 				let size = if is_dir {
 					0
 				} else {
-					match self.icb_size(LogicalAddress::from_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir) {
+					match self.icb_size(LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir) {
 						Ok(size) => size,
 						Err(error) => return Err(error),
 					}
@@ -699,8 +714,7 @@ impl<D: BlockDevice> Udf<D> {
 		// data. The caller passes what the FID claimed and this refuses a mismatch.
 		match le16(&block[0..2]) {
 			TAG_FILE_ENTRY | TAG_EXT_FILE_ENTRY => {
-				// ICB file type: 4 is a directory, 5 a regular file.
-				let entry_is_dir = block[27] == 4;
+				let entry_is_dir = file_type_is_dir(block[27])?;
 				if entry_is_dir != expect_dir {
 					return Err(FsError::Corrupt);
 				}
@@ -761,11 +775,13 @@ impl<D: BlockDevice> Udf<D> {
 		// on the path a caller actually uses.
 		//
 		// Type 4 is a directory and 5 a regular file; the caller says which it expected.
-		if let Some(want_dir) = expect_dir {
-			let is_dir = block[27] == 4;
-			if is_dir != want_dir {
-				return Err(FsError::Corrupt);
-			}
+		// MATCHED EXACTLY, whether or not the caller stated an expectation: a FIFO served as a file
+		// is the failure this is about, and it is a failure with no expectation attached.
+		let is_dir = file_type_is_dir(block[27])?;
+		if let Some(want_dir) = expect_dir
+			&& is_dir != want_dir
+		{
+			return Err(FsError::Corrupt);
 		}
 		// THE ICB TAG'S STRATEGY IS AT 20, NOT 28.
 		//
@@ -797,12 +813,6 @@ impl<D: BlockDevice> Udf<D> {
 		let l_ea = le32(&block[l_ea_off..l_ea_off + 4]) as usize;
 		let l_ad = le32(&block[l_ad_off..l_ad_off + 4]) as usize;
 		let alloc = le16(&block[34..36]) & 0x07;
-		// a symlink File Entry (ICB file type 12) stores its target path as data - the
-		// volume API has no symlink semantics, so it refuses rather than serves path
-		// bytes as file content.
-		if block[27] == 12 {
-			return Err(FsError::Invalid);
-		}
 		let ad_off = header + l_ea;
 		if ad_off > block.len() {
 			return Err(FsError::Invalid);
@@ -823,7 +833,23 @@ impl<D: BlockDevice> Udf<D> {
 		let Some(alloc_end) = ad_off.checked_add(l_ad) else {
 			return Err(FsError::Invalid);
 		};
-		if 16 + (le16(&block[10..12]) as usize) < alloc_end.min(block.len()) {
+		// AND `alloc_end` HAS TO MEAN SOMETHING, before the allocation form is branched on.
+		//
+		// The clamp below is what lets an honest descriptor pass, and for the external forms it costs
+		// nothing because `ad_end > block.len()` is refused twenty lines later. The EMBEDDED branch
+		// returns before that, and its own bounds - `end > block.len() || info_len > l_ad` - are both
+		// satisfied trivially by a LARGE `l_ad`. So an embedded File Entry declaring `l_ad = 100000`
+		// and `info_len = 5` inside a 2048-byte block was accepted, and five bytes returned for a
+		// descriptor claiming its allocation area runs fifty blocks past itself.
+		//
+		// Nothing was read out of bounds and nothing was misattributed. What failed is that `l_ad`
+		// was not required to mean anything - and it is one of the two numbers the coverage
+		// requirement above is computed from, so a number that means nothing is a requirement that
+		// means nothing.
+		if alloc_end > block.len() {
+			return Err(FsError::Corrupt);
+		}
+		if 16 + (le16(&block[10..12]) as usize) < alloc_end {
 			return Err(FsError::Corrupt);
 		}
 		// What ONE read may allocate, which is not what the partition could hold.
@@ -903,7 +929,10 @@ impl<D: BlockDevice> Udf<D> {
 			// definition. Reading the block number alone treated the two the same, so a `long_ad`
 			// naming another partition was read here as this one.
 			let lba = le32(&block[ad + 4..ad + 8]);
-			let extent = if step == 16 { LogicalAddress::from_long_ad(&block, ad).ok_or(FsError::Corrupt)? } else { LogicalAddress { lb: lba, partition: 0 } };
+			// PARSED, not judged: the four-way decision is the three tests below, and it is the same
+			// decision for both allocation forms. Going through the ICB reference's rule here made
+			// the terminator and the two unrecorded types unreachable for `long_ad` alone.
+			let extent = if step == 16 { LogicalAddress::parse_long_ad(&block, ad).ok_or(FsError::Corrupt)?.address } else { LogicalAddress { lb: lba, partition: 0 } };
 			// a zero-length extent terminates the sequence; a type-3 entry chains to
 			// further descriptors - not followed, refused rather than read as data.
 			if len == 0 {
@@ -1047,22 +1076,73 @@ struct LogicalAddress {
 	partition: u16,
 }
 
+// A parsed `long_ad`: where it points, how long it is, and which of the four extent types it is.
+//
+// PARSING IS NOT POLICY, and conflating the two broke a caller. `from_long_ad` returned
+// `Option<LogicalAddress>` and encoded the ICB reference's rule in the `None` - refusing every extent
+// type but 0 and every zero length - while the file-data allocation loop uses the same helper and has
+// its own four-way decision two lines further down: a zero length TERMINATES the list, type 3 is
+// refused, and types 1 and 2 read as zeros. Both of those paths went dead for `long_ad` and stayed
+// live for `short_ad`, which does not go through the helper: one rule implemented twice and
+// disagreeing, which is this file's recurring shape, arrived at by fixing one of its instances.
+//
+// A valid file with a sparse `long_ad` extent - the ordinary shape of a sparse file on a `long_ad`
+// volume - became `FsError::Corrupt`. Not a safety defect; an interoperability one, and one this
+// milestone introduced.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LongAd {
+	address: LogicalAddress,
+	length: usize,
+	// 0 recorded and allocated, 1 allocated but not recorded, 2 neither, 3 the next extent of
+	// allocation descriptors.
+	extent_type: u32,
+}
+
 impl LogicalAddress {
-	// The `long_ad` at `at`: length(4), block(4), partition(2), implementation use(6).
-	fn from_long_ad(bytes: &[u8], at: usize) -> Option<LogicalAddress> {
+	// The `long_ad` at `at`, PARSED: length(4), block(4), partition(2), implementation use(6).
+	// `None` only when the bytes are not there - every caller states its own rule about what the
+	// parts mean.
+	fn parse_long_ad(bytes: &[u8], at: usize) -> Option<LongAd> {
 		let block = bytes.get(at..at + 16)?;
-		// THE EXTENT LENGTH, which this read past.
-		//
-		// A `long_ad` is extent length, logical block address, implementation use - and the length's
-		// top two bits are the extent TYPE: 0 recorded and allocated, 1 not recorded but allocated,
-		// 2 not recorded and not allocated, 3 the next extent of allocation descriptors. Only the
-		// address was read, so an ICB reference recorded as UNALLOCATED, or of zero length, was
-		// followed as though it named data.
-		let length = le32(&block[0..4]);
-		if length >> 30 != 0 || length & 0x3fff_ffff == 0 {
+		let raw = le32(&block[0..4]);
+		Some(LongAd { address: LogicalAddress { lb: le32(&block[4..8]), partition: le16(&block[8..10]) }, length: (raw & 0x3fff_ffff) as usize, extent_type: raw >> 30 })
+	}
+
+	// The `long_ad` at `at` AS AN ICB REFERENCE, which is a stricter thing than a `long_ad`.
+	//
+	// The length's top two bits are the extent TYPE, and only the address used to be read - so an ICB
+	// reference recorded as UNALLOCATED, or of zero length, was followed as though it named data. An
+	// ICB reference has to be a recorded, allocated extent with something in it; there is no reading
+	// of "the root directory is here and it is not recorded" that is worth following.
+	//
+	// SERVES ONE CALLER SHAPE. The file-data allocation loop wants `parse_long_ad` above, because
+	// its rules for those cases are different and legitimate.
+	fn from_icb_long_ad(bytes: &[u8], at: usize) -> Option<LogicalAddress> {
+		let parsed = Self::parse_long_ad(bytes, at)?;
+		if parsed.extent_type != 0 || parsed.length == 0 {
 			return None;
 		}
-		Some(LogicalAddress { lb: le32(&block[4..8]), partition: le16(&block[8..10]) })
+		Some(parsed.address)
+	}
+}
+
+// Whether an ICB file type is a directory - and whether it is one of the two this volume API has
+// semantics for at all.
+//
+// Type 4 is a directory and type 5 an ordinary byte file. Everything else - 6 block device, 7
+// character device, 8 extended-attribute file, 9 FIFO, 10 socket, 11 terminal entry, 12 symbolic
+// link, 13 stream directory - was read as `!= 4`, therefore "not a directory", therefore served as
+// an ordinary file. Only the symlink was refused, which is the shape of the right answer applied to
+// the one type somebody happened to think of.
+//
+// `Invalid` and not `Corrupt`: a FIFO File Entry is a shape the medium is entitled to carry, and this
+// reader has no semantics for it. Blaming the medium for that would be blaming it for being more
+// than this reader implements.
+fn file_type_is_dir(file_type: u8) -> Result<bool, FsError> {
+	match file_type {
+		4 => Ok(true),
+		5 => Ok(false),
+		_ => Err(FsError::Invalid),
 	}
 }
 

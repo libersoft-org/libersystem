@@ -129,7 +129,12 @@ unsafe impl GlobalAlloc for Heap {
 			let Some(addr) = crate::alloc_pages(services, pages) else {
 				return ptr::null_mut();
 			};
-			let Some(end) = (addr as usize).checked_add(pages * crate::PAGE_SIZE as usize) else {
+			// The PRODUCT first: `checked_add` cannot save a multiplication that already wrapped,
+			// and `pages` is derived from an allocation size a caller chose.
+			let Some(span) = pages.checked_mul(crate::PAGE_SIZE as usize) else {
+				return ptr::null_mut();
+			};
+			let Some(end) = (addr as usize).checked_add(span) else {
 				return ptr::null_mut();
 			};
 			// Recorded so it can be given back. An untrackable arena is refused rather than taken

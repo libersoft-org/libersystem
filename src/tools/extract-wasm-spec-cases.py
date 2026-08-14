@@ -117,6 +117,19 @@ BARE = re.compile(r'^\(module(?:\s+\$[^\s()]+)?\s+binary((?:\s*"(?:[^"\\]|\\.)*"
 ASSERTED = re.compile(r'^\((assert_malformed|assert_invalid)\s*(\(module(?:\s+\$[^\s()]+)?\s+binary(?:\s*"(?:[^"\\]|\\.)*")+\s*\))\s*"((?:[^"\\]|\\.)*)"\s*\)$', re.S)
 LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
 
+# `(assert_return (invoke "name" arg...) expected...)` and `(assert_trap (invoke ...) "reason")`.
+#
+# THE OTHER DIRECTION, and the one the binary corpus could not reach. Everything above answers
+# "is this module accepted", which a module that parses, validates, instantiates and then computes
+# the WRONG ANSWER passes - and that is exactly the defect this extension was written for: block
+# parameters were dropped by the interpreter while the validator handled them correctly.
+INVOKE = re.compile(r'^\((assert_return|assert_trap)\s*\(invoke\s+"((?:[^"\\]|\\.)*)"(.*?)\)\s*(.*)\)$', re.S)
+# Only integer constants. Float equality in the suite is written with `nan:canonical`,
+# `nan:arithmetic` and hex float literals, each with its own comparison rule - a fixture that
+# flattened them to bit patterns would be asserting something the specification does not say.
+CONST = re.compile(r'\((i32|i64)\.const\s+([^\s()]+)\)')
+ANY_CONST = re.compile(r'\(([a-z0-9]+)\.const\s')
+
 
 def main():
 	if len(sys.argv) != 2:
@@ -127,11 +140,17 @@ def main():
 		if not name.endswith('.wast'):
 			continue
 		text = strip_comments(open(os.path.join(root, name), encoding='utf-8').read())
+		# The module the assertions after it apply to, when that module is one this fixture carries.
+		# Reset to `None` by any other module form, so an `assert_return` is never attached to a
+		# text-format module whose bytes are not here - a wrong pairing would be a test asserting a
+		# result about something else entirely.
+		current = None
 		for form in forms(text):
 			form = form.strip()
 			bare = BARE.match(form)
 			if bare:
 				data = b''.join(unescape(x[1:-1]) for x in LITERAL.findall(bare.group(1)))
+				current = data
 				print(f'valid\t{name}\t{data.hex()}\t')
 				continue
 			asserted = ASSERTED.match(form)
@@ -140,6 +159,24 @@ def main():
 				kind = 'malformed' if asserted.group(1) == 'assert_malformed' else 'invalid'
 				reason = asserted.group(3).replace('\t', ' ')
 				print(f'{kind}\t{name}\t{data.hex()}\t{reason}')
+				continue
+			if form.startswith('(module'):
+				current = None
+				continue
+			run = INVOKE.match(form)
+			if run and current is not None:
+				export, args, expected = run.group(2), run.group(3), run.group(4).strip()
+				# Anything carrying a non-integer constant is skipped WHOLE rather than half
+				# understood: a dropped float argument would turn a real assertion into a different
+				# one that happens to pass.
+				if any(m not in ('i32', 'i64') for m in ANY_CONST.findall(args + ' ' + expected)):
+					continue
+				argv = ['%s:%s' % (t, v.replace('_', '')) for t, v in CONST.findall(args)]
+				if run.group(1) == 'assert_trap':
+					result = 'trap'
+				else:
+					result = ','.join('%s:%s' % (t, v.replace('_', '')) for t, v in CONST.findall(expected))
+				print('run\t%s\t%s\t%s|%s|%s' % (name, current.hex(), export.replace('\t', ' '), ','.join(argv), result))
 	return 0
 
 

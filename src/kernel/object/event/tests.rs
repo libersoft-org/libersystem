@@ -2,7 +2,7 @@ use super::Event;
 
 crate::tagged_test!(event_object_latches_and_clears, [Object, Kernel], id = "kernel.object.event.event_object_latches_and_clears", covers = ["kernel"]);
 fn event_object_latches_and_clears() {
-	let event = Event::create();
+	let event = Event::create().expect("a test event");
 	assert!(!event.is_signaled());
 	event.signal();
 	assert!(event.is_signaled());

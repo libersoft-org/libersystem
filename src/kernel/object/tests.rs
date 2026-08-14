@@ -114,8 +114,8 @@ fn a_message_carries_several_capabilities() {
 	// two however it was written. A pipeline stage needs its stdin AND its stdout, which is
 	// what found this.
 	let (sender, receiver) = Channel::create();
-	let first = Event::create();
-	let second = Event::create();
+	let first = Event::create().expect("a test event");
+	let second = Event::create().expect("a test event");
 	let (first_koid, second_koid) = (first.header().koid(), second.header().koid());
 
 	let caps = alloc::vec![super::handle::Capability::new(first as Arc<dyn KernelObject>, Rights::ALL, 0), super::handle::Capability::new(second as Arc<dyn KernelObject>, Rights::ALL, 0),];
@@ -148,7 +148,7 @@ fn a_prepared_thread_does_not_run_until_released() {
 		RAN.store(true, Ordering::SeqCst);
 	}
 
-	let thread = crate::sched::prepare_with_object(body, Event::create(), Rights::ALL, 0);
+	let thread = crate::sched::prepare_with_object(body, Event::create().expect("a test event"), Rights::ALL, 0);
 
 	// The scheduler is given every chance to run it. Without this the test would pass over an
 	// implementation that merely deferred the start by a tick.
@@ -170,7 +170,7 @@ fn a_process_group_reaches_every_member() {
 	// terminal. ConsoleService holds a single Process handle today, so every stage but one
 	// would keep running with nothing able to reach it - which is what M0035j deferred and
 	// named.
-	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain());
+	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain()).expect("a test process");
 	let stages = alloc::vec![make(), make(), make()];
 	let group = ProcessGroup::create(&stages).expect("a three-stage group");
 	assert_eq!(group.size(), 3, "the group holds every stage it was created over");
@@ -215,7 +215,7 @@ fn a_clean_exit_reports_its_status() {
 	// syscall's own one line is exercised by every process in every boot instead, since all
 	// 311 `exit()` calls in the tree now pass a status through it and a process that could not
 	// exit would take the boot chain with it.
-	let process = Process::new(super::address_space::AddressSpace::create().expect("an address space for the test process"), crate::sched::root_domain());
+	let process = Process::new(super::address_space::AddressSpace::create().expect("an address space for the test process"), crate::sched::root_domain()).expect("a test process");
 
 	// Nothing reported yet is NOT zero. That distinction is why the report carries a validity
 	// flag: a process that faulted never got to say anything, and reading that as a successful
@@ -233,7 +233,7 @@ fn a_clean_exit_reports_its_status() {
 	assert_eq!(process.exit_status(), Some(42), "a later exit does not overwrite the first");
 
 	// Zero is a real status and must survive the same path, or success would read as absent.
-	let clean = Process::new(super::address_space::AddressSpace::create().expect("an address space for the test process"), crate::sched::root_domain());
+	let clean = Process::new(super::address_space::AddressSpace::create().expect("an address space for the test process"), crate::sched::root_domain()).expect("a test process");
 	clean.set_exit_status(0);
 	assert_eq!(clean.exit_status(), Some(0), "exiting 0 reports 0, not None");
 }
@@ -284,7 +284,7 @@ fn object_property_set_names_an_object() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	let event = Event::create();
+	let event = Event::create().expect("a test event");
 	// The driver thread holds a handle to this same Event; the test keeps an Arc to
 	// read the label back after the thread names it.
 	crate::sched::spawn_with_object(body, event.clone(), Rights::ALL, 0);
@@ -313,7 +313,7 @@ fn a_group_handle_becomes_waitable_only_once_every_stage_ends() {
 		READY.store(result as i64 == 0, Ordering::SeqCst);
 	}
 
-	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain());
+	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain()).expect("a test process");
 	let stages = alloc::vec![make(), make()];
 	let group = ProcessGroup::create(&stages).expect("a two-stage group");
 
@@ -380,7 +380,7 @@ fn the_console_and_display_syscalls_refuse_a_caller_without_the_capability() {
 		}
 	}
 
-	let feed = Privilege::create(PrivilegeKind::ConsoleInputSource);
+	let feed = Privilege::create(PrivilegeKind::ConsoleInputSource).expect("a test privilege");
 	crate::sched::spawn_with_object(body, feed, Rights::ALL, 0);
 	crate::sched::run_until_idle();
 

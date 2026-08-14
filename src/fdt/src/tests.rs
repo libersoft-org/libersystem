@@ -339,3 +339,139 @@ fn a_blob_that_is_not_a_device_tree_answers_none_rather_than_walking_it() {
 	assert_eq!(fdt.timebase_frequency(), None);
 	assert!(!fdt.has_isa_extension(b"svpbmt"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// PSCI: which instruction reaches the platform's implementation.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_psci_conduit_comes_from_the_tree_rather_than_the_exception_level() {
+	// THE MACHINE THIS SYSTEM BOOTS ON SAYS IT. The loader used to answer `PSCI_HVC` for any boot
+	// that did not start at EL2, which is true of QEMU's `virt` and false of most server-class
+	// AArch64 - where EL2 belongs to a hypervisor and PSCI lives in EL3 firmware behind `smc`.
+	assert_eq!(at(AARCH64).psci_conduit(), Some(PsciConduit::Hvc), "QEMU virt's own tree states hvc, which is what the guess happened to be");
+
+	// And a tree that states the other one is read as the other one.
+	let smc = machine(|builder| {
+		builder.begin("psci").prop_str("compatible", "arm,psci-1.0").prop_str("method", "smc").end();
+	});
+	assert_eq!(at(smc).psci_conduit(), Some(PsciConduit::Smc), "a platform whose PSCI is in EL3 firmware");
+
+	let hvc = machine(|builder| {
+		builder.begin("psci").prop_str("compatible", "arm,psci-1.0").prop_str("method", "hvc").end();
+	});
+	assert_eq!(at(hvc).psci_conduit(), Some(PsciConduit::Hvc));
+
+	// NO NODE IS NOT "HVC BY DEFAULT". riscv64's virt tree has no `/psci` at all, and the answer to
+	// "which instruction" for a machine that describes none is that there is no instruction.
+	assert_eq!(at(RISCV64).psci_conduit(), None, "a tree with no /psci node states nothing");
+	let bare = machine(|_| {});
+	assert_eq!(at(bare).psci_conduit(), None);
+
+	// A node with no `method`, and a method this system has no instruction for, are both "nothing
+	// stated" rather than a guess at the more likely one.
+	let no_method = machine(|builder| {
+		builder.begin("psci").prop_str("compatible", "arm,psci-1.0").end();
+	});
+	assert_eq!(at(no_method).psci_conduit(), None);
+	let strange = machine(|builder| {
+		builder.begin("psci").prop_str("method", "mailbox").end();
+	});
+	assert_eq!(at(strange).psci_conduit(), None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Malformed trees: every walk is bounded by the blocks the header declares.
+// ---------------------------------------------------------------------------------------------
+
+// The bytes of a well-formed tree, mutable, so a test can break one field of it. `Builder::finish`
+// leaks its output, which is what `Fdt` needs, so this hands back a `&'static mut`.
+fn broken(body: impl FnOnce(&mut Builder), damage: impl FnOnce(&mut [u8])) -> &'static [u8] {
+	let good = machine(body);
+	let mut bytes = good.to_vec();
+	damage(&mut bytes);
+	Vec::leak(bytes)
+}
+
+fn put_be32(bytes: &mut [u8], at: usize, value: u32) {
+	bytes[at..at + 4].copy_from_slice(&value.to_be_bytes());
+}
+
+#[test]
+fn a_header_whose_blocks_do_not_fit_is_refused() {
+	// `is_valid` checked that `off_struct` and `off_strings` were each BELOW `totalsize` and stopped
+	// there, so a structure block that starts inside the tree and runs past its end passed - and
+	// nothing below bounded the walk either. The header carries `size_dt_struct` and
+	// `size_dt_strings` for exactly this and neither was read.
+	let past_end = broken(|_| {}, |bytes| put_be32(bytes, 36, 0x0010_0000));
+	assert!(!at(past_end).is_valid(), "a structure block declared past the end of the tree");
+	assert!(at(past_end).parse().is_none(), "and nothing walks it");
+
+	let strings_past_end = broken(|_| {}, |bytes| put_be32(bytes, 32, 0x0010_0000));
+	assert!(!at(strings_past_end).is_valid(), "a strings block declared past the end of the tree");
+
+	// And the well-formed tree the damage was applied to is accepted, so the refusals above are
+	// about the damage rather than about the fixture.
+	assert!(at(machine(|_| {})).is_valid());
+}
+
+#[test]
+fn a_record_that_runs_past_its_block_is_refused_rather_than_read() {
+	let good = machine(|builder| {
+		builder.begin("serial@9000000").prop_str("compatible", "arm,pl011").prop_reg64(0x0900_0000, 0x1000).end();
+		builder.begin("chosen").prop_str("stdout-path", "/serial@9000000").end();
+	});
+	assert!(at(good).console().is_some(), "the fixture is a tree with a console");
+
+	// A property whose declared length reaches beyond the structure block. The walk used to advance
+	// the cursor by that length and keep reading whatever followed.
+	let off_struct = u32::from_be_bytes([good[8], good[9], good[10], good[11]]) as usize;
+	let huge = broken(
+		|builder| {
+			builder.begin("serial@9000000").prop_str("compatible", "arm,pl011").prop_reg64(0x0900_0000, 0x1000).end();
+			builder.begin("chosen").prop_str("stdout-path", "/serial@9000000").end();
+		},
+		|bytes| {
+			// The first FDT_PROP in the stream: the root's `#address-cells`. Its length word sits
+			// four bytes past the token, and the root's BEGIN_NODE is one token plus an empty
+			// padded name.
+			let prop = off_struct + 4 + 4;
+			put_be32(bytes, prop + 4, 0x0000_ffff);
+		},
+	);
+	assert!(at(huge).parse().is_none(), "a property whose value runs past the structure block stops the walk");
+	assert_eq!(at(huge).console(), None);
+
+	// A node name with no terminator inside the block: the scan used to run until it found a zero
+	// byte, anywhere in memory.
+	let unterminated = broken(
+		|builder| {
+			builder.begin("serial@9000000").prop_str("compatible", "arm,pl011").prop_reg64(0x0900_0000, 0x1000).end();
+			builder.begin("chosen").prop_str("stdout-path", "/serial@9000000").end();
+		},
+		|bytes| {
+			let total = bytes.len();
+			let strings_len = u32::from_be_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]) as usize;
+			// Fill the whole structure block with a BEGIN_NODE followed by non-zero bytes.
+			put_be32(bytes, off_struct, 1);
+			for byte in bytes.iter_mut().take(total - strings_len).skip(off_struct + 4) {
+				*byte = b'x';
+			}
+		},
+	);
+	assert!(at(unterminated).parse().is_none(), "a node name with no terminator inside the block is refused");
+
+	// A property name offset outside the strings block.
+	let bad_nameoff = broken(
+		|builder| {
+			builder.begin("serial@9000000").prop_str("compatible", "arm,pl011").prop_reg64(0x0900_0000, 0x1000).end();
+			builder.begin("chosen").prop_str("stdout-path", "/serial@9000000").end();
+		},
+		|bytes| {
+			let prop = off_struct + 4 + 4;
+			put_be32(bytes, prop + 8, 0x0000_ffff);
+		},
+	);
+	assert!(at(bad_nameoff).parse().is_none(), "a nameoff outside the strings block is refused");
+	assert_eq!(at(bad_nameoff).console(), None);
+}

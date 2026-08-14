@@ -3,7 +3,7 @@ use crate::arch;
 
 crate::tagged_test!(timer_object_expires_and_cancels, [Object, Kernel], id = "kernel.object.timer.timer_object_expires_and_cancels", covers = ["kernel"]);
 fn timer_object_expires_and_cancels() {
-	let timer = Timer::create();
+	let timer = Timer::create().expect("a test timer");
 	assert!(!timer.is_expired());
 	let deadline = arch::apic::ticks() + 2;
 	timer.set(deadline);

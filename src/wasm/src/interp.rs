@@ -106,7 +106,7 @@ pub const MAX_MEMORY_PAGES: usize = 1024;
 struct Frame {
 	base: usize,
 	is_loop: bool,
-	arity: u8,
+	arity: usize,
 	target: usize,
 }
 
@@ -375,20 +375,43 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 			// The interpreter needs only HOW MANY values a frame keeps, which the block type answers -
 			// so the arities it used to be handed are derived here rather than carried, and the
 			// validator gets the types it needs from the same field.
+			// THE LABEL'S HEIGHT IS THE STACK AFTER THE PARAMETERS ARE TAKEN, for all three.
+			//
+			// Entering a block of type `[t1*] -> [t2*]` pops the `t1*` and pushes a label whose
+			// height is what is left; the parameters then become the block's own operands, and a
+			// branch to that label truncates the stack to the label's height. `Block` and `If`
+			// recorded `stack.len()` with the parameters still counted, so the truncation left them
+			// behind: `(param i32) (result i32)` entered with `[10, 20]` and branched out carrying
+			// `30` produced `[10, 20, 30]` instead of `[10, 30]`, and the function answered 50 where
+			// the specification says 40.
+			//
+			// A module that VALIDATES and then computes the wrong answer, which is the one failure
+			// an interpreter exists to make impossible. It arrived through the repair that gave
+			// `BlockType` the real type: the validator was taught what block parameters mean
+			// (`validate.rs` pops them and takes the height AFTER the pop) and the frame setup here
+			// was left as it was, so the two halves of the engine disagreed about the same block and
+			// the half that decides the answer was the wrong one.
 			Instr::Block { ty, end_pc } => {
-				ctrl.push(Frame { base: stack.len(), is_loop: false, arity: block_results(module, ty), target: *end_pc + 1 });
+				let base = stack.len().saturating_sub(block_params(module, ty));
+				ctrl.push(Frame { base, is_loop: false, arity: block_results(module, ty), target: *end_pc + 1 });
 			}
+			// A loop's label targets the loop itself, so a branch to it re-supplies the PARAMETERS
+			// rather than delivering the results - which is why its arity is `block_params` where
+			// the other two use `block_results`.
 			Instr::Loop { ty } => {
 				let params = block_params(module, ty);
-				ctrl.push(Frame { base: stack.len().saturating_sub(params as usize), is_loop: true, arity: params, target: pc });
+				ctrl.push(Frame { base: stack.len().saturating_sub(params), is_loop: true, arity: params, target: pc });
 			}
 			Instr::If { ty, has_else, else_pc, end_pc } => {
 				let cond: i32 = pop(stack)?.as_i32();
 				let arity = block_results(module, ty);
+				// After the condition is popped, and after the parameters: the condition is not one
+				// of them - `if` is `[t1* i32] -> [t2*]` and only the `t1*` reach the arms.
+				let base = stack.len().saturating_sub(block_params(module, ty));
 				if cond != 0 {
-					ctrl.push(Frame { base: stack.len(), is_loop: false, arity, target: *end_pc + 1 });
+					ctrl.push(Frame { base, is_loop: false, arity, target: *end_pc + 1 });
 				} else if *has_else {
-					ctrl.push(Frame { base: stack.len(), is_loop: false, arity, target: *end_pc + 1 });
+					ctrl.push(Frame { base, is_loop: false, arity, target: *end_pc + 1 });
 					pc = *else_pc;
 				} else {
 					pc = *end_pc + 1;
@@ -639,7 +662,7 @@ fn branch(ctrl: &mut Vec<Frame>, stack: &mut Vec<Value>, k: u32) -> Result<Optio
 	}
 	let idx: usize = ctrl.len() - 1 - k as usize;
 	let frame: Frame = ctrl[idx];
-	let keep: usize = frame.arity as usize;
+	let keep: usize = frame.arity;
 	let total: usize = stack.len();
 	if total < frame.base + keep {
 		return Err(Trap("stack underflow on branch"));
@@ -1435,17 +1458,17 @@ fn trunc_sat(sub: u8, stack: &mut Vec<Value>) -> Result<(), Trap> {
 // The decoder used to answer these two numbers and nothing else; it now carries the TYPE and these
 // derive the counts, so the interpreter is unchanged in what it needs while the validator gains what
 // it could not reconstruct.
-fn block_results(module: &Module, ty: &crate::decode::BlockType) -> u8 {
-	match ty {
-		crate::decode::BlockType::Empty => 0,
-		crate::decode::BlockType::Value(_) => 1,
-		crate::decode::BlockType::TypeIndex(i) => module.types.get(*i as usize).map_or(0, |t| t.results.len() as u8),
-	}
+// Both counts from ONE resolution - `BlockType::arity`, which the validator's `block_signature` also
+// goes through. These were two separate matches over `BlockType` beside a third in the validator, and
+// the three disagreeing is what put a wrong answer behind a valid module.
+//
+// `usize` rather than `u8`, here and in `Frame::arity`: a block type with 256 results wrapped to zero
+// through `as u8`, and the engine's own limits already assume more than 255 values can be live - the
+// validator caps the operand stack at 8192.
+fn block_results(module: &Module, ty: &crate::decode::BlockType) -> usize {
+	ty.arity(module).1
 }
 
-fn block_params(module: &Module, ty: &crate::decode::BlockType) -> u8 {
-	match ty {
-		crate::decode::BlockType::Empty | crate::decode::BlockType::Value(_) => 0,
-		crate::decode::BlockType::TypeIndex(i) => module.types.get(*i as usize).map_or(0, |t| t.params.len() as u8),
-	}
+fn block_params(module: &Module, ty: &crate::decode::BlockType) -> usize {
+	ty.arity(module).0
 }

@@ -105,6 +105,13 @@ pub(crate) struct PostEbs {
 
 static mut POST_EBS: Option<PostEbs> = None;
 
+// The two firmware descriptions of the machine, as the configuration table published them.
+//
+// Kept because the console is not the only question they answer: `build_boot_info` asks them which
+// instruction reaches PSCI, which it used to infer from its own exception level. Read once here,
+// while the configuration table is still there.
+static mut FIRMWARE_TABLES: (u64, u64) = (0, 0);
+
 // Physical addresses are reachable as themselves here: UEFI identity-maps memory for the loader,
 // and this runs before anything changes that.
 fn identity(address: u64) -> u64 {
@@ -135,7 +142,21 @@ pub(crate) fn discover(system_table: *mut uefi::SystemTable) {
 	// while SPCR describes what the firmware was using - which is the same thing on every machine
 	// this has met, and the tree is the more specific of the two.
 	let found = from_tree.or_else(|| (rsdp != 0).then(|| uefi::acpi::Acpi::new(rsdp, identity).console()).flatten().map(|console| PostEbs { pl011: console.uart == uefi::acpi::Uart::Pl011, base: console.base, reg_shift: console.reg_shift }));
-	unsafe { POST_EBS = found };
+	unsafe {
+		POST_EBS = found;
+		FIRMWARE_TABLES = (dtb, rsdp);
+	}
+}
+
+// The device tree and RSDP physical addresses the firmware published, or 0 for one it did not.
+pub(crate) fn firmware_tables() -> (u64, u64) {
+	unsafe { FIRMWARE_TABLES }
+}
+
+// Physical addresses are reachable as themselves in the loader; exposed so the backends can read
+// the same tables through the same translation this module uses.
+pub(crate) fn identity_map(address: u64) -> u64 {
+	identity(address)
 }
 
 // What was discovered, for the backends' post-ExitBootServices output.

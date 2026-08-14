@@ -98,7 +98,11 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	}
 
 	// From here on the Process owns the frames and frees them when it is dropped.
-	let process = Process::new(address_space, domain);
+	// A short heap here refuses the load, which the caller already handles - the frames go back
+	// with the address space rather than the kernel going down mid-spawn.
+	let Some(process) = Process::new(address_space, domain) else {
+		return Err(LoadError::OutOfMemory);
+	};
 	if let Some(name) = image_artifact_name(elf_image) {
 		process.header().set_name(name);
 	}

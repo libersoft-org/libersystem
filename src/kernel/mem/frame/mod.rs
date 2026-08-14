@@ -42,8 +42,10 @@ use crate::sync::SpinLock;
 
 // The buddy allocator lives in its own crate so a HOST can drive it: the bitmap arithmetic is
 // pure, and inside the kernel the only way to exercise it was to boot a guest a few thousand
-// allocations at a time. See `src/buddy` - and P02M0120, which is open on a defect that was seen
-// once in exactly that setting.
+// allocations at a time. See `src/buddy` - and P02M0120, which was opened on a defect seen once in
+// exactly that setting and closed on 2026-08-14: 14.4 million host operations never produced the
+// signature, and a free that overlaps an already-free block is refused inside the allocator, so the
+// signature is unreachable from any caller rather than merely unobserved.
 use buddy::Buddy;
 
 // The table's floor, for a pool too small for the worst-case sizing below to matter. The real bound
@@ -376,6 +378,7 @@ impl FrameAllocator {
 					crate::serial_println!("frame: run table full at {} runs, which the worst-case sizing says cannot happen - a freed span is being LOST", v.len());
 					return false;
 				}
+				// ALLOC-OK: the frame allocator's own free list; taking heap for it would recurse into this allocator.
 				v.insert(at, run);
 				true
 			}
@@ -634,6 +637,7 @@ pub fn init(regions: &[MemRegion]) {
 		}
 		if base + PAGE_SIZE <= end {
 			let pages = (end - base) / PAGE_SIZE;
+			// ALLOC-OK: the frame allocator's own free list, populated at boot from the memory map.
 			allocator.insert(base, pages);
 		}
 	}
@@ -1119,6 +1123,7 @@ pub fn allocate_contiguous(pages: usize) -> Option<u64> {
 // `allocate_contiguous` span), still owned by the caller, freed exactly once, and no longer
 // mapped anywhere it could be written through.
 pub unsafe fn deallocate(phys: u64) {
+	// ALLOC-OK: the frame allocator's own free list; a free must not be able to fail.
 	ALLOCATOR.lock().insert(phys, 1);
 }
 

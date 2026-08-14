@@ -20,6 +20,35 @@ pub enum BlockType {
 	TypeIndex(u32),
 }
 
+impl BlockType {
+	// The block's signature: what it takes off the stack, and what it leaves.
+	//
+	// ONE RESOLUTION, FOR BOTH HALVES OF THE ENGINE. This was written three times - the validator's
+	// `block_signature` for the types, the interpreter's `block_params` and `block_results` for the
+	// counts - and the three agreed only as long as somebody kept them agreeing. They stopped: the
+	// validator was taught that a block's label sits below its parameters and the interpreter was
+	// not, and a module that validated correctly then executed with the wrong answer, which is the
+	// one failure an interpreter exists to make impossible. Three copies of a rule is the shape that
+	// allowed it, so there is one.
+	//
+	// Borrowed rather than cloned, because the interpreter asks on every block entry.
+	pub fn signature<'a>(&'a self, module: &'a Module) -> Option<(&'a [crate::module::ValType], &'a [crate::module::ValType])> {
+		match self {
+			BlockType::Empty => Some((&[], &[])),
+			BlockType::Value(v) => Some((&[], core::slice::from_ref(v))),
+			BlockType::TypeIndex(index) => module.types.get(*index as usize).map(|t| (t.params.as_slice(), t.results.as_slice())),
+		}
+	}
+
+	// How many operands the block takes and how many it leaves.
+	//
+	// `(0, 0)` for a type index that names nothing: the validator refuses such a module by name and
+	// the decoder refuses it earlier still, and the interpreter may not panic over it.
+	pub fn arity(&self, module: &Module) -> (usize, usize) {
+		self.signature(module).map_or((0, 0), |(params, results)| (params.len(), results.len()))
+	}
+}
+
 #[derive(Clone, Debug)]
 pub enum Instr {
 	Unreachable,
@@ -287,8 +316,8 @@ pub fn decode(module: &Module, func_index: usize) -> Result<Vec<Instr>, DecodeEr
 				memory_index(body, &mut pc)?;
 				out.push(Instr::MemoryGrow);
 			}
-			0x41 => out.push(Instr::I32Const(read_i64(body, &mut pc)? as i32)),
-			0x42 => out.push(Instr::I64Const(read_i64(body, &mut pc)?)),
+			0x41 => out.push(Instr::I32Const(read_s32(body, &mut pc)?)),
+			0x42 => out.push(Instr::I64Const(read_s64(body, &mut pc)?)),
 			0x43 => {
 				let bits: u32 = read_f32_bits(body, &mut pc)?;
 				out.push(Instr::F32Const(f32::from_bits(bits)));
@@ -406,7 +435,7 @@ fn read_f64_bits(body: &[u8], pc: &mut usize) -> Result<u64, DecodeError> {
 // A blocktype is a negative value type, a positive type index, or `0x40` for empty. All three are
 // representable and none of them is an arity.
 fn block_type(module: &Module, body: &[u8], pc: &mut usize) -> Result<BlockType, DecodeError> {
-	let v: i64 = read_i64(body, pc)?;
+	let v: i64 = read_s33(body, pc)?;
 	if v == -64 {
 		return Ok(BlockType::Empty); // 0x40
 	}
@@ -460,12 +489,41 @@ fn read_u32(body: &[u8], pc: &mut usize) -> Result<u32, DecodeError> {
 	}
 }
 
-// Read a signed LEB128 (sign-extended into 64 bits) from the body, advancing `pc`.
-fn read_i64(body: &[u8], pc: &mut usize) -> Result<i64, DecodeError> {
+// Read a signed LEB128 of EXACTLY `bits` width, sign-extended into 64 bits, advancing `pc`.
+//
+// THREE WIDTHS, NOT ONE. The binary format specifies `s32` for `i32.const`, `s33` for a block type
+// and `s64` for `i64.const`, and each bounds its own encoding: at most `ceil(bits/7)` bytes, with the
+// unused high bits of the last byte required to be the sign extension of the value. One `s64` reader
+// served all three, so `i32.const 0` written in six bytes parsed here and was truncated by `as i32` -
+// a module the specification calls malformed, accepted and reinterpreted.
+//
+// The last-byte rule is the part a length check alone does not give. At the final byte the value
+// has `bits - shift` bits left to fill; every bit above that in the byte's payload must equal the
+// sign bit, or the encoding names a number outside the width.
+fn read_signed(body: &[u8], pc: &mut usize, bits: u32) -> Result<i64, DecodeError> {
 	let mut result: i64 = 0;
 	let mut shift: u32 = 0;
 	loop {
 		let b: u8 = read_byte(body, pc)?;
+		if shift + 7 >= bits {
+			// The last byte this width allows. `remaining` is how many of its seven payload bits
+			// carry value; the rest, together with the sign bit, must all match the sign.
+			let remaining: u32 = bits - shift;
+			if b & 0x80 != 0 {
+				return Err("LEB128 signed value is longer than its width allows");
+			}
+			let sign: u8 = if (b >> (remaining - 1)) & 1 == 1 { 0x7f } else { 0x00 };
+			// Everything at or above `remaining` in the payload, compared with the sign extension.
+			if remaining < 7 && (b & 0x7f) >> remaining != (sign >> remaining) {
+				return Err("LEB128 signed value does not fit in its width");
+			}
+			result |= ((b & 0x7f) as i64) << shift;
+			shift += 7;
+			if shift < 64 && (b & 0x40) != 0 {
+				result |= -1i64 << shift;
+			}
+			return Ok(result);
+		}
 		result |= ((b & 0x7f) as i64) << shift;
 		shift += 7;
 		if b & 0x80 == 0 {
@@ -474,8 +532,21 @@ fn read_i64(body: &[u8], pc: &mut usize) -> Result<i64, DecodeError> {
 			}
 			return Ok(result);
 		}
-		if shift >= 64 {
-			return Err("LEB128 overflow");
-		}
 	}
+}
+
+// `i32.const`'s immediate: `s32`, at most five bytes.
+fn read_s32(body: &[u8], pc: &mut usize) -> Result<i32, DecodeError> {
+	Ok(read_signed(body, pc, 32)? as i32)
+}
+
+// A block type: `s33`, at most five bytes. Thirty-THREE, because the encoding is a negative value
+// type or a non-negative type index, and a `u32` index must survive the sign bit.
+fn read_s33(body: &[u8], pc: &mut usize) -> Result<i64, DecodeError> {
+	read_signed(body, pc, 33)
+}
+
+// `i64.const`'s immediate: `s64`, at most ten bytes.
+fn read_s64(body: &[u8], pc: &mut usize) -> Result<i64, DecodeError> {
+	read_signed(body, pc, 64)
 }

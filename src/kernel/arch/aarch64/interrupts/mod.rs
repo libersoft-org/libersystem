@@ -102,17 +102,23 @@ pub fn release_unused_msi(vector: u8) {
 	}
 }
 
-// Whether this device already holds a LIVE MSI vector - see `MsiRegistry::has_live`. The policy it
-// serves lives in `sys_device_msix_acquire`.
-pub fn device_has_live_msi(owner: u32) -> bool {
-	REGISTRY.has_live(owner)
-}
-
 // One vector per device, entry 0 - see the x86_64 `acquire_msi`, which states the limit and why
-// `MsiRegistry::acquire` refuses a device that already holds a slot.
+// `MsiRegistry::acquire_unique_live` refuses a device that already holds a live slot - `acquire`
+// itself does not, which this comment used to claim.
 pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
 	let len = MSI_LEN.load(Ordering::Relaxed);
-	let slot = REGISTRY.acquire(owner, len)?;
+	program_acquired(REGISTRY.acquire(owner, len)?, table_phys)
+}
+
+// The same, and ONLY IF the device holds no live vector already - see
+// `MsiRegistry::acquire_unique_live`. This is what `sys_device_msix_acquire` calls; the form above
+// stays for the kernel's own bring-up test.
+pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
+	let len = MSI_LEN.load(Ordering::Relaxed);
+	program_acquired(REGISTRY.acquire_unique_live(owner, len)?, table_phys)
+}
+
+fn program_acquired(slot: usize, table_phys: u64) -> Option<u8> {
 	let spi = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
 	program_msix_entry(table_phys, spi);
 	super::gic::enable_msi_spi(spi);

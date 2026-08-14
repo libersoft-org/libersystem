@@ -30,6 +30,16 @@ pub enum Uart {
 	Ns16550,
 }
 
+// How a PSCI call reaches its implementation on this platform - the same two answers `fdt` gives,
+// from the other kind of firmware description. A separate type for the same reason `Uart` is: this
+// one decodes a FADT flag and that one a device-tree string, and one shared enum would invite one
+// decoder's notion of "unknown" to be read as the other's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PsciConduit {
+	Smc,
+	Hvc,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Console {
 	pub uart: Uart,
@@ -66,16 +76,68 @@ impl Acpi {
 		want.iter().enumerate().all(|(index, byte)| self.u8_at(pa + index as u64) == *byte)
 	}
 
-	// Is this a plausible RSDP? Signature and the first checksum, which is what tells a real RSDP
-	// from a configuration-table entry pointing at something else entirely.
+	// Is this a plausible RSDP? Signature and BOTH checksums.
+	//
+	// The ACPI 1.0 part is the first twenty bytes and sums to zero, and that is what tells a real
+	// RSDP from a configuration-table entry pointing at something else entirely. It is not enough:
+	// from revision 2 the structure carries `Length` and a second checksum over the WHOLE of it, and
+	// the XSDT pointer lives in the part the first checksum does not cover. So the pointer this
+	// parser walks first was taken from bytes nothing had summed - and the console address it walks
+	// to is the only thing printed after `ExitBootServices`, which this code then writes to. A table
+	// that passes a signature check and fails its checksum is precisely the "firmware that is not
+	// QEMU" case this milestone exists for.
 	pub fn is_valid(&self) -> bool {
 		if self.rsdp == 0 || !self.signature_is(self.rsdp, b"RSD PTR ") {
 			return false;
 		}
-		// The ACPI 1.0 part is the first twenty bytes and sums to zero. A table that fails this is
-		// not an RSDP, and walking the pointers inside it would follow arbitrary numbers.
-		let sum = (0..20u64).fold(0u8, |sum, index| sum.wrapping_add(self.u8_at(self.rsdp + index)));
+		if !self.sums_to_zero(self.rsdp, 20) {
+			return false;
+		}
+		let revision = self.u8_at(self.rsdp + 15);
+		if revision < 2 {
+			return true;
+		}
+		let length = self.u32_at(self.rsdp + 20) as u64;
+		// The extended structure is 36 bytes; anything shorter than the fields it is about to be
+		// read for, or long enough to be a wild number, is not one.
+		if !(36..0x1000).contains(&length) {
+			return false;
+		}
+		self.sums_to_zero(self.rsdp, length)
+	}
+
+	// Do `length` bytes at `pa` sum to zero? Every ACPI structure carries a checksum with exactly
+	// this rule, so there is one implementation of it.
+	fn sums_to_zero(&self, pa: u64, length: u64) -> bool {
+		let mut sum = 0u8;
+		let mut index = 0u64;
+		while index < length {
+			sum = sum.wrapping_add(self.u8_at(pa + index));
+			index += 1;
+		}
 		sum == 0
+	}
+
+	// Is the system description table at `pa` one this parser may read? Its signature, a sane
+	// declared length, and its checksum over that whole length.
+	//
+	// One helper because the rule is one rule: the root table, SPCR and the FADT all carry a
+	// 36-byte header whose bytes 0..4 are the signature, 4..8 the length and 9 the checksum. None of
+	// the three was checked.
+	fn table_is_valid(&self, pa: u64, signature: Option<&[u8; 4]>) -> bool {
+		if pa == 0 {
+			return false;
+		}
+		if let Some(want) = signature
+			&& !self.signature_is(pa, want)
+		{
+			return false;
+		}
+		let length = self.u32_at(pa + 4) as u64;
+		if !(36..0x10_0000).contains(&length) {
+			return false;
+		}
+		self.sums_to_zero(pa, length)
 	}
 
 	// The physical address of the table with this signature, or None.
@@ -94,24 +156,46 @@ impl Acpi {
 		} else {
 			(self.u32_at(self.rsdp + 16) as u64, 4)
 		};
-		if root == 0 {
+		// THE ROOT TABLE'S OWN SIGNATURE AND CHECKSUM. Neither was checked: a length below 36 or
+		// absurdly large was refused and everything else was walked, so entries were read out of a
+		// structure that had only been assumed to be a table.
+		let want: &[u8; 4] = if width == 8 { b"XSDT" } else { b"RSDT" };
+		if !self.table_is_valid(root, Some(want)) {
 			return None;
 		}
 		let length = self.u32_at(root + 4) as u64;
-		// A header is 36 bytes; a length below that, or one large enough to be a wild number, means
-		// the pointer is not a table and its entries are not entries.
-		if !(36..0x10_0000).contains(&length) {
-			return None;
-		}
 		let mut at = root + 36;
 		while at + width <= root + length {
 			let entry = if width == 8 { self.u64_at(at) } else { self.u32_at(at) as u64 };
 			at += width;
-			if entry != 0 && self.signature_is(entry, signature) {
+			// And the table the entry names, before its contents are believed.
+			if entry != 0 && self.signature_is(entry, signature) && self.table_is_valid(entry, Some(signature)) {
 				return Some(entry);
 			}
 		}
 		None
+	}
+
+	// Which instruction reaches PSCI on this machine, as the FADT states it - the ACPI half of the
+	// same question `fdt::psci_conduit` answers from a device tree.
+	//
+	// The FADT's ARM Boot Architecture Flags are a u16 at offset 129: bit 0 `PSCI_COMPLIANT` says
+	// whether PSCI exists at all, bit 1 `PSCI_USE_HVC` says which of the two instructions reaches it.
+	// A firmware that is not PSCI-compliant gets `None`, which the caller must treat as "no PSCI"
+	// rather than as a reason to guess.
+	//
+	// The flags field arrived in FADT revision 5, so a shorter table has no answer either.
+	pub fn psci_conduit(&self) -> Option<PsciConduit> {
+		let fadt = self.table(b"FACP")?;
+		let length = self.u32_at(fadt + 4) as u64;
+		if length < 131 {
+			return None;
+		}
+		let flags = self.u8_at(fadt + 129) as u16 | (self.u8_at(fadt + 130) as u16) << 8;
+		if flags & 0x0001 == 0 {
+			return None;
+		}
+		Some(if flags & 0x0002 != 0 { PsciConduit::Hvc } else { PsciConduit::Smc })
 	}
 
 	// The console SPCR describes, or None when there is no SPCR, it names a device this system

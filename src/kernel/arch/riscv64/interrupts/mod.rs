@@ -80,16 +80,21 @@ pub fn release_unused_msi(vector: u8) {
 	}
 }
 
-// Whether this device already holds a LIVE MSI vector - see `MsiRegistry::has_live`. The policy it
-// serves lives in `sys_device_msix_acquire`.
-pub fn device_has_live_msi(owner: u32) -> bool {
-	REGISTRY.has_live(owner)
+// One vector per device, entry 0 - see the x86_64 `acquire_msi`, which states the limit and why it
+// exists. `MsiRegistry::acquire` does NOT enforce it, which this comment used to claim: the form that
+// does is `acquire_unique_live`, reached through `acquire_msi_unique` below.
+pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
+	program_acquired(REGISTRY.acquire(owner, MAX_MSI)?, table_phys)
 }
 
-// One vector per device, entry 0 - see the x86_64 `acquire_msi`, which states the limit and why
-// `MsiRegistry::acquire` refuses a device that already holds a slot.
-pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
-	let slot = REGISTRY.acquire(owner, MAX_MSI)?;
+// The same, and ONLY IF the device holds no live vector already - see
+// `MsiRegistry::acquire_unique_live`. This is what `sys_device_msix_acquire` calls; the form above
+// stays for the kernel's own bring-up test.
+pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
+	program_acquired(REGISTRY.acquire_unique_live(owner, MAX_MSI)?, table_phys)
+}
+
+fn program_acquired(slot: usize, table_phys: u64) -> Option<u8> {
 	let eid = EID_BASE + slot as u32;
 	let hart = super::percpu::this_cpu().lapic_id() as u64;
 	program_msix_entry(table_phys, super::imsic::msi_address(hart), eid);

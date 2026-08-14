@@ -121,6 +121,7 @@ impl KernelStack {
 				Some(frame) => {
 					// SAFETY: ours since `allocate` returned it, mapped nowhere - the mapping is
 					// exactly what failed - so nothing can reach it and it goes straight back.
+					// NEVER-MAPPED: `try_map_page` is what failed, so no page table ever held it.
 					unsafe { crate::mem::frame::deallocate(frame) };
 					None
 				}
@@ -207,7 +208,8 @@ impl Thread {
 	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
 		let mut stack = KernelStack::allocate()?;
 		let sp = arch::context::init_thread_stack(stack.as_mut_slice(), entry, arg);
-		let thread = Arc::new(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process });
+		// FALLIBLY: `SYS_THREAD_CREATE` reaches this, and `build` already answers `Option`.
+		let thread = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process })?;
 		// Forward-link the thread to its process so signal delivery can reach it - and refuse to
 		// build the thread at all if the process is already tearing down. A thread that cannot be
 		// registered is a thread nothing can signal, reap or account, inside a process whose handles

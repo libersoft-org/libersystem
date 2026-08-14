@@ -43,6 +43,9 @@ pub struct MsiRegistry<const N: usize> {
 	// The discovered-device index each slot was acquired for (u32::MAX = none),
 	// retained for the `lsirq` inventory.
 	owner: [AtomicU32; N],
+	// Serialises HANDING OUT a slot, so "this owner holds no live slot, and here is a free one" is
+	// one operation rather than two. See `acquire_unique_live`.
+	claim: SpinLock<()>,
 }
 
 impl<const N: usize> Default for MsiRegistry<N> {
@@ -53,7 +56,7 @@ impl<const N: usize> Default for MsiRegistry<N> {
 
 impl<const N: usize> MsiRegistry<N> {
 	pub const fn new() -> Self {
-		Self { bound: [const { SpinLock::new(None) }; N], used: [const { AtomicBool::new(false) }; N], pending: [const { AtomicBool::new(false) }; N], owner: [const { AtomicU32::new(u32::MAX) }; N] }
+		Self { bound: [const { SpinLock::new(None) }; N], used: [const { AtomicBool::new(false) }; N], pending: [const { AtomicBool::new(false) }; N], owner: [const { AtomicU32::new(u32::MAX) }; N], claim: SpinLock::new(()) }
 	}
 
 	// Reserve a free slot for device `owner`, searching the first `limit` slots
@@ -63,6 +66,47 @@ impl<const N: usize> MsiRegistry<N> {
 	// then programs the device's MSI-X table for the slot's hardware vector and binds
 	// an Interrupt with `bind`.
 	pub fn acquire(&self, owner: u32, limit: usize) -> Option<usize> {
+		let _claim = self.claim.lock();
+		self.claim_free_slot(owner, limit)
+	}
+
+	// Reserve a free slot for `owner`, and ONLY IF `owner` holds no live slot already.
+	//
+	// ONE OPERATION, because two are not enough. The policy - one live vector per device - used to be
+	// `has_live` at the syscall followed by `acquire` here, and a question answered from a value that
+	// can change before it is used is not answered:
+	//
+	//   CPU 0                          CPU 1
+	//   has_live(A) -> false
+	//                                  has_live(A) -> false
+	//   acquire(A) -> slot 4
+	//                                  acquire(A) -> slot 5
+	//   program A's entry 0 = 52
+	//                                  program A's entry 0 = 53
+	//
+	// Both syscalls succeed, the device's entry 0 holds 53, and dropping the first `Interrupt` masks
+	// entry 0 - the entry the second one is live on. That is exactly the aliasing `has_live`'s own
+	// comment describes and forbids: an old handle silently disabling a new one. Two backends'
+	// comments also claimed this mechanism refused it, which it did not.
+	//
+	// The SYSCALL still owns the policy in the sense that matters - what to do when this answers
+	// `None` - and `acquire` stays beside it for the kernel's own bring-up test, which stands in for
+	// DeviceManager on a device the booted system has already claimed.
+	pub fn acquire_unique_live(&self, owner: u32, limit: usize) -> Option<usize> {
+		// The composite is two reads and a write across N atomics, which no single compare-exchange
+		// can make atomic. A lock is what makes it one operation; acquisition is rare enough that
+		// serialising it costs nothing worth measuring.
+		let _claim = self.claim.lock();
+		if self.has_live(owner) {
+			return None;
+		}
+		self.claim_free_slot(owner, limit)
+	}
+
+	// The claim itself, with `claim` already held. Every public entry point that hands out a slot
+	// goes through it under that lock, so `acquire_unique_live`'s check cannot be overtaken by one
+	// of the others.
+	fn claim_free_slot(&self, owner: u32, limit: usize) -> Option<usize> {
 		for slot in 0..limit.min(N) {
 			if self.used[slot].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
 				continue;
@@ -105,6 +149,9 @@ impl<const N: usize> MsiRegistry<N> {
 		if slot >= N {
 			return false;
 		}
+		// Under the same lock as the searching form, so `acquire_unique_live`'s check cannot be
+		// overtaken by a fixed-slot claim for the same owner.
+		let _claim = self.claim.lock();
 		if self.used[slot].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
 			return false;
 		}

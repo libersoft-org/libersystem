@@ -296,6 +296,14 @@ impl<'a> Elf<'a> {
 			if ph.p_paddr.checked_add(ph.p_memsz).is_none() {
 				return None;
 			}
+			// AND THE VIRTUAL END, for the same reason one line up. The x86 mapper walks
+			// `virt + i * PAGE_SIZE` over this span unchecked, and a `PT_LOAD` whose virtual span
+			// wraps is not a meaningful segment for any consumer - so the refusal belongs beside its
+			// neighbour rather than in each backend, which is the argument that put the physical one
+			// here.
+			if ph.p_vaddr.checked_add(ph.p_memsz).is_none() {
+				return None;
+			}
 			if ph.p_filesz > ph.p_memsz {
 				return None;
 			}

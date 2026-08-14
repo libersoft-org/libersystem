@@ -165,6 +165,7 @@ fn write_byte(byte: u8) {
 			return;
 		}
 	}
+	// ALLOC-OK: a fixed-capacity TX ring, not a heap collection - the capacity is checked on the lines above.
 	ring.push(byte);
 }
 
@@ -198,8 +199,10 @@ pub fn write_bytes(bytes: &[u8]) -> usize {
 			return i;
 		}
 		if byte == b'\n' {
+			// ALLOC-OK: a fixed-capacity TX ring, not a heap collection - the capacity is checked on the line above.
 			ring.push(b'\r');
 		}
+		// ALLOC-OK: a fixed-capacity TX ring, not a heap collection - the capacity is checked on the lines above.
 		ring.push(byte);
 	}
 	bytes.len()

@@ -166,19 +166,27 @@ pub struct Channel {
 
 impl Channel {
 	// Create a connected pair of endpoints with the default queue depth.
+	//
+	// INFALLIBLE, and deliberately: its callers are the boot chain and the tests, where a heap too
+	// short to hold two channel endpoints is a failed boot or a failed test either way. The syscall
+	// path uses `try_create_with_depth`, and this wrapper is where that choice is stated rather than
+	// buried in an `Arc::new` somewhere.
 	pub fn create() -> (Arc<Channel>, Arc<Channel>) {
-		Self::create_with_depth(0)
+		Self::try_create_with_depth(0).expect("a channel pair at boot")
 	}
 
 	// Create a connected pair whose endpoints queue up to `depth` messages each
 	// (0 = the default depth; anything else is clamped to the sane band).
-	pub fn create_with_depth(depth: usize) -> (Arc<Channel>, Arc<Channel>) {
+	//
+	// FALLIBLY: `SYS_CHANNEL_CREATE` reaches this, and `Arc::new` aborts the kernel when the heap is
+	// short - a denial of service needing no privilege at all.
+	pub fn try_create_with_depth(depth: usize) -> Option<(Arc<Channel>, Arc<Channel>)> {
 		let limit = if depth == 0 { CHANNEL_QUEUE_DEFAULT } else { depth.clamp(1, CHANNEL_QUEUE_MAX) };
-		let a = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None) });
-		let b = Arc::new(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None) });
+		let a = crate::mem::heap::try_arc(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None) })?;
+		let b = crate::mem::heap::try_arc(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None) })?;
 		*a.peer.lock() = Some(Arc::downgrade(&b));
 		*b.peer.lock() = Some(Arc::downgrade(&a));
-		(a, b)
+		Some((a, b))
 	}
 
 	// This endpoint's depth against its limit: what is queued plus what a receive is holding but has
@@ -247,6 +255,18 @@ impl Channel {
 		{
 			let mut inbox = peer.inbox.lock();
 			if peer.depth(&inbox) >= peer.limit {
+				return Err((ChannelError::Full, msg.caps));
+			}
+			// ROOM IN THE RING BEFORE THE CHARGE, and before anything is committed.
+			//
+			// The depth check above and the quota below both pass on a queue whose RING is full:
+			// `VecDeque::push_back` then grows it, infallibly, on every userspace send. Ring 3
+			// reaches this by making an ordinary IPC call against a short heap, and the answer was a
+			// kernel abort - which is the class K06 names, on the busiest syscall path there is.
+			//
+			// Reserved first so the failure costs nothing: a charge taken and then given back is
+			// two more places for the accounting to be wrong.
+			if inbox.try_reserve(1).is_err() {
 				return Err((ChannelError::Full, msg.caps));
 			}
 			// Charge only once space is assured, so a refused message charges nothing.
@@ -376,6 +396,7 @@ impl Channel {
 			if core::mem::take(&mut message.slot_reserved) {
 				self.in_flight.fetch_sub(1, Ordering::Relaxed);
 			}
+			// ALLOC-OK: the message came OFF this deque a moment ago, so the slot it is going back into is the one it left.
 			inbox.push_front(message);
 		}
 		sched::wake_object(self.header.koid());

@@ -222,8 +222,11 @@ pub fn alloc_frame() -> Option<u64> {
 // # Safety
 //
 // Same contract as `frame::deallocate`: `pa` must be a frame this caller owns, freed once,
-// and no longer reachable through any page table on any core.
+// and no longer reachable through any page table on any core. Every CALLER of this is checked by
+// `src/tools/check-frame-retirement.sh` for the statement of why that holds, which is where the
+// obligation this signature defers is actually discharged.
 pub unsafe fn dealloc_frame(pa: u64) {
+	// NEVER-MAPPED: the contract above is the caller's, and each caller states its own reason.
 	unsafe { crate::mem::frame::deallocate(pa) };
 }
 
@@ -445,6 +448,10 @@ pub fn free_address_space(root: u64) {
 				free_table_level(l1, 1);
 			}
 		}
+		// NEVER-MAPPED: a page-table frame of a DEAD address space, not a data frame. This runs
+		// from `AddressSpace::drop`, so the last reference is gone and no thread can be in this
+		// address space; and no port assigns ASIDs, so every switch away from it invalidated the
+		// whole TLB of the core that left. Nothing anywhere can still translate through these.
 		dealloc_frame(root);
 	}
 }
@@ -464,6 +471,10 @@ unsafe fn free_table_level(phys: u64, level: u32) {
 				}
 			}
 		}
+		// NEVER-MAPPED: a page-table frame of a DEAD address space, not a data frame. This runs
+		// from `AddressSpace::drop`, so the last reference is gone and no thread can be in this
+		// address space; and no port assigns ASIDs, so every switch away from it invalidated the
+		// whole TLB of the core that left. Nothing anywhere can still translate through these.
 		dealloc_frame(phys);
 	}
 }

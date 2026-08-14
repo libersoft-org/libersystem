@@ -138,10 +138,14 @@ pub enum Universe {
 	// The serialized name stays `Host`, so the records already on disk keep meaning what they said:
 	// they were produced by that same producer, over that same evidence.
 	Host,
-	// Builds, which no shadow producer covers today. A separate universe so its certificate can only
-	// be earned by evidence about builds - which is to say, not yet - rather than inherited from a
-	// comparison that never looked at one. A universe's certificate may not be broader than the
-	// evidence behind it, and this is that rule made structural rather than remembered.
+	// Builds. A separate universe so its certificate can only be earned by evidence about builds
+	// rather than inherited from a comparison that never looked at one: a universe's certificate may
+	// not be broader than the evidence behind it, and this is that rule made structural rather than
+	// remembered.
+	//
+	// This said "which no shadow producer covers today", eighteen lines above
+	// `universes_with_producers`, which lists it - a comment describing a previous state as the
+	// current one, which is the class this milestone has now recorded six times.
 	HostBuild,
 	// The tagged suite inside `qemu-run.sh TEST=1`.
 	TestGuest,
@@ -524,6 +528,19 @@ pub struct Record {
 	// fails its own checks is not evidence about the tree.
 	#[serde(default)]
 	pub model_self_check: bool,
+	// WHAT THE SELECTOR DECIDED FOR EACH COMPONENT, as `component\tdigest` pairs.
+	//
+	// Distinctness used to be keyed on `(source_digest, changed_components)`, and the criterion this
+	// file states is five genuinely different CHANGES. On one unchanged tree, five comparisons of
+	// `audio + neighbour-0` .. `audio + neighbour-4` are five different change SETS whose decision
+	// about audio may be byte-identical - and the neighbour is free while the audio half is what the
+	// certificate is about. "Impossible to manufacture" was too strong.
+	//
+	// The digest covers the selected `PlanItemKey`s that name the component, the edge kinds that
+	// reached it and the architectures the plan built and booted - which is the decision, rather than
+	// the company it was made in.
+	#[serde(default)]
+	pub component_decisions: Vec<String>,
 }
 
 // The kinds of change a set of paths represents, read from the working tree.
@@ -578,7 +595,7 @@ impl Log {
 	// the same argument that makes an unresolved handle cardinality a refusal: a record that cannot
 	// say whether the model passed its own checks is not evidence that it did. The cost is evidence
 	// that has to be re-earned, which is what this milestone already says the cost of waiting is.
-	fn is_clean(record: &Record, component: &str, model_hash: &str, universe: Universe) -> bool {
+	pub(crate) fn is_clean(record: &Record, component: &str, model_hash: &str, universe: Universe) -> bool {
 		record.model_hash == model_hash && record.universe == universe && record.verdict == "Consistent" && record.model_self_check && record.changed_components.iter().any(|changed| changed == component)
 	}
 
@@ -609,8 +626,22 @@ impl Log {
 	// The unit is the SELECTION INPUT - the tree's content digest and the change set - because that
 	// is what determines the answer being validated. Two changes compared against one tree are two
 	// pieces of evidence; one change compared twice is one.
+	// KEYED ON WHAT THE SELECTOR DECIDED FOR THIS COMPONENT, not on the global change set.
+	//
+	// `(source_digest, changed_components)` counted `audio + neighbour-0` .. `audio + neighbour-4` as
+	// five pieces of evidence about audio, and the decision about audio may be identical in all five.
+	// A record written before `component_decisions` existed carries none, and falls back to the old
+	// key rather than collapsing every old record into one - the evidence it represents was real.
 	pub fn distinct_evidence_for(&self, component: &str, model_hash: &str, universe: Universe) -> usize {
-		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).map(|record| (record.source_digest.clone(), record.changed_components.join(","))).collect::<BTreeSet<(String, String)>>().len()
+		self.records
+			.iter()
+			.filter(|record| Self::is_clean(record, component, model_hash, universe))
+			.map(|record| {
+				let decision = record.component_decisions.iter().find_map(|entry| entry.split_once('\t').filter(|(name, _)| *name == component).map(|(_, digest)| String::from(digest))).unwrap_or_else(|| record.changed_components.join(","));
+				(record.source_digest.clone(), decision)
+			})
+			.collect::<BTreeSet<(String, String)>>()
+			.len()
 	}
 
 	// Targets this component has CLEAN evidence on. Filtering on the verdict is the whole point and

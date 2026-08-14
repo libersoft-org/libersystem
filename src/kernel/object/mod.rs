@@ -129,8 +129,13 @@ impl ObjectHeader {
 	}
 
 	// Set this object's human-readable label.
+	//
+	// FALLIBLY, because the name comes from ring 3: `String::from` aborts the kernel on a short
+	// heap, and a label is the least important thing in the system to halt for. A refused name
+	// leaves the object unnamed, which is what it was a moment ago.
 	pub fn set_name(&self, name: &str) {
-		*self.name.lock() = Some(String::from(name));
+		let Some(owned) = crate::mem::heap::try_string(name) else { return };
+		*self.name.lock() = Some(owned);
 	}
 
 	// This object's label, if one was set.

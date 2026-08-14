@@ -95,6 +95,16 @@ impl VaPool {
 			return;
 		}
 		let pos = self.free.partition_point(|&(b, _)| b < base);
+		// FALLIBLY, and a refusal LEAKS THE RANGE rather than aborting the kernel.
+		//
+		// Ring 3 reaches this on every unmap, and a freed range that touches no neighbour is a new
+		// hole - so the list grows, and `Vec::insert` reallocates. The heap module makes the same
+		// trade on its own rollback path and states it: address space, of which there is 2^48,
+		// rather than frames, of which there are not. A hole that is never reused costs a range no
+		// mapping will ever be given; the alternative costs the machine.
+		if self.free.try_reserve(1).is_err() {
+			return;
+		}
 		self.free.insert(pos, (base, len));
 	}
 }

@@ -290,6 +290,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	{
 		let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 		for i in 0..8 {
+			// ALLOC-OK: boot bring-up self-test, before userspace exists.
 			v.push(i * i);
 		}
 		let (mapped, free) = crate::mem::heap::stats();
@@ -308,6 +309,8 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	paging::unmap_page(TEST_VA);
 	// SAFETY: the frame this bring-up check allocated three lines up, just unmapped from
 	// the only address that ever reached it.
+	// NEVER-MAPPED: boot bring-up on the first core, before any other core is started, so no
+	// other TLB exists to hold the translation this one just dropped.
 	unsafe { paging::dealloc_frame(frame) };
 
 	// Increment 5: monotonic clock, per-CPU block, context switch, scheduler, timer.

@@ -31,6 +31,10 @@ declare -A GATES=(
 	# A kernel allocation ring 3 can trigger must be able to refuse. Three audits closed that class
 	# by enumeration and a fourth would have found the next member; this is the rule instead.
 	["kernel-allocations"]="tools/check-kernel-allocations.sh"
+	# A frame a page table ever pointed at goes back through `frame::retire`. The module's own doc
+	# comment said so and the next round still wrote a rollback that unmapped a page and called
+	# `deallocate` - a rule in a comment is a rule the next diff does not read.
+	["frame-retirement"]="tools/check-frame-retirement.sh"
 	# The `--artifact` fast path knows a library's DEPENDENCIES, or it reports an artifact as
 	# current after a crate it compiles against changed - which makes every test result taken on
 	# that artifact meaningless. Its own family's `quick` and `provider` modes are not gates because

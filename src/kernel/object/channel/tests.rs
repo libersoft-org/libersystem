@@ -88,7 +88,7 @@ fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
 			}
 		}
 	}
-	let (sender_end, receiver_end) = Channel::create_with_depth(2);
+	let (sender_end, receiver_end) = Channel::try_create_with_depth(2).expect("a channel pair");
 	sched::spawn_with_object(sender, sender_end, Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(SENDER_REFUSED.load(Ordering::SeqCst), "the depth-2 queue refused the third send");
@@ -269,7 +269,7 @@ fn receives_in_flight_never_let_the_queue_pass_its_limit() {
 	// stopped between their take and their put-back always do.
 	use crate::object::channel::Channel;
 	const DEPTH: usize = 4;
-	let (a, b) = Channel::create_with_depth(DEPTH);
+	let (a, b) = Channel::try_create_with_depth(DEPTH).expect("a channel pair");
 	let limit = b.queue_limit();
 	assert_eq!(limit, DEPTH, "the endpoint has the depth it was created with");
 

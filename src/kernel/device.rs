@@ -56,6 +56,7 @@ pub fn init() {
 	let mut functions = PCI_FUNCTIONS.lock();
 	functions.clear();
 	for p in crate::arch::pci::scan() {
+		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
 		functions.push(abi::PciInfo { vendor: p.vendor, device: p.device_id, class: p.class, subclass: p.subclass, prog_if: p.prog_if, bus: p.bus, dev: p.dev, func: p.func, _pad: 0 });
 	}
 	drop(functions);
@@ -67,6 +68,7 @@ pub fn init() {
 		// a shared INTx line. Disabling the pins keeps a stray assertion off the (fully masked)
 		// I/O APIC by construction.
 		crate::arch::pci::set_intx_disabled(v.pci.bus, v.pci.dev, v.pci.func, true);
+		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
 		table.push(DeviceEntry { device_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if });
 	}
 	for x in crate::arch::pci::scan_xhci() {
@@ -74,6 +76,7 @@ pub fn init() {
 		// BAR 0, so the virtio structure offsets are zero and the driver reads the
 		// operational/runtime/doorbell offsets from the capability registers at the base.
 		crate::arch::pci::set_intx_disabled(x.pci.bus, x.pci.dev, x.pci.func, true);
+		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
 		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if });
 	}
 }

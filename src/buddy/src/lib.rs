@@ -3,10 +3,16 @@
 //! SEPARATE FROM THE KERNEL SO IT CAN BE DRIVEN HARD. This is the kernel's physical frame
 //! allocator and it used to live inside `kernel::mem::frame`, where the only way to exercise it was
 //! to boot a guest: a few thousand allocations per architecture, in whatever order that boot
-//! happened to produce, at up to ninety minutes a run on riscv64. P02M0120 is open on a defect seen
-//! ONCE in exactly that setting - eighty double allocations of one page, on the last page of the
-//! first usable region, never reproduced in fourteen full runs since - and "run the suite again and
-//! hope" is not a way to find it.
+//! happened to produce, at up to ninety minutes a run on riscv64. P02M0120 was opened on a defect
+//! seen ONCE in exactly that setting - eighty double allocations of one page, on the last page of the
+//! first usable region - and "run the suite again and hope" is not a way to find it.
+//!
+//! It is CLOSED (2026-08-14), and on a stronger statement than an explanation of the original event.
+//! The arithmetic was searched here over 14.4 million host operations against a reference model
+//! without ever producing the signature, and the one mechanism that could produce it - a free
+//! overlapping a block that is already free - is now refused inside the allocator at its source. So
+//! the signature is unreachable from any caller, which is a different claim from "we could not
+//! reproduce it": the first says the code cannot do it, the second says we did not see it do it.
 //!
 //! Here the same code takes tens of millions of operations in under a second, against a reference
 //! model that knows where every page is, over pool shapes chosen to be the shape of the sighting.

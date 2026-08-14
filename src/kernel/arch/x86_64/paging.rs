@@ -501,6 +501,10 @@ pub fn free_address_space(pml4_phys: u64) {
 				free_table_level(entry & ADDR_MASK, 3);
 			}
 		}
+		// NEVER-MAPPED: a page-table frame of a DEAD address space, not a data frame. This runs
+		// from `AddressSpace::drop`, so the last reference is gone and no thread can be in this
+		// address space; and no port assigns ASIDs, so every switch away from it invalidated the
+		// whole TLB of the core that left. Nothing anywhere can still translate through these.
 		frame::deallocate(pml4_phys);
 	}
 }
@@ -522,6 +526,10 @@ unsafe fn free_table_level(phys: u64, level: u32) {
 				}
 			}
 		}
+		// NEVER-MAPPED: a page-table frame of a DEAD address space, not a data frame. This runs
+		// from `AddressSpace::drop`, so the last reference is gone and no thread can be in this
+		// address space; and no port assigns ASIDs, so every switch away from it invalidated the
+		// whole TLB of the core that left. Nothing anywhere can still translate through these.
 		frame::deallocate(phys);
 	}
 }

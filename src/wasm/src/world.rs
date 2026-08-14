@@ -44,6 +44,48 @@ pub const STATUS_FAULT: i32 = -2;
 pub const STATUS_IO: i32 = -3;
 pub const STATUS_UNSUPPORTED: i32 = -4;
 
+// WHAT EACH SERVICE ERROR MEANS TO A GUEST, decided once and here rather than by whichever wildcard
+// an adapter reached for. Both hosts implement `WorldServices` over the same `liber:base@1` error
+// enum - `Denied`, `NotFound`, `Invalid`, `Again`, `Closed` - and until this was written down they
+// answered the same failure with different statuses, which is the thing a version on an interface
+// exists to make impossible.
+//
+//   Denied   -> Refused -> STATUS_DENIED. The only one that means "you may not". The grant does not
+//               cover this and the guest should not retry.
+//   NotFound -> Failed  -> STATUS_IO. THE HARD CASE, and the world has no "not there" to give it.
+//               The guest never names a path: it asks for THE granted input or THE granted output,
+//               and which file that is was decided by the host's manifest before the instance
+//               existed. So a granted path that is not there is the HOST being misconfigured, not
+//               the guest asking for something it may not have - and telling the guest DENIED would
+//               blame it for a wiring mistake it cannot see, let alone fix. `STATUS_IO` says "this
+//               did not work and it is not about your authority", which is exactly true here. The
+//               day the world gains a path argument this decision has to be made again.
+//   Invalid  -> Failed  -> STATUS_IO. This host asked the service wrongly. Nobody's business but
+//               this host's, and certainly not a statement about the guest's grant.
+//   Again    -> Failed  -> STATUS_IO. "Try later" - and a guest told DENIED will not.
+//   Closed   -> Failed  -> STATUS_IO. The peer went away: the machine, not the grant.
+
+// Why an import is not in the world - the two different answers `None` used to give at once.
+//
+// A caller that has to SAY which of the two happened had to re-derive the table to find out, and
+// `src/tools/mkpackages` did exactly that: a second copy of the world's three rows, kept only so its
+// two panics could name whether the import was unknown or wrongly typed. A compatibility boundary
+// with two copies is a boundary that drifts, and the drift's failure mode is a package the
+// build-time gate passes and the host refuses - which is the one thing that gate exists to prevent.
+//
+// So the distinction lives with the rule that makes it, and the gate reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImportError {
+	// No operation of this world answers to `module`.`field` at all. The guest is asking for
+	// authority the host does not offer - a camera, somebody else's world, a version this host does
+	// not implement.
+	Unknown,
+	// The name is the world's and the type is not. Carries what the world DECLARES, so a caller can
+	// report what was expected and not only that something was wrong - a build-time gate saying
+	// "wrong signature" and nothing else leaves the reader to go and find the world by hand.
+	Signature { params: &'static [ValType], results: &'static [ValType] },
+}
+
 // Resolve one import to its world operation, BY NAME AND BY SIGNATURE. This is the whole authority
 // surface: only these three names are wired, and only with the types the world declares.
 //
@@ -56,21 +98,24 @@ pub const STATUS_UNSUPPORTED: i32 = -4;
 // AN UNKNOWN IMPORT IS REFUSED AT INSTANTIATION, not tolerated until it is called. For a capability
 // system the import list IS the manifest of requested authority: a module asking for `liber.camera`
 // is asking for a camera, and "the call site might be unreachable" is not an answer to that.
-pub fn resolve(module: &str, field: &str, signature: Option<&FuncType>) -> Option<WorldFn> {
-	let (op, params, results): (WorldFn, &[ValType], &[ValType]) = match (module, field) {
+pub fn resolve(module: &str, field: &str, signature: Option<&FuncType>) -> Result<WorldFn, ImportError> {
+	let (op, params, results): (WorldFn, &'static [ValType], &'static [ValType]) = match (module, field) {
 		// read(ptr: u32, max: u32) -> i32 (count, or a negative status)
 		("liber:vfs@1", "read") => (WorldFn::Read, &[ValType::I32, ValType::I32], &[ValType::I32]),
 		// write(ptr: u32, len: u32) -> i32 (count, or a negative status)
 		("liber:vfs@1", "write") => (WorldFn::Write, &[ValType::I32, ValType::I32], &[ValType::I32]),
 		// log(ptr: u32, len: u32) -> i32 (0, or a negative status)
 		("liber:log@1", "log") => (WorldFn::Log, &[ValType::I32, ValType::I32], &[ValType::I32]),
-		_ => return None,
+		_ => return Err(ImportError::Unknown),
 	};
-	let signature = signature?;
+	// A module whose type index points nowhere has no signature to check, which is not a reason to
+	// admit it. It is a SIGNATURE failure rather than an unknown name, because the name was found:
+	// the world offers this operation and this module did not say it wanted that shape of it.
+	let Some(signature) = signature else { return Err(ImportError::Signature { params, results }) };
 	if signature.params != params || signature.results != results {
-		return None;
+		return Err(ImportError::Signature { params, results });
 	}
-	Some(op)
+	Ok(op)
 }
 
 // Resolve a (ptr, len) argument pair into a bounds-checked [ptr, end) memory window.
@@ -118,6 +163,11 @@ pub enum WriteOutcome {
 	// The host could not make the request, or the service did not answer it. Not the volume's
 	// doing, and not something the guest can fix by asking differently.
 	Failed,
+	// THIS HOST DOES NOT OFFER THIS OPERATION AT ALL - not "you may not", which is what `Refused`
+	// means and what a host without a write grant used to answer. The difference is whether a
+	// different grant would help: for `Refused` it would, and for this it would not, because there
+	// is nothing behind the import in this host to grant.
+	Unsupported,
 }
 
 // Why a read did not happen, rather than whether it did.
@@ -130,11 +180,14 @@ pub enum WriteOutcome {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadOutcome {
 	Read(usize),
-	// The volume said no: the grant does not cover this, or the file is not there. The component
-	// can act on that and should not retry.
+	// The volume said no. THE GRANT DOES NOT COVER THIS, and nothing else - see the decision on
+	// `Error::NotFound` under the status codes above: a granted path that is not there is the
+	// host's misconfiguration and answers `Failed`, not this.
 	Refused,
 	// The host could not make the request, or the service did not answer it.
 	Failed,
+	// This host does not offer this operation at all. See `WriteOutcome::Unsupported`.
+	Unsupported,
 }
 
 // The same for the log, which has no count to report.
@@ -143,6 +196,7 @@ pub enum LogOutcome {
 	Logged,
 	Refused,
 	Failed,
+	Unsupported,
 }
 
 // The two capabilities the world is wired to, as three operations over bytes.
@@ -215,6 +269,7 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 				ReadOutcome::Read(n) => n as i32,
 				ReadOutcome::Refused => STATUS_DENIED,
 				ReadOutcome::Failed => STATUS_IO,
+				ReadOutcome::Unsupported => STATUS_UNSUPPORTED,
 			},
 			// write(ptr, len) -> n: the component's bytes to the one granted output file.
 			WorldFn::Write => {
@@ -223,6 +278,7 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 					WriteOutcome::Wrote(n) => n as i32,
 					WriteOutcome::Refused => STATUS_DENIED,
 					WriteOutcome::Failed => STATUS_IO,
+					WriteOutcome::Unsupported => STATUS_UNSUPPORTED,
 				}
 			}
 			// log(ptr, len) -> 0: the component's bytes as one structured entry.
@@ -242,6 +298,7 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 						// The log used to return NOTHING, so a component could not tell whether its
 						// one diagnostic channel had worked.
 						LogOutcome::Failed => STATUS_IO,
+						LogOutcome::Unsupported => STATUS_UNSUPPORTED,
 					},
 				}
 			}

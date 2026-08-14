@@ -79,7 +79,7 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 
 	// 2. A buffer whose owner was TERMINATED holding it. The process teardown marks it, so the drop
 	//    that follows keeps the frames out of circulation.
-	let process = Process::new(AddressSpace::create().expect("an address space"), domain.clone());
+	let process = Process::new(AddressSpace::create().expect("an address space"), domain.clone()).expect("a test process");
 	let Ok(orphan) = DmaBuffer::create_for(&domain, 3 * PAGE_SIZE as usize, Some(DEVICE)) else {
 		panic!("a 3-page DMA buffer should allocate");
 	};
@@ -91,7 +91,7 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 
 	// 3. And they come back when - and only when - somebody proves the device has been stopped.
 	//    That claim is a capability: the holder of the device's own DeviceMemory.
-	let other = DeviceMemory::for_device(DEVICE + 1, 0x1000_0000, PAGE_SIZE as usize);
+	let other = DeviceMemory::for_device(DEVICE + 1, 0x1000_0000, PAGE_SIZE as usize).expect("a test device memory");
 	assert_eq!(super::release_for(other.device_index().expect("a device-table entry")), 0, "resetting a different device releases nothing");
 	assert_eq!(super::held_frames_for_test(DEVICE), frames.len(), "still held");
 

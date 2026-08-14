@@ -189,6 +189,8 @@ pub fn setup_ramfb(fwcfg_base: u64, width: u32, height: u32, p2v: fn(u64) -> u64
 	for i in 0..SCRATCH_PAGES as u64 {
 		// SAFETY: pages of the contiguous scratch span allocated for this setup and used
 		// by nothing else once `probe_and_program` has returned.
+		// NEVER-MAPPED: firmware scratch reached through the physical map only - it is never
+		// entered into a page table, and this runs at boot before any other core is up.
 		unsafe { crate::mem::frame::deallocate(scratch + i * 4096) };
 	}
 	result
@@ -257,6 +259,8 @@ unsafe fn probe_and_program(fw: &FwCfg, dma_pa: u64, buf_pa: u64, buf_cap: u64, 
 		if !fw.dma(dma_pa, (ramfb_sel as u32) << 16 | DMA_SELECT | DMA_WRITE, 28, buf_pa) {
 			// SAFETY: the framebuffer span this call allocated, never published - the DMA
 			// that would have handed it to the device is what just failed.
+			// NEVER-MAPPED: allocated for the device and never entered into a page table; the DMA
+			// that would have published it is what failed.
 			crate::mem::frame::deallocate(fb_phys); // the run stays contiguous
 			return None;
 		}

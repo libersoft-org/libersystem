@@ -142,7 +142,15 @@ impl<D: BlockDevice> LiberFs<D> {
 		// are raised.
 		let named = tally.checksum + tally.io + tally.stream + tally.structural;
 		let structural_failures = (faults.len() as u32 - named) + tally.structural + snapshot_tally.structural;
-		Ok(FsckReport { checksum_failures, damaged, structural_failures, stream_failures: tally.stream + snapshot_tally.stream, faults })
+		Ok(FsckReport {
+			checksum_failures,
+			damaged,
+			structural_failures,
+			stream_failures: tally.stream + snapshot_tally.stream,
+			// REPORTED, from both halves. `snapshot_tally.io` was maintained and never read.
+			io_failures: tally.io + snapshot_tally.io,
+			faults,
+		})
 	}
 
 	// Read the whole file at `path` out of the named snapshot's pinned generation,
@@ -665,7 +673,7 @@ impl<D: BlockDevice> LiberFs<D> {
 						bad
 					})
 				} else if inode.r#type == TYPE_DIR {
-					self.check_dir_tree(inode.dir_root, inode.dir_root_crc, TREE_DEPTH_MAX, visited)
+					self.check_dir_tree(inode.dir_root, inode.dir_root_crc, TREE_DEPTH_MAX, visited, tally)
 				} else {
 					Ok(0)
 				};
@@ -695,7 +703,19 @@ impl<D: BlockDevice> LiberFs<D> {
 			for i in 0..=internal_count(&buf) {
 				bad = bad.saturating_add(match self.check_inode_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, visited, tally) {
 					Ok(b) => b,
-					Err(FsError::Corrupt | FsError::Io) => 1,
+					// THE SAME SPLIT THE LEAF ARM MAKES, one level of recursion up. This was
+					// `Err(Corrupt | Io) => 1`, so an I/O failure deep in a subtree was added to
+					// `bad` and reported as a checksum failure - the exact miscategorisation the
+					// round below it had just closed, at the recursion boundary.
+					//
+					// `Corrupt` STAYS a checksum failure: `fs-core` defines it as "a block read back
+					// whose checksum did not match the one stored beside its pointer", which is the
+					// medium answering wrongly. `Io` is the medium not answering at all.
+					Err(FsError::Io) => {
+						tally.io = tally.io.saturating_add(1);
+						0
+					}
+					Err(FsError::Corrupt) => 1,
 					Err(e) => return Err(e),
 				});
 			}
@@ -706,7 +726,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Walk a directory B+tree verifying every node against the CRC32C its parent link
 	// stored, counting corrupt subtrees like `check_inode_tree`; only the root's own
 	// damage surfaces as the error (the caller counts it).
-	pub(crate) fn check_dir_tree(&mut self, ptr: u64, crc: u32, depth: usize, visited: &mut [u8]) -> Result<u32, FsError> {
+	pub(crate) fn check_dir_tree(&mut self, ptr: u64, crc: u32, depth: usize, visited: &mut [u8], tally: &mut StructureTally) -> Result<u32, FsError> {
 		if ptr == 0 {
 			return Ok(0);
 		}
@@ -730,9 +750,15 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut bad = 0u32;
 		if node_type(&buf) == NODE_INTERNAL {
 			for i in 0..=internal_count(&buf) {
-				bad = bad.saturating_add(match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, visited) {
+				bad = bad.saturating_add(match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, visited, tally) {
 					Ok(b) => b,
-					Err(FsError::Corrupt | FsError::Io) => 1,
+					// As in `check_inode_tree`: the medium not answering is not the medium answering
+					// wrongly, and the tally has a counter for each.
+					Err(FsError::Io) => {
+						tally.io = tally.io.saturating_add(1);
+						0
+					}
+					Err(FsError::Corrupt) => 1,
 					Err(e) => return Err(e),
 				});
 			}

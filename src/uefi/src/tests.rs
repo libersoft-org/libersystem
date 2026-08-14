@@ -610,7 +610,9 @@ fn machine(tables: &[Vec<u8>], revision: u8) -> u64 {
 	let leaked: &'static mut [u8] = Vec::leak(blob);
 	let origin = publish_at(leaked.as_ptr() as u64, leaked.len() as u64);
 
-	// The XSDT, with its own header and checksum.
+	// The XSDT, with its own header and checksum. The checksum is written because real firmware
+	// writes it: a fixture that left it zero would be testing the reader against a table no machine
+	// produces, which is how a reader that never checked one passed for two rounds.
 	let xsdt_at = rsdp_len;
 	leaked[xsdt_at..xsdt_at + 4].copy_from_slice(b"XSDT");
 	leaked[xsdt_at + 4..xsdt_at + 8].copy_from_slice(&(xsdt_len as u32).to_le_bytes());
@@ -619,14 +621,29 @@ fn machine(tables: &[Vec<u8>], revision: u8) -> u64 {
 		let at = xsdt_at + 36 + index * 8;
 		leaked[at..at + 8].copy_from_slice(&(origin + *offset as u64).to_le_bytes());
 	}
+	checksum_at(leaked, xsdt_at, xsdt_len, xsdt_at + 9);
 
-	// The RSDP: signature, checksum over the first twenty bytes, revision, then the XSDT pointer.
+	// The RSDP: signature, revision, the XSDT pointer, and BOTH checksums - the ACPI 1.0 one over
+	// the first twenty bytes and, from revision 2, the extended one over the whole structure. The
+	// XSDT pointer lives in the part the first does not cover.
 	leaked[0..8].copy_from_slice(b"RSD PTR ");
 	leaked[15] = revision;
 	leaked[24..32].copy_from_slice(&(origin + xsdt_at as u64).to_le_bytes());
-	let sum = leaked[0..20].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
-	leaked[9] = (!sum).wrapping_add(1);
+	if revision >= 2 {
+		leaked[20..24].copy_from_slice(&(rsdp_len as u32).to_le_bytes());
+	}
+	checksum_at(leaked, 0, 20, 9);
+	if revision >= 2 {
+		checksum_at(leaked, 0, rsdp_len, 32);
+	}
 	origin
+}
+
+// Write the byte at `slot` that makes `length` bytes from `start` sum to zero.
+fn checksum_at(bytes: &mut [u8], start: usize, length: usize, slot: usize) {
+	bytes[slot] = 0;
+	let sum = bytes[start..start + length].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+	bytes[slot] = (!sum).wrapping_add(1);
 }
 
 #[test]
@@ -707,12 +724,85 @@ fn an_acpi_one_point_zero_machine_is_read_through_its_rsdt() {
 	leaked[rsdt_at..rsdt_at + 4].copy_from_slice(b"RSDT");
 	leaked[rsdt_at + 4..rsdt_at + 8].copy_from_slice(&40u32.to_le_bytes());
 	leaked[rsdt_at + 36..rsdt_at + 40].copy_from_slice(&((origin + spcr_at as u64) as u32).to_le_bytes());
+	checksum_at(leaked, rsdt_at, 40, rsdt_at + 9);
 	leaked[0..8].copy_from_slice(b"RSD PTR ");
 	leaked[15] = 0;
 	leaked[16..20].copy_from_slice(&((origin + rsdt_at as u64) as u32).to_le_bytes());
-	let sum = leaked[0..20].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
-	leaked[9] = (!sum).wrapping_add(1);
+	checksum_at(leaked, 0, 20, 9);
 
 	let console = acpi::Acpi::new(origin, here).console().expect("revision 0 is read through the RSDT");
 	assert_eq!(console.base, 0x9000_0000);
+}
+
+#[test]
+fn a_table_that_fails_its_checksum_is_not_read() {
+	// THE HALF THE SIGNATURE CANNOT TELL. A stale or half-written table keeps its signature and
+	// stops summing to zero, and this parser walks to an address the loader then WRITES to after
+	// `ExitBootServices`. Three structures carry a checksum on the way there and none was checked.
+
+	// 1. The RSDP's extended checksum. Revision 2 carries `Length` and a second sum over the whole
+	// structure, and the XSDT pointer lives in the part the first twenty bytes do not cover - so
+	// the pointer this parser follows first was taken from bytes nothing had summed.
+	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
+	assert!(acpi::Acpi::new(rsdp, here).is_valid(), "the well-formed one is accepted");
+	let bytes = unsafe { core::slice::from_raw_parts_mut(here(rsdp) as *mut u8, 36) };
+	bytes[32] = bytes[32].wrapping_add(1);
+	assert!(!acpi::Acpi::new(rsdp, here).is_valid(), "an RSDP whose extended checksum is off by one is not an RSDP");
+	assert_eq!(acpi::Acpi::new(rsdp, here).console(), None, "and nothing is read through it");
+	bytes[32] = bytes[32].wrapping_sub(1);
+
+	// 2. The root table's signature. It was taken on trust: a length in range was the whole test,
+	// so entries were read out of a structure only assumed to be a table.
+	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
+	let root = unsafe { core::slice::from_raw_parts_mut(here(rsdp + 36) as *mut u8, 4) };
+	root.copy_from_slice(b"XSDX");
+	assert_eq!(acpi::Acpi::new(rsdp, here).table(b"SPCR"), None, "a root table whose signature is neither XSDT nor RSDT is not walked");
+
+	// 3. The root table's own checksum.
+	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
+	let root = unsafe { core::slice::from_raw_parts_mut(here(rsdp + 36) as *mut u8, 45) };
+	root[9] = root[9].wrapping_add(1);
+	assert_eq!(acpi::Acpi::new(rsdp, here).table(b"SPCR"), None, "a root table that does not sum to zero is not walked");
+
+	// 4. And the table the entry names. An SPCR whose checksum is off by one gives no console
+	// rather than a wrong one, which is the address the loader would have stored to.
+	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
+	let spcr = acpi::Acpi::new(rsdp, here).table(b"SPCR").expect("the good one is found");
+	let body = unsafe { core::slice::from_raw_parts_mut(here(spcr) as *mut u8, 80) };
+	body[9] = body[9].wrapping_add(1);
+	assert_eq!(acpi::Acpi::new(rsdp, here).table(b"SPCR"), None, "an SPCR that does not sum to zero is not a table");
+	assert_eq!(acpi::Acpi::new(rsdp, here).console(), None, "and the loader gets no console rather than a wrong one");
+}
+
+// An FADT body with ARM Boot Architecture Flags at offset 129 (revision 5 and later). The header is
+// 36 bytes, so the flags are at body offset 93.
+fn fadt_body(flags: u16) -> Vec<u8> {
+	let mut body = vec![0u8; 240 - 36];
+	body[93..95].copy_from_slice(&flags.to_le_bytes());
+	body
+}
+
+#[test]
+fn the_fadt_says_which_instruction_reaches_psci() {
+	// THE ACPI HALF of the question the loader used to answer by looking at its own exception level.
+	// A machine that hands firmware EL1 has something below it, and what that something answers is
+	// stated by the platform - here, in the FADT's ARM Boot Architecture Flags.
+	let hvc = machine(&[table(b"FACP", 5, &fadt_body(0x0003))], 2);
+	assert_eq!(acpi::Acpi::new(hvc, here).psci_conduit(), Some(acpi::PsciConduit::Hvc), "PSCI_COMPLIANT and PSCI_USE_HVC");
+
+	let smc = machine(&[table(b"FACP", 5, &fadt_body(0x0001))], 2);
+	assert_eq!(acpi::Acpi::new(smc, here).psci_conduit(), Some(acpi::PsciConduit::Smc), "PSCI_COMPLIANT without PSCI_USE_HVC is SMC - which is most server-class AArch64");
+
+	// NOT COMPLIANT IS NOT "SMC BY DEFAULT". A firmware that says it has no PSCI has none, and the
+	// caller must treat that as no secondaries rather than as a reason to try an instruction.
+	let none = machine(&[table(b"FACP", 5, &fadt_body(0x0002))], 2);
+	assert_eq!(acpi::Acpi::new(none, here).psci_conduit(), None, "PSCI_USE_HVC without PSCI_COMPLIANT describes nothing");
+
+	let no_fadt = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
+	assert_eq!(acpi::Acpi::new(no_fadt, here).psci_conduit(), None, "a machine with no FADT states nothing");
+
+	// A table too short to hold the field has no answer either - the flags arrived in FADT
+	// revision 5, and reading them out of a shorter table reads whatever follows it.
+	let short = machine(&[table(b"FACP", 1, &vec![0u8; 116 - 36])], 2);
+	assert_eq!(acpi::Acpi::new(short, here).psci_conduit(), None, "an ACPI 1.0 FADT has no ARM boot flags");
 }

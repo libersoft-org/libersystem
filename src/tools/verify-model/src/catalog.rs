@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 18] = [
+const GATES: [(&str, &str); 19] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -133,6 +133,12 @@ const GATES: [(&str, &str); 18] = [
 	// result taken on that artifact meaningless. Registered in `check.sh` on 2026-08-12 and not
 	// here, so `verify-model check` had been reporting it as unselectable ever since.
 	("targeted-cache", "harness.tools"),
+	// P02M0133's second gate: a frame a page table ever pointed at goes back through `frame::retire`,
+	// and every plain `deallocate` says why no core can still translate it. Its subject is the
+	// kernel, so a kernel change selects it. Registered here in the same commit as `check.sh` this
+	// time - the two gates before it both arrived on one side first and were reported as
+	// unselectable on the next run, which is the drift these lists exist to catch.
+	("frame-retirement", "kernel"),
 ];
 
 // check.sh's gate names, read from the script. Parsing a shell array is crude and correct here:

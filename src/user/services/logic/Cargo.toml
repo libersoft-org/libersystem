@@ -17,5 +17,12 @@ description = "The pure decisions CoreServices makes, split out so they can be t
 [dependencies]
 # Shared kernel/userspace ABI constants: the executable suffix, and nothing else.
 abi = { path = "../../../abi" }
+# The error enum the component world's two hosts classify. `base-proto` reaches only `wire` and
+# `abi`, so it does not breach the contract above - the `proto` facade would, through its optional
+# `ipc-client`.
+base-proto = { path = "../../libs/protocol/base-proto" }
 # The dynamic-loader bounds the module graph is checked against.
 bootproto = { path = "../../../bootproto" }
+# The component world's outcome types, so the classification answers in the vocabulary the guest is
+# actually told rather than in a private one both hosts would then have to translate.
+wasm = { path = "../../../wasm" }

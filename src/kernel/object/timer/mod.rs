@@ -21,8 +21,9 @@ pub struct Timer {
 }
 
 impl Timer {
-	pub fn create() -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), armed: AtomicBool::new(false), deadline: AtomicU64::new(0) })
+	// FALLIBLY: `SYS_TIMER_CREATE` reaches this, so a short heap must be a refusal and not a halt.
+	pub fn create() -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), armed: AtomicBool::new(false), deadline: AtomicU64::new(0) })
 	}
 
 	// Arm the timer to fire when the tick counter reaches `deadline_ticks`.

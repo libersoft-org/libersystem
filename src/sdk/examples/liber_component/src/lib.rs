@@ -50,8 +50,15 @@ pub extern "C" fn run() -> i32 {
 	// refused log and a short write were all invisible - on both sides of a boundary whose whole
 	// purpose is to report exactly those. A negative return from `run` is this component saying
 	// which call failed, and the host reports it.
+	// THREE WORLD CALLS, ONE PATTERN. `Denied` is the grant answering - a read the component may not
+	// do, a log it was not given - and every other error is the machine on the way there. The write
+	// below already said so; the read and the log collapsed both into `STATUS_IO`, which discarded
+	// two thirds of an API three rounds of this milestone went into making distinguishable. Not
+	// reachable in this example, whose grants are wired before it starts, and that is beside the
+	// point: this file is the thing a component author copies.
 	let n: usize = match read_input(&mut buf) {
 		Ok(n) => n,
+		Err(Error::Denied) => return STATUS_DENIED,
 		Err(_) => return STATUS_IO,
 	};
 	for byte in &mut buf[..n] {
@@ -62,10 +69,12 @@ pub extern "C" fn run() -> i32 {
 	// The log takes TEXT. The transform above only upper-cases ASCII, so anything that was not text
 	// on the way in is not text now either - and a component that hands the host bytes and lets it
 	// substitute replacement characters has decided something the caller should have.
-	if let Ok(text) = core::str::from_utf8(&buf[..n])
-		&& log_message(text).is_err()
-	{
-		return STATUS_IO;
+	if let Ok(text) = core::str::from_utf8(&buf[..n]) {
+		match log_message(text) {
+			Ok(()) => {}
+			Err(Error::Denied) => return STATUS_DENIED,
+			Err(_) => return STATUS_IO,
+		}
 	}
 	// A SHORT WRITE IS A FAILURE, and saying so is the point of the count. `Denied` is what a
 	// read-only grant answers, and it is not the same as having written nothing.

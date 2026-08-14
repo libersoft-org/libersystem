@@ -1,6 +1,10 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+// `Arc::try_new`, for `heap::try_arc`. Almost every kernel object is an `Arc` and almost every one
+// of them is built on a syscall path, so "an allocation ring 3 can trigger must be able to refuse"
+// is not a rule this kernel can keep without it.
+#![feature(allocator_api)]
 #![cfg_attr(test, feature(custom_test_frameworks))]
 #![cfg_attr(test, test_runner(crate::tests::test_runner))]
 #![cfg_attr(test, reexport_test_harness_main = "test_main")]
@@ -368,7 +372,9 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	copy_into_object(&package_obj, bytes);
 	// ALLOC-OK: boot, handing SystemManager its bootstrap; nothing else is running
 	let mut msg = alloc::vec::Vec::with_capacity(7 + 8);
+	// ALLOC-OK: the boot chain's own hand-off message, built before userspace exists.
 	msg.extend_from_slice(b"PACKAGE");
+	// ALLOC-OK: the boot chain's own hand-off message, built before userspace exists.
 	msg.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
 	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER | Rights::DUPLICATE, 0);
 	// ALLOC-OK: boot, as above
@@ -399,7 +405,9 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	copy_into_object(&ramdisk, volume);
 	// ALLOC-OK: boot, as above
 	let mut rdmsg = alloc::vec::Vec::with_capacity(7 + 8);
+	// ALLOC-OK: the boot chain's own hand-off message, built before userspace exists.
 	rdmsg.extend_from_slice(tag);
+	// ALLOC-OK: the boot chain's own hand-off message, built before userspace exists.
 	rdmsg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
 	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
 	// ALLOC-OK: boot, as above
@@ -439,7 +447,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// Like the power capability above, this process holds them only to pass them on. They are
 	// minted exactly here and nowhere else - no syscall creates one - so the three that exist
 	// after this line are the four that will ever exist.
-	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind) as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
+	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind).expect("the four privilege capabilities, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
 	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges, 0)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
 	Ok((kernel_ep, sm_koid))
 }

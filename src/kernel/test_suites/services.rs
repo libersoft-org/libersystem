@@ -487,7 +487,7 @@ fn display_service_restores_the_console_surface() {
 	assert_eq!(scanout_pixel(&scanout), 0x0011_2233, "release restores the console surface");
 
 	// The private emergency command revokes a frozen foreground display connection.
-	let process = Process::new(AddressSpace::create().expect("bound process address space"), sched::root_domain());
+	let process = Process::new(AddressSpace::create().expect("bound process address space"), sched::root_domain()).expect("a test process");
 	let mut bind = alloc::vec::Vec::new();
 	bind.extend_from_slice(&1u16.to_le_bytes());
 	bind.extend_from_slice(&50u32.to_le_bytes());

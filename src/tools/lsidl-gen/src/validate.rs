@@ -421,13 +421,17 @@ fn type_cardinality(ty: &Type, cards: &HashMap<String, Cardinality>, names: &Has
 				.get(name)
 				.copied()
 				.or_else(|| {
+					// THE NUMBER, not a rounding of it. `HandleCardinality` was `Zero | One | Many`
+					// and `Many` was read here as `Exact(MAX_HANDLES)` under a comment calling that
+					// "the conservative reading" - so an imported two-capability record was counted
+					// as four, and a local record combining it with another two-capability field was
+					// refused at six when the truth is four. Safe, and wrong, and invisible until
+					// somebody wrote that schema.
 					imports.and_then(|resolved| resolved.get(name)).map(|symbol| match symbol.cardinality {
-						HandleCardinality::Zero => Cardinality::Exact(0),
-						HandleCardinality::One => Cardinality::Exact(1),
-						// An import's summary says "more than one" without a number, so the
-						// conservative reading is the most it could be. Two such records side by
-						// side then exceed the limit - which is TRUE, they could.
-						HandleCardinality::Many => Cardinality::Exact(MAX_HANDLES),
+						HandleCardinality::Exact(n) => Cardinality::Exact(n),
+						// The one shape no number describes, refused for the same reason a local
+						// `list<handle<T>>` is.
+						HandleCardinality::Unbounded => Cardinality::Unbounded,
 					})
 				})
 				.unwrap_or(Cardinality::Unknown),

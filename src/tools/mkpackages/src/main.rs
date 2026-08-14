@@ -513,7 +513,8 @@ fn user_dynamic_path(manifest: &Path, destination: &str) -> PathBuf {
 // because `Value::as_i32` converts every numeric type and a wrongly typed import used to be a
 // silent conversion at call time.
 fn validate_component(path: &Path, bytes: &[u8]) {
-	use wasm::{ValType, parse, validate};
+	use wasm::world::{ImportError, resolve};
+	use wasm::{parse, validate};
 
 	let module = parse(bytes).unwrap_or_else(|error| panic!("{} is not a component this system can host: {error:?}", path.display()));
 
@@ -537,15 +538,29 @@ fn validate_component(path: &Path, bytes: &[u8]) {
 	let declared = module.memory.map_or(0, |m| m.min_pages);
 	assert!(declared <= MAX_PAGES, "{} declares {declared} initial memory pages, more than the {MAX_PAGES} the host can hold - is the wasm stack size still set?", path.display());
 
-	let world: [(&str, &str, &[ValType], &[ValType]); 3] = [
-		("liber:vfs@1", "read", &[ValType::I32, ValType::I32], &[ValType::I32]),
-		("liber:vfs@1", "write", &[ValType::I32, ValType::I32], &[ValType::I32]),
-		("liber:log@1", "log", &[ValType::I32, ValType::I32], &[ValType::I32]),
-	];
+	// AND THE WORLD THE HOST RESOLVES, rather than a second copy of it.
+	//
+	// This built its own table of three `(module, field, params, results)` tuples and did its own
+	// `find` plus signature comparison - a re-implementation of `wasm::world::resolve`, which is the
+	// canonical answer to "is this import in the world, with the right signature" and what
+	// `component_host` actually runs. Two copies of a compatibility boundary drift the day the
+	// boundary moves - a `@2` world, one signature changed - and the drift's failure mode is a
+	// package this gate passes and the host refuses, which is the one thing the gate exists to
+	// prevent. The table was kept only so the two panics below could name which of the two failures
+	// happened; `ImportError` carries that, so the copy is deleted rather than moved.
 	for import in module.imports.iter() {
-		let signature = module.types.get(import.type_index as usize).unwrap_or_else(|| panic!("{} imports {}.{} with no type", path.display(), import.module, import.field));
-		let known = world.iter().find(|(m, f, _, _)| *m == import.module && *f == import.field).unwrap_or_else(|| panic!("{} imports {}.{}, which is not in the world the host offers", path.display(), import.module, import.field));
-		assert!(signature.params == known.2 && signature.results == known.3, "{} imports {}.{} with the wrong signature", path.display(), import.module, import.field);
+		let signature = module.types.get(import.type_index as usize);
+		match resolve(&import.module, &import.field, signature) {
+			Ok(_) => {}
+			Err(ImportError::Unknown) => panic!("{} imports {}.{}, which is not in the world the host offers", path.display(), import.module, import.field),
+			// The world's own declaration, so the message says what was expected and not only that
+			// something was wrong. `signature` is `None` when the type index points nowhere, which
+			// is a module that never said what shape it wanted.
+			Err(ImportError::Signature { params, results }) => match signature {
+				Some(got) => panic!("{} imports {}.{} as {:?} -> {:?}, and the world declares {params:?} -> {results:?}", path.display(), import.module, import.field, got.params, got.results),
+				None => panic!("{} imports {}.{} with no type at all, and the world declares {params:?} -> {results:?}", path.display(), import.module, import.field),
+			},
+		}
 	}
 }
 

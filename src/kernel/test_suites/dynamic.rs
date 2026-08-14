@@ -234,7 +234,7 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 		unsafe { mem::frame::deallocate(frame) };
 	}
 
-	let process = Process::new(AddressSpace::create().expect("dynamic module process address space"), sched::root_domain());
+	let process = Process::new(AddressSpace::create().expect("dynamic module process address space"), sched::root_domain()).expect("a test process");
 	let provider = symbol_image(true, 0xc3);
 	let consumer = symbol_image(false, 0xc3);
 	let colliding_provider = symbol_image(true, 0x90);
@@ -247,7 +247,7 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 	assert_ne!(provider, colliding_provider, "colliding providers are distinct images");
 	assert!(matches!(crate::loader::load_module_into(&process, &colliding_provider, 0x2200_0000), Err(crate::loader::LoadError::BadImage)), "distinct providers with a duplicate export are rejected");
 	assert!(process.address_space().unmap(0x2200_0000).is_none(), "duplicate-export provider mapping is rolled back");
-	let second = Process::new(AddressSpace::create().expect("second module process address space"), sched::root_domain());
+	let second = Process::new(AddressSpace::create().expect("second module process address space"), sched::root_domain()).expect("a test process");
 	crate::loader::load_module_into(&second, &provider, 0x2000_0000).expect("same provider loads in a second process");
 	let first_text = process.address_space().unmap(0x2000_0000).expect("first provider text mapping");
 	let second_text = second.address_space().unmap(0x2000_0000).expect("second provider text mapping");
@@ -297,7 +297,7 @@ fn lico_provider_loads_with_lsrt() {
 	let lico = volume_file(volume, b"lib/terminal/lico.lslib").expect("staged lico provider");
 	let storage_proto = volume_file(volume, b"lib/protocol/storage-proto.lslib").expect("staged storage protocol provider");
 	let volume_client = volume_file(volume, b"lib/clients/volume-client.lslib").expect("staged volume client provider");
-	let process = Process::new(AddressSpace::create().expect("lico provider address space"), sched::root_domain());
+	let process = Process::new(AddressSpace::create().expect("lico provider address space"), sched::root_domain()).expect("a test process");
 	crate::loader::load_module_into(&process, &lsrt, 0x2000_0000).expect("staged lsrt loads as the first dynamic provider");
 	crate::loader::load_module_into(&process, &ipc_client, 0x2100_0000).expect("staged ipc client resolves its lsrt imports");
 	crate::loader::load_module_into(&process, &wire, 0x2200_0000).expect("staged wire resolves its lsrt imports");
@@ -1255,11 +1255,11 @@ fn a_load_into_a_terminating_process_is_refused() {
 	// not the caller's mistake, the race is.
 	let not_an_image: alloc::vec::Vec<u8> = alloc::vec![0u8; 256];
 
-	let live = Process::new(AddressSpace::create().expect("live address space"), sched::root_domain());
+	let live = Process::new(AddressSpace::create().expect("live address space"), sched::root_domain()).expect("a test process");
 	assert!(matches!(crate::loader::load_image_into(&live, &not_an_image), Err(crate::loader::LoadError::BadImage)), "a live process gets as far as parsing");
 	assert!(matches!(crate::loader::load_module_into(&live, &not_an_image, 0x2000_0000), Err(crate::loader::LoadError::BadImage)), "and so does a module load");
 
-	let dying = Process::new(AddressSpace::create().expect("dying address space"), sched::root_domain());
+	let dying = Process::new(AddressSpace::create().expect("dying address space"), sched::root_domain()).expect("a test process");
 	dying.terminate();
 	assert!(matches!(crate::loader::load_image_into(&dying, &not_an_image), Err(crate::loader::LoadError::Terminating)), "a terminating process refuses before it parses anything");
 	assert!(matches!(crate::loader::load_module_into(&dying, &not_an_image, 0x2000_0000), Err(crate::loader::LoadError::Terminating)), "and refuses the module load the same way");

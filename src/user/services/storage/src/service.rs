@@ -2931,6 +2931,20 @@ impl FileSystem for IsoFs {
 	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
 		self.fs.read_file(name).map_err(map_fs_err)
 	}
+	// THE RANGED READ, CONNECTED. `Storage.Volume.read(path, offset, length)` is in the interface,
+	// `read_window` is the backend hook and `DiskFs` overrides it; this took the default, which
+	// reads the WHOLE file and slices it - so the 64 MiB ceiling still applied to every window read
+	// from `vol://iso`, and `read_file_into`, added to this backend precisely to avoid that, was
+	// unreachable from the service. The milestone recorded it as not done because whole-file staging
+	// would have to be reworked first; `volume.read` and `read_window` are that rework.
+	fn read_window(&mut self, name: &[u8], offset: u64, len: usize) -> Result<Vec<u8>, Error> {
+		let mut window: Vec<u8> = Vec::new();
+		window.try_reserve_exact(len).map_err(|_| Error::Again)?;
+		window.resize(len, 0);
+		let read = self.fs.read_file_into(name, offset, &mut window).map_err(map_fs_err)?;
+		window.truncate(read);
+		Ok(window)
+	}
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
 		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.list_dir(dir) }.map_err(map_fs_err)?;
 		try_collect(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)))

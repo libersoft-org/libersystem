@@ -70,6 +70,16 @@ pub struct Fdt {
 	p2v: fn(u64) -> u64,
 }
 
+// The structure and strings blocks, as physical spans, checked to lie inside the tree. Every walk
+// takes one of these before it reads a token and is bounded by it from there on.
+#[derive(Clone, Copy)]
+struct Bounds {
+	struct_start: u64,
+	struct_end: u64,
+	strings_start: u64,
+	strings_end: u64,
+}
+
 impl Fdt {
 	// An FDT at physical `base`, reachable through `phys_to_virt`.
 	pub fn new(base: u64, phys_to_virt: fn(u64) -> u64) -> Self {
@@ -88,16 +98,105 @@ impl Fdt {
 
 	// A plausible FDT header at `base`? (magic + a sane, self-consistent totalsize).
 	pub fn is_valid(&self) -> bool {
+		self.bounds().is_some()
+	}
+
+	// The two blocks the header declares, CHECKED TO FIT, computed once.
+	//
+	// `is_valid` used to check that `off_struct` and `off_strings` were each below `totalsize` and
+	// stop there - so a header declaring a structure block that STARTS inside the tree and runs past
+	// its end passed, and nothing below bounded the walk either: the token loop had no end test, a
+	// string was scanned for a terminator with no ceiling, and a property advanced the cursor by its
+	// own declared length without checking where that landed. The header carries `size_dt_struct`
+	// and `size_dt_strings` for exactly this and neither was read.
+	//
+	// None of that matters on QEMU's tree or on any tree a real firmware writes. This crate exists
+	// because the loader must not assume the machine behaves like QEMU, and it is read by the loader
+	// AND the kernel - so it is the one place where bounding it bounds it everywhere.
+	fn bounds(&self) -> Option<Bounds> {
 		unsafe {
 			if self.be32(self.base) != FDT_MAGIC {
-				return false;
+				return None;
 			}
-			let totalsize = self.be32(self.base + 4);
-			let off_struct = self.be32(self.base + 8);
-			let off_strings = self.be32(self.base + 12);
+			let totalsize = self.be32(self.base + 4) as u64;
+			let off_struct = self.be32(self.base + 8) as u64;
+			let off_strings = self.be32(self.base + 12) as u64;
+			let size_struct = self.be32(self.base + 36) as u64;
+			let size_strings = self.be32(self.base + 32) as u64;
 			let version = self.be32(self.base + 20);
-			totalsize >= 64 && totalsize < 0x20_0000 && off_struct < totalsize && off_strings < totalsize && version == 17
+			if version != 17 || !(64..0x20_0000).contains(&totalsize) {
+				return None;
+			}
+			// Each block starts inside the tree AND ends inside it. `checked_add` because both
+			// halves come from the same untrusted header.
+			let struct_end = off_struct.checked_add(size_struct)?;
+			let strings_end = off_strings.checked_add(size_strings)?;
+			if struct_end > totalsize || strings_end > totalsize {
+				return None;
+			}
+			// A structure block with no room for a single token is not one this can walk.
+			if size_struct < 4 {
+				return None;
+			}
+			Some(Bounds { struct_start: self.base + off_struct, struct_end: self.base + struct_end, strings_start: self.base + off_strings, strings_end: self.base + strings_end })
 		}
+	}
+
+	// Read a big-endian u32 that must lie WHOLLY inside `[.., end)`.
+	unsafe fn be32_in(&self, p: u64, end: u64) -> Option<u32> {
+		if p.checked_add(4)? > end {
+			return None;
+		}
+		Some(unsafe { self.be32(p) })
+	}
+
+	// Length (excluding the terminator) of a null-terminated string at `p`, BOUNDED by the block it
+	// is being read in. None when no terminator lies inside it.
+	//
+	// The bound is a parameter because the two kinds of caller read in different blocks: a node name
+	// is in the structure block and a property name is in the strings block, and a length that walks
+	// out of one and into the other is exactly what this is here to refuse.
+	unsafe fn str_len_in(&self, p: u64, end: u64) -> Option<u64> {
+		let mut n = 0u64;
+		while p.checked_add(n)? < end {
+			if unsafe { self.u8_at(p + n) } == 0 {
+				return Some(n);
+			}
+			n += 1;
+		}
+		None
+	}
+
+	// One `FDT_PROP` record: its value span and where the next token starts, all inside the block.
+	// `None` refuses the whole walk, which is the only safe answer to a record that does not fit.
+	unsafe fn prop_in(&self, p: u64, b: &Bounds) -> Option<(u64, u32, u64, u64)> {
+		unsafe {
+			let len = self.be32_in(p, b.struct_end)? as u64;
+			let nameoff = self.be32_in(p + 4, b.struct_end)?;
+			let value = p.checked_add(8)?;
+			// The value itself must fit, and so must the padding the next token starts after.
+			if value.checked_add(len)? > b.struct_end {
+				return None;
+			}
+			let next = value.checked_add((len + 3) & !3)?;
+			if next > b.struct_end {
+				return None;
+			}
+			let name = b.strings_start.checked_add(nameoff as u64)?;
+			// And the property's NAME has a terminator inside the strings block.
+			self.str_len_in(name, b.strings_end)?;
+			Some((name, len as u32, value, next))
+		}
+	}
+
+	// One `FDT_BEGIN_NODE` name: where it starts and where the next token is.
+	unsafe fn node_name_in(&self, p: u64, b: &Bounds) -> Option<(u64, u64)> {
+		let len = unsafe { self.str_len_in(p, b.struct_end)? };
+		let next = p.checked_add((len + 1 + 3) & !3)?;
+		if next > b.struct_end {
+			return None;
+		}
+		Some((p, next))
 	}
 
 	// Compare a null-terminated FDT string at `p` against `s`.
@@ -158,22 +257,20 @@ impl Fdt {
 		if !self.is_valid() || want.is_empty() {
 			return false;
 		}
+		let Some(b) = self.bounds() else { return false };
 		unsafe {
-			let off_struct = self.be32(self.base + 8) as u64;
-			let off_strings = self.be32(self.base + 12) as u64;
-			let strings = self.base + off_strings;
-			let mut p = self.base + off_struct;
+			let mut p = b.struct_start;
 			let mut depth: i32 = -1;
 			let mut d1_cpus = false;
 			let mut in_cpu = false;
 			loop {
-				let token = self.be32(p);
+				let Some(token) = self.be32_in(p, b.struct_end) else { return false };
 				p += 4;
 				match token {
 					FDT_BEGIN_NODE => {
 						depth += 1;
-						let name = p;
-						p += (self.str_len(name) + 1 + 3) & !3;
+						let Some((name, next)) = self.node_name_in(p, &b) else { return false };
+						p = next;
 						if depth == 1 {
 							d1_cpus = self.str_eq(name, "cpus");
 						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
@@ -193,14 +290,12 @@ impl Fdt {
 						}
 					}
 					FDT_PROP => {
-						let len = self.be32(p) as u64;
-						let nameoff = self.be32(p + 4);
-						let val = p + 8;
-						p += 8 + ((len + 3) & !3);
+						let Some((pname, len, val, next)) = self.prop_in(p, &b) else { return false };
+						let len = len as u64;
+						p = next;
 						if !in_cpu {
 							continue;
 						}
-						let pname = strings + nameoff as u64;
 						if !(self.str_eq(pname, "riscv,isa") || self.str_eq(pname, "riscv,isa-extensions")) {
 							continue;
 						}
@@ -241,9 +336,9 @@ impl Fdt {
 	}
 
 	unsafe fn timebase_frequency_inner(&self) -> Option<u32> {
+		let b = self.bounds()?;
 		unsafe {
-			let strings = self.base + self.be32(self.base + 12) as u64;
-			let mut p = self.base + self.be32(self.base + 8) as u64;
+			let mut p = b.struct_start;
 			// MINUS ONE, so the root node is depth 0 and `/cpus` is depth 1 - the same convention the
 			// two walks beside this one use.
 			//
@@ -256,13 +351,13 @@ impl Fdt {
 			let mut depth = -1i32;
 			let mut in_cpus = false;
 			loop {
-				let token = self.be32(p);
+				let token = self.be32_in(p, b.struct_end)?;
 				p += 4;
 				match token {
 					FDT_BEGIN_NODE => {
 						depth += 1;
-						let name = p;
-						p += (self.str_len(name) + 1 + 3) & !3;
+						let (name, next) = self.node_name_in(p, &b)?;
+						p = next;
 						if depth == 1 {
 							in_cpus = self.str_eq(name, "cpus");
 						}
@@ -277,15 +372,13 @@ impl Fdt {
 						}
 					}
 					FDT_PROP => {
-						let len = self.be32(p);
-						let nameoff = self.be32(p + 4);
-						let val = p + 8;
-						p += 8 + ((len as u64 + 3) & !3);
+						let (pname, len, val, next) = self.prop_in(p, &b)?;
+						p = next;
 						// On `/cpus` itself, which is where the specification puts it. A per-cpu
 						// override exists in the binding and is not read here: a machine whose harts
 						// tick at different rates needs more than one number anyway, and inventing one
 						// from the first hart would be a guess wearing a measurement's clothes.
-						if depth == 1 && in_cpus && len == 4 && self.str_eq(strings + nameoff as u64, "timebase-frequency") {
+						if depth == 1 && in_cpus && len == 4 && self.str_eq(pname, "timebase-frequency") {
 							return Some(self.be32(val));
 						}
 					}
@@ -301,12 +394,9 @@ impl Fdt {
 		if !self.is_valid() {
 			return None;
 		}
+		let b = self.bounds()?;
 		unsafe {
-			let off_struct = self.be32(self.base + 8) as u64;
-			let off_strings = self.be32(self.base + 12) as u64;
-			let strings = self.base + off_strings;
-
-			let mut p = self.base + off_struct;
+			let mut p = b.struct_start;
 			let mut depth: i32 = -1;
 			let mut d1_memory = false; // inside a depth-1 "memory" node
 			let mut d1_cpus = false; //   inside the depth-1 "cpus" node
@@ -328,13 +418,13 @@ impl Fdt {
 			let mut modules_end: u64 = 0;
 
 			loop {
-				let token = self.be32(p);
+				let token = self.be32_in(p, b.struct_end)?;
 				p += 4;
 				match token {
 					FDT_BEGIN_NODE => {
 						depth += 1;
-						let name = p;
-						p += (self.str_len(name) + 1 + 3) & !3; // name + NUL, padded to 4
+						let (name, next) = self.node_name_in(p, &b)?; // name + NUL, padded to 4
+						p = next;
 						if depth == 1 {
 							d1_memory = self.str_starts(name, "memory");
 							d1_cpus = self.str_eq(name, "cpus");
@@ -370,11 +460,8 @@ impl Fdt {
 						depth -= 1;
 					}
 					FDT_PROP => {
-						let len = self.be32(p);
-						let nameoff = self.be32(p + 4);
-						let val = p + 8;
-						p += 8 + ((len as u64 + 3) & !3);
-						let pname = strings + nameoff as u64;
+						let (pname, len, val, next) = self.prop_in(p, &b)?;
+						p = next;
 						if depth == 0 {
 							if self.str_eq(pname, "#address-cells") {
 								addr_cells = self.be32(val);
@@ -448,6 +535,18 @@ pub enum Uart {
 	Ns16550,
 }
 
+// How a PSCI call reaches its implementation on this platform.
+//
+// A property of the PLATFORM and not of the exception level: what the caller runs at says nothing
+// about which of the two instructions is trapped by something that implements PSCI.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PsciConduit {
+	// `smc #0` - PSCI in EL3 firmware, which is most server-class AArch64.
+	Smc,
+	// `hvc #0` - PSCI in a hypervisor at EL2, which is QEMU's `virt`.
+	Hvc,
+}
+
 // Where the console is and what it is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Console {
@@ -507,6 +606,33 @@ impl Fdt {
 	// `/aliases/<name>`.
 	unsafe fn alias(&self, name: &[u8], out: &mut [u8; MAX_PATH]) -> Option<usize> {
 		unsafe { self.property_string(&[b"aliases"], name, out) }
+	}
+
+	// Which instruction reaches this platform's PSCI implementation, as the tree states it.
+	//
+	// TAKEN FROM THE MACHINE, not inferred from the exception level. The loader used to answer
+	// `PSCI_HVC` for any boot that did not start at EL2, which is true of QEMU's `virt` and false of
+	// most server-class AArch64 - where EL2 belongs to a hypervisor and PSCI lives in EL3 firmware
+	// behind `smc`. That is the same class of assumption as the hard-coded UART address this crate
+	// was extracted to remove: a value that is right on the machine it was written against.
+	//
+	// The binding is `/psci` with a required `method` property whose value is `"smc"` or `"hvc"`.
+	// `None` means the tree does not describe PSCI at all - no node, no `method`, or a method this
+	// system has no instruction for - and a caller must treat that as "no PSCI" rather than
+	// guessing, which is the whole point.
+	pub fn psci_conduit(&self) -> Option<PsciConduit> {
+		if !self.is_valid() {
+			return None;
+		}
+		let mut method = [0u8; MAX_PATH];
+		// SAFETY: the header was validated, so every read below is bounded by the blocks it
+		// declares - the same contract every other walk in this file relies on.
+		let len = unsafe { self.property_string(&[b"psci"], b"method", &mut method)? };
+		match &method[..len] {
+			b"smc" => Some(PsciConduit::Smc),
+			b"hvc" => Some(PsciConduit::Hvc),
+			_ => None,
+		}
 	}
 
 	// Copy the string property `want` of the node at `path` into `out`, stopping at a `:` - the
@@ -610,15 +736,21 @@ impl Fdt {
 	// Visit every property of the node named by `parts`, with the parent's `(#address-cells,
 	// #size-cells)` - which is what `reg` is expressed in, and which is NOT the root's on riscv64,
 	// where the console lives under `/soc`.
-	unsafe fn walk_node(&self, parts: &[&[u8]], mut visit: impl FnMut(u64, u64, u32, (u32, u32))) {
+	unsafe fn walk_node(&self, parts: &[&[u8]], visit: impl FnMut(u64, u64, u32, (u32, u32))) {
+		// A malformed record stops the walk, which for this one means "no more properties" - its
+		// callers already treat an absent property as the answer.
+		let _ = unsafe { self.walk_node_inner(parts, visit) };
+	}
+
+	unsafe fn walk_node_inner(&self, parts: &[&[u8]], mut visit: impl FnMut(u64, u64, u32, (u32, u32))) -> Option<()> {
 		// The root has no parent to take its `reg` cells from, and every caller here names at least
 		// one component. Stated rather than assumed, because the alternative is an index of -1.
 		if parts.is_empty() {
-			return;
+			return None;
 		}
+		let b = self.bounds()?;
 		unsafe {
-			let strings = self.base + self.be32(self.base + 12) as u64;
-			let mut p = self.base + self.be32(self.base + 8) as u64;
+			let mut p = b.struct_start;
 			// What each depth declares for its CHILDREN. The specification's fallback when a node
 			// says nothing is the parent's value; the root's own default is 2/2 here, which is what
 			// every tree this system meets writes explicitly anyway.
@@ -627,15 +759,15 @@ impl Fdt {
 			// The depth of the deepest node on `parts` we are currently inside; 0 is the root.
 			let mut matched: i32 = -1;
 			loop {
-				let token = self.be32(p);
+				let token = self.be32_in(p, b.struct_end)?;
 				p += 4;
 				match token {
 					FDT_BEGIN_NODE => {
 						depth += 1;
-						let name = p;
-						p += (self.str_len(name) + 1 + 3) & !3;
+						let (name, next) = self.node_name_in(p, &b)?;
+						p = next;
 						if depth as usize > MAX_DEPTH {
-							return;
+							return None;
 						}
 						if depth == 0 {
 							matched = 0;
@@ -653,18 +785,15 @@ impl Fdt {
 						}
 						depth -= 1;
 						if depth < 0 {
-							return;
+							return None;
 						}
 					}
 					FDT_PROP => {
-						let len = self.be32(p);
-						let nameoff = self.be32(p + 4);
-						let value = p + 8;
-						p += 8 + ((len as u64 + 3) & !3);
+						let (pname, len, value, next) = self.prop_in(p, &b)?;
+						p = next;
 						if depth < 0 || depth as usize > MAX_DEPTH {
-							return;
+							return None;
 						}
-						let pname = strings + nameoff as u64;
 						// `#address-cells` / `#size-cells` govern this node's CHILDREN, and the
 						// properties of a node precede its children in the token stream - so by the
 						// time a child's `reg` is read, its parent's cells are known.
@@ -678,8 +807,8 @@ impl Fdt {
 						}
 					}
 					FDT_NOP => {}
-					FDT_END => return,
-					_ => return,
+					FDT_END => return Some(()),
+					_ => return None,
 				}
 			}
 		}

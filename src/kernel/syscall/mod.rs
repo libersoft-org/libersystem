@@ -955,7 +955,7 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0 });
+	let info = device::with(index as usize, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, _pad1: [0; 6] });
 	match info {
 		Some(info) => {
 			if let Err(e) = write_user(buf_ptr, info) {
@@ -981,7 +981,10 @@ fn sys_device_acquire(index: u64, privilege: u64) -> i64 {
 	}
 	let thread = current_thread!();
 	let memory = match device::with(index as usize, |d| DeviceMemory::for_device(index as u32, d.bar_phys, d.bar_len as usize)) {
-		Some(m) => m,
+		Some(Some(m)) => m,
+		// The device is there and the heap is not: a refusal the caller can retry, and distinct
+		// from naming a device that does not exist.
+		Some(None) => return ERR_RESOURCE_EXHAUSTED,
 		None => return ERR_INVALID,
 	};
 	install_object(&thread, memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER, 0)
@@ -1094,7 +1097,7 @@ fn sys_interrupt_bind(vector: u64, privilege: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let v = vector as u8;
-	let interrupt = Interrupt::new(v);
+	let Some(interrupt) = Interrupt::new(v) else { return ERR_RESOURCE_EXHAUSTED };
 	if !arch::interrupts::bind(v, &interrupt) {
 		return ERR_RESOURCE_EXHAUSTED;
 	}
@@ -1142,18 +1145,21 @@ fn sys_device_msix_acquire(index: u64, privilege: u64) -> i64 {
 	// and unmaps entry 0, which is the entry the SECOND interrupt is live on. An old handle silently
 	// disabling a new one.
 	//
-	// HERE AND NOT IN THE REGISTRY, which is the mechanism: this syscall is the userspace path whose
-	// one caller is DeviceManager, and the kernel's own xHCI bring-up test calls `acquire_msi`
-	// directly to stand in for DeviceManager on a device the booted system has already claimed. A
-	// rule inside the registry made that test fail - correctly, and for a reason that has nothing to
-	// do with what it is testing.
+	// ASKED AND ANSWERED IN ONE OPERATION, by `acquire_msi_unique` below.
+	//
+	// This was a `device_has_live_msi` here followed by an `acquire` further down, with the reasoning
+	// that the policy belongs at the syscall and the mechanism should stay callable by the kernel's
+	// own xHCI bring-up test - which stands in for DeviceManager on a device the booted system has
+	// already claimed. The split of RESPONSIBILITY was right and the split into two operations was
+	// not: two CPUs could both read `false` and then both claim a slot, and the device's entry 0
+	// would end up holding the second while the first `Interrupt` is bound to a vector that will
+	// never fire - and masks entry 0 when it drops. So the mechanism gained a form that does both at
+	// once, `acquire_msi` stays beside it for the bring-up test, and this syscall still owns what to
+	// do when the answer is no.
 	//
 	// A PENDING slot does not count: its `Interrupt` is gone, and a restarting driver reprogramming
 	// its own device's entry 0 is exactly what should happen. `ERR_RESOURCE_EXHAUSTED` because that
 	// is what the caller can act on - the device's vector is spoken for.
-	if arch::interrupts::device_has_live_msi(index as u32) {
-		return ERR_RESOURCE_EXHAUSTED;
-	}
 	// THE HANDLE SLOT IS BOOKED BEFORE THE HARDWARE IS TOUCHED.
 	//
 	// This programmed the device's table, bound the `Interrupt`, enabled MSI-X and only then tried
@@ -1168,14 +1174,20 @@ fn sys_device_msix_acquire(index: u64, privilege: u64) -> i64 {
 	if !thread.handles().lock().reserve(1) {
 		return ERR_RESOURCE_EXHAUSTED;
 	}
-	let vector = match arch::interrupts::acquire_msi(table_phys, dest, index as u32) {
+	let vector = match arch::interrupts::acquire_msi_unique(table_phys, dest, index as u32) {
 		Some(v) => v,
 		None => {
 			thread.handles().lock().release_reservation(1);
 			return ERR_RESOURCE_EXHAUSTED;
 		}
 	};
-	let interrupt = Interrupt::new(vector);
+	let Some(interrupt) = Interrupt::new(vector) else {
+		// The vector is ours and the heap is not. Given back the same way a failed bind gives it
+		// back: MSI-X is not enabled yet, so nothing can have been sent.
+		arch::interrupts::release_unused_msi(vector);
+		thread.handles().lock().release_reservation(1);
+		return ERR_RESOURCE_EXHAUSTED;
+	};
 	if !arch::interrupts::bind_msi(vector, &interrupt) {
 		// The vector raced to another binder. FREED, not retired: MSI-X has not been enabled on the
 		// device yet, so nothing can have been sent and there is no owner to quiesce it.
@@ -1844,7 +1856,7 @@ fn sys_channel_create(out0_ptr: u64, out1_ptr: u64, depth: u64) -> i64 {
 	if !user_buf_ok(out0_ptr, 8) || !user_buf_ok(out1_ptr, 8) {
 		return ERR_INVALID;
 	}
-	let (ep0, ep1) = Channel::create_with_depth(depth as usize);
+	let Some((ep0, ep1)) = Channel::try_create_with_depth(depth as usize) else { return ERR_RESOURCE_EXHAUSTED };
 	let (h0, h1) = {
 		let mut table = thread.handles().lock();
 		// Enforce the Domain's handle quota for both endpoints; if the second
@@ -2511,7 +2523,8 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 // as long as it runs. A set pays that once per member, when the member joins.
 fn sys_waitset_create() -> i64 {
 	let thread = current_thread!();
-	install_object(&thread, WaitSet::create_in(thread.domain().clone()), Rights::ALL, 0)
+	let Some(set) = WaitSet::create_in(thread.domain().clone()) else { return ERR_RESOURCE_EXHAUSTED };
+	install_object(&thread, set, Rights::ALL, 0)
 }
 
 // Add the object behind `object_handle` to the set behind `set_handle`.
@@ -2832,7 +2845,8 @@ fn sys_domain_kill(handle: u64) -> i64 {
 // Create an Event and install a handle to it in the caller's table.
 fn sys_event_create() -> i64 {
 	let thread = current_thread!();
-	install_object(&thread, Event::create(), Rights::ALL, 0)
+	let Some(event) = Event::create() else { return ERR_RESOURCE_EXHAUSTED };
+	install_object(&thread, event, Rights::ALL, 0)
 }
 
 // Raise an event's signal.
@@ -2857,7 +2871,8 @@ fn sys_event_poll(handle: u64) -> i64 {
 // Create a Timer and install a handle to it in the caller's table.
 fn sys_timer_create() -> i64 {
 	let thread = current_thread!();
-	install_object(&thread, Timer::create(), Rights::ALL, 0)
+	let Some(timer) = Timer::create() else { return ERR_RESOURCE_EXHAUSTED };
+	install_object(&thread, timer, Rights::ALL, 0)
 }
 
 // Arm a timer to fire at an absolute tick deadline.

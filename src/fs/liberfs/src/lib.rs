@@ -361,6 +361,25 @@ pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
 	Ok(v)
 }
 
+// Grow a vector by one, FALLIBLY, with the fault injector inside it.
+//
+// THE INJECTOR HAS TO BE WHERE THE ALLOCATION IS. `try_zeroed` above carries it, and the alias set
+// on the mount path does not go through `try_zeroed` - it called `Vec::try_reserve` directly. So
+// `a_mount_that_runs_short_inside_the_namespace_walk_refuses_rather_than_aborts` swept allocation
+// budgets that landed on the free map, the pinned map and every other `try_zeroed` call, and never
+// on the allocation its own comment names. The production code was right and the evidence was not:
+// a test that names a specific allocation and cannot fail it is a check that passes for a reason
+// other than the one it states.
+pub(crate) fn try_push<T>(vec: &mut alloc::vec::Vec<T>, value: T) -> Result<(), FsError> {
+	#[cfg(test)]
+	if inject::should_fail() {
+		return Err(FsError::NoMemory);
+	}
+	vec.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+	vec.push(value);
+	Ok(())
+}
+
 // Deterministic refusal of the Nth `try_zeroed`, so the paths that must SURVIVE a refused
 // allocation can be exercised without exhausting the host.
 //
@@ -440,6 +459,17 @@ pub struct FsckReport {
 	// shape is legal, and yet the file cannot be read. `fsck` used to run no decoder at all, so
 	// this was a volume reporting zero failures and answering `Corrupt` to the first read.
 	pub stream_failures: u32,
+	// The medium would not give the bytes back AT ALL - which is not the same as giving them back
+	// wrongly, and is not a fault of the filesystem.
+	//
+	// The tally that both halves of the walk maintain has always had this counter and the report
+	// could not express it: `snapshot_tally.io` was incremented and never read, and every I/O
+	// failure the recursion met was folded into `checksum_failures` by an
+	// `Err(Corrupt | Io) => 1`. A counter that is written and never read is worse than no counter,
+	// because it looks like the case is handled. The four kinds send an operator to four different
+	// places - a failing medium, a medium that is gone, wrong metadata, or the writer that produced
+	// a stream - so the report names four.
+	pub io_failures: u32,
 	// One line per structural fault, in the order found, naming what and where.
 	pub faults: Vec<Vec<u8>>,
 }
@@ -953,7 +983,15 @@ pub struct LiberFs<D: BlockDevice> {
 	// commit - each commit clears `dead_prev`'s unpinned bits and promotes `dead`,
 	// keeping the free map exact without rewalking the volume.
 	dead: BTreeSet<u64>,
-	dead_prev: BTreeSet<u64>,
+	// A SORTED `Vec` GROWN FALLIBLY, not a `BTreeSet`.
+	//
+	// This holds the blocks that only the previous generation still references, which after a large
+	// rewrite or delete can be a substantial fraction of the volume. `BTreeSet::insert` has no
+	// fallible form, so filling it on the mount path was the one structure left that could end the
+	// process on a short heap - every other one was converted. The derivation walks the free map in
+	// ascending order, so it arrives sorted and without duplicates by construction; the `Vec` needs
+	// no sort and the commit only iterates it.
+	dead_prev: Vec<u64>,
 	// Every block a named snapshot pins (one bit per block, rebuilt by the full
 	// derivation whenever the snapshot set changes): a dead block that is pinned stays
 	// allocated until the snapshot holding it is deleted.

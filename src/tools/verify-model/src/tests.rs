@@ -644,7 +644,7 @@ fn trust_lapses_when_the_model_hash_moves() {
 // criteria now refuse, so the fixtures have to be honest about it: five pieces of evidence means
 // five different trees.
 fn evidence(universe: crate::shadow::Universe, architecture: &str, exec: bool, tree: &str) -> crate::shadow::Record {
-	crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: tree.to_string(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true }
+	crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: tree.to_string(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true, component_decisions: vec![format!("audio\t{tree}")] }
 }
 
 #[test]
@@ -667,16 +667,46 @@ fn five_comparisons_of_one_change_are_one_piece_of_evidence() {
 	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("six repetitions of one answer are one answer");
 	assert!(error.contains("distinct"), "{error}");
 
-	// Two changes compared against ONE tree are two pieces of evidence, because the selection input
-	// is the pair rather than the tree: the selector is being asked a different question.
+	// FIVE DIFFERENT NEIGHBOURS ARE STILL ONE PIECE OF EVIDENCE ABOUT AUDIO.
+	//
+	// This asserted the opposite, and the criterion this file states is five genuinely different
+	// CHANGES. Keyed on `(source_digest, changed_components)`, `audio + neighbour-0` ..
+	// `audio + neighbour-4` are five different change SETS whose decision about audio may be
+	// byte-identical - and the neighbour half is free while the audio half is what the certificate
+	// is about. "Impossible to manufacture" was too strong, and this is the narrowing.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
 	for (index, architecture) in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"].into_iter().enumerate() {
 		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, true, "one-tree");
 		record.changed_components = vec![String::from("audio"), format!("neighbour-{}", index / 2)];
+		// The neighbour differs and the decision about audio does not.
+		record.component_decisions = vec![String::from("audio\tsame-decision"), format!("neighbour-{}\tdiffers-{}", index / 2, index / 2)];
+		log.records.push(record);
+	}
+	assert_eq!(log.distinct_evidence_for("audio", "hash-a", crate::shadow::Universe::TestGuest), 1, "the selector decided the same thing about audio five times over");
+	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect_err("a free neighbour is not evidence about audio");
+	assert!(error.contains("distinct"), "{error}");
+
+	// And when the decision about AUDIO really does differ, they are five.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for (index, architecture) in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"].into_iter().enumerate() {
+		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, true, "one-tree");
+		record.changed_components = vec![String::from("audio"), format!("neighbour-{}", index / 2)];
+		record.component_decisions = vec![format!("audio\tdecision-{}", index / 2)];
 		log.records.push(record);
 	}
 	assert_eq!(log.distinct_evidence_for("audio", "hash-a", crate::shadow::Universe::TestGuest), 5);
-	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok(), "five different changes are five pieces of evidence, whatever tree they were made against");
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok(), "five different decisions about audio are five pieces of evidence about audio");
+
+	// A record written before the field existed falls back to the change set rather than collapsing
+	// into one: the evidence it represents was real, and rewriting history is not this store's job.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for (index, architecture) in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"].into_iter().enumerate() {
+		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, true, "one-tree");
+		record.changed_components = vec![String::from("audio"), format!("neighbour-{}", index / 2)];
+		record.component_decisions = Vec::new();
+		log.records.push(record);
+	}
+	assert_eq!(log.distinct_evidence_for("audio", "hash-a", crate::shadow::Universe::TestGuest), 5, "an old record keeps the meaning it was written with");
 }
 
 #[test]
@@ -733,14 +763,25 @@ fn every_comparison_on_record_being_dry_is_not_evidence_that_running_the_selecti
 	host.records.push(host_record(true, "tree-5"));
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &host).is_ok(), "one sample is the requirement here as well");
 
-	// `HostBuild` stays exempt, and for a reason rather than by omission: executing a build
-	// selection means building those parts, and the sweep builds every part anyway - so the sample
-	// would be a second full build of evidence the sweep has already taken.
+	// AND SO DOES `HostBuild`, since 2026-08-14. It was exempt on the reasoning that executing a
+	// build selection means building those parts and the sweep builds every part anyway - true of
+	// the BUILD, and false of the MECHANISM. The evidence producer runs the catalog's commands one
+	// part at a time; the runner groups them into `./build.sh --arch X --part a,b,c`. Those are
+	// different code paths through the same script and only the second one ships, so a grouped part
+	// list whose parser silently used only the first entry and exited zero left every individual
+	// check passing and the scoped runner building less than the selection said.
+	//
+	// `verify.sh --shadow-exec` runs the grouped command and compares what `build.sh` reports
+	// building against the parts the selection named, so the sample exists and the exemption is
+	// gone - which leaves `exec_universes` covering every universe with a producer.
 	let mut builds = crate::shadow::Log { schema: 1, records: Vec::new() };
 	for (tree, architecture) in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"].into_iter().enumerate() {
 		builds.records.push(evidence(crate::shadow::Universe::HostBuild, architecture, false, &format!("tree-{tree}")));
 	}
-	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::HostBuild, &builds).is_ok(), "a build universe grants on dry comparisons, by decision");
+	let error = store.evaluate("audio", "hash-a", crate::shadow::Universe::HostBuild, &builds).expect_err("dry build comparisons say the right parts were chosen and nothing about the grouped command");
+	assert!(error.contains("EXECUTED"), "{error}");
+	builds.records.push(evidence(crate::shadow::Universe::HostBuild, "x86_64", true, "tree-6"));
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::HostBuild, &builds).is_ok(), "one sample of the mechanism that ships is the requirement here too");
 }
 
 #[test]
@@ -1348,18 +1389,24 @@ fn a_build_covered_component_can_reach_trusted() {
 	// produces can carry a component all the way. `HostBuild` needs two architectures, for the same
 	// reason the guest suite does - a build of x86_64 says nothing about aarch64.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
-	// Builds have no execution sample to take - `exec_universes` says which universes do - so
-	// `shadow_exec` is false throughout and must not be what stands in the way.
-	let record = |architecture: &str, tree: &str| {
-		let mut record = evidence(crate::shadow::Universe::HostBuild, architecture, false, tree);
+	// AND BUILDS TAKE AN EXECUTION SAMPLE TOO, since 2026-08-14. They were exempt on the reasoning
+	// that a full sweep builds everything anyway - true of the BUILD and false of the MECHANISM: the
+	// evidence producer runs the catalog's commands one part at a time and the runner groups them
+	// into `./build.sh --arch X --part a,b,c`, which is a different code path through the same
+	// script and the only one that ships.
+	let record = |architecture: &str, exec: bool, tree: &str| {
+		let mut record = evidence(crate::shadow::Universe::HostBuild, architecture, exec, tree);
 		record.changed_components = vec![String::from("term")];
 		record
 	};
 	for (tree, architecture) in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"].into_iter().enumerate() {
-		log.records.push(record(architecture, &format!("tree-{tree}")));
+		log.records.push(record(architecture, false, &format!("tree-{tree}")));
 	}
 	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
-	let (clean, architectures) = store.evaluate("term", "hash-a", crate::shadow::Universe::HostBuild, &log).expect("six clean build comparisons over two architectures");
+	let dry = store.evaluate("term", "hash-a", crate::shadow::Universe::HostBuild, &log).expect_err("six dry build comparisons say the right parts were chosen and nothing about running the grouped command");
+	assert!(dry.contains("EXECUTED"), "{dry}");
+	log.records.push(record("x86_64", true, "tree-6"));
+	let (clean, architectures) = store.evaluate("term", "hash-a", crate::shadow::Universe::HostBuild, &log).expect("six clean build comparisons over two architectures, one of them sampled");
 	store.grant("term", "hash-a", crate::shadow::Universe::HostBuild, clean, architectures, 0);
 	assert_eq!(store.level("term", "hash-a", crate::shadow::Universe::HostBuild), crate::trust::Level::Trusted, "a build-covered component can now arrive");
 }
@@ -1506,4 +1553,89 @@ fn which_universes_may_judge_a_component_comes_from_its_checks() {
 	// than vacuously true - an empty `all()` is true, and that is the shape of the bug it would be.
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	assert!(!store.trusted_everywhere("a-component-no-check-covers", "hash", &[]), "no judge is not the same as every judge agreeing");
+}
+
+#[test]
+fn the_build_evidence_producer_runs_on_the_architectures_the_plan_builds() {
+	// TWO SETS, AND THE PRODUCER WAS USING THE WRONG ONE. `verify.sh` computed one target list from
+	// `booted` and both loops read it - the guest shadow, correctly, and the `HostBuild` evidence
+	// producer, which asks a question about BUILDS.
+	//
+	// The plan carries both fields on purpose, and the regression corpus states the case in the
+	// model's own words: `riscv64-trap-handling` boots riscv64 alone and must select
+	// `build.kernel / x86_64 / host / shared-image`, "because a branch that stops compiling elsewhere
+	// is a regression as well". So on that change the planner selected an x86_64 build check and the
+	// producer never ran one, because x86_64 is not in the boot set - and `HostBuild` requires
+	// evidence from two architectures. The ordinary shape of userspace work is exactly this shape.
+	//
+	// AT THE PRODUCTION SEMANTICS, not at the record shape. `a_build_covered_component_can_reach_trusted`
+	// builds its two-architecture records by hand, so it cannot see that the shell never produces
+	// them.
+	let model = model();
+	let ownership = model.ownership();
+	let planner = crate::plan::Planner::for_model(&model, &ownership);
+	let plan = planner.plan(&[String::from("src/kernel/arch/riscv64/traps/mod.rs")]);
+	assert_ne!(plan.architectures_built, plan.architectures_booted, "a per-target kernel change boots one target and builds all of them");
+	assert!(plan.architectures_built.len() >= 2, "and `HostBuild` needs evidence from at least two: {:?}", plan.architectures_built);
+
+	// Every build check the plan selected names an architecture the producer will visit. This is the
+	// property the shell was breaking: a selected check on an architecture nobody loops over is a
+	// check that is never discharged and never recorded.
+	for item in &plan.items {
+		if item.kind != crate::catalog::CheckKind::Build {
+			continue;
+		}
+		assert!(plan.architectures_built.contains(&item.key.architecture), "the plan selected the build check {} and the producer would not visit {}: {:?}", item.key.display(), item.key.architecture, plan.architectures_built);
+	}
+
+	// And the shell reads the right one. The two loops are two lines apart and the whole defect was
+	// that they shared a variable, so the assertion is on the text of the script rather than on a
+	// property that would still hold if it went back to sharing.
+	const VERIFY: &str = include_str!("../../../../verify.sh");
+	assert!(VERIFY.contains("-- built --stdin"), "verify.sh asks the planner which architectures to BUILD on");
+	assert!(VERIFY.contains("for build_arch in $build_targets; do"), "and the build-evidence producer loops over that set rather than the booted one");
+	assert!(VERIFY.contains("for target in $targets; do"), "while the guest shadow keeps the booted set");
+}
+
+#[test]
+fn a_certificate_names_what_its_evidence_covers() {
+	// THE CRITERIA THE RECORDS COULD ALREADY ANSWER. `evaluate` counts clean runs, distinct
+	// decisions, architectures and an execution sample; the frozen design also asked which change
+	// classes and which edge kinds were exercised, and the records have carried `change_kinds`,
+	// `edge_kinds` and `model_self_check` since the round that added them - under a comment saying
+	// the policy could not be written before there were records to grade. There are records now, and
+	// the data was being discarded at the point of judgement rather than at the point of collection.
+	//
+	// Graded rather than required, because the honest use of it is to say what a certificate covers:
+	// five perfect verifications of one KIND of change are not evidence about a different kind, and
+	// distinctness only makes them five different decisions.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for (index, architecture) in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"].into_iter().enumerate() {
+		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, true, "one-tree");
+		record.component_decisions = vec![format!("audio\tdecision-{}", index / 2)];
+		record.change_kinds = vec![String::from("source")];
+		record.edge_kinds = vec![String::from("link.static")];
+		log.records.push(record);
+	}
+	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
+	let scope = store.evidence_scope("audio", "hash-a", crate::shadow::Universe::TestGuest, &log);
+	assert_eq!(scope.records, 10);
+	assert_eq!(scope.change_kinds, vec![String::from("source")], "ten runs over source edits say nothing about a manifest edit, and the certificate says which it is");
+	assert_eq!(scope.edge_kinds, vec![String::from("link.static")]);
+	assert!(scope.all_self_checked);
+
+	// A comparison made by a model failing its own checks is not evidence about the tree at all -
+	// `is_clean` excludes it, so it does not reach the scope rather than diluting it.
+	log.records[3].model_self_check = false;
+	let scope = store.evidence_scope("audio", "hash-a", crate::shadow::Universe::TestGuest, &log);
+	assert_eq!(scope.records, 9, "the record made by an unsound model is not counted");
+	assert!(scope.all_self_checked, "and what is counted was all made by a sound one, which is the statement");
+
+	// And a component with no clean evidence at all has an EMPTY scope rather than a missing one:
+	// zero records, nothing exercised. `all_self_checked` is vacuously true over none, which is why
+	// the count is what a reader has to look at first.
+	let scope = store.evidence_scope("nothing", "hash-a", crate::shadow::Universe::TestGuest, &log);
+	assert_eq!(scope.records, 0);
+	assert!(scope.change_kinds.is_empty() && scope.edge_kinds.is_empty());
 }

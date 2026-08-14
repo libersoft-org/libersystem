@@ -63,8 +63,9 @@ pub struct Privilege {
 }
 
 impl Privilege {
-	pub fn create(kind: PrivilegeKind) -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), kind })
+	// FALLIBLY, like every other object a syscall mints.
+	pub fn create(kind: PrivilegeKind) -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), kind })
 	}
 
 	pub fn kind(&self) -> PrivilegeKind {

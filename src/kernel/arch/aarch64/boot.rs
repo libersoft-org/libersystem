@@ -314,6 +314,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	{
 		let mut v: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 		for i in 0..8 {
+			// ALLOC-OK: boot bring-up self-test, before userspace exists.
 			v.push(i * i);
 		}
 		let (mapped, free) = crate::mem::heap::stats();

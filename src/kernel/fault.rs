@@ -76,6 +76,8 @@ pub fn grow_user_stack(address: u64, error_code: u64) -> bool {
 	if process.address_space().try_map(page, new_frame, flags).is_err() {
 		// SAFETY: allocated a few lines above, never mapped (the map is what just failed),
 		// and not handed to the process.
+		// NEVER-MAPPED: the mapping is exactly what failed, so no page table on any core ever
+		// referenced this frame.
 		unsafe { frame::deallocate(new_frame) };
 		// Unless somebody else already mapped it - which is the ordinary outcome when two threads
 		// of one process fault on the same stack page at once. The loser used to return false and
@@ -99,7 +101,21 @@ pub fn grow_user_stack(address: u64, error_code: u64) -> bool {
 		// Unmap what was just mapped and give the frame back, then report the fault unhandled: the
 		// process is killed for a stack it cannot grow, which is a refusal rather than a halt.
 		let _ = process.address_space().unmap(page);
-		unsafe { frame::deallocate(new_frame) };
+		// THROUGH THE RETIREMENT DOOR, because this frame WAS in a page table.
+		//
+		// `unmap` is `arch::paging::unmap_page_in` and nothing else: the PTE is cleared and the
+		// local core invalidates its own TLB. Another core running in the same address space keeps
+		// its translation until a shootdown tells it to drop one, so `deallocate` here handed a
+		// still-translated frame back to the allocator - a physical use-after-free reachable from
+		// ring 3 by touching a guard page while the kernel heap is short, which is exactly the
+		// condition the fallible adoption above was added for. `retire` is the rule this module
+		// states for anything a page table ever pointed at, and this rollback was written without
+		// it. The `deallocate` a few lines above is correct: that frame's mapping is what FAILED, so
+		// no core ever had a translation for it.
+		//
+		// SAFETY: allocated in this function, mapped only into `page` in this address space, and
+		// that mapping was just removed. Nothing else holds it - the adoption is what failed.
+		unsafe { frame::retire(&[new_frame]) };
 		return false;
 	}
 	process.charge_stack(PAGE_SIZE);

@@ -301,6 +301,7 @@ fn scan_bus<A: ConfigAccess>(bus: u8, seen: &mut [bool; 256], out: &mut Vec<PciD
 			}
 			let function = read_function::<A>(bus, dev, func);
 			let is_bridge = function.header_type & 0x7F == HEADER_TYPE_BRIDGE;
+			// ALLOC-OK: PCI enumeration at boot; the count is the bus's, not ring 3's.
 			out.push(function);
 			if !is_bridge || depth >= MAX_BRIDGE_DEPTH {
 				continue;

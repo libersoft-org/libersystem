@@ -166,10 +166,22 @@ fn insert(children: &mut Children, name: String, node: Node) -> Result<(), FsErr
 }
 
 fn remove(children: &mut Children, name: &str) -> Option<Node> {
-	let at = children.binary_search_by(|(key, _)| key.as_str().cmp(name)).ok()?;
-	let node = children.remove(at).1;
+	let node = take(children, name)?;
 	shrink_children(children);
 	Some(node)
+}
+
+// The same, WITHOUT the shrink.
+//
+// `rename` reserves one slot in the destination's table specifically so the insert cannot fail after
+// the source is gone. For a rename within one directory those are the same table, and `remove`'s
+// shrink replaces it with one sized exactly to its contents - giving the reserved slot back, so the
+// insert had to allocate again and a failure there dropped the node with it. The ABI promises rename
+// is atomic within a volume. The window is narrow, since `shrink_children` only acts at or below a
+// quarter occupancy, and it is exactly the case the reservation was written to make impossible.
+fn take(children: &mut Children, name: &str) -> Option<Node> {
+	let at = children.binary_search_by(|(key, _)| key.as_str().cmp(name)).ok()?;
+	Some(children.remove(at).1)
 }
 
 // Give a directory's table back when it is mostly empty.
@@ -439,7 +451,13 @@ impl LiberMemFs {
 		let pending = path.len();
 		match self.resolve(parts)? {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
-			Some(Node::File(_)) | Some(Node::Claimed(_)) => {
+			// A CLAIMED DESTINATION ANSWERS WHAT THE OPERATION ANSWERS. `stream_begin` refuses a
+			// claimed path with `Exists`; this reported the space a stream would have, so a caller
+			// could ask during another caller's open stream, be told a number, prepare that payload
+			// and be refused. Not a data-loss path, and the same class this milestone has closed
+			// twice: a preflight answering a question the operation behind it answers differently.
+			Some(Node::Claimed(_)) => Err(FsError::Exists),
+			Some(Node::File(_)) => {
 				if free < pending {
 					return Err(FsError::NoSpace);
 				}
@@ -466,8 +484,11 @@ impl LiberMemFs {
 		}
 		let free = self.capacity.saturating_sub(self.footprint() as usize);
 		match self.resolve(parts)? {
+			// A claimed destination is `Exists`, which is what `write_file` answers for it. See
+			// `stream_len` for why the two must be the same answer.
+			Some(Node::Claimed(_)) => Err(FsError::Exists),
 			// A rewrite may use what the file already holds, plus whatever is still free.
-			Some(Node::File(existing)) | Some(Node::Claimed(existing)) => Ok(existing.capacity().saturating_add(free).min(MAX_FILE_BYTES)),
+			Some(Node::File(existing)) => Ok(existing.capacity().saturating_add(free).min(MAX_FILE_BYTES)),
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			// A new entry pays for its name out of the same free space.
 			None => {
@@ -1517,21 +1538,32 @@ impl LiberMemFs {
 		let (destination_parts, destination_count) = Self::segments(to)?;
 		let destination_parts = &destination_parts[..destination_count];
 		let destination_name = *destination_parts.last().ok_or(FsError::BadName)?;
-		if source_parts == destination_parts {
-			return Ok(());
-		}
 		// EVERYTHING THAT CAN REFUSE, FIRST. The source has to be an ordinary file, the
 		// destination has to be free, and the destination's parent has to exist - all asked
 		// before the entry is taken out of the tree, because putting it back is a second failure
 		// with nowhere to report it.
+		//
+		// BEFORE the same-path shortcut, which used to come first - so renaming something that is
+		// not there to itself answered `Ok(())`.
 		match self.resolve(source_parts)? {
 			Some(Node::File(_)) => {}
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
 			Some(Node::Claimed(_)) => return Err(FsError::Exists),
 			None => return Err(FsError::NotFound),
 		}
+		if source_parts == destination_parts {
+			return Ok(());
+		}
 		if self.resolve(destination_parts)?.is_some() {
 			return Err(FsError::Exists);
+		}
+		// AND THE NAME DELTA IS CHARGED. Names are part of `footprint()`, and this allocated the new
+		// one and checked nothing - so on a volume exactly full, renaming `a` to `very-long-name`
+		// succeeded as long as the host heap had room and left `footprint()` above `capacity()`,
+		// which is the one invariant this milestone exists to hold.
+		let footprint = self.footprint() as usize;
+		if footprint - source_name.len() + destination_name.len() > self.capacity {
+			return Err(FsError::NoSpace);
 		}
 		let mut owned = String::new();
 		owned.try_reserve_exact(destination_name.len()).map_err(|_| FsError::NoSpace)?;
@@ -1543,12 +1575,21 @@ impl LiberMemFs {
 			let children = self.parent_mut(destination_parts)?;
 			children.try_reserve(1).map_err(|_| FsError::NoSpace)?;
 		}
+		// `take` RATHER THAN `remove`: the shrink inside `remove` would hand the slot just reserved
+		// back before the insert could use it, which for a rename within one directory is the same
+		// table. See `take`.
 		let node = {
 			let children = self.parent_mut(source_parts)?;
-			remove(children, source_name).ok_or(FsError::NotFound)?
+			take(children, source_name).ok_or(FsError::NotFound)?
 		};
 		let children = self.parent_mut(destination_parts)?;
 		insert(children, owned, node)?;
+		// The source's table is shrunk AFTER the insert has succeeded, so the reservation is never
+		// alive across a shrink of the table it is in.
+		{
+			let children = self.parent_mut(source_parts)?;
+			shrink_children(children);
+		}
 		self.resync_reservation();
 		Ok(())
 	}
@@ -1562,38 +1603,81 @@ impl LiberMemFs {
 		let parts = &parts[..count];
 		let name = *parts.last().ok_or(FsError::BadName)?;
 		let want = usize::try_from(length).map_err(|_| FsError::NoSpace)?;
+		// THE FILE-SIZE BOUND IS A PROPERTY OF THE VOLUME, not of which call reached it. `write_file`
+		// and the streaming path both refuse past this; `truncate` bounded `want` by the volume's
+		// capacity alone, so on a large volume a caller could build a file no other write path in
+		// this crate would accept.
+		if want > MAX_FILE_BYTES {
+			return Err(FsError::TooLong);
+		}
+		// WHAT THE FILE COSTS TODAY, AS AN ALLOCATION. This read `bytes.len()`, and the volume
+		// accounts `capacity()` - so a file holding 20 bytes in an 80-byte buffer, already charged
+		// for 80, was refused a grow to 40 that allocates nothing. That is the `len`-versus-
+		// `capacity` confusion this milestone was opened for, in a function written after it closed.
 		let have: usize = match self.resolve(parts)? {
-			Some(Node::File(bytes)) => bytes.len(),
+			Some(Node::File(bytes)) => bytes.capacity(),
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
 			Some(Node::Claimed(_)) => return Err(FsError::Exists),
 			None => return Err(FsError::NotFound),
 		};
-		// GROWING IS AN ALLOCATION and is charged like one: a volume with no room for the
-		// zero-extension refuses it rather than growing past its capacity.
-		if want > have {
-			if self.footprint() as usize + (want - have) > self.capacity {
-				return Err(FsError::NoSpace);
-			}
-			if self.policy == Policy::Reserved {
-				self.release_reservation();
-			}
+		let becomes = have.max(want);
+		if self.footprint() as usize - have + becomes > self.capacity {
+			return Err(FsError::NoSpace);
 		}
-		{
-			let children = self.parent_mut(parts)?;
-			match find_mut(children, name) {
-				Some(Node::File(bytes)) => {
-					if want > bytes.len() {
-						bytes.try_reserve_exact(want - bytes.len()).map_err(|_| FsError::NoSpace)?;
-					}
-					bytes.resize(want, 0);
-					if want < have {
-						bytes.shrink_to_fit();
-					}
-				}
-				_ => return Err(FsError::NotFound),
-			}
+		// ALLOCATE, CHECK, SWAP - the shape `write_file` uses, and the reason it uses it. Mutating
+		// in place meant trusting what `try_reserve_exact` returned: the allocator promises AT LEAST
+		// what was asked for, `footprint` counts what was actually given, and a generous allocator
+		// left a successful truncate with the volume over its own capacity.
+		//
+		// It also meant a refused grow could return with the reservation dropped - released before
+		// the allocation, with `resync_reservation()` after the `?`. That is exactly the defect the
+		// previous round found and fixed in `write_file`, in the function beside it. Building the new
+		// buffer first makes all three one problem with one answer.
+		let allocates = becomes > have;
+		if self.policy == Policy::Reserved && allocates {
+			self.release_reservation();
 		}
+		let outcome = self.truncate_swap(parts, name, want, have);
 		self.resync_reservation();
+		outcome
+	}
+
+	// The mutating half of `truncate`, in its own call so every temporary it makes is dropped BEFORE
+	// the caller resyncs its reservation - holding a refused buffer while asking for the reservation
+	// back means competing with yourself for the memory.
+	fn truncate_swap(&mut self, parts: &[&str], name: &str, want: usize, charged: usize) -> Result<(), FsError> {
+		let capacity = self.capacity;
+		let footprint = self.footprint() as usize;
+		let children = self.parent_mut(parts)?;
+		let Some(Node::File(bytes)) = find_mut(children, name) else {
+			return Err(FsError::NotFound);
+		};
+		if want <= bytes.len() {
+			bytes.truncate(want);
+			// THROUGH THE FALLIBLE PATH, because `shrink_to_fit` aborts the storage service when the
+			// smaller allocation fails - which is precisely why `shrink_children` next door is
+			// hand-written rather than calling it. One shrink policy, one implementation.
+			//
+			// A shrink that cannot allocate leaves the buffer where it is: the file is the right
+			// length and the volume is holding more than it needs, which is a cost rather than a
+			// defect, and the resync below reports the truth either way.
+			let mut smaller: Vec<u8> = Vec::new();
+			if smaller.try_reserve_exact(want).is_ok() {
+				smaller.extend_from_slice(&bytes[..want]);
+				*bytes = smaller;
+			}
+			return Ok(());
+		}
+		// Growing: build the whole new buffer, measure what the allocator actually gave, and only
+		// then swap it in.
+		let mut grown: Vec<u8> = Vec::new();
+		grown.try_reserve_exact(want).map_err(|_| FsError::NoSpace)?;
+		if footprint - charged + grown.capacity() > capacity {
+			return Err(FsError::NoSpace);
+		}
+		grown.extend_from_slice(bytes);
+		grown.resize(want, 0);
+		*bytes = grown;
 		Ok(())
 	}
 

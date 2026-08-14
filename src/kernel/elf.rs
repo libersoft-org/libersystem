@@ -75,6 +75,7 @@ static SHARED_PAGES: SpinLock<BTreeMap<u64, Vec<Weak<SharedPage>>>> = SpinLock::
 #[cfg(test)]
 pub fn shared_page_for_test() -> Arc<SharedPage> {
 	let frame = frame::allocate().expect("a frame for the test's shared page");
+	// ALLOC-OK: a test helper - a test that cannot allocate has already failed.
 	Arc::new(SharedPage { frame })
 }
 
@@ -180,6 +181,7 @@ fn load_parsed(image: &bootproto::elf::Elf<'_>, addr_space: &AddressSpace, frame
 			}
 			validate_segment(&ph, bias, window, &loaded)?;
 			let data = image.segment_data(&ph).ok_or(ElfError::BadImage)?;
+			// ALLOC-OK: one entry per PT_LOAD segment, and the vector is reserved from the segment count above.
 			loaded.push(map_segment(data, addr_space, frames, shared, &ph, bias)?);
 		}
 		if loaded.is_empty() {
@@ -343,7 +345,7 @@ fn shared_page(data: &[u8], source_offset: usize, destination_offset: usize, cop
 	if !cache.contains_key(&hash) && cache.len() >= MAX_SHARED_CACHE_KEYS {
 		let frame = frame::allocate().ok_or(ElfError::OutOfMemory)?;
 		initialize_page(frame, data, source_offset, destination_offset, copy);
-		return Ok(Arc::new(SharedPage { frame }));
+		return crate::mem::heap::try_arc(SharedPage { frame }).ok_or(ElfError::OutOfMemory);
 	}
 	let candidates = cache.entry(hash).or_default();
 	candidates.retain(|candidate| candidate.strong_count() != 0);
@@ -354,8 +356,9 @@ fn shared_page(data: &[u8], source_offset: usize, destination_offset: usize, cop
 	}
 	let frame = frame::allocate().ok_or(ElfError::OutOfMemory)?;
 	initialize_page(frame, data, source_offset, destination_offset, copy);
-	let page = Arc::new(SharedPage { frame });
+	let page = crate::mem::heap::try_arc(SharedPage { frame }).ok_or(ElfError::OutOfMemory)?;
 	if candidates.len() < MAX_HASH_COLLISIONS {
+		// ALLOC-OK: the shared-page cache for one image, bounded by the image's own page count.
 		candidates.push(Arc::downgrade(&page));
 	}
 	Ok(page)
@@ -441,7 +444,13 @@ fn collect_exports(image: &bootproto::elf::Elf<'_>, loaded: &[LoadedSegment], bi
 		if exports.iter().any(|(existing, _): &(String, u64)| existing == name) {
 			return Err(ElfError::BadImage);
 		}
-		exports.push((String::from(name), address));
+		// FALLIBLY, both halves: the name and the slot for it. The export count comes from the
+		// image's own symbol table, so ring 3 chooses how many of these there are by spawning a
+		// process whose library declares them.
+		let Some(owned) = crate::mem::heap::try_string(name) else { return Err(ElfError::OutOfMemory) };
+		if crate::mem::heap::try_push(&mut exports, (owned, address)).is_err() {
+			return Err(ElfError::OutOfMemory);
+		}
 	}
 	Ok(exports)
 }

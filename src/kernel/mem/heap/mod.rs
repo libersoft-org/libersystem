@@ -123,12 +123,30 @@ fn unwind(base: u64, mapped: u64, end: u64) {
 	let mut virt = base;
 	while virt < mapped {
 		if let Some(phys) = paging::unmap_page(virt) {
-			// SAFETY: the frame came from this growth's own allocation and has just been
-			// unmapped from the only place it was ever mapped.
-			unsafe { frame::deallocate(phys) };
+			// THROUGH THE RETIREMENT DOOR, because these frames WERE in the kernel's page tables.
+			//
+			// `unmap_page` clears the PTE and invalidates this core's TLB, and the kernel half is
+			// shared by every core - so a plain `deallocate` here returns a frame to the allocator
+			// while another core may still hold a translation for it. That nothing ever ACCESSED
+			// these addresses is a good argument and it is not the rule: the rule this module states
+			// is that anything a page table pointed at goes back through `retire`, and a rollback
+			// reasoning its way around it is how the stack-growth path came to have the same defect.
+			//
+			// SAFETY: the frame came from this growth's own allocation and has just been unmapped
+			// from the only place it was ever mapped.
+			unsafe { frame::retire(&[phys]) };
 		}
 		virt += PAGE_SIZE;
 	}
+	// AND DRAINED HERE, which is what keeps "a rollback gives back what it took" true.
+	//
+	// `retire` defers: it queues the frames and frees them on the next completed shootdown, which
+	// is right for the steady state and wrong for this caller. A heap growth that ran out of frames
+	// is the machine at its shortest, and leaving its own frames in a quarantine until something
+	// else happens to retire sixty-four more is holding memory back at the exact moment it is
+	// needed. The module names this case itself - the drain is forced where a caller knows a lot has
+	// just been freed - and process teardown and the loader rollback already do it.
+	unsafe { frame::drain_quarantine() };
 	let _ = NEXT_REGION.compare_exchange(end, base, Ordering::Relaxed, Ordering::Relaxed);
 }
 
@@ -365,6 +383,60 @@ mod tests;
 // `try_reserve`. Used by the paths reachable from ring 3 - the thread-entry context of every spawn,
 // and anything else that boxes on a userspace-triggered path - where a short heap must be a refusal
 // and not a halt.
+// Reference-count a value FALLIBLY.
+//
+// `Arc::new` aborts the kernel when the heap is short, and almost every kernel OBJECT is built with
+// it: `MemoryObject`, `Channel`, `Domain`, `AddressSpace`, `WaitSet`, `Thread`, `Interrupt`, `Timer`.
+// `SYS_MEMORY_OBJECT_CREATE`, `SYS_CHANNEL_CREATE` and their neighbours reach those constructors
+// directly, so it is as reachable from ring 3 as `Box::new` was and the allocation gate did not look
+// for it.
+//
+// `Arc::try_new` is the real answer and it is unstable; this crate is built on nightly with
+// `-Z build-std` and already carries `#![feature(abi_x86_interrupt)]`, so `allocator_api` costs
+// nothing to add and this is one line rather than a layout trick.
+pub fn try_arc<T>(value: T) -> Option<alloc::sync::Arc<T>> {
+	alloc::sync::Arc::try_new(value).ok()
+}
+
+// Grow a vector by one FALLIBLY - `Vec::push` reallocates when it is full, and that reallocation
+// aborts.
+//
+// Returns the value back on refusal rather than dropping it, because a caller that cannot store it
+// often still has to give it somewhere: the channel send hands its capabilities back to the sender.
+pub fn try_push<T>(vec: &mut alloc::vec::Vec<T>, value: T) -> Result<(), T> {
+	if vec.try_reserve(1).is_err() {
+		return Err(value);
+	}
+	vec.push(value);
+	Ok(())
+}
+
+// Append a slice FALLIBLY, reserving the whole extension before any of it is copied - so a refusal
+// leaves the vector exactly as it was rather than partly grown.
+pub fn try_extend<T: Clone>(vec: &mut alloc::vec::Vec<T>, items: &[T]) -> bool {
+	if vec.try_reserve(items.len()).is_err() {
+		return false;
+	}
+	vec.extend_from_slice(items);
+	true
+}
+
+// Copy a `&str` onto the heap FALLIBLY. `String::from` and `format!` both abort.
+pub fn try_string(text: &str) -> Option<alloc::string::String> {
+	let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	out.try_reserve_exact(text.len()).ok()?;
+	out.extend_from_slice(text.as_bytes());
+	// SAFETY: the bytes came from a `&str`, so they are valid UTF-8.
+	Some(unsafe { alloc::string::String::from_utf8_unchecked(out) })
+}
+
+// A vector with room for `capacity`, FALLIBLY - `Vec::with_capacity` aborts.
+pub fn try_vec<T>(capacity: usize) -> Option<alloc::vec::Vec<T>> {
+	let mut out: alloc::vec::Vec<T> = alloc::vec::Vec::new();
+	out.try_reserve_exact(capacity).ok()?;
+	Some(out)
+}
+
 pub fn try_box<T>(value: T) -> Option<alloc::boxed::Box<T>> {
 	let mut room: alloc::vec::Vec<T> = alloc::vec::Vec::new();
 	room.try_reserve_exact(1).ok()?;

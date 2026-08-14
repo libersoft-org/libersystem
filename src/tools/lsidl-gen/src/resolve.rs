@@ -11,29 +11,43 @@ pub enum SymbolKind {
 	Interface,
 }
 
+// How many capabilities an exported shape carries, AS A NUMBER.
+//
+// It was `Zero | One | Many`, and the validator became quantitative around it - so an imported record
+// carrying two capabilities arrived here as `Many` and the import mapping read it as
+// `Cardinality::Exact(MAX_HANDLES)`, four. A local record combining that import with another
+// two-capability field was then refused at six when the truth is four. It fails SAFE, and it is
+// invisible until somebody writes that schema, and it was the last place in this chain where the
+// count was a word rather than a number - which is what the whole `Exact`/`OverLimit` change was for.
+//
+// `Unbounded` is the one shape a number cannot describe: a `list<handle<T>>`, whose count is a
+// property of the value. The validator refuses it; carrying it through import means an importer
+// refuses it for the same reason rather than rounding it to something it can compare.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandleCardinality {
-	Zero,
-	One,
-	Many,
+	Exact(usize),
+	Unbounded,
 }
 
 impl HandleCardinality {
+	pub const ZERO: HandleCardinality = HandleCardinality::Exact(0);
+
+	// Side by side: the counts add. Saturating, because a sum past the wire's limit is refused by
+	// the validator with the number it computed - and the number only has to be big enough to lose.
 	fn sum(self, other: HandleCardinality) -> HandleCardinality {
 		use HandleCardinality::*;
 		match (self, other) {
-			(Many, _) | (_, Many) | (One, One) => Many,
-			(One, Zero) | (Zero, One) => One,
-			(Zero, Zero) => Zero,
+			(Unbounded, _) | (_, Unbounded) => Unbounded,
+			(Exact(a), Exact(b)) => Exact(a.saturating_add(b)),
 		}
 	}
 
+	// Alternatives: the most either arm can carry.
 	fn max(self, other: HandleCardinality) -> HandleCardinality {
 		use HandleCardinality::*;
 		match (self, other) {
-			(Many, _) | (_, Many) => Many,
-			(One, _) | (_, One) => One,
-			(Zero, Zero) => Zero,
+			(Unbounded, _) | (_, Unbounded) => Unbounded,
+			(Exact(a), Exact(b)) => Exact(a.max(b)),
 		}
 	}
 }
@@ -191,7 +205,7 @@ fn base_exports(file: &File) -> HashMap<String, Export> {
 			Item::Resource(item) => (&item.name, SymbolKind::Resource, false, None),
 			Item::Interface(item) => (&item.name, SymbolKind::Interface, false, None),
 		};
-		out.entry(name.clone()).or_insert(Export { kind, cardinality: HandleCardinality::Zero, contains_again: again, wire_type });
+		out.entry(name.clone()).or_insert(Export { kind, cardinality: HandleCardinality::ZERO, contains_again: again, wire_type });
 	}
 	out
 }
@@ -203,10 +217,10 @@ fn resolved_exports(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> H
 		for item in &file.items {
 			let (name, next) = match item {
 				Item::Alias(alias) => (&alias.name, type_cardinality(&alias.ty, &out, imports)),
-				Item::Record(record) => (&record.name, record.fields.iter().fold(HandleCardinality::Zero, |acc, field| acc.sum(type_cardinality(&field.ty, &out, imports)))),
-				Item::Variant(variant) => (&variant.name, variant.cases.iter().filter_map(|case| case.payload.as_ref()).fold(HandleCardinality::Zero, |acc, ty| acc.max(type_cardinality(ty, &out, imports)))),
-				Item::Enum(item) => (&item.name, HandleCardinality::Zero),
-				Item::Flags(item) => (&item.name, HandleCardinality::Zero),
+				Item::Record(record) => (&record.name, record.fields.iter().fold(HandleCardinality::ZERO, |acc, field| acc.sum(type_cardinality(&field.ty, &out, imports)))),
+				Item::Variant(variant) => (&variant.name, variant.cases.iter().filter_map(|case| case.payload.as_ref()).fold(HandleCardinality::ZERO, |acc, ty| acc.max(type_cardinality(ty, &out, imports)))),
+				Item::Enum(item) => (&item.name, HandleCardinality::ZERO),
+				Item::Flags(item) => (&item.name, HandleCardinality::ZERO),
 				Item::Resource(_) | Item::Interface(_) => continue,
 			};
 			let export = out.get_mut(name).expect("local export");
@@ -252,16 +266,19 @@ fn expand_alias_type(ty: &Type, locals: &HashMap<String, Export>, imports: &Hash
 
 fn type_cardinality(ty: &Type, locals: &HashMap<String, Export>, imports: &HashMap<String, ResolvedSymbol>) -> HandleCardinality {
 	match ty {
-		Type::Handle(_) | Type::Buffer | Type::Stream(_) => HandleCardinality::One,
+		Type::Handle(_) | Type::Buffer | Type::Stream(_) => HandleCardinality::Exact(1),
 		Type::Option(inner) => type_cardinality(inner, locals, imports),
+		// A list of capability-free values carries none; a list of anything else has no
+		// generation-time count at all, which is what `Unbounded` says and what the validator
+		// refuses.
 		Type::List(inner) => match type_cardinality(inner, locals, imports) {
-			HandleCardinality::Zero => HandleCardinality::Zero,
-			HandleCardinality::One | HandleCardinality::Many => HandleCardinality::Many,
+			HandleCardinality::Exact(0) => HandleCardinality::ZERO,
+			_ => HandleCardinality::Unbounded,
 		},
-		Type::Tuple(items) => items.iter().fold(HandleCardinality::Zero, |acc, item| acc.sum(type_cardinality(item, locals, imports))),
+		Type::Tuple(items) => items.iter().fold(HandleCardinality::ZERO, |acc, item| acc.sum(type_cardinality(item, locals, imports))),
 		Type::Result(ok, err) => type_cardinality(ok, locals, imports).max(type_cardinality(err, locals, imports)),
-		Type::Named(name) => locals.get(name).map(|export| export.cardinality).or_else(|| imports.get(name).map(|symbol| symbol.cardinality)).unwrap_or(HandleCardinality::Zero),
-		_ => HandleCardinality::Zero,
+		Type::Named(name) => locals.get(name).map(|export| export.cardinality).or_else(|| imports.get(name).map(|symbol| symbol.cardinality)).unwrap_or(HandleCardinality::ZERO),
+		_ => HandleCardinality::ZERO,
 	}
 }
 

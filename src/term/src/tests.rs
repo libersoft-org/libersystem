@@ -1146,3 +1146,91 @@ fn a_multi_byte_character_reaches_the_screen_whole() {
 	expected.extend_from_slice(b"\x08");
 	assert_eq!(echoed(&mut ld, &mut echo, &ch[1..]), expected, "the completed character and the suffix arrive together");
 }
+
+#[test]
+fn typing_past_the_width_soft_wraps_and_keeps_scrolling() {
+	// THE ORDINARY CASE, which the long-line test above does not reach: it types fifty characters
+	// and then presses `Home`, and `Home` sets `self.cursor = 0` before moving, so the count that
+	// `Ld::insert` steps back by is zero on a path where zero was already the answer.
+	//
+	// Typing at the END of a line - most typing - is exactly where the count is zero and the answer
+	// is not. `move_left(0)` fed `caret_index()` back into an absolute CUP, and CUP cancels the
+	// deferred wrap: the glyph landed where it would have landed anyway and `wrap[0]` was never set,
+	// so a line the user typed continuously rendered as a hard newline.
+	let mut term = test_term(8, 4, 16);
+	let mut ld = Ld::new(8);
+	let vocab: Vec<Vec<u8>> = Vec::new();
+	{
+		let mut echo = Echo { term: Some(&mut term), ser: EchoBuf::new() };
+		for b in b"123456789" {
+			ld.feed(*b, &vocab, &mut echo);
+		}
+	}
+	assert!(term.screen.row_wrapped(0), "the first row is SOFT-wrapped: the ninth character continued the line rather than starting a new one");
+	assert_eq!(term.screen.cell(0, 1).glyph, b'9' as u32, "and the ninth character is on the second row");
+	assert_eq!((term.screen.cursor_col(), term.screen.cursor_row()), (1, 1), "with the caret just past it");
+
+	// And past `rows * cols`, where the same defect stopped the screen scrolling: `target / cols`
+	// was `rows`, the CUP arm clamped it to `rows - 1`, and every later character overwrote the
+	// last row.
+	{
+		let mut echo = Echo { term: Some(&mut term), ser: EchoBuf::new() };
+		for i in 0..40u8 {
+			ld.feed(b'A' + i % 26, &vocab, &mut echo);
+		}
+	}
+	assert_eq!(term.screen.cursor_row(), 3, "the caret is on the last row because the screen scrolled under it");
+	let last = (0..8).map(|c| term.screen.cell(c, 3).glyph).collect::<Vec<u32>>();
+	assert!(last.iter().all(|g| *g != b'1' as u32), "the last row holds the tail of the typing rather than a row overwritten in place");
+	assert_eq!(ld.len, 49, "and every character went into the buffer");
+}
+
+#[test]
+fn every_cursor_move_settles_the_deferred_wrap() {
+	// THE SENTENCE MADE CHECKABLE. `cursor_moved`'s comment says "every path that actually assigns
+	// `row` or `col` calls this, and nothing else does", and that claim has now been wrong twice -
+	// `Screen::clear`, which `ConsoleService` calls when a VT is reused for a fresh shell, and
+	// `restore_cursor`. Both left a wrap owed against a column the cursor had left, so the next
+	// glyph started a row down.
+	//
+	// So this drives every public way to move the cursor, each from a state with the wrap owed, and
+	// asserts the flag is settled afterwards. A new mover written against that sentence and not
+	// honouring it fails here rather than in somebody's prompt.
+	let moves: &[(&str, &[u8])] = &[
+		("CUP", b"\x1b[1;1H"),
+		("CUU", b"\x1b[1A"),
+		("CUD", b"\x1b[1B"),
+		("CUF", b"\x1b[1C"),
+		("CUB", b"\x1b[1D"),
+		("CNL", b"\x1b[1E"),
+		("CPL", b"\x1b[1F"),
+		("CHA", b"\x1b[1G"),
+		("VPA", b"\x1b[1d"),
+		("carriage return", b"\r"),
+		("line feed", b"\n"),
+		("backspace", b"\x08"),
+		("tab", b"\t"),
+		("index", b"\x1bD"),
+		("reverse index", b"\x1bM"),
+		("next line", b"\x1bE"),
+		("DECSTBM", b"\x1b[1;4r"),
+		("DECRC", b"\x1b8"),
+		("alternate screen", b"\x1b[?1049h"),
+		("reset", b"\x1bc"),
+	];
+	for (label, sequence) in moves {
+		let mut term = test_term(8, 4, 16);
+		// Fill the last column of row 0, which is the only way to owe a wrap.
+		feed(&mut term.screen, b"12345678");
+		assert!(term.screen.wrap_pending(), "{label}: the fixture must start with the wrap owed");
+		feed(&mut term.screen, sequence);
+		assert!(!term.screen.wrap_pending(), "{label} moves the cursor and must settle the deferred wrap with it");
+	}
+
+	// And `clear`, which is not a control sequence but is reached from production.
+	let mut term = test_term(8, 4, 16);
+	feed(&mut term.screen, b"12345678");
+	assert!(term.screen.wrap_pending());
+	term.screen.clear();
+	assert!(!term.screen.wrap_pending(), "clear() homes the cursor, so it settles the wrap");
+}

@@ -48,7 +48,7 @@ impl MemoryObject {
 	pub fn create(size: usize) -> Option<Arc<Self>> {
 		let pages = frame::pages_for(size);
 		let frames = frame::allocate_pages(pages)?;
-		Some(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: None }))
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: None })
 	}
 
 	// Allocate physical frames for an object charged to `domain`. The Domain's
@@ -77,7 +77,7 @@ impl MemoryObject {
 				return Err(MemoryError::OutOfMemory);
 			}
 		};
-		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: Some(domain.clone()) }))
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: Some(domain.clone()) }).ok_or(MemoryError::OutOfMemory)
 	}
 
 	pub fn size(&self) -> usize {
@@ -133,6 +133,7 @@ impl MemoryObject {
 	}
 
 	pub fn add_mapping(&self, cr3: u64, base: u64) {
+		// ALLOC-OK: one entry per address space this object is mapped into, bounded by the process count the Domain quota allows.
 		self.mappings.lock().push((cr3, base));
 	}
 

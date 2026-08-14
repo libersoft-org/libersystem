@@ -32,8 +32,9 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
-use proto::system::{Entry, Error, Field, OpenOpts, Severity, log, volume};
+use proto::system::{Entry, Field, OpenOpts, Severity, log, volume};
 use rt::*;
+use service_logic::world_errors::{log_failure, read_failure, write_failure};
 use wasm::module::FuncType;
 use wasm::{Instance, Module, ValidatedModule, Value};
 
@@ -110,14 +111,22 @@ unsafe fn load_component(storage: u64, uri: &[u8]) -> Option<Vec<u8>> {
 // that did not answer, or a read that failed once the file was open, is `Failed`. Both used to be
 // `None` and both reached the guest as `STATUS_IO`, so a component told to try again was sometimes
 // being told to try something it may not do.
+//
+// AND `Denied` IS MATCHED, not every error. A wildcard here called four things access denied:
+// `Again` is "try later" and a guest told `STATUS_DENIED` will not, `Closed` is the peer going away,
+// `Invalid` is this host having asked wrongly, and `NotFound` is this host's manifest naming a file
+// that is not there - none of them is "you may not", which is the only thing `Denied` means. The
+// full reasoning, including why `NotFound` is not a refusal in a world where the guest never names
+// the path, is with the status codes in `src/wasm/src/world.rs`.
 unsafe fn read_file(storage: u64, uri: &[u8], dst: &mut [u8]) -> ReadOutcome {
 	unsafe {
 		let opts: OpenOpts = OpenOpts { path: String::from_utf8_lossy(uri).into_owned(), write: false, create: false };
 		let mut client = volume::Client::new(ChannelTransport { chan: storage });
 		let result = match client.open(&opts) {
 			Some(Ok(r)) => r,
-			// The volume answered and said no: that is the grant, not the machine.
-			Some(Err(_)) => return ReadOutcome::Refused,
+			// The volume answered and said no - or said something else, which is not the same
+			// thing. One classification, in `service-logic` where a host test can reach it.
+			Some(Err(error)) => return read_failure(error),
 			// Nothing came back at all.
 			None => return ReadOutcome::Failed,
 		};
@@ -144,8 +153,10 @@ unsafe fn write_file(storage: u64, uri: &[u8], bytes: &[u8]) -> WriteOutcome {
 			// `Denied` is the volume refusing; every other answer is a fault on the way there.
 			// `NotFound` and `Invalid` are the host having asked wrongly, `Again` and `Closed` are
 			// the service - none of them is "you may not", which is the only thing `Denied` means.
-			Some(Err(Error::Denied)) => WriteOutcome::Refused,
-			_ => WriteOutcome::Failed,
+			// This match was right and it was the ONLY one that was, which is why the rule moved
+			// out of the three call sites that each wrote their own version of it.
+			Some(Err(error)) => write_failure(error),
+			None => WriteOutcome::Failed,
 		}
 	}
 }
@@ -167,7 +178,10 @@ unsafe fn emit_log(logsvc: u64, msg: &[u8]) -> LogOutcome {
 	let mut client = log::Client::new(ChannelTransport { chan: logsvc });
 	match client.emit(&entry) {
 		Some(Ok(())) => LogOutcome::Logged,
-		Some(Err(_)) => LogOutcome::Refused,
+		// One vocabulary for all three operations. This answered `Refused` for every error, so a
+		// component told `STATUS_DENIED` by a log daemon under back-pressure stopped using the only
+		// diagnostic channel it has.
+		Some(Err(error)) => log_failure(error),
 		None => LogOutcome::Failed,
 	}
 }
@@ -239,8 +253,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	for i in module.imports.iter() {
 		let signature: Option<&FuncType> = module.types.get(i.type_index as usize);
 		match resolve(&i.module, &i.field, signature) {
-			Some(op) => imports.push(op),
-			None => exit(),
+			Ok(op) => imports.push(op),
+			// Both cases refuse the component, and this host has nowhere to SAY which: it is a
+			// `*-unknown-none` binary whose only report is its exit. The build-time gate in
+			// `mkpackages` reads the same `Err` and names it, which is the point of the gate.
+			Err(_) => exit(),
 		}
 	}
 	let mut instance: Instance = match Instance::new(&validated) {
@@ -289,7 +306,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		ReadOutcome::Read(n) => n,
 		// The readback is the test's evidence that the write landed; a refusal and a failure are
 		// both "nothing to report", and the assertion on the other side is what says so.
-		ReadOutcome::Refused | ReadOutcome::Failed => 0,
+		// `Unsupported` is what a host without a read path at all answers, and this host has one -
+		// listed rather than folded into a wildcard so the day the vocabulary grows again, the
+		// build stops here and somebody decides.
+		ReadOutcome::Refused | ReadOutcome::Failed | ReadOutcome::Unsupported => 0,
 	};
 
 	let mut report: Vec<u8> = Vec::with_capacity(17 + written + host.output().len());

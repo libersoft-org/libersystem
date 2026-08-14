@@ -153,7 +153,15 @@ impl<D: BlockDevice> LiberFs<D> {
 				clear_bit(&mut self.free, b);
 			}
 		}
-		self.dead_prev = core::mem::take(&mut self.dead);
+		// The set this transaction dropped becomes the next commit's `dead_prev`. Copied FALLIBLY,
+		// like everything else that grows here: a commit that cannot hold the list refuses rather
+		// than aborting, and the transaction it was committing is already on the medium - so the
+		// caller's retry re-derives the same list from the free map.
+		self.dead_prev.clear();
+		let dead = core::mem::take(&mut self.dead);
+		for b in dead {
+			crate::try_push(&mut self.dead_prev, b)?;
+		}
 		Ok(())
 	}
 
@@ -260,8 +268,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// its `reached` set contains the root BEFORE the walk starts. Seeding the same way here is
 		// what makes the two checkers agree by construction instead of by coincidence, which is the
 		// gap this whole milestone is named after.
-		names.try_reserve(1).map_err(|_| FsError::NoMemory)?;
-		names.push(ROOT_INODE);
+		crate::try_push(&mut names, ROOT_INODE)?;
 		self.mark_names = Some(names);
 		self.mark_alias = false;
 		self.mark_strict = true;
@@ -284,6 +291,16 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		// everything past here spans generations, where sharing is legal by design.
 		let dup = self.mark_dup.take();
+		// THE ALIAS IS A PROPERTY OF THE FINISHED SET, decided in one pass over it rather than by a
+		// flag raised during the walk - which is also what makes the sort valid: there is nothing to
+		// preserve about the order the inodes were reached in.
+		//
+		// Seeding `ROOT_INODE` first still catches a record pointing at the root, because a
+		// duplicate root shows up as an adjacent pair like any other.
+		if let Some(names) = self.mark_names.as_mut() {
+			names.sort_unstable();
+			self.mark_alias = names.windows(2).any(|pair| pair[0] == pair[1]);
+		}
 		self.mark_names = None;
 		if self.mark_alias {
 			self.read_only = true;
@@ -328,7 +345,9 @@ impl<D: BlockDevice> LiberFs<D> {
 			if only_prev != 0 {
 				for bit in 0..8 {
 					if only_prev & (1 << bit) != 0 {
-						self.dead_prev.insert(i as u64 * 8 + bit);
+						// Ascending by construction - `i` and `bit` both climb - so the vector is
+						// sorted and duplicate-free without being told to be.
+						crate::try_push(&mut self.dead_prev, i as u64 * 8 + bit)?;
 					}
 				}
 			}
@@ -640,19 +659,22 @@ impl<D: BlockDevice> LiberFs<D> {
 					// Read-only rather than a walk-damage flag: the repair for an alias is to
 					// remove one of the two names, and that removal is exactly the operation that
 					// destroys the shared inode. `fsck` names both.
+					// APPENDED, NOT INSERTED IN ORDER. Nothing about the correctness needs this
+					// sorted DURING the walk: the question is "has this inode been seen", and the
+					// answer is only wanted at the end.
+					//
+					// Sorted insertion was O(N²) memmove during MOUNT. Inode numbers arrive in the
+					// order the namespace walk reaches them and the directory B+tree is ordered by
+					// `(name_hash, name)`, so arrival order is effectively unrelated to numeric
+					// order and each insert moved about half the vector - on a filesystem whose own
+					// milestones aim at directories with millions of entries.
+					//
+					// FALLIBLY, which is the whole reason this is a `Vec`: a mount that cannot hold
+					// one more inode number answers `NoMemory` and is refused. `try_push` rather
+					// than `try_reserve` so the fault injector is inside the allocation the test
+					// sweeping budgets is named for.
 					if let Some(names) = self.mark_names.as_mut() {
-						match names.binary_search(&rec.child) {
-							// Seen before: this inode has a second name.
-							Ok(_) => self.mark_alias = true,
-							// FALLIBLY, which is the whole reason this is a `Vec`. A mount that
-							// cannot hold one more inode number answers `NoMemory` and is refused;
-							// it does not take the process down, and it does not carry on with an
-							// alias check that has silently stopped recording.
-							Err(at) => {
-								names.try_reserve(1).map_err(|_| FsError::NoMemory)?;
-								names.insert(at, rec.child);
-							}
-						}
+						crate::try_push(names, rec.child)?;
 					}
 				}
 			}

@@ -289,15 +289,31 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>,
 		// what you do not know": an unrecognised CRITICAL secondary (type code with bit 5 clear)
 		// makes the whole entry set unrecognised, and an implementation may not modify it normally.
 		//
-		// A benign one (bit 5 set - the vendor extensions) is preserved by being left alone, which
-		// is what happens anyway; a critical one marks the entry read-only, so it lists and reads
-		// and refuses overwrite and remove. That is the one answer that cannot damage a volume whose
-		// owner understands more of the format than this driver does.
+		// ANY unrecognised secondary, benign or critical, marks the entry read-only: it lists and
+		// reads, and refuses overwrite and remove.
+		//
+		// This tested bit 5 and left benign records alone, on the reasoning that "a benign one (bit
+		// 5 set - the vendor extensions) is preserved by being left alone, which is what happens
+		// anyway". Both halves of that sentence are wrong for Vendor Allocation, `0xE1` - a BENIGN
+		// secondary that carries its own `FirstCluster` and `DataLength`.
+		//
+		// It is not preserved by being left alone: `exfat_write` retires the old set and rebuilds it
+		// with `build_exfat_set`, which emits `0x85` / `0xC0` / `0xC1` and nothing else, so the
+		// vendor records are dropped. And leaving it alone is not safe: `remove` retires the set and
+		// releases the Stream Extension's chain, because `Raw` carries one `first_cluster` - so the
+		// clusters the Vendor Allocation owned stay allocated with nothing naming them.
+		//
+		// Carrying those records properly means `Raw` holding every auxiliary
+		// `(first_cluster, size, no_fat_chain)` and `remove` freeing them with the main chain. Until
+		// then, refusing is the one answer that cannot damage a volume whose owner understands more
+		// of the format than this driver does - which is the rule the comment above already states.
 		let mut unrecognised = false;
 		for r in (1 + fragments)..secondary {
 			let kind = bytes[i + 32 + r * 32];
-			// In use (bit 7), secondary (bit 6 clear), and BENIGN is bit 5.
-			if kind & 0x80 != 0 && kind & 0x20 == 0 {
+			// In use is bit 7; bit 6 SET is secondary, and every record in this range is one by
+			// construction - the Stream Extension and the File Name entries are behind it. So the
+			// question is only whether this driver emits it, and it emits `0xC0` and `0xC1`.
+			if kind & 0x80 != 0 && !matches!(kind, 0xC0 | 0xC1) {
 				unrecognised = true;
 			}
 		}

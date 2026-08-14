@@ -21,8 +21,9 @@ pub struct Event {
 }
 
 impl Event {
-	pub fn create() -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), signaled: AtomicBool::new(false) })
+	// FALLIBLY: `SYS_EVENT_CREATE` reaches this, so a short heap must be a refusal and not a halt.
+	pub fn create() -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), signaled: AtomicBool::new(false) })
 	}
 
 	// Raise the signal.

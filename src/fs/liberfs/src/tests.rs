@@ -1034,20 +1034,25 @@ fn a_pinned_snapshots_undecodable_stream_is_reported() {
 	// `a_compressed_extent_with_a_bad_checksum_is_counted_once` asserts all three.
 	assert_eq!(report.stream_failures, 1, "an undecodable snapshot stream is a STREAM failure: {report:?}");
 	assert_eq!(report.structural_failures, 0, "and not a structural one - the metadata is intact: {report:?}");
-	// `checksum_failures` is deliberately NOT asserted at zero, and the reason is worth having in
-	// the file rather than discovered again.
+	// ALL FOUR COUNTERS, which this could not assert until the fixture's fourth re-stamp was found.
 	//
-	// Making a snapshot's medium look perfect takes four re-stamps, not three: the block's checksum
-	// slot, the checksum block's own CRC in the extent record, the leaf's CRC in the snapshot
-	// record, and the snapshot block's CRC in the superblock. The first three are done above and
-	// the volume still reports one checksum failure, so something in the chain is read through a
-	// path the raw edits do not reproduce - `read_block_csum_aware`, most likely, which the live
-	// equivalent of this test happens not to exercise the same way.
+	// The comment here used to record a guess: making a snapshot's medium look perfect takes four
+	// re-stamps and only three were done, and the surviving checksum failure was blamed on
+	// "something read through a path the raw edits do not reproduce - `read_block_csum_aware`, most
+	// likely". It is not the reader. `derive_free` walks the PREVIOUS generation as well as the live
+	// one and reads that generation's snapshot table through the CRC the OLDER superblock recorded;
+	// copy-on-write only allocates a new snapshot block when the table changes, so both generations
+	// pointed at the same block and the edit invalidated both copies of its CRC. Restamping only the
+	// active slot left `read_snapshot_table` failing for the previous generation, which sets
+	// `walk_damage`, which `derive_free` reports as `Corrupt`, which arrives here as one checksum
+	// failure with no path to name. `forge_snapshot_inode_slot` restamps both slots now.
 	//
-	// What the test is FOR is the classification, and that is now provable: the stream fault is
-	// counted once, in `stream_failures`, where before it was added into `checksum_failures` and
-	// the assertion - a disjunction over the counters - could not tell. Chasing the last re-stamp
-	// would make the fixture prettier and would not make this assertion stronger.
+	// So the test's premise - "an undecodable stream over blocks that all match their checksums" -
+	// is established by the fixture rather than assumed, and what it pins is that the stream fault
+	// is the ONLY thing counted.
+	assert_eq!(report.checksum_failures, 0, "every block matches its checksum, which is the premise: {report:?}");
+	assert_eq!(report.io_failures, 0, "and the medium answered every read: {report:?}");
+	assert!(report.damaged.is_empty(), "nothing in the LIVE tree is damaged: {report:?}");
 }
 
 #[test]
@@ -2284,6 +2289,24 @@ fn forge_snapshot_inode_slot(dev: &mut MemDevice, index: usize, f: impl FnOnce(&
 	dev.blocks[rec + SNAP_ROOT_CRC_OFF..rec + SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&leaf_crc.to_le_bytes());
 	let snap_crc = crc32c(&dev.blocks[snap_start..snap_start + BLOCK_SIZE]);
 	forge_superblock(dev, slot, |sb| sb[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&snap_crc.to_le_bytes()));
+	// AND THE OTHER SUPERBLOCK SLOT, which is the fourth re-stamp this fixture was missing.
+	//
+	// `derive_free` walks the PREVIOUS generation as well as the live one, and reads that
+	// generation's snapshot table through the CRC the older superblock recorded. Copy-on-write only
+	// allocates a new snapshot block when the table changes, so both generations usually point at
+	// the SAME block - and editing a record inside it invalidates both copies of its CRC. Restamping
+	// only the active slot left `read_snapshot_table` failing for the previous generation, which
+	// sets `walk_damage`, which `derive_free` reports as `Corrupt`, which `fsck` counts as one
+	// checksum failure with no path to name.
+	//
+	// That is what the comment in `a_pinned_snapshots_undecodable_stream_is_reported` recorded as a
+	// guess about `read_block_csum_aware`. It is not the reader: it is a generation the fixture was
+	// not editing.
+	let other = 1 - slot;
+	let previous = parse_superblock(&dev.blocks[other * BLOCK_SIZE..(other + 1) * BLOCK_SIZE]);
+	if previous.is_some_and(|sb| sb.snap_root as usize * BLOCK_SIZE == snap_start) {
+		forge_superblock(dev, other, |sb| sb[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&snap_crc.to_le_bytes()));
+	}
 }
 
 fn first_extent_of_snapshot(dev: &MemDevice, index: usize) -> (u64, u64) {
@@ -4039,11 +4062,30 @@ fn a_check_that_could_not_run_is_a_fault_not_a_clean_report() {
 	assert!(mentions(&faults, b"memory to check this directory"), "a check that could not run says so: {faults:?}");
 	// and the whole report carries it, so no caller reads a directory that was skipped as
 	// a directory that passed.
-	let report = {
-		let _armed = fail_allocation_after(6);
-		fs.fsck().unwrap()
-	};
-	assert!(report.structural_failures > 0, "the report counts what it could not check: {:?}", report.faults);
+	//
+	// SWEPT RATHER THAN TUNED. This named one budget, chosen by counting the allocations the pass
+	// made at the time - so making one more allocation fallible moved the number and the test failed
+	// for a reason that was not about what it asserts. What it means is "there is a budget that lands
+	// inside the directory walk", and sweeping says exactly that while also requiring that no budget
+	// aborts or answers a clean report it did not earn.
+	let mut reported = false;
+	for budget in 0..40 {
+		let outcome = {
+			let _armed = fail_allocation_after(budget);
+			fs.fsck()
+		};
+		match outcome {
+			// Refused before it could report anything, which is the other legal answer.
+			Err(FsError::NoMemory) => {}
+			Err(other) => panic!("budget {budget}: a short allocation must not be reported as {other:?}"),
+			Ok(report) => {
+				if report.structural_failures > 0 {
+					reported = true;
+				}
+			}
+		}
+	}
+	assert!(reported, "some budget lands inside the directory walk, and the report counts what it could not check");
 }
 
 #[test]
@@ -4082,7 +4124,7 @@ fn a_mount_that_runs_short_inside_the_namespace_walk_refuses_rather_than_aborts(
 	let dev = fs.into_device();
 	let mut refused = 0u32;
 	let mut mounted = 0u32;
-	for budget in 0..40usize {
+	for budget in 0..64usize {
 		let attempt = dev.clone();
 		let _armed = fail_allocation_after(budget);
 		match LiberFs::mount(attempt) {
@@ -4093,6 +4135,38 @@ fn a_mount_that_runs_short_inside_the_namespace_walk_refuses_rather_than_aborts(
 	}
 	assert!(refused > 0, "no budget in the sweep produced a refusal, so nothing here was exercised");
 	assert!(mounted > 0, "no budget in the sweep completed a mount, so the sweep never reached the walk");
+
+	// AND THE BUDGETS REACH THE WALK, which is what this test is named for and could not show.
+	//
+	// The alias set did not go through the injected allocator: it called `Vec::try_reserve` directly,
+	// so every budget above landed on the free map, the pinned map and the other `try_zeroed` calls,
+	// and none of them on the allocation the comment at the top of this test is about. A test that
+	// names a specific allocation and cannot fail it is a check that passes for a reason other than
+	// the one it states.
+	//
+	// The evidence is a COUNT that moves with the namespace: the walk pushes one inode number per
+	// reachable inode, so a volume with more files takes strictly more allocations to mount. Nothing
+	// else on the mount path scales with the file count.
+	let wide = smallest_budget_that_mounts(&dev);
+	let mut narrow_fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	for i in 0..12u32 {
+		narrow_fs.write_file(alloc::format!("f{i}").as_bytes(), b"payload").unwrap();
+	}
+	let narrow = smallest_budget_that_mounts(&narrow_fs.into_device());
+	assert!(wide - narrow >= 12, "twelve more files cost at least twelve more allocations ({narrow} against {wide}) - one per extra inode, which is the alias set being allocated through the injector at all. Nothing that scales with the FILE COUNT rather than the block count is allocated any other way here.");
+}
+
+// The smallest allocation budget under which a mount completes: one more than the number of
+// allocations the mount makes.
+fn smallest_budget_that_mounts(dev: &MemDevice) -> usize {
+	for budget in 0..512usize {
+		let attempt = dev.clone();
+		let _armed = fail_allocation_after(budget);
+		if LiberFs::mount(attempt).is_ok() {
+			return budget;
+		}
+	}
+	panic!("no budget under 512 mounts this volume");
 }
 
 #[test]

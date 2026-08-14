@@ -3265,10 +3265,16 @@ fn an_exfat_set_with_a_trailing_vendor_entry_is_handled_whole() {
 	// Tested at the PARSER, which is where the decision is: building a patched image to reach it
 	// would prove the same thing through three more layers of fixture.
 	//
-	// Two cases, answered differently. A BENIGN vendor entry (type bit 5 set) is a set this reader
-	// understands well enough to modify, so its records are inside the range unlink clears. An
-	// unrecognised CRITICAL one makes the whole set unrecognised, and the answer is read-only.
-	for (label, kind, read_only) in [("benign vendor extension", 0xE0u8, false), ("unknown critical secondary", 0x9Au8, true)] {
+	// THREE CASES, ANSWERED THE SAME WAY. This used to answer benign and critical differently, on
+	// the reasoning that a benign record is "preserved by being left alone" - and the case that
+	// matters is `0xE1`, Vendor Allocation: a BENIGN secondary that owns its own clusters, which an
+	// overwrite drops and a remove leaks. So any record this driver does not emit makes the set
+	// read-only, whichever side of bit 5 it falls on.
+	//
+	// `0xE1` is the one the fixture set used to bracket without covering: `0xE0` owns nothing and
+	// `0x9A` was already refused.
+	for (label, kind) in [("benign vendor extension", 0xE0u8), ("vendor ALLOCATION, which owns clusters", 0xE1u8), ("unknown critical secondary", 0x9Au8)] {
+		let read_only = true;
 		let name: Vec<u16> = "A".encode_utf16().collect();
 		let upcase = crate::dir::Upcase::ascii();
 		let mut set: Vec<u8> = alloc::vec![0u8; 32 * 4];
@@ -3340,4 +3346,86 @@ fn a_ranged_read_answers_what_the_whole_file_read_refuses() {
 		}
 	}
 	assert!(swept >= 2, "the sweep reached only {swept} filesystems");
+}
+
+#[test]
+fn a_ranged_read_refuses_a_cyclic_chain_the_way_a_whole_read_does() {
+	// THE INVARIANT THE NEW READER DID NOT INHERIT. `read_file` has refused cycles since the first
+	// audit and has the test above; `read_file_range` was written beside it with Floyd detection on
+	// the SKIP and none on the read loop, and its comment said the walk was "bounded by the same
+	// Floyd cycle detection every other walk in this file uses" - which was true of half of it.
+	//
+	// At offset 0 the skip does not execute at all, so the half that had the detection never ran:
+	// a self-loop was read twice and reported as two clusters of file. The offsets below are the two
+	// that matter - before the cycle, and inside it.
+	fn build(data: &'static [u8]) -> Vec<u8> {
+		build_fat(Kind::Fat16, &[File { path: "LOOP.BIN", data }])
+	}
+	let fat_off = 512;
+	let mut buffer = alloc::vec![0u8; 4 * 512];
+
+	// The self-loop, read for two clusters.
+	let mut img = build(&[0xABu8; 2 * 512]);
+	let root_off = classic_root_off(&img);
+	let first = u16::from_le_bytes([img[root_off + 26], img[root_off + 27]]) as usize;
+	img_set_fat16(&mut img, fat_off, first, first as u16);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert!(matches!(fs.read_file_range(b"LOOP.BIN", 0, &mut buffer[..2 * 512]), Err(FsError::Invalid | FsError::Corrupt)), "a self-pointing cluster read from offset 0 handed back the same cluster twice");
+	assert!(matches!(fs.read_file_range(b"LOOP.BIN", 512, &mut buffer[..512]), Err(FsError::Invalid | FsError::Corrupt)), "and from inside the cycle");
+
+	// And the two-cluster cycle, which is the shape a step budget is least able to see.
+	let mut img = build(&[0xABu8; 4 * 512]);
+	let first = u16::from_le_bytes([img[root_off + 26], img[root_off + 27]]) as usize;
+	img_set_fat16(&mut img, fat_off, first, first as u16 + 1);
+	img_set_fat16(&mut img, fat_off, first + 1, first as u16);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert!(matches!(fs.read_file_range(b"LOOP.BIN", 0, &mut buffer[..4 * 512]), Err(FsError::Invalid | FsError::Corrupt)), "A -> B -> A from offset 0");
+	assert!(matches!(fs.read_file_range(b"LOOP.BIN", 2 * 512, &mut buffer[..2 * 512]), Err(FsError::Invalid | FsError::Corrupt)), "and from inside it");
+}
+
+#[test]
+fn an_exfat_root_carrying_a_critical_primary_this_driver_does_not_know_refuses_at_mount() {
+	// THE REFUSAL THAT WAS IN A FUNCTION THE MOUNT DID NOT CALL. `exfat_bitmap` held it, and its own
+	// comment said "refusing at the mount is where every other hostile-media decision in this file
+	// is made, and `exfat_bitmap` is the first thing the mount asks for" - which the mount did not
+	// do. It read the boot sector, loaded the up-case table and tested the dirty flag, so a volume
+	// whose root carried `0x84` mounted, listed and read, and was refused only when something needed
+	// free space.
+	let good = build_exfat(ROOT);
+	assert!(FatFs::mount(MemDisk { data: good.clone() }).is_some(), "the fixture itself must mount");
+
+	// The root's first free slot, after the entries the fixture writes.
+	// The root is cluster 3, which is one cluster past the heap start (cluster 2 is the bitmap).
+	// 24 reserved sectors + 1 FAT sector, 512-byte clusters, matching `build_exfat_tree`.
+	let heap = 25usize;
+	let root_off = (heap + 1) * 512;
+	// ASSERTED RATHER THAN ASSUMED: a wrong offset would put the damage below the root, and every
+	// assertion below would pass over a volume nothing had been done to.
+	assert_eq!(good[root_off], 0x81, "the root starts with the Allocation Bitmap entry");
+	assert_eq!(good[root_off + 32], 0x82, "and the Up-case Table follows it");
+	for (label, kind) in [("an unknown critical primary", 0x84u8), ("another one", 0x90u8)] {
+		let mut img = good.clone();
+		let mut at = root_off;
+		while img[at] != 0x00 {
+			at += 32;
+		}
+		img[at] = kind;
+		assert!(FatFs::mount(MemDisk { data: img }).is_none(), "{label} in the root refuses the mount");
+	}
+
+	// And a second Up-case Table, which used to be resolved by position - the same defect the
+	// bitmap fix was written for, one entry type over.
+	let mut img = good.clone();
+	let mut at = root_off;
+	while img[at] != 0x00 {
+		at += 32;
+	}
+	let mut upcase = root_off;
+	while img[upcase] != 0x82 {
+		upcase += 32;
+	}
+	let (source, destination) = (upcase, at);
+	let record: [u8; 32] = img[source..source + 32].try_into().expect("one entry");
+	img[destination..destination + 32].copy_from_slice(&record);
+	assert!(FatFs::mount(MemDisk { data: img }).is_none(), "two Up-case Tables is a volume outside its own format, not a choice to make");
 }

@@ -162,6 +162,61 @@ struct Geometry {
 // terminator is all thirty-two bits set and nothing less.
 const EXFAT_EOC: u32 = 0xFFFF_FFFF;
 
+// A walk along one cluster chain, with the four things every walk in this file has to get right:
+// the cluster is inside the volume, it is not an end marker, a `NoFatChain` file advances by
+// arithmetic and a chained one by its links, and a chain that loops back on itself is caught.
+//
+// A TYPE RATHER THAN A PATTERN. `read_file`, `read_file_range`, `read_chain`, `read_chain_to_end`,
+// the free path and the grow path each re-implemented all four, and the sixth author to write it
+// forgot one: `read_file_range`'s Floyd detection bounded the SKIP to the offset and its read loop
+// had none, so a self-loop read at offset 0 handed the caller the same cluster twice and called it
+// a file. The comment above it said the walk was "bounded by the same Floyd cycle detection every
+// other walk in this file uses", which was true of half of it.
+struct ChainCursor {
+	cluster: u32,
+	// Floyd's slow pointer: one link for every two the walk takes, so a cycle is caught in the
+	// length of the cycle rather than by a step budget - which cannot tell repetition from length.
+	slow: u32,
+	steps: u64,
+	no_fat_chain: bool,
+	max: u32,
+}
+
+impl ChainCursor {
+	fn new(first: u32, no_fat_chain: bool, max: u32) -> Self {
+		Self { cluster: first, slow: first, steps: 0, no_fat_chain, max }
+	}
+
+	// The cluster this cursor is on, or why it is not one: outside the volume, below the first data
+	// cluster, or the end of the chain.
+	fn current<D: BlockDevice>(&self, fs: &FatFs<D>) -> Result<u32, FsError> {
+		if self.cluster < 2 || self.cluster > self.max || fs.is_end(self.cluster) {
+			return Err(FsError::Corrupt);
+		}
+		Ok(self.cluster)
+	}
+
+	// Step to the next cluster. `Invalid` for a chain that loops back on itself.
+	fn advance<D: BlockDevice>(&mut self, fs: &mut FatFs<D>) -> Result<(), FsError> {
+		if self.no_fat_chain {
+			self.cluster = self.cluster.checked_add(1).ok_or(FsError::Invalid)?;
+			return Ok(());
+		}
+		self.cluster = fs.next_cluster(self.cluster)?;
+		self.steps += 1;
+		if self.steps % 2 == 0 {
+			self.slow = fs.next_cluster(self.slow)?;
+		}
+		if self.cluster >= 2 && self.cluster == self.slow {
+			return Err(FsError::Invalid);
+		}
+		if self.steps > self.max as u64 {
+			return Err(FsError::Invalid);
+		}
+		Ok(())
+	}
+}
+
 pub struct FatFs<D: BlockDevice> {
 	dev: D,
 	geo: Geometry,
@@ -181,6 +236,9 @@ pub struct FatFs<D: BlockDevice> {
 	// implementation must use the one it finds; the classic families fold ASCII by rule, so they
 	// get a table that says exactly that.
 	upcase: dir::Upcase,
+	// What the mount's scan of the exFAT root established: where the Allocation Bitmap is. None on
+	// the classic families, which have no root to scan.
+	exfat_root: Option<ExfatRoot>,
 }
 
 // Why a directory swap failed, and whether the new entry may already be on the medium.
@@ -202,6 +260,13 @@ pub struct FatFs<D: BlockDevice> {
 // So the error is derived from `placed` rather than passed alongside it, in one place, and the mount
 // goes degraded with it: `ensure_writable` consults that flag, so the refusal sticks for every later
 // mutation rather than only for the call that discovered it.
+// What one scan of the exFAT root established, so nothing re-derives it per operation.
+#[derive(Clone, Copy)]
+struct ExfatRoot {
+	bitmap_first: u32,
+	bitmap_size: u64,
+}
+
 struct SwapFailure {
 	error: FsError,
 	placed: bool,
@@ -256,12 +321,14 @@ impl<D: BlockDevice> FatFs<D> {
 		if !dev.read_block(heap_end * ratio - 1, &mut last) {
 			return None;
 		}
-		let mut fs = FatFs { dev, geo, clock: 0, degraded: false, upcase: dir::Upcase::ascii() };
+		let mut fs = FatFs { dev, geo, clock: 0, degraded: false, upcase: dir::Upcase::ascii(), exfat_root: None };
 		// An exFAT volume without a readable Up-case Table is refused rather than mounted with a
 		// guess: every name decision on it - lookup, collision, the hash written into an entry set -
 		// would be this driver's opinion instead of the volume's, and the damage is silent.
 		if fs.geo.kind == Kind::ExFat {
-			fs.upcase = fs.load_upcase().ok()?;
+			let (root, upcase) = fs.scan_exfat_root().ok()?;
+			fs.exfat_root = Some(root);
+			fs.upcase = upcase;
 			// VolumeDirty already set means the last writer never finished: the metadata may be
 			// mid-transaction. Mounting it read-only is what the flag is FOR - writing over a
 			// volume in that state is how a recoverable inconsistency becomes an unrecoverable one.
@@ -377,47 +444,53 @@ impl<D: BlockDevice> FatFs<D> {
 			buffer[..want].fill(0);
 			return Ok(want);
 		}
-		let want = want.min((readable - offset) as usize);
+		// A read that CROSSES the ValidDataLength gets its tail zeroed here rather than being cut
+		// short. It used to be truncated to the VDL, so a caller reading across it got fewer bytes
+		// than it asked for inside a file it had not reached the end of, and had to call again to be
+		// told zeros - while `read_file_bounded`, reading the same volume, zero-filled in one answer.
+		// Two readers of one volume disagreeing about what is past the VDL is the defect; which of
+		// the two behaviours is right is a separate and easier question.
+		let from_disk = (readable - offset) as usize;
+		if want > from_disk {
+			buffer[from_disk..want].fill(0);
+		}
+		// `answer` is what the caller is told - the disk bytes plus the zeroed tail - and `want` is
+		// how far the read loop below goes.
+		let answer = want;
+		let want = want.min(from_disk);
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as u64;
 		let max = self.max_cluster();
-		// Walk to the cluster holding `offset`. NoFatChain files are contiguous, so the walk is
-		// arithmetic; a chained file follows its links, bounded by the same Floyd cycle detection
-		// every other walk in this file uses.
+		// ONE CURSOR FOR THE SKIP AND THE READ. The skip walked with Floyd detection and the read
+		// loop had none, so a chain that loops back on itself was refused only when the caller asked
+		// for an offset far enough in to walk it - and at offset 0 the skip does not run at all, so
+		// a self-loop was read twice and reported as two clusters of file.
 		let skip = offset / cluster_bytes;
-		let mut cluster = entry.first_cluster;
+		let mut chain = ChainCursor::new(entry.first_cluster, entry.no_fat_chain, max);
 		if entry.no_fat_chain {
-			cluster = cluster.checked_add(u32::try_from(skip).map_err(|_| FsError::Invalid)?).ok_or(FsError::Invalid)?;
+			// Contiguous: the skip is arithmetic, and one `checked_add` says so better than `skip`
+			// steps that cannot fail differently.
+			chain.cluster = chain.cluster.checked_add(u32::try_from(skip).map_err(|_| FsError::Invalid)?).ok_or(FsError::Invalid)?;
 		} else {
-			let mut slow = cluster;
-			for step in 0..skip {
-				if cluster < 2 || cluster > max || self.is_end(cluster) {
-					return Err(FsError::Corrupt);
-				}
-				cluster = self.next_cluster(cluster)?;
-				if step % 2 == 1 {
-					slow = self.next_cluster(slow)?;
-				}
-				if cluster >= 2 && cluster == slow {
-					return Err(FsError::Invalid);
-				}
+			for _ in 0..skip {
+				chain.current(self)?;
+				chain.advance(self)?;
 			}
 		}
 		let mut done = 0usize;
 		let mut scratch = vec![0u8; cluster_bytes as usize];
 		let mut within = (offset % cluster_bytes) as usize;
 		while done < want {
-			if cluster < 2 || cluster > max || self.is_end(cluster) {
-				return Err(FsError::Corrupt);
-			}
+			let cluster = chain.current(self)?;
 			let sec = self.cluster_fs_sector(cluster);
 			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut scratch)?;
 			let take = (cluster_bytes as usize - within).min(want - done);
 			buffer[done..done + take].copy_from_slice(&scratch[within..within + take]);
 			done += take;
 			within = 0;
-			cluster = if entry.no_fat_chain { cluster.checked_add(1).ok_or(FsError::Invalid)? } else { self.next_cluster(cluster)? };
+			chain.advance(self)?;
 		}
-		Ok(done)
+		debug_assert_eq!(done, want, "the read loop fills exactly the disk-backed part");
+		Ok(answer)
 	}
 
 	pub fn read_file_bounded(&mut self, path: &[u8], limit: usize) -> Result<Vec<u8>, FsError> {
@@ -655,13 +728,9 @@ impl<D: BlockDevice> FatFs<D> {
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let max = self.max_cluster();
 		let mut out: Vec<u8> = Vec::new();
-		let mut cluster = first;
-		let mut slow = first;
-		let mut guard = 0u32;
-		while cluster >= 2 && !self.is_end(cluster) {
-			if cluster > max {
-				return Err(FsError::Invalid);
-			}
+		// Through `ChainCursor`, as every other walk in this file now is.
+		let mut chain = ChainCursor::new(first, false, max);
+		while let Ok(cluster) = chain.current(self) {
 			// BEFORE the read, not after the buffer holds it. This is the whole difference.
 			if out.len().saturating_add(cluster_bytes) > cap {
 				return Err(FsError::TooLarge);
@@ -670,19 +739,7 @@ impl<D: BlockDevice> FatFs<D> {
 			let mut buf = vec![0u8; cluster_bytes];
 			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut buf)?;
 			out.extend_from_slice(&buf);
-			cluster = self.next_cluster(cluster)?;
-			guard += 1;
-			if guard % 2 == 0 {
-				slow = self.next_cluster(slow)?;
-			}
-			// Floyd, as in `read_chain`: a chain that loops back on itself is caught in the length
-			// of the cycle rather than by a step budget, which cannot tell repetition from length.
-			if cluster >= 2 && cluster == slow {
-				return Err(FsError::Invalid);
-			}
-			if guard > max {
-				return Err(FsError::Invalid);
-			}
+			chain.advance(self)?;
 		}
 		Ok(out)
 	}
@@ -694,7 +751,6 @@ impl<D: BlockDevice> FatFs<D> {
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let max = self.max_cluster();
 		let mut out: Vec<u8> = Vec::new();
-		let mut cluster = first;
 		// Floyd over the chain: `slow` follows one link for every two the read takes, so a chain
 		// that loops back on itself is caught in the length of the cycle.
 		//
@@ -705,12 +761,9 @@ impl<D: BlockDevice> FatFs<D> {
 		// no limit at all (the exFAT root, the allocation bitmap) grew the buffer a cluster at a
 		// time until the budget tripped at `cluster_count`, which on a real volume is an enormous
 		// allocation performed on behalf of a medium the driver does not trust.
-		let mut slow = first;
-		let mut guard = 0u32;
-		while cluster >= 2 && !self.is_end(cluster) {
-			if cluster > max {
-				return Err(FsError::Invalid);
-			}
+		// Through `ChainCursor`, which is where all four of those rules live now.
+		let mut chain = ChainCursor::new(first, false, max);
+		while let Ok(cluster) = chain.current(self) {
 			let sec = self.cluster_fs_sector(cluster);
 			let mut buf = vec![0u8; cluster_bytes];
 			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut buf)?;
@@ -718,17 +771,7 @@ impl<D: BlockDevice> FatFs<D> {
 			if out.len() >= limit {
 				break;
 			}
-			cluster = self.next_cluster(cluster)?;
-			guard += 1;
-			if guard % 2 == 0 {
-				slow = self.next_cluster(slow)?;
-			}
-			if cluster >= 2 && cluster == slow {
-				return Err(FsError::Invalid);
-			}
-			if guard > max {
-				return Err(FsError::Invalid);
-			}
+			chain.advance(self)?;
 		}
 		// A chain that ended before it produced the bytes it was read for is a truncated file, not
 		// a short one: the entry's own length says how much is there and the FAT does not have it.
@@ -1805,15 +1848,67 @@ impl<D: BlockDevice> FatFs<D> {
 	// the FORMATTER wrote, so a driver that folds by its own rule computes different name hashes
 	// and different collisions than the system the medium came from - a file written here with a
 	// non-ASCII name is listable there and not openable by name.
-	fn load_upcase(&mut self) -> Result<dir::Upcase, FsError> {
+	// ONE SCAN OF THE ROOT, AT MOUNT, VALIDATED WHOLE.
+	//
+	// This was two functions. `load_upcase` read the whole root looking for `0x82` and stopped at the
+	// first one; `exfat_bitmap` read the whole root again, enforced the critical-primary rule and
+	// required exactly one `0x81`. Each enforced a different subset of the root's rules, which is how
+	// one of them came to hold a rule that belongs to the mount: `exfat_bitmap`'s own comment said
+	// "refusing at the mount is where every other hostile-media decision in this file is made, and
+	// `exfat_bitmap` is the first thing the mount asks for" - and the mount did not ask for it. It
+	// called `load_upcase` and read the dirty flag, so a volume whose root carried `0x84`, a critical
+	// primary this driver does not know, mounted, listed and read, and was refused only when
+	// something needed free space.
+	//
+	// And the up-case table was chosen by POSITION, which is the same defect the bitmap fix was
+	// written for, one entry type over: the format allows exactly one `0x82`, this took the first and
+	// never looked at the rest.
+	fn scan_exfat_root(&mut self) -> Result<(ExfatRoot, dir::Upcase), FsError> {
 		let bytes = self.read_dir_bytes(&Dir::at(self.geo.root_cluster))?;
+		let mut bitmap: Option<(u32, u64)> = None;
+		let mut upcase: Option<(u32, u32, u64)> = None;
 		let mut i = 0;
 		while i + 32 <= bytes.len() {
 			let e = &bytes[i..i + 32];
 			if e[0] == 0x00 {
 				break;
 			}
+			// AN UNRECOGNISED CRITICAL PRIMARY MAKES THE VOLUME INVALID.
+			//
+			// A primary is in use (bit 7) and not secondary (bit 6 clear); benign is bit 5. So the
+			// critical primaries are `0x80..=0x9F`, of which this reader knows `0x81` (Allocation
+			// Bitmap), `0x82` (Up-case Table), `0x83` (Volume Label) and `0x85` (File). Anything
+			// else in that range is a structure the volume says the reader must understand, and
+			// listing the volume anyway is operating on a layout this driver does not know.
+			if e[0] & 0xE0 == 0x80 && !matches!(e[0], 0x81 | 0x82 | 0x83 | 0x85) {
+				return Err(FsError::Invalid);
+			}
+			if e[0] == 0x81 {
+				// THE FLAGS AND THE COUNT, not the type byte alone.
+				//
+				// With one FAT there is exactly one Allocation Bitmap and its BitmapIdentifier (bit
+				// 0 of the flags) says it is the first. This mount already refuses `NumberOfFats
+				// != 1`, so the rule it needs is the simple one, and a second bitmap entry is a
+				// volume outside its own format rather than a choice to make.
+				if e[1] & 0x01 != 0 || bitmap.is_some() {
+					return Err(FsError::Invalid);
+				}
+				// A RESERVED FIELD IS A FIELD WITH A REQUIRED VALUE, which is this file's standard
+				// for a parser of untrusted media: seven reserved bits above the identifier, and
+				// eighteen reserved bytes between the flags and the FirstCluster.
+				if e[1] & 0xFE != 0 || e[2..20].iter().any(|byte| *byte != 0) {
+					return Err(FsError::Invalid);
+				}
+				let first = u32::from_le_bytes([e[20], e[21], e[22], e[23]]);
+				let size = u64::from_le_bytes([e[24], e[25], e[26], e[27], e[28], e[29], e[30], e[31]]);
+				bitmap = Some((first, size));
+			}
 			if e[0] == 0x82 {
+				// EXACTLY ONE, for the same reason as the bitmap: a volume with two would be
+				// mounted against whichever came first.
+				if upcase.is_some() {
+					return Err(FsError::Invalid);
+				}
 				let stored = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
 				let first = u32::from_le_bytes([e[20], e[21], e[22], e[23]]);
 				let size = u64::from_le_bytes([e[24], e[25], e[26], e[27], e[28], e[29], e[30], e[31]]);
@@ -1822,66 +1917,30 @@ impl<D: BlockDevice> FatFs<D> {
 				if size == 0 || size > 2 * 0x1_0000 {
 					return Err(FsError::Invalid);
 				}
-				let cluster_bytes = self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64;
-				let cap = size.div_ceil(cluster_bytes).saturating_mul(cluster_bytes) as usize;
-				let mut table = self.read_chain(first, cap)?;
-				table.truncate(size as usize);
-				if dir::Upcase::checksum(&table) != stored {
-					return Err(FsError::Invalid);
-				}
-				return dir::Upcase::decode(&table).ok_or(FsError::Invalid);
+				upcase = Some((first, stored, size));
 			}
 			i += 32;
 		}
-		Err(FsError::Invalid)
+		let (bitmap_first, bitmap_size) = bitmap.ok_or(FsError::Invalid)?;
+		let (first, stored, size) = upcase.ok_or(FsError::Invalid)?;
+		let cluster_bytes = self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64;
+		let cap = size.div_ceil(cluster_bytes).saturating_mul(cluster_bytes) as usize;
+		let mut table = self.read_chain(first, cap)?;
+		table.truncate(size as usize);
+		if dir::Upcase::checksum(&table) != stored {
+			return Err(FsError::Invalid);
+		}
+		let decoded = dir::Upcase::decode(&table).ok_or(FsError::Invalid)?;
+		Ok((ExfatRoot { bitmap_first, bitmap_size }, decoded))
 	}
 
+	// WHERE THE BITMAP IS, as the mount's own scan of the root recorded it.
+	//
+	// This used to re-read and re-validate the whole root on every allocation and free. The rules it
+	// enforced belong to the mount and are enforced there now; what is left is the answer.
 	fn exfat_bitmap(&mut self) -> Result<(u32, u64), FsError> {
-		let bytes = self.read_dir_bytes(&Dir::at(self.geo.root_cluster))?;
-		let mut found: Option<(u32, u64)> = None;
-		let mut i = 0;
-		while i + 32 <= bytes.len() {
-			let e = &bytes[i..i + 32];
-			if e[0] == 0x00 {
-				break;
-			}
-			// AN UNRECOGNISED CRITICAL PRIMARY MAKES THE VOLUME INVALID, and this loop skipped one.
-			//
-			// A primary is in use (bit 7) and not secondary (bit 6 clear); benign is bit 5. So the
-			// critical primaries are `0x80..=0x9F`, of which this reader knows `0x81` (Allocation
-			// Bitmap), `0x82` (Up-case Table), `0x83` (Volume Label) and `0x85` (File). Anything
-			// else in that range is a structure the volume says the reader must understand, and
-			// listing the volume anyway is operating on a layout this driver does not know.
-			//
-			// Refusing at the mount is where every other hostile-media decision in this file is
-			// made, and `exfat_bitmap` is the first thing the mount asks for.
-			if e[0] & 0xE0 == 0x80 && !matches!(e[0], 0x81 | 0x82 | 0x83 | 0x85) {
-				return Err(FsError::Invalid);
-			}
-			if e[0] == 0x81 {
-				// THE FLAGS AND THE COUNT, not the type byte alone.
-				//
-				// This took the FIRST entry whose type is `0x81` and read its cluster and length. On
-				// a corrupt or hostile volume with two such entries the driver would allocate
-				// against whichever came first - a stale bitmap, chosen by position.
-				//
-				// With one FAT there is exactly one Allocation Bitmap and its BitmapIdentifier (bit
-				// 0 of the flags) says it is the first. This mount already refuses `NumberOfFats
-				// != 1`, so the rule it needs is the simple one, and a second bitmap entry is a
-				// volume outside its own format rather than a choice to make.
-				if e[1] & 0x01 != 0 {
-					return Err(FsError::Invalid);
-				}
-				if found.is_some() {
-					return Err(FsError::Invalid);
-				}
-				let first = u32::from_le_bytes([e[20], e[21], e[22], e[23]]);
-				let size = u64::from_le_bytes([e[24], e[25], e[26], e[27], e[28], e[29], e[30], e[31]]);
-				found = Some((first, size));
-			}
-			i += 32;
-		}
-		found.ok_or(FsError::Invalid)
+		let root = self.exfat_root.ok_or(FsError::Invalid)?;
+		Ok((root.bitmap_first, root.bitmap_size))
 	}
 
 	// Allocate `n` clusters from the bitmap into a FAT-linked chain, returning them in

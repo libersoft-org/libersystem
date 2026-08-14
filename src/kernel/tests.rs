@@ -1303,7 +1303,7 @@ extern "C" fn user_nx_thread_body(_arg: u64) {
 fn device_privilege() -> u64 {
 	use object::privilege::{Privilege, PrivilegeKind};
 	let thread = sched::current_thread().expect("a current thread");
-	let privilege = Privilege::create(PrivilegeKind::DeviceManager);
+	let privilege = Privilege::create(PrivilegeKind::DeviceManager).expect("a test privilege");
 	thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL, 0).expect("the privilege installs").raw()
 }
 
@@ -3823,7 +3823,7 @@ fn spawn_dynamic_test_process(domain: alloc::sync::Arc<object::domain::Domain>, 
 
 	let volume = volume_package_bytes().expect("volume package present");
 	let package = pkg::Package::parse(volume).expect("volume package parses");
-	let process = object::process::Process::new(object::address_space::AddressSpace::create().expect("dynamic test address space"), domain);
+	let process = object::process::Process::new(object::address_space::AddressSpace::create().expect("dynamic test address space"), domain).expect("dynamic test process");
 	let elf = bootproto::elf::Elf::parse(main).expect("dynamic test main is ELF");
 	let dynamic = elf.dynamic_info().expect("main dynamic metadata parses").expect("main has PT_DYNAMIC");
 	let mut loaded = alloc::vec::Vec::new();

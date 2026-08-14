@@ -40,13 +40,20 @@ pub struct Func {
 	pub body: Vec<u8>,
 }
 
-// The kind of item an export names. Only functions and memory are tracked; any
-// other export kind is recorded as `Other` and ignored.
+// The kind of item an export names. THE FOUR THE FORMAT DEFINES, each named.
+//
+// `0x00` and `0x02` were mapped and everything else - including an undefined byte like `0xff` -
+// became one `Other` the validator matched with `_ => {}`. So "a table export this engine does not
+// support", "a global export this engine does not support" and "a byte the format does not define"
+// were one answer, and the answer was to accept it unvalidated under a name that means "ignored".
+// That is the hole in this milestone's claim that every static index is checked before an instance
+// exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportKind {
 	Func,
+	Table,
 	Memory,
-	Other,
+	Global,
 }
 
 // An export: a name bound to an item by index.

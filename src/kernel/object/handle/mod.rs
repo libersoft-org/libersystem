@@ -171,6 +171,7 @@ fn retire_or_recycle(slot: &mut Slot, free: &mut Vec<u32>, index: usize) {
 	match slot.generation.checked_add(1) {
 		Some(next) => {
 			slot.generation = next;
+			// ALLOC-OK: the free list of a table that already holds this slot - it shrank by one on the way in, so the push reuses that capacity.
 			free.push(index as u32);
 		}
 		None => slot.generation = u32::MAX,
@@ -424,6 +425,7 @@ impl HandleTable {
 				if !cap.is_valid() {
 					continue;
 				}
+				// ALLOC-OK: the inspection buffer is reserved by its caller from the table's own length before this runs.
 				out.push(HandleInfo::from_cap(cap));
 			}
 		}
@@ -489,6 +491,7 @@ impl HandleTable {
 	// why the rollback path has to hand the caller its new handles rather than pretending
 	// nothing happened.
 	pub fn put_back(&mut self, cap: Capability) -> Handle {
+		// ALLOC-OK: `HandleTable::insert`, not a collection insert - the table's own growth is reserved by its callers and checked where it happens.
 		self.insert(cap)
 	}
 
@@ -575,6 +578,7 @@ impl HandleTable {
 		}
 		// The slot vanished under us, which nothing in this kernel does while a table is locked.
 		// Reissuing is still better than dropping the capability on the floor.
+		// ALLOC-OK: `HandleTable::insert`, not a collection insert - the table's own growth is reserved by its callers and checked where it happens.
 		self.insert(cap);
 	}
 
@@ -653,6 +657,8 @@ impl HandleTable {
 				slot.generation == u32::MAX
 			};
 			if !retired {
+				// ALLOC-OK: the free list of a table that already holds this slot - it shrank by one on the way in, so the push reuses that capacity.
+				// ALLOC-OK: the free list of a table that already holds this slot - it shrank by one on the way in, so the push reuses that capacity.
 				self.free.push(index as u32);
 			}
 		}

@@ -667,3 +667,33 @@ fn every_generated_message_boundary_ends_with_finish() {
 	assert!(rust.contains("if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {"), "a bare stream-open reply ends too");
 	assert!(rust.contains("let _ = r.u32()?;\n\t\t\t\t\tr.finish()?;"), "and so does the Ok arm of a guarded one");
 }
+
+#[test]
+fn an_imported_two_capability_record_is_counted_as_two() {
+	// THE LAST PLACE THE COUNT WAS A WORD. `HandleCardinality` was `Zero | One | Many`, and the
+	// import mapping read `Many` as `Exact(MAX_HANDLES)` under a comment calling four "the
+	// conservative reading" - so an imported record carrying TWO capabilities was counted as four,
+	// and a local record combining it with another two-capability field was refused at six when the
+	// truth is four.
+	//
+	// It fails safe, which is why it survived: it rejects a valid schema rather than admitting an
+	// over-limit one, and nothing in the tree had written that schema. This is that schema.
+	let files = vec![
+		parse_only("package liber:app@1; use liber:shared@1.{pair}; record quad { left: pair, right: pair }"),
+		parse_only("package liber:shared@1; resource file; record pair { a: handle<file>, b: handle<file> }"),
+	];
+	let packages = resolve::resolve(&files).expect("resolve");
+	let app = packages.iter().find(|package| package.id.display() == "liber:app@1").unwrap();
+	let errors = validate::validate_resolved(&files[app.file], &app.imports);
+	assert!(errors.is_empty(), "two imported two-capability records are four capabilities, which the wire carries: {errors:?}");
+
+	// And the refusal still lands where it should: three of them is six, which it does not.
+	let files = vec![
+		parse_only("package liber:app@1; use liber:shared@1.{pair}; record six { a: pair, b: pair, c: pair }"),
+		parse_only("package liber:shared@1; resource file; record pair { a: handle<file>, b: handle<file> }"),
+	];
+	let packages = resolve::resolve(&files).expect("resolve");
+	let app = packages.iter().find(|package| package.id.display() == "liber:app@1").unwrap();
+	let errors = validate::validate_resolved(&files[app.file], &app.imports);
+	assert!(errors.iter().any(|error| error.msg.contains('6')), "and six is refused with the number it computed: {errors:?}");
+}

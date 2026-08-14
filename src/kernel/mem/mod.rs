@@ -81,6 +81,7 @@ pub fn set_hhdm_offset(offset: u64) {
 pub fn retain_memmap(regions: &[MemRegion]) {
 	let mut retained = MEMMAP.lock();
 	for region in regions {
+		// ALLOC-OK: the firmware memory map, read once at boot.
 		retained.push(abi::MemmapRegion { base: region.base, length: region.length, kind: region.kind, _pad: 0 });
 	}
 	publish_direct_map_limit(regions);
@@ -116,6 +117,7 @@ pub fn init(regions: &[MemRegion], hhdm: u64) {
 	crate::syscall::reserve_kernel_vmap();
 	let mut retained = MEMMAP.lock();
 	for region in regions {
+		// ALLOC-OK: the firmware memory map, read once at boot.
 		retained.push(abi::MemmapRegion { base: region.base, length: region.length, kind: region.kind, _pad: 0 });
 	}
 	publish_direct_map_limit(regions);

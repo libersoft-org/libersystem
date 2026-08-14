@@ -61,6 +61,7 @@ fn indent(depth: usize) {
 
 fn render_domain(node: &DomainNode, depth: usize) {
 	indent(depth);
+	// ALLOC-OK: the System Graph renderer writes to the serial log at the developer's request.
 	let limit: String = if node.memory_limit == UNLIMITED { String::from("inf") } else { alloc::format!("{}", node.memory_limit) };
 	let killed: &str = if node.killed { " (killed)" } else { "" };
 	crate::serial_println!("domain koid={} mem {}/{} handles {} threads {}{}", node.koid, node.memory_used, limit, node.handles_used, node.threads_used, killed);

@@ -608,7 +608,9 @@ name = "service-logic"
 version = "0.0.0"
 dependencies = [
  "abi",
+ "base-proto",
  "bootproto",
+ "wasm",
 ]
 
 [[package]]
@@ -780,6 +782,10 @@ dependencies = [
  "pcm",
  "tinyvec",
 ]
+
+[[package]]
+name = "wasm"
+version = "0.0.0"
 
 [[package]]
 name = "wav"

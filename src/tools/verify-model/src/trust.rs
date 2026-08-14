@@ -12,7 +12,7 @@
 
 use crate::shadow::Log;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -98,8 +98,39 @@ pub fn required_architectures(universe: crate::shadow::Universe) -> usize {
 // selection" there means building those parts, and the sweep builds every part anyway - so a scoped
 // build run would be a second full build for a sample the sweep has already effectively taken. The
 // day that stops being true, this is one line.
-fn exec_universes(universe: crate::shadow::Universe) -> bool {
-	matches!(universe, crate::shadow::Universe::TestGuest | crate::shadow::Universe::Host | crate::shadow::Universe::DevGuest)
+// What a component's clean evidence actually covers, beside how much of it there is.
+//
+// A certificate says "this component's scoped runs can be believed"; the design's criteria say that
+// sentence needs a scope. These are the parts of it the records can answer today.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct EvidenceScope {
+	pub records: usize,
+	// The classes of change the clean evidence was made over - source edits, manifest edits, test
+	// edits. Five perfect verifications of one class are not evidence about another.
+	pub change_kinds: Vec<String>,
+	// The graph edges the selector walked to reach this component in those runs.
+	pub edge_kinds: Vec<String>,
+	// Whether the model passed its own checks in every one of them - which `is_clean` already
+	// requires, so this is `true` whenever `records` is non-zero. Kept because the scope is a
+	// STATEMENT about what was proved, and "the model was sound throughout" is part of that
+	// statement even when another rule is what enforces it.
+	pub all_self_checked: bool,
+}
+
+// EVERY UNIVERSE WITH A PRODUCER, which is now all four.
+//
+// `HostBuild` was exempted on the reasoning that a full sweep builds everything anyway, so a scoped
+// build proves nothing new. That is true of the BUILD and false of the MECHANISM: the evidence
+// producer runs the catalog's commands one at a time - `./build.sh --arch X --part libs`, then
+// `--part user` - and the production runner groups them into `./build.sh --arch X --part a,b,c`.
+// Those are different code paths through the same script, and only the second one ships. A grouped
+// part list whose parser silently used only the first entry and exited zero would leave every
+// individual build check passing, every record clean, a certificate granted, and the scoped runner
+// building less than the selection said - which is exactly the defect that produced SHADOW-EXEC: a
+// planner naming Rust function names while the runner used stable IDs, every dry comparison clean,
+// found by hand.
+fn exec_universes(_universe: crate::shadow::Universe) -> bool {
+	true
 }
 
 impl Store {
@@ -203,6 +234,37 @@ impl Store {
 			return Err(String::from("no run has EXECUTED this selection - every comparison on record is dry, so they say the right set was chosen and nothing about whether running it works; ./verify.sh --shadow-exec produces the sample"));
 		}
 		Ok((clean, architectures))
+	}
+
+	// The criteria the RECORDS can already answer, which `evaluate` did not read.
+	//
+	// The frozen design named them - every relevant change class exercised, every relevant edge kind
+	// exercised, the regression corpus green in the run that produced the record - and the records
+	// have carried `change_kinds`, `edge_kinds` and `model_self_check` since the round that added
+	// them, under a comment saying the policy could not be written before there were records to
+	// grade. There are records now, and the data was being discarded at the point of judgement
+	// rather than at the point of collection.
+	//
+	// The reason it matters is the one distinctness only partly addresses: five perfect verifications
+	// of one KIND of change are not evidence about a different kind. Distinctness makes them five
+	// different decisions; this makes them five different KINDS of decision.
+	//
+	// Graded rather than required: what is returned is what the evidence covers, so a caller can say
+	// "trusted for source changes and manifest changes" instead of "trusted". A certificate that
+	// cannot name its own scope is the broad-certificate defect this milestone split `HostBuild` out
+	// to prevent, one level up.
+	pub fn evidence_scope(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe, log: &Log) -> EvidenceScope {
+		let mut change_kinds: BTreeSet<String> = BTreeSet::new();
+		let mut edge_kinds: BTreeSet<String> = BTreeSet::new();
+		let mut all_self_checked = true;
+		let mut records = 0usize;
+		for record in log.records.iter().filter(|record| Log::is_clean(record, component, model_hash, universe)) {
+			records += 1;
+			change_kinds.extend(record.change_kinds.iter().cloned());
+			edge_kinds.extend(record.edge_kinds.iter().cloned());
+			all_self_checked &= record.model_self_check;
+		}
+		EvidenceScope { records, change_kinds: change_kinds.into_iter().collect(), edge_kinds: edge_kinds.into_iter().collect(), all_self_checked }
 	}
 
 	pub fn grant(&mut self, component: &str, model_hash: &str, universe: crate::shadow::Universe, clean_runs: usize, architectures: Vec<String>, at: u64) {

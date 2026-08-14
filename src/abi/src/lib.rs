@@ -496,6 +496,23 @@ pub struct DeviceInfo {
 	pub class: u8,
 	pub subclass: u8,
 	pub prog_if: u8,
+	// EXPLICIT, for the same reason `_pad0` is - and this is the SAME DEFECT, recreated at the other
+	// end of the same struct by the change that added the three fields above.
+	//
+	// `prog_if` ends at offset 42 and the alignment is 8, so 42..47 belonged to nothing; `write_user`
+	// copies `size_of::<T>()` bytes and `sys_device_info` builds the value on the kernel stack, so
+	// six bytes of whatever the stack held there went to userspace.
+	//
+	// What makes this worth more than six bytes is that the layout assertion DID fire on that change
+	// - on the SIZE, which went 40 to 48 - and the belief it corrected was about where the fields
+	// would fit, not about what the tail became. "Size, alignment and every field offset are what
+	// they were" and "every byte of this struct belongs to a named field" are different properties,
+	// and the first was satisfied by a change that broke the second. `no_repr_c_struct_has_implicit_padding`
+	// is the second one, asserted over the whole crate rather than over this struct.
+	//
+	// Not `repr(packed)`: that would make `bar_len` unaligned and trade a disclosure for a soundness
+	// problem.
+	pub _pad1: [u8; 6],
 }
 
 // The framebuffer geometry framebuffer_map writes into the caller's buffer (the

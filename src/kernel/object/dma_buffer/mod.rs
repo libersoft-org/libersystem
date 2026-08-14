@@ -195,16 +195,18 @@ impl DmaBuffer {
 		// fallible, like every other metadata allocation sized from a caller's number.
 		let mut frames: Vec<u64> = Vec::new();
 		if frames.try_reserve_exact(pages).is_err() {
-			// SAFETY: the span was allocated by this call and has never been mapped, so it goes
-			// straight back rather than through `retire`.
 			for i in 0..pages as u64 {
+				// SAFETY: the span was allocated by this call and has never been mapped, so it
+				// goes straight back rather than through `retire`.
+				// NEVER-MAPPED: allocated a few lines above and refused before any mapping was
+				// made - the metadata vector this rollback is for is what failed.
 				unsafe { frame::deallocate(base + i * PAGE_SIZE) };
 			}
 			domain.uncharge_dma(bytes);
 			return Err(MemoryError::OutOfMemory);
 		}
 		frames.extend((0..pages as u64).map(|i| base + i * PAGE_SIZE));
-		Ok(Arc::new(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: domain.clone(), device, orphaned: AtomicBool::new(false) }))
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: domain.clone(), device, orphaned: AtomicBool::new(false) }).ok_or(MemoryError::OutOfMemory)
 	}
 
 	pub fn size(&self) -> usize {
@@ -272,6 +274,7 @@ impl DmaBuffer {
 	}
 
 	pub fn add_mapping(&self, cr3: u64, base: u64) {
+		// ALLOC-OK: one entry per address space this buffer is mapped into, bounded by the process count the Domain quota allows.
 		self.mappings.lock().push((cr3, base));
 	}
 

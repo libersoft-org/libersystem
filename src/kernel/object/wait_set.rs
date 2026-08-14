@@ -53,13 +53,14 @@ pub struct WaitSet {
 }
 
 impl WaitSet {
-	pub fn create() -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: None })
+	// FALLIBLY, here and in `create_in`: `SYS_WAITSET_CREATE` reaches them.
+	pub fn create() -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: None })
 	}
 
 	// The same, charging its memberships to `domain`. What `sys_waitset_create` builds.
-	pub fn create_in(domain: Arc<super::domain::Domain>) -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: Some(domain) })
+	pub fn create_in(domain: Arc<super::domain::Domain>) -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: Some(domain) })
 	}
 
 	// Add `object` to the set, registering the set as a persistent observer of it.

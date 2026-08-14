@@ -147,6 +147,26 @@ impl Echo<'_> {
 		let Some(t) = &mut self.term else {
 			return true;
 		};
+		// ZERO CELLS TO THE LEFT IS WHERE THE CARET ALREADY IS, and the only way to say that
+		// without disturbing the screen is to say nothing.
+		//
+		// `Ld::insert` echoes a character and then steps back over whatever follows the cursor,
+		// which for typing at the END of a line - most typing - is zero. `caret_index` deliberately
+		// counts the deferred wrap ("a glyph that filled the last column leaves the caret parked on
+		// it with the wrap owed, and the editor has already counted that column as printed"), which
+		// is right for MEASURING and wrong to feed back into an absolute move: CUP is a cursor
+		// movement, so `csi_dispatch`'s `b'H'` arm calls `cursor_moved()` and CANCELS the wrap.
+		//
+		// On an eight-column screen, typing the eighth character parked the caret on column 7 with
+		// the wrap owed; `move_left(0)` then addressed cell 8 - row 1, column 0 - and cleared it. The
+		// ninth glyph printed in the right place and `wrap[0]` was never set, because only
+		// `put_glyph`'s deferred-wrap branch sets it and that branch no longer ran. So a line the
+		// user typed continuously rendered as a hard newline and reverse-wrap backspace had no row
+		// to step onto. On the LAST row it was worse: `target / cols` was `rows`, the CUP arm
+		// clamped it to `rows - 1`, and the screen stopped scrolling altogether.
+		if n == 0 {
+			return true;
+		}
 		let cols: usize = t.screen.cols().max(1);
 		let here: usize = t.screen.caret_index();
 		if n > here {
@@ -446,10 +466,13 @@ impl Ld {
 		}
 	}
 
-	// The byte index where the character ending at `at` begins: `at` itself unless the byte before
-	// it is a UTF-8 continuation, in which case walk back over them. A lone continuation byte -
-	// which the medium can produce and this buffer can hold - stops after four steps rather than
-	// walking off the front.
+	// The byte index where the character BEFORE `at` begins: one character back, walking over UTF-8
+	// continuation bytes. A lone continuation byte - which the medium can produce and this buffer can
+	// hold - stops after four steps rather than walking off the front. `0` stays `0`.
+	//
+	// The comment used to say "`at` itself unless the byte before it is a UTF-8 continuation", and it
+	// never returns `at`: the loop decrements before it tests. Four callers depend on what it does
+	// and the fifth was written against what this said, and stepped back two characters per column.
 	fn char_start(&self, at: usize) -> usize {
 		let mut start = at;
 		let mut steps = 0;
@@ -572,7 +595,13 @@ impl Ld {
 		let back: usize = self.columns(0, self.cursor).min(cols);
 		let mut start: usize = self.cursor;
 		for _ in 0..back {
-			start = self.char_start(start.saturating_sub(1));
+			// ONE CHARACTER PER COLUMN. `char_start` decrements before it tests, so it already
+			// steps back a whole character - which is what its other four callers want. The extra
+			// `- 1` stepped back two, so the window opened a screenful earlier than intended and
+			// `e.cup(back / cols, back % cols)` then put the caret `back` cells from the wrong
+			// place: the rendered caret and `self.cursor` disagreed, which is the exact invariant
+			// this fallback exists to restore.
+			start = self.char_start(start);
 		}
 		e.cup(0, 0);
 		// Clear first, from the top-left, so nothing of the old rendering survives below the

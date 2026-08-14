@@ -5,7 +5,7 @@ use crate::{elf, sched};
 crate::tagged_test!(dynamic_symbol_names_accept_rust_mangling_with_a_bound, [Dynamic, Memory, Process], id = "kernel.object.process.dynamic_symbol_names_accept_rust_mangling_with_a_bound", covers = ["kernel"]);
 fn dynamic_symbol_names_accept_rust_mangling_with_a_bound() {
 	let address_space = AddressSpace::create().expect("address space");
-	let process = Process::new(address_space, sched::root_domain());
+	let process = Process::new(address_space, sched::root_domain()).expect("a test process");
 	let accepted = alloc::string::String::from_utf8(alloc::vec![b'x'; elf::MAX_DYNAMIC_SYMBOL_NAME]).expect("ASCII symbol");
 	assert!(process.register_dynamic_symbols(&[(accepted, 0x2000_1000)]), "the bounded Rust symbol is accepted");
 	let rejected = alloc::string::String::from_utf8(alloc::vec![b'y'; elf::MAX_DYNAMIC_SYMBOL_NAME + 1]).expect("ASCII symbol");
@@ -36,7 +36,7 @@ fn a_process_that_has_torn_down_never_gains_a_thread() {
 	extern "C" fn nothing(_: u64) {}
 
 	let address_space = AddressSpace::create().expect("address space");
-	let process = Process::new(address_space, sched::root_domain());
+	let process = Process::new(address_space, sched::root_domain()).expect("a test process");
 	let before = Thread::new(nothing, 0, process.clone()).expect("a live process takes a thread");
 	assert_eq!(process.live_threads().len(), 1, "the thread joined the process");
 	assert!(!process.is_terminating(), "the process is live");
@@ -84,7 +84,7 @@ fn the_lifecycle_guard_covers_the_whole_operation_and_not_just_its_first_line() 
 	use crate::mem::frame::PAGE_SIZE;
 	use crate::object::dma_buffer::DmaBuffer;
 
-	let process = Process::new(AddressSpace::create().expect("address space"), sched::root_domain());
+	let process = Process::new(AddressSpace::create().expect("address space"), sched::root_domain()).expect("a test process");
 
 	// 1 and 3. A buffer created under the guard, held only by this test - no handle table anywhere
 	//    names it - and registered while the process is live.

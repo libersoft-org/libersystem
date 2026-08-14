@@ -21,7 +21,10 @@ extern crate alloc;
 use ipc_client::ChannelTransport;
 use proto::system::{OpenOpts, picker, volume};
 use rt::*;
-use wasm::{Host, Instance, Trap, Value};
+use service_logic::world_errors::read_failure;
+// `Host` and `Trap` went with the private dispatch this host used to carry: the trait is
+// implemented by `WorldHost` now and the trap it used to answer a failed read with is a status.
+use wasm::{Instance, Value};
 
 // The single file the host grants the component (its whole "world"). The component
 // cannot name a file - it only calls `read`, and the host reads this one.
@@ -138,67 +141,97 @@ struct WasiServices {
 }
 
 impl wasm::world::WorldServices for WasiServices {
+	// A PASS-THROUGH, which is the shape `ComponentServices::read` already has.
+	//
+	// This used to collapse both helpers' answers into `Failed`, with a comment deferring the
+	// distinction to "the day this host's grants grow past two". That deferral was not about cost -
+	// it was about what each service error MEANS to a guest, and that decision is the ABI. Left in
+	// an adapter as a wildcard it made `Error::Denied` on the same versioned import reach the guest
+	// as `STATUS_IO` here and `STATUS_DENIED` under `component_host`: two hosts of one interface
+	// with two error semantics, which is the exact class `WorldHost` was built to end. The seam made
+	// the disagreement visible; only the helpers classifying their own answers removes it.
 	fn read(&mut self, dst: &mut [u8]) -> wasm::world::ReadOutcome {
-		let read = match self.grant {
+		match self.grant {
 			Grant::Storage(storage) => unsafe { read_fixed(storage, dst) },
 			Grant::Picker(picker) => unsafe { read_picked(picker, dst) },
-		};
-		// `Failed` rather than `Refused`: these two helpers answer `None` for a service that did not
-		// reply as well as for an open that was refused, and telling the guest `DENIED` when the
-		// truth may be "the service is gone" is the conflation the typed outcomes exist to end.
-		// Separating them properly means the helpers reporting which, which is work for the day
-		// this host's grants grow past two.
-		match read {
-			Some(n) => wasm::world::ReadOutcome::Read(n),
-			None => wasm::world::ReadOutcome::Failed,
 		}
 	}
 
 	// Neither is granted here: this host demonstrates the READ half of the world - a fixed file, or
 	// one the user picked through the powerbox - and a component asking for either is refused at
 	// instantiation by the import resolution below, not at the call. These exist because the trait
-	// does, and answering them by refusing is more honest than a panic on a path that cannot run.
+	// does, and answering them is more honest than a panic on a path that cannot run.
+	//
+	// `Unsupported` RATHER THAN `Refused`. `Refused` is `STATUS_DENIED`, which says "you may not" -
+	// and it reads as a grant this host could have been given and was not. There is no write path
+	// behind this host at all, for any grant, so `STATUS_UNSUPPORTED` is the true one: not
+	// authority withheld, an operation that does not exist here.
 	fn write(&mut self, _bytes: &[u8]) -> wasm::world::WriteOutcome {
-		wasm::world::WriteOutcome::Refused
+		wasm::world::WriteOutcome::Unsupported
 	}
 
 	fn log(&mut self, _text: &str) -> wasm::world::LogOutcome {
-		wasm::world::LogOutcome::Refused
+		wasm::world::LogOutcome::Unsupported
 	}
 }
 
-// Open the host's one fixed granted file over StorageService and copy up to
-// `dst.len()` bytes into `dst`, returning the number copied. None on any failure.
-unsafe fn read_fixed(storage: u64, dst: &mut [u8]) -> Option<usize> {
+// Open the host's one fixed granted file over StorageService and copy up to `dst.len()` bytes into
+// `dst`, answering WHY it did not happen rather than whether it did.
+//
+// THE HELPER IS THE ONLY PLACE THAT SEES THE SERVICE'S ANSWER, so it is the only place that can
+// classify it. It answered `Option<usize>` and its caller turned every `None` into `Failed`, which
+// meant a volume that answered and refused reached the guest as `STATUS_IO` - the same refusal that
+// `component_host` reports as `STATUS_DENIED`, on the same versioned import.
+//
+// The vocabulary is the world's, decided once beside the status codes in `src/wasm/src/world.rs`:
+// `Denied` is the grant and everything else is a fault on the way there.
+unsafe fn read_fixed(storage: u64, dst: &mut [u8]) -> wasm::world::ReadOutcome {
+	use wasm::world::ReadOutcome;
 	unsafe {
 		let opts: OpenOpts = OpenOpts { path: alloc::string::String::from_utf8_lossy(GRANTED).into_owned(), write: false, create: false };
 		let mut client = volume::Client::new(ChannelTransport { chan: storage });
 		let result = match client.open(&opts) {
 			Some(Ok(r)) => r,
-			_ => return None,
+			// The volume answered and said no - or said something else, which is not the same
+			// thing. The same classification `component_host` uses, from the one place that makes
+			// it, which is what stops the two hosts drifting apart again.
+			Some(Err(error)) => return read_failure(error),
+			// Nothing came back at all.
+			None => return ReadOutcome::Failed,
 		};
 		if result.file == 0 {
-			return None;
+			return ReadOutcome::Failed;
 		}
-		read_into(result.file, result.size, dst)
+		match read_into(result.file, result.size, dst) {
+			Some(n) => ReadOutcome::Read(n),
+			None => ReadOutcome::Failed,
+		}
 	}
 }
 
-// Ask the FilePicker for the user's chosen file - the powerbox: the host has no
-// filesystem access of its own, only the picker - then copy up to `dst.len()` bytes
-// of that granted file into `dst`. The picker returns the file as a handle<file>
-// capability, which the host maps and reads. None on any failure.
-unsafe fn read_picked(picker: u64, dst: &mut [u8]) -> Option<usize> {
+// Ask the FilePicker for the user's chosen file - the powerbox: the host has no filesystem access
+// of its own, only the picker - then copy up to `dst.len()` bytes of that granted file into `dst`.
+// The picker returns the file as a handle<file> capability, which the host maps and reads.
+//
+// Classified the same way as `read_fixed`, for the same reason: a picker that answered `Denied` -
+// the user declined - is the grant and not the machine, and it is the one answer here a component
+// can genuinely act on.
+unsafe fn read_picked(picker: u64, dst: &mut [u8]) -> wasm::world::ReadOutcome {
+	use wasm::world::ReadOutcome;
 	unsafe {
 		let mut client = picker::Client::new(ChannelTransport { chan: picker });
 		let picked = match client.pick() {
 			Some(Ok(p)) => p,
-			_ => return None,
+			Some(Err(error)) => return read_failure(error),
+			None => return ReadOutcome::Failed,
 		};
 		if picked.file == 0 {
-			return None;
+			return ReadOutcome::Failed;
 		}
-		read_into(picked.file, picked.size, dst)
+		match read_into(picked.file, picked.size, dst) {
+			Some(n) => ReadOutcome::Read(n),
+			None => ReadOutcome::Failed,
+		}
 	}
 }
 
@@ -236,7 +269,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// asking for a camera is asking for a camera, whether or not the call is reachable.
 	for import in module.imports.iter() {
 		let signature = module.types.get(import.type_index as usize);
-		if wasm::world::resolve(&import.module, &import.field, signature) != Some(wasm::world::WorldFn::Read) {
+		if wasm::world::resolve(&import.module, &import.field, signature) != Ok(wasm::world::WorldFn::Read) {
 			exit();
 		}
 	}

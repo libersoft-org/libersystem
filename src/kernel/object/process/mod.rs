@@ -156,18 +156,20 @@ pub struct Process {
 impl Process {
 	// Create a process with a fresh handle table bound to `domain`, running in
 	// `address_space`.
-	pub fn new(address_space: Arc<AddressSpace>, domain: Arc<Domain>) -> Arc<Self> {
+	// FALLIBLY: `SYS_PROCESS_CREATE` reaches this, and a `Process` is one of the larger objects the
+	// kernel builds on a syscall path.
+	pub fn new(address_space: Arc<AddressSpace>, domain: Arc<Domain>) -> Option<Arc<Self>> {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = Arc::new(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0) });
+		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0) })?;
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
 		if !process.domain.register_process(&process) {
 			process.terminate();
 		}
-		process
+		Some(process)
 	}
 
 	pub fn address_space(&self) -> &Arc<AddressSpace> {
@@ -207,10 +209,12 @@ impl Process {
 	}
 
 	pub fn adopt_frames(&self, frames: Vec<u64>) {
+		// ALLOC-OK: the loader's own frame list, moved in whole at spawn - its size is the image's and the image was already held in memory to be read.
 		self.user_frames.lock().extend(frames);
 	}
 
 	pub fn adopt_shared_pages(&self, pages: Vec<Arc<crate::elf::SharedPage>>) {
+		// ALLOC-OK: the loader's own page list, moved in whole at spawn.
 		self.shared_image_pages.lock().extend(pages);
 	}
 
@@ -295,6 +299,7 @@ impl Process {
 		if biases.len() >= 64 || biases.contains(&bias) {
 			return false;
 		}
+		// ALLOC-OK: one entry per shared library the image names, bounded by the loader's module-graph limit.
 		biases.push(bias);
 		self.dynamic_modules.store(biases.len(), Ordering::Release);
 		true

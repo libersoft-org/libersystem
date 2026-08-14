@@ -202,3 +202,100 @@ fn the_setup_header_reads_back_field_by_field() {
 	assert_eq!(rdr.read_u8().unwrap(), 0, "mode mapping");
 	assert_eq!(rdr.read_bit_flag().unwrap(), true, "framing");
 }
+
+#[test]
+fn the_forward_mdct_and_this_trees_inverse_round_trip() {
+	// THE SCALE COMES FROM HERE. Vorbis' MDCT pair carries a normalisation that implementations
+	// place differently, and reading it off the specification is the mistake this whole file is
+	// written against - so the forward transform's constant is the one that makes a round trip
+	// through the DECODER'S OWN inverse reproduce the input, and this is the measurement.
+	//
+	// A single block is not a full TDAC round trip - that needs two overlapping blocks, which the
+	// test below does - but it is where a scale error or a sign error shows up first and largest.
+	const LOG2: u8 = 8; // 256-sample blocks: 128 spectral values
+	let two_n: usize = 1 << LOG2;
+	let n = two_n / 2;
+
+	// A signal with content at several frequencies, so a transform that is right for one bin and
+	// wrong for the rest cannot pass.
+	let signal: alloc::vec::Vec<f32> = (0..two_n)
+		.map(|i| {
+			let t = i as f32;
+			0.5 * libm::sinf(core::f32::consts::PI * 2.0 * 3.0 * t / two_n as f32) + 0.25 * libm::sinf(core::f32::consts::PI * 2.0 * 11.0 * t / two_n as f32) + 0.125 * libm::cosf(core::f32::consts::PI * 2.0 * 29.0 * t / two_n as f32)
+		})
+		.collect();
+
+	let spectrum = forward_mdct(&signal).expect("a power-of-two block");
+	assert_eq!(spectrum.len(), n, "the MDCT of 2n samples is n coefficients");
+
+	// Through the decoder's inverse, which takes a full-length buffer with the second half zeroed -
+	// the same shape `audio.rs` hands it.
+	let cached = crate::header_cached::CachedBlocksizeDerived::from_blocksize(LOG2);
+	let mut buffer: alloc::vec::Vec<f32> = spectrum.clone();
+	buffer.resize(two_n, 0.0);
+	crate::imdct::inverse_mdct(&cached, &mut buffer, LOG2);
+
+	// TIME-DOMAIN ALIASING is the whole point of the transform: one block back is the input plus a
+	// folded copy of itself, and only the overlap-add of two blocks cancels it. What a single block
+	// can show is that the SECOND quarter and the THIRD quarter are the input's, up to that fold -
+	// so the assertion is on the shape of the aliasing rather than on equality, and it is enough to
+	// catch a scale, a sign or an off-by-one in the phase.
+	//
+	// Measured, not derived: `2 / n` is the constant that makes this hold.
+	let mut worst = 0.0f32;
+	for i in 0..n {
+		// The aliasing rule for the first half: y[i] = x[i] - x[n - 1 - i] reflected about n/2.
+		let folded = signal[i] - signal[n - 1 - i];
+		let error = libm::fabsf(buffer[i] - folded);
+		if error > worst {
+			worst = error;
+		}
+	}
+	assert!(worst < 0.02, "the first half comes back as the input minus its own reflection, which is what a single MDCT block carries: worst error {worst}");
+}
+
+#[test]
+fn two_overlapping_blocks_reconstruct_the_signal() {
+	// THE PROPERTY THAT MATTERS. A codec's transform is only correct if consecutive blocks, each
+	// windowed going in and coming out, add back up to what went in - that is what makes the
+	// aliasing cancel, and it is the thing a per-block test cannot see.
+	//
+	// Three blocks of a continuous signal, hopped by n, and the middle n samples of the output are
+	// compared against the middle n samples of the input.
+	const LOG2: u8 = 8;
+	let two_n: usize = 1 << LOG2;
+	let n = two_n / 2;
+	let window = window_for(LOG2);
+	assert_eq!(window.len(), two_n, "the window spans a whole block");
+
+	let total = two_n * 3;
+	let signal: alloc::vec::Vec<f32> = (0..total).map(|i| 0.6 * libm::sinf(core::f32::consts::PI * 2.0 * 5.0 * i as f32 / two_n as f32)).collect();
+
+	let cached = crate::header_cached::CachedBlocksizeDerived::from_blocksize(LOG2);
+	// Two consecutive blocks, hopped by n, each windowed in and out.
+	let mut halves: alloc::vec::Vec<alloc::vec::Vec<f32>> = alloc::vec::Vec::new();
+	for block in 0..2usize {
+		let start = block * n;
+		let framed: alloc::vec::Vec<f32> = (0..two_n).map(|i| signal[start + i] * window[i]).collect();
+		let spectrum = forward_mdct(&framed).expect("a power-of-two block");
+		let mut buffer: alloc::vec::Vec<f32> = spectrum;
+		buffer.resize(two_n, 0.0);
+		crate::imdct::inverse_mdct(&cached, &mut buffer, LOG2);
+		for (i, value) in buffer.iter_mut().enumerate() {
+			*value *= window[i];
+		}
+		halves.push(buffer);
+	}
+
+	// The overlap-add region: the second half of block 0 plus the first half of block 1 is the
+	// input over `n..2n`.
+	let mut worst = 0.0f32;
+	for i in 0..n {
+		let reconstructed = halves[0][n + i] + halves[1][i];
+		let error = libm::fabsf(reconstructed - signal[n + i]);
+		if error > worst {
+			worst = error;
+		}
+	}
+	assert!(worst < 0.02, "two windowed, overlapped blocks reconstruct the signal between them: worst error {worst}");
+}

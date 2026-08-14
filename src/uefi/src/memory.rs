@@ -49,7 +49,13 @@ pub fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDe
 	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
 		return None;
 	}
-	map_size += desc_size * 8;
+	// CHECKED, like `memory_top` in this file already is. Every number here came from the firmware,
+	// and the memory map is the one input that describes the whole address space - so a `desc_size`
+	// that is absurd should refuse rather than wrap into a small allocation the second call then
+	// overruns.
+	let Some(headroom) = desc_size.checked_mul(8) else { return None };
+	let Some(sized) = map_size.checked_add(headroom) else { return None };
+	map_size = sized;
 	let pages = map_size.div_ceil(PAGE_SIZE as usize);
 	let buf = alloc_pages(bs, pages)? as *mut uefi::MemoryDescriptor;
 	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, buf, &mut key, &mut desc_size, &mut desc_ver) };
@@ -80,7 +86,10 @@ pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_s
 		let d = unsafe { &*((buf as *const u8).add(i * desc_size) as *const uefi::MemoryDescriptor) };
 		let kind = region_kind(d.ty);
 		unsafe {
-			*regions.add(n) = MemRegion { base: d.phys_start, length: d.page_count * PAGE_SIZE, kind, _pad: 0 };
+			// A page count from the firmware, times the page size. Unchecked this wraps a descriptor
+			// claiming 2^52 pages into a small region - a memory map the kernel then believes.
+			let Some(length) = d.page_count.checked_mul(PAGE_SIZE) else { return None };
+			*regions.add(n) = MemRegion { base: d.phys_start, length, kind, _pad: 0 };
 		}
 		n += 1;
 	}
@@ -108,7 +117,10 @@ pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_s
 	for r in 1..n {
 		let cur = unsafe { *regions.add(r) };
 		let last = unsafe { &mut *regions.add(w) };
-		if cur.kind == last.kind && last.base + last.length == cur.base {
+		// Both sums checked: the coalescing pass adds two firmware-provided lengths, and the
+		// comparison that decides whether to coalesce is itself a sum.
+		let adjacent = last.base.checked_add(last.length) == Some(cur.base);
+		if cur.kind == last.kind && adjacent && last.length.checked_add(cur.length).is_some() {
 			last.length += cur.length;
 		} else {
 			w += 1;

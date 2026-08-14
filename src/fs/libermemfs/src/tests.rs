@@ -449,7 +449,10 @@ fn the_reservation_survives_ten_thousand_random_operations() {
 	// is deliberately tiny so that refusals - where four of those five defects lived - are the
 	// common case rather than the exception.
 	const CAPACITY: usize = 64;
-	let paths: [&[u8]; 8] = [b"a", b"bb", b"ccc", b"d", b"d/x", b"d/yy", b"e", b"e/f"];
+	// ONE LONG NAME AMONG THE SHORT ONES, because the name delta is what `rename` charges. With
+	// every path one to four characters on a 64-byte volume, a rename could never push the footprint
+	// past the capacity - so a model drawing renames would still have proved nothing.
+	let paths: [&[u8]; 9] = [b"a", b"bb", b"ccc", b"d", b"d/x", b"d/yy", b"e", b"e/f", b"a-considerably-longer-name"];
 	let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("mount");
 	let mut rng = Lcg(0x5eed);
 	let mut refusals = 0usize;
@@ -458,22 +461,35 @@ fn the_reservation_survives_ten_thousand_random_operations() {
 
 	for step in 0..10_000 {
 		let path = paths[(rng.next() % paths.len() as u64) as usize];
-		let kind = rng.next() % 6;
+		// NINE OPERATIONS, NOT SIX. `rename`, `truncate` and `touch` arrived after this model was
+		// written and were not added to it - and they are exactly the two mutators that broke the
+		// two rules it enforces. `rename` charged no name delta and could end with `footprint()`
+		// above `capacity()`; `truncate` charged `len()` where the volume accounts `capacity()` and
+		// dropped a reserved volume's reservation on a refusal. Ten thousand steps over the six that
+		// were drawn had nothing to say about either.
+		let kind = rng.next() % 9;
 		let wrote = if kind == 0 { (rng.next() % 40) as usize } else { 0 };
+		// A second path, so `rename` has a destination. Drawn for every step so the sequence of
+		// random numbers does not depend on which operation came up.
+		let other = paths[(rng.next() % paths.len() as u64) as usize];
+		let length = (rng.next() % 40) as usize;
 		let outcome = match kind {
 			0 => fs.write_file(path, &alloc::vec![b'z'; wrote]),
 			1 => fs.write_file(path, b""),
 			2 => fs.mkdir(path),
 			3 => fs.remove(path),
 			4 => fs.rmdir(path),
-			_ => fs.read_file(path).map(|_| ()),
+			5 => fs.read_file(path).map(|_| ()),
+			6 => fs.rename(path, other),
+			7 => fs.truncate(path, length as u64),
+			_ => fs.touch(path, true),
 		};
 		if outcome.is_ok() {
 			successes += 1
 		} else {
 			refusals += 1
 		}
-		model.apply(kind, outcome.is_ok(), path, wrote);
+		model.apply(kind, outcome.is_ok(), path, other, wrote, length);
 
 		// Checked against a model kept BESIDE the filesystem rather than against the filesystem's
 		// own arithmetic. `resync_reservation` computes its target from `footprint()`, so a test
@@ -668,11 +684,12 @@ struct Model {
 }
 
 impl Model {
-	fn apply(&mut self, kind: u64, succeeded: bool, path: &[u8], wrote: usize) {
+	fn apply(&mut self, kind: u64, succeeded: bool, path: &[u8], other: &[u8], wrote: usize, length: usize) {
 		if !succeeded {
 			return;
 		}
 		let name = core::str::from_utf8(path).expect("test paths are utf-8");
+		let destination = core::str::from_utf8(other).expect("test paths are utf-8");
 		match kind {
 			// A file holds the largest size ever written to it until it is removed, because a
 			// cleared vector keeps its buffer - EXCEPT a write of nothing, which drops the buffer
@@ -691,6 +708,30 @@ impl Model {
 			}
 			4 => {
 				self.dirs.remove(name);
+			}
+			// The bytes never move: the node leaves one table and joins another, so a rename costs
+			// the difference between the two names and nothing else. A rename onto itself succeeds
+			// and changes nothing.
+			6 => {
+				if name != destination
+					&& let Some(held) = self.files.remove(name)
+				{
+					self.files.insert(alloc::string::String::from(destination), held);
+				}
+			}
+			// EXACTLY `length`, growing or shrinking: both halves rebuild the buffer at the size
+			// asked for rather than mutating in place, so the capacity the volume charges is the
+			// length. That is the allocate-check-swap shape, and it is what makes the truncated
+			// file's cost predictable enough for a model to state.
+			7 => {
+				if let Some(held) = self.files.get_mut(name) {
+					*held = length;
+				}
+			}
+			// `touch` with `create` writes an empty file when the name is free, and leaves an
+			// existing one alone.
+			8 => {
+				self.files.entry(alloc::string::String::from(name)).or_insert(0);
 			}
 			_ => {}
 		}
@@ -1465,4 +1506,120 @@ fn truncating_a_file_to_nothing_returns_its_quota() {
 	let before = fs.free();
 	fs.write_file(b"big", &[b'x'; 1024]).expect("shrink");
 	assert_eq!(fs.free(), before, "a partial shrink must keep its allocation");
+}
+
+#[test]
+fn a_rename_to_a_longer_name_is_charged_and_can_be_refused() {
+	// Names are part of `footprint()`, and `rename` allocated the new one and checked nothing - so a
+	// volume exactly full accepted a rename to a longer name as long as the HOST heap had room, and
+	// ended above its own capacity. That is the one invariant this milestone exists to hold.
+	//
+	// `EVERYTHING THAT CAN REFUSE, FIRST` is the block's own comment; the charge belongs in it.
+	const CAPACITY: usize = 32;
+	let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("mount");
+	// `a` plus its name is 1 + 20 = 21; the rest is slack the longer name must not fit into.
+	fs.write_file(b"a", &alloc::vec![b'z'; 20]).expect("the file fits");
+	let before = fs.footprint();
+	assert_eq!(fs.rename(b"a", b"a-much-longer-name"), Err(FsError::NoSpace), "a rename that would not fit is refused");
+	assert_eq!(fs.footprint(), before, "and the volume is exactly as it was");
+	assert!(fs.read_file(b"a").is_ok(), "with the file still where it was");
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), CAPACITY as u64, "and the reservation intact");
+
+	// A rename that DOES fit is charged for the difference and no more.
+	assert_eq!(fs.rename(b"a", b"ab"), Ok(()), "one more byte of name fits");
+	assert_eq!(fs.footprint(), before + 1, "and costs exactly the extra byte");
+	assert!(fs.footprint() <= CAPACITY as u64, "a successful rename never leaves the volume over its capacity");
+	assert!(fs.read_file(b"ab").is_ok());
+}
+
+#[test]
+fn a_rename_within_one_directory_keeps_its_reserved_slot() {
+	// `rename` reserves one slot in the destination's table so the insert cannot fail after the
+	// source is gone. For a rename WITHIN one directory those are the same table, and `remove`'s
+	// shrink replaced it with one sized exactly to its contents - handing the reserved slot straight
+	// back. The insert then had to allocate again, and a failure there dropped the node it was
+	// holding. The ABI promises rename is atomic within a volume.
+	//
+	// `shrink_children` only acts at or below a quarter occupancy, so the fixture has to get there:
+	// a directory grown past `MIN_SLOTS` and then emptied down to one entry.
+	let mut fs = LiberMemFs::mount(Policy::Capped, 4096).expect("mount");
+	fs.mkdir(b"d").expect("a directory");
+	for i in 0..16u8 {
+		let name = alloc::format!("d/f{i}");
+		fs.write_file(name.as_bytes(), b"x").expect("fill the table");
+	}
+	for i in 1..16u8 {
+		let name = alloc::format!("d/f{i}");
+		fs.remove(name.as_bytes()).expect("empty it down to one");
+	}
+	// One entry in a table that was sized for sixteen: the shrink window.
+	assert_eq!(fs.rename(b"d/f0", b"d/g0"), Ok(()), "the rename succeeds");
+	assert!(fs.read_file(b"d/g0").is_ok(), "the file is at its new name");
+	assert_eq!(fs.read_file(b"d/f0"), Err(FsError::NotFound), "and not at its old one");
+	assert!(fs.footprint() <= 4096, "and the volume is inside its capacity");
+}
+
+#[test]
+fn renaming_something_that_is_not_there_is_not_found() {
+	// The same-path early return came BEFORE the existence check, so `rename("missing", "missing")`
+	// answered `Ok(())`.
+	let mut fs = LiberMemFs::mount(Policy::Capped, 4096).expect("mount");
+	assert_eq!(fs.rename(b"missing", b"missing"), Err(FsError::NotFound), "a no-op rename of a missing file is NotFound");
+	assert_eq!(fs.rename(b"missing", b"elsewhere"), Err(FsError::NotFound));
+	fs.write_file(b"here", b"x").expect("a file");
+	assert_eq!(fs.rename(b"here", b"here"), Ok(()), "and a real no-op rename still succeeds");
+}
+
+#[test]
+fn truncate_charges_what_the_file_allocates_and_keeps_the_reservation() {
+	// FOUR RULES THE WRITE PATH ALREADY KEPT. `truncate` arrived after the round that established
+	// them and kept none: it charged `len()` where the volume accounts `capacity()`, never checked
+	// `MAX_FILE_BYTES`, trusted what `try_reserve_exact` gave it, and released a reserved volume's
+	// reservation before an allocation that could return through a `?` placed above the resync.
+	const CAPACITY: usize = 128;
+	let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("mount");
+	// 80 bytes of data in `f`, then cleared to 20 - the buffer stays at 80 and the volume charges
+	// for 80, which is the whole point of accounting capacity.
+	fs.write_file(b"f", &alloc::vec![b'z'; 80]).expect("the file fits");
+	fs.truncate(b"f", 20).expect("shrink to 20");
+
+	// Growing back to 40 - which the old code refused with `NoSpace`, because it compared
+	// `footprint() + (40 - 20)` against the capacity while the file was already charged for what it
+	// held.
+	assert_eq!(fs.truncate(b"f", 40), Ok(()), "a grow inside what the file already holds is not a new allocation");
+	assert!(fs.footprint() <= CAPACITY as u64, "and never leaves the volume over its capacity");
+	assert_eq!(fs.read_file(b"f").expect("read").len(), 40, "the file is the length asked for");
+
+	// A refused grow leaves the reservation where it was - the defect the previous round fixed in
+	// `write_file`, in the function beside it.
+	let before = fs.footprint();
+	assert_eq!(fs.truncate(b"f", 4096), Err(FsError::NoSpace), "past the capacity is refused");
+	assert_eq!(fs.footprint(), before, "and changes nothing");
+	assert_eq!(fs.footprint() + fs.reserved_bytes(), CAPACITY as u64, "with the reservation still held");
+
+	// And the file-size bound is the volume's, not the calling path's.
+	let mut big = LiberMemFs::mount(Policy::Capped, MAX_FILE_BYTES * 4).expect("mount");
+	big.write_file(b"g", b"x").expect("a file");
+	assert_eq!(big.truncate(b"g", MAX_FILE_BYTES as u64 + 1), Err(FsError::TooLong), "no write path in this crate makes a file larger than this");
+
+	// The zeros are the promise.
+	fs.truncate(b"f", 8).expect("shrink");
+	fs.truncate(b"f", 16).expect("grow");
+	assert_eq!(fs.read_file(b"f").expect("read")[8..], [0u8; 8], "an extended file reads as zeros");
+}
+
+#[test]
+fn a_preflight_over_a_claimed_name_answers_what_the_write_answers() {
+	// `writable_len` and `stream_len` accepted a claimed destination and reported the space a write
+	// would have, while `write_file` and `stream_begin` refuse one with `Exists`. So a caller could
+	// ask during another caller's open stream, be told a number, prepare that payload, and be
+	// refused - the same class this milestone has closed twice: a preflight answering a question the
+	// operation behind it answers differently.
+	let mut fs = LiberMemFs::mount(Policy::Capped, 4096).expect("mount");
+	fs.stream_begin(b"claimed").expect("a stream claims the name");
+	assert_eq!(fs.writable_len(b"claimed"), Err(FsError::Exists), "writable_len says what write_file says");
+	assert_eq!(fs.stream_len(b"claimed"), Err(FsError::Exists), "and stream_len says what stream_begin says");
+	assert_eq!(fs.write_file(b"claimed", b"x"), Err(FsError::Exists), "which is this");
+	fs.stream_abort();
+	assert!(fs.writable_len(b"claimed").is_ok(), "and once the claim is gone the name is available again");
 }

@@ -116,17 +116,33 @@ pub(crate) fn conduit(arg: u64) -> u32 {
 // `virtualization=on` the guest owns EL2, so the `hvc` landed in the firmware's EL2 vectors - which
 // outlive `ExitBootServices` - and the boot died there with fifteen lines of kernel output behind it
 // and no explanation. `BootInfo::psci_conduit` is the loader saying what it left behind.
-fn cpu_on(target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
+fn cpu_on(conduit: u32, target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
 	let ret: i64;
+	// TWO INSTRUCTIONS, ONE CALLING CONVENTION. The SMC arm used to be a printed refusal, because
+	// nothing in this tree could set `PSCI_SMC` - the loader inferred `PSCI_HVC` from the exception
+	// level. Now that the loader reads the conduit off the platform, `PSCI_SMC` is a real answer on
+	// most server-class AArch64, where EL2 belongs to a hypervisor and PSCI lives in EL3 firmware.
+	// The register conventions are identical, so the difference is the instruction and nothing else.
 	unsafe {
-		core::arch::asm!(
-			"hvc #0",
-			inout("x0") PSCI_CPU_ON => ret,
-			in("x1") target_mpidr,
-			in("x2") entry,
-			in("x3") context_id,
-			options(nostack),
-		);
+		if conduit == bootproto::PSCI_SMC {
+			core::arch::asm!(
+				"smc #0",
+				inout("x0") PSCI_CPU_ON => ret,
+				in("x1") target_mpidr,
+				in("x2") entry,
+				in("x3") context_id,
+				options(nostack),
+			);
+		} else {
+			core::arch::asm!(
+				"hvc #0",
+				inout("x0") PSCI_CPU_ON => ret,
+				in("x1") target_mpidr,
+				in("x2") entry,
+				in("x3") context_id,
+				options(nostack),
+			);
+		}
 	}
 	ret
 }
@@ -170,14 +186,9 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_arg: u64) {
 	// exception vectors. A single-core boot is a working system; a machine that dies bringing up its
 	// second core is not, and the difference used to be one instruction the kernel had no way to know
 	// was unanswered.
-	match conduit(boot_arg) {
-		bootproto::PSCI_HVC => {}
-		bootproto::PSCI_SMC => {
-			// Nothing in this tree sets it, and guessing at an `smc` here would be the same mistake
-			// one instruction over: refused by name.
-			crate::serial_println!("aarch64: SMP - the SMC conduit is not implemented; running on one core");
-			return;
-		}
+	let conduit = conduit(boot_arg);
+	match conduit {
+		bootproto::PSCI_HVC | bootproto::PSCI_SMC => {}
 		_ => {
 			crate::serial_println!("aarch64: SMP - no PSCI conduit below this kernel; running on one core");
 			return;
@@ -191,7 +202,7 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_arg: u64) {
 	let entry = unsafe { aarch64_secondary_entry };
 	let want = (cpu_count - 1).min((MAX_CPUS - 1) as u32);
 	for cpu_id in 1..=want as u64 {
-		let status = cpu_on(cpu_id, entry, cpu_id);
+		let status = cpu_on(conduit, cpu_id, entry, cpu_id);
 		if status != 0 {
 			crate::serial_println!("aarch64: CPU_ON core {cpu_id} failed (PSCI {status})");
 		}

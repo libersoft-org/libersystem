@@ -48,13 +48,14 @@ pub struct DeviceMemory {
 
 impl DeviceMemory {
 	// A capability to the physical MMIO region [phys_base, phys_base + len), naming no device.
-	pub fn new(phys_base: u64, len: usize) -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), index: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+	// FALLIBLY, here and in `for_device`: `sys_device_acquire` mints them.
+	pub fn new(phys_base: u64, len: usize) -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
 	}
 
 	// The same, for entry `index` of the device table - what `sys_device_acquire` mints.
-	pub fn for_device(index: u32, phys_base: u64, len: usize) -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), index: Some(index), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+	pub fn for_device(index: u32, phys_base: u64, len: usize) -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: Some(index), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
 	}
 
 	// The device-table entry this capability is for, if it is for one.

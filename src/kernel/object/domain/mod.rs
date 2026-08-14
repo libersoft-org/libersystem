@@ -220,6 +220,9 @@ impl Domain {
 	// Create a standalone Domain (no parent) with the given resource caps
 	// (UNLIMITED for no cap).
 	pub fn new(memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Arc<Self> {
+		// A parentless Domain is built at boot only; `new_child` is the syscall path and it is
+		// fallible.
+		// ALLOC-OK: boot only - the root Domain and the test Domains, before any syscall runs.
 		Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: None, children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) })
 	}
 
@@ -238,7 +241,8 @@ impl Domain {
 	// by that kill, and its charges would pass through a parent that is no longer
 	// enforcing anything.
 	pub fn new_child(parent: &Arc<Domain>, memory_limit: u64, handle_limit: u64, thread_limit: u64) -> Option<Arc<Self>> {
-		let child = Arc::new(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: Some(Arc::downgrade(parent)), children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) });
+		// FALLIBLY: `SYS_DOMAIN_CREATE` reaches this.
+		let child = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), account: ResourceAccount::new(memory_limit, handle_limit, thread_limit), parent: Some(Arc::downgrade(parent)), children: SpinLock::new(Vec::new()), processes: SpinLock::new(Vec::new()), killed: AtomicBool::new(false) })?;
 		// The check is UNDER the same lock as the push, which is what `register_process` was taught
 		// and this was not - the doc comment already claimed it. A kill takes a snapshot of the
 		// children and then walks it, so a child pushed after the snapshot and before the flag is
@@ -247,6 +251,7 @@ impl Domain {
 		if parent.killed.load(Ordering::Acquire) {
 			return None;
 		}
+		// ALLOC-OK: the child count is bounded by the Domain quota this call already charged.
 		children.push(child.clone());
 		Some(child)
 	}
@@ -280,6 +285,7 @@ impl Domain {
 			return false;
 		}
 		list.retain(|weak| weak.strong_count() > 0);
+		// ALLOC-OK: the process count is bounded by the Domain quota, and the line above drops every dead entry first.
 		list.push(Arc::downgrade(process));
 		true
 	}

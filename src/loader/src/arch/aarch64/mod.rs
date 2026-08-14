@@ -81,12 +81,16 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// sets up EL1 translation - with the CPU still at EL2. QEMU's virt machine starts the loader at
 	// EL1, which is why this has never been seen here.
 	//
-	// THE EL2 BRANCH BELOW HAS NEVER EXECUTED, ON ANY MACHINE THIS PROJECT HAS RUN ON, and that has
-	// to be said in the code rather than inferred from a milestone. "aarch64 passes 226 tests" is a
-	// statement about the EL1 branch: every one of those runs took the `else` path. The EL2 branch
-	// is written from the architecture reference manual and reviewed, which is not the same as
-	// tested - so a reader must treat a change to it as unverified, and anyone who acquires a part
-	// that boots UEFI at EL2 should treat running this once as a milestone in itself.
+	// THE EL2 BRANCH BELOW HAS NOW BEEN RUN, on `-machine virt,virtualization=on`, and what it found
+	// is the reason the PSCI conduit is read from the platform a hundred lines down. The drop itself
+	// works: fifteen lines of kernel output came out of it. What broke was everything AFTER the
+	// `eret` that assumed something was still at EL2 - the kernel's `hvc #0` at `cpu_on` landed in
+	// the firmware's EL2 vectors, which outlive `ExitBootServices`, and the boot died there with no
+	// explanation. `BootInfo::psci_conduit` exists because of that run.
+	//
+	// So a reader inherits the finding rather than the warning that preceded it: this branch is
+	// exercised, and the thing to be careful about is not the drop but what the code below it
+	// believes about the level it just left.
 	unsafe {
 		let current_el: u64;
 		core::arch::asm!("mrs {0}, CurrentEL", out(reg) current_el, options(nomem, nostack));
@@ -240,20 +244,56 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 		};
 		// WHAT WILL BE LEFT BELOW THE KERNEL, decided here because this is the code that decides it.
 		//
-		// If the firmware entered this loader at EL1, something at EL2 is serving it and will go on
-		// serving the kernel: that is QEMU's `virt`, whose PSCI is at HVC. If it entered at EL2, this
-		// loader is about to drop to EL1 and the only thing that was at EL2 is the firmware it is
-		// about to leave - so after the `eret` an `hvc` reaches nobody. Saying `PSCI_NONE` is what
-		// turns the kernel's secondary bring-up from a fault into a single-core boot with a reason.
-		//
 		// `CurrentEL` is read here rather than remembered from `hand_off`, so the two answers cannot
 		// drift apart.
 		let current_el: u64;
 		core::arch::asm!("mrs {0}, CurrentEL", out(reg) current_el, options(nomem, nostack));
-		let psci_conduit = if (current_el >> 2) & 0b11 == 2 { bootproto::PSCI_NONE } else { bootproto::PSCI_HVC };
+		let psci_conduit = psci_conduit(current_el, dtb);
 		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: 0, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit, rsdp: 0, smp_trampoline: 0, dtb };
 	}
 	phys
+}
+
+// Which PSCI conduit, if any, the kernel will have below it.
+//
+// THE EXCEPTION LEVEL DECIDES ONE THING AND THE PLATFORM DECIDES THE OTHER. This used to be a single
+// expression: `PSCI_NONE` at EL2, `PSCI_HVC` otherwise. The first half is right and is what the EL2
+// run found - this loader drops to EL1 itself, so after the `eret` nothing answers an `hvc`, and
+// saying so turns the kernel's secondary bring-up from a fault into a single-core boot with a
+// reason. The second half was a guess: a machine that hands firmware EL1 has something below it, and
+// what that something answers is stated by the platform, not implied by where the firmware put us.
+// Most server-class AArch64 keeps EL2 for a hypervisor and PSCI in EL3 firmware behind `smc`, so
+// this loader was declaring `PSCI_HVC` and the kernel was executing `hvc #0` at `cpu_on` - the same
+// class of assumption as the hard-coded UART address this milestone is named for.
+//
+// The two places a platform states it, in the order everything else in this milestone reads them:
+// the device tree's `/psci/method`, then ACPI's FADT ARM Boot Architecture Flags. A machine that
+// states neither gets `PSCI_NONE`, which the kernel reports and boots single-core on - the honest
+// answer, and not the same as picking the more common instruction and hoping.
+fn psci_conduit(current_el: u64, dtb: u64) -> u32 {
+	if (current_el >> 2) & 0b11 == 2 {
+		// Whatever answered before is above the kernel now, whatever the tables said.
+		return bootproto::PSCI_NONE;
+	}
+	let (discovered_dtb, rsdp) = crate::console::firmware_tables();
+	let tree = if dtb != 0 { dtb } else { discovered_dtb };
+	if tree != 0
+		&& let Some(conduit) = fdt::Fdt::new(tree, crate::console::identity_map).psci_conduit()
+	{
+		return match conduit {
+			fdt::PsciConduit::Hvc => bootproto::PSCI_HVC,
+			fdt::PsciConduit::Smc => bootproto::PSCI_SMC,
+		};
+	}
+	if rsdp != 0
+		&& let Some(conduit) = uefi::acpi::Acpi::new(rsdp, crate::console::identity_map).psci_conduit()
+	{
+		return match conduit {
+			uefi::acpi::PsciConduit::Hvc => bootproto::PSCI_HVC,
+			uefi::acpi::PsciConduit::Smc => bootproto::PSCI_SMC,
+		};
+	}
+	bootproto::PSCI_NONE
 }
 
 // Load each PT_LOAD segment at its physical (link) address - the placement QEMU's

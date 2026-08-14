@@ -163,8 +163,11 @@ fn malformed_records_do_not_panic() {
 	// NM entry with length 4 used to build an inverted range. Both must parse cleanly.
 	let mut img = build_iso(false);
 	let root_off = 19 * SECTOR_SIZE;
-	let mut a = vec![0u8; 35];
-	a[0] = 35;
+	// 36, not 35: an even-length identifier is followed by the padding byte the format requires, and
+	// the parser checks it now. The `record` helper above has always emitted it; this hand-built
+	// fixture did not, which is the shape a strict parser is supposed to notice.
+	let mut a = vec![0u8; 36];
+	a[0] = 36;
 	both32(&mut a, 2, 21);
 	both32(&mut a, 10, 0);
 	// The Volume Sequence Number, which a real record carries and the parser now requires: an
@@ -185,8 +188,8 @@ fn malformed_records_do_not_panic() {
 	b[34..36].copy_from_slice(b"NM");
 	b[36] = 4; // sig + len + version only: no flags, no name
 	b[37] = 1;
-	img[root_off + ROOT_FREE..root_off + ROOT_FREE + 35].copy_from_slice(&a);
-	img[root_off + ROOT_FREE + 35..root_off + ROOT_FREE + 77].copy_from_slice(&b);
+	img[root_off + ROOT_FREE..root_off + ROOT_FREE + 36].copy_from_slice(&a);
+	img[root_off + ROOT_FREE + 36..root_off + ROOT_FREE + 78].copy_from_slice(&b);
 	let mut fs = Iso9660::mount(MemDisc { data: img }).unwrap();
 	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
 	assert!(names.contains(&"AB".to_string()) && names.contains(&"C".to_string()), "{names:?}");
@@ -890,4 +893,172 @@ fn an_er_whose_declared_lengths_do_not_fit_announces_nothing() {
 	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
 	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
 	assert!(!names.contains(&"real".to_string()), "an ER whose lengths do not fit its own entry announces nothing: {names:?}");
+}
+
+#[test]
+fn an_nm_entry_at_another_version_is_not_read_as_a_name() {
+	// `for_each_susp` refuses `version != 1` and `rock_ridge_name` did not go through it: it walked
+	// the area itself, reading `sys[off + 2]` for the length and `sys[off..off + 2]` for the
+	// signature, and never `sys[off + 3]` at all. So an `NM` declaring version 2 was consumed as
+	// though it were version 1 - and `NM` is the entry whose contents become a filename, which
+	// becomes a lookup key. The test that covers the version rule alters an `ER`, which does go
+	// through the walker.
+	let good: Vec<u8> = [b"NM".as_slice(), &[9, 1, 0], b"real"].concat();
+	let mut fs = Iso9660::mount(MemDisc { data: iso_with_susp(true, &good) }).expect("mount");
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(names.contains(&"real".to_string()), "the fixture's NM is read at version 1: {names:?}");
+
+	let wrong: Vec<u8> = [b"NM".as_slice(), &[9, 2, 0], b"real"].concat();
+	let mut fs = Iso9660::mount(MemDisc { data: iso_with_susp(true, &wrong) }).expect("mount");
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(!names.contains(&"real".to_string()), "an NM at version 2 is a different structure with the same signature: {names:?}");
+	assert!(names.iter().any(|n| n == "X.TXT"), "and the ISO name stands instead: {names:?}");
+}
+
+#[test]
+fn an_enhanced_volume_descriptor_does_not_kill_the_mount() {
+	// ECMA-119's second edition defines the Enhanced Volume Descriptor: type 2, version 2. The
+	// descriptor loop refused anything whose version byte was not 1 BEFORE it looked at the type,
+	// under a comment saying version "is 1 for every descriptor this format defines" - so a
+	// well-formed `PVD (v1)`, `Enhanced VD (v2)`, `Terminator` was refused at the second descriptor
+	// rather than the primary hierarchy this reader fully understands being read.
+	//
+	// Skipping something unimplemented is not the same as refusing the volume.
+	let mut img = build_iso(false);
+	// The non-Joliet fixture puts the terminator at 17; move it to 18 and put the Enhanced
+	// descriptor in between.
+	let mut enhanced = img[16 * SECTOR_SIZE..17 * SECTOR_SIZE].to_vec();
+	enhanced[0] = 2; // Supplementary/Enhanced
+	enhanced[6] = 2; // ...at version 2, which is what makes it Enhanced
+	img[17 * SECTOR_SIZE..18 * SECTOR_SIZE].copy_from_slice(&enhanced);
+	img[18 * SECTOR_SIZE] = 255;
+	img[18 * SECTOR_SIZE + 1..18 * SECTOR_SIZE + 6].copy_from_slice(b"CD001");
+	img[18 * SECTOR_SIZE + 6] = 1;
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("the primary hierarchy mounts past an Enhanced descriptor");
+	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"hello iso");
+
+	// And a type-2 descriptor at any OTHER version is still a refusal: 2 is the Enhanced one and
+	// nothing else is defined.
+	let mut img = build_iso(false);
+	let mut odd = img[16 * SECTOR_SIZE..17 * SECTOR_SIZE].to_vec();
+	odd[0] = 2;
+	odd[6] = 3;
+	img[17 * SECTOR_SIZE..18 * SECTOR_SIZE].copy_from_slice(&odd);
+	img[18 * SECTOR_SIZE] = 255;
+	img[18 * SECTOR_SIZE + 1..18 * SECTOR_SIZE + 6].copy_from_slice(b"CD001");
+	img[18 * SECTOR_SIZE + 6] = 1;
+	assert_eq!(Iso9660::mount_checked(MemDisc { data: img }).err(), Some(MountError::Corrupt), "a version this format does not define is not a descriptor to skip");
+}
+
+#[test]
+fn a_joliet_descriptor_must_agree_with_the_primary_about_the_volume() {
+	// The PVD's volume set size and sequence number are validated in the `1 =>` arm; the `2 =>` arm
+	// took the Joliet root and the geometry and checked neither - and when Joliet is present that
+	// geometry BECOMES the filesystem's. ECMA-119 requires a Supplementary descriptor's common
+	// fields to match the primary's within one set, so a crafted medium could declare one volume
+	// space in the PVD and another in the SVD and have the second used without the two ever being
+	// compared.
+	//
+	// PER FIELD, because one mismatched-geometry test would pass on whichever of the four somebody
+	// happened to check.
+	assert!(Iso9660::mount(MemDisc { data: build_iso(true) }).is_some(), "the fixture itself agrees with its own primary");
+
+	// Volume space size.
+	let mut img = build_iso(true);
+	both32(&mut img[17 * SECTOR_SIZE..], 80, 22);
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "a Joliet descriptor declaring another volume space is not this volume's");
+
+	// Logical block size.
+	let mut img = build_iso(true);
+	img[17 * SECTOR_SIZE + 128..17 * SECTOR_SIZE + 130].copy_from_slice(&512u16.to_le_bytes());
+	img[17 * SECTOR_SIZE + 130..17 * SECTOR_SIZE + 132].copy_from_slice(&512u16.to_be_bytes());
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "nor one declaring another block size");
+
+	// Volume set size.
+	let mut img = build_iso(true);
+	both16(&mut img[17 * SECTOR_SIZE..], 120, 2);
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "nor one claiming to belong to a larger set");
+
+	// Volume sequence number.
+	let mut img = build_iso(true);
+	both16(&mut img[17 * SECTOR_SIZE..], 124, 2);
+	assert!(Iso9660::mount(MemDisc { data: img }).is_none(), "nor one claiming to be the second volume of it");
+}
+
+#[test]
+fn an_associated_file_record_is_validated_before_it_is_ignored() {
+	// `parse_record` validated the extent, the size and the volume sequence, saw the associated
+	// flag and returned `Ok(None)` - and the identifier length, the bounds and the identifier itself
+	// were validated after that point. So an associated-file record with `id_len = 0` was silently
+	// dropped, while the same `id_len = 0` on an ordinary record was `Corrupt`.
+	//
+	// That is the shape the `Result<Option<Entry>>` refactor was written to remove: a malformed
+	// record disappearing from a directory rather than refusing it. `Ok(None)` means "a well-formed
+	// record this reader deliberately does not surface".
+	let mut img = build_iso(false);
+	let root_off = 19 * SECTOR_SIZE;
+	// Walk to the free space after the fixture's records and write one associated-file record.
+	let mut at = root_off;
+	while img[at] != 0 {
+		at += img[at] as usize;
+	}
+	let mut rec = vec![0u8; 34];
+	rec[0] = 34;
+	both32(&mut rec, 2, 21);
+	both32(&mut rec, 10, 9);
+	rec[25] = 0x04; // associated file
+	rec[28..30].copy_from_slice(&1u16.to_le_bytes());
+	rec[30..32].copy_from_slice(&1u16.to_be_bytes());
+	rec[32] = 1;
+	rec[33] = b'A';
+	img[at..at + rec.len()].copy_from_slice(&rec);
+	let mut fs = Iso9660::mount(MemDisc { data: img.clone() }).expect("mount");
+	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+	assert!(!names.iter().any(|n| n == "A"), "a well-formed associated file is not surfaced: {names:?}");
+
+	// And a MALFORMED one is refused rather than dropped.
+	img[at + 32] = 0; // id_len = 0
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+	assert_eq!(fs.list(), Err(FsError::Corrupt), "an associated-file record with no identifier is malformed, whatever this reader would have done with a valid one");
+}
+
+#[test]
+fn a_window_read_of_a_large_file_does_not_stage_the_whole_thing() {
+	// `read_file` refuses past `MAX_READ_BYTES`; `read_file_into` exists so a window can be taken
+	// out of a file that large, and until this round the storage service could not reach it - `IsoFs`
+	// took the default `read_window`, which reads the whole file and slices it.
+	//
+	// The fixture is a logical file whose declared size is past the ceiling, in an image far smaller
+	// than that: the extent is bounded by the volume's own block count, so the read is refused for
+	// what it reaches rather than for what it claims - and the point is that the ceiling itself is
+	// not what stops it.
+	// The image grows so the file can: the extent is bounded by the volume's own block count, which
+	// is the check that would otherwise refuse this before the ceiling ever came up.
+	let mut img = build_iso(false);
+	img.resize(SECTOR_SIZE * 32, 0);
+	both32(&mut img[16 * SECTOR_SIZE..], 80, 32);
+	let root_off = 19 * SECTOR_SIZE;
+	let mut at = root_off;
+	while img[at] != 0 {
+		let len = img[at] as usize;
+		let id_len = img[at + 32] as usize;
+		if id_len > 1 && &img[at + 33..at + 33 + 5] == b"HELLO" {
+			both32(&mut img[at..], 10, (SECTOR_SIZE * 4) as u32);
+			break;
+		}
+		at += len;
+	}
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+	// A window from the middle, which the whole-file path would have had to stage four sectors for.
+	let mut window = [0u8; 16];
+	let read = fs.read_file_into(b"HELLO.TXT", SECTOR_SIZE as u64, &mut window).expect("a window past the first sector");
+	assert_eq!(read, 16, "the window is the size asked for");
+	// A window spanning the head, the aligned middle and the tail - the three paths the batched read
+	// takes, which a per-sector loop had no shape for.
+	let mut wide = vec![0u8; SECTOR_SIZE * 2 + 32];
+	let read = fs.read_file_into(b"HELLO.TXT", 16, &mut wide).expect("a window across three sectors");
+	assert_eq!(read, SECTOR_SIZE * 2 + 32);
+	// The first nine bytes of the extent are the fixture's own, so a window starting at 16 begins
+	// past them and the batched read has to have got its offsets right to see zeros there.
+	assert_eq!(&wide[..8], &[0u8; 8], "the head sector's bytes past the written content");
 }

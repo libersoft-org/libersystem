@@ -25,7 +25,7 @@ fn device_memory_maps_mmio_region() {
 		DONE.store(true, Ordering::SeqCst);
 	}
 	let phys = mem::frame::allocate().expect("a frame for the stand-in MMIO region");
-	let device = DeviceMemory::new(phys, mem::frame::PAGE_SIZE as usize);
+	let device = DeviceMemory::new(phys, mem::frame::PAGE_SIZE as usize).expect("a test device memory");
 	// Hand the capability to the driver thread as its bootstrap handle.
 	sched::spawn_with_object(body, device, Rights::ALL, 0);
 	sched::run_until_idle();
@@ -168,7 +168,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_XHCI {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0 }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, _pad1: [0; 6] }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}
@@ -182,7 +182,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	assert!(msix_cap != 0, "the xHCI controller should expose MSI-X");
 	let dest = arch::percpu::this_cpu().lapic_id() as u8;
 	let vector = arch::interrupts::acquire_msi(table_phys, dest, index as u32).expect("an MSI vector should be free");
-	let interrupt = object::interrupt::Interrupt::new(vector);
+	let interrupt = object::interrupt::Interrupt::new(vector).expect("a test interrupt");
 	assert!(arch::interrupts::bind_msi(vector, &interrupt), "the MSI vector should bind");
 	arch::pci::msix_enable(bus, dev, func, msix_cap);
 
@@ -191,7 +191,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let mut msg = alloc::vec::Vec::with_capacity(6 + core::mem::size_of::<abi::DeviceInfo>());
 	msg.extend_from_slice(b"DEVICE");
 	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
-	send_cap(&kernel_ep, &msg, DeviceMemory::new(bar_phys, bar_len as usize), Rights::ALL).expect("the DEVICE handoff should send");
+	send_cap(&kernel_ep, &msg, DeviceMemory::new(bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE handoff should send");
 	send_cap(&kernel_ep, b"IRQ", interrupt, Rights::ALL).expect("the IRQ handoff should send");
 	// The raw keyboard sink is the third handoff, and it is not optional here: the
 	// driver tolerates an absent sink (it stores handle 0 and carries on) but blocks
@@ -522,7 +522,7 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 			let wrong = {
 				use object::privilege::{Privilege, PrivilegeKind};
 				let thread = sched::current_thread().expect("a current thread");
-				let privilege = Privilege::create(PrivilegeKind::ConsoleSink);
+				let privilege = Privilege::create(PrivilegeKind::ConsoleSink).expect("a test privilege");
 				thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL, 0).expect("installs").raw()
 			};
 			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, wrong, 0, 0) as i64, syscall::ERR_ACCESS_DENIED, "a console authority does not open a device");
@@ -536,7 +536,7 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
 }

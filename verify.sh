@@ -274,6 +274,12 @@ if [[ "$action" == shadow ]]; then
 	model_before="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
 	targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- booted --stdin)" || planner_failed "the planner could not name the targets"
 	[[ -n "$targets" ]] || planner_failed "the plan named no target to sweep"
+	# THE BUILT SET, WHICH IS NOT THE BOOTED SET. A change that boots one target still has to compile
+	# on the other two, and the build-evidence producer below asks a question about BUILDS - so it
+	# loops over this and the guest shadow keeps `targets`. The two must not merge back: the plan
+	# carries both fields because they answer different questions.
+	build_targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- built --stdin)" || planner_failed "the planner could not name the build targets"
+	[[ -n "$build_targets" ]] || planner_failed "the plan named no target to build"
 	note "shadow: full sweep on ${targets//$'\n'/ }, compared against a selection that is not run"
 	note "        pinned to source $source_before"
 	for target in $targets; do
@@ -412,7 +418,7 @@ if [[ "$action" == shadow ]]; then
 	# each command below is a no-op re-run against a warm cache - it reports whether that part builds
 	# rather than building it again. PER ARCHITECTURE, because a build of x86_64 says nothing about
 	# aarch64, which is what `required_architectures` asks for.
-	for build_arch in $targets; do
+	for build_arch in $build_targets; do
 		build_log="$BUILD_DIR/logs/verify-build-shadow-$build_arch.txt"
 		: >"$build_log"
 		build_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- build-checks)" || planner_failed "the planner could not list the build checks"
@@ -428,7 +434,44 @@ if [[ "$action" == shadow ]]; then
 			fi
 		done <<<"$build_ids"
 		printf 'total %s\n' "$build_total" >>"$build_log"
-		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --build-log "../$build_log" --build-arch "$build_arch") || shadow_failed=1
+
+		# SHADOW-EXEC FOR THE BUILD UNIVERSE, when one was asked for.
+		#
+		# Everything above runs the CATALOG's commands, one part at a time. The production runner
+		# groups them - `./build.sh --arch X --part a,b,c` - and those are different code paths
+		# through the same script, of which only the second one ships. A grouped part list whose
+		# parser silently used only the first entry and exited zero would leave every check above
+		# passing and the scoped runner building less than the selection said, with every record
+		# clean and a certificate granted: the precise shape of the defect SHADOW-EXEC was built for.
+		#
+		# So the grouped command is RUN and what `build.sh` reports having built is compared against
+		# the parts the selection named. The same three invariants the guest comparison uses: it is
+		# executable, it is not wider than the selection, and the two agree.
+		build_exec=no
+		if [[ "${shadow_exec:-0}" == "1" ]]; then
+			build_steps="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- build-steps --stdin)" || planner_failed "the planner could not lower the build steps"
+			build_exec=ok
+			while IFS=$'\t' read -r label command keys; do
+				[[ -n "$command" ]] || continue
+				[[ "$command" == *"--arch $build_arch "* ]] || continue
+				built_line="$( (cd "$SRC_DIR/.." && eval "$command") 2>&1 | grep -E 'built: .* for ' | tail -1)" || true
+				if [[ -z "$built_line" ]]; then
+					note "shadow-exec (build, $build_arch): '$label' did not report what it built - the step is not executable as the runner ships it"
+					build_exec=no
+					break
+				fi
+				# `build.sh: built: sdk libs user kernel loader packages volume for x86_64`
+				reported="$(sed -E 's/.*built: (.*) for .*/\1/' <<<"$built_line" | tr ' ' '\n' | sort -u | paste -sd, -)"
+				wanted="$(tr '|' '\n' <<<"$keys" | sed -E 's#^build\.([^ ]+) .*#\1#' | sort -u | paste -sd, -)"
+				if [[ "$reported" != "$wanted" ]]; then
+					note "shadow-exec (build, $build_arch): the grouped step built [$reported] and the selection named [$wanted]"
+					build_exec=no
+					break
+				fi
+				note "shadow-exec (build, $build_arch): the grouped step built exactly what the selection named"
+			done <<<"$build_steps"
+		fi
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --build-log "../$build_log" --build-arch "$build_arch" --build-exec "$build_exec") || shadow_failed=1
 	done
 
 	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"

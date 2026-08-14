@@ -183,7 +183,7 @@ fn the_last_thread_out_is_decided_by_a_counter_not_a_snapshot() {
 	extern "C" fn nothing(_: u64) {}
 
 	let space = AddressSpace::create().expect("address space");
-	let process = Process::new(space, crate::object::domain::Domain::root());
+	let process = Process::new(space, crate::object::domain::Domain::root()).expect("a test process");
 
 	// four threads registered, four exits, exactly one "you were the last".
 	let threads: alloc::vec::Vec<_> = (0..4).map(|_| crate::object::thread::Thread::new(nothing, 0, process.clone()).expect("a thread")).collect();
@@ -192,7 +192,7 @@ fn the_last_thread_out_is_decided_by_a_counter_not_a_snapshot() {
 	assert_eq!(lasts, 1, "exactly one thread may be told it was the last");
 
 	// and it is the final one, not whichever ran first.
-	let process2 = Process::new(AddressSpace::create().expect("address space"), crate::object::domain::Domain::root());
+	let process2 = Process::new(AddressSpace::create().expect("address space"), crate::object::domain::Domain::root()).expect("a test process");
 	let _t: alloc::vec::Vec<_> = (0..2).map(|_| crate::object::thread::Thread::new(nothing, 0, process2.clone()).expect("a thread")).collect();
 	assert!(!process2.thread_exited(), "the first of two is not the last");
 	assert!(process2.thread_exited(), "the second of two is");
@@ -313,8 +313,8 @@ fn process_isolation_and_per_process_tables() {
 	}
 
 	// Two processes, each with its own page tables, in the root Domain.
-	let p1 = Process::new(AddressSpace::create().expect("address space 1"), sched::root_domain());
-	let p2 = Process::new(AddressSpace::create().expect("address space 2"), sched::root_domain());
+	let p1 = Process::new(AddressSpace::create().expect("address space 1"), sched::root_domain()).expect("a test process");
+	let p2 = Process::new(AddressSpace::create().expect("address space 2"), sched::root_domain()).expect("a test process");
 
 	// Back the same VA with a distinct physical frame in each process, and stamp a
 	// distinct value into each frame through the HHDM before mapping it.
@@ -738,11 +738,11 @@ fn system_graph_reflects_live_state() {
 	// with two handles, one of them the channel we installed - with its koid, type,
 	// rights, and badge intact. Dropping the process removes it from the graph.
 	let domain = Domain::new(1 << 20, 16, 8);
-	let process = Process::new(AddressSpace::kernel(), domain.clone());
+	let process = Process::new(AddressSpace::kernel(), domain.clone()).expect("a test process");
 	let (endpoint, _peer) = Channel::create();
 	let channel_koid = endpoint.header().koid();
 	process.install(endpoint, Rights::READ | Rights::WRITE, 42);
-	process.install(object::event::Event::create(), Rights::ALL, 0);
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0);
 
 	let node = graph::collect_from(&domain);
 	assert_eq!(node.koid, domain.header().koid());
@@ -772,7 +772,7 @@ fn process_counters_track_ipc_and_resources() {
 	// IPC volume independently, installing handles grows the handle count, and a kill is
 	// observable as the FAILED liveness the stats syscall derives.
 	let domain = Domain::new(1 << 20, 16, 8);
-	let process = Process::new(AddressSpace::kernel(), domain.clone());
+	let process = Process::new(AddressSpace::kernel(), domain.clone()).expect("a test process");
 	assert_eq!(process.messages_sent(), 0);
 	assert_eq!(process.messages_received(), 0);
 	assert_eq!(process.handle_count(), 0);
@@ -784,8 +784,8 @@ fn process_counters_track_ipc_and_resources() {
 	assert_eq!(process.messages_sent(), 2, "two sends counted");
 	assert_eq!(process.messages_received(), 1, "one recv counted");
 
-	process.install(object::event::Event::create(), Rights::ALL, 0);
-	process.install(object::event::Event::create(), Rights::ALL, 0);
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0);
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0);
 	assert_eq!(process.handle_count(), 2, "two installed handles");
 
 	// Liveness the stats syscall reports: not killed here, killed after terminate().
@@ -1242,7 +1242,7 @@ fn a_refused_capability_send_leaves_every_handle_with_the_sender() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the transfer thread ran to completion");
 }
@@ -1279,7 +1279,7 @@ fn a_receiver_too_small_for_a_message_keeps_it_queued() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
 }
@@ -1315,7 +1315,7 @@ fn a_batch_naming_one_handle_twice_is_refused_whole() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the batch thread ran to completion");
 }
@@ -1332,7 +1332,7 @@ fn starting_a_thread_twice_runs_it_once() {
 		RUNS.fetch_add(1, Ordering::SeqCst);
 	}
 	RUNS.store(0, Ordering::SeqCst);
-	let process = object::process::Process::new(object::address_space::AddressSpace::kernel(), sched::root_domain());
+	let process = object::process::Process::new(object::address_space::AddressSpace::kernel(), sched::root_domain()).expect("a test process");
 	let thread = sched::thread_create_suspended(process, body, 0).expect("a suspended thread");
 	assert!(sched::thread_start(thread.clone()), "the first release starts it");
 	assert!(!sched::thread_start(thread.clone()), "the second must report that it lost, not enqueue again");
@@ -1359,7 +1359,7 @@ fn a_wake_can_only_be_claimed_once() {
 	// over this was confidence that the claim is a compare-exchange, which is visible in the
 	// one line that implements it. What it cost was a suite that no longer meant anything.
 	extern "C" fn never_runs(_arg: u64) {}
-	let process = object::process::Process::new(object::address_space::AddressSpace::kernel(), sched::root_domain());
+	let process = object::process::Process::new(object::address_space::AddressSpace::kernel(), sched::root_domain()).expect("a test process");
 	let subject = sched::thread_create_suspended(process, never_runs, 0).expect("a suspended subject");
 
 	for round in 0..8 {
@@ -1406,7 +1406,7 @@ fn a_terminating_process_takes_no_new_mappings() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the termination thread ran to completion");
 }
@@ -1433,7 +1433,7 @@ fn a_timer_armed_after_the_wait_began_still_wakes_it() {
 
 	WOKE.store(false, Ordering::SeqCst);
 	RESULT.store(u64::MAX, Ordering::SeqCst);
-	let timer = object::timer::Timer::create();
+	let timer = object::timer::Timer::create().expect("a test timer");
 	let thread = sched::spawn_with_object(waiter, timer.clone(), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(!WOKE.load(Ordering::SeqCst), "the waiter must not return while the timer is unarmed");
@@ -1464,7 +1464,7 @@ fn wait_any_on_only_a_timer_returns_when_it_fires() {
 
 	WOKE.store(false, Ordering::SeqCst);
 	RESULT.store(u64::MAX, Ordering::SeqCst);
-	let timer = object::timer::Timer::create();
+	let timer = object::timer::Timer::create().expect("a test timer");
 	let thread = sched::spawn_with_object(waiter, timer.clone(), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(!WOKE.load(Ordering::SeqCst), "the waiter must not return while the timer is unarmed");
@@ -1555,7 +1555,7 @@ fn a_fuzzed_capability_batch_never_mints_a_capability() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the capability fuzz ran to completion");
 }
@@ -1616,7 +1616,7 @@ fn handle_churn_never_resurrects_a_closed_capability() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the handle churn ran to completion");
 }
@@ -1690,7 +1690,7 @@ fn fuzzed_map_and_unmap_sequences_round_trip_the_window() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the map/unmap fuzz ran to completion");
 }
@@ -1732,7 +1732,7 @@ fn a_refused_single_capability_send_leaves_the_handle_where_it_was() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the transfer thread ran to completion");
 }
@@ -1770,7 +1770,7 @@ fn a_receive_takes_a_message_only_if_it_fits() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
 }
@@ -1932,7 +1932,7 @@ fn a_set_that_was_told_it_joined_is_a_set_that_will_be_woken() {
 			WOKEN.store(all, Ordering::SeqCst);
 		}
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert_eq!(REFUSED.load(Ordering::SeqCst), syscall::ERR_RESOURCE_EXHAUSTED, "a set past what a wake can reach must be refused at the ADD, not silently left unwoken");
 	assert!(WOKEN.load(Ordering::SeqCst), "and every set inside the limit still answers for the member");
@@ -2040,7 +2040,7 @@ fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the wait-set thread ran to completion");
 }
@@ -2080,7 +2080,7 @@ fn a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the lifetime thread ran to completion");
 }
@@ -2101,7 +2101,7 @@ fn a_wait_set_has_a_ceiling_and_says_so() {
 			for _ in 0..object::wait_set::MAX_WAIT_SET_MEMBERS + 4 {
 				let handle = {
 					let thread = sched::current_thread().expect("a current thread");
-					let event = object::event::Event::create();
+					let event = object::event::Event::create().expect("a test event");
 					match thread.handles().lock().try_insert_object(event, object::rights::Rights::ALL, 0) {
 						Some(h) => h.raw(),
 						None => break,
@@ -2118,7 +2118,7 @@ fn a_wait_set_has_a_ceiling_and_says_so() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the ceiling thread ran to completion");
 }
@@ -2162,7 +2162,7 @@ fn a_secure_random_syscall_refuses_rather_than_answering_from_a_formula() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the random thread ran to completion");
 }
@@ -2235,7 +2235,7 @@ fn a_typed_receive_keeps_every_capability_a_client_sent() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create(), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the capability-count thread ran to completion");
 }

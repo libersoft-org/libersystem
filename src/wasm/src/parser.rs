@@ -80,7 +80,12 @@ impl<'a> Reader<'a> {
 	//
 	// The signed case's redundant byte is `0x00` after a non-negative value or `0x7f` after a
 	// negative one: both re-state the sign bit the previous byte already carried.
-	fn i64(&mut self) -> Result<i64, ParseError> {
+	// PARAMETERISED BY WIDTH, because the format specifies three of them. `i32.const` is `s32`, a
+	// block type is `s33` and `i64.const` is `s64`, and each bounds its own encoding: at most
+	// `ceil(bits/7)` bytes, with the last byte's unused payload bits required to be the sign
+	// extension. This read `s64` for all of them and the caller truncated with `as i32`, so
+	// `i32.const 0` written in six bytes parsed and became a different, well-formed module.
+	fn signed(&mut self, bits: u32) -> Result<i64, ParseError> {
 		let mut result: i64 = 0;
 		let mut shift: u32 = 0;
 		loop {
@@ -88,24 +93,36 @@ impl<'a> Reader<'a> {
 			// THE FINAL BYTE'S UNUSED BITS, which the width bound alone does not cover.
 			//
 			// A signed value of `n` bits has `ceil(n/7)` bytes, and the last one contributes only
-			// `n - 7*(ceil(n/7)-1)` meaningful bits - the rest must all be the sign. `s33` (a block
-			// type) and `s64` both end mid-byte, so a final byte whose top bits are neither all 0
-			// nor all 1 is an over-wide encoding rather than a large value. The specification calls
-			// these "integer too large" and "integer representation too long", and its own suite is
-			// what named them here.
-			if shift == 63 {
-				// Only ONE bit of the tenth byte is inside 64, so its seven payload bits must be
-				// all-zero (a positive value) or all-one (a negative one). Anything between carries
-				// bits past the width, which the specification calls "integer too large".
+			// `n - 7*(ceil(n/7)-1)` meaningful bits - the rest must all be the sign. `s32`, `s33`
+			// and `s64` all end mid-byte, so a final byte whose top bits are neither all 0 nor all 1
+			// is an over-wide encoding rather than a large value. The specification calls these
+			// "integer too large" and "integer representation too long", and its own suite is what
+			// named them here.
+			if shift + 7 >= bits {
+				// The last byte this width allows, so a continuation bit on it is a longer encoding
+				// than the width has room for.
+				if b & 0x80 != 0 {
+					return Err(ParseError("LEB128 signed value is longer than its width allows"));
+				}
+				// `remaining` payload bits are inside the width; the rest, and the byte's own top
+				// bit, must all repeat the sign.
 				//
 				// Derived from the FINAL BYTE and not from the value so far: nine bytes of ones
 				// build a positive `i64` and the tenth is what makes it -1, so reading the running
 				// value here refused `i64.const -1` written in full - which the specification's own
 				// suite says is well-formed. The check is about the byte, not about what has been
 				// accumulated, and the suite is what said so.
-				if (b & 0x7f) != 0x00 && (b & 0x7f) != 0x7f {
-					return Err(ParseError("LEB128 signed value does not fit in 64 bits"));
+				let remaining: u32 = bits - shift;
+				let sign: u8 = if (b >> (remaining - 1)) & 1 == 1 { 0x7f } else { 0x00 };
+				if remaining < 7 && (b & 0x7f) >> remaining != (sign >> remaining) {
+					return Err(ParseError("LEB128 signed value does not fit in its width"));
 				}
+				result |= ((b & 0x7f) as i64) << shift;
+				shift += 7;
+				if shift < 64 && (b & 0x40) != 0 {
+					result |= -1i64 << shift;
+				}
+				return Ok(result);
 			}
 			result |= ((b & 0x7f) as i64) << shift;
 			shift += 7;
@@ -115,10 +132,17 @@ impl<'a> Reader<'a> {
 				}
 				return Ok(result);
 			}
-			if shift >= 64 {
-				return Err(ParseError("LEB128 overflow"));
-			}
 		}
+	}
+
+	// `i32.const`'s immediate: `s32`, at most five bytes.
+	fn i32(&mut self) -> Result<i32, ParseError> {
+		Ok(self.signed(32)? as i32)
+	}
+
+	// `i64.const`'s immediate: `s64`, at most ten bytes.
+	fn i64(&mut self) -> Result<i64, ParseError> {
+		self.signed(64)
 	}
 
 	// A length-prefixed UTF-8 name.
@@ -328,8 +352,22 @@ fn parse_tables(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 			return Err(ParseError("only funcref tables are supported"));
 		}
 		let flags: u8 = r.byte()?;
+		// THE RULE `parse_memory` STATES, applied to the other limits in the format. See the comment
+		// there for why: the defined encodings are `0x00`, `0x01`, `0x04` and `0x05`, and the upper
+		// pair names a 64-bit address type this engine does not implement - so testing only bit 0
+		// parsed a table64 module here as an ordinary 32-bit table, which is a module for a
+		// different engine being read as one for this one.
+		if flags > 1 {
+			return Err(ParseError("a table limits flag byte this engine does not know"));
+		}
 		let min: u32 = r.u32()?;
 		let max: Option<u32> = if flags & 0x01 != 0 { Some(r.u32()?) } else { None };
+		// The same bound `parse_memory` places on its own pair, which the table half never had.
+		if let Some(max) = max
+			&& max < min
+		{
+			return Err(ParseError("a table whose maximum is below its minimum"));
+		}
 		m.table = Some(Table { min, max });
 	}
 	Ok(())
@@ -381,8 +419,8 @@ fn parse_elements(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 fn const_expr(r: &mut Reader) -> Result<(i64, ValType), ParseError> {
 	let op: u8 = r.byte()?;
 	let (v, ty): (i64, ValType) = match op {
-		0x41 => (r.i64()? as i32 as i64, ValType::I32), // i32.const (sign-extended via i32)
-		0x42 => (r.i64()?, ValType::I64),               // i64.const
+		0x41 => (r.i32()? as i64, ValType::I32), // i32.const: `s32`, not a truncated `s64`
+		0x42 => (r.i64()?, ValType::I64),        // i64.const
 		0x43 => {
 			let b: &[u8] = r.bytes(4)?; // f32.const: raw IEEE-754 bits, little-endian
 			(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64, ValType::F32)
@@ -485,10 +523,14 @@ fn parse_exports(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 		let name: String = r.name()?;
 		let kind_byte: u8 = r.byte()?;
 		let index: u32 = r.u32()?;
+		// AN UNDEFINED KIND BYTE IS A REFUSAL, not a catch-all. The format defines exactly four, and
+		// a fifth is a module this parser is reading as something its author did not write.
 		let kind: ExportKind = match kind_byte {
 			0x00 => ExportKind::Func,
+			0x01 => ExportKind::Table,
 			0x02 => ExportKind::Memory,
-			_ => ExportKind::Other,
+			0x03 => ExportKind::Global,
+			_ => return Err(ParseError("an export kind byte the format does not define")),
 		};
 		m.exports.push(Export { name, kind, index });
 	}

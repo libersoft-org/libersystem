@@ -58,7 +58,7 @@ impl ProcessGroup {
 		}
 		let weak: Vec<Weak<Process>> = members.iter().map(Arc::downgrade).collect();
 		let original_size = weak.len();
-		Some(Arc::new(Self { header: ObjectHeader::new(), members: SpinLock::new(weak), original_size }))
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), members: SpinLock::new(weak), original_size })
 	}
 
 	// The members still alive, as owning references. Dead entries are dropped from the list as

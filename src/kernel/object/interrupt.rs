@@ -27,8 +27,9 @@ pub struct Interrupt {
 }
 
 impl Interrupt {
-	pub fn new(vector: u8) -> Arc<Self> {
-		Arc::new(Self { header: ObjectHeader::new(), vector, pending: AtomicBool::new(false), bound: AtomicBool::new(false) })
+	// FALLIBLY: `SYS_IRQ_BIND` and `SYS_DEVICE_MSIX_ACQUIRE` reach this.
+	pub fn new(vector: u8) -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), vector, pending: AtomicBool::new(false), bound: AtomicBool::new(false) })
 	}
 
 	pub fn vector(&self) -> u8 {

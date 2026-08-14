@@ -53,7 +53,22 @@ step_sdk() {
 	# `--workspace`, because `src/sdk` is the SDK LIBRARY now and the component is the example
 	# beside it. Without it cargo builds the root package only and the staged `.wasm` is whatever
 	# the last build left behind.
+	#
+	# THE SHIPPING BUILD, and the one the image stages. `dev-diagnostics` is off, so the guest's
+	# panic handler traps in silence - a component should not narrate its own failures to a log it
+	# does not own - and `mkpackages` reads `.build/cargo/sdk/.../liber_component.wasm` for exactly
+	# that reason.
 	(cd "$SRC_DIR/sdk" && cargo build --release --target wasm32-unknown-unknown --workspace)
+	# AND THE SAME EXAMPLE WITH THE FEATURE ON, into its own target directory so the artifact above
+	# is untouched.
+	#
+	# `src/wasm`'s toolchain test asserts what a real guest does when it panics, and both halves of
+	# `report_panic` are worth asserting: with the feature it logs its line through the granted log
+	# AND traps, without it it only traps. One artifact can only be one of those, and because
+	# nothing in the tree passed `--features` the half that ran was always the silent one -
+	# everything under `#[cfg(feature = "dev-diagnostics")]` in `src/sdk/src/panic.rs` had no
+	# automatic coverage against a real guest at all. Two artifacts, each asserted unconditionally.
+	(cd "$SRC_DIR/sdk" && CARGO_TARGET_DIR="$BUILD_DIR/cargo/sdk-dev" cargo build --release --target wasm32-unknown-unknown -p liber_component --features liber-sdk/dev-diagnostics)
 }
 
 step_libs() {

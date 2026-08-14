@@ -262,12 +262,13 @@ pub fn spawn(entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 // A remote target core is kicked with a wake IPI, so a halted core picks the
 // thread up immediately instead of on its next timer tick.
 pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
-	let process = Process::new(kernel_as(), root_domain());
+	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
 	// A KERNEL thread. Nothing here has a caller that could carry a refusal back to
 	// somebody who could act on it - these are boot-time and test-time spawns - so an
 	// out-of-frames says so and stops. The userspace-reachable path is `thread_create`
 	// below, and that one returns None.
 	let thread = Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack");
+	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
 	cpu_sched(cpu).inner.lock().run_queue.push_back(thread.clone());
 	if cpu != current_cpu_id() {
 		arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
@@ -288,13 +289,14 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 // of them runs. Split out of `spawn_with_object` rather than added beside it, so the two cannot
 // drift in how a thread is constructed.
 pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
-	let process = Process::new(kernel_as(), root_domain());
+	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
 	let arg = process.install(object, rights, badge);
 	Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack")
 }
 
 // Release a prepared thread onto the run queue.
 pub fn start_thread(thread: &Arc<Thread>) {
+	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
 }
 
@@ -302,8 +304,9 @@ pub fn start_thread(thread: &Arc<Thread>) {
 // Domain's thread quota. Returns None (spawning nothing) if the Domain is at its
 // thread cap - a clean refusal rather than a crash.
 pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
-	let process = Process::new(kernel_as(), domain);
+	let process = Process::new(kernel_as(), domain)?;
 	let thread = Thread::new_in(entry, arg, process)?;
+	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
 	Some(thread)
 }
@@ -312,13 +315,14 @@ pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Opt
 // None if no frame is available for the address space's top-level page table.
 pub fn process_create(domain: Arc<Domain>) -> Option<Arc<Process>> {
 	let address_space = AddressSpace::create()?;
-	Some(Process::new(address_space, domain))
+	Process::new(address_space, domain)
 }
 
 // Create a thread in an existing `process` on the current core's run queue. The
 // thread shares the process's address space and handle table with its siblings.
 pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
 	let thread = Thread::new(entry, arg, process)?;
+	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
 	Some(thread)
 }
@@ -341,6 +345,7 @@ pub fn thread_start(thread: Arc<Thread>) -> bool {
 		return false;
 	}
 	thread.set_state(ThreadState::Ready);
+	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread);
 	true
 }
@@ -469,8 +474,10 @@ pub fn block_on_flagged<F: Fn() -> bool>(koid: u64, deadline: u64, periodic: boo
 	// Register under the koid even when it is 0 (nothing will wake it by object):
 	// the bucket entry's Arc is what keeps a blocked thread alive off every run
 	// queue, deadline or not.
+	// ALLOC-OK: one entry per BLOCKED thread, bounded by the Domain's thread quota.
 	bucket_of(koid).lock().push(BucketWaiter { thread: thread.clone(), koid });
 	if deadline != NO_DEADLINE {
+		// ALLOC-OK: one entry per sleeping thread, bounded by the Domain's thread quota.
 		TIMED_WAITERS.lock().push(TimedWaiter { thread: thread.clone(), deadline, periodic });
 	}
 	// Re-check now that we are registered. If the object became ready in the race
@@ -522,9 +529,11 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 	arch::disable_interrupts();
 	thread.begin_park();
 	for &koid in koids {
+		// ALLOC-OK: one entry per BLOCKED thread, bounded by the Domain's thread quota.
 		bucket_of(koid).lock().push(BucketWaiter { thread: thread.clone(), koid });
 	}
 	if deadline != NO_DEADLINE {
+		// ALLOC-OK: one entry per sleeping thread, bounded by the Domain's thread quota.
 		TIMED_WAITERS.lock().push(TimedWaiter { thread: thread.clone(), deadline, periodic });
 	}
 	// Register-then-recheck, closing the wait/wake race across the whole set (see
@@ -720,6 +729,7 @@ fn enqueue(thread: Arc<Thread>) {
 	// no shootdown, so a thread migrating away from a core leaves translations behind it.
 	// That is the open item in Phase 2, and it is the reason migration is not yet safe for
 	// a process with threads on several cores rather than a reason to stop migrating.
+	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
 	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread);
 }
 
@@ -1010,6 +1020,7 @@ fn stash_prev(inner: &mut CpuSchedInner, sched: &CpuSched, prev: Option<Arc<Thre
 				}
 				Disposition::Requeue => {
 					prev.set_state(ThreadState::Ready);
+					// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota, and a deque that has held its peak never reallocates again.
 					inner.run_queue.push_back(prev);
 				}
 				Disposition::Block => {

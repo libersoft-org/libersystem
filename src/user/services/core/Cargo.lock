@@ -283,7 +283,9 @@ name = "service-logic"
 version = "0.0.0"
 dependencies = [
  "abi",
+ "base-proto",
  "bootproto",
+ "wasm",
 ]
 
 [[package]]

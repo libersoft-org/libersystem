@@ -182,6 +182,41 @@ fn the_snapshot_names_every_syscall_the_crate_declares() {
 	assert_eq!(declared, snapshot, "the crate declares {} `pub const SYS_*` and the snapshot names {}; a syscall was added or removed without updating `SYSCALLS`", declared.len(), snapshot.len());
 }
 
+// The `pub const RIGHT_*` this crate declares, read out of its own source.
+//
+// The same argument `declared_syscalls` makes, for the family beside it. `RIGHTS` below is a frozen
+// snapshot and its comment says "a thirteenth right added without touching the literal is a right
+// that `RIGHTS_ALL` silently does not grant" - and a thirteenth right added without touching EITHER
+// the literal or the list is exactly as silent. Correctness stays with the snapshot, because only a
+// frozen copy can catch a value MOVING; completeness comes from the source, which nobody has to
+// remember to update.
+fn declared_rights() -> alloc::vec::Vec<(alloc::string::String, u32)> {
+	const SOURCE: &str = include_str!("lib.rs");
+	let mut out: alloc::vec::Vec<(alloc::string::String, u32)> = alloc::vec::Vec::new();
+	for line in SOURCE.lines() {
+		let Some(rest) = line.strip_prefix("pub const RIGHT_") else { continue };
+		let Some((name, value)) = rest.split_once(": u32 = ") else { continue };
+		let value = value.trim().trim_end_matches(';').trim();
+		let parsed = value.strip_prefix("1 << ").and_then(|shift| shift.trim().parse::<u32>().ok()).map(|shift| 1u32 << shift);
+		let Some(number) = parsed else { continue };
+		out.push((alloc::format!("RIGHT_{name}"), number));
+	}
+	out
+}
+
+// The `pub const ERR_*` this crate declares, likewise.
+fn declared_errors() -> alloc::vec::Vec<(alloc::string::String, i64)> {
+	const SOURCE: &str = include_str!("lib.rs");
+	let mut out: alloc::vec::Vec<(alloc::string::String, i64)> = alloc::vec::Vec::new();
+	for line in SOURCE.lines() {
+		let Some(rest) = line.strip_prefix("pub const ERR_") else { continue };
+		let Some((name, value)) = rest.split_once(": i64 = ") else { continue };
+		let Some(number) = value.trim().strip_suffix(';').and_then(|n| n.trim().parse::<i64>().ok()) else { continue };
+		out.push((alloc::format!("ERR_{name}"), number));
+	}
+	out
+}
+
 #[test]
 fn every_right_is_one_bit_and_rights_all_is_their_union() {
 	// `RIGHTS_ALL` was a hand-written 0xfff beside twelve individually defined bits. A thirteenth
@@ -207,6 +242,15 @@ fn every_right_is_one_bit_and_rights_all_is_their_union() {
 		union |= bit;
 	}
 	assert_eq!(union, RIGHTS_ALL, "RIGHTS_ALL is not the union of the rights that exist");
+
+	// AND THE LIST IS EVERY RIGHT, which is the half that was asserted rather than checked. A
+	// thirteenth right added without touching this list would have left the union above correct over
+	// twelve bits and `RIGHTS_ALL` correct over thirteen, and nothing would have said so.
+	let mut declared: alloc::vec::Vec<u32> = declared_rights().into_iter().map(|(_, bit)| bit).collect();
+	declared.sort_unstable();
+	let mut snapshot: alloc::vec::Vec<u32> = RIGHTS.iter().map(|&(bit, _)| bit).collect();
+	snapshot.sort_unstable();
+	assert_eq!(declared, snapshot, "the crate declares {} `pub const RIGHT_*` and this list names {}; a right was added or removed without updating it", declared.len(), snapshot.len());
 }
 
 #[test]
@@ -232,6 +276,14 @@ fn the_error_codes_are_what_they_were() {
 		assert_eq!(code, expected, "an error code moved");
 		assert_eq!(code, -(index as i64 + 1), "the error codes are no longer contiguous from -1");
 	}
+
+	// And the snapshot names every error the crate declares - the same completeness check the
+	// syscalls have and this family did not.
+	let mut declared: alloc::vec::Vec<i64> = declared_errors().into_iter().map(|(_, code)| code).collect();
+	declared.sort_unstable();
+	let mut snapshot: alloc::vec::Vec<i64> = ERRORS.iter().map(|&(code, _)| code).collect();
+	snapshot.sort_unstable();
+	assert_eq!(declared, snapshot, "the crate declares {} `pub const ERR_*` and the snapshot names {}; an error was added or removed without updating it", declared.len(), snapshot.len());
 }
 
 // The fields a `repr(C)` struct declares, in order, read out of the crate's own source.
@@ -264,21 +316,71 @@ fn declared_fields(name: &str) -> alloc::vec::Vec<alloc::string::String> {
 // Size, alignment, and the offset of every field IN DECLARATION ORDER - checked against the source,
 // so the list cannot quietly stop being every field.
 macro_rules! assert_layout {
-	($ty:ident, $size:expr, $align:expr, $($field:ident => $offset:expr),+ $(,)?) => {{
-		use core::mem::{align_of, offset_of, size_of};
+	($covered:ident, $ty:ident, $size:expr, $align:expr, $($field:ident => $offset:expr),+ $(,)?) => {{
+		use core::mem::{align_of, offset_of, size_of, size_of_val};
 		assert_eq!((size_of::<$ty>(), align_of::<$ty>()), ($size, $align), concat!(stringify!($ty), " changed size or alignment"));
 		$(assert_eq!(offset_of!($ty, $field), $offset, concat!(stringify!($ty), ".", stringify!($field), " moved"));)+
 		let named: alloc::vec::Vec<alloc::string::String> = alloc::vec![$(alloc::string::String::from(stringify!($field))),+];
 		assert_eq!(declared_fields(stringify!($ty)), named, concat!(stringify!($ty), ": the assertions above are not every field in declaration order"));
+		// NO IMPLICIT PADDING: every byte of the struct belongs to a named field.
+		//
+		// THE PROPERTY, not the instance. `DeviceInfo` had four unnamed bytes, they were named, and
+		// the change that landed next created six more at the other end - and the assertions above
+		// FIRED on that change, on the size, and the belief they corrected was about where the new
+		// fields would fit. "Size, alignment and every field offset are what they were" and "every
+		// byte belongs to a named field" are different properties, and the first was satisfied by a
+		// change that broke the second. These structs are copied to userspace with
+		// `size_of::<T>()` from values built on the kernel stack, and Rust does not promise that
+		// padding in an otherwise initialised value is initialised.
+		let probe = <$ty>::default();
+		let mut occupied = 0usize;
+		$(occupied += size_of_val(&probe.$field);)+
+		assert_eq!(occupied, size_of::<$ty>(), concat!(stringify!($ty), ": its fields occupy fewer bytes than the struct, so `repr(C)` inserted padding - name it, the way `_pad0` is named, or userspace receives whatever the kernel stack held there"));
+		$covered.push(alloc::string::String::from(stringify!($ty)));
 	}};
+}
+
+// The `repr(C)` structs this crate declares, read out of its own source.
+//
+// Nine structs, nine layout assertions, and nothing that said the two numbers must match. This is
+// what makes the no-implicit-padding property above cover the CRATE rather than the nine structs
+// somebody listed.
+fn declared_repr_c_structs() -> alloc::vec::Vec<alloc::string::String> {
+	const SOURCE: &str = include_str!("lib.rs");
+	let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+	let mut marked = false;
+	for line in SOURCE.lines() {
+		let line = line.trim();
+		if line == "#[repr(C)]" {
+			marked = true;
+			continue;
+		}
+		if let Some(rest) = line.strip_prefix("pub struct ")
+			&& marked
+		{
+			let name = rest.split(|c: char| c == ' ' || c == '{' || c == '<').next().unwrap_or("");
+			out.push(alloc::string::String::from(name));
+			marked = false;
+			continue;
+		}
+		// A `#[derive(..)]` between the two is expected; anything else ends the run.
+		if !line.starts_with("#[derive") && !line.starts_with("//") && !line.is_empty() {
+			marked = false;
+		}
+	}
+	out
 }
 
 #[test]
 fn every_marshalled_struct_has_the_layout_it_had() {
 	// The offsets are the point: a size that happens to stay the same while two fields swap places
 	// is the change this catches and a size check does not.
+	//
+	// `covered` collects what was asserted, so the crate's own source can say whether that is all of
+	// them - the same completeness argument the syscall snapshot is built on.
+	let mut covered: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 	assert_layout!(
-		DeviceInfo, 48, 8,
+		covered, DeviceInfo, 48, 8,
 		device_type => 0,
 		// The explicit padding must stay where the implicit padding was.
 		_pad0 => 4,
@@ -292,16 +394,20 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		bus => 36,
 		dev => 37,
 		func => 38,
-		// The three that replaced the single `_pad` byte. They occupy it and the two the struct's
-		// tail alignment already held, so nothing before them moved - and this assertion is what
-		// says so rather than leaving it to be believed.
+		// The three the standards identity added. They took the struct from 40 bytes to 48 - there
+		// was no tail padding to use, since 40 is already 8-aligned - and nothing BEFORE them moved,
+		// which is the half of the old claim here that was true. The struct's own comment corrected
+		// the other half and this copy of it was left behind.
 		class => 39,
 		subclass => 40,
 		prog_if => 41,
+		// And the six bytes the growth created, named rather than implicit: this struct is copied
+		// to userspace with `size_of::<T>()` from a value built on the kernel stack.
+		_pad1 => 42,
 	);
 
 	assert_layout!(
-		Framebuffer, 24, 4,
+		covered, Framebuffer, 24, 4,
 		width => 0,
 		height => 4,
 		pitch => 8,
@@ -315,10 +421,10 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		_pad => 22,
 	);
 
-	assert_layout!(ObjectInfo, 32, 8, koid => 0, object_type => 8, rights => 16, generation => 20, size => 24);
+	assert_layout!(covered, ObjectInfo, 32, 8, koid => 0, object_type => 8, rights => 16, generation => 20, size => 24);
 
 	assert_layout!(
-		ProcessStats, 56, 8,
+		covered, ProcessStats, 56, 8,
 		messages_sent => 0,
 		messages_received => 8,
 		handle_count => 16,
@@ -329,7 +435,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	);
 
 	assert_layout!(
-		DomainStats, 104, 8,
+		covered, DomainStats, 104, 8,
 		memory_used => 0,
 		memory_peak => 8,
 		memory_limit => 16,
@@ -345,11 +451,11 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		stack_limit => 96,
 	);
 
-	assert_layout!(MemoryStats, 32, 8, total_frames => 0, free_frames => 8, heap_total => 16, heap_free => 24);
-	assert_layout!(MemmapRegion, 24, 8, base => 0, length => 8, kind => 16, _pad => 20);
-	assert_layout!(IrqInfo, 16, 4, vector => 0, kind => 4, bound => 8, device => 12);
+	assert_layout!(covered, MemoryStats, 32, 8, total_frames => 0, free_frames => 8, heap_total => 16, heap_free => 24);
+	assert_layout!(covered, MemmapRegion, 24, 8, base => 0, length => 8, kind => 16, _pad => 20);
+	assert_layout!(covered, IrqInfo, 16, 4, vector => 0, kind => 4, bound => 8, device => 12);
 	assert_layout!(
-		PciInfo, 12, 2,
+		covered, PciInfo, 12, 2,
 		vendor => 0,
 		device => 2,
 		class => 4,
@@ -360,6 +466,16 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		func => 9,
 		_pad => 10,
 	);
+
+	// AND EVERY `repr(C)` STRUCT THE CRATE DECLARES IS ONE OF THEM. Nine structs, nine assertions,
+	// and nothing said the two numbers had to match - so a tenth marshalled struct would have had no
+	// layout assertion and no padding check, and the properties above would have covered the nine
+	// somebody remembered.
+	let mut declared = declared_repr_c_structs();
+	declared.sort();
+	let mut asserted = covered;
+	asserted.sort();
+	assert_eq!(declared, asserted, "the crate declares {} `repr(C)` structs and {} have layout assertions; a marshalled struct was added without one", declared.len(), asserted.len());
 }
 
 #[test]

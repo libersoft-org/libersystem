@@ -77,6 +77,7 @@ pub fn set_cpu_count(count: usize) {
 		// ALLOC-OK: boot, the core id table, built during SMP bring-up
 		let mut ids: Vec<AtomicU32> = Vec::with_capacity(count);
 		for i in 0..count {
+			// ALLOC-OK: CPU bring-up at boot; bounded by MAX_CPUS.
 			ids.push(AtomicU32::new(i as u32));
 		}
 		LAPIC_IDS.store(Vec::leak(ids).as_mut_ptr(), Ordering::Release);
@@ -129,6 +130,7 @@ pub fn init(boot_info: &BootInfo) {
 	// firmware exposed no RSDP or no MADT (the kernel then runs single-core).
 	let mut lapics = madt_local_apics(boot_info.rsdp);
 	if lapics.is_empty() {
+		// ALLOC-OK: CPU bring-up at boot; bounded by MAX_CPUS.
 		lapics.push(bsp_lapic_id);
 	}
 
@@ -458,6 +460,7 @@ fn parse_madt(hhdm: u64, madt_phys: u64, out: &mut Vec<u32>) {
 			let apic_id = unsafe { *base.add(off + 3) } as u32;
 			let flags = unsafe { core::ptr::read_unaligned(base.add(off + 4) as *const u32) };
 			if flags & 1 != 0 {
+				// ALLOC-OK: CPU bring-up at boot; bounded by MAX_CPUS.
 				out.push(apic_id);
 			}
 		}

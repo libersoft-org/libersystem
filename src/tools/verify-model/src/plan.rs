@@ -58,6 +58,46 @@ pub struct PathVerdict {
 	pub detail: String,
 }
 
+// The selector's decision ABOUT each component: what it selected for it, how it reached it, and
+// which architectures that implied - digested, so a record can carry one line per component instead
+// of the whole plan.
+//
+// `Check::covers` is the mapping. A component the plan selected nothing for still gets an entry, so
+// "nothing was selected for audio" is itself a decision two runs can agree or disagree about.
+fn decisions(catalog: &crate::catalog::Catalog, items: &[PlanItem], edge_kinds: &[String], built: &[String], booted: &[String], components: &[String]) -> Vec<String> {
+	let mut out: Vec<String> = Vec::new();
+	for component in components {
+		let mut parts: Vec<String> = Vec::new();
+		for item in items {
+			let covers = catalog.checks.iter().find(|check| check.id == item.key.check).map(|check| check.covers.contains(component)).unwrap_or(false);
+			if covers {
+				parts.push(item.key.display());
+			}
+		}
+		parts.sort();
+		parts.dedup();
+		parts.push(format!("edges={}", edge_kinds.join(",")));
+		parts.push(format!("built={}", built.join(",")));
+		parts.push(format!("booted={}", booted.join(",")));
+		out.push(format!("{component}\t{:016x}", digest(&parts.join("\n"))));
+	}
+	out.sort();
+	out.dedup();
+	out
+}
+
+// A short content digest, enough to tell two decisions apart. Not cryptographic and not pretending
+// to be: nothing here defends against a chosen collision, and the alternative - storing the whole
+// decision in every record - makes the evidence log unreadable.
+fn digest(text: &str) -> u64 {
+	let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+	for byte in text.as_bytes() {
+		hash ^= *byte as u64;
+		hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+	}
+	hash
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Plan {
 	// Whether this is the whole thing. Recorded rather than inferred from the item count, because
@@ -71,6 +111,17 @@ pub struct Plan {
 	pub architectures_built: Vec<String>,
 	pub architectures_booted: Vec<String>,
 	pub items: Vec<PlanItem>,
+	// WHAT THE SELECTOR DECIDED FOR EACH COMPONENT, as `component\tdigest` pairs.
+	//
+	// Distinctness in the trust store used to be keyed on the CHANGE SET, and the criterion it
+	// serves is five genuinely different changes. On one unchanged tree, `audio + neighbour-0` ..
+	// `audio + neighbour-4` are five different change sets whose decision about AUDIO may be
+	// byte-identical - and the neighbour is free, while the audio half is what the certificate is
+	// about. So the record carries what was decided about each component, and the store keys on that.
+	//
+	// Computed here because this is where the catalog is: `Check::covers` is what says which
+	// component a selected item is about.
+	pub component_decisions: Vec<String>,
 	// WHICH EDGES the selection walked to reach what it selected.
 	//
 	// Recorded so a shadow record can say what it is evidence ABOUT. `Store::evaluate` counts clean
@@ -313,7 +364,16 @@ impl<'a> Planner<'a> {
 			return self.full_plan(paths, seeds, affected, vec![String::from("an empty selection for a change with owned paths")], warnings);
 		}
 
-		Plan { full, full_reasons, paths, changed_components: seeds.into_iter().collect(), affected_components: affected.into_iter().collect(), architectures_built: built.into_iter().collect(), architectures_booted: booted.into_iter().collect(), items, edge_kinds, nothing_to_do, warnings }
+		let changed_components: Vec<String> = seeds.into_iter().collect();
+		let affected_components: Vec<String> = affected.into_iter().collect();
+		let architectures_built: Vec<String> = built.into_iter().collect();
+		let architectures_booted: Vec<String> = booted.into_iter().collect();
+		let mut components: Vec<String> = changed_components.clone();
+		components.extend(affected_components.iter().cloned());
+		components.sort();
+		components.dedup();
+		let component_decisions = decisions(self.catalog, &items, &edge_kinds, &architectures_built, &architectures_booted, &components);
+		Plan { full, full_reasons, paths, changed_components, affected_components, architectures_built, architectures_booted, items, component_decisions, edge_kinds, nothing_to_do, warnings }
 	}
 
 	// Why this check is in the plan, or None for "it is not".
@@ -389,7 +449,14 @@ impl<'a> Planner<'a> {
 			}
 		}
 		items.sort_by(|left, right| left.key.cmp(&right.key));
-		Plan { full: true, full_reasons: reasons, paths, changed_components: seeds.into_iter().collect(), affected_components: affected.into_iter().collect(), architectures_built: all.clone(), architectures_booted: all, items, edge_kinds: Vec::new(), nothing_to_do: false, warnings }
+		let changed_components: Vec<String> = seeds.into_iter().collect();
+		let affected_components: Vec<String> = affected.into_iter().collect();
+		let mut components: Vec<String> = changed_components.clone();
+		components.extend(affected_components.iter().cloned());
+		components.sort();
+		components.dedup();
+		let component_decisions = decisions(self.catalog, &items, &[], &all, &all, &components);
+		Plan { full: true, full_reasons: reasons, paths, changed_components, affected_components, architectures_built: all.clone(), architectures_booted: all, items, component_decisions, edge_kinds: Vec::new(), nothing_to_do: false, warnings }
 	}
 }
 

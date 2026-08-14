@@ -79,6 +79,7 @@ fn run() -> Result<ExitCode, String> {
 	// back from, and until it existed 189 of the catalog's 192 components could never reach TRUSTED.
 	let mut build_log: Option<String> = None;
 	let mut build_arch: String = String::from("x86_64");
+	let mut build_exec = false;
 	// `--scoped` narrows a producer to the keys the SELECTION names, which is what an execution
 	// sample runs. Without it a producer emits the whole universe, which is the sweep.
 	let mut scoped_only = false;
@@ -138,6 +139,16 @@ fn run() -> Result<ExitCode, String> {
 				index += 1;
 				dev_scoped_log = Some(arguments.get(index).ok_or("--dev-scoped-log needs a path")?.clone());
 			}
+			// Whether a SHADOW-EXEC sample for the BUILD universe came back agreeing.
+			//
+			// The evidence producer runs the catalog's commands one part at a time; the runner
+			// groups them. `verify.sh` runs the grouped one and compares what `build.sh` reports
+			// building against the parts the selection named - so the mechanism that ships is the
+			// one that was sampled, which is the whole argument SHADOW-EXEC is made of.
+			"--build-exec" => {
+				index += 1;
+				build_exec = arguments.get(index).map(|value| value == "ok").unwrap_or(false);
+			}
 			"--build-log" => {
 				index += 1;
 				build_log = Some(arguments.get(index).ok_or("--build-log needs a path")?.clone());
@@ -181,7 +192,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "booted" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
 	{
 		command = positional.remove(0);
 	}
@@ -279,6 +290,30 @@ fn run() -> Result<ExitCode, String> {
 		// It costs no extra run. A full sweep already builds every part on every architecture; this
 		// says which keys those runs discharge, in the same shape the other two producers emit, so
 		// `compare_keyed` is pointed at it unchanged.
+		// The COLLAPSED build steps the production runner ships, one per architecture, with the keys
+		// each claims to discharge: `label \t command \t key|key|...`.
+		//
+		// `build-checks` above lists the catalog's per-part commands, which is what the evidence
+		// producer runs - one `--part` at a time. The runner groups them: `./build.sh --arch X
+		// --part a,b,c`. Those are different code paths through the same script and only the second
+		// one was ever compared. A grouped `--part a,b,c` whose parser silently used only `a` and
+		// exited zero would leave every individual build check passing, every `HostBuild` record
+		// clean, a certificate granted - and the scoped runner building less than the selection
+		// said. That is the precise shape of the defect SHADOW-EXEC was built for.
+		"build-steps" => {
+			let ownership = model.ownership();
+			let planner = Planner::for_model(&model, &ownership);
+			let plan = if paths.is_empty() { planner.full_plan(Vec::new(), BTreeSet::new(), BTreeSet::new(), vec![String::from("no changed paths were given")], Vec::new()) } else { planner.plan(&paths) };
+			let kernel_tests: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+			for step in verify_model::commands::steps(&plan, &kernel_tests, &model.registry) {
+				if !step.command.starts_with("./build.sh") {
+					continue;
+				}
+				let keys: Vec<String> = step.keys.iter().map(|key| key.display()).collect();
+				println!("{}\t{}\t{}", step.label, step.command, keys.join("|"));
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		"build-checks" => {
 			for check in &model.catalog.checks {
 				if check.kind != verify_model::catalog::CheckKind::Build {
@@ -413,6 +448,28 @@ fn run() -> Result<ExitCode, String> {
 			}
 			Ok(ExitCode::SUCCESS)
 		}
+		// Which targets a change must be BUILT on, one per line.
+		//
+		// SEPARATE FROM `booted`, and this milestone separated the two fields on purpose: a change
+		// that boots one target still has to COMPILE on the other two, which the regression corpus
+		// states in its own words - `riscv64-trap-handling` boots riscv64 alone and must select
+		// `build.kernel / x86_64 / host / shared-image`, "a branch that stops compiling elsewhere is
+		// a regression as well".
+		//
+		// `verify.sh`'s build-evidence producer looped over the BOOTED set, so on exactly that change
+		// the planner selected an x86_64 build check and the shadow producer never ran one. The
+		// ordinary shape of userspace work - cross-build everything, boot x86_64 - recorded build
+		// evidence for one architecture, and `HostBuild` requires two. The wall was removed from the
+		// data model two rounds ago; the shell was still building the wrong side of it.
+		"built" => {
+			let ownership = model.ownership();
+			let planner = Planner::for_model(&model, &ownership);
+			let plan = if paths.is_empty() { planner.full_plan(Vec::new(), BTreeSet::new(), BTreeSet::new(), vec![String::from("no changed paths were given")], Vec::new()) } else { planner.plan(&paths) };
+			for architecture in &plan.architectures_built {
+				println!("{architecture}");
+			}
+			Ok(ExitCode::SUCCESS)
+		}
 		// Which targets a change must be booted on, one per line. A separate command because the
 		// shell should not be grepping architecture names out of JSON: every decision that needs the
 		// model belongs in the model, and a fragile parse in `verify.sh` is a decision made twice.
@@ -501,7 +558,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone() });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -535,7 +592,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: false, model_self_check: self_check_failures(&model, false).is_empty() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone() });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -582,7 +639,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone() });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -651,7 +708,7 @@ fn run() -> Result<ExitCode, String> {
 			// judged is a record that will be believed about a different system later.
 			let mut log = verify_model::shadow::Log::load(&repo_root);
 			log.schema = 1;
-			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty() });
+			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone() });
 			log.save(&repo_root)?;
 			// Only Consistent is green, and the other three are green in different wrong ways.
 			// CandidateMiss is the selector's problem; SelectionFailed is the code's and the sweep
@@ -731,7 +788,15 @@ fn run() -> Result<ExitCode, String> {
 					match store.evaluate(&component, &hash, universe, &log) {
 						Ok((clean, architectures)) => {
 							store.grant(&component, &hash, universe, clean, architectures, verify_model::history::now());
+							// WHAT THE EVIDENCE COVERS, printed with the grant. `evaluate` counts
+							// clean runs, distinct decisions, architectures and an execution sample;
+							// the design also asked which change classes and edge kinds were
+							// exercised, and the records have carried both since they were added.
+							// A certificate that cannot name its own scope is the broad-certificate
+							// defect this milestone split `HostBuild` out to prevent, one level up.
+							let scope = store.evidence_scope(&component, &hash, universe, &log);
 							println!("{component} is TRUSTED for {universe:?} under model {hash}");
+							println!("  evidence: {} clean record(s), change kinds [{}], edge kinds [{}], model self-check {}", scope.records, scope.change_kinds.join(", "), scope.edge_kinds.join(", "), if scope.all_self_checked { "green in every one" } else { "NOT green in all of them" });
 							granted += 1;
 						}
 						Err(reason) => println!("{component} stays in SHADOW for {universe:?}: {reason}"),

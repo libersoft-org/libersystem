@@ -1,9 +1,11 @@
 // What a host can ask this allocator that a booted guest cannot.
 //
-// P02M0120's remaining item is one defect: eighty `DOUBLE ALLOCATION` lines naming one page, seen
-// once on riscv64, on the last page of the first usable region, and never reproduced. Four
-// deliberate attempts to arrange the failing boot's allocation history did not reproduce it, and
-// fourteen full suites since have not either. Every one of those experiments costs a guest boot -
+// P02M0120's last item was one defect: eighty `DOUBLE ALLOCATION` lines naming one page, seen once
+// on riscv64, on the last page of the first usable region, and never reproduced. Four deliberate
+// attempts to arrange the failing boot's allocation history did not reproduce it, and fourteen full
+// suites since did not either. It is CLOSED (2026-08-14) - by the search below finding nothing over
+// 14.4 million operations, and by the allocator refusing the one mechanism that could produce the
+// signature, which is what turns "not observed" into "not reachable". Every one of those experiments costs a guest boot -
 // up to ninety minutes on riscv64 - and buys a few thousand allocations in one order.
 //
 // The tests below buy tens of millions, in the pool shapes the sighting happened in, against a

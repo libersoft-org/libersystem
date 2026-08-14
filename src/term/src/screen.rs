@@ -415,6 +415,22 @@ impl Screen {
 		self.row * self.cols + self.col + usize::from(self.pending_wrap)
 	}
 
+	// Whether a glyph has filled the last column and its wrap is still owed.
+	//
+	// EXPOSED SO THE INVARIANT CAN BE ASSERTED DIRECTLY. `cursor_moved`'s comment claims "every path
+	// that actually assigns `row` or `col` calls this, and nothing else does", and that claim has
+	// been wrong twice - a sentence nothing can check is a sentence that drifts. The tests drive
+	// every public way to move the cursor from a state with the wrap owed and read this afterwards.
+	pub fn wrap_pending(&self) -> bool {
+		self.pending_wrap
+	}
+
+	// Whether `row` continues onto the next one - a SOFT wrap, written by `put_glyph`'s deferred
+	// branch, as against a line the user ended.
+	pub fn row_wrapped(&self, row: usize) -> bool {
+		self.screen().wrap.get(row).copied().unwrap_or(false)
+	}
+
 	pub fn cursor_row(&self) -> usize {
 		self.row
 	}
@@ -743,6 +759,14 @@ impl Screen {
 		self.mark_all_dirty();
 		self.col = 0;
 		self.row = 0;
+		// THE INVARIANT THIS FILE STATES IN THE STRONGEST TERMS IT HAS: "every path that actually
+		// assigns `row` or `col` calls this, and nothing else does". This one assigned both and did
+		// not - and it is reachable from production, not only from the public API: `ConsoleService`
+		// calls it when a VT is reused for a fresh shell. So a shell whose last output filled the
+		// final column left the wrap owed, the clear reset the cursor to the origin, and the next
+		// shell's first prompt character took `put_glyph`'s deferred-wrap branch and started on
+		// row 1.
+		self.cursor_moved();
 	}
 
 	// Resize the logical grid to new_cols x new_rows (clamped to what the physical
@@ -1694,6 +1718,11 @@ impl Screen {
 		self.bold = saved.bold;
 		self.underline = saved.underline;
 		self.reverse = saved.reverse;
+		// THE SECOND ONE THE AUDIT ASKED FOR. `clear` was the finding; this is what looking at the
+		// rest of the assignments found. DECRC moves the cursor, so it owes the same call - without
+		// it a restore to a column the cursor had just left carried the previous position's deferred
+		// wrap, and the next glyph started a row down.
+		self.cursor_moved();
 	}
 
 	// DEC private mode set/reset (CSI ? ... h/l): cursor visibility + alternate screen.

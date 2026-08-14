@@ -13,10 +13,10 @@ fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
 	// unused on AArch64; `owner` is a fake discovered-device index.
 	let vector = acquire_msi(table, 0, 3).expect("acquire_msi hands out a free SPI");
 	// Bind a driver Interrupt to the vector; a second live bind is refused.
-	let interrupt = Interrupt::new(vector);
+	let interrupt = Interrupt::new(vector).expect("a test interrupt");
 	assert!(bind_msi(vector, &interrupt), "the first bind succeeds");
 	assert!(is_bound(vector), "the vector reads as bound");
-	let second_interrupt = Interrupt::new(vector);
+	let second_interrupt = Interrupt::new(vector).expect("a test interrupt");
 	assert!(!bind_msi(vector, &second_interrupt), "a second live bind is refused");
 	// Dispatching the SPI INTID - what gic::handle_irq does when the SPI fires - marks
 	// the bound Interrupt pending (its wait readiness).

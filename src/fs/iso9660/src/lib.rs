@@ -111,6 +111,24 @@ pub struct Iso9660<D: BlockDevice> {
 	geo: Geometry,
 }
 
+// WHY A MEDIUM DID NOT MOUNT, which `Option` could not say.
+//
+// The same four answers UDF's `MountError` carries, and for the same reason: a probe deciding which
+// backend to hand a device to has to tell "somebody else's medium" from "this device did not
+// answer", and StorageService turns the second into `Again` and the first into a refusal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MountError {
+	// No `CD001` where the format puts it: a blank disc, or one belonging to something else.
+	NotIso,
+	// ISO9660, and using something this reader does not implement - a logical block size it does
+	// not read in, a descriptor form it has no code for.
+	Unsupported,
+	// ISO9660, and its own structures failed its own checks.
+	Corrupt,
+	// The device did not answer. Says nothing about what is on it.
+	Io,
+}
+
 impl<D: BlockDevice> Iso9660<D> {
 	// The block device this filesystem reads through.
 	pub fn device(&self) -> &D {
@@ -118,39 +136,72 @@ impl<D: BlockDevice> Iso9660<D> {
 	}
 	// Mount optical media: scan the volume descriptors for a Primary (and a preferred
 	// Joliet) descriptor and take its root directory record. None if no PVD is found.
-	pub fn mount(mut dev: D) -> Option<Iso9660<D>> {
+	// The convenience wrapper. `mount_checked` is where the reasons are.
+	pub fn mount(dev: D) -> Option<Iso9660<D>> {
+		Self::mount_checked(dev).ok()
+	}
+
+	// WHY a medium is not mountable, not merely that it is not.
+	//
+	// This answered `Option`, so "not an ISO", a bad `CD001`, a both-endian field whose halves
+	// disagree, a block size this reader does not implement, an I/O failure reading a descriptor and
+	// a missing terminator were all `None` - and a probe deciding which backend to hand a device to
+	// could not tell "this is somebody else's medium" from "this device did not answer". UDF next
+	// door has carried `MountError` since the round that introduced it, for exactly that reason, and
+	// StorageService depends on the distinction to choose between `Again` and a refusal.
+	pub fn mount_checked(mut dev: D) -> Result<Iso9660<D>, MountError> {
 		let mut pvd_root: Option<((u32, u32), u32, u32)> = None;
 		let mut joliet_root: Option<((u32, u32), u32, u32)> = None;
 		let mut block = [0u8; SECTOR_SIZE];
 		let mut terminated = false;
+		// The Joliet descriptor's own copies of the fields ECMA-119 requires it to share with the
+		// primary: volume space size, logical block size, volume set size, volume sequence number.
+		let mut joliet_common: Option<(u32, u32, u16, u16)> = None;
 		for i in 0..32 {
+			// THE DEVICE, not the medium. An unreadable descriptor sector answered the same way a
+			// blank disc does, so a probe could not tell them apart.
 			if !dev.read_block(FIRST_DESCRIPTOR_LBA + i, &mut block) {
-				return None;
+				return Err(MountError::Io);
 			}
 			if &block[1..6] != b"CD001" {
-				return None;
+				return Err(MountError::NotIso);
 			}
-			// The descriptor VERSION, which was read past entirely. It is 1 for every descriptor
-			// this format defines, and it matters most for the type-2 descriptors, where a few
-			// bytes decide that this is Joliet.
-			if block[6] != 1 {
-				return None;
-			}
-			// The TYPE first: a terminator carries none of the fields below, so reading them out of
-			// it and requiring them to be well-formed refuses the very descriptor that says the set
-			// is complete.
+			// THE VERSION UNDER THE TYPE, not above it.
+			//
+			// This refused anything whose version byte was not 1, under a comment saying version "is
+			// 1 for every descriptor this format defines" - which ECMA-119's second edition makes
+			// false: the Enhanced Volume Descriptor is type 2 at version 2. A well-formed set of
+			// `PVD (v1)`, `Enhanced VD (v2)`, `Terminator` was refused at the second descriptor,
+			// rather than the primary hierarchy this reader fully understands being read.
+			//
+			// Skipping something unimplemented is not the same as refusing the volume.
+			//
+			// The TYPE first for the other reason too: a terminator carries none of the fields below,
+			// so reading them out of it and requiring them to be well-formed would refuse the very
+			// descriptor that says the set is complete.
 			if block[0] == 255 {
+				if block[6] != 1 {
+					return Err(MountError::Corrupt);
+				}
 				terminated = true;
 				break;
 			}
 			if block[0] != 1 && block[0] != 2 {
 				continue;
 			}
+			// An Enhanced Volume Descriptor: type 2, version 2. Not implemented here, and not a
+			// reason to refuse the medium.
+			if block[0] == 2 && block[6] == 2 {
+				continue;
+			}
+			if block[6] != 1 {
+				return Err(MountError::Corrupt);
+			}
 			// Both halves of the volume space size and of the logical block size, which were taken
 			// from their little ends alone.
-			let Some(blocks) = both32(&block[80..88]) else { return None };
-			let Some(block_size) = both16(&block[128..132]) else { return None };
-			let Some(root) = root_extent(&block) else { return None };
+			let Some(blocks) = both32(&block[80..88]) else { return Err(MountError::Corrupt) };
+			let Some(block_size) = both16(&block[128..132]) else { return Err(MountError::Corrupt) };
+			let Some(root) = root_extent(&block) else { return Err(MountError::Corrupt) };
 			let found = (root, blocks, block_size as u32);
 			match block[0] {
 				1 => {
@@ -159,22 +210,36 @@ impl<D: BlockDevice> Iso9660<D> {
 					// per-RECORD sequence number check, halfway through a listing. A set larger
 					// than one is refused here, which is where a reader that does not implement
 					// multi-volume should say so - at mount, before anything is read.
-					let Some(set_size) = both16(&block[120..124]) else { return None };
+					let Some(set_size) = both16(&block[120..124]) else { return Err(MountError::Corrupt) };
 					// EXACTLY one. `> 1` admitted zero, which is not a legal set size - a volume
 					// belongs to a set of at least itself.
 					if set_size != 1 {
-						return None;
+						return Err(MountError::Corrupt);
 					}
 					// And this volume's own sequence number within that set. The root record's and
 					// every ordinary record's were checked and the DESCRIPTOR's was not, which is
 					// the one that says which volume of the set this is.
-					let Some(sequence) = both16(&block[124..128]) else { return None };
+					let Some(sequence) = both16(&block[124..128]) else { return Err(MountError::Corrupt) };
 					if sequence != 1 {
-						return None;
+						return Err(MountError::Corrupt);
 					}
 					pvd_root = Some(found)
 				}
-				2 if is_joliet(&block) => joliet_root = Some(found),
+				// AND ITS COMMON FIELDS HAVE TO AGREE WITH THE PRIMARY'S.
+				//
+				// The `1 =>` arm validates the volume set size and sequence number; this one took
+				// the Joliet root and the geometry and checked neither - and when Joliet is present
+				// that geometry BECOMES the filesystem's. ECMA-119 requires a Supplementary
+				// descriptor's common fields to match the primary's within one set, so a crafted
+				// medium could declare one volume space in the PVD and another here and have the
+				// second used without the two ever being compared. What an SVD is allowed to differ
+				// in is the root directory and the hierarchy under it.
+				2 if is_joliet(&block) => {
+					let Some(set_size) = both16(&block[120..124]) else { return Err(MountError::Corrupt) };
+					let Some(sequence) = both16(&block[124..128]) else { return Err(MountError::Corrupt) };
+					joliet_common = Some((blocks, block_size as u32, set_size, sequence));
+					joliet_root = Some(found)
+				}
 				_ => {}
 			}
 		}
@@ -183,12 +248,22 @@ impl<D: BlockDevice> Iso9660<D> {
 		// bounds itself with - mounted anyway. The limit is a good one and reaching it is now a
 		// refusal rather than a silent truncation of the search.
 		if !terminated {
-			return None;
+			return Err(MountError::Corrupt);
 		}
 		// A Joliet SVD supplies the namespace, and only ON TOP of a valid Primary Volume Descriptor.
 		// The match answered `(Some(joliet), _)`, so a recognised Joliet descriptor alone was enough
 		// and `pvd_root` being None was not an obstacle - which ECMA-119 does not allow.
-		let Some(primary) = pvd_root else { return None };
+		let Some(primary) = pvd_root else { return Err(MountError::Corrupt) };
+		// The primary's geometry is canonical, and the Joliet descriptor is required to agree with
+		// it field by field - so a mismatch is a refusal rather than a silent change of which
+		// numbers the filesystem runs on. Per field, because one combined comparison would pass on
+		// whichever of the four somebody happened to check.
+		if let Some((blocks, block_size, set_size, sequence)) = joliet_common {
+			let ((_, _), primary_blocks, primary_block_size) = primary;
+			if blocks != primary_blocks || block_size != primary_block_size || set_size != 1 || sequence != 1 {
+				return Err(MountError::Corrupt);
+			}
+		}
 		let (joliet, ((root_lba, root_len), blocks, block_size)) = match joliet_root {
 			Some(r) => (true, r),
 			None => (false, primary),
@@ -196,15 +271,20 @@ impl<D: BlockDevice> Iso9660<D> {
 		// the logical block size is 2048 on real media and the unit this backend reads
 		// in - any other legal size would be read at wrong positions, so it refuses -
 		// and the root extent must fit the volume's own block count.
-		if block_size != SECTOR_SIZE as u32 || blocks == 0 || root_lba as u64 + (root_len as u64).div_ceil(SECTOR_SIZE as u64) > blocks as u64 {
-			return None;
+		if block_size != SECTOR_SIZE as u32 {
+			// A legal size this reader does not read in: it would read every extent at the wrong
+			// position. Not the medium's fault.
+			return Err(MountError::Unsupported);
+		}
+		if blocks == 0 || root_lba as u64 + (root_len as u64).div_ceil(SECTOR_SIZE as u64) > blocks as u64 {
+			return Err(MountError::Corrupt);
 		}
 		// the block count is the medium's own claim: its last block must exist on the
 		// device, or a forged or truncated image mounts and only fails - or allocates
 		// without bound - inside a later read. The real media size then bounds every
 		// extent read.
 		if !dev.read_block(blocks as u64 - 1, &mut block) {
-			return None;
+			return Err(MountError::Io);
 		}
 		// SUSP, established once from the root directory's own first record - which is where the
 		// standard puts `SP`. Joliet volumes do not use Rock Ridge names, so the question is only
@@ -253,7 +333,7 @@ impl<D: BlockDevice> Iso9660<D> {
 				};
 			}
 		}
-		Some(Iso9660 { dev, geo: Geometry { root_lba, root_len, blocks, joliet, rrip, susp_skip } })
+		Ok(Iso9660 { dev, geo: Geometry { root_lba, root_len, blocks, joliet, rrip, susp_skip } })
 	}
 
 	// The volume's size in bytes - the space size the Primary Volume Descriptor
@@ -320,20 +400,45 @@ impl<D: BlockDevice> Iso9660<D> {
 		// The read is sector-aligned on the medium, so it starts at the sector holding `offset` and
 		// the wanted bytes are copied out of it. One scratch sector rather than the whole file,
 		// which is the entire point.
+		// BATCHED: head sector, then the aligned middle in ONE `read_blocks`, then the tail.
+		//
+		// This looped `read_block` per 2048 bytes, and `IsoBlockDevice::read_blocks` exists because
+		// that loop is one IPC round trip per sector behind the block device the storage service
+		// hands over - a 64 MiB window was thirty-two thousand messages.
 		let mut done = 0usize;
 		let mut sector = [0u8; SECTOR_SIZE];
-		while done < want {
-			let at = offset + done as u64;
-			let block = entry.lba as u64 + at / SECTOR_SIZE as u64;
-			if block >= self.geo.blocks as u64 {
-				return Err(FsError::Invalid);
-			}
-			let within = (at % SECTOR_SIZE as u64) as usize;
-			let take = (SECTOR_SIZE - within).min(want - done);
+		let bound = |block: u64, count: u64| -> Result<(), FsError> { if block.checked_add(count).is_none_or(|end| end > self.geo.blocks as u64) { Err(FsError::Invalid) } else { Ok(()) } };
+		// The head, when the window does not start on a sector boundary.
+		let within = (offset % SECTOR_SIZE as u64) as usize;
+		if within != 0 {
+			let block = entry.lba as u64 + offset / SECTOR_SIZE as u64;
+			bound(block, 1)?;
 			if !self.dev.read_block(block, &mut sector) {
 				return Err(FsError::Io);
 			}
-			buffer[done..done + take].copy_from_slice(&sector[within..within + take]);
+			let take = (SECTOR_SIZE - within).min(want);
+			buffer[..take].copy_from_slice(&sector[within..within + take]);
+			done = take;
+		}
+		// The aligned middle, whole sectors, in one call.
+		let whole = (want - done) / SECTOR_SIZE;
+		if whole > 0 {
+			let block = entry.lba as u64 + (offset + done as u64) / SECTOR_SIZE as u64;
+			bound(block, whole as u64)?;
+			if !self.dev.read_blocks(block, whole as u64, &mut buffer[done..done + whole * SECTOR_SIZE]) {
+				return Err(FsError::Io);
+			}
+			done += whole * SECTOR_SIZE;
+		}
+		// The tail, when the window does not end on one.
+		if done < want {
+			let block = entry.lba as u64 + (offset + done as u64) / SECTOR_SIZE as u64;
+			bound(block, 1)?;
+			if !self.dev.read_block(block, &mut sector) {
+				return Err(FsError::Io);
+			}
+			let take = want - done;
+			buffer[done..done + take].copy_from_slice(&sector[..take]);
 			done += take;
 		}
 		Ok(done)
@@ -416,7 +521,7 @@ impl<D: BlockDevice> Iso9660<D> {
 				// uniform across the backends behind the volume API.
 				let info = FileInfo { name: e.name, size: if e.is_dir { 0 } else { e.size as u64 }, is_dir: e.is_dir };
 				if out.try_reserve(1).is_err() {
-					failed = Some(FsError::NoSpace);
+					failed = Some(FsError::NoMemory);
 					return Ok(false);
 				}
 				out.push(info);
@@ -603,8 +708,15 @@ fn is_joliet(desc: &[u8]) -> bool {
 	// contain those three bytes anywhere - in a publisher string, in padding a mastering tool left
 	// behind - was read as Joliet, and its namespace was taken as the volume's. Joliet defines the
 	// three sequences for its UCS-2 levels and writes one of them first.
+	// THE WHOLE FIELD, not its first three bytes. The sequences have to start at the first byte,
+	// follow each other without gaps, and leave the rest zero - so a descriptor carrying `%/E`
+	// followed by anything at all was read as Joliet and its namespace taken as the volume's.
+	// Checking the prefix is correct as far as it goes and the remaining 29 bytes were unread.
 	let esc = &desc[88..120];
-	[b"%/@".as_slice(), b"%/C", b"%/E"].iter().any(|s| esc.starts_with(s))
+	let Some(len) = [b"%/@".as_slice(), b"%/C", b"%/E"].iter().find(|s| esc.starts_with(s)).map(|s| s.len()) else {
+		return false;
+	};
+	esc[len..].iter().all(|byte| *byte == 0)
 }
 
 // Parse a directory record: extent, length, dir flag, and the name (Joliet UCS-2, a Rock
@@ -640,13 +752,6 @@ fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Result<Opt
 		return Err(FsError::Corrupt);
 	}
 	let is_dir = rec[25] & 0x02 != 0;
-	// an associated file (flag 0x04) is a secondary stream recorded BEFORE its
-	// same-named main file - it must neither list (a duplicate name) nor match a
-	// lookup (it would shadow the main content). IGNORED rather than refused: it is a
-	// legal record this reader has no use for, which is what `Ok(None)` is for.
-	if rec[25] & 0x04 != 0 {
-		return Ok(None);
-	}
 	// multi-extent (segments in further records) and interleaving (gap blocks woven
 	// into the extent) are forms the reader refuses rather than misreads.
 	let unsupported = rec[25] & 0x80 != 0 || rec[26] != 0 || rec[27] != 0;
@@ -657,7 +762,33 @@ fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Result<Opt
 	if id_len == 0 || 33 + id_len > rec.len() {
 		return Err(FsError::Corrupt);
 	}
+	// THE PADDING BYTE after an even-length identifier, which the format requires to be present and
+	// zero. The offset was computed and the record carried on if it was short, so a parser that
+	// describes itself as strict was taking the format's word for one field and not the other.
+	if id_len % 2 == 0 {
+		let Some(&pad) = rec.get(33 + id_len) else {
+			return Err(FsError::Corrupt);
+		};
+		if pad != 0 {
+			return Err(FsError::Corrupt);
+		}
+	}
 	let id = &rec[33..33 + id_len];
+	// AN ASSOCIATED FILE IS DECIDED AFTER THE RECORD IS KNOWN TO BE WELL-FORMED.
+	//
+	// This returned before the identifier length, the bounds and the identifier itself were checked -
+	// so an associated-file record with `id_len = 0` was silently dropped while the same `id_len = 0`
+	// on an ordinary record was `Corrupt`. That is precisely the shape the `Result<Option<Entry>>`
+	// refactor was written to remove: a malformed record disappearing from a directory rather than
+	// refusing it.
+	//
+	// `Ok(None)` means "a well-formed record this reader deliberately does not surface", which is
+	// what the type was introduced to say. An associated file (flag 0x04) is a secondary stream
+	// recorded BEFORE its same-named main file: it must neither list (a duplicate name) nor match a
+	// lookup (it would shadow the main content).
+	if rec[25] & 0x04 != 0 {
+		return Ok(None);
+	}
 	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
 	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip).ok_or(FsError::Corrupt)? };
 	Ok(Some(Entry { lba, size, is_dir, special, unsupported, name, case_sensitive }))
@@ -719,21 +850,16 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 		return None;
 	}
 	let sys = &sys[skip..];
-	let mut off = 0usize;
 	let mut out = String::new();
-	while off + 4 <= sys.len() {
-		let len = sys[off + 2] as usize;
-		// A MALFORMED ENTRY IS NOT AN END, it is a reason to distrust everything after it - and
-		// everything before it, because what has been accumulated so far is a PREFIX.
-		//
-		// This used to `break`, and the function then returned whatever `NM` fragments it had
-		// collected. That is the truncated name the comment below refuses `CE` for, arriving by the
-		// other door: a structurally broken area produced a name the medium does not carry, and it
-		// became a lookup key.
-		if len < 4 || off + len > sys.len() {
-			return None;
-		}
-		let sig = &sys[off..off + 2];
+	// ONE SUSP PARSER. This walked the area itself - its own length and signature decode, reading
+	// `sys[off + 2]` and `sys[off..off + 2]` and never `sys[off + 3]` - so the version rule the
+	// walker enforces did not apply to the one entry whose contents become a filename. The test that
+	// covers the version rule alters an `ER`, which does go through the walker.
+	//
+	// A MALFORMED ENTRY IS NOT AN END, it is a reason to distrust everything after it - and
+	// everything before it, because what has been accumulated so far is a PREFIX. The walker's
+	// `Err(())` carries exactly that, which a `FnMut` callback could not.
+	let walked = for_each_susp(sys, |entry| {
 		// FAIL CLOSED on what this parser cannot follow, rather than answering with a different
 		// name than the medium records.
 		//
@@ -742,31 +868,28 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 		// Rock Ridge relocates deep directories, so ignoring them dismantles the structure they
 		// exist to express. Falling back to the ISO9660 identifier is a name the medium really
 		// carries; a truncated `NM` is not.
-		if matches!(sig, b"CE" | b"CL" | b"PL" | b"RE") {
-			return None;
+		if matches!(&entry.signature, b"CE" | b"CL" | b"PL" | b"RE") {
+			return Err(());
 		}
-		// `ST` ends the system use area: past it the bytes are not SUSP entries at all, and walking
-		// on into them is how an unrelated extension's data becomes a filename.
-		if sig == b"ST" {
-			break;
-		}
-		// an NM payload begins after sig, len, version, and flags - a shorter entry
-		// carries no name and must not build an inverted range.
-		if sig == b"NM" && len >= 5 {
+		// an NM payload begins after the flags byte - a shorter entry carries no name.
+		if &entry.signature == b"NM" && !entry.body.is_empty() {
 			// The CONTINUE flag (bit 0) says this name runs into a further entry. Honouring only
 			// the part in hand is the same truncation `CE` causes.
-			if sys[off + 4] & 0x01 != 0 {
-				return None;
+			if entry.body[0] & 0x01 != 0 {
+				return Err(());
 			}
 			// NON-UTF-8 IS A REFUSAL, not an empty fragment. `unwrap_or("")` contributed nothing
 			// and left whatever the other fragments held, which is a name assembled out of the
 			// parts that happened to decode - the same partial answer, one layer down.
-			let Ok(fragment) = core::str::from_utf8(&sys[off + 5..off + len]) else {
-				return None;
+			let Ok(fragment) = core::str::from_utf8(&entry.body[1..]) else {
+				return Err(());
 			};
 			out.push_str(fragment);
 		}
-		off += len;
+		Ok(())
+	});
+	if walked.is_err() {
+		return None;
 	}
 	if out.is_empty() { None } else { Some(out) }
 }
@@ -793,16 +916,34 @@ fn susp_skip_of(sys: &[u8]) -> Option<usize> {
 //
 // `ST` ends the area. A length below the four-byte header, or one that runs past the end, stops the
 // walk rather than sliding: a malformed entry means nothing after it can be located.
-fn for_each_susp(sys: &[u8], mut f: impl FnMut(&SuspEntry<'_>)) {
+// `Ok(())` when the area was walked to its end or to an `ST`; `Err(())` when an entry is malformed
+// or carries a version this reader does not implement.
+//
+// THE DIFFERENCE MATTERS TO ONE CALLER AND A `FnMut` CANNOT CARRY IT. `rock_ridge_name` fails closed
+// - a structurally broken area means the name it has accumulated is a PREFIX, and a prefix that
+// becomes a lookup key is two long names collapsing into one - and it could not use this walker
+// while the walker could only stop. So it had a second length-and-signature decode of its own, which
+// never read the version byte at all: an `NM` declaring version 2 was consumed as though it were
+// version 1, and `NM` is the entry whose contents become a filename.
+//
+// The callback may also stop the walk itself, by answering `Err(())` - which is how a caller refuses
+// a signature it cannot follow.
+fn for_each_susp(sys: &[u8], mut f: impl FnMut(&SuspEntry<'_>) -> Result<(), ()>) -> Result<(), ()> {
 	let mut at = 0usize;
 	while at + 4 <= sys.len() {
 		let sig = [sys[at], sys[at + 1]];
 		let len = sys[at + 2] as usize;
 		if &sig == b"ST" {
-			return;
+			return Ok(());
+		}
+		// PADDING IS NOT DAMAGE. A System Use Area is padded to the record's length, and the padding
+		// is zeros - so a zero signature is the end of the entries rather than an entry this reader
+		// could not parse. Reading it as damage makes every ordinary Rock Ridge area malformed.
+		if sig == [0, 0] {
+			return Ok(());
 		}
 		if len < 4 || at + len > sys.len() {
-			return;
+			return Err(());
 		}
 		// THE VERSION, which this handed out as part of a slice nobody looked at.
 		//
@@ -812,11 +953,12 @@ fn for_each_susp(sys: &[u8], mut f: impl FnMut(&SuspEntry<'_>)) {
 		// bytes become a filename - the thing the `ST` check above exists to stop, one field in.
 		let entry = SuspEntry { signature: sig, version: sys[at + 3], body: &sys[at + 4..at + len] };
 		if entry.version != 1 {
-			return;
+			return Err(());
 		}
-		f(&entry);
+		f(&entry)?;
 		at += len;
 	}
+	Ok(())
 }
 
 // One SUSP entry, with the fields the format defines rather than a signature and a slice.
@@ -838,10 +980,13 @@ struct SuspEntry<'a> {
 // both-endian field in this reader.
 fn continuation_of(sys: &[u8]) -> Option<(u32, usize, usize)> {
 	let mut found = None;
-	for_each_susp(sys, |entry| {
+	// A malformed area answers `None` here rather than the entries before the damage: what a `CE`
+	// points at decides where Rock Ridge is looked for, and a pointer read out of a broken area is a
+	// pointer to nothing this reader can vouch for.
+	let walked = for_each_susp(sys, |entry| {
 		let body = entry.body;
 		if &entry.signature != b"CE" || body.len() < 24 || found.is_some() {
-			return;
+			return Ok(());
 		}
 		// BOTH HALVES, like every other both-endian field in this reader - which is what the comment
 		// above used to claim this did while reading one.
@@ -854,15 +999,19 @@ fn continuation_of(sys: &[u8]) -> Option<(u32, usize, usize)> {
 		// It matters more here than at most of them: the pointer decides where Rock Ridge is looked
 		// for, and therefore what every file on the disc is called.
 		let (Some(block), Some(offset), Some(len)) = (both32(&body[0..8]), both32(&body[8..16]), both32(&body[16..24])) else {
-			return;
+			return Ok(());
 		};
 		let (offset, len) = (offset as usize, len as usize);
 		// A continuation has to fit in the block it names, or it is describing something else.
 		if offset >= SECTOR_SIZE || len == 0 || offset + len > SECTOR_SIZE {
-			return;
+			return Ok(());
 		}
 		found = Some((block, offset, len));
+		Ok(())
 	});
+	if walked.is_err() {
+		return None;
+	}
 	found
 }
 
@@ -875,10 +1024,12 @@ fn continuation_of(sys: &[u8]) -> Option<(u32, usize, usize)> {
 // header, so the identifier it promised did not exist - and the parser turned Rock Ridge on for it.
 fn announces_rockridge(sys: &[u8]) -> bool {
 	let mut announced = false;
-	for_each_susp(sys, |entry| {
+	// And a malformed area announces NOTHING: switching the whole disc's name source on the strength
+	// of an area this reader could not parse is the guess the `ER` check exists to remove.
+	let walked = for_each_susp(sys, |entry| {
 		let body = entry.body;
 		if &entry.signature != b"ER" || body.len() < 4 {
-			return;
+			return Ok(());
 		}
 		// EVERY DECLARED LENGTH, against the entry's own size.
 		//
@@ -886,20 +1037,21 @@ fn announces_rockridge(sys: &[u8]) -> bool {
 		// the source in that order. Only `LEN_ID` was read, so an `ER` carrying `RRIP_1991A` and
 		// nonsense in every other field switched the whole disc's name source.
 		let (id_len, des_len, src_len) = (body[0] as usize, body[1] as usize, body[2] as usize);
-		let Some(declared) = id_len.checked_add(des_len).and_then(|n| n.checked_add(src_len)) else { return };
+		let Some(declared) = id_len.checked_add(des_len).and_then(|n| n.checked_add(src_len)) else { return Ok(()) };
 		if 4 + declared > body.len() + 4 || declared > body.len().saturating_sub(4) {
-			return;
+			return Ok(());
 		}
 		// The identifier has to BE there, not merely be declared.
-		let Some(id) = body.get(4..4 + id_len) else { return };
+		let Some(id) = body.get(4..4 + id_len) else { return Ok(()) };
 		// The versions of Rock Ridge whose `NM`, `CE`, `CL`, `PL` and `RE` this reader understands.
 		// An extension it does not implement must not switch the name source: reading somebody
 		// else's `NM` is the guess this whole check exists to remove.
 		if id == b"RRIP_1991A" || id == b"IEEE_P1282" || id == b"IEEE_1282" {
 			announced = true;
 		}
+		Ok(())
 	});
-	announced
+	walked.is_ok() && announced
 }
 
 // Split a `/`-separated path into (parent dir, final name); errors on an empty name.

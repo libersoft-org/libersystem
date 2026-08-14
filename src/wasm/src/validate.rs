@@ -118,6 +118,16 @@ struct Frame {
 	// The types a branch targeting this frame must carry. For a `loop` these are its PARAMETERS - a
 	// branch to a loop restarts it - and for everything else its results.
 	label_types: Vec<ValType>,
+	// The types the frame was entered with - its block type's PARAMETERS, which are pushed inside
+	// the frame and become its own operands.
+	//
+	// The specification's validation algorithm carries them for two reasons and this carried
+	// neither. `else` starts a second arm from the same stack the first one started from, so the
+	// parameters have to be pushed again; without them the `then` arm saw them and the `else` arm
+	// did not, and a valid parameterised `if` was refused. And an `if` with no `else` is legal
+	// exactly when its empty branch typechecks - `start_types == end_types`, which for
+	// `[i32] -> [i32]` it does, the parameter BEING the result.
+	start_types: Vec<ValType>,
 	// The types on the stack when the frame ends normally.
 	end_types: Vec<ValType>,
 	height: usize,
@@ -180,7 +190,39 @@ pub fn validate(module: Module) -> Result<ValidatedModule, ValidationError> {
 			ExportKind::Memory if !has_memory => {
 				return Err(ValidationError::module(format!("export \"{}\" names a memory the module does not declare", export.name)));
 			}
-			_ => {}
+			// THE INDEX IS CHECKED, which is the rule; whether an embedder can reach the item is a
+			// separate question and not this one's.
+			//
+			// These two used to arrive as a catch-all `Other` that the validator matched with
+			// `_ => {}`, so they were the one place where "every static index is validated before an
+			// instance exists" was not true. REFUSING them was tried and is wrong: every Rust wasm
+			// artifact exports `__data_end` and `__heap_base` as globals, so a rule against global
+			// exports is a rule against the toolchain this host is built to run. A dangling one is
+			// still a malformed module, and that is what is refused.
+			ExportKind::Table if export.index as usize >= module.table.iter().count() => {
+				return Err(ValidationError::module(format!("export \"{}\" names table {}, and the module declares {}", export.name, export.index, module.table.iter().count())));
+			}
+			// No global imports are supported, so the defined globals are the whole index space.
+			ExportKind::Global if export.index as usize >= module.globals.len() => {
+				return Err(ValidationError::module(format!("export \"{}\" names global {} of {}", export.name, export.index, module.globals.len())));
+			}
+			ExportKind::Func | ExportKind::Memory | ExportKind::Table | ExportKind::Global => {}
+		}
+	}
+	// EVERY EXPORT NAME IN A MODULE IS DISTINCT. A module-level rule, and the only export rule that
+	// cannot be decided from one entry: two exports named `run` make `Module::export_func` answer
+	// whichever came first, which is a host resolving a name to an implementation the module never
+	// uniquely named.
+	//
+	// A SET rather than a pairwise scan - a module may declare as many exports as its section holds,
+	// and a quadratic comparison over them is work an untrusted input chooses the size of. A
+	// `BTreeSet` rather than sorting a vector, because `slice::sort_unstable` instantiates the whole
+	// pattern-defeating sort in this crate, and this crate is a shared library whose every imported
+	// symbol must have a declared provider.
+	let mut seen: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+	for export in &module.exports {
+		if !seen.insert(export.name.as_str()) {
+			return Err(ValidationError::module(format!("two exports share the name \"{}\"", export.name)));
 		}
 	}
 
@@ -252,8 +294,10 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 
 	let mut stack: Vec<Type> = Vec::new();
 	let mut frames: Vec<Frame> = Vec::new();
-	// The implicit function-level frame: a branch to it returns, so it carries the results.
-	frames.push(Frame { label_types: ftype.results.clone(), end_types: ftype.results.clone(), height: 0, unreachable: false, is_if: false, had_else: false });
+	// The implicit function-level frame: a branch to it returns, so it carries the results. Its
+	// parameters are the function's LOCALS rather than stack operands, so it starts empty - and
+	// `start_types` is only read for an `if`, which this frame is not.
+	frames.push(Frame { label_types: ftype.results.clone(), start_types: Vec::new(), end_types: ftype.results.clone(), height: 0, unreachable: false, is_if: false, had_else: false });
 
 	let total_funcs = module.imports.len() + module.funcs.len();
 	let has_memory = module.memory.is_some();
@@ -283,7 +327,7 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 				for param in &params {
 					stack.push(Type::Val(*param));
 				}
-				frames.push(Frame { label_types, end_types: results, height, unreachable: false, is_if: matches!(instr, Instr::If { .. }), had_else: false });
+				frames.push(Frame { label_types, start_types: params, end_types: results, height, unreachable: false, is_if: matches!(instr, Instr::If { .. }), had_else: false });
 			}
 			Instr::Else { .. } => {
 				let Some(frame) = frames.last_mut() else {
@@ -297,6 +341,7 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 				}
 				frame.had_else = true;
 				let end_types = frame.end_types.clone();
+				let start_types = frame.start_types.clone();
 				let height = frame.height;
 				let unreachable = frame.unreachable;
 				// The then arm must have produced the block's results, unless it ended in
@@ -305,16 +350,29 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 					expect_at(&stack, height, &end_types).map_err(&at)?;
 				}
 				stack.truncate(height);
+				// AND THE PARAMETERS GO BACK. Both arms of an `if` are entered with the block's
+				// parameters on the stack; truncating to `height` and stopping there gave them to
+				// the `then` arm only, so a valid `(param i32) (result i32) if ... else ... end`
+				// was refused for a stack underflow the module does not have.
+				for param in &start_types {
+					stack.push(Type::Val(*param));
+				}
 				frames.last_mut().expect("checked above").unreachable = false;
 			}
 			Instr::End => {
 				let Some(frame) = frames.pop() else {
 					return Err(at(String::from("end without a block")));
 				};
-				// An `if` with no `else` may only have the empty result type: its absent else arm
-				// produces nothing, so anything else is a stack shape that depends on the branch.
-				if frame.is_if && !frame.had_else && !frame.end_types.is_empty() {
-					return Err(at(String::from("an if with results and no else")));
+				// An `if` with no `else` is legal exactly when its ABSENT arm typechecks, which is
+				// `start_types == end_types`: the missing arm does nothing, so what it produces is
+				// what it was entered with.
+				//
+				// This tested `!end_types.is_empty()`, which is the same rule only for blocks with
+				// no parameters. `[i32] -> [i32]` has a legal empty branch - the parameter IS the
+				// result - and the binary format permits omitting `else` for exactly that case.
+				// Requiring no results is stricter than requiring the empty branch to typecheck.
+				if frame.is_if && !frame.had_else && frame.start_types != frame.end_types {
+					return Err(at(format!("an if whose missing else arm would leave {:?} where the block produces {:?}", frame.start_types, frame.end_types)));
 				}
 				if !frame.unreachable {
 					expect_at(&stack, frame.height, &frame.end_types).map_err(&at)?;
@@ -512,14 +570,15 @@ fn block_signature(module: &Module, instr: &Instr) -> Result<(Vec<ValType>, Vec<
 		Instr::Block { ty, .. } | Instr::If { ty, .. } | Instr::Loop { ty } => ty,
 		_ => return Err(String::from("not a block")),
 	};
-	match ty {
-		crate::decode::BlockType::Empty => Ok((Vec::new(), Vec::new())),
-		crate::decode::BlockType::Value(v) => Ok((Vec::new(), alloc::vec![*v])),
-		crate::decode::BlockType::TypeIndex(index) => {
-			let t = module.types.get(*index as usize).ok_or_else(|| format!("a block naming type {index} of {}", module.types.len()))?;
-			Ok((t.params.clone(), t.results.clone()))
-		}
-	}
+	// THE SAME RESOLUTION THE INTERPRETER USES, cloned into owned vectors because validation needs
+	// them to outlive the borrow of `module`. The counts the interpreter derives and the types
+	// checked here now come from one place, which is what makes the two halves of the engine unable
+	// to disagree about where a block's label sits.
+	let (params, results) = ty.signature(module).ok_or_else(|| match ty {
+		crate::decode::BlockType::TypeIndex(index) => format!("a block naming type {index} of {}", module.types.len()),
+		_ => String::from("a block with no resolvable type"),
+	})?;
+	Ok((params.to_vec(), results.to_vec()))
 }
 
 // The types a branch to `label` must carry (0 = innermost).

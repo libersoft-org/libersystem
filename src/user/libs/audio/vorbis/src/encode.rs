@@ -376,6 +376,56 @@ pub fn write_setup(channels: u8, blocksize_log2: u8) -> Option<Vec<u8>> {
 	Some(out.finish())
 }
 
+/// The forward MDCT: `2n` windowed samples in, `n` spectral coefficients out.
+///
+/// DIRECT FROM THE DEFINITION, and O(n²). The decoder's inverse is a fast one because it runs on
+/// every packet of every file somebody plays; an encoder runs once over a file somebody is
+/// converting, and a transform whose loop IS its own definition is one that can be read against the
+/// formula rather than against a paper with known bugs in its pseudocode - which the decoder's own
+/// comments say theirs had.
+///
+/// `X[k] = sum over i of x[i] * cos(pi/n * (i + 1/2 + n/2) * (k + 1/2))`
+///
+/// THE SCALE COMES FROM THE DECODER, not from the specification. Vorbis' IMDCT carries a
+/// normalisation that implementations place differently, and this tree has one specific inverse -
+/// so the constant below is the one that makes `forward_mdct` followed by that inverse reproduce the
+/// input, measured by the round-trip test rather than derived. A specification can be misread twice
+/// in the same direction; a round trip through somebody else's transform cannot agree by accident.
+pub fn forward_mdct(input: &[f32]) -> Option<Vec<f32>> {
+	let two_n = input.len();
+	if two_n < 4 || !two_n.is_power_of_two() {
+		return None;
+	}
+	let n = two_n / 2;
+	let mut out: Vec<f32> = Vec::new();
+	out.try_reserve_exact(n).ok()?;
+	let scale = 2.0 / n as f32;
+	for k in 0..n {
+		let mut sum = 0.0f32;
+		for (i, &sample) in input.iter().enumerate() {
+			let angle = core::f32::consts::PI / n as f32 * (i as f32 + 0.5 + n as f32 / 2.0) * (k as f32 + 0.5);
+			sum += sample * libm::cosf(angle);
+		}
+		out.push(sum * scale);
+	}
+	Some(out)
+}
+
+/// The window a Vorbis block is multiplied by, on the way in and on the way out.
+///
+/// THE DECODER'S OWN, through `CachedBlocksizeDerived`: the slope is the `sin(pi/2 * sin²(...))`
+/// curve, and the specification's own text about the right half has a note in this tree's decoder
+/// saying it may be wrong. Taking the array the decoder uses means the encoder cannot disagree with
+/// it about the half of the window that overlaps.
+pub fn window_for(blocksize_log2: u8) -> Vec<f32> {
+	let cached = crate::header_cached::CachedBlocksizeDerived::from_blocksize(blocksize_log2);
+	let half = cached.window_slope.len();
+	let mut window: Vec<f32> = Vec::with_capacity(half * 2);
+	window.extend_from_slice(&cached.window_slope);
+	window.extend(cached.window_slope.iter().rev());
+	window
+}
+
 #[cfg(test)]
 #[path = "encode_tests.rs"]
 mod tests;

@@ -40,6 +40,7 @@ pub struct AddressSpace {
 impl AddressSpace {
 	// Capture the active address space (the kernel tables the bootloader built).
 	pub fn kernel() -> Arc<Self> {
+		// ALLOC-OK: the kernel's own address space, captured once at boot before userspace exists.
 		Arc::new(Self { header: ObjectHeader::new(), cr3: arch::context::read_cr3(), owned: false, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)) })
 	}
 
@@ -48,7 +49,7 @@ impl AddressSpace {
 	// no frame is available for the top-level table.
 	pub fn create() -> Option<Arc<Self>> {
 		let cr3 = arch::paging::new_address_space()?;
-		Some(Arc::new(Self { header: ObjectHeader::new(), cr3, owned: true, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)) }))
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), cr3, owned: true, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)) })
 	}
 
 	// Hand out a range of this space's user mmap window, or 0 when it is exhausted.
