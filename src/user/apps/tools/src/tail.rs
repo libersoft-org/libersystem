@@ -173,10 +173,16 @@ unsafe fn follow_file(storage: u64, path: &str, mut offset: u64) {
 					return;
 				}
 			};
+			// DECODE FIRST, THEN CLOSE WHAT IS LEFT. This closed the whole list and decoded
+			// afterwards, which handed the decoder handle numbers it had already closed - harmless
+			// only because `FileEvent` carries no capability, and wrong the moment one is added.
+			// `watch_read` takes the list by `&mut` and empties it of everything the value adopted,
+			// so what remains here is what nothing owns.
+			let decoded = volume::watch_read(&bytes, &mut frame_handles);
 			for handle in frame_handles.as_slice() {
 				close(*handle);
 			}
-			let Some(event) = volume::watch_read(&bytes, &frame_handles) else { continue };
+			let Some(event) = decoded else { continue };
 			if matches!(event.kind, proto::system::FileEventKind::Removed) {
 				eprint(b"tail: file removed\n");
 				close(events);

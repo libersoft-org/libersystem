@@ -165,7 +165,7 @@ pub unsafe fn list_volume_directory(storage: u64, path: &str, limit: usize) -> R
 						close(consumer);
 						return Ok(entries);
 					}
-					let entry = volume::list_read(&bytes, &frame_handles);
+					let entry = volume::list_read(&bytes, &mut frame_handles);
 					for handle in frame_handles.as_slice() {
 						close(*handle);
 					}

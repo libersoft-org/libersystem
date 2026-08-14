@@ -94,6 +94,8 @@ pub mod config {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:config")?;
@@ -266,6 +268,7 @@ pub mod config {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn get(&mut self, key: &str) -> Option<Result<String, Error>> {
@@ -475,6 +478,8 @@ pub mod picker {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:config")?;
@@ -568,6 +573,7 @@ pub mod picker {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn pick(&mut self) -> Option<Result<Picked, Error>> {

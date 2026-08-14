@@ -1601,8 +1601,8 @@ unsafe fn mouse_cmd(inputsvc: u64) {
 			// The multi-capability receive: a frame carries what its element type declares, and
 			// `recv_blocking` takes the first and drops the rest.
 			match recv_caps_blocking(consumer, &mut buf) {
-				ReceivedCaps::Message { len, handles: frame_handles } => {
-					if let Some(event) = input::subscribe_read(&buf[..len], &frame_handles) {
+				ReceivedCaps::Message { len, handles: mut frame_handles } => {
+					if let Some(event) = input::subscribe_read(&buf[..len], &mut frame_handles) {
 						print(b"  (");
 						print_usize(event.col as usize);
 						print(b", ");

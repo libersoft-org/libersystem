@@ -293,6 +293,8 @@ pub mod session {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:session")?;
@@ -813,6 +815,7 @@ pub mod session {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn cwd(&mut self) -> Option<Result<String, Error>> {

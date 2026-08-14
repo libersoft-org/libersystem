@@ -269,9 +269,24 @@ enum Cardinality {
 	// More than the wire carries, with the count, so the refusal can name it.
 	OverLimit(usize),
 	// A `list<handle<T>>`: the count is a property of the VALUE, not of the schema, so no
-	// generation-time check can bound it. ACCEPTED, and `report_cardinality` states why in one
-	// place - separate from `Exact` because the two are answered differently and folding them into
-	// one word is what made five indistinguishable from four.
+	// generation-time check can bound it. REFUSED, and it took a fourth audit to see why the
+	// acceptance was wrong.
+	//
+	// The argument for accepting it was that the writer answers at run time: `set_handle` returns
+	// `Option`, every generated `write` propagates it, so the whole message fails to encode rather
+	// than losing its fifth capability. The message does fail. The CAPABILITY is still lost, because
+	// the fifth handle is never given to the writer - `set_handle` refuses at the boundary - so
+	// `writer.handles()` holds four and the generated failure cleanup, which can only hand back what
+	// the writer holds, cannot reach the fifth. It sits in the service's own value, which for a
+	// `list<handle<T>>` is a `Vec<u64>`: integers with no `Drop`. Nothing closes it and nothing can.
+	//
+	// "The whole message fails rather than losing a capability" was a statement about the BYTES,
+	// made in a system where losing a capability means a live handle with no holder.
+	//
+	// Refusing it is the cheap half of a choice. The other half is an encoder that gives back every
+	// capability the VALUE holds rather than every one the WRITER accepted, which is a change to the
+	// writer trait and to every generated encoder - worth doing the day a schema needs this shape,
+	// and not before, since none does.
 	Unbounded,
 	// An imported shape nothing has resolved. Fails closed, as it always did.
 	Unknown,
@@ -391,7 +406,8 @@ fn type_cardinality(ty: &Type, cards: &HashMap<String, Cardinality>, names: &Has
 		// A LIST OF CAPABILITIES HAS NO GENERATION-TIME COUNT. `list<handle<T>>` collapsed to `Many`
 		// and was accepted, so a schema could ask for as many capabilities as the value happened to
 		// hold and the writer would refuse past four - at run time, on the fifth element, with the
-		// first four already written. A list of things that carry NONE is still zero.
+		// first four already written and the fifth reachable by nobody. A list of things that carry
+		// NONE is still zero, which is what keeps an ordinary `list<record>` out of the refusal.
 		Type::List(inner) => match type_cardinality(inner, cards, names, imports) {
 			Cardinality::Exact(0) => Cardinality::Exact(0),
 			Cardinality::Unknown => Cardinality::Unknown,
@@ -456,7 +472,11 @@ fn report_cardinality(card: Cardinality, span: Span, what: &str, errs: &mut Vec<
 	match card {
 		Cardinality::Unknown => errs.push(Error::new(span, format!("{what} uses an imported wire shape that has not been resolved"))),
 		Cardinality::OverLimit(n) => errs.push(Error::new(span, format!("{what} carries {n} capabilities and a message carries at most {MAX_HANDLES}"))),
-		Cardinality::Exact(_) | Cardinality::Unbounded => {}
+		// A COLLECTION OF CAPABILITIES, refused for the reason written above `Cardinality::Unbounded`:
+		// an encode that stops at the limit cannot give back the capabilities it never accepted, so
+		// the failure that was supposed to protect the fifth one is what strands it.
+		Cardinality::Unbounded => errs.push(Error::new(span, format!("{what} carries a collection of capabilities, whose count no schema can bound - and an encode that stops at {MAX_HANDLES} cannot hand back the ones it never took"))),
+		Cardinality::Exact(_) => {}
 	}
 }
 

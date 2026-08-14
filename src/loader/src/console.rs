@@ -1,15 +1,20 @@
-// The loader's diagnostic output, while the firmware is still there to do it properly.
+// The loader's diagnostic output: the firmware's console while it exists, and the machine's own
+// afterwards.
 //
-// Every architecture backend carries a UART driver at a FIXED PHYSICAL ADDRESS - PL011 at
-// 0x0900_0000 on aarch64, a 16550 at 0x1000_0000 on riscv64 - and `efi_main` starts printing almost
+// Every architecture backend used to carry a UART driver at a FIXED PHYSICAL ADDRESS - PL011 at
+// 0x0900_0000 on aarch64, a 16550 at 0x1000_0000 on riscv64 - and `efi_main` started printing almost
 // immediately. Those are QEMU's addresses. UEFI promises an identity map for RAM; it promises
 // nothing about a device region at an address the loader made up, so on a machine that is not
-// `virt` the first diagnostic line is a store to whatever happens to live there. That is the wrong
-// way round: while boot services exist, the firmware's own console is the console, and it works on
-// every machine because the firmware wrote the driver for the machine it is running on.
+// `virt` the first diagnostic line was a store to whatever happens to live there. That is the wrong
+// way round twice over: while boot services exist, the firmware's own console is the console, and it
+// works on every machine because the firmware wrote the driver for the machine it is running on -
+// and once they are gone, the machine still says where its console is, in the device tree or in
+// ACPI's SPCR table.
 //
-// So: output goes to `ConOut` until `ExitBootServices`, and only after that to the built-in UART,
-// which from then on is what it always was - a `qemu-virt` fallback, now named as one.
+// So there are two halves here and NEITHER of them is a guess. Output goes to `ConOut` until
+// `ExitBootServices`; after that it goes to the address the machine named, and if the machine named
+// none, it goes nowhere. The fixed addresses are gone rather than demoted to a fallback: a fallback
+// is the same store into somebody else's device region, kept on the grounds that it usually is not.
 
 use core::ptr;
 
@@ -29,8 +34,9 @@ pub(crate) fn release() {
 	unsafe { CON_OUT = ptr::null_mut() };
 }
 
-// Write a string through the firmware console. False when there is none, which is the signal to
-// fall back to the built-in UART.
+// Write a string through the firmware console. False when there is none, which is the signal to try
+// the post-ExitBootServices console below - which may itself answer false, and then nothing is
+// printed.
 //
 // `OutputString` takes NUL-terminated UTF-16, so this fills a small buffer and flushes it - no
 // allocation, because this runs before the heap exists and after it is gone. Newlines are expanded
@@ -67,7 +73,7 @@ pub(crate) fn write_byte(byte: u8) -> bool {
 	one[0] = byte;
 	match core::str::from_utf8(&one) {
 		Ok(s) => write_str(s),
-		// Not a character on its own; the UART path takes it.
+		// Not a character on its own; the raw byte path takes it.
 		Err(_) => false,
 	}
 }

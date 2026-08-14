@@ -287,11 +287,19 @@ fn the_validator_counts_capabilities_and_names_the_limit() {
 }
 
 #[test]
-fn a_list_of_handle_bearing_values_is_a_shape_and_not_a_refusal() {
-	// The `Many` case reached through a list, which is the one the old refusal was really about: a
-	// `list<item>` where `item` carries a handle has a count the schema cannot know. It is accepted
-	// here and bounded at the wire, where the count exists.
-	parse_ok(&wrap("resource file;\nrecord item { file: handle<file> }\nrecord batch { items: list<item> }"));
+fn a_list_of_handle_bearing_values_is_refused_because_a_failed_encode_cannot_give_them_back() {
+	// THIS TEST USED TO ASSERT THE OPPOSITE, and the argument it carried was that the count is a
+	// property of the value rather than of the schema, so the wire bounds it: `set_handle` refuses
+	// past the limit and the whole message fails to encode.
+	//
+	// The message does fail. The capability does not come back. `set_handle` refuses at the
+	// BOUNDARY, so the fifth handle never enters the writer, and the generated failure cleanup hands
+	// back `writer.handles()` - the four that did. The fifth is in the caller's `Vec<u64>`, which
+	// has no `Drop`, and nothing else knows it exists. "The message fails rather than losing a
+	// capability" was true of the bytes.
+	assert_err_contains(&wrap("resource file;\nrecord item { file: handle<file> }\nrecord batch { items: list<item> }"), "collection of capabilities");
+	// And a list of values carrying NO capability is untouched, which is every list in this tree.
+	parse_ok(&wrap("record item { name: string }\nrecord batch { items: list<item> }"));
 }
 
 #[test]
@@ -378,11 +386,14 @@ fn imported_handle_cardinality_is_checked_after_resolution() {
 	let packages = resolve::resolve(&files).expect("resolve");
 	let app = packages.iter().find(|package| package.id.display() == "liber:app@1").unwrap();
 	let errors = validate::validate_resolved(&files[app.file], &app.imports);
-	// RESOLVED, so its cardinality is known - `Many`, which is a shape rather than a refusal since
-	// the handle migration finished. What must still fail is the UNRESOLVED case below: a schema
-	// whose imported wire shape nobody has established cannot be reasoned about at all, and that
-	// one fails closed.
-	assert!(errors.is_empty(), "a resolved list of handle-bearing values is a legal shape: {errors:?}");
+	// RESOLVED, so its cardinality is known - and a list of capability-bearing values is refused for
+	// what it is rather than for being unknown. The two refusals are what this test tells apart:
+	// resolution makes the shape legible, and the shape is then judged on its merits. Before the
+	// collection refusal existed this asserted `errors.is_empty()`, which proved resolution had
+	// happened by the absence of any complaint - a weaker signal, since a validator that had
+	// silently given up would also produce none.
+	assert!(errors.iter().any(|error| error.msg.contains("collection of capabilities")), "a resolved list of handle-bearing values is refused for its shape: {errors:?}");
+	assert!(!errors.iter().any(|error| error.msg.contains("has not been resolved")), "and not for being unresolved, which it is not: {errors:?}");
 	let unresolved = validate::validate(&files[app.file]);
 	assert!(unresolved.iter().any(|error| error.msg.contains("has not been resolved")), "an unresolved imported shape still fails closed: {unresolved:?}");
 }
@@ -503,7 +514,12 @@ fn a_stream_may_fail_before_it_starts() {
 
 	// The per-element framing is unchanged - the error arm is about whether the stream STARTS.
 	assert!(rust.contains("pub fn tail_frame(seq: u32, item: &Entry, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize>"));
-	assert!(rust.contains("pub fn tail_read(msg: &[u8], frame_handles: &Handles) -> Option<Entry>"));
+	assert!(rust.contains("pub fn tail_read(msg: &[u8], frame_handles: &mut Handles) -> Option<Entry>"));
+	// AND IT SPENDS THE LIST IT WAS GIVEN. `finish` already requires every transferred handle to be
+	// adopted, so a successful read leaves nothing for the caller to close and says so by clearing
+	// the list - which is what lets a consumer close `frame_handles` unconditionally instead of
+	// knowing whether the decode succeeded.
+	assert!(rust.contains("reader.finish()?;\n\t\tframe_handles.clear();"), "a successful frame read empties the caller's handle list");
 
 	// And the bare `stream<T>` form still generates what it did: no tag, no error, the handle alone.
 	let bare = parse_only("package liber:stream@1; record item { n: u32 } interface feed { @op(1) open: func() -> stream<item>; }");
@@ -616,4 +632,38 @@ fn rust_package_selection_and_external_ownership_are_explicit() {
 fn temp_dir(name: &str) -> PathBuf {
 	let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
 	std::env::temp_dir().join(format!("lsidl-{name}-{}-{nonce}", std::process::id()))
+}
+
+#[test]
+fn every_generated_message_boundary_ends_with_finish() {
+	// ONE RULE, ASSERTED STRUCTURALLY, because stating it in a comment on one path is what produced
+	// the three that did not have it.
+	//
+	// `Reader::finish` answers both halves of a framing question - every byte consumed and every
+	// transferred handle taken - and the ordinary reply path has called it since the finding that
+	// named it. Three boundaries beside it did not: `protocol_info`'s client, the server's
+	// `PROTOCOL_INFO_OP` arm, and both stream-open replies. Each was written next to the ordinary
+	// path rather than through it, so each inherited the shape and not the rule.
+	//
+	// The schema below has every one of them in one file: a plain method, the identity query the
+	// generator always emits, a bare `stream<T>` and a `result<stream<T>, E>`.
+	let file = parse_only(
+		"package liber:bound@1; enum error { bad } record item { n: u32 } \
+		 interface svc { @op(1) plain: func(v: u32) -> u32; @op(2) feed: func() -> stream<item>; @op(3) guarded: func() -> result<stream<item>, error>; }",
+	);
+	assert!(validate::validate(&file).is_empty());
+	let rust = crate::codegen::rust(&file, "bound.lsidl", &std::collections::HashMap::new()).unwrap();
+
+	// Every `Reader` a generated function builds is a message being read, so every one of them has
+	// to reach a `finish`. Counting is what makes this a rule rather than four assertions that a
+	// fifth boundary can be added beside.
+	let readers = rust.matches("Reader::new(").count() + rust.matches("Reader::with_handle_list(").count() + rust.matches("Reader::with_handles(").count();
+	let finishes = rust.matches(".finish()").count();
+	assert!(finishes >= readers, "every message a generated function reads must end at a boundary check: {readers} readers, {finishes} finishes\n{rust}");
+
+	// And the three that were missing, named so a regression says which one came back.
+	assert!(rust.contains("let version = r.u32()?;\n\t\t\tr.finish()?;"), "the identity query's client ends its reply: {rust}");
+	assert!(rust.contains("if op == PROTOCOL_INFO_OP {\n\t\t\tr.finish()?;"), "and its server ends the request");
+	assert!(rust.contains("if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {"), "a bare stream-open reply ends too");
+	assert!(rust.contains("let _ = r.u32()?;\n\t\t\t\t\tr.finish()?;"), "and so does the Ok arm of a guarded one");
 }

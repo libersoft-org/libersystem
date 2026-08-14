@@ -176,8 +176,8 @@ unsafe fn drain(sock: &mut SocketClient) {
 			let mut frame: [u8; 1024] = [0u8; 1024];
 			loop {
 				match recv_caps_blocking(rxstream, &mut frame) {
-					ReceivedCaps::Message { len, handles: frame_handles } => {
-						if let Some(chunk) = socket::recv_read(&frame[..len], &frame_handles) {
+					ReceivedCaps::Message { len, handles: mut frame_handles } => {
+						if let Some(chunk) = socket::recv_read(&frame[..len], &mut frame_handles) {
 							print(&chunk.data);
 						}
 						for handle in frame_handles.as_slice() {

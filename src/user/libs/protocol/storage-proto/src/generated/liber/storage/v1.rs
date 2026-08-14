@@ -853,6 +853,8 @@ pub mod volume {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:storage")?;
@@ -1707,12 +1709,13 @@ pub mod volume {
 		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn list_read(msg: &[u8], frame_handles: &Handles) -> Option<FileInfo> {
+	pub fn list_read(msg: &[u8], frame_handles: &mut Handles) -> Option<FileInfo> {
 		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = FileInfo::read(r)?;
 		reader.finish()?;
+		frame_handles.clear();
 		Some(value)
 	}
 
@@ -1763,12 +1766,13 @@ pub mod volume {
 		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn watch_read(msg: &[u8], frame_handles: &Handles) -> Option<FileEvent> {
+	pub fn watch_read(msg: &[u8], frame_handles: &mut Handles) -> Option<FileEvent> {
 		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = FileEvent::read(r)?;
 		reader.finish()?;
+		frame_handles.clear();
 		Some(value)
 	}
 
@@ -1809,6 +1813,7 @@ pub mod volume {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn open(&mut self, o: &OpenOpts) -> Option<Result<OpenResult, Error>> {
@@ -1857,6 +1862,7 @@ pub mod volume {
 				}
 				if r.tag()? {
 					let _ = r.u32()?;
+					r.finish()?;
 					if reply_handles.len() != 1 {
 						return None;
 					}
@@ -2432,6 +2438,7 @@ pub mod volume {
 				}
 				if r.tag()? {
 					let _ = r.u32()?;
+					r.finish()?;
 					if reply_handles.len() != 1 {
 						return None;
 					}
@@ -2719,6 +2726,8 @@ pub mod writer {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:storage")?;
@@ -3009,6 +3018,7 @@ pub mod writer {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn write(&mut self, data: &Vec<u8>) -> Option<Result<u64, Error>> {
@@ -3256,6 +3266,8 @@ pub mod volume_admin {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:storage")?;
@@ -3351,6 +3363,7 @@ pub mod volume_admin {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn open_directory(&mut self, path: &str) -> Option<Result<u64, Error>> {

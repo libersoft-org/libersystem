@@ -61,7 +61,7 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 			let mut frame_handles = proto::codec::Handles::new();
 			match recv_vec_caps_blocking(consumer, &mut frame_handles) {
 				ReceivedVecCaps::Message { bytes } => {
-					if let Some(e) = permission::audit_read(&bytes, &frame_handles) {
+					if let Some(e) = permission::audit_read(&bytes, &mut frame_handles) {
 						if mode.is_some() {
 							if !first {
 								out.push(',');

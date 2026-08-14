@@ -193,6 +193,8 @@ pub mod process {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:process")?;
@@ -532,6 +534,7 @@ pub mod process {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn start(&mut self, name: &str) -> Option<Result<ProcessInfo, Error>> {

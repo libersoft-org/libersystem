@@ -157,6 +157,8 @@ pub mod device {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:device")?;
@@ -293,6 +295,7 @@ pub mod device {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn list(&mut self) -> Option<Result<Vec<DeviceEntry>, Error>> {
@@ -472,6 +475,8 @@ pub mod usb {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:device")?;
@@ -571,6 +576,7 @@ pub mod usb {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn list(&mut self) -> Option<Result<Vec<UsbDevice>, Error>> {

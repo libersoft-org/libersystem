@@ -311,13 +311,25 @@ the glue threads the list through
 and decoding recovers each with `take_handle` (ignoring the placeholder), in the order
 they were written.
 
-**Past the limit, nothing is dropped.** A schema whose shape carries five is refused at
-generation. A `list<handle<T>>` is accepted, because its count is a property of the value
-rather than of the schema - and there the writer answers: `set_handle` returns `Option`,
-every generated `write` propagates it with `?`, so the WHOLE message fails to encode
-rather than losing its fifth capability. `encode` and `encode_vec` refuse outright for a
-type that records one, because both return only the bytes; `encode_message` is the shape
-that carries both halves.
+**Every capability count is bounded at generation.** A schema whose shape carries five is
+refused, and so is one whose count the schema cannot bound at all - a `list<handle<T>>`,
+or any list whose element carries a capability. `encode` and `encode_vec` refuse outright
+for a type that records one, because both return only the bytes; `encode_message` is the
+shape that carries both halves.
+
+The collection case was accepted once, on the argument that the writer answers at run
+time: `set_handle` returns `Option`, every generated `write` propagates it with `?`, so
+the whole message fails to encode rather than losing its fifth capability. The message
+does fail. The capability does not come back - `set_handle` refuses at the boundary, so
+the fifth handle never enters the writer, and the failure cleanup can only hand back the
+four that did. The fifth stays in the caller's own value, which for a list of handles is
+a `Vec<u64>`: integers with no destructor. "Nothing is dropped" was a statement about the
+bytes, made in a document about capabilities, where losing one means a live handle no
+code can reach.
+
+Lifting the refusal needs an encoder that returns every capability the VALUE holds rather
+than every one the WRITER accepted. That is a change to the writer trait and to every
+generated encoder, and it belongs to the day a schema needs the shape.
 
 ```lsidl
 interface volume {
@@ -340,11 +352,15 @@ against the object's real size.
 
 **`stream<T>`** - a backpressured sequence of `T`. A method returning `stream<T>`
 replies with a `handle<channel>` to a freshly created sub-channel; the producer
-sends elements (each framed as `[seq u32][T]`) and the consumer drains them with
-ordinary channel receives. Flow control is the bounded channel itself: when the
-channel is full the producer's `wait` blocks until the consumer drains, so there
-is no unbounded buffering. This matches LiberSystem's existing wait-drained
-channel semantics rather than an async runtime.
+sends elements (each framed as `[seq u32][T]`) and the consumer drains them with a
+capability-aware receive - `recv_vec_caps_blocking` and its siblings - because a
+frame carries the capabilities its `T` declares, up to the same limit a reply does.
+An ordinary receive is enough only for a `T` that carries none, and a consumer
+written that way stops being correct the day the element grows a `handle<R>`.
+Flow control is the bounded channel itself: when the channel is full the producer's
+`wait` blocks until the consumer drains, so there is no unbounded buffering. This
+matches LiberSystem's existing wait-drained channel semantics rather than an async
+runtime.
 
 ---
 

@@ -721,6 +721,8 @@ pub mod network {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:network")?;
@@ -1159,6 +1161,7 @@ pub mod network {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn info(&mut self) -> Option<Result<NetInfo, Error>> {
@@ -1584,6 +1587,8 @@ pub mod socket {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:network")?;
@@ -1707,12 +1712,13 @@ pub mod socket {
 		*frame_handles = Handles::try_from_slice(writer.handles())?;
 		Some(writer.pos())
 	}
-	pub fn recv_read(msg: &[u8], frame_handles: &Handles) -> Option<Chunk> {
+	pub fn recv_read(msg: &[u8], frame_handles: &mut Handles) -> Option<Chunk> {
 		let mut reader = Reader::with_handles(msg, frame_handles);
 		let r = &mut reader;
 		let _seq = r.u32()?;
 		let value = Chunk::read(r)?;
 		reader.finish()?;
+		frame_handles.clear();
 		Some(value)
 	}
 
@@ -1753,6 +1759,7 @@ pub mod socket {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn send(&mut self, data: &crate::codec::Buffer) -> Option<Result<u32, Error>> {
@@ -1795,7 +1802,7 @@ pub mod socket {
 			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
 			let mut reader = Reader::new(&reply);
 			let r = &mut reader;
-			if r.u32()? != corr || reply_handles.len() != 1 {
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
 				self.transport.discard_handles(reply_handles.as_slice());
 				return None;
 			}
@@ -1945,6 +1952,8 @@ pub mod listener {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:network")?;
@@ -2039,6 +2048,7 @@ pub mod listener {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn accept(&mut self) -> Option<Result<u64, Error>> {

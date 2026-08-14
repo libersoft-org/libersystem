@@ -285,10 +285,14 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 				let mut frame_handles = proto::codec::Handles::new();
 				match recv_vec_caps_blocking(consumer, &mut frame_handles) {
 					ReceivedVecCaps::Message { bytes } => {
-						if let Some(f) = volume::list_read(&bytes, &frame_handles) {
+						if let Some(f) = volume::list_read(&bytes, &mut frame_handles) {
 							let shown: usize = f.name.len() + if f.r#type == FileType::Dir { 1 } else { 0 };
 							row(&f, shown, size_text(&f, unit).len(), unit, &mut dirs, &mut plain, &mut total);
 						}
+						// What the decode did not adopt, which after a successful read is nothing:
+						// `list_read` empties the list of everything the value took. Closing here
+						// unconditionally is right in both cases, and it is the reader's signature
+						// that makes it right rather than this loop knowing which case it is in.
 						for handle in frame_handles.as_slice() {
 							close(*handle);
 						}

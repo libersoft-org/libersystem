@@ -311,7 +311,7 @@ fn tail_stream_round_trip() {
 		// had its second dropped by the encoder.
 		let mut frame_handles = crate::codec::Handles::new();
 		let n = log::tail_frame(seq as u32, item, &mut frame, &mut frame_handles).unwrap();
-		assert_eq!(log::tail_read(&frame[..n], &frame_handles), Some(item.clone()));
+		assert_eq!(log::tail_read(&frame[..n], &mut frame_handles), Some(item.clone()));
 		assert!(frame_handles.is_empty(), "an entry carries no capabilities, so the frame carries none");
 	}
 }
@@ -881,16 +881,16 @@ fn a_listing_frame_that_will_not_decode_is_refused_rather_than_read_as_an_entry(
 	// a time, invisible because the reader ignores the sequence number and cannot see the gap. The
 	// producer now ends the listing instead, and this is the half that says the reader agrees:
 	// a damaged frame is `None`, not a guess.
-	let handles = crate::codec::Handles::new();
+	let mut handles = crate::codec::Handles::new();
 
 	// Truncated after the sequence number, with no record behind it.
-	assert!(volume::list_read(&[1, 0, 0, 0], &handles).is_none(), "a frame with a sequence and nothing else is not an entry");
+	assert!(volume::list_read(&[1, 0, 0, 0], &mut handles).is_none(), "a frame with a sequence and nothing else is not an entry");
 
 	// Empty: the terminal marker, which is not an entry either and must not decode as one.
-	assert!(volume::list_read(&[], &handles).is_none(), "the terminal frame is not an entry");
+	assert!(volume::list_read(&[], &mut handles).is_none(), "the terminal frame is not an entry");
 
 	// A length prefix that promises more than the frame carries.
-	assert!(volume::list_read(&[1, 0, 0, 0, 0xff, 0xff], &handles).is_none(), "a name longer than the frame is refused");
+	assert!(volume::list_read(&[1, 0, 0, 0, 0xff, 0xff], &mut handles).is_none(), "a name longer than the frame is refused");
 
 	// A positive case belongs here and is missing on purpose: `FileInfo` and `FileType` are not
 	// visible from this module, so a well-formed frame cannot be constructed to prove the reader

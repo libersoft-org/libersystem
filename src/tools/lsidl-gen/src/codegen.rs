@@ -467,6 +467,13 @@ impl Cg {
 			// typed match so an interface can never shadow it - the validator also refuses a
 			// typed `@op` this high, so the two guards agree.
 			self.line("\t\tif op == PROTOCOL_INFO_OP {");
+			// A MESSAGE BOUNDARY LIKE ANY OTHER. This answered after reading the opcode and the
+			// correlation id without looking at the rest, so `[OP][corr]` and `[OP][corr][DE AD]`
+			// were the same request - the exact thing the typed arms below refuse, in the one arm
+			// emitted above them. The identity query takes no arguments, so `finish` here means
+			// "and nothing else", which is the whole of its contract.
+			self.line("\t\t\tr.finish()?;");
+			self.line("\t\t\trequest_handles.clear();");
 			self.line("\t\t\tlet w = &mut writer;");
 			self.line("\t\t\tw.u32(corr)?;");
 			self.line(&format!("\t\t\tw.bytes_lp(b\"{}\")?;", self.package_id));
@@ -643,7 +650,22 @@ impl Cg {
 				self.line("\t\t*frame_handles = Handles::try_from_slice(writer.handles())?;");
 				self.line("\t\tSome(writer.pos())");
 				self.line("\t}");
-				self.line(&format!("\tpub fn {mname}_read(msg: &[u8], frame_handles: &Handles) -> Option<{et}> {{"));
+				// `&mut`, SO THE CALLER'S LIST SAYS WHAT IT STILL OWNS.
+				//
+				// This took `&Handles`, copied them into the reader and left the caller's list
+				// untouched - so after a successful read the same capability was named twice, once by
+				// the decoded value that adopted it and once by the list the caller still held, and
+				// which of the two owned it was a convention nobody could typecheck. The tree held
+				// both readings of that convention: `tail` closed the list BEFORE decoding and `ls`
+				// closed it AFTER, and both were correct only because their element types carry no
+				// capability. The first one to grow a `handle<R>` would have broken one of them.
+				//
+				// `finish` already requires that every transferred handle was adopted, so on success
+				// the list is provably spent and clearing it is exact rather than approximate. On
+				// failure it is left whole: the partially built value is made of integers and drops
+				// nothing, so everything is still the caller's to close. Either way the caller closes
+				// `frame_handles` unconditionally and needs to know nothing about which case it is in.
+				self.line(&format!("\tpub fn {mname}_read(msg: &[u8], frame_handles: &mut Handles) -> Option<{et}> {{"));
 				self.line("\t\tlet mut reader = Reader::with_handles(msg, frame_handles);");
 				self.line("\t\tlet r = &mut reader;");
 				self.line("\t\tlet _seq = r.u32()?;");
@@ -652,6 +674,7 @@ impl Cg {
 				// A frame is a message too: trailing bytes after the item are a frame its writer
 				// and its reader disagree about.
 				self.line("\t\treader.finish()?;");
+				self.line("\t\tframe_handles.clear();");
 				self.line("\t\tSome(value)");
 				self.line("\t}");
 				self.line("");
@@ -698,6 +721,11 @@ impl Cg {
 		self.line("\t\t\t}");
 		self.line("\t\t\tlet package = r.string_lp()?;");
 		self.line("\t\t\tlet version = r.u32()?;");
+		// The reply's framing boundary, for the reason the typed replies carry one: a package
+		// name and a version followed by anything at all decoded as though they were not. This
+		// path was written beside the typed one rather than through it, which is how it stayed
+		// the only reply in the file that did not end here.
+		self.line("\t\t\tr.finish()?;");
 		self.line("\t\t\tSome((package, version))");
 		self.line("\t\t}");
 		for m in &supported {
@@ -730,7 +758,12 @@ impl Cg {
 				// discards what the schema did not account for; this one did not.
 				match err {
 					None => {
-						self.line("\t\t\tif r.u32()? != corr || reply_handles.len() != 1 {");
+						// `finish` HERE TOO. A stream-open reply is a message boundary, and this branch
+						// checked the correlation id and the handle count and stopped - so a reply
+						// carrying the right handle and trailing bytes opened the stream anyway. The
+						// specialised path was written beside the ordinary reply rather than through it,
+						// which is how it missed a rule the ordinary one states in a comment.
+						self.line("\t\t\tif r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {");
 						self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
 						self.line("\t\t\t\treturn None;");
 						self.line("\t\t\t}");
@@ -747,6 +780,9 @@ impl Cg {
 						// `Reader::boolean` states. This spelling decoded `0xff` as `Ok`.
 						self.line("\t\t\t\tif r.tag()? {");
 						self.line("\t\t\t\t\tlet _ = r.u32()?;");
+						// And the `Ok` arm ends at that placeholder: the stream itself arrives as the
+						// handle, so the bytes are finished here.
+						self.line("\t\t\t\t\tr.finish()?;");
 						self.line("\t\t\t\t\tif reply_handles.len() != 1 { return None; }");
 						self.line("\t\t\t\t\treturn Some(Ok(reply_handles.first()));");
 						self.line("\t\t\t\t}");

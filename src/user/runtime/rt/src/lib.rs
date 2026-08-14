@@ -960,7 +960,7 @@ pub unsafe fn recv_vec_deadline(channel: u64, max: usize, deadline: u64) -> Boun
 // which a plain close cannot express: "the channel closed" is what a finished stream looks like
 // too, so a consumer had no way to tell the whole of a directory from the first sixty-four entries
 // of it. Producers that do not send the marker should use `drain_stream`.
-pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
+pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &mut wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
 	unsafe {
 		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
 		loop {
@@ -982,15 +982,19 @@ pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &wire::Handles) -> Option<T>
 					// DECODE first, then close what the decoder did not claim - the order
 					// `drain_stream` already uses. Closing first and then handing the same numbers
 					// to `read` gave the decoder handles that were already gone.
-					let decoded = read(&bytes, &handles);
-					// Whatever the decoder left behind is ours to close, on both paths. The reader
-					// takes what it wants out of a copy, so the list here still names them all;
-					// closing a handle the decoded value kept is what `Handles` ownership rules
-					// out, and the frame's capabilities belong to the decoded item.
+					let decoded = read(&bytes, &mut handles);
+					// WHAT THE DECODER DID NOT TAKE, closed without asking which case this is.
+					//
+					// `read` takes the list by `&mut` and empties it of everything the decoded value
+					// adopted, so a successful frame leaves nothing here and the loop below closes
+					// nothing. It used to take a shared reference and leave the list naming every
+					// handle whether or not the value had adopted them, which made "may I close
+					// these" a question about the element type - answered by a comment, in each
+					// consumer, and answered two different ways in this tree.
+					for handle in handles.as_slice() {
+						close(*handle);
+					}
 					let Some(item) = decoded else {
-						for handle in handles.as_slice() {
-							close(*handle);
-						}
 						close(consumer);
 						return None;
 					};
@@ -1015,21 +1019,23 @@ pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &wire::Handles) -> Option<T>
 	}
 }
 
-pub unsafe fn drain_stream<T, F: Fn(&[u8], &wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
+pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut wire::Handles) -> Option<T>>(consumer: u64, read: F) -> Option<alloc::vec::Vec<T>> {
 	unsafe {
 		let mut items: alloc::vec::Vec<T> = alloc::vec::Vec::new();
 		loop {
 			let mut handles = wire::Handles::new();
 			match recv_vec_caps_blocking(consumer, &mut handles) {
 				ReceivedVecCaps::Message { bytes } => {
-					let decoded = read(&bytes, &handles);
+					let decoded = read(&bytes, &mut handles);
+					// What the decoder did not take, on both paths - see `drain_stream_complete`
+					// above for why this is unconditional and why it is empty after a good frame.
+					for handle in handles.as_slice() {
+						close(*handle);
+					}
 					// A frame that will not decode ENDS the stream. Skipping it and carrying on
 					// returned a short list as a complete one - the same defect the transport was
 					// just fixed for, one layer down in the decoder.
 					let Some(item) = decoded else {
-						for handle in handles.as_slice() {
-							close(*handle);
-						}
 						close(consumer);
 						return None;
 					};

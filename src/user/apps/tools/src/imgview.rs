@@ -482,8 +482,8 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 				// declares rather than exactly one. `recv_blocking` takes the first and drops the
 				// rest, which is the defect this milestone is named for wearing its consumer face.
 				match recv_caps_blocking(key_stream, &mut key_frame) {
-					ReceivedCaps::Message { len, handles: frame_handles } => {
-						if let Some(event) = input::subscribe_keys_read(&key_frame[..len], &frame_handles) {
+					ReceivedCaps::Message { len, handles: mut frame_handles } => {
+						if let Some(event) = input::subscribe_keys_read(&key_frame[..len], &mut frame_handles) {
 							let action = handle_code(event.code, event.pressed, &mut viewport, framebuffer, &mut held);
 							if action == ViewAction::Exit {
 								exit_requested = true;

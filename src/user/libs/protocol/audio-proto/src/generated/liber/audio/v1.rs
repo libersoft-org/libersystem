@@ -37,6 +37,8 @@ pub mod audio {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:audio")?;
@@ -170,6 +172,7 @@ pub mod audio {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn beep(&mut self, freq: &u16, millis: &u32) -> Option<Result<(), Error>> {
@@ -280,6 +283,8 @@ pub mod pcm_stream {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:audio")?;
@@ -413,6 +418,7 @@ pub mod pcm_stream {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn write(&mut self, data: &crate::codec::Buffer) -> Option<Result<u32, Error>> {
@@ -509,6 +515,8 @@ pub mod audio_admin {
 		let corr = r.u32()?;
 		let mut writer = SliceWriter::new(out);
 		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
 			let w = &mut writer;
 			w.u32(corr)?;
 			w.bytes_lp(b"liber:audio")?;
@@ -603,6 +611,7 @@ pub mod audio_admin {
 			}
 			let package = r.string_lp()?;
 			let version = r.u32()?;
+			r.finish()?;
 			Some((package, version))
 		}
 		pub fn open_streams(&mut self) -> Option<Result<u64, Error>> {

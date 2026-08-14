@@ -86,7 +86,12 @@ pub fn events(client: &Client) -> Option<u64> {
 // A display event frame and whatever capabilities it carried. The frame transport takes a bounded
 // list now, like every other message on this wire - it used to take exactly one handle, and a frame
 // whose element type declared two would have had the second dropped by the encoder.
-pub fn read_event(message: &[u8], handles: &Handles) -> Option<DisplayEvent> {
+//
+// `&mut`, and the list is SPENT by a successful read: what remains afterwards is what the decoded
+// value did not adopt, so the caller closes it unconditionally rather than knowing whether the
+// decode worked. Passing it through unchanged was how one caller in this tree came to close its
+// handles before decoding and another after, both correct only by accident of their element types.
+pub fn read_event(message: &[u8], handles: &mut Handles) -> Option<DisplayEvent> {
 	display::events_read(message, handles)
 }
 

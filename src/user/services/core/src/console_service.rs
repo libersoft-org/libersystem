@@ -1229,17 +1229,21 @@ unsafe fn handle_display_resize(console: &mut Console) {
 	unsafe {
 		let mut frame: [u8; 32] = [0u8; 32];
 		// The multi-capability receive, because a frame carries what its element type declares.
-		let (len, frame_handles) = match recv_caps_blocking(console.display_events, &mut frame) {
+		let (len, mut frame_handles) = match recv_caps_blocking(console.display_events, &mut frame) {
 			ReceivedCaps::Message { len, handles } => (len, handles),
 			ReceivedCaps::Closed => {
 				console.display_events = 0;
 				return;
 			}
 		};
-		if surface::read_event(&frame[..len], &frame_handles).is_none() {
-			for handle in frame_handles.as_slice() {
-				close(*handle);
-			}
+		// The read spends the list of everything the event adopted, so what is left is what nothing
+		// owns - closed on both paths rather than only on the failure one, which is what the old
+		// `&Handles` signature made this loop decide for itself.
+		let decoded = surface::read_event(&frame[..len], &mut frame_handles);
+		for handle in frame_handles.as_slice() {
+			close(*handle);
+		}
+		if decoded.is_none() {
 			return;
 		}
 		let Some(new_surface) = surface::acquire(&console.display, 0, 0).and_then(Result::ok) else {
