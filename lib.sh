@@ -103,7 +103,7 @@ for tool in imgview imgconv audioconv play graphics_probe lico licoedit licoview
 # bounded window read, the shared parsers, the volume bundle - so a regression in that shape shows
 # as a wave rather than as one tool, and because measuring them beside the image and audio tools
 # would mix a kilobyte of argument parsing with a megabyte of codec.
-for tool in pwd clear which wc head tail hexdump touch truncate tree find grep cp mv sort cut kill tee; do TOOL_WAVES[$tool]=6; done
+for tool in pwd clear which wc head tail hexdump touch truncate tree find grep cp mv sort cut kill tee watch; do TOOL_WAVES[$tool]=6; done
 unset tool
 
 declare -A WAVE_TAGS=()

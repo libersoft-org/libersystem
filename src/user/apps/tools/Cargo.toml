@@ -48,6 +48,10 @@ name = "tee"
 path = "src/tee.rs"
 
 [[bin]]
+name = "watch"
+path = "src/watch.rs"
+
+[[bin]]
 name = "write"
 path = "src/write.rs"
 

@@ -80,6 +80,8 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("head", "head [-n N][-c N][-q] PATH... - print the first lines or bytes"),
 	("tail", "tail [-n N][-f] PATH - print the last lines, optionally following"),
 	("hexdump", "hexdump [-s SKIP][-n LEN] PATH - offsets, hex bytes and ASCII"),
+	("tee", "tee [-a][--fail-fast] PATH... - copy the input stream to stdout and to files"),
+	("watch", "watch [-n SECONDS] COMMAND [ARG...] - rerun a command and show its latest output"),
 	("truncate", "truncate -s SIZE PATH... - set a file length (+/- is relative)"),
 	("touch", "touch [-c][-d SECS] PATH... - stamp mtime, creating when asked"),
 	("mkdir", "mkdir PATH - create a directory"),

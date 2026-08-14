@@ -446,6 +446,15 @@ destination = "bin/tee.lsexe"
 providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
+name = "watch"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/watch.lsexe"
+providers = ["base-proto", "cli", "security-client", "storage-proto", "lsrt"]
+
+[[programs]]
 name = "component_host"
 owner = "services"
 role = "helper"

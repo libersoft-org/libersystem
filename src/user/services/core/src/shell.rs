@@ -822,6 +822,13 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"head", Shape::Args),
 	(b"tail", Shape::Args),
 	(b"hexdump", Shape::Args),
+	// `tee` takes paths and reads its input from a pipe, so it is an ordinary argument tool that
+	// happens to be useless without a producer - which it says for itself rather than being kept
+	// off the table.
+	(b"tee", Shape::Args),
+	// `watch` redraws in the alternate screen and must own the terminal for as long as it runs, so
+	// it takes the interactive shape - the same one `play` and `ps -i` take.
+	(b"watch", Shape::InteractiveArgs),
 	(b"truncate", Shape::Args),
 	(b"touch", Shape::Args),
 	(b"mkdir", Shape::Args),

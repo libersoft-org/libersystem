@@ -213,6 +213,11 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"ps" => Some(granted("ps", alloc::vec![Capability::Resource, Capability::Process])),
 		b"run" => Some(granted("run", alloc::vec![Capability::Process])),
 		b"perm" => Some(granted("perm", alloc::vec![Capability::Permission])),
+		// `watch` launches the command it watches through the manager, so it holds a manager client
+		// and NOTHING ELSE. That is what makes "watching a command lends it no authority" true by
+		// construction rather than by intention: the child is started under its own manifest, and
+		// `watch` has nothing of its own to lend it.
+		b"watch" => Some(granted("watch", alloc::vec![Capability::Permission])),
 		b"stop" => Some(granted("stop", alloc::vec![Capability::Supervisor])),
 		// The inverse of `stop`, and granted exactly what it is granted: one admin channel.
 		b"start" => Some(granted("start", alloc::vec![Capability::Supervisor])),
