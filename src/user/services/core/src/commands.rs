@@ -82,6 +82,8 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("hexdump", "hexdump [-s SKIP][-n LEN] PATH - offsets, hex bytes and ASCII"),
 	("tee", "tee [-a][--fail-fast] PATH... - copy the input stream to stdout and to files"),
 	("watch", "watch [-n SECONDS] COMMAND [ARG...] - rerun a command and show its latest output"),
+	("less", "less [-N][-S] [PATH] - page a file or the input stream one screen at a time"),
+	("traceroute", "traceroute [-m HOPS][-q PROBES] HOST [json] - the path a packet takes, hop by hop"),
 	("truncate", "truncate -s SIZE PATH... - set a file length (+/- is relative)"),
 	("touch", "touch [-c][-d SECS] PATH... - stamp mtime, creating when asked"),
 	("mkdir", "mkdir PATH - create a directory"),

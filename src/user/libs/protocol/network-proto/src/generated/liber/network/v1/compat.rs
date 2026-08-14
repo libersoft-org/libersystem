@@ -58,6 +58,22 @@ fn ping_reply_wire_is_stable() {
 	assert_eq!(PingReply::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn hop_status_wire_is_stable() {
+	let sample = HopStatus::TimeExceeded;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(HopStatus::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn trace_hop_wire_is_stable() {
+	let sample = TraceHop { status: HopStatus::TimeExceeded, addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, rtt_us: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0, 7, 7, 7, 7, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(TraceHop::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn tcp_request_wire_is_stable() {
 	let sample = TcpRequest { ep: Endpoint { addr: Ipv4Addr { a: 7, b: 7, c: 7, d: 7 }, port: 7 }, request: alloc::vec![7] };
 	let bytes = sample.encode_vec().expect("encode");

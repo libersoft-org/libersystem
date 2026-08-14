@@ -481,6 +481,135 @@ impl PingReply {
 	}
 }
 
+/// What answered one traceroute probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HopStatus {
+	/// A router discarded the datagram because its TTL ran out, and reported itself. This is the
+	/// ordinary answer for every hop before the destination.
+	TimeExceeded = 0,
+	/// The destination itself answered the echo: the trace has arrived.
+	Reply = 1,
+	/// Somebody refused the datagram - no route, a filtered path, administratively prohibited.
+	Unreachable = 2,
+	/// Nothing came back before the deadline. NOT the same as `unreachable`: a hop that does not
+	/// report itself is silent, and a path that is blocked says so.
+	Timeout = 3,
+}
+
+impl HopStatus {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
+		Some(w.into_inner())
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
+	pub fn decode(bytes: &[u8]) -> Option<HopStatus> {
+		let mut r = Reader::new(bytes);
+		let value = HopStatus::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<HopStatus> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = HopStatus::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<HopStatus> {
+		match r.u8()? {
+			0 => Some(HopStatus::TimeExceeded),
+			1 => Some(HopStatus::Reply),
+			2 => Some(HopStatus::Unreachable),
+			3 => Some(HopStatus::Timeout),
+			_ => None,
+		}
+	}
+}
+
+/// The result of one probe: what happened, who said so, and how long it took.
+///
+/// `addr` and `rtt-us` are meaningful only when something answered - for a timeout they are zero,
+/// because there is no address to report and inventing one would be worse than an empty row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TraceHop {
+	pub status: HopStatus,
+	pub addr: Ipv4Addr,
+	pub rtt_us: u32,
+}
+
+impl TraceHop {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
+		Some(w.into_inner())
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
+	pub fn decode(bytes: &[u8]) -> Option<TraceHop> {
+		let mut r = Reader::new(bytes);
+		let value = TraceHop::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<TraceHop> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = TraceHop::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.status.write(w)?;
+		self.addr.write(w)?;
+		w.u32(self.rtt_us)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<TraceHop> {
+		let status = HopStatus::read(r)?;
+		let addr = Ipv4Addr::read(r)?;
+		let rtt_us = r.u32()?;
+		Some(TraceHop { status, addr, rtt_us })
+	}
+}
+
 /// A one-shot TCP exchange: connect to `ep`, send `request`, and read the response.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TcpRequest {
@@ -700,6 +829,7 @@ pub mod network {
 	pub const OP_SOCKETS: u16 = 8;
 	pub const OP_SNTP: u16 = 9;
 	pub const OP_CAPACITY: u16 = 10;
+	pub const OP_PROBE: u16 = 11;
 
 	pub trait Service {
 		fn info(&mut self) -> Result<NetInfo, Error>;
@@ -712,6 +842,19 @@ pub mod network {
 		fn sockets(&mut self) -> Result<Vec<SockInfo>, Error>;
 		fn sntp(&mut self, server: Ipv4Addr) -> Result<u64, Error>;
 		fn capacity(&mut self) -> Result<NetCapacity, Error>;
+		/// One traceroute probe: send an echo to `addr` with the IP TTL set to `ttl` and report what
+		/// answered.
+		///
+		/// THE TOOL NEVER TOUCHES THE NIC. A traceroute is conventionally a program with a raw socket,
+		/// which is ambient authority over every packet the machine sends and receives - to discover a
+		/// route. This is the operation instead: the service owns the interface and the caller owns one
+		/// question, "who discards a datagram that lives this long".
+		///
+		/// The three outcomes are DISTINCT because they mean different things about the path: a hop
+		/// answered (`time-exceeded`), the destination itself answered (`reply`, so the trace is over),
+		/// or nothing came back (`timeout`, a hop that does not report itself) - and `unreachable`,
+		/// which is an answer saying the path is refused rather than silence saying nothing about it.
+		fn probe(&mut self, addr: Ipv4Addr, ttl: u8) -> Result<TraceHop, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1115,6 +1258,44 @@ pub mod network {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_PROBE => {
+				let addr = Ipv4Addr::read(r)?;
+				let ttl = r.u8()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.probe(addr, ttl);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v34) => {
+							w.u8(1)?;
+							v34.write(w)?;
+						}
+						Err(v35) => {
+							w.u8(0)?;
+							v35.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -1263,13 +1444,13 @@ pub mod network {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v34 = r.u16()? as usize;
-						let mut v35 = Vec::new();
-						v35.try_reserve_exact(v34).ok()?;
-						for _ in 0..v34 {
-							v35.push(r.u8()?);
+						let v36 = r.u16()? as usize;
+						let mut v37 = Vec::new();
+						v37.try_reserve_exact(v36).ok()?;
+						for _ in 0..v36 {
+							v37.push(r.u8()?);
 						}
-						v35
+						v37
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1402,13 +1583,13 @@ pub mod network {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v36 = r.u16()? as usize;
-						let mut v37 = Vec::new();
-						v37.try_reserve_exact(v36).ok()?;
-						for _ in 0..v36 {
-							v37.push(SockInfo::read(r)?);
+						let v38 = r.u16()? as usize;
+						let mut v39 = Vec::new();
+						v39.try_reserve_exact(v38).ok()?;
+						for _ in 0..v38 {
+							v39.push(SockInfo::read(r)?);
 						}
-						v37
+						v39
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1466,6 +1647,34 @@ pub mod network {
 					return None;
 				}
 				let value = if r.tag()? { Ok(NetCapacity::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn probe(&mut self, addr: &Ipv4Addr, ttl: &u8) -> Option<Result<TraceHop, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_PROBE)?;
+			w.u32(corr)?;
+			addr.write(w)?;
+			w.u8(*ttl)?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(TraceHop::read(r)?) } else { Err(Error::read(r)?) };
 				r.finish()?;
 				Some(value)
 			})();
@@ -1556,6 +1765,14 @@ pub mod network {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.capacity()
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_network_network_probe")]
+	fn channel_invoke_probe(chan: u64, addr: &Ipv4Addr, ttl: &u8) -> Option<Result<TraceHop, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.probe(addr, ttl)
+	}
 }
 
 /// A connected TCP socket, served on the channel `network.connect` hands back as a
@@ -1613,13 +1830,13 @@ pub mod socket {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v38) => {
+						Ok(v40) => {
 							w.u8(1)?;
-							w.u32(*v38)?;
+							w.u32(*v40)?;
 						}
-						Err(v39) => {
+						Err(v41) => {
 							w.u8(0)?;
-							v39.write(w)?;
+							v41.write(w)?;
 						}
 					}
 					Some(())
@@ -1649,12 +1866,12 @@ pub mod socket {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v40) => {
+						Ok(v42) => {
 							w.u8(1)?;
 						}
-						Err(v41) => {
+						Err(v43) => {
 							w.u8(0)?;
-							v41.write(w)?;
+							v43.write(w)?;
 						}
 					}
 					Some(())
@@ -1909,20 +2126,20 @@ impl Chunk {
 			return None;
 		}
 		w.u16(self.data.len() as u16)?;
-		for v42 in self.data.iter() {
-			w.u8(*v42)?;
+		for v44 in self.data.iter() {
+			w.u8(*v44)?;
 		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<Chunk> {
 		let data = {
-			let v43 = r.u16()? as usize;
-			let mut v44 = Vec::new();
-			v44.try_reserve_exact(v43).ok()?;
-			for _ in 0..v43 {
-				v44.push(r.u8()?);
+			let v45 = r.u16()? as usize;
+			let mut v46 = Vec::new();
+			v46.try_reserve_exact(v45).ok()?;
+			for _ in 0..v45 {
+				v46.push(r.u8()?);
 			}
-			v44
+			v46
 		};
 		Some(Chunk { data })
 	}
@@ -1973,14 +2190,14 @@ pub mod listener {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v45) => {
+						Ok(v47) => {
 							w.u8(1)?;
-							w.set_handle(*v45)?;
+							w.set_handle(*v47)?;
 							w.u32(0)?;
 						}
-						Err(v46) => {
+						Err(v48) => {
 							w.u8(0)?;
-							v46.write(w)?;
+							v48.write(w)?;
 						}
 					}
 					Some(())
@@ -2220,13 +2437,13 @@ impl Neighbor {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v48 = true;
-		for v47 in self.mac.iter() {
-			if !v48 {
+		let mut v50 = true;
+		for v49 in self.mac.iter() {
+			if !v50 {
 				out.push(',');
 			}
-			v48 = false;
-			let _ = write!(out, "{}", v47);
+			v50 = false;
+			let _ = write!(out, "{}", v49);
 		}
 		out.push(']');
 		out.push('}');
@@ -2238,13 +2455,13 @@ impl Neighbor {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v50 = true;
-		for v49 in self.mac.iter() {
-			if !v50 {
+		let mut v52 = true;
+		for v51 in self.mac.iter() {
+			if !v52 {
 				out.push_str(", ");
 			}
-			v50 = false;
-			let _ = write!(out, "{}", v49);
+			v52 = false;
+			let _ = write!(out, "{}", v51);
 		}
 		out.push(']');
 		out.push('}');
@@ -2255,8 +2472,8 @@ impl Neighbor {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
 		crate::codec::cbor::array(out, self.mac.len());
-		for v51 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v51 as u64);
+		for v53 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v53 as u64);
 		}
 	}
 }
@@ -2284,13 +2501,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"mac\":");
 		out.push('[');
-		let mut v53 = true;
-		for v52 in self.mac.iter() {
-			if !v53 {
+		let mut v55 = true;
+		for v54 in self.mac.iter() {
+			if !v55 {
 				out.push(',');
 			}
-			v53 = false;
-			let _ = write!(out, "{}", v52);
+			v55 = false;
+			let _ = write!(out, "{}", v54);
 		}
 		out.push(']');
 		out.push(',');
@@ -2302,13 +2519,13 @@ impl NetInfo {
 		out.push(',');
 		out.push_str("\"neighbors\":");
 		out.push('[');
-		let mut v55 = true;
-		for v54 in self.neighbors.iter() {
-			if !v55 {
+		let mut v57 = true;
+		for v56 in self.neighbors.iter() {
+			if !v57 {
 				out.push(',');
 			}
-			v55 = false;
-			v54.to_json_into(out);
+			v57 = false;
+			v56.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2320,13 +2537,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("mac=");
 		out.push('[');
-		let mut v57 = true;
-		for v56 in self.mac.iter() {
-			if !v57 {
+		let mut v59 = true;
+		for v58 in self.mac.iter() {
+			if !v59 {
 				out.push_str(", ");
 			}
-			v57 = false;
-			let _ = write!(out, "{}", v56);
+			v59 = false;
+			let _ = write!(out, "{}", v58);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -2338,13 +2555,13 @@ impl NetInfo {
 		out.push_str(", ");
 		out.push_str("neighbors=");
 		out.push('[');
-		let mut v59 = true;
-		for v58 in self.neighbors.iter() {
-			if !v59 {
+		let mut v61 = true;
+		for v60 in self.neighbors.iter() {
+			if !v61 {
 				out.push_str(", ");
 			}
-			v59 = false;
-			v58.to_text_into(out);
+			v61 = false;
+			v60.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -2355,8 +2572,8 @@ impl NetInfo {
 		self.addr.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mac");
 		crate::codec::cbor::array(out, self.mac.len());
-		for v60 in self.mac.iter() {
-			crate::codec::cbor::uint(out, *v60 as u64);
+		for v62 in self.mac.iter() {
+			crate::codec::cbor::uint(out, *v62 as u64);
 		}
 		crate::codec::cbor::text(out, "mtu");
 		crate::codec::cbor::uint(out, self.mtu as u64);
@@ -2364,8 +2581,8 @@ impl NetInfo {
 		self.gateway.to_cbor_into(out);
 		crate::codec::cbor::text(out, "neighbors");
 		crate::codec::cbor::array(out, self.neighbors.len());
-		for v61 in self.neighbors.iter() {
-			v61.to_cbor_into(out);
+		for v63 in self.neighbors.iter() {
+			v63.to_cbor_into(out);
 		}
 	}
 }
@@ -2519,6 +2736,99 @@ impl PingReply {
 	}
 }
 
+impl HopStatus {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			HopStatus::TimeExceeded => out.push_str("\"time-exceeded\""),
+			HopStatus::Reply => out.push_str("\"reply\""),
+			HopStatus::Unreachable => out.push_str("\"unreachable\""),
+			HopStatus::Timeout => out.push_str("\"timeout\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			HopStatus::TimeExceeded => out.push_str("time-exceeded"),
+			HopStatus::Reply => out.push_str("reply"),
+			HopStatus::Unreachable => out.push_str("unreachable"),
+			HopStatus::Timeout => out.push_str("timeout"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			HopStatus::TimeExceeded => crate::codec::cbor::text(out, "time-exceeded"),
+			HopStatus::Reply => crate::codec::cbor::text(out, "reply"),
+			HopStatus::Unreachable => crate::codec::cbor::text(out, "unreachable"),
+			HopStatus::Timeout => crate::codec::cbor::text(out, "timeout"),
+		}
+	}
+}
+
+impl TraceHop {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"status\":");
+		self.status.to_json_into(out);
+		out.push(',');
+		out.push_str("\"addr\":");
+		self.addr.to_json_into(out);
+		out.push(',');
+		out.push_str("\"rtt-us\":");
+		let _ = write!(out, "{}", self.rtt_us);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("status=");
+		self.status.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("addr=");
+		self.addr.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("rtt-us=");
+		let _ = write!(out, "{}", self.rtt_us);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "status");
+		self.status.to_cbor_into(out);
+		crate::codec::cbor::text(out, "addr");
+		self.addr.to_cbor_into(out);
+		crate::codec::cbor::text(out, "rtt-us");
+		crate::codec::cbor::uint(out, self.rtt_us as u64);
+	}
+}
+
 impl TcpRequest {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -2542,13 +2852,13 @@ impl TcpRequest {
 		out.push(',');
 		out.push_str("\"request\":");
 		out.push('[');
-		let mut v63 = true;
-		for v62 in self.request.iter() {
-			if !v63 {
+		let mut v65 = true;
+		for v64 in self.request.iter() {
+			if !v65 {
 				out.push(',');
 			}
-			v63 = false;
-			let _ = write!(out, "{}", v62);
+			v65 = false;
+			let _ = write!(out, "{}", v64);
 		}
 		out.push(']');
 		out.push('}');
@@ -2560,13 +2870,13 @@ impl TcpRequest {
 		out.push_str(", ");
 		out.push_str("request=");
 		out.push('[');
-		let mut v65 = true;
-		for v64 in self.request.iter() {
-			if !v65 {
+		let mut v67 = true;
+		for v66 in self.request.iter() {
+			if !v67 {
 				out.push_str(", ");
 			}
-			v65 = false;
-			let _ = write!(out, "{}", v64);
+			v67 = false;
+			let _ = write!(out, "{}", v66);
 		}
 		out.push(']');
 		out.push('}');
@@ -2577,8 +2887,8 @@ impl TcpRequest {
 		self.ep.to_cbor_into(out);
 		crate::codec::cbor::text(out, "request");
 		crate::codec::cbor::array(out, self.request.len());
-		for v66 in self.request.iter() {
-			crate::codec::cbor::uint(out, *v66 as u64);
+		for v68 in self.request.iter() {
+			crate::codec::cbor::uint(out, *v68 as u64);
 		}
 	}
 }
@@ -2702,13 +3012,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("\"data\":");
 		out.push('[');
-		let mut v68 = true;
-		for v67 in self.data.iter() {
-			if !v68 {
+		let mut v70 = true;
+		for v69 in self.data.iter() {
+			if !v70 {
 				out.push(',');
 			}
-			v68 = false;
-			let _ = write!(out, "{}", v67);
+			v70 = false;
+			let _ = write!(out, "{}", v69);
 		}
 		out.push(']');
 		out.push('}');
@@ -2717,13 +3027,13 @@ impl Chunk {
 		out.push('{');
 		out.push_str("data=");
 		out.push('[');
-		let mut v70 = true;
-		for v69 in self.data.iter() {
-			if !v70 {
+		let mut v72 = true;
+		for v71 in self.data.iter() {
+			if !v72 {
 				out.push_str(", ");
 			}
-			v70 = false;
-			let _ = write!(out, "{}", v69);
+			v72 = false;
+			let _ = write!(out, "{}", v71);
 		}
 		out.push(']');
 		out.push('}');
@@ -2732,8 +3042,8 @@ impl Chunk {
 		crate::codec::cbor::map(out, 1);
 		crate::codec::cbor::text(out, "data");
 		crate::codec::cbor::array(out, self.data.len());
-		for v71 in self.data.iter() {
-			crate::codec::cbor::uint(out, *v71 as u64);
+		for v73 in self.data.iter() {
+			crate::codec::cbor::uint(out, *v73 as u64);
 		}
 	}
 }

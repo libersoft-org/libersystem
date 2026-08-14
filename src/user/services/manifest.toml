@@ -455,6 +455,24 @@ destination = "bin/watch.lsexe"
 providers = ["base-proto", "cli", "security-client", "storage-proto", "lsrt"]
 
 [[programs]]
+name = "less"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/less.lsexe"
+providers = ["base-proto", "lico", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "traceroute"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/traceroute.lsexe"
+providers = ["base-proto", "cli", "network-client", "network-proto", "wire", "lsrt"]
+
+[[programs]]
 name = "component_host"
 owner = "services"
 role = "helper"

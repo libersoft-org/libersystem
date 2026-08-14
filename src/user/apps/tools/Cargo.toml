@@ -52,6 +52,14 @@ name = "watch"
 path = "src/watch.rs"
 
 [[bin]]
+name = "less"
+path = "src/less.rs"
+
+[[bin]]
+name = "traceroute"
+path = "src/traceroute.rs"
+
+[[bin]]
 name = "write"
 path = "src/write.rs"
 

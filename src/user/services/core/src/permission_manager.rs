@@ -218,6 +218,13 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// construction rather than by intention: the child is started under its own manifest, and
 		// `watch` has nothing of its own to lend it.
 		b"watch" => Some(granted("watch", alloc::vec![Capability::Permission])),
+		// A pager reads files and nothing else. It runs as an interactive foreground job, which is
+		// how it reaches the terminal - the tty is inherited stdio rather than a manifest grant.
+		b"less" => Some(granted("less", alloc::vec![Capability::Volumes])),
+		// A traceroute asks NetworkService one typed question per hop and holds no interface of its
+		// own - which is the point of the op existing, since the conventional tool holds a raw
+		// socket over every packet the machine sends.
+		b"traceroute" => Some(granted("traceroute", alloc::vec![Capability::Network])),
 		b"stop" => Some(granted("stop", alloc::vec![Capability::Supervisor])),
 		// The inverse of `stop`, and granted exactly what it is granted: one admin channel.
 		b"start" => Some(granted("start", alloc::vec![Capability::Supervisor])),

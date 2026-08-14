@@ -4,7 +4,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use base_proto::generated::liber::base::v1::Error;
-use network_proto::generated::liber::network::v1::{Endpoint, Ipv4Addr, NetCapacity, NetInfo, PingReply, SockInfo, TcpRequest};
+use network_proto::generated::liber::network::v1::{Endpoint, Ipv4Addr, NetCapacity, NetInfo, PingReply, SockInfo, TcpRequest, TraceHop};
 use wire::Buffer;
 
 unsafe extern "Rust" {
@@ -14,6 +14,8 @@ unsafe extern "Rust" {
 	fn network_resolve(chan: u64, name: &str) -> Option<Result<Ipv4Addr, Error>>;
 	#[link_name = "liber_channel_liber_network_network_ping"]
 	fn network_ping(chan: u64, addr: &Ipv4Addr) -> Option<Result<PingReply, Error>>;
+	#[link_name = "liber_channel_liber_network_network_probe"]
+	fn network_probe(chan: u64, addr: &Ipv4Addr, ttl: &u8) -> Option<Result<TraceHop, Error>>;
 	fn network_fetch(chan: u64, request: &TcpRequest) -> Option<Result<Vec<u8>, Error>>;
 	#[link_name = "liber_channel_liber_network_network_connect"]
 	fn network_connect(chan: u64, endpoint: &Endpoint) -> Option<Result<u64, Error>>;
@@ -59,6 +61,11 @@ impl NetworkClient {
 	#[inline(always)]
 	pub fn ping(&mut self, addr: &Ipv4Addr) -> Option<Result<PingReply, Error>> {
 		unsafe { network_ping(self.chan, addr) }
+	}
+	/// One traceroute probe: an echo with the IP TTL set to `ttl`, and whatever answered it.
+	#[inline(always)]
+	pub fn probe(&mut self, addr: &Ipv4Addr, ttl: u8) -> Option<Result<TraceHop, Error>> {
+		unsafe { network_probe(self.chan, addr, &ttl) }
 	}
 	#[inline(always)]
 	pub fn fetch(&mut self, request: &TcpRequest) -> Option<Result<Vec<u8>, Error>> {

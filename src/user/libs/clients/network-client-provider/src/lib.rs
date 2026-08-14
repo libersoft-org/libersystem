@@ -30,6 +30,7 @@ forward!("liber_channel_liber_network_network_info", "liber_channel_impl_liber_n
 forward!("liber_channel_liber_network_network_listen", "liber_channel_impl_liber_network_network_listen");
 forward!("liber_channel_liber_network_network_open", "liber_channel_impl_liber_network_network_open");
 forward!("liber_channel_liber_network_network_ping", "liber_channel_impl_liber_network_network_ping");
+forward!("liber_channel_liber_network_network_probe", "liber_channel_impl_liber_network_network_probe");
 forward!("liber_channel_liber_network_network_resolve", "liber_channel_impl_liber_network_network_resolve");
 forward!("liber_channel_liber_network_network_sntp", "liber_channel_impl_liber_network_network_sntp");
 forward!("liber_channel_liber_network_network_sockets", "liber_channel_impl_liber_network_network_sockets");

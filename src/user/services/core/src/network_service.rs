@@ -26,7 +26,7 @@ use rt::*;
 
 use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack, TCP_SEGMENT_OVERHEAD};
 use proto::codec::{Buffer, Handles};
-use proto::system::{Chunk, Endpoint, Error, Ipv4Addr as WireIp, Neighbor, NetCapacity, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, config, listener, network, socket};
+use proto::system::{Chunk, Endpoint, Error, HopStatus, Ipv4Addr as WireIp, Neighbor, NetCapacity, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, TraceHop, config, listener, network, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -665,6 +665,15 @@ impl network::Service for Net<'_> {
 		}
 	}
 
+	// One traceroute probe. See the op's own comment in `network.lsidl` for why this is an
+	// operation rather than a raw socket handed to a tool.
+	fn probe(&mut self, addr: WireIp, ttl: u8) -> Result<TraceHop, Error> {
+		unsafe {
+			let (status, who, rtt_us) = do_probe(from_wire(&addr), ttl.max(1), self.frames, self.stack, &mut self.seq, self.rx, self.tx);
+			Ok(TraceHop { status, addr: to_wire(who), rtt_us })
+		}
+	}
+
 	// A one-shot TCP exchange: connect, send the request, read the response, close.
 	// Maps the connect failure modes onto the error enum. The response accumulates
 	// in a Vec and rides an exactly-sized reply - its size is bounded by the peer
@@ -907,6 +916,48 @@ unsafe fn do_ping(ip: Ipv4Addr, frames: u64, stack: &mut Stack, seq: &mut u16, r
 			}
 		}
 		(0, 0, 0)
+	}
+}
+
+// Send one echo with a chosen TTL and report what answered.
+//
+// EVERY ANSWER IS MATCHED BY SEQUENCE, and that is not belt-and-braces: several probes may be in
+// flight, every router answers from its own address, and an ICMP error quotes the datagram that
+// caused it precisely so the quote can be matched. Accepting the first error that arrives would
+// attribute one hop's answer to another probe's row, which is a traceroute that draws a plausible
+// route that is not the route.
+//
+// A hop that does not report itself is a TIMEOUT and not a failure: routers are commonly
+// configured not to answer, and the conventional `* * *` row says exactly that. It is distinct
+// from `unreachable`, which is somebody answering to refuse.
+unsafe fn do_probe(ip: Ipv4Addr, ttl: u8, frames: u64, stack: &mut Stack, seq: &mut u16, rx: &mut [u8], tx: &mut [u8]) -> (HopStatus, Ipv4Addr, u32) {
+	unsafe {
+		let hop: Ipv4Addr = stack.next_hop(ip);
+		let mac: MacAddr = match resolve(hop, frames, stack, rx, tx) {
+			Some(m) => m,
+			// The FIRST hop cannot be resolved, which is not a hop refusing us - it is this machine
+			// having no way to send at all.
+			None => return (HopStatus::Unreachable, Ipv4Addr([0, 0, 0, 0]), 0),
+		};
+		*seq = seq.wrapping_add(1);
+		let sent_seq: u16 = *seq;
+		let echo: usize = stack.build_icmp_echo_ttl(mac, ip, 1, sent_seq, ttl, tx);
+		let start: u64 = clock_ns();
+		send_frame(frames, &tx[..echo]);
+		let deadline: u64 = clock() + PING_TIMEOUT_TICKS;
+		while clock() < deadline {
+			if wait(frames, deadline) != 0 {
+				break;
+			}
+			let elapsed = || (clock_ns().saturating_sub(start) / 1000).min(u32::MAX as u64) as u32;
+			match pump(frames, stack, rx, tx) {
+				Event::EchoReply(reply, _, rseq) if rseq == sent_seq => return (HopStatus::Reply, reply, elapsed()),
+				Event::TimeExceeded(router, rseq) if rseq == sent_seq => return (HopStatus::TimeExceeded, router, elapsed()),
+				Event::Unreachable(who, rseq) if rseq == sent_seq => return (HopStatus::Unreachable, who, elapsed()),
+				_ => {}
+			}
+		}
+		(HopStatus::Timeout, Ipv4Addr([0, 0, 0, 0]), 0)
 	}
 }
 

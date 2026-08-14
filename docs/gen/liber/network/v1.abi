@@ -6,6 +6,8 @@ record net-info(addr:ipv4-addr,mac:list<u8>,mtu:u16,gateway:ipv4-addr,neighbors:
 record net-capacity(clients:u32,sockets:u32,listeners:u32,connections:u32)
 enum ping-status(reply=0,timeout=1,unreachable=2)
 record ping-reply(status:ping-status,ttl:u8,rtt-us:u32)
+enum hop-status(time-exceeded=0,reply=1,unreachable=2,timeout=3)
+record trace-hop(status:hop-status,addr:ipv4-addr,rtt-us:u32)
 record tcp-request(ep:endpoint,request:list<u8>)
 enum sock-state(closed=0,syn-sent=1,syn-rcvd=2,established=3,fin-wait=4,listen=5)
 record sock-info(local-port:u16,remote:endpoint,state:sock-state)
@@ -20,6 +22,7 @@ method network.listen op=7 (port:u16:rights=) -> result<handle<channel>, liber:b
 method network.sockets op=8 () -> result<list<sock-info>, liber:base@1::error>
 method network.sntp op=9 (server:ipv4-addr:rights=) -> result<u64, liber:base@1::error>
 method network.capacity op=10 () -> result<net-capacity, liber:base@1::error>
+method network.probe op=11 (addr:ipv4-addr:rights=,ttl:u8:rights=) -> result<trace-hop, liber:base@1::error>
 interface socket
 method socket.send op=1 (data:buffer:rights=) -> result<u32, liber:base@1::error>
 method socket.recv op=2 () -> stream<chunk>

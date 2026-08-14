@@ -829,6 +829,9 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	// `watch` redraws in the alternate screen and must own the terminal for as long as it runs, so
 	// it takes the interactive shape - the same one `play` and `ps -i` take.
 	(b"watch", Shape::InteractiveArgs),
+	// The pager owns the terminal while it runs, like `watch` - and it takes the interactive shape
+	// with a REST form, because `less` with no path pages its input from a pipe.
+	(b"less", Shape::InteractiveArgs),
 	(b"truncate", Shape::Args),
 	(b"touch", Shape::Args),
 	(b"mkdir", Shape::Args),
@@ -845,6 +848,7 @@ const NET_TOOLS: &[(&[u8], &[u8], bool)] = &[
 	(b"ss", b"ss", false),
 	(b"netstat", b"ss", false),
 	(b"ping", b"ping", true),
+	(b"traceroute", b"traceroute", true),
 	(b"nslookup", b"nslookup", true),
 	(b"host", b"nslookup", true),
 	(b"tcp", b"tcp", true),

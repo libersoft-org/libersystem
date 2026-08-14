@@ -28,6 +28,10 @@ const IP_PROTO_TCP: u8 = 6;
 // ICMP message types.
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
+// The two errors a traceroute reads. A router that drops a datagram because its TTL ran out says
+// so with type 11; a host or router that will not forward it at all says so with type 3.
+const ICMP_DEST_UNREACHABLE: u8 = 3;
+const ICMP_TIME_EXCEEDED: u8 = 11;
 
 // The DNS server port (UDP).
 const DNS_PORT: u16 = 53;
@@ -293,6 +297,51 @@ pub enum Event {
 	DhcpReply(u8),
 	// An SNTP reply arrived carrying this Unix timestamp (seconds since 1970, UTC).
 	SntpReply(u64),
+	// A router discarded one of our datagrams because its TTL reached zero, and said so: the
+	// router's address and the sequence number of the echo it was carrying.
+	//
+	// THE SEQUENCE COMES FROM INSIDE THE ERROR. An ICMP error quotes the datagram that caused it -
+	// its IP header and the first eight bytes after - and for an echo those eight bytes include the
+	// identifier and sequence we sent. That quote is the only thing that ties the answer to the
+	// probe: several probes are in flight and every router answers from its own address, so
+	// without it a reply cannot be attributed to a hop.
+	TimeExceeded(Ipv4Addr, u16),
+	// A host or a router refused the datagram outright - no route, a filtered port, an
+	// administratively prohibited path. Distinct from a timeout, which says nothing came back at
+	// all: one is an answer and the other is silence, and a traceroute that showed them the same
+	// way would hide where a path is blocked.
+	Unreachable(Ipv4Addr, u16),
+}
+
+// The sequence number of the echo an ICMP error is quoting, if it is quoting one.
+//
+// An error carries `[type, code, checksum, unused(4)]` and then the offending datagram: its IPv4
+// header, and at least the first eight bytes after it. For an echo those eight are
+// `[type, code, checksum(2), identifier(2), sequence(2)]`, so the sequence is the last two.
+//
+// EVERY LENGTH IS CHECKED AGAINST THE BUFFER, because this is data from the network describing the
+// shape of data from the network: the quoted header's own IHL field says how long it is, and a
+// hostile one can say anything. A quote that does not fit, does not carry IPv4, or does not carry
+// ICMP is not an answer to a probe - and answering `None` is what makes it not one.
+fn quoted_echo_sequence(icmp: &[u8]) -> Option<u16> {
+	const ERROR_HEADER: usize = 8;
+	let quoted: &[u8] = icmp.get(ERROR_HEADER..)?;
+	let first: u8 = *quoted.first()?;
+	if first >> 4 != 4 {
+		return None;
+	}
+	let ihl: usize = (first & 0x0f) as usize * 4;
+	if ihl < IPV4_HDR {
+		return None;
+	}
+	if *quoted.get(9)? != IP_PROTO_ICMP {
+		return None;
+	}
+	let inner: &[u8] = quoted.get(ihl..)?;
+	if inner.len() < ICMP_HDR || inner[0] != ICMP_ECHO_REQUEST {
+		return None;
+	}
+	Some(be16(inner, 6))
 }
 
 // The result of feeding one frame to the stack: an optional reply to transmit
@@ -1037,6 +1086,15 @@ impl Stack {
 			let seq: u16 = be16(icmp, 6);
 			return Outcome { reply_len: 0, event: Event::EchoReply(src_ip, ttl, seq) };
 		}
+		// THE TWO ERRORS A TRACEROUTE IS MADE OF. Each quotes the datagram that caused it, and the
+		// quote is what attributes the answer to a probe - see `Event::TimeExceeded`.
+		if icmp[0] == ICMP_TIME_EXCEEDED || icmp[0] == ICMP_DEST_UNREACHABLE {
+			let Some(seq) = quoted_echo_sequence(icmp) else {
+				return Outcome { reply_len: 0, event: Event::None };
+			};
+			let event = if icmp[0] == ICMP_TIME_EXCEEDED { Event::TimeExceeded(src_ip, seq) } else { Event::Unreachable(src_ip, seq) };
+			return Outcome { reply_len: 0, event };
+		}
 		Outcome { reply_len: 0, event: Event::None }
 	}
 
@@ -1072,6 +1130,17 @@ impl Stack {
 	// Build an ICMP echo request to `dst_ip` (whose MAC is `dst_mac`) with the given
 	// identifier and sequence, into `out`, returning its length.
 	pub fn build_icmp_echo(&self, dst_mac: MacAddr, dst_ip: Ipv4Addr, ident: u16, seq: u16, out: &mut [u8]) -> usize {
+		self.build_icmp_echo_ttl(dst_mac, dst_ip, ident, seq, 64, out)
+	}
+
+	// The same echo with the IP TTL chosen by the caller.
+	//
+	// THE TTL IS THE WHOLE OF A TRACEROUTE. A datagram sent with a TTL of `n` is discarded by the
+	// `n`-th router on the path, which reports itself - so the route is discovered one hop at a
+	// time by a field that already existed for a different reason. It is a parameter here rather
+	// than a second builder because everything else about the packet is identical, and two builders
+	// that differ in one byte are two things that can drift.
+	pub fn build_icmp_echo_ttl(&self, dst_mac: MacAddr, dst_ip: Ipv4Addr, ident: u16, seq: u16, ttl: u8, out: &mut [u8]) -> usize {
 		let total: usize = IPV4_HDR + ICMP_HDR + ICMP_PAYLOAD;
 		out[0..6].copy_from_slice(&dst_mac.0);
 		out[6..12].copy_from_slice(&self.mac.0);
@@ -1082,7 +1151,7 @@ impl Stack {
 		put16(ip, 2, total as u16);
 		put16(ip, 4, 0);
 		put16(ip, 6, 0);
-		ip[8] = 64;
+		ip[8] = ttl;
 		ip[9] = IP_PROTO_ICMP;
 		put16(ip, 10, 0);
 		ip[12..16].copy_from_slice(&self.ip.0);

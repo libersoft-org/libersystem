@@ -628,6 +628,50 @@ static TTY_CONTROL: AtomicU64 = AtomicU64::new(0);
 // the terminal: a program's data and a program's request were the same thing, and no filter on a
 // byte stream can separate them. A capability can: this channel is handed to the foreground job by
 // the shell, and a program that does not have it cannot ask.
+// Ask the controlling terminal how big it is: `(rows, cols)`, or None when this program has no
+// control channel or the terminal does not answer.
+//
+// THROUGH THE SAME CAPABILITY AS THE MODE CHANGE, and for the same reason. The size is not
+// something a program can read off its output stream; the conventional way - print a cursor-position
+// query and parse what comes back on stdin - makes a program's request indistinguishable from its
+// data and needs the answer to arrive interleaved with whatever the user is typing. The control
+// channel is a capability the shell hands to an interactive foreground job, and a program without
+// one simply cannot ask.
+//
+// A tool that gets None has to choose a size rather than fail: a pager on a terminal that will not
+// say is still a pager, and refusing to run would be a worse answer than a conservative guess.
+pub unsafe fn tty_winsize() -> Option<(u16, u16)> {
+	let control: u64 = TTY_CONTROL.load(Ordering::Relaxed);
+	if control == 0 {
+		return None;
+	}
+	unsafe {
+		if !send_blocking(control, b"GET_WINSIZE", 0) {
+			return None;
+		}
+		let mut buf: [u8; 32] = [0u8; 32];
+		// BOUNDED, unlike the shell's own version of this loop: an interactive tool asking for its
+		// size must not be able to park forever on a control channel that is answering something
+		// else. Sixteen messages is far more than the queue ever holds between a request and its
+		// reply, and running out is a size this tool has to choose for itself.
+		for _ in 0..16 {
+			match recv_blocking(control, &mut buf) {
+				Received::Message { len, .. } => {
+					let message: &[u8] = &buf[..len];
+					if message.starts_with(b"WINSIZE") && len >= b"WINSIZE".len() + 4 {
+						let at = b"WINSIZE".len();
+						let rows = u16::from_le_bytes([message[at], message[at + 1]]);
+						let cols = u16::from_le_bytes([message[at + 2], message[at + 3]]);
+						return if rows == 0 || cols == 0 { None } else { Some((rows, cols)) };
+					}
+				}
+				Received::Closed => return None,
+			}
+		}
+		None
+	}
+}
+
 pub unsafe fn tty_set_mode(raw: bool, echo: bool) -> bool {
 	let control: u64 = TTY_CONTROL.load(Ordering::Relaxed);
 	if control == 0 {
