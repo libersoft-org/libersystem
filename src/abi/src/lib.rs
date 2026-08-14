@@ -330,6 +330,15 @@ pub const MAX_ELF_BYTES: usize = 64 * 1024 * 1024;
 
 pub const SYS_PROCESS_GROUP_CREATE: u64 = 65;
 pub const SYS_PROCESS_GROUP_SIGNAL: u64 = 66;
+// Per-member `ProcessStats` for a ProcessGroup, in CREATION ORDER - which for a pipeline is the
+// order of the line, so a caller can say which stage failed rather than that something in it did.
+//
+// It reads the group's own record of what each member finished as, captured when that member
+// reached a terminal state. Reading the live processes instead would be a race dressed as an API:
+// a group holds its members weakly so it never keeps a dead one alive, so by the time anybody asks
+// about a finished pipeline the processes may be gone, and the answer would depend on how quickly
+// the question was asked.
+pub const SYS_PROCESS_GROUP_STATS: u64 = 75;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

@@ -44,6 +44,30 @@ pub struct ProcessGroup {
 	// The membership count at creation. `members` is pruned as processes die, so it
 	// cannot answer a question about the original set.
 	original_size: usize,
+	// WHAT EACH STAGE FINISHED AS, in creation order - which for a pipeline is the order of the
+	// line, so "which stage failed" is answerable and not just "something did".
+	//
+	// Captured when the member reaches a terminal state rather than read when somebody asks,
+	// because by the time anybody asks the process may be gone: the group holds it weakly on
+	// purpose, and holding it strongly would keep its user frames alive for the length of the job's
+	// history. A record is a handful of bytes; a Process is an address space.
+	//
+	// `None` means the stage has not finished. A slot is written once - the first terminal
+	// transition wins, so a process killed after exiting cleanly is still recorded as having
+	// exited cleanly.
+	records: SpinLock<Vec<Option<StageRecord>>>,
+}
+
+/// What one stage of a group finished as.
+#[derive(Clone, Copy)]
+pub struct StageRecord {
+	/// `PROC_STATE_STOPPED` for a clean exit, `PROC_STATE_FAILED` for a fault or a kill.
+	pub state: u64,
+	/// What the program passed to `exit_with`, when it got to say. Zero is both the commonest
+	/// success value and the natural "nothing here", so a caller must not have to guess which it is
+	/// looking at - which is why `completion_valid` exists beside it.
+	pub completion: u64,
+	pub completion_valid: u64,
 }
 
 impl_kernel_object!(ProcessGroup, ProcessGroup);
@@ -58,7 +82,59 @@ impl ProcessGroup {
 		}
 		let weak: Vec<Weak<Process>> = members.iter().map(Arc::downgrade).collect();
 		let original_size = weak.len();
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), members: SpinLock::new(weak), original_size })
+		let mut records: Vec<Option<StageRecord>> = Vec::new();
+		if records.try_reserve_exact(original_size).is_err() {
+			return None;
+		}
+		records.resize(original_size, None);
+		let group = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), members: SpinLock::new(weak), original_size, records: SpinLock::new(records) })?;
+		// THE BACK-LINK, and it is what makes a finished stage answerable for. Each member takes a
+		// weak reference to this group so that when it reaches a terminal state it can say what it
+		// finished as - see `records`. A member that cannot take one fails the whole creation: a
+		// group that would silently never learn what one of its stages did is worse than no group,
+		// because the caller would read the missing record as "still running".
+		for member in members {
+			if !member.join_group(&group) {
+				return None;
+			}
+			// ALREADY GONE IS STILL AN ANSWER. A process that terminated between the caller looking
+			// it up and this line has already run its notification, with this group not yet on its
+			// list - so the record is taken here instead. Without it a group built over a stage that
+			// exited immediately would report that stage as running forever.
+			if member.is_terminated() {
+				group.record_member(member);
+			}
+		}
+		Some(group)
+	}
+
+	// Write what `process` finished as into its slot, if it has not been written already.
+	//
+	// Called from the process's own terminal paths and from `create` for a member that was already
+	// gone. Matching by koid rather than by pointer because the members are weak and the caller is
+	// a `&Process` - the koid is the identity that survives both.
+	pub fn record_member(&self, process: &Process) {
+		let koid = process.header().koid();
+		let position = {
+			let members = self.members.lock();
+			members.iter().position(|member| member.upgrade().is_some_and(|member| member.header().koid() == koid))
+		};
+		let Some(position) = position else { return };
+		let mut records = self.records.lock();
+		if records[position].is_some() {
+			return;
+		}
+		let state = if process.is_killed() { crate::syscall::PROC_STATE_FAILED } else { crate::syscall::PROC_STATE_STOPPED };
+		let (completion, completion_valid) = match process.exit_status() {
+			Some(status) => (status, 1),
+			None => (0, 0),
+		};
+		records[position] = Some(StageRecord { state, completion, completion_valid });
+	}
+
+	/// What each stage finished as, in creation order. `None` for a stage still running.
+	pub fn records(&self) -> Vec<Option<StageRecord>> {
+		self.records.lock().clone()
 	}
 
 	// The members still alive, as owning references. Dead entries are dropped from the list as

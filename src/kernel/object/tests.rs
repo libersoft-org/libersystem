@@ -389,6 +389,62 @@ fn signalling_a_job_reaches_a_group_the_same_way_it_reaches_a_process() {
 	}
 }
 
+crate::tagged_test!(a_group_remembers_what_each_stage_finished_as_after_the_stage_is_gone, [Object, Kernel, Process, Syscall], id = "kernel.object.a_group_remembers_what_each_stage_finished_as_after_the_stage_is_gone", covers = ["kernel"]);
+fn a_group_remembers_what_each_stage_finished_as_after_the_stage_is_gone() {
+	use super::address_space::AddressSpace;
+	use super::process::Process;
+	use super::process_group::ProcessGroup;
+
+	// A PIPELINE'S EXIT IS THE LAST STAGE'S, which is a sensible default and a terrible way to
+	// notice that the third of five stages died: `a | b | c` where `b` faults still ends with `c`
+	// reporting success, because `c` read an empty input and had nothing to complain about. So the
+	// group has to remember what each member finished as - and the hard part is WHEN.
+	//
+	// A group holds its members WEAKLY, deliberately, so it never keeps a dead process alive; a
+	// Process releases its user frames on drop rather than on exit, so holding one strongly would
+	// pin an address space for the length of the job's history. That means by the time anybody asks
+	// about a finished pipeline the processes may be gone, and a stats call that read them would
+	// answer differently depending on how quickly it was asked.
+	//
+	// The record is therefore taken at the moment each member reaches a terminal state, through a
+	// weak back-link from the process to its groups. This test is the reason that is not
+	// over-engineering: it DROPS every member before reading, which is exactly the state a shell
+	// asking about a finished job is in.
+	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain()).expect("a test process");
+	let stages = alloc::vec![make(), make(), make()];
+	let group = ProcessGroup::create(&stages).expect("a three-stage group");
+
+	// Stage 0 exits cleanly with a status, stage 1 is killed, stage 2 exits cleanly with zero -
+	// the three answers a pipeline can give, in one group.
+	stages[0].set_exit_status(3);
+	stages[0].mark_exited();
+	stages[1].terminate();
+	stages[2].set_exit_status(0);
+	stages[2].mark_exited();
+
+	// EVERY STRONG REFERENCE GONE. What is left is the group and its weak members, which is the
+	// state that used to make this question unanswerable.
+	drop(stages);
+
+	let records = group.records();
+	assert_eq!(records.len(), 3, "one slot per stage, in creation order");
+	let first = records[0].expect("stage 0 finished and was recorded");
+	assert_eq!(first.state, crate::syscall::PROC_STATE_STOPPED, "stage 0 exited cleanly");
+	assert_eq!(first.completion_valid, 1, "and it got to say what with");
+	assert_eq!(first.completion, 3, "which was 3");
+	let second = records[1].expect("stage 1 finished and was recorded");
+	assert_eq!(second.state, crate::syscall::PROC_STATE_FAILED, "stage 1 was killed");
+	// A KILLED STAGE HAS NO EXIT CODE, and `completion_valid` is what says so. Zero is both the
+	// commonest success value and the natural "nothing here", so a caller must never have to guess
+	// which it is looking at - a pipeline whose middle stage was killed would otherwise read as one
+	// whose middle stage succeeded.
+	assert_eq!(second.completion_valid, 0, "a killed stage never reported anything");
+	let third = records[2].expect("stage 2 finished and was recorded");
+	assert_eq!(third.state, crate::syscall::PROC_STATE_STOPPED);
+	assert_eq!(third.completion_valid, 1, "an exit status of zero is a status and not an absence");
+	assert_eq!(third.completion, 0);
+}
+
 crate::tagged_test!(the_console_and_display_syscalls_refuse_a_caller_without_the_capability, [Object, Kernel, Syscall], id = "kernel.object.the_console_and_display_syscalls_refuse_a_caller_without_the_capability", covers = ["kernel"]);
 fn the_console_and_display_syscalls_refuse_a_caller_without_the_capability() {
 	use super::privilege::{Privilege, PrivilegeKind};

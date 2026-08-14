@@ -44,7 +44,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -477,6 +477,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_PROCESS_SIGNAL => sys_process_signal(a0, a1),
 		SYS_PROCESS_GROUP_CREATE => sys_process_group_create(a0, a1),
 		SYS_PROCESS_GROUP_SIGNAL => sys_process_group_signal(a0, a1),
+		SYS_PROCESS_GROUP_STATS => sys_process_group_stats(a0, a1, a2),
 		SYS_SIGNAL_CATCH => sys_signal_catch(a0),
 		SYS_SIGNAL_TAKE => sys_signal_take(a0),
 		SYS_THREAD_CREATE => sys_thread_create(a0, a1, a2, a3),
@@ -1637,7 +1638,17 @@ fn sys_process_group_create(handles_ptr: u64, count: u64) -> i64 {
 		return ERR_INVALID;
 	};
 	let thread = current_thread!();
-	install_object(&thread, group, Rights::MANAGE | Rights::READ | Rights::TRANSFER | Rights::DUPLICATE, 0)
+	// WAIT IS IN THE SET, and its absence is what made a group unwaitable in practice.
+	//
+	// The object has been waitable since the arm was added to `wait`, and the test that pins that
+	// installs its own handle with every right - so the gap was invisible from there. Every handle
+	// a real caller gets comes from HERE, and without WAIT the lookup refuses before readiness is
+	// ever consulted: `wait_any([group, control])` answered ACCESS_DENIED, which the shell read as
+	// "the control channel is ready" and blocked on a channel only the terminal writes to. A
+	// foreground pipeline never returned a prompt.
+	//
+	// A job you may signal and may not wait for is not a job control handle.
+	install_object(&thread, group, Rights::MANAGE | Rights::READ | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE, 0)
 }
 
 // Deliver `signal` to every live member of a group. Authority is the group handle carrying
@@ -1661,6 +1672,57 @@ fn sys_process_group_signal(group_handle: u64, signal: u64) -> i64 {
 		}
 	}
 	result
+}
+
+// PER-MEMBER STATS FOR A GROUP: one `ProcessStats` per stage, in creation order, into the caller's
+// array. Returns how many were written, which is the group's size when the buffer is big enough.
+//
+// THE ORDER IS THE POINT. A pipeline's group is created in the order of the line, so slot `i` is
+// stage `i` - and "which stage failed" is a question a caller can only answer if the answer keeps
+// its position. A set with no order would say that something failed, which the caller already knew
+// from the last stage's status being wrong.
+//
+// A FINISHED STAGE COMES FROM THE GROUP'S RECORD and a running one from the process. The group
+// holds its members weakly, so a finished pipeline's processes may already be gone; the record was
+// taken when each reached a terminal state, which is the only moment it is certainly available.
+// The live counters are meaningless for a process that no longer exists and are reported as zero
+// rather than as a number nobody can act on.
+fn sys_process_group_stats(group_handle: u64, buf_ptr: u64, count: u64) -> i64 {
+	use crate::object::process_group::ProcessGroup;
+	// READ, not MANAGE: asking what a job did is not the authority to end it. The shell holds both,
+	// but a monitor handed a group to observe should not thereby be able to kill it - and a right
+	// is only withheld where it is checked.
+	let group = match current_typed::<ProcessGroup>(group_handle, ObjectType::ProcessGroup, Rights::READ) {
+		Ok(g) => g,
+		Err(e) => return e,
+	};
+	let records = group.records();
+	let live = group.live();
+	let size = core::mem::size_of::<ProcessStats>() as u64;
+	let writable = core::cmp::min(count, records.len() as u64);
+	let bytes = match writable.checked_mul(size) {
+		Some(bytes) => bytes,
+		None => return ERR_INVALID,
+	};
+	if bytes == 0 {
+		return 0;
+	}
+	if !user_buf_ok(buf_ptr, bytes) {
+		return ERR_INVALID;
+	}
+	for index in 0..writable as usize {
+		let out = match records[index] {
+			Some(record) => ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: record.state, completion: record.completion, completion_valid: record.completion_valid },
+			None => match live.get(index).filter(|process| !process.is_terminated()) {
+				Some(process) => ProcessStats { messages_sent: process.messages_sent(), messages_received: process.messages_received(), handle_count: process.handle_count(), memory_bytes: process.memory_bytes(), state: PROC_STATE_RUNNING, completion: 0, completion_valid: 0 },
+				None => ProcessStats { state: PROC_STATE_RUNNING, ..Default::default() },
+			},
+		};
+		if let Err(e) = write_user(buf_ptr + index as u64 * size, out) {
+			return e;
+		}
+	}
+	writable as i64
 }
 
 // The disposition one signal has on one process, shared by the per-process and per-group
@@ -2477,9 +2539,10 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 		return ERR_NO_MEMORY;
 	}
 	objects.resize_with(n, || None);
-	let Some(mut koids) = try_zeroed_u64(n) else {
+	let mut koids: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	if koids.try_reserve(n).is_err() {
 		return ERR_NO_MEMORY;
-	};
+	}
 	{
 		let table = thread.handles().lock();
 		for i in 0..n {
@@ -2488,7 +2551,25 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 				Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
 				Err(_) => return ERR_BAD_HANDLE,
 			};
-			koids[i] = object.header().koid();
+			koids.push(object.header().koid());
+			// A PROCESSGROUP IS WOKEN BY ITS MEMBERS, and they wake their own koids.
+			//
+			// `SYS_WAIT` learned this and this call did not, which was invisible for as long as
+			// nothing waited on a group here - and then the shell started waiting on `[group,
+			// control]` for a foreground pipeline and never woke: the pipeline finished, the group
+			// reported itself ready on the next re-check, and no re-check ever came. The prompt
+			// never returned.
+			//
+			// Registering on the members as well needs no back-link from a process to its groups:
+			// the wake it already sends is the one being listened for. FALLIBLY, because the
+			// membership is a length a ring-3 caller chose.
+			if let Some(group) = object.as_any().downcast_ref::<crate::object::process_group::ProcessGroup>() {
+				let members = group.live();
+				if koids.try_reserve(members.len()).is_err() {
+					return ERR_NO_MEMORY;
+				}
+				koids.extend(members.iter().map(|member| member.header().koid()));
+			}
 			objects[i] = Some(object);
 		}
 	}
@@ -2528,7 +2609,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 		if block_deadline != sched::NO_DEADLINE && arch::apic::ticks() >= block_deadline {
 			return ERR_TIMED_OUT;
 		}
-		sched::block_on_any(&koids[..n], block_deadline, periodic, || objects.iter().take(n).any(|slot| slot.as_ref().is_some_and(|o| object_ready(o))));
+		sched::block_on_any(&koids, block_deadline, periodic, || objects.iter().take(n).any(|slot| slot.as_ref().is_some_and(|o| object_ready(o))));
 	}
 }
 

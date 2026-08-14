@@ -528,6 +528,45 @@ fn a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream() {
 	assert!(counted.windows(10).any(|window| window == b"2 13 83 83"), "the bytes reached the far end anyway: {:?}", core::str::from_utf8(counted));
 }
 
+tagged_test!(a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline, [Service, Process, PermissionService, Shell], id = "kernel.applications.a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline", covers = ["kernel", "services"]);
+fn a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline() {
+	// THE LAYER EVERY OTHER TEST HERE SKIPS. The pipeline tests beside this one are hand-written
+	// requests to PermissionManager, which is the transaction and not the shell: the parse, the
+	// redirection expansion, the launch and the status report are the half above it - and that is
+	// where this milestone's defects were. A refused line ran as an ordinary command; a redirection
+	// target that expanded to nothing became a stage with no argument; a foreground pipeline was
+	// relayed rather than made a job. None of those are reachable from a broker request.
+	//
+	// So this spawns the real `shell` binary against the services already running in the scenario,
+	// types `redirect_in motd.txt | wc` at its console as one line, and reads what comes back.
+	// `motd.txt` is two lines of 83 bytes, so a leading count of 2 is the whole chain working:
+	// lexed, expanded into stages, launched as one transaction through the broker, the bytes
+	// carried down an edge, and the last stage's output printed on the terminal the shell was
+	// given.
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	let out: &[u8] = &result.shell_read;
+	let says = |needle: &[u8]| out.windows(needle.len()).any(|window| window == needle);
+	assert!(!out.is_empty(), "the shell answered a typed line at all");
+	assert!(!out.starts_with(b"<the shell"), "the shell started: {:?}", core::str::from_utf8(out));
+	// `redirect_in motd.txt | wc`: two lines of 83 bytes, so this one string is the whole chain -
+	// lexed, expanded into stages, launched as one transaction, carried down an edge, printed on
+	// the terminal the shell was given.
+	assert!(says(b"2 13 83 83"), "a two-stage pipeline ran: {:?}", core::str::from_utf8(out));
+	// `cat ::not-a-path 2>&1 | wc`: the producer fails and its diagnostic follows its OUTPUT rather
+	// than going to the terminal, so `wc` counts it - a non-zero count where the failing-stage test
+	// beside this one gets zero.
+	assert!(says(b"1 4 44 44"), "2>&1 folded the diagnostic into the stream: {:?}", core::str::from_utf8(out));
+	// THE THREE REFUSALS, each of which used to be RUN as an ordinary command with its operator as
+	// a literal argument. Matched on a distinctive phrase of each sentence rather than the whole,
+	// so rewording the message does not break the test while dropping it does.
+	assert!(says(b"only descriptors 1 and 2"), "`3>&1` is refused by name: {:?}", core::str::from_utf8(out));
+	assert!(says(b"change THIS shell"), "a state-mutating builtin in a pipeline is refused: {:?}", core::str::from_utf8(out));
+	assert!(says(b"expanded to nothing"), "a redirection target that vanished is refused: {:?}", core::str::from_utf8(out));
+	// `cat < motd.txt > copied.txt` on a READ-ONLY archive: the destination cannot be opened, and
+	// what this pins is that the refusal reaches the person rather than the pipe.
+	assert!(says(b"cannot open for writing"), "an unwritable destination is reported: {:?}", core::str::from_utf8(out));
+}
+
 tagged_test!(merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge, [Service, Process, PermissionService], id = "kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge", covers = ["kernel", "services"]);
 fn merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge() {
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");

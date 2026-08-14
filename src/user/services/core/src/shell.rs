@@ -326,7 +326,7 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 					Err(reason) => print(redirect_refusal(&reason)),
 					Ok(expansion) => {
 						let parsed = pipeline.as_ref().expect("checked by needs_broker");
-						if !run_pipeline_line(&mut jobs, permsvc, &expansion.stages, parsed.background, cwd.as_bytes(), &vars) {
+						if !run_pipeline_line(&mut jobs, permsvc, &expansion.stages, parsed.background, cwd.as_bytes(), &mut vars, session) {
 							print(b"shell: pipeline could not be started\n");
 						}
 					}
@@ -591,6 +591,16 @@ unsafe fn run_foreground(control: u64, job: Job) -> Option<Job> {
 		let mut cbuf: [u8; 32] = [0u8; 32];
 		loop {
 			let ready: i64 = wait_any(&waits, 0);
+			// A NEGATIVE ANSWER IS NOT "THE CONTROL CHANNEL IS READY". Anything but 0 fell through
+			// to a blocking receive on the control channel, so a `wait_any` that REFUSED - a handle
+			// without WAIT, a set it could not size - parked the shell forever on a channel only the
+			// terminal ever writes to. That is a prompt that never comes back, from a syscall that
+			// answered immediately.
+			if ready < 0 {
+				send_blocking(control, b"CLEAR_FG", 0);
+				close(job.proc);
+				return None;
+			}
 			if ready == 0 {
 				// The Process handle is ready: the process has terminated (it exited or a
 				// signal killed it). The job is done; release the tty and reap it.
@@ -1512,7 +1522,7 @@ fn redirect_refusal(reason: &RedirectError) -> &'static [u8] {
 	}
 }
 
-unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[ExpandedStage], background: bool, cwd: &[u8], vars: &[(String, String)]) -> bool {
+unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[ExpandedStage], background: bool, cwd: &[u8], vars: &mut Vec<(String, String)>, session: u64) -> bool {
 	unsafe {
 		let cwd_str: &str = match core::str::from_utf8(cwd) {
 			Ok(s) => s,
@@ -1599,13 +1609,132 @@ unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[ExpandedStag
 			}
 			return true;
 		}
+		// A SECOND HANDLE, kept for the status. `run_foreground_tracked` owns the one it is given and
+		// closes it when the job ends, and the per-stage records have to be read after that - so the
+		// alternative to a duplicate is asking the job control machinery to hand something back,
+		// which would make every caller of it carry a pipeline's concern.
+		//
+		// READ only: this copy exists to ask what the job did, and giving it the authority to end
+		// the job as well would be authority nobody here uses.
+		let observer: i64 = duplicate(group, RIGHT_READ | RIGHT_WAIT);
 		// AND A FOREGROUND ONE IS ONE JOB TOO, over the same handle. `run_foreground_tracked` hands
 		// the tty a MANAGE dup so the signal keys reach it, waits for the group to terminate, and
 		// on a Ctrl+Z hands it back as a stopped background job. None of that is pipeline-specific:
 		// a ProcessGroup is waitable and - since the signal syscall learned to take one - signalable
 		// exactly where a Process was.
 		jobs.run_foreground_tracked(Job { proc: group, name: label });
+		if observer >= 0 {
+			report_pipeline_status(observer as u64, words, vars, session);
+			close(observer as u64);
+		}
 		true
+	}
+}
+
+// The name of the session setting that changes which stage decides a pipeline's status, and the
+// value that turns it on. A variable rather than a new `set -o` grammar: it is already written
+// through to the session, so it survives the shell, and `set` already lists it.
+const PIPEFAIL: &str = "pipefail";
+
+// The variable a pipeline's status is left in, so `echo $?` can read it.
+const STATUS_VAR: &str = "?";
+
+// Read what each stage finished as and say so - the interactive half of a pipeline's status.
+//
+// WHY THIS EXISTS AT ALL. A pipeline's exit is the LAST stage's, which is a sensible default and a
+// terrible way to notice that the third of five stages died: `a | b | c` where `b` faults still
+// ends with `c` reporting success, because `c` read an empty input and had nothing to complain
+// about. Nothing anywhere said `b` was gone. The records make it sayable, and saying it is most of
+// the value - a shell that knows and does not tell is the same as one that does not know.
+//
+// `pipefail` changes only WHICH status is adopted, not what is reported: a failing stage is named
+// either way. That is the opposite of the Unix setting, where turning it off makes the failure
+// invisible rather than merely non-fatal, and there is no reason for a person to have to opt in to
+// being told.
+unsafe fn report_pipeline_status(group: u64, words: &[ExpandedStage], vars: &mut Vec<(String, String)>, session: u64) {
+	unsafe {
+		let mut stats: Vec<ProcessStats> = Vec::new();
+		if stats.try_reserve(words.len()).is_err() {
+			return;
+		}
+		stats.resize(words.len(), ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: 0, completion: 0, completion_valid: 0 });
+		let written: usize = process_group_stats(group, &mut stats);
+		if written == 0 {
+			return;
+		}
+		let failed = |stat: &ProcessStats| stat.state == PROC_STATE_FAILED || (stat.completion_valid != 0 && stat.completion != 0);
+		// The rightmost failing stage, which is what `pipefail` adopts and what the report names.
+		// Rightmost rather than leftmost because a pipeline's failures cascade: `b` dying breaks
+		// `c`'s input, and the interesting one is the furthest along that still had something to
+		// say about itself.
+		let mut culprit: Option<usize> = None;
+		for index in 0..written {
+			if failed(&stats[index]) {
+				culprit = Some(index);
+			}
+		}
+		let last: &ProcessStats = &stats[written - 1];
+		let pipefail: bool = vars.iter().any(|(name, value)| name == PIPEFAIL && (value == "on" || value == "1"));
+		let status: u64 = match culprit {
+			Some(index) if pipefail => status_of(&stats[index]),
+			_ => status_of(last),
+		};
+		let mut rendered = String::new();
+		push_decimal_u64(&mut rendered, status);
+		set_var(vars, session, STATUS_VAR, rendered.as_bytes());
+		// A stage that failed and is NOT the last one is invisible in the status either way, so it
+		// is named. The last stage's own failure is not announced: its output is on the screen and
+		// its diagnostic went to the terminal a moment ago, and a shell that adds a line after every
+		// non-zero exit is a shell people stop reading.
+		let Some(index) = culprit else { return };
+		if index + 1 == written {
+			return;
+		}
+		print(b"shell: stage ");
+		print_usize(index + 1);
+		print(b" (");
+		if let Some(name) = words.get(index).and_then(|stage| stage.words.first()) {
+			print(name);
+		}
+		print(b") ");
+		if stats[index].state == PROC_STATE_FAILED {
+			print(b"was killed or faulted\n");
+		} else {
+			print(b"exited ");
+			print_usize(stats[index].completion as usize);
+			print(b"\n");
+		}
+	}
+}
+
+// One stage's status as a number: what it reported, or a stand-in for a stage that never got to
+// report. 125 rather than 1 for the second, because a stage that faulted did not choose an exit
+// code and reporting the one a program most often chooses for ordinary failure would make the two
+// indistinguishable.
+fn status_of(stat: &ProcessStats) -> u64 {
+	if stat.state == PROC_STATE_FAILED {
+		125
+	} else if stat.completion_valid != 0 {
+		stat.completion
+	} else {
+		0
+	}
+}
+
+fn push_decimal_u64(out: &mut String, mut value: u64) {
+	if value == 0 {
+		out.push('0');
+		return;
+	}
+	let mut buf: [u8; 20] = [0u8; 20];
+	let mut at: usize = 20;
+	while value > 0 {
+		at -= 1;
+		buf[at] = b'0' + (value % 10) as u8;
+		value /= 10;
+	}
+	for &byte in &buf[at..] {
+		out.push(byte as char);
 	}
 }
 

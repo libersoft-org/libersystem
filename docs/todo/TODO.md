@@ -166,7 +166,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md)
 - [ ] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [ ] [P02M0101 - Additional system utilities](P02M0101.md)
-- [ ] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
+- [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
 - [ ] [P02M0103 - Future-ready 3D graphics foundation + software-rendered scene](P02M0103.md)
 - [x] [P02M0104 - Incremental development and persistent QEMU test loop](P02M0104.md)
 - [ ] [P02M0105 - Locales: language, region, time zone, keyboard and formats](P02M0105.md)

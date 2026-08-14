@@ -103,6 +103,17 @@ pub struct Process {
 	// The `threads` vector answers "which threads exist to signal"; this answers "am I the
 	// last one out", which is a different question and cannot be read off a snapshot.
 	live_thread_count: AtomicUsize,
+	// THE GROUPS THIS PROCESS IS A MEMBER OF, weakly, so a job can record what its stage did.
+	//
+	// A group holds `Weak<Process>` so membership never extends a member's life, and that is right -
+	// but it means a group cannot answer "what did stage 2 exit with" after stage 2 is gone, and
+	// that question is the whole of a pipeline's status. The answer has to be captured at the moment
+	// the process reaches a terminal state, which is here, and the only way to reach the group from
+	// here is a link back.
+	//
+	// Weak in this direction too: a Process that outlives its group must not keep the group alive,
+	// and two strong links would be a cycle that never frees either.
+	groups: SpinLock<Vec<alloc::sync::Weak<super::process_group::ProcessGroup>>>,
 	// Set while the process is suspended (SIGSTOP); its threads park at their next
 	// scheduling point until resumed (SIGCONT).
 	stopped: AtomicBool,
@@ -162,7 +173,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0) })?;
+		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()) })?;
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
@@ -406,7 +417,33 @@ impl Process {
 		self.orphan_dma_buffers();
 		self.handles.lock().close_all();
 		self.exited.store(true, Ordering::Release);
+		self.record_in_groups();
 		sched::wake_object(self.header.koid());
+	}
+
+	// Take note of a group this process belongs to. Called by `ProcessGroup::create`, which is the
+	// only thing that can make one - membership is sealed there, so this list is written once.
+	pub fn join_group(&self, group: &alloc::sync::Arc<super::process_group::ProcessGroup>) -> bool {
+		let mut groups = self.groups.lock();
+		// FALLIBLY, like every other allocation a ring-3 caller can drive. A process may be in more
+		// than one group and a caller decides how many, so this is a list whose length is chosen by
+		// userspace.
+		if groups.try_reserve(1).is_err() {
+			return false;
+		}
+		groups.push(alloc::sync::Arc::downgrade(group));
+		true
+	}
+
+	// Tell every group this process is in what it finished as. Called from both terminal paths, and
+	// idempotent at the group's end: whichever of the two runs first writes the record and a second
+	// call leaves it alone, because a process that was killed after exiting cleanly still exited
+	// cleanly.
+	fn record_in_groups(&self) {
+		let groups: Vec<alloc::sync::Weak<super::process_group::ProcessGroup>> = self.groups.lock().clone();
+		for group in groups.iter().filter_map(alloc::sync::Weak::upgrade) {
+			group.record_member(self);
+		}
 	}
 
 	// Whether the process has reached a terminal state - killed by a fault / kill, or
@@ -645,6 +682,7 @@ impl Process {
 		self.orphan_dma_buffers();
 		self.handles.lock().close_all();
 		self.killed.store(true, Ordering::Release);
+		self.record_in_groups();
 		// A kill is a terminal state, so wake anything blocked on this process handle to
 		// observe it - the same process-terminated signal a clean exit delivers.
 		sched::wake_object(self.header.koid());

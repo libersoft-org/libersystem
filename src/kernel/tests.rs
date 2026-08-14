@@ -302,6 +302,8 @@ struct PermissionScenarioResult {
 	// What the three migrated-tool pipelines printed, in the order the scenario runs them:
 	// `... | wc`, `... | head -n 1`, `... | tee <path> | wc`.
 	stream_reads: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+	// What the REAL SHELL printed after one typed line - the layer every other field here skips.
+	shell_read: alloc::vec::Vec<u8>,
 	expected: alloc::vec::Vec<u8>,
 	probe_read: alloc::vec::Vec<u8>,
 	probe_summary: alloc::vec::Vec<u8>,
@@ -365,6 +367,10 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let (process_server, process_client) = Channel::create();
 	let (time_server, time_client) = Channel::create();
 	let (perm_server, perm_client) = Channel::create();
+	// The shell's own client to the manager. A handle to the same endpoint, which is only safe
+	// because the shell runs at the very end of this scenario, after the test has finished asking
+	// its own questions - two holders of one reply queue is the hazard `volume.connect` exists for.
+	let perm_client_for_shell = perm_client.clone();
 	// The manager's log grant: a real, duplicable client whose service peer is dropped, so
 	// the sandboxed probe's best-effort log emit fails fast instead of blocking (no
 	// LogService runs in this scenario). The capability is still granted and audited.
@@ -450,6 +456,10 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	core::mem::drop(registry_server);
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL)?;
 	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL)?;
+	// A SECOND CLIENT FOR THE SHELL, taken here where the pair is made. The shell drives every
+	// governed launch through PermissionManager and never through this, but its bootstrap requires
+	// one: a shell without a process client fails before it prints a prompt.
+	let process_client_for_shell = process_client.clone();
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL)?;
 
 	// TimeService: its (dead-peer) network client and its service channel. It seeds its
@@ -464,6 +474,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	// client it drives to load the components, and the channel its clients reach it on. The order
 	// matches PermissionManager's receive order. (The grantable permission capability is not sent:
 	// the manager mints that self-connection itself.)
+	let shell_storage_client = storage_client.clone();
 	send_cap(&pm_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"LOG", log_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"NETWORK", net_client, Rights::ALL)?;
@@ -837,8 +848,92 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let cat_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no cat output")?;
 	let ip_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip output")?;
 	let ip_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip decisions summary")?;
+	// THE SHELL ITSELF, driven by a typed line - the one layer the rest of this scenario skips.
+	//
+	// Every pipeline above is a hand-written request to PermissionManager, which is the transaction
+	// and not the shell: the parse, the redirection expansion, the launch and the status report are
+	// the half above it, and the defects found in this milestone lived there. So this spawns the
+	// real `shell` binary against the services already running here, types one line at its console
+	// and reads what comes back.
+	//
+	// LAST IN THE SCENARIO on purpose. The shell needs a client to PermissionManager, and this test
+	// holds the only one; a second handle to the same endpoint is a second holder of one reply
+	// queue, which is the exact hazard `volume.connect` was added to end. Running the shell after
+	// the test has finished asking its own questions means the two never overlap.
+	let shell_read: alloc::vec::Vec<u8> = {
+		let shell_elf = program_elf(&package, volume, b"shell").ok_or("shell in the package or volume")?;
+		let (shell_boot_kernel, shell_boot_user) = Channel::create();
+		// One full-duplex channel, because that is what a console IS to a shell: it prints to the
+		// same endpoint it reads keystrokes from. The test holds the other end and plays the
+		// terminal.
+		let (terminal, shell_console) = Channel::create();
+		let (_terminal_control, shell_control) = Channel::create();
+		// Required at bootstrap and unused by anything typed here. A dead peer is the honest stand-in:
+		// the net builtins would report the service unavailable, which is true.
+		let (_dead_net, shell_net) = Channel::create();
+		let _shell = spawn_dynamic_test_process(sched::root_domain(), shell_elf, shell_boot_user);
+		send_cap(&shell_boot_kernel, b"STORAGE", shell_storage_client, Rights::ALL)?;
+		send_cap(&shell_boot_kernel, b"PROCESS", process_client_for_shell, Rights::ALL)?;
+		send_cap(&shell_boot_kernel, b"NET", shell_net, Rights::ALL)?;
+		send_cap(&shell_boot_kernel, b"PERM", perm_client_for_shell, Rights::ALL)?;
+		send_cap(&shell_boot_kernel, b"CONSOLE", shell_console, Rights::ALL)?;
+		send_cap(&shell_boot_kernel, b"CONTROL", shell_control, Rights::ALL)?;
+		shell_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not end the shell's bootstrap")?;
+		sched::run_until_idle();
+		// WHAT THE SHELL SAID ON ITS BOOTSTRAP, kept for the failure message. A shell that could not
+		// start writes the reason there and exits, and without this a missing capability looks
+		// exactly like a shell that ran and printed nothing.
+		let mut announced: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		while let Ok(message) = shell_boot_kernel.recv() {
+			announced.extend_from_slice(&message.bytes);
+			sched::run_until_idle();
+		}
+		// The banner and the first prompt, discarded: what this test is about is what comes back
+		// AFTER the line, and leaving the greeting in the buffer would let a test pass on it.
+		while terminal.recv().is_ok() {
+			sched::run_until_idle();
+		}
+		// THE LINES, EACH AS ONE MESSAGE, which is what a line discipline delivers: the shell's read
+		// loop takes a whole submitted line including its newline. Everything they print is
+		// concatenated, because what each one proves is a distinct string in the output and the
+		// order they arrive in is the order they were typed.
+		//
+		// Together they are the forms this milestone added, at the layer a person reaches them:
+		//   - a two-stage pipeline of a redirection and a migrated tool, which is the whole chain;
+		//   - `<` and `>` in one line, whose destination is a read-only archive here, so what it
+		//     proves is that the refusal reaches the terminal rather than the pipe;
+		//   - `2>&1`, folding a failing stage's diagnostic into the stream so `wc` counts it;
+		//   - three lines the grammar refuses, each of which used to be RUN as an ordinary command:
+		//     an unsupported descriptor, a state-mutating builtin in a pipeline, and a redirection
+		//     target that expanded to nothing.
+		let mut read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		for line in [
+			&b"redirect_in motd.txt | wc\n"[..],
+			&b"cat < motd.txt > copied.txt\n"[..],
+			&b"cat ::not-a-path 2>&1 | wc\n"[..],
+			&b"cat 3>&1\n"[..],
+			&b"cd x | grep y\n"[..],
+			&b"cat < $NOTHING\n"[..],
+		] {
+			terminal.send(Message::new(line.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not type at the shell")?;
+			for _ in 0..24 {
+				sched::run_until_idle();
+				match terminal.recv() {
+					Ok(message) => read.extend_from_slice(&message.bytes),
+					Err(_) => continue,
+				}
+			}
+		}
+		if read.is_empty() {
+			read.extend_from_slice(b"<the shell printed nothing; its bootstrap said: ");
+			read.extend_from_slice(&announced);
+			read.extend_from_slice(b">");
+		}
+		read
+	};
+
 	if scenario != PermissionScenario::ScopedGrants {
-		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), redirect_read: redirect_read.clone(), merged_read: merged_read.clone(), stream_reads: stream_reads.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
+		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), redirect_read: redirect_read.clone(), merged_read: merged_read.clone(), stream_reads: stream_reads.clone(), shell_read: shell_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
 	}
 
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
@@ -1074,7 +1169,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	if !mp3_process.is_terminated() {
 		return Err("MP3 play did not exit");
 	}
-	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, merged_read, stream_reads, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
+	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, merged_read, stream_reads, shell_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
 }
 
 // Build the component topology and run it to completion. A StorageService serves

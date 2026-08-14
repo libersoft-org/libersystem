@@ -2055,6 +2055,21 @@ pub unsafe fn process_group_signal(group: u64, signal: u64) -> i64 {
 	unsafe { syscall(SYS_PROCESS_GROUP_SIGNAL, group, signal, 0, 0) as i64 }
 }
 
+// What each stage of a group finished as, in the order the group was created - for a pipeline, the
+// order of the line. Fills `into` and returns how many entries were written.
+//
+// A CALLER SIZES THE ARRAY, which is why this takes a slice rather than answering a Vec: the shell
+// knows how many stages it launched, and a stats call that allocated would be one more thing that
+// can fail while reporting why something else did.
+pub unsafe fn process_group_stats(group: u64, into: &mut [ProcessStats]) -> usize {
+	if into.is_empty() {
+		return 0;
+	}
+	let size: u64 = core::mem::size_of::<ProcessStats>() as u64;
+	let written: i64 = unsafe { syscall(SYS_PROCESS_GROUP_STATS, group, into.as_mut_ptr() as u64, into.len() as u64, 0) as i64 };
+	if written > 0 { core::cmp::min(written as usize, into.len()) } else { 0 }
+}
+
 // Send a message transferring SEVERAL capabilities at once. The ordinary `send_blocking` moves
 // exactly one, which is what stopped an interface op from handing over two - a pipeline stage
 // needs its stdin AND its stdout, and no amount of interface design works around a transport
