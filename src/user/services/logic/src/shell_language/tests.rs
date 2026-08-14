@@ -175,3 +175,67 @@ fn a_state_mutating_builtin_is_refused_anywhere_its_effect_would_be_discarded() 
 	// And a command whose name merely starts like one is untouched.
 	assert!(parse_pipeline(b"cdrom x | cat", &none).is_ok(), "`cdrom` is not `cd`");
 }
+
+#[test]
+fn a_redirection_expands_into_pipeline_stages() {
+	// THE WHOLE DESIGN, in one assertion. A redirection is not a property of a stage that something
+	// downstream has to interpret - it is two more stages, governed like any other, and the command
+	// in the middle receives one stream endpoint and no file capability at all.
+	let vars: Vec<(String, String)> = Vec::new();
+	let pipeline = parse_pipeline(b"cat < in.txt\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline).expect("expands"), alloc::vec![alloc::vec![b"redirect_in".to_vec(), b"in.txt".to_vec()], alloc::vec![b"cat".to_vec()]]);
+
+	let pipeline = parse_pipeline(b"cat > out.txt\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline).expect("expands"), alloc::vec![alloc::vec![b"cat".to_vec()], alloc::vec![b"redirect_out".to_vec(), b"out.txt".to_vec()]]);
+
+	// Append carries the flag rather than a second program: one destination, two modes.
+	let pipeline = parse_pipeline(b"cat >> out.txt\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline).expect("expands"), alloc::vec![alloc::vec![b"cat".to_vec()], alloc::vec![b"redirect_out".to_vec(), b"--append".to_vec(), b"out.txt".to_vec()]]);
+
+	// Both ends of a real pipeline, which is the shape the milestone's own example uses.
+	let pipeline = parse_pipeline(b"cat < a.txt | grep hello > b.txt\n", &vars).expect("parses");
+	assert_eq!(
+		expand_redirects(&pipeline).expect("expands"),
+		alloc::vec![
+			alloc::vec![b"redirect_in".to_vec(), b"a.txt".to_vec()],
+			alloc::vec![b"cat".to_vec()],
+			alloc::vec![b"grep".to_vec(), b"hello".to_vec()],
+			alloc::vec![b"redirect_out".to_vec(), b"b.txt".to_vec()],
+		]
+	);
+
+	// A line with no redirection is its own stages, unchanged - so the expansion is on one path
+	// rather than a branch the ordinary case has to avoid.
+	let pipeline = parse_pipeline(b"cat a | grep b\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline).expect("expands"), alloc::vec![alloc::vec![b"cat".to_vec(), b"a".to_vec()], alloc::vec![b"grep".to_vec(), b"b".to_vec()]]);
+}
+
+#[test]
+fn a_redirection_that_cannot_mean_what_it_looks_like_is_refused() {
+	// EACH REFUSAL IS A LINE THAT HAS NO HONEST READING, and each one is named rather than folded
+	// into "unsupported": a user who typed `a > f | b` wants to know that the file took the output
+	// and `b` got nothing, not that redirection is unavailable.
+	let vars: Vec<(String, String)> = Vec::new();
+
+	// Input on anything but the first stage: two producers for one consumer.
+	let pipeline = parse_pipeline(b"a | b < f\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::InputNotFirst));
+
+	// Output on anything but the last: the rest of the chain would be fed nothing.
+	let pipeline = parse_pipeline(b"a > f | b\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::OutputNotLast));
+
+	// Two destinations for one stream. A shell that picked one would be choosing for the user.
+	let pipeline = parse_pipeline(b"a > x > y\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::Duplicate));
+	let pipeline = parse_pipeline(b"a < x < y\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::Duplicate));
+
+	// The error stream is not a position in the chain: a stage's stderr goes to the terminal
+	// BESIDE the pipe, so it needs an endpoint the pipeline transaction does not carry today.
+	// Refused by name rather than run with the part the user asked for silently dropped.
+	let pipeline = parse_pipeline(b"a 2> f\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::StderrUnsupported));
+	let pipeline = parse_pipeline(b"a 2>&1\n", &vars).expect("parses");
+	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::StderrUnsupported));
+}

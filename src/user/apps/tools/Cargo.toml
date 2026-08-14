@@ -36,6 +36,14 @@ name = "cat"
 path = "src/cat.rs"
 
 [[bin]]
+name = "redirect_in"
+path = "src/redirect_in.rs"
+
+[[bin]]
+name = "redirect_out"
+path = "src/redirect_out.rs"
+
+[[bin]]
 name = "write"
 path = "src/write.rs"
 

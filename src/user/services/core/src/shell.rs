@@ -19,7 +19,7 @@ use proto::codec::JsonMode;
 use proto::system::{Component, EnvVar, Error, JobEntry, JobInfo, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
-use services::shell_language::{Pipeline, parse_and_expand, parse_assignment, parse_pipeline, trim};
+use services::shell_language::{Pipeline, RedirectError, expand_redirects, parse_and_expand, parse_assignment, parse_pipeline, trim};
 use storage_proto::path;
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
@@ -275,16 +275,33 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// transaction - takes today's path unchanged.
 			let cwd_before: String = cwd.clone();
 			let pipeline = parse_pipeline(&line_buf[..n], &vars);
-			let multi_stage: bool = matches!(&pipeline, Ok(p) if p.stages.len() > 1);
-			if multi_stage {
-				let parsed = pipeline.expect("checked by multi_stage");
-				if parsed.stages.iter().any(|stage| !stage.redirects.is_empty()) {
-					// Redirection inside a pipeline is not wired yet - it waits on P02M0101's
-					// streaming-read adapter and transactional writer. Refusing beats running
-					// the line with the part the user asked for silently dropped.
-					print(b"shell: redirection is not supported in a pipeline yet\n");
-				} else if !run_pipeline_line(&mut jobs, permsvc, &parsed, cwd.as_bytes(), &vars) {
-					print(b"shell: pipeline could not be started\n");
+			// A REDIRECTION IS A PIPELINE, which is what lets one path serve both.
+			//
+			// `cmd < a > b` expands to `redirect_in a | cmd | redirect_out b` before anything is
+			// launched, so the line goes to the broker as an ordinary transaction and the two halves
+			// of the redirection are governed programs granted `volumes` - while `cmd` in the middle
+			// receives one stream endpoint and no file capability at all. That is the milestone's
+			// rule, and it falls out of the shape rather than being enforced on top of it.
+			//
+			// So "does this need the broker" is a question about the EXPANDED line: a single command
+			// with a redirection needs it, and a single command without one still takes today's
+			// path, where the builtins live.
+			let expanded: Option<Result<Vec<Vec<Vec<u8>>>, RedirectError>> = pipeline.as_ref().ok().map(expand_redirects);
+			let needs_broker: bool = match &expanded {
+				Some(Ok(stages)) => stages.len() > 1,
+				// A line whose redirections cannot be expanded is reported below rather than run.
+				Some(Err(_)) => true,
+				None => false,
+			};
+			if needs_broker {
+				match expanded.expect("checked by needs_broker") {
+					Err(reason) => print(redirect_refusal(&reason)),
+					Ok(stages) => {
+						let parsed = pipeline.as_ref().expect("checked by needs_broker");
+						if !run_pipeline_line(&mut jobs, permsvc, &stages, parsed.background, cwd.as_bytes(), &vars) {
+							print(b"shell: pipeline could not be started\n");
+						}
+					}
 				}
 			} else {
 				let prepared: Vec<u8> = parse_and_expand(&line_buf[..n], &vars);
@@ -1435,23 +1452,38 @@ unsafe fn run_tool(permsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], vars: &[(
 //
 // Returns false when the broker refuses the pipeline, in which case NO stage was started: the
 // transaction releases nothing until every stage exists and is wired.
-unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, pipeline: &Pipeline, cwd: &[u8], vars: &[(String, String)]) -> bool {
+// Why a line's redirections could not be expanded, as the sentence the person typing sees.
+//
+// NAMED RATHER THAN "UNSUPPORTED". Somebody who typed `a > f | b` wants to be told that the file
+// would have taken the output and `b` would have got nothing - which is a thing about their line -
+// rather than that redirection is unavailable, which is a thing about the shell and is not true.
+fn redirect_refusal(reason: &RedirectError) -> &'static [u8] {
+	match reason {
+		RedirectError::InputNotFirst => b"shell: `< path` belongs to the first command of a pipeline; a later stage already has a producer\n",
+		RedirectError::OutputNotLast => b"shell: `> path` belongs to the last command of a pipeline; redirecting an earlier one leaves the rest with no input\n",
+		RedirectError::Duplicate => b"shell: one input and one output per line - two destinations for one stream is not something to pick between\n",
+		RedirectError::StderrUnsupported => b"shell: `2>` and `2>&1` are not wired yet; the error stream is not a position in the pipeline and needs its own endpoint\n",
+	}
+}
+
+unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[Vec<Vec<u8>>], background: bool, cwd: &[u8], vars: &[(String, String)]) -> bool {
 	unsafe {
 		let cwd_str: &str = match core::str::from_utf8(cwd) {
 			Ok(s) => s,
 			Err(_) => return false,
 		};
 		let mut stages: Vec<PipelineStage> = Vec::new();
-		for stage in &pipeline.stages {
-			let name: &str = match core::str::from_utf8(&stage.words[0]) {
+		for stage in words {
+			let Some(first) = stage.first() else { return false };
+			let name: &str = match core::str::from_utf8(first) {
 				Ok(s) => s,
 				Err(_) => return false,
 			};
 			// The words after the command, rejoined as the argument string the governed launch
-			// contract passes. Redirections are not carried yet - a stage that names one is
-			// refused below rather than run with it silently dropped.
+			// contract passes. A redirection is already one of these stages by the time this runs -
+			// `redirect_in` and `redirect_out` carry their path as an ordinary argument.
 			let mut args: Vec<u8> = Vec::new();
-			for word in stage.words.iter().skip(1) {
+			for word in stage.iter().skip(1) {
 				if !args.is_empty() {
 					args.push(b' ');
 				}
@@ -1475,16 +1507,18 @@ unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, pipeline: &Pipeline, 
 				return false;
 			}
 		};
-		if pipeline.background {
+		if background {
 			// A background pipeline becomes ONE job over its group, so `jobs`, `fg` and
 			// completion reaping treat it exactly like a background command. The relay is
 			// skipped: nothing is waiting on its output at the prompt.
 			let mut label: Vec<u8> = Vec::new();
-			for (index, stage) in pipeline.stages.iter().enumerate() {
+			for (index, stage) in words.iter().enumerate() {
 				if index > 0 {
 					label.extend_from_slice(b" | ");
 				}
-				label.extend_from_slice(&stage.words[0]);
+				if let Some(first) = stage.first() {
+					label.extend_from_slice(first);
+				}
 			}
 			if jobs.register_group(group, &label, false).is_none() {
 				close(group);

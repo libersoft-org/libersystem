@@ -290,6 +290,11 @@ struct PermissionScenarioResult {
 	// as itself, not relayed by the consumer, which is the difference between an error stream on
 	// the terminal and one that empties into the pipe.
 	diagnostic_read: alloc::vec::Vec<u8>,
+	// What `redirect_in hello.txt | readln` printed. A redirection IS a pipeline stage in this
+	// shell, so proving it is proving that the governed program opened the file with its own
+	// `volumes` grant and pushed the bytes down an ordinary edge - and that the consumer never
+	// touched storage at all.
+	redirect_read: alloc::vec::Vec<u8>,
 	expected: alloc::vec::Vec<u8>,
 	probe_read: alloc::vec::Vec<u8>,
 	probe_summary: alloc::vec::Vec<u8>,
@@ -554,6 +559,43 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 			}
 		}
 	}
+	// REDIRECTION AS A PIPELINE STAGE, end to end through the broker.
+	//
+	// `cat < hello.txt` is `redirect_in hello.txt | cat` after the shell expands it, and this drives
+	// the expansion's product directly: `redirect_in hello.txt | readln`. What it proves is the
+	// whole design - `redirect_in` was authorized against its own manifest, opened the file with the
+	// `volumes` grant that manifest gives it, and pushed the bytes down an edge the broker
+	// allocated, while the consumer holds no storage capability of any kind and reads a stream.
+	//
+	// `readln` prefixes each line with `in> `, which is what tells "the consumer read the file's
+	// bytes" from "the bytes reached the terminal some other way".
+	let (redirect_read_end, redirect_write_end) = Channel::create();
+	let mut redirect_request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	redirect_request.extend_from_slice(&4u16.to_le_bytes());
+	redirect_request.extend_from_slice(&2u32.to_le_bytes());
+	redirect_request.extend_from_slice(&2u16.to_le_bytes());
+	for (name, args) in [(&b"redirect_in"[..], &b"hello.txt"[..]), (&b"readln"[..], &b""[..])] {
+		for value in [name, args] {
+			redirect_request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+			redirect_request.extend_from_slice(value);
+		}
+	}
+	redirect_request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
+	redirect_request.extend_from_slice(b"vol://system");
+	redirect_request.extend_from_slice(&0u16.to_le_bytes());
+	redirect_request.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&perm_client, &redirect_request, redirect_write_end, Rights::ALL)?;
+	sched::run_until_idle();
+	let _ = perm_client.recv();
+	let mut redirect_read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..8 {
+		sched::run_until_idle();
+		match redirect_read_end.recv() {
+			Ok(message) => redirect_read.extend_from_slice(&message.bytes),
+			Err(_) => break,
+		}
+	}
+
 	// A pipeline whose PRODUCER fails: its diagnostic belongs on the terminal, not in the pipe.
 	//
 	// `cat` refuses a path no volume can name and says so. Every stage but the last writes into an
@@ -688,7 +730,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let ip_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip output")?;
 	let ip_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip decisions summary")?;
 	if scenario != PermissionScenario::ScopedGrants {
-		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
+		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), redirect_read: redirect_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
 	}
 
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
@@ -924,7 +966,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	if !mp3_process.is_terminated() {
 		return Err("MP3 play did not exit");
 	}
-	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
+	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
 }
 
 // Build the component topology and run it to completion. A StorageService serves

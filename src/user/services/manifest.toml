@@ -415,6 +415,28 @@ destination = "bin/cat.lsexe"
 providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
+# The two halves of shell redirection. `role = "helper"` and `libexec`, because a person does not
+# type these: the shell expands `cmd < a > b` into `redirect_in a | cmd | redirect_out b`, which is
+# what makes a redirection an ordinary governed pipeline stage instead of ambient authority inside
+# the shell.
+name = "redirect_in"
+owner = "tools"
+role = "helper"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/redirect_in.lsexe"
+providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "redirect_out"
+owner = "tools"
+role = "helper"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/redirect_out.lsexe"
+providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
 name = "component_host"
 owner = "services"
 role = "helper"

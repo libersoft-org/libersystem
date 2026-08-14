@@ -163,6 +163,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"echo" => Some(granted("echo", alloc::vec![])),
 		b"readln" => Some(granted("readln", alloc::vec![])),
 		b"cat" => Some(granted("cat", alloc::vec![Capability::Volumes])),
+		// The two halves of shell redirection, granted exactly what a redirection is: the volumes,
+		// and nothing else. The command being redirected gets neither - it receives one stream
+		// endpoint, which is the whole point of expanding `cmd < a > b` into a pipeline rather than
+		// opening files inside the shell and handing the child a file capability.
+		b"redirect_in" => Some(granted("redirect_in", alloc::vec![Capability::Volumes])),
+		b"redirect_out" => Some(granted("redirect_out", alloc::vec![Capability::Volumes])),
 		b"write" => Some(granted("write", alloc::vec![Capability::Volumes])),
 		b"rm" => Some(granted("rm", alloc::vec![Capability::Volumes])),
 		b"pwd" => Some(granted("pwd", alloc::vec![])),

@@ -382,6 +382,97 @@ pub fn parse_pipeline(raw: &[u8], vars: &[(String, String)]) -> Result<Pipeline,
 	Ok(Pipeline { stages, background })
 }
 
+// The names of the two programs a redirection becomes.
+//
+// A REDIRECTION IS A PIPELINE STAGE. `cmd < a > b` expands to `redirect_in a | cmd | redirect_out b`
+// before anything is launched, which is what makes it capability-native rather than a special case:
+// the two halves are governed programs granted `volumes` and nothing else, the command in the middle
+// receives one stream endpoint and no file capability at all, and every lifecycle rule the pipeline
+// already has - EOF on a producer's close, broken pipe on a consumer's early exit, one ProcessGroup
+// for the whole line - applies to them unchanged.
+//
+// The alternative is a pump inside the shell or inside the broker. Both have to hold the source or
+// destination capability for as long as the child runs, which is the thing the milestone's rule
+// about the child receiving only the stream endpoint exists to prevent; and a shell-side pump cannot
+// serve a BACKGROUND pipeline at all, because the shell has gone back to its prompt.
+pub const REDIRECT_IN: &[u8] = b"redirect_in";
+pub const REDIRECT_OUT: &[u8] = b"redirect_out";
+pub const APPEND_FLAG: &[u8] = b"--append";
+
+// Why a line's redirections cannot be expanded.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RedirectError {
+	// `< path` anywhere but on the first stage. `a | b < f` asks for b's input to come from a file
+	// AND from a, which is two producers for one consumer - not a thing to pick a winner for.
+	InputNotFirst,
+	// `> path` anywhere but on the last stage. `a > f | b` sends a's output to the file and leaves
+	// b with nothing, which is a line that cannot mean what it looks like.
+	OutputNotLast,
+	// More than one input or more than one output on the line. `a > x > y` is two destinations for
+	// one stream; a shell that picked one would be choosing for the user.
+	Duplicate,
+	// A form this expansion does not implement yet: `2>` and `2>&1`. The error stream is not a
+	// position in the chain - a stage's stderr goes to the terminal beside the pipe - so it needs
+	// an endpoint the pipeline transaction does not carry today. Refused by name rather than run
+	// with the part the user asked for silently dropped.
+	StderrUnsupported,
+}
+
+// The stages a line becomes once its redirections are expanded, as `(command, arguments)` pairs in
+// launch order.
+//
+// Returned as words rather than as `Stage`s because the expansion's product is exactly what the
+// launch contract takes, and a `Stage` carrying a `redirects` list that is now always empty would
+// invite somebody to look at it.
+pub fn expand_redirects(pipeline: &Pipeline) -> Result<Vec<Vec<Vec<u8>>>, RedirectError> {
+	let last: usize = pipeline.stages.len() - 1;
+	let mut input: Option<&[u8]> = None;
+	let mut output: Option<(&[u8], bool)> = None;
+	for (index, stage) in pipeline.stages.iter().enumerate() {
+		for redirect in &stage.redirects {
+			match redirect {
+				Redirect::In(path) => {
+					if index != 0 {
+						return Err(RedirectError::InputNotFirst);
+					}
+					if input.is_some() {
+						return Err(RedirectError::Duplicate);
+					}
+					input = Some(path);
+				}
+				Redirect::Out { stderr: true, .. } | Redirect::ErrToOut => {
+					return Err(RedirectError::StderrUnsupported);
+				}
+				Redirect::Out { path, append, stderr: false } => {
+					if index != last {
+						return Err(RedirectError::OutputNotLast);
+					}
+					if output.is_some() {
+						return Err(RedirectError::Duplicate);
+					}
+					output = Some((path, *append));
+				}
+			}
+		}
+	}
+	let mut expanded: Vec<Vec<Vec<u8>>> = Vec::new();
+	if let Some(path) = input {
+		expanded.push(alloc::vec![REDIRECT_IN.to_vec(), path.to_vec()]);
+	}
+	for stage in &pipeline.stages {
+		expanded.push(stage.words.clone());
+	}
+	if let Some((path, append)) = output {
+		let mut words: Vec<Vec<u8>> = alloc::vec![REDIRECT_OUT.to_vec()];
+		if append {
+			words.push(APPEND_FLAG.to_vec());
+		}
+		words.push(path.to_vec());
+		expanded.push(words);
+	}
+	Ok(expanded)
+}
+
 #[cfg(test)]
 #[path = "shell_language/tests.rs"]
 mod tests;

@@ -439,6 +439,30 @@ fn component_host_runs_an_sdk_component() {
 	assert_eq!(run.report.score_negative, -2, "the float-to-int conversion rounds toward zero, as the cast does");
 }
 
+tagged_test!(a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage, [Service, Process, PermissionService], id = "kernel.applications.a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage", covers = ["kernel", "services"]);
+fn a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage() {
+	// `cat < hello.txt` expands to `redirect_in hello.txt | cat` before anything is launched, and
+	// this drives the expansion's product: `redirect_in hello.txt | readln`.
+	//
+	// WHAT IT PROVES IS THE DESIGN RATHER THAN THE FEATURE. `redirect_in` was authorized against its
+	// own manifest, opened the file with the `volumes` grant that manifest gives it, and pushed the
+	// bytes down an edge the broker allocated. The consumer holds no storage capability of any kind
+	// - `readln`'s manifest grants nothing at all - so bytes reaching it can only have come through
+	// the pipe. A redirection implemented inside the shell would have had to hand the child a file
+	// capability or pump it from a process that has one; this is the reason it is not.
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	assert!(!result.redirect_read.is_empty(), "the redirected pipeline produced output at all");
+	// `readln` prefixes each line it reads with `in> `, which is what tells the file's bytes
+	// arriving through the pipe from bytes reaching the terminal some other way. Asserted as "the
+	// prefix immediately precedes content" rather than as an exact buffer, for the reason the
+	// pipeline test beside this one gives: a producer is entitled to split its writes.
+	assert!(result.redirect_read.windows(4).any(|window| window == b"in> "), "readln read what redirect_in sent and echoed it behind its own prefix, got {:?}", core::str::from_utf8(&result.redirect_read));
+	// And what came through is the FILE, not a diagnostic: `hello.txt` is the volume's seeded
+	// greeting, which the storage tests read through the service, so its own text is what to look
+	// for rather than anything this test could have produced.
+	assert!(result.redirect_read.windows(8).any(|window| window == b"Hello fr"), "the bytes are the file's, so a redirect_in that failed to open it cannot pass this: {:?}", core::str::from_utf8(&result.redirect_read));
+}
+
 tagged_test!(a_governed_pipeline_starts_as_one_transaction_and_carries_data, [Service, Process, PermissionService], id = "kernel.applications.a_governed_pipeline_starts_as_one_transaction_and_carries_data", covers = ["kernel", "services"]);
 fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	// `echo hello | readln` through PermissionManager: two stages, each authorized against
