@@ -52,7 +52,7 @@ use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::network;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, StartResult, process};
+use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, StartResult, process, volume};
 use rt::*;
 use services::executable;
 
@@ -169,6 +169,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// opening files inside the shell and handing the child a file capability.
 		b"redirect_in" => Some(granted("redirect_in", alloc::vec![Capability::Volumes])),
 		b"redirect_out" => Some(granted("redirect_out", alloc::vec![Capability::Volumes])),
+		// `tee` writes files as well as passing bytes on, so it holds exactly what a redirection
+		// holds and nothing more - it is a redirection that also has a stdout.
+		b"tee" => Some(granted("tee", alloc::vec![Capability::Volumes])),
 		b"write" => Some(granted("write", alloc::vec![Capability::Volumes])),
 		b"rm" => Some(granted("rm", alloc::vec![Capability::Volumes])),
 		b"pwd" => Some(granted("pwd", alloc::vec![])),
@@ -531,8 +534,15 @@ impl Service for Manager {
 				//
 				// Send-only deliberately: a stage has no business READING the terminal through the
 				// channel it reports errors on.
+				//
+				// UNLESS THE STAGE ASKED FOR `2>&1`, which is the opposite request: fold the
+				// diagnostics into the stream. Only the broker can serve it, because only the broker
+				// knows which endpoint a stage's output actually IS - an edge for every stage but
+				// the last, and the caller's terminal for that one. The shell cannot name it and
+				// deliberately cannot: the record's own comment says a caller names no stdio at all.
 				let error: u64 = {
-					let dup: i64 = duplicate(stdout, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+					let source: u64 = if stage.merge_errors { out } else { stdout };
+					let dup: i64 = duplicate(source, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
 					if dup > 0 { dup as u64 } else { 0 }
 				};
 				requests.push(StageRequest { name: stage.name.as_bytes(), args: stage.args.as_bytes(), stdout: out, stdin: input, stderr: error });
@@ -987,9 +997,34 @@ unsafe fn grant_volumes(manager_side: u64, clients: &Clients) -> bool {
 			(CAP_TMP, clients.storage_tmp),
 		];
 		for &(tag, client) in volumes.iter() {
-			let dup: i64 = duplicate(client, GRANT_RIGHTS);
-			let handle: u64 = if dup >= 0 { dup as u64 } else { 0 };
-			if !send_blocking(manager_side, tag, handle) {
+			// A FRESH SUB-CONNECTION PER GRANT, not a duplicate of the manager's own.
+			//
+			// `grant_handle` states the rule for network - "Network is always a fresh `open`
+			// sub-connection, so concurrent tools never share one reply queue" - and this path
+			// duplicated instead, which was invisible while tools ran one at a time. A pipeline
+			// runs them at once: `redirect_in f | tee g | wc` had two stages sending on two names
+			// for ONE endpoint, and one of them took the other's reply and reported that the file
+			// could not be opened. See `volume.connect` in `storage.lsidl`.
+			//
+			// A VOLUME THAT CANNOT MINT ONE IS GRANTED AS ZERO rather than failing the launch. The
+			// manager holds seven volume clients and several are routinely absent (no USB, no ISO);
+			// a stage that asks such a volume for anything already gets nothing, and turning a
+			// missing volume into a failed pipeline would break every line that touches storage on
+			// a machine with one disk.
+			let minted: u64 = if client == 0 {
+				0
+			} else {
+				let mut volume_client = volume::Client::new(ChannelTransport { chan: client });
+				match volume_client.connect() {
+					Some(Ok(fresh)) => {
+						let dup: i64 = duplicate(fresh, GRANT_RIGHTS);
+						close(fresh);
+						if dup >= 0 { dup as u64 } else { 0 }
+					}
+					_ => 0,
+				}
+			};
+			if !send_blocking(manager_side, tag, minted) {
 				return false;
 			}
 		}

@@ -2,7 +2,7 @@ package liber:security@1
 enum capability(log=0,storage=1,network=2,device=3,config=4,time=5,audio=6,input=7,graph=8,resource=9,process=10,permission=11,supervisor=12,volumes=13,services=14,usb=15,display=16,input-keys=17,audio-stream=18,session=19)
 record manifest(component:string,requested:list<capability>,grants:list<capability>)
 record audit-entry(component:string,capability:capability,granted:bool,dynamic:bool)
-record pipeline-stage(name:string,args:string)
+record pipeline-stage(name:string,args:string,merge-errors:bool)
 record pipeline-result(group:handle<liber:process@1::task>,stages:u32)
 interface permission
 method permission.lookup op=1 (component:string:rights=) -> result<manifest, liber:base@1::error>

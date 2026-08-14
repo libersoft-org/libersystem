@@ -88,9 +88,11 @@ unsafe fn cat(storage: u64, uri: &[u8]) {
 			None => return,
 		};
 		let contents: &[u8] = core::slice::from_raw_parts(mapped as *const u8, result.size as usize);
-		print(contents);
-		if contents.last() != Some(&b'\n') {
-			print(b"\n");
+		// `write_stdout` rather than `print`, for the reason `redirect_in` gives: in `cat big | head
+		// -1` the consumer is gone after the first line, and `print` would answer a refused channel
+		// by sending the rest of the file to the serial console instead of stopping.
+		if write_stdout(contents) && contents.last() != Some(&b'\n') {
+			write_stdout(b"\n");
 		}
 		unmap_object(result.file);
 		close(result.file);

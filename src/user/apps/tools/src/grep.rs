@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use cli::{Arg, ChunkError, LineOutcome, Lines, classify};
 use proto::system::LaunchContext;
 use rt::*;
-use tools::{VolumeSet, VolumeSource, push_decimal, split_args};
+use tools::{Source, VolumeSet, push_decimal, split_args};
 
 const WINDOW: u32 = 16 * 1024;
 // The longest line this tool will hold. A file with no newline in it is otherwise a way to grow a
@@ -70,12 +70,25 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 		}
-		if words.len() < 2 {
+		if words.is_empty() {
 			eprint(b"grep: usage: grep [-i][-v][-n][-c][-l] <text> <path> [path...]\n");
 			exit();
 		}
 		let needle: &[u8] = words[0];
 		let paths = &words[1..];
+		// A PATTERN AND NO PATH MEANS STDIN, which is the shape `cat log | grep error` needs and
+		// the shape the milestone's own example uses. With no stream either there is nothing to
+		// search and the usage line is the honest answer.
+		if paths.is_empty() {
+			match Source::from_stdin() {
+				Some(source) => search(source, b"-", needle, ignore_case, invert, numbers, count_only, names_only, false),
+				None => {
+					eprint(b"grep: usage: grep [-i][-v][-n][-c][-l] <text> <path> [path...]\n");
+					exit();
+				}
+			}
+			exit();
+		}
 		let many = paths.len() > 1;
 		for argument in paths {
 			let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
@@ -87,16 +100,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				eprint(b"grep: no volume\n");
 				continue;
 			}
-			search(storage, &uri, needle, ignore_case, invert, numbers, count_only, names_only, many);
+			search(Source::from_path(storage, &uri, WINDOW), uri.as_bytes(), needle, ignore_case, invert, numbers, count_only, names_only, many);
 		}
 	}
 	exit();
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn search(storage: u64, path: &str, needle: &[u8], ignore_case: bool, invert: bool, numbers: bool, count_only: bool, names_only: bool, many: bool) {
+unsafe fn search(source: Source, label: &[u8], needle: &[u8], ignore_case: bool, invert: bool, numbers: bool, count_only: bool, names_only: bool, many: bool) {
 	unsafe {
-		let mut lines = Lines::new(VolumeSource::new(storage, path, WINDOW), MAX_LINE);
+		let mut lines = Lines::new(source, MAX_LINE);
 		let mut matches: u64 = 0;
 		let mut number: u64 = 0;
 		loop {
@@ -109,7 +122,7 @@ unsafe fn search(storage: u64, path: &str, needle: &[u8], ignore_case: bool, inv
 					}
 					matches += 1;
 					if names_only {
-						print(path.as_bytes());
+						print(label);
 						print(b"\n");
 						return;
 					}
@@ -118,16 +131,18 @@ unsafe fn search(storage: u64, path: &str, needle: &[u8], ignore_case: bool, inv
 					}
 					let mut prefix = String::new();
 					if many {
-						prefix.push_str(path);
+						prefix.push_str(&String::from_utf8_lossy(label));
 						prefix.push(':');
 					}
 					if numbers {
 						push_decimal(&mut prefix, number);
 						prefix.push(':');
 					}
-					print(prefix.as_bytes());
-					print(lines.line());
-					print(b"\n");
+					// Stops when the consumer does - `grep x big | head -1` should not search the
+					// rest of a large file to print into a channel nobody holds.
+					if !write_stdout(prefix.as_bytes()) || !write_stdout(lines.line()) || !write_stdout(b"\n") {
+						return;
+					}
 				}
 				LineOutcome::End => break,
 				// A LINE TOO LONG IS REPORTED, not skipped. A `grep` that silently ignored the one
@@ -135,13 +150,13 @@ unsafe fn search(storage: u64, path: &str, needle: &[u8], ignore_case: bool, inv
 				// text - the exact shape of a wrong answer that looks right.
 				LineOutcome::TooLong => {
 					eprint(b"grep: ");
-					eprint(path.as_bytes());
+					eprint(label);
 					eprint(b": a line is longer than this tool will hold\n");
 					return;
 				}
 				LineOutcome::Failed(ChunkError::Unavailable) => {
 					eprint(b"grep: cannot read ");
-					eprint(path.as_bytes());
+					eprint(label);
 					eprint(b"\n");
 					return;
 				}
@@ -154,7 +169,7 @@ unsafe fn search(storage: u64, path: &str, needle: &[u8], ignore_case: bool, inv
 		if count_only {
 			let mut out = String::new();
 			if many {
-				out.push_str(path);
+				out.push_str(&String::from_utf8_lossy(label));
 				out.push(':');
 			}
 			push_decimal(&mut out, matches);

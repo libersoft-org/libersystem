@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use cli::{Arg, ChunkError, HoldError, LineBuffer, LineOutcome, Lines, classify, parse_u64};
 use proto::system::LaunchContext;
 use rt::*;
-use tools::{VolumeSet, VolumeSource, split_args};
+use tools::{Source, VolumeSet, split_args};
 
 const WINDOW: u32 = 16 * 1024;
 const MAX_LINE: usize = 64 * 1024;
@@ -72,20 +72,35 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 		}
-		let Some(argument) = path.filter(|_| !expect) else {
+		if expect {
 			eprint(b"sort: usage: sort [-r][-u][-n][-k FIELD] <path>\n");
 			exit();
-		};
-		let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-			eprint(b"sort: invalid path\n");
-			exit();
-		};
-		let storage: u64 = volumes.client_for(&cwd, argument);
-		if storage == 0 {
-			eprint(b"sort: no volume\n");
-			exit();
 		}
-		let Some(mut lines) = collect(storage, &uri) else { exit() };
+		// NO PATH MEANS STDIN. `sort` has to hold its whole input to order it, so this is the one
+		// migrated tool where the stream case is not also a memory improvement - but `LineBuffer`'s
+		// own bounds are what stop a huge input, and they apply identically either way.
+		let source: Source = match path {
+			Some(argument) => {
+				let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+					eprint(b"sort: invalid path\n");
+					exit();
+				};
+				let storage: u64 = volumes.client_for(&cwd, argument);
+				if storage == 0 {
+					eprint(b"sort: no volume\n");
+					exit();
+				}
+				Source::from_path(storage, &uri, WINDOW)
+			}
+			None => match Source::from_stdin() {
+				Some(source) => source,
+				None => {
+					eprint(b"sort: usage: sort [-r][-u][-n][-k FIELD] <path>\n");
+					exit();
+				}
+			},
+		};
+		let Some(mut lines) = collect(source) else { exit() };
 		// A STABLE SORT, and the key decides only the comparison: two lines with equal keys keep
 		// the order the file had, which is what makes `-k` predictable and a second sort by another
 		// key meaningful.
@@ -101,8 +116,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			if unique && previous.is_some_and(|previous| lines.line(previous) == line) {
 				continue;
 			}
-			print(line);
-			print(b"\n");
+			// Stops when the consumer does: a `sort | head -3` that kept printing after `head`
+			// exited would be sorting for nobody.
+			if !write_stdout(line) || !write_stdout(b"\n") {
+				break;
+			}
 			previous = Some(at);
 		}
 	}
@@ -133,10 +151,11 @@ fn compare_numeric(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
 	}
 }
 
-unsafe fn collect(storage: u64, path: &str) -> Option<LineBuffer> {
+unsafe fn collect(source: Source) -> Option<LineBuffer> {
 	unsafe {
+		let label: alloc::vec::Vec<u8> = source.label().to_vec();
 		let mut lines = LineBuffer::new(MAX_LINES, MAX_BYTES);
-		let mut reader = Lines::new(VolumeSource::new(storage, path, WINDOW), MAX_LINE);
+		let mut reader = Lines::new(source, MAX_LINE);
 		loop {
 			match reader.next_line() {
 				LineOutcome::Line => match lines.push(reader.line()) {
@@ -157,7 +176,7 @@ unsafe fn collect(storage: u64, path: &str) -> Option<LineBuffer> {
 				}
 				LineOutcome::Failed(ChunkError::Unavailable) => {
 					eprint(b"sort: cannot read ");
-					eprint(path.as_bytes());
+					eprint(&label);
 					eprint(b"\n");
 					return None;
 				}

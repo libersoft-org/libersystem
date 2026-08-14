@@ -272,6 +272,21 @@ interface volume {
 	/// file publish in an order neither of them chose, and the loser's work disappears at the
 	/// moment it reports success.
 	@op(23) open-writer:     func(path: string, mode: writer-mode) -> result<handle<channel>, error>;
+	/// Mint a FRESH sub-connection to this same volume, carrying this client's scope and nothing
+	/// more. It grants no authority the caller does not already hold - it is the same client
+	/// again - and that is the point: it exists so two concurrent callers do not have to share one.
+	///
+	/// A DUPLICATED HANDLE IS NOT A SECOND CLIENT. Duplicating a channel endpoint produces another
+	/// name for the SAME endpoint: both holders send into one queue and both take replies out of
+	/// one queue, so whichever receives first gets whatever arrived - including the other's answer.
+	/// While tools ran one at a time nothing noticed. A pipeline runs several at once, and the
+	/// first line with two storage-using stages in it (`redirect_in f | tee g | wc`) had one stage
+	/// read the other's reply and report that the file could not be opened.
+	///
+	/// `network.open` has always existed for exactly this reason, and the grant path that mints one
+	/// says so in a comment - "so concurrent tools never share one reply queue". This is that op
+	/// for storage; the rule was right and applied to one service.
+	@op(24) connect:         func() -> result<handle<channel>, error>;
 }
 
 /// A transactional writer session over one path, reached through `volume.open-writer`.

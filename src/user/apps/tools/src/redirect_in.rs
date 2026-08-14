@@ -119,7 +119,14 @@ unsafe fn pump(storage: u64, uri: &[u8]) {
 			// UNMODIFIED BYTES. `cat` appends a newline when a file has none, because a person is
 			// reading its output; a redirection is a byte stream into another program, and adding
 			// a byte the file does not contain would make `wc -c < f` disagree with the file.
-			print(&contents[at..end]);
+			//
+			// AND IT STOPS WHEN THE CONSUMER DOES. `print` falls back to the debug serial when its
+			// channel refuses, which is right for a diagnostic and wrong here: `redirect_in big.log
+			// | head -1` would spend the rest of the file on the serial console after `head` had
+			// exited. `write_stdout` reports instead, and a redirection nobody is reading is done.
+			if !write_stdout(&contents[at..end]) {
+				break;
+			}
 			at = end;
 		}
 		unmap_object(result.file);

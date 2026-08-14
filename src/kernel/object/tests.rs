@@ -337,6 +337,43 @@ fn a_group_handle_becomes_waitable_only_once_every_stage_ends() {
 	assert!(READY.load(Ordering::SeqCst), "the group is ready once every stage has ended");
 }
 
+crate::tagged_test!(signalling_a_job_reaches_a_group_the_same_way_it_reaches_a_process, [Object, Kernel, Process, Syscall], id = "kernel.object.signalling_a_job_reaches_a_group_the_same_way_it_reaches_a_process", covers = ["kernel"]);
+fn signalling_a_job_reaches_a_group_the_same_way_it_reaches_a_process() {
+	use super::address_space::AddressSpace;
+	use super::process::Process;
+	use super::process_group::ProcessGroup;
+	use super::rights::Rights;
+	use core::sync::atomic::{AtomicI64, Ordering};
+
+	// EVERYTHING THAT SIGNALS A JOB WAS WRITTEN AGAINST A PROCESS, and a pipeline's job-control
+	// handle is a ProcessGroup. The tty turns Ctrl+C into `signal(fg, SIG_INT)`, `fg` resumes a
+	// stopped job with `signal(job, SIG_CONT)`, and the session's table holds whatever it was
+	// handed. Each of those refused a group with `bad handle` - so a foreground pipeline could not
+	// be interrupted and a stopped one could not be resumed - and refused it SILENTLY, because
+	// nothing checks the return value of a signal.
+	//
+	// So `SYS_PROCESS_SIGNAL` takes either. This asserts the group case reaches every member,
+	// which is what makes one Ctrl+C stop a whole line rather than its last stage.
+	static RESULT: AtomicI64 = AtomicI64::new(0);
+	extern "C" fn stop_the_group(group: u64) {
+		RESULT.store(unsafe { crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_SIGNAL, group, crate::syscall::SIG_STOP, 0, 0) } as i64, Ordering::SeqCst);
+	}
+
+	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain()).expect("a test process");
+	let stages = alloc::vec![make(), make(), make()];
+	let group = ProcessGroup::create(&stages).expect("a three-stage group");
+
+	crate::sched::spawn_with_object(stop_the_group, group.clone(), Rights::ALL, 0);
+	crate::sched::run_until_idle();
+	assert_eq!(RESULT.load(Ordering::SeqCst), 0, "the process-signal syscall accepted a group handle");
+	// EVERY member, not the first one. A fan-out that stopped at the first process would leave a
+	// pipeline half-suspended, which is worse than not suspending it: the stages still running
+	// fill their pipes and block against stages that will never drain them.
+	for (index, stage) in stages.iter().enumerate() {
+		assert!(stage.is_stopped(), "stage {index} was stopped by one signal to the group");
+	}
+}
+
 crate::tagged_test!(the_console_and_display_syscalls_refuse_a_caller_without_the_capability, [Object, Kernel, Syscall], id = "kernel.object.the_console_and_display_syscalls_refuse_a_caller_without_the_capability", covers = ["kernel"]);
 fn the_console_and_display_syscalls_refuse_a_caller_without_the_capability() {
 	use super::privilege::{Privilege, PrivilegeKind};

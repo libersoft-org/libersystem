@@ -1575,11 +1575,27 @@ fn sys_thread_start(thread_handle: u64) -> i64 {
 // cleanly. There are no other user-installed handlers yet - only the
 // default dispositions.
 fn sys_process_signal(process_handle: u64, signal: u64) -> i64 {
-	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
-		Ok(p) => p,
-		Err(e) => return e,
-	};
-	deliver_signal(&process, signal)
+	// A GROUP HANDLE IS ACCEPTED HERE TOO, and it has to be.
+	//
+	// A pipeline's job-control handle is a ProcessGroup, and everything that signals a job was
+	// written against a Process: the tty turns Ctrl+C into `signal(fg, SIG_INT)`, `fg` resumes a
+	// stopped job with `signal(job, SIG_CONT)`, and the session's job table holds whatever it was
+	// given. Each of those refused a group with `bad handle` - so a foreground pipeline could not
+	// be interrupted and a stopped one could not be resumed, silently, because the return value of
+	// a signal is not something a shell checks.
+	//
+	// The alternative was a second control message and a second code path at each of those three
+	// sites, all to answer the same question - "signal this job" - differently depending on how
+	// many processes happen to be in it. That is the kind of distinction a caller should not have
+	// to carry: the object knows what it is.
+	//
+	// `sys_process_group_signal` stays, for a caller that means to require a group, and both go
+	// through `deliver_signal` so the disposition cannot drift.
+	match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
+		Ok(process) => deliver_signal(&process, signal),
+		Err(ERR_BAD_HANDLE) => sys_process_group_signal(process_handle, signal),
+		Err(e) => e,
+	}
 }
 
 // Create a ProcessGroup over the Process handles in a user array, so a pipeline can be

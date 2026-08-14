@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use proto::codec::{JsonMode, json_escape};
 use proto::system::LaunchContext;
 use rt::*;
-use tools::{VolumeSet, push_decimal, split_args};
+use tools::{Source, VolumeSet, Window, push_decimal, split_args};
 
 // One window. Large enough that a big file costs few round trips, small enough that the tool's
 // footprint does not depend on what it is counting.
@@ -73,20 +73,51 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 		}
+		// NO PATH MEANS STDIN, when there is a stdin. `cat notes | wc` is the same counting code
+		// as `wc notes`, reached through `Source` - see the migration checklist beside that type.
+		// With neither a path nor an input stream there is genuinely nothing to count.
+		let mut streamed: Option<Source> = None;
 		if paths.is_empty() {
-			eprint(b"wc: usage: wc <path> [path...] [json]\n");
-			exit();
+			match Source::from_stdin() {
+				Some(source) => streamed = Some(source),
+				None => {
+					eprint(b"wc: usage: wc <path> [path...] [json]\n");
+					exit();
+				}
+			}
 		}
 		let mut document = String::from("[");
 		let mut total = Counts::default();
 		let mut counted: usize = 0;
+		if let Some(mut source) = streamed {
+			let Some(counts) = count(&mut source) else {
+				eprint(b"wc: input stream failed\n");
+				exit();
+			};
+			match json {
+				Some(mode) => {
+					document.push_str("{\"path\":\"-\"");
+					push_field(&mut document, ",\"bytes\":", counts.bytes);
+					push_field(&mut document, ",\"lines\":", counts.lines);
+					push_field(&mut document, ",\"words\":", counts.words);
+					push_field(&mut document, ",\"scalars\":", counts.scalars);
+					document.push_str("}]");
+					let rendered = mode.render(document);
+					print(rendered.as_bytes());
+					print(b"\n");
+				}
+				// No label: `wc` naming a file it was not given would be inventing one.
+				None => print_row(&counts, b""),
+			}
+			exit();
+		}
 		for (index, argument) in paths.iter().enumerate() {
 			let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
 				eprint(b"wc: invalid path\n");
 				continue;
 			};
 			let storage: u64 = volumes.client_for(&cwd, argument);
-			let Some(counts) = count(storage, &uri) else {
+			let Some(counts) = count(&mut Source::from_path(storage, &uri, WINDOW)) else {
 				eprint(b"wc: cannot read ");
 				eprint(uri.as_bytes());
 				eprint(b"\n");
@@ -155,20 +186,18 @@ unsafe fn print_row(counts: &Counts, label: &[u8]) {
 // is one character. The two carried states - "was the previous byte whitespace" and "is this byte
 // a continuation" - are what make the answer independent of the window size, and a `wc` whose
 // answer depended on its chunking would be wrong in a way nothing would notice.
-unsafe fn count(storage: u64, path: &str) -> Option<Counts> {
+unsafe fn count(source: &mut Source) -> Option<Counts> {
 	unsafe {
-		if storage == 0 {
-			return None;
-		}
 		let mut counts = Counts::default();
-		let mut offset: u64 = 0;
 		let mut in_word = false;
 		loop {
-			let window = tools::read_volume_window(storage, path, offset, WINDOW).ok()?;
-			if window.is_empty() {
-				return Some(counts);
-			}
-			offset = offset.saturating_add(window.len() as u64);
+			let window = match source.next() {
+				Window::Bytes(bytes) => bytes,
+				Window::End => return Some(counts),
+				// A source that could not finish is not a short file. Counting what arrived and
+				// printing it as the answer is the one outcome worse than saying nothing.
+				Window::Failed => return None,
+			};
 			for &byte in &window {
 				counts.bytes = counts.bytes.saturating_add(1);
 				if byte == b'\n' {

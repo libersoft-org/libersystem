@@ -292,6 +292,17 @@ impl AuditEntry {
 pub struct PipelineStage {
 	pub name: String,
 	pub args: String,
+	/// `2>&1`: this stage's diagnostics go wherever its OUTPUT goes rather than to the terminal.
+	///
+	/// A stage's stderr is a send-only duplicate of the terminal by default, which is what keeps a
+	/// producer's diagnostic out of the pipe its consumer is reading. `2>&1` asks for the opposite -
+	/// fold the diagnostics into the stream - and it is the form that most needs the broker, because
+	/// only the broker knows which endpoint a stage's output actually is: an edge for every stage
+	/// but the last, and the caller's terminal for that one.
+	///
+	/// A FLAG RATHER THAN AN ENDPOINT, for the reason the record's own comment gives: the caller
+	/// names no stdio at all. It says what it wants and the broker decides which handle that is.
+	pub merge_errors: bool,
 }
 
 impl PipelineStage {
@@ -334,12 +345,14 @@ impl PipelineStage {
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		w.bytes_lp(self.name.as_bytes())?;
 		w.bytes_lp(self.args.as_bytes())?;
+		w.boolean(self.merge_errors)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<PipelineStage> {
 		let name = r.string_lp()?;
 		let args = r.string_lp()?;
-		Some(PipelineStage { name, args })
+		let merge_errors = r.boolean()?;
+		Some(PipelineStage { name, args, merge_errors })
 	}
 }
 
@@ -1129,6 +1142,13 @@ impl PipelineStage {
 		out.push(',');
 		out.push_str("\"args\":");
 		crate::codec::json_escape(&self.args, out);
+		out.push(',');
+		out.push_str("\"merge-errors\":");
+		if self.merge_errors {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -1138,14 +1158,23 @@ impl PipelineStage {
 		out.push_str(", ");
 		out.push_str("args=");
 		out.push_str(&self.args);
+		out.push_str(", ");
+		out.push_str("merge-errors=");
+		if self.merge_errors {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::map(out, 3);
 		crate::codec::cbor::text(out, "name");
 		crate::codec::cbor::text(out, &self.name);
 		crate::codec::cbor::text(out, "args");
 		crate::codec::cbor::text(out, &self.args);
+		crate::codec::cbor::text(out, "merge-errors");
+		crate::codec::cbor::boolean(out, self.merge_errors);
 	}
 }
 

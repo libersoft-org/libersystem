@@ -295,6 +295,13 @@ struct PermissionScenarioResult {
 	// `volumes` grant and pushed the bytes down an ordinary edge - and that the consumer never
 	// touched storage at all.
 	redirect_read: alloc::vec::Vec<u8>,
+	// What `cat ::not-a-path 2>&1 | readln` printed - the diagnostic scenario with `merge-errors`
+	// on the producer. The contrast with `diagnostic_read` is the whole assertion: same stages,
+	// same failure, one flag, and the sentence changes which side of the pipe it comes out on.
+	merged_read: alloc::vec::Vec<u8>,
+	// What the three migrated-tool pipelines printed, in the order the scenario runs them:
+	// `... | wc`, `... | head -n 1`, `... | tee <path> | wc`.
+	stream_reads: alloc::vec::Vec<alloc::vec::Vec<u8>>,
 	expected: alloc::vec::Vec<u8>,
 	probe_read: alloc::vec::Vec<u8>,
 	probe_summary: alloc::vec::Vec<u8>,
@@ -537,6 +544,8 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 			pipeline_request.extend_from_slice(&(value.len() as u16).to_le_bytes());
 			pipeline_request.extend_from_slice(value);
 		}
+		// `merge-errors`: this stage's diagnostics go to the terminal, the ordinary case.
+		pipeline_request.push(0);
 	}
 	pipeline_request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
 	pipeline_request.extend_from_slice(b"vol://system");
@@ -579,6 +588,8 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 			redirect_request.extend_from_slice(&(value.len() as u16).to_le_bytes());
 			redirect_request.extend_from_slice(value);
 		}
+		// `merge-errors`: this stage's diagnostics go to the terminal, the ordinary case.
+		redirect_request.push(0);
 	}
 	redirect_request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
 	redirect_request.extend_from_slice(b"vol://system");
@@ -612,6 +623,8 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 			diagnostic_request.extend_from_slice(&(value.len() as u16).to_le_bytes());
 			diagnostic_request.extend_from_slice(value);
 		}
+		// `merge-errors`: this stage's diagnostics go to the terminal, the ordinary case.
+		diagnostic_request.push(0);
 	}
 	diagnostic_request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
 	diagnostic_request.extend_from_slice(b"vol://system");
@@ -627,6 +640,101 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 			Ok(message) => diagnostic_read.extend_from_slice(&message.bytes),
 			Err(_) => break,
 		}
+	}
+
+	// THE SAME LINE WITH `2>&1`, which is the previous scenario with one byte of the request flipped.
+	//
+	// That is the point of it. `cat ::not-a-path | readln` above proves the diagnostic reaches the
+	// terminal and NOT the pipe; this is the identical request, the identical stages, the identical
+	// failure - and `merge-errors` set on the producer. The sentence now arrives at the consumer,
+	// behind `readln`'s `in> ` prefix, which is the prefix that distinguishes "read as input" from
+	// "printed to the terminal".
+	//
+	// AND IT COULD NOT HAVE BEEN A STAGE. Every other redirection expands into a program because it
+	// names a file, and a file is authority somebody has to be granted. This one names the stage's
+	// own output edge - a handle the broker allocates inside this very transaction, which the shell
+	// never sees and cannot pass. So it travels as a flag on the record and the broker duplicates
+	// the handle it just made, which is what this exercises.
+	let (merged_read_end, merged_write_end) = Channel::create();
+	let mut merged_request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	merged_request.extend_from_slice(&4u16.to_le_bytes());
+	merged_request.extend_from_slice(&3u32.to_le_bytes());
+	merged_request.extend_from_slice(&2u16.to_le_bytes());
+	for (name, args, merge) in [(&b"cat"[..], &b"::not-a-path"[..], 1u8), (&b"readln"[..], &b""[..], 0u8)] {
+		for value in [name, args] {
+			merged_request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+			merged_request.extend_from_slice(value);
+		}
+		merged_request.push(merge);
+	}
+	merged_request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
+	merged_request.extend_from_slice(b"vol://system");
+	merged_request.extend_from_slice(&0u16.to_le_bytes());
+	merged_request.extend_from_slice(&0u32.to_le_bytes());
+	send_cap(&perm_client, &merged_request, merged_write_end, Rights::ALL)?;
+	sched::run_until_idle();
+	let _ = perm_client.recv();
+	let mut merged_read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	for _ in 0..16 {
+		sched::run_until_idle();
+		match merged_read_end.recv() {
+			Ok(message) => merged_read.extend_from_slice(&message.bytes),
+			Err(_) => break,
+		}
+	}
+
+	// THE MIGRATED STREAM TOOLS, reading a pipeline instead of a path.
+	//
+	// This is what the migration is FOR, and each of the three asks a different question.
+	//
+	// `redirect_in motd.txt | wc` - a tool that was given no path at all counts the bytes that
+	// arrived on its input. `motd.txt` has two lines, so a leading "2" says it counted the whole
+	// stream: a `wc` that read nothing would print zeros and one that lost a window would print one.
+	//
+	// `redirect_in motd.txt | head -n 1` - the early-closing consumer this milestone asks for.
+	// `head` stops after one line and drops its source, which closes the read end; the producer
+	// learns at its next write. Nothing in `head` does that explicitly - it falls out of owning the
+	// endpoint - so what this really pins is that the pipeline ENDS rather than hanging with a
+	// producer blocked on a consumer that is gone.
+	//
+	// `redirect_in motd.txt | tee <path> | wc` - the fan-out, on a scenario whose volume is a
+	// read-only archive. So the destination CANNOT be opened, which makes this the test for the
+	// decision `tee` documents: a destination that fails is reported and abandoned, and the stream
+	// the rest of the line is built on carries on. `wc` still counts two lines.
+	let mut stream_reads: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+	for (correlation, stages) in [
+		(4u32, &[(&b"redirect_in"[..], &b"motd.txt"[..]), (&b"tee"[..], &b"teed.txt"[..]), (&b"wc"[..], &b""[..])][..]),
+		(5u32, &[(&b"redirect_in"[..], &b"motd.txt"[..]), (&b"head"[..], &b"-n 1"[..])][..]),
+		(6u32, &[(&b"redirect_in"[..], &b"motd.txt"[..]), (&b"wc"[..], &b""[..])][..]),
+	] {
+		let (read_end, write_end) = Channel::create();
+		let mut request: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		request.extend_from_slice(&4u16.to_le_bytes());
+		request.extend_from_slice(&correlation.to_le_bytes());
+		request.extend_from_slice(&(stages.len() as u16).to_le_bytes());
+		for (name, args) in stages {
+			for value in [name, args] {
+				request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+				request.extend_from_slice(value);
+			}
+			request.push(0);
+		}
+		request.extend_from_slice(&(b"vol://system".len() as u16).to_le_bytes());
+		request.extend_from_slice(b"vol://system");
+		request.extend_from_slice(&0u16.to_le_bytes());
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&perm_client, &request, write_end, Rights::ALL)?;
+		sched::run_until_idle();
+		let _ = perm_client.recv();
+		let mut read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		for _ in 0..16 {
+			sched::run_until_idle();
+			match read_end.recv() {
+				Ok(message) => read.extend_from_slice(&message.bytes),
+				Err(_) => break,
+			}
+		}
+		stream_reads.push(read);
 	}
 
 	// The P02M0101 command tools, through the same governed path as everything else.
@@ -730,7 +838,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let ip_read = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip output")?;
 	let ip_summary = pm_boot_kernel.recv().map_err(|_| "PermissionManager reported no ip decisions summary")?;
 	if scenario != PermissionScenario::ScopedGrants {
-		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), redirect_read: redirect_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
+		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), redirect_read: redirect_read.clone(), merged_read: merged_read.clone(), stream_reads: stream_reads.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
 	}
 
 	// Prequeue one successful admin mint on each private connection. PermissionManager's
@@ -966,7 +1074,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	if !mp3_process.is_terminated() {
 		return Err("MP3 play did not exit");
 	}
-	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
+	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, merged_read, stream_reads, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
 }
 
 // Build the component topology and run it to completion. A StorageService serves

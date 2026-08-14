@@ -44,6 +44,10 @@ name = "redirect_out"
 path = "src/redirect_out.rs"
 
 [[bin]]
+name = "tee"
+path = "src/tee.rs"
+
+[[bin]]
 name = "write"
 path = "src/write.rs"
 

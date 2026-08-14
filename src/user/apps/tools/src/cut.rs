@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use cli::{Arg, ChunkError, LineOutcome, Lines, Range, classify, parse_ranges};
 use proto::system::LaunchContext;
 use rt::*;
-use tools::{VolumeSet, VolumeSource, split_args};
+use tools::{Source, VolumeSet, split_args};
 
 const WINDOW: u32 = 16 * 1024;
 const MAX_LINE: usize = 64 * 1024;
@@ -95,21 +95,40 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 		}
-		let (Some(mode), Some(ranges), Some(argument)) = (mode, ranges, path.filter(|_| expect.is_none())) else {
+		let (Some(mode), Some(ranges)) = (mode, ranges) else {
 			usage();
 			exit();
 		};
-		let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-			eprint(b"cut: invalid path\n");
-			exit();
-		};
-		let storage: u64 = volumes.client_for(&cwd, argument);
-		if storage == 0 {
-			eprint(b"cut: no volume\n");
+		if expect.is_some() {
+			usage();
 			exit();
 		}
+		// NO PATH MEANS STDIN, which is what makes `cut` usable at all in a pipeline - selecting
+		// columns out of another tool's output is most of what it is for.
+		let source: Source = match path {
+			Some(argument) => {
+				let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+					eprint(b"cut: invalid path\n");
+					exit();
+				};
+				let storage: u64 = volumes.client_for(&cwd, argument);
+				if storage == 0 {
+					eprint(b"cut: no volume\n");
+					exit();
+				}
+				Source::from_path(storage, &uri, WINDOW)
+			}
+			None => match Source::from_stdin() {
+				Some(source) => source,
+				None => {
+					usage();
+					exit();
+				}
+			},
+		};
+		let label: Vec<u8> = source.label().to_vec();
 		let out_delimiter: u8 = output_delimiter.unwrap_or(delimiter);
-		let mut lines = Lines::new(VolumeSource::new(storage, &uri, WINDOW), MAX_LINE);
+		let mut lines = Lines::new(source, MAX_LINE);
 		loop {
 			match lines.next_line() {
 				LineOutcome::Line => {
@@ -119,8 +138,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						eprint(b"cut: out of memory\n");
 						exit();
 					}
-					print(&out);
-					print(b"\n");
+					if !write_stdout(&out) || !write_stdout(b"\n") {
+						exit();
+					}
 				}
 				LineOutcome::End => break,
 				LineOutcome::TooLong => {
@@ -129,7 +149,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				LineOutcome::Failed(ChunkError::Unavailable) => {
 					eprint(b"cut: cannot read ");
-					eprint(uri.as_bytes());
+					eprint(&label);
 					eprint(b"\n");
 					exit();
 				}

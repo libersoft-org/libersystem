@@ -461,3 +461,170 @@ pub fn push_decimal(out: &mut String, value: u64) {
 		out.push(digits[n - 1 - i] as char);
 	}
 }
+
+// ONE INPUT CONTRACT FOR EVERY STREAM TOOL, so `wc file` and `cat file | wc` run the same code.
+//
+// The nine tools this exists for - `grep`, `head`, `tail`, `sort`, `cut`, `tee`, `wc`, `less`,
+// `hexdump` - all had the same shape: resolve a path, pick a volume client, loop over
+// `read_volume_window`. A pipeline gives them bytes with no path and no volume at all, and the
+// wrong way to fix that is nine `if stdin_is_wired` branches, because then nine tools have two
+// input paths and the pipeline one is the one nothing tests.
+//
+// THE MIGRATION CHECKLIST, which is the deliverable this type carries:
+//
+//   1. Where the tool refuses with "usage: ... <path>" because it got no path, call
+//      `Source::from_stdin` instead and refuse only if THAT is absent too. A tool launched with
+//      no path and no input stream genuinely has nothing to read.
+//   2. Replace the `read_volume_window` loop with `Source::next`, and treat `Window::Failed` as
+//      an error rather than as an end - a producer that could not finish must not be reported as
+//      a complete short answer.
+//   3. Write output through `rt::write_stdout` rather than `print` wherever the tool is in a loop
+//      it could stop: `false` means the consumer exited, and a tool that keeps going is doing
+//      work for nobody. (Diagnostics stay on `eprint`, which is a different endpoint.)
+//   4. Drop `Source` when finished. A consumer that stops early closes its read end, which the
+//      producer sees as a broken pipe at its next write - that is the whole propagation mechanism
+//      and it needs no code in the tool.
+//   5. Do not detect "am I in a pipeline" any other way. There is no environment variable for it
+//      and there must not be: the presence of a stdin endpoint is the only signal, it is a
+//      capability, and it is the same one the tool reads from.
+//
+// A tool that follows those five points needs no broader volume grant to work in a pipeline than
+// it needs to work on a path - `Source::Stream` holds a channel and nothing else.
+//
+// EVERY METHOD HERE IS `#[inline(always)]`, like the rest of this file, and that is a link-time
+// requirement rather than a performance choice. Each tool is built as one object that may define
+// no global but `__user_main`; anything else has to come from a declared shared provider, and this
+// crate is not one - it is a dependency compiled into each tool. A `pub fn` without the attribute
+// is emitted as an import nothing provides, and the shared build refuses the image by name.
+pub enum Source {
+	// Bytes from a file, one bounded window at a time through `volume.read`. The window is the
+	// existing `VolumeSource`, so the path case here IS the path case every tool already had -
+	// this adds a second source beside it rather than a second implementation of the first.
+	Volume(VolumeSource),
+	// Bytes from the stage upstream. Owns the endpoint, so dropping it breaks the producer's pipe.
+	Stream(rt::stream::Reader, Vec<u8>),
+}
+
+// What one step of a source produced.
+pub enum Window {
+	// Bytes to process. Never empty - see `rt::stream::Chunk::Data` for why an empty window
+	// cannot be allowed to mean an end.
+	Bytes(Vec<u8>),
+	// No more input, normally.
+	End,
+	// The input ended and the thing producing it is reporting that it could not finish. A tool
+	// that treats this as `End` publishes a truncated answer as a complete one.
+	Failed,
+}
+
+impl Source {
+	// Read from a path, the way every one of these tools already did. `window` is the tool's own
+	// read size, kept a parameter because these tools chose different ones for reasons - 16 KiB
+	// for the line readers, 64 KiB for the counters - and collapsing them here would change how
+	// many round trips each makes without anybody deciding to.
+	#[inline(always)]
+	pub fn from_path(storage: u64, uri: &str, window: u32) -> Self {
+		Source::Volume(VolumeSource::new(storage, uri, window))
+	}
+
+	// Read from the stage upstream, or `None` when nothing is wired to this launch's input.
+	//
+	// THE ABSENCE IS THE SIGNAL. A terminal launch has no stdin endpoint, a pipeline stage after
+	// the first has one, and that is the whole test - no environment variable, no flag, and
+	// nothing the tool could be lied to about by a caller that cannot forge a capability.
+	#[inline(always)]
+	pub unsafe fn from_stdin() -> Option<Self> {
+		let input: u64 = unsafe { rt::stdin() };
+		if input == 0 { None } else { Some(Source::Stream(rt::stream::Reader::new(input), Vec::new())) }
+	}
+
+	// The next window of input, for the tools that work on windows rather than lines. The ones
+	// that work on lines wrap this same type in `cli::Lines` through the `ChunkSource` impl below.
+	#[inline(always)]
+	pub unsafe fn next(&mut self) -> Window {
+		use cli::ChunkSource;
+		match self.next_chunk() {
+			Ok(bytes) if bytes.is_empty() => Window::End,
+			Ok(bytes) => Window::Bytes(bytes.to_vec()),
+			Err(_) => Window::Failed,
+		}
+	}
+
+	// Discard the first `count` bytes.
+	//
+	// A VOLUME SEEKS AND A STREAM DRAINS, which is not an implementation detail a caller can
+	// ignore: skipping a gigabyte of a file costs nothing and skipping a gigabyte of a stream
+	// costs reading a gigabyte. It is still the right thing to offer, because `hexdump -s` has to
+	// mean the same thing on both, and the alternative is a tool that silently ignores its flag
+	// on the input it was piped.
+	//
+	// Returns false when the input ended before `count` bytes, or failed.
+	#[inline(always)]
+	pub unsafe fn skip(&mut self, count: u64) -> bool {
+		if count == 0 {
+			return true;
+		}
+		match self {
+			Source::Volume(source) => {
+				source.seek(source.position().saturating_add(count));
+				true
+			}
+			Source::Stream(..) => {
+				let mut left: u64 = count;
+				while left > 0 {
+					match unsafe { self.next() } {
+						Window::Bytes(bytes) => left = left.saturating_sub(bytes.len() as u64),
+						Window::End | Window::Failed => return false,
+					}
+				}
+				true
+			}
+		}
+	}
+
+	// What to call this input in a diagnostic or a per-file label. A stream has no name a user
+	// would recognise, and inventing a path for it would be a lie about where the bytes came from.
+	#[inline(always)]
+	pub fn label(&self) -> &[u8] {
+		match self {
+			Source::Volume(_) => b"",
+			Source::Stream(..) => b"-",
+		}
+	}
+}
+
+// THE REASON `Source` IS A `ChunkSource` AND NOT A SECOND MECHANISM. `cli::Lines` turns any chunk
+// source into lines across window boundaries, and `grep`, `sort` and `cut` are built on it. Making
+// the stream a chunk source means those three take stdin by changing which value they construct,
+// not by growing a second reading loop - and the loop that would have been duplicated is exactly
+// the one with the boundary handling in it.
+impl cli::ChunkSource for Source {
+	#[inline(always)]
+	fn next_chunk(&mut self) -> Result<&[u8], cli::ChunkError> {
+		match self {
+			Source::Volume(source) => source.next_chunk(),
+			Source::Stream(reader, held) => {
+				held.clear();
+				if held.try_reserve(rt::stream::MAX_CHUNK).is_err() {
+					return Err(cli::ChunkError::OutOfMemory);
+				}
+				held.resize(rt::stream::MAX_CHUNK, 0);
+				match unsafe { reader.read(held) } {
+					rt::stream::Chunk::Data(len) => {
+						held.truncate(len);
+						Ok(held)
+					}
+					// An empty chunk is how `ChunkSource` spells the end.
+					rt::stream::Chunk::End => {
+						held.clear();
+						Ok(held)
+					}
+					// A producer that reported it could not finish. NOT an end: a consumer that
+					// cannot tell the two apart prints a truncated answer as a complete one, which
+					// is the failure the whole stream contract exists to prevent.
+					rt::stream::Chunk::Failed => Err(cli::ChunkError::Unavailable),
+				}
+			}
+		}
+	}
+}

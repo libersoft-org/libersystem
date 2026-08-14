@@ -411,11 +411,23 @@ pub enum RedirectError {
 	// More than one input or more than one output on the line. `a > x > y` is two destinations for
 	// one stream; a shell that picked one would be choosing for the user.
 	Duplicate,
-	// A form this expansion does not implement yet: `2>` and `2>&1`. The error stream is not a
-	// position in the chain - a stage's stderr goes to the terminal beside the pipe - so it needs
-	// an endpoint the pipeline transaction does not carry today. Refused by name rather than run
-	// with the part the user asked for silently dropped.
-	StderrUnsupported,
+	// `2> path`: the stage's errors would have to reach a consumer that is NOT in the chain, and
+	// the transaction allocates one edge per `A | B` and no others. `2>&1` is not here - it is a
+	// flag on the stage, because it asks for an endpoint the broker already has.
+	StderrToPathUnsupported,
+}
+
+/// One stage of an expanded line: the words to launch, and whether it asked for `2>&1`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct ExpandedStage {
+	pub words: Vec<Vec<u8>>,
+	pub merge_errors: bool,
+}
+
+/// A line with its redirections expanded into stages.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Expansion {
+	pub stages: Vec<ExpandedStage>,
 }
 
 // The stages a line becomes once its redirections are expanded, as `(command, arguments)` pairs in
@@ -424,10 +436,11 @@ pub enum RedirectError {
 // Returned as words rather than as `Stage`s because the expansion's product is exactly what the
 // launch contract takes, and a `Stage` carrying a `redirects` list that is now always empty would
 // invite somebody to look at it.
-pub fn expand_redirects(pipeline: &Pipeline) -> Result<Vec<Vec<Vec<u8>>>, RedirectError> {
+pub fn expand_redirects(pipeline: &Pipeline) -> Result<Expansion, RedirectError> {
 	let last: usize = pipeline.stages.len() - 1;
 	let mut input: Option<&[u8]> = None;
 	let mut output: Option<(&[u8], bool)> = None;
+	let mut merged: Vec<usize> = Vec::new();
 	for (index, stage) in pipeline.stages.iter().enumerate() {
 		for redirect in &stage.redirects {
 			match redirect {
@@ -440,8 +453,17 @@ pub fn expand_redirects(pipeline: &Pipeline) -> Result<Vec<Vec<Vec<u8>>>, Redire
 					}
 					input = Some(path);
 				}
-				Redirect::Out { stderr: true, .. } | Redirect::ErrToOut => {
-					return Err(RedirectError::StderrUnsupported);
+				// `2>&1` is a property of the stage rather than a stage of its own: it asks for the
+				// diagnostics to go wherever the OUTPUT goes, and where that is - an edge, or the
+				// terminal for the last stage - is something only the broker knows. So it travels
+				// as a flag on the stage and the broker duplicates the right handle.
+				Redirect::ErrToOut => merged.push(index),
+				// `2> path` is not the same shape at all. It needs the stage's errors to reach a
+				// `redirect_out` that is NOT in the chain - a second consumer beside the linear one -
+				// and the pipeline transaction allocates one edge per `A | B` and no others. Refused
+				// by name until the transaction can carry a side edge.
+				Redirect::Out { stderr: true, .. } => {
+					return Err(RedirectError::StderrToPathUnsupported);
 				}
 				Redirect::Out { path, append, stderr: false } => {
 					if index != last {
@@ -455,12 +477,12 @@ pub fn expand_redirects(pipeline: &Pipeline) -> Result<Vec<Vec<Vec<u8>>>, Redire
 			}
 		}
 	}
-	let mut expanded: Vec<Vec<Vec<u8>>> = Vec::new();
+	let mut stages: Vec<ExpandedStage> = Vec::new();
 	if let Some(path) = input {
-		expanded.push(alloc::vec![REDIRECT_IN.to_vec(), path.to_vec()]);
+		stages.push(ExpandedStage { words: alloc::vec![REDIRECT_IN.to_vec(), path.to_vec()], merge_errors: false });
 	}
-	for stage in &pipeline.stages {
-		expanded.push(stage.words.clone());
+	for (index, stage) in pipeline.stages.iter().enumerate() {
+		stages.push(ExpandedStage { words: stage.words.clone(), merge_errors: merged.contains(&index) });
 	}
 	if let Some((path, append)) = output {
 		let mut words: Vec<Vec<u8>> = alloc::vec![REDIRECT_OUT.to_vec()];
@@ -468,9 +490,9 @@ pub fn expand_redirects(pipeline: &Pipeline) -> Result<Vec<Vec<Vec<u8>>>, Redire
 			words.push(APPEND_FLAG.to_vec());
 		}
 		words.push(path.to_vec());
-		expanded.push(words);
+		stages.push(ExpandedStage { words, merge_errors: false });
 	}
-	Ok(expanded)
+	Ok(Expansion { stages })
 }
 
 #[cfg(test)]

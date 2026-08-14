@@ -551,6 +551,29 @@ impl volume::Service for VolumeCall<'_> {
 		}
 		Ok(client)
 	}
+
+	// A SECOND CLIENT, not a second name for this one. See the op's own comment in `storage.lsidl`
+	// for the failure this exists to stop; the short form is that a duplicated channel endpoint is
+	// one queue with two holders, so two concurrent callers take each other's replies.
+	//
+	// It grants nothing new: the minted client carries this caller's scope, so a directory-scoped
+	// client can only mint another directory-scoped client, and one that was refused a path is
+	// refused it again on every connection it makes. That is what makes this safe to hand to a
+	// governed tool - it is the authority the caller already has, arriving on its own wire.
+	fn connect(&mut self) -> Result<u64, Error> {
+		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		// A refused admission closes BOTH ends, for `open-directory`'s reason: the grant did not
+		// happen, so neither handle has an owner. `Again` is the honest answer - the client table
+		// is full, which a caller can retry rather than a fault in what it asked.
+		if !admit_client(self.set, self.clients, Client { chan: server, koid: 0, scope: self.scope.clone(), quiet: false, writer: None }) {
+			unsafe {
+				close(server);
+				close(client);
+			}
+			return Err(Error::Again);
+		}
+		Ok(client)
+	}
 }
 
 // A `String` that says it could not be allocated instead of aborting the service.
@@ -2386,6 +2409,11 @@ impl volume::Service for Volume {
 	// belongs to the serve loop. `VolumeCall` is what the loop dispatches through, and its
 	// implementation of this op is the real one.
 	fn open_writer(&mut self, _path: String, _mode: WriterMode) -> Result<u64, Error> {
+		Err(Error::Invalid)
+	}
+	// This impl answers ops that need only the volume; minting a client needs the client table,
+	// which is why `VolumeCall` exists. The serve loop dispatches through that one.
+	fn connect(&mut self) -> Result<u64, Error> {
 		Err(Error::Invalid)
 	}
 }

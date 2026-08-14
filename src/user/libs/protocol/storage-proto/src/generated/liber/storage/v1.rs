@@ -702,6 +702,7 @@ pub mod volume {
 	pub const OP_READ: u16 = 21;
 	pub const OP_WATCH: u16 = 22;
 	pub const OP_OPEN_WRITER: u16 = 23;
+	pub const OP_CONNECT: u16 = 24;
 
 	pub trait Service {
 		fn open(&mut self, o: OpenOpts) -> Result<OpenResult, Error>;
@@ -844,6 +845,21 @@ pub mod volume {
 		/// file publish in an order neither of them chose, and the loser's work disappears at the
 		/// moment it reports success.
 		fn open_writer(&mut self, path: String, mode: WriterMode) -> Result<u64, Error>;
+		/// Mint a FRESH sub-connection to this same volume, carrying this client's scope and nothing
+		/// more. It grants no authority the caller does not already hold - it is the same client
+		/// again - and that is the point: it exists so two concurrent callers do not have to share one.
+		///
+		/// A DUPLICATED HANDLE IS NOT A SECOND CLIENT. Duplicating a channel endpoint produces another
+		/// name for the SAME endpoint: both holders send into one queue and both take replies out of
+		/// one queue, so whichever receives first gets whatever arrived - including the other's answer.
+		/// While tools ran one at a time nothing noticed. A pipeline runs several at once, and the
+		/// first line with two storage-using stages in it (`redirect_in f | tee g | wc`) had one stage
+		/// read the other's reply and report that the file could not be opened.
+		///
+		/// `network.open` has always existed for exactly this reason, and the grant path that mints one
+		/// says so in a comment - "so concurrent tools never share one reply queue". This is that op
+		/// for storage; the rule was right and applied to one service.
+		fn connect(&mut self) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1653,6 +1669,43 @@ pub mod volume {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_CONNECT => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.connect();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v46) => {
+							w.u8(1)?;
+							w.set_handle(*v46)?;
+							w.u32(0)?;
+						}
+						Err(v47) => {
+							w.u8(0)?;
+							v47.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -1979,13 +2032,13 @@ pub mod volume {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v46 = r.u16()? as usize;
-						let mut v47 = Vec::new();
-						v47.try_reserve_exact(v46).ok()?;
-						for _ in 0..v46 {
-							v47.push(SnapshotInfo::read(r)?);
+						let v48 = r.u16()? as usize;
+						let mut v49 = Vec::new();
+						v49.try_reserve_exact(v48).ok()?;
+						for _ in 0..v48 {
+							v49.push(SnapshotInfo::read(r)?);
 						}
-						v47
+						v49
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -2489,6 +2542,39 @@ pub mod volume {
 			}
 			decoded
 		}
+		pub fn connect(&mut self) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CONNECT)?;
+			w.u32(corr)?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -2674,6 +2760,14 @@ pub mod volume {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.open_writer(path, mode)
 	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_connect")]
+	fn channel_invoke_connect(chan: u64) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.connect()
+	}
 }
 
 /// A transactional writer session over one path, reached through `volume.open-writer`.
@@ -2741,13 +2835,13 @@ pub mod writer {
 		match op {
 			OP_WRITE => {
 				let data = {
-					let v48 = r.u16()? as usize;
-					let mut v49 = Vec::new();
-					v49.try_reserve_exact(v48).ok()?;
-					for _ in 0..v48 {
-						v49.push(r.u8()?);
+					let v50 = r.u16()? as usize;
+					let mut v51 = Vec::new();
+					v51.try_reserve_exact(v50).ok()?;
+					for _ in 0..v50 {
+						v51.push(r.u8()?);
 					}
-					v49
+					v51
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -2756,13 +2850,13 @@ pub mod writer {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v50) => {
+						Ok(v52) => {
 							w.u8(1)?;
-							w.u64(*v50)?;
+							w.u64(*v52)?;
 						}
-						Err(v51) => {
+						Err(v53) => {
 							w.u8(0)?;
-							v51.write(w)?;
+							v53.write(w)?;
 						}
 					}
 					Some(())
@@ -2787,53 +2881,17 @@ pub mod writer {
 			OP_WRITE_AT => {
 				let offset = r.u64()?;
 				let data = {
-					let v52 = r.u16()? as usize;
-					let mut v53 = Vec::new();
-					v53.try_reserve_exact(v52).ok()?;
-					for _ in 0..v52 {
-						v53.push(r.u8()?);
+					let v54 = r.u16()? as usize;
+					let mut v55 = Vec::new();
+					v55.try_reserve_exact(v54).ok()?;
+					for _ in 0..v54 {
+						v55.push(r.u8()?);
 					}
-					v53
+					v55
 				};
 				r.finish()?;
 				request_handles.clear();
 				let result = service.write_at(offset, data);
-				let encoded: Option<()> = (|| {
-					let w = &mut writer;
-					w.u32(corr)?;
-					match &result {
-						Ok(v54) => {
-							w.u8(1)?;
-						}
-						Err(v55) => {
-							w.u8(0)?;
-							v55.write(w)?;
-						}
-					}
-					Some(())
-				})();
-				if encoded.is_none() {
-					if writer.has_handle() {
-						match Handles::try_from_slice(writer.handles()) {
-							Some(taken) => *reply_handles = taken,
-							None => {}
-						}
-						return None;
-					}
-					// the reply outgrew the caller's buffer: replace it with a typed
-					// error, so the client sees a failure instead of hanging.
-					writer.reset();
-					let w = &mut writer;
-					w.u32(corr)?;
-					w.u8(0)?;
-					Error::Again.write(w)?;
-				}
-			}
-			OP_TRUNCATE => {
-				let length = r.u64()?;
-				r.finish()?;
-				request_handles.clear();
-				let result = service.truncate(length);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -2865,17 +2923,17 @@ pub mod writer {
 					Error::Again.write(w)?;
 				}
 			}
-			OP_FLUSH => {
+			OP_TRUNCATE => {
+				let length = r.u64()?;
 				r.finish()?;
 				request_handles.clear();
-				let result = service.flush();
+				let result = service.truncate(length);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
 						Ok(v58) => {
 							w.u8(1)?;
-							w.u64(*v58)?;
 						}
 						Err(v59) => {
 							w.u8(0)?;
@@ -2901,10 +2959,10 @@ pub mod writer {
 					Error::Again.write(w)?;
 				}
 			}
-			OP_COMMIT => {
+			OP_FLUSH => {
 				r.finish()?;
 				request_handles.clear();
-				let result = service.commit();
+				let result = service.flush();
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -2937,6 +2995,42 @@ pub mod writer {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_COMMIT => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.commit();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v62) => {
+							w.u8(1)?;
+							w.u64(*v62)?;
+						}
+						Err(v63) => {
+							w.u8(0)?;
+							v63.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			OP_ABORT => {
 				r.finish()?;
 				request_handles.clear();
@@ -2945,12 +3039,12 @@ pub mod writer {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v62) => {
+						Ok(v64) => {
 							w.u8(1)?;
 						}
-						Err(v63) => {
+						Err(v65) => {
 							w.u8(0)?;
-							v63.write(w)?;
+							v65.write(w)?;
 						}
 					}
 					Some(())
@@ -3031,8 +3125,8 @@ pub mod writer {
 				return None;
 			}
 			w.u16(data.len() as u16)?;
-			for v64 in data.iter() {
-				w.u8(*v64)?;
+			for v66 in data.iter() {
+				w.u8(*v66)?;
 			}
 			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
@@ -3065,8 +3159,8 @@ pub mod writer {
 				return None;
 			}
 			w.u16(data.len() as u16)?;
-			for v65 in data.iter() {
-				w.u8(*v65)?;
+			for v67 in data.iter() {
+				w.u8(*v67)?;
 			}
 			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
@@ -3288,14 +3382,14 @@ pub mod volume_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v66) => {
+						Ok(v68) => {
 							w.u8(1)?;
-							w.set_handle(*v66)?;
+							w.set_handle(*v68)?;
 							w.u32(0)?;
 						}
-						Err(v67) => {
+						Err(v69) => {
 							w.u8(0)?;
-							v67.write(w)?;
+							v69.write(w)?;
 						}
 					}
 					Some(())
@@ -3907,13 +4001,13 @@ impl FsckReport {
 		out.push(',');
 		out.push_str("\"damaged\":");
 		out.push('[');
-		let mut v69 = true;
-		for v68 in self.damaged.iter() {
-			if !v69 {
+		let mut v71 = true;
+		for v70 in self.damaged.iter() {
+			if !v71 {
 				out.push(',');
 			}
-			v69 = false;
-			crate::codec::json_escape(v68, out);
+			v71 = false;
+			crate::codec::json_escape(v70, out);
 		}
 		out.push(']');
 		out.push('}');
@@ -3925,13 +4019,13 @@ impl FsckReport {
 		out.push_str(", ");
 		out.push_str("damaged=");
 		out.push('[');
-		let mut v71 = true;
-		for v70 in self.damaged.iter() {
-			if !v71 {
+		let mut v73 = true;
+		for v72 in self.damaged.iter() {
+			if !v73 {
 				out.push_str(", ");
 			}
-			v71 = false;
-			out.push_str(v70);
+			v73 = false;
+			out.push_str(v72);
 		}
 		out.push(']');
 		out.push('}');
@@ -3942,8 +4036,8 @@ impl FsckReport {
 		crate::codec::cbor::uint(out, self.checksum_failures as u64);
 		crate::codec::cbor::text(out, "damaged");
 		crate::codec::cbor::array(out, self.damaged.len());
-		for v72 in self.damaged.iter() {
-			crate::codec::cbor::text(out, v72);
+		for v74 in self.damaged.iter() {
+			crate::codec::cbor::text(out, v74);
 		}
 	}
 }

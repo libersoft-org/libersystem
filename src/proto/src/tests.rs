@@ -388,6 +388,12 @@ impl volume::Service for VolStub {
 		}
 	}
 
+	// A fixed handle, because what this stub is asked to prove is that a `handle<channel>` return
+	// survives the wire - not that anything is on the other end of it.
+	fn connect(&mut self) -> Result<u64, Error> {
+		Ok(0x0BAD_0003)
+	}
+
 	fn snap_create(&mut self, name: String) -> Result<(), Error> {
 		if name.is_empty() { Err(Error::Invalid) } else { Ok(()) }
 	}

@@ -176,6 +176,13 @@ fn a_state_mutating_builtin_is_refused_anywhere_its_effect_would_be_discarded() 
 	assert!(parse_pipeline(b"cdrom x | cat", &none).is_ok(), "`cdrom` is not `cd`");
 }
 
+// The words of an expansion, for the assertions that are about SHAPE rather than about `2>&1`.
+// The flag has its own test; folding it into every comparison would make five assertions restate
+// "and nothing merged its errors" and bury the one place where that is the point.
+fn words_of(expansion: &Expansion) -> Vec<Vec<Vec<u8>>> {
+	expansion.stages.iter().map(|stage| stage.words.clone()).collect()
+}
+
 #[test]
 fn a_redirection_expands_into_pipeline_stages() {
 	// THE WHOLE DESIGN, in one assertion. A redirection is not a property of a stage that something
@@ -183,19 +190,19 @@ fn a_redirection_expands_into_pipeline_stages() {
 	// in the middle receives one stream endpoint and no file capability at all.
 	let vars: Vec<(String, String)> = Vec::new();
 	let pipeline = parse_pipeline(b"cat < in.txt\n", &vars).expect("parses");
-	assert_eq!(expand_redirects(&pipeline).expect("expands"), alloc::vec![alloc::vec![b"redirect_in".to_vec(), b"in.txt".to_vec()], alloc::vec![b"cat".to_vec()]]);
+	assert_eq!(words_of(&expand_redirects(&pipeline).expect("expands")), alloc::vec![alloc::vec![b"redirect_in".to_vec(), b"in.txt".to_vec()], alloc::vec![b"cat".to_vec()]]);
 
 	let pipeline = parse_pipeline(b"cat > out.txt\n", &vars).expect("parses");
-	assert_eq!(expand_redirects(&pipeline).expect("expands"), alloc::vec![alloc::vec![b"cat".to_vec()], alloc::vec![b"redirect_out".to_vec(), b"out.txt".to_vec()]]);
+	assert_eq!(words_of(&expand_redirects(&pipeline).expect("expands")), alloc::vec![alloc::vec![b"cat".to_vec()], alloc::vec![b"redirect_out".to_vec(), b"out.txt".to_vec()]]);
 
 	// Append carries the flag rather than a second program: one destination, two modes.
 	let pipeline = parse_pipeline(b"cat >> out.txt\n", &vars).expect("parses");
-	assert_eq!(expand_redirects(&pipeline).expect("expands"), alloc::vec![alloc::vec![b"cat".to_vec()], alloc::vec![b"redirect_out".to_vec(), b"--append".to_vec(), b"out.txt".to_vec()]]);
+	assert_eq!(words_of(&expand_redirects(&pipeline).expect("expands")), alloc::vec![alloc::vec![b"cat".to_vec()], alloc::vec![b"redirect_out".to_vec(), b"--append".to_vec(), b"out.txt".to_vec()]]);
 
 	// Both ends of a real pipeline, which is the shape the milestone's own example uses.
 	let pipeline = parse_pipeline(b"cat < a.txt | grep hello > b.txt\n", &vars).expect("parses");
 	assert_eq!(
-		expand_redirects(&pipeline).expect("expands"),
+		words_of(&expand_redirects(&pipeline).expect("expands")),
 		alloc::vec![
 			alloc::vec![b"redirect_in".to_vec(), b"a.txt".to_vec()],
 			alloc::vec![b"cat".to_vec()],
@@ -207,7 +214,7 @@ fn a_redirection_expands_into_pipeline_stages() {
 	// A line with no redirection is its own stages, unchanged - so the expansion is on one path
 	// rather than a branch the ordinary case has to avoid.
 	let pipeline = parse_pipeline(b"cat a | grep b\n", &vars).expect("parses");
-	assert_eq!(expand_redirects(&pipeline).expect("expands"), alloc::vec![alloc::vec![b"cat".to_vec(), b"a".to_vec()], alloc::vec![b"grep".to_vec(), b"b".to_vec()]]);
+	assert_eq!(words_of(&expand_redirects(&pipeline).expect("expands")), alloc::vec![alloc::vec![b"cat".to_vec(), b"a".to_vec()], alloc::vec![b"grep".to_vec(), b"b".to_vec()]]);
 }
 
 #[test]
@@ -231,11 +238,45 @@ fn a_redirection_that_cannot_mean_what_it_looks_like_is_refused() {
 	let pipeline = parse_pipeline(b"a < x < y\n", &vars).expect("parses");
 	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::Duplicate));
 
-	// The error stream is not a position in the chain: a stage's stderr goes to the terminal
-	// BESIDE the pipe, so it needs an endpoint the pipeline transaction does not carry today.
-	// Refused by name rather than run with the part the user asked for silently dropped.
+	// `2> path` needs the stage's errors to reach a consumer that is NOT in the chain, beside the
+	// linear one - a second edge, where the transaction allocates one per `A | B` and no others.
+	// Refused by name rather than run with the part the user asked for silently dropped. Note this
+	// is NOT the same refusal as `2>&1`, which the next test shows working: one asks for an endpoint
+	// nobody has, the other asks for one the broker already holds.
 	let pipeline = parse_pipeline(b"a 2> f\n", &vars).expect("parses");
-	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::StderrUnsupported));
-	let pipeline = parse_pipeline(b"a 2>&1\n", &vars).expect("parses");
-	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::StderrUnsupported));
+	assert_eq!(expand_redirects(&pipeline), Err(RedirectError::StderrToPathUnsupported));
+}
+
+#[test]
+fn merging_the_error_stream_is_a_property_of_a_stage_and_not_a_stage_of_its_own() {
+	// `2>&1` DOES NOT EXPAND. Every other redirection becomes a program because it names a FILE,
+	// and a file needs authority somebody has to be granted; this one names the stage's own output,
+	// which is a handle the broker allocates inside the launch transaction. So it travels as a flag
+	// and adds nothing to the chain - and the shell could not expand it if it wanted to, because
+	// the shell never sees the edge.
+	let vars: Vec<(String, String)> = Vec::new();
+
+	let pipeline = parse_pipeline(b"a 2>&1 | b\n", &vars).expect("parses");
+	let expansion = expand_redirects(&pipeline).expect("expands");
+	assert_eq!(words_of(&expansion), alloc::vec![alloc::vec![b"a".to_vec()], alloc::vec![b"b".to_vec()]], "no stage is added");
+	assert_eq!(expansion.stages[0].merge_errors, true, "the stage that asked for it carries it");
+	assert_eq!(expansion.stages[1].merge_errors, false, "and no other stage does");
+
+	// THE FLAG LANDS ON THE STAGE THE USER WROTE IT ON, even when an input redirection has pushed
+	// every typed stage one place along. `redirect_in` is stage 0 of the expanded line and stage 0
+	// of what the user typed is `a`, and an off-by-one here would send `a`'s diagnostics nowhere
+	// and merge the ones from the redirection instead.
+	let pipeline = parse_pipeline(b"a < f 2>&1 | b\n", &vars).expect("parses");
+	let expansion = expand_redirects(&pipeline).expect("expands");
+	assert_eq!(words_of(&expansion)[0], alloc::vec![b"redirect_in".to_vec(), b"f".to_vec()]);
+	assert_eq!(expansion.stages.iter().map(|s| s.merge_errors).collect::<Vec<bool>>(), alloc::vec![false, true, false]);
+
+	// `cmd > file 2>&1`: the last stage's output IS the edge into `redirect_out`, so merging its
+	// errors into that edge puts both streams in the file. Nothing here special-cases the shape -
+	// it falls out of the flag meaning "wherever my output goes".
+	let pipeline = parse_pipeline(b"a 2>&1 > f\n", &vars).expect("parses");
+	let expansion = expand_redirects(&pipeline).expect("expands");
+	assert_eq!(words_of(&expansion), alloc::vec![alloc::vec![b"a".to_vec()], alloc::vec![b"redirect_out".to_vec(), b"f".to_vec()]]);
+	assert_eq!(expansion.stages[0].merge_errors, true);
+	assert_eq!(expansion.stages[1].merge_errors, false, "the writer's own diagnostics still reach the terminal - they are about the file");
 }

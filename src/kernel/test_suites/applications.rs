@@ -463,6 +463,78 @@ fn a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage(
 	assert!(result.redirect_read.windows(8).any(|window| window == b"Hello fr"), "the bytes are the file's, so a redirect_in that failed to open it cannot pass this: {:?}", core::str::from_utf8(&result.redirect_read));
 }
 
+// `2>&1` IS THE SAME PIPELINE WITH ONE FLAG, AND THE DIAGNOSTIC CHANGES SIDES.
+//
+// `a_failing_stage_reports_to_the_terminal_and_not_into_the_pipe` proves `cat ::not-a-path | readln`
+// keeps the error off the stream. This is that request byte for byte with `merge-errors` set on the
+// producer, and the assertion is the opposite one: the sentence now arrives at the consumer, behind
+// `readln`'s `in> ` prefix. A pair, because either half alone would pass with the routing stuck.
+//
+// THE FLAG EXISTS BECAUSE THE SHELL CANNOT NAME THE ANSWER. `2>&1` asks for "wherever my output
+// goes", and for a non-final stage that is an edge the broker allocates inside this transaction.
+// The shell has no handle to it and never will - so unlike `<` and `>`, which become programs
+// holding their own grant, this one has to be a request the broker interprets.
+tagged_test!(a_migrated_stream_tool_reads_a_pipeline_the_way_it_reads_a_path, [Service, Process, PermissionService], id = "kernel.applications.a_migrated_stream_tool_reads_a_pipeline_the_way_it_reads_a_path", covers = ["kernel", "services"]);
+fn a_migrated_stream_tool_reads_a_pipeline_the_way_it_reads_a_path() {
+	// `redirect_in motd.txt | wc`, where `wc` was given NO PATH AND NO VOLUME ARGUMENT.
+	//
+	// Before the migration that line was a usage error: every one of these tools refused when it
+	// got no path, because a path was the only input it had. What makes this pass is `Source`
+	// answering "stdin" when there is a stdin - and the only thing that tells it so is the presence
+	// of the endpoint, which is a capability the launch either carried or did not.
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	let counted: &[u8] = &result.stream_reads[2];
+	assert!(!counted.is_empty(), "the counting pipeline produced output at all");
+	// `motd.txt` is two lines, and `wc` prints the line count first. A `wc` that read nothing
+	// prints a leading zero and one that lost a window prints a one, so the digit is the assertion.
+	assert!(counted.starts_with(b"2 "), "wc counted the whole stream: {:?}", core::str::from_utf8(counted));
+}
+
+tagged_test!(a_consumer_that_stops_early_ends_the_pipeline_instead_of_hanging_it, [Service, Process, PermissionService], id = "kernel.applications.a_consumer_that_stops_early_ends_the_pipeline_instead_of_hanging_it", covers = ["kernel", "services"]);
+fn a_consumer_that_stops_early_ends_the_pipeline_instead_of_hanging_it() {
+	// `redirect_in motd.txt | head -n 1` - the broken-pipe case, and the thing it really pins is
+	// that the run ENDS. `head` takes its line and drops its source, which closes the read end;
+	// the producer discovers it at its next write and stops. Nothing in `head` asks for that - it
+	// falls out of owning the endpoint - and if it did not work the producer would sit blocked on
+	// a consumer that is gone and this scenario would never return.
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	let taken: &[u8] = &result.stream_reads[1];
+	assert!(taken.windows(5).any(|window| window == b"MOTD:"), "head printed the first line: {:?}", core::str::from_utf8(taken));
+	// AND NOT THE SECOND. A `head` that ignored its count would print the whole file, which on a
+	// two-line input is the difference between a limit that works and one that is never reached.
+	assert!(!taken.windows(5).any(|window| window == b"Files"), "head stopped at one line: {:?}", core::str::from_utf8(taken));
+}
+
+tagged_test!(a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream, [Service, Process, PermissionService], id = "kernel.applications.a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream", covers = ["kernel", "services"]);
+fn a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream() {
+	// `redirect_in motd.txt | tee teed.txt | wc` on a volume that is a READ-ONLY ARCHIVE.
+	//
+	// So the destination cannot be opened, which is exactly the case `tee` documents a decision
+	// for: a destination that fails is named on stderr and abandoned, and the stream the rest of
+	// the line is built on carries on. The alternative - a failed destination ending the pipeline -
+	// would mean `cmd | tee log | grep x` silently became a different command whenever the log
+	// could not be written.
+	//
+	// Three stages, so it is also the multi-stage transaction: two edges allocated in one request,
+	// and the middle stage both reading and writing.
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	let counted: &[u8] = &result.stream_reads[0];
+	// The destination really was refused - otherwise this test would be measuring the ordinary
+	// three-stage case and calling it the failure case. The diagnostic shares the channel because
+	// a stage's stderr is a duplicate of the caller's terminal, which is this test's channel.
+	assert!(counted.windows(23).any(|window| window == b"cannot open for writing"), "tee's destination was refused: {:?}", core::str::from_utf8(counted));
+	// AND THE STREAM STILL ARRIVED. `motd.txt` is two lines of 83 bytes, so this is the whole file
+	// through three stages with the middle one's destination unusable.
+	assert!(counted.windows(10).any(|window| window == b"2 13 83 83"), "the bytes reached the far end anyway: {:?}", core::str::from_utf8(counted));
+}
+
+tagged_test!(merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge, [Service, Process, PermissionService], id = "kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge", covers = ["kernel", "services"]);
+fn merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge() {
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	assert!(result.merged_read.windows(4).any(|window| window == b"in> "), "the consumer read something: `readln` only prints its prefix for a line it took off its input, got {:?}", core::str::from_utf8(&result.merged_read));
+	assert!(result.merged_read.windows(4).any(|window| window == b"cat:"), "and what it read is the PRODUCER'S DIAGNOSTIC, which without the flag goes to the terminal instead: {:?}", core::str::from_utf8(&result.merged_read));
+}
+
 tagged_test!(a_governed_pipeline_starts_as_one_transaction_and_carries_data, [Service, Process, PermissionService], id = "kernel.applications.a_governed_pipeline_starts_as_one_transaction_and_carries_data", covers = ["kernel", "services"]);
 fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	// `echo hello | readln` through PermissionManager: two stages, each authorized against

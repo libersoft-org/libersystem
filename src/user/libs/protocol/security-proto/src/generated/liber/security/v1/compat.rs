@@ -27,9 +27,9 @@ fn audit_entry_wire_is_stable() {
 }
 #[test]
 fn pipeline_stage_wire_is_stable() {
-	let sample = PipelineStage { name: String::from("x"), args: String::from("x") };
+	let sample = PipelineStage { name: String::from("x"), args: String::from("x"), merge_errors: true };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[1, 0, 120, 1, 0, 120];
+	let golden: &[u8] = &[1, 0, 120, 1, 0, 120, 1];
 	assert_eq!(bytes, golden);
 	assert_eq!(PipelineStage::decode(&bytes).unwrap(), sample);
 }

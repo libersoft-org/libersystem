@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use cli::{Arg, classify, parse_size};
 use proto::system::LaunchContext;
 use rt::*;
-use tools::{VolumeSet, split_args};
+use tools::{Source, VolumeSet, Window, split_args};
 
 const WINDOW: u32 = 16 * 1024;
 const PER_LINE: usize = 16;
@@ -67,18 +67,41 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 		}
-		let Some(argument) = path.filter(|_| expect.is_none()) else {
+		if expect.is_some() {
 			eprint(b"hexdump: usage: hexdump [-s skip] [-n length] <path>\n");
 			exit();
+		}
+		// NO PATH MEANS STDIN. `-s` still means "start this many bytes in", which on a stream is
+		// bytes read and thrown away rather than a seek - see `Source::skip`. The OFFSET COLUMN
+		// still counts from the skip, because it is an offset into the input and not into whatever
+		// part of it this run happened to read.
+		let (mut source, label): (Source, Vec<u8>) = match path {
+			Some(argument) => {
+				let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+					eprint(b"hexdump: invalid path\n");
+					exit();
+				};
+				let storage: u64 = volumes.client_for(&cwd, argument);
+				if storage == 0 {
+					eprint(b"hexdump: cannot read ");
+					eprint(uri.as_bytes());
+					eprint(b"\n");
+					exit();
+				}
+				let bytes: Vec<u8> = uri.as_bytes().to_vec();
+				(Source::from_path(storage, &uri, WINDOW), bytes)
+			}
+			None => match Source::from_stdin() {
+				Some(source) => (source, b"-".to_vec()),
+				None => {
+					eprint(b"hexdump: usage: hexdump [-s skip] [-n length] <path>\n");
+					exit();
+				}
+			},
 		};
-		let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-			eprint(b"hexdump: invalid path\n");
-			exit();
-		};
-		let storage: u64 = volumes.client_for(&cwd, argument);
-		if storage == 0 || !dump(storage, &uri, skip, length) {
+		if !dump(&mut source, skip, length) {
 			eprint(b"hexdump: cannot read ");
-			eprint(uri.as_bytes());
+			eprint(&label);
 			eprint(b"\n");
 		}
 	}
@@ -95,9 +118,13 @@ fn size_or_die(value: &[u8]) -> u64 {
 	}
 }
 
-unsafe fn dump(storage: u64, path: &str, skip: u64, length: Option<u64>) -> bool {
+unsafe fn dump(source: &mut Source, skip: u64, length: Option<u64>) -> bool {
 	unsafe {
-		let mut offset: u64 = skip;
+		if !source.skip(skip) {
+			// Nothing to dump is not a failure: a file shorter than the skip is an empty answer,
+			// which is what `hexdump -s` past the end has always printed.
+			return true;
+		}
 		let mut left: u64 = length.unwrap_or(u64::MAX);
 		// One line's worth carried between windows, so a window boundary does not break the
 		// sixteen-byte rows - a dump whose row width depended on the chunking would not line up
@@ -107,14 +134,16 @@ unsafe fn dump(storage: u64, path: &str, skip: u64, length: Option<u64>) -> bool
 		let mut previous: Vec<u8> = Vec::new();
 		let mut folding = false;
 		while left > 0 {
-			let want: u32 = core::cmp::min(left, WINDOW as u64).min(WINDOW as u64) as u32;
-			let Ok(window) = tools::read_volume_window(storage, path, offset, want) else { return false };
-			if window.is_empty() {
-				break;
-			}
-			offset = offset.saturating_add(window.len() as u64);
-			left = left.saturating_sub(window.len() as u64);
-			for &byte in &window {
+			let window = match source.next() {
+				Window::Bytes(bytes) => bytes,
+				Window::End => break,
+				Window::Failed => return false,
+			};
+			// A WINDOW CAN NOW OVERSHOOT `-n`, because a stream window is whatever the producer
+			// sent rather than a size this asked for. Cut here, on the bytes in hand.
+			let take: usize = core::cmp::min(left, window.len() as u64) as usize;
+			left = left.saturating_sub(take as u64);
+			for &byte in &window[..take] {
 				if row.try_reserve(1).is_err() {
 					eprint(b"hexdump: out of memory\n");
 					return false;

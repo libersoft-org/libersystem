@@ -19,7 +19,7 @@ use proto::codec::JsonMode;
 use proto::system::{Component, EnvVar, Error, JobEntry, JobInfo, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
-use services::shell_language::{Pipeline, RedirectError, expand_redirects, parse_and_expand, parse_assignment, parse_pipeline, trim};
+use services::shell_language::{ExpandedStage, Expansion, RedirectError, expand_redirects, parse_and_expand, parse_assignment, parse_pipeline, trim};
 use storage_proto::path;
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
@@ -286,9 +286,15 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			// So "does this need the broker" is a question about the EXPANDED line: a single command
 			// with a redirection needs it, and a single command without one still takes today's
 			// path, where the builtins live.
-			let expanded: Option<Result<Vec<Vec<Vec<u8>>>, RedirectError>> = pipeline.as_ref().ok().map(expand_redirects);
+			let expanded: Option<Result<Expansion, RedirectError>> = pipeline.as_ref().ok().map(expand_redirects);
 			let needs_broker: bool = match &expanded {
-				Some(Ok(stages)) => stages.len() > 1,
+				// `2>&1` ON A LINE OF ONE STAGE IS NOT A REASON TO GO THROUGH THE BROKER. It asks
+				// for the diagnostics to follow the output, and on a bare command the output IS the
+				// terminal that the diagnostics already go to - so honouring it means doing nothing,
+				// and routing the line through a launch service to do nothing would be worse than
+				// the no-op. On every other shape the stage's output is an edge, which is exactly
+				// when the flag has something to say and exactly when this is already true.
+				Some(Ok(expansion)) => expansion.stages.len() > 1,
 				// A line whose redirections cannot be expanded is reported below rather than run.
 				Some(Err(_)) => true,
 				None => false,
@@ -296,9 +302,9 @@ unsafe fn repl(console: u64, control: u64, storage: u64, media: u64, iso: u64, u
 			if needs_broker {
 				match expanded.expect("checked by needs_broker") {
 					Err(reason) => print(redirect_refusal(&reason)),
-					Ok(stages) => {
+					Ok(expansion) => {
 						let parsed = pipeline.as_ref().expect("checked by needs_broker");
-						if !run_pipeline_line(&mut jobs, permsvc, &stages, parsed.background, cwd.as_bytes(), &vars) {
+						if !run_pipeline_line(&mut jobs, permsvc, &expansion.stages, parsed.background, cwd.as_bytes(), &vars) {
 							print(b"shell: pipeline could not be started\n");
 						}
 					}
@@ -1462,11 +1468,11 @@ fn redirect_refusal(reason: &RedirectError) -> &'static [u8] {
 		RedirectError::InputNotFirst => b"shell: `< path` belongs to the first command of a pipeline; a later stage already has a producer\n",
 		RedirectError::OutputNotLast => b"shell: `> path` belongs to the last command of a pipeline; redirecting an earlier one leaves the rest with no input\n",
 		RedirectError::Duplicate => b"shell: one input and one output per line - two destinations for one stream is not something to pick between\n",
-		RedirectError::StderrUnsupported => b"shell: `2>` and `2>&1` are not wired yet; the error stream is not a position in the pipeline and needs its own endpoint\n",
+		RedirectError::StderrToPathUnsupported => b"shell: `2> path` needs the errors to reach a second consumer beside the pipeline, which the launch transaction does not carry; `2>&1` works, and `cmd > file 2>&1` puts both streams in the file\n",
 	}
 }
 
-unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[Vec<Vec<u8>>], background: bool, cwd: &[u8], vars: &[(String, String)]) -> bool {
+unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[ExpandedStage], background: bool, cwd: &[u8], vars: &[(String, String)]) -> bool {
 	unsafe {
 		let cwd_str: &str = match core::str::from_utf8(cwd) {
 			Ok(s) => s,
@@ -1474,7 +1480,7 @@ unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[Vec<Vec<u8>>
 		};
 		let mut stages: Vec<PipelineStage> = Vec::new();
 		for stage in words {
-			let Some(first) = stage.first() else { return false };
+			let Some(first) = stage.words.first() else { return false };
 			let name: &str = match core::str::from_utf8(first) {
 				Ok(s) => s,
 				Err(_) => return false,
@@ -1483,7 +1489,7 @@ unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[Vec<Vec<u8>>
 			// contract passes. A redirection is already one of these stages by the time this runs -
 			// `redirect_in` and `redirect_out` carry their path as an ordinary argument.
 			let mut args: Vec<u8> = Vec::new();
-			for word in stage.iter().skip(1) {
+			for word in stage.words.iter().skip(1) {
 				if !args.is_empty() {
 					args.push(b' ');
 				}
@@ -1493,51 +1499,72 @@ unsafe fn run_pipeline_line(jobs: &mut Jobs, permsvc: u64, words: &[Vec<Vec<u8>>
 				Ok(s) => s,
 				Err(_) => return false,
 			};
-			stages.push(PipelineStage { name: String::from(name), args: args_str });
+			// `merge_errors` TRAVELS AS A FLAG AND NOT AS AN ENDPOINT. The shell cannot hand the
+			// stage its own output channel because the shell does not have one: the broker allocates
+			// every edge inside the launch transaction, so which handle "wherever the output goes"
+			// names is knowable only there. The flag says what the user asked for; the broker
+			// decides which handle answers it.
+			stages.push(PipelineStage { name: String::from(name), args: args_str, merge_errors: stage.merge_errors });
 		}
-		let (out_read, out_write): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
+		// THE LAST STAGE WRITES TO THE TERMINAL ITSELF, and this used to be a relay: a channel
+		// pair, with the shell parked in a receive loop copying the far end onto its console until
+		// the pipe closed.
+		//
+		// The relay is what made a foreground pipeline UNINTERRUPTIBLE. A shell blocked in
+		// `recv_blocking` is not waiting on the job, so it cannot be handed to the tty as the
+		// foreground one, and Ctrl+C reached nobody - which is this milestone's "terminal interrupt
+		// targets the whole ProcessGroup", not implemented and not visibly missing, because a
+		// pipeline that finishes quickly never gives anybody a chance to press it. Ctrl+Z was worse
+		// than missing: with a relay in the middle there is no honest way to suspend, since resuming
+		// the job would need the relay resumed too, and the shell has gone back to its prompt.
+		//
+		// Handing the stage the console removes the question. There is nothing in the middle to
+		// suspend, the shell waits on the GROUP handle exactly as it waits on a single job's
+		// process handle, and interrupt, quit, suspend, `fg` and `bg` are the code that already
+		// exists rather than a second copy of it for pipelines.
+		//
+		// SEND-ONLY, unlike `run_tool_interactive`'s full-duplex dup. A pipeline stage has no
+		// business reading the keyboard: the shell is still reading the console, and a stage that
+		// could take from that queue would eat the next line the user typed.
+		let console: u64 = stdout();
+		if console == 0 {
+			return false;
+		}
+		let out_write: i64 = duplicate(console, RIGHT_SEND | RIGHT_WAIT | RIGHT_TRANSFER);
+		if out_write < 0 {
+			return false;
+		}
+		let out_write: u64 = out_write as u64;
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
 		let group: u64 = match client.run_pipeline(&stages, cwd_str, &environment_snapshot(vars), &out_write) {
 			Some(Ok(result)) => result.group,
-			_ => {
-				close(out_read);
-				return false;
-			}
+			// The broker closes the handle it was given on every refusal, so there is nothing to
+			// clean up here - the transaction either took it or ended it.
+			_ => return false,
 		};
+		let mut label: Vec<u8> = Vec::new();
+		for (index, stage) in words.iter().enumerate() {
+			if index > 0 {
+				label.extend_from_slice(b" | ");
+			}
+			if let Some(first) = stage.words.first() {
+				label.extend_from_slice(first);
+			}
+		}
 		if background {
 			// A background pipeline becomes ONE job over its group, so `jobs`, `fg` and
-			// completion reaping treat it exactly like a background command. The relay is
-			// skipped: nothing is waiting on its output at the prompt.
-			let mut label: Vec<u8> = Vec::new();
-			for (index, stage) in words.iter().enumerate() {
-				if index > 0 {
-					label.extend_from_slice(b" | ");
-				}
-				if let Some(first) = stage.first() {
-					label.extend_from_slice(first);
-				}
-			}
+			// completion reaping treat it exactly like a background command.
 			if jobs.register_group(group, &label, false).is_none() {
 				close(group);
 			}
-			close(out_read);
 			return true;
 		}
-		// Relay until the last stage exits and its end closes. Earlier stages write into their
-		// edges, which the broker never holds a copy of, so each closes when its writer exits
-		// and its reader sees end-of-stream rather than hanging.
-		let mut obuf: [u8; 4096] = [0u8; 4096];
-		loop {
-			match recv_blocking(out_read, &mut obuf) {
-				Received::Message { len, .. } => print(&obuf[..len]),
-				Received::Closed => break,
-			}
-		}
-		close(out_read);
-		close(group);
+		// AND A FOREGROUND ONE IS ONE JOB TOO, over the same handle. `run_foreground_tracked` hands
+		// the tty a MANAGE dup so the signal keys reach it, waits for the group to terminate, and
+		// on a Ctrl+Z hands it back as a stopped background job. None of that is pipeline-specific:
+		// a ProcessGroup is waitable and - since the signal syscall learned to take one - signalable
+		// exactly where a Process was.
+		jobs.run_foreground_tracked(Job { proc: group, name: label });
 		true
 	}
 }

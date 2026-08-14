@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use cli::{Arg, LastLines, classify, parse_u64};
 use proto::system::{LaunchContext, volume};
 use rt::*;
-use tools::{VolumeSet, split_args};
+use tools::{Source, VolumeSet, Window, split_args};
 use volume_client::VolumeClient;
 
 const WINDOW: u32 = 16 * 1024;
@@ -75,20 +75,43 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 			}
 		}
-		let Some(argument) = path.filter(|_| !expect) else {
+		if expect {
 			eprint(b"tail: usage: tail [-n lines] [-f] <path>\n");
 			exit();
-		};
-		let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
-			eprint(b"tail: invalid path\n");
-			exit();
-		};
-		let storage: u64 = volumes.client_for(&cwd, argument);
-		if storage == 0 {
-			eprint(b"tail: no volume\n");
-			exit();
 		}
-		let Some(end) = tail(storage, &uri, lines) else {
+		// NO PATH MEANS STDIN, and `tail` needs no restructuring for it: it already finds the last
+		// lines by scanning FORWARD through a ring rather than by seeking to the end, so the same
+		// loop works on an input it cannot seek at all.
+		//
+		// `-f` IS REFUSED BY NAME ON A STREAM, not ignored. Following means asking the volume to
+		// say when the file changed; a pipe has no such thing - it ends, and the end is the end.
+		// A `tail -f` that silently behaved as `tail` would look like it was watching.
+		let (mut source, storage, uri): (Source, u64, String) = match path {
+			Some(argument) => {
+				let Some(uri) = storage_proto::path::resolve(&cwd, argument) else {
+					eprint(b"tail: invalid path\n");
+					exit();
+				};
+				let storage: u64 = volumes.client_for(&cwd, argument);
+				if storage == 0 {
+					eprint(b"tail: no volume\n");
+					exit();
+				}
+				(Source::from_path(storage, &uri, WINDOW), storage, uri)
+			}
+			None => {
+				let Some(source) = Source::from_stdin() else {
+					eprint(b"tail: usage: tail [-n lines] [-f] <path>\n");
+					exit();
+				};
+				if follow {
+					eprint(b"tail: -f needs a file to watch; a pipe ends rather than growing\n");
+					exit();
+				}
+				(source, 0, String::new())
+			}
+		};
+		let Some(end) = tail(&mut source, lines) else {
 			eprint(b"tail: cannot read ");
 			eprint(uri.as_bytes());
 			eprint(b"\n");
@@ -103,16 +126,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 // Print the last `lines` lines and return the offset the file ended at, which is where a follow
 // resumes.
-unsafe fn tail(storage: u64, path: &str, lines: u64) -> Option<u64> {
+unsafe fn tail(source: &mut Source, lines: u64) -> Option<u64> {
 	unsafe {
 		let mut ring = LastLines::new(usize::try_from(lines).ok()?);
 		let mut offset: u64 = 0;
 		let mut partial: Vec<u8> = Vec::new();
 		loop {
-			let window = tools::read_volume_window(storage, path, offset, WINDOW).ok()?;
-			if window.is_empty() {
-				break;
-			}
+			let window = match source.next() {
+				Window::Bytes(bytes) => bytes,
+				Window::End => break,
+				Window::Failed => return None,
+			};
 			offset = offset.saturating_add(window.len() as u64);
 			for &byte in &window {
 				if byte == b'\n' {
@@ -136,8 +160,9 @@ unsafe fn tail(storage: u64, path: &str, lines: u64) -> Option<u64> {
 			return None;
 		}
 		for line in ring.lines() {
-			print(line);
-			print(b"\n");
+			if !write_stdout(line) || !write_stdout(b"\n") {
+				break;
+			}
 		}
 		Some(offset)
 	}

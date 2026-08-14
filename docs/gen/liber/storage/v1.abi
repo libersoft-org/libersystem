@@ -34,6 +34,7 @@ method volume.touch op=20 (path:string:rights=,create:bool:rights=,at:u64:rights
 method volume.read op=21 (path:string:rights=,offset:u64:rights=,length:u32:rights=) -> result<buffer, liber:base@1::error>
 method volume.watch op=22 (path:string:rights=) -> result<stream<file-event>, liber:base@1::error>
 method volume.open-writer op=23 (path:string:rights=,mode:writer-mode:rights=) -> result<handle<channel>, liber:base@1::error>
+method volume.connect op=24 () -> result<handle<channel>, liber:base@1::error>
 interface writer
 method writer.write op=1 (data:list<u8>:rights=) -> result<u64, liber:base@1::error>
 method writer.write-at op=2 (offset:u64:rights=,data:list<u8>:rights=) -> result<unit, liber:base@1::error>

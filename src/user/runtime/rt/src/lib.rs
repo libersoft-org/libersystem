@@ -311,6 +311,29 @@ pub unsafe fn print(bytes: &[u8]) {
 	}
 }
 
+// `print` for a program that has to KNOW whether anybody took the bytes.
+//
+// `print` is fire-and-forget by design: when the stdout channel refuses, it falls back to the
+// debug port so a diagnostic still reaches a human. That is right for a terminal launch and wrong
+// for a PIPELINE STAGE, where a refused send means the consumer exited and the honest response is
+// to stop producing - not to redirect the rest of a large stream at the serial console, which
+// takes as long as the whole job and produces nothing anybody asked for.
+//
+// So this is the same write with the fallback removed and the answer returned: `false` means the
+// far end is gone. A program with no stdout channel at all still gets the debug port, because
+// there "nobody is reading" is not something that happened, it is how the program was launched.
+#[unsafe(no_mangle)]
+pub unsafe fn write_stdout(bytes: &[u8]) -> bool {
+	unsafe {
+		let out: u64 = STDOUT.load(Ordering::Relaxed);
+		if out == 0 {
+			print(bytes);
+			return true;
+		}
+		send_blocking(out, bytes, 0)
+	}
+}
+
 // Write bytes to the kernel debug/serial port, returning how many the kernel's
 // transmit ring accepted (one syscall, no chunk loop). A caller draining a backlog -
 // the console's serial mirror - consumes exactly that many and retries the rest on a

@@ -437,6 +437,15 @@ destination = "libexec/redirect_out.lsexe"
 providers = ["base-proto", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
+name = "tee"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/tee.lsexe"
+providers = ["base-proto", "cli", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
 name = "component_host"
 owner = "services"
 role = "helper"
