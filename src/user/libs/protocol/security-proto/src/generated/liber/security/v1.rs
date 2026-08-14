@@ -42,6 +42,18 @@ pub enum Capability {
 	/// one. It does NOT carry the session's Process handles - `job-signal` acts on the session's
 	/// behalf precisely so a tool granted this cannot take them.
 	Session = 19,
+	/// A storage client CONFINED TO THE COMPONENT'S OWN ASSET DIRECTORY, and to nothing else.
+	///
+	/// An application that ships data beside itself - LiberCommander's syntax descriptors are the
+	/// first - needs to read that data and nothing more. Granting `volumes` would hand it every
+	/// file on every mounted volume in order to colour some keywords, which is the shape of
+	/// over-granting that a capability system exists to make unnecessary: the authority to read one
+	/// directory is expressible, so it should be expressed.
+	///
+	/// The client is minted per launch through `volume-admin.open-directory`, so it carries the
+	/// directory as its SCOPE rather than as a convention the holder is trusted to respect: a path
+	/// outside it is refused by the service, and the client cannot mint a broader one.
+	AppAssets = 20,
 }
 
 impl Capability {
@@ -106,6 +118,7 @@ impl Capability {
 			17 => Some(Capability::InputKeys),
 			18 => Some(Capability::AudioStream),
 			19 => Some(Capability::Session),
+			20 => Some(Capability::AppAssets),
 			_ => None,
 		}
 	}
@@ -899,6 +912,7 @@ impl Capability {
 			Capability::InputKeys => out.push_str("\"input-keys\""),
 			Capability::AudioStream => out.push_str("\"audio-stream\""),
 			Capability::Session => out.push_str("\"session\""),
+			Capability::AppAssets => out.push_str("\"app-assets\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -923,6 +937,7 @@ impl Capability {
 			Capability::InputKeys => out.push_str("input-keys"),
 			Capability::AudioStream => out.push_str("audio-stream"),
 			Capability::Session => out.push_str("session"),
+			Capability::AppAssets => out.push_str("app-assets"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -947,6 +962,7 @@ impl Capability {
 			Capability::InputKeys => crate::codec::cbor::text(out, "input-keys"),
 			Capability::AudioStream => crate::codec::cbor::text(out, "audio-stream"),
 			Capability::Session => crate::codec::cbor::text(out, "session"),
+			Capability::AppAssets => crate::codec::cbor::text(out, "app-assets"),
 		}
 	}
 }

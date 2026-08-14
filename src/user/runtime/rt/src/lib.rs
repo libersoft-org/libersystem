@@ -1369,6 +1369,12 @@ pub const CAP_INPUT_ADMIN: &[u8] = b"INPUT_ADMIN";
 pub const CAP_AUDIO_ADMIN: &[u8] = b"AUDIO_ADMIN";
 pub const CAP_PROCESS_GRANT: &[u8] = b"PROCESS_GRANT";
 pub const CAP_SUPERVISOR: &[u8] = b"SUPERVISOR";
+// The private StorageService admin endpoint, which mints a client confined to one system-volume
+// directory. Held by the supervisor and by PermissionManager, and granted to NOBODY: the thing
+// that hands out a narrowed authority must not itself be one of the things handed out.
+pub const CAP_STORAGE_ADMIN: &[u8] = b"STORAGE_ADMIN";
+// A component's own asset directory, minted per launch from the endpoint above.
+pub const CAP_APP_ASSETS: &[u8] = b"APP_ASSETS";
 pub const CAP_STORAGE_MEDIA: &[u8] = b"STORAGE_MEDIA";
 pub const CAP_STORAGE_ISO: &[u8] = b"STORAGE_ISO";
 pub const CAP_STORAGE_UDF: &[u8] = b"STORAGE_UDF";

@@ -11,8 +11,9 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
-use lico::{FileType, InputDecoder, InputEvent, Key, MouseTracking, TerminalGuard, TerminalOptions, TerminalWriter, append_display_line, detect_file_type};
+use lico::{FileType, InputDecoder, InputEvent, Key, MAX_DESCRIPTOR_BYTES, MouseTracking, SyntaxDescriptor, TerminalGuard, TerminalOptions, TerminalWriter, append_display_line, detect_file_type, parse_descriptor};
 use proto::system::LaunchContext;
 use rt::*;
 use storage_proto::path;
@@ -41,6 +42,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		let arg: Vec<u8> = context.arguments.clone().into_bytes();
 		let volumes = VolumeSet::receive(bootstrap, &mut buf);
+		// THIS APPLICATION'S OWN ASSET DIRECTORY, and nothing else on the volume.
+		//
+		// The syntax descriptors live under `bin/lico/`, the bundle LiberCommander's three programs
+		// share, and reading them
+		// through the volume bundle above would mean the viewer had every file on every mounted
+		// volume in order to colour some keywords. This client is minted by PermissionManager from
+		// the private admin endpoint and carries the directory as its SCOPE: a path outside it is
+		// refused by StorageService, and the client cannot mint a broader one.
+		//
+		// Absent on a boot that grants no assets, which is a viewer that highlights nothing rather
+		// than a viewer that fails - see `load_descriptors`.
+		let assets: u64 = recv_tagged(bootstrap, &mut buf, CAP_APP_ASSETS).unwrap_or(0);
+		let descriptors: Vec<SyntaxDescriptor> = load_descriptors(assets);
 		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
 		let arg = trim(&arg);
@@ -82,6 +96,41 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 	exit();
+}
+
+// Read every descriptor in the granted asset directory.
+//
+// A MISSING OR BAD DESCRIPTOR FALLS BACK TO PLAIN TEXT AND CANNOT PREVENT OPENING THE FILE, which
+// is this milestone's rule and is why every failure here is a `continue`: no assets granted, a
+// directory that will not list, a file that will not read, a descriptor that does not parse. The
+// viewer's job is to show the file.
+unsafe fn load_descriptors(assets: u64) -> Vec<SyntaxDescriptor> {
+	let mut loaded: Vec<SyntaxDescriptor> = Vec::new();
+	if assets == 0 {
+		return loaded;
+	}
+	unsafe {
+		let Ok(entries) = tools::list_volume_directory(assets, "vol://system/bin/lico/syntax", 64) else {
+			return loaded;
+		};
+		for entry in &entries {
+			if !entry.name.as_bytes().ends_with(b".syntax") {
+				continue;
+			}
+			let mut path = String::from("vol://system/bin/lico/syntax/");
+			path.push_str(&entry.name);
+			let Ok(bytes) = tools::read_volume_window(assets, &path, 0, MAX_DESCRIPTOR_BYTES as u32) else {
+				continue;
+			};
+			if let Ok(descriptor) = parse_descriptor(&bytes) {
+				if loaded.try_reserve(1).is_err() {
+					return loaded;
+				}
+				loaded.push(descriptor);
+			}
+		}
+	}
+	loaded
 }
 
 unsafe fn view_file(output: &mut impl TerminalWriter, bytes: &[u8], name: &[u8]) -> bool {

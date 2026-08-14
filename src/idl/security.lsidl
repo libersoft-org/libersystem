@@ -33,6 +33,18 @@ enum capability {
 	/// one. It does NOT carry the session's Process handles - `job-signal` acts on the session's
 	/// behalf precisely so a tool granted this cannot take them.
 	session,
+	/// A storage client CONFINED TO THE COMPONENT'S OWN ASSET DIRECTORY, and to nothing else.
+	///
+	/// An application that ships data beside itself - LiberCommander's syntax descriptors are the
+	/// first - needs to read that data and nothing more. Granting `volumes` would hand it every
+	/// file on every mounted volume in order to colour some keywords, which is the shape of
+	/// over-granting that a capability system exists to make unnecessary: the authority to read one
+	/// directory is expressible, so it should be expressed.
+	///
+	/// The client is minted per launch through `volume-admin.open-directory`, so it carries the
+	/// directory as its SCOPE rather than as a convention the holder is trusted to respect: a path
+	/// outside it is refused by the service, and the client cannot mint a broader one.
+	app-assets,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the

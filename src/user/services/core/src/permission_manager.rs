@@ -52,7 +52,7 @@ use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::network;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, StartResult, process, volume};
+use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, StartResult, process, volume, volume_admin};
 use rt::*;
 use services::executable;
 
@@ -107,7 +107,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
 // over nothing).
-const VOCABULARY: [Capability; 19] = [
+const VOCABULARY: [Capability; 20] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -127,6 +127,7 @@ const VOCABULARY: [Capability; 19] = [
 	Capability::Display,
 	Capability::InputKeys,
 	Capability::AudioStream,
+	Capability::AppAssets,
 ];
 
 // A store row where the policy allows everything the component requests - the
@@ -203,9 +204,9 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
 		b"imgview" => Some(granted("imgview", alloc::vec![Capability::Volumes, Capability::Display, Capability::InputKeys])),
-		b"licoview" => Some(granted("licoview", alloc::vec![Capability::Volumes])),
-		b"licoedit" => Some(granted("licoedit", alloc::vec![Capability::Volumes])),
-		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes])),
+		b"licoview" => Some(granted("licoview", alloc::vec![Capability::Volumes, Capability::AppAssets])),
+		b"licoedit" => Some(granted("licoedit", alloc::vec![Capability::Volumes, Capability::AppAssets])),
+		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets])),
 		b"imgconv" => Some(granted("imgconv", alloc::vec![Capability::Volumes])),
 		b"play" => Some(granted("play", alloc::vec![Capability::Volumes, Capability::AudioStream])),
 		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
@@ -302,6 +303,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::InputKeys => b"INPUT_KEYS",
 		Capability::AudioStream => b"AUDIO_STREAM",
 		Capability::Session => b"SESSION",
+		Capability::AppAssets => b"APP_ASSETS",
 	}
 }
 
@@ -320,6 +322,11 @@ struct Clients {
 	process: u64,
 	permission: u64,
 	supervisor: u64,
+	// The PRIVATE StorageService admin endpoint, which mints a client confined to one directory
+	// below the system volume. The manager keeps it and never grants it: an ordinary volume client
+	// cannot mint a broader scope, and this one can, which is exactly the difference between the
+	// thing that hands out authority and the authority itself.
+	storage_admin: u64,
 	// The broker (bootstrap) channel the re-resolvable capabilities are re-resolved
 	// over when their held client dies: config and device restart transparently
 	// (ServiceManager relaunches them and answers a RESOLVE with a connection to the
@@ -375,6 +382,9 @@ impl Clients {
 			// bundle of five channels by `grant_volumes`, never through this single-channel path.
 			// The system volume stands in here for the (headless-denied) dynamic-request path.
 			Capability::Volumes => self.storage,
+			// Minted per launch rather than held, so `for_capability` has nothing to answer with.
+			// See `grant_handle`.
+			Capability::AppAssets => 0,
 		}
 	}
 }
@@ -382,7 +392,7 @@ impl Clients {
 // Mint a launch-scoped capability. Display binding consumes a duplicate of the exact
 // task ProcessService just returned and atomically returns its associated connection;
 // input/audio admins mint connections narrowed to their advertised operation subset.
-unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64) -> u64 {
+unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, component: &str) -> u64 {
 	unsafe {
 		match cap {
 			Capability::Display => {
@@ -419,8 +429,26 @@ unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64) -> u
 					_ => 0,
 				}
 			}
-			_ => grant_handle(clients, cap),
+			_ => grant_handle(clients, cap, component),
 		}
+	}
+}
+
+// Which asset directory under `bin/` a component reads its own data from.
+//
+// USUALLY ITS OWN NAME, and the exception is a FAMILY that ships one bundle between its members.
+// LiberCommander is three programs - the manager, the editor and the viewer - over one set of
+// syntax descriptors, and installing three copies would be three things to keep in step for no
+// gain. They share `bin/lico`, which is where the descriptors are installed and what this milestone
+// calls the asset bundle.
+//
+// A FUNCTION AND NOT A MANIFEST FIELD. A path beside the grant would be a place to write the wrong
+// one, and "which files may this program read" is not something a policy table should be able to
+// get subtly wrong - it should be answerable from the program's identity alone.
+fn asset_bundle(component: &str) -> &str {
+	match component {
+		"lico" | "licoedit" | "licoview" => "lico",
+		other => other,
 	}
 }
 
@@ -432,8 +460,29 @@ unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64) -> u
 // Returns 0 when no live client can be produced. (A re-resolving grant assumes the
 // broker peer answers RESOLVE - ServiceManager does; a scenario that grants config or
 // device must stand in for the broker or keep the service alive.)
-unsafe fn grant_handle(clients: &mut Clients, cap: Capability) -> u64 {
+unsafe fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) -> u64 {
 	unsafe {
+		// A LAUNCH-SCOPED, DIRECTORY-CONFINED CLIENT, minted fresh for every launch.
+		//
+		// The scope is DERIVED FROM WHO IS BEING LAUNCHED rather than written in the manifest beside
+		// the grant, so a component cannot be given somebody else's assets by a typo: `asset_bundle`
+		// is a function, and the manifest says only whether the capability is granted at all.
+		// Minting per launch also means the grant dies with the process rather than being a handle
+		// the manager keeps and hands out repeatedly.
+		if cap == Capability::AppAssets {
+			if clients.storage_admin == 0 {
+				return 0;
+			}
+			let mut path = String::from("vol://system/bin/");
+			path.push_str(asset_bundle(component));
+			let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_directory(&path) {
+				Some(Ok(client)) => client,
+				_ => return 0,
+			};
+			let dup = duplicate(minted, GRANT_RIGHTS);
+			close(minted);
+			return if dup >= 0 { dup as u64 } else { 0 };
+		}
 		if cap == Capability::Network {
 			let mut client = network::Client::new(ChannelTransport { chan: clients.network });
 			let minted = match client.open() {
@@ -648,7 +697,7 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 		for &cap in VOCABULARY.iter() {
 			let granted: bool = manifest.grants.contains(&cap);
 			if granted {
-				let handle: u64 = grant_for_task(clients, cap, task);
+				let handle: u64 = grant_for_task(clients, cap, task, &policy_name);
 				if handle == 0 || !send_blocking(manager_side, tag_for(cap), handle) {
 					close(manager_side);
 					close(task);
@@ -699,7 +748,7 @@ unsafe fn launch_under_manifest(procsvc: u64, component: &[u8], clients: &mut Cl
 unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients, manager_side: u64) -> bool {
 	unsafe {
 		if dynamic_policy(component, cap) {
-			let handle: u64 = grant_handle(clients, cap);
+			let handle: u64 = grant_handle(clients, cap, &String::from_utf8_lossy(component));
 			if handle != 0 && send_blocking(manager_side, tag_for(cap), handle) {
 				return true;
 			}
@@ -770,7 +819,7 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 				let ok: bool = if cap == Capability::Volumes {
 					grant_volumes(manager_side, clients)
 				} else {
-					let handle: u64 = grant_for_task(clients, cap, started.task);
+					let handle: u64 = grant_for_task(clients, cap, started.task, &policy_name);
 					handle != 0 && send_blocking(manager_side, tag_for(cap), handle)
 				};
 				if !ok {
@@ -885,7 +934,7 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 					let ok: bool = if cap == Capability::Volumes {
 						grant_volumes(manager_side, clients)
 					} else {
-						let handle: u64 = grant_for_task(clients, cap, started.task);
+						let handle: u64 = grant_for_task(clients, cap, started.task, &policy_name);
 						handle != 0 && send_blocking(manager_side, tag_for(cap), handle)
 					};
 					if !ok {
@@ -1145,6 +1194,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// the manager holds but never drives itself - it only duplicates a narrowed copy onto the
 	// sandboxed `stop` tool, which speaks the bare request/reply teardown protocol over it.
 	let supervisor: u64 = caps.take(CAP_SUPERVISOR);
+	// The admin endpoint scoped grants are minted from. Absent on a minimal boot, which makes
+	// `app-assets` a capability the manager records as denied rather than one it cannot describe.
+	let storage_admin: u64 = caps.take(CAP_STORAGE_ADMIN);
 	// The three non-system volume StorageService clients the supervisor connects for the
 	// manager, bundled with the system `storage` client under the `volumes` capability the
 	// governed `lsvol` command is granted: media (FAT/exFAT), iso (ISO9660), udf (UDF). A
@@ -1171,7 +1223,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, broker: bootstrap };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, storage_admin, broker: bootstrap };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") },
 		handle => handle,
