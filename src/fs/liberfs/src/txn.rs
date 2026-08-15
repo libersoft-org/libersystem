@@ -84,6 +84,26 @@ impl<D: BlockDevice> LiberFs<D> {
 			self.abort();
 			return Err(FsError::Io);
 		}
+		// THE NEXT GENERATION'S DEAD LIST, BUILT WHILE FAILING IS STILL FREE.
+		//
+		// After the commit, the set this transaction dropped becomes the next commit's `dead_prev`,
+		// and copying it allocates. That copy used to happen AFTER the superblock write, with a
+		// bare `?` - so a volume that ran out of memory there answered `NoMemory` for a transaction
+		// that was already durable. StorageService maps `NoMemory` to `again`, which tells the
+		// caller to retry, which is the one thing that must not happen against a generation that
+		// has already moved.
+		//
+		// The correct answer for a failure past that line is ten lines below this one: read-only
+		// and `CommitUncertain`, with a comment saying the caller is told not to retry the write it
+		// thinks it lost. This is the same hazard reached by a different road, and the cheapest fix
+		// is not to be on that road: the list is known before the barrier, so it is built before
+		// the barrier, and the only thing left after the superblock lands is a swap that cannot
+		// fail.
+		let mut next_dead_prev: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+		next_dead_prev.try_reserve_exact(self.dead.len()).map_err(|_| FsError::NoMemory)?;
+		// `dead` is a `BTreeSet`, so this arrives in ascending order - which is what the reclaim
+		// above and `derive_free` both produce, and what keeps the two paths interchangeable.
+		next_dead_prev.extend(self.dead.iter().copied());
 		// the point of no return: once the superblock write is ATTEMPTED, the new
 		// generation may be durable no matter what the device reports (a reported
 		// failure can still have landed; a torn write is caught by the slot's
@@ -153,15 +173,10 @@ impl<D: BlockDevice> LiberFs<D> {
 				clear_bit(&mut self.free, b);
 			}
 		}
-		// The set this transaction dropped becomes the next commit's `dead_prev`. Copied FALLIBLY,
-		// like everything else that grows here: a commit that cannot hold the list refuses rather
-		// than aborting, and the transaction it was committing is already on the medium - so the
-		// caller's retry re-derives the same list from the free map.
-		self.dead_prev.clear();
-		let dead = core::mem::take(&mut self.dead);
-		for b in dead {
-			crate::try_push(&mut self.dead_prev, b)?;
-		}
+		// A SWAP, AND SWAPS DO NOT FAIL. The list was built above, before the barrier, precisely so
+		// nothing past the point of no return can answer with an error the caller would retry.
+		self.dead_prev = next_dead_prev;
+		self.dead.clear();
 		Ok(())
 	}
 

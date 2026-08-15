@@ -303,6 +303,30 @@ fn a_list_of_handle_bearing_values_is_refused_because_a_failed_encode_cannot_giv
 }
 
 #[test]
+fn a_stream_open_whose_error_arm_carries_a_capability_is_refused() {
+	// THE SCHEMA SAID YES AND THE PROTOCOL COULD NOT. `result<stream<T>, E>` takes its cardinality
+	// as `max(ok, err)`, so a one-capability `E` against the Ok arm's one subchannel was legal -
+	// while the generated `_reply_err` takes no handle out-parameter and refuses outright when the
+	// encoder recorded one, and the client's Err arm refuses a reply carrying any handle.
+	//
+	// Worse than a plain mismatch: by the time `_reply_err` refuses, the server has already MINTED
+	// the capability, and there is no out-parameter to hand it back through. It is stranded exactly
+	// the way an over-long capability list strands its fifth handle - which is the failure this
+	// milestone is named for.
+	assert_err_contains(&wrap("resource file;\nrecord item { value: u32 }\ninterface s { @op(1) watch: func() -> result<stream<item>, handle<file>>; }"), "error arm of a stream open carries a capability");
+	// A record error carrying one is the same shape wearing a name, and is refused for the same
+	// reason - the check is on the CARDINALITY, not on the syntax.
+	assert_err_contains(&wrap("resource file;\nrecord item { value: u32 }\nrecord failure { detail: handle<file> }\ninterface s { @op(1) watch: func() -> result<stream<item>, failure>; }"), "error arm of a stream open carries a capability");
+	// AND THE ORDINARY SHAPE IS UNTOUCHED, which is every stream in this tree: an enum error, or a
+	// record of plain values. A refusal that also refused these would be the stricter reading and
+	// the wrong one.
+	parse_ok(&wrap("record item { value: u32 }\nenum failure { denied, gone }\ninterface s { @op(1) watch: func() -> result<stream<item>, failure>; }"));
+	// A capability in the OK arm's frame is a different question and stays legal: the frame carries
+	// it on its own message, which the transport does support.
+	parse_ok(&wrap("resource file;\nrecord item { handle: handle<file> }\nenum failure { denied }\ninterface s { @op(1) watch: func() -> result<stream<item>, failure>; }"));
+}
+
+#[test]
 fn rejects_direct_value_recursion_but_allows_indirected_recursion() {
 	assert_err_contains(&wrap("record node { next: option<node> }"), "non-indirected recursive value cycle");
 	parse_ok(&wrap("record node { children: list<node> }"));
@@ -666,6 +690,17 @@ fn every_generated_message_boundary_ends_with_finish() {
 	assert!(rust.contains("if op == PROTOCOL_INFO_OP {\n\t\t\tr.finish()?;"), "and its server ends the request");
 	assert!(rust.contains("if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {"), "a bare stream-open reply ends too");
 	assert!(rust.contains("let _ = r.u32()?;\n\t\t\t\t\tr.finish()?;"), "and so does the Ok arm of a guarded one");
+	// AND THE ERR ARM, which the counting invariant above cannot see and did not.
+	//
+	// A guarded stream-open reply has ONE reader and two paths through it. The Ok arm ended at a
+	// boundary and the Err arm did not, so the counts were one reader and one finish and the rule
+	// passed - while a refusal with bytes after it decoded as an ordinary refusal. That is a test
+	// checking the right idea with the wrong invariant: `finishes >= readers` is a statement about
+	// TEXT, and "every message boundary is checked" is a statement about PATHS.
+	//
+	// Counting stays, because it catches a whole reader with no finish anywhere. This is the other
+	// half: every arm that returns a decoded value is named, so a new one has to be added here.
+	assert!(rust.contains("let error = Error::read(r)?;\n\t\t\t\tr.finish()?;\n\t\t\t\tSome(Err(error))"), "and the Err arm of a guarded stream open, which is the one that was missed: {rust}");
 }
 
 #[test]

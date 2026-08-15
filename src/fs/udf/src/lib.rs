@@ -1,8 +1,11 @@
-//! UDF - a read-only backend for DVD / Blu-ray and large optical (`.udf`) media,
+//! UDF - a read-only backend for DVD and large optical (`.udf`) media,
 //! behind the same [`BlockDevice`] trait FAT, ISO9660 and LiberFS use. It sits behind
 //! `Storage.Volume` as just another FS backend: per the layering principle several
 //! filesystems mount behind one volume API, and UDF is the format DVDs and Blu-ray
-//! discs use, so ISO9660 covers CDs and this completes optical-media interop.
+//! discs use, so ISO9660 covers CDs and this covers DVDs. It is NOT a Blu-ray reader:
+//! BDMV needs the Metadata Partition Map, which is not implemented - said here in the
+//! first sentence rather than a paragraph later, because a reader who stops after one
+//! line should not come away with the wrong answer.
 //!
 //! Read-only by design - no allocation or write path. Mounting reads the Anchor Volume
 //! Descriptor Pointer at LBA 256, scans the Main Volume Descriptor Sequence for the
@@ -18,9 +21,12 @@
 //! partition's own length (whose last block is verified to exist on the device at
 //! mount) before a buffer is allocated, descriptor tag checksums and locations are
 //! verified, and an unrecorded (sparse) extent reads as zeros, never as stale disk
-//! content. One physical partition is assumed (the long_ad partition references are
-//! not interpreted) and the UDF 2.50+ metadata partition (Blu-ray) is not - such
-//! volumes refuse to mount rather than misread.
+//! content. One physical partition is supported, and a `long_ad`'s partition reference
+//! IS read: it is carried through `LogicalAddress` and a reference this reader has no
+//! map for is refused rather than assumed to be zero. (This paragraph said the
+//! references were "not interpreted" until 2026-08-15, which described the reader as it
+//! was before they were.) The UDF 2.50+ metadata partition (Blu-ray) is not supported -
+//! such volumes refuse to mount rather than misread.
 //!
 //! ## What this reader does not do
 //!
@@ -401,10 +407,47 @@ impl<D: BlockDevice> Udf<D> {
 			return Err(MountError::Unsupported);
 		}
 		let map_partition = le16(&block[444..446]);
-		let fileset_lb = le32(&block[252..256]);
+		// THE FILE SET IS NAMED BY A `long_ad`, AND ALL SIXTEEN BYTES OF IT MEAN SOMETHING.
+		//
+		// `LogicalVolumeContentsUse` at 248 is a full `long_ad` identifying the first extent of the
+		// File Set Descriptor Sequence. This read the logical block and the partition reference out
+		// of the middle of it and ignored the first four bytes - which carry the extent's LENGTH and
+		// TYPE. So a volume naming an extent of zero bytes, or one recorded as unallocated, was
+		// followed anyway, and whatever happened to be at that block was mounted if it looked like a
+		// File Set Descriptor.
+		//
+		// That is the same defect that was fixed for the root and child ICB references, in the one
+		// place still reading a `long_ad` by hand - and the parser those fixes produced is right
+		// here.
+		let Some(fileset) = LogicalAddress::parse_long_ad(&block, 248) else {
+			return Err(MountError::Corrupt);
+		};
+		// Recorded and allocated, and at least one descriptor long. `extent_type` 0 is the only one
+		// that names bytes that exist; a File Set Sequence is not a file, so "allocated but not
+		// recorded" has no reading worth following.
+		if fileset.extent_type != 0 || fileset.length < SECTOR_SIZE {
+			return Err(MountError::Corrupt);
+		}
+		let fileset_lb = fileset.address.lb;
 		// The File Set's partition reference, which was discarded. With one map it can only be
 		// partition 0, and requiring that is what makes the discard safe.
-		if le16(&block[256..258]) != 0 {
+		if fileset.address.partition != 0 {
+			return Err(MountError::Unsupported);
+		}
+		// AND A SEQUENCE LONGER THAN ONE DESCRIPTOR IS REFUSED RATHER THAN ASSUMED AWAY.
+		//
+		// ECMA-167 defines a File Set Descriptor SEQUENCE: several descriptors, possibly continued
+		// through a Next Extent, with the prevailing one chosen by File Set Number. UDF requires a
+		// single File Set on ordinary media and permits several on WORM. This reader takes the first
+		// descriptor of the extent and always did - which is right for the single-File-Set case and
+		// silently wrong for the other, because it would mount whichever File Set happens to be
+		// first rather than the one that prevails.
+		//
+		// Refusing is the honest answer for a shape this reader does not implement, and it is the
+		// same answer it gives to a Metadata Partition Map. An extent long enough to hold a second
+		// descriptor is not proof that one is there - but a volume whose writer sized it that way is
+		// a volume this reader should not be guessing about.
+		if fileset.length > SECTOR_SIZE {
 			return Err(MountError::Unsupported);
 		}
 		// THE DESCRIPTOR FOR THE PARTITION THE MAP NAMES. The question used to be "does the one
@@ -532,6 +575,9 @@ impl<D: BlockDevice> Udf<D> {
 			if off + total > data.len() {
 				return Err(FsError::Corrupt);
 			}
+			if !fid_lengths_ok(fid, l_iu, l_fi, total) {
+				return Err(FsError::Corrupt);
+			}
 			// AND ITS BODY CRC, through the same function everything else goes through.
 			//
 			// A FID was checked with `tag_ok` alone - the sixteen-byte tag checksum - so the name,
@@ -564,6 +610,23 @@ impl<D: BlockDevice> Udf<D> {
 			let parent = chars & 0x08 != 0;
 			let deleted = chars & 0x04 != 0;
 			let is_dir = chars & 0x02 != 0;
+			// A DELETED RECORD IS SKIPPED BEFORE ITS NAME IS READ, and the order is the whole point.
+			//
+			// UDF overwrites a deleted entry's compression id - 8 becomes 254, 16 becomes 255 - so
+			// the identifier of a deleted FID deliberately decodes as nothing. `decode_name` knows
+			// 8 and 16 and answers `None` to everything else, which this function turned into
+			// `Corrupt` for the WHOLE directory. So one deleted file made every lookup in that
+			// directory fail.
+			//
+			// `read_dir` over the same records tests the flag first and never decodes the name, so
+			// the same volume LISTED correctly and could not be looked up in - two functions over
+			// one record type disagreeing about whether it is readable. Deleted FIDs are a standard
+			// mechanism and the specification recommends reusing them, so this is ordinary media
+			// rather than a hostile case.
+			if deleted {
+				off += (total + 3) & !3;
+				continue;
+			}
 			// A name that does not decode is a CORRUPT record, not one to pass over: skipping it
 			// listed a damaged directory as a tidy one.
 			let Some(id) = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]) else {
@@ -573,7 +636,8 @@ impl<D: BlockDevice> Udf<D> {
 				if name == b".." {
 					return Ok((LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
 				}
-			} else if !deleted && !id.is_empty() {
+			} else if !id.is_empty() {
+				// `deleted` is no longer tested here: such a record never reaches this point.
 				if id.as_bytes() == name {
 					return Ok((LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
 				}
@@ -622,6 +686,9 @@ impl<D: BlockDevice> Udf<D> {
 			let l_fi = fid[19] as usize;
 			let total = 38 + l_iu + l_fi;
 			if off + total > data.len() {
+				return Err(FsError::Corrupt);
+			}
+			if !fid_lengths_ok(fid, l_iu, l_fi, total) {
 				return Err(FsError::Corrupt);
 			}
 			// AND ITS BODY CRC, through the same function everything else goes through.
@@ -1242,6 +1309,40 @@ fn validate_descriptor_within(block: &[u8], expected_tag: u16, expected_location
 //
 // `Some("")` means the field was genuinely empty, which is what a parent record carries and the only
 // place an empty name is legal.
+// THE FIXED LENGTHS UDF PUTS ON A FILE IDENTIFIER DESCRIPTOR, which this reader checked none of.
+//
+// Everything else about a FID was validated - the tag, the body CRC, the dynamic CRC coverage, the
+// tag location, and the two lengths against the directory's own buffer - so a record could be
+// internally consistent, pass every one of those, and still be a shape no UDF writer produces.
+// That is a gap in a parser whose whole premise is that the medium is untrusted: a forgery only has
+// to be self-consistent, and these are the constraints that make self-consistency harder to reach.
+//
+// Each one is from UDF 2.60 and each rules out something a forger would otherwise have free:
+//   - a descriptor larger than one logical block, which no writer emits and which lets a single
+//     record span the whole directory;
+//   - `FileVersionNumber` other than 1, which the specification fixes and nothing reads, so any
+//     other value is a field carrying something else;
+//   - an implementation-use area that is neither absent nor large enough to hold the header it is
+//     defined to start with;
+//   - a name of one byte, which is a compression id and no characters - not a name, and a shape
+//     that would otherwise decode as the empty string and be skipped silently.
+//
+// The parent record is the deliberate exception: it carries no name at all, which is why the length
+// rule is written against `l_fi == 0` for it rather than being relaxed for everybody.
+fn fid_lengths_ok(fid: &[u8], l_iu: usize, l_fi: usize, total: usize) -> bool {
+	if total > SECTOR_SIZE {
+		return false;
+	}
+	if le16(&fid[16..18]) != 1 {
+		return false;
+	}
+	if l_iu != 0 && l_iu < 32 {
+		return false;
+	}
+	let parent = fid[18] & 0x08 != 0;
+	if parent { l_fi == 0 } else { l_fi != 1 }
+}
+
 fn decode_name(id: &[u8]) -> Option<String> {
 	if id.is_empty() {
 		return Some(String::new());

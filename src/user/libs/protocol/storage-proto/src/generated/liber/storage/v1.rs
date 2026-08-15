@@ -1924,7 +1924,9 @@ pub mod volume {
 				if !reply_handles.is_empty() {
 					return None;
 				}
-				Some(Err(Error::read(r)?))
+				let error = Error::read(r)?;
+				r.finish()?;
+				Some(Err(error))
 			})();
 			if !matches!(decoded, Some(Ok(_))) {
 				self.transport.discard_handles(reply_handles.as_slice());
@@ -2500,7 +2502,9 @@ pub mod volume {
 				if !reply_handles.is_empty() {
 					return None;
 				}
-				Some(Err(Error::read(r)?))
+				let error = Error::read(r)?;
+				r.finish()?;
+				Some(Err(error))
 			})();
 			if !matches!(decoded, Some(Ok(_))) {
 				self.transport.discard_handles(reply_handles.as_slice());

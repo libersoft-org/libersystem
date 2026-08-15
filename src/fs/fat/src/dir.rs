@@ -307,15 +307,35 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>,
 		// `(first_cluster, size, no_fat_chain)` and `remove` freeing them with the main chain. Until
 		// then, refusing is the one answer that cannot damage a volume whose owner understands more
 		// of the format than this driver does - which is the rule the comment above already states.
+		//
+		// AND A KNOWN TYPE IN AN IMPOSSIBLE PLACE IS NOT A KNOWN RECORD. This loop exempted `0xC0`
+		// and `0xC1` by type code, in a range that begins AFTER the one Stream Extension and after
+		// every File Name entry the name length calls for - so a set of `85 C0 C1 C0`, with the
+		// checksum recomputed over it, parsed as an ordinary writable file. The second Stream
+		// Extension carries its own `FirstCluster` and `DataLength`; `Raw` holds one allocation,
+		// taken from the first. A remove clears the in-use bit across the whole set and frees the
+		// first stream's chain, leaving the second stream's clusters allocated with nothing naming
+		// them - the exact leak the Vendor Allocation refusal above was written for, reached through
+		// a type code this driver claims to know.
+		//
+		// So it is `malformed` rather than `unrecognised`: read-only is the answer for a record the
+		// driver failed to understand, and this is a set the format forbids.
 		let mut unrecognised = false;
+		let mut misplaced = false;
 		for r in (1 + fragments)..secondary {
 			let kind = bytes[i + 32 + r * 32];
 			// In use is bit 7; bit 6 SET is secondary, and every record in this range is one by
 			// construction - the Stream Extension and the File Name entries are behind it. So the
 			// question is only whether this driver emits it, and it emits `0xC0` and `0xC1`.
-			if kind & 0x80 != 0 && !matches!(kind, 0xC0 | 0xC1) {
+			if matches!(kind, 0xC0 | 0xC1) {
+				misplaced = true;
+			} else if kind & 0x80 != 0 {
 				unrecognised = true;
 			}
+		}
+		if misplaced {
+			i += set_len;
+			continue;
 		}
 		let mut name: Vec<u16> = Vec::new();
 		let mut malformed = false;
@@ -786,6 +806,24 @@ impl Upcase {
 
 	pub(super) fn up(&self, unit: u16) -> u16 {
 		self.map.get(unit as usize).copied().unwrap_or(unit)
+	}
+
+	// The specification FIXES the first 128 entries of an exFAT Up-case Table: identity everywhere
+	// except `0x61..=0x7A`, which map to `0x41..=0x5A`. That is precisely the table `ascii()` builds
+	// for the classic families, so the rule is a comparison rather than a second table.
+	//
+	// Structure and checksum were all this table was held to, and neither says what it MEANS. A
+	// volume can carry a decodable table with a correct checksum in which `a` does not up-case to
+	// `A`, and this driver then uses it to compare names, to compute `NameHash` and to decide
+	// collisions on write. The parser already skips an entry set whose stored hash disagrees with
+	// its own name, because surfacing it means this driver can open a file no other driver can find;
+	// a forged table produces that divergence one level down, for every name on the volume at once.
+	//
+	// Compared through `up()` rather than over `map`, because `decode` drops trailing identity
+	// entries - a conforming table may hold fewer than 128 of them.
+	pub(super) fn ascii_prefix_ok(&self) -> bool {
+		let ascii = Upcase::ascii();
+		(0u16..0x80).all(|unit| self.up(unit) == ascii.up(unit))
 	}
 
 	// Decode the table as it is stored: a run of little-endian units where 0xFFFF is the escape and

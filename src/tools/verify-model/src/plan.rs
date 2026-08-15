@@ -64,7 +64,7 @@ pub struct PathVerdict {
 //
 // `Check::covers` is the mapping. A component the plan selected nothing for still gets an entry, so
 // "nothing was selected for audio" is itself a decision two runs can agree or disagree about.
-fn decisions(catalog: &crate::catalog::Catalog, items: &[PlanItem], edge_kinds: &[String], built: &[String], booted: &[String], components: &[String]) -> Vec<String> {
+fn decisions(catalog: &crate::catalog::Catalog, items: &[PlanItem], edge_kinds: &BTreeMap<String, Vec<String>>, built: &[String], booted: &[String], components: &[String]) -> Vec<String> {
 	let mut out: Vec<String> = Vec::new();
 	for component in components {
 		let mut parts: Vec<String> = Vec::new();
@@ -76,7 +76,11 @@ fn decisions(catalog: &crate::catalog::Catalog, items: &[PlanItem], edge_kinds: 
 		}
 		parts.sort();
 		parts.dedup();
-		parts.push(format!("edges={}", edge_kinds.join(",")));
+		// THIS COMPONENT'S EDGES. The global list put the neighbour back into the decision the
+		// digest exists to isolate: `audio + neighbour-A` and `audio + neighbour-B` reached through
+		// different edge kinds gave audio two different digests, so the two counted as two pieces of
+		// evidence about audio again.
+		parts.push(format!("edges={}", edge_kinds.get(component).map(|kinds| kinds.join(",")).unwrap_or_default()));
 		parts.push(format!("built={}", built.join(",")));
 		parts.push(format!("booted={}", booted.join(",")));
 		out.push(format!("{component}\t{:016x}", digest(&parts.join("\n"))));
@@ -131,6 +135,14 @@ pub struct Plan {
 	// discarding the data: every run that happens before this lands is a record that can never be
 	// graded against those criteria when they are written.
 	pub edge_kinds: Vec<String>,
+	// THE EDGES WALKED OUT OF EACH CHANGED COMPONENT, which is the per-component half of the field
+	// above.
+	//
+	// `edge_kinds` is the union over the whole plan, and a certificate is about one component: a
+	// change touching `audio` and `term` gave audio's record every edge kind the walk from TERM
+	// used. What audio's evidence actually covers is the edges the selector walked out of AUDIO, so
+	// the reach paths are attributed to the seed each one starts from.
+	pub component_edge_kinds: BTreeMap<String, Vec<String>>,
 	// Set when every changed path is declared non-code. Distinct from an empty plan for any other
 	// reason, which cannot happen: this is the only way out with nothing to run.
 	pub nothing_to_do: bool,
@@ -219,6 +231,16 @@ impl<'a> Planner<'a> {
 		// graph its evidence covers. A component reached through `link.dynamic` proves nothing about
 		// `generation.build`.
 		let edge_kinds: Vec<String> = reached.values().flatten().map(|edge| edge.kind.clone()).collect::<BTreeSet<String>>().into_iter().collect();
+		// And the same walk attributed to the seed it started from. Every reach path is a chain from
+		// a changed component outwards, so `path[0].to` names the seed - a component reached with an
+		// empty path IS a seed, and contributes nothing to anyone else.
+		let mut per_component: BTreeMap<String, BTreeSet<String>> = seeds.iter().map(|seed| (seed.clone(), BTreeSet::new())).collect();
+		for edges in reached.values() {
+			let Some(first) = edges.first() else { continue };
+			let entry = per_component.entry(first.to.clone()).or_default();
+			entry.extend(edges.iter().map(|edge| edge.kind.clone()));
+		}
+		let component_edge_kinds: BTreeMap<String, Vec<String>> = per_component.into_iter().map(|(component, kinds)| (component, kinds.into_iter().collect())).collect();
 		// How each one was reached, which decides what has to happen because of it.
 		let reach = self.graph.affected_by_reach(&seeds);
 
@@ -372,8 +394,8 @@ impl<'a> Planner<'a> {
 		components.extend(affected_components.iter().cloned());
 		components.sort();
 		components.dedup();
-		let component_decisions = decisions(self.catalog, &items, &edge_kinds, &architectures_built, &architectures_booted, &components);
-		Plan { full, full_reasons, paths, changed_components, affected_components, architectures_built, architectures_booted, items, component_decisions, edge_kinds, nothing_to_do, warnings }
+		let component_decisions = decisions(self.catalog, &items, &component_edge_kinds, &architectures_built, &architectures_booted, &components);
+		Plan { full, full_reasons, paths, changed_components, affected_components, architectures_built, architectures_booted, items, component_decisions, edge_kinds, component_edge_kinds, nothing_to_do, warnings }
 	}
 
 	// Why this check is in the plan, or None for "it is not".
@@ -455,8 +477,8 @@ impl<'a> Planner<'a> {
 		components.extend(affected_components.iter().cloned());
 		components.sort();
 		components.dedup();
-		let component_decisions = decisions(self.catalog, &items, &[], &all, &all, &components);
-		Plan { full: true, full_reasons: reasons, paths, changed_components, affected_components, architectures_built: all.clone(), architectures_booted: all, items, component_decisions, edge_kinds: Vec::new(), nothing_to_do: false, warnings }
+		let component_decisions = decisions(self.catalog, &items, &BTreeMap::new(), &all, &all, &components);
+		Plan { full: true, full_reasons: reasons, paths, changed_components, affected_components, architectures_built: all.clone(), architectures_booted: all, items, component_decisions, edge_kinds: Vec::new(), component_edge_kinds: BTreeMap::new(), nothing_to_do: false, warnings }
 	}
 }
 

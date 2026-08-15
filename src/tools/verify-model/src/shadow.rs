@@ -541,6 +541,72 @@ pub struct Record {
 	// the company it was made in.
 	#[serde(default)]
 	pub component_decisions: Vec<String>,
+	// WHAT THIS RECORD IS EVIDENCE ABOUT, PER COMPONENT.
+	//
+	// `change_kinds` and `edge_kinds` above are the whole change set's, and a certificate is about
+	// one component. A commit that renames a file in `term` while editing a source file in `audio`
+	// gave the audio record `{modified, renamed}` and every edge kind the plan walked anywhere - so
+	// audio's evidence claimed coverage of a change class and a graph edge audio was never
+	// validated over. That is the same "the neighbour is free" defect `component_decisions` was
+	// added to close, one field along.
+	//
+	// Kept beside the global fields rather than replacing them: the global pair is a true statement
+	// about the RUN, and the run is what the record describes.
+	#[serde(default)]
+	pub component_scopes: BTreeMap<String, Scope>,
+}
+
+// What a piece of evidence covers: the classes of change it was made over, and the graph edges the
+// selector walked out of the component to make it.
+//
+// A certificate that cannot name its own scope is a broad certificate, which is the defect this
+// milestone split `HostBuild` out of `Host` to prevent. Five perfect verifications of a source edit
+// reached through `link.static` are not evidence about a rename reached through `generation.build`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Scope {
+	pub change_kinds: Vec<String>,
+	pub edge_kinds: Vec<String>,
+}
+
+impl Scope {
+	// Whether evidence of this scope answers for a change of that one. Subset, in both dimensions:
+	// a certificate covers what it was earned over and nothing beside it.
+	//
+	// An EMPTY requirement is covered by anything, which is what a report with no change in hand
+	// asks - and an empty CERTIFICATE scope covers only that, which is what a certificate granted
+	// before scopes existed can honestly claim. Failing closed there is the same rule
+	// `model_self_check` already applies: a record that cannot say what it proved is not evidence
+	// that it proved anything.
+	pub fn covers(&self, needed: &Scope) -> bool {
+		let mine: BTreeSet<&str> = self.change_kinds.iter().map(String::as_str).collect();
+		let edges: BTreeSet<&str> = self.edge_kinds.iter().map(String::as_str).collect();
+		needed.change_kinds.iter().all(|kind| mine.contains(kind.as_str())) && needed.edge_kinds.iter().all(|kind| edges.contains(kind.as_str()))
+	}
+
+	// What is missing, for a refusal that says what to do about it.
+	pub fn shortfall(&self, needed: &Scope) -> Vec<String> {
+		let mine: BTreeSet<&str> = self.change_kinds.iter().map(String::as_str).collect();
+		let edges: BTreeSet<&str> = self.edge_kinds.iter().map(String::as_str).collect();
+		let mut out: Vec<String> = needed.change_kinds.iter().filter(|kind| !mine.contains(kind.as_str())).map(|kind| format!("change kind '{kind}'")).collect();
+		out.extend(needed.edge_kinds.iter().filter(|kind| !edges.contains(kind.as_str())).map(|kind| format!("edge kind '{kind}'")));
+		out
+	}
+}
+
+// The scope of the change in hand, for each component it changed.
+//
+// One function, used at both ends: when a record is written it says what that comparison covered,
+// and when a certificate is consulted it says what the current change needs. Those two have to be
+// the same computation or the subset test compares different vocabularies.
+pub fn component_scopes(repo_root: &Path, plan: &crate::plan::Plan) -> BTreeMap<String, Scope> {
+	let mut out: BTreeMap<String, Scope> = BTreeMap::new();
+	for component in &plan.changed_components {
+		// The paths THIS component owns, which `PathVerdict::outcome` already records - not the
+		// whole change set.
+		let owned: Vec<String> = plan.paths.iter().filter(|verdict| &verdict.outcome == component).map(|verdict| verdict.path.clone()).collect();
+		out.insert(component.clone(), Scope { change_kinds: change_kinds_for(repo_root, &owned), edge_kinds: plan.component_edge_kinds.get(component).cloned().unwrap_or_default() });
+	}
+	out
 }
 
 // The kinds of change a set of paths represents, read from the working tree.
@@ -623,25 +689,25 @@ impl Log {
 	// strength of one comparison, which is the precise shape of the false confidence this milestone
 	// exists to prevent, arriving inside its own trust criteria.
 	//
-	// The unit is the SELECTION INPUT - the tree's content digest and the change set - because that
-	// is what determines the answer being validated. Two changes compared against one tree are two
-	// pieces of evidence; one change compared twice is one.
-	// KEYED ON WHAT THE SELECTOR DECIDED FOR THIS COMPONENT, not on the global change set.
+	// KEYED ON WHAT THE SELECTOR DECIDED FOR THIS COMPONENT, and on nothing else.
 	//
 	// `(source_digest, changed_components)` counted `audio + neighbour-0` .. `audio + neighbour-4` as
 	// five pieces of evidence about audio, and the decision about audio may be identical in all five.
-	// A record written before `component_decisions` existed carries none, and falls back to the old
-	// key rather than collapsing every old record into one - the evidence it represents was real.
+	//
+	// `(source_digest, decision)` was the same hole through a smaller door. `source_digest` covers
+	// the HEAD commit and the content of every changed file, so five edits to audio that each
+	// produce the SAME decision are five different digests and counted five times - which is one
+	// decision validated five times, the shape this criterion exists to refuse. The selector is
+	// deterministic, so validating one decision repeatedly validates one thing however many trees it
+	// is asked from.
+	//
+	// `source_digest` keeps its other job: it pins a record to the tree that produced it. That is
+	// immutability, not distinctness, and merging the two purposes into one key is what let the
+	// weaker one stand in for the stronger. A record written before `component_decisions` existed
+	// falls back to its change set, which now collapses several old records into one - the safe
+	// direction, and evidence a current model prunes anyway.
 	pub fn distinct_evidence_for(&self, component: &str, model_hash: &str, universe: Universe) -> usize {
-		self.records
-			.iter()
-			.filter(|record| Self::is_clean(record, component, model_hash, universe))
-			.map(|record| {
-				let decision = record.component_decisions.iter().find_map(|entry| entry.split_once('\t').filter(|(name, _)| *name == component).map(|(_, digest)| String::from(digest))).unwrap_or_else(|| record.changed_components.join(","));
-				(record.source_digest.clone(), decision)
-			})
-			.collect::<BTreeSet<(String, String)>>()
-			.len()
+		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).map(|record| record.component_decisions.iter().find_map(|entry| entry.split_once('\t').filter(|(name, _)| *name == component).map(|(_, digest)| String::from(digest))).unwrap_or_else(|| record.changed_components.join(","))).collect::<BTreeSet<String>>().len()
 	}
 
 	// Targets this component has CLEAN evidence on. Filtering on the verdict is the whole point and

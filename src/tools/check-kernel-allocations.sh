@@ -47,23 +47,65 @@ scan() {
 	# against whether its own function reserved room. A bash line loop cannot see that.
 	out="$(find "$dir" -name '*.rs' ! -name 'tests.rs' -not -path '*/tests/*' -not -path '*/test_suites/*' -not -path '*/build.rs' | sort | while IFS= read -r file; do
 		awk -v file="$file" -v prefix="$dir/" '
+			# The identifier chain immediately before `.method(` - `self.free` in
+			# `self.free.insert(..)`, `inbox` in `inbox.push_back(..)`. What a receiver-matched
+			# exemption needs, and what a whole-function one never asked for.
+			function receiver(s, m,   i, c, out) {
+				i = index(s, m)
+				if (i == 0) return ""
+				out = ""
+				i--
+				while (i > 0) {
+					c = substr(s, i, 1)
+					if (c ~ /[A-Za-z0-9_.]/) { out = c out; i-- } else break
+				}
+				return out
+			}
 			{ lines[FNR] = $0 }
 			/^[[:space:]]*(pub[[:space:]]+)?(pub\([^)]*\)[[:space:]]+)?(const[[:space:]]+)?(unsafe[[:space:]]+)?(extern[[:space:]]+"[^"]*"[[:space:]]+)?fn[[:space:]]/ { starts[++nf] = FNR }
 			END {
+				# The growth calls, as a pattern and as the literal text `receiver()` looks for.
+				growth[1] = ".push("; growth[2] = ".push_back("; growth[3] = ".push_front("
+				growth[4] = ".insert("; growth[5] = ".extend("; growth[6] = ".extend_from_slice("
 				# Everything before the first fn is item scope: statics, consts. Judged as one span.
 				starts[0] = 1
 				starts[nf + 1] = FNR + 1
 				for (i = 0; i <= nf; i++) {
-					reserved = 0
-					for (l = starts[i]; l < starts[i + 1]; l++) if (lines[l] ~ /try_reserve/) reserved = 1
+					delete booked
 					for (l = starts[i]; l < starts[i + 1]; l++) {
 						line = lines[l]
+						# BOOKED BEFORE, AND THE SAME COLLECTION. Walked in order and keyed on the
+						# receiver, because the old rule was "this function mentions try_reserve
+						# somewhere" - which exempted a push above the reservation, and a push on a
+						# different collection entirely. One booking still exempts any number of
+						# growths of that collection: a `try_reserve(n)` followed by a loop of pushes
+						# is the CORRECT pattern, and no textual rule can count them.
+						# EVERY reservation on the line, not the first: a transaction that books two
+						# collections in one condition - `a.try_reserve(n).is_err() || b.try_reserve(n).is_err()`
+						# - books both, and reading only the first left the second looking unbooked.
+						rest = line
+						while (index(rest, ".try_reserve") > 0) {
+							r = receiver(rest, ".try_reserve")
+							if (r != "") booked[r] = 1
+							rest = substr(rest, index(rest, ".try_reserve") + 12)
+						}
 						if (line ~ /^[[:space:]]*\/\//) continue
 						if (line ~ /ALLOC-OK:/) continue
-						if (l > 1 && lines[l - 1] ~ /ALLOC-OK:/) continue
-						hard = (line ~ /Vec::with_capacity\(|(^|[^_[:alnum:]])vec!\[|Box::new\(|Arc::new\(|Rc::new\(|String::from\(|format!\(|\.to_string\(\)/)
-						grow = (line ~ /\.push\(|\.push_back\(|\.push_front\(|\.insert\(|\.extend\(|\.extend_from_slice\(/)
-						if (hard || (grow && !reserved)) {
+						# ANYWHERE IN THE COMMENT BLOCK ABOVE, not only on the line touching the code.
+						# A marker whose reason needs two sentences is an ordinary marker, and making
+						# the last line carry the keyword produced comments written for the gate
+						# rather than for a reader.
+						marked = 0
+						for (u = l - 1; u >= starts[i] && lines[u] ~ /^[[:space:]]*\/\//; u--) {
+							if (lines[u] ~ /ALLOC-OK:/) { marked = 1; break }
+						}
+						if (marked) continue
+						hard = (line ~ /Vec::with_capacity\(|(^|[^_[:alnum:]])vec!\[|Box::new\(|Arc::new\(|Rc::new\(|String::from\(|format!\(|\.to_string\(\)|\.collect\(\)/)
+						grow = 0
+						# Substring search rather than a regex, so `.push(` needs no escaping to mean
+						# itself - and `receiver` is handed the same literal it matched on.
+						for (m = 1; m <= 6; m++) if (index(line, growth[m]) > 0) { grow = 1; who = receiver(line, growth[m]) }
+						if (hard || (grow && !booked[who])) {
 							name = file
 							sub("^" prefix, "", name)
 							printf "kernel-allocations: %s:%d infallible allocation on a path that may be reachable from ring 3\n", name, l
@@ -135,6 +177,9 @@ self_test() {
 		exit 1
 	fi
 	# One marker does not license the next line as well.
+	printf 'fn f() {\n\t// ALLOC-OK: boot, before userspace exists\n\t// and the reason runs onto a second line, as reasons do\n\tlet v = Vec::with_capacity(4);\n}\n' >"$scratch/marked/a.rs"
+	scan "$scratch/marked" || fail "a marker in the comment block above the line was not honoured"
+
 	printf 'fn f() {\n\t// ALLOC-OK: boot\n\tlet v = Vec::with_capacity(4);\n\tlet w = Vec::with_capacity(4);\n}\n' >"$scratch/marked/a.rs"
 	if scan "$scratch/marked" 2>/dev/null; then
 		echo "kernel-allocations: SELF-TEST FAILED - one marker covered a second allocation" >&2

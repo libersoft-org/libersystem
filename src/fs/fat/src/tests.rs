@@ -3429,3 +3429,142 @@ fn an_exfat_root_carrying_a_critical_primary_this_driver_does_not_know_refuses_a
 	img[destination..destination + 32].copy_from_slice(&record);
 	assert!(FatFs::mount(MemDisk { data: img }).is_none(), "two Up-case Tables is a volume outside its own format, not a choice to make");
 }
+
+#[test]
+fn a_cycle_that_closes_exactly_on_the_declared_length_is_still_a_cycle() {
+	// THE LINK OUT OF THE LAST CLUSTER, which a bounded read never looked at. `read_chain` broke out
+	// of its loop before the advance that validates the link it had just followed, and that advance
+	// is where Floyd fires - so `A -> B -> A` read for exactly three clusters came back as
+	// `Ok([A, B, A])`, a file made of one cluster served twice.
+	//
+	// The existing cycle test declares a longer file, so the walk takes one more step and the error
+	// appears. The length that lands exactly on the repeat is the case nothing stated.
+	//
+	// Both readers, because the defect was that they DISAGREED: `read_file_range` advances inside its
+	// loop body rather than behind an early break, so it refused the chain that `read_file` returned.
+	let mut img = build_fat(Kind::Fat16, &[File { path: "LOOP.BIN", data: &[0xABu8; 3 * 512] }]);
+	let fat_off = 512; // one reserved sector
+	let root_off = classic_root_off(&img);
+	let first = u16::from_le_bytes([img[root_off + 26], img[root_off + 27]]) as usize;
+	img_set_fat16(&mut img, fat_off, first, first as u16 + 1);
+	img_set_fat16(&mut img, fat_off, first + 1, first as u16);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"LOOP.BIN"), Err(FsError::Invalid), "three clusters of A -> B -> A read back as a file");
+	let mut buffer = alloc::vec![0u8; 3 * 512];
+	assert_eq!(fs.read_file_range(b"LOOP.BIN", 0, &mut buffer), Err(FsError::Invalid), "and the two readers must agree about it");
+}
+
+#[test]
+fn a_file_ending_on_a_cluster_the_fat_calls_free_is_not_a_file() {
+	// The same break, the other thing it hid. A file whose size ends exactly on its first cluster
+	// never had that cluster's FAT entry read, so an entry holding 0 - which says the cluster is
+	// FREE - read back as a perfectly good file. `alloc_chain` hands out any entry holding 0, so the
+	// next write on this volume cross-links the two.
+	//
+	// `a_chain_shorter_than_its_entry_is_corruption_not_a_short_file` covers the free link in the
+	// MIDDLE of a chain; the last link is the one the read stopped before.
+	let mut img = build_fat(Kind::Fat16, &[File { path: "ONE.BIN", data: &[0xCDu8; 512] }]);
+	let fat_off = 512;
+	let root_off = classic_root_off(&img);
+	let first = u16::from_le_bytes([img[root_off + 26], img[root_off + 27]]) as usize;
+	img_set_fat16(&mut img, fat_off, first, 0);
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"ONE.BIN"), Err(FsError::Invalid), "a file naming a cluster the FAT says is free");
+	let mut buffer = alloc::vec![0u8; 512];
+	assert_eq!(fs.read_file_range(b"ONE.BIN", 0, &mut buffer), Err(FsError::Invalid), "and the ranged reader agrees");
+}
+
+#[test]
+fn a_chain_that_runs_off_the_volume_did_not_end() {
+	// `ChainCursor::current` answered with one error for three states - below the first data cluster,
+	// past the last, and the end-of-chain marker - and `read_chain_to_end` looped `while let Ok(..)`,
+	// so a chain running off the volume ended its loop exactly as a terminator would. What pays for
+	// that is `scan_exfat_root`: the root is the directory with no recorded length, so it is read
+	// through this path, and a root scanned as far as the damage and then called whole is a root
+	// whose second Allocation Bitmap - or second Up-case Table - was never seen by the rules that
+	// exist to refuse them.
+	let mut img = build_fat(Kind::Fat16, &[File { path: "TWO.BIN", data: &[0x5Au8; 2 * 512] }]);
+	let fat_off = 512;
+	let root_off = classic_root_off(&img);
+	let first = u16::from_le_bytes([img[root_off + 26], img[root_off + 27]]) as usize;
+	img_set_fat16(&mut img, fat_off, first + 1, 0xF000); // out of the heap, and not an end marker
+	let mut fs = FatFs::mount(MemDisk { data: img }).unwrap();
+	assert_eq!(fs.read_chain_to_end_for_test(first as u32, 1 << 20), Err(FsError::Invalid), "the walk stopped at the damage and reported the prefix as the whole chain");
+}
+
+#[test]
+fn an_exfat_record_of_a_known_type_in_an_impossible_place_is_not_a_file() {
+	// `0xC0` and `0xC1` were exempted by TYPE CODE from the classification of trailing records, in a
+	// range that begins after the one Stream Extension and after every File Name entry the name
+	// length calls for. So `85 C0 C1 C0`, with the checksum recomputed over it, parsed as an ordinary
+	// WRITABLE file.
+	//
+	// The second Stream Extension carries its own FirstCluster and DataLength; `Raw` holds one
+	// allocation, taken from the first. A remove clears the in-use bit across the whole set and
+	// frees the first stream's chain, leaving the second stream's clusters allocated with nothing
+	// naming them - the exact leak the Vendor Allocation refusal was written for, reached through a
+	// type code this driver claims to know.
+	//
+	// Read-only would be the wrong answer here: that is what an unrecognised record earns, and this
+	// is not a record the driver failed to understand but a set the format forbids.
+	for (label, kind) in [("a second Stream Extension", 0xC0u8), ("a File Name entry past the count NameLength calls for", 0xC1u8)] {
+		let name: Vec<u16> = "A".encode_utf16().collect();
+		let upcase = crate::dir::Upcase::ascii();
+		let mut set: Vec<u8> = alloc::vec![0u8; 32 * 4];
+		set[0] = 0x85; // File
+		set[1] = 3; // stream + one name + the record that may not be there
+		set[4] = 0x20; // attributes: archive
+		set[32] = 0xC0; // Stream Extension
+		set[32 + 3] = name.len() as u8;
+		let hash = crate::dir::exfat_name_hash_for_test(&name, &upcase);
+		set[32 + 4..32 + 6].copy_from_slice(&hash.to_le_bytes());
+		set[32 + 20..32 + 24].copy_from_slice(&5u32.to_le_bytes());
+		set[32 + 24..32 + 32].copy_from_slice(&1u64.to_le_bytes());
+		set[32 + 8..32 + 16].copy_from_slice(&1u64.to_le_bytes());
+		set[64] = 0xC1; // File Name
+		set[64 + 2..64 + 4].copy_from_slice(&name[0].to_le_bytes());
+		set[96] = kind;
+		// The second stream names clusters of its own, which is what makes accepting the set a leak.
+		set[96 + 20..96 + 24].copy_from_slice(&9u32.to_le_bytes());
+		set[96 + 24..96 + 32].copy_from_slice(&1u64.to_le_bytes());
+		let sum = crate::dir::exfat_set_checksum(&set);
+		set[2..4].copy_from_slice(&sum.to_le_bytes());
+
+		let entries = crate::dir::parse_exfat_dir(&set, &upcase).expect("the parse itself must not fail");
+		assert!(entries.is_empty(), "{label}: surfaced as a file");
+	}
+}
+
+#[test]
+fn an_upcase_table_is_read_as_well_as_checksummed() {
+	// Structure and checksum were all this table was held to, and neither says what it MEANS. The
+	// specification fixes the first 128 mappings - identity except a-z, which map to A-Z - and this
+	// driver folds every name on the volume through whatever it finds: lookup, the NameHash it
+	// writes, the collision it refuses. A table this driver accepts and no other implementation
+	// would makes all three of those its own opinion, which is the defect the name-hash check one
+	// level up already refuses.
+	let good = build_exfat(ROOT);
+	assert!(FatFs::mount(MemDisk { data: good.clone() }).is_some(), "the fixture itself must mount");
+	let entry = 26 * 512 + 32;
+	assert_eq!(good[entry], 0x82, "the fixture's second root entry is the Up-case Table");
+	let table_off = 27 * 512;
+	let table_len = exfat_upcase_table().len();
+
+	// `a` mapped to itself, with the checksum recomputed so that the only thing wrong is the meaning.
+	let mut img = good.clone();
+	img[table_off + 4..table_off + 6].copy_from_slice(&0x0061u16.to_le_bytes());
+	let mut sum: u32 = 0;
+	for &b in &img[table_off..table_off + table_len] {
+		sum = sum.rotate_right(1).wrapping_add(b as u32);
+	}
+	img[entry + 4..entry + 8].copy_from_slice(&sum.to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: img }).is_none(), "a table in which 'a' does not up-case to 'A'");
+
+	// And the reserved fields, to the standard the Allocation Bitmap entry beside it is already held
+	// to: three bytes below the checksum and twelve between it and the FirstCluster.
+	for at in [1usize, 3, 8, 19] {
+		let mut img = good.clone();
+		img[entry + at] = 1;
+		assert!(FatFs::mount(MemDisk { data: img }).is_none(), "a 0x82 entry with a nonzero reserved byte at {at}");
+	}
+}

@@ -342,9 +342,15 @@ fn wasi_host_runs_a_component() {
 	// bytes the component read must equal the file straight from the volume, proving
 	// a Wasm component performed a capability-gated operation via a host import
 	// mapped to a native service.
-	let (expected, actual) = run_wasi_scenario().expect("the wasi scenario should run");
+	let (expected, status, actual) = run_wasi_scenario().expect("the wasi scenario should run");
 	assert!(!expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(actual, expected, "the component read the granted file's bytes through the host import");
+	// AND THE STATUS SAYS SO, which is the half the report used to drop. `count.max(0)` turned a
+	// refusal into zero bytes, and a successful read of an empty file is also zero bytes - so the
+	// supervisor could not tell "you may not" from "there was nothing there". The status is the
+	// byte count on success and a negative status on refusal, and the two are now different
+	// messages rather than the same empty one.
+	assert_eq!(status, expected.len() as i32, "the report's status is the count the component read, not a sign the payload has to be guessed from");
 }
 
 tagged_test!(powerbox_grants_a_picked_file_to_a_component, [Component, Service], id = "kernel.applications.powerbox_grants_a_picked_file_to_a_component", covers = ["kernel", "services"]);

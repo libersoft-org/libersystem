@@ -25,7 +25,9 @@
 # assertion carrying any non-integer value is skipped WHOLE rather than half understood, because a
 # dropped argument turns a real assertion into a different one that happens to pass.
 #
-# Output is two kinds of line, so a module shared by two hundred assertions is written once:
+# Output is two kinds of line, so a module shared by two hundred assertions is written once - once
+# per DECLARATION of it, since two identical declarations are two instances and the assertions after
+# the second are written against a fresh one:
 #   M <index> <module bytes as hex>
 #   R <module index> <source file> <export> <args> <expected>
 # where `args` and `expected` are comma-separated `i32:<decimal>` / `i64:<decimal>` and `expected`
@@ -90,11 +92,20 @@ def main():
 				continue
 			doc = json.load(open(out, encoding='utf-8'))
 			current = None
+			current_index = None
 			for command in doc.get('commands', []):
 				kind = command.get('type')
 				if kind == 'module':
 					path = os.path.join(work, os.path.basename(command.get('filename', '')))
 					current = open(path, 'rb').read() if os.path.exists(path) else None
+					# A NEW OCCURRENCE, even when the bytes repeat. The index used to be
+					# `modules.setdefault(bytes, len(modules))`, so two separate `(module ...)`
+					# declarations that happened to assemble identically collapsed into one - and the
+					# runner groups by this index and instantiates once per group, so the second
+					# declaration inherited the first one's mutated globals and memory. The suite
+					# writes its assertions against a fresh instance; instance identity is the
+					# module's OCCURRENCE in the file, not its content.
+					current_index = None
 					continue
 				# A module this engine could never be handed - a component, a text-only module - and
 				# anything else that redefines what "the current module" is: the assertions after it
@@ -131,10 +142,13 @@ def main():
 				# written out to break the reader.
 				if not field or any(c < ' ' or c > '~' for c in field):
 					continue
-				index = modules.setdefault(current, len(modules))
-				rows.append((index, name, field, ','.join(args), expected))
+				# Assigned on first use, so a module no assertion reaches is not written out.
+				if current_index is None:
+					current_index = len(modules)
+					modules[current_index] = current
+				rows.append((current_index, name, field, ','.join(args), expected))
 
-	for data, index in sorted(modules.items(), key=lambda kv: kv[1]):
+	for index, data in sorted(modules.items()):
 		print('M\t%d\t%s' % (index, data.hex()))
 	for index, name, field, args, expected in rows:
 		print('R\t%d\t%s\t%s\t%s\t%s' % (index, name, field.replace('\t', ' '), args, expected))

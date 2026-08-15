@@ -157,6 +157,8 @@ impl<D: BlockDevice> Iso9660<D> {
 		// The Joliet descriptor's own copies of the fields ECMA-119 requires it to share with the
 		// primary: volume space size, logical block size, volume set size, volume sequence number.
 		let mut joliet_common: Option<(u32, u32, u16, u16)> = None;
+		// Whether the medium has identified itself as ISO9660 - see the refusal below.
+		let mut recognised = false;
 		for i in 0..32 {
 			// THE DEVICE, not the medium. An unreadable descriptor sector answered the same way a
 			// blank disc does, so a probe could not tell them apart.
@@ -164,8 +166,13 @@ impl<D: BlockDevice> Iso9660<D> {
 				return Err(MountError::Io);
 			}
 			if &block[1..6] != b"CD001" {
-				return Err(MountError::NotIso);
+				// NOT ISO ONLY UNTIL THE MEDIUM HAS SAID OTHERWISE. The first descriptor deciding
+				// this is a genuine "try another backend"; a later one failing it is an ISO whose
+				// descriptor set is damaged, and answering `NotIso` there tells a probe to move on
+				// from a medium that has already identified itself.
+				return Err(if recognised { MountError::Corrupt } else { MountError::NotIso });
 			}
+			recognised = true;
 			// THE VERSION UNDER THE TYPE, not above it.
 			//
 			// This refused anything whose version byte was not 1, under a comment saying version "is
@@ -237,6 +244,17 @@ impl<D: BlockDevice> Iso9660<D> {
 				2 if is_joliet(&block) => {
 					let Some(set_size) = both16(&block[120..124]) else { return Err(MountError::Corrupt) };
 					let Some(sequence) = both16(&block[124..128]) else { return Err(MountError::Corrupt) };
+					// EVERY RECOGNISED JOLIET DESCRIPTOR IS CHECKED, not only the last one. These
+					// were plain `Option`s, so a second Joliet SVD overwrote the first and the
+					// comparison after the scan saw only whichever came last - a volume could carry
+					// a contradictory descriptor and a conforming one and mount as though the
+					// contradictory one were not there. ECMA-119 permits zero or more supplementary
+					// descriptors, so "the last one" is not a rule, it was an accident of storage.
+					if let Some(previous) = joliet_common
+						&& previous != (blocks, block_size as u32, set_size, sequence)
+					{
+						return Err(MountError::Corrupt);
+					}
 					joliet_common = Some((blocks, block_size as u32, set_size, sequence));
 					joliet_root = Some(found)
 				}
@@ -291,7 +309,16 @@ impl<D: BlockDevice> Iso9660<D> {
 		// asked for the ISO9660 namespace.
 		let mut rrip = false;
 		let mut susp_skip = 0usize;
-		if !joliet && dev.read_block(root_lba as u64, &mut block) && block[0] as usize >= 34 {
+		// THE PROBE'S READ IS PART OF THE MOUNT, so a device that will not answer it is an I/O
+		// failure and not a volume without Rock Ridge. This was `&& dev.read_block(...)`, so a
+		// failed read made the whole condition false and the mount SUCCEEDED with `rrip = false` -
+		// which is the one answer that cannot be distinguished from the truth by anything
+		// downstream. The distinction `MountError::Io` was added for stopped one line short of the
+		// place it mattered most.
+		if !joliet && !dev.read_block(root_lba as u64, &mut block) {
+			return Err(MountError::Io);
+		}
+		if !joliet && block[0] as usize >= 34 {
 			let id_len = block[32] as usize;
 			let sys_off = 33 + id_len + (id_len % 2 == 0) as usize;
 			if let Some(sys) = block.get(sys_off..block[0] as usize)
@@ -708,15 +735,50 @@ fn is_joliet(desc: &[u8]) -> bool {
 	// contain those three bytes anywhere - in a publisher string, in padding a mastering tool left
 	// behind - was read as Joliet, and its namespace was taken as the volume's. Joliet defines the
 	// three sequences for its UCS-2 levels and writes one of them first.
-	// THE WHOLE FIELD, not its first three bytes. The sequences have to start at the first byte,
-	// follow each other without gaps, and leave the rest zero - so a descriptor carrying `%/E`
-	// followed by anything at all was read as Joliet and its namespace taken as the volume's.
-	// Checking the prefix is correct as far as it goes and the remaining 29 bytes were unread.
+	// THE WHOLE FIELD IS READ, AND IT MAY HOLD MORE THAN ONE SEQUENCE.
+	//
+	// Two mistakes have been made here in opposite directions. It first searched the field with
+	// `windows(3)`, so any descriptor happening to contain those bytes anywhere - in a publisher
+	// string, in a tool's leftover padding - was read as Joliet and its namespace taken as the
+	// volume's. The fix required the field to be one Joliet sequence and then nothing but zeros,
+	// which is too strict the other way: ECMA-119 says the field holds ONE OR MORE escape
+	// sequences, packed without gaps, with only the unused remainder zero. A volume announcing
+	// Joliet followed by another legal sequence stopped being recognised as Joliet at all - and
+	// the failure is silent, because it simply mounts the ISO9660 namespace instead.
+	//
+	// So the field is walked sequence by sequence. Joliet's three are the ones being looked for;
+	// any other well-formed sequence is skipped, and the walk ends where the zeros begin. What is
+	// still refused is the shape the first fix was aimed at: bytes after the sequences that are
+	// neither another sequence nor zero.
 	let esc = &desc[88..120];
-	let Some(len) = [b"%/@".as_slice(), b"%/C", b"%/E"].iter().find(|s| esc.starts_with(s)).map(|s| s.len()) else {
-		return false;
-	};
-	esc[len..].iter().all(|byte| *byte == 0)
+	let mut at = 0usize;
+	let mut joliet = false;
+	while at < esc.len() {
+		if esc[at] == 0 {
+			// The unused remainder. Everything from here on must be zero, or this field is not a
+			// sequence list and nothing in it can be trusted.
+			return joliet && esc[at..].iter().all(|byte| *byte == 0);
+		}
+		// An escape sequence is an introducer of one or more intermediate bytes in 0x20..=0x2F
+		// followed by one final byte in 0x30..=0x7E. Joliet's are `%/@`, `%/C` and `%/E`, which is
+		// `%` as the introducer, `/` intermediate, and the level as the final byte.
+		if esc[at] != 0x1b && esc[at] != b'%' {
+			return false;
+		}
+		let start = at;
+		at += 1;
+		while at < esc.len() && (0x20..=0x2f).contains(&esc[at]) {
+			at += 1;
+		}
+		if at >= esc.len() || !(0x30..=0x7e).contains(&esc[at]) {
+			return false;
+		}
+		at += 1;
+		if matches!(&esc[start..at], b"%/@" | b"%/C" | b"%/E") {
+			joliet = true;
+		}
+	}
+	joliet
 }
 
 // Parse a directory record: extent, length, dir flag, and the name (Joliet UCS-2, a Rock
@@ -786,11 +848,22 @@ fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Result<Opt
 	// what the type was introduced to say. An associated file (flag 0x04) is a secondary stream
 	// recorded BEFORE its same-named main file: it must neither list (a duplicate name) nor match a
 	// lookup (it would shadow the main content).
+	// AND THE IDENTIFIER IS DECODED FIRST, so "well-formed" means the whole record.
+	//
+	// The skip moved after the structural checks and stopped in front of the NAME, which left one
+	// asymmetry of the pair this was meant to remove: an odd-length UCS-2 identifier on a Joliet
+	// associated record was dropped silently, while the identical identifier on an ordinary record
+	// was `Corrupt`. The milestone's own word for what `Ok(None)` means is "a WELL-FORMED record
+	// this reader deliberately does not surface", and a record whose name does not decode is not
+	// well-formed.
+	//
+	// The decode's cost is paid for a record that is then discarded, which is the price of the
+	// claim being true.
+	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
+	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip).ok_or(FsError::Corrupt)? };
 	if rec[25] & 0x04 != 0 {
 		return Ok(None);
 	}
-	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
-	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip).ok_or(FsError::Corrupt)? };
 	Ok(Some(Entry { lba, size, is_dir, special, unsupported, name, case_sensitive }))
 }
 

@@ -80,7 +80,16 @@ impl ProcessGroup {
 		if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
 			return None;
 		}
-		let weak: Vec<Weak<Process>> = members.iter().map(Arc::downgrade).collect();
+		// BOOKED, then filled. `collect` allocated infallibly for a length a ring-3 caller chose -
+		// bounded by `MAX_GROUP_MEMBERS`, which says the vector will never be enormous and nothing
+		// about whether the heap can hold it. The gate did not look at `collect` at all.
+		let mut weak: Vec<Weak<Process>> = Vec::new();
+		if weak.try_reserve_exact(members.len()).is_err() {
+			return None;
+		}
+		for member in members {
+			weak.push(Arc::downgrade(member));
+		}
 		let original_size = weak.len();
 		let mut records: Vec<Option<StageRecord>> = Vec::new();
 		if records.try_reserve_exact(original_size).is_err() {
@@ -142,7 +151,31 @@ impl ProcessGroup {
 	pub fn live(&self) -> Vec<Arc<Process>> {
 		let mut guard = self.members.lock();
 		guard.retain(|member| member.strong_count() > 0);
+		// ALLOC-OK: the owned-list form, kept for the test suites. Every ring-3 path goes through
+		// `live_into`, which fills storage the caller already has - a group is bounded at
+		// `MAX_GROUP_MEMBERS`, so one fixed array covers a whole group in one pass.
 		guard.iter().filter_map(Weak::upgrade).collect()
+	}
+
+	// The members still alive, into storage the caller already has - answering how many were
+	// written. `out` should be `MAX_GROUP_MEMBERS` long, which covers any group in one pass.
+	//
+	// The lock is released before the caller acts on what it was given: signalling a member takes
+	// the scheduler's lock, and dropping the last reference to one runs its teardown.
+	pub fn live_into(&self, out: &mut [Option<Arc<Process>>]) -> usize {
+		let mut guard = self.members.lock();
+		guard.retain(|member| member.strong_count() > 0);
+		let mut written = 0;
+		for member in guard.iter() {
+			if written == out.len() {
+				break;
+			}
+			if let Some(process) = member.upgrade() {
+				out[written] = Some(process);
+				written += 1;
+			}
+		}
+		written
 	}
 
 	// Whether every member has reached a terminal state - the condition a group wait completes
@@ -150,7 +183,9 @@ impl ProcessGroup {
 	// and a lone process agree on what "finished" means rather than each deciding. An empty
 	// group is finished by definition, which is the state a fully reaped job reaches.
 	pub fn finished(&self) -> bool {
-		self.live().iter().all(|process| process.is_terminated())
+		let mut members: [Option<Arc<Process>>; MAX_GROUP_MEMBERS] = [const { None }; _];
+		let live = self.live_into(&mut members);
+		members.iter().take(live).all(|member| member.as_ref().is_some_and(|process| process.is_terminated()))
 	}
 
 	// How many processes this group was created over, live or not.

@@ -788,7 +788,15 @@ impl Cg {
 						self.line("\t\t\t\t}");
 						self.line("\t\t\t\tif !reply_handles.is_empty() { return None; }");
 						let errexpr = self.read_value(errty).map_err(|e| Error::new(m.span, e))?;
-						self.line(&format!("\t\t\t\tSome(Err({errexpr}))"));
+						// AND THE ERROR ARM ENDS AT A BOUNDARY TOO. This read the error and returned
+						// it, so a stream-open refusal with bytes after it decoded as an ordinary
+						// refusal - the one arm of the one reply shape that did not check. The
+						// error is bound before `finish` because the check is about what is LEFT
+						// after the value, and a `?` inside the `Some(...)` would have ordered them
+						// the other way round.
+						self.line(&format!("\t\t\t\tlet error = {errexpr};"));
+						self.line("\t\t\t\tr.finish()?;");
+						self.line("\t\t\t\tSome(Err(error))");
 						self.line("\t\t\t})();");
 						self.line("\t\t\tif !matches!(decoded, Some(Ok(_))) {");
 						self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");

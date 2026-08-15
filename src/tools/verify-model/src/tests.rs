@@ -626,11 +626,11 @@ fn a_partial_sweep_is_refused_rather_than_believed() {
 #[test]
 fn trust_lapses_when_the_model_hash_moves() {
 	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
-	store.grant("audio", "hash-a", crate::shadow::Universe::TestGuest, 9, vec![String::from("x86_64"), String::from("riscv64")], 1);
-	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest), crate::trust::Level::Trusted);
+	store.grant("audio", "hash-a", crate::shadow::Universe::TestGuest, 9, vec![String::from("x86_64"), String::from("riscv64")], crate::shadow::Scope::default(), 1);
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &crate::shadow::Scope::default()), crate::trust::Level::Trusted);
 	// The graph changed, or the covers declarations did, or the selector did. The evidence was
 	// produced by a model that is no longer the one running.
-	assert_eq!(store.level("audio", "hash-b", crate::shadow::Universe::TestGuest), crate::trust::Level::Shadow);
+	assert_eq!(store.level("audio", "hash-b", crate::shadow::Universe::TestGuest, &crate::shadow::Scope::default()), crate::trust::Level::Shadow);
 	let dropped = store.prune("hash-b");
 	assert_eq!(dropped, vec![String::from("audio")]);
 	assert!(store.certificates.is_empty());
@@ -644,7 +644,7 @@ fn trust_lapses_when_the_model_hash_moves() {
 // criteria now refuse, so the fixtures have to be honest about it: five pieces of evidence means
 // five different trees.
 fn evidence(universe: crate::shadow::Universe, architecture: &str, exec: bool, tree: &str) -> crate::shadow::Record {
-	crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: tree.to_string(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true, component_decisions: vec![format!("audio\t{tree}")] }
+	crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: tree.to_string(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true, component_decisions: vec![format!("audio\t{tree}")], component_scopes: [(String::from("audio"), crate::shadow::Scope { change_kinds: vec![String::from("modified")], edge_kinds: vec![String::from("link.static")] })].into_iter().collect() }
 }
 
 #[test]
@@ -1290,11 +1290,12 @@ fn evidence_in_one_universe_does_not_vouch_for_another() {
 	}
 	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	let (clean, architectures) = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect("the guest suite has been validated");
-	store.grant("audio", "hash-a", crate::shadow::Universe::TestGuest, clean, architectures, 0);
+	let scope = store.evidence_scope("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).scope;
+	store.grant("audio", "hash-a", crate::shadow::Universe::TestGuest, clean, architectures, scope, 0);
 
-	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest), crate::trust::Level::Trusted);
-	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::Host), crate::trust::Level::Shadow, "nothing has compared a host-suite selection for this component");
-	assert!(!store.trusted_everywhere("audio", "hash-a", &[crate::shadow::Universe::Host, crate::shadow::Universe::TestGuest]), "and a scoped run therefore still has something unproven behind it");
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &crate::shadow::Scope::default()), crate::trust::Level::Trusted);
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::Host, &crate::shadow::Scope::default()), crate::trust::Level::Shadow, "nothing has compared a host-suite selection for this component");
+	assert!(!store.trusted_everywhere("audio", "hash-a", &[crate::shadow::Universe::Host, crate::shadow::Universe::TestGuest], &crate::shadow::Scope::default()), "and a scoped run therefore still has something unproven behind it");
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::Host, &log).is_err());
 }
 
@@ -1397,6 +1398,12 @@ fn a_build_covered_component_can_reach_trusted() {
 	let record = |architecture: &str, exec: bool, tree: &str| {
 		let mut record = evidence(crate::shadow::Universe::HostBuild, architecture, exec, tree);
 		record.changed_components = vec![String::from("term")];
+		// The DECISION about term, which is what distinctness is keyed on. The fixture used to leave
+		// audio's decision here and lean on `source_digest` to tell the records apart - which is the
+		// key that stopped counting, because a deterministic selector asked the same question from
+		// six trees answers it the same way six times.
+		record.component_decisions = vec![format!("term\t{tree}")];
+		record.component_scopes = [(String::from("term"), crate::shadow::Scope { change_kinds: vec![String::from("modified")], edge_kinds: vec![String::from("link.static")] })].into_iter().collect();
 		record
 	};
 	for (tree, architecture) in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"].into_iter().enumerate() {
@@ -1407,8 +1414,9 @@ fn a_build_covered_component_can_reach_trusted() {
 	assert!(dry.contains("EXECUTED"), "{dry}");
 	log.records.push(record("x86_64", true, "tree-6"));
 	let (clean, architectures) = store.evaluate("term", "hash-a", crate::shadow::Universe::HostBuild, &log).expect("six clean build comparisons over two architectures, one of them sampled");
-	store.grant("term", "hash-a", crate::shadow::Universe::HostBuild, clean, architectures, 0);
-	assert_eq!(store.level("term", "hash-a", crate::shadow::Universe::HostBuild), crate::trust::Level::Trusted, "a build-covered component can now arrive");
+	let scope = store.evidence_scope("term", "hash-a", crate::shadow::Universe::HostBuild, &log).scope;
+	store.grant("term", "hash-a", crate::shadow::Universe::HostBuild, clean, architectures, scope, 0);
+	assert_eq!(store.level("term", "hash-a", crate::shadow::Universe::HostBuild, &crate::shadow::Scope::default()), crate::trust::Level::Trusted, "a build-covered component can now arrive");
 }
 
 #[test]
@@ -1552,7 +1560,7 @@ fn which_universes_may_judge_a_component_comes_from_its_checks() {
 	// A component nothing covers has NO judges, and `trusted_everywhere` must answer false rather
 	// than vacuously true - an empty `all()` is true, and that is the shape of the bug it would be.
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
-	assert!(!store.trusted_everywhere("a-component-no-check-covers", "hash", &[]), "no judge is not the same as every judge agreeing");
+	assert!(!store.trusted_everywhere("a-component-no-check-covers", "hash", &[], &crate::shadow::Scope::default()), "no judge is not the same as every judge agreeing");
 }
 
 #[test]
@@ -1601,28 +1609,30 @@ fn the_build_evidence_producer_runs_on_the_architectures_the_plan_builds() {
 fn a_certificate_names_what_its_evidence_covers() {
 	// THE CRITERIA THE RECORDS COULD ALREADY ANSWER. `evaluate` counts clean runs, distinct
 	// decisions, architectures and an execution sample; the frozen design also asked which change
-	// classes and which edge kinds were exercised, and the records have carried `change_kinds`,
-	// `edge_kinds` and `model_self_check` since the round that added them - under a comment saying
-	// the policy could not be written before there were records to grade. There are records now, and
-	// the data was being discarded at the point of judgement rather than at the point of collection.
+	// classes and which edge kinds were exercised, and the records have carried them since the round
+	// that added them - under a comment saying the policy could not be written before there were
+	// records to grade.
 	//
-	// Graded rather than required, because the honest use of it is to say what a certificate covers:
-	// five perfect verifications of one KIND of change are not evidence about a different kind, and
-	// distinctness only makes them five different decisions.
+	// PER COMPONENT, which is the half that was still global. `change_kinds` and `edge_kinds` on the
+	// record describe the whole change set, so a commit that renamed a file in a NEIGHBOUR widened
+	// this component's scope to cover renames nothing had validated it over.
 	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
 	for (index, architecture) in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"].into_iter().enumerate() {
 		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, true, "one-tree");
 		record.component_decisions = vec![format!("audio\tdecision-{}", index / 2)];
-		record.change_kinds = vec![String::from("source")];
-		record.edge_kinds = vec![String::from("link.static")];
+		// The run also renamed something in a neighbour and reached it through another edge. Both
+		// are true of the RUN and neither is true of audio.
+		record.change_kinds = vec![String::from("modified"), String::from("renamed")];
+		record.edge_kinds = vec![String::from("link.static"), String::from("generation.build")];
+		record.component_scopes.insert(String::from("term"), crate::shadow::Scope { change_kinds: vec![String::from("renamed")], edge_kinds: vec![String::from("generation.build")] });
 		log.records.push(record);
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
 	assert!(store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).is_ok());
 	let scope = store.evidence_scope("audio", "hash-a", crate::shadow::Universe::TestGuest, &log);
 	assert_eq!(scope.records, 10);
-	assert_eq!(scope.change_kinds, vec![String::from("source")], "ten runs over source edits say nothing about a manifest edit, and the certificate says which it is");
-	assert_eq!(scope.edge_kinds, vec![String::from("link.static")]);
+	assert_eq!(scope.scope.change_kinds, vec![String::from("modified")], "the neighbour's rename is not audio's evidence");
+	assert_eq!(scope.scope.edge_kinds, vec![String::from("link.static")], "nor the edge the neighbour was reached through");
 	assert!(scope.all_self_checked);
 
 	// A comparison made by a model failing its own checks is not evidence about the tree at all -
@@ -1632,10 +1642,85 @@ fn a_certificate_names_what_its_evidence_covers() {
 	assert_eq!(scope.records, 9, "the record made by an unsound model is not counted");
 	assert!(scope.all_self_checked, "and what is counted was all made by a sound one, which is the statement");
 
+	// A record written before `component_scopes` existed cannot say what it covered FOR A COMPONENT,
+	// and its global fields are the whole run's. It counts as a run and contributes no scope, which
+	// is the same failing-closed rule `model_self_check` applies.
+	for record in &mut log.records {
+		record.component_scopes.clear();
+	}
+	let scope = store.evidence_scope("audio", "hash-a", crate::shadow::Universe::TestGuest, &log);
+	assert_eq!(scope.records, 9, "the runs still happened");
+	assert!(scope.scope.change_kinds.is_empty() && scope.scope.edge_kinds.is_empty(), "and say nothing about what they covered");
+
 	// And a component with no clean evidence at all has an EMPTY scope rather than a missing one:
 	// zero records, nothing exercised. `all_self_checked` is vacuously true over none, which is why
 	// the count is what a reader has to look at first.
 	let scope = store.evidence_scope("nothing", "hash-a", crate::shadow::Universe::TestGuest, &log);
 	assert_eq!(scope.records, 0);
-	assert!(scope.change_kinds.is_empty() && scope.edge_kinds.is_empty());
+	assert!(scope.scope.change_kinds.is_empty() && scope.scope.edge_kinds.is_empty());
+}
+
+#[test]
+fn a_certificate_earned_on_one_kind_of_change_does_not_answer_for_another() {
+	// THE SCOPE WAS A REPORT AND NOT A BOUND. It was computed at grant time, printed, and thrown
+	// away: the certificate stored was `TRUSTED(component, universe, model_hash)`, and `level` looked
+	// it up without ever asking what the change in hand was. So five clean comparisons over source
+	// edits reached through `link.static` answered for a RENAME reached through `generation.build` -
+	// a combination no shadow comparison had seen, trusted on the strength of ones that had nothing
+	// to do with it.
+	//
+	// This is the broad-certificate defect the milestone split `HostBuild` out of `Host` to prevent,
+	// one level down: a grant wider than its evidence.
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	for (index, architecture) in ["x86_64", "riscv64", "x86_64", "riscv64", "x86_64", "riscv64"].into_iter().enumerate() {
+		let mut record = evidence(crate::shadow::Universe::TestGuest, architecture, true, "one-tree");
+		record.component_decisions = vec![format!("audio\tdecision-{index}")];
+		log.records.push(record);
+	}
+	let mut store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	let (clean, architectures) = store.evaluate("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).expect("six distinct clean decisions, two architectures, one execution sample");
+	let scope = store.evidence_scope("audio", "hash-a", crate::shadow::Universe::TestGuest, &log).scope;
+	assert_eq!(scope.change_kinds, vec![String::from("modified")]);
+	store.grant("audio", "hash-a", crate::shadow::Universe::TestGuest, clean, architectures, scope, 0);
+
+	let earned = crate::shadow::Scope { change_kinds: vec![String::from("modified")], edge_kinds: vec![String::from("link.static")] };
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &earned), crate::trust::Level::Trusted, "the change it was earned over");
+
+	let renamed = crate::shadow::Scope { change_kinds: vec![String::from("renamed")], edge_kinds: vec![String::from("link.static")] };
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &renamed), crate::trust::Level::Shadow, "a class of change nothing validated this selector over");
+	assert_eq!(store.shortfall("audio", "hash-a", crate::shadow::Universe::TestGuest, &renamed), vec![String::from("change kind 'renamed'")], "and the runner can say what is missing");
+
+	let generated = crate::shadow::Scope { change_kinds: vec![String::from("modified")], edge_kinds: vec![String::from("generation.build")] };
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &generated), crate::trust::Level::Shadow, "an edge of the graph the evidence never walked");
+
+	// Both dimensions at once, which is the combination the audit named.
+	let both = crate::shadow::Scope { change_kinds: vec![String::from("renamed")], edge_kinds: vec![String::from("generation.build")] };
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &both), crate::trust::Level::Shadow);
+	assert!(!store.trusted_everywhere("audio", "hash-a", &[crate::shadow::Universe::TestGuest], &both), "and the whole-run answer follows the same rule");
+
+	// A certificate written before scopes existed covers nothing but a requirement that asks
+	// nothing. Failing closed: a grant that cannot say what it proved has not proved anything.
+	store.certificates[0].scope = crate::shadow::Scope::default();
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &earned), crate::trust::Level::Shadow);
+	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &crate::shadow::Scope::default()), crate::trust::Level::Trusted, "which is what a report with no change in hand asks");
+}
+
+#[test]
+fn the_edges_a_component_is_evidence_about_are_the_ones_walked_out_of_it() {
+	// `edge_kinds` is the union over the whole plan, and a certificate is about one component - so a
+	// change touching two components gave each of them the other's edges. The reach paths carry the
+	// seed they start from, which is what makes the attribution possible at all.
+	let model = model();
+	let plan = plan_for(&model, &["src/user/libs/audio/flac/src/lib.rs", "src/term/src/screen.rs"]);
+	assert_eq!(plan.changed_components.len(), 2, "the fixture must change exactly two components: {:?}", plan.changed_components);
+	for component in &plan.changed_components {
+		let mine = plan.component_edge_kinds.get(component).expect("every changed component is a seed and gets an entry");
+		for kind in mine {
+			assert!(plan.edge_kinds.contains(kind), "{component}: '{kind}' is not an edge this plan walked at all");
+		}
+	}
+	// The union of the per-component sets is what the global set is FOR THE SEEDS - anything the
+	// global list has beyond it was walked out of a component this change did not touch.
+	let union: BTreeSet<&String> = plan.component_edge_kinds.values().flatten().collect();
+	assert!(union.iter().all(|kind| plan.edge_kinds.contains(*kind)));
 }

@@ -558,7 +558,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -592,7 +592,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -639,7 +639,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone() });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -708,7 +708,7 @@ fn run() -> Result<ExitCode, String> {
 			// judged is a record that will be believed about a different system later.
 			let mut log = verify_model::shadow::Log::load(&repo_root);
 			log.schema = 1;
-			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone() });
+			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan) });
 			log.save(&repo_root)?;
 			// Only Consistent is green, and the other three are green in different wrong ways.
 			// CandidateMiss is the selector's problem; SelectionFailed is the code's and the sweep
@@ -744,7 +744,13 @@ fn run() -> Result<ExitCode, String> {
 			// Trusted EVERYWHERE, not merely in the universe that happens to have evidence: a clean
 			// record on the kernel suite says nothing about whether a host suite or a gate would have
 			// been selected, and shadow only ever examined the kernel suite until now.
-			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| !store.trusted_everywhere(component, &hash, &verify_model::catalog::judging_universes(&model.catalog, component))).collect();
+			// AND TRUSTED FOR THIS CHANGE. A certificate is earned over particular classes of edit
+			// reached through particular graph edges; a rename that pulls a component in through
+			// `generation.build` is not what five clean source-edit comparisons validated. The
+			// scope travels with the grant now, so the question the runner asks is a subset test
+			// rather than a lookup.
+			let scopes = verify_model::shadow::component_scopes(&repo_root, &plan);
+			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| !store.trusted_everywhere(component, &hash, &verify_model::catalog::judging_universes(&model.catalog, component), scopes.get(component.as_str()).unwrap_or(&verify_model::shadow::Scope::default()))).collect();
 			// The age BOUND, which is the part that makes it a bound rather than a report.
 			//
 			// A key past its window has not been exercised within the period this tree is willing to
@@ -787,16 +793,17 @@ fn run() -> Result<ExitCode, String> {
 				] {
 					match store.evaluate(&component, &hash, universe, &log) {
 						Ok((clean, architectures)) => {
-							store.grant(&component, &hash, universe, clean, architectures, verify_model::history::now());
-							// WHAT THE EVIDENCE COVERS, printed with the grant. `evaluate` counts
-							// clean runs, distinct decisions, architectures and an execution sample;
-							// the design also asked which change classes and edge kinds were
-							// exercised, and the records have carried both since they were added.
-							// A certificate that cannot name its own scope is the broad-certificate
-							// defect this milestone split `HostBuild` out to prevent, one level up.
+							// WHAT THE EVIDENCE COVERS, computed BEFORE the grant and stored ON it.
+							// `evaluate` counts clean runs, distinct decisions, architectures and an
+							// execution sample; the design also asked which change classes and edge
+							// kinds were exercised. This used to be computed after the grant and
+							// printed, so the certificate that was stored could not name its own
+							// scope and `level` had nothing to compare a change against.
 							let scope = store.evidence_scope(&component, &hash, universe, &log);
+							store.grant(&component, &hash, universe, clean, architectures, scope.scope.clone(), verify_model::history::now());
 							println!("{component} is TRUSTED for {universe:?} under model {hash}");
-							println!("  evidence: {} clean record(s), change kinds [{}], edge kinds [{}], model self-check {}", scope.records, scope.change_kinds.join(", "), scope.edge_kinds.join(", "), if scope.all_self_checked { "green in every one" } else { "NOT green in all of them" });
+							println!("  evidence: {} clean record(s), change kinds [{}], edge kinds [{}], model self-check {}", scope.records, scope.scope.change_kinds.join(", "), scope.scope.edge_kinds.join(", "), if scope.all_self_checked { "green in every one" } else { "NOT green in all of them" });
+							println!("  and it answers for those and nothing else: a change of another class falls back to shadow");
 							granted += 1;
 						}
 						Err(reason) => println!("{component} stays in SHADOW for {universe:?}: {reason}"),

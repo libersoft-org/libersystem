@@ -35,6 +35,18 @@ pub struct Certificate {
 	pub model_hash: String,
 	pub clean_runs: usize,
 	pub architectures: Vec<String>,
+	// WHAT THE EVIDENCE COVERED, carried on the grant rather than printed beside it.
+	//
+	// This was computed at grant time, written to stdout and thrown away, so the certificate stored
+	// was `TRUSTED(component, universe, model_hash)` - and `level` had nothing to compare a change
+	// against. Evidence gathered over source edits reached through `link.static` then answered for a
+	// rename reached through `generation.build`, a combination no shadow comparison had ever seen.
+	// A grant that names its own scope and a check that ignores it is a report, not a bound.
+	//
+	// Defaulted empty for certificates written before the field, which covers nothing but an empty
+	// requirement - the same failing-closed rule `model_self_check` applies to records.
+	#[serde(default)]
+	pub scope: crate::shadow::Scope,
 	pub granted_at: u64,
 	pub note: String,
 }
@@ -86,18 +98,6 @@ pub fn required_architectures(universe: crate::shadow::Universe) -> usize {
 	}
 }
 
-// Which universes have an execution mechanism a sample can be taken of.
-//
-// The guest suite has one: an exact `TEST_SELECTION` handed to a runner that can fail to match it.
-// The host and dev producers lower a selection into shell commands, and a sample of those is exactly
-// as valuable - `verify.sh` now runs the scoped selection on both before the sweep, so they are here
-// too. The exemption they used to have is what hid a real defect for a round: the dev producer
-// emitted a command bash could not parse, which is precisely what an execution sample detects.
-//
-// `HostBuild` stays exempt, and this is the reason rather than an omission: "executing the
-// selection" there means building those parts, and the sweep builds every part anyway - so a scoped
-// build run would be a second full build for a sample the sweep has already effectively taken. The
-// day that stops being true, this is one line.
 // What a component's clean evidence actually covers, beside how much of it there is.
 //
 // A certificate says "this component's scoped runs can be believed"; the design's criteria say that
@@ -105,11 +105,9 @@ pub fn required_architectures(universe: crate::shadow::Universe) -> usize {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct EvidenceScope {
 	pub records: usize,
-	// The classes of change the clean evidence was made over - source edits, manifest edits, test
-	// edits. Five perfect verifications of one class are not evidence about another.
-	pub change_kinds: Vec<String>,
-	// The graph edges the selector walked to reach this component in those runs.
-	pub edge_kinds: Vec<String>,
+	// The classes of change the clean evidence was made over and the graph edges it walked out of
+	// this component. Five perfect verifications of one class are not evidence about another.
+	pub scope: crate::shadow::Scope,
 	// Whether the model passed its own checks in every one of them - which `is_clean` already
 	// requires, so this is `true` whenever `records` is non-zero. Kept because the scope is a
 	// STATEMENT about what was proved, and "the model was sound throughout" is part of that
@@ -154,10 +152,25 @@ impl Store {
 
 	// A certificate earned under a different model is not demoted so much as it stops applying: the
 	// thing it vouched for is not the thing that runs now.
-	pub fn level(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe) -> Level {
+	//
+	// AND NEITHER IS ONE EARNED OVER A DIFFERENT KIND OF CHANGE. `needed` is the scope of the change
+	// being judged - its classes of edit, and the graph edges the selector walked out of this
+	// component to reach what it selected. A certificate answers for it only when it covers both.
+	// Pass `Scope::default()` where there is no change in hand, which is every reporting caller: an
+	// empty requirement asks nothing and is covered by anything.
+	pub fn level(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe, needed: &crate::shadow::Scope) -> Level {
 		match self.certificates.iter().find(|certificate| certificate.component == component && certificate.universe == universe) {
-			Some(certificate) if certificate.model_hash == model_hash => Level::Trusted,
+			Some(certificate) if certificate.model_hash == model_hash && certificate.scope.covers(needed) => Level::Trusted,
 			_ => Level::Shadow,
+		}
+	}
+
+	// Why a certificate did not answer for this change, for a runner that has to say what it is
+	// falling back to shadow FOR.
+	pub fn shortfall(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe, needed: &crate::shadow::Scope) -> Vec<String> {
+		match self.certificates.iter().find(|certificate| certificate.component == component && certificate.universe == universe) {
+			Some(certificate) if certificate.model_hash == model_hash => certificate.scope.shortfall(needed),
+			_ => Vec::new(),
 		}
 	}
 
@@ -170,11 +183,11 @@ impl Store {
 	//
 	// `universes` comes from the catalog - the environments the component's own checks run in - so a
 	// component acquires and loses judges as its checks do.
-	pub fn trusted_everywhere(&self, component: &str, model_hash: &str, universes: &[crate::shadow::Universe]) -> bool {
+	pub fn trusted_everywhere(&self, component: &str, model_hash: &str, universes: &[crate::shadow::Universe], needed: &crate::shadow::Scope) -> bool {
 		if universes.is_empty() {
 			return false;
 		}
-		universes.iter().all(|universe| self.level(component, model_hash, *universe) == Level::Trusted)
+		universes.iter().all(|universe| self.level(component, model_hash, *universe, needed) == Level::Trusted)
 	}
 
 	pub fn stale(&self, model_hash: &str) -> Vec<&Certificate> {
@@ -209,7 +222,7 @@ impl Store {
 		// times over, and it would have worked.
 		let distinct = log.distinct_evidence_for(component, model_hash, universe);
 		if distinct < REQUIRED_CLEAN_RUNS {
-			return Err(format!("{clean} clean comparison(s) but only {distinct} distinct one(s) - {REQUIRED_CLEAN_RUNS} different (tree, change) pairs are needed, because the selector is deterministic and the same comparison repeated is one piece of evidence"));
+			return Err(format!("{clean} clean comparison(s) but only {distinct} distinct one(s) - {REQUIRED_CLEAN_RUNS} different DECISIONS about this component are needed, because the selector is deterministic and the same decision validated again is one piece of evidence however many trees it was asked from"));
 		}
 		let needed = required_architectures(universe);
 		if architectures.len() < needed {
@@ -249,10 +262,16 @@ impl Store {
 	// of one KIND of change are not evidence about a different kind. Distinctness makes them five
 	// different decisions; this makes them five different KINDS of decision.
 	//
-	// Graded rather than required: what is returned is what the evidence covers, so a caller can say
-	// "trusted for source changes and manifest changes" instead of "trusted". A certificate that
-	// cannot name its own scope is the broad-certificate defect this milestone split `HostBuild` out
-	// to prevent, one level up.
+	// Carried onto the certificate rather than printed beside it. It used to be computed AFTER the
+	// grant and written to stdout, which made the scope a report about a certificate that did not
+	// contain it - so `level` could not consult it and the change being judged was never compared
+	// against what the evidence had covered.
+	//
+	// PER COMPONENT, from the record's own `component_scopes`. The global `change_kinds` and
+	// `edge_kinds` describe the whole change set, so a commit that renamed a file in a neighbour
+	// widened this component's scope to cover renames it was never validated over - the same free
+	// neighbour that distinctness had to be keyed away from. A record written before those existed
+	// contributes nothing, which fails closed.
 	pub fn evidence_scope(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe, log: &Log) -> EvidenceScope {
 		let mut change_kinds: BTreeSet<String> = BTreeSet::new();
 		let mut edge_kinds: BTreeSet<String> = BTreeSet::new();
@@ -260,16 +279,18 @@ impl Store {
 		let mut records = 0usize;
 		for record in log.records.iter().filter(|record| Log::is_clean(record, component, model_hash, universe)) {
 			records += 1;
-			change_kinds.extend(record.change_kinds.iter().cloned());
-			edge_kinds.extend(record.edge_kinds.iter().cloned());
+			if let Some(scope) = record.component_scopes.get(component) {
+				change_kinds.extend(scope.change_kinds.iter().cloned());
+				edge_kinds.extend(scope.edge_kinds.iter().cloned());
+			}
 			all_self_checked &= record.model_self_check;
 		}
-		EvidenceScope { records, change_kinds: change_kinds.into_iter().collect(), edge_kinds: edge_kinds.into_iter().collect(), all_self_checked }
+		EvidenceScope { records, scope: crate::shadow::Scope { change_kinds: change_kinds.into_iter().collect(), edge_kinds: edge_kinds.into_iter().collect() }, all_self_checked }
 	}
 
-	pub fn grant(&mut self, component: &str, model_hash: &str, universe: crate::shadow::Universe, clean_runs: usize, architectures: Vec<String>, at: u64) {
+	pub fn grant(&mut self, component: &str, model_hash: &str, universe: crate::shadow::Universe, clean_runs: usize, architectures: Vec<String>, scope: crate::shadow::Scope, at: u64) {
 		self.certificates.retain(|certificate| !(certificate.component == component && certificate.universe == universe));
-		self.certificates.push(Certificate { component: component.to_string(), universe, model_hash: model_hash.to_string(), clean_runs, architectures, granted_at: at, note: String::from("earned by clean dry-shadow comparisons under this model hash, in this universe alone; it lapses the moment the hash moves") });
+		self.certificates.push(Certificate { component: component.to_string(), universe, model_hash: model_hash.to_string(), clean_runs, architectures, scope, granted_at: at, note: String::from("earned by clean dry-shadow comparisons under this model hash, in this universe alone, over the change classes and edge kinds in `scope` and no others; it lapses the moment the hash moves") });
 		self.certificates.sort_by(|left, right| (&left.component, left.universe).cmp(&(&right.component, right.universe)));
 	}
 

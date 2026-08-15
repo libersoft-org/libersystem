@@ -173,9 +173,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None })),
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"ISOBLOCK" => match Iso9660::mount(IsoBlockDevice { chan: handle }) {
-			Some(fs) => Volume::new(alloc::boxed::Box::new(IsoFs { fs })),
-			None => exit(),
+		// `mount_checked` here too, for the reason written against UDF below - which was written
+		// while this line went on calling `mount`. The reader gained `MountError` and this boundary
+		// went on collapsing it, so the distinction existed everywhere except where somebody would
+		// read it.
+		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"ISOBLOCK" => match Iso9660::mount_checked(IsoBlockDevice { chan: handle }) {
+			Ok(fs) => Volume::new(alloc::boxed::Box::new(IsoFs { fs })),
+			Err(why) => {
+				unsafe { print(alloc::format!("storage: the ISO volume was refused: {why:?}\n").as_bytes()) };
+				exit()
+			}
 		},
 		// `mount_checked`, so a refusal says WHICH refusal. `mount` collapses "this is not UDF",
 		// "this UDF is damaged", "this UDF uses something the reader does not implement" and "the

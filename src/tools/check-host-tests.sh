@@ -59,11 +59,17 @@ while IFS=$'\t' read -r dir crate configuration; do
 	# host test: the harness needs `std` and `test`, and a second `core` collides with the one `std`
 	# already carries. Cargo takes its config from the working directory, so staying out of that
 	# subtree is what selects the host.
+	# `--include-ignored`, so a test that is ignored for want of a build artifact RUNS here.
+	#
+	# `#[ignore]` is how a test says "not under a bare `cargo test`" - the SDK panic tests need a
+	# wasm32 artifact this tree builds elsewhere. That is right for a developer running one crate's
+	# tests and wrong for the gate, which is the place those artifacts exist. Without this the gate
+	# reported them as ignored and nothing exercised the SDK's own panic handler.
 	args=(--quiet --manifest-path "../$dir/Cargo.toml")
 	if [[ "$configuration" != default ]]; then
 		args+=(--no-default-features --features "$configuration")
 	fi
-	if ! cargo test "${args[@]}"; then
+	if ! cargo test "${args[@]}" -- --include-ignored; then
 		echo "host-tests: $crate ($configuration) FAILED" >&2
 		failed+=("$crate/$configuration")
 		status=1

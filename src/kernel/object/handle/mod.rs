@@ -252,11 +252,26 @@ impl HandleTable {
 		// and to reissue one whose slot vanished. The failure is therefore made into a handle value
 		// that names nothing, which the holder discovers as a bad handle on first use - a refusal,
 		// where the infallible push was a kernel abort reachable from ring 3 by exhausting the heap.
-		self.place(cap)
+		//
+		// AND THE CHARGE COMES BACK WHEN IT DOES. The quota was taken above and the failure branch
+		// dropped the capability and returned handle 0, so a table that could not grow left the
+		// Domain paying for a handle that does not exist - a leak that repeats every time the heap
+		// is short and is never reclaimed, because there is no handle to close.
+		match self.try_place(cap) {
+			Ok(handle) => handle,
+			Err(_) => {
+				if let Some(domain) = &self.domain {
+					domain.uncharge_handles(1);
+				}
+				Handle::new(0, 0)
+			}
+		}
 	}
 
 	// Mint a fresh capability for `object` with `rights`/`badge` and install it.
 	pub fn insert_object(&mut self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Handle {
+		// ALLOC-OK: `HandleTable::insert`, not a collection insert - and it books its slot through
+		// `try_place`, refunding the Domain charge when the table cannot grow.
 		self.insert(Capability::new(object, rights, badge))
 	}
 

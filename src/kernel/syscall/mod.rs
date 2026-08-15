@@ -1665,10 +1665,17 @@ fn sys_process_group_signal(group_handle: u64, signal: u64) -> i64 {
 		Err(e) => return e,
 	};
 	let mut result = 0;
-	for process in group.live() {
-		let one = deliver_signal(&process, signal);
-		if one != 0 {
-			result = one;
+	// Into a fixed array: a group is bounded at `MAX_GROUP_MEMBERS`, so one pass covers it and the
+	// walk asks the heap for nothing. `live()` collects into a `Vec`, which is an infallible
+	// allocation on a syscall path.
+	let mut members: [Option<alloc::sync::Arc<Process>>; crate::object::process_group::MAX_GROUP_MEMBERS] = [const { None }; _];
+	let live = group.live_into(&mut members);
+	for slot in members.iter_mut().take(live) {
+		if let Some(process) = slot.take() {
+			let one = deliver_signal(&process, signal);
+			if one != 0 {
+				result = one;
+			}
 		}
 	}
 	result
@@ -1697,7 +1704,9 @@ fn sys_process_group_stats(group_handle: u64, buf_ptr: u64, count: u64) -> i64 {
 		Err(e) => return e,
 	};
 	let records = group.records();
-	let live = group.live();
+	let mut members: [Option<alloc::sync::Arc<Process>>; crate::object::process_group::MAX_GROUP_MEMBERS] = [const { None }; _];
+	let live_count = group.live_into(&mut members);
+	let live: &[Option<alloc::sync::Arc<Process>>] = &members[..live_count];
 	let size = core::mem::size_of::<ProcessStats>() as u64;
 	let writable = core::cmp::min(count, records.len() as u64);
 	let bytes = match writable.checked_mul(size) {
@@ -1713,7 +1722,7 @@ fn sys_process_group_stats(group_handle: u64, buf_ptr: u64, count: u64) -> i64 {
 	for index in 0..writable as usize {
 		let out = match records[index] {
 			Some(record) => ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: record.state, completion: record.completion, completion_valid: record.completion_valid },
-			None => match live.get(index).filter(|process| !process.is_terminated()) {
+			None => match live.get(index).and_then(|slot| slot.as_ref()).filter(|process| !process.is_terminated()) {
 				Some(process) => ProcessStats { messages_sent: process.messages_sent(), messages_received: process.messages_received(), handle_count: process.handle_count(), memory_bytes: process.memory_bytes(), state: PROC_STATE_RUNNING, completion: 0, completion_valid: 0 },
 				None => ProcessStats { state: PROC_STATE_RUNNING, ..Default::default() },
 			},
@@ -1725,27 +1734,51 @@ fn sys_process_group_stats(group_handle: u64, buf_ptr: u64, count: u64) -> i64 {
 	writable as i64
 }
 
+// Wake every thread of `process`, WITHOUT allocating.
+//
+// This was `for thread in process.live_threads()`, and `live_threads` collects into a `Vec` - so
+// delivering a signal to a process asked the heap for memory, from a syscall, on behalf of ring 3.
+// A short heap turned `SYS_PROCESS_SIGNAL` into a kernel abort, and the allocation gate never saw it
+// because it does not look for `collect`.
+//
+// A fixed batch, refilled until the list is walked. Eight is one cache line of pointers and covers
+// every process in this tree in one pass; a larger one costs another pass and no correctness. A
+// thread that appears twice across two batches is woken twice, which `try_claim_wake` already makes
+// a no-op - and a thread that exits between batches is one that no longer needs waking.
+fn wake_every_thread(process: &alloc::sync::Arc<Process>) {
+	let mut at = 0;
+	loop {
+		let mut batch: [Option<alloc::sync::Arc<crate::object::thread::Thread>>; 8] = [const { None }; _];
+		let (written, next) = process.live_threads_from(at, &mut batch);
+		for slot in batch.iter_mut().take(written) {
+			// Outside the process's thread lock, which `live_threads_from` has already released:
+			// waking takes the scheduler's lock and dropping the last reference runs `Thread::drop`.
+			if let Some(thread) = slot.take() {
+				sched::wake_thread(&thread);
+			}
+		}
+		if written == 0 && next == at {
+			break;
+		}
+		at = next;
+	}
+}
+
 // The disposition one signal has on one process, shared by the per-process and per-group
 // syscalls so a group cannot drift from what signalling a member directly does.
 fn deliver_signal(process: &alloc::sync::Arc<Process>, signal: u64) -> i64 {
 	match signal {
 		SIG_INT if process.is_int_caught() => {
 			process.set_int_pending();
-			for thread in process.live_threads() {
-				sched::wake_thread(&thread);
-			}
+			wake_every_thread(process);
 		}
 		SIG_INT | SIG_TERM | SIG_KILL => {
 			process.terminate();
-			for thread in process.live_threads() {
-				sched::wake_thread(&thread);
-			}
+			wake_every_thread(process);
 		}
 		SIG_STOP => {
 			process.set_stopped(true);
-			for thread in process.live_threads() {
-				sched::wake_thread(&thread);
-			}
+			wake_every_thread(process);
 		}
 		SIG_CONT => {
 			process.set_stopped(false);
@@ -2459,12 +2492,13 @@ fn sys_wait(handle: u64, deadline: u64, flags: u64) -> i64 {
 	// short heap ABORTS the kernel.
 	let mut group_koids: Vec<u64> = Vec::new();
 	if let Some(group) = object.as_any().downcast_ref::<crate::object::process_group::ProcessGroup>() {
-		let members = group.live();
-		if group_koids.try_reserve(members.len() + 1).is_err() {
+		let mut live: [Option<alloc::sync::Arc<Process>>; crate::object::process_group::MAX_GROUP_MEMBERS] = [const { None }; _];
+		let count = group.live_into(&mut live);
+		if group_koids.try_reserve(count + 1).is_err() {
 			return ERR_NO_MEMORY;
 		}
 		group_koids.push(koid);
-		group_koids.extend(members.iter().map(|member| member.header().koid()));
+		group_koids.extend(live.iter().take(count).filter_map(|member| member.as_ref()).map(|member| member.header().koid()));
 	}
 	// Condition-variable loop: re-check readiness after each wake, so an early or
 	// spurious wake just re-blocks and a deadline is honored on re-check. A signal that
@@ -2564,11 +2598,12 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 			// the wake it already sends is the one being listened for. FALLIBLY, because the
 			// membership is a length a ring-3 caller chose.
 			if let Some(group) = object.as_any().downcast_ref::<crate::object::process_group::ProcessGroup>() {
-				let members = group.live();
-				if koids.try_reserve(members.len()).is_err() {
+				let mut live: [Option<alloc::sync::Arc<Process>>; crate::object::process_group::MAX_GROUP_MEMBERS] = [const { None }; _];
+				let count = group.live_into(&mut live);
+				if koids.try_reserve(count).is_err() {
 					return ERR_NO_MEMORY;
 				}
-				koids.extend(members.iter().map(|member| member.header().koid()));
+				koids.extend(live.iter().take(count).filter_map(|member| member.as_ref()).map(|member| member.header().koid()));
 			}
 			objects[i] = Some(object);
 		}
@@ -2872,7 +2907,7 @@ fn sys_process_stats_get(handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	}
 	let state = if process.is_killed() {
 		PROC_STATE_FAILED
-	} else if process.live_threads().is_empty() {
+	} else if process.live_thread_count() == 0 {
 		PROC_STATE_STOPPED
 	} else {
 		PROC_STATE_RUNNING

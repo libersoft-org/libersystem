@@ -1199,6 +1199,8 @@ pub unsafe fn retire(frames: &[u64]) {
 			// grew by taking frames, and the moment it was most needed was the moment it could not
 			// grow. That turned deferred memory into permanently lost memory on precisely the path
 			// that exists to avoid losing memory.
+			// ALLOC-OK: not a heap collection at all - a fixed ring that answers false when full,
+			// which is what the paragraph above is about.
 			if !quarantine.push(phys) {
 				if unqueued_len < unqueued.len() {
 					unqueued[unqueued_len] = phys;

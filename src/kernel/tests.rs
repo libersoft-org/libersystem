@@ -200,7 +200,7 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 // authority. The host reports the bytes the component read back over its bootstrap
 // channel. The kernel only brokers the initial capabilities. Returns (expected,
 // actual): the file straight from the volume, and the bytes the component read.
-fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'static str> {
+fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, i32, alloc::vec::Vec<u8>), &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
@@ -225,7 +225,14 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), &'s
 
 	sched::run_until_idle();
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
-	Ok((expected, result.bytes))
+	// THE STATUS, THEN THE PAYLOAD. The host used to send the bytes alone, so a refusal and an
+	// empty file arrived identically - see `wasi_host`'s report. The scenario reads the status so a
+	// test can assert which of the two happened.
+	if result.bytes.len() < 4 {
+		return Err("the host's report carries a status");
+	}
+	let status = i32::from_le_bytes([result.bytes[0], result.bytes[1], result.bytes[2], result.bytes[3]]);
+	Ok((expected, status, result.bytes[4..].to_vec()))
 }
 
 // Build the powerbox topology and run it to completion. A StorageService serves
@@ -271,7 +278,11 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 
 	sched::run_until_idle();
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
-	Ok((expected, result.bytes))
+	// The same report shape as the scenario above: status first, payload after.
+	if result.bytes.len() < 4 {
+		return Err("the host's report carries a status");
+	}
+	Ok((expected, result.bytes[4..].to_vec()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

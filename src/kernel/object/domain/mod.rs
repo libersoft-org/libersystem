@@ -292,15 +292,54 @@ impl Domain {
 
 	// A snapshot of this Domain's live child Domains (for the System Graph). The
 	// children are owned strongly, so each is guaranteed live.
+	//
 	pub fn child_domains(&self) -> Vec<Arc<Domain>> {
+		// ALLOC-OK: the System Graph dump, which runs from the kernel test suites and from nothing a
+		// ring-3 caller can reach - `graph::collect_from` has no syscall behind it. `kill` walks the
+		// same two lists without allocating, because that one does.
 		self.children.lock().iter().cloned().collect()
 	}
 
 	// A snapshot of the processes currently accounted to this Domain (for the
 	// System Graph). Dead weak references are skipped, so only live processes are
 	// returned.
+	//
 	pub fn live_processes(&self) -> Vec<Arc<Process>> {
+		// ALLOC-OK: the System Graph dump, as above.
 		self.processes.lock().iter().filter_map(Weak::upgrade).collect()
+	}
+
+	// A BATCH of live processes, into storage the caller already has.
+	//
+	// Neither list is ever shortened - `register_process` and the child registration only append -
+	// so a walk by index sees every entry that existed when it started and any that arrive while it
+	// runs. The lock is released before the caller touches what it was given: terminating a process
+	// refunds handles to this Domain, which would re-enter the lock this walk holds.
+	pub fn processes_from(&self, from: usize, out: &mut [Option<Arc<Process>>]) -> (usize, usize) {
+		let list = self.processes.lock();
+		let mut written = 0;
+		let mut at = from;
+		while at < list.len() && written < out.len() {
+			if let Some(process) = list[at].upgrade() {
+				out[written] = Some(process);
+				written += 1;
+			}
+			at += 1;
+		}
+		(written, at)
+	}
+
+	// The same, for the child Domains.
+	pub fn children_from(&self, from: usize, out: &mut [Option<Arc<Domain>>]) -> (usize, usize) {
+		let list = self.children.lock();
+		let mut written = 0;
+		let mut at = from;
+		while at < list.len() && written < out.len() {
+			out[written] = Some(list[at].clone());
+			written += 1;
+			at += 1;
+		}
+		(written, at)
 	}
 
 	// Kill this Domain and its entire subtree: mark every Domain killed and
@@ -311,13 +350,38 @@ impl Domain {
 		self.killed.store(true, Ordering::Release);
 		// Upgrade and act outside the lock so termination (which refunds handles
 		// to this Domain) does not re-enter a held lock.
-		let processes: Vec<Arc<Process>> = self.processes.lock().iter().filter_map(Weak::upgrade).collect();
-		for process in processes {
-			process.terminate();
+		//
+		// IN BATCHES, so the walk does not allocate. This built two `Vec`s by `collect`, and killing
+		// a Domain is what a supervisor does when things are already going wrong - frequently
+		// because memory ran out. An allocation on the path that reclaims memory is the one that
+		// must not be there, and the gate could not see it: `collect` was outside what it looked at.
+		let mut at = 0;
+		loop {
+			let mut batch: [Option<Arc<Process>>; 8] = [const { None }; _];
+			let (written, next) = self.processes_from(at, &mut batch);
+			for slot in batch.iter_mut().take(written) {
+				if let Some(process) = slot.take() {
+					process.terminate();
+				}
+			}
+			if written == 0 && next == at {
+				break;
+			}
+			at = next;
 		}
-		let children: Vec<Arc<Domain>> = self.children.lock().iter().cloned().collect();
-		for child in children {
-			child.kill();
+		let mut at = 0;
+		loop {
+			let mut batch: [Option<Arc<Domain>>; 8] = [const { None }; _];
+			let (written, next) = self.children_from(at, &mut batch);
+			for slot in batch.iter_mut().take(written) {
+				if let Some(child) = slot.take() {
+					child.kill();
+				}
+			}
+			if written == 0 && next == at {
+				break;
+			}
+			at = next;
 		}
 	}
 

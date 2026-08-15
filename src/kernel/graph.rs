@@ -42,7 +42,9 @@ pub fn collect() -> DomainNode {
 
 // Collect the subtree rooted at `domain`.
 pub fn collect_from(domain: &Arc<Domain>) -> DomainNode {
+	// ALLOC-OK: the System Graph dump, called from the kernel test suites and from no syscall.
 	let processes: Vec<ProcessNode> = domain.live_processes().iter().map(|p| ProcessNode { koid: p.header().koid(), handles: p.handles().lock().entries() }).collect();
+	// ALLOC-OK: the System Graph dump, as above.
 	let children: Vec<DomainNode> = domain.child_domains().iter().map(collect_from).collect();
 	let account = domain.account();
 	DomainNode { koid: domain.header().koid(), killed: domain.is_killed(), memory_used: account.memory().used(), memory_limit: account.memory().limit(), handles_used: account.handles().used(), threads_used: account.threads().used(), processes, children }

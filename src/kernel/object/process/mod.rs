@@ -219,13 +219,32 @@ impl Process {
 		true
 	}
 
+	// Book the room the two `adopt_*` calls below need, so they cannot fail.
+	//
+	// "MOVED IN WHOLE AT SPAWN" was the marker on both, and it was false for the caller that matters:
+	// `SYS_PROCESS_LOAD_MODULE` reaches `load_module_into`, which adopts into a process that already
+	// owns every frame of its main image - so `extend` grows a vector that already has contents, on
+	// a ring-3 path, with no way to report a failure. A bound over the image size says nothing about
+	// whether the heap can hold the destination.
+	//
+	// Reserving separately from adopting is what makes the loader's transaction possible: the
+	// booking happens while the load can still be unwound, and the adopt happens after the last
+	// step that can fail.
+	pub fn reserve_adopt(&self, frames: usize, pages: usize) -> bool {
+		if self.user_frames.lock().try_reserve(frames).is_err() {
+			return false;
+		}
+		self.shared_image_pages.lock().try_reserve(pages).is_ok()
+	}
+
 	pub fn adopt_frames(&self, frames: Vec<u64>) {
-		// ALLOC-OK: the loader's own frame list, moved in whole at spawn - its size is the image's and the image was already held in memory to be read.
+		// ALLOC-OK: `reserve_adopt` booked this room before the caller reached its point of no
+		// return, which is what makes the extend infallible rather than assumed to be.
 		self.user_frames.lock().extend(frames);
 	}
 
 	pub fn adopt_shared_pages(&self, pages: Vec<Arc<crate::elf::SharedPage>>) {
-		// ALLOC-OK: the loader's own page list, moved in whole at spawn.
+		// ALLOC-OK: booked by `reserve_adopt`, as above.
 		self.shared_image_pages.lock().extend(pages);
 	}
 
@@ -310,7 +329,13 @@ impl Process {
 		if biases.len() >= 64 || biases.contains(&bias) {
 			return false;
 		}
-		// ALLOC-OK: one entry per shared library the image names, bounded by the loader's module-graph limit.
+		// A BOUND IS NOT A BOOKING. The marker here read "bounded by the loader's module-graph
+		// limit", which says there will never be a sixty-fifth entry and nothing at all about
+		// whether the heap can hold the first one. This is on the `SYS_PROCESS_LOAD_MODULE` path,
+		// so the growth is ring-3 reachable, and the refusal it needs already exists.
+		if biases.try_reserve(1).is_err() {
+			return false;
+		}
 		biases.push(bias);
 		self.dynamic_modules.store(biases.len(), Ordering::Release);
 		true
@@ -519,10 +544,48 @@ impl Process {
 	}
 
 	// This process's currently-live threads, pruning any that have been dropped.
+	//
+	// ALLOCATES, through `collect`, which is why the two ring-3 paths that used it do not any more:
+	// `SYS_PROCESS_SIGNAL` walks this to wake every thread and `SYS_PROCESS_STATS_GET` used it to
+	// ask whether any thread is left, so a short heap turned either syscall into a kernel abort. The
+	// allocation gate does not look at `collect` at all, which is how it stayed. Kept for the test
+	// suites, which are the callers that want an owned list and are not reachable from ring 3.
 	pub fn live_threads(&self) -> Vec<Arc<Thread>> {
 		let mut threads = self.threads.lock();
 		threads.retain(|w: &Weak<Thread>| w.strong_count() > 0);
+		// ALLOC-OK: the owned-list form, kept for the test suites - `SYS_PROCESS_SIGNAL` walks
+		// `live_threads_from` and `SYS_PROCESS_STATS_GET` reads the counter, so no ring-3 path
+		// reaches this any more.
 		threads.iter().filter_map(Weak::upgrade).collect()
+	}
+
+	// A BATCH of live threads, into storage the caller already has.
+	//
+	// Fills `out` from position `from` onwards and answers how many were written and where to
+	// resume, so a caller with a fixed array can walk every thread without allocating. The lock is
+	// released before the caller touches what it was given: waking a thread takes the scheduler's
+	// lock, and dropping the last reference to one runs `Thread::drop`, neither of which may happen
+	// underneath this one.
+	pub fn live_threads_from(&self, from: usize, out: &mut [Option<Arc<Thread>>]) -> (usize, usize) {
+		let threads = self.threads.lock();
+		let mut written = 0;
+		let mut at = from;
+		while at < threads.len() && written < out.len() {
+			if let Some(thread) = threads[at].upgrade() {
+				out[written] = Some(thread);
+				written += 1;
+			}
+			at += 1;
+		}
+		(written, at)
+	}
+
+	// How many threads this process has registered and not yet counted out.
+	//
+	// `SYS_PROCESS_STATS_GET` asked this by building a `Vec<Arc<Thread>>` and testing whether it was
+	// empty, which is an allocation to answer a question a counter already holds.
+	pub fn live_thread_count(&self) -> usize {
+		self.live_thread_count.load(Ordering::Acquire)
 	}
 
 	// Whether the process is currently suspended (SIGSTOP).

@@ -516,6 +516,7 @@ fn resolve_virtio<A: ConfigAccess>(d: &PciDevice) -> Option<VirtioDevice> {
 
 // Scan the bus and resolve every modern virtio device's MMIO layout.
 pub fn scan_virtio<A: ConfigAccess>() -> Vec<VirtioDevice> {
+	// ALLOC-OK: bus enumeration, at boot, before any userspace exists to reach it.
 	scan::<A>().iter().filter_map(resolve_virtio::<A>).collect()
 }
 
@@ -536,6 +537,7 @@ fn resolve_xhci<A: ConfigAccess>(d: &PciDevice) -> Option<XhciDevice> {
 
 // Scan the bus and resolve every xHCI USB host controller's MMIO window.
 pub fn scan_xhci<A: ConfigAccess>() -> Vec<XhciDevice> {
+	// ALLOC-OK: bus enumeration, at boot, as above.
 	scan::<A>().iter().filter_map(resolve_xhci::<A>).collect()
 }
 

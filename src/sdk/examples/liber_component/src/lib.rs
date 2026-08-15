@@ -39,7 +39,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn run() -> i32 {
-	use liber_sdk::{Error, STATUS_DENIED, STATUS_IO, log_message, read_input, write_output};
+	use liber_sdk::{STATUS_IO, log_message, read_input, write_output};
 
 	// A LOCAL, not a static. `static mut BUF` plus a hand-made `&mut` through `addr_of_mut!` was
 	// sound here - the instance is single-threaded and the host never re-enters `run` - and this is
@@ -50,16 +50,21 @@ pub extern "C" fn run() -> i32 {
 	// refused log and a short write were all invisible - on both sides of a boundary whose whole
 	// purpose is to report exactly those. A negative return from `run` is this component saying
 	// which call failed, and the host reports it.
-	// THREE WORLD CALLS, ONE PATTERN. `Denied` is the grant answering - a read the component may not
-	// do, a log it was not given - and every other error is the machine on the way there. The write
-	// below already said so; the read and the log collapsed both into `STATUS_IO`, which discarded
-	// two thirds of an API three rounds of this milestone went into making distinguishable. Not
-	// reachable in this example, whose grants are wired before it starts, and that is beside the
-	// point: this file is the thing a component author copies.
+	// THREE WORLD CALLS, ONE PATTERN, AND THE PATTERN IS A FUNCTION.
+	//
+	// `Denied` is the grant answering - a read the component may not do, a log it was not given -
+	// and this file used to collapse everything else into `STATUS_IO`. That was already better than
+	// the version before it, and it still discarded one the ABI names outright: `Unsupported` is an
+	// operation the host does not implement, which is a different thing from a machine that failed,
+	// and a component author copying this file would have thrown it away.
+	//
+	// Written once as `status_of` below rather than three times inline, because three copies of a
+	// mapping is how the two halves of this file came to disagree in the first place. Not reachable
+	// in this example, whose grants are wired before it starts, and that is beside the point: this
+	// file is the thing a component author copies.
 	let n: usize = match read_input(&mut buf) {
 		Ok(n) => n,
-		Err(Error::Denied) => return STATUS_DENIED,
-		Err(_) => return STATUS_IO,
+		Err(error) => return status_of(error),
 	};
 	for byte in &mut buf[..n] {
 		if byte.is_ascii_lowercase() {
@@ -72,8 +77,7 @@ pub extern "C" fn run() -> i32 {
 	if let Ok(text) = core::str::from_utf8(&buf[..n]) {
 		match log_message(text) {
 			Ok(()) => {}
-			Err(Error::Denied) => return STATUS_DENIED,
-			Err(_) => return STATUS_IO,
+			Err(error) => return status_of(error),
 		}
 	}
 	// A SHORT WRITE IS A FAILURE, and saying so is the point of the count. `Denied` is what a
@@ -81,8 +85,23 @@ pub extern "C" fn run() -> i32 {
 	match write_output(&buf[..n]) {
 		Ok(written) if written == n => n as i32,
 		Ok(_) => STATUS_IO,
-		Err(Error::Denied) => STATUS_DENIED,
-		Err(_) => STATUS_IO,
+		Err(error) => status_of(error),
+	}
+}
+
+// One error, one status, for every world call - which is what the ABI already distinguishes and
+// what a component that collapses them throws away.
+//
+// `Unknown(x)` passes the host's own number straight back: it is a status this SDK did not know how
+// to name, and inventing one here would lose what the host actually said.
+fn status_of(error: liber_sdk::Error) -> i32 {
+	use liber_sdk::{Error, STATUS_DENIED, STATUS_FAULT, STATUS_IO, STATUS_UNSUPPORTED};
+	match error {
+		Error::Denied => STATUS_DENIED,
+		Error::Fault => STATUS_FAULT,
+		Error::Io => STATUS_IO,
+		Error::Unsupported => STATUS_UNSUPPORTED,
+		Error::Unknown(status) => status,
 	}
 }
 

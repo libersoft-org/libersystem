@@ -274,12 +274,22 @@ impl<'a> Instance<'a> {
 	// Invoke the exported function `name` with `args`, dispatching any imports to
 	// `host`, and return its result value(s).
 	pub fn invoke(&mut self, name: &str, args: &[Value], host: &mut dyn Host) -> Result<Vec<Value>, Trap> {
+		self.invoke_with_fuel(name, args, host, DEFAULT_FUEL)
+	}
+
+	// The same call against a wall the CALLER chooses.
+	//
+	// `DEFAULT_FUEL`'s own comment says "a caller that wants a different wall calls
+	// `invoke_with_fuel`", and there was no such function: `Budget::with_fuel` existed and was
+	// reachable from nothing, so the sentence described an API that had never been written. An
+	// embedder metering a component it does not trust is the reason the budget exists.
+	pub fn invoke_with_fuel(&mut self, name: &str, args: &[Value], host: &mut dyn Host, fuel: u64) -> Result<Vec<Value>, Trap> {
 		let index: u32 = self.module.export_func(name).ok_or(Trap("no such exported function"))?;
 		let Instance { module, code, memory, globals, table } = self;
 		// A fresh budget per call, and a fresh depth. Both are per-INVOCATION rather than
 		// per-instance: a component that is called many times gets its budget each time, and one
 		// that never returns is stopped inside the call it never returned from.
-		let mut budget = Budget::new();
+		let mut budget = Budget::with_fuel(fuel);
 		call(module, code, memory, globals, table, index, args, host, &mut budget)
 	}
 }
@@ -294,6 +304,30 @@ fn call(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 }
 
 fn call_inner(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mut [Value], table: &[Option<u32>], index: u32, args: &[Value], host: &mut dyn Host, budget: &mut Budget) -> Result<Vec<Value>, Trap> {
+	// THE ARGUMENTS FIRST, FOR EITHER KIND OF CALLEE.
+	//
+	// The count-and-type check below used to sit in the DEFINED-function branch, past the return
+	// that dispatches an import - so a module importing `(func (param i32 i32))` and re-exporting it
+	// handed the embedder's arguments to `Host::call_import` with neither checked. That is the exact
+	// invariant this check exists for, reached by the one call shape it did not cover: the boundary
+	// is where the values enter, not where the body is.
+	//
+	// Both hosts in this tree destructure their arguments exactly and are not at risk; the generic
+	// `Host` API is, and it is what a third implementation reaches for.
+	if let Some(ftype) = module.func_type(index) {
+		if args.len() != ftype.params.len() {
+			return Err(Trap("wrong argument count"));
+		}
+		// Validation proved the BODY consistent with its declared signature; a caller invoking
+		// `("takes_i32", &[Value::F64(1.0)])` breaks that signature from outside, which validation
+		// cannot see. The value then sat in a local the body reads as an `i32`, and `Value::as_i32`
+		// converts every variant, so it did not even surface as a wrong answer.
+		for (arg, declared) in args.iter().zip(ftype.params.iter()) {
+			if arg.val_type() != *declared {
+				return Err(Trap("an argument's type does not match the function's signature"));
+			}
+		}
+	}
 	if index < module.import_count() {
 		let results = host.call_import(index, args, memory)?;
 		// WHAT THE HOST RETURNED, against what the import declared.
@@ -320,21 +354,6 @@ fn call_inner(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, global
 	let ftype = module.types.get(func.type_index as usize).ok_or(Trap("function type out of range"))?;
 	if args.len() != ftype.params.len() {
 		return Err(Trap("wrong argument count"));
-	}
-	// AND THEIR TYPES, which only the count was checked against.
-	//
-	// Validation proved the BODY consistent with its declared signature; a host calling
-	// `invoke("takes_i32", &[Value::F64(1.0)])` is the caller breaking that signature from outside,
-	// which validation cannot see. The value then sat in a local the body reads as an `i32`, and
-	// `Value::as_i32` converts every variant, so it did not even surface as a wrong answer.
-	//
-	// The two hosts in this tree destructure their arguments exactly and are not at risk; what was
-	// unsafe is the generic API, which is what a third caller reaches for.
-	for (index, (arg, declared)) in args.iter().zip(ftype.params.iter()).enumerate() {
-		if arg.val_type() != *declared {
-			let _ = index;
-			return Err(Trap("an argument's type does not match the function's signature"));
-		}
 	}
 	let body: &[Instr] = code.get(defined).ok_or(Trap("missing function code"))?;
 	// locals are the parameters followed by the declared locals (zero-initialized)
@@ -615,6 +634,17 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 					stack.push(refused);
 					continue;
 				}
+				// AND CHARGED FOR THE PAGES, like the bulk operations below.
+				//
+				// `resize` zeroes every byte it adds, so this instruction's cost is bounded by an
+				// operand - which is the rule that put `memory.copy` and `memory.fill` in the bulk
+				// class. It was costing one unit for up to sixty-four megabytes of zeroing while a
+				// `memory.fill` over the same bytes cost 65,000, so the budget priced the same work
+				// two ways depending on which instruction asked for it.
+				//
+				// Charged only on the path that grows: a refused grow does no work, and charging it
+				// would let a rejected request drain the budget.
+				budget.charge_bulk(new_bytes - memory.len())?;
 				memory.resize(new_bytes, 0);
 				stack.push(Value::I32(old_pages as i32));
 			}

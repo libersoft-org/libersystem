@@ -1186,6 +1186,62 @@ fn typing_past_the_width_soft_wraps_and_keeps_scrolling() {
 }
 
 #[test]
+fn arrowing_left_off_the_top_of_a_long_line_keeps_the_buffer_and_the_caret_together() {
+	// THE OTHER WAY TO REACH THE PLACE `home` WAS FIXED FOR, and the slower one - which makes it the
+	// more likely one, because holding Left is what somebody does when they are looking for a
+	// character rather than jumping to the start.
+	//
+	// `left` wrote a bare backspace and moved the buffer cursor regardless. The reverse-wrap
+	// backspace steps onto the previous physical row only while there is one, so once the line's
+	// first row has scrolled away the caret sticks at the top-left while the buffer goes on moving:
+	// they diverge by one character per keypress, and every later edit is drawn in the wrong place.
+	//
+	// It also exercises `repaint` with a NON-ZERO step back, which nothing did. `home` sets the
+	// cursor to zero before moving, so the repaint's own backwards walk - the one whose off-by-one
+	// was fixed last round - ran zero times on the only path that reached it.
+	let mut term = test_term(8, 4, 16);
+	let mut ld = Ld::new(8);
+	let vocab: Vec<Vec<u8>> = Vec::new();
+	// Fifty characters on an 8x4 screen: the line is longer than the viewport, so its first rows
+	// are in the scrollback by the time the typing stops.
+	{
+		let mut echo = Echo { term: Some(&mut term), ser: EchoBuf::new() };
+		for i in 0..50u8 {
+			ld.feed(b'a' + i % 26, &vocab, &mut echo);
+		}
+	}
+	assert_eq!(ld.len, 50);
+	assert_eq!(ld.cursor, 50, "the cursor is at the end of what was typed");
+
+	// Left, once per character, PAST the point where the caret reaches the top-left. Thirty-five
+	// presses land exactly on it - measured, not guessed - so the presses that matter are the ones
+	// after that: the old code emitted a backspace the screen had nowhere to apply and moved the
+	// buffer anyway.
+	{
+		let mut echo = Echo { term: Some(&mut term), ser: EchoBuf::new() };
+		for _ in 0..40 {
+			ld.feed(0x1b, &vocab, &mut echo);
+			ld.feed(b'[', &vocab, &mut echo);
+			ld.feed(b'D', &vocab, &mut echo);
+		}
+	}
+	assert_eq!(ld.cursor, 10, "forty characters back from fifty");
+
+	// THE CARET MOVED WITH IT. With the defect the caret pins at the top-left and stays there for
+	// every press past the top - measured as five presses with the cursor dropping 15, 14, 13, 12,
+	// 11, 10 and the caret reading (0,0) throughout. The repaint re-opens the window instead, so
+	// the caret is somewhere the buffer's character actually is.
+	assert_ne!((term.screen.cursor_col(), term.screen.cursor_row()), (0, 0), "the caret is not pinned at the top-left while the buffer went on moving");
+
+	// AND THE CHARACTER UNDER IT IS THE BUFFER'S. The caret sits at the cursor, so what was drawn
+	// immediately before it is the character before the cursor - which is only true if the two never
+	// came apart.
+	let (col, row) = (term.screen.cursor_col(), term.screen.cursor_row());
+	let (before_col, before_row) = if col == 0 { (7, row.checked_sub(1).expect("the repaint leaves a row of context above the caret")) } else { (col - 1, row) };
+	assert_eq!(term.screen.cell(before_col, before_row).glyph, ld.line[ld.cursor - 1] as u32, "the cell before the caret holds the character before the cursor");
+}
+
+#[test]
 fn every_cursor_move_settles_the_deferred_wrap() {
 	// THE SENTENCE MADE CHECKABLE. `cursor_moved`'s comment says "every path that actually assigns
 	// `row` or `col` calls this, and nothing else does", and that claim has now been wrong twice -

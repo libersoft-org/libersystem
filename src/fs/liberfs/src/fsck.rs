@@ -42,6 +42,12 @@ impl<D: BlockDevice> LiberFs<D> {
 		self.rcsum = None;
 		self.decomp.clear();
 		let mut checksum_failures = 0u32;
+		// THE LIVE WALK'S OWN COUNTS, kept beside the checksum one it used to fold them into. The
+		// structure pass and the snapshot recursion each have a tally; the live namespace walk had
+		// only this one number, which is why a failed read and a dangling entry both read as
+		// checksum mismatches.
+		let mut live_io = 0u32;
+		let mut live_structural = 0u32;
 		let mut damaged: Vec<Vec<u8>> = Vec::new();
 		match self.derive_free() {
 			Ok(()) => {}
@@ -61,11 +67,30 @@ impl<D: BlockDevice> LiberFs<D> {
 		while let Some((dir, prefix)) = stack.pop() {
 			let entries = match self.dir_entries_of(dir) {
 				Ok(entries) => entries,
-				// Invalid covers a dangling walk target: a directory entry (or the
-				// superblock's root_inode) naming an inode that does not exist -
-				// structural damage like any other.
-				Err(FsError::Corrupt | FsError::Io | FsError::Invalid) => {
+				// THREE DIFFERENT FAULTS, COUNTED SEPARATELY - which they were not until 2026-08-15,
+				// when all three landed in `checksum_failures`.
+				//
+				// The report grew an `io_failures` field for the snapshot walk, and the live walk
+				// kept folding a failed READ into the checksum count. So the same disk not
+				// answering was an I/O fault when the snapshot recursion met it and a checksum
+				// mismatch when the live namespace did - and an operator reading the report cannot
+				// tell a failing medium from a corrupted one, which is the first question they have.
+				//
+				// `Invalid` is a dangling walk target: a directory entry naming an inode that does
+				// not exist. That is the NAMESPACE being wrong, not the bytes, and it is what
+				// `structural_failures` counts.
+				Err(FsError::Io) => {
+					live_io = live_io.saturating_add(1);
+					damaged.push(if prefix.is_empty() { b"/".to_vec() } else { prefix });
+					continue;
+				}
+				Err(FsError::Corrupt) => {
 					checksum_failures = checksum_failures.saturating_add(1);
+					damaged.push(if prefix.is_empty() { b"/".to_vec() } else { prefix });
+					continue;
+				}
+				Err(FsError::Invalid) => {
+					live_structural = live_structural.saturating_add(1);
 					damaged.push(if prefix.is_empty() { b"/".to_vec() } else { prefix });
 					continue;
 				}
@@ -87,12 +112,21 @@ impl<D: BlockDevice> LiberFs<D> {
 						self.count_corrupt(&inode)
 					}
 				});
+				// Every one of these is damage the operator is shown the path of; which COUNTER it
+				// lands in is the diagnosis, and the three are different diagnoses - see above.
 				let bad = match checked {
 					Ok(bad) => bad,
-					// an unreadable block (a hostile out-of-pool pointer fails its read as
-					// Io) and a dangling entry (Invalid: the inode does not exist) are
-					// damage to the operator, exactly like a checksum mismatch.
-					Err(FsError::Corrupt | FsError::Io | FsError::Invalid) => 1,
+					Err(FsError::Io) => {
+						live_io = live_io.saturating_add(1);
+						damaged.push(path);
+						continue;
+					}
+					Err(FsError::Invalid) => {
+						live_structural = live_structural.saturating_add(1);
+						damaged.push(path);
+						continue;
+					}
+					Err(FsError::Corrupt) => 1,
 					Err(e) => return Err(e),
 				};
 				if bad > 0 {
@@ -141,14 +175,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		// arithmetic in one place while the three that are NOT structural are counted where they
 		// are raised.
 		let named = tally.checksum + tally.io + tally.stream + tally.structural;
-		let structural_failures = (faults.len() as u32 - named) + tally.structural + snapshot_tally.structural;
+		let structural_failures = (faults.len() as u32 - named) + tally.structural + snapshot_tally.structural + live_structural;
 		Ok(FsckReport {
 			checksum_failures,
 			damaged,
 			structural_failures,
 			stream_failures: tally.stream + snapshot_tally.stream,
 			// REPORTED, from both halves. `snapshot_tally.io` was maintained and never read.
-			io_failures: tally.io + snapshot_tally.io,
+			io_failures: tally.io + snapshot_tally.io + live_io,
 			faults,
 		})
 	}
@@ -614,8 +648,19 @@ impl<D: BlockDevice> LiberFs<D> {
 		if ptr == 0 {
 			return Ok(0);
 		}
+		// A TREE TOO DEEP IS THE SHAPE BEING WRONG, NOT THE BYTES. This returned `Corrupt`, and the
+		// caller counted `Corrupt` as a checksum failure - so an operator was told a block failed
+		// its checksum when nothing had, and the actual fault (a tree deeper than the format
+		// permits) was not reported at all.
+		//
+		// `FsError::Corrupt` is defined by fs-core as a checksum mismatch, and this crate was using
+		// it for that AND for two structural faults. Counting the fault where it is RAISED, and
+		// answering `Ok(0)` - no checksum failures below here - keeps the classification with the
+		// code that knows what went wrong, which is the same shape `walk_inode_records` already
+		// uses for the faults it names.
 		if depth == 0 {
-			return Err(FsError::Corrupt);
+			tally.structural = tally.structural.saturating_add(1);
+			return Ok(0);
 		}
 		// The raw marking walk carries a visited bitmap; this one carried only a depth
 		// limit, which protects the stack and not the clock. A node with hundreds of
@@ -633,8 +678,11 @@ impl<D: BlockDevice> LiberFs<D> {
 		// nothing about it. Verifying first and skipping only the descent keeps the whole
 		// saving (each block is walked once) and costs one read per shared edge - which is
 		// linear in the tree's edges, never the exponential the bitmap was added to stop.
+		// And a pointer outside the pool is the same kind of fault: the tree names a block this
+		// volume does not have, which no checksum could ever have detected.
 		if ptr >= self.num_blocks {
-			return Err(FsError::Corrupt);
+			tally.structural = tally.structural.saturating_add(1);
+			return Ok(0);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;

@@ -435,7 +435,11 @@ fn both_hosts_answer_a_refused_service_the_same_way() {
 	}
 }
 
+// IGNORED BY DEFAULT because it needs a wasm32 artifact this crate does not build. The gate runs it
+// with `--include-ignored`; a bare `cargo test` reports it as ignored, which is a line in the
+// summary rather than a captured message nobody sees.
 #[test]
+#[ignore = "needs the SDK artifact from `just sdk`; the host-tests gate runs it"]
 fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() {
 	// THE OTHER HALF of `a_guest_that_panics_...`, which hand-assembles the shape
 	// `dev-diagnostics` is assumed to produce. Nothing tied that shape to `liber_sdk::report_panic`:
@@ -451,7 +455,7 @@ fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() 
 	// ANCHORED TO THE CRATE, not to whatever directory `cargo test` happened to be run from - which
 	// is how this skipped silently the first time it ran from the repository root, and a test that
 	// reports a skip nobody reads is the shape this tree has a gate against elsewhere.
-	let Some((trapped, logged, bytes)) = panic_the_real_guest("sdk") else { return };
+	let (trapped, logged, bytes) = panic_the_real_guest("sdk");
 	// TWO ASSERTIONS WITH DIFFERENT PRECONDITIONS, said apart rather than skipped together.
 	//
 	// The TRAP is unconditional: `report_panic` ends in `unreachable()` whether or not
@@ -469,16 +473,27 @@ fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() 
 	// nothing on its way down" is what this file is here to prove. The positive half has its own
 	// artifact and its own test below, so neither half depends on how the other happened to be
 	// built.
-	assert!(trapped, "a panicking guest reaches the host as a trap, not as a result - whatever the diagnostics feature is set to");
-	let diagnostics_on = bytes.windows(8).any(|w| w == b"panic at");
-	if diagnostics_on {
-		assert!(logged, "with dev-diagnostics its line went through the log the component already had");
-	} else {
-		assert!(!logged, "without dev-diagnostics a shipping component says nothing on its way down");
-	}
+	assert!(trapped, "a panicking guest reaches the host as a trap, not as a result");
+	// AND THE SHIPPING ARTIFACT IS ASSERTED TO BE A SHIPPING ARTIFACT, rather than the test working
+	// out which kind it was handed and grading itself accordingly.
+	//
+	// This branched on whether the bytes contained "panic at" and asserted whichever half matched,
+	// so a build that accidentally turned the feature on - a changed default, a `--features` added
+	// to the shipping step - would have switched the test's expectation and stayed green. A test
+	// that adapts to the change it exists to catch is not a test of anything.
+	//
+	// `build.sh` stages this artifact with no `--features`, and the policy is that a shipping
+	// component says nothing on its way down. That is what is asserted; the positive half has its
+	// own artifact and its own test below.
+	assert!(!bytes.windows(8).any(|w| w == b"panic at"), "a shipping artifact carries no panic diagnostics - if this fails, the shipping build gained the dev-diagnostics feature");
+	assert!(logged.is_empty(), "and says nothing through its log on the way down");
 }
 
+// IGNORED BY DEFAULT because it needs a wasm32 artifact this crate does not build. The gate runs it
+// with `--include-ignored`; a bare `cargo test` reports it as ignored, which is a line in the
+// summary rather than a captured message nobody sees.
 #[test]
+#[ignore = "needs the SDK artifact from `just sdk`; the host-tests gate runs it"]
 fn with_dev_diagnostics_the_real_guests_panic_reaches_the_log_it_was_granted() {
 	// THE OTHER HALF OF THE FEATURE, against its own artifact, with no condition on the assertion.
 	//
@@ -489,30 +504,40 @@ fn with_dev_diagnostics_the_real_guests_panic_reaches_the_log_it_was_granted() {
 	// thing exercising the diagnostic half was a hand-assembled module asserting a shape the real
 	// handler is merely ASSUMED to produce. One artifact can only be one of the two builds, so
 	// `build.sh` now produces both and each is asserted for what it is.
-	let Some((trapped, logged, _)) = panic_the_real_guest("sdk-dev") else { return };
+	let (trapped, logged, _) = panic_the_real_guest("sdk-dev");
 	assert!(trapped, "the trap is unconditional: `report_panic` ends in `unreachable()` in both builds");
-	assert!(logged, "with dev-diagnostics a real panic goes through the granted log before it traps");
+	assert_eq!(logged.len(), 1, "with dev-diagnostics a real panic goes through the granted log before it traps");
+	// AND IT IS THE DIAGNOSTIC, not merely a log entry. `report_panic` promises
+	// "panic at <file>:<line>:<col>: <message>", and a test that asserted only that SOMETHING was
+	// logged would stay green if that promise were quietly replaced by a bare word.
+	let line = &logged[0];
+	assert!(line.starts_with("panic at "), "the entry is the diagnostic the SDK documents: {line}");
+	assert!(line.contains(".rs:"), "with the file it happened in: {line}");
+	assert!(line.contains(": "), "and the message after the location: {line}");
 }
 
 // Load a toolchain-built `liber_component.wasm` from one of the two target directories, invoke its
 // `panic_now` export, and report whether it trapped and whether it logged - plus the bytes, for the
 // caller that inspects them.
 //
-// SKIPPED LOUDLY rather than failing when the artifact is not there: it is built by `just sdk` / the
-// image build, and a unit test that requires a wasm32 toolchain run would make `cargo test` in this
-// crate depend on one. Its absence is said, not passed over in silence. ANCHORED TO THE CRATE, not
-// to whatever directory `cargo test` happened to be run from - which is how this skipped silently
-// the first time it ran from the repository root, and a test that reports a skip nobody reads is the
-// shape this tree has a gate against elsewhere.
-fn panic_the_real_guest(target_dir: &str) -> Option<(bool, bool, Vec<u8>)> {
+// A MISSING ARTIFACT IS A FAILURE, AND NOT RUNNING IS SPELLED `#[ignore]`.
+//
+// This printed "SKIPPED" and returned, and the caller returned too - so the test PASSED. The
+// comment said the skip was loud; the Rust harness captures stdout and stderr of passing tests, so
+// on the gate it was silent. A component whose panic handler had been removed, or a tree where the
+// SDK never built, produced a green suite with nobody told.
+//
+// The two halves of the problem need different answers. "This machine has no wasm32 toolchain" is a
+// reason not to RUN the test, and the harness has a word for that: `#[ignore]` is reported in the
+// summary as ignored, which is visible where a captured `eprintln!` is not. "The artifact should be
+// there and is not" is a reason to FAIL, because it is the difference between a check that did not
+// run and a check that ran against nothing.
+//
+// ANCHORED TO THE CRATE, not to whatever directory `cargo test` happened to be run from - which is
+// how this skipped silently the first time it ran from the repository root.
+fn panic_the_real_guest(target_dir: &str) -> (bool, Vec<String>, Vec<u8>) {
 	let built = alloc::format!("{}/../../.build/cargo/{target_dir}/wasm32-unknown-unknown/release/liber_component.wasm", env!("CARGO_MANIFEST_DIR"));
-	let bytes = match std::fs::read(&built) {
-		Ok(bytes) => bytes,
-		Err(_) => {
-			std::eprintln!("SKIPPED: {built} is not built, so the SDK's own panic handler is not exercised");
-			return None;
-		}
-	};
+	let bytes = std::fs::read(&built).unwrap_or_else(|error| panic!("{built} is not built ({error}), so the SDK's own panic handler is not exercised - build it with `just sdk` or run this test with the image build"));
 	let module = crate::parse(&bytes).expect("the toolchain's own component parses");
 	let validated = crate::validate(module).expect("and validates");
 	let mut instance = Instance::new(&validated).expect("and instantiates");
@@ -529,5 +554,10 @@ fn panic_the_real_guest(target_dir: &str) -> Option<(bool, bool, Vec<u8>)> {
 		.collect();
 	let mut host = WorldHost::new(Stub::working(), imports);
 	let out = instance.invoke("panic_now", &[], &mut host);
-	Some((out.is_err(), host.logged(), bytes))
+	// THE LINES, NOT ONLY WHETHER THERE WERE ANY. `host.logged()` answers a bool, and a test built
+	// on it passes for a guest that logs anything at all - so a panic handler rewritten to log
+	// "oops" and trap would keep it green while the diagnostic it exists to produce disappeared.
+	// The stub records the text; this hands it back so the caller can say what it wanted to see.
+	let lines = host.services_mut().logged.clone();
+	(out.is_err(), lines, bytes)
 }

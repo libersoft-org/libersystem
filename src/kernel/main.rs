@@ -447,6 +447,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// Like the power capability above, this process holds them only to pass them on. They are
 	// minted exactly here and nowhere else - no syscall creates one - so the three that exist
 	// after this line are the four that will ever exist.
+	// ALLOC-OK: boot, minting the four privilege capabilities before userspace exists.
 	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind).expect("the four privilege capabilities, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
 	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges, 0)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
 	Ok((kernel_ep, sm_koid))

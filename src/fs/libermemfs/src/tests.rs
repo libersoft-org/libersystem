@@ -679,7 +679,14 @@ fn a_mount_that_cannot_take_its_capacity_fails_rather_than_pretending() {
 // behind agreeing with itself.
 #[derive(Default)]
 struct Model {
-	files: alloc::collections::BTreeMap<alloc::string::String, usize>,
+	// LENGTH AND CHARGE, separately, because a truncate's cost depends on both.
+	//
+	// The model held one number - what the volume is charged - and that was enough while every
+	// write path rebuilt the buffer at the size asked for. It stopped being enough when `truncate`
+	// learned to extend INSIDE the buffer a file already holds: whether that allocates depends on
+	// where `want` falls relative to the length AND the capacity, and a model carrying one of the
+	// two cannot tell those cases apart.
+	files: alloc::collections::BTreeMap<alloc::string::String, (usize, usize)>,
 	dirs: alloc::collections::BTreeSet<alloc::string::String>,
 }
 
@@ -697,8 +704,8 @@ impl Model {
 			// derives both from the sizes it asked for; it never reads a length back from the
 			// implementation it is checking.
 			0 | 1 => {
-				let held = if wrote == 0 { 0 } else { self.files.get(name).copied().unwrap_or(0).max(wrote) };
-				self.files.insert(alloc::string::String::from(name), held);
+				let charge = if wrote == 0 { 0 } else { self.files.get(name).map_or(0, |(_, charge)| *charge).max(wrote) };
+				self.files.insert(alloc::string::String::from(name), (wrote, charge));
 			}
 			2 => {
 				self.dirs.insert(alloc::string::String::from(name));
@@ -719,19 +726,34 @@ impl Model {
 					self.files.insert(alloc::string::String::from(destination), held);
 				}
 			}
-			// EXACTLY `length`, growing or shrinking: both halves rebuild the buffer at the size
-			// asked for rather than mutating in place, so the capacity the volume charges is the
-			// length. That is the allocate-check-swap shape, and it is what makes the truncated
-			// file's cost predictable enough for a model to state.
+			// A HIGH-WATER MARK, not the length - and this sentence said the opposite until
+			// 2026-08-15, when the implementation stopped agreeing with it.
+			//
+			// A truncate SHORTER than the contents rebuilds the buffer at the new size, so the
+			// charge is the length. A truncate LONGER, but still inside the buffer the file already
+			// holds, extends in place and allocates nothing - so the charge stays where it was.
+			// Only a grow past the buffer builds a new one, and then the charge is the length again.
+			//
+			// The model has to say the same thing, because the thing it is checking is what the
+			// volume CHARGES: modelling a truncate as "the charge becomes the length" made an
+			// in-place grow look like a disagreement, which is how this was found.
 			7 => {
-				if let Some(held) = self.files.get_mut(name) {
-					*held = length;
+				if let Some((len, charge)) = self.files.get_mut(name) {
+					// THREE CASES AND ONLY THE MIDDLE ONE IS FREE. Shorter than the contents rebuilds
+					// the buffer at the new size; longer than the buffer builds a new one; longer than
+					// the contents but INSIDE the buffer extends in place and allocates nothing, so
+					// the charge stays where it was. Modelling all three as "the charge becomes the
+					// length" is what made an in-place grow look like a disagreement.
+					if length <= *len || length > *charge {
+						*charge = length;
+					}
+					*len = length;
 				}
 			}
 			// `touch` with `create` writes an empty file when the name is free, and leaves an
 			// existing one alone.
 			8 => {
-				self.files.entry(alloc::string::String::from(name)).or_insert(0);
+				self.files.entry(alloc::string::String::from(name)).or_insert((0, 0));
 			}
 			_ => {}
 		}
@@ -740,7 +762,7 @@ impl Model {
 	// The same number `footprint()` reports, derived from the model instead: every file's data,
 	// plus the final segment of every path, which is the name its parent holds.
 	fn footprint(&self) -> u64 {
-		let data: usize = self.files.values().sum();
+		let data: usize = self.files.values().map(|(_, charge)| *charge).sum();
 		let names: usize = self.files.keys().chain(self.dirs.iter()).map(|path| path.rsplit('/').next().map_or(0, str::len)).sum();
 		(data + names) as u64
 	}
@@ -1540,23 +1562,69 @@ fn a_rename_within_one_directory_keeps_its_reserved_slot() {
 	// back. The insert then had to allocate again, and a failure there dropped the node it was
 	// holding. The ABI promises rename is atomic within a volume.
 	//
-	// `shrink_children` only acts at or below a quarter occupancy, so the fixture has to get there:
-	// a directory grown past `MIN_SLOTS` and then emptied down to one entry.
+	// THE FIXTURE HAS TO LEAVE A SURVIVOR, and the one here did not - which is why the sweep below
+	// found nothing until it was rebuilt. `shrink_children` sizes the new table EXACTLY to the
+	// contents, so the insert needs a fresh allocation only when something is still in the table
+	// after the source is taken out. Emptying the directory down to ONE entry and renaming it left
+	// zero, the shrink went to an empty table, and the insert of a single entry fit without asking
+	// for anything: the defect could not happen and the test could not have seen it.
+	//
+	// Two entries: take one, one remains, the shrink lands at exactly one slot, and the destination
+	// insert needs a second. That is the allocation the old code had already spent its reservation
+	// on. The table also has to be at or below a quarter occupancy for the shrink to fire at all,
+	// so it is grown well past `MIN_SLOTS` first.
 	let mut fs = LiberMemFs::mount(Policy::Capped, 4096).expect("mount");
 	fs.mkdir(b"d").expect("a directory");
-	for i in 0..16u8 {
+	for i in 0..32u8 {
 		let name = alloc::format!("d/f{i}");
 		fs.write_file(name.as_bytes(), b"x").expect("fill the table");
 	}
-	for i in 1..16u8 {
+	for i in 2..32u8 {
 		let name = alloc::format!("d/f{i}");
-		fs.remove(name.as_bytes()).expect("empty it down to one");
+		fs.remove(name.as_bytes()).expect("empty it down to two");
 	}
-	// One entry in a table that was sized for sixteen: the shrink window.
 	assert_eq!(fs.rename(b"d/f0", b"d/g0"), Ok(()), "the rename succeeds");
 	assert!(fs.read_file(b"d/g0").is_ok(), "the file is at its new name");
 	assert_eq!(fs.read_file(b"d/f0"), Err(FsError::NotFound), "and not at its old one");
 	assert!(fs.footprint() <= 4096, "and the volume is inside its capacity");
+
+	// AND THE SAME RENAME UNDER EVERY HEAP BUDGET, because the assertions above would have passed
+	// on the broken code.
+	//
+	// The defect was an allocation FAILURE: reserve the destination slot, remove the source,
+	// `remove`'s shrink hands the reservation back, and the insert has to allocate a second time -
+	// dropping the node it is holding if that fails. On an ordinary heap the second allocation
+	// simply succeeds, so the old code renamed the file correctly and nothing above could tell.
+	//
+	// A SWEEP RATHER THAN A CHOSEN NUMBER, for the reason this tree has learned twice: a budget
+	// tuned to today's allocation sequence stops testing the moment the sequence moves, and the test
+	// goes quiet rather than red. What is asserted is the property instead - ATOMICITY - which holds
+	// at every budget: the rename either happened or it did not, and the file is at exactly one of
+	// the two names. The broken code has a budget at which it is at NEITHER, and the sweep walks
+	// over it.
+	for budget in 0..512 {
+		let mut attempt = LiberMemFs::mount(Policy::Capped, 4096).expect("mount");
+		attempt.mkdir(b"d").expect("a directory");
+		for i in 0..32u8 {
+			let name = alloc::format!("d/f{i}");
+			attempt.write_file(name.as_bytes(), b"x").expect("fill the table");
+		}
+		for i in 2..32u8 {
+			let name = alloc::format!("d/f{i}");
+			attempt.remove(name.as_bytes()).expect("empty it down to two");
+		}
+		// THE BUDGET COVERS THE RENAME AND NOTHING ELSE. Reading a file back allocates the Vec it
+		// returns, so observing inside the budget answers "the heap was empty" rather than "the file
+		// is gone" - which at budget 0 is every file, and the sweep would fail on its own probe.
+		let mut result = Ok(());
+		within(budget, || result = attempt.rename(b"d/f0", b"d/g0"));
+		let at_old = attempt.read_file(b"d/f0").is_ok();
+		let at_new = attempt.read_file(b"d/g0").is_ok();
+		match result {
+			Ok(()) => assert!(at_new && !at_old, "budget {budget}: a rename that reported success left the file at its new name only"),
+			Err(_) => assert!(at_old && !at_new, "budget {budget}: a rename that failed left the file where it was"),
+		}
+	}
 }
 
 #[test]
@@ -1578,24 +1646,57 @@ fn truncate_charges_what_the_file_allocates_and_keeps_the_reservation() {
 	// reservation before an allocation that could return through a `?` placed above the resync.
 	const CAPACITY: usize = 128;
 	let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("mount");
-	// 80 bytes of data in `f`, then cleared to 20 - the buffer stays at 80 and the volume charges
-	// for 80, which is the whole point of accounting capacity.
+	// THE GAP HAS TO BE MADE BY A PARTIAL OVERWRITE, and this used a truncate to make it - which
+	// closes it. `truncate` shorter than the contents rebuilds the buffer at the new size, so
+	// `write(80)` then `truncate(20)` leaves 20 bytes in a 20-byte buffer and the grow that follows
+	// genuinely has to allocate. The test passed, and not for the reason its own comment gave.
+	//
+	// `write_file` is the path that keeps the high-water allocation deliberately: a partial
+	// overwrite clears and refills the buffer it already has. So 80 bytes then 20 bytes is 20 bytes
+	// of contents in an 80-byte buffer, charged at 80, which is the state this test is about.
 	fs.write_file(b"f", &alloc::vec![b'z'; 80]).expect("the file fits");
-	fs.truncate(b"f", 20).expect("shrink to 20");
+	let charged = fs.footprint();
+	fs.write_file(b"f", &alloc::vec![b'y'; 20]).expect("a partial overwrite keeps the buffer");
+	assert_eq!(fs.footprint(), charged, "the volume still charges for the buffer the file holds");
 
 	// Growing back to 40 - which the old code refused with `NoSpace`, because it compared
 	// `footprint() + (40 - 20)` against the capacity while the file was already charged for what it
 	// held.
 	assert_eq!(fs.truncate(b"f", 40), Ok(()), "a grow inside what the file already holds is not a new allocation");
+	// AND IT REALLY DID NOT ALLOCATE. The footprint is the assertion: `truncate` used to rebuild the
+	// buffer at 40 even here, which is an allocation the caller's own accounting had just declared
+	// unnecessary - and on a tight heap that disagreement was a `NoSpace` for memory the volume was
+	// already holding.
+	assert_eq!(fs.footprint(), charged, "the buffer the file already held is the buffer it grew into");
 	assert!(fs.footprint() <= CAPACITY as u64, "and never leaves the volume over its capacity");
 	assert_eq!(fs.read_file(b"f").expect("read").len(), 40, "the file is the length asked for");
+	assert_eq!(&fs.read_file(b"f").expect("read")[..20], &[b'y'; 20], "the contents that were there are still there");
+	assert_eq!(&fs.read_file(b"f").expect("read")[20..], &[0u8; 20], "and the extension reads as zeros");
 
 	// A refused grow leaves the reservation where it was - the defect the previous round fixed in
 	// `write_file`, in the function beside it.
+	// THIS ASKS FOR MORE THAN THE VOLUME HOLDS, so it is refused by the capacity precheck - before
+	// the reservation is touched at all. Worth having, and it is not the case the fix was about.
 	let before = fs.footprint();
 	assert_eq!(fs.truncate(b"f", 4096), Err(FsError::NoSpace), "past the capacity is refused");
 	assert_eq!(fs.footprint(), before, "and changes nothing");
 	assert_eq!(fs.footprint() + fs.reserved_bytes(), CAPACITY as u64, "with the reservation still held");
+
+	// THE CASE THE FIX WAS ABOUT is a grow the capacity check ALLOWS and the heap then refuses: the
+	// reservation has been released by then, and the old shape returned through `?` without putting
+	// it back. Reaching it needs the allocation to fail, which needs a budget - and a swept one
+	// rather than a chosen one, so the test does not stop testing when the allocation sequence moves.
+	//
+	// The invariant at every budget is the volume's own: whatever the answer, a Reserved volume's
+	// footprint plus its reservation is its capacity. That is the sentence the reservation exists to
+	// make true, and it is exactly what a lost reservation breaks.
+	for budget in 0..2048 {
+		let mut attempt = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("mount");
+		attempt.write_file(b"f", &alloc::vec![b'z'; 40]).expect("a file to grow");
+		let mut result = Ok(());
+		within(budget, || result = attempt.truncate(b"f", 96));
+		assert_eq!(attempt.footprint() + attempt.reserved_bytes(), CAPACITY as u64, "budget {budget}: the reservation and the footprint still account for the whole volume after {result:?}");
+	}
 
 	// And the file-size bound is the volume's, not the calling path's.
 	let mut big = LiberMemFs::mount(Policy::Capped, MAX_FILE_BYTES * 4).expect("mount");

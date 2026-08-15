@@ -460,15 +460,18 @@ fn type_cardinality(ty: &Type, cards: &HashMap<String, Cardinality>, names: &Has
 // which is the defect this milestone is named for, at the other end of the same road. `Exact(n)`
 // compares against the limit and PRINTS, so the diagnostic says five and says four.
 //
-// `Unbounded` is a `list<handle<T>>`, and it is ACCEPTED. That is the policy this milestone asked to
-// have written down, and it is the one the tree already implements rather than a new decision.
+// `Unbounded` is a `list<handle<T>>`, and it is REFUSED.
 //
-// The count is a property of the VALUE, so no generation-time check can bound it - and the wire
-// bounds it where the count exists: `SliceWriter::set_handle` refuses past `MAX_HANDLES` and returns
-// `Option`, and every generated `write` propagates that with `?`. So a five-element list does not
-// lose its fifth capability; the WHOLE message fails to encode, and `encode`/`encode_vec` answer
-// `None`. A refusal at generation time would be the stricter reading, and it would refuse shapes
-// that are legal whenever the list is short - which is most of them.
+// This comment argued the opposite until 2026-08-15, and had gone on arguing it after the code
+// stopped agreeing: the reasoning below it - that the wire bounds the count where the count exists -
+// is true about the WRITER and false about what happens to the capabilities the writer never took.
+// `SliceWriter::set_handle` refuses past `MAX_HANDLES` and the whole encode fails, which sounds
+// safe; but cleanup walks `writer.handles()`, and the fifth capability was never recorded there. The
+// failure that was supposed to protect it is what strands it.
+//
+// Left standing, a stale comment arguing for the behaviour the code no longer has is worse than no
+// comment: the next reader has to work out which of the two is current, and the comment is the more
+// persuasive of the pair.
 //
 // `Unknown` - an imported shape nothing has resolved - fails closed for the same reason it always
 // did.
@@ -507,6 +510,32 @@ fn check_stream_frames(ty: &Type, span: Span, cards: &HashMap<String, Cardinalit
 		Type::Result(ok, err) => {
 			check_stream_frames(ok, span, cards, names, imports, errs);
 			check_stream_frames(err, span, cards, names, imports, errs);
+			// AND THE ERROR ARM OF A STREAM OPEN CARRIES NO CAPABILITY.
+			//
+			// `result<stream<T>, E>` is the guarded stream open, and its cardinality is
+			// `max(ok, err)` - so a capability-bearing `E` is one handle against the Ok arm's one
+			// subchannel and the schema is legal. The generated transport cannot carry it: the
+			// server's `_reply_err` takes no `reply_handles` out-parameter and refuses outright
+			// when the encoder recorded one, and the client's Err arm refuses a reply that arrives
+			// with any handle at all.
+			//
+			// So the schema permits a shape the protocol cannot express, which is the class this
+			// milestone exists to close - and it is worse than a plain mismatch: the server has
+			// already MINTED the capability by the time `_reply_err` refuses, and there is no
+			// out-parameter to hand it back through, so it is stranded exactly as an over-long
+			// capability list strands its fifth handle.
+			//
+			// REFUSED STATICALLY RATHER THAN SUPPORTED, deliberately. Supporting it means an
+			// out-parameter on `_reply_err` and a handle-aware decode on the client's Err arm -
+			// a wire and API change for a shape nothing in this tree asks for. When something does,
+			// this refusal is where the decision is recorded and the place to change it.
+			if matches!(ok.as_ref(), Type::Stream(_)) {
+				match type_cardinality(err, cards, names, imports) {
+					Cardinality::Exact(0) => {}
+					Cardinality::Unknown => errs.push(Error::new(span, String::from("the error arm of a stream open uses an imported wire shape that has not been resolved"))),
+					_ => errs.push(Error::new(span, String::from("the error arm of a stream open carries a capability, which the generated reply cannot transport - the server mints it and has no way to hand it back"))),
+				}
+			}
 		}
 		_ => {}
 	}

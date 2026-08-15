@@ -847,8 +847,13 @@ impl<'a> Package<'a> {
 		let count = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
 		// AND A CEILING ON THE READER. The strict pass compares each entry against every earlier
 		// one, which is O(n^2), and `bootstrap::MAX_ENTRIES` bounds the WRITER only - so a hostile
-		// archive with a large enough entry table drove quadratic work. The bound is the same one
-		// the writer keeps, stated once here for both.
+		// archive with a large enough entry table drove quadratic work.
+		//
+		// THIS IS THE READER'S OWN CEILING AND IT IS NOT THE WRITER'S. `bootstrap::MAX_ENTRIES` is
+		// 64 and bounds a bootstrap set, which is a handful of boot programs; this is 4096 and
+		// bounds what a reader will look at, which is a system package of 146 today. They are
+		// deliberately different sizes because they bound different sets, and unifying them would
+		// be a regression in one direction or the other.
 		if count > MAX_PACKAGE_ENTRIES {
 			return None;
 		}

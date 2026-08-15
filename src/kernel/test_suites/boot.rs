@@ -12,6 +12,25 @@ fn system_packages_use_canonical_executable_names() {
 		let name = volume.name(index).expect("volume entry name");
 		let name = core::str::from_utf8(name).expect("volume entry name is UTF-8");
 		assert!(test_volume_path_is_declared(name), "system volume contains an undeclared entry {name}");
+		// EVERY PROGRAM DIRECTORY HOLDS PROGRAMS - and, under `bin/`, one thing more.
+		//
+		// The rule was "anything under these three prefixes is an executable", which was true while
+		// `bin/` held only programs. It now also holds APP ASSET BUNDLES: `bin/<program>/...` is the
+		// data that program ships beside itself, and it is what a `app-assets` grant is scoped to.
+		// LiberCommander's syntax descriptors are the first.
+		//
+		// So the distinction is DEPTH, and it is checked rather than assumed: a path directly under
+		// `bin/` is a program and must be named like one, while a deeper path is an asset - and the
+		// program that owns it must actually be staged, or the bundle is a staging mistake wearing
+		// the name of something that does not exist.
+		let asset: Option<&str> = name.strip_prefix("bin/").and_then(|rest| rest.split_once('/')).map(|(owner, _)| owner);
+		if let Some(owner) = asset {
+			let mut program = alloc::string::String::from("bin/");
+			program.push_str(owner);
+			program.push_str(abi::EXECUTABLE_SUFFIX);
+			assert!(volume.lookup(program.as_bytes()).is_some(), "the asset bundle {name} belongs to a program the volume does not stage");
+			continue;
+		}
 		if name.starts_with("bin/") || name.starts_with("libexec/") || name.starts_with("drivers/") {
 			assert!(name.ends_with(abi::EXECUTABLE_SUFFIX), "system volume contains an extensionless native artifact");
 		}

@@ -224,14 +224,6 @@ impl Fdt {
 	}
 
 	// Length (excluding the terminator) of a null-terminated FDT string at `p`.
-	unsafe fn str_len(&self, p: u64) -> u64 {
-		let mut n = 0u64;
-		while unsafe { self.u8_at(p + n) } != 0 {
-			n += 1;
-		}
-		n
-	}
-
 	// Combine `cells` big-endian u32 cells at `p` into a u64 (advancing `p`).
 	unsafe fn read_cells(&self, p: &mut u64, cells: u32) -> u64 {
 		let mut v = 0u64;
@@ -463,23 +455,60 @@ impl Fdt {
 						let (pname, len, val, next) = self.prop_in(p, &b)?;
 						p = next;
 						if depth == 0 {
-							if self.str_eq(pname, "#address-cells") {
+							// FOUR BYTES, BECAUSE THAT IS WHAT THE PROPERTY IS. `prop_in` proves the
+							// declared value lies inside the structure block; it does not prove the
+							// value is as long as this reader assumes. A one-byte `#address-cells`
+							// had `be32` reading three bytes of whatever followed it - inside the
+							// blob, so no bounds check fires, and the cell count it produced then
+							// decided how every `reg` in the tree was parsed.
+							if self.str_eq(pname, "#address-cells") && len == 4 {
 								addr_cells = self.be32(val);
-							} else if self.str_eq(pname, "#size-cells") {
+							} else if self.str_eq(pname, "#size-cells") && len == 4 {
 								size_cells = self.be32(val);
 							}
 						} else if depth == 1 && d1_memory && self.str_eq(pname, "reg") {
+							// RAM IS NOT ONE RANGE, AND SUMMING THE BANKS PRETENDS IT IS.
+							//
+							// This took the first bank's base and added up every bank's SIZE, so a
+							// board with a hole in its map - two 256 MB banks at 0x4000_0000 and
+							// 0x8000_0000 - produced base 0x4000_0000 and size 512 MB. The kernel
+							// builds its usable frame region from `ram_base .. ram_base + ram_size`,
+							// so it would have handed out frames from the middle of the HOLE as
+							// though they were memory, and stopped short of the second bank's real
+							// end. Writing to a hole is not a fault the allocator can attribute:
+							// the store simply goes nowhere and the data is gone.
+							//
+							// So banks are accumulated only while they are CONTIGUOUS with what has
+							// been seen, and a gap ends the run. What this reports is a range that
+							// genuinely is memory - which is the property the frame allocator needs
+							// and the one the old arithmetic could not promise.
+							//
+							// The cost is the RAM past the first hole, which is not used. That is a
+							// limitation and it is stated: see the milestone task for carrying the
+							// real region list, which is the fix that keeps it. Losing memory is
+							// recoverable by anyone who reads the boot report; handing out a hole is
+							// not recoverable by anybody.
 							let mut q = val;
 							let end = val + len as u64;
-							let mut first = true;
 							while q + 4 * (addr_cells + size_cells) as u64 <= end {
 								let a = self.read_cells(&mut q, addr_cells);
 								let s = self.read_cells(&mut q, size_cells);
-								if first {
-									ram_base = a;
-									first = false;
+								if s == 0 {
+									continue;
 								}
-								ram_size += s;
+								if ram_size == 0 {
+									ram_base = a;
+									ram_size = s;
+									continue;
+								}
+								// Contiguous with the run so far - in either direction, because a
+								// device tree does not promise its banks are in address order.
+								if a == ram_base + ram_size {
+									ram_size += s;
+								} else if a + s == ram_base {
+									ram_base = a;
+									ram_size += s;
+								}
 							}
 						} else if in_pcie == depth && self.str_eq(pname, "reg") {
 							// The pcie node's reg is <ecam_base ecam_size> in root cells.
@@ -493,7 +522,14 @@ impl Fdt {
 							// QEMU writes these as one or two cells depending on the machine, so
 							// the width is taken from the property length rather than assumed -
 							// reading a 4-byte property as 8 would produce a wild address.
-							let value = if len == 8 { ((self.be32(val) as u64) << 32) | self.be32(val + 4) as u64 } else { self.be32(val) as u64 };
+							// FOUR OR EIGHT AND NOTHING ELSE. The width was taken as "eight if the
+							// length says eight, otherwise four", so a property of one, two or three
+							// bytes - or of zero - still took a four-byte read past its own end.
+							let value = match len {
+								8 => ((self.be32(val) as u64) << 32) | self.be32(val + 4) as u64,
+								4 => self.be32(val) as u64,
+								_ => continue,
+							};
 							if self.str_eq(pname, "linux,initrd-start") {
 								modules_start = value;
 							} else {
@@ -722,7 +758,14 @@ impl Fdt {
 		let end = value + len as u64;
 		while at < end {
 			let entry = at;
-			let entry_len = unsafe { self.str_len(entry) };
+			// BOUNDED BY THE PROPERTY, not by the first zero byte anywhere after it. This used the
+			// unbounded `str_len`, which walks until it finds a NUL - so a `compatible` whose last
+			// entry has no terminator read past the end of its own property and kept going. The
+			// bounded reader exists for exactly this class and was already used elsewhere; this was
+			// the one call site still on the old one.
+			let Some(entry_len) = (unsafe { self.str_len_in(entry, end) }) else {
+				return None;
+			};
 			at += entry_len + 1;
 			for (name, uart) in [("arm,pl011", Uart::Pl011), ("ns16550a", Uart::Ns16550), ("ns16550", Uart::Ns16550), ("snps,dw-apb-uart", Uart::Ns16550)] {
 				if unsafe { self.str_eq(entry, name) } {

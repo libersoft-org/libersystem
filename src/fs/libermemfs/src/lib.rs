@@ -1662,14 +1662,35 @@ impl LiberMemFs {
 			// length and the volume is holding more than it needs, which is a cost rather than a
 			// defect, and the resync below reports the truth either way.
 			let mut smaller: Vec<u8> = Vec::new();
-			if smaller.try_reserve_exact(want).is_ok() {
+			// AND IT IS ADOPTED ONLY IF IT IS ACTUALLY SMALLER. `try_reserve_exact` promises AT
+			// LEAST what was asked for, which is the sentence the grow path below is built around -
+			// and this path took whatever came back on faith. A generous allocator answering a
+			// shrink with a larger block than the buffer already had would have made a SHRINK raise
+			// the volume's footprint. Measuring both sides is the same discipline, applied to the
+			// same uncertainty, in the same function.
+			if smaller.try_reserve_exact(want).is_ok() && smaller.capacity() < bytes.capacity() && footprint - charged + smaller.capacity() <= capacity {
 				smaller.extend_from_slice(&bytes[..want]);
 				*bytes = smaller;
 			}
 			return Ok(());
 		}
-		// Growing: build the whole new buffer, measure what the allocator actually gave, and only
-		// then swap it in.
+		// LONGER THAN THE CONTENTS AND INSIDE THE BUFFER: no allocation at all.
+		//
+		// This branched on `len` alone, so a file holding 20 bytes in an 80-byte buffer built a
+		// fresh 40-byte Vec to grow to 40 - and the caller had just computed, from `capacity`, that
+		// the operation allocates nothing and therefore may keep its reservation. The outer function
+		// and this one disagreed about whether an allocation was about to happen, and on a tight
+		// heap the disagreement was a `NoSpace` for memory the volume was already holding.
+		//
+		// Extending in place is also what `write_file` does with the same buffer, which is where the
+		// 20-in-80 shape comes from: a partial overwrite deliberately keeps the high-water
+		// allocation. A grow that rebuilt it would hand back memory the volume is still charged for.
+		if want <= bytes.capacity() {
+			bytes.resize(want, 0);
+			return Ok(());
+		}
+		// Growing past the buffer: build the whole new one, measure what the allocator actually
+		// gave, and only then swap it in.
 		let mut grown: Vec<u8> = Vec::new();
 		grown.try_reserve_exact(want).map_err(|_| FsError::NoSpace)?;
 		if footprint - charged + grown.capacity() > capacity {

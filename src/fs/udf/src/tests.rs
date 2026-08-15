@@ -105,6 +105,11 @@ fn fid(name: &str, is_dir: bool, parent: bool, icb: u32) -> Vec<u8> {
 	let id = if parent { Vec::new() } else { dstring(name) };
 	let total = 38 + id.len();
 	let mut f = vec![0u8; (total + 3) & !3];
+	// THE FILE VERSION NUMBER, which UDF fixes at 1 and this fixture left at zero - the third field
+	// in this builder to be zero where a real volume has a value, and the third to be found by the
+	// parser learning to read it. A fixture that is not a shape any writer produces cannot tell a
+	// stricter parser from a broken one.
+	w16(&mut f, 16, 1);
 	f[18] = if parent { 0x08 } else { 0 } | if is_dir { 0x02 } else { 0 };
 	f[19] = id.len() as u8;
 	// THE EXTENT LENGTH, which this fixture left as zero - and a `long_ad` whose length is zero
@@ -339,10 +344,9 @@ fn an_unchecksummed_descriptor_is_not_trusted() {
 
 #[test]
 fn listing_contract_and_dot_dot() {
-	// an empty-named File Identifier neither lists nor matches an empty lookup, and
-	// ".." resolves to the parent as on the other backends.
+	// ".." resolves to the parent as on the other backends, and an empty lookup finds nothing.
 	let mut img = build_udf();
-	let sub = file_entry(261, true, &[fid("", true, true, 260), fid("WORLD.TXT", false, false, 263), fid("", false, false, 262)], b"");
+	let sub = file_entry(261, true, &[fid("", true, true, 260), fid("WORLD.TXT", false, false, 263)], b"");
 	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&sub);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
 	let list = fs.list_dir(b"SUB").unwrap();
@@ -351,6 +355,103 @@ fn listing_contract_and_dot_dot() {
 	let mut up: Vec<_> = fs.list_dir(b"SUB/..").unwrap().into_iter().map(|f| f.name).collect();
 	up.sort();
 	assert_eq!(up, ["HELLO.TXT", "SUB"]);
+}
+
+#[test]
+fn the_file_sets_own_extent_is_read_rather_than_only_its_address() {
+	// `LogicalVolumeContentsUse` is a whole `long_ad`, and this reader used to take the logical
+	// block and the partition reference out of the middle of it while ignoring the first four
+	// bytes - the extent's LENGTH and TYPE. So a volume naming an extent of no bytes, or one
+	// recorded as unallocated, was followed anyway and whatever was at that block was mounted if it
+	// looked like a File Set Descriptor.
+	//
+	// The same defect was fixed for the root and child ICB references; this was the one place still
+	// reading a `long_ad` by hand.
+	for (offset, value, why) in [
+		(248u32, 0u32, "an extent of no bytes names nothing"),
+		(248, 0x4000_0800, "an extent recorded as allocated-but-not-recorded is not data"),
+		(248, 0x8000_0800, "nor is one recorded as not allocated"),
+		(248, 0xC000_0800, "and type 3 is a continuation, not a File Set"),
+	] {
+		let mut img = build_udf();
+		let lvd = &mut img[258 * SECTOR_SIZE..259 * SECTOR_SIZE];
+		w32(lvd, offset as usize, value);
+		// The edit is inside the CRC's coverage, so the descriptor is re-stamped: what is being
+		// tested is the parser reading the field, not the parser catching a broken checksum.
+		tag(lvd, TAG_LOGICAL_VOLUME, 258);
+		assert!(Udf::mount_checked(MemDisc { data: img }).is_err(), "{why}");
+	}
+	// AND A SEQUENCE LONGER THAN ONE DESCRIPTOR IS REFUSED RATHER THAN GUESSED AT. ECMA-167 allows
+	// several File Set Descriptors with the prevailing one chosen by File Set Number; this reader
+	// takes the first and always did, which is right for the single-File-Set case UDF requires on
+	// ordinary media and silently wrong for the WORM case it permits.
+	let mut img = build_udf();
+	let lvd = &mut img[258 * SECTOR_SIZE..259 * SECTOR_SIZE];
+	w32(lvd, 248, SECTOR_SIZE as u32 * 2);
+	tag(lvd, TAG_LOGICAL_VOLUME, 258);
+	assert_eq!(Udf::mount_checked(MemDisc { data: img }).err(), Some(MountError::Unsupported), "a File Set Sequence this reader does not walk is refused by name");
+}
+
+#[test]
+fn a_deleted_entry_is_skipped_by_the_lookup_the_way_the_listing_skips_it() {
+	// TWO FUNCTIONS OVER ONE RECORD TYPE, DISAGREEING ABOUT WHETHER IT IS READABLE.
+	//
+	// UDF overwrites a deleted entry's compression id - 8 becomes 254, 16 becomes 255 - so the
+	// identifier of a deleted File Identifier deliberately decodes as nothing. `read_dir` tests the
+	// deleted flag before it reads the name and skips the record; `find_entry` decoded the name
+	// FIRST and turned the unknown compression id into `Corrupt` for the whole directory.
+	//
+	// So a volume with one deleted file listed perfectly and could not be looked up in. Deleted
+	// FIDs are a standard mechanism and the specification recommends reusing them, so this is
+	// ordinary media rather than a hostile case - which is what makes it worth a test rather than a
+	// bounds check.
+	let mut img = build_udf();
+	// A deleted record carrying UDF's own deleted compression id, ahead of the file being looked up.
+	// The tag is recomputed because both bytes are inside the CRC's coverage.
+	let mut gone = fid("OLD.TXT", false, false, 262);
+	gone[18] |= 0x04;
+	gone[38] = 254;
+	tag(&mut gone, TAG_FILE_ID, 0);
+	let sub = file_entry(261, true, &[fid("", true, true, 260), gone, fid("WORLD.TXT", false, false, 263)], b"");
+	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&sub);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	// The listing has always skipped it...
+	let names: Vec<String> = fs.list_dir(b"SUB").unwrap().into_iter().map(|f| f.name).collect();
+	assert_eq!(names, ["WORLD.TXT"], "the deleted record does not list");
+	// ...and now the lookup does too, instead of reporting the directory corrupt.
+	assert_eq!(fs.read_file(b"SUB/WORLD.TXT"), Ok(b"world".to_vec()), "a file behind a deleted record is reachable");
+	// And a name that genuinely is not there is still NOT FOUND rather than corrupt: skipping the
+	// deleted record must not turn the directory into one this reader cannot finish reading.
+	assert_eq!(fs.read_file(b"SUB/MISSING.TXT"), Err(FsError::NotFound), "and a missing file is missing");
+}
+
+#[test]
+fn a_non_parent_identifier_of_one_byte_is_corruption_rather_than_an_empty_name() {
+	// A BEHAVIOUR CHANGE, AND A DELIBERATE ONE. This directory used to list cleanly: a non-parent
+	// File Identifier of one byte is a compression id and no characters, `decode_name` answered the
+	// empty string, and both the listing and the lookup passed over it.
+	//
+	// UDF fixes the length of a non-parent identifier at more than one byte, so such a record is
+	// not an unnamed file - it is a record no writer produces. Passing over it is the behaviour
+	// this file argues against everywhere else: the comment on the name decode says a record that
+	// does not decode is corrupt "not one to pass over: skipping it listed a damaged directory as a
+	// tidy one", and this was the one shape that still slipped through, because it decoded to
+	// something.
+	//
+	// The parent record is the exception and stays one: it carries no identifier at all, which is a
+	// length of zero rather than of one.
+	let mut img = build_udf();
+	let sub = file_entry(261, true, &[fid("", true, true, 260), fid("WORLD.TXT", false, false, 263), fid("", false, false, 262)], b"");
+	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&sub);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.list_dir(b"SUB"), Err(FsError::Corrupt), "the directory holds a record UDF does not permit");
+	// A LOOKUP THAT REACHES THE RECORD SAYS SO; one that finds its answer first does not, and that
+	// asymmetry is right. `WORLD.TXT` is ordered before the bad record, so it is found and returned
+	// - a reader is not obliged to walk past what it came for. A name that is NOT there walks the
+	// whole directory, meets the record, and answers `Corrupt` instead of `NotFound`: the caller
+	// must not be told a file is absent from a directory this reader could not read to the end.
+	assert_eq!(fs.read_file(b"SUB/WORLD.TXT"), Ok(b"world".to_vec()), "a name found before the damage is still answered");
+	assert_eq!(fs.read_file(b"SUB/MISSING.TXT"), Err(FsError::Corrupt), "and a name that is not there reports the damage rather than reporting it missing");
 }
 
 #[test]

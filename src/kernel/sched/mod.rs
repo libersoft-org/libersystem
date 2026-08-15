@@ -60,6 +60,65 @@ impl CpuSched {
 
 static SCHED: AtomicPtr<CpuSched> = AtomicPtr::new(core::ptr::null_mut());
 
+// How many threads exist, anywhere, right now.
+//
+// Not a statistic: it is the number every core's run queue has to have room for, because a woken
+// thread joins the WAKER's queue and any core can be the waker. `Process::live_thread_count` is
+// per-process and cannot answer that.
+static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+// Book a run-queue slot on EVERY core for a thread about to be created, or refuse.
+//
+// The seven `run_queue.push_back` call sites carried `ALLOC-OK: bounded by the Domain thread quota`,
+// and a bound is not a booking: the quota says the queue will never hold a millionth entry and
+// nothing about whether the heap can hold its first. `SYS_THREAD_START` and every wake reach those
+// pushes, so a short heap made them a kernel abort from ring 3 - the K06 class, in the one structure
+// that must never fail.
+//
+// Booked at creation rather than at enqueue because enqueue has nowhere to put a refusal: a runnable
+// thread that cannot be queued is a thread that never runs again. Creation already answers `None`
+// and every caller already handles it.
+//
+// The reservation is never given back, which is right twice over: a `VecDeque`'s capacity does not
+// shrink, and the ceiling that matters is the peak thread count rather than the current one. So the
+// invariant each core holds is `capacity >= live threads`, and since one thread occupies at most one
+// slot of one queue, a push can always find room.
+pub fn reserve_run_slot() -> bool {
+	// Claimed before it is booked, so two cores creating threads at once cannot both reserve for the
+	// same target and leave the queue one short.
+	let target = LIVE_THREADS.fetch_add(1, Ordering::AcqRel) + 1;
+	if SCHED.load(Ordering::Acquire).is_null() {
+		// `allocate` runs before any thread exists, so this is the host test build, where there are
+		// no run queues to book.
+		return true;
+	}
+	for cpu in 0..crate::smp::cpu_count() {
+		let mut inner = cpu_sched(cpu).inner.lock();
+		// `try_reserve(n)` guarantees room for `len + n`, so the argument is what is missing rather
+		// than the target itself.
+		let want = target.saturating_sub(inner.run_queue.len());
+		if inner.run_queue.try_reserve(want).is_err() {
+			drop(inner);
+			LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
+			return false;
+		}
+	}
+	true
+}
+
+// Give back a booking whose thread was never built, or whose thread has been dropped. The queue
+// capacity stays - it cannot shrink - and what this restores is the count the next reservation
+// measures against.
+pub fn release_run_slot() {
+	LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
+}
+
+// The booking count, so a test can say it comes back.
+#[cfg(test)]
+pub fn live_thread_bookings() -> usize {
+	LIVE_THREADS.load(Ordering::Acquire)
+}
+
 // Allocate the per-core scheduler slots for `count` cores, sized by the MP
 // response. Called once by smp::init before any core parks in its idle loop.
 pub fn allocate(count: usize) {

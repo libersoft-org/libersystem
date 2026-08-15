@@ -172,6 +172,13 @@ const EXFAT_EOC: u32 = 0xFFFF_FFFF;
 // had none, so a self-loop read at offset 0 handed the caller the same cluster twice and called it
 // a file. The comment above it said the walk was "bounded by the same Floyd cycle detection every
 // other walk in this file uses", which was true of half of it.
+//
+// WHICH WALKS. The three read paths - `read_file_range`, `read_chain`, `read_chain_to_end`. The two
+// free paths do not and cannot: they clear each entry as they pass it, so a trailing Floyd pointer
+// would read the zeros this walk just wrote and meet nothing. They carry the test that a mutating
+// walk can make instead, which is that an entry about to be freed is already free. Saying so here
+// is the point of the comment: the last version claimed the invariant was universal, and a claim
+// like that is how the sixth hand-written copy came to be written.
 struct ChainCursor {
 	cluster: u32,
 	// Floyd's slow pointer: one link for every two the walk takes, so a cycle is caught in the
@@ -182,18 +189,67 @@ struct ChainCursor {
 	max: u32,
 }
 
+// Where a walk stands: on a cluster, or at the chain's terminator. Every other value a FAT entry can
+// hold is an `Err`, because it is damage.
+//
+// ONE ERROR FOR THREE STATES is what this was, and the end marker is the only one of the three that
+// is not damage. A caller written as `while let Ok(c) = chain.current(..)` therefore ended its loop
+// on a chain that ran off the volume exactly as it would on a terminator - and `read_chain_to_end`
+// was written that way, which is how the exFAT root read at mount could be scanned as far as the
+// corruption and then treated as whole. A root scanned short hides a second Allocation Bitmap from
+// the rule that exists to refuse one.
+enum ChainState {
+	Cluster(u32),
+	End,
+}
+
 impl ChainCursor {
 	fn new(first: u32, no_fat_chain: bool, max: u32) -> Self {
 		Self { cluster: first, slow: first, steps: 0, no_fat_chain, max }
 	}
 
-	// The cluster this cursor is on, or why it is not one: outside the volume, below the first data
-	// cluster, or the end of the chain.
-	fn current<D: BlockDevice>(&self, fs: &FatFs<D>) -> Result<u32, FsError> {
-		if self.cluster < 2 || self.cluster > self.max || fs.is_end(self.cluster) {
-			return Err(FsError::Corrupt);
+	// Where the walk stands. The end marker is checked first: it is out of the heap's range by
+	// definition, so the bounds test below would otherwise call every terminator corruption.
+	fn state<D: BlockDevice>(&self, fs: &FatFs<D>) -> Result<ChainState, FsError> {
+		if !self.no_fat_chain && fs.is_end(self.cluster) {
+			return Ok(ChainState::End);
 		}
-		Ok(self.cluster)
+		if self.cluster < 2 || self.cluster > self.max {
+			// `Invalid`, which fs-core defines as "an out-of-range value read off an untrusted
+			// medium" - exactly this. `Corrupt` is defined there as a block whose stored checksum
+			// did not match, which no FAT family has. This said `Corrupt` and nothing noticed,
+			// because every caller reached it through a `while let Ok(..)` that turned the error
+			// into the end of a loop; the two callers that now propagate it are why it matters.
+			return Err(FsError::Invalid);
+		}
+		Ok(ChainState::Cluster(self.cluster))
+	}
+
+	// The cluster this cursor is on, for a walk whose length is already known: reaching the end of
+	// the chain early means the entry declared more bytes than the FAT holds, which is a truncated
+	// file rather than a short one.
+	fn current<D: BlockDevice>(&self, fs: &FatFs<D>) -> Result<u32, FsError> {
+		match self.state(fs)? {
+			ChainState::Cluster(c) => Ok(c),
+			ChainState::End => Err(FsError::Invalid),
+		}
+	}
+
+	// The link out of the last cluster a bounded read consumed. A read that stops on its declared
+	// length never looks at it otherwise, and it is the one that carries the answer: a chain that
+	// loops back is caught by the advance, and a successor that is neither a terminator nor a real
+	// cluster is a file naming space the FAT says is free.
+	//
+	// A successor that IS a real cluster is accepted deliberately. A chain longer than the size its
+	// entry declares is over-allocation - other implementations leave it behind and a reader has no
+	// business refusing the volume for it.
+	fn settle<D: BlockDevice>(&mut self, fs: &mut FatFs<D>) -> Result<(), FsError> {
+		if self.no_fat_chain {
+			return Ok(());
+		}
+		self.advance(fs)?;
+		self.state(fs)?;
+		Ok(())
 	}
 
 	// Step to the next cluster. `Invalid` for a chain that loops back on itself.
@@ -487,6 +543,14 @@ impl<D: BlockDevice> FatFs<D> {
 			buffer[done..done + take].copy_from_slice(&scratch[within..within + take]);
 			done += take;
 			within = 0;
+			if done >= want {
+				// The link out of the last cluster read, which is where a cycle that closes exactly
+				// on the requested length shows up - and where a file naming a cluster the FAT calls
+				// FREE stops looking like a file. `alloc_chain` hands out any entry holding 0, so a
+				// referenced-but-free cluster is a cross-link waiting for the next write.
+				chain.settle(self)?;
+				break;
+			}
 			chain.advance(self)?;
 		}
 		debug_assert_eq!(done, want, "the read loop fills exactly the disk-backed part");
@@ -728,9 +792,13 @@ impl<D: BlockDevice> FatFs<D> {
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let max = self.max_cluster();
 		let mut out: Vec<u8> = Vec::new();
-		// Through `ChainCursor`, as every other walk in this file now is.
+		// Through `ChainCursor`, and through its STATE rather than through the absence of an error.
+		// `while let Ok(..)` over one error that meant three things ended this loop on a chain
+		// running off the volume as readily as on a terminator, and the caller that pays for it is
+		// `scan_exfat_root`: the root is the directory with no recorded length, so it is read here,
+		// and a root scanned short is a root whose second Allocation Bitmap was never seen.
 		let mut chain = ChainCursor::new(first, false, max);
-		while let Ok(cluster) = chain.current(self) {
+		while let ChainState::Cluster(cluster) = chain.state(self)? {
 			// BEFORE the read, not after the buffer holds it. This is the whole difference.
 			if out.len().saturating_add(cluster_bytes) > cap {
 				return Err(FsError::TooLarge);
@@ -762,13 +830,22 @@ impl<D: BlockDevice> FatFs<D> {
 		// time until the budget tripped at `cluster_count`, which on a real volume is an enormous
 		// allocation performed on behalf of a medium the driver does not trust.
 		// Through `ChainCursor`, which is where all four of those rules live now.
+		//
+		// AND THROUGH ITS LAST LINK. The break below used to come before the advance, so the final
+		// cluster of every bounded read was the one cluster whose outgoing link nothing looked at -
+		// and that link is where the cycle detection lives. `A -> B -> A` read for exactly three
+		// clusters gave `Ok([A, B, A])`: Floyd fires on the step from the second A, which is the
+		// step the break skipped. `read_file_range` over the same chain refused it, because its
+		// advance sits in the loop body rather than behind an early exit, so one volume had two
+		// readers that disagreed about whether it was corrupt.
 		let mut chain = ChainCursor::new(first, false, max);
-		while let Ok(cluster) = chain.current(self) {
+		while let ChainState::Cluster(cluster) = chain.state(self)? {
 			let sec = self.cluster_fs_sector(cluster);
 			let mut buf = vec![0u8; cluster_bytes];
 			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut buf)?;
 			out.extend_from_slice(&buf);
 			if out.len() >= limit {
+				chain.settle(self)?;
 				break;
 			}
 			chain.advance(self)?;
@@ -1169,6 +1246,12 @@ impl<D: BlockDevice> FatFs<D> {
 		r
 	}
 
+	// NOT `ChainCursor`, and the reason is that this walk MUTATES what the cursor would read.
+	// Floyd's slow pointer trails the fast one over entries this loop has already cleared, so it
+	// would read zeros and never meet anything - detection that is present but inert, which is worse
+	// than none because it reads as covered. What a free walk has instead is exact: an entry it is
+	// about to free that is ALREADY free is one it has been to before. That ends the walk on a cycle
+	// in the length of the cycle, like Floyd, and without a second reader of the table.
 	fn free_walk(&mut self, first: u32, freed: &mut i64) -> Result<(), FsError> {
 		let max = self.max_cluster();
 		let mut cluster = first;
@@ -1178,6 +1261,12 @@ impl<D: BlockDevice> FatFs<D> {
 				break;
 			}
 			let next = self.next_cluster(cluster)?;
+			// A revisit, or a link into space the FAT already calls free. Either way the entry is
+			// not this walk's to release, and counting it inflated the FSInfo free count by one for
+			// every cycle freed.
+			if next == 0 {
+				break;
+			}
 			self.set_fat_entry(cluster, 0)?;
 			*freed += 1;
 			cluster = next;
@@ -1909,6 +1998,12 @@ impl<D: BlockDevice> FatFs<D> {
 				if upcase.is_some() {
 					return Err(FsError::Invalid);
 				}
+				// The same standard the Allocation Bitmap above is held to, which this entry was
+				// not: three reserved bytes below the checksum and twelve between it and the
+				// FirstCluster, all required to be zero.
+				if e[1..4].iter().any(|byte| *byte != 0) || e[8..20].iter().any(|byte| *byte != 0) {
+					return Err(FsError::Invalid);
+				}
 				let stored = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
 				let first = u32::from_le_bytes([e[20], e[21], e[22], e[23]]);
 				let size = u64::from_le_bytes([e[24], e[25], e[26], e[27], e[28], e[29], e[30], e[31]]);
@@ -1931,6 +2026,11 @@ impl<D: BlockDevice> FatFs<D> {
 			return Err(FsError::Invalid);
 		}
 		let decoded = dir::Upcase::decode(&table).ok_or(FsError::Invalid)?;
+		// A table that decodes and checksums is not yet a table that says what the format requires;
+		// the first 128 mappings are fixed and a volume whose table disagrees is invalid.
+		if !decoded.ascii_prefix_ok() {
+			return Err(FsError::Invalid);
+		}
 		Ok((ExfatRoot { bitmap_first, bitmap_size }, decoded))
 	}
 
@@ -2049,6 +2149,12 @@ impl<D: BlockDevice> FatFs<D> {
 				break;
 			}
 			let next = self.next_cluster(cluster)?;
+			// Already free, so already visited - the same exact cycle test `free_walk` uses, and for
+			// the same reason it is not `ChainCursor`: this walk clears the entries a Floyd pointer
+			// would be reading.
+			if next == 0 {
+				break;
+			}
 			let idx = (cluster - 2) as usize;
 			let byte = idx / 8;
 			if byte < bm_used {

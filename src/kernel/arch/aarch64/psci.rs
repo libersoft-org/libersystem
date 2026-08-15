@@ -99,11 +99,27 @@ aarch64_secondary_entry:
 // under QEMU's own PSCI, which is HVC. That is the path every aarch64 test in this tree takes.
 pub(crate) fn conduit(arg: u64) -> u32 {
 	if arg == 0 {
-		return bootproto::PSCI_HVC;
+		return bootproto::PSCI_NONE;
 	}
 	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
 	if magic != bootproto::MAGIC {
-		return bootproto::PSCI_HVC;
+		// A RAW DEVICE TREE, WHICH IS THE OTHER WAY THIS KERNEL BOOTS - and it answered `PSCI_HVC`
+		// unconditionally.
+		//
+		// The loader learned to read `/psci/method` and the FADT, so a UEFI boot gets the conduit
+		// the platform states. Booted directly by firmware with a DTB in `x0` there is no
+		// `BootInfo`, and this fell back to the same guess the loader had just stopped making: the
+		// identical machine, with `method = "smc"` in its own device tree, executed `hvc #0`.
+		//
+		// The tree is right there and `Fdt::psci_conduit` already reads it - the same function the
+		// loader calls, so the two boot paths cannot answer differently about one platform. A tree
+		// that states nothing gets `PSCI_NONE`, which boots single-core with a reason rather than
+		// faulting on the first secondary.
+		return match fdt::Fdt::new(arg, super::paging::phys_to_virt).psci_conduit() {
+			Some(fdt::PsciConduit::Smc) => bootproto::PSCI_SMC,
+			Some(fdt::PsciConduit::Hvc) => bootproto::PSCI_HVC,
+			None => bootproto::PSCI_NONE,
+		};
 	}
 	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
 	unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).psci_conduit)) }

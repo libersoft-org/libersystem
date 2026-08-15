@@ -417,17 +417,23 @@ impl Screen {
 
 	// Whether a glyph has filled the last column and its wrap is still owed.
 	//
-	// EXPOSED SO THE INVARIANT CAN BE ASSERTED DIRECTLY. `cursor_moved`'s comment claims "every path
-	// that actually assigns `row` or `col` calls this, and nothing else does", and that claim has
-	// been wrong twice - a sentence nothing can check is a sentence that drifts. The tests drive
-	// every public way to move the cursor from a state with the wrap owed and read this afterwards.
-	pub fn wrap_pending(&self) -> bool {
+	// EXPOSED TO THIS CRATE SO THE INVARIANT CAN BE ASSERTED DIRECTLY. `cursor_moved`'s rule has been
+	// wrong twice - a sentence nothing can check is a sentence that drifts - so the tests drive every
+	// way to move the cursor from a state with the wrap owed and read this afterwards.
+	//
+	// `pub(crate)` and `cfg(test)`, not `pub`: this is the deferred-wrap flag, which is
+	// implementation state, and the only reader is the suite in this crate. A consumer that could
+	// read it would be writing against how wrapping is implemented rather than against what the
+	// terminal displays - and left visible to the ordinary build it is two methods nothing calls.
+	#[cfg(test)]
+	pub(crate) fn wrap_pending(&self) -> bool {
 		self.pending_wrap
 	}
 
 	// Whether `row` continues onto the next one - a SOFT wrap, written by `put_glyph`'s deferred
 	// branch, as against a line the user ended.
-	pub fn row_wrapped(&self, row: usize) -> bool {
+	#[cfg(test)]
+	pub(crate) fn row_wrapped(&self, row: usize) -> bool {
 		self.screen().wrap.get(row).copied().unwrap_or(false)
 	}
 
@@ -1424,7 +1430,14 @@ impl Screen {
 	// instead of at the start of the next row. A colour change between a full line and the next
 	// character is what a prompt does.
 	//
-	// So every path that actually assigns `row` or `col` calls this, and nothing else does.
+	// So the rule is: EVERY EXPLICIT REPOSITIONING OF THE CURSOR SETTLES THE DEFERRED WRAP, and
+	// nothing else does. It used to be written as "every path that actually assigns `row` or `col`
+	// calls this", which is not quite the rule and is falsified by a path that is correct: `resize`
+	// assigns both and then sets `pending_wrap = false` itself, because a reflow is not a cursor
+	// movement and what it owes depends on where the text ended up.
+	//
+	// The distinction that matters is between a printable advance - which is where a deferred wrap
+	// comes FROM and must not cancel it - and anything that puts the cursor somewhere, which must.
 	fn cursor_moved(&mut self) {
 		self.pending_wrap = false;
 	}

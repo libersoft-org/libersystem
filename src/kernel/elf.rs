@@ -172,6 +172,17 @@ pub fn unmap_module(elf: &[u8], addr_space: &AddressSpace, bias: u64) {
 
 fn load_parsed(image: &bootproto::elf::Elf<'_>, addr_space: &AddressSpace, frames: &mut Vec<u64>, shared: &mut Vec<Arc<SharedPage>>, bias: u64, window: Option<(u64, u64)>, require_entry: bool, resolve: &impl Fn(&str) -> Option<u64>) -> Result<(u64, Vec<(String, u64)>), ElfError> {
 	let mut loaded = Vec::new();
+	// THE RESERVATION THE COMMENT BELOW CLAIMED. It said "the vector is reserved from the segment
+	// count above" and no reservation existed anywhere in this function - the two `try_reserve`s in
+	// `map_segment` book `frames` and `shared`, which are different vectors. So the `ALLOC-OK` marker
+	// on the push asserted a fact about the code that was not true of it, which is worse than an
+	// unmarked allocation: the gate reads the marker and stops asking.
+	//
+	// The count is the image's, so it is not a compile-time bound - which is exactly why booking it
+	// has to be fallible rather than asserted.
+	if loaded.try_reserve(image.segment_count()).is_err() {
+		return Err(ElfError::OutOfMemory);
+	}
 	let shared_start = shared.len();
 	let result = (|| {
 		for i in 0..image.segment_count() {

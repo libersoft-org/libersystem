@@ -208,8 +208,26 @@ impl Thread {
 	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
 		let mut stack = KernelStack::allocate()?;
 		let sp = arch::context::init_thread_stack(stack.as_mut_slice(), entry, arg);
+		// A RUN-QUEUE SLOT ON EVERY CORE, booked before the thread exists.
+		//
+		// The scheduler's `push_back` calls carried `ALLOC-OK: bounded by the Domain thread quota`,
+		// which says the queue will never hold too many entries and nothing about whether the heap
+		// can hold the next one - and `SYS_THREAD_START` and every wake reach them, with no way to
+		// refuse. Creation is where a refusal can be carried, so the room is taken here.
+		//
 		// FALLIBLY: `SYS_THREAD_CREATE` reaches this, and `build` already answers `Option`.
-		let thread = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process })?;
+		// The booking is taken IMMEDIATELY BEFORE the object that owns it, and released by hand only
+		// on the one path where no object came into being. `Drop for Thread` releases it otherwise -
+		// so a `Thread` that is constructed and then refused registration below releases it exactly
+		// once, through its own drop. Booking in a wrapper around this function released it twice on
+		// that path, which took the count below zero.
+		if !crate::sched::reserve_run_slot() {
+			return None;
+		}
+		let Some(thread) = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process }) else {
+			crate::sched::release_run_slot();
+			return None;
+		};
 		// Forward-link the thread to its process so signal delivery can reach it - and refuse to
 		// build the thread at all if the process is already tearing down. A thread that cannot be
 		// registered is a thread nothing can signal, reap or account, inside a process whose handles
@@ -321,6 +339,10 @@ impl Drop for Thread {
 		// thread drops, the Arc to the Process drops with it, tearing down the
 		// process's handle table (refunding its handles) and address space.
 		self.process.domain().uncharge_thread();
+		// And the run-queue booking taken in `build`. Every core keeps the capacity - a `VecDeque`
+		// cannot give it back - and what this restores is the count the next booking measures
+		// against, so a system that churns threads does not ratchet its queues upwards forever.
+		crate::sched::release_run_slot();
 		// And the LIVE-THREAD counter, for a thread that never ran.
 		//
 		// `register_thread` increments it as the thread is built, and the scheduler decrements it

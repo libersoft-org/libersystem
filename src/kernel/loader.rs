@@ -106,6 +106,14 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	if let Some(name) = image_artifact_name(elf_image) {
 		process.header().set_name(name);
 	}
+	// BOOKED BEFORE IT IS TAKEN. `adopt_frames` extends a vector, and extending an EMPTY vector
+	// allocates too - the marker on it said "moved in whole at spawn", which describes where the
+	// list came from and not whether the destination can hold it. Nothing is mapped into a process
+	// anyone else can see yet, so the failure just returns the frames.
+	if !process.reserve_adopt(frames.len(), shared.len()) {
+		free_frames(frames);
+		return Err(LoadError::OutOfMemory);
+	}
 	process.adopt_frames(frames);
 	process.adopt_shared_pages(shared);
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
@@ -194,6 +202,20 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 	if let Some(name) = image_artifact_name(elf_image) {
 		process.header().set_name(name);
 	}
+	// The same booking, and here the unwind has more to do: the segments and the stack are mapped
+	// into a live address space, so they come out of the page tables before the frames go back.
+	if !process.reserve_adopt(frames.len(), shared.len()) {
+		elf::for_each_loaded_range(elf_image, |start, end| {
+			let mut address = start;
+			while address < end {
+				let _ = process.address_space().unmap(address);
+				address += PAGE_SIZE;
+			}
+		});
+		unmap_stack(process.address_space(), USER_STACK_PAGES);
+		free_frames(frames);
+		return Err(LoadError::OutOfMemory);
+	}
 	process.adopt_frames(frames);
 	process.adopt_shared_pages(shared);
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
@@ -223,6 +245,17 @@ pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Resul
 			return Err(err.into());
 		}
 	};
+	// BOOKED BEFORE THE POINT OF NO RETURN. This is the caller that made the old marker false: the
+	// process already owns every frame of its main image, so the adopt at the end extends a vector
+	// with contents in it, on the `SYS_PROCESS_LOAD_MODULE` path. Reserving here rather than at the
+	// adopt puts the failure inside the transaction that already knows how to unwind - before the
+	// symbols are registered, which is the step this function cannot take back.
+	if !process.reserve_adopt(frames.len(), shared.len()) {
+		process.release_dynamic_module_at(bias);
+		elf::unmap_module(elf_image, process.address_space(), bias);
+		free_frames(frames);
+		return Err(LoadError::OutOfMemory);
+	}
 	if !process.register_dynamic_symbols(&exports) {
 		process.release_dynamic_module_at(bias);
 		elf::unmap_module(elf_image, process.address_space(), bias);

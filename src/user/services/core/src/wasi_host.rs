@@ -166,6 +166,14 @@ impl wasm::world::WorldServices for WasiServices {
 	// and it reads as a grant this host could have been given and was not. There is no write path
 	// behind this host at all, for any grant, so `STATUS_UNSUPPORTED` is the true one: not
 	// authority withheld, an operation that does not exist here.
+	//
+	// AND IN THIS HOST THESE ARE UNREACHABLE, which is worth saying rather than leaving for somebody
+	// to discover. A component importing `write` or `log` is refused at INSTANTIATION by the import
+	// resolution below - the import list is the manifest of requested authority, and a host that
+	// cannot serve an import should not build the instance. So these answers are the trait's
+	// contract being met rather than a path that runs; `component_host` is where they are reached.
+	// That refusal is the stricter behaviour and is deliberate: it is better to decline the whole
+	// component than to instantiate one whose world is half-served.
 	fn write(&mut self, _bytes: &[u8]) -> wasm::world::WriteOutcome {
 		wasm::world::WriteOutcome::Unsupported
 	}
@@ -286,11 +294,26 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Err(_) => exit(),
 	};
 
-	// 3. report the bytes the component read (now in its linear memory) back over
-	//    the bootstrap channel, then exit.
-	let n: usize = (count.max(0) as usize).min(instance.memory().len());
+	// 3. report WHAT THE COMPONENT ANSWERED, and not merely what it produced.
+	//
+	// This sent `count.max(0)` bytes of the component's memory and nothing else, which collapses
+	// the two answers four rounds of work went into separating. A refused read returns
+	// `STATUS_DENIED` - a negative status - and `max(0)` turns it into zero bytes; a successful read
+	// of an empty file also produces zero bytes. The supervisor received an empty message either
+	// way and could not tell "you may not" from "there was nothing there".
+	//
+	// So the report carries the STATUS FIRST, as four little-endian bytes, and the payload after
+	// it. A negative status has no payload, because there is nothing the component read. The
+	// distinction that `world_errors` exists to make now survives the last hop instead of being
+	// undone by the last four lines.
+	let mut report: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+	report.extend_from_slice(&count.to_le_bytes());
+	if count > 0 {
+		let n: usize = (count as usize).min(instance.memory().len());
+		report.extend_from_slice(&instance.memory()[..n]);
+	}
 	unsafe {
-		send_blocking(bootstrap, &instance.memory()[..n], 0);
+		send_blocking(bootstrap, &report, 0);
 	}
 	exit();
 }

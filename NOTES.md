@@ -1,5 +1,8 @@
 # Bugs / changes
 
+- architecture audit (!!!)
+- create SDK not just for WASM, but for Rust too
+- h.264 codec + mp4 container + make "play" play video too (not just audio)
 - check if we have only our own implementations of image and audio decoders and encoders
 - check if image and audio decoders are separate libraries + common code
 - remove manual word wrapping in all documents - mainly milestone documents

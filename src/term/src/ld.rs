@@ -194,7 +194,10 @@ impl Echo<'_> {
 pub struct Ld {
 	pub line: [u8; LD_LINE_MAX],
 	pub len: usize,
-	cursor: usize,
+	// Readable by the tests in this crate, which is where the buffer-versus-caret agreement is
+	// asserted: a test that can see only `len` can prove the buffer took the character and not that
+	// it took it in the right PLACE, which is the half the long-line defects were in.
+	pub(crate) cursor: usize,
 	history: Vec<Vec<u8>>,
 	// The history depth: the operator's policy (the `console.history` config key,
 	// read at VT creation), LD_HIST_MAX when no configuration answers.
@@ -517,11 +520,28 @@ impl Ld {
 	// One CHARACTER left, and one cell of echo - see `backspace`. Stepping one byte left over a
 	// multi-byte character put the cursor inside it, so the next insert or delete split it.
 	fn left(&mut self, e: &mut Echo) {
-		if self.cursor > 0 {
-			if self.echo {
-				e.put(b"\x08");
-			}
-			self.cursor = self.char_start(self.cursor);
+		if self.cursor == 0 {
+			return;
+		}
+		// THROUGH `move_left`, LIKE `home` - which is twenty lines below this and already says why.
+		//
+		// This wrote a bare backspace and moved the buffer cursor regardless, which is the exact
+		// assumption `move_left` exists to stop making: the reverse-wrap backspace steps onto the
+		// previous physical row only while there IS one, and once a command line is long enough
+		// that its first row has scrolled away the caret reaches the top-left and stays there. The
+		// screen swallowed the backspace, the buffer moved anyway, and every later edit was drawn a
+		// character further left than the editor thought.
+		//
+		// `home` was given the robust path when the long-line case was found; arrowing left to the
+		// same place was the other way to reach it, and it kept the old code. One key at a time
+		// rather than a jump is the SLOWER way to get there and the more likely one, because it is
+		// what somebody does when they are looking for a character.
+		//
+		// THE BUFFER MOVES FIRST, for `home`'s reason: a repaint prints the line from the cursor,
+		// so the cursor has to be where the caret is going before it runs.
+		self.cursor = self.char_start(self.cursor);
+		if self.echo {
+			self.move_left(1, e);
 		}
 	}
 

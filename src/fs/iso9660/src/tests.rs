@@ -11,6 +11,32 @@ struct MemDisc {
 	data: Vec<u8>,
 }
 
+// A device whose blocks past `data` read as zeros rather than failing.
+//
+// THE ONLY WAY TO TEST A FILE LARGER THAN THE READ CEILING WITHOUT HOLDING ONE. The ceiling is
+// 64 MiB, and a fixture that allocated that much to prove a window read does not allocate it would
+// be its own counter-example. The descriptors and the directory live in `data`; the file's extent
+// runs off the end of it and the device answers zeros, so the volume is as large as the test needs
+// and the test costs a few kilobytes.
+struct SparseDisc {
+	data: Vec<u8>,
+	blocks: u64,
+}
+
+impl BlockDevice for SparseDisc {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		if lba >= self.blocks {
+			return false;
+		}
+		let start = lba as usize * SECTOR_SIZE;
+		match self.data.get(start..start + SECTOR_SIZE) {
+			Some(src) => buf.copy_from_slice(src),
+			None => buf.fill(0),
+		}
+		true
+	}
+}
+
 impl BlockDevice for MemDisc {
 	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
 		let start = lba as usize * SECTOR_SIZE;
@@ -1020,6 +1046,48 @@ fn an_associated_file_record_is_validated_before_it_is_ignored() {
 	img[at + 32] = 0; // id_len = 0
 	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
 	assert_eq!(fs.list(), Err(FsError::Corrupt), "an associated-file record with no identifier is malformed, whatever this reader would have done with a valid one");
+}
+
+#[test]
+fn a_window_read_of_a_file_past_the_ceiling_reads_where_the_whole_file_cannot() {
+	// THE TEST BESIDE THIS ONE DOES NOT TEST WHAT ITS NAME SAYS. It calls a four-sector file
+	// "large" and reads a window out of it, which exercises the head/middle/tail batching and
+	// proves nothing about the 64 MiB ceiling - the file is eight kilobytes and `read_file` would
+	// have staged it happily.
+	//
+	// The product property is the other one: a window can be read out of a file that `read_file`
+	// REFUSES. Proving it needs a file past the ceiling, and holding one would make the fixture its
+	// own counter-example - so the device answers zeros past the end of its image and the file's
+	// extent runs off into that.
+	let mut img = build_iso(false);
+	// A volume large enough to hold the extent, and a device that will answer for all of it.
+	let blocks: u64 = (MAX_READ_BYTES / SECTOR_SIZE) as u64 + 64;
+	both32(&mut img[16 * SECTOR_SIZE..], 80, blocks as u32);
+	let root_off = 19 * SECTOR_SIZE;
+	let mut at = root_off;
+	while img[at] != 0 {
+		let len = img[at] as usize;
+		let id_len = img[at + 32] as usize;
+		if id_len > 1 && &img[at + 33..at + 33 + 5] == b"HELLO" {
+			// One byte past the ceiling: `read_file` must refuse, and a window must not care.
+			both32(&mut img[at..], 10, MAX_READ_BYTES as u32 + 1);
+			break;
+		}
+		at += len;
+	}
+	let mut fs = Iso9660::mount(SparseDisc { data: img, blocks }).expect("mount");
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::TooLarge), "the whole file is past what one read may stage");
+	// AND THE WINDOW IS ANSWERED ANYWAY, which is the whole point of the ranged path: the ceiling
+	// bounds what a single read allocates, not what a file may contain.
+	let mut window = [0u8; 32];
+	let read = fs.read_file_into(b"HELLO.TXT", (MAX_READ_BYTES - 16) as u64, &mut window).expect("a window near the end of a file too large to stage");
+	// SEVENTEEN, NOT THIRTY-TWO, and that is the second thing worth pinning: the file is one byte
+	// past the ceiling, the window starts sixteen before the ceiling, so seventeen bytes remain. A
+	// ranged read is bounded by the file's declared size and not by the buffer it was handed.
+	assert_eq!(read, 17, "the window stops at the end of the file rather than filling the buffer");
+	// And a window wholly inside the file fills what it asked for.
+	let read = fs.read_file_into(b"HELLO.TXT", (MAX_READ_BYTES / 2) as u64, &mut window).expect("a window from the middle");
+	assert_eq!(read, 32, "a window with the file behind it is the size asked for, from a file no whole read could hold");
 }
 
 #[test]

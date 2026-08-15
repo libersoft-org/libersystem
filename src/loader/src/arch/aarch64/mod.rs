@@ -257,10 +257,8 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 // Which PSCI conduit, if any, the kernel will have below it.
 //
 // THE EXCEPTION LEVEL DECIDES ONE THING AND THE PLATFORM DECIDES THE OTHER. This used to be a single
-// expression: `PSCI_NONE` at EL2, `PSCI_HVC` otherwise. The first half is right and is what the EL2
-// run found - this loader drops to EL1 itself, so after the `eret` nothing answers an `hvc`, and
-// saying so turns the kernel's secondary bring-up from a fault into a single-core boot with a
-// reason. The second half was a guess: a machine that hands firmware EL1 has something below it, and
+// expression: `PSCI_NONE` at EL2, `PSCI_HVC` otherwise. The first half was right about HVC and wrong
+// about SMC, which is the correction below; the second half was a guess: a machine that hands firmware EL1 has something below it, and
 // what that something answers is stated by the platform, not implied by where the firmware put us.
 // Most server-class AArch64 keeps EL2 for a hypervisor and PSCI in EL3 firmware behind `smc`, so
 // this loader was declaring `PSCI_HVC` and the kernel was executing `hvc #0` at `cpu_on` - the same
@@ -271,29 +269,41 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 // states neither gets `PSCI_NONE`, which the kernel reports and boots single-core on - the honest
 // answer, and not the same as picking the more common instruction and hoping.
 fn psci_conduit(current_el: u64, dtb: u64) -> u32 {
-	if (current_el >> 2) & 0b11 == 2 {
-		// Whatever answered before is above the kernel now, whatever the tables said.
-		return bootproto::PSCI_NONE;
-	}
 	let (discovered_dtb, rsdp) = crate::console::firmware_tables();
 	let tree = if dtb != 0 { dtb } else { discovered_dtb };
-	if tree != 0
-		&& let Some(conduit) = fdt::Fdt::new(tree, crate::console::identity_map).psci_conduit()
-	{
-		return match conduit {
+	let discovered = if tree != 0 {
+		fdt::Fdt::new(tree, crate::console::identity_map).psci_conduit().map(|conduit| match conduit {
 			fdt::PsciConduit::Hvc => bootproto::PSCI_HVC,
 			fdt::PsciConduit::Smc => bootproto::PSCI_SMC,
-		};
-	}
-	if rsdp != 0
-		&& let Some(conduit) = uefi::acpi::Acpi::new(rsdp, crate::console::identity_map).psci_conduit()
-	{
-		return match conduit {
+		})
+	} else {
+		None
+	};
+	let discovered = discovered.or_else(|| {
+		if rsdp == 0 {
+			return None;
+		}
+		uefi::acpi::Acpi::new(rsdp, crate::console::identity_map).psci_conduit().map(|conduit| match conduit {
 			uefi::acpi::PsciConduit::Hvc => bootproto::PSCI_HVC,
 			uefi::acpi::PsciConduit::Smc => bootproto::PSCI_SMC,
-		};
+		})
+	});
+	// THE EXCEPTION LEVEL INVALIDATES ONE CONDUIT AND NOT THE OTHER.
+	//
+	// This returned `PSCI_NONE` at EL2 before it looked at anything, and the reasoning - "whatever
+	// answered before is above the kernel now" - is true of an HVC service and false of an SMC one.
+	// `hvc` traps to EL2, which is the level this loader itself leaves behind, so after the `eret`
+	// nothing is there to answer. `smc` traps to EL3, which is BELOW both and is not affected by
+	// where the firmware put us at all: a secure monitor implementing PSCI goes on implementing it.
+	//
+	// Most server-class AArch64 is exactly that shape - a hypervisor's EL2 and PSCI in EL3 firmware
+	// behind `smc` - so the discarding branch threw away the right answer on the machines the
+	// discovery was added for.
+	match discovered {
+		Some(bootproto::PSCI_HVC) if (current_el >> 2) & 0b11 == 2 => bootproto::PSCI_NONE,
+		Some(conduit) => conduit,
+		None => bootproto::PSCI_NONE,
 	}
-	bootproto::PSCI_NONE
 }
 
 // Load each PT_LOAD segment at its physical (link) address - the placement QEMU's

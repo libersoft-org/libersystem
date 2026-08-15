@@ -144,6 +144,98 @@ fn machine(body: impl FnOnce(&mut Builder)) -> &'static [u8] {
 	builder.finish()
 }
 
+#[test]
+fn a_hole_in_the_memory_map_is_not_reported_as_memory() {
+	// THE ARITHMETIC USED TO CLAIM THE HOLE. `ram_base` was the first bank's base and `ram_size` the
+	// SUM of every bank's size, so two 256 MiB banks either side of a gap produced base 0x4000_0000
+	// and size 512 MiB - a range whose second half is the hole, and whose end stops short of the
+	// second bank. The kernel builds its usable frame region from exactly `ram_base + ram_size`, so
+	// it would have handed out frames addressing nothing.
+	//
+	// That failure is unattributable at the point it bites: a store into a hole goes nowhere and the
+	// data is simply gone, with no fault, in whatever subsystem happened to be handed that frame.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	// Two banks with a gap between them, in ONE `reg` - which is how a device tree usually says it.
+	let mut reg = 0x4000_0000u64.to_be_bytes().to_vec();
+	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+	reg.extend_from_slice(&0x8000_0000u64.to_be_bytes());
+	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+	builder.begin("memory@40000000").prop("reg", &reg).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	let info = at(builder.finish()).parse().expect("the machine describes its memory");
+	assert_eq!(info.ram_base, 0x4000_0000, "the run starts at the first bank");
+	assert_eq!(info.ram_size, 0x1000_0000, "and ends where the first bank does - the hole is not memory");
+
+	// AND CONTIGUOUS BANKS STILL JOIN, which is the case this must not break: a tree that describes
+	// one range in two pieces is describing one range.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	let mut reg = 0x4000_0000u64.to_be_bytes().to_vec();
+	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+	reg.extend_from_slice(&0x5000_0000u64.to_be_bytes());
+	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+	builder.begin("memory@40000000").prop("reg", &reg).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	let info = at(builder.finish()).parse().expect("parses");
+	assert_eq!(info.ram_base, 0x4000_0000);
+	assert_eq!(info.ram_size, 0x2000_0000, "two touching banks are one range");
+
+	// AND A BANK THAT EXTENDS THE RUN DOWNWARDS joins too, because a device tree does not promise
+	// its banks are in address order.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	let mut reg = 0x5000_0000u64.to_be_bytes().to_vec();
+	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+	reg.extend_from_slice(&0x4000_0000u64.to_be_bytes());
+	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
+	builder.begin("memory@50000000").prop("reg", &reg).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	let info = at(builder.finish()).parse().expect("parses");
+	assert_eq!(info.ram_base, 0x4000_0000, "the run grew downwards");
+	assert_eq!(info.ram_size, 0x2000_0000);
+}
+
+#[test]
+fn a_property_shorter_than_the_reader_assumes_is_not_read_past_its_end() {
+	// `prop_in` proves a property's declared value lies inside the structure block. It does not
+	// prove the value is as long as a particular reader assumes - and three readers assumed.
+	//
+	// A one-byte `#address-cells` had `be32` taking three bytes of whatever followed it. The value
+	// stayed inside the blob, so no bounds check fired; what it corrupted was the CELL COUNT, which
+	// then decided how every `reg` in the tree was parsed.
+	let fdt = at(machine(|b| {
+		b.begin("chosen").prop("#address-cells", &[2u8]).end();
+	}));
+	// The tree still parses - a short property is refused, not the whole blob - and the geometry is
+	// the root's, which is what a refused override means.
+	let info = fdt.parse().expect("a short property refuses itself rather than the tree");
+	assert_eq!(info.ram_base, 0x4000_0000, "the root's cells still describe the memory");
+
+	// The initrd properties took a four-byte read for any length that was not eight, including
+	// zero, one, two and three.
+	for bytes in [&[][..], &[1u8], &[1, 2], &[1, 2, 3], &[1, 2, 3, 4, 5]] {
+		let fdt = at(machine(|b| {
+			b.begin("chosen").prop("linux,initrd-start", bytes).end();
+		}));
+		let info = fdt.parse().expect("parses");
+		assert_eq!(info.modules_start, 0, "a property of {} bytes names no address", bytes.len());
+	}
+	// And the two widths a device tree really writes are still read.
+	let fdt = at(machine(|b| {
+		b.begin("chosen").prop("linux,initrd-start", &0x4800_0000u32.to_be_bytes()).prop("linux,initrd-end", &0x4900_0000u64.to_be_bytes()).end();
+	}));
+	let info = fdt.parse().expect("parses");
+	assert_eq!(info.modules_start, 0x4800_0000, "four bytes is one cell");
+	assert_eq!(info.modules_end, 0x4900_0000, "eight bytes is two");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The machines this system boots on.
 // ---------------------------------------------------------------------------------------------

@@ -2565,7 +2565,14 @@ fn a_dangling_entry_is_reported_listable_around_and_removable() {
 	.unwrap();
 	// fsck names the dangling entry instead of dying on it...
 	let report = fs.fsck().unwrap();
-	assert!(report.checksum_failures >= 1);
+	// ...AS STRUCTURAL DAMAGE, which is what it is. This asserted `checksum_failures` until
+	// 2026-08-15, and the assertion was the taxonomy being wrong rather than the code: a directory
+	// entry naming an inode that does not exist is the NAMESPACE being inconsistent, not the bytes
+	// failing their checksum. An operator reading a report that says "checksum failure" reaches for
+	// the medium; this fault is not about the medium.
+	assert_eq!(report.checksum_failures, 0, "nothing here failed a checksum");
+	assert!(report.structural_failures >= 1, "the dangling entry is structural damage");
+	assert_eq!(report.io_failures, 0, "and the disk answered every read");
 	assert!(report.damaged.contains(&b"ghost.txt".to_vec()));
 	// ...the directory still lists its healthy entries around it...
 	let names: Vec<Vec<u8>> = fs.list().unwrap().into_iter().map(|(n, _, _, _, _)| n).collect();
@@ -4502,6 +4509,29 @@ fn a_spilled_extent_map_that_cannot_allocate_its_block_says_so() {
 				// And the filesystem is still answerable afterwards - a refused write is an error,
 				// not a corrupted map.
 				assert!(attempt.read_at(b"sparse", span(1), 6).is_ok(), "the earlier spans still read after a refused write");
+				// AND THE WRITE THAT WAS REFUSED DID NOT HAPPEN, which is the half this sweep was
+				// missing and the half the contract is about.
+				//
+				// `NoMemory` reaches StorageService as `again`, which tells the caller to retry - so
+				// it is only a truthful answer if nothing landed. A commit that published its
+				// superblock and THEN failed to allocate would answer `NoMemory` for a transaction
+				// already on the medium, and the caller would retry a write it was told it had lost.
+				// The answer for a failure past that line is `CommitUncertain`, which reaches the
+				// caller as `denied` precisely so it does not retry.
+				//
+				// Reading the range back is what makes this a statement about the MEDIUM rather
+				// than about a return value: the span the refused write aimed at must still be
+				// absent.
+				let mut probe = [0u8; 13];
+				match attempt.read_at(b"sparse", span(9), 13) {
+					Ok(bytes) => {
+						probe[..bytes.len().min(13)].copy_from_slice(&bytes[..bytes.len().min(13)]);
+						assert_ne!(&probe[..], b"one more span", "budget {budget}: the write reported NoMemory and its bytes are on the volume - a retryable answer for a transaction that landed");
+					}
+					// A range that was never written reads as absent or as zeros; either is the
+					// write not having happened.
+					Err(_) => {}
+				}
 			}
 			Err(other) => panic!("a refused allocation must be NoMemory or NoSpace, not {other:?}"),
 			Ok(()) => continue,

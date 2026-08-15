@@ -238,7 +238,12 @@ pub fn terminate_user(info: FaultInfo) -> ! {
 			// message say which one it was: an instruction pointer alone is unattributable
 			// when every EXEC image shares a load base.
 			let kind = if info.kind == FAULT_PAGE { "page fault" } else { "general protection fault" };
-			crate::serial_println!("fault: ring-3 {} (code {:#x}) at {:#x}, addr {:#x} - terminating process koid={} ({})", kind, info.error_code, info.instruction_pointer, info.address, koid, process.header().name().as_deref().unwrap_or("unnamed"));
+			// BORROWED. This used to be `header().name()`, which clones the label into a fresh
+			// `String` - an allocation taken while handling a ring-3 fault, which is the moment a
+			// short heap is most likely and least survivable.
+			process.header().with_name(|name| {
+				crate::serial_println!("fault: ring-3 {} (code {:#x}) at {:#x}, addr {:#x} - terminating process koid={} ({})", kind, info.error_code, info.instruction_pointer, info.address, koid, name.unwrap_or("unnamed"));
+			});
 			// Eagerly tear the crashed process's capabilities down - detaching its
 			// IRQ, refunding its DMA and memory, and removing every handle - rather
 			// than waiting for the thread to be reaped, so a supervisor can reclaim

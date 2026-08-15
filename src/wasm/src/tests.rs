@@ -1560,6 +1560,13 @@ mod spec_run {
 			})
 	}
 
+	// A trap this ENGINE imposes rather than one WebAssembly defines. The specification models no
+	// fuel and no call-depth ceiling, so a case that hits either has not disagreed with it - and
+	// every other trap message in the interpreter is a rule the specification does state.
+	fn host_limit(trap: &Trap) -> bool {
+		trap.0.contains("out of fuel") || trap.0.contains("call depth")
+	}
+
 	#[test]
 	fn the_specifications_own_answers_are_this_engines_answers() {
 		let (modules, runs) = fixture();
@@ -1584,6 +1591,17 @@ mod spec_run {
 				skipped += group.len();
 				continue;
 			};
+			// A MODULE THIS HARNESS CANNOT SERVE, decided about the MODULE.
+			//
+			// The suite's modules import `print_i32` and friends from its `spectest` host, and this
+			// runner supplies `NoHost` - which traps every import with "no imports available". That
+			// is a property of the fixture, knowable before a single assertion runs, and leaving it
+			// to be discovered per result is what let a genuine trap hide among skips. Whether a
+			// module can be run is a module question; whether its answer is right is not.
+			if !validated.module().imports.is_empty() {
+				skipped += group.len();
+				continue;
+			}
 			let Ok(mut instance) = crate::interp::Instance::new(&validated) else {
 				skipped += group.len();
 				continue;
@@ -1616,10 +1634,26 @@ mod spec_run {
 					continue;
 				};
 				match outcome {
-					// An export this engine cannot reach at all - an unsupported instruction in its
-					// body - is the subset again rather than a wrong answer. The floor below is what
-					// keeps that from swallowing everything.
-					Err(_) => skipped += 1,
+					// A TRAP WHERE THE SPECIFICATION SAYS A VALUE IS A WRONG ANSWER, not a skip.
+					//
+					// This counted every `Err` as outside the subset, on the reasoning that an
+					// unsupported instruction in the body cannot be run. That reasoning describes a
+					// module, and the module is past it: `validate` decodes every body and refuses
+					// `unsupported opcode`, so a module that instantiated has no unreachable
+					// instruction left in it. What arrived here instead was the interpreter
+					// returning a trap where the specification says it returns a number - which is
+					// the exact class of defect the execution corpus was built to catch, filed as
+					// "skipped" and leaving the suite green.
+					//
+					// The two host limits are the real exception and are counted apart rather than
+					// folded in: fuel and call depth are this engine's policy, they are not modelled
+					// by the specification at all, and a case that hits one has not disagreed with
+					// anything.
+					Err(trap) if host_limit(&trap) => skipped += 1,
+					Err(trap) => {
+						ran += 1;
+						wrong.push(alloc::format!("{}: {}({}) trapped with {trap:?}, and the specification says {want:?}", run.file, run.export, run.args));
+					}
 					Ok(got) => {
 						ran += 1;
 						if !same(&got, &want) {
@@ -1634,7 +1668,18 @@ mod spec_run {
 		// THE FLOOR, so "everything was skipped" cannot pass as "nothing disagreed". A ratchet: it
 		// may go up and must not go down. Measured 2026-08-14: 2137 executed, 562 skipped as outside this
 		// engine's subset.
-		assert!(ran >= 2137, "only {ran} of {} specification assertions were executed ({skipped} skipped) - a subset got smaller and the reason belongs here", runs.len());
+		//
+		// 2026-08-15: 2133 executed, 567 skipped. The four that moved belong to modules importing the
+		// suite's `spectest` host, which this runner does not provide - and two of the four were
+		// TRAPPING, counted as "skipped" by the arm that read every `Err` as an unsupported
+		// instruction. They are skipped for a reason stated about the module now rather than
+		// discovered per result, which is the whole point of the change; the count went down by four
+		// because four of them were never evidence about this engine.
+		//
+		// Providing a `spectest` host would win them back and little else: those modules also import
+		// globals, tables and memories, which this engine does not support at all, so they are
+		// refused before instantiation whatever host is passed.
+		assert!(ran >= 2133, "only {ran} of {} specification assertions were executed ({skipped} skipped) - a subset got smaller and the reason belongs here", runs.len());
 	}
 }
 
@@ -1809,4 +1854,109 @@ fn an_over_wide_signed_leb_is_refused_at_the_width_it_belongs_to() {
 	let validated = validate(parse(&build(&spec)).expect("parses")).expect("validates");
 	let mut instance = Instance::new(&validated).expect("and a five-byte `i32.const -1` is well-formed");
 	assert_eq!(instance.invoke("run", &[], &mut NoHost).expect("runs"), alloc::vec![Value::I32(-1)]);
+}
+
+#[test]
+fn an_export_naming_a_memory_that_is_not_there_does_not_validate() {
+	// EVERY OTHER KIND OF EXPORT HAD ITS INDEX CHECKED. This one asked only whether the module
+	// declares A memory, so `(memory 1) (export "mem" (memory 1))` validated - and one memory is
+	// memory 0, because this engine supports exactly one. A dangling export is a malformed module
+	// whichever item it names, and the promise this validator makes is that every static index is
+	// checked before an instance exists.
+	let good = Spec { types: &[(&[], &[])], imports: &[], funcs: &[0], mem_pages: 1, globals: &[], data: &[], exports: &[("mem", 0x02, 0)], codes: &[(&[], &[0x0b])] };
+	assert!(validate(parse(&build(&good)).expect("parses")).is_ok(), "memory 0 is the one the module declares");
+
+	let dangling = Spec { exports: &[("mem", 0x02, 1)], ..good };
+	let error = validate(parse(&build(&dangling)).expect("parses")).expect_err("memory 1 is not a memory this module has");
+	assert!(error.reason.contains("names memory 1"), "{error:?}");
+
+	// And the case that already worked, so the rule is not narrowed to the new half.
+	let none = Spec { mem_pages: 0, exports: &[("mem", 0x02, 0)], ..good };
+	assert!(validate(parse(&build(&none)).expect("parses")).is_err(), "a module with no memory may not export one");
+}
+
+#[test]
+fn an_exported_import_checks_its_arguments_before_the_host_sees_them() {
+	// THE BOUNDARY IS WHERE THE VALUES ENTER. The argument count and type check sat in the DEFINED
+	// function branch, past the return that dispatches an import - so a module that imports a
+	// function and re-exports it handed the embedder's arguments straight to `Host::call_import`
+	// with neither checked. The embedder guarantee was true of every call shape but that one.
+	//
+	// The host here records what it was handed, so the test can say the values never reached it
+	// rather than only that the call failed.
+	struct Recording {
+		seen: Vec<Vec<Value>>,
+	}
+	impl Host for Recording {
+		fn call_import(&mut self, _import: u32, args: &[Value], _memory: &mut [u8]) -> Result<Vec<Value>, Trap> {
+			self.seen.push(args.to_vec());
+			Ok(alloc::vec![Value::I32(0)])
+		}
+	}
+
+	// (import "liber" "read" (func (param i32 i32) (result i32))) re-exported as "run".
+	let wasm: Vec<u8> = build(&Spec { types: &[(&[I32, I32], &[I32])], imports: &[("liber", "read", 0)], funcs: &[], mem_pages: 1, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[] });
+	let m: ValidatedModule = validate(parse(&wasm).expect("parses")).expect("an imported function may be re-exported");
+	let mut inst: Instance = Instance::new(&m).expect("instantiates");
+
+	let mut host = Recording { seen: Vec::new() };
+	assert_eq!(inst.invoke("run", &[Value::F64(123.0), Value::I32(1)], &mut host), Err(Trap("an argument's type does not match the function's signature")));
+	assert_eq!(inst.invoke("run", &[Value::I32(1)], &mut host), Err(Trap("wrong argument count")));
+	assert!(host.seen.is_empty(), "the host was handed arguments that do not match what the import declares: {:?}", host.seen);
+
+	// And the call that DOES match still reaches it, so the check is a check and not a wall.
+	assert_eq!(inst.invoke("run", &[Value::I32(1), Value::I32(2)], &mut host), Ok(alloc::vec![Value::I32(0)]));
+	assert_eq!(host.seen, alloc::vec![alloc::vec![Value::I32(1), Value::I32(2)]]);
+}
+
+#[test]
+fn blocks_may_not_nest_past_the_hosts_control_depth() {
+	// ALLOCATION AMPLIFICATION, in the structure that walks the body. `MAX_STACK_DEPTH` bounds the
+	// operand stack and does not bound this: entering a block pops its parameters and pushes them
+	// straight back, so a body nesting blocks of a type with many parameters holds the stack at a
+	// constant height forever while every control frame clones three type vectors. Two bytes of
+	// module per frame against kilobytes of validator allocation is the same shape as the `br_table`
+	// amplification, which is why the answer is the same: a bound.
+	let deep = |depth: usize| {
+		let mut body: Vec<u8> = Vec::new();
+		for _ in 0..depth {
+			body.extend_from_slice(&[0x02, 0x40]); // block (empty type)
+		}
+		for _ in 0..depth {
+			body.push(0x0b); // end
+		}
+		body.push(0x0b); // end of the function
+		body
+	};
+	let run = |depth: usize| {
+		let body = deep(depth);
+		let spec = Spec { types: &[(&[], &[])], imports: &[], funcs: &[0], mem_pages: 0, globals: &[], data: &[], exports: &[], codes: &[(&[], &body)] };
+		validate(parse(&build(&spec)).expect("parses"))
+	};
+	assert!(run(crate::validate::MAX_CONTROL_DEPTH).is_ok(), "the limit itself is reachable, not one short of it");
+	let error = run(crate::validate::MAX_CONTROL_DEPTH + 1).expect_err("one deeper is refused");
+	assert!(error.reason.contains("nest"), "{error:?}");
+}
+
+#[test]
+fn memory_grow_is_charged_for_the_pages_it_zeroes() {
+	// `memory.copy` and `memory.fill` are charged per kilobyte because their cost is bounded by an
+	// operand. `memory.grow` has the same property - `resize` zeroes every byte it adds - and cost
+	// one unit, so the budget priced the same work two ways depending on which instruction asked
+	// for it.
+	//
+	// (func (export "run") (result i32) i32.const 16  memory.grow)  ;; sixteen pages = 1 MiB
+	let body: &[u8] = &[0x41, 16, 0x40, 0x00, 0x0b];
+	let spec = Spec { types: &[(&[], &[I32])], imports: &[], funcs: &[0], mem_pages: 1, globals: &[], data: &[], exports: &[("run", 0x00, 0)], codes: &[(&[], body)] };
+	let m: ValidatedModule = validate(parse(&build(&spec)).expect("parses")).expect("validates");
+
+	// Sixteen pages is 1 MiB, which is 1024 units at the bulk rate - so a budget of a few hundred
+	// cannot pay for it while it comfortably pays for the two instructions themselves.
+	let mut inst = Instance::new(&m).expect("instantiates");
+	assert_eq!(inst.invoke_with_fuel("run", &[], &mut NoHost, 256), Err(Trap("out of fuel: the guest ran for longer than the host allows")));
+	assert_eq!(inst.memory().len(), 65536, "and a grow the budget refused did not happen");
+
+	// And with fuel to pay for it, the grow succeeds and answers the old size in pages.
+	assert_eq!(inst.invoke_with_fuel("run", &[], &mut NoHost, 100_000), Ok(alloc::vec![Value::I32(1)]));
+	assert_eq!(inst.memory().len(), 17 * 65536);
 }

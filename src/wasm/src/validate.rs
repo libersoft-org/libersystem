@@ -68,6 +68,19 @@ impl core::fmt::Display for ValidationError {
 // of its own. It is deliberately generous: a body reaching this has thousands of live operands,
 // which no compiler emits and a hand-written module has to mean.
 pub const MAX_STACK_DEPTH: usize = 8192;
+// How deep blocks may nest inside one body.
+//
+// The operand stack bounds itself and does NOT bound this, which is what made it a hole. Entering a
+// block pops its parameters and pushes them straight back, so a body nesting blocks of a type with
+// 8192 parameters and 8192 results holds the stack at exactly 8192 forever while every frame clones
+// three type vectors - about 24 KiB of validator allocation for the two bytes that encode the block.
+// A few hundred kilobytes of hostile module then asks the host for gigabytes, which is the same
+// allocation amplification `br_table` was fixed for, in the structure that walks it.
+//
+// A bound rather than a restructure: making the frame borrow its signatures instead of owning them
+// divides the constant by three and leaves the growth linear in a number the module chooses, which
+// is the part that matters.
+pub const MAX_CONTROL_DEPTH: usize = 1024;
 pub const MAX_LOCALS: usize = 4096;
 pub const MAX_TABLE_ENTRIES: usize = 65536;
 pub const MAX_FUNCTIONS: usize = 65536;
@@ -187,8 +200,13 @@ pub fn validate(module: Module) -> Result<ValidatedModule, ValidationError> {
 			ExportKind::Func if export.index as usize >= total_funcs => {
 				return Err(ValidationError::module(format!("export \"{}\" names function {} of {total_funcs}", export.name, export.index)));
 			}
-			ExportKind::Memory if !has_memory => {
-				return Err(ValidationError::module(format!("export \"{}\" names a memory the module does not declare", export.name)));
+			// THE INDEX AS WELL AS THE EXISTENCE. This checked only that the module declared A
+			// memory, so `(memory 1) (export "mem" (memory 1))` validated - and there is no memory 1,
+			// because one memory is memory 0 and this engine supports exactly one. Every other kind
+			// of export had its index checked; this one had the question it asks written as the
+			// easier half.
+			ExportKind::Memory if !has_memory || export.index != 0 => {
+				return Err(ValidationError::module(format!("export \"{}\" names memory {}, and the module declares {}", export.name, export.index, usize::from(has_memory))));
 			}
 			// THE INDEX IS CHECKED, which is the rule; whether an embedder can reach the item is a
 			// separate question and not this one's.
@@ -319,6 +337,11 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 				// last.
 				if matches!(instr, Instr::If { .. }) {
 					pop_expect(&mut stack, &frames, &[ValType::I32]).map_err(&at)?;
+				}
+				// `frames` starts at one - the function's own frame, which is not a block - so the
+				// blocks open are `frames.len() - 1` and this one would make `frames.len()`.
+				if frames.len() > MAX_CONTROL_DEPTH {
+					return Err(at(format!("blocks nest {} deep, past the host limit of {MAX_CONTROL_DEPTH}", frames.len())));
 				}
 				let (params, results) = block_signature(module, instr).map_err(&at)?;
 				pop_expect(&mut stack, &frames, &params).map_err(&at)?;

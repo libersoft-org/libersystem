@@ -139,8 +139,18 @@ impl ObjectHeader {
 	}
 
 	// This object's label, if one was set.
-	pub fn name(&self) -> Option<String> {
-		self.name.lock().clone()
+	//
+	// BORROWED, not cloned. `name()` returned `Option<String>` - a fresh heap allocation for every
+	// reader - and the reader that matters is the ring-3 fault handler, which names the process it
+	// is about to terminate. So a faulting process on a short heap took the kernel through an
+	// allocation while it was handling the fault, which is the worst moment this kernel has to ask
+	// for memory: the request that caused the pressure is the one being cleaned up.
+	//
+	// The lock is held across the closure, so the callee must not name another object - which no
+	// caller does and none should: this answers one question.
+	pub fn with_name<R>(&self, f: impl FnOnce(Option<&str>) -> R) -> R {
+		let guard = self.name.lock();
+		f(guard.as_deref())
 	}
 
 	// Current revocation generation. Capabilities snapshot this at mint time and

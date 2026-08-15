@@ -290,7 +290,7 @@ fn object_property_set_names_an_object() {
 	crate::sched::spawn_with_object(body, event.clone(), Rights::ALL, 0);
 	crate::sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst));
-	assert_eq!(event.header().name().as_deref(), Some("irq-driver"));
+	event.header().with_name(|name| assert_eq!(name, Some("irq-driver")));
 }
 
 crate::tagged_test!(a_group_handle_becomes_waitable_only_once_every_stage_ends, [Object, Kernel, Process, Syscall], id = "kernel.object.a_group_handle_becomes_waitable_only_once_every_stage_ends", covers = ["kernel"]);
