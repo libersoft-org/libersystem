@@ -136,6 +136,66 @@ fn a_copy_that_loses_its_page_partway_reports_exactly_how_far_it_got() {
 	unsafe { crate::mem::frame::deallocate(frame) };
 }
 
+crate::tagged_test!(a_process_load_of_a_fully_mapped_image_answers_without_faulting, [Kernel, Memory, Syscall, Process], id = "kernel.extable.a_process_load_of_a_fully_mapped_image_answers_without_faulting", covers = ["kernel"]);
+fn a_process_load_of_a_fully_mapped_image_answers_without_faulting() {
+	// The CONTROL for the test below, and the experiment that separates its two suspects.
+	//
+	// That test hangs on aarch64 - and prints nothing while doing it, which now means something
+	// precise: a deliberate null dereference on this target prints its `NO ENTRY` line, its
+	// `aarch64 EXCEPTION` line and `halting`, complete and in order. So the reporting path works, and
+	// a hang that prints nothing is NOT an unhandled fault. Something inside `SYS_PROCESS_LOAD` stops
+	// without ever faulting, and there are two candidates: the bounded kernel-side allocation the
+	// image is copied into, and the faultable copy itself.
+	//
+	// This one maps BOTH pages, so the copy cannot fault. Everything else is identical - the same
+	// spawned thread, the same handle, the same length, the same allocation. An inline variant was
+	// tried first and is not possible: `SYS_PROCESS_CREATE` refuses from the test thread, which has
+	// none of the process context `spawn_with_object` gives.
+	//
+	// If this hangs, the fault is irrelevant and the allocation path is the bug.
+	// If it answers, the hang needs the fault, and the copy is where to look.
+	use crate::arch::paging::{PRESENT, USER, WRITABLE};
+	use crate::mem::frame::PAGE_SIZE;
+	use core::sync::atomic::{AtomicI64, Ordering};
+
+	const AT: u64 = crate::memlayout::USER_VA_END / 2 - 8 * PAGE_SIZE;
+	static ANSWER: AtomicI64 = AtomicI64::new(0);
+
+	extern "C" fn spawner(_bootstrap: u64) {
+		unsafe {
+			let child = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_CREATE, 0, 0, 0, 0);
+			assert!((child as i64) > 0, "the child process is created");
+			let answer = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_LOAD, child, AT, 2 * PAGE_SIZE, 0) as i64;
+			ANSWER.store(answer, Ordering::SeqCst);
+		}
+	}
+
+	let first = crate::mem::frame::allocate().expect("a frame for the first page");
+	let second = crate::mem::frame::allocate().expect("a frame for the second page");
+	crate::arch::paging::map_page(AT, first, PRESENT | WRITABLE | USER);
+	crate::arch::paging::map_page(AT + PAGE_SIZE, second, PRESENT | WRITABLE | USER);
+	crate::arch::paging::user_access(|| unsafe {
+		core::ptr::write_bytes(AT as *mut u8, 0, 2 * PAGE_SIZE as usize);
+		core::ptr::copy_nonoverlapping(b"\x7fELF".as_ptr(), AT as *mut u8, 4);
+	});
+
+	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
+	crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL, 0);
+	crate::sched::run_until_idle();
+
+	// Four bytes of magic and eight kilobytes of zeroes is not a loadable image, so the loader
+	// refuses it. What matters is that it ANSWERS: the syscall returned, from the same thread shape
+	// and the same allocation that hangs when the second page is absent.
+	assert!(ANSWER.load(Ordering::SeqCst) < 0, "a load of a malformed but fully mapped image must answer with an error rather than hang");
+
+	crate::arch::paging::unmap_page(AT);
+	crate::arch::paging::unmap_page(AT + PAGE_SIZE);
+	unsafe {
+		crate::mem::frame::deallocate(first);
+		crate::mem::frame::deallocate(second);
+	}
+}
+
 crate::tagged_test!(a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel, [Kernel, Memory, Syscall, Process], id = "kernel.extable.a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel", covers = ["kernel"]);
 fn a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel() {
 	// The path P02M0119 was written for and did not cover.
@@ -165,14 +225,10 @@ fn a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel() 
 
 	extern "C" fn spawner(_bootstrap: u64) {
 		unsafe {
-			crate::serial_println!("PROBE spawner: entered");
 			let child = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_CREATE, 0, 0, 0, 0);
-			crate::serial_println!("PROBE spawner: child={child:#x}");
 			assert!((child as i64) > 0, "the child process is created");
 			CAUGHT_BEFORE.store(super::caught(), Ordering::SeqCst);
-			crate::serial_println!("PROBE spawner: caught_before={} - calling load", super::caught());
 			let answer = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_LOAD, child, AT, 2 * PAGE_SIZE, 0) as i64;
-			crate::serial_println!("PROBE spawner: load returned {answer} caught={}", super::caught());
 			ANSWER.store(answer, Ordering::SeqCst);
 		}
 	}
@@ -184,12 +240,9 @@ fn a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel() 
 		core::ptr::copy_nonoverlapping(b"\x7fELF".as_ptr(), AT as *mut u8, 4);
 	});
 
-	crate::serial_println!("PROBE test: mapped at {AT:#x}, spawning");
 	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
 	crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL, 0);
-	crate::serial_println!("PROBE test: spawned, entering run_until_idle");
 	crate::sched::run_until_idle();
-	crate::serial_println!("PROBE test: run_until_idle returned, answer={} caught={}", ANSWER.load(Ordering::SeqCst), caught());
 
 	assert!(ANSWER.load(Ordering::SeqCst) < 0, "a load whose image is half absent must answer with an error - and the kernel must still be running to answer");
 	assert!(caught() > CAUGHT_BEFORE.load(Ordering::SeqCst), "the absent page was reached through the faultable copy; if it were not, this line would not have been reached at all");
