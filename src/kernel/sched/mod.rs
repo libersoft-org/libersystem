@@ -1039,8 +1039,15 @@ fn reschedule(disp: Disposition) {
 			// ring-3 syscall it issues after resuming lands on its own kernel stack
 			// even though cooperative services share the per-CPU block.
 			let new_syscall_rsp = next.syscall_rsp_load();
+			// AND WHICH STACK THIS CORE IS ABOUT TO BE ON, so the exception entry can refuse to
+			// save a trap frame anywhere else. Published here, with the rest of the incoming
+			// thread's per-CPU state and with interrupts already disabled: an exception taken
+			// between this and `switch_context` would judge the outgoing stack pointer against the
+			// incoming thread's bounds, so the two cannot be separated.
+			let new_stack = next.kstack_region();
 			guard.current = Some(next);
 			drop(guard);
+			arch::percpu::set_stack_bounds(new_stack.0, new_stack.1);
 			arch::percpu::set_kernel_rsp(new_syscall_rsp);
 			// Point TSS.RSP0 at the same parked position, so a ring-3 interrupt taken
 			// while this thread runs lands on its own kernel stack (a zero value - a
@@ -1070,6 +1077,10 @@ fn reschedule(disp: Disposition) {
 					guard.current = None;
 					let new_sp = sched.idle_sp.load(Ordering::Acquire);
 					drop(guard);
+					// The idle context runs on this core's boot stack, which no Thread describes -
+					// so the exception entry's stack check is told it does not know, rather than
+					// left judging against the bounds of a thread that has just exited.
+					arch::percpu::use_idle_stack();
 					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 					unsafe { arch::context::switch_context(old_sp, new_sp) };
 				}
@@ -1090,6 +1101,9 @@ fn reschedule(disp: Disposition) {
 					guard.current = None;
 					let new_sp = sched.idle_sp.load(Ordering::Acquire);
 					drop(guard);
+					// Same as the retire path: the idle stack is not a thread's, so the check is
+					// disabled rather than aimed at the blocked thread's stack.
+					arch::percpu::use_idle_stack();
 					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 					unsafe { arch::context::switch_context(old_sp, new_sp) };
 					// Woken and resumed: restore the interrupt state we blocked with.

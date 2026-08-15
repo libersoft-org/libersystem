@@ -180,8 +180,15 @@ fn a_process_load_of_a_fully_mapped_image_answers_without_faulting() {
 			crate::serial_println!("MARK-1-entered");
 			// Read before loading, so a mapping the loader cannot see is reported rather than
 			// inferred. Both pages are mapped here, so both reads must succeed.
-			SEEN_FIRST.store(core::ptr::read_volatile(AT as *const u8) as i64, Ordering::SeqCst);
-			SEEN_SECOND.store(core::ptr::read_volatile((AT + PAGE_SIZE) as *const u8) as i64, Ordering::SeqCst);
+			// INSIDE `user_access`, because these read a USER address from ring 0 and x86_64 has
+			// SMAP. The raw reads passed on aarch64 - where `user_access` is a passthrough, there
+			// being no PAN on cortex-a72 - and faulted on x86_64 with error code 0x1, a supervisor
+			// read of a present user page, which is exactly what SMAP is for. A probe that only
+			// works on the target being debugged is a probe that hides the target's differences.
+			crate::arch::paging::user_access(|| {
+				SEEN_FIRST.store(core::ptr::read_volatile(AT as *const u8) as i64, Ordering::SeqCst);
+				SEEN_SECOND.store(core::ptr::read_volatile((AT + PAGE_SIZE) as *const u8) as i64, Ordering::SeqCst);
+			});
 			crate::serial_println!("MARK-2-read first={} second={}", SEEN_FIRST.load(Ordering::SeqCst), SEEN_SECOND.load(Ordering::SeqCst));
 			// A canary either side of the create call. `a_spawned_thread_can_create_a_child_process_
 			// and_let_it_go` proves the call RETURNS a handle; it does not prove it leaves memory

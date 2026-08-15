@@ -125,3 +125,19 @@ pub fn in_user_syscall() -> bool {
 pub fn set_from_user(from_user: bool) {
 	unsafe { (*this_cpu_mut()).from_user = from_user as u64 };
 }
+
+// The portable hook the scheduler calls with the incoming thread's kernel stack extent. aarch64
+// uses it to bound what its exception vectors will save a frame onto, after a stack pointer that
+// was not on any stack turned every fault into an unbounded, silent runaway (P02M0133). Nothing
+// here does that yet, so this records nothing rather than pretending to check.
+//
+// Worth keeping in mind before this stays empty by default: the same failure is possible on any
+// port whose exception entry writes to the stack before it can validate it. What makes it cheap to
+// leave alone here is that these two have not shown it, not that they cannot.
+pub fn set_stack_bounds(_base: u64, _len: usize) {}
+
+// The idle/boot stack twin of `set_stack_bounds`, for the same reason and with the same status
+// here: recorded nowhere, so nothing to restore.
+pub fn record_idle_stack(_base: u64, _len: usize) {}
+
+pub fn use_idle_stack() {}

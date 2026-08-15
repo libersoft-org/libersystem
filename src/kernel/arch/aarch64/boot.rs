@@ -171,6 +171,13 @@ fn boot_archive() -> &'static [u8] {
 	(*BOOT_MODULES.lock()).unwrap_or(&[])
 }
 
+// The boot stack's extent, placed by the linker script. Read only to bound it - see the call in
+// `aarch64_main`.
+unsafe extern "C" {
+	static __boot_stack_bottom: u8;
+	static __boot_stack_top: u8;
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_main(arg: u64) -> ! {
 	super::serial::init();
@@ -394,6 +401,20 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	}
 	super::percpu::allocate(cpu_count as usize);
 	super::percpu::init(0, mpidr as u32);
+	// THE BOOT STACK HAS NO GUARD PAGE EITHER, and the linker script already records what that
+	// costs: it was 64 KiB until the in-kernel LiberFS format walked a B-tree and a transaction log
+	// off the bottom of it and into `.bss`, and the symptom was "memory corruption rather than a
+	// fault - a `serial_println!` printing megabytes of memory, and data aborts at addresses that
+	// made no sense". It is 256 KiB now, which makes it unlikely rather than impossible.
+	//
+	// Bounding it here means the exception entry REPORTS the next one instead of the kernel
+	// discovering it three subsystems later. The stack below `__boot_stack_bottom` is `.bss`, so
+	// there is nothing to fault on and nothing else would ever say so.
+	unsafe {
+		let bottom = (&raw const __boot_stack_bottom) as u64;
+		let top = (&raw const __boot_stack_top) as u64;
+		super::percpu::record_idle_stack(bottom, (top - bottom) as usize);
+	}
 	let cpu = super::percpu::this_cpu();
 	crate::serial_println!("aarch64: per-CPU up (TPIDR_EL1) cpu_id={} mpidr={:#x} of {} CPU(s)", cpu.cpu_id(), cpu.lapic_id() & 0xff_ffff, cpu_count);
 

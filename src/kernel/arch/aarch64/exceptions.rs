@@ -25,6 +25,10 @@ use core::arch::{asm, global_asm};
 // context's vector registers. An IRQ returns and `__trap_return` restores the
 // frame and `eret`s; a fault halts inside the handler. The heavy save lives in the
 // shared trampoline, not each slot, because the full save does not fit in 128 bytes.
+// The size of the trap frame every vector reserves. One number, used by the reserve, by the
+// restore, and by the stack-bounds check that decides whether it fits.
+pub const TRAP_FRAME_BYTES: u64 = 816;
+
 global_asm!(
 	r#"
 .section .text.vectors, "ax"
@@ -33,9 +37,50 @@ global_asm!(
 .global __exception_vectors
 __exception_vectors:
 
+// EVERY VECTOR ASKS WHETHER `SP` IS USABLE BEFORE IT USES IT, because the answer used to be
+// discovered by faulting.
+//
+// The entry was `sub sp, sp, #816` followed by `stp x0, x1, [sp]`, and when `SP` did not point at
+// mapped memory that store faulted - which re-entered this same vector, subtracted another 816,
+// stored again and faulted again, forever. Measured in a wedged guest: all eight cores at
+// `__exception_vectors + 0x200`, `ESR_EL1 = 0x96000044` (a write, translation fault at level 0),
+// `FAR_EL1` equal to `SP` to the byte, and `ELR_EL1` on that `stp`. The stack pointer walked down
+// through the kernel window at 816 bytes a turn, writing a register pair everywhere it happened to
+// land on a mapped page - which is what corrupted a virtio queue register in one run, and why the
+// failure was silent in all of them: the loop never reaches a print. A guard page whose fault
+// cannot be reported only changes which byte the damage starts at.
+//
+// The check is a range test, so one subtract and one compare catch a stack pointer that has run off
+// the bottom AND one that has been corrupted upward: `sp - floor <= span`, unsigned.
+//
+// GETTING A REGISTER TO ASK WITH is the whole difficulty, since anything spilled to the stack
+// depends on the stack being usable. `TPIDRRO_EL0` is free on this kernel and needs no memory, so
+// it frees `x0`; `x0` then reaches the per-CPU block through `TPIDR_EL1`, which frees two more into
+// per-CPU memory that is statically allocated and mapped for the life of the kernel.
+//
+// EVERY FAILURE OF THE CHECK ITSELF FALLS BACK TO THE OLD BEHAVIOUR. A zero `TPIDR_EL1` (an
+// exception before per-CPU init) and a zero span (the boot stack, the secondary bring-up stacks,
+// the idle loop - contexts the scheduler does not describe) both skip straight to the reserve. The
+// check can therefore only ever turn a silent runaway into a report; it cannot turn a working boot
+// into a refusal.
 .macro VEC id
 .balign 128
-	sub     sp, sp, #816
+	msr     tpidrro_el0, x0            // a register, without touching memory
+	mrs     x0, tpidr_el1
+	cbz     x0, 8f                     // per-CPU block not up yet: nothing to check against
+	stp     x1, x2, [x0, #{PC_SCRATCH}]
+	ldp     x1, x2, [x0, #{PC_FLOOR}]  // x1 = lowest SP a frame fits under, x2 = how far above it
+	cbz     x2, 9f                     // no bounds recorded for this context
+	mov     x0, sp
+	sub     x0, x0, x1
+	cmp     x0, x2
+	b.hi    __trap_bad_stack           // SP is not on the stack this thread was given
+9:
+	mrs     x0, tpidr_el1
+	ldp     x1, x2, [x0, #{PC_SCRATCH}]
+8:
+	mrs     x0, tpidrro_el0
+	sub     sp, sp, #{FRAME}
 	stp     x0, x1, [sp, #0]
 	mov     x0, #\id
 	b       __trap_common
@@ -104,6 +149,24 @@ __trap_common:
 	bl      aarch64_trap
 	b       __trap_return
 
+// Reached when a vector decided the stack it was handed cannot hold a frame. The offending `SP`
+// is recoverable because the check computed `sp - floor` in x0 and left the floor in x1; the
+// per-CPU reporting stack is a fixed allocation set before `TPIDR_EL1` was ever published, so
+// standing on it needs nothing that could itself be broken.
+__trap_bad_stack:
+	add     x0, x0, x1                 // x0 = the SP that was refused
+	mrs     x1, tpidr_el1
+	ldr     x1, [x1, #{PC_TRAP_STACK}]
+	cbz     x1, 6f
+	mov     sp, x1
+	mrs     x1, esr_el1
+	mrs     x2, far_el1
+	mrs     x3, elr_el1
+	bl      aarch64_bad_stack
+6:
+	wfi
+	b       6b
+
 // Restore the frame and return to the interrupted context.
 __trap_return:
 	ldr     x2,  [sp, #800]
@@ -146,9 +209,17 @@ __trap_return:
 	ldp     x24, x25, [sp, #192]
 	ldp     x26, x27, [sp, #208]
 	ldp     x28, x29, [sp, #224]
-	add     sp, sp, #816
+	add     sp, sp, #{FRAME}
+	// The vector prologue parks a register in `TPIDRRO_EL0`, which EL0 can READ. Leaving whatever
+	// x0 held at the last trap there would hand userspace a kernel value for free, so it goes back
+	// as zero - one instruction on the return path, against an information leak on every trap.
+	msr     tpidrro_el0, xzr
 	eret
-"#
+"#,
+	PC_SCRATCH = const super::percpu::OFF_SCRATCH,
+	PC_FLOOR = const super::percpu::OFF_STACK_FLOOR,
+	PC_TRAP_STACK = const super::percpu::OFF_TRAP_STACK,
+	FRAME = const TRAP_FRAME_BYTES,
 );
 
 // EL0 entry / return trampolines.
@@ -210,6 +281,58 @@ pub fn init_vectors() {
 // The common trap handler, called from every vector entry with the vector index
 // and a pointer to the saved register frame. An IRQ is acknowledged, dispatched,
 // and returns (the caller `eret`s); a synchronous fault is decoded and halts.
+// A trap arrived on a stack pointer that is not on the running thread's kernel stack.
+//
+// THIS IS THE REPORT THAT DID NOT EXIST, and its absence is what made the aarch64 failure in
+// P02M0133 cost four days. The old vector saved its frame wherever `SP` pointed; when that was not
+// mapped, the save faulted, re-entered the vector, and looped - producing no output at all while
+// walking `SP` down through the kernel window and overwriting whatever it passed. Every hypothesis
+// about that failure had to be built from its end state, and every one of them was wrong.
+//
+// Running on this core's own reporting stack, so nothing here depends on the stack that was
+// refused. It halts rather than returning: `SP` is unusable, so there is no frame to `eret` from,
+// and continuing would mean guessing which of the two - the pointer or the bounds - is the wrong
+// one.
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_bad_stack(sp: u64, esr: u64, far: u64, elr: u64) -> ! {
+	use core::fmt::Write as _;
+	use core::sync::atomic::{AtomicU32, Ordering};
+
+	// STRAIGHT AT THE WIRE, deliberately bypassing `serial_println!`.
+	//
+	// `_print` takes a lock to keep two cores' lines from interleaving, and this is the one place
+	// in the kernel where that trade is backwards: the machine is already broken, the other cores
+	// are usually broken in the same instant, and a report that waits for a lock is a report that
+	// does not arrive. The first version of this did use the macro and the guest wedged INSIDE the
+	// reporter, with several cores spinning on the print lock and the diagnosis never reaching the
+	// serial log - the failure this whole mechanism exists to end, reproduced one level up.
+	//
+	// The PL011 path is polled and lock-free, so this can only ever be slow, never stuck. Two
+	// reports may interleave; two interleaved reports are readable and a missing one is not.
+	let mut wire = super::serial::SerialWriter;
+
+	// ONLY THE FIRST FEW SPEAK. Whatever corrupts one core's stack usually takes its neighbours
+	// with it, and eight cores writing the same four lines byte by byte through a polled UART turns
+	// the answer into a wall. The first report is the one that matters; the second is worth having
+	// to see whether the second core failed the same way.
+	static REPORTS: AtomicU32 = AtomicU32::new(0);
+	if REPORTS.fetch_add(1, Ordering::AcqRel) < 2 {
+		let cpu = super::percpu::this_cpu().cpu_id();
+		let (floor, span) = super::percpu::stack_bounds();
+		let _ = writeln!(wire, "\naarch64: BAD KERNEL STACK on cpu {cpu} - a trap arrived with sp {sp:#x}, and this core's stack holds {floor:#x}..={:#x}", floor + span);
+		let _ = writeln!(wire, "aarch64:   ESR={esr:#x} (EC={:#x}) FAR={far:#x} ELR={elr:#x}", (esr >> 26) & 0x3f);
+		if sp < floor {
+			let _ = writeln!(wire, "aarch64:   {} bytes BELOW the floor, which already allows a {TRAP_FRAME_BYTES}-byte frame: this is a stack overflow", floor - sp);
+		} else {
+			let _ = writeln!(wire, "aarch64:   {} bytes ABOVE the top: this pointer did not come from growing a stack, so something WROTE it", sp - (floor + span));
+		}
+		let _ = writeln!(wire, "aarch64: halting this core - a trap frame cannot be saved, and a fault while saving one has no bottom");
+	}
+	loop {
+		unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
+	}
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 	// vector index: source = index / 4 (0 cur-EL/SP0, 1 cur-EL/SPx, 2 lower/A64,

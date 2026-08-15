@@ -206,6 +206,11 @@ impl KernelStack {
 		self.pages * crate::mem::frame::PAGE_SIZE as usize
 	}
 
+	// The lowest MAPPED address of this stack: one page above `base`, which is the guard.
+	pub fn usable_base(&self) -> u64 {
+		self.base + crate::mem::frame::PAGE_SIZE
+	}
+
 	// The stack bytes, above the guard page. `&mut self` because this hands out the only
 	// mutable view of a region this struct owns exclusively.
 	fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -349,6 +354,15 @@ impl Thread {
 	// the stack it is measuring.
 	pub fn kstack_used(&self) -> usize {
 		self.stack.used_bytes()
+	}
+
+	// Where this thread's kernel stack actually is: `(lowest mapped address, bytes)`.
+	//
+	// The REGION, not a rule about it. What a usable stack pointer is depends on how big a frame
+	// the architecture's exception entry saves before it can do anything else, and that number
+	// belongs to the port that saves it - so this hands over the extent and lets the port decide.
+	pub fn kstack_region(&self) -> (u64, usize) {
+		(self.stack.usable_base(), self.stack.capacity())
 	}
 
 	pub fn kstack_capacity(&self) -> usize {

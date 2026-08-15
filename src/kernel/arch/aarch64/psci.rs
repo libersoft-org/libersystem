@@ -176,6 +176,27 @@ extern "C" fn aarch64_secondary_main(cpu_id: u64) -> ! {
 		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 	}
 	super::percpu::init(cpu_id as usize, mpidr as u32);
+	// AND THE STACK THIS CORE IS STANDING ON, which nothing described until now.
+	//
+	// `SEC_STACKS` is a static array of 16 KiB slices with NO GUARD PAGES between them, so a core
+	// that runs off the bottom of its slice walks into the previous core's - mapped memory, no
+	// fault, silent. What it overwrites there is another core's saved state, and the first thing
+	// that core does with a corrupted stack pointer is take an exception on it.
+	//
+	// The scheduler sets these bounds for every thread it runs and clears them for the idle
+	// context, which left the one stack in the system with no guard page also being the one with no
+	// check. This closes that: from here on this core's idle and interrupt work is bounded too, and
+	// an exception taken on a stack pointer outside the slice is REPORTED rather than turned into a
+	// runaway.
+	//
+	// `record_idle_stack` rather than `set_stack_bounds`: this IS this core's idle stack, so it has
+	// to be the value the scheduler restores every time it leaves a thread. Setting only the live
+	// pair made the bounds survive exactly until the first context switch back to idle, which is a
+	// mistake worth leaving named - the check then covers everything except the moment it is for.
+	unsafe {
+		let base = (&raw const SEC_STACKS[cpu_id as usize]) as u64;
+		super::percpu::record_idle_stack(base, SEC_STACK_SIZE as usize);
+	}
 	super::gic::init_secondary();
 	SEC_MPIDR[cpu_id as usize].store(mpidr, Ordering::Relaxed);
 	SMP_ONLINE.fetch_add(1, Ordering::Release);
