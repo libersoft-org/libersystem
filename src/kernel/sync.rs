@@ -17,6 +17,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch;
 
+// How many read-only spins pass between TLB-shootdown services in a contended acquire. Far enough
+// out that no ordinary acquire pays for it, close enough that a core which would otherwise deadlock
+// answers within microseconds rather than never. See the comment at the spin itself.
+const SERVICE_EVERY: u32 = 1024;
+
 pub struct SpinLock<T> {
 	locked: AtomicBool,
 	data: UnsafeCell<T>,
@@ -37,11 +42,34 @@ impl<T> SpinLock<T> {
 		// lock). The prior interrupt state is restored when the guard drops.
 		let was_enabled = arch::interrupts_enabled();
 		arch::disable_interrupts();
+		let mut spins: u32 = 0;
 		while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
 			// Spin read-only (cheap, cache-friendly) until the lock looks free,
 			// then retry the atomic acquire above.
 			while self.locked.load(Ordering::Relaxed) {
 				core::hint::spin_loop();
+				// AND ANSWER TLB SHOOTDOWNS WHILE WAITING, because this is the deadlock
+				// `mem::tlb::shootdown` describes and could not fix from its own side. Interrupts
+				// are masked two lines above, so a core spinning here answers no IPI - and its
+				// comment names exactly this case: "a core that masks interrupts for a lock, or is
+				// already inside this function, does not". Shootdown gained a `service_pending` in
+				// its own wait; this is the other half.
+				//
+				// The deadlock it closes: core A holds some lock and allocates, the allocation grows
+				// the heap, the mapper shoots down, and it waits for core B - which is here, waiting
+				// for A's lock with interrupts off, and will not acknowledge until A finishes.
+				// Neither moves. `a_process_load_whose_image_goes_away...` hangs on eight cores and
+				// passes on one, which is the signature of exactly this and of nothing else that has
+				// survived measurement.
+				//
+				// Only after real contention, and only every so often: `lock` is among the hottest
+				// paths in the kernel, an uncontended acquire never reaches this line, and a brief
+				// wait does not either. `service_pending` is lock-free - atomics and a local flush -
+				// so it cannot recurse into another acquire.
+				spins = spins.wrapping_add(1);
+				if spins % SERVICE_EVERY == 0 {
+					crate::mem::tlb::service_pending();
+				}
 			}
 		}
 		SpinLockGuard { lock: self, was_enabled, _not_send: PhantomData }

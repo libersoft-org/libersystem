@@ -880,6 +880,20 @@ pub fn run_until_idle() {
 				// input, and check_deadlines runs each wake so a periodic wait due inside this
 				// window still wakes on time.
 				while arch::apic::ticks() < deadline && cpu_sched(cpu).inner.lock().run_queue.is_empty() {
+					// ANSWER TLB SHOOTDOWNS HERE TOO, for the reason `cpu_idle_loop` gives and this
+					// loop did not: a core that requested a shootdown waits for every other core to
+					// acknowledge, and this one is sitting in a deadline wait. Relying on the wake
+					// IPI's handler is not enough - `mem::tlb::shootdown` says so in its own comment,
+					// and names the test that proved it - so the requester spun its two-hundred-
+					// million-spin timeout per collision while the BSP halted here without ever
+					// looking at its flag.
+					//
+					// That is an SMP-only deadlock, which is exactly what the evidence said: on
+					// `--smp 1` the whole path completes, because `shootdown` returns immediately
+					// when there is one core; on eight it hung, differently each run, wherever the
+					// collision happened to land. `cpu_idle_loop` has serviced pending requests in
+					// its own loop since that fix; this loop is the one that was missed.
+					crate::mem::tlb::service_pending();
 					run_idle_hook();
 					arch::serial::drain_tx();
 					check_deadlines();

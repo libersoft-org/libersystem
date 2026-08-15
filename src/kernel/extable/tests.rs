@@ -161,11 +161,43 @@ fn a_process_load_of_a_fully_mapped_image_answers_without_faulting() {
 	const AT: u64 = crate::memlayout::USER_VA_END / 2 - 8 * PAGE_SIZE;
 	static ANSWER: AtomicI64 = AtomicI64::new(0);
 
+	// What the SPAWNED thread can see of the mapping the TEST thread made. Every component of this
+	// path has now been cleared in isolation - scheduler, registers, exception table, fault report,
+	// the kernel-side buffer, process creation, and the loader called directly - so what is left is
+	// the combination, and the first thing a combination can get wrong is whose address space the
+	// pages are in. `map_page` maps into the ACTIVE address space; if the spawned thread's is not the
+	// one the test mapped into, the image the loader is handed is not the image that was written.
+	static SEEN_FIRST: AtomicI64 = AtomicI64::new(-1);
+	static SEEN_SECOND: AtomicI64 = AtomicI64::new(-1);
+
 	extern "C" fn spawner(_bootstrap: u64) {
 		unsafe {
+			// STAGED MARKERS, because the thread does not come back and the atomics above can only be
+			// read by a test body that never resumes. Each marker is a short constant so that garbled
+			// output is unmistakable rather than merely suspicious - the earlier probe run showed
+			// clean lines up to a point and mangled ones after, and the LAST CLEAN MARKER is the
+			// measurement this run exists to take.
+			crate::serial_println!("MARK-1-entered");
+			// Read before loading, so a mapping the loader cannot see is reported rather than
+			// inferred. Both pages are mapped here, so both reads must succeed.
+			SEEN_FIRST.store(core::ptr::read_volatile(AT as *const u8) as i64, Ordering::SeqCst);
+			SEEN_SECOND.store(core::ptr::read_volatile((AT + PAGE_SIZE) as *const u8) as i64, Ordering::SeqCst);
+			crate::serial_println!("MARK-2-read first={} second={}", SEEN_FIRST.load(Ordering::SeqCst), SEEN_SECOND.load(Ordering::SeqCst));
+			// A canary either side of the create call. `a_spawned_thread_can_create_a_child_process_
+			// and_let_it_go` proves the call RETURNS a handle; it does not prove it leaves memory
+			// alone, and the probe run garbled its very next line - so this checks rather than
+			// assumes.
+			let mut canary = alloc::vec![0xA5u8; 4096];
+			crate::serial_println!("MARK-3-canary-ready");
 			let child = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_CREATE, 0, 0, 0, 0);
+			crate::serial_println!("MARK-4-created");
+			let intact = canary.iter().all(|byte| *byte == 0xA5);
+			crate::serial_println!("MARK-5-canary intact={intact}");
+			canary[0] = 0;
 			assert!((child as i64) > 0, "the child process is created");
+			crate::serial_println!("MARK-6-calling-load");
 			let answer = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_LOAD, child, AT, 2 * PAGE_SIZE, 0) as i64;
+			crate::serial_println!("MARK-7-load-returned");
 			ANSWER.store(answer, Ordering::SeqCst);
 		}
 	}
@@ -186,6 +218,11 @@ fn a_process_load_of_a_fully_mapped_image_answers_without_faulting() {
 	// Four bytes of magic and eight kilobytes of zeroes is not a loadable image, so the loader
 	// refuses it. What matters is that it ANSWERS: the syscall returned, from the same thread shape
 	// and the same allocation that hangs when the second page is absent.
+	// The magic byte is at AT and the second page is all zeroes, so this says whether the spawned
+	// thread saw the SAME memory the test wrote - checked before the answer, because a wrong image
+	// makes every later assertion meaningless.
+	assert_eq!(SEEN_FIRST.load(Ordering::SeqCst), 0x7f, "the spawned thread must see the image the test mapped - its first byte is the ELF magic");
+	assert_eq!(SEEN_SECOND.load(Ordering::SeqCst), 0, "and its second page, which the test zeroed");
 	assert!(ANSWER.load(Ordering::SeqCst) < 0, "a load of a malformed but fully mapped image must answer with an error rather than hang");
 
 	crate::arch::paging::unmap_page(AT);

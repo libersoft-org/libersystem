@@ -160,3 +160,31 @@ fn a_spawned_thread_can_create_a_child_process_and_let_it_go() {
 	assert!(child != 0, "the spawned thread never ran");
 	assert!(child > 0, "a spawned kernel thread with a process context must be able to create a child process, and got {child}");
 }
+
+crate::tagged_test!(the_loader_refuses_a_malformed_image_without_disturbing_anything, [Kernel, Process, Memory], id = "kernel.syscall.the_loader_refuses_a_malformed_image_without_disturbing_anything", covers = ["kernel"]);
+fn the_loader_refuses_a_malformed_image_without_disturbing_anything() {
+	// The last piece of the path that breaks, with everything else stripped off.
+	//
+	// `SYS_PROCESS_LOAD` from a spawned kernel thread breaks on aarch64 - and the same test passes on
+	// x86_64, so the reproducer is sound and the fault is this target's. Every other stage has been
+	// cleared by its own test: the scheduler runs the thread, the syscall preserves registers, the
+	// exception table is intact, the fault report prints in full, the 8 KiB image buffer allocates and
+	// holds its contents, and `SYS_PROCESS_CREATE` works from that thread.
+	//
+	// This calls the loader DIRECTLY - no spawned thread, no syscall dispatch, no handle table, no
+	// user mapping, no faultable copy - with the same malformed image the control used: four bytes of
+	// ELF magic and nothing else. A parser that reads `EI_CLASS` refuses it immediately.
+	//
+	// If this breaks, the loader owns the bug and none of the machinery around it matters.
+	// If it passes, the loader is innocent in isolation and what breaks is the COMBINATION - which
+	// points at the address space the load runs against rather than at the parsing.
+	use crate::object::address_space::AddressSpace;
+	use crate::object::process::Process;
+
+	let mut image = alloc::vec![0u8; 8192];
+	image[..4].copy_from_slice(b"\x7fELF");
+
+	let process = Process::new(AddressSpace::create().expect("an address space"), crate::sched::root_domain()).expect("a test process");
+	let outcome = crate::loader::load_image_into(&process, &image);
+	assert!(outcome.is_err(), "four bytes of magic and eight kilobytes of zeroes is not a loadable image");
+}
