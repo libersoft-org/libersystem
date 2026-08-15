@@ -165,10 +165,14 @@ fn a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel() 
 
 	extern "C" fn spawner(_bootstrap: u64) {
 		unsafe {
+			crate::serial_println!("PROBE spawner: entered");
 			let child = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_CREATE, 0, 0, 0, 0);
+			crate::serial_println!("PROBE spawner: child={child:#x}");
 			assert!((child as i64) > 0, "the child process is created");
 			CAUGHT_BEFORE.store(super::caught(), Ordering::SeqCst);
+			crate::serial_println!("PROBE spawner: caught_before={} - calling load", super::caught());
 			let answer = crate::arch::syscall::invoke(crate::syscall::SYS_PROCESS_LOAD, child, AT, 2 * PAGE_SIZE, 0) as i64;
+			crate::serial_println!("PROBE spawner: load returned {answer} caught={}", super::caught());
 			ANSWER.store(answer, Ordering::SeqCst);
 		}
 	}
@@ -180,9 +184,12 @@ fn a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel() 
 		core::ptr::copy_nonoverlapping(b"\x7fELF".as_ptr(), AT as *mut u8, 4);
 	});
 
+	crate::serial_println!("PROBE test: mapped at {AT:#x}, spawning");
 	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
 	crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL, 0);
+	crate::serial_println!("PROBE test: spawned, entering run_until_idle");
 	crate::sched::run_until_idle();
+	crate::serial_println!("PROBE test: run_until_idle returned, answer={} caught={}", ANSWER.load(Ordering::SeqCst), caught());
 
 	assert!(ANSWER.load(Ordering::SeqCst) < 0, "a load whose image is half absent must answer with an error - and the kernel must still be running to answer");
 	assert!(caught() > CAUGHT_BEFORE.load(Ordering::SeqCst), "the absent page was reached through the faultable copy; if it were not, this line would not have been reached at all");
