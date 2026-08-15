@@ -294,8 +294,26 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 	// Offset 240 holds x30 and 248 holds the saved ELR, as the `stp` pair above lays them out.
 	const FRAME_ELR: usize = 248 / 8;
 	if let Some(fixup) = crate::extable::fixup_for(elr, far) {
-		unsafe { *frame.add(FRAME_ELR) = fixup };
-		return;
+		// CHECK the slot before writing it, because writing it blind is how this fails silently.
+		//
+		// The stub saved ELR_EL1 into this slot on the way in, so the slot must already hold `elr` -
+		// the address this fault is resuming from. If it holds anything else then this offset is not
+		// where the saved ELR lives on THIS entry path, and storing the fixup into it corrupts some
+		// other saved register while leaving the resume address untouched. The faulting instruction is
+		// then retried forever, and a fault handler that never returns prints NOTHING: the machine
+		// goes silent and the suite times out with no diagnostic at all. That is exactly what
+		// `a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel` does on this
+		// target, which is why the check is here rather than in a comment.
+		//
+		// A mismatch is a kernel bug either way. Refusing it falls through to the report below and
+		// halts loudly with both numbers, which is strictly better than resuming into a frame nobody
+		// has verified.
+		let saved = unsafe { *frame.add(FRAME_ELR) };
+		if saved == elr {
+			unsafe { *frame.add(FRAME_ELR) = fixup };
+			return;
+		}
+		crate::serial_println!("aarch64: extable fixup for pc {elr:#x} REFUSED - frame slot holds {saved:#x} rather than the faulting ELR, so this frame is not laid out as the fixup path assumes");
 	}
 
 	// Anything else reaching here is a kernel bug: report it and halt.

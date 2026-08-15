@@ -200,6 +200,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [P02M0133 - The parts are right; the transactions between them are not](P02M0133.md)
 - [x] [P02M0134 - The Wasm engine runs modules it has never validated](P02M0134.md)
 - [ ] [P02M0135 - Foreign graphics-stack prerequisites](P02M0135.md)
+- [ ] [P02M0136 - Text foundation: shaping, fallback and layout](P02M0136.md)
 
 ### Definition of done (phase 2)
 
