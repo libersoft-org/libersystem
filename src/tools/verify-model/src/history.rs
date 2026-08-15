@@ -45,6 +45,9 @@ pub struct History {
 	pub fixed_overshoot: BTreeMap<String, f64>,
 }
 
+// The history file's format version. Bumped when a recorded value stops meaning what it meant.
+pub const SCHEMA: u32 = 2;
+
 impl History {
 	pub fn path(repo_root: &Path) -> PathBuf {
 		repo_root.join(".build/state/verify-history.json")
@@ -53,13 +56,23 @@ impl History {
 	pub fn load(repo_root: &Path) -> Result<Self, String> {
 		let path = Self::path(repo_root);
 		if !path.is_file() {
-			return Ok(History { schema: 1, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new() });
+			return Ok(History { schema: SCHEMA, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new() });
 		}
 		let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
 		// A history that cannot be read is an empty history, not a failure. It records what has run;
 		// losing it costs a wider next sweep, which is the safe direction, and refusing to plan
 		// because a cache is corrupt would be the unsafe one.
-		Ok(serde_json::from_str(&text).unwrap_or(History { schema: 1, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new() }))
+		let mut history: History = serde_json::from_str(&text).unwrap_or(History { schema: SCHEMA, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new() });
+		// EVIDENCE RECORDED UNDER A RULE THAT WAS WRONG IS NOT EVIDENCE. Schema 1 recorded an
+		// overshoot for any step that came in under its fixed term, including steps that did not run
+		// at all - see `record_step`. The per-key records are unaffected and are kept; the overshoot
+		// is dropped, because it is a claim about a constant and the observations behind it were not
+		// observations.
+		if history.schema < SCHEMA {
+			history.fixed_overshoot.clear();
+			history.schema = SCHEMA;
+		}
+		Ok(history)
 	}
 
 	pub fn save(&self, repo_root: &Path) -> Result<(), String> {
@@ -106,7 +119,21 @@ impl History {
 		// to distribute. `verify-model cost` reports it, which is how a constant that is wrong
 		// becomes visible rather than merely inert.
 		let residual = step_seconds - fixed;
-		if residual < 0.0 {
+		// A STEP THAT DID NOT RUN IS NOT A MEASUREMENT OF WHAT RUNNING COSTS.
+		//
+		// The overshoot was recorded for any negative residual, and `verify.sh` records whatever
+		// `$((SECONDS - started))` came to - so a step that failed at its first instruction, or one
+		// whose runner short-circuited, recorded ZERO seconds and the whole fixed term became
+		// "evidence" that the constant is a whole-suite figure. That is what the three entries on
+		// disk were: two of them equal to their fixed term exactly, which is a step of zero seconds,
+		// and the third an x86_64 guest step of a second and a half, which is less than the time it
+		// takes to boot one.
+		//
+		// So the conclusion needs a step that ran AND finished: `passed`, because a failure may have
+		// died before doing the work, and a positive duration, because a suite cannot take no time.
+		// The residual is still recorded as zero share below either way - what changes is only
+		// whether the run is allowed to contradict a constant.
+		if residual < 0.0 && passed && step_seconds > 0.0 {
 			for pair in &pairs {
 				let seen = self.fixed_overshoot.entry(format!("{}/{}", pair.0, pair.1)).or_insert(0.0);
 				// The LARGEST overshoot seen, not the last: the fixed term is a floor on what a run

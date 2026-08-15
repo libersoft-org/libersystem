@@ -131,10 +131,18 @@ unsafe impl GlobalAlloc for Heap {
 			};
 			// The PRODUCT first: `checked_add` cannot save a multiplication that already wrapped,
 			// and `pages` is derived from an allocation size a caller chose.
+			//
+			// AND BOTH GIVE THE PAGES BACK. These returned null with the firmware allocation already
+			// made, so an arena whose arithmetic did not fit was leaked for the rest of the boot -
+			// while the `MAX_ARENAS` refusal three lines below frees before it refuses, which is the
+			// same situation answered correctly. Not reachable on a real machine; the reason to fix
+			// it is that "not reachable" is a property of today's callers rather than of this code.
 			let Some(span) = pages.checked_mul(crate::PAGE_SIZE as usize) else {
+				((*services).free_pages)(addr, pages);
 				return ptr::null_mut();
 			};
 			let Some(end) = (addr as usize).checked_add(span) else {
+				((*services).free_pages)(addr, pages);
 				return ptr::null_mut();
 			};
 			// Recorded so it can be given back. An untrackable arena is refused rather than taken

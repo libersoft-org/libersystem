@@ -1724,3 +1724,33 @@ fn a_preflight_over_a_claimed_name_answers_what_the_write_answers() {
 	fs.stream_abort();
 	assert!(fs.writable_len(b"claimed").is_ok(), "and once the claim is gone the name is available again");
 }
+
+#[test]
+fn a_shrunk_directory_table_has_room_for_the_insert_that_follows_it() {
+	// STATED AND TESTED, rather than true by how three constants interact. `rename` removes an entry
+	// from one table - which may shrink it - and inserts into another, and the shape that made an
+	// earlier defect unreachable rested on the shrink never leaving a table too small for the insert
+	// after it. Nothing said so and nothing checked it, and an EXACT-fit resize does not actually
+	// provide it: a table of a hundred entries shrunk to a capacity of a hundred has no room at all.
+	//
+	// The guarantee is one slot - about the insert that FOLLOWS a shrink, not about a run of them.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 8 * 1024 * 1024).expect("a volume");
+	fs.mkdir(b"/d").expect("a directory");
+	// Enough entries to take the table well past `MIN_SLOTS`, then remove almost all of them so the
+	// quarter-occupancy window opens and the shrink actually fires.
+	for i in 0..64u32 {
+		let mut name = alloc::vec::Vec::from(&b"/d/f"[..]);
+		name.extend_from_slice(i.to_string().as_bytes());
+		fs.write_file(&name, b"x").expect("a file");
+	}
+	for i in 0..60u32 {
+		let mut name = alloc::vec::Vec::from(&b"/d/f"[..]);
+		name.extend_from_slice(i.to_string().as_bytes());
+		fs.remove(&name).expect("removed");
+	}
+	// The insert that follows the shrink. It must succeed - and under the guarantee it does not need
+	// the allocator at all, which is what makes it safe on the paths that cannot refuse.
+	fs.write_file(b"/d/after", b"y").expect("the insert after a shrink");
+	let names = fs.list_entries(b"/d").expect("the directory lists");
+	assert!(names.iter().any(|entry| entry.name == "after"), "the entry inserted after the shrink is there");
+}

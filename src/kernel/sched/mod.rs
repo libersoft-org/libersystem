@@ -13,7 +13,6 @@
 
 #![allow(dead_code)]
 
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -39,8 +38,65 @@ enum Disposition {
 	Block,
 }
 
+// A FIFO of threads that ALLOCATES NOTHING, because the link lives in the thread.
+//
+// This was a `VecDeque<Arc<Thread>>`, and the push that grew it ran under the per-CPU scheduler
+// lock - asking the kernel heap for memory while a core is locked out of its own scheduler, which is
+// asking for a TLB shootdown under that lock, which waits for the very core that is spinning on it.
+// The `ALLOC-OK` markers said "bounded by the Domain thread quota", and a bound is not a booking:
+// the quota says the queue will never hold a millionth entry and nothing about whether the heap can
+// hold its first.
+//
+// Booking a slot on every core at thread creation was tried and withdrawn - it moved the allocation
+// under N locks instead of one. This is the answer the audit named: a thread is in at most one run
+// queue at a time (it is running, queued on one core, or blocked), so ONE link in the `Thread` is
+// enough, and enqueueing becomes three pointer stores. There is nothing left to allocate, so there
+// is nothing left to refuse, and `push` cannot fail.
+struct RunQueue {
+	head: Option<Arc<Thread>>,
+	tail: Option<Arc<Thread>>,
+	len: usize,
+}
+
+impl RunQueue {
+	const fn new() -> Self {
+		Self { head: None, tail: None, len: 0 }
+	}
+
+	fn is_empty(&self) -> bool {
+		self.head.is_none()
+	}
+
+	fn len(&self) -> usize {
+		self.len
+	}
+
+	// The queue holds `head` strongly and each thread's link holds the next, so the chain keeps
+	// every queued thread alive without a second list to keep in step.
+	fn push_back(&mut self, thread: Arc<Thread>) {
+		*thread.run_link() = None;
+		match self.tail.take() {
+			Some(tail) => *tail.run_link() = Some(thread.clone()),
+			None => self.head = Some(thread.clone()),
+		}
+		self.tail = Some(thread);
+		self.len += 1;
+	}
+
+	fn pop_front(&mut self) -> Option<Arc<Thread>> {
+		let head = self.head.take()?;
+		match head.run_link().take() {
+			Some(next) => self.head = Some(next),
+			// The last one out takes the tail with it: a queue with no head has no tail.
+			None => self.tail = None,
+		}
+		self.len -= 1;
+		Some(head)
+	}
+}
+
 struct CpuSchedInner {
-	run_queue: VecDeque<Arc<Thread>>,
+	run_queue: RunQueue,
 	current: Option<Arc<Thread>>,
 	// A thread that just exited on this core, awaiting reap by the next context.
 	zombie: Option<Arc<Thread>>,
@@ -54,69 +110,46 @@ struct CpuSched {
 
 impl CpuSched {
 	const fn new() -> Self {
-		Self { inner: SpinLock::new(CpuSchedInner { run_queue: VecDeque::new(), current: None, zombie: None }), idle_sp: AtomicU64::new(0) }
+		Self { inner: SpinLock::new(CpuSchedInner { run_queue: RunQueue::new(), current: None, zombie: None }), idle_sp: AtomicU64::new(0) }
 	}
 }
 
 static SCHED: AtomicPtr<CpuSched> = AtomicPtr::new(core::ptr::null_mut());
 
-// How many threads exist, anywhere, right now.
+// WHY THE RUN QUEUES ARE NOT BOOKED AHEAD, and what was tried.
 //
-// Not a statistic: it is the number every core's run queue has to have room for, because a woken
-// thread joins the WAKER's queue and any core can be the waker. `Process::live_thread_count` is
-// per-process and cannot answer that.
-static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+// The `push_back` calls below carry `ALLOC-OK: bounded by the Domain thread quota`, and that marker
+// is HONEST ABOUT BEING INCOMPLETE: a bound says the queue will never hold a millionth entry and
+// says nothing about whether the heap can hold its first. `SYS_THREAD_START` and every wake reach
+// those pushes, so a short heap is a kernel abort reachable from ring 3.
+//
+// The obvious answer - book a slot on every core when a thread is CREATED, where a refusal can be
+// carried - was implemented and REVERTED, because it deadlocks. Reserving takes each core's
+// scheduler lock, and asking the heap for memory under that lock is asking for a TLB shootdown under
+// it: mapping a new heap page waits for every other core to acknowledge, and a core spinning for the
+// lock this one holds never will. Building the larger queue outside the lock and swapping it in
+// under it fixes that particular hazard and the suite still stopped, one test further along - the
+// mechanism takes N spinlocks on a path reached from a syscall, and that is a scheduling hazard
+// whatever the allocation does.
+//
+// The real answer is the one the audit that raised this named: an INTRUSIVE run queue, where the
+// link lives in the `Thread` and enqueue moves pointers rather than growing a container. Then there
+// is nothing to book because there is nothing to allocate. That is a rewrite of this file's data
+// structure and it is a task rather than a patch - recorded in P02M0133 with this evidence, because
+// the next person to have the obvious idea should find out here that it was tried.
+//
+// Measured on aarch64 with eight cores online: the full suite stopped at the seventh test with the
+// booking in place, and passes without it.
 
-// Book a run-queue slot on EVERY core for a thread about to be created, or refuse.
+// Put `thread` on `cpu`'s run queue.
 //
-// The seven `run_queue.push_back` call sites carried `ALLOC-OK: bounded by the Domain thread quota`,
-// and a bound is not a booking: the quota says the queue will never hold a millionth entry and
-// nothing about whether the heap can hold its first. `SYS_THREAD_START` and every wake reach those
-// pushes, so a short heap made them a kernel abort from ring 3 - the K06 class, in the one structure
-// that must never fail.
-//
-// Booked at creation rather than at enqueue because enqueue has nowhere to put a refusal: a runnable
-// thread that cannot be queued is a thread that never runs again. Creation already answers `None`
-// and every caller already handles it.
-//
-// The reservation is never given back, which is right twice over: a `VecDeque`'s capacity does not
-// shrink, and the ceiling that matters is the peak thread count rather than the current one. So the
-// invariant each core holds is `capacity >= live threads`, and since one thread occupies at most one
-// slot of one queue, a push can always find room.
-pub fn reserve_run_slot() -> bool {
-	// Claimed before it is booked, so two cores creating threads at once cannot both reserve for the
-	// same target and leave the queue one short.
-	let target = LIVE_THREADS.fetch_add(1, Ordering::AcqRel) + 1;
-	if SCHED.load(Ordering::Acquire).is_null() {
-		// `allocate` runs before any thread exists, so this is the host test build, where there are
-		// no run queues to book.
-		return true;
-	}
-	for cpu in 0..crate::smp::cpu_count() {
-		let mut inner = cpu_sched(cpu).inner.lock();
-		// `try_reserve(n)` guarantees room for `len + n`, so the argument is what is missing rather
-		// than the target itself.
-		let want = target.saturating_sub(inner.run_queue.len());
-		if inner.run_queue.try_reserve(want).is_err() {
-			drop(inner);
-			LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
-			return false;
-		}
-	}
-	true
-}
-
-// Give back a booking whose thread was never built, or whose thread has been dropped. The queue
-// capacity stays - it cannot shrink - and what this restores is the count the next reservation
-// measures against.
-pub fn release_run_slot() {
-	LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
-}
-
-// The booking count, so a test can say it comes back.
-#[cfg(test)]
-pub fn live_thread_bookings() -> usize {
-	LIVE_THREADS.load(Ordering::Acquire)
+// One lock, no allocation, no way to fail - which is what the intrusive queue above bought. Before
+// it, this line was `cpu_sched(cpu).inner.lock().run_queue.push_back(..)` holding the lock across a
+// push that could reallocate, and the two attempts to make that safe from outside (booking a slot on
+// every core at creation, growing the deque outside the lock) are recorded there because both are
+// worse than not needing to.
+fn enqueue_on(cpu: usize, thread: Arc<Thread>) {
+	cpu_sched(cpu).inner.lock().run_queue.push_back(thread);
 }
 
 // Allocate the per-core scheduler slots for `count` cores, sized by the MP
@@ -328,7 +361,7 @@ pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> 
 	// below, and that one returns None.
 	let thread = Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack");
 	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
-	cpu_sched(cpu).inner.lock().run_queue.push_back(thread.clone());
+	enqueue_on(cpu, thread.clone());
 	if cpu != current_cpu_id() {
 		arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
 	}
@@ -356,7 +389,7 @@ pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObje
 // Release a prepared thread onto the run queue.
 pub fn start_thread(thread: &Arc<Thread>) {
 	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
-	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
+	enqueue_on(current_cpu_id(), thread.clone());
 }
 
 // Create a kernel thread accounted to `domain` on the current core, enforcing the
@@ -366,7 +399,7 @@ pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Opt
 	let process = Process::new(kernel_as(), domain)?;
 	let thread = Thread::new_in(entry, arg, process)?;
 	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
-	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
+	enqueue_on(current_cpu_id(), thread.clone());
 	Some(thread)
 }
 
@@ -382,7 +415,7 @@ pub fn process_create(domain: Arc<Domain>) -> Option<Arc<Process>> {
 pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
 	let thread = Thread::new(entry, arg, process)?;
 	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
-	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread.clone());
+	enqueue_on(current_cpu_id(), thread.clone());
 	Some(thread)
 }
 
@@ -405,7 +438,7 @@ pub fn thread_start(thread: Arc<Thread>) -> bool {
 	}
 	thread.set_state(ThreadState::Ready);
 	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
-	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread);
+	enqueue_on(current_cpu_id(), thread);
 	true
 }
 
@@ -789,7 +822,7 @@ fn enqueue(thread: Arc<Thread>) {
 	// That is the open item in Phase 2, and it is the reason migration is not yet safe for
 	// a process with threads on several cores rather than a reason to stop migrating.
 	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
-	cpu_sched(current_cpu_id()).inner.lock().run_queue.push_back(thread);
+	enqueue_on(current_cpu_id(), thread);
 }
 
 // An optional hook the BSP runs while idle-spinning for the next timed wakeup. It

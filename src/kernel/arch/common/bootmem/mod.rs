@@ -43,6 +43,44 @@ const PAGE: u64 = 4096;
 // the last region written is TRUNCATED at the start of the next hole rather than extended over it -
 // losing memory, never handing out a hole. Deliberately: with room for `n` regions the safe failure
 // is a smaller pool.
+// How many reservations `carve_banks` will copy for each bank. The same sixteen both ports pass.
+pub const MAX_HOLES: usize = 16;
+
+// Carve EVERY RAM bank against the loader's reservations, into one region array.
+//
+// The device-tree ports used to hand `carve` a single range - the contiguous run from the first bank
+// - so a board with discontiguous RAM lost everything past its first hole. The reader carries the
+// real bank list now, and this is the other half: the allocator has always taken a list of regions,
+// and the boot path was the side that collapsed it.
+//
+// Not a loop around `carve`, because `carve` CLAMPS its holes to the range it is given, in place. A
+// second call would see reservations already trimmed to the first bank and carve nothing out of the
+// second. Each bank gets its own copy, which also makes each bank's answer independent of the order
+// the tree wrote them in.
+//
+// `floor` is the first address above the kernel image: a bank below it is memory the kernel is
+// standing in, and the part above it is what is free.
+//
+// `out` needs `banks + holes` entries at most - each reservation splits exactly one bank into at
+// most one extra region - and a bank that does not fit is dropped rather than half-written, because
+// a region array that looks complete and is missing its tail is the failure this file exists to
+// avoid.
+pub fn carve_banks(banks: &[(u64, u64)], floor: u64, holes: &[Hole], out: &mut [MemRegion]) -> usize {
+	let mut written = 0usize;
+	for &(base, len) in banks {
+		let start = base.max(floor);
+		let end = base.saturating_add(len);
+		if end <= start || written >= out.len() {
+			continue;
+		}
+		let mut scratch = [Hole { start: 0, end: 0 }; MAX_HOLES];
+		let count = holes.len().min(scratch.len());
+		scratch[..count].copy_from_slice(&holes[..count]);
+		written += carve(start, end - start, &mut scratch[..count], &mut out[written..]);
+	}
+	written
+}
+
 pub fn carve(base: u64, len: u64, holes: &mut [Hole], out: &mut [MemRegion]) -> usize {
 	let end = base + len;
 	// Page-align outward, drop what cannot matter, and sort. Insertion sort because there are a

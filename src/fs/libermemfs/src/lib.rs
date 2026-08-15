@@ -215,11 +215,26 @@ fn shrink_children(children: &mut Children) {
 	if children.capacity() <= MIN_SLOTS || children.len() * 4 > children.capacity() {
 		return;
 	}
+	// A GUARANTEE, NOT AN ACCIDENT: a table this function has shrunk has room for at least one more
+	// entry without allocating.
+	//
+	// Several call sites lean on it - `rename` removes from one table and inserts into another, and
+	// the shape that made the old defect unreachable was exactly this - and until now it held by the
+	// way `MIN_SLOTS`, the quarter-occupancy window and an EXACT-fit resize happened to interact.
+	// Exact fit does not actually provide it: a table of a hundred entries shrunk to a capacity of a
+	// hundred has no room at all, and the next insert allocates. What made it look true was that the
+	// callers reaching this path had small tables.
+	//
+	// So the headroom is asked for rather than hoped for. One slot is what the property needs and
+	// all it needs: the guarantee is about the insert that FOLLOWS a shrink, not about a run of
+	// them, and a run has to be able to allocate anyway.
+	let want = children.len().saturating_add(1).max(MIN_SLOTS);
 	let mut smaller = Children::new();
-	if smaller.try_reserve_exact(children.len()).is_err() {
+	if smaller.try_reserve_exact(want).is_err() {
 		return;
 	}
 	smaller.extend(children.drain(..));
+	debug_assert!(smaller.capacity() > smaller.len(), "a shrunk table must have room for the insert that follows it");
 	*children = smaller;
 }
 

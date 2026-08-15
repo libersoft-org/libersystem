@@ -27,8 +27,22 @@ use core::ptr::read_volatile;
 // What the kernel wants out of the device tree.
 #[derive(Clone, Copy)]
 pub struct BootInfo {
+	// The CONTIGUOUS run from the first bank, which is what a caller that wants one range gets.
 	pub ram_base: u64,
 	pub ram_size: u64,
+	// EVERY BANK THE TREE DECLARES, which is what the frame allocator actually wants.
+	//
+	// `ram_base`/`ram_size` describe a run and stop at the first hole, so a board with discontiguous
+	// RAM lost everything past it - safe, because a hole handed out as memory is a store that goes
+	// nowhere, and lossy, because the loss is silent to anyone not reading the boot report. The
+	// allocator takes a LIST of regions and always has; the reader was the side that collapsed it.
+	//
+	// Banks arrive in whatever order the tree wrote them and are coalesced when adjacent. More banks
+	// than this array holds are dropped and `ram_region_count` says how many were kept - capped
+	// rather than refused, because refusing the tree falls back to built-in defaults, which is a
+	// worse answer than sixteen banks of a seventeen-bank machine.
+	pub ram_regions: [(u64, u64); MAX_RAM_REGIONS],
+	pub ram_region_count: usize,
 	pub cpu_count: u32,
 	// PCIe ECAM config-space base (0 if the tree has no pcie node).
 	pub pcie_ecam: u64,
@@ -55,6 +69,18 @@ pub struct BootInfo {
 pub const MODULES_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
 // FDT token + header constants.
+// The widest `#address-cells` / `#size-cells` this reader can hold.
+//
+// `read_cells` folds cells into a `u64`, which is two cells. A tree declaring more describes
+// addresses this reader cannot represent, and reading them anyway shifts the high cells out and
+// keeps the low bits - a wrong address that looks like a right one. Two is also what every tree in
+// the wild declares for a 64-bit machine, so the bound refuses nothing real.
+const MAX_CELLS: u32 = 2;
+
+// How many separate RAM banks the reader will carry. Boards in this tree declare one or two; the
+// array is generous so the cap is not a limit anyone meets.
+pub const MAX_RAM_REGIONS: usize = 16;
+
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;
 const FDT_END_NODE: u32 = 2;
@@ -402,6 +428,8 @@ impl Fdt {
 			let mut size_cells: u32 = 2;
 			let mut ram_base: u64 = 0;
 			let mut ram_size: u64 = 0;
+			let mut ram_regions = [(0u64, 0u64); MAX_RAM_REGIONS];
+			let mut ram_region_count = 0usize;
 			let mut cpu_count: u32 = 0;
 			let mut pcie_ecam: u64 = 0;
 			let mut plic_base: u64 = 0;
@@ -461,10 +489,24 @@ impl Fdt {
 							// had `be32` reading three bytes of whatever followed it - inside the
 							// blob, so no bounds check fires, and the cell count it produced then
 							// decided how every `reg` in the tree was parsed.
+							// AND WHAT THE READER CAN REPRESENT. `read_cells` folds cells into a
+							// `u64`, so a tree declaring three or more cells describes addresses
+							// wider than this reader can hold - and it read them anyway, shifting
+							// the high cells out and silently keeping the low bits. An address
+							// this reader cannot represent is a tree it is not for, and saying so
+							// is a rule rather than a truncation nobody can see.
 							if self.str_eq(pname, "#address-cells") && len == 4 {
-								addr_cells = self.be32(val);
+								let cells = self.be32(val);
+								if cells > MAX_CELLS {
+									return None;
+								}
+								addr_cells = cells;
 							} else if self.str_eq(pname, "#size-cells") && len == 4 {
-								size_cells = self.be32(val);
+								let cells = self.be32(val);
+								if cells > MAX_CELLS {
+									return None;
+								}
+								size_cells = cells;
 							}
 						} else if depth == 1 && d1_memory && self.str_eq(pname, "reg") {
 							// RAM IS NOT ONE RANGE, AND SUMMING THE BANKS PRETENDS IT IS.
@@ -495,6 +537,17 @@ impl Fdt {
 								let s = self.read_cells(&mut q, size_cells);
 								if s == 0 {
 									continue;
+								}
+								// EVERY BANK, beside the run below. Coalesced with the last one when
+								// they touch, so a tree that splits one range into two entries does
+								// not spend two slots on it.
+								if let Some(last) = ram_region_count.checked_sub(1)
+									&& ram_regions[last].0 + ram_regions[last].1 == a
+								{
+									ram_regions[last].1 += s;
+								} else if ram_region_count < MAX_RAM_REGIONS {
+									ram_regions[ram_region_count] = (a, s);
+									ram_region_count += 1;
 								}
 								if ram_size == 0 {
 									ram_base = a;
@@ -550,7 +603,7 @@ impl Fdt {
 			if ram_size == 0 {
 				return None;
 			}
-			Some(BootInfo { ram_base, ram_size, cpu_count: cpu_count.max(1), pcie_ecam, plic_base, fwcfg_base, modules_start, modules_end })
+			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, cpu_count: cpu_count.max(1), pcie_ecam, plic_base, fwcfg_base, modules_start, modules_end })
 		}
 	}
 }

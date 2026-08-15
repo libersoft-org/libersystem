@@ -4070,7 +4070,8 @@ fn a_check_that_could_not_run_is_a_fault_not_a_clean_report() {
 	// and the whole report carries it, so no caller reads a directory that was skipped as
 	// a directory that passed.
 	//
-	// SWEPT RATHER THAN TUNED. This named one budget, chosen by counting the allocations the pass
+	// SWEPT RATHER THAN TUNED. This named one budget, chosen by counting the fallible growth points
+	// the pass
 	// made at the time - so making one more allocation fallible moved the number and the test failed
 	// for a reason that was not about what it asserts. What it means is "there is a budget that lands
 	// inside the directory walk", and sweeping says exactly that while also requiring that no budget
@@ -4152,7 +4153,10 @@ fn a_mount_that_runs_short_inside_the_namespace_walk_refuses_rather_than_aborts(
 	// the one it states.
 	//
 	// The evidence is a COUNT that moves with the namespace: the walk pushes one inode number per
-	// reachable inode, so a volume with more files takes strictly more allocations to mount. Nothing
+	// reachable inode, so a volume with more files passes strictly more growth points on mount. (A
+	// "budget" counts calls that COULD be refused, not mallocs - `try_push` fires the injector even
+	// when the vector already has room, and that is the unit the property is about: every growth
+	// point can refuse and the caller survives it.) Nothing
 	// else on the mount path scales with the file count.
 	let wide = smallest_budget_that_mounts(&dev);
 	let mut narrow_fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
@@ -4160,11 +4164,11 @@ fn a_mount_that_runs_short_inside_the_namespace_walk_refuses_rather_than_aborts(
 		narrow_fs.write_file(alloc::format!("f{i}").as_bytes(), b"payload").unwrap();
 	}
 	let narrow = smallest_budget_that_mounts(&narrow_fs.into_device());
-	assert!(wide - narrow >= 12, "twelve more files cost at least twelve more allocations ({narrow} against {wide}) - one per extra inode, which is the alias set being allocated through the injector at all. Nothing that scales with the FILE COUNT rather than the block count is allocated any other way here.");
+	assert!(wide - narrow >= 12, "twelve more files cost at least twelve more growth points ({narrow} against {wide}) - one per extra inode, which is the alias set being allocated through the injector at all. Nothing that scales with the FILE COUNT rather than the block count is allocated any other way here.");
 }
 
 // The smallest allocation budget under which a mount completes: one more than the number of
-// allocations the mount makes.
+// growth points the mount passes - calls that could be refused, which is not the same as mallocs.
 fn smallest_budget_that_mounts(dev: &MemDevice) -> usize {
 	for budget in 0..512usize {
 		let attempt = dev.clone();
@@ -4370,7 +4374,7 @@ fn a_directorys_speculative_reservation_is_not_skipped_when_memory_is_short() {
 	let mut dev = fs.into_device();
 	forge_inode_slot_of(&mut dev, dir, |slot| slot[INO_TYPE_OFF] = 7);
 
-	// Exactly ONE refusal, and it has to be the scratch map's. Three allocations precede it: the
+	// Exactly ONE refusal, and it has to be the scratch map's. Three growth points precede it: the
 	// mount's two superblock-sized maps, then `derive_free`'s live map.
 	//
 	// A one-shot refusal is the whole point of the fixture. With `fail_after`, every allocation
@@ -4491,7 +4495,7 @@ fn a_spilled_extent_map_that_cannot_allocate_its_block_says_so() {
 	// unrelated allocation counts.
 	let mut reported = false;
 	for budget in 0..64 {
-		// A fresh filesystem per budget: the injection is a count of allocations from the moment it
+		// A fresh filesystem per budget: the injection is a count of GROWTH POINTS from the moment it
 		// is armed, so the state it is armed over has to be identical each time.
 		let mut attempt = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
 		for i in 0..8u64 {

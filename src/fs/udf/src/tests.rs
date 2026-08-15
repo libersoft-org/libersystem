@@ -20,6 +20,12 @@ impl BlockDevice for MemDisc {
 		buf.copy_from_slice(src);
 		true
 	}
+
+	// This fixture knows how big it is, which is what lets the reader reach the anchors at N-256 and
+	// N. A backing that does not know answers `None` and gets the anchor at 256 alone, as before.
+	fn block_count(&mut self) -> Option<u64> {
+		Some((self.data.len() / SECTOR_SIZE) as u64)
+	}
 }
 
 fn w16(b: &mut [u8], off: usize, v: u16) {
@@ -1511,4 +1517,82 @@ fn an_embedded_file_entry_whose_allocation_area_leaves_the_block_is_refused() {
 	img[fe + 4] = sum;
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
 	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Corrupt), "a CRC that stops short of the allocation area is refused at the File Entry call site too");
+}
+
+#[test]
+fn a_damaged_anchor_at_256_is_survived_by_the_one_at_the_end() {
+	// THE REDUNDANCY THE MEDIUM CARRIES. UDF puts an Anchor Volume Descriptor Pointer at LBA 256, at
+	// N-256 and at N precisely so a damaged one is survivable - optical media is where that matters
+	// most - and this reader used only the first of the three, because `BlockDevice` had no way to
+	// say how big the backing was. One scratch over block 256 reported a perfectly good disc as not
+	// being UDF at all.
+	//
+	// `block_count` is a defaulted trait method: a backing that does not know its size answers
+	// `None` and gets exactly the behaviour it had before.
+	let img = build_udf();
+	let blocks = img.len() / SECTOR_SIZE;
+	assert_eq!(blocks, 264, "the fixture's size is what puts N within reach of the pair");
+
+	// The fixture as built mounts through the anchor at 256.
+	assert!(Udf::mount(MemDisc { data: img.clone() }).is_some(), "the fixture itself mounts");
+
+	// Copy the anchor to N - the last block - and destroy the one at 256. Nothing else changes.
+	let mut damaged = img.clone();
+	let n = blocks - 1;
+	let anchor = damaged[256 * SECTOR_SIZE..257 * SECTOR_SIZE].to_vec();
+	damaged[n * SECTOR_SIZE..(n + 1) * SECTOR_SIZE].copy_from_slice(&anchor);
+	refresh(&mut damaged, n, TAG_AVDP, n as u32);
+	for byte in &mut damaged[256 * SECTOR_SIZE..257 * SECTOR_SIZE] {
+		*byte = 0xFF;
+	}
+	let mut fs = Udf::mount(MemDisc { data: damaged }).expect("the anchor at N carries the volume");
+	assert!(!fs.list().expect("the root lists").is_empty(), "and the volume it names reads");
+
+	// And a backing that cannot say how big it is keeps the old answer: one anchor, and a scratch
+	// over it is fatal.
+	struct Sizeless {
+		data: Vec<u8>,
+	}
+	impl BlockDevice for Sizeless {
+		fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+			let start = lba as usize * SECTOR_SIZE;
+			let Some(src) = self.data.get(start..start + SECTOR_SIZE) else {
+				return false;
+			};
+			buf.copy_from_slice(src);
+			true
+		}
+	}
+	let mut blind = img;
+	let n = blocks - 1;
+	let anchor = blind[256 * SECTOR_SIZE..257 * SECTOR_SIZE].to_vec();
+	blind[n * SECTOR_SIZE..(n + 1) * SECTOR_SIZE].copy_from_slice(&anchor);
+	refresh(&mut blind, n, TAG_AVDP, n as u32);
+	for byte in &mut blind[256 * SECTOR_SIZE..257 * SECTOR_SIZE] {
+		*byte = 0xFF;
+	}
+	assert!(Udf::mount(Sizeless { data: blind }).is_none(), "with no size there is only one anchor to try");
+}
+
+#[test]
+fn an_information_length_larger_than_the_partition_is_refused() {
+	// The information length comes off the medium and nothing looked at it, so a forged 2^63 was
+	// reported to a caller as a file size - a listing that says a file is eight exabytes is a
+	// listing that lies about the disc. The partition's own length is the ceiling no file inside it
+	// can exceed.
+	let mut img = build_udf();
+	// The file entry for the regular file, whose information length sits at offset 56.
+	let mut found = None;
+	for lb in 0..(img.len() / SECTOR_SIZE) {
+		let off = lb * SECTOR_SIZE;
+		if u16::from_le_bytes([img[off], img[off + 1]]) == TAG_FILE_ENTRY && img[off + 27] != 4 {
+			found = Some(lb);
+			break;
+		}
+	}
+	let lb = found.expect("the fixture has a regular file entry");
+	w64(&mut img[lb * SECTOR_SIZE..], 56, u64::MAX / 2);
+	refresh(&mut img, lb, TAG_FILE_ENTRY, lb as u32);
+	let mut fs = Udf::mount(MemDisc { data: img }).expect("the volume still mounts - only one length is forged");
+	assert_eq!(fs.list(), Err(FsError::Corrupt), "a length no partition could hold is not a size");
 }

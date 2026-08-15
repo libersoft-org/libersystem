@@ -100,7 +100,8 @@ pub enum ImportError {
 // is asking for a camera, and "the call site might be unreachable" is not an answer to that.
 pub fn resolve(module: &str, field: &str, signature: Option<&FuncType>) -> Result<WorldFn, ImportError> {
 	let (op, params, results): (WorldFn, &'static [ValType], &'static [ValType]) = match (module, field) {
-		// read(ptr: u32, max: u32) -> i32 (count, or a negative status)
+		// read(ptr: u32, max: u32) -> i32 (count, or a negative status). A count is at most
+		// `i32::MAX`: the result carries both, so anything wider cannot be told apart from a status.
 		("liber:vfs@1", "read") => (WorldFn::Read, &[ValType::I32, ValType::I32], &[ValType::I32]),
 		// write(ptr: u32, len: u32) -> i32 (count, or a negative status)
 		("liber:vfs@1", "write") => (WorldFn::Write, &[ValType::I32, ValType::I32], &[ValType::I32]),
@@ -144,6 +145,19 @@ pub fn window(args: &[Value], mem_len: usize) -> Option<(usize, usize)> {
 	let len: usize = len as u32 as usize;
 	let end: usize = ptr.checked_add(len)?;
 	if end > mem_len {
+		return None;
+	}
+	// THE ABI'S OWN CEILING, STATED. `read` and `write` answer an `i32` that is a byte count when it
+	// is positive and a status when it is negative, so a count above `i32::MAX` cannot be expressed
+	// - `n as i32` would wrap it into a negative number the guest reads as a failure code. Nothing
+	// can reach it today, because a component's memory is capped far below it, and that is a reason
+	// to write the limit down rather than a reason not to: a limit nobody wrote down is a limit
+	// somebody finds.
+	//
+	// The contract is therefore "one call moves at most `i32::MAX` bytes", refused here rather than
+	// left to depend on a cap in another file. Widening it means a later ABI revision that returns
+	// something wider, which is a decision about the interface and not about this function.
+	if len > i32::MAX as usize {
 		return None;
 	}
 	Some((ptr, end))

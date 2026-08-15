@@ -109,6 +109,7 @@ dependencies = [
 name = "proto"
 version = "0.0.0"
 dependencies = [
+ "abi",
  "audio-proto",
  "base-proto",
  "config-proto",

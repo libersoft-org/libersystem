@@ -370,6 +370,18 @@ pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
 // on the allocation its own comment names. The production code was right and the evidence was not:
 // a test that names a specific allocation and cannot fail it is a check that passes for a reason
 // other than the one it states.
+//
+// WHAT IT COUNTS IS FALLIBLE GROWTH POINTS, not allocations. The injector fires on every call,
+// including the many where the vector already has spare capacity and `try_reserve(1)` would allocate
+// nothing - so a "budget" is a count of places this code asked to grow and could have been refused,
+// which is one per call rather than one per malloc.
+//
+// That is the right unit and the comments describing it as an allocation count were the thing that
+// was wrong. The property the sweeps prove is "every fallible growth point can refuse and the caller
+// survives it", and a refusal at a call that would not have allocated is exactly as valid a test of
+// that: the caller cannot tell which kind it got, and it must not. Firing only on real allocations
+// would make the budget a number about `Vec`'s growth strategy - it would skip whole call sites
+// because an earlier push happened to reserve room - which is a worse test wearing a truer name.
 pub(crate) fn try_push<T>(vec: &mut alloc::vec::Vec<T>, value: T) -> Result<(), FsError> {
 	#[cfg(test)]
 	if inject::should_fail() {

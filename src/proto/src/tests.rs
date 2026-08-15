@@ -2,6 +2,17 @@
 //!
 //! The golden test pins the `entry` encoding to the existing `abi::log` wire
 //! layout, byte for byte, so the generated codec stays a drop-in replacement.
+//!
+//! WHICH SIDE OWNS THE FORMAT: `abi::log` does, and `liber:log@1` mirrors it. The duplication is
+//! kept deliberately rather than left undecided. Generating `abi::log` from the IDL would put the
+//! code generator into the kernel's build path, and `abi` is the crate whose whole point is being
+//! small and dependency-free - it is what the kernel and every userspace binary agree on before any
+//! generated code exists. Deleting the IDL side is not open either: the bindings userspace uses are
+//! generated from it.
+//!
+//! So the agreement is held by a test, and the test now compares against the OWNER rather than
+//! against a third hand-typed copy of the same bytes. That is the difference between a golden test
+//! and two independently maintained answers that happen to match.
 
 use crate::codec::{Sink, VecWriter};
 use crate::system::*;
@@ -13,6 +24,13 @@ fn entry_matches_abi_log_layout() {
 	let e = Entry { timestamp: 42, severity: Severity::Info, source: String::from("kernel"), fields: Vec::new() };
 	let mut buf = [0u8; 64];
 	let n = e.encode(&mut buf).expect("encode");
+	// AGAINST THE OWNER. `abi::log` defines this wire format and the IDL mirrors it; encoding the
+	// same record with both and comparing is what makes "byte for byte" a checked claim rather than
+	// a comment. The literal below stays as well: it is what says the format itself did not move,
+	// which two encoders agreeing with each other cannot.
+	let mut owner = [0u8; 64];
+	let owned = abi::log::encode(42, abi::log::Severity::Info, b"kernel", &[], &mut owner).expect("the owning encoder");
+	assert_eq!(&buf[..n], &owner[..owned], "the generated codec and `abi::log` disagree about the record they both claim to write");
 	let expected: &[u8] = &[
 		0x2a,
 		0,
@@ -103,8 +121,20 @@ fn error_round_trips() {
 
 #[test]
 fn severity_ordinals_match_abi_log() {
+	// Against `abi::log::Severity` itself, for the same reason: the IDL's comment says the ordinal
+	// "matches abi::log::Severity byte for byte", and a test that repeats the numbers checks the
+	// comment against itself.
+	for (generated, owned) in [
+		(Severity::Trace, abi::log::Severity::Trace),
+		(Severity::Debug, abi::log::Severity::Debug),
+		(Severity::Info, abi::log::Severity::Info),
+		(Severity::Warn, abi::log::Severity::Warn),
+		(Severity::Error, abi::log::Severity::Error),
+		(Severity::Fatal, abi::log::Severity::Fatal),
+	] {
+		assert_eq!(generated as u8, owned as u8, "a severity ordinal moved apart from the one `abi::log` defines");
+	}
 	assert_eq!(Severity::Trace as u8, 0);
-	assert_eq!(Severity::Info as u8, 2);
 	assert_eq!(Severity::Fatal as u8, 5);
 }
 

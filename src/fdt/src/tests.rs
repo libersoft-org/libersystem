@@ -169,6 +169,13 @@ fn a_hole_in_the_memory_map_is_not_reported_as_memory() {
 	assert_eq!(info.ram_base, 0x4000_0000, "the run starts at the first bank");
 	assert_eq!(info.ram_size, 0x1000_0000, "and ends where the first bank does - the hole is not memory");
 
+	// AND BOTH BANKS ARE CARRIED, which is the half the run cannot express. Reporting only the run
+	// was safe and lossy - the second bank's 256 MiB were simply never used - and the frame
+	// allocator has taken a LIST of regions since it existed; the reader was the side collapsing it.
+	assert_eq!(info.ram_region_count, 2, "two banks, two regions");
+	assert_eq!(info.ram_regions[0], (0x4000_0000, 0x1000_0000));
+	assert_eq!(info.ram_regions[1], (0x8000_0000, 0x1000_0000), "the memory past the hole is not lost any more");
+
 	// AND CONTIGUOUS BANKS STILL JOIN, which is the case this must not break: a tree that describes
 	// one range in two pieces is describing one range.
 	let mut builder = Builder::new();
@@ -183,6 +190,7 @@ fn a_hole_in_the_memory_map_is_not_reported_as_memory() {
 	builder.end();
 	let info = at(builder.finish()).parse().expect("parses");
 	assert_eq!(info.ram_base, 0x4000_0000);
+	assert_eq!(info.ram_region_count, 1, "one range described in two pieces is one region");
 	assert_eq!(info.ram_size, 0x2000_0000, "two touching banks are one range");
 
 	// AND A BANK THAT EXTENDS THE RUN DOWNWARDS joins too, because a device tree does not promise

@@ -200,11 +200,16 @@ impl<D: BlockDevice> Udf<D> {
 		// anchor carries a RESERVE volume descriptor sequence beside the Main one. This read one
 		// anchor and one sequence and answered `None` if either was damaged - on optical media,
 		// where that redundancy is most likely to be the thing that saves the volume.
-		// Only the anchor at 256 here. The other two live at N-256 and N, and `BlockDevice` does not
-		// expose N - so finding them needs a device-size accessor on the trait, which is a change
-		// to the shared contract rather than to this crate. Said plainly rather than left as an
-		// unexplained single read; the RESERVE sequence below is the redundancy that IS reachable.
-		let anchors = [AVDP_LBA];
+		// ALL THREE, when the backing knows how big it is. `BlockDevice::block_count` answers `None`
+		// by default - a stream, or a window onto something larger, genuinely does not know - and a
+		// backing that does gets the other two anchors for free. A disc whose anchor at 256 is
+		// unreadable is exactly the case this redundancy exists for, and it used to mount nothing.
+		//
+		// `n` is the last addressable block, so the pair is `n - 256` and `n`. Zero entries are
+		// skipped by the loop below, which is what a backing with no size or a disc too small for
+		// the pair produces.
+		let n = dev.block_count().map(|count| count.saturating_sub(1)).unwrap_or(0);
+		let anchors = [AVDP_LBA, if n > AVDP_LBA { n - AVDP_LBA } else { 0 }, n];
 		let mut sequences: [(u32, u32); 6] = [(0, 0); 6];
 		let mut sequence_count = 0usize;
 		let mut io_error = false;
@@ -785,7 +790,17 @@ impl<D: BlockDevice> Udf<D> {
 				if entry_is_dir != expect_dir {
 					return Err(FsError::Corrupt);
 				}
-				Ok(le64(&block[56..64]))
+				// BOUNDED BY WHAT THE PARTITION COULD HOLD. The information length comes off the
+				// medium and nothing looked at it: a forged 2^63 was reported to a caller as a file
+				// size, and a listing that says a file is eight exabytes is a listing that lies
+				// about the disc. The partition's own length is the ceiling that cannot be exceeded
+				// by any file inside it.
+				let size = le64(&block[56..64]);
+				let ceiling = (self.geo.part_len as u64).saturating_mul(SECTOR_SIZE as u64);
+				if size > ceiling {
+					return Err(FsError::Corrupt);
+				}
+				Ok(size)
 			}
 			_ => Err(FsError::Invalid),
 		}

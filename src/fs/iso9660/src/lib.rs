@@ -1006,12 +1006,31 @@ fn for_each_susp(sys: &[u8], mut f: impl FnMut(&SuspEntry<'_>) -> Result<(), ()>
 	while at + 4 <= sys.len() {
 		let sig = [sys[at], sys[at + 1]];
 		let len = sys[at + 2] as usize;
+		// TOLERANT, AND THAT IS THE DECISION rather than the behaviour that happens to exist.
+		//
+		// `ST` ends the walk on its signature alone: its own length and version are not validated,
+		// and everything after it is unread whatever it holds. A maximally strict reading would
+		// check the terminator's structure too and state how much trailing padding is acceptable.
+		//
+		// The argument against strictness wins here and it is about what the reader is FOR. Every
+		// byte past `ST` is already outside the area's meaning, so a malformed terminator cannot
+		// mislead this parser into reading something as a filename - which is the failure mode the
+		// checks above exist against. What strictness would buy is refusing a disc whose mastering
+		// tool left harmless slack, and those discs work everywhere else. A reader of removable
+		// media that refuses what every other reader accepts is wrong even when it is right.
+		//
+		// The line that would move if this were reconsidered: validate `len >= 4` and
+		// `sys[at + 3] == 1` before returning, and refuse a `ST` that runs past the area.
 		if &sig == b"ST" {
 			return Ok(());
 		}
 		// PADDING IS NOT DAMAGE. A System Use Area is padded to the record's length, and the padding
 		// is zeros - so a zero signature is the end of the entries rather than an entry this reader
 		// could not parse. Reading it as damage makes every ordinary Rock Ridge area malformed.
+		//
+		// The same decision as `ST` above and for the same reason: a signature of zero is treated as
+		// the end by SIGNATURE ALONE, without asking whether the rest of the area is really zero.
+		// Checking it would refuse discs over bytes that mean nothing to this reader either way.
 		if sig == [0, 0] {
 			return Ok(());
 		}

@@ -94,7 +94,16 @@ fn a_window_that_does_not_fit_is_refused_rather_than_clamped() {
 	// this host the sum is simply large - and a memory that large would legitimately contain it,
 	// which is what this asserts rather than pretending otherwise. The `checked_add` is what keeps
 	// the same code right where `usize` is 32 bits, and what keeps a future 64-bit `ptr` honest.
-	assert_eq!(window(&[Value::I32(-1), Value::I32(-1)], usize::MAX), Some((0xFFFF_FFFF, 0x1_FFFF_FFFE)), "no wrap: the sum is exact");
+	assert_eq!(window(&[Value::I32(-1), Value::I32(i32::MAX)], usize::MAX), Some((0xFFFF_FFFF, 0x1_7FFF_FFFE)), "no wrap: the sum is exact");
+
+	// AND THE ABI'S OWN CEILING. `read` and `write` answer an `i32` that carries a byte count when
+	// positive and a status when negative, so a count above `i32::MAX` cannot be told apart from a
+	// failure - `n as i32` would wrap it into one. Nothing reaches it today, because a component's
+	// memory is capped far below it; the limit is written down and checked here rather than left to
+	// depend on that cap, because a limit nobody wrote down is a limit somebody finds.
+	assert_eq!(window(&[Value::I32(0), Value::I32(i32::MAX)], usize::MAX), Some((0, i32::MAX as usize)), "the largest expressible count is allowed");
+	assert_eq!(window(&[Value::I32(0), Value::I32(i32::MIN)], usize::MAX), None, "0x8000_0000 bytes is one more than the result can carry");
+	assert_eq!(window(&[Value::I32(0), Value::I32(-1)], usize::MAX), None, "and so is 0xFFFF_FFFF");
 
 	// Missing arguments are REFUSED rather than defaulted to zero. They used to read as `(0, 0)`,
 	// which is an answer to a call that should not have happened - the world's signature is

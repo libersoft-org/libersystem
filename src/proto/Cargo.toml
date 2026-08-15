@@ -27,6 +27,12 @@ shared-image = [
 	"time-proto/shared-image",
 ]
 
+[dev-dependencies]
+# The OWNER of the log wire format, so the golden test compares the generated codec against it
+# rather than against a third hand-typed copy of the same bytes. A dev-dependency: nothing shipped
+# links `abi` through `proto`.
+abi = { path = "../abi" }
+
 [dependencies]
 audio-proto = { path = "../user/libs/protocol/audio-proto" }
 base-proto = { path = "../user/libs/protocol/base-proto" }

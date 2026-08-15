@@ -252,6 +252,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// ELF, so the parser scans for it) to learn the real RAM size and CPU count
 	// instead of hard-coding them.
 	let boot_info = super::dtb::parse(dtb);
+	let ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
 	let (ram_top, cpu_count, fwcfg_base) = match boot_info {
 		Some(bi) => {
 			crate::serial_println!("aarch64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s)", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count);
@@ -286,11 +287,20 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	//
 	// Declaring them free is only harmless while nothing allocates that far up. See
 	// `arch::common::bootmem` for how long that held and what ended it.
-	let (region_base, region_len) = paging::usable_region(ram_top);
 	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; 16];
 	let hole_count = unsafe { crate::arch::common::bootmem::loader_reservations(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys), &mut holes) };
-	let mut regions = [bootproto::MemRegion { base: 0, length: 0, kind: bootproto::MEM_USABLE, _pad: 0 }; 17];
-	let region_count = crate::arch::common::bootmem::carve(region_base, region_len, &mut holes[..hole_count], &mut regions);
+	// `banks + holes`, because each reservation splits at most one bank into one extra region.
+	let mut regions = [bootproto::MemRegion { base: 0, length: 0, kind: bootproto::MEM_USABLE, _pad: 0 }; fdt::MAX_RAM_REGIONS + crate::arch::common::bootmem::MAX_HOLES];
+	// EVERY BANK, not the contiguous run from the first one. `usable_region(0)` answers the floor -
+	// the first page above the kernel image - and the fallback below is the machine with no device
+	// tree at all, where one range is all there is to know.
+	let region_count = match ram_banks {
+		Some((banks, count)) if count > 0 => crate::arch::common::bootmem::carve_banks(&banks[..count], paging::usable_region(0).0, &holes[..hole_count], &mut regions),
+		_ => {
+			let (region_base, region_len) = paging::usable_region(ram_top);
+			crate::arch::common::bootmem::carve(region_base, region_len, &mut holes[..hole_count], &mut regions)
+		}
+	};
 	for hole in &holes[..hole_count] {
 		crate::serial_println!("aarch64: reserved {:#x}..{:#x} ({} KiB) - handed over by the loader", hole.start, hole.end, (hole.end - hole.start) / 1024);
 	}

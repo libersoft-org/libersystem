@@ -69,6 +69,13 @@ pub fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDe
 // Translate the EFI memory map into the boot protocol's region array (sorted
 // ascending by base and coalesced). Returns the region count.
 pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_size: usize, regions: *mut MemRegion) -> Option<usize> {
+	// ITS OWN INVARIANT, not its caller's. The only caller today validates `desc_size` before
+	// getting here, so the division was safe - by a fact about somewhere else. A shared helper that
+	// divides by an argument holds the argument's precondition itself, or the day a second caller
+	// appears it divides by zero.
+	if desc_size == 0 {
+		return None;
+	}
 	let entries = map_size / desc_size;
 	let mut n = 0usize;
 	for i in 0..entries {

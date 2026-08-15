@@ -52,8 +52,18 @@ fn log_record_roundtrip_and_renders() {
 // the machinery that will make one possible, and in the meantime it is what turns "somebody
 // reordered a struct" from a silent success into a failing test.
 
+// The snapshot rows, with each constant's own NAME beside it - through `stringify!`, so the name
+// cannot drift from the constant it labels the way a hand-written string could.
+macro_rules! named {
+	($(($name:ident, $value:expr)),* $(,)?) => { &[$(($name, $value, stringify!($name))),*] };
+}
+
+macro_rules! named_only {
+	($($name:ident),* $(,)?) => { &[$(($name, stringify!($name))),*] };
+}
+
 // Every syscall number, snapshotted. A new call appends; an existing one never moves.
-const SYSCALLS: &[(u64, u64)] = &[
+const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_DEBUG_NOOP, 0),
 	(SYS_CLOCK_GET, 1),
 	(SYS_DEBUG_WRITE, 2),
@@ -145,14 +155,37 @@ const SYSCALLS: &[(u64, u64)] = &[
 //
 // `include_str!` is compile-time and dependency-free, which is what makes this affordable in a crate
 // whose whole point is being small.
-fn declared_syscalls() -> alloc::vec::Vec<(alloc::string::String, u64)> {
+//
+// NAMES, AND A REFUSAL FOR ANYTHING IT CANNOT READ. This parsed the VALUE too, and ended every line
+// it did not understand with `continue` - so a declaration written in an unfamiliar shape was
+// treated as though it were not a declaration:
+//
+//   pub const SYS_FOO: u64 = 0x4a;      // not a decimal literal, silently skipped
+//   pub const RIGHT_FOO: u32 = 1u32 << 12;  // the suffix defeats `strip_prefix("1 << ")`
+//   pub const ERR_FOO: i64 = -14 - 1;   // not a bare literal, skipped
+//
+// None of those exists in the crate today, which is exactly why it mattered: the mechanism built to
+// make a missing declaration impossible had a hole through which one could arrive silently, and the
+// failure mode is the quiet one - the test keeps passing while what it checks stops being checked.
+//
+// Two changes close it. The question is COMPLETENESS, which is about names, so the value is not
+// parsed at all - the snapshot beside it already checks values, and parsing each one twice, once by
+// the compiler and once by a string parser, is what created the shapes above. And a line that begins
+// like a declaration and cannot be read is a PANIC rather than a skip: "I saw something claiming to
+// be a declaration and could not read it" is a different and much safer question than "did I find
+// one".
+fn declared_names(prefix: &str) -> alloc::vec::Vec<alloc::string::String> {
 	const SOURCE: &str = include_str!("lib.rs");
-	let mut out: alloc::vec::Vec<(alloc::string::String, u64)> = alloc::vec::Vec::new();
+	let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 	for line in SOURCE.lines() {
-		let Some(rest) = line.strip_prefix("pub const SYS_") else { continue };
-		let Some((name, value)) = rest.split_once(": u64 = ") else { continue };
-		let Some(number) = value.trim().strip_suffix(';').and_then(|n| n.trim().parse::<u64>().ok()) else { continue };
-		out.push((alloc::format!("SYS_{name}"), number));
+		let Some(rest) = line.strip_prefix("pub const ") else { continue };
+		let Some(rest) = rest.strip_prefix(prefix) else { continue };
+		let Some((name, _)) = rest.split_once(':') else {
+			panic!("`pub const {prefix}` declaration this test cannot read - it names no type: {line}");
+		};
+		let name = name.trim();
+		assert!(!name.is_empty() && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'), "`pub const {prefix}` declaration this test cannot read - `{name}` is not a constant name: {line}");
+		out.push(alloc::format!("{prefix}{name}"));
 	}
 	out
 }
@@ -162,7 +195,7 @@ fn the_syscall_numbers_are_what_they_were() {
 	// 39 is deliberately absent: a retired call's number is not reused, because a stale binary
 	// calling it must get "no such syscall" rather than somebody else's handler.
 	let mut seen: [bool; 128] = [false; 128];
-	for &(number, expected) in SYSCALLS {
+	for &(number, expected, _) in SYSCALLS {
 		assert_eq!(number, expected, "a syscall number moved");
 		let slot = number as usize;
 		assert!(slot < seen.len(), "syscall {number} is past the table this test can check");
@@ -174,67 +207,35 @@ fn the_syscall_numbers_are_what_they_were() {
 
 #[test]
 fn the_snapshot_names_every_syscall_the_crate_declares() {
-	let mut declared: alloc::vec::Vec<u64> = declared_syscalls().into_iter().map(|(_, number)| number).collect();
-	declared.sort_unstable();
-	let mut snapshot: alloc::vec::Vec<u64> = SYSCALLS.iter().map(|&(number, _)| number).collect();
-	snapshot.sort_unstable();
+	// BY NAME. The values are the snapshot's business and it checks them above; completeness is a
+	// question about which declarations exist, and a name is something a line-oriented parser can
+	// extract without knowing the grammar of an expression.
+	let mut declared = declared_names("SYS_");
+	declared.sort();
+	let mut snapshot: alloc::vec::Vec<alloc::string::String> = SYSCALLS.iter().map(|&(_, _, name)| alloc::string::String::from(name)).collect();
+	snapshot.sort();
 	// Declaration order is not numeric order - `SYS_DEVICE_QUIESCED` is declared two hundred lines
 	// above a syscall with a lower number - so both sides are sorted before they are compared.
 	assert_eq!(declared, snapshot, "the crate declares {} `pub const SYS_*` and the snapshot names {}; a syscall was added or removed without updating `SYSCALLS`", declared.len(), snapshot.len());
-}
-
-// The `pub const RIGHT_*` this crate declares, read out of its own source.
-//
-// The same argument `declared_syscalls` makes, for the family beside it. `RIGHTS` below is a frozen
-// snapshot and its comment says "a thirteenth right added without touching the literal is a right
-// that `RIGHTS_ALL` silently does not grant" - and a thirteenth right added without touching EITHER
-// the literal or the list is exactly as silent. Correctness stays with the snapshot, because only a
-// frozen copy can catch a value MOVING; completeness comes from the source, which nobody has to
-// remember to update.
-fn declared_rights() -> alloc::vec::Vec<(alloc::string::String, u32)> {
-	const SOURCE: &str = include_str!("lib.rs");
-	let mut out: alloc::vec::Vec<(alloc::string::String, u32)> = alloc::vec::Vec::new();
-	for line in SOURCE.lines() {
-		let Some(rest) = line.strip_prefix("pub const RIGHT_") else { continue };
-		let Some((name, value)) = rest.split_once(": u32 = ") else { continue };
-		let value = value.trim().trim_end_matches(';').trim();
-		let parsed = value.strip_prefix("1 << ").and_then(|shift| shift.trim().parse::<u32>().ok()).map(|shift| 1u32 << shift);
-		let Some(number) = parsed else { continue };
-		out.push((alloc::format!("RIGHT_{name}"), number));
-	}
-	out
-}
-
-// The `pub const ERR_*` this crate declares, likewise.
-fn declared_errors() -> alloc::vec::Vec<(alloc::string::String, i64)> {
-	const SOURCE: &str = include_str!("lib.rs");
-	let mut out: alloc::vec::Vec<(alloc::string::String, i64)> = alloc::vec::Vec::new();
-	for line in SOURCE.lines() {
-		let Some(rest) = line.strip_prefix("pub const ERR_") else { continue };
-		let Some((name, value)) = rest.split_once(": i64 = ") else { continue };
-		let Some(number) = value.trim().strip_suffix(';').and_then(|n| n.trim().parse::<i64>().ok()) else { continue };
-		out.push((alloc::format!("ERR_{name}"), number));
-	}
-	out
 }
 
 #[test]
 fn every_right_is_one_bit_and_rights_all_is_their_union() {
 	// `RIGHTS_ALL` was a hand-written 0xfff beside twelve individually defined bits. A thirteenth
 	// right added without touching the literal is a right that `RIGHTS_ALL` silently does not grant.
-	const RIGHTS: &[(u32, &str)] = &[
-		(RIGHT_READ, "READ"),
-		(RIGHT_WRITE, "WRITE"),
-		(RIGHT_EXECUTE, "EXECUTE"),
-		(RIGHT_MAP, "MAP"),
-		(RIGHT_SEND, "SEND"),
-		(RIGHT_RECEIVE, "RECEIVE"),
-		(RIGHT_DUPLICATE, "DUPLICATE"),
-		(RIGHT_TRANSFER, "TRANSFER"),
-		(RIGHT_REVOKE, "REVOKE"),
-		(RIGHT_GET_INFO, "GET_INFO"),
-		(RIGHT_MANAGE, "MANAGE"),
-		(RIGHT_WAIT, "WAIT"),
+	const RIGHTS: &[(u32, &str)] = named_only![
+		RIGHT_READ,
+		RIGHT_WRITE,
+		RIGHT_EXECUTE,
+		RIGHT_MAP,
+		RIGHT_SEND,
+		RIGHT_RECEIVE,
+		RIGHT_DUPLICATE,
+		RIGHT_TRANSFER,
+		RIGHT_REVOKE,
+		RIGHT_GET_INFO,
+		RIGHT_MANAGE,
+		RIGHT_WAIT
 	];
 	let mut union = 0u32;
 	for &(bit, name) in RIGHTS {
@@ -247,10 +248,10 @@ fn every_right_is_one_bit_and_rights_all_is_their_union() {
 	// AND THE LIST IS EVERY RIGHT, which is the half that was asserted rather than checked. A
 	// thirteenth right added without touching this list would have left the union above correct over
 	// twelve bits and `RIGHTS_ALL` correct over thirteen, and nothing would have said so.
-	let mut declared: alloc::vec::Vec<u32> = declared_rights().into_iter().map(|(_, bit)| bit).collect();
-	declared.sort_unstable();
-	let mut snapshot: alloc::vec::Vec<u32> = RIGHTS.iter().map(|&(bit, _)| bit).collect();
-	snapshot.sort_unstable();
+	let mut declared = declared_names("RIGHT_");
+	declared.sort();
+	let mut snapshot: alloc::vec::Vec<alloc::string::String> = RIGHTS.iter().map(|&(_, name)| alloc::string::String::from(name)).collect();
+	snapshot.sort();
 	assert_eq!(declared, snapshot, "the crate declares {} `pub const RIGHT_*` and this list names {}; a right was added or removed without updating it", declared.len(), snapshot.len());
 }
 
@@ -258,7 +259,7 @@ fn every_right_is_one_bit_and_rights_all_is_their_union() {
 fn the_error_codes_are_what_they_were() {
 	// Negative, distinct, contiguous from -1, and never renumbered: a caller matching on -6 has to
 	// keep meaning INVALID.
-	const ERRORS: &[(i64, i64)] = &[
+	const ERRORS: &[(i64, i64, &str)] = named![
 		(ERR_BAD_SYSCALL, -1),
 		(ERR_NO_THREAD, -2),
 		(ERR_NO_MEMORY, -3),
@@ -273,17 +274,17 @@ fn the_error_codes_are_what_they_were() {
 		(ERR_ABI_MISMATCH, -12),
 		(ERR_UNSUPPORTED, -13),
 	];
-	for (index, &(code, expected)) in ERRORS.iter().enumerate() {
+	for (index, &(code, expected, _)) in ERRORS.iter().enumerate() {
 		assert_eq!(code, expected, "an error code moved");
 		assert_eq!(code, -(index as i64 + 1), "the error codes are no longer contiguous from -1");
 	}
 
 	// And the snapshot names every error the crate declares - the same completeness check the
 	// syscalls have and this family did not.
-	let mut declared: alloc::vec::Vec<i64> = declared_errors().into_iter().map(|(_, code)| code).collect();
-	declared.sort_unstable();
-	let mut snapshot: alloc::vec::Vec<i64> = ERRORS.iter().map(|&(code, _)| code).collect();
-	snapshot.sort_unstable();
+	let mut declared = declared_names("ERR_");
+	declared.sort();
+	let mut snapshot: alloc::vec::Vec<alloc::string::String> = ERRORS.iter().map(|&(_, _, name)| alloc::string::String::from(name)).collect();
+	snapshot.sort();
 	assert_eq!(declared, snapshot, "the crate declares {} `pub const ERR_*` and the snapshot names {}; an error was added or removed without updating it", declared.len(), snapshot.len());
 }
 
@@ -346,13 +347,23 @@ macro_rules! assert_layout {
 // Nine structs, nine layout assertions, and nothing that said the two numbers must match. This is
 // what makes the no-implicit-padding property above cover the CRATE rather than the nine structs
 // somebody listed.
+//
+// AND THE SPELLING IS A RULE, not a coincidence the parser happens to match. It compared against the
+// exact string `#[repr(C)]`, so `#[repr(C, align(8))]` or `#[repr(C, packed)]` would have been read
+// as no marker at all and the struct behind it would have left the covered set silently. Both
+// answers to that were defensible - accept every `#[repr(C..)]` form, or state that an ABI struct
+// carries exactly `#[repr(C)]` - and this is the second one, made explicit: a struct whose layout is
+// modified by `packed` or `align` has a different contract with userspace and must be a decision
+// somebody makes rather than a spelling this test skips. All nine structs in the crate satisfy it
+// today, so the rule costs nothing and closes the hole.
 fn declared_repr_c_structs() -> alloc::vec::Vec<alloc::string::String> {
 	const SOURCE: &str = include_str!("lib.rs");
 	let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 	let mut marked = false;
 	for line in SOURCE.lines() {
 		let line = line.trim();
-		if line == "#[repr(C)]" {
+		if line.starts_with("#[repr(") {
+			assert_eq!(line, "#[repr(C)]", "this crate's marshalled types carry exactly `#[repr(C)]`; `{line}` changes the layout userspace is compiled against and has to be a decision rather than a spelling this test does not recognise");
 			marked = true;
 			continue;
 		}

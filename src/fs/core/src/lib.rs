@@ -48,6 +48,19 @@ pub trait BlockDevice {
 		false
 	}
 
+	// How many blocks the backing holds, when it knows.
+	//
+	// `None` by default, because plenty of backings genuinely do not know - a stream, a window onto
+	// something larger - and a wrong answer is worse than no answer for the readers that use it.
+	//
+	// The reader that wanted it is UDF: the format puts an Anchor Volume Descriptor Pointer at LBA
+	// 256, at N-256 and at N, precisely so a damaged one is survivable on optical media - and with
+	// no way to ask for N, only the first of the three was reachable. That is redundancy the medium
+	// carries and the reader could not use.
+	fn block_count(&mut self) -> Option<u64> {
+		None
+	}
+
 	// Make every write issued so far durable (flush the device's volatile write cache)
 	// before any later write reaches the medium, so a commit protocol can bracket its
 	// publish with a barrier. A backing with no volatile cache (memory, a write-through
