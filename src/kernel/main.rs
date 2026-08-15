@@ -71,10 +71,58 @@ macro_rules! serial_println {
     () => {
         $crate::_print(core::format_args!("\n"))
     };
+    // ONE call, not two. Printing the line and then the newline separately hands another core a
+    // gap between them, and a log where the newlines belong to the wrong lines is the same defect
+    // as a garbled line. Nesting `format_args!` costs nothing: no intermediate string exists.
     ($($arg:tt)*) => {{
-        $crate::_print(core::format_args!($($arg)*));
-        $crate::_print(core::format_args!("\n"));
+        $crate::_print(core::format_args!("{}\n", core::format_args!($($arg)*)));
     }};
+}
+
+// Serializes a whole log LINE between cores, which is what "the corrupted serial output on
+// aarch64" turned out to be.
+//
+// `core::write!` calls `write_str` once per FORMATTING FRAGMENT, so `serial_println!("a={a} b={b}")`
+// reaches the port as five separate writes. Nothing stood between them, so two cores printing at
+// once produced a line belonging to neither - `caught_before=1837` where the counter was in single
+// digits, and `child=<mixed>100000001`. Those were read as memory corruption for four measured
+// cycles of this milestone; they are two cores' digits landing in one line, and nothing was wrong
+// with the values at all.
+//
+// It is worst on the device-tree targets because their consoles are polled and take NO lock -
+// aarch64's PL011 and riscv64's NS16550 mix at BYTE granularity - while x86_64 locks its TX ring
+// per slice and could only ever mix at a fragment boundary. That difference is exactly the shape of
+// the evidence: x86_64 never showed it, and both emulated targets did.
+//
+// Here rather than in each backend because the fragments are what has to be held together, and only
+// this side can see them.
+static PRINT: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+// How long a core waits for the print lock before writing anyway.
+//
+// A CONSOLE THAT CAN DEADLOCK IS WORSE THAN ONE THAT CAN INTERLEAVE, and this kernel has the
+// failure to prove it: a core that halts, panics or faults while holding this lock would silence
+// every other core forever, turning a diagnosable panic into the silent hang that has cost this
+// milestone the most. The same bound covers re-entry - a fault handler printing from inside a print
+// on this very core cannot be granted a lock this core already holds, and must not wait for it.
+// Past the bound the line goes out unserialized, which is the behaviour that existed before.
+const PRINT_SPINS: u32 = 200_000;
+
+// Take the print lock if it comes free within the bound, otherwise `None` and the caller prints
+// anyway. `try_lock` in a loop rather than `lock`, because `lock` cannot give up.
+fn print_lock() -> Option<crate::sync::SpinLockGuard<'static, ()>> {
+	for _ in 0..PRINT_SPINS {
+		// Test before test-and-set: `try_lock` masks and restores interrupts on every failed
+		// attempt, which is far too much to pay two hundred thousand times while another core
+		// finishes a line.
+		if !PRINT.is_locked() {
+			if let Some(guard) = PRINT.try_lock() {
+				return Some(guard);
+			}
+		}
+		core::hint::spin_loop();
+	}
+	None
 }
 
 // Write formatted output to the serial port (always) and mirror it to the
@@ -83,6 +131,7 @@ macro_rules! serial_println {
 #[doc(hidden)]
 pub fn _print(args: core::fmt::Arguments<'_>) {
 	use core::fmt::Write as _;
+	let _guard = print_lock();
 	let _ = core::write!(arch::serial::SerialWriter, "{}", args);
 	console::write_fmt(args);
 }
@@ -95,6 +144,9 @@ pub fn _print(args: core::fmt::Arguments<'_>) {
 // backlog knows where to resume instead of losing the tail.
 #[doc(hidden)]
 pub fn _print_bytes(bytes: &[u8]) -> usize {
+	// The same lock as `_print`, so a screenful pushed through SYS_DEBUG_WRITE does not land in the
+	// middle of a kernel log line - the two sinks are the same wire.
+	let _guard = print_lock();
 	let n = arch::serial::write_bytes(bytes);
 	console::write_bytes(&bytes[..n]);
 	n

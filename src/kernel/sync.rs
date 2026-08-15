@@ -75,6 +75,13 @@ impl<T> SpinLock<T> {
 		SpinLockGuard { lock: self, was_enabled, _not_send: PhantomData }
 	}
 
+	// Whether the lock LOOKED taken a moment ago. Only useful for spinning read-only before
+	// attempting an acquire: the answer is stale the instant it is returned, so nothing may
+	// conclude it holds the lock (or that it would get it) from a `false`.
+	pub fn is_locked(&self) -> bool {
+		self.locked.load(Ordering::Relaxed)
+	}
+
 	pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
 		let was_enabled = arch::interrupts_enabled();
 		arch::disable_interrupts();

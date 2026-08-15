@@ -21,7 +21,28 @@ use crate::arch;
 use crate::sync::SpinLock;
 
 // Per-thread kernel stack size.
-pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
+//
+// It was 16 KiB, and 16 KiB is what took the aarch64 suite down for four days. The deepest path
+// this kernel has - a ring-3 spawn, `SYS_PROCESS_LOAD` into the ELF loader and the mapper - ran off
+// the bottom of it in a debug build, and the guard page below caught the overflow exactly as it was
+// designed to. What happens NEXT is the part nobody had measured: aarch64's exception entry opens
+// with `sub sp, sp, #816` and `stp x0, x1, [sp]`, so the handler for a stack overflow cannot save
+// its own frame. It faults on that store, re-enters the same vector, subtracts another 816, faults
+// again - forever - walking the stack pointer down through the kernel window and writing a register
+// pair everywhere it happens to land on a mapped page. Measured in a wedged guest: all eight cores
+// at `__exception_vectors + 0x200`, `ESR_EL1 = 0x96000044` (a WRITE translation fault at level 0),
+// `FAR_EL1` equal to `SP` to the byte, and `ELR_EL1` on that `stp`. That runaway is what corrupted
+// the virtio queue register, and it is why the failure was silent: the loop never reaches a print.
+//
+// So the size is set from a MEASUREMENT rather than from a round number:
+// `kernel.object.thread.the_deepest_kernel_path_leaves_headroom_on_its_stack` reads the high-water
+// mark of the real spawn path and fails if it is within a quarter of the ceiling. Raise this and
+// the test says what the headroom bought; lower it and the test says so before a guest does.
+//
+// The overflow is still a fault rather than silent corruption - the guard page below every stack is
+// what makes it one - and making that fault SURVIVABLE is a separate piece of work, recorded in
+// P02M0133: a guard page whose fault cannot be reported is a guard that only changes the symptom.
+pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -153,6 +174,36 @@ impl KernelStack {
 		// which would be handing out a `&mut` from a shared borrow.
 		unsafe { core::ptr::write_bytes((base + crate::mem::frame::PAGE_SIZE) as *mut u8, 0, pages * crate::mem::frame::PAGE_SIZE as usize) };
 		Some(Self { base, pages })
+	}
+
+	// How deep anything has ever gone on this stack, MEASURED rather than tracked.
+	//
+	// `allocate` zeroes the whole range, so the lowest non-zero byte is the deepest point any call
+	// has reached: everything below it has never been written. That costs a scan when somebody asks
+	// and nothing at all on the hot path, which is what makes it usable as an assertion rather than
+	// as a debugging session - and this kernel needed an assertion, because the number that mattered
+	// (how much of a 16 KiB stack the spawn path actually used) was never once measured before the
+	// overflow took the machine down.
+	//
+	// A LOWER BOUND, deliberately: a frame that stored only zeroes leaves no trace, so the true
+	// figure can be higher. That is the right direction for the error to lean - it can say a stack
+	// is too small and cannot say a stack is safe.
+	pub fn used_bytes(&self) -> usize {
+		let start = self.base + crate::mem::frame::PAGE_SIZE;
+		let len = self.pages * crate::mem::frame::PAGE_SIZE as usize;
+		for offset in 0..len {
+			// SAFETY: mapped by `allocate`, owned by this stack for its whole life, and read one
+			// byte at a time as a plain integer - no reference into it is created.
+			if unsafe { core::ptr::read_volatile((start + offset as u64) as *const u8) } != 0 {
+				return len - offset;
+			}
+		}
+		0
+	}
+
+	// The usable bytes above the guard page.
+	pub fn capacity(&self) -> usize {
+		self.pages * crate::mem::frame::PAGE_SIZE as usize
 	}
 
 	// The stack bytes, above the guard page. `&mut self` because this hands out the only
@@ -293,6 +344,17 @@ impl Thread {
 	// pointer means "this context is complete and may be resumed" - so a store that could
 	// be seen before the register frame it describes would hand another core a half-written
 	// thread. Any change to either side has to move the other with it.
+	// The high-water mark of this thread's kernel stack, and what it had to spend. Read from
+	// outside the thread (the spawner keeps an `Arc`), so the measurement does not itself deepen
+	// the stack it is measuring.
+	pub fn kstack_used(&self) -> usize {
+		self.stack.used_bytes()
+	}
+
+	pub fn kstack_capacity(&self) -> usize {
+		self.stack.capacity()
+	}
+
 	pub fn kstack_ptr_addr(&self) -> *mut u64 {
 		self.kstack_ptr.as_ptr()
 	}
