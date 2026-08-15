@@ -78,6 +78,30 @@ fn the_deepest_kernel_path_leaves_headroom_on_its_stack() {
 	// CHEAPER is an assertion that gets deleted. The printed figure above is the record; whoever
 	// wants the stack back has the number to argue from.
 
+	// AND THE IDLE STACKS, which are the ones that actually overflowed.
+	//
+	// A thread's kernel stack has a guard page below it; the secondary cores' idle stacks are slices
+	// of one static array, so a core that runs off the bottom of its slice writes into the previous
+	// core's - mapped memory, no fault, and the damage surfaces later as that core resuming with a
+	// stack pointer and a return address it never saved. That is what took this milestone four days,
+	// and the size involved had never been measured either.
+	//
+	// The array is in `.bss` and therefore zeroed before any core runs, so the same high-water
+	// technique applies. Reported for every core rather than asserted on: how deep the idle path
+	// goes depends on how much reaping has happened by the time the suite reaches this test, so a
+	// threshold here would be a threshold on test ORDER. The number is the point.
+	#[cfg(target_arch = "aarch64")]
+	{
+		let capacity = crate::arch::psci::secondary_stack_capacity();
+		let mut deepest = 0;
+		for cpu in 1..crate::smp::cpu_count() {
+			let used = crate::arch::psci::secondary_stack_used(cpu);
+			deepest = deepest.max(used);
+			crate::serial_println!("secondary idle stack high-water: cpu {cpu} used {used} of {capacity} bytes ({}%)", used * 100 / capacity);
+		}
+		assert!(deepest * 4 <= capacity * 3, "a secondary core's idle stack reached {deepest} of {capacity} bytes, leaving less than a quarter spare - and there is NO GUARD PAGE below it, so the next overflow silently rewrites the neighbouring core's saved state");
+	}
+
 	crate::arch::paging::unmap_page(AT);
 	crate::arch::paging::unmap_page(AT + PAGE_SIZE);
 	unsafe {

@@ -1048,6 +1048,7 @@ fn reschedule(disp: Disposition) {
 			guard.current = Some(next);
 			drop(guard);
 			arch::percpu::set_stack_bounds(new_stack.0, new_stack.1);
+			check_switch_target("THREAD", new_sp);
 			arch::percpu::set_kernel_rsp(new_syscall_rsp);
 			// Point TSS.RSP0 at the same parked position, so a ring-3 interrupt taken
 			// while this thread runs lands on its own kernel stack (a zero value - a
@@ -1081,6 +1082,7 @@ fn reschedule(disp: Disposition) {
 					// so the exception entry's stack check is told it does not know, rather than
 					// left judging against the bounds of a thread that has just exited.
 					arch::percpu::use_idle_stack();
+					check_switch_target("IDLE", new_sp);
 					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 					unsafe { arch::context::switch_context(old_sp, new_sp) };
 				}
@@ -1104,6 +1106,7 @@ fn reschedule(disp: Disposition) {
 					// Same as the retire path: the idle stack is not a thread's, so the check is
 					// disabled rather than aimed at the blocked thread's stack.
 					arch::percpu::use_idle_stack();
+					check_switch_target("IDLE", new_sp);
 					switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
 					unsafe { arch::context::switch_context(old_sp, new_sp) };
 					// Woken and resumed: restore the interrupt state we blocked with.
@@ -1112,6 +1115,24 @@ fn reschedule(disp: Disposition) {
 			},
 		},
 	}
+}
+
+// The stack pointer this core is about to switch ONTO, checked against the stack it is supposed to
+// be on before the switch makes it the live one.
+//
+// One step earlier than the exception vectors, and that is the whole point. The vectors catch a bad
+// `SP` when the next trap arrives, by which time the only thing left to say is that it is bad; this
+// catches the moment a saved pointer is USED, which names the slot it came out of. Both are cheap
+// and neither replaces the other.
+//
+// `(0, 0)` bounds mean the port records none, so there is nothing to check and the call costs a
+// load and a branch.
+fn check_switch_target(what: &str, new_sp: u64) {
+	let (floor, span) = arch::percpu::stack_bounds();
+	if span == 0 || new_sp.wrapping_sub(floor) <= span {
+		return;
+	}
+	crate::serial_println!("sched: {what} STACK POINTER {new_sp:#x} IS NOT ON THE STACK IT BELONGS TO ({floor:#x}..={:#x}) - it was overwritten while parked, and switching onto it is what turns that into an unrecoverable trap", floor + span);
 }
 
 // Restore the interrupt flag captured at the start of a reschedule. Called after

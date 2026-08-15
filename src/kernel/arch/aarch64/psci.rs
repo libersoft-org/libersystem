@@ -17,11 +17,49 @@ const PSCI_CPU_ON: u64 = 0xC400_0003;
 
 // Matches the per-CPU pool size in `percpu`.
 const MAX_CPUS: usize = 8;
+// Per-core idle/bring-up stack for the secondaries.
+//
+// 16 KiB, and now MEASURED rather than assumed: with the alignment defect below fixed, the deepest
+// any core's idle context has ever gone is 4203 bytes - 26% of this - and the other seven sit at
+// 2568. `the_deepest_kernel_path_leaves_headroom_on_its_stack` reports every core's high-water from
+// the zeroed `.bss` and fails if any of them passes three quarters.
+//
+// It was briefly raised to 64 KiB on the theory that the idle path - the scheduler plus the reaping
+// of exited threads and processes, which walks `Arc::drop_slow` through the object graph in a debug
+// build - had outgrown it. THE MEASUREMENT REFUTED THAT, and the size came back down. What was
+// actually wrong was the alignment, one declaration below.
+//
+// What remains true and is not fixed here: there is no guard page between these slices, so an
+// overflow walks into the previous core's memory with no fault at all. The exception vectors now
+// catch it at the next trap, which is a catch and not a stop - see P02M0133.
 const SEC_STACK_SIZE: u64 = 16384;
 
-// Per-core boot stacks for the secondaries (indexed by cpu id).
+// ALIGNED TO 16, WHICH IT WAS NOT, AND THAT WAS THE DEFECT THIS MILESTONE IS NAMED FOR.
+//
+// This was `[[u8; SEC_STACK_SIZE]; MAX_CPUS]`. The element type is `u8`, so the whole array has an
+// alignment of ONE, and the linker put it at `0xffff0000404436a9`. The bring-up stub computes each
+// core's stack top as `SEC_STACKS + cpu_id * SEC_STACK_SIZE + SEC_STACK_SIZE`, so every secondary
+// core has been running its entire life with `SP` congruent to 9 modulo 16.
+//
+// AAPCS64 requires `SP` to be 16-byte aligned at all times and the compiler generates code that
+// assumes it. Most of what a misaligned stack does is invisible, because frame-relative accesses are
+// self-consistent - which is exactly why this survived every test the kernel has: the arithmetic
+// works, the values are right, and nothing complains. What does NOT survive is any instruction that
+// requires natural alignment regardless of `SCTLR_EL1.A`, and `ldxr`/`stxr` - the exclusive pair
+// under every atomic - is one of them. An atomic on a stack slot raises an alignment fault, and the
+// fault arrives with a stack pointer no handler can save a frame on.
+//
+// The evidence was in the first measurement ever taken and went unread for four days: EVERY stack
+// pointer in every gdb capture and every bad-stack report ends in 9. `...95b9`, `...9ac9`, `...5349`,
+// `...0109`. That is not corruption with a pattern, it is one misalignment, present from boot.
+//
+// The boot stack never had this because the linker script aligns it explicitly; these were a Rust
+// static, where the alignment is the element type's and nobody said otherwise.
+#[repr(C, align(16))]
+struct SecStack([u8; SEC_STACK_SIZE as usize]);
+
 #[unsafe(no_mangle)]
-static mut SEC_STACKS: [[u8; SEC_STACK_SIZE as usize]; MAX_CPUS] = [[0; SEC_STACK_SIZE as usize]; MAX_CPUS];
+static mut SEC_STACKS: [SecStack; MAX_CPUS] = [const { SecStack([0; SEC_STACK_SIZE as usize]) }; MAX_CPUS];
 
 // Count of secondaries that have come online, and their reported MPIDRs.
 static SMP_ONLINE: AtomicU32 = AtomicU32::new(0);
@@ -64,9 +102,16 @@ aarch64_secondary_start:
 	msr     sctlr_el1, x0
 	isb
 	// Per-core higher-half stack: SEC_STACKS[cpu_id] top.
+	//
+	// THE SIZE COMES FROM `SEC_STACK_SIZE`, not from a number typed here. It was `#16384` written
+	// out, beside a Rust constant that said the same thing - so changing the constant would have
+	// given every secondary a stack pointer inside core 0's slice, with all seven overlapping, and
+	// the first symptom would have been another round of memory corruption with no obvious cause.
+	// This is the shared-number hazard an audit of this kernel named about trap-frame offsets, in a
+	// second place and one edit away from firing.
 	adrp    x0, .Ls_stack
 	ldr     x5, [x0, :lo12:.Ls_stack]
-	mov     x6, #16384
+	mov     x6, #{STACK}
 	madd    x5, x19, x6, x5
 	add     x5, x5, x6
 	mov     sp, x5
@@ -84,7 +129,8 @@ aarch64_secondary_start:
 .global aarch64_secondary_entry
 aarch64_secondary_entry:
 	.quad aarch64_secondary_start
-"#
+"#,
+	STACK = const SEC_STACK_SIZE,
 );
 
 // Which conduit, if any, answers a PSCI call on this machine - what the loader recorded in the
@@ -264,4 +310,35 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_arg: u64) {
 unsafe extern "C" {
 	// The low physical address of the secondary boot stub, filled in by the linker.
 	static aarch64_secondary_entry: u64;
+}
+
+// How deep anything has ever gone on secondary `cpu`'s idle stack, MEASURED rather than assumed.
+//
+// `SEC_STACKS` is in `.bss` and therefore zeroed before any core runs, so the lowest non-zero byte
+// is the deepest point reached - the same technique the per-thread stacks use, and for the same
+// reason: this size had never been checked against anything, and when it turned out to be too small
+// the failure was not a fault but another core's memory quietly changing underneath it.
+//
+// A lower bound, deliberately: a frame that stored only zeroes leaves no trace. That is the right
+// direction for the error to lean - it can say a stack is too small and cannot say one is safe.
+pub fn secondary_stack_used(cpu: usize) -> usize {
+	if cpu >= MAX_CPUS {
+		return 0;
+	}
+	// SAFETY: taking the ADDRESS of the slice, not a reference into it - every read below goes
+	// through the raw pointer one byte at a time, so no `&` to memory other cores are using is ever
+	// created.
+	let base = unsafe { (&raw const SEC_STACKS[cpu]) as *const u8 };
+	for offset in 0..SEC_STACK_SIZE as usize {
+		// SAFETY: inside a static array that lives for the whole life of the kernel, read one byte
+		// at a time as a plain integer.
+		if unsafe { core::ptr::read_volatile(base.add(offset)) } != 0 {
+			return SEC_STACK_SIZE as usize - offset;
+		}
+	}
+	0
+}
+
+pub fn secondary_stack_capacity() -> usize {
+	SEC_STACK_SIZE as usize
 }

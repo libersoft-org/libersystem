@@ -23,7 +23,7 @@ mod boot;
 mod dtb;
 mod exceptions;
 mod gic;
-mod psci;
+pub mod psci;
 pub mod serial;
 pub mod usercopy;
 mod virtio_blk;
@@ -400,6 +400,34 @@ pub mod usermode {
 	// current thread's parked resume pointer.
 	pub fn exit_to_kernel() -> ! {
 		let resume = crate::sched::current_thread().map_or(0, |thread| thread.syscall_rsp_load());
+		// ZERO IS NOT A STACK POINTER, and this handed it to one.
+		//
+		// `aarch64_exit_el0` opens with `mov sp, x0` and immediately `ldp x19, x20, [sp, #0]`, so a
+		// `resume` of zero sets `SP` to zero and reads from address zero - a trap taken with an
+		// unusable `SP`, which is the class of failure this milestone exists for and the one shape
+		// of it that needs no corruption at all to reach. `map_or(0, ..)` produces it twice over: no
+		// current thread, and a thread whose `syscall_rsp` is still the zero it was built with
+		// because it never entered EL0.
+		//
+		// Halting here says which of those happened, at the instruction that caused it, instead of
+		// leaving the exception entry to discover it one fault later with nothing left to name.
+		if resume == 0 {
+			panic!("aarch64: exit_to_kernel with no parked EL0 resume stack ({}), so there is nothing to return to", if crate::sched::current_thread().is_some() { "the running thread never entered EL0" } else { "no thread is current on this core" });
+		}
+		// AND IT HAS TO BE ON THIS THREAD'S OWN STACK, which refusing zero does not establish.
+		//
+		// `mov sp, x0` here is one of only four instructions in this port that can put a value into
+		// `SP` from a register, and it is the ONLY one that takes it from memory a thread owns. The
+		// wedge this milestone is chasing ends with `SP` inside the kernel image, which cannot come
+		// from arithmetic on a good stack pointer - so either it came through one of those four, or
+		// the value was already wrong. Three of the four are now checked and silent; this closes the
+		// fourth, and a silence here is as informative as a report.
+		if let Some(thread) = crate::sched::current_thread() {
+			let (base, len) = thread.kstack_region();
+			if resume < base || resume > base + len as u64 {
+				panic!("aarch64: exit_to_kernel would return onto {resume:#x}, which is not on this thread's kernel stack {base:#x}..={:#x} - the parked EL0 resume pointer was overwritten", base + len as u64);
+			}
+		}
 		unsafe { aarch64_exit_el0(resume) }
 	}
 

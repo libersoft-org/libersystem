@@ -164,3 +164,9 @@ pub fn set_stack_bounds(_base: u64, _len: usize) {}
 pub fn record_idle_stack(_base: u64, _len: usize) {}
 
 pub fn use_idle_stack() {}
+
+// No bounds are recorded here, so nothing can be checked against them. `(0, 0)` is the agreed
+// "not known" answer every caller already handles by skipping the check.
+pub fn stack_bounds() -> (u64, u64) {
+	(0, 0)
+}

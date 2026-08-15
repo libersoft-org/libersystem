@@ -56,6 +56,14 @@ pub struct PerCpu {
 	// stack nothing bounded.
 	idle_floor: u64,
 	idle_span: u64,
+	// How many exceptions this core took on a context with no recorded bounds.
+	//
+	// IN THE PER-CPU BLOCK BECAUSE `.data` IS DOWNHILL. The first version of this counter was a
+	// `.data` word, and the runaway it exists to explain walks down from the secondary stacks in
+	// `.bss` straight through `.data` and `.rodata` - so it overwrote the counter, which printed a
+	// pointer-shaped value instead of a small number. That is the reading that proved the runaway's
+	// path, and it is also the reason nothing this diagnostic depends on may live below the stacks.
+	unchecked: u64,
 }
 
 // The offsets the exception vectors index this block by. Exported as constants and fed to the
@@ -65,6 +73,7 @@ pub struct PerCpu {
 pub(crate) const OFF_SCRATCH: usize = core::mem::offset_of!(PerCpu, scratch);
 pub(crate) const OFF_STACK_FLOOR: usize = core::mem::offset_of!(PerCpu, stack_floor);
 pub(crate) const OFF_TRAP_STACK: usize = core::mem::offset_of!(PerCpu, trap_stack);
+pub(crate) const OFF_UNCHECKED: usize = core::mem::offset_of!(PerCpu, unchecked);
 // `ldp`/`stp` read the two halves of the range in one instruction, which only works while they are
 // adjacent and in this order.
 const _: () = assert!(core::mem::offset_of!(PerCpu, stack_span) == OFF_STACK_FLOOR + 8, "the vector loads the floor and the span with one `ldp`");
@@ -93,7 +102,7 @@ static TRAP_STACKS: TrapStacks = TrapStacks([const { UnsafeCell::new(TrapStack([
 
 impl PerCpu {
 	const fn empty() -> Self {
-		Self { cpu_id: 0, lapic_id: 0, kernel_sp: 0, entry_sp_slot: 0, from_user: 0, scratch: [0; 2], stack_floor: 0, stack_span: 0, trap_stack: 0, idle_floor: 0, idle_span: 0 }
+		Self { cpu_id: 0, lapic_id: 0, kernel_sp: 0, entry_sp_slot: 0, from_user: 0, scratch: [0; 2], stack_floor: 0, stack_span: 0, trap_stack: 0, idle_floor: 0, idle_span: 0, unchecked: 0 }
 	}
 
 	pub fn cpu_id(&self) -> u32 {
@@ -249,6 +258,11 @@ pub fn use_idle_stack() {
 		(*cpu).stack_floor = (*cpu).idle_floor;
 		(*cpu).stack_span = (*cpu).idle_span;
 	}
+}
+
+// How many exceptions this core took with no bounds to check against.
+pub fn unchecked_traps() -> u64 {
+	unsafe { (*this_cpu_mut()).unchecked }
 }
 
 // What this core last recorded, for the bad-stack report to say what it was compared against.

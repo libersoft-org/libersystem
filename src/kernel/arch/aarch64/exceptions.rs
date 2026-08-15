@@ -70,11 +70,22 @@ __exception_vectors:
 	cbz     x0, 8f                     // per-CPU block not up yet: nothing to check against
 	stp     x1, x2, [x0, #{PC_SCRATCH}]
 	ldp     x1, x2, [x0, #{PC_FLOOR}]  // x1 = lowest SP a frame fits under, x2 = how far above it
-	cbz     x2, 9f                     // no bounds recorded for this context
+	cbz     x2, 7f                     // no bounds recorded for this context - counted at 7:
 	mov     x0, sp
 	sub     x0, x0, x1
 	cmp     x0, x2
+	mov     x4, #\id                   // which slot this is, for the report; harmless otherwise
 	b.hi    __trap_bad_stack           // SP is not on the stack this thread was given
+	b       9f
+7:
+	// UNCHECKED, AND COUNTED. An exception taken on a context with no recorded bounds is exactly
+	// where the runaway must have started - it is caught hundreds of frames later, on a core whose
+	// bounds ARE set, which can only happen if it began somewhere they were not. A bare skip made
+	// that invisible; a counter makes "how often does this happen, and to whom" a number the report
+	// prints instead of a hypothesis.
+	ldr     x1, [x0, #{PC_UNCHECKED}]
+	add     x1, x1, #1
+	str     x1, [x0, #{PC_UNCHECKED}]
 9:
 	mrs     x0, tpidr_el1
 	ldp     x1, x2, [x0, #{PC_SCRATCH}]
@@ -162,6 +173,10 @@ __trap_bad_stack:
 	mrs     x1, esr_el1
 	mrs     x2, far_el1
 	mrs     x3, elr_el1
+	// x4 already holds the vector index; SPSR says which level and which stack the exception came
+	// from, which is what separates "the stack is bad" from "the check is looking at the wrong
+	// stack pointer".
+	mrs     x5, spsr_el1
 	bl      aarch64_bad_stack
 6:
 	wfi
@@ -219,6 +234,7 @@ __trap_return:
 	PC_SCRATCH = const super::percpu::OFF_SCRATCH,
 	PC_FLOOR = const super::percpu::OFF_STACK_FLOOR,
 	PC_TRAP_STACK = const super::percpu::OFF_TRAP_STACK,
+	PC_UNCHECKED = const super::percpu::OFF_UNCHECKED,
 	FRAME = const TRAP_FRAME_BYTES,
 );
 
@@ -293,40 +309,104 @@ pub fn init_vectors() {
 // refused. It halts rather than returning: `SP` is unusable, so there is no frame to `eret` from,
 // and continuing would mean guessing which of the two - the pointer or the bounds - is the wrong
 // one.
+// NO `core::fmt` ANYWHERE ON THIS PATH, and that is the second thing this reporter had to learn.
+//
+// It was written with `writeln!` at a polled UART, which looked safe: no lock, no allocation, one
+// short line. It printed NOTHING - seven cores reached the halt loop below with not a byte on the
+// wire - because `core::fmt` unoptimised is many nested frames deep for a single formatted line, so
+// the formatting ran off the reporting stack. That is silent rather than a fault (the stacks are a
+// plain array, so the neighbour's slice is mapped memory), and the re-entry counted itself as
+// another report, which is exactly the state a debugger found.
+//
+// A fixed string and a hand-written hex digit need one small buffer and no call depth at all. The
+// report is uglier to read and it arrives, which is the entire trade.
+fn wire_str(text: &str) {
+	super::serial::write_bytes(text.as_bytes());
+}
+
+fn wire_hex(value: u64) {
+	let mut out = [0u8; 18];
+	out[0] = b'0';
+	out[1] = b'x';
+	for index in 0..16 {
+		let nibble = ((value >> (60 - index * 4)) & 0xf) as u8;
+		out[2 + index] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+	}
+	super::serial::write_bytes(&out);
+}
+
 #[unsafe(no_mangle)]
-extern "C" fn aarch64_bad_stack(sp: u64, esr: u64, far: u64, elr: u64) -> ! {
-	use core::fmt::Write as _;
+extern "C" fn aarch64_bad_stack(sp: u64, esr: u64, far: u64, elr: u64, vector: u64, spsr: u64) -> ! {
 	use core::sync::atomic::{AtomicU32, Ordering};
 
-	// STRAIGHT AT THE WIRE, deliberately bypassing `serial_println!`.
+	// STRAIGHT AT THE WIRE, deliberately bypassing `serial_println!`. `_print` takes a lock to keep
+	// two cores' lines from interleaving, and this is the one place in the kernel where that trade
+	// is backwards: the machine is already broken, the other cores are usually broken in the same
+	// instant, and a report that waits for a lock is a report that does not arrive. The first
+	// version used the macro and the guest wedged INSIDE the reporter, with cores spinning on the
+	// print lock - the failure this whole mechanism exists to end, reproduced one level up.
 	//
-	// `_print` takes a lock to keep two cores' lines from interleaving, and this is the one place
-	// in the kernel where that trade is backwards: the machine is already broken, the other cores
-	// are usually broken in the same instant, and a report that waits for a lock is a report that
-	// does not arrive. The first version of this did use the macro and the guest wedged INSIDE the
-	// reporter, with several cores spinning on the print lock and the diagnosis never reaching the
-	// serial log - the failure this whole mechanism exists to end, reproduced one level up.
-	//
-	// The PL011 path is polled and lock-free, so this can only ever be slow, never stuck. Two
-	// reports may interleave; two interleaved reports are readable and a missing one is not.
-	let mut wire = super::serial::SerialWriter;
-
-	// ONLY THE FIRST FEW SPEAK. Whatever corrupts one core's stack usually takes its neighbours
-	// with it, and eight cores writing the same four lines byte by byte through a polled UART turns
-	// the answer into a wall. The first report is the one that matters; the second is worth having
-	// to see whether the second core failed the same way.
+	// THE SYNDROME FIRST, before anything that could fail. `this_cpu()` dereferences `TPIDR_EL1`
+	// and the bounds come out of the per-CPU block, and if what corrupted this core's stack pointer
+	// also reached those, then asking for them is how the report dies before it says anything. So
+	// the four values that came from the CPU's own registers go out first, and everything derived
+	// comes after.
+	// ONE CORE SPEAKS. Whatever corrupts one core's state usually takes its neighbours with it
+	// within microseconds, and this path has no lock by design - so letting three cores report
+	// produced three reports interleaved at byte granularity, which is the defect this milestone is
+	// named for, reproduced by its own diagnostic. The first report is the informative one; a second
+	// core's would say the same thing about a different slice, and a garbled pair says nothing.
 	static REPORTS: AtomicU32 = AtomicU32::new(0);
-	if REPORTS.fetch_add(1, Ordering::AcqRel) < 2 {
-		let cpu = super::percpu::this_cpu().cpu_id();
+	if REPORTS.fetch_add(1, Ordering::AcqRel) == 0 {
+		wire_str("\naarch64: BAD KERNEL STACK sp=");
+		wire_hex(sp);
+		wire_str(" esr=");
+		wire_hex(esr);
+		wire_str(" far=");
+		wire_hex(far);
+		wire_str(" elr=");
+		wire_hex(elr);
+		wire_str("\naarch64:   this core was told its stack is ");
 		let (floor, span) = super::percpu::stack_bounds();
-		let _ = writeln!(wire, "\naarch64: BAD KERNEL STACK on cpu {cpu} - a trap arrived with sp {sp:#x}, and this core's stack holds {floor:#x}..={:#x}", floor + span);
-		let _ = writeln!(wire, "aarch64:   ESR={esr:#x} (EC={:#x}) FAR={far:#x} ELR={elr:#x}", (esr >> 26) & 0x3f);
-		if sp < floor {
-			let _ = writeln!(wire, "aarch64:   {} bytes BELOW the floor, which already allows a {TRAP_FRAME_BYTES}-byte frame: this is a stack overflow", floor - sp);
+		wire_hex(floor);
+		wire_str("..=");
+		wire_hex(floor + span);
+
+		// BELOW THE FLOOR IS NOT THE SAME AS HAVING GROWN THERE, and the first version of this line
+		// said it was - "sp is BELOW it, so this is a stack overflow" - which the very first real
+		// report contradicted: three cores with stack pointers hundreds of kilobytes below their
+		// floors and NOT 16-byte aligned. A stack pointer that got where it is by making calls moves
+		// in 16-byte steps and stays inside its own allocation; one that is misaligned was WRITTEN.
+		// The alignment is the evidence, so the report states it instead of concluding from
+		// direction alone.
+		wire_str(if sp < floor { " - sp is BELOW it by " } else { " - sp is ABOVE it by " });
+		wire_hex(if sp < floor { floor - sp } else { sp - (floor + span) });
+		if sp & 0xf != 0 {
+			wire_str(" and is NOT 16-byte aligned, so it was written rather than grown\n");
 		} else {
-			let _ = writeln!(wire, "aarch64:   {} bytes ABOVE the top: this pointer did not come from growing a stack, so something WROTE it", sp - (floor + span));
+			wire_str(" and is 16-byte aligned, which is consistent with having grown there\n");
 		}
-		let _ = writeln!(wire, "aarch64: halting this core - a trap frame cannot be saved, and a fault while saving one has no bottom");
+		// AND HOW MANY TRAPS WENT UNCHECKED, which is the number that says whether this was caught
+		// where it started. A runaway found hundreds of frames deep on a core with bounds must have
+		// begun on one without them; a zero here refutes that outright.
+		// THE SLOT AND THE LEVEL, which decide whether this report is about a bad stack at all.
+		// Slots 0-3 are "Current EL with SP0", where `SP` means SP_EL0 - the USER stack pointer on
+		// this kernel - so a report from one of those is the check being pointed at the wrong
+		// register rather than a corrupted kernel stack. Slots 4-7 are the kernel's own SPx.
+		wire_str("aarch64:   vector slot ");
+		wire_hex(vector);
+		wire_str(" spsr=");
+		wire_hex(spsr);
+		wire_str(if vector < 4 {
+			" (Current EL with SP0 - SP here is SP_EL0, NOT a kernel stack)\n"
+		} else if vector < 8 {
+			" (Current EL with SPx - the kernel's own stack)\n"
+		} else {
+			" (a lower EL - SP is the kernel stack the entry switched to)\n"
+		});
+		wire_str("aarch64:   exceptions taken with no recorded stack bounds so far: ");
+		wire_hex(super::percpu::unchecked_traps());
+		wire_str("\naarch64:   halting this core; a trap frame cannot be saved, and a fault while saving one has no bottom\n");
 	}
 	loop {
 		unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
