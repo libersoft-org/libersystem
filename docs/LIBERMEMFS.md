@@ -154,10 +154,19 @@ One thing the capped policy does NOT do is give memory back to the system. The u
 grows by mapping a region and never unmaps one, so freeing a file returns its bytes to the storage
 service's own free list - reusable by that process, including by the other volumes it serves - but
 the Domain stays charged at the high-water mark. A capped volume that has once been full costs the
-system what its files still hold, permanently - and because a file keeps the allocation it grew
-to, a grow-and-shrink cycle across several files can leave it holding multiples of what it
-stores. The capacity check counts what is held rather than what is stored, so the volume refuses
-rather than exceeding itself, but the memory is not returned until the files are removed.
+system what its files still hold, permanently - and because an ordinary write keeps the allocation
+a file grew to, a grow-and-shrink cycle across several files can leave it holding multiples of what
+it stores. The capacity check counts what is held rather than what is stored, so the volume refuses
+rather than exceeding itself.
+
+`truncate()` is the exception, and this paragraph used to say there was none. A shrink through it
+COMPACTS: the file is cut to length and the buffer is rebuilt at the smaller size, so the quota
+comes back to the volume without the file being removed. It does so fallibly - the smaller
+allocation is taken with `try_reserve_exact`, adopted only if it is genuinely smaller than what the
+file already had, and a shrink that cannot allocate leaves the buffer where it is. The file is the
+right length either way; the volume is holding more than it needs, which is a cost rather than a
+defect, and the accounting reports the truth in both cases. What is still true is the rest of the
+sentence: an ordinary rewrite reuses the buffer and gives nothing back.
 
 So the capped policy's advantage is that it never takes what it never needs, not that it returns
 what it took, and that distinction matters when sizing one: a `vol://tmp` that briefly peaks is a
@@ -207,8 +216,15 @@ being done.
 
 A path is a byte string of `/`-separated segments and must be UTF-8.
 
-- Leading, trailing and repeated separators are ignored: `/a/b/`, `a//b` and `a/b` name the same
-  file. Callers in this tree produce all three.
+- A leading or trailing separator is ignored: `/a/b/` and `a/b` name the same file. Callers in this
+  tree produce both.
+- A separator in the MIDDLE is a missing name, and `a//b` is `BadName`. This document used to say
+  all three spellings named the same file, "which is what every caller in this tree expects" - and
+  the sentence claiming consensus was the wrong half: `fscore::validate_name_segment` answers
+  `BadName` for an empty segment, so LiberFS refused `a//b` while LiberMemFS accepted it, on a
+  service that mounts both. One path meaning two things depending on which backend is underneath is
+  the ambiguity worth removing; leading and trailing separators are tolerated by decision, because
+  matching LiberFS there would change what every existing `vol://` path means.
 - `.` and `..` are REFUSED, not resolved. This filesystem has no working directory and no
   outside, and accepting `..` would be the one way to name something beyond the volume.
 - A name that is not UTF-8 is refused rather than stored under a mangled key.

@@ -3102,11 +3102,42 @@ impl StorageHarness {
 			fs.write_file(name, bytes).expect("fixture file");
 		}
 
-		// Prove the fixture mounts before handing it over. A volume that formats but does not
-		// mount surfaces as "the service found no filesystem", which points at the service rather
-		// than at the fixture that produced it.
+		// Prove the fixture mounts WRITABLE before handing it over.
+		//
+		// This asserted `mount(..).is_ok()`, and `is_ok()` is not the property the fixture needs:
+		// `LiberFs::mount` answers `Ok` for a volume it has degraded to READ-ONLY because
+		// `derive_free` found damage. So a format that produced damaged metadata handed back a
+		// perfectly good-looking fixture, which is then CACHED in a static and cloned into every
+		// later storage harness - one bad format poisoning every storage test in the suite.
+		//
+		// What that cost: on aarch64 the suite ran forty-eight tests past this point and then took
+		// an unhandled data abort inside `imgconv`, reading an `&[u8; 8]` at address five. The
+		// fault was four levels of consequence away from the cause, and the only clue was a line
+		// StorageService printed about a read-only mount. A fixture that cannot be trusted has to
+		// say so at the moment it is built, not leave the next forty tests to discover it.
+		//
+		// And it says WHICH KIND, because the categories drive completely different investigations:
+		// a checksum failure is the medium, an I/O failure is the device, and a structural failure
+		// is this code writing metadata that cannot be true - which is the only one of the three a
+		// deterministic in-memory disk can produce.
 		let mut disk = fs.into_device();
-		assert!(liberfs::LiberFs::mount(FixtureDisk { sectors: disk.sectors.clone() }).is_ok(), "the fixture volume does not mount");
+		let mut check = liberfs::LiberFs::mount(FixtureDisk { sectors: disk.sectors.clone() }).expect("the fixture volume does not mount");
+		if check.is_read_only() {
+			let report = check.fsck();
+			match report {
+				Ok(report) => {
+					crate::serial_println!("fixture: LiberFS refuses to mount its own format writable - checksum {} io {} structural {} stream {}", report.checksum_failures, report.io_failures, report.structural_failures, report.stream_failures);
+					for fault in report.faults.iter().take(8) {
+						crate::serial_println!("fixture:   {}", core::str::from_utf8(fault).unwrap_or("<not utf-8>"));
+					}
+					for path in report.damaged.iter().take(8) {
+						crate::serial_println!("fixture:   damaged: {}", core::str::from_utf8(path).unwrap_or("<not utf-8>"));
+					}
+				}
+				Err(e) => crate::serial_println!("fixture: LiberFS refuses to mount its own format writable, and fsck could not run either: {e:?}"),
+			}
+			panic!("the fixture volume mounts READ-ONLY, so every storage test built on it is running against damaged metadata");
+		}
 		core::mem::take(&mut disk.sectors)
 	}
 

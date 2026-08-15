@@ -54,10 +54,13 @@ impl Severity {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Severity> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Severity> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Severity::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -114,10 +117,13 @@ impl Field {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Field> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Field> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Field::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -173,10 +179,13 @@ impl Entry {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Entry> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Entry> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Entry::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -251,10 +260,13 @@ impl Query {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Query> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Query> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Query::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

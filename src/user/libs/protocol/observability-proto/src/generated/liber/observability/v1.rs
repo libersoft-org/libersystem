@@ -52,10 +52,13 @@ impl ComponentType {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<ComponentType> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ComponentType> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = ComponentType::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -116,10 +119,13 @@ impl ComponentState {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<ComponentState> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ComponentState> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = ComponentState::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -186,10 +192,13 @@ impl Counters {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Counters> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Counters> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Counters::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -258,10 +267,13 @@ impl Component {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Component> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Component> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Component::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -337,10 +349,13 @@ impl TraceSpan {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<TraceSpan> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<TraceSpan> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = TraceSpan::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -395,10 +410,13 @@ impl Graph {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Graph> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Graph> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Graph::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -645,10 +663,13 @@ impl SupervisorStat {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<SupervisorStat> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SupervisorStat> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = SupervisorStat::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

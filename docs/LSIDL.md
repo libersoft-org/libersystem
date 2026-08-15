@@ -362,6 +362,29 @@ Flow control is the bounded channel itself: when the channel is full the produce
 matches LiberSystem's existing wait-drained channel semantics rather than an async
 runtime.
 
+**The error arm of a guarded stream open carries no capability.** `result<stream<T>, E>`
+is the shape that lets a stream open be refused with a reason, and `E` is required to
+carry **exactly zero** capabilities. A schema whose `E` carries one is refused at
+generation, naming the arm.
+
+The reason is the reply the generator can write. A stream open's Ok arm answers with the
+consumer end of the sub-channel, so the reply's out-of-band list is already spoken for by
+the stream itself; the Err arm is emitted as `_reply_err`, which takes no `reply_handles`
+out-parameter at all and refuses outright if the encoder recorded one, and the client's
+Err arm refuses a reply that arrives carrying any handle. The cardinality rule alone does
+not catch this - a stream open's count is `max(ok, err)`, so a one-capability `E` against
+a one-sub-channel Ok arm is one, which is legal - and the shape is worse than a plain
+mismatch: by the time `_reply_err` refuses, the server has already **minted** the
+capability, and there is no out-parameter to hand it back through. It is stranded exactly
+the way an over-long capability list strands its fifth handle.
+
+This is a refusal rather than a supported shape on purpose. Supporting it means an
+out-parameter on `_reply_err` and a handle-aware decode on the client's Err arm - a wire
+and API change for a shape nothing asks for yet. The day one does, the refusal is where
+the decision is recorded and the place to change it. An `E` whose capability count the
+generator cannot resolve (an imported wire shape it has not seen) is refused too, and
+says so separately: an unbounded answer is not a zero.
+
 ---
 
 ## 5. Interfaces and methods

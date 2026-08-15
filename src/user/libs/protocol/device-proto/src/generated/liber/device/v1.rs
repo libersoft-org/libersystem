@@ -52,10 +52,13 @@ impl DeviceType {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<DeviceType> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<DeviceType> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = DeviceType::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -113,10 +116,13 @@ impl DeviceEntry {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<DeviceEntry> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<DeviceEntry> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = DeviceEntry::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -427,10 +433,13 @@ impl UsbDevice {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<UsbDevice> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<UsbDevice> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = UsbDevice::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

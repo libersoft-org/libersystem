@@ -194,10 +194,26 @@ impl Cg {
 		self.line("\t\tr.finish()?;");
 		self.line("\t\tSome(value)");
 		self.line("\t}");
-		self.line(&format!("\tpub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<{ty}> {{"));
+		// `&mut Handles` AND A CLEAR, the same shape the framing boundaries already have.
+		//
+		// This took `&Handles` and cleared nothing, so after a successful decode the returned value
+		// and the caller's list named the SAME kernel handles - and the rule "success means do not
+		// close these, failure means close them" lived in whoever remembered it rather than in the
+		// signature. `Handles` is non-owning and `Copy` on purpose, so nothing in the type system
+		// was going to catch the caller that got it backwards.
+		//
+		// The dispatch, the stream frame and the reply readers all take `&mut Handles` and clear
+		// once the frame is known good (`request_handles.clear()`, `frame_handles.clear()`), which
+		// leaves a successful read holding nothing and a failed one holding everything. The generic
+		// helper is the same question with the same answer; it is only a hazard rather than a leak
+		// because no production caller uses it yet, which is exactly why it is cheap to change.
+		self.line(&format!("\tpub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<{ty}> {{"));
 		self.line("\t\tlet mut r = Reader::with_handles(bytes, handles);");
 		self.line(&format!("\t\tlet value = {ty}::read(&mut r)?;"));
 		self.line("\t\tr.finish()?;");
+		self.line("\t\t// The frame is good, so the capabilities it carried are the value's now. A");
+		self.line("\t\t// refusal above leaves them in the caller's list, which is the half that closes.");
+		self.line("\t\thandles.clear();");
 		self.line("\t\tSome(value)");
 		self.line("\t}");
 	}

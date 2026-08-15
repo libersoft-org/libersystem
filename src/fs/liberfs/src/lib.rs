@@ -332,7 +332,11 @@ pub struct Stat {
 // FORMAT, and a caller sizing a volume needs to be able to name it.
 pub const MAX_BLOCKS: u64 = 1 << 40;
 
-// A zeroed byte map of `len`, or `NoSpace` if the machine will not give it.
+// A zeroed byte map of `len`, or `NoMemory` if the machine will not give it.
+//
+// `NoSpace` is what this line said, and the sentence twenty lines below explains why it is wrong:
+// the injector answered `NoSpace`, the real allocator answers `NoMemory`, and the whole point of
+// that round was making the two agree. The summary line kept the word the code stopped using.
 //
 // Every one of these is sized from a number read off the medium, and `vec![0u8; len]`
 // ABORTS the process when the allocator refuses. `MAX_BLOCKS` bounds what the format may
@@ -438,7 +442,10 @@ pub(crate) mod inject {
 		ONCE.with(|o| o.set(false));
 	}
 
-	pub(super) fn should_fail() -> bool {
+	// `pub(crate)` rather than `pub(super)`: `txn::commit` has a refusal path of its own that a
+	// plain `Vec::try_reserve_exact` put out of the injector's reach, and untestable is how that
+	// path came to be written without a rollback. See `try_reserve_blocks`.
+	pub(crate) fn should_fail() -> bool {
 		BUDGET.with(|b| match b.get() {
 			None => false,
 			Some(0) => {
@@ -453,6 +460,41 @@ pub(crate) mod inject {
 				false
 			}
 		})
+	}
+}
+
+// What a free-map walk found, by category.
+//
+// The three are kept apart because they drive different decisions. `io` says the medium did not
+// answer and the metadata may be perfectly good - copy the volume elsewhere and try again.
+// `checksum` says a block came back and is not what was written - the medium corrupted it.
+// `structural` says every byte is what was written and what was written cannot be true - the
+// metadata is wrong, and no amount of re-reading will change it.
+//
+// A walk can find more than one, which is why this is a set rather than an enum: a failing disk
+// produces read errors AND checksum mismatches, and reporting only the first found would tell an
+// operator half of what the volume knows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalkDamage {
+	pub io: bool,
+	pub checksum: bool,
+	pub structural: bool,
+}
+
+impl WalkDamage {
+	pub fn any(self) -> bool {
+		self.io || self.checksum || self.structural
+	}
+
+	// Fold one failed sub-walk into the set, reading the category out of the error it answered
+	// with. `Io` is the medium; `Corrupt` is a block that did not match its checksum; anything else
+	// reached here is a shape that cannot be true.
+	fn from_error(&mut self, error: &FsError) {
+		match error {
+			FsError::Io => self.io = true,
+			FsError::Corrupt => self.checksum = true,
+			_ => self.structural = true,
+		}
 	}
 }
 
@@ -1040,7 +1082,15 @@ pub struct LiberFs<D: BlockDevice> {
 	// fails mid-walk: the derived free map is then incomplete, so the walk's caller
 	// must degrade (a mount goes read-only, a commit refuses) rather than allocate
 	// from a map that may hand out live blocks.
-	walk_damage: bool,
+	// WHAT the walk found, by kind rather than as one bit.
+	//
+	// This was a `bool`, so `derive_free` could only answer `Err(FsError::Corrupt)` and `fsck` could
+	// only turn that into `checksum_failures += 1`. A device that did not answer, a block that is
+	// not a node of the tree, a leaf outside the key interval routing to it and an actual CRC
+	// mismatch were therefore indistinguishable in the report - after a round of work whose whole
+	// point was separating exactly those categories, and in front of an operator whose first
+	// question is whether the medium or the metadata is at fault.
+	walk_damage: WalkDamage,
 	// Two-owner detection for the free-map walks. Marking a bitmap is idempotent -
 	// setting a bit twice is setting a bit - so an image in which two files point at one
 	// data block, or two parents at one subtree, derives a free map that looks perfect.
@@ -1068,8 +1118,15 @@ pub struct LiberFs<D: BlockDevice> {
 	// namespace on a short heap aborted the process - which is the one thing this filesystem is
 	// written not to do, and the reason every other structure here reserves before it commits.
 	//
-	// A sorted `Vec` answers the same question - "have I seen this inode" - through a binary search,
-	// grows through `try_reserve`, and is smaller per element than a tree node.
+	// A `Vec` answers the same question and grows through `try_reserve`, which is the property that
+	// mattered.
+	//
+	// APPENDED AND SORTED ONCE, not kept in order with a binary search on every insert - which is
+	// what this comment used to describe, over an implementation that had already moved. The
+	// question "have I seen this inode" is not asked DURING the walk at all: the alias is decided in
+	// one pass over the finished list (`names.sort_unstable()` and a `windows(2)` scan in
+	// `derive_free`), which is cheaper than an insertion sort per inode and is also what makes the
+	// sort valid - there is nothing about the order the inodes were reached in worth preserving.
 	mark_names: Option<Vec<u32>>,
 	mark_alias: bool,
 	// The highest inode key the live walk saw. `next_inode` hands out numbers ABOVE

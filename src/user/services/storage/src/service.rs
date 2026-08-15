@@ -2610,9 +2610,17 @@ impl FileSystem for DiskFs {
 	fn set_compression(&mut self, enabled: bool) -> Result<(), Error> {
 		self.fs.set_compression(enabled).map_err(map_fs_err)
 	}
+	// THE WHOLE TAXONOMY, not two fields of it.
+	//
+	// `LiberFs::FsckReport` has carried `structural_failures`, `stream_failures`, `io_failures` and
+	// `faults` for several rounds, and this adapter forwarded `checksum_failures` and `damaged`
+	// alone, because the wire record had nowhere to put the rest. So the entire distinction between
+	// a failing disk, wrong metadata and an undecodable stream existed for unit tests and for a
+	// direct Rust caller of the crate - not through `volume.fsck()`, which is the only way the
+	// system exposes it, and the only way an operator ever sees any of this.
 	fn fsck(&mut self) -> Result<FsckReport, Error> {
 		let report = self.fs.fsck().map_err(map_fs_err)?;
-		Ok(FsckReport { checksum_failures: report.checksum_failures, damaged: report.damaged.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect() })
+		Ok(FsckReport { checksum_failures: report.checksum_failures, damaged: report.damaged.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect(), structural_failures: report.structural_failures, stream_failures: report.stream_failures, io_failures: report.io_failures, faults: report.faults.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect() })
 	}
 	// STRAIGHT OFF THE MEDIUM. The default reads the whole file to hand back a window of it, which
 	// on the disk means reading a gigabyte to answer a question about sixty-four kilobytes of it -

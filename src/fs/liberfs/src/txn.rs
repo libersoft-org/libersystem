@@ -99,8 +99,27 @@ impl<D: BlockDevice> LiberFs<D> {
 		// is not to be on that road: the list is known before the barrier, so it is built before
 		// the barrier, and the only thing left after the superblock lands is a swap that cannot
 		// fail.
+		//
+		// AND THE REFUSAL ROLLS BACK, which it did not. This was a bare `?`, and a bare `?` here is
+		// the one shape `finish()` cannot repair: `finish` calls `abort()` only when the transaction
+		// BODY failed, so a body that succeeded goes straight to `commit()` and its error is
+		// returned unchanged. What that left behind was a live mount carrying uncommitted state -
+		// `self.txn` still holding the rollback snapshot, `inode_root` pointing at the new
+		// uncommitted root, `fresh` and `dead` holding the failed operation's blocks - while the
+		// caller was told `NoMemory`, which StorageService maps to `again`.
+		//
+		// The next `mutate()` then calls `begin()`, which overwrites the rollback snapshot and
+		// clears both sets, and a later unrelated commit publishes the new root: an operation whose
+		// caller was told it failed, committed. The block bookkeeping leans toward a leak, which is
+		// the safe direction, and the transaction contract is broken either way.
+		//
+		// This is before the point of no return - the superblock has not been touched - so `abort()`
+		// is exactly right and is what it exists for.
 		let mut next_dead_prev: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-		next_dead_prev.try_reserve_exact(self.dead.len()).map_err(|_| FsError::NoMemory)?;
+		if try_reserve_blocks(&mut next_dead_prev, self.dead.len()).is_err() {
+			self.abort();
+			return Err(FsError::NoMemory);
+		}
 		// `dead` is a `BTreeSet`, so this arrives in ascending order - which is what the reclaim
 		// above and `derive_free` both produce, and what keeps the two paths interchangeable.
 		next_dead_prev.extend(self.dead.iter().copied());
@@ -246,8 +265,15 @@ impl<D: BlockDevice> LiberFs<D> {
 		true
 	}
 
-	pub(crate) fn derive_free(&mut self) -> Result<(), FsError> {
-		self.walk_damage = false;
+	// The categorised walk: `Ok(kinds)` for a walk that COMPLETED, whether or not it found damage,
+	// and `Err` only for a failure of this machine rather than of the volume (a refused allocation).
+	//
+	// Split out from `derive_free` because the single `Err(FsError::Corrupt)` that used to be the
+	// only answer was thrown away twice over: once here, where four different problems became one
+	// error, and again in `fsck`, which counted whatever came back as a checksum failure. The
+	// categories were already known at every site that raised them; nothing carried them out.
+	pub(crate) fn derive_free_kinds(&mut self) -> Result<WalkDamage, FsError> {
+		self.walk_damage = WalkDamage::default();
 		self.mark_dup = None;
 		self.mark_max_inode = 0;
 		let len = self.free.len();
@@ -298,7 +324,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			while ptr != 0 && ptr < self.num_blocks && !test_bit(&live, ptr) {
 				self.mark(&mut live, ptr);
 				if !self.dev.read_block(ptr, &mut buf) {
-					self.walk_damage = true;
+					self.walk_damage.io = true;
 					break;
 				}
 				ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -347,7 +373,7 @@ impl<D: BlockDevice> LiberFs<D> {
 							self.mark_inode_tree(s.inode_root, s.inode_root_crc, &mut prev)?;
 						}
 					}
-					Err(_) => self.walk_damage = true,
+					Err(e) => self.walk_damage.from_error(&e),
 				}
 			}
 		}
@@ -372,17 +398,30 @@ impl<D: BlockDevice> LiberFs<D> {
 		// a walk that could not complete (an unreadable node, a broken spill chain)
 		// leaves the free map incomplete: surface it, so the caller degrades to
 		// read-only rather than allocate blocks the map failed to reserve.
-		if core::mem::take(&mut self.walk_damage) {
-			return Err(FsError::Corrupt);
-		}
+		let mut damage = core::mem::take(&mut self.walk_damage);
 		// two owners of one block in the live generation. The map itself cannot show it -
 		// it is one bit either way - so it is caught while deriving and reported here.
 		// Allocating from such a map is safe; the danger is the DELETE, which returns a
 		// block the other owner still reads. Read-only forecloses both.
+		//
+		// STRUCTURAL, not a checksum failure: every block involved matched its checksum, and what
+		// is wrong is that two owners claim one of them. The medium did exactly what it was told.
 		if dup.is_some() {
-			return Err(FsError::Corrupt);
+			damage.structural = true;
 		}
-		Ok(())
+		// An inode reachable under two names is the same kind of statement: the bytes are what were
+		// written and the namespace they describe cannot be true.
+		if self.mark_alias {
+			damage.structural = true;
+		}
+		Ok(damage)
+	}
+
+	// The answer the mount path and the commit path want: did the walk leave a free map that can be
+	// allocated from? `Corrupt` for any damage, whatever kind - the allocator's question has one
+	// answer, and the categories are for the operator's report.
+	pub(crate) fn derive_free(&mut self) -> Result<(), FsError> {
+		if self.derive_free_kinds()?.any() { Err(FsError::Corrupt) } else { Ok(()) }
 	}
 
 	// Mark, in `map`, every block the inode B+tree rooted at `ptr` references: the tree
@@ -420,8 +459,9 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		while let Some((ptr, want, lower, upper)) = nodes.pop() {
+			// The device did not answer. The metadata may be perfectly good.
 			if !self.dev.read_block(ptr, &mut buf) {
-				self.walk_damage = true;
+				self.walk_damage.io = true;
 				continue;
 			}
 			// Under `mark_strict` - the live generation - a node is checked against the CRC
@@ -432,15 +472,17 @@ impl<D: BlockDevice> LiberFs<D> {
 			// not a source of truth for an allocator. The older generations keep the blind
 			// walk on purpose: there the point is to reserve what MIGHT still be referenced,
 			// and refusing to follow damage would under-reserve.
+			// A block came back and is not what was written.
 			if self.mark_strict && crc32c(&buf) != want {
-				self.walk_damage = true;
+				self.walk_damage.checksum = true;
 				continue;
 			}
 			// a byte that is neither node type was treated as an internal node, so the
 			// walk read separators and child links out of whatever the block held. A
 			// block that is not a node of the tree is damage in every generation.
+			// The checksum matched and the block is still not a node. Structural.
 			if node_type(&buf) != NODE_LEAF && node_type(&buf) != NODE_INTERNAL {
-				self.walk_damage = true;
+				self.walk_damage.structural = true;
 				continue;
 			}
 			// The LOCAL structure too, under `mark_strict`. The interval above proves a node
@@ -460,7 +502,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			if self.mark_strict {
 				let local = if node_type(&buf) == NODE_LEAF { validate_fixed_leaf(&buf, INODE_REC, 8) } else { validate_internal(&buf) };
 				if local.is_err() {
-					self.walk_damage = true;
+					self.walk_damage.structural = true;
 					continue;
 				}
 			}
@@ -481,7 +523,7 @@ impl<D: BlockDevice> LiberFs<D> {
 						// referenced, and refusing to follow a wrong-looking subtree would
 						// under-reserve.
 						if lower.is_some_and(|l| key < l) || upper.is_some_and(|u| key >= u) {
-							self.walk_damage = true;
+							self.walk_damage.structural = true;
 						}
 					}
 					let off = rec + 8;
@@ -492,8 +534,8 @@ impl<D: BlockDevice> LiberFs<D> {
 						// image in `buf` stays intact). A file whose chain cannot be
 						// loaded is damage, not a mount failure.
 						let marked = self.load_spill(&mut inode).and_then(|()| self.collect_inode_blocks(&inode, map));
-						if marked.is_err() {
-							self.walk_damage = true;
+						if let Err(e) = marked {
+							self.walk_damage.from_error(&e);
 						}
 					} else if inode.r#type == TYPE_DIR {
 						self.mark_dir_tree(inode.dir_root, inode.dir_root_crc, map)?;
@@ -514,8 +556,8 @@ impl<D: BlockDevice> LiberFs<D> {
 						// at best it is exactly right, because the record usually IS a file.
 						// The structural pass reports the type, so it is not silent either.
 						let marked = self.load_spill(&mut inode).and_then(|()| self.collect_inode_blocks(&inode, map));
-						if marked.is_err() {
-							self.walk_damage = true;
+						if let Err(e) = marked {
+							self.walk_damage.from_error(&e);
 						}
 						// AND as a directory, because the flip could have gone the other way.
 						//
@@ -618,16 +660,19 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		while let Some((ptr, want, lower, upper)) = nodes.pop() {
+			// The device did not answer. The metadata may be perfectly good.
 			if !self.dev.read_block(ptr, &mut buf) {
-				self.walk_damage = true;
+				self.walk_damage.io = true;
 				continue;
 			}
+			// A block came back and is not what was written.
 			if self.mark_strict && crc32c(&buf) != want {
-				self.walk_damage = true;
+				self.walk_damage.checksum = true;
 				continue;
 			}
+			// The checksum matched and the block is still not a node. Structural.
 			if node_type(&buf) != NODE_LEAF && node_type(&buf) != NODE_INTERNAL {
-				self.walk_damage = true;
+				self.walk_damage.structural = true;
 				continue;
 			}
 			if node_type(&buf) == NODE_INTERNAL {
@@ -659,7 +704,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				// That is worth the whole mount.
 				for rec in &crate::dir::dir_leaf_parse(&buf) {
 					if lower.is_some_and(|l| rec.hash < l) || upper.is_some_and(|u| rec.hash >= u) {
-						self.walk_damage = true;
+						self.walk_damage.structural = true;
 					}
 					// ONE INODE, ONE NAME - checked here because this walk is already reading every
 					// leaf of every directory in the live generation, so it costs a bit per inode
@@ -1296,4 +1341,19 @@ pub(crate) fn leaf_split_point(recs: &[Vec<u8>]) -> usize {
 		down -= 1;
 	}
 	down
+}
+
+// Reserve exactly `n` block numbers, or report that the memory could not be had.
+//
+// A FUNCTION RATHER THAN A BARE `try_reserve_exact`, so the allocation injector can reach it.
+// `inject` hooks `try_zeroed` and nothing else, which left the one refusal path inside `commit()`
+// with no way to be exercised - and a path that cannot be exercised is how that one came to be
+// written as a bare `?`, returning `NoMemory` with the transaction still open for somebody else's
+// commit to publish. The helper is the difference between a rule and a hope.
+fn try_reserve_blocks(target: &mut alloc::vec::Vec<u64>, n: usize) -> Result<(), FsError> {
+	#[cfg(test)]
+	if crate::inject::should_fail() {
+		return Err(FsError::NoMemory);
+	}
+	target.try_reserve_exact(n).map_err(|_| FsError::NoMemory)
 }

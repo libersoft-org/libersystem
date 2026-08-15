@@ -119,16 +119,48 @@ unsafe fn fsck(storage: u64) {
 				return;
 			}
 		};
-		if report.checksum_failures == 0 {
-			print(b"fsck: clean (0 checksum failures)\n");
+		// FOUR CATEGORIES, BECAUSE THEY MEAN DIFFERENT THINGS TO WHOEVER IS READING.
+		//
+		// This printed `checksum_failures` and nothing else, and answered "clean" whenever that one
+		// number was zero - so a volume with wrong metadata, an unreadable disk or an undecodable
+		// compressed stream reported itself CLEAN at the only place a person ever looks. The
+		// backend had kept the categories apart for several rounds; the wire record and this tool
+		// were where they were thrown away.
+		let total = report.checksum_failures + report.structural_failures + report.stream_failures + report.io_failures;
+		if total == 0 {
+			print(b"fsck: clean\n");
 			return;
 		}
 		let mut out = String::new();
 		{
 			use core::fmt::Write as _;
-			let _ = writeln!(out, "fsck: {} checksum failure(s) in {} file(s):", report.checksum_failures, report.damaged.len());
-			for path in &report.damaged {
-				let _ = writeln!(out, "  {path}");
+			// Each line only when it has something to say, so an ordinary checksum fault does not
+			// arrive buried in three zeroes.
+			if report.checksum_failures > 0 {
+				let _ = writeln!(out, "fsck: {} checksum failure(s) - the medium gave back bytes that are not what was written", report.checksum_failures);
+			}
+			if report.io_failures > 0 {
+				let _ = writeln!(out, "fsck: {} read failure(s) - the medium would not answer; copy the volume elsewhere and check it there", report.io_failures);
+			}
+			if report.structural_failures > 0 {
+				let _ = writeln!(out, "fsck: {} structural failure(s) - the metadata is wrong, and re-reading will not change it", report.structural_failures);
+			}
+			if report.stream_failures > 0 {
+				let _ = writeln!(out, "fsck: {} undecodable stream(s) - every block matched its checksum and the compressed data still will not decode", report.stream_failures);
+			}
+			if !report.damaged.is_empty() {
+				let _ = writeln!(out, "damaged file(s):");
+				for path in &report.damaged {
+					let _ = writeln!(out, "  {path}");
+				}
+			}
+			// What the structural pass has to SAY. A count tells an operator something is wrong;
+			// these tell them what, which is the difference between a report and an alarm.
+			if !report.faults.is_empty() {
+				let _ = writeln!(out, "faults:");
+				for fault in &report.faults {
+					let _ = writeln!(out, "  {fault}");
+				}
 			}
 			let _ = writeln!(out, "restore with: volume restore <vol://system/...> [snapshot]");
 		}

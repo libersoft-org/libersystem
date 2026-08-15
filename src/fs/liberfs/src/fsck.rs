@@ -4,7 +4,7 @@ use crate::*;
 // failures on purpose - they send an operator to three different places, the medium, the metadata
 // or the writer that produced the stream - and a single count plus a subtraction could not keep
 // them apart.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct StructureTally {
 	// Faults in the shape of the metadata: a record that cannot be true.
 	pub structural: u32,
@@ -49,13 +49,26 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut live_io = 0u32;
 		let mut live_structural = 0u32;
 		let mut damaged: Vec<Vec<u8>> = Vec::new();
-		match self.derive_free() {
-			Ok(()) => {}
-			Err(FsError::Corrupt) => {
-				checksum_failures = checksum_failures.saturating_add(1);
-				self.read_only = true;
-			}
-			Err(e) => return Err(e),
+		// THE FREE-MAP WALK'S DAMAGE, IN THE BUCKET IT BELONGS TO. This was
+		// `Err(FsError::Corrupt) => checksum_failures += 1`, so a device that did not answer, a
+		// block that is not a node of the tree, a leaf outside the interval that routes to it, an
+		// inode with two names and two owners of one block were all reported as checksum failures -
+		// in the one pass that visits every block of the live generation, and therefore the pass
+		// most likely to be the first to see anything. `derive_free_kinds` carries the categories
+		// out; each is counted once, because the walk reports whether it found a kind and not how
+		// many times.
+		let walk = self.derive_free_kinds()?;
+		if walk.any() {
+			self.read_only = true;
+		}
+		if walk.io {
+			live_io = live_io.saturating_add(1);
+		}
+		if walk.checksum {
+			checksum_failures = checksum_failures.saturating_add(1);
+		}
+		if walk.structural {
+			live_structural = live_structural.saturating_add(1);
 		}
 		// walk the live namespace from the root, tracking each file's full path (the
 		// root directory itself reports as "/"). The visited set makes a hostile
@@ -690,8 +703,26 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(0);
 		}
 		set_bit(visited, ptr);
+		// THE NODE TYPE, which this pass did not check at all.
+		//
+		// `read_node` checks the pointer bounds, the device read and the CRC, and nothing about
+		// what the block IS; the branch below then tested `== NODE_LEAF` and treated EVERY other
+		// value as an internal node. So a corrupted or forged type byte turned a leaf into an
+		// internal node and its inode records into child pointers - inside the checker whose job is
+		// to notice exactly that, walking whatever the block happened to hold.
+		//
+		// The raw marking walk in `derive_free` already requires the byte to be one of the two
+		// values that exist ("a block that is not a node of the tree is damage in every
+		// generation"); this is the same rule in the pass that REPORTS. Structural, because the
+		// checksum matched: the medium gave back what was written and what was written cannot be a
+		// node.
+		let kind = node_type(&buf);
+		if kind != NODE_LEAF && kind != NODE_INTERNAL {
+			tally.structural = tally.structural.saturating_add(1);
+			return Ok(0);
+		}
 		let mut bad = 0u32;
-		if node_type(&buf) == NODE_LEAF {
+		if kind == NODE_LEAF {
 			for i in 0..leaf_count(&buf, INODE_REC) {
 				let off = NODE_HDR + i * INODE_REC + 8;
 				let mut inode = Inode::parse(&buf[off..off + INODE_SIZE]);
@@ -778,8 +809,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		if ptr == 0 {
 			return Ok(0);
 		}
+		// THE SAME THREE STRUCTURAL CASES THE INODE WALK ALREADY NAMES. These answered
+		// `Err(FsError::Corrupt)`, which the caller counts into `bad` and the caller above that adds
+		// to `checksum_failures` - so a tree deeper than the format permits, a pointer to a block
+		// this volume does not have, and a block that is not a node were all reported as failed
+		// checksums, when in each case every checksum involved matched.
 		if depth == 0 {
-			return Err(FsError::Corrupt);
+			tally.structural = tally.structural.saturating_add(1);
+			return Ok(0);
 		}
 		// same bound as the inode walk, sharing its map: a block is one node of one tree,
 		// so a directory node reached twice - however many names alias it - is DESCENDED
@@ -787,7 +824,8 @@ impl<D: BlockDevice> LiberFs<D> {
 		// the block's contents having been scrubbed says nothing about whether this
 		// particular pointer records the right CRC for them.
 		if ptr >= self.num_blocks {
-			return Err(FsError::Corrupt);
+			tally.structural = tally.structural.saturating_add(1);
+			return Ok(0);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
 		self.read_node(ptr, crc, &mut buf)?;
@@ -795,8 +833,13 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(0);
 		}
 		set_bit(visited, ptr);
+		let kind = node_type(&buf);
+		if kind != NODE_LEAF && kind != NODE_INTERNAL {
+			tally.structural = tally.structural.saturating_add(1);
+			return Ok(0);
+		}
 		let mut bad = 0u32;
-		if node_type(&buf) == NODE_INTERNAL {
+		if kind == NODE_INTERNAL {
 			for i in 0..=internal_count(&buf) {
 				bad = bad.saturating_add(match self.check_dir_tree(child_ptr(&buf, i), child_crc(&buf, i), depth - 1, visited, tally) {
 					Ok(b) => b,

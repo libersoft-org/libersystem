@@ -50,10 +50,13 @@ impl ConfigEntry {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<ConfigEntry> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ConfigEntry> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = ConfigEntry::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -432,10 +435,13 @@ impl Picked {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Picked> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Picked> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Picked::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

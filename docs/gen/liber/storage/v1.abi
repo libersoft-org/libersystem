@@ -9,7 +9,7 @@ record file-event(path:string,kind:file-event-kind,size:u64)
 enum writer-mode(replace=0,append=1)
 record snapshot-info(name:string,generation:u64)
 record volume-status(label:string,total-bytes:u64,free-bytes:u64,compression:bool,read-only:bool,filesystem:string)
-record fsck-report(checksum-failures:u32,damaged:list<string>)
+record fsck-report(checksum-failures:u32,damaged:list<string>,structural-failures:u32,stream-failures:u32,io-failures:u32,faults:list<string>)
 interface volume
 method volume.open op=1 (o:open-opts:rights=) -> result<open-result, liber:base@1::error>
 method volume.list op=2 (path:string:rights=) -> result<stream<file-info>, liber:base@1::error>

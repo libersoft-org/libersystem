@@ -49,10 +49,13 @@ impl OpenOpts {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<OpenOpts> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<OpenOpts> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = OpenOpts::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -109,10 +112,13 @@ impl OpenResult {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<OpenResult> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<OpenResult> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = OpenResult::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -171,10 +177,13 @@ impl FileType {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<FileType> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FileType> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = FileType::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -233,10 +242,13 @@ impl FileInfo {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<FileInfo> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FileInfo> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = FileInfo::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -299,10 +311,13 @@ impl FileEventKind {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<FileEventKind> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FileEventKind> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = FileEventKind::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -359,10 +374,13 @@ impl FileEvent {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<FileEvent> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FileEvent> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = FileEvent::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -423,10 +441,13 @@ impl WriterMode {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<WriterMode> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<WriterMode> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = WriterMode::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -480,10 +501,13 @@ impl SnapshotInfo {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<SnapshotInfo> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SnapshotInfo> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = SnapshotInfo::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -545,10 +569,13 @@ impl VolumeStatus {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<VolumeStatus> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<VolumeStatus> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = VolumeStatus::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -571,12 +598,36 @@ impl VolumeStatus {
 	}
 }
 
-/// What a volume integrity check found: how many data blocks failed their checksum,
-/// and the paths of the damaged files - so the operator knows what to restore.
+/// What a volume integrity check found, BY CATEGORY, and the paths of the damaged files - so the
+/// operator knows what to restore and, before that, which of three different problems they have.
+///
+/// The categories are not a refinement of one number; they drive different actions.
+///
+/// - `checksum-failures`: a block came back and is not what was written. The medium corrupted it.
+/// - `io-failures`: the medium would not answer at all. Not the same fault, and often not the
+///   filesystem's at all - copy the volume elsewhere and check it there.
+/// - `structural-failures`: every byte is what was written and what was written cannot be true - a
+///   tree deeper than the format permits, a pointer to a block the volume does not have, a block
+///   that is not a node, a record outside the key interval that routes to it, one inode reachable
+///   under two names. Re-reading will never change these.
+/// - `stream-failures`: every block matched its checksum and the compressed stream still does not
+///   decode.
+/// - `faults`: what the structural pass has to SAY, one line each. A count tells an operator
+///   something is wrong; these tell them what.
+///
+/// This record carried the first field and `damaged` alone until 2026-08-16, while the
+/// implementation behind it had kept all five apart for several rounds - so the entire taxonomy
+/// existed for unit tests and for a direct Rust caller of the crate, and not through `volume.fsck()`,
+/// which is the only way the system exposes it. An operator was shown one number that folded a
+/// failing disk, wrong metadata and an undecodable stream together.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FsckReport {
 	pub checksum_failures: u32,
 	pub damaged: Vec<String>,
+	pub structural_failures: u32,
+	pub stream_failures: u32,
+	pub io_failures: u32,
+	pub faults: Vec<String>,
 }
 
 impl FsckReport {
@@ -610,10 +661,13 @@ impl FsckReport {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<FsckReport> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FsckReport> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = FsckReport::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -625,20 +679,42 @@ impl FsckReport {
 		for v0 in self.damaged.iter() {
 			w.bytes_lp(v0.as_bytes())?;
 		}
+		w.u32(self.structural_failures)?;
+		w.u32(self.stream_failures)?;
+		w.u32(self.io_failures)?;
+		if self.faults.len() > u16::MAX as usize {
+			return None;
+		}
+		w.u16(self.faults.len() as u16)?;
+		for v1 in self.faults.iter() {
+			w.bytes_lp(v1.as_bytes())?;
+		}
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<FsckReport> {
 		let checksum_failures = r.u32()?;
 		let damaged = {
-			let v1 = r.u16()? as usize;
-			let mut v2 = Vec::new();
-			v2.try_reserve_exact(v1).ok()?;
-			for _ in 0..v1 {
-				v2.push(r.string_lp()?);
+			let v2 = r.u16()? as usize;
+			let mut v3 = Vec::new();
+			v3.try_reserve_exact(v2).ok()?;
+			for _ in 0..v2 {
+				v3.push(r.string_lp()?);
 			}
-			v2
+			v3
 		};
-		Some(FsckReport { checksum_failures, damaged })
+		let structural_failures = r.u32()?;
+		let stream_failures = r.u32()?;
+		let io_failures = r.u32()?;
+		let faults = {
+			let v4 = r.u16()? as usize;
+			let mut v5 = Vec::new();
+			v5.try_reserve_exact(v4).ok()?;
+			for _ in 0..v4 {
+				v5.push(r.string_lp()?);
+			}
+			v5
+		};
+		Some(FsckReport { checksum_failures, damaged, structural_failures, stream_failures, io_failures, faults })
 	}
 }
 
@@ -891,13 +967,13 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v3) => {
+						Ok(v6) => {
 							w.u8(1)?;
-							v3.write(w)?;
+							v6.write(w)?;
 						}
-						Err(v4) => {
+						Err(v7) => {
 							w.u8(0)?;
-							v4.write(w)?;
+							v7.write(w)?;
 						}
 					}
 					Some(())
@@ -933,12 +1009,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v5) => {
+						Ok(v8) => {
 							w.u8(1)?;
 						}
-						Err(v6) => {
+						Err(v9) => {
 							w.u8(0)?;
-							v6.write(w)?;
+							v9.write(w)?;
 						}
 					}
 					Some(())
@@ -969,12 +1045,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v7) => {
+						Ok(v10) => {
 							w.u8(1)?;
 						}
-						Err(v8) => {
+						Err(v11) => {
 							w.u8(0)?;
-							v8.write(w)?;
+							v11.write(w)?;
 						}
 					}
 					Some(())
@@ -1005,12 +1081,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v9) => {
+						Ok(v12) => {
 							w.u8(1)?;
 						}
-						Err(v10) => {
+						Err(v13) => {
 							w.u8(0)?;
-							v10.write(w)?;
+							v13.write(w)?;
 						}
 					}
 					Some(())
@@ -1040,19 +1116,19 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v11) => {
+						Ok(v14) => {
 							w.u8(1)?;
-							if v11.len() > u16::MAX as usize {
+							if v14.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v11.len() as u16)?;
-							for v13 in v11.iter() {
-								v13.write(w)?;
+							w.u16(v14.len() as u16)?;
+							for v16 in v14.iter() {
+								v16.write(w)?;
 							}
 						}
-						Err(v12) => {
+						Err(v15) => {
 							w.u8(0)?;
-							v12.write(w)?;
+							v15.write(w)?;
 						}
 					}
 					Some(())
@@ -1083,12 +1159,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v14) => {
+						Ok(v17) => {
 							w.u8(1)?;
 						}
-						Err(v15) => {
+						Err(v18) => {
 							w.u8(0)?;
-							v15.write(w)?;
+							v18.write(w)?;
 						}
 					}
 					Some(())
@@ -1120,13 +1196,13 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v16) => {
+						Ok(v19) => {
 							w.u8(1)?;
-							v16.write(w)?;
+							v19.write(w)?;
 						}
-						Err(v17) => {
+						Err(v20) => {
 							w.u8(0)?;
-							v17.write(w)?;
+							v20.write(w)?;
 						}
 					}
 					Some(())
@@ -1157,12 +1233,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v18) => {
+						Ok(v21) => {
 							w.u8(1)?;
 						}
-						Err(v19) => {
+						Err(v22) => {
 							w.u8(0)?;
-							v19.write(w)?;
+							v22.write(w)?;
 						}
 					}
 					Some(())
@@ -1193,12 +1269,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v20) => {
+						Ok(v23) => {
 							w.u8(1)?;
 						}
-						Err(v21) => {
+						Err(v24) => {
 							w.u8(0)?;
-							v21.write(w)?;
+							v24.write(w)?;
 						}
 					}
 					Some(())
@@ -1228,13 +1304,13 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v22) => {
+						Ok(v25) => {
 							w.u8(1)?;
-							w.u64(*v22)?;
+							w.u64(*v25)?;
 						}
-						Err(v23) => {
+						Err(v26) => {
 							w.u8(0)?;
-							v23.write(w)?;
+							v26.write(w)?;
 						}
 					}
 					Some(())
@@ -1264,13 +1340,13 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v24) => {
+						Ok(v27) => {
 							w.u8(1)?;
-							v24.write(w)?;
+							v27.write(w)?;
 						}
-						Err(v25) => {
+						Err(v28) => {
 							w.u8(0)?;
-							v25.write(w)?;
+							v28.write(w)?;
 						}
 					}
 					Some(())
@@ -1301,12 +1377,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v26) => {
+						Ok(v29) => {
 							w.u8(1)?;
 						}
-						Err(v27) => {
+						Err(v30) => {
 							w.u8(0)?;
-							v27.write(w)?;
+							v30.write(w)?;
 						}
 					}
 					Some(())
@@ -1336,13 +1412,13 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v28) => {
+						Ok(v31) => {
 							w.u8(1)?;
-							v28.write(w)?;
+							v31.write(w)?;
 						}
-						Err(v29) => {
+						Err(v32) => {
 							w.u8(0)?;
-							v29.write(w)?;
+							v32.write(w)?;
 						}
 					}
 					Some(())
@@ -1374,12 +1450,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v30) => {
+						Ok(v33) => {
 							w.u8(1)?;
 						}
-						Err(v31) => {
+						Err(v34) => {
 							w.u8(0)?;
-							v31.write(w)?;
+							v34.write(w)?;
 						}
 					}
 					Some(())
@@ -1414,12 +1490,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v32) => {
+						Ok(v35) => {
 							w.u8(1)?;
 						}
-						Err(v33) => {
+						Err(v36) => {
 							w.u8(0)?;
-							v33.write(w)?;
+							v36.write(w)?;
 						}
 					}
 					Some(())
@@ -1450,13 +1526,13 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v34) => {
+						Ok(v37) => {
 							w.u8(1)?;
-							v34.write(w)?;
+							v37.write(w)?;
 						}
-						Err(v35) => {
+						Err(v38) => {
 							w.u8(0)?;
-							v35.write(w)?;
+							v38.write(w)?;
 						}
 					}
 					Some(())
@@ -1488,12 +1564,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v36) => {
+						Ok(v39) => {
 							w.u8(1)?;
 						}
-						Err(v37) => {
+						Err(v40) => {
 							w.u8(0)?;
-							v37.write(w)?;
+							v40.write(w)?;
 						}
 					}
 					Some(())
@@ -1525,12 +1601,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v38) => {
+						Ok(v41) => {
 							w.u8(1)?;
 						}
-						Err(v39) => {
+						Err(v42) => {
 							w.u8(0)?;
-							v39.write(w)?;
+							v42.write(w)?;
 						}
 					}
 					Some(())
@@ -1563,12 +1639,12 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v40) => {
+						Ok(v43) => {
 							w.u8(1)?;
 						}
-						Err(v41) => {
+						Err(v44) => {
 							w.u8(0)?;
-							v41.write(w)?;
+							v44.write(w)?;
 						}
 					}
 					Some(())
@@ -1601,14 +1677,14 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v42) => {
+						Ok(v45) => {
 							w.u8(1)?;
-							w.set_handle(v42.handle)?;
-							w.u64(v42.len)?;
+							w.set_handle(v45.handle)?;
+							w.u64(v45.len)?;
 						}
-						Err(v43) => {
+						Err(v46) => {
 							w.u8(0)?;
-							v43.write(w)?;
+							v46.write(w)?;
 						}
 					}
 					Some(())
@@ -1640,14 +1716,14 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v44) => {
+						Ok(v47) => {
 							w.u8(1)?;
-							w.set_handle(*v44)?;
+							w.set_handle(*v47)?;
 							w.u32(0)?;
 						}
-						Err(v45) => {
+						Err(v48) => {
 							w.u8(0)?;
-							v45.write(w)?;
+							v48.write(w)?;
 						}
 					}
 					Some(())
@@ -1677,14 +1753,14 @@ pub mod volume {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v46) => {
+						Ok(v49) => {
 							w.u8(1)?;
-							w.set_handle(*v46)?;
+							w.set_handle(*v49)?;
 							w.u32(0)?;
 						}
-						Err(v47) => {
+						Err(v50) => {
 							w.u8(0)?;
-							v47.write(w)?;
+							v50.write(w)?;
 						}
 					}
 					Some(())
@@ -2034,13 +2110,13 @@ pub mod volume {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v48 = r.u16()? as usize;
-						let mut v49 = Vec::new();
-						v49.try_reserve_exact(v48).ok()?;
-						for _ in 0..v48 {
-							v49.push(SnapshotInfo::read(r)?);
+						let v51 = r.u16()? as usize;
+						let mut v52 = Vec::new();
+						v52.try_reserve_exact(v51).ok()?;
+						for _ in 0..v51 {
+							v52.push(SnapshotInfo::read(r)?);
 						}
-						v49
+						v52
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -2839,13 +2915,13 @@ pub mod writer {
 		match op {
 			OP_WRITE => {
 				let data = {
-					let v50 = r.u16()? as usize;
-					let mut v51 = Vec::new();
-					v51.try_reserve_exact(v50).ok()?;
-					for _ in 0..v50 {
-						v51.push(r.u8()?);
+					let v53 = r.u16()? as usize;
+					let mut v54 = Vec::new();
+					v54.try_reserve_exact(v53).ok()?;
+					for _ in 0..v53 {
+						v54.push(r.u8()?);
 					}
-					v51
+					v54
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -2854,13 +2930,13 @@ pub mod writer {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v52) => {
+						Ok(v55) => {
 							w.u8(1)?;
-							w.u64(*v52)?;
+							w.u64(*v55)?;
 						}
-						Err(v53) => {
+						Err(v56) => {
 							w.u8(0)?;
-							v53.write(w)?;
+							v56.write(w)?;
 						}
 					}
 					Some(())
@@ -2885,13 +2961,13 @@ pub mod writer {
 			OP_WRITE_AT => {
 				let offset = r.u64()?;
 				let data = {
-					let v54 = r.u16()? as usize;
-					let mut v55 = Vec::new();
-					v55.try_reserve_exact(v54).ok()?;
-					for _ in 0..v54 {
-						v55.push(r.u8()?);
+					let v57 = r.u16()? as usize;
+					let mut v58 = Vec::new();
+					v58.try_reserve_exact(v57).ok()?;
+					for _ in 0..v57 {
+						v58.push(r.u8()?);
 					}
-					v55
+					v58
 				};
 				r.finish()?;
 				request_handles.clear();
@@ -2900,12 +2976,12 @@ pub mod writer {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v56) => {
+						Ok(v59) => {
 							w.u8(1)?;
 						}
-						Err(v57) => {
+						Err(v60) => {
 							w.u8(0)?;
-							v57.write(w)?;
+							v60.write(w)?;
 						}
 					}
 					Some(())
@@ -2936,12 +3012,12 @@ pub mod writer {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v58) => {
+						Ok(v61) => {
 							w.u8(1)?;
 						}
-						Err(v59) => {
+						Err(v62) => {
 							w.u8(0)?;
-							v59.write(w)?;
+							v62.write(w)?;
 						}
 					}
 					Some(())
@@ -2971,13 +3047,13 @@ pub mod writer {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v60) => {
+						Ok(v63) => {
 							w.u8(1)?;
-							w.u64(*v60)?;
+							w.u64(*v63)?;
 						}
-						Err(v61) => {
+						Err(v64) => {
 							w.u8(0)?;
-							v61.write(w)?;
+							v64.write(w)?;
 						}
 					}
 					Some(())
@@ -3007,13 +3083,13 @@ pub mod writer {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v62) => {
+						Ok(v65) => {
 							w.u8(1)?;
-							w.u64(*v62)?;
+							w.u64(*v65)?;
 						}
-						Err(v63) => {
+						Err(v66) => {
 							w.u8(0)?;
-							v63.write(w)?;
+							v66.write(w)?;
 						}
 					}
 					Some(())
@@ -3043,12 +3119,12 @@ pub mod writer {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v64) => {
+						Ok(v67) => {
 							w.u8(1)?;
 						}
-						Err(v65) => {
+						Err(v68) => {
 							w.u8(0)?;
-							v65.write(w)?;
+							v68.write(w)?;
 						}
 					}
 					Some(())
@@ -3129,8 +3205,8 @@ pub mod writer {
 				return None;
 			}
 			w.u16(data.len() as u16)?;
-			for v66 in data.iter() {
-				w.u8(*v66)?;
+			for v69 in data.iter() {
+				w.u8(*v69)?;
 			}
 			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
@@ -3163,8 +3239,8 @@ pub mod writer {
 				return None;
 			}
 			w.u16(data.len() as u16)?;
-			for v67 in data.iter() {
-				w.u8(*v67)?;
+			for v70 in data.iter() {
+				w.u8(*v70)?;
 			}
 			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
@@ -3386,14 +3462,14 @@ pub mod volume_admin {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v68) => {
+						Ok(v71) => {
 							w.u8(1)?;
-							w.set_handle(*v68)?;
+							w.set_handle(*v71)?;
 							w.u32(0)?;
 						}
-						Err(v69) => {
+						Err(v72) => {
 							w.u8(0)?;
-							v69.write(w)?;
+							v72.write(w)?;
 						}
 					}
 					Some(())
@@ -4005,13 +4081,34 @@ impl FsckReport {
 		out.push(',');
 		out.push_str("\"damaged\":");
 		out.push('[');
-		let mut v71 = true;
-		for v70 in self.damaged.iter() {
-			if !v71 {
+		let mut v74 = true;
+		for v73 in self.damaged.iter() {
+			if !v74 {
 				out.push(',');
 			}
-			v71 = false;
-			crate::codec::json_escape(v70, out);
+			v74 = false;
+			crate::codec::json_escape(v73, out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"structural-failures\":");
+		let _ = write!(out, "{}", self.structural_failures);
+		out.push(',');
+		out.push_str("\"stream-failures\":");
+		let _ = write!(out, "{}", self.stream_failures);
+		out.push(',');
+		out.push_str("\"io-failures\":");
+		let _ = write!(out, "{}", self.io_failures);
+		out.push(',');
+		out.push_str("\"faults\":");
+		out.push('[');
+		let mut v76 = true;
+		for v75 in self.faults.iter() {
+			if !v76 {
+				out.push(',');
+			}
+			v76 = false;
+			crate::codec::json_escape(v75, out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4023,25 +4120,57 @@ impl FsckReport {
 		out.push_str(", ");
 		out.push_str("damaged=");
 		out.push('[');
-		let mut v73 = true;
-		for v72 in self.damaged.iter() {
-			if !v73 {
+		let mut v78 = true;
+		for v77 in self.damaged.iter() {
+			if !v78 {
 				out.push_str(", ");
 			}
-			v73 = false;
-			out.push_str(v72);
+			v78 = false;
+			out.push_str(v77);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("structural-failures=");
+		let _ = write!(out, "{}", self.structural_failures);
+		out.push_str(", ");
+		out.push_str("stream-failures=");
+		let _ = write!(out, "{}", self.stream_failures);
+		out.push_str(", ");
+		out.push_str("io-failures=");
+		let _ = write!(out, "{}", self.io_failures);
+		out.push_str(", ");
+		out.push_str("faults=");
+		out.push('[');
+		let mut v80 = true;
+		for v79 in self.faults.iter() {
+			if !v80 {
+				out.push_str(", ");
+			}
+			v80 = false;
+			out.push_str(v79);
 		}
 		out.push(']');
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 2);
+		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "checksum-failures");
 		crate::codec::cbor::uint(out, self.checksum_failures as u64);
 		crate::codec::cbor::text(out, "damaged");
 		crate::codec::cbor::array(out, self.damaged.len());
-		for v74 in self.damaged.iter() {
-			crate::codec::cbor::text(out, v74);
+		for v81 in self.damaged.iter() {
+			crate::codec::cbor::text(out, v81);
+		}
+		crate::codec::cbor::text(out, "structural-failures");
+		crate::codec::cbor::uint(out, self.structural_failures as u64);
+		crate::codec::cbor::text(out, "stream-failures");
+		crate::codec::cbor::uint(out, self.stream_failures as u64);
+		crate::codec::cbor::text(out, "io-failures");
+		crate::codec::cbor::uint(out, self.io_failures as u64);
+		crate::codec::cbor::text(out, "faults");
+		crate::codec::cbor::array(out, self.faults.len());
+		for v82 in self.faults.iter() {
+			crate::codec::cbor::text(out, v82);
 		}
 	}
 }

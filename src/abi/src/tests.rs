@@ -1,3 +1,5 @@
+extern crate std;
+
 use super::log::{LogRecord, Severity, encode, render_cbor, render_json, render_text};
 use super::*;
 
@@ -56,10 +58,6 @@ fn log_record_roundtrip_and_renders() {
 // cannot drift from the constant it labels the way a hand-written string could.
 macro_rules! named {
 	($(($name:ident, $value:expr)),* $(,)?) => { &[$(($name, $value, stringify!($name))),*] };
-}
-
-macro_rules! named_only {
-	($($name:ident),* $(,)?) => { &[$(($name, stringify!($name))),*] };
 }
 
 // Every syscall number, snapshotted. A new call appends; an existing one never moves.
@@ -175,9 +173,15 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 // be a declaration and could not read it" is a different and much safer question than "did I find
 // one".
 fn declared_names(prefix: &str) -> alloc::vec::Vec<alloc::string::String> {
-	const SOURCE: &str = include_str!("lib.rs");
+	// EVERY MODULE, for the same reason `declared_repr_c_structs` reads every module: a completeness
+	// question answered from one file is a completeness question about one file.
+	let mut source = alloc::string::String::new();
+	for (_, text) in crate_sources() {
+		source.push_str(&text);
+		source.push('\n');
+	}
 	let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-	for line in SOURCE.lines() {
+	for line in source.lines() {
 		let Some(rest) = line.strip_prefix("pub const ") else { continue };
 		let Some(rest) = rest.strip_prefix(prefix) else { continue };
 		let Some((name, _)) = rest.split_once(':') else {
@@ -223,22 +227,32 @@ fn the_snapshot_names_every_syscall_the_crate_declares() {
 fn every_right_is_one_bit_and_rights_all_is_their_union() {
 	// `RIGHTS_ALL` was a hand-written 0xfff beside twelve individually defined bits. A thirteenth
 	// right added without touching the literal is a right that `RIGHTS_ALL` silently does not grant.
-	const RIGHTS: &[(u32, &str)] = named_only![
-		RIGHT_READ,
-		RIGHT_WRITE,
-		RIGHT_EXECUTE,
-		RIGHT_MAP,
-		RIGHT_SEND,
-		RIGHT_RECEIVE,
-		RIGHT_DUPLICATE,
-		RIGHT_TRANSFER,
-		RIGHT_REVOKE,
-		RIGHT_GET_INFO,
-		RIGHT_MANAGE,
-		RIGHT_WAIT
+	//
+	// AND THE BIT IS SNAPSHOTTED BESIDE THE NAME, which it was not. This used `named_only!`, so the
+	// four properties checked here - one bit each, no collision, the union is `RIGHTS_ALL`, no name
+	// missing - were ALL true of a list in which two rights had swapped values. Both are one bit,
+	// they do not collide, the union is unchanged and the names are the same set. Userspace passes
+	// raw rights bits across the syscall boundary, so a swap is a program that asks for read and is
+	// granted write; this is the same class the syscall-number snapshot exists to close, and the
+	// claim that the frozen snapshot checks values was true for `SYS_*` and `ERR_*` and not for
+	// these.
+	const RIGHTS: &[(u32, u32, &str)] = named![
+		(RIGHT_READ, 1 << 0),
+		(RIGHT_WRITE, 1 << 1),
+		(RIGHT_EXECUTE, 1 << 2),
+		(RIGHT_MAP, 1 << 3),
+		(RIGHT_SEND, 1 << 4),
+		(RIGHT_RECEIVE, 1 << 5),
+		(RIGHT_DUPLICATE, 1 << 6),
+		(RIGHT_TRANSFER, 1 << 7),
+		(RIGHT_REVOKE, 1 << 8),
+		(RIGHT_GET_INFO, 1 << 9),
+		(RIGHT_MANAGE, 1 << 10),
+		(RIGHT_WAIT, 1 << 11),
 	];
 	let mut union = 0u32;
-	for &(bit, name) in RIGHTS {
+	for &(bit, expected, name) in RIGHTS {
+		assert_eq!(bit, expected, "right {name} is {bit:#x} and the snapshot froze it at {expected:#x}; a rights bit is an ABI value userspace passes raw across the syscall boundary");
 		assert_eq!(bit.count_ones(), 1, "right {name} is not a single bit");
 		assert_eq!(union & bit, 0, "right {name} collides with one already defined");
 		union |= bit;
@@ -250,9 +264,110 @@ fn every_right_is_one_bit_and_rights_all_is_their_union() {
 	// twelve bits and `RIGHTS_ALL` correct over thirteen, and nothing would have said so.
 	let mut declared = declared_names("RIGHT_");
 	declared.sort();
-	let mut snapshot: alloc::vec::Vec<alloc::string::String> = RIGHTS.iter().map(|&(_, name)| alloc::string::String::from(name)).collect();
+	let mut snapshot: alloc::vec::Vec<alloc::string::String> = RIGHTS.iter().map(|&(_, _, name)| alloc::string::String::from(name)).collect();
 	snapshot.sort();
 	assert_eq!(declared, snapshot, "the crate declares {} `pub const RIGHT_*` and this list names {}; a right was added or removed without updating it", declared.len(), snapshot.len());
+}
+
+#[test]
+fn every_wire_stable_numeric_family_is_frozen_and_complete() {
+	// THE DECISION, made rather than deferred: these families ARE wire-stable and get the same
+	// snapshot `SYS_*` and `ERR_*` have.
+	//
+	// The question was whether to freeze them or to write down that they are not stable.
+	// `OBJECT_TYPE_*` settles it - `abi` documents it as a stable ABI code, and userspace matches on
+	// the raw number that `SYS_OBJECT_INFO_GET` returns - and once one family is in, the argument
+	// for the rest is identical: every one of these crosses the syscall boundary as a bare integer
+	// that a userspace program compares against a constant it was compiled with.
+	//
+	// NOTHING IS VERSIONED BEFORE THE FIRST RELEASE, so today a changed object-type code is a
+	// rebuild rather than a break. That is the reason to do this NOW and not the reason to skip it:
+	// after the release, two codes that moved through a green suite are a compatibility break
+	// nobody can undo. The cost while it is cheap is one test.
+	//
+	// Each family is checked for VALUES (the snapshot below, which is the only thing that can catch
+	// a code moving) and for COMPLETENESS (`declared_names`, which is what catches one added without
+	// being frozen). A generated list would move with the constants and prove neither.
+	const OBJECT_TYPES: &[(u64, u64, &str)] = named![
+		(OBJECT_TYPE_DOMAIN, 0),
+		(OBJECT_TYPE_PROCESS, 1),
+		(OBJECT_TYPE_THREAD, 2),
+		(OBJECT_TYPE_ADDRESS_SPACE, 3),
+		(OBJECT_TYPE_MEMORY_OBJECT, 4),
+		(OBJECT_TYPE_CHANNEL, 5),
+		(OBJECT_TYPE_EVENT, 6),
+		(OBJECT_TYPE_TIMER, 7),
+		(OBJECT_TYPE_INTERRUPT, 8),
+		(OBJECT_TYPE_DEVICE_MEMORY, 9),
+		(OBJECT_TYPE_DMA_BUFFER, 10),
+		(OBJECT_TYPE_PROCESS_GROUP, 11),
+		(OBJECT_TYPE_PRIVILEGE, 12),
+		(OBJECT_TYPE_WAIT_SET, 13),
+	];
+	const PROC_STATES: &[(u64, u64, &str)] = named![(PROC_STATE_RUNNING, 0), (PROC_STATE_STOPPED, 1), (PROC_STATE_FAILED, 2)];
+	// The POSIX numbers, deliberately: a program written against `kill -9` means nine.
+	const SIGNALS: &[(u64, u64, &str)] = named![(SIG_INT, 2), (SIG_KILL, 9), (SIG_TERM, 15), (SIG_CONT, 18), (SIG_STOP, 19)];
+	const PROPERTIES: &[(u64, u64, &str)] = named![(PROP_NAME, 0), (PROP_MEMORY_LIMIT, 1), (PROP_HANDLE_LIMIT, 2), (PROP_THREAD_LIMIT, 3), (PROP_DMA_LIMIT, 4), (PROP_IPC_QUEUE_LIMIT, 5), (PROP_STACK_LIMIT, 6),];
+	const POWER: &[(u64, u64, &str)] = named![(POWER_REBOOT, 0), (POWER_OFF, 1)];
+	const MEMMAP: &[(u32, u32, &str)] = named![
+		(MEMMAP_USABLE, 0),
+		(MEMMAP_RESERVED, 1),
+		(MEMMAP_ACPI_RECLAIMABLE, 2),
+		(MEMMAP_ACPI_NVS, 3),
+		(MEMMAP_BAD, 4),
+		(MEMMAP_BOOTLOADER, 5),
+		(MEMMAP_KERNEL, 6),
+		(MEMMAP_FRAMEBUFFER, 7),
+	];
+	const IRQ_KINDS: &[(u32, u32, &str)] = named![(IRQ_KIND_FIXED, 0), (IRQ_KIND_MSI, 1)];
+
+	// Written twice, once per width, rather than through a generic: this crate is `no_std` and
+	// dependency-free by policy, and a trait bound to save four lines is not worth a `num` import.
+	fn check_u64(family: &str, rows: &[(u64, u64, &str)]) {
+		let mut seen: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+		for &(value, expected, name) in rows {
+			assert_eq!(value, expected, "{name} is {value} and the snapshot froze it at {expected}; userspace compares this code raw across the syscall boundary");
+			assert!(!seen.contains(&value), "{family}: {name} reuses code {value}");
+			seen.push(value);
+		}
+	}
+	fn check_u32(family: &str, rows: &[(u32, u32, &str)]) {
+		let mut seen: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+		for &(value, expected, name) in rows {
+			assert_eq!(value, expected, "{name} is {value} and the snapshot froze it at {expected}; userspace compares this code raw across the syscall boundary");
+			assert!(!seen.contains(&value), "{family}: {name} reuses code {value}");
+			seen.push(value);
+		}
+	}
+	fn complete_u64(prefix: &str, rows: &[(u64, u64, &str)]) {
+		let mut declared = declared_names(prefix);
+		declared.sort();
+		let mut snapshot: alloc::vec::Vec<alloc::string::String> = rows.iter().map(|&(_, _, name)| alloc::string::String::from(name)).collect();
+		snapshot.sort();
+		assert_eq!(declared, snapshot, "the crate declares {} `pub const {prefix}` and the snapshot names {}; one was added or removed without freezing it", declared.len(), snapshot.len());
+	}
+	fn complete_u32(prefix: &str, rows: &[(u32, u32, &str)]) {
+		let mut declared = declared_names(prefix);
+		declared.sort();
+		let mut snapshot: alloc::vec::Vec<alloc::string::String> = rows.iter().map(|&(_, _, name)| alloc::string::String::from(name)).collect();
+		snapshot.sort();
+		assert_eq!(declared, snapshot, "the crate declares {} `pub const {prefix}` and the snapshot names {}; one was added or removed without freezing it", declared.len(), snapshot.len());
+	}
+
+	check_u64("OBJECT_TYPE", OBJECT_TYPES);
+	complete_u64("OBJECT_TYPE_", OBJECT_TYPES);
+	check_u64("PROC_STATE", PROC_STATES);
+	complete_u64("PROC_STATE_", PROC_STATES);
+	check_u64("SIG", SIGNALS);
+	complete_u64("SIG_", SIGNALS);
+	check_u64("PROP", PROPERTIES);
+	complete_u64("PROP_", PROPERTIES);
+	check_u64("POWER", POWER);
+	complete_u64("POWER_", POWER);
+	check_u32("MEMMAP", MEMMAP);
+	complete_u32("MEMMAP_", MEMMAP);
+	check_u32("IRQ_KIND", IRQ_KINDS);
+	complete_u32("IRQ_KIND_", IRQ_KINDS);
 }
 
 #[test]
@@ -342,11 +457,41 @@ macro_rules! assert_layout {
 	}};
 }
 
-// The `repr(C)` structs this crate declares, read out of its own source.
+// Every `.rs` file this crate is built from, read at test time.
+//
+// `include_str!("lib.rs")` and nothing else is what the parser below used to read, so the
+// completeness argument it supports was about ONE FILE while claiming to be about the crate. That
+// is not hypothetical here: `src/abi` already has three modules - `lib.rs`, `log.rs` and
+// `bootstrap.rs` - and today every `repr(C)` struct happens to live in `lib.rs`, which is the only
+// reason the count matched. A marshalled struct added to either of the others would have been
+// invisible to the test whose whole purpose is that no marshalled struct is invisible.
+//
+// Read from the filesystem rather than through `include_str!` because the set of files is the
+// question: a macro that has to name each file cannot notice a new one. `CARGO_MANIFEST_DIR` is
+// resolved at compile time and the directory is walked at run time, so adding a module needs no
+// edit here.
+fn crate_sources() -> alloc::vec::Vec<(alloc::string::String, alloc::string::String)> {
+	let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+	let mut out: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = alloc::vec::Vec::new();
+	for entry in std::fs::read_dir(root).expect("this crate's own source directory is readable") {
+		let path = entry.expect("a readable directory entry").path();
+		if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+			continue;
+		}
+		let name = alloc::string::String::from(path.file_name().and_then(|name| name.to_str()).unwrap_or(""));
+		let source = std::fs::read_to_string(&path).expect("a readable source file");
+		out.push((name, source));
+	}
+	assert!(out.len() >= 3, "this crate has at least lib.rs, log.rs and bootstrap.rs; the scan found {}", out.len());
+	out.sort();
+	out
+}
+
+// The `repr(C)` structs one source file declares.
 //
 // Nine structs, nine layout assertions, and nothing that said the two numbers must match. This is
-// what makes the no-implicit-padding property above cover the CRATE rather than the nine structs
-// somebody listed.
+// what makes the no-implicit-padding property cover the CRATE rather than the nine structs somebody
+// listed.
 //
 // AND THE SPELLING IS A RULE, not a coincidence the parser happens to match. It compared against the
 // exact string `#[repr(C)]`, so `#[repr(C, align(8))]` or `#[repr(C, packed)]` would have been read
@@ -354,33 +499,89 @@ macro_rules! assert_layout {
 // answers to that were defensible - accept every `#[repr(C..)]` form, or state that an ABI struct
 // carries exactly `#[repr(C)]` - and this is the second one, made explicit: a struct whose layout is
 // modified by `packed` or `align` has a different contract with userspace and must be a decision
-// somebody makes rather than a spelling this test skips. All nine structs in the crate satisfy it
-// today, so the rule costs nothing and closes the hole.
-fn declared_repr_c_structs() -> alloc::vec::Vec<alloc::string::String> {
-	const SOURCE: &str = include_str!("lib.rs");
+// somebody makes rather than a spelling this test skips.
+//
+// AND IT FAILS CLOSED. The old version cleared `marked` on any line it did not recognise, so
+//
+//     #[repr(C)]
+//     #[cfg(target_arch = "x86_64")]
+//     pub struct Foo { .. }
+//
+// was not refused - `Foo` simply never entered the list the completeness test compares against, and
+// a struct nobody checks is precisely what this machinery exists to make impossible. An
+// unrecognised line between a `#[repr(..)]` and its declaration is now a panic naming the file and
+// the line, the same way an unreadable `#[repr(..)]` spelling already was. A `#[repr(u8)]` on an
+// ENUM is not this test's business and ends the run quietly; anything else is a human decision.
+//
+// A PARSER THAT DECIDES WHAT GETS CHECKED IS ITSELF SOMETHING THAT HAS TO BE CHECKED, which is why
+// this takes its source as an argument: `the_repr_c_parser_sees_what_it_claims_to_see` drives it
+// over synthetic files covering every branch, including the two that used to be silent.
+fn repr_c_structs_in(file: &str, source: &str) -> alloc::vec::Vec<alloc::string::String> {
 	let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-	let mut marked = false;
-	for line in SOURCE.lines() {
-		let line = line.trim();
+	let mut marked: Option<alloc::string::String> = None;
+	for (index, raw) in source.lines().enumerate() {
+		let line = raw.trim();
+		let number = index + 1;
 		if line.starts_with("#[repr(") {
-			assert_eq!(line, "#[repr(C)]", "this crate's marshalled types carry exactly `#[repr(C)]`; `{line}` changes the layout userspace is compiled against and has to be a decision rather than a spelling this test does not recognise");
-			marked = true;
+			marked = Some(alloc::string::String::from(line));
 			continue;
 		}
-		if let Some(rest) = line.strip_prefix("pub struct ")
-			&& marked
-		{
-			let name = rest.split(|c: char| c == ' ' || c == '{' || c == '<').next().unwrap_or("");
+		let Some(repr) = marked.clone() else { continue };
+		// A `#[derive(..)]`, a comment or a blank line between the marker and the declaration.
+		if line.starts_with("#[derive") || line.starts_with("//") || line.is_empty() {
+			continue;
+		}
+		if let Some(rest) = line.strip_prefix("pub struct ") {
+			assert_eq!(repr, "#[repr(C)]", "{file}:{number}: this crate's marshalled types carry exactly `#[repr(C)]`; `{repr}` changes the layout userspace is compiled against and has to be a decision rather than a spelling this test does not recognise");
+			// `;` and `(` as well as `{` and `<`: a unit struct and a tuple struct are structs, and
+			// splitting on the brace alone read `pub struct Spaced;` as a type named `Spaced;`.
+			// Found by the parser's own test, which is what that test is for.
+			let name = rest.split(|c: char| c == ' ' || c == '{' || c == '<' || c == ';' || c == '(').next().unwrap_or("");
+			assert!(!name.is_empty(), "{file}:{number}: a `pub struct` whose name this test cannot read: {line}");
 			out.push(alloc::string::String::from(name));
-			marked = false;
+			marked = None;
 			continue;
 		}
-		// A `#[derive(..)]` between the two is expected; anything else ends the run.
-		if !line.starts_with("#[derive") && !line.starts_with("//") && !line.is_empty() {
-			marked = false;
+		// A representation on an ENUM or a UNION fixes a discriminant or a layout this test says
+		// nothing about, and `#[repr(u8)]` on an enum is ordinary. Ends the run without a verdict.
+		if line.starts_with("pub enum ") || line.starts_with("enum ") || line.starts_with("pub union ") || line.starts_with("union ") {
+			marked = None;
+			continue;
 		}
+		// FAIL CLOSED. Anything else between a representation and its declaration - a `cfg`, an
+		// `allow`, a visibility this test does not read, a doc attribute - would have dropped the
+		// declaration out of the covered set in silence.
+		panic!("{file}:{number}: `{repr}` is followed by a line this test cannot read, so whatever it marks would silently leave the covered set: {line}");
 	}
 	out
+}
+
+// Every `repr(C)` struct the crate declares, across every module.
+fn declared_repr_c_structs() -> alloc::vec::Vec<alloc::string::String> {
+	let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+	for (file, source) in crate_sources() {
+		out.extend(repr_c_structs_in(&file, &source));
+	}
+	out
+}
+
+#[test]
+fn the_repr_c_parser_sees_what_it_claims_to_see() {
+	// The completeness test is only as good as the parser that feeds it, and both of the ways this
+	// parser used to lose a struct were silent - which is the failure mode that survives a green
+	// suite indefinitely.
+	assert_eq!(repr_c_structs_in("t.rs", "#[repr(C)]\npub struct Plain { a: u32 }\n"), alloc::vec!["Plain"], "the ordinary shape");
+	assert_eq!(repr_c_structs_in("t.rs", "#[repr(C)]\n#[derive(Clone, Copy)]\n// a comment\n\npub struct Spaced;\n"), alloc::vec!["Spaced"], "derives, comments and blank lines sit between the marker and the declaration");
+	assert_eq!(repr_c_structs_in("t.rs", "#[repr(u8)]\npub enum Kind { A }\n"), alloc::vec::Vec::<alloc::string::String>::new(), "a representation on an enum is not this test's business");
+	assert_eq!(repr_c_structs_in("t.rs", "pub struct Unmarked;\n"), alloc::vec::Vec::<alloc::string::String>::new(), "a struct with no representation is not marshalled");
+	assert_eq!(repr_c_structs_in("t.rs", "#[repr(C)]\npub struct One;\n#[repr(C)]\npub struct Two;\n"), alloc::vec!["One", "Two"], "the marker does not leak from one declaration to the next");
+
+	// THE TWO SILENT LOSSES, now loud.
+	let cfg_between = std::panic::catch_unwind(|| repr_c_structs_in("t.rs", "#[repr(C)]\n#[cfg(target_arch = \"x86_64\")]\npub struct Hidden { a: u32 }\n"));
+	assert!(cfg_between.is_err(), "an attribute the parser does not know sits between the marker and the declaration, and the struct would leave the covered set in silence");
+
+	let modified_layout = std::panic::catch_unwind(|| repr_c_structs_in("t.rs", "#[repr(C, packed)]\npub struct Packed { a: u32 }\n"));
+	assert!(modified_layout.is_err(), "a representation that modifies the layout is a decision rather than a spelling this test skips");
 }
 
 #[test]

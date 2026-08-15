@@ -50,10 +50,13 @@ impl PixelFormat {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<PixelFormat> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PixelFormat> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = PixelFormat::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -112,10 +115,13 @@ impl SurfaceInfo {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<SurfaceInfo> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SurfaceInfo> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = SurfaceInfo::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -181,10 +187,13 @@ impl DisplayEvent {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<DisplayEvent> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<DisplayEvent> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = DisplayEvent::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -246,10 +255,13 @@ impl PresentationStats {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<PresentationStats> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PresentationStats> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = PresentationStats::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

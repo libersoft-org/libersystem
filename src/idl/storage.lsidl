@@ -93,11 +93,35 @@ record volume-status {
 	filesystem:  string,
 }
 
-/// What a volume integrity check found: how many data blocks failed their checksum,
-/// and the paths of the damaged files - so the operator knows what to restore.
+/// What a volume integrity check found, BY CATEGORY, and the paths of the damaged files - so the
+/// operator knows what to restore and, before that, which of three different problems they have.
+///
+/// The categories are not a refinement of one number; they drive different actions.
+///
+/// - `checksum-failures`: a block came back and is not what was written. The medium corrupted it.
+/// - `io-failures`: the medium would not answer at all. Not the same fault, and often not the
+///   filesystem's at all - copy the volume elsewhere and check it there.
+/// - `structural-failures`: every byte is what was written and what was written cannot be true - a
+///   tree deeper than the format permits, a pointer to a block the volume does not have, a block
+///   that is not a node, a record outside the key interval that routes to it, one inode reachable
+///   under two names. Re-reading will never change these.
+/// - `stream-failures`: every block matched its checksum and the compressed stream still does not
+///   decode.
+/// - `faults`: what the structural pass has to SAY, one line each. A count tells an operator
+///   something is wrong; these tell them what.
+///
+/// This record carried the first field and `damaged` alone until 2026-08-16, while the
+/// implementation behind it had kept all five apart for several rounds - so the entire taxonomy
+/// existed for unit tests and for a direct Rust caller of the crate, and not through `volume.fsck()`,
+/// which is the only way the system exposes it. An operator was shown one number that folded a
+/// failing disk, wrong metadata and an undecodable stream together.
 record fsck-report {
-	checksum-failures: u32,
-	damaged:           list<string>,
+	checksum-failures:   u32,
+	damaged:             list<string>,
+	structural-failures: u32,
+	stream-failures:     u32,
+	io-failures:         u32,
+	faults:              list<string>,
 }
 
 /// PATHS. A `vol://` path is `/`-separated, and this contract states the rule its backends must

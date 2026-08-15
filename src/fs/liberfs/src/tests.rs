@@ -5292,3 +5292,112 @@ fn one_inode_with_two_names_is_refused_by_the_mount_and_named_by_fsck() {
 	assert!(under_a == b"shared" || under_a == b"other", "and they are one of the two files that were written");
 	assert_eq!(remounted.remove(b"a.txt"), Err(FsError::ReadOnly), "and the removal that would free the shared inode is refused");
 }
+
+#[test]
+fn a_refused_allocation_inside_commit_does_not_leave_the_operation_to_be_published_later() {
+	// THE SHAPE `finish()` CANNOT REPAIR. It calls `abort()` when the transaction BODY fails; a
+	// body that succeeded goes straight to `commit()`, and `commit()`'s error is returned unchanged.
+	// So the one `?` inside `commit()` before the point of no return - building the next
+	// generation's dead list - returned `NoMemory` with the transaction still open: `self.txn`
+	// holding the rollback snapshot, `inode_root` pointing at the new uncommitted root, and `fresh`
+	// and `dead` holding the failed operation's blocks.
+	//
+	// The visible consequence is not the refusal. It is what the NEXT mutation does: `begin()`
+	// overwrites the rollback snapshot and clears both sets, and the commit after it publishes the
+	// root the refused operation left behind - an operation whose caller was told it failed,
+	// committed, under an unrelated write's generation.
+	//
+	// That is what this checks, and it is why the second write is here. A test that only asserted
+	// "the refused write is not on the volume" passes against the defect, because at that moment it
+	// is not: it is in memory, waiting for somebody else's commit to carry it.
+	//
+	// A SWEEP, because which allocation is the one inside `commit` depends on everything the write
+	// did first, and a pinned budget stops testing the moment that changes.
+	let nblocks: u64 = 512;
+	let mut published = 0usize;
+	let mut refusals = 0usize;
+	for budget in 0..96 {
+		let mut fs = LiberFs::format_scratch(MemDevice::new(nblocks), nblocks).unwrap();
+		fs.write_file(b"keep", b"original").unwrap();
+
+		let refused = {
+			let _armed = fail_one_allocation_after(budget);
+			fs.write_file(b"ghost", b"should not exist")
+		};
+		let Err(error) = refused else { continue };
+		assert!(matches!(error, FsError::NoMemory | FsError::NoSpace), "budget {budget}: a starved allocator answers NoMemory or NoSpace, not {error:?}");
+		refusals += 1;
+
+		// An UNRELATED, successful mutation. This is the commit that used to carry the refused
+		// operation's root onto the medium.
+		if fs.write_file(b"after", b"unrelated").is_err() {
+			// The volume may have gone read-only (a `CommitUncertain` path) or be genuinely out of
+			// room; either way there is no later commit to publish anything and this budget has
+			// nothing to say.
+			continue;
+		}
+
+		// Re-mounted from the device, so the question is about the MEDIUM rather than about a cache.
+		let mut remounted = LiberFs::mount(fs.into_device()).expect("the volume still mounts");
+		assert_eq!(remounted.read_file(b"keep").as_deref(), Ok(&b"original"[..]), "budget {budget}: the file written before the refusal survives");
+		assert_eq!(remounted.read_file(b"after").as_deref(), Ok(&b"unrelated"[..]), "budget {budget}: the unrelated write that followed is on the volume");
+		if remounted.read_file(b"ghost").is_ok() {
+			published += 1;
+		}
+	}
+	assert!(refusals > 0, "no allocation budget produced a refused write, so this swept nothing");
+	assert_eq!(published, 0, "{published} of {refusals} refused write(s) were published by the unrelated commit that followed - the caller was told NoMemory and the operation landed anyway");
+}
+
+#[test]
+fn the_snapshot_checker_refuses_a_block_that_is_not_a_node() {
+	// `read_node` checks the pointer bounds, the device read and the CRC, and NOTHING about what
+	// the block is. `check_inode_tree` then tested `node_type(&buf) == NODE_LEAF` and treated every
+	// other value as an internal node - so a corrupted or forged type byte turned a leaf into an
+	// internal node and its inode records into child pointers, inside the checker whose job is to
+	// notice exactly that. It then descended into whatever those bytes named.
+	//
+	// The raw marking walk in `derive_free` has required the byte to be one of the two values that
+	// exist for some time; this is the same rule in the pass that reports, and the point of the test
+	// is that the two checkers agree by construction rather than by coincidence.
+	//
+	// DRIVEN DIRECTLY rather than through `fsck()`. `derive_free` visits the snapshot trees too and
+	// would flag the same block, so a whole-report assertion cannot tell which pass noticed - it
+	// would be green with this checker still walking garbage. Calling it is what isolates it.
+	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
+	for i in 0..8u32 {
+		fs.write_file(format!("f{i}").as_bytes(), b"payload").unwrap();
+	}
+	fs.create_snapshot(b"s1").unwrap();
+	let mut dev = fs.into_device();
+
+	// The snapshot's inode-tree root, with its type byte set to a value that is neither node type
+	// and every checksum above it re-stamped, so the medium looks perfect and the only thing wrong
+	// is that the block claims to be something that does not exist.
+	let slot = active_slot(&dev);
+	let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
+	let snap_start = sb.snap_root as usize * BLOCK_SIZE;
+	let rec = snap_start + SNAP_HDR;
+	let root = u64::from_le_bytes(dev.blocks[rec + SNAP_ROOT_OFF..rec + SNAP_ROOT_OFF + 8].try_into().unwrap());
+	let node = root as usize * BLOCK_SIZE;
+	assert_eq!(dev.blocks[node], NODE_LEAF, "the fixture's snapshot root must be a leaf, or this forges the wrong thing");
+	dev.blocks[node] = 7;
+	let node_crc = crc32c(&dev.blocks[node..node + BLOCK_SIZE]);
+	dev.blocks[rec + SNAP_ROOT_CRC_OFF..rec + SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&node_crc.to_le_bytes());
+	let snap_crc = crc32c(&dev.blocks[snap_start..snap_start + BLOCK_SIZE]);
+	for s in 0..SUPER_SLOTS as usize {
+		if parse_superblock(&dev.blocks[s * BLOCK_SIZE..(s + 1) * BLOCK_SIZE]).is_some_and(|sb| sb.snap_root as usize * BLOCK_SIZE == snap_start) {
+			forge_superblock(&mut dev, s, |sb| sb[SB_SNAP_ROOT_CRC_OFF..SB_SNAP_ROOT_CRC_OFF + 4].copy_from_slice(&snap_crc.to_le_bytes()));
+		}
+	}
+
+	let mut fs = LiberFs::mount(dev).expect("every checksum still matches, so it mounts");
+	let mut visited = try_zeroed(fs.num_blocks.div_ceil(8) as usize).unwrap();
+	let mut tally = crate::fsck::StructureTally::default();
+	let bad = fs.check_inode_tree(root, node_crc, TREE_DEPTH_MAX, &mut visited, &mut tally).expect("the checker answers rather than failing");
+
+	assert_eq!(tally.structural, 1, "a block that is neither node type is one structural fault: {tally:?}");
+	assert_eq!(bad, 0, "and not a checksum failure - every checksum over this volume matches");
+	assert_eq!(tally.checksum, 0, "nor a checksum fault found by descending into it: {tally:?}");
+	assert_eq!(tally.io, 0, "and the medium answered every read: {tally:?}");
+}

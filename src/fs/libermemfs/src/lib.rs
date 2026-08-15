@@ -151,6 +151,51 @@ fn find_mut<'a>(children: &'a mut Children, name: &str) -> Option<&'a mut Node> 
 }
 
 // Insert or replace, reserving the slot before anything is moved into it.
+// What `Vec::try_reserve(1)` grows a table to, when the table is full.
+//
+// `RawVec::grow_amortized` takes `max(capacity * 2, required)` and then raises it to a floor that
+// depends on the element size - eight slots for a one-byte element, four for anything up to a
+// kilobyte, one above that - and stores exactly that number as the new `capacity()`. So this is not
+// an estimate of what the ALLOCATOR gave back; it is what `Vec` will ask for and then report, which
+// is the number `metadata_bytes()` reads.
+//
+// It is predicted rather than measured because the ceiling has to be decided BEFORE the allocation:
+// a table that grew past the limit cannot be put back, since `shrink_children` keeps a table within
+// a factor of four of its contents and would leave the growth in place. `a_full_table_grows_the_way
+// _the_metadata_ceiling_predicts` in the test module checks the prediction against a real `Vec`, so
+// a change in the standard library's growth policy is a failing test rather than a silent ceiling
+// that no longer holds.
+fn grown_capacity(capacity: usize, required: usize) -> usize {
+	let floor = if SLOT_BYTES == 1 {
+		8
+	} else if SLOT_BYTES <= 1024 {
+		4
+	} else {
+		1
+	};
+	capacity.saturating_mul(2).max(required).max(floor)
+}
+
+// Would one more entry in a table of `capacity` slots holding `len` of them keep the volume's
+// directory tables within `ceiling`, given that they hold `metadata` bytes right now?
+//
+// A PURE FUNCTION OF FOUR NUMBERS, so the rule can be exercised AT the ceiling - which a volume
+// cannot be driven to. `MAX_METADATA_BYTES` is four times the entire node budget and
+// `shrink_children` keeps every table within a factor of four of its contents, so building that
+// state through the public API would need more entries than a volume is allowed to hold. The rule
+// is the thing worth testing; the volume is what applies it. See
+// `the_metadata_ceiling_is_decided_against_the_table_the_entry_grows`.
+fn metadata_admits_a_slot(metadata: usize, capacity: usize, len: usize, ceiling: usize) -> bool {
+	// An insert into a table with a spare slot allocates nothing, so no metadata ceiling can have
+	// anything to say about it. The old rule refused this at exactly the boundary, because the
+	// question it asked was about the volume rather than about the work.
+	if len < capacity {
+		return true;
+	}
+	let grown = grown_capacity(capacity, len + 1);
+	metadata.saturating_sub(capacity * SLOT_BYTES).saturating_add(grown * SLOT_BYTES) <= ceiling
+}
+
 fn insert(children: &mut Children, name: String, node: Node) -> Result<(), FsError> {
 	match children.binary_search_by(|(key, _)| key.as_str().cmp(name.as_str())) {
 		Ok(at) => {
@@ -342,17 +387,25 @@ pub struct LiberMemFs {
 struct Pending {
 	path: Vec<u8>,
 	data: Vec<u8>,
-	// The destination's final name, ALLOCATED AT BEGIN and moved into the tree at commit.
+	// THE NAME IS NOT HELD HERE, and this block used to say it was - describing a `name` field
+	// "allocated at begin and moved into the tree at commit", with a `None for a replace` state,
+	// beside a struct whose fields are `path`, `data`, `placeholder` and `offered`. The comment
+	// outlived two revisions of the design it was written for.
 	//
-	// A stream is allowed roughly `capacity - path.len()`, and the pending state then holds the
-	// path plus that data - the whole capacity. `stream_commit` used to allocate a fresh `String`
-	// for the name at the very end, so a transfer could accept one hundred per cent of what it was
-	// promised and then fail on a few bytes of metadata, after the sender had done all the work.
-	// Allocating it up front turns that into a refusal at `stream_begin`, before anything is sent.
+	// The problem it names is real and is still solved, by a different mechanism. A stream is
+	// allowed roughly `capacity - path.len()`, and the pending state then holds the path plus that
+	// data - the whole capacity - so `stream_commit` allocating a fresh `String` for the name at
+	// the very end meant a transfer could accept one hundred per cent of what it was promised and
+	// then fail on a few bytes of metadata, after the sender had done all the work.
 	//
-	// `None` for a replace, where the name is already in the tree.
-	// Whether `stream_begin` put an empty file at the path to hold the name and the slot. An abort
-	// takes it away again; a commit writes over it.
+	// What `stream_begin` does now is stronger than holding the name: it puts a `Node::Claimed`
+	// entry in the tree, which pays for the name AND the directory slot up front and takes the path
+	// out of anyone else's reach for the stream's lifetime. So the name is in the tree rather than
+	// in this struct, and `footprint()` counts it there - which is why that function's comment says
+	// counting it here as well would be double-counting.
+	//
+	// Whether `stream_begin` created that entry rather than claiming a file that was already there.
+	// An abort takes a created one away and puts a claimed one back; a commit writes over either.
 	placeholder: bool,
 	// How many bytes the last `stream_spare` handed out and nobody has accounted for yet.
 	//
@@ -483,7 +536,7 @@ impl LiberMemFs {
 				// destination's metadata is prepared up front so a commit cannot fail on it after
 				// the whole transfer has been accepted. Whatever begin charges, this must promise.
 				let cost = pending + parts.last().map_or(0, |name| name.len());
-				if !self.room_for_an_entry() || free < cost {
+				if !self.room_for_an_entry(parts) || free < cost {
 					return Err(FsError::NoSpace);
 				}
 				Ok((free - cost).min(MAX_FILE_BYTES))
@@ -507,7 +560,7 @@ impl LiberMemFs {
 			Some(Node::Directory(_)) => Err(FsError::IsDir),
 			// A new entry pays for its name out of the same free space.
 			None => {
-				if !self.room_for_an_entry() {
+				if !self.room_for_an_entry(parts) {
 					return Err(FsError::NoSpace);
 				}
 				let name = parts.last().map_or(0, |name| name.len());
@@ -682,16 +735,57 @@ impl LiberMemFs {
 		}
 	}
 
-	// Whether the volume may take another entry, by BOTH limits: the count of live nodes and the
-	// bytes its directory tables hold. Two rules rather than one because they bound different
-	// things - MAX_ENTRIES bounds what exists, MAX_METADATA_BYTES bounds what was kept - and the
-	// second is the one a caller can drive without limit through fill-and-empty cycles.
+	// Walk to the parent of `parts` without borrowing mutably. The read-only twin of `parent_mut`,
+	// for the preflight answers (`stream_len`, `writable_len`) that must give the same verdict as
+	// the write without being allowed to change anything.
+	fn parent(&self, parts: &[&str]) -> Result<&Children, FsError> {
+		let (_, directories) = parts.split_last().ok_or(FsError::BadName)?;
+		let mut node = &self.root;
+		for part in directories {
+			let Node::Directory(children) = node else { return Err(FsError::NotDir) };
+			node = find(children, part).ok_or(FsError::NotFound)?;
+		}
+		match node {
+			Node::Directory(children) => Ok(children),
+			Node::File(_) | Node::Claimed(_) => Err(FsError::NotDir),
+		}
+	}
+
+	// Whether the volume may take another entry AT `parts`, by BOTH limits: the count of live nodes
+	// and the bytes its directory tables would hold AFTERWARDS. Two rules rather than one because
+	// they bound different things - MAX_ENTRIES bounds what exists, MAX_METADATA_BYTES bounds what
+	// was kept - and the second is the one a caller can drive without limit through fill-and-empty
+	// cycles.
 	//
-	// Reaching the metadata ceiling should not happen: `shrink_children` keeps every table within a
-	// factor of four of its contents. It is here so that "should not" is enforced rather than
-	// argued.
-	fn room_for_an_entry(&self) -> bool {
-		self.root.count() < MAX_ENTRIES && (self.metadata_bytes() as usize) < MAX_METADATA_BYTES
+	// AGAINST THE RESULT, AND FOR THE DESTINATION'S OWN TABLE. This was
+	// `self.root.count() < MAX_ENTRIES && self.metadata_bytes() < MAX_METADATA_BYTES` - a check on
+	// the state BEFORE the allocation, with no idea which table the entry was going into - and it
+	// was wrong in both directions.
+	//
+	// It let an insert finish above the ceiling: `insert` does `children.try_reserve(1)`, which may
+	// DOUBLE the table rather than add one slot, so a table admitted a byte below the limit could
+	// come back megabytes above it, with no post-check and no rollback. "A hard ceiling on live and
+	// retained directory tables" was a ceiling on the state before the allocation.
+	//
+	// And it refused an insert that needed no allocation at all: at exactly the boundary, a table
+	// with a free slot already in it was turned away, because the question asked was about the
+	// volume rather than about the work.
+	//
+	// Reaching this ceiling should not happen either way: `shrink_children` keeps every table
+	// within a factor of four of its contents. It is here so that "should not" is enforced rather
+	// than argued - which is only true if what it enforces is the result.
+	fn room_for_an_entry(&self, parts: &[&str]) -> bool {
+		self.root.count() < MAX_ENTRIES && self.room_for_an_entry_by_bytes(parts)
+	}
+
+	// The metadata half alone, for `rename` - which moves an entry rather than adding one, so the
+	// node count is unchanged and only the destination table's growth is in question.
+	fn room_for_an_entry_by_bytes(&self, parts: &[&str]) -> bool {
+		// A missing or non-directory parent is not a metadata question - the insert will refuse it
+		// on its own, with a better error than `NoSpace`. Answering `true` leaves that refusal
+		// where it belongs.
+		let Ok(children) = self.parent(parts) else { return true };
+		metadata_admits_a_slot(self.metadata_bytes() as usize, children.capacity(), children.len(), MAX_METADATA_BYTES)
 	}
 
 	// Give up the whole reservation. The vector and the byte count move together and must never
@@ -855,7 +949,7 @@ impl LiberMemFs {
 			Some(Node::Claimed(_)) => return Err(FsError::Exists),
 			Some(Node::File(existing)) => (existing.capacity(), existing.capacity().max(data.len()), false),
 			None => {
-				if !self.room_for_an_entry() {
+				if !self.room_for_an_entry(parts) {
 					return Err(FsError::NoSpace);
 				}
 				(0, data.len(), true)
@@ -920,9 +1014,32 @@ impl LiberMemFs {
 	// The destination is validated NOW, so a stream to a missing parent or to a directory is
 	// refused before a byte is taken, and the caller learns it while it still costs nothing.
 	pub fn stream_begin(&mut self, path: &[u8]) -> Result<(), FsError> {
+		// THE RESYNC HAPPENS AFTER THE LOCALS ARE GONE, which is why this is a wrapper.
+		//
+		// Two refusal branches inside used to resync while an allocation they had just made was
+		// still a live local: `owned` after `extend_from_slice` succeeded, and `owned` plus
+		// `owned_name` when the `insert` failed. Neither was in `self.pending` and neither was in
+		// the tree, so `footprint()` could not see them - and `resync_reservation` therefore tried
+		// to take back the WHOLE declared free capacity while part of the heap was still held by
+		// memory nothing was accounting for. On a tight heap the regrow came up short, the locals
+		// dropped at the `return`, no second resync ever ran, and the volume was left answering
+		// `NoSpace` with `reservation_intact() == false` - the invariant this filesystem documents
+		// as restored by every refusal.
+		//
+		// `write_file`, `truncate` and `stream_commit` all have this shape already: the fallible
+		// work happens in an `_unsynced` body whose temporaries are destroyed by the return, and
+		// the caller resynchronises once, unconditionally, on both endings. It is not an
+		// improvement in tidiness - it is the only ordering under which the resync sees the heap
+		// the volume actually has.
 		if self.pending.is_some() {
 			return Err(FsError::Invalid);
 		}
+		let begun = self.stream_begin_unsynced(path);
+		self.resync_reservation();
+		begun
+	}
+
+	fn stream_begin_unsynced(&mut self, path: &[u8]) -> Result<(), FsError> {
 		let (parts, count) = Self::segments(path)?;
 		let parts = &parts[..count];
 		if parts.is_empty() {
@@ -935,7 +1052,7 @@ impl LiberMemFs {
 			Some(Node::Claimed(_)) => return Err(FsError::Exists),
 			Some(Node::File(_)) => false,
 			None => {
-				if !self.room_for_an_entry() {
+				if !self.room_for_an_entry(parts) {
 					return Err(FsError::NoSpace);
 				}
 				true
@@ -970,13 +1087,18 @@ impl LiberMemFs {
 		// path beside it competes with memory the volume itself is sitting on: a stream could be
 		// refused for want of a few bytes the volume was holding for exactly this. The ordinary
 		// path has released first since the reservation existed; the stream path did not.
+		//
+		// Released HERE and not in the wrapper, so it is released only when there is something to
+		// release it for - the same discipline `write_file_owned_unsynced_named` follows. A refusal
+		// above this line (a bad path, a directory, no room for an entry) never touched the
+		// reservation and must not start: dropping it and asking for it back is a window in which
+		// a tight heap can decline, and a volume should not acquire that window for a call that
+		// allocates nothing. The wrapper's resync is a no-op when nothing moved.
 		if self.policy == Policy::Reserved {
 			self.release_reservation();
 		}
 		let mut owned: Vec<u8> = Vec::new();
 		if owned.try_reserve_exact(path.len()).is_err() {
-			// Put the volume back the way it was before reporting the refusal.
-			self.resync_reservation();
 			return Err(FsError::NoSpace);
 		}
 		owned.extend_from_slice(path);
@@ -1014,13 +1136,11 @@ impl LiberMemFs {
 			let last = parts.last().copied().unwrap_or("");
 			let mut owned_name = String::new();
 			if owned_name.try_reserve_exact(last.len()).is_err() {
-				self.resync_reservation();
 				return Err(FsError::NoSpace);
 			}
 			owned_name.push_str(last);
 			let placed = self.parent_mut(parts).and_then(|children| insert(children, owned_name, Node::Claimed(Vec::new())));
 			if placed.is_err() {
-				self.resync_reservation();
 				return Err(FsError::NoSpace);
 			}
 		} else {
@@ -1042,10 +1162,8 @@ impl LiberMemFs {
 		// `reservation_intact`.
 		if (self.footprint() as usize) > self.capacity {
 			self.stream_abort();
-			self.resync_reservation();
 			return Err(FsError::NoSpace);
 		}
-		self.resync_reservation();
 		Ok(())
 	}
 
@@ -1326,7 +1444,7 @@ impl LiberMemFs {
 			Some(Node::Directory(_)) => return Err(FsError::IsDir),
 			Some(Node::File(existing)) | Some(Node::Claimed(existing)) => (existing.capacity(), false),
 			None => {
-				if !self.room_for_an_entry() {
+				if !self.room_for_an_entry(parts) {
 					return Err(FsError::NoSpace);
 				}
 				(0, true)
@@ -1515,7 +1633,7 @@ impl LiberMemFs {
 		}
 		// A directory stores nothing but still costs its name, and that name is memory the caller
 		// asked for.
-		if !self.room_for_an_entry() || self.footprint() as usize + name.len() > self.capacity {
+		if !self.room_for_an_entry(parts) || self.footprint() as usize + name.len() > self.capacity {
 			return Err(FsError::NoSpace);
 		}
 		if self.policy == Policy::Reserved {
@@ -1580,6 +1698,19 @@ impl LiberMemFs {
 		if footprint - source_name.len() + destination_name.len() > self.capacity {
 			return Err(FsError::NoSpace);
 		}
+		// AND THE METADATA CEILING, which a rename used to walk straight past.
+		//
+		// It does not change the node count, so `MAX_ENTRIES` has nothing to say - and that was
+		// read as "no entry check applies". The destination's table still has to grow by one, and
+		// growth is exactly what `MAX_METADATA_BYTES` bounds: a caller could rename entries between
+		// directories to drive the retained tables past the ceiling one move at a time, through the
+		// one mutator that never asked.
+		//
+		// Asked for the DESTINATION, whose table grows; the source's shrinks or stays, and neither
+		// can push the total up.
+		if !self.room_for_an_entry_by_bytes(destination_parts) {
+			return Err(FsError::NoSpace);
+		}
 		let mut owned = String::new();
 		owned.try_reserve_exact(destination_name.len()).map_err(|_| FsError::NoSpace)?;
 		owned.push_str(destination_name);
@@ -1617,14 +1748,25 @@ impl LiberMemFs {
 		let (parts, count) = Self::segments(path)?;
 		let parts = &parts[..count];
 		let name = *parts.last().ok_or(FsError::BadName)?;
-		let want = usize::try_from(length).map_err(|_| FsError::NoSpace)?;
 		// THE FILE-SIZE BOUND IS A PROPERTY OF THE VOLUME, not of which call reached it. `write_file`
 		// and the streaming path both refuse past this; `truncate` bounded `want` by the volume's
 		// capacity alone, so on a large volume a caller could build a file no other write path in
 		// this crate would accept.
-		if want > MAX_FILE_BYTES {
+		//
+		// COMPARED BEFORE THE NARROWING, and in a width that can hold the argument. This was
+		// `usize::try_from(length).map_err(|_| FsError::NoSpace)?` and then the bound - so on a
+		// 32-bit target a length past `usize::MAX` answered `NoSpace`, which says the volume is
+		// full, when the truth is that no volume of any size would take it. `length` arrives as a
+		// `u64` from an ABI that is the same width everywhere; the check that decides WHICH refusal
+		// it is has to be too. No 32-bit target exists in this tree today, which is exactly why it
+		// cost nothing to put right now rather than after one does.
+		if length > MAX_FILE_BYTES as u64 {
 			return Err(FsError::TooLong);
 		}
+		// Cannot fail after the bound above - `MAX_FILE_BYTES` is a `usize` - but written fallibly
+		// rather than with a cast, so raising the constant past a target's word size is a refusal
+		// and not a truncation.
+		let want = usize::try_from(length).map_err(|_| FsError::TooLong)?;
 		// WHAT THE FILE COSTS TODAY, AS AN ALLOCATION. This read `bytes.len()`, and the volume
 		// accounts `capacity()` - so a file holding 20 bytes in an 80-byte buffer, already charged
 		// for 80, was refused a grow to 40 that allocates nothing. That is the `len`-versus-

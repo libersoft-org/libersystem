@@ -58,10 +58,13 @@ impl JobInfo {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<JobInfo> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<JobInfo> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = JobInfo::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -121,10 +124,13 @@ impl JobEntry {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<JobEntry> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<JobEntry> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = JobEntry::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -217,10 +223,13 @@ impl JobSignalKind {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<JobSignalKind> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<JobSignalKind> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = JobSignalKind::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

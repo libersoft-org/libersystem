@@ -685,22 +685,26 @@ fn every_generated_message_boundary_ends_with_finish() {
 	let finishes = rust.matches(".finish()").count();
 	assert!(finishes >= readers, "every message a generated function reads must end at a boundary check: {readers} readers, {finishes} finishes\n{rust}");
 
-	// And the three that were missing, named so a regression says which one came back.
-	assert!(rust.contains("let version = r.u32()?;\n\t\t\tr.finish()?;"), "the identity query's client ends its reply: {rust}");
-	assert!(rust.contains("if op == PROTOCOL_INFO_OP {\n\t\t\tr.finish()?;"), "and its server ends the request");
-	assert!(rust.contains("if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {"), "a bare stream-open reply ends too");
-	assert!(rust.contains("let _ = r.u32()?;\n\t\t\t\t\tr.finish()?;"), "and so does the Ok arm of a guarded one");
-	// AND THE ERR ARM, which the counting invariant above cannot see and did not.
+	// AND NO ARM-BY-ARM STRING MATCHING, which is what used to sit here.
 	//
-	// A guarded stream-open reply has ONE reader and two paths through it. The Ok arm ended at a
-	// boundary and the Err arm did not, so the counts were one reader and one finish and the rule
-	// passed - while a refusal with bytes after it decoded as an ordinary refusal. That is a test
-	// checking the right idea with the wrong invariant: `finishes >= readers` is a statement about
-	// TEXT, and "every message boundary is checked" is a statement about PATHS.
+	// The counting rule is a statement about TEXT, and it let the Err arm of a guarded stream open
+	// through: one reader with two paths, the Ok arm ending at a boundary and the Err arm not, is
+	// one reader and one finish. The repair was five `rust.contains("let _ = r.u32()?;\n\t\t\t\t\t
+	// r.finish()?;")`-shaped assertions naming each arm - which closed that day's gap, said nothing
+	// about a NEW arm, and broke on reindentation, because they were matching generated Rust
+	// FORMATTING to prove a protocol property.
 	//
-	// Counting stays, because it catches a whole reader with no finish anywhere. This is the other
-	// half: every arm that returns a decoded value is named, so a new one has to be added here.
-	assert!(rust.contains("let error = Error::read(r)?;\n\t\t\t\tr.finish()?;\n\t\t\t\tSome(Err(error))"), "and the Err arm of a guarded stream open, which is the one that was missed: {rust}");
+	// What proves it is driving the decoder, and that now happens in `proto`, where the generated
+	// code compiles: `every_arm_of_a_guarded_stream_open_ends_at_its_framing_boundary` and
+	// `the_identity_query_ends_at_its_boundary_too` (`src/proto/src/tests.rs`) send hand-written
+	// replies - a valid Err, the same plus a trailing byte, a valid Ok stream open, the same plus a
+	// trailing byte, an arm with the wrong capability cardinality, an unknown tag, and the identity
+	// reply in both shapes - and check the answer AND that a refusal closed what it was carrying.
+	//
+	// The count stays here because it is the half those cannot give: it sees every reader the
+	// generator emits, including ones no schema in this tree instantiates yet, and it catches a
+	// whole boundary added with no `finish` anywhere. Text is the right tool for "does this exist";
+	// it is the wrong tool for "does this hold".
 }
 
 #[test]

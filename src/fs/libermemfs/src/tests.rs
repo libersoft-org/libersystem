@@ -1600,8 +1600,21 @@ fn a_rename_within_one_directory_keeps_its_reserved_slot() {
 	// tuned to today's allocation sequence stops testing the moment the sequence moves, and the test
 	// goes quiet rather than red. What is asserted is the property instead - ATOMICITY - which holds
 	// at every budget: the rename either happened or it did not, and the file is at exactly one of
-	// the two names. The broken code has a budget at which it is at NEITHER, and the sweep walks
-	// over it.
+	// the two names.
+	//
+	// WHAT THIS DOES NOT DO IS REPRODUCE THE OLD DEFECT, and this comment used to claim it did -
+	// "the broken code has a budget at which it is at NEITHER, and the sweep walks over it". It was
+	// measured and it is false. With the old `remove`-based shape restored, the sweep passes at
+	// every budget from 0 to 512, across three fixtures: `shrink_children` fires only at or below a
+	// quarter occupancy and sizes the new table exactly to its contents, every `remove` in the
+	// fixture shrinks as it goes, so by the time the rename runs the table is already tight, the
+	// reserve grows it by one, and after the take the occupancy is too high for the shrink to fire.
+	// The insert then needs no allocation and the defect cannot happen.
+	//
+	// The fix is still worth having - `take` removes the possibility by construction instead of
+	// relying on three policies' arithmetic never lining up - and this test asserts a real
+	// invariant. What it is not is evidence that the old code was broken, and a comment saying
+	// otherwise is the kind of claim that makes a green suite mean less than it looks.
 	for budget in 0..512 {
 		let mut attempt = LiberMemFs::mount(Policy::Capped, 4096).expect("mount");
 		attempt.mkdir(b"d").expect("a directory");
@@ -1753,4 +1766,170 @@ fn a_shrunk_directory_table_has_room_for_the_insert_that_follows_it() {
 	fs.write_file(b"/d/after", b"y").expect("the insert after a shrink");
 	let names = fs.list_entries(b"/d").expect("the directory lists");
 	assert!(names.iter().any(|entry| entry.name == "after"), "the entry inserted after the shrink is there");
+}
+
+// P02M0131, sixth round.
+
+#[test]
+fn every_refused_stream_begin_leaves_the_reservation_whole() {
+	// THE SWEEP, because the defect only exists on some budgets and nobody knows which.
+	//
+	// `stream_begin` released the reservation and then resynchronised inside its own failure
+	// branches - while `owned` (the path) and, in the `insert` branch, `owned_name` were still LIVE
+	// LOCALS. Neither is in `self.pending` and neither is in the tree, so `footprint()` could not
+	// see them, and the resync tried to take back the whole declared free capacity with part of the
+	// heap held by memory nothing was accounting for. On a tight heap the regrow came up short, the
+	// locals dropped at the `return`, and no second resync ever ran: the volume answered `NoSpace`
+	// with `reservation_intact() == false`, which the documentation says never happens.
+	//
+	// THE SIZES ARE WHAT MAKE THE BRANCHES REACHABLE, and the first version of this test got them
+	// wrong - it swept 640 budgets around a 4 KiB volume and never produced a single refusal, so it
+	// passed against the defect. A stream releases the whole reservation before it allocates, so on
+	// a volume much larger than the path there is always room and no failure branch is ever taken.
+	// The window needs a volume barely wider than the two allocations: 520 bytes against a 255-byte
+	// path and the same 255-byte name, so the second `try_reserve_exact` is the one that runs out.
+	//
+	// `refusals` is asserted for that reason. A sweep that observed no refusal proves nothing, and
+	// looking green while proving nothing is how the first version of this survived.
+	const CAPACITY: usize = 520;
+	let name = alloc::vec![b'n'; 255];
+	let mut refusals = 0usize;
+	let mut failures: Vec<(usize, u64, u64)> = Vec::new();
+	for slack in 0..1200 {
+		let mut record: Option<(u64, u64, bool)> = None;
+		within(CAPACITY + slack, || {
+			let Ok(mut fs) = LiberMemFs::mount(Policy::Reserved, CAPACITY) else { return };
+			// Only the REFUSALS are the subject. A begin that succeeded is covered by the tests
+			// above; what this is about is the invariant a refusal promises to restore.
+			if fs.stream_begin(&name).is_ok() {
+				return;
+			}
+			record = Some((fs.footprint(), fs.reserved_bytes(), fs.reservation_intact()));
+		});
+		// NOTHING is asserted inside the budgeted block. A failing assertion there panics, the
+		// panic machinery allocates, the cap refuses it and the process ABORTS.
+		if let Some((footprint, reserved, intact)) = record {
+			refusals += 1;
+			if !intact {
+				failures.push((slack, footprint, reserved));
+			}
+		}
+	}
+	assert!(refusals > 0, "the sweep never produced a refused `stream_begin`, so it tested nothing - the volume is too large for its own path allocations to run out");
+	assert!(failures.is_empty(), "a refused `stream_begin` left the reservation short at {} of {refusals} refusal(s); first: slack {}, footprint {}, reserved {} of a {CAPACITY}-byte capacity", failures.len(), failures[0].0, failures[0].1, failures[0].2);
+}
+
+#[test]
+fn a_full_table_grows_the_way_the_metadata_ceiling_predicts() {
+	// The metadata ceiling is decided BEFORE the allocation, against what the table will grow TO,
+	// so `grown_capacity` has to agree with what `Vec` actually does. It is a prediction of the
+	// standard library's growth policy - double, then a floor by element size - and a prediction is
+	// only a bound while it is checked.
+	//
+	// If `RawVec` ever changes, this fails here, at the one place that says why, rather than as a
+	// ceiling that quietly stopped holding.
+	let mut table: Children = Vec::new();
+	let mut previous = table.capacity();
+	for i in 0..64u32 {
+		let mut name = String::new();
+		name.try_reserve_exact(8).expect("the host heap");
+		name.push_str(&alloc::format!("{i:08}"));
+		if table.len() == table.capacity() {
+			let predicted = grown_capacity(previous, table.len() + 1);
+			table.push((name, Node::File(Vec::new())));
+			assert_eq!(table.capacity(), predicted, "a full table of {} slots grew to {} where the ceiling predicted {}", previous, table.capacity(), predicted);
+		} else {
+			table.push((name, Node::File(Vec::new())));
+		}
+		previous = table.capacity();
+	}
+}
+
+#[test]
+fn the_metadata_ceiling_is_decided_against_the_table_the_entry_grows() {
+	// BOTH DIRECTIONS OF THE SAME MISTAKE. `room_for_an_entry` was
+	// `metadata_bytes() < MAX_METADATA_BYTES` - a question about the state BEFORE the allocation,
+	// with no idea which table the entry was going into.
+	//
+	// Tested through `metadata_admits_a_slot` rather than through a volume, and that is not a
+	// convenience. `MAX_METADATA_BYTES` is four times the whole node budget and `shrink_children`
+	// keeps every table within a factor of four of its contents, so a volume driven through the
+	// public API cannot be brought to its own ceiling - the count limit stops it first, by design.
+	// A test that filled a volume and watched it refuse would be measuring `MAX_ENTRIES` and
+	// reporting it as evidence about `MAX_METADATA_BYTES`.
+	const CEILING: usize = 64 * SLOT_BYTES;
+
+	// The half that let an insert FINISH ABOVE THE CEILING: `try_reserve(1)` on a full table
+	// doubles it, so a table of 32 slots asks for 64 - and a volume one byte below the ceiling was
+	// admitted and came back 32 slots past it.
+	assert!(!metadata_admits_a_slot(CEILING - 1, 32, 32, CEILING), "a full 32-slot table doubles to 64, which does not fit under a 64-slot ceiling");
+	// The old rule's answer for the same state, for contrast: it compared what is held now.
+	assert!(CEILING - 1 < CEILING, "which is exactly the comparison the old rule made, and it said yes");
+
+	// The same growth WITH room for it is admitted, so this is a ceiling and not a refusal.
+	assert!(metadata_admits_a_slot(32 * SLOT_BYTES, 32, 32, CEILING), "a full 32-slot table doubling to 64 fits when 64 is all that is held");
+
+	// The half that REFUSED WORK THAT ALLOCATES NOTHING: a table with a spare slot needs no
+	// allocation, so no ceiling can have anything to say about it - even at the ceiling, and even
+	// past it.
+	assert!(metadata_admits_a_slot(CEILING, 32, 8, CEILING), "an insert into a table with 24 spare slots allocates nothing and is admitted at the ceiling");
+	assert!(metadata_admits_a_slot(CEILING * 2, 32, 8, CEILING), "and above it, because refusing it would not give a byte back");
+
+	// A table that has never allocated grows to the small-table floor rather than to one slot.
+	assert!(metadata_admits_a_slot(0, 0, 0, 4 * SLOT_BYTES), "an empty table's first entry costs the floor");
+	assert!(!metadata_admits_a_slot(0, 0, 0, 3 * SLOT_BYTES), "and a ceiling below the floor cannot take a first entry at all");
+}
+
+#[test]
+fn a_volume_filled_to_its_limit_stays_within_the_metadata_ceiling() {
+	// The end-to-end half: whatever the rule decides, the tables must never end up past the
+	// ceiling. Checked after EVERY accepted entry, because the defect was an insert that was
+	// admitted and then overshot - a check only at the end would see the state after
+	// `shrink_children` had had a chance to hide it.
+	//
+	// A big capacity: what is bounded here is METADATA, and letting the byte capacity refuse first
+	// would measure the wrong limit.
+	let mut fs = capped(1024 * 1024 * 1024);
+	let mut created = 0usize;
+	let mut refused: Option<FsError> = None;
+	for i in 0..MAX_ENTRIES + 16 {
+		let name = alloc::format!("{i:08}");
+		match fs.write_file(name.as_bytes(), b"") {
+			Ok(()) => created += 1,
+			Err(error) => {
+				refused = Some(error);
+				break;
+			}
+		}
+		assert!(fs.metadata_bytes() as usize <= MAX_METADATA_BYTES, "entry {created} was accepted and left the tables at {} bytes, past the {MAX_METADATA_BYTES}-byte ceiling", fs.metadata_bytes());
+	}
+	// The COUNT limit is what stops it, not the byte limit - `shrink_children` keeps every table
+	// within a factor of four of its contents, so a flat directory of live entries cannot approach
+	// four times `MAX_ENTRIES` slots. Reaching the metadata ceiling first would mean the growth
+	// prediction is over-charging and turning a ceiling into a smaller entry limit.
+	assert_eq!(created, MAX_ENTRIES - 1, "the volume takes entries until the node count stops it (refused with {refused:?})");
+	assert!(fs.metadata_bytes() as usize <= MAX_METADATA_BYTES, "and the tables are within the ceiling at the end: {} of {MAX_METADATA_BYTES}", fs.metadata_bytes());
+}
+
+#[test]
+fn a_length_no_volume_could_hold_is_too_long_rather_than_out_of_space() {
+	// `truncate` narrowed the length to `usize` and only then compared it, so on a 32-bit target a
+	// value past `usize::MAX` answered `NoSpace` - "this volume is full" - when the truth is that no
+	// volume of any size would take it. The two refusals mean different things to a caller: one says
+	// delete something, the other says the request is impossible.
+	//
+	// A 64-BIT HOST CANNOT SEE THE ORDERING, and saying otherwise would be this test claiming more
+	// than it checks: `u64::MAX` fits a 64-bit `usize`, so narrow-then-compare and compare-then-
+	// narrow give the same answer here. What makes the fix hold on a target where they differ is
+	// not the order at all - it is that BOTH refusal paths in `truncate` now answer `TooLong`, so
+	// no ordering of them can produce `NoSpace` for a length that does not fit a word. That is a
+	// property of the source rather than of this run, and it is stated here because a test that
+	// cannot reach a case should say which case it cannot reach.
+	let mut fs = capped(64 * 1024);
+	fs.write_file(b"f", b"x").expect("a file to truncate");
+	assert_eq!(fs.truncate(b"f", u64::MAX), Err(FsError::TooLong), "a length past every bound is refused as too long");
+	assert_eq!(fs.truncate(b"f", MAX_FILE_BYTES as u64 + 1), Err(FsError::TooLong), "and so is one byte past the file limit");
+	// And the volume's own limit still answers `NoSpace`, which is the refusal that means what it
+	// says: this length is representable and would fit some volume, just not this one.
+	assert_eq!(fs.truncate(b"f", 128 * 1024), Err(FsError::NoSpace), "a length within the file limit but past the volume is out of space");
 }

@@ -67,9 +67,9 @@ fn volume_status_wire_is_stable() {
 }
 #[test]
 fn fsck_report_wire_is_stable() {
-	let sample = FsckReport { checksum_failures: 7, damaged: alloc::vec![String::from("x")] };
+	let sample = FsckReport { checksum_failures: 7, damaged: alloc::vec![String::from("x")], structural_failures: 7, stream_failures: 7, io_failures: 7, faults: alloc::vec![String::from("x")] };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 1, 0, 1, 0, 120];
+	let golden: &[u8] = &[7, 0, 0, 0, 1, 0, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 1, 0, 120];
 	assert_eq!(bytes, golden);
 	assert_eq!(FsckReport::decode(&bytes).unwrap(), sample);
 }

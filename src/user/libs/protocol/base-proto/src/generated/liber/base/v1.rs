@@ -66,10 +66,13 @@ impl EnvVar {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<EnvVar> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<EnvVar> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = EnvVar::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -145,10 +148,13 @@ impl LaunchContext {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<LaunchContext> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<LaunchContext> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = LaunchContext::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -228,10 +234,13 @@ impl Error {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Error> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Error> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Error::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

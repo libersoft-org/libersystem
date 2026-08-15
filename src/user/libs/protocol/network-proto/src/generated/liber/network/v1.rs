@@ -52,10 +52,13 @@ impl Ipv4Addr {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Ipv4Addr> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Ipv4Addr> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Ipv4Addr::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -112,10 +115,13 @@ impl Endpoint {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Endpoint> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Endpoint> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Endpoint::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -168,10 +174,13 @@ impl Neighbor {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Neighbor> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Neighbor> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Neighbor::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -243,10 +252,13 @@ impl NetInfo {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<NetInfo> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<NetInfo> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = NetInfo::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -338,10 +350,13 @@ impl NetCapacity {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<NetCapacity> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<NetCapacity> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = NetCapacity::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -401,10 +416,13 @@ impl PingStatus {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<PingStatus> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PingStatus> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = PingStatus::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -461,10 +479,13 @@ impl PingReply {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<PingReply> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PingReply> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = PingReply::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -528,10 +549,13 @@ impl HopStatus {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<HopStatus> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<HopStatus> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = HopStatus::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -590,10 +614,13 @@ impl TraceHop {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<TraceHop> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<TraceHop> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = TraceHop::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -648,10 +675,13 @@ impl TcpRequest {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<TcpRequest> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<TcpRequest> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = TcpRequest::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -723,10 +753,13 @@ impl SockState {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<SockState> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SockState> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = SockState::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -786,10 +819,13 @@ impl SockInfo {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<SockInfo> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SockInfo> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = SockInfo::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -2115,10 +2151,13 @@ impl Chunk {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Chunk> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Chunk> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Chunk::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

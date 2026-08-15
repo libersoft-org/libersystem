@@ -52,10 +52,13 @@ impl PointerEvent {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<PointerEvent> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PointerEvent> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = PointerEvent::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -113,10 +116,13 @@ impl KeyEvent {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<KeyEvent> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<KeyEvent> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = KeyEvent::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

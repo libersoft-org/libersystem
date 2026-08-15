@@ -87,10 +87,13 @@ impl Capability {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Capability> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Capability> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Capability::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -170,10 +173,13 @@ impl Manifest {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Manifest> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Manifest> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Manifest::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -265,10 +271,13 @@ impl AuditEntry {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<AuditEntry> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<AuditEntry> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = AuditEntry::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -349,10 +358,13 @@ impl PipelineStage {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<PipelineStage> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PipelineStage> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = PipelineStage::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -413,10 +425,13 @@ impl PipelineResult {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<PipelineResult> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PipelineResult> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = PipelineResult::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {

@@ -57,10 +57,13 @@ impl ResourceType {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<ResourceType> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ResourceType> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = ResourceType::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -120,10 +123,13 @@ impl ResourceUsage {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<ResourceUsage> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ResourceUsage> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = ResourceUsage::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
@@ -181,10 +187,13 @@ impl Budget {
 		r.finish()?;
 		Some(value)
 	}
-	pub fn decode_message(bytes: &[u8], handles: &Handles) -> Option<Budget> {
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<Budget> {
 		let mut r = Reader::with_handles(bytes, handles);
 		let value = Budget::read(&mut r)?;
 		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
