@@ -222,26 +222,44 @@ extern "C" fn aarch64_secondary_main(cpu_id: u64) -> ! {
 		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 	}
 	super::percpu::init(cpu_id as usize, mpidr as u32);
-	// AND THE STACK THIS CORE IS STANDING ON, which nothing described until now.
+	// OFF THE BRING-UP SLICE AND ONTO A GUARDED STACK, before anything deep runs on it.
 	//
-	// `SEC_STACKS` is a static array of 16 KiB slices with NO GUARD PAGES between them, so a core
-	// that runs off the bottom of its slice walks into the previous core's - mapped memory, no
-	// fault, silent. What it overwrites there is another core's saved state, and the first thing
-	// that core does with a corrupted stack pointer is take an exception on it.
+	// `SEC_STACKS` is a static array with NO GUARD PAGES between its slices, so a core that runs off
+	// the bottom of its own walks into the previous core's - mapped memory, no fault, silent, and
+	// what it overwrites there is another core's saved state. The exception vectors now REPORT a
+	// stack pointer outside the recorded bounds, but that is a catch at the next trap rather than a
+	// stop at the store that caused it; a guard page is the stop.
 	//
-	// The scheduler sets these bounds for every thread it runs and clears them for the idle
-	// context, which left the one stack in the system with no guard page also being the one with no
-	// check. This closes that: from here on this core's idle and interrupt work is bounded too, and
-	// an exception taken on a stack pointer outside the slice is REPORTED rather than turned into a
-	// runaway.
+	// Threads have had one since they existed, from `KernelStack::allocate` - a kernel virtual range
+	// with its base page left unmapped - and this is the same allocation for the same reason. The
+	// bring-up slice is only what this core stands on until the frame allocator can give it
+	// something better, which by here it can: the BSP wakes secondaries after memory is up.
 	//
-	// `record_idle_stack` rather than `set_stack_bounds`: this IS this core's idle stack, so it has
-	// to be the value the scheduler restores every time it leaves a thread. Setting only the live
-	// pair made the bounds survive exactly until the first context switch back to idle, which is a
-	// mistake worth leaving named - the check then covers everything except the moment it is for.
+	// The stack is never freed, so the handle is forgotten deliberately rather than leaked by
+	// accident: an idle context lives as long as its core does.
+	if let Some(stack) = crate::object::thread::KernelStack::allocate() {
+		let top = stack.top();
+		super::percpu::record_idle_stack(stack.usable_base(), stack.capacity());
+		core::mem::forget(stack);
+		unsafe { super::context::run_on_stack(top, secondary_idle, cpu_id) }
+	}
+	// NO ROOM FOR ONE, WHICH IS NOT A REASON TO REFUSE THE CORE. It keeps the unguarded slice and
+	// says so, and the vector check still bounds it - the same trade the rest of this kernel makes
+	// when an allocation fails on a path that has a working fallback.
+	crate::serial_println!("aarch64: core {cpu_id} has no guarded idle stack (out of memory); it keeps its bring-up slice");
 	unsafe {
 		let base = (&raw const SEC_STACKS[cpu_id as usize]) as u64;
 		super::percpu::record_idle_stack(base, SEC_STACK_SIZE as usize);
+	}
+	secondary_idle(cpu_id)
+}
+
+// Everything a secondary does after it is standing on the stack it will keep. Split out so the
+// switch above can hand it a new stack and never return.
+extern "C" fn secondary_idle(cpu_id: u64) -> ! {
+	let mpidr: u64;
+	unsafe {
+		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 	}
 	super::gic::init_secondary();
 	SEC_MPIDR[cpu_id as usize].store(mpidr, Ordering::Relaxed);

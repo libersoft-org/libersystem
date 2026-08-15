@@ -13,6 +13,9 @@ use core::arch::{asm, global_asm};
 unsafe extern "C" {
 	// Save the current context to *old_sp and resume the context at new_sp.
 	pub fn switch_context(old_sp: *mut u64, new_sp: u64);
+	// Continue on a different stack and never come back - `top` becomes SP, then
+	// `entry(arg)` runs. For a core moving off its bring-up stack onto a real one.
+	pub fn run_on_stack(top: u64, entry: extern "C" fn(u64) -> !, arg: u64) -> !;
 	// Return target baked into a new thread's initial stack frame.
 	fn thread_trampoline();
 }
@@ -20,6 +23,14 @@ unsafe extern "C" {
 global_asm!(
 	r#"
 .text
+.global run_on_stack
+run_on_stack:
+	// x0 = new stack top, x1 = entry, x2 = argument. Nothing is saved: the caller's
+	// frame is on a stack this core is abandoning, and the entry never returns.
+	mov     sp, x0
+	mov     x0, x2
+	br      x1
+
 .global switch_context
 switch_context:
 	// Save the callee-saved registers: x19..x28, x29 fp, x30 lr, and the

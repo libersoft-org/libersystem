@@ -127,7 +127,7 @@ impl KernelStack {
 	// userspace call into a kernel panic. The Domain thread quota does not help: it bounds how
 	// many threads ONE process may have, not whether there is memory for the next one, and the
 	// pressure can come from anywhere in the system.
-	fn allocate() -> Option<Self> {
+	pub(crate) fn allocate() -> Option<Self> {
 		let pages = KERNEL_STACK_SIZE.div_ceil(crate::mem::frame::PAGE_SIZE as usize);
 		let len = (pages as u64 + 1) * crate::mem::frame::PAGE_SIZE;
 		let base = crate::syscall::alloc_kernel_vrange(len);
@@ -209,6 +209,11 @@ impl KernelStack {
 	// The lowest MAPPED address of this stack: one page above `base`, which is the guard.
 	pub fn usable_base(&self) -> u64 {
 		self.base + crate::mem::frame::PAGE_SIZE
+	}
+
+	// One past the highest mapped byte - what a stack pointer starts at.
+	pub fn top(&self) -> u64 {
+		self.usable_base() + self.capacity() as u64
 	}
 
 	// The stack bytes, above the guard page. `&mut self` because this hands out the only
