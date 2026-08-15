@@ -4094,7 +4094,7 @@ fn spawn_dynamic_test_process(domain: alloc::sync::Arc<object::domain::Domain>, 
 		load(&package, &process, dependency, &mut loaded, &mut visiting);
 	}
 	let entry = loader::load_image_into(&process, main).expect("load dynamic test main");
-	let bootstrap = process.install(bootstrap, object::rights::Rights::ALL, 0);
+	let bootstrap = process.install(bootstrap, object::rights::Rights::ALL, 0).expect("a bootstrap handle");
 	let thread = loader::create_user_thread(&process, entry, memlayout::USER_STACK_TOP, bootstrap).expect("create dynamic test thread");
 	assert!(sched::thread_start(thread), "start dynamic test thread");
 	process

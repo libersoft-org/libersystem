@@ -251,7 +251,16 @@ impl Domain {
 		if parent.killed.load(Ordering::Acquire) {
 			return None;
 		}
-		// ALLOC-OK: the child count is bounded by the Domain quota this call already charged.
+		// BOOKED, NOT BOUNDED. This carried `ALLOC-OK: bounded by the Domain quota`, and a quota says
+		// the list will never hold a millionth entry - it says nothing about whether the heap can add
+		// the first one under pressure. That is the argument this milestone rejected for the
+		// scheduler and for `reserve_dynamic_module_at`, and it was still standing here on a path
+		// `SYS_DOMAIN_CREATE` reaches. The function already answers `None`, so a refusal costs
+		// nothing: the child is simply never attached, and the caller sees the same failure it
+		// already handles.
+		if children.try_reserve(1).is_err() {
+			return None;
+		}
 		children.push(child.clone());
 		Some(child)
 	}
@@ -285,7 +294,13 @@ impl Domain {
 			return false;
 		}
 		list.retain(|weak| weak.strong_count() > 0);
-		// ALLOC-OK: the process count is bounded by the Domain quota, and the line above drops every dead entry first.
+		// The same correction as `new_child`: dropping dead entries first makes a growth less likely
+		// and does not make it impossible, and a bound is not a booking. `false` is the refusal this
+		// function already returns, and `Thread::build` already declines to construct a thread into a
+		// process whose registration was refused.
+		if list.try_reserve(1).is_err() {
+			return false;
+		}
 		list.push(Arc::downgrade(process));
 		true
 	}

@@ -360,7 +360,7 @@ pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> 
 	// out-of-frames says so and stops. The userspace-reachable path is `thread_create`
 	// below, and that one returns None.
 	let thread = Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack");
-	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
+	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
 	enqueue_on(cpu, thread.clone());
 	if cpu != current_cpu_id() {
 		arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
@@ -382,13 +382,13 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 // drift in how a thread is constructed.
 pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
-	let arg = process.install(object, rights, badge);
+	let arg = process.install(object, rights, badge).expect("out of memory for a kernel thread's bootstrap handle");
 	Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack")
 }
 
 // Release a prepared thread onto the run queue.
 pub fn start_thread(thread: &Arc<Thread>) {
-	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
+	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
 	enqueue_on(current_cpu_id(), thread.clone());
 }
 
@@ -398,7 +398,7 @@ pub fn start_thread(thread: &Arc<Thread>) {
 pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
 	let process = Process::new(kernel_as(), domain)?;
 	let thread = Thread::new_in(entry, arg, process)?;
-	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
+	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
 	enqueue_on(current_cpu_id(), thread.clone());
 	Some(thread)
 }
@@ -414,7 +414,7 @@ pub fn process_create(domain: Arc<Domain>) -> Option<Arc<Process>> {
 // thread shares the process's address space and handle table with its siblings.
 pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
 	let thread = Thread::new(entry, arg, process)?;
-	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
+	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
 	enqueue_on(current_cpu_id(), thread.clone());
 	Some(thread)
 }
@@ -437,7 +437,7 @@ pub fn thread_start(thread: Arc<Thread>) -> bool {
 		return false;
 	}
 	thread.set_state(ThreadState::Ready);
-	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
+	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
 	enqueue_on(current_cpu_id(), thread);
 	true
 }
@@ -821,7 +821,7 @@ fn enqueue(thread: Arc<Thread>) {
 	// no shootdown, so a thread migrating away from a core leaves translations behind it.
 	// That is the open item in Phase 2, and it is the reason migration is not yet safe for
 	// a process with threads on several cores rather than a reason to stop migrating.
-	// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota.
+	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
 	enqueue_on(current_cpu_id(), thread);
 }
 
@@ -1161,7 +1161,7 @@ fn stash_prev(inner: &mut CpuSchedInner, sched: &CpuSched, prev: Option<Arc<Thre
 				}
 				Disposition::Requeue => {
 					prev.set_state(ThreadState::Ready);
-					// ALLOC-OK: the run queue holds one entry per RUNNABLE thread, bounded by the Domain thread quota, and a deque that has held its peak never reallocates again.
+					// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
 					inner.run_queue.push_back(prev);
 				}
 				Disposition::Block => {

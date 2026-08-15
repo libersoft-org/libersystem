@@ -84,7 +84,7 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 		panic!("a 3-page DMA buffer should allocate");
 	};
 	let frames: alloc::vec::Vec<u64> = orphan.frames().to_vec();
-	assert!(process.install(orphan, Rights::ALL, 0) != 0, "the buffer is installed in the driver process");
+	assert!(process.install(orphan, Rights::ALL, 0).is_some(), "the buffer is installed in the driver process");
 	process.terminate();
 	crate::sched::run_until_idle();
 	assert_eq!(super::held_frames_for_test(DEVICE), frames.len(), "the frames of a driver that died holding a buffer are held for its device, not handed to whoever allocates next");

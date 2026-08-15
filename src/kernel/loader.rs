@@ -117,7 +117,13 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	process.adopt_frames(frames);
 	process.adopt_shared_pages(shared);
 	process.charge_stack(USER_STACK_PAGES * PAGE_SIZE);
-	let handle = process.install(bootstrap, rights, badge);
+	// REFUSED RATHER THAN STARTED WITHOUT IT. A spawn whose bootstrap capability cannot be installed
+	// is not a spawn: the child would run with nothing to talk to and the parent would be told it
+	// succeeded.
+	let Some(handle) = process.install(bootstrap, rights, badge) else {
+		process.terminate();
+		return Err(LoadError::OutOfMemory);
+	};
 
 	// FALLIBLY: this is the last allocation of a spawn and `Box::new` made a short heap a halt.
 	let Some(ctx) = crate::mem::heap::try_box(UserEntry { entry, stack_top: USER_STACK_TOP, bootstrap: handle }) else {
@@ -163,6 +169,12 @@ pub fn load_image_into(process: &Process, elf_image: &[u8]) -> Result<u64, LoadE
 	// it has just created is not terminating. The guard is held to the end, which is after the
 	// adopts and after every rollback.
 	let Some(_extend) = process.begin_extend() else {
+		return Err(LoadError::Terminating);
+	};
+	// AND THE ADOPTION BOOKING, which `begin_extend` does not serialise - see `Process::image_load`.
+	// Two loads into one process would otherwise both pass `reserve_adopt` and the second would
+	// extend infallibly.
+	let Some(_load) = process.begin_image_load() else {
 		return Err(LoadError::Terminating);
 	};
 	if process.has_dynamic_modules() && bootproto::elf::Elf::parse(elf_image).is_none_or(|image| image.image_type != bootproto::elf::ET_DYN) {
@@ -230,6 +242,12 @@ pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Resul
 	// and may already be dying. It also claims a module slot and registers dynamic symbols, both of
 	// which are records the teardown snapshot has to see.
 	let Some(_extend) = process.begin_extend() else {
+		return Err(LoadError::Terminating);
+	};
+	// The same booking as `load_image_into`: modules adopt into the same two vectors, and this is
+	// the path the audit named, since `SYS_PROCESS_LOAD_MODULE` runs against a process that already
+	// owns its main image.
+	let Some(_load) = process.begin_image_load() else {
 		return Err(LoadError::Terminating);
 	};
 	if !process.reserve_dynamic_module_at(bias) {

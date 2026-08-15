@@ -349,7 +349,7 @@ fn process_isolation_and_per_process_tables() {
 	// Handle tables are per-process: a capability installed in one process is
 	// invisible to the other.
 	let (endpoint, _peer) = object::channel::Channel::create();
-	p1.install(endpoint, Rights::ALL, 0);
+	p1.install(endpoint, Rights::ALL, 0).expect("a handle in a test process");
 	assert_eq!(p1.handles().lock().len(), 1);
 	assert_eq!(p2.handles().lock().len(), 0);
 
@@ -600,7 +600,7 @@ fn a_clean_exit_releases_the_process_channel_endpoints() {
 	let (ours, theirs) = Channel::create();
 	// park the peer endpoint in the child's handle table, standing in for a tool's
 	// inherited stdout.
-	process.install(theirs, Rights::ALL, 0);
+	process.install(theirs, Rights::ALL, 0).expect("a handle in a test process");
 	// the child's single thread exits cleanly at once.
 	extern "C" fn clean_body(_arg: u64) {}
 	let thread = sched::thread_create(process.clone(), clean_body, 0);
@@ -741,8 +741,8 @@ fn system_graph_reflects_live_state() {
 	let process = Process::new(AddressSpace::kernel(), domain.clone()).expect("a test process");
 	let (endpoint, _peer) = Channel::create();
 	let channel_koid = endpoint.header().koid();
-	process.install(endpoint, Rights::READ | Rights::WRITE, 42);
-	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0);
+	process.install(endpoint, Rights::READ | Rights::WRITE, 42).expect("a handle in a test process");
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0).expect("a handle in a test process");
 
 	let node = graph::collect_from(&domain);
 	assert_eq!(node.koid, domain.header().koid());
@@ -784,8 +784,8 @@ fn process_counters_track_ipc_and_resources() {
 	assert_eq!(process.messages_sent(), 2, "two sends counted");
 	assert_eq!(process.messages_received(), 1, "one recv counted");
 
-	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0);
-	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0);
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0).expect("a handle in a test process");
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0).expect("a handle in a test process");
 	assert_eq!(process.handle_count(), 2, "two installed handles");
 
 	// Liveness the stats syscall reports: not killed here, killed after terminate().

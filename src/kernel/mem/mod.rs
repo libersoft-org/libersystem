@@ -35,6 +35,11 @@ pub fn hhdm_offset() -> u64 {
 // map, rounded the same way, is the extent rather than an estimate of it. Zero until `init` has run.
 static DIRECT_MAP_LIMIT: AtomicU64 = AtomicU64::new(0);
 
+// What the boot stub actually mapped, on the ports that build their own direct map. Zero means "no
+// ceiling recorded", which is the x86_64 case: there the loader builds the HHDM from the same map
+// the kernel is handed, so the map IS the extent.
+static DIRECT_MAP_MAPPED: AtomicU64 = AtomicU64::new(0);
+
 // Is `[phys, phys + len)` inside the direct map?
 //
 // FOR FIRMWARE POINTERS. Everything the kernel allocates is inside by construction; what is not is
@@ -62,6 +67,12 @@ fn publish_direct_map_limit(regions: &[MemRegion]) {
 	// Rounded up the way the loader rounds its map, so a table in the last partial 2 MiB of the
 	// last region is inside the bound rather than one byte outside it.
 	let top = top.next_multiple_of(2 * 1024 * 1024);
+	// CLAMPED TO WHAT IS MAPPED. The map says what memory EXISTS; on aarch64 and riscv64 the boot
+	// stub maps a fixed span in assembly before any map is read, so a machine with more RAM than
+	// that would otherwise have `within_direct_map` answering true for addresses `phys_to_virt`
+	// cannot translate.
+	let mapped = DIRECT_MAP_MAPPED.load(Ordering::Relaxed);
+	let top = if mapped == 0 { top } else { top.min(mapped) };
 	DIRECT_MAP_LIMIT.fetch_max(top, Ordering::Relaxed);
 }
 
@@ -72,6 +83,30 @@ fn publish_direct_map_limit(regions: &[MemRegion]) {
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn set_hhdm_offset(offset: u64) {
 	HHDM_OFFSET.store(offset, Ordering::Relaxed);
+}
+
+// Publish the direct map's extent from what the BOOT STUB ACTUALLY MAPPED, on the ports that build
+// their own.
+//
+// `publish_direct_map_limit` derives the limit from the retained memory map, and its reasoning is
+// the loader's: the HHDM covers the map because the loader built it from the map. That is true on
+// x86_64 and false on the device-tree ports, where the stub maps a FIXED span in assembly before any
+// map is read - 0..4 GiB on aarch64 (1 GB blocks at `aarch64/boot.rs:47`) and 0..8 GiB on riscv64
+// (`riscv64/boot.rs:55-63`). On a machine whose device tree reports more RAM than that,
+// `within_direct_map` answers true for physical addresses `phys_to_virt` does not translate, and the
+// frame allocator can be seeded with banks the kernel cannot reach through the HHDM at all.
+//
+// A CEILING, not a maximum: `fetch_max` is what the map-derived version needs (two boot paths retain
+// at different points) and is the wrong operation for a hard limit, so this clamps instead. Long
+// term the direct map is built from the banks and this goes away; until then the limit says what is
+// mapped rather than what exists.
+// A CEILING RECORDED SEPARATELY, because it is published before the memory map exists. The stub sets
+// this during early boot and `publish_direct_map_limit` applies it whenever the map is retained, so
+// the two do not depend on each other's order - the first attempt stored straight into the limit and
+// the map's later `fetch_max` simply raised it again.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub fn set_direct_map_extent(mapped_bytes: u64) {
+	DIRECT_MAP_MAPPED.store(mapped_bytes, Ordering::Relaxed);
 }
 
 // Retain the boot memory map for runtime inspection (SYS_MEMMAP_GET / lsmem). The x86

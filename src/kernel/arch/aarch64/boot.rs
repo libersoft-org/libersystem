@@ -284,6 +284,11 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// Publish the direct-map offset so the portable subsystems (heap, ELF loader,
 	// ...) reach physical frames the same way this backend does (phys | KOFF).
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
+	// AND WHAT THE STUB ACTUALLY MAPPED. The boot assembly maps 1 GB blocks over 0..4 GiB before any memory
+	// map is read, so the direct map's extent is that number and not the top of whatever the device
+	// tree reports. Without this a machine with more RAM than the stub maps has `within_direct_map`
+	// answering true for addresses `phys_to_virt` does not translate.
+	crate::mem::set_direct_map_extent(4 * 1024 * 1024 * 1024);
 	// The pool runs to the top of RAM, MINUS what the loader left in it.
 	//
 	// It used to be one region and nothing else, on the reasoning that a clamp without the thing
@@ -294,7 +299,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	//
 	// Declaring them free is only harmless while nothing allocates that far up. See
 	// `arch::common::bootmem` for how long that held and what ended it.
-	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; 16];
+	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; crate::arch::common::bootmem::MAX_HOLES];
 	let hole_count = unsafe { crate::arch::common::bootmem::loader_reservations(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys), &mut holes) };
 	// `banks + holes`, because each reservation splits at most one bank into one extra region.
 	let mut regions = [bootproto::MemRegion { base: 0, length: 0, kind: bootproto::MEM_USABLE, _pad: 0 }; fdt::MAX_RAM_REGIONS + crate::arch::common::bootmem::MAX_HOLES];

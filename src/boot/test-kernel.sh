@@ -174,11 +174,24 @@ rm -f "$STALL_MARK.hit"
 progress_count() {
 	cat "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | grep -c '\[ok\]' || true
 }
+# IT KILLS ITS OWN RUN'S GUEST, BY PID, AND NOTHING ELSE'S.
+#
+# This used to end with `pkill -f "qemu-system-$ARCH"`, which matches by PATTERN - so a watchdog left
+# behind by a run whose cargo and QEMU had been killed kept polling its own log, saw no progress, and
+# shot down an unrelated guest started minutes later. That happened while debugging P02M0133 and cost
+# a measurement: the victim run reported `FAIL (exit 101, 54s)` with `signal: 9, SIGKILL` over a
+# guest log full of passing tests, which reads exactly like a kernel defect and is not one.
+#
+# Two changes, both about the watchdog only ever affecting the run that started it: it waits for the
+# guest to EXIST and remembers its pid, and it exits when its parent is gone as well as when its
+# stall mark is removed. A watchdog whose run has already ended has nothing left to watch.
 (
 	last=-1
 	quiet=0
+	parent=$$
 	while sleep 30; do
 		[[ -f "$STALL_MARK" ]] || break
+		kill -0 "$parent" 2>/dev/null || break
 		now="$(progress_count)"
 		if [[ "$now" != "$last" ]]; then
 			last="$now"
@@ -189,7 +202,19 @@ progress_count() {
 		if ((quiet >= STALL)); then
 			stuck="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | tail -1 | sed -E 's/\.\.\..*$//' || true)"
 			printf '%s\t%s\n' "${stuck:-unknown}" "$quiet" >"$STALL_MARK.hit"
-			pkill -f "qemu-system-$ARCH" || true
+			# By pid, and only a guest this shell is an ancestor of. `pgrep -P` walks from our own
+			# process tree rather than matching every QEMU on the machine.
+			victim="$(pgrep -f "qemu-system-$ARCH" 2>/dev/null | while read -r pid; do
+				walk="$pid"
+				while [[ -n "$walk" && "$walk" != "1" ]]; do
+					[[ "$walk" == "$parent" ]] && {
+						echo "$pid"
+						break
+					}
+					walk="$(ps -o ppid= -p "$walk" 2>/dev/null | tr -d ' ')"
+				done
+			done | head -n 1)"
+			[[ -n "$victim" ]] && kill "$victim" 2>/dev/null
 			break
 		fi
 	done

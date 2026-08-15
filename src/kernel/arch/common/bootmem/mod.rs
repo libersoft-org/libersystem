@@ -31,6 +31,16 @@ pub struct Hole {
 
 const PAGE: u64 = 4096;
 
+// The most modules a hand-off may declare, and therefore the most buffers that have to be carved out
+// of free RAM. Exported so the callers can size their hole arrays from it instead of guessing.
+//
+// They guessed 16, and `push` below stops silently when the caller's slice is full - so with two
+// slots spent on `BootInfo` and the module descriptor array, modules past the fourteenth were simply
+// not reserved, and the frame allocator was free to hand out the page an ELF archive was sitting in.
+// That is the flaky `BadImage` this milestone already fixed once, reachable again by staging more
+// modules, and nothing would have said so.
+pub const MAX_MODULES: usize = 64;
+
 // Cut `holes` out of `[base, base + len)` and write what survives into `out`, returning how many
 // regions were written.
 //
@@ -43,8 +53,16 @@ const PAGE: u64 = 4096;
 // the last region written is TRUNCATED at the start of the next hole rather than extended over it -
 // losing memory, never handing out a hole. Deliberately: with room for `n` regions the safe failure
 // is a smaller pool.
-// How many reservations `carve_banks` will copy for each bank. The same sixteen both ports pass.
-pub const MAX_HOLES: usize = 16;
+// How many reservations a hole array has to hold, and it is DERIVED now.
+//
+// It was sixteen, and both ports wrote `16` out by hand rather than using it - so nothing connected
+// the array's size to the number of reservations there can be. `loader_reservations` spends two
+// slots on `BootInfo` and the module descriptor array and one per module, and it accepts up to
+// `MAX_MODULES` of them: with sixteen slots, a hand-off declaring more than fourteen modules had the
+// rest dropped in silence, and a module buffer that is not carved out of free RAM is a page the
+// allocator may hand out with an ELF archive still in it. That is the flaky `BadImage` this
+// milestone already fixed once, reachable again by staging more modules.
+pub const MAX_HOLES: usize = 2 + MAX_MODULES;
 
 // Carve EVERY RAM bank against the loader's reservations, into one region array.
 //
@@ -166,11 +184,20 @@ pub unsafe fn loader_reservations(arg: u64, to_virt: impl Fn(u64) -> u64, out: &
 	let info = to_virt(arg) as *const bootproto::BootInfo;
 	let (modules_phys, modules_len) = unsafe { (core::ptr::read_volatile(&raw const (*info).modules), core::ptr::read_volatile(&raw const (*info).modules_len)) };
 	let mut written = 0usize;
+	// SAYS SO WHEN IT CANNOT FIT ONE. A reservation that does not make it into the list is a region
+	// the allocator will hand out, and the old version returned a short list that reads exactly like
+	// a complete one. Callers size their arrays from `MAX_HOLES`, so this should never fire - which
+	// is precisely why it must be audible if it ever does.
 	let push = |start: u64, length: u64, out: &mut [Hole], written: &mut usize| {
-		if length > 0 && *written < out.len() {
-			out[*written] = Hole { start, end: start + length };
-			*written += 1;
+		if length == 0 {
+			return;
 		}
+		if *written >= out.len() {
+			crate::serial_println!("bootmem: NO ROOM to reserve {start:#x}..{:#x} - the hole list holds {} and the allocator may hand this range out", start + length, out.len());
+			return;
+		}
+		out[*written] = Hole { start, end: start + length };
+		*written += 1;
 	};
 	push(arg, core::mem::size_of::<bootproto::BootInfo>() as u64, out, &mut written);
 	if modules_phys == 0 || modules_len == 0 {
@@ -179,7 +206,7 @@ pub unsafe fn loader_reservations(arg: u64, to_virt: impl Fn(u64) -> u64, out: &
 	push(modules_phys, modules_len * core::mem::size_of::<bootproto::Module>() as u64, out, &mut written);
 	// A length the hand-off cannot plausibly have means the pointer is not what it claims, and
 	// walking it would read arbitrary memory as descriptors. Refuse rather than guess.
-	if modules_len > 64 {
+	if modules_len > MAX_MODULES as u64 {
 		return written;
 	}
 	let modules = unsafe { core::slice::from_raw_parts(to_virt(modules_phys) as *const bootproto::Module, modules_len as usize) };

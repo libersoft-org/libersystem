@@ -95,6 +95,24 @@ pub struct Process {
 	// point at, so the Process owns those frames and frees them on drop. Empty for
 	// kernel processes (their threads run on the shared kernel mappings).
 	user_frames: SpinLock<Vec<u64>>,
+	// Set while an image or module load owns this process's adoption booking.
+	//
+	// `reserve_adopt` calls `try_reserve` on two vectors and `adopt_frames` extends them later, and
+	// `try_reserve` books capacity against the CURRENT length while recording nothing. Two loads can
+	// therefore both be told yes - A reserves 50 against len 100, B sees the capacity is already
+	// there and reserves nothing, A adopts to len 150, and B's extend reallocates INFALLIBLY. That is
+	// the defect the reservation exists to prevent, reached through concurrency rather than through a
+	// missing call, and `begin_extend` does not close it: it COUNTS operations so teardown can wait
+	// for them and explicitly does not serialise them.
+	//
+	// NOT A SPINLOCK, deliberately. A lock held across a load is a lock held across allocation and
+	// mapping with interrupts masked, which is the hazard that got the scheduler's pre-booking
+	// withdrawn earlier in this same milestone: heap growth waits on a TLB shootdown, and a core
+	// spinning for the lock cannot acknowledge it. A one-owner gate costs one atomic, holds nothing,
+	// and lets the second load be REFUSED - which is an answer `SYS_PROCESS_LOAD` already has and a
+	// caller already handles, and a second concurrent load into one process is not a thing a correct
+	// spawner does.
+	image_load: AtomicBool,
 	// Forward links to this process's threads (Weak, so they never keep a dead thread
 	// alive). Signal delivery wakes each so a blocked thread observes a kill / stop at
 	// its next scheduling point.
@@ -173,7 +191,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()) })?;
+		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()) })?;
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
@@ -199,8 +217,20 @@ impl Process {
 
 	// Seed a capability to `object` into the table and return its raw handle, the
 	// way a new process is endowed with an initial bootstrap capability.
-	pub fn install(&self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> u64 {
-		self.handles.lock().insert_object(object, rights, badge).raw()
+	// Install a capability in this process's handle table, or `None` when the table could not take
+	// it.
+	//
+	// IT USED TO RETURN A RAW `u64` AND SIGNAL FAILURE AS ZERO, which is not a handle and reads
+	// exactly like one. `loader::spawn_elf_process` took that number and passed it to the child
+	// without looking, so an out-of-memory at the last step of a spawn produced a process that
+	// STARTED, was reported as spawned, and had no bootstrap capability - a failure the parent
+	// could not detect and the child could not name. The quota leak on that path was fixed a round
+	// earlier; the failure semantics were not, because the type could not express them.
+	pub fn install(&self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Option<u64> {
+		match self.handles.lock().insert_object(object, rights, badge).raw() {
+			0 => None,
+			handle => Some(handle),
+		}
 	}
 
 	// Take ownership of the physical frames backing this process's user image and
@@ -230,6 +260,15 @@ impl Process {
 	// Reserving separately from adopting is what makes the loader's transaction possible: the
 	// booking happens while the load can still be unwound, and the adopt happens after the last
 	// step that can fail.
+	// Claim this process's adoption booking for the duration of one load, or `None` when another
+	// load already holds it. The guard releases on drop, including on every rollback path.
+	pub fn begin_image_load(&self) -> Option<ImageLoadGuard<'_>> {
+		match self.image_load.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire) {
+			Ok(_) => Some(ImageLoadGuard { process: self }),
+			Err(_) => None,
+		}
+	}
+
 	pub fn reserve_adopt(&self, frames: usize, pages: usize) -> bool {
 		if self.user_frames.lock().try_reserve(frames).is_err() {
 			return false;
@@ -844,3 +883,14 @@ impl_kernel_object!(Process, Process);
 
 #[cfg(test)]
 mod tests;
+
+// Held for the length of one image or module load - see `Process::image_load`.
+pub struct ImageLoadGuard<'a> {
+	process: &'a Process,
+}
+
+impl Drop for ImageLoadGuard<'_> {
+	fn drop(&mut self) {
+		self.process.image_load.store(false, Ordering::Release);
+	}
+}

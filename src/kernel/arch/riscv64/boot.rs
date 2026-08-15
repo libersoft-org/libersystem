@@ -244,10 +244,15 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	super::pci::set_ecam_base(pcie_ecam);
 
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
+	// AND WHAT THE STUB ACTUALLY MAPPED. The boot assembly maps eight 1 GiB leaves over 0..8 GiB before any memory
+	// map is read, so the direct map's extent is that number and not the top of whatever the device
+	// tree reports. Without this a machine with more RAM than the stub maps has `within_direct_map`
+	// answering true for addresses `phys_to_virt` does not translate.
+	crate::mem::set_direct_map_extent(8 * 1024 * 1024 * 1024);
 	// The pool runs to the top of RAM, MINUS what the loader left in it. Same hand-off and same
 	// hazard as aarch64 - no memory map, packages read into RAM above the kernel and read for the
 	// life of the boot - so the same carve. See `arch::common::bootmem`.
-	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; 16];
+	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; crate::arch::common::bootmem::MAX_HOLES];
 	let hole_count = unsafe { crate::arch::common::bootmem::loader_reservations(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys), &mut holes) };
 	// `banks + holes`, because each reservation splits at most one bank into one extra region.
 	let mut regions = [bootproto::MemRegion { base: 0, length: 0, kind: bootproto::MEM_USABLE, _pad: 0 }; fdt::MAX_RAM_REGIONS + crate::arch::common::bootmem::MAX_HOLES];
