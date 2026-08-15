@@ -83,3 +83,80 @@ fn random_fills_distinct_bytes_from_whichever_source_is_honest() {
 	crate::sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst));
 }
+
+crate::tagged_test!(the_syscall_image_buffer_allocates_and_survives_on_a_spawned_thread, [Kernel, Syscall, Memory], id = "kernel.syscall.the_syscall_image_buffer_allocates_and_survives_on_a_spawned_thread", covers = ["kernel"]);
+fn the_syscall_image_buffer_allocates_and_survives_on_a_spawned_thread() {
+	// `SYS_PROCESS_LOAD` buffers the caller's image into the kernel before parsing it, and that
+	// buffer is the last untested thing on a path that breaks: driven from a spawned kernel thread on
+	// aarch64, the load neither answers nor faults, and a control with the image FULLY MAPPED - so no
+	// fault is possible - died with QEMU reporting a kernel address written into a virtio queue
+	// register. Memory is being corrupted somewhere on that path whether or not a page is absent.
+	//
+	// This is the allocation on its own, in the context that breaks: the same `try_zeroed_bytes`, the
+	// same 8 KiB, the same spawned thread, and nothing else - no handle, no user buffer, no loader.
+	// It writes a pattern through the whole buffer and reads it back, so a buffer that is short,
+	// overlapping something live, or not really there fails here rather than three layers later.
+	//
+	// If this passes, the allocation is cleared and the ELF loader is what remains. If it fails, this
+	// is the bug, and it is one this milestone has already met once in another form - an allocation
+	// reachable from a context that cannot safely make one.
+	use core::sync::atomic::{AtomicU64, Ordering};
+
+	const LEN: usize = 8192;
+	// 0 = never ran, 1 = allocation refused, 2 = pattern did not survive, 3 = fine.
+	static OUTCOME: AtomicU64 = AtomicU64::new(0);
+
+	extern "C" fn body(_bootstrap: u64) {
+		let Some(mut image) = super::try_zeroed_bytes(LEN) else {
+			OUTCOME.store(1, Ordering::SeqCst);
+			return;
+		};
+		assert_eq!(image.len(), LEN, "the buffer is the length that was asked for");
+		for (index, slot) in image.iter_mut().enumerate() {
+			*slot = (index % 251) as u8;
+		}
+		let intact = image.iter().enumerate().all(|(index, byte)| *byte == (index % 251) as u8);
+		OUTCOME.store(if intact { 3 } else { 2 }, Ordering::SeqCst);
+	}
+
+	crate::sched::spawn(body, 0);
+	crate::sched::run_until_idle();
+
+	match OUTCOME.load(Ordering::SeqCst) {
+		0 => panic!("the spawned thread never ran"),
+		1 => panic!("an 8 KiB kernel buffer could not be allocated from a spawned thread"),
+		2 => panic!("an 8 KiB kernel buffer did not hold what was written into it - the allocation overlaps something live"),
+		_ => {}
+	}
+}
+
+crate::tagged_test!(a_spawned_thread_can_create_a_child_process_and_let_it_go, [Kernel, Syscall, Process], id = "kernel.syscall.a_spawned_thread_can_create_a_child_process_and_let_it_go", covers = ["kernel"]);
+fn a_spawned_thread_can_create_a_child_process_and_let_it_go() {
+	// The first half of the path that breaks, on its own.
+	//
+	// `SYS_PROCESS_LOAD` from a spawned kernel thread neither answers nor faults on aarch64, and the
+	// two things it does have now been split: the kernel-side image buffer is cleared by the test
+	// above - it allocates and holds its contents - so what is left is creating the child process and
+	// the loader that fills it. This test does the FIRST of those and stops: create the child, check
+	// the handle, and let the thread end without loading anything.
+	//
+	// If this breaks, process creation or teardown from a spawned thread is the bug and the loader is
+	// innocent. If it passes, both halves are individually sound and the loader is the last thing on
+	// the path that has not been isolated.
+	use core::sync::atomic::{AtomicI64, Ordering};
+
+	static CHILD: AtomicI64 = AtomicI64::new(0);
+
+	extern "C" fn body(_bootstrap: u64) {
+		let child = unsafe { arch::syscall::invoke(SYS_PROCESS_CREATE, 0, 0, 0, 0) } as i64;
+		CHILD.store(child, Ordering::SeqCst);
+	}
+
+	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
+	crate::sched::spawn_with_object(body, user_ep, crate::object::rights::Rights::ALL, 0);
+	crate::sched::run_until_idle();
+
+	let child = CHILD.load(Ordering::SeqCst);
+	assert!(child != 0, "the spawned thread never ran");
+	assert!(child > 0, "a spawned kernel thread with a process context must be able to create a child process, and got {child}");
+}
