@@ -51,9 +51,22 @@ struct Entry {
 static REFUSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static CAUGHT: AtomicU64 = AtomicU64::new(0);
 
+// Faults at a user address whose pc the table does not name. Each one is a kernel bug the caller is
+// about to halt on, so the first few say enough to tell WHICH bug; the budget exists because this
+// runs inside a fault handler and a fault that repeats must not turn a halt into a flood.
+static UNDECLARED: AtomicU64 = AtomicU64::new(0);
+const UNDECLARED_DIAGNOSTICS: u64 = 4;
+
+// The linker-provided bounds of the section, as ADDRESSES. Read once here so the diagnostic below
+// can print the same two numbers `entries()` computed its length from: a table that is empty, short
+// or misplaced at runtime is indistinguishable from one that simply does not cover an instruction,
+// and those need different fixes.
+fn bounds() -> (usize, usize) {
+	(&raw const __extable_start as usize, &raw const __extable_end as usize)
+}
+
 fn entries() -> &'static [Entry] {
-	let start = &raw const __extable_start as usize;
-	let end = &raw const __extable_end as usize;
+	let (start, end) = bounds();
 	// An empty or malformed table is not a reason to fault while handling a fault. The section is
 	// emitted by the copy routines, so a build that inlined none of them legitimately has none.
 	if end <= start {
@@ -106,8 +119,31 @@ pub fn fixup_for(pc: u64, fault_address: u64) -> Option<u64> {
 		return None;
 	}
 	let found = entries().iter().find(|entry| entry.fault == pc).map(|entry| entry.fixup);
-	if found.is_some() {
-		CAUGHT.fetch_add(1, Ordering::AcqRel);
+	match found {
+		Some(_) => {
+			CAUGHT.fetch_add(1, Ordering::AcqRel);
+		}
+		None => {
+			// The caller is about to call this a kernel bug and halt, and until now it halted with
+			// NOTHING to say why - which is how the aarch64 suite came to stop at
+			// `a_process_load_whose_image_goes_away...` with only an exception dump, at a pc the
+			// linked `.extable` demonstrably contains.
+			//
+			// This budget is SEPARATE from the refusal one above on purpose, and that separation is
+			// the actual defect being fixed. Both used to share a single once-per-boot line, and
+			// `a_fault_on_a_kernel_address_is_never_rescued_however_the_pc_matches` spends refusals
+			// DELIBERATELY - three of them - immediately before the test that halts. So the halt was
+			// silent, and "no diagnostic appeared" could not be used to rule the refusal branch out.
+			// A diagnostic a passing test can spend is absent exactly when it is needed.
+			//
+			// The bounds and the count are printed with the pc because they separate the three
+			// causes that look identical from the outside: a table that is empty, one the linker
+			// placed or sized wrongly, and one that is intact but does not name this instruction.
+			if UNDECLARED.fetch_add(1, Ordering::AcqRel) < UNDECLARED_DIAGNOSTICS {
+				let (start, end) = bounds();
+				crate::serial_println!("extable: NO ENTRY for pc {pc:#x} faulting on user address {fault_address:#x} - the table declares {} entries between {start:#x} and {end:#x}", entries().len());
+			}
+		}
 	}
 	found
 }
