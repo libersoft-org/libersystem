@@ -16,6 +16,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use cli::Regex;
 use lico::{Chord, FileType, InputDecoder, InputEvent, Key, LineState, MAX_DESCRIPTOR_BYTES, MouseTracking, SyntaxDescriptor, TerminalGuard, TerminalOptions, TerminalWriter, TextBuffer, TextBufferError, TextQuery, TokenSpan, append_display_line, detect_file_type, parse_descriptor, select_descriptor};
 use proto::system::{FileInfo, LaunchContext, SelectedFile, WriterMode};
 use rt::*;
@@ -105,6 +106,10 @@ struct Editor {
 	spaces_for_tab: bool,
 	indent_width: usize,
 	auto_indent: bool,
+	// Whether the search and replace read their pattern as a regular expression. Off by default,
+	// because a reader who typed exact characters meant them - and a pattern read as an expression
+	// when they did not ask is a wrong answer that looks right.
+	regex_mode: bool,
 	// The selected-file client, or 0. Held rather than passed, because the save and the reload both
 	// need it and a parameter threaded through two call paths is a parameter one of them forgets.
 	granted: u64,
@@ -208,7 +213,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			eprint(b"licoedit: nothing could be opened\n");
 			exit();
 		}
-		let mut editor = Editor { buffers, active: 0, descriptors, clipboard: Vec::new(), prompt: Prompt::None, entry: Vec::new(), needle: Vec::new(), replacement: Vec::new(), status: Vec::new(), line_numbers: true, highlight: true, wrap: false, show_whitespace: false, overwrite_mode: false, spaces_for_tab: true, indent_width: 4, auto_indent: true, granted: selected };
+		let mut editor = Editor { buffers, active: 0, descriptors, clipboard: Vec::new(), prompt: Prompt::None, entry: Vec::new(), needle: Vec::new(), replacement: Vec::new(), status: Vec::new(), line_numbers: true, highlight: true, wrap: false, show_whitespace: false, overwrite_mode: false, spaces_for_tab: true, indent_width: 4, auto_indent: true, regex_mode: false, granted: selected };
 		editor.say(b"^S save  M-a save-as  M-r reload  ^Z/^Y undo  ^C/^X/^V clip  ^G line  ^F find  ^R replace  ^W buffer  F10 exit");
 		if stdin() == 0 || stdout() == 0 {
 			eprint(b"licoedit: interactive terminal unavailable\n");
@@ -353,6 +358,11 @@ impl Editor {
 			InputEvent::Chord(Chord { key: Key::Byte(b't'), alt: true, .. }) => {
 				self.spaces_for_tab = !self.spaces_for_tab;
 				self.say(if self.spaces_for_tab { b"Tab inserts spaces" } else { b"Tab inserts a tab byte" });
+				EditAction::Redraw
+			}
+			InputEvent::Chord(Chord { key: Key::Byte(b'x'), alt: true, .. }) => {
+				self.regex_mode = !self.regex_mode;
+				self.say(if self.regex_mode { b"find and replace read a regular expression" } else { b"find and replace read literal text" });
 				EditAction::Redraw
 			}
 			InputEvent::Chord(Chord { key: Key::Byte(b'i'), alt: true, .. }) => {
@@ -711,7 +721,7 @@ impl Editor {
 			Prompt::ReplaceWith => {
 				self.replacement = entry;
 				let (needle, replacement) = (core::mem::take(&mut self.needle), core::mem::take(&mut self.replacement));
-				let outcome = self.buffers[self.active].text.replace_all(&needle, &replacement, false);
+				let outcome = if self.regex_mode { self.replace_all_matching(&needle, &replacement) } else { self.buffers[self.active].text.replace_all(&needle, &replacement, false) };
 				self.needle = needle;
 				self.replacement = replacement;
 				match outcome {
@@ -783,6 +793,30 @@ impl Editor {
 			return EditAction::Redraw;
 		}
 		let from = if backward { self.buffers[self.active].text.cursor() } else { self.buffers[self.active].text.cursor() + 1 };
+		// A REGULAR EXPRESSION SEARCHES FORWARD ONLY, and says so rather than pretending: the engine
+		// answers "the first match at or after here", and running it backward would mean matching
+		// every position from the start to find the last one before the caret. A reader who wants
+		// that has `^` and the literal mode.
+		if self.regex_mode {
+			let Ok(pattern) = Regex::compile(&self.needle) else {
+				self.say(b"that is not a pattern this search can read");
+				return EditAction::Redraw;
+			};
+			let found = pattern.find(self.buffers[self.active].text.bytes(), from).or_else(|| pattern.find(self.buffers[self.active].text.bytes(), 0));
+			return match found {
+				Some((start, end)) => {
+					self.buffers[self.active].text.set_cursor(start);
+					self.buffers[self.active].text.set_anchor();
+					self.buffers[self.active].text.set_cursor(end);
+					self.say(b"");
+					EditAction::Redraw
+				}
+				None => {
+					self.say(b"not found - the view stays where it was");
+					EditAction::Redraw
+				}
+			};
+		}
 		let query = TextQuery::new(&self.needle);
 		let hit = query.find(self.buffers[self.active].text.bytes(), from, backward).or_else(|| {
 			// WRAPPING IS SAID OUT LOUD rather than done silently: a search that quietly starts
@@ -803,6 +837,37 @@ impl Editor {
 				EditAction::Redraw
 			}
 		}
+	}
+
+	// Replace every match of a regular expression, from the end BACKWARD.
+	//
+	// Backward because each replacement moves everything after it: going forward would need every
+	// later offset adjusted by the difference in length, and an off-by-one there silently corrupts
+	// the file rather than failing. From the end, an earlier match's offsets are still true.
+	//
+	// NOT one edit, unlike the literal replace-all - each is its own, so undo takes them back one at
+	// a time. Making it one would mean building the whole result first, which is a second copy of
+	// the file for an operation that already has the buffer in hand.
+	fn replace_all_matching(&mut self, pattern: &[u8], replacement: &[u8]) -> Result<usize, TextBufferError> {
+		let Ok(compiled) = Regex::compile(pattern) else {
+			return Ok(0);
+		};
+		let mut ranges: Vec<(usize, usize)> = Vec::new();
+		let mut at = 0;
+		while let Some((start, end)) = compiled.find(self.buffers[self.active].text.bytes(), at) {
+			ranges.try_reserve(1).map_err(|_| TextBufferError::OutOfMemory)?;
+			ranges.push((start, end));
+			// AN EMPTY MATCH STILL ADVANCES, or `a*` against any text never terminates.
+			at = if end > start { end } else { end + 1 };
+			if at > self.buffers[self.active].text.bytes().len() {
+				break;
+			}
+		}
+		let count = ranges.len();
+		for (start, end) in ranges.into_iter().rev() {
+			self.buffers[self.active].text.replace_range(start, end, replacement)?;
+		}
+		Ok(count)
 	}
 
 	// Replace the match that is selected, then select the next one - so holding the key walks the
@@ -1016,6 +1081,9 @@ fn render(output: &mut impl TerminalWriter, editor: &Editor) -> bool {
 	}
 	if editor.overwrite_mode {
 		rendered.extend_from_slice(b"  ovr");
+	}
+	if editor.regex_mode {
+		rendered.extend_from_slice(b"  regex");
 	}
 	rendered.extend_from_slice(b"  line ");
 	append_decimal(&mut rendered, active.text.line_number());

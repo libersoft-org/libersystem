@@ -584,6 +584,18 @@ impl TextBuffer {
 		self.splice(start, needle.len(), replacement).is_ok()
 	}
 
+	/// Replace the bytes between `start` and `end` with `bytes`, as one edit.
+	///
+	/// The general primitive, for a caller that found its own match - a regular expression, say,
+	/// whose engine lives where the tools that share it can reach it. The buffer does not need to
+	/// know how the range was chosen, only that it is one.
+	pub fn replace_range(&mut self, start: usize, end: usize, bytes: &[u8]) -> Result<(), TextBufferError> {
+		let start = start.min(self.bytes.len());
+		let end = end.clamp(start, self.bytes.len());
+		self.coalescing = false;
+		self.splice(start, end - start, bytes)
+	}
+
 	/// Replace every occurrence, as ONE edit - so a replace-all that turned out to be wrong is one
 	/// undo rather than one per occurrence.
 	pub fn replace_all(&mut self, needle: &[u8], replacement: &[u8], ignore_case: bool) -> Result<usize, TextBufferError> {

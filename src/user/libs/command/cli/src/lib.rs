@@ -542,5 +542,226 @@ impl LineBuffer {
 	}
 }
 
+/// A bounded regular expression, compiled once and matched with a STEP BUDGET.
+///
+/// WHY A BUDGET RATHER THAN A CLEVERER ENGINE. Backtracking is the simple implementation and it is
+/// the one with the pathological cases: `(a*)*b` against a run of `a` is the classic way to make a
+/// search take longer than the machine has. A budget makes every match TERMINATE - a pattern that
+/// needs more steps than it allows is REFUSED as too complex rather than run until somebody notices,
+/// and refusing is an answer a caller can act on where a hang is not.
+///
+/// THE SYNTAX IS SMALL AND SAID OUT LOUD, because a half-understood pattern is a wrong answer that
+/// looks right: literal bytes, `.` for any byte, `*` `+` `?` on the item before them, `[abc]`
+/// `[^abc]` `[a-z]` classes, `^` and `$` anchors, and `\` to escape any of these. No groups, no
+/// alternation, no repetition counts - each is an addition behind this same interface rather than a
+/// different thing, and none of them is needed to find a word in a file.
+#[derive(Debug)]
+pub struct Regex {
+	items: Vec<Item>,
+	anchored_start: bool,
+	anchored_end: bool,
+}
+
+/// One compiled item: what to match, and how many times.
+#[derive(Debug)]
+struct Item {
+	kind: Kind,
+	min: u8,
+	/// `u32::MAX` for `*` and `+`.
+	max: u32,
+}
+
+#[derive(Debug)]
+enum Kind {
+	Byte(u8),
+	Any,
+	/// A class as a 256-bit set, so `[a-z0-9_]` costs the same to test as `[a]`.
+	Class {
+		set: [u64; 4],
+		negated: bool,
+	},
+}
+
+/// Why a pattern could not be compiled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegexError {
+	/// A repetition with nothing before it - `*ab`.
+	NothingToRepeat,
+	/// A class that is never closed.
+	UnterminatedClass,
+	/// A trailing backslash, which escapes nothing.
+	DanglingEscape,
+	/// Past the item bound.
+	TooComplex,
+	OutOfMemory,
+}
+
+/// The most items one pattern may compile to, and the most steps one match may take.
+pub const MAX_REGEX_ITEMS: usize = 128;
+pub const MAX_REGEX_STEPS: u32 = 200_000;
+
+impl Regex {
+	pub fn compile(pattern: &[u8]) -> Result<Regex, RegexError> {
+		let mut items: Vec<Item> = Vec::new();
+		let mut at = 0;
+		let anchored_start = pattern.first() == Some(&b'^');
+		if anchored_start {
+			at = 1;
+		}
+		let mut anchored_end = false;
+		while at < pattern.len() {
+			// `$` is an anchor only at the very end; anywhere else it is a literal dollar, which is
+			// what somebody searching for a price typed.
+			if pattern[at] == b'$' && at + 1 == pattern.len() {
+				anchored_end = true;
+				break;
+			}
+			let kind = match pattern[at] {
+				b'\\' => {
+					at += 1;
+					let byte = *pattern.get(at).ok_or(RegexError::DanglingEscape)?;
+					Kind::Byte(byte)
+				}
+				b'.' => Kind::Any,
+				b'[' => {
+					let (kind, next) = compile_class(pattern, at)?;
+					at = next;
+					kind
+				}
+				b'*' | b'+' | b'?' => return Err(RegexError::NothingToRepeat),
+				byte => Kind::Byte(byte),
+			};
+			at += 1;
+			let (min, max) = match pattern.get(at) {
+				Some(b'*') => {
+					at += 1;
+					(0, u32::MAX)
+				}
+				Some(b'+') => {
+					at += 1;
+					(1, u32::MAX)
+				}
+				Some(b'?') => {
+					at += 1;
+					(0, 1)
+				}
+				_ => (1, 1),
+			};
+			if items.len() == MAX_REGEX_ITEMS {
+				return Err(RegexError::TooComplex);
+			}
+			items.try_reserve(1).map_err(|_| RegexError::OutOfMemory)?;
+			items.push(Item { kind, min, max });
+		}
+		Ok(Regex { items, anchored_start, anchored_end })
+	}
+
+	/// The first match at or after `from`, as `(start, end)`. `None` when there is none, or when the
+	/// match ran out of steps - which is refused rather than reported as "not found", so a caller
+	/// can tell a pattern that is too expensive from a file that does not contain it.
+	pub fn find(&self, haystack: &[u8], from: usize) -> Option<(usize, usize)> {
+		let mut start = from.min(haystack.len());
+		loop {
+			let mut steps = MAX_REGEX_STEPS;
+			if let Some(end) = self.match_here(haystack, start, 0, &mut steps) {
+				if !self.anchored_end || end == haystack.len() {
+					return Some((start, end));
+				}
+			}
+			// AN ANCHORED PATTERN IS TRIED ONCE. `^ab` that does not match at the start does not
+			// match anywhere, and sliding it along would be answering a different question.
+			if self.anchored_start || start >= haystack.len() {
+				return None;
+			}
+			start += 1;
+		}
+	}
+
+	/// Whether the whole of `text` is this pattern.
+	pub fn matches(&self, text: &[u8]) -> bool {
+		let mut steps = MAX_REGEX_STEPS;
+		self.match_here(text, 0, 0, &mut steps) == Some(text.len())
+	}
+
+	// Match `items[index..]` at `at`, answering where the match ended. GREEDY WITH BACKTRACKING:
+	// each repetition takes as much as it can and gives back one at a time, which is what makes
+	// `.*b` find the LAST `b` and `.*?` unnecessary.
+	fn match_here(&self, haystack: &[u8], at: usize, index: usize, steps: &mut u32) -> Option<usize> {
+		if *steps == 0 {
+			return None;
+		}
+		*steps -= 1;
+		let Some(item) = self.items.get(index) else { return Some(at) };
+		let mut taken = 0u32;
+		let mut cursor = at;
+		while taken < item.max && cursor < haystack.len() && item.kind.admits(haystack[cursor]) {
+			cursor += 1;
+			taken += 1;
+		}
+		while taken + 1 > item.min as u32 || (taken == 0 && item.min == 0) {
+			if let Some(end) = self.match_here(haystack, at + taken as usize, index + 1, steps) {
+				return Some(end);
+			}
+			if taken == 0 {
+				return None;
+			}
+			taken -= 1;
+		}
+		None
+	}
+}
+
+impl Kind {
+	fn admits(&self, byte: u8) -> bool {
+		match self {
+			Kind::Byte(wanted) => *wanted == byte,
+			Kind::Any => true,
+			Kind::Class { set, negated } => {
+				let present = set[(byte >> 6) as usize] & (1u64 << (byte & 63)) != 0;
+				present != *negated
+			}
+		}
+	}
+}
+
+// Compile `[...]` starting at `at`, answering the kind and the index of its closing bracket.
+fn compile_class(pattern: &[u8], at: usize) -> Result<(Kind, usize), RegexError> {
+	let mut set = [0u64; 4];
+	let mut index = at + 1;
+	let negated = pattern.get(index) == Some(&b'^');
+	if negated {
+		index += 1;
+	}
+	// A `]` FIRST IS A LITERAL `]`, which is the convention and is what somebody writing a class of
+	// brackets needs - there is no other way to say it without an escape.
+	let mut first = true;
+	while index < pattern.len() {
+		let byte = pattern[index];
+		if byte == b']' && !first {
+			return Ok((Kind::Class { set, negated }, index));
+		}
+		first = false;
+		let byte = if byte == b'\\' {
+			index += 1;
+			*pattern.get(index).ok_or(RegexError::DanglingEscape)?
+		} else {
+			byte
+		};
+		// A RANGE, when a `-` sits between two members and is not the last character.
+		if pattern.get(index + 1) == Some(&b'-') && pattern.get(index + 2).is_some_and(|end| *end != b']') {
+			let end = pattern[index + 2];
+			let (low, high) = if byte <= end { (byte, end) } else { (end, byte) };
+			for value in low..=high {
+				set[(value >> 6) as usize] |= 1u64 << (value & 63);
+			}
+			index += 3;
+			continue;
+		}
+		set[(byte >> 6) as usize] |= 1u64 << (byte & 63);
+		index += 1;
+	}
+	Err(RegexError::UnterminatedClass)
+}
+
 #[cfg(test)]
 mod tests;

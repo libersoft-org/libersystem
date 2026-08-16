@@ -13,13 +13,19 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use lico::{FileType, HexPattern, HexPatternError, InputDecoder, InputEvent, Key, LineState, MAX_DESCRIPTOR_BYTES, MouseTracking, SyntaxDescriptor, TerminalGuard, TerminalOptions, TerminalWriter, TextQuery, TokenSpan, append_display_line, detect_file_type, parse_descriptor, select_descriptor};
+use lico::{FileType, HexPattern, HexPatternError, InputDecoder, InputEvent, Key, LineState, MAX_DESCRIPTOR_BYTES, MouseTracking, SyntaxDescriptor, TerminalGuard, TerminalOptions, TerminalWriter, TokenSpan, append_display_line, detect_file_type, parse_descriptor, select_descriptor};
 use proto::system::{LaunchContext, SelectedFile};
 use rt::*;
 use storage_proto::path;
-use tools::{ConsoleWriter, VolumeSet, read_volume_file};
+use tools::{ConsoleWriter, VolumeSet, read_volume_file, read_volume_window};
 use volume_client_provider as _;
 
+// How much of a file is held at once when it is PAGED, so the viewer's memory is a function of the
+// screen rather than of the file.
+const WINDOW_BYTES: usize = 64 * 1024;
+// The most of one line the viewer will render. A file with no newline in it is one enormous line.
+const MAX_LINE_BYTES: usize = 8192;
+// A file at or below this is read whole; above it the viewer pages.
 const MAX_VIEW_BYTES: usize = 512 * 1024;
 const VIEW_COLUMNS: usize = 80;
 const VIEW_ROWS: usize = 20;
@@ -90,10 +96,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(opened) => opened.name.as_bytes(),
 			None => arg,
 		};
-		let file = match read_volume_file(storage, &uri, MAX_VIEW_BYTES) {
-			Ok(file) => file,
-			Err(_) => {
-				eprint(b"licoview: cannot open file or it exceeds the current 512 kB limit\n");
+		let mut source = match Source::open(storage, &uri) {
+			Some(source) => source,
+			None => {
+				eprint(b"licoview: cannot open that file\n");
 				exit();
 			}
 		};
@@ -110,7 +116,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// terminal to ask, and the program runs cooked rather than failing.
 			let owns_tty: bool = tty_set_mode(true, false);
 			if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
-				let _ = view_file(terminal.writer(), &file, arg, &descriptors);
+				let _ = view_file(terminal.writer(), &mut source, arg, &descriptors);
 			}
 			// And back to cooked input and echo, through the same request path.
 			if owns_tty {
@@ -154,6 +160,186 @@ unsafe fn load_descriptors(assets: u64) -> Vec<SyntaxDescriptor> {
 		}
 	}
 	loaded
+}
+
+// WHERE THE BYTES COME FROM.
+//
+// A file that fits is HELD; one that does not is PAGED, through a table of line-start offsets built
+// in one pass and one window in hand. Everything above this reads through the same three methods, so
+// there is one rendering path and one search rather than two - and the streamed one is not the one
+// nobody exercises.
+//
+// The index costs eight bytes a line against the line itself, and it is what makes going BACKWARD
+// cheap: a forward-only viewer is `head` with extra steps, and finding a line again needs either
+// the whole file or a table like this one.
+enum Source {
+	Held { bytes: Vec<u8>, lines: Vec<u64> },
+	Paged { storage: u64, uri: String, len: u64, lines: Vec<u64>, window: Vec<u8>, window_at: u64 },
+}
+
+impl Source {
+	// Read the file, or - when it is past the bound - index it and page it.
+	unsafe fn open(storage: u64, uri: &str) -> Option<Source> {
+		if let Ok(bytes) = unsafe { read_volume_file(storage, uri, MAX_VIEW_BYTES) } {
+			let lines = line_index(&bytes);
+			return Some(Source::Held { bytes, lines });
+		}
+		let mut lines: Vec<u64> = Vec::new();
+		lines.try_reserve(1024).ok()?;
+		lines.push(0);
+		let mut at: u64 = 0;
+		loop {
+			let window = unsafe { read_volume_window(storage, uri, at, WINDOW_BYTES as u32) }.ok()?;
+			if window.is_empty() {
+				break;
+			}
+			for (index, byte) in window.iter().enumerate() {
+				if *byte == b'\n' && lines.try_reserve(1).is_ok() {
+					lines.push(at + index as u64 + 1);
+				}
+			}
+			at += window.len() as u64;
+		}
+		if at == 0 {
+			return None;
+		}
+		let mut owned = String::new();
+		owned.try_reserve(uri.len()).ok()?;
+		owned.push_str(uri);
+		Some(Source::Paged { storage, uri: owned, len: at, lines, window: Vec::new(), window_at: 0 })
+	}
+
+	fn len(&self) -> usize {
+		match self {
+			Source::Held { bytes, .. } => bytes.len(),
+			Source::Paged { len, .. } => *len as usize,
+		}
+	}
+
+	fn lines(&self) -> &[u64] {
+		match self {
+			Source::Held { lines, .. } => lines,
+			Source::Paged { lines, .. } => lines,
+		}
+	}
+
+	// At most `limit` bytes from `offset`. A held file slices; a paged one reads the window that
+	// covers the offset, re-reading only when the one in hand does not.
+	fn read(&mut self, offset: usize, limit: usize) -> Vec<u8> {
+		let mut out: Vec<u8> = Vec::new();
+		match self {
+			Source::Held { bytes, .. } => {
+				let start = offset.min(bytes.len());
+				let end = (start + limit).min(bytes.len());
+				if out.try_reserve_exact(end - start).is_ok() {
+					out.extend_from_slice(&bytes[start..end]);
+				}
+			}
+			Source::Paged { storage, uri, window, window_at, .. } => {
+				let covered = offset as u64 >= *window_at && (offset as u64) < *window_at + window.len() as u64;
+				if !covered {
+					let start = offset as u64 - offset as u64 % WINDOW_BYTES as u64;
+					*window = unsafe { read_volume_window(*storage, uri, start, WINDOW_BYTES as u32) }.unwrap_or_default();
+					*window_at = start;
+				}
+				let within = ((offset as u64).saturating_sub(*window_at) as usize).min(window.len());
+				let end = (within + limit).min(window.len());
+				if out.try_reserve_exact(end - within).is_ok() {
+					out.extend_from_slice(&window[within..end]);
+				}
+				// A RUN THAT REACHES THE END OF A WINDOW CONTINUES INTO THE NEXT, because a line
+				// straddling a window boundary is an ordinary line and a viewer that showed half of
+				// it would be showing the window rather than the file.
+				if end == window.len() && out.len() < limit && (offset + out.len()) < self.len() {
+					let rest = self.read(offset + out.len(), limit - out.len());
+					if out.try_reserve(rest.len()).is_ok() {
+						out.extend_from_slice(&rest);
+					}
+				}
+			}
+		}
+		out
+	}
+
+	// The line that begins at or before `offset`, and where it starts.
+	fn line_start_at(&self, offset: usize) -> usize {
+		let lines = self.lines();
+		match lines.binary_search(&(offset as u64)) {
+			Ok(index) => lines[index] as usize,
+			Err(0) => 0,
+			Err(index) => lines[index - 1] as usize,
+		}
+	}
+
+	fn line_number_at(&self, offset: usize) -> usize {
+		let lines = self.lines();
+		match lines.binary_search(&(offset as u64)) {
+			Ok(index) => index + 1,
+			Err(index) => index.max(1),
+		}
+	}
+
+	// Where the line beginning at `start` ends, not counting its terminator.
+	fn line_end(&self, start: usize) -> usize {
+		let lines = self.lines();
+		match lines.binary_search(&(start as u64)) {
+			Ok(index) if index + 1 < lines.len() => lines[index + 1] as usize - 1,
+			_ => self.len(),
+		}
+	}
+
+	fn next_line(&self, start: usize) -> usize {
+		let end = self.line_end(start);
+		if end < self.len() { end + 1 } else { start }
+	}
+
+	fn previous_line(&self, start: usize) -> usize {
+		if start == 0 {
+			return 0;
+		}
+		self.line_start_at(start - 1)
+	}
+
+	// Search, over windows that OVERLAP by the pattern's length minus one - the whole difficulty of
+	// searching a file you are not holding.
+	fn find(&mut self, needle_len: usize, backward: bool, from: usize, matches: impl Fn(&[u8]) -> bool) -> Option<usize> {
+		if needle_len == 0 || needle_len > self.len() {
+			return None;
+		}
+		let last = self.len() - needle_len;
+		if backward {
+			let mut at = from.min(self.len()).checked_sub(1)?.min(last);
+			loop {
+				if matches(&self.read(at, needle_len)) {
+					return Some(at);
+				}
+				at = at.checked_sub(1)?;
+			}
+		}
+		let mut at = from.min(self.len());
+		while at <= last {
+			if matches(&self.read(at, needle_len)) {
+				return Some(at);
+			}
+			at += 1;
+		}
+		None
+	}
+}
+
+// The offsets every line begins at, for a file that is held.
+fn line_index(bytes: &[u8]) -> Vec<u64> {
+	let mut lines: Vec<u64> = Vec::new();
+	if lines.try_reserve(1).is_err() {
+		return lines;
+	}
+	lines.push(0);
+	for (index, byte) in bytes.iter().enumerate() {
+		if *byte == b'\n' && lines.try_reserve(1).is_ok() {
+			lines.push(index as u64 + 1);
+		}
+	}
+	lines
 }
 
 // WHAT THE READER IS LOOKING AT. Three views over the same bytes rather than three programs: a
@@ -207,11 +393,12 @@ struct View {
 	last_match: Option<usize>,
 }
 
-unsafe fn view_file(output: &mut impl TerminalWriter, bytes: &[u8], name: &[u8], descriptors: &[SyntaxDescriptor]) -> bool {
+unsafe fn view_file(output: &mut impl TerminalWriter, source: &mut Source, name: &[u8], descriptors: &[SyntaxDescriptor]) -> bool {
 	unsafe {
 		let input = stdin();
 		let mut decoder = InputDecoder::new();
-		let kind = detect_file_type(name, &bytes[..bytes.len().min(32)], false);
+		let head = source.read(0, 32);
+		let kind = detect_file_type(name, &head, false);
 		// A FILE THAT IS NOT TEXT OPENS AS BYTES. Showing a decoded rendering of an executable is
 		// showing a reader something that is not there, and the first thing they would do is switch.
 		let mode = if matches!(kind, FileType::Binary | FileType::Archive | FileType::Executable | FileType::Image | FileType::Audio) { Mode::Hex } else { Mode::Text };
@@ -220,7 +407,7 @@ unsafe fn view_file(output: &mut impl TerminalWriter, bytes: &[u8], name: &[u8],
 		let mut redraw = true;
 		loop {
 			if redraw {
-				if !render(output, bytes, name, &view, kind, descriptors) {
+				if !render(output, source, name, &view, kind, descriptors) {
 					return false;
 				}
 				redraw = false;
@@ -241,7 +428,7 @@ unsafe fn view_file(output: &mut impl TerminalWriter, bytes: &[u8], name: &[u8],
 					Polled::Message { len, .. } => {
 						for &byte in &input_bytes[..len] {
 							let Some(event) = decoder.feed(byte) else { continue };
-							match view.apply(event, bytes) {
+							match view.apply(event, source) {
 								ViewAction::None => {}
 								ViewAction::Redraw => redraw = true,
 								ViewAction::Exit => return true,
@@ -264,9 +451,9 @@ impl View {
 		}
 	}
 
-	fn apply(&mut self, event: InputEvent, bytes: &[u8]) -> ViewAction {
+	fn apply(&mut self, event: InputEvent, source: &mut Source) -> ViewAction {
 		if self.prompt != Prompt::None {
-			return self.apply_prompt(event, bytes);
+			return self.apply_prompt(event, source);
 		}
 		let old = self.position;
 		match event {
@@ -301,16 +488,16 @@ impl View {
 			InputEvent::Key(Key::Byte(b'g')) => return self.open_prompt(Prompt::GotoLine, b"go to line: "),
 			InputEvent::Key(Key::Byte(b'o')) => return self.open_prompt(Prompt::GotoOffset, b"go to byte offset: "),
 			InputEvent::Key(Key::Byte(b'%')) => return self.open_prompt(Prompt::GotoPercent, b"go to percent: "),
-			InputEvent::Key(Key::Byte(b'n')) => return self.repeat(bytes, false),
-			InputEvent::Key(Key::Byte(b'p')) => return self.repeat(bytes, true),
-			InputEvent::Key(Key::ArrowDown) => self.position = self.step(bytes, self.position, true),
-			InputEvent::Key(Key::ArrowUp) => self.position = self.step(bytes, self.position, false),
-			InputEvent::Key(Key::PageDown) => self.position = self.page(bytes, self.position, true),
-			InputEvent::Key(Key::PageUp) => self.position = self.page(bytes, self.position, false),
+			InputEvent::Key(Key::Byte(b'n')) => return self.repeat(source, false),
+			InputEvent::Key(Key::Byte(b'p')) => return self.repeat(source, true),
+			InputEvent::Key(Key::ArrowDown) => self.position = self.step(source, self.position, true),
+			InputEvent::Key(Key::ArrowUp) => self.position = self.step(source, self.position, false),
+			InputEvent::Key(Key::PageDown) => self.position = self.page(source, self.position, true),
+			InputEvent::Key(Key::PageUp) => self.position = self.page(source, self.position, false),
 			InputEvent::Key(Key::Home) => self.position = 0,
-			InputEvent::Key(Key::End) => self.position = self.page(bytes, bytes.len(), false),
-			InputEvent::Pointer(pointer) if pointer.pressed && pointer.code == 64 => self.position = self.page(bytes, self.position, false),
-			InputEvent::Pointer(pointer) if pointer.pressed && pointer.code == 65 => self.position = self.page(bytes, self.position, true),
+			InputEvent::Key(Key::End) => self.position = self.page(source, source.len(), false),
+			InputEvent::Pointer(pointer) if pointer.pressed && pointer.code == 64 => self.position = self.page(source, self.position, false),
+			InputEvent::Pointer(pointer) if pointer.pressed && pointer.code == 65 => self.position = self.page(source, self.position, true),
 			_ => {}
 		}
 		if old == self.position { ViewAction::None } else { ViewAction::Redraw }
@@ -331,28 +518,31 @@ impl View {
 		ViewAction::Redraw
 	}
 
-	fn step(&self, bytes: &[u8], from: usize, down: bool) -> usize {
+	// MOVEMENT IS INDEX ARITHMETIC and reads nothing. That is what the line table buys: paging
+	// through a file the viewer is not holding costs a lookup per row rather than a read.
+	fn step(&self, source: &Source, from: usize, down: bool) -> usize {
 		match self.mode {
 			Mode::Hex => {
 				if down {
-					(from + HEX_BYTES_PER_ROW).min(bytes.len() - bytes.len() % HEX_BYTES_PER_ROW)
+					let len = source.len();
+					(from + HEX_BYTES_PER_ROW).min(len - len % HEX_BYTES_PER_ROW)
 				} else {
 					from.saturating_sub(HEX_BYTES_PER_ROW)
 				}
 			}
 			_ => {
 				if down {
-					next_line(bytes, from)
+					source.next_line(from)
 				} else {
-					previous_line(bytes, from)
+					source.previous_line(from)
 				}
 			}
 		}
 	}
 
-	fn page(&self, bytes: &[u8], mut from: usize, down: bool) -> usize {
+	fn page(&self, source: &Source, mut from: usize, down: bool) -> usize {
 		for _ in 0..VIEW_ROWS {
-			let next = self.step(bytes, from, down);
+			let next = self.step(source, from, down);
 			if next == from {
 				break;
 			}
@@ -368,7 +558,7 @@ impl View {
 		ViewAction::Redraw
 	}
 
-	fn apply_prompt(&mut self, event: InputEvent, bytes: &[u8]) -> ViewAction {
+	fn apply_prompt(&mut self, event: InputEvent, source: &mut Source) -> ViewAction {
 		match event {
 			InputEvent::Key(Key::Escape) => {
 				self.prompt = Prompt::None;
@@ -380,7 +570,7 @@ impl View {
 				self.entry.pop();
 				ViewAction::Redraw
 			}
-			InputEvent::Key(Key::Enter) => self.commit_prompt(bytes),
+			InputEvent::Key(Key::Enter) => self.commit_prompt(source),
 			InputEvent::Key(Key::Byte(byte)) if byte >= 0x20 && byte != 0x7f => {
 				if self.entry.len() < MAX_PROMPT_BYTES && self.entry.try_reserve(1).is_ok() {
 					self.entry.push(byte);
@@ -391,7 +581,7 @@ impl View {
 		}
 	}
 
-	fn commit_prompt(&mut self, bytes: &[u8]) -> ViewAction {
+	fn commit_prompt(&mut self, source: &mut Source) -> ViewAction {
 		let prompt = self.prompt;
 		let entry = core::mem::take(&mut self.entry);
 		self.prompt = Prompt::None;
@@ -400,7 +590,7 @@ impl View {
 				self.text_needle = entry;
 				self.hex_last = false;
 				self.last_match = None;
-				self.repeat(bytes, false)
+				self.repeat(source, false)
 			}
 			Prompt::FindHex => {
 				// THE WHOLE PATTERN IS VALIDATED BEFORE ANYTHING IS SCANNED, and a bad one says
@@ -411,7 +601,7 @@ impl View {
 						self.hex_needle = Some(pattern);
 						self.hex_last = true;
 						self.last_match = None;
-						self.repeat(bytes, false)
+						self.repeat(source, false)
 					}
 					Err(error) => {
 						self.say(hex_error(error));
@@ -421,15 +611,10 @@ impl View {
 			}
 			Prompt::GotoLine => match parse_decimal(&entry) {
 				Some(line) => {
-					let mut at = 0;
-					for _ in 1..line.max(1) {
-						let next = next_line(bytes, at);
-						if next == at {
-							break;
-						}
-						at = next;
-					}
-					self.position = at;
+					// STRAIGHT INTO THE INDEX. Walking line by line would read the file to
+					// reach a line the table already knows the offset of.
+					let lines = source.lines();
+					self.position = lines.get(line.max(1) - 1).copied().unwrap_or(*lines.last().unwrap_or(&0)) as usize;
 					self.say(b"");
 					ViewAction::Redraw
 				}
@@ -440,7 +625,7 @@ impl View {
 			},
 			Prompt::GotoOffset => match parse_decimal(&entry) {
 				Some(offset) => {
-					self.jump(bytes, offset.min(bytes.len()));
+					self.jump(source, offset.min(source.len()));
 					ViewAction::Redraw
 				}
 				None => {
@@ -450,7 +635,7 @@ impl View {
 			},
 			Prompt::GotoPercent => match parse_decimal(&entry) {
 				Some(percent) if percent <= 100 => {
-					self.jump(bytes, bytes.len() / 100 * percent.min(100));
+					self.jump(source, source.len() / 100 * percent.min(100));
 					ViewAction::Redraw
 				}
 				_ => {
@@ -464,10 +649,10 @@ impl View {
 
 	// Put a byte offset on the screen. In the text views the view starts at a line boundary, so an
 	// offset in the middle of a line shows that whole line rather than its tail.
-	fn jump(&mut self, bytes: &[u8], offset: usize) {
+	fn jump(&mut self, source: &Source, offset: usize) {
 		self.position = match self.mode {
 			Mode::Hex => offset - offset % HEX_BYTES_PER_ROW,
-			_ => line_start(bytes, offset),
+			_ => source.line_start_at(offset),
 		};
 		self.last_match = Some(offset);
 		self.say(b"");
@@ -476,12 +661,16 @@ impl View {
 	// The next match of whichever query was asked for last. A SEARCH THAT FINDS NOTHING LEAVES THE
 	// VIEW WHERE IT WAS and says so - moving to the end on a failed search loses the reader's place,
 	// which is the thing they were looking at when they typed the query.
-	fn repeat(&mut self, bytes: &[u8], backward: bool) -> ViewAction {
+	fn repeat(&mut self, source: &mut Source, backward: bool) -> ViewAction {
 		let anchor = self.last_match.unwrap_or(self.position);
 		let from = if backward { anchor } else { anchor + 1 };
 		let hit = if self.hex_last {
-			match self.hex_needle.as_ref() {
-				Some(pattern) => pattern.find(bytes, from, backward),
+			match self.hex_needle.take() {
+				Some(pattern) => {
+					let found = source.find(pattern.len(), backward, from, |window| pattern.matches(window));
+					self.hex_needle = Some(pattern);
+					found
+				}
 				None => {
 					self.say(b"no byte pattern yet - press \\ first");
 					return ViewAction::Redraw;
@@ -491,11 +680,30 @@ impl View {
 			self.say(b"nothing to find yet - press / first");
 			return ViewAction::Redraw;
 		} else {
-			TextQuery { needle: &self.text_needle, ignore_case: self.ignore_case, whole_word: self.whole_word }.find(bytes, from, backward)
+			// THE QUERY IS COMPARED WINDOW BY WINDOW, so a file the viewer is not holding is searched
+			// the same way as one it is - one search rather than two.
+			let needle = core::mem::take(&mut self.text_needle);
+			let ignore_case = self.ignore_case;
+			let whole_word = self.whole_word;
+			let mut at = from;
+			let found = loop {
+				let hit = source.find(needle.len(), backward, at, |window| if ignore_case { window.iter().zip(needle.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b)) } else { window == needle.as_slice() });
+				let Some(hit) = hit else { break None };
+				// WHOLE WORD IS A FILTER AND NOT A STOP: a match rejected for having a letter beside
+				// it must not end the search, or `alpha` inside `alphabet` would hide the real word
+				// further along. The bytes either side are read where they are, which is one more
+				// window lookup rather than a second pass.
+				if !whole_word || !word_bounded(source, hit, needle.len()) {
+					break Some(hit);
+				}
+				at = if backward { hit } else { hit + 1 };
+			};
+			self.text_needle = needle;
+			found
 		};
 		match hit {
 			Some(at) => {
-				self.jump(bytes, at);
+				self.jump(source, at);
 				let mut message: Vec<u8> = Vec::new();
 				if message.try_reserve(32).is_ok() {
 					message.extend_from_slice(b"match at byte ");
@@ -521,6 +729,18 @@ fn hex_error(error: HexPatternError) -> &'static [u8] {
 	}
 }
 
+// Whether a match at `at` has a word byte against either end - in which case whole-word rejects it.
+// Word bytes are ASCII alphanumeric plus `_`, the same rule the editor's word movement uses.
+fn word_bounded(source: &mut Source, at: usize, len: usize) -> bool {
+	let before = at.checked_sub(1).map(|index| source.read(index, 1)).and_then(|byte| byte.first().copied());
+	let after = source.read(at + len, 1).first().copied();
+	before.is_some_and(is_word_byte) || after.is_some_and(is_word_byte)
+}
+
+fn is_word_byte(byte: u8) -> bool {
+	byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 fn parse_decimal(bytes: &[u8]) -> Option<usize> {
 	if bytes.is_empty() {
 		return None;
@@ -533,7 +753,7 @@ fn parse_decimal(bytes: &[u8]) -> Option<usize> {
 	Some(value)
 }
 
-fn render(output: &mut impl TerminalWriter, bytes: &[u8], name: &[u8], view: &View, kind: FileType, descriptors: &[SyntaxDescriptor]) -> bool {
+fn render(output: &mut impl TerminalWriter, source: &mut Source, name: &[u8], view: &View, kind: FileType, descriptors: &[SyntaxDescriptor]) -> bool {
 	let mut rendered: Vec<u8> = Vec::new();
 	if rendered.try_reserve((VIEW_ROWS + 4) * (VIEW_COLUMNS * 4 + 32)).is_err() {
 		return false;
@@ -556,7 +776,7 @@ fn render(output: &mut impl TerminalWriter, bytes: &[u8], name: &[u8], view: &Vi
 	rendered.extend_from_slice(b"  byte ");
 	append_decimal(&mut rendered, view.position);
 	rendered.push(b'/');
-	append_decimal(&mut rendered, bytes.len());
+	append_decimal(&mut rendered, source.len());
 	rendered.push(b'\n');
 	append_safe(&mut rendered, &view.status, VIEW_COLUMNS);
 	if view.prompt != Prompt::None {
@@ -565,34 +785,38 @@ fn render(output: &mut impl TerminalWriter, bytes: &[u8], name: &[u8], view: &Vi
 	}
 	rendered.extend_from_slice(b"\n\n");
 	let ok = match view.mode {
-		Mode::Hex => render_hex(&mut rendered, bytes, view),
-		_ => render_lines(&mut rendered, bytes, view, name, descriptors),
+		Mode::Hex => render_hex(&mut rendered, source, view),
+		_ => render_lines(&mut rendered, source, view, name, descriptors),
 	};
 	ok && output.write(&rendered)
 }
 
-fn render_hex(output: &mut Vec<u8>, bytes: &[u8], view: &View) -> bool {
+fn render_hex(output: &mut Vec<u8>, source: &mut Source, view: &View) -> bool {
 	let mut at = view.position - view.position % HEX_BYTES_PER_ROW;
+	let len = source.len();
 	for _ in 0..VIEW_ROWS {
-		if at >= bytes.len() {
+		if at >= len {
 			break;
 		}
+		// ONE ROW AT A TIME, sixteen bytes read where they are. A held file slices; a paged one
+		// takes them out of the window it already has.
+		let row = source.read(at, HEX_BYTES_PER_ROW);
 		append_hex_offset(output, at);
 		output.extend_from_slice(b"  ");
-		let end = (at + HEX_BYTES_PER_ROW).min(bytes.len());
-		for index in at..at + HEX_BYTES_PER_ROW {
-			if index < end {
-				append_hex_byte(output, bytes[index]);
+		let end = at + row.len();
+		for index in 0..HEX_BYTES_PER_ROW {
+			if index < row.len() {
+				append_hex_byte(output, row[index]);
 			} else {
 				output.extend_from_slice(b"  ");
 			}
 			output.push(b' ');
-			if index - at == HEX_BYTES_PER_ROW / 2 - 1 {
+			if index == HEX_BYTES_PER_ROW / 2 - 1 {
 				output.push(b' ');
 			}
 		}
 		output.push(b'|');
-		for &byte in &bytes[at..end] {
+		for &byte in &row {
 			// A BYTE WRITTEN AS ITSELF PUTS CONTROL CHARACTERS ON THE TERMINAL, which is how a dump
 			// of a binary file changes the terminal's mode - the same rule `hexdump` follows.
 			output.push(if (0x20..0x7f).contains(&byte) { byte } else { b'.' });
@@ -604,24 +828,29 @@ fn render_hex(output: &mut Vec<u8>, bytes: &[u8], view: &View) -> bool {
 	true
 }
 
-fn render_lines(output: &mut Vec<u8>, bytes: &[u8], view: &View, name: &[u8], descriptors: &[SyntaxDescriptor]) -> bool {
+fn render_lines(output: &mut Vec<u8>, source: &mut Source, view: &View, name: &[u8], descriptors: &[SyntaxDescriptor]) -> bool {
 	// The descriptor is chosen ONCE per render from the file's name and its first line, and a file
 	// that matches nothing is plain text - which is this milestone's rule, and the reason every
 	// failure here is an absence rather than an error.
-	let first_line = &bytes[..line_end(bytes, 0).min(bytes.len())];
-	let selection = if view.highlight && view.mode == Mode::Text { select_descriptor(descriptors, name, first_line) } else { None };
+	let first_line = source.read(0, source.line_end(0).min(MAX_LINE_BYTES));
+	let selection = if view.highlight && view.mode == Mode::Text { select_descriptor(descriptors, name, &first_line) } else { None };
 	let mut state = LineState::new();
 	let mut spans = [TokenSpan { start: 0, end: 0, style: 0 }; 64];
-	let mut line_start_offset = view.position.min(bytes.len());
-	let mut number = 1 + bytes[..line_start_offset].iter().filter(|&&byte| byte == b'\n').count();
+	let len = source.len();
+	let mut line_start_offset = view.position.min(len);
+	let mut number = source.line_number_at(line_start_offset);
 	let columns = if view.numbers { VIEW_COLUMNS - 7 } else { VIEW_COLUMNS };
 	for _ in 0..VIEW_ROWS {
-		if line_start_offset >= bytes.len() {
+		if line_start_offset >= len {
 			break;
 		}
-		let end = line_end(bytes, line_start_offset);
-		let visible_end = if end > line_start_offset && bytes[end - 1] == b'\r' { end - 1 } else { end };
-		let line = &bytes[line_start_offset..visible_end];
+		// ONE LINE, BOUNDED. A file with no newline in it is one enormous line, and a viewer that
+		// read it whole to show eighty columns of it would fail on exactly the file somebody opened
+		// a viewer for.
+		let end = source.line_end(line_start_offset);
+		let wanted = (end - line_start_offset).min(MAX_LINE_BYTES);
+		let raw = source.read(line_start_offset, wanted);
+		let line: &[u8] = raw.strip_suffix(b"\r").unwrap_or(&raw);
 		if view.numbers {
 			append_padded_decimal(output, number, 5);
 			output.extend_from_slice(b"  ");
@@ -640,7 +869,7 @@ fn render_lines(output: &mut Vec<u8>, bytes: &[u8], view: &View, name: &[u8], de
 			}
 		}
 		output.push(b'\n');
-		let next = next_line(bytes, line_start_offset);
+		let next = source.next_line(line_start_offset);
 		if next == line_start_offset {
 			break;
 		}
@@ -777,41 +1006,6 @@ fn type_label(kind: FileType) -> &'static [u8] {
 		FileType::Archive => b"archive",
 		FileType::Executable => b"executable",
 	}
-}
-
-fn line_start(bytes: &[u8], offset: usize) -> usize {
-	let mut at = offset.min(bytes.len());
-	while at > 0 && bytes[at - 1] != b'\n' {
-		at -= 1;
-	}
-	at
-}
-
-fn line_end(bytes: &[u8], start: usize) -> usize {
-	let mut offset = start.min(bytes.len());
-	while offset < bytes.len() && bytes[offset] != b'\n' {
-		offset += 1;
-	}
-	offset
-}
-
-fn next_line(bytes: &[u8], start: usize) -> usize {
-	let end = line_end(bytes, start);
-	if end < bytes.len() { end + 1 } else { end }
-}
-
-fn previous_line(bytes: &[u8], start: usize) -> usize {
-	if start == 0 {
-		return 0;
-	}
-	let mut offset = start.saturating_sub(1);
-	if offset > 0 && bytes[offset] == b'\n' {
-		offset -= 1;
-	}
-	while offset > 0 && bytes[offset - 1] != b'\n' {
-		offset -= 1;
-	}
-	offset
 }
 
 fn trim(mut bytes: &[u8]) -> &[u8] {

@@ -197,3 +197,63 @@ fn the_line_buffer_holds_bytes_flat_and_sorts_an_index() {
 	assert_eq!(sized.push(b"abcd"), Ok(()));
 	assert_eq!(sized.push(b"e"), Err(HoldError::Full));
 }
+
+#[test]
+fn a_pattern_matches_what_its_syntax_says_and_nothing_more() {
+	let matches = |pattern: &[u8], text: &[u8]| Regex::compile(pattern).expect("compiles").matches(text);
+	assert!(matches(b"abc", b"abc"));
+	assert!(!matches(b"abc", b"abd"));
+	assert!(matches(b"a.c", b"axc"));
+	assert!(matches(b"ab*c", b"ac"));
+	assert!(matches(b"ab*c", b"abbbc"));
+	assert!(!matches(b"ab+c", b"ac"));
+	assert!(matches(b"ab?c", b"ac"));
+	assert!(!matches(b"ab?c", b"abbc"));
+	assert!(matches(b"[abc]x", b"bx"));
+	assert!(!matches(b"[abc]x", b"dx"));
+	assert!(matches(b"[^abc]x", b"dx"));
+	assert!(matches(b"[a-z0-9_]+", b"name_9"));
+	assert!(!matches(b"[a-z]+", b"Name"));
+
+	// AN ESCAPE MAKES A METACHARACTER ITSELF, which is the only way to search for one.
+	assert!(matches(br"a\*b", b"a*b"));
+	assert!(!matches(br"a\*b", b"aab"));
+	assert!(matches(br"\[x\]", b"[x]"));
+
+	// GREEDY WITH BACKTRACKING: `.*b` finds the LAST `b`, and gives back enough to let the rest fit.
+	let last = Regex::compile(b".*b").expect("compiles");
+	assert_eq!(last.find(b"abcbd", 0), Some((0, 4)));
+	let after = Regex::compile(b"a.*d").expect("compiles");
+	assert_eq!(after.find(b"axxxd", 0), Some((0, 5)));
+
+	// ANCHORS. `^` is tried once rather than slid along - `^ab` that does not match at the start does
+	// not match anywhere - and `$` is an anchor only at the end, so a price is searchable.
+	let start = Regex::compile(b"^ab").expect("compiles");
+	assert_eq!(start.find(b"xxab", 0), None);
+	assert_eq!(start.find(b"abxx", 0), Some((0, 2)));
+	let end = Regex::compile(b"ab$").expect("compiles");
+	assert_eq!(end.find(b"abxx", 0), None);
+	assert_eq!(end.find(b"xxab", 0), Some((2, 4)));
+	assert!(matches(b"5$x", b"5$x"), "a dollar that is not at the end is a literal dollar");
+}
+
+#[test]
+fn a_pattern_that_could_run_forever_is_refused_rather_than_run() {
+	// THE PATHOLOGICAL CASE, which is why there is a budget at all: a backtracking matcher against a
+	// run of `a` with no `b` at the end explores exponentially. It must come back with an answer
+	// rather than take longer than the machine has.
+	let pathological = Regex::compile(b"a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b").expect("compiles");
+	let haystack: alloc::vec::Vec<u8> = alloc::vec![b'a'; 64];
+	assert_eq!(pathological.find(&haystack, 0), None, "it answers, and the answer is that there is no match");
+
+	// AND THE COMPILER REFUSES WHAT IT CANNOT READ, each by name, because each needs a different
+	// sentence to fix.
+	assert_eq!(Regex::compile(b"*ab").unwrap_err(), RegexError::NothingToRepeat);
+	assert_eq!(Regex::compile(b"[abc").unwrap_err(), RegexError::UnterminatedClass);
+	assert_eq!(Regex::compile(br"ab\").unwrap_err(), RegexError::DanglingEscape);
+	let long: alloc::vec::Vec<u8> = alloc::vec![b'a'; MAX_REGEX_ITEMS + 1];
+	assert_eq!(Regex::compile(&long).unwrap_err(), RegexError::TooComplex);
+
+	// A `]` FIRST IS A LITERAL `]`, which is the convention and the only way to name one in a class.
+	assert!(Regex::compile(b"[]]").expect("compiles").matches(b"]"));
+}

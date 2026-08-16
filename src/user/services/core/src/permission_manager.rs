@@ -107,6 +107,22 @@ const DENY_REPLY: &[u8] = b"DENY";
 // client only for the ones the supervisor wired it (the rest stay 0 - declared in the
 // vocabulary, not yet grantable - so a manifest naming them records the decision but hands
 // over nothing).
+// EVERY CAPABILITY THE GRANT LOOP CAN SEND, and the order it sends them in.
+//
+// `Session` IS DELIBERATELY ABSENT, and it is a defect rather than a policy - recorded here because
+// the obvious fix makes things worse and the next reader should find that out from this comment
+// rather than from a red suite.
+//
+// `kill` holds `Capability::Session` and waits for the tag; the loop never walks past it, so `kill`
+// launches into a hang. Adding `Session` here was tried on 2026-08-16 and turned that hang into
+// something worse: the manager holds no session client to grant, so `grant_for_task` answers 0, the
+// grant fails, and the failure path below closes the bootstrap channel WITHOUT closing the prepared
+// task - leaving a process that will never be released and never exit. The suite measured it two
+// hundred tests later, as ProcessService reporting one live program where two had started.
+//
+// So the fix is two changes and not one: the manager has to HOLD a session client to grant, and the
+// grant loop's failure path has to close the task it prepared. Until both, this list stays as it is
+// and `kill`'s hang is the lesser fault.
 const VOCABULARY: [Capability; 20] = [
 	Capability::Storage,
 	Capability::Log,

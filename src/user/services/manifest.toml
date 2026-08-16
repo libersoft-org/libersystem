@@ -795,7 +795,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/licoedit.lsexe"
-providers = ["base-proto", "lico", "volume-client", "storage-proto", "lsrt"]
+providers = ["base-proto", "cli", "lico", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "lico"
