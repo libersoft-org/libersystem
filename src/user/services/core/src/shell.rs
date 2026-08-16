@@ -862,6 +862,25 @@ fn strip_word<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 	rest.strip_prefix(b" ")
 }
 
+// The same, admitting the command word ON ITS OWN as the empty argument.
+//
+// THE COMMAND WORD ALONE IS STILL THE COMMAND. `strip_word` requires a trailing space, so the
+// argument-taking shapes matched `lico .` and not `lico` - and a line that matches no shape falls
+// through to "unknown command", which the shell prints about a name sitting in its own tool table,
+// in its own help, and in its own completion. Three places say the command exists and the fourth
+// says it does not.
+//
+// It is not a cosmetic difference for a tool whose argument is OPTIONAL: `lico [DIRECTORY]` opens
+// the working directory when given none, so the ordinary way to start the file manager was the one
+// spelling that did not work. For a tool that genuinely needs an argument this hands it the empty
+// one, and the tool prints its own usage - which is what this shell already says it prefers, in the
+// note beside `tee` about a tool useless without a producer saying so for itself rather than being
+// kept off the table.
+fn strip_word_or_bare<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+	let rest: &[u8] = line.strip_prefix(name)?;
+	if rest.is_empty() { Some(rest) } else { rest.strip_prefix(b" ") }
+}
+
 // Route a line to a governed tool from `TOOLS`, returning whether it matched one.
 // PermissionManager grants each tool its manifest and forwards this terminal, the cwd,
 // and the argument the line's shape carries; a foreground launch, so a trailing `&` (the
@@ -925,13 +944,13 @@ unsafe fn dispatch_tool(line: &[u8], jobs: &mut Jobs, permsvc: u64, cwd: &[u8], 
 					}
 				}
 				Shape::Args => {
-					if let Some(rest) = strip_word(line, name) {
+					if let Some(rest) = strip_word_or_bare(line, name) {
 						run_tool(permsvc, name, trim(rest), cwd, vars);
 						return true;
 					}
 				}
 				Shape::InteractiveArgs => {
-					if let Some(rest) = strip_word(line, name) {
+					if let Some(rest) = strip_word_or_bare(line, name) {
 						run_tool_interactive(jobs, permsvc, name, trim(rest), cwd, vars);
 						return true;
 					}

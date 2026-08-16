@@ -471,7 +471,23 @@ unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial:
 			// A RUNNING JOB MUST NOT BLOCK THE LOOP. With one in progress the wait is a short
 			// deadline rather than "until a key arrives", which is what keeps the panels navigable
 			// while a copy runs - and with none it blocks, so an idle manager costs nothing.
-			let ready = if manager.job.is_some() { wait_any(&[input], clock_ns().saturating_add(2_000_000)) } else { wait_any(&[input], 0) };
+			//
+			// TICKS. The deadline `wait_any` takes is an ABSOLUTE LAPIC TICK COUNT, and this passed
+			// `clock_ns()` - a different clock, reading nanoseconds. Seconds after boot that is a
+			// tick number years away, so the wait never expired: a started operation advanced only
+			// when a key happened to arrive, and one left alone made no progress at all. `rt` warns
+			// about exactly this substitution, in as many words - "a hang that looks like a deadlock
+			// rather than a wrong unit" - and this is what it looks like from the other side. The
+			// governed `F8` test measures it: with `clock_ns()` here, the delete never completes.
+			//
+			// PERIODIC because this wake is HOUSEKEEPING rather than pending progress - a judgement
+			// about what the wait MEANS, and not something that test distinguishes, since it passes
+			// either way. A plain timed wait holds `run_until_idle` until its deadline, and the loop
+			// driving the console polls the serial wire only BETWEEN those calls; a job re-arming a
+			// deadline every tick would therefore keep typed input from being forwarded for as long
+			// as it ran - including the interrupt that cancels it. A periodic waiter lets the system
+			// settle each round and is still woken when it comes due.
+			let ready = if manager.job.is_some() { wait_any_periodic(&[input], clock().saturating_add(1)) } else { wait_any(&[input], 0) };
 			if interrupted() {
 				if manager.job.is_some() {
 					manager.cancel_job(volumes);

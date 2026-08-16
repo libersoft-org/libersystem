@@ -737,6 +737,20 @@ pub const ERR_ABI_MISMATCH: i64 = -12;
 // of something right now): the caller asked a reasonable question of a machine that has no answer.
 pub const ERR_UNSUPPORTED: i64 = -13;
 
+// A blocking wait gave up because the caller has a CAUGHT interrupt pending (SYS_SIGNAL_CATCH):
+// not a failure of the wait, and not the deadline - the caller asked to handle Ctrl+C itself, and
+// this is the kernel handing control back so it can.
+//
+// It exists because without it that promise cannot be kept. A caught SIG_INT sets a flag the
+// process polls; a process parked in `SYS_WAIT`/`SYS_WAIT_ANY` polls nothing, and the wait's
+// condition loop re-blocks on every wake that leaves its objects unready. So the flag was set,
+// the thread was woken, and it went straight back to sleep having never returned to the code that
+// would have read it - Ctrl+C on an idle interactive program did nothing whatsoever.
+//
+// The pending flag is NOT consumed here: `SYS_SIGNAL_TAKE` is what clears it, so a caller that
+// treats this as an ordinary wakeup and polls `interrupted()` sees exactly one interrupt.
+pub const ERR_INTERRUPTED: i64 = -14;
+
 // True if a syscall return value encodes an error (the reserved band [-4095, -1]).
 // A higher-half kernel address has its top bit set and so is never mistaken for
 // an error.

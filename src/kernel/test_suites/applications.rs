@@ -38,6 +38,16 @@ fn lico_switches_panels_and_restores_the_terminal() {
 	run_lico_harness(lico_elf, &mut system);
 }
 
+tagged_test!(lico_restores_the_terminal_when_it_is_interrupted, [Lico, Process, Service, Storage], id = "kernel.applications.lico_restores_the_terminal_when_it_is_interrupted", covers = ["bin.lico", "keys", "lico"]);
+fn lico_restores_the_terminal_when_it_is_interrupted() {
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let lico_elf = program_elf(&package, volume, b"lico").expect("lico tool");
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	run_lico_interrupt_harness(lico_elf, &mut system);
+}
+
 tagged_test!(imgconv_cross_volume_and_failed_overwrite_preserve_destination, [Image, Service, Storage, Process, Filesystem], id = "kernel.applications.imgconv_cross_volume_and_failed_overwrite_preserve_destination", covers = ["bin.imgconv", "imgconv", "storage", "volume-client"]);
 fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
@@ -609,6 +619,27 @@ fn a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline() {
 	// opened. Both halves of `tee`'s documented policy are visible in one row - the destination is
 	// named as refused, and the stream carries on to the far end.
 	assert!(says(b"2 13 83 83"), "tee passed the stream on through a typed line: {:?}", core::str::from_utf8(out));
+}
+
+tagged_test!(a_command_word_on_its_own_runs_the_command, [Service, Process, PermissionService, Shell], id = "kernel.applications.a_command_word_on_its_own_runs_the_command", covers = ["kernel", "services"]);
+fn a_command_word_on_its_own_runs_the_command() {
+	// REPORTED FROM THE OUTSIDE: `lico` said it was not a command. It is in the tool table, in the
+	// help table and in completion, and typing its name got "unknown command" - because the
+	// argument-taking shapes matched a command word FOLLOWED BY A SPACE and nothing else, so the
+	// name alone matched no shape and fell through to the error at the bottom.
+	//
+	// It is worst for a tool whose argument is optional, which is exactly the reported one:
+	// `lico [DIRECTORY]` opens the working directory when given none, so the ordinary way to start
+	// the file manager was the one spelling that did not work. The interactive shapes cannot be
+	// typed here - they take the terminal, and this would be reading their redraws - so this drives
+	// the same matcher through `which`, whose bare form prints its own usage.
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
+	let out: &[u8] = &result.shell_read;
+	let says = |needle: &[u8]| out.windows(needle.len()).any(|window| window == needle);
+	assert!(!says(b"unknown command: which"), "a command word on its own is not an unknown command: {:?}", core::str::from_utf8(out));
+	// AND IT RAN, which the absence of an error does not show on its own - a line silently dropped
+	// looks identical. This is the tool's own output, so it was launched.
+	assert!(says(b"which: usage:"), "the bare command word launched the tool, which answered for itself: {:?}", core::str::from_utf8(out));
 }
 
 tagged_test!(merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge, [Service, Process, PermissionService], id = "kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge", covers = ["kernel", "services"]);

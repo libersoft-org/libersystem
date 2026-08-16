@@ -142,6 +142,12 @@ pub struct Process {
 	// Set when a caught SIG_INT has been delivered and not yet consumed; the process
 	// polls and clears it with SYS_SIGNAL_TAKE.
 	int_pending: AtomicBool,
+	// Set once a blocking wait has broken out to report this pending interrupt, so it breaks
+	// each wait ONCE rather than every time. Without it a program that does not poll between
+	// waits - which every loop that ignores its wait's result is - turns a hang into a spin, and
+	// a spin keeps the run queue non-empty, which is strictly the worse of the two. Cleared by a
+	// fresh delivery and by taking the flag, so every interrupt gets its one report.
+	int_reported: AtomicBool,
 	// Per-process IPC volume counters: the number of channel messages this process has
 	// sent and received. Bumped on each successful channel send / recv, so a userspace
 	// SystemGraphService can read a component's traffic over SYS_PROCESS_STATS_GET.
@@ -191,7 +197,7 @@ impl Process {
 		let mut table = HandleTable::new();
 		// Bind the table to the Domain so its handles are accounted there.
 		table.set_domain(domain.clone());
-		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()) })?;
+		let process = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), address_space, handles: SpinLock::new(table), domain, fault: SpinLock::new(None), killed: AtomicBool::new(false), terminating: AtomicBool::new(false), extending: SpinLock::new(0), exited: AtomicBool::new(false), exit_status: AtomicU64::new(0), exit_status_set: AtomicBool::new(false), exit_status_claimed: AtomicBool::new(false), user_frames: SpinLock::new(Vec::new()), image_load: AtomicBool::new(false), threads: SpinLock::new(Vec::new()), stopped: AtomicBool::new(false), int_caught: AtomicBool::new(false), int_pending: AtomicBool::new(false), int_reported: AtomicBool::new(false), messages_sent: AtomicU64::new(0), messages_received: AtomicU64::new(0), stack_bytes: AtomicU64::new(0), mapped_memory: SpinLock::new(Vec::new()), mapped_dma: SpinLock::new(Vec::new()), dma_buffers: SpinLock::new(Vec::new()), dynamic_symbols: SpinLock::new(Vec::new()), shared_image_pages: SpinLock::new(Vec::new()), dynamic_modules: AtomicUsize::new(0), dynamic_biases: SpinLock::new(Vec::new()), live_thread_count: AtomicUsize::new(0), groups: SpinLock::new(Vec::new()) })?;
 		// Register with the Domain so a Domain kill can reach and terminate it. A killed
 		// Domain refuses, and the process is terminated at once rather than left running
 		// under an authority that no longer accounts for it.
@@ -667,14 +673,32 @@ impl Process {
 	}
 
 	// Record that a caught SIG_INT was delivered (set by signal delivery on an armed
-	// process in place of termination).
+	// process in place of termination). A fresh delivery is reportable again, so a second
+	// Ctrl+C breaks a wait even if the program never read the first.
 	pub fn set_int_pending(&self) {
+		self.int_reported.store(false, Ordering::Release);
 		self.int_pending.store(true, Ordering::Release);
 	}
 
 	// Poll and clear the pending caught SIG_INT, returning whether one was pending.
 	pub fn take_int_pending(&self) -> bool {
+		self.int_reported.store(false, Ordering::Release);
 		self.int_pending.swap(false, Ordering::AcqRel)
+	}
+
+	// Claim the right to break ONE blocking wait for a pending caught interrupt. True at most once
+	// per delivery: the flag itself is left alone, because SYS_SIGNAL_TAKE is what consumes it and
+	// taking it here would swallow the interrupt on its way to the code whose job is to read it.
+	//
+	// Once per delivery rather than every wait, because the alternative is a spin. A program that
+	// polls between waits (which is why it armed itself at all) gets its one break and acts on it;
+	// one that does not - any loop that discards its wait's result and retries - would otherwise
+	// come straight back and be released again, forever.
+	pub fn take_int_report(&self) -> bool {
+		if !self.int_caught.load(Ordering::Acquire) || !self.int_pending.load(Ordering::Acquire) {
+			return false;
+		}
+		!self.int_reported.swap(true, Ordering::AcqRel)
 	}
 
 	// Count a channel message this process has sent (one successful send).

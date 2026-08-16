@@ -991,6 +991,14 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 			// composes, and this is it in the shape it is for: a producer, a copy to a file, and a
 			// consumer that still sees the stream.
 			&b"redirect_in motd.txt | tee teed.txt | wc\n"[..],
+			// THE COMMAND WORD ON ITS OWN. An argument-taking tool matched only `name <rest>`, so a
+			// line that was just the name fell past every shape to "unknown command" - about a name
+			// in the shell's own table, help and completion. `which` is typed rather than `lico`
+			// because the interactive shapes take the terminal and this test would then be reading
+			// its own redraws; both shapes ask the same matcher, and it is the matcher that was
+			// wrong. What is asserted is that it LAUNCHED - the tool's own usage line - and not
+			// merely that a particular error went missing.
+			&b"which\n"[..],
 		] {
 			terminal.send(Message::new(line.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not type at the shell")?;
 			for _ in 0..24 {
@@ -4546,7 +4554,11 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	panic!("imgview harness did not exit");
 }
 
-fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
+// Start `lico` on a channel standing in for its terminal, with the grants PermissionManager would
+// send, and pump until it has drawn its first frame. Hands back the process, that channel and
+// everything written so far, so one caller can assert on the startup sequence and drive the
+// program while another takes it straight to an exit it has to survive.
+fn start_lico(lico_elf: &[u8], system: &mut StorageHarness) -> (alloc::sync::Arc<object::process::Process>, alloc::sync::Arc<object::channel::Channel>, alloc::vec::Vec<alloc::vec::Vec<u8>>) {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
 
@@ -4585,6 +4597,13 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 		}
 	}
 	assert!(rendered, "lico renders both panels before waiting for input");
+	(process, terminal, output)
+}
+
+fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
+	use object::channel::Message;
+
+	let (process, terminal, mut output) = start_lico(lico_elf, system);
 	assert_eq!(output.get(0).map(Vec::as_slice), Some(b"\x1b[?1049h".as_slice()), "lico enters the alternate screen first");
 	// By CONTENT, not by position. This read message four, which was the mouse request only while
 	// two tty-mode escapes sat in front of it - and those are gone: raw and echo are a request on
@@ -4635,6 +4654,43 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	}
 	assert!(created, "F7 creates the directory and the panel shows it, with the trailing separator that marks one");
 
+	// F8 DELETES IT AGAIN, AND THIS IS THE ASSERTION THAT FOUND THE JOB LOOP'S HANG. A delete is not
+	// a call the manager makes and waits on: it is planned, then advanced a few steps per turn of
+	// the input loop, so this drives the ONE path in the suite where the manager has work of its own
+	// to do between keystrokes. Nothing else here would notice a job that never gets a turn.
+	//
+	// The entry is named rather than pointed at - `+` tags by pattern, so the test does not depend
+	// on where the cursor landed or on how the panel happens to be sorted. Then the typed
+	// confirmation, which the delete requires and a keystroke cannot give.
+	terminal.send(Message::new(b"+".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico tag-by-pattern input");
+	for byte in b"licodir" {
+		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new(), 0)).expect("lico tag pattern");
+	}
+	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico confirms the pattern");
+	terminal.send(Message::new(b"\x1b[19~".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico F8 input");
+	for byte in b"yes" {
+		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new(), 0)).expect("lico delete confirmation");
+	}
+	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico confirms the delete");
+	// The completed frame is the one to read, and it carries BOTH halves of the claim: the job ran
+	// to its end, and the refreshed panel no longer lists what it removed. A count alone would pass
+	// for an operation that reported success and deleted nothing.
+	let mut settled: Option<alloc::vec::Vec<u8>> = None;
+	for _ in 0..200_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			if settled.is_none() && message.bytes.windows(b"1 done, 0 refused".len()).any(|window| window == b"1 done, 0 refused") {
+				settled = Some(message.bytes.clone());
+			}
+			output.push(message.bytes);
+		}
+		if settled.is_some() {
+			break;
+		}
+	}
+	let settled = settled.expect("F8 advances the delete job to completion and reports one entry done");
+	assert!(!settled.windows(b"licodir/".len()).any(|window| window == b"licodir/"), "the panel refreshed after the delete no longer lists the directory it removed");
+
 	terminal.send(Message::new(b"\x1b[21~".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico F10 input");
 	for _ in 0..100_000 {
 		system.pump();
@@ -4646,16 +4702,53 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 		}
 	}
 	assert!(process.is_terminated(), "lico exits after F10");
-	// The tty's raw and echo modes are NOT in this list any more: they are requests on the
-	// terminal's control channel, not escapes in the output stream. What is left is the terminal's
-	// own state - mouse reporting, the cursor, the alternate screen - which a program may set for
-	// its own screen and which no file's contents can misuse.
+	assert_restored_in_order(&output);
+}
+
+// THE RESTORE SEQUENCE, READ THE SAME WAY WHATEVER ENDED THE PROGRAM. Which is the point of having
+// it as a function: the claim is that EVERY exit restores the terminal, and a claim about every
+// exit that is only ever checked against one of them is a claim about that one.
+//
+// The tty's raw and echo modes are not in this list: they are requests on the terminal's control
+// channel, not escapes in the output stream. What is left is the terminal's own state - mouse
+// reporting, the cursor, the alternate screen - which a program may set for its own screen and
+// which no file's contents can misuse.
+fn assert_restored_in_order(output: &[alloc::vec::Vec<u8>]) {
 	let restore = [b"\x1b[?1006l".as_slice(), b"\x1b[?1000l".as_slice(), b"\x1b[?25h".as_slice(), b"\x1b[?1049l".as_slice()];
 	let mut cursor = 0;
 	for expected in restore {
 		let position = output[cursor..].iter().position(|line| line == expected).expect("lico restores every terminal mode in order");
 		cursor += position + 1;
 	}
+}
+
+// AN INTERRUPT IS AN EXIT TOO, and it is the one a person actually reaches for. `lico` arms itself
+// to CATCH Ctrl+C rather than be killed by it, which is the only reason its terminal can be put
+// back at all - an uncaught SIG_INT terminates the process where it stands, and a program that
+// died inside the alternate screen with the cursor hidden leaves the shell it returns to unusable.
+//
+// So this drives the caught disposition exactly as the kernel does for a tty's Ctrl+C - the pending
+// flag plus a wake, because the manager is asleep in `wait_any` and a flag nobody wakes it to read
+// is not a signal - and then asks for the same restore sequence the F10 exit produces.
+fn run_lico_interrupt_harness(lico_elf: &[u8], system: &mut StorageHarness) {
+	let (process, terminal, mut output) = start_lico(lico_elf, system);
+	assert!(process.is_int_caught(), "lico arms itself to catch the interrupt rather than be killed by it");
+
+	process.set_int_pending();
+	for thread in process.live_threads() {
+		sched::wake_thread(&thread);
+	}
+	for _ in 0..100_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			output.push(message.bytes);
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	assert!(process.is_terminated(), "lico exits on an interrupt instead of ignoring it");
+	assert_restored_in_order(&output);
 }
 
 // Kernel-thread body that drops to ring 3 running the embedded cooperative-yield

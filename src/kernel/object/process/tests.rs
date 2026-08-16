@@ -115,3 +115,34 @@ fn the_lifecycle_guard_covers_the_whole_operation_and_not_just_its_first_line() 
 	drop(process);
 	sched::run_until_idle();
 }
+
+crate::tagged_test!(a_caught_interrupt_breaks_one_wait_per_delivery, [Process, Kernel, Scheduler], id = "kernel.object.process.a_caught_interrupt_breaks_one_wait_per_delivery", covers = ["kernel"]);
+fn a_caught_interrupt_breaks_one_wait_per_delivery() {
+	// THE BOUND THAT KEEPS A FIX FROM BECOMING A SPIN.
+	//
+	// A caught SIG_INT sets a flag its process polls, and a process parked in `SYS_WAIT` polls
+	// nothing - so the blocking waits break out and hand control back. The question this pins is
+	// how OFTEN they may: a program that does not poll between waits (any loop that discards its
+	// wait's result and retries is one) would be released again immediately, and again, turning a
+	// hang into a busy loop that also keeps the run queue non-empty. One report per delivery is
+	// what makes the second wait block normally.
+	let process = Process::new(AddressSpace::create().expect("address space"), sched::root_domain()).expect("a test process");
+
+	// UNARMED FIRST, because the whole disposition is opt-in: a process that never asked to catch
+	// interrupts is terminated by one, and no wait of its may be broken on account of a flag.
+	process.set_int_pending();
+	assert!(!process.take_int_report(), "an unarmed process never breaks a wait for an interrupt");
+
+	process.catch_int();
+	assert!(process.take_int_report(), "the first wait after a delivery is released");
+	assert!(!process.take_int_report(), "and the next one is not - one report, not one per wait");
+	assert!(process.take_int_pending(), "the flag itself is untouched by reporting: SYS_SIGNAL_TAKE is what consumes it");
+	assert!(!process.take_int_report(), "with nothing pending there is nothing to report");
+
+	// A SECOND CTRL+C IS A SECOND INTERRUPT, even if the first was never read. Somebody pressing it
+	// again is asking again, and a program still wedged in a wait is exactly who they are asking.
+	process.set_int_pending();
+	assert!(process.take_int_report(), "a fresh delivery is reportable again");
+	process.set_int_pending();
+	assert!(process.take_int_report(), "and so is the one after it, read or not");
+}
