@@ -18,6 +18,14 @@ fn launch_context_wire_is_stable() {
 	assert_eq!(LaunchContext::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn selected_file_wire_is_stable() {
+	let sample = SelectedFile { uri: String::from("x"), name: String::from("x"), writable: true };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 0, 120, 1, 0, 120, 1];
+	assert_eq!(bytes, golden);
+	assert_eq!(SelectedFile::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn error_wire_is_stable() {
 	let sample = Error::Denied;
 	let bytes = sample.encode_vec().expect("encode");

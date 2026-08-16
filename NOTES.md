@@ -1,6 +1,7 @@
 # Bugs / changes
 
 - architecture audit (!!!)
+- for testing of one utility, it builds the whole system with all utils (./build.sh --arch x86_64) - we need to enhance our testing suit by compiling only the minimal system with only minimal set of drivers, services and libraries for testing that utility ... also we should not build everything from scratch, only parts that are are not in its current version
 - create SDK not just for WASM, but for Rust too
 - h.264 codec + mp4 container + make "play" play video too (not just audio)
 - check if we have only our own implementations of image and audio decoders and encoders

@@ -185,6 +185,77 @@ impl LaunchContext {
 	}
 }
 
+/// What a program was opened ON, when it was launched over one selected file.
+///
+/// It travels beside the attenuated volume client that carries the AUTHORITY, and holds only what
+/// the authority cannot say: the URI to open through that client, the name to show a person, and
+/// whether the grant may be written back through. There is no handle here and there is nowhere to
+/// put one - a capability rides the message, never a field of a record.
+///
+/// `writable` is a statement about the GRANT and not a request: a target that reads `false` and
+/// tries to open a writer is refused by StorageService, so the field tells it what will happen
+/// rather than deciding it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SelectedFile {
+	pub uri: String,
+	pub name: String,
+	pub writable: bool,
+}
+
+impl SelectedFile {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
+		Some(w.into_inner())
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
+	pub fn decode(bytes: &[u8]) -> Option<SelectedFile> {
+		let mut r = Reader::new(bytes);
+		let value = SelectedFile::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<SelectedFile> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = SelectedFile::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.bytes_lp(self.uri.as_bytes())?;
+		w.bytes_lp(self.name.as_bytes())?;
+		w.boolean(self.writable)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<SelectedFile> {
+		let uri = r.string_lp()?;
+		let name = r.string_lp()?;
+		let writable = r.boolean()?;
+		Some(SelectedFile { uri, name, writable })
+	}
+}
+
 /// A common error enum rendered identically in binary, JSON, and CLI.
 /// Each case names a kernel ERR_* condition; the wire value is the enum's
 /// own 0-based ordinal, not the negative ERR_* number.
@@ -370,6 +441,65 @@ impl LaunchContext {
 		for v7 in self.environment.iter() {
 			v7.to_cbor_into(out);
 		}
+	}
+}
+
+impl SelectedFile {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"uri\":");
+		crate::codec::json_escape(&self.uri, out);
+		out.push(',');
+		out.push_str("\"name\":");
+		crate::codec::json_escape(&self.name, out);
+		out.push(',');
+		out.push_str("\"writable\":");
+		if self.writable {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("uri=");
+		out.push_str(&self.uri);
+		out.push_str(", ");
+		out.push_str("name=");
+		out.push_str(&self.name);
+		out.push_str(", ");
+		out.push_str("writable=");
+		if self.writable {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::text(out, "uri");
+		crate::codec::cbor::text(out, &self.uri);
+		crate::codec::cbor::text(out, "name");
+		crate::codec::cbor::text(out, &self.name);
+		crate::codec::cbor::text(out, "writable");
+		crate::codec::cbor::boolean(out, self.writable);
 	}
 }
 

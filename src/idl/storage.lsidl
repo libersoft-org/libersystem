@@ -348,4 +348,15 @@ interface writer {
 /// but rejects paths outside the granted directory and cannot mint a broader client.
 interface volume-admin {
 	@op(1) open-directory: func(path: string) -> result<handle<channel>, error>;
+
+	/// Mint a client restricted to EXACTLY ONE PATH - not the directory it sits in, not a sibling.
+	///
+	/// This is what a selected-file grant is made of. A program handed one file to open must not be
+	/// able to reopen the file next to it, which a directory-scoped client can; the narrowest thing
+	/// a volume client can be is one that admits a single path and refuses every other, including
+	/// the directory listing that would reveal them.
+	///
+	/// `writable` decides whether the client may open a transactional writer over that path. A
+	/// viewer is minted read-only and cannot become a writer by asking.
+	@op(2) open-file: func(path: string, writable: bool) -> result<handle<channel>, error>;
 }

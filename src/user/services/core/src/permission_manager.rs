@@ -52,7 +52,7 @@ use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::network;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, StartResult, process, volume, volume_admin};
+use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, SelectedFile, StartResult, process, volume, volume_admin};
 use rt::*;
 use services::executable;
 
@@ -210,7 +210,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// ask for a NAMED program to be started, which then runs under that program's own manifest -
 		// so an association or a command-bar line can launch something without lending it anything.
 		// `Process` would be raw process creation, and is deliberately not here.
-		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets, Capability::Permission])),
+		//
+		// `Session` is for ONE op: a command backgrounded with `&` has to become a job the session
+		// knows about, or `jobs` and `fg` cannot see it and nothing reaps it. The narrow
+		// `session-client` is what bounds that - it exports the job list, the job signal and the
+		// job REGISTER, and not `job-take`, so this cannot reach into a job's Process handle.
+		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets, Capability::Permission, Capability::Session])),
 		b"imgconv" => Some(granted("imgconv", alloc::vec![Capability::Volumes])),
 		b"play" => Some(granted("play", alloc::vec![Capability::Volumes, Capability::AudioStream])),
 		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
@@ -545,6 +550,29 @@ impl Service for Manager {
 			return Err(Error::Invalid);
 		}
 		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, &mut self.clients, &mut self.audit) } {
+			Some(started) => Ok(started),
+			None => Err(Error::NotFound),
+		}
+	}
+
+	// Start a program over ONE SELECTED FILE, with an attenuated grant in place of the volume
+	// bundle its manifest would otherwise give it.
+	//
+	// THE NARROWING IS THE POINT. A viewer opened on one file holds a client scoped to that path
+	// and nothing else - it cannot reopen the file beside it, and it cannot list the directory to
+	// find out what those are. `writable` is the difference between "show this" and "edit this",
+	// and StorageService enforces it: a read-only grant that asks for a transactional writer is
+	// refused there rather than trusted here.
+	fn run_with_file(&mut self, name: String, args: String, cwd: String, file: String, writable: bool, stdout: u64) -> Result<StartResult, Error> {
+		// THE TARGET MUST BE ONE THE TABLE ADMITS FOR THIS. A grant that could be minted for any
+		// program would be a way to hand a file to something that was never meant to receive one,
+		// and the closed set is checked here as well as in the caller because the caller is not the
+		// thing being trusted.
+		if !matches!(name.as_str(), "licoview" | "licoedit" | "imgview" | "play") {
+			unsafe { close(stdout) };
+			return Err(Error::Denied);
+		}
+		match unsafe { run_tool_over_file(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &file, writable, stdout, &mut self.clients, &mut self.audit) } {
 			Some(started) => Ok(started),
 			None => Err(Error::NotFound),
 		}
@@ -1037,6 +1065,125 @@ unsafe fn send_launch_context(manager_side: u64, args: &[u8], cwd: &[u8], enviro
 		return false;
 	}
 	unsafe { send_blocking(manager_side, &bytes, 0) }
+}
+
+// Start a tool over ONE selected file.
+//
+// The same launch as `run_tool_under_manifest` with one substitution: where that hands over the
+// whole volume bundle, this mints a client scoped to a single path and hands that over instead,
+// beside a record naming what was opened. Every other grant in the tool's manifest is unchanged -
+// a viewer still gets its syntax descriptors, a player still gets its audio stream - because
+// narrowing the file authority is not a reason to take away the rest.
+//
+// A FAILURE TO MINT THE GRANT ENDS THE LAUNCH. Starting the program without it would give it a
+// process, a terminal and no file, which is a window with nothing in it and no way to say why.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], file: &str, writable: bool, stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
+	unsafe {
+		if clients.storage_admin == 0 {
+			close(stdout);
+			return None;
+		}
+		let name_str: &str = core::str::from_utf8(name).ok()?;
+		let (manager_side, child_side): (u64, u64) = channel()?;
+		let mut process_client = process::Client::new(ChannelTransport { chan: procsvc });
+		let started: StartResult = match process_client.launch_prepared(name_str, &child_side) {
+			Some(Ok(s)) => s,
+			_ => {
+				close(manager_side);
+				close(stdout);
+				return None;
+			}
+		};
+		let policy_name: String = match executable::logical_name(&started.info.name) {
+			Some(name) => String::from(name),
+			None => {
+				close(manager_side);
+				close(started.task);
+				close(stdout);
+				return None;
+			}
+		};
+		let manifest: Manifest = match manifest_for(policy_name.as_bytes()) {
+			Some(manifest) => manifest,
+			None => {
+				close(manager_side);
+				close(started.task);
+				close(stdout);
+				return None;
+			}
+		};
+		send_blocking(manager_side, CAP_STDOUT, stdout);
+		send_ready(manager_side);
+		if !send_launch_context(manager_side, args, cwd, &[]) {
+			close(manager_side);
+			close(started.task);
+			return None;
+		}
+		// THE ATTENUATED GRANT, minted from the private admin endpoint the manager holds and grants
+		// to nobody - the thing that hands out a narrowed authority must not itself be one of the
+		// things handed out.
+		let minted: u64 = match volume_admin::Client::new(ChannelTransport { chan: clients.storage_admin }).open_file(file, &writable) {
+			Some(Ok(client)) => client,
+			_ => {
+				close(manager_side);
+				close(started.task);
+				return None;
+			}
+		};
+		let granted: i64 = duplicate(minted, GRANT_RIGHTS);
+		close(minted);
+		if granted < 0 || !send_blocking(manager_side, CAP_SELECTED_FILE, granted as u64) {
+			close(manager_side);
+			close(started.task);
+			return None;
+		}
+		// The record travels AFTER the capability and says what the capability cannot: which URI to
+		// open through it, what to show a person, and whether a write-back will be accepted.
+		let selected = SelectedFile { uri: String::from(file), name: String::from(last_path_component(file)), writable };
+		let Some(bytes) = selected.encode_vec() else {
+			close(manager_side);
+			close(started.task);
+			return None;
+		};
+		if !send_blocking(manager_side, &bytes, 0) {
+			close(manager_side);
+			close(started.task);
+			return None;
+		}
+		// EVERY OTHER GRANT IS UNCHANGED, except `volumes` - which is exactly what the selected
+		// file replaced. The audit records the substitution rather than hiding it.
+		for &cap in VOCABULARY.iter() {
+			if cap == Capability::Volumes {
+				audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: false, dynamic: true });
+				continue;
+			}
+			let want: bool = manifest.grants.contains(&cap);
+			if want {
+				let handle: u64 = grant_for_task(clients, cap, started.task, &policy_name);
+				if handle == 0 || !send_blocking(manager_side, tag_for(cap), handle) {
+					close(manager_side);
+					return None;
+				}
+			}
+			audit.push(AuditEntry { component: policy_name.clone(), capability: cap, granted: want, dynamic: false });
+		}
+		if !matches!(process_client.release(&started.info.koid), Some(Ok(true))) {
+			close(manager_side);
+			return None;
+		}
+		close(manager_side);
+		Some(started)
+	}
+}
+
+// The last component of a URI, which is the name to show a person. A grant over
+// `vol://system/notes.txt` is presented as `notes.txt`.
+fn last_path_component(uri: &str) -> &str {
+	match uri.rfind('/') {
+		Some(at) => &uri[at + 1..],
+		None => uri,
+	}
 }
 
 // Grant the volume StorageService clients the `volumes` capability bundles, each under its own

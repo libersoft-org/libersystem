@@ -57,6 +57,22 @@ record launch-context {
 	environment: list<env-var>,
 }
 
+/// What a program was opened ON, when it was launched over one selected file.
+///
+/// It travels beside the attenuated volume client that carries the AUTHORITY, and holds only what
+/// the authority cannot say: the URI to open through that client, the name to show a person, and
+/// whether the grant may be written back through. There is no handle here and there is nowhere to
+/// put one - a capability rides the message, never a field of a record.
+///
+/// `writable` is a statement about the GRANT and not a request: a target that reads `false` and
+/// tries to open a writer is refused by StorageService, so the field tells it what will happen
+/// rather than deciding it.
+record selected-file {
+	uri:      string,
+	name:     string,
+	writable: bool,
+}
+
 /// A common error enum rendered identically in binary, JSON, and CLI.
 /// Each case names a kernel ERR_* condition; the wire value is the enum's
 /// own 0-based ordinal, not the negative ERR_* number.

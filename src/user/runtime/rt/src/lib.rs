@@ -1375,6 +1375,12 @@ pub const CAP_SUPERVISOR: &[u8] = b"SUPERVISOR";
 pub const CAP_STORAGE_ADMIN: &[u8] = b"STORAGE_ADMIN";
 // A component's own asset directory, minted per launch from the endpoint above.
 pub const CAP_APP_ASSETS: &[u8] = b"APP_ASSETS";
+/// The attenuated volume client a program is handed when it is launched over ONE selected file.
+///
+/// It carries the authority to reach exactly that path - not the directory it sits in, not a
+/// sibling - and the `selected-file` record that follows it says which URI to open through it and
+/// whether a write-back will be accepted.
+pub const CAP_SELECTED_FILE: &[u8] = b"SELECTED_FILE";
 pub const CAP_STORAGE_MEDIA: &[u8] = b"STORAGE_MEDIA";
 pub const CAP_STORAGE_ISO: &[u8] = b"STORAGE_ISO";
 pub const CAP_STORAGE_UDF: &[u8] = b"STORAGE_UDF";

@@ -247,6 +247,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 enum Scope {
 	Full,
 	Directory(String),
+	/// EXACTLY ONE PATH, and nothing beside it - not the directory it sits in, not a sibling.
+	///
+	/// This is what a selected-file grant is made of: a program handed one file to open must not be
+	/// able to reopen the file next to it, which a directory-scoped client can. The narrowest thing
+	/// a volume client can be.
+	///
+	/// `writable` is carried HERE rather than being a property of the handle, because it has to
+	/// survive `connect`: a client minted from a read-only file grant is read-only too, and a scope
+	/// that forgot the flag would let a viewer mint itself a writer.
+	File {
+		path: String,
+		writable: bool,
+	},
 }
 
 struct Client {
@@ -406,8 +419,21 @@ struct AdminCall<'a> {
 }
 
 impl volume_admin::Service for AdminCall<'_> {
+	fn open_file(&mut self, path: String, writable: bool) -> Result<u64, Error> {
+		let scope: Scope = Scope::file(self.volume, &path, writable)?;
+		self.mint(scope)
+	}
+
 	fn open_directory(&mut self, path: String) -> Result<u64, Error> {
 		let scope: Scope = Scope::directory(self.volume, &path)?;
+		self.mint(scope)
+	}
+}
+
+impl AdminCall<'_> {
+	// One place a narrowed client is made, so a file grant and a directory grant cannot come to
+	// differ in how they are admitted or in what a refusal leaves behind.
+	fn mint(&mut self, scope: Scope) -> Result<u64, Error> {
 		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
 		// A refused admission closes BOTH ends: the grant did not happen, so neither handle has an
 		// owner. `Again` is what it is - the table is full or the machine is short, and both are
@@ -608,6 +634,15 @@ impl Scope {
 		Ok(Scope::Directory(String::from(directory)))
 	}
 
+	fn file(volume: &Volume, path: &str, writable: bool) -> Result<Scope, Error> {
+		let target: VolumePath = VolumePath::parse(path.as_bytes()).ok_or(Error::Invalid)?;
+		if target.volume != volume.name() {
+			return Err(Error::NotFound);
+		}
+		let file: &str = core::str::from_utf8(target.path.as_bytes()).map_err(|_| Error::Invalid)?;
+		Ok(Scope::File { path: String::from(file), writable })
+	}
+
 	fn allows_path(&self, volume: &[u8], path: &str) -> bool {
 		match self {
 			Self::Full => true,
@@ -615,12 +650,33 @@ impl Scope {
 				let Some(target) = VolumePath::parse(path.as_bytes()) else { return false };
 				target.volume == volume && (target.path.as_bytes() == directory.as_bytes() || target.path.as_bytes().strip_prefix(directory.as_bytes()).is_some_and(|rest| rest.starts_with(b"/")))
 			}
+			// EQUALITY, not a prefix. A file scope that admitted anything beginning with its path
+			// would admit `notes.txt.bak` for a grant over `notes.txt`, and a directory's worth of
+			// files for a grant over the directory's own name.
+			Self::File { path: file, .. } => {
+				let Some(target) = VolumePath::parse(path.as_bytes()) else { return false };
+				target.volume == volume && target.path.as_bytes() == file.as_bytes()
+			}
 		}
 	}
 
 	fn allows_request(&self, volume: &[u8], request: &[u8]) -> bool {
 		if matches!(self, Self::Full) {
 			return true;
+		}
+		// WHAT A SELECTED-FILE GRANT CAN DO, in one place so the answer is readable rather than
+		// assembled from the path check and the op table. It may not LIST - listing its own path
+		// answers nothing and listing anything else is refused anyway - and a READ-ONLY one may not
+		// reach any op that changes the file, which is the whole difference between handing a
+		// program a file to show and handing it one to edit.
+		if let Self::File { writable, .. } = self {
+			let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+			if op == volume::OP_LIST {
+				return false;
+			}
+			if !writable && matches!(op, volume::OP_WRITE | volume::OP_REMOVE | volume::OP_TRUNCATE | volume::OP_TOUCH | volume::OP_WRITE_STREAM | volume::OP_OPEN_WRITER) {
+				return false;
+			}
 		}
 		let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
 		match op {

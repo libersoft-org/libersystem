@@ -129,4 +129,20 @@ interface permission {
 	/// blocks forever. `stdout` is the terminal end the LAST stage writes to; every earlier
 	/// stage writes into the edge the broker made for it.
 	@op(4) run-pipeline: func(stages: list<pipeline-stage>, cwd: string, environment: list<env-var>, stdout: handle<channel>) -> result<pipeline-result, error>;
+
+	/// Start a program over ONE SELECTED FILE, with an attenuated grant instead of a volume bundle.
+	///
+	/// The caller names a file it can already reach and the broker mints a client SCOPED TO THAT
+	/// PATH - not to the directory it sits in, and not to a sibling - which the child receives in
+	/// place of the volumes its manifest would otherwise grant it. So a viewer opened on one file
+	/// holds the authority to read that file and nothing else, and cannot reopen the file next to
+	/// it or list the directory to find out what those are.
+	///
+	/// `writable` decides whether the grant may open a transactional writer over the path. It is
+	/// the difference between "show this" and "edit this", and it is a decision the CALLER makes
+	/// and the broker records, rather than something the target asks for after it starts.
+	///
+	/// The path is checked against the caller's own reach before anything is minted: this narrows
+	/// authority and never widens it.
+	@op(5) run-with-file: func(name: string, args: string, cwd: string, file: string, writable: bool, stdout: handle<channel>) -> result<process-start-result, error>;
 }

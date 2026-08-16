@@ -44,3 +44,4 @@ method writer.commit op=5 () -> result<u64, liber:base@1::error>
 method writer.abort op=6 () -> result<unit, liber:base@1::error>
 interface volume-admin
 method volume-admin.open-directory op=1 (path:string:rights=) -> result<handle<channel>, liber:base@1::error>
+method volume-admin.open-file op=2 (path:string:rights=,writable:bool:rights=) -> result<handle<channel>, liber:base@1::error>

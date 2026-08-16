@@ -14,7 +14,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lico::{FileType, HexPattern, HexPatternError, InputDecoder, InputEvent, Key, LineState, MAX_DESCRIPTOR_BYTES, MouseTracking, SyntaxDescriptor, TerminalGuard, TerminalOptions, TerminalWriter, TextQuery, TokenSpan, append_display_line, detect_file_type, parse_descriptor, select_descriptor};
-use proto::system::LaunchContext;
+use proto::system::{LaunchContext, SelectedFile};
 use rt::*;
 use storage_proto::path;
 use tools::{ConsoleWriter, VolumeSet, read_volume_file};
@@ -58,15 +58,35 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
 		let arg = trim(&arg);
-		if arg.is_empty() || arg.iter().any(u8::is_ascii_whitespace) {
-			print(b"Usage: licoview PATH\n");
-			exit();
-		}
-		let Some(uri) = path::resolve(cwd, arg) else {
-			eprint(b"licoview: invalid path\n");
-			exit();
+		// THE SELECTED-FILE GRANT, WHEN THERE IS ONE. A launch over one file hands this program a
+		// client scoped to exactly that path - not the directory it sits in, not a sibling - so the
+		// viewer opened on a file cannot reopen the file beside it or list the directory to find
+		// out what those are. The record that follows says which URI to open through it.
+		//
+		// ABSENT IS THE ORDINARY LAUNCH, which is why this is an `Option` rather than a
+		// requirement: `licoview PATH` typed at a shell still resolves a path against the volume
+		// bundle its own manifest grants, and that path is checked the way it always was.
+		let selected: u64 = recv_tagged(bootstrap, &mut buf, CAP_SELECTED_FILE).unwrap_or(0);
+		let opened: Option<SelectedFile> = if selected == 0 { None } else { recv_launch_bytes(bootstrap).as_deref().and_then(SelectedFile::decode) };
+		let (uri, storage) = match opened.as_ref() {
+			Some(opened) => (String::from(opened.uri.as_str()), selected),
+			None => {
+				if arg.is_empty() || arg.iter().any(u8::is_ascii_whitespace) {
+					print(b"Usage: licoview PATH\n");
+					exit();
+				}
+				let Some(uri) = path::resolve(cwd, arg) else {
+					eprint(b"licoview: invalid path\n");
+					exit();
+				};
+				let storage = volumes.client_for(cwd, arg);
+				(uri, storage)
+			}
 		};
-		let storage = volumes.client_for(cwd, arg);
+		let arg: &[u8] = match opened.as_ref() {
+			Some(opened) => opened.name.as_bytes(),
+			None => arg,
+		};
 		let file = match read_volume_file(storage, &uri, MAX_VIEW_BYTES) {
 			Ok(file) => file,
 			Err(_) => {

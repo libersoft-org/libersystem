@@ -26,3 +26,4 @@ macro_rules! forward {
 forward!("liber_channel_liber_security_permission_lookup", "liber_channel_impl_liber_security_permission_lookup");
 forward!("liber_channel_liber_security_permission_audit", "liber_channel_impl_liber_security_permission_audit");
 forward!("liber_channel_liber_security_permission_run", "liber_channel_impl_liber_security_permission_run");
+forward!("liber_channel_liber_security_permission_run_with_file", "liber_channel_impl_liber_security_permission_run_with_file");

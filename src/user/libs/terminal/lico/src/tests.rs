@@ -985,3 +985,62 @@ fn a_result_set_and_a_walk_frontier_say_when_they_stopped_short() {
 	assert!(!frontier.push(b"vol://system/deep", MAX_OPERATION_DEPTH + 1));
 	assert!(frontier.refused_anything());
 }
+
+#[test]
+fn expanding_a_directory_puts_it_before_its_contents_and_a_delete_after_them() {
+	// A COPY HAS TO MAKE THE DIRECTORY BEFORE IT CAN PUT ANYTHING IN IT, and a DELETE has to empty
+	// one before it can remove it. The two orders are exact opposites, which is why the delete gets
+	// its own pass rather than hoping the walk produced the right order by accident.
+	let dir = Source { path: b"vol://system/sub", name: b"sub", is_dir: true, size: 0 };
+	let mut copy = plan(Operation::Copy, &[dir], b"vol://media", Overwrite::Skip).expect("a plan");
+	let parent = Step { source: copy.steps[0].source.clone(), destination: copy.steps[0].destination.clone(), is_dir: true, size: 0 };
+	let children = [
+		Source { path: b"vol://system/sub/a.txt", name: b"a.txt", is_dir: false, size: 40 },
+		Source { path: b"vol://system/sub/deeper", name: b"deeper", is_dir: true, size: 0 },
+	];
+	assert_eq!(expand(&mut copy, &parent, &children, 1).expect("room"), 2);
+	assert_eq!(copy.steps[0].source, b"vol://system/sub", "the directory itself is still first");
+	assert_eq!(copy.steps[1].destination, b"vol://media/sub/a.txt", "and a child lands below the directory's own destination");
+	assert_eq!(copy.steps[2].destination, b"vol://media/sub/deeper");
+	assert_eq!(copy.total_bytes, 40, "the file's bytes are counted");
+	assert!(copy.total_is_partial, "and the total is still a lower bound while a directory is unwalked");
+
+	// DEEPEST FIRST FOR A DELETE. Removing `sub` before `sub/a.txt` is a removal that fails on a
+	// directory that is not empty.
+	let mut removal = plan(Operation::Delete, &[dir], b"", Overwrite::Skip).expect("a plan");
+	let parent = Step { source: removal.steps[0].source.clone(), destination: std::vec::Vec::new(), is_dir: true, size: 0 };
+	expand(&mut removal, &parent, &children, 1).expect("room");
+	deepest_first(&mut removal);
+	assert_eq!(removal.steps[0].source, b"vol://system/sub/a.txt", "a child goes first");
+	assert_eq!(removal.steps.last().unwrap().source, b"vol://system/sub", "and the directory last");
+	assert!(removal.steps.iter().all(|step| step.destination.is_empty()), "a delete still invents no destination");
+
+	// AND THE DEPTH BOUND IS A REFUSAL rather than a silent stop.
+	let mut deep = plan(Operation::Copy, &[dir], b"vol://media", Overwrite::Skip).expect("a plan");
+	let parent = Step { source: deep.steps[0].source.clone(), destination: deep.steps[0].destination.clone(), is_dir: true, size: 0 };
+	assert_eq!(expand(&mut deep, &parent, &children, MAX_OPERATION_DEPTH + 1).unwrap_err(), PlanError::TooMany);
+}
+
+#[test]
+fn a_search_line_carries_its_filters_and_refuses_a_contradiction() {
+	// ONE PROMPT RATHER THAN FIVE. A dialog with a field per filter is a dialog nobody fills in,
+	// and these are the flags a person already knows from `find`.
+	let (pattern, criteria) = parse_criteria(b"*.rs -d 3 -f -s 100").expect("a search line");
+	assert_eq!(pattern, b"*.rs");
+	assert_eq!(criteria.max_depth, Some(3));
+	assert!(criteria.files_only);
+	assert_eq!(criteria.min_size, Some(100));
+	assert_eq!(criteria.max_size, None, "a filter nobody set admits everything");
+
+	let (pattern, criteria) = parse_criteria(b"  notes  ").expect("a bare pattern");
+	assert_eq!(pattern, b"notes");
+	assert!(!criteria.files_only && !criteria.directories_only);
+
+	// A CONTRADICTION IS REFUSED rather than resolved: `-f -D` admits nothing at all, and a search
+	// that ran and found nothing would look exactly like a tree with nothing in it.
+	assert_eq!(parse_criteria(b"* -f -D").unwrap_err(), CriteriaError::Contradictory);
+	assert_eq!(parse_criteria(b"* -d").unwrap_err(), CriteriaError::MissingValue, "a flag that takes a number and was given none is a mistake, not a default");
+	assert_eq!(parse_criteria(b"* -d x").unwrap_err(), CriteriaError::NotANumber);
+	assert_eq!(parse_criteria(b"* -q").unwrap_err(), CriteriaError::UnknownFlag);
+	assert_eq!(parse_criteria(b"* second").unwrap_err(), CriteriaError::UnknownFlag, "a second bare word is not a second pattern");
+}

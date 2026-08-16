@@ -9,3 +9,4 @@ method permission.lookup op=1 (component:string:rights=) -> result<manifest, lib
 method permission.audit op=2 () -> stream<audit-entry>
 method permission.run op=3 (name:string:rights=,args:string:rights=,cwd:string:rights=,environment:list<liber:base@1::env-var>:rights=,stdout:handle<channel>:rights=) -> result<liber:process@1::start-result, liber:base@1::error>
 method permission.run-pipeline op=4 (stages:list<pipeline-stage>:rights=,cwd:string:rights=,environment:list<liber:base@1::env-var>:rights=,stdout:handle<channel>:rights=) -> result<pipeline-result, liber:base@1::error>
+method permission.run-with-file op=5 (name:string:rights=,args:string:rights=,cwd:string:rights=,file:string:rights=,writable:bool:rights=,stdout:handle<channel>:rights=) -> result<liber:process@1::start-result, liber:base@1::error>

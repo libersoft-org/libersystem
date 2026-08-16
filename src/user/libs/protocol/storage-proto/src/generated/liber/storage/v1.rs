@@ -3428,9 +3428,20 @@ pub mod volume_admin {
 	use alloc::vec::Vec;
 
 	pub const OP_OPEN_DIRECTORY: u16 = 1;
+	pub const OP_OPEN_FILE: u16 = 2;
 
 	pub trait Service {
 		fn open_directory(&mut self, path: String) -> Result<u64, Error>;
+		/// Mint a client restricted to EXACTLY ONE PATH - not the directory it sits in, not a sibling.
+		///
+		/// This is what a selected-file grant is made of. A program handed one file to open must not be
+		/// able to reopen the file next to it, which a directory-scoped client can; the narrowest thing
+		/// a volume client can be is one that admits a single path and refuses every other, including
+		/// the directory listing that would reveal them.
+		///
+		/// `writable` decides whether the client may open a transactional writer over that path. A
+		/// viewer is minted read-only and cannot become a writer by asking.
+		fn open_file(&mut self, path: String, writable: bool) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -3470,6 +3481,45 @@ pub mod volume_admin {
 						Err(v72) => {
 							w.u8(0)?;
 							v72.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_OPEN_FILE => {
+				let path = r.string_lp()?;
+				let writable = r.boolean()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open_file(path, writable);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v73) => {
+							w.u8(1)?;
+							w.set_handle(*v73)?;
+							w.u32(0)?;
+						}
+						Err(v74) => {
+							w.u8(0)?;
+							v74.write(w)?;
 						}
 					}
 					Some(())
@@ -3574,6 +3624,41 @@ pub mod volume_admin {
 			}
 			decoded
 		}
+		pub fn open_file(&mut self, path: &str, writable: &bool) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN_FILE)?;
+			w.u32(corr)?;
+			w.bytes_lp(path.as_bytes())?;
+			w.boolean(*writable)?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -3582,6 +3667,14 @@ pub mod volume_admin {
 	fn channel_invoke_open_directory(chan: u64, path: &str) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.open_directory(path)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_storage_volume_admin_open_file")]
+	fn channel_invoke_open_file(chan: u64, path: &str, writable: &bool) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open_file(path, writable)
 	}
 }
 
@@ -4081,13 +4174,13 @@ impl FsckReport {
 		out.push(',');
 		out.push_str("\"damaged\":");
 		out.push('[');
-		let mut v74 = true;
-		for v73 in self.damaged.iter() {
-			if !v74 {
+		let mut v76 = true;
+		for v75 in self.damaged.iter() {
+			if !v76 {
 				out.push(',');
 			}
-			v74 = false;
-			crate::codec::json_escape(v73, out);
+			v76 = false;
+			crate::codec::json_escape(v75, out);
 		}
 		out.push(']');
 		out.push(',');
@@ -4102,13 +4195,13 @@ impl FsckReport {
 		out.push(',');
 		out.push_str("\"faults\":");
 		out.push('[');
-		let mut v76 = true;
-		for v75 in self.faults.iter() {
-			if !v76 {
+		let mut v78 = true;
+		for v77 in self.faults.iter() {
+			if !v78 {
 				out.push(',');
 			}
-			v76 = false;
-			crate::codec::json_escape(v75, out);
+			v78 = false;
+			crate::codec::json_escape(v77, out);
 		}
 		out.push(']');
 		out.push('}');
@@ -4120,13 +4213,13 @@ impl FsckReport {
 		out.push_str(", ");
 		out.push_str("damaged=");
 		out.push('[');
-		let mut v78 = true;
-		for v77 in self.damaged.iter() {
-			if !v78 {
+		let mut v80 = true;
+		for v79 in self.damaged.iter() {
+			if !v80 {
 				out.push_str(", ");
 			}
-			v78 = false;
-			out.push_str(v77);
+			v80 = false;
+			out.push_str(v79);
 		}
 		out.push(']');
 		out.push_str(", ");
@@ -4141,13 +4234,13 @@ impl FsckReport {
 		out.push_str(", ");
 		out.push_str("faults=");
 		out.push('[');
-		let mut v80 = true;
-		for v79 in self.faults.iter() {
-			if !v80 {
+		let mut v82 = true;
+		for v81 in self.faults.iter() {
+			if !v82 {
 				out.push_str(", ");
 			}
-			v80 = false;
-			out.push_str(v79);
+			v82 = false;
+			out.push_str(v81);
 		}
 		out.push(']');
 		out.push('}');
@@ -4158,8 +4251,8 @@ impl FsckReport {
 		crate::codec::cbor::uint(out, self.checksum_failures as u64);
 		crate::codec::cbor::text(out, "damaged");
 		crate::codec::cbor::array(out, self.damaged.len());
-		for v81 in self.damaged.iter() {
-			crate::codec::cbor::text(out, v81);
+		for v83 in self.damaged.iter() {
+			crate::codec::cbor::text(out, v83);
 		}
 		crate::codec::cbor::text(out, "structural-failures");
 		crate::codec::cbor::uint(out, self.structural_failures as u64);
@@ -4169,8 +4262,8 @@ impl FsckReport {
 		crate::codec::cbor::uint(out, self.io_failures as u64);
 		crate::codec::cbor::text(out, "faults");
 		crate::codec::cbor::array(out, self.faults.len());
-		for v82 in self.faults.iter() {
-			crate::codec::cbor::text(out, v82);
+		for v84 in self.faults.iter() {
+			crate::codec::cbor::text(out, v84);
 		}
 	}
 }

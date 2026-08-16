@@ -23,3 +23,12 @@ global_asm!(".section .text.liber_channel_liber_session_session_job_signal,\"ax\
 
 #[cfg(target_arch = "riscv64")]
 global_asm!(".section .text.liber_channel_liber_session_session_job_signal,\"ax\",@progbits\n.globl liber_channel_liber_session_session_job_signal\n.type liber_channel_liber_session_session_job_signal,%function\nliber_channel_liber_session_session_job_signal:\ntail liber_channel_impl_liber_session_session_job_signal\n.size liber_channel_liber_session_session_job_signal, . - liber_channel_liber_session_session_job_signal\n");
+
+#[cfg(target_arch = "x86_64")]
+global_asm!(".section .text.liber_channel_liber_session_session_job_register,\"ax\",@progbits\n.globl liber_channel_liber_session_session_job_register\n.type liber_channel_liber_session_session_job_register,@function\nliber_channel_liber_session_session_job_register:\njmp liber_channel_impl_liber_session_session_job_register\n.size liber_channel_liber_session_session_job_register, . - liber_channel_liber_session_session_job_register\n");
+
+#[cfg(target_arch = "aarch64")]
+global_asm!(".section .text.liber_channel_liber_session_session_job_register,\"ax\",@progbits\n.globl liber_channel_liber_session_session_job_register\n.type liber_channel_liber_session_session_job_register,%function\nliber_channel_liber_session_session_job_register:\nb liber_channel_impl_liber_session_session_job_register\n.size liber_channel_liber_session_session_job_register, . - liber_channel_liber_session_session_job_register\n");
+
+#[cfg(target_arch = "riscv64")]
+global_asm!(".section .text.liber_channel_liber_session_session_job_register,\"ax\",@progbits\n.globl liber_channel_liber_session_session_job_register\n.type liber_channel_liber_session_session_job_register,%function\nliber_channel_liber_session_session_job_register:\ntail liber_channel_impl_liber_session_session_job_register\n.size liber_channel_liber_session_session_job_register, . - liber_channel_liber_session_session_job_register\n");

@@ -460,6 +460,7 @@ pub mod permission {
 	pub const OP_AUDIT: u16 = 2;
 	pub const OP_RUN: u16 = 3;
 	pub const OP_RUN_PIPELINE: u16 = 4;
+	pub const OP_RUN_WITH_FILE: u16 = 5;
 
 	pub trait Service {
 		fn lookup(&mut self, component: String) -> Result<Manifest, Error>;
@@ -472,6 +473,21 @@ pub mod permission {
 		/// blocks forever. `stdout` is the terminal end the LAST stage writes to; every earlier
 		/// stage writes into the edge the broker made for it.
 		fn run_pipeline(&mut self, stages: Vec<PipelineStage>, cwd: String, environment: Vec<EnvVar>, stdout: u64) -> Result<PipelineResult, Error>;
+		/// Start a program over ONE SELECTED FILE, with an attenuated grant instead of a volume bundle.
+		///
+		/// The caller names a file it can already reach and the broker mints a client SCOPED TO THAT
+		/// PATH - not to the directory it sits in, and not to a sibling - which the child receives in
+		/// place of the volumes its manifest would otherwise grant it. So a viewer opened on one file
+		/// holds the authority to read that file and nothing else, and cannot reopen the file next to
+		/// it or list the directory to find out what those are.
+		///
+		/// `writable` decides whether the grant may open a transactional writer over the path. It is
+		/// the difference between "show this" and "edit this", and it is a decision the CALLER makes
+		/// and the broker records, rather than something the target asks for after it starts.
+		///
+		/// The path is checked against the caller's own reach before anything is minted: this narrows
+		/// authority and never widens it.
+		fn run_with_file(&mut self, name: String, args: String, cwd: String, file: String, writable: bool, stdout: u64) -> Result<ProcessStartResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -642,6 +658,51 @@ pub mod permission {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_RUN_WITH_FILE => {
+				let name = r.string_lp()?;
+				let args = r.string_lp()?;
+				let cwd = r.string_lp()?;
+				let file = r.string_lp()?;
+				let writable = r.boolean()?;
+				let stdout = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let result = service.run_with_file(name, args, cwd, file, writable, stdout);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v18) => {
+							w.u8(1)?;
+							v18.write(w)?;
+						}
+						Err(v19) => {
+							w.u8(0)?;
+							v19.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -786,8 +847,8 @@ pub mod permission {
 				return None;
 			}
 			w.u16(environment.len() as u16)?;
-			for v18 in environment.iter() {
-				v18.write(w)?;
+			for v20 in environment.iter() {
+				v20.write(w)?;
 			}
 			w.set_handle(*stdout)?;
 			w.u32(0)?;
@@ -821,16 +882,16 @@ pub mod permission {
 				return None;
 			}
 			w.u16(stages.len() as u16)?;
-			for v19 in stages.iter() {
-				v19.write(w)?;
+			for v21 in stages.iter() {
+				v21.write(w)?;
 			}
 			w.bytes_lp(cwd.as_bytes())?;
 			if environment.len() > u16::MAX as usize {
 				return None;
 			}
 			w.u16(environment.len() as u16)?;
-			for v20 in environment.iter() {
-				v20.write(w)?;
+			for v22 in environment.iter() {
+				v22.write(w)?;
 			}
 			w.set_handle(*stdout)?;
 			w.u32(0)?;
@@ -845,6 +906,39 @@ pub mod permission {
 					return None;
 				}
 				let value = if r.tag()? { Ok(PipelineResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn run_with_file(&mut self, name: &str, args: &str, cwd: &str, file: &str, writable: &bool, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RUN_WITH_FILE)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			w.bytes_lp(args.as_bytes())?;
+			w.bytes_lp(cwd.as_bytes())?;
+			w.bytes_lp(file.as_bytes())?;
+			w.boolean(*writable)?;
+			w.set_handle(*stdout)?;
+			w.u32(0)?;
+			let request_handles = Handles::try_from_slice(writer.handles())?;
+			let request = writer.into_inner();
+			let mut reply_handles = Handles::new();
+			let reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(ProcessStartResult::read(r)?) } else { Err(Error::read(r)?) };
 				r.finish()?;
 				Some(value)
 			})();
@@ -886,6 +980,14 @@ pub mod permission {
 	fn channel_invoke_run_pipeline(chan: u64, stages: &Vec<PipelineStage>, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<PipelineResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.run_pipeline(stages, cwd, environment, stdout)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_run_with_file")]
+	fn channel_invoke_run_with_file(chan: u64, name: &str, args: &str, cwd: &str, file: &str, writable: &bool, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.run_with_file(name, args, cwd, file, writable, stdout)
 	}
 }
 
@@ -1005,25 +1107,25 @@ impl Manifest {
 		out.push(',');
 		out.push_str("\"requested\":");
 		out.push('[');
-		let mut v22 = true;
-		for v21 in self.requested.iter() {
-			if !v22 {
-				out.push(',');
-			}
-			v22 = false;
-			v21.to_json_into(out);
-		}
-		out.push(']');
-		out.push(',');
-		out.push_str("\"grants\":");
-		out.push('[');
 		let mut v24 = true;
-		for v23 in self.grants.iter() {
+		for v23 in self.requested.iter() {
 			if !v24 {
 				out.push(',');
 			}
 			v24 = false;
 			v23.to_json_into(out);
+		}
+		out.push(']');
+		out.push(',');
+		out.push_str("\"grants\":");
+		out.push('[');
+		let mut v26 = true;
+		for v25 in self.grants.iter() {
+			if !v26 {
+				out.push(',');
+			}
+			v26 = false;
+			v25.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1035,25 +1137,25 @@ impl Manifest {
 		out.push_str(", ");
 		out.push_str("requested=");
 		out.push('[');
-		let mut v26 = true;
-		for v25 in self.requested.iter() {
-			if !v26 {
-				out.push_str(", ");
-			}
-			v26 = false;
-			v25.to_text_into(out);
-		}
-		out.push(']');
-		out.push_str(", ");
-		out.push_str("grants=");
-		out.push('[');
 		let mut v28 = true;
-		for v27 in self.grants.iter() {
+		for v27 in self.requested.iter() {
 			if !v28 {
 				out.push_str(", ");
 			}
 			v28 = false;
 			v27.to_text_into(out);
+		}
+		out.push(']');
+		out.push_str(", ");
+		out.push_str("grants=");
+		out.push('[');
+		let mut v30 = true;
+		for v29 in self.grants.iter() {
+			if !v30 {
+				out.push_str(", ");
+			}
+			v30 = false;
+			v29.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1064,13 +1166,13 @@ impl Manifest {
 		crate::codec::cbor::text(out, &self.component);
 		crate::codec::cbor::text(out, "requested");
 		crate::codec::cbor::array(out, self.requested.len());
-		for v29 in self.requested.iter() {
-			v29.to_cbor_into(out);
+		for v31 in self.requested.iter() {
+			v31.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "grants");
 		crate::codec::cbor::array(out, self.grants.len());
-		for v30 in self.grants.iter() {
-			v30.to_cbor_into(out);
+		for v32 in self.grants.iter() {
+			v32.to_cbor_into(out);
 		}
 	}
 }

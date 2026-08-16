@@ -15,6 +15,8 @@ unsafe extern "Rust" {
 	fn permission_audit(chan: u64) -> Option<u64>;
 	#[link_name = "liber_channel_liber_security_permission_run"]
 	fn permission_run(chan: u64, name: &str, args: &str, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<StartResult, Error>>;
+	#[link_name = "liber_channel_liber_security_permission_run_with_file"]
+	fn permission_run_with_file(chan: u64, name: &str, args: &str, cwd: &str, file: &str, writable: &bool, stdout: &u64) -> Option<Result<StartResult, Error>>;
 }
 
 #[derive(Clone, Copy)]
@@ -48,5 +50,16 @@ impl PermissionClient {
 	#[inline(always)]
 	pub fn run(&mut self, name: &str, args: &str, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<StartResult, Error>> {
 		unsafe { permission_run(self.chan, name, args, cwd, environment, stdout) }
+	}
+
+	/// Launch a governed program over ONE selected file, with an attenuated grant in place of the
+	/// volume bundle its manifest would otherwise give it.
+	///
+	/// The caller names a file and whether it may be written; the broker mints a client scoped to
+	/// exactly that path and hands it to the child. This narrows authority and never widens it -
+	/// the broker checks the target against the closed set of programs a file may be handed to.
+	#[inline(always)]
+	pub fn run_with_file(&mut self, name: &str, args: &str, cwd: &str, file: &str, writable: &bool, stdout: &u64) -> Option<Result<StartResult, Error>> {
+		unsafe { permission_run_with_file(self.chan, name, args, cwd, file, writable, stdout) }
 	}
 }

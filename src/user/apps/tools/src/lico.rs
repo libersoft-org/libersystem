@@ -16,10 +16,11 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use lico::{Action, Bookmarks, Chord, CommandBar, Criteria, EntryKey, Focus, Frontier, History, InputDecoder, InputEvent, Key, MouseTracking, Operation, Overwrite, ParseError, PlanError, Request, Results, Settings, SortKey, SortSpec, Source, Tags, TerminalGuard, TerminalOptions, TerminalWriter, classify, detect_file_type, join, order, plan, quick_search, resolve};
-use proto::system::{Error, FileInfo, FileType, LaunchContext, WriterMode};
+use lico::{Action, Bookmarks, Chord, CommandBar, CriteriaError, EntryKey, Focus, Frontier, History, InputDecoder, InputEvent, Key, MouseTracking, Operation, Overwrite, ParseError, Plan, PlanError, Request, Results, Settings, SortKey, SortSpec, Source, Step, Tags, TerminalGuard, TerminalOptions, TerminalWriter, classify, deepest_first, detect_file_type, expand, join, order, parse_criteria, plan, quick_search, resolve};
+use proto::system::{EnvVar, Error, FileInfo, FileType, LaunchContext, WriterMode};
 use rt::*;
 use security_client::PermissionClient;
+use session_client::SessionClient;
 use storage_proto::path;
 use tools::{ConsoleWriter, ListDirectoryError, VolumeSet, list_volume_directory, read_volume_window};
 use volume_client::VolumeClient;
@@ -31,6 +32,13 @@ const MAX_PANEL_ENTRIES: usize = 4_096;
 // The window one copy reads at a time. The transactional writer stages what it is given, so this
 // bounds what the manager holds rather than what the destination can take.
 const COPY_CHUNK: u32 = 8192;
+// The window a content search reads at a time. Windows OVERLAP by the pattern's length minus one,
+// so a match straddling a boundary is still found.
+const CONTENT_CHUNK: u32 = 8192;
+// How many steps of a running operation are advanced per turn of the input loop. A few rather than
+// one, because an entry can be a rename - which is fast - and redrawing after every one of those
+// spends more time on the screen than on the work.
+const STEPS_PER_TURN: usize = 4;
 const SETTINGS_PATH: &str = "vol://system/bin/lico/settings.conf";
 
 // What a panel is showing. Four views over the same directory rather than four programs, and the
@@ -68,13 +76,24 @@ struct Panel {
 	// Set when the panel is showing search results rather than a directory, so an operation acts on
 	// each result's own URI rather than on a name joined to the panel's path.
 	results: Option<Results>,
+	// How deep below the panel's own directory each visible row sits. Empty in list mode; in tree
+	// mode it is what indents a row, and it is a PARALLEL ARRAY to `view` rather than a field on the
+	// entry because the entries are the volume's answer and the depth is this panel's arrangement.
+	depths: Vec<usize>,
+	// Whether the listing shows the long columns. A per-panel choice, because the narrow panel is
+	// usually the one being read and the wide one the one being worked in.
+	long_columns: bool,
+	// What the volume said about its own space, when it was asked. `None` when it would not say,
+	// which is a volume that cannot answer rather than one with no room - and the difference is
+	// worth showing.
+	free_bytes: Option<u64>,
 	// The first screenful of the previewed file, for the quick view.
 	preview: Vec<u8>,
 }
 
 impl Panel {
 	fn new(path: String) -> Panel {
-		Panel { path, entries: Vec::new(), view: Vec::new(), selected: 0, sort: SortSpec::default(), filter: Vec::new(), history: History::new(), tags: Tags::new(), mode: PanelMode::List, results: None, preview: Vec::new() }
+		Panel { path, entries: Vec::new(), view: Vec::new(), selected: 0, sort: SortSpec::default(), filter: Vec::new(), history: History::new(), tags: Tags::new(), mode: PanelMode::List, results: None, depths: Vec::new(), long_columns: false, free_bytes: None, preview: Vec::new() }
 	}
 
 	fn key_of(entry: &FileInfo) -> EntryKey<'_> {
@@ -116,6 +135,10 @@ impl Panel {
 		let entries = &self.entries;
 		let spec = self.sort;
 		self.view.sort_by(|left, right| order(spec, &Panel::key_of(&entries[*left]), &Panel::key_of(&entries[*right])));
+		// A REBUILD IS A LIST. Tree mode re-walks after it, because the arrangement the depths
+		// describe is one this rebuild has just thrown away - and leaving stale depths behind would
+		// indent rows by an arrangement that no longer exists.
+		self.depths.clear();
 		// THE CURSOR FOLLOWS THE ENTRY, not the position. Re-sorting a listing and leaving the
 		// cursor on row four selects whatever moved there, which is how a reader deletes the wrong
 		// file after changing the sort order.
@@ -256,8 +279,65 @@ enum Prompt {
 	Select,
 	Unselect,
 	Search,
+	SearchContent,
 	QuickSearch,
 	Filter,
+}
+
+// THE MENU IS THE SAME ACTIONS THE F-KEYS ARE, named once. Two tables would drift, and the way a
+// menu drifts from its keys is that one of them quietly stops doing what its label says.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MenuItem {
+	View,
+	Edit,
+	Copy,
+	Move,
+	MakeDirectory,
+	Delete,
+	Find,
+	Sort,
+	Hidden,
+	Mode,
+	Columns,
+	SaveSettings,
+	Quit,
+}
+
+const MENU: &[(MenuItem, &[u8])] = &[
+	(MenuItem::View, b"View          F3"),
+	(MenuItem::Edit, b"Edit          F4"),
+	(MenuItem::Copy, b"Copy          F5"),
+	(MenuItem::Move, b"Move          F6"),
+	(MenuItem::MakeDirectory, b"Make directory F7"),
+	(MenuItem::Delete, b"Delete        F8"),
+	(MenuItem::Find, b"Find files    M-F3"),
+	(MenuItem::Sort, b"Sort order    M-s"),
+	(MenuItem::Hidden, b"Hidden files  M-h"),
+	(MenuItem::Mode, b"Panel mode    M-v"),
+	(MenuItem::Columns, b"Long columns  M-c"),
+	(MenuItem::SaveSettings, b"Save settings M-w"),
+	(MenuItem::Quit, b"Quit          F10"),
+];
+
+// AN OPERATION IN PROGRESS. It is not a thread and does not pretend to be one: the manager advances
+// it a few steps per turn of its own input loop, so the panels stay navigable, the progress is
+// visible, and pause, resume and cancel are decisions the reader makes WHILE it runs rather than
+// afterwards. A worker process would be the other shape, and it would need process authority this
+// program is deliberately not given.
+struct Job {
+	plan: Plan,
+	at: usize,
+	done: usize,
+	refused: usize,
+	bytes: u64,
+	paused: bool,
+	operation: Operation,
+}
+
+impl Job {
+	fn finished(&self) -> bool {
+		self.at >= self.plan.steps.len()
+	}
 }
 
 struct Manager {
@@ -266,11 +346,25 @@ struct Manager {
 	bookmarks: Bookmarks,
 	bar: CommandBar,
 	prompt: Prompt,
+	// The name half of a search, held while the content half is being typed.
+	pending_search: Vec<u8>,
+	// The operation running now, if any.
+	job: Option<Job>,
+	// Which menu row is highlighted, or None when the menu is closed. A mode like the prompt, for
+	// the same reason: one input loop and one set of exit paths.
+	menu: Option<usize>,
 	entry: Vec<u8>,
 	status: Vec<u8>,
 	settings: Settings,
 	permission: u64,
 	assets: u64,
+	// The session, for registering a backgrounded command as a job. Held rather than reached for,
+	// and used for exactly one op: a command started with `&` has to become a job the session knows
+	// about, or `jobs` and `fg` cannot see it and nothing ever reaps it.
+	session: u64,
+	// The environment this manager was launched with, forwarded to what it launches. A child reads
+	// what it inherited and cannot change what its parent or its session will see.
+	environment: Vec<EnvVar>,
 }
 
 #[unsafe(no_mangle)]
@@ -291,6 +385,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let permission: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, b"PERMISSION").unwrap_or(0);
 		// This application's own asset directory, where the settings live beside the descriptors.
 		let assets: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_APP_ASSETS).unwrap_or(0);
+		let session: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_SESSION).unwrap_or(0);
+		let environment: Vec<EnvVar> = context.environment.clone();
 		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("vol://system");
 		let argument = trim(&argument);
@@ -321,7 +417,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// terminal to ask, and the program runs cooked rather than failing.
 			let owns_tty: bool = tty_set_mode(true, false);
 			if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
-				let _ = manage(terminal.writer(), &volumes, initial, permission, assets);
+				let _ = manage(terminal.writer(), &volumes, initial, permission, assets, session, environment);
 			}
 			// And back to cooked input and echo, through the same request path.
 			if owns_tty {
@@ -332,14 +428,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial: String, permission: u64, assets: u64) -> bool {
+#[allow(clippy::too_many_arguments)]
+unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial: String, permission: u64, assets: u64, session: u64, environment: Vec<EnvVar>) -> bool {
 	unsafe {
 		// SETTINGS ARE READ BEFORE THE FIRST LISTING, so the panels come up ordered the way they
 		// were left. A file that will not read, will not parse or names a version this build does
 		// not know yields DEFAULTS - which is exactly what no file at all yields, and is why a
 		// corrupt settings file can never stop the manager starting.
 		let settings = load_settings(assets);
-		let mut manager = Manager { panels: [Panel::new(initial.clone()), Panel::new(initial)], focus: Focus::new(2), bookmarks: Bookmarks::new(), bar: CommandBar::new(), prompt: Prompt::None, entry: Vec::new(), status: Vec::new(), settings, permission, assets };
+		let mut manager = Manager { panels: [Panel::new(initial.clone()), Panel::new(initial)], focus: Focus::new(2), bookmarks: Bookmarks::new(), bar: CommandBar::new(), prompt: Prompt::None, pending_search: Vec::new(), job: None, menu: None, entry: Vec::new(), status: Vec::new(), settings, permission, assets, session, environment };
 		for panel in &mut manager.panels {
 			panel.sort = SortSpec { key: settings.sort_key, reverse: settings.reverse, directories_first: settings.directories_first, show_hidden: settings.show_hidden };
 		}
@@ -348,6 +445,7 @@ unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial:
 			if let Err(error) = manager.panels[index].refresh(volumes) {
 				manager.say(list_error(error));
 			}
+			manager.refresh_free_space(index, volumes);
 		}
 		let input = stdin();
 		let mut decoder = InputDecoder::new();
@@ -360,10 +458,29 @@ unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial:
 				redraw = false;
 			}
 			if interrupted() {
+				// AN INTERRUPT CANCELS THE JOB rather than the program, when one is running. What a
+				// reader means by Ctrl+C over a running copy is "stop the copy", and leaving the
+				// manager is what F10 is for.
+				if manager.job.is_some() {
+					manager.cancel_job(volumes);
+					redraw = true;
+					continue;
+				}
 				return true;
 			}
-			let ready = wait_any(&[input], 0);
-			if interrupted() || ready < 0 {
+			// A RUNNING JOB MUST NOT BLOCK THE LOOP. With one in progress the wait is a short
+			// deadline rather than "until a key arrives", which is what keeps the panels navigable
+			// while a copy runs - and with none it blocks, so an idle manager costs nothing.
+			let ready = if manager.job.is_some() { wait_any(&[input], clock_ns().saturating_add(2_000_000)) } else { wait_any(&[input], 0) };
+			if interrupted() {
+				if manager.job.is_some() {
+					manager.cancel_job(volumes);
+					redraw = true;
+					continue;
+				}
+				return true;
+			}
+			if ready < 0 && manager.job.is_none() {
 				return true;
 			}
 			let mut bytes = [0u8; 64];
@@ -382,6 +499,9 @@ unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial:
 					Polled::Empty => break,
 					Polled::Closed => return true,
 				}
+			}
+			if manager.advance_job(volumes) {
+				redraw = true;
 			}
 		}
 	}
@@ -406,6 +526,9 @@ impl Manager {
 	fn apply(&mut self, event: InputEvent, volumes: &VolumeSet, output: &mut impl TerminalWriter) -> ManagerAction {
 		if self.prompt != Prompt::None {
 			return self.apply_prompt(event, volumes);
+		}
+		if self.menu.is_some() {
+			return self.apply_menu(event, volumes, output);
 		}
 		let active = self.active();
 		match event {
@@ -438,7 +561,8 @@ impl Manager {
 			InputEvent::Key(Key::Function(7)) => self.open_prompt(Prompt::MakeDirectory, b"new directory: "),
 			InputEvent::Key(Key::Function(8)) => self.confirm_delete(),
 			InputEvent::Key(Key::Function(9)) => {
-				self.say(b"menu: F3 view  F4 edit  F5 copy  F6 move  F7 mkdir  F8 delete  M-F3 search  F10 exit");
+				self.menu = Some(0);
+				self.say(b"arrows choose, Enter invokes, Esc closes");
 				ManagerAction::Redraw
 			}
 			InputEvent::Key(Key::Insert) => {
@@ -452,6 +576,17 @@ impl Manager {
 			InputEvent::Key(Key::Byte(b'*')) if self.bar.is_empty() => {
 				let count = self.panels[active].rows();
 				self.panels[active].tags.invert(count);
+				ManagerAction::Redraw
+			}
+			InputEvent::Key(Key::Control(0x10)) => {
+				match self.job.as_mut() {
+					Some(job) => {
+						job.paused = !job.paused;
+						let paused = job.paused;
+						self.say(if paused { b"paused - ^P resumes, ^C cancels" } else { b"resumed" });
+					}
+					None => self.say(b"nothing is running"),
+				}
 				ManagerAction::Redraw
 			}
 			InputEvent::Key(Key::Control(0x13)) => self.open_prompt(Prompt::QuickSearch, b"go to name: "),
@@ -495,11 +630,17 @@ impl Manager {
 			}
 			InputEvent::Chord(Chord { key: Key::Byte(b'v'), alt: true, .. }) => {
 				self.panels[active].cycle_mode();
+				self.panels[active].rebuild();
+				self.build_tree(active, volumes);
 				self.refresh_preview(volumes);
 				ManagerAction::Redraw
 			}
+			InputEvent::Chord(Chord { key: Key::Byte(b'c'), alt: true, .. }) => {
+				self.panels[active].long_columns = !self.panels[active].long_columns;
+				ManagerAction::Redraw
+			}
 			InputEvent::Chord(Chord { key: Key::Byte(b'f'), alt: true, .. }) => self.open_prompt(Prompt::Filter, b"filter: "),
-			InputEvent::Chord(Chord { key: Key::Function(3), alt: true, .. }) => self.open_prompt(Prompt::Search, b"find files matching: "),
+			InputEvent::Chord(Chord { key: Key::Function(3), alt: true, .. }) => self.open_prompt(Prompt::Search, b"find files matching (glob, then -d N -f -D -s N -S N): "),
 			InputEvent::Chord(Chord { key: Key::Byte(b'b'), alt: true, .. }) => {
 				let path = self.panels[active].path.clone();
 				let added = self.bookmarks.add(path.as_bytes());
@@ -542,6 +683,77 @@ impl Manager {
 			}
 			InputEvent::Pointer(pointer) if pointer.pressed => self.pointer(pointer.column, pointer.row, volumes),
 			_ => ManagerAction::None,
+		}
+	}
+
+	// The menu, driven by the same events everything else is.
+	fn apply_menu(&mut self, event: InputEvent, volumes: &VolumeSet, output: &mut impl TerminalWriter) -> ManagerAction {
+		let Some(at) = self.menu else { return ManagerAction::None };
+		match event {
+			InputEvent::Key(Key::Escape) | InputEvent::Key(Key::Function(9)) => {
+				self.menu = None;
+				self.say(b"");
+				ManagerAction::Redraw
+			}
+			InputEvent::Key(Key::ArrowUp) => {
+				self.menu = Some(if at == 0 { MENU.len() - 1 } else { at - 1 });
+				ManagerAction::Redraw
+			}
+			InputEvent::Key(Key::ArrowDown) => {
+				self.menu = Some((at + 1) % MENU.len());
+				ManagerAction::Redraw
+			}
+			// A CLICK ON A ROW CHOOSES IT AND INVOKES IT, which is what "the same actions through
+			// pointer input" means - a pointer that could only highlight would be a slower keyboard.
+			InputEvent::Pointer(pointer) if pointer.pressed => {
+				let row = pointer.row.saturating_sub(3) as usize;
+				if row < MENU.len() {
+					self.menu = Some(row);
+					return self.invoke_menu(volumes, output);
+				}
+				ManagerAction::Redraw
+			}
+			InputEvent::Key(Key::Enter) => self.invoke_menu(volumes, output),
+			_ => ManagerAction::None,
+		}
+	}
+
+	// Invoke the highlighted row. EVERY ARM CALLS THE SAME METHOD ITS F-KEY DOES, so the menu
+	// cannot come to mean something different from the key beside it in the label.
+	fn invoke_menu(&mut self, volumes: &VolumeSet, output: &mut impl TerminalWriter) -> ManagerAction {
+		let Some(at) = self.menu.take() else { return ManagerAction::None };
+		let active = self.active();
+		match MENU[at].0 {
+			MenuItem::View => self.open_selected(Action::View, volumes, output),
+			MenuItem::Edit => self.open_selected(Action::Edit, volumes, output),
+			MenuItem::Copy => self.open_prompt(Prompt::CopyTo, b"copy to: "),
+			MenuItem::Move => self.open_prompt(Prompt::MoveTo, b"move to: "),
+			MenuItem::MakeDirectory => self.open_prompt(Prompt::MakeDirectory, b"new directory: "),
+			MenuItem::Delete => self.confirm_delete(),
+			MenuItem::Find => self.open_prompt(Prompt::Search, b"find files matching (glob, then -d N -f -D -s N -S N): "),
+			MenuItem::Sort => {
+				self.panels[active].cycle_sort();
+				ManagerAction::Redraw
+			}
+			MenuItem::Hidden => {
+				self.panels[active].sort.show_hidden = !self.panels[active].sort.show_hidden;
+				self.panels[active].rebuild();
+				self.build_tree(active, volumes);
+				ManagerAction::Redraw
+			}
+			MenuItem::Mode => {
+				self.panels[active].cycle_mode();
+				self.panels[active].rebuild();
+				self.build_tree(active, volumes);
+				self.refresh_preview(volumes);
+				ManagerAction::Redraw
+			}
+			MenuItem::Columns => {
+				self.panels[active].long_columns = !self.panels[active].long_columns;
+				ManagerAction::Redraw
+			}
+			MenuItem::SaveSettings => self.save_settings(),
+			MenuItem::Quit => ManagerAction::Exit,
 		}
 	}
 
@@ -652,7 +864,17 @@ impl Manager {
 				self.refresh_preview(volumes);
 				ManagerAction::Redraw
 			}
-			Prompt::Search => self.search(volumes, &entry),
+			Prompt::Search => {
+				// THE NAME FILTERS FIRST, THEN THE TEXT. Two prompts rather than one line with both
+				// in it, because a content pattern is free text and would need quoting to sit
+				// beside flags - and a search line that needs quoting is one people get wrong.
+				self.pending_search = entry;
+				self.open_prompt(Prompt::SearchContent, b"and containing (blank for any): ")
+			}
+			Prompt::SearchContent => {
+				let line = core::mem::take(&mut self.pending_search);
+				self.search(volumes, &line, &entry)
+			}
 			Prompt::None => ManagerAction::Redraw,
 		}
 	}
@@ -717,6 +939,12 @@ impl Manager {
 	// touch a volume. The plan refuses a copy into a subtree of its own source, a move onto itself
 	// and an empty selection - each with its own sentence, before any byte is read.
 	fn run_operation(&mut self, volumes: &VolumeSet, operation: Operation, destination: &[u8]) -> ManagerAction {
+		// ONE AT A TIME. Two operations over the same tree would race each other, and a queue is a
+		// promise this cannot keep while the reader can still tag and retarget between them.
+		if self.job.is_some() {
+			self.say(b"an operation is already running - ^C cancels it first");
+			return ManagerAction::Redraw;
+		}
 		let active = self.active();
 		let rows = self.panels[active].operands();
 		if rows.is_empty() {
@@ -761,40 +989,215 @@ impl Manager {
 				return ManagerAction::Redraw;
 			}
 		};
-		let mut done = 0usize;
-		let mut refused = 0usize;
-		for step in &planned.steps {
-			// CANCELLATION IS CHECKED BETWEEN ENTRIES, so an interrupt stops the operation at an
-			// entry boundary: what has been done is complete, and what has not been started is
-			// untouched.
-			if unsafe { interrupted() } {
+		// THE TREE IS WALKED BEFORE ANYTHING IS TOUCHED, so a recursive operation knows its whole
+		// extent - and its refusals - while the volumes are still untouched. Directories come out
+		// before their contents, which is the order a copy needs; a delete is reversed afterwards,
+		// because removing a directory before its contents is a removal that fails.
+		let mut planned = planned;
+		if !self.walk_into_directories(volumes, &mut planned) {
+			self.say(b"that tree is larger than one operation will carry - nothing was changed");
+			return ManagerAction::Redraw;
+		}
+		if operation == Operation::Delete {
+			deepest_first(&mut planned);
+		}
+		// STARTED, NOT RUN. The steps are advanced a few at a time by the input loop, so the panels
+		// stay navigable and pause, resume and cancel are decisions the reader makes while it runs.
+		self.job = Some(Job { plan: planned, at: 0, done: 0, refused: 0, bytes: 0, paused: false, operation });
+		self.say(b"^P pauses, ^C cancels - what is done stays done and what is not started is untouched");
+		ManagerAction::Redraw
+	}
+
+	// Advance the running job by a few steps. True when anything changed, so the caller redraws.
+	//
+	// A FEW AT A TIME rather than one: an entry can be a rename, which is fast, and redrawing after
+	// every one of those would spend more time on the screen than on the work.
+	fn advance_job(&mut self, volumes: &VolumeSet) -> bool {
+		let Some(job) = self.job.as_mut() else { return false };
+		if job.paused {
+			return false;
+		}
+		if job.finished() {
+			let (done, refused) = (job.done, job.refused);
+			self.job = None;
+			let mut message: Vec<u8> = Vec::new();
+			if message.try_reserve(112).is_ok() {
+				append_decimal(&mut message, done);
+				message.extend_from_slice(b" done, ");
+				append_decimal(&mut message, refused);
+				message.extend_from_slice(b" refused - a refusal leaves the source and any existing destination as they were");
+				self.status = message;
+			}
+			for index in 0..2 {
+				let _ = self.panels[index].refresh(volumes);
+			}
+			return true;
+		}
+		let operation = job.operation;
+		for _ in 0..STEPS_PER_TURN {
+			let Some(job) = self.job.as_mut() else { return true };
+			if job.finished() {
 				break;
 			}
+			let step = &job.plan.steps[job.at];
+			let (source, destination, is_dir, size) = (step.source.clone(), step.destination.clone(), step.is_dir, step.size);
 			let ok = unsafe {
 				match operation {
-					Operation::Delete => remove_entry(volumes, &step.source, step.is_dir),
-					Operation::Copy => copy_entry(volumes, &step.source, &step.destination, step.is_dir),
-					Operation::Move => move_entry(volumes, &step.source, &step.destination, step.is_dir),
+					Operation::Delete => remove_entry(volumes, &source, is_dir),
+					Operation::Copy => copy_entry(volumes, &source, &destination, is_dir),
+					Operation::Move => move_entry(volumes, &source, &destination, is_dir),
 				}
 			};
+			let Some(job) = self.job.as_mut() else { return true };
 			if ok {
-				done += 1;
+				job.done += 1;
+				job.bytes = job.bytes.saturating_add(size);
 			} else {
-				refused += 1;
+				job.refused += 1;
 			}
+			job.at += 1;
 		}
+		true
+	}
+
+	// Stop the job where it is. WHAT IS DONE STAYS DONE and what was not started is untouched -
+	// there is no half-finished entry, because cancellation lands between steps and every step
+	// publishes or does not.
+	fn cancel_job(&mut self, volumes: &VolumeSet) {
+		let Some(job) = self.job.take() else { return };
 		let mut message: Vec<u8> = Vec::new();
 		if message.try_reserve(112).is_ok() {
-			append_decimal(&mut message, done);
-			message.extend_from_slice(b" done, ");
-			append_decimal(&mut message, refused);
-			message.extend_from_slice(b" refused - a refusal leaves the source and any existing destination as they were");
+			message.extend_from_slice(b"cancelled after ");
+			append_decimal(&mut message, job.done);
+			message.extend_from_slice(b" of ");
+			append_decimal(&mut message, job.plan.steps.len());
+			message.extend_from_slice(b" - what was done is complete and what was not started is untouched");
 			self.status = message;
 		}
 		for index in 0..2 {
 			let _ = self.panels[index].refresh(volumes);
 		}
-		ManagerAction::Redraw
+	}
+
+	// Expand every directory in the plan into its contents, breadth first, until nothing is left to
+	// open. False when the tree is past a bound - and then NOTHING is done, because a plan that
+	// covered part of a tree would report success over work it did not do.
+	fn walk_into_directories(&mut self, volumes: &VolumeSet, planned: &mut Plan) -> bool {
+		let mut at = 0;
+		let mut depth = 1;
+		while at < planned.steps.len() {
+			if unsafe { interrupted() } {
+				return true;
+			}
+			if !planned.steps[at].is_dir {
+				at += 1;
+				continue;
+			}
+			let parent = Step { source: planned.steps[at].source.clone(), destination: planned.steps[at].destination.clone(), is_dir: true, size: 0 };
+			let Ok(uri) = core::str::from_utf8(&parent.source) else {
+				at += 1;
+				continue;
+			};
+			let storage = volumes.client_for(uri, uri.as_bytes());
+			let Ok(entries) = (unsafe { list_volume_directory(storage, uri, MAX_PANEL_ENTRIES) }) else {
+				at += 1;
+				continue;
+			};
+			let mut children: Vec<Vec<u8>> = Vec::new();
+			let mut names: Vec<Vec<u8>> = Vec::new();
+			let mut shapes: Vec<(bool, u64)> = Vec::new();
+			for entry in &entries {
+				let Some(child) = join(&parent.source, entry.name.as_bytes()) else { continue };
+				let mut name: Vec<u8> = Vec::new();
+				if name.try_reserve_exact(entry.name.len()).is_err() || children.try_reserve(1).is_err() || names.try_reserve(1).is_err() || shapes.try_reserve(1).is_err() {
+					return false;
+				}
+				name.extend_from_slice(entry.name.as_bytes());
+				children.push(child);
+				names.push(name);
+				shapes.push((entry.r#type == FileType::Dir, entry.size));
+			}
+			let mut sources: Vec<Source> = Vec::new();
+			if sources.try_reserve_exact(children.len()).is_err() {
+				return false;
+			}
+			for index in 0..children.len() {
+				sources.push(Source { path: &children[index], name: &names[index], is_dir: shapes[index].0, size: shapes[index].1 });
+			}
+			if expand(planned, &parent, &sources, depth).is_err() {
+				return false;
+			}
+			depth += 1;
+			at += 1;
+		}
+		true
+	}
+
+	// Build the tree view for a panel: the directory's own entries, and below each directory the
+	// entries inside it, indented.
+	//
+	// LAZY AND BOUNDED. Only directories the reader has EXPANDED are walked - which for this first
+	// slice is every directory at depth one and no further, so entering tree mode costs one listing
+	// per subdirectory rather than a walk of the whole volume. The frontier is the same explicit,
+	// bounded one the search uses, because a recursive walk over somebody else's tree is a stack
+	// overflow waiting for a deep enough directory.
+	fn build_tree(&mut self, panel: usize, volumes: &VolumeSet) {
+		if self.panels[panel].mode != PanelMode::Tree || self.panels[panel].results.is_some() {
+			return;
+		}
+		let base = self.panels[panel].path.clone();
+		let rows: Vec<usize> = self.panels[panel].view.clone();
+		let mut view: Vec<usize> = Vec::new();
+		let mut depths: Vec<usize> = Vec::new();
+		let mut extra: Vec<FileInfo> = Vec::new();
+		for row in rows {
+			if view.try_reserve(1).is_err() || depths.try_reserve(1).is_err() {
+				return;
+			}
+			view.push(row);
+			depths.push(0);
+			if self.panels[panel].entries[row].r#type != FileType::Dir {
+				continue;
+			}
+			let Some(child_uri) = join(base.as_bytes(), self.panels[panel].entries[row].name.as_bytes()) else { continue };
+			let Ok(child_uri) = core::str::from_utf8(&child_uri) else { continue };
+			let storage = volumes.client_for(child_uri, child_uri.as_bytes());
+			let Ok(children) = (unsafe { list_volume_directory(storage, child_uri, MAX_PANEL_ENTRIES) }) else { continue };
+			for child in children {
+				let key = Panel::key_of(&child);
+				if !self.panels[panel].sort.admits(&key) {
+					continue;
+				}
+				if extra.try_reserve(1).is_err() || view.try_reserve(1).is_err() || depths.try_reserve(1).is_err() {
+					return;
+				}
+				view.push(self.panels[panel].entries.len() + extra.len());
+				depths.push(1);
+				extra.push(child);
+			}
+		}
+		if self.panels[panel].entries.try_reserve(extra.len()).is_err() {
+			return;
+		}
+		for entry in extra {
+			self.panels[panel].entries.push(entry);
+		}
+		self.panels[panel].view = view;
+		self.panels[panel].depths = depths;
+		if self.panels[panel].selected >= self.panels[panel].view.len() {
+			self.panels[panel].selected = self.panels[panel].view.len().saturating_sub(1);
+		}
+	}
+
+	// Ask the volume how much room it has. `None` is a volume that would not say, which is not the
+	// same as one with no room and is shown differently.
+	fn refresh_free_space(&mut self, panel: usize, volumes: &VolumeSet) {
+		let uri = self.panels[panel].path.clone();
+		let storage = volumes.client_for(&uri, uri.as_bytes());
+		self.panels[panel].free_bytes = match VolumeClient::new(storage).status() {
+			Some(Ok(status)) => Some(status.free_bytes),
+			_ => None,
+		};
 	}
 
 	fn make_directory(&mut self, volumes: &VolumeSet, name: &[u8]) -> ManagerAction {
@@ -821,13 +1224,25 @@ impl Manager {
 	// A recursive search from the active panel's directory, into a bounded result set that becomes
 	// a temporary panel. Each result keeps its own URI, so viewing, editing, copying or deleting one
 	// acts on the file it came from through the capability that reached it.
-	fn search(&mut self, volumes: &VolumeSet, pattern: &[u8]) -> ManagerAction {
+	fn search(&mut self, volumes: &VolumeSet, line: &[u8], content: &[u8]) -> ManagerAction {
+		let (pattern, mut criteria) = match parse_criteria(line) {
+			Ok(parsed) => parsed,
+			Err(error) => {
+				self.say(criteria_error(error));
+				return ManagerAction::Redraw;
+			}
+		};
 		if pattern.is_empty() {
-			self.say(b"a search needs a pattern");
+			self.say(b"a search needs a pattern - `*.rs -d 3 -f` is a glob and its filters");
 			return ManagerAction::Redraw;
 		}
 		let active = self.active();
-		let criteria = Criteria { name: Some(pattern), ..Criteria::default() };
+		criteria.name = Some(&pattern);
+		// A CONTENT SEARCH ONLY EVER MATCHES FILES, whatever the name filter said: a directory has
+		// no bytes to hold the text, and reporting one would be answering a different question.
+		if !content.is_empty() {
+			criteria.files_only = true;
+		}
 		let mut frontier = Frontier::new();
 		let mut results = Results::new();
 		frontier.push(self.panels[active].path.as_bytes(), 0);
@@ -841,7 +1256,7 @@ impl Manager {
 			for entry in &entries {
 				let key = Panel::key_of(entry);
 				let Some(child) = join(&directory, entry.name.as_bytes()) else { continue };
-				if criteria.admits(&key, depth + 1) {
+				if criteria.admits(&key, depth + 1) && (content.is_empty() || unsafe { file_contains(volumes, &child, content) }) {
 					results.push(&child);
 				}
 				// A DIRECTORY WHOSE NAME DOES NOT MATCH IS STILL WALKED INTO: the files somebody is
@@ -894,7 +1309,37 @@ impl Manager {
 		let kind = detect_file_type(last_component(&uri).as_bytes(), &head, false);
 		let association = resolve(lico::DEFAULT_ASSOCIATIONS, kind);
 		let program = if wanted == Action::View && association.action == Action::Edit { "licoview" } else { association.program };
-		self.launch(output, program, &uri, true)
+		// ONLY AN EDIT ASKS FOR A WRITE-BACK. A viewer is opened over a grant that StorageService
+		// will refuse a writer on, so "the viewer remains read-only" is enforced a service away
+		// rather than being a property of the viewer's own good behaviour.
+		let writable = association.action == Action::Edit && wanted == Action::Edit;
+		self.launch_over_file(output, program, &uri, writable)
+	}
+
+	// Launch a program over ONE file, with an attenuated grant instead of a volume bundle.
+	//
+	// The broker mints the grant; this names the file and whether it may be written. The target
+	// gets neither this panel's volumes nor permission to reopen a sibling path, which is the whole
+	// reason the op exists - handing over a URI and a five-volume bundle would give a viewer every
+	// file on every mounted volume in order to show one.
+	fn launch_over_file(&mut self, output: &mut impl TerminalWriter, program: &str, uri: &str, writable: bool) -> ManagerAction {
+		if self.permission == 0 {
+			self.say(b"this boot granted no launch broker, so nothing can be opened from here");
+			return ManagerAction::Redraw;
+		}
+		let Some((read_end, write_end)) = (unsafe { channel() }) else {
+			self.say(b"could not make an output channel");
+			return ManagerAction::Redraw;
+		};
+		let cwd = self.panels[self.active()].path.clone();
+		let mut client = PermissionClient::new(self.permission);
+		let started = matches!(client.run_with_file(program, "", &cwd, uri, &writable, &write_end), Some(Ok(_)));
+		if !started {
+			unsafe { close(read_end) };
+			self.say(b"the broker refused to open that file with that program");
+			return ManagerAction::Redraw;
+		}
+		self.hand_over_terminal(output, read_end)
 	}
 
 	// Run what is in the command bar.
@@ -955,23 +1400,42 @@ impl Manager {
 		};
 		let cwd = self.panels[self.active()].path.clone();
 		let mut client = PermissionClient::new(self.permission);
-		let started = matches!(client.run(program, args, &cwd, &Vec::new(), &write_end), Some(Ok(_)));
-		if !started {
-			unsafe { close(read_end) };
-			self.say(b"the broker refused that program - it may not be a governed executable");
-			return ManagerAction::Redraw;
-		}
+		// THE ENVIRONMENT IS FORWARDED, not invented. What this manager inherited is what it hands
+		// on, so a command run from the bar sees the same variables one typed at the shell would -
+		// and the child holds the values with no capability to the session, so it can read what it
+		// inherited and cannot change what its parent will see.
+		let started = match client.run(program, args, &cwd, &self.environment, &write_end) {
+			Some(Ok(started)) => started,
+			_ => {
+				unsafe { close(read_end) };
+				self.say(b"the broker refused that program - it may not be a governed executable");
+				return ManagerAction::Redraw;
+			}
+		};
 		if !foreground {
-			// A BACKGROUND LAUNCH IS NOT A SESSION JOB HERE, and saying so is the honest answer:
-			// registering one needs a SessionService capability this program is deliberately not
-			// given, and claiming a job that no session knows about would be worse than the gap.
+			// A BACKGROUND COMMAND BECOMES A SESSION JOB, so `jobs` and `fg` can see it and
+			// something eventually reaps it. Without that it would be a process nobody is tracking,
+			// which is the thing an `&` must not quietly produce.
 			unsafe { close(read_end) };
-			self.say(b"started in the background; it is not a session job, because registering one needs session authority this program does not hold");
+			if self.session == 0 {
+				self.say(b"started, but this boot granted no session - it is not a job anything is tracking");
+				return ManagerAction::Redraw;
+			}
+			let registered = SessionClient::new(self.session).job_register(program, false, false, started.task);
+			self.say(match registered {
+				Some(Ok(_)) => b"started as a session job",
+				_ => b"started, but the session would not register it as a job",
+			});
 			return ManagerAction::Redraw;
 		}
-		// THE FOREGROUND COMMAND OWNS THE SCREEN AND GIVES IT BACK. The panels are left through the
-		// alternate screen so what the command writes lands on the ordinary terminal, and the exact
-		// panel screen is redrawn on return.
+		self.hand_over_terminal(output, read_end)
+	}
+
+	// THE FOREGROUND COMMAND OWNS THE SCREEN AND GIVES IT BACK. The panels are left through the
+	// alternate screen so what the command writes lands on the ordinary terminal, and the exact
+	// panel screen is redrawn on return. One implementation, because a command started from the
+	// bar and a file opened by association are the same thing to the terminal.
+	fn hand_over_terminal(&mut self, output: &mut impl TerminalWriter, read_end: u64) -> ManagerAction {
 		output.write(b"\x1b[?1049l");
 		let mut buffer = [0u8; 512];
 		loop {
@@ -1001,6 +1465,8 @@ impl Manager {
 		match self.panels[active].refresh(volumes) {
 			Ok(()) => {
 				self.panels[active].selected = 0;
+				self.build_tree(active, volumes);
+				self.refresh_free_space(active, volumes);
 				self.refresh_preview(volumes);
 				ManagerAction::Redraw
 			}
@@ -1102,6 +1568,15 @@ impl Manager {
 	}
 
 	fn pointer(&mut self, column: u16, row: u16, volumes: &VolumeSet) -> ManagerAction {
+		// THE F-KEY ROW IS CLICKABLE. It is drawn as labels with their keys on it, and a label that
+		// looks like a button and is not is the thing a pointer user tries first.
+		if row as usize == PANEL_ROWS + 4 {
+			let slot = (column as usize) / 9;
+			let key = [1u8, 3, 4, 5, 6, 7, 8, 9, 10];
+			if let Some(function) = key.get(slot) {
+				return self.apply(InputEvent::Key(Key::Function(*function)), volumes, &mut NullWriter);
+			}
+		}
 		let panel = usize::from(column > PANEL_WIDTH as u16 + 2);
 		self.focus.select(panel as u16);
 		let row = row.saturating_sub(3) as usize;
@@ -1113,6 +1588,18 @@ impl Manager {
 		}
 		self.refresh_preview(volumes);
 		ManagerAction::Redraw
+	}
+}
+
+// A writer that goes nowhere, for the pointer path: clicking `F3` chooses the action, and the
+// action that needs the terminal takes it from the caller a moment later. Handing the click the
+// real writer would mean a pointer press could enter and leave the alternate screen inside an
+// event handler, which is a screen state nothing else in the loop expects.
+struct NullWriter;
+
+impl TerminalWriter for NullWriter {
+	fn write(&mut self, _bytes: &[u8]) -> bool {
+		true
 	}
 }
 
@@ -1173,9 +1660,9 @@ unsafe fn peek(volumes: &VolumeSet, uri: &str, limit: u32) -> Vec<u8> {
 	unsafe { read_volume_window(storage, uri, 0, limit) }.unwrap_or_default()
 }
 
-// Copy one entry through the transactional writer. A directory becomes a directory: the recursive
-// copy of its contents belongs to the background-jobs item, and a "copy" that silently made an
-// empty directory without saying so would be worse than one that says what it did.
+// Copy one entry through the transactional writer. A directory becomes a directory and its
+// contents are separate steps of the same plan - the walk expanded them before anything was
+// touched, so this never has to decide what is inside one.
 unsafe fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> bool {
 	let (Ok(source), Ok(destination)) = (core::str::from_utf8(source), core::str::from_utf8(destination)) else {
 		return false;
@@ -1275,6 +1762,54 @@ unsafe fn load_settings(assets: u64) -> Settings {
 	}
 }
 
+// Whether a file holds `needle`, read in bounded windows that OVERLAP by the needle's length minus
+// one - so a match straddling a window boundary is still found, which is the whole difficulty of
+// searching a file you are not holding.
+unsafe fn file_contains(volumes: &VolumeSet, uri: &[u8], needle: &[u8]) -> bool {
+	let Ok(uri) = core::str::from_utf8(uri) else { return false };
+	if needle.is_empty() || needle.len() > CONTENT_CHUNK as usize {
+		return false;
+	}
+	let storage = volumes.client_for(uri, uri.as_bytes());
+	let overlap = needle.len() - 1;
+	let mut offset: u64 = 0;
+	let mut carry: Vec<u8> = Vec::new();
+	loop {
+		if unsafe { interrupted() } {
+			return false;
+		}
+		let Ok(window) = (unsafe { read_volume_window(storage, uri, offset, CONTENT_CHUNK) }) else { return false };
+		if window.is_empty() {
+			return false;
+		}
+		offset += window.len() as u64;
+		let mut span: Vec<u8> = Vec::new();
+		if span.try_reserve_exact(carry.len() + window.len()).is_err() {
+			return false;
+		}
+		span.extend_from_slice(&carry);
+		span.extend_from_slice(&window);
+		if span.windows(needle.len()).any(|candidate| candidate == needle) {
+			return true;
+		}
+		carry.clear();
+		let tail = span.len().saturating_sub(overlap);
+		if carry.try_reserve_exact(span.len() - tail).is_err() {
+			return false;
+		}
+		carry.extend_from_slice(&span[tail..]);
+	}
+}
+
+fn criteria_error(error: CriteriaError) -> &'static [u8] {
+	match error {
+		CriteriaError::UnknownFlag => b"that line has a flag this search does not know - `-d N -f -D -s N -S N -t N -T N`",
+		CriteriaError::MissingValue => b"that flag takes a number and was not given one",
+		CriteriaError::NotANumber => b"that is not a number",
+		CriteriaError::Contradictory => b"`-f` and `-D` together admit nothing at all",
+	}
+}
+
 fn plan_error(error: PlanError) -> &'static [u8] {
 	match error {
 		PlanError::Empty => b"nothing selected",
@@ -1295,6 +1830,19 @@ fn render(output: &mut impl TerminalWriter, manager: &Manager) -> bool {
 	rendered.extend_from_slice(b" | ");
 	render_panel_header(&mut rendered, &manager.panels[1], manager.focus.active() == Some(1));
 	rendered.push(b'\n');
+	if let Some(at) = manager.menu {
+		for (row, (_, label)) in MENU.iter().enumerate() {
+			rendered.push(if row == at { b'>' } else { b' ' });
+			append_safe(&mut rendered, label, PANEL_WIDTH);
+			rendered.push(b'\n');
+		}
+		for _ in MENU.len()..PANEL_ROWS {
+			rendered.push(b'\n');
+		}
+		rendered.extend_from_slice(b"\nF9/Esc closes the menu\n");
+		append_safe(&mut rendered, &manager.status, PANEL_WIDTH * 2 + 4);
+		return output.write(&rendered);
+	}
 	let starts = [visible_start(&manager.panels[0]), visible_start(&manager.panels[1])];
 	for row in 0..PANEL_ROWS {
 		render_row(&mut rendered, &manager.panels[0], starts[0], row, manager.focus.active() == Some(0));
@@ -1310,6 +1858,32 @@ fn render(output: &mut impl TerminalWriter, manager: &Manager) -> bool {
 	append_safe(&mut rendered, manager.bar.line(), PANEL_WIDTH * 2);
 	rendered.push(b'_');
 	rendered.push(b'\n');
+	// THE PROGRESS IS ON THE SCREEN WHILE IT RUNS, with the entry being worked on: a copy that shows
+	// only a count says nothing about which file it is stuck on.
+	if let Some(job) = manager.job.as_ref() {
+		rendered.extend_from_slice(match job.operation {
+			Operation::Copy => b"copy ",
+			Operation::Move => b"move ",
+			Operation::Delete => b"delete ",
+		});
+		append_decimal(&mut rendered, job.at);
+		rendered.push(b'/');
+		append_decimal(&mut rendered, job.plan.steps.len());
+		rendered.extend_from_slice(b"  ");
+		append_units(&mut rendered, job.bytes);
+		if job.plan.total_bytes > 0 {
+			rendered.push(b'/');
+			append_units(&mut rendered, job.plan.total_bytes);
+			if job.plan.total_is_partial {
+				rendered.push(b'+');
+			}
+		}
+		rendered.extend_from_slice(if job.paused { b"  PAUSED  " } else { b"  " });
+		if let Some(step) = job.plan.steps.get(job.at) {
+			append_safe(&mut rendered, &step.source, PANEL_WIDTH);
+		}
+		rendered.push(b'\n');
+	}
 	append_safe(&mut rendered, &manager.status, PANEL_WIDTH * 2 + 4);
 	if manager.prompt != Prompt::None {
 		append_safe(&mut rendered, &manager.entry, 128);
@@ -1344,6 +1918,14 @@ fn render_panel_header(output: &mut Vec<u8>, panel: &Panel, active: bool) {
 		PanelMode::Info => b'I',
 		PanelMode::Quick => b'Q',
 	});
+	// FREE SPACE, and a volume that would not say is shown as `?` rather than as zero - a volume
+	// that cannot answer and one with no room are different facts and a reader acts differently on
+	// each.
+	output.push(b' ');
+	match panel.free_bytes {
+		Some(free) => append_units(output, free),
+		None => output.push(b'?'),
+	}
 	let used = output.len() - start;
 	if used < PANEL_WIDTH {
 		pad(output, PANEL_WIDTH - used);
@@ -1387,10 +1969,17 @@ fn render_entry(output: &mut Vec<u8>, panel: &Panel, index: usize, active: bool)
 	// A TAG IS VISIBLE WITHOUT COLOUR. An operation acts on the tagged set, so which rows are in it
 	// has to be readable on a terminal that renders no attributes at all.
 	output.push(if panel.tags.contains(index) { b'#' } else { b' ' });
+	// TREE ROWS ARE INDENTED BY THEIR DEPTH, which is what makes a walked subtree readable as one
+	// rather than as a flat list with duplicate names in it.
+	let indent = if panel.mode == PanelMode::Tree { panel.depths.get(index).copied().unwrap_or(0) * 2 } else { 0 };
+	pad(output, indent);
 	if panel.mode == PanelMode::Tree {
-		output.extend_from_slice(if entry.r#type == FileType::Dir { b"+ " } else { b"  " });
+		output.extend_from_slice(if entry.r#type == FileType::Dir { b"+" } else { b" " });
 	}
-	let name_width = PANEL_WIDTH.saturating_sub(if panel.mode == PanelMode::Tree { 16 } else { 14 });
+	// CONCISE SHOWS A SIZE; LONG SHOWS A SIZE AND A TIME. The narrow panel is usually the one being
+	// read and the wide one the one being worked in, so the choice is per panel.
+	let tail = if panel.long_columns { 20 } else { 12 };
+	let name_width = PANEL_WIDTH.saturating_sub(tail + indent + 2);
 	let before = output.len();
 	append_safe(output, entry.name.as_bytes(), name_width);
 	if entry.r#type == FileType::Dir {
@@ -1400,7 +1989,11 @@ fn render_entry(output: &mut Vec<u8>, panel: &Panel, index: usize, active: bool)
 	if written < name_width + 1 {
 		pad(output, name_width + 1 - written);
 	}
-	append_decimal(output, entry.size as usize);
+	append_units(output, entry.size);
+	if panel.long_columns {
+		output.push(b' ');
+		append_decimal(output, entry.mtime as usize);
+	}
 }
 
 // Everything the listing knows about the selected entry, one field per row.
@@ -1505,6 +2098,21 @@ fn pad(output: &mut Vec<u8>, count: usize) {
 	for _ in 0..count {
 		output.push(b' ');
 	}
+}
+
+// A size a person can read at a glance: bytes below a kilobyte, then K, M, G. BINARY units, and
+// the suffix is what says so - a listing that showed decimal kilobytes beside a volume reporting
+// binary ones would disagree with itself by seven per cent.
+fn append_units(output: &mut Vec<u8>, value: u64) {
+	const SUFFIX: [u8; 4] = [b'B', b'K', b'M', b'G'];
+	let mut scaled = value;
+	let mut step = 0;
+	while scaled >= 10_000 && step + 1 < SUFFIX.len() {
+		scaled /= 1024;
+		step += 1;
+	}
+	append_decimal(output, scaled as usize);
+	output.push(SUFFIX[step]);
 }
 
 fn append_decimal(output: &mut Vec<u8>, value: usize) {

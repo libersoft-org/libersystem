@@ -9,4 +9,5 @@ record env-var(name:string,value:string)
 meta record env-var since=1 deprecated=-
 record launch-context(arguments:string,cwd:string,environment:list<env-var>)
 meta record launch-context since=1 deprecated=-
+record selected-file(uri:string,name:string,writable:bool)
 enum error(denied=0,not-found=1,invalid=2,again=3,closed=4)

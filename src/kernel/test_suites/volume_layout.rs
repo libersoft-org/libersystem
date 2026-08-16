@@ -151,6 +151,34 @@ fn directory_scoped_storage_clients_cannot_escape_their_grant() {
 
 	let child = storage.connect_from(&scope);
 	assert!(storage.open_from(&child, hello_uri.as_bytes(), 0xd104).is_none(), "a child minted by a directory scope cannot widen to the volume root");
+
+	// THE SELECTED-FILE GRANT IS NARROWER STILL, and this is what it buys over a directory scope:
+	// a program handed one file to open cannot reopen the file BESIDE it. A directory scope can -
+	// that is what a directory is - so a viewer opened on one file through a directory grant would
+	// hold every file in that directory in order to show one of them.
+	let file = storage.open_file(component_uri.as_bytes(), false);
+	assert!(storage.open_from(&file, component_uri.as_bytes(), 0xd110).is_some(), "the file scope reads the one file it was granted");
+	assert!(storage.open_from(&file, hello_uri.as_bytes(), 0xd111).is_none(), "and cannot read a file outside it");
+	// EQUALITY AND NOT A PREFIX, measured with a pair that EXISTS: a grant over the DIRECTORY's own
+	// path must not reach the file inside it. A prefix test would admit that file - and would admit
+	// `notes.txt.bak` for a grant over `notes.txt` - so the assertion needs a real file whose path
+	// begins with the granted one, rather than an absent sibling that reads as denied either way.
+	let by_prefix = storage.open_file(scope_uri.as_bytes(), false);
+	assert!(storage.open_from(&by_prefix, component_uri.as_bytes(), 0xd112).is_none(), "a file grant over a directory's path does not reach the file inside it");
+
+	// A CHILD OF A FILE SCOPE IS A FILE SCOPE. `connect` carries the caller's scope, so a grant
+	// cannot mint itself a broader one.
+	let narrowed = storage.connect_from(&file);
+	assert!(storage.open_from(&narrowed, hello_uri.as_bytes(), 0xd114).is_none(), "a child minted by a file scope cannot widen either");
+	assert!(storage.open_from(&narrowed, component_uri.as_bytes(), 0xd115).is_some(), "and still reaches the file it was minted from");
+
+	// READ-ONLY MEANS THERE IS NOTHING TO PUBLISH THROUGH, and it is StorageService that says so
+	// rather than the program's own good behaviour: a viewer handed a read-only grant is refused a
+	// transactional writer over the very file it is showing.
+	assert!(!storage.can_open_writer(&file, component_uri.as_bytes(), 0xd116), "a read-only file grant is refused a writer over its own file");
+	let writable = storage.open_file(config_uri.as_bytes(), true);
+	assert!(storage.can_open_writer(&writable, config_uri.as_bytes(), 0xd117), "a writable file grant may publish through");
+	assert!(!storage.can_open_writer(&writable, hello_uri.as_bytes(), 0xd118), "and still only over the file it names");
 }
 
 tagged_test!(existing_system_volume_preserves_owned_state_across_a_restart, [Filesystem, Storage, VolumeLayout, VolumeScope], id = "kernel.volume_layout.existing_system_volume_preserves_owned_state_across_a_restart", covers = ["liberfs", "storage"]);

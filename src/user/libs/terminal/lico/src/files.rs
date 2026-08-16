@@ -304,6 +304,50 @@ pub fn join(directory: &[u8], name: &[u8]) -> Option<Vec<u8>> {
 	Some(out)
 }
 
+/// Expand one directory's listing into the plan, as the entries below `source` going to the
+/// matching place below `destination`.
+///
+/// THE CALLER DOES THE READING. This module touches no volume, so a recursive copy is the caller
+/// walking the tree and handing each listing here - which keeps the part with the traps in it (the
+/// path arithmetic, the depth bound, the ordering) testable without one.
+///
+/// DIRECTORIES COME BEFORE THEIR CONTENTS, because a copy has to make the directory before it can
+/// put anything in it, and a plan whose order does not say so leaves the caller to rediscover it.
+pub fn expand(plan: &mut Plan, parent: &Step, children: &[Source], depth: usize) -> Result<usize, PlanError> {
+	if depth > MAX_OPERATION_DEPTH {
+		return Err(PlanError::TooMany);
+	}
+	if plan.steps.len() + children.len() > MAX_OPERATION_ENTRIES {
+		return Err(PlanError::TooMany);
+	}
+	plan.steps.try_reserve(children.len()).map_err(|_| PlanError::OutOfMemory)?;
+	let mut added = 0;
+	for child in children {
+		let destination = if plan.operation == Operation::Delete { Vec::new() } else { join(&parent.destination, child.name).ok_or(PlanError::OutOfMemory)? };
+		let mut source: Vec<u8> = Vec::new();
+		source.try_reserve_exact(child.path.len()).map_err(|_| PlanError::OutOfMemory)?;
+		source.extend_from_slice(child.path);
+		if child.is_dir {
+			plan.total_is_partial = true;
+		} else {
+			plan.total_bytes = plan.total_bytes.saturating_add(child.size);
+		}
+		plan.steps.push(Step { source, destination, is_dir: child.is_dir, size: child.size });
+		added += 1;
+	}
+	Ok(added)
+}
+
+/// The order a DELETE has to run in: deepest first, so a directory is empty by the time it is
+/// removed. The exact reverse of the order a copy needs, which is why it is a separate pass rather
+/// than something the walk could get right by accident.
+pub fn deepest_first(plan: &mut Plan) {
+	plan.steps.sort_by(|left, right| {
+		let depth = |step: &Step| step.source.iter().filter(|byte| **byte == b'/').count();
+		depth(right).cmp(&depth(left))
+	});
+}
+
 /// Whether an existing destination should be replaced under `policy`.
 ///
 /// `Ask` answers false here and is the caller's business: a planner cannot ask, and answering yes
@@ -373,6 +417,83 @@ impl<'a> Criteria<'a> {
 	pub fn descends(&self, depth: usize) -> bool {
 		depth < self.max_depth.unwrap_or(MAX_OPERATION_DEPTH).min(MAX_OPERATION_DEPTH)
 	}
+}
+
+/// Why a search line could not be read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CriteriaError {
+	/// A flag that names nothing.
+	UnknownFlag,
+	/// A flag that takes a number and was not given one.
+	MissingValue,
+	/// A number that is not one.
+	NotANumber,
+	/// Both `-f` and `-D`, which admits nothing.
+	Contradictory,
+}
+
+/// Read a search line: a glob, then flags.
+///
+/// ONE PROMPT RATHER THAN FIVE. A dialog with a field per filter is a dialog nobody fills in, and
+/// the flags are the ones a person already knows from `find`: `-d N` depth, `-f` files only,
+/// `-D` directories only, `-s N` and `-S N` the size bounds, `-t N` and `-T N` the mtime bounds.
+///
+/// CONTRADICTIONS ARE REFUSED rather than resolved. `-f -D` admits nothing at all, and a search
+/// that ran and found nothing would look exactly like a tree with nothing in it - so it is answered
+/// as the mistake it is.
+pub fn parse_criteria(line: &[u8]) -> Result<(Vec<u8>, Criteria<'static>), CriteriaError> {
+	let mut pattern: Vec<u8> = Vec::new();
+	let mut criteria = Criteria::default();
+	let mut words = line.split(|byte| byte.is_ascii_whitespace()).filter(|word| !word.is_empty());
+	let mut pending: Option<u8> = None;
+	for word in &mut words {
+		if let Some(flag) = pending.take() {
+			let value = parse_number(word)?;
+			match flag {
+				b'd' => criteria.max_depth = Some(value as usize),
+				b's' => criteria.min_size = Some(value),
+				b'S' => criteria.max_size = Some(value),
+				b't' => criteria.min_modified = Some(value),
+				b'T' => criteria.max_modified = Some(value),
+				_ => return Err(CriteriaError::UnknownFlag),
+			}
+			continue;
+		}
+		if word.len() == 2 && word[0] == b'-' {
+			match word[1] {
+				b'f' => criteria.files_only = true,
+				b'D' => criteria.directories_only = true,
+				b'd' | b's' | b'S' | b't' | b'T' => pending = Some(word[1]),
+				_ => return Err(CriteriaError::UnknownFlag),
+			}
+			continue;
+		}
+		if pattern.is_empty() {
+			pattern.try_reserve_exact(word.len()).map_err(|_| CriteriaError::NotANumber)?;
+			pattern.extend_from_slice(word);
+			continue;
+		}
+		return Err(CriteriaError::UnknownFlag);
+	}
+	if pending.is_some() {
+		return Err(CriteriaError::MissingValue);
+	}
+	if criteria.files_only && criteria.directories_only {
+		return Err(CriteriaError::Contradictory);
+	}
+	Ok((pattern, criteria))
+}
+
+fn parse_number(word: &[u8]) -> Result<u64, CriteriaError> {
+	if word.is_empty() {
+		return Err(CriteriaError::NotANumber);
+	}
+	let mut value: u64 = 0;
+	for &byte in word {
+		let digit = byte.checked_sub(b'0').filter(|digit| *digit < 10).ok_or(CriteriaError::NotANumber)?;
+		value = value.checked_mul(10).and_then(|value| value.checked_add(digit as u64)).ok_or(CriteriaError::NotANumber)?;
+	}
+	Ok(value)
 }
 
 /// A bounded result set that becomes a temporary panel.

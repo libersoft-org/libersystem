@@ -17,7 +17,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lico::{Chord, FileType, InputDecoder, InputEvent, Key, LineState, MAX_DESCRIPTOR_BYTES, MouseTracking, SyntaxDescriptor, TerminalGuard, TerminalOptions, TerminalWriter, TextBuffer, TextBufferError, TextQuery, TokenSpan, append_display_line, detect_file_type, parse_descriptor, select_descriptor};
-use proto::system::{FileInfo, LaunchContext, WriterMode};
+use proto::system::{FileInfo, LaunchContext, SelectedFile, WriterMode};
 use rt::*;
 use storage_proto::path;
 use tools::{ConsoleWriter, VolumeSet, read_volume_file};
@@ -105,6 +105,9 @@ struct Editor {
 	spaces_for_tab: bool,
 	indent_width: usize,
 	auto_indent: bool,
+	// The selected-file client, or 0. Held rather than passed, because the save and the reload both
+	// need it and a parameter threaded through two call paths is a parameter one of them forgets.
+	granted: u64,
 }
 
 #[unsafe(no_mangle)]
@@ -121,7 +124,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
 		let argument = trim(&argument);
-		if argument.is_empty() {
+		// THE SELECTED-FILE GRANT, WHEN THERE IS ONE. A launch over one file hands this program a
+		// client scoped to exactly that path, and the record that follows says whether a write-back
+		// will be accepted - so an editor opened from a panel holds the authority to change that
+		// one file and nothing else. A read-only grant is opened read-only and SAYS SO, because an
+		// editor that let somebody type for an hour and then refused the save is worse than one
+		// that said at the top.
+		let selected: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_SELECTED_FILE).unwrap_or(0);
+		let opened: Option<SelectedFile> = if selected == 0 { None } else { recv_launch_bytes(bootstrap).as_deref().and_then(SelectedFile::decode) };
+		if argument.is_empty() && opened.is_none() {
 			print(b"Usage: licoedit PATH [PATH ...]\n");
 			exit();
 		}
@@ -130,10 +141,29 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let assets: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_APP_ASSETS).unwrap_or(0);
 		let descriptors: Vec<SyntaxDescriptor> = load_descriptors(assets);
 		let mut buffers: Vec<Buffer> = Vec::new();
+		// A GRANTED FILE IS THE FIRST BUFFER, and when there is one the command line's paths are
+		// not opened at all: a launch over a selected file was given authority over that file, and
+		// resolving a path beside it would be reaching for something the grant deliberately does
+		// not cover.
+		if let Some(opened) = opened.as_ref() {
+			let uri = String::from(opened.uri.as_str());
+			let existing = VolumeClient::new(selected).stat(&uri).and_then(|answer| answer.ok());
+			let file = unsafe { read_volume_file(selected, &uri, MAX_EDIT_BYTES) }.unwrap_or_default();
+			match TextBuffer::from_bytes(&file, MAX_EDIT_BYTES) {
+				Ok(text) => {
+					let mut name: Vec<u8> = Vec::new();
+					if name.try_reserve_exact(opened.name.len()).is_ok() {
+						name.extend_from_slice(opened.name.as_bytes());
+					}
+					buffers.push(Buffer { uri, name, text, loaded: existing, overwrite_confirmed: false, read_only: !opened.writable, language: None });
+				}
+				Err(_) => eprint(b"licoedit: cannot allocate an editor buffer\n"),
+			}
+		}
 		// ONE BUFFER PER PATH, and a path that cannot be opened is REPORTED and skipped rather than
 		// ending the launch: `licoedit a b c` where `b` is a directory should still open `a` and
 		// `c`, because the reader asked for three files and two of them are there.
-		for word in argument.split(|byte| byte.is_ascii_whitespace()).filter(|word| !word.is_empty()) {
+		for word in argument.split(|byte| byte.is_ascii_whitespace()).filter(|_| opened.is_none()).filter(|word| !word.is_empty()) {
 			if buffers.len() == MAX_BUFFERS {
 				eprint(b"licoedit: too many files; the rest were not opened\n");
 				break;
@@ -174,7 +204,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			eprint(b"licoedit: nothing could be opened\n");
 			exit();
 		}
-		let mut editor = Editor { buffers, active: 0, descriptors, clipboard: Vec::new(), prompt: Prompt::None, entry: Vec::new(), needle: Vec::new(), replacement: Vec::new(), status: Vec::new(), line_numbers: true, highlight: true, wrap: false, show_whitespace: false, overwrite_mode: false, spaces_for_tab: true, indent_width: 4, auto_indent: true };
+		let mut editor = Editor { buffers, active: 0, descriptors, clipboard: Vec::new(), prompt: Prompt::None, entry: Vec::new(), needle: Vec::new(), replacement: Vec::new(), status: Vec::new(), line_numbers: true, highlight: true, wrap: false, show_whitespace: false, overwrite_mode: false, spaces_for_tab: true, indent_width: 4, auto_indent: true, granted: selected };
 		editor.say(b"^S save  M-a save-as  M-r reload  ^Z/^Y undo  ^C/^X/^V clip  ^G line  ^F find  ^R replace  ^W buffer  F10 exit");
 		if stdin() == 0 || stdout() == 0 {
 			eprint(b"licoedit: interactive terminal unavailable\n");
@@ -790,12 +820,23 @@ impl Editor {
 		self.find_next(false)
 	}
 
+	// WHICH CLIENT REACHES THIS BUFFER. A buffer opened through a selected-file grant is reached
+	// through that grant and never through the volume bundle - which for a launch over one file is
+	// not there at all. One place decides, so the save and the reload cannot pick differently.
+	fn storage_for(&self, volumes: &VolumeSet, uri: &str) -> u64 {
+		match self.granted {
+			0 => volumes.client_for(uri, uri.as_bytes()),
+			granted if self.buffers[self.active].uri == uri => granted,
+			_ => volumes.client_for(uri, uri.as_bytes()),
+		}
+	}
+
 	// Read the file again, discarding what is in the buffer. The other answer to a conflict, and
 	// the one the item asks for beside overwrite: a reader told the file changed underneath them
 	// needs to be able to take the volume's copy rather than only to write over it.
 	fn reload(&mut self, volumes: &VolumeSet) -> EditAction {
 		let uri = self.buffers[self.active].uri.clone();
-		let storage = volumes.client_for(&uri, uri.as_bytes());
+		let storage = self.storage_for(volumes, &uri);
 		let file = match unsafe { read_volume_file(storage, &uri, MAX_EDIT_BYTES) } {
 			Ok(file) => file,
 			Err(_) => {
@@ -827,9 +868,13 @@ impl Editor {
 	// visible under the destination's name only at `commit`, so every failure below - a read-only
 	// volume, a volume with no room, a session that goes away - leaves the previous file intact.
 	fn save(&mut self, volumes: &VolumeSet) -> EditAction {
+		if self.buffers[self.active].read_only {
+			self.say(b"this file was opened read-only, so there is nothing to publish through");
+			return EditAction::Redraw;
+		}
 		let uri = self.buffers[self.active].uri.clone();
 		let uri = uri.as_str();
-		let storage = volumes.client_for(uri, uri.as_bytes());
+		let storage = self.storage_for(volumes, uri);
 		let mut client = VolumeClient::new(storage);
 		// EXTERNAL REPLACEMENT IS DETECTED AT SAVE, which is the moment it matters: the file may
 		// have been replaced at any point since it was read, and a size or a timestamp that no

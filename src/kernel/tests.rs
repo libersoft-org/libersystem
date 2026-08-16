@@ -3375,6 +3375,51 @@ impl StorageHarness {
 		panic!("StorageService did not mint a directory scope");
 	}
 
+	// Mint a client scoped to EXACTLY ONE PATH - the selected-file grant, as `volume-admin.open-file`
+	// answers it. `writable` decides whether it may open a transactional writer over that path.
+	fn open_file(&mut self, path: &[u8], writable: bool) -> alloc::sync::Arc<object::channel::Channel> {
+		use object::channel::{Channel, Message};
+		let corr: u32 = 0xd1ec_8000;
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.push(u8::from(writable));
+		self.admin.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage file request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = self.admin.recv() {
+				assert_eq!(le_u32(&reply.bytes, 0), corr, "storage file reply echoes the correlation id");
+				assert_eq!(reply.bytes.get(4), Some(&1), "storage file scope succeeds");
+				let cap = reply.caps.first().expect("storage file capability");
+				return cap.object().into_any_arc().downcast::<Channel>().expect("storage file scope is a channel");
+			}
+		}
+		panic!("StorageService did not mint a file scope");
+	}
+
+	// Whether a client may open a transactional writer over `path`. The one op that separates a
+	// read-only selected-file grant from a writable one.
+	fn can_open_writer(&mut self, client: &alloc::sync::Arc<object::channel::Channel>, path: &[u8], corr: u32) -> bool {
+		use object::channel::Message;
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&23u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
+		request.extend_from_slice(path);
+		request.push(0);
+		client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage writer request");
+		for _ in 0..100_000 {
+			self.pump();
+			if let Ok(reply) = client.recv() {
+				assert_eq!(le_u32(&reply.bytes, 0), corr, "writer reply echoes the correlation id");
+				return reply.bytes.get(4) == Some(&1);
+			}
+		}
+		panic!("StorageService did not answer an open-writer request");
+	}
+
 	fn open(&mut self, path: &[u8], corr: u32) -> Option<alloc::vec::Vec<u8>> {
 		let client = self.client.clone();
 		self.open_from(&client, path, corr)
