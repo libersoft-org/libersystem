@@ -620,6 +620,8 @@ impl HandleTable {
 	// is not observable through the ordinary API until the damage has already been handed out.
 	#[cfg(test)]
 	pub fn free_indices_for_test(&self) -> alloc::vec::Vec<u32> {
+		// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed. The gate
+		// exempts test code by PATH, which does not reach a test helper living in a source file.
 		self.free.clone()
 	}
 

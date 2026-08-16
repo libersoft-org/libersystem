@@ -13,7 +13,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use lico::{Focus, InputDecoder, InputEvent, Key, MouseTracking, TerminalGuard, TerminalOptions, TerminalWriter};
+use lico::{Bookmarks, EntryKey, Focus, History, InputDecoder, InputEvent, Key, MouseTracking, SortKey, SortSpec, TerminalGuard, TerminalOptions, TerminalWriter, order, quick_search};
 use proto::system::{Error, FileInfo, FileType, LaunchContext};
 use rt::*;
 use storage_proto::path;
@@ -26,30 +26,132 @@ const MAX_PANEL_ENTRIES: usize = 4_096;
 
 struct Panel {
 	path: String,
+	// Everything the volume listed, kept whole. The presentation - what is sorted, what is hidden,
+	// what a filter admits - is applied to the VIEW rather than to this, so turning a filter off
+	// costs nothing and never needs the directory read again.
 	entries: Vec<FileInfo>,
+	// Indexes into `entries`, in the order the reader sees them. One indirection, and it is what
+	// makes the selection survive a sort: the cursor names a position in this list, and the entry it
+	// points at is looked up rather than copied.
+	view: Vec<usize>,
 	selected: usize,
+	sort: SortSpec,
+	// A literal name filter. Not a glob: the glob matcher lives in the command library and a panel
+	// filter is a thing somebody types one letter at a time, where a partial pattern that matches
+	// nothing looks like a broken panel.
+	filter: Vec<u8>,
+	// What has been typed for the quick search, cleared by anything that is not another letter.
+	typed: Vec<u8>,
+	history: History,
 }
 
 impl Panel {
 	fn new(path: String) -> Panel {
-		Panel { path, entries: Vec::new(), selected: 0 }
+		Panel { path, entries: Vec::new(), view: Vec::new(), selected: 0, sort: SortSpec::default(), filter: Vec::new(), typed: Vec::new(), history: History::new() }
+	}
+
+	fn key_of(entry: &FileInfo) -> EntryKey<'_> {
+		EntryKey { name: entry.name.as_bytes(), size: entry.size, modified: entry.mtime, is_dir: entry.r#type == FileType::Dir }
 	}
 
 	fn refresh(&mut self, volumes: &VolumeSet) -> Result<(), ListDirectoryError> {
 		let storage = volumes.client_for(&self.path, self.path.as_bytes());
-		let mut entries = unsafe { list_volume_directory(storage, &self.path, MAX_PANEL_ENTRIES)? };
-		entries.sort_by(|left, right| {
-			let left_dir = left.r#type == FileType::Dir;
-			let right_dir = right.r#type == FileType::Dir;
-			right_dir.cmp(&left_dir).then_with(|| left.name.cmp(&right.name))
-		});
+		let entries = unsafe { list_volume_directory(storage, &self.path, MAX_PANEL_ENTRIES)? };
 		self.entries = entries;
-		if self.entries.is_empty() {
-			self.selected = 0;
-		} else if self.selected >= self.entries.len() {
-			self.selected = self.entries.len() - 1;
-		}
+		self.history.visit(self.path.as_bytes());
+		self.rebuild();
 		Ok(())
+	}
+
+	// The view, from the listing and the current presentation. Called after a refresh and after
+	// every change to the ordering or the filter, and it is the ONLY place either is applied - two
+	// places would eventually disagree about what the reader is looking at.
+	fn rebuild(&mut self) {
+		let selected_name: Option<String> = self.current().map(|entry| entry.name.clone());
+		self.view.clear();
+		if self.view.try_reserve(self.entries.len()).is_err() {
+			return;
+		}
+		for (index, entry) in self.entries.iter().enumerate() {
+			let key = Panel::key_of(entry);
+			if !self.sort.admits(&key) {
+				continue;
+			}
+			if !self.filter.is_empty() && !contains(entry.name.as_bytes(), &self.filter) {
+				continue;
+			}
+			self.view.push(index);
+		}
+		let entries = &self.entries;
+		let spec = self.sort;
+		self.view.sort_by(|left, right| order(spec, &Panel::key_of(&entries[*left]), &Panel::key_of(&entries[*right])));
+		// THE CURSOR FOLLOWS THE ENTRY, not the position. Re-sorting a listing and leaving the
+		// cursor on row four selects whatever moved there, which is how a reader deletes the wrong
+		// file after changing the sort order.
+		self.selected = match selected_name {
+			Some(name) => self.view.iter().position(|index| self.entries[*index].name == name).unwrap_or(0),
+			None => 0,
+		};
+		if self.selected >= self.view.len() {
+			self.selected = self.view.len().saturating_sub(1);
+		}
+	}
+
+	fn current(&self) -> Option<&FileInfo> {
+		self.view.get(self.selected).map(|index| &self.entries[*index])
+	}
+
+	fn len(&self) -> usize {
+		self.view.len()
+	}
+
+	fn entry_at(&self, row: usize) -> Option<&FileInfo> {
+		self.view.get(row).map(|index| &self.entries[*index])
+	}
+
+	// Type a letter of a quick search: the cursor moves to the first name beginning with what has
+	// been typed so far, and a letter that matches nothing is REFUSED rather than added - so the
+	// search never gets into a state where every further keystroke also matches nothing.
+	fn quick(&mut self, byte: u8) -> bool {
+		let mut typed = core::mem::take(&mut self.typed);
+		if typed.try_reserve(1).is_err() {
+			return false;
+		}
+		typed.push(byte);
+		let names = self.view.iter().map(|index| self.entries[*index].name.as_bytes());
+		match quick_search(names, &typed, self.selected) {
+			Some(at) => {
+				self.selected = at;
+				self.typed = typed;
+				true
+			}
+			None => {
+				typed.pop();
+				self.typed = typed;
+				false
+			}
+		}
+	}
+
+	fn cycle_sort(&mut self) {
+		self.sort.key = match self.sort.key {
+			SortKey::Name => SortKey::Extension,
+			SortKey::Extension => SortKey::Size,
+			SortKey::Size => SortKey::Modified,
+			SortKey::Modified => SortKey::Type,
+			SortKey::Type => SortKey::Name,
+		};
+		self.rebuild();
+	}
+
+	fn sort_label(&self) -> &'static [u8] {
+		match self.sort.key {
+			SortKey::Name => b"name",
+			SortKey::Extension => b"ext",
+			SortKey::Size => b"size",
+			SortKey::Modified => b"time",
+			SortKey::Type => b"type",
+		}
 	}
 
 	fn move_up(&mut self) -> bool {
@@ -61,7 +163,7 @@ impl Panel {
 	}
 
 	fn move_down(&mut self) -> bool {
-		if self.selected + 1 >= self.entries.len() {
+		if self.selected + 1 >= self.view.len() {
 			return false;
 		}
 		self.selected += 1;
@@ -77,7 +179,7 @@ impl Panel {
 	}
 
 	fn move_end(&mut self) -> bool {
-		let Some(last) = self.entries.len().checked_sub(1) else { return false };
+		let Some(last) = self.view.len().checked_sub(1) else { return false };
 		if self.selected == last {
 			return false;
 		}
@@ -132,13 +234,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// so `cat` on a file holding them reconfigured the terminal. `tty_set_mode` goes over the
 			// control channel the shell hands to an interactive foreground job; false means there is no
 			// terminal to ask, and the program runs cooked rather than failing.
-			let owns_tty: bool = unsafe { tty_set_mode(true, false) };
+			let owns_tty: bool = tty_set_mode(true, false);
 			if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
 				let _ = manage(terminal.writer(), &volumes, initial);
 			}
 			// And back to cooked input and echo, through the same request path.
 			if owns_tty {
-				unsafe { tty_set_mode(false, true) };
+				tty_set_mode(false, true);
 			}
 		}
 	}
@@ -149,7 +251,8 @@ unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial:
 	unsafe {
 		let mut panels = [Panel::new(initial.clone()), Panel::new(initial)];
 		let mut focus = Focus::new(2);
-		let mut status: &[u8] = b"Tab/pointer panel  arrows select  Enter directory  Backspace parent  F10 exit";
+		let mut bookmarks = Bookmarks::new();
+		let mut status: &[u8] = b"Tab panel  arrows select  Enter open  Backspace parent  F1 keys  F10 exit";
 		for panel in &mut panels {
 			if let Err(error) = panel.refresh(volumes) {
 				status = list_error(error);
@@ -178,7 +281,7 @@ unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial:
 					Polled::Message { len, .. } => {
 						for &byte in &bytes[..len] {
 							let Some(event) = decoder.feed(byte) else { continue };
-							match apply_event(event, &mut panels, &mut focus, volumes, &mut status) {
+							match apply_event(event, &mut panels, &mut focus, volumes, &mut bookmarks, &mut status) {
 								ManagerAction::None => {}
 								ManagerAction::Redraw => redraw = true,
 								ManagerAction::Exit => return true,
@@ -193,7 +296,7 @@ unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial:
 	}
 }
 
-fn apply_event(event: InputEvent, panels: &mut [Panel; 2], focus: &mut Focus, volumes: &VolumeSet, status: &mut &[u8]) -> ManagerAction {
+fn apply_event(event: InputEvent, panels: &mut [Panel; 2], focus: &mut Focus, volumes: &VolumeSet, bookmarks: &mut Bookmarks, status: &mut &[u8]) -> ManagerAction {
 	let active = focus.active().unwrap_or(0) as usize;
 	match event {
 		InputEvent::Key(Key::Escape) | InputEvent::Key(Key::Function(10)) => ManagerAction::Exit,
@@ -210,14 +313,72 @@ fn apply_event(event: InputEvent, panels: &mut [Panel; 2], focus: &mut Focus, vo
 		InputEvent::Key(Key::Enter) => enter_directory(&mut panels[active], volumes, status),
 		InputEvent::Key(Key::Backspace) | InputEvent::Key(Key::ArrowLeft) => parent_directory(&mut panels[active], volumes, status),
 		InputEvent::Key(Key::Function(1)) => {
-			*status = b"F1 help  F3 view  F4 edit  F5 copy  F6 move  F7 mkdir  F8 delete  F10 exit";
+			*status = b"Tab focus  ^U swap  s sort  r reverse  . hidden  d dirs  f filter  b mark  1-9 go  ,/; back/fwd  type to search";
 			ManagerAction::Redraw
 		}
+		// THE PRESENTATION KEYS. Each rebuilds the view rather than re-reading the directory: what
+		// changed is how the listing is being looked at, and asking the volume again for the same
+		// answer is both slower and a chance for it to have changed underneath.
+		InputEvent::Key(Key::Byte(b's')) => {
+			panels[active].cycle_sort();
+			ManagerAction::Redraw
+		}
+		InputEvent::Key(Key::Byte(b'r')) => {
+			panels[active].sort.reverse = !panels[active].sort.reverse;
+			panels[active].rebuild();
+			ManagerAction::Redraw
+		}
+		InputEvent::Key(Key::Byte(b'.')) => {
+			panels[active].sort.show_hidden = !panels[active].sort.show_hidden;
+			panels[active].rebuild();
+			ManagerAction::Redraw
+		}
+		InputEvent::Key(Key::Byte(b'd')) => {
+			panels[active].sort.directories_first = !panels[active].sort.directories_first;
+			panels[active].rebuild();
+			ManagerAction::Redraw
+		}
+		InputEvent::Key(Key::Byte(b'f')) => {
+			// The filter is what has been typed for the quick search: one keystroke turns a search
+			// into a standing filter, which is the same question asked twice.
+			panels[active].filter = core::mem::take(&mut panels[active].typed);
+			panels[active].rebuild();
+			*status = if panels[active].filter.is_empty() { b"filter cleared" } else { b"filter set from the typed name - f with nothing typed clears it" };
+			ManagerAction::Redraw
+		}
+		// PANEL SWAP is one operation and not two navigations: the paths trade places and each
+		// panel's selection and ordering go with its own path.
+		InputEvent::Key(Key::Control(0x15)) => {
+			panels.swap(0, 1);
+			ManagerAction::Redraw
+		}
+		InputEvent::Key(Key::Byte(b',')) => navigate_history(&mut panels[active], volumes, status, false),
+		InputEvent::Key(Key::Byte(b';')) => navigate_history(&mut panels[active], volumes, status, true),
+		InputEvent::Key(Key::Byte(b'b')) => {
+			let path = panels[active].path.clone();
+			*status = if bookmarks.add(path.as_bytes()) { b"bookmarked - 1..9 goes to one" } else { b"the bookmark list is full; it refuses rather than dropping an older one" };
+			ManagerAction::Redraw
+		}
+		InputEvent::Key(Key::Byte(byte @ b'1'..=b'9')) => match bookmarks.get((byte - b'1') as usize).and_then(|path| core::str::from_utf8(path).ok()).map(String::from) {
+			Some(path) => go_to(&mut panels[active], volumes, status, path),
+			None => {
+				*status = b"no bookmark there";
+				ManagerAction::Redraw
+			}
+		},
 		InputEvent::Key(Key::Function(3)) | InputEvent::Key(Key::Function(4)) | InputEvent::Key(Key::Function(5)) | InputEvent::Key(Key::Function(6)) | InputEvent::Key(Key::Function(7)) | InputEvent::Key(Key::Function(8)) => {
 			*status = b"selected-file actions require a scoped file grant and transactional writer";
 			ManagerAction::Redraw
 		}
 		InputEvent::Pointer(pointer) if pointer.pressed => pointer_focus(pointer.column, pointer.row, panels, focus),
+		// TYPING MOVES TO THE NAME. Last in the match, so every binding above wins - which is the
+		// orthodox trade, and the filter is how a reader reaches a name starting with one of them.
+		InputEvent::Key(Key::Byte(byte)) if byte > 0x20 && byte != 0x7f => {
+			if !panels[active].quick(byte) {
+				*status = b"no name begins with that";
+			}
+			ManagerAction::Redraw
+		}
 		_ => ManagerAction::None,
 	}
 }
@@ -239,7 +400,7 @@ fn repeat_move(panel: &mut Panel, down: bool) -> bool {
 }
 
 fn enter_directory(panel: &mut Panel, volumes: &VolumeSet, status: &mut &[u8]) -> ManagerAction {
-	let Some(entry) = panel.entries.get(panel.selected) else { return ManagerAction::None };
+	let Some(entry) = panel.current() else { return ManagerAction::None };
 	if entry.r#type != FileType::Dir {
 		*status = b"F3/F4 associations require a selected-file grant";
 		return ManagerAction::Redraw;
@@ -275,13 +436,64 @@ fn parent_directory(panel: &mut Panel, volumes: &VolumeSet, status: &mut &[u8]) 
 	}
 }
 
+// Go to a path the reader named - a bookmark, a history entry. A directory that will not open
+// leaves the panel WHERE IT WAS: a bookmark to a volume that is no longer mounted must not empty
+// the panel somebody was using.
+fn go_to(panel: &mut Panel, volumes: &VolumeSet, status: &mut &[u8], path: String) -> ManagerAction {
+	let previous = core::mem::replace(&mut panel.path, path);
+	panel.typed.clear();
+	match panel.refresh(volumes) {
+		Ok(()) => {
+			panel.selected = 0;
+			ManagerAction::Redraw
+		}
+		Err(error) => {
+			panel.path = previous;
+			*status = list_error(error);
+			let _ = panel.refresh(volumes);
+			ManagerAction::Redraw
+		}
+	}
+}
+
+// Back and forward through the panel's own history. The entry is taken from the history FIRST and
+// the visit `refresh` then records is the place it just arrived at, which `History::visit`
+// recognises as no navigation at all - otherwise going back would itself be a new visit and the
+// history would be a loop.
+fn navigate_history(panel: &mut Panel, volumes: &VolumeSet, status: &mut &[u8], forward: bool) -> ManagerAction {
+	let target = if forward { panel.history.forward() } else { panel.history.back() };
+	let Some(path) = target.and_then(|bytes| core::str::from_utf8(bytes).ok()).map(String::from) else {
+		*status = if forward { b"nothing forward from here" } else { b"nothing before this" };
+		return ManagerAction::Redraw;
+	};
+	panel.path = path;
+	panel.typed.clear();
+	match panel.refresh(volumes) {
+		Ok(()) => {
+			panel.selected = 0;
+			ManagerAction::Redraw
+		}
+		Err(error) => {
+			*status = list_error(error);
+			ManagerAction::Redraw
+		}
+	}
+}
+
+// Whether `name` holds `needle`, ignoring ASCII case. The panel filter is a literal because it is
+// typed one letter at a time, where a partial pattern that matches nothing looks like a broken
+// panel rather than an unfinished expression.
+fn contains(name: &[u8], needle: &[u8]) -> bool {
+	needle.is_empty() || name.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn pointer_focus(column: u16, row: u16, panels: &mut [Panel; 2], focus: &mut Focus) -> ManagerAction {
 	let panel = usize::from(column > PANEL_WIDTH as u16 + 2);
 	focus.select(panel as u16);
 	let row = row.saturating_sub(3) as usize;
 	if row < PANEL_ROWS {
 		let start = visible_start(&panels[panel]);
-		if start + row < panels[panel].entries.len() {
+		if start + row < panels[panel].len() {
 			panels[panel].selected = start + row;
 		}
 	}
@@ -314,7 +526,20 @@ fn render(output: &mut impl TerminalWriter, panels: &[Panel; 2], focus: &Focus, 
 fn render_panel_header(output: &mut Vec<u8>, panel: &Panel, active: bool) {
 	let start = output.len();
 	output.push(if active { b'>' } else { b' ' });
-	append_safe(output, panel.path.as_bytes(), PANEL_WIDTH - 1);
+	// THE MARKER STAYS AGAINST THE PATH. Which panel is active is read at a glance from the left
+	// edge, and anything between the two turns that glance into reading.
+	append_safe(output, panel.path.as_bytes(), PANEL_WIDTH.saturating_sub(8));
+	// THE ORDERING GOES AFTER IT, because a listing sorted by size looks like a listing sorted by
+	// name that is in the wrong order, and a filter that hides most of a directory looks like an
+	// empty one - so both say so where the reader is already looking.
+	output.push(b' ');
+	append_safe(output, panel.sort_label(), 4);
+	if panel.sort.reverse {
+		output.push(b'^');
+	}
+	if !panel.filter.is_empty() {
+		output.push(b'*');
+	}
 	let used = output.len() - start;
 	if used < PANEL_WIDTH {
 		pad(output, PANEL_WIDTH - used);
@@ -323,7 +548,7 @@ fn render_panel_header(output: &mut Vec<u8>, panel: &Panel, active: bool) {
 
 fn render_entry(output: &mut Vec<u8>, panel: &Panel, index: usize, active: bool) {
 	let row_start = output.len();
-	if let Some(entry) = panel.entries.get(index) {
+	if let Some(entry) = panel.entry_at(index) {
 		output.push(if active && index == panel.selected { b'>' } else { b' ' });
 		append_safe(output, entry.name.as_bytes(), PANEL_WIDTH.saturating_sub(12));
 		if entry.r#type == FileType::Dir {
@@ -344,7 +569,7 @@ fn render_entry(output: &mut Vec<u8>, panel: &Panel, index: usize, active: bool)
 }
 
 fn visible_start(panel: &Panel) -> usize {
-	if panel.entries.len() <= PANEL_ROWS { 0 } else { panel.selected.saturating_sub(PANEL_ROWS / 2).min(panel.entries.len() - PANEL_ROWS) }
+	if panel.len() <= PANEL_ROWS { 0 } else { panel.selected.saturating_sub(PANEL_ROWS / 2).min(panel.len() - PANEL_ROWS) }
 }
 
 fn parent_uri(uri: &str) -> String {

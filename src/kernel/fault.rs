@@ -158,6 +158,8 @@ pub fn clear_crash_notify() {
 // endpoint, if any. Best-effort: a full or closed channel drops the record, since
 // the kernel must neither block nor fail on the fault path.
 fn notify_crash(koid: u64, kind: u64) {
+	// ALLOC-OK: an `Option<Arc<Channel>>` out of the guard - a refcount bump. Nothing is copied,
+	// which matters here more than elsewhere: this is the fault path.
 	let channel = CRASH_NOTIFY.lock().clone();
 	if let Some(channel) = channel {
 		// FALLIBLY, on the FAULT path - which runs when a process has just died, a plausible moment

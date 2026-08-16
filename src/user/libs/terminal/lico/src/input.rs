@@ -32,10 +32,30 @@ pub struct PointerEvent {
 	pub pressed: bool,
 }
 
+/// A key with modifiers held, as `CSI 1;<mod><letter>` and `CSI <n>;<mod>~` report them.
+///
+/// The bitmask is xterm's and is one more than the bits: 1 is nothing, 2 is shift, 5 is control,
+/// and so on. Decoded here rather than handed on raw, because a number a caller has to remember to
+/// subtract one from is a number somebody will forget to subtract one from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Chord {
+	pub key: Key,
+	pub shift: bool,
+	pub alt: bool,
+	pub control: bool,
+}
+
 /// One raw-terminal input event.
+///
+/// A MODIFIED KEY IS A DIFFERENT EVENT from the same key alone, deliberately. Folding shift+F10
+/// into F10 would make every program that ignores modifiers act on a keystroke its user did not
+/// press, and the alternative - a modifier field on every key - would change fifty call sites that
+/// have no opinion about modifiers. Nothing regresses by adding this: a modified key decoded to
+/// `InvalidSequence` before it existed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InputEvent {
 	Key(Key),
+	Chord(Chord),
 	Pointer(PointerEvent),
 	InvalidSequence,
 }
@@ -179,20 +199,44 @@ impl InputDecoder {
 			}
 			return InputEvent::InvalidSequence;
 		}
+		// BACK-TAB has its own final byte rather than a modifier parameter, which is why it is here
+		// and not in the modified-key arm below. It is how every terminal reports shift+Tab, and it
+		// is what an editor's unindent is bound to.
+		if final_byte == b'Z' && count == 0 {
+			return InputEvent::Chord(Chord { key: Key::Tab, shift: true, alt: false, control: false });
+		}
 		if count == 0 {
-			let key = match final_byte {
-				b'A' => Key::ArrowUp,
-				b'B' => Key::ArrowDown,
-				b'C' => Key::ArrowRight,
-				b'D' => Key::ArrowLeft,
-				b'H' => Key::Home,
-				b'F' => Key::End,
-				_ => return InputEvent::InvalidSequence,
+			let Some(key) = csi_navigation_key(final_byte) else {
+				return InputEvent::InvalidSequence;
 			};
 			return InputEvent::Key(key);
 		}
 		if final_byte == b'~' && count == 1 {
 			return csi_tilde_key(params[0]).map(InputEvent::Key).unwrap_or(InputEvent::InvalidSequence);
+		}
+		// THE MODIFIED FORMS. `CSI 1;2A` is shift+up and `CSI 3;5~` is control+delete; the first
+		// parameter of the letter form is always 1, and a value that is not is a sequence this
+		// decoder does not claim to understand rather than one to guess at.
+		if count == 2 {
+			let key = if final_byte == b'~' {
+				csi_tilde_key(params[0])
+			} else if params[0] == 1 {
+				csi_navigation_key(final_byte)
+			} else {
+				None
+			};
+			let Some(key) = key else {
+				return InputEvent::InvalidSequence;
+			};
+			let Some(bits) = params[1].checked_sub(1) else {
+				return InputEvent::InvalidSequence;
+			};
+			// A MODIFIER OF NONE IS THE PLAIN KEY. Some terminals spell `CSI 1;1A` for a bare arrow,
+			// and reporting it as a chord with nothing held would make callers handle one key twice.
+			if bits == 0 {
+				return InputEvent::Key(key);
+			}
+			return InputEvent::Chord(Chord { key, shift: bits & 1 != 0, alt: bits & 2 != 0, control: bits & 4 != 0 });
 		}
 		InputEvent::InvalidSequence
 	}
@@ -203,6 +247,20 @@ impl InputDecoder {
 		self.has_value = false;
 		self.sgr = false;
 		self.overflow = false;
+	}
+}
+
+// The navigation letters, shared by the bare and the modified forms so the two cannot disagree
+// about what `A` means.
+fn csi_navigation_key(final_byte: u8) -> Option<Key> {
+	match final_byte {
+		b'A' => Some(Key::ArrowUp),
+		b'B' => Some(Key::ArrowDown),
+		b'C' => Some(Key::ArrowRight),
+		b'D' => Some(Key::ArrowLeft),
+		b'H' => Some(Key::Home),
+		b'F' => Some(Key::End),
+		_ => None,
 	}
 }
 

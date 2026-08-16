@@ -480,6 +480,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// this message instead and the whole boot chain stops before the first service starts.
 	let power_cap = Capability::new(sched::root_domain() as Arc<dyn KernelObject>, Rights::MANAGE | Rights::TRANSFER | Rights::DUPLICATE, 0);
 	// ALLOC-OK: boot, as above
+	// ALLOC-OK: boot, before userspace exists - a four-byte tag on the handover path.
 	kernel_ep.send(Message::new(b"POWER".to_vec(), alloc::vec![power_cap], 0)).map_err(|_| "failed to hand SystemManager the power capability")?;
 
 	// Tell the boot chain which kind of boot this is: "MODE" + one byte, 1 in a test
@@ -501,6 +502,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// after this line are the four that will ever exist.
 	// ALLOC-OK: boot, minting the four privilege capabilities before userspace exists.
 	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind).expect("the four privilege capabilities, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
+	// ALLOC-OK: boot, before userspace exists - a tag on the same handover path.
 	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges, 0)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
 	Ok((kernel_ep, sm_koid))
 }

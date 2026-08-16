@@ -486,9 +486,14 @@ impl Process {
 	}
 
 	// Take note of a group this process belongs to. Called by `ProcessGroup::create`, which is the
-	// only thing that can make one - membership is sealed there, so this list is written once.
+	// only thing that can make one - membership is sealed there, so a given group is added once.
 	pub fn join_group(&self, group: &alloc::sync::Arc<super::process_group::ProcessGroup>) -> bool {
 		let mut groups = self.groups.lock();
+		// DEAD LINKS GO FIRST, so this list is bounded by the groups that still exist rather than by
+		// every group this process has ever been in. A long-lived process joined to a succession of
+		// short-lived groups walked all of them on every terminal path, and each dead one cost a
+		// failed upgrade for nothing.
+		groups.retain(|existing| existing.strong_count() > 0);
 		// FALLIBLY, like every other allocation a ring-3 caller can drive. A process may be in more
 		// than one group and a caller decides how many, so this is a list whose length is chosen by
 		// userspace.
@@ -499,12 +504,24 @@ impl Process {
 		true
 	}
 
+	// Forget a group. The unwind half of `join_group`: `ProcessGroup::create` fails if any member
+	// cannot take a back-link, and the members that already took one must not be left pointing at a
+	// group that never came into existence.
+	pub fn leave_group(&self, group_koid: u64) {
+		let mut groups = self.groups.lock();
+		groups.retain(|existing| !existing.upgrade().is_some_and(|group| group.header().koid() == group_koid));
+	}
+
 	// Tell every group this process is in what it finished as. Called from both terminal paths, and
 	// idempotent at the group's end: whichever of the two runs first writes the record and a second
 	// call leaves it alone, because a process that was killed after exiting cleanly still exited
 	// cleanly.
+	// UNDER THE LOCK, and asking the heap for nothing. This was `self.groups.lock().clone()` - an
+	// infallible `Vec` allocation on every process teardown, which is a path that runs precisely
+	// when memory has already run out. The clone bought nothing: `record_member` takes the GROUP's
+	// lock, never this one, so there is no re-entry to avoid.
 	fn record_in_groups(&self) {
-		let groups: Vec<alloc::sync::Weak<super::process_group::ProcessGroup>> = self.groups.lock().clone();
+		let groups = self.groups.lock();
 		for group in groups.iter().filter_map(alloc::sync::Weak::upgrade) {
 			group.record_member(self);
 		}

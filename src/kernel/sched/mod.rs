@@ -149,6 +149,12 @@ static SCHED: AtomicPtr<CpuSched> = AtomicPtr::new(core::ptr::null_mut());
 // every core at creation, growing the deque outside the lock) are recorded there because both are
 // worse than not needing to.
 fn enqueue_on(cpu: usize, thread: Arc<Thread>) {
+	// ALLOC-OK: NOTHING IS ALLOCATED - the intrusive `RunQueue` moves pointers, since the link
+	// lives in the `Thread` itself. The same marker the requeue path above carries, and it has to
+	// be repeated HERE rather than left in the comment block above the function: the gate reads a
+	// marker in the comment block that begins inside the function, and everything above `fn` belongs
+	// to the previous span. That is why this line was flagged while the identical push at the bottom
+	// of this file was not.
 	cpu_sched(cpu).inner.lock().run_queue.push_back(thread);
 }
 
@@ -335,11 +341,13 @@ pub fn init() {
 
 // The root (unlimited) resource Domain.
 pub fn root_domain() -> Arc<Domain> {
+	// ALLOC-OK: an `Option<Arc<Domain>>` out of the guard - a refcount bump.
 	ROOT_DOMAIN.lock().clone().expect("scheduler not initialized")
 }
 
 // A handle to the kernel address space (shared higher-half kernel mappings).
 fn kernel_as() -> Arc<AddressSpace> {
+	// ALLOC-OK: an `Option<Arc<AddressSpace>>` out of the guard - a refcount bump.
 	KERNEL_AS.lock().clone().expect("scheduler not initialized")
 }
 

@@ -426,8 +426,9 @@ fn a_group_remembers_what_each_stage_finished_as_after_the_stage_is_gone() {
 	// state that used to make this question unanswerable.
 	drop(stages);
 
-	let records = group.records();
-	assert_eq!(records.len(), 3, "one slot per stage, in creation order");
+	let mut records: [Option<super::process_group::StageRecord>; super::process_group::MAX_GROUP_MEMBERS] = [const { None }; _];
+	let written = group.records_into(&mut records);
+	assert_eq!(written, 3, "one slot per stage, in creation order");
 	let first = records[0].expect("stage 0 finished and was recorded");
 	assert_eq!(first.state, crate::syscall::PROC_STATE_STOPPED, "stage 0 exited cleanly");
 	assert_eq!(first.completion_valid, 1, "and it got to say what with");
@@ -443,6 +444,67 @@ fn a_group_remembers_what_each_stage_finished_as_after_the_stage_is_gone() {
 	assert_eq!(third.state, crate::syscall::PROC_STATE_STOPPED);
 	assert_eq!(third.completion_valid, 1, "an exit status of zero is a status and not an absence");
 	assert_eq!(third.completion, 0);
+}
+
+crate::tagged_test!(a_stages_slot_survives_an_earlier_stage_being_dropped, [Object, Kernel, Process], id = "kernel.object.a_stages_slot_survives_an_earlier_stage_being_dropped", covers = ["kernel"]);
+fn a_stages_slot_survives_an_earlier_stage_being_dropped() {
+	use super::address_space::AddressSpace;
+	use super::process::Process;
+	use super::process_group::{MAX_GROUP_MEMBERS, ProcessGroup};
+
+	// THE POSITION OF A MEMBER IS THE ABI. `SYS_PROCESS_GROUP_STATS` promises per-member stats "in
+	// the order the processes were created into the group", and a shell reads slot `i` as stage `i`
+	// of the line it typed. So anything that renumbers the list breaks the contract - and the
+	// existing records test cannot see it, because it ends all three stages BEFORE dropping any
+	// reference, which is the one ordering in which the renumbering is invisible.
+	//
+	// The order here is the interleaved one a real pipeline produces: a stage finishes, its last
+	// reference goes away as the job table reaps it, something reads the live set, and THEN the next
+	// stage finishes.
+	let make = || Process::new(AddressSpace::create().expect("address space"), crate::sched::root_domain()).expect("a test process");
+	let a = make();
+	let b = make();
+	let c = make();
+	let group = ProcessGroup::create(&[a.clone(), b.clone(), c.clone()]).expect("a three-stage group");
+
+	a.set_exit_status(7);
+	a.mark_exited();
+	drop(a);
+
+	// `finished()` is the condition a group wait completes on, so an ordinary pipeline waiting on
+	// its own job reaches this on every poll - which is what makes this a defect on the pipeline
+	// path rather than a wrong answer in a diagnostic.
+	assert!(!group.finished(), "B and C are still running");
+
+	b.set_exit_status(9);
+	b.mark_exited();
+
+	let mut records: [Option<super::process_group::StageRecord>; MAX_GROUP_MEMBERS] = [const { None }; _];
+	let written = group.records_into(&mut records);
+	assert_eq!(written, 3, "one slot per stage: a dropped member leaves its slot behind, not a gap closed up");
+	let first = records[0].expect("stage A finished and was recorded");
+	assert_eq!(first.completion, 7, "slot 0 is stage A's and stays stage A's after A is gone");
+	let second = records[1].expect("stage B finished and was recorded");
+	assert_eq!(second.completion, 9, "slot 1 is stage B's - not whichever position B slid into");
+	assert!(records[2].is_none(), "stage C has not finished");
+
+	// The live set skips the dead slot without renumbering the living ones, which is the same
+	// property from the other side: C is still the third stage.
+	let mut live: [Option<alloc::sync::Arc<Process>>; MAX_GROUP_MEMBERS] = [const { None }; _];
+	let count = group.live_into(&mut live);
+	assert_eq!(count, 2, "A is gone; B and C are still held here");
+	assert_eq!(group.size(), 3, "the group is still three stages wide");
+
+	// AND A GROUP'S STAGES MUST BE DISTINCT. Two capabilities to one process is ordinary, so a
+	// caller can hand the same process twice - and a repeated member cannot mean what a pipeline
+	// needs it to mean: one slot would take both records, the other would read as permanently
+	// running, and one group signal would reach that process twice.
+	assert!(ProcessGroup::create(&[c.clone(), c.clone()]).is_none(), "a repeated member is refused rather than half-recorded");
+
+	// AND THE STAGE THAT NEVER FINISHED IS FINISHED HERE. A test that leaves a process in a running
+	// state hands the rest of the suite a process that will never exit - which is a resource every
+	// later test pays for, and this suite runs two hundred and sixty tests in one boot.
+	c.terminate();
 }
 
 crate::tagged_test!(the_console_and_display_syscalls_refuse_a_caller_without_the_capability, [Object, Kernel, Syscall], id = "kernel.object.the_console_and_display_syscalls_refuse_a_caller_without_the_capability", covers = ["kernel"]);

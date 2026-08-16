@@ -59,6 +59,13 @@ impl TextSink {
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.out
 	}
+
+	// The serialized text, taken rather than copied. For a caller that wants to own it: the sink
+	// already holds exactly this buffer, so `sink.as_bytes().to_vec()` allocated a second copy of a
+	// whole scrollback to hand over the one that was already there.
+	pub fn into_bytes(self) -> Vec<u8> {
+		self.out
+	}
 }
 
 impl Default for TextSink {

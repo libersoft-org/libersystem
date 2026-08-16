@@ -1703,12 +1703,14 @@ fn sys_process_group_stats(group_handle: u64, buf_ptr: u64, count: u64) -> i64 {
 		Ok(g) => g,
 		Err(e) => return e,
 	};
-	let records = group.records();
-	let mut members: [Option<alloc::sync::Arc<Process>>; crate::object::process_group::MAX_GROUP_MEMBERS] = [const { None }; _];
-	let live_count = group.live_into(&mut members);
-	let live: &[Option<alloc::sync::Arc<Process>>] = &members[..live_count];
+	// ONE PASS, ONE LOCK, into a fixed array a group's cap covers whole. This read the records and
+	// the live members as two independent snapshots and joined them BY INDEX - which is the pairing
+	// that came apart the moment the member list was compacted, and would still be two reads of a
+	// group that can change between them even now that it is not.
+	let mut stats: [ProcessStats; crate::object::process_group::MAX_GROUP_MEMBERS] = [ProcessStats { state: PROC_STATE_RUNNING, ..Default::default() }; _];
+	let written = group.snapshot_into(&mut stats);
 	let size = core::mem::size_of::<ProcessStats>() as u64;
-	let writable = core::cmp::min(count, records.len() as u64);
+	let writable = core::cmp::min(count, written as u64);
 	let bytes = match writable.checked_mul(size) {
 		Some(bytes) => bytes,
 		None => return ERR_INVALID,
@@ -1720,14 +1722,7 @@ fn sys_process_group_stats(group_handle: u64, buf_ptr: u64, count: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	for index in 0..writable as usize {
-		let out = match records[index] {
-			Some(record) => ProcessStats { messages_sent: 0, messages_received: 0, handle_count: 0, memory_bytes: 0, state: record.state, completion: record.completion, completion_valid: record.completion_valid },
-			None => match live.get(index).and_then(|slot| slot.as_ref()).filter(|process| !process.is_terminated()) {
-				Some(process) => ProcessStats { messages_sent: process.messages_sent(), messages_received: process.messages_received(), handle_count: process.handle_count(), memory_bytes: process.memory_bytes(), state: PROC_STATE_RUNNING, completion: 0, completion_valid: 0 },
-				None => ProcessStats { state: PROC_STATE_RUNNING, ..Default::default() },
-			},
-		};
-		if let Err(e) = write_user(buf_ptr + index as u64 * size, out) {
+		if let Err(e) = write_user(buf_ptr + index as u64 * size, stats[index]) {
 			return e;
 		}
 	}

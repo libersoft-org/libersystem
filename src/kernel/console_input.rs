@@ -63,6 +63,8 @@ pub fn shell_listening() -> bool {
 // Send one input byte to the attached shell. Returns false if no shell is attached
 // or its endpoint has closed (it exited).
 pub fn feed(byte: u8) -> bool {
+	// ALLOC-OK: the guard holds an `Option<Arc<Channel>>`, so this is a refcount bump and not a
+	// copy - taken out of the lock because the send below must not run under it.
 	let channel = CONSOLE.lock().clone();
 	match channel {
 		Some(channel) => match try_one(byte) {
@@ -75,6 +77,7 @@ pub fn feed(byte: u8) -> bool {
 }
 
 pub fn feed_serial(byte: u8) -> bool {
+	// ALLOC-OK: an `Option<Arc<Channel>>` out of the guard - a refcount bump, as in `feed`.
 	let channel = CONSOLE.lock().clone();
 	match channel {
 		Some(channel) => match try_two(SERIAL_INPUT_MARKER, byte) {

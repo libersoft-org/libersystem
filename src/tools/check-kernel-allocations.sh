@@ -26,7 +26,27 @@
 #   Arc::new                                 - almost every kernel OBJECT is one, and almost every
 #                                              one of those is minted by a syscall.
 #   String::from, format!, to_string          - allocate outright, and names come from ring 3.
+#   to_vec, to_owned                          - allocate outright, and are how a slice becomes a
+#                                              buffer somebody keeps.
+#   .clone() out of a lock guard              - the idiom for copying a collection out from under
+#                                              a lock, which is what both defects below were.
+#   .clone() into a collection-typed `let`    - the same copy, written with its type spelled out.
 #   push / push_back / push_front / insert / extend on a collection - reallocate when full.
+#
+# THE CLONE RULES WERE ADDED 2026-08-16, after an audit found `ProcessGroup::records()` and
+# `Process::record_in_groups()` - two infallible `Vec::clone()`s in files this gate already scanned,
+# one on the `SYS_PROCESS_GROUP_STATS` path and one on every process teardown, which is a path that
+# runs when memory has already run out. Neither could refuse and neither was flagged, because
+# `.clone()` on a heap-backed type is not `Vec::with_capacity`. Widening it immediately found a
+# third: `boot_log_text` copied the entire boot scrollback a second time to hand it to
+# `SYS_CONSOLE_READLOG`.
+#
+# WHAT THE CLONE RULES DO NOT CATCH, stated because the next audit should not have to find it out:
+# a bare `x.clone()` on a collection FIELD. `thread.clone()` is a refcount bump and
+# `self.free.clone()` copies a vector, and no rule over source text can tell them apart - the
+# difference is in the type, which is not on the line. The two forms above are the ones that ARE
+# decidable from the text, and they are decidable because each carries something extra: a lock the
+# value is being taken out of, or a type the author wrote down.
 #
 # The exemptions:
 #   - test code, by path: a test that cannot allocate has already failed.
@@ -100,7 +120,15 @@ scan() {
 							if (lines[u] ~ /ALLOC-OK:/) { marked = 1; break }
 						}
 						if (marked) continue
-						hard = (line ~ /Vec::with_capacity\(|(^|[^_[:alnum:]])vec!\[|Box::new\(|Arc::new\(|Rc::new\(|String::from\(|format!\(|\.to_string\(\)|\.collect\(\)/)
+						hard = (line ~ /Vec::with_capacity\(|(^|[^_[:alnum:]])vec!\[|Box::new\(|Arc::new\(|Rc::new\(|String::from\(|format!\(|\.to_string\(\)|\.to_vec\(\)|\.to_owned\(\)|\.collect\(\)/)
+						# A CLONE OUT OF A LOCK GUARD. The idiom exists to copy a collection out from
+						# under the lock, which is exactly what the two defects that prompted this rule
+						# were doing; a guard holding an `Arc` is a refcount bump and says so in a
+						# marker, which is a sentence worth having beside it either way.
+						if (line ~ /\.(lock|try_lock|borrow|borrow_mut|read|write)\(\)[[:space:]]*\.clone\(\)/) hard = 1
+						# THE SAME COPY WITH ITS TYPE WRITTEN DOWN. `let x: Vec<..> = y.clone();` is
+						# decidable precisely because the author spelled out what is being copied.
+						if (line ~ /let[[:space:]]+(mut[[:space:]]+)?[A-Za-z0-9_]+[[:space:]]*:[[:space:]]*([A-Za-z0-9_]+::)*(Vec|String|BTreeMap|BTreeSet|VecDeque|BinaryHeap)[<[:space:]]/ && line ~ /\.clone\(\)/) hard = 1
 						grow = 0
 						# Substring search rather than a regex, so `.push(` needs no escaping to mean
 						# itself - and `receiver` is handed the same literal it matched on.
@@ -138,7 +166,7 @@ self_test() {
 		exit 1
 	fi
 
-	for form in 'let v = Vec::with_capacity(4);' 'let v = alloc::vec![0u8; 4];' 'let b = Box::new(4u8);' 'let a = Arc::new(4u8);' 'let s = String::from("x");' 'let s = alloc::format!("{}", 1);' 'v.push(4u8);' 'q.push_back(4u8);' 'v.extend(other);'; do
+	for form in 'let v = Vec::with_capacity(4);' 'let v = alloc::vec![0u8; 4];' 'let b = Box::new(4u8);' 'let a = Arc::new(4u8);' 'let s = String::from("x");' 'let s = alloc::format!("{}", 1);' 'v.push(4u8);' 'q.push_back(4u8);' 'v.extend(other);' 'let v = slice.to_vec();' 'let s = text.to_owned();' 'let v = self.records.lock().clone();' 'let v = cell.borrow().clone();' 'let v: Vec<u32> = self.free.clone();' 'let mut m: alloc::vec::Vec<u8> = other.clone();'; do
 		printf 'fn f() {\n\t%s\n}\n' "$form" >"$scratch/bad/a.rs"
 		if scan "$scratch/bad" 2>/dev/null; then
 			echo "kernel-allocations: SELF-TEST FAILED - an infallible allocation was accepted: $form" >&2
@@ -164,6 +192,21 @@ self_test() {
 		echo "kernel-allocations: SELF-TEST FAILED - a reservation covered another function's growth" >&2
 		exit 1
 	fi
+
+	# A refcount bump is NOT an allocation, and the rules must not turn every `Arc` clone in the
+	# kernel into a marker: the gate's own reason for exempting a push after a reservation is that
+	# burying the markers that matter is a cost, not a saving.
+	printf 'fn f() {\n\tlet t = thread.clone();\n\tlet p = Arc::clone(&process);\n}\n' >"$scratch/good/a.rs"
+	if ! scan "$scratch/good" 2>/dev/null; then
+		echo "kernel-allocations: SELF-TEST FAILED - a plain refcount clone was refused" >&2
+		exit 1
+	fi
+	printf 'fn f() {\n\tlet v: Vec<u32> = self.free.clone(); // ALLOC-OK: test-only helper\n}\n' >"$scratch/good/a.rs"
+	if ! scan "$scratch/good" 2>/dev/null; then
+		echo "kernel-allocations: SELF-TEST FAILED - a marked collection clone was refused" >&2
+		exit 1
+	fi
+	printf 'fn f() {\n\tlet v = Vec::new();\n}\n' >"$scratch/good/a.rs"
 
 	# The marker, on the line and on the line above it.
 	printf 'fn f() {\n\tlet v = Vec::with_capacity(4); // ALLOC-OK: boot, before userspace exists\n}\n' >"$scratch/marked/a.rs"
