@@ -11,9 +11,12 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod assoc;
 mod buffer;
+mod command;
 mod control;
 mod detect;
+mod files;
 mod input;
 mod panel;
 mod search;
@@ -22,9 +25,12 @@ mod syntax;
 mod text;
 mod ui;
 
+pub use assoc::{Action, Association, DEFAULT_ASSOCIATIONS, SETTINGS_VERSION, Settings, is_associable, resolve};
 pub use buffer::{TextBuffer, TextBufferError, UNDO_BYTE_BUDGET};
+pub use command::{CommandBar, MAX_COMMAND_BYTES, MAX_HISTORY_LINES, MAX_WORDS, ParseError, Request, classify, split};
 pub use control::{RESIZE_EVENT, TerminalControl, TerminalSize, WINSIZE_REPLY, WINSIZE_REQUEST, decode_control};
 pub use detect::{FileType, detect_file_type};
+pub use files::{Criteria, Frontier, MAX_OPERATION_DEPTH, MAX_OPERATION_ENTRIES, Operation, Overwrite, Plan, PlanError, Results, Source, Step, Tags, glob_match, is_within, join, plan, should_replace};
 pub use input::{Chord, InputDecoder, InputEvent, Key, PointerEvent};
 pub use panel::{Bookmarks, EntryKey, History, MAX_BOOKMARKS, MAX_HISTORY, SortKey, SortSpec, compare, order, quick_search};
 pub use search::{HexPattern, HexPatternError, MAX_PATTERN_BYTES, TextQuery};

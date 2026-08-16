@@ -692,3 +692,296 @@ fn a_bookmark_is_never_dropped_to_make_room_for_a_newer_one() {
 	assert!(!marks.add(b"vol://usb"), "past the cap it refuses");
 	assert_eq!(marks.get(0), Some(&b"vol://media"[..]), "and the oldest is still there");
 }
+
+#[test]
+fn a_group_select_pattern_cannot_be_made_to_hang() {
+	// FORTY ASTERISKS AGAINST A LONG NAME is the input that crashes the recursive matcher, and a
+	// group-select is exactly where somebody types one. This is the iterative form with one
+	// backtrack point, so the pattern below returns rather than exploring.
+	let name: std::vec::Vec<u8> = std::vec![b'a'; 4096];
+	let pattern: std::vec::Vec<u8> = core::iter::repeat_n(&b"*a"[..], 40).flatten().copied().collect();
+	assert!(glob_match(&pattern, &name));
+
+	assert!(glob_match(b"*.rs", b"main.rs"));
+	assert!(glob_match(b"*.RS", b"main.rs"), "case is folded - `*.RS` selects the same files as `*.rs`");
+	assert!(glob_match(b"m?in.rs", b"main.rs"));
+	assert!(!glob_match(b"m?in.rs", b"maiin.rs"), "`?` is exactly one byte");
+	assert!(glob_match(b"*", b""), "a star matches nothing as well as something");
+	assert!(!glob_match(b"?", b""));
+	assert!(glob_match(b"a*b*c", b"axxbyyc"));
+	assert!(!glob_match(b"a*b*c", b"axxbyy"));
+}
+
+#[test]
+fn tagging_is_by_row_and_group_select_uses_the_glob() {
+	let names: std::vec::Vec<&[u8]> = std::vec![b"main.rs", b"lib.rs", b"Cargo.toml", b"README.md"];
+	let mut tags = Tags::new();
+	assert!(tags.is_empty());
+	assert!(tags.toggle(1));
+	assert!(tags.contains(1));
+	assert!(tags.toggle(1));
+	assert!(!tags.contains(1), "Insert on a tagged row untags it");
+
+	assert_eq!(tags.select(names.iter().copied(), b"*.rs"), 2);
+	assert_eq!(tags.rows(), &[0, 1], "the set is kept in row order, so an operation runs top to bottom");
+	assert_eq!(tags.select(names.iter().copied(), b"*.rs"), 0, "selecting the same pattern twice adds nothing");
+	assert_eq!(tags.unselect(names.iter().copied(), b"lib.*"), 1);
+	assert_eq!(tags.rows(), &[0]);
+
+	assert!(tags.invert(names.len()));
+	assert_eq!(tags.rows(), &[1, 2, 3], "invert tags what was untagged and untags what was tagged");
+}
+
+#[test]
+fn a_plan_refuses_a_destination_inside_its_own_source() {
+	// `cp -r a a/b` IS A REQUEST THAT CANNOT BE SATISFIED, and a program that starts it finds out
+	// by filling the volume. It is refused here, against every source, before a byte is read.
+	let dir = Source { path: b"vol://system/bin", name: b"bin", is_dir: true, size: 0 };
+	assert_eq!(plan(Operation::Copy, &[dir], b"vol://system/bin/lico", Overwrite::Skip).unwrap_err(), PlanError::DestinationInsideSource);
+	assert_eq!(plan(Operation::Copy, &[dir], b"vol://system/bin", Overwrite::Skip).unwrap_err(), PlanError::DestinationInsideSource, "into itself is inside itself");
+
+	// AND A PREFIX IS NOT A PARENT. `vol://system/binary` is not inside `vol://system/bin`, and a
+	// check that did not require the separator would refuse a copy that is perfectly legal.
+	assert!(!is_within(b"vol://system/binary", b"vol://system/bin"));
+	assert!(is_within(b"vol://system/bin/lico", b"vol://system/bin"));
+	assert!(is_within(b"vol://system/bin/lico", b"vol://system/bin/"), "a trailing separator on the parent changes nothing");
+
+	// A source landing on itself is refused too, and separately - it needs a different sentence.
+	let file = Source { path: b"vol://system/motd.txt", name: b"motd.txt", is_dir: false, size: 12 };
+	assert_eq!(plan(Operation::Copy, &[file], b"vol://system", Overwrite::Skip).unwrap_err(), PlanError::SameObject);
+	assert_eq!(plan(Operation::Copy, &[], b"vol://media", Overwrite::Skip).unwrap_err(), PlanError::Empty);
+}
+
+#[test]
+fn a_plan_says_when_its_total_is_a_lower_bound() {
+	// A PROGRESS BAR OVER A TOTAL NOBODY COMPUTED IS A PROGRESS BAR THAT LIES. A directory entry's
+	// own size says nothing about what is inside it, so a plan that includes one marks its total
+	// partial rather than being quietly wrong by however much the subtree holds.
+	let file = Source { path: b"vol://system/a.txt", name: b"a.txt", is_dir: false, size: 100 };
+	let dir = Source { path: b"vol://system/sub", name: b"sub", is_dir: true, size: 4096 };
+	let flat = plan(Operation::Copy, &[file], b"vol://media", Overwrite::Skip).expect("a plan");
+	assert_eq!(flat.total_bytes, 100);
+	assert!(!flat.total_is_partial);
+	assert_eq!(flat.steps[0].destination, b"vol://media/a.txt");
+
+	let deep = plan(Operation::Copy, &[file, dir], b"vol://media", Overwrite::Skip).expect("a plan");
+	assert_eq!(deep.total_bytes, 100, "the directory's own entry size is not counted as content");
+	assert!(deep.total_is_partial, "and the total says it is a lower bound");
+
+	// A DELETE HAS NO DESTINATION, and the plan does not invent one.
+	let removal = plan(Operation::Delete, &[file], b"", Overwrite::Skip).expect("a plan");
+	assert!(removal.steps[0].destination.is_empty());
+
+	assert_eq!(join(b"vol://media/", b"a.txt").unwrap(), b"vol://media/a.txt", "exactly one separator, whatever the caller passed");
+	assert!(should_replace(Overwrite::Newer, 200, 100));
+	assert!(!should_replace(Overwrite::Newer, 100, 200));
+	assert!(!should_replace(Overwrite::Ask, 200, 100), "`ask` is not `yes` - a planner cannot ask, and answering for the reader turns the question into an answer");
+}
+
+#[test]
+fn the_command_bar_edits_recalls_and_completes_without_becoming_a_shell() {
+	let mut bar = CommandBar::new();
+	for byte in b"ls -l" {
+		assert!(bar.insert(*byte));
+	}
+	assert_eq!(bar.line(), b"ls -l");
+	assert!(bar.word_left());
+	assert_eq!(bar.caret(), 3, "word movement lands at the start of the last word");
+	assert!(bar.insert_slice(b"main.rs "), "inserting the selected name puts it at the caret");
+	assert_eq!(bar.line(), b"ls main.rs -l");
+
+	// THE LINE BEING TYPED SURVIVES A WALK THROUGH THE HISTORY. Walking back and forward again must
+	// return to it, not to an empty bar - losing what somebody was in the middle of typing is the
+	// thing a history is most able to do wrong.
+	assert_eq!(bar.take(), b"ls main.rs -l");
+	for byte in b"cat motd" {
+		assert!(bar.insert(*byte));
+	}
+	assert!(bar.recall_previous());
+	assert_eq!(bar.line(), b"ls main.rs -l");
+	assert!(!bar.recall_previous(), "there is only one entry");
+	assert!(bar.recall_next());
+	assert_eq!(bar.line(), b"cat motd", "and the half-typed line comes back");
+
+	// COMPLETION CONVERGES on the longest common prefix rather than cycling through possibilities.
+	bar.clear();
+	for byte in b"li" {
+		assert!(bar.insert(*byte));
+	}
+	let names: std::vec::Vec<&[u8]> = std::vec![b"lico", b"licoedit", b"licoview", b"ls"];
+	assert_eq!(bar.complete(names.iter().copied()), 3, "three commands begin with `li`");
+	assert_eq!(bar.line(), b"lico", "and the bar holds what they all share");
+	assert_eq!(bar.complete(names.iter().copied()), 3);
+	assert_eq!(bar.line(), b"lico", "a second press adds nothing rather than picking one");
+
+	bar.clear();
+	for byte in b"lich" {
+		assert!(bar.insert(*byte));
+	}
+	assert_eq!(bar.complete(names.iter().copied()), 0, "nothing matches, and nothing is changed");
+	assert_eq!(bar.line(), b"lich");
+
+	// A REPEATED LINE IS NOT RECORDED TWICE - a history full of one command is one nobody can walk.
+	let mut repeated = CommandBar::new();
+	for _ in 0..3 {
+		for byte in b"ls" {
+			repeated.insert(*byte);
+		}
+		repeated.take();
+	}
+	assert_eq!(repeated.history().len(), 1);
+}
+
+#[test]
+fn a_typed_line_is_split_and_classified_without_reinterpreting_its_data() {
+	assert_eq!(split(b"cat  a.txt").unwrap(), std::vec![b"cat".to_vec(), b"a.txt".to_vec()]);
+	assert_eq!(split(b"cat \"two words.txt\"").unwrap(), std::vec![b"cat".to_vec(), b"two words.txt".to_vec()], "quotes hold a name with a space in it together");
+	assert_eq!(split(b"echo 'it is'").unwrap()[1], b"it is".to_vec());
+	assert_eq!(split(b"cat \"unclosed").unwrap_err(), ParseError::UnterminatedQuote, "where the argument ends changes what the command is, so it is refused rather than guessed");
+	assert_eq!(split(b"   ").unwrap_err(), ParseError::Empty);
+	assert_eq!(split(b"").unwrap_err(), ParseError::Empty);
+
+	// A PIPE IS DATA HERE. The bar launches ONE executable, and a line holding an operator passes
+	// it on as an argument rather than building something out of it - the bar gains pipelines when
+	// it gains the shell's own parser, not by growing a second one.
+	assert_eq!(split(b"echo a | b").unwrap(), std::vec![b"echo".to_vec(), b"a".to_vec(), b"|".to_vec(), b"b".to_vec()]);
+
+	assert_eq!(classify(b"cd vol://media").unwrap(), Request::ChangeDirectory(b"vol://media".to_vec()));
+	assert_eq!(classify(b"cd").unwrap(), Request::ChangeDirectory(std::vec::Vec::new()), "no argument means the volume root, which the caller resolves");
+	assert_eq!(classify(b"ls -l").unwrap(), Request::Foreground(std::vec![b"ls".to_vec(), b"-l".to_vec()]));
+	assert_eq!(classify(b"ls -l &").unwrap(), Request::Background(std::vec![b"ls".to_vec(), b"-l".to_vec()]));
+
+	// THE STATE-MUTATING BUILTINS ARE REFUSED BY NAME rather than run somewhere their effect is
+	// thrown away, which is the shell's rule and is right for the same reason.
+	assert_eq!(classify(b"export A=b").unwrap(), Request::Unsupported(b"export".to_vec()));
+	assert_eq!(classify(b"A=b").unwrap(), Request::Unsupported(b"A=b".to_vec()));
+	assert_eq!(classify(b"fg").unwrap(), Request::Unsupported(b"fg".to_vec()));
+
+	// AND THE BOUNDARY CASES A SHAPE TEST GETS WRONG.
+	assert_eq!(classify(b"cdrom").unwrap(), Request::Foreground(std::vec![b"cdrom".to_vec()]), "`cdrom` is not `cd`");
+	assert!(matches!(classify(b"cmd --opt=v").unwrap(), Request::Foreground(_)), "an option with an equals sign is not an assignment");
+	assert!(matches!(classify(b"=leading").unwrap(), Request::Foreground(_)), "and neither is a word that starts with one");
+	assert_eq!(classify(b"&").unwrap_err(), ParseError::Empty, "an ampersand with nothing in front of it names no command");
+}
+
+#[test]
+fn an_association_names_a_program_and_can_hold_nothing_else() {
+	// AN UNKNOWN FILE DEFAULTS TO THE VIEWER AND NEVER TO EXECUTION. There is no executable row in
+	// the table, so `Enter` on a program cannot run it - running a program is what the command bar
+	// is for, where somebody typed its name on purpose.
+	assert_eq!(resolve(DEFAULT_ASSOCIATIONS, FileType::Executable).program, "licoview");
+	assert_eq!(resolve(DEFAULT_ASSOCIATIONS, FileType::Executable).action, Action::View);
+	assert_eq!(resolve(DEFAULT_ASSOCIATIONS, FileType::Binary).program, "licoview");
+	assert_eq!(resolve(DEFAULT_ASSOCIATIONS, FileType::Archive).program, "licoview");
+
+	assert_eq!(resolve(DEFAULT_ASSOCIATIONS, FileType::Rust), Association { kind: FileType::Rust, action: Action::Edit, program: "licoedit" });
+	assert_eq!(resolve(DEFAULT_ASSOCIATIONS, FileType::Image).program, "imgview");
+	assert_eq!(resolve(DEFAULT_ASSOCIATIONS, FileType::Audio).program, "play");
+
+	// ONLY EDIT ASKS FOR A WRITE-BACK GRANT, which is the whole reason the action is a field rather
+	// than something inferred from the program's name.
+	assert!(DEFAULT_ASSOCIATIONS.iter().filter(|entry| entry.action == Action::Edit).all(|entry| entry.program == "licoedit"));
+	assert!(DEFAULT_ASSOCIATIONS.iter().all(|entry| is_associable(entry.program)), "every shipped row names a program the closed set admits");
+	assert!(!is_associable("shell"), "and the set is closed - a table cannot name something that launches other things");
+	assert!(!is_associable("rm"));
+}
+
+#[test]
+fn settings_fall_back_field_by_field_rather_than_being_discarded() {
+	let mut settings = Settings::default();
+	settings.sort_key = SortKey::Size;
+	settings.reverse = true;
+	settings.show_hidden = true;
+	settings.indent_width = 2;
+	let encoded = settings.encode().expect("room");
+	assert_eq!(Settings::decode(&encoded), settings, "what is written comes back");
+
+	// ONE BAD LINE IS ONE BAD LINE. A settings file with a mistyped value must not throw away the
+	// fields around it, and an unrecognised value keeps the current setting rather than reading as
+	// false - `reverse=maybe` is a typo, and turning the setting off because of it is a change
+	// nobody asked for.
+	let damaged = b"lico-settings 1\nsort=nonsense\nreverse=maybe\nshow-hidden=yes\ngarbage-with-no-equals\nindent=2\n";
+	let read = Settings::decode(damaged);
+	assert_eq!(read.sort_key, SortKey::Name, "an unreadable sort key falls back to the default");
+	assert_eq!(read.reverse, false, "and an unreadable boolean keeps what it had");
+	assert_eq!(read.show_hidden, true, "while the field after the damage is still read");
+	assert_eq!(read.indent_width, 2);
+
+	// A FILE THAT IS NOT THIS FORMAT YIELDS DEFAULTS, which is exactly what no file at all yields -
+	// so a corrupt settings file can never stop the suite from starting.
+	assert_eq!(Settings::decode(b"\x00\x01\x02 not a settings file"), Settings::default());
+	assert_eq!(Settings::decode(b""), Settings::default());
+	// A future version is read as defaults too rather than refused: settings are a convenience, and
+	// a newer build having written the file is not a reason for an older one to fail.
+	assert_eq!(Settings::decode(b"lico-settings 99\nreverse=yes\n").reverse, true, "an unknown version still reads the fields it recognises");
+
+	// The indent is CLAMPED rather than refused - a nonsensical width is a preference nobody can
+	// act on, and a usable one is always available.
+	assert_eq!(Settings::decode(b"lico-settings 1\nindent=0\n").indent_width, 1);
+	assert_eq!(Settings::decode(b"lico-settings 1\nindent=9\n").indent_width, 8);
+}
+
+#[test]
+fn a_search_walks_into_directories_whose_names_do_not_match() {
+	// THE DIFFERENCE BETWEEN "IS A RESULT" AND "IS WALKED INTO" is the whole of a recursive search
+	// being useful: the files somebody is looking for live in directories whose names do not match
+	// the pattern, so a walk that only descended into matching directories would find almost
+	// nothing.
+	let criteria = Criteria { name: Some(b"*.rs"), ..Criteria::default() };
+	let dir = EntryKey { name: b"source", size: 4096, modified: 100, is_dir: true };
+	let hit = EntryKey { name: b"main.rs", size: 500, modified: 100, is_dir: false };
+	assert!(!criteria.admits(&dir, 1), "the directory is not a result");
+	assert!(criteria.descends(1), "and is still walked into");
+	assert!(criteria.admits(&hit, 2));
+
+	// DEPTH IS A CEILING ON BOTH. A directory past the limit is neither a result nor opened.
+	let shallow = Criteria { max_depth: Some(1), ..criteria };
+	assert!(!shallow.admits(&hit, 2));
+	assert!(!shallow.descends(1), "at the limit there is nowhere further to go");
+	assert!(shallow.descends(0));
+
+	// SIZE AND TIME DO NOT APPLY TO A DIRECTORY: its entry size is a fact about the medium, not an
+	// amount of content, so filtering on it answers the wrong question.
+	let sized = Criteria { min_size: Some(1_000_000), ..Criteria::default() };
+	assert!(sized.admits(&dir, 1), "a directory is not excluded by a size filter");
+	assert!(!sized.admits(&hit, 1));
+
+	let ranged = Criteria { min_modified: Some(50), max_modified: Some(150), ..Criteria::default() };
+	assert!(ranged.admits(&hit, 1));
+	assert!(!Criteria { min_modified: Some(200), ..Criteria::default() }.admits(&hit, 1));
+	assert!(Criteria::default().admits(&hit, 1), "a criterion nobody set admits everything");
+	assert!(Criteria { directories_only: true, ..Criteria::default() }.admits(&dir, 1));
+	assert!(!Criteria { directories_only: true, ..Criteria::default() }.admits(&hit, 1));
+}
+
+#[test]
+fn a_result_set_and_a_walk_frontier_say_when_they_stopped_short() {
+	// A RESULT LIST THAT SILENTLY STOPPED GROWING LOOKS EXACTLY LIKE A TREE WITH NOTHING MORE IN
+	// IT, which is the failure a bound has to avoid being: the set remembers that it refused.
+	let mut results = Results::new();
+	assert!(results.push(b"vol://system/main.rs"));
+	assert_eq!(results.get(0), Some(&b"vol://system/main.rs"[..]), "a result keeps its real URI, so acting on it acts on the file it came from");
+	assert!(!results.is_truncated());
+	for index in 0..MAX_OPERATION_ENTRIES {
+		let mut uri = std::vec::Vec::from(&b"vol://system/"[..]);
+		uri.extend_from_slice(std::format!("{index}").as_bytes());
+		let _ = results.push(&uri);
+	}
+	assert_eq!(results.len(), MAX_OPERATION_ENTRIES);
+	assert!(results.is_truncated(), "and it says so rather than reporting a partial answer as a whole one");
+
+	// THE FRONTIER IS DEPTH-FIRST, so results arrive near the first thing that was opened rather
+	// than as a breadth-first sweep of the shallowest matches from everywhere at once.
+	let mut frontier = Frontier::new();
+	assert!(frontier.push(b"vol://system/a", 1));
+	assert!(frontier.push(b"vol://system/b", 1));
+	assert_eq!(frontier.pop(), Some((b"vol://system/b".to_vec(), 1)));
+	assert_eq!(frontier.pop(), Some((b"vol://system/a".to_vec(), 1)));
+	assert_eq!(frontier.pop(), None);
+	assert!(!frontier.refused_anything());
+
+	// AND IT IS BOUNDED IN DEPTH AS WELL AS IN WIDTH - a recursive walk over somebody else's tree
+	// is a stack overflow waiting for a deep enough directory, and this one refuses by name.
+	assert!(!frontier.push(b"vol://system/deep", MAX_OPERATION_DEPTH + 1));
+	assert!(frontier.refused_anything());
+}

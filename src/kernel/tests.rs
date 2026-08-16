@@ -4516,6 +4516,13 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent volume");
 	}
 	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
+	// THE TWO GRANTS THIS HARNESS WITHHOLDS, sent as bare messages so the tag arrives and the
+	// capability does not. `lico` takes a launch broker and its own asset directory from
+	// PermissionManager; here it gets neither, which is a state it has to run in - a manager that
+	// blocked forever waiting for a grant nobody sent would be one that could not start on a boot
+	// that granted less than the full set.
+	bootstrap.send(Message::new(b"PERMISSION".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent launch broker");
+	bootstrap.send(Message::new(b"APP_ASSETS".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent asset directory");
 
 	let mut output = alloc::vec::Vec::new();
 	let mut rendered = false;
@@ -4556,6 +4563,29 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 		}
 	}
 	assert!(switched, "Tab moves the active panel to the right side");
+
+	// F7 MAKES A DIRECTORY, and this is the first thing in this test that changes the volume rather
+	// than the screen. It is worth having at exactly this layer: the mkdir path runs through the
+	// prompt mode, the volume client the panel's own URI names, and the refresh afterwards - and a
+	// manager that drew a directory it had not created, or created one and did not show it, would
+	// look identical from any one of those three alone.
+	terminal.send(Message::new(b"\x1b[18~".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico F7 input");
+	for byte in b"licodir" {
+		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new(), 0)).expect("lico directory name");
+	}
+	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico confirms the name");
+	let mut created = false;
+	for _ in 0..200_000 {
+		system.pump();
+		while let Ok(message) = terminal.recv() {
+			created |= message.bytes.windows(b"licodir/".len()).any(|window| window == b"licodir/");
+			output.push(message.bytes);
+		}
+		if created {
+			break;
+		}
+	}
+	assert!(created, "F7 creates the directory and the panel shows it, with the trailing separator that marks one");
 
 	terminal.send(Message::new(b"\x1b[21~".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico F10 input");
 	for _ in 0..100_000 {

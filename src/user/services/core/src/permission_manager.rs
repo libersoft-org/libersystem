@@ -206,7 +206,11 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"imgview" => Some(granted("imgview", alloc::vec![Capability::Volumes, Capability::Display, Capability::InputKeys])),
 		b"licoview" => Some(granted("licoview", alloc::vec![Capability::Volumes, Capability::AppAssets])),
 		b"licoedit" => Some(granted("licoedit", alloc::vec![Capability::Volumes, Capability::AppAssets])),
-		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets])),
+		// THE MANAGER GETS THE NARROW LAUNCH BROKER AND NOT PROCESS AUTHORITY. `Permission` lets it
+		// ask for a NAMED program to be started, which then runs under that program's own manifest -
+		// so an association or a command-bar line can launch something without lending it anything.
+		// `Process` would be raw process creation, and is deliberately not here.
+		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets, Capability::Permission])),
 		b"imgconv" => Some(granted("imgconv", alloc::vec![Capability::Volumes])),
 		b"play" => Some(granted("play", alloc::vec![Capability::Volumes, Capability::AudioStream])),
 		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
