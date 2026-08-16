@@ -3,7 +3,7 @@
 // The module names are what the host matches on, together with the exact signature; the host that
 // instantiates the module supplies the implementations.
 
-use crate::status::{Error, clamp_count};
+use crate::status::{Error, MAX_TRANSFER, clamp_count};
 
 #[link(wasm_import_module = "liber:vfs@1")]
 unsafe extern "C" {
@@ -20,12 +20,23 @@ unsafe extern "C" {
 // Read up to `buf.len()` bytes of the granted input into `buf`; `Ok(n)` is how many bytes the host
 // delivered, and `Ok(0)` means the input really was empty.
 pub fn read_input(buf: &mut [u8]) -> Result<usize, Error> {
+	// CHECKED BEFORE THE CAST. `buf.len() as i32` wraps a buffer larger than `i32::MAX` into a
+	// negative length, which the host reads as neither a length nor a status - and the wrapper whose
+	// whole job is to be the safe side of this boundary was doing the unsafe thing itself.
+	// `Unsupported` is the host's own answer for the same length, so the guest gets one verdict
+	// whether it checked or the host did.
+	if buf.len() > MAX_TRANSFER {
+		return Err(Error::Unsupported);
+	}
 	clamp_count(read(buf.as_mut_ptr() as i32, buf.len() as i32), buf.len())
 }
 
 // Write `buf` to the granted output; `Ok(n)` is how many bytes the host persisted. A read-only
 // grant is `Err(Denied)` rather than `Ok(0)`, which is the difference this world exists to carry.
 pub fn write_output(buf: &[u8]) -> Result<usize, Error> {
+	if buf.len() > MAX_TRANSFER {
+		return Err(Error::Unsupported);
+	}
 	clamp_count(write(buf.as_ptr() as i32, buf.len() as i32), buf.len())
 }
 
@@ -36,6 +47,9 @@ pub fn write_output(buf: &[u8]) -> Result<usize, Error> {
 // the wrong answer to either contract. A caller that really has bytes can decide for itself how to
 // render them.
 pub fn log_message(msg: &str) -> Result<(), Error> {
+	if msg.len() > MAX_TRANSFER {
+		return Err(Error::Unsupported);
+	}
 	let status: i32 = log_raw(msg.as_ptr() as i32, msg.len() as i32);
 	if status < 0 { Err(Error::from_status(status)) } else { Ok(()) }
 }

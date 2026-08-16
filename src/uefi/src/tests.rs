@@ -806,3 +806,40 @@ fn the_fadt_says_which_instruction_reaches_psci() {
 	let short = machine(&[table(b"FACP", 1, &vec![0u8; 116 - 36])], 2);
 	assert_eq!(acpi::Acpi::new(short, here).psci_conduit(), None, "an ACPI 1.0 FADT has no ARM boot flags");
 }
+
+// P02M0129, sixth round: the stride, the whole-number rule and the second `GetMemoryMap`.
+#[test]
+fn a_descriptor_stride_that_cannot_be_one_is_refused() {
+	let _guard = guard();
+	state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, 0x1000, 1), descriptor(crate::CONVENTIONAL_MEMORY, 0x3000, 1)];
+	let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+	let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
+
+	// A stride SMALLER than a descriptor reads each entry past its own end into the next - or, at
+	// the last, past the buffer. `desc_size == 0` was refused and this was not; the specification
+	// allows the firmware's stride to be larger than the structure, never smaller.
+	assert!(memory::translate_map(buf, map_size, core::mem::size_of::<crate::MemoryDescriptor>() - 1, regions.as_mut_ptr()).is_none(), "a stride shorter than a descriptor is not a stride");
+
+	// A map that is not a whole number of descriptors had its partial tail silently discarded, which
+	// for the one structure that says which RAM exists is the same looks-complete-and-is-not failure
+	// the `MAX_REGIONS` refusal exists for.
+	assert!(memory::translate_map(buf, map_size - 1, desc_size, regions.as_mut_ptr()).is_none(), "a map that is not a whole number of descriptors is refused rather than truncated");
+
+	// And the honest pair still translates, so these are rules about the arguments and not a
+	// refusal of the ordinary case.
+	assert_eq!(memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()), Some(2), "the map itself is fine");
+	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
+}
+
+#[test]
+fn a_region_whose_end_leaves_the_address_space_is_refused() {
+	// `page_count * PAGE_SIZE` was checked and `phys_start + length` was not, so a descriptor whose
+	// base is near the top of the address space and whose length takes it past described a region no
+	// machine has - which the kernel would then carve, seed or map.
+	let _guard = guard();
+	state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, u64::MAX - 0x1000, 4)];
+	let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+	let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
+	assert!(memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).is_none(), "a region that leaves the address space is refused");
+	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
+}

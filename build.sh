@@ -59,6 +59,14 @@ step_sdk() {
 	# does not own - and `mkpackages` reads `.build/cargo/sdk/.../liber_component.wasm` for exactly
 	# that reason.
 	(cd "$SRC_DIR/sdk" && cargo build --release --target wasm32-unknown-unknown --workspace)
+	# A SIDECAR NAMING WHAT IT WAS BUILT FROM.
+	#
+	# A missing artifact is a failure and a STALE one used to pass: build the SDK, change
+	# `report_panic()`, run the host-tests gate alone, and the old binary made the test green against
+	# an implementation that no longer exists. The test compares this against a freshly computed
+	# digest of the same inputs, so an artifact that predates the sources is named as stale rather
+	# than trusted. See `tools/sdk-inputs.sh` for what goes into it.
+	(cd "$SRC_DIR" && tools/sdk-inputs.sh default) >"$BUILD_DIR/cargo/sdk/wasm32-unknown-unknown/release/liber_component.wasm.inputs"
 	# AND THE SAME EXAMPLE WITH THE FEATURE ON, into its own target directory so the artifact above
 	# is untouched.
 	#
@@ -69,6 +77,7 @@ step_sdk() {
 	# everything under `#[cfg(feature = "dev-diagnostics")]` in `src/sdk/src/panic.rs` had no
 	# automatic coverage against a real guest at all. Two artifacts, each asserted unconditionally.
 	(cd "$SRC_DIR/sdk" && CARGO_TARGET_DIR="$BUILD_DIR/cargo/sdk-dev" cargo build --release --target wasm32-unknown-unknown -p liber_component --features liber-sdk/dev-diagnostics)
+	(cd "$SRC_DIR" && tools/sdk-inputs.sh dev-diagnostics) >"$BUILD_DIR/cargo/sdk-dev/wasm32-unknown-unknown/release/liber_component.wasm.inputs"
 }
 
 step_libs() {

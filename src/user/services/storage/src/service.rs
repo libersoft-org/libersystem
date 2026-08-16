@@ -3283,6 +3283,24 @@ impl udf::BlockDevice for UdfBlockDevice {
 	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
 		unsafe { read_blocks_chunked(self.chan, UDF_SECTORS, index, count, buf, UDF_SECTORS as usize * SECTOR_SIZE) }
 	}
+
+	// HOW BIG THE DISC IS, which this did not implement and therefore answered `None`.
+	//
+	// `udf::mount` probes the Anchor Volume Descriptor Pointer at 256, at N-256 and at N when the
+	// backing knows its size - the redundancy optical media carries precisely so a damaged anchor is
+	// survivable. `MemDisc` in the UDF test suite implements this and the tests pass; this adapter
+	// did not, so every real `vol://udf` mount took the default `None` and probed anchor 256 alone.
+	// A feature that worked in the fixture and nowhere else.
+	//
+	// The capacity was already available: `block_capacity` asks the driver, in this file, and is
+	// what the LiberFS and FAT paths use to size their volumes.
+	fn block_count(&mut self) -> Option<u64> {
+		let bytes = unsafe { block_capacity(self.chan) }.ok()?;
+		// In UDF blocks, not disk sectors. A capacity that is not a whole number of 2 KiB blocks is
+		// truncated rather than rounded up: the last partial block is not addressable as a UDF
+		// block, and answering N+1 would send the anchor probe off the end of the medium.
+		Some(bytes / (UDF_SECTORS * SECTOR_SIZE as u64))
+	}
 }
 // How many 2048-byte logical blocks one request may carry.
 //

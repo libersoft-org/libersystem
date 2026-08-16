@@ -181,6 +181,8 @@ fn missing_is_not_found() {
 // bytes, so 148 is the first free record slot and 104 is HELLO.TXT's offset.
 const ROOT_FREE: usize = 148;
 const HELLO_REC: usize = 104;
+// The subdirectory's record: after the two 34-byte special entries and before HELLO.TXT's.
+const SUB_REC: usize = 68;
 
 #[test]
 fn malformed_records_do_not_panic() {
@@ -304,8 +306,14 @@ fn a_joliet_escape_later_in_the_field_is_not_joliet() {
 	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("the PVD still mounts it");
 	// The volume's records are UCS-2 here, so reading them through the PVD namespace gives
 	// something other than the Joliet names - which is the point: the SVD was NOT taken as Joliet.
-	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
-	assert!(!names.contains(&"HELLO.TXT".to_string()), "a descriptor whose escape is not at the start of the field must not supply the namespace: {names:?}");
+	// The SVD was NOT taken as Joliet, and the proof is now stronger than "the names are different".
+	//
+	// This fixture writes UCS-2 identifiers into the one directory both namespaces share, so reading
+	// them through the PVD means reading NUL bytes as name characters - and a name with a NUL in it
+	// is not a name, which the component rule added in the sixth round refuses. The old assertion
+	// was that `HELLO.TXT` is absent from the listing, which the same behaviour satisfies; this says
+	// which listing came back.
+	assert_eq!(fs.list(), Err(FsError::Corrupt), "the PVD namespace over UCS-2 identifiers is not a namespace, and the SVD was not used");
 }
 
 #[test]
@@ -622,8 +630,14 @@ fn an_odd_length_joliet_identifier_is_refused() {
 	rec[33..33 + id.len()].copy_from_slice(&id);
 	img[at..at + rec.len()].copy_from_slice(&rec);
 	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
-	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
-	assert!(!names.iter().any(|n| n.contains('?')), "a damaged UCS-2 identifier must not become a lossy name: {names:?}");
+	// REFUSED OUTRIGHT NOW, which is stronger than what this used to assert.
+	//
+	// The old assertion was that no name comes back containing '?' - the lossy character an invalid
+	// unit used to become - and it was satisfied by the record being SKIPPED. Skipping a damaged
+	// record is the short-listing-reported-as-complete this crate refuses everywhere else, and the
+	// name rule added in the sixth round makes it a refusal: a damaged identifier is not a name, and
+	// a directory holding one is not a directory this reader will list.
+	assert_eq!(fs.list(), Err(FsError::Corrupt), "an odd-length UCS-2 identifier makes the directory unreadable, rather than one entry quietly missing");
 }
 
 #[test]
@@ -653,8 +667,8 @@ fn a_surrogate_ucs2_unit_is_refused() {
 	rec[33..33 + id.len()].copy_from_slice(&id);
 	img[at..at + rec.len()].copy_from_slice(&rec);
 	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
-	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
-	assert!(!names.iter().any(|n| n.contains('?')), "an unpaired surrogate must not become a lossy name: {names:?}");
+	// The same strengthening as the odd-length case above: refused rather than skipped.
+	assert_eq!(fs.list(), Err(FsError::Corrupt), "an unpaired surrogate makes the directory unreadable, rather than one entry quietly missing");
 }
 
 #[test]
@@ -1129,4 +1143,128 @@ fn a_window_read_of_a_large_file_does_not_stage_the_whole_thing() {
 	// The first nine bytes of the extent are the fixture's own, so a window starting at 16 begins
 	// past them and the batched read has to have got its offsets right to see zeros there.
 	assert_eq!(&wide[..8], &[0u8; 8], "the head sector's bytes past the written content");
+}
+
+// P02M0126, sixth round: what a hostile disc can make this backend DO, and the namespaces it can
+// make ambiguous.
+//
+// The round before bounded how much MEMORY a crafted image can make this backend spend - the walk
+// reads a sector at a time instead of allocating the extent. What none of it bounded is WORK, and
+// what none of it checked is whether the names a listing shows are names a lookup can reach.
+
+#[test]
+fn a_directory_extent_larger_than_the_work_bound_is_refused_before_it_is_read() {
+	// `for_each_record` checked only that `lba + sectors` fits the medium and `MAX_DIR_ENTRIES`
+	// counts entries LISTED - so a directory declaring a near-4 GiB extent whose every sector opens
+	// with a zero byte yields no entries at all, never reaches the entry limit, and drives millions
+	// of synchronous `read_block` calls while holding the StorageService request.
+	//
+	// `TooLarge`, not `Corrupt`: the directory may be perfectly well formed and this backend will
+	// not walk something that size in one request.
+	// Through the SUBDIRECTORY, because the mount checks the ROOT extent against the volume's block
+	// count and would refuse this image before the walk ever ran. `for_each_record` makes the same
+	// bounds check for a subdirectory - and the work bound is asked FIRST, which is what this
+	// distinguishes: `TooLarge` rather than the `Invalid` a too-big-for-the-volume extent gets.
+	let mut img = build_iso(false);
+	let root = 19 * SECTOR_SIZE;
+	both32(&mut img[root + SUB_REC..], 10, 64 * 1024 * 1024);
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("the geometry is otherwise sound");
+	assert_eq!(fs.list_dir(b"SUB"), Err(FsError::TooLarge), "an extent past the work bound is refused before a sector of it is read");
+}
+
+#[test]
+fn a_directory_record_that_is_not_a_legal_directory_refuses_the_listing() {
+	// `parse_record` folded multi-extent and interleaving into a general `unsupported` flag and
+	// `read_dir` filtered those entries out - defensible for a regular FILE this backend will not
+	// read, and for a DIRECTORY it is a short listing presented as a complete one, with the whole
+	// subtree behind it gone and no error anywhere.
+	//
+	// ECMA-119: a directory is not an associated file, is not interleaved and has a single file
+	// section.
+	for (label, at, bit) in [("associated", 25usize, 0x04u8), ("multi-extent", 25, 0x80), ("interleaved", 26, 0x01), ("a non-zero interleave gap", 27, 0x01)] {
+		let mut img = build_iso(false);
+		let root = 19 * SECTOR_SIZE;
+		let sub = root + SUB_REC;
+		assert!(img[sub + 25] & 0x02 != 0, "{label}: the fixture's second record must be the subdirectory");
+		img[sub + at] |= bit;
+		let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+		assert_eq!(fs.list(), Err(FsError::Corrupt), "{label} on a DIRECTORY record refuses the listing rather than dropping the subtree");
+	}
+}
+
+#[test]
+fn a_name_that_is_not_one_path_component_is_refused() {
+	// `decode_name` accepted `/`, NUL and control characters. A UCS-2 `/` produces an entry listed
+	// as `aaa/bbb` that lookup splits into two components, so the entry cannot be opened by the name
+	// it was listed under; control characters additionally corrupt whatever renders the listing.
+	for (label, byte) in [("a separator", b'/'), ("a control character", 0x07u8)] {
+		let mut img = build_iso(false);
+		let root = 19 * SECTOR_SIZE;
+		// HELLO.TXT's identifier begins at byte 33 of its record.
+		let rec = root + HELLO_REC;
+		img[rec + 33] = byte;
+		let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+		assert_eq!(fs.list(), Err(FsError::Corrupt), "{label} in an identifier is not a name");
+	}
+}
+
+#[test]
+fn two_entries_with_one_name_make_the_directory_ambiguous() {
+	// The de-duplication compared against `out.last()` alone, which is right for ISO version
+	// records - their identifiers are ordered, so equal names are adjacent - and wrong once names
+	// come from somewhere other than the identifier: a listing showed two entries called `same` and
+	// `open("same")` could only ever reach the first.
+	//
+	// Built with the version suffix, which is what makes two RECORDS with different identifiers
+	// decode to one name without being neighbours.
+	let mut img = build_iso(false);
+	let root = 19 * SECTOR_SIZE;
+	// The third record slot in the root, given HELLO.TXT's identifier again.
+	// SUB's record copied into the free slot AFTER HELLO.TXT, so the two records naming `SUB` are
+	// not neighbours - which is the whole point: the `out.last()` comparison collapses adjacent
+	// equals and sees nothing at a distance.
+	let sub = root + SUB_REC;
+	let len = img[sub] as usize;
+	let third = root + ROOT_FREE;
+	let copy: Vec<u8> = img[sub..sub + len].to_vec();
+	img[third..third + len].copy_from_slice(&copy);
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+	assert_eq!(fs.list(), Err(FsError::Corrupt), "a directory whose listing shows one name twice is ambiguous, and half of it is unreachable");
+}
+
+#[test]
+fn a_multi_volume_set_is_unsupported_and_a_set_of_none_is_corrupt() {
+	// `set_size != 1` returned `Corrupt` for both, and this error type deliberately distinguishes
+	// "valid ISO using a construct this backend does not implement" from "does not obey its own
+	// rules". A multi-volume set is the former; a set of zero volumes is the latter, because a
+	// volume belongs to a set of at least itself.
+	let pvd = 16 * SECTOR_SIZE;
+	let mut img = build_iso(false);
+	both16(&mut img[pvd..], 120, 2);
+	assert_eq!(Iso9660::mount_checked(MemDisc { data: img }).err(), Some(MountError::Unsupported), "a valid multi-volume set is a construct this backend does not implement");
+
+	let mut img = build_iso(false);
+	both16(&mut img[pvd..], 120, 0);
+	assert_eq!(Iso9660::mount_checked(MemDisc { data: img }).err(), Some(MountError::Corrupt), "a set of no volumes is a disc disobeying its own rules");
+}
+
+#[test]
+fn a_second_primary_volume_descriptor_that_disagrees_is_refused() {
+	// The standard permits a PVD to be recorded more than once, and every type-1 descriptor
+	// overwrote the previous one - so a disc could carry a benign PVD followed by a hostile one and
+	// be parsed by the second.
+	let mut img = vec![0u8; SECTOR_SIZE * 25];
+	let base = build_iso(false);
+	img[..base.len()].copy_from_slice(&base);
+	// Move the terminator out to sector 18 and put a second, disagreeing PVD at 17.
+	let pvd: Vec<u8> = img[16 * SECTOR_SIZE..17 * SECTOR_SIZE].to_vec();
+	img[18 * SECTOR_SIZE] = 255;
+	img[18 * SECTOR_SIZE + 1..18 * SECTOR_SIZE + 6].copy_from_slice(b"CD001");
+	img[18 * SECTOR_SIZE + 6] = 1;
+	img[17 * SECTOR_SIZE..18 * SECTOR_SIZE].copy_from_slice(&pvd);
+	// A second copy that AGREES is fine.
+	assert!(Iso9660::mount(MemDisc { data: img.clone() }).is_some(), "a repeated PVD that agrees with the first is legal");
+	// One that disagrees about where the root is, is not.
+	both32(&mut img[17 * SECTOR_SIZE + 156..], 2, 20);
+	assert_eq!(Iso9660::mount_checked(MemDisc { data: img }).err(), Some(MountError::Corrupt), "a second PVD naming a different root must not silently become the one that is used");
 }

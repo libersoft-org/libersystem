@@ -94,11 +94,28 @@ unsafe fn load_component(storage: u64, uri: &[u8]) -> Option<Vec<u8>> {
 		if result.file == 0 || result.size == 0 {
 			return None;
 		}
+		// A CEILING, AND A FALLIBLE COPY. `to_vec()` on a length the volume chose is an infallible
+		// allocation, so a component file large enough killed this host before the parser saw a byte
+		// of it - the resource policy the engine states beginning after the one allocation nobody
+		// bounded.
+		//
+		// 16 MiB is far past anything this system's components are: the SDK's example is a few
+		// kilobytes, and the engine's own memory ceiling is four pages. A module past it is refused
+		// with the file closed rather than parsed.
+		const MAX_COMPONENT_BYTES: u64 = 16 * 1024 * 1024;
+		if result.size > MAX_COMPONENT_BYTES {
+			close(result.file);
+			return None;
+		}
 		let mapped: u64 = map_object(result.file)?;
-		let bytes: Vec<u8> = core::slice::from_raw_parts(mapped as *const u8, result.size as usize).to_vec();
+		let mut bytes: Vec<u8> = Vec::new();
+		let copied = bytes.try_reserve_exact(result.size as usize).is_ok();
+		if copied {
+			bytes.extend_from_slice(core::slice::from_raw_parts(mapped as *const u8, result.size as usize));
+		}
 		unmap_object(result.file);
 		close(result.file);
-		Some(bytes)
+		if copied { Some(bytes) } else { None }
 	}
 }
 

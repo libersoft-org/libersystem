@@ -353,6 +353,39 @@ fn wasi_host_runs_a_component() {
 	assert_eq!(status, expected.len() as i32, "the report's status is the count the component read, not a sign the payload has to be guessed from");
 }
 
+tagged_test!(the_hosts_report_tells_an_empty_file_from_a_refusal, [Component, Service], id = "kernel.applications.the_hosts_report_tells_an_empty_file_from_a_refusal", covers = ["bin.wasi_host", "wasm"]);
+fn the_hosts_report_tells_an_empty_file_from_a_refusal() {
+	// THE TWO SHAPES `wasi_host_runs_a_component` CANNOT REACH, and the two the status word exists
+	// for. That test runs against the real system volume, where the granted file exists and is not
+	// empty - one of three answers the protocol can give, and the only one covered. The other two
+	// produce an IDENTICAL payload (none) and are distinguished only by the status: a refusal is
+	// negative, and a successful read of an empty file is zero.
+	//
+	// Before the status existed the host sent `count.max(0)` bytes and nothing else, so a
+	// supervisor received an empty message either way and could not tell "you may not" from "there
+	// was nothing there". Four rounds of work went into separating those two answers and the last
+	// hop undid it; these are the two cases that say it stays undone.
+	//
+	// The volumes are built here rather than staged, through the archive writer `abi` already
+	// carries - so this needs no build change and cannot drift from what the system volume happens
+	// to contain.
+
+	// An empty granted file: status ZERO, empty payload, and NOT an error.
+	let empty = run_wasi_scenario_over(&[(b"hello.txt", b"")]).expect("the scenario runs against an empty granted file");
+	assert_eq!(empty.status, 0, "an empty file read successfully is a count of zero, not a refusal");
+	assert!(empty.payload.is_empty(), "and there is nothing after the status");
+
+	// The granted file ABSENT: the volume answers and says no, which reaches the guest as a
+	// negative status and reaches the supervisor as the same negative status.
+	let missing = run_wasi_scenario_over(&[(b"other.txt", b"something else")]).expect("the scenario runs against a volume without the granted file");
+	assert!(missing.status < 0, "a granted file that is not there is a refusal, not a zero-byte read (status {})", missing.status);
+	assert!(missing.payload.is_empty(), "and a refusal carries no payload");
+
+	// AND THE TWO ARE DIFFERENT ANSWERS, which is the entire point and the thing the old report
+	// could not express.
+	assert_ne!(empty.status, missing.status, "an empty file and a refusal must not arrive as the same report");
+}
+
 tagged_test!(powerbox_grants_a_picked_file_to_a_component, [Component, Service], id = "kernel.applications.powerbox_grants_a_picked_file_to_a_component", covers = ["kernel", "services"]);
 fn powerbox_grants_a_picked_file_to_a_component() {
 	// A Wasm component with NO filesystem access of its own runs under wasi_host,

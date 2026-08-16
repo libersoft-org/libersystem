@@ -73,52 +73,60 @@ fn a_window_that_does_not_fit_is_refused_rather_than_clamped() {
 	const MEM: usize = 64 * 1024;
 
 	// The ordinary cases, including both degenerate ends.
-	assert_eq!(window(&[Value::I32(0), Value::I32(256)], MEM), Some((0, 256)));
-	assert_eq!(window(&[Value::I32(0), Value::I32(0)], MEM), Some((0, 0)), "an empty window is legal");
-	assert_eq!(window(&[Value::I32(MEM as i32), Value::I32(0)], MEM), Some((MEM, MEM)), "an empty window at the very end is still inside");
-	assert_eq!(window(&[Value::I32(MEM as i32 - 256), Value::I32(256)], MEM), Some((MEM - 256, MEM)), "exactly to the end fits");
+	assert_eq!(window(&[Value::I32(0), Value::I32(256)], MEM), Ok((0, 256)));
+	assert_eq!(window(&[Value::I32(0), Value::I32(0)], MEM), Ok((0, 0)), "an empty window is legal");
+	assert_eq!(window(&[Value::I32(MEM as i32), Value::I32(0)], MEM), Ok((MEM, MEM)), "an empty window at the very end is still inside");
+	assert_eq!(window(&[Value::I32(MEM as i32 - 256), Value::I32(256)], MEM), Ok((MEM - 256, MEM)), "exactly to the end fits");
 
 	// One byte past the end is refused, not shortened. `end` used to be `.min(mem_len)`, so a
 	// component asking for three hundred bytes near the top of its memory silently got fewer - and
 	// a count it could not distinguish from a short file.
-	assert_eq!(window(&[Value::I32(MEM as i32 - 256), Value::I32(257)], MEM), None, "one byte past the end");
-	assert_eq!(window(&[Value::I32(MEM as i32), Value::I32(1)], MEM), None, "starting at the end");
+	assert_eq!(window(&[Value::I32(MEM as i32 - 256), Value::I32(257)], MEM), Err(WindowError::OutOfBounds), "one byte past the end");
+	assert_eq!(window(&[Value::I32(MEM as i32), Value::I32(1)], MEM), Err(WindowError::OutOfBounds), "starting at the end");
 
 	// A POINTER WITH THE HIGH BIT SET. A wasm32 address is a 32-bit pattern; read as a signed
 	// integer it sign-extends into an enormous `usize`. Either reading refuses this window - the
 	// point is that it is refused as OUT OF RANGE and not accepted as a small negative offset.
-	assert_eq!(window(&[Value::I32(-1), Value::I32(1)], MEM), None, "0xFFFF_FFFF is not inside a 64 KiB memory");
-	assert_eq!(window(&[Value::I32(i32::MIN), Value::I32(0)], MEM), None, "0x8000_0000 is not inside a 64 KiB memory");
+	assert_eq!(window(&[Value::I32(-1), Value::I32(1)], MEM), Err(WindowError::OutOfBounds), "0xFFFF_FFFF is not inside a 64 KiB memory");
+	assert_eq!(window(&[Value::I32(i32::MIN), Value::I32(0)], MEM), Err(WindowError::OutOfBounds), "0x8000_0000 is not inside a 64 KiB memory");
 
 	// And the arithmetic does not wrap. Two 32-bit values cannot overflow a 64-bit `usize`, so on
 	// this host the sum is simply large - and a memory that large would legitimately contain it,
 	// which is what this asserts rather than pretending otherwise. The `checked_add` is what keeps
 	// the same code right where `usize` is 32 bits, and what keeps a future 64-bit `ptr` honest.
-	assert_eq!(window(&[Value::I32(-1), Value::I32(i32::MAX)], usize::MAX), Some((0xFFFF_FFFF, 0x1_7FFF_FFFE)), "no wrap: the sum is exact");
+	assert_eq!(window(&[Value::I32(-1), Value::I32(i32::MAX)], usize::MAX), Ok((0xFFFF_FFFF, 0x1_7FFF_FFFE)), "no wrap: the sum is exact");
 
 	// AND THE ABI'S OWN CEILING. `read` and `write` answer an `i32` that carries a byte count when
 	// positive and a status when negative, so a count above `i32::MAX` cannot be told apart from a
 	// failure - `n as i32` would wrap it into one. Nothing reaches it today, because a component's
 	// memory is capped far below it; the limit is written down and checked here rather than left to
 	// depend on that cap, because a limit nobody wrote down is a limit somebody finds.
-	assert_eq!(window(&[Value::I32(0), Value::I32(i32::MAX)], usize::MAX), Some((0, i32::MAX as usize)), "the largest expressible count is allowed");
-	assert_eq!(window(&[Value::I32(0), Value::I32(i32::MIN)], usize::MAX), None, "0x8000_0000 bytes is one more than the result can carry");
-	assert_eq!(window(&[Value::I32(0), Value::I32(-1)], usize::MAX), None, "and so is 0xFFFF_FFFF");
+	assert_eq!(window(&[Value::I32(0), Value::I32(i32::MAX)], usize::MAX), Ok((0, i32::MAX as usize)), "the largest expressible count is allowed");
+	assert_eq!(window(&[Value::I32(0), Value::I32(i32::MIN)], usize::MAX), Err(WindowError::TooLarge), "0x8000_0000 bytes is one more than the result can carry - and it is TOO LARGE, not out of bounds: the address is legal and the length is not");
+	assert_eq!(window(&[Value::I32(0), Value::I32(-1)], usize::MAX), Err(WindowError::TooLarge), "and so is 0xFFFF_FFFF");
 
 	// Missing arguments are REFUSED rather than defaulted to zero. They used to read as `(0, 0)`,
 	// which is an answer to a call that should not have happened - the world's signature is
 	// `(i32, i32)` and `resolve` refuses anything else, so the wrong arity here means the
 	// interpreter is broken and guessing is the wrong response.
-	assert_eq!(window(&[], MEM), None, "no arguments is not an empty window");
-	assert_eq!(window(&[Value::I32(8)], MEM), None, "one argument is not a window either");
-	assert_eq!(window(&[Value::I32(0), Value::I32(0), Value::I32(0)], MEM), None, "nor is three");
+	assert_eq!(window(&[], MEM), Err(WindowError::OutOfBounds), "no arguments is not an empty window");
+	assert_eq!(window(&[Value::I32(8)], MEM), Err(WindowError::OutOfBounds), "one argument is not a window either");
+	assert_eq!(window(&[Value::I32(0), Value::I32(0), Value::I32(0)], MEM), Err(WindowError::OutOfBounds), "nor is three");
 
 	// AND THE TYPES ARE MATCHED, not converted. `Value::as_i32` accepts `I64`, `F32` and `F64`, and
 	// there is no type validator below this yet - so a module can declare `(param i32 i32)` and push
 	// two floats in a body nothing type-checked. `resolve` constrains what a module DECLARES; this
 	// constrains what arrives.
-	assert_eq!(window(&[Value::F64(0.0), Value::I32(4)], MEM), None, "a float where the pointer belongs");
-	assert_eq!(window(&[Value::I32(0), Value::I64(4)], MEM), None, "an i64 where the length belongs");
+	assert_eq!(window(&[Value::F64(0.0), Value::I32(4)], MEM), Err(WindowError::OutOfBounds), "a float where the pointer belongs");
+	assert_eq!(window(&[Value::I32(0), Value::I64(4)], MEM), Err(WindowError::OutOfBounds), "an i64 where the length belongs");
+
+	// AND THE TWO REFUSALS ARE DIFFERENT REFUSALS, which is the whole point of the enum. This
+	// returned `Option`, and the dispatch turned every `None` into `STATUS_FAULT` - documented by
+	// the SDK as "(ptr, len) is not in guest memory". An in-bounds length past `i32::MAX` is not
+	// that; it is `Unsupported`, "the argument is outside what the host accepts". A guest told
+	// `Fault` for an address it can legally read goes looking for a pointer bug it does not have.
+	assert_eq!(window(&[Value::I32(0), Value::I32(i32::MIN)], usize::MAX).unwrap_err(), WindowError::TooLarge, "a legal address with an over-long length is not a fault");
+	assert_eq!(window(&[Value::I32(MEM as i32), Value::I32(1)], MEM).unwrap_err(), WindowError::OutOfBounds, "and an address outside the memory is");
 }
 
 #[test]
@@ -185,16 +193,27 @@ struct Stub {
 	// what the stub was actually asked to do, so a test can tell "refused" from "never called".
 	wrote: Vec<u8>,
 	logged: Vec<String>,
+	// A DELIBERATELY LYING ADAPTER: report this count instead of the honest one.
+	//
+	// `window` bounds the length the GUEST asked for and says nothing about what the adapter
+	// answers, and the host used to cast that answer straight into an `i32`. So an adapter
+	// returning more than the buffer - or more than `i32::MAX` - produced a number the guest reads
+	// as a status. Every adapter in the tree is honest, which is what makes this a boundary rather
+	// than a reachable bug, and a boundary nothing exercises is a boundary that decays.
+	lie: Option<usize>,
 }
 
 impl Stub {
 	fn working() -> Stub {
-		Stub { read: ReadOutcome::Read(0), read_bytes: b"input", write: WriteOutcome::Wrote(0), log: LogOutcome::Logged, wrote: Vec::new(), logged: Vec::new() }
+		Stub { read: ReadOutcome::Read(0), read_bytes: b"input", write: WriteOutcome::Wrote(0), log: LogOutcome::Logged, wrote: Vec::new(), logged: Vec::new(), lie: None }
 	}
 }
 
 impl WorldServices for Stub {
 	fn read(&mut self, dst: &mut [u8]) -> ReadOutcome {
+		if let Some(count) = self.lie {
+			return ReadOutcome::Read(count);
+		}
 		match self.read {
 			// the count a real service reports is what it copied, which is what fits.
 			ReadOutcome::Read(_) => {
@@ -208,6 +227,9 @@ impl WorldServices for Stub {
 
 	fn write(&mut self, bytes: &[u8]) -> WriteOutcome {
 		self.wrote = bytes.to_vec();
+		if let Some(count) = self.lie {
+			return WriteOutcome::Wrote(count);
+		}
 		match self.write {
 			// the count a real service reports is what it accepted, which is the whole request.
 			WriteOutcome::Wrote(_) => WriteOutcome::Wrote(bytes.len()),
@@ -519,10 +541,23 @@ fn with_dev_diagnostics_the_real_guests_panic_reaches_the_log_it_was_granted() {
 	// AND IT IS THE DIAGNOSTIC, not merely a log entry. `report_panic` promises
 	// "panic at <file>:<line>:<col>: <message>", and a test that asserted only that SOMETHING was
 	// logged would stay green if that promise were quietly replaced by a bare word.
+	// AND THE MESSAGE ITSELF, which this did not check. The three assertions were
+	// `starts_with("panic at ")`, `contains(".rs:")` and `contains(": ")` - which is the FORMAT and
+	// not the content, so a `report_panic` that emitted a location and an empty message passed all
+	// three. The message is the only part of the line a person reads.
+	//
+	// `panic_now` in `sdk/examples/liber_component` panics with a known string, so there is nothing
+	// to guess at: it is asserted verbatim.
 	let line = &logged[0];
 	assert!(line.starts_with("panic at "), "the entry is the diagnostic the SDK documents: {line}");
 	assert!(line.contains(".rs:"), "with the file it happened in: {line}");
-	assert!(line.contains(": "), "and the message after the location: {line}");
+	assert!(line.ends_with(": the input was not what the component expected"), "and the guest's own panic message after the location, not merely a colon and a space: {line}");
+	// The location is REAL - a file, a line and a column - rather than a fixed prefix followed by
+	// the message. `panic at src/lib.rs:149:2: ...` has two colons inside the location.
+	let location = line.trim_start_matches("panic at ").split(": ").next().unwrap_or("");
+	let parts: Vec<&str> = location.split(':').collect();
+	assert_eq!(parts.len(), 3, "the location is <file>:<line>:<col>, and this is {location:?}");
+	assert!(parts[1].parse::<u32>().is_ok() && parts[2].parse::<u32>().is_ok(), "with a numeric line and column: {location:?}");
 }
 
 // Load a toolchain-built `liber_component.wasm` from one of the two target directories, invoke its
@@ -544,9 +579,36 @@ fn with_dev_diagnostics_the_real_guests_panic_reaches_the_log_it_was_granted() {
 //
 // ANCHORED TO THE CRATE, not to whatever directory `cargo test` happened to be run from - which is
 // how this skipped silently the first time it ran from the repository root.
+// Refuse an artifact that predates the sources it claims to have been built from.
+//
+// Absent sidecar is a FAILURE and not a skip, for the reason the whole of `panic_the_real_guest`
+// exists: "the digest could not be checked" and "the digest matched" must not look alike. A tree
+// built before this existed has to rebuild, which is one `just sdk`.
+fn check_artifact_is_current(artifact: &str, features: &str) {
+	let sidecar = alloc::format!("{artifact}.inputs");
+	let recorded = std::fs::read_to_string(&sidecar).unwrap_or_else(|error| panic!("{sidecar} is missing ({error}), so nothing says whether {artifact} was built from the sources in this tree - rebuild with `just sdk`"));
+	let script = alloc::format!("{}/../tools/sdk-inputs.sh", env!("CARGO_MANIFEST_DIR"));
+	let out = std::process::Command::new(&script).arg(features).output().unwrap_or_else(|error| panic!("{script} could not be run ({error}), so the artifact's freshness could not be established either way"));
+	assert!(out.status.success(), "{script} failed: {}", String::from_utf8_lossy(&out.stderr));
+	let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
+	assert_eq!(recorded.trim(), current, "{artifact} was built from different sources than the ones in this tree ({} recorded, {current} now), so this test would be checking an implementation that no longer exists - rebuild with `just sdk`", recorded.trim());
+}
+
 fn panic_the_real_guest(target_dir: &str) -> (bool, Vec<String>, Vec<u8>) {
 	let built = alloc::format!("{}/../../.build/cargo/{target_dir}/wasm32-unknown-unknown/release/liber_component.wasm", env!("CARGO_MANIFEST_DIR"));
 	let bytes = std::fs::read(&built).unwrap_or_else(|error| panic!("{built} is not built ({error}), so the SDK's own panic handler is not exercised - build it with `just sdk` or run this test with the image build"));
+	// AND IT WAS BUILT FROM THESE SOURCES, which nothing checked.
+	//
+	// A missing artifact fails and a STALE one passed: build the SDK, change `report_panic()`, run
+	// the host-tests gate on its own, and this test went green against an implementation that no
+	// longer exists. It is the same false-green class as the missing artifact, one step further
+	// along - and slower to notice, because everything looks like it ran.
+	//
+	// `build.sh` writes a sidecar digest of what the artifact was built from (SDK sources, the
+	// toolchain pin's CONTENT, and the feature set) and this recomputes it with the SAME SCRIPT.
+	// Hashing the inputs again in Rust would be two implementations of one answer, which is how a
+	// check comes to agree with itself and with nothing else.
+	check_artifact_is_current(&built, if target_dir == "sdk-dev" { "dev-diagnostics" } else { "default" });
 	let module = crate::parse(&bytes).expect("the toolchain's own component parses");
 	let validated = crate::validate(module).expect("and validates");
 	let mut instance = Instance::new(&validated).expect("and instantiates");
@@ -569,4 +631,48 @@ fn panic_the_real_guest(target_dir: &str) -> (bool, Vec<String>, Vec<u8>) {
 	// The stub records the text; this hands it back so the caller can say what it wanted to see.
 	let lines = host.services_mut().logged.clone();
 	(out.is_err(), lines, bytes)
+}
+
+#[test]
+fn an_adapter_that_reports_more_than_it_moved_is_refused_rather_than_forwarded() {
+	// `ReadOutcome::Read(n) => n as i32` and `WriteOutcome::Wrote(n) => n as i32`, with nothing in
+	// between. `window` bounds what the GUEST asked for; the adapter's answer was taken on trust and
+	// cast - so a count above the buffer reached the guest as an impossible number, and a count
+	// above `i32::MAX` wrapped into a negative one the guest reads as a status code.
+	//
+	// Every adapter in this tree returns bounded counts, which is why this is a boundary rather than
+	// a reachable bug. It is also why it needs a deliberately lying stub: without one, nothing here
+	// can ever produce the answer the check exists to refuse.
+	let (module, imports) = caller(0, 0, 8, b"");
+	let (out, _) = run(module, imports, Stub { lie: Some(9), ..Stub::working() });
+	assert_eq!(out.expect("a lying adapter is not a trap"), alloc::vec![Value::I32(STATUS_IO)], "a read that claims nine bytes into an eight-byte window is refused");
+
+	let (module, imports) = caller(1, 0, 8, b"hello123");
+	let (out, _) = run(module, imports, Stub { lie: Some(usize::MAX), ..Stub::working() });
+	assert_eq!(out.expect("a lying adapter is not a trap"), alloc::vec![Value::I32(STATUS_IO)], "and a write claiming more than the ABI can express is refused rather than wrapped into a status");
+
+	// The honest boundary case still passes: exactly the window is a legal answer.
+	let (module, imports) = caller(1, 0, 8, b"hello123");
+	let (out, _) = run(module, imports, Stub { lie: Some(8), ..Stub::working() });
+	assert_eq!(out.expect("an honest adapter is not a trap"), alloc::vec![Value::I32(8)], "exactly the window is a count, not a fault");
+}
+
+#[test]
+fn an_over_long_window_is_unsupported_and_an_out_of_bounds_one_is_a_fault() {
+	// The two refusals the dispatch used to fold together. `window` answered `Option` and every
+	// `None` became `STATUS_FAULT` - "(ptr, len) is not in guest memory" - including for a pair that
+	// IS in guest memory and is merely longer than one call may move. The SDK's vocabulary already
+	// separates them, and a guest told `Fault` for a legal address goes looking for a pointer bug it
+	// does not have.
+	//
+	// The module's memory is one page, so an out-of-bounds pair is easy; an over-long LENGTH is
+	// checked against `MAX_TRANSFER` before the memory bound is consulted at all, so it is reachable
+	// here even though a real guest could never hold that much.
+	let (module, imports) = caller(0, 0x1_0000, 1, b"");
+	let (out, _) = run(module, imports, Stub::working());
+	assert_eq!(out.expect("a refused window is not a trap"), alloc::vec![Value::I32(STATUS_FAULT)], "one byte past a one-page memory is a fault");
+
+	let (module, imports) = caller(0, 0, i32::MIN, b"");
+	let (out, _) = run(module, imports, Stub::working());
+	assert_eq!(out.expect("a refused window is not a trap"), alloc::vec![Value::I32(STATUS_UNSUPPORTED)], "0x8000_0000 bytes is more than one call may move, which is not a fault");
 }

@@ -59,22 +59,64 @@ while IFS=$'\t' read -r dir crate configuration; do
 	# host test: the harness needs `std` and `test`, and a second `core` collides with the one `std`
 	# already carries. Cargo takes its config from the working directory, so staying out of that
 	# subtree is what selects the host.
-	# `--include-ignored`, so a test that is ignored for want of a build artifact RUNS here.
+	# ORDINARY SUITES RUN ORDINARILY. This was `-- --include-ignored` for EVERY discovered crate, so
+	# every `#[ignore]` in the tree became a mandatory part of the gate - and there is already one
+	# that must not be: `bench_scaling` in `fs/liberfs` is a benchmark, deliberately ignored, and the
+	# gate ran it on every invocation. Every future long, manual or experimental `#[ignore]` would
+	# have joined it without anybody deciding to, which is the opposite of what `#[ignore]` is for.
 	#
-	# `#[ignore]` is how a test says "not under a bare `cargo test`" - the SDK panic tests need a
-	# wasm32 artifact this tree builds elsewhere. That is right for a developer running one crate's
-	# tests and wrong for the gate, which is the place those artifacts exist. Without this the gate
-	# reported them as ignored and nothing exercised the SDK's own panic handler.
+	# The two tests that genuinely need it get a targeted run below, named one by one.
 	args=(--quiet --manifest-path "../$dir/Cargo.toml")
 	if [[ "$configuration" != default ]]; then
 		args+=(--no-default-features --features "$configuration")
 	fi
-	if ! cargo test "${args[@]}" -- --include-ignored; then
+	if ! cargo test "${args[@]}"; then
 		echo "host-tests: $crate ($configuration) FAILED" >&2
 		failed+=("$crate/$configuration")
 		status=1
 	fi
 done <<<"$suites"
+
+# THE ARTIFACT-DEPENDENT TESTS, BY NAME.
+#
+# `#[ignore]` is how a test says "not under a bare `cargo test`" - these two need a wasm32 artifact
+# this tree builds elsewhere, and running them is right for the gate, which is the place that
+# artifact exists. What was wrong was applying that decision to every `#[ignore]` in the tree by
+# accident rather than to these two on purpose.
+#
+# NAMED RATHER THAN DISCOVERED, deliberately. A pattern like "every ignored test in `src/wasm`"
+# brings the next one along silently, which is the defect being fixed. Adding a third means adding
+# a line here, which is somebody deciding.
+#
+# `--exact` so a name is a name and not a prefix; `--ignored` rather than `--include-ignored` so
+# this run is exactly these tests and a typo is a run of nothing rather than a silent re-run of the
+# whole crate.
+# The `dev-diagnostics` half is a feature of the SDK ARTIFACT, not of this crate - `just sdk` builds
+# both wasm binaries and the test picks the one it needs - so both entries run the `wasm` crate as
+# the model enumerates it, with no `--features` of their own.
+artifact_tests=(
+	"src/wasm	world::tests::the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged"
+	"src/wasm	world::tests::with_dev_diagnostics_the_real_guests_panic_reaches_the_log_it_was_granted"
+)
+for entry in "${artifact_tests[@]}"; do
+	IFS=$'\t' read -r dir test <<<"$entry"
+	args=(--quiet --manifest-path "../$dir/Cargo.toml")
+	# `--exact` names one test, and a run that matched none is a silent pass - so the count is
+	# checked. This is the same floor the inventory above has, for the same reason.
+	output="$(cargo test "${args[@]}" -- --ignored --exact "$test" 2>&1)" || {
+		echo "$output" >&2
+		echo "host-tests: artifact test $test FAILED" >&2
+		failed+=("$test")
+		status=1
+		continue
+	}
+	if ! grep -qE '1 passed' <<<"$output"; then
+		echo "$output" >&2
+		echo "host-tests: artifact test $test matched no test - the name moved and this gate would have passed over it" >&2
+		failed+=("$test")
+		status=1
+	fi
+done
 
 if ((status != 0)); then
 	echo "host-tests: ${#failed[@]} of $count failed: ${failed[*]}" >&2

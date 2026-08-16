@@ -83,11 +83,37 @@ pub const MAX_HOLES: usize = 2 + MAX_MODULES;
 // most one extra region - and a bank that does not fit is dropped rather than half-written, because
 // a region array that looks complete and is missing its tail is the failure this file exists to
 // avoid.
-pub fn carve_banks(banks: &[(u64, u64)], floor: u64, holes: &[Hole], out: &mut [MemRegion]) -> usize {
+// AND A CEILING, because a bank outside the direct map is not memory this kernel can touch.
+//
+// The allocator used to be seeded from every bank the device tree reported, while aarch64's boot
+// stub maps 1 GB blocks over a fixed 0..4 GiB and riscv64's maps a fixed 0..8 GiB. `run.sh --arch
+// aarch64 --mem 4G` puts QEMU `virt` RAM at 1 GiB running to ~5 GiB, so the top gigabyte is outside
+// the direct map and the first `write_bytes(phys_to_virt(frame), ..)` on a frame from it is a
+// translation fault - not attributable to whoever allocated it, and not reproducible without that
+// much memory.
+//
+// This is the same defect as the `DIRECT_MAP_LIMIT` work in P02M0133 seen from the ALLOCATOR's side
+// rather than the firmware-pointer side, and the rule is the one that milestone states: nothing may
+// enter the allocator before `phys_to_virt` on it is guaranteed to translate.
+//
+// The remainder is REPORTED rather than dropped in silence - losing memory is recoverable by
+// somebody who reads the boot log, and it is the only way anyone learns the map wants widening.
+pub fn carve_banks(banks: &[(u64, u64)], floor: u64, ceiling: u64, holes: &[Hole], out: &mut [MemRegion]) -> usize {
 	let mut written = 0usize;
 	for &(base, len) in banks {
 		let start = base.max(floor);
-		let end = base.saturating_add(len);
+		// `checked_add`, not `saturating_add`: a bank declaring `size = u64::MAX` saturated into a
+		// usable range covering nearly the whole address space, and the frame allocator's overlap
+		// refusal then kept the system safe by discarding legitimate memory. The device-tree reader
+		// drops such a bank now; this is the second answer, at the consumer.
+		let Some(declared_end) = base.checked_add(len) else {
+			crate::serial_println!("bootmem: bank {base:#x} declares a length that leaves the address space - dropped");
+			continue;
+		};
+		let end = declared_end.min(ceiling);
+		if declared_end > ceiling {
+			crate::serial_println!("bootmem: {} MiB of RAM above {ceiling:#x} is outside the direct map and is NOT usable - widen the boot mapping to reach it", (declared_end - ceiling.max(start)) / (1024 * 1024));
+		}
 		if end <= start || written >= out.len() {
 			continue;
 		}
@@ -218,3 +244,81 @@ pub unsafe fn loader_reservations(arg: u64, to_virt: impl Fn(u64) -> u64, out: &
 
 #[cfg(test)]
 mod tests;
+
+// THE DEVICE TREE'S OWN RESERVATIONS, and the blob itself.
+//
+// `loader_reservations` carves out `BootInfo`, the module descriptor array and the modules, and
+// nothing else. The Devicetree Specification requires a client not to use the memory reservation
+// block's regions and not to overwrite the tree while it is still in use - and this kernel keeps
+// reading the tree after the allocator is up: riscv64 reads `timebase-frequency` from it well after
+// `frame` init. So the pages holding the device tree, firmware runtime data and whatever a board
+// reserves could be allocated and zeroed while still live.
+//
+// Appended to whatever the loader reservations already wrote, and returns the new total. A blob
+// this cannot read reserves nothing and says so; refusing the boot over an unreadable reservation
+// list would take a machine down over a list that is usually empty.
+pub unsafe fn devicetree_reservations(fdt: &fdt::Fdt, out: &mut [Hole], written: usize) -> usize {
+	let mut written = written;
+	let mut push = |start: u64, length: u64, written: &mut usize| {
+		if length == 0 {
+			return;
+		}
+		if *written >= out.len() {
+			crate::serial_println!("bootmem: NO ROOM to reserve {start:#x}..{:#x} - the hole list holds {} and the allocator may hand this range out", start + length, out.len());
+			return;
+		}
+		out[*written] = Hole { start, end: start + length };
+		*written += 1;
+	};
+	// The blob's own pages first: it is the one this kernel is certain to keep reading.
+	if let Some((base, len)) = fdt.extent() {
+		push(base, len, &mut written);
+	}
+	let mut entries = 0usize;
+	let complete = fdt.for_each_reserved_region(|base, len| {
+		entries += 1;
+		push(base, len, &mut written);
+	});
+	if !complete {
+		crate::serial_println!("bootmem: the device tree's reservation block could not be read to its end - {entries} entr(ies) carved out, and anything past them is NOT reserved");
+	}
+	written
+}
+
+// THE FIRMWARE'S OWN MAP, when the loader handed one over.
+//
+// These two architectures used to receive `memmap: 0` and fall back to the device tree's `/memory`,
+// which under UEFI is not the system memory map: the EFI map carries runtime services code and
+// data, ACPI NVS and reclaimable regions, unusable memory, firmware reservations, loader
+// allocations and MMIO apertures, none of which a `/memory` node expresses. The loader translates
+// it now; this is the side that reads it.
+//
+// `None` when there is none - a QEMU `-kernel` boot, which has no firmware at all - and the caller
+// falls back to the device tree, which is the right source when there is no better one.
+pub unsafe fn handed_memmap(arg: u64, to_virt: impl Fn(u64) -> u64) -> Option<(*const MemRegion, usize)> {
+	if arg == 0 {
+		return None;
+	}
+	let magic = unsafe { core::ptr::read_volatile(to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return None;
+	}
+	let info = to_virt(arg) as *const bootproto::BootInfo;
+	let (phys, len) = unsafe { (core::ptr::read_volatile(&raw const (*info).memmap), core::ptr::read_volatile(&raw const (*info).memmap_len)) };
+	if phys == 0 || len == 0 {
+		return None;
+	}
+	// The count comes off the same untrusted structure as everything else, and the array it
+	// describes was sized by `MAX_REGIONS` in the loader. A larger claim is a BootInfo this kernel
+	// will not read rather than one to clamp: clamping would seed the allocator from a map that
+	// looks complete and is not.
+	// The loader's own ceiling, restated here rather than imported: the `uefi` crate is a
+	// loader-side dependency and the kernel does not link it. A number that must match one in
+	// another crate is worth a sentence, and this is it.
+	const LOADER_MAX_REGIONS: u64 = 512;
+	if len > LOADER_MAX_REGIONS {
+		crate::serial_println!("bootmem: the loader claims {len} memory regions, past the {LOADER_MAX_REGIONS} the protocol carries - falling back to the device tree");
+		return None;
+	}
+	Some((to_virt(phys) as *const MemRegion, len as usize))
+}

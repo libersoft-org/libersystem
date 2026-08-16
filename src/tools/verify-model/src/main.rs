@@ -196,10 +196,30 @@ fn run() -> Result<ExitCode, String> {
 	{
 		command = positional.remove(0);
 	}
+	// `KIND\tPATH` OR A BARE PATH, and the tab is what closes the `--for-range` hole.
+	//
+	// `change_kinds_for` reads the WORKING TREE and nothing else, and `verify.sh --for-range`
+	// resolved its range to a list of paths and passed only the paths onward. On a clean tree the
+	// needed scope therefore had an empty `change_kinds`, and `Scope::covers` is satisfied trivially
+	// by an empty requirement - so a certificate earned over `modified` answered for a range
+	// containing a RENAME that nothing had verified. The range knows its own change kinds; they just
+	// had nowhere to travel.
+	//
+	// A bare path still means "ask the working tree", which is what `--for PATH` has always meant
+	// and what the regression corpus drives.
+	let mut path_change_kinds: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
 	if from_stdin {
 		let mut text = String::new();
 		io::stdin().read_to_string(&mut text).map_err(|error| format!("stdin: {error}"))?;
-		paths.extend(text.lines().map(str::trim).filter(|path| !path.is_empty()).map(str::to_string));
+		for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+			match line.split_once('\t') {
+				Some((kind, path)) if !kind.is_empty() && !path.is_empty() => {
+					path_change_kinds.insert(String::from(path), String::from(kind));
+					paths.push(String::from(path));
+				}
+				_ => paths.push(String::from(line)),
+			}
+		}
 	}
 
 	let repo_root = find_repo_root()?;
@@ -443,8 +463,14 @@ fn run() -> Result<ExitCode, String> {
 				Some(range) => verify_model::changes::range(&repo_root, range)?,
 				None => verify_model::changes::working_tree(&repo_root)?,
 			};
-			for path in verify_model::changes::paths(&changes) {
-				println!("{path}");
+			// `KIND\tPATH`, which is what the stdin reader above accepts. Both modes print it, so
+			// there is one format rather than one per caller - and a range, which has no working
+			// tree to be asked about afterwards, carries its own classes of change onward instead of
+			// arriving with an empty scope that covers everything.
+			for change in &changes {
+				let path = change.origin.as_deref().unwrap_or(change.path.as_str());
+				let _ = path;
+				println!("{}\t{}", format!("{:?}", change.kind).to_lowercase(), change.path);
 			}
 			Ok(ExitCode::SUCCESS)
 		}
@@ -558,7 +584,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan) });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -592,7 +618,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan) });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -639,7 +665,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan) });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -708,7 +734,7 @@ fn run() -> Result<ExitCode, String> {
 			// judged is a record that will be believed about a different system later.
 			let mut log = verify_model::shadow::Log::load(&repo_root);
 			log.schema = 1;
-			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan) });
+			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds) });
 			log.save(&repo_root)?;
 			// Only Consistent is green, and the other three are green in different wrong ways.
 			// CandidateMiss is the selector's problem; SelectionFailed is the code's and the sweep
@@ -749,8 +775,16 @@ fn run() -> Result<ExitCode, String> {
 			// `generation.build` is not what five clean source-edit comparisons validated. The
 			// scope travels with the grant now, so the question the runner asks is a subset test
 			// rather than a lookup.
-			let scopes = verify_model::shadow::component_scopes(&repo_root, &plan);
-			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| !store.trusted_everywhere(component, &hash, &verify_model::catalog::judging_universes(&model.catalog, component), scopes.get(component.as_str()).unwrap_or(&verify_model::shadow::Scope::default()))).collect();
+			// AND THE TARGETS THIS CHANGE NEEDS, which the lookup never asked for. `Certificate`
+			// has carried `architectures` since it existed and `level` matched on the model hash and
+			// the scope alone, so a certificate earned from x86_64 and riscv64 evidence answered an
+			// aarch64-only change on which no clean record had ever run.
+			let mut required: std::collections::BTreeSet<String> = plan.architectures_built.iter().cloned().collect();
+			required.extend(plan.architectures_booted.iter().cloned());
+			let required: Vec<String> = required.into_iter().collect();
+			let scopes: std::collections::BTreeMap<String, verify_model::shadow::Scope> = verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds).into_iter().map(|(component, scope)| (component, scope.with_architectures(required.clone()))).collect();
+			let empty = verify_model::shadow::Scope::default();
+			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| !store.trusted_everywhere(component, &hash, &verify_model::catalog::judging_universes(&model.catalog, component), scopes.get(component.as_str()).unwrap_or(&empty))).collect();
 			// The age BOUND, which is the part that makes it a bound rather than a report.
 			//
 			// A key past its window has not been exercised within the period this tree is willing to
@@ -770,6 +804,22 @@ fn run() -> Result<ExitCode, String> {
 				println!("TRUSTED");
 			} else {
 				println!("SHADOW\t{}", untrusted.iter().map(|component| component.as_str()).collect::<Vec<_>>().join(","));
+				// AND WHAT IS MISSING, WHICH `shortfall()` HAS ALWAYS COMPUTED AND NOBODY CALLED.
+				//
+				// The refusal arrived without the one sentence that says what to do about it: an
+				// operator was told a component falls back to shadow and not whether it is a change
+				// class, a graph edge or a target that the certificate does not cover. The
+				// difference matters - the first two are answered by gathering evidence over that
+				// kind of change, and the third by running the sweep on that target.
+				for component in &untrusted {
+					let needed = scopes.get(component.as_str()).unwrap_or(&empty);
+					for universe in verify_model::catalog::judging_universes(&model.catalog, component) {
+						let missing = store.shortfall(component, &hash, universe, needed);
+						if !missing.is_empty() {
+							println!("  {component} ({universe:?}) is not covered for: {}", missing.join(", "));
+						}
+					}
+				}
 			}
 			Ok(ExitCode::SUCCESS)
 		}
@@ -819,8 +869,15 @@ fn run() -> Result<ExitCode, String> {
 			if store.certificates.is_empty() {
 				println!("nothing is TRUSTED yet - every component's scoped answers are validated against a full sweep before they are believed");
 			}
-			for (component, level) in store.summary(&hash) {
-				println!("  {component}: {level:?}");
+			// THE SCOPE BESIDE THE LEVEL. `summary` answered `Trusted`/`Shadow` and ignored the
+			// scope it was summarising, so a reader saw a component listed as TRUSTED with no way to
+			// know that the trust covers modifications through static links and nothing else - which
+			// is exactly the misreading the scope was added to prevent.
+			for (component, entry) in store.summary(&hash) {
+				match entry.scope {
+					Some(scope) if !scope.pairs.is_empty() => println!("  {component}: {:?} for [{}] on [{}]", entry.level, scope.pairs.iter().map(|pair| pair.replace('\t', " through ")).collect::<Vec<String>>().join(", "), scope.architectures.join(", ")),
+					_ => println!("  {component}: {:?} (the certificate names no scope, so it covers nothing)", entry.level),
+				}
 			}
 			Ok(ExitCode::SUCCESS)
 		}

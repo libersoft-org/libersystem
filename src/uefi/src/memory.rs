@@ -63,6 +63,18 @@ pub fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDe
 		unsafe { ((*bs).free_pages)(buf as u64, pages) };
 		return None;
 	}
+	// AND `desc_size` IS RE-CHECKED, because this call reports it again.
+	//
+	// The SIZING call's answer was validated above and nothing looked at the second one - and the
+	// second is the one that describes the buffer now in hand. Firmware that reported one stride for
+	// the sizing and another for the fill would have had every descriptor after the first read at
+	// the wrong offset, out of a buffer whose contents are the one structure that says which RAM
+	// exists. Ordinary firmware reports the same number twice; the helper's comments claimed more
+	// independence than it had.
+	if desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() || map_size % desc_size != 0 {
+		unsafe { ((*bs).free_pages)(buf as u64, pages) };
+		return None;
+	}
 	Some((buf, pages, map_size, desc_size))
 }
 
@@ -74,6 +86,19 @@ pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_s
 	// divides by an argument holds the argument's precondition itself, or the day a second caller
 	// appears it divides by zero.
 	if desc_size == 0 {
+		return None;
+	}
+	// AND IT HAS TO BE A DESCRIPTOR. `desc_size` is the firmware's stride, which may legitimately be
+	// LARGER than this structure - the specification says so, precisely to allow future fields - and
+	// may not be smaller: reading a `MemoryDescriptor` out of fewer bytes than one takes reads past
+	// the entry into the next, or past the buffer at the last.
+	if desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
+		return None;
+	}
+	// AND THE MAP HAS TO BE A WHOLE NUMBER OF THEM. `map_size / desc_size` silently discarded a
+	// partial tail, which for the one structure that says which RAM exists is the same
+	// looks-complete-and-is-not failure the `MAX_REGIONS` refusal above was written for.
+	if map_size % desc_size != 0 {
 		return None;
 	}
 	let entries = map_size / desc_size;
@@ -96,6 +121,12 @@ pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_s
 			// A page count from the firmware, times the page size. Unchecked this wraps a descriptor
 			// claiming 2^52 pages into a small region - a memory map the kernel then believes.
 			let Some(length) = d.page_count.checked_mul(PAGE_SIZE) else { return None };
+			// AND THE REGION'S END. The base comes off the firmware too, and a descriptor whose
+			// start plus length leaves the address space describes a region no machine has - which
+			// the kernel would then carve, seed or map.
+			if d.phys_start.checked_add(length).is_none() {
+				return None;
+			}
 			*regions.add(n) = MemRegion { base: d.phys_start, length, kind, _pad: 0 };
 		}
 		n += 1;

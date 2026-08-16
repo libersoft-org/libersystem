@@ -27,7 +27,7 @@
 extern crate std;
 
 mod status;
-pub use status::{Error, STATUS_DENIED, STATUS_FAULT, STATUS_IO, STATUS_UNSUPPORTED, clamp_count};
+pub use status::{Error, MAX_TRANSFER, STATUS_DENIED, STATUS_FAULT, STATUS_IO, STATUS_UNSUPPORTED, clamp_count};
 
 // The world itself only exists for a wasm guest: the imports are resolved by the host at
 // instantiation, and there is nothing on the other side of them anywhere else. Everything the SDK

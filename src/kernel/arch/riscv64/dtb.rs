@@ -40,6 +40,15 @@ pub fn parse(hint: u64) -> Option<BootInfo> {
 	at(locate(hint)?).parse()
 }
 
+// The tree itself, at wherever it was actually found.
+//
+// `parse` locates the blob and throws the location away, so a caller that needs the FDT for anything
+// else - carving its reservation block and its own pages out of the usable memory, which nothing
+// did - had only the raw hint, which may not be where the tree is.
+pub fn located(hint: u64) -> Option<Fdt> {
+	Some(at(locate(hint)?))
+}
+
 // `/cpus/timebase-frequency` in Hz, or None when this tree does not carry it.
 pub fn timebase_frequency(hint: u64) -> Option<u32> {
 	at(locate(hint)?).timebase_frequency()

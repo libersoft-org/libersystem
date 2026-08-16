@@ -35,11 +35,19 @@ const FDT_HEADER_LEN: usize = 40;
 struct Builder {
 	structure: Vec<u8>,
 	strings: Vec<u8>,
+	// The memory reservation block's entries, which the fixtures could not express until the parser
+	// could read them.
+	reserved: Vec<(u64, u64)>,
 }
 
 impl Builder {
 	fn new() -> Self {
-		Self { structure: Vec::new(), strings: Vec::new() }
+		Self { structure: Vec::new(), strings: Vec::new(), reserved: Vec::new() }
+	}
+
+	fn reserve(&mut self, base: u64, size: u64) -> &mut Self {
+		self.reserved.push((base, size));
+		self
 	}
 
 	fn token(&mut self, token: u32) {
@@ -114,14 +122,21 @@ impl Builder {
 		self.token(FDT_END);
 		let structure = core::mem::take(&mut self.structure);
 		let strings = core::mem::take(&mut self.strings);
-		// Header, an empty memory-reservation block, then the two blocks.
+		// Header, the memory-reservation block (its entries and the zero terminator), then the two
+		// blocks.
+		let reserved = core::mem::take(&mut self.reserved);
+		let rsvmap_len = (reserved.len() + 1) * 16;
 		let off_rsvmap = FDT_HEADER_LEN;
-		let off_struct = off_rsvmap + 16;
+		let off_struct = off_rsvmap + rsvmap_len;
 		let off_strings = off_struct + structure.len();
 		let total = off_strings + strings.len();
 		let mut out = Vec::with_capacity(total);
 		for word in [FDT_MAGIC, total as u32, off_struct as u32, off_strings as u32, off_rsvmap as u32, 17, 16, 0, strings.len() as u32, structure.len() as u32] {
 			out.extend_from_slice(&word.to_be_bytes());
+		}
+		for (base, size) in &reserved {
+			out.extend_from_slice(&base.to_be_bytes());
+			out.extend_from_slice(&size.to_be_bytes());
 		}
 		out.extend_from_slice(&[0u8; 16]);
 		out.extend_from_slice(&structure);
@@ -137,7 +152,7 @@ fn machine(body: impl FnOnce(&mut Builder)) -> &'static [u8] {
 	let mut builder = Builder::new();
 	builder.begin("");
 	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
-	builder.begin("memory@40000000").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
 	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
 	body(&mut builder);
 	builder.end();
@@ -162,7 +177,7 @@ fn a_hole_in_the_memory_map_is_not_reported_as_memory() {
 	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
 	reg.extend_from_slice(&0x8000_0000u64.to_be_bytes());
 	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
-	builder.begin("memory@40000000").prop("reg", &reg).end();
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop("reg", &reg).end();
 	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
 	builder.end();
 	let info = at(builder.finish()).parse().expect("the machine describes its memory");
@@ -185,7 +200,7 @@ fn a_hole_in_the_memory_map_is_not_reported_as_memory() {
 	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
 	reg.extend_from_slice(&0x5000_0000u64.to_be_bytes());
 	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
-	builder.begin("memory@40000000").prop("reg", &reg).end();
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop("reg", &reg).end();
 	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
 	builder.end();
 	let info = at(builder.finish()).parse().expect("parses");
@@ -202,7 +217,7 @@ fn a_hole_in_the_memory_map_is_not_reported_as_memory() {
 	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
 	reg.extend_from_slice(&0x4000_0000u64.to_be_bytes());
 	reg.extend_from_slice(&0x1000_0000u64.to_be_bytes());
-	builder.begin("memory@50000000").prop("reg", &reg).end();
+	builder.begin("memory@50000000").prop("device_type", b"memory\0").prop("reg", &reg).end();
 	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
 	builder.end();
 	let info = at(builder.finish()).parse().expect("parses");
@@ -362,7 +377,7 @@ fn a_bus_with_its_own_address_cells_decides_how_its_children_are_read() {
 	let mut builder = Builder::new();
 	builder.begin("");
 	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
-	builder.begin("memory@40000000").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
 	builder.begin("chosen").prop_str("stdout-path", "/soc/serial@10000000").end();
 	builder.begin("soc").prop_u32("#address-cells", 1).prop_u32("#size-cells", 1);
 	let mut reg = 0x1000_0000u32.to_be_bytes().to_vec();
@@ -574,4 +589,128 @@ fn a_record_that_runs_past_its_block_is_refused_rather_than_read() {
 	);
 	assert!(at(bad_nameoff).parse().is_none(), "a nameoff outside the strings block is refused");
 	assert_eq!(at(bad_nameoff).console(), None);
+}
+
+// P02M0129, sixth round.
+
+#[test]
+fn a_memory_node_is_named_and_typed_and_enabled() {
+	// `str_starts(name, "memory")` matched `memory-controller@`, `memory-window@` and anything else
+	// beginning with those six letters - and if such a node had a `reg`, its MMIO aperture was added
+	// to the RAM list and handed to the frame allocator. The specification's rule is a unit name of
+	// exactly `memory` or `memory@...` AND `device_type = "memory"`, and `device_type` was not read
+	// anywhere in this parser.
+	//
+	// Confirmed against a real tree before the rule was imposed: QEMU's `virt` writes
+	// `device_type = "memory"` on its `memory@40000000`.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	// A memory CONTROLLER's aperture, which is not memory.
+	builder.begin("memory-controller@10000000").prop_reg64(0x1000_0000, 0x1000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	let info = at(builder.finish()).parse().expect("the machine describes its memory");
+	assert_eq!(info.ram_region_count, 1, "the controller's aperture is not RAM");
+	assert_eq!((info.ram_base, info.ram_size), (0x4000_0000, 0x2000_0000));
+
+	// A node with the right name and no `device_type` is not memory either.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	assert!(at(builder.finish()).parse().is_none(), "a node without `device_type = \"memory\"` is not memory whatever it is called");
+
+	// And one this board has disabled is memory the kernel may not use.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop("status", b"disabled\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	assert!(at(builder.finish()).parse().is_none(), "a disabled memory node is not memory this kernel may use");
+}
+
+#[test]
+fn a_zero_width_memory_tuple_is_refused_rather_than_walked_forever() {
+	// `while q + 4 * (addr_cells + size_cells) <= end` never becomes false at width zero,
+	// `read_cells(.., 0)` does not advance the cursor, `s == 0` takes the `continue`, and the loader
+	// HANGS at boot - before there is any way to say so.
+	//
+	// `#size-cells = 0` is legitimate on other node types (the `cpus` node in every fixture here
+	// uses it), so the rule is contextual: it is about reading a `/memory/reg`.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 0);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop("reg", &0x4000_0000u64.to_be_bytes()).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	assert!(at(builder.finish()).parse().is_none(), "a zero-width tuple is refused rather than walked forever");
+}
+
+#[test]
+fn the_bank_list_is_sorted_and_merged_and_bounded() {
+	// The list coalesced a bank only with the one IMMEDIATELY before it, did not sort, did not merge
+	// overlaps, and computed the previous bank's end unchecked. `carve_banks` then used
+	// `saturating_add`, so a bank declaring `size = u64::MAX` saturated into a usable range covering
+	// nearly the whole address space - and the frame allocator's overlap refusal kept the system
+	// safe by discarding legitimate memory.
+	let mut reg: Vec<u8> = Vec::new();
+	// Out of order, with the second touching the first and the third overlapping it.
+	for (base, size) in [(0x8000_0000u64, 0x1000_0000u64), (0x4000_0000, 0x1000_0000), (0x5000_0000, 0x1000_0000), (0x8800_0000, 0x1000_0000)] {
+		reg.extend_from_slice(&base.to_be_bytes());
+		reg.extend_from_slice(&size.to_be_bytes());
+	}
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop("reg", &reg).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	let info = at(builder.finish()).parse().expect("the machine describes its memory");
+	assert_eq!(info.ram_region_count, 2, "the touching pair merged and the overlapping pair merged");
+	assert_eq!(info.ram_regions[0], (0x4000_0000, 0x2000_0000), "sorted first, and 0x4000_0000 touches 0x5000_0000");
+	assert_eq!(info.ram_regions[1], (0x8000_0000, 0x1800_0000), "and the overlapping pair is their union, not the sum of their sizes");
+
+	// A bank whose end overflows is the tree contradicting itself and is dropped, rather than
+	// saturating into a range covering everything.
+	let mut reg = 0x4000_0000u64.to_be_bytes().to_vec();
+	reg.extend_from_slice(&u64::MAX.to_be_bytes());
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop("reg", &reg).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	assert!(at(builder.finish()).parse().is_none(), "a bank that does not fit the address space is not a bank");
+}
+
+#[test]
+fn the_memory_reservation_block_is_read() {
+	// There was no `off_mem_rsvmap` handling anywhere in this parser. The specification requires a
+	// client not to use the reservation block's regions, and nothing carved them out - so pages
+	// holding firmware runtime data and whatever a board reserves could be allocated and zeroed
+	// while still live.
+	let mut builder = Builder::new();
+	builder.reserve(0x4000_0000, 0x10_0000);
+	builder.reserve(0x4100_0000, 0x2_0000);
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.end();
+	let blob = builder.finish();
+	let fdt = at(blob);
+	let mut seen: Vec<(u64, u64)> = Vec::new();
+	assert!(fdt.for_each_reserved_region(|base, size| seen.push((base, size))), "the list terminates");
+	assert_eq!(seen, vec![(0x4000_0000u64, 0x10_0000u64), (0x4100_0000, 0x2_0000)], "both reservations are reported");
+
+	// AND THE BLOB'S OWN PAGES, which nothing reserved either - and this kernel keeps reading the
+	// tree after the allocator is up.
+	let (base, len) = fdt.extent().expect("the blob knows how big it is");
+	assert_eq!(base, blob.as_ptr() as u64);
+	assert_eq!(len as usize, blob.len(), "the extent is the whole blob, which is what must not be overwritten");
 }

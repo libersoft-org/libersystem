@@ -56,6 +56,26 @@ impl<'a> Reader<'a> {
 	// which encodings this system will SHIP - a check over an image about to be signed - and not a
 	// fact about which modules are well-formed. Stating it here as the specification's rule is how a
 	// conformance defect acquired a regression test.
+	// A DECLARED COUNT, BOUNDED BY THE BYTES THAT COULD POSSIBLY ENCODE IT.
+	//
+	// Every section parser read a count and then filled the corresponding vector, so a six-byte
+	// declaration of four billion entries had the host allocating before anything asked whether the
+	// count was plausible. The module is refused in the end and the host paid for it first, which is
+	// the resource policy beginning after the expensive part.
+	//
+	// `least` is the smallest number of bytes one entry can occupy - one for a byte-per-entry table,
+	// more for a structure - so `count * least` is a floor on what the section must contain. A count
+	// larger than the bytes REMAINING cannot be honest whatever else is true, and this needs no
+	// knowledge of the entries themselves.
+	fn count(&mut self, least: usize) -> Result<u32, ParseError> {
+		let count = self.u32()?;
+		let floor = (count as usize).saturating_mul(least.max(1));
+		if floor > self.buf.len().saturating_sub(self.pos) {
+			return Err(ParseError("a section declares more entries than its bytes could encode"));
+		}
+		Ok(count)
+	}
+
 	fn u32(&mut self) -> Result<u32, ParseError> {
 		let mut result: u32 = 0;
 		let mut shift: u32 = 0;
@@ -264,7 +284,8 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 }
 
 fn parse_types(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: u32 = r.u32()?;
+	// A function type is at least `0x60` and two zero counts: three bytes.
+	let count: u32 = r.count(3)?;
 	for _ in 0..count {
 		if r.byte()? != 0x60 {
 			return Err(ParseError("expected a function type"));
@@ -284,7 +305,7 @@ fn parse_types(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 }
 
 fn parse_imports(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: u32 = r.u32()?;
+	let count: u32 = r.count(4)?;
 	for _ in 0..count {
 		let module: String = r.name()?;
 		let field: String = r.name()?;
@@ -311,7 +332,7 @@ fn parse_functions(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 }
 
 fn parse_memory(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: u32 = r.u32()?;
+	let count: u32 = r.count(2)?;
 	if count > 1 {
 		return Err(ParseError("at most one memory is supported"));
 	}
@@ -343,7 +364,7 @@ fn parse_memory(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 // maximum entry count. The table is the array `call_indirect` dispatches through; its
 // entries are filled by the element section.
 fn parse_tables(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: u32 = r.u32()?;
+	let count: u32 = r.count(2)?;
 	if count > 1 {
 		return Err(ParseError("at most one table is supported"));
 	}
@@ -378,7 +399,7 @@ fn parse_tables(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 // and 2, the forms a Rust/LLVM toolchain emits); passive and declarative segments and
 // expression-initialized (`ref.func`) forms are rejected.
 fn parse_elements(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: u32 = r.u32()?;
+	let count: u32 = r.count(2)?;
 	for _ in 0..count {
 		let flags: u32 = r.u32()?;
 		match flags {
@@ -472,7 +493,7 @@ fn const_offset(r: &mut Reader) -> Result<u32, ParseError> {
 }
 
 fn parse_globals(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: u32 = r.u32()?;
+	let count: u32 = r.count(3)?;
 	for _ in 0..count {
 		let val_type: ValType = val_type(r.byte()?)?;
 		let mutable: bool = match r.byte()? {
@@ -490,7 +511,7 @@ fn parse_globals(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 }
 
 fn parse_data(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: u32 = r.u32()?;
+	let count: u32 = r.count(2)?;
 	for _ in 0..count {
 		let flags: u32 = r.u32()?;
 		match flags {
@@ -518,7 +539,7 @@ fn parse_data(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 }
 
 fn parse_exports(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: u32 = r.u32()?;
+	let count: u32 = r.count(3)?;
 	for _ in 0..count {
 		let name: String = r.name()?;
 		let kind_byte: u8 = r.byte()?;
@@ -538,7 +559,7 @@ fn parse_exports(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 }
 
 fn parse_code(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
-	let count: usize = r.u32()? as usize;
+	let count: usize = r.count(2)? as usize;
 	// A code section with more entries than the function section declared has code belonging to no
 	// function; the reverse is caught in `parse` once every section has been read.
 	if count != m.funcs.len() {

@@ -431,6 +431,12 @@ fn a_deferred_wrap_does_not_survive_a_buffer_switch() {
 	let mut screen = Screen::new(8, 4, 0);
 	feed(&mut screen, b"ab");
 	feed(&mut screen, b"\x1b[?47h");
+	// HOMED EXPLICITLY. This fixture used to get the cursor to column 0 from `?47h` itself, which
+	// homed for every caller - and it must not: xterm gives the cursor save/restore to `?1048` and
+	// the combination to `?1049` precisely so the bare switch does neither. The subject here is the
+	// deferred-wrap flag, so the fixture says where the cursor is instead of depending on a
+	// behaviour the sequence is not supposed to have.
+	feed(&mut screen, b"\x1b[H");
 	feed(&mut screen, b"12345678"); // fill the alternate's first row: a wrap is now deferred
 	feed(&mut screen, b"\x1b[?47l");
 	assert_eq!(screen.cursor_row(), 0, "back on the primary, on its first row");
@@ -438,13 +444,15 @@ fn a_deferred_wrap_does_not_survive_a_buffer_switch() {
 	assert_eq!(screen.cursor_row(), 0, "the next glyph stays on it");
 	assert_eq!(dump(&screen), b"ab     X", "the alternate's deferred wrap did not follow it here");
 
-	// The other direction, which the homing already covered - asserted so the rule is pinned on
-	// both sides rather than on the side that happened to be broken.
+	// The other direction, which used to be covered by the homing `?47h` did for every caller -
+	// and it is the FLAG that is the subject, not the position. `?47h` no longer moves the cursor,
+	// so the deferred wrap is cancelled with the cursor left exactly where the primary had it: the
+	// next glyph goes in the column after it and does NOT wrap to the next row.
 	let mut screen = Screen::new(8, 4, 0);
 	feed(&mut screen, b"12345678");
 	feed(&mut screen, b"\x1b[?47h");
 	feed(&mut screen, b"X");
-	assert_eq!((screen.cursor_col(), screen.cursor_row()), (1, 0), "entering homes and cancels the wrap");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (7, 0), "entering leaves the cursor where it was and cancels the wrap, so the glyph lands in the last column rather than on the next row");
 }
 
 #[test]
@@ -1289,4 +1297,88 @@ fn every_cursor_move_settles_the_deferred_wrap() {
 	assert!(term.screen.wrap_pending());
 	term.screen.clear();
 	assert!(!term.screen.wrap_pending(), "clear() homes the cursor, so it settles the wrap");
+}
+
+// P02M0128, sixth round.
+
+#[test]
+fn the_bare_alternate_screen_switch_does_not_move_the_cursor() {
+	// `enter_alt_buffer` ended with `col = 0; row = 0; cursor_moved()` for EVERY caller, while the
+	// mode dispatcher's own comment said `?47` switches buffers and nothing else. xterm gives the
+	// cursor save/restore to `?1048` and the combination to `?1049` precisely so the bare switch
+	// does neither, and a program using it found its cursor moved out from under it.
+	//
+	// The existing `?47` case checks the cursor after moving INSIDE the alternate screen and
+	// returning, so entry-homing was invisible to it.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"\x1b[3;6H"); // row 2, column 5, zero-based
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (5, 2));
+	feed(&mut screen, b"\x1b[?47h");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (5, 2), "?47h switches buffers and nothing else");
+	feed(&mut screen, b"\x1b[?47l");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (5, 2), "and neither does ?47l");
+
+	// `?1049h` still homes, because a clean slate is its whole promise - the behaviour did not go
+	// away, it moved to the mode that owns it.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"\x1b[3;6H");
+	feed(&mut screen, b"\x1b[?1049h");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (0, 0), "?1049h gives the program a clean slate, cursor included");
+}
+
+#[test]
+fn a_selection_does_not_survive_a_buffer_switch() {
+	// `cells`, `wrap` and the saved cursor are per-buffer and `selection` was one field on `Screen`,
+	// so a selection made in the primary stayed highlighted at the same coordinates over the
+	// alternate screen's entirely different text - and `selection_text()` reads the glyphs of
+	// whichever buffer is now live, so a copy returned the fullscreen application's text rather than
+	// what was selected.
+	//
+	// The existing test only makes a selection AFTER entering the alternate screen, so it cannot see
+	// the transition.
+	let mut screen = Screen::new(8, 4, 0);
+	feed(&mut screen, b"primary!");
+	screen.selection_begin(0, 0);
+	screen.selection_extend(7, 0);
+	assert_eq!(screen.selection_text(), b"primary!".to_vec(), "the primary's text is selected");
+
+	feed(&mut screen, b"\x1b[?47h");
+	assert!(screen.selection_text().is_empty(), "entering the alternate screen leaves no selection over text that is no longer there");
+	feed(&mut screen, b"\x1b[H");
+	feed(&mut screen, b"ALTERNAT");
+	assert!(screen.selection_text().is_empty(), "and a copy cannot return the fullscreen program's text as though it had been selected");
+
+	// The same leaving, so the rule is pinned on both sides.
+	screen.selection_begin(0, 0);
+	screen.selection_extend(7, 0);
+	assert_eq!(screen.selection_text(), b"ALTERNAT".to_vec());
+	feed(&mut screen, b"\x1b[?47l");
+	assert!(screen.selection_text().is_empty(), "and leaving clears it too");
+}
+
+#[test]
+fn a_hard_reset_leaves_nothing_of_the_previous_session() {
+	// `reload_vt` called `screen.clear()`, which empties the active cell buffer, clears its wrap
+	// flags and homes the cursor - and nothing else. If a reload is a logout/login boundary that is
+	// session isolation: the next session could read the previous one's scrollback with
+	// Shift+PageUp, and start with the alternate screen active, a hidden cursor, live SGR
+	// attributes, a modified palette, a scroll region, mouse tracking and bracketed paste.
+	let mut screen = Screen::new(8, 4, 8);
+	feed(&mut screen, b"secret\r\n"); // into the scrollback once the screen scrolls
+	feed(&mut screen, b"\x1b[?1049h\x1b[?1000h\x1b[?2004h\x1b[1;31m\x1b[?25l\x1b[2;3r");
+	feed(&mut screen, b"alt");
+
+	screen.hard_reset();
+	assert!(screen.cursor_visible(), "the cursor is visible again");
+	assert!(!screen.bracketed_paste(), "bracketed paste is off");
+	assert!(!screen.has_selection(), "no selection is left");
+	assert_eq!((screen.cursor_col(), screen.cursor_row()), (0, 0), "and the cursor is home");
+	// AND THE SCREEN ITSELF, including the alternate buffer the program was using: a reset means
+	// indistinguishable from a fresh `Screen`, and `dump` trims trailing blanks - so an empty dump
+	// is the whole grid blank.
+	assert!(dump(&screen).is_empty(), "nothing of either buffer is left");
+	// The scrollback with it: a fresh `Screen` of this size dumps the same, and the previous
+	// session's line is not reachable by scrolling back to it.
+	let fresh = Screen::new(8, 4, 8);
+	assert_eq!(dump(&screen), dump(&fresh), "a reset screen is indistinguishable from a fresh one");
 }

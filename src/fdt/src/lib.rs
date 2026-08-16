@@ -150,7 +150,18 @@ impl Fdt {
 			let size_struct = self.be32(self.base + 36) as u64;
 			let size_strings = self.be32(self.base + 32) as u64;
 			let version = self.be32(self.base + 20);
-			if version != 17 || !(64..0x20_0000).contains(&totalsize) {
+			let last_comp_version = self.be32(self.base + 24);
+			// BACKWARD COMPATIBLE WITH 17, NOT EXACTLY 17.
+			//
+			// This was `version != 17`, and the format carries `last_comp_version` precisely so a
+			// client can accept a NEWER tree that remains compatible with the version it implements.
+			// Refusing one is a boot failure whose cause reads like a corrupt device tree. It is not
+			// a blocker on any machine this runs on - QEMU's `virt` writes version 17 with
+			// `last_comp_version` 16 - which is why it is worth fixing before it is one.
+			//
+			// An OLDER tree is still refused: version 16 has no `size_dt_struct`, which this reader
+			// uses to bound the walk.
+			if version < 17 || last_comp_version > 17 || !(64..0x20_0000).contains(&totalsize) {
 				return None;
 			}
 			// Each block starts inside the tree AND ends inside it. `checked_add` because both
@@ -251,6 +262,29 @@ impl Fdt {
 
 	// Length (excluding the terminator) of a null-terminated FDT string at `p`.
 	// Combine `cells` big-endian u32 cells at `p` into a u64 (advancing `p`).
+	// ONE CELL READ, WITH EVERY CHECK IT NEEDS. `pcie_ecam`, `plic_base` and `fwcfg_base` called
+	// `read_cells` without first requiring the property to BE `cells * 4` bytes long, so a short
+	// `reg` read the padding after it or the next token as an address - and that address is used for
+	// real MMIO writes after `ExitBootServices`.
+	//
+	// `read_cells` folds cells into a `u64` by shifting, so three or more cells silently drop the
+	// high ones; the width is bounded here rather than at each caller, which is how the console path
+	// came to accept four.
+	//
+	// `Option`, so a caller that cannot read its property leaves the previous value alone instead of
+	// adopting whatever the bytes happened to be.
+	unsafe fn read_cells_property(&self, value: u64, len: u32, cells: u32) -> Option<u64> {
+		if cells == 0 || cells > MAX_CELLS {
+			return None;
+		}
+		let want = cells.checked_mul(4)?;
+		if len < want {
+			return None;
+		}
+		let mut p = value;
+		Some(unsafe { self.read_cells(&mut p, cells) })
+	}
+
 	unsafe fn read_cells(&self, p: &mut u64, cells: u32) -> u64 {
 		let mut v = 0u64;
 		for _ in 0..cells {
@@ -417,6 +451,12 @@ impl Fdt {
 			let mut p = b.struct_start;
 			let mut depth: i32 = -1;
 			let mut d1_memory = false; // inside a depth-1 "memory" node
+			// `device_type = "memory"` seen, and `status` not `disabled`/`fail`. Both are properties,
+			// and a device tree does not promise property order - so the node's `reg` is REMEMBERED
+			// and the banks are committed at the node's end, once everything about it is known.
+			let mut d1_memory_typed = false;
+			let mut d1_memory_ok = true;
+			let mut d1_memory_reg: Option<(u64, u32)> = None;
 			let mut d1_cpus = false; //   inside the depth-1 "cpus" node
 			// The pcie/pci and plic nodes sit at the root on aarch64 virt but under /soc
 			// (depth 2) on riscv64 virt, so track them by the depth at which we entered.
@@ -446,7 +486,18 @@ impl Fdt {
 						let (name, next) = self.node_name_in(p, &b)?; // name + NUL, padded to 4
 						p = next;
 						if depth == 1 {
-							d1_memory = self.str_starts(name, "memory");
+							// A UNIT NAME OF EXACTLY `memory` OR `memory@...`, not a prefix.
+							//
+							// This was `str_starts(name, "memory")`, which matches
+							// `memory-controller@`, `memory-window@` and anything else beginning
+							// with those six letters - and if such a node has a `reg`, its MMIO
+							// aperture was added to the RAM list and handed to the frame allocator.
+							// The specification's rule is the unit name AND `device_type = "memory"`,
+							// which this parser did not read at all; `device_type` is checked below,
+							// where the property is seen.
+							d1_memory = self.str_eq(name, "memory") || self.str_starts(name, "memory@");
+							d1_memory_typed = false;
+							d1_memory_ok = true;
 							d1_cpus = self.str_eq(name, "cpus");
 							d1_chosen = self.str_eq(name, "chosen");
 						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
@@ -464,7 +515,43 @@ impl Fdt {
 					}
 					FDT_END_NODE => {
 						if depth == 1 {
+							// THE MEMORY NODE'S BANKS, COMMITTED NOW THAT IT IS FINISHED.
+							//
+							// `device_type` and `status` decide whether this node is memory at all,
+							// and either may appear after `reg`. A node without `device_type =
+							// "memory"` is not memory whatever its name; one marked `disabled` or
+							// `fail` is memory this kernel may not use.
+							if d1_memory
+								&& d1_memory_typed && d1_memory_ok
+								&& let Some((val, len)) = d1_memory_reg
+							{
+								if addr_cells == 0 || size_cells == 0 {
+									return None;
+								}
+								let mut q = val;
+								let end = val + len as u64;
+								while q + 4 * (addr_cells + size_cells) as u64 <= end {
+									let a = self.read_cells(&mut q, addr_cells);
+									let s = self.read_cells(&mut q, size_cells);
+									if s == 0 || a.checked_add(s).is_none() {
+										continue;
+									}
+									if ram_region_count < MAX_RAM_REGIONS {
+										ram_regions[ram_region_count] = (a, s);
+										ram_region_count += 1;
+									} else {
+										// AN EXPLICIT REFUSAL RATHER THAN A SILENT DROP. Everything
+										// past the sixteenth bank used to disappear, so a board
+										// with a fragmented map booted with less memory than it has
+										// and nothing said which part was missing.
+										return None;
+									}
+								}
+							}
 							d1_memory = false;
+							d1_memory_typed = false;
+							d1_memory_ok = true;
+							d1_memory_reg = None;
 							d1_cpus = false;
 							d1_chosen = false;
 						}
@@ -509,68 +596,43 @@ impl Fdt {
 								size_cells = cells;
 							}
 						} else if depth == 1 && d1_memory && self.str_eq(pname, "reg") {
-							// RAM IS NOT ONE RANGE, AND SUMMING THE BANKS PRETENDS IT IS.
+							// REMEMBERED, NOT PARSED HERE. `device_type` and `status` decide whether
+							// this node is memory at all and either may come after `reg`, so the
+							// banks are committed at the node's end - see `FDT_END_NODE`.
 							//
-							// This took the first bank's base and added up every bank's SIZE, so a
-							// board with a hole in its map - two 256 MB banks at 0x4000_0000 and
-							// 0x8000_0000 - produced base 0x4000_0000 and size 512 MB. The kernel
-							// builds its usable frame region from `ram_base .. ram_base + ram_size`,
-							// so it would have handed out frames from the middle of the HOLE as
-							// though they were memory, and stopped short of the second bank's real
-							// end. Writing to a hole is not a fault the allocator can attribute:
-							// the store simply goes nowhere and the data is gone.
-							//
-							// So banks are accumulated only while they are CONTIGUOUS with what has
-							// been seen, and a gap ends the run. What this reports is a range that
-							// genuinely is memory - which is the property the frame allocator needs
-							// and the one the old arithmetic could not promise.
-							//
-							// The cost is the RAM past the first hole, which is not used. That is a
-							// limitation and it is stated: see the milestone task for carrying the
-							// real region list, which is the fix that keeps it. Losing memory is
-							// recoverable by anyone who reads the boot report; handing out a hole is
-							// not recoverable by anybody.
-							let mut q = val;
-							let end = val + len as u64;
-							while q + 4 * (addr_cells + size_cells) as u64 <= end {
-								let a = self.read_cells(&mut q, addr_cells);
-								let s = self.read_cells(&mut q, size_cells);
-								if s == 0 {
-									continue;
-								}
-								// EVERY BANK, beside the run below. Coalesced with the last one when
-								// they touch, so a tree that splits one range into two entries does
-								// not spend two slots on it.
-								if let Some(last) = ram_region_count.checked_sub(1)
-									&& ram_regions[last].0 + ram_regions[last].1 == a
-								{
-									ram_regions[last].1 += s;
-								} else if ram_region_count < MAX_RAM_REGIONS {
-									ram_regions[ram_region_count] = (a, s);
-									ram_region_count += 1;
-								}
-								if ram_size == 0 {
-									ram_base = a;
-									ram_size = s;
-									continue;
-								}
-								// Contiguous with the run so far - in either direction, because a
-								// device tree does not promise its banks are in address order.
-								if a == ram_base + ram_size {
-									ram_size += s;
-								} else if a + s == ram_base {
-									ram_base = a;
-									ram_size += s;
-								}
-							}
+							// RAM IS NOT ONE RANGE, AND SUMMING THE BANKS PRETENDED IT WAS. The
+							// first version took the first bank's base and added up every bank's
+							// SIZE, so a board with a hole in its map - two 256 MB banks at
+							// 0x4000_0000 and 0x8000_0000 - produced base 0x4000_0000 and size
+							// 512 MB, and the allocator handed out frames from the middle of the
+							// hole. A store into a hole is not a fault the allocator can attribute:
+							// it simply goes nowhere.
+							d1_memory_reg = Some((val, len));
+						} else if depth == 1 && d1_memory && self.str_eq(pname, "device_type") {
+							// The specification's own test for a memory node, which this parser did
+							// not read at all: the unit name says where to look and this says what
+							// it is. NUL-terminated in the blob.
+							d1_memory_typed = len >= 7 && self.str_eq(val, "memory");
+						} else if depth == 1 && d1_memory && self.str_eq(pname, "status") {
+							// `disabled` and `fail` are memory this kernel may not use; `okay` and
+							// an absent property mean it may. Anything else is unrecognised and is
+							// treated as unusable, which is the direction that cannot hand out
+							// memory the firmware still owns.
+							d1_memory_ok = (len >= 5 && self.str_eq(val, "okay")) || (len >= 3 && self.str_eq(val, "ok"));
 						} else if in_pcie == depth && self.str_eq(pname, "reg") {
 							// The pcie node's reg is <ecam_base ecam_size> in root cells.
-							let mut q = val;
-							pcie_ecam = self.read_cells(&mut q, addr_cells);
+							// Through the bounded reader: a short `reg` leaves the previous value
+							// rather than adopting the bytes after it.
+							if let Some(base) = self.read_cells_property(val, len, addr_cells) {
+								pcie_ecam = base;
+							}
 						} else if in_plic == depth && self.str_eq(pname, "reg") {
 							// The plic node's reg is <plic_base plic_size> in root cells.
-							let mut q = val;
-							plic_base = self.read_cells(&mut q, addr_cells);
+							// Through the bounded reader: a short `reg` leaves the previous value
+							// rather than adopting the bytes after it.
+							if let Some(base) = self.read_cells_property(val, len, addr_cells) {
+								plic_base = base;
+							}
 						} else if depth == 1 && d1_chosen && (self.str_eq(pname, "linux,initrd-start") || self.str_eq(pname, "linux,initrd-end")) {
 							// QEMU writes these as one or two cells depending on the machine, so
 							// the width is taken from the property length rather than assumed -
@@ -590,8 +652,11 @@ impl Fdt {
 							}
 						} else if in_fwcfg == depth && self.str_eq(pname, "reg") {
 							// The fw-cfg node's reg is <fwcfg_base size> in root cells.
-							let mut q = val;
-							fwcfg_base = self.read_cells(&mut q, addr_cells);
+							// Through the bounded reader: a short `reg` leaves the previous value
+							// rather than adopting the bytes after it.
+							if let Some(base) = self.read_cells_property(val, len, addr_cells) {
+								fwcfg_base = base;
+							}
 						}
 					}
 					FDT_NOP => {}
@@ -600,6 +665,58 @@ impl Fdt {
 				}
 			}
 
+			// THE BANK LIST'S INVARIANTS, ESTABLISHED ONCE INSTEAD OF HOPED FOR.
+			//
+			// The list used to be built by coalescing a bank only with the one IMMEDIATELY before
+			// it: not sorted, overlaps not merged, `ram_regions[last].0 + ram_regions[last].1` and
+			// `+= s` computed unchecked. A tree listing its banks out of order therefore spent one
+			// slot each on ranges that touch, and two banks that OVERLAP both entered the list -
+			// after which the frame allocator's overlap refusal kept the system safe by discarding
+			// legitimate memory.
+			//
+			// Sorted by base, then merged where they touch or overlap. An insertion sort, because
+			// the list is at most sixteen entries and this crate is `no_std` and allocation-free.
+			let mut i = 1usize;
+			while i < ram_region_count {
+				let mut j = i;
+				while j > 0 && ram_regions[j - 1].0 > ram_regions[j].0 {
+					ram_regions.swap(j - 1, j);
+					j -= 1;
+				}
+				i += 1;
+			}
+			let mut merged = 0usize;
+			let mut k = 0usize;
+			while k < ram_region_count {
+				let (base, size) = ram_regions[k];
+				if merged > 0 {
+					let (held_base, held_size) = ram_regions[merged - 1];
+					// `checked_add` throughout: every one of these numbers came off the medium, and
+					// the end of a bank is exactly where the old arithmetic overflowed.
+					let held_end = held_base.checked_add(held_size);
+					if let Some(held_end) = held_end
+						&& base <= held_end
+					{
+						// Touching or overlapping: the union, which for an overlap is the larger of
+						// the two ends rather than the sum of the sizes.
+						let end = base.checked_add(size).unwrap_or(u64::MAX).max(held_end);
+						ram_regions[merged - 1] = (held_base, end - held_base);
+						k += 1;
+						continue;
+					}
+				}
+				ram_regions[merged] = (base, size);
+				merged += 1;
+				k += 1;
+			}
+			ram_region_count = merged;
+			// `ram_base`/`ram_size` describe the FIRST run, which is what a caller reading the pair
+			// has always got - and now it is the first run of a sorted, merged list rather than
+			// whichever banks happened to be adjacent in the tree.
+			if ram_region_count > 0 {
+				ram_base = ram_regions[0].0;
+				ram_size = ram_regions[0].1;
+			}
 			if ram_size == 0 {
 				return None;
 			}
@@ -953,3 +1070,74 @@ impl Fdt {
 
 #[cfg(test)]
 mod tests;
+
+impl Fdt {
+	// THE BLOB'S OWN EXTENT, so a caller can carve it out of the usable memory it hands to the
+	// allocator.
+	//
+	// The specification requires a client not to overwrite the device tree while it is still in use,
+	// and this kernel keeps using it after the allocator is up - riscv64 reads `timebase-frequency`
+	// from it well after `frame` init. Nothing reserved the pages holding it, so they could be
+	// allocated and zeroed while still live.
+	pub fn extent(&self) -> Option<(u64, u64)> {
+		unsafe {
+			if self.be32(self.base) != FDT_MAGIC {
+				return None;
+			}
+			let total = self.be32(self.base + 4) as u64;
+			if !(64..0x20_0000).contains(&total) {
+				return None;
+			}
+			Some((self.base, total))
+		}
+	}
+
+	// Every entry of the memory reservation block, which nothing read.
+	//
+	// `off_mem_rsvmap` points at a list of `(address, size)` big-endian pairs ending with a zero
+	// pair, and the specification says a client must not use those regions - they hold firmware
+	// runtime data and whatever a board reserves. `bootmem::loader_reservations` carved out
+	// `BootInfo`, the module descriptor array and the modules, and nothing else.
+	//
+	// Bounded by the blob's own total size and by a hard entry cap: the terminator comes off the
+	// same untrusted bytes as everything else, and a list that never terminates must not spin.
+	pub fn for_each_reserved_region(&self, mut visit: impl FnMut(u64, u64)) -> bool {
+		unsafe {
+			if self.be32(self.base) != FDT_MAGIC {
+				return false;
+			}
+			let total = self.be32(self.base + 4) as u64;
+			let off = self.be32(self.base + 16) as u64;
+			if !(64..0x20_0000).contains(&total) || off >= total {
+				return false;
+			}
+			let mut p = self.base + off;
+			let end = self.base + total;
+			for _ in 0..MAX_RESERVED_REGIONS {
+				if p.checked_add(16).is_none_or(|next| next > end) {
+					return false;
+				}
+				let address = ((self.be32(p) as u64) << 32) | self.be32(p + 4) as u64;
+				let size = ((self.be32(p + 8) as u64) << 32) | self.be32(p + 12) as u64;
+				p += 16;
+				if address == 0 && size == 0 {
+					return true;
+				}
+				// A reservation whose end overflows is the tree contradicting itself; skipped
+				// rather than carved, because carving a saturated range would take the whole
+				// address space out of the allocator.
+				if size == 0 || address.checked_add(size).is_none() {
+					continue;
+				}
+				visit(address, size);
+			}
+			// The list did not terminate within the cap: refused, because a client that carried on
+			// would be using memory the firmware reserved.
+			false
+		}
+	}
+}
+
+// A reservation list longer than this is a device tree this reader will not follow. Boards reserve
+// a handful of ranges; a thousand is a blob that has gone wrong or is trying to.
+const MAX_RESERVED_REGIONS: usize = 64;

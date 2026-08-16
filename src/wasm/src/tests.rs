@@ -1620,12 +1620,43 @@ mod spec_run {
 				// resets its memory before every check, and dropping those made thirteen of its
 				// loads read a memory the specification had cleared.
 				if run.expected == "effect" {
+					// AND A TRAP IN ONE IS A FAILURE OF THE CASE, not something to discard.
+					//
+					// The result was thrown away and so was the trap, so a module that trapped
+					// part-way through was replayed as though its state change had SUCCEEDED - and
+					// the assertions after it are written against the state it was supposed to
+					// leave. That is the same class as the `assert_return` false green this corpus
+					// was built to catch, in the other direction.
+					//
+					// A host limit is still not a disagreement with the specification, which is the
+					// one exception the value path already makes for the same reason.
+					match outcome {
+						Ok(_) => ran += 1,
+						Err(trap) if host_limit(&trap) => skipped += 1,
+						Err(trap) => {
+							ran += 1;
+							wrong.push(alloc::format!("{}: {}({}) trapped with {trap:?} while being replayed for its effect, so every assertion after it is written against a state that was never reached", run.file, run.export, run.args));
+						}
+					}
 					continue;
 				}
 				if run.expected == "trap" {
 					ran += 1;
-					if outcome.is_ok() {
-						wrong.push(alloc::format!("{}: {}({}) returned {:?} where the specification says it traps", run.file, run.export, run.args, outcome.ok()));
+					match outcome {
+						Ok(value) => wrong.push(alloc::format!("{}: {}({}) returned {value:?} where the specification says it traps", run.file, run.export, run.args)),
+						// A HOST-LIMIT TRAP IS NOT THE TRAP THE CASE NAMES.
+						//
+						// Any `Err` satisfied this, so a module that hit `MAX_STACK_DEPTH`, ran out
+						// of fuel or was refused by a host limit passed a case about integer
+						// division by zero - the assertion held for a reason that has nothing to do
+						// with what it is testing. Fuel and call depth are this engine's policy and
+						// the specification does not model them, so such a case has neither agreed
+						// nor disagreed: it is counted apart, exactly as the value path counts it.
+						Err(trap) if host_limit(&trap) => {
+							ran -= 1;
+							skipped += 1;
+						}
+						Err(_) => {}
 					}
 					continue;
 				}
@@ -1959,4 +1990,33 @@ fn memory_grow_is_charged_for_the_pages_it_zeroes() {
 	// And with fuel to pay for it, the grow succeeds and answers the old size in pages.
 	assert_eq!(inst.invoke_with_fuel("run", &[], &mut NoHost, 100_000), Ok(alloc::vec![Value::I32(1)]));
 	assert_eq!(inst.memory().len(), 17 * 65536);
+}
+
+// P02M0134, sixth round.
+
+#[test]
+fn a_declared_count_larger_than_its_own_section_is_refused_before_it_is_filled() {
+	// Every section parser read a count and then filled the corresponding vector, so a six-byte
+	// declaration of four billion entries had the host allocating before anything asked whether the
+	// count was plausible. The module is refused in the end and the host paid for it first, which is
+	// this engine's resource policy beginning after the expensive part.
+	//
+	// The bound needs no knowledge of the entries: a count times the SMALLEST an entry can be is a
+	// floor on the bytes the section must contain, and a count past the bytes remaining cannot be
+	// honest whatever else is true.
+	let mut wasm: Vec<u8> = alloc::vec![];
+	wasm.extend_from_slice(b"\0asm");
+	wasm.extend_from_slice(&[1, 0, 0, 0]);
+	// A type section declaring 0x0fff_ffff types in five bytes of content.
+	let content: Vec<u8> = alloc::vec![0xff, 0xff, 0xff, 0x7f];
+	wasm.extend_from_slice(&section(1, &content));
+	assert!(crate::parse(&wasm).is_err(), "a count larger than its section could encode is refused at the boundary");
+
+	// And an honest one still parses, so this is a bound and not a refusal of the ordinary case.
+	let mut wasm: Vec<u8> = alloc::vec![];
+	wasm.extend_from_slice(b"\0asm");
+	wasm.extend_from_slice(&[1, 0, 0, 0]);
+	let content: Vec<u8> = alloc::vec![0x01, 0x60, 0x00, 0x00];
+	wasm.extend_from_slice(&section(1, &content));
+	assert_eq!(crate::parse(&wasm).expect("one type in four bytes is honest").types.len(), 1);
 }

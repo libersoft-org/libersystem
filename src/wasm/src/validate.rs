@@ -68,6 +68,22 @@ impl core::fmt::Display for ValidationError {
 // of its own. It is deliberately generous: a body reaching this has thousands of live operands,
 // which no compiler emits and a hand-written module has to mean.
 pub const MAX_STACK_DEPTH: usize = 8192;
+
+// A FUNCTION TYPE'S OWN WIDTHS, because `MAX_STACK_DEPTH` alone is not an allocation ceiling.
+//
+// The depth is checked once per instruction, BEFORE `match instr` - so it bounds what the PREVIOUS
+// instruction left. A `call` pushes one operand per callee RESULT and a typed block pushes its whole
+// parameter and result tuple, so a single instruction can take the stack far past the ceiling, clone
+// a large `FuncType` and reallocate the validator's stack before the next iteration refuses it. The
+// module is still rejected, so this was never a soundness bypass; it is the ceiling failing to be
+// what it exists to be.
+//
+// The comment on that check argues that "an instruction adds a bounded number of operands", and a
+// large result tuple is exactly the assumption that breaks. Bounding the TYPE is the fix that makes
+// the argument true again, and it is checked where types are read rather than at each of the twenty
+// places that push.
+pub const MAX_TYPE_PARAMS: usize = 1024;
+pub const MAX_TYPE_RESULTS: usize = 1024;
 // How deep blocks may nest inside one body.
 //
 // The operand stack bounds itself and does NOT bound this, which is what made it a hole. Entering a
@@ -154,6 +170,17 @@ struct Frame {
 // Validate `module`, or say which rule it broke.
 pub fn validate(module: Module) -> Result<ValidatedModule, ValidationError> {
 	// The host's own ceilings first, because everything after them walks these lists.
+	//
+	// THE TYPES BEFORE THE FUNCTIONS, because every later ceiling is stated in operands and a type
+	// is what decides how many operands one instruction moves. See `MAX_TYPE_PARAMS`.
+	for (index, ty) in module.types.iter().enumerate() {
+		if ty.params.len() > MAX_TYPE_PARAMS {
+			return Err(ValidationError::module(format!("type {index} takes {} parameters, past the host limit of {MAX_TYPE_PARAMS}", ty.params.len())));
+		}
+		if ty.results.len() > MAX_TYPE_RESULTS {
+			return Err(ValidationError::module(format!("type {index} returns {} results, past the host limit of {MAX_TYPE_RESULTS}", ty.results.len())));
+		}
+	}
 	if module.funcs.len() > MAX_FUNCTIONS {
 		return Err(ValidationError::module(format!("a module with {} defined functions exceeds the host limit of {MAX_FUNCTIONS}", module.funcs.len())));
 	}
@@ -326,8 +353,11 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 		// instruction adds a bounded number of operands, so testing the depth once per instruction
 		// bounds it within one instruction's worth - which is what a ceiling needs to do and is a
 		// rule a new opcode cannot forget.
-		if stack.len() > MAX_STACK_DEPTH {
-			return Err(at(format!("the operand stack reaches {}, past the host limit of {MAX_STACK_DEPTH}", stack.len())));
+		// The bound the comment above claims. `MAX_TYPE_PARAMS`/`MAX_TYPE_RESULTS` are checked at the
+		// top of `validate`, so the most one instruction can add is one type's results - and this
+		// leaves room for exactly that before the next iteration is reached.
+		if stack.len() + MAX_TYPE_RESULTS > MAX_STACK_DEPTH {
+			return Err(at(format!("the operand stack reaches {}, past the host limit of {MAX_STACK_DEPTH} once one instruction's results are allowed for", stack.len())));
 		}
 		match instr {
 			Instr::Unreachable => mark_unreachable(&mut stack, &mut frames),

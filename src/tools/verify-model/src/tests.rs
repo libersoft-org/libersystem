@@ -644,7 +644,7 @@ fn trust_lapses_when_the_model_hash_moves() {
 // criteria now refuse, so the fixtures have to be honest about it: five pieces of evidence means
 // five different trees.
 fn evidence(universe: crate::shadow::Universe, architecture: &str, exec: bool, tree: &str) -> crate::shadow::Record {
-	crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: tree.to_string(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true, component_decisions: vec![format!("audio\t{tree}")], component_scopes: [(String::from("audio"), crate::shadow::Scope { change_kinds: vec![String::from("modified")], edge_kinds: vec![String::from("link.static")] })].into_iter().collect() }
+	crate::shadow::Record { universe, architecture: architecture.to_string(), verdict: String::from("Consistent"), reason: String::new(), model_hash: String::from("hash-a"), source_digest: tree.to_string(), changed_components: vec![String::from("audio")], outside_failures: Vec::new(), at: 0, change_kinds: Vec::new(), edge_kinds: Vec::new(), shadow_exec: exec, model_self_check: true, component_decisions: vec![format!("audio\t{tree}")], component_scopes: [(String::from("audio"), crate::shadow::Scope::from_kinds(vec![String::from("modified")], vec![String::from("link.static")]))].into_iter().collect() }
 }
 
 #[test]
@@ -1403,7 +1403,7 @@ fn a_build_covered_component_can_reach_trusted() {
 		// key that stopped counting, because a deterministic selector asked the same question from
 		// six trees answers it the same way six times.
 		record.component_decisions = vec![format!("term\t{tree}")];
-		record.component_scopes = [(String::from("term"), crate::shadow::Scope { change_kinds: vec![String::from("modified")], edge_kinds: vec![String::from("link.static")] })].into_iter().collect();
+		record.component_scopes = [(String::from("term"), crate::shadow::Scope::from_kinds(vec![String::from("modified")], vec![String::from("link.static")]))].into_iter().collect();
 		record
 	};
 	for (tree, architecture) in ["x86_64", "aarch64", "x86_64", "aarch64", "x86_64", "aarch64"].into_iter().enumerate() {
@@ -1624,7 +1624,7 @@ fn a_certificate_names_what_its_evidence_covers() {
 		// are true of the RUN and neither is true of audio.
 		record.change_kinds = vec![String::from("modified"), String::from("renamed")];
 		record.edge_kinds = vec![String::from("link.static"), String::from("generation.build")];
-		record.component_scopes.insert(String::from("term"), crate::shadow::Scope { change_kinds: vec![String::from("renamed")], edge_kinds: vec![String::from("generation.build")] });
+		record.component_scopes.insert(String::from("term"), crate::shadow::Scope::from_kinds(vec![String::from("renamed")], vec![String::from("generation.build")]));
 		log.records.push(record);
 	}
 	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
@@ -1683,18 +1683,20 @@ fn a_certificate_earned_on_one_kind_of_change_does_not_answer_for_another() {
 	assert_eq!(scope.change_kinds, vec![String::from("modified")]);
 	store.grant("audio", "hash-a", crate::shadow::Universe::TestGuest, clean, architectures, scope, 0);
 
-	let earned = crate::shadow::Scope { change_kinds: vec![String::from("modified")], edge_kinds: vec![String::from("link.static")] };
+	let earned = crate::shadow::Scope::from_kinds(vec![String::from("modified")], vec![String::from("link.static")]);
 	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &earned), crate::trust::Level::Trusted, "the change it was earned over");
 
-	let renamed = crate::shadow::Scope { change_kinds: vec![String::from("renamed")], edge_kinds: vec![String::from("link.static")] };
+	let renamed = crate::shadow::Scope::from_kinds(vec![String::from("renamed")], vec![String::from("link.static")]);
 	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &renamed), crate::trust::Level::Shadow, "a class of change nothing validated this selector over");
-	assert_eq!(store.shortfall("audio", "hash-a", crate::shadow::Universe::TestGuest, &renamed), vec![String::from("change kind 'renamed'")], "and the runner can say what is missing");
+	// NAMED AS A PAIR, because that is what the scope is now: a certificate covers observed
+	// combinations, not two independent sets, so what is missing is a combination.
+	assert_eq!(store.shortfall("audio", "hash-a", crate::shadow::Universe::TestGuest, &renamed), vec![String::from("change kind 'renamed' reached through edge kind 'link.static'")], "and the runner can say what is missing");
 
-	let generated = crate::shadow::Scope { change_kinds: vec![String::from("modified")], edge_kinds: vec![String::from("generation.build")] };
+	let generated = crate::shadow::Scope::from_kinds(vec![String::from("modified")], vec![String::from("generation.build")]);
 	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &generated), crate::trust::Level::Shadow, "an edge of the graph the evidence never walked");
 
 	// Both dimensions at once, which is the combination the audit named.
-	let both = crate::shadow::Scope { change_kinds: vec![String::from("renamed")], edge_kinds: vec![String::from("generation.build")] };
+	let both = crate::shadow::Scope::from_kinds(vec![String::from("renamed")], vec![String::from("generation.build")]);
 	assert_eq!(store.level("audio", "hash-a", crate::shadow::Universe::TestGuest, &both), crate::trust::Level::Shadow);
 	assert!(!store.trusted_everywhere("audio", "hash-a", &[crate::shadow::Universe::TestGuest], &both), "and the whole-run answer follows the same rule");
 

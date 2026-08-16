@@ -81,8 +81,23 @@ fn decisions(catalog: &crate::catalog::Catalog, items: &[PlanItem], edge_kinds: 
 		// different edge kinds gave audio two different digests, so the two counted as two pieces of
 		// evidence about audio again.
 		parts.push(format!("edges={}", edge_kinds.get(component).map(|kinds| kinds.join(",")).unwrap_or_default()));
-		parts.push(format!("built={}", built.join(",")));
-		parts.push(format!("booted={}", booted.join(",")));
+		// THIS COMPONENT'S TARGETS, from its own selected items - not the plan's global lists.
+		//
+		// `built=` and `booted=` were `plan.architectures_built` and `plan.architectures_booted`,
+		// which describe the WHOLE change set. So an `audio` decision changed because an unrelated
+		// component in the same diff pulled in an aarch64 boot or a different cost tier, and the
+		// distinctness counter - whose entire purpose is that a neighbour must not buy evidence -
+		// advanced on the neighbour again, through the one field it had left.
+		//
+		// It cut both ways: for an isolated leaf component under one model hash the decision is
+		// often byte-identical run after run, so the counter was hard to advance HONESTLY and easy
+		// to advance by accident. Reading the architectures out of the items that cover this
+		// component makes the digest what its name says: what was decided for it.
+		let mut targets: Vec<String> = items.iter().filter(|item| catalog.checks.iter().find(|check| check.id == item.key.check).map(|check| check.covers.contains(component)).unwrap_or(false)).map(|item| item.key.architecture.clone()).collect();
+		targets.sort();
+		targets.dedup();
+		parts.push(format!("targets={}", targets.join(",")));
+		let _ = (built, booted);
 		out.push(format!("{component}\t{:016x}", digest(&parts.join("\n"))));
 	}
 	out.sort();

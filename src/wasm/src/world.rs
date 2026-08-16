@@ -40,6 +40,14 @@ pub enum WorldFn {
 // and "the service did not answer" were one answer, on the boundary where a capability system most
 // needs them apart.
 pub const STATUS_DENIED: i32 = -1;
+// The most bytes one call of this ABI may move.
+//
+// `read` and `write` answer an `i32` that is a byte count when positive and a status when negative,
+// so a count above `i32::MAX` cannot be expressed - `n as i32` would wrap it into a failure code.
+// Named rather than written as `i32::MAX as usize` at each of the three places that need it,
+// because the SDK carries the same number and the two have to be the same number.
+pub const MAX_TRANSFER: usize = i32::MAX as usize;
+
 pub const STATUS_FAULT: i32 = -2;
 pub const STATUS_IO: i32 = -3;
 pub const STATUS_UNSUPPORTED: i32 = -4;
@@ -130,7 +138,26 @@ pub fn resolve(module: &str, field: &str, signature: Option<&FuncType>) -> Resul
 // three hundred bytes from an address near the top of its memory silently wrote fewer - the caller
 // was told a count it could not distinguish from a short file. A window that does not fit is
 // `Fault`, and the guest can say so.
-pub fn window(args: &[Value], mem_len: usize) -> Option<(usize, usize)> {
+// WHY a window could not be resolved, because the two answers are different statuses.
+//
+// `window` returned `Option` and the dispatch mapped every `None` to `STATUS_FAULT`, which the SDK
+// documents as "(ptr, len) is not in guest memory". That is right for a pair outside the memory and
+// wrong for an in-bounds length past `i32::MAX`, which the SDK's own vocabulary already has a word
+// for: `Unsupported` is "the argument is outside what the host accepts". A guest told `Fault` for a
+// legal address it can read looks for a pointer bug it does not have.
+//
+// Unreachable today behind the four-page memory cap - a component cannot hold two gigabytes to
+// point at - which is exactly why the contract is written for the future rather than for now: the
+// day the cap moves, the answer is already the right one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowError {
+	// The pair does not lie inside the guest's memory.
+	OutOfBounds,
+	// It does, and it is longer than one call may move.
+	TooLarge,
+}
+
+pub fn window(args: &[Value], mem_len: usize) -> Result<(usize, usize), WindowError> {
 	// BOTH ARGUMENTS, and typed. Missing ones defaulted to zero, which is a guess about a call that
 	// should not have happened: the world's signature is `(i32, i32)` and `resolve` refuses an
 	// import that declares anything else, so an import reaching here with the wrong arity is a
@@ -140,27 +167,28 @@ pub fn window(args: &[Value], mem_len: usize) -> Option<(usize, usize)> {
 	// too, and there is no type validator below this - so a module may declare `(param i32 i32)`
 	// correctly and push two `F64`s in a body nothing type-checked. Defence in depth, and it stays
 	// correct after the validator lands.
-	let [Value::I32(ptr), Value::I32(len)] = args[..] else { return None };
+	let [Value::I32(ptr), Value::I32(len)] = args[..] else { return Err(WindowError::OutOfBounds) };
 	let ptr: usize = ptr as u32 as usize;
 	let len: usize = len as u32 as usize;
-	let end: usize = ptr.checked_add(len)?;
-	if end > mem_len {
-		return None;
-	}
-	// THE ABI'S OWN CEILING, STATED. `read` and `write` answer an `i32` that is a byte count when it
-	// is positive and a status when it is negative, so a count above `i32::MAX` cannot be expressed
-	// - `n as i32` would wrap it into a negative number the guest reads as a failure code. Nothing
-	// can reach it today, because a component's memory is capped far below it, and that is a reason
-	// to write the limit down rather than a reason not to: a limit nobody wrote down is a limit
-	// somebody finds.
+	// THE ABI CEILING IS CHECKED FIRST, and the order is a decision rather than an accident.
 	//
-	// The contract is therefore "one call moves at most `i32::MAX` bytes", refused here rather than
-	// left to depend on a cap in another file. Widening it means a later ABI revision that returns
-	// something wider, which is a decision about the interface and not about this function.
-	if len > i32::MAX as usize {
-		return None;
+	// A pair can fail both tests at once - a one-page guest asking for two gigabytes is out of its
+	// memory AND longer than one call may move - and only one status can be returned. The length
+	// ceiling wins because it is a property of the INTERFACE and holds whatever the guest's memory
+	// is: no memory of any size makes `0x8000_0000` bytes expressible in the `i32` this ABI answers
+	// with. "Not in your memory" is contingent on the memory; "more than a call can carry" is not.
+	//
+	// It also makes the arm reachable. With the bound checked first, `STATUS_UNSUPPORTED` could only
+	// be produced by a guest holding more than 2 GiB, which the four-page cap forbids - so the
+	// distinction this enum exists for would have had no test at the dispatch level at all.
+	if len > MAX_TRANSFER {
+		return Err(WindowError::TooLarge);
 	}
-	Some((ptr, end))
+	let Some(end) = ptr.checked_add(len) else { return Err(WindowError::OutOfBounds) };
+	if end > mem_len {
+		return Err(WindowError::OutOfBounds);
+	}
+	Ok((ptr, end))
 }
 
 // Why a write did not happen, rather than whether it did.
@@ -274,12 +302,24 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 		let Some(op) = self.imports.get(import as usize).copied() else {
 			return Err(crate::interp::Trap("import index outside the resolved world"));
 		};
-		let Some((ptr, end)) = window(args, memory.len()) else {
-			return Ok(alloc::vec![Value::I32(STATUS_FAULT)]);
+		let (ptr, end) = match window(args, memory.len()) {
+			Ok(pair) => pair,
+			// The two failures the SDK's vocabulary already distinguishes: a pair outside the
+			// guest's memory is `Fault`, and a legal pair longer than one call may move is
+			// `Unsupported` - "the argument is outside what the host accepts".
+			Err(WindowError::OutOfBounds) => return Ok(alloc::vec![Value::I32(STATUS_FAULT)]),
+			Err(WindowError::TooLarge) => return Ok(alloc::vec![Value::I32(STATUS_UNSUPPORTED)]),
 		};
 		let status: i32 = match op {
 			// read(ptr, max) -> n: the one granted input file into the component's memory.
 			WorldFn::Read => match self.services.read(&mut memory[ptr..end]) {
+				// THE COUNT AN ADAPTER RETURNS IS CHECKED, not cast. `window` bounds the length the
+				// GUEST asked for and says nothing about what the adapter answers, so a wrong
+				// implementation returning more than the buffer - or more than `i32::MAX` - produced
+				// a number the guest reads as a status. Every adapter in this tree returns bounded
+				// counts, which makes this a boundary rather than a reachable bug; a boundary the
+				// host does not enforce is a boundary the next adapter gets to decide.
+				ReadOutcome::Read(n) if n > end - ptr || n > MAX_TRANSFER => STATUS_IO,
 				ReadOutcome::Read(n) => n as i32,
 				ReadOutcome::Refused => STATUS_DENIED,
 				ReadOutcome::Failed => STATUS_IO,
@@ -289,6 +329,8 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 			WorldFn::Write => {
 				self.output = memory[ptr..end].to_vec();
 				match self.services.write(&memory[ptr..end]) {
+					// The same check the read arm makes, for the same reason.
+					WriteOutcome::Wrote(n) if n > end - ptr || n > MAX_TRANSFER => STATUS_IO,
 					WriteOutcome::Wrote(n) => n as i32,
 					WriteOutcome::Refused => STATUS_DENIED,
 					WriteOutcome::Failed => STATUS_IO,

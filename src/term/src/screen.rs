@@ -1776,6 +1776,15 @@ impl Screen {
 						self.enter_alt_buffer();
 						// ...and blank it, which is the part that makes `?1049h` a clean slate.
 						self.clear_alt();
+						// AND HOME THE CURSOR, HERE rather than inside `enter_alt_buffer`.
+						//
+						// The switch used to home for every caller, which is what `?47` must not do
+						// - and `?1049`'s whole promise is a clean slate, which a cursor left
+						// wherever the shell had it is not. The behaviour did not move; it moved to
+						// the mode that owns it.
+						self.col = 0;
+						self.row = 0;
+						self.cursor_moved();
 					} else {
 						self.leave_alt_buffer();
 						self.clear_alt();
@@ -1821,6 +1830,15 @@ impl Screen {
 		}
 		self.alt_active = true;
 		self.view_offset = 0;
+		// THE SELECTION BELONGS TO THE TEXT IT WAS MADE OVER. `cells`, `wrap` and the saved cursor
+		// are per-buffer and `selection` is one field on `Screen`, so a selection made in the
+		// primary stayed highlighted at the same coordinates over the alternate screen's entirely
+		// different text - and `selection_text()` reads the glyphs of whichever buffer is now live,
+		// so a copy returned the fullscreen application's text rather than what was selected.
+		//
+		// Cleared on the switch rather than made per-buffer: a selection is a transient gesture, and
+		// nobody expects one to be waiting for them when a fullscreen program exits.
+		self.selection = None;
 		// NOTHING IS SWAPPED AND NOTHING IS CLEARED. Each buffer owns its own flags, so the
 		// primary's are simply not the live ones any more - and the alternate's are whatever it
 		// had, which is the fix for `?47`: the cells were deliberately preserved across leave and
@@ -1828,8 +1846,15 @@ impl Screen {
 		// characters back without their line structure. Entry-clearing belongs to `?1049`, and it
 		// clears the whole buffer through `clear_alt`.
 		self.mark_all_dirty();
-		self.col = 0;
-		self.row = 0;
+		// AND THE CURSOR IS NOT MOVED. This ended with `col = 0; row = 0; cursor_moved()` for every
+		// caller while the mode dispatcher's own comment said `?47` switches buffers and nothing
+		// else. xterm gives the cursor save/restore to `?1048` and the combination to `?1049`
+		// precisely so that `?47` does not do it, and a program using the bare switch found its
+		// cursor moved out from under it.
+		//
+		// `cursor_moved()` still runs, because the deferred-wrap flag describes the LIVE buffer's
+		// current row and the live buffer is being changed underneath it - which is the same reason
+		// `leave_alt_buffer` calls it.
 		self.cursor_moved();
 	}
 
@@ -1839,6 +1864,9 @@ impl Screen {
 		}
 		self.alt_active = false;
 		self.mark_all_dirty();
+		// The same rule leaving as entering: the highlighted coordinates describe text that is no
+		// longer under them.
+		self.selection = None;
 		// A DEFERRED WRAP DOES NOT SURVIVE THE SWITCH, in either direction. The flag describes "the
 		// glyph in the last column of the live buffer's current row is waiting to wrap", and the
 		// live buffer is being changed underneath it: after `?47l` it would describe the primary's
@@ -1891,6 +1919,20 @@ impl Screen {
 	// OSC-modified palette, the default colours, the DECSCUSR shape and blink and the saved-cursor
 	// state exactly as the previous program had them. That is the whole purpose of the sequence and
 	// the thing a shell relies on after a program crashes: a terminal it did not configure.
+	// PUBLIC, because a logout is a reset. `reload_vt` in the ConsoleService called `clear()` -
+	// which empties the ACTIVE cell buffer, clears its wrap flags and homes the cursor, and nothing
+	// else - so a fresh shell could start with the alternate screen active, a hidden or restyled
+	// cursor, live SGR attributes, a modified palette, a scroll region, mouse tracking, bracketed
+	// paste, a live selection, and the PREVIOUS SESSION'S SCROLLBACK. If a reload is a
+	// logout/login boundary that is session isolation and not tidiness: the next session could read
+	// the previous one's screen history with Shift+PageUp.
+	//
+	// The function that does the right thing already existed and was private, which is why `clear`
+	// was being called instead.
+	pub fn hard_reset(&mut self) {
+		self.reset();
+	}
+
 	fn reset(&mut self) {
 		self.fg_color = Color::Default;
 		self.bg_color = Color::Default;

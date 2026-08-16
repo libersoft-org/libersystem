@@ -1,11 +1,17 @@
 // The interpreter: a stack machine over the decoded [`Instr`] stream. It supports
 // structured control flow (block / loop / if / else / br / br_if / br_table /
-// return), the integer instruction set (i32 / i64 arithmetic, comparison, bitwise,
-// shifts, rotates, and the width conversions), globals, a single linear memory with
-// loads / stores / size / grow / copy / fill, and calls - both to defined functions
-// and, through the [`Host`] seam, to imported ones. Floating point is added by a
-// later step. Imported functions are how a WASI-style component reaches native
+// return), the integer AND floating-point instruction sets (i32 / i64 / f32 / f64
+// arithmetic, comparison, bitwise, shifts, rotates, and the width and float
+// conversions), globals, a single linear memory with loads / stores / size / grow /
+// copy / fill, and calls - both to defined functions and, through the [`Host`] seam,
+// to imported ones. Imported functions are how a WASI-style component reaches native
 // services; the host services only the imports it was wired up to grant.
+//
+// "Floating point is added by a later step" is what this said, and it is not: `Value`
+// three lines below carries `F32` and `F64`, the spec corpus runs the float suites,
+// and `lib.rs` has described the supported subset as including them for some time.
+// This engine has been reopened by a stale comment before, and a comment describing a
+// subset the code no longer has is the one a new contributor builds on.
 
 use crate::decode::Instr;
 use crate::module::{Module, ValType};
@@ -628,6 +634,14 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 					stack.push(refused);
 					continue;
 				};
+				// CHARGED BEFORE THE RESERVATION, which is the ordering the comment below already
+				// argues for and the code did not have.
+				//
+				// The reservation came first and the charge after it, so a guest with too little
+				// fuel still got the host to reserve the memory and only then trapped - and the
+				// reservation STAYS. "A refused grow does no work" is the rule; a refusal that has
+				// already made the host commit sixty-four megabytes is not one.
+				budget.charge_bulk(new_bytes - memory.len())?;
 				// `try_reserve` before `resize`, so a host that cannot find the memory answers the
 				// guest instead of aborting under it.
 				if memory.try_reserve(new_bytes.saturating_sub(memory.len())).is_err() {
@@ -643,8 +657,8 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				// two ways depending on which instruction asked for it.
 				//
 				// Charged only on the path that grows: a refused grow does no work, and charging it
-				// would let a rejected request drain the budget.
-				budget.charge_bulk(new_bytes - memory.len())?;
+				// would let a rejected request drain the budget. The charge itself has moved above
+				// the reservation - see there.
 				memory.resize(new_bytes, 0);
 				stack.push(Value::I32(old_pages as i32));
 			}

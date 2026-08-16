@@ -106,7 +106,8 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// they reach the kernel as `MEM_BOOTLOADER` - which its frame allocator never seeds, so they
 	// would be reserved for the system's whole life. The number is printed because it is the one
 	// this milestone asked to be measured.
-	exit_boot_services(bs, image_handle);
+	let region_count = exit_boot_services(bs, image_handle, unsafe { (*(boot_info as *const BootInfo)).memmap as *mut bootproto::MemRegion });
+	unsafe { (*(boot_info as *mut BootInfo)).memmap_len = region_count as u64 };
 
 	// Now, and only now, put the kernel at its link addresses and enter it. The loader ran
 	// under the firmware's identity map, so with paging off it keeps executing at the same
@@ -128,6 +129,21 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 	let fb = crate::locate_framebuffer(bs);
 	serial::write_str(if fb.present { "loader: GOP framebuffer found\n" } else { "loader: no GOP framebuffer (serial-only boot log)\n" });
 	let phys = crate::alloc_pages(bs, 1).expect("loader: cannot allocate BootInfo");
+	// THE FIRMWARE'S MEMORY MAP, WHICH THIS ARCHITECTURE HANDED OVER AS NOTHING.
+	//
+	// `memmap: 0, memmap_len: 0` was written here and the kernel fell back to the device tree's
+	// `/memory`. The Devicetree Specification is explicit that under UEFI the system memory map
+	// comes from `GetMemoryMap()` and `/memory` is to be ignored, and the reason is not formal: the
+	// EFI map carries runtime services code and data, ACPI NVS and reclaimable regions, unusable
+	// memory, firmware reservations, loader allocations and MMIO apertures, none of which a
+	// `/memory` node expresses. So the kernel could mark as usable, zero, and hand to a page table
+	// or a userspace process memory the firmware still owns.
+	//
+	// The array is allocated here and FILLED after the last `GetMemoryMap`, because that call must
+	// be the one immediately before `ExitBootServices` - see `exit_boot_services`. The DTB stays
+	// what it is for: CPU and device topology.
+	let regions_pages = (uefi::memory::MAX_REGIONS * core::mem::size_of::<bootproto::MemRegion>()).div_ceil(PAGE_SIZE as usize);
+	let regions_phys = crate::alloc_pages(bs, regions_pages).expect("loader: cannot allocate region array");
 	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: fb.bpp, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
 	unsafe {
 		// The page is allocated ONLY when there is a package to describe. `match (init_pkg,
@@ -160,7 +176,7 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 			}
 			_ => (0, 0),
 		};
-		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: 0, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit: bootproto::PSCI_NONE, rsdp: 0, smp_trampoline: 0, dtb };
+		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: regions_phys, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit: bootproto::PSCI_NONE, rsdp: 0, smp_trampoline: 0, dtb };
 	}
 	phys
 }
@@ -398,7 +414,16 @@ fn find_dtb(system_table: *mut SystemTable) -> u64 {
 // Get the current memory map (only for its key) and exit boot services, retrying if
 // the map changed between the two calls. After this returns no firmware service may
 // be called. riscv64 needs no translated map - the kernel reads RAM from the DTB.
-fn exit_boot_services(bs: *mut BootServices, image_handle: Handle) {
+// AND TRANSLATES THE MAP IT TAKES, which this threw away.
+//
+// The comment here said "aarch64 needs no translated map - the kernel reads RAM from the DTB", and
+// that is the finding: under UEFI the device tree's `/memory` is not the system memory map. The
+// final `GetMemoryMap` - the one whose key `ExitBootServices` consumes - is translated into
+// `regions` in the same iteration, with no allocation between them, exactly as x86_64 does.
+//
+// Returns the region count, which the caller writes into the BootInfo after the exit: that is a
+// store to plain memory and needs no firmware service.
+fn exit_boot_services(bs: *mut BootServices, image_handle: Handle, regions: *mut bootproto::MemRegion) -> usize {
 	let mut map_size = 0usize;
 	let mut key = 0usize;
 	let mut desc_size = 0usize;
@@ -443,9 +468,17 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle) {
 		// And the firmware's console with it: after this call `ConOut` points at memory the loader
 		// no longer owns, so every later diagnostic goes to the built-in UART.
 		crate::console::release();
+		// FATAL, not silent, and said HERE because this is where there is a serial port to say it
+		// on: `translate_map` refuses a map with more regions than the boot protocol carries rather
+		// than truncating it, and a map that looks complete and is missing its tail is the worst
+		// available failure for the one structure that says which RAM exists.
+		let Some(count) = uefi::memory::translate_map(buf, size, desc_size, regions) else {
+			serial::write_str("loader: FATAL - the firmware memory map has more regions than the boot protocol carries\n");
+			panic!("memory map larger than MAX_REGIONS");
+		};
 		let status = unsafe { ((*bs).exit_boot_services)(image_handle, key) };
 		if !uefi::is_error(status) {
-			return;
+			return count;
 		}
 		// ONLY a stale map key is worth retrying. This looped on every error forever, which is the
 		// least informative possible response to a firmware saying something else is wrong.

@@ -211,6 +211,25 @@ fn build_udf() -> Vec<u8> {
 	tag(&mut lvd, TAG_LOGICAL_VOLUME, 258);
 	blk(258, &lvd);
 	let mut fsd = vec![0u8; SECTOR_SIZE];
+	// A CONFORMING File Set Descriptor, not a zeroed block with a root pointer in it.
+	//
+	// The parser reads `NextExtent`, the File Set and Descriptor numbers, the interchange levels,
+	// the two character sets and the Domain Identifier, because those fields exist to say how the
+	// structures and the names are to be interpreted - and assuming the answer while the field is
+	// present is the wrong direction to guess in. A fixture of zeros answered "interchange level 0,
+	// no domain", which no writer produces; it is the same lesson this file has already learned at
+	// the Descriptor Version and the FID tag location, one field further out.
+	// The offsets are ECMA-167's, checked against an image `mkfs.udf` wrote - see the layout in
+	// `finish_mount`.
+	w16(&mut fsd, 28, 2); // InterchangeLevel: what this volume uses
+	w16(&mut fsd, 30, 3); // MaximumInterchangeLevel: what it may use
+	// The two 64-byte character set specifications: type 0 (CS0) then the OSTA identifier.
+	fsd[48] = 0;
+	fsd[49..49 + 23].copy_from_slice(b"OSTA Compressed Unicode");
+	fsd[240] = 0;
+	fsd[241..241 + 23].copy_from_slice(b"OSTA Compressed Unicode");
+	// The Domain Identifier: flags byte then the identifier.
+	fsd[417..417 + 19].copy_from_slice(b"*OSTA UDF Compliant");
 	w32(&mut fsd, 400, SECTOR_SIZE as u32); // the root ICB's extent length
 	w32(&mut fsd, 404, 260); // root ICB at lb 260
 	tag(&mut fsd, TAG_FILE_SET, 259);
@@ -322,7 +341,10 @@ fn an_unrecorded_extent_reads_as_zeros_and_a_chain_ad_refuses() {
 	img[fe + 34] = 0; // short_ad
 	w64(&mut img[fe..], 56, 5);
 	w32(&mut img[fe..], 172, 8);
-	w32(&mut img[fe..], 176, (1 << 30) | 2048); // allocated, not recorded
+	// The extent declares exactly the file's length. It used to declare 2048 against an
+	// `InformationLength` of 5 - a fixture describing a File Entry whose two lengths disagree, which
+	// the parser now refuses. See the exact-coverage rule in `flatten`.
+	w32(&mut img[fe..], 176, (1 << 30) | 5); // allocated, not recorded
 	w32(&mut img[fe..], 180, 0); // points at the boot area's stale bytes
 	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
@@ -451,12 +473,21 @@ fn a_non_parent_identifier_of_one_byte_is_corruption_rather_than_an_empty_name()
 	img[261 * SECTOR_SIZE..262 * SECTOR_SIZE].copy_from_slice(&sub);
 	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
 	assert_eq!(fs.list_dir(b"SUB"), Err(FsError::Corrupt), "the directory holds a record UDF does not permit");
-	// A LOOKUP THAT REACHES THE RECORD SAYS SO; one that finds its answer first does not, and that
-	// asymmetry is right. `WORLD.TXT` is ordered before the bad record, so it is found and returned
-	// - a reader is not obliged to walk past what it came for. A name that is NOT there walks the
-	// whole directory, meets the record, and answers `Corrupt` instead of `NotFound`: the caller
-	// must not be told a file is absent from a directory this reader could not read to the end.
-	assert_eq!(fs.read_file(b"SUB/WORLD.TXT"), Ok(b"world".to_vec()), "a name found before the damage is still answered");
+	// AND THE LOOKUP SAYS SO WHATEVER ORDER THE RECORDS ARE IN, which is a change from what this
+	// test used to assert.
+	//
+	// It asserted an asymmetry - `WORLD.TXT` is ordered before the bad record, so it was found and
+	// returned, while a name that is not there walked the whole directory and reported the damage -
+	// and called it right, on the argument that a reader is not obliged to walk past what it came
+	// for. That argument is worth less than it looks: the directory is already fully in memory
+	// before the walk begins, so finishing the scan costs parsing and no I/O, and the asymmetry
+	// means one damaged volume answers truthfully or not depending on alphabetical luck.
+	//
+	// It also made a whole class of rule unenforceable. "Exactly one parent record, first, and no
+	// two active records sharing a name" cannot be checked by a walk that stops early - and the
+	// duplicate-name rule is the one with teeth, because `find_entry` returned the first match and
+	// hid the second permanently.
+	assert_eq!(fs.read_file(b"SUB/WORLD.TXT"), Err(FsError::Corrupt), "a name ordered before the damage is refused too: the directory is what is damaged, not the lookup");
 	assert_eq!(fs.read_file(b"SUB/MISSING.TXT"), Err(FsError::Corrupt), "and a name that is not there reports the damage rather than reporting it missing");
 }
 
@@ -1361,7 +1392,10 @@ fn a_long_ad_sparse_extent_reads_as_zeros_and_a_zero_length_one_terminates() {
 		img[fe + 34] = 1; // long_ad
 		w64(&mut img[fe..], 56, 5); // InformationLength
 		w32(&mut img[fe..], 172, 16); // one long_ad of allocation descriptors
-		w32(&mut img[fe..], 176, (extent_type << 30) | 2048); // the extent, unrecorded
+		// Exactly the declared `InformationLength`, for the same reason as the short_ad fixture
+		// above: an extent that overruns the file's length is now corruption rather than something
+		// to clamp.
+		w32(&mut img[fe..], 176, (extent_type << 30) | 5); // the extent, unrecorded
 		w32(&mut img[fe..], 180, 0); // pointing at the boot area's stale bytes
 		w16(&mut img[fe..], 184, 0); // partition 0
 		refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
@@ -1500,8 +1534,12 @@ fn an_embedded_file_entry_whose_allocation_area_leaves_the_block_is_refused() {
 	let mut img = build_udf();
 	let fe = 262 * SECTOR_SIZE;
 	img[fe + 34] = 3;
-	w64(&mut img[fe..], 56, 5);
-	w32(&mut img[fe..], 172, 64); // a legal l_ad: the embedded bytes sit inside it
+	// EQUAL, because for embedded data the descriptor area IS the data. This declared
+	// `InformationLength = 5` inside a 64-byte allocation area and called it "the honest
+	// descriptor", which is the semantics this milestone found being locked in by its own test: the
+	// two numbers describe one object and a File Entry where they disagree contradicts itself.
+	w64(&mut img[fe..], 56, 64);
+	w32(&mut img[fe..], 172, 64);
 	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
 	let mut fs = Udf::mount(MemDisc { data: img.clone() }).unwrap();
 	assert!(fs.read_file(b"HELLO.TXT").is_ok(), "the honest descriptor passes");
@@ -1595,4 +1633,241 @@ fn an_information_length_larger_than_the_partition_is_refused() {
 	refresh(&mut img, lb, TAG_FILE_ENTRY, lb as u32);
 	let mut fs = Udf::mount(MemDisc { data: img }).expect("the volume still mounts - only one length is forged");
 	assert_eq!(fs.list(), Err(FsError::Corrupt), "a length no partition could hold is not a size");
+}
+
+#[test]
+fn the_extents_must_account_for_exactly_the_information_length() {
+	// TWO FORMS OF ONE DEFECT: a File Entry whose two lengths describe one file and disagree.
+	//
+	// The embedded arm was `info_len > l_ad`, so `InformationLength = 5` inside a 64-byte allocation
+	// area returned the first five bytes of a sixty-four-byte object as the whole file. The external
+	// arm took `len.min(info_len - done)`, so an extent declaring 2048 bytes against an
+	// `InformationLength` of 5 had 2043 bytes silently ignored - and every descriptor after the
+	// point where the count was reached was never parsed at all.
+	//
+	// It is not a memory-safety problem: the bounds were good throughout. It is the same silent
+	// truncation this milestone already closed at the directory level, one layer further down.
+	let fe = 262 * SECTOR_SIZE;
+
+	// Embedded, short of its area.
+	let mut img = build_udf();
+	img[fe + 34] = 3;
+	w64(&mut img[fe..], 56, 5);
+	w32(&mut img[fe..], 172, 64);
+	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Corrupt), "an embedded file shorter than the area it is embedded in is a File Entry contradicting itself");
+
+	// Embedded, exactly its area: accepted, and the whole of it comes back.
+	let mut img = build_udf();
+	img[fe + 34] = 3;
+	w64(&mut img[fe..], 56, 32);
+	w32(&mut img[fe..], 172, 32);
+	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT").map(|bytes| bytes.len()), Ok(32), "and one where they agree reads its whole length");
+
+	// External, an extent longer than the file it belongs to.
+	let mut img = build_udf();
+	img[fe + 34] = 0; // short_ad
+	w64(&mut img[fe..], 56, 5);
+	w32(&mut img[fe..], 172, 8);
+	w32(&mut img[fe..], 176, 2048); // recorded, and eight times longer than the file
+	w32(&mut img[fe..], 180, 0);
+	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Corrupt), "an extent that overruns the declared length is refused rather than clamped");
+
+	// External, a descriptor AFTER the length has been accounted for. The old loop stopped at
+	// `done == info_len` and never looked at it; a file's descriptor area is now parsed whole.
+	let mut img = build_udf();
+	img[fe + 34] = 0;
+	// The base image embeds its data at 176, so the descriptor area has to be cleared before
+	// descriptors are written into it - otherwise the "nothing after the terminator" rule fires on
+	// the fixture's own leftovers rather than on what the case is about.
+	img[fe + 176..fe + 200].fill(0);
+	w64(&mut img[fe..], 56, 5);
+	w32(&mut img[fe..], 172, 24); // three descriptor slots
+	w32(&mut img[fe..], 176, 5); // the file, in full
+	w32(&mut img[fe..], 180, 0);
+	w32(&mut img[fe..], 184, 0); // the terminator
+	w32(&mut img[fe..], 188, 0);
+	w32(&mut img[fe..], 192, 2048); // and an extent nothing accounts for
+	w32(&mut img[fe..], 196, 0);
+	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Corrupt), "a descriptor past the terminator is one the file's length does not account for");
+
+	// And the same shape without the stray descriptor is accepted, so this is a rule about the
+	// leftover and not about having a terminator at all.
+	let mut img = build_udf();
+	img[fe + 34] = 0;
+	img[fe + 176..fe + 200].fill(0);
+	w64(&mut img[fe..], 56, 5);
+	w32(&mut img[fe..], 172, 24);
+	w32(&mut img[fe..], 176, (1u32 << 30) | 5); // unrecorded, so the five bytes are zeros by rule
+	w32(&mut img[fe..], 180, 0);
+	refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
+	let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+	assert_eq!(fs.read_file(b"HELLO.TXT"), Ok(alloc::vec![0u8; 5]), "a terminated sequence with zero padding after it is well formed");
+}
+
+#[test]
+fn the_allocation_descriptor_area_must_be_a_whole_number_of_descriptors() {
+	// A FORMAT RULE, CHECKED BECAUSE IT IS THE RULE. ECMA-167 requires the extended attributes to be
+	// a multiple of four and the allocation descriptors to be a whole number of descriptors. Nothing
+	// asked, and the exact-coverage rule above rejects most misaligned areas as a side effect - a
+	// rule that holds only because a later arithmetic step happens to notice is one that stops
+	// holding when the arithmetic changes.
+	let fe = 262 * SECTOR_SIZE;
+	for (form, byte, bad, good) in [("short_ad", 0u8, 12u32, 8u32), ("long_ad", 1u8, 24, 16)] {
+		let mut img = build_udf();
+		img[fe + 34] = byte;
+		img[fe + 176..fe + 208].fill(0);
+		w64(&mut img[fe..], 56, 5);
+		w32(&mut img[fe..], 172, bad);
+		w32(&mut img[fe..], 176, 5);
+		w32(&mut img[fe..], 180, 0);
+		w16(&mut img[fe..], 184, 0);
+		refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
+		let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+		assert_eq!(fs.read_file(b"HELLO.TXT"), Err(FsError::Corrupt), "{form}: an allocation area of {bad} bytes is not a whole number of descriptors");
+
+		let mut img = build_udf();
+		img[fe + 34] = byte;
+		img[fe + 176..fe + 208].fill(0);
+		w64(&mut img[fe..], 56, 5);
+		w32(&mut img[fe..], 172, good);
+		w32(&mut img[fe..], 176, (1u32 << 30) | 5);
+		w32(&mut img[fe..], 180, 0);
+		w16(&mut img[fe..], 184, 0);
+		refresh(&mut img, 262, TAG_FILE_ENTRY, 262);
+		let mut fs = Udf::mount(MemDisc { data: img }).unwrap();
+		assert_eq!(fs.read_file(b"HELLO.TXT"), Ok(alloc::vec![0u8; 5]), "{form}: and {good} bytes is exactly one");
+	}
+}
+
+// The same fixture with the one thing a production backing forgot: it does not know its own size.
+//
+// `MemDisc` implements `block_count`, so every backup-anchor test in this file passes over a backing
+// that answers - while `impl udf::BlockDevice for UdfBlockDevice` in StorageService implemented
+// `read_block` and `read_blocks` and NOT `block_count`, took the defaulted `None`, and probed anchor
+// 256 alone. The feature worked in the suite and on no real disc, and no test could say so because
+// every fixture answered.
+struct SizelessDisc {
+	data: Vec<u8>,
+}
+
+impl BlockDevice for SizelessDisc {
+	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+		let start = lba as usize * SECTOR_SIZE;
+		let Some(src) = self.data.get(start..start + SECTOR_SIZE) else {
+			return false;
+		};
+		buf.copy_from_slice(src);
+		true
+	}
+	// Deliberately the DEFAULT, spelled out: this is the whole subject of the test below.
+	fn block_count(&mut self) -> Option<u64> {
+		None
+	}
+}
+
+#[test]
+fn a_backing_that_does_not_answer_its_size_loses_the_backup_anchors() {
+	// A disc whose anchor at 256 is damaged is exactly the case the format's redundancy exists for.
+	// Whether it is survivable depends entirely on the backing being able to say how big it is, and
+	// nothing in this suite made that dependence visible: every fixture answered, so a backing that
+	// did not was a silent downgrade from three anchors to one.
+	//
+	// The two halves of the same image, differing only in `block_count`.
+	let mut img = build_udf();
+	// A second anchor at N - 256 and at N, which is what a real disc carries.
+	let blocks = img.len() / SECTOR_SIZE;
+	let anchor = img[256 * SECTOR_SIZE..257 * SECTOR_SIZE].to_vec();
+	for at in [blocks - 1 - 256, blocks - 1] {
+		img[at * SECTOR_SIZE..(at + 1) * SECTOR_SIZE].copy_from_slice(&anchor);
+		refresh(&mut img, at, TAG_AVDP, at as u32);
+	}
+	// And the primary anchor destroyed, so only the backups can answer.
+	img[256 * SECTOR_SIZE..257 * SECTOR_SIZE].fill(0);
+
+	assert!(Udf::mount(MemDisc { data: img.clone() }).is_some(), "a backing that knows its size reaches the backup anchors, which is what they are for");
+	assert!(Udf::mount(SizelessDisc { data: img }).is_none(), "and one that does not is left with the single damaged anchor - so an adapter that omits `block_count` silently gives up the format's redundancy");
+}
+
+#[test]
+fn the_file_set_descriptor_is_read_semantically_and_not_only_structurally() {
+	// Tag, CRC and location were checked and the fields that say HOW to interpret the volume were
+	// not - so this reader assumed OSTA CS0 for every name it decoded while the descriptor carried
+	// the answer, ignored the continuation pointer that says which File Set is the prevailing one,
+	// and took the first descriptor of a multi-set volume as "the" File Set.
+	//
+	// Each case is one field of an otherwise valid descriptor, and each answers `Unsupported` rather
+	// than `Corrupt`: the volume is well formed and this reader does not implement it, which is a
+	// different thing to tell an operator.
+	let fsd = 259;
+	let cases: [(&str, usize, &[u8]); 6] = [
+		("a continuation to a further File Set", 448, &[0x00, 0x08, 0x00, 0x00]),
+		("a second File Set", 40, &[1, 0, 0, 0]),
+		("a File Set Descriptor other than the first", 44, &[1, 0, 0, 0]),
+		// The fixture is level 2 of a maximum of 3; lowering the MAXIMUM below the level is the
+		// contradiction, and setting the level to 3 would have been an ordinary volume.
+		("an interchange level above the maximum it declares", 30, &[1, 0]),
+		("a character set that is not CS0", 48, &[1]),
+		("a domain this reader does not implement", 417, b"*Some Other Domain\0"),
+	];
+	for (label, at, bytes) in cases {
+		let mut img = build_udf();
+		img[fsd * SECTOR_SIZE + at..fsd * SECTOR_SIZE + at + bytes.len()].copy_from_slice(bytes);
+		refresh(&mut img, fsd, TAG_FILE_SET, fsd as u32);
+		assert_eq!(Udf::mount_checked(MemDisc { data: img }).err(), Some(MountError::Unsupported), "{label} is refused as unsupported rather than mounted from whatever came first");
+	}
+
+	// The interchange level is a PAIR, so the well-formed pair still mounts - this is a rule about
+	// the relationship, not a ceiling on the field.
+	let mut img = build_udf();
+	w16(&mut img[fsd * SECTOR_SIZE..], 28, 3);
+	w16(&mut img[fsd * SECTOR_SIZE..], 30, 3);
+	refresh(&mut img, fsd, TAG_FILE_SET, fsd as u32);
+	assert!(Udf::mount(MemDisc { data: img }).is_some(), "level 3 of a maximum of 3 is an ordinary volume");
+}
+
+#[test]
+fn a_root_icb_in_another_partition_is_refused_at_mount() {
+	// `finish_mount` checked `root_icb.lb < part_len` and said nothing about which PARTITION the
+	// `long_ad` names, so `mount_checked` answered `Ok(Udf)` for a volume whose root is
+	// unaddressable and the failure surfaced later, inside `Geometry::physical`, as something that
+	// reads like corruption. The reason is known at mount time.
+	let fsd = 259;
+	let mut img = build_udf();
+	w16(&mut img[fsd * SECTOR_SIZE..], 408, 1); // the root ICB's partition reference
+	refresh(&mut img, fsd, TAG_FILE_SET, fsd as u32);
+	assert_eq!(Udf::mount_checked(MemDisc { data: img }).err(), Some(MountError::Unsupported), "a root in a partition this reader does not resolve is refused where the reason is known");
+}
+
+#[test]
+fn the_file_sets_crc_must_cover_the_fields_the_mount_trusts() {
+	// `crc_must_cover(TAG_FILE_SET)` stopped at 416 - the end of the Root Directory ICB - while the
+	// mount now reads the Domain Identifier at 416 and `NextExtent` at 448. A descriptor recording
+	// a CRC length that stops at 416 leaves both outside the range the CRC was computed over, so
+	// they can be edited freely and the checksum still matches: the finding this milestone opened
+	// with, at the descriptor that decides where the root directory is.
+	let fsd = 259;
+	let mut img = build_udf();
+	let at = fsd * SECTOR_SIZE;
+	// Shrink the recorded coverage to just past the root ICB and re-stamp the CRC and the tag
+	// checksum over what it now claims - the minimal forgery, which is what a forger can do.
+	let to = 400u16;
+	img[at + 10..at + 12].copy_from_slice(&to.to_le_bytes());
+	let crc = crc_ccitt(&img[at + 16..at + 16 + to as usize]);
+	img[at + 8..at + 10].copy_from_slice(&crc.to_le_bytes());
+	let mut sum = 0u8;
+	for (i, &b) in img[at..at + 16].iter().enumerate() {
+		if i != 4 {
+			sum = sum.wrapping_add(b);
+		}
+	}
+	img[at + 4] = sum;
+	assert_eq!(Udf::mount_checked(MemDisc { data: img }).err(), Some(MountError::Corrupt), "a File Set whose CRC stops before the domain and the continuation pointer is not vouching for them");
 }

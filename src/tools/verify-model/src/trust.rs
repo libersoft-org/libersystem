@@ -51,6 +51,14 @@ pub struct Certificate {
 	pub note: String,
 }
 
+// One line of `trust`'s report: what a certificate says, and what it says it about. A certificate
+// from a stale model carries no scope, because it describes a system that is not running.
+#[derive(Clone, Debug)]
+pub struct Summary {
+	pub level: Level,
+	pub scope: Option<crate::shadow::Scope>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Store {
 	pub schema: u32,
@@ -203,6 +211,14 @@ impl Store {
 	}
 
 	// Whether the evidence on record would earn a certificate right now, and if not, what is short.
+	//
+	// THE COMPONENT-WIDE CHECK IS A PRECONDITION, NOT THE GRANT. It answers cheaply and with a
+	// readable message when there is plainly not enough evidence yet; what the certificate may
+	// actually CLAIM is decided per scope pair by `evidence_scope`, because a threshold met once
+	// over the union grants combinations no five distinct decisions ever backed. The final check
+	// below is that at least one pair survived that grading - a component with five clean runs
+	// spread across five different kinds of change qualifies for none of them, and must be told so
+	// rather than handed an empty certificate.
 	pub fn evaluate(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe, log: &Log) -> Result<(usize, Vec<String>), String> {
 		let clean = log.clean_runs_for(component, model_hash, universe);
 		let architectures: Vec<String> = log.clean_architectures_seen(component, model_hash, universe).into_iter().collect();
@@ -246,6 +262,19 @@ impl Store {
 		if !log.has_exec_sample(component, model_hash, universe) {
 			return Err(String::from("no run has EXECUTED this selection - every comparison on record is dry, so they say the right set was chosen and nothing about whether running it works; ./verify.sh --shadow-exec produces the sample"));
 		}
+		// AND AT LEAST ONE SCOPE PAIR SURVIVES THE SAME GRADING ON ITS OWN.
+		let candidates = log.candidate_pairs(component, model_hash, universe);
+		let mut reasons: Vec<String> = Vec::new();
+		let mut qualified = 0usize;
+		for pair in &candidates {
+			match pair_qualifies(log, component, model_hash, universe, pair) {
+				Ok(()) => qualified += 1,
+				Err(reason) => reasons.push(format!("{}: {reason}", describe_pair(pair))),
+			}
+		}
+		if qualified == 0 {
+			return Err(format!("the component has enough evidence overall and none of its {} scope pair(s) does - a certificate promises per pair, and evidence spread across kinds of change is not evidence about any one of them: {}", candidates.len(), reasons.join("; ")));
+		}
 		Ok((clean, architectures))
 	}
 
@@ -272,29 +301,99 @@ impl Store {
 	// widened this component's scope to cover renames it was never validated over - the same free
 	// neighbour that distinctness had to be keyed away from. A record written before those existed
 	// contributes nothing, which fails closed.
+	// AND EVERY PAIR IN IT MEETS THE THRESHOLD ON ITS OWN.
+	//
+	// The union used to be taken over ALL clean records and the threshold checked once, globally -
+	// so five `modified/link.static` records qualified the component and one
+	// `renamed/generation.build` record, on one target, with no execution sample, extended the
+	// certificate to cover `renamed/generation.build`. The grant then promised something no five
+	// distinct decisions had ever backed.
+	//
+	// So each candidate pair is graded by `pair_qualifies` against the records that EXHIBIT it, and
+	// only the ones that pass go into the scope. A component with plenty of evidence about one kind
+	// of change and a single record about another now gets a certificate covering the first and
+	// silent about the second, which is what the evidence says.
 	pub fn evidence_scope(&self, component: &str, model_hash: &str, universe: crate::shadow::Universe, log: &Log) -> EvidenceScope {
-		let mut change_kinds: BTreeSet<String> = BTreeSet::new();
-		let mut edge_kinds: BTreeSet<String> = BTreeSet::new();
 		let mut all_self_checked = true;
 		let mut records = 0usize;
 		for record in log.records.iter().filter(|record| Log::is_clean(record, component, model_hash, universe)) {
 			records += 1;
-			if let Some(scope) = record.component_scopes.get(component) {
-				change_kinds.extend(scope.change_kinds.iter().cloned());
-				edge_kinds.extend(scope.edge_kinds.iter().cloned());
-			}
 			all_self_checked &= record.model_self_check;
 		}
-		EvidenceScope { records, scope: crate::shadow::Scope { change_kinds: change_kinds.into_iter().collect(), edge_kinds: edge_kinds.into_iter().collect() }, all_self_checked }
+		let mut qualified: BTreeSet<String> = BTreeSet::new();
+		let mut architectures: BTreeSet<String> = BTreeSet::new();
+		for pair in log.candidate_pairs(component, model_hash, universe) {
+			if pair_qualifies(log, component, model_hash, universe, &pair).is_ok() {
+				architectures.extend(log.clean_architectures_for_pair(component, model_hash, universe, Some(&pair)));
+				qualified.insert(pair);
+			}
+		}
+		// The targets a certificate may claim are the ones the QUALIFYING evidence ran on, not every
+		// target that ever produced a clean record: a pair that did not earn its place should not
+		// contribute the architecture it happened to run on either.
+		EvidenceScope { records, scope: crate::shadow::Scope::from_pairs(qualified).with_architectures(architectures.into_iter().collect()), all_self_checked }
 	}
 
-	pub fn grant(&mut self, component: &str, model_hash: &str, universe: crate::shadow::Universe, clean_runs: usize, architectures: Vec<String>, scope: crate::shadow::Scope, at: u64) {
+	// `architectures` is the DISPLAY copy of `scope.architectures` and is written from it, so the
+	// number a reader sees and the number `covers` checks cannot drift apart - which is the shape of
+	// every accounting defect this tree has found.
+	pub fn grant(&mut self, component: &str, model_hash: &str, universe: crate::shadow::Universe, clean_runs: usize, _architectures: Vec<String>, scope: crate::shadow::Scope, at: u64) {
+		let architectures = scope.architectures.clone();
 		self.certificates.retain(|certificate| !(certificate.component == component && certificate.universe == universe));
-		self.certificates.push(Certificate { component: component.to_string(), universe, model_hash: model_hash.to_string(), clean_runs, architectures, scope, granted_at: at, note: String::from("earned by clean dry-shadow comparisons under this model hash, in this universe alone, over the change classes and edge kinds in `scope` and no others; it lapses the moment the hash moves") });
+		self.certificates.push(Certificate { component: component.to_string(), universe, model_hash: model_hash.to_string(), clean_runs, architectures, scope, granted_at: at, note: String::from("earned by clean dry-shadow comparisons under this model hash, in this universe alone, over the (change kind, edge kind) pairs in `scope` and on the targets it names, and nothing beside them; it lapses the moment the hash moves") });
 		self.certificates.sort_by(|left, right| (&left.component, left.universe).cmp(&(&right.component, right.universe)));
 	}
 
-	pub fn summary(&self, model_hash: &str) -> BTreeMap<String, Level> {
-		self.certificates.iter().map(|certificate| (format!("{} ({:?})", certificate.component, certificate.universe), if certificate.model_hash == model_hash { Level::Trusted } else { Level::Shadow })).collect()
+	// The level AND the scope it is a level FOR.
+	//
+	// This answered a bare `Level`, so a reader saw `audio (TestGuest): Trusted` with nothing saying
+	// the trust covers modifications reached through static links and nothing else - the exact
+	// misreading the scope exists to prevent, produced by the function whose job is to report it.
+	pub fn summary(&self, model_hash: &str) -> BTreeMap<String, Summary> {
+		self.certificates
+			.iter()
+			.map(|certificate| {
+				let current = certificate.model_hash == model_hash;
+				(format!("{} ({:?})", certificate.component, certificate.universe), Summary { level: if current { Level::Trusted } else { Level::Shadow }, scope: current.then(|| certificate.scope.clone()) })
+			})
+			.collect()
 	}
+}
+
+// A readable name for a `change kind\tedge kind` pair.
+fn describe_pair(pair: &str) -> String {
+	match pair.split_once('\t') {
+		Some((change, "")) => format!("change kind '{change}'"),
+		Some(("", edge)) => format!("edge kind '{edge}'"),
+		Some((change, edge)) => format!("'{change}' through '{edge}'"),
+		None => format!("'{pair}'"),
+	}
+}
+
+// Whether the records that exhibit ONE scope pair meet the whole threshold on their own.
+//
+// The same four questions `evaluate` asks about a component - enough clean comparisons, enough
+// DISTINCT decisions among them, enough targets, and an execution sample where the universe has one
+// - restricted to the records that actually cover this pair. That restriction is the finding: the
+// threshold was evaluated once over the union and the scope was then widened past it, so a single
+// record about a different kind of change rode into the grant on evidence that was about something
+// else.
+fn pair_qualifies(log: &Log, component: &str, model_hash: &str, universe: crate::shadow::Universe, pair: &str) -> Result<(), String> {
+	let clean = log.clean_runs_for_pair(component, model_hash, universe, Some(pair));
+	if clean < REQUIRED_CLEAN_RUNS {
+		return Err(format!("{clean} clean comparison(s), {REQUIRED_CLEAN_RUNS} needed"));
+	}
+	let distinct = log.distinct_evidence_for_pair(component, model_hash, universe, Some(pair));
+	if distinct < REQUIRED_CLEAN_RUNS {
+		return Err(format!("{clean} clean comparison(s) but only {distinct} distinct decision(s), {REQUIRED_CLEAN_RUNS} needed"));
+	}
+	let targets = log.clean_architectures_for_pair(component, model_hash, universe, Some(pair));
+	let needed = required_architectures(universe);
+	if targets.len() < needed {
+		return Err(format!("evidence from {} target(s) ({}), {needed} needed in this universe", targets.len(), targets.iter().cloned().collect::<Vec<String>>().join(", ")));
+	}
+	if exec_universes(universe) && !log.has_exec_sample_for(component, model_hash, universe, Some(pair)) {
+		return Err(String::from("no run covering it has EXECUTED the selection"));
+	}
+	Ok(())
 }

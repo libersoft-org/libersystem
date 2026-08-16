@@ -562,13 +562,91 @@ pub struct Record {
 // A certificate that cannot name its own scope is a broad certificate, which is the defect this
 // milestone split `HostBuild` out of `Host` to prevent. Five perfect verifications of a source edit
 // reached through `link.static` are not evidence about a rename reached through `generation.build`.
+//
+// A SET OF OBSERVED PAIRS, not two independent sets.
+//
+// It was `change_kinds: Vec<String>` beside `edge_kinds: Vec<String>`, with `covers` checking each
+// separately and `evidence_scope` unioning each separately across every clean record. That is a
+// CARTESIAN PRODUCT, and it granted combinations nothing had produced: a record of
+// `modified + link.static` and a record of `renamed + generation.build` together covered
+// `renamed + link.static`, which no shadow comparison had ever seen.
+//
+// Within ONE record the product is honest - the classes of edit and the edges walked co-occurred in
+// the verification that record describes - so a record contributes the product of its own two sets
+// and the union happens over PAIRS. That is the difference between "these were verified together"
+// and "these were each verified, separately, at some point".
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Scope {
+	// Kept for the records and certificates written before pairs existed, and for `shortfall`'s
+	// per-dimension message. `pairs` is what `covers` reads.
 	pub change_kinds: Vec<String>,
 	pub edge_kinds: Vec<String>,
+	// `change kind	edge kind`, one per observed combination. Serialised as strings rather than as
+	// tuples so the evidence log stays readable by eye, which is the whole reason it is JSON.
+	//
+	// Defaulted empty for anything written before this existed, which covers only an empty
+	// requirement - the same failing-closed rule `model_self_check` applies to records.
+	#[serde(default)]
+	pub pairs: Vec<String>,
+	// THE TARGETS THE EVIDENCE CAME FROM, and the ones a change needs.
+	//
+	// `Certificate` has carried `architectures` since it existed and `level` never looked at it: the
+	// lookup matched on the model hash and the scope, and the required architecture set was not part
+	// of `needed` at all. So a certificate earned from x86_64 and riscv64 evidence answered an
+	// aarch64-only change on which no clean record had ever run - a component "trusted" on targets
+	// it was never verified on.
+	//
+	// It lives here rather than as a parameter because it is the same kind of fact as the pairs:
+	// what this evidence covers, and what this change asks for. `grant` writes `Certificate
+	// ::architectures` from this one, so the display copy and the checked copy cannot drift.
+	#[serde(default)]
+	pub architectures: Vec<String>,
+}
+
+pub fn scope_pair(change_kind: &str, edge_kind: &str) -> String {
+	format!("{change_kind}\t{edge_kind}")
 }
 
 impl Scope {
+	// The product of one record's own two sets - which is what that record actually verified.
+	//
+	// A dimension that is EMPTY does not erase the other: a change with no edge kinds (nothing was
+	// reached out of this component) still has classes of edit, and pairing them with an empty edge
+	// is what keeps `covers` able to answer about it.
+	pub fn from_kinds(change_kinds: Vec<String>, edge_kinds: Vec<String>) -> Scope {
+		let mut pairs: BTreeSet<String> = BTreeSet::new();
+		let changes: Vec<&str> = if change_kinds.is_empty() { alloc_empty() } else { change_kinds.iter().map(String::as_str).collect() };
+		let edges: Vec<&str> = if edge_kinds.is_empty() { alloc_empty() } else { edge_kinds.iter().map(String::as_str).collect() };
+		for change in &changes {
+			for edge in &edges {
+				pairs.insert(scope_pair(change, edge));
+			}
+		}
+		Scope { change_kinds, edge_kinds, pairs: pairs.into_iter().collect(), architectures: Vec::new() }
+	}
+
+	pub fn from_pairs(pairs: BTreeSet<String>) -> Scope {
+		let mut change_kinds: BTreeSet<String> = BTreeSet::new();
+		let mut edge_kinds: BTreeSet<String> = BTreeSet::new();
+		for pair in &pairs {
+			if let Some((change, edge)) = pair.split_once('\t') {
+				if !change.is_empty() {
+					change_kinds.insert(String::from(change));
+				}
+				if !edge.is_empty() {
+					edge_kinds.insert(String::from(edge));
+				}
+			}
+		}
+		Scope { change_kinds: change_kinds.into_iter().collect(), edge_kinds: edge_kinds.into_iter().collect(), pairs: pairs.into_iter().collect(), architectures: Vec::new() }
+	}
+
+	// The same scope with the targets it covers, or asks for, attached.
+	pub fn with_architectures(mut self, architectures: Vec<String>) -> Scope {
+		self.architectures = architectures;
+		self
+	}
+
 	// Whether evidence of this scope answers for a change of that one. Subset, in both dimensions:
 	// a certificate covers what it was earned over and nothing beside it.
 	//
@@ -578,19 +656,37 @@ impl Scope {
 	// `model_self_check` already applies: a record that cannot say what it proved is not evidence
 	// that it proved anything.
 	pub fn covers(&self, needed: &Scope) -> bool {
-		let mine: BTreeSet<&str> = self.change_kinds.iter().map(String::as_str).collect();
-		let edges: BTreeSet<&str> = self.edge_kinds.iter().map(String::as_str).collect();
-		needed.change_kinds.iter().all(|kind| mine.contains(kind.as_str())) && needed.edge_kinds.iter().all(|kind| edges.contains(kind.as_str()))
+		let mine: BTreeSet<&str> = self.pairs.iter().map(String::as_str).collect();
+		let targets: BTreeSet<&str> = self.architectures.iter().map(String::as_str).collect();
+		needed.pairs.iter().all(|pair| mine.contains(pair.as_str())) && needed.architectures.iter().all(|arch| targets.contains(arch.as_str()))
 	}
 
 	// What is missing, for a refusal that says what to do about it.
 	pub fn shortfall(&self, needed: &Scope) -> Vec<String> {
-		let mine: BTreeSet<&str> = self.change_kinds.iter().map(String::as_str).collect();
-		let edges: BTreeSet<&str> = self.edge_kinds.iter().map(String::as_str).collect();
-		let mut out: Vec<String> = needed.change_kinds.iter().filter(|kind| !mine.contains(kind.as_str())).map(|kind| format!("change kind '{kind}'")).collect();
-		out.extend(needed.edge_kinds.iter().filter(|kind| !edges.contains(kind.as_str())).map(|kind| format!("edge kind '{kind}'")));
-		out
+		let mine: BTreeSet<&str> = self.pairs.iter().map(String::as_str).collect();
+		needed
+			.pairs
+			.iter()
+			.filter(|pair| !mine.contains(pair.as_str()))
+			.map(|pair| match pair.split_once('\t') {
+				Some((change, "")) => format!("change kind '{change}'"),
+				Some(("", edge)) => format!("edge kind '{edge}'"),
+				Some((change, edge)) => format!("change kind '{change}' reached through edge kind '{edge}'"),
+				None => format!("scope '{pair}'"),
+			})
+			.chain({
+				let targets: BTreeSet<&str> = self.architectures.iter().map(String::as_str).collect();
+				needed.architectures.iter().filter(move |arch| !targets.contains(arch.as_str())).map(|arch| format!("evidence on target '{arch}'"))
+			})
+			.collect()
 	}
+}
+
+// One empty string, so a dimension with nothing in it still pairs with the other rather than
+// erasing it. A `const` slice cannot be borrowed as `Vec<&str>` in the shape above, and a helper
+// says why the empty case is deliberate.
+fn alloc_empty() -> Vec<&'static str> {
+	vec![""]
 }
 
 // The scope of the change in hand, for each component it changed.
@@ -598,13 +694,13 @@ impl Scope {
 // One function, used at both ends: when a record is written it says what that comparison covered,
 // and when a certificate is consulted it says what the current change needs. Those two have to be
 // the same computation or the subset test compares different vocabularies.
-pub fn component_scopes(repo_root: &Path, plan: &crate::plan::Plan) -> BTreeMap<String, Scope> {
+pub fn component_scopes(repo_root: &Path, plan: &crate::plan::Plan, explicit: &BTreeMap<String, String>) -> BTreeMap<String, Scope> {
 	let mut out: BTreeMap<String, Scope> = BTreeMap::new();
 	for component in &plan.changed_components {
 		// The paths THIS component owns, which `PathVerdict::outcome` already records - not the
 		// whole change set.
 		let owned: Vec<String> = plan.paths.iter().filter(|verdict| &verdict.outcome == component).map(|verdict| verdict.path.clone()).collect();
-		out.insert(component.clone(), Scope { change_kinds: change_kinds_for(repo_root, &owned), edge_kinds: plan.component_edge_kinds.get(component).cloned().unwrap_or_default() });
+		out.insert(component.clone(), Scope::from_kinds(change_kinds_for(repo_root, &owned, explicit), plan.component_edge_kinds.get(component).cloned().unwrap_or_default()));
 	}
 	out
 }
@@ -614,10 +710,23 @@ pub fn component_scopes(repo_root: &Path, plan: &crate::plan::Plan) -> BTreeMap<
 // Best effort by design: the regression corpus drives `shadow` with `--paths`, where there is no
 // working tree to ask and the answer is legitimately empty. A record that says nothing about its
 // change classes is better than one that invents them.
-pub fn change_kinds_for(repo_root: &Path, paths: &[String]) -> Vec<String> {
-	let Ok(changes) = crate::changes::working_tree(repo_root) else { return Vec::new() };
+// AND FROM WHAT THE CALLER SUPPLIED, which is how a commit RANGE says what it changed.
+//
+// The working tree is not the only source of change kinds and used to be the only one consulted:
+// `verify.sh --for-range` resolved a range to paths and passed the paths alone, so on a clean tree
+// this answered an empty list - and an empty requirement is covered by any certificate. A range
+// containing a rename was answered by evidence about modifications, with the rename verified by
+// nothing.
+//
+// Explicit kinds win where they exist and the working tree fills in the rest, so `--for PATH` and
+// the regression corpus (which have no kinds to give) behave exactly as before.
+pub fn change_kinds_for(repo_root: &Path, paths: &[String], explicit: &BTreeMap<String, String>) -> Vec<String> {
 	let wanted: BTreeSet<&str> = paths.iter().map(String::as_str).collect();
-	changes.iter().filter(|change| wanted.contains(change.path.as_str()) || change.origin.as_deref().is_some_and(|origin| wanted.contains(origin))).map(|change| format!("{:?}", change.kind).to_lowercase()).collect::<BTreeSet<String>>().into_iter().collect()
+	let mut kinds: BTreeSet<String> = explicit.iter().filter(|(path, _)| wanted.contains(path.as_str())).map(|(_, kind)| kind.clone()).collect();
+	if let Ok(changes) = crate::changes::working_tree(repo_root) {
+		kinds.extend(changes.iter().filter(|change| wanted.contains(change.path.as_str()) || change.origin.as_deref().is_some_and(|origin| wanted.contains(origin))).map(|change| format!("{:?}", change.kind).to_lowercase()));
+	}
+	kinds.into_iter().collect()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -673,11 +782,59 @@ impl Log {
 	// a planner emitting Rust function names computed selections no runner could match and every dry
 	// comparison stayed clean.
 	pub fn has_exec_sample(&self, component: &str, model_hash: &str, universe: Universe) -> bool {
-		self.records.iter().any(|record| Self::is_clean(record, component, model_hash, universe) && record.shadow_exec)
+		self.has_exec_sample_for(component, model_hash, universe, None)
 	}
 
 	pub fn clean_runs_for(&self, component: &str, model_hash: &str, universe: Universe) -> usize {
-		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).count()
+		self.clean_runs_for_pair(component, model_hash, universe, None)
+	}
+
+	// THE SAME COUNTS, RESTRICTED TO THE RECORDS THAT EXHIBIT ONE SCOPE PAIR.
+	//
+	// The threshold used to be evaluated once, globally, and the scope was then widened past it:
+	// five `modified/link.static` records satisfied the criteria and one `renamed/generation.build`
+	// record on a single target extended the certificate to cover `renamed/generation.build` - a
+	// scope never backed by five distinct decisions, possibly never run on the required targets, and
+	// possibly with no execution sample of its own.
+	//
+	// A certificate is a promise per pair, so the evidence has to be counted per pair. `None` is the
+	// component-wide question, which is still asked first as the cheap precondition.
+	pub fn records_for(&self, component: &str, model_hash: &str, universe: Universe, pair: Option<&str>) -> impl Iterator<Item = &Record> {
+		self.records.iter().filter(move |record| {
+			Self::is_clean(record, component, model_hash, universe)
+				&& match pair {
+					None => true,
+					Some(wanted) => record.component_scopes.get(component).is_some_and(|scope| scope.pairs.iter().any(|held| held == wanted)),
+				}
+		})
+	}
+
+	pub fn clean_runs_for_pair(&self, component: &str, model_hash: &str, universe: Universe, pair: Option<&str>) -> usize {
+		self.records_for(component, model_hash, universe, pair).count()
+	}
+
+	pub fn has_exec_sample_for(&self, component: &str, model_hash: &str, universe: Universe, pair: Option<&str>) -> bool {
+		self.records_for(component, model_hash, universe, pair).any(|record| record.shadow_exec)
+	}
+
+	pub fn distinct_evidence_for_pair(&self, component: &str, model_hash: &str, universe: Universe, pair: Option<&str>) -> usize {
+		self.records_for(component, model_hash, universe, pair).map(|record| record.component_decisions.iter().find_map(|entry| entry.split_once('\t').filter(|(name, _)| *name == component).map(|(_, digest)| String::from(digest))).unwrap_or_else(|| record.changed_components.join(","))).collect::<BTreeSet<String>>().len()
+	}
+
+	pub fn clean_architectures_for_pair(&self, component: &str, model_hash: &str, universe: Universe, pair: Option<&str>) -> BTreeSet<String> {
+		self.records_for(component, model_hash, universe, pair).map(|record| record.architecture.clone()).collect()
+	}
+
+	// Every scope pair any clean record for this component exhibits - the CANDIDATES, before the
+	// per-pair threshold decides which of them a certificate may actually claim.
+	pub fn candidate_pairs(&self, component: &str, model_hash: &str, universe: Universe) -> BTreeSet<String> {
+		let mut out: BTreeSet<String> = BTreeSet::new();
+		for record in self.records_for(component, model_hash, universe, None) {
+			if let Some(scope) = record.component_scopes.get(component) {
+				out.extend(scope.pairs.iter().cloned());
+			}
+		}
+		out
 	}
 
 	// How many DISTINCT selection inputs the clean records cover.
@@ -707,14 +864,14 @@ impl Log {
 	// falls back to its change set, which now collapses several old records into one - the safe
 	// direction, and evidence a current model prunes anyway.
 	pub fn distinct_evidence_for(&self, component: &str, model_hash: &str, universe: Universe) -> usize {
-		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).map(|record| record.component_decisions.iter().find_map(|entry| entry.split_once('\t').filter(|(name, _)| *name == component).map(|(_, digest)| String::from(digest))).unwrap_or_else(|| record.changed_components.join(","))).collect::<BTreeSet<String>>().len()
+		self.distinct_evidence_for_pair(component, model_hash, universe, None)
 	}
 
 	// Targets this component has CLEAN evidence on. Filtering on the verdict is the whole point and
 	// was missing: five clean x86_64 comparisons plus one riscv64 CandidateMiss counted as "evidence
 	// from two targets" and could earn a certificate on the strength of a run that found a fault.
 	pub fn clean_architectures_seen(&self, component: &str, model_hash: &str, universe: Universe) -> BTreeSet<String> {
-		self.records.iter().filter(|record| Self::is_clean(record, component, model_hash, universe)).map(|record| record.architecture.clone()).collect()
+		self.clean_architectures_for_pair(component, model_hash, universe, None)
 	}
 }
 

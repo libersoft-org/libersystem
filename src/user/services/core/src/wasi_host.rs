@@ -10,8 +10,15 @@
 // capability, so it can reach nothing it was not explicitly given - a WASI "world"
 // is exactly the set of imports the host wires up.
 //
-// After running the component the host reports the bytes the component read back
-// over the bootstrap channel (the kernel scenario / test reads them), then exits.
+// After running the component the host reports back over the bootstrap channel and exits. The
+// report is a STATUS followed by a PAYLOAD: four little-endian bytes carrying what the component's
+// `run` answered - a byte count when it is non-negative, one of the world's negative statuses when
+// it is not - and then, on success, exactly that many bytes of the component's memory.
+//
+// This header said "reports the bytes the component read", which was the contract before the status
+// existed and is exactly the confusion the status was added to remove: with the bytes alone, a
+// refusal and a successful read of an empty file arrive identically, and a supervisor cannot tell
+// "you may not" from "there was nothing there".
 
 #![no_std]
 #![no_main]

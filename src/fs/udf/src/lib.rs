@@ -493,6 +493,70 @@ impl<D: BlockDevice> Udf<D> {
 		if !validate_descriptor(&block, TAG_FILE_SET, fileset_lb) {
 			return Err(MountError::Corrupt);
 		}
+		// THE FILE SET DESCRIPTOR SEQUENCE CAN CONTINUE, and `NextExtent` was never read.
+		//
+		// `finish_mount` took the first FSD's tag, CRC and location and its Root Directory ICB, and
+		// looked no further - so a volume whose PREVAILING File Set lives in the continuation
+		// mounted from the superseded one, silently, with every descriptor it read perfectly valid.
+		// Refusing a File Set extent longer than one sector closed the other way the sequence
+		// continues and left this one open.
+		//
+		// Multi-File-Set is out of scope, so the safe rule is stated rather than guessed: the
+		// sequence is one descriptor, `NextExtent` is zero, and anything else is `Unsupported`
+		// rather than `Corrupt` - the volume is well formed and this reader does not implement it,
+		// which is a different thing to tell an operator.
+		//
+		// THE OFFSETS ARE ECMA-167'S AND WERE CHECKED AGAINST A REAL DISC, because the first
+		// attempt at this used guessed ones and read `InterchangeLevel: 1, Max: 0` out of a volume
+		// `mkfs.udf` had written as 3 and 3. A File Set Descriptor is:
+		//
+		//     16  RecordingDateandTime (12)      28  InterchangeLevel        30  MaximumInterchange
+		//     32  CharacterSetList               40  FileSetNumber           44  FileSetDescNumber
+		//     48  LogicalVolumeIdentifierCharacterSet (64)                  112  LogicalVolumeIdentifier (128)
+		//    240  FileSetCharacterSet (64)      304  FileSetIdentifier (32) 400  RootDirectoryICB (16)
+		//    416  DomainIdentifier (32)         448  NextExtent (16)        464  SystemStreamDirectoryICB
+		//
+		// `NextExtent` is a `long_ad`: length, then location.
+		if le32(&block[448..452]) != 0 || le32(&block[452..456]) != 0 {
+			return Err(MountError::Unsupported);
+		}
+		// AND THE SINGLE-SET SHAPE. `FileSetNumber` and `FileSetDescriptorNumber` are both zero for
+		// the one and only set; a non-zero either way is a volume with more sets than this reader
+		// will walk, and taking its first descriptor as "the" File Set is the same mistake as
+		// ignoring `NextExtent`.
+		if le32(&block[40..44]) != 0 || le32(&block[44..48]) != 0 {
+			return Err(MountError::Unsupported);
+		}
+		// THE INTERCHANGE LEVELS, which say what shapes the structures may take. A volume may not
+		// declare a level above the maximum it also declares, and this reader is written against
+		// levels up to 3 - the highest ECMA-167 defines. A higher one is a volume using features
+		// this parser has not been written for, and assuming otherwise is guessing in the direction
+		// that reads garbage.
+		let interchange = le16(&block[28..30]);
+		let max_interchange = le16(&block[30..32]);
+		if interchange == 0 || interchange > max_interchange || max_interchange > 3 {
+			return Err(MountError::Unsupported);
+		}
+		// THE CHARACTER SET THE NAMES ARE IN, which this parser ASSUMED. Every identifier it decodes
+		// is read as OSTA CS0, and the descriptor carries `LogicalVolumeIdentifierCharacterSet` and
+		// `FileSetCharacterSet` precisely to say whether that is right. A field that exists to
+		// confirm the interpretation, present and unread, is the wrong direction to guess in.
+		//
+		// A charspec is a one-byte type then 63 bytes of information; CS0 is type 0 with
+		// "OSTA Compressed Unicode" in the information field.
+		if block[48] != 0 || block[240] != 0 {
+			return Err(MountError::Unsupported);
+		}
+		if &block[49..49 + 23] != b"OSTA Compressed Unicode" || &block[241..241 + 23] != b"OSTA Compressed Unicode" {
+			return Err(MountError::Unsupported);
+		}
+		// THE DOMAIN IDENTIFIER. It names the specification the structures conform to, and the same
+		// reasoning applies: this reader implements the OSTA Compliant domain, and reading a volume
+		// that declares another one is reading structures under rules it does not know. The
+		// Logical Volume Descriptor's copy is already checked; this is the File Set's own.
+		if &block[417..417 + 19] != b"*OSTA UDF Compliant" {
+			return Err(MountError::Unsupported);
+		}
 		// The root ICB is a `long_ad`, and its PARTITION was thrown away here - only the block
 		// number was read. Kept now, so a File Set naming another partition is refused by the
 		// resolver rather than read as partition 0.
@@ -501,6 +565,14 @@ impl<D: BlockDevice> Udf<D> {
 		};
 		if root_icb.lb >= part_len {
 			return Err(MountError::Corrupt);
+		}
+		// AND IN THIS PARTITION. `root_icb.lb < part_len` bounds the block number and says nothing
+		// about which partition the `long_ad` names, so `mount_checked` answered `Ok(Udf)` for a
+		// volume whose root is unaddressable and the failure surfaced later, inside
+		// `Geometry::physical`, as something that reads like corruption. This reader resolves
+		// partition 0 and only partition 0; the reason is known here, so it is answered here.
+		if root_icb.partition != 0 {
+			return Err(MountError::Unsupported);
 		}
 		Ok(Udf { dev, geo: Geometry { part_start, part_len, root_icb } })
 	}
@@ -559,8 +631,11 @@ impl<D: BlockDevice> Udf<D> {
 		// is an error rather than whichever record came first. `README`, `Readme` and `readme` can
 		// all exist on a UDF volume, and answering with the first was a coin toss that made the
 		// others unreachable by their own names.
+		let mut exact: Option<(LogicalAddress, bool)> = None;
 		let mut folded: Option<(LogicalAddress, bool)> = None;
 		let mut folded_ambiguous = false;
+		// The rules one record cannot answer: one parent, first, and no repeated active name.
+		let mut rules = DirRules::default();
 		// A DIRECTORY'S RECORDS TILE ITS EXTENT. Anything from one to thirty-seven bytes after the
 		// last FID ends this walk and the listing returns `Ok`, so a directory whose records do not
 		// tile its extent exactly reads as a healthy one that is simply missing a file. The check
@@ -629,6 +704,9 @@ impl<D: BlockDevice> Udf<D> {
 			// mechanism and the specification recommends reusing them, so this is ordinary media
 			// rather than a hostile case.
 			if deleted {
+				// A deleted record still occupies a slot, so it counts toward "the parent comes
+				// first" - but its name is not part of the namespace and may repeat.
+				rules.record(parent, None)?;
 				off += (total + 3) & !3;
 				continue;
 			}
@@ -637,14 +715,24 @@ impl<D: BlockDevice> Udf<D> {
 			let Some(id) = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]) else {
 				return Err(FsError::Corrupt);
 			};
+			rules.record(parent, if parent { None } else { Some(id.as_str()) })?;
+			// RECORDED, NOT RETURNED. This answered the moment it found an exact match, so the
+			// whole-directory rules below - one parent, first, and no repeated active name - only
+			// ever ran when the lookup FAILED. A directory with two active records of the same name
+			// therefore answered with the first and hid the second permanently, which is the parser
+			// picking one of several inconsistent objects where it should refuse the directory.
+			//
+			// The cost is one more pass over a buffer that is already in memory: `read_icb_mapped`
+			// has read the whole directory before this loop starts, so finishing the scan is
+			// parsing and no additional I/O.
 			if parent {
 				if name == b".." {
-					return Ok((LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
+					exact = Some((LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
 				}
 			} else if !id.is_empty() {
 				// `deleted` is no longer tested here: such a record never reaches this point.
 				if id.as_bytes() == name {
-					return Ok((LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
+					exact = Some((LogicalAddress::from_icb_long_ad(fid, 20).ok_or(FsError::Corrupt)?, is_dir));
 				}
 				if eq_ci(&id, name) {
 					if folded.is_some() {
@@ -662,6 +750,12 @@ impl<D: BlockDevice> Udf<D> {
 		if off != data.len() {
 			return Err(FsError::Corrupt);
 		}
+		rules.finish()?;
+		// An exact match wins over a case-folded one, and the folded ambiguity only matters when
+		// there was no exact match to prefer.
+		if let Some(found) = exact {
+			return Ok(found);
+		}
 		if folded_ambiguous {
 			return Err(FsError::BadName);
 		}
@@ -676,6 +770,10 @@ impl<D: BlockDevice> Udf<D> {
 		let data = &dir.data;
 		let mut out = Vec::new();
 		let mut off = 0usize;
+		// The same whole-directory rules `find_entry` applies. Two walkers over one record type
+		// disagreeing about whether a directory is readable is a defect this file has already had
+		// once, so the rule lives in one place and both call it.
+		let mut rules = DirRules::default();
 		// A DIRECTORY'S RECORDS TILE ITS EXTENT. Anything from one to thirty-seven bytes after the
 		// last FID ends this walk and the listing returns `Ok`, so a directory whose records do not
 		// tile its extent exactly reads as a healthy one that is simply missing a file. The check
@@ -725,11 +823,17 @@ impl<D: BlockDevice> Udf<D> {
 				return Err(FsError::Corrupt);
 			}
 			let chars = fid[18];
-			if chars & 0x08 == 0 && chars & 0x04 == 0 {
+			let parent = chars & 0x08 != 0;
+			let deleted = chars & 0x04 != 0;
+			if parent || deleted {
+				rules.record(parent, None)?;
+			}
+			if !parent && !deleted {
 				let is_dir = chars & 0x02 != 0;
 				let Some(id) = decode_name(&fid[38 + l_iu..38 + l_iu + l_fi]) else {
 					return Err(FsError::Corrupt);
 				};
+				rules.record(false, Some(id.as_str()))?;
 				// an unreadable child header lists as size 0 by decision - the listing
 				// stays best-effort, the file's own read reports the error honestly.
 				// A child whose File Entry cannot be read is not a zero-byte file.
@@ -754,6 +858,7 @@ impl<D: BlockDevice> Udf<D> {
 		if off != data.len() {
 			return Err(FsError::Corrupt);
 		}
+		rules.finish()?;
 		Ok(out)
 	}
 
@@ -958,6 +1063,26 @@ impl<D: BlockDevice> Udf<D> {
 		if info_len as u64 > self.geo.part_len as u64 * SECTOR_SIZE as u64 {
 			return Err(FsError::Invalid);
 		}
+		// THE ALIGNMENT THE FORMAT REQUIRES, CHECKED BECAUSE IT IS THE RULE.
+		//
+		// ECMA-167 requires the extended attributes to be a multiple of four bytes and the
+		// allocation descriptors to be a whole number of descriptors - eight bytes for a short_ad,
+		// sixteen for a long_ad. Nothing asked. Requiring the extents to account for exactly
+		// `InformationLength` rejects most misaligned descriptors as a side effect, and a format
+		// rule that holds only because a later arithmetic step happens to notice is a rule that
+		// stops holding when the arithmetic changes.
+		//
+		// Checked HERE rather than beside the parse, so a descriptor that is both misaligned and
+		// impossible in some larger way still reports the larger thing: an `InformationLength` of
+		// `u64::MAX` is `TooLarge` whatever its descriptor area is a multiple of.
+		if l_ea % 4 != 0 {
+			return Err(FsError::Corrupt);
+		}
+		match alloc {
+			0 if l_ad % 8 != 0 => return Err(FsError::Corrupt),
+			1 if l_ad % 16 != 0 => return Err(FsError::Corrupt),
+			_ => {}
+		}
 		// embedded: the file's bytes sit inline in the File Entry.
 		if alloc == 3 {
 			// The embedded data has to fit in the descriptor area it is declared in, and in the
@@ -965,7 +1090,16 @@ impl<D: BlockDevice> Udf<D> {
 			let Some(end) = ad_off.checked_add(info_len) else {
 				return Err(FsError::Invalid);
 			};
-			if end > block.len() || info_len > l_ad {
+			// EXACTLY, not "at most". For embedded data the allocation-descriptor area IS the data,
+			// so `InformationLength` and `LengthOfAllocationDescriptors` describe ONE object and a
+			// disagreement between them is a File Entry that contradicts itself.
+			//
+			// This was `info_len > l_ad`, which accepted `InformationLength = 5` with
+			// `LengthOfAllocationDescriptors = 64` and returned the first five bytes of a
+			// sixty-four-byte object as the whole file. The test beside it asserted that case passes
+			// and called it "the honest descriptor", so the semantics were locked in rather than
+			// checked - which is the thing this milestone exists to catch.
+			if end > block.len() || info_len != l_ad {
 				return Err(FsError::Corrupt);
 			}
 			// The embedded bytes live in the File Entry's own block, so every offset in them maps
@@ -1003,7 +1137,21 @@ impl<D: BlockDevice> Udf<D> {
 		let mut runs: Vec<(usize, u32)> = Vec::new();
 		let mut done = 0usize;
 		let mut ad = ad_off;
-		while done < info_len && ad + step <= ad_end {
+		// THE WHOLE DECLARED DESCRIPTOR AREA, and the extents have to account for exactly
+		// `InformationLength`.
+		//
+		// The loop stopped at `done == info_len` and took `len.min(info_len - done)`, so an extent
+		// declaring 2048 bytes against an `InformationLength` of 5 had 2043 bytes silently ignored,
+		// and every descriptor after the point where the count was reached was never parsed at all.
+		// `min()` was papering over a disagreement between two pieces of metadata that describe one
+		// file - the same class as the silent truncation this milestone already closed, one layer
+		// further down.
+		//
+		// So: an extent that would take the total past the declared length is corruption, the scan
+		// runs to the end of `l_ad`, and anything after the terminator has to be zero-length
+		// padding. The `done != info_len` check at the bottom then means what it says.
+		let mut terminated = false;
+		while ad + step <= ad_end {
 			let raw = le32(&block[ad..ad + 4]);
 			let len = (raw & 0x3fff_ffff) as usize;
 			let ext_type = raw >> 30;
@@ -1017,8 +1165,20 @@ impl<D: BlockDevice> Udf<D> {
 			let extent = if step == 16 { LogicalAddress::parse_long_ad(&block, ad).ok_or(FsError::Corrupt)?.address } else { LogicalAddress { lb: lba, partition: 0 } };
 			// a zero-length extent terminates the sequence; a type-3 entry chains to
 			// further descriptors - not followed, refused rather than read as data.
+			if terminated {
+				// Past the terminator the descriptor area is padding. A non-zero length here is an
+				// extent the file's declared length does not account for - a descriptor left
+				// uninterpreted, which is exactly what "the extents cover the file" must exclude.
+				if len != 0 {
+					return Err(FsError::Corrupt);
+				}
+				ad += step;
+				continue;
+			}
 			if len == 0 {
-				break;
+				terminated = true;
+				ad += step;
+				continue;
 			}
 			if ext_type == 3 {
 				return Err(FsError::Invalid);
@@ -1033,7 +1193,12 @@ impl<D: BlockDevice> Udf<D> {
 			if lba as u64 + (len as u64).div_ceil(SECTOR_SIZE as u64) > self.geo.part_len as u64 {
 				return Err(FsError::Invalid);
 			}
-			let take = len.min(info_len - done);
+			// REFUSED, not clamped: an extent that would take the total past the declared length is
+			// two pieces of metadata disagreeing about one file.
+			if len > info_len - done {
+				return Err(FsError::Corrupt);
+			}
+			let take = len;
 			if runs.try_reserve(1).is_err() {
 				return Err(FsError::NoMemory);
 			}
@@ -1240,8 +1405,13 @@ fn crc_must_cover(tag: u16) -> usize {
 		// is read - a constant here would be a guess. Measured against `mkfs.udf`: one Type-1 map is
 		// six bytes and the descriptor covers to 446.
 		TAG_LOGICAL_VOLUME => 440,
-		// The root ICB `long_ad` at 400..416.
-		TAG_FILE_SET => 416,
+		// The root ICB `long_ad` at 400..416, the Domain Identifier at 416..448 and `NextExtent` at
+		// 448..464 - all of which `finish_mount` now makes decisions from, so all of which the
+		// recorded CRC has to vouch for. It stopped at 416, which left the domain and the
+		// continuation pointer outside the range the CRC was computed over: exactly the shape of
+		// the finding this milestone opened with, at the descriptor that decides where the root is.
+		// `mkfs.udf` records 496, which clears this comfortably.
+		TAG_FILE_SET => 464,
 		// InformationLength at 56, the ICB tag through 212, `l_ad` at 172. The EXTENDED form is what
 		// `mkfs.udf` actually writes for a root - measured at 256 bytes covered, which clears this.
 		TAG_FILE_ENTRY | TAG_EXT_FILE_ENTRY => 216,
@@ -1324,6 +1494,53 @@ fn validate_descriptor_within(block: &[u8], expected_tag: u16, expected_location
 //
 // `Some("")` means the field was genuinely empty, which is what a parent record carries and the only
 // place an empty name is legal.
+
+// THE RULES A DIRECTORY AS A WHOLE HAS TO SATISFY, tracked across its records.
+//
+// `fid_lengths_ok` judges one record at a time and cannot see any of these: exactly one parent
+// entry, that entry first, and no two ACTIVE records sharing a name. The last has a visible
+// consequence - `find_entry` returns the first exact match, so a directory with two active FIDs of
+// the same name hides the second permanently. Case-fold ambiguity was already refused and exact
+// duplication was not, which is the parser picking one of several inconsistent objects where it
+// should refuse the directory.
+#[derive(Default)]
+struct DirRules {
+	seen: usize,
+	parents: usize,
+	names: Vec<String>,
+}
+
+impl DirRules {
+	// One record, in the order the walk meets them. `None` for a deleted record's name, which is
+	// not part of the namespace and may legitimately repeat.
+	fn record(&mut self, parent: bool, name: Option<&str>) -> Result<(), FsError> {
+		if parent {
+			self.parents += 1;
+			// FIRST, and exactly one. A parent record anywhere else is a directory whose shape no
+			// writer produces, and two of them is a directory with two parents.
+			if self.parents > 1 || self.seen != 0 {
+				return Err(FsError::Corrupt);
+			}
+		}
+		if let Some(name) = name {
+			if self.names.iter().any(|held| held == name) {
+				return Err(FsError::Corrupt);
+			}
+			self.names.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+			self.names.push(String::from(name));
+		}
+		self.seen += 1;
+		Ok(())
+	}
+
+	// The root directory is the exception: it is its own parent and carries a parent record like
+	// any other, so this is about SHAPE and not about which directory it is. A directory with no
+	// parent record at all is one the walk cannot climb out of.
+	fn finish(&self) -> Result<(), FsError> {
+		if self.parents != 1 { Err(FsError::Corrupt) } else { Ok(()) }
+	}
+}
+
 // THE FIXED LENGTHS UDF PUTS ON A FILE IDENTIFIER DESCRIPTOR, which this reader checked none of.
 //
 // Everything else about a FID was validated - the tag, the body CRC, the dynamic CRC coverage, the
@@ -1351,11 +1568,27 @@ fn fid_lengths_ok(fid: &[u8], l_iu: usize, l_fi: usize, total: usize) -> bool {
 	if le16(&fid[16..18]) != 1 {
 		return false;
 	}
-	if l_iu != 0 && l_iu < 32 {
+	// A MULTIPLE OF FOUR, which the format requires and nothing asked. The implementation-use area
+	// is followed by the file identifier and then by padding to a four-byte boundary, so a length
+	// that is not itself aligned puts every later field at an offset no writer produces.
+	if l_iu != 0 && (l_iu < 32 || l_iu % 4 != 0) {
+		return false;
+	}
+	// THE RESERVED FILE CHARACTERISTICS BITS. UDF 2.60 defines bits 0-4 (hidden, directory, deleted,
+	// parent, metadata) and reserves the rest. A record setting one of them is carrying something
+	// this reader does not understand in a field it makes decisions from.
+	if fid[18] & 0xe0 != 0 {
 		return false;
 	}
 	let parent = fid[18] & 0x08 != 0;
-	if parent { l_fi == 0 } else { l_fi != 1 }
+	// `l_fi > 1` FOR A NON-PARENT, not `l_fi != 1`.
+	//
+	// The rule was written to reject the degenerate one-byte "compression id and no characters"
+	// case and let `l_fi == 0` straight through - which decodes to `Some("")` and is then quietly
+	// skipped by both directory walkers. So a directory holding a nameless non-parent record listed
+	// as a healthy directory that was simply missing a file, which is the silent shortening this
+	// reader refuses everywhere else, reached through the one arm of the length rule.
+	if parent { l_fi == 0 } else { l_fi > 1 }
 }
 
 fn decode_name(id: &[u8]) -> Option<String> {

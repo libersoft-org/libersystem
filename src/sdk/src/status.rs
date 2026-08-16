@@ -17,6 +17,21 @@ pub const STATUS_FAULT: i32 = -2;
 pub const STATUS_IO: i32 = -3;
 pub const STATUS_UNSUPPORTED: i32 = -4;
 
+// The most bytes one world call may move, and part of the same ABI.
+//
+// `read`, `write` and `log` take an `i32` length and answer an `i32` that is a count when positive
+// and a status when negative, so a length above this cannot be expressed - `buf.len() as i32` would
+// wrap it into a negative number the HOST would then read as nonsense. The wrappers checked nothing
+// and cast, which put the one boundary the SDK exists to be the safe side of on the wrong side of
+// the cast.
+//
+// `src/wasm/src/world.rs` carries the same constant and refuses the same length with
+// `STATUS_UNSUPPORTED`; the two have to be the same number, which is why both are named rather than
+// spelled `i32::MAX as usize` at each use. Nothing can reach it today behind the four-page memory
+// cap - a guest cannot hold two gigabytes to point at - and that is a reason to write the limit
+// down rather than a reason to leave it implied.
+pub const MAX_TRANSFER: usize = i32::MAX as usize;
+
 // Why a world call did not do what was asked. Negative returns from the host, named.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {

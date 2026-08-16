@@ -198,14 +198,65 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 // the granted file vol://system/hello.txt through StorageService into the
 // component's linear memory. The component has no other capability - no ambient
 // authority. The host reports the bytes the component read back over its bootstrap
-// channel. The kernel only brokers the initial capabilities. Returns (expected,
-// actual): the file straight from the volume, and the bytes the component read.
+// channel. The kernel only brokers the initial capabilities.
+//
+// Returns (expected, STATUS, actual): the file straight from the volume, the status word the host
+// sends ahead of the payload, and the bytes the component read. The comment here said `(expected,
+// actual)` for as long as the third element has existed - which is the exact confusion the status
+// was added to remove, restated in the comment above the function that removes it.
 fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, i32, alloc::vec::Vec<u8>), &'static str> {
+	let (volume, _) = scenario_packages()?;
+	let expected = volume_file(volume, b"hello.txt")?;
+	let run = run_wasi_scenario_on(None)?;
+	Ok((expected, run.status, run.payload))
+}
+
+// What the host's report says: the status word and, when there is one, the payload after it.
+//
+// ONE PARSER, because the protocol has three shapes and only one of them had a test. The status is
+// four little-endian bytes carrying what the component's `run` answered - a byte count when
+// non-negative, one of the world's negative statuses when not - and the payload is exactly that
+// many bytes of the component's memory. A refusal and a successful read of an empty file both
+// produce an empty payload and are told apart ONLY by the status, which is the whole reason the
+// status exists; parsing it in each test separately is how one of them comes to check the count
+// against the payload length and the others do not.
+pub(crate) struct WasiRun {
+	pub(crate) status: i32,
+	pub(crate) payload: alloc::vec::Vec<u8>,
+}
+
+fn parse_wasi_report(bytes: &[u8]) -> Result<WasiRun, &'static str> {
+	if bytes.len() < 4 {
+		return Err("the host's report carries a status");
+	}
+	let status = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+	let payload = bytes[4..].to_vec();
+	// The two halves have to AGREE, and nothing checked that they did. A negative status carries no
+	// payload because there is nothing the component read; a non-negative one is the count of the
+	// bytes that follow. A report whose two halves disagree is a host contradicting itself, and
+	// reading the payload past that point is reading whatever the mismatch left behind.
+	if status < 0 && !payload.is_empty() {
+		return Err("a refusal carries no payload, and this one does");
+	}
+	if status >= 0 && payload.len() != status as usize {
+		return Err("the report's status is the length of its payload, and these disagree");
+	}
+	Ok(WasiRun { status, payload })
+}
+
+// The scenario, with the volume StorageService serves chosen by the caller.
+//
+// `None` is the real system volume - what the ordinary test runs against. `Some(archive)` hands
+// StorageService a volume built for the occasion, which is how the report protocol's other two
+// shapes are reachable at all: an empty `hello.txt` for the "status 0 with an empty payload" case,
+// and a volume without it for the refusal. The PROGRAMS still come out of the real volume, because
+// what is being varied is the data the host is granted and not the system it runs on.
+fn run_wasi_scenario_on(serve: Option<&[u8]>) -> Result<WasiRun, &'static str> {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
 	let (volume, package) = scenario_packages()?;
-	let expected = volume_file(volume, b"hello.txt")?;
+	let serve = serve.unwrap_or(volume);
 	let storage_elf = package.lookup(b"storage_service.lsexe").ok_or("storage_service.lsexe missing from the init package")?;
 	let host_elf = program_elf(&package, volume, b"wasi_host").ok_or("wasi_host missing from the package or volume")?;
 
@@ -219,20 +270,29 @@ fn run_wasi_scenario() -> Result<(alloc::vec::Vec<u8>, i32, alloc::vec::Vec<u8>)
 
 	// storage bootstrap: the ramdisk volume and its service channel; the host gets
 	// only the StorageService client - the one capability it is granted.
-	send_ramdisk(&storage_boot_kernel, volume)?;
+	send_ramdisk(&storage_boot_kernel, serve)?;
 	send_cap(&storage_boot_kernel, b"SERVE", service_server, Rights::ALL)?;
 	send_cap(&host_boot_kernel, b"STORAGE", service_client, Rights::ALL)?;
 
 	sched::run_until_idle();
 	let result = host_boot_kernel.recv().map_err(|_| "the host reported no result")?;
-	// THE STATUS, THEN THE PAYLOAD. The host used to send the bytes alone, so a refusal and an
-	// empty file arrived identically - see `wasi_host`'s report. The scenario reads the status so a
-	// test can assert which of the two happened.
-	if result.bytes.len() < 4 {
-		return Err("the host's report carries a status");
-	}
-	let status = i32::from_le_bytes([result.bytes[0], result.bytes[1], result.bytes[2], result.bytes[3]]);
-	Ok((expected, status, result.bytes[4..].to_vec()))
+	parse_wasi_report(&result.bytes)
+}
+
+// The same scenario against a volume built for the occasion, so the report protocol's other two
+// shapes are reachable.
+//
+// `run_wasi_scenario` has always run against the real system volume, where `hello.txt` exists and
+// is non-empty - which is exactly one of the three answers the protocol can give. The two it could
+// not reach are the two the status was ADDED for: a legitimate zero (an empty file) and a negative
+// status (a refusal), which produce identical payloads and are told apart only by the status word.
+//
+// `abi::bootstrap::build_package` is the archive writer this crate already carries, so a volume can
+// be assembled here without a build change. The PROGRAMS still come from the real volume; what is
+// varied is only the data StorageService serves.
+pub(crate) fn run_wasi_scenario_over(files: &[(&[u8], &[u8])]) -> Result<WasiRun, &'static str> {
+	let archive = abi::bootstrap::build_package(files).ok_or("the fixture archive could not be built")?;
+	run_wasi_scenario_on(Some(&archive))
 }
 
 // Build the powerbox topology and run it to completion. A StorageService serves

@@ -418,7 +418,18 @@ pub fn parse_touches(text: &str) -> Vec<(String, BTreeSet<String>, BTreeSet<Stri
 	let mut current: Option<(String, String)> = None;
 	for line in text.lines() {
 		let trimmed = line.trim_start();
-		let declaration = trimmed.strip_prefix("pub fn ").or_else(|| trimmed.strip_prefix("fn "));
+		// `pub(crate) fn` AND `pub(super) fn` TOO, which this did not recognise.
+		//
+		// It stripped `pub fn ` or `fn ` and nothing else, so a `pub(crate) fn` was not seen as a
+		// declaration at all - its body was appended to the PREVIOUS function's, the name never
+		// entered the call graph, and every test that reached a program through such a helper was
+		// reported as unable to reach it. Silent in both directions: the previous function gained
+		// reaches it does not have, and the helper vanished.
+		//
+		// Found by writing a `pub(crate) fn` helper in `kernel/tests.rs` and watching the gate say
+		// the test calling it could not reach `bin.wasi_host`.
+		let visibility = trimmed.strip_prefix("pub(crate) ").or_else(|| trimmed.strip_prefix("pub(super) ")).or_else(|| trimmed.strip_prefix("pub ")).unwrap_or(trimmed);
+		let declaration = visibility.strip_prefix("fn ").or_else(|| visibility.strip_prefix("async fn "));
 		if let Some(rest) = declaration
 			&& let Some(name) = rest.split(['(', '<', ' ']).next()
 			&& !name.is_empty()

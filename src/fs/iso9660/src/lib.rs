@@ -63,6 +63,24 @@ const MAX_READ_BYTES: usize = 64 * 1024 * 1024;
 // buffer" - rather than an allocation the service cannot make.
 const MAX_DIR_ENTRIES: usize = 65536;
 
+// THE WORK A DIRECTORY MAY COST, which nothing bounded.
+//
+// The previous round bounded how much MEMORY a hostile disc can make this backend spend - the walk
+// reads a sector at a time instead of allocating the extent - and nothing bounded how much WORK.
+// `for_each_record` checks only that `lba + sectors` fits the medium, and `MAX_DIR_ENTRIES` counts
+// entries LISTED: a directory declaring a near-4 GiB extent whose every sector opens with a zero
+// byte yields no entries at all, never reaches the entry limit, and drives two million synchronous
+// `read_block` calls while holding the StorageService request. `find_entry` has the same shape for
+// a name that is not there.
+//
+// 16 MiB is 8192 sectors. A directory that large is far past anything a real disc carries -
+// `MAX_DIR_ENTRIES` at 65536 entries of the 34-byte minimum is about 2 MiB - so this bounds the
+// hostile case and not the ordinary one.
+//
+// BATCHING WOULD NOT HAVE ANSWERED IT. Reading many sectors per device call cuts the IPC cost and
+// leaves the work, which is the thing that holds the request; the bound has to be on the extent.
+const MAX_DIR_BYTES: u64 = 16 * 1024 * 1024;
+
 // The volume descriptors begin here; LBAs 0..16 are the boot/system area.
 const FIRST_DESCRIPTOR_LBA: u64 = 16;
 
@@ -151,7 +169,10 @@ impl<D: BlockDevice> Iso9660<D> {
 	// StorageService depends on the distinction to choose between `Again` and a refusal.
 	pub fn mount_checked(mut dev: D) -> Result<Iso9660<D>, MountError> {
 		let mut pvd_root: Option<((u32, u32), u32, u32)> = None;
+		// The chosen Joliet hierarchy and the LEVEL it was chosen for, so a later descriptor of a
+		// lower level cannot displace it and a later one of the same level does not either.
 		let mut joliet_root: Option<((u32, u32), u32, u32)> = None;
+		let mut joliet_at: u8 = 0;
 		let mut block = [0u8; SECTOR_SIZE];
 		let mut terminated = false;
 		// The Joliet descriptor's own copies of the fields ECMA-119 requires it to share with the
@@ -220,8 +241,18 @@ impl<D: BlockDevice> Iso9660<D> {
 					let Some(set_size) = both16(&block[120..124]) else { return Err(MountError::Corrupt) };
 					// EXACTLY one. `> 1` admitted zero, which is not a legal set size - a volume
 					// belongs to a set of at least itself.
-					if set_size != 1 {
+					//
+					// AND THE TWO ANSWERS ARE DIFFERENT ANSWERS. A set size of zero is a volume
+					// disobeying its own rules, which is `Corrupt`; a set size ABOVE one is a
+					// perfectly valid ISO using a construct this backend does not implement, which
+					// is what `Unsupported` means and what this error type deliberately
+					// distinguishes. Returning `Corrupt` for a legal disc tells an operator their
+					// medium is damaged when it is not.
+					if set_size == 0 {
 						return Err(MountError::Corrupt);
+					}
+					if set_size > 1 {
+						return Err(MountError::Unsupported);
 					}
 					// And this volume's own sequence number within that set. The root record's and
 					// every ordinary record's were checked and the DESCRIPTOR's was not, which is
@@ -230,7 +261,18 @@ impl<D: BlockDevice> Iso9660<D> {
 					if sequence != 1 {
 						return Err(MountError::Corrupt);
 					}
-					pvd_root = Some(found)
+					// THE FIRST PVD IS CANONICAL, AND EVERY LATER ONE MUST AGREE.
+					//
+					// The standard permits a Primary Volume Descriptor to be recorded more than
+					// once, and every type-1 descriptor overwrote the previous one - so a disc
+					// could carry a benign PVD followed by a hostile one and be parsed by the
+					// second. Which is exactly the storage accident the Joliet arm below had
+					// already been fixed for, in the descriptor that decides the whole volume.
+					match pvd_root {
+						Some(previous) if previous != found => return Err(MountError::Corrupt),
+						Some(_) => {}
+						None => pvd_root = Some(found),
+					}
 				}
 				// AND ITS COMMON FIELDS HAVE TO AGREE WITH THE PRIMARY'S.
 				//
@@ -241,7 +283,7 @@ impl<D: BlockDevice> Iso9660<D> {
 				// medium could declare one volume space in the PVD and another here and have the
 				// second used without the two ever being compared. What an SVD is allowed to differ
 				// in is the root directory and the hierarchy under it.
-				2 if is_joliet(&block) => {
+				2 if joliet_level(&block).is_some() => {
 					let Some(set_size) = both16(&block[120..124]) else { return Err(MountError::Corrupt) };
 					let Some(sequence) = both16(&block[124..128]) else { return Err(MountError::Corrupt) };
 					// EVERY RECOGNISED JOLIET DESCRIPTOR IS CHECKED, not only the last one. These
@@ -256,7 +298,15 @@ impl<D: BlockDevice> Iso9660<D> {
 						return Err(MountError::Corrupt);
 					}
 					joliet_common = Some((blocks, block_size as u32, set_size, sequence));
-					joliet_root = Some(found)
+					// THE HIGHEST LEVEL, AND THE FIRST OCCURRENCE WITHIN IT - stated rather than
+					// emergent. Every Joliet SVD used to overwrite the chosen root, so a medium
+					// carrying Level 3 and then Level 1 was read at Level 1 and which hierarchy a
+					// disc got depended on descriptor order.
+					let level = joliet_level(&block).unwrap_or(0);
+					if joliet_root.is_none() || level > joliet_at {
+						joliet_at = level;
+						joliet_root = Some(found);
+					}
 				}
 				_ => {}
 			}
@@ -339,17 +389,36 @@ impl<D: BlockDevice> Iso9660<D> {
 				// Found by the first golden image from an independent tool, which is exactly what
 				// that test exists for.
 				let sys: alloc::vec::Vec<u8> = sys.to_vec();
-				rrip = announces_rockridge(&sys) || {
+				// THREE ENDINGS, NOT ONE. A failed `read_block`, an out-of-range LBA and a genuine
+				// end of chain shared a single `break`, so a disc read error, a malformed pointer
+				// and "there is no continuation" all produced the same silent fall back to the 8.3
+				// namespace - a medium that fails to read halfway through its Rock Ridge data
+				// mounted with different file names than it has, and said nothing.
+				//
+				// `Io` propagates, a range error refuses the volume, and the chain ends only when
+				// it actually ends.
+				rrip = if announces_rockridge(&sys) {
+					true
+				} else {
 					let mut found = false;
 					let mut area = sys.clone();
 					// Bounded: SUSP allows a chain, and a disc may name one that loops.
 					for _ in 0..4 {
+						// The chain ENDING is the one case that is not an error.
 						let Some((next_lba, offset, len)) = continuation_of(&area) else { break };
-						let mut cont = [0u8; SECTOR_SIZE];
-						if next_lba as u64 >= blocks as u64 || !dev.read_block(next_lba as u64, &mut cont) {
-							break;
+						// A pointer outside the medium is the disc contradicting itself, not the end
+						// of anything.
+						if next_lba as u64 >= blocks as u64 {
+							return Err(MountError::Corrupt);
 						}
-						let Some(part) = cont.get(offset..offset.saturating_add(len)) else { break };
+						let mut cont = [0u8; SECTOR_SIZE];
+						// And the device not answering is the device.
+						if !dev.read_block(next_lba as u64, &mut cont) {
+							return Err(MountError::Io);
+						}
+						let Some(part) = cont.get(offset..offset.saturating_add(len)) else {
+							return Err(MountError::Corrupt);
+						};
 						if announces_rockridge(part) {
 							found = true;
 							break;
@@ -555,10 +624,31 @@ impl<D: BlockDevice> Iso9660<D> {
 			}
 			Ok(true)
 		})?;
-		match failed {
-			Some(error) => Err(error),
-			None => Ok(out),
+		if let Some(error) = failed {
+			return Err(error);
 		}
+		// AND NO NAME APPEARS TWICE, checked over the WHOLE listing.
+		//
+		// The de-duplication above compares against `out.last()` alone, which is right for ISO
+		// version records - their identifiers are ordered, so equal names are adjacent - and wrong
+		// for Rock Ridge: records ordered by ISO identifier can carry the same `NM` in non-adjacent
+		// positions, so a listing showed two entries called `same` and `open("same")` could only
+		// ever reach the first. One of the two was unreachable by the name it was listed under,
+		// which is the namespace being ambiguous rather than merely untidy.
+		//
+		// Sorted rather than kept in a set: the listing is already in hand and bounded by
+		// `MAX_DIR_ENTRIES`, and a sort plus a neighbour scan needs no second allocation, which
+		// matters on a path whose whole point is that a hostile disc cannot make it spend.
+		let mut names: Vec<&str> = Vec::new();
+		if names.try_reserve_exact(out.len()).is_err() {
+			return Err(FsError::NoMemory);
+		}
+		names.extend(out.iter().map(|entry| entry.name.as_str()));
+		names.sort_unstable();
+		if names.windows(2).any(|pair| pair[0] == pair[1]) {
+			return Err(FsError::Corrupt);
+		}
+		Ok(out)
 	}
 
 	// Walk a directory extent one SECTOR at a time, handing each record to `visit`.
@@ -580,6 +670,12 @@ impl<D: BlockDevice> Iso9660<D> {
 	{
 		if len == 0 {
 			return Ok(());
+		}
+		// The extent's own size, before a single sector is read. `TooLarge` rather than `Corrupt`:
+		// the directory may be perfectly well formed and this backend will not walk something that
+		// size in one request, which is what that error means everywhere else in this crate.
+		if len as u64 > MAX_DIR_BYTES {
+			return Err(FsError::TooLarge);
 		}
 		let sectors = (len as u64).div_ceil(SECTOR_SIZE as u64);
 		if lba as u64 + sectors > self.geo.blocks as u64 {
@@ -697,6 +793,27 @@ struct Entry {
 // Take a volume descriptor's root directory record (fixed 34 bytes at offset 156): its
 // extent LBA and data length, both stored little-endian first. The root record can
 // carry an XAR length too - its data follows those blocks, like any record's.
+// The shape a DIRECTORY record must have, whether it is the root or an ordinary entry.
+//
+// ECMA-119 says a directory is not an associated file, is not interleaved and has a single file
+// section. `parse_record` folded the last two into a general `unsupported` flag and `read_dir`
+// filtered those entries out - which is a defensible product decision for a regular FILE this
+// backend will not read, and for a DIRECTORY it is a short listing presented as a complete one. The
+// associated-file case was worse: the record returned `Ok(None)` regardless of `is_dir`, so an
+// associated DIRECTORY was ignored as though it were a legitimate associated file.
+//
+// `root_extent` checked the directory bit, the identifier, the volume sequence, the endian copies
+// and the XAR, and none of these three - so the one record that decides where the whole namespace
+// begins was exempt from the rules its children are held to. One function, both callers.
+fn validate_directory_shape(flags: u8, file_unit: u8, gap: u8) -> Result<(), FsError> {
+	// Bit 2 is associated, bit 7 is multi-extent; a non-zero file unit size or interleave gap is
+	// interleaving. None of the three may appear on a directory.
+	if flags & 0x04 != 0 || flags & 0x80 != 0 || file_unit != 0 || gap != 0 {
+		return Err(FsError::Corrupt);
+	}
+	Ok(())
+}
+
 fn root_extent(desc: &[u8]) -> Option<(u32, u32)> {
 	let r = &desc[156..156 + 34];
 	// The Root Directory Record is an ordinary 34-byte Directory Record and was taken entirely on
@@ -719,6 +836,10 @@ fn root_extent(desc: &[u8]) -> Option<(u32, u32)> {
 	if r[25] & 0x02 == 0 {
 		return None;
 	}
+	// And the shape every directory must have - the root included, which it was not.
+	if validate_directory_shape(r[25], r[26], r[27]).is_err() {
+		return None;
+	}
 	let extent = both32(&r[2..10])?;
 	let size = both32(&r[10..18])?;
 	// The XAR skip is added to the extent; `saturating_add` invented a value the medium did not
@@ -726,59 +847,68 @@ fn root_extent(desc: &[u8]) -> Option<(u32, u32)> {
 	Some((extent.checked_add(r[1] as u32)?, size))
 }
 
-// A type-2 descriptor is Joliet when its escape sequences select UCS-2 (%/@, %/C, %/E) at the START
-// of its escape field.
-fn is_joliet(desc: &[u8]) -> bool {
-	// The escape sequence is written at the START of the field, not somewhere inside it.
-	//
-	// This searched the whole 32-byte field with `windows(3)`, so any descriptor that happened to
-	// contain those three bytes anywhere - in a publisher string, in padding a mastering tool left
-	// behind - was read as Joliet, and its namespace was taken as the volume's. Joliet defines the
-	// three sequences for its UCS-2 levels and writes one of them first.
-	// THE WHOLE FIELD IS READ, AND IT MAY HOLD MORE THAN ONE SEQUENCE.
-	//
-	// Two mistakes have been made here in opposite directions. It first searched the field with
-	// `windows(3)`, so any descriptor happening to contain those bytes anywhere - in a publisher
-	// string, in a tool's leftover padding - was read as Joliet and its namespace taken as the
-	// volume's. The fix required the field to be one Joliet sequence and then nothing but zeros,
-	// which is too strict the other way: ECMA-119 says the field holds ONE OR MORE escape
-	// sequences, packed without gaps, with only the unused remainder zero. A volume announcing
-	// Joliet followed by another legal sequence stopped being recognised as Joliet at all - and
-	// the failure is silent, because it simply mounts the ISO9660 namespace instead.
-	//
-	// So the field is walked sequence by sequence. Joliet's three are the ones being looked for;
-	// any other well-formed sequence is skipped, and the walk ends where the zeros begin. What is
-	// still refused is the shape the first fix was aimed at: bytes after the sequences that are
-	// neither another sequence nor zero.
+// WHICH Joliet level a type-2 descriptor selects, or `None` if it selects none.
+//
+// It answered a bool and each Joliet SVD overwrote the chosen root, so a medium carrying Level 3 and
+// then Level 1 was read at Level 1 - a policy that was emergent rather than stated. The level
+// travels now and the caller picks the highest, with the first occurrence winning within a level.
+//
+// THE FIELD IS READ, AND IT MAY HOLD MORE THAN ONE SEQUENCE.
+//
+// Two mistakes have been made here in opposite directions. It first searched the field with
+// `windows(3)`, so any descriptor happening to contain those bytes anywhere - in a publisher
+// string, in a tool's leftover padding - was read as Joliet and its namespace taken as the volume's.
+// The fix required the field to be one Joliet sequence and then nothing but zeros, which is too
+// strict the other way: ECMA-119 says the field holds ONE OR MORE escape sequences, packed without
+// gaps, with only the unused remainder zero.
+//
+// AND THE SEQUENCE GRAMMAR WAS WRONG IN BOTH DIRECTIONS TOO. It required each sequence to begin
+// `0x1b` or `%`, and ECMA-119 OMITS the escape character when writing this field - so an explicit
+// `ESC` is malformed and was being accepted, while a perfectly legal accompanying sequence that
+// does not happen to start with `%` was refused, taking the whole field with it. The comment
+// claimed any other well-formed sequence was skipped and the code only skipped `%`-led ones.
+//
+// The grammar, from ECMA-35 with the escape omitted: zero or more intermediate bytes in
+// `0x20..=0x2F`, then one final byte in `0x30..=0x7E`. Joliet's three fall out of it - `%` and `/`
+// are intermediates and the level is the final byte - so they are compared as whole slices rather
+// than assumed to be three bytes beginning with a particular one.
+fn joliet_level(desc: &[u8]) -> Option<u8> {
 	let esc = &desc[88..120];
 	let mut at = 0usize;
-	let mut joliet = false;
+	let mut level: Option<u8> = None;
 	while at < esc.len() {
 		if esc[at] == 0 {
 			// The unused remainder. Everything from here on must be zero, or this field is not a
 			// sequence list and nothing in it can be trusted.
-			return joliet && esc[at..].iter().all(|byte| *byte == 0);
+			return if esc[at..].iter().all(|byte| *byte == 0) { level } else { None };
 		}
-		// An escape sequence is an introducer of one or more intermediate bytes in 0x20..=0x2F
-		// followed by one final byte in 0x30..=0x7E. Joliet's are `%/@`, `%/C` and `%/E`, which is
-		// `%` as the introducer, `/` intermediate, and the level as the final byte.
-		if esc[at] != 0x1b && esc[at] != b'%' {
-			return false;
+		// An explicit escape character is not written in this field.
+		if esc[at] == 0x1b {
+			return None;
 		}
 		let start = at;
-		at += 1;
 		while at < esc.len() && (0x20..=0x2f).contains(&esc[at]) {
 			at += 1;
 		}
 		if at >= esc.len() || !(0x30..=0x7e).contains(&esc[at]) {
-			return false;
+			return None;
 		}
 		at += 1;
-		if matches!(&esc[start..at], b"%/@" | b"%/C" | b"%/E") {
-			joliet = true;
+		// The three UCS-2 levels Joliet defines. A level already found is not replaced by a lower
+		// one appearing later in the same field.
+		let found = match &esc[start..at] {
+			b"%/@" => Some(1u8),
+			b"%/C" => Some(2),
+			b"%/E" => Some(3),
+			_ => None,
+		};
+		if let Some(found) = found
+			&& level.is_none_or(|held| found > held)
+		{
+			level = Some(found);
 		}
 	}
-	joliet
+	level
 }
 
 // Parse a directory record: extent, length, dir flag, and the name (Joliet UCS-2, a Rock
@@ -814,6 +944,14 @@ fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Result<Opt
 		return Err(FsError::Corrupt);
 	}
 	let is_dir = rec[25] & 0x02 != 0;
+	// A DIRECTORY IS HELD TO ITS OWN SHAPE, and refused rather than dropped.
+	//
+	// Skipping a regular FILE this backend will not read is a product decision; skipping a
+	// DIRECTORY whose shape the format forbids is a short listing presented as a complete one, and
+	// the subtree behind it disappears with no error anywhere.
+	if is_dir {
+		validate_directory_shape(rec[25], rec[26], rec[27])?;
+	}
 	// multi-extent (segments in further records) and interleaving (gap blocks woven
 	// into the extent) are forms the reader refuses rather than misreads.
 	let unsupported = rec[25] & 0x80 != 0 || rec[26] != 0 || rec[27] != 0;
@@ -861,10 +999,39 @@ fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Result<Opt
 	// claim being true.
 	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
 	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip).ok_or(FsError::Corrupt)? };
+	// The decoded name has to BE a name: one path component, with nothing in it that makes a lookup
+	// mean something other than what the listing showed.
+	if !special {
+		validate_component(&name, joliet)?;
+	}
 	if rec[25] & 0x04 != 0 {
 		return Ok(None);
 	}
 	Ok(Some(Entry { lba, size, is_dir, special, unsupported, name, case_sensitive }))
+}
+
+// ONE PATH COMPONENT, and nothing that corrupts a terminal.
+//
+// `decode_name` and `rock_ridge_name` built a `String` and accepted `/`, NUL and control characters.
+// A UCS-2 `/` therefore produced an entry listed as `aaa/bbb` that lookup splits into two
+// components, so the entry could not be opened by the name it was listed under - and control
+// characters additionally corrupt whatever renders the listing. Joliet's own rules forbid the
+// control code points along with `/`, `:`, `;`, `?` and `\\`.
+//
+// `/` and NUL are `Corrupt` on every namespace, because they are the two characters that make a
+// name mean something other than a name. The rest of Joliet's forbidden set is refused on the
+// Joliet namespace, where it is the format's rule, and tolerated on the ISO and Rock Ridge ones,
+// where those characters are legal in a name a real disc carries.
+fn validate_component(name: &str, joliet: bool) -> Result<(), FsError> {
+	for ch in name.chars() {
+		if ch == '/' || ch == '\0' || ch.is_control() {
+			return Err(FsError::Corrupt);
+		}
+		if joliet && matches!(ch, ':' | ';' | '?' | '\\') {
+			return Err(FsError::Corrupt);
+		}
+	}
+	Ok(())
 }
 
 // Decode an entry name. Joliet is big-endian UCS-2; otherwise a Rock Ridge NM entry in
@@ -878,7 +1045,16 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, s
 		if id.len() % 2 != 0 {
 			return None;
 		}
+		// RESERVED UP FRONT, FALLIBLY. `read_dir` reserves with `try_reserve` and returns
+		// `NoMemory`, and the NAMES on the same path used `String::new` and `push` with no
+		// reservation - so the milestone's claim that a hostile disc never exhausts the service had
+		// one allocation with no route to `FsError::NoMemory` in it. A single name is bounded by
+		// the 255-byte record, so this is small; what matters is that the path has no infallible
+		// step left. Worst case is three UTF-8 bytes per UCS-2 unit.
 		let mut s = String::new();
+		if s.try_reserve(id.len() / 2 * 3).is_err() {
+			return None;
+		}
 		for c in id.chunks_exact(2) {
 			let u = u16::from_be_bytes([c[0], c[1]]);
 			if u == b';' as u16 {
@@ -897,6 +1073,11 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, s
 		return Some((n, true));
 	}
 	let mut s = String::new();
+	// The same reservation as the Joliet arm: one byte per identifier byte is enough, because the
+	// identifier is ASCII-oriented and a byte above 0x7F costs at most two.
+	if s.try_reserve(id.len() * 2).is_err() {
+		return None;
+	}
 	for &b in id {
 		if b == b';' {
 			break;
@@ -924,6 +1105,12 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 	}
 	let sys = &sys[skip..];
 	let mut out = String::new();
+	// The whole System Use Area bounds every fragment this can accumulate, and a `NM` cannot be
+	// longer than the record that holds it. Reserved once so the pushes below cannot be the one
+	// infallible allocation on an otherwise fallible path.
+	if out.try_reserve(sys.len()).is_err() {
+		return None;
+	}
 	// ONE SUSP PARSER. This walked the area itself - its own length and signature decode, reading
 	// `sys[off + 2]` and `sys[off..off + 2]` and never `sys[off + 3]` - so the version rule the
 	// walker enforces did not apply to the one entry whose contents become a filename. The test that
@@ -957,6 +1144,17 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 			let Ok(fragment) = core::str::from_utf8(&entry.body[1..]) else {
 				return Err(());
 			};
+			// A SECOND `NM` WITHOUT CONTINUE IS FAIL-CLOSED, not something to append.
+			//
+			// The CONTINUE flag is refused above because continued names are not implemented, and
+			// then every further `NM` was appended regardless - so `NM "foo"` and `NM "bar"`,
+			// neither continued, produced `foobar`: a third name the medium does not carry, used as
+			// the lookup key. Whether that layout should be `Corrupt` or fall back to the ISO
+			// identifier is a judgement; inventing a name is the one answer that is wrong, and
+			// until continuation is implemented this is the same refusal `CE` already gets.
+			if !out.is_empty() {
+				return Err(());
+			}
 			out.push_str(fragment);
 		}
 		Ok(())
@@ -1138,6 +1336,13 @@ fn announces_rockridge(sys: &[u8]) -> bool {
 		// The versions of Rock Ridge whose `NM`, `CE`, `CL`, `PL` and `RE` this reader understands.
 		// An extension it does not implement must not switch the name source: reading somebody
 		// else's `NM` is the guess this whole check exists to remove.
+		// AND THE VERSION, which `EXT_VER` records and this ignored - so a medium could pair the
+		// known `RRIP_1991A` identifier with a different extension version and still get the parser
+		// written for the version this reader knows. Every one of these extensions is version 1;
+		// anything else is a structure with the same name and a layout nobody here has seen.
+		if body[3] != 1 {
+			return Ok(());
+		}
 		if id == b"RRIP_1991A" || id == b"IEEE_P1282" || id == b"IEEE_1282" {
 			announced = true;
 		}

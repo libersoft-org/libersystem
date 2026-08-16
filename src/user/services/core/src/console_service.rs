@@ -117,9 +117,16 @@ const BELL_FLASH_TICKS: u64 = 10;
 //     frame. Past the bound they are dropped too: a program that has not drained its input in half a
 //     second is not going to be helped by holding every other VT hostage.
 //
-// Writes to SERVICES (the factory, the display, a PTY master, a shell's control channel) are not
-// covered by this: those peers are ours, they are known to drain, and a failure there is a broken
-// system rather than a misbehaving client.
+// Writes to SERVICES (the factory, the display, a shell's control channel) are not covered by this:
+// those peers are ours, they are known to drain, and a failure there is a broken system rather than
+// a misbehaving client.
+//
+// A PTY MASTER IS NOT ONE OF THEM, and this list said it was. `master_host` is handed to an ordinary
+// hosted program - a `script`, a future `ssh` - not to a peer service, so a program that opens a
+// PTY, stops draining it and lets its slave produce enough output to fill the queue put the single
+// multiplexing loop into an unbounded retry, after which no VT, no keyboard, no pointer, no resize
+// and no other PTY was serviced. The comment's own words for the assumption - "known to drain" -
+// are exactly what does not hold for a client-held handle.
 const CLIENT_SEND_TICKS: u64 = 50;
 
 // Deliver bytes the CONSOLE generated to a client - see the rule above. One attempt; a full queue
@@ -298,6 +305,13 @@ fn term_policy(config: u64) -> (usize, usize) {
 // live VTs (vts[fg] is foreground and owns the display), and the spawn capabilities.
 struct Console {
 	addr: u64,
+	// When the visual bell's inverted frame is due to be taken down (0 = no flash running).
+	//
+	// THE FLASH IS A DEADLINE, NOT A WAIT. It used to be performed inline - invert, present, wait
+	// out the hold, repaint - so the single multiplexing loop stopped serving every other VT, the
+	// keyboard and the pointer for its duration. A program can ring the bell as often as it likes.
+	// The loop already wakes on its own timing for the caret blink; this rides the same wake.
+	bell_until: u64,
 	fb: Framebuffer,
 	// The mapped client-owned surface and typed DisplayService connection. The event
 	// sub-channel carries host display resizes without sharing the physical scanout.
@@ -451,7 +465,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -532,7 +546,25 @@ unsafe fn run(console: &mut Console) -> ! {
 			// forever, so it must never count as pending progress for the scheduler's boot
 			// driver (or the kernel tests). Headless (no framebuffer) there is no caret to
 			// blink, so the wait has no deadline at all.
-			let ready: i64 = if console.has_fb { wait_any_periodic(&waits, clock() + BLINK_PHASE_TICKS) } else { wait_any(&waits, 0) };
+			// THE BELL'S DEADLINE, when one is running, so the flash is taken down on time rather
+			// than at the next blink tick - which would hold an inverted screen for up to four
+			// times as long as the bell asks for.
+			let mut deadline: u64 = clock() + BLINK_PHASE_TICKS;
+			if console.bell_until != 0 && console.bell_until < deadline {
+				deadline = console.bell_until;
+			}
+			let ready: i64 = if console.has_fb { wait_any_periodic(&waits, deadline) } else { wait_any(&waits, 0) };
+			// The flash comes down on ANY wake past its deadline - a keystroke, a program's output
+			// or the tick - because holding it longer than asked serves nobody, and taking it down
+			// early on a keystroke is what the inline version did too.
+			if console.bell_until != 0 && clock() >= console.bell_until {
+				console.bell_until = 0;
+				if let Some(t) = console.vts[console.fg].term.as_mut() {
+					t.screen.mark_all_dirty();
+					t.flush();
+					t.present();
+				}
+			}
 			if ready == ERR_TIMED_OUT {
 				// the idle blink tick: toggle the foreground caret's phase. Every flush
 				// repaints the caret, so activity keeps it solid and the phase restarts
@@ -603,7 +635,14 @@ unsafe fn run(console: &mut Console) -> ! {
 						0 => loop {
 							// Drain the slave program's output burst before the single present below.
 							match try_recv(console.ptys[pj].client, &mut out) {
-								Polled::Message { len, .. } => pty_output(console, pj, &out[..len]),
+								Polled::Message { len, .. } => {
+									// A host that stopped draining its own terminal loses the
+									// terminal, not the loop. See `pty_output`.
+									if !pty_output(console, pj, &out[..len]) {
+										close_pty(console, pj);
+										break;
+									}
+								}
 								Polled::Empty => break,
 								Polled::Closed => {
 									close_pty(console, pj);
@@ -638,9 +677,11 @@ unsafe fn run(console: &mut Console) -> ! {
 unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 	unsafe {
 		let fg: bool = vi == console.fg;
-		let input: u64 = console.input;
 		let mut clip_req: Option<Vec<u8>> = None;
 		let mut reply: Vec<u8> = Vec::new();
+		// When a bell rung in this output should stop showing. Recorded rather than waited out;
+		// the run loop takes it down. See `Console::bell_until`.
+		let mut flash_until: u64 = 0;
 		if let Some(t) = console.vts[vi].term.as_mut() {
 			for &b in bytes {
 				t.screen.put_byte(b);
@@ -681,11 +722,12 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 				if bell {
 					t.draw_inverted();
 					t.present();
-					let _ = wait(input, clock() + BELL_FLASH_TICKS);
-					t.screen.mark_all_dirty();
-					t.flush();
+					flash_until = clock() + BELL_FLASH_TICKS;
 				}
 			}
+		}
+		if flash_until != 0 {
+			console.bell_until = flash_until;
 		}
 		// Adopt an OSC 52 clipboard-set into the console-held clipboard (a program sets
 		// the selection, a later middle-click pastes it) - FROM THE FOREGROUND VT ONLY.
@@ -965,7 +1007,11 @@ unsafe fn feed_tty(vt: &mut Vt, b: u8, vocab: &[Vec<u8>]) {
 		if vt.master == 0 {
 			print(ser.as_slice());
 		} else {
-			send_blocking(vt.master, ser.as_slice(), 0);
+			// The same bound the slave-output path has, and for the same reason: a host that
+			// stopped draining its terminal must not hold the multiplexing loop. Dropping the echo
+			// past the bound is the lesser harm - the PTY itself is torn down by the output path,
+			// which is the one that sees the stall first and holds the index to act on it.
+			let _ = send_deadline(vt.master, ser.as_slice(), 0, clock() + CLIENT_SEND_TICKS);
 		}
 		if submitted {
 			if vt.ld.relist {
@@ -1016,7 +1062,7 @@ unsafe fn tty_echo(vt: &mut Vt, msg: &[u8]) {
 		if vt.master == 0 {
 			print(msg);
 		} else {
-			send_blocking(vt.master, msg, 0);
+			let _ = send_deadline(vt.master, msg, 0, clock() + CLIENT_SEND_TICKS);
 		}
 	}
 }
@@ -1190,10 +1236,17 @@ unsafe fn tty_resize_pty(vt: &mut Vt) {
 // Forward a PTY slave program's output bytes straight out to the host over the master
 // channel. A pty has no framebuffer; the host (the `script` tool, a future ssh) renders or
 // relays the bytes itself.
-unsafe fn pty_output(console: &mut Console, pj: usize, bytes: &[u8]) {
-	unsafe {
-		send_blocking(console.ptys[pj].master, bytes, 0);
-	}
+//
+// BOUNDED, AND A STALL TEARS THE PTY DOWN. `try_send` is the wrong answer here - silently dropping
+// terminal output is its own defect, and a program that is merely behind should not lose bytes -
+// so this waits like the user-input path and then gives up on the PTY rather than on the byte. A
+// host that has not read its own terminal's output in half a second has abandoned it, and the
+// alternative is holding every other VT for as long as it likes.
+//
+// Returns false when the PTY should be closed; the caller owns the teardown, because it holds the
+// index and closing underneath a borrow is how the pool gets corrupted.
+unsafe fn pty_output(console: &mut Console, pj: usize, bytes: &[u8]) -> bool {
+	unsafe { !matches!(send_deadline(console.ptys[pj].master, bytes, 0, clock() + CLIENT_SEND_TICKS), SendOutcome::Stalled) }
 }
 
 // Feed bytes the host wrote on a PTY's master channel through that PTY's line discipline
@@ -1653,9 +1706,25 @@ unsafe fn reload_vt(console: &mut Console, vi: usize) -> bool {
 		console.vts[vi].client = vt_service;
 		console.vts[vi].control = control_console;
 		console.vts[vi].fg_proc = None;
+		// A RELOAD IS A LOGOUT/LOGIN BOUNDARY, so it is SESSION ISOLATION and not tidiness.
+		//
+		// This called `screen.clear()`, which empties the active cell buffer, clears its wrap flags
+		// and homes the cursor - and nothing else. The fresh shell could therefore start with the
+		// alternate screen active, a hidden or restyled cursor, live SGR attributes, an OSC-modified
+		// palette, a scroll region, mouse tracking, bracketed paste, a live selection, DECSC saved
+		// cursors and the PREVIOUS SESSION'S SCROLLBACK - readable with Shift+PageUp - and, because
+		// neither was replaced, the previous line discipline (raw/cooked mode, echo state, a
+		// half-typed command line, the command HISTORY, readable with Up) and the previous `cwd`.
+		//
+		// `Screen::reset` already did the right thing and was private, which is why `clear` was
+		// being called; it is `hard_reset` now.
 		if let Some(t) = console.vts[vi].term.as_mut() {
-			t.screen.clear();
+			t.screen.hard_reset();
+			t.screen.mark_all_dirty();
 		}
+		let history: usize = console.vts[vi].ld.history_capacity();
+		console.vts[vi].ld = Box::new(Ld::new(history));
+		console.vts[vi].cwd = String::from("vol://system");
 		// nudge the fresh shell to print its first prompt (an empty line reprompts).
 		send_blocking(vt_service, b"\n", 0);
 		true

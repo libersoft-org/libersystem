@@ -525,6 +525,20 @@ fn exfat_upcase_table() -> Vec<u8> {
 	units.extend((0xE0u16..=0xF6).map(|c| c - 0x20)); // latin-1 lowercase -> capitals
 	units.push(0xF7); // division sign, itself
 	units.extend((0xF8u16..=0xFE).map(|c| c - 0x20));
+	// AND THE REST OF THE PLANE, which this fixture did not describe at all.
+	//
+	// It stopped at 0x00FF, so it expanded to 255 mappings and left 0x0100-0xFFFF undescribed -
+	// which the decoder used to accept, after which `up()` returned every remaining character
+	// unchanged because a lookup past the end returns its input. The format requires a custom table
+	// to cover 0000h-FFFFh unless the implementation restricts create and rename to the first 128
+	// characters, and this one accepts Unicode names.
+	//
+	// Confirmed against `mkfs.exfat`: a real table is 5836 bytes compressed and expands to exactly
+	// 65536 mappings. A fixture that would not survive its own driver's rule was not describing a
+	// volume any formatter writes - the same lesson the UDF fixtures learned at the File Set
+	// Descriptor.
+	// 65536 - 255 already described: the table ends at 0x00FE, so 0xFF01 units map to themselves.
+	identity(&mut units, 0xFF01); // 0x00FF..0xFFFF map to themselves
 	let mut out: Vec<u8> = Vec::new();
 	for u in units {
 		out.extend_from_slice(&u.to_le_bytes());
@@ -2945,7 +2959,7 @@ fn owned_clusters<D: BlockDevice>(fs: &mut FatFs<D>) -> Result<Vec<(String, Vec<
 	let root = Dir::at(fs.root_cluster());
 	let bytes = fs.read_dir_bytes(&root).map_err(|e| alloc::format!("the root is unreadable: {e:?}"))?;
 	let entries = match fs.geo.kind {
-		Kind::ExFat => parse_exfat_dir(&bytes, &fs.upcase).map_err(|e| alloc::format!("the root does not parse: {e:?}"))?,
+		Kind::ExFat => parse_exfat_dir(&bytes, &fs.upcase, crate::dir::Location::Root).map_err(|e| alloc::format!("the root does not parse: {e:?}"))?,
 		_ => parse_fat_dir(&bytes).map_err(|e| alloc::format!("the root does not parse: {e:?}"))?,
 	};
 	let max = fs.max_cluster();
@@ -3295,7 +3309,7 @@ fn an_exfat_set_with_a_trailing_vendor_entry_is_handled_whole() {
 		let sum = crate::dir::exfat_set_checksum(&set);
 		set[2..4].copy_from_slice(&sum.to_le_bytes());
 
-		let entries = crate::dir::parse_exfat_dir(&set, &upcase).expect("the set parses");
+		let entries = crate::dir::parse_exfat_dir(&set, &upcase, crate::dir::Location::Root).expect("the set parses");
 		assert_eq!(entries.len(), 1, "{label}: one file");
 		let e = &entries[0];
 		assert_eq!(e.name, "A", "{label}: the name still reads");
@@ -3530,7 +3544,7 @@ fn an_exfat_record_of_a_known_type_in_an_impossible_place_is_not_a_file() {
 		let sum = crate::dir::exfat_set_checksum(&set);
 		set[2..4].copy_from_slice(&sum.to_le_bytes());
 
-		let entries = crate::dir::parse_exfat_dir(&set, &upcase).expect("the parse itself must not fail");
+		let entries = crate::dir::parse_exfat_dir(&set, &upcase, crate::dir::Location::Root).expect("the parse itself must not fail");
 		assert!(entries.is_empty(), "{label}: surfaced as a file");
 	}
 }
@@ -3567,4 +3581,152 @@ fn an_upcase_table_is_read_as_well_as_checksummed() {
 		img[entry + at] = 1;
 		assert!(FatFs::mount(MemDisk { data: img }).is_none(), "a 0x82 entry with a nonzero reserved byte at {at}");
 	}
+}
+
+// P02M0125, sixth round: the volumes this backend was never asked to look at.
+//
+// Every test above builds a well-formed image or interrupts this driver's own operation. What none
+// of them does is hand it a volume that was ALREADY inconsistent - which is the premise every crash
+// invariant here rests on and the one thing nothing checked. Each case below is one field of an
+// otherwise healthy image.
+
+// The exFAT fixtures' layout, named once: 24 reserved sectors, one FAT sector, then the heap. The
+// bitmap is cluster 2, the root cluster 3, the Up-case Table cluster 4, and files start at 5.
+const EX_HEAP: usize = 25;
+const EX_BPS: usize = 512;
+
+fn ex_cluster(cluster: usize) -> usize {
+	(EX_HEAP + cluster - 2) * EX_BPS
+}
+
+#[test]
+fn a_volume_that_already_cross_links_two_files_mounts_read_only() {
+	// `unlink_in` deletes the entry durably and then frees the chain, with nothing asking whether
+	// another live entry owns it. On a FAT16 volume where two files share a cluster, removing the
+	// first marks the second's clusters free and the next allocation hands them to a third file - a
+	// correct, durable, crash-safe operation over an ownership map that was a lie before this
+	// driver touched it.
+	let mut img = build_fat(Kind::Fat16, &[File { path: "A.TXT", data: &[b'a'; 600] }, File { path: "B.TXT", data: &[b'b'; 600] }]);
+	// A.TXT occupies clusters 2..=3 and B.TXT 4..=5 in a 512-byte-cluster image. Point B's second
+	// cluster at A's first, which is the shape a torn FAT entry leaves behind - and do it in BOTH
+	// copies, so the mirror check has nothing of its own to say.
+	let bps = 512usize;
+	let fat_size = (5000 * 2usize).div_ceil(bps) * bps;
+	for copy in 0..FATS {
+		let at = bps + copy * fat_size;
+		img[at + 5 * 2..at + 5 * 2 + 2].copy_from_slice(&2u16.to_le_bytes());
+	}
+
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("a cross-linked volume still mounts - the data is readable");
+	assert!(fs.is_degraded(), "and it mounts READ-ONLY: its ownership map contradicts itself before this driver writes anything");
+	// The refusal is what protects B.TXT: without it, removing A frees clusters B still names.
+	assert_eq!(fs.remove(b"A.TXT"), Err(FsError::ReadOnly), "a remove over a lying ownership map is refused rather than performed correctly");
+	assert_eq!(fs.write_file(b"C.TXT", b"x"), Err(FsError::ReadOnly), "and so is an allocation that would be handed the disputed clusters");
+}
+
+#[test]
+fn a_healthy_volume_is_not_degraded_by_the_audit() {
+	// The other half, and the one that says the audit is a check rather than a refusal: every
+	// family this driver mounts passes it, with a subdirectory in the walk.
+	for (label, kind) in [("fat12", Kind::Fat12), ("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
+		let img = build_fat(kind, &[File { path: "A.TXT", data: b"alpha" }, File { path: "SUB/B.TXT", data: b"beta" }]);
+		let mut fs = FatFs::mount(MemDisk { data: img }).unwrap_or_else(|| panic!("{label} mounts"));
+		assert!(!fs.is_degraded(), "{label}: a well-formed volume is not degraded by the ownership audit");
+		assert_eq!(fs.write_file(b"C.TXT", b"gamma"), Ok(()), "{label}: and it is still writable");
+	}
+	let img = build_exfat(&[File { path: "A.TXT", data: b"alpha" }]);
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("exfat mounts");
+	assert!(!fs.is_degraded(), "exfat: a well-formed volume is not degraded by the ownership audit");
+	assert_eq!(fs.write_file(b"C.TXT", b"gamma"), Ok(()), "exfat: and it is still writable");
+}
+
+#[test]
+fn an_exfat_bitmap_that_calls_a_live_files_clusters_free_mounts_read_only() {
+	// `exfat_alloc` takes the first CLEAR bit from cluster 2 upward and the mount never inspected
+	// the bitmap's content, so a cleanly-flagged image whose bitmap marks a live file's clusters as
+	// free has an ordinary `write_file` hand them out again - two files over one cluster, with
+	// every checksum and flag on the volume correct.
+	let mut img = build_exfat(&[File { path: "A.TXT", data: b"alpha" }]);
+	let bitmap = ex_cluster(2);
+	let bit = 5 - 2; // the first file's cluster; the bitmap indexes from cluster 2
+	img[bitmap + bit / 8] &= !(1u8 << (bit % 8));
+
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("the volume still mounts, and its data is readable");
+	assert!(fs.is_degraded(), "a bitmap that disagrees with the namespace it describes is not an allocation map this driver may write through");
+	assert_eq!(fs.write_file(b"B.TXT", b"beta"), Err(FsError::ReadOnly), "so the allocation that would collide is refused");
+	// AND THE DATA IS STILL THERE, which is why this is read-only rather than a refused mount.
+	assert_eq!(fs.read_file(b"A.TXT"), Ok(b"alpha".to_vec()), "an operator can still copy the volume off");
+}
+
+#[test]
+fn an_exfat_bitmap_that_calls_a_system_chain_free_mounts_read_only() {
+	// The same rule reaching the chains the volume itself is made of: the bitmap's own clusters and
+	// the root. A bit clear on either means the next allocation overwrites volume metadata.
+	for (label, cluster) in [("the bitmap's own chain", 2usize), ("the root", 3)] {
+		let mut img = build_exfat(&[File { path: "A.TXT", data: b"alpha" }]);
+		let bitmap = ex_cluster(2);
+		let bit = cluster - 2;
+		img[bitmap + bit / 8] &= !(1u8 << (bit % 8));
+		let mut fs = FatFs::mount(MemDisk { data: img }).unwrap_or_else(|| panic!("{label}: the volume still mounts"));
+		assert!(fs.is_degraded(), "{label} marked free is a volume whose next write overwrites its own metadata");
+	}
+}
+
+#[test]
+fn a_directory_whose_valid_length_stops_short_of_its_size_is_not_a_directory() {
+	// `resolve_dir` stores `size` for a directory, and the only check was `valid_len > size` - so an
+	// entry claiming `ValidDataLength = 0` with `DataLength = 512` had this driver interpret the
+	// whole cluster of undefined data as directory entries. Stale-but-plausible entry sets left in
+	// that tail become phantom files that path resolution reaches and that `read_file`, `remove` and
+	// overwrite act on.
+	let mut img = build_exfat_tree(&[], &[], &["SUB"]);
+	let set = exfat_first_set(&img, ex_cluster(3));
+	let stream = set + 32;
+	img[stream + 8..stream + 16].copy_from_slice(&0u64.to_le_bytes());
+	let checksum = exfat_set_checksum(&img[set..set + (img[set + 1] as usize + 1) * 32]);
+	img[set + 2..set + 4].copy_from_slice(&checksum.to_le_bytes());
+
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("the volume mounts");
+	// The set is refused outright, so the directory is not there at all - which is the honest answer
+	// for a record whose two lengths contradict each other.
+	assert_eq!(fs.list_dir(b"SUB"), Err(FsError::NotFound), "a directory with an undefined tail is not a directory this driver will walk");
+}
+
+#[test]
+fn a_critical_primary_in_a_subdirectory_makes_it_invalid() {
+	// `if e[0] != 0x85 { i += 32; continue; }` was one rule for both places. In the ROOT the mount
+	// expects the Allocation Bitmap, the Up-case Table and the Volume Label; in a SUBDIRECTORY none
+	// of them may appear, and any critical primary that is not a File entry makes the containing
+	// directory invalid - so `0x81` inside one was stepped over and the directory kept listing,
+	// resolving and mutating.
+	let mut img = build_exfat_tree(&[], &[], &["SUB"]);
+	// The directory gets the first cluster after the bitmap, the root and the Up-case Table.
+	img[ex_cluster(5)] = 0x81; // an Allocation Bitmap entry, inside a subdirectory
+
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("the volume mounts - the root is intact");
+	assert_eq!(fs.list_dir(b"SUB"), Err(FsError::Corrupt), "a critical primary this driver does not expect here makes the directory invalid, not something to step over");
+	// And the root still lists, because the rule is about WHERE the record is.
+	assert!(fs.list().is_ok(), "the root is unaffected");
+}
+
+#[test]
+fn an_upcase_table_that_ends_early_is_refused() {
+	// The size was bounded from above - `size > 2 * 0x1_0000` - and not from below, so a table that
+	// expands to 128 mappings was accepted and `up()` then treated every character above them as an
+	// identity mapping, because a lookup past the end returns its input. An implementation may
+	// ignore the non-mandatory part only if it restricts create and rename to the first 128
+	// characters; this one accepts Unicode names and uses the volume's table for their hash and
+	// comparison.
+	//
+	// Confirmed against `mkfs.exfat`: a real table is 5836 bytes and expands to exactly 65536.
+	let short: Vec<u16> = alloc::vec![0xFFFF, 0x61, 0xFFFF, 0x1F];
+	let mut raw: Vec<u8> = Vec::new();
+	for u in short {
+		raw.extend_from_slice(&u.to_le_bytes());
+	}
+	assert!(crate::dir::Upcase::decode(&raw).is_none(), "a table that describes 128 characters and stops is not a table for a volume with Unicode names on it");
+
+	// And the one the fixtures build, which covers the plane, still decodes - so this is a rule
+	// about coverage and not a rejection of the compressed form.
+	assert!(crate::dir::Upcase::decode(&exfat_upcase_table()).is_some(), "a table that covers 0000h-FFFFh decodes");
 }

@@ -178,11 +178,23 @@ impl Echo<'_> {
 	}
 
 	fn move_left(&mut self, n: usize) -> bool {
-		for _ in 0..n {
-			self.ser.push(b"\x08");
+		// THE MIRROR IS NOT TOLD ABOUT A MOVE THE LOCAL GRID COULD NOT MAKE.
+		//
+		// The backspaces used to be pushed first and the local walk attempted afterwards, so when
+		// the walk ran off the top the caller repainted the local grid from a new anchor WHILE the
+		// mirror had already received `n` more backspaces - which at its own top-left may do
+		// nothing at all. From then on the two views disagreed by however many the mirror swallowed,
+		// and nothing ever brought them back together.
+		//
+		// Ordering them the other way makes the mirror's bytes conditional on the same answer the
+		// local grid gave, and `repaint` (which is what the caller does on `false`) speaks to both.
+		let moved: bool = self.move_left_screen(n);
+		if moved {
+			for _ in 0..n {
+				self.ser.push(b"\x08");
+			}
 		}
-		// No local grid: nothing to contradict the count, and the far end owns the outcome.
-		self.move_left_screen(n)
+		moved
 	}
 }
 
@@ -231,6 +243,12 @@ pub struct Ld {
 }
 
 impl Ld {
+	// The history ceiling this discipline was built with, so a caller replacing it - a logout on a
+	// VT - can build the new one the same size without carrying the number around itself.
+	pub fn history_capacity(&self) -> usize {
+		self.hist_max
+	}
+
 	pub fn new(history_max: usize) -> Ld {
 		// AT LEAST ONE. `Ld::new(0)` is a legal public call, and its first `commit` then ran
 		// `history.remove(0)` on an empty vector. The configuration path filters zero today, which
@@ -461,8 +479,20 @@ impl Ld {
 		self.cursor = start;
 		self.len -= removed;
 		if self.echo {
+			// THROUGH THE CARET MODEL, LIKE `left()` - which is forty lines below this and says why.
+			//
+			// This wrote a bare `\x08`, which is the REMOTE terminal's own rule for moving left, and
+			// it is wrong in exactly the `pending_wrap` state `left()` was fixed for: after the
+			// eighth character on an eight-column terminal the model holds `col = 7` with the wrap
+			// owed, and a raw backspace from there deletes the wrong cell. It is also the same
+			// unchecked assumption `move_left` exists to stop making - a reverse-wrap backspace
+			// steps onto the previous physical row only while there IS one.
+			//
+			// `move_left` handles both: it counts through `caret_index`, which knows about the
+			// deferred wrap, and it repaints when the caret cannot walk that far.
+			//
 			// The echo is in COLUMNS: one character is one cell however many bytes it took.
-			e.put(b"\x08");
+			self.move_left(1, e);
 			e.put(&self.line[self.cursor..self.len]);
 			e.put(b" ");
 			self.move_left(self.columns(self.cursor, self.len) + 1, e);
@@ -602,6 +632,21 @@ impl Ld {
 	// screen. It is the same answer `replace_line` gives for Ctrl+U - reprint rather than seek -
 	// applied to the case where seeking is not possible at all.
 	fn repaint(&self, e: &mut Echo) {
+		// THE MIRROR IS RECOVERED TOO, with the only anchor that is valid without knowing the far
+		// end's geometry.
+		//
+		// `cup` is deliberately local-only - an absolute cell address is meaningless on a mirror
+		// whose size we do not know - so this path used to repaint the grid and leave the mirror
+		// holding whatever the failed walk had already sent it. A carriage return, an
+		// erase-to-end-of-line and the visible tail is the same recovery expressed in bytes any
+		// terminal understands: it re-anchors the mirror on the current row rather than on a cell.
+		//
+		// It is not exact - a line that has wrapped on the far end leaves the earlier rows as they
+		// were - and it is the strongest statement available to a sink whose geometry is unknown,
+		// which is the honest limit of a mirror as opposed to a session. A PTY host that wants an
+		// exact view renders the line itself; the serial mirror is a debug view.
+		e.ser.push(b"\r\x1b[K");
+		e.ser.push(&self.line[self.char_start_of_row(e)..self.len]);
 		let Some(t) = &e.term else {
 			// No local grid: the far end owns its own caret and there is nothing here to repaint.
 			return;
@@ -644,6 +689,22 @@ impl Ld {
 			}
 		}
 		e.cup(back / cols, back % cols);
+	}
+
+	// Where the mirror's current row begins, in buffer bytes.
+	//
+	// Without a local grid there is no geometry to divide by, so the whole line is the row - which
+	// is what a mirror that has not wrapped sees, and the closest a sink of unknown width can be
+	// given. With one, the row is the last `cols` columns before the cursor.
+	fn char_start_of_row(&self, e: &Echo) -> usize {
+		let Some(t) = &e.term else { return 0 };
+		let cols: usize = t.screen.cols().max(1);
+		let back: usize = self.columns(0, self.cursor) % cols;
+		let mut start: usize = self.cursor;
+		for _ in 0..back {
+			start = self.char_start(start);
+		}
+		start
 	}
 
 	// Ctrl+U: erase the whole line.

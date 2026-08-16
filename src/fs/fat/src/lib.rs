@@ -41,7 +41,7 @@ use alloc::vec::Vec;
 mod tests;
 
 mod dir;
-use dir::{Raw, build_entries, build_exfat_set, check_name, dos_datetime, exfat_free_run, exfat_mark_unlinked, exfat_set_checksum, free_run, mark_unlinked, parse_exfat_dir, parse_fat_dir, scrub_after_terminator, split_parent, writable_name};
+use dir::{Location, Raw, Understanding, build_entries, build_exfat_set, check_name, dos_datetime, exfat_free_run, exfat_mark_unlinked, exfat_set_checksum, free_run, mark_unlinked, parse_exfat_dir, parse_fat_dir, scrub_after_terminator, split_parent, writable_name};
 #[cfg(test)]
 use dir::{existing_shorts, short_char, trim_spaces};
 
@@ -110,6 +110,18 @@ struct Dir {
 	// where this directory's own entry set lives (None = the root, which has no
 	// record) - the exFAT grow path must update the DataLength recorded there.
 	parent: Option<Parent>,
+	// HOW WELL THE ENTRY SET THAT NAMED THIS DIRECTORY WAS UNDERSTOOD.
+	//
+	// The synthetic `ATTR_READ_ONLY` an unrecognised secondary produces is right for a file and is
+	// LOST for a directory: `resolve_dir` built a `Dir` from the cluster and the lengths and nothing
+	// else, so `write_file("OPAQUE_DIR/new.txt", ..)` reached an ordinary `exfat_write` INSIDE a
+	// directory the implementation admits it does not understand.
+	//
+	// The rule this carries is the format's, and it is a table rather than a flag: traversal and
+	// enumeration are allowed, creating entries and ordinarily modifying them are not, and deleting
+	// a contained entry is a named exception - because removing something is how an operator gets
+	// out of the situation.
+	understanding: Understanding,
 }
 
 // The location of a directory's entry set in its parent: the parent directory's
@@ -125,7 +137,7 @@ struct Parent {
 
 impl Dir {
 	fn at(cluster: u32) -> Dir {
-		Dir { cluster, nfc_len: None, rec_len: None, parent: None }
+		Dir { cluster, nfc_len: None, rec_len: None, parent: None, understanding: Understanding::Complete }
 	}
 }
 
@@ -393,7 +405,178 @@ impl<D: BlockDevice> FatFs<D> {
 				fs.degraded = true;
 			}
 		}
+		// WHAT THE VOLUME ALREADY SAYS, BEFORE THIS DRIVER WRITES A WORD OF IT.
+		//
+		// This backend is careful that ITS OWN interrupted operation cannot create a cross-link, and
+		// it never asked whether the volume already contained one. On a crafted or already-damaged
+		// FAT16 volume where `A.TXT` and `B.TXT` share cluster 100, removing `A.TXT` marks `B.TXT`'s
+		// clusters free and the next allocation hands them to a third file - a correct, durable,
+		// crash-safe operation performed over an ownership map that was a lie before the driver
+		// touched it. Every crash invariant this crate asserts is conditional on a premise nothing
+		// checked.
+		//
+		// THE DECISION, made rather than implied: a mount that fails the audit is READ-ONLY, not
+		// refused. The three options were an audit, a read-only default with read-write entered
+		// after validation, and an exFAT-only system-chain check. This is the first two together,
+		// through the mechanism that already exists - `degraded` is exactly "the medium no longer
+		// describes its own contents, so stop mutating" - and refusing outright would take the data
+		// away from an operator who can still copy it off. A repair tool clears the condition; this
+		// driver does not.
+		//
+		// The cost is a metadata walk at mount: every directory read once, every chain followed
+		// once. It is paid on volumes of the size this system mounts, and it buys the premise the
+		// rest of the crate's guarantees rest on. An audit that cannot RUN - a heap too short for
+		// the bitmap - is also read-only, because "not checked" and "checked and sound" must not
+		// look alike.
+		if !fs.degraded && fs.audit_ownership().is_err() {
+			fs.degraded = true;
+		}
 		Some(fs)
+	}
+
+	// Whether this mount refuses to mutate, and why it might. Public so an operator's tools and the
+	// service layer can tell a read-only mount from a full one rather than discovering it at the
+	// first write.
+	pub fn is_degraded(&self) -> bool {
+		self.degraded
+	}
+
+	// Walk the live namespace and check that no cluster is named twice.
+	//
+	// `Ok(())` means the volume's ownership map is self-consistent as far as this can see it;
+	// `Err` means it is not, or that the walk could not be completed - and the caller treats those
+	// the same, because a check that did not run proves nothing.
+	//
+	// ITERATIVE, with a visited set over DIRECTORIES as well as clusters: a crafted volume whose
+	// directory names itself as a subdirectory would otherwise walk forever, and a mount that hangs
+	// is worse than one that refuses.
+	fn audit_ownership(&mut self) -> Result<(), FsError> {
+		let max = self.max_cluster();
+		let bytes = (max as usize / 8) + 2;
+		let mut owned: Vec<u8> = Vec::new();
+		owned.try_reserve_exact(bytes).map_err(|_| FsError::NoMemory)?;
+		owned.resize(bytes, 0);
+		let mut claim = |cluster: u32, owned: &mut Vec<u8>| -> Result<(), FsError> {
+			if cluster < 2 || cluster > max {
+				return Err(FsError::Corrupt);
+			}
+			let (index, bit) = (cluster as usize / 8, 1u8 << (cluster % 8));
+			let slot = owned.get_mut(index).ok_or(FsError::Corrupt)?;
+			// The whole point: a second claim on one cluster is two owners.
+			if *slot & bit != 0 {
+				return Err(FsError::Corrupt);
+			}
+			*slot |= bit;
+			Ok(())
+		};
+		// The exFAT system chains are claimed FIRST, so a file that overlaps the bitmap or the
+		// Up-case Table is caught as a cross-link by the same rule rather than needing its own -
+		// and so the three of them are checked against each other on the way in.
+		if let Some(root) = self.exfat_root {
+			self.claim_chain(root.bitmap_first, None, &mut owned, &mut claim)?;
+		}
+		// The root: a chained root on FAT32 and exFAT, and the fixed region (cluster 0) on FAT12
+		// and FAT16, which owns no clusters and is walked without claiming any.
+		let mut pending: Vec<Dir> = Vec::new();
+		let mut seen_dirs: Vec<u32> = Vec::new();
+		let root = Dir::at(self.root_cluster());
+		if root.cluster != 0 {
+			self.claim_chain(root.cluster, None, &mut owned, &mut claim)?;
+			seen_dirs.push(root.cluster);
+		}
+		pending.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+		pending.push(root);
+		while let Some(dir) = pending.pop() {
+			let bytes = self.read_dir_bytes(&dir)?;
+			let entries = match self.geo.kind {
+				Kind::ExFat => dir::parse_exfat_dir(&bytes, &self.upcase, self.location_of(&dir))?,
+				_ => dir::parse_fat_dir(&bytes)?,
+			};
+			for entry in &entries {
+				if entry.first_cluster == 0 {
+					continue;
+				}
+				let length = if entry.no_fat_chain { Some(entry.size) } else { None };
+				if entry.is_dir {
+					// A directory reached twice is a namespace this walk cannot terminate over, and
+					// its clusters would be claimed twice in any case - so the cluster claim below
+					// is what catches it, and this only stops the second descent.
+					if seen_dirs.contains(&entry.first_cluster) {
+						return Err(FsError::Corrupt);
+					}
+					seen_dirs.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+					seen_dirs.push(entry.first_cluster);
+					self.claim_chain(entry.first_cluster, length, &mut owned, &mut claim)?;
+					pending.try_reserve(1).map_err(|_| FsError::NoMemory)?;
+					pending.push(Dir { cluster: entry.first_cluster, nfc_len: length, rec_len: Some(entry.size), parent: None, understanding: entry.understanding });
+					continue;
+				}
+				self.claim_chain(entry.first_cluster, length, &mut owned, &mut claim)?;
+			}
+		}
+		// AND ON exFAT, THE BITMAP HAS TO AGREE WITH ALL OF IT.
+		//
+		// The specification makes the Allocation Bitmap the source of allocation state, and
+		// `exfat_alloc` takes the first clear bit from cluster 2 upward without ever asking whether
+		// the bitmap describes the volume. A cleanly-flagged image whose bitmap marks the root, its
+		// own chain, the Up-case Table or a live file's clusters as free has an ordinary
+		// `write_file` overwrite volume metadata.
+		//
+		// Checked in one direction only, deliberately: every cluster a live entry owns must be
+		// marked in use. A bit set with nothing naming it is a LEAK - space nobody can use - which
+		// costs capacity and cannot corrupt anything, and refusing to write to a volume over it
+		// would turn a harmless waste into an unmountable card.
+		if let Some(root) = self.exfat_root {
+			let bm = self.read_chain(root.bitmap_first, self.bitmap_cap(root.bitmap_size))?;
+			let usable = bm.len().min(root.bitmap_size as usize);
+			for cluster in 2..=max {
+				let (index, bit) = (cluster as usize / 8, 1u8 << (cluster % 8));
+				if owned.get(index).is_some_and(|slot| slot & bit != 0) {
+					// The bitmap indexes from cluster 2, so the bit for cluster N is at N - 2.
+					let at = (cluster - 2) as usize;
+					let (bi, bb) = (at / 8, 1u8 << (at % 8));
+					if bi >= usable || bm.get(bi).is_none_or(|slot| slot & bb == 0) {
+						return Err(FsError::Corrupt);
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
+	// Claim every cluster of one chain. `nfc_len` is the recorded size of a NoFatChain extent, whose
+	// clusters are the contiguous run that size implies rather than a FAT walk - walking one would
+	// report every cluster of it as free.
+	fn claim_chain(&mut self, first: u32, nfc_len: Option<u64>, owned: &mut Vec<u8>, claim: &mut impl FnMut(u32, &mut Vec<u8>) -> Result<(), FsError>) -> Result<(), FsError> {
+		let max = self.max_cluster();
+		if let Some(len) = nfc_len {
+			let cluster_bytes = (self.geo.sectors_per_cluster as u64 * self.geo.bytes_per_sector as u64).max(1);
+			let count = len.div_ceil(cluster_bytes).max(1);
+			for i in 0..count {
+				let cluster = first.checked_add(u32::try_from(i).map_err(|_| FsError::Corrupt)?).ok_or(FsError::Corrupt)?;
+				claim(cluster, owned)?;
+			}
+			return Ok(());
+		}
+		let mut cluster = first;
+		let mut guard: u64 = 0;
+		while cluster >= 2 && cluster <= max && !self.is_end(cluster) {
+			claim(cluster, owned)?;
+			cluster = self.next_cluster(cluster)?;
+			guard += 1;
+			// Bounded by the pool: a chain longer than every cluster there is has a loop in it, and
+			// the claim above would normally catch that - this is the second answer for the case
+			// where the loop leaves the pool.
+			if guard > max as u64 {
+				return Err(FsError::Corrupt);
+			}
+		}
+		// A chain that ends anywhere other than an end-of-chain marker names a cluster outside the
+		// pool, which is not a chain this volume can own.
+		if cluster >= 2 && !self.is_end(cluster) {
+			return Err(FsError::Corrupt);
+		}
+		Ok(())
 	}
 
 	// Set the wall clock (Unix seconds, UTC) subsequent writes stamp their directory
@@ -599,6 +782,21 @@ impl<D: BlockDevice> FatFs<D> {
 		let (parent, name) = split_parent(path)?;
 		check_name(name)?;
 		let dir = self.resolve_dir(parent)?;
+		// CREATING OR MODIFYING INSIDE A DIRECTORY THIS DRIVER DOES NOT UNDERSTAND IS REFUSED.
+		//
+		// The synthetic read-only bit an unrecognised secondary produces answers for the entry
+		// ITSELF and says nothing about what may be done inside it, so this reached an ordinary
+		// `exfat_write` in a directory whose entry set carried records the driver could not read -
+		// rebuilding neighbours' sets with `build_exfat_set`, which emits `0x85`/`0xC0`/`0xC1` and
+		// drops everything else.
+		//
+		// `remove` deliberately does NOT carry this check: deleting a contained entry is the
+		// format's named exception, and it is how an operator gets out of the situation. Traversal
+		// and enumeration are allowed too, which is why the refusal is here and not in
+		// `resolve_dir`.
+		if !dir.understanding.is_complete() {
+			return Err(FsError::ReadOnly);
+		}
 		if self.geo.kind == Kind::ExFat {
 			return self.under_dirty_flag(|fs| fs.exfat_write(&dir, name, data));
 		}
@@ -704,7 +902,7 @@ impl<D: BlockDevice> FatFs<D> {
 			let nfc_len = if e.no_fat_chain && e.first_cluster != 0 { Some(e.size) } else { None };
 			let rec_len = if self.geo.kind == Kind::ExFat && nfc_len.is_none() && cluster != self.root_cluster() { Some(e.size) } else { None };
 			let parent = if cluster == self.root_cluster() { None } else { Some(Parent { cluster: dir.cluster, nfc_len: dir.nfc_len, set_off: e.set_off, ent_off: e.ent_off }) };
-			dir = Dir { cluster, nfc_len, rec_len, parent };
+			dir = Dir { cluster, nfc_len, rec_len, parent, understanding: e.understanding };
 		}
 		Ok(dir)
 	}
@@ -729,9 +927,17 @@ impl<D: BlockDevice> FatFs<D> {
 	fn scan_dir(&mut self, dir: &Dir) -> Result<Vec<Raw>, FsError> {
 		let bytes = self.read_dir_bytes(dir)?;
 		match self.geo.kind {
-			Kind::ExFat => parse_exfat_dir(&bytes, &self.upcase),
+			Kind::ExFat => parse_exfat_dir(&bytes, &self.upcase, self.location_of(dir)),
 			_ => parse_fat_dir(&bytes),
 		}
+	}
+
+	// Whether a directory is the root, which decides which critical PRIMARY records may appear in
+	// it. The mount reads the Allocation Bitmap, the Up-case Table and the Volume Label out of the
+	// root; in a subdirectory none of them may appear, and one that does makes the directory invalid
+	// rather than something to step over.
+	fn location_of(&self, dir: &Dir) -> dir::Location {
+		if dir.cluster == self.geo.root_cluster { dir::Location::Root } else { dir::Location::Subdirectory }
 	}
 
 	// Read the fixed-size root directory region of a FAT12/16 volume into a Vec.
@@ -1763,7 +1969,7 @@ impl<D: BlockDevice> FatFs<D> {
 	fn exfat_remove(&mut self, dir: &Dir, name: &[u8]) -> Result<(), FsError> {
 		let mut bytes = self.read_dir_bytes(dir)?;
 		let orig = bytes.clone();
-		let Some(old) = exfat_mark_unlinked(&mut bytes, name, &self.upcase)? else {
+		let Some(old) = exfat_mark_unlinked(&mut bytes, name, &self.upcase, self.location_of(dir))? else {
 			return Err(FsError::NotFound);
 		};
 		self.write_dir_dirty(dir, &bytes, &orig)?;
@@ -1799,7 +2005,7 @@ impl<D: BlockDevice> FatFs<D> {
 		let mut bytes = self.read_dir_bytes(dir).map_err(fail)?;
 		let orig = bytes.clone();
 		scrub_after_terminator(&mut bytes);
-		let old = exfat_mark_unlinked(&mut bytes, name, &self.upcase).map_err(fail)?;
+		let old = exfat_mark_unlinked(&mut bytes, name, &self.upcase, self.location_of(dir)).map_err(fail)?;
 		let name: &[u8] = match &old {
 			Some(o) if writable_name(o.name.as_bytes()) => o.name.as_bytes(),
 			_ => name,
@@ -1898,7 +2104,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// inside the entry set at `p`, restamp the set checksum, and write the parent
 	// directory back - the bookkeeping half of growing an exFAT directory.
 	fn exfat_grow_parent_record(&mut self, p: &Parent, delta: u64) -> Result<(), FsError> {
-		let pdir = Dir { cluster: p.cluster, nfc_len: p.nfc_len, rec_len: None, parent: None };
+		let pdir = Dir { cluster: p.cluster, nfc_len: p.nfc_len, rec_len: None, parent: None, understanding: Understanding::Complete };
 		let mut bytes = self.read_dir_bytes(&pdir)?;
 		let orig = bytes.clone();
 		let end = p.ent_off + 32;

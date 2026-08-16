@@ -25,8 +25,52 @@ pub(super) struct Raw {
 	pub(super) attr: u8,
 	pub(super) first_cluster: u32,
 	pub(super) no_fat_chain: bool,
+	// HOW WELL THIS DRIVER UNDERSTANDS THE SET, carried rather than flattened into a bit.
+	//
+	// An unrecognised secondary used to become a synthetic `ATTR_READ_ONLY`, which is the right
+	// answer for a FILE and is LOST for a DIRECTORY: `resolve_dir` builds a `Dir` from the cluster
+	// and the lengths, so `write_file("OPAQUE_DIR/new.txt", ..)` reached an ordinary `exfat_write`
+	// inside a directory the implementation admits it does not understand.
+	//
+	// The specification's rule for an unknown CRITICAL secondary is stricter than read-only and it
+	// is a table rather than a flag: traversal and enumeration are allowed, creating entries and
+	// ordinarily modifying or opening them are not, and deleting a contained entry is a named
+	// exception. A single bit cannot express that, which is why the reason travels.
+	pub(super) understanding: Understanding,
 	pub(super) set_off: usize,
 	pub(super) ent_off: usize,
+}
+
+// What an entry set carried that this driver could not read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Understanding {
+	// Every record in the set is one this driver emits and reads.
+	Complete,
+	// A secondary with bit 5 set: a vendor extension. Not fatal to the format's meaning, and this
+	// driver still cannot rebuild the set without dropping it - see the Vendor Allocation case.
+	UnknownBenign,
+	// A secondary with bit 5 clear. The format says the whole set is unrecognised and an
+	// implementation may not modify it normally.
+	UnknownCritical,
+}
+
+impl Understanding {
+	pub(super) fn is_complete(self) -> bool {
+		self == Understanding::Complete
+	}
+}
+
+// Where a directory being parsed sits, because the rule for a critical PRIMARY differs by place.
+//
+// In the root, `0x81` (Allocation Bitmap), `0x82` (Up-case Table) and `0x83` (Volume Label) are
+// expected and the mount reads them. In a subdirectory none of them may appear: the format says any
+// critical primary other than a File entry makes the containing directory invalid. This parser had
+// one rule - `if e[0] != 0x85 { continue }` - so `0x81` inside a subdirectory was stepped over and
+// the directory went on listing, resolving and mutating.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Location {
+	Root,
+	Subdirectory,
 }
 
 impl Raw {
@@ -86,8 +130,8 @@ pub(super) fn mark_unlinked(bytes: &mut [u8], name: &[u8], upcase: &Upcase) -> R
 // The exFAT counterpart: clear the in-use bit of every record in the named entry set,
 // returning the parsed entry (first cluster, size, NoFatChain) so the caller can release
 // its clusters the right way once the directory write is safe.
-pub(super) fn exfat_mark_unlinked(bytes: &mut [u8], name: &[u8], upcase: &Upcase) -> Result<Option<Raw>, FsError> {
-	let entries = parse_exfat_dir(bytes, upcase)?;
+pub(super) fn exfat_mark_unlinked(bytes: &mut [u8], name: &[u8], upcase: &Upcase, at: Location) -> Result<Option<Raw>, FsError> {
+	let entries = parse_exfat_dir(bytes, upcase, at)?;
 	let Some(e) = entries.into_iter().find(|e| e.matches(name, upcase)) else {
 		return Ok(None);
 	};
@@ -203,7 +247,9 @@ pub(super) fn parse_fat_dir(bytes: &[u8]) -> Result<Vec<Raw>, FsError> {
 		let is_dir = e[11] & 0x10 != 0;
 		let first_cluster = ((u16::from_le_bytes([e[20], e[21]]) as u32) << 16) | u16::from_le_bytes([e[26], e[27]]) as u32;
 		let size = u32::from_le_bytes([e[28], e[29], e[30], e[31]]) as u64;
-		out.push(Raw { name, short, size, valid_len: size, is_dir, attr: e[11], first_cluster, no_fat_chain: false, set_off, ent_off: off });
+		// The classic families have no secondary records, so a classic entry is always fully
+		// understood - there is nothing in one this driver could fail to read.
+		out.push(Raw { name, short, size, valid_len: size, is_dir, attr: e[11], first_cluster, no_fat_chain: false, understanding: Understanding::Complete, set_off, ent_off: off });
 	}
 	Ok(out)
 }
@@ -233,13 +279,26 @@ fn lfn_fragment(e: &[u8]) -> Vec<u16> {
 // set is skipped, never trusted. The stream's NoFatChain flag (bit 0x02) marks a
 // contiguous file with no FAT chain - the common form Windows writes - which must be
 // read and freed by length, never by following the FAT.
-pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>, FsError> {
+pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase, at: Location) -> Result<Vec<Raw>, FsError> {
 	let mut out: Vec<Raw> = Vec::new();
 	let mut i = 0;
 	while i + 32 <= bytes.len() {
 		let e = &bytes[i..i + 32];
 		if e[0] == 0x00 {
 			break;
+		}
+		// A CRITICAL PRIMARY OTHER THAN A FILE, and where it is decides what it means.
+		//
+		// A primary is in use (bit 7) and not secondary (bit 6 clear); benign is bit 5. So the
+		// critical primaries are `0x80..=0x9F`. In the ROOT the mount expects `0x81`, `0x82` and
+		// `0x83` and reads them; in a SUBDIRECTORY none of them may appear at all, and any critical
+		// primary that is not a File entry makes the containing directory invalid.
+		//
+		// This was `if e[0] != 0x85 { i += 32; continue; }` for both places, so `0x81` in a
+		// subdirectory was stepped over in silence and the directory kept listing, resolving and
+		// mutating - inside a structure the format says is not a directory this reader may use.
+		if e[0] != 0x85 && e[0] & 0xE0 == 0x80 && at == Location::Subdirectory {
+			return Err(FsError::Corrupt);
 		}
 		if e[0] != 0x85 {
 			i += 32;
@@ -278,6 +337,21 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>,
 		// ValidDataLength past DataLength would make the zero-fill read past the file.
 		let fragments = name_len.div_ceil(15);
 		if name_len == 0 || name_len > 255 || valid_len > size || secondary < 1 + fragments {
+			i += set_len;
+			continue;
+		}
+		// A DIRECTORY HAS NO UNDEFINED TAIL. `valid_len > size` was the only check, and `resolve_dir`
+		// stores `size` for a directory - so a forged entry claiming `ValidDataLength = 512` with
+		// `DataLength = 4096` had this driver interpret 3584 bytes of undefined data as directory
+		// entries. Stale-but-plausible entry sets left in that tail become phantom files that path
+		// resolution reaches and that `read_file`, `remove` and overwrite then act on.
+		//
+		// The format requires the two to be equal for a directory: there is no such thing as a
+		// partially-written directory, because every byte of one is metadata.
+		//
+		// And a directory is bounded: 256 MiB is the format's ceiling, and a `DataLength` past it
+		// is a length no writer produces.
+		if is_dir && (valid_len != size || size > 256 * 1024 * 1024) {
 			i += set_len;
 			continue;
 		}
@@ -320,7 +394,7 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>,
 		//
 		// So it is `malformed` rather than `unrecognised`: read-only is the answer for a record the
 		// driver failed to understand, and this is a set the format forbids.
-		let mut unrecognised = false;
+		let mut understanding = Understanding::Complete;
 		let mut misplaced = false;
 		for r in (1 + fragments)..secondary {
 			let kind = bytes[i + 32 + r * 32];
@@ -330,7 +404,15 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>,
 			if matches!(kind, 0xC0 | 0xC1) {
 				misplaced = true;
 			} else if kind & 0x80 != 0 {
-				unrecognised = true;
+				// Bit 5 is the benign/critical distinction, and they lead to different rules - see
+				// `Understanding`. Critical wins if a set carries both.
+				if kind & 0x20 != 0 {
+					if understanding == Understanding::Complete {
+						understanding = Understanding::UnknownBenign;
+					}
+				} else {
+					understanding = Understanding::UnknownCritical;
+				}
 			}
 		}
 		if misplaced {
@@ -376,8 +458,8 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase) -> Result<Vec<Raw>,
 		let last = i + set_len - 32;
 		// A set this reader does not fully understand is READ-ONLY, expressed through the attribute
 		// every write path already honours rather than through a second flag nothing checks.
-		let attr = if unrecognised { e[4] | ATTR_READ_ONLY } else { e[4] };
-		out.push(Raw { name: decode_utf16(&name), short: String::new(), size, valid_len, is_dir, attr, first_cluster, no_fat_chain, set_off: i, ent_off: last });
+		let attr = if understanding.is_complete() { e[4] } else { e[4] | ATTR_READ_ONLY };
+		out.push(Raw { name: decode_utf16(&name), short: String::new(), size, valid_len, is_dir, attr, first_cluster, no_fat_chain, understanding, set_off: i, ent_off: last });
 		i += set_len;
 	}
 	Ok(out)
@@ -859,6 +941,23 @@ impl Upcase {
 				return None;
 			}
 			map.push(unit);
+		}
+		// THE TABLE HAS TO COVER 0000h-FFFFh, CHECKED BEFORE THE TRAILING RUN IS DROPPED.
+		//
+		// The upper bound refused a table describing more than 65536 units and there was no lower
+		// one, so a table that expanded to 128 mappings was accepted - after which `up()` treats
+		// every remaining character as an identity mapping, because a lookup past the end returns
+		// its input. The format permits ignoring the non-mandatory part only for an implementation
+		// that restricts create and rename to the first 128 characters; this one accepts Unicode
+		// names and uses the volume's table for their hash and comparison, so a custom table that
+		// ends early makes this driver disagree with every other one about which names collide,
+		// silently, for the whole of the character set above the ASCII prefix.
+		//
+		// Checked HERE and not after the truncation below, which is the only place it can be: the
+		// truncation deliberately drops the trailing identity run, so the in-memory length says
+		// nothing about how much the table on the medium described.
+		if map.len() != 0x1_0000 {
+			return None;
 		}
 		// Trailing identity entries carry no information and are what makes the standard table
 		// large; dropping them is why this holds kilobytes rather than the full 128 KiB.

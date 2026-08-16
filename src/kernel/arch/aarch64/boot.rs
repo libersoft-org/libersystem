@@ -300,14 +300,40 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// Declaring them free is only harmless while nothing allocates that far up. See
 	// `arch::common::bootmem` for how long that held and what ended it.
 	let mut holes = [crate::arch::common::bootmem::Hole { start: 0, end: 0 }; crate::arch::common::bootmem::MAX_HOLES];
-	let hole_count = unsafe { crate::arch::common::bootmem::loader_reservations(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys), &mut holes) };
+	let mut hole_count = unsafe { crate::arch::common::bootmem::loader_reservations(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys), &mut holes) };
+	// AND WHAT THE DEVICE TREE RESERVES, including the blob itself - none of which anything carved.
+	//
+	// This kernel keeps reading the tree after the allocator is up, and the specification requires a
+	// client not to overwrite it or use the reservation block's regions. See
+	// `bootmem::devicetree_reservations`.
+	if let Some(tree) = super::dtb::located(dtb) {
+		hole_count = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
+	}
 	// `banks + holes`, because each reservation splits at most one bank into one extra region.
 	let mut regions = [bootproto::MemRegion { base: 0, length: 0, kind: bootproto::MEM_USABLE, _pad: 0 }; fdt::MAX_RAM_REGIONS + crate::arch::common::bootmem::MAX_HOLES];
 	// EVERY BANK, not the contiguous run from the first one. `usable_region(0)` answers the floor -
 	// the first page above the kernel image - and the fallback below is the machine with no device
 	// tree at all, where one range is all there is to know.
-	let region_count = match ram_banks {
-		Some((banks, count)) if count > 0 => crate::arch::common::bootmem::carve_banks(&banks[..count], paging::usable_region(0).0, &holes[..hole_count], &mut regions),
+	// THE FIRMWARE'S MAP FIRST, when the loader handed one over. Under UEFI it IS the system memory
+	// map and the device tree's `/memory` is to be ignored - the EFI map carries runtime services
+	// code and data, ACPI NVS and reclaimable regions, unusable memory, firmware reservations,
+	// loader allocations and MMIO apertures, none of which a `/memory` node expresses. Without a
+	// loader - a QEMU `-kernel` boot - there is none, and the device tree is the best source there
+	// is.
+	let mut handed_banks = [(0u64, 0u64); fdt::MAX_RAM_REGIONS];
+	let mut handed_count = 0usize;
+	if let Some((map, len)) = unsafe { crate::arch::common::bootmem::handed_memmap(BOOT_ARG.load(core::sync::atomic::Ordering::SeqCst), |phys| paging::phys_to_virt(phys)) } {
+		for region in unsafe { core::slice::from_raw_parts(map, len) } {
+			if region.kind == bootproto::MEM_USABLE && handed_count < handed_banks.len() {
+				handed_banks[handed_count] = (region.base, region.length);
+				handed_count += 1;
+			}
+		}
+		crate::serial_println!("firmware memory map: {len} region(s) from the loader, {handed_count} usable - the device tree's /memory is not used");
+	}
+	let region_count = match (handed_count > 0, ram_banks) {
+		(true, _) => crate::arch::common::bootmem::carve_banks(&handed_banks[..handed_count], paging::usable_region(0).0, 4 * 1024 * 1024 * 1024, &holes[..hole_count], &mut regions),
+		(false, Some((banks, count))) if count > 0 => crate::arch::common::bootmem::carve_banks(&banks[..count], paging::usable_region(0).0, 4 * 1024 * 1024 * 1024, &holes[..hole_count], &mut regions),
 		_ => {
 			let (region_base, region_len) = paging::usable_region(ram_top);
 			crate::arch::common::bootmem::carve(region_base, region_len, &mut holes[..hole_count], &mut regions)
