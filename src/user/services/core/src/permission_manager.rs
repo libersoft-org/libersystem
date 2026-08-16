@@ -211,11 +211,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// so an association or a command-bar line can launch something without lending it anything.
 		// `Process` would be raw process creation, and is deliberately not here.
 		//
-		// `Session` is for ONE op: a command backgrounded with `&` has to become a job the session
-		// knows about, or `jobs` and `fg` cannot see it and nothing reaps it. The narrow
-		// `session-client` is what bounds that - it exports the job list, the job signal and the
-		// job REGISTER, and not `job-take`, so this cannot reach into a job's Process handle.
-		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets, Capability::Permission, Capability::Session])),
+		// `Session` IS NOT HERE, and the reason is a defect in the grant loop rather than a policy:
+		// `VOCABULARY` does not list `Capability::Session`, so the loop never sends it - and a tool
+		// that waits for the tag blocks on a message nobody will send. `kill` has the same grant and
+		// the same problem. Granting it here would hang the manager at launch; it waits for the
+		// vocabulary to be fixed.
+		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets, Capability::Permission])),
 		b"imgconv" => Some(granted("imgconv", alloc::vec![Capability::Volumes])),
 		b"play" => Some(granted("play", alloc::vec![Capability::Volumes, Capability::AudioStream])),
 		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
@@ -841,6 +842,19 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 			close(started.task);
 			return None;
 		}
+		// THE PLACEHOLDER IS NOT OPTIONAL. A program that reads `SELECTED_FILE` has to find the tag
+		// in a fixed position whether or not it was opened over a file: `recv_tagged` BLOCKS, and a
+		// tag read where nothing was sent consumes the message that was actually next and then waits
+		// forever for one nobody will send. That is the ordered-bootstrap hazard P02M0102 records,
+		// and it reappeared here the moment a grant became conditional.
+		//
+		// Sent only to the programs that READ it, because sending it to the other fifty would shift
+		// their sequences by one - the same trap from the other side.
+		if reads_selected_file(&policy_name) && !send_blocking(manager_side, CAP_SELECTED_FILE, 0) {
+			close(manager_side);
+			close(started.task);
+			return None;
+		}
 		for &cap in VOCABULARY.iter() {
 			let granted: bool = manifest.grants.contains(&cap);
 			if granted {
@@ -1175,6 +1189,13 @@ unsafe fn run_tool_over_file(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8],
 		close(manager_side);
 		Some(started)
 	}
+}
+
+// Which programs read a `SELECTED_FILE` tag out of their bootstrap, and therefore must be sent one
+// - bare when they were not opened over a file. The same closed set `run-with-file` admits, named
+// once so the sender and the check cannot disagree about who expects the message.
+fn reads_selected_file(name: &str) -> bool {
+	matches!(name, "licoview" | "licoedit")
 }
 
 // The last component of a URI, which is the name to show a person. A grant over

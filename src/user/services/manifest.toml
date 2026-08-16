@@ -804,15 +804,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lico.lsexe"
-providers = [
-	"base-proto",
-	"lico",
-	"security-client",
-	"session-client",
-	"volume-client",
-	"storage-proto",
-	"lsrt",
-]
+providers = ["base-proto", "lico", "security-client", "volume-client", "storage-proto", "lsrt"]
 
 [[programs]]
 name = "mkdir"

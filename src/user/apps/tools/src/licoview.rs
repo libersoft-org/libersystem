@@ -41,6 +41,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 		let arg: Vec<u8> = context.arguments.clone().into_bytes();
+		// THE SELECTED-FILE TAG COMES FIRST, where the launcher sends it - before the vocabulary
+		// grants. It is always sent to this program, bare when there was no file, because a tag read
+		// where nothing arrives consumes the next message and then blocks forever.
+		let selected: u64 = recv_tagged(bootstrap, &mut buf, CAP_SELECTED_FILE).unwrap_or(0);
+		let opened: Option<SelectedFile> = if selected == 0 { None } else { recv_launch_bytes(bootstrap).as_deref().and_then(SelectedFile::decode) };
 		let volumes = VolumeSet::receive(bootstrap, &mut buf);
 		// THIS APPLICATION'S OWN ASSET DIRECTORY, and nothing else on the volume.
 		//
@@ -66,8 +71,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// ABSENT IS THE ORDINARY LAUNCH, which is why this is an `Option` rather than a
 		// requirement: `licoview PATH` typed at a shell still resolves a path against the volume
 		// bundle its own manifest grants, and that path is checked the way it always was.
-		let selected: u64 = recv_tagged(bootstrap, &mut buf, CAP_SELECTED_FILE).unwrap_or(0);
-		let opened: Option<SelectedFile> = if selected == 0 { None } else { recv_launch_bytes(bootstrap).as_deref().and_then(SelectedFile::decode) };
 		let (uri, storage) = match opened.as_ref() {
 			Some(opened) => (String::from(opened.uri.as_str()), selected),
 			None => {

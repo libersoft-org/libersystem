@@ -120,6 +120,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 		let argument: Vec<u8> = context.arguments.clone().into_bytes();
+		// THE SELECTED-FILE TAG COMES FIRST, where the launcher sends it - before the vocabulary
+		// grants. It is always sent to this program, bare when there was no file, because a tag read
+		// where nothing arrives consumes the next message and then blocks forever.
+		let selected: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_SELECTED_FILE).unwrap_or(0);
+		let opened: Option<SelectedFile> = if selected == 0 { None } else { recv_launch_bytes(bootstrap).as_deref().and_then(SelectedFile::decode) };
 		let volumes = VolumeSet::receive(bootstrap, &mut bootstrap_buffer);
 		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("");
@@ -130,8 +135,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// one file and nothing else. A read-only grant is opened read-only and SAYS SO, because an
 		// editor that let somebody type for an hour and then refused the save is worse than one
 		// that said at the top.
-		let selected: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_SELECTED_FILE).unwrap_or(0);
-		let opened: Option<SelectedFile> = if selected == 0 { None } else { recv_launch_bytes(bootstrap).as_deref().and_then(SelectedFile::decode) };
+
 		if argument.is_empty() && opened.is_none() {
 			print(b"Usage: licoedit PATH [PATH ...]\n");
 			exit();

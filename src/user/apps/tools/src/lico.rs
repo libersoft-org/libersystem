@@ -20,7 +20,6 @@ use lico::{Action, Bookmarks, Chord, CommandBar, CriteriaError, EntryKey, Focus,
 use proto::system::{EnvVar, Error, FileInfo, FileType, LaunchContext, WriterMode};
 use rt::*;
 use security_client::PermissionClient;
-use session_client::SessionClient;
 use storage_proto::path;
 use tools::{ConsoleWriter, ListDirectoryError, VolumeSet, list_volume_directory, read_volume_window};
 use volume_client::VolumeClient;
@@ -358,10 +357,6 @@ struct Manager {
 	settings: Settings,
 	permission: u64,
 	assets: u64,
-	// The session, for registering a backgrounded command as a job. Held rather than reached for,
-	// and used for exactly one op: a command started with `&` has to become a job the session knows
-	// about, or `jobs` and `fg` cannot see it and nothing ever reaps it.
-	session: u64,
 	// The environment this manager was launched with, forwarded to what it launches. A child reads
 	// what it inherited and cannot change what its parent or its session will see.
 	environment: Vec<EnvVar>,
@@ -377,15 +372,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		};
 		let argument: Vec<u8> = context.arguments.clone().into_bytes();
-		let volumes = VolumeSet::receive(bootstrap, &mut bootstrap_buffer);
+		// THE READS ARE IN THE ORDER THE LAUNCHER SENDS, and that order is `VOCABULARY`: Permission
+		// before Volumes before AppAssets. It has to be, because `recv_tagged` BLOCKS and a tag read
+		// out of turn consumes the message that was actually next - which is the ordered-bootstrap
+		// hazard P02M0102 records, reached again here by reading three grants in the wrong sequence.
+		//
 		// THE NARROW LAUNCH BROKER AND NOTHING MORE. `lico` cannot create a process; it can ask
 		// PermissionManager to start a NAMED program, which then runs under that program's own
 		// manifest. Launching from a panel lends the child nothing, because this holds nothing it
 		// could lend.
 		let permission: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, b"PERMISSION").unwrap_or(0);
+		let volumes = VolumeSet::receive(bootstrap, &mut bootstrap_buffer);
 		// This application's own asset directory, where the settings live beside the descriptors.
+		// Last in the vocabulary, so last here.
 		let assets: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_APP_ASSETS).unwrap_or(0);
-		let session: u64 = recv_tagged(bootstrap, &mut bootstrap_buffer, CAP_SESSION).unwrap_or(0);
 		let environment: Vec<EnvVar> = context.environment.clone();
 		let cwd: Vec<u8> = context.cwd.clone().into_bytes();
 		let cwd = core::str::from_utf8(&cwd).unwrap_or("vol://system");
@@ -417,7 +417,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// terminal to ask, and the program runs cooked rather than failing.
 			let owns_tty: bool = tty_set_mode(true, false);
 			if let Some(mut terminal) = TerminalGuard::enter(&mut output, options) {
-				let _ = manage(terminal.writer(), &volumes, initial, permission, assets, session, environment);
+				let _ = manage(terminal.writer(), &volumes, initial, permission, assets, environment);
 			}
 			// And back to cooked input and echo, through the same request path.
 			if owns_tty {
@@ -429,14 +429,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial: String, permission: u64, assets: u64, session: u64, environment: Vec<EnvVar>) -> bool {
+unsafe fn manage(output: &mut impl TerminalWriter, volumes: &VolumeSet, initial: String, permission: u64, assets: u64, environment: Vec<EnvVar>) -> bool {
 	unsafe {
 		// SETTINGS ARE READ BEFORE THE FIRST LISTING, so the panels come up ordered the way they
 		// were left. A file that will not read, will not parse or names a version this build does
 		// not know yields DEFAULTS - which is exactly what no file at all yields, and is why a
 		// corrupt settings file can never stop the manager starting.
 		let settings = load_settings(assets);
-		let mut manager = Manager { panels: [Panel::new(initial.clone()), Panel::new(initial)], focus: Focus::new(2), bookmarks: Bookmarks::new(), bar: CommandBar::new(), prompt: Prompt::None, pending_search: Vec::new(), job: None, menu: None, entry: Vec::new(), status: Vec::new(), settings, permission, assets, session, environment };
+		let mut manager = Manager { panels: [Panel::new(initial.clone()), Panel::new(initial)], focus: Focus::new(2), bookmarks: Bookmarks::new(), bar: CommandBar::new(), prompt: Prompt::None, pending_search: Vec::new(), job: None, menu: None, entry: Vec::new(), status: Vec::new(), settings, permission, assets, environment };
 		for panel in &mut manager.panels {
 			panel.sort = SortSpec { key: settings.sort_key, reverse: settings.reverse, directories_first: settings.directories_first, show_hidden: settings.show_hidden };
 		}
@@ -1417,15 +1417,7 @@ impl Manager {
 			// something eventually reaps it. Without that it would be a process nobody is tracking,
 			// which is the thing an `&` must not quietly produce.
 			unsafe { close(read_end) };
-			if self.session == 0 {
-				self.say(b"started, but this boot granted no session - it is not a job anything is tracking");
-				return ManagerAction::Redraw;
-			}
-			let registered = SessionClient::new(self.session).job_register(program, false, false, started.task);
-			self.say(match registered {
-				Some(Ok(_)) => b"started as a session job",
-				_ => b"started, but the session would not register it as a job",
-			});
+			self.say(b"started in the background; it is not a session job, because nothing sends this program a session grant - see the note in the milestone");
 			return ManagerAction::Redraw;
 		}
 		self.hand_over_terminal(output, read_end)

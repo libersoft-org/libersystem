@@ -4556,6 +4556,10 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("lico terminal bootstrap");
 	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
 	bootstrap.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new(), 0)).expect("lico empty arguments");
+	// IN THE ORDER THE VOCABULARY SENDS THEM: the launch broker before the volumes, the asset
+	// directory after. `recv_tagged` blocks, so a tag read out of turn consumes the message that was
+	// actually next - and this staging is hand-written, which is exactly where that goes unnoticed.
+	bootstrap.send(Message::new(b"PERMISSION".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent launch broker");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("lico system volume");
 	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent volume");
@@ -4566,7 +4570,6 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	// PermissionManager; here it gets neither, which is a state it has to run in - a manager that
 	// blocked forever waiting for a grant nobody sent would be one that could not start on a boot
 	// that granted less than the full set.
-	bootstrap.send(Message::new(b"PERMISSION".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent launch broker");
 	bootstrap.send(Message::new(b"APP_ASSETS".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent asset directory");
 
 	let mut output = alloc::vec::Vec::new();

@@ -1,7 +1,7 @@
 # Bugs / changes
 
 - architecture audit (!!!)
-- for testing of one utility, it builds the whole system from scratch (./build.sh --arch x86_64) - we should not build everything from scratch, only parts that are are not built in its current version
+- for testing of one utility, it builds the whole system from scratch (./build.sh --arch x86_64) - we should not build everything from scratch, only parts that are are not built in its current version - this command took a long time: ./build.sh --arch x86_64 >/dev/null 2>&1; ./test.sh --arch x86_64 --tags kernel,memory,component,service --timeout 1500 2>&1 | tail -4
 - create SDK not just for WASM, but for Rust and other languages too
 - h.264 codec + mp4 container + make "play" play video too (not just audio)
 - check if we have only our own implementations of image and audio decoders and encoders
