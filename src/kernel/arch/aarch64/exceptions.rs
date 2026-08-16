@@ -520,7 +520,21 @@ extern "C" fn aarch64_trap(vector: u64, frame: *mut u64) {
 	}
 
 	// Anything else reaching here is a kernel bug: report it and halt.
+	//
+	// WITH THE LINK REGISTER AND THE FRAME POINTER, because the faulting PC is often not enough to
+	// name anything. A generic monomorphised into a crate - `Result<&[u8; 8], _>::copied`, say - has
+	// one address and a hundred and thirty call sites, so `ELR` resolves to a symbol that tells you
+	// which OPERATION faulted and nothing about which code asked for it. `x30` is the caller's
+	// return address, which names the call site outright, and `x29` is the frame pointer, which is
+	// where a walk starts.
+	//
+	// The frame already holds both - `stp x28, x29, [sp, #224]` and `stp x30, x2, [sp, #240]` in
+	// the prologue above - so this is reading numbers that were being saved and thrown away.
+	const FRAME_X29: usize = 232 / 8;
+	const FRAME_X30: usize = 240 / 8;
+	let (fp, lr) = unsafe { (*frame.add(FRAME_X29), *frame.add(FRAME_X30)) };
 	crate::serial_println!("aarch64 EXCEPTION [{source} {kind_str}] EC={ec:#x} ESR={esr:#x} FAR={far:#x} ELR={elr:#x}");
+	crate::serial_println!("aarch64:   called from LR={lr:#x}, frame pointer x29={fp:#x}");
 	crate::serial_println!("aarch64: unhandled exception - halting");
 	super::halt_loop()
 }

@@ -2963,6 +2963,18 @@ impl FixtureDisk {
 
 impl fscore::BlockDevice for FixtureDisk {
 	fn read_block(&mut self, index: u64, buf: &mut [u8]) -> bool {
+		// A BUFFER THAT IS NOT A WHOLE NUMBER OF SECTORS IS REFUSED, not silently left alone.
+		//
+		// `per` is `buf.len() / SECTOR`, so a buffer shorter than one sector made the loop below run
+		// zero times - and this returned `true`. A caller then held a buffer it believed had been
+		// filled from the medium and had in fact never been touched, with the device reporting
+		// success: the "looks like it worked" failure this tree keeps finding, in the fixture that
+		// stands in for a disk.
+		//
+		// No caller does this today, which is exactly why the harness should say so if one starts.
+		if buf.is_empty() || buf.len() % Self::SECTOR != 0 {
+			return false;
+		}
 		let per = buf.len() / Self::SECTOR;
 		for s in 0..per {
 			let lba = index * per as u64 + s as u64;
@@ -2977,6 +2989,11 @@ impl fscore::BlockDevice for FixtureDisk {
 	}
 
 	fn write_block(&mut self, index: u64, buf: &[u8]) -> bool {
+		// The same rule writing: a partial sector written as nothing and reported as written is how
+		// a fixture comes to disagree with what the code under test believes it stored.
+		if buf.is_empty() || buf.len() % Self::SECTOR != 0 {
+			return false;
+		}
 		let per = buf.len() / Self::SECTOR;
 		for s in 0..per {
 			let lba = index * per as u64 + s as u64;
