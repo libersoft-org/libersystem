@@ -388,6 +388,7 @@ fn the_error_codes_are_what_they_were() {
 		(ERR_TIMED_OUT, -11),
 		(ERR_ABI_MISMATCH, -12),
 		(ERR_UNSUPPORTED, -13),
+		(ERR_INTERRUPTED, -14),
 	];
 	for (index, &(code, expected, _)) in ERRORS.iter().enumerate() {
 		assert_eq!(code, expected, "an error code moved");
