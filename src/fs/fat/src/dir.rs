@@ -340,6 +340,28 @@ pub(super) fn parse_exfat_dir(bytes: &[u8], upcase: &Upcase, at: Location) -> Re
 			i += set_len;
 			continue;
 		}
+		// THE STREAM EXTENSION'S OWN FLAGS AND ALLOCATION INVARIANTS, of which only `NoFatChain` was
+		// ever read.
+		//
+		// `GeneralSecondaryFlags` bit 0 is `AllocationPossible` and the specification fixes it to 1
+		// for a Stream Extension; bits 2..7 are reserved and must be zero. A record with neither
+		// asserted is not a Stream Extension this reader can act on, and reading its cluster fields
+		// anyway means acting on numbers the format does not vouch for.
+		//
+		// And the generic relation between the two: a nonzero `DataLength` with `FirstCluster == 0`
+		// describes bytes that live nowhere, and a `NoFatChain` allocation - a contiguous run, which
+		// is followed by ARITHMETIC rather than by the FAT - must have a real first cluster and a
+		// nonzero length or the run has no anchor at all.
+		let allocation_possible = stream[1] & 0x01 != 0;
+		let reserved_flags = stream[1] & 0xFC != 0;
+		if !allocation_possible || reserved_flags {
+			i += set_len;
+			continue;
+		}
+		if (size != 0 && first_cluster == 0) || (no_fat_chain && (first_cluster == 0 || size == 0)) {
+			i += set_len;
+			continue;
+		}
 		// A DIRECTORY HAS NO UNDEFINED TAIL. `valid_len > size` was the only check, and `resolve_dir`
 		// stores `size` for a directory - so a forged entry claiming `ValidDataLength = 512` with
 		// `DataLength = 4096` had this driver interpret 3584 bytes of undefined data as directory

@@ -3296,7 +3296,10 @@ fn an_exfat_set_with_a_trailing_vendor_entry_is_handled_whole() {
 		set[1] = 3; // stream + one name + the extra record
 		set[4] = 0x20; // attributes: archive
 		set[32] = 0xC0; // Stream Extension
-		set[32 + 1] = 0; // flags: FAT chain
+		// AllocationPossible, and a FAT chain. This fixture wrote a bare zero, which the parser now
+		// refuses: bit 0 is `AllocationPossible` and the specification fixes it to 1 for a Stream
+		// Extension, so a record without it is not one this reader may take cluster numbers from.
+		set[32 + 1] = 0x01;
 		set[32 + 3] = name.len() as u8;
 		let hash = crate::dir::exfat_name_hash_for_test(&name, &upcase);
 		set[32 + 4..32 + 6].copy_from_slice(&hash.to_le_bytes());
@@ -3824,4 +3827,153 @@ fn a_flush_that_fails_after_the_commit_does_not_report_the_write_as_failed() {
 	let outcome = fs.write_file(b"A.TXT", b"second");
 	assert!(outcome.is_ok(), "a flush failing after the commit is not the write failing: {outcome:?}");
 	assert_eq!(fs.read_file(b"A.TXT").expect("read back"), b"second", "and the committed contents are what the file holds");
+}
+
+#[test]
+fn mirrored_fat_copies_that_disagree_do_not_stay_writable() {
+	// `set_fat_entry` keeps future writes identical across every copy, which is not the same as
+	// checking what is already on the medium. With mirroring enabled every read and every ownership
+	// decision uses copy 0 and nothing ever looked at the others - so two copies carrying different
+	// but individually in-range chains both pass their own audit, this driver and a foreign
+	// implementation reading another copy disagree about where a file's data is, and the mount
+	// stayed WRITABLE over that disagreement.
+	for (label, kind) in [("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
+		let img = build_fat(kind, &[File { path: "HELLO.TXT", data: b"hi" }]);
+		let fs = FatFs::mount(MemDisk { data: img.clone() }).expect("mount");
+		assert!(!fs.is_degraded(), "{label}: the unmodified fixture mounts writable");
+
+		// Find where the second copy starts and change one byte of it - a difference that is not
+		// otherwise detectable, because copy 0 is what everything reads.
+		let bytes_per_sector = u16::from_le_bytes([img[11], img[12]]) as usize;
+		let reserved = u16::from_le_bytes([img[14], img[15]]) as usize;
+		let fat16_size = u16::from_le_bytes([img[22], img[23]]) as usize;
+		let fat_size = if fat16_size != 0 { fat16_size } else { u32::from_le_bytes([img[36], img[37], img[38], img[39]]) as usize };
+		let second = (reserved + fat_size) * bytes_per_sector;
+
+		let mut skewed = img;
+		skewed[second + 8] ^= 0xFF;
+		let fs = FatFs::mount(MemDisk { data: skewed }).expect("it still mounts - the volume is readable through the copy this build uses");
+		assert!(fs.is_degraded(), "{label}: a volume whose two records of the allocation map differ is not one to write to");
+	}
+}
+
+#[test]
+fn a_name_two_entries_claim_may_be_read_but_not_written() {
+	// Neither directory parser checks uniqueness, so two entries can fold to one name - through the
+	// volume's up-casing table or a classic 8.3 alias - while owning different chains. `find_entry`,
+	// remove and overwrite each take the FIRST match, so a remove leaves the other file's clusters
+	// allocated with nothing naming them, and an overwrite replaces one of two things the caller
+	// cannot tell apart.
+	//
+	// READS STILL WORK, and that is not an oversight: classic FAT's two-phase publish deliberately
+	// leaves both names live after an uncertain commit, and classic FAT has no durable dirty marker,
+	// so a volume can legitimately be mounted in this state after a reboot. A file that survived a
+	// crash has to stay readable. What must not happen is a WRITE choosing one of two by position.
+	let img = build_fat(Kind::Fat16, &[File { path: "SAME.TXT", data: b"first" }, File { path: "OTHER.TXT", data: b"second" }]);
+
+	// Rename the second entry's 8.3 name to the first's, so two live entries claim one name.
+	let at = img.windows(11).position(|w| w == b"OTHER   TXT").expect("the fixture writes OTHER.TXT");
+	let mut collided = img;
+	collided[at..at + 11].copy_from_slice(b"SAME    TXT");
+
+	let mut fs = FatFs::mount(MemDisk { data: collided }).expect("the volume still mounts");
+	assert!(fs.read_file(b"SAME.TXT").is_ok(), "a duplicated name is still readable - a crash can produce this state");
+	assert_eq!(fs.write_file(b"SAME.TXT", b"third"), Err(FsError::Corrupt), "but an overwrite would replace one of two by position");
+	assert_eq!(fs.remove(b"SAME.TXT"), Err(FsError::Corrupt), "and a remove would leave the other file's clusters behind");
+}
+
+#[test]
+fn a_stream_extension_that_breaks_its_own_invariants_is_not_a_file() {
+	// The parser read only `NoFatChain` out of `GeneralSecondaryFlags`. The specification fixes bit
+	// 0 - `AllocationPossible` - to 1 for a Stream Extension and reserves bits 2..7, and it fixes
+	// the relation between `FirstCluster` and `DataLength`: a nonzero length with no first cluster
+	// describes bytes that live nowhere, and a `NoFatChain` run - followed by ARITHMETIC rather than
+	// by the FAT - has no anchor without a real first cluster and a nonzero length.
+	//
+	// A record that breaks any of these is not a Stream Extension this reader may take cluster
+	// numbers from, and taking them anyway means acting on numbers the format does not vouch for.
+	let upcase = crate::dir::Upcase::ascii();
+	let build = |flags: u8, cluster: u32, size: u64| -> Vec<u8> {
+		let mut set = alloc::vec![0u8; 96];
+		let name: Vec<u16> = "A".encode_utf16().collect();
+		set[0] = 0x85;
+		set[1] = 2;
+		set[4] = 0x20;
+		set[32] = 0xC0;
+		set[32 + 1] = flags;
+		set[32 + 3] = name.len() as u8;
+		let hash = crate::dir::exfat_name_hash_for_test(&name, &upcase);
+		set[32 + 4..32 + 6].copy_from_slice(&hash.to_le_bytes());
+		set[32 + 20..32 + 24].copy_from_slice(&cluster.to_le_bytes());
+		set[32 + 24..32 + 32].copy_from_slice(&size.to_le_bytes());
+		set[32 + 8..32 + 16].copy_from_slice(&size.to_le_bytes());
+		set[64] = 0xC1;
+		set[64 + 2..64 + 4].copy_from_slice(&name[0].to_le_bytes());
+		let sum = crate::dir::exfat_set_checksum(&set);
+		set[2..4].copy_from_slice(&sum.to_le_bytes());
+		set
+	};
+
+	// The well-formed shape first, so every refusal below is known to be about what it changed.
+	assert_eq!(crate::dir::parse_exfat_dir(&build(0x01, 5, 1), &upcase, crate::dir::Location::Root).expect("parses").len(), 1, "an ordinary chained file");
+	assert_eq!(crate::dir::parse_exfat_dir(&build(0x03, 5, 1), &upcase, crate::dir::Location::Root).expect("parses").len(), 1, "and an ordinary contiguous one");
+
+	for (flags, cluster, size, why) in [
+		(0x00u8, 5u32, 1u64, "AllocationPossible is not set"),
+		(0x05, 5, 1, "a reserved flag bit is set"),
+		(0x80, 5, 1, "the top reserved bit is set"),
+		(0x01, 0, 1, "a nonzero length with no first cluster"),
+		(0x03, 0, 1, "a contiguous run with no first cluster"),
+		(0x03, 5, 0, "a contiguous run of no length"),
+	] {
+		let entries = crate::dir::parse_exfat_dir(&build(flags, cluster, size), &upcase, crate::dir::Location::Root).expect("the directory still parses");
+		assert!(entries.is_empty(), "{why}: flags {flags:#04x} cluster {cluster} size {size} -> {} entries", entries.len());
+	}
+}
+
+#[test]
+fn a_mount_says_why_it_failed_rather_than_only_that_it_did() {
+	// `mount` answered `Option`, so boot-sector I/O, absent media, an unsupported layout, a failed
+	// checksum, truncated geometry and a refused allocation were ONE word - and StorageService
+	// turns that word into `NotFound`, telling an operator the volume is not there when the truth
+	// may be a cable. Each of these sends somebody somewhere different.
+	let img = build_fat(Kind::Fat16, &[File { path: "HELLO.TXT", data: b"hi" }]);
+	assert!(FatFs::mount_checked(MemDisk { data: img.clone() }).is_ok(), "the fixture mounts");
+
+	// Not FAT at all: no boot signature. A "try another backend" answer.
+	let mut blank = img.clone();
+	blank[510] = 0;
+	blank[511] = 0;
+	assert_eq!(FatFs::mount_checked(MemDisk { data: blank }).err(), Some(MountError::NotFat), "no boot signature is not a damaged FAT volume");
+
+	// A geometry this build cannot act on: zero sectors per cluster.
+	let mut impossible = img.clone();
+	impossible[13] = 0;
+	assert_eq!(FatFs::mount_checked(MemDisk { data: impossible }).err(), Some(MountError::Unsupported), "an impossible geometry is not a missing volume");
+
+	// Truncated media: the geometry claims a sector the device will not answer for.
+	let mut short = img;
+	short.truncate(SECTOR_SIZE * 4);
+	assert_eq!(FatFs::mount_checked(MemDisk { data: short }).err(), Some(MountError::Io), "a device that will not answer is the DEVICE");
+
+	// And `mount` is still the convenience over it, so no caller had to change.
+	assert!(FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, &[File { path: "A.TXT", data: b"x" }]) }).is_some());
+}
+
+#[test]
+fn an_exfat_bitmap_too_short_for_the_heap_is_not_a_volume_to_write_to() {
+	// Any `DataLength` was accepted, and the ownership audit only inspects bits for clusters that
+	// are actually claimed - so if every system and live allocation falls inside the covered prefix,
+	// a SHORT bitmap passes and the mount stays writable. `free_bytes` and `exfat_alloc` then treat
+	// every cluster past the prefix as unavailable, so the volume reports less free space than its
+	// own geometry contains and can answer `NoSpace` while most of the heap is simply unreachable.
+	let img = build_exfat(&[File { path: "HELLO.TXT", data: b"hi" }]);
+	assert!(FatFs::mount(MemDisk { data: img.clone() }).is_some(), "the fixture mounts");
+
+	// Halve the Allocation Bitmap's declared length. Its entry is the `0x81` record in the root.
+	let root = img.windows(1).position(|w| w[0] == 0x81).expect("the fixture writes an allocation bitmap entry");
+	let mut short = img;
+	let size = u64::from_le_bytes(short[root + 24..root + 32].try_into().unwrap());
+	short[root + 24..root + 32].copy_from_slice(&(size / 2).to_le_bytes());
+	assert!(FatFs::mount(MemDisk { data: short }).is_none(), "a bitmap that cannot describe the heap it belongs to is not a volume this driver acts on");
 }

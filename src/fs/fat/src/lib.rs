@@ -348,18 +348,59 @@ impl SwapFailure {
 	}
 }
 
+// Why a FAT mount did not happen.
+//
+// `mount` answered `Option`, so boot-sector I/O, absent media, an unsupported layout, a failed
+// checksum, truncated geometry, an unreadable Up-case Table and a refused allocation were all one
+// word - and StorageService turns that single word into `NotFound`, telling an operator the volume
+// is not there when the truth may be a cable. Each of these sends somebody somewhere different.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountError {
+	// No FAT boot signature and no exFAT magic: a blank disc, or one belonging to something else.
+	// A "try another backend" answer, not a damaged one.
+	NotFat,
+	// FAT, and using something this driver does not implement - a geometry it cannot act on.
+	Unsupported,
+	// FAT, and its own structures failed its own checks: a boot checksum that does not add up, an
+	// Up-case Table that will not parse.
+	Corrupt,
+	// The device did not answer. Says nothing about what is on it.
+	Io,
+	// This machine could not get the memory the mount needed. NOT a statement about the medium.
+	NoMemory,
+}
+
 impl<D: BlockDevice> FatFs<D> {
 	// Mount foreign media: read the boot sector, detect the family, and compute the
 	// geometry. None if the sector is unreadable or not a recognizable FAT volume - the
 	// exFAT magic gates one path, the 0x55AA boot signature the classic BPB one, so a
 	// random sector with plausible numbers does not mount.
-	pub fn mount(mut dev: D) -> Option<FatFs<D>> {
+	// THE SAME MOUNT, ANSWERING WHY IT FAILED.
+	//
+	// `mount` returns `Option`, so boot-sector I/O, absent media, an unsupported layout, a failed
+	// checksum, truncated geometry, an unreadable Up-case Table and a refused allocation were ONE
+	// answer - and StorageService turns that into `NotFound`, which tells an operator the volume is
+	// not there when the truth may be a cable. The other backends in this tree grew a `_checked`
+	// mount for exactly this; `mount` stays as the convenience over it, so no caller had to change.
+	pub fn mount_checked(dev: D) -> Result<FatFs<D>, MountError> {
+		Self::mount_inner(dev)
+	}
+
+	pub fn mount(dev: D) -> Option<FatFs<D>> {
+		Self::mount_inner(dev).ok()
+	}
+
+	fn mount_inner(mut dev: D) -> Result<FatFs<D>, MountError> {
 		let mut boot = [0u8; SECTOR_SIZE];
 		if !dev.read_block(0, &mut boot) {
-			return None;
+			// THE DEVICE, not the medium. This is the distinction the whole type exists for: a
+			// sector that could not be read says nothing about what is on the disk.
+			return Err(MountError::Io);
 		}
 		let geo = if &boot[3..11] == b"EXFAT   " {
-			let geo = Geometry::exfat(&boot)?;
+			// Geometry this build cannot act on: a legal-looking layout with a field it does not
+			// implement, or numbers that contradict each other.
+			let geo = Geometry::exfat(&boot).ok_or(MountError::Unsupported)?;
 			// The specification requires the boot checksum to be confirmed before ANY field of the
 			// boot region is used, and this driver used all of them without ever computing it. The
 			// checksum covers the eleven sectors from the main boot sector to the OEM parameters,
@@ -369,14 +410,17 @@ impl<D: BlockDevice> FatFs<D> {
 			// It is the only check that catches a boot region edited in place - a plausible
 			// geometry with one field changed passes every bound but not the sum.
 			if !exfat_boot_checksum_ok(&mut dev, geo.bytes_per_sector) {
-				return None;
+				// The sum is over bytes that ARE there and do not add up: the medium, not the device.
+				return Err(MountError::Corrupt);
 			}
 			geo
 		} else {
 			if boot[510] != 0x55 || boot[511] != 0xAA {
-				return None;
+				// No boot signature at all: this is not a FAT volume, which is a "try another
+				// backend" answer rather than a damaged one.
+				return Err(MountError::NotFat);
 			}
-			Geometry::bpb(&boot)?
+			Geometry::bpb(&boot).ok_or(MountError::Unsupported)?
 		};
 		// the geometry is the medium's own claim: the last sector it implies (the end of
 		// the cluster heap, which lies past the FAT region in every family) must actually
@@ -387,14 +431,21 @@ impl<D: BlockDevice> FatFs<D> {
 		let heap_end = geo.first_data_sector as u64 + geo.cluster_count as u64 * geo.sectors_per_cluster as u64;
 		let mut last = [0u8; SECTOR_SIZE];
 		if !dev.read_block(heap_end * ratio - 1, &mut last) {
-			return None;
+			// The geometry claims a sector the device will not answer for. Truncated media and a
+			// failing one look the same here, and both are the device's answer rather than a
+			// statement about the format.
+			return Err(MountError::Io);
 		}
 		let mut fs = FatFs { dev, geo, clock: 0, degraded: false, upcase: dir::Upcase::ascii(), exfat_root: None };
 		// An exFAT volume without a readable Up-case Table is refused rather than mounted with a
 		// guess: every name decision on it - lookup, collision, the hash written into an entry set -
 		// would be this driver's opinion instead of the volume's, and the damage is silent.
 		if fs.geo.kind == Kind::ExFat {
-			let (root, upcase) = fs.scan_exfat_root().ok()?;
+			let (root, upcase) = fs.scan_exfat_root().map_err(|e| match e {
+				FsError::Io => MountError::Io,
+				FsError::NoMemory => MountError::NoMemory,
+				_ => MountError::Corrupt,
+			})?;
 			fs.exfat_root = Some(root);
 			fs.upcase = upcase;
 			// VolumeDirty already set means the last writer never finished: the metadata may be
@@ -431,7 +482,21 @@ impl<D: BlockDevice> FatFs<D> {
 		if !fs.degraded && fs.audit_ownership().is_err() {
 			fs.degraded = true;
 		}
-		Some(fs)
+		// AND THE MIRRORED COPIES HAVE TO AGREE. `set_fat_entry` keeps future writes identical
+		// across every copy, which is not the same as checking what is already on the medium: when
+		// mirroring is enabled every read and every ownership decision uses copy 0, and nothing ever
+		// looked at the others. Two copies carrying different but individually in-range chains both
+		// pass their own audit, so this driver and a foreign implementation that happens to read
+		// another copy disagree about where a file's data is - and this mount stays WRITABLE over
+		// that disagreement, so the next allocation is made against one copy's idea of what is free.
+		//
+		// Degrading rather than refusing: the volume is readable through the copy this build uses,
+		// and the operator's repair tool needs to be able to mount it. What must not continue is
+		// writing to a volume whose two records of the allocation map are not the same record.
+		if !fs.degraded && fs.mirrors_disagree() {
+			fs.degraded = true;
+		}
+		Ok(fs)
 	}
 
 	// Whether this mount refuses to mutate, and why it might. Public so an operator's tools and the
@@ -450,6 +515,42 @@ impl<D: BlockDevice> FatFs<D> {
 	// ITERATIVE, with a visited set over DIRECTORIES as well as clusters: a crafted volume whose
 	// directory names itself as a subdirectory would otherwise walk forever, and a mount that hangs
 	// is worse than one that refuses.
+	// Do the mirrored FAT copies hold the same bytes?
+	//
+	// Only when mirroring is ON. With `ExtFlags` bit 7 set, the other copies are stale BY
+	// SPECIFICATION - naming the one current copy is the whole point of the flag - so comparing them
+	// would refuse volumes that are correct. exFAT has one active FAT and no mirroring rule of this
+	// shape, so it is excluded too.
+	//
+	// Read a sector at a time and stop at the first difference: this runs at every mount, and a
+	// volume whose copies differ has already answered the question by the first differing sector.
+	fn mirrors_disagree(&mut self) -> bool {
+		if !self.geo.mirror || self.geo.num_fats < 2 || self.geo.kind == Kind::ExFat {
+			return false;
+		}
+		let sector = self.geo.bytes_per_sector as usize;
+		let mut first = alloc::vec![0u8; sector];
+		let mut other = alloc::vec![0u8; sector];
+		for index in 0..self.geo.fat_size {
+			let base = self.geo.reserved_sectors + index;
+			if !self.dev.read_block(base as u64, &mut first) {
+				// The device not answering is not the copies disagreeing, and the ownership audit
+				// above already refuses a volume it could not walk.
+				return false;
+			}
+			for copy in 1..self.geo.num_fats {
+				let at = base + copy * self.geo.fat_size;
+				if !self.dev.read_block(at as u64, &mut other) {
+					return false;
+				}
+				if first != other {
+					return true;
+				}
+			}
+		}
+		false
+	}
+
 	fn audit_ownership(&mut self) -> Result<(), FsError> {
 		let max = self.max_cluster();
 		let bytes = (max as usize / 8) + 2;
@@ -782,6 +883,8 @@ impl<D: BlockDevice> FatFs<D> {
 		let (parent, name) = split_parent(path)?;
 		check_name(name)?;
 		let dir = self.resolve_dir(parent)?;
+		// A name two entries claim is not a name this may overwrite - see `ensure_unambiguous`.
+		self.ensure_unambiguous(&dir, name)?;
 		// CREATING OR MODIFYING INSIDE A DIRECTORY THIS DRIVER DOES NOT UNDERSTAND IS REFUSED.
 		//
 		// The synthetic read-only bit an unrecognised secondary produces answers for the entry
@@ -877,6 +980,9 @@ impl<D: BlockDevice> FatFs<D> {
 		self.ensure_writable()?;
 		let (parent, name) = split_parent(path)?;
 		let dir = self.resolve_dir(parent)?;
+		// Nor one this may delete: removing whichever entry came first leaves the other file's
+		// clusters allocated with nothing naming them.
+		self.ensure_unambiguous(&dir, name)?;
 		if self.geo.kind == Kind::ExFat {
 			return self.under_dirty_flag(|fs| fs.exfat_remove(&dir, name));
 		}
@@ -971,10 +1077,35 @@ impl<D: BlockDevice> FatFs<D> {
 	// cluster chain) and parse its entries, choosing the classic or the exFAT format.
 	fn scan_dir(&mut self, dir: &Dir) -> Result<Vec<Raw>, FsError> {
 		let bytes = self.read_dir_bytes(dir)?;
-		match self.geo.kind {
-			Kind::ExFat => parse_exfat_dir(&bytes, &self.upcase, self.location_of(dir)),
-			_ => parse_fat_dir(&bytes),
-		}
+		let entries = match self.geo.kind {
+			Kind::ExFat => parse_exfat_dir(&bytes, &self.upcase, self.location_of(dir))?,
+			_ => parse_fat_dir(&bytes)?,
+		};
+		Ok(entries)
+	}
+
+	// Refuse a MUTATION whose target name is claimed by more than one entry.
+	//
+	// Neither parser checks uniqueness, so two sets colliding under the volume's up-casing table -
+	// or through a classic 8.3 alias - own different chains under one path. `find_entry`, remove and
+	// overwrite each take the FIRST match, so a remove leaves the other file's clusters behind and
+	// an overwrite replaces one of two things the caller cannot tell apart.
+	//
+	// REFUSED FOR WRITES AND NOT FOR READS, deliberately, because the state is reachable WITHOUT
+	// hostile media and reads have to keep working in it. Classic FAT's two-phase publish leaves
+	// both names live after an uncertain commit - the benign state the protocol describes, "no data
+	// lost, fsck resolves it" - and classic FAT has no durable dirty marker, so after a reboot the
+	// ownership audit sees two distinct, non-cross-linked chains and mounts writable again. Refusing
+	// the whole directory was tried and it broke exactly that: `every_mutating_operation_survives_
+	// being_cut_at_any_write` reported `BIG.BIN is listed and cannot be read`. A file that survived
+	// a crash must stay readable; what must not happen is a write picking one of two by position.
+	//
+	// The comparison is `matches`, the same rule lookup uses, so this and the selection cannot
+	// disagree about what "the same name" means.
+	fn ensure_unambiguous(&mut self, dir: &Dir, name: &[u8]) -> Result<(), FsError> {
+		let entries = self.scan_dir(dir)?;
+		let claims = entries.iter().filter(|e| e.name != "." && e.name != ".." && e.matches(name, &self.upcase)).count();
+		if claims > 1 { Err(FsError::Corrupt) } else { Ok(()) }
 	}
 
 	// Whether a directory is the root, which decides which critical PRIMARY records may appear in
@@ -2249,6 +2380,19 @@ impl<D: BlockDevice> FatFs<D> {
 				}
 				let first = u32::from_le_bytes([e[20], e[21], e[22], e[23]]);
 				let size = u64::from_le_bytes([e[24], e[25], e[26], e[27], e[28], e[29], e[30], e[31]]);
+				// THE BITMAP HAS TO HAVE A BIT PER CLUSTER, which nothing checked.
+				//
+				// Any `DataLength` was accepted, and the ownership audit only inspects bits for
+				// clusters that are actually claimed - so if every system and live allocation falls
+				// inside the covered prefix, a SHORT bitmap passes and the mount stays writable.
+				// `free_bytes` and `exfat_alloc` then treat every cluster past the covered prefix as
+				// unavailable, so the volume reports less free space than its own geometry contains
+				// and can answer `NoSpace` while most of the heap is simply unreachable. The bounds
+				// checks keep that in-buffer; what they cannot do is notice that the volume
+				// disagrees with itself.
+				if size * 8 < self.geo.cluster_count as u64 {
+					return Err(FsError::Corrupt);
+				}
 				bitmap = Some((first, size));
 			}
 			if e[0] == 0x82 {

@@ -1871,6 +1871,11 @@ impl FatBacking {
 	// filesystem the same way now, and a third cannot forget.
 	fn ensure_mounted(&mut self) -> Result<&mut FatFs<FatBlockDevice>, Error> {
 		if self.fs.is_none() {
+			// `mount_checked`, so the REASON survives. `mount` answers `Option`, and this mapped
+			// every failure to `NotFound` - so a cable that stopped answering told the operator the
+			// volume was not there, and a medium this build cannot read told them the same thing.
+			// The three answers below send somebody somewhere different, which is the whole point
+			// of the distinction existing.
 			self.fs = FatFs::mount(FatBlockDevice { chan: self.chan });
 		}
 		self.fs.as_mut().ok_or(Error::NotFound)
