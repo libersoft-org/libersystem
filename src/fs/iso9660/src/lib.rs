@@ -998,7 +998,7 @@ fn parse_record(rec: &[u8], joliet: bool, rrip: bool, skip: usize) -> Result<Opt
 	// The decode's cost is paid for a record that is then discarded, which is the price of the
 	// claim being true.
 	let special = id_len == 1 && (id[0] == 0 || id[0] == 1);
-	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip).ok_or(FsError::Corrupt)? };
+	let (name, case_sensitive) = if special { (String::from(if id[0] == 0 { "." } else { ".." }), false) } else { decode_name(id, rec, id_len, joliet, rrip, skip)? };
 	// The decoded name has to BE a name: one path component, with nothing in it that makes a lookup
 	// mean something other than what the listing showed.
 	if !special {
@@ -1036,14 +1036,23 @@ fn validate_component(name: &str, joliet: bool) -> Result<(), FsError> {
 
 // Decode an entry name. Joliet is big-endian UCS-2; otherwise a Rock Ridge NM entry in
 // the system-use area wins, falling back to plain ASCII 8.3 with ";version" dropped.
-fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, skip: usize) -> Option<(String, bool)> {
+// THE THREE ANSWERS A NAME DECODE HAS, told apart.
+//
+// This returned `Option`, and `parse_record` turned every `None` into `FsError::Corrupt`. So a
+// failed reservation - a healthy disc read on a machine briefly short of memory - was reported as a
+// DAMAGED MEDIUM, which sends a person to replace media that is fine. The Rock Ridge arm was worse:
+// there a reserve failure read as "this record has no NM entry" and the reader fell back to the
+// primary ISO namespace, so a file appeared under a different name than the disc intends.
+//
+// `Err(NoMemory)` is now distinct from `Err(Corrupt)`, and absence stays absence.
+fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, skip: usize) -> Result<(String, bool), FsError> {
 	if joliet {
 		// An odd length is corruption and an invalid unit is corruption, and neither may become a
 		// NAME. `chunks_exact(2)` dropped a trailing odd byte and an unpaired surrogate became '?',
 		// so two distinct damaged identifiers could collide on one name - and that name is the
 		// lookup key.
 		if id.len() % 2 != 0 {
-			return None;
+			return Err(FsError::Corrupt);
 		}
 		// RESERVED UP FRONT, FALLIBLY. `read_dir` reserves with `try_reserve` and returns
 		// `NoMemory`, and the NAMES on the same path used `String::new` and `push` with no
@@ -1053,30 +1062,34 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, s
 		// step left. Worst case is three UTF-8 bytes per UCS-2 unit.
 		let mut s = String::new();
 		if s.try_reserve(id.len() / 2 * 3).is_err() {
-			return None;
+			return Err(FsError::NoMemory);
 		}
 		for c in id.chunks_exact(2) {
 			let u = u16::from_be_bytes([c[0], c[1]]);
 			if u == b';' as u16 {
 				break;
 			}
-			s.push(char::from_u32(u as u32)?);
+			// An invalid UCS-2 unit is corruption in the identifier, not a shortage.
+			let Some(c) = char::from_u32(u as u32) else {
+				return Err(FsError::Corrupt);
+			};
+			s.push(c);
 		}
-		return Some((s, true));
+		return Ok((s, true));
 	}
 	let sys_off = 33 + id_len + (id_len % 2 == 0) as usize;
 	// a malformed record can end exactly after its identifier (the pad byte missing) -
 	// there is no system-use area to read then, never a slice past the record.
 	if let Some(sys) = rec.get(sys_off..)
-		&& let Some(n) = rock_ridge_name(sys, rrip, skip)
+		&& let Some(n) = rock_ridge_name(sys, rrip, skip)?
 	{
-		return Some((n, true));
+		return Ok((n, true));
 	}
 	let mut s = String::new();
 	// The same reservation as the Joliet arm: one byte per identifier byte is enough, because the
 	// identifier is ASCII-oriented and a byte above 0x7F costs at most two.
 	if s.try_reserve(id.len() * 2).is_err() {
-		return None;
+		return Err(FsError::NoMemory);
 	}
 	for &b in id {
 		if b == b';' {
@@ -1087,7 +1100,7 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, s
 	if s.ends_with('.') {
 		s.pop();
 	}
-	Some((s, false))
+	Ok((s, false))
 }
 
 // The Rock Ridge name in a System Use Area, when RRIP is actually in use and the entries this
@@ -1099,9 +1112,12 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, s
 // whose area happens to contain those two bytes had its filenames replaced by whatever followed.
 //
 // `skip` is SUSP's own offset into the area, from the root's `SP` entry.
-fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
+// `Ok(None)` is a record with no usable `NM`, which is ordinary; `Err(NoMemory)` is this machine
+// being short, which must never be mistaken for it - falling back to the ISO name on a memory
+// shortage renames a file for a reason that has nothing to do with the disc.
+fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Result<Option<String>, FsError> {
 	if !rrip || skip > sys.len() {
-		return None;
+		return Ok(None);
 	}
 	let sys = &sys[skip..];
 	let mut out = String::new();
@@ -1109,7 +1125,7 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 	// longer than the record that holds it. Reserved once so the pushes below cannot be the one
 	// infallible allocation on an otherwise fallible path.
 	if out.try_reserve(sys.len()).is_err() {
-		return None;
+		return Err(FsError::NoMemory);
 	}
 	// ONE SUSP PARSER. This walked the area itself - its own length and signature decode, reading
 	// `sys[off + 2]` and `sys[off..off + 2]` and never `sys[off + 3]` - so the version rule the
@@ -1160,9 +1176,9 @@ fn rock_ridge_name(sys: &[u8], rrip: bool, skip: usize) -> Option<String> {
 		Ok(())
 	});
 	if walked.is_err() {
-		return None;
+		return Ok(None);
 	}
-	if out.is_empty() { None } else { Some(out) }
+	Ok(if out.is_empty() { None } else { Some(out) })
 }
 
 // Does this System Use Area open with a SUSP `SP` entry, and if so what offset does it declare?

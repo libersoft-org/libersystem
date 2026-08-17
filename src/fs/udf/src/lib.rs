@@ -128,6 +128,13 @@ pub enum MountError {
 	Corrupt,
 	// The device did not answer. Says nothing about what is on it.
 	Io,
+	// This machine could not get the memory the mount needed. NOT a statement about the medium.
+	//
+	// It was `Corrupt`, which is the wrong answer in the most expensive direction: it sends a person
+	// to replace a disc that is fine, and it makes the failure look permanent when retrying under
+	// less pressure would succeed. `LiberFS` has drawn this distinction since its own audit; the
+	// three other backends in this tree drew it too, and this one had not.
+	NoMemory,
 }
 
 impl Geometry {
@@ -334,7 +341,7 @@ impl<D: BlockDevice> Udf<D> {
 						Some(_) => {}
 						None => {
 							if partitions.try_reserve(1).is_err() {
-								return Err(MountError::Corrupt);
+								return Err(MountError::NoMemory);
 							}
 							partitions.push(entry);
 						}
