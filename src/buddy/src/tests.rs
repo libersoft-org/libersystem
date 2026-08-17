@@ -549,3 +549,110 @@ fn random_extents_and_random_workloads_never_hand_a_page_out_twice() {
 		pool.check();
 	}
 }
+
+#[test]
+fn the_metadata_cost_is_what_the_module_says_it_is() {
+	// THE EXAMPLE IN THE MODULE COMMENT, DERIVED RATHER THAN TYPED. It said 128 KiB for a 4 GiB
+	// machine and the real figure is 256 KiB - `pages / 4` where `pages` is 1,048,576, not 524,288.
+	// The arithmetic beside it was right and only the worked example was wrong, so nothing failed:
+	// the implementation reports the true cost and only a person planning boot memory from the
+	// prose would ever have been misled. Deriving it here is what stops that happening again.
+	const GIB: u64 = 1024 * 1024 * 1024;
+	let four_gib = Buddy::new(0, 4 * GIB / PAGE_SIZE).expect("metadata for a 4 GiB extent");
+	// In KiB, which is the unit the sentence is written in - the exact byte count carries a few
+	// words of per-order rounding on top, and pinning those would make this a test of `div_ceil`
+	// rather than of the claim.
+	assert_eq!(four_gib.metadata_bytes() / 1024, 256, "the module says 256 KiB for a 4 GiB machine; it reports {} bytes", four_gib.metadata_bytes());
+	assert!(four_gib.metadata_bytes() / 1024 != 128, "and it is emphatically not the 128 KiB the comment used to claim");
+
+	// The general shape the sentence claims, at four sizes: two bits per page, plus at most one
+	// 64-bit word of rounding per order. A bound rather than an equality, because the tail word is
+	// what the rounding costs and it is the part an example hides.
+	for pages in [1u64, 100, 512 * 1024 * 1024 / PAGE_SIZE, 4 * GIB / PAGE_SIZE] {
+		let pool = Buddy::new(0, pages).expect("metadata");
+		let slack = 8 * (MAX_ORDER as u64 + 1);
+		assert!(pool.metadata_bytes() as u64 <= pages / 4 + slack, "{pages} pages cost {} bytes, past two bits per page plus one word per order", pool.metadata_bytes());
+	}
+}
+
+#[test]
+fn a_partly_overlapping_span_keeps_every_page_that_was_not_already_free() {
+	// THE DEFECT THIS MILESTONE IS NAMED FOR, REACHED THROUGH SEEDING RATHER THAN A DOUBLE FREE.
+	//
+	// `free_span` frames a span into the largest aligned blocks it contains and hands each to
+	// `free`, which refuses any block overlapping an existing free one. The loop then advanced by
+	// the WHOLE block whether the free was accepted or not - so a single already-free page inside a
+	// chosen order-3 block discarded the other seven. Seven pages that overlapped nothing, that no
+	// allocation can find again, and the only trace is a smaller number coming back.
+	//
+	// Every position in turn, because the greedy framing is what decides which block is chosen and
+	// the original fixture happened to put its overlap on a boundary where old and new pages fall
+	// into different blocks. That is why it passed.
+	for already_free in 0..8u64 {
+		let mut pool = Buddy::new(0, 8).expect("an 8-page extent");
+		assert_eq!(pool.free_span(already_free * PAGE_SIZE, 1), 1, "seed one page");
+		assert_eq!(pool.free_pages(), 1);
+
+		let taken = pool.free_span(0, 8);
+		assert_eq!(taken, 7, "page {already_free} was already free, so seven pages are newly taken");
+		assert_eq!(pool.free_pages(), 8, "and the whole extent is now free");
+
+		// The property directly: every page is represented exactly once across the free set.
+		let mut seen = vec![0u32; 8];
+		pool.for_each_free_block(|order, phys| {
+			let first = (phys / PAGE_SIZE) as usize;
+			for page in 0..(1usize << order) {
+				seen[first + page] += 1;
+			}
+		});
+		assert!(seen.iter().all(|count| *count == 1), "overlap at page {already_free}: {seen:?}");
+
+		// And all eight can be handed out, which is the only thing that proves they were not lost.
+		let mut handed = 0;
+		while pool.alloc(0).is_some() {
+			handed += 1;
+		}
+		assert_eq!(handed, 8, "every page of the extent is allocatable after the overlapping seed");
+	}
+}
+
+#[test]
+fn construction_refuses_an_extent_that_is_not_one() {
+	// `new` returns `Option` in order to BE the validation boundary, and it validated nothing: any
+	// base, any page count. An unaligned base is the sharpest case, because `free` checks alignment
+	// relative to `self.base` - so an unaligned base lets equally unaligned addresses through every
+	// later check, and the allocator hands out physical addresses that are not frames.
+	assert!(Buddy::new(0, 0).is_none(), "zero pages is not an extent");
+	assert!(Buddy::new(1, 1).is_none(), "an unaligned base would make page 0 physical address 1");
+	assert!(Buddy::new(PAGE_SIZE - 1, 4).is_none());
+	assert!(Buddy::new(u64::MAX - PAGE_SIZE + 1, 2).is_none(), "an extent whose end leaves the address space");
+	assert!(Buddy::new(0, u64::MAX).is_none(), "a byte length that overflows");
+
+	// And the shapes that ARE extents still build, including the largest one that fits.
+	assert!(Buddy::new(0, 1).is_some());
+	assert!(Buddy::new(PAGE_SIZE, 100).is_some());
+	let top = Buddy::new(u64::MAX - PAGE_SIZE + 1 - PAGE_SIZE, 1).expect("a one-page extent at the very top");
+	assert_eq!(top.metadata_bytes() > 0, true);
+}
+
+#[test]
+fn a_span_query_is_bounded_by_the_extent_and_not_by_the_caller() {
+	// `any_free` walked one iteration per page of whatever count it was given and computed each
+	// address unchecked, so `u64::MAX` pages against a one-page allocator was either an overflow
+	// panic or a wrapped address revisiting the pool low down - for attacker-controlled time, with
+	// the frame allocator's lock held. `free_span` had the same shape.
+	//
+	// These calls answer immediately if the bound holds and hang the test runner if it does not,
+	// which is the only way to assert "bounded" without counting instructions.
+	let mut pool = Buddy::new(0, 1).expect("a one-page extent");
+	assert!(!pool.any_free(0, u64::MAX), "nothing is free yet, however much is asked about");
+	assert_eq!(pool.free_span(0, u64::MAX), 1, "only the page that exists can be taken");
+	assert!(pool.any_free(0, u64::MAX), "and now it is free");
+	assert_eq!(pool.free_pages(), 1, "the count is the extent's, not the caller's");
+
+	// A start outside the extent is refused rather than wrapped into it.
+	assert!(!pool.any_free(64 * PAGE_SIZE, 4));
+	assert_eq!(pool.free_span(64 * PAGE_SIZE, 4), 0);
+	assert!(!pool.any_free(u64::MAX - PAGE_SIZE, 8));
+	assert_eq!(pool.free_span(u64::MAX - PAGE_SIZE, 8), 0);
+}

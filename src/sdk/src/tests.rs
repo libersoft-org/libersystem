@@ -24,11 +24,34 @@ fn a_negative_answer_is_a_status_and_a_non_negative_one_is_a_count() {
 
 #[test]
 fn a_count_larger_than_the_buffer_is_not_a_count() {
-	// `write_output` returned whatever the host said. A host regression answering a million for a
-	// hundred-byte write handed a million straight to the application - through the wrapper whose
-	// whole job is to be the safe side of that boundary.
-	assert_eq!(clamp_count(1_000_000, 100), Ok(100));
-	assert_eq!(clamp_count(i32::MAX, 100), Ok(100));
-	// And the degenerate buffer: nothing offered, nothing can have moved.
-	assert_eq!(clamp_count(5, 0), Ok(0));
+	// AND IS THEREFORE NOT REPORTED AS ONE. This test used to assert `Ok(100)` - it was named after
+	// a property and then required its opposite, which is how the defect survived being written
+	// down twice: the function's own comment said "the host cannot have moved more bytes than it
+	// was given room for" and then returned `min(answer, capacity)`.
+	//
+	// Clamping is not a safe middle. On a read `Ok(100)` says a hundred fresh bytes are in the
+	// buffer when the host may have written none, so the component consumes whatever was there
+	// before; on a write it says the payload persisted. Both convert a detectable broken host into
+	// data the caller cannot question.
+	assert_eq!(clamp_count(1_000_000, 100), Err(Error::HostContract(1_000_000)));
+	assert_eq!(clamp_count(i32::MAX, 100), Err(Error::HostContract(i32::MAX)));
+	// The degenerate buffer, where it is clearest: nothing was offered, so nothing can have moved,
+	// and a host claiming five is not reporting an empty transfer.
+	assert_eq!(clamp_count(5, 0), Err(Error::HostContract(5)));
+	assert_eq!(clamp_count(0, 0), Ok(0), "and zero of zero is still an honest answer");
+	// One below and exactly the bound stay successful, so the refusal is a boundary and not a mood.
+	assert_eq!(clamp_count(99, 100), Ok(99));
+	assert_eq!(clamp_count(100, 100), Ok(100));
+}
+
+#[test]
+fn an_impossible_answer_is_told_apart_from_one_this_build_has_not_heard_of() {
+	// `Unknown` is forward compatibility: a newer host may define a status this guest predates, and
+	// the honest answer is to carry the number rather than guess. `HostContract` is the opposite -
+	// there is no future version of this world in which a host moved more bytes than it was given
+	// room for, so a caller must not treat the two the same way. One may become meaningful; the
+	// other is the boundary being broken.
+	assert_ne!(clamp_count(-99, 16), clamp_count(99, 16));
+	assert_eq!(clamp_count(-99, 16), Err(Error::Unknown(-99)));
+	assert_eq!(clamp_count(99, 16), Err(Error::HostContract(99)));
 }

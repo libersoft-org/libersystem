@@ -13,6 +13,12 @@
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
+// The only ELF version there is, in both places the format writes it: `e_ident[EI_VERSION]` and
+// `e_version`. Neither was checked, so a file that declared no version - or a version whose layout
+// this reader does not implement - was accepted and then read as though it had said version 1. That
+// is fail-open on the field whose entire job is to say which layout follows.
+const EV_CURRENT: u8 = 1;
+const EI_VERSION: usize = 6;
 const SHT_STRTAB: u32 = 3;
 const SHT_NOTE: u32 = 7;
 const SHF_ALLOC: u64 = 1 << 1;
@@ -255,6 +261,12 @@ impl<'a> Elf<'a> {
 			return None;
 		}
 		if header.e_ident[4] != ELFCLASS64 || header.e_ident[5] != ELFDATA2LSB {
+			return None;
+		}
+		// BOTH VERSION FIELDS, because the format writes it twice and a reader that checks neither
+		// is trusting a layout the file never claimed. `e_version` is a `u32` and the identification
+		// byte is a `u8`; both must say 1.
+		if header.e_ident[EI_VERSION] != EV_CURRENT || header.e_version != EV_CURRENT as u32 {
 			return None;
 		}
 		if (header.e_type != ET_EXEC && header.e_type != ET_DYN) || header.e_machine != expected_machine || header.e_ehsize as usize != core::mem::size_of::<Elf64Header>() || header.e_phentsize as usize != core::mem::size_of::<ProgramHeader>() {

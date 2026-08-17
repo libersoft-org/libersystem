@@ -183,7 +183,14 @@ fn record(providers: &[&str], overrides: &[(&str, &str)]) -> String {
 	for provider in providers {
 		text.push_str("provider=");
 		text.push_str(provider);
-		text.push_str(":b8b8b8b8\n");
+		// A provider may bring its OWN digest, so a test can change one and nothing else. The
+		// helper used to append the same placeholder to every entry unconditionally, which meant no
+		// test could ever vary a digest - and that is why the rule comparing names alone went
+		// unnoticed for as long as it did.
+		if !provider.contains(':') {
+			text.push_str(":b8b8b8b8");
+		}
+		text.push('\n');
 	}
 	text
 }
@@ -198,7 +205,8 @@ fn the_fixture_is_readable_and_a_rebuild_of_the_same_sources_is_compatible() {
 	let image = Elf::parse(&installed).expect("the fixture parses");
 	let identity = Identity::read(&image).expect("the fixture carries an identity record");
 	assert_eq!(identity.field("artifact"), Some("png"));
-	assert_eq!(identity.providers().collect::<Vec<_>>(), vec!["lsrt", "pix"]);
+	assert_eq!(identity.providers().collect::<Vec<_>>(), vec!["lsrt:b8b8b8b8", "pix:b8b8b8b8"], "the entries carry their digests");
+	assert_eq!(identity.provider_names().collect::<Vec<_>>(), vec!["lsrt", "pix"], "and the names are still available on their own");
 	assert_eq!(decide(&installed, &installed), Verdict::Compatible);
 }
 
@@ -273,13 +281,27 @@ fn a_changed_provider_closure_or_order_requires_the_cold_path() {
 	let exports = [Export::function("decode"), Export::function("encode")];
 
 	let reordered = library(&record(&["pix", "lsrt"], &[]), &["lsrt.lslib", "pix.lslib"], &exports);
-	assert_eq!(decide(&installed, &reordered), Verdict::Incompatible(Reason::ProviderList { position: 0, installed: Some("lsrt"), candidate: Some("pix") }));
+	assert_eq!(decide(&installed, &reordered), Verdict::Incompatible(Reason::ProviderList { position: 0, installed: Some("lsrt:b8b8b8b8"), candidate: Some("pix:b8b8b8b8") }));
 
 	let added = library(&record(&["lsrt", "pix", "inflate"], &[]), &["lsrt.lslib", "pix.lslib"], &exports);
-	assert_eq!(decide(&installed, &added), Verdict::Incompatible(Reason::ProviderList { position: 2, installed: None, candidate: Some("inflate") }));
+	assert_eq!(decide(&installed, &added), Verdict::Incompatible(Reason::ProviderList { position: 2, installed: None, candidate: Some("inflate:b8b8b8b8") }));
 
 	let removed = library(&record(&["lsrt"], &[]), &["lsrt.lslib", "pix.lslib"], &exports);
-	assert_eq!(decide(&installed, &removed), Verdict::Incompatible(Reason::ProviderList { position: 1, installed: Some("pix"), candidate: None }));
+	assert_eq!(decide(&installed, &removed), Verdict::Incompatible(Reason::ProviderList { position: 1, installed: Some("pix:b8b8b8b8"), candidate: None }));
+
+	// AND THE CASE THIS TEST COULD NOT REACH BEFORE: the same providers, in the same order, one of
+	// them built from different sources. That is what a provider digest is FOR, and the rule threw
+	// the digests away before comparing - so this pair was reported `Compatible` and a library
+	// could be hot-replaced against a dependency closure that is not the installed one.
+	//
+	// The process loader has always compared these digests, so the two components disagreed about
+	// what identity means: this rule said the replacement was safe and the loader then refused to
+	// launch it.
+	let restated = library(&record(&["lsrt:b8b8b8b8", "pix:b8b8b8b8"], &[]), &["lsrt.lslib", "pix.lslib"], &exports);
+	assert_eq!(decide(&installed, &restated), Verdict::Compatible, "spelling the fixture's own digests out changes nothing");
+
+	let rebuilt_provider = library(&record(&["lsrt:b8b8b8b8", "pix:0badc0de"], &[]), &["lsrt.lslib", "pix.lslib"], &exports);
+	assert_eq!(decide(&installed, &rebuilt_provider), Verdict::Incompatible(Reason::ProviderList { position: 1, installed: Some("pix:b8b8b8b8"), candidate: Some("pix:0badc0de") }), "a provider rebuilt from different sources is a different closure, even under the same name");
 }
 
 #[test]

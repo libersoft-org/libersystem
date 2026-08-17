@@ -3222,12 +3222,27 @@ fn a_volume_this_machine_cannot_map_is_an_error_not_an_abort() {
 	// The answer is NoMemory, not NoSpace: the medium is not full, this machine cannot hold the
 	// map. They used to be the same error, and they drive opposite policies - one says delete
 	// something, the other says the service is under memory pressure.
+	//
+	// THE SHORTAGE IS INJECTED RATHER THAN REAL, and that is a correction to how this was written.
+	// It used to ASK FOR 64 GiB and rely on the machine being unable to give it. That makes the
+	// result a property of the host: on a machine with 251 GB of RAM the allocation succeeds, and
+	// the test spent over a minute zeroing before the runner was killed by the OOM killer - taking
+	// the whole `liberfs` suite with it. What the test is about is the REFUSAL being reported
+	// rather than aborting, and the injector produces that refusal without asking the host for
+	// anything.
 	let huge = MAX_BLOCKS / 2;
+	inject::fail_after(0);
 	assert_eq!(LiberFs::format_scratch(MemDevice::new(8), huge).err(), Some(FsError::NoMemory), "the format path reports rather than aborts");
+	inject::disarm();
 	// and the helper itself, which is what every derived map goes through.
-	assert_eq!(try_zeroed((huge / 8) as usize).err(), Some(FsError::NoMemory));
+	inject::fail_after(0);
+	assert_eq!(try_zeroed(1024).err(), Some(FsError::NoMemory));
+	inject::disarm();
 	// while an ordinary size still succeeds, so the guard is not simply refusing.
 	assert!(try_zeroed(1024).is_ok());
+	// AND THE DECLARED-SIZE BOUND IS STILL CHECKED WITHOUT ALLOCATING: a volume this build cannot
+	// map is refused for its declared size, which is the half that must not depend on the injector
+	// at all. `a_volume_larger_than_this_build_can_map_is_refused` beside this one covers it.
 }
 
 #[test]
@@ -4719,9 +4734,18 @@ fn a_memory_shortage_is_not_a_full_disk() {
 	// fallible allocation answered `NoSpace`, so a caller under memory pressure was told to free
 	// disk space that was already free.
 	//
-	// `try_zeroed` is the helper every derived map goes through, and the size here is a legal
-	// superblock claim whose bitmap this machine cannot hold - the medium is not involved at all.
-	assert_eq!(try_zeroed((MAX_BLOCKS / 16) as usize).err(), Some(FsError::NoMemory));
+	// `try_zeroed` is the helper every derived map goes through, and the refusal is INJECTED rather
+	// than provoked by asking for a huge buffer.
+	//
+	// IT USED TO ASK FOR `MAX_BLOCKS / 16` BYTES, which is 64 GiB, on the theory that no machine
+	// could hold it. That made the test's result a property of the HOST: on a machine with 251 GB
+	// of RAM the allocation succeeds, `try_zeroed` returns `Ok`, and the assertion fails after
+	// twenty-five seconds of zeroing. It passed inside a full sweep on the same machine and failed
+	// when run alone afterwards - the difference was how loaded the host happened to be, which is
+	// not something this test is about. The injector is a bound the test owns.
+	inject::fail_after(0);
+	assert_eq!(try_zeroed(1024).err(), Some(FsError::NoMemory), "a refused allocation is a memory shortage, not a full medium");
+	inject::disarm();
 	assert!(try_zeroed(1024).is_ok(), "an ordinary size still succeeds, so the guard is not simply refusing");
 
 	// And a genuinely full volume still says so, which is the half that must not move.

@@ -48,7 +48,13 @@
 //! is not a linear scan over the pool, it is a handful of `u64` loads with a hint in front of them.
 //!
 //! Metadata is one bit per block per order, summed over orders: 2 bits per page, `pages / 4` bytes.
-//! 128 KiB on a 4 GiB machine, reserved once and never grown.
+//! 256 KiB on a 4 GiB machine, reserved once and never grown.
+//!
+//! That figure said 128 KiB and was wrong by a factor of two: a 4 GiB extent is 1,048,576 pages at
+//! `PAGE_SIZE`, so `pages / 4` is 262,144 bytes. The arithmetic above it was right and only the
+//! example was wrong, which is the kind of error nothing catches - the implementation reports the
+//! real cost, so only a person planning boot memory from the prose would ever be misled.
+//! `the_metadata_cost_is_what_the_module_says_it_is` now derives it from `metadata_bytes()`.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -103,16 +109,35 @@ impl Buddy {
 	// them permanently out of the pool.
 	//
 	// Fallible, because it is sized from the memory map and the map comes from the machine.
+	//
+	// AND THE EXTENT IS VALIDATED, WHICH IT WAS NOT. This accepted any `base` and any `pages`: an
+	// unaligned base, zero pages, or a byte length that overflows the address space. Each of those
+	// makes a SAFE method later manufacture a physical address that is not a frame - `free` checks
+	// alignment RELATIVE to `self.base`, so an unaligned base lets an equally unaligned address
+	// through, and `Buddy::new(1, 1)` can hand out physical address 1 as a page. The kernel's caller
+	// supplies page-granular runs today, so nothing was reachable; but `new` returns `Option`
+	// precisely to be the boundary that establishes this, and a boundary that establishes nothing
+	// is where the next caller gets it wrong.
 	pub fn new(base: u64, pages: u64) -> Option<Self> {
+		if pages == 0 || base % PAGE_SIZE != 0 {
+			return None;
+		}
+		// The whole extent has to exist: `pages * PAGE_SIZE` must not overflow, and neither must the
+		// end address. Every later address reconstruction is `base + index * size * PAGE_SIZE`, and
+		// this is what makes those additions provably in range rather than merely usually so.
+		let extent_bytes = pages.checked_mul(PAGE_SIZE)?;
+		base.checked_add(extent_bytes)?;
 		let mut offsets = [0usize; MAX_ORDER + 1];
 		let mut words = [0usize; MAX_ORDER + 1];
 		let mut total = 0usize;
 		for order in 0..=MAX_ORDER {
 			let blocks = (pages >> order).max(1);
-			let w = (blocks as usize).div_ceil(64);
+			let w = usize::try_from(blocks).ok()?.div_ceil(64);
 			offsets[order] = total;
 			words[order] = w;
-			total += w;
+			// Checked, for the same reason the extent is: this is a sum over a caller-supplied page
+			// count, and `total` sizes the one allocation the type makes.
+			total = total.checked_add(w)?;
 		}
 		let mut bits: Vec<u64> = Vec::new();
 		bits.try_reserve_exact(total).ok()?;
@@ -366,6 +391,21 @@ impl Buddy {
 	// caller must not count those as free or the pool will report memory that no allocation can
 	// find. Silently returning nothing was the earlier shape and it made a divergence between
 	// `free_count` and the bitmap invisible.
+	// A REFUSED BLOCK IS SUBDIVIDED, NOT SKIPPED. This is the defect this milestone is named for,
+	// reached through the seeding path rather than through a double free.
+	//
+	// `free` refuses a block that overlaps ANY existing free block, and this loop used to advance by
+	// the whole block whether the free was accepted or not. So one already-free page inside a chosen
+	// order-3 block discarded the other SEVEN - seven pages that overlapped nothing, that no
+	// allocation can ever find again, with only an aggregate shortfall in the return value to show
+	// for it. Seed page 4 of an otherwise allocated 8-page extent and `free_span(base, 8)` returned
+	// zero. That contradicted the overlapping-seed contract the tests describe, whose fixture
+	// happens to put the overlap on a boundary where the greedy framing separates old from new.
+	//
+	// Splitting is the answer rather than an all-or-nothing precondition, because partial insertion
+	// is what the contract promises and what a seeder actually needs: an order-0 block that is
+	// refused really is already free, and every other page of the span still belongs in the pool.
+	// The recursion is bounded by the order, so a block is split at most `MAX_ORDER` times.
 	#[must_use]
 	pub fn free_span(&mut self, phys: u64, pages: u64) -> u64 {
 		// `at - self.base` below is computed before anything establishes `at >= base`, which wraps
@@ -373,8 +413,16 @@ impl Buddy {
 		if phys < self.base || (phys - self.base) % PAGE_SIZE != 0 {
 			return 0;
 		}
+		// AND BOUNDED BY THE EXTENT. The loop ran until the caller's count reached zero, however far
+		// past the end of the allocator that took it - unchecked `at +=` all the way - so a wrong
+		// count became unbounded work with the frame allocator's lock held instead of a bounded
+		// refusal. Nothing outside the extent could ever be taken anyway.
+		let first = (phys - self.base) / PAGE_SIZE;
+		if first >= self.pages {
+			return 0;
+		}
+		let mut left = pages.min(self.pages - first);
 		let mut at = phys;
-		let mut left = pages;
 		let mut taken_total = 0u64;
 		while left > 0 {
 			let page = (at - self.base) / PAGE_SIZE;
@@ -384,13 +432,28 @@ impl Buddy {
 			let by_size = (63 - left.leading_zeros() as usize).min(MAX_ORDER);
 			let order = by_alignment.min(by_size);
 			let taken = 1u64 << order;
-			if self.free(at, order) {
-				taken_total += taken;
-			}
+			taken_total += self.free_block_or_split(at, order);
 			at += taken * PAGE_SIZE;
 			left -= taken;
 		}
 		taken_total
+	}
+
+	// Free one aligned block, or - when it is refused - its two halves, recursively. Answers how
+	// many pages actually entered the pool.
+	//
+	// An order-0 refusal is final and correct: a single page that `free` will not take is a page
+	// that is already free, or outside the extent, and there is nothing left to split.
+	fn free_block_or_split(&mut self, phys: u64, order: usize) -> u64 {
+		if self.free(phys, order) {
+			return 1u64 << order;
+		}
+		if order == 0 {
+			return 0;
+		}
+		let half = order - 1;
+		let second = phys + (1u64 << half) * PAGE_SIZE;
+		self.free_block_or_split(phys, half) + self.free_block_or_split(second, half)
 	}
 
 	// Take `pages` CONTIGUOUS frames - the DMA allocation. Rounded up to a whole block, and the
@@ -439,8 +502,35 @@ impl Buddy {
 	// double free with an overlap test it could not avoid making; a bitmap has no such test built
 	// in, so this is the one that has to be remembered, and a rule that has to be remembered belongs
 	// next to the code that would otherwise forget it.
+	// BOUNDED BY THE EXTENT, NOT BY THE CALLER'S COUNT. This ran one iteration per page of whatever
+	// `pages` it was handed and computed each address with an unchecked `phys + page * PAGE_SIZE`,
+	// so a caller error - `u64::MAX` pages against a one-page allocator - became either an overflow
+	// panic or a wrapped address that revisits the pool low down and keeps going for as long as the
+	// count says, with the frame allocator's lock held. The question is only ever about pages inside
+	// this allocator, so the intersection is taken first and the walk is over that.
 	pub fn any_free(&self, phys: u64, pages: u64) -> bool {
-		(0..pages).any(|page| self.is_free_page(phys + page * PAGE_SIZE))
+		let Some(first) = self.page_index(phys) else { return false };
+		// The last page the caller named, clamped to the extent. Saturating rather than checked: a
+		// count that runs off the end is a caller error, and the answer for the part that IS inside
+		// the extent is still exactly right.
+		let last = first.saturating_add(pages.saturating_sub(1)).min(self.pages.saturating_sub(1));
+		if pages == 0 || first >= self.pages {
+			return false;
+		}
+		(first..=last).any(|page| (0..=MAX_ORDER).any(|order| self.get(order, page >> order)))
+	}
+
+	// The index of `phys` in this extent, or None when it is outside it or not page-aligned.
+	fn page_index(&self, phys: u64) -> Option<u64> {
+		if phys < self.base {
+			return None;
+		}
+		let offset = phys - self.base;
+		if offset % PAGE_SIZE != 0 {
+			return None;
+		}
+		let page = offset / PAGE_SIZE;
+		if page >= self.pages { None } else { Some(page) }
 	}
 
 	// Every free block, as (order, first physical address). Walks the bitmaps rather than

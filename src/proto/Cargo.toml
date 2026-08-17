@@ -7,7 +7,34 @@ description = "Generated LSIDL bindings (wire codec, clients, servers) for Liber
 
 [features]
 default = []
-channel-client-impl = ["dep:ipc-client"]
+# THE FACADE'S FEATURE HAS TO SELECT THE DOMAINS' FEATURES, because Cargo features are per package.
+#
+# This was `["dep:ipc-client"]` and nothing else. Enabling it therefore pulled in the optional
+# dependency and selected the same-named feature in exactly none of the fifteen crates whose
+# generated wrappers it is named after - so `cargo check --features channel-client-impl` succeeded
+# while compiling not one `liber_channel_impl_*` symbol, and the mismatch surfaced at a link far
+# away from the manifest that caused it. `shared-image` was unaffected because it propagates
+# `X/shared-image` per domain and each of those enables its own `channel-client-impl`; that is the
+# pattern, and this is it written out for the narrow feature too.
+#
+# `base-proto` is absent deliberately: it declares no channel methods, so it has no such feature.
+channel-client-impl = [
+	"audio-proto/channel-client-impl",
+	"config-proto/channel-client-impl",
+	"dep:ipc-client",
+	"device-proto/channel-client-impl",
+	"display-proto/channel-client-impl",
+	"input-proto/channel-client-impl",
+	"log-proto/channel-client-impl",
+	"network-proto/channel-client-impl",
+	"observability-proto/channel-client-impl",
+	"process-proto/channel-client-impl",
+	"resources-proto/channel-client-impl",
+	"security-proto/channel-client-impl",
+	"session-proto/channel-client-impl",
+	"storage-proto/channel-client-impl",
+	"time-proto/channel-client-impl",
+]
 shared-image = [
 	"audio-proto/shared-image",
 	"channel-client-impl",

@@ -47,6 +47,14 @@ pub enum Error {
 	// codes an older guest has never heard of, and inventing a meaning for them is worse than
 	// saying so.
 	Unknown(i32),
+	// The host answered something the world does not permit: a count larger than the buffer it was
+	// given, or a nonzero result from a status-only call.
+	//
+	// SEPARATE FROM `Unknown`, which is a status this build has not heard of and a newer host may
+	// legitimately send. This one is not forward compatibility - there is no future version of the
+	// contract in which the host moved more bytes than it was offered room for. It is the other
+	// side of the boundary being wrong, and a component that retries it will get the same answer.
+	HostContract(i32),
 }
 
 impl Error {
@@ -61,16 +69,28 @@ impl Error {
 	}
 }
 
-// Turn one host answer into a count or an error, CLAMPED to what the caller offered.
+// Turn one host answer into a count, or an error.
 //
-// The clamp is not defensive decoration. `write_output` returned whatever the host said, so a host
-// regression answering a million for a hundred-byte write handed a million straight to the
-// application - through the wrapper whose whole job is to be the safe side of that boundary. A
-// count larger than what was offered is not a count: the host cannot have moved more bytes than it
-// was given room for.
+// A COUNT LARGER THAN WHAT WAS OFFERED IS REFUSED, NOT CLAMPED - and the difference is the whole of
+// this function. `write_output` used to return whatever the host said, so a host regression
+// answering a million for a hundred-byte write handed a million straight to the application. That
+// was replaced by `min(answer, capacity)`, which stopped the absurd number reaching the caller and
+// replaced it with a plausible lie: `Ok(100)`.
+//
+// The host cannot have moved more bytes than it was given room for, so such an answer proves the
+// other side of the boundary is broken - and the two ways of reporting a broken host are not equal.
+// On a READ, `Ok(capacity)` tells the component that every byte of its buffer is freshly delivered
+// when the host may have written none, so it goes on to process whatever was there before. On a
+// WRITE, it lets the caller report the whole payload persisted on an answer already known to be
+// impossible. Clamping converts a detectable contract violation into undetectable data.
+//
+// Exactly the capacity is fine, and so is zero. Anything above it is `HostContract`.
 pub fn clamp_count(answer: i32, capacity: usize) -> Result<usize, Error> {
 	if answer < 0 {
 		return Err(Error::from_status(answer));
 	}
-	Ok((answer as usize).min(capacity))
+	if answer as usize > capacity {
+		return Err(Error::HostContract(answer));
+	}
+	Ok(answer as usize)
 }

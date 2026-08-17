@@ -51,5 +51,14 @@ pub fn log_message(msg: &str) -> Result<(), Error> {
 		return Err(Error::Unsupported);
 	}
 	let status: i32 = log_raw(msg.as_ptr() as i32, msg.len() as i32);
-	if status < 0 { Err(Error::from_status(status)) } else { Ok(()) }
+	// EXACTLY ZERO IS SUCCESS. `log` is status-only - it moves no bytes, so it has no count to
+	// report - and the host answers zero for `Logged` and a negative status for every failure. A
+	// POSITIVE answer has no meaning in this world at all, and treating it as success is how host
+	// and guest drift apart silently: the two are built separately, so a version skew shows up
+	// exactly here and nowhere else.
+	match status {
+		0 => Ok(()),
+		negative if negative < 0 => Err(Error::from_status(negative)),
+		positive => Err(Error::HostContract(positive)),
+	}
 }

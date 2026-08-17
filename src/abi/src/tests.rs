@@ -909,3 +909,46 @@ fn a_package_that_would_describe_itself_wrongly_is_not_built() {
 	assert!(!entry_fits(4, 2, MAX_TOTAL_BYTES - 1), "and one byte past it does not");
 	assert!(!entry_fits(4, 1, usize::MAX), "a total that would wrap is refused rather than wrapped");
 }
+
+#[test]
+fn a_bootstrap_path_has_a_grammar_at_the_parser_that_calls_itself_strict() {
+	use crate::bootstrap::{MAX_PATH_BYTES, parse_list, valid_bootstrap_path};
+
+	// THE SIDE OF A ROW THAT WAS ONLY CHECKED FOR BEING NON-EMPTY. The name got the package-name
+	// rule and the path got nothing, in the file whose comment calls it the strict parser - so a
+	// list containing a NUL, a control byte, `//`, a leading separator or `..` parsed here and was
+	// refused later, differently, by whichever filesystem backend the recovery path selected. The
+	// diagnostic for that is "could not assemble the package", which names nothing.
+	assert!(valid_bootstrap_path(b"libexec/storage_service.lsexe"), "the shape every real list uses");
+	assert!(valid_bootstrap_path(b"etc/bootstrap.list"));
+	assert!(valid_bootstrap_path(b"single"));
+
+	for bad in [
+		&b""[..],
+		b"/libexec/x",
+		b"libexec/x/",
+		b"libexec//x",
+		b"./x",
+		b"../x",
+		b"libexec/../etc/x",
+		b"libexec/.",
+		b"libexec\\x",
+		b"libexec/\x00x",
+		b"libexec/\x1fx",
+		b"libexec/\x7fx",
+	] {
+		assert!(!valid_bootstrap_path(bad), "refused: {:?}", core::str::from_utf8(bad));
+	}
+
+	let overlong: alloc::vec::Vec<u8> = alloc::vec![b'x'; MAX_PATH_BYTES + 1];
+	assert!(!valid_bootstrap_path(&overlong), "and a path past the bound");
+
+	// And the whole-list parser applies it, so the grammar is not merely available.
+	assert!(parse_list(b"a.lsexe libexec/a.lsexe\n").is_some(), "a well-formed row");
+	assert!(parse_list(b"a.lsexe libexec/../etc/a.lsexe\n").is_none(), "a row whose path escapes is refused HERE");
+	assert!(parse_list(b"a.lsexe /libexec/a.lsexe\n").is_none(), "and so is one that is not relative");
+
+	// THE REAL LIST STILL PARSES, which is the half a grammar can get wrong in the other direction.
+	let real = b"device_manager.lsexe libexec/device_manager.lsexe\nstorage_service.lsexe libexec/storage_service.lsexe\n";
+	assert_eq!(parse_list(real).map(|rows| rows.len()), Some(2), "the shape the build actually writes");
+}

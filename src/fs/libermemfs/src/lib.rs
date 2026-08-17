@@ -203,7 +203,7 @@ fn insert(children: &mut Children, name: String, node: Node) -> Result<(), FsErr
 			Ok(())
 		}
 		Err(at) => {
-			children.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+			children.try_reserve(1).map_err(|_| FsError::NoMemory)?;
 			children.insert(at, (name, node));
 			Ok(())
 		}
@@ -427,9 +427,18 @@ impl LiberMemFs {
 		if policy == Policy::Reserved {
 			// `try_reserve` rather than a plain allocation: running out here must be an error
 			// the caller can report, not an abort inside the storage service.
+			//
+			// AND THE ERROR IS `NoMemory`, WHICH IT WAS NOT. Every failed reservation in this file
+			// answered `NoSpace` - 52 of them, against zero uses of `NoMemory` - even though
+			// `fs-core` grew `NoMemory` precisely because the two drive opposite policies: `NoSpace`
+			// says delete something or use another volume, `NoMemory` says the machine is under
+			// pressure and the same request may well succeed in a moment. `read_file` and
+			// `list_entries` were the clearest cases, because they add nothing to the volume and
+			// still reported it full. The split is mechanical and it is the whole fix: an explicit
+			// capacity check stays `NoSpace`, a refused allocation is `NoMemory`.
 			let mut allocation: Vec<u8> = Vec::new();
-			allocation.try_reserve_exact(capacity).map_err(|_| FsError::NoSpace)?;
-			reservation.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+			allocation.try_reserve_exact(capacity).map_err(|_| FsError::NoMemory)?;
+			reservation.try_reserve(1).map_err(|_| FsError::NoMemory)?;
 			reservation.push(Chunk { allocation, bytes: capacity });
 			reserved = capacity;
 		}
@@ -911,7 +920,7 @@ impl LiberMemFs {
 			// the opposite of what the claim is for.
 			Some(Node::File(data)) | Some(Node::Claimed(data)) => {
 				let mut out: Vec<u8> = Vec::new();
-				out.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
+				out.try_reserve_exact(data.len()).map_err(|_| FsError::NoMemory)?;
 				out.extend_from_slice(data);
 				Ok(out)
 			}
@@ -928,8 +937,12 @@ impl LiberMemFs {
 	// on a full volume, and - crucially - cannot refuse after the reservation has been released.
 	// Only then is anything released or allocated.
 	pub fn write_file(&mut self, path: &[u8], data: &[u8]) -> Result<(), FsError> {
+		// `TooLarge`, NOT `TooLong`. `fs-core` documents `TooLong` as "a path or name longer than the
+		// filesystem allows" and `TooLarge` as an answer that does not fit one buffer, and this is a
+		// ceiling on the FILE. A caller told `TooLong` may reasonably shorten its path, which cannot
+		// help; every byte-count refusal in this file now says the one thing the caller can act on.
 		if data.len() > MAX_FILE_BYTES {
-			return Err(FsError::TooLong);
+			return Err(FsError::TooLarge);
 		}
 		let (parts, count) = Self::segments(path)?;
 		let parts = &parts[..count];
@@ -1099,7 +1112,7 @@ impl LiberMemFs {
 		}
 		let mut owned: Vec<u8> = Vec::new();
 		if owned.try_reserve_exact(path.len()).is_err() {
-			return Err(FsError::NoSpace);
+			return Err(FsError::NoMemory);
 		}
 		owned.extend_from_slice(path);
 		// The destination's NAME, taken now rather than at commit - see `Pending::name`. It is the
@@ -1136,7 +1149,7 @@ impl LiberMemFs {
 			let last = parts.last().copied().unwrap_or("");
 			let mut owned_name = String::new();
 			if owned_name.try_reserve_exact(last.len()).is_err() {
-				return Err(FsError::NoSpace);
+				return Err(FsError::NoMemory);
 			}
 			owned_name.push_str(last);
 			let placed = self.parent_mut(parts).and_then(|children| insert(children, owned_name, Node::Claimed(Vec::new())));
@@ -1186,7 +1199,7 @@ impl LiberMemFs {
 		let want = pending.data.len().saturating_add(chunk.len());
 		if want > MAX_FILE_BYTES {
 			self.stream_abort();
-			return Err(FsError::TooLong);
+			return Err(FsError::TooLarge);
 		}
 		// What the volume would hold once this chunk is in: everything except the pending buffer's
 		// current allocation, plus what it would grow to.
@@ -1211,7 +1224,7 @@ impl LiberMemFs {
 		// which is the single failure this filesystem exists to avoid.
 		if pending.data.try_reserve_exact(chunk.len()).is_err() {
 			self.stream_abort();
-			return Err(FsError::NoSpace);
+			return Err(FsError::NoMemory);
 		}
 		pending.data.extend_from_slice(chunk);
 		// The check the preflight above cannot make: `try_reserve_exact` promises at least what was
@@ -1256,7 +1269,7 @@ impl LiberMemFs {
 		let total = filled.saturating_add(want);
 		if total > MAX_FILE_BYTES {
 			self.stream_abort();
-			return Err(FsError::TooLong);
+			return Err(FsError::TooLarge);
 		}
 		let without = (self.footprint() as usize).saturating_sub(pending.data.capacity());
 		if without.saturating_add(total) > self.capacity {
@@ -1269,7 +1282,7 @@ impl LiberMemFs {
 		let pending = self.pending.as_mut().ok_or(FsError::Invalid)?;
 		if pending.data.try_reserve_exact(want).is_err() {
 			self.stream_abort();
-			return Err(FsError::NoSpace);
+			return Err(FsError::NoMemory);
 		}
 		pending.data.resize(total, 0);
 		// `try_reserve_exact` promises at least what was asked for and may give more, and the
@@ -1433,7 +1446,7 @@ impl LiberMemFs {
 
 	fn write_file_owned_unsynced_named(&mut self, path: &[u8], data: Vec<u8>, prepared: Option<String>) -> Result<(), FsError> {
 		if data.len() > MAX_FILE_BYTES {
-			return Err(FsError::TooLong);
+			return Err(FsError::TooLarge);
 		}
 		let (parts, count) = Self::segments(path)?;
 		let parts = &parts[..count];
@@ -1498,7 +1511,7 @@ impl LiberMemFs {
 			None => {
 				let last = parts.last().copied().ok_or(FsError::BadName)?;
 				let mut name = String::new();
-				name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
+				name.try_reserve_exact(last.len()).map_err(|_| FsError::NoMemory)?;
 				name.push_str(last);
 				name
 			}
@@ -1553,7 +1566,7 @@ impl LiberMemFs {
 				// the growth path, where the file is getting bigger anyway.
 				let mut grown: Vec<u8> = Vec::new();
 				if grown.try_reserve_exact(data.len()).is_err() {
-					return Err(FsError::NoSpace);
+					return Err(FsError::NoMemory);
 				}
 				let would_be = self.footprint() as usize - held + grown.capacity();
 				if would_be > self.capacity {
@@ -1571,11 +1584,11 @@ impl LiberMemFs {
 		// A new entry: the bytes are built before the entry exists, so a failure leaves the tree
 		// untouched.
 		let mut written: Vec<u8> = Vec::new();
-		written.try_reserve_exact(data.len()).map_err(|_| FsError::NoSpace)?;
+		written.try_reserve_exact(data.len()).map_err(|_| FsError::NoMemory)?;
 		written.extend_from_slice(data);
 		let mut name = String::new();
 		let last = parts.last().copied().ok_or(FsError::BadName)?;
-		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
+		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoMemory)?;
 		name.push_str(last);
 		let children = self.parent_mut(parts)?;
 		insert(children, name, Node::File(written))
@@ -1600,10 +1613,10 @@ impl LiberMemFs {
 		match self.resolve(parts)? {
 			Some(Node::Directory(children)) => {
 				let mut out: Vec<Entry> = Vec::new();
-				out.try_reserve_exact(children.len()).map_err(|_| FsError::NoSpace)?;
+				out.try_reserve_exact(children.len()).map_err(|_| FsError::NoMemory)?;
 				for (name, node) in children {
 					let mut copy = String::new();
-					copy.try_reserve_exact(name.len()).map_err(|_| FsError::NoSpace)?;
+					copy.try_reserve_exact(name.len()).map_err(|_| FsError::NoMemory)?;
 					copy.push_str(name);
 					// A DIRECTORY REPORTS ZERO, which is what the generated `Storage` documentation
 					// says plainly and what the adapter passes straight to the client. This filled
@@ -1648,7 +1661,7 @@ impl LiberMemFs {
 	fn make_dir(&mut self, parts: &[&str]) -> Result<(), FsError> {
 		let last = parts.last().copied().ok_or(FsError::BadName)?;
 		let mut name = String::new();
-		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoSpace)?;
+		name.try_reserve_exact(last.len()).map_err(|_| FsError::NoMemory)?;
 		name.push_str(last);
 		let children = self.parent_mut(parts)?;
 		insert(children, name, Node::Directory(Children::new()))
@@ -1712,14 +1725,14 @@ impl LiberMemFs {
 			return Err(FsError::NoSpace);
 		}
 		let mut owned = String::new();
-		owned.try_reserve_exact(destination_name.len()).map_err(|_| FsError::NoSpace)?;
+		owned.try_reserve_exact(destination_name.len()).map_err(|_| FsError::NoMemory)?;
 		owned.push_str(destination_name);
 		// The destination's table may have to grow by one, and that growth can be refused - so it
 		// is done while the file is still where it was. `insert` reserves before it inserts, and
 		// the entry it would displace was ruled out above.
 		{
 			let children = self.parent_mut(destination_parts)?;
-			children.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+			children.try_reserve(1).map_err(|_| FsError::NoMemory)?;
 		}
 		// `take` RATHER THAN `remove`: the shrink inside `remove` would hand the slot just reserved
 		// back before the insert could use it, which for a rename within one directory is the same
@@ -1761,12 +1774,12 @@ impl LiberMemFs {
 		// it is has to be too. No 32-bit target exists in this tree today, which is exactly why it
 		// cost nothing to put right now rather than after one does.
 		if length > MAX_FILE_BYTES as u64 {
-			return Err(FsError::TooLong);
+			return Err(FsError::TooLarge);
 		}
 		// Cannot fail after the bound above - `MAX_FILE_BYTES` is a `usize` - but written fallibly
 		// rather than with a cast, so raising the constant past a target's word size is a refusal
 		// and not a truncation.
-		let want = usize::try_from(length).map_err(|_| FsError::TooLong)?;
+		let want = usize::try_from(length).map_err(|_| FsError::TooLarge)?;
 		// WHAT THE FILE COSTS TODAY, AS AN ALLOCATION. This read `bytes.len()`, and the volume
 		// accounts `capacity()` - so a file holding 20 bytes in an 80-byte buffer, already charged
 		// for 80, was refused a grow to 40 that allocates nothing. That is the `len`-versus-
@@ -1849,7 +1862,7 @@ impl LiberMemFs {
 		// Growing past the buffer: build the whole new one, measure what the allocator actually
 		// gave, and only then swap it in.
 		let mut grown: Vec<u8> = Vec::new();
-		grown.try_reserve_exact(want).map_err(|_| FsError::NoSpace)?;
+		grown.try_reserve_exact(want).map_err(|_| FsError::NoMemory)?;
 		if footprint - charged + grown.capacity() > capacity {
 			return Err(FsError::NoSpace);
 		}

@@ -1087,3 +1087,52 @@ fn the_identity_query_ends_at_its_boundary_too() {
 	assert_eq!(client.protocol_info(), None, "an identity reply carrying a capability is not an identity reply");
 	assert_eq!(client.into_transport().closed, alloc::vec![0xC0FFEE], "and it is closed");
 }
+
+#[test]
+fn the_facades_channel_feature_selects_every_domains_own() {
+	// CARGO FEATURES ARE PER PACKAGE, and this facade only re-exports. `channel-client-impl` was
+	// declared here as `["dep:ipc-client"]` alone, so enabling it selected the optional dependency
+	// and the same-named feature in NONE of the fifteen crates whose wrappers it is named after.
+	// `cargo check --features channel-client-impl` passed while compiling not one
+	// `liber_channel_impl_*` symbol, and the mismatch surfaced at a link far from the manifest that
+	// caused it. `shared-image` masked it by propagating `X/shared-image` per domain.
+	//
+	// Read out of the manifest rather than asserted against a list typed here: the failure this
+	// guards is a SIXTEENTH protocol crate being added and left out, and a hand-written expectation
+	// would have to be updated by the same person who forgot.
+	const MANIFEST: &str = include_str!("../Cargo.toml");
+
+	let section = |name: &str| -> &str {
+		let start = MANIFEST.find(name).expect("the manifest declares this section");
+		let rest = &MANIFEST[start..];
+		let end = rest[1..].find("\n[").map(|at| at + 1).unwrap_or(rest.len());
+		&rest[..end]
+	};
+	let features = section("[features]");
+	let dependencies = section("[dependencies]");
+
+	// Every protocol dependency, taken from the dependency table.
+	let mut domains: Vec<&str> = Vec::new();
+	for line in dependencies.lines() {
+		let Some((name, _)) = line.split_once(" = ") else { continue };
+		let name = name.trim();
+		if name.ends_with("-proto") {
+			domains.push(name);
+		}
+	}
+	assert!(domains.len() >= 15, "the facade re-exports the protocol crates: {domains:?}");
+
+	// The aggregate has to name each one whose crate declares the feature. `base-proto` has no
+	// channel methods and therefore no such feature, so it is expected to be absent - which is
+	// checked rather than assumed, since a `base` that grew one and was left out is the same bug.
+	let aggregate = features.split("channel-client-impl = [").nth(1).expect("the root feature is a list").split(']').next().expect("terminated");
+	for domain in &domains {
+		let declares = match *domain {
+			"base-proto" => false,
+			_ => true,
+		};
+		let named = aggregate.contains(&alloc::format!("{domain}/channel-client-impl"));
+		assert_eq!(named, declares, "{domain} is {} the aggregate and {} declare the feature", if named { "in" } else { "not in" }, if declares { "should" } else { "does not" });
+	}
+	assert!(aggregate.contains("dep:ipc-client"), "and the optional dependency is still selected");
+}

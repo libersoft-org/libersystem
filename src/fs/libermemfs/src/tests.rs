@@ -642,7 +642,7 @@ fn a_read_too_large_for_the_heap_is_refused_rather_than_fatal() {
 	// Less the name, which counts toward the capacity like any other byte.
 	fs.write_file(b"big", &alloc::vec![b'x'; CAPACITY - b"big".len()]).expect("write");
 	within(4 * 1024, || {
-		assert_eq!(fs.read_file(b"big"), Err(FsError::NoSpace), "a read that cannot be satisfied is refused, not fatal");
+		assert_eq!(fs.read_file(b"big"), Err(FsError::NoMemory), "a read that cannot be satisfied is refused, not fatal");
 	});
 	assert_eq!(fs.read_file(b"big").expect("read").len(), CAPACITY - b"big".len(), "the file is untouched by the refusal");
 }
@@ -655,7 +655,7 @@ fn a_listing_too_large_for_the_heap_is_refused_rather_than_fatal() {
 		fs.write_file(alloc::format!("entry-{i:04}").as_bytes(), b"x").expect("write");
 	}
 	within(512, || {
-		assert_eq!(fs.list_entries(b"").err(), Some(FsError::NoSpace), "a listing that cannot be satisfied is refused, not fatal");
+		assert_eq!(fs.list_entries(b"").err(), Some(FsError::NoMemory), "a listing that cannot be satisfied is refused, not fatal");
 	});
 	assert_eq!(fs.list_entries(b"").expect("list").len(), 64);
 }
@@ -665,7 +665,7 @@ fn a_mount_that_cannot_take_its_capacity_fails_rather_than_pretending() {
 	// The reserved policy's whole claim is that the memory is taken at mount. Under a budget
 	// smaller than the capacity, the mount must fail - not succeed holding less.
 	within(16 * 1024, || {
-		assert_eq!(LiberMemFs::mount(Policy::Reserved, 1024 * 1024).err(), Some(FsError::NoSpace), "a reserved mount that cannot take its capacity fails");
+		assert_eq!(LiberMemFs::mount(Policy::Reserved, 1024 * 1024).err(), Some(FsError::NoMemory), "a reserved mount that cannot take its capacity fails");
 		// A capped volume of the same size mounts, because it takes nothing yet.
 		let fs = LiberMemFs::mount(Policy::Capped, 1024 * 1024).expect("a capped volume always mounts");
 		assert_eq!(fs.reserved_bytes(), 0);
@@ -831,7 +831,7 @@ fn growing_past_a_files_high_water_mark_needs_both_blocks() {
 		match fs.write_file(b"f", &large) {
 			Ok(()) => assert_eq!(fs.used(), LARGE as u64, "if it fit, it fit completely"),
 			Err(error) => {
-				assert_eq!(error, FsError::NoSpace, "a growth that cannot be satisfied is refused");
+				assert_eq!(error, FsError::NoMemory, "a growth that cannot be satisfied is refused");
 				assert_eq!(fs.read_file(b"f").expect("the file survives").len(), SMALL, "a refused growth leaves the file whole");
 			}
 		}
@@ -885,7 +885,7 @@ fn a_reserved_mount_that_cannot_take_its_slot_fails_rather_than_aborting() {
 	// something this harness can do reliably, so the slot's fallibility is argued from the code
 	// rather than demonstrated here.
 	within(2 * 1024, || {
-		assert_eq!(LiberMemFs::mount(Policy::Reserved, 1024 * 1024).err(), Some(FsError::NoSpace), "a mount that cannot be satisfied is refused, not fatal");
+		assert_eq!(LiberMemFs::mount(Policy::Reserved, 1024 * 1024).err(), Some(FsError::NoMemory), "a mount that cannot be satisfied is refused, not fatal");
 	});
 }
 
@@ -968,7 +968,7 @@ fn a_stream_that_grows_past_its_spare_capacity_reserves_fallibly() {
 		fs.stream_push(&first).expect("the first chunk fits");
 		// The volume has room for the whole stream; the HEAP does not. Growing must report that
 		// rather than abort, which is only possible if the reservation asked for the right amount.
-		assert_eq!(fs.stream_push(&second), Err(FsError::NoSpace), "growing past the spare capacity is refused, not aborted");
+		assert_eq!(fs.stream_push(&second), Err(FsError::NoMemory), "growing past the spare capacity is refused, not aborted");
 		assert!(!fs.streaming(), "and the refused stream is abandoned rather than left half-received");
 	});
 }
@@ -1714,7 +1714,7 @@ fn truncate_charges_what_the_file_allocates_and_keeps_the_reservation() {
 	// And the file-size bound is the volume's, not the calling path's.
 	let mut big = LiberMemFs::mount(Policy::Capped, MAX_FILE_BYTES * 4).expect("mount");
 	big.write_file(b"g", b"x").expect("a file");
-	assert_eq!(big.truncate(b"g", MAX_FILE_BYTES as u64 + 1), Err(FsError::TooLong), "no write path in this crate makes a file larger than this");
+	assert_eq!(big.truncate(b"g", MAX_FILE_BYTES as u64 + 1), Err(FsError::TooLarge), "no write path in this crate makes a file larger than this");
 
 	// The zeros are the promise.
 	fs.truncate(b"f", 8).expect("shrink");
@@ -1921,14 +1921,23 @@ fn a_length_no_volume_could_hold_is_too_long_rather_than_out_of_space() {
 	// A 64-BIT HOST CANNOT SEE THE ORDERING, and saying otherwise would be this test claiming more
 	// than it checks: `u64::MAX` fits a 64-bit `usize`, so narrow-then-compare and compare-then-
 	// narrow give the same answer here. What makes the fix hold on a target where they differ is
-	// not the order at all - it is that BOTH refusal paths in `truncate` now answer `TooLong`, so
+	// not the order at all - it is that BOTH refusal paths in `truncate` now answer `TooLarge`, so
 	// no ordering of them can produce `NoSpace` for a length that does not fit a word. That is a
 	// property of the source rather than of this run, and it is stated here because a test that
 	// cannot reach a case should say which case it cannot reach.
+	//
+	// `TooLarge` RATHER THAN `TooLong`, which is what these two asserted before. `fs-core` gives
+	// `TooLong` to a path or a name and `TooLarge` to a byte count that does not fit, and a caller
+	// told its PATH was too long for a refusal about the file's LENGTH is being sent to shorten
+	// something that cannot help.
 	let mut fs = capped(64 * 1024);
 	fs.write_file(b"f", b"x").expect("a file to truncate");
-	assert_eq!(fs.truncate(b"f", u64::MAX), Err(FsError::TooLong), "a length past every bound is refused as too long");
-	assert_eq!(fs.truncate(b"f", MAX_FILE_BYTES as u64 + 1), Err(FsError::TooLong), "and so is one byte past the file limit");
+	assert_eq!(fs.truncate(b"f", u64::MAX), Err(FsError::TooLarge), "a length past every bound is refused as too large");
+	assert_eq!(fs.truncate(b"f", MAX_FILE_BYTES as u64 + 1), Err(FsError::TooLarge), "and so is one byte past the file limit");
+	// And a NAME past its limit still answers `TooLong`, so the two have not merged into one word:
+	// `TooLong` kept the meaning the enum documents for it and only the byte-count refusals moved.
+	let overlong: alloc::vec::Vec<u8> = alloc::vec![b'n'; MAX_NAME_BYTES + 1];
+	assert_eq!(fs.write_file(&overlong, b"x"), Err(FsError::TooLong), "a name past the name limit is still TooLong");
 	// And the volume's own limit still answers `NoSpace`, which is the refusal that means what it
 	// says: this length is representable and would fit some volume, just not this one.
 	assert_eq!(fs.truncate(b"f", 128 * 1024), Err(FsError::NoSpace), "a length within the file limit but past the volume is out of space");

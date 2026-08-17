@@ -123,10 +123,28 @@ impl<'a> Identity<'a> {
 		self.text.lines().find_map(|line| line.strip_prefix(key).and_then(|rest| rest.strip_prefix('=')))
 	}
 
-	// The declared provider names, in the record's order, without their digests. The order is
-	// the canonical provider order, so it is part of what is compared and not incidental.
+	// The declared provider entries, in the record's order, WITH their identity digests. The order
+	// is the canonical provider order, so it is part of what is compared and not incidental.
+	//
+	// THE DIGESTS USED TO BE CUT OFF HERE, and that made the comparison in `decide` unsound. A
+	// record writes each provider as `provider=<name>:<identity-digest>`; this returned only the
+	// name. Two images built against DIFFERENT versions of the same provider - which is exactly what
+	// a digest exists to distinguish - therefore compared equal and were reported safe to
+	// hot-replace, against a dependency closure that is not the installed one. The process loader
+	// has always parsed and compared these digests, so the two components implemented different
+	// identity languages, and a publication this rule called compatible could then fail to launch.
+	//
+	// Keeping the whole entry rather than splitting into a `(name, digest)` pair is deliberate: the
+	// comparison is an equality over an ordered list, and `Reason::ProviderList` carries the entry
+	// as text for the diagnostic, so splitting would only mean rejoining it there.
 	pub fn providers(&self) -> impl Iterator<Item = &'a str> {
-		self.text.lines().filter_map(|line| line.strip_prefix("provider=")).map(|entry| match entry.find(':') {
+		self.text.lines().filter_map(|line| line.strip_prefix("provider="))
+	}
+
+	// The provider NAMES alone, for a caller that wants the identity of a dependency rather than
+	// the identity of the build of it. Not used by the compatibility rule, which needs both halves.
+	pub fn provider_names(&self) -> impl Iterator<Item = &'a str> {
+		self.providers().map(|entry| match entry.find(':') {
 			Some(at) => &entry[..at],
 			None => entry,
 		})
@@ -173,7 +191,11 @@ pub fn decide<'a>(installed: &'a [u8], candidate: &'a [u8]) -> Verdict<'a> {
 // Public because a publication needs the same distinction this rule needs: an image for
 // another target is a wrong-target rejection, not an unreadable file.
 pub fn declared_machine(bytes: &[u8]) -> Option<u16> {
-	if bytes.len() < 20 || bytes[..4] != [0x7f, b'E', b'L', b'F'] || bytes[4] != 2 || bytes[5] != 1 {
+	// A PRELIMINARY CLASSIFIER, NOT A VALIDATOR - it exists so a wrong-target image can be named as
+	// such before either side is parsed, and `Elf::parse_for_machine` is what establishes validity.
+	// It checks the identification version anyway, because reading `e_machine` out of a file that
+	// never declared this layout is reading a field at an offset the file did not promise.
+	if bytes.len() < 20 || bytes[..4] != [0x7f, b'E', b'L', b'F'] || bytes[4] != 2 || bytes[5] != 1 || bytes[6] != 1 {
 		return None;
 	}
 	Some(u16::from_le_bytes([bytes[18], bytes[19]]))

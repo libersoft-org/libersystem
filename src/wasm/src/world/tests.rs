@@ -157,6 +157,19 @@ fn the_hosts_status_codes_and_the_sdks_are_the_same_four() {
 	let sdk = constants(SDK);
 	assert_eq!(host.len(), 4, "the host declares the four the world defines: {host:?}");
 	assert_eq!(host, sdk, "the host's status codes and the SDK's have drifted apart");
+
+	// AND THE TRANSFER LIMIT, which this comparison used to leave out.
+	//
+	// It is the same kind of value as the four above - a number both sides declare separately and
+	// must agree on - and it was the one the guard did not cover. Nothing catches a divergence in
+	// it: the guest would refuse a length the host accepts, or hand over one the host refuses, and
+	// the symptom is an `Unsupported` from whichever side happens to be stricter. That reads as a
+	// host that does not implement the call rather than as two builds disagreeing about a bound.
+	let transfer = |source: &str| -> Option<alloc::string::String> { source.lines().find_map(|line| line.trim().strip_prefix("pub const MAX_TRANSFER: usize = ")?.trim().strip_suffix(';').map(alloc::string::String::from)) };
+	let host_transfer = transfer(HOST).expect("the host declares MAX_TRANSFER");
+	let sdk_transfer = transfer(SDK).expect("the SDK declares MAX_TRANSFER");
+	assert_eq!(host_transfer, sdk_transfer, "the host's transfer limit and the SDK's have drifted apart");
+	assert_eq!(host_transfer, "i32::MAX as usize", "and it is still the bound the i32 count/status split implies");
 }
 
 #[test]

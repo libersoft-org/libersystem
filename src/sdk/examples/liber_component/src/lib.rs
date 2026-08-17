@@ -102,6 +102,13 @@ fn status_of(error: liber_sdk::Error) -> i32 {
 		Error::Io => STATUS_IO,
 		Error::Unsupported => STATUS_UNSUPPORTED,
 		Error::Unknown(status) => status,
+		// A HOST THAT BROKE THE CONTRACT IS REPORTED AS `IO`, and deliberately not passed through.
+		// `Unknown` carries the host's own number back because it may mean something this build has
+		// not heard of; `HostContract` carries a number that is not a status at all - it is the
+		// impossible count, or the nonzero answer to a status-only call - so returning it would put
+		// a positive value where the caller reads a status. The component was reached and could not
+		// complete, which is what `IO` says.
+		Error::HostContract(_) => STATUS_IO,
 	}
 }
 

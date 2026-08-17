@@ -33,6 +33,11 @@ fn an_et_exec_may_not_name_the_kernel_half() {
 		bytes[..4].copy_from_slice(b"\x7fELF");
 		bytes[4] = 2;
 		bytes[5] = 1;
+		// The identification VERSION, which these builders left at zero. `Elf::parse_for_machine`
+		// now requires it - a file that declares no ELF version was being read as though it had
+		// said version 1 - so every hand-built header in this tree had to gain the byte it should
+		// always have carried.
+		bytes[6] = 1;
 		put16(&mut bytes, 16, 2); // ET_EXEC
 		put16(&mut bytes, 18, elf_machine());
 		put32(&mut bytes, 20, 1);
@@ -118,6 +123,11 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 		bytes[..4].copy_from_slice(b"\x7fELF");
 		bytes[4] = 2;
 		bytes[5] = 1;
+		// The identification VERSION, which these builders left at zero. `Elf::parse_for_machine`
+		// now requires it - a file that declares no ELF version was being read as though it had
+		// said version 1 - so every hand-built header in this tree had to gain the byte it should
+		// always have carried.
+		bytes[6] = 1;
 		put16(&mut bytes, 16, 3);
 		put16(&mut bytes, 18, elf_machine());
 		put32(&mut bytes, 20, 1);
@@ -157,6 +167,11 @@ fn elf_dyn_applies_relative_relocations_and_rejects_symbols() {
 		bytes[..4].copy_from_slice(b"\x7fELF");
 		bytes[4] = 2;
 		bytes[5] = 1;
+		// The identification VERSION, which these builders left at zero. `Elf::parse_for_machine`
+		// now requires it - a file that declares no ELF version was being read as though it had
+		// said version 1 - so every hand-built header in this tree had to gain the byte it should
+		// always have carried.
+		bytes[6] = 1;
 		put16(&mut bytes, 16, 3);
 		put16(&mut bytes, 18, elf_machine());
 		put32(&mut bytes, 20, 1);
@@ -1301,6 +1316,11 @@ fn a_fuzzed_elf_header_is_refused_without_leaking() {
 		bytes[..4].copy_from_slice(b"\x7fELF");
 		bytes[4] = 2;
 		bytes[5] = 1;
+		// The identification VERSION, which these builders left at zero. `Elf::parse_for_machine`
+		// now requires it - a file that declares no ELF version was being read as though it had
+		// said version 1 - so every hand-built header in this tree had to gain the byte it should
+		// always have carried.
+		bytes[6] = 1;
 		put16(&mut bytes, 16, 2);
 		put16(&mut bytes, 18, elf_machine());
 		put32(&mut bytes, 20, 1);
@@ -1426,6 +1446,11 @@ fn a_fuzzed_relocation_table_is_refused_without_leaking() {
 		bytes[..4].copy_from_slice(b"\x7fELF");
 		bytes[4] = 2;
 		bytes[5] = 1;
+		// The identification VERSION, which these builders left at zero. `Elf::parse_for_machine`
+		// now requires it - a file that declares no ELF version was being read as though it had
+		// said version 1 - so every hand-built header in this tree had to gain the byte it should
+		// always have carried.
+		bytes[6] = 1;
 		put16(&mut bytes, 16, 3); // ET_DYN
 		put16(&mut bytes, 18, elf_machine());
 		put32(&mut bytes, 20, 1);

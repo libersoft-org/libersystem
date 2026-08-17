@@ -10,6 +10,11 @@ fn image(image_type: u16, segments: &[ProgramHeader], payload: &[u8]) -> Vec<u8>
 	ident[..4].copy_from_slice(&ELF_MAGIC);
 	ident[4] = ELFCLASS64;
 	ident[5] = ELFDATA2LSB;
+	// THE IDENTIFICATION VERSION, which these fixtures left at zero. The parser did not read it,
+	// so every fixture here declared no ELF version and was accepted anyway - which is precisely
+	// the defect, visible from the test side: eleven fixtures had to be corrected for the check to
+	// pass, and not one of them had ever been a legal ELF file.
+	ident[EI_VERSION] = EV_CURRENT;
 	let header = Elf64Header { e_ident: ident, e_type: image_type, e_machine: EXPECTED_MACHINE, e_version: 1, e_entry: 0x1000, e_phoff: header_len as u64, e_shoff: 0, e_flags: 0, e_ehsize: header_len as u16, e_phentsize: core::mem::size_of::<ProgramHeader>() as u16, e_phnum: segments.len() as u16, e_shentsize: 0, e_shnum: 0, e_shstrndx: 0 };
 	unsafe {
 		core::ptr::write_unaligned(bytes.as_mut_ptr() as *mut Elf64Header, header);
@@ -35,6 +40,7 @@ fn identity_note_image(record: &[u8]) -> (Vec<u8>, usize, usize) {
 	ident[..4].copy_from_slice(&ELF_MAGIC);
 	ident[4] = ELFCLASS64;
 	ident[5] = ELFDATA2LSB;
+	ident[EI_VERSION] = EV_CURRENT;
 	let header = Elf64Header { e_ident: ident, e_type: ET_DYN, e_machine: EXPECTED_MACHINE, e_version: 1, e_entry: 0, e_phoff: header_len as u64, e_shoff: section_offset as u64, e_flags: 0, e_ehsize: header_len as u16, e_phentsize: core::mem::size_of::<ProgramHeader>() as u16, e_phnum: 0, e_shentsize: core::mem::size_of::<SectionHeader>() as u16, e_shnum: sections.len() as u16, e_shstrndx: 1 };
 	unsafe {
 		core::ptr::write_unaligned(bytes.as_mut_ptr() as *mut Elf64Header, header);
@@ -404,4 +410,42 @@ fn a_segment_whose_physical_end_wraps_is_refused() {
 	let mut fits = wrapping;
 	fits.p_paddr = 0x10_0000;
 	assert!(Elf::parse(&image(ET_EXEC, &[fits], &payload)).is_some(), "an ordinary physical address is unaffected");
+}
+
+#[test]
+fn an_image_that_declares_no_elf_version_is_refused() {
+	// BOTH FIELDS, because the format writes the version twice and neither was read. An image with
+	// either one set to zero - or to a version whose layout this reader does not implement - was
+	// parsed as though it had said version 1, which is fail-open on the field whose only job is to
+	// say which layout follows.
+	//
+	// The evidence that nothing checked it is in this file rather than in an argument: every
+	// fixture above built `e_ident` from magic, class and data order and left the version byte at
+	// zero, and all of them parsed. None had ever been a legal ELF file.
+	let good = image(ET_EXEC, &[], &[]);
+	assert!(Elf::parse_for_machine(&good, EXPECTED_MACHINE).is_some(), "the corrected fixture is accepted");
+
+	for (offset, what) in [(6usize, "the identification version byte")] {
+		let mut broken = good.clone();
+		broken[offset] = 0;
+		assert!(Elf::parse_for_machine(&broken, EXPECTED_MACHINE).is_none(), "a zero in {what} is refused");
+		let mut future = good.clone();
+		future[offset] = 2;
+		assert!(Elf::parse_for_machine(&future, EXPECTED_MACHINE).is_none(), "and so is a version this reader does not implement in {what}");
+	}
+
+	// `e_version` is the `u32` at offset 20, after the 16-byte identification, `e_type` and
+	// `e_machine`.
+	for value in [0u32, 2, u32::MAX] {
+		let mut broken = good.clone();
+		broken[20..24].copy_from_slice(&value.to_le_bytes());
+		assert!(Elf::parse_for_machine(&broken, EXPECTED_MACHINE).is_none(), "e_version = {value} is refused");
+	}
+
+	// And the preliminary classifier agrees about the identification byte, so a wrong-target answer
+	// cannot be read out of a file that never declared this layout.
+	let mut broken = good.clone();
+	broken[6] = 0;
+	assert_eq!(crate::compat::declared_machine(&broken), None, "the classifier refuses it too");
+	assert_eq!(crate::compat::declared_machine(&good), Some(EXPECTED_MACHINE));
 }

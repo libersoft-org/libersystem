@@ -1228,7 +1228,10 @@ fn verify_image(bytes: &[u8], name: &[u8]) -> Option<u16> {
 	};
 	for need in needed {
 		let stem: &str = need.strip_suffix(LIBRARY_SUFFIX).unwrap_or(need);
-		if !identity.providers().any(|provider| provider == stem) {
+		// `provider_names`, because this asks whether the NAME is in the closure. `providers` now
+		// yields `<name>:<identity-digest>` - the compatibility rule needs both halves and used to
+		// throw the digest away - and matching a DT_NEEDED stem against that would never succeed.
+		if !identity.provider_names().any(|provider| provider == stem) {
 			return Some(ST_BAD_PROVIDERS);
 		}
 	}

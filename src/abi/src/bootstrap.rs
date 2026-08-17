@@ -46,6 +46,47 @@ fn trim(mut s: &[u8]) -> &[u8] {
 	s
 }
 
+// The longest path a bootstrap row may name. Far above any real layout and low enough that a line
+// cannot describe a path no filesystem here would accept anyway.
+pub const MAX_PATH_BYTES: usize = 255;
+
+// Is `path` a well-formed bootstrap path?
+//
+// THE SIDE OF A ROW THAT HAD NO GRAMMAR AT ALL. `parse_list` applied the package-name rule to the
+// NAME and accepted any path that was merely non-empty, in the file that describes itself as the
+// strict shared parser. NUL bytes, ASCII controls, repeated separators, a leading or trailing one,
+// `.` and `..` all passed it and were refused later - differently - by whichever `ReadsFiles`
+// backend the recovery path happened to select, which collapses into "could not assemble the
+// package" with nothing saying why. The same list could then mean different things depending on
+// which backend read it.
+//
+// The rule is the one `rt::RelativePath` already applies everywhere else in this tree: one or more
+// separated segments, each non-empty and neither `.` nor `..`, no NUL, no control byte, no
+// backslash. Written here rather than shared with it because `abi` is the layer beneath everything
+// and depends on nothing; the two are checked against each other by test instead.
+//
+// Backend validation stays exactly as it is. This is the shared parser refusing what it should
+// never have admitted, not a replacement for defence in depth.
+pub fn valid_bootstrap_path(path: &[u8]) -> bool {
+	if path.is_empty() || path.len() > MAX_PATH_BYTES {
+		return false;
+	}
+	for segment in path.split(|&b| b == b'/') {
+		if segment.is_empty() || segment == b"." || segment == b".." {
+			return false;
+		}
+		for &byte in segment {
+			// Controls and DEL are not names; `\` is refused because a path that means one thing to
+			// a backend splitting on it and another to one that does not is a path with two
+			// meanings.
+			if byte < 0x20 || byte == 0x7f || byte == b'\\' {
+				return false;
+			}
+		}
+	}
+	true
+}
+
 // Parse the whole list, or refuse it.
 //
 // STRICTLY, because this is the file that decides what the system starts and every accepted oddity
@@ -63,7 +104,7 @@ pub fn parse_list(bytes: &[u8]) -> Option<Vec<Row<'_>>> {
 		let split = line.iter().position(|&b| b == b' ' || b == b'\t')?;
 		let name = trim(&line[..split]);
 		let path = trim(&line[split + 1..]);
-		if !crate::valid_package_name(name) || path.is_empty() {
+		if !crate::valid_package_name(name) || !valid_bootstrap_path(path) {
 			return None;
 		}
 		if rows.iter().any(|row| row.name == name) {
