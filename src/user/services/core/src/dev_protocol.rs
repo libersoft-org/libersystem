@@ -1148,6 +1148,14 @@ fn explain(reason: &compat::Reason) -> Vec<u8> {
 			out.extend_from_slice(b" changed ");
 			out.extend_from_slice(field.as_bytes());
 		}
+		// The comparison gave up rather than run. It says so, and says how much it spent, because
+		// "this needs the cold path" and "this image is too tangled to decide cheaply" are different
+		// things for whoever is publishing.
+		compat::Reason::TooComplex { visits } => {
+			out.extend_from_slice(b"export comparison exceeded its budget after ");
+			push_number(&mut out, *visits as usize);
+			out.extend_from_slice(b" symbol visits; use the cold path");
+		}
 	}
 	out.truncate(MAX_VERDICT_DETAIL);
 	out

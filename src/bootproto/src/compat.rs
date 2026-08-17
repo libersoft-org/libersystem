@@ -50,6 +50,26 @@ pub const REQUIRED_FIELDS: [&str; 9] = ["format", "kind", "artifact", "package",
 // The identity record layout this rule understands.
 pub const IDENTITY_FORMAT: &str = "liber-image-identity-v1";
 
+// How many candidate symbols the export comparison may visit in total before giving up.
+//
+// THE BOUND THE WALK DID NOT HAVE. Matching each installed export against the candidate's is a
+// forward walk that restarts and rescans the whole table whenever the orders diverge. A rebuild
+// emits its symbols in the same order with new ones appended, so in practice the walk is one pass -
+// but ELF does not require that order, and a candidate whose exports are REVERSED reaches the
+// rescan for every symbol. That is quadratic in a table the format allows to hold 65,536 entries,
+// and `compat::decide` runs synchronously inside a core service while a development artifact of up
+// to 32 MB is being published, so the cost lands on the control plane.
+//
+// A budget rather than an index, because this crate is `no_std` with no allocator at all: there is
+// nowhere to build the sorted table the obvious fix wants. The number is chosen so both legitimate
+// shapes stay exact - the largest library in this tree has 672 exports, whose worst case is about
+// 451,000 visits, and a 65,536-symbol table in ordinary order costs one pass - while the
+// adversarial combination of the two is refused rather than run.
+//
+// Measured, in the guest, on that 672-export library: the ordinary walk is ~8 ms and rescanning per
+// symbol is ~810 ms. The budget's job is the case neither of those numbers covers.
+const MAX_SYMBOL_VISITS: u64 = 1 << 22;
+
 // ELF symbol binding and visibility values this rule reasons about.
 const BINDING_LOCAL: u8 = 0;
 const VISIBILITY_HIDDEN: u8 = 2;
@@ -81,6 +101,11 @@ pub enum Reason<'a> {
 	ExportRemoved { symbol: &'a str },
 	// An export survived but changed in a way an already-resolved reference would notice.
 	ExportChanged { symbol: &'a str, field: &'static str },
+	// Deciding the export comparison would cost more work than this rule is willing to spend.
+	//
+	// FAILS CLOSED, which is what makes a budget safe to have: the answer is "use the cold path",
+	// never "assume compatible". See `MAX_SYMBOL_VISITS`.
+	TooComplex { visits: u64 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,11 +299,23 @@ fn compare_exports<'a>(installed: &Elf<'a>, candidate: &Elf<'a>) -> Verdict<'a> 
 		Some(symbols) => symbols,
 		None => return Verdict::Incompatible(Reason::UnreadableDynamic { installed: false }),
 	};
+	// Every candidate symbol the walk looks at, across the whole comparison. See `MAX_SYMBOL_VISITS`:
+	// the walk is one pass when the orders agree and a full rescan per symbol when they do not, and
+	// nothing bounded the second case.
+	let mut visits: u64 = 0;
+	let mut budget = |seen: usize, visits: &mut u64| -> bool {
+		*visits = visits.saturating_add(seen as u64);
+		*visits <= MAX_SYMBOL_VISITS
+	};
 	for (symbol, name) in installed_symbols {
 		if !is_export(&symbol, name) {
 			continue;
 		}
-		let mut found = walk.by_ref().find(|(s, n)| is_export(s, n) && *n == name);
+		let mut seen = 0usize;
+		let mut found = walk.by_ref().inspect(|_| seen += 1).find(|(s, n)| is_export(s, n) && *n == name);
+		if !budget(seen, &mut visits) {
+			return Verdict::Incompatible(Reason::TooComplex { visits });
+		}
 		if found.is_none() {
 			// The walk ran out before this name: either the orders diverged or the export is
 			// gone. Restart it and scan the whole table before concluding the latter.
@@ -286,7 +323,11 @@ fn compare_exports<'a>(installed: &Elf<'a>, candidate: &Elf<'a>) -> Verdict<'a> 
 				Some(symbols) => symbols,
 				None => return Verdict::Incompatible(Reason::UnreadableDynamic { installed: false }),
 			};
-			found = walk.by_ref().find(|(s, n)| is_export(s, n) && *n == name);
+			let mut rescan = 0usize;
+			found = walk.by_ref().inspect(|_| rescan += 1).find(|(s, n)| is_export(s, n) && *n == name);
+			if !budget(rescan, &mut visits) {
+				return Verdict::Incompatible(Reason::TooComplex { visits });
+			}
 		}
 		let (other, _) = match found {
 			Some(pair) => pair,

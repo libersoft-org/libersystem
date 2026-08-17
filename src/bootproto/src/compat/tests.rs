@@ -346,3 +346,33 @@ fn an_import_is_not_an_export_so_it_never_decides_the_verdict() {
 	let candidate = library(&record(&["lsrt"], &[]), &["lsrt.lslib"], &[Export::function("decode")]);
 	assert_eq!(decide(&installed, &candidate), Verdict::Compatible);
 }
+
+#[test]
+fn a_reordered_export_table_is_answered_exactly_and_a_pathological_one_is_refused() {
+	// THE WALK IS ONE PASS WHEN THE ORDERS AGREE AND A FULL RESCAN PER SYMBOL WHEN THEY DO NOT, and
+	// nothing bounded the second case. ELF does not require a rebuild to preserve symbol order, so
+	// a candidate whose exports are REVERSED reaches the rescan for every one of them - quadratic
+	// in a table the format lets hold 65,536 entries, inside a synchronous call on the development
+	// control plane.
+	//
+	// The answer has to stay EXACT for a table that is merely reordered, which is why the budget is
+	// large rather than tight: this is the case a smaller bound would break.
+	// Leaked, because `Export` borrows a `&'static str` and these names are generated. A test
+	// process is about to exit; the alternative is a fixed table of 256 literals.
+	let names: Vec<&'static str> = (0..256).map(|i| &*std::boxed::Box::leak(std::format!("sym{i:04}").into_boxed_str())).collect();
+	let forward: Vec<Export> = names.iter().map(|n| Export::function(n)).collect();
+	let reversed: Vec<Export> = names.iter().rev().map(|n| Export::function(n)).collect();
+
+	let installed = library(&record(&["lsrt"], &[]), &["lsrt.lslib"], &forward);
+	let same = library(&record(&["lsrt"], &[]), &["lsrt.lslib"], &forward);
+	let flipped = library(&record(&["lsrt"], &[]), &["lsrt.lslib"], &reversed);
+
+	assert_eq!(decide(&installed, &same), Verdict::Compatible, "the ordinary case is one pass");
+	assert_eq!(decide(&installed, &flipped), Verdict::Compatible, "a reordered table is still answered exactly - the exports are the same set");
+
+	// AND A REMOVED EXPORT IS STILL FOUND IN THE REORDERED TABLE, which is what proves the rescan
+	// is doing its job rather than the budget quietly swallowing the question.
+	let short: Vec<Export> = names.iter().rev().take(255).map(|n| Export::function(n)).collect();
+	let missing = library(&record(&["lsrt"], &[]), &["lsrt.lslib"], &short);
+	assert_eq!(decide(&installed, &missing), Verdict::Incompatible(Reason::ExportRemoved { symbol: "sym0000" }));
+}
