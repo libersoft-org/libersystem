@@ -595,11 +595,45 @@ pub fn block_on_flagged<F: Fn() -> bool>(koid: u64, deadline: u64, periodic: boo
 	// Register under the koid even when it is 0 (nothing will wake it by object):
 	// the bucket entry's Arc is what keeps a blocked thread alive off every run
 	// queue, deadline or not.
-	// ALLOC-OK: one entry per BLOCKED thread, bounded by the Domain's thread quota.
-	bucket_of(koid).lock().push(BucketWaiter { thread: thread.clone(), koid });
+	// UNDER THE LOCK THAT OWNS THE CAPACITY.
+	//
+	// `reserve_wait_slots` above books room, but capacity belongs to the VECTOR and not to the
+	// caller that asked for it: it releases every lock before interrupts are disabled, so another
+	// core can consume the room in between. The push then allocated - with interrupts masked and
+	// this thread already marked blocked - and a short heap ended the kernel from an ordinary wait
+	// syscall. Reserving again while holding the same lock the push takes is what makes the push
+	// allocation-free rather than merely likely to be; the up-front reservation stays, because
+	// failing early is cheaper than unwinding a half-built park.
+	let registered = {
+		let mut bucket = bucket_of(koid).lock();
+		match bucket.try_reserve(1) {
+			Ok(()) => {
+				bucket.push(BucketWaiter { thread: thread.clone(), koid });
+				true
+			}
+			Err(_) => false,
+		}
+	};
+	if !registered {
+		// Nothing was registered, so no waker can hold a claim on this thread: reclaim the park and
+		// return without blocking. The caller's condition loop re-checks and comes back, which is
+		// exactly what it does after a spurious wake.
+		if thread.try_claim_wake() {
+			thread.set_state(ThreadState::Running);
+		}
+		if saved_if {
+			arch::enable_interrupts();
+		}
+		return;
+	}
 	if deadline != NO_DEADLINE {
-		// ALLOC-OK: one entry per sleeping thread, bounded by the Domain's thread quota.
-		TIMED_WAITERS.lock().push(TimedWaiter { thread: thread.clone(), deadline, periodic });
+		let mut timed = TIMED_WAITERS.lock();
+		if timed.try_reserve(1).is_ok() {
+			timed.push(TimedWaiter { thread: thread.clone(), deadline, periodic });
+		}
+		// A deadline that cannot be recorded is a wait without a timeout rather than a dead kernel.
+		// The waiter is registered on the object either way, so a wake still arrives; only the
+		// timeout is lost, and the caller's loop is written to re-check regardless.
 	}
 	// Re-check now that we are registered. If the object became ready in the race
 	// window AND we can reclaim ourselves (try_claim_wake wins the Blocked -> Ready
@@ -649,13 +683,39 @@ pub fn block_on_any<F: Fn() -> bool>(koids: &[u64], deadline: u64, periodic: boo
 	let saved_if = arch::interrupts_enabled();
 	arch::disable_interrupts();
 	thread.begin_park();
+	// UNDER THE LOCK THAT OWNS THE CAPACITY - see the same reasoning in `block_on_flagged`. The
+	// up-front `reserve_buckets` releases each lock before the park begins, so the room it booked
+	// can be taken by another core; only a reservation held across the push is a booking.
+	let mut registered = 0usize;
 	for &koid in koids {
-		// ALLOC-OK: one entry per BLOCKED thread, bounded by the Domain's thread quota.
-		bucket_of(koid).lock().push(BucketWaiter { thread: thread.clone(), koid });
+		let mut bucket = bucket_of(koid).lock();
+		if bucket.try_reserve(1).is_err() {
+			break;
+		}
+		bucket.push(BucketWaiter { thread: thread.clone(), koid });
+		registered += 1;
+	}
+	if registered != koids.len() {
+		// A PARTIAL registration is not a wait: a wake on one of the koids that did get registered
+		// would return while the others were never watched. Take the entries back and reclaim the
+		// park - unless a waker has already claimed this thread through one of them, in which case
+		// it is spinning for a parked SP and the park has to be completed to release it.
+		for &koid in &koids[..registered] {
+			bucket_of(koid).lock().retain(|w: &BucketWaiter| !Arc::ptr_eq(&w.thread, &thread));
+		}
+		if thread.try_claim_wake() {
+			thread.set_state(ThreadState::Running);
+			if saved_if {
+				arch::enable_interrupts();
+			}
+			return;
+		}
 	}
 	if deadline != NO_DEADLINE {
-		// ALLOC-OK: one entry per sleeping thread, bounded by the Domain's thread quota.
-		TIMED_WAITERS.lock().push(TimedWaiter { thread: thread.clone(), deadline, periodic });
+		let mut timed = TIMED_WAITERS.lock();
+		if timed.try_reserve(1).is_ok() {
+			timed.push(TimedWaiter { thread: thread.clone(), deadline, periodic });
+		}
 	}
 	// Register-then-recheck, closing the wait/wake race across the whole set (see
 	// block_on_flagged): if any object became ready in the window since the caller's

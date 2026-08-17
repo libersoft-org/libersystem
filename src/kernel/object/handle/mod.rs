@@ -140,6 +140,19 @@ struct Slot {
 pub struct HandleTable {
 	slots: Vec<Slot>,
 	free: Vec<u32>,
+	// CONCRETE SLOTS BOOKED FOR AN UPCOMING `insert_reserved`, by index.
+	//
+	// `reserve` used to reserve vector CAPACITY and Domain quota and nothing else - it did not take
+	// the free indices out of circulation. Another thread sharing this process's table could then
+	// insert handles between the reservation and its use, consume the free slots, and leave
+	// `insert_reserved` calling `place` with nothing to place into: it answers with the raw ZERO
+	// handle, which names nothing. In the MSI path the hardware has already been programmed by then,
+	// and in channel receive the message and its capabilities have already been committed - so the
+	// caller receives handle zero while the capability is dropped, and the quota charged at
+	// reservation no longer corresponds to an installed handle.
+	//
+	// Holding the indices themselves is what makes the reservation a booking.
+	booked: Vec<u32>,
 	// CLOSED once `close_all` has run: this table is a dead process's and takes nothing new.
 	//
 	// `close_all` skips reserved slots, which is right - their capability is elsewhere and one of
@@ -181,7 +194,7 @@ fn retire_or_recycle(slot: &mut Slot, free: &mut Vec<u32>, index: usize) {
 
 impl HandleTable {
 	pub const fn new() -> Self {
-		Self { slots: Vec::new(), free: Vec::new(), closed: false, domain: None }
+		Self { slots: Vec::new(), free: Vec::new(), booked: Vec::new(), closed: false, domain: None }
 	}
 
 	// Bind this table to a Domain so inserts/closes charge its handle quota.
@@ -309,9 +322,28 @@ impl HandleTable {
 	// that already exist, so only the shortfall needs allocating; `try_reserve` may over-allocate,
 	// which is fine - it never under-allocates, and that is the direction that matters here.
 	pub fn reserve(&mut self, count: usize) -> bool {
-		let needed = count.saturating_sub(self.free.len());
-		if needed > 0 && self.slots.try_reserve(needed).is_err() {
+		if self.booked.try_reserve(count).is_err() {
 			return false;
+		}
+		let before = self.booked.len();
+		for _ in 0..count {
+			// A CONCRETE SLOT, taken out of circulation here so nothing else can have it.
+			let index = match self.free.pop() {
+				Some(index) => index,
+				None => {
+					// Same pairing `try_place` uses: a fresh slot needs room in `slots` AND a place
+					// in `free` for the index it will carry when it is eventually closed.
+					let wanted = self.slots.len() + 1;
+					if self.slots.try_reserve(1).is_err() || self.free.try_reserve(wanted - self.free.len()).is_err() {
+						self.unbook(before);
+						return false;
+					}
+					let index = self.slots.len() as u32;
+					self.slots.push(Slot { cap: None, generation: 1, reserved: false });
+					index
+				}
+			};
+			self.booked.push(index);
 		}
 		let Some(domain) = &self.domain else {
 			return true;
@@ -319,10 +351,23 @@ impl HandleTable {
 		for taken in 0..count {
 			if !domain.try_charge_handle() {
 				domain.uncharge_handles(taken as u64);
+				self.unbook(before);
 				return false;
 			}
 		}
 		true
+	}
+
+	// Put every slot booked since `keep` back on the free list, for a reservation that could not be
+	// completed. The free list has room by construction: each index came out of it, or came with a
+	// place in it.
+	fn unbook(&mut self, keep: usize) {
+		while self.booked.len() > keep {
+			let index = self.booked.pop().expect("length checked");
+			// ALLOC-OK: every booked index either came off this list or arrived with a place
+			// reserved on it by `reserve`, so returning it cannot grow the vector.
+			self.free.push(index);
+		}
 	}
 
 	// Install a capability against a reservation already taken by `reserve`. Charges
@@ -330,11 +375,29 @@ impl HandleTable {
 	// again here would bill twice for one handle. Cannot fail, and `reserve` is what makes
 	// that true of the memory as well as of the quota.
 	pub fn insert_reserved(&mut self, cap: Capability) -> Handle {
-		self.place(cap)
+		// INTO THE SLOT THIS RESERVATION OWNS. `place` searched the free list, which another thread
+		// may have emptied since the booking - and answered with the zero handle when it had, after
+		// the hardware was programmed or the message committed.
+		match self.booked.pop() {
+			Some(index) => {
+				let slot = &mut self.slots[index as usize];
+				slot.cap = Some(cap);
+				Handle::new(slot.generation, index)
+			}
+			// No booking: the caller reserved less than it installs, which is a contract error
+			// rather than a race. `place` is the honest fallback - it charges nothing, and a handle
+			// value naming nothing fails at the caller's next use.
+			None => self.place(cap),
+		}
 	}
 
 	// Give back part of a reservation that was not used.
 	pub fn release_reservation(&mut self, count: usize) {
+		// The booked slots go back too, not only the quota: they were taken out of circulation by
+		// `reserve` and nothing else can use them until they are returned.
+		let give_back = count.min(self.booked.len());
+		let keep = self.booked.len() - give_back;
+		self.unbook(keep);
 		if let Some(domain) = &self.domain {
 			domain.uncharge_handles(count as u64);
 		}

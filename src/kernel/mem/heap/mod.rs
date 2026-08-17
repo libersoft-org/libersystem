@@ -79,13 +79,22 @@ pub fn reserve_window() {
 // hand it to the free list. Called under the allocator lock when an allocation finds
 // no fitting region; false when the frame pool is exhausted (the real OOM).
 fn grow(heap: &mut Heap, at_least: usize) -> bool {
-	let bytes: u64 = (at_least as u64 + PAGE_SIZE).next_multiple_of(HEAP_REGION);
+	// CHECKED, because `at_least` comes from an allocation request and a request can be absurd.
+	// `(at_least + PAGE_SIZE).next_multiple_of(HEAP_REGION)` and the window comparison below both
+	// overflowed on a large one, and an overflow in a `+` is a PANIC - so a `try_reserve` for an
+	// impossible count reached the allocator and ended the kernel instead of returning `Err`. A size
+	// that cannot be expressed cannot be served, which is a refusal like any other.
+	let Some(bytes) = (at_least as u64).checked_add(PAGE_SIZE).and_then(|n| n.checked_next_multiple_of(HEAP_REGION)) else {
+		return false;
+	};
 	let base: u64 = NEXT_REGION.fetch_add(bytes, Ordering::Relaxed);
 	// Past the reserved window there are no top-level entries, and creating one here would be
 	// invisible to every address space already made - a triple fault the next time one of them
 	// is switched to. Refuse instead, and give the range back so the bump does not run away.
-	if base + bytes > HEAP_START + HEAP_WINDOW {
-		let _ = NEXT_REGION.compare_exchange(base + bytes, base, Ordering::Relaxed, Ordering::Relaxed);
+	if base.checked_add(bytes).is_none_or(|end| end > HEAP_START + HEAP_WINDOW) {
+		// `wrapping_add` matches the `fetch_add` that produced the value: an overflowing bump wraps
+		// rather than panicking, and the compare-exchange has to name what is actually stored.
+		let _ = NEXT_REGION.compare_exchange(base.wrapping_add(bytes), base, Ordering::Relaxed, Ordering::Relaxed);
 		return false;
 	}
 	let mut virt = base;
