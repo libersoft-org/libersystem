@@ -333,6 +333,15 @@ pub struct FatFs<D: BlockDevice> {
 struct ExfatRoot {
 	bitmap_first: u32,
 	bitmap_size: u64,
+	// The Up-case Table's allocation, which this used to DISCARD after validating it.
+	//
+	// `scan_exfat_root` finds the table, checks its chain, its contents and its checksum, and then
+	// returned only the bitmap - so `audit_ownership` claimed the bitmap and the root and never the
+	// table, even though its own comment says every system chain is claimed first. With no `owned`
+	// bit for those clusters, the bitmap-consistency pass has nothing to compare, and a file
+	// allocated over the table cross-links the one structure every NAME on the volume is decided by.
+	upcase_first: u32,
+	upcase_size: u64,
 }
 
 struct SwapFailure {
@@ -368,6 +377,21 @@ pub enum MountError {
 	Io,
 	// This machine could not get the memory the mount needed. NOT a statement about the medium.
 	NoMemory,
+}
+
+// A zeroed buffer, FALLIBLY.
+//
+// Every buffer in this crate that is sized from a number off the medium goes through here. exFAT
+// permits a 32 MB cluster and a 256 MB directory, so `vec![0u8; n]` on a disc's own arithmetic is an
+// infallible allocation an attacker chooses the size of - and an infallible allocation that fails
+// ABORTS the process, which for this crate is StorageService and every volume it serves. The API
+// has had `FsError::NoMemory` since the shared error type grew it; what was missing was the paths
+// that could return it.
+fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
+	let mut buf: Vec<u8> = Vec::new();
+	buf.try_reserve_exact(len).map_err(|_| FsError::NoMemory)?;
+	buf.resize(len, 0);
+	Ok(buf)
 }
 
 impl<D: BlockDevice> FatFs<D> {
@@ -575,6 +599,10 @@ impl<D: BlockDevice> FatFs<D> {
 		// and so the three of them are checked against each other on the way in.
 		if let Some(root) = self.exfat_root {
 			self.claim_chain(root.bitmap_first, None, &mut owned, &mut claim)?;
+			// AND THE UP-CASE TABLE, which was validated at mount and then left out of the audit -
+			// so nothing stopped a file being allocated over the structure every name on the volume
+			// is compared through.
+			self.claim_chain(root.upcase_first, Some(root.upcase_size), &mut owned, &mut claim)?;
 		}
 		// The root: a chained root on FAT32 and exFAT, and the fixed region (cluster 0) on FAT12
 		// and FAT16, which owns no clusters and is walked without claiming any.
@@ -597,6 +625,15 @@ impl<D: BlockDevice> FatFs<D> {
 				if entry.first_cluster == 0 {
 					continue;
 				}
+				// THE SELF AND PARENT LINKS ARE NOT OWNERSHIP. `.` names this directory's own chain
+				// and `..` names its parent's, both already claimed by whoever descended here - so
+				// claiming them again reads as two chains sharing clusters, which is exactly the
+				// condition this audit exists to catch. They were unreachable while the walk never
+				// descended into a classic subdirectory at all; they are the first thing it meets
+				// now that it does.
+				if entry.name == "." || entry.name == ".." {
+					continue;
+				}
 				let length = if entry.no_fat_chain { Some(entry.size) } else { None };
 				if entry.is_dir {
 					// A directory reached twice is a namespace this walk cannot terminate over, and
@@ -609,7 +646,22 @@ impl<D: BlockDevice> FatFs<D> {
 					seen_dirs.push(entry.first_cluster);
 					self.claim_chain(entry.first_cluster, length, &mut owned, &mut claim)?;
 					pending.try_reserve(1).map_err(|_| FsError::NoMemory)?;
-					pending.push(Dir { cluster: entry.first_cluster, nfc_len: length, rec_len: Some(entry.size), parent: None, understanding: entry.understanding });
+					// `rec_len` IS AN exFAT FIELD, and passing it for a classic volume made this
+					// audit read nothing at all.
+					//
+					// A classic directory entry records a size of ZERO for a directory - the
+					// convention every FAT implementation follows - so `Some(0)` gave
+					// `read_dir_bytes` a zero cap, `read_chain(.., 0)` returned an empty vector
+					// without touching a cluster, and the walk claimed the subdirectory's own chain
+					// and then descended into nothing. Every file and every nested directory below
+					// the root went unclaimed, which is most of the volume on anything but a flat
+					// one - so the audit's whole premise, that a cluster belongs to at most one
+					// chain, was established for the root alone.
+					//
+					// `resolve_dir` sets `rec_len` only for exFAT, which is why ordinary traversal
+					// never had this and only the audit did.
+					let rec_len = if self.geo.kind == Kind::ExFat { Some(entry.size) } else { None };
+					pending.push(Dir { cluster: entry.first_cluster, nfc_len: length, rec_len, parent: None, understanding: entry.understanding });
 					continue;
 				}
 				self.claim_chain(entry.first_cluster, length, &mut owned, &mut claim)?;
@@ -674,7 +726,18 @@ impl<D: BlockDevice> FatFs<D> {
 		}
 		// A chain that ends anywhere other than an end-of-chain marker names a cluster outside the
 		// pool, which is not a chain this volume can own.
-		if cluster >= 2 && !self.is_end(cluster) {
+		//
+		// AND 0 AND 1 ARE SUCH ENDINGS, which this let through. The walk continues while the value
+		// is at least 2, so a FAT entry of 0 (FREE) or 1 (RESERVED) after the last live cluster
+		// exits the loop - and `cluster >= 2` then skipped the check entirely, returning `Ok`. The
+		// comment directly above says only an end-of-chain marker terminates a chain, and the
+		// condition beneath it did not enforce that.
+		//
+		// It matters because this is the MOUNT audit: a file whose chain runs into a free cluster
+		// is a file whose next allocation will hand that cluster to somebody else while this file
+		// still points at it. The read cursor was corrected for exactly this condition; the audit
+		// uses a separate walker and kept the hole.
+		if !self.is_end(cluster) {
 			return Err(FsError::Corrupt);
 		}
 		Ok(())
@@ -817,7 +880,7 @@ impl<D: BlockDevice> FatFs<D> {
 			}
 		}
 		let mut done = 0usize;
-		let mut scratch = vec![0u8; cluster_bytes as usize];
+		let mut scratch = try_zeroed(cluster_bytes as usize)?;
 		let mut within = (offset % cluster_bytes) as usize;
 		while done < want {
 			let cluster = chain.current(self)?;
@@ -1120,7 +1183,7 @@ impl<D: BlockDevice> FatFs<D> {
 	fn read_root_region(&mut self) -> Result<Vec<u8>, FsError> {
 		let root_sectors = (self.geo.root_entries * 32).div_ceil(self.geo.bytes_per_sector);
 		let start = self.geo.reserved_sectors + self.geo.num_fats * self.geo.fat_size;
-		let mut out = vec![0u8; (root_sectors * self.geo.bytes_per_sector) as usize];
+		let mut out = try_zeroed((root_sectors * self.geo.bytes_per_sector) as usize)?;
 		self.read_fs_sectors(start as u64, root_sectors, &mut out)?;
 		Ok(out)
 	}
@@ -1186,8 +1249,10 @@ impl<D: BlockDevice> FatFs<D> {
 				return Err(FsError::TooLarge);
 			}
 			let sec = self.cluster_fs_sector(cluster);
-			let mut buf = vec![0u8; cluster_bytes];
+			let mut buf = try_zeroed(cluster_bytes)?;
 			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut buf)?;
+			out.try_reserve(buf.len()).map_err(|_| FsError::NoMemory)?;
+			out.try_reserve(buf.len()).map_err(|_| FsError::NoMemory)?;
 			out.extend_from_slice(&buf);
 			chain.advance(self)?;
 		}
@@ -1223,8 +1288,9 @@ impl<D: BlockDevice> FatFs<D> {
 		let mut chain = ChainCursor::new(first, false, max);
 		while let ChainState::Cluster(cluster) = chain.state(self)? {
 			let sec = self.cluster_fs_sector(cluster);
-			let mut buf = vec![0u8; cluster_bytes];
+			let mut buf = try_zeroed(cluster_bytes)?;
 			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut buf)?;
+			out.try_reserve(buf.len()).map_err(|_| FsError::NoMemory)?;
 			out.extend_from_slice(&buf);
 			if out.len() >= limit {
 				chain.settle(self)?;
@@ -1296,8 +1362,9 @@ impl<D: BlockDevice> FatFs<D> {
 		let mut out: Vec<u8> = Vec::new();
 		for i in 0..count {
 			let sec = self.cluster_fs_sector(first + i);
-			let mut buf = vec![0u8; cluster_bytes];
+			let mut buf = try_zeroed(cluster_bytes)?;
 			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut buf)?;
+			out.try_reserve(buf.len()).map_err(|_| FsError::NoMemory)?;
 			out.extend_from_slice(&buf);
 		}
 		out.truncate(limit);
@@ -1374,7 +1441,7 @@ impl<D: BlockDevice> FatFs<D> {
 		let sectors: u32 = if byte_off % bps as u64 == bps as u64 - 1 { 2 } else { 1 };
 		let sec = fat_base as u64 + byte_off / bps as u64;
 		let within = (byte_off % bps as u64) as usize;
-		let mut buf = vec![0u8; (bps * sectors) as usize];
+		let mut buf = try_zeroed((bps * sectors) as usize)?;
 		self.read_fs_sectors(sec, sectors, &mut buf)?;
 		Ok(match self.geo.kind {
 			Kind::Fat12 => {
@@ -1498,7 +1565,7 @@ impl<D: BlockDevice> FatFs<D> {
 			let fat_base = self.geo.reserved_sectors + fat * self.geo.fat_size;
 			let sec = fat_base as u64 + byte_off / bps as u64;
 			let within = (byte_off % bps as u64) as usize;
-			let mut buf = vec![0u8; (bps * sectors) as usize];
+			let mut buf = try_zeroed((bps * sectors) as usize)?;
 			if let Err(error) = self.read_fs_sectors(sec, sectors, &mut buf) {
 				self.restore_fat_sectors(undo, sectors);
 				return Err(error);
@@ -1606,7 +1673,7 @@ impl<D: BlockDevice> FatFs<D> {
 	fn write_clusters(&mut self, chain: &[u32], data: &[u8]) -> Result<(), FsError> {
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		for (i, c) in chain.iter().enumerate() {
-			let mut buf = vec![0u8; cluster_bytes];
+			let mut buf = try_zeroed(cluster_bytes)?;
 			let off = i * cluster_bytes;
 			let end = (off + cluster_bytes).min(data.len());
 			if off < data.len() {
@@ -2434,7 +2501,7 @@ impl<D: BlockDevice> FatFs<D> {
 		if !decoded.ascii_prefix_ok() {
 			return Err(FsError::Invalid);
 		}
-		Ok((ExfatRoot { bitmap_first, bitmap_size }, decoded))
+		Ok((ExfatRoot { bitmap_first, bitmap_size, upcase_first: first, upcase_size: size }, decoded))
 	}
 
 	// WHERE THE BITMAP IS, as the mount's own scan of the root recorded it.

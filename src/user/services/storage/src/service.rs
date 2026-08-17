@@ -1876,7 +1876,17 @@ impl FatBacking {
 			// volume was not there, and a medium this build cannot read told them the same thing.
 			// The three answers below send somebody somewhere different, which is the whole point
 			// of the distinction existing.
-			self.fs = FatFs::mount(FatBlockDevice { chan: self.chan });
+			match FatFs::mount_checked(FatBlockDevice { chan: self.chan }) {
+				Ok(fs) => self.fs = Some(fs),
+				// The device did not answer, or the memory was not there: both are worth retrying
+				// and neither says anything about the medium.
+				Err(fat::MountError::Io | fat::MountError::NoMemory) => return Err(Error::Again),
+				// A medium this build cannot read, or one whose own structures failed their own
+				// checks. Retrying changes nothing.
+				Err(fat::MountError::Unsupported | fat::MountError::Corrupt) => return Err(Error::Invalid),
+				// Nothing here claims to be FAT, which is the one answer that really is "not found".
+				Err(fat::MountError::NotFat) => return Err(Error::NotFound),
+			}
 		}
 		self.fs.as_mut().ok_or(Error::NotFound)
 	}

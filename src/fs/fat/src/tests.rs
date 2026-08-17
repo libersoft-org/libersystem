@@ -3977,3 +3977,59 @@ fn an_exfat_bitmap_too_short_for_the_heap_is_not_a_volume_to_write_to() {
 	short[root + 24..root + 32].copy_from_slice(&(size / 2).to_le_bytes());
 	assert!(FatFs::mount(MemDisk { data: short }).is_none(), "a bitmap that cannot describe the heap it belongs to is not a volume this driver acts on");
 }
+
+// NOT TESTED, AND SAID SO: a chain whose LAST FAT value is 0 or 1.
+//
+// `claim_chain` walks while the value is at least 2, so a free or reserved entry after the last
+// live cluster exits the loop - and the final check was `cluster >= 2 && !is_end(cluster)`, which
+// skipped both. That is corrected, and the comment above the check already stated the rule it
+// failed to enforce.
+//
+// A test was written and withdrawn because it passed either way: patching an end marker in the raw
+// image degrades the mount through a DIFFERENT path - the walk sees a cluster outside the pool -
+// so it could not tell the corrected condition from the old one. Reaching the case needs a fixture
+// that ends a chain at 0 or 1 while every other invariant still holds, which `build_fat` cannot
+// produce. Left as a coverage gap rather than as a test that proves nothing.
+
+#[test]
+fn the_ownership_audit_descends_into_classic_subdirectories() {
+	// The audit pushed `rec_len: Some(entry.size)` for every subdirectory regardless of family, and
+	// a CLASSIC directory entry records a size of ZERO for a directory - the convention every FAT
+	// implementation follows. `read_dir_bytes` then saw `Some(0)`, `read_chain(.., 0)` returned an
+	// empty vector without touching a cluster, and the walk claimed the subdirectory's own chain and
+	// descended into nothing. Every file and every nested directory below the root went unclaimed,
+	// so the audit's premise - a cluster belongs to at most one chain - held for the ROOT alone.
+	//
+	// Two files in a subdirectory sharing a cluster is the condition the audit exists to catch. It
+	// is invisible from the root, so a volume carrying it mounted WRITABLE.
+	let img = build_fat(Kind::Fat16, &[File { path: "DOCS/a.txt", data: &[0xAA; 2048] }, File { path: "DOCS/b.txt", data: &[0xBB; 2048] }]);
+	let fs = FatFs::mount(MemDisk { data: img.clone() }).expect("mount");
+	assert!(!fs.is_degraded(), "the unmodified fixture mounts writable");
+
+	// Point b.txt's directory entry at a.txt's first cluster: two files, one chain, inside a
+	// subdirectory.
+	let a_at = img.windows(11).position(|w| w == b"A       TXT").expect("the fixture writes a.txt");
+	let b_at = img.windows(11).position(|w| w == b"B       TXT").expect("the fixture writes b.txt");
+	let mut crossed = img;
+	let a_lo = [crossed[a_at + 26], crossed[a_at + 27]];
+	let a_hi = [crossed[a_at + 20], crossed[a_at + 21]];
+	crossed[b_at + 26] = a_lo[0];
+	crossed[b_at + 27] = a_lo[1];
+	crossed[b_at + 20] = a_hi[0];
+	crossed[b_at + 21] = a_hi[1];
+
+	let fs = FatFs::mount(MemDisk { data: crossed }).expect("it still mounts - the volume is readable");
+	assert!(fs.is_degraded(), "two files in a SUBDIRECTORY sharing a chain is what the audit is for");
+}
+
+// NOT TESTED, AND SAID SO: a file allocated over the Up-case Table.
+//
+// The fix is that `audit_ownership` claims the table's chain - `scan_exfat_root` validated it at
+// mount and then discarded the allocation, so nothing stopped a file cross-linking the one
+// structure every name on the volume is compared through.
+//
+// A test was written and withdrawn because it could not be made to reach the case: patching the
+// file's Stream Extension to point at the table's first cluster needs the root directory located
+// exactly, and a byte scan for the record markers finds `0xC0` and `0x82` inside the boot region
+// and the FAT long before the directory. `build_exfat` exposes no way to place a deliberately
+// cross-linked entry. Left as a coverage gap rather than as a test that passes for the wrong reason.
