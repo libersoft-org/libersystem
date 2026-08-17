@@ -1942,3 +1942,38 @@ fn a_length_no_volume_could_hold_is_too_long_rather_than_out_of_space() {
 	// says: this length is representable and would fit some volume, just not this one.
 	assert_eq!(fs.truncate(b"f", 128 * 1024), Err(FsError::NoSpace), "a length within the file limit but past the volume is out of space");
 }
+
+// NOT TESTED, AND SAID SO RATHER THAN IMPLIED: the reserved-rename COMPETITION itself.
+//
+// The fix is that `rename` releases the reservation before it allocates, as every other mutator
+// does. Showing the old behaviour failing needs a heap where the destination name fits only once
+// the reservation is gone - so the slack above the volume's capacity must be smaller than the name.
+// `MAX_NAME_BYTES` is 255, and a budget that tight aborts on the TEST HARNESS's own infallible
+// allocations (`assert_eq!` formatting, `expect`) long before it reaches the rename: measured, the
+// abort is a 76-byte allocation inside `within`. So no budget discriminates here, and a test that
+// passes either way would be worse than none.
+//
+// What IS covered is the other half - that a refusal still gives the reservation back - which is
+// the part the restructuring into `rename_unsynced` introduced the risk of.
+
+#[test]
+fn a_refused_reserved_rename_changes_nothing_and_keeps_its_reservation() {
+	// WHAT THIS CHECKS AND WHAT IT DOES NOT. It pins that a refused rename leaves the file where it
+	// was and the reservation whole - which is worth having, because moving the allocation out of
+	// the reservation's way meant restructuring `rename` around an early-returning helper, and a
+	// path that returns without resyncing would leave the volume permanently holding less than its
+	// policy promises.
+	//
+	// It does NOT reach the post-release refusal path: this destination is refused by a PREFLIGHT,
+	// which runs before the release point, so the reservation was never given up. Reaching a
+	// refusal after the release means making an allocation fail there, and the budget that would do
+	// it is tighter than the harness's own infallible allocations - see the note above.
+	const CAPACITY: usize = 8 * 1024;
+	within(CAPACITY + 2 * 1024, || {
+		let mut fs = LiberMemFs::mount(Policy::Reserved, CAPACITY).expect("mount");
+		fs.write_file(b"a", b"x").expect("a file");
+		assert!(fs.rename(b"a", b"missing/b").is_err(), "a rename into a directory that is not there is refused");
+		assert!(fs.reservation_intact(), "and the reservation is whole afterwards");
+		assert_eq!(fs.read_file(b"a").expect("read"), b"x", "with the file where it was");
+	});
+}

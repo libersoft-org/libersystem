@@ -1724,6 +1724,30 @@ impl LiberMemFs {
 		if !self.room_for_an_entry_by_bytes(destination_parts) {
 			return Err(FsError::NoSpace);
 		}
+		// THE RESERVATION IS RELEASED BEFORE THE FIRST ALLOCATION, which every other mutator does
+		// and this one did not.
+		//
+		// Under `Policy::Reserved` the volume holds its unused capacity as a real allocation. The
+		// destination name and the destination table's growth were allocated with that reservation
+		// STILL HELD, so a rename that fits the volume - and whose bytes were, by the policy's whole
+		// claim, already set aside - could fail because the filesystem was sitting on the memory it
+		// needed. Every preflight above has already run, so from here on the only refusals left are
+		// allocation ones.
+		if self.policy == Policy::Reserved {
+			self.release_reservation();
+		}
+		// IN ITS OWN CALL, so the resync below runs on EVERY path out - the same shape `write_file`
+		// uses, and for the same two reasons: every temporary the move makes is dropped before the
+		// reservation is asked for again, and a refusal cannot leave the volume holding less than
+		// its policy promises.
+		let moved = self.rename_unsynced(source_parts, source_name, destination_parts, destination_name);
+		self.resync_reservation();
+		moved
+	}
+
+	// The allocating half of `rename`. Every preflight has already run, so the only refusals left
+	// here are allocation ones - and the caller resyncs the reservation whichever way this ends.
+	fn rename_unsynced(&mut self, source_parts: &[&str], source_name: &str, destination_parts: &[&str], destination_name: &str) -> Result<(), FsError> {
 		let mut owned = String::new();
 		owned.try_reserve_exact(destination_name.len()).map_err(|_| FsError::NoMemory)?;
 		owned.push_str(destination_name);
@@ -1749,7 +1773,6 @@ impl LiberMemFs {
 			let children = self.parent_mut(source_parts)?;
 			shrink_children(children);
 		}
-		self.resync_reservation();
 		Ok(())
 	}
 
