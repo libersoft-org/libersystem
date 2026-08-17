@@ -342,15 +342,36 @@ impl<D: BlockDevice> LiberFs<D> {
 		if dir.r#type != TYPE_DIR {
 			return Err(FsError::NotDir);
 		}
-		let mut page = Vec::new();
-		self.collect_dir_page(dir.dir_root, dir.dir_root_crc, after, max, &mut page)?;
+		// A PAGE OF `max` HEALTHY ENTRIES, not a page of `max` records some of which survive.
+		//
+		// `collect_dir_page` stops after `max` RAW records and the loop below then drops the ones
+		// whose inode will not read. So a run of `max` dangling or damaged records produced an EMPTY
+		// page - and the public contract says an empty page ends the enumeration, with no cursor
+		// left to reach the healthy entries behind them. A paginated backup, sync or repair walk
+		// would silently omit everything after the first damaged run.
+		//
+		// Refilling from the last raw name keeps the cursor moving through the damage instead of
+		// stopping in it. Bounded: each round advances past at least one record, and the walk ends
+		// when a round returns nothing, which is the tree really being exhausted.
 		let mut out = Vec::new();
-		for (name, inode_num) in page {
-			match self.read_inode(inode_num) {
-				Ok(inode) => out.push((name, inode.size, inode.r#type == TYPE_DIR, inode.mtime, inode.ctime)),
-				Err(FsError::Io) => return Err(FsError::Io),
-				Err(FsError::Invalid | FsError::Corrupt) => {}
-				Err(e) => return Err(e),
+		let mut cursor: Option<Vec<u8>> = after.map(|a| a.to_vec());
+		while out.len() < max {
+			let mut page = Vec::new();
+			let want = max - out.len();
+			self.collect_dir_page(dir.dir_root, dir.dir_root_crc, cursor.as_deref(), want, &mut page)?;
+			if page.is_empty() {
+				break;
+			}
+			cursor = page.last().map(|(name, _): &(Vec<u8>, u32)| name.clone());
+			for (name, inode_num) in page {
+				match self.read_inode(inode_num) {
+					Ok(inode) => out.push((name, inode.size, inode.r#type == TYPE_DIR, inode.mtime, inode.ctime)),
+					Err(FsError::Io) => return Err(FsError::Io),
+					// Dropped from the page and stepped over by the cursor above, so the entries
+					// behind them stay reachable.
+					Err(FsError::Invalid | FsError::Corrupt) => {}
+					Err(e) => return Err(e),
+				}
 			}
 		}
 		Ok(out)

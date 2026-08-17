@@ -141,7 +141,12 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn flush_extents(&mut self, inode: &mut Inode) -> Result<(), FsError> {
 		// the rebuilt chain replaces the old one wholesale: drop the old blocks.
 		self.walk_chain(inode.spill, |fs, ptr| fs.drop_block(ptr))?;
-		inode.extent_count = inode.extents.len() as u32;
+		// CHECKED, because the on-disk field is a `u32` and the map in memory is a `usize`. The cast
+		// silently wrapped, so an inode with more than `u32::MAX` extents wrote a count describing a
+		// fraction of its own map - and every later read would follow that fraction and treat the
+		// rest of the file as absent. Nothing in this build reaches the ceiling today, which is
+		// precisely why the truncation would go unnoticed if it ever did.
+		inode.extent_count = u32::try_from(inode.extents.len()).map_err(|_| FsError::TooLarge)?;
 		if inode.extents.len() <= EXTENTS_INLINE {
 			inode.spill = 0;
 			inode.spill_crc = 0;

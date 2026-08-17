@@ -18,6 +18,22 @@ pub(crate) struct StructureTally {
 	pub stream: u32,
 }
 
+// Which tally an error belongs in, so a failure the MEDIUM caused is never counted as damage to the
+// filesystem's shape.
+//
+// Three reports in `check_structure` wrote plain text and incremented nothing: the root inode, the
+// snapshot table re-read and the inode-tree walk. So an unreadable disc, a checksum mismatch and a
+// genuinely impossible record produced the same note and the same (zero) counts - and the caller
+// that decides whether a volume is damaged or merely unreachable had nothing to decide on. This
+// crate has drawn that distinction everywhere else since its own audit; the structure pass had not.
+fn count_by_cause(error: FsError, tally: &mut StructureTally) {
+	match error {
+		FsError::Io => tally.io += 1,
+		FsError::Corrupt => tally.checksum += 1,
+		_ => tally.structural += 1,
+	}
+}
+
 impl<D: BlockDevice> LiberFs<D> {
 	// Verify integrity. With copy-on-write a crash cannot leak blocks or orphan an
 	// inode (the free map is derived and a commit is atomic), so there is nothing to
@@ -258,7 +274,10 @@ impl<D: BlockDevice> LiberFs<D> {
 		match self.read_inode(self.root_inode) {
 			Ok(inode) if inode.r#type == TYPE_DIR => {}
 			Ok(_) => note("root inode is not a directory", faults),
-			Err(_) => note("root inode cannot be read", faults),
+			Err(error) => {
+				count_by_cause(error, &mut tally);
+				note("root inode cannot be read", faults);
+			}
 		}
 
 		// the snapshot table as it is ON DISK, not as the mount remembers it. Nothing
@@ -275,7 +294,10 @@ impl<D: BlockDevice> LiberFs<D> {
 					note("the snapshot table on disk differs from the mounted one", faults);
 				}
 			}
-			Err(_) => note("the snapshot table cannot be re-read", faults),
+			Err(error) => {
+				count_by_cause(error, &mut tally);
+				note("the snapshot table cannot be re-read", faults);
+			}
 		}
 
 		// every inode in the tree, checked as a shape and collected so the ones no name
@@ -285,7 +307,8 @@ impl<D: BlockDevice> LiberFs<D> {
 			note("not enough memory to check the inode tree's structure", faults);
 			return tally;
 		};
-		if self.walk_inode_records(self.inode_root, self.inode_root_crc, TREE_DEPTH_MAX, &mut inodes, &mut seen_blocks, faults, &mut tally).is_err() {
+		if let Err(error) = self.walk_inode_records(self.inode_root, self.inode_root_crc, TREE_DEPTH_MAX, &mut inodes, &mut seen_blocks, faults, &mut tally) {
+			count_by_cause(error, &mut tally);
 			note("the inode tree could not be walked to the end", faults);
 		}
 
@@ -371,7 +394,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		set_bit(seen, ptr);
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		self.read_node(ptr, crc, &mut buf)?;
+		self.read_node_raw(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
 			// The record count and the key order come from the function `tree_insert_node` and
 			// `tree_delete_node` call before they binary-search this leaf, so the pass and the
@@ -474,7 +497,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				continue;
 			}
 			set_bit(&mut visited, ptr);
-			if self.read_node(ptr, crc, &mut buf).is_err() {
+			if self.read_node_raw(ptr, crc, &mut buf).is_err() {
 				faults.push(alloc::format!("inode {num}: a directory node that does not match the checksum recorded for it").into_bytes());
 				continue;
 			}
@@ -698,7 +721,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(0);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		self.read_node(ptr, crc, &mut buf)?;
+		self.read_node_raw(ptr, crc, &mut buf)?;
 		if test_bit(visited, ptr) {
 			return Ok(0);
 		}
@@ -828,7 +851,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(0);
 		}
 		let mut buf = vec![0u8; BLOCK_SIZE];
-		self.read_node(ptr, crc, &mut buf)?;
+		self.read_node_raw(ptr, crc, &mut buf)?;
 		if test_bit(visited, ptr) {
 			return Ok(0);
 		}

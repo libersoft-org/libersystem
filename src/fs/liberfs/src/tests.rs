@@ -988,7 +988,11 @@ fn a_pinned_snapshots_undecodable_stream_is_reported() {
 	// said the pinned generations were verified. For a snapshot that matters more than for the live
 	// tree: the data may be needed after the live copy is gone.
 	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
-	fs.set_compression(true);
+	// CHECKED, not discarded. Both of these called `set_compression(true)` and threw the `Result`
+	// away, so a regression in compression setup left the test green while it exercised the RAW
+	// path it is named after the compressed one. The compiler warned about it, which is the kind of
+	// warning a red gate makes invisible.
+	fs.set_compression(true).expect("the volume takes the compression setting");
 	fs.write_file(b"c.bin", &[0x41u8; 4 * BLOCK_SIZE]).unwrap();
 	fs.create_snapshot(b"s1").unwrap();
 	// REMOVED, not rewritten. Rewriting left a live `c.bin` whose own extent `first_extent_of`
@@ -5025,13 +5029,25 @@ fn a_compressed_extent_with_a_bad_checksum_is_counted_once() {
 	// because it was in `faults` and was not a stream failure. The three counters exist because they
 	// send an operator to three different places; two of them naming one fault defeats that.
 	let mut fs = LiberFs::format_scratch(MemDevice::new(NBLOCKS), NBLOCKS).unwrap();
-	fs.set_compression(true);
+	// CHECKED, not discarded. Both of these called `set_compression(true)` and threw the `Result`
+	// away, so a regression in compression setup left the test green while it exercised the RAW
+	// path it is named after the compressed one. The compiler warned about it, which is the kind of
+	// warning a red gate makes invisible.
+	fs.set_compression(true).expect("the volume takes the compression setting");
 	fs.write_file(b"c.bin", &[0x41u8; 4 * BLOCK_SIZE]).unwrap();
 	assert_eq!(fs.fsck().unwrap().checksum_failures, 0, "a healthy compressed file is clean");
 
 	// Damage a stored block and leave the checksum alone: the medium disagrees with what was
 	// written, which is precisely one fault of precisely one kind.
 	let mut dev = fs.into_device();
+	// AND THE EXTENT REALLY IS COMPRESSED, which every assertion below assumes and none of them
+	// checked - all of them pass for a RAW extent with a bad checksum too, so a compression
+	// regression could leave this test green while it stopped testing its own subject.
+	{
+		let slot = active_slot(&dev);
+		let sb = parse_superblock(&dev.blocks[slot * BLOCK_SIZE..(slot + 1) * BLOCK_SIZE]).unwrap();
+		assert!(sb.compress, "the volume records the compression setting it was given");
+	}
 	let (block, _) = first_extent_of(&dev);
 	let at = block as usize * BLOCK_SIZE;
 	dev.blocks[at + 4..at + 16].copy_from_slice(&[0xFFu8; 12]);

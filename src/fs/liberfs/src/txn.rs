@@ -67,7 +67,15 @@ impl<D: BlockDevice> LiberFs<D> {
 		// increment below could wrap and produce a superblock that looks OLDER than the
 		// one it supersedes - which would make the volume mount at the wrong generation
 		// from then on. Refuse the commit instead; the volume stays exactly as it is.
-		if self.generation == u64::MAX {
+		// OFF BY ONE, AND THE ONE MATTERS. This refused a commit AT `u64::MAX`, which stops the
+		// increment wrapping - but the increment then publishes `MAX` from `MAX - 1`, and the
+		// superblock parser refuses `MAX` outright. So the last permitted commit wrote a volume
+		// that cannot be mounted again: the write succeeds, the medium is consistent, and the next
+		// boot reads the paired slot and silently goes back a generation.
+		//
+		// The bound belongs where the parser's is: the generation ABOUT TO BE WRITTEN must be one
+		// the parser will accept.
+		if self.generation >= u64::MAX - 1 {
 			self.abort();
 			return Err(FsError::NoSpace);
 		}
@@ -751,6 +759,25 @@ impl<D: BlockDevice> LiberFs<D> {
 	// shared device, and a checksum proves integrity, not sanity - a forged link with a
 	// matching CRC must not surface foreign bytes as tree contents.
 	pub(crate) fn read_node(&mut self, ptr: u64, crc: u32, buf: &mut [u8]) -> Result<(), FsError> {
+		self.read_node_raw(ptr, crc, buf)?;
+		// AND THE NODE HAS TO SAY WHICH KIND IT IS. Every caller tests `node_type(&buf) ==
+		// NODE_LEAF` and treats everything else as an INTERNAL node - so a byte of 2, or 200, was
+		// routed through as a router and its bytes read as (key, pointer, CRC) triples. The CRC
+		// proves integrity and not sanity: a node whose kind field is not one this format defines is
+		// damage, and this is the one place every live walker comes through.
+		if !matches!(buf[0], NODE_INTERNAL | NODE_LEAF) {
+			return Err(FsError::Corrupt);
+		}
+		Ok(())
+	}
+
+	// The same read WITHOUT the kind check, for `fsck`.
+	//
+	// The checker's whole job is to classify a block that is not a node, so it has to be able to
+	// READ one: refusing it here would turn `the_snapshot_checker_refuses_a_block_that_is_not_a_node`
+	// into an error where it currently reports one structural fault and carries on. The live paths
+	// get the refusal; the checker gets the bytes and decides what they are.
+	pub(crate) fn read_node_raw(&mut self, ptr: u64, crc: u32, buf: &mut [u8]) -> Result<(), FsError> {
 		if ptr >= self.num_blocks {
 			return Err(FsError::Corrupt);
 		}
