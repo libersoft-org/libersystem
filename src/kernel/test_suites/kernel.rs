@@ -389,6 +389,38 @@ fn syscall_object_and_handle_ops() {
 			// the READ-only duplicate lacks MAP, so mapping through it is denied
 			let dup_map = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, dup, 0, 0, 0);
 			assert!(syscall::sys_is_err(dup_map));
+
+			// A `READ | MAP` CAPABILITY MAPS READ-ONLY, and that is the property the mapping
+			// syscalls did not have. They checked `MAP` and then built a writable PTE
+			// unconditionally, so a capability deliberately attenuated to `READ | MAP` produced a
+			// writable mapping - which is the whole of what attenuation is for. The kernel hands out
+			// exactly such capabilities: the bootstrap package and the ramdisk are passed read-only
+			// and a holder could write to both.
+			//
+			// The write is not attempted here, because a refused write is a page fault and this
+			// thread would die rather than report. What is asserted is the PTE the mapping produced,
+			// which is the fact the fault would follow from.
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, handle, 0, 0, 0) as i64, 0);
+			let read_only = arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, handle, (Rights::READ | Rights::MAP).bits() as u64, 0, 0);
+			assert!(!syscall::sys_is_err(read_only));
+			let ro_virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, read_only, 0, 0, 0);
+			assert!(!syscall::sys_is_err(ro_virt), "READ | MAP may still be mapped - MAP is what says whether, not what says how");
+			assert_eq!(arch::paging::translate_flags(ro_virt).map(|f| f & arch::paging::WRITABLE), Some(0), "a capability without WRITE must not produce a writable mapping");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, read_only, 0, 0, 0) as i64, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, read_only, 0, 0, 0) as i64, 0);
+
+			// And WRITE | MAP still maps writable, so this is a rights check and not a refusal of
+			// writable mappings.
+			let writable = arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, handle, (Rights::READ | Rights::WRITE | Rights::MAP).bits() as u64, 0, 0);
+			assert!(!syscall::sys_is_err(writable));
+			let rw_virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, writable, 0, 0, 0);
+			assert!(!syscall::sys_is_err(rw_virt));
+			assert_ne!(arch::paging::translate_flags(rw_virt).map(|f| f & arch::paging::WRITABLE), Some(0), "WRITE | MAP maps writable");
+			(rw_virt as *mut u64).write_volatile(0xfeed_face);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, writable, 0, 0, 0) as i64, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, writable, 0, 0, 0) as i64, 0);
+			let virt = arch::syscall::invoke(syscall::SYS_MEMORY_MAP, handle, 0, 0, 0);
+			assert!(!syscall::sys_is_err(virt));
 			// unmap and close both handles
 			assert_eq!(arch::syscall::invoke(syscall::SYS_MEMORY_UNMAP, handle, 0, 0, 0) as i64, 0);
 			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle, 0, 0, 0) as i64, 0);

@@ -423,7 +423,11 @@ fn display_service_restores_the_console_surface() {
 	let mut fb_reply = unsafe { core::slice::from_raw_parts(&fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) }.to_vec();
 	fb_reply.extend_from_slice(&4u32.to_le_bytes());
 	fb_reply.extend_from_slice(&4u32.to_le_bytes());
-	send_cap(&gpu_kernel, &fb_reply, scanout.clone(), Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
+	// `WRITE` EXPLICITLY: DisplayService COMPOSITES into this scanout. It was handed over with `MAP`
+	// alone, which worked only while every mapping was writable regardless of what the capability
+	// said - `sys_memory_map` and `sys_dma_buffer_map` now set the writable bit from `Rights::WRITE`,
+	// so a surface to be drawn into has to say it is one.
+	send_cap(&gpu_kernel, &fb_reply, scanout.clone(), Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("DisplayService online report");
 	assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
@@ -535,7 +539,7 @@ fn display_service_restores_the_console_surface() {
 	replacement.extend_from_slice(unsafe { core::slice::from_raw_parts(&large_fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) });
 	replacement.extend_from_slice(&1024u32.to_le_bytes());
 	replacement.extend_from_slice(&768u32.to_le_bytes());
-	send_cap(&gpu_kernel, &replacement, large_scanout, Rights::MAP | Rights::TRANSFER).expect("large framebuffer replacement");
+	send_cap(&gpu_kernel, &replacement, large_scanout, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER).expect("large framebuffer replacement");
 	acknowledge_present(&gpu_kernel, None);
 	let resized = events.recv().expect("large resize event");
 	assert_eq!((le_u32(&resized.bytes, 4), le_u32(&resized.bytes, 8)), (1024, 768));
@@ -1309,7 +1313,7 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	let mut fb_reply = unsafe { core::slice::from_raw_parts(&fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) }.to_vec();
 	fb_reply.extend_from_slice(&FB_W.to_le_bytes());
 	fb_reply.extend_from_slice(&FB_H.to_le_bytes());
-	send_cap(&gpu_kernel, &fb_reply, scanout, Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
+	send_cap(&gpu_kernel, &fb_reply, scanout, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
 	sched::run_until_idle();
 	let online = display_boot_kernel.recv().expect("DisplayService online report");
 	assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");

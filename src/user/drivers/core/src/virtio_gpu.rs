@@ -480,7 +480,12 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, 
 								// FBNEW: the new backing's geometry, the display size, and a
 								// mappable dup - ConsoleService remaps, swaps its surfaces, and
 								// closes its old handle (which frees the old buffer).
-								let dup: i64 = duplicate(backing.handle, RIGHT_MAP | RIGHT_TRANSFER);
+								// `RIGHT_WRITE` EXPLICITLY. The receiver maps this framebuffer and DRAWS into it, and it
+								// used to be handed over with `MAP` alone - which worked only because every
+								// mapping was made writable whether or not the capability said so. Now that
+								// `WRITE` is what decides, the intent has to be stated: this is a surface to
+								// render into, so the grant says so.
+								let dup: i64 = duplicate(backing.handle, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER);
 								if dup < 0 {
 									exit();
 								}
@@ -535,7 +540,12 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, 
 							// hand back the allocated framebuffer geometry (pitch and extent),
 							// the current display size, and a mappable, transferable dup of the
 							// backing handle (we keep our own handle to stay pinned).
-							let dup: i64 = duplicate(backing.handle, RIGHT_MAP | RIGHT_TRANSFER);
+							// `RIGHT_WRITE` EXPLICITLY. The receiver maps this framebuffer and DRAWS into it, and it
+							// used to be handed over with `MAP` alone - which worked only because every
+							// mapping was made writable whether or not the capability said so. Now that
+							// `WRITE` is what decides, the intent has to be stated: this is a surface to
+							// render into, so the grant says so.
+							let dup: i64 = duplicate(backing.handle, RIGHT_READ | RIGHT_WRITE | RIGHT_MAP | RIGHT_TRANSFER);
 							if dup < 0 {
 								exit();
 							}

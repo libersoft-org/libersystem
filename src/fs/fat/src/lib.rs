@@ -898,7 +898,35 @@ impl<D: BlockDevice> FatFs<D> {
 			if !e.is_dir {
 				return Err(FsError::NotDir);
 			}
-			let cluster = if e.first_cluster == 0 { self.root_cluster() } else { e.first_cluster };
+			// A ZERO FIRST CLUSTER IS NOT THE ROOT, and this line said it was - unconditionally, for
+			// every directory entry, in both FAT families.
+			//
+			// The rule it was reaching for is a classic-FAT one: a `..` entry pointing at the root
+			// records cluster zero, because FAT12/16 keep the root outside the cluster area and have
+			// no number for it. Applied to any directory it aliases the root. exFAT has no `.` or
+			// `..` entries at all and its specification permits an EMPTY directory with
+			// `DataLength = 0` and no allocation - so a perfectly valid exFAT directory named
+			// `EMPTY` made `list_dir("EMPTY")` list the root, `write_file("EMPTY/X", ..)` create `X`
+			// in the root, and `remove("EMPTY/X")` remove a root file. That is a namespace failure
+			// on VALID metadata, not graceful handling of a damaged disc.
+			//
+			// The normalisation is now what it always meant: only for a classic `..` record. An
+			// unallocated exFAT directory is refused rather than aliased - reading it as empty would
+			// need a distinct empty-directory state, and creating in it would need the first cluster
+			// allocated and its own Stream Extension updated, neither of which exists here. Refusing
+			// names the limit; aliasing hides it behind the wrong directory.
+			let dotdot_to_root = self.geo.kind != Kind::ExFat && seg == b"..";
+			let cluster = if e.first_cluster == 0 {
+				// `Invalid`, which `fs-core` documents as an operation the filesystem cannot
+				// perform: an unallocated directory is a shape this reader does not implement, and
+				// saying so is the honest answer where aliasing the root was a wrong one.
+				if !dotdot_to_root {
+					return Err(FsError::Invalid);
+				}
+				self.root_cluster()
+			} else {
+				e.first_cluster
+			};
 			let nfc_len = if e.no_fat_chain && e.first_cluster != 0 { Some(e.size) } else { None };
 			let rec_len = if self.geo.kind == Kind::ExFat && nfc_len.is_none() && cluster != self.root_cluster() { Some(e.size) } else { None };
 			let parent = if cluster == self.root_cluster() { None } else { Some(Parent { cluster: dir.cluster, nfc_len: dir.nfc_len, set_off: e.set_off, ent_off: e.ent_off }) };

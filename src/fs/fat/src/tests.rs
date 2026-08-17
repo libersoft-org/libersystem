@@ -3730,3 +3730,45 @@ fn an_upcase_table_that_ends_early_is_refused() {
 	// about coverage and not a rejection of the compressed form.
 	assert!(crate::dir::Upcase::decode(&exfat_upcase_table()).is_some(), "a table that covers 0000h-FFFFh decodes");
 }
+
+#[test]
+fn a_directory_with_no_first_cluster_is_not_the_root() {
+	// `resolve_dir` turned EVERY directory entry whose `first_cluster` is zero into the root
+	// cluster - unconditionally, for both FAT families. The rule it was reaching for is a classic
+	// one: a `..` entry pointing at the root records cluster zero, because FAT12/16 keep the root
+	// outside the cluster area and have no number for it. Applied to an ordinary directory it
+	// ALIASES THE ROOT, so a path resolved to a different directory than the one it names - and
+	// then created, listed and removed files there.
+	//
+	// A FAT32 image with a subdirectory, whose entry is patched to cluster zero. exFAT reaches the
+	// same line through valid metadata (its specification permits a zero-length directory with no
+	// allocation and it has no dot entries at all), but a damaged classic entry gets there too and
+	// is far cheaper to construct.
+	let img = build_fat(Kind::Fat32, &[File { path: "DOCS/a.txt", data: b"in a subdir" }, File { path: "ROOTMARK.TXT", data: b"at the top" }]);
+
+	let mut patched = img.clone();
+	// The 8.3 entry for `DOCS` in the root directory: cluster high at offset 20, low at 26.
+	let at = patched.windows(11).position(|w| w == b"DOCS       ").expect("the fixture writes a DOCS directory entry");
+	patched[at + 20..at + 22].fill(0);
+	patched[at + 26..at + 28].fill(0);
+
+	let mut fs = FatFs::mount(MemDisk { data: patched }).expect("the patched image still mounts");
+	// THE POINT: whatever this answers, it must not be the ROOT's contents. Listing the root
+	// through a path that names something else is the failure, and an error is the honest answer
+	// for a directory this reader cannot follow.
+	match fs.list_dir(b"DOCS") {
+		Err(_) => {}
+		Ok(entries) => {
+			let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+			panic!("a directory with no first cluster resolved to something listable: {names:?}");
+		}
+	}
+
+	// And the unpatched image is ordinary, so this refuses the aliasing rather than the directory.
+	let mut good = FatFs::mount(MemDisk { data: img }).expect("mount");
+	assert!(good.list_dir(b"DOCS").is_ok(), "an allocated subdirectory still lists");
+	assert_eq!(good.read_file(b"DOCS/a.txt").expect("read"), b"in a subdir");
+	// `..` STILL REACHES THE ROOT on a classic volume, which is the case the normalisation exists
+	// for and the one that must not be broken by narrowing it.
+	assert_eq!(good.read_file(b"DOCS/../ROOTMARK.TXT").expect("parent traversal"), b"at the top");
+}
