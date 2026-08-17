@@ -846,12 +846,29 @@ impl<D: BlockDevice> FatFs<D> {
 		//    the free walks already accept), never a false failure of a finished write.
 		// 2b. BARRIER before the old chain is freed: the new entry has to be durable first, or a
 		//     crash can leave the OLD entry live with its clusters already back in the free pool.
-		self.barrier()?;
-		if let Some(old) = old_first {
+		//
+		// AND ITS FAILURE IS NOT THIS WRITE'S FAILURE. `swap_entry` returns `Ok` only after
+		// barriering twice - once behind the new entry and once behind the old one's retirement -
+		// so by here the namespace change is already durable and the comment above says as much.
+		// Propagating this barrier with `?` therefore reported `Io` for a write that HAD committed:
+		// StorageService turns that into `Again` and drops the mount, so the caller retries an
+		// operation known to have landed - another overwrite on classic FAT, leaking the old chain,
+		// and on exFAT a `VolumeDirty` left set so the remount is read-only over a consistent
+		// namespace.
+		//
+		// A failing barrier here means only that the ORDERING behind the free is unproven, so the
+		// free is skipped: that costs the old chain's clusters, which is the leak class the
+		// best-effort free already accepts, and it is the safe direction. What must not happen is
+		// handing those clusters back while their entry may still be live.
+		if self.barrier().is_ok()
+			&& let Some(old) = old_first
+		{
 			let _ = self.free_chain(old);
 		}
-		// Durable when it returns, which is what a caller that reports a written file assumes.
-		self.barrier()
+		// Best-effort for the same reason: the namespace is durable and a flush that fails after it
+		// says the durability of the CLEANUP is unknown, not that the write did not happen.
+		let _ = self.barrier();
+		Ok(())
 	}
 
 	// Delete a file named by a `/`-separated path: free its cluster chain and clear its
@@ -1986,11 +2003,19 @@ impl<D: BlockDevice> FatFs<D> {
 		};
 		// the write is durable once the entry set lands - the release of the replaced
 		// clusters is best-effort, like the classic path's.
-		self.barrier()?;
-		if let Some(old) = old {
+		//
+		// AND SO ARE THESE BARRIERS, for the reason the classic caller records: `exfat_swap_entry`
+		// returns `Ok` only after its own two barriers, so the namespace change has already been
+		// confirmed durable and a flush failing here cannot un-commit it. Propagating it made
+		// `under_dirty_flag` see a body error and deliberately leave `VolumeDirty` set - so a
+		// consistent namespace remounted READ-ONLY, on a write that succeeded.
+		if self.barrier().is_ok()
+			&& let Some(old) = old
+		{
 			let _ = self.exfat_release(&old);
 		}
-		self.barrier()
+		let _ = self.barrier();
+		Ok(())
 	}
 
 	// Delete an exFAT file: clear its entry set's in-use bits and release its clusters.
@@ -2495,6 +2520,18 @@ impl Geometry {
 		let reserved_sectors = u16::from_le_bytes([b[14], b[15]]) as u32;
 		let num_fats = b[16] as u32;
 		let root_entries = u16::from_le_bytes([b[17], b[18]]) as u32;
+		// THE ROOT REGION MUST BE A WHOLE NUMBER OF SECTORS' WORTH OF ENTRIES, which the
+		// specification requires and nothing checked.
+		//
+		// The region is rounded UP to full sectors, `read_root_region` hands back every byte of it,
+		// and `free_run` treats each 32-byte slot in that buffer as a directory slot - so a BPB
+		// declaring `RootEntCnt = 1` with 512-byte sectors gives this implementation SIXTEEN. Once
+		// the declared entry is taken, a create writes into sector padding and reports success, and
+		// a conforming reader bounded by `RootEntCnt` cannot see the file it wrote. That is a
+		// namespace two readers disagree about, produced by a write this build called successful.
+		if root_entries != 0 && (root_entries as u64 * 32) % bytes_per_sector as u64 != 0 {
+			return None;
+		}
 		let total16 = u16::from_le_bytes([b[19], b[20]]) as u32;
 		let fat16 = u16::from_le_bytes([b[22], b[23]]) as u32;
 		let total32 = u32::from_le_bytes([b[32], b[33], b[34], b[35]]);
@@ -2553,6 +2590,29 @@ impl Geometry {
 		let ext_flags = if kind == Kind::Fat32 { u16::from_le_bytes([b[40], b[41]]) as u32 } else { 0 };
 		let (mirror, active_fat) = if ext_flags & 0x80 != 0 { (false, ext_flags & 0x0F) } else { (true, 0) };
 		if active_fat >= num_fats {
+			return None;
+		}
+		// THE FAT HAS TO BE ABLE TO ADDRESS THE HEAP THIS VOLUME CLAIMS - the check the exFAT parser
+		// makes and this one did not.
+		//
+		// `max_cluster` silently takes the smaller of the table's capacity and the data region's, so
+		// a BPB declaring a large data region and a FAT that can only address its first part MOUNTED
+		// WRITABLE as a quietly smaller filesystem. `total_bytes()` then reports the whole declared
+		// heap while allocation and free-space scanning stop at the implicit smaller bound, which
+		// surfaces as premature `NoSpace` on a volume the caller was told had room. Taking a minimum
+		// keeps the writes in bounds and hides that the volume disagrees with itself.
+		//
+		// Entries for clusters 0 through `clusters + 1`, at this kind's width. FAT12 packs two
+		// entries into three bytes, so its need is computed in halves of a byte to avoid rounding a
+		// legal table away.
+		let slots = clusters as u64 + 2;
+		let table_bytes = fat_size as u64 * bytes_per_sector as u64;
+		let needed = match kind {
+			Kind::Fat12 => (slots * 3).div_ceil(2),
+			Kind::Fat16 => slots * 2,
+			Kind::Fat32 | Kind::ExFat => slots * 4,
+		};
+		if table_bytes < needed {
 			return None;
 		}
 		let fsinfo = if kind == Kind::Fat32 { u16::from_le_bytes([b[48], b[49]]) as u32 } else { 0 };

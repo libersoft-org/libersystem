@@ -745,7 +745,7 @@ fn mounts_and_lists_exfat() {
 
 #[test]
 fn reads_a_file_off_each_family() {
-	for kind in [Kind::Fat12, Kind::Fat16, Kind::Fat32] {
+	for (label, kind) in [("fat12", Kind::Fat12), ("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
 		let mut fs = FatFs::mount(MemDisk { data: build_fat(kind, ROOT) }).unwrap();
 		assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"Hello, FAT!");
 	}
@@ -3771,4 +3771,57 @@ fn a_directory_with_no_first_cluster_is_not_the_root() {
 	// `..` STILL REACHES THE ROOT on a classic volume, which is the case the normalisation exists
 	// for and the one that must not be broken by narrowing it.
 	assert_eq!(good.read_file(b"DOCS/../ROOTMARK.TXT").expect("parent traversal"), b"at the top");
+}
+
+#[test]
+fn a_classic_fat_too_short_for_its_own_heap_is_refused() {
+	// `max_cluster` takes the SMALLER of the table's capacity and the data region's, so a BPB
+	// declaring a large heap and a FAT that can address only its first part mounted writable as a
+	// quietly smaller filesystem. `total_bytes()` then reports the whole declared heap while
+	// allocation and free-space scanning stop at the implicit bound - premature `NoSpace` on a
+	// volume the caller was told had room. The exFAT parser has always refused the same
+	// inconsistency; the classic one did not.
+	for (label, kind) in [("fat12", Kind::Fat12), ("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
+		let good = build_fat(kind, &[File { path: "HELLO.TXT", data: b"hi" }]);
+		assert!(FatFs::mount(MemDisk { data: good.clone() }).is_some(), "{label}: the unmodified fixture mounts");
+
+		// Halve the declared FAT size, leaving the data region's own claim untouched.
+		let mut short = good;
+		let fat16_size = u16::from_le_bytes([short[22], short[23]]);
+		if fat16_size != 0 {
+			short[22..24].copy_from_slice(&(fat16_size / 2).to_le_bytes());
+		} else {
+			let fat32_size = u32::from_le_bytes([short[36], short[37], short[38], short[39]]);
+			short[36..40].copy_from_slice(&(fat32_size / 2).to_le_bytes());
+		}
+		assert!(FatFs::mount(MemDisk { data: short }).is_none(), "{label}: a FAT that cannot address the heap it declares is not a volume to mount");
+	}
+}
+
+#[test]
+fn a_flush_that_fails_after_the_commit_does_not_report_the_write_as_failed() {
+	// `swap_entry` returns `Ok` only after barriering twice - once behind the new entry set and once
+	// behind the old one's retirement - so by the time its caller runs, the namespace change is
+	// already durable. The caller then barriered again with `?`, which turned a failing POST-COMMIT
+	// flush into `FsError::Io` for a write that HAD committed.
+	//
+	// StorageService maps `Io` to `Again` and drops the mount, so the caller retries an operation
+	// known to have landed: another overwrite on classic FAT, leaking the old chain, and on exFAT a
+	// `VolumeDirty` left set so the remount is read-only over a consistent namespace.
+	//
+	// The flush index is found by counting. The LAST flush of the write was already best-effort -
+	// it is the cleanup one - so the flush that matters is the one BEFORE it: the barrier that
+	// stood between the commit and freeing the old chain, and the one that used to be propagated
+	// with `?`.
+	let img = build_fat(Kind::Fat32, &[File { path: "A.TXT", data: b"first" }]);
+	let mut fs = FatFs::mount(FailNthWrite::cut_flush(img.clone(), 0)).expect("mount");
+	fs.write_file(b"A.TXT", b"second").expect("a healthy overwrite");
+	let flushes = fs.device_for_test().flushes;
+	assert!(flushes >= 3, "the write barriers more than once: {flushes}");
+
+	// Now fail exactly the last one.
+	let mut fs = FatFs::mount(FailNthWrite::cut_flush(img, flushes - 1)).expect("mount");
+	let outcome = fs.write_file(b"A.TXT", b"second");
+	assert!(outcome.is_ok(), "a flush failing after the commit is not the write failing: {outcome:?}");
+	assert_eq!(fs.read_file(b"A.TXT").expect("read back"), b"second", "and the committed contents are what the file holds");
 }
