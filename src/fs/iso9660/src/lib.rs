@@ -145,6 +145,10 @@ pub enum MountError {
 	Corrupt,
 	// The device did not answer. Says nothing about what is on it.
 	Io,
+	// This machine could not get the memory the mount needed. NOT a statement about the medium, and
+	// the same distinction `FsError` draws: blaming a healthy disc sends a person to replace media
+	// that is fine, and makes a transient shortage look permanent.
+	NoMemory,
 }
 
 impl<D: BlockDevice> Iso9660<D> {
@@ -402,10 +406,27 @@ impl<D: BlockDevice> Iso9660<D> {
 				} else {
 					let mut found = false;
 					let mut area = sys.clone();
+					// EVERY CONTINUATION VISITED, so a cycle is refused rather than merely exhausting
+					// the iteration cap - reaching the cap and reaching the end of the chain used to
+					// be the same observation, and both produced a quietly non-Rock-Ridge mount.
+					let mut visited: alloc::vec::Vec<(u32, usize, usize)> = alloc::vec::Vec::new();
 					// Bounded: SUSP allows a chain, and a disc may name one that loops.
 					for _ in 0..4 {
-						// The chain ENDING is the one case that is not an error.
-						let Some((next_lba, offset, len)) = continuation_of(&area) else { break };
+						// The chain ENDING is the one case that is not an error; a malformed area or
+						// a malformed `CE` is now told apart from it.
+						let next = match continuation_of(&area) {
+							Ok(Some(next)) => next,
+							Ok(None) => break,
+							Err(()) => return Err(MountError::Corrupt),
+						};
+						if visited.contains(&next) {
+							return Err(MountError::Corrupt);
+						}
+						if visited.try_reserve(1).is_err() {
+							return Err(MountError::NoMemory);
+						}
+						visited.push(next);
+						let (next_lba, offset, len) = next;
 						// A pointer outside the medium is the disc contradicting itself, not the end
 						// of anything.
 						if next_lba as u64 >= blocks as u64 {
@@ -693,7 +714,17 @@ impl<D: BlockDevice> Iso9660<D> {
 				let rec_len = block[off] as usize;
 				// Zero length: the rest of THIS sector is padding, which is how ECMA-119 says a
 				// directory ends a sector early.
+				//
+				// AND PADDING IS ZEROES, WHICH WAS NOT CHECKED. One zero byte ended the sector and
+				// whatever followed was never looked at, so a sector holding a zero and then
+				// arbitrary bytes was treated as canonical padding: localised corruption hidden, and
+				// a short directory reported as a complete one. Nothing was parsed out of those
+				// bytes, so this is integrity rather than memory safety - but "the directory ended
+				// here" is a claim, and it is only true if the rest really is padding.
 				if rec_len == 0 {
+					if block[off..valid].iter().any(|&b| b != 0) {
+						return Err(FsError::Corrupt);
+					}
 					break;
 				}
 				// A Directory Record is 33 bytes before its identifier, and it may not cross the
@@ -1284,8 +1315,20 @@ struct SuspEntry<'a> {
 // ordinary case rather than an exotic one: `SP`, `PX` and `TF` leave no room for an `ER` naming
 // `IEEE_P1282`. The fields are both-endian pairs; the little-endian half is read, like every other
 // both-endian field in this reader.
-fn continuation_of(sys: &[u8]) -> Option<(u32, usize, usize)> {
+// THREE STATES, NOT TWO. This returned `Option` for a genuine absence, a malformed SUSP area and a
+// malformed `CE`, and the mount loop read every `None` as "the chain ended normally". So a small
+// corruption in one entry turned Rock Ridge OFF for the whole disc with no error anywhere - every
+// filename silently becoming its ISO fallback, which can collide with another file's, and the
+// caller opening a different path than the medium intends.
+//
+// `Err(())` is now "this area or this pointer is damaged" and `Ok(None)` is "there is no `CE`".
+fn continuation_of(sys: &[u8]) -> Result<Option<(u32, usize, usize)>, ()> {
 	let mut found = None;
+	// Set when a `CE` IS present and its own fields are impossible. Kept apart from the walk's own
+	// failure, which is a different thing: an area this reader cannot walk may simply hold a SUSP
+	// entry at a version it does not implement, and ending the chain there is conservative. A
+	// broken `CE` is damage in the pointer that decides where Rock Ridge is looked for.
+	let mut damaged = false;
 	// A malformed area answers `None` here rather than the entries before the damage: what a `CE`
 	// points at decides where Rock Ridge is looked for, and a pointer read out of a broken area is a
 	// pointer to nothing this reader can vouch for.
@@ -1304,21 +1347,31 @@ fn continuation_of(sys: &[u8]) -> Option<(u32, usize, usize)> {
 		//
 		// It matters more here than at most of them: the pointer decides where Rock Ridge is looked
 		// for, and therefore what every file on the disc is called.
+		// A `CE` whose both-endian halves disagree is damage, not an absent pointer.
 		let (Some(block), Some(offset), Some(len)) = (both32(&body[0..8]), both32(&body[8..16]), both32(&body[16..24])) else {
+			damaged = true;
 			return Ok(());
 		};
 		let (offset, len) = (offset as usize, len as usize);
 		// A continuation has to fit in the block it names, or it is describing something else.
 		if offset >= SECTOR_SIZE || len == 0 || offset + len > SECTOR_SIZE {
+			damaged = true;
 			return Ok(());
 		}
 		found = Some((block, offset, len));
 		Ok(())
 	});
-	if walked.is_err() {
-		return None;
+	// AN AREA THIS READER CANNOT WALK IS NOT DAMAGE. It may hold a SUSP entry at a version this
+	// build does not implement, which is a different structure rather than a broken one - so the
+	// chain ends here, conservatively, exactly as before. What became an error is narrower and is
+	// the thing the audit named: a `CE` that IS present and whose fields are impossible.
+	if damaged {
+		return Err(());
 	}
-	found
+	if walked.is_err() {
+		return Ok(None);
+	}
+	Ok(found)
 }
 
 // Does this System Use Area announce a Rock Ridge extension THIS READER IMPLEMENTS?

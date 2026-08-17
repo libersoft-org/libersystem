@@ -1382,3 +1382,41 @@ fn a_hard_reset_leaves_nothing_of_the_previous_session() {
 	let fresh = Screen::new(8, 4, 8);
 	assert_eq!(dump(&screen), dump(&fresh), "a reset screen is indistinguishable from a fresh one");
 }
+
+// A malformed OSC 52 payload sets NO clipboard. The decoder stopped at the first `=` and accepted
+// whatever preceded it, so three shapes that are not base64 all produced a clipboard: a length that
+// is not a multiple of four, a final quantum of one character (six bits, which encode no byte), and
+// arbitrary bytes after the padding. Two different payloads could therefore yield the same
+// clipboard - and this is a value a program hands the user through their own paste buffer.
+#[test]
+fn a_malformed_osc_52_payload_sets_no_clipboard() {
+	let cases: [(&[u8], &str); 6] = [
+		(b"aGVsbG8", "a length that is not a multiple of four"),
+		(b"aGVsbG8=extra", "trailing bytes after the padding"),
+		(b"aGVsbG8=A===", "padding in the middle of the data"),
+		(b"YQ===", "more padding than a quantum can carry"),
+		(b"a===", "a final quantum of one character encodes nothing"),
+		(b"aGVsbG9=", "a full quantum whose leftover bits are not zero"),
+	];
+	for (payload, why) in cases {
+		let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
+		let mut seq: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		seq.extend_from_slice(b"\x1b]52;c;");
+		seq.extend_from_slice(payload);
+		seq.push(0x07);
+		feed(&mut s, &seq);
+		assert_eq!(s.take_clipboard_set(), None, "{why}: {:?}", core::str::from_utf8(payload));
+	}
+
+	// And the canonical forms still decode, at every padding length, so this refuses malformation
+	// rather than refusing base64.
+	for (payload, expect) in [(&b"aGVsbG8="[..], &b"hello"[..]), (b"aGVsbG9v", b"helloo"), (b"aGVsbG8hIQ==", b"hello!!")] {
+		let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
+		let mut seq: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+		seq.extend_from_slice(b"\x1b]52;c;");
+		seq.extend_from_slice(payload);
+		seq.push(0x07);
+		feed(&mut s, &seq);
+		assert_eq!(s.take_clipboard_set().as_deref(), Some(expect), "{:?} still decodes", core::str::from_utf8(payload));
+	}
+}

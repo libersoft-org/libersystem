@@ -2020,3 +2020,44 @@ fn a_declared_count_larger_than_its_own_section_is_refused_before_it_is_filled()
 	wasm.extend_from_slice(&section(1, &content));
 	assert_eq!(crate::parse(&wasm).expect("one type in four bytes is honest").types.len(), 1);
 }
+
+#[test]
+fn the_published_stack_ceiling_is_the_effective_one() {
+	// The precheck reserved `MAX_TYPE_RESULTS` on top of the limit before EVERY instruction,
+	// independently of what that instruction does. Past `MAX_STACK_DEPTH - MAX_TYPE_RESULTS` the
+	// next opcode was refused even when it was a `drop` - room reserved for the widest call any
+	// module could contain, in front of an instruction that cannot make one. So the documented
+	// 8,192 was not the effective ceiling, and acceptance could turn on where a body's high-water
+	// mark happened to fall.
+	//
+	// This body sits in the band the old check refused and the published one allows: it pushes
+	// past the old effective ceiling, then drops back down. Every instruction in it is legal and
+	// the stack never reaches `MAX_STACK_DEPTH`.
+	let depth = crate::validate::MAX_STACK_DEPTH - 16;
+	let mut body: Vec<u8> = alloc::vec![0x00]; // no locals
+	for _ in 0..depth {
+		body.push(0x41);
+		body.extend_from_slice(&sleb(1));
+	}
+	for _ in 0..depth {
+		body.push(0x1a); // drop
+	}
+	body.push(0x0b);
+
+	let mut wasm: Vec<u8> = alloc::vec![];
+	wasm.extend_from_slice(b"\0asm");
+	wasm.extend_from_slice(&[1, 0, 0, 0]);
+	wasm.extend_from_slice(&section(1, &[1, 0x60, 0x00, 0x00]));
+	wasm.extend_from_slice(&section(3, &[1, 0]));
+	let mut exports: Vec<u8> = alloc::vec![1, 3];
+	exports.extend_from_slice(b"run");
+	exports.extend_from_slice(&[0x00, 0]);
+	wasm.extend_from_slice(&section(7, &exports));
+	let mut code: Vec<u8> = alloc::vec![1];
+	code.extend_from_slice(&leb(body.len() as u32));
+	code.extend_from_slice(&body);
+	wasm.extend_from_slice(&section(10, &code));
+
+	let parsed = parse(&wasm).expect("parses");
+	assert!(validate(parsed).is_ok(), "a body that stays under the published ceiling is accepted: depth {depth} of {}", crate::validate::MAX_STACK_DEPTH);
+}

@@ -353,11 +353,20 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 		// instruction adds a bounded number of operands, so testing the depth once per instruction
 		// bounds it within one instruction's worth - which is what a ceiling needs to do and is a
 		// rule a new opcode cannot forget.
-		// The bound the comment above claims. `MAX_TYPE_PARAMS`/`MAX_TYPE_RESULTS` are checked at the
-		// top of `validate`, so the most one instruction can add is one type's results - and this
-		// leaves room for exactly that before the next iteration is reached.
-		if stack.len() + MAX_TYPE_RESULTS > MAX_STACK_DEPTH {
-			return Err(at(format!("the operand stack reaches {}, past the host limit of {MAX_STACK_DEPTH} once one instruction's results are allowed for", stack.len())));
+		// THE CEILING IS THE CEILING, and this used to reserve `MAX_TYPE_RESULTS` on top of it before
+		// EVERY instruction - independently of what that instruction does. Past 7,168 entries the
+		// next opcode was refused even when it was a `drop`, or consumed operands, or pushed
+		// nothing at all: the check reserved room for the widest call any module could contain
+		// before an instruction that could not make a call. So the published 8,192 was not the
+		// effective limit, and whether a module was accepted could turn on where its high-water
+		// mark happened to fall.
+		//
+		// Checking the ACTUAL depth here and once more after the instruction keeps the same
+		// guarantee - the stack is bounded within one instruction's worth - without refusing
+		// sequences that never approach the bound. Deeply nested generated expressions are exactly
+		// the shape that lives near it.
+		if stack.len() > MAX_STACK_DEPTH {
+			return Err(at(format!("the operand stack reaches {}, past the host limit of {MAX_STACK_DEPTH}", stack.len())));
 		}
 		match instr {
 			Instr::Unreachable => mark_unreachable(&mut stack, &mut frames),
@@ -599,6 +608,13 @@ fn check_body(module: &Module, func_index: usize, body: &[Instr]) -> Result<(), 
 					stack.push(Type::Val(result));
 				}
 			}
+		}
+		// AND AFTER, which is what actually bounds the stack. `MAX_TYPE_PARAMS`/`MAX_TYPE_RESULTS`
+		// are checked at the top of `validate`, so one instruction can add at most one type's
+		// results; testing here catches the instruction that crossed the line instead of refusing
+		// the one before it on the strength of what it MIGHT have done.
+		if stack.len() > MAX_STACK_DEPTH {
+			return Err(at(format!("the operand stack reaches {}, past the host limit of {MAX_STACK_DEPTH}", stack.len())));
 		}
 	}
 

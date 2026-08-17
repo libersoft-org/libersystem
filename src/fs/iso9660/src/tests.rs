@@ -852,10 +852,21 @@ fn a_continuation_entry_whose_halves_disagree_is_not_followed() {
 	let ce_at = img[root..root + dot_len].windows(2).position(|w| w == b"CE").map(|i| root + i).expect("the fixture's CE");
 	// Both halves agree in the fixture; break the BIG one, which is the half that was never read.
 	img[ce_at + 8..ce_at + 12].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
-	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
-	let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
-	assert!(!names.contains(&"real".to_string()), "a continuation whose halves disagree is not followed: {names:?}");
-	assert!(names.iter().any(|n| n == "X.TXT"), "and the 8.3 name stands instead: {names:?}");
+	// REFUSED, WHERE THIS USED TO FALL BACK - and the reversal is deliberate.
+	//
+	// The old answer was to mount with Rock Ridge off and let the 8.3 names stand. That looks
+	// conservative and is not: a `CE` is the pointer that decides where Rock Ridge is looked for, so
+	// one damaged field silently changes EVERY filename on the disc to its ISO fallback. Nothing
+	// reports it, two files whose Rock Ridge names differ can collide on one 8.3 name, and a caller
+	// opening a path gets a different file than the medium intends. `rock_ridge_name` already makes
+	// this argument for itself one layer down - "falling back to the ISO9660 identifier is a name
+	// the medium really carries; a truncated `NM` is not" - and the same reasoning says a pointer
+	// this reader cannot trust is not a reason to rename the disc.
+	//
+	// Genuine ABSENCE still mounts without Rock Ridge, and an area holding a SUSP entry at a version
+	// this build does not implement still ends the chain conservatively. Only a `CE` that is present
+	// and impossible is damage.
+	assert_eq!(Iso9660::mount_checked(MemDisc { data: img }).err(), Some(MountError::Corrupt), "a continuation whose halves disagree is damage, not a quiet rename of every file");
 
 	// The same fixture UNBROKEN still finds the name, or the assertion above proves nothing.
 	let mut fs = Iso9660::mount(MemDisc { data: iso_with_susp_behind_ce(&nm) }).expect("mount");
@@ -1267,4 +1278,69 @@ fn a_second_primary_volume_descriptor_that_disagrees_is_refused() {
 	// One that disagrees about where the root is, is not.
 	both32(&mut img[17 * SECTOR_SIZE + 156..], 2, 20);
 	assert_eq!(Iso9660::mount_checked(MemDisc { data: img }).err(), Some(MountError::Corrupt), "a second PVD naming a different root must not silently become the one that is used");
+}
+
+#[test]
+fn a_continuation_that_loops_is_refused_rather_than_exhausting_its_cap() {
+	// The chain was bounded at four iterations and reaching that bound produced the SAME successful
+	// non-Rock-Ridge mount as reaching the end of the chain. So a disc whose `CE` points back into
+	// itself renamed every file to its 8.3 fallback and said nothing - a cycle and an absence were
+	// one observation.
+	let nm: Vec<u8> = [b"NM".as_slice(), &[9, 1, 0], b"real"].concat();
+	let mut img = iso_with_susp_behind_ce(&nm);
+	let root = 19 * SECTOR_SIZE;
+	let dot_len = img[root] as usize;
+	let ce_at = img[root..root + dot_len].windows(2).position(|w| w == b"CE").map(|i| root + i).expect("the fixture's CE");
+	// Point the continuation at the block the chain is already reading, in both halves, so the walk
+	// visits the same (block, offset, length) a second time.
+	let target = u32::from_le_bytes(img[ce_at + 4..ce_at + 8].try_into().unwrap());
+	let cont = target as usize * SECTOR_SIZE;
+	let inner = img[cont..cont + SECTOR_SIZE].windows(2).position(|w| w == b"ER").map(|i| cont + i);
+	if let Some(er) = inner {
+		// Turn the continuation's `ER` into a `CE` pointing back at itself.
+		img[er] = b'C';
+		img[er + 1] = b'E';
+		img[er + 2] = 28;
+		img[er + 3] = 1;
+		let block = target.to_le_bytes();
+		img[er + 4..er + 8].copy_from_slice(&block);
+		img[er + 8..er + 12].copy_from_slice(&target.to_be_bytes());
+		let off = (er - cont) as u32;
+		img[er + 12..er + 16].copy_from_slice(&off.to_le_bytes());
+		img[er + 16..er + 20].copy_from_slice(&off.to_be_bytes());
+		img[er + 20..er + 24].copy_from_slice(&28u32.to_le_bytes());
+		img[er + 24..er + 28].copy_from_slice(&28u32.to_be_bytes());
+	}
+	// Whatever this answers, it must not be a SUCCESSFUL mount that quietly renamed the disc.
+	match Iso9660::mount_checked(MemDisc { data: img }) {
+		Err(_) => {}
+		Ok(mut fs) => {
+			let names: Vec<_> = fs.list().unwrap().into_iter().map(|f| f.name).collect();
+			assert!(names.contains(&"real".to_string()), "a looping continuation must not silently produce the 8.3 namespace: {names:?}");
+		}
+	}
+}
+
+#[test]
+fn a_directory_sector_pads_with_zeroes_or_it_is_not_padding() {
+	// A zero record-length byte ends the sector, and the rest was never looked at - so a sector
+	// holding a zero followed by arbitrary bytes read as canonical padding. Localised corruption
+	// hidden, and a short directory reported as a complete one. Nothing is parsed out of those
+	// bytes, so this is integrity rather than memory safety: "the directory ended here" is a claim,
+	// and it is only true if what follows really is padding.
+	let img = build_iso(false);
+	let mut fs = Iso9660::mount(MemDisc { data: img.clone() }).expect("mount");
+	assert!(fs.list().is_ok(), "the unmodified fixture lists");
+
+	// Find the root's padding - the byte after the last record - and put something in it.
+	let root = 19 * SECTOR_SIZE;
+	let mut at = root;
+	while img[at] != 0 {
+		at += img[at] as usize;
+	}
+	assert!(at < root + SECTOR_SIZE, "the fixture's root ends inside its first sector");
+	let mut broken = img;
+	broken[at + 1] = 0x42;
+	let mut fs = Iso9660::mount(MemDisc { data: broken }).expect("the volume still mounts - this is about the directory");
+	assert!(fs.list().is_err(), "a nonzero byte in a directory sector's padding is not padding");
 }

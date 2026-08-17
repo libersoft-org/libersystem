@@ -2247,12 +2247,33 @@ fn base64_decode(s: &[u8]) -> Option<Vec<u8>> {
 			_ => None,
 		}
 	}
+	// CANONICAL, because this decodes a payload a program sent and the result becomes the user's
+	// clipboard. The loop below used to stop at the first `=` and accept whatever came before it,
+	// so three shapes that are not base64 all decoded: a length that is not a multiple of four, a
+	// final quantum of a single character (which carries six bits and encodes nothing), and
+	// arbitrary trailing bytes after the padding. Two different payloads could therefore produce
+	// the same clipboard, and a malformed one produced a clipboard at all.
+	if s.len() % 4 != 0 {
+		return None;
+	}
 	let mut out: Vec<u8> = Vec::new();
 	let mut acc: u32 = 0;
 	let mut bits: u32 = 0;
-	for &b in s {
+	let mut padding = 0usize;
+	for (index, &b) in s.iter().enumerate() {
 		if b == b'=' {
-			break;
+			// Padding belongs to the LAST quantum and there is at most two of it. Anything else is
+			// a `=` in the middle of the data, which the old `break` silently accepted along with
+			// everything after it.
+			if index + 2 < s.len() || padding == 2 {
+				return None;
+			}
+			padding += 1;
+			continue;
+		}
+		if padding > 0 {
+			// A data byte after padding: the payload continues past its own end.
+			return None;
 		}
 		acc = (acc << 6) | sextet(b)?;
 		bits += 6;
@@ -2260,6 +2281,11 @@ fn base64_decode(s: &[u8]) -> Option<Vec<u8>> {
 			bits -= 8;
 			out.push((acc >> bits) as u8);
 		}
+	}
+	// The bits a full quantum leaves over must be zero, and a quantum of one character is not a
+	// quantum at all - six bits encode no byte.
+	if bits >= 6 || acc & ((1 << bits) - 1) != 0 {
+		return None;
 	}
 	Some(out)
 }
