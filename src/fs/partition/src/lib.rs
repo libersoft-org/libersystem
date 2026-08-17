@@ -574,6 +574,29 @@ fn read_gpt(dev: &mut impl Sectors, header: &[u8], at: u64, counterpart: u64) ->
 	if entries_last_lba >= first_usable && entries_lba <= last_usable {
 		return Err(Fault::Unusable);
 	}
+	// AND IT BELONGS TO ITS OWN COPY, which "outside the usable range" does not say.
+	//
+	// Outside that range means one of two places - below `first_usable` or above `last_usable` - and
+	// this accepted either for either header. So a PRIMARY header could point its array into the
+	// BACKUP metadata region at the far end of the disk, or lay it across its own sector, and still
+	// verify end to end: both CRCs correct, every relation above satisfied, and a structurally
+	// impossible table reported as a good one. That answer authorises a write.
+	//
+	// The spec's geometry is exact. The primary header sits at LBA 1 and its array follows, ending
+	// before `FirstUsableLBA`; the backup's array follows `LastUsableLBA` and ends before the backup
+	// header at the last sector. Each copy's metadata is contiguous with itself, which is also what
+	// makes the two independently recoverable - the reason there are two of them.
+	if header_lba < first_usable {
+		// The primary: below the usable range, and after the header it belongs to.
+		if entries_lba <= header_lba || entries_last_lba >= first_usable {
+			return Err(Fault::Unusable);
+		}
+	} else {
+		// The backup: above the usable range, and before the header it belongs to.
+		if entries_lba <= last_usable || entries_last_lba >= header_lba {
+			return Err(Fault::Unusable);
+		}
+	}
 
 	// the device is the outermost bound on every number above. A device that will not say
 	// its size leaves the header unbounded, and an unbounded header may not be acted on.

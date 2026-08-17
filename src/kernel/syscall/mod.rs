@@ -349,6 +349,20 @@ fn current_object(handle: u64, ty: ObjectType, rights: Rights) -> Result<Arc<dyn
 	}
 }
 
+// Does the handle carry these rights, without resolving the object again?
+//
+// The mapping syscalls need a SECOND question about the same handle: `current_typed` has already
+// established that it names the right kind of object and carries `MAP`, and what is left to ask is
+// whether it also carries `WRITE` - because that, and not `MAP`, decides whether the pages may be
+// written through. Answering false for an unknown handle is safe by construction: the caller has
+// already failed if the handle does not resolve, so the only way to reach a `false` here is a
+// handle that genuinely lacks the right.
+fn handle_rights_allow(handle: u64, rights: Rights) -> bool {
+	let Some(thread) = sched::current_thread() else { return false };
+	let table = thread.handles().lock();
+	table.rights_of(Handle::from_raw(handle)).is_ok_and(|held| held.contains(rights))
+}
+
 // Bind the calling thread or return ERR_NO_THREAD from the enclosing handler. The
 // handlers that touch per-thread state (the handle table, the address space) open
 // with this; a macro, not a function, because the early return must leave the
@@ -643,7 +657,18 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 		dma.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
-	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
+	// WRITABLE ONLY IF THE CAPABILITY CARRIES `WRITE`.
+	//
+	// Every mapping syscall checked `Rights::MAP` and then built a writable PTE unconditionally, so
+	// a capability deliberately attenuated to `READ | MAP` produced a writable mapping - which is
+	// the whole of what attenuation is for. The kernel hands out exactly such capabilities: the
+	// bootstrap package and the ramdisk are passed read-only, and a holder could write to both.
+	//
+	// `MAP` says WHETHER the object may be mapped and `WRITE` says what may be done through it;
+	// collapsing the two made `READ`, `WRITE` and `MAP` mean one thing for a direct operation and
+	// another for a mapping.
+	let writable = handle_rights_allow(handle, Rights::WRITE);
+	let flags = arch::paging::PRESENT | arch::paging::NO_EXECUTE | if writable { arch::paging::WRITABLE } else { 0 } | if user { arch::paging::USER } else { 0 };
 	let frames = dma.frames();
 	if !map_pages_or_rollback(base, frames.len(), flags, |i| frames[i]) {
 		free_vrange(Some(&space), base, dma.size() as u64);
@@ -1864,7 +1889,18 @@ fn sys_memory_map(handle: u64) -> i64 {
 		memory.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
-	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE | if user { arch::paging::USER } else { 0 };
+	// WRITABLE ONLY IF THE CAPABILITY CARRIES `WRITE`.
+	//
+	// Every mapping syscall checked `Rights::MAP` and then built a writable PTE unconditionally, so
+	// a capability deliberately attenuated to `READ | MAP` produced a writable mapping - which is
+	// the whole of what attenuation is for. The kernel hands out exactly such capabilities: the
+	// bootstrap package and the ramdisk are passed read-only, and a holder could write to both.
+	//
+	// `MAP` says WHETHER the object may be mapped and `WRITE` says what may be done through it;
+	// collapsing the two made `READ`, `WRITE` and `MAP` mean one thing for a direct operation and
+	// another for a mapping.
+	let writable = handle_rights_allow(handle, Rights::WRITE);
+	let flags = arch::paging::PRESENT | arch::paging::NO_EXECUTE | if writable { arch::paging::WRITABLE } else { 0 } | if user { arch::paging::USER } else { 0 };
 	let frames = memory.frames();
 	if !map_pages_or_rollback(base, frames.len(), flags, |i| frames[i]) {
 		free_vrange(Some(&space), base, memory.size() as u64);

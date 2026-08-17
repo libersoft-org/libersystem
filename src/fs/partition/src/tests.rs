@@ -1094,3 +1094,30 @@ fn reserved_fields_and_duplicate_partition_identities_are_format_errors() {
 	let mut distinct = gpt_disk(&[Entry { guid: LIBERFS_TYPE_GUID, first: 2048, last: 20479, unique: Some(0x7777) }, Entry { guid: [0x11; 16], first: 20480, last: 40959, unique: Some(0x8888) }]);
 	assert_eq!(probe(&mut distinct), Disk::LiberFs { first: 2048, last: 20479 });
 }
+
+#[test]
+fn an_entry_array_must_sit_in_its_own_copys_metadata_region() {
+	// "OUTSIDE THE USABLE RANGE" NAMES TWO PLACES, and the check accepted either for either header.
+	// So a primary header could point its array into the BACKUP metadata region at the far end of
+	// the disk, or lay it across its own sector, and still verify end to end - both CRCs correct,
+	// every other relation satisfied, and a structurally impossible table reported as a good one.
+	//
+	// `primary_only`, because on a disk with a backup the recovery path answers instead and the
+	// case under test would not be what decided.
+	let entries = [liberfs_entry(2048, 30000)];
+
+	// The array on the wrong end of the disk: above `last_usable`, where the BACKUP's array lives.
+	let wrong_end = Layout { entries_lba: LAST_USABLE + 1, ..Layout::primary() };
+	let mut img = primary_only(wrong_end, &entries);
+	assert_ne!(probe(&mut img), Disk::LiberFs { first: 2048, last: 30000 }, "a primary array in the backup's region is not a table to act on");
+
+	// The array at LBA 1, on top of the primary header itself. Below `first_usable`, so the old
+	// check was satisfied.
+	let over_header = Layout { entries_lba: 1, ..Layout::primary() };
+	let mut img = primary_only(over_header, &entries);
+	assert_ne!(probe(&mut img), Disk::LiberFs { first: 2048, last: 30000 }, "an array laid over its own header is not a table to act on");
+
+	// And the ordinary geometry still reads, so this refuses misplacement rather than refusing GPT.
+	let mut ok = primary_only(Layout::primary(), &entries);
+	assert_eq!(probe(&mut ok), Disk::LiberFs { first: 2048, last: 30000 });
+}

@@ -186,7 +186,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0119 - A fault in a user copy must be an error, not a dead kernel](P02M0119.md)
 - [x] [P02M0120 - A free must never lose the memory it frees](P02M0120.md)
 - [x] [P02M0121 - A receive that takes a message must be able to deliver it](P02M0121.md)
-- [ ] [P02M0122 - What authorises a write to somebody's disk](P02M0122.md)
+- [x] [P02M0122 - What authorises a write to somebody's disk](P02M0122.md)
 - [x] [P02M0123 - What a mount allocates, and what a write may assume about what it found](P02M0123.md)
 - [ ] [P02M0124 - What the UDF backend claims to read, and what it actually does](P02M0124.md)
 - [ ] [P02M0125 - What the FAT backend writes, and what it says it wrote](P02M0125.md)
