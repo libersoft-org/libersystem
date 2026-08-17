@@ -235,14 +235,20 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 			}
 			last_place = Some(place);
 		}
+		// A READER BOUNDED TO THIS SECTION. The sub-parsers read from the whole module, so a
+		// declared count or length inside one section could run on into the NEXT section's bytes -
+		// allocating and filling from them - and the `r.pos != end` check below only noticed
+		// afterwards, once the work was already done. Truncating the buffer at `end` turns that into
+		// an "unexpected end of section" at the first byte past the boundary, before the allocation.
+		let mut sr = Reader { buf: &r.buf[..end], pos: r.pos };
 		match id {
-			1 => parse_types(&mut r, &mut m)?,
-			2 => parse_imports(&mut r, &mut m)?,
-			3 => parse_functions(&mut r, &mut m)?,
-			4 => parse_tables(&mut r, &mut m)?,
-			5 => parse_memory(&mut r, &mut m)?,
-			6 => parse_globals(&mut r, &mut m)?,
-			7 => parse_exports(&mut r, &mut m)?,
+			1 => parse_types(&mut sr, &mut m)?,
+			2 => parse_imports(&mut sr, &mut m)?,
+			3 => parse_functions(&mut sr, &mut m)?,
+			4 => parse_tables(&mut sr, &mut m)?,
+			5 => parse_memory(&mut sr, &mut m)?,
+			6 => parse_globals(&mut sr, &mut m)?,
+			7 => parse_exports(&mut sr, &mut m)?,
 			// THE START SECTION, refused rather than skipped.
 			//
 			// It was skipped by its declared size and `Instance::new` never ran one - so a module
@@ -252,9 +258,9 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 			// implementing it would be untested code, and skipping it is the one answer that is
 			// certainly wrong.
 			8 => return Err(ParseError("a start section, which this runtime does not run and will not ignore")),
-			9 => parse_elements(&mut r, &mut m)?,
-			10 => parse_code(&mut r, &mut m)?,
-			11 => parse_data(&mut r, &mut m)?,
+			9 => parse_elements(&mut sr, &mut m)?,
+			10 => parse_code(&mut sr, &mut m)?,
+			11 => parse_data(&mut sr, &mut m)?,
 			// REFUSED, not skipped - the same answer the start section already gives, for the same
 			// reason.
 			//
@@ -268,8 +274,9 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 			// saying so is more honest than reading past it. The alternative - read it and compare -
 			// is the right answer the day `memory.init` exists.
 			12 => return Err(ParseError("a data-count section, which this engine's bulk-memory support does not include")),
-			_ => r.pos = end,
+			_ => sr.pos = end,
 		}
+		r.pos = sr.pos;
 		if r.pos != end {
 			return Err(ParseError("section size mismatch"));
 		}
@@ -293,13 +300,13 @@ fn parse_types(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 		let mut ft: FuncType = FuncType::default();
 		let nparams: u32 = r.u32()?;
 		for _ in 0..nparams {
-			ft.params.push(val_type(r.byte()?)?);
+			push_checked(&mut ft.params, val_type(r.byte()?)?)?;
 		}
 		let nresults: u32 = r.u32()?;
 		for _ in 0..nresults {
-			ft.results.push(val_type(r.byte()?)?);
+			push_checked(&mut ft.results, val_type(r.byte()?)?)?;
 		}
-		m.types.push(ft);
+		push_checked(&mut m.types, ft)?;
 	}
 	Ok(())
 }
@@ -314,7 +321,7 @@ fn parse_imports(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 			0x00 => {
 				// an imported function: its type index follows
 				let type_index: u32 = r.u32()?;
-				m.imports.push(Import { module, field, type_index });
+				push_checked(&mut m.imports, Import { module, field, type_index })?;
 			}
 			_ => return Err(ParseError("only function imports are supported")),
 		}
@@ -326,7 +333,7 @@ fn parse_functions(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 	let count: u32 = r.u32()?;
 	for _ in 0..count {
 		let type_index: u32 = r.u32()?;
-		m.funcs.push(Func { type_index, locals: Vec::new(), body: Vec::new() });
+		push_checked(&mut m.funcs, Func { type_index, locals: Vec::new(), body: Vec::new() })?;
 	}
 	Ok(())
 }
@@ -407,7 +414,7 @@ fn parse_elements(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 				// active, table 0: an offset expression, then a vector of function indices.
 				let offset: u32 = const_offset(r)?;
 				let funcs = read_function_indices(r)?;
-				m.elements.push(Element { offset, funcs });
+				push_checked(&mut m.elements, Element { offset, funcs })?;
 			}
 			2 => {
 				// active with an explicit table index (must be 0) and an element-kind byte.
@@ -419,7 +426,7 @@ fn parse_elements(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 					return Err(ParseError("only the funcref element kind is supported"));
 				}
 				let funcs = read_function_indices(r)?;
-				m.elements.push(Element { offset, funcs });
+				push_checked(&mut m.elements, Element { offset, funcs })?;
 			}
 			_ => return Err(ParseError("only active element segments into table 0 are supported")),
 		}
@@ -456,6 +463,28 @@ fn const_expr(r: &mut Reader) -> Result<(i64, ValType), ParseError> {
 		return Err(ParseError("constant expression must end in `end`"));
 	}
 	Ok((v, ty))
+}
+
+// A push that reports an allocation failure instead of aborting the host.
+//
+// A module is UNTRUSTED INPUT, and every vector below is grown from numbers the module chooses. The
+// counts are bounded by the bytes present - a declaration cannot outrun its own section - so the
+// totals are linear in the module size, but `Vec::push` still grows by doubling with an infallible
+// allocation, and a host that cannot serve one aborts. Decoding is the first stage a hostile module
+// reaches, before validation, before fuel and before any host limit; it must be the first stage that
+// can say no. `try_reserve(1)` is a length-against-capacity comparison on the common path.
+fn push_checked<T>(v: &mut Vec<T>, item: T) -> Result<(), ParseError> {
+	v.try_reserve(1).map_err(|_| ParseError("a module section larger than the decoder can hold"))?;
+	v.push(item);
+	Ok(())
+}
+
+// The same for a byte slice copied out of the module: `to_vec` is infallible.
+fn copy_checked(bytes: &[u8]) -> Result<Vec<u8>, ParseError> {
+	let mut v: Vec<u8> = Vec::new();
+	v.try_reserve_exact(bytes.len()).map_err(|_| ParseError("a module section larger than the decoder can hold"))?;
+	v.extend_from_slice(bytes);
+	Ok(v)
 }
 
 // A constant expression that must be an `i32` - every OFFSET in the format is one.
@@ -505,7 +534,7 @@ fn parse_globals(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 		if init_type != val_type {
 			return Err(ParseError("a global whose initialiser is not of its declared type"));
 		}
-		m.globals.push(Global { val_type, mutable, init });
+		push_checked(&mut m.globals, Global { val_type, mutable, init })?;
 	}
 	Ok(())
 }
@@ -519,8 +548,8 @@ fn parse_data(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 				// active segment, memory 0, with an offset expression
 				let offset: u32 = const_offset(r)?;
 				let n: usize = r.u32()? as usize;
-				let bytes: Vec<u8> = r.bytes(n)?.to_vec();
-				m.data.push(DataSegment { offset, bytes });
+				let bytes: Vec<u8> = copy_checked(r.bytes(n)?)?;
+				push_checked(&mut m.data, DataSegment { offset, bytes })?;
 			}
 			2 => {
 				// active segment with an explicit memory index (must be 0)
@@ -529,8 +558,8 @@ fn parse_data(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 				}
 				let offset: u32 = const_offset(r)?;
 				let n: usize = r.u32()? as usize;
-				let bytes: Vec<u8> = r.bytes(n)?.to_vec();
-				m.data.push(DataSegment { offset, bytes });
+				let bytes: Vec<u8> = copy_checked(r.bytes(n)?)?;
+				push_checked(&mut m.data, DataSegment { offset, bytes })?;
 			}
 			_ => return Err(ParseError("passive data segments are not supported")),
 		}
@@ -553,7 +582,7 @@ fn parse_exports(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 			0x03 => ExportKind::Global,
 			_ => return Err(ParseError("an export kind byte the format does not define")),
 		};
-		m.exports.push(Export { name, kind, index });
+		push_checked(&mut m.exports, Export { name, kind, index })?;
 	}
 	Ok(())
 }
@@ -591,10 +620,10 @@ fn parse_code(r: &mut Reader, m: &mut Module) -> Result<(), ParseError> {
 				return Err(ParseError("more locals than the host allows"));
 			}
 			for _ in 0..n {
-				locals.push(t);
+				push_checked(&mut locals, t)?;
 			}
 		}
-		let body: Vec<u8> = body_reader.buf[body_reader.pos..].to_vec();
+		let body: Vec<u8> = copy_checked(&body_reader.buf[body_reader.pos..])?;
 		r.pos = body_end;
 		let func: &mut Func = m.funcs.get_mut(i).ok_or(ParseError("code entry without a function"))?;
 		func.locals = locals;

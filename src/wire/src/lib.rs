@@ -229,6 +229,37 @@ impl Sink for VecWriter {
 	}
 }
 
+// Why a call did not produce a reply.
+//
+// `call` returned `Option<Vec<u8>>`, so peer closure, a refused send, a timeout, an allocation
+// failure and a malformed reply were ONE VALUE - and the decision a client has to make after a
+// failed call depends on telling them apart. `PeerClosed` means the service is gone and a retry on
+// this channel cannot succeed; `SendRefused` means the request never left, so retrying is safe;
+// `TimedOut` means the request MAY have been received and acted on, so retrying is only safe for an
+// idempotent operation. Collapsing those three into `None` made every caller guess, and the
+// conservative guess - do not retry - is wrong for the one case where retrying is free.
+//
+// Service-level failures are NOT here: they stay in the generated `result<_, error>` where the
+// schema already puts them. This is about the pipe, not about what travelled through it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportError {
+	// No channel to the service - it was never resolved, or the handle is zero.
+	NoRoute,
+	// The request was refused by the kernel and did not leave. Retrying is safe.
+	SendRefused,
+	// The peer closed the channel. A retry on this channel cannot succeed.
+	PeerClosed,
+	// The deadline passed with no reply. The request may have been received and acted on.
+	TimedOut,
+	// The receive itself was refused, but the peer may still be there.
+	ReceiveFailed,
+	// The reply could not be held.
+	NoMemory,
+	// The reply arrived but does not obey the framing rules - a wrong correlation id, unexpected
+	// capabilities, trailing bytes.
+	Malformed,
+}
+
 // A request/reply channel the generated clients call over. The userspace impl
 // sends on a channel and blocks for the reply; tests use an in-memory loopback.
 pub trait Transport {
@@ -240,7 +271,12 @@ pub trait Transport {
 	// the bytes: returning a `Handles` inside a tuple is a 40-byte move that aarch64 codegen
 	// performs with a `memcpy` call, and `ipc-client` is held to an exact list of runtime
 	// imports that should not grow for a calling convention detail.
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>>;
+	//
+	// A DEADLINE, because a live peer that accepts a request and never replies used to block the
+	// caller forever: the trait could not express "give up". It is absolute rather than a duration
+	// so a retry loop cannot extend its own budget by restarting the clock, and `0` means no
+	// deadline for the transports - the host loopbacks - that answer immediately by construction.
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError>;
 
 	// Release reply capabilities that could not be decoded or were not expected by the schema.
 	// Host test transports need no action; the runtime closes them. Takes the whole list: a

@@ -303,7 +303,7 @@ fn compare_exports<'a>(installed: &Elf<'a>, candidate: &Elf<'a>) -> Verdict<'a> 
 	// the walk is one pass when the orders agree and a full rescan per symbol when they do not, and
 	// nothing bounded the second case.
 	let mut visits: u64 = 0;
-	let mut budget = |seen: usize, visits: &mut u64| -> bool {
+	let budget = |seen: usize, visits: &mut u64| -> bool {
 		*visits = visits.saturating_add(seen as u64);
 		*visits <= MAX_SYMBOL_VISITS
 	};

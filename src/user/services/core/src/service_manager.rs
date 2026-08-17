@@ -1101,10 +1101,10 @@ struct DrillTransport<'a> {
 }
 
 impl proto::codec::Transport for DrillTransport<'_> {
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut proto::codec::Handles) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut proto::codec::Handles, _deadline: u64) -> Result<Vec<u8>, proto::codec::TransportError> {
 		unsafe {
 			if !send_caps_blocking(self.perm, request, request_handles) {
-				return None;
+				return Err(proto::codec::TransportError::SendRefused);
 			}
 			let mut buf: [u8; 64] = [0u8; 64];
 			loop {
@@ -1118,10 +1118,11 @@ impl proto::codec::Transport for DrillTransport<'_> {
 						}
 					}
 					0 => match recv_vec_caps_blocking(self.perm, reply_handles) {
-						ReceivedVecCaps::Message { bytes } => return Some(bytes),
-						ReceivedVecCaps::Closed | ReceivedVecCaps::Failed => return None,
+						ReceivedVecCaps::Message { bytes } => return Ok(bytes),
+						ReceivedVecCaps::Closed => return Err(proto::codec::TransportError::PeerClosed),
+						ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => return Err(proto::codec::TransportError::ReceiveFailed),
 					},
-					_ => return None,
+					_ => return Err(proto::codec::TransportError::ReceiveFailed),
 				}
 			}
 		}

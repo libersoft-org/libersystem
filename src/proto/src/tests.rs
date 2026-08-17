@@ -291,13 +291,13 @@ struct TrailingLoopback<S: log::Service> {
 impl<S: log::Service> crate::codec::Transport for TrailingLoopback<S> {
 	fn discard_handles(&mut self, _handles: &[u64]) {}
 
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles, _deadline: u64) -> Result<Vec<u8>, crate::codec::TransportError> {
 		let mut out = [0u8; 4096];
 		let mut request_handles = crate::codec::Handles::try_from_slice(request_handles).expect("the fixture stays within the bound");
-		let n = log::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles)?;
+		let n = log::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles).ok_or(crate::codec::TransportError::Malformed)?;
 		let mut reply = out[..n].to_vec();
 		reply.extend(core::iter::repeat_n(0xdd, self.trailing));
-		Some(reply)
+		Ok(reply)
 	}
 }
 
@@ -313,12 +313,12 @@ impl<S: log::Service> crate::codec::Transport for Loopback<S> {
 	// what let a real transport forget it and leak - see `Transport::discard_handles`.
 	fn discard_handles(&mut self, _handles: &[u64]) {}
 
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles, _deadline: u64) -> Result<Vec<u8>, crate::codec::TransportError> {
 		let mut out = [0u8; 4096];
 		let mut request_handles = crate::codec::Handles::try_from_slice(request_handles).expect("the fixture stays within the bound");
-		let n = log::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles)?;
+		let n = log::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles).ok_or(crate::codec::TransportError::Malformed)?;
 		assert!(request_handles.is_empty(), "the dispatch consumed every capability the request carried");
-		Some(out[..n].to_vec())
+		Ok(out[..n].to_vec())
 	}
 }
 
@@ -522,12 +522,12 @@ impl<S: volume::Service> crate::codec::Transport for VolLoopback<S> {
 	// what let a real transport forget it and leak - see `Transport::discard_handles`.
 	fn discard_handles(&mut self, _handles: &[u64]) {}
 
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut crate::codec::Handles, _deadline: u64) -> Result<Vec<u8>, crate::codec::TransportError> {
 		let mut out = [0u8; 256];
 		let mut request_handles = crate::codec::Handles::try_from_slice(request_handles).expect("the fixture stays within the bound");
-		let n = volume::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles)?;
+		let n = volume::dispatch(&mut self.service, request, &mut request_handles, &mut out, reply_handles).ok_or(crate::codec::TransportError::Malformed)?;
 		assert!(request_handles.is_empty(), "the dispatch consumed every capability the request carried");
-		Some(out[..n].to_vec())
+		Ok(out[..n].to_vec())
 	}
 }
 
@@ -601,14 +601,70 @@ struct UnexpectedHandleTransport {
 	discarded: u64,
 }
 
+// THE THREE FAILURES A CLIENT HAS TO TELL APART. `call` returned `Option`, so a refused send (the
+// request never left - retrying is safe), a departed peer (retrying on this channel cannot work) and
+// a deadline (the request may already have been acted on, so retrying is safe only if the operation
+// is idempotent) were one `None`, and every caller had to guess. The generated client keeps its
+// `Option`-returning methods - hundreds of call sites depend on them - and records the reason, which
+// is the smallest shape that lets a caller decide.
+struct FailingTransport {
+	error: crate::codec::TransportError,
+}
+
+impl crate::codec::Transport for FailingTransport {
+	fn call(&mut self, _request: &[u8], _request_handles: &[u64], _reply_handles: &mut crate::codec::Handles, _deadline: u64) -> Result<Vec<u8>, crate::codec::TransportError> {
+		Err(self.error)
+	}
+
+	fn discard_handles(&mut self, _handles: &[u64]) {}
+}
+
+#[test]
+fn a_failed_call_says_why_so_a_caller_can_decide_whether_to_retry() {
+	use crate::codec::TransportError;
+	for error in [TransportError::SendRefused, TransportError::PeerClosed, TransportError::TimedOut, TransportError::NoRoute] {
+		let mut client = log::Client::new(FailingTransport { error });
+		// The method still answers `None`: no existing caller changes.
+		assert!(client.protocol_info().is_none(), "a failed transport still reports no reply");
+		// And the reason is available to the caller that needs it.
+		assert_eq!(client.last_error(), Some(error), "the transport's reason reaches the caller");
+	}
+}
+
+// The deadline reaches the transport rather than being a promise the trait cannot keep: a live peer
+// that accepts a request and never replies used to block the caller forever, because `call` had no
+// way to be told when to give up.
+#[test]
+fn the_clients_deadline_is_handed_to_the_transport() {
+	struct DeadlineSpy {
+		seen: u64,
+	}
+	impl crate::codec::Transport for DeadlineSpy {
+		fn call(&mut self, _request: &[u8], _request_handles: &[u64], _reply_handles: &mut crate::codec::Handles, deadline: u64) -> Result<Vec<u8>, crate::codec::TransportError> {
+			self.seen = deadline;
+			Err(crate::codec::TransportError::TimedOut)
+		}
+		fn discard_handles(&mut self, _handles: &[u64]) {}
+	}
+
+	let mut client = log::Client::with_deadline(DeadlineSpy { seen: 0 }, 4242);
+	assert!(client.protocol_info().is_none());
+	assert_eq!(client.into_transport().seen, 4242, "the transport was told when to give up");
+
+	let mut client = log::Client::new(DeadlineSpy { seen: 0 });
+	client.set_deadline(99);
+	assert!(client.protocol_info().is_none());
+	assert_eq!(client.into_transport().seen, 99);
+}
+
 impl crate::codec::Transport for UnexpectedHandleTransport {
-	fn call(&mut self, request: &[u8], _request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
-		let corr = u32::from_le_bytes(request[2..6].try_into().ok()?);
+	fn call(&mut self, request: &[u8], _request_handles: &[u64], reply_handles: &mut crate::codec::Handles, _deadline: u64) -> Result<Vec<u8>, crate::codec::TransportError> {
+		let corr = u32::from_le_bytes(request[2..6].try_into().map_err(|_| crate::codec::TransportError::Malformed)?);
 		let mut reply = corr.to_le_bytes().to_vec();
 		reply.extend_from_slice(&[1, 0]); // Ok(()) for log.emit
 		{
 			*reply_handles = crate::codec::Handles::try_from_slice(&[0xBAD]).expect("one handle is within the bound");
-			Some(reply)
+			Ok(reply)
 		}
 	}
 
@@ -991,14 +1047,14 @@ struct ScriptedReply {
 }
 
 impl crate::codec::Transport for ScriptedReply {
-	fn call(&mut self, request: &[u8], _request_handles: &[u64], reply_handles: &mut crate::codec::Handles) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], _request_handles: &[u64], reply_handles: &mut crate::codec::Handles, _deadline: u64) -> Result<Vec<u8>, crate::codec::TransportError> {
 		// The correlation id is echoed from the request, so a test writes only the reply BODY and
 		// never has to know which call number it is on.
-		let corr = u32::from_le_bytes(request[2..6].try_into().ok()?);
+		let corr = u32::from_le_bytes(request[2..6].try_into().map_err(|_| crate::codec::TransportError::Malformed)?);
 		let mut reply = corr.to_le_bytes().to_vec();
 		reply.extend_from_slice(&self.body);
 		*reply_handles = crate::codec::Handles::try_from_slice(&self.handles).expect("the fixture stays within the bound");
-		Some(reply)
+		Ok(reply)
 	}
 
 	fn discard_handles(&mut self, handles: &[u64]) {

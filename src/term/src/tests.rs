@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 fn dump(screen: &Screen) -> Vec<u8> {
 	let mut sink = TextSink::new();
-	sink.capture(screen);
+	assert!(sink.capture(screen));
 	sink.as_bytes().to_vec()
 }
 
@@ -83,7 +83,7 @@ fn raw_sink_records_the_exact_stream() {
 	let stream: &[u8] = b"\x1b[31mhi\x1b[0m\nbye";
 	let mut s = Screen::new(8, 4, SCROLLBACK_ROWS);
 	let mut raw = RawSink::new();
-	raw.feed(stream);
+	assert!(raw.feed(stream));
 	feed(&mut s, stream);
 	// L1: the tap holds the stream byte-for-byte, control codes and all.
 	assert_eq!(raw.as_bytes(), stream);
@@ -97,7 +97,7 @@ fn raw_sink_records_the_exact_stream() {
 fn raw_sink_clear_resets_the_capture() {
 	let mut raw = RawSink::new();
 	assert!(raw.is_empty());
-	raw.feed(b"abc");
+	assert!(raw.feed(b"abc"));
 	assert!(!raw.is_empty());
 	raw.clear();
 	assert!(raw.is_empty());
@@ -109,10 +109,10 @@ fn raw_sink_clear_resets_the_capture() {
 #[test]
 fn raw_sink_consume_drops_only_the_oldest_bytes() {
 	let mut raw = RawSink::new();
-	raw.feed(b"hello world");
+	assert!(raw.feed(b"hello world"));
 	raw.consume(6);
 	assert_eq!(raw.as_bytes(), b"world");
-	raw.feed(b"!");
+	assert!(raw.feed(b"!"));
 	assert_eq!(raw.as_bytes(), b"world!");
 	raw.consume(100);
 	assert!(raw.is_empty());
@@ -126,7 +126,7 @@ fn raw_sink_consume_drops_only_the_oldest_bytes() {
 	let mut expected: Vec<u8> = Vec::new();
 	for i in 0..500u32 {
 		let chunk = [b'a' + (i % 26) as u8; 32];
-		raw.feed(&chunk);
+		assert!(raw.feed(&chunk));
 		expected.extend_from_slice(&chunk);
 		raw.consume(16);
 		expected.drain(..16);
@@ -135,8 +135,38 @@ fn raw_sink_consume_drops_only_the_oldest_bytes() {
 	// And the front is actually reclaimed rather than accumulating for the life of the sink.
 	raw.consume(expected.len());
 	assert!(raw.is_empty());
-	raw.feed(b"after");
+	assert!(raw.feed(b"after"));
 	assert_eq!(raw.as_bytes(), b"after");
+}
+
+// The backlog is bounded BY THE SINK, and the bound is applied before the allocation rather than
+// after it. A producer that outruns its drain keeps the newest bytes and reports the gap; the
+// buffer itself does not grow past the cap, which the old shape allowed because the trim lived in
+// the caller and ran after `feed` had already extended the vector.
+#[test]
+fn raw_sink_caps_the_backlog_and_reports_the_gap() {
+	let mut raw = RawSink::with_limit(16);
+	assert!(raw.feed(b"0123456789"));
+	// Crossing the cap drops the oldest bytes and says so.
+	assert!(!raw.feed(b"abcdefghij"));
+	assert_eq!(raw.as_bytes(), b"456789abcdefghij");
+	assert_eq!(raw.as_bytes().len(), 16);
+
+	// A single chunk larger than the whole cap keeps its tail, and keeps it without ever holding
+	// the oversized chunk: the capacity never reaches the chunk's length.
+	let mut raw = RawSink::with_limit(8);
+	assert!(!raw.feed(&[b'x'; 1000]));
+	assert_eq!(raw.as_bytes(), &[b'x'; 8]);
+	assert!(raw.capacity_for_test() < 1000, "the oversized chunk was never allocated");
+
+	// Steady overflow keeps the buffer itself bounded, not just the pending count - the forced
+	// compaction in `feed`. Without it the read offset advances while the vector grows forever.
+	let mut raw = RawSink::with_limit(64);
+	for i in 0..2000u32 {
+		let _ = raw.feed(&[b'a' + (i % 26) as u8; 40]);
+	}
+	assert_eq!(raw.as_bytes().len(), 64);
+	assert!(raw.capacity_for_test() <= 512, "the backing buffer stayed bounded across the run");
 }
 
 // The DEC private mouse-tracking modes (?1000 normal, ?1002 button-event, ?1003 any-event)

@@ -449,7 +449,7 @@ fn stream_helpers_carry_handles_per_open_and_frame() {
 	let file = parse_only("package liber:stream@1; resource file; record held { file: handle<file> } interface feed { @op(1) open: func(source: handle<file>) -> stream<held>; }");
 	assert!(validate::validate(&file).is_empty());
 	let rust = crate::codegen::rust(&file, "stream.lsidl", &std::collections::HashMap::new()).unwrap();
-	assert!(rust.contains("self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?"));
+	assert!(rust.contains("self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)"));
 	assert!(rust.contains("frame_handles: &mut Handles"), "the frame writer takes the bounded list");
 	assert!(rust.contains("*frame_handles = Handles::try_from_slice(writer.handles())?;"), "and hands back every handle the element wrote");
 	assert!(rust.contains("Reader::with_handles(msg, frame_handles)"), "and the reader takes the list too");

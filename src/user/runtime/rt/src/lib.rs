@@ -1077,7 +1077,10 @@ pub unsafe fn drain_stream_complete<T, F: Fn(&[u8], &mut wire::Handles) -> Optio
 					close(consumer);
 					return None;
 				}
-				ReceivedVecCaps::Failed => {
+				// A blocking receive cannot time out - the deadline is zero - but the variant must be
+				// handled, and "no message and the peer may still be there" is what `Failed` means
+				// here too: an incomplete answer, refused rather than handed back as a whole one.
+				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
 					close(consumer);
 					return None;
 				}
@@ -1116,7 +1119,10 @@ pub unsafe fn drain_stream<T, F: Fn(&[u8], &mut wire::Handles) -> Option<T>>(con
 					items.push(item);
 				}
 				ReceivedVecCaps::Closed => break,
-				ReceivedVecCaps::Failed => {
+				// A blocking receive cannot time out - the deadline is zero - but the variant must be
+				// handled, and "no message and the peer may still be there" is what `Failed` means
+				// here too: an incomplete answer, refused rather than handed back as a whole one.
+				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
 					close(consumer);
 					return None;
 				}
@@ -2304,6 +2310,10 @@ pub enum ReceivedVecCaps {
 	// complete one. This enum folded the two together until the frame transport moved onto it, and
 	// folding them would have undone that fix on every consumer the move touched.
 	Failed,
+	// The deadline passed with no message. Distinct from `Failed` because the peer is still there
+	// and the request may yet have been acted on - which is exactly the difference a caller needs to
+	// decide whether retrying is safe.
+	TimedOut,
 }
 
 // `recv_vec_blocking` that keeps EVERY capability the message carried instead of the first.
@@ -2311,11 +2321,31 @@ pub enum ReceivedVecCaps {
 #[unsafe(no_mangle)]
 // Image-internal transport boundary consumed by ipc-client.lslib.
 pub unsafe fn recv_vec_caps_blocking(channel: u64, out: &mut wire::Handles) -> ReceivedVecCaps {
+	unsafe { recv_vec_caps_deadline(channel, out, 0) }
+}
+
+// The same receive with an ABSOLUTE deadline in LAPIC ticks, `0` meaning none.
+//
+// A request/reply client that blocks forever is at the mercy of its peer: a service that accepts a
+// request and never answers hangs the caller with no way out, which is why `Transport::call` now
+// carries a deadline. Absolute rather than relative so a retry loop cannot extend its own budget by
+// restarting the clock.
+#[unsafe(no_mangle)]
+// Image-internal transport boundary consumed by ipc-client.lslib.
+pub unsafe fn recv_vec_caps_deadline(channel: u64, out: &mut wire::Handles, deadline: u64) -> ReceivedVecCaps {
 	unsafe {
 		loop {
 			let pending: i64 = channel_peek(channel);
 			if pending == ERR_WOULD_BLOCK {
-				wait(channel, 0);
+				if deadline != 0 && clock() >= deadline {
+					return ReceivedVecCaps::TimedOut;
+				}
+				wait(channel, deadline);
+				// `wait` returning on a deadline leaves the channel empty, so the next peek says
+				// WOULD_BLOCK again; the check above is what ends the loop, not this call's answer.
+				if deadline != 0 && clock() >= deadline {
+					return ReceivedVecCaps::TimedOut;
+				}
 				continue;
 			}
 			if pending < 0 {

@@ -1994,6 +1994,66 @@ fn memory_grow_is_charged_for_the_pages_it_zeroes() {
 
 // P02M0134, sixth round.
 
+// A SECTION MAY NOT READ ITS NEIGHBOUR'S BYTES. A count that runs past the section's own declared
+// size used to be served from whatever followed - the next section's content - and only the
+// `r.pos != end` check afterwards noticed, once the vector had already been allocated and filled
+// from bytes that were never part of this section. With each sub-parser bounded to its own span the
+// read fails at the boundary instead, so the failure is "this section is short", which it is.
+// A HOST IMPORT IS CHARGED FOR WHAT IT MOVES. Fuel bounded interpretation only: a host call cost
+// nothing, so a guest that did nothing but call out could move sixty-four megabytes per unit and the
+// budget never noticed. The rate is the one `memory.copy` pays, so a byte costs the same whichever
+// side of the boundary moves it.
+#[test]
+fn a_host_import_is_charged_for_the_work_it_reports() {
+	struct BulkHost {
+		bytes: usize,
+		calls: u32,
+	}
+	impl Host for BulkHost {
+		fn call_import(&mut self, _import: u32, _args: &[Value], _memory: &mut [u8]) -> Result<Vec<Value>, Trap> {
+			self.calls += 1;
+			Ok(Vec::new())
+		}
+		fn work_bytes(&self) -> usize {
+			self.bytes
+		}
+	}
+
+	// A module importing `env.work` (type 0) and calling it in a loop until the fuel runs out.
+	// body: loop { call 0; br 0 } end
+	let body: Vec<u8> = alloc::vec![0x03, 0x40, 0x10, 0x00, 0x0c, 0x00, 0x0b, 0x0b];
+	let wasm: Vec<u8> = build(&Spec { types: &[(&[], &[])], imports: &[("env", "work", 0)], funcs: &[0], mem_pages: 1, globals: &[], data: &[], exports: &[("run", 0x00, 1)], codes: &[(&[], &body)] });
+	let m: ValidatedModule = validate(parse(&wasm).unwrap()).expect("the fixture module validates");
+
+	// A host that reports moving a megabyte per call: the budget must stop it far sooner than a host
+	// that reports nothing.
+	let mut heavy = BulkHost { bytes: 1024 * 1024, calls: 0 };
+	let mut inst = Instance::new(&m).unwrap();
+	let _ = inst.invoke_with_fuel("run", &[], &mut heavy, 100_000);
+
+	let mut light = BulkHost { bytes: 0, calls: 0 };
+	let mut inst = Instance::new(&m).unwrap();
+	let _ = inst.invoke_with_fuel("run", &[], &mut light, 100_000);
+
+	assert!(heavy.calls > 0 && light.calls > 0, "both hosts ran");
+	assert!(light.calls > heavy.calls * 10, "the bulk host must exhaust the budget far sooner: heavy={} light={}", heavy.calls, light.calls);
+}
+
+#[test]
+fn a_section_cannot_read_into_the_one_that_follows_it() {
+	// A type section declaring TWO types but carrying only one, followed by a second section whose
+	// bytes happen to spell a valid second type. Unbounded, the type parser walks straight into it.
+	let one_type: Vec<u8> = alloc::vec![0x60, 0x00, 0x00];
+	let mut types: Vec<u8> = alloc::vec![0x02];
+	types.extend_from_slice(&one_type);
+	let mut m: Vec<u8> = alloc::vec![0x00, b'a', b's', b'm', 0x01, 0x00, 0x00, 0x00];
+	m.extend_from_slice(&section(1, &types));
+	// The function section that follows starts with bytes readable as `0x60 () -> ()`.
+	m.extend_from_slice(&[0x03, 0x04, 0x60, 0x00, 0x00, 0x00]);
+	let err = crate::parser::parse(&m).unwrap_err();
+	assert!(err.0.contains("end") || err.0.contains("short") || err.0.contains("section"), "the type section must fail at its own boundary, not borrow the next one: {}", err.0);
+}
+
 #[test]
 fn a_declared_count_larger_than_its_own_section_is_refused_before_it_is_filled() {
 	// Every section parser read a count and then filled the corresponding vector, so a six-byte

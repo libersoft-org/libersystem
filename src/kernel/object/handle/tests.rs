@@ -118,3 +118,35 @@ fn a_close_all_racing_a_transfer_never_frees_the_same_slot_twice() {
 	let again = table.insert_object(TestObject::new(4), Rights::ALL, 0);
 	assert!(reused != again, "two inserts must not answer with the same handle");
 }
+
+crate::tagged_test!(closing_a_handle_never_needs_an_allocation, [Handle, Object, Kernel], id = "kernel.object.handle.closing_a_handle_never_needs_an_allocation", covers = ["kernel"]);
+fn closing_a_handle_never_needs_an_allocation() {
+	// `try_place` reserved room in `slots` and NOT in `free`, so a fresh slot was appended with no
+	// room for the index it would carry when it was closed. Every `free.push` on the closing paths
+	// then allocated - and none of them has anywhere to report a failure. A ring-3 process that
+	// exhausted the heap and closed a handle could end the kernel; teardown could do it at the point
+	// in a process's life where there is least left to recover with.
+	//
+	// The property is a capacity invariant, which is checkable without an allocator failure:
+	// `free.capacity() >= slots.len()` after every insertion means no closing push can ever grow it.
+	let mut table = HandleTable::new();
+	for n in 1..=64u64 {
+		let _ = table.insert_object(TestObject::new(n), Rights::ALL, 0);
+		assert!(table.free_capacity_for_test() >= table.slot_count_for_test(), "after {n} inserts the free list has room for {} of {} slots: closing one would allocate", table.free_capacity_for_test(), table.slot_count_for_test());
+	}
+
+	// And it still holds once slots are recycled rather than appended, which is the case the old
+	// comment described and the only one it was true for.
+	let mut handles = alloc::vec::Vec::new();
+	for n in 100..=120u64 {
+		handles.push(table.insert_object(TestObject::new(n), Rights::ALL, 0));
+	}
+	for handle in handles {
+		table.close(handle).expect("an installed handle closes");
+		assert!(table.free_capacity_for_test() >= table.slot_count_for_test(), "the invariant survives recycling");
+	}
+
+	// Bulk teardown rebuilds the whole free list, which is the largest push run there is.
+	table.close_all();
+	assert!(table.free_capacity_for_test() >= table.slot_count_for_test(), "close_all rebuilt the free list within the reserved capacity");
+}

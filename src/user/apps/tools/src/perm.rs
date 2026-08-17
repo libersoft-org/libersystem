@@ -78,7 +78,7 @@ unsafe fn query_permission(permsvc: u64, mode: Option<JsonMode>) {
 					}
 				}
 				ReceivedVecCaps::Closed => break,
-				ReceivedVecCaps::Failed => {
+				ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
 					eprint(b"perm: the audit stream ended abnormally; what is shown above is incomplete\n");
 					break;
 				}

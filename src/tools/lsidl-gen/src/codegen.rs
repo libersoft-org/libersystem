@@ -426,7 +426,7 @@ impl Cg {
 		self.line(&format!("// interface `{}` over a channel: opcodes, a Service trait + dispatch, and a Client.", i.name));
 		self.line(&format!("pub mod {modname} {{"));
 		self.line("\tuse super::*;");
-		self.line("\tuse crate::codec::{Reader, SliceWriter, Sink, Transport, VecWriter};");
+		self.line("\tuse crate::codec::{Reader, SliceWriter, Sink, Transport, TransportError, VecWriter};");
 		self.line("\tuse alloc::vec::Vec;");
 		self.line("");
 		for m in &i.methods {
@@ -699,11 +699,32 @@ impl Cg {
 		self.line("\tpub struct Client<T: Transport> {");
 		self.line("\t\ttransport: T,");
 		self.line("\t\tcorr: u32,");
+		// The deadline every call on this client carries, and the reason the last one failed.
+		//
+		// The methods keep returning `Option`, so the hundreds of existing call sites are unchanged;
+		// what they could not do before is ASK WHY. A caller that needs to decide whether retrying is
+		// safe reads `last_error`: `SendRefused` never left, `PeerClosed` will never succeed on this
+		// channel, `TimedOut` may already have been acted on. Collapsing those into `None` is what
+		// the audit found, and this is the smallest shape that undoes it without changing every
+		// generated signature in fifteen protocol crates.
+		self.line("\t\tdeadline: u64,");
+		self.line("\t\tlast_error: Option<TransportError>,");
 		self.line("\t}");
 		self.line("");
 		self.line("\timpl<T: Transport> Client<T> {");
 		self.line("\t\tpub fn new(transport: T) -> Client<T> {");
-		self.line("\t\t\tClient { transport, corr: 0 }");
+		self.line("\t\t\tClient { transport, corr: 0, deadline: 0, last_error: None }");
+		self.line("\t\t}");
+		// An ABSOLUTE deadline, in the same ticks `rt::clock` reports. Zero - the default - keeps
+		// the blocking behaviour every existing caller already has.
+		self.line("\t\tpub fn with_deadline(transport: T, deadline: u64) -> Client<T> {");
+		self.line("\t\t\tClient { transport, corr: 0, deadline, last_error: None }");
+		self.line("\t\t}");
+		self.line("\t\tpub fn set_deadline(&mut self, deadline: u64) {");
+		self.line("\t\t\tself.deadline = deadline;");
+		self.line("\t\t}");
+		self.line("\t\tpub fn last_error(&self) -> Option<TransportError> {");
+		self.line("\t\t\tself.last_error");
 		self.line("\t\t}");
 		self.line("\t\tpub fn into_transport(self) -> T {");
 		self.line("\t\t\tself.transport");
@@ -725,7 +746,7 @@ impl Cg {
 		self.line("\t\t\tw.u32(corr)?;");
 		self.line("\t\t\tlet request = writer.into_inner();");
 		self.line("\t\t\tlet mut reply_handles = Handles::new();");
-		self.line("\t\t\tlet reply = self.transport.call(&request, &[], &mut reply_handles)?;");
+		self.line("\t\t\tlet reply = self.transport.call(&request, &[], &mut reply_handles, self.deadline).map_err(|e| { self.last_error = Some(e); e }).ok()?;");
 		self.line("\t\t\tif !reply_handles.is_empty() {");
 		self.line("\t\t\t\tself.transport.discard_handles(reply_handles.as_slice());");
 		self.line("\t\t\t\treturn None;");
@@ -764,7 +785,7 @@ impl Cg {
 				self.line("\t\t\tlet request_handles = Handles::try_from_slice(writer.handles())?;");
 				self.line("\t\t\tlet request = writer.into_inner();");
 				self.line("\t\t\tlet mut reply_handles = Handles::new();");
-				self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;");
+				self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline).map_err(|e| { self.last_error = Some(e); e }).ok()?;");
 				self.line("\t\t\tlet mut reader = Reader::new(&reply);");
 				self.line("\t\t\tlet r = &mut reader;");
 				// EXACTLY ONE, and the extras closed. This checked only that the list was NOT
@@ -837,7 +858,7 @@ impl Cg {
 			self.line("\t\t\tlet request_handles = Handles::try_from_slice(writer.handles())?;");
 			self.line("\t\t\tlet request = writer.into_inner();");
 			self.line("\t\t\tlet mut reply_handles = Handles::new();");
-			self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles)?;");
+			self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline).map_err(|e| { self.last_error = Some(e); e }).ok()?;");
 			self.line("\t\t\tlet mut reader = Reader::with_handle_list(&reply, &reply_handles);");
 			let retexpr = self.read_value(&m.ret).map_err(|e| Error::new(m.span, e))?;
 			self.line("\t\t\tlet decoded = (|| {");

@@ -2042,7 +2042,7 @@ for spec in "$@"; do
 	done
 	if [[ "$artifact" == "ipc-client" ]]; then
 		actual_imports="$(llvm-readelf --wide --dyn-syms "$out" | awk '$7 == "UND" && $8 != "" {print $8}' | sort -u)"
-		expected_imports="$(printf '%s\n' recv_vec_caps_blocking resolve send_caps_blocking | sort)"
+		expected_imports="$(printf '%s\n' recv_vec_caps_deadline resolve send_caps_blocking | sort)"
 		if [[ "$actual_imports" != "$expected_imports" ]]; then
 			echo "build-shared: $out has unexpected runtime imports: $actual_imports" >&2
 			exit 1

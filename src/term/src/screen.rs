@@ -165,9 +165,20 @@ impl Default for SavedCursor {
 	}
 }
 
+// A filled vector that reports failure instead of aborting. Every grid buffer goes through this:
+// a `Screen` is built and resized on behalf of ring 3 (a client asking for a VT, a window resize),
+// and `alloc::vec![x; n]` ends the process - in the kernel's case the MACHINE - when the allocator
+// cannot serve it.
+fn try_filled<T: Clone>(value: T, len: usize) -> Option<Vec<T>> {
+	let mut v: Vec<T> = Vec::new();
+	v.try_reserve_exact(len).ok()?;
+	v.resize(len, value);
+	Some(v)
+}
+
 impl ScreenBuffer {
-	fn new(cols: usize, rows: usize, blank: Cell) -> ScreenBuffer {
-		ScreenBuffer { cells: alloc::vec![blank; cols * rows], wrap: alloc::vec![false; rows], saved: SavedCursor::default() }
+	fn try_new(cols: usize, rows: usize, blank: Cell) -> Option<ScreenBuffer> {
+		Some(ScreenBuffer { cells: try_filled(blank, cols * rows)?, wrap: try_filled(false, rows)?, saved: SavedCursor::default() })
 	}
 }
 
@@ -310,11 +321,20 @@ impl Screen {
 	// a 0x0 `Screen` whose first `put_glyph` indexed an empty `wrap` vector. The kernel checks for
 	// 0x0 after constructing one; a public API should not require its callers to know that.
 	pub fn new(cols: usize, rows: usize, scrollback: usize) -> Screen {
+		// The infallible form, for tests and for callers that have no way to fail. Real callers use
+		// `try_new`: a grid is built on behalf of ring 3.
+		Screen::try_new(cols, rows, scrollback).expect("screen allocation")
+	}
+
+	// Build a grid, reporting an allocation failure rather than aborting on one. Five buffers are
+	// live at once here - two screens, their wrap flags, the dirty map and the scrollback ring -
+	// and the scrollback is by far the largest.
+	pub fn try_new(cols: usize, rows: usize, scrollback: usize) -> Option<Screen> {
 		// The request is kept as it arrived; `scrollback` below is what fits at this width.
 		let requested: usize = scrollback;
 		let (cols, rows, scrollback) = geometry(cols, rows, scrollback, MAX_COLS, MAX_ROWS);
 		let blank = Cell { glyph: b' ' as u32, fg: Color::Default, bg: Color::Default, bold: false, underline: false, reverse: false };
-		Screen { cols, rows, col: 0, row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, osc_overflow: false, mouse_mode: 0, mouse_press: false, mouse_button: false, mouse_any: false, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, clipboard_query: None, reply: Vec::new(), selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: ScreenBuffer::new(cols, rows, blank), alt: ScreenBuffer::new(cols, rows, blank), alt_active: false, dirty: alloc::vec![true; cols * rows], pending_wrap: false, scrollback: alloc::vec![blank; scrollback * cols], sb_wrap: alloc::vec![false; scrollback], sb_cap: scrollback, requested_scrollback: requested, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None }
+		Some(Screen { cols, rows, col: 0, row: 0, scroll_top: 0, scroll_bottom: rows.saturating_sub(1), default_fg: FG, default_bg: BG, palette: ANSI_PALETTE, fg_color: Color::Default, bg_color: Color::Default, bold: false, underline: false, reverse: false, cursor_visible: true, cursor_shape: CursorShape::Underline, cursor_blink: false, bell: false, osc: [0; 256], osc_len: 0, osc_overflow: false, mouse_mode: 0, mouse_press: false, mouse_button: false, mouse_any: false, mouse_sgr: false, bracketed_paste: false, clipboard_set: None, clipboard_query: None, reply: Vec::new(), selection: None, esc_state: 0, csi_private: 0, params: [0; 16], nparams: 0, utf8_acc: 0, utf8_rem: 0, utf8_min: 0, primary: ScreenBuffer::try_new(cols, rows, blank)?, alt: ScreenBuffer::try_new(cols, rows, blank)?, alt_active: false, dirty: try_filled(true, cols * rows)?, pending_wrap: false, scrollback: try_filled(blank, scrollback * cols)?, sb_wrap: try_filled(false, scrollback)?, sb_cap: scrollback, requested_scrollback: requested, sb_head: 0, sb_len: 0, view_offset: 0, scrolls: Vec::new(), mouse: None })
 	}
 
 	// How many rows of scrollback this screen can hold at its current width. Public so a test can
@@ -907,14 +927,18 @@ impl Screen {
 		}
 		// The last `new_rows` rows are the screen; everything before them is scrollback.
 		let screen_from = rows_out.len().saturating_sub(new_rows);
-		let mut new_primary = alloc::vec![blank; new_cols * new_rows];
-		let mut new_wrap = alloc::vec![false; new_rows];
+		// FALLIBLE, and BEFORE anything is written back: a resize runs on behalf of ring 3 (a client
+		// resizing its window), and these four buffers plus the reflowed `lines` and `rows_out` are
+		// all live at once - roughly twice the whole scrollback at the peak. An `alloc::vec!` that
+		// cannot be served aborts; failing the resize leaves the old geometry standing instead.
+		let Some(mut new_primary) = try_filled(blank, new_cols * new_rows) else { return false };
+		let Some(mut new_wrap) = try_filled(false, new_rows) else { return false };
 		for (r, (row, wrapped)) in rows_out[screen_from..].iter().enumerate() {
 			new_primary[r * new_cols..r * new_cols + new_cols].copy_from_slice(row);
 			new_wrap[r] = *wrapped;
 		}
-		let mut new_scrollback = alloc::vec![blank; new_sb_cap * new_cols];
-		let mut new_sb_wrap = alloc::vec![false; new_sb_cap];
+		let Some(mut new_scrollback) = try_filled(blank, new_sb_cap * new_cols) else { return false };
+		let Some(mut new_sb_wrap) = try_filled(false, new_sb_cap) else { return false };
 		let keep_from = screen_from.saturating_sub(new_sb_cap);
 		let mut sb_len = 0usize;
 		for (row, wrapped) in rows_out[keep_from..screen_from].iter() {

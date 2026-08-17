@@ -218,13 +218,16 @@ struct DeadlineTransport {
 }
 
 impl proto::codec::Transport for DeadlineTransport {
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut proto::codec::Handles) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut proto::codec::Handles, _deadline: u64) -> Result<Vec<u8>, proto::codec::TransportError> {
 		unsafe {
 			if !send_caps_blocking(self.chan, request, request_handles) {
-				return None;
+				return Err(proto::codec::TransportError::SendRefused);
 			}
+			// This transport carried its own deadline before the trait could express one; it keeps
+			// its own because it is a fixed service policy rather than a per-call budget, and its
+			// endings are now told apart the way every other transport's are.
 			if wait(self.chan, clock() + self.ticks) != 0 {
-				return None;
+				return Err(proto::codec::TransportError::TimedOut);
 			}
 			let mut reply: [u8; 4096] = [0u8; 4096];
 			// EVERY CAPABILITY THE REPLY CARRIED. This took the first and dropped the rest, which
@@ -233,9 +236,9 @@ impl proto::codec::Transport for DeadlineTransport {
 			match try_recv_caps(self.chan, &mut reply) {
 				PolledCaps::Message { len, handles } => {
 					*reply_handles = handles;
-					Some(reply[..len].to_vec())
+					Ok(reply[..len].to_vec())
 				}
-				_ => None,
+				_ => Err(proto::codec::TransportError::ReceiveFailed),
 			}
 		}
 	}
@@ -443,8 +446,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// first pixel: `has_fb` says a framebuffer was mapped, and this says it is one we can draw
 		// into.
 		let drawable: Option<Box<dyn Surface>> = if has_fb { make_surface(addr, &fb, &display) } else { None };
-		let term: Option<Term> = if let Some(drawable) = drawable {
-			let mut t = Term::new(drawable, vt_scrollback);
+		let term: Option<Term> = if let Some(mut t) = drawable.and_then(|d| Term::try_new(d, vt_scrollback)) {
 			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 			let mut log: Vec<u8> = alloc::vec![0u8; 16384];
 			let n: i64 = console_readlog(&mut log);
@@ -465,7 +467,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::new(), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::with_limit(SERIAL_PENDING_MAX), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -752,11 +754,10 @@ unsafe fn render_output(console: &mut Console, vi: usize, bytes: &[u8]) {
 			// the session loop drains it after the present, bounded by what the kernel's transmit
 			// ring accepts, so the baud-throttled serial port never delays the display (see `run`).
 			// A backlog past the cap drops its oldest bytes - the newest output is the valuable
-			// part of a debug mirror - and the gap is marked on the next drain.
-			console.serial.feed(bytes);
-			let pending: usize = console.serial.as_bytes().len();
-			if pending > SERIAL_PENDING_MAX {
-				console.serial.consume(pending - SERIAL_PENDING_MAX);
+			// part of a debug mirror - and the gap is marked on the next drain. The cap lives in the
+			// sink, which applies it BEFORE allocating; trimming here afterwards let a single large
+			// chunk allocate past the bound first and be cut back only once it was already held.
+			if !console.serial.feed(bytes) {
 				console.serial_gap = true;
 			}
 		}
@@ -1877,11 +1878,13 @@ unsafe fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: 
 		let (vt_scrollback, vt_history): (usize, usize) = term_policy(config_client);
 		// No drawable surface means this VT has no terminal - the same answer boot gives when the
 		// geometry cannot be addressed, rather than a panic on the first pixel.
-		let term: Option<Term> = make_surface(addr, fb, display).map(|drawable| {
-			let mut t = Term::new(drawable, vt_scrollback);
+		// `and_then`, not `map`: a VT whose grid cannot be allocated has no terminal, the same answer
+		// an unaddressable geometry gives, rather than aborting the whole console service.
+		let term: Option<Term> = make_surface(addr, fb, display).and_then(|drawable| {
+			let mut t = Term::try_new(drawable, vt_scrollback)?;
 			t.resize(cur_w as usize / CELL_W, cur_h as usize / CELL_H);
 			t.screen.clear();
-			t
+			Some(t)
 		});
 		Some(Vt { term, client: vt_service, control: control_console, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") })
 	}

@@ -274,11 +274,14 @@ pub struct WorldHost<S: WorldServices> {
 	// the bytes the component handed to its `write` import - its output, seen through the granted
 	// write path, rather than a guess at where they sit in linear memory.
 	output: alloc::vec::Vec<u8>,
+	// bytes the last import call was asked to move, so the interpreter can charge fuel for the work
+	// rather than for the one instruction that requested it.
+	work: usize,
 }
 
 impl<S: WorldServices> WorldHost<S> {
 	pub fn new(services: S, imports: alloc::vec::Vec<WorldFn>) -> Self {
-		WorldHost { services, imports, logged: false, output: alloc::vec::Vec::new() }
+		WorldHost { services, imports, logged: false, output: alloc::vec::Vec::new(), work: 0 }
 	}
 
 	pub fn logged(&self) -> bool {
@@ -302,8 +305,15 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 		let Some(op) = self.imports.get(import as usize).copied() else {
 			return Err(crate::interp::Trap("import index outside the resolved world"));
 		};
+		// What this call is about to move, so the interpreter can price it: the guest chose the
+		// window, and fuel must be charged for its size rather than for the single instruction that
+		// asked. Recorded before the dispatch so a failing call is charged for the attempt too.
+		self.work = 0;
 		let (ptr, end) = match window(args, memory.len()) {
-			Ok(pair) => pair,
+			Ok(pair) => {
+				self.work = pair.1.saturating_sub(pair.0);
+				pair
+			}
 			// The two failures the SDK's vocabulary already distinguishes: a pair outside the
 			// guest's memory is `Fault`, and a legal pair longer than one call may move is
 			// `Unsupported` - "the argument is outside what the host accepts".
@@ -360,6 +370,12 @@ impl<S: WorldServices> crate::interp::Host for WorldHost<S> {
 			}
 		};
 		Ok(alloc::vec![Value::I32(status)])
+	}
+
+	// The window the last call was given. `charge_bulk` prices it at the same per-kilobyte rate as
+	// the guest's own `memory.copy`, so moving a byte costs the same on either side of the boundary.
+	fn work_bytes(&self) -> usize {
+		self.work
 	}
 }
 

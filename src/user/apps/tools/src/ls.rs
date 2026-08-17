@@ -298,7 +298,7 @@ unsafe fn ls(storage: u64, uri: &[u8], key: SortKey, reverse: bool, unit: Unit, 
 						}
 					}
 					ReceivedVecCaps::Closed => break,
-					ReceivedVecCaps::Failed => {
+					ReceivedVecCaps::Failed | ReceivedVecCaps::TimedOut => {
 						eprint(b"ls: listing failed partway through; what is shown above is incomplete\n");
 						break;
 					}

@@ -20,19 +20,35 @@ impl TextSink {
 	// soft-wrapped rows are concatenated into one line, a hard break ends a line, trailing
 	// spaces are trimmed, and trailing empty lines are dropped. Lines are joined with '\n'
 	// (no trailing newline). Replaces any previously captured text.
-	pub fn capture(&mut self, screen: &Screen) {
+	// FALLIBLE, because a ring-3 caller reaches this through `SYS_CONSOLE_READLOG` and every
+	// allocation below is sized by the scrollback: the line buffer, the per-line vector, the encoded
+	// bytes and the joined output, each growing infallibly, with peak memory of roughly twice the
+	// whole scrollback while both the line list and the joined result are live. An infallible
+	// allocation that fails does not fail the syscall - it ends the KERNEL.
+	//
+	// `false` means the capture could not be made and the sink holds nothing, which the caller
+	// reports as an absent log rather than as an empty one.
+	pub fn capture(&mut self, screen: &Screen) -> bool {
 		self.out.clear();
 		let cols = screen.cols();
 		let total = screen.total_logical_rows();
 		let mut lines: Vec<Vec<u8>> = Vec::new();
 		let mut line: Vec<u32> = Vec::new();
 		for g in 0..total {
+			if line.try_reserve(cols).is_err() {
+				self.out.clear();
+				return false;
+			}
 			for col in 0..cols {
 				line.push(screen.global_glyph(col, g));
 			}
 			if !screen.global_wrap(g) {
 				// Hard break (or a non-wrapped row): the logical line ends here.
 				trim_trailing_spaces(&mut line);
+				if lines.try_reserve(1).is_err() {
+					self.out.clear();
+					return false;
+				}
 				lines.push(encode_line(&line));
 				line.clear();
 			}
@@ -41,11 +57,22 @@ impl TextSink {
 		// A trailing soft-wrapped partial with no closing hard break still forms a line.
 		if !line.is_empty() {
 			trim_trailing_spaces(&mut line);
+			if lines.try_reserve(1).is_err() {
+				self.out.clear();
+				return false;
+			}
 			lines.push(encode_line(&line));
 		}
 		// Drop trailing empty logical lines (the blank bottom of the screen).
 		while matches!(lines.last(), Some(l) if l.is_empty()) {
 			lines.pop();
+		}
+		// One reservation for the joined result rather than one per line: the total is known here,
+		// and this is the allocation that doubles the peak.
+		let joined: usize = lines.iter().map(|l| l.len() + 1).sum();
+		if self.out.try_reserve(joined).is_err() {
+			self.out.clear();
+			return false;
 		}
 		for (i, l) in lines.iter().enumerate() {
 			if i > 0 {
@@ -53,6 +80,7 @@ impl TextSink {
 			}
 			self.out.extend_from_slice(l);
 		}
+		true
 	}
 
 	// The serialized text from the last `capture`.

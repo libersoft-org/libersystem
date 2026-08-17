@@ -171,7 +171,8 @@ fn retire_or_recycle(slot: &mut Slot, free: &mut Vec<u32>, index: usize) {
 	match slot.generation.checked_add(1) {
 		Some(next) => {
 			slot.generation = next;
-			// ALLOC-OK: the free list of a table that already holds this slot - it shrank by one on the way in, so the push reuses that capacity.
+			// ALLOC-OK: `try_place` reserves one free entry for every slot it creates, so
+			// `free.capacity() >= slots.len()` and this push never allocates.
 			free.push(index as u32);
 		}
 		None => slot.generation = u32::MAX,
@@ -217,7 +218,22 @@ impl HandleTable {
 			slot.cap = Some(cap);
 			return Ok(Handle::new(slot.generation, index));
 		}
-		if self.slots.try_reserve(1).is_err() {
+		// BOTH VECTORS, and the free list first in intent: this reserved only `slots`, so a fresh
+		// slot appended here left `free` with no room for the index it will one day carry. Every
+		// later `free.push` - in `close`, in `commit_taken`, in `close_all` - then allocated, and
+		// those pushes have nowhere to report a failure. A ring-3 process that exhausts the heap and
+		// then CLOSES a handle could end the kernel, and bulk teardown could do it at the least
+		// recoverable point in a process's life.
+		//
+		// Reserving one free entry per fresh slot makes `free.capacity() >= slots.len()` an
+		// invariant of slot creation, which is what the "it shrank by one on the way in" comments on
+		// those pushes have always claimed and only ever been true for a RECYCLED slot.
+		// AGAINST THE SLOT COUNT, not `try_reserve(1)`: `free` is usually EMPTY while slots are being
+		// appended, and `try_reserve(1)` only promises room for one more than its current length - so
+		// it is satisfied immediately and the capacity lags the slot count for ever after. What has
+		// to hold is `free.capacity() >= slots.len()`, which is the amount a full teardown pushes.
+		let wanted = self.slots.len() + 1;
+		if self.slots.try_reserve(1).is_err() || self.free.try_reserve(wanted - self.free.len()).is_err() {
 			return Err(cap);
 		}
 		let index = self.slots.len() as u32;
@@ -619,6 +635,18 @@ impl HandleTable {
 	// The free list, for a test that has to look at it. The invariant it checks - no index twice -
 	// is not observable through the ordinary API until the damage has already been handed out.
 	#[cfg(test)]
+	// The free list's capacity, so a test can assert the invariant `try_place` establishes rather
+	// than only its visible effect.
+	#[cfg(test)]
+	pub fn free_capacity_for_test(&self) -> usize {
+		self.free.capacity()
+	}
+
+	#[cfg(test)]
+	pub fn slot_count_for_test(&self) -> usize {
+		self.slots.len()
+	}
+
 	pub fn free_indices_for_test(&self) -> alloc::vec::Vec<u32> {
 		// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed. The gate
 		// exempts test code by PATH, which does not reach a test helper living in a source file.
@@ -674,8 +702,8 @@ impl HandleTable {
 				slot.generation == u32::MAX
 			};
 			if !retired {
-				// ALLOC-OK: the free list of a table that already holds this slot - it shrank by one on the way in, so the push reuses that capacity.
-				// ALLOC-OK: the free list of a table that already holds this slot - it shrank by one on the way in, so the push reuses that capacity.
+				// ALLOC-OK: `free` was cleared above, which keeps its capacity, and `try_place`
+				// reserved one entry per slot - so this rebuild cannot exceed what is already there.
 				self.free.push(index as u32);
 			}
 		}

@@ -3,8 +3,8 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use rt::{RIGHT_MAP, RIGHT_READ, RIGHT_TRANSFER, ReceivedVecCaps, close, duplicate, map_object, memory_object_create, recv_vec_caps_blocking, resolve, send_caps_blocking, unmap_object};
-use wire::{Buffer, Handles, Transport};
+use rt::{RIGHT_MAP, RIGHT_READ, RIGHT_TRANSFER, ReceivedVecCaps, close, duplicate, map_object, memory_object_create, recv_vec_caps_deadline, resolve, send_caps_blocking, unmap_object};
+use wire::{Buffer, Handles, Transport, TransportError};
 
 pub unsafe fn make_buffer(bytes: &[u8]) -> Option<Buffer> {
 	unsafe {
@@ -36,17 +36,19 @@ pub struct ChannelTransport {
 }
 
 impl Transport for ChannelTransport {
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError> {
 		unsafe {
 			if !send_caps_blocking(self.chan, request, request_handles) {
-				return None;
+				return Err(TransportError::SendRefused);
 			}
-			match recv_vec_caps_blocking(self.chan, reply_handles) {
-				ReceivedVecCaps::Message { bytes } => Some(bytes),
-				// A refused receive and a departed peer are both "no reply" to a caller waiting for
-				// one; they are told apart at the drainer, where a short answer would otherwise
-				// look complete.
-				ReceivedVecCaps::Closed | ReceivedVecCaps::Failed => None,
+			// EACH ENDING KEPT DISTINCT. These were one `None`, so a caller could not tell a
+			// departed peer (retry impossible) from a refused receive (peer still there) from a
+			// deadline (the request may already have been acted on).
+			match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
+				ReceivedVecCaps::Message { bytes } => Ok(bytes),
+				ReceivedVecCaps::Closed => Err(TransportError::PeerClosed),
+				ReceivedVecCaps::Failed => Err(TransportError::ReceiveFailed),
+				ReceivedVecCaps::TimedOut => Err(TransportError::TimedOut),
 			}
 		}
 	}
@@ -90,23 +92,24 @@ impl SvcTransport {
 }
 
 impl Transport for SvcTransport {
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>> {
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError> {
 		unsafe {
 			let chan = self.channel();
 			if chan == 0 {
-				return None;
+				return Err(TransportError::NoRoute);
 			}
 			if !send_caps_blocking(chan, request, request_handles) {
 				if !self.reconnect() || !send_caps_blocking(self.chan, request, request_handles) {
-					return None;
+					return Err(TransportError::SendRefused);
 				}
 			}
-			match recv_vec_caps_blocking(self.chan, reply_handles) {
-				ReceivedVecCaps::Message { bytes } => Some(bytes),
-				ReceivedVecCaps::Failed => None,
+			match recv_vec_caps_deadline(self.chan, reply_handles, deadline) {
+				ReceivedVecCaps::Message { bytes } => Ok(bytes),
+				ReceivedVecCaps::Failed => Err(TransportError::ReceiveFailed),
+				ReceivedVecCaps::TimedOut => Err(TransportError::TimedOut),
 				ReceivedVecCaps::Closed => {
 					let _ = self.reconnect();
-					None
+					Err(TransportError::PeerClosed)
 				}
 			}
 		}
@@ -122,8 +125,8 @@ impl Transport for SvcTransport {
 }
 
 impl Transport for &mut SvcTransport {
-	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles) -> Option<Vec<u8>> {
-		(**self).call(request, request_handles, reply_handles)
+	fn call(&mut self, request: &[u8], request_handles: &[u64], reply_handles: &mut Handles, deadline: u64) -> Result<Vec<u8>, TransportError> {
+		(**self).call(request, request_handles, reply_handles, deadline)
 	}
 
 	fn discard_handles(&mut self, handles: &[u64]) {

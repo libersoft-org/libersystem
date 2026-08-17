@@ -98,7 +98,11 @@ pub fn init(info: FbInfo) {
 	};
 	// ALLOC-OK: boot, the kernel's own console surface, built once during bring-up
 	let surface: Box<dyn Surface> = Box::new(KernelSurface { raster });
-	let term = Term::new(surface, term::SCROLLBACK_ROWS);
+	// A console that does not start rather than a machine that stops: the grid buffers are sized by
+	// the framebuffer geometry, and an infallible allocation here would abort during bring-up.
+	let Some(term) = Term::try_new(surface, term::SCROLLBACK_ROWS) else {
+		return;
+	};
 	if term.screen.cols() == 0 || term.screen.rows() == 0 {
 		return;
 	}
@@ -145,15 +149,16 @@ pub fn boot_log_text() -> Option<Vec<u8>> {
 	let mut guard = CONSOLE.try_lock()?;
 	let console = guard.as_mut()?;
 	let mut sink = TextSink::new();
-	sink.capture(&console.term.screen);
+	// A capture that cannot allocate reports an absent log. It does not end the kernel, which is
+	// what the infallible growth inside `capture` used to do on a path ring 3 reaches through
+	// `SYS_CONSOLE_READLOG`.
+	if !sink.capture(&console.term.screen) {
+		return None;
+	}
 	// TAKEN, not copied. This was `sink.as_bytes().to_vec()` - a second copy of the whole
 	// scrollback, allocated infallibly, on a path a ring-3 caller reaches through
 	// `SYS_CONSOLE_READLOG`. The sink already owns exactly these bytes.
 	//
-	// What remains, said rather than implied: `TextSink::capture` itself grows its line buffers
-	// infallibly, in `src/term`, which this gate does not scan and which userspace links too. That
-	// is the same class one crate over, and closing it is a change to a shared library's signature
-	// rather than to this call.
 	Some(sink.into_bytes())
 }
 

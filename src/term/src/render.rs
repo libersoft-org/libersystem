@@ -358,6 +358,14 @@ impl Term {
 		Term { screen: Screen::new(cols, rows, scrollback), renderer: FramebufferRenderer::new(surface) }
 	}
 
+	// The same construction, reporting an allocation failure instead of aborting on one: the grid
+	// buffers are sized by the surface and a VT is built on behalf of ring 3.
+	pub fn try_new(surface: Box<dyn Surface>, scrollback: usize) -> Option<Term> {
+		let cols = surface.width() / CELL_W;
+		let rows = surface.height() / CELL_H;
+		Some(Term { screen: Screen::try_new(cols, rows, scrollback)?, renderer: FramebufferRenderer::new(surface) })
+	}
+
 	// Reflow the model to fit new_cols x new_rows, clamped to what the physical framebuffer
 	// can show, then clear the now-unused area (only when the grid actually changed). The
 	// local stand-in for a virtio-gpu mode-set.

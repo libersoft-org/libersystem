@@ -91,7 +91,28 @@ pub struct Trap(pub &'static str);
 // gating lives: the host only services imports it was wired up to grant.
 pub trait Host {
 	fn call_import(&mut self, import: u32, args: &[Value], memory: &mut [u8]) -> Result<Vec<Value>, Trap>;
+
+	// Bytes this host touched serving the CALL THAT JUST RETURNED, so the interpreter can charge for
+	// them.
+	//
+	// Without it a host import was free: one instruction's worth of fuel bought a call that could
+	// read or write the whole 64 MB linear memory, so fuel bounded INTERPRETATION rather than WORK,
+	// which is the opposite of what it exists to do - the cheapest way to spend a host's time was to
+	// stop executing wasm and start calling out.
+	//
+	// The default is zero for a host that only exchanges scalars, which costs no more than the call
+	// itself. A host that copies reports what it copied and is charged at the same per-kilobyte rate
+	// as `memory.copy` and `memory.grow`, so the price of moving a byte does not depend on which
+	// side of the boundary moved it.
+	fn work_bytes(&self) -> usize {
+		0
+	}
 }
+
+// What one host import costs before anything it moves is priced. A host call crosses a boundary,
+// validates its arguments and usually performs a syscall, so it is worth more than an add - and a
+// guest that does nothing but call out must still run out of fuel.
+const HOST_CALL_UNITS: u64 = 16;
 
 // One page of linear memory.
 pub const PAGE: usize = 65536;
@@ -335,7 +356,11 @@ fn call_inner(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, global
 		}
 	}
 	if index < module.import_count() {
+		// A HOST CALL IS NOT FREE. The base unit is the call; `work_bytes` prices what it moved.
+		// A HOST CALL IS NOT FREE. The base unit is the call; `work_bytes` prices what it moved.
+		budget.spend(HOST_CALL_UNITS)?;
 		let results = host.call_import(index, args, memory)?;
+		budget.charge_bulk(host.work_bytes())?;
 		// WHAT THE HOST RETURNED, against what the import declared.
 		//
 		// The vector went straight onto the operand stack with neither its length nor its types

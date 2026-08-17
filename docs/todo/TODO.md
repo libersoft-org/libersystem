@@ -192,7 +192,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0125 - What the FAT backend writes, and what it says it wrote](P02M0125.md)
 - [x] [P02M0126 - What the ISO9660 backend accepts, and the threat model it states](P02M0126.md)
 - [x] [P02M0127 - The ABI's own guarantee, which is the one thing it cannot get wrong](P02M0127.md)
-- [ ] [P02M0128 - The terminal's state machine, and the one safe function that is not safe](P02M0128.md)
+- [x] [P02M0128 - The terminal's state machine, and the one safe function that is not safe](P02M0128.md)
 - [ ] [P02M0129 - What the loader assumes about the machine it is running on](P02M0129.md)
 - [x] [P02M0130 - What the component SDK is, and what its milestone says it is](P02M0130.md)
 - [x] [P02M0131 - What LiberMemFS's capacity actually bounds](P02M0131.md)
