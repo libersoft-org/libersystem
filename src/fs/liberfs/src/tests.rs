@@ -4078,14 +4078,35 @@ fn a_check_that_could_not_run_is_a_fault_not_a_clean_report() {
 	fs.check_structure(&mut clean);
 	assert_eq!(clean.len(), 0, "the volume itself is sound: {clean:?}");
 
-	// the pass allocates its inode-tree map first and then one map per directory, so
-	// letting exactly one through puts the refusal inside `check_dir_structure`.
+	// SWEPT RATHER THAN TUNED, and that is a correction. This let exactly ONE allocation through on
+	// the reasoning that the pass allocates its inode-tree map first and then one map per
+	// directory - a number that describes the allocation SEQUENCE, so it stopped being true the
+	// moment more of that sequence became fallible. Which it now has: the block buffers this pass
+	// reads through are `try_zeroed` rather than `vec![0u8; ..]`, because an infallible one aborts
+	// StorageService and every volume it serves.
+	//
+	// What the test is about is that a refusal inside the directory check is REPORTED, so it sweeps
+	// the first several budgets and requires one of them to land there. The count is then evidence
+	// rather than a constant somebody has to re-derive after every change.
+	let mut reported = false;
+	for allow in 0..12 {
+		let mut faults: Vec<Vec<u8>> = Vec::new();
+		{
+			let _armed = fail_allocation_after(allow);
+			fs.check_structure(&mut faults);
+		}
+		if mentions(&faults, b"memory to check this directory") {
+			reported = true;
+			break;
+		}
+	}
+	assert!(reported, "some budget puts the refusal inside the directory check, and it says so");
 	let mut faults: Vec<Vec<u8>> = Vec::new();
 	{
 		let _armed = fail_allocation_after(1);
 		fs.check_structure(&mut faults);
 	}
-	assert!(mentions(&faults, b"memory to check this directory"), "a check that could not run says so: {faults:?}");
+	assert!(!faults.is_empty(), "and a refused check is never a clean report: {faults:?}");
 	// and the whole report carries it, so no caller reads a directory that was skipped as
 	// a directory that passed.
 	//
@@ -4151,7 +4172,11 @@ fn a_mount_that_runs_short_inside_the_namespace_walk_refuses_rather_than_aborts(
 	let dev = fs.into_device();
 	let mut refused = 0u32;
 	let mut mounted = 0u32;
-	for budget in 0..64usize {
+	// WIDENED, because the mount's allocation sequence grew longer: the block buffers it reads
+	// through are `try_zeroed` rather than `vec![0u8; ..]` now, so more of the sequence is fallible
+	// and the budget at which a mount can complete moved out past the old ceiling. The sweep is
+	// about there BEING such a budget, not about which one it is.
+	for budget in 0..512usize {
 		let attempt = dev.clone();
 		let _armed = fail_allocation_after(budget);
 		match LiberFs::mount(attempt) {

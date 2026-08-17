@@ -742,9 +742,17 @@ impl Ld {
 			if repaint {
 				// The old line ran off the top of the screen, so there is no start of it to erase
 				// back to: put the new one at the top-left and start again from there.
+				//
+				// AND THAT IS THE WHOLE EMISSION. `repaint` already writes `CR`, `EL` and the line
+				// from the start of the cursor's row - and with `cursor` reset to zero that is the
+				// ENTIRE new line - so the `e.put` below sent every byte of it a second time. The
+				// local grid absorbs the repetition (the second copy overwrites the first), which
+				// is why the screen looked right; the SERIAL and PTY mirrors do not, so what a
+				// person sees over a remote terminal is the line twice.
 				self.repaint(e);
+			} else {
+				e.put(&self.line[..n]);
 			}
-			e.put(&self.line[..n]);
 		}
 		self.cursor = n;
 	}

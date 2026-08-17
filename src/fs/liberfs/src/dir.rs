@@ -115,7 +115,10 @@ impl<D: BlockDevice> LiberFs<D> {
 		if root == 0 {
 			return true;
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		// A refused allocation cannot be reported from a `bool`, and answering "empty" for a
+		// directory this could not read would be the false end-of-directory this milestone just
+		// removed one layer up. Not empty is the safe answer: the caller re-reads.
+		let Ok(mut buf) = try_zeroed(BLOCK_SIZE) else { return false };
 		if self.read_node(root, crc, &mut buf).is_err() {
 			// Unreadable is not empty, and a removal must not conclude anything from it.
 			return false;
@@ -240,7 +243,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut visited: BTreeSet<u64> = BTreeSet::new();
 		// (block, crc, depth remaining)
 		let mut stack: Vec<(u64, u32, usize)> = vec![(root, root_crc, depth)];
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		while let Some((ptr, crc, left)) = stack.pop() {
 			// Only the ROOT may be absent, and it was handled above - so a zero reaching
 			// here came out of a child slot of an internal node, which is an impossible
@@ -295,7 +298,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let cursor = after.map(|name| (name_hash(name), name));
 		let mut visited: BTreeSet<u64> = BTreeSet::new();
 		let mut stack: Vec<(u64, u32, usize)> = vec![(root, root_crc, TREE_DEPTH_MAX)];
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		while let Some((ptr, crc, left)) = stack.pop() {
 			if ptr == 0 || left == 0 || ptr >= self.num_blocks {
 				return Err(FsError::Corrupt);
@@ -390,7 +393,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let hash = name_hash(name);
 		let mut ptr = root;
 		let mut crc = root_crc;
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		// bounded descent, like every tree walk: a longer path is a hostile shape.
 		for _ in 0..TREE_DEPTH_MAX {
 			self.read_node(ptr, crc, &mut buf)?;
@@ -413,7 +416,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	pub(crate) fn dir_tree_insert(&mut self, root: u64, root_crc: u32, name: &[u8], child: u32) -> Result<(u64, u32), FsError> {
 		if root == 0 {
 			let blk = self.alloc_meta()?;
-			let mut buf = vec![0u8; BLOCK_SIZE];
+			let mut buf = try_zeroed(BLOCK_SIZE)?;
 			dir_leaf_write(&mut buf, &[DirRec { hash: name_hash(name), name: name.to_vec(), child }]);
 			let crc = self.write_node_to(blk, &buf)?;
 			return Ok((blk, crc));
@@ -447,7 +450,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Corrupt);
 		}
 		let hash = name_hash(name);
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
 			let mut recs = dir_leaf_parse(&buf);
@@ -479,9 +482,9 @@ impl<D: BlockDevice> LiberFs<D> {
 			};
 			let left_dest = self.node_dest(ptr)?;
 			let right_dest = self.alloc_meta()?;
-			let mut lbuf = vec![0u8; BLOCK_SIZE];
+			let mut lbuf = try_zeroed(BLOCK_SIZE)?;
 			dir_leaf_write(&mut lbuf, &recs[..split]);
-			let mut rbuf = vec![0u8; BLOCK_SIZE];
+			let mut rbuf = try_zeroed(BLOCK_SIZE)?;
 			dir_leaf_write(&mut rbuf, &recs[split..]);
 			let lcrc = self.write_node_to(left_dest, &lbuf)?;
 			let rcrc = self.write_node_to(right_dest, &rbuf)?;
@@ -520,7 +523,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Err(FsError::Corrupt);
 		}
 		let hash = name_hash(name);
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
 			let mut recs = dir_leaf_parse(&buf);
@@ -662,9 +665,12 @@ impl<D: BlockDevice> LiberFs<D> {
 			for off in 0..ext.store_len as u64 {
 				self.mark(bitmap, ext.stored(off));
 			}
-			if ext.csum != 0 {
-				self.mark(bitmap, ext.csum);
-			}
+			// UNCONDITIONAL, now that `check_extent` above requires the pointer to be inside the
+			// pool. The `!= 0` skip was what let an extent naming block 0 or 1 as its checksum
+			// escape the duplicate-owner detector entirely: the live bitmap starts with those two
+			// reserved, so the reference was never compared against anything and a forged image
+			// stayed writable. With the pointer validated, there is no absent case left to skip.
+			self.mark(bitmap, ext.csum);
 		}
 		self.walk_chain(inode.spill, |fs, ptr| {
 			fs.mark(bitmap, ptr);

@@ -658,7 +658,19 @@ pub fn json_pretty(min: &str, color: bool) -> String {
 	const NUM: &str = "\x1b[33m";
 	const LIT: &str = "\x1b[35m";
 	const RESET: &str = "\x1b[0m";
-	let mut out = String::with_capacity(min.len() * 2);
+	// `with_capacity` ABORTS on a short heap, and `min.len() * 2` is unchecked arithmetic over a
+	// length that came from a service reply. Reserved fallibly and then grown, so a diagnostic
+	// command on a low-memory machine renders less rather than killing the process it runs in.
+	//
+	// The binary writer beside this one has been fallible since it was written; the presentation
+	// paths were not, and generated list rendering amplifies its input substantially through keys,
+	// escaping, colour codes and indentation.
+	let mut out = String::new();
+	if out.try_reserve(min.len().saturating_mul(2)).is_err() {
+		// Nothing rendered rather than a process gone. The caller has the minified form already -
+		// that is what was passed in - so an empty pretty rendering is a degradation and not a loss.
+		return String::new();
+	}
 	let bytes = min.as_bytes();
 	let mut depth: usize = 0;
 	let mut i: usize = 0;

@@ -473,8 +473,14 @@ impl Screen {
 		self.default_bg
 	}
 
+	// TOLERANT OF AN INDEX OUT OF RANGE, like `cell` and `set_dirty` beside it.
+	//
+	// This indexed a 16-entry array directly, so a caller holding a stale palette index - or one
+	// derived from a resize that has already happened - panicked the terminal. The adjacent
+	// accessors answer a blank cell or do nothing for exactly that reason: a renderer reading
+	// geometry that moved under it is an ordinary race in this design, not a bug to abort on.
 	pub fn palette_color(&self, i: usize) -> (u8, u8, u8) {
-		self.palette[i]
+		self.palette.get(i).copied().unwrap_or((0, 0, 0))
 	}
 
 	pub fn mark_all_dirty(&mut self) {
@@ -485,6 +491,12 @@ impl Screen {
 
 	// Read and clear one cell's dirty mark - the renderer consuming the diff as it paints.
 	pub fn dirty_take(&mut self, col: usize, row: usize) -> bool {
+		// Bounds-checked, for the reason `set_dirty` directly below already is: the renderer walks
+		// coordinates it decided on before the grid may have been resized, and a cell outside the
+		// grid is nothing to repaint rather than something to panic over.
+		if col >= self.cols || row >= self.rows {
+			return false;
+		}
 		let idx = row * self.cols + col;
 		let was = self.dirty[idx];
 		self.dirty[idx] = false;
@@ -997,12 +1009,25 @@ impl Screen {
 	// scrollback row while the viewport reaches above the live screen, else a live cell.
 	// The mouse selection highlight is applied (reversed colours) over both.
 	pub fn view_cell(&self, col: usize, row: usize) -> Cell {
+		// Bounds-checked, like `cell` and `set_dirty`: this indexed the scrollback ring or the
+		// screen directly, so a coordinate from before a resize panicked the terminal instead of
+		// reading as the blank it now is. Both stores are indexed by `cols`, so a column outside
+		// the grid would also silently read the NEXT row's cell rather than nothing.
+		if col >= self.cols {
+			return self.blank();
+		}
 		let g = (self.sb_len - self.view_offset) + row;
 		let mut cell = if g < self.sb_len {
 			let ring = (self.sb_head + g) % self.sb_cap;
-			self.scrollback[ring * self.cols + col]
+			match self.scrollback.get(ring * self.cols + col) {
+				Some(cell) => *cell,
+				None => return self.blank(),
+			}
 		} else {
-			self.screen().cells[(g - self.sb_len) * self.cols + col]
+			match self.screen().cells.get((g - self.sb_len) * self.cols + col) {
+				Some(cell) => *cell,
+				None => return self.blank(),
+			}
 		};
 		if self.is_selected(g, col) {
 			cell.reverse = !cell.reverse;

@@ -393,7 +393,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			return Ok(());
 		}
 		set_bit(seen, ptr);
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		self.read_node_raw(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
 			// The record count and the key order come from the function `tree_insert_node` and
@@ -481,7 +481,14 @@ impl<D: BlockDevice> LiberFs<D> {
 		if inode.dir_root != 0 {
 			stack.push((inode.dir_root, inode.dir_root_crc, TREE_DEPTH_MAX, (None, None)));
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		// The checker reports faults rather than returning them, so a refused allocation is a fault
+		// it records and stops on rather than one it can propagate.
+		// The checker reports faults rather than returning them, so a refused allocation is a fault
+		// it records and stops on rather than one it can propagate.
+		let Ok(mut buf) = try_zeroed(BLOCK_SIZE) else {
+			faults.push(b"not enough memory to check this directory".to_vec());
+			return;
+		};
 		let mut entries: u64 = 0;
 		let mut names: BTreeSet<Vec<u8>> = BTreeSet::new();
 		while let Some((ptr, crc, left, (lower, upper))) = stack.pop() {
@@ -720,7 +727,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			tally.structural = tally.structural.saturating_add(1);
 			return Ok(0);
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		self.read_node_raw(ptr, crc, &mut buf)?;
 		if test_bit(visited, ptr) {
 			return Ok(0);
@@ -741,6 +748,20 @@ impl<D: BlockDevice> LiberFs<D> {
 		// node.
 		let kind = node_type(&buf);
 		if kind != NODE_LEAF && kind != NODE_INTERNAL {
+			tally.structural = tally.structural.saturating_add(1);
+			return Ok(0);
+		}
+		// AND THE SAME SHAPE VALIDATION THE LIVE PASS DOES, which this omitted entirely.
+		//
+		// The public contract says pinned generations are VERIFIED. This walk checked pointer
+		// bounds, link CRCs, node kinds, stored-block checksums and stream decodability - and then
+		// parsed leaves with a clamped `leaf_count` without ever asking whether the claimed count,
+		// the key ordering or the absence of duplicate keys held. So a snapshot tree whose records
+		// are out of order, or whose leaf claims more entries than it holds, was reported CLEAN,
+		// and for a snapshot that matters more than for the live tree: the data may be wanted after
+		// the live copy is gone.
+		let shape = if kind == NODE_LEAF { validate_fixed_leaf(&buf, INODE_REC, 8) } else { validate_internal(&buf) };
+		if shape.is_err() {
 			tally.structural = tally.structural.saturating_add(1);
 			return Ok(0);
 		}
@@ -850,7 +871,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			tally.structural = tally.structural.saturating_add(1);
 			return Ok(0);
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		self.read_node_raw(ptr, crc, &mut buf)?;
 		if test_bit(visited, ptr) {
 			return Ok(0);

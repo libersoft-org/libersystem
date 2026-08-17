@@ -73,21 +73,52 @@ pub fn init(cpu_id: usize, hartid: u32) {
 	}
 }
 
+// `tp` IS NOT TRUSTED, AND THAT IS A MITIGATION RATHER THAN THE FIX.
+//
+// U-mode may put any value in `tp` - it is an ordinary register there - and `__trap_entry` saves
+// the user's `x4` into the frame and never establishes a kernel one before calling Rust. So every
+// reader below used to dereference an address the USER chose, and `set_from_user` WROTE through it
+// on the syscall path: an arbitrary S-mode write from ring 3.
+//
+// What this check does is bound the damage: the pointer must be the base of one of the slots in the
+// block this kernel allocated, so the worst a user can now select is a DIFFERENT HART'S block
+// rather than any address in the address space. That turns memory-unsafety into a wrong answer,
+// which is not the same as correct.
+//
+// THE ACTUAL FIX is to establish a trusted per-hart pointer on every trap before any Rust runs, the
+// way `sp` already is. `sscratch` cannot simply be shared: it holds the kernel trap stack for the
+// U-mode path and zero while an S-mode handler runs, which is what tells the two apart. The
+// conventional shape - the one Linux uses on this architecture - is to put the PER-CPU POINTER in
+// `sscratch` and derive the trap stack from the block it names, which is a restructuring of
+// `__trap_entry`, `riscv64_enter_umode` and the nested-trap discriminator together. That wants its
+// own round and a riscv64 guest run; this bound is what stands until then.
+fn trusted_tp() -> *mut PerCpu {
+	let raw: u64;
+	unsafe {
+		asm!("mv {}, tp", out(reg) raw, options(nomem, nostack, preserves_flags));
+	}
+	let base = PER_CPU.load(Ordering::Acquire);
+	let count = CPU_COUNT.load(Ordering::Acquire);
+	if base.is_null() || count == 0 {
+		panic!("per-CPU access before the blocks were allocated");
+	}
+	// Exactly a slot base: an offset into the middle of a block would let a user choose which FIELD
+	// a write lands on, which is most of the original problem back again.
+	let offset = (raw as usize).wrapping_sub(base as usize);
+	let stride = core::mem::size_of::<PerCpu>();
+	if raw as usize % core::mem::align_of::<PerCpu>() != 0 || offset % stride != 0 || offset / stride >= count {
+		panic!("tp does not name a per-CPU block: ring 3 may have chosen it");
+	}
+	raw as *mut PerCpu
+}
+
 // The per-CPU block of the running hart (from `tp`).
 pub fn this_cpu() -> &'static PerCpu {
-	let base: u64;
-	unsafe {
-		asm!("mv {}, tp", out(reg) base, options(nomem, nostack, preserves_flags));
-		&*(base as *const PerCpu)
-	}
+	unsafe { &*trusted_tp() }
 }
 
 fn this_cpu_mut() -> *mut PerCpu {
-	let base: u64;
-	unsafe {
-		asm!("mv {}, tp", out(reg) base, options(nomem, nostack, preserves_flags));
-	}
-	base as *mut PerCpu
+	trusted_tp()
 }
 
 // Set the running hart's parked kernel stack pointer, the stack a U-mode entry

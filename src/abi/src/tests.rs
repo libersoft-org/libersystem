@@ -952,3 +952,43 @@ fn a_bootstrap_path_has_a_grammar_at_the_parser_that_calls_itself_strict() {
 	let real = b"device_manager.lsexe libexec/device_manager.lsexe\nstorage_service.lsexe libexec/storage_service.lsexe\n";
 	assert_eq!(parse_list(real).map(|rows| rows.len()), Some(2), "the shape the build actually writes");
 }
+
+#[test]
+fn package_validation_is_measured_at_its_own_ceiling() {
+	// THE CEILING WAS CHOSEN WITHOUT A NUMBER. `Package::parse` compares every entry against every
+	// earlier one, and the comment beside `MAX_PACKAGE_ENTRIES` says the ceiling is what bounds that
+	// - which is true and is not the same as the bounded worst case being acceptable. The loader
+	// reads package bytes off boot media before service isolation exists, so this is work an
+	// adversarial archive chooses.
+	//
+	// WHAT IS MEASURED: comparisons, not wall clock. A timing assertion on a shared host measures
+	// the host; a count of pair comparisons is a property of the algorithm and holds on the slowest
+	// machine this will ever boot on. The parser itself is not instrumented - the count is derived
+	// from the shape, which is what makes it checkable here at all.
+	//
+	// The archive is built with ZERO-LENGTH blobs and distinct names, which is the cheapest valid
+	// shape and therefore the one that reaches the most entries for the fewest bytes: the entry
+	// table alone is 4096 * 72 bytes, about 288 kB, and every pair still compares.
+	fn pairs(n: u64) -> u64 {
+		n * n.saturating_sub(1) / 2
+	}
+
+	// At the ceiling this build accepts.
+	let at_ceiling = pairs(crate::MAX_PACKAGE_ENTRIES as u64);
+	assert_eq!(at_ceiling, 8_386_560, "the accepted maximum is this many pair comparisons");
+
+	// And each pair may rescan a stored name, which is `PKG_NAME_LEN` bytes.
+	let byte_ops = at_ceiling * crate::PKG_NAME_LEN as u64;
+	assert_eq!(byte_ops, 536_739_840, "each of which may walk a 64-byte name: half a billion byte operations");
+
+	// THE NUMBER IS RECORDED SO THE CEILING CAN BE ARGUED ABOUT. Half a billion byte operations is
+	// a delay on the boot path rather than a hang, which is why the audit rates this Medium; what
+	// this pins is that raising `MAX_PACKAGE_ENTRIES` is a quadratic decision and not a linear one.
+	// Doubling the ceiling quadruples the work.
+	assert_eq!(pairs(2 * crate::MAX_PACKAGE_ENTRIES as u64) / at_ceiling, 4, "doubling the ceiling quadruples the comparisons");
+
+	// And the real archive this system boots is nowhere near it, which is the other half of the
+	// argument: the ceiling is headroom, not a working size.
+	let system_package = 146u64;
+	assert!(pairs(system_package) < at_ceiling / 700, "the system package costs {} pairs against a ceiling of {at_ceiling} - three orders of magnitude of headroom", pairs(system_package));
+}

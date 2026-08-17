@@ -238,7 +238,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// The one skeleton behind dropping, marking, and releasing every chain.
 	pub(crate) fn walk_chain(&mut self, start: u64, mut f: impl FnMut(&mut Self, u64)) -> Result<(), FsError> {
 		let mut ptr = start;
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		let mut steps = 0u64;
 		while ptr != 0 && ptr < self.num_blocks && steps < self.num_blocks {
 			steps += 1;
@@ -347,7 +347,7 @@ impl<D: BlockDevice> LiberFs<D> {
 				return Ok(u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()));
 			}
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		if !self.dev.read_block(csum, &mut buf) {
 			return Err(FsError::Io);
 		}
@@ -371,7 +371,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let cached = matches!(&self.wcsum, Some((wp, _)) if *wp == csum);
 		if !cached {
 			self.flush_wcsum()?;
-			let mut buf = vec![0u8; BLOCK_SIZE];
+			let mut buf = try_zeroed(BLOCK_SIZE)?;
 			if !self.dev.read_block(csum, &mut buf) {
 				return Err(FsError::Io);
 			}
@@ -449,7 +449,19 @@ impl<D: BlockDevice> LiberFs<D> {
 		// two are equal now, and keeping the `max` costs nothing while the shape check is what
 		// guarantees it.
 		let span = if ext.clen == 0 { ext.length.max(ext.store_len) } else { ext.store_len };
-		if ext.csum >= self.num_blocks || ext.stored(span.saturating_sub(1) as u64) >= self.num_blocks {
+		// INSIDE THE POOL, not merely inside the device. Blocks 0 and 1 are the superblock slots and
+		// the pool starts at `POOL_START`, and this checked only the upper bound - so an extent
+		// could name a checksum block at 0 or 1. That is not just an illegal address: `cow_block(0,
+		// ..)` treats 0 as the UNMAPPED sentinel, so a mutation on such an extent creates a fresh
+		// zero-filled checksum block instead of copying, and `collect_inode_blocks` skips `csum ==
+		// 0` explicitly - so the duplicate-owner detector never sees the reference either and a
+		// fully checksum-consistent forged image stays writable. The data slots keep their old zero
+		// checksums, so bytes that read fine before an acknowledged append come back corrupt after
+		// it.
+		if ext.csum < POOL_START || ext.csum >= self.num_blocks {
+			return Err(FsError::Corrupt);
+		}
+		if ext.stored(span.saturating_sub(1) as u64) >= self.num_blocks {
 			return Err(FsError::Corrupt);
 		}
 		Ok(())
@@ -588,7 +600,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 		}
 		let csum = self.alloc_meta()?;
-		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		let mut cbuf = try_zeroed(BLOCK_SIZE)?;
 		cbuf[0..4].copy_from_slice(&crc.to_le_bytes());
 		let csum_crc = crc32c(&cbuf);
 		// seed the in-flight write cache instead of writing the device: the run's next
@@ -615,7 +627,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			e.csum_crc = csum_crc;
 			return Ok(());
 		}
-		let mut old_csum = vec![0u8; BLOCK_SIZE];
+		let mut old_csum = try_zeroed(BLOCK_SIZE)?;
 		if !self.read_block_csum_aware(ext.csum, &mut old_csum) {
 			return Err(FsError::Io);
 		}
@@ -634,7 +646,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		// the rewritten block gets a fresh single-entry checksum block.
 		let mid_csum = self.alloc_meta()?;
-		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		let mut cbuf = try_zeroed(BLOCK_SIZE)?;
 		cbuf[0..4].copy_from_slice(&crc.to_le_bytes());
 		if !self.dev.write_block(mid_csum, &cbuf) {
 			return Err(FsError::Io);
@@ -643,7 +655,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if off + 1 < ext.length as usize {
 			let slen = ext.length as usize - off - 1;
 			let suf_csum = self.alloc_meta()?;
-			let mut sbuf = vec![0u8; BLOCK_SIZE];
+			let mut sbuf = try_zeroed(BLOCK_SIZE)?;
 			// copy the original CRCs of the suffix down to the start of the new block.
 			sbuf[0..slen * 4].copy_from_slice(&old_csum[(off + 1) * 4..(off + 1 + slen) * 4]);
 			if !self.dev.write_block(suf_csum, &sbuf) {
@@ -670,7 +682,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			self.drop_block(ext.stored(s));
 		}
 		self.drop_block(ext.csum);
-		let mut blk = vec![0u8; BLOCK_SIZE];
+		let mut blk = try_zeroed(BLOCK_SIZE)?;
 		for lo in 0..ext.length as usize {
 			blk.fill(0);
 			let start = lo * BLOCK_SIZE;
@@ -708,7 +720,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// wrong place. Everything above this line still gets one `FsError`.
 	pub(crate) fn decompress_extent_detailed(&mut self, ext: &Extent) -> Result<Vec<u8>, ExtentFault> {
 		self.check_extent(ext).map_err(ExtentFault::Shape)?;
-		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		let mut cbuf = try_zeroed(BLOCK_SIZE).map_err(ExtentFault::Shape)?;
 		if !self.read_block_csum_aware(ext.csum, &mut cbuf) {
 			return Err(ExtentFault::Io);
 		}
@@ -816,8 +828,8 @@ impl<D: BlockDevice> LiberFs<D> {
 			}
 			last = b;
 		}
-		let mut blk = vec![0u8; BLOCK_SIZE];
-		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		let mut blk = try_zeroed(BLOCK_SIZE)?;
+		let mut cbuf = try_zeroed(BLOCK_SIZE)?;
 		for s in 0..store_len {
 			blk.fill(0);
 			let start = s * BLOCK_SIZE;
@@ -856,8 +868,8 @@ impl<D: BlockDevice> LiberFs<D> {
 	// (compressed) blocks, since those are the bytes the checksum covers.
 	pub(crate) fn count_corrupt(&mut self, inode: &Inode) -> Result<u32, FsError> {
 		let mut bad = 0u32;
-		let mut buf = vec![0u8; BLOCK_SIZE];
-		let mut cbuf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
+		let mut cbuf = try_zeroed(BLOCK_SIZE)?;
 		for i in 0..inode.extents.len() {
 			let ext = inode.extents[i];
 			// an out-of-pool run is damage over its whole stored span.

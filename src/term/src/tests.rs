@@ -1420,3 +1420,43 @@ fn a_malformed_osc_52_payload_sets_no_clipboard() {
 		assert_eq!(s.take_clipboard_set().as_deref(), Some(expect), "{:?} still decodes", core::str::from_utf8(payload));
 	}
 }
+
+// NOT TESTED, AND SAID SO: the double emission `replace_line` used to make.
+//
+// The fix is that the `repaint` branch is the WHOLE emission - `repaint` writes `CR`, `EL` and the
+// line from the start of the cursor's row, and the cursor has just been reset to zero, so that is
+// the entire new line; the `e.put` that followed sent every byte a second time.
+//
+// THE LOCAL GRID ABSORBS THE REPETITION - the second copy overwrites the first - which is why the
+// screen looked right and why this is the local-grid-plus-exact-mirror combination the long-line
+// tests do not have. Reaching the branch needs a long line that scrolled off REPLACED BY ANOTHER
+// LONG LINE, which means a history recall; a replacement by nothing emits no content and cannot
+// show the doubling. Two attempts to drive the recall through this harness did not install the
+// recalled line, and chasing the harness further was not worth more of this round than the fix
+// itself. Left as a coverage gap rather than as a test that passes for the wrong reason.
+
+#[test]
+fn the_public_readers_tolerate_geometry_that_moved_under_them() {
+	// `cell` and `set_dirty` answer a blank or do nothing for a coordinate outside the grid, on the
+	// stated reasoning that a renderer reading geometry which moved under it is an ordinary race in
+	// this design. `palette_color`, `dirty_take` and `view_cell` indexed directly and panicked -
+	// three readers on the same surface, two policies.
+	//
+	// `view_cell`'s column was the worst of the three: both stores are indexed by `cols`, so a
+	// column past the grid did not merely risk a panic, it read the NEXT ROW'S cell.
+	let term = test_term(8, 4, 16);
+	let blank = term.screen.blank();
+
+	assert_eq!(term.screen.palette_color(0), term.screen.palette_color(0), "an in-range palette entry still answers");
+	assert_eq!(term.screen.palette_color(16), (0, 0, 0), "and one past the end is black rather than a panic");
+	assert_eq!(term.screen.palette_color(usize::MAX), (0, 0, 0));
+
+	assert_eq!(term.screen.view_cell(8, 0).glyph, blank.glyph, "a column past the grid is blank, not the next row's cell");
+	assert_eq!(term.screen.view_cell(usize::MAX, 0).glyph, blank.glyph);
+	assert_eq!(term.screen.view_cell(0, 4096).glyph, blank.glyph, "and a row past the view is blank too");
+
+	let mut term = term;
+	assert!(!term.screen.dirty_take(8, 0), "a cell outside the grid has nothing to repaint");
+	assert!(!term.screen.dirty_take(0, 4096));
+	assert!(!term.screen.dirty_take(usize::MAX, usize::MAX));
+}

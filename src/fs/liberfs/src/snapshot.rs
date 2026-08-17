@@ -75,7 +75,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let snapshots = self.snapshots.clone();
 		for chunk in snapshots.chunks(SNAPS_PER_BLOCK).rev() {
 			let blk = self.alloc_meta()?;
-			let mut block = vec![0u8; BLOCK_SIZE];
+			let mut block = try_zeroed(BLOCK_SIZE)?;
 			block[CHAIN_NEXT_OFF..CHAIN_NEXT_OFF + 8].copy_from_slice(&next_ptr.to_le_bytes());
 			block[CHAIN_CRC_OFF..CHAIN_CRC_OFF + 4].copy_from_slice(&next_crc.to_le_bytes());
 			block[CHAIN_COUNT_OFF..CHAIN_COUNT_OFF + 4].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
@@ -128,7 +128,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		let mut hashes: Vec<(u64, usize)> = Vec::new();
 		let mut ptr = root;
 		let mut crc = root_crc;
-		let mut block = vec![0u8; BLOCK_SIZE];
+		let mut block = try_zeroed(BLOCK_SIZE)?;
 		let mut steps = 0u64;
 		while ptr != 0 {
 			// bound the walk like `walk_chain`: a pointer outside the pool is damage,
@@ -312,7 +312,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			let end = offset.checked_add(data.len() as u64).ok_or(FsError::Invalid)?;
 			let first = start / BLOCK_SIZE as u64;
 			let last = (end - 1) / BLOCK_SIZE as u64;
-			let mut buf = vec![0u8; BLOCK_SIZE];
+			let mut buf = try_zeroed(BLOCK_SIZE)?;
 			for lb in first..=last {
 				let block_start = lb * BLOCK_SIZE as u64;
 				// The guard above refuses a write that runs PAST the addressable end, so
@@ -370,7 +370,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			let tail = (new_len % BLOCK_SIZE as u64) as usize;
 			if tail != 0 {
 				let lb = new_len / BLOCK_SIZE as u64;
-				let mut buf = vec![0u8; BLOCK_SIZE];
+				let mut buf = try_zeroed(BLOCK_SIZE)?;
 				if self.read_logical(&inode, lb, &mut buf)? {
 					buf[tail..].fill(0);
 					// rewriting the block refreshes its stored checksum too.

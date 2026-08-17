@@ -328,7 +328,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		// damage below) - and at a marked block, so a corrupt cycle terminates.
 		{
 			let mut ptr = self.snap_root;
-			let mut buf = vec![0u8; BLOCK_SIZE];
+			let mut buf = try_zeroed(BLOCK_SIZE)?;
 			while ptr != 0 && ptr < self.num_blocks && !test_bit(&live, ptr) {
 				self.mark(&mut live, ptr);
 				if !self.dev.read_block(ptr, &mut buf) {
@@ -465,7 +465,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if root != 0 && root < self.num_blocks && self.mark(map, root) {
 			nodes.push((root, root_crc, None, None));
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		while let Some((ptr, want, lower, upper)) = nodes.pop() {
 			// The device did not answer. The metadata may be perfectly good.
 			if !self.dev.read_block(ptr, &mut buf) {
@@ -666,7 +666,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if root != 0 && root < self.num_blocks && self.mark(map, root) {
 			nodes.push((root, root_crc, None, None));
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		while let Some((ptr, want, lower, upper)) = nodes.pop() {
 			// The device did not answer. The metadata may be perfectly good.
 			if !self.dev.read_block(ptr, &mut buf) {
@@ -821,7 +821,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		}
 		let mut ptr = root;
 		let mut crc = root_crc;
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		// bounded descent: no legitimate tree is deeper than TREE_DEPTH_MAX, so a
 		// longer path is a hostile chain of one-child internals - Corrupt, not a crawl.
 		for _ in 0..TREE_DEPTH_MAX {
@@ -855,7 +855,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if root == 0 {
 			// empty tree: a new leaf with the single record.
 			let blk = self.alloc_meta()?;
-			let mut buf = vec![0u8; BLOCK_SIZE];
+			let mut buf = try_zeroed(BLOCK_SIZE)?;
 			node_set_header(&mut buf, NODE_LEAF, 1);
 			buf[NODE_HDR..NODE_HDR + rec].copy_from_slice(record);
 			let crc = self.write_node_to(blk, &buf)?;
@@ -872,7 +872,7 @@ impl<D: BlockDevice> LiberFs<D> {
 			Ins::Updated(p, c) => Ok((p, c)),
 			Ins::Split(lp, lc, sep, rp, rc) => {
 				let blk = self.alloc_meta()?;
-				let mut buf = vec![0u8; BLOCK_SIZE];
+				let mut buf = try_zeroed(BLOCK_SIZE)?;
 				node_set_header(&mut buf, NODE_INTERNAL, 1);
 				set_sep(&mut buf, 0, sep);
 				set_child(&mut buf, 0, lp, lc);
@@ -927,7 +927,7 @@ impl<D: BlockDevice> LiberFs<D> {
 					let up = seps[mid];
 					let left_dest = self.node_dest(ptr)?;
 					let right_dest = self.alloc_meta()?;
-					let mut lbuf = vec![0u8; BLOCK_SIZE];
+					let mut lbuf = try_zeroed(BLOCK_SIZE)?;
 					node_set_header(&mut lbuf, NODE_INTERNAL, mid);
 					for i in 0..mid {
 						set_sep(&mut lbuf, i, seps[i]);
@@ -936,7 +936,7 @@ impl<D: BlockDevice> LiberFs<D> {
 						set_child(&mut lbuf, i, kids[i].0, kids[i].1);
 					}
 					let rcount = s - mid - 1;
-					let mut rbuf = vec![0u8; BLOCK_SIZE];
+					let mut rbuf = try_zeroed(BLOCK_SIZE)?;
 					node_set_header(&mut rbuf, NODE_INTERNAL, rcount);
 					for i in 0..rcount {
 						set_sep(&mut rbuf, i, seps[mid + 1 + i]);
@@ -958,7 +958,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if depth == 0 {
 			return Err(FsError::Corrupt);
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
 			// The search below is a binary search, so a leaf whose keys do not ascend answers
@@ -1012,13 +1012,13 @@ impl<D: BlockDevice> LiberFs<D> {
 			let split = leaf_split_point(&recs);
 			let left_dest = self.node_dest(ptr)?;
 			let right_dest = self.alloc_meta()?;
-			let mut lbuf = vec![0u8; BLOCK_SIZE];
+			let mut lbuf = try_zeroed(BLOCK_SIZE)?;
 			node_set_header(&mut lbuf, NODE_LEAF, split);
 			for (i, r) in recs[..split].iter().enumerate() {
 				let off = NODE_HDR + i * rec;
 				lbuf[off..off + rec].copy_from_slice(r);
 			}
-			let mut rbuf = vec![0u8; BLOCK_SIZE];
+			let mut rbuf = try_zeroed(BLOCK_SIZE)?;
 			node_set_header(&mut rbuf, NODE_LEAF, recs.len() - split);
 			for (i, r) in recs[split..].iter().enumerate() {
 				let off = NODE_HDR + i * rec;
@@ -1060,7 +1060,7 @@ impl<D: BlockDevice> LiberFs<D> {
 	// Collapse a root that became a single-child internal node, repeatedly; each
 	// collapsed node leaves the new generation. Shared by every tree flavour.
 	pub(crate) fn collapse_root(&mut self, mut ptr: u64, mut crc: u32) -> Result<(u64, u32), FsError> {
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		// bounded like every descent: a longer single-child chain is a hostile shape.
 		for _ in 0..TREE_DEPTH_MAX {
 			self.read_node(ptr, crc, &mut buf)?;
@@ -1118,7 +1118,7 @@ impl<D: BlockDevice> LiberFs<D> {
 		if depth == 0 {
 			return Err(FsError::Corrupt);
 		}
-		let mut buf = vec![0u8; BLOCK_SIZE];
+		let mut buf = try_zeroed(BLOCK_SIZE)?;
 		self.read_node(ptr, crc, &mut buf)?;
 		if node_type(&buf) == NODE_LEAF {
 			validate_fixed_leaf(&buf, rec, keylen).map_err(|_| FsError::Corrupt)?;
