@@ -189,7 +189,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0122 - What authorises a write to somebody's disk](P02M0122.md)
 - [x] [P02M0123 - What a mount allocates, and what a write may assume about what it found](P02M0123.md)
 - [ ] [P02M0124 - What the UDF backend claims to read, and what it actually does](P02M0124.md)
-- [ ] [P02M0125 - What the FAT backend writes, and what it says it wrote](P02M0125.md)
+- [x] [P02M0125 - What the FAT backend writes, and what it says it wrote](P02M0125.md)
 - [x] [P02M0126 - What the ISO9660 backend accepts, and the threat model it states](P02M0126.md)
 - [ ] [P02M0127 - The ABI's own guarantee, which is the one thing it cannot get wrong](P02M0127.md)
 - [ ] [P02M0128 - The terminal's state machine, and the one safe function that is not safe](P02M0128.md)

@@ -387,7 +387,7 @@ pub enum MountError {
 // ABORTS the process, which for this crate is StorageService and every volume it serves. The API
 // has had `FsError::NoMemory` since the shared error type grew it; what was missing was the paths
 // that could return it.
-fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
+pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
 	let mut buf: Vec<u8> = Vec::new();
 	buf.try_reserve_exact(len).map_err(|_| FsError::NoMemory)?;
 	buf.resize(len, 0);
@@ -607,6 +607,17 @@ impl<D: BlockDevice> FatFs<D> {
 		// The root: a chained root on FAT32 and exFAT, and the fixed region (cluster 0) on FAT12
 		// and FAT16, which owns no clusters and is walked without claiming any.
 		let mut pending: Vec<Dir> = Vec::new();
+		// SORTED, so the membership test is a binary search rather than a scan.
+		//
+		// This was a `Vec` walked with `contains` for every directory discovered, so distinct
+		// directories cost O(d^2) comparisons - and exFAT permits over eight million entries in one
+		// 256 MB directory, with FAT32 bounded by the same read ceiling. A valid image can hold
+		// enough one-cluster directories to make MOUNT monopolise the storage service, which is a
+		// denial of service delivered by a disc rather than by a request.
+		//
+		// A sorted `Vec` rather than a set: this crate is `no_std` with `alloc` and has no hasher,
+		// the insertion is one `binary_search` away from the lookup that already happened, and the
+		// order it keeps is not otherwise used.
 		let mut seen_dirs: Vec<u32> = Vec::new();
 		let root = Dir::at(self.root_cluster());
 		if root.cluster != 0 {
@@ -639,11 +650,12 @@ impl<D: BlockDevice> FatFs<D> {
 					// A directory reached twice is a namespace this walk cannot terminate over, and
 					// its clusters would be claimed twice in any case - so the cluster claim below
 					// is what catches it, and this only stops the second descent.
-					if seen_dirs.contains(&entry.first_cluster) {
-						return Err(FsError::Corrupt);
-					}
+					let at = match seen_dirs.binary_search(&entry.first_cluster) {
+						Ok(_) => return Err(FsError::Corrupt),
+						Err(at) => at,
+					};
 					seen_dirs.try_reserve(1).map_err(|_| FsError::NoMemory)?;
-					seen_dirs.push(entry.first_cluster);
+					seen_dirs.insert(at, entry.first_cluster);
 					self.claim_chain(entry.first_cluster, length, &mut owned, &mut claim)?;
 					pending.try_reserve(1).map_err(|_| FsError::NoMemory)?;
 					// `rec_len` IS AN exFAT FIELD, and passing it for a classic volume made this

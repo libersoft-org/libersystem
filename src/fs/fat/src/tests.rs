@@ -4033,3 +4033,54 @@ fn the_ownership_audit_descends_into_classic_subdirectories() {
 // exactly, and a byte scan for the record markers finds `0xC0` and `0x82` inside the boot region
 // and the FAT long before the directory. `build_exfat` exposes no way to place a deliberately
 // cross-linked entry. Left as a coverage gap rather than as a test that passes for the wrong reason.
+
+#[test]
+fn a_buffer_sized_from_the_medium_refuses_rather_than_aborting() {
+	// Every buffer sized from a number off the medium was `vec![0u8; n]`. exFAT permits a 32 MB
+	// cluster and a 256 MB directory, so those are infallible allocations whose size the DISC
+	// chooses - and an infallible allocation that fails aborts the process, which for this crate is
+	// StorageService and every volume it serves. `FsError::NoMemory` has existed since the shared
+	// error type grew it; what was missing was any path that could return it.
+	//
+	// THE HELPER IS TESTED DIRECTLY, and that is a smaller claim than a whole-filesystem one made
+	// deliberately: this crate has no budget allocator, and installing a global one to reach the
+	// converted paths through a read is what destabilised another crate's suite when it was tried
+	// there. What can be established without one is that the helper every converted site now goes
+	// through refuses instead of aborting.
+	assert_eq!(crate::try_zeroed(usize::MAX / 2).err(), Some(FsError::NoMemory), "an allocation this machine cannot make is an error");
+	assert_eq!(crate::try_zeroed(64).expect("an ordinary size still succeeds").len(), 64);
+	assert!(crate::try_zeroed(0).expect("and zero is not an error").is_empty());
+}
+
+#[test]
+fn short_name_generation_does_not_rescan_the_directory_per_candidate() {
+	// `gen_short` collected every live 8.3 field and then tried up to a million `BASIS~N` aliases,
+	// each with a LINEAR `contains` over that collection - so a valid directory holding enough
+	// aliases forced hundreds of billions of 11-byte comparisons before one create succeeded. The
+	// million-iteration cap stops an infinite loop and is not an operation budget: the work inside
+	// it is what a directory chooses.
+	//
+	// WHAT THIS TEST IS AND IS NOT. It pins that creates still SUCCEED in a directory full of
+	// colliding aliases, which is the behaviour the sort must not change. It does NOT measure the
+	// complexity: at four hundred entries the linear and the sorted versions are both under a
+	// second, so no assertion here can tell them apart, and the scale where they diverge is one
+	// this suite cannot afford to build. The improvement is in the source and is argued from the
+	// shape of the loop, not from a number this test took.
+	let mut files: Vec<File> = Vec::new();
+	// Leaked, because `File` borrows a `&'static str` and these names are generated. A test process
+	// is about to exit; the alternative is four hundred literals.
+	for i in 0..400 {
+		let name: &'static str = std::boxed::Box::leak(std::format!("collide{i:03}.txt").into_boxed_str());
+		files.push(File { path: name, data: b"x" });
+	}
+	let img = build_fat(Kind::Fat32, &files);
+	let mut fs = FatFs::mount(MemDisk { data: img }).expect("mount");
+
+	// Every one of these long names folds to the same 8.3 basis, so each create walks the alias
+	// space past all the ones already there.
+	for i in 0..64 {
+		let name = std::format!("collide{:03}-extra-long-name.txt", 500 + i);
+		fs.write_file(name.as_bytes(), b"y").unwrap_or_else(|e| panic!("create {i} in a directory full of colliding aliases: {e:?}"));
+	}
+	assert_eq!(fs.read_file(b"collide500-extra-long-name.txt").expect("read back"), b"y");
+}

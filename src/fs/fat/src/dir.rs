@@ -702,8 +702,16 @@ fn gen_short(name: &[u8], dir_bytes: &[u8]) -> Result<[u8; 11], FsError> {
 		lossy |= replaced;
 		short[8 + i] = mapped;
 	}
-	let existing = existing_shorts(dir_bytes);
-	if !lossy && base_len > 0 && !existing.contains(&short) {
+	// SORTED ONCE, so each candidate below is a binary search rather than a walk of the directory.
+	//
+	// `existing_shorts` collects every live 8.3 field and the loop below tried up to a million
+	// aliases, each with a linear `contains` - so a valid FAT32 directory holding enough `BASIS~N`
+	// names forced hundreds of billions of 11-byte comparisons before one create succeeded or
+	// answered `NoSpace`. The million-iteration cap stops an infinite loop and is not an operation
+	// budget: the work inside it is what a directory chooses.
+	let mut existing = existing_shorts(dir_bytes);
+	existing.sort_unstable();
+	if !lossy && base_len > 0 && existing.binary_search(&short).is_err() {
 		return Ok(short);
 	}
 	// numeric tail: BASIS~N in the base columns, N growing until the name is unique.
@@ -724,7 +732,7 @@ fn gen_short(name: &[u8], dir_bytes: &[u8]) -> Result<[u8; 11], FsError> {
 		for d in 0..len {
 			cand[keep + 1 + d] = digits[len - 1 - d];
 		}
-		if !existing.contains(&cand) {
+		if existing.binary_search(&cand).is_err() {
 			return Ok(cand);
 		}
 	}
