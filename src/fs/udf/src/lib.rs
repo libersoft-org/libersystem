@@ -315,6 +315,16 @@ impl<D: BlockDevice> Udf<D> {
 			if !dev.read_block(vds_loc as u64 + i, &mut block) {
 				return Err(MountError::Io);
 			}
+			// THE LAST BLOCK MAY BE PARTIAL, and this validated every candidate against the whole
+			// 2 kB regardless. `vds_len` is rounded UP to a block count, so a length of 2049 claims
+			// one full block plus one byte - and a complete Partition or Logical Volume Descriptor
+			// placed in that second block was accepted whole, with every field trusted, though the
+			// anchor's extent contains one byte of it. A descriptor the sequence does not claim is
+			// not in the sequence.
+			let claimed = (vds_len as usize).saturating_sub(i as usize * SECTOR_SIZE);
+			if claimed < SECTOR_SIZE {
+				break;
+			}
 			// a descriptor must checksum AND record its own address - a stale or copied
 			// block is skipped, never trusted.
 			// Every descriptor in the sequence, body CRC included: a bit flipped in a partition
@@ -333,6 +343,21 @@ impl<D: BlockDevice> Udf<D> {
 				TAG_PARTITION => {
 					// PartitionNumber at 22, which nothing read - so the map could name partition 3
 					// and the descriptor be partition 0 and the two were used together anyway.
+					// THE PARTITION'S CONTENTS HAVE TO BE THE ONES THIS READER IMPLEMENTS. The
+					// logical volume's Domain Identifier is checked for `*OSTA UDF Compliant` and
+					// this descriptor's Partition Contents was not checked at all - so a
+					// checksum-correct descriptor for ANOTHER contents format was combined with the
+					// UDF logical volume and then read with UDF File Set and ICB rules. For the
+					// physical-partition profile this reader supports, the identifier is `+NSR03`.
+					// `+NSR02` OR `+NSR03`: the second and third editions of ECMA-167, both of which
+					// UDF builds on. MEASURED, because the first attempt required `+NSR03` alone and
+					// a real `mkudffs --udfrev=1.02` image does not contain that string anywhere -
+					// it writes `+NSR02`. Demanding one revision would have refused media the
+					// standard tool produces, which is the failure mode a conformance check has to
+					// avoid in the other direction.
+					if !matches!(&block[25..31], b"+NSR02" | b"+NSR03") {
+						continue;
+					}
 					let number = le16(&block[22..24]);
 					let entry = (number, vdsn, le32(&block[188..192]), le32(&block[192..196]));
 					match partitions.iter_mut().find(|(seen, _, _, _)| *seen == number) {
@@ -617,7 +642,23 @@ impl<D: BlockDevice> Udf<D> {
 	// return the final directory's ICB. An empty path is the root.
 	fn resolve_dir(&mut self, path: &[u8]) -> Result<LogicalAddress, FsError> {
 		let mut icb = self.geo.root_icb;
-		for seg in path.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+		// `.` AND `..` ARE REFUSED, which `fs-core` documents as `BadName` and this backend admitted.
+		// The writable backends refuse them and so does `rt::RelativePath`, which every `vol://`
+		// path is parsed by before a backend sees it - so this reader was admitting a spelling
+		// nothing could deliver to it, and disagreeing with the shared contract about what a path
+		// is. The parent records themselves are still parsed and required; they are structure, not
+		// path syntax.
+		//
+		// EMPTY SEGMENTS STAY TOLERATED, for the reason recorded in `iso9660` and `libermemfs`:
+		// this crate's own fixtures use the leading-slash form, the boundary already refuses it, and
+		// the tolerance is unreachable rather than wrong.
+		for seg in path.split(|&b| b == b'/') {
+			if seg.is_empty() {
+				continue;
+			}
+			if seg == b"." || seg == b".." {
+				return Err(FsError::BadName);
+			}
 			let (next, is_dir) = self.find_entry(icb, seg)?;
 			if !is_dir {
 				return Err(FsError::NotFound);
@@ -857,6 +898,10 @@ impl<D: BlockDevice> Udf<D> {
 					}
 				};
 				if !id.is_empty() {
+					// FALLIBLY: the entry count is the medium's, so this vector's growth is a
+					// number the disc chose - and an infallible growth that fails aborts
+					// StorageService and every volume it serves rather than refusing this one.
+					out.try_reserve(1).map_err(|_| FsError::NoMemory)?;
 					out.push(FileInfo { name: id, size, is_dir });
 				}
 			}
@@ -1111,7 +1156,16 @@ impl<D: BlockDevice> Udf<D> {
 			}
 			// The embedded bytes live in the File Entry's own block, so every offset in them maps
 			// to `at.lb` - one run, and the data is shorter than a block by construction.
-			return Ok(Flattened { data: block[ad_off..end].to_vec(), runs: alloc::vec![(0usize, at.lb)] });
+			// `to_vec` is infallible; the length comes from the File Entry. Bounded by a block by
+			// construction, which is why this is small - and copied fallibly anyway, because
+			// "small today" is how the next ceiling change becomes an abort.
+			let mut data: Vec<u8> = Vec::new();
+			data.try_reserve_exact(end - ad_off).map_err(|_| FsError::NoMemory)?;
+			data.extend_from_slice(&block[ad_off..end]);
+			let mut runs: Vec<(usize, u32)> = Vec::new();
+			runs.try_reserve_exact(1).map_err(|_| FsError::NoMemory)?;
+			runs.push((0usize, at.lb));
+			return Ok(Flattened { data, runs });
 		}
 		// only short_ad, long_ad, and embedded forms exist on real media - extended_ad
 		// (20-byte records) and the reserved values are refused rather than misparsed
@@ -1371,9 +1425,25 @@ impl LogicalAddress {
 	//
 	// SERVES ONE CALLER SHAPE. The file-data allocation loop wants `parse_long_ad` above, because
 	// its rules for those cases are different and legitimate.
+	// AN ICB REFERENCE IS AN ADDRESS AND A LENGTH, and this threw the length away.
+	//
+	// The extent was checked for being recorded and non-zero and then only the address was
+	// returned - so every caller passed a bare address into `read_icb_mapped`, which reads and
+	// validates fields across a whole 2 kB block and may parse an allocation-descriptor region, with
+	// nothing proving those bytes are inside the extent the referring `long_ad` declared. A
+	// reference claiming 40 bytes had a 2048-byte descriptor read out of it.
+	//
+	// One block is what this reader can act on: an ICB spanning more is a shape it does not
+	// implement, and an extent shorter than a File Entry's fixed header describes something that is
+	// not one.
 	fn from_icb_long_ad(bytes: &[u8], at: usize) -> Option<LogicalAddress> {
 		let parsed = Self::parse_long_ad(bytes, at)?;
 		if parsed.extent_type != 0 || parsed.length == 0 {
+			return None;
+		}
+		// 176 is the File Entry header up to its allocation descriptors; anything shorter cannot be
+		// one whatever else is true of it.
+		if (parsed.length as usize) < 176 || parsed.length as usize > SECTOR_SIZE {
 			return None;
 		}
 		Some(parsed.address)
@@ -1530,11 +1600,26 @@ impl DirRules {
 			}
 		}
 		if let Some(name) = name {
-			if self.names.iter().any(|held| held == name) {
-				return Err(FsError::Corrupt);
-			}
+			// SORTED, so this is a binary search rather than a walk of everything seen so far.
+			//
+			// It was `names.iter().any(..)` per record, which is quadratic in the directory's entry
+			// count - and the count comes off the medium. A large directory on a hostile or merely
+			// damaged disc therefore turned a listing into a long single-threaded scan inside
+			// StorageService, which serves every other volume from the same thread.
+			//
+			// A sorted `Vec` rather than a set: this crate is `no_std` with `alloc` and has no
+			// hasher, and the insertion point falls out of the lookup that already happened.
+			let at = match self.names.binary_search_by(|held| held.as_str().cmp(name)) {
+				Ok(_) => return Err(FsError::Corrupt),
+				Err(at) => at,
+			};
 			self.names.try_reserve(1).map_err(|_| FsError::NoMemory)?;
-			self.names.push(String::from(name));
+			// The name is copied fallibly too: it is a string off the medium, and `String::from`
+			// would abort the service rather than refuse the disc.
+			let mut owned = String::new();
+			owned.try_reserve_exact(name.len()).map_err(|_| FsError::NoMemory)?;
+			owned.push_str(name);
+			self.names.insert(at, owned);
 		}
 		self.seen += 1;
 		Ok(())
@@ -1603,6 +1688,12 @@ fn decode_name(id: &[u8]) -> Option<String> {
 		return Some(String::new());
 	}
 	let mut s = String::new();
+	// Reserved up front, fallibly: a name is bounded by its record, but every push below was
+	// infallible and the record's length is the medium's number. Worst case is three UTF-8 bytes
+	// per UCS-2 unit, which is what the OSTA compression byte selects between.
+	if s.try_reserve(id.len() * 3).is_err() {
+		return None;
+	}
 	if id[0] == 16 {
 		// An odd length is corruption and an invalid code unit is corruption; neither may become a
 		// name. `unwrap_or('?')` mapped every bad unit to one character, so two different malformed

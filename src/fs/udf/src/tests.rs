@@ -177,6 +177,12 @@ fn build_udf() -> Vec<u8> {
 	w32(&mut pd, 188, 0); // partition starts at LBA 0
 	w32(&mut pd, 192, 264); // and spans the whole 264-block image
 	w16(&mut pd, 22, 0); // PartitionNumber, which the LVD's map has to name
+	// PartitionContents, which the fixture did not write and the parser did not read - so the two
+	// agreed with each other rather than with the format, the same shape as the missing descriptor
+	// CRC above. The EntityID sits at 24 and its identifier at 25; `+NSR03` names the ECMA-167
+	// revision UDF uses, and it is what says this partition's contents are the ones this reader
+	// implements rather than some other format sharing the descriptor layout.
+	pd[25..31].copy_from_slice(b"+NSR03");
 	tag(&mut pd, TAG_PARTITION, 257);
 	blk(257, &pd);
 	let mut lvd = vec![0u8; SECTOR_SIZE];
@@ -380,9 +386,17 @@ fn listing_contract_and_dot_dot() {
 	let list = fs.list_dir(b"SUB").unwrap();
 	assert!(list.iter().all(|f| !f.name.is_empty()), "{list:?}");
 	assert_eq!(fs.read_file(b"SUB/"), Err(FsError::NotFound));
-	let mut up: Vec<_> = fs.list_dir(b"SUB/..").unwrap().into_iter().map(|f| f.name).collect();
-	up.sort();
-	assert_eq!(up, ["HELLO.TXT", "SUB"]);
+	// `..` IS NO LONGER A TRAVERSAL COMPONENT, and this assertion is reversed deliberately - the
+	// same call recorded in `iso9660`. The comment above said `..` resolves "as on the other
+	// backends", and that was the untrue part: `fs-core` documents `.` and `..` as `BadName`, the
+	// writable backends refuse them, and `rt::RelativePath` refuses them before any backend sees a
+	// `vol://` path. This reader was the only one admitting a spelling nothing could deliver to it.
+	//
+	// The parent records are still parsed and are still REQUIRED - `DirRules` refuses a directory
+	// whose parent record is missing or misplaced. They are structure, not path syntax.
+	assert_eq!(fs.list_dir(b"SUB/.."), Err(FsError::BadName), "parent traversal is not a path component this API has");
+	assert_eq!(fs.list_dir(b"SUB/."), Err(FsError::BadName), "and neither is the self spelling");
+	assert!(fs.list_dir(b"SUB").is_ok(), "the directory itself still lists, so this refuses the spelling and not the directory");
 }
 
 #[test]
@@ -1870,4 +1884,30 @@ fn the_file_sets_crc_must_cover_the_fields_the_mount_trusts() {
 	}
 	img[at + 4] = sum;
 	assert_eq!(Udf::mount_checked(MemDisc { data: img }).err(), Some(MountError::Corrupt), "a File Set whose CRC stops before the domain and the continuation pointer is not vouching for them");
+}
+
+#[test]
+fn a_partition_whose_contents_are_not_udf_is_not_combined_with_a_udf_volume() {
+	// The logical volume's Domain Identifier is checked for `*OSTA UDF Compliant` and the partition
+	// descriptor's Partition Contents was not checked at all - so a checksum-correct descriptor for
+	// ANOTHER contents format was combined with the UDF logical volume and then read with UDF File
+	// Set and ICB rules.
+	let img = build_udf();
+	assert!(Udf::mount(MemDisc { data: img.clone() }).is_some(), "the fixture mounts");
+
+	// Both revisions UDF builds on are accepted, which is not a detail: a real
+	// `mkudffs --udfrev=1.02` image carries `+NSR02` and contains `+NSR03` nowhere, so requiring
+	// one revision would refuse media the standard tool produces.
+	for revision in [&b"+NSR02"[..], b"+NSR03"] {
+		let mut ok = img.clone();
+		ok[257 * SECTOR_SIZE + 25..257 * SECTOR_SIZE + 31].copy_from_slice(revision);
+		tag(&mut ok[257 * SECTOR_SIZE..258 * SECTOR_SIZE], TAG_PARTITION, 257);
+		assert!(Udf::mount(MemDisc { data: ok }).is_some(), "{:?} is a UDF partition", core::str::from_utf8(revision));
+	}
+
+	// And a contents identifier this reader does not implement is not a partition it may use.
+	let mut foreign = img;
+	foreign[257 * SECTOR_SIZE + 25..257 * SECTOR_SIZE + 31].copy_from_slice(b"+FOO01");
+	tag(&mut foreign[257 * SECTOR_SIZE..258 * SECTOR_SIZE], TAG_PARTITION, 257);
+	assert!(Udf::mount(MemDisc { data: foreign }).is_none(), "a partition whose contents are some other format is not one to read with UDF rules");
 }
