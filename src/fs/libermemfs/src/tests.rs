@@ -1977,3 +1977,43 @@ fn a_refused_reserved_rename_changes_nothing_and_keeps_its_reservation() {
 		assert_eq!(fs.read_file(b"a").expect("read"), b"x", "with the file where it was");
 	});
 }
+
+#[test]
+fn the_accounting_charges_what_is_owned_and_not_what_was_asked_for() {
+	// Files were charged by `Vec::capacity` and directory tables by their own capacity, while NAMES
+	// were charged by `String::len` and reservation chunks recorded the REQUESTED size.
+	// `try_reserve_exact` promises at least what was asked for and may give more, so on an allocator
+	// that rounds, the volume physically held more than `footprint` and `reserved_bytes` reported -
+	// across up to `MAX_ENTRIES` names and `MAX_RESERVATION_CHUNKS` chunks. A reserved volume could
+	// then report `footprint + reserved == capacity` while holding more, which is the configured
+	// capacity ceasing to be a truthful bound on the heap.
+	//
+	// THIS HOST'S ALLOCATOR RETURNS EXACTLY WHAT IS ASKED FOR, so the two readings agree here and no
+	// test can tell them apart by outcome. What is checked instead is that the accounting is
+	// computed from the containers themselves - walk them and compare - which is the property that
+	// stays true on an allocator that rounds.
+	let mut fs = LiberMemFs::mount(Policy::Reserved, 64 * 1024).expect("a reserved volume");
+	for i in 0..16 {
+		let name = alloc::format!("entry-{i:03}");
+		fs.write_file(name.as_bytes(), b"payload").expect("write");
+	}
+
+	// The reservation's own books against what its chunks actually own.
+	let held: usize = fs.reservation.iter().map(|chunk| chunk.allocation.capacity()).sum();
+	assert_eq!(fs.reserved_bytes() as usize, held, "reserved_bytes is the sum of what the chunks own");
+
+	// And the names, walked independently of the implementation's own accessor.
+	fn name_capacity(node: &Node) -> usize {
+		match node {
+			Node::File(_) | Node::Claimed(_) => 0,
+			Node::Directory(children) => children.iter().map(|(name, child)| name.capacity() + name_capacity(child)).sum(),
+		}
+	}
+	let names = name_capacity(&fs.root);
+	assert!(names > 0, "the fixture has names to account for");
+	assert!(fs.footprint() as usize >= names, "the footprint includes what the names own: {names} of {}", fs.footprint());
+
+	// The invariant the whole policy rests on, stated once: a reserved volume never holds more than
+	// its configured capacity.
+	assert!(fs.footprint() as usize + fs.reserved_bytes() as usize <= 64 * 1024, "footprint {} + reserved {} must not exceed the capacity", fs.footprint(), fs.reserved_bytes());
+}

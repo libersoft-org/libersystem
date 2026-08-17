@@ -80,6 +80,13 @@ pub const MAX_PATH_BYTES: usize = MAX_PATH_DEPTH * (MAX_NAME_BYTES + 1);
 struct Chunk {
 	// Held for its capacity alone. Never read, never written.
 	allocation: Vec<u8>,
+	// What the chunk actually OWNS, which is `allocation.capacity()` and not what was asked for.
+	//
+	// It recorded the REQUEST. `try_reserve_exact` promises at least that and may give more, so on
+	// an allocator that rounds, `reserved_bytes` under-reported what the volume was holding - and
+	// with up to `MAX_RESERVATION_CHUNKS` of them the slack accumulates. A reserved volume could
+	// then report `footprint + reserved == capacity` while physically holding more, which makes the
+	// configured capacity stop being a truthful bound on the heap.
 	bytes: usize,
 }
 
@@ -323,10 +330,16 @@ impl Node {
 	// reserved volume, which would make "reserved" mean nothing.
 	//
 	// A node does not count its own name; the parent holding the key does.
+	//
+	// `capacity()` RATHER THAN `len()`, for the same reason `allocated` counts a file's capacity.
+	// Every name is built with `try_reserve_exact`, which promises AT LEAST what was asked for and
+	// may give more - so an allocator that rounds leaves the volume physically holding more than
+	// `footprint` reports, across up to `MAX_ENTRIES` names. `capacity` is what the `String`
+	// actually owns, which is the question every accounting caller is really asking.
 	fn names(&self) -> usize {
 		match self {
 			Node::File(_) | Node::Claimed(_) => 0,
-			Node::Directory(children) => children.iter().map(|(name, node)| name.len() + node.names()).sum(),
+			Node::Directory(children) => children.iter().map(|(name, node)| name.capacity() + node.names()).sum(),
 		}
 	}
 
@@ -439,8 +452,9 @@ impl LiberMemFs {
 			let mut allocation: Vec<u8> = Vec::new();
 			allocation.try_reserve_exact(capacity).map_err(|_| FsError::NoMemory)?;
 			reservation.try_reserve(1).map_err(|_| FsError::NoMemory)?;
-			reservation.push(Chunk { allocation, bytes: capacity });
-			reserved = capacity;
+			let held = allocation.capacity();
+			reservation.push(Chunk { allocation, bytes: held });
+			reserved = held;
 		}
 		Ok(LiberMemFs { root: Node::Directory(Children::new()), policy, capacity, reservation, reserved, pending: None })
 	}
@@ -674,6 +688,16 @@ impl LiberMemFs {
 				// would change what `vol://` paths mean for every caller in the tree. Which of the
 				// two rules the Storage ABI should state is a question for the ABI; what could not
 				// stand is a middle segment meaning different things on two volumes under it.
+				//
+				// TIGHTENING THIS WAS TRIED AND WITHDRAWN (2026-08-16), and the measurement is the
+				// reason it is still written this way. The Storage boundary DOES already answer the
+				// question - `rt::RelativePath` refuses an empty segment, `.`, `..`, NUL and
+				// backslash before any backend sees a path - so nothing that arrives through
+				// `vol://` can carry these spellings and the tolerance is unreachable from outside.
+				// Refusing them here anyway turned SEVEN tests red and hung the model soak, because
+				// this crate's own callers and fixtures use the leading-slash form throughout. That
+				// is an internal renaming exercise, not the finding: the audit's own preferred
+				// answer is normalisation at the boundary, which is what already happens.
 				if index != 0 && index != last_index {
 					return Err(FsError::BadName);
 				}
@@ -821,8 +845,10 @@ impl LiberMemFs {
 		if allocation.try_reserve_exact(bytes).is_err() {
 			return false;
 		}
-		self.reservation.push(Chunk { allocation, bytes });
-		self.reserved += bytes;
+		// Measured AFTER the allocation, because what the volume holds is what the allocator gave.
+		let held = allocation.capacity();
+		self.reservation.push(Chunk { allocation, bytes: held });
+		self.reserved += held;
 		true
 	}
 

@@ -385,9 +385,24 @@ fn listing_contract_and_dot_dot() {
 	assert_eq!(fs.read_file(b""), Err(FsError::NotFound));
 	let sub = list.iter().find(|f| f.name == "SUB").unwrap();
 	assert_eq!((sub.is_dir, sub.size), (true, 0), "a directory must list with size zero");
-	let mut up: Vec<_> = fs.list_dir(b"SUB/..").unwrap().into_iter().map(|f| f.name).collect();
-	up.sort();
-	assert_eq!(up, ["HELLO.TXT", "SUB"]);
+	// `..` IS NO LONGER A TRAVERSAL COMPONENT, and this assertion is reversed deliberately.
+	//
+	// It used to expect `SUB/..` to list the root, on the reasoning in `find_entry`'s comment that
+	// the special records "resolve the way the other backends behind the volume API resolve them".
+	// That was factually wrong: `fs-core` documents `.` and `..` as `BadName`, the writable backends
+	// refuse them, and `rt::RelativePath` - which every `vol://` path is parsed by before a backend
+	// sees it - refuses them too. So this backend was the only one admitting a spelling nothing
+	// could deliver to it, and the comment claiming consensus was the part that was untrue.
+	//
+	// The records themselves are still parsed and are now REQUIRED: `check_hierarchy` refuses a
+	// directory whose self and parent records are missing, reordered or not directories. They are
+	// structure, not path syntax.
+	assert_eq!(fs.list_dir(b"SUB/.."), Err(FsError::BadName), "parent traversal is not a path component this API has");
+	assert_eq!(fs.list_dir(b"SUB/."), Err(FsError::BadName), "and neither is the self record");
+	// The directory itself still lists, so this refuses the spelling rather than the directory.
+	let mut inside: Vec<_> = fs.list_dir(b"SUB").unwrap().into_iter().map(|f| f.name).collect();
+	inside.sort();
+	assert_eq!(inside, ["WORLD.TXT"]);
 }
 
 #[test]
@@ -1343,4 +1358,139 @@ fn a_directory_sector_pads_with_zeroes_or_it_is_not_padding() {
 	broken[at + 1] = 0x42;
 	let mut fs = Iso9660::mount(MemDisc { data: broken }).expect("the volume still mounts - this is about the directory");
 	assert!(fs.list().is_err(), "a nonzero byte in a directory sector's padding is not padding");
+}
+
+#[test]
+fn lookup_walks_the_whole_directory_and_agrees_with_the_listing() {
+	// `find_entry` stopped at the FIRST record whose name matched, so it never looked at what came
+	// after. A second record decoding to the same name went unseen, and lookup and listing then
+	// disagreed about whether the directory was valid: `read_dir` scans the whole extent and
+	// refuses a duplicate, `open` took whichever record came first. Which object a name reaches
+	// depended on record ORDER, on a medium install images are loaded from.
+	//
+	// Two records with distinct ISO identifiers - `A.TXT;1` and `B.TXT;1` - are given the same
+	// Joliet name, which is where a collision has no version suffix to be explained by.
+	let root_lba = 19u32;
+	let dup = name("SAME.TXT", false, true);
+	let root = dir_block(&[record(root_lba, SECTOR_SIZE as u32, true, &[0]), record(root_lba, SECTOR_SIZE as u32, true, &[1]), record(21, 9, false, &dup), record(22, 5, false, &dup)]);
+	// A Joliet volume, so the duplicate is a namespace collision rather than a version pair.
+	let mut img = build_iso(true);
+	let o = root_lba as usize * SECTOR_SIZE;
+	img[o..o + SECTOR_SIZE].fill(0);
+	img[o..o + root.len()].copy_from_slice(&root);
+
+	let mut fs = Iso9660::mount(MemDisc { data: img }).expect("mount");
+	let listed = fs.list();
+	let looked_up = fs.read_file(b"SAME.TXT");
+	// THE PROPERTY: the two must agree about whether this directory is usable. Before, listing
+	// refused and lookup succeeded.
+	assert_eq!(listed.is_err(), looked_up.is_err(), "lookup and listing must agree: listing {:?}, lookup {:?}", listed.as_ref().map(|v| v.len()), looked_up.as_ref().map(|v| v.len()));
+	assert!(looked_up.is_err(), "two records claiming one name is not a name that resolves");
+}
+
+#[test]
+fn a_directory_without_its_self_and_parent_records_is_not_a_directory() {
+	// ECMA-119 puts a directory's SELF and PARENT records first, in that order, both marked as
+	// directories. `parse_record` recognised the one-byte identifiers 0 and 1 and named them `.`
+	// and `..`, and neither walker ever checked that they were present, first, in order, or
+	// directories - so a malformed hierarchy listed as healthy and the parent relation the format
+	// guarantees was whatever the medium said.
+	let root_lba = 19u32;
+	let dot = record(root_lba, SECTOR_SIZE as u32, true, &[0]);
+	let dotdot = record(root_lba, SECTOR_SIZE as u32, true, &[1]);
+	let file = record(21, 9, false, &name("HELLO.TXT", false, false));
+
+	let rebuild = |records: &[Vec<u8>]| {
+		let mut img = build_iso(false);
+		let o = root_lba as usize * SECTOR_SIZE;
+		let block = dir_block(records);
+		img[o..o + SECTOR_SIZE].fill(0);
+		img[o..o + block.len()].copy_from_slice(&block);
+		img
+	};
+
+	// Swapped: parent first, self second.
+	let mut fs = Iso9660::mount(MemDisc { data: rebuild(&[dotdot.clone(), dot.clone(), file.clone()]) }).expect("mount");
+	assert!(fs.list().is_err(), "self and parent in the wrong order is not a directory");
+
+	// Missing entirely: the file record is first.
+	let mut fs = Iso9660::mount(MemDisc { data: rebuild(&[file.clone()]) }).expect("mount");
+	assert!(fs.list().is_err(), "a directory with no self record is not a directory");
+
+	// A duplicate special record later in the extent: a second claim about the same relation.
+	let mut fs = Iso9660::mount(MemDisc { data: rebuild(&[dot.clone(), dotdot.clone(), file.clone(), dot.clone()]) }).expect("mount");
+	assert!(fs.list().is_err(), "a second self record is a second claim about one relation");
+
+	// A self record flagged as a FILE rather than a directory.
+	let mut bad_kind = dot.clone();
+	bad_kind[25] &= !0x02;
+	let mut fs = Iso9660::mount(MemDisc { data: rebuild(&[bad_kind, dotdot.clone(), file.clone()]) }).expect("mount");
+	assert!(fs.list().is_err(), "a self record that is not a directory is not a self record");
+
+	// AND THE WELL-FORMED SHAPE STILL LISTS, so this refuses malformation rather than directories.
+	let mut fs = Iso9660::mount(MemDisc { data: rebuild(&[dot, dotdot, file]) }).expect("mount");
+	let names: Vec<_> = fs.list().expect("a well-formed directory lists").into_iter().map(|f| f.name).collect();
+	assert!(names.iter().any(|n| n == "HELLO.TXT"), "{names:?}");
+}
+
+#[test]
+fn a_volume_must_contain_the_descriptors_it_was_read_from_and_a_usable_root() {
+	// Mount checked that `blocks` was nonzero and that the ROOT fit inside it, and stopped there.
+	// So an image could place a valid descriptor set at LBA 16 and upwards while declaring
+	// `VolumeSpaceSize = 1` - geometry contradicting the very bytes it was built from - and mount as
+	// healthy. That hides truncation at mount instead of surfacing it at the first read that runs
+	// off the end.
+	let mut small = build_iso(false);
+	// `VolumeSpaceSize` is the both-endian pair at offset 80 of the PVD.
+	both32(&mut small, 16 * SECTOR_SIZE + 80, 17);
+	assert_eq!(Iso9660::mount_checked(MemDisc { data: small }).err(), Some(MountError::Corrupt), "a volume smaller than its own descriptor set");
+
+	// AND A ROOT THAT COULD HOLD ITS MANDATORY RECORDS. `root_extent` accepted a data length of
+	// zero, so a medium with no root directory at all mounted and listed as a healthy EMPTY volume -
+	// which a caller cannot tell from a genuinely empty one. The two self/parent records are 34
+	// bytes each.
+	let mut rootless = build_iso(false);
+	both32(&mut rootless, 16 * SECTOR_SIZE + 156 + 10, 0);
+	assert_eq!(Iso9660::mount_checked(MemDisc { data: rootless }).err(), Some(MountError::Corrupt), "a zero-length root is not an empty directory");
+
+	// The unmodified image still mounts, so these refuse impossible geometry rather than geometry.
+	assert!(Iso9660::mount_checked(MemDisc { data: build_iso(false) }).is_ok());
+}
+
+#[test]
+fn an_identifier_version_is_parsed_before_it_is_stripped() {
+	// The decoder stopped at the first `;` and never asked what followed, so `A;garbage`, `A;0`,
+	// `A;1;2` and `;1` all became `A` or an empty name. Normalisation without validation makes
+	// distinct malformed identifiers COLLIDE with a valid one - and the decoded name is the lookup
+	// key, so a nonconforming record could hide a real file, or be returned under a name the medium
+	// never legally declared. `validate_component` runs afterwards, when the evidence is gone.
+	let root_lba = 19u32;
+	let with_identifier = |id: &[u8]| {
+		let mut img = build_iso(false);
+		let block = dir_block(&[record(root_lba, SECTOR_SIZE as u32, true, &[0]), record(root_lba, SECTOR_SIZE as u32, true, &[1]), record(21, 9, false, id)]);
+		let o = root_lba as usize * SECTOR_SIZE;
+		img[o..o + SECTOR_SIZE].fill(0);
+		img[o..o + block.len()].copy_from_slice(&block);
+		img
+	};
+
+	for (id, why) in [
+		(&b"A.TXT;garbage"[..], "a version that is not a number"),
+		(b"A.TXT;0", "version zero, which the format does not define"),
+		(b"A.TXT;1;2", "two separators"),
+		(b";1", "an empty base identifier"),
+		(b"A.TXT;", "a separator with no version"),
+		(b"A.TXT;01", "a leading zero is a second spelling of one number"),
+		(b"A.TXT;99999", "a version past the format's range"),
+	] {
+		let mut fs = Iso9660::mount(MemDisc { data: with_identifier(id) }).expect("the volume mounts - this is about the record");
+		assert!(fs.list().is_err(), "{why}: {:?}", core::str::from_utf8(id));
+	}
+
+	// And the legal spellings still list, at both ends of the version range.
+	for id in [&b"A.TXT;1"[..], b"A.TXT;32767"] {
+		let mut fs = Iso9660::mount(MemDisc { data: with_identifier(id) }).expect("mount");
+		let names: Vec<_> = fs.list().expect("a legal identifier lists").into_iter().map(|f| f.name).collect();
+		assert!(names.iter().any(|n| n == "A.TXT"), "{:?} decodes to its base name: {names:?}", core::str::from_utf8(id));
+	}
 }

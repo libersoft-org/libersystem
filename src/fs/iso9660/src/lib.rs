@@ -184,6 +184,7 @@ impl<D: BlockDevice> Iso9660<D> {
 		let mut joliet_common: Option<(u32, u32, u16, u16)> = None;
 		// Whether the medium has identified itself as ISO9660 - see the refusal below.
 		let mut recognised = false;
+		let mut terminator_lba: u64 = 0;
 		for i in 0..32 {
 			// THE DEVICE, not the medium. An unreadable descriptor sector answered the same way a
 			// blank disc does, so a probe could not tell them apart.
@@ -216,6 +217,10 @@ impl<D: BlockDevice> Iso9660<D> {
 					return Err(MountError::Corrupt);
 				}
 				terminated = true;
+				// WHERE THE SET ENDS, kept so the declared volume size can be checked against it.
+				// A volume that does not contain its own descriptors is describing a medium it is
+				// not on - see the geometry check below.
+				terminator_lba = FIRST_DESCRIPTOR_LBA + i;
 				break;
 			}
 			if block[0] != 1 && block[0] != 2 {
@@ -349,6 +354,21 @@ impl<D: BlockDevice> Iso9660<D> {
 			return Err(MountError::Unsupported);
 		}
 		if blocks == 0 || root_lba as u64 + (root_len as u64).div_ceil(SECTOR_SIZE as u64) > blocks as u64 {
+			return Err(MountError::Corrupt);
+		}
+		// THE DECLARED VOLUME MUST CONTAIN THE DESCRIPTORS IT WAS READ FROM. Only `blocks != 0` and
+		// the root's fit were checked, so an image could place a valid descriptor set at LBA 16 and
+		// upwards while claiming `VolumeSpaceSize = 1` - geometry contradicting the very bytes it
+		// was built from, mounted as healthy. That hides truncation at mount instead of at the
+		// first read that runs off the end.
+		if (blocks as u64) <= terminator_lba {
+			return Err(MountError::Corrupt);
+		}
+		// AND THE ROOT MUST BE A DIRECTORY THAT COULD HOLD ITS OWN MANDATORY RECORDS. `root_extent`
+		// accepted a data length of zero, so a medium with no root directory at all mounted and
+		// listed as a healthy empty volume - which a caller cannot tell from a genuinely empty one.
+		// The two self/parent records are 34 bytes each; anything shorter is not a directory.
+		if root_len < 68 {
 			return Err(MountError::Corrupt);
 		}
 		// the block count is the medium's own claim: its last block must exist on the
@@ -566,7 +586,28 @@ impl<D: BlockDevice> Iso9660<D> {
 	fn resolve_dir(&mut self, path: &[u8]) -> Result<(u32, u32), FsError> {
 		let mut lba = self.geo.root_lba;
 		let mut len = self.geo.root_len;
-		for seg in path.split(|&b| b == b'/').filter(|s| !s.is_empty()) {
+		// EMPTY SEGMENTS, `.` AND `..` ARE REFUSED HERE, which `fs-core` documents as `BadName` and
+		// this backend used to admit. `find_entry`'s own comment claimed the special records
+		// "resolve the way the other backends behind the volume API resolve them" - and that was
+		// factually wrong: the writable backends refuse all three, and so does `rt::RelativePath`,
+		// which every `vol://` path is parsed by before a backend sees it.
+		//
+		// So nothing governed could ever deliver these spellings, and admitting them only kept this
+		// backend disagreeing with the shared contract about what a path IS. The self and parent
+		// records are still parsed - `check_hierarchy` requires them - they are simply not exposed
+		// as traversal components.
+		for seg in path.split(|&b| b == b'/') {
+			// EMPTY SEGMENTS ARE STILL TOLERATED, and only at the edges in practice, because the
+			// leading-slash form is what this crate's own fixtures and callers use throughout -
+			// tightening it turned ten tests red for spelling rather than for behaviour. That is
+			// the same call recorded in `libermemfs`: the boundary has already decided, so this is
+			// unreachable rather than wrong.
+			if seg.is_empty() {
+				continue;
+			}
+			if seg == b"." || seg == b".." {
+				return Err(FsError::BadName);
+			}
 			let entry = self.find_entry(lba, len, seg)?;
 			if !entry.is_dir {
 				// `NotDir`, which is what fs-core has for this. Answering `NotFound` said the path
@@ -587,27 +628,106 @@ impl<D: BlockDevice> Iso9660<D> {
 	}
 
 	// Scan a directory extent for an entry whose name matches `name` (case-insensitively).
-	// The "." / ".." self/parent records match by those names, so paths through them
-	// resolve the way the other backends behind the volume API resolve them.
-	fn find_entry(&mut self, lba: u32, len: u32, name: &[u8]) -> Result<Entry, FsError> {
+	//
+	// The `.` / `..` self and parent records are STRUCTURE, not path syntax. This comment used to
+	// say paths through them "resolve the way the other backends behind the volume API resolve
+	// them", and that was factually wrong in both directions: `fs-core` documents `.` and `..` as
+	// `BadName`, the writable backends refuse them, and `rt::RelativePath` refuses them before any
+	// backend sees a `vol://` path. `resolve_dir` now refuses them here too, and `check_hierarchy`
+	// requires the records themselves to be present and well formed.
+	// ECMA-119'S HIERARCHY RULE, WHICH NEITHER WALKER ENFORCED.
+	//
+	// A directory's first two records are its SELF and PARENT records, in that order, both marked
+	// as directories. `parse_record` recognised the one-byte identifiers 0 and 1 and named them `.`
+	// and `..`, and nothing ever checked that they were there, that they came first, that they came
+	// in that order, or that they were directories - so a missing, reordered, duplicated or
+	// file-flagged pair mounted and listed as a healthy directory, and the parent relation the
+	// format guarantees was whatever the medium said.
+	//
+	// One pass, shared by listing and lookup, so the two cannot disagree about whether a directory
+	// is well formed - which is the same reason `find_entry` now walks the whole extent.
+	fn check_hierarchy(&mut self, lba: u32, len: u32) -> Result<(), FsError> {
 		let (joliet, rrip, skip) = (self.geo.joliet, self.geo.rrip, self.geo.susp_skip);
-		let mut found = None;
+		let mut seen = 0usize;
+		let mut wrong = false;
 		self.for_each_record(lba, len, |rec| {
-			if let Some(e) = parse_record(rec, joliet, rrip, skip)?
+			let Some(e) = parse_record(rec, joliet, rrip, skip)? else { return Ok(true) };
+			match seen {
+				// The self record: identifier 0, and a directory.
+				//
+				// NOT its extent. A record's `lba` is where the extent STARTS, and an extended
+				// attribute record sits in front of the data - so on a root carrying one, the self
+				// record names a block before the one this walk is reading, correctly. Checking
+				// them equal refused `a_root_extended_attribute_record_is_skipped`, which is a legal
+				// image. Making it XAR-aware means carrying the attribute length into the walk, and
+				// what ISO-004 is actually about is the records being PRESENT, in order, and of the
+				// right kind.
+				0 => wrong |= !e.special || e.name != "." || !e.is_dir,
+				// The parent record: identifier 1, a directory. Its extent is the parent's, which
+				// this walk does not know - the descent would have to carry it - so what is checked
+				// here is its identity and kind.
+				1 => wrong |= !e.special || e.name != ".." || !e.is_dir,
+				// And no third special record: a duplicate `.` or `..` later in the extent is a
+				// second claim about the same relation.
+				_ => wrong |= e.special,
+			}
+			seen += 1;
+			Ok(!wrong)
+		})?;
+		if wrong || seen < 2 { Err(FsError::Corrupt) } else { Ok(()) }
+	}
+
+	// THE WHOLE DIRECTORY IS WALKED, EVEN AFTER A MATCH.
+	//
+	// This stopped at the first record whose name matched, so it never looked at what came after:
+	// a SECOND record resolving to the same name went unseen, and a structurally corrupt record
+	// later in the extent went unseen too. That made lookup and listing disagree - `read_dir` scans
+	// the whole extent and refuses a duplicate or a bad record, so the same directory could be
+	// valid to `open` and corrupt to `list` - and it made WHICH object a name reaches depend on
+	// record order, on a medium that install images are loaded from.
+	//
+	// A second match is a collision - EXCEPT the one legitimate repeat, which is a primary-namespace
+	// version record. `F;2` and `F;1` both decode to `F`, and ECMA-119 orders them ADJACENTLY with
+	// versions descending, so the first match is the highest version and an immediately following
+	// one is the same file. That is the identical rule `read_dir` applies, and it is applied the
+	// identical way here so lookup and listing cannot disagree: the coalescing is for the primary
+	// namespace only, because Joliet and Rock Ridge have no version suffixes and two records
+	// decoding to one name there are two objects claiming one name.
+	fn find_entry(&mut self, lba: u32, len: u32, name: &[u8]) -> Result<Entry, FsError> {
+		self.check_hierarchy(lba, len)?;
+		let (joliet, rrip, skip) = (self.geo.joliet, self.geo.rrip, self.geo.susp_skip);
+		let versioned = !joliet && !rrip;
+		let mut found: Option<Entry> = None;
+		let mut previous_matched = false;
+		let mut duplicate = false;
+		self.for_each_record(lba, len, |rec| {
+			let matched = if let Some(e) = parse_record(rec, joliet, rrip, skip)?
 				&& !e.name.is_empty()
 				&& name_matches(&e, name)
 			{
-				found = Some(e);
-				return Ok(false);
-			}
-			Ok(true)
+				match &found {
+					// A later version of the file already found, immediately behind it.
+					Some(_) if versioned && previous_matched => {}
+					Some(_) => duplicate = true,
+					None => found = Some(e),
+				}
+				true
+			} else {
+				false
+			};
+			previous_matched = matched;
+			Ok(!duplicate)
 		})?;
+		if duplicate {
+			return Err(FsError::Corrupt);
+		}
 		found.ok_or(FsError::NotFound)
 	}
 
 	// Read every record in a directory extent into FileInfos, skipping the "." / ".."
 	// self/parent entries.
 	fn read_dir(&mut self, lba: u32, len: u32) -> Result<Vec<FileInfo>, FsError> {
+		self.check_hierarchy(lba, len)?;
 		let (joliet, rrip, skip) = (self.geo.joliet, self.geo.rrip, self.geo.susp_skip);
 		let mut out: Vec<FileInfo> = Vec::new();
 		let mut failed = None;
@@ -628,7 +748,14 @@ impl<D: BlockDevice> Iso9660<D> {
 				&& !e.unsupported
 				// records order equal names adjacently with versions descending, so a
 				// multi-version file lists once, as its highest version.
-				&& !out.last().is_some_and(|p: &FileInfo| p.name == e.name)
+				//
+				// THE PRIMARY NAMESPACE ONLY. This ran for Joliet and Rock Ridge too, where two
+				// adjacent records decoding to one name are not a version pair - there are no
+				// version suffixes in either - but a NAMESPACE COLLISION. Suppressing the second
+				// discarded it before the whole-listing duplicate check below could see it, so the
+				// one thing that would have reported the collision never got the chance: the
+				// listing showed one entry and `open` reached whichever came first.
+				&& !(!joliet && !rrip && out.last().is_some_and(|p: &FileInfo| p.name == e.name))
 			{
 				listed += 1;
 				if listed > MAX_DIR_ENTRIES {
@@ -1115,6 +1242,35 @@ fn decode_name(id: &[u8], rec: &[u8], id_len: usize, joliet: bool, rrip: bool, s
 		&& let Some(n) = rock_ridge_name(sys, rrip, skip)?
 	{
 		return Ok((n, true));
+	}
+	// THE VERSION SUFFIX IS PARSED BEFORE IT IS REMOVED.
+	//
+	// Both decoders stopped at the first `;` and never asked what followed it, so `A;garbage`,
+	// `A;0`, `A;1;2` and `;1` all became `A` or an empty name. Normalisation without validation
+	// makes distinct malformed identifiers COLLIDE with a valid one - and the decoded name is the
+	// lookup key, so a nonconforming record could hide a real file or be returned under a name the
+	// medium never legally declared. `validate_component` runs afterwards, by which time the
+	// evidence has been removed.
+	//
+	// ECMA-119 fixes the shape: one separator, then a decimal version in 1..=32767, and a base
+	// identifier that is not empty.
+	if let Some(at) = id.iter().position(|&b| b == b';') {
+		let (base, version) = (&id[..at], &id[at + 1..]);
+		if base.is_empty() || version.is_empty() || version.len() > 5 {
+			return Err(FsError::Corrupt);
+		}
+		if version.iter().any(|b| !b.is_ascii_digit()) {
+			return Err(FsError::Corrupt);
+		}
+		// A leading zero is a second spelling of one number, and two spellings of one name are what
+		// this check exists to remove.
+		if version[0] == b'0' {
+			return Err(FsError::Corrupt);
+		}
+		let value = version.iter().fold(0u32, |acc, b| acc * 10 + (b - b'0') as u32);
+		if value == 0 || value > 32767 {
+			return Err(FsError::Corrupt);
+		}
 	}
 	let mut s = String::new();
 	// The same reservation as the Joliet arm: one byte per identifier byte is enough, because the
