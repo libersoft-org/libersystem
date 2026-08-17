@@ -675,7 +675,17 @@ fn sys_dma_buffer_map(handle: u64) -> i64 {
 		dma.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
-	dma.commit_mapping(cr3, base);
+	// A COMMIT THAT FINDS NO RESERVATION MUST UNDO THE MAP. Since `remove_mapping` no longer matches
+	// a reservation this cannot happen any more; if it ever does, the page tables would hold a
+	// mapping nothing records, which is precisely the state that lets teardown retire frames while
+	// translations are live.
+	if !dma.commit_mapping(cr3, base) {
+		for i in 0..frames.len() {
+			arch::paging::unmap_page(base + i as u64 * PAGE_SIZE);
+		}
+		free_vrange(Some(&space), base, dma.size() as u64);
+		return ERR_NO_MEMORY;
+	}
 	// Rolled back the same way `sys_memory_map` does, and for the same reason.
 	if !guard.record_dma_mapping(dma.clone()) {
 		dma.remove_mapping(&space);
@@ -1907,7 +1917,15 @@ fn sys_memory_map(handle: u64) -> i64 {
 		memory.abandon_reservation(cr3);
 		return ERR_NO_MEMORY;
 	}
-	memory.commit_mapping(cr3, base);
+	// Same rule as the DMA path: a mapping in the page tables that no registry describes is the
+	// state teardown cannot clean up, so a commit that finds nothing undoes the map instead.
+	if !memory.commit_mapping(cr3, base) {
+		for i in 0..frames.len() {
+			arch::paging::unmap_page(base + i as u64 * PAGE_SIZE);
+		}
+		free_vrange(Some(&space), base, memory.size() as u64);
+		return ERR_NO_MEMORY;
+	}
 	// `remove_mapping` unmaps the pages AND returns the virtual range, which is the whole rollback:
 	// a mapping the process's cleanup list does not know about is one nothing will ever collect, so
 	// a record that cannot be made has to undo the map rather than leave it.
@@ -2442,7 +2460,14 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 	// refusal would convert a handled shortfall into an aborted stream. The multi-cap receive
 	// refuses instead, because its callers know the shape they are expecting and a message that
 	// does not fit is one they can come back for.
-	let mut message = match receive_transactionally(&thread, channel, usize::MAX, 1) {
+	//
+	// ONLY WHEN THE CALLER WANTS ONE. This reserved a handle unconditionally, including when
+	// `out_handle_ptr` is null - which is the caller saying "I am not taking the capability". A
+	// process at its exact handle quota was then refused BEFORE it could dequeue, so it could not
+	// drain its own channel of capability-bearing messages despite needing no new handle. The
+	// reservation was released afterwards, which is too late to help: the refusal happens first.
+	let install_max: usize = if out_handle_ptr != 0 { 1 } else { 0 };
+	let mut message = match receive_transactionally(&thread, channel, usize::MAX, install_max) {
 		Ok(message) => message,
 		Err(error) => return error,
 	};
@@ -2455,7 +2480,7 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 	let n = core::cmp::min(message.bytes.len(), bytes_cap as usize);
 	if n > 0 && bytes_ptr != 0 {
 		if let Err(error) = copy_to_user_exact(bytes_ptr, message.bytes.as_ptr(), n) {
-			thread.handles().lock().release_reservation(message.caps.len().min(1));
+			thread.handles().lock().release_reservation(message.caps.len().min(install_max));
 			channel.return_to_head(message);
 			return error;
 		}
@@ -2481,11 +2506,10 @@ fn sys_channel_recv(ch: u64, bytes_ptr: u64, bytes_cap: u64, out_handle_ptr: u64
 			}
 			return error;
 		}
-	} else {
-		// No out pointer: the caller is not taking the capability, so the slot booked for it goes
-		// back. Nothing is installed and the message's capabilities are dropped with it.
-		thread.handles().lock().release_reservation(message.caps.len().min(1));
 	}
+	// No `else`: with a null out pointer nothing was reserved in the first place, so there is
+	// nothing to give back. The message's capabilities are dropped with it, which is what the
+	// caller asked for by not offering somewhere to put them.
 	n as i64
 }
 

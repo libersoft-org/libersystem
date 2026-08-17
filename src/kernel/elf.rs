@@ -7,7 +7,6 @@
 
 #![allow(dead_code)]
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -67,7 +66,21 @@ impl Drop for SharedPage {
 	}
 }
 
-static SHARED_PAGES: SpinLock<BTreeMap<u64, Vec<Weak<SharedPage>>>> = SpinLock::new(BTreeMap::new());
+// A SORTED VECTOR RATHER THAN A `BTreeMap`, because `BTreeMap::insert` cannot fail politely.
+//
+// This cache is reached from `sys_process_create` and `sys_module_load`, so a ring-3 caller chooses
+// the image and therefore chooses the page hashes. `cache.entry(hash).or_default()` allocated a map
+// node infallibly and `candidates.push` grew a vector infallibly - both AFTER the loader had entered
+// an operation whose contract is to return `OutOfMemory`, so a caller could exhaust the heap, ask for
+// an image with a page hash the cache has not seen, and turn an ordinary load refusal into a kernel
+// abort. `alloc`'s `BTreeMap` has no fallible insert, so no amount of care at the call site fixes it;
+// a `Vec` has `try_reserve`, and that is the whole reason for the change.
+//
+// The cost is honest: an insertion at a new key memmoves the tail of a vector that holds at most
+// `MAX_SHARED_CACHE_KEYS` (hash, candidates) pairs - about half a megabyte at the very top end,
+// against an O(log n) lookup that is unchanged. Sharing pages is worth that; ending the kernel is
+// not worth anything.
+static SHARED_PAGES: SpinLock<Vec<(u64, Vec<Weak<SharedPage>>)>> = SpinLock::new(Vec::new());
 
 // One shared page, owning a fresh frame and registered nowhere, so a test can drop it and watch
 // what its `Drop` does with the frame. Not `shared_page()`: that one hashes real image bytes and
@@ -353,24 +366,43 @@ fn initialize_page(frame: u64, data: &[u8], source_offset: usize, destination_of
 fn shared_page(data: &[u8], source_offset: usize, destination_offset: usize, copy: usize) -> Result<Arc<SharedPage>, ElfError> {
 	let hash = page_hash(data, source_offset, destination_offset, copy);
 	let mut cache = SHARED_PAGES.lock();
-	if !cache.contains_key(&hash) && cache.len() >= MAX_SHARED_CACHE_KEYS {
+	let found = cache.binary_search_by(|(key, _)| key.cmp(&hash));
+
+	// An EXISTING key: search its candidates, and share one if it matches. No allocation on this
+	// path at all, which is the common one.
+	if let Ok(at) = found {
+		let candidates = &mut cache[at].1;
+		candidates.retain(|candidate| candidate.strong_count() != 0);
+		for candidate in candidates.iter().filter_map(Weak::upgrade) {
+			if page_matches(candidate.frame(), data, source_offset, destination_offset, copy) {
+				return Ok(candidate);
+			}
+		}
 		let frame = frame::allocate().ok_or(ElfError::OutOfMemory)?;
 		initialize_page(frame, data, source_offset, destination_offset, copy);
-		return crate::mem::heap::try_arc(SharedPage { frame }).ok_or(ElfError::OutOfMemory);
-	}
-	let candidates = cache.entry(hash).or_default();
-	candidates.retain(|candidate| candidate.strong_count() != 0);
-	for candidate in candidates.iter().filter_map(Weak::upgrade) {
-		if page_matches(candidate.frame(), data, source_offset, destination_offset, copy) {
-			return Ok(candidate);
+		let page = crate::mem::heap::try_arc(SharedPage { frame }).ok_or(ElfError::OutOfMemory)?;
+		// A collision slot that cannot be reserved is simply not taken: the page is produced and
+		// returned either way, it is just not offered to a later load. Degrading the cache is the
+		// correct answer to memory pressure; aborting the kernel is not.
+		if candidates.len() < MAX_HASH_COLLISIONS && candidates.try_reserve(1).is_ok() {
+			candidates.push(Arc::downgrade(&page));
 		}
+		return Ok(page);
 	}
+
+	// A NEW key. Produce the page first - it is what the caller asked for and it must be returned
+	// whether or not the cache can record it.
 	let frame = frame::allocate().ok_or(ElfError::OutOfMemory)?;
 	initialize_page(frame, data, source_offset, destination_offset, copy);
 	let page = crate::mem::heap::try_arc(SharedPage { frame }).ok_or(ElfError::OutOfMemory)?;
-	if candidates.len() < MAX_HASH_COLLISIONS {
-		// ALLOC-OK: the shared-page cache for one image, bounded by the image's own page count.
-		candidates.push(Arc::downgrade(&page));
+	if cache.len() < MAX_SHARED_CACHE_KEYS {
+		let mut candidates: Vec<Weak<SharedPage>> = Vec::new();
+		// Both reservations before either mutation, so a failure leaves the cache exactly as it was.
+		if candidates.try_reserve(1).is_ok() && cache.try_reserve(1).is_ok() {
+			candidates.push(Arc::downgrade(&page));
+			let at = found.unwrap_err();
+			cache.insert(at, (hash, candidates));
+		}
 	}
 	Ok(page)
 }

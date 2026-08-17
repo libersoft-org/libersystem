@@ -262,10 +262,16 @@ impl DmaBuffer {
 		true
 	}
 
-	pub fn commit_mapping(&self, cr3: u64, base: u64) {
+	// The reservation slot only - see `MemoryObject::commit_mapping`, which this mirrors, and which
+	// carries the reasoning for both.
+	pub fn commit_mapping(&self, cr3: u64, base: u64) -> bool {
 		let mut mappings = self.mappings.lock();
-		if let Some(entry) = mappings.iter_mut().find(|(mapped_cr3, _)| *mapped_cr3 == cr3) {
-			entry.1 = base;
+		match mappings.iter_mut().find(|(mapped_cr3, mapped_base)| *mapped_cr3 == cr3 && *mapped_base == 0) {
+			Some(entry) => {
+				entry.1 = base;
+				true
+			}
+			None => false,
 		}
 	}
 
@@ -284,7 +290,11 @@ impl DmaBuffer {
 		let cr3 = space.cr3();
 		let base = {
 			let mut mappings = self.mappings.lock();
-			let Some(index) = mappings.iter().position(|(mapped_cr3, _)| *mapped_cr3 == cr3) else { return false };
+			// A COMMITTED MAPPING ONLY - the same hazard `MemoryObject::remove_mapping` describes at
+			// length: matching on `cr3` alone also matched an in-flight RESERVATION, so a sibling
+			// thread's unmap stole it, unmapped the first pages of the address space, and left the
+			// real mapping in the page tables with nothing recording it.
+			let Some(index) = mappings.iter().position(|(mapped_cr3, base)| *mapped_cr3 == cr3 && *base != 0) else { return false };
 			mappings.swap_remove(index).1
 		};
 		for page in 0..self.frames.len() {

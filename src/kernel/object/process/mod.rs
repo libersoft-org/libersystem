@@ -834,6 +834,22 @@ impl Process {
 
 impl Drop for Process {
 	fn drop(&mut self) {
+		// A TERMINAL RECORD FOR A PROCESS THAT NEVER RAN.
+		//
+		// A process can be added to a ProcessGroup and lose its last strong reference before any
+		// thread is started - a spawn that fails after the group is joined, a handle closed on a
+		// prepared-but-unstarted process. Nothing ran, so neither `terminate` nor the exit path
+		// published a transition, and the group's weak member simply expired. Group COMPLETION then
+		// counted the member as gone while a SNAPSHOT found neither a live process nor a record and
+		// reported the slot as still running: two answers that contradict each other, and a pipeline
+		// whose stage outcome is lost.
+		//
+		// `record_member` writes at most once and does nothing for a slot that already has a record,
+		// so this is a no-op for every process that reached a terminal state the ordinary way.
+		if !self.is_terminated() {
+			self.killed.store(true, Ordering::Release);
+			self.record_in_groups();
+		}
 		self.unmap_objects();
 		// Refund the Domain's stack account for every page this process's stack held.
 		let stack = self.stack_bytes.swap(0, Ordering::AcqRel);

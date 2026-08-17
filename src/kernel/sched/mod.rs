@@ -361,6 +361,27 @@ pub fn spawn(entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 // Domain - so a kernel thread's table is reclaimed when the thread is reaped.
 // A remote target core is kicked with a wake IPI, so a halted core picks the
 // thread up immediately instead of on its next timer tick.
+// Mark a thread STARTED and put it on `cpu`'s run queue, exactly once.
+//
+// Every first enqueue goes through here, because doing it by hand is what broke the live-thread
+// count. `spawn_on`, `spawn_in`, `thread_create` and `start_thread` called `enqueue_on` directly and
+// never set `started`, so a thread that ran and exited was counted out TWICE: once by `sched::exit`,
+// and again by `Thread::drop`, which compensates for threads that never started by looking at
+// exactly this flag. The process's live count could then underflow, and `start_thread` had the other
+// half of the same problem - with no `try_start` a second call enqueued one thread's intrusive link
+// onto the run queue twice, which corrupts it.
+//
+// Returns false when the thread was already started, so a repeat is a no-op rather than damage.
+fn start_and_enqueue(cpu: usize, thread: Arc<Thread>) -> bool {
+	if !thread.try_start() {
+		return false;
+	}
+	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` moves pointers - the link lives in
+	// the `Thread` - so this cannot allocate and cannot fail.
+	enqueue_on(cpu, thread);
+	true
+}
+
 pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
 	// A KERNEL thread. Nothing here has a caller that could carry a refusal back to
@@ -368,8 +389,7 @@ pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> 
 	// out-of-frames says so and stops. The userspace-reachable path is `thread_create`
 	// below, and that one returns None.
 	let thread = Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack");
-	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
-	enqueue_on(cpu, thread.clone());
+	start_and_enqueue(cpu, thread.clone());
 	if cpu != current_cpu_id() {
 		arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
 	}
@@ -396,8 +416,7 @@ pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObje
 
 // Release a prepared thread onto the run queue.
 pub fn start_thread(thread: &Arc<Thread>) {
-	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
-	enqueue_on(current_cpu_id(), thread.clone());
+	start_and_enqueue(current_cpu_id(), thread.clone());
 }
 
 // Create a kernel thread accounted to `domain` on the current core, enforcing the
@@ -406,8 +425,7 @@ pub fn start_thread(thread: &Arc<Thread>) {
 pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
 	let process = Process::new(kernel_as(), domain)?;
 	let thread = Thread::new_in(entry, arg, process)?;
-	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
-	enqueue_on(current_cpu_id(), thread.clone());
+	start_and_enqueue(current_cpu_id(), thread.clone());
 	Some(thread)
 }
 
@@ -422,8 +440,7 @@ pub fn process_create(domain: Arc<Domain>) -> Option<Arc<Process>> {
 // thread shares the process's address space and handle table with its siblings.
 pub fn thread_create(process: Arc<Process>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
 	let thread = Thread::new(entry, arg, process)?;
-	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
-	enqueue_on(current_cpu_id(), thread.clone());
+	start_and_enqueue(current_cpu_id(), thread.clone());
 	Some(thread)
 }
 
@@ -445,7 +462,11 @@ pub fn thread_start(thread: Arc<Thread>) -> bool {
 		return false;
 	}
 	thread.set_state(ThreadState::Ready);
-	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` above moves pointers - the link lives in the `Thread` - so this cannot allocate and cannot fail. The marker used to say "bounded by the Domain thread quota", which is the argument this file was rewritten to disprove: a bound is not a booking. The reason it is safe is the data structure, and saying so keeps the old argument from coming back.
+	// `try_start` was already claimed above, so this enqueues directly rather than through
+	// `start_and_enqueue` - which would refuse, the flag being set.
+	//
+	// ALLOC-OK: NOTHING IS ALLOCATED. The intrusive `RunQueue` moves pointers - the link lives in
+	// the `Thread` - so this cannot allocate and cannot fail.
 	enqueue_on(current_cpu_id(), thread);
 	true
 }
@@ -981,6 +1002,24 @@ pub fn on_timer_preempt(from_user: bool) {
 		// plain bool), and the lock guard drops at the end of the statement.
 		let killed = sched.inner.lock().current.as_ref().is_some_and(|t| t.process().is_killed());
 		if killed {
+			// ACCOUNTED OUT FIRST, the way `exit` does it.
+			//
+			// This retired the thread directly and never called `thread_exited`, so a thread killed
+			// here was never counted out: `Thread::drop` compensates only for a thread that never
+			// STARTED, and this one had. The process's live-thread count then stayed permanently
+			// high, "last thread exited" never became true, and its finaliser never ran - for every
+			// process killed while spinning in ring 3, which is exactly the case this kill point
+			// exists to catch.
+			//
+			// Scoped so the Arc is released before the retire: `reschedule(Retire)` does not return,
+			// and holding it would pin the thread and keep its slot from being refunded.
+			{
+				if let Some(thread) = current_thread() {
+					if thread.process().thread_exited() {
+						thread.process().mark_exited();
+					}
+				}
+			}
 			reschedule(Disposition::Retire);
 			// Retire switched away for good; this frame is never resumed.
 			arch::halt_loop();

@@ -59,6 +59,9 @@ pub fn init() {
 	let end = HEAP_START + HEAP_REGION;
 	while virt < end {
 		let phys = frame::allocate().expect("out of frames: kernel heap");
+		// ALLOC-OK: boot, before any process exists; a kernel that cannot map its own first heap
+		// region has nothing to degrade to, which is why this one keeps panicking and `grow` below
+		// does not.
 		paging::map_page(virt, phys, paging::WRITABLE | paging::NO_EXECUTE);
 		virt += PAGE_SIZE;
 	}
@@ -103,7 +106,21 @@ fn grow(heap: &mut Heap, at_least: usize) -> bool {
 				return false;
 			}
 		};
-		paging::map_page(virt, phys, paging::WRITABLE | paging::NO_EXECUTE);
+		// FALLIBLY. `map_page` panics when an intermediate page table cannot be allocated, and the
+		// only reason to be here at all is that memory is short - so the one path guaranteed to meet
+		// an empty frame pool was the one that could not survive it. `reserve_window` gives the heap
+		// window its TOP-LEVEL entries and says nothing about the levels below it, and on aarch64 it
+		// reserves nothing at all, so an intermediate allocation is a real possibility on every port.
+		//
+		// The leaf frame goes back before the unwind: it was allocated by this iteration and never
+		// reached a page table, so it returns to the allocator directly rather than through
+		// retirement, which is for frames a page table pointed at.
+		if paging::try_map_page(virt, phys, paging::WRITABLE | paging::NO_EXECUTE).is_err() {
+			// SAFETY: allocated by this iteration and never written into any page table.
+			unsafe { frame::deallocate(phys) };
+			unwind(base, virt, base + bytes);
+			return false;
+		}
 		virt += PAGE_SIZE;
 	}
 	unsafe { heap.add_free_region(base as usize, bytes as usize) };

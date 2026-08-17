@@ -120,16 +120,40 @@ impl MemoryObject {
 	}
 
 	// Record where a reserved mapping ended up.
-	pub fn commit_mapping(&self, cr3: u64, base: u64) {
+	//
+	// Matches the RESERVATION (base 0) rather than any entry for this `cr3`, so a commit can only
+	// ever fill in the slot this mapper booked - never overwrite a committed mapping's base. Returns
+	// whether the reservation was still there: it cannot be stolen by `remove_mapping` any more, but
+	// a caller that is told its reservation is gone must roll its page tables back rather than leave
+	// them behind unrecorded.
+	pub fn commit_mapping(&self, cr3: u64, base: u64) -> bool {
 		let mut mappings = self.mappings.lock();
-		if let Some(entry) = mappings.iter_mut().find(|(mapped_cr3, _)| *mapped_cr3 == cr3) {
-			entry.1 = base;
+		match mappings.iter_mut().find(|(mapped_cr3, mapped_base)| *mapped_cr3 == cr3 && *mapped_base == 0) {
+			Some(entry) => {
+				entry.1 = base;
+				true
+			}
+			None => false,
 		}
 	}
 
 	// Drop a reservation whose mapping never happened.
 	pub fn abandon_reservation(&self, cr3: u64) {
 		self.mappings.lock().retain(|(mapped_cr3, base)| !(*mapped_cr3 == cr3 && *base == 0));
+	}
+
+	// What is recorded for `cr3`, so a test can tell a reservation (`Some(0)`) from a committed
+	// mapping (`Some(base)`) from nothing at all. Returns a scalar rather than the list: cloning the
+	// list would be an allocation in a file the kernel-allocations gate scans, and the gate is right
+	// to refuse one whether or not this particular caller is a test.
+	#[cfg(test)]
+	pub fn mapping_for_test(&self, cr3: u64) -> Option<u64> {
+		self.mappings.lock().iter().find(|(mapped_cr3, _)| *mapped_cr3 == cr3).map(|(_, base)| *base)
+	}
+
+	#[cfg(test)]
+	pub fn mapping_count_for_test(&self) -> usize {
+		self.mappings.lock().len()
 	}
 
 	pub fn add_mapping(&self, cr3: u64, base: u64) {
@@ -141,16 +165,38 @@ impl MemoryObject {
 	// the virtual range goes back to a pool that lives inside it.
 	pub fn remove_mapping(&self, space: &crate::object::address_space::AddressSpace) -> bool {
 		let cr3 = space.cr3();
-		let base = {
-			let mut mappings = self.mappings.lock();
-			let Some(index) = mappings.iter().position(|(mapped_cr3, _)| *mapped_cr3 == cr3) else { return false };
-			mappings.swap_remove(index).1
-		};
+		let Some(base) = self.take_committed_mapping(cr3) else { return false };
 		for page in 0..self.frames.len() {
 			paging::unmap_page_in(cr3, base + page as u64 * PAGE_SIZE);
 		}
 		crate::syscall::free_vrange(Some(space), base, self.size as u64);
 		true
+	}
+
+	// The selection half of `remove_mapping`, separate so a test can exercise the rule without an
+	// address space to unmap from. Takes a COMMITTED mapping and never a reservation.
+	#[cfg_attr(not(test), doc(hidden))]
+	pub(crate) fn take_committed_mapping(&self, cr3: u64) -> Option<u64> {
+		let base = {
+			let mut mappings = self.mappings.lock();
+			// A COMMITTED MAPPING ONLY. This matched on `cr3` alone, so it also matched a RESERVATION
+			// - the `(cr3, 0)` a mapper records before it drops this lock to build the page tables.
+			//
+			// A sibling thread calling unmap in that window removed the reservation and then unmapped
+			// `0 + page * PAGE_SIZE`: the FIRST PAGES OF THE ADDRESS SPACE, which belong to whatever
+			// else is mapped low, not to this object. The original mapper then installed its real
+			// PTEs and found no reservation to commit into, so the mapping existed in the page tables
+			// and in no registry - teardown could not remove it, and the frames were retired while
+			// live translations still pointed at them. That is a use-after-free of physical memory
+			// reachable from two ring-3 threads of one process.
+			//
+			// Skipping the reservation makes unmap answer "not mapped", which is the truth at that
+			// instant: the mapping is not finished. The mapper commits normally afterwards and a
+			// later unmap removes it. `abandon_reservation` remains the only way a reservation goes.
+			let index = mappings.iter().position(|(mapped_cr3, base)| *mapped_cr3 == cr3 && *base != 0)?;
+			mappings.swap_remove(index).1
+		};
+		Some(base)
 	}
 }
 

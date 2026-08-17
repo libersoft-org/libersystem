@@ -765,3 +765,42 @@ fn the_committed_receive_refunds_what_it_takes() {
 	drop(taken);
 	assert_eq!(domain.account().ipc_queue().used(), before, "and refunded when it dies uncommitted");
 }
+
+crate::tagged_test!(an_unmap_cannot_steal_a_mapping_that_is_still_being_made, [Memory, Object, Kernel], id = "kernel.object.memory.an_unmap_cannot_steal_a_mapping_that_is_still_being_made", covers = ["kernel"]);
+fn an_unmap_cannot_steal_a_mapping_that_is_still_being_made() {
+	use crate::object::memory_object::MemoryObject;
+
+	// A mapper records `(cr3, 0)` - "being mapped, by someone" - drops the object lock, builds the
+	// page-table entries, and only then writes the real base. `remove_mapping` matched on `cr3`
+	// ALONE, so a sibling thread calling unmap inside that window took the reservation, unmapped
+	// `0 + page * PAGE_SIZE` (the first pages of the address space, belonging to whatever else is
+	// mapped low), and left the original mapper with nothing to commit into. Its real PTEs then
+	// existed in the page tables and in no registry at all: teardown could not find them, and the
+	// frames behind them were retired while live translations still pointed there.
+	//
+	// The window is a lock drop, not a schedule, so the property is checkable without racing
+	// anything: reserve, then ask what an unmap sees.
+	let object = MemoryObject::create(4096).expect("a one-page object");
+	const CR3: u64 = 0x1234_0000;
+
+	assert!(object.reserve_mapping(CR3), "the reservation is taken");
+	assert_eq!(object.mapping_for_test(CR3), Some(0), "a reservation is recorded as base 0");
+
+	// THE STEAL, attempted at exactly the moment it used to succeed. `take_committed_mapping` is
+	// the selection `remove_mapping` performs; running it directly exercises the rule without
+	// needing an address space to unmap pages from.
+	assert!(object.take_committed_mapping(CR3).is_none(), "an unmap must not claim a mapping that is not finished");
+	assert_eq!(object.mapping_for_test(CR3), Some(0), "and must leave the reservation standing");
+	assert_eq!(object.mapping_count_for_test(), 1, "nothing was removed");
+
+	// So the mapper still has its slot, and committing fills it in.
+	assert!(object.commit_mapping(CR3, 0x4000), "the reservation survived for its owner to commit");
+	assert_eq!(object.mapping_for_test(CR3), Some(0x4000), "the real base replaced the sentinel");
+
+	// A second commit finds no reservation - it must not overwrite a committed base.
+	assert!(!object.commit_mapping(CR3, 0x9000), "a commit with no reservation of its own reports failure");
+	assert_eq!(object.mapping_for_test(CR3), Some(0x4000), "and changes nothing");
+
+	// And now that it IS committed, an unmap finds it.
+	assert_eq!(object.take_committed_mapping(CR3), Some(0x4000), "a committed mapping is removable");
+}
