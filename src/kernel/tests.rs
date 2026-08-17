@@ -2828,6 +2828,10 @@ fn lay_gpt(disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, ca
 
 	let mut mbr = alloc::vec![0u8; SECTOR];
 	mbr[446 + 4] = 0xEE;
+	// STARTING AT LBA 1, which this fixture left at zero. A protective MBR exists so MBR-only
+	// software sees the whole disk as allocated, and `partition::probe` now requires that shape -
+	// an entry that does not begin where the GPT begins protects nothing. Every real one has it.
+	mbr[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
 	mbr[446 + 12..446 + 16].copy_from_slice(&u32::MAX.to_le_bytes());
 	mbr[510] = 0x55;
 	mbr[511] = 0xAA;

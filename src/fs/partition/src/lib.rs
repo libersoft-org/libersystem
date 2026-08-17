@@ -64,6 +64,8 @@ const HDR_SIGNATURE: usize = 0;
 const HDR_REVISION: usize = 8;
 const HDR_SIZE: usize = 12;
 const HDR_CRC: usize = 16;
+// Revision 1.0 reserves the four bytes between the header CRC and `MyLBA`. Zero, always.
+const HDR_RESERVED: usize = 20;
 const HDR_CURRENT_LBA: usize = 24;
 const HDR_BACKUP_LBA: usize = 32;
 const HDR_FIRST_USABLE: usize = 40;
@@ -82,6 +84,8 @@ const HDR_SIZE_MIN: usize = 92;
 
 // A partition entry's fixed offsets.
 const ENT_TYPE_GUID: usize = 0;
+// The partition's own identity, as opposed to its type. Two used entries may not share one.
+const ENT_UNIQUE_GUID: usize = 16;
 const ENT_FIRST_LBA: usize = 32;
 const ENT_LAST_LBA: usize = 40;
 
@@ -153,6 +157,12 @@ pub enum Disk {
 	// A GPT, verified end to end, that names no usable LiberFS partition. The disk belongs
 	// to something else.
 	GptWithoutLiberFs,
+	// A verified GPT naming MORE THAN ONE usable LiberFS partition, with nothing to choose between
+	// them. Not `LiberFs`, because this answer authorises a writable mount and the identity of what
+	// would be mounted is decided by entry order - which a partitioning tool or a clone may change
+	// without touching a byte of either filesystem. Selecting one needs a configured unique GUID or
+	// another boot policy; until there is one, the honest answer is that the disk is ambiguous.
+	AmbiguousLiberFs,
 	// An MBR partition table (or a protective MBR whose GPT did not verify - see
 	// `CorruptGpt` for the case where the signature was there). Not a blank disk.
 	MbrWithoutLiberFs,
@@ -195,12 +205,24 @@ pub fn probe(dev: &mut impl Sectors) -> Disk {
 		return Disk::Io;
 	}
 
-	let mbr = classify_mbr(&lba0);
+	let mbr = classify_mbr(&lba0, dev.capacity());
 	// A real hybrid is decided BEFORE the GPT is read. `classify_mbr` used to be computed here and
 	// then thrown away whenever LBA 1 carried a signature, so a disk with real MBR partitions AND a
 	// valid GPT was decided entirely by the GPT.
 	if mbr == Mbr::Partitioned && &lba1[HDR_SIGNATURE..HDR_SIGNATURE + 8] == b"EFI PART" {
 		return Disk::HybridMbrAndGpt;
+	}
+	// AND A GPT DISK MUST CARRY A PROTECTIVE MBR, which the primary path did not require at all: an
+	// `EFI PART` signature at LBA 1 was enough on its own, so a disk whose LBA 0 had been erased -
+	// or whose `0xEE` entry protects nothing - was reported as an ordinary, fully verified GPT. The
+	// protective MBR is the reason legacy tooling does not see a GPT disk as empty space, so its
+	// absence is exactly the state in which something else may already have written there.
+	//
+	// `CorruptGpt` rather than a softer answer, because this result authorises a WRITE: the caller
+	// mounts what `probe` names, and "the metadata is not the shape it must be" is the one thing
+	// that has to stop that.
+	if &lba1[HDR_SIGNATURE..HDR_SIGNATURE + 8] == b"EFI PART" && !matches!(mbr, Mbr::Protective) {
+		return Disk::CorruptGpt;
 	}
 	if &lba1[HDR_SIGNATURE..HDR_SIGNATURE + 8] == b"EFI PART" {
 		let counterpart = primary_counterpart(dev);
@@ -337,34 +359,59 @@ enum Mbr {
 	Protective,
 	// At least one entry naming a real partition.
 	Partitioned,
+	// A boot signature and a `0xEE` entry that is not a protective MBR: more than one of them, or
+	// one that does not start at LBA 1 and cover the disk. Distinct from `Absent` because "nothing
+	// claims this disk" and "something claims it and the claim is malformed" are different facts,
+	// and only the second is evidence of damage.
+	Malformed,
 }
 
 // Classify LBA 0's MBR partition table. A hybrid MBR (a protective 0xEE entry BESIDE real
 // ones) reads as `Partitioned`, which is the safe direction: it says a table is there.
-fn classify_mbr(lba0: &[u8]) -> Mbr {
+fn classify_mbr(lba0: &[u8], capacity: Option<u64>) -> Mbr {
 	if lba0[510] != 0x55 || lba0[511] != 0xAA {
 		return Mbr::Absent;
 	}
-	let mut protective = false;
+	let mut protective = 0usize;
+	let mut malformed_protective = false;
 	let mut real = false;
 	for i in 0..4 {
 		let e = &lba0[446 + i * 16..446 + (i + 1) * 16];
 		let kind = e[4];
+		let first = u32::from_le_bytes(e[8..12].try_into().unwrap());
 		let sectors = u32::from_le_bytes(e[12..16].try_into().unwrap());
 		// an empty slot is type 0 with no length; either alone is enough to skip it.
 		if kind == 0 || sectors == 0 {
 			continue;
 		}
 		if kind == 0xEE {
-			protective = true;
+			protective += 1;
+			// A PROTECTIVE ENTRY HAS A SHAPE, and `kind == 0xEE` was the whole of the test. UEFI
+			// fixes it: it starts at LBA 1 and spans the rest of the disk, which is what makes
+			// MBR-only software see the whole disk as taken - the one job it exists for. An entry at
+			// LBA 1234 spanning one sector protects nothing, and reading it as proof that a GPT is
+			// expected reads a damaged table as a healthy one.
+			//
+			// COVERAGE RATHER THAN AN EXACT LENGTH. The specification's value is `disk - 1` and the
+			// convention when that does not fit 32 bits is `0xFFFFFFFF`, but tools differ in the last
+			// sector and a reader that demanded one exact number would refuse disks that are
+			// perfectly protected. What has to hold is that nothing past the entry looks free.
+			let covers = sectors == u32::MAX || capacity.is_none_or(|c| u64::from(sectors) + 1 >= c);
+			if first != 1 || !covers {
+				malformed_protective = true;
+			}
 		} else {
 			real = true;
 		}
 	}
-	match (real, protective) {
-		(true, _) => Mbr::Partitioned,
-		(false, true) => Mbr::Protective,
-		(false, false) => Mbr::Absent,
+	match (real, protective, malformed_protective) {
+		(true, _, _) => Mbr::Partitioned,
+		// More than one `0xEE` entry, or one that does not cover the disk from LBA 1, is not a
+		// protective MBR. `Malformed` rather than `Absent`, because the difference matters to the
+		// caller: nothing claims the disk, versus something claims it and is wrong.
+		(false, 1, false) => Mbr::Protective,
+		(false, 0, _) => Mbr::Absent,
+		(false, _, _) => Mbr::Malformed,
 	}
 }
 
@@ -451,6 +498,21 @@ fn read_gpt(dev: &mut impl Sectors, header: &[u8], at: u64, counterpart: u64) ->
 	}
 	let header_size = u32::from_le_bytes(header[HDR_SIZE..HDR_SIZE + 4].try_into().ok().ok_or(Fault::Unusable)?) as usize;
 	if header_size < HDR_SIZE_MIN || header_size > SECTOR_SIZE {
+		return Err(Fault::Unusable);
+	}
+	// THE RESERVED FIELD IS RESERVED, and nothing looked at it. A producer may put anything in a
+	// field no reader checks, and then it is not reserved - it is a place to hide a byte that two
+	// tools disagree about. These are FORMAT invariants and not checksum ones: the CRC is computed
+	// over whatever is there, so a nonconforming value carries a perfectly correct checksum.
+	//
+	// Revision 1.0's reserved word sits between the header CRC and `MyLBA`, and everything from
+	// `HeaderSize` to the end of the logical block must be zero too - that tail is not covered by
+	// the CRC at all, so it is the one place a byte can differ between two readings of the same
+	// "verified" header.
+	if header[HDR_RESERVED..HDR_RESERVED + 4] != [0, 0, 0, 0] {
+		return Err(Fault::Unusable);
+	}
+	if header[header_size..].iter().any(|&b| b != 0) {
 		return Err(Fault::Unusable);
 	}
 	// the header's own CRC32, computed over `header_size` bytes with the CRC field zeroed.
@@ -649,17 +711,37 @@ fn find_liberfs(gpt: &Gpt, companion: Option<(u64, u64)>) -> Disk {
 	if table_is_inconsistent(gpt, companion) {
 		return Disk::CorruptGpt;
 	}
+	// EXACTLY ONE CANDIDATE, OR NONE OF THEM.
+	//
+	// This returned the FIRST structurally usable LiberFS entry it met, so which filesystem the
+	// system mounts - writable - was decided by array order. Two non-overlapping LiberFS partitions
+	// both pass the table-wide consistency pass; swapping their entries, which a partitioning tool
+	// or a disk clone may do for reasons of its own, silently changes which one is the system
+	// volume. There is no stable identity in that answer, and nothing reported the ambiguity.
+	//
+	// Refusing is the only safe answer available here: this rule has no configured unique GUID to
+	// select by, so it cannot know WHICH of two candidates was meant, and picking one would be
+	// guessing about a volume it is about to authorise writes to. `CorruptGpt` is the answer the
+	// caller already handles as "do not act on this table".
+	let mut found: Option<(u64, u64)> = None;
 	for e in gpt.entries.chunks_exact(gpt.entry_size) {
 		if e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] == UNUSED_TYPE_GUID || e[ENT_TYPE_GUID..ENT_TYPE_GUID + 16] != LIBERFS_TYPE_GUID {
 			continue;
 		}
 		let first = u64::from_le_bytes(e[ENT_FIRST_LBA..ENT_FIRST_LBA + 8].try_into().unwrap());
 		let last = u64::from_le_bytes(e[ENT_LAST_LBA..ENT_LAST_LBA + 8].try_into().unwrap());
-		if usable_span(gpt, companion, first, last) {
-			return Disk::LiberFs { first, last };
+		if !usable_span(gpt, companion, first, last) {
+			continue;
 		}
+		if found.is_some() {
+			return Disk::AmbiguousLiberFs;
+		}
+		found = Some((first, last));
 	}
-	Disk::GptWithoutLiberFs
+	match found {
+		Some((first, last)) => Disk::LiberFs { first, last },
+		None => Disk::GptWithoutLiberFs,
+	}
 }
 
 // Is every used entry of this table one this build is willing to act on, and do any two of them
@@ -721,9 +803,21 @@ fn table_is_inconsistent(gpt: &Gpt, companion: Option<(u64, u64)>) -> bool {
 	}
 	for (index, a) in gpt.entries.chunks_exact(gpt.entry_size).enumerate().filter(|(_, e)| used(e)) {
 		let (a_first, a_last) = span(a);
+		// A UNIQUE PARTITION GUID THAT IS NOT UNIQUE. The field's whole purpose is to name one
+		// partition across tools, reboots and clones, and nothing compared them - so a table could
+		// carry two partitions with one identity and every consumer that selects by GUID would pick
+		// whichever it met first. Same class as the ambiguity `find_liberfs` now refuses, one field
+		// lower down: an identifier that identifies two things is not an identifier.
+		//
+		// All-zero is exempt, because an unused slot is already excluded by `used` and a zero GUID
+		// in a used entry is a table that never assigned one rather than two that collide.
+		let a_guid = &a[ENT_UNIQUE_GUID..ENT_UNIQUE_GUID + 16];
 		for b in gpt.entries.chunks_exact(gpt.entry_size).skip(index + 1).filter(|e| used(e)) {
 			let (b_first, b_last) = span(b);
 			if a_first <= b_last && b_first <= a_last {
+				return true;
+			}
+			if a_guid != UNUSED_TYPE_GUID && a_guid == &b[ENT_UNIQUE_GUID..ENT_UNIQUE_GUID + 16] {
 				return true;
 			}
 		}

@@ -69,10 +69,13 @@ struct Entry {
 	guid: [u8; 16],
 	first: u64,
 	last: u64,
+	// The partition's own identity. `None` means "derive a distinct one from the slot index", which
+	// is what a real table has; `Some` is how a test expresses TWO entries claiming one identity.
+	unique: Option<u64>,
 }
 
 fn liberfs_entry(first: u64, last: u64) -> Entry {
-	Entry { guid: LIBERFS_TYPE_GUID, first, last }
+	Entry { guid: LIBERFS_TYPE_GUID, first, last, unique: None }
 }
 
 // A disk carrying a protective MBR and a complete, correctly checksummed GPT (primary and
@@ -89,6 +92,11 @@ fn gpt_disk(entries: &[Entry]) -> Image {
 fn protective_mbr() -> [u8; SECTOR_SIZE] {
 	let mut mbr = [0u8; SECTOR_SIZE];
 	mbr[446 + 4] = 0xEE;
+	// STARTING AT LBA 1, which this fixture left at zero. A protective MBR exists so MBR-only
+	// software sees the whole disk as allocated, and an entry that does not begin where the GPT
+	// begins does not do that - `classify_mbr` now requires the shape, so the fixture has to have
+	// it. Every real one does: `SGDISK_MBR` below carries `first = 1` in its own bytes.
+	mbr[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
 	mbr[446 + 12..446 + 16].copy_from_slice(&u32::MAX.to_le_bytes());
 	mbr[510] = 0x55;
 	mbr[511] = 0xAA;
@@ -133,8 +141,9 @@ fn entry_array(layout: &Layout, entries: &[Entry]) -> Vec<u8> {
 			continue;
 		}
 		array[off..off + 16].copy_from_slice(&e.guid);
-		// a unique partition GUID; nothing reads it, but a real table has one.
-		array[off + 16..off + 24].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+		// The unique partition GUID. Distinct per slot by default, because that is what a real table
+		// carries and `table_is_inconsistent` now refuses two used entries that share one.
+		array[off + 16..off + 24].copy_from_slice(&e.unique.unwrap_or(i as u64 + 1).to_le_bytes());
 		array[off + 32..off + 40].copy_from_slice(&e.first.to_le_bytes());
 		array[off + 40..off + 48].copy_from_slice(&e.last.to_le_bytes());
 	}
@@ -375,7 +384,7 @@ fn a_foreign_entry_that_could_not_have_been_written_condemns_the_whole_table() {
 	// So a checksum-valid table with a perfectly good LiberFS partition AND a foreign entry sitting
 	// on the GPT header, overlapping nothing else, answered `LiberFs` and authorised a write. The
 	// foreign entry is not this build's business to interpret; that a writer produced it at all is.
-	let foreign = |first: u64, last: u64| Entry { guid: [0x28; 16], first, last };
+	let foreign = |first: u64, last: u64| Entry { guid: [0x28; 16], first, last, unique: None };
 
 	let mut img = gpt_disk(&[liberfs_entry(4096, 30_000), foreign(1, 1)]);
 	assert_eq!(probe(&mut img), Disk::CorruptGpt, "a foreign entry on top of the primary header condemns the table");
@@ -430,7 +439,7 @@ fn a_degenerate_span_is_skipped_and_the_real_one_still_found() {
 	// _whole_table`. Too-small is the one degeneracy that stays skippable, because it is not
 	// impossible: `MIN_PARTITION_SECTORS` is this build's floor for holding a VOLUME, and a small
 	// partition is a perfectly ordinary thing for another system to have made.
-	let mut img = gpt_disk(&[liberfs_entry(2048, 2055), Entry { guid: [0; 16], first: 0, last: 0 }, liberfs_entry(4096, 40959)]);
+	let mut img = gpt_disk(&[liberfs_entry(2048, 2055), Entry { guid: [0; 16], first: 0, last: 0, unique: None }, liberfs_entry(4096, 40959)]);
 	assert_eq!(probe(&mut img), Disk::LiberFs { first: 4096, last: 40959 });
 
 	// and the inverted one on its own, so the change in answer is stated rather than implied.
@@ -440,7 +449,7 @@ fn a_degenerate_span_is_skipped_and_the_real_one_still_found() {
 
 #[test]
 fn a_gpt_that_names_no_liberfs_partition_belongs_to_somebody_else() {
-	let mut img = gpt_disk(&[Entry { guid: [0x28; 16], first: 2048, last: 40959 }]);
+	let mut img = gpt_disk(&[Entry { guid: [0x28; 16], first: 2048, last: 40959, unique: None }]);
 	assert_eq!(probe(&mut img), Disk::GptWithoutLiberFs);
 }
 
@@ -851,12 +860,12 @@ fn a_table_whose_partitions_overlap_is_not_a_table_to_act_on() {
 	// 10000..40000. Every check this build made was about the LiberFS entry alone - the usable
 	// range, both copies of the metadata, a minimum size - and none of them looks at the other
 	// partitions. Formatting the LiberFS span would have destroyed half the Linux one.
-	let linux = Entry { guid: [0x28; 16], first: 2048, last: 30_000 };
+	let linux = Entry { guid: [0x28; 16], first: 2048, last: 30_000, unique: None };
 	let mut img = gpt_disk(&[linux, liberfs_entry(10_000, 40_959)]);
 	assert_eq!(probe(&mut img), Disk::CorruptGpt, "partitions that claim the same sectors describe a disk that cannot exist");
 
 	// and the ordinary table, where they do not overlap, is still found.
-	let linux = Entry { guid: [0x28; 16], first: 2048, last: 9_999 };
+	let linux = Entry { guid: [0x28; 16], first: 2048, last: 9_999, unique: None };
 	let mut img = gpt_disk(&[linux, liberfs_entry(10_000, 40_959)]);
 	assert_eq!(probe(&mut img), Disk::LiberFs { first: 10_000, last: 40_959 });
 }
@@ -992,4 +1001,96 @@ fn a_partition_reaching_over_the_other_copys_entry_array_is_refused() {
 	// above are about the overlap and not about the partition or the layout.
 	let mut ok = gpt_disk(&[liberfs_entry(FIRST_USABLE, LAST_USABLE)]);
 	assert_eq!(probe(&mut ok), Disk::LiberFs { first: FIRST_USABLE, last: LAST_USABLE }, "a partition inside the usable range is still found");
+}
+
+#[test]
+fn two_liberfs_partitions_are_an_ambiguity_rather_than_a_race_between_them() {
+	// WHICH FILESYSTEM IS MOUNTED WRITABLE WAS DECIDED BY ARRAY ORDER. `find_liberfs` returned the
+	// first structurally usable entry it met, and the table-wide consistency pass admits two
+	// non-overlapping LiberFS partitions - so swapping the entries, which a partitioning tool or a
+	// disk clone may do for its own reasons, silently changes which volume is the system volume.
+	// Nothing reported the ambiguity, and the answer authorises a write.
+	let first_then_second = gpt_disk(&[liberfs_entry(2048, 20479), liberfs_entry(20480, 40959)]);
+	let second_then_first = gpt_disk(&[liberfs_entry(20480, 40959), liberfs_entry(2048, 20479)]);
+
+	let (mut a, mut b) = (first_then_second, second_then_first);
+	assert_eq!(probe(&mut a), Disk::AmbiguousLiberFs, "two candidates and nothing to choose between them");
+	assert_eq!(probe(&mut b), Disk::AmbiguousLiberFs, "and the answer does not depend on which came first");
+	assert_eq!(probe(&mut a), probe(&mut b), "the two orders agree, which is the whole property");
+
+	// ONE candidate is still found, so the refusal is about ambiguity and not about counting.
+	let mut single = gpt_disk(&[liberfs_entry(2048, 40959)]);
+	assert_eq!(probe(&mut single), Disk::LiberFs { first: 2048, last: 40959 });
+}
+
+#[test]
+fn a_gpt_without_a_well_formed_protective_mbr_is_not_an_ordinary_gpt() {
+	// The primary path entered on the `EFI PART` signature alone, so LBA 0 was never required to
+	// hold anything at all. The protective MBR is the reason MBR-only software does not see a GPT
+	// disk as free space, so its absence is exactly the state in which something else may already
+	// have written there - and this result authorises a writable mount.
+	let good = gpt_disk(&[liberfs_entry(2048, 40959)]);
+
+	// LBA 0 erased entirely: a GPT header with nothing protecting it.
+	let mut erased = gpt_disk(&[liberfs_entry(2048, 40959)]);
+	erased.edit(0, |s| s.fill(0));
+	assert_eq!(probe(&mut erased), Disk::CorruptGpt, "no protective MBR at all");
+
+	// The signature is there and the entry is not: a boot record claiming nothing.
+	let mut empty_table = gpt_disk(&[liberfs_entry(2048, 40959)]);
+	empty_table.edit(0, |s| s[446..446 + 16].fill(0));
+	assert_eq!(probe(&mut empty_table), Disk::CorruptGpt, "a boot signature with no entry protects nothing");
+
+	// AND THE SHAPE OF THE ENTRY, which `kind == 0xEE` alone never checked: an entry at LBA 1234
+	// spanning one sector is type 0xEE and protects nothing.
+	let mut misplaced = gpt_disk(&[liberfs_entry(2048, 40959)]);
+	misplaced.edit(0, |s| {
+		s[446 + 8..446 + 12].copy_from_slice(&1234u32.to_le_bytes());
+		s[446 + 12..446 + 16].copy_from_slice(&1u32.to_le_bytes());
+	});
+	assert_eq!(probe(&mut misplaced), Disk::CorruptGpt, "a 0xEE entry that does not start at LBA 1 and cover the disk");
+
+	// And the good disk is still good, so this is a shape check and not a refusal of GPT.
+	let mut ok = good;
+	assert_eq!(probe(&mut ok), Disk::LiberFs { first: 2048, last: 40959 });
+}
+
+#[test]
+fn reserved_fields_and_duplicate_partition_identities_are_format_errors() {
+	// FORMAT INVARIANTS, NOT CHECKSUM ONES, which is why a CRC cannot stand in for them: the header
+	// CRC is computed over whatever is there, so a nonconforming value carries a perfectly correct
+	// checksum. A field no reader checks is a field a producer may put anything in - and then it is
+	// not reserved, it is a place for two tools to disagree.
+	//
+	// THE TAIL PAST `HeaderSize` IS NOT COVERED BY THE CRC AT ALL, so it is the one place a byte can
+	// differ between two readings of the same "verified" header.
+	// `primary_only`, so the case under test is the only thing that decides: on a disk WITH a backup
+	// a damaged primary is recovered from it, which is correct and would hide this.
+	let mut tail = primary_only(Layout::primary(), &[liberfs_entry(2048, 40959)]);
+	assert_eq!(probe(&mut tail), Disk::LiberFs { first: 2048, last: 40959 }, "the undamaged primary-only disk reads");
+	let mut tail = primary_only(Layout::primary(), &[liberfs_entry(2048, 40959)]);
+	tail.edit(1, |s| s[100] = 0x01);
+	assert_ne!(probe(&mut tail), Disk::LiberFs { first: 2048, last: 40959 }, "a nonzero byte between HeaderSize and the end of the block is not an ordinary header");
+
+	// The reserved word, with its CRC recomputed over the change so the refusal is about the FIELD
+	// and not about the checksum.
+	let mut reserved = primary_only(Layout::primary(), &[liberfs_entry(2048, 40959)]);
+	reserved.edit(1, |s| {
+		s[20..24].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+		s[16..20].fill(0);
+		let crc = crc32(&s[..92]);
+		s[16..20].copy_from_slice(&crc.to_le_bytes());
+	});
+	assert_ne!(probe(&mut reserved), Disk::LiberFs { first: 2048, last: 40959 }, "a nonzero reserved word, checksummed correctly, is still not a header this build acts on");
+
+	// AND AN IDENTITY THAT IDENTIFIES TWO THINGS. Nothing compared unique partition GUIDs, so a
+	// table could carry two partitions with one identity and every consumer selecting by GUID would
+	// take whichever it met first - the same ambiguity `find_liberfs` refuses, one field lower.
+	let mut twins = gpt_disk(&[Entry { guid: LIBERFS_TYPE_GUID, first: 2048, last: 20479, unique: Some(0x7777) }, Entry { guid: [0x11; 16], first: 20480, last: 40959, unique: Some(0x7777) }]);
+	assert_eq!(probe(&mut twins), Disk::CorruptGpt, "two used entries sharing one unique GUID");
+
+	// And the same two with distinct identities are an ordinary table, so this refuses collisions
+	// rather than refusing a second partition.
+	let mut distinct = gpt_disk(&[Entry { guid: LIBERFS_TYPE_GUID, first: 2048, last: 20479, unique: Some(0x7777) }, Entry { guid: [0x11; 16], first: 20480, last: 40959, unique: Some(0x8888) }]);
+	assert_eq!(probe(&mut distinct), Disk::LiberFs { first: 2048, last: 20479 });
 }

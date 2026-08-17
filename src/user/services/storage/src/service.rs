@@ -3452,6 +3452,15 @@ unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockD
 			}
 			return None;
 		}
+		// TWO CANDIDATES AND NOTHING TO CHOOSE BETWEEN THEM. Mounting either would be mounting
+		// whichever the entry order happens to name first, which a partitioning tool or a clone can
+		// change without touching either filesystem - and this mount is writable.
+		partition::Disk::AmbiguousLiberFs => {
+			unsafe {
+				print(b"storage: vol://system NOT mounted: the disk names MORE THAN ONE LiberFS partition and nothing says which is the system volume. Nothing was changed - remove or retype the one that is not\n");
+			}
+			return None;
+		}
 		partition::Disk::MbrWithoutLiberFs => {
 			unsafe {
 				print(b"storage: vol://system NOT mounted: the disk carries an MBR partition table. Nothing was changed - its partitions are still there; repartition it deliberately if that is what you want\n");
