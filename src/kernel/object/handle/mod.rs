@@ -500,6 +500,20 @@ impl HandleTable {
 		Ok(self.live_cap_of(handle)?.badge)
 	}
 
+	// The object AND its badge, from ONE look at the table.
+	//
+	// A send resolved the object under one lock and then took the badge under another. A sibling
+	// thread closing or transferring the handle in between left the send authorized - the `Arc` was
+	// already retained - while the second lookup failed and the caller's `unwrap_or(0)` stamped the
+	// message with badge ZERO. A legitimate operation was then attributed to the wrong authority,
+	// which is what server-side routing and audit policy are built on.
+	pub fn lookup_typed_with_badge(&self, handle: Handle, kind: ObjectType, rights: Rights) -> Result<(Arc<dyn KernelObject>, u64), HandleError> {
+		let object = self.lookup_typed(handle, kind, rights)?;
+		// Cannot fail: `lookup_typed` just proved this handle live, under this same borrow.
+		let badge = self.live_cap_of(handle)?.badge;
+		Ok((object, badge))
+	}
+
 	// Introspect a handle: the identity, type, rights, and badge behind it. Like
 	// rights_of/badge_of this is a get_info-style query; it underlies the
 	// object_info_get syscall. Returns None for a bad or stale handle.

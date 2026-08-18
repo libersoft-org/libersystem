@@ -458,7 +458,11 @@ pub fn thread_create_suspended(process: Arc<Process>, entry: extern "C" fn(u64),
 // once. Returns false if the thread was already started, so a repeated call is a
 // safe no-op rather than a double-enqueue.
 pub fn thread_start(thread: Arc<Thread>) -> bool {
-	if !thread.try_start() {
+	// THROUGH THE PROCESS, so the check and the claim are one operation. A bare `try_start` answers
+	// "has this thread been started before" and says nothing about whether its process is still
+	// alive; `claim_thread_start` takes the same lock teardown publishes under, so a termination
+	// cannot complete between the two.
+	if !thread.process().claim_thread_start(&thread) {
 		return false;
 	}
 	thread.set_state(ThreadState::Ready);
@@ -1083,6 +1087,29 @@ pub fn on_timer_preempt(from_user: bool) {
 			reschedule(Disposition::Retire);
 			// Retire switched away for good; this frame is never resumed.
 			arch::halt_loop();
+		}
+		// SIG_STOP ENFORCED HERE TOO, for the same reason the kill is.
+		//
+		// Stop delivery set the flag and woke blocked threads, and the only places that consulted it
+		// were the blocking wait paths - so a CPU-bound user loop, or one issuing nothing but
+		// non-waiting syscalls, ran on after `SIG_STOP` for as long as it liked. This is the point a
+		// never-syscalling loop cannot dodge, and `from_user` means it holds no kernel locks.
+		//
+		// Parked on the process's own koid, which is exactly what `SIG_CONT` wakes.
+		let stopped = sched.inner.lock().current.as_ref().is_some_and(|t| t.process().is_stopped());
+		if stopped {
+			let parked = current_thread().map(|t| (t.process().clone(), t.process().header().koid()));
+			if let Some((process, koid)) = parked {
+				// The Arc is released before the park: `block_on_flagged` does not return until the
+				// thread is woken, and holding it would pin the process for that whole time.
+				let ready = {
+					let process = process.clone();
+					move || !process.is_stopped()
+				};
+				drop(process);
+				block_on_flagged(koid, NO_DEADLINE, false, ready);
+			}
+			return;
 		}
 	}
 	{

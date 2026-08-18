@@ -527,9 +527,32 @@ impl Process {
 	// when memory has already run out. The clone bought nothing: `record_member` takes the GROUP's
 	// lock, never this one, so there is no re-entry to avoid.
 	fn record_in_groups(&self) {
-		let groups = self.groups.lock();
-		for group in groups.iter().filter_map(alloc::sync::Weak::upgrade) {
-			group.record_member(self);
+		// The koids to wake, taken while the list is locked and woken after it is not.
+		//
+		// `notify_member_terminated` existed and NOTHING called it. A direct `wait` on a group works
+		// because it registers on the individual processes; a WaitSet records and blocks on the
+		// GROUP's koid alone, so a member reaching a terminal state changed the group's readiness
+		// and woke nobody. With no deadline that set sleeps for ever while being ready - which is
+		// the one failure a wait primitive may not have.
+		//
+		// A fixed array rather than a Vec: this runs on the terminal path, where an allocation is the
+		// last thing wanted, and a process cannot be in more groups than a group can hold members.
+		let mut koids: [u64; crate::object::process_group::MAX_GROUP_MEMBERS] = [0; crate::object::process_group::MAX_GROUP_MEMBERS];
+		let mut count = 0usize;
+		{
+			let groups = self.groups.lock();
+			for group in groups.iter().filter_map(alloc::sync::Weak::upgrade) {
+				group.record_member(self);
+				if count < koids.len() {
+					koids[count] = group.header().koid();
+					count += 1;
+				}
+			}
+		}
+		// Outside the lock: waking takes scheduler locks, and the ordering between those and this
+		// one is not a thing to discover on a teardown path.
+		for &koid in &koids[..count] {
+			crate::sched::wake_object(koid);
 		}
 	}
 
@@ -554,6 +577,24 @@ impl Process {
 	// Dead` with a guard every resource-extending syscall holds - is still worth having; what is
 	// closed here is the one path that demonstrably ends with a live thread inside a dead process.
 	#[must_use]
+	// Claim the right to START `thread`, atomically against teardown.
+	//
+	// `sys_thread_start` read `is_terminating()` and then enqueued in a separate step, so a
+	// termination could begin AND FINISH in between - the thread then entered a process whose
+	// handles were closed and whose mappings were gone. `begin_teardown` publishes the flag under
+	// this same `threads` lock, so checking and claiming under it is what makes the two ordered
+	// rather than merely adjacent.
+	//
+	// Returns false when the process is tearing down or the thread was already started; the caller
+	// enqueues only on true, and the enqueue happens outside this lock.
+	pub fn claim_thread_start(&self, thread: &Arc<Thread>) -> bool {
+		let _threads = self.threads.lock();
+		if self.terminating.load(Ordering::Acquire) {
+			return false;
+		}
+		thread.try_start()
+	}
+
 	fn register_thread(&self, thread: &Arc<Thread>) -> bool {
 		let mut threads = self.threads.lock();
 		if self.terminating.load(Ordering::Acquire) {

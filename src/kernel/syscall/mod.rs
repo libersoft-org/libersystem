@@ -743,16 +743,26 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64, privilege: u64) -> i64 {
 	if buf_len < size || !user_buf_ok(buf_ptr, size) {
 		return ERR_INVALID;
 	}
-	if crate::console::is_disabled() {
+	// CLAIMED HERE, not checked here. `is_disabled()` followed by `disable()` at the very end left
+	// the whole mapping between the check and the act, so two privileged callers could both pass and
+	// both be handed the display. Every failure below releases the claim, because a caller that took
+	// it and then could not finish must not leave the console dark and the display unowned.
+	if !crate::console::try_claim() {
 		return ERR_INVALID;
 	}
 	let (addr, geom) = match crate::framebuffer_geometry() {
 		Some(t) => t,
-		None => return ERR_INVALID,
+		None => {
+			crate::console::release_claim();
+			return ERR_INVALID;
+		}
 	};
 	let base_phys = match arch::paging::translate(addr) {
 		Some(p) => p,
-		None => return ERR_INVALID,
+		None => {
+			crate::console::release_claim();
+			return ERR_INVALID;
+		}
 	};
 	let total = geom.height as u64 * geom.pitch as u64;
 	let pages = total.div_ceil(PAGE_SIZE);
@@ -761,6 +771,7 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64, privilege: u64) -> i64 {
 	let space = caller_address_space(user, &thread);
 	let base = alloc_vrange_in(&space, user, total);
 	if base == 0 {
+		crate::console::release_claim();
 		return ERR_NO_MEMORY;
 	}
 	let mut flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::NO_EXECUTE;
@@ -769,6 +780,7 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64, privilege: u64) -> i64 {
 	}
 	if !map_pages_or_rollback(base, pages as usize, flags, |i| base_phys + i as u64 * PAGE_SIZE) {
 		free_vrange(Some(&space), base, total);
+		crate::console::release_claim();
 		return ERR_NO_MEMORY;
 	}
 	if let Err(e) = write_user(buf_ptr, geom) {
@@ -779,10 +791,11 @@ fn sys_framebuffer_map(buf_ptr: u64, buf_len: u64, privilege: u64) -> i64 {
 			arch::paging::unmap_page(base + i * PAGE_SIZE);
 		}
 		free_vrange(Some(&space), base, total);
+		crate::console::release_claim();
 		return e;
 	}
-	// Hand the display to the caller: the kernel console stops drawing to it.
-	crate::console::disable();
+	// The display is already claimed - `try_claim` above took it - so the console has stopped
+	// drawing and there is nothing left to do but answer.
 	base as i64
 }
 
@@ -2064,16 +2077,18 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let thread = current_thread!();
-	let object = {
+	// ONE LOOK for the authority and the badge alike. Two lookups let a sibling thread close the
+	// handle in between: the send stayed authorized through the retained `Arc` while the badge fell
+	// back to zero, attributing a valid message to the wrong authority.
+	let (object, badge) = {
 		let table = thread.handles().lock();
-		match table.lookup_typed(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
-			Ok(o) => o,
+		match table.lookup_typed_with_badge(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
+			Ok(pair) => pair,
 			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
 			Err(_) => return ERR_BAD_HANDLE,
 		}
 	};
 	let channel = object.as_any().downcast_ref::<Channel>().expect("type checked by lookup_typed");
-	let badge = thread.handles().lock().badge_of(Handle::from_raw(ch)).unwrap_or(0);
 	if !user_buf_ok(bytes_ptr, bytes_len) {
 		return ERR_INVALID;
 	}
@@ -2193,10 +2208,16 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 		*slot = read_user::<u64>(caps_ptr + ((index + 1) * 8) as u64);
 	}
 
-	let channel = match current_typed::<Channel>(ch, ObjectType::Channel, Rights::SEND) {
-		Ok(c) => c,
-		Err(e) => return e,
+	// ONE LOOK for the authority and the badge - see `sys_channel_send` for why two was a defect.
+	let (object, badge) = {
+		let table = thread.handles().lock();
+		match table.lookup_typed_with_badge(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
+			Ok(pair) => pair,
+			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+			Err(_) => return ERR_BAD_HANDLE,
+		}
 	};
+	let channel: Arc<Channel> = object.into_any_arc().downcast::<Channel>().ok().expect("type checked by lookup_typed");
 	let Some(mut bytes) = try_zeroed_bytes(bytes_len as usize) else {
 		return ERR_NO_MEMORY;
 	};
@@ -2204,7 +2225,6 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 	if let Err(error) = copy_from_user_exact(bytes.as_mut_ptr(), bytes_ptr, bytes_len as usize) {
 		return error;
 	}
-	let badge = thread.handles().lock().badge_of(Handle::from_raw(ch)).unwrap_or(0);
 
 	if has_repeat(&raw[..count]) {
 		return ERR_INVALID;

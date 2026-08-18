@@ -167,11 +167,26 @@ pub fn boot_log_text() -> Option<Vec<u8>> {
 // kept so boot_log_text can still read it. Called by the framebuffer_map syscall
 // when ConsoleService maps the display.
 pub fn disable() {
-	DISABLED.store(true, Ordering::Relaxed);
+	DISABLED.store(true, Ordering::Release);
+}
+
+// CLAIM the display, once. Returns true to exactly one caller.
+//
+// `is_disabled()` then `disable()` is a check followed by an act with the whole mapping between
+// them, so two privileged callers could both pass the check and both be handed the framebuffer -
+// concurrent writers on a resource whose entire contract is that there is one owner. The atomic was
+// there; it was being read rather than used to decide.
+pub fn try_claim() -> bool {
+	DISABLED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+// Give the claim back, for a caller that took it and then could not complete the mapping.
+pub fn release_claim() {
+	DISABLED.store(false, Ordering::Release);
 }
 
 // Whether the framebuffer has been handed to userspace (so a second framebuffer_map
 // is refused - the first mapper owns the display).
 pub fn is_disabled() -> bool {
-	DISABLED.load(Ordering::Relaxed)
+	DISABLED.load(Ordering::Acquire)
 }

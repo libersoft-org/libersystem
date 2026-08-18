@@ -534,7 +534,17 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: 
 	for attempt in 0..=max_restarts {
 		let koid = spawn();
 		sched::run_until_idle();
-		if koid == 0 || !crash_seen(crash_rx, koid) {
+		// A KOID OF ZERO IS A SPAWN THAT DID NOT HAPPEN, not a process that behaved.
+		//
+		// This read `koid == 0 || !crash_seen(..)` and returned true for both, so the one gate the
+		// recovery ladder has reported SUCCESS when nothing had been started - and the boot then
+		// carried on as though userspace were up. A failed spawn is a failed attempt: retry it like
+		// a crash, and let the ladder run out if it keeps failing.
+		if koid == 0 {
+			serial_println!("recovery: SystemManager did not start (attempt {} of {})", attempt + 1, max_restarts + 1);
+			continue;
+		}
+		if !crash_seen(crash_rx, koid) {
 			return true;
 		}
 		serial_println!("recovery: SystemManager (koid {}) faulted - starting a recovery SystemManager (attempt {} of {})", koid, attempt + 1, max_restarts + 1);

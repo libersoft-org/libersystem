@@ -57,6 +57,16 @@ struct UserEntry {
 extern "C" fn user_process_trampoline(ctx: u64) {
 	let boxed = unsafe { Box::from_raw(ctx as *mut UserEntry) };
 	let UserEntry { entry, stack_top, bootstrap } = *boxed;
+	// THE LAST GATE BEFORE RING 3. A thread can be enqueued and then have its process killed before
+	// it is ever scheduled, and every other kill point is a SCHEDULING point - which this thread has
+	// not reached yet. Entering here would run user code in an address space whose mappings and
+	// handles have already been torn down. Returning instead reaps the thread the ordinary way.
+	if let Some(thread) = crate::sched::current_thread() {
+		let process = thread.process();
+		if process.is_terminating() || process.is_killed() {
+			return;
+		}
+	}
 	unsafe {
 		arch::usermode::enter(entry, stack_top, bootstrap);
 	}
