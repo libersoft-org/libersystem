@@ -247,8 +247,16 @@ impl Process {
 	// allocation on a path ring 3 reaches by touching a guard page. This asks the allocator instead:
 	// false means the frame was not adopted and the caller still owns it.
 	pub fn try_adopt_frame(&self, frame: u64) -> bool {
+		// CHARGED TO THE DOMAIN, because this frame is physical memory the process holds. The
+		// account's own documentation said it counted "physical memory held" while the only
+		// production charge was `MemoryObject::create_in` - so a process's image and its
+		// fault-grown stack pages were outside the limit that claims to bound them.
+		if !self.domain.try_charge_memory(crate::mem::frame::PAGE_SIZE) {
+			return false;
+		}
 		let mut frames = self.user_frames.lock();
 		if frames.try_reserve(1).is_err() {
+			self.domain.uncharge_memory(crate::mem::frame::PAGE_SIZE);
 			return false;
 		}
 		frames.push(frame);
@@ -279,7 +287,18 @@ impl Process {
 		if self.user_frames.lock().try_reserve(frames).is_err() {
 			return false;
 		}
-		self.shared_image_pages.lock().try_reserve(pages).is_ok()
+		if self.shared_image_pages.lock().try_reserve(pages).is_err() {
+			return false;
+		}
+		// The DOMAIN's booking, taken here for the same reason the vector's is: while the load can
+		// still be unwound. A caller that reserves and then fails before `adopt_frames` must call
+		// `release_adopt_charge`; `load_module_into` is the one that can.
+		self.domain.try_charge_memory(frames as u64 * crate::mem::frame::PAGE_SIZE)
+	}
+
+	// Give back a booking whose adoption never happened.
+	pub fn release_adopt_charge(&self, frames: usize) {
+		self.domain.uncharge_memory(frames as u64 * crate::mem::frame::PAGE_SIZE);
 	}
 
 	pub fn adopt_frames(&self, frames: Vec<u64>) {
@@ -900,6 +919,11 @@ impl Drop for Process {
 		// Release the leaf data frames backing the user image and stack. The address
 		// space, dropped alongside, reclaims only the page-table structure.
 		let frames = core::mem::take(&mut *self.user_frames.lock());
+		// The image and fault-grown pages go back to the Domain's account, matching the charges
+		// `reserve_adopt` and `try_adopt_frame` took.
+		if !frames.is_empty() {
+			self.domain.uncharge_memory(frames.len() as u64 * crate::mem::frame::PAGE_SIZE);
+		}
 		// Every core that ever ran a thread of this process may still hold translations for these,
 		// so they go back to the allocator only once nobody does - which `retire` is what decides.
 		//

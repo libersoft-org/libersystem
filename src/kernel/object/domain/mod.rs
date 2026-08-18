@@ -5,6 +5,23 @@
 // ResourceAccount that counts and caps the kernel resources the MVP enforces:
 // physical memory held, live handles, and live threads.
 //
+// WHAT `memory` ACTUALLY BOUNDS, stated because it used to claim more than it did. Charged against
+// it: MemoryObject bytes, a process's image frames, and the pages a growing stack faults in - the
+// frame classes a process holds and can grow. NOT charged against it, deliberately and separately:
+//
+//   - kernel stacks, which have their own `stack` counter and their own ceiling, because the policy
+//     that bounds them (PROP_STACK_LIMIT) is a different policy;
+//   - page tables, whose size is a function of the address space the classes above already bound,
+//     so charging them would be counting the same thing twice at a worse resolution;
+//   - ELF shared pages, because a page shared by four processes has no correct single owner and an
+//     attribution rule is a design decision this account does not yet make. The sharing is bounded
+//     by MAX_SHARED_CACHE_KEYS instead.
+//
+// The first of those is a real limit elsewhere; the last is a stated gap rather than an oversight.
+// Before this, `memory` had exactly ONE production charge - `MemoryObject::create_in` - while the
+// comment above said "physical memory held", so a process's whole image sat outside the limit whose
+// name implied it was inside.
+//
 // Enforcement is at the boundary: the operation that creates a resource
 // (*_create, memory_map) atomically charges the account, and either succeeds with
 // the resource counted or fails with a typed error - never half-allocated. The

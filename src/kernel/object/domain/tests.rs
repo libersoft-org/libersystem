@@ -85,3 +85,40 @@ fn domain_quota_enforced_cleanly() {
 	assert_eq!(domain.account().handles().used(), 0);
 	assert_eq!(domain.account().threads().used(), 0);
 }
+
+crate::tagged_test!(a_processs_image_counts_against_its_domains_memory_limit, [Domain, Memory, Process, Kernel], id = "kernel.object.domain.a_processs_image_counts_against_its_domains_memory_limit", covers = ["kernel"]);
+fn a_processs_image_counts_against_its_domains_memory_limit() {
+	// The account's own header said it caps "physical memory held", and the only production charge
+	// against it was `MemoryObject::create_in` - so a process's IMAGE, the largest thing it holds,
+	// sat entirely outside the limit whose name implied it was inside. A Domain could be given a
+	// small memory cap and a process loaded into it would consume many times that in image frames
+	// without the counter moving.
+	//
+	// The property is checkable without a loader: `reserve_adopt` is the booking every image load
+	// goes through, and `try_adopt_frame` is what a growing stack uses.
+	use crate::mem::frame::PAGE_SIZE;
+	use crate::object::process::Process;
+
+	let domain = Domain::new(4 * PAGE_SIZE, UNLIMITED, UNLIMITED);
+	let space = crate::object::address_space::AddressSpace::create().expect("an address space");
+	let process = Process::new(space, domain.clone()).expect("a process in a bounded domain");
+	let before = domain.account().memory().used();
+
+	// Two pages of image fit.
+	assert!(process.reserve_adopt(2, 0), "a booking within the limit is granted");
+	assert_eq!(domain.account().memory().used(), before + 2 * PAGE_SIZE, "the image booking reached the account");
+
+	// A booking past the cap is refused, and refused WITHOUT charging.
+	let at_limit = domain.account().memory().used();
+	assert!(!process.reserve_adopt(8, 0), "a booking past the limit is refused");
+	assert_eq!(domain.account().memory().used(), at_limit, "a refused booking leaves the account where it was");
+
+	// And a booking that is abandoned gives its charge back.
+	process.release_adopt_charge(2);
+	assert_eq!(domain.account().memory().used(), before, "an abandoned booking is refunded");
+
+	// The stack-growth path charges too, and refuses when the limit is reached.
+	let frame = crate::mem::frame::allocate().expect("a frame");
+	assert!(process.try_adopt_frame(frame), "one page fits");
+	assert_eq!(domain.account().memory().used(), before + PAGE_SIZE, "an adopted frame reached the account");
+}

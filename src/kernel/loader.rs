@@ -287,6 +287,9 @@ pub fn load_module_into(process: &Process, elf_image: &[u8], bias: u64) -> Resul
 	if !process.register_dynamic_symbols(&exports) {
 		process.release_dynamic_module_at(bias);
 		elf::unmap_module(elf_image, process.address_space(), bias);
+		// The Domain booking `reserve_adopt` took above: this is the one rollback that happens
+		// AFTER a successful reservation, so it is the one that has to give it back.
+		process.release_adopt_charge(frames.len());
 		free_frames(frames);
 		return Err(LoadError::BadImage);
 	}
