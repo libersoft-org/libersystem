@@ -19,9 +19,33 @@ pub const PAGE_SIZE: u64 = 4096;
 // Allocate `pages` 4 KiB pages of retained LOADER_DATA and return the physical base (0-checked None
 // on failure).
 pub fn alloc_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
-	let mut addr: u64 = 0;
-	let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ANY_PAGES, uefi::LOADER_DATA, pages, &mut addr) };
+	// UNDER THE CEILING, when one has been declared.
+	//
+	// `ALLOCATE_ANY_PAGES` lets firmware place a retained allocation anywhere in physical memory,
+	// and everything the loader HANDS TO THE KERNEL goes through here: BootInfo, module arrays,
+	// region arrays, file reads, RISC-V scratch. The non-x86 kernels enter Rust on a boot stub with
+	// a FIXED early direct map - 4 GB on aarch64, 8 GB on riscv64 - so an allocation above that is
+	// memory the kernel cannot address at the moment it is asked to read it. On a machine with RAM
+	// high in the physical space, firmware is entitled to put it there.
+	//
+	// x86 declares no ceiling and keeps the old behaviour: it builds its own direct map over all RAM
+	// before entering the kernel, so it has no such limit to respect.
+	let ceiling = ALLOC_CEILING.load(core::sync::atomic::Ordering::Relaxed);
+	let mut addr: u64 = if ceiling == 0 { 0 } else { ceiling };
+	let policy = if ceiling == 0 { uefi::ALLOCATE_ANY_PAGES } else { uefi::ALLOCATE_MAX_ADDRESS };
+	let status = unsafe { ((*bs).allocate_pages)(policy, uefi::LOADER_DATA, pages, &mut addr) };
 	if uefi::is_error(status) { None } else { Some(addr) }
+}
+
+// The highest physical address a retained loader allocation may occupy, or 0 for no limit.
+//
+// Set once by an architecture whose kernel enters on a fixed early direct map, BEFORE any handoff
+// allocation is made. It is a `static` rather than a parameter because every caller of `alloc_pages`
+// hands its result to the kernel and none of them should be able to forget.
+static ALLOC_CEILING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_alloc_ceiling(max_physical_address: u64) {
+	ALLOC_CEILING.store(max_physical_address, core::sync::atomic::Ordering::Relaxed);
 }
 
 // Whether `ExitBootServices` refusing with `status` is worth retrying with a fresh memory map.

@@ -91,6 +91,15 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// The firmware's console before the built-in UART, for as long as the firmware is there. See
 	// `console`: the UART addresses are QEMU's, and nothing about them is promised on a machine
 	// that is not `virt`.
+	// EVERY RETAINED ALLOCATION FROM HERE IS HANDED TO THE KERNEL, so it has to land where the
+	// kernel can address it. aarch64 and riscv64 enter Rust on a boot stub with a FIXED early direct
+	// map - 4 GB and 8 GB - and firmware placing a handoff allocation above that gives the kernel a
+	// pointer it cannot read at the one moment it must. x86 declares no ceiling: it builds its own
+	// direct map over all RAM first. Set before anything is allocated, which is why it is here.
+	#[cfg(target_arch = "aarch64")]
+	uefi::memory::set_alloc_ceiling(4 * 1024 * 1024 * 1024 - 1);
+	#[cfg(target_arch = "riscv64")]
+	uefi::memory::set_alloc_ceiling(8 * 1024 * 1024 * 1024 - 1);
 	console::adopt(system_table);
 	// And ask the machine where its console is, while the configuration table is still readable.
 	// What comes out of this is what the loader prints to AFTER `ExitBootServices` - or nothing,
