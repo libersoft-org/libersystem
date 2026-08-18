@@ -47,6 +47,13 @@ pub struct Console {
 	// Register spacing for the 16550 family, derived from the Generic Address Structure's access
 	// size: a table describing 32-bit accesses is describing registers four bytes apart.
 	pub reg_shift: u32,
+	// ACCESS WIDTH IN BYTES, kept as well as the spacing it implies.
+	//
+	// The access-size byte was converted to `reg_shift` and then thrown away, so the console scaled
+	// its ADDRESSES by the declared width and still performed byte reads and writes. A UART whose
+	// SPCR says dword access frequently does not answer a byte access at all - the spacing and the
+	// access size are two facts and only one of them was kept.
+	pub access_width: u32,
 }
 
 // An ACPI view rooted at the RSDP the firmware published.
@@ -233,12 +240,25 @@ impl Acpi {
 		// Access size 1 = byte, 2 = word, 3 = dword, 4 = qword. A table describing dword accesses
 		// is describing registers four bytes apart, which is `reg-shift = 2` in the device tree's
 		// vocabulary. PL011 registers are at fixed offsets and take no shift.
+		// Access size 4 is QWORD and fell into the default zero-shift branch, so a table declaring
+		// eight-byte spacing got registers one byte apart - the one value in the enumeration that
+		// was silently mistranslated rather than merely unused.
 		let reg_shift = match (uart, access) {
 			(Uart::Pl011, _) => 0,
+			(Uart::Ns16550, 4) => 3,
 			(Uart::Ns16550, 3) => 2,
 			(Uart::Ns16550, 2) => 1,
 			(Uart::Ns16550, _) => 0,
 		};
-		Some(Console { uart, base, reg_shift })
+		let access_width = match (uart, access) {
+			(Uart::Pl011, _) => 4,
+			(Uart::Ns16550, 4) => 8,
+			(Uart::Ns16550, 3) => 4,
+			(Uart::Ns16550, 2) => 2,
+			// Access size 1 is byte, and 0 means the table did not say - byte is the safe reading of
+			// both, and the one every 16550 answers.
+			(Uart::Ns16550, _) => 1,
+		};
+		Some(Console { uart, base, reg_shift, access_width })
 	}
 }

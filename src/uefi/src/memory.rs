@@ -71,6 +71,19 @@ pub fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDe
 	// the wrong offset, out of a buffer whose contents are the one structure that says which RAM
 	// exists. Ordinary firmware reports the same number twice; the helper's comments claimed more
 	// independence than it had.
+	// AND NOT MORE THAN THE BUFFER IT WAS GIVEN.
+	//
+	// `map_size` is an input capacity AND a firmware output through the same variable, and only the
+	// stride and divisibility were checked afterwards. A defective firmware can return success while
+	// enlarging it to a stride-aligned value bigger than the buffer; `translate_map` then derives its
+	// entry count from that number and walks past the allocation, reading unrelated firmware memory
+	// as descriptors - which can publish invented usable regions straight into the frame allocator.
+	// Correct firmware would answer BUFFER_TOO_SMALL; the caller still owns not trusting a count
+	// beyond the capacity it supplied.
+	if map_size > pages * PAGE_SIZE as usize {
+		unsafe { ((*bs).free_pages)(buf as u64, pages) };
+		return None;
+	}
 	if desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() || map_size % desc_size != 0 {
 		unsafe { ((*bs).free_pages)(buf as u64, pages) };
 		return None;
@@ -151,19 +164,68 @@ pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_s
 	if n == 0 {
 		return Some(0);
 	}
+	// COALESCE ADJACENT RUNS AND CANONICALIZE OVERLAPS INTO A DISJOINT PARTITION.
+	//
+	// Only exactly-adjacent same-kind runs were merged, and OVERLAPPING descriptors were passed
+	// through as independent regions - so the same physical page could be described twice, once as
+	// usable and once as reserved, and handed to two owners. Firmware does produce these.
+	//
+	// The precedence is restrictive and it is the whole point: where two descriptors disagree about
+	// a byte, the one that is NOT usable owns it. An ambiguity that resolved to usable would put
+	// MMIO or firmware-owned memory into the frame allocator, which is the direction that corrupts.
+	// Where both are non-usable the first keeps the overlap: neither answer is usable, so either is
+	// safe, and keeping the earlier one makes the pass deterministic.
+	let restrictive = |kind: u32| kind != bootproto::MEM_USABLE;
 	let mut w = 0usize;
 	for r in 1..n {
 		let cur = unsafe { *regions.add(r) };
 		let last = unsafe { &mut *regions.add(w) };
-		// Both sums checked: the coalescing pass adds two firmware-provided lengths, and the
-		// comparison that decides whether to coalesce is itself a sum.
-		let adjacent = last.base.checked_add(last.length) == Some(cur.base);
-		if cur.kind == last.kind && adjacent && last.length.checked_add(cur.length).is_some() {
-			last.length += cur.length;
-		} else {
-			w += 1;
-			unsafe { *regions.add(w) = cur };
+		// Both sums checked: this pass adds firmware-provided lengths, and the comparison that
+		// decides whether to coalesce is itself a sum.
+		let Some(last_end) = last.base.checked_add(last.length) else { return None };
+		let Some(cur_end) = cur.base.checked_add(cur.length) else { return None };
+
+		// Disjoint, in sorted order: the ordinary case.
+		if cur.base >= last_end {
+			if cur.kind == last.kind && cur.base == last_end {
+				last.length = cur_end - last.base;
+			} else {
+				w += 1;
+				unsafe { *regions.add(w) = cur };
+			}
+			continue;
 		}
+
+		// Overlapping. Same kind is not a conflict - it is one region described twice.
+		if cur.kind == last.kind {
+			if cur_end > last_end {
+				last.length = cur_end - last.base;
+			}
+			continue;
+		}
+
+		if restrictive(cur.kind) && !restrictive(last.kind) {
+			// The restrictive descriptor takes the contested bytes: the usable one gives up its
+			// tail, and disappears entirely if that was all of it.
+			last.base = last.base;
+			last.length = cur.base - last.base;
+			if last.length == 0 {
+				// It contributed nothing; overwrite it rather than keeping an empty region.
+				unsafe { *regions.add(w) = cur };
+			} else {
+				w += 1;
+				unsafe { *regions.add(w) = cur };
+			}
+			continue;
+		}
+
+		// `last` is restrictive (or both are): it keeps the overlap and `cur` starts after it.
+		if cur_end <= last_end {
+			// Fully contained - nothing of `cur` survives.
+			continue;
+		}
+		w += 1;
+		unsafe { *regions.add(w) = MemRegion { base: last_end, length: cur_end - last_end, kind: cur.kind, _pad: 0 } };
 	}
 	Some(w + 1)
 }

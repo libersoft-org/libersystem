@@ -101,6 +101,9 @@ pub(crate) struct PostEbs {
 	pl011: bool,
 	base: u64,
 	reg_shift: u32,
+	// Access width in bytes for the 16550 family: a UART whose table declares dword access often
+	// does not answer a byte access. The device-tree path has no equivalent field and uses 1.
+	access_width: u32,
 }
 
 static mut POST_EBS: Option<PostEbs> = None;
@@ -137,11 +140,11 @@ pub(crate) fn discover(system_table: *mut uefi::SystemTable) {
 			}
 		}
 	}
-	let from_tree = (dtb != 0).then(|| fdt::Fdt::new(dtb, identity).console()).flatten().map(|console| PostEbs { pl011: console.uart == fdt::Uart::Pl011, base: console.base, reg_shift: console.reg_shift });
+	let from_tree = (dtb != 0).then(|| fdt::Fdt::new(dtb, identity).console()).flatten().map(|console| PostEbs { pl011: console.uart == fdt::Uart::Pl011, base: console.base, reg_shift: console.reg_shift, access_width: 1 });
 	// The device tree first: a machine that has one is describing the hardware it actually has,
 	// while SPCR describes what the firmware was using - which is the same thing on every machine
 	// this has met, and the tree is the more specific of the two.
-	let found = from_tree.or_else(|| (rsdp != 0).then(|| uefi::acpi::Acpi::new(rsdp, identity).console()).flatten().map(|console| PostEbs { pl011: console.uart == uefi::acpi::Uart::Pl011, base: console.base, reg_shift: console.reg_shift }));
+	let found = from_tree.or_else(|| (rsdp != 0).then(|| uefi::acpi::Acpi::new(rsdp, identity).console()).flatten().map(|console| PostEbs { pl011: console.uart == uefi::acpi::Uart::Pl011, base: console.base, reg_shift: console.reg_shift, access_width: console.access_width }));
 	unsafe {
 		POST_EBS = found;
 		FIRMWARE_TABLES = (dtb, rsdp);
@@ -220,15 +223,44 @@ pub(crate) fn write_byte_post_ebs(byte: u8) -> bool {
 			// scaled by the register spacing the machine declared.
 			let lsr = console.base + (5u64 << console.reg_shift);
 			let mut left = PATIENCE;
-			while core::ptr::read_volatile(lsr as *const u8) & (1 << 5) == 0 {
+			// AT THE DECLARED WIDTH. The spacing was honoured and the access size was not, so a UART
+			// described as dword-access got byte reads at correctly-spaced addresses - and many such
+			// parts do not answer those at all.
+			while read_reg(lsr, console.access_width) & (1 << 5) == 0 {
 				left -= 1;
 				if left == 0 {
 					return true;
 				}
 				core::hint::spin_loop();
 			}
-			core::ptr::write_volatile(console.base as *mut u8, byte);
+			write_reg(console.base, byte, console.access_width);
 		}
 	}
 	true
+}
+
+// Read and write a 16550 register at the width its table declares. Anything unrecognised is a byte,
+// which is what every 16550 answers.
+#[inline]
+unsafe fn read_reg(address: u64, width: u32) -> u8 {
+	unsafe {
+		match width {
+			8 => core::ptr::read_volatile(address as *const u64) as u8,
+			4 => core::ptr::read_volatile(address as *const u32) as u8,
+			2 => core::ptr::read_volatile(address as *const u16) as u8,
+			_ => core::ptr::read_volatile(address as *const u8),
+		}
+	}
+}
+
+#[inline]
+unsafe fn write_reg(address: u64, byte: u8, width: u32) {
+	unsafe {
+		match width {
+			8 => core::ptr::write_volatile(address as *mut u64, byte as u64),
+			4 => core::ptr::write_volatile(address as *mut u32, byte as u32),
+			2 => core::ptr::write_volatile(address as *mut u16, byte as u16),
+			_ => core::ptr::write_volatile(address as *mut u8, byte),
+		}
+	}
 }

@@ -51,6 +51,9 @@ pub struct State {
 	pub exit_attempts: usize,
 	// Pages handed out by `allocate_pages`, so a test can see what was allocated and freed.
 	pub allocations: Vec<(u64, usize)>,
+	// (pointer, len, capacity) of every buffer `locate_handle_buffer` handed out, so the Guard can
+	// give them back: `free_pool` is a no-op here and nothing else ever did.
+	pub handle_buffers: Vec<(usize, usize, usize)>,
 	pub frees: Vec<(u64, usize)>,
 	// Addresses `allocate_pages` must hand back, in order, before it allocates for real.
 	//
@@ -87,7 +90,7 @@ pub struct GopConfig {
 
 impl State {
 	const fn new() -> State {
-		State { disks: Vec::new(), descriptors: Vec::new(), map_key: 1, key_changes: 0, exit_status: crate::STATUS_SUCCESS, exit_refusals: 0, exit_attempts: 0, allocations: Vec::new(), frees: Vec::new(), forced_pages: Vec::new(), file_bytes: Vec::new(), file_declared_size: 0, file_read_chunk: 0, file_reads_before_failure: usize::MAX, file_reads: 0, file_opened: Vec::new(), gop: None }
+		State { disks: Vec::new(), descriptors: Vec::new(), map_key: 1, key_changes: 0, exit_status: crate::STATUS_SUCCESS, exit_refusals: 0, exit_attempts: 0, allocations: Vec::new(), handle_buffers: Vec::new(), frees: Vec::new(), forced_pages: Vec::new(), file_bytes: Vec::new(), file_declared_size: 0, file_read_chunk: 0, file_reads_before_failure: usize::MAX, file_reads: 0, file_opened: Vec::new(), gop: None }
 	}
 }
 
@@ -117,6 +120,11 @@ impl Drop for Guard {
 			for (addr, pages) in core::mem::take(&mut (*&raw mut STATE).allocations) {
 				let layout = alloc::alloc::Layout::from_size_align(pages * 4096, 4096).expect("page layout");
 				alloc::alloc::dealloc(addr as *mut u8, layout);
+			}
+			// And every handle buffer `locate_handle_buffer` handed out. `free_pool` is a no-op, so
+			// nothing else ever gave these back.
+			for (ptr, len, capacity) in core::mem::take(&mut (*&raw mut STATE).handle_buffers) {
+				drop(Vec::from_raw_parts(ptr as *mut Handle, len, capacity));
 			}
 			core::ptr::write(&raw mut STATE, State::new());
 		}
@@ -239,9 +247,15 @@ unsafe extern "efiapi" fn locate_handle_buffer(_ty: crate::LocateSearchType, gui
 		*count = list.len();
 		*handles = list.as_mut_ptr();
 	}
-	// Handed to the caller, which frees it through `free_pool` - a no-op above, so the memory is
-	// kept alive here for the length of the test.
+	// Handed to the caller, which frees it through `free_pool` - a no-op above - so the allocation
+	// has to stay alive for the length of the test and be reclaimed with the rest of the state.
+	// `forget` alone leaked one buffer per call, and a test looping over `locate_handle_buffer` grew
+	// the process's heap for as long as it ran. Recorded here, freed by the Guard.
+	let (ptr, len, capacity) = (list.as_mut_ptr(), list.len(), list.capacity());
 	core::mem::forget(list);
+	unsafe {
+		(*&raw mut STATE).handle_buffers.push((ptr as usize, len, capacity));
+	}
 	crate::STATUS_SUCCESS
 }
 

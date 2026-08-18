@@ -293,6 +293,83 @@ fn the_translated_map_is_sorted_and_coalesced() {
 	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
 }
 
+// OVERLAPPING DESCRIPTORS BECOME A DISJOINT PARTITION, AND NO CONTESTED BYTE COMES OUT USABLE.
+//
+// Only exactly-adjacent same-kind runs were merged; overlapping descriptors were passed through as
+// independent regions, so one physical page could be described twice - once usable, once reserved -
+// and handed to two owners. Real firmware produces these. The precedence is restrictive: where two
+// descriptors disagree about a byte, the one that is NOT usable owns it, because an ambiguity that
+// resolved to usable would put MMIO or firmware memory into the frame allocator.
+#[test]
+fn overlapping_descriptors_are_canonicalized_with_the_restrictive_kind_winning() {
+	// A usable run whose tail is claimed by a reserved descriptor.
+	{
+		let _guard = guard();
+		state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, 0x1000, 4), descriptor(crate::UNUSABLE_MEMORY, 0x3000, 2)];
+		let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+		let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
+		let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+		assert_eq!(n, 2, "the overlap is resolved into two disjoint regions");
+		assert_eq!((regions[0].base, regions[0].length, regions[0].kind), (0x1000, 0x2000, bootproto::MEM_USABLE), "the usable region gives up its contested tail");
+		assert_eq!((regions[1].base, regions[1].length, regions[1].kind), (0x3000, 0x2000, bootproto::MEM_BAD), "and the restrictive one keeps all of it");
+		assert_disjoint_and_no_restricted_byte_usable(&regions[..n], &[(0x3000, 0x5000)]);
+		unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
+	}
+
+	// A usable descriptor fully contained inside a reserved one contributes nothing.
+	{
+		let _guard = guard();
+		state().descriptors = vec![descriptor(crate::ACPI_MEMORY_NVS, 0x1000, 8), descriptor(crate::CONVENTIONAL_MEMORY, 0x2000, 2)];
+		let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+		let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
+		let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+		assert_eq!(n, 1, "a usable region inside a restricted one disappears");
+		assert_eq!((regions[0].base, regions[0].length, regions[0].kind), (0x1000, 0x8000, bootproto::MEM_ACPI_NVS));
+		assert_disjoint_and_no_restricted_byte_usable(&regions[..n], &[(0x1000, 0x9000)]);
+		unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
+	}
+
+	// Identical bases, different kinds: the restricted one owns the shared span and the usable
+	// remainder starts after it.
+	{
+		let _guard = guard();
+		state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, 0x1000, 4), descriptor(crate::ACPI_RECLAIM_MEMORY, 0x1000, 1)];
+		let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+		let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
+		let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+		assert_disjoint_and_no_restricted_byte_usable(&regions[..n], &[(0x1000, 0x2000)]);
+		unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
+	}
+
+	// Same kind overlapping is one region described twice, not a conflict.
+	{
+		let _guard = guard();
+		state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, 0x1000, 4), descriptor(crate::CONVENTIONAL_MEMORY, 0x2000, 4)];
+		let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+		let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
+		let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+		assert_eq!(n, 1, "two overlapping usable descriptors are one region");
+		assert_eq!((regions[0].base, regions[0].length), (0x1000, 0x5000));
+		unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
+	}
+}
+
+// Every region disjoint and ascending, and not one byte of a restricted input span reported usable.
+fn assert_disjoint_and_no_restricted_byte_usable(regions: &[bootproto::MemRegion], restricted: &[(u64, u64)]) {
+	let mut previous_end = 0u64;
+	for r in regions {
+		assert!(r.length > 0, "an empty region was emitted");
+		assert!(r.base >= previous_end, "regions overlap or are unsorted: {:#x} starts before {:#x}", r.base, previous_end);
+		previous_end = r.base + r.length;
+		if r.kind == bootproto::MEM_USABLE {
+			for &(start, end) in restricted {
+				let overlaps = r.base < end && start < r.base + r.length;
+				assert!(!overlaps, "usable region {:#x}..{:#x} covers restricted {:#x}..{:#x}", r.base, r.base + r.length, start, end);
+			}
+		}
+	}
+}
+
 // A FIRMWARE THAT KEEPS HANDING BACK THE ADDRESS THE KERNEL HAS TO GO TO.
 //
 // This is the riscv64 case, made ordinary. On QEMU `virt` the kernel is linked at 0x8020_0000, which
@@ -481,6 +558,37 @@ fn a_pixel_bitmask_mode_is_decoded_by_its_masks() {
 	assert_eq!((fb.blue_shift, fb.blue_size), (0, 5));
 }
 
+// A MODE THAT DOES NOT FIT ITS OWN APERTURE IS REFUSED. Width, height, stride and pixel size all
+// come from firmware, and so does the aperture size - and nothing compared them. A mode claiming
+// more rows, or a wider stride, than `frame_buffer_size` can hold produced a renderer writing past
+// the end of the mapping, out of values nobody chose maliciously and simply got wrong.
+#[test]
+fn a_gop_mode_larger_than_its_aperture_is_refused() {
+	let _guard = guard();
+	let mask = crate::PixelBitmask { red: 0xf800, green: 0x07e0, blue: 0x001f, reserved: 0 };
+
+	// The honest mode is accepted: 640x480 at two bytes per pixel, aperture exactly that.
+	state().gop = Some(mock::GopConfig { width: 640, height: 480, stride: 640, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: 640 * 480 * 2 });
+	assert!(gop::locate_framebuffer(mock::boot_services()).present, "a mode that fits is reported");
+
+	// One row too many for the aperture.
+	state().gop = Some(mock::GopConfig { width: 640, height: 481, stride: 640, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: 640 * 480 * 2 });
+	assert!(!gop::locate_framebuffer(mock::boot_services()).present, "a mode one row past its aperture is refused");
+
+	// A stride wider than the aperture allows, with an honest height.
+	state().gop = Some(mock::GopConfig { width: 640, height: 480, stride: 4096, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: 640 * 480 * 2 });
+	assert!(!gop::locate_framebuffer(mock::boot_services()).present, "a stride past its aperture is refused");
+
+	// A stride narrower than the visible width describes no picture at all.
+	state().gop = Some(mock::GopConfig { width: 640, height: 480, stride: 320, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: 640 * 480 * 2 });
+	assert!(!gop::locate_framebuffer(mock::boot_services()).present, "a stride narrower than the width is refused");
+
+	// And a height whose product overflows rather than merely exceeding: the case where a
+	// large-but-plausible pair becomes a small number.
+	state().gop = Some(mock::GopConfig { width: 640, height: u32::MAX, stride: u32::MAX, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: usize::MAX });
+	assert!(!gop::locate_framebuffer(mock::boot_services()).present, "a geometry whose product overflows is refused");
+}
+
 // The two NAMED formats do not carry masks, and reading them as though they did would decode every
 // channel as absent.
 #[test]
@@ -654,7 +762,7 @@ fn spcr_names_the_console_of_an_acpi_machine() {
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x0e, 0, 1, 0xffff_0000_0000_9000))], 2);
 	let acpi = acpi::Acpi::new(rsdp, here);
 	assert!(acpi.is_valid(), "a well-formed RSDP is accepted");
-	assert_eq!(acpi.console(), Some(acpi::Console { uart: acpi::Uart::Pl011, base: 0xffff_0000_0000_9000, reg_shift: 0 }), "an SBSA generic UART is a PL011 for the two registers this drives");
+	assert_eq!(acpi.console(), Some(acpi::Console { uart: acpi::Uart::Pl011, base: 0xffff_0000_0000_9000, reg_shift: 0, access_width: 4 }), "an SBSA generic UART is a PL011 for the two registers this drives");
 }
 
 #[test]
@@ -663,7 +771,18 @@ fn a_sixteen_five_fifty_with_dword_access_is_four_bytes_between_registers() {
 	// describing registers four bytes apart. Writing the character at +5 instead of +20 puts it in
 	// the modem-control register.
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 0, 3, 0x1000_0000))], 2);
-	assert_eq!(acpi::Acpi::new(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 2 }));
+	assert_eq!(acpi::Acpi::new(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 2, access_width: 4 }));
+
+	// ACCESS SIZE 4 IS QWORD, and it fell into the default zero-shift branch - the one value in the
+	// enumeration that was silently MISTRANSLATED rather than merely unused, so a table declaring
+	// eight-byte spacing got registers one byte apart and every write landed in the wrong register.
+	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 0, 4, 0x1000_0000))], 2);
+	assert_eq!(acpi::Acpi::new(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 3, access_width: 8 }));
+
+	// And the access width is KEPT, not only converted: byte access is what an unspecified table
+	// means and what every 16550 answers.
+	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 0, 1, 0x1000_0000))], 2);
+	assert_eq!(acpi::Acpi::new(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 0, access_width: 1 }));
 }
 
 #[test]

@@ -112,7 +112,32 @@ pub fn locate_framebuffer(bs: *mut BootServices) -> GopFb {
 		}
 		_ => 32u32,
 	};
-	GopFb { present: true, phys: unsafe { (*mode).frame_buffer_base }, size: unsafe { (*mode).frame_buffer_size as u64 }, width, height, pitch: pitch_px * (bpp / 8), bpp, red_shift: rs, red_size: rz, green_shift: gs, green_size: gz, blue_shift: bs_shift, blue_size: bz }
+	// THE GEOMETRY MUST FIT THE APERTURE, and firmware is the one telling us both.
+	//
+	// Width, height, stride and pixel size were taken as given and multiplied into writes against a
+	// mapped aperture whose size was taken from the same source and never compared. A mode claiming
+	// a tall screen or a wide stride against a small `frame_buffer_size` produced a renderer writing
+	// past the end of the mapping - out of a value nobody chose maliciously, just wrongly.
+	//
+	// Every step checked, because a product that overflows is the interesting case: `pitch_px * bpp`
+	// and `height * pitch` are exactly where a large-but-plausible pair becomes a small number.
+	let phys = unsafe { (*mode).frame_buffer_base };
+	let size = unsafe { (*mode).frame_buffer_size as u64 };
+	if width == 0 || height == 0 || bpp == 0 || bpp % 8 != 0 || pitch_px < width {
+		return GopFb::NONE;
+	}
+	let Some(pitch) = pitch_px.checked_mul(bpp / 8) else {
+		return GopFb::NONE;
+	};
+	// The last row must END inside the aperture, so the bound is over the whole span rather than
+	// over one row.
+	let Some(span) = (height as u64).checked_mul(pitch as u64) else {
+		return GopFb::NONE;
+	};
+	if span > size || phys.checked_add(size).is_none() {
+		return GopFb::NONE;
+	}
+	GopFb { present: true, phys, size, width, height, pitch, bpp, red_shift: rs, red_size: rz, green_shift: gs, green_size: gz, blue_shift: bs_shift, blue_size: bz }
 }
 
 // Bit position of the lowest set bit of a channel mask.
