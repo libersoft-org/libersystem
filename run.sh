@@ -23,7 +23,8 @@ Boots the system in QEMU, headless, with the serial console on your terminal.
   --smp N         cores given to the guest (default: the host's, capped at 8 on aarch64/riscv64)
   --mem SIZE      guest memory, QEMU-style: 512M, 4G
   --serial SPEC   QEMU serial backend, e.g. --serial file:boot.log
-  --vnc-addr A    VNC bind address and display (default 0.0.0.0:0)
+  --vnc-addr A    VNC bind address and display (default 127.0.0.1:0 - loopback)
+  --spice-addr A  SPICE bind address (default 127.0.0.1 - loopback)
   --spice-port P  SPICE port (default 5930)
   --debug         wait for GDB on :1234, no KVM
   -h, --help      this text
@@ -114,6 +115,11 @@ while [[ $# -gt 0 ]]; do
 	--vnc-addr)
 		[[ $# -ge 2 ]] || die "--vnc-addr needs an address"
 		export VNC_ADDR="$2"
+		shift 2
+		;;
+	--spice-addr)
+		[[ $# -ge 2 ]] || die "--spice-addr needs an address"
+		export SPICE_ADDR="$2"
 		shift 2
 		;;
 	--spice-port)

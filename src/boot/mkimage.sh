@@ -40,8 +40,22 @@ source "$REPO_ROOT/product.conf"
 BUILD="$REPO_ROOT/.build/boot"
 SLUG="$(echo "$PRODUCT_NAME" | tr '[:upper:]' '[:lower:]')"
 
+# THE CANDIDATE THIS RUN IS ACTUALLY WRITING, recorded as it is chosen.
+#
+# Cleanup used to name `$SLUG.iso.$$.candidate` and `$SLUG.img.$$.candidate` by hand, and the test
+# ISO builder chooses `$SLUG-test.iso.$$.candidate` - a third name neither line matched. Every
+# failed or interrupted test-image build therefore left a full-size candidate under `.build/boot`,
+# accumulating silently, while the comment said cleanup covered it. One variable, set where the name
+# is decided, cannot drift from the name that was decided.
+CANDIDATES=()
+
+manifest_rows=""
+
 cleanup() {
-	rm -f "$BUILD/$SLUG.iso.$$.candidate" "$BUILD/$SLUG.img.$$.candidate"
+	local path
+	for path in "${CANDIDATES[@]}"; do
+		rm -f "$path"
+	done
 	rm -f "$BUILD/$SLUG.iso.build-key.tmp.$$" "$BUILD/$SLUG.img.build-key.tmp.$$"
 }
 trap cleanup EXIT
@@ -82,6 +96,19 @@ stage_kernel() {
 verify_boot_artifacts() {
 	local staged_kernel="$1"
 	local kind name destination source missing=0
+	# THE MANIFEST IS READ FROM A CHECKED SUBPROCESS, not through `< <(...)`.
+	#
+	# Bash does not propagate a process substitution's exit status to the `while` that reads it, so a
+	# `cargo run -- boot-artifacts` that failed and printed nothing left this loop with no
+	# iterations and `missing=0` - and the function then declared every required artifact present.
+	# That is the authoritative list of what an image must contain, verified by not being read.
+	local rows
+	rows="$(cd "$REPO_ROOT/src/tools/system-manifest" && cargo run --quiet -- boot-artifacts)" ||
+		die "the system manifest could not be exported, so nothing here knows what this image must contain"
+	[[ -n "$rows" ]] || die "the system manifest exported no boot artifacts, which is not a manifest this builder can act on"
+	# Published for the cache key: the artifact list and its destinations ARE part of what an image
+	# is, and the key did not contain them in any form.
+	manifest_rows="$rows"
 	while read -r kind name destination; do
 		[[ -n "$kind" ]] || continue
 		case "$kind" in
@@ -97,7 +124,7 @@ verify_boot_artifacts() {
 			echo "mkimage: missing $kind '$name': $source" >&2
 			missing=1
 		fi
-	done < <(cd "$REPO_ROOT/src/tools/system-manifest" && cargo run --quiet -- boot-artifacts)
+	done <<<"$rows"
 	((missing == 0)) || die "packaging needs every artifact built first - run './build.sh'"
 }
 
@@ -176,6 +203,7 @@ make_iso() {
 		final="$BUILD/$SLUG-test.iso"
 		out="$BUILD/$SLUG-test.iso.$$.candidate"
 	fi
+	CANDIDATES+=("$out")
 	local iso_root="$BUILD/iso_root"
 	rm -f "$out"
 
@@ -368,19 +396,56 @@ esac
 # The kernel is checked here as the ELF it was given; the builders re-check the stripped copy.
 verify_boot_artifacts "$kernel"
 key_file="$output.build-key"
-key="$({
-	printf 'format=liber-boot-image-input-v1\n'
+digest_file="$output.build-digest"
+
+# EVERY COPIED BYTE, not the subset that was easy to name.
+#
+# The key hashed the builder, the product configuration, the kernel, the loader, two packages and
+# the system volume - and NOT the manifest that decides which artifacts go where, nor the fallback
+# `bootstrap.list` and `libexec/` files this copies onto the ESP, nor the volume UUID sidecar. So a
+# destination could move, the fallback set could change, or the pairing file could be corrected, and
+# the key stayed equal: a cache HIT returning an image that does not implement the current manifest.
+image_input_key() {
+	printf 'format=liber-boot-image-input-v2\n'
 	printf 'mode=%s\n' "$mode_input"
 	printf 'strip=%s\n' "$STRIP"
+	# The manifest's own bytes AND its normalized projection: the file catches an edit, the export
+	# catches a generator change that produces a different layout from the same file.
+	printf 'manifest=%s\n' "$(sha256sum "$REPO_ROOT/src/user/services/manifest.toml" | awk '{print $1}')"
+	printf 'layout=%s\n' "$(printf '%s' "$manifest_rows" | sha256sum | awk '{print $1}')"
+	# The fallback bootstrap set, file by file in a stable order - it is copied onto the ESP and was
+	# in no key at all.
+	local bootstrap_root="$BUILD/bootstrap-x86_64"
+	if [[ -d "$bootstrap_root" ]]; then
+		find "$bootstrap_root" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+	else
+		printf 'bootstrap=absent\n'
+	fi
+	# The pairing sidecar, which decides which volume the medium declares itself paired with.
+	local uuid_file="$BUILD/system-volume-x86_64.uuid"
+	if [[ -f "$uuid_file" ]]; then
+		sha256sum "$uuid_file"
+	else
+		printf 'pairing=absent\n'
+	fi
 	# BOTH payloads are hashed, whichever medium is being built: the shipping ISO carries the
 	# system volume and the test ISO the archive, and keying on only one would serve a stale image
 	# whenever the other changed. `mode=` above already separates the two outputs.
 	sha256sum "$0" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg" "$BUILD/volume-x86_64.pkg" "$BUILD/system-volume-x86_64.img"
-} | sha256sum | awk '{print $1}')"
-if [[ -f "$output" && -f "$key_file" && "$(<"$key_file")" == "$key" ]]; then
-	info "cache hit $output"
-	echo "$output"
-	exit 0
+}
+
+key="$(image_input_key | sha256sum | awk '{print $1}')"
+# AND THE OUTPUT IS VERIFIED ON A HIT. A matching key used to return the existing file without
+# looking at it, so a truncated, hand-edited or half-written image was served as current - the key
+# describes the INPUTS and says nothing about the bytes that were produced from them.
+if [[ -f "$output" && -f "$key_file" && -f "$digest_file" && "$(<"$key_file")" == "$key" ]]; then
+	actual_digest="$(sha256sum "$output" | awk '{print $1}')"
+	if [[ "$actual_digest" == "$(<"$digest_file")" ]]; then
+		info "cache hit $output"
+		echo "$output"
+		exit 0
+	fi
+	info "cache key matches but $output does not match its recorded digest - rebuilding"
 fi
 info "cache miss $output; rebuilding"
 
@@ -389,5 +454,12 @@ iso) make_iso "$kernel" 0 ;;
 testiso) make_iso "$kernel" 1 ;;
 img) make_img "$kernel" "${3:-64M}" ;;
 esac
+# The key is recomputed AFTER assembly and must still agree. Producers are not covered by this
+# script's lock, so an input can be replaced while the image is being written - and the record would
+# then describe bytes the image was not built from.
+after="$(image_input_key | sha256sum | awk '{print $1}')"
+[[ "$after" == "$key" ]] || die "an input changed while the image was being assembled; nothing was cached - build again with the tree still"
+printf '%s\n' "$(sha256sum "$output" | awk '{print $1}')" >"$digest_file.tmp.$$"
+mv "$digest_file.tmp.$$" "$digest_file"
 printf '%s\n' "$key" >"$key_file.tmp.$$"
 mv "$key_file.tmp.$$" "$key_file"

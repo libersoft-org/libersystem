@@ -16,11 +16,20 @@
 # Usage:
 #   boot/perf-trace.py [--sock /tmp/ls-ser.sock] [--cmd help] [--window 3.0]
 #
-# Typical session (kill any stale QEMU first):
-#   pkill -9 qemu-system-x86
+# Typical session (start a guest of your own; do NOT pattern-kill QEMU - this used to say
+# `pkill -9 qemu-system-x86`, which takes down every QEMU the user owns, including ones this has
+# nothing to do with):
 #   SERIAL="unix:/tmp/ls-ser.sock,server,nowait" DISPLAYS=vnc VNC_ADDR=127.0.0.1:9 \
 #     boot/qemu-run.sh x86_64 ../.build/cargo/kernel/x86_64-unknown-none/debug/kernel >/tmp/qemu.log 2>&1 &
 #   boot/perf-trace.py            # connects, waits for boot, runs `help`, prints the trace
+#
+# WHAT IT REFUSES TO MEASURE. A trace is only a measurement of the command if the guest was up
+# before the command was sent and the command's own markers bound the window. This used to print a
+# plausible-looking latency report when neither held: the boot loop set a flag it never checked, so
+# a guest still booting produced a "trace" made of boot markers; the only acceptance condition was
+# that at least one marker of any kind had been captured; and a missing phase endpoint printed
+# `n/a` and carried on. Each of those is a report about work nobody asked for, and performance work
+# was then aimed by it. Every one of them is now an error that says which condition failed.
 
 import argparse
 import os
@@ -86,20 +95,32 @@ def main() -> None:
 	ap.add_argument("--cmd", default="help", help="command to send and measure")
 	ap.add_argument("--window", type=float, default=3.0, help="seconds to collect markers after the command")
 	ap.add_argument("--boot-timeout", type=float, default=30.0, help="seconds to wait for boot")
+	ap.add_argument("--require", action="append", default=None, help="marker label the trace must contain (repeatable); default: the command's own start/end pair")
 	args = ap.parse_args()
+	if args.window <= 0:
+		sys.exit("perf-trace: --window must be positive; a window of zero collects nothing and would report it as a trace")
+	if args.boot_timeout <= 0:
+		sys.exit("perf-trace: --boot-timeout must be positive")
+	# The command's own boundary markers, unless the caller names others. `help` emits
+	# `shell_help_start` / `shell_help_end`, and a trace that has neither is a trace of something
+	# else that happened to be running.
+	required = args.require if args.require is not None else [f"shell_{args.cmd.split()[0]}_start", f"shell_{args.cmd.split()[0]}_end"]
 
 	s = connect(args.sock, args.boot_timeout)
 	buf = bytearray()
 	tsc_hz = 0
 
 	# Phase 1: read the boot stream until the shell is ready, capturing the tsc_hz anchor.
-	deadline = time.time() + args.boot_timeout
+	#
+	# Monotonic, because a wall clock that steps during a boot moves a deadline this depends on.
+	deadline = time.monotonic() + args.boot_timeout
 	booted = False
-	while time.time() < deadline and not booted:
+	while time.monotonic() < deadline and not booted:
 		try:
 			chunk = s.recv(65536)
-			if chunk:
-				buf += chunk
+			if not chunk:
+				sys.exit("perf-trace: the serial connection closed before the guest was ready - the guest is gone, not slow")
+			buf += chunk
 		except BlockingIOError:
 			time.sleep(0.02)
 			continue
@@ -109,6 +130,11 @@ def main() -> None:
 				tsc_hz = m[1]
 			if b"boot OK" in line or b"entering the userspace shell" in line:
 				booted = True
+	# AND THIS IS CHECKED. The flag was set and never read: execution fell through to sending the
+	# command into a guest that had not reached a shell, and whatever markers the boot was still
+	# emitting became the command's trace.
+	if not booted:
+		sys.exit(f"perf-trace: no ready marker within {args.boot_timeout} s - nothing was measured")
 	# Settle, then flush anything still queued so only post-command markers are collected.
 	time.sleep(0.3)
 	try:
@@ -125,26 +151,37 @@ def main() -> None:
 
 	# Phase 2: send the command and collect the markers it triggers.
 	markers = []  # (label, tsc, host_recv_time, val)
-	t_send = time.time()
 	s.sendall(args.cmd.encode() + b"\n")
-	end = time.time() + args.window
-	while time.time() < end:
+	end = time.monotonic() + args.window
+	closed = False
+	while time.monotonic() < end:
 		try:
 			chunk = s.recv(65536)
-			if chunk:
-				buf += chunk
+			if not chunk:
+				closed = True
+				break
+			buf += chunk
 		except BlockingIOError:
 			time.sleep(0.01)
 			continue
-		now = time.time()
+		now = time.monotonic()
 		for line in drain_lines(buf):
 			m = parse_marker(line)
 			if m:
 				markers.append((m[0], m[1], now, m[2]))
 	s.close()
+	if closed:
+		sys.exit("perf-trace: the serial connection closed while the command was running")
 
 	if not markers:
 		sys.exit("perf-trace: no markers captured (is PERF enabled? did the command run?)")
+	# THE COMMAND'S OWN MARKERS, not any markers. One captured marker of any label used to be the
+	# whole acceptance condition, so background activity in an idle guest produced a trace of a
+	# command that had never been accepted.
+	seen = {label for label, _, _, _ in markers}
+	missing = [label for label in required if label not in seen]
+	if missing:
+		sys.exit(f"perf-trace: the command produced no {', '.join(missing)} - this is not a trace of {args.cmd!r} (captured: {', '.join(sorted(seen))})")
 
 	# Order by TSC (the true timeline; serial delivery order can differ).
 	markers.sort(key=lambda x: x[1])
@@ -157,7 +194,12 @@ def main() -> None:
 	else:
 		span_cyc = markers[-1][1] - markers[0][1]
 		span_s = markers[-1][2] - markers[0][2]
-		cyc_to_ms = (span_s * 1e3 / span_cyc) if span_cyc else 0.0
+		# A calibration that cannot be performed is its own failure, not a scale of zero. With
+		# `cyc_to_ms = 0` every duration below printed as 0.000 ms, which reads as an
+		# extraordinarily fast system rather than as no measurement at all.
+		if span_cyc <= 0 or span_s <= 0:
+			sys.exit("perf-trace: no tsc_hz anchor and the captured markers span no time - nothing can be converted to milliseconds")
+		cyc_to_ms = span_s * 1e3 / span_cyc
 
 	def ms(tsc: int) -> float:
 		return (tsc - tsc0) * cyc_to_ms
@@ -193,13 +235,24 @@ def main() -> None:
 		("gpu present (transfer + flush)", "gpu_present_start", "gpu_present_end"),
 		("TOTAL help_start -> last gpu present_end", "shell_help_start", "gpu_present_end"),
 	]
+	unmeasured = []
 	for name, a, b in phases:
 		v = span(a, b)
 		print(f"  {name:<48} {v:8.3f} ms" if v is not None else f"  {name:<48} {'n/a':>8}")
+		if v is None:
+			unmeasured.append(name)
 
 	# How many gpu presents the command caused (1 = ideal coalescing).
 	n_present = sum(1 for label, _, _, _ in markers if label == "gpu_present_end")
 	print(f"\nperf-trace: gpu presents for this command = {n_present} (1 = fully coalesced)")
+
+	# AND AN INCOMPLETE TRACE IS A FAILURE. A phase whose endpoints were never seen printed `n/a`
+	# and the tool exited 0, so a broken input path or missing instrumentation was reported as a
+	# successful measurement with some gaps in it.
+	if unmeasured:
+		sys.exit("perf-trace: these phases were never observed, so this trace does not measure the console path: " + "; ".join(unmeasured))
+	if n_present == 0:
+		sys.exit("perf-trace: the command caused no gpu present - nothing reached the display, so there is no console latency here")
 
 
 if __name__ == "__main__":

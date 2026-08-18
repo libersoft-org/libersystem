@@ -1,5 +1,10 @@
-#!/usr/bin/env python3
 # The scenario format and its host runner.
+#
+# A MODULE, not a command: `lab.py dev-test` and `lab.py scenario-cold` import it and nothing runs
+# it directly. It carried a `#!/usr/bin/env python3` and mode 0644, which is the pair that made
+# `perf-trace.py`'s documented entry point fail with `Permission denied` on a clean checkout. The
+# rule `check-source-hygiene.sh` enforces is that a shebang means "run me"; this file does not mean
+# that, so the shebang is gone rather than the mode changed.
 #
 # Application-level interaction tests live here as versioned data rather than as Rust
 # compiled into the kernel test binary. That is the whole point: a scenario that is data
@@ -25,8 +30,11 @@
 # A scenario that would exceed a bound is refused as a whole, so a run never stops halfway
 # through because of something that was knowable before it started.
 
+import hashlib
+import json
 import os
 import re
+import struct
 import sys
 import time
 import tomllib
@@ -68,6 +76,70 @@ MAX_FRAME_LOSS = 0
 
 # Which scenarios have already run in this instance, one name per line.
 SEEN_PATH = os.path.join(lab.BUILD, 'dev-scenarios-seen')
+
+# WHICH TARGET THE HOST-SIDE ARTIFACTS COME FROM.
+#
+# A scenario names host files it publishes into the guest, and those files are architecture-specific:
+# the guest verifies an image's target and correctly refuses one built for another. The TOMLs used to
+# spell out `.build/image/x86_64-unknown-none/...` and `.build/fixtures/...`, so the cold runner's
+# promise of the same scenarios on all three targets could not hold - an aarch64 cold run sent x86
+# images to a guest that rejects them. The documents name `{staged}` and `{fixtures}` instead and the
+# runner resolves them for whichever target it is driving.
+TARGET = 'x86_64'
+TRIPLES = {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}
+
+
+def fixtures_dir(target=None):
+	return os.path.join(lab.BUILD_ROOT, 'fixtures', target or TARGET)
+
+
+def staged_dir(target=None):
+	return os.path.join(lab.BUILD_ROOT, 'image', TRIPLES[target or TARGET])
+
+
+# Resolve a document's host path. Absolute after this, so nothing depends on the working directory
+# the runner happened to be started from either.
+def resolve_path(path, target=None):
+	return path.format(staged=staged_dir(target), fixtures=fixtures_dir(target))
+
+
+# Refuse a fixture set that was not built from this tree, BEFORE anything is published into a guest.
+#
+# `dev-test` used to check only that the files existed. A fixture whose staged source had since been
+# rebuilt stayed on disk indefinitely and was published as though it were current, so a scenario's
+# pass or failure could be about bytes from an older tree. The manifest `make-fixtures.py` writes
+# names the target it was built for, the staged sources it read and each fixture's digest; all three
+# are checked here. Returns a list of complaints, empty when the set is current.
+def stale_fixtures(target=None):
+	target = target or TARGET
+	manifest_path = os.path.join(fixtures_dir(target), 'fixtures.json')
+	try:
+		with open(manifest_path, encoding='utf-8') as handle:
+			record = json.load(handle)
+	except (OSError, ValueError):
+		return [f'no usable fixture manifest at {manifest_path} - run boot/scenarios/make-fixtures.py']
+	if record.get('target') != target:
+		return [f'{manifest_path} was built for {record.get("target")!r}, not {target!r}']
+	complaints = []
+	for name, digest in sorted((record.get('fixtures') or {}).items()):
+		path = os.path.join(fixtures_dir(target), name)
+		if file_digest(path) != digest:
+			complaints.append(f'the fixture {name} does not match the set it was published with')
+	for relative, digest in sorted((record.get('sources') or {}).items()):
+		if file_digest(os.path.join(staged_dir(target), relative)) != digest:
+			complaints.append(f'{relative} has been rebuilt since the fixtures were made from it')
+	return complaints
+
+
+def file_digest(path):
+	try:
+		with open(path, 'rb') as handle:
+			digest = hashlib.sha256()
+			for chunk in iter(lambda: handle.read(1 << 20), b''):
+				digest.update(chunk)
+			return digest.hexdigest()
+	except OSError:
+		return None
 
 # How much longer every deadline in a scenario may take, set by the runner for a guest that is
 # emulated rather than native. A scenario states its deadlines once, for one machine, and they
@@ -165,7 +237,13 @@ STEP_FIELDS = {
 	'prompt': {'required': (), 'optional': ('timeout',)},
 	# Assert that the guest's terminal output since the previous step does NOT contain
 	# `contains` - the check that a fix stopped producing something.
-	'absent': {'required': ('contains',), 'optional': ('timeout',)},
+	#
+	# `until` names the boundary the assertion holds to. `quiet` (the default) watches the whole
+	# declared timeout; `prompt` watches until the shell prompt comes back, which is the right
+	# boundary for "this command printed no such thing" and finishes as soon as the command does.
+	# Either way the forbidden text is checked CONTINUOUSLY, so it fails at the moment it appears
+	# rather than at whatever instant a sample happens to land on.
+	'absent': {'required': ('contains',), 'optional': ('timeout', 'until')},
 	# Drop the guest's development state: the artifact registry and any open candidate.
 	'reset': {'required': (), 'optional': ('timeout',)},
 	# Replace the guest's development agent with a fresh one and wait until it serves. Larger
@@ -252,11 +330,14 @@ def validate_step(step, index, path):
 			raise ScenarioError(f'{where} ({kind}): contains must not be empty')
 		if len(step['contains'].encode()) > MAX_PATTERN_BYTES:
 			raise ScenarioError(f'{where} ({kind}): contains is {len(step["contains"].encode())} B, at most {MAX_PATTERN_BYTES}')
-	if kind == 'publish' and not os.path.isfile(step['file']):
-		raise ScenarioError(f'{where} (publish): no such file {step["file"]}')
+	if kind in ('publish', 'fixture'):
+		try:
+			resolved = resolve_path(step['file'])
+		except (KeyError, IndexError, ValueError):
+			raise ScenarioError(f'{where} ({kind}): {step["file"]!r} names a placeholder this runner does not have; use {{staged}} or {{fixtures}}') from None
+		if not os.path.isfile(resolved):
+			raise ScenarioError(f'{where} ({kind}): no such file {resolved}')
 	if kind == 'fixture':
-		if not os.path.isfile(step['file']):
-			raise ScenarioError(f'{where} (fixture): no such file {step["file"]}')
 		if not FIXTURE_NAME.fullmatch(step['name']):
 			raise ScenarioError(f'{where} (fixture): {step["name"]!r} is not a bare fixture name')
 	# Key names, pointer buttons and the things a terminal restores are closed vocabularies,
@@ -284,6 +365,8 @@ def validate_step(step, index, path):
 			raise ScenarioError(f'{where} (pointer): action must be press, release or click')
 		if 'x' not in step and 'y' not in step and 'button' not in step:
 			raise ScenarioError(f'{where} (pointer): needs a position, a button, or both')
+	if kind == 'absent' and 'until' in step and step['until'] not in ('quiet', 'prompt'):
+		raise ScenarioError(f'{where} (absent): until must be quiet or prompt')
 	if kind == 'restored':
 		if not isinstance(step['expect'], list) or not step['expect']:
 			raise ScenarioError(f'{where} (restored): expect must be a non-empty list')
@@ -307,20 +390,33 @@ class Guest:
 		# later assertion can match something an earlier read already consumed.
 		self.launched = ''
 
-	# Everything the guest has printed since the last time this was called.
+	# Everything the guest has printed since the last time this was called, AND the offset those
+	# bytes end at.
+	#
+	# Every cursor move in this file goes through a read that answers both. It used to read from the
+	# old cursor and then ask separately how big the file is, and the broker appends the whole time:
+	# bytes arriving in between were stepped over without any oracle seeing them. The rule is that
+	# the cursor only ever advances to the end of bytes that were actually returned.
 	def output(self):
-		text = self.lab.serial_since(self.at)
-		self.at = self.lab.serial_size()
+		text, end = self.read_since(self.at)
+		self.at = end
 		return text
 
-	# Everything printed since `mark`, without consuming it.
+	# Everything printed since `mark`, without consuming it - the text and the offset it ends at.
+	def read_since(self, mark):
+		raw, end = self.lab.serial_read(mark)
+		return lab_module.strip_ansi(raw).decode(errors='replace'), end
+
 	def output_since(self, mark):
-		return self.lab.serial_since(mark)
+		return self.read_since(mark)[0]
 
 	# The same, with the escape sequences left in, which is the only way to see a terminal
 	# being put back.
+	def raw_read_since(self, mark):
+		return self.lab.serial_read(mark)
+
 	def raw_since(self, mark):
-		return self.lab.serial_raw_since(mark)
+		return self.raw_read_since(mark)[0]
 
 	def mark(self):
 		return self.lab.serial_size()
@@ -334,6 +430,23 @@ def run(document, lab, verbose=False):
 	total = document.get('timeout', 300) * TIME_SCALE
 	deadline = time.monotonic() + total
 	started = time.monotonic()
+	# PRIMARY RESULT, THEN TEARDOWN, ALWAYS.
+	#
+	# This used to call `teardown` from a `except ScenarioError` handler and again after a completely
+	# normal loop, which covers exactly two of the ways out. The step adapters reach the protocol
+	# helpers directly and those report connection, handshake, timeout and refusal failures with
+	# `die`, which raises `SystemExit` - the protocol layer's NORMAL error path, not an exotic
+	# programmer exception. A control socket that disappeared, a request that timed out, a malformed
+	# reply reaching an unpack, or a Ctrl-C during a step all left through neither handler, so
+	# teardown never ran: the launched program kept running, the terminal stayed in raw or alternate
+	# screen, generations kept shadowing installed files, and the fixtures stayed. The next scenario
+	# then inherited all of it and failed - or passed - for the wrong reason.
+	#
+	# So: capture whatever ended the run, tear down unconditionally, then decide. `KeyboardInterrupt`
+	# and `SystemExit` are re-raised after the cleanup rather than converted, because a person
+	# interrupting a run means to stop, not to see it recorded as a step failure.
+	failure = None
+	interrupted = None
 	try:
 		for index, step in enumerate(document['step']):
 			if time.monotonic() >= deadline:
@@ -342,15 +455,34 @@ def run(document, lab, verbose=False):
 			limit = min(step.get('timeout', 30) * TIME_SCALE, remaining)
 			label = f'{index + 1}/{len(document["step"])} {step["do"]}'
 			at = time.monotonic()
-			run_step(step, guest, lab, limit, index)
+			try:
+				run_step(step, guest, lab, limit, index)
+			except ScenarioError:
+				raise
+			except SystemExit as error:
+				# The protocol layer's way of reporting a refusal or a lost connection. It names the
+				# step it happened in from here; as a bare SystemExit it named nothing and took the
+				# whole runner with it.
+				raise ScenarioError(f'step {index + 1} ({step["do"]}): the control protocol gave up: {error}') from None
+			except (OSError, struct.error, ValueError) as error:
+				raise ScenarioError(f'step {index + 1} ({step["do"]}): {type(error).__name__}: {error}') from None
 			if verbose:
 				print(f'     {label} in {(time.monotonic() - at) * 1000:.0f} ms')
-	except ScenarioError as failure:
+	except ScenarioError as error:
+		failure = error
+	except BaseException as error:  # noqa: BLE001 - re-raised below, after the guest is given back
+		interrupted = error
+	# Exactly once, whatever happened above, and it must not be able to replace the primary result.
+	try:
+		left = teardown(lab, verbose, baseline, first_run)
+	except BaseException as error:  # noqa: BLE001 - a broken teardown is a finding, not an exit
+		left = [f'teardown raised {type(error).__name__}: {error}']
+	if interrupted is not None:
+		raise interrupted
+	if failure is not None:
 		# The scenario's own result is what the caller is waiting to hear, so a teardown that
 		# also went wrong is appended to it rather than replacing it.
-		left = teardown(lab, verbose, baseline, first_run)
 		raise ScenarioError(f'{failure}; and the scope was not restored: {"; ".join(left)}' if left else str(failure)) from None
-	left = teardown(lab, verbose, baseline, first_run)
 	if left:
 		# A run that passed but left the instance dirty is not a pass. The instance is shared by
 		# every scenario after it, and a scope that could not be given back is the failure this
@@ -379,6 +511,13 @@ def teardown(lab, verbose=False, baseline=None, first_run=True):
 	lab_module.timing_event('scenario', 'cleanup-start')
 	notes = []
 	left = []
+	# ASSIGNED BEFORE THE `try`, all three. `free` was not, and it is read after the handler below:
+	# any failure before the `teardown_state` call - a `stop_launch` that raised, terminal recovery,
+	# the reset - was caught as intended and then the next line read an uninitialized local. Python
+	# raises `UnboundLocalError` there, which replaced both the scenario's own result and the
+	# teardown diagnosis that had just been collected, and took the remaining scenarios with it. The
+	# traceback named a harness variable rather than the guest failure that started it.
+	held, stuck, free = None, None, None
 	try:
 		if lab.stop_launch(10):
 			notes.append('stopped the launched program')
@@ -457,20 +596,22 @@ def run_step(step, guest, lab, limit, index):
 	kind = step['do']
 	where = f'step {index + 1} ({kind})'
 	if kind == 'publish':
-		if not lab.publish(step['artifact'], step['file'], int(limit)):
+		if not lab.publish(step['artifact'], resolve_path(step['file']), int(limit)):
 			raise ScenarioError(f'{where}: publishing {step["artifact"]} failed')
 	elif kind == 'fixture':
-		if not lab.fixture_put(step['name'], step['file'], int(limit)):
+		if not lab.fixture_put(step['name'], resolve_path(step['file']), int(limit)):
 			raise ScenarioError(f'{where}: writing the fixture {step["name"]} failed')
 	elif kind == 'input':
 		if not lab.type_text(step['text'], step.get('enter', True), int(limit)):
 			raise ScenarioError(f'{where}: the guest console refused the input')
 	elif kind == 'key':
 		keys = step['keys'] if 'keys' in step else lab_keys_for_text(step['text'], step.get('enter', True))
-		if not lab.send_keys(keys):
+		# The step's budget reaches the device. A key batch is up to 64 separate monitor operations
+		# and this step declared a deadline none of them had ever been told about.
+		if not lab.send_keys(keys, limit):
 			raise ScenarioError(f'{where}: the emulated keyboard refused the events')
 	elif kind == 'pointer':
-		if not lab.send_pointer(step.get('x'), step.get('y'), step.get('button'), step.get('action', 'click')):
+		if not lab.send_pointer(step.get('x'), step.get('y'), step.get('button'), step.get('action', 'click'), limit):
 			raise ScenarioError(f'{where}: the emulated tablet refused the event')
 	elif kind == 'restored':
 		# In the order named, not merely all present. Order is the property that matters: a
@@ -484,13 +625,14 @@ def run_step(step, guest, lab, limit, index):
 		mark = guest.at
 		end = time.monotonic() + limit
 		while True:
-			missing = out_of_order(guest.raw_since(mark), step['expect'])
+			raw, at = guest.raw_read_since(mark)
+			missing = out_of_order(raw, step['expect'])
 			if missing is None:
 				break
 			if time.monotonic() >= end:
 				raise ScenarioError(f'{where}: the terminal did not restore {missing} in order within {int(limit)} s')
 			time.sleep(0.2)
-		guest.at = guest.mark()
+		guest.at = at
 	elif kind == 'reset':
 		if not lab.reset(int(limit)):
 			raise ScenarioError(f'{where}: reset failed')
@@ -503,10 +645,13 @@ def run_step(step, guest, lab, limit, index):
 	elif kind == 'expect':
 		wanted = step['contains']
 		end = time.monotonic() + limit
-		while time.monotonic() < end:
-			if wanted in guest.output_since(guest.at):
-				guest.at = guest.mark()
+		while True:
+			text, at = guest.read_since(guest.at)
+			if wanted in text:
+				guest.at = at
 				return
+			if time.monotonic() >= end:
+				break
 			time.sleep(0.2)
 		raise ScenarioError(f'{where}: {wanted!r} did not appear within {int(limit)} s')
 	elif kind == 'launch':
@@ -515,9 +660,12 @@ def run_step(step, guest, lab, limit, index):
 			raise ScenarioError(f'{where}: the launcher refused {step["program"]}')
 		guest.launched = ''
 	elif kind == 'output':
+		# EACH POLL GETS WHAT IS LEFT, not the whole step budget again. Every iteration handed
+		# `launch_output` the original limit, so one late call could spend another full step's worth
+		# past the deadline this loop had just computed - and the scenario's total deadline with it.
 		end = time.monotonic() + limit
-		while time.monotonic() < end:
-			text, exited = lab.launch_output(int(limit))
+		while True:
+			text, exited = lab.launch_output(max(1, int(end - time.monotonic())))
 			if text is None:
 				raise ScenarioError(f'{where}: nothing has been launched')
 			guest.launched += text
@@ -525,25 +673,55 @@ def run_step(step, guest, lab, limit, index):
 				return
 			if exited:
 				raise ScenarioError(f'{where}: {step["contains"]!r} never appeared and the program finished')
+			if time.monotonic() >= end:
+				break
 			time.sleep(0.1)
 		raise ScenarioError(f'{where}: {step["contains"]!r} did not appear within {int(limit)} s')
 	elif kind == 'finished':
 		end = time.monotonic() + limit
-		while time.monotonic() < end:
-			text, exited = lab.launch_output(int(limit))
+		while True:
+			text, exited = lab.launch_output(max(1, int(end - time.monotonic())))
 			if text is None:
 				raise ScenarioError(f'{where}: nothing has been launched')
 			guest.launched += text
 			if exited:
 				return
+			if time.monotonic() >= end:
+				break
 			time.sleep(0.1)
 		raise ScenarioError(f'{where}: the program had not finished within {int(limit)} s')
 	elif kind == 'absent':
+		# WATCHED FOR THE WHOLE DECLARED INTERVAL, not sampled once two seconds in.
+		#
+		# This used to `sleep(min(limit, 2))` and then look. Its only caller declares ten seconds,
+		# so eight of them were not observed at all: text emitted after the sample passed the
+		# assertion, and the cursor was then advanced past it so the next step could not see it
+		# either. A negative assertion whose subject is allowed to happen unobserved is a test that
+		# reports success without measuring anything - and this one guards a refusal, so what it
+		# waves through is an incompatible provider being launched.
+		#
+		# Two boundaries, because negative assertions have two honest shapes: watch a fixed quiet
+		# period, or watch until the thing that was supposed to produce nothing has finished. The
+		# cursor advances only over bytes this actually read, so nothing is hidden from the step
+		# after it either.
 		mark = guest.at
-		time.sleep(min(limit, 2))
-		if step['contains'] in guest.output_since(mark):
-			raise ScenarioError(f'{where}: {step["contains"]!r} appeared and should not have')
-		guest.at = guest.mark()
+		until = step.get('until', 'quiet')
+		end = time.monotonic() + limit
+		while True:
+			if step['contains'] in guest.output_since(mark):
+				raise ScenarioError(f'{where}: {step["contains"]!r} appeared and should not have')
+			if until == 'prompt' and lab_module.has_prompt(guest.raw_since(mark)):
+				break
+			if time.monotonic() >= end:
+				if until == 'prompt':
+					raise ScenarioError(f'{where}: no shell prompt within {int(limit)} s, so nothing bounded the assertion')
+				break
+			time.sleep(0.1)
+		# AND THE CURSOR STAYS WHERE IT WAS. This step asserts a negative; consuming the window it
+		# watched would hide the guest's actual output from whatever comes next, which is how the
+		# old implementation could lose a marker twice over - once past its own two-second sample
+		# and once past the cursor it then advanced. A step asserting that nothing appeared has no
+		# business deciding that what did appear has been dealt with.
 
 
 def strip_ansi(data):

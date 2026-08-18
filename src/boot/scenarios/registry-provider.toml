@@ -52,7 +52,7 @@ timeout = 20
 [[step]]
 do = "publish"
 artifact = "process-proto"
-file = "../.build/fixtures/process-proto-shadow"
+file = "{fixtures}/process-proto-shadow"
 timeout = 60
 
 [[step]]
@@ -69,7 +69,7 @@ timeout = 20
 [[step]]
 do = "publish"
 artifact = "process-proto"
-file = "../.build/fixtures/process-proto-incompatible"
+file = "{fixtures}/process-proto-incompatible"
 timeout = 60
 
 [[step]]
@@ -83,9 +83,13 @@ text = "ps"
 # that fails is silent there - and the reason lives in the publication verdict, which named
 # the deciding field when the generation arrived. That the terminal is still working, rather
 # than the input having gone nowhere, is what the last two steps establish.
+# Bounded by the prompt coming back rather than by a fixed sample, so it holds for the WHOLE of
+# `ps` rather than for whichever instant a sleep happened to land on. The runner used to look once,
+# two seconds in, whatever the timeout said - so a `koid=` line printed at 2.1 s passed this.
 [[step]]
 do = "absent"
 contains = "koid="
+until = "prompt"
 timeout = 10
 
 # Rolling the generations away puts the installed provider back, with no restart.

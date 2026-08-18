@@ -16,6 +16,10 @@ declare -A GATES=(
 	["artifact-metadata"]="tools/check-artifact-metadata.sh"
 	["dynamic-report"]="tools/check-dynamic-report.sh --check"
 	["test-tags"]="boot/check-test-tags.sh"
+	# The harness that decides whether every other test passed, tested against fakes. An audit found
+	# four of its oracles reporting success without measuring their subject; each looked correct on a
+	# reading, which is why this is a gate rather than a review note.
+	["boot-harness"]="boot/harness-test.py"
 	["host-tests"]="tools/check-host-tests.sh"
 	["verify-model"]="cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- check"
 	["verify-model-tests"]="cargo test --quiet --manifest-path tools/verify-model/Cargo.toml"

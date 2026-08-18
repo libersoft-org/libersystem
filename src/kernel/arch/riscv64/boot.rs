@@ -107,7 +107,9 @@ _start:
 
 // The boot modules, handed over at RUN time rather than compiled in. riscv64 virt boots the
 // kernel directly with no bootloader hand-off, so the archive arrives as an initrd and the
-// device tree carries its range (`/chosen/linux,initrd-start` / `-end`).
+// device tree carries its range (`/chosen/linux,initrd-start` / `-end`) - which is true now that
+// the runner passes one. It said this for as long as it was false, and the kernel came up with an
+// empty archive on every direct boot.
 //
 // The kernel used to `include_bytes!` the packages from its own OUT_DIR, which made the kernel
 // binary contain the userspace and made building the kernel require a built userspace. It does
@@ -226,6 +228,29 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 		}
 	};
 	let cpu_count = cpu_count.max(1);
+
+	// THE BOOT ARCHIVE, when this is a direct boot rather than a UEFI one.
+	//
+	// The UEFI branch above already took it out of the loader's module list. This is the other path,
+	// and it used to have nothing: the comment on BOOT_MODULES said the archive arrived as an
+	// initrd whose range the device tree carried, and no invocation of the runner had ever passed
+	// one - so every direct boot reached `run_system_manager` with an empty archive and said it was
+	// starting no userspace.
+	//
+	// It really does arrive that way now. OpenSBI hands over the tree QEMU generated for THIS
+	// invocation, so `-initrd` annotates the tree this kernel reads and `/chosen/linux,initrd-start`
+	// and `-end` are the archive's exact range. aarch64 cannot do this - its tree comes from a
+	// separate dump - which is why `boot_archive_range` also takes a fixed probe address; there is
+	// none to give here, because the mechanism that works is the one the platform documents.
+	let archive = match *BOOT_MODULES.lock() {
+		Some(_) => None,
+		None => unsafe { crate::arch::common::bootmem::boot_archive_range(boot_info.map_or(0, |bi| bi.modules_start), boot_info.map_or(0, |bi| bi.modules_end), 0, paging::phys_to_virt) },
+	};
+	if let Some((base, len)) = archive {
+		*BOOT_MODULES.lock() = Some(unsafe { core::slice::from_raw_parts(paging::phys_to_virt(base) as *const u8, len as usize) });
+		crate::serial_println!("riscv64: boot packages at {base:#x}..{:#x} ({len} bytes) - initrd, direct boot", base + len);
+	}
+
 	// Svpbmt, before the first device is mapped. Without it `NO_CACHE` is dropped and MMIO gets
 	// whatever the platform's physical memory attributes say - which is right on QEMU virt and
 	// is not a general answer. With it, an uncacheable request becomes a PBMT=IO leaf and means
@@ -261,6 +286,18 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// `bootmem::devicetree_reservations`.
 	if let Some(tree) = super::dtb::located(dtb) {
 		hole_count = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
+	}
+	// AND THE DIRECT BOOT'S ARCHIVE. Nothing else carves it: `loader_reservations` reads a hand-off
+	// this boot does not have, and the device tree's reservation block does not cover an initrd -
+	// `/chosen` names the range, `/reserved-memory` does not. Those are the bytes every program's
+	// ELF image is read from for the life of the boot, so a pool spanning them hands one out.
+	if let Some((base, len)) = archive {
+		if hole_count < holes.len() {
+			holes[hole_count] = crate::arch::common::bootmem::Hole { start: base, end: base + len };
+			hole_count += 1;
+		} else {
+			crate::serial_println!("riscv64: NO ROOM to reserve the boot archive {base:#x}..{:#x} - the allocator may hand it out", base + len);
+		}
 	}
 	// `banks + holes`, because each reservation splits at most one bank into one extra region.
 	let mut regions = [bootproto::MemRegion { base: 0, length: 0, kind: bootproto::MEM_USABLE, _pad: 0 }; fdt::MAX_RAM_REGIONS + crate::arch::common::bootmem::MAX_HOLES];

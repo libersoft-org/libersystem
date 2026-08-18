@@ -113,14 +113,28 @@ _start:
 );
 
 // The boot modules, handed over at RUN time rather than compiled in. aarch64 virt has no
-// bootloader module hand-off, so the archive arrives as an initrd and the device tree carries
-// its range (`/chosen/linux,initrd-start` / `-end`); this reads it from there.
+// bootloader module hand-off, so on a direct boot the runner loads the archive at a fixed address
+// and this reads it back from there; under UEFI the loader passes it as a named module.
+//
+// NOT AN INITRD, which is what this comment used to say. QEMU enters an ELF kernel with x0 = 0 and
+// places no device tree for it, so the runner dumps a tree from a separate invocation - and that
+// invocation cannot be given `-kernel`/`-initrd` (it segfaults qemu-system-aarch64 10.0.11), so no
+// tree this kernel can ever read carries `/chosen/linux,initrd-start`. riscv64 is the arch where
+// that mechanism works, and it uses it.
 //
 // The kernel used to `include_bytes!` the packages out of its own OUT_DIR, which made the
 // kernel binary contain the userspace and made building the kernel depend on having built the
 // userspace first. It no longer does either: the kernel is the same binary whatever userspace
 // is handed to it, exactly as on x86_64 where its own loader passes the modules.
 static BOOT_MODULES: crate::sync::SpinLock<Option<&'static [u8]>> = crate::sync::SpinLock::new(None);
+
+// Where `boot/qemu-run.sh aarch64` loads the archive on a direct boot, and the one number the two
+// have to agree on (`MODULES_ADDR` there). It sits 16 MiB above the dumped DTB at 0x4A00_0000,
+// which is itself 1 MiB, and both are inside the 512 MiB the `virt` machine gets by default.
+//
+// The LENGTH is deliberately not a second constant: the archive names its own extent, so a longer
+// or shorter package needs no change on either side. See `bootmem::archive_len`.
+const RUNNER_MODULES_ADDR: u64 = 0x4B00_0000;
 
 // The archive the initrd carries, or an empty slice when none was supplied - a kernel booted
 // with no userspace still comes up, it just has nothing to start.
@@ -277,10 +291,31 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 		}
 	};
 
+	use super::paging;
+
+	// THE BOOT ARCHIVE, when this is a direct boot rather than a UEFI one.
+	//
+	// The UEFI branch above already took it out of the loader's module list. This is the other
+	// path, and it used to have nothing: `-kernel` on `virt` has no module hand-off, the comment in
+	// the runner claimed an initrd carried the archive, and no invocation had ever passed one - so
+	// every direct boot reached `run_system_manager` with an empty archive and said it was starting
+	// no userspace. The runner loads the init package at MODULES_ADDR now, and this reads it back.
+	//
+	// The address is the agreement, and it is one number rather than two: the archive states its own
+	// extent in its PKGARCH1 header. `boot_archive_range` prefers a device-tree initrd range when a
+	// bootloader wrote one, which this machine cannot do and riscv64 can.
+	let archive = match *BOOT_MODULES.lock() {
+		Some(_) => None,
+		None => unsafe { crate::arch::common::bootmem::boot_archive_range(boot_info.map_or(0, |bi| bi.modules_start), boot_info.map_or(0, |bi| bi.modules_end), RUNNER_MODULES_ADDR, paging::phys_to_virt) },
+	};
+	if let Some((base, len)) = archive {
+		*BOOT_MODULES.lock() = Some(unsafe { core::slice::from_raw_parts(paging::phys_to_virt(base) as *const u8, len as usize) });
+		crate::serial_println!("aarch64: boot packages at {base:#x}..{:#x} ({len} bytes) - direct boot", base + len);
+	}
+
 	// Seed the portable frame allocator from the device-tree memory map, then bring
 	// up the kernel heap in the higher half (the TTBR1 root is already live from the
 	// boot stub). After this, `alloc` collections (Box, Vec, ...) are usable.
-	use super::paging;
 	// Publish the direct-map offset so the portable subsystems (heap, ELF loader,
 	// ...) reach physical frames the same way this backend does (phys | KOFF).
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
@@ -308,6 +343,19 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// `bootmem::devicetree_reservations`.
 	if let Some(tree) = super::dtb::located(dtb) {
 		hole_count = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
+	}
+	// AND THE DIRECT BOOT'S ARCHIVE. Nothing else carves it: `loader_reservations` reads a hand-off
+	// this boot does not have, and the device tree reserves its own blob and its reservation block
+	// and knows nothing about a range the runner loaded with `-device loader`. Those are the bytes
+	// every program's ELF image is read from for the whole life of the boot, so a pool spanning
+	// them hands one out - the `BadImage` this milestone has already paid for once.
+	if let Some((base, len)) = archive {
+		if hole_count < holes.len() {
+			holes[hole_count] = crate::arch::common::bootmem::Hole { start: base, end: base + len };
+			hole_count += 1;
+		} else {
+			crate::serial_println!("aarch64: NO ROOM to reserve the boot archive {base:#x}..{:#x} - the allocator may hand it out", base + len);
+		}
 	}
 	// `banks + holes`, because each reservation splits at most one bank into one extra region.
 	let mut regions = [bootproto::MemRegion { base: 0, length: 0, kind: bootproto::MEM_USABLE, _pad: 0 }; fdt::MAX_RAM_REGIONS + crate::arch::common::bootmem::MAX_HOLES];

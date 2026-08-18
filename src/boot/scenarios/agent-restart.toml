@@ -33,7 +33,7 @@ do = "prompt"
 [[step]]
 do = "publish"
 artifact = "uname"
-file = "../.build/fixtures/uname-shadow"
+file = "{fixtures}/uname-shadow"
 timeout = 60
 
 [[step]]
@@ -64,7 +64,7 @@ timeout = 20
 [[step]]
 do = "publish"
 artifact = "uname"
-file = "../.build/fixtures/uname-shadow"
+file = "{fixtures}/uname-shadow"
 timeout = 60
 
 [[step]]

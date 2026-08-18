@@ -12,15 +12,16 @@
 #   TEST=1    test mode (isa-debug-exit or semihosting, maps exit code to pass/fail)
 #   DEV_PROFILE=1 development profile: names it over fw_cfg so the guest reports it and
 #             DeviceManager starts a control agent, and attaches the channel the agent
-#             answers on. On x86_64 that is the persistent instance `just dev-up` owns; on
+#             answers on. On x86_64 that is the persistent instance `just lab dev-up` owns; on
 #             the other targets it is a one-shot guest a scenario runner drives cold, which
 #             is why this is not x86_64-only. Refused together with TEST.
 #   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log or stdio)
 #   SMP=N     override core/hart count (default: nproc, with arch-specific caps)
 #   MEM=      override RAM (default varies by arch)
 #   DISPLAYS= space-separated list of vnc and/or spice (empty = headless)
-#   VNC_ADDR= VNC bind address (default 0.0.0.0:0)
+#   VNC_ADDR= VNC bind address (default 127.0.0.1:0 - loopback, see the note at -vnc below)
 #   SPICE_PORT= SPICE TCP port (default 5930)
+#   SPICE_ADDR= SPICE bind address (default 127.0.0.1)
 #   AUDIO_WAV= capture virtio-sound output to this WAV file (overrides spice/none)
 #   QEMU_EXTRA= extra QEMU arguments
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
@@ -29,7 +30,9 @@
 #             specification puts AArch64 firmware on most server-class parts - and which the
 #             loader's EL2 branch had never once executed under, because QEMU's `virt` starts at
 #             EL1 by default. Only meaningful with UEFI=1: the branch is in the loader.
-#   OVMF_*, AAVMF_*, BIOS=, UBOOT=, LOADER_EFI=, DTB_ADDR= arch-specific firmware
+#   INIT_PKG= boot-module archive for a direct (non-UEFI) aarch64/riscv64 boot
+#             (default .build/boot/init-<arch>.pkg)
+#   OVMF_*, AAVMF_*, BIOS=, UBOOT=, LOADER_EFI=, DTB_ADDR=, MODULES_ADDR= arch-specific firmware
 
 set -euo pipefail
 
@@ -110,12 +113,148 @@ qemu_prepare_system_disk() {
 	# Larger than the image so the volume has room to grow; the storage service reports a volume
 	# that spans less than its container rather than silently resizing it.
 	local size=$((128 * 1024 * 1024))
-	if [[ ! -f "$disk" || "$(stat -c%s "$disk")" -ne "$size" || "$volume_image" -nt "$disk" ]]; then
-		rm -f "$disk"
-		truncate -s "$size" "$disk"
-		dd if="$volume_image" of="$disk" bs=1M conv=notrunc status=none
+	# KEYED ON THE VOLUME'S CONTENT, not on its modification time.
+	#
+	# The test was `existence, exact size, and source -nt destination`. An mtime is not a content
+	# identity: a restored file, a checkout, a copy that preserved timestamps, or any build that
+	# writes an older stamp leaves the disk untouched with different bytes behind it. And the copy
+	# went straight into the canonical path, so an interrupted `dd` left a half-written system disk
+	# that the size check then accepted forever.
+	local key
+	key="$(sha256sum "$volume_image" | awk '{print $1}')"
+	if [[ -f "$disk" && "$(stat -c%s "$disk")" -eq "$size" && -f "$disk.key" && "$(<"$disk.key")" == "$key" ]]; then
+		return 0
 	fi
+	local candidate="$disk.$$.candidate"
+	rm -f "$candidate"
+	truncate -s "$size" "$candidate"
+	dd if="$volume_image" of="$candidate" bs=1M conv=notrunc status=none || {
+		rm -f "$candidate"
+		echo "qemu-run: the system disk could not be written from $volume_image" >&2
+		return 1
+	}
+	sync "$candidate" 2>/dev/null || true
+	rm -f "$disk"
+	mv "$candidate" "$disk"
+	printf '%s\n' "$key" >"$disk.key.tmp.$$"
+	mv "$disk.key.tmp.$$" "$disk.key"
 	return 0
+}
+
+# THE FIXTURE MEDIA, AND WHY THEY ARE KEYED RATHER THAN MERELY PRESENT.
+#
+# These four images used to be generated only when the output path did not exist. Nothing else was
+# consulted: not the files copied into them, not the recipe, not the tool that formatted them. So a
+# change to `volume/hello.txt`, to `motd.txt`, to the mkfs options or to this script never
+# invalidated anything - the images in this tree were dated three weeks before the script that
+# claims to produce them, and every run reused them solely because they were there.
+#
+# Worse than stale: `xorriso` failure was swallowed with `|| true`, and mount, copy and umount
+# failures likewise, AFTER the output file had already been created. A formatted but empty image, or
+# a half-written one, was left at the canonical path where the existence check would protect it
+# forever - so a filesystem test could exercise an empty filesystem and report it as the guest's
+# behaviour, and a fixture-setup failure was indistinguishable from a guest regression.
+#
+# The rule now: build into a candidate, VERIFY the bytes contain what they were supposed to, then
+# rename into place and record the key. A failure leaves the previous valid image or no image, never
+# a partial canonical one.
+FIXTURE_SOURCES=(hello.txt motd.txt)
+
+# What a fixture medium is keyed on: the recipe, the tool that formats it, and every byte of the
+# source directory.
+media_key() {
+	local kind="$1" voldir="$2"
+	shift 2
+	{
+		printf 'format=liber-qemu-fixture-v1\n'
+		printf 'kind=%s\n' "$kind"
+		printf 'recipe=%s\n' "$(sha256sum "$QEMU_BOOT_DIR/qemu-run.sh" | awk '{print $1}')"
+		local tool
+		for tool in "$@"; do
+			printf 'tool=%s path=%s version=%s\n' "$tool" "$(command -v "$tool" 2>/dev/null || echo absent)" "$("$tool" --version 2>&1 | head -n 1 || echo unknown)"
+		done
+		find "$voldir" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+	} | sha256sum | awk '{print $1}'
+}
+
+media_current() {
+	local path="$1" key="$2"
+	[[ -f "$path" && -f "$path.key" && "$(<"$path.key")" == "$key" ]]
+}
+
+# Publish a verified candidate: rename first, then record the key. In that order, because a key
+# written before the rename would describe an image that is not there yet.
+media_publish() {
+	local candidate="$1" final="$2" key="$3"
+	mv "$candidate" "$final"
+	printf '%s\n' "$key" >"$final.key.tmp.$$"
+	mv "$final.key.tmp.$$" "$final.key"
+}
+
+# Does this image actually CONTAIN the fixture files? Verification is per format, because "the
+# bytes are in there somewhere" is only readable for the format that stores names as plain ASCII.
+#
+# What every one of these has to distinguish is "formatted and populated" from "formatted and
+# empty" - the second is exactly the state that used to be written to the canonical path and then
+# protected by the existence check forever.
+
+# ISO9660 keeps its directory records in ASCII, so the names are in the image as written.
+media_iso_holds_fixtures() {
+	local image="$1" name
+	for name in "${FIXTURE_SOURCES[@]}"; do
+		grep -qa "$name" "$image" || return 1
+	done
+	return 0
+}
+
+# A FAT built with mtools is read back with mtools.
+media_fat_holds_fixtures() {
+	local image="$1" listing name
+	listing="$(mdir -i "$image" :: 2>/dev/null)" || return 1
+	for name in "${FIXTURE_SOURCES[@]}"; do
+		# mtools prints the 8.3 and long names in one listing; the stem is what both share.
+		grep -qi "${name%%.*}" <<<"$listing" || return 1
+	done
+	return 0
+}
+
+# Mount, copy, VERIFY WHILE MOUNTED, unmount.
+#
+# The mounted filesystem is the only reader either exFAT or UDF has here, so the check belongs
+# inside the mount rather than after it: names on both are UTF-16 and a raw byte search finds
+# nothing even when the copy worked. Each file has to be present and be the size of its source,
+# which is what separates a copy that happened from one that was suppressed with `|| true`.
+#
+# And the UNMOUNT IS CHECKED. It used to be suppressed, which leaves a host loop mount live on an
+# image QEMU is about to attach writable from the other side - both halves then writing one
+# filesystem, which is the corruption this file is otherwise careful to avoid.
+media_populate_mounted() {
+	local image="$1" mountpoint="$2" options="$3" voldir="$4"
+	mkdir -p "$mountpoint"
+	mount -o "$options" "$image" "$mountpoint" 2>/dev/null || {
+		rmdir "$mountpoint" 2>/dev/null || true
+		return 1
+	}
+	# THE FIXTURE FILES, named. `cp "$voldir"/*` swept in `audio/`, `bin/` and `wallpapers/` too,
+	# and `cp` without `-r` refuses a directory - so the copy reported failure on every run for
+	# reasons that had nothing to do with the fixtures, which is part of why its status was being
+	# thrown away.
+	local status=0 name
+	for name in "${FIXTURE_SOURCES[@]}"; do
+		cp "$voldir/$name" "$mountpoint/$name" 2>/dev/null || status=1
+	done
+	for name in "${FIXTURE_SOURCES[@]}"; do
+		if [[ ! -f "$mountpoint/$name" ]] || [[ "$(stat -c%s "$mountpoint/$name")" -ne "$(stat -c%s "$voldir/$name")" ]]; then
+			status=1
+		fi
+	done
+	sync
+	if ! umount "$mountpoint" 2>/dev/null; then
+		echo "qemu-run: could not unmount $mountpoint - the host still holds $image and QEMU must not attach it" >&2
+		return 2
+	fi
+	rmdir "$mountpoint" 2>/dev/null || true
+	return "$status"
 }
 
 # Build the reusable exFAT/FAT, ISO9660 and UDF images. The caller owns QEMU attachment
@@ -132,49 +271,68 @@ qemu_prepare_media_images() {
 	fi
 
 	FAT_DISK="$QEMU_BUILD_DIR/fat-media${suffix}.img"
-	if [[ ! -f "$FAT_DISK" ]] && command -v mkfs.exfat >/dev/null; then
-		truncate -s 16M "$FAT_DISK"
-		if mkfs.exfat "$FAT_DISK" >/dev/null 2>&1; then
-			local fmnt="$QEMU_BUILD_DIR/media-mnt${mount_suffix}"
-			mkdir -p "$fmnt"
-			if mount -o loop "$FAT_DISK" "$fmnt" 2>/dev/null; then
-				cp "$voldir/hello.txt" "$voldir/motd.txt" "$fmnt"/ 2>/dev/null || true
-				umount "$fmnt" 2>/dev/null || true
+	local fat_key candidate
+	fat_key="$(media_key fat "$voldir" mkfs.exfat mformat mcopy)"
+	if ! media_current "$FAT_DISK" "$fat_key"; then
+		candidate="$FAT_DISK.$$.candidate"
+		rm -f "$candidate"
+		if command -v mkfs.exfat >/dev/null; then
+			truncate -s 16M "$candidate"
+			if mkfs.exfat "$candidate" >/dev/null 2>&1 && media_populate_mounted "$candidate" "$QEMU_BUILD_DIR/media-mnt${mount_suffix}" loop "$voldir"; then
+				media_publish "$candidate" "$FAT_DISK" "$fat_key"
+			else
+				rm -f "$candidate"
 			fi
-			rmdir "$fmnt" 2>/dev/null || true
-		else
-			rm -f "$FAT_DISK"
 		fi
-	fi
-	if [[ "$allow_fallbacks" == "1" && ! -f "$FAT_DISK" ]] && command -v mformat >/dev/null && command -v mcopy >/dev/null; then
-		truncate -s 16M "$FAT_DISK"
-		mformat -i "$FAT_DISK" -F ::
-		mcopy -i "$FAT_DISK" "$voldir/hello.txt" ::hello.txt
-		mcopy -i "$FAT_DISK" "$voldir/motd.txt" ::motd.txt
+		if [[ "$allow_fallbacks" == "1" ]] && ! media_current "$FAT_DISK" "$fat_key" && command -v mformat >/dev/null && command -v mcopy >/dev/null; then
+			rm -f "$candidate"
+			truncate -s 16M "$candidate"
+			if mformat -i "$candidate" -F :: && mcopy -i "$candidate" "$voldir/hello.txt" ::hello.txt && mcopy -i "$candidate" "$voldir/motd.txt" ::motd.txt && media_fat_holds_fixtures "$candidate"; then
+				media_publish "$candidate" "$FAT_DISK" "$fat_key"
+			else
+				rm -f "$candidate"
+			fi
+		fi
 	fi
 
 	ISO_DISK="$QEMU_BUILD_DIR/iso-media${suffix}.iso"
-	if [[ ! -f "$ISO_DISK" ]]; then
+	local iso_key
+	iso_key="$(media_key iso "$voldir" xorriso genisoimage)"
+	if ! media_current "$ISO_DISK" "$iso_key"; then
+		candidate="$ISO_DISK.$$.candidate"
+		rm -f "$candidate"
+		local made=0
 		if command -v xorriso >/dev/null; then
-			xorriso -as mkisofs -quiet -J -R -o "$ISO_DISK" "$voldir" 2>/dev/null || true
+			xorriso -as mkisofs -quiet -J -R -o "$candidate" "$voldir" 2>/dev/null && made=1
 		elif [[ "$allow_fallbacks" == "1" ]] && command -v genisoimage >/dev/null; then
-			genisoimage -quiet -J -R -o "$ISO_DISK" "$voldir" 2>/dev/null || true
+			genisoimage -quiet -J -R -o "$candidate" "$voldir" 2>/dev/null && made=1
+		fi
+		if ((made == 1)) && media_iso_holds_fixtures "$candidate"; then
+			media_publish "$candidate" "$ISO_DISK" "$iso_key"
+		else
+			rm -f "$candidate"
 		fi
 	fi
 
 	UDF_DISK="$QEMU_BUILD_DIR/udf-media${suffix}.udf"
-	if [[ ! -f "$UDF_DISK" ]] && command -v mkfs.udf >/dev/null; then
-		dd if=/dev/zero of="$UDF_DISK" bs=1M count=8 status=none 2>/dev/null || true
-		if mkfs.udf --media-type=hd --blocksize=2048 "$UDF_DISK" >/dev/null 2>&1; then
-			local umnt="$QEMU_BUILD_DIR/udf-mnt${mount_suffix}"
-			mkdir -p "$umnt"
-			if mount -o "$udf_mount_options" "$UDF_DISK" "$umnt" 2>/dev/null; then
-				cp "$voldir"/* "$umnt"/ 2>/dev/null || true
-				umount "$umnt" 2>/dev/null || true
-			fi
-			rmdir "$umnt" 2>/dev/null || true
+	local udf_key
+	udf_key="$(media_key udf "$voldir" mkfs.udf)"
+	if ! media_current "$UDF_DISK" "$udf_key" && command -v mkfs.udf >/dev/null; then
+		candidate="$UDF_DISK.$$.candidate"
+		rm -f "$candidate"
+		dd if=/dev/zero of="$candidate" bs=1M count=8 status=none
+		if mkfs.udf --media-type=hd --blocksize=2048 "$candidate" >/dev/null 2>&1 && media_populate_mounted "$candidate" "$QEMU_BUILD_DIR/udf-mnt${mount_suffix}" "$udf_mount_options" "$voldir"; then
+			media_publish "$candidate" "$UDF_DISK" "$udf_key"
 		else
-			rm -f "$UDF_DISK"
+			rm -f "$candidate"
+			# SAID OUT LOUD, because this one has never worked and nothing reported it.
+			#
+			# Measured on this host: the kernel mounts a `mkfs.udf --media-type=hd` image READ-ONLY,
+			# so the copy has always failed - `cp: Read-only file system` - and the old code
+			# suppressed that and kept the empty filesystem it had just created. Every UDF fixture
+			# in this tree is therefore an EMPTY UDF volume, and has been since it was first built.
+			# Nothing is published now, so whatever was there stays and this line says why.
+			echo "qemu-run: the UDF fixture could not be populated (the host mounts this image read-only); ${UDF_DISK##*/} is unchanged and holds no fixture files" >&2
 		fi
 	fi
 }
@@ -183,14 +341,24 @@ qemu_prepare_usb_image() {
 	local suffix="$1"
 	local voldir="$QEMU_BOOT_DIR/../volume"
 	USB_DISK="$QEMU_BUILD_DIR/usb-media${suffix}.img"
-	if [[ -f "$USB_DISK" ]]; then
+	local key candidate
+	key="$(media_key usb "$voldir" mformat mcopy)"
+	media_current "$USB_DISK" "$key" && return
+	command -v mformat >/dev/null && command -v mcopy >/dev/null || {
+		# A 16 MB file of zeros used to be left here when mtools was absent, and a zeroed image is
+		# not a FAT filesystem - the guest reports it as unreadable media, which is a true statement
+		# about a fixture that was never built.
+		echo "qemu-run: mtools (mformat/mcopy) is required for the USB fixture; none was created" >&2
 		return
-	fi
-	truncate -s 16M "$USB_DISK"
-	if command -v mformat >/dev/null && command -v mcopy >/dev/null; then
-		mformat -i "$USB_DISK" -F ::
-		mcopy -i "$USB_DISK" "$voldir/hello.txt" ::hello.txt 2>/dev/null || true
-		mcopy -i "$USB_DISK" "$voldir/motd.txt" ::motd.txt 2>/dev/null || true
+	}
+	candidate="$USB_DISK.$$.candidate"
+	rm -f "$candidate"
+	truncate -s 16M "$candidate"
+	if mformat -i "$candidate" -F :: && mcopy -i "$candidate" "$voldir/hello.txt" ::hello.txt && mcopy -i "$candidate" "$voldir/motd.txt" ::motd.txt && media_fat_holds_fixtures "$candidate"; then
+		media_publish "$candidate" "$USB_DISK" "$key"
+	else
+		rm -f "$candidate"
+		echo "qemu-run: the USB fixture could not be built; the previous one (if any) is unchanged" >&2
 	fi
 }
 
@@ -301,13 +469,47 @@ qemu_attach_virt_interactive() {
 	arr+=(-device "virtio-sound-pci,audiodev=snd0")
 }
 
+# PER-RUN SCRATCH, SWEPT BY OWNERSHIP.
+#
+# The mutable boot inputs - the ESP, the stripped kernel, the firmware variable store - were fixed
+# per-architecture paths, deleted and repopulated in place with no lock. Two UEFI runs could
+# therefore interleave: one deleted and reformatted the ESP while the other was populating it or
+# about to attach it, so a guest could boot a partially written filesystem or the other run's
+# kernel. The firmware store was worse - each run deleted ALL `ovmf-vars.*.fd` before making its
+# own, so a run that had just created its copy, and had not yet opened it, found it gone.
+#
+# Every one of them now carries this shell's pid, and this shell is the process that BECOMES QEMU
+# (the runner execs it) or waits for it. So the pid in the name is alive exactly as long as the file
+# is in use, and a sweep can tell a leftover from a live run's file with certainty - no age
+# heuristic, no wildcard that reaches into somebody else's run.
+scratch_sweep() {
+	local prefix="$1" suffix="$2" path owner
+	for path in "$prefix".*"$suffix"; do
+		[[ -e "$path" ]] || continue
+		owner="${path#"$prefix".}"
+		owner="${owner%"$suffix"}"
+		if [[ ! "$owner" =~ ^[0-9]+$ ]]; then
+			# A name from before this scheme - `mktemp` produced random suffixes, which cannot be
+			# attributed to a run at all. Removed only when it is a day old, which no live run's
+			# file can be.
+			[[ -n "$(find "$path" -maxdepth 0 -mtime +1 2>/dev/null)" ]] && rm -f "$path"
+			continue
+		fi
+		[[ "$owner" == "$$" ]] && continue
+		kill -0 "$owner" 2>/dev/null && continue
+		rm -f "$path"
+	done
+}
+
 qemu_build_esp() {
 	local arch="$1"
 	local kernel="$2"
 	local loader_efi="$3"
 	local boot_name="$4"
-	ESP="$QEMU_BUILD_DIR/esp-${arch}.img"
-	STAGED_KERNEL="$QEMU_BUILD_DIR/kernel-${arch}.stripped"
+	scratch_sweep "$QEMU_BUILD_DIR/esp-${arch}" .img
+	scratch_sweep "$QEMU_BUILD_DIR/kernel-${arch}" .stripped
+	ESP="$QEMU_BUILD_DIR/esp-${arch}.$$.img"
+	STAGED_KERNEL="$QEMU_BUILD_DIR/kernel-${arch}.$$.stripped"
 	llvm-strip --strip-debug -o "$STAGED_KERNEL" "$kernel" 2>/dev/null || cp "$kernel" "$STAGED_KERNEL"
 	local esp_mb=$((($(stat -c%s "$STAGED_KERNEL") + $(stat -c%s "$loader_efi")) / 1048576 + 16))
 	rm -f "$ESP"
@@ -404,6 +606,21 @@ fi
 # rather than boot an ordinary guest that merely looks like a development one.
 if [[ "${DEV_PROFILE:-0}" == "1" && "${TEST:-0}" == "1" ]]; then
 	echo "qemu-run: DEV_PROFILE and TEST are mutually exclusive" >&2
+	exit 1
+fi
+
+# AND REJECT A DRIVEN GUEST ON A DIRECT BOOT, on the two targets whose direct path can carry only
+# one blob.
+#
+# `-kernel` on `virt` has no bootloader module hand-off: the machine takes an initrd and nothing
+# else, so a direct boot can be handed the init package and NOT the system volume package beside it.
+# That starts SystemManager and stops there - no shell, no development agent, no control channel -
+# and `scenario-cold` then waited for a handshake that could never arrive while the guest looked
+# alive. The UEFI path hands over both, which is what a driven guest needs, so a request for one on
+# these targets says so instead of hanging.
+if [[ "${DEV_PROFILE:-0}" == "1" && "${UEFI:-0}" != "1" && "$TARGET_ARCH" != "x86_64" ]]; then
+	echo "qemu-run: DEV_PROFILE on $TARGET_ARCH needs UEFI=1 - a direct -kernel boot carries one" >&2
+	echo "          module, so it can start SystemManager but not the shell or the dev agent" >&2
 	exit 1
 fi
 
@@ -519,9 +736,8 @@ qemu_run_x86_64() {
 		echo "qemu-run: OVMF firmware not found (install the 'ovmf' package)" >&2
 		exit 1
 	}
-	rm -f "$QEMU_BUILD_DIR/ovmf-vars."*.fd
-	local ovmf_vars
-	ovmf_vars="$(mktemp "$QEMU_BUILD_DIR/ovmf-vars.XXXXXX.fd")"
+	scratch_sweep "$QEMU_BUILD_DIR/ovmf-vars" .fd
+	local ovmf_vars="$QEMU_BUILD_DIR/ovmf-vars.$$.fd"
 	cp "$ovmf_vars_src" "$ovmf_vars"
 
 	local qemu_args=(
@@ -552,14 +768,14 @@ qemu_run_x86_64() {
 	# outright, so the answer is to refuse early rather than to hand out parallel disks.
 	if [[ "${TEST:-0}" != "1" && "${DEV_PROFILE:-0}" != "1" && -e "$QEMU_BUILD_DIR/dev-instance.lock" ]] && ! flock -n "$QEMU_BUILD_DIR/dev-instance.lock" true 2>/dev/null; then
 		echo "qemu-run: a development instance is running and holds the system, media and USB images" >&2
-		echo "qemu-run: release it with \`just dev-down\` (or \`just dev-status\` to see what it is)" >&2
+		echo "qemu-run: release it with \`just lab dev-down\` (or \`just lab dev-status\` to see what it is)" >&2
 		exit 1
 	fi
 
 	# Network: user-mode NIC with optional hostfwd for interactive runs.
 	#
 	# The persistent development instance forwards a different port from an ordinary run,
-	# because otherwise the two cannot coexist: the port was hard-coded, so `just run` while a
+	# because otherwise the two cannot coexist: the port was hard-coded, so `./run.sh` while a
 	# `dev-up` instance was alive died on
 	#   Could not set up host forwarding rule 'tcp:127.0.0.1:5555-:80'
 	# which names the port and not the reason. That is the same rule the instance already
@@ -582,7 +798,7 @@ qemu_run_x86_64() {
 		listeners="$(ss -ltn "sport = :$port" 2>/dev/null || true)"
 		if grep -q LISTEN <<<"$listeners"; then
 			echo "qemu-run: host port $port is already in use, so this guest cannot forward it" >&2
-			echo "qemu-run: a persistent development instance is the usual holder - check \`just dev-status\`, release it with \`just dev-down\`" >&2
+			echo "qemu-run: a persistent development instance is the usual holder - check \`just lab dev-status\`, release it with \`just lab dev-down\`" >&2
 			echo "qemu-run: or run this guest on another port with HOSTFWD_PORT=<port>" >&2
 			exit 1
 		fi
@@ -805,9 +1021,8 @@ qemu_run_aarch64() {
 		# write each other's firmware variables, and the script `exec`s QEMU so no trap can clean up
 		# afterwards - stale copies from earlier runs are unlinked here instead, while a still-
 		# running instance keeps its own alive through its open descriptor.
-		rm -f "$QEMU_BUILD_DIR/aavmf-vars."*.fd
-		local vars
-		vars="$(mktemp "$QEMU_BUILD_DIR/aavmf-vars.XXXXXX.fd")"
+		scratch_sweep "$QEMU_BUILD_DIR/aavmf-vars" .fd
+		local vars="$QEMU_BUILD_DIR/aavmf-vars.$$.fd"
 		cp "$aavmf_vars" "$vars"
 		# ESP goes last so system volume enumerates ahead of it.
 		qemu_attach_virtio_blk qemu_args "$ESP" esp "disable-legacy=on"
@@ -826,11 +1041,38 @@ qemu_run_aarch64() {
 			${QEMU_EXTRA:-}
 	fi
 
-	# The boot modules, handed over as an initrd. This machine has no bootloader module
-	# hand-off, so the kernel receives the archive here and finds its range in the device tree -
-	# which is why the DTB below is dumped WITH `-initrd` and `-kernel` present: dumping it
-	# without them yields a tree whose /chosen carries no initrd range, and the kernel would
-	# come up with no userspace at all.
+	# THE BOOT MODULES, and they are handed over here rather than not at all.
+	#
+	# This machine has no bootloader module hand-off, so a direct boot used to reach the kernel with
+	# an empty boot archive: the comment that stood here said the archive arrived as an initrd whose
+	# range the device tree carried, and neither the dump below nor the command under it had ever
+	# had an `-initrd`. The kernel says what that costs - "no boot packages were handed over -
+	# userspace is not started" - so every direct aarch64 boot came up with no userspace at all.
+	#
+	# IT CANNOT ARRIVE AS AN INITRD ON THIS PATH, which is why the archive is loaded at a fixed
+	# address instead. The kernel is an ELF rather than a Linux Image, so QEMU enters it with x0 = 0
+	# and places no device tree for it (measured: `arch: aarch64 | EL1 | DTB 0x0`) - hence the
+	# separate dump loaded at DTB_ADDR. And that dump cannot be taken with the real arguments:
+	# `dumpdtb` together with `-kernel` SEGFAULTS qemu-system-aarch64 10.0.11, with and without
+	# `-initrd`. So the tree this guest reads is not the tree an initrd would have annotated, and
+	# `/chosen/linux,initrd-start` can never appear in it. `-device loader` is the mechanism that is
+	# left, it is the same one the DTB itself already uses on this line, and the address is fixed by
+	# agreement with the kernel's `arch::aarch64::boot` rather than discovered - the archive names
+	# its own length in its PKGARCH1 header, so only the start has to be agreed on.
+	#
+	# ONE BLOB, so this is the init package alone: the system volume package does not fit through a
+	# single hand-off and a driven guest needs it, which is why DEV_PROFILE on this target is
+	# refused above unless UEFI=1.
+	local modules_addr="${MODULES_ADDR:-0x4B000000}"
+	local module_args=()
+	if [[ "${TEST:-0}" != "1" ]]; then
+		local init_pkg="${INIT_PKG:-$QEMU_BUILD_DIR/init-aarch64.pkg}"
+		[[ -f "$init_pkg" ]] || {
+			echo "qemu-run: init package not found: $init_pkg (run 'just build --arch aarch64')" >&2
+			exit 1
+		}
+		module_args+=(-device "loader,file=$init_pkg,addr=$modules_addr")
+	fi
 
 	# Direct -kernel boot: dump DTB and load it at DTB_ADDR.
 	local dtb_file
@@ -843,19 +1085,31 @@ qemu_run_aarch64() {
 		-m "$mem" \
 		-display none >/dev/null 2>&1
 
-	exec qemu-system-aarch64 \
+	# NOT `exec`, and the difference is the trap above. Bash does not run an EXIT trap when the
+	# shell successfully replaces itself, so every direct aarch64 start since this path existed
+	# abandoned its `/tmp/qemu-virt-XXXXXX.dtb`. QEMU runs as a child instead and this shell waits
+	# for it, keeping the same foreground process group - a terminal interrupt still reaches QEMU -
+	# and then removes exactly the file it created and exits with the child's status.
+	local qemu_status=0
+	qemu-system-aarch64 \
 		-machine "$machine" \
 		"${cpu_args[@]}" \
 		-smp "$smp" \
 		-m "$mem" \
 		-kernel "$kernel" \
 		-device "loader,file=$dtb_file,addr=$dtb_addr" \
+		"${module_args[@]}" \
 		-serial "$serial" \
 		"${DISPLAY_ARGS[@]}" \
 		-no-reboot \
 		"${test_args[@]}" \
 		"${qemu_args[@]}" \
-		${QEMU_EXTRA:-}
+		${QEMU_EXTRA:-} &
+	local qemu_pid=$!
+	wait "$qemu_pid" || qemu_status=$?
+	rm -f "$dtb_file"
+	trap - EXIT
+	exit "$qemu_status"
 }
 
 qemu_run_riscv64() {
@@ -970,6 +1224,28 @@ qemu_run_riscv64() {
 			${QEMU_EXTRA:-}
 	fi
 
+	# THE BOOT MODULES, as an initrd - the mechanism this machine actually has.
+	#
+	# Unlike aarch64 above, OpenSBI hands the kernel a device tree in a1, and it is the tree QEMU
+	# generated for THIS invocation. So `-initrd` annotates the tree the kernel reads:
+	# `/chosen/linux,initrd-start` and `-end` carry the archive's exact range, which is where
+	# `arch::riscv64::boot` takes it from. Measured on qemu-system-riscv64 10.0.11: with
+	# `-initrd init-riscv64.pkg` the dumped tree gains both properties, eight bytes each, and their
+	# difference is the file's size to the byte.
+	#
+	# Without this the kernel came up with an empty boot archive and printed that it was starting no
+	# userspace, on every direct riscv64 boot. ONE BLOB, as on aarch64: the init package, not the
+	# system volume package with it - see the DEV_PROFILE refusal near the top.
+	local initrd_args=()
+	if [[ "${TEST:-0}" != "1" ]]; then
+		local init_pkg="${INIT_PKG:-$QEMU_BUILD_DIR/init-riscv64.pkg}"
+		[[ -f "$init_pkg" ]] || {
+			echo "qemu-run: init package not found: $init_pkg (run 'just build --arch riscv64')" >&2
+			exit 1
+		}
+		initrd_args+=(-initrd "$init_pkg")
+	fi
+
 	# Direct -kernel boot: OpenSBI jumps to kernel entry.
 	exec qemu-system-riscv64 \
 		-machine "virt,aia=aplic-imsic" \
@@ -978,6 +1254,7 @@ qemu_run_riscv64() {
 		-m "$mem" \
 		-bios "$bios" \
 		-kernel "$kernel" \
+		"${initrd_args[@]}" \
 		-serial "$serial" \
 		"${DISPLAY_ARGS[@]}" \
 		-no-reboot \

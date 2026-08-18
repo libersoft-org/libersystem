@@ -17,7 +17,7 @@ do = "prompt"
 [[step]]
 do = "publish"
 artifact = "base-proto"
-file = "../.build/image/x86_64-unknown-none/lib/protocol/base-proto.lslib"
+file = "{staged}/lib/protocol/base-proto.lslib"
 timeout = 60
 
 [[step]]

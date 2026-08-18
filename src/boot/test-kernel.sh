@@ -171,8 +171,15 @@ STALL="${TEST_STALL:-900}"
 STALL_MARK="$RUN_LOG.stall"
 : >"$STALL_MARK"
 rm -f "$STALL_MARK.hit"
+# COMPLETED TESTS, from the runner's own completion lines rather than from any `[ok]` anywhere.
+#
+# It counted every occurrence of `[ok]` in either log, and that string is ordinary display text: a
+# test whose own output contains it, a repeated banner, a driver reporting a device as ok - all of
+# them reset the quiet counter, so a real hang could be held off indefinitely by output that
+# completes nothing. The runner prints `<test id>...\t[ok]` per finished test, so a completion is a
+# line that has BOTH the `...` opener and the marker, which display text does not.
 progress_count() {
-	cat "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | grep -c '\[ok\]' || true
+	cat "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | grep -c -E '^[[:alnum:]_.]+\.\.\..*\[ok\]' || true
 }
 # IT KILLS ITS OWN RUN'S GUEST, BY PID, AND NOTHING ELSE'S.
 #
@@ -202,19 +209,38 @@ progress_count() {
 		if ((quiet >= STALL)); then
 			stuck="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | tail -1 | sed -E 's/\.\.\..*$//' || true)"
 			printf '%s\t%s\n' "${stuck:-unknown}" "$quiet" >"$STALL_MARK.hit"
-			# By pid, and only a guest this shell is an ancestor of. `pgrep -P` walks from our own
-			# process tree rather than matching every QEMU on the machine.
-			victim="$(pgrep -f "qemu-system-$ARCH" 2>/dev/null | while read -r pid; do
+			# By pid, and only a guest this shell is an ancestor of - `pgrep` matches every QEMU on
+			# the machine, so ancestry is what makes the victim ours.
+			#
+			# COLLECTED WHOLE, then chosen from. This pipeline used to end in `head -n 1` inside a
+			# command substitution: with more than one candidate, `head` closes the pipe, the loop
+			# upstream dies of SIGPIPE, `pipefail` makes that the pipeline's status, and `set -e`
+			# ends the WATCHER - at the exact moment it was about to kill the guest, and after it
+			# had already written its `.hit` file. The stall bound then silently collapsed back to
+			# the suite timeout, and the run was classified by a mark left by a watchdog that never
+			# acted. `check-source-hygiene.sh` names this shape, and this was the tree's own
+			# outstanding violation of it.
+			candidates=()
+			while read -r pid; do
 				walk="$pid"
 				while [[ -n "$walk" && "$walk" != "1" ]]; do
-					[[ "$walk" == "$parent" ]] && {
-						echo "$pid"
+					if [[ "$walk" == "$parent" ]]; then
+						candidates+=("$pid")
 						break
-					}
+					fi
 					walk="$(ps -o ppid= -p "$walk" 2>/dev/null | tr -d ' ')"
 				done
-			done | head -n 1)"
-			[[ -n "$victim" ]] && kill "$victim" 2>/dev/null
+			done < <(pgrep -f "qemu-system-$ARCH" 2>/dev/null || true)
+			if ((${#candidates[@]} == 1)); then
+				kill "${candidates[0]}" 2>/dev/null || true
+			elif ((${#candidates[@]} == 0)); then
+				echo "test-kernel: stalled for ${quiet}s and no guest of this run is running - nothing to stop" >&2
+			else
+				# Ambiguous ownership is stated rather than resolved by picking the first. One run
+				# owns one guest; more than one means the assumption this watchdog acts on is wrong,
+				# and killing an arbitrary member of the set is how it would take down the wrong one.
+				echo "test-kernel: stalled for ${quiet}s but this run has ${#candidates[@]} guests (${candidates[*]}) - refusing to guess which to stop" >&2
+			fi
 			break
 		fi
 	done

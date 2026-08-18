@@ -119,6 +119,32 @@ if [[ -n "$invalid_test_modules" ]]; then
 	exit 1
 fi
 
+# A SHEBANG MEANS "RUN ME", and a file that says so has to be runnable.
+#
+# `perf-trace.py` carried `#!/usr/bin/env python3` and documented itself as `boot/perf-trace.py`
+# while its mode was 0644, so the documented entry point failed with `Permission denied` before
+# Python started - which reads as a missing interpreter rather than as a missing bit, and the
+# workaround people find (`python3 boot/perf-trace.py`) is not the documented interface.
+#
+# The working tree is what this looks at, and that is also what Git records: a checkout takes its
+# modes from the index, so on the clean checkout this defect actually bites, the two are the same
+# number. A file that is a MODULE rather than a command should lose its shebang instead - which is
+# what `scenario.py` did, since nothing has ever run it directly.
+unrunnable="$(git ls-files -- src | while read -r path; do
+	[[ -f "$path" && ! -L "$path" ]] || continue
+	# `#!/`, not `#!`: a Rust file opening with an inner attribute (`#![no_std]`) is not a script,
+	# and matching two characters flagged every one of them. The NUL strip keeps a binary file from
+	# making the substitution warn rather than simply not matching.
+	[[ "$(head -c 3 "$path" 2>/dev/null | tr -d '\0')" == '#!/' ]] || continue
+	[[ -x "$path" ]] || printf '%s (mode %s)\n' "$path" "$(stat -c%a "$path")"
+done)"
+if [[ -n "$unrunnable" ]]; then
+	echo "source-hygiene: these files declare an interpreter but are not executable:" >&2
+	printf '%s\n' "$unrunnable" >&2
+	echo "  either mark them executable, or remove the shebang if they are modules rather than commands" >&2
+	exit 1
+fi
+
 tracked="$(git ls-files | grep -E "$path_pattern" || true)"
 if [[ -n "$tracked" ]]; then
 	echo "source-hygiene: generated artifacts are tracked by Git:" >&2

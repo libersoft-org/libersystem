@@ -100,8 +100,20 @@ def fail(message):
 	sys.exit(1)
 
 
-def run(command, cwd=None, **kwargs):
-	return subprocess.run(command, cwd=cwd or lab.SRC, capture_output=True, text=True, **kwargs)
+# How long any one child here may take. A warm build is seconds and a leaf loop is a minute or two;
+# ten minutes is far above anything this gate measures and finite, which is what matters. Every
+# child ran unbounded, so a hung build held the gate - and the gate edits a tracked source, so a
+# person who then interrupts it leaves that edit behind.
+CHILD_TIMEOUT = 600
+
+
+def run(command, cwd=None, timeout=CHILD_TIMEOUT, **kwargs):
+	try:
+		return subprocess.run(command, cwd=cwd or lab.SRC, capture_output=True, text=True, timeout=timeout, **kwargs)
+	except subprocess.TimeoutExpired as expired:
+		# A `CompletedProcess`-shaped answer, so every caller's `returncode != 0` handling applies
+		# without each of them learning about timeouts.
+		return subprocess.CompletedProcess(command, 124, expired.stdout or '', (expired.stderr or '') + f'\nperf-gate: {os.path.basename(command[0])} did not finish within {timeout} s')
 
 
 # One no-op build, timed. Nothing is edited and nothing is published, so this is also the
@@ -136,12 +148,22 @@ def measure_leaf(source_path):
 	return run([os.path.join(HERE, 'lab.py'), 'dev-loop', ARTIFACT, SCENARIO])
 
 
+# Put the file back, and say so if it could not be.
+#
+# The restoration build's status was discarded. A failed one leaves the STAGED EXECUTABLE derived
+# from the probe while the source says otherwise, and the gate carried on measuring against that -
+# so a later no-change build reports a miss it did not earn, and a publication ships a generation
+# built from a comment nobody wrote. Returns whether the tree is consistent again.
 def restore(source_path, original):
 	with open(source_path, 'w', encoding='utf-8') as handle:
 		handle.write(original)
-	# Leave the staged artifact agreeing with the restored source. Without this the tree keeps
-	# whatever the probe built, and the next no-change build would report a miss it did not earn.
-	run([os.path.join(lab.SRC, 'tools', 'dev-build.sh'), ARTIFACT, TARGET])
+		handle.flush()
+		os.fsync(handle.fileno())
+	rebuilt = run([os.path.join(lab.SRC, 'tools', 'dev-build.sh'), ARTIFACT, TARGET])
+	if rebuilt.returncode != 0:
+		print(f'perf-gate: the source was restored but rebuilding from it FAILED, so the staged {ARTIFACT} still derives from the probe\n{rebuilt.stdout}{rebuilt.stderr}', file=sys.stderr)
+		return False
+	return True
 
 
 def verdict(name, measured, budget, unit='s'):
@@ -154,10 +176,14 @@ def verdict(name, measured, budget, unit='s'):
 def main():
 	state, identity = lab.dev_state()
 	if state != 'ready':
-		fail(f'the development instance is {state}; the gate measures a warm loop, so bring one up with `just dev-up`')
+		fail(f'the development instance is {state}; the gate measures a warm loop, so bring one up with `just lab dev-up`')
 
 	source_path = os.path.join(lab.REPO, 'src', SOURCE)
 	dirty = run(['git', 'status', '--porcelain', '--', os.path.relpath(source_path, lab.REPO)], cwd=lab.REPO)
+	# CHECKED, because a failed Git query prints nothing and looked exactly like a clean file - and
+	# the next thing this does is append to that file.
+	if dirty.returncode != 0:
+		fail(f'git could not report the state of {SOURCE}, so the gate cannot tell whether it is safe to edit\n{dirty.stderr}')
 	if dirty.stdout.strip():
 		fail(f'{SOURCE} already has uncommitted changes; the gate edits that file and will not write over work in progress')
 	with open(source_path, encoding='utf-8') as handle:
@@ -175,13 +201,30 @@ def main():
 		print(f'     OVER no-change rebuilt        {no_change_misses}')
 
 	before = lab.instance_inputs()
-	guest_before = identity.get('pgid')
+	# THE BOOT GENERATION, not the process group. `system_reset` gives the guest a new boot while
+	# QEMU keeps the same pgid, so comparing the group could not see the one event this check exists
+	# to catch: a measurement taken across a reboot is a measurement of a reboot.
+	guest_before = lab.guest_boot()
+	if guest_before is None:
+		fail('the guest did not answer a handshake, so nothing here could tell a loop from a reboot')
 
-	result = measure_leaf(source_path)
-	restore(source_path, original)
-	with open(source_path, encoding='utf-8') as handle:
-		if handle.read() != original:
-			fail(f'{SOURCE} was not restored; fix it before trusting anything else in the tree')
+	# THE PROBE IS UNDONE WHATEVER HAPPENS TO THE MEASUREMENT.
+	#
+	# `restore` was called on the normal path only, after `subprocess.run` returned. An interruption,
+	# a `KeyboardInterrupt` on a slow child, an exception in this file, or a person killing a hung
+	# gate all left the appended probe in the user's tracked source - and the next build, or the next
+	# publication, was made from it. A measurement tool has no business changing the tree it
+	# measures, and if it must, undoing that is not conditional on the measurement working.
+	consistent = True
+	try:
+		result = measure_leaf(source_path)
+	finally:
+		consistent = restore(source_path, original)
+		with open(source_path, encoding='utf-8') as handle:
+			if handle.read() != original:
+				fail(f'{SOURCE} was not restored; fix it before trusting anything else in the tree')
+	if not consistent:
+		fail(f'the staged {ARTIFACT} could not be rebuilt from the restored source, so no verdict here would be about the tree as it stands')
 
 	if result.returncode != 0:
 		print(result.stdout)
@@ -222,12 +265,12 @@ def main():
 	else:
 		print(f'     ok   no cold path            {len(COLD_CLASSES)} input classes byte-identical')
 
-	_, identity_after = lab.dev_state()
-	if identity_after.get('pgid') != guest_before:
+	guest_after = lab.guest_boot()
+	if guest_after != guest_before:
 		failures.append('the guest restarted during the iteration, so the measurement is of a reboot rather than of a loop')
-		print('     OVER guest restarted')
+		print(f'     OVER guest restarted        boot {guest_before} -> {guest_after}')
 	else:
-		print(f'     ok   no guest restart       process group {guest_before} throughout')
+		print(f'     ok   no guest restart       boot {guest_before} throughout')
 
 	if failures:
 		print()

@@ -6,7 +6,7 @@
 #   and ppm all work (anything ImageMagick can write; the netpbm fallback covers
 #   png/jpg/ppm).
 #
-# If a `just run` instance is already up (its QEMU control-monitor socket exists
+# If a `./run.sh` instance is already up (its QEMU control-monitor socket exists
 # and accepts a connection), this attaches to it and snaps the CURRENT frame, so
 # a screenshot can be taken at any moment during a live run - no reboot. If no
 # run is up, it boots a throwaway headless instance, waits for the boot log to
@@ -24,11 +24,18 @@ OUT="${1:?usage: screenshot.sh <output-path> (e.g. screenshot.png, shot.jpg, sho
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 BUILD="$REPO_ROOT/.build/boot"
-RUN_MON="$BUILD/qemu-monitor.sock" # control monitor exposed by a live `just run`
-PPM="$BUILD/.screenshot.ppm"
+RUN_MON="$BUILD/qemu-monitor.sock" # control monitor exposed by a live `./run.sh`
 
 mkdir -p "$BUILD"
-rm -f "$PPM"
+# A RUN DIRECTORY OF ITS OWN, because every path here used to be a singleton.
+#
+# `.screenshot.ppm`, `.screenshot-serial.log` and `.screenshot-mon.sock` were fixed names deleted at
+# startup, so two captures overwrote each other's framebuffer, log and monitor socket, and one
+# cleanup removed paths the other was still using. A live-instance capture and a fallback capture
+# raced on the same PPM too. Nothing here is shared any more, so concurrent captures cannot see each
+# other at all.
+SCRATCH="$(mktemp -d "$BUILD/.screenshot.XXXXXX")"
+PPM="$SCRATCH/frame.ppm"
 
 # Drive a QEMU HMP monitor over its unix socket to dump the framebuffer to $PPM.
 # The trailing pause keeps the connection open long enough for QEMU to run the
@@ -76,7 +83,7 @@ socket_live() {
 	socat -u OPEN:/dev/null UNIX-CONNECT:"$1" 2>/dev/null
 }
 
-# Fast path: a live `just run` is up - snap its current frame, no reboot.
+# Fast path: a live `./run.sh` is up - snap its current frame, no reboot.
 if socket_live "$RUN_MON"; then
 	echo "screenshot: attaching to the running QEMU (live frame)" >&2
 	screendump_via "$RUN_MON"
@@ -94,9 +101,8 @@ KERNEL="$REPO_ROOT/.build/cargo/kernel/x86_64-unknown-none/debug/kernel"
 ISO="$("$HERE/mkimage.sh" iso "$KERNEL")"
 WAIT_LINE="${WAIT_LINE:-boot OK}"
 TIMEOUT="${TIMEOUT:-30}"
-LOG="$BUILD/.screenshot-serial.log"
-MON="$BUILD/.screenshot-mon.sock"
-rm -f "$LOG" "$MON"
+LOG="$SCRATCH/serial.log"
+MON="$SCRATCH/mon.sock"
 : >"$LOG"
 
 QEMU_ARGS=(
@@ -118,18 +124,25 @@ fi
 echo "screenshot: no live run found, booting a throwaway instance" >&2
 qemu-system-x86_64 "${QEMU_ARGS[@]}" &
 QPID=$!
+# EXACT PIDS, never a pattern. Cleanup used to `pkill -f "tail -f $LOG"`, which kills every process
+# on the machine whose command line matches - including an unrelated `tail -f` a person had open on
+# the same file. The follower this starts is a child whose pid is right here.
+TAILPID=""
 cleanup() {
 	kill "$QPID" 2>/dev/null || true
-	pkill -f "tail -f $LOG" 2>/dev/null || true
-	rm -f "$PPM" "$MON"
+	[[ -n "$TAILPID" ]] && kill "$TAILPID" 2>/dev/null
+	rm -rf "$SCRATCH"
 }
 trap cleanup EXIT
 
 # wait (bounded, no busy sleep) for the guest to finish booting
-if ! timeout "$TIMEOUT" grep -q "$WAIT_LINE" <(tail -f "$LOG"); then
+tail -f "$LOG" >"$SCRATCH/follow" &
+TAILPID=$!
+if ! timeout "$TIMEOUT" bash -c 'while ! grep -q "$1" "$2"; do sleep 0.2; done' _ "$WAIT_LINE" "$SCRATCH/follow"; then
 	echo "screenshot: '$WAIT_LINE' not seen within ${TIMEOUT}s, capturing current frame" >&2
 fi
-pkill -f "tail -f $LOG" 2>/dev/null || true
+kill "$TAILPID" 2>/dev/null || true
+TAILPID=""
 
 screendump_via "$MON"
 emit_image

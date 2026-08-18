@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Build the fixtures the scenarios publish, into .build/fixtures.
+# Build the fixtures the scenarios publish, into .build/fixtures/<target>.
 #
 # A fixture has to be a real image - the guest verifies the ELF, its target, its identity
 # record and that the record names the artifact it is published as - so it is derived from a
@@ -9,21 +9,45 @@
 #
 # Every alteration is same-length by construction, so nothing in the image moves and no
 # offset, size or relocation recorded anywhere in it becomes wrong.
+import hashlib
+import json
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-STAGE = os.path.join(HERE, '../../../.build/image/x86_64-unknown-none')
-OUT = os.path.join(HERE, '../../../.build/fixtures')
+REPO = os.path.abspath(os.path.join(HERE, '../../..'))
+
+# TARGET-QUALIFIED, because a guest verifies the ELF's target and correctly refuses an image built
+# for another one.
+#
+# This hard-coded `x86_64-unknown-none` as its only staged source and wrote unqualified names into
+# one shared directory - while the cold runner promises the same scenarios on x86_64, aarch64 and
+# riscv64. An aarch64 cold run therefore sent x86 images to a guest that refuses them, so those
+# scenarios could not exercise their stated behaviour at all; and on x86 the fixtures had no input
+# key of any kind, so an old set survived any change to its staged source or to this recipe.
+TRIPLES = {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}
+TARGET = os.environ.get('FIXTURE_TARGET', 'x86_64')
+if TARGET not in TRIPLES:
+	raise SystemExit(f'make-fixtures: unknown target {TARGET!r}; expected one of {", ".join(sorted(TRIPLES))}')
+STAGE = os.path.join(REPO, '.build', 'image', TRIPLES[TARGET])
+OUT = os.path.join(REPO, '.build', 'fixtures', TARGET)
+# What the set was built from. `dev-test` and `scenario-cold` read it and refuse a set that does not
+# match the tree, rather than publishing bytes from an older one into a guest.
+MANIFEST = os.path.join(OUT, 'fixtures.json')
+
+# Every staged file this recipe reads, so the key covers its inputs and not just its own source.
+READ = {}
 
 
 def staged(path):
 	source = os.path.join(STAGE, path)
 	try:
 		with open(source, 'rb') as handle:
-			return bytearray(handle.read())
+			data = handle.read()
 	except OSError as error:
-		raise SystemExit(f'{source}: {error}; build the tree first')
+		raise SystemExit(f'{source}: {error}; build {TARGET} first')
+	READ[path] = hashlib.sha256(data).hexdigest()
+	return bytearray(data)
 
 
 # Replace one exact byte string with another of the same length, everywhere it occurs, and
@@ -101,9 +125,48 @@ def fixture_text():
 os.makedirs(OUT, exist_ok=True)
 fixtures = [('uname-shadow', shadowed_uname), ('process-proto-shadow', shadowed_process_proto), ('process-proto-incompatible', incompatible_process_proto), ('fixture-text', fixture_text)]
 fixtures += [(f'uname-generation{index}', lambda index=index: generation_uname(index)) for index in (1, 2, 3)]
+
+# BUILT ENTIRELY, THEN PUBLISHED ENTIRELY.
+#
+# Each canonical target used to be opened with `wb` BEFORE its `build()` was evaluated, so a missing
+# staged source or a failed occurrence check truncated the previous valid fixture and then raised -
+# and a failure partway through the list left an inconsistent mixture of generations, some new and
+# some old, which the scenarios would then publish against each other. Nothing is written into the
+# canonical directory until every fixture has been produced.
+built = {}
 for name, build in fixtures:
+	built[name] = bytes(build())
+
+for name, data in built.items():
 	target = os.path.join(OUT, name)
-	with open(target, 'wb') as handle:
-		handle.write(bytes(build()))
-	print(f'scenario fixtures: wrote {os.path.relpath(target, os.path.join(HERE, "../.."))}')
+	candidate = f'{target}.{os.getpid()}.candidate'
+	with open(candidate, 'wb') as handle:
+		handle.write(data)
+		handle.flush()
+		os.fsync(handle.fileno())
+	os.replace(candidate, target)
+	print(f'scenario fixtures: wrote {os.path.relpath(target, REPO)}')
+
+# The key, published last: a manifest that exists describes a complete set, because it is written
+# after every file in it. It carries the staged sources this recipe read, this recipe's own bytes,
+# and the digest of each fixture - so a consumer can check the set against the tree without
+# rebuilding it.
+with open(__file__, 'rb') as handle:
+	recipe = hashlib.sha256(handle.read()).hexdigest()
+record = {
+	'format': 'liber-scenario-fixtures-v1',
+	'target': TARGET,
+	'triple': TRIPLES[TARGET],
+	'recipe': recipe,
+	'sources': dict(sorted(READ.items())),
+	'fixtures': {name: hashlib.sha256(data).hexdigest() for name, data in sorted(built.items())},
+}
+candidate = f'{MANIFEST}.{os.getpid()}.candidate'
+with open(candidate, 'w', encoding='utf-8') as handle:
+	json.dump(record, handle, indent='\t', sort_keys=True)
+	handle.write('\n')
+	handle.flush()
+	os.fsync(handle.fileno())
+os.replace(candidate, MANIFEST)
+print(f'scenario fixtures: {len(built)} fixture(s) for {TARGET}, recorded in {os.path.relpath(MANIFEST, REPO)}')
 sys.exit(0)

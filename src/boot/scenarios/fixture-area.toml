@@ -17,7 +17,7 @@ timeout = 30
 [[step]]
 do = "fixture"
 name = "hello.txt"
-file = "../.build/fixtures/fixture-text"
+file = "{fixtures}/fixture-text"
 
 # The guest joins the name to its own prefix, so the file the shell sees is fixture-hello.txt.
 [[step]]

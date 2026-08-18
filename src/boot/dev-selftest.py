@@ -38,7 +38,10 @@ sys.path.insert(0, HERE)
 
 import lab
 
-FIXTURES = os.path.join(lab.REPO, '.build', 'fixtures')
+# Target-qualified, like everything else that publishes into a guest: an image built for another
+# architecture is refused by the guest, correctly, and the fixture directory used to be one shared
+# unqualified place. The persistent instance is x86_64, so that is what this drives.
+FIXTURES = os.path.join(lab.REPO, '.build', 'fixtures', 'x86_64')
 TIMEOUT = 60
 # The name the refused publication is offered under. It is a declared program, so the name
 # itself is acceptable and the refusal can only come from the identity record naming another
@@ -56,8 +59,17 @@ def step(message):
 	print(f'dev-selftest: {message}')
 
 
-def lab_command(*args):
-	return subprocess.run([os.path.join(HERE, 'lab.py'), *args], cwd=lab.SRC, capture_output=True, text=True)
+# How long any one child here may take. Every one of them ran unbounded, so a hung publication held
+# the self-test - and this test mutates the shared guest's registry, so a person killing it leaves
+# that guest holding generations nothing will roll back.
+CHILD_TIMEOUT = 300
+
+
+def lab_command(*args, timeout=CHILD_TIMEOUT):
+	try:
+		return subprocess.run([os.path.join(HERE, 'lab.py'), *args], cwd=lab.SRC, capture_output=True, text=True, timeout=timeout)
+	except subprocess.TimeoutExpired as expired:
+		return subprocess.CompletedProcess(args, 124, expired.stdout or '', (expired.stderr or '') + f'\ndev-selftest: lab.py {args[0]} did not finish within {timeout} s')
 
 
 # Type `uname` at the guest terminal and return what it printed.
@@ -93,10 +105,18 @@ def expect(guest, marker, what):
 def main():
 	state, identity = lab.dev_state()
 	if state != 'ready':
-		fail(f'the development instance is {state}; this needs a running one, so start it with `just dev-up`')
-	guest_at_start = identity.get('pgid')
+		fail(f'the development instance is {state}; this needs a running one, so start it with `just lab dev-up`')
+	# THE BOOT GENERATION, not the process group. `system_reset` gives the guest a new boot and
+	# leaves QEMU's pgid alone, so the group could not distinguish the succession this test claims
+	# to prove from a reboot in the middle of it.
+	guest_at_start = lab.guest_boot()
+	if guest_at_start is None:
+		fail('the guest did not answer a handshake, so nothing below could be attributed to one boot')
 
-	built = subprocess.run([os.path.join(HERE, 'scenarios', 'make-fixtures.py')], cwd=lab.SRC, capture_output=True, text=True)
+	try:
+		built = subprocess.run([os.path.join(HERE, 'scenarios', 'make-fixtures.py')], cwd=lab.SRC, capture_output=True, text=True, timeout=CHILD_TIMEOUT)
+	except subprocess.TimeoutExpired:
+		fail(f'building the fixtures did not finish within {CHILD_TIMEOUT} s')
 	if built.returncode != 0:
 		fail(f'the fixtures could not be built, so nothing below would mean anything\n{built.stdout}{built.stderr}')
 	for index in (1, 2, 3):
@@ -132,10 +152,10 @@ def main():
 		fail(f'the reset failed\n{reset.stdout}{reset.stderr}')
 	expect(guest, 'LiberSystem', 'after the reset the installed artifact answers')
 
-	_, identity_after = lab.dev_state()
-	if identity_after.get('pgid') != guest_at_start:
-		fail('the guest restarted during the run, so none of the above was the succession it claims to be')
-	step(f'one boot throughout: process group {guest_at_start}')
+	guest_at_end = lab.guest_boot()
+	if guest_at_end != guest_at_start:
+		fail(f'the guest restarted during the run (boot {guest_at_start} -> {guest_at_end}), so none of the above was the succession it claims to be')
+	step(f'one boot throughout: generation {guest_at_start}')
 	print('dev-selftest: passed')
 
 

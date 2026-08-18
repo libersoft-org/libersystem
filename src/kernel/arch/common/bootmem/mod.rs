@@ -322,3 +322,78 @@ pub unsafe fn handed_memmap(arg: u64, to_virt: impl Fn(u64) -> u64) -> Option<(*
 	}
 	Some((to_virt(phys) as *const MemRegion, len as usize))
 }
+
+// THE BOOT ARCHIVE A DEVICE-TREE MACHINE HANDED OVER, as a physical range.
+//
+// aarch64 and riscv64 have no bootloader module hand-off on their direct `-kernel` path, so the
+// runner passes the init package one of the only two ways the platform offers, and the two machines
+// do not offer the same one:
+//
+//   - riscv64 gets its device tree from the invocation that boots it (OpenSBI passes it in a1), so
+//     `-initrd` annotates the tree the kernel reads and `/chosen/linux,initrd-start` / `-end` carry
+//     the exact range. That is `fdt_start`/`fdt_end` here, and it is preferred whenever present -
+//     it is also what real firmware writes.
+//   - aarch64 enters an ELF kernel with x0 = 0 and places no tree for it, so the runner dumps one
+//     from a SEPARATE QEMU invocation and loads it at a fixed address. That tree cannot carry an
+//     initrd range (the dump crashes qemu-system-aarch64 10.0.11 when `-kernel` is present at all),
+//     so the archive is loaded at a fixed address too and `probe` is where.
+//
+// Only the START has to be agreed on: a PKGARCH1 archive states its own extent, so the length is
+// read out of it rather than out of a second constant that two components would have to keep equal.
+pub unsafe fn boot_archive_range(fdt_start: u64, fdt_end: u64, probe: u64, to_virt: impl Fn(u64) -> u64) -> Option<(u64, u64)> {
+	if fdt_end > fdt_start {
+		return Some((fdt_start, fdt_end - fdt_start));
+	}
+	if probe == 0 {
+		return None;
+	}
+	let len = unsafe { archive_len(to_virt(probe) as *const u8) }?;
+	Some((probe, len))
+}
+
+// Every scalar in the header and the entry table is read one byte at a time and volatile, because
+// this runs against an address nothing has promised holds an archive: on a boot where the runner
+// loaded nothing there it is ordinary RAM, and the answer has to be `None` rather than a fault or a
+// wild length. The magic and the reserved word are twelve bytes of exact match before anything
+// derived from the contents is used.
+pub unsafe fn archive_len(at: *const u8) -> Option<u64> {
+	unsafe fn byte(at: *const u8, off: usize) -> u8 {
+		unsafe { core::ptr::read_volatile(at.add(off)) }
+	}
+	unsafe fn le32(at: *const u8, off: usize) -> u32 {
+		let mut bytes = [0u8; 4];
+		for (i, b) in bytes.iter_mut().enumerate() {
+			*b = unsafe { byte(at, off + i) };
+		}
+		u32::from_le_bytes(bytes)
+	}
+	for (i, want) in abi::PKG_MAGIC.iter().enumerate() {
+		if unsafe { byte(at, i) } != *want {
+			return None;
+		}
+	}
+	if unsafe { le32(at, 12) } != 0 {
+		return None;
+	}
+	let count = unsafe { le32(at, 8) } as usize;
+	// The READER's ceiling, the same one `abi::Package::parse` applies - an archive declaring more
+	// entries than that is not one this system produces, and walking its table would be a long read
+	// through memory that has not been shown to be an archive at all.
+	if count == 0 || count > abi::MAX_PACKAGE_ENTRIES {
+		return None;
+	}
+	let table_end = abi::PKG_HEADER_LEN.checked_add(count.checked_mul(abi::PKG_ENTRY_LEN)?)? as u64;
+	let mut end = table_end;
+	for i in 0..count {
+		let entry = abi::PKG_HEADER_LEN + i * abi::PKG_ENTRY_LEN;
+		let offset = unsafe { le32(at, entry + abi::PKG_NAME_LEN) } as u64;
+		let size = unsafe { le32(at, entry + abi::PKG_NAME_LEN + 4) } as u64;
+		// A blob inside the header or the table is a malformed archive, and taking its extent
+		// anyway would understate the range the frame pool has to be carved around.
+		if offset < table_end {
+			return None;
+		}
+		end = end.max(offset.checked_add(size)?);
+	}
+	Some(end)
+}

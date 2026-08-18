@@ -110,6 +110,98 @@ def timing_event(phase, event):
 		pass
 REPO = os.path.dirname(SRC)
 BUILD_ROOT = os.path.join(REPO, '.build')
+
+# The two entry points this file drives, BY PATH.
+#
+# It used to name Justfile recipes - `just run`, `just user kernel-build`, `just user-aarch64` -
+# and none of the three exists any more: building moved to `build.sh` and booting to `run.sh` at the
+# repository root, and the recipes went with the move. Nothing noticed, because every caller here
+# reports the failure as something else: `dev-up` waits for a QEMU that was never started and
+# blames the build timeout, and `scenario-cold` dies with "the userspace did not build" whatever
+# went wrong. Both were, in fact, `error: justfile does not contain recipe`.
+#
+# Paths rather than recipe names, so a missing entry point is a missing FILE - which is a thing this
+# file can check for and say plainly.
+RUN_SH = os.path.join(REPO, 'run.sh')
+BUILD_SH = os.path.join(REPO, 'build.sh')
+
+
+# The QEMU command a lab guest is started with. `run.sh` builds first and then execs the runner, so
+# the process this returns is the one that becomes QEMU - which is what `dev_guest_qemu` waits for
+# and what `record_lab_guest` takes the process group from.
+# EVERY CHILD THIS FILE STARTS HAS A DEADLINE, and a child that ignores TERM is killed.
+#
+# `dev-loop`, the scenario wrappers, the cold build and the artifact build all ran children with no
+# host timeout at all. A command documented as bounded by construction could therefore run
+# indefinitely: the deadline was a value passed to some GUEST requests, not a boundary on the host
+# processes those requests were made from. A child hanging in build logic, socket setup or QEMU
+# before reaching its own internal timeout was outside every bound in the system.
+#
+# `subprocess.run` with a timeout kills the child on expiry but not its descendants, so the child
+# gets a session of its own and the whole group is signalled - TERM first, KILL after a grace
+# period, which is what stops a cold QEMU that ignores TERM from surviving the command that started
+# it. Returns a `CompletedProcess`; on expiry the returncode is negative and `timed_out` is set.
+# How much longer than its own declared timeout a child is given before the host stops it. Enough
+# for a child that is going to report its own failure to do so - that message is more useful than
+# "the host killed it" - and short enough that the step's bound still means something.
+CHILD_GRACE = 15
+
+
+class ChildTimeout(Exception):
+	def __init__(self, command, seconds):
+		super().__init__(f'{os.path.basename(command[0])} did not finish within {seconds:.0f} s')
+		self.command = command
+		self.seconds = seconds
+
+
+def run_child(command, timeout, **kwargs):
+	kwargs.setdefault('start_new_session', True)
+	child = subprocess.Popen(command, **kwargs)
+	try:
+		out, err = child.communicate(timeout=timeout)
+		return subprocess.CompletedProcess(command, child.returncode, out, err)
+	except subprocess.TimeoutExpired:
+		stop_child_group(child)
+		raise ChildTimeout(command, timeout) from None
+
+
+# TERM the child's whole group, then KILL what is left. The group is what matters: a build script
+# that starts a compiler, or a runner that starts QEMU, leaves those behind when only the leader is
+# signalled.
+def stop_child_group(child, grace=5):
+	try:
+		group = os.getpgid(child.pid)
+	except OSError:
+		return
+	for signal_number in (signal.SIGTERM, signal.SIGKILL):
+		try:
+			os.killpg(group, signal_number)
+		except OSError:
+			return
+		try:
+			child.wait(timeout=grace)
+			return
+		except subprocess.TimeoutExpired:
+			continue
+
+
+def run_command(displays):
+	if not os.path.exists(RUN_SH):
+		die(f'{RUN_SH} is missing - the lab boots the system through it')
+	command = [RUN_SH]
+	if displays:
+		command += ['--display', ','.join(displays)]
+	return command
+
+
+# What a target has to be built with before a cold guest can boot it: the userspace, the kernel and
+# the boot packages the loader hands over. `build.sh` with no `--part` builds every part, which is
+# what this wants - the old recipe pair (`user` + `kernel-build`) predates the packages being a
+# build part at all.
+def build_command(target):
+	if not os.path.exists(BUILD_SH):
+		die(f'{BUILD_SH} is missing - the lab builds the system through it')
+	return [BUILD_SH, '--arch', target]
 BUILD = os.path.join(BUILD_ROOT, 'boot')
 SERIAL_SOCK = os.path.join(BUILD, 'lab-serial.sock')
 CTL_SOCK = os.path.join(BUILD, 'lab-ctl.sock')
@@ -164,6 +256,40 @@ NAME_OK = re.compile(r'[A-Za-z0-9_-][A-Za-z0-9_.-]{0,47}')
 ANSI = re.compile(rb'\x1b\[[0-9;?]*[ -/]*[@-~]')
 PROMPT = re.compile(rb'vol://[^\r\n]*> ?$')
 
+# How long a prompt match has to stand with no further guest output before the broker calls a
+# request finished. See the note in `serve_request`: this is what stops a foreground program that
+# prints a prompt-shaped line from ending someone else's command.
+PROMPT_SETTLE = 0.25
+
+# The broker's reply frame. `<magic> <outcome> <length>\n` then exactly `<length>` bytes.
+#
+# There was no frame at all: the reply was the collected bytes, so the caller could not tell a
+# prompt from a timeout from a closed serial line. The outcomes are named rather than inferred.
+REPLY_MAGIC = b'LIBERLAB1'
+REPLY_OUTCOMES = ('prompt', 'timeout', 'closed', 'status', 'unsupported')
+
+
+class Reply:
+	__slots__ = ('outcome', 'data')
+
+	def __init__(self, outcome, data):
+		self.outcome = outcome
+		self.data = data
+
+	# The one question almost every caller asks. Named so no caller has to re-derive it by running
+	# the prompt regex over the bytes again - which is what they all did, and which cannot tell a
+	# timeout whose tail happens to hold a prompt from a request the prompt actually ended.
+	@property
+	def prompted(self):
+		return self.outcome == 'prompt'
+
+
+def broker_reply(conn, outcome, data):
+	try:
+		conn.sendall(REPLY_MAGIC + f' {outcome} {len(data)}\n'.encode() + data)
+	except OSError:
+		pass
+
 
 # The instance's console output, as a file the broker appends to. Reading it is how anything
 # here watches the guest say something without taking the console away from whoever has it.
@@ -193,12 +319,26 @@ def serial_since(at):
 # putting a terminal back is escape sequences and only escape sequences, so the reader that
 # strips them cannot see whether it happened.
 def serial_raw_since(at):
+	return serial_read(at)[0]
+
+
+# THE BYTES AND WHERE THEY END, from ONE open descriptor.
+#
+# The cursor used to be advanced with a separate `serial_size()` after the read - and the broker
+# appends to this file the whole time. Bytes landing between the read reaching EOF and the size
+# being taken were skipped: the cursor moved past them although no oracle ever saw them. That is a
+# false failure when the skipped bytes hold a marker a step was waiting for, and a false PASS when
+# they hold one a step forbade - `absent` is exactly that shape.
+#
+# Nothing about the file system makes this rare. Two adjacent lines of guest output are enough.
+def serial_read(at):
 	try:
 		with open(serial_log_path(), 'rb') as handle:
 			handle.seek(at)
-			return handle.read()
+			data = handle.read()
+			return data, at + len(data)
 	except OSError:
-		return b''
+		return b'', at
 
 
 def strip_ansi(data):
@@ -256,14 +396,28 @@ def broker_absorb(state, data):
 		broker_send(state, client, data)
 
 
-# Never block on a client. A terminal that stopped reading loses bytes rather than
-# holding up the guest; its replay covers the gap when it reattaches.
+# Never block on a client. A terminal that stopped reading must not hold up the guest.
+#
+# WHAT IT MUST NOT DO IS LOSE BYTES SILENTLY. A nonblocking `send` may accept only a PREFIX without
+# raising at all, and the return value was discarded - so the unsent tail simply vanished, on a
+# connection that stayed attached and therefore never asked for the replay that would have covered
+# the gap. A live console then showed truncated escape sequences, half prompts and missing log
+# lines while looking like a continuous stream, and anything using that stream as an oracle was
+# reading a different guest from the one that was running.
+#
+# Backpressure disconnects instead. Replay is bounded and starts from a known point, so a client
+# that reconnects gets a window it can reason about; a client that keeps its connection and quietly
+# misses the middle cannot tell that it did.
 def broker_send(state, client, data):
 	try:
-		client['sock'].send(data)
+		sent = client['sock'].send(data)
 	except BlockingIOError:
-		pass
+		broker_drop(state, client)
+		return
 	except OSError:
+		broker_drop(state, client)
+		return
+	if sent < len(data):
 		broker_drop(state, client)
 
 
@@ -399,15 +553,13 @@ def serve_request(state, conn):
 		return True
 	parts = request.split(' ', 2)
 	if not parts:
+		broker_reply(conn, 'unsupported', b'')
 		return True
 	if parts[0] == 'STAT':
 		# Console occupancy, asked over the control channel rather than over the console
 		# socket, so querying it never touches the human byte stream.
 		readers = sum(1 for c in state['clients'] if not c['writer'])
-		try:
-			conn.sendall(f'writer={1 if state["writer"] else 0} readers={readers}\n'.encode())
-		except OSError:
-			pass
+		broker_reply(conn, 'status', f'writer={1 if state["writer"] else 0} readers={readers}\n'.encode())
 		return True
 	collected = b''
 	if parts[0] == 'RUN' and len(parts) == 3:
@@ -423,26 +575,50 @@ def serve_request(state, conn):
 		# can only see bytes yet to come, and an idle guest sends none.
 		collected = serial_tail(state['log_path'])
 	else:
+		# A request this broker does not implement is answered, not dropped. Silence reaches the
+		# caller as an empty read that looks like every other empty read.
+		broker_reply(conn, 'unsupported', b'')
 		return True
-	# Collect serial output until the prompt returns or the timeout passes; the collected
-	# bytes are the reply. Everything still goes through the shared drain, so an attached
-	# console keeps seeing the guest while a scripted command runs.
+	# Collect serial output until the prompt returns or the timeout passes. Everything still goes
+	# through the shared drain, so an attached console keeps seeing the guest while a scripted
+	# command runs.
+	#
+	# WHAT HAPPENED IS PART OF THE ANSWER. This used to send the collected bytes and nothing else in
+	# both cases, so a request that timed out and a request whose command finished were WIRE
+	# IDENTICAL: a hung command that had printed something looked exactly like a successful one, and
+	# `lab sh` exited 0 on it. That is a false green in the one tool a person is most likely to wrap
+	# in a script.
+	#
+	# AND A PROMPT HAS TO SETTLE. `has_prompt` is a regex over terminal bytes and any foreground
+	# program can print that shape - `program output\nvol://attacker> ` matches, measured. Nothing
+	# on this side can prove a prompt came from the shell; what it can do is refuse to accept one
+	# that is still being written past. A real prompt is followed by silence until the next input, so
+	# a match must survive PROMPT_SETTLE seconds with no further bytes. A program that prints a
+	# prompt shape and keeps running no longer ends the request. A program that prints one and then
+	# blocks in silence still does, and closing that needs an unforgeable per-request sentinel from
+	# the guest shell, which is guest-side work this cannot do alone.
 	deadline = time.time() + timeout
+	outcome = 'timeout'
+	settled_at = None
 	while time.time() < deadline:
 		ready, _, _ = select.select([serial], [], [], 0.2)
 		if serial in ready:
 			data = serial.recv(65536)
 			if not data:
-				conn.sendall(collected)
+				broker_reply(conn, 'closed', collected)
 				return False
 			broker_absorb(state, data)
 			collected += data
+			settled_at = None
 		if has_prompt(collected[-256:]):
-			break
-	try:
-		conn.sendall(collected)
-	except OSError:
-		pass
+			if settled_at is None:
+				settled_at = time.time()
+			elif time.time() - settled_at >= PROMPT_SETTLE:
+				outcome = 'prompt'
+				break
+		else:
+			settled_at = None
+	broker_reply(conn, outcome, collected)
 	return True
 
 
@@ -474,7 +650,32 @@ def ctl_request(request, timeout, ctl_path=CTL_SOCK):
 			break
 		reply += data
 	conn.close()
-	return reply
+	return parse_reply(reply)
+
+
+# Take the frame apart, and refuse anything that is not one.
+#
+# A broker that answers without a frame is one from before this protocol existed - a persistent
+# instance that was already running when the tree changed under it. That is reported rather than
+# guessed at: reading its bytes as a successful reply is exactly the false green the frame was added
+# to remove, and the fix (`just lab dev-down && just lab dev-up`) is one line to state.
+def parse_reply(reply):
+	header, newline, body = reply.partition(b'\n')
+	parts = header.split(b' ')
+	if not newline or len(parts) != 3 or parts[0] != REPLY_MAGIC:
+		die('the instance answered without a reply frame - it predates this protocol; restart it with `just lab dev-down && just lab dev-up`')
+	outcome = parts[1].decode(errors='replace')
+	if outcome not in REPLY_OUTCOMES:
+		die(f'the instance answered with an unknown outcome {outcome!r}')
+	try:
+		length = int(parts[2])
+	except ValueError:
+		die('the instance answered with a malformed reply frame')
+	# Short is a truncated answer and must not be read as a complete one; long would mean the frame
+	# and the payload disagree, which is the same defect from the other side.
+	if length != len(body):
+		die(f'the instance answered with {len(body)} B of payload, its frame declares {length} B')
+	return Reply(outcome, body)
 
 
 # ---- persistent development instance ---------------------------------------
@@ -497,9 +698,24 @@ INSTANCE_INPUTS = (
 	('packages', [], ['.build/boot/init-x86_64.pkg', '.build/boot/volume-x86_64.pkg']),
 	('image', [], ['.build/boot/libersystem.iso', 'src/boot/mkimage.sh']),
 	('topology', [], ['src/boot/qemu-run.sh']),
+	# THE CLASSES THAT WERE MISSING, and each of them can change what a guest is running while
+	# every fingerprint above stays equal.
+	#
+	# `payload`: the factory volume directory and the product configuration. Editing a payload
+	# source without rebuilding leaves the built package bytes alone, so `packages` reported the
+	# instance current against a tree whose content had moved.
+	# `build`: the scripts that decide what gets built and how it is assembled. They are not inside
+	# any source root above, so a changed build recipe was invisible to every class.
+	# `manifest`: the single statement of what the system contains and where each part goes.
+	('payload', ['src/volume'], ['product.conf']),
+	('build', ['src/tools'], ['build.sh', 'image.sh', 'run.sh', 'lib.sh', 'src/Justfile']),
+	('manifest', [], ['src/user/services/manifest.toml']),
 )
 
 INPUT_ACTIONS = {
+	'payload': 'factory volume content or product configuration: reassembles the system volume and the image',
+	'build': 'build or packaging recipe: what every artifact is made of changed, so nothing below can be trusted as current',
+	'manifest': 'the system manifest: which components ship and where they are placed on the medium',
 	'protocol': 'shared boot contract: rebuilds every binary that consumes it, kernel and loader alike',
 	'kernel': 'recompiles the kernel and reassembles the image; an unchanged loader is not recompiled',
 	'loader': 'recompiles the loader and reassembles the image; an unchanged kernel is not recompiled',
@@ -508,15 +724,25 @@ INPUT_ACTIONS = {
 	'topology': 'restarts the VM; the boot image is not rebuilt',
 }
 
-SOURCE_SUFFIXES = ('.rs', '.toml', '.lock', '.ld')
+
+
+# EVERY FILE UNDER THE ROOT, not four suffixes.
+#
+# It hashed `.rs`, `.toml`, `.lock` and `.ld` and nothing else, so a linker script with another
+# extension, an assembly file, a generated header, a build script, a JSON target specification or a
+# payload the build reads was invisible: the instance reported itself current against a tree it no
+# longer matched. The exclusions are build OUTPUT directories, which is a different thing from a
+# suffix allowlist - a directory of products can be named, and the set of source kinds cannot.
+#
+# `unreadable` is recorded as a distinct marker per path rather than folded into the digest silently,
+# so a file that cannot be read changes the fingerprint instead of vanishing from it.
+IGNORED_TREE_DIRS = ('target', '.build', '__pycache__', '.git')
 
 
 def digest_tree(root, digest):
 	for base, dirs, names in os.walk(root):
-		dirs[:] = sorted(d for d in dirs if d != 'target')
+		dirs[:] = sorted(d for d in dirs if d not in IGNORED_TREE_DIRS)
 		for name in sorted(names):
-			if not name.endswith(SOURCE_SUFFIXES):
-				continue
 			path = os.path.join(base, name)
 			digest.update(os.path.relpath(path, REPO).encode() + b'\0')
 			try:
@@ -584,7 +810,7 @@ def warn_stale_inputs(identity):
 	print(f'lab: WARNING: this instance predates the tree: {", ".join(stale)} changed since it booted', file=sys.stderr)
 	for name in stale:
 		print(f'     {name:9}{INPUT_ACTIONS[name]}', file=sys.stderr)
-	print('     a cold restart (`just dev-down && just dev-up`) is what picks it up; hot publication cannot', file=sys.stderr)
+	print('     a cold restart (`just lab dev-down && just lab dev-up`) is what picks it up; hot publication cannot', file=sys.stderr)
 
 
 def dev_identity_read():
@@ -593,6 +819,84 @@ def dev_identity_read():
 			return json.load(handle)
 	except (OSError, ValueError):
 		return {}
+
+
+# WHICH BOOT THIS INSTANCE OWNS, in a file of its own.
+#
+# The guest draws a value once per boot and reports it in every handshake, and comparing against it
+# is what stops a publication, a rollback or a registry read from landing in a different boot from
+# the one the instance record describes. That value used to be written by reopening the LIVE LOCK
+# FILE and truncating it: a crash or a concurrent read during the rewrite left an empty or partial
+# JSON document, which `dev_identity_read` returns as `{}` - so status misread a live locked
+# instance as merely starting, and the boot generation was simply gone.
+#
+# A sidecar, published by rename, so a reader sees the old record or the new one and never half of
+# either. KEYED TO THE LOCK'S INODE: the lock is created once per instance and unlinked by
+# `dev-down`, so a sidecar naming a different inode belongs to an instance that is gone, and reading
+# it would bind this session to a boot generation from a previous guest.
+DEV_BOOT_RECORD = os.path.join(BUILD, 'dev-instance.boot')
+
+# ONE SCENARIO RUN AT A TIME, PER INSTANCE.
+#
+# Scenarios share everything the instance has: the terminal, the control channel, the artifact
+# registry, the single launch slot, the fixture area, the reset and restart operations, and the
+# teardown that gives all of it back. Two host processes could both see `ready` and begin - and then
+# one run's reset erased the other's registry, one run's teardown stopped the other's program, and
+# their output cursors read each other's bytes. The failure lands on whichever run notices the
+# other's state, which is not the one that caused it.
+#
+# An flock, so it is released by the kernel when the holder dies: a killed run does not leave a
+# lease to break by hand, and "is somebody running scenarios" is answered by asking the lock rather
+# than by trusting a file to have been cleaned up.
+DEV_SCENARIO_LEASE = os.path.join(BUILD, 'dev-scenario.lease')
+
+
+@contextlib.contextmanager
+def scenario_lease(what):
+	fd = os.open(DEV_SCENARIO_LEASE, os.O_RDWR | os.O_CREAT, 0o600)
+	try:
+		fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+	except OSError:
+		os.close(fd)
+		die(f'another scenario run already holds this instance; {what} would interleave with it - wait for it to finish')
+	try:
+		os.ftruncate(fd, 0)
+		os.write(fd, f'{os.getpid()} {what}\n'.encode())
+		yield
+	finally:
+		os.close(fd)
+
+
+def dev_boot_record_write(boot):
+	try:
+		inode = os.stat(DEV_LOCK).st_ino
+	except OSError:
+		return False
+	temporary = f'{DEV_BOOT_RECORD}.{os.getpid()}'
+	try:
+		with open(temporary, 'w') as handle:
+			handle.write(json.dumps({'inode': inode, 'boot': boot}) + '\n')
+			handle.flush()
+			os.fsync(handle.fileno())
+		os.replace(temporary, DEV_BOOT_RECORD)
+	except OSError:
+		with contextlib.suppress(OSError):
+			os.unlink(temporary)
+		return False
+	return True
+
+
+def dev_boot_record_read():
+	try:
+		with open(DEV_BOOT_RECORD) as handle:
+			record = json.load(handle)
+		inode = os.stat(DEV_LOCK).st_ino
+	except (OSError, ValueError):
+		return None
+	if not isinstance(record, dict) or record.get('inode') != inode:
+		return None
+	boot = record.get('boot')
+	return boot if isinstance(boot, str) and boot else None
 
 
 def dev_identity_write(lock_fd, identity):
@@ -623,10 +927,9 @@ def dev_ready(timeout=3):
 	if not os.path.exists(DEV_CTL_SOCK):
 		return False
 	try:
-		reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
+		return ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK).prompted
 	except (SystemExit, OSError):
 		return False
-	return has_prompt(reply[-256:])
 
 
 # One of: down, detached, stale, foreign, starting, ready. Every dev command branches on
@@ -639,7 +942,11 @@ def dev_ready(timeout=3):
 def dev_state():
 	identity = dev_identity_read()
 	if dev_lock_free():
-		if dev_group_alive(identity.get('pgid')):
+		# VERIFIED, not merely alive. A lock-free record whose pgid happens to name a living group
+		# was called `detached` on the strength of the number alone - and `detached` is the state
+		# `dev-down` escalates SIGKILL against and `dev-up` reattaches to. A reused id would have
+		# taken either of those to an unrelated process group.
+		if dev_group_is_ours(identity):
 			return 'detached', identity
 		leftovers = [p for p in (DEV_CTL_SOCK, DEV_SERIAL_SOCK, DEV_CONSOLE_SOCK) if os.path.exists(p)]
 		return ('stale' if leftovers else 'down'), identity
@@ -659,7 +966,7 @@ def dev_console_stat():
 	if not os.path.exists(DEV_CTL_SOCK):
 		return ''
 	try:
-		return ctl_request('STAT', 3, DEV_CTL_SOCK).decode(errors='replace').strip()
+		return ctl_request('STAT', 3, DEV_CTL_SOCK).data.decode(errors='replace').strip()
 	except (SystemExit, OSError):
 		return ''
 
@@ -681,10 +988,10 @@ def dev_owner_conflict(identity):
 	# A bring-up that has taken the lock but recorded nothing yet is not an ownership dispute,
 	# and saying so would send the reader looking for a worktree to release it from.
 	if not identity:
-		print('lab: a development instance is starting; wait for it, or `just dev-down` to abandon it', file=sys.stderr)
+		print('lab: a development instance is starting; wait for it, or `just lab dev-down` to abandon it', file=sys.stderr)
 		sys.exit(1)
 	print(f'lab: development profile is owned by {dev_describe(identity)}', file=sys.stderr)
-	print(f'lab: release it with `just dev-down` in {identity.get("repo", "that worktree")}', file=sys.stderr)
+	print(f'lab: release it with `just lab dev-down` in {identity.get("repo", "that worktree")}', file=sys.stderr)
 	sys.exit(1)
 
 
@@ -724,7 +1031,7 @@ def dev_reattach(lock_fd, identity, timeout):
 	os.close(lock_fd)
 	time.sleep(0.2)
 	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
-	if not has_prompt(reply[-256:]):
+	if not reply.prompted:
 		die(f'reattached, but no shell prompt within {timeout} s (see {DEV_SERIAL_LOG})')
 	print(f'lab: reattached to the running instance without rebooting (up {dev_uptime(identity)})')
 
@@ -768,7 +1075,7 @@ def cmd_dev_up(args):
 	if state in ('starting', 'foreign'):
 		dev_owner_conflict(identity)
 	if state == 'stale':
-		die('stale development instance state; run `just dev-down` to clear it')
+		die('stale development instance state; run `just lab dev-down` to clear it')
 
 	lock_fd = os.open(DEV_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
 	try:
@@ -798,20 +1105,36 @@ def cmd_dev_up(args):
 	# trace of them.
 	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1')
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
+	# THE BUILD IS A STEP OF ITS OWN, because the runner no longer performs one.
+	#
+	# The build and the boot are different waits and want different budgets: a tree needing a full
+	# rebuild - anything that touched the build tooling invalidates every artifact's cache key - can
+	# spend longer building than any sensible boot deadline, and charged to one number a slow build
+	# is reported as a serial socket that never appeared, which sends the reader to QEMU for a
+	# problem that is in Cargo. That reasoning is unchanged; what changed is who builds. `run.sh`
+	# says of itself that it builds nothing, so the wait that used to watch for QEMU appearing
+	# behind a building `just run` was watching a process that starts QEMU immediately - and a stale
+	# or absent artifact was reported by the runner as a missing kernel rather than built.
 	timing_event('qemu', 'build-start')
-	guest = subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
+	# x86_64 by name: the persistent instance is that target and nothing else - `dev-status`
+	# fingerprints `init-x86_64.pkg`, and `scenario-cold` exists precisely because the other two
+	# have no persistent instance to be.
+	try:
+		build = subprocess.run(build_command('x86_64'), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, timeout=build_timeout)
+	except subprocess.TimeoutExpired:
+		os.close(lock_fd)
+		die(f'the development build did not finish within {build_timeout} s (see {DEV_QEMU_LOG})')
+	if build.returncode != 0:
+		os.close(lock_fd)
+		die(f'the development build failed (see {DEV_QEMU_LOG})')
+	guest = subprocess.Popen(run_command(displays), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
 	record_lab_guest(guest)
-	# The build and the boot are different waits and want different budgets. `just run` builds
-	# before it starts QEMU, and a tree needing a full rebuild - anything that touched the build
-	# tooling invalidates every artifact's cache key - can spend longer building than any
-	# sensible boot deadline. Charged to one number, a slow build is reported as a serial socket
-	# that never appeared, which sends the reader to QEMU for a problem that is in Cargo.
-	build_deadline = time.time() + build_timeout
+	qemu_deadline = time.time() + 60
 	while not dev_guest_qemu(guest.pid):
 		if guest.poll() is not None:
-			dev_bring_up_failed(lock_fd, guest, f'the build failed before QEMU started (see {DEV_QEMU_LOG})')
-		if time.time() > build_deadline:
-			dev_bring_up_failed(lock_fd, guest, f'the build did not reach QEMU within {build_timeout} s (see {DEV_QEMU_LOG})')
+			dev_bring_up_failed(lock_fd, guest, f'the runner exited before QEMU started (see {DEV_QEMU_LOG})')
+		if time.time() > qemu_deadline:
+			dev_bring_up_failed(lock_fd, guest, f'the runner did not reach QEMU within 60 s (see {DEV_QEMU_LOG})')
 		time.sleep(0.5)
 	timing_event('qemu', 'start')
 	booted = time.time()
@@ -827,7 +1150,7 @@ def cmd_dev_up(args):
 		except OSError:
 			serial.close()
 			if guest.poll() is not None:
-				# `just` is gone, but QEMU is a child in the same group and may not be, so
+				# The runner is gone, but QEMU is a child in the same group and may not be, so
 				# this goes through the same reaping the deadlines use.
 				dev_bring_up_failed(lock_fd, guest, f'guest exited before the serial socket appeared (see {DEV_QEMU_LOG})')
 			time.sleep(0.5)
@@ -839,6 +1162,9 @@ def cmd_dev_up(args):
 		'host': socket.gethostname(),
 		'broker': broker_pid,
 		'pgid': guest.pid,
+		# The pair, not the number. See `dev_group_is_ours`: a pgid on its own is reusable, and
+		# `dev-down` signals what this names.
+		'pgid_started': process_start_time(guest.pid),
 		'started': started,
 		# Taken after the guest booted, so it describes what this instance is actually
 		# running. A reattach deliberately keeps it: the broker changed, the guest did not.
@@ -847,13 +1173,19 @@ def cmd_dev_up(args):
 	os.close(lock_fd)
 	time.sleep(0.2)
 	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
-	if not has_prompt(reply[-256:]):
+	if not reply.prompted:
 		die(f'no shell prompt within {timeout} s (see {DEV_SERIAL_LOG})')
 	# Record which boot this is, now that the guest is up and its agent can answer. Every
 	# later session compares against it, so a tool can never publish into, or read a registry
 	# from, a guest that restarted since this instance was recorded.
 	timing_event('guest', 'ready')
-	dev_record_boot()
+	# READINESS INCLUDES THIS. The result was computed and thrown away, and `dev_record_boot`
+	# returns False when the agent does not answer inside its retry interval or when the record
+	# cannot be written - so `dev-up` could print "ready" having recorded no boot generation at all,
+	# with every later session then skipping the restart comparison because there was nothing to
+	# compare against. The shell comes up before the agent does, which is exactly when this happens.
+	if not dev_record_boot():
+		dev_bring_up_failed(lock_fd, guest, 'the guest reached a shell but its development agent never answered, so this instance has no boot generation - nothing could tell a later restart from this boot')
 	# A fresh guest has touched nothing, so the record of which scenarios have run starts empty.
 	# The scenario runner reads it to tell a first run's first-touch residency, which is memory
 	# in use, from a repeat run's loss, which is not.
@@ -861,9 +1193,9 @@ def cmd_dev_up(args):
 		os.remove(os.path.join(BUILD, 'dev-scenarios-seen'))
 	except OSError:
 		pass
-	profile = 'development' if b'boot profile: development' in strip_ansi(reply) or dev_profile_logged() else 'not reported'
+	profile = 'development' if b'boot profile: development' in strip_ansi(reply.data) or dev_profile_logged() else 'not reported'
 	print(f'lab: development instance ready in {time.time() - started:.1f} s (guest profile: {profile})')
-	print(f'lab: serial log {os.path.relpath(DEV_SERIAL_LOG, SRC)}; `just dev-status`, `just dev-down`')
+	print(f'lab: serial log {os.path.relpath(DEV_SERIAL_LOG, SRC)}; `just lab dev-status`, `just lab dev-down`')
 
 
 def dev_profile_logged():
@@ -878,16 +1210,16 @@ def cmd_dev_status(args):
 	state, identity = dev_state()
 	print(f'lab: development instance {state}')
 	if state == 'down':
-		print('     start it with `just dev-up`')
+		print('     start it with `just lab dev-up`')
 		sys.exit(1)
 	if state == 'stale':
 		print('     the broker is gone but its sockets remain')
-		print('     clear it with `just dev-down`')
+		print('     clear it with `just lab dev-down`')
 		sys.exit(1)
 	if state == 'detached':
 		print(f'     owner    {dev_describe(identity)}')
 		print('     the guest is running but no broker is draining its console')
-		print('     reattach without rebooting: `just dev-up`')
+		print('     reattach without rebooting: `just lab dev-up`')
 		sys.exit(1)
 	console = dev_console_stat()
 	print(f'     owner    {dev_describe(identity)}')
@@ -900,7 +1232,7 @@ def cmd_dev_status(args):
 		print('     another worktree owns it; this one cannot use or stop it')
 		sys.exit(1)
 	if state == 'starting':
-		print('     no shell prompt yet; rerun `just dev-status` or watch `just dev-log -f`')
+		print('     no shell prompt yet; rerun `just lab dev-status` or watch `just lab dev-log -f`')
 		sys.exit(1)
 	shadowed = dev_shadowed()
 	if shadowed is None:
@@ -911,7 +1243,7 @@ def cmd_dev_status(args):
 		print(f'     registry {len(shadowed)} artifact(s) shadowing the system volume:')
 		for name, generation, when in shadowed:
 			print(f'              {name} generation {generation}, published {when}')
-		print('              these override the built image until `just dev-rollback` or a restart')
+		print('              these override the built image until `just lab dev-rollback` or a restart')
 	stale = instance_stale_inputs(identity)
 	if stale is None:
 		print('     inputs   not recorded by this instance; restart it to compare')
@@ -925,7 +1257,7 @@ def cmd_dev_status(args):
 	print(f'     inputs   stale: {", ".join(stale)}')
 	for name in stale:
 		print(f'              {name:9}{INPUT_ACTIONS[name]}')
-	print('     action   cold restart: `just dev-down && just dev-up`')
+	print('     action   cold restart: `just lab dev-down && just lab dev-up`')
 	print('              this is a cold invalidation, not a hot-publishable application change')
 	sys.exit(1)
 
@@ -946,7 +1278,7 @@ def dev_check_socket(path):
 	except OSError as error:
 		die(f'cannot check {os.path.relpath(path, SRC)}: {error}')
 	if mode & 0o077:
-		die(f'{os.path.relpath(path, SRC)} is mode {mode:03o}, reachable beyond its owner; stop the instance with `just dev-down`')
+		die(f'{os.path.relpath(path, SRC)} is mode {mode:03o}, reachable beyond its owner; stop the instance with `just lab dev-down`')
 
 
 # Ask the guest which boot it is and record it on the instance lock.
@@ -985,19 +1317,28 @@ def dev_record_boot(deadline=30):
 			if time.monotonic() >= give_up:
 				return False
 			time.sleep(0.5)
-	identity = dev_identity_read()
-	identity['boot'] = bounds['boot']
+	return dev_boot_record_write(bounds['boot'])
+
+
+# THE BOOT THIS GUEST IS CURRENTLY ON, straight from a handshake.
+#
+# The guest draws the value once per boot, so it is the only thing that distinguishes one boot from
+# the next. Tools that wanted to prove "the guest did not restart under me" compared QEMU's process
+# GROUP before and after instead - and `system_reset` keeps that process group while creating an
+# entirely new boot, so the check could not see the event it was written for. None when the guest
+# cannot be asked, which is a third answer and not a restart.
+def guest_boot(timeout=5):
 	try:
-		fd = os.open(DEV_LOCK, os.O_RDWR)
-	except OSError:
-		return False
+		sock = proto_connect(timeout)
+	except SystemExit:
+		return None
+	buffer = bytearray()
 	try:
-		os.ftruncate(fd, 0)
-		os.lseek(fd, 0, os.SEEK_SET)
-		os.write(fd, json.dumps(identity).encode() + b'\n')
+		return proto_hello(sock, buffer, timeout)['boot']
+	except (SystemExit, ProtoTimeout, OSError, struct.error):
+		return None
 	finally:
-		os.close(fd)
-	return True
+		sock.close()
 
 
 # What the guest registry currently shadows, as (name, generation, age). None when the
@@ -1016,8 +1357,14 @@ def dev_shadowed():
 	try:
 		proto_hello(sock, buffer, 2)
 		artifacts, _ = read_registry(sock, buffer, 2)
-		return [(a['name'], a['generations'][-1]['generation'], published_ago(a['generations'][-1]['published_at'])) for a in artifacts]
-	except (SystemExit, ProtoTimeout, OSError, struct.error):
+		# `[-1]` on an artifact the guest listed with no generations is an `IndexError` out of a
+		# status command, which reads as a broken tool rather than as a guest that answered oddly.
+		return [(a['name'], a['generations'][-1]['generation'], published_ago(a['generations'][-1]['published_at'])) for a in artifacts if a['generations']]
+	# `Malformed` and `IndexError` are in this list because a truncated or inconsistent reply used to
+	# leave here as a traceback: only `struct.error` was caught, and the decoder's own failures are
+	# an index past the end or a short slice. A status command reporting "no answer" is the right
+	# outcome for a guest whose agent has gone wrong; a stack trace is not.
+	except (SystemExit, ProtoTimeout, OSError, struct.error, Malformed, IndexError, UnicodeError):
 		return None
 	finally:
 		sock.close()
@@ -1034,9 +1381,9 @@ def cmd_dev_console(args):
 	if state == 'foreign':
 		dev_owner_conflict(identity)
 	if state in ('down', 'stale'):
-		die('no development instance (run `just dev-up` first)')
+		die('no development instance (run `just lab dev-up` first)')
 	if not os.path.exists(DEV_CONSOLE_SOCK):
-		die('this instance has no console socket; restart it with `just dev-down && just dev-up`')
+		die('this instance has no console socket; restart it with `just lab dev-down && just lab dev-up`')
 	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	try:
 		sock.connect(DEV_CONSOLE_SOCK)
@@ -1103,7 +1450,7 @@ def console_pump(sock, interactive):
 
 def cmd_dev_log(args):
 	if not os.path.exists(DEV_SERIAL_LOG):
-		die('no development serial log yet (run `just dev-up` first)')
+		die('no development serial log yet (run `just lab dev-up` first)')
 	if '-f' in args:
 		os.execvp('tail', ['tail', '-f', DEV_SERIAL_LOG])
 	if args:
@@ -1119,6 +1466,51 @@ def dev_group_alive(pgid):
 		return True
 	except OSError:
 		return False
+
+
+# WHEN THE LEADER OF `pgid` IS THE PROCESS THIS INSTANCE STARTED, and not merely something with
+# that number.
+#
+# A process group id is reused. `dev_group_alive` answers "some group with this number exists", and
+# that was the whole basis on which `dev-down` sent SIGKILL to it and on which `dev_state` called a
+# lock-free instance `detached`. An id belonging to a guest that exited long ago can be held by
+# anything at all by the time somebody runs `dev-down`.
+#
+# The leader's start time is what makes the record immutable: it is fixed when the process is
+# created and cannot be reused with the number. `/proc/<pid>/stat` field 22 is that value in clock
+# ticks since boot, so a recorded pair (pgid, starttime) identifies one process and no other on this
+# machine's uptime.
+def process_start_time(pid):
+	try:
+		with open(f'/proc/{pid}/stat', 'rb') as handle:
+			fields = handle.read()
+	except OSError:
+		return None
+	# The command name is field 2 and may contain spaces and brackets, so everything is counted from
+	# after its closing parenthesis rather than by splitting the whole line.
+	close = fields.rfind(b')')
+	if close < 0:
+		return None
+	rest = fields[close + 2:].split()
+	if len(rest) < 20:
+		return None
+	try:
+		return int(rest[19])
+	except ValueError:
+		return None
+
+
+def dev_group_is_ours(identity):
+	pgid = identity.get('pgid')
+	if not pgid or not dev_group_alive(pgid):
+		return False
+	recorded = identity.get('pgid_started')
+	if recorded is None:
+		# An instance recorded before this field existed. Its group cannot be verified, so it is not
+		# signalled - reporting an unverifiable record is recoverable, and killing the wrong process
+		# group is not.
+		return False
+	return process_start_time(pgid) == recorded
 
 
 def dev_stopped(pgid):
@@ -1138,6 +1530,12 @@ def cmd_dev_down(args):
 	# does not own. A stale instance takes the same path on purpose: its broker is gone,
 	# which says nothing about whether its guest is still running.
 	pgid = identity.get('pgid')
+	verified = dev_group_is_ours(identity)
+	if pgid and dev_group_alive(pgid) and not verified:
+		# The recorded group is alive but is NOT the process this instance started - the number has
+		# been reused, or the record predates the identity that would prove it. Signalling it is how
+		# a cleanup kills something it has nothing to do with, so it does not.
+		die(f'the recorded process group {pgid} is alive but is not this instance\'s guest (the id has been reused, or the record is too old to verify); inspect it with `ps -g {pgid}` and stop it yourself')
 	if os.path.exists(mon_sock()):
 		try:
 			monitor_command('quit')
@@ -1146,7 +1544,7 @@ def cmd_dev_down(args):
 	deadline = time.time() + timeout
 	while time.time() < deadline and not dev_stopped(pgid):
 		time.sleep(0.2)
-	if not dev_stopped(pgid) and pgid:
+	if not dev_stopped(pgid) and verified:
 		try:
 			os.killpg(pgid, signal.SIGKILL)
 		except OSError:
@@ -1157,13 +1555,22 @@ def cmd_dev_down(args):
 	# Settle the verdict before unlinking: probing the lock recreates its file, which
 	# would leave an empty one behind and make a stopped instance look half-cleaned.
 	stopped = dev_stopped(pgid)
-	for path in (DEV_SERIAL_SOCK, DEV_CTL_SOCK, DEV_CONSOLE_SOCK, DEV_CHANNEL_SOCK, DEV_LOCK):
+	# AND NOTHING IS UNLINKED UNLESS IT STOPPED.
+	#
+	# This removed the lock and every socket whatever the verdict. If the broker or QEMU survived,
+	# unlinking `DEV_LOCK` took away the PATHNAME while the broker still held its flock on the old
+	# inode - so the next `dev-up` created a new file at the same path, locked it successfully, and
+	# two instances both believed they owned the singleton profile. That is the exclusivity
+	# guarantee that protects the system volume and the shared ports, destroyed by the command whose
+	# job is to release it. Removing the live socket names on top of that is what makes the repair
+	# hard: there is then nothing left to reattach to.
+	if not stopped:
+		print(f'lab: the guest did not stop; its lock and sockets are LEFT IN PLACE so the instance stays reachable', file=sys.stderr)
+		die(f'development instance did not stop; inspect it with `ps -g {pgid}`')
+	for path in (DEV_SERIAL_SOCK, DEV_CTL_SOCK, DEV_CONSOLE_SOCK, DEV_CHANNEL_SOCK, DEV_BOOT_RECORD, DEV_LOCK):
 		if os.path.exists(path):
 			os.unlink(path)
-	if stopped:
-		print('lab: development instance down')
-	else:
-		die(f'development instance did not stop; inspect it with `ps -g {pgid}`')
+	print('lab: development instance down')
 
 
 # ---- development-control protocol ------------------------------------------
@@ -1338,7 +1745,7 @@ def channel_path():
 
 def proto_connect(timeout):
 	if not os.path.exists(channel_path()):
-		die('this instance has no development channel; restart it with `just dev-down && just dev-up`')
+		die('this instance has no development channel; restart it with `just lab dev-down && just lab dev-up`')
 	if CHANNEL_OVERRIDE is None:
 		dev_check_socket(DEV_CHANNEL_SOCK)
 	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1411,9 +1818,9 @@ def proto_session(timeout, announce=True):
 	if state == 'foreign':
 		dev_owner_conflict(identity)
 	if state in ('down', 'stale'):
-		die('no development instance (run `just dev-up` first)')
+		die('no development instance (run `just lab dev-up` first)')
 	if state == 'detached':
-		die('the guest is running but no broker owns it; reattach with `just dev-up`')
+		die('the guest is running but no broker owns it; reattach with `just lab dev-up`')
 	sock = proto_connect(timeout)
 	buffer = bytearray()
 	bounds = proto_hello(sock, buffer, timeout)
@@ -1421,9 +1828,16 @@ def proto_session(timeout, announce=True):
 	# meant to outlive the tools that drive it, so a tool can be talking to a guest that
 	# restarted under it; comparing against what `dev-up` recorded turns that into a refusal
 	# instead of a publication into the wrong boot.
-	recorded = identity.get('boot')
-	if recorded and recorded != bounds['boot']:
-		die(f'the guest has restarted since this instance was recorded (boot {recorded[:16]} -> {bounds["boot"][:16]}); rerun `just dev-up`')
+	#
+	# AN ABSENT RECORD IS A REFUSAL, not a comparison to skip. The check was `if recorded and ...`,
+	# so an instance that never recorded one - or whose record was lost to the in-place rewrite this
+	# replaced - handshook happily with whichever boot answered, and the safety invariant was off
+	# with nothing saying so.
+	recorded = dev_boot_record_read()
+	if recorded is None:
+		die('this instance has no recorded boot generation, so nothing can tell this guest from one that restarted under it; rerun `just lab dev-up`')
+	if recorded != bounds['boot']:
+		die(f'the guest has restarted since this instance was recorded (boot {recorded[:16]} -> {bounds["boot"][:16]}); rerun `just lab dev-up`')
 	warn_stale_inputs(identity)
 	if announce:
 		registry = f'registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact' if bounds['registry'] else 'no registry on this boot'
@@ -1486,21 +1900,35 @@ def cmd_dev_publish(args):
 		if len(encoded) > bounds['max_name']:
 			die(f'name is {len(encoded)} B; the guest accepts at most {bounds["max_name"]} B')
 		started = time.monotonic()
+		# ONE ABSOLUTE DEADLINE FOR THE WHOLE PUBLICATION, not `--timeout` again per exchange.
+		#
+		# It was applied independently to the handshake, the begin, EVERY CHUNK and the commit. A
+		# maximum-size artifact is thousands of chunks, so `--timeout 15` bounded nothing anyone
+		# would recognise as fifteen seconds: the advertised bound was multiplied by the number of
+		# frames the file happened to need.
+		deadline = started + timeout
+
+		def left(what):
+			remaining = deadline - time.monotonic()
+			if remaining <= 0:
+				die(f'publication of {name} ran past its {timeout} s deadline before {what}')
+			return remaining
+
 		begin = struct.pack('<I', len(blob)) + digest + bytes([len(encoded)]) + encoded
-		_, generation, body = proto_request(sock, buffer, 2, OP_PUB_BEGIN, begin, timeout=timeout, what='publication begin')
+		_, generation, body = proto_request(sock, buffer, 2, OP_PUB_BEGIN, begin, timeout=left('the begin'), what='publication begin')
 		print(f'lab: publishing {name} as generation {generation} ({len(blob)} B, sha256 {digest.hex()[:16]}...)')
 		request = 3
 		sent = 0
 		try:
 			while sent < len(blob):
 				chunk = blob[sent:sent + bounds['max_payload']]
-				_, _, body = proto_request(sock, buffer, request, OP_PUB_CHUNK, chunk, generation, timeout, f'chunk at offset {sent}')
+				_, _, body = proto_request(sock, buffer, request, OP_PUB_CHUNK, chunk, generation, left(f'the chunk at offset {sent}'), f'chunk at offset {sent}')
 				sent += len(chunk)
 				acked = struct.unpack('<I', body[:4])[0] if len(body) >= 4 else -1
 				if acked != sent:
 					die(f'guest acknowledged {acked} B after {sent} B were sent')
 				request += 1
-			_, _, body = proto_request(sock, buffer, request, OP_PUB_COMMIT, b'', generation, timeout, 'commit')
+			_, _, body = proto_request(sock, buffer, request, OP_PUB_COMMIT, b'', generation, left('the commit'), 'commit')
 		except SystemExit:
 			# The guest would drop the candidate on its own deadline; aborting now returns the
 			# megabyte it is holding immediately instead.
@@ -1593,13 +2021,13 @@ def cmd_dev_reboot(args):
 	started = time.time()
 	qmp_command('system_reset')
 	reply = ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)
-	if not has_prompt(reply[-256:]):
+	if not reply.prompted:
 		die(f'no shell prompt within {timeout} s of the reset (see {DEV_SERIAL_LOG})')
 	# The registry went with the reboot, because it was the agent's memory. Recording the new
 	# boot value is not optional bookkeeping: without it every session refuses this guest for
 	# having restarted, and the recovery it names is the rebuild this command exists to avoid.
 	if not dev_record_boot():
-		die('the guest rebooted but its development agent never answered, so the instance is now unusable; `just dev-up` will rebuild it')
+		die('the guest rebooted but its development agent never answered, so the instance is now unusable; `just lab dev-up` will rebuild it')
 	print(f'lab: guest rebooted to a prompt in {time.time() - started:.1f} s; the registry is empty and the volume is unchanged')
 
 
@@ -1669,30 +2097,80 @@ def cmd_dev_restart(args):
 # Read the registry: every artifact, and the generations retained for it. The newest
 # generation of each is what currently shadows the system volume, which is the thing worth
 # seeing at a glance - a forgotten override is a fix that appears not to have worked.
-def read_registry(sock, buffer, timeout):
-	opcode, _, body = proto_request(sock, buffer, 2, OP_GEN_LIST, timeout=timeout, what='registry query')
-	if opcode != OP_GEN_LIST_REPLY or len(body) < 6:
-		die(f'registry query answered with opcode {opcode:#04x} and {len(body)} B')
-	count, registry_bytes = struct.unpack('<HI', body[:6])
-	at = 6
+# A malformed reply, named as one.
+#
+# Raised rather than `die`d so a caller that is diagnosing a protocol regression - which is what
+# these tools are for - can say WHICH field at WHICH offset did not fit.
+class Malformed(Exception):
+	pass
+
+
+# A cursor that checks every read against the end of the buffer.
+#
+# The registry decoder indexed `body[at]`, sliced names, generation records and detail strings, and
+# advanced past them without a single bounds check, and Python's slicing hides the failure: a slice
+# past the end is silently SHORT, so a truncated reply produced a plausible-looking registry with
+# quietly missing bytes, while an index past the end raised `IndexError` out of a function whose
+# caller catches `struct.error`. Neither is a named malformed-input outcome, and both come from a
+# guest that has gone wrong, which is exactly when a diagnostic tool has to be exact.
+class Cursor:
+	def __init__(self, data, what):
+		self.data = data
+		self.what = what
+		self.at = 0
+
+	def take(self, count):
+		if count < 0 or self.at + count > len(self.data):
+			raise Malformed(f'{self.what}: {count} B at offset {self.at}, past the end of a {len(self.data)} B payload')
+		chunk = self.data[self.at:self.at + count]
+		self.at += count
+		return chunk
+
+	def unpack(self, layout):
+		return layout.unpack(self.take(layout.size))
+
+	def byte(self):
+		return self.take(1)[0]
+
+	# Some formats end exactly where they say they do, and trailing bytes mean the reply was built
+	# by something that does not agree with this reader.
+	def require_exhausted(self):
+		if self.at != len(self.data):
+			raise Malformed(f'{self.what}: {len(self.data) - self.at} B of trailing data after offset {self.at}')
+
+
+REGISTRY_HEADER = struct.Struct('<HI')
+# generation u32 | length u32 | digest [32] | published_at u64 | verdict u8 | detail length u8
+REGISTRY_GENERATION = struct.Struct('<II32sQBB')
+
+
+def decode_registry(body):
+	cursor = Cursor(body, 'registry reply')
+	count, registry_bytes = cursor.unpack(REGISTRY_HEADER)
 	artifacts = []
 	for _ in range(count):
-		name_len = body[at]
-		name = body[at + 1:at + 1 + name_len].decode(errors='replace')
-		at += 1 + name_len
-		held = body[at]
-		at += 1
+		name = cursor.take(cursor.byte()).decode(errors='replace')
+		held = cursor.byte()
 		generations = []
 		for _ in range(held):
-			generation, length = struct.unpack('<II', body[at:at + 8])
-			digest = body[at + 8:at + 40]
-			published_at = struct.unpack('<Q', body[at + 40:at + 48])[0]
-			verdict, detail_len = body[at + 48], body[at + 49]
-			detail = body[at + 50:at + 50 + detail_len].decode(errors='replace')
-			at += 50 + detail_len
+			generation, length, digest, published_at, verdict, detail_len = cursor.unpack(REGISTRY_GENERATION)
+			detail = cursor.take(detail_len).decode(errors='replace')
 			generations.append({'generation': generation, 'length': length, 'digest': digest, 'published_at': published_at, 'verdict': verdict, 'detail': detail})
 		artifacts.append({'name': name, 'generations': generations})
+	# The reply describes exactly `count` artifacts and ends. Anything after them was written by
+	# something that does not agree with this reader about the format.
+	cursor.require_exhausted()
 	return artifacts, registry_bytes
+
+
+def read_registry(sock, buffer, timeout):
+	opcode, _, body = proto_request(sock, buffer, 2, OP_GEN_LIST, timeout=timeout, what='registry query')
+	if opcode != OP_GEN_LIST_REPLY or len(body) < REGISTRY_HEADER.size:
+		die(f'registry query answered with opcode {opcode:#04x} and {len(body)} B')
+	try:
+		return decode_registry(body)
+	except Malformed as error:
+		die(str(error))
 
 
 def published_ago(published_at):
@@ -1759,10 +2237,30 @@ def cmd_dev_loop(args):
 	child_env = dict(os.environ, LIBER_DEV_INPUTS_CHECKED='1')
 	phases = []
 	started = time.monotonic()
+	# ONE ABSOLUTE DEADLINE ACROSS THE PHASES. `--timeout` was parsed and then placed on nothing: the
+	# build and the scenario run were unbounded children, so a loop documented as bounded could hang
+	# in either forever. The publish child gets what is left rather than the whole number again.
+	deadline = started + timeout
 
-	at = time.monotonic()
-	build = subprocess.run([os.path.join(SRC, 'tools', 'dev-build.sh'), artifact, target], cwd=SRC, env=child_env, capture_output=True, text=True)
-	phases.append(('build', time.monotonic() - at, build.returncode == 0))
+	def remaining(phase):
+		left = deadline - time.monotonic()
+		if left <= 0:
+			report_loop(phases, started, '')
+			die(f'dev-loop: out of time before the {phase} phase ({timeout} s total)')
+		return left
+
+	def phase_child(name, command):
+		at = time.monotonic()
+		try:
+			done = run_child(command, remaining(name), cwd=SRC, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+		except ChildTimeout as expired:
+			phases.append((name, time.monotonic() - at, False))
+			report_loop(phases, started, str(expired))
+			die(f'dev-loop: the {name} phase did not finish within its share of {timeout} s')
+		phases.append((name, time.monotonic() - at, done.returncode == 0))
+		return done
+
+	build = phase_child('build', [os.path.join(SRC, 'tools', 'dev-build.sh'), artifact, target])
 	summary = next((line for line in reversed(build.stdout.splitlines()) if 'summary target=' in line), '')
 	if build.returncode != 0:
 		report_loop(phases, started, build.stdout + build.stderr)
@@ -1770,10 +2268,8 @@ def cmd_dev_loop(args):
 	if summary:
 		print(f'lab: {summary.split("summary ", 1)[-1]}')
 
-	at = time.monotonic()
 	path = staged_artifact(artifact, {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}.get(target, target))
-	publish = subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, env=child_env, capture_output=True, text=True)
-	phases.append(('publish', time.monotonic() - at, publish.returncode == 0))
+	publish = phase_child('publish', [os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(int(remaining('publish')))])
 	if publish.returncode != 0:
 		report_loop(phases, started, publish.stdout + publish.stderr)
 		die(f'dev-loop: publishing {artifact} failed')
@@ -1781,9 +2277,7 @@ def cmd_dev_loop(args):
 		if 'committed' in line or 'compatibility' in line:
 			print(line)
 
-	at = time.monotonic()
-	run = subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-test'] + scenarios, cwd=SRC, env=child_env, capture_output=True, text=True)
-	phases.append(('run', time.monotonic() - at, run.returncode == 0))
+	run = phase_child('run', [os.path.join(HERE, 'lab.py'), 'dev-test'] + scenarios)
 	print(run.stdout.strip())
 	report_loop(phases, started, run.stderr if run.returncode != 0 else '')
 	if run.returncode != 0:
@@ -1912,9 +2406,12 @@ def cmd_dev_launch(args):
 		if opcode != OP_LAUNCH_ACK or len(body) < 8:
 			die(f'launch answered with opcode {opcode:#04x} and {len(body)} B')
 		print(f'lab: launched {name} as koid {struct.unpack("<Q", body[:8])[0]}')
+		# Each poll gets what is LEFT of the deadline this loop computed. It gave every poll the
+		# original full timeout, so the last one could overrun that deadline by another complete
+		# interval - the bound was the loop's, and the operation it bounded had never been told.
 		request, deadline = 3, time.monotonic() + timeout
 		while time.monotonic() < deadline:
-			opcode, _, body = proto_request(sock, buffer, request, OP_LAUNCH_OUTPUT, timeout=timeout, what='reading output')
+			opcode, _, body = proto_request(sock, buffer, request, OP_LAUNCH_OUTPUT, timeout=max(deadline - time.monotonic(), 0.1), what='reading output')
 			request += 1
 			if len(body) >= 2:
 				if body[1]:
@@ -1990,19 +2487,22 @@ class LabGuest:
 	def serial_raw_since(self, at):
 		return serial_raw_since(at)
 
+	def serial_read(self, at):
+		return serial_read(at)
+
 	# Key and pointer events go through the emulated devices rather than the control protocol,
 	# so a scenario that sends them exercises the input stack the way a person does: the device,
 	# its driver, InputService, the session and the foreground program. Typed input over the
 	# protocol reaches the console directly and proves none of that.
-	def send_keys(self, keys):
+	def send_keys(self, keys, timeout=None):
 		try:
-			return send_keys(keys)
+			return send_keys(keys, None if timeout is None else time.monotonic() + timeout)
 		except SystemExit:
 			return False
 
-	def send_pointer(self, x, y, button, action):
+	def send_pointer(self, x, y, button, action, timeout=None):
 		try:
-			return send_pointer(x, y, button, action)
+			return send_pointer(x, y, button, action, timeout)
 		except SystemExit:
 			return False
 
@@ -2023,7 +2523,7 @@ class LabGuest:
 				time.sleep(0.5)
 			return False
 		try:
-			return has_prompt(ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK)[-256:])
+			return ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK).prompted
 		except (SystemExit, OSError):
 			return False
 
@@ -2184,14 +2684,25 @@ class LabGuest:
 			sock.close()
 		return held, stuck, free
 
+	# These three run a child, and the child was given the step's timeout as an ARGUMENT with no host
+	# bound on the process itself. A child that hangs before reaching its own deadline - in socket
+	# setup, in an import, anywhere - ran forever inside a step that had declared a limit. The host
+	# bound is the same number plus a small allowance, so the child's own timeout still reports the
+	# failure when it can and the host stops it when it cannot.
+	def scenario_child(self, arguments, timeout):
+		try:
+			return run_child([os.path.join(HERE, 'lab.py'), *arguments], timeout + CHILD_GRACE, cwd=SRC, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+		except ChildTimeout:
+			return False
+
 	def publish(self, artifact, path, timeout):
-		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-publish', artifact, path, '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
+		return self.scenario_child(['dev-publish', artifact, path, '--timeout', str(timeout)], timeout)
 
 	def reset(self, timeout):
-		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-reset', '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
+		return self.scenario_child(['dev-reset', '--timeout', str(timeout)], timeout)
 
 	def restart(self, timeout):
-		return subprocess.run([os.path.join(HERE, 'lab.py'), 'dev-restart', '--timeout', str(timeout)], cwd=SRC, capture_output=True).returncode == 0
+		return self.scenario_child(['dev-restart', '--timeout', str(timeout)], timeout)
 
 
 def cmd_dev_test(args):
@@ -2214,16 +2725,28 @@ def cmd_dev_test(args):
 	if state == 'foreign':
 		dev_owner_conflict(identity)
 	if state != 'ready':
-		die(f'development instance is {state}; scenarios need a ready one (`just dev-up`)')
+		die(f'development instance is {state}; scenarios need a ready one (`just lab dev-up`)')
+	# The fixtures are checked against the tree they were made from BEFORE anything is published.
+	# Validation used to check only that the files existed, so a fixture whose staged source had
+	# been rebuilt was published as though it were current and the run's verdict was about bytes
+	# from an older tree.
+	stale = scenario.stale_fixtures()
+	if stale:
+		for complaint in stale:
+			print(f'lab: {complaint}', file=sys.stderr)
+		die('the scenario fixtures do not match this tree; rebuild them with boot/scenarios/make-fixtures.py')
 	failures = 0
-	for path, document in documents:
-		name = document['name']
-		try:
-			elapsed = scenario.run(document, LabGuest(30), verbose)
-			print(f'lab: {name} passed in {elapsed:.1f} s ({os.path.relpath(path, SRC)})')
-		except scenario.ScenarioError as error:
-			print(f'lab: {name} FAILED: {error}', file=sys.stderr)
-			failures += 1
+	# HELD ACROSS EVERY SCENARIO, not per scenario: teardown restores the instance for the run that
+	# comes next, and a second run starting between two of them inherits a half-restored guest.
+	with scenario_lease(f'{len(documents)} scenario(s)'):
+		for path, document in documents:
+			name = document['name']
+			try:
+				elapsed = scenario.run(document, LabGuest(30), verbose)
+				print(f'lab: {name} passed in {elapsed:.1f} s ({os.path.relpath(path, SRC)})')
+			except scenario.ScenarioError as error:
+				print(f'lab: {name} FAILED: {error}', file=sys.stderr)
+				failures += 1
 	if failures:
 		die(f'{failures} of {len(documents)} scenario(s) failed')
 	print(f'lab: {len(documents)} scenario(s) passed')
@@ -2254,13 +2777,17 @@ def cmd_scenario_cold(args):
 			die(str(error))
 
 	env = dict(os.environ, LIBER_DEVELOPMENT='1')
-	build = {'x86_64': ['just', 'user', 'kernel-build'], 'aarch64': ['just', 'user-aarch64'], 'riscv64': ['just', 'user-riscv64']}[target]
+	build_timeout = arg_value(args, '--build-timeout', 3600)
 	print(f'lab: building {target} with the development profile')
-	if subprocess.run(build, cwd=SRC, env=env).returncode != 0:
-		die(f'the {target} userspace did not build')
+	# Bounded, and its whole group is stopped on expiry. A cross build for an emulated target is the
+	# longest-running child this file starts, and it had no deadline at all - so a wedged compiler
+	# held a command that is documented as bounded for as long as it liked.
+	try:
+		if run_child(build_command(target), build_timeout, cwd=SRC, env=env).returncode != 0:
+			die(f'the {target} system did not build')
+	except ChildTimeout as expired:
+		die(f'the {target} build did not finish within {build_timeout} s ({expired})')
 	triple = {'x86_64': 'x86_64-unknown-none', 'aarch64': 'aarch64-unknown-none', 'riscv64': 'riscv64gc-unknown-none-elf'}[target]
-	if subprocess.run(['cargo', 'build', '--target', triple], cwd=os.path.join(SRC, 'kernel'), env=env).returncode != 0:
-		die(f'the {target} kernel did not build')
 
 	# A NAMESPACE OF ITS OWN, on every target. This took the persistent instance's unsuffixed x86
 	# path and unlinked it below without checking whether that instance was up - so a cold run and
@@ -2279,11 +2806,48 @@ def cmd_scenario_cold(args):
 	# A cold guest has run nothing, so the record of which scenarios have already run starts
 	# empty here for the same reason `dev-up` empties it: first-touch residency is relative to a
 	# boot, and this is a new one.
+	#
+	# RUN-LOCAL, per target. Every cold run on every architecture shared the persistent instance's
+	# one `dev-scenarios-seen`, so a cold aarch64 run deleted the x86 instance's record and its own
+	# first/repeat verdicts were decided by whatever had run last anywhere.
+	scenario.SEEN_PATH = os.path.join(BUILD, f'cold-{target}-scenarios-seen')
 	with contextlib.suppress(OSError):
-		os.remove(os.path.join(BUILD, 'dev-scenarios-seen'))
+		os.remove(scenario.SEEN_PATH)
+	# THE FIXTURES FOR THIS TARGET, built here and checked here.
+	#
+	# The documents name `{staged}` and `{fixtures}`; this is what decides which target those resolve
+	# to. Without it a cold aarch64 or riscv64 run published x86 images into a guest that refuses
+	# them by design, so a substantial part of the advertised cross-architecture suite could not
+	# exercise its stated behaviour at all.
+	scenario.TARGET = target
+	fixture_env = dict(env, FIXTURE_TARGET=target)
+	try:
+		if run_child([os.path.join(HERE, 'scenarios', 'make-fixtures.py')], 600, cwd=SRC, env=fixture_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode != 0:
+			die(f'the {target} scenario fixtures could not be built')
+	except ChildTimeout as expired:
+		die(f'building the {target} scenario fixtures did not finish ({expired})')
+	stale = scenario.stale_fixtures(target)
+	if stale:
+		for complaint in stale:
+			print(f'lab: {complaint}', file=sys.stderr)
+		die(f'the {target} scenario fixtures do not match this tree')
 	guest_env = dict(env, DEV_PROFILE='1', COLD='1', SERIAL=f'file:{log}')
+	# UEFI ON THE DEVICE-TREE TARGETS, because a direct boot cannot carry what a driven guest needs.
+	#
+	# `-kernel` on `virt` has no module hand-off: the machine takes one blob, so a direct boot gets
+	# the init package and NOT the system volume package beside it. That starts SystemManager and
+	# stops - no shell, no development agent - and this runner then waited on a handshake that could
+	# never arrive from a guest that looked perfectly alive. The runner refuses the combination now;
+	# this is the side that asks for the boot that works. `run.sh` takes the same position for the
+	# same reason.
+	if target != 'x86_64':
+		guest_env['UEFI'] = '1'
 	print(f'lab: booting {target}; serial log {os.path.relpath(log, SRC)}')
-	guest = subprocess.Popen(['bash', 'boot/qemu-run.sh', target, kernel], cwd=SRC, env=guest_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+	# The runner's own diagnosis goes into the serial log's neighbour rather than into /dev/null: it
+	# is the process that says "loader EFI not found" or "init package not found", and discarding
+	# that left every startup failure looking like a guest that never answered.
+	runner_log = open(os.path.join(BUILD, f'cold-{target}-runner.log'), 'wb')
+	guest = subprocess.Popen(['bash', 'boot/qemu-run.sh', target, kernel], cwd=SRC, env=guest_env, stdout=runner_log, stderr=runner_log, start_new_session=True)
 	record_lab_guest(guest)
 	failures = 0
 	try:
@@ -2351,10 +2915,12 @@ def cmd_scenario_cold(args):
 		SERIAL_OVERRIDE = None
 		MON_OVERRIDE = None
 		QMP_OVERRIDE = None
-		with contextlib.suppress(ProcessLookupError):
-			os.killpg(os.getpgid(guest.pid), signal.SIGTERM)
-		with contextlib.suppress(Exception):
-			guest.wait(timeout=15)
+		# TERM, then KILL. This sent TERM, waited fifteen seconds and SUPPRESSED the failure - so a
+		# QEMU that ignores TERM outlived the command that started it, holding the sockets and disk
+		# images the next run needs and appearing as a mysteriously busy resource somewhere else.
+		stop_child_group(guest, grace=15)
+		if guest.poll() is None:
+			print(f'lab: the {target} guest (pgid {guest.pid}) did not stop even on SIGKILL', file=sys.stderr)
 	if failures:
 		die(f'{failures} of {len(documents)} scenario(s) failed on {target}')
 	print(f'lab: {len(documents)} scenario(s) passed on {target}')
@@ -2420,7 +2986,12 @@ def cmd_boot(args):
 	# boot output is ever lost between startup and the connect below.
 	env = dict(os.environ, SERIAL=f'unix:{SERIAL_SOCK},server')
 	qemu_log = open(QEMU_LOG, 'wb')
-	record_lab_guest(subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True))
+	# BUILD, then boot. The runner builds nothing, so without this `lab boot` boots whatever
+	# artifacts were last left in `.build` - or refuses with "no kernel for x86_64" on a clean tree,
+	# which reads as a broken lab rather than as a step nobody performed.
+	if subprocess.run(build_command('x86_64'), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log).returncode != 0:
+		die(f'the build failed (see {QEMU_LOG})')
+	record_lab_guest(subprocess.Popen(run_command(displays), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True))
 	started = time.time()
 	serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	while True:
@@ -2441,7 +3012,7 @@ def cmd_boot(args):
 	serial.close()
 	time.sleep(0.2)
 	reply = ctl_request(f'WAIT {timeout}', timeout)
-	if not has_prompt(reply[-256:]):
+	if not reply.prompted:
 		die(f'no shell prompt within {timeout} s (see {SERIAL_LOG})')
 	print(f'lab: booted in {time.time() - started:.1f} s' + (' (fresh volume)' if fresh else ''))
 	print(f'lab: serial log {os.path.relpath(SERIAL_LOG, SRC)}; try `just lab sh uname`')
@@ -2453,7 +3024,7 @@ def cmd_sh(args):
 	if not command:
 		die('usage: lab sh <command...>')
 	reply = ctl_request(f'RUN {timeout} {command}', timeout, active_ctl_sock())
-	text = strip_ansi(reply).decode(errors='replace').replace('\r\n', '\n')
+	text = strip_ansi(reply.data).decode(errors='replace').replace('\r\n', '\n')
 	lines = text.split('\n')
 	# Drop the echoed command line and the trailing prompt; the rest is the output.
 	if lines and command in lines[0]:
@@ -2461,12 +3032,20 @@ def cmd_sh(args):
 	while lines and (lines[-1] == '' or PROMPT.search(lines[-1].encode())):
 		lines.pop()
 	print('\n'.join(lines))
+	# AND THE OUTCOME DECIDES THE EXIT STATUS. This printed whatever bytes arrived and exited 0
+	# either way, so a command that hung until its deadline - having printed part of its output -
+	# was indistinguishable from one that finished. Anything wrapping `lab sh` in a script read that
+	# as success. There is still no guest command status here: this says whether the REQUEST
+	# completed, which is the honest claim and is the one the broker can actually make.
+	if not reply.prompted:
+		print(f'lab: the request ended as {reply.outcome}, not at a prompt - the output above may be partial', file=sys.stderr)
+		sys.exit(1)
 
 
 def cmd_wait(args):
 	timeout = arg_value(args, '--timeout', 60)
 	reply = ctl_request(f'WAIT {timeout}', timeout, active_ctl_sock())
-	sys.exit(0 if has_prompt(reply[-256:]) else 1)
+	sys.exit(0 if reply.prompted else 1)
 
 
 # Interrupt the guest's foreground job: one 0x03 byte on the serial console (the
@@ -2474,7 +3053,7 @@ def cmd_wait(args):
 def cmd_int(args):
 	timeout = arg_value(args, '--timeout', 15)
 	reply = ctl_request(f'INT {timeout}', timeout, active_ctl_sock())
-	sys.exit(0 if has_prompt(reply[-256:]) else 1)
+	sys.exit(0 if reply.prompted else 1)
 
 
 def cmd_log(args):
@@ -2539,6 +3118,12 @@ def text_keys(text, enter):
 # and capabilities negotiated before anything is accepted, so a connection is made per batch
 # rather than kept: these are rare, and a socket held open across a guest restart would be a
 # thing to invalidate.
+# The most bytes a QMP peer may queue before this gives up. QEMU's replies are small; a stream that
+# never produces a newline is a peer that is not QMP, and reading it forever is how a helper with a
+# timeout still hangs.
+QMP_MAX_BUFFER = 4 * 1024 * 1024
+
+
 def qmp_command(execute, arguments=None, timeout=5):
 	if not os.path.exists(qmp_sock()):
 		die('no QEMU QMP socket (is the instance up?)')
@@ -2546,26 +3131,58 @@ def qmp_command(execute, arguments=None, timeout=5):
 	conn.settimeout(timeout)
 	buffer = bytearray()
 
-	def reply():
+	# One JSON object, whatever it is.
+	def read_object():
 		while b'\n' not in buffer:
 			more = conn.recv(65536)
 			if not more:
 				die('the QEMU QMP socket closed')
 			buffer.extend(more)
+			if len(buffer) > QMP_MAX_BUFFER:
+				die('the QMP peer sent more than one reply frame without a newline')
 		line, _, rest = bytes(buffer).partition(b'\n')
 		buffer[:] = rest
-		return json.loads(line)
+		try:
+			return json.loads(line)
+		except ValueError:
+			die('the QMP peer sent something that is not JSON')
+
+	# THE OBJECT THAT ANSWERS THIS REQUEST, and not whatever arrives next.
+	#
+	# QMP is asynchronous: a device event, a reset, a stop or a job update can arrive between a
+	# request and its response. This used to read exactly the next line and return it - so an event
+	# became the answer, and because an event carries no `error` key, a refused or never-executed
+	# command was reported as a success with `None`. Every later read was then one object out of
+	# step. Requests carry an `id` now and this skips everything that is not the matching response,
+	# which is what the `id` is for.
+	def response_to(request_id):
+		deadline = time.monotonic() + timeout
+		while True:
+			answer = read_object()
+			if 'event' in answer:
+				continue
+			if answer.get('id') == request_id:
+				return answer
+			# A reply with someone else's id, or none, is not this request's answer. It can only
+			# come from a socket shared with something else, which is worth saying rather than
+			# silently skipping past.
+			if time.monotonic() > deadline:
+				die(f'no QMP reply for request {request_id} within {timeout} s')
 
 	try:
 		conn.connect(qmp_sock())
-		reply()
-		conn.sendall(json.dumps({'execute': 'qmp_capabilities'}).encode() + b'\n')
-		reply()
-		request = {'execute': execute}
+		greeting = read_object()
+		if 'QMP' not in greeting:
+			die('the QMP socket did not open with a greeting')
+		conn.sendall(json.dumps({'execute': 'qmp_capabilities', 'id': 'caps'}).encode() + b'\n')
+		negotiated = response_to('caps')
+		if 'error' in negotiated:
+			die(f'QMP capability negotiation refused: {negotiated["error"].get("desc", negotiated["error"])}')
+		request = {'execute': execute, 'id': 'cmd'}
 		if arguments is not None:
 			request['arguments'] = arguments
 		conn.sendall(json.dumps(request).encode() + b'\n')
-		answer = reply()
+		answer = response_to('cmd')
 		if 'error' in answer:
 			die(f'QMP {execute} refused: {answer["error"].get("desc", answer["error"])}')
 		return answer.get('return')
@@ -2574,12 +3191,20 @@ def qmp_command(execute, arguments=None, timeout=5):
 
 
 # Send key events into the guest through the emulated keyboard.
-def send_keys(keys):
+# `deadline` is a monotonic instant, not a per-key allowance.
+#
+# A batch is up to 64 keys and each key was its own five-second monitor operation plus a pause, so a
+# step declaring five seconds could spend several minutes inside this and the scenario's own total
+# deadline meant nothing while it did. The budget is the caller's and it is spent, not multiplied.
+def send_keys(keys, deadline=None):
 	for name in keys:
 		sequence = key_sequence(name)
 		if sequence is None:
 			die(f'no key named {name!r}')
-		monitor_command(f'sendkey {sequence}')
+		if deadline is not None and time.monotonic() >= deadline:
+			die(f'the key batch ran out of time with {len(keys)} key(s) requested')
+		remaining = 5 if deadline is None else max(0.5, deadline - time.monotonic())
+		monitor_command(f'sendkey {sequence}', timeout=remaining)
 		# The guest's line discipline is a real one: keys arriving faster than it drains lose
 		# nothing, but pacing them keeps a burst from being one indistinguishable event.
 		time.sleep(0.05)
@@ -2589,7 +3214,7 @@ def send_keys(keys):
 # Send pointer events into the guest through the emulated tablet. `x` and `y` are fractions of
 # the screen, absolute because the device is a tablet; a button is pressed and released as one
 # event batch, which is what a click is.
-def send_pointer(x=None, y=None, button=None, action='click'):
+def send_pointer(x=None, y=None, button=None, action='click', timeout=None):
 	events = []
 	if x is not None:
 		events.append({'type': 'abs', 'data': {'axis': 'x', 'value': int(max(0.0, min(1.0, x)) * ABSOLUTE_RANGE)}})
@@ -2604,7 +3229,7 @@ def send_pointer(x=None, y=None, button=None, action='click'):
 			events.append({'type': 'btn', 'data': {'down': False, 'button': button}})
 	if not events:
 		die('a pointer event needs a position, a button, or both')
-	qmp_command('input-send-event', {'events': events})
+	qmp_command('input-send-event', {'events': events}, timeout=5 if timeout is None else max(1, timeout))
 	return True
 
 
@@ -2702,12 +3327,12 @@ def cmd_key(args):
 	send_keys(keys)
 
 
-def monitor_command(command):
+def monitor_command(command, timeout=5):
 	if not os.path.exists(mon_sock()):
 		die('no QEMU monitor socket (is the instance up?)')
 	conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	conn.connect(mon_sock())
-	conn.settimeout(5)
+	conn.settimeout(timeout)
 	conn.sendall(command.encode() + b'\n')
 	reply = b''
 	try:
@@ -2771,16 +3396,30 @@ def cmd_pcap(args):
 def pcap_dump():
 	if not os.path.exists(PCAP):
 		die('no capture file (run `lab pcap on` first)')
-	data = open(PCAP, 'rb').read()
+	with open(PCAP, 'rb') as handle:
+		data = handle.read()
 	offset, index = 24, 0
 	while offset + 16 <= len(data):
 		_, _, incl, _ = struct.unpack('<IIII', data[offset:offset + 16])
+		# A RECORD LENGTH IS A CLAIM, and this file may be truncated - a capture is stopped by
+		# whatever stopped the guest. A slice past the end is silently short in Python, so an
+		# incomplete final record used to be decoded as a whole packet, with every offset inside it
+		# reading whatever was there.
+		if incl > len(data) - offset - 16:
+			print(f'{index + 1}: truncated record, {incl} B claimed and {len(data) - offset - 16} B present')
+			return
 		packet = data[offset + 16:offset + 16 + incl]
 		offset += 16 + incl
 		index += 1
 		print(f'{index}: {decode_packet(packet)}')
 
 
+# EVERY OFFSET CHECKED AGAINST THE PACKET, because a capture is untrusted input in the ordinary
+# sense: it is bytes off a wire, truncated at whatever length the capture was cut at, and the
+# header fields that say where the transport starts are themselves in the packet. `ihl` was read
+# and used as an offset with no check that it landed inside the frame - a nibble of 15 puts the
+# transport header 60 bytes in - and the transport fields were then unpacked from there. That is a
+# `struct.error` traceback out of a diagnostic tool, or a decode of adjacent bytes.
 def decode_packet(p):
 	if len(p) < 14:
 		return f'short frame ({len(p)} B)'
@@ -2793,19 +3432,33 @@ def decode_packet(p):
 	ihl = (p[14] & 0x0f) * 4
 	total = struct.unpack('>H', p[16:18])[0]
 	proto, src, dst = p[23], ip_str(p[26:30]), ip_str(p[30:34])
+	# The minimum legal IHL is 20 bytes, and the header has to be inside the frame.
+	if ihl < 20 or 14 + ihl > len(p):
+		return f'IP {src} -> {dst}: header length {ihl} B does not fit a {len(p)} B frame'
 	t = 14 + ihl
+
+	# How many transport bytes are actually present from `t` onward.
+	def fits(count):
+		return t + count <= len(p)
+
 	if proto == 1:
-		return f'ICMP {src} -> {dst} type {p[t]} ({total} B)'
+		return f'ICMP {src} -> {dst} type {p[t]} ({total} B)' if fits(1) else f'ICMP {src} -> {dst}: no type byte in a {len(p)} B frame'
 	if proto == 17:
+		if not fits(8):
+			return f'UDP {src} -> {dst}: header truncated in a {len(p)} B frame'
 		sp, dp = struct.unpack('>HH', p[t:t + 4])
 		return f'UDP {src}:{sp} -> {dst}:{dp} len {total - ihl - 8}'
 	if proto == 6:
+		if not fits(20):
+			return f'TCP {src} -> {dst}: header truncated in a {len(p)} B frame'
 		sp, dp = struct.unpack('>HH', p[t:t + 4])
 		seq, ack = struct.unpack('>II', p[t + 4:t + 12])
 		doff = (p[t + 12] >> 4) * 4
 		flags = ''.join(name for name, bit in (('F', 1), ('S', 2), ('R', 4), ('P', 8), ('A', 16)) if p[t + 13] & bit)
 		win = struct.unpack('>H', p[t + 14:t + 16])[0]
-		opts = p[t + 20:t + doff].hex()
+		# The data offset is also a claim. Options that run past the frame are reported as absent
+		# rather than as a short hex string that looks like the whole of them.
+		opts = p[t + 20:t + doff].hex() if 20 <= doff and fits(doff) else ''
 		payload = total - ihl - doff
 		return f'TCP {src}:{sp} -> {dst}:{dp} [{flags}] seq={seq} ack={ack} win={win} len={payload}' + (f' opts={opts}' if opts else '')
 	return f'IP proto {proto} {src} -> {dst} ({total} B)'
