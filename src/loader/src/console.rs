@@ -126,7 +126,13 @@ fn identity(address: u64) -> u64 {
 pub(crate) fn discover(system_table: *mut uefi::SystemTable) {
 	let (mut dtb, mut rsdp) = (0u64, 0u64);
 	unsafe {
-		let entries = core::slice::from_raw_parts((*system_table).configuration_table, (*system_table).number_of_table_entries);
+		// A NULL POINTER IS NOT AN EMPTY SLICE. `from_raw_parts` requires a non-null, aligned pointer
+		// EVEN FOR LENGTH ZERO, and firmware with no configuration tables is entitled to publish
+		// null with a count of zero - so the ordinary case was undefined behaviour that happened to
+		// work. There is nothing to search either way; say so instead of forming the slice.
+		let table = (*system_table).configuration_table;
+		let count = (*system_table).number_of_table_entries;
+		let entries: &[uefi::ConfigurationTable] = if table.is_null() || count == 0 { &[] } else { core::slice::from_raw_parts(table, count) };
 		for entry in entries {
 			if entry.vendor_guid == uefi::DTB_TABLE_GUID {
 				dtb = entry.vendor_table as u64;

@@ -117,7 +117,17 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	}
 
 	// The highest physical address the HHDM and identity map must cover.
-	let ram_top = align_up(uefi::memory::memory_top(bs), PAGE_2MB);
+	//
+	// ZERO IS A FAILURE, NOT A RESULT. `memory_top` answers 0 for every snapshot failure, and that
+	// value was rounded and used: the HHDM and identity map were then built over an EMPTY interval,
+	// so the loader handed the kernel a direct map covering nothing and carried on. That is the
+	// fail-open shape this project has removed twice elsewhere - a machine with no RAM does not
+	// exist, so 0 can only mean the map could not be taken.
+	let top = uefi::memory::memory_top(bs);
+	if top == 0 {
+		panic!("loader: the firmware would not give a memory map, so there is no RAM ceiling to build the direct map over");
+	}
+	let ram_top = align_up(top, PAGE_2MB);
 
 	// Build the page hierarchy: HHDM over all RAM, the framebuffer uncacheable,
 	// a low identity map for the CR3 switch, and the kernel's segments.
@@ -307,6 +317,12 @@ fn locate_framebuffer(bs: *mut BootServices) -> FbResult {
 fn find_rsdp(system_table: *mut SystemTable) -> u64 {
 	let count = unsafe { (*system_table).number_of_table_entries };
 	let entries = unsafe { (*system_table).configuration_table };
+	// Firmware with no configuration tables may publish a null pointer with a zero count, and
+	// `entries.add(i)` on null is undefined even when the loop never runs. Nothing to find either
+	// way.
+	if entries.is_null() || count == 0 {
+		return 0;
+	}
 	let mut fallback = 0u64;
 	for i in 0..count {
 		let e = unsafe { &*entries.add(i) };

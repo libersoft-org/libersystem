@@ -26,6 +26,29 @@ const PCD: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
 const NX: u64 = 1 << 63;
 
+const IA32_EFER: u32 = 0xC000_0080;
+const EFER_NXE: u64 = 1 << 11;
+const CR4_LA57: u64 = 1 << 12;
+
+#[inline]
+unsafe fn rdmsr(msr: u32) -> u64 {
+	let (low, high): (u32, u32);
+	unsafe { core::arch::asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags)) };
+	((high as u64) << 32) | low as u64
+}
+
+#[inline]
+unsafe fn wrmsr(msr: u32, value: u64) {
+	unsafe { core::arch::asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nomem, nostack, preserves_flags)) };
+}
+
+#[inline]
+unsafe fn cr4() -> u64 {
+	let value: u64;
+	unsafe { core::arch::asm!("mov {}, cr4", out(reg) value, options(nomem, nostack, preserves_flags)) };
+	value
+}
+
 // Physical-address field of a page-table entry (bits 12..=51).
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -42,6 +65,27 @@ pub struct PageTables {
 impl PageTables {
 	// Allocate a zeroed PML4 to root the new hierarchy.
 	pub fn new(bs: *mut BootServices) -> Option<Self> {
+		// ESTABLISH WHAT THE TABLES ASSUME, before building any.
+		//
+		// Every entry below carries `NX`, and bit 63 is RESERVED - a fault on use - until `EFER.NXE`
+		// is set. Firmware usually sets it, and "usually" is the whole problem: on firmware that does
+		// not, the loader builds tables that fault the moment they are switched to, and it does so
+		// after the point where anything could report it. Setting it here costs one MSR write and
+		// removes the assumption.
+		//
+		// And the DEPTH: these are four-level tables. With `CR4.LA57` set the CPU walks five, so the
+		// PML4 built here would be read as a PML5 and every translation would come from the wrong
+		// level. Nothing confirmed it; refuse instead of producing a hierarchy the CPU will read
+		// differently than it was written.
+		unsafe {
+			if cr4() & CR4_LA57 != 0 {
+				return None;
+			}
+			let efer = rdmsr(IA32_EFER);
+			if efer & EFER_NXE == 0 {
+				wrmsr(IA32_EFER, efer | EFER_NXE);
+			}
+		}
 		let pml4 = alloc_table(bs)?;
 		Some(Self { bs, pml4 })
 	}
