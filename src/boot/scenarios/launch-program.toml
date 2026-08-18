@@ -39,6 +39,15 @@ timeout = 30
 do = "finished"
 timeout = 30
 
-# A component the installed permission manifest does not cover is refused. The manifest stays
-# the authority for what may be launched, and a scenario cannot talk its way past it - which
-# is why there is no step here that could have run `echo` some other way.
+# A component the installed permission manifest does not cover is refused. The manifest stays the
+# authority for what may be launched, and a scenario cannot talk its way past it.
+#
+# THIS USED TO BE THE END OF THE FILE - the paragraph above and no step after it. The behaviour it
+# describes was covered nowhere in this scenario, so removing the manifest check would have left it
+# green while its own comment claimed otherwise. `refused` states the expectation as a step: status
+# 24 is the launcher declining the component, and a launch that SUCCEEDS fails here.
+[[step]]
+do = "refused"
+program = "no-such-component"
+status = 24
+timeout = 30

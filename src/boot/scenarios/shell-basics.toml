@@ -12,14 +12,15 @@ timeout = 120
 do = "prompt"
 timeout = 30
 
-[[step]]
-do = "input"
-text = "echo scenario-one"
-
-[[step]]
-do = "expect"
-contains = "scenario-one"
-timeout = 20
+# EVERY MARKER BELOW IS ABSENT FROM THE INPUT THAT PRODUCES IT.
+#
+# This scenario used to type `echo scenario-one` and then look for `scenario-one`. The terminal
+# echoes what is typed, so that string was on the console before the shell did anything at all: the
+# assertion passed on the echo of its own command line, and would have gone on passing with the
+# shell's command execution removed entirely. It is the exact shape of a test that reports success
+# without measuring its subject.
+#
+# `uname` and `ls` are used instead, because what they print appears nowhere in what is typed.
 
 [[step]]
 do = "input"
@@ -28,4 +29,14 @@ text = "uname"
 [[step]]
 do = "expect"
 contains = "LiberSystem"
+timeout = 20
+
+# A command with an argument, whose answer is a filename the input does not contain.
+[[step]]
+do = "input"
+text = "ls vol://system/lib/protocol"
+
+[[step]]
+do = "expect"
+contains = "base-proto.lslib"
 timeout = 20

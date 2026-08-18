@@ -20,9 +20,28 @@ artifact = "base-proto"
 file = "{staged}/lib/protocol/base-proto.lslib"
 timeout = 60
 
+# WHAT THIS LISTING PROVES, AND WHAT IT DOES NOT.
+#
+# The installed file is still there and still has its installed length. That is the claim: a
+# publication puts a generation in the registry and leaves the volume alone. It is NOT a proof that
+# resolution consults the generation - the same output appears whether it does or not - and the
+# scenario's description used to imply otherwise. Proving the shadow is consulted is
+# `registry-shadow`'s job, where a consumer runs against the published generation and prints
+# something the installed build does not.
 [[step]]
 do = "input"
 text = "ls vol://system/lib/protocol"
+
+[[step]]
+do = "expect"
+contains = "base-proto.lslib"
+timeout = 20
+
+# And the installed file is not itself replaced: `du` reports the length the volume holds, which a
+# publication that wrote through to the volume would change.
+[[step]]
+do = "input"
+text = "du vol://system/lib/protocol/base-proto.lslib"
 
 [[step]]
 do = "expect"

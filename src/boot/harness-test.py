@@ -922,6 +922,47 @@ class FixtureSetTest(unittest.TestCase):
 				scenario.load(os.path.join(HERE, 'scenarios', name))
 
 
+class RefusedStepTest(unittest.TestCase):
+	# BOOT-020. `launch-program` ended with a paragraph saying an unmanifested component is refused
+	# and no step after it, so the behaviour it claimed to cover was asserted nowhere.
+	def guest(self, status):
+		class Guest(ScriptedGuest):
+			def launch_status(self, *args, **kwargs):
+				self.calls.append('launch_status')
+				return status
+
+		return Guest()
+
+	def step(self, guest, expected=None):
+		step = {'do': 'refused', 'program': 'no-such-component'}
+		if expected is not None:
+			step['status'] = expected
+		scenario.run_step(step, scenario.Guest(guest), guest, 5, 0)
+
+	def test_a_refusal_passes(self):
+		self.step(self.guest(24), 24)
+
+	# The failure this step exists to catch: the component was launched after all.
+	def test_a_successful_launch_fails_the_step(self):
+		with self.assertRaises(scenario.ScenarioError) as caught:
+			self.step(self.guest(0), 24)
+		self.assertIn('was LAUNCHED', str(caught.exception))
+
+	# A refusal for a different reason is not the refusal that was asserted - "the guest is gone"
+	# would otherwise satisfy "this component is refused".
+	def test_the_wrong_refusal_fails_the_step(self):
+		with self.assertRaises(scenario.ScenarioError):
+			self.step(self.guest(23), 24)
+
+	def test_any_refusal_passes_when_none_is_named(self):
+		self.step(self.guest(23))
+
+	def test_the_status_field_is_validated(self):
+		document = {'version': scenario.SCENARIO_VERSION, 'name': 'x', 'step': [{'do': 'refused', 'program': 'p', 'status': 'twenty-four'}]}
+		with self.assertRaises(scenario.ScenarioError):
+			scenario.validate(document, 'test.toml')
+
+
 class ScenarioValidationTest(unittest.TestCase):
 	# The step vocabulary is closed on purpose: a misspelled field is a scenario that silently
 	# asserts something other than what was written.

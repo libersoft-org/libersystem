@@ -1794,6 +1794,14 @@ def proto_hello(sock, buffer, timeout):
 # Send one request and return its answer, turning a refusal into a named failure. Every
 # caller passes a deadline, because the peer is a live guest that can stop answering.
 def proto_request(sock, buffer, request, opcode, payload=b'', generation=0, timeout=5, what='request', tolerate=()):
+	reply, replied_generation, _, body = proto_request_full(sock, buffer, request, opcode, payload, generation, timeout, what, tolerate)
+	return reply, replied_generation, body
+
+
+# The same, with the refusal STATUS. A caller that expects a particular refusal needs to know which
+# one it got - collapsing every one of them into "not an ack" is how a step meant to prove a
+# component is refused would have passed on any failure at all, including the guest being gone.
+def proto_request_full(sock, buffer, request, opcode, payload=b'', generation=0, timeout=5, what='request', tolerate=()):
 	sock.sendall(proto_frame(opcode, request, payload, generation))
 	try:
 		reply, replied_generation, status, body = proto_await(sock, buffer, request, time.monotonic() + timeout)
@@ -1801,7 +1809,7 @@ def proto_request(sock, buffer, request, opcode, payload=b'', generation=0, time
 		die(f'{what}: {error}')
 	if reply == OP_ERROR and status not in tolerate:
 		die(f'{what} refused: {proto_status(status)}')
-	return reply, replied_generation, body
+	return reply, replied_generation, status, body
 
 
 # Open a session and describe its bounds in one line, so every command that talks to the
@@ -2558,6 +2566,21 @@ class LabGuest:
 			if opcode != OP_LAUNCH_ACK or len(body) < 8:
 				return None
 			return struct.unpack('<Q', body[:8])[0]
+		finally:
+			sock.close()
+
+	# A launch that is EXPECTED to be refused, answering the guest's status rather than a Boolean.
+	#
+	# The `launch` adapter above collapses every refusal into `None`, which is right for a step that
+	# wanted a program running - but it makes "this component is refused" inexpressible, and a
+	# scenario that claimed to cover a refusal therefore had no step for it at all. This answers the
+	# status so the scenario can name which refusal it expects; 0 means the launch SUCCEEDED, which
+	# is the failure that step exists to catch.
+	def launch_status(self, name, args, cwd, timeout):
+		sock, buffer, _ = proto_session(timeout, announce=False)
+		try:
+			opcode, _, status, _ = proto_request_full(sock, buffer, 2, OP_LAUNCH, launch_payload(name, args, cwd), timeout=timeout, what=f'launching {name}', tolerate=tuple(PROTO_STATUS))
+			return 0 if opcode == OP_LAUNCH_ACK else status
 		finally:
 			sock.close()
 

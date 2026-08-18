@@ -259,6 +259,14 @@ STEP_FIELDS = {
 	'output': {'required': ('contains',), 'optional': ('timeout',)},
 	# Wait for the launched program to finish.
 	'finished': {'required': (), 'optional': ('timeout',)},
+	# Assert that launching `program` is REFUSED, and by which refusal. `status` names the guest's
+	# protocol status; omitting it accepts any refusal but still fails if the launch succeeds.
+	#
+	# There was no way to say this, and a scenario claimed to cover it anyway: `launch-program`
+	# ended with a comment saying an unmanifested component is refused and no step after it. A
+	# comment is not an assertion, and the behaviour it describes is the manifest being the
+	# authority for what may run - which is worth an executable check rather than a sentence.
+	'refused': {'required': ('program',), 'optional': ('args', 'cwd', 'status', 'timeout')},
 }
 
 
@@ -365,6 +373,11 @@ def validate_step(step, index, path):
 			raise ScenarioError(f'{where} (pointer): action must be press, release or click')
 		if 'x' not in step and 'y' not in step and 'button' not in step:
 			raise ScenarioError(f'{where} (pointer): needs a position, a button, or both')
+	if kind == 'refused':
+		if not PROGRAM_NAME.fullmatch(step['program']):
+			raise ScenarioError(f'{where} (refused): program {step["program"]!r} is not a plain component name')
+		if 'status' in step and (not isinstance(step['status'], int) or isinstance(step['status'], bool) or not 0 < step['status'] < 256):
+			raise ScenarioError(f'{where} (refused): status must be a protocol status, 1..255')
 	if kind == 'absent' and 'until' in step and step['until'] not in ('quiet', 'prompt'):
 		raise ScenarioError(f'{where} (absent): until must be quiet or prompt')
 	if kind == 'restored':
@@ -654,6 +667,12 @@ def run_step(step, guest, lab, limit, index):
 				break
 			time.sleep(0.2)
 		raise ScenarioError(f'{where}: {wanted!r} did not appear within {int(limit)} s')
+	elif kind == 'refused':
+		status = lab.launch_status(step['program'], step.get('args', ''), step.get('cwd', 'vol://system'), int(limit))
+		if status == 0:
+			raise ScenarioError(f'{where}: {step["program"]} was LAUNCHED, and this step exists because it must not be')
+		if 'status' in step and status != step['status']:
+			raise ScenarioError(f'{where}: {step["program"]} was refused with status {status}, expected {step["status"]}')
 	elif kind == 'launch':
 		koid = lab.launch(step['program'], step.get('args', ''), step.get('cwd', 'vol://system'), int(limit))
 		if koid is None:

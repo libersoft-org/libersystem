@@ -433,10 +433,19 @@ def group_terminal(suite):
 	reply = peer.call(TERM, line)
 	accounted = struct.unpack('<H', reply.payload[:2])[0] if reply.payload else 0
 	suite.check('a typed line is fully accounted for', (reply.opcode == TERM_ACK and accounted == len(line)) or (reply.opcode == ERROR and reply.status == TERM_REFUSED and accounted < len(line)), True)
+	# BOUNDED. A guest that keeps accounting for zero bytes - a console whose queue never drains -
+	# left this loop spinning forever, inside a suite that is otherwise deadline-bounded throughout.
+	# A retry that cannot end is not a retry, it is a hang with a progress condition.
 	sent = accounted
-	while sent < len(line):
+	deadline = time.monotonic() + 30
+	stalled = 0
+	while sent < len(line) and time.monotonic() < deadline:
 		reply = peer.call(TERM, line[sent:])
-		sent += struct.unpack('<H', reply.payload[:2])[0]
+		took = struct.unpack('<H', reply.payload[:2])[0]
+		sent += took
+		stalled = 0 if took else stalled + 1
+		if stalled >= 100:
+			break
 		if reply.opcode == ERROR:
 			time.sleep(0.05)
 	suite.check('resuming from the count delivers the rest', sent, len(line))
@@ -568,7 +577,12 @@ def group_launch(suite):
 	# Reading consumes, so a second read of a finished program is empty and still says it ended.
 	answer = peer.call(LAUNCH_OUTPUT)
 	suite.check('reading again consumes nothing and still reports the exit', (answer.opcode, answer.payload[0], answer.payload[2:]), (LAUNCH_BYTES, 1, b''))
-	suite.check('stopping a program that already finished signals nothing', (peer.call(LAUNCH_STOP).outcome(), peer.call(LAUNCH_STOP).payload[0]), ((LAUNCH_STOP_ACK, OK), 0))
+	# ONE REQUEST, ONE ASSERTION. This called `LAUNCH_STOP` TWICE and combined the first reply's
+	# outcome with the SECOND reply's payload, so a wrong "signalled something" byte in the first
+	# was hidden by the second - and stopping is state-changing, so the two requests are not
+	# interchangeable readings of one fact.
+	stopped = peer.call(LAUNCH_STOP)
+	suite.check('stopping a program that already finished signals nothing', (stopped.outcome(), stopped.payload[0]), ((LAUNCH_STOP_ACK, OK), 0))
 
 	# One that does not end on its own: it holds a terminal until something ends it, which is
 	# the case the operation exists for.
@@ -704,6 +718,14 @@ def group_untouched(suite):
 				body = text[text.index('\n'):text.index('bytes total')]
 				# Names and sizes only. A re-read of an untouched file must not depend on the
 				# clock, and the timestamps are the only part of a listing that does.
+				#
+				# WHAT THIS DOES NOT COVER, stated because the group's name overstates it: a
+				# mutation that preserves a file's length is invisible here, as is a change to
+				# anything on the volume outside these four directories. Covering it needs a
+				# guest-side digest of each file, and this system ships no such program - `cat`,
+				# `hexdump` and `wc` are what there is, and hexdumping every installed library over
+				# a serial console is not a check anyone would run. The claim this group can honestly
+				# make is that the installed SET did not change, and that is the claim it makes.
 				return '\n'.join(' '.join(line.split()[:2]) for line in body.splitlines() if line.strip())
 		raise SystemExit(f'proto-test: the guest did not list {path}')
 

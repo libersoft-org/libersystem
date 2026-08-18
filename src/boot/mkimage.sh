@@ -63,6 +63,50 @@ trap cleanup EXIT
 # operate on raw partition offsets without tripping mtools' geometry checks
 export MTOOLS_SKIP_CHECK=1
 
+# WHAT MAKES TWO BUILDS OF THE SAME TREE THE SAME BYTES.
+#
+# Filesystem metadata, timestamps and GUIDs are generated fresh on every run unless they are told
+# not to be: mtools picks a random FAT volume serial and stamps the host clock, `sgdisk` draws random
+# disk and partition GUIDs, and `xorriso` records the moment it ran. So two clean builders could not
+# be expected to produce equivalent media even with identical payloads, and a cached image could not
+# be traced to the environment that made it - binary comparison, provenance and delta updates all
+# rest on that and none of them was available.
+#
+# Each of these pins ONE variable field. What they deliberately do not pin is per-installed-machine
+# identity: the system volume's own UUID is drawn when the volume is formatted, and two installed
+# machines are supposed to differ there. Reproducible MEDIA identity and unique INSTALLED identity
+# are different properties, and this file is about the first.
+#
+# `SOURCE_DATE_EPOCH` is the cross-project spelling of "the timestamp to record"; it is honoured when
+# set and otherwise fixed, so an unset environment is deterministic rather than merely usual.
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1735689600}" # 2025-01-01T00:00:00Z
+export TZ=UTC
+# mtools reads these: a fixed FAT volume serial and no host clock in the directory entries.
+MTOOLS_FAT_SERIAL="0x4C696265" # "Libe", so a hexdump of a serial says where it came from
+# The GPT identities, derived from a declared seed rather than drawn. They name the MEDIUM layout,
+# which is the same on every copy of the same build, and not the installed system.
+GPT_DISK_GUID="4C424653-0000-4000-8000-000000000000"
+GPT_ESP_GUID="4C424653-0000-4000-8000-000000000001"
+GPT_SYSTEM_GUID="4C424653-0000-4000-8000-000000000002"
+
+# Stamp a staged file with the build epoch before it is copied into a filesystem that records
+# mtimes. mtools copies the source file's timestamp, so the recorded time is whatever the build
+# happened to write - which differs between two builds of identical content.
+stamp_epoch() {
+	touch -d "@$SOURCE_DATE_EPOCH" "$@"
+}
+
+# The tool identities this image's bytes depend on. Two builders with different mtools, xorriso or
+# sgdisk can produce different media from the same inputs, and the cache key said nothing about
+# which ones made the image it holds.
+tool_identity() {
+	local tool version
+	for tool in objcopy llvm-strip mformat mcopy sgdisk xorriso; do
+		version="$("$tool" --version 2>&1 || echo unknown)"
+		printf 'tool=%s version=%s\n' "$tool" "${version%%$'\n'*}"
+	done
+}
+
 info() { echo "mkimage: $*" >&2; }
 die() {
 	echo "mkimage: $*" >&2
@@ -135,6 +179,9 @@ stage_bootstrap_files() {
 	local image="$1" root="$BUILD/bootstrap-${2:-x86_64}"
 	[[ -d "$root" ]] || die "no fallback bootstrap set at $root (run \`just system-volume\`)"
 	mmd -i "$image" ::/etc ::/libexec
+	# Stamped before the copy: mtools records the source file's mtime, so an identical build made a
+	# minute later produced different directory entries.
+	stamp_epoch "$root/etc/bootstrap.list" "$root"/libexec/*
 	mcopy -i "$image" "$root/etc/bootstrap.list" ::/etc/bootstrap.list
 	mcopy -i "$image" "$root"/libexec/* ::/libexec/
 }
@@ -173,6 +220,7 @@ stage_volume_pairing() {
 	assert_pairing_matches_volume "$uuid_file" "$BUILD/system-volume-${arch}.img"
 	# `::/etc` already exists when the bootstrap set was staged; the shipping ISO stages no set.
 	mmd -i "$image" ::/etc 2>/dev/null || true
+	stamp_epoch "$uuid_file"
 	mcopy -i "$image" "$uuid_file" ::/etc/system-volume.uuid
 }
 
@@ -246,8 +294,9 @@ make_iso() {
 	((total < 32)) && total=32
 	rm -f "$efi_img"
 	truncate -s "${total}M" "$efi_img"
-	mformat -i "$efi_img" ::
+	mformat -i "$efi_img" -N "${MTOOLS_FAT_SERIAL#0x}" ::
 	mmd -i "$efi_img" ::/EFI ::/EFI/BOOT
+	stamp_epoch "$LOADER_EFI" "$staged"
 	mcopy -i "$efi_img" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$efi_img" "$staged" ::/kernel
 	# The TEST medium carries the bootstrap set as FILES, the same way the disk image's ESP does
@@ -267,6 +316,7 @@ make_iso() {
 		# find rather than fall back cleanly.
 		stage_volume_pairing "$efi_img" x86_64
 	fi
+	stamp_epoch "$payload"
 	mcopy -i "$efi_img" "$payload" "::/$payload_name"
 
 	rm -rf "$iso_root"
@@ -275,11 +325,24 @@ make_iso() {
 
 	# UEFI-only El Torito: no BIOS boot entry. The EFI image is also exposed as a
 	# GPT partition so the ISO boots when dd'd to a USB stick.
+	# Every date in the volume descriptors set from the build epoch rather than from the clock, and
+	# the file dates with them - otherwise two builds of identical content differ in the seconds
+	# they were made.
+	local iso_date
+	iso_date="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S00)"
+	# The mkisofs-compatible spellings; `-volume_date` is xorriso's own command syntax and is not
+	# accepted under `-as mkisofs`, which fails the whole invocation. Measured on xorriso 1.5.6:
+	# with these two, two builds of the same tree produce byte-identical ISOs even when the source
+	# files' mtimes have moved in between.
 	xorriso -as mkisofs -quiet \
 		--efi-boot boot/efiboot.img \
 		-efi-boot-part --efi-boot-image \
 		--protective-msdos-label \
-		"$iso_root" -o "$out" 2>/dev/null
+		--set_all_file_dates "=$SOURCE_DATE_EPOCH" \
+		--modification-date="$iso_date" \
+		"$iso_root" -o "$out" 2>/dev/null ||
+		die "xorriso could not build the ISO"
+	[[ -s "$out" ]] || die "xorriso produced no ISO at $out"
 	mv "$out" "$final"
 
 	info "wrote $final"
@@ -305,8 +368,10 @@ make_img() {
 	# The ESP is fixed at 32 MiB: it needs the loader, the kernel and the init fallback, and every
 	# byte beyond that is a byte the system volume does not get.
 	local esp_end=$((2048 + 32 * 1024 * 1024 / 512 - 1))
-	sgdisk "$out" -n "1:2048:$esp_end" -t 1:ef00 -c 1:ESP >/dev/null
-	sgdisk "$out" -n 2:0:0 -t 2:4C424653-0001-4000-8000-4C6962657246 -c 2:system >/dev/null
+	sgdisk "$out" -n "1:2048:$esp_end" -t 1:ef00 -c 1:ESP -u "1:$GPT_ESP_GUID" >/dev/null
+	sgdisk "$out" -n 2:0:0 -t 2:4C424653-0001-4000-8000-4C6962657246 -c 2:system -u "2:$GPT_SYSTEM_GUID" >/dev/null
+	# The disk GUID last, so it is not re-drawn by the partition edits above.
+	sgdisk "$out" -U "$GPT_DISK_GUID" >/dev/null
 
 	# read back the ESP's exact start and length (mtools cannot parse GPT, so we
 	# build the FAT filesystem as a standalone image and splice it into place).
@@ -322,8 +387,9 @@ make_img() {
 	staged="$(stage_kernel "$kernel")"
 	verify_boot_artifacts "$staged"
 
-	mformat -i "$esp" ::
+	mformat -i "$esp" -N "${MTOOLS_FAT_SERIAL#0x}" ::
 	mmd -i "$esp" ::/EFI ::/EFI/BOOT
+	stamp_epoch "$LOADER_EFI" "$staged"
 	mcopy -i "$esp" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$esp" "$staged" ::/kernel
 	# The bootstrap set as FILES, not as a packaged archive.
@@ -406,9 +472,11 @@ digest_file="$output.build-digest"
 # destination could move, the fallback set could change, or the pairing file could be corrected, and
 # the key stayed equal: a cache HIT returning an image that does not implement the current manifest.
 image_input_key() {
-	printf 'format=liber-boot-image-input-v2\n'
+	printf 'format=liber-boot-image-input-v3\n'
 	printf 'mode=%s\n' "$mode_input"
 	printf 'strip=%s\n' "$STRIP"
+	printf 'epoch=%s\n' "$SOURCE_DATE_EPOCH"
+	tool_identity
 	# The manifest's own bytes AND its normalized projection: the file catches an edit, the export
 	# catches a generator change that produces a different layout from the same file.
 	printf 'manifest=%s\n' "$(sha256sum "$REPO_ROOT/src/user/services/manifest.toml" | awk '{print $1}')"

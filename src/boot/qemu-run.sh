@@ -169,9 +169,13 @@ media_key() {
 		printf 'format=liber-qemu-fixture-v1\n'
 		printf 'kind=%s\n' "$kind"
 		printf 'recipe=%s\n' "$(sha256sum "$QEMU_BOOT_DIR/qemu-run.sh" | awk '{print $1}')"
-		local tool
+		local tool version
 		for tool in "$@"; do
-			printf 'tool=%s path=%s version=%s\n' "$tool" "$(command -v "$tool" 2>/dev/null || echo absent)" "$("$tool" --version 2>&1 | head -n 1 || echo unknown)"
+			# Captured whole, THEN first-lined. `$tool --version | head -n 1` inside a command
+			# substitution is the shape `check-source-hygiene.sh` refuses: `head` closes the pipe
+			# and `pipefail` turns a successful read into a failed pipeline.
+			version="$("$tool" --version 2>&1 || echo unknown)"
+			printf 'tool=%s path=%s version=%s\n' "$tool" "$(command -v "$tool" 2>/dev/null || echo absent)" "${version%%$'\n'*}"
 		done
 		find "$voldir" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
 	} | sha256sum | awk '{print $1}'
@@ -261,7 +265,9 @@ media_populate_mounted() {
 # order and transport flags because those are part of each architecture's device model.
 qemu_prepare_media_images() {
 	local suffix="$1"
-	local mount_suffix="$2"
+	# Per RUN, not per target: the mount point is created and removed while an image is populated,
+	# and two runs sharing the name means one removes the directory the other is mounted on.
+	local mount_suffix="$2.$$"
 	local udf_mount_options="${3:-loop}"
 	local allow_fallbacks="${4:-0}"
 	local voldir="$QEMU_BOOT_DIR/../volume"
@@ -691,8 +697,17 @@ fi
 
 qemu_run_x86_64() {
 	local kernel="$1"
+	# WHICH SET OF WRITABLE IMAGES THIS GUEST GETS.
+	#
+	# A guest writes to its system volume, its media and its USB stick, and QEMU takes a write lock
+	# on each - so two guests sharing a set cannot both run, and if they somehow did they would
+	# corrupt it. The test profile has had its own `-test` set for a long time. A COLD RUN DID NOT:
+	# it took the persistent instance's unsuffixed images, which is the other half of the collision
+	# whose control-socket half was separated first. The `-cold-<arch>` set gives it images of its
+	# own, which is what makes the disk-conflict check below able to let it through honestly.
 	local artifact_suffix=""
 	[[ "${TEST:-0}" == "1" ]] && artifact_suffix="-test"
+	[[ "${COLD:-0}" == "1" ]] && artifact_suffix="-cold-$TARGET_ARCH"
 	timing_event runner start
 	timing_event image start
 	# Build the own UEFI loader (its EFI binary is staged into the boot image as
@@ -766,7 +781,14 @@ qemu_run_x86_64() {
 	# instance that actually holds them, so the reader debugs QEMU instead of running one
 	# command. Two guests writing one image is also the corruption this milestone refuses
 	# outright, so the answer is to refuse early rather than to hand out parallel disks.
-	if [[ "${TEST:-0}" != "1" && "${DEV_PROFILE:-0}" != "1" && -e "$QEMU_BUILD_DIR/dev-instance.lock" ]] && ! flock -n "$QEMU_BUILD_DIR/dev-instance.lock" true 2>/dev/null; then
+	# THE EXEMPTION IS FOR A GUEST WITH ITS OWN IMAGES, not for a profile name.
+	#
+	# The condition was "not TEST and not DEV_PROFILE", and `scenario-cold` runs with DEV_PROFILE=1 -
+	# so the one mode that shared the persistent instance's writable images was the one excused from
+	# the check that exists to stop exactly that. Now the exemption is `artifact_suffix`: a run that
+	# has been given a set of its own may proceed, and a run reaching for the unsuffixed set while a
+	# development instance holds it is refused, whatever profile it declares.
+	if [[ -z "$artifact_suffix" && -e "$QEMU_BUILD_DIR/dev-instance.lock" ]] && ! flock -n "$QEMU_BUILD_DIR/dev-instance.lock" true 2>/dev/null; then
 		echo "qemu-run: a development instance is running and holds the system, media and USB images" >&2
 		echo "qemu-run: release it with \`just lab dev-down\` (or \`just lab dev-status\` to see what it is)" >&2
 		exit 1
@@ -949,14 +971,20 @@ qemu_run_aarch64() {
 	qemu_select_cpu cpu_args aarch64 cortex-a72
 
 	# System volume disk: virtio-blk holding the factory archive.
+	#
+	# A cold run gets writable images of its own, like every other target: it shares this machine's
+	# `.build/boot` with whatever else is running, and two guests attaching one raw image is a write
+	# lock collision at best and corruption at worst.
+	local media_suffix="-aarch64"
+	[[ "${COLD:-0}" == "1" ]] && media_suffix="-cold-aarch64"
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-aarch64.img"
-	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk-aarch64.img"
+	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
 		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 "disable-legacy=on"
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
-	qemu_prepare_media_images -aarch64 -a64
+	qemu_prepare_media_images "$media_suffix" -a64
 	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "disable-legacy=on"
 	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "disable-legacy=on"
 	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "disable-legacy=on"
@@ -965,7 +993,7 @@ qemu_run_aarch64() {
 	qemu_attach_virtio_net qemu_args vnet0 "" "disable-legacy=on"
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
-	qemu_prepare_usb_image -aarch64
+	qemu_prepare_usb_image "$media_suffix"
 	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$USB_DISK")
 	qemu_attach_xhci qemu_args vusb
 
@@ -1128,14 +1156,20 @@ qemu_run_riscv64() {
 	qemu_select_cpu cpu_args riscv64 rv64
 
 	# System volume disk: virtio-blk holding the factory archive.
+	#
+	# A cold run gets writable images of its own, like every other target: it shares this machine's
+	# `.build/boot` with whatever else is running, and two guests attaching one raw image is a write
+	# lock collision at best and corruption at worst.
+	local media_suffix="-riscv64"
+	[[ "${COLD:-0}" == "1" ]] && media_suffix="-cold-riscv64"
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-riscv64.img"
-	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk-riscv64.img"
+	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
 		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 ""
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
-	qemu_prepare_media_images -riscv64 -rv64
+	qemu_prepare_media_images "$media_suffix" -rv64
 	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 ""
 	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 ""
 	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 ""
@@ -1144,7 +1178,7 @@ qemu_run_riscv64() {
 	qemu_attach_virtio_net qemu_args vnet0 "" ""
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
-	qemu_prepare_usb_image -riscv64
+	qemu_prepare_usb_image "$media_suffix"
 	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$USB_DISK")
 	qemu_attach_xhci qemu_args vusb
 
