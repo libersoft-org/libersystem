@@ -162,6 +162,13 @@ def run_child(command, timeout, **kwargs):
 		return subprocess.CompletedProcess(command, child.returncode, out, err)
 	except subprocess.TimeoutExpired:
 		stop_child_group(child)
+		# The pipes go with it. `communicate` leaves them open when it times out, and this runs
+		# inside processes that outlive many children - `dev-loop` and the scenario runner both call
+		# it in a loop, so a leaked descriptor per stopped child is a file table that only grows.
+		for stream in (child.stdin, child.stdout, child.stderr):
+			if stream is not None:
+				with contextlib.suppress(OSError):
+					stream.close()
 		raise ChildTimeout(command, timeout) from None
 
 

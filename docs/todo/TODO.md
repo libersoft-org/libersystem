@@ -202,6 +202,8 @@ observability, persistent storage and multi-architecture support.
 - [ ] [P02M0135 - Foreign graphics-stack prerequisites](P02M0135.md)
 - [ ] [P02M0136 - Text foundation: shaping, fallback and layout](P02M0136.md)
 - [ ] [P02M0137 - Remove redundant dynamic-report work from warm builds](P02M0137.md)
+- [ ] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)
+- [ ] [P02M0139 - Reuse the PermissionManager test fixture without sharing test state](P02M0139.md)
 
 ### Definition of done (phase 2)
 

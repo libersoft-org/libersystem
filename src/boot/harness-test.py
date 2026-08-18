@@ -963,6 +963,74 @@ class RefusedStepTest(unittest.TestCase):
 			scenario.validate(document, 'test.toml')
 
 
+# BOOT-007's other half: the claim that a child which ignores TERM is killed, and that its whole
+# GROUP goes with it. Asserted in a comment when it was written; exercised here, because a cleanup
+# that quietly fails to clean is worse than none - the next run inherits whatever survived.
+class ChildProcessTest(unittest.TestCase):
+	def setUp(self):
+		self.directory = tempfile.TemporaryDirectory()
+		self.addCleanup(self.directory.cleanup)
+
+	def script(self, body):
+		path = os.path.join(self.directory.name, 'child-%d.py' % len(os.listdir(self.directory.name)))
+		with open(path, 'w') as handle:
+			handle.write(body)
+		return [sys.executable, path]
+
+	def test_a_child_that_finishes_returns_its_output(self):
+		done = lab.run_child(self.script('print("answered")'), 30, stdout=subprocess.PIPE, text=True)
+		self.assertEqual(done.returncode, 0)
+		self.assertEqual(done.stdout.strip(), 'answered')
+
+	def test_a_failing_child_reports_its_status(self):
+		self.assertEqual(lab.run_child(self.script('raise SystemExit(3)'), 30).returncode, 3)
+
+	# A child that never finishes must not hold the caller past its deadline.
+	def test_a_hanging_child_raises_within_its_deadline(self):
+		started = time.monotonic()
+		with self.assertRaises(lab.ChildTimeout):
+			lab.run_child(self.script('import time; time.sleep(120)'), 1)
+		self.assertLess(time.monotonic() - started, 30, 'the deadline bounds the wait, not the child')
+
+	# The case the escalation exists for: a child that catches TERM and keeps going.
+	def test_a_child_that_ignores_term_is_killed(self):
+		body = 'import signal, time\nsignal.signal(signal.SIGTERM, lambda *a: None)\nprint("up", flush=True)\ntime.sleep(120)\n'
+		with self.assertRaises(lab.ChildTimeout):
+			lab.run_child(self.script(body), 1, stdout=subprocess.PIPE, text=True)
+		self.assertEqual(self.leftovers(), [], 'a process that ignores TERM survived the escalation')
+
+	# And the child's own children, which is the whole reason the GROUP is signalled: a build script
+	# that started a compiler leaves it behind when only the leader is stopped.
+	def test_the_childs_own_children_go_with_it(self):
+		marker = os.path.join(self.directory.name, 'grandchild.pid')
+		body = (
+			'import subprocess, sys, time\n'
+			'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])\n'
+			'open(%r, "w").write(str(child.pid))\n'
+			'time.sleep(120)\n'
+		) % marker
+		with self.assertRaises(lab.ChildTimeout):
+			lab.run_child(self.script(body), 2)
+		with open(marker) as handle:
+			grandchild = int(handle.read())
+		for _ in range(50):
+			if not self.alive(grandchild):
+				break
+			time.sleep(0.1)
+		self.assertFalse(self.alive(grandchild), 'the grandchild outlived the group it was signalled with')
+
+	def alive(self, pid):
+		try:
+			os.kill(pid, 0)
+		except OSError:
+			return False
+		return True
+
+	def leftovers(self):
+		found = subprocess.run(['pgrep', '-f', self.directory.name], capture_output=True, text=True)
+		return [line for line in found.stdout.split() if line]
+
+
 class ScenarioValidationTest(unittest.TestCase):
 	# The step vocabulary is closed on purpose: a misspelled field is a scenario that silently
 	# asserts something other than what was written.
