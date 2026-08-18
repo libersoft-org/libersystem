@@ -87,4 +87,28 @@ enum error {
 	again,
 	/// Peer closed connection (~ ERR_PEER_CLOSED).
 	closed,
+	/// A deadline passed with no answer. The request MAY have been received and acted on, so
+	/// retrying is safe only for an idempotent operation - which is precisely the distinction
+	/// `again` cannot carry.
+	timed-out,
+	/// The operation is understood and not implemented here, or the argument is outside what this
+	/// implementation accepts. Distinct from `invalid`, which says the argument is wrong.
+	unsupported,
+	/// A resource limit was reached - handles, threads, memory quota. Distinct from `no-space`,
+	/// which is about a volume, and from `again`, which promises the condition is transient.
+	exhausted,
+	/// A storage volume has no room. `fs/core` distinguishes this from `no-memory` and the
+	/// protocol could not carry the difference across.
+	no-space,
+	/// The underlying device or medium failed.
+	io,
+	/// The data read is structurally invalid - a corrupt on-disk structure rather than a bad
+	/// request.
+	corrupt,
+	/// The operation was cancelled before it completed.
+	cancelled,
+	/// A commit was issued and its outcome is UNKNOWN. Neither success nor failure may be assumed,
+	/// which is the one answer a caller must not be forced to guess: `fs/core` grew
+	/// `CommitUncertain` for exactly this and the protocol could not express it.
+	commit-uncertain,
 }

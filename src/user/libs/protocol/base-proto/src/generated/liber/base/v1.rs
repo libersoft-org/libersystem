@@ -272,6 +272,30 @@ pub enum Error {
 	Again = 3,
 	/// Peer closed connection (~ ERR_PEER_CLOSED).
 	Closed = 4,
+	/// A deadline passed with no answer. The request MAY have been received and acted on, so
+	/// retrying is safe only for an idempotent operation - which is precisely the distinction
+	/// `again` cannot carry.
+	TimedOut = 5,
+	/// The operation is understood and not implemented here, or the argument is outside what this
+	/// implementation accepts. Distinct from `invalid`, which says the argument is wrong.
+	Unsupported = 6,
+	/// A resource limit was reached - handles, threads, memory quota. Distinct from `no-space`,
+	/// which is about a volume, and from `again`, which promises the condition is transient.
+	Exhausted = 7,
+	/// A storage volume has no room. `fs/core` distinguishes this from `no-memory` and the
+	/// protocol could not carry the difference across.
+	NoSpace = 8,
+	/// The underlying device or medium failed.
+	Io = 9,
+	/// The data read is structurally invalid - a corrupt on-disk structure rather than a bad
+	/// request.
+	Corrupt = 10,
+	/// The operation was cancelled before it completed.
+	Cancelled = 11,
+	/// A commit was issued and its outcome is UNKNOWN. Neither success nor failure may be assumed,
+	/// which is the one answer a caller must not be forced to guess: `fs/core` grew
+	/// `CommitUncertain` for exactly this and the protocol could not express it.
+	CommitUncertain = 12,
 }
 
 impl Error {
@@ -324,6 +348,14 @@ impl Error {
 			2 => Some(Error::Invalid),
 			3 => Some(Error::Again),
 			4 => Some(Error::Closed),
+			5 => Some(Error::TimedOut),
+			6 => Some(Error::Unsupported),
+			7 => Some(Error::Exhausted),
+			8 => Some(Error::NoSpace),
+			9 => Some(Error::Io),
+			10 => Some(Error::Corrupt),
+			11 => Some(Error::Cancelled),
+			12 => Some(Error::CommitUncertain),
 			_ => None,
 		}
 	}
@@ -526,6 +558,14 @@ impl Error {
 			Error::Invalid => out.push_str("\"invalid\""),
 			Error::Again => out.push_str("\"again\""),
 			Error::Closed => out.push_str("\"closed\""),
+			Error::TimedOut => out.push_str("\"timed-out\""),
+			Error::Unsupported => out.push_str("\"unsupported\""),
+			Error::Exhausted => out.push_str("\"exhausted\""),
+			Error::NoSpace => out.push_str("\"no-space\""),
+			Error::Io => out.push_str("\"io\""),
+			Error::Corrupt => out.push_str("\"corrupt\""),
+			Error::Cancelled => out.push_str("\"cancelled\""),
+			Error::CommitUncertain => out.push_str("\"commit-uncertain\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -535,6 +575,14 @@ impl Error {
 			Error::Invalid => out.push_str("invalid"),
 			Error::Again => out.push_str("again"),
 			Error::Closed => out.push_str("closed"),
+			Error::TimedOut => out.push_str("timed-out"),
+			Error::Unsupported => out.push_str("unsupported"),
+			Error::Exhausted => out.push_str("exhausted"),
+			Error::NoSpace => out.push_str("no-space"),
+			Error::Io => out.push_str("io"),
+			Error::Corrupt => out.push_str("corrupt"),
+			Error::Cancelled => out.push_str("cancelled"),
+			Error::CommitUncertain => out.push_str("commit-uncertain"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -544,6 +592,14 @@ impl Error {
 			Error::Invalid => crate::codec::cbor::text(out, "invalid"),
 			Error::Again => crate::codec::cbor::text(out, "again"),
 			Error::Closed => crate::codec::cbor::text(out, "closed"),
+			Error::TimedOut => crate::codec::cbor::text(out, "timed-out"),
+			Error::Unsupported => crate::codec::cbor::text(out, "unsupported"),
+			Error::Exhausted => crate::codec::cbor::text(out, "exhausted"),
+			Error::NoSpace => crate::codec::cbor::text(out, "no-space"),
+			Error::Io => crate::codec::cbor::text(out, "io"),
+			Error::Corrupt => crate::codec::cbor::text(out, "corrupt"),
+			Error::Cancelled => crate::codec::cbor::text(out, "cancelled"),
+			Error::CommitUncertain => crate::codec::cbor::text(out, "commit-uncertain"),
 		}
 	}
 }

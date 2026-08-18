@@ -375,7 +375,17 @@ struct Processes<'a> {
 	//
 	// A token left here is a process that never runs, which is what an abandoned transaction
 	// should leave behind: harmless, and reaped with everything else.
-	prepared: Vec<(u64, Spawned)>,
+	// (owner channel, koid, token). The OWNER is what makes this safe.
+	//
+	// A prepared launch was keyed by koid alone, and a koid is not a secret - `process.list` returns
+	// them. Any client of this shared service could therefore release, and so START, another
+	// client's prepared launch: the one step a pipeline builder performs precisely because it wants
+	// to decide when the program runs. The channel a request arrived on is the client's identity and
+	// `serve_multi` already provides it; it was simply being discarded.
+	prepared: Vec<(u64, u64, Spawned)>,
+	// The channel the request being dispatched arrived on, set by the serve loop before dispatch.
+	// Zero means "no client" - a self-call or a test - which owns nothing and can release nothing.
+	client: u64,
 }
 
 // One launched process, and the handle that lets this service find out whether it is still
@@ -836,7 +846,7 @@ impl<'a> Service for Processes<'a> {
 		let observer: i64 = unsafe { duplicate(spawned.process, RIGHT_READ) };
 		self.record(info.clone(), if observer > 0 { observer as u64 } else { 0 }, 0);
 		let task = spawned.process;
-		self.prepared.push((koid, spawned));
+		self.prepared.push((self.client, koid, spawned));
 		Ok(StartResult { task, info })
 	}
 
@@ -845,10 +855,14 @@ impl<'a> Service for Processes<'a> {
 	// to distinguish from an error, because releasing twice is a bug in the caller and not a
 	// condition the system should hide.
 	fn release(&mut self, koid: u64) -> Result<bool, Error> {
-		let Some(index) = self.prepared.iter().position(|(pending, _)| *pending == koid) else {
+		// ITS OWN CLIENT'S, or nobody's. A koid names a prepared launch and proves nothing about who
+		// prepared it; matching the owner too is what stops one client starting another's program.
+		// A client that names a koid it does not own gets the same answer as one naming a koid that
+		// does not exist - the truth from where it stands, and no evidence that the koid is real.
+		let Some(index) = self.prepared.iter().position(|(owner, pending, _)| *pending == koid && *owner == self.client) else {
 			return Ok(false);
 		};
-		let (_, spawned) = self.prepared.remove(index);
+		let (_, _, spawned) = self.prepared.remove(index);
 		Ok(unsafe { spawned.release() })
 	}
 
@@ -901,11 +915,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	}
 
 	// 5. serve generated start/list requests until the client side closes.
-	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new(), prepared: Vec::new() };
+	let mut procs: Processes = Processes { package, storage, registry, registry_armed: false, started: Vec::new(), prepared: Vec::new(), client: 0 };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {
-		serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { process::dispatch(&mut procs, req, handle, out, reply_handle) });
+		serve_multi(service, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
+			// The client's identity, carried into the dispatch that cannot take an extra argument:
+			// the generated trait's shape is fixed, and the serve loop is the only place that knows
+			// which channel a request arrived on.
+			procs.client = chan;
+			process::dispatch(&mut procs, req, handle, out, reply_handle)
+		});
 	}
 	exit();
 }

@@ -36,12 +36,17 @@ use wasm::world::{LogOutcome, ReadOutcome, WriteOutcome};
 ///   wiring mistake it cannot see, let alone fix. The day the world gains a path argument, this
 ///   decision has to be made again.
 ///
-/// Exhaustive rather than a wildcard, so a sixth variant added to the enum stops the build here -
+/// Exhaustive rather than a wildcard, so a variant added to the enum stops the build here -
 /// at the one place that decides - instead of quietly joining whichever side the wildcard picked.
 pub fn is_refusal(error: Error) -> bool {
 	match error {
 		Error::Denied => true,
 		Error::NotFound | Error::Invalid | Error::Again | Error::Closed => false,
+		// The eight added with IDL-006, and none of them is a refusal: every one is a statement
+		// about the host, the medium or the operation, not about whether the guest was ALLOWED.
+		// `Unsupported` is the closest call - it can look like "you may not" - but it says the
+		// implementation does not do this, which is the host's shape and not the guest's authority.
+		Error::TimedOut | Error::Unsupported | Error::Exhausted | Error::NoSpace | Error::Io | Error::Corrupt | Error::Cancelled | Error::CommitUncertain => false,
 	}
 }
 
