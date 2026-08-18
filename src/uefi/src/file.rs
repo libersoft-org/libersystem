@@ -14,6 +14,22 @@ use crate::{self as uefi, BootServices};
 
 // Read an entire file from the boot volume into fresh LOADER_DATA pages and return it
 // as a 'static slice (the memory is retained across the hand-off).
+// Give back the pages a `read_file` result occupies. The slice must be exactly what `read_file`
+// returned and must not have been used since.
+//
+// `read_file` allocates fresh LOADER_DATA pages and returns an UNOWNED static slice, so a caller that
+// copies the bytes elsewhere - which is what every bootstrap-list and pairing-file reader does - left
+// the whole page allocation behind. Loader data becomes `MEM_BOOTLOADER`, which the kernel never
+// seeds as usable, so each such read permanently removed its own size from the machine's RAM.
+//
+// # Safety
+// `bytes` must be a slice returned by `read_file` from the same `bs`, and nothing may reference it
+// afterwards.
+pub unsafe fn free_file(bs: *mut BootServices, bytes: &[u8]) {
+	let pages = bytes.len().div_ceil(PAGE_SIZE as usize).max(1);
+	unsafe { ((*bs).free_pages)(bytes.as_ptr() as u64, pages) };
+}
+
 pub fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> Option<&'static [u8]> {
 	let mut wname = [0u16; 64];
 	// A name that does not fit is not this name: opening a truncated path would open a different

@@ -221,9 +221,20 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 			let name = core::str::from_utf8(&name[..path.len()]).ok()?;
 			let bytes = read_file(self.bs, self.root, name)?;
 			let mut owned = alloc::vec::Vec::new();
-			owned.try_reserve_exact(bytes.len()).ok()?;
-			owned.extend_from_slice(bytes);
-			Some(owned)
+			let copied = owned.try_reserve_exact(bytes.len()).is_ok();
+			if copied {
+				owned.extend_from_slice(bytes);
+			}
+			// THE PAGES GO BACK. `read_file` hands out an unowned slice in fresh LOADER_DATA pages,
+			// and this copies out of it - so leaving it behind permanently removed one file's worth
+			// of RAM from the machine, once per bootstrap-list entry. Loader data becomes
+			// `MEM_BOOTLOADER`, which the kernel never seeds as usable, so it is not reclaimed later
+			// either. Freed on the failure path too, which is the one a `try_reserve` makes reachable.
+			//
+			// SAFETY: `bytes` is exactly what `read_file` returned and nothing refers to it now - the
+			// copy above is complete.
+			unsafe { uefi::file::free_file(self.bs, bytes) };
+			if copied { Some(owned) } else { None }
 		}
 	}
 
@@ -330,6 +341,11 @@ fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) ->
 	// The parse lives with the rule it feeds - `uefi::disk::parse_pairing`, beside `choose_volume` -
 	// so both halves of the pairing mechanism are in one place and both are tested. What stays here
 	// is the reading.
+	// NOT FREED HERE, deliberately. A UUID is 36 bytes and this read costs a whole page of
+	// LOADER_DATA that the kernel never seeds as usable - but `read_boot_file` has TWO sources, the
+	// firmware read (page-backed, freeable) and the FAT fallback (its own buffer, not), and the
+	// return type does not say which. Handing the wrong one to `free_pages` is worse than the leak.
+	// Closing this needs the ownership expressed in the type; see LDR-012.
 	uefi::disk::parse_pairing(read_boot_file(bs, root, "etc/system-volume.uuid")?)
 }
 
