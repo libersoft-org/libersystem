@@ -121,6 +121,10 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// `csrci sstatus, 2` clears SIE (bit 1) and nothing else.
 	unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack, preserves_flags)) };
 
+	// AND THE DESTINATION IS PROVED OURS, from the map that was just translated. Before this the
+	// only question asked was whether any object the loader remembered was in the way.
+	unsafe { check_destination_is_ours(&staged, (*(boot_info as *const BootInfo)).memmap as *const bootproto::MemRegion, region_count) };
+
 	// Now, and only now, put the kernel at its link addresses and enter it. The loader ran
 	// under the firmware's identity map, so with paging off it keeps executing at the same
 	// (physical) addresses through the copy and the jump.
@@ -205,7 +209,30 @@ struct Staged {
 	scratch: u64,
 	dest_low: u64,
 	dest_high: u64,
+	// THE PAGES THE COPY MAY ACTUALLY WRITE, and nothing between them.
+	//
+	// The placement used to move the whole `dest_low..dest_high` interval in one block, which
+	// writes every inter-segment GAP as well - and a gap is memory nobody asked for and nobody
+	// reserved. The common reservation pass claims each `PT_LOAD` page span separately, so even a
+	// run where every reservation succeeded had claimed none of the holes between them. This kernel
+	// happens to have page-contiguous load spans; the loader admits ELF layouts that do not, and
+	// the incomplete-reservation path is deliberately live.
+	//
+	// Page-aligned outward and merged where they touch, so this is exactly the set of pages the
+	// placement is allowed to touch - the overlap proof and the post-exit ownership proof both work
+	// from it rather than from the interval.
+	spans: [(u64, u64); MAX_SEGMENTS],
+	span_count: usize,
 }
+
+// The most `PT_LOAD` segments a kernel may have. A kernel with more stops here rather than being
+// placed from a plan that describes a prefix of it.
+const MAX_SEGMENTS: usize = 8;
+
+// How many pages the placement runs its own stack on. See `place_and_enter`: the copy happens on
+// memory this loader allocated and proved clear of every destination span, rather than on the
+// firmware stack whose extent nothing here can establish.
+const HANDOFF_STACK_PAGES: usize = 4;
 
 // Copy the kernel into SCRATCH memory rather than to its link address, and record where it has
 // to go.
@@ -262,9 +289,18 @@ fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 	// existing and no machine here produces it on demand.
 
 	let scratch = uefi::memory::staging_clear_of(bs, pages, dest_low, dest_high).expect("loader: every staging allocation landed on the kernel's destination");
-	// Zero the whole block first, so every BSS tail and inter-segment gap is already zero when
-	// the single block copy places it.
+	// The stack the placement will run on, allocated the same way and for the same reason: it has
+	// to be somewhere the copy is not about to write.
+	let stack = uefi::memory::staging_clear_of(bs, HANDOFF_STACK_PAGES, dest_low, dest_high).expect("loader: every handoff stack allocation landed on the kernel's destination");
+	unsafe { core::ptr::write_bytes(stack as *mut u8, 0, HANDOFF_STACK_PAGES * PAGE_SIZE as usize) };
+	unsafe { HANDOFF_STACK = stack };
+	// Zero the whole block first, so every BSS tail is already zero when the placement copies it.
+	// The gaps between segments are zeroed here too and simply never copied out - see `spans`.
 	unsafe { core::ptr::write_bytes(scratch as *mut u8, 0, pages * PAGE_SIZE as usize) };
+	// THE PLAN, built from the headers: one page-aligned span per loadable segment, merged where
+	// they meet. Nothing outside these pages is ever written at the destination.
+	let mut spans: [(u64, u64); MAX_SEGMENTS] = [(0, 0); MAX_SEGMENTS];
+	let mut span_count = 0usize;
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
 		if ph.p_type != crate::elf::PT_LOAD || ph.p_memsz == 0 {
@@ -272,8 +308,21 @@ fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 		}
 		let Some(data) = image.segment_data(&ph) else { continue };
 		unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), (scratch + (ph.p_paddr - dest_low)) as *mut u8, data.len()) };
+		let start = align_down(ph.p_paddr, PAGE_SIZE);
+		let end = ph.p_paddr.checked_add(ph.p_memsz).and_then(|v| v.checked_add(PAGE_SIZE - 1)).map(|v| v & !(PAGE_SIZE - 1)).expect("a segment whose page-rounded end wraps");
+		// Merged into the previous span when they touch or overlap. Program headers are ordered by
+		// physical address in every image this loads, and an out-of-order one simply gets a span of
+		// its own rather than a wrong merge.
+		if span_count > 0 && start <= spans[span_count - 1].1 {
+			spans[span_count - 1].1 = spans[span_count - 1].1.max(end);
+			continue;
+		}
+		assert!(span_count < MAX_SEGMENTS, "loader: the kernel has more loadable segments than the placement plan holds");
+		spans[span_count] = (start, end);
+		span_count += 1;
 	}
-	Staged { entry: image.entry, scratch, dest_low, dest_high }
+	assert!(span_count > 0, "loader: the placement plan is empty");
+	Staged { entry: image.entry, scratch, dest_low, dest_high, spans, span_count }
 }
 
 // Put the staged image where it belongs and enter the kernel. Nothing may call the firmware
@@ -286,8 +335,123 @@ fn stage_kernel(bs: *mut BootServices, kernel: &[u8]) -> Staged {
 // own code, the staging block, and what the kernel is handed - must lie outside
 // [dest_low, dest_high), which `check_clear_of_destination` establishes first.
 unsafe fn place_and_enter(staged: &Staged, hartid: u64, boot_info: u64) -> ! {
+	// ON A STACK THIS LOADER OWNS, not on the firmware's.
+	//
+	// The overlap proof could only ever cover `[sampled sp, end of that page)`: nothing here can
+	// establish where the firmware's stack begins or ends, so caller state on a higher page - or a
+	// later frame past the end of the sampled page - lay outside every checked interval. The copy
+	// would then be able to overwrite its own saved arguments, its return address, or the values it
+	// reloads afterwards, while running, after the console is gone. Stack layout changes with the
+	// compiler, so the failure would come and go between builds.
+	//
+	// So the placement runs on pages allocated for it and proved clear of every destination span,
+	// and switching to them is the first instruction of a block that never returns. Everything the
+	// placement needs is already in `Placement`, which lives on that same stack.
+	let block = unsafe { HANDOFF_STACK };
+	assert!(block != 0, "loader: no handoff stack was allocated");
+	// The plan goes at the BOTTOM of that block and the stack starts at its top, growing down
+	// toward it - so the object the routine reads is inside the same checked allocation as the
+	// stack it runs on, rather than in a frame on the firmware's stack that this cannot bound. Four
+	// pages of room for a routine whose only frame is its own.
+	let plan = block as *mut Placement;
+	unsafe { plan.write(Placement { spans: staged.spans, span_count: staged.span_count, scratch: staged.scratch, dest_low: staged.dest_low, entry: staged.entry, hartid, boot_info }) };
+	let stack_top = (block + (HANDOFF_STACK_PAGES as u64) * PAGE_SIZE) & !0xf;
 	unsafe {
-		core::ptr::copy_nonoverlapping(staged.scratch as *const u8, staged.dest_low as *mut u8, (staged.dest_high - staged.dest_low) as usize);
+		core::arch::asm!(
+			"mv sp, {stack}",
+			"jalr {routine}",
+			stack = in(reg) stack_top,
+			routine = in(reg) place_on_own_stack as usize,
+			in("a0") plan,
+			options(noreturn),
+		);
+	}
+}
+
+// What the placement needs, in one object, so the routine below takes a single argument and reads
+// nothing that could have been overwritten.
+#[repr(C)]
+struct Placement {
+	spans: [(u64, u64); MAX_SEGMENTS],
+	span_count: usize,
+	scratch: u64,
+	dest_low: u64,
+	entry: u64,
+	hartid: u64,
+	boot_info: u64,
+}
+
+// The pages the placement runs its stack on, allocated before `ExitBootServices` and checked with
+// everything else. Zero until `stage_kernel` has run, which is long before anything reads it.
+static mut HANDOFF_STACK: u64 = 0;
+
+// EVERY DESTINATION PAGE HAS TO BE MEMORY THE FIRMWARE SAID BECOMES OURS.
+//
+// The reservation pass claims each segment's page span and records failure only as
+// `complete = false`, and this architecture logged that and carried on, on the premise that the
+// object-overlap check was enough. It is not the same question: checking a remembered set of live
+// objects establishes that no object THIS LOADER KNOWS ABOUT is in the way. It says nothing about
+// whether a destination page belongs to runtime firmware, a platform reservation, ACPI NVS, a
+// device aperture, or nothing at all - and the first post-exit act is to write every one of them.
+//
+// The final EFI map, which was translated immediately before the exit, is the answer to that
+// question and was never consulted. `MEM_USABLE` and `MEM_BOOTLOADER` are the two kinds that
+// become the kernel's after a successful exit; every other kind, and any page the map does not
+// describe at all, is a refusal.
+fn check_destination_is_ours(staged: &Staged, regions: *const bootproto::MemRegion, count: usize) {
+	for index in 0..staged.span_count {
+		let (start, end) = staged.spans[index];
+		let mut at = start;
+		while at < end {
+			let mut owned = false;
+			for region in 0..count {
+				let entry = unsafe { &*regions.add(region) };
+				let region_end = entry.base.saturating_add(entry.length);
+				if at >= entry.base && at < region_end {
+					owned = entry.kind == bootproto::MEM_USABLE || entry.kind == bootproto::MEM_BOOTLOADER;
+					break;
+				}
+			}
+			if !owned {
+				serial::write_str("loader: FATAL - the kernel's destination covers memory the firmware did not hand over\n");
+				halt();
+			}
+			at += PAGE_SIZE;
+		}
+	}
+}
+
+// Copy each planned span and enter the kernel. Runs on the handoff stack; never returns.
+//
+// PER SPAN, AND NOTHING BETWEEN THEM. The old copy moved `dest_low..dest_high` as one block, so
+// every gap between segments was written too - memory that no reservation had claimed and that can
+// belong to runtime firmware, a platform reservation, or a device aperture.
+//
+// The copy loop is inline assembly rather than `copy_nonoverlapping` because a call to `memcpy` is
+// a frame, a return address and a set of saved registers whose lifetime spans the write. Here the
+// only live state during a span's copy is in registers.
+unsafe extern "C" fn place_on_own_stack(placement: *mut Placement) -> ! {
+	unsafe {
+		let plan = &*placement;
+		for index in 0..plan.span_count {
+			let (start, end) = plan.spans[index];
+			let source = plan.scratch + (start - plan.dest_low);
+			core::arch::asm!(
+				"1:",
+				"beq {src}, {srcend}, 2f",
+				"ld {word}, 0({src})",
+				"sd {word}, 0({dst})",
+				"addi {src}, {src}, 8",
+				"addi {dst}, {dst}, 8",
+				"j 1b",
+				"2:",
+				src = inout(reg) source => _,
+				srcend = in(reg) source + (end - start),
+				dst = inout(reg) start => _,
+				word = out(reg) _,
+				options(nostack, preserves_flags),
+			);
+		}
 		// The kernel's text was just written as data; make the instruction fetch see it.
 		core::arch::asm!("fence rw, rw", "fence.i", options(nostack, preserves_flags));
 		// Mirror the OpenSBI `-kernel` entry state: paging off, hart id in a0, the hand-off
@@ -296,15 +460,15 @@ unsafe fn place_and_enter(staged: &Staged, hartid: u64, boot_info: u64) -> ! {
 			"csrw satp, zero",
 			"sfence.vma",
 			"jr {entry}",
-			entry = in(reg) staged.entry,
-			in("a0") hartid,
-			in("a1") boot_info,
+			entry = in(reg) plan.entry,
+			in("a0") plan.hartid,
+			in("a1") plan.boot_info,
 			options(noreturn),
 		);
 	}
 }
 
-// Six fixed objects plus the module array and its entries. A hand-off with more modules than this
+// Eight fixed objects plus the module array and its entries. A hand-off with more modules than this
 // stops rather than silently checking a prefix of them.
 const MAX_CHECKED_RANGES: usize = 16;
 
@@ -319,9 +483,12 @@ fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64, loader:
 	// destination, and the post-EBS copy would then overwrite the bootstrap data before the kernel
 	// reads it.
 	let span = staged.dest_high - staged.dest_low;
+	// AGAINST THE PLANNED SPANS, not the whole interval. The copy writes only those pages now, so
+	// an object sitting in a gap between segments is not in the way - and one sitting in a span is,
+	// however small the span.
 	let overlaps = |start: u64, len: u64| -> bool {
 		let end = start.saturating_add(len.max(1));
-		start < staged.dest_high && staged.dest_low < end
+		staged.spans.iter().take(staged.span_count).any(|&(low, high)| start < high && low < end)
 	};
 	let sp: u64;
 	unsafe { core::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
@@ -331,10 +498,16 @@ fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64, loader:
 	// THE LOADER'S REAL EXTENT, from `EFI_LOADED_IMAGE_PROTOCOL`. One page around
 	// `place_and_enter` stood in for this, and the loader is bigger than one page - so the check
 	// most directly about "the loader is about to overwrite itself" was the loosest of them all.
-	let (loader_base, loader_size) = loader.unwrap_or_else(|| {
-		serial::write_str("loader: WARNING - EFI_LOADED_IMAGE_PROTOCOL gave no extent; checking one page around the copy routine instead\n");
-		(place_and_enter as *const () as u64, crate::PAGE_SIZE)
-	});
+	// REQUIRED, not substituted. One page around the copy routine stood in when the protocol did
+	// not answer, and the loader is far bigger than one page - so the check most directly about
+	// "the loader is about to overwrite itself" became the loosest of them all, on exactly the
+	// machines whose firmware is least like the one this was developed on. A boot that cannot
+	// establish where the loader is cannot establish that the copy is safe, and says so while there
+	// is still a console to say it on.
+	let Some((loader_base, loader_size)) = loader else {
+		serial::write_str("loader: FATAL - EFI_LOADED_IMAGE_PROTOCOL gave no extent, so nothing can prove the placement will not overwrite this loader\n");
+		halt();
+	};
 	let mut ranges: [(u64, u64, &str); MAX_CHECKED_RANGES] = [(0, 0, ""); MAX_CHECKED_RANGES];
 	ranges[0] = (loader_base, loader_size, "the loader's own image");
 	ranges[1] = (sp, stack_top - sp, "the loader's stack");
@@ -344,7 +517,18 @@ fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64, loader:
 	ranges[4] = (boot_info, core::mem::size_of::<bootproto::BootInfo>() as u64, "the hand-off record");
 	// The device tree's real length, off its own header: bytes 4..8 are `totalsize`, big-endian.
 	ranges[5] = (dtb, dtb_total_size(dtb), "the device tree");
-	let mut extra = 6;
+	// THE MEMORY-MAP ARRAY, AT ITS FULL CAPACITY. It was in `BootInfo` from the day this
+	// architecture stopped handing over nothing, and it was in no checked range at all - so the
+	// copy could destroy the kernel's only physical memory map. Its CAPACITY rather than its
+	// populated length, because this check runs before `ExitBootServices` and the array is filled
+	// by the translation immediately after: the length is still zero here, and checking zero bytes
+	// checks nothing.
+	let info = boot_info as *const bootproto::BootInfo;
+	let memmap = unsafe { (*info).memmap };
+	ranges[6] = (memmap, (uefi::memory::MAX_REGIONS * core::mem::size_of::<bootproto::MemRegion>()) as u64, "the kernel's memory map");
+	// And the stack the placement itself will run on.
+	ranges[7] = (unsafe { HANDOFF_STACK }, (HANDOFF_STACK_PAGES as u64) * PAGE_SIZE, "the handoff stack");
+	let mut extra = 8;
 
 	// AND EVERYTHING `BootInfo` POINTS AT, rather than a list of globals somebody remembered.
 	//
@@ -357,7 +541,6 @@ fn check_clear_of_destination(staged: &Staged, boot_info: u64, dtb: u64, loader:
 	// Being in `BootInfo` is what makes an object one the kernel still has to read, so that is what
 	// is walked: the record, the array over `modules_len` entries, and every module's own bytes -
 	// which covers the bootstrap archive, both packages and the live image without naming any.
-	let info = boot_info as *const bootproto::BootInfo;
 	let (modules, modules_len) = unsafe { ((*info).modules, (*info).modules_len) };
 	if modules != 0 && modules_len != 0 {
 		ranges[extra] = (modules, modules_len * core::mem::size_of::<bootproto::Module>() as u64, "the module descriptor array");
