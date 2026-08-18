@@ -228,7 +228,15 @@ The following are out of scope here and are tracked in the Concept's
 "no ambient authority" property; they extend policy and coverage on top of it.
 
 ```text
-- a signed/immutable system image, verified boot, and a package trust chain;
+- a signed/immutable system image, verified boot, and a package trust chain. Said precisely,
+  because a reader may otherwise assume UEFI Secure Boot covers the boot chain: Secure Boot verifies
+  the LOADER BINARY and stops there. Nothing verifies the kernel, the bootstrap list, the early
+  modules, or the system volume they come from, and nothing binds them to the loader that read them.
+  An attacker who can modify the boot or system volume replaces the kernel or early userspace and
+  owns the machine before a single capability exists. Closing it means a signed boot manifest rooted
+  in a key the loader authenticates, binding the system UUID, kernel, bootstrap list, every module
+  and the image by length and strong digest, verified BEFORE any fixed-address placement, with
+  revocation and a monotonic rollback version whose storage is explicit;
 - fine-grained portals (mic/camera/screenshot) and network policy granularity;
 - side-channel and timing attacks (Spectre-class microarchitectural leaks);
 - physical attacks (cold boot, bus probing) and encrypted user volumes;

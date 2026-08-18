@@ -201,9 +201,22 @@ fn pt_index(v: u64) -> usize {
 }
 
 // Allocate one zeroed 4 KiB page for a page table.
+// BELOW 4 GB, all of them.
+//
+// The application-processor trampoline starts in 16-bit real mode and loads CR3 with a 32-BIT
+// register, so a page table above 4 GB is an address it cannot express - and it is the PML4 that
+// matters most, because that is the one the trampoline loads. `ALLOCATE_ANY_PAGES` let firmware put
+// it anywhere, so on a machine with plenty of high memory the APs would fail to come up, or come up
+// on a truncated CR3, depending on what the low bits happened to be.
+//
+// Every level is capped rather than only the root: the intermediate tables are reached through
+// physical addresses stored in entries, and keeping the whole hierarchy in the low 4 GB costs
+// nothing and removes the question of which levels the constraint applies to.
+const TABLE_CEILING: PhysicalAddress = 0xFFFF_FFFF;
+
 fn alloc_table(bs: *mut BootServices) -> Option<PhysicalAddress> {
-	let mut addr: PhysicalAddress = 0;
-	let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_ANY_PAGES, uefi::LOADER_DATA, 1, &mut addr) };
+	let mut addr: PhysicalAddress = TABLE_CEILING;
+	let status = unsafe { ((*bs).allocate_pages)(uefi::ALLOCATE_MAX_ADDRESS, uefi::LOADER_DATA, 1, &mut addr) };
 	if uefi::is_error(status) {
 		return None;
 	}

@@ -104,6 +104,14 @@ pub fn enable_fpu() {
 		asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
 		cr0 &= !((1 << 2) | (1 << 3)); // EM=0, TS=0
 		cr0 |= (1 << 1) | (1 << 5); // MP=1, NE=1
+		// AND WP, WHICH WAS INHERITED RATHER THAN ESTABLISHED.
+		//
+		// With `CR0.WP` clear, a supervisor write IGNORES the read-only bit - so every read-only
+		// kernel mapping is writable from ring 0 and the loader's W^X segment checks decide nothing
+		// at all. UEFI specifies only some CR0 bits and promises nothing about this one, so firmware
+		// leaving it clear was a state this kernel accepted and carried. It is set here, on every
+		// core, because a property that matters must be established rather than hoped for.
+		cr0 |= 1 << 16; // WP=1
 		asm!("mov cr0, {}", in(reg) cr0, options(nostack, preserves_flags));
 
 		let mut cr4: u64;
