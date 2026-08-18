@@ -2357,11 +2357,46 @@ def cmd_scenario_cold(args):
 
 # ---- subcommands -----------------------------------------------------------
 
+# The lab's own guest, and nothing else.
+#
+# This was `pkill -9 -f qemu-system-x86`, which matches by PATTERN across every process the user
+# owns: a developer with an unrelated QEMU open - another project, a VM they were mid-way through -
+# lost it to `lab boot`, `lab test` or `lab down`. The pattern cannot tell whose guest it is.
+#
+# A pid file can. QEMU writes one with `-pidfile`, and this kills that pid and only that pid, after
+# checking the process is actually a QEMU: a stale pid file whose number has been reused by something
+# unrelated is the other half of the same mistake.
+LAB_PIDFILE = os.path.join(BUILD, 'lab-qemu.pid')
+
+
+def kill_lab_guest():
+	try:
+		with open(LAB_PIDFILE) as handle:
+			pid = int(handle.read().strip())
+	except (OSError, ValueError):
+		return
+	try:
+		with open(f'/proc/{pid}/cmdline', 'rb') as handle:
+			cmdline = handle.read().decode('utf-8', 'replace')
+	except OSError:
+		# Already gone; the file is stale.
+		cmdline = ''
+	if 'qemu-system-' in cmdline:
+		try:
+			os.kill(pid, signal.SIGKILL)
+		except OSError:
+			pass
+	try:
+		os.unlink(LAB_PIDFILE)
+	except OSError:
+		pass
+
+
 def cmd_boot(args):
 	fresh = '--fresh' in args
 	timeout = arg_value(args, '--timeout', 240)
 	displays = [d for d in ('vnc', 'spice') if f'--{d}' in args]
-	subprocess.run(['pkill', '-9', '-f', 'qemu-system-x86'], check=False)
+	kill_lab_guest()
 	time.sleep(1)
 	for path in (SERIAL_SOCK, CTL_SOCK):
 		if os.path.exists(path):
@@ -2770,7 +2805,7 @@ def ip_str(b):
 
 def cmd_test(args):
 	timeout = arg_value(args, '--timeout', 900)
-	subprocess.run(['pkill', '-9', '-f', 'qemu-system-x86'], check=False)
+	kill_lab_guest()
 	time.sleep(1)
 	if os.path.exists(VOLUME_IMG):
 		os.unlink(VOLUME_IMG)
@@ -2802,7 +2837,7 @@ def cmd_quit(_args):
 		except (SystemExit, OSError):
 			pass
 	time.sleep(1)
-	subprocess.run(['pkill', '-9', '-f', 'qemu-system-x86'], check=False)
+	kill_lab_guest()
 	for path in (SERIAL_SOCK, CTL_SOCK):
 		if os.path.exists(path):
 			os.unlink(path)

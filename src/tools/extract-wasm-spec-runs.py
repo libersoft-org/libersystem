@@ -31,7 +31,7 @@
 #   M <index> <module bytes as hex>
 #   R <module index> <source file> <export> <args> <expected>
 # where `args` and `expected` are comma-separated `i32:<decimal>` / `i64:<decimal>` and `expected`
-# is the literal `trap` for `assert_trap`.
+# is `trap:<expected message>` for `assert_trap` (or the bare `trap` when the case names no text).
 
 import json
 import os
@@ -122,7 +122,12 @@ def main():
 				if args is None:
 					continue
 				if kind == 'assert_trap':
-					expected = 'trap'
+					# THE MESSAGE TOO, not just the fact. `trap` alone means every trap satisfies
+					# every trap assertion: a module that traps with "out of bounds memory access"
+					# passes a case asserting "integer divide by zero", and the oracle cannot tell
+					# them apart. The specification names the expected text, so record it.
+					text = command.get('text') or ''
+					expected = 'trap:' + text if text else 'trap'
 				elif kind == 'action':
 					# A BARE `(invoke ...)`: no assertion, but it MUTATES the instance, and the
 					# assertions after it are written against the state it leaves. `float_memory.wast`

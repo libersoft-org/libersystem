@@ -1567,6 +1567,16 @@ mod spec_run {
 		trap.0.contains("out of fuel") || trap.0.contains("call depth")
 	}
 
+	// Does this engine's trap say what the specification's expected message says?
+	//
+	// The specification's texts are short phrases ("integer divide by zero", "out of bounds memory
+	// access") and this engine writes its own sentences, so an exact comparison would fail on every
+	// case. Matching on the phrase being PRESENT is the honest middle: it catches a module that traps
+	// for a completely different reason, which is what the audit found, without demanding that two
+	// independently-written wordings agree character for character.
+	fn trap_says(trap: &Trap, want: &str) -> bool {
+		trap.0.contains(want)
+	}
 	#[test]
 	fn the_specifications_own_answers_are_this_engines_answers() {
 		let (modules, runs) = fixture();
@@ -1640,7 +1650,13 @@ mod spec_run {
 					}
 					continue;
 				}
-				if run.expected == "trap" {
+				// A TRAP CASE, with or without the message the specification names. `trap` is the
+				// legacy shape - the fixture on disk was extracted before the message was captured -
+				// and `trap:<text>` is what the extractor writes now. When the text is there it is
+				// CHECKED, because otherwise every trap satisfies every trap assertion and a module
+				// trapping with "out of bounds memory access" passes a case asserting "integer
+				// divide by zero".
+				if run.expected == "trap" || run.expected.starts_with("trap:") {
 					ran += 1;
 					match outcome {
 						Ok(value) => wrong.push(alloc::format!("{}: {}({}) returned {value:?} where the specification says it traps", run.file, run.export, run.args)),
@@ -1656,7 +1672,16 @@ mod spec_run {
 							ran -= 1;
 							skipped += 1;
 						}
-						Err(_) => {}
+						Err(trap) => {
+							// The message, WHEN THE FIXTURE CARRIES ONE. `trap:<text>` cases compare
+							// it; bare `trap` cases accept any trap, which is what the fixture on
+							// disk still is until it is regenerated with a specification checkout.
+							if let Some(want) = run.expected.strip_prefix("trap:")
+								&& !want.is_empty() && !trap_says(&trap, want)
+							{
+								wrong.push(alloc::format!("{}: {}({}) trapped with {trap:?} where the specification says {want:?}", run.file, run.export, run.args));
+							}
+						}
 					}
 					continue;
 				}
