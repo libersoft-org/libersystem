@@ -109,6 +109,18 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let region_count = exit_boot_services(bs, image_handle, unsafe { (*(boot_info as *const BootInfo)).memmap as *mut bootproto::MemRegion });
 	unsafe { (*(boot_info as *mut BootInfo)).memmap_len = region_count as u64 };
 
+	// MASK SUPERVISOR INTERRUPTS, FIRST THING AFTER THE LAST FIRMWARE CALL.
+	//
+	// UEFI runs boot services with interrupts enabled, and on RISC-V it additionally leaves a
+	// SUPERVISOR TIMER configured for delivery - so this is not an inherited-state worry, it is a
+	// timer that is going to fire. Nothing here ever cleared `sstatus.SIE`, and the kernel installs
+	// `stvec` well into its Rust entry path: from this line until then, a delivered interrupt
+	// vectors through the firmware's `stvec`, whose handler this code is about to overwrite with the
+	// kernel image. `place_and_enter` copies over exactly that memory.
+	//
+	// `csrci sstatus, 2` clears SIE (bit 1) and nothing else.
+	unsafe { core::arch::asm!("csrci sstatus, 2", options(nomem, nostack, preserves_flags)) };
+
 	// Now, and only now, put the kernel at its link addresses and enter it. The loader ran
 	// under the firmware's identity map, so with paging off it keeps executing at the same
 	// (physical) addresses through the copy and the jump.

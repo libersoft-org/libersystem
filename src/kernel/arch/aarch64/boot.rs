@@ -26,6 +26,70 @@ global_asm!(
 _start:
 	mov     x19, x0                 // save DTB
 
+	// INVALIDATE THE DATA CACHE BEFORE ANYTHING IS WRITTEN, because this stub is about to turn the
+	// caches back ON and it must not inherit a line from whoever ran before it.
+	//
+	// The loader hands over with SCTLR.C clear, so every store below goes straight to memory - but
+	// the cache may still hold lines for those addresses from when the firmware and the loader ran
+	// with caching on. Enabling C afterwards would let a read hit one of them and see a page table
+	// entry that was never written.
+	//
+	// INVALIDATE, NOT CLEAN-AND-INVALIDATE, and the order is the reason. A stale DIRTY line for an
+	// address this stub is about to write would, on a clean, be written back OVER the fresh value -
+	// so the maintenance has to happen BEFORE the writes, and at that point there is nothing of
+	// this kernel's worth keeping. What the loader hands over it publishes itself, to the point of
+	// coherency, while its own cache is still enabled (`publish_handoff`).
+	//
+	// By set/way: architecturally that is only meaningful with nothing else running, which is
+	// exactly this instruction of this boot. The loop is the canonical one - for each level CLIDR_EL1
+	// names as having a data cache, read its geometry from CCSIDR_EL1 and walk every set of every
+	// way. QEMU's caches are coherent and model none of this, so it is written from the architecture
+	// manual and has never been observed mattering.
+	mrs     x0, clidr_el1
+	and     w3, w0, #0x07000000     // LoC, bits 26:24
+	lsr     w3, w3, #23             // ... as 2 * level
+	cbz     w3, 5f
+	mov     w10, #0                 // w10 = 2 * current level
+1:
+	add     w2, w10, w10, lsr #1    // w2 = 3 * level: this level's CLIDR field offset
+	lsr     w1, w0, w2
+	and     w1, w1, #0x7            // cache type at this level
+	cmp     w1, #2
+	b.lt    4f                      // no data or unified cache here
+	msr     csselr_el1, x10
+	isb
+	mrs     x1, ccsidr_el1
+	and     w2, w1, #7              // log2(line bytes) - 4
+	add     w2, w2, #4
+	mov     w4, #0x3ff
+	and     w4, w4, w1, lsr #3      // highest way
+	clz     w5, w4                  // where the way field starts
+	mov     w7, #0x7fff
+	and     w7, w7, w1, lsr #13     // highest set
+2:
+	mov     w9, w4
+3:
+	lsl     w6, w9, w5
+	orr     w11, w10, w6            // level | way
+	lsl     w6, w7, w2
+	orr     w11, w11, w6            // ... | set
+	dc      isw, x11
+	subs    w9, w9, #1
+	b.ge    3b
+	subs    w7, w7, #1
+	b.ge    2b
+4:
+	add     w10, w10, #2
+	cmp     w3, w10
+	b.gt    1b
+5:
+	mov     x0, #0
+	msr     csselr_el1, x0
+	dsb     sy
+	ic      iallu
+	dsb     sy
+	isb
+
 	// Boot tables: x20 = L1, x21 = L0_LOW (TTBR0), x22 = L0_HIGH (TTBR1).
 	adrp    x20, __boot_tables
 	add     x20, x20, :lo12:__boot_tables
@@ -80,9 +144,18 @@ _start:
 	tlbi    vmalle1
 	dsb     sy
 	isb
-	// Enable the MMU (SCTLR_EL1.M).
+	// Enable the MMU (SCTLR_EL1.M), the data cache (C) and the instruction cache (I).
+	//
+	// C AND I WERE NOT SET HERE, AND NOTHING ELSE SET THEM. The loader clears all three on purpose -
+	// this stub builds translation from scratch - and this line put back only M, so both caches
+	// stayed off for the life of the machine, on the primary core and, through the same sequence in
+	// `psci.rs`, on every secondary. Page-table memory attributes do not re-enable the architectural
+	// caches; only these bits do. On QEMU TCG it costs nothing measurable, which is why it survived;
+	// on a real part it is orders of magnitude of memory traffic, and services that look hung.
 	mrs     x0, sctlr_el1
-	orr     x0, x0, #1
+	orr     x0, x0, #1     // M: translation on
+	orr     x0, x0, #0x4   // C: data and unified caches
+	orr     x0, x0, #0x1000 // I: instruction caches
 	msr     sctlr_el1, x0
 	isb
 

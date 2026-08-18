@@ -78,6 +78,57 @@ aarch64_secondary_start:
 	// x0 = context_id = cpu id (passed by PSCI CPU_ON). MMU is off; PC is the low
 	// physical entry. Adopt the boot page tables the primary already built.
 	mov     x19, x0
+
+	// Invalidate this core's data cache before it turns caching on, for the reason the primary
+	// stub's copy of this loop states at length: a core coming out of PSCI CPU_ON has caches in an
+	// architecturally UNKNOWN state, and it is about to enable C over page tables another core
+	// wrote. Invalidate rather than clean, and before anything is stored - a stale dirty line
+	// written back later would land on top of live memory.
+	mrs     x0, clidr_el1
+	and     w3, w0, #0x07000000
+	lsr     w3, w3, #23
+	cbz     w3, 5f
+	mov     w10, #0
+1:
+	add     w2, w10, w10, lsr #1
+	lsr     w1, w0, w2
+	and     w1, w1, #0x7
+	cmp     w1, #2
+	b.lt    4f
+	msr     csselr_el1, x10
+	isb
+	mrs     x1, ccsidr_el1
+	and     w2, w1, #7
+	add     w2, w2, #4
+	mov     w4, #0x3ff
+	and     w4, w4, w1, lsr #3
+	clz     w5, w4
+	mov     w7, #0x7fff
+	and     w7, w7, w1, lsr #13
+2:
+	mov     w9, w4
+3:
+	lsl     w6, w9, w5
+	orr     w11, w10, w6
+	lsl     w6, w7, w2
+	orr     w11, w11, w6
+	dc      isw, x11
+	subs    w9, w9, #1
+	b.ge    3b
+	subs    w7, w7, #1
+	b.ge    2b
+4:
+	add     w10, w10, #2
+	cmp     w3, w10
+	b.gt    1b
+5:
+	mov     x0, #0
+	msr     csselr_el1, x0
+	dsb     sy
+	ic      iallu
+	dsb     sy
+	isb
+
 	adrp    x20, __boot_tables
 	add     x20, x20, :lo12:__boot_tables
 	add     x21, x20, #4096         // L0_LOW  (TTBR0, low identity)
@@ -97,8 +148,12 @@ aarch64_secondary_start:
 	tlbi    vmalle1
 	dsb     sy
 	isb
+	// M, C and I together, as on the primary. This put back only the MMU bit, so every secondary
+	// ran its whole life with both caches off - independently of core 0, and for the same reason.
 	mrs     x0, sctlr_el1
-	orr     x0, x0, #1             // enable the MMU (SCTLR_EL1.M)
+	orr     x0, x0, #1             // M: translation on
+	orr     x0, x0, #0x4           // C: data and unified caches
+	orr     x0, x0, #0x1000        // I: instruction caches
 	msr     sctlr_el1, x0
 	isb
 	// Per-core higher-half stack: SEC_STACKS[cpu_id] top.

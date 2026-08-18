@@ -67,6 +67,24 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let region_count = exit_boot_services(bs, image_handle, unsafe { (*(boot_info as *const BootInfo)).memmap as *mut bootproto::MemRegion });
 	unsafe { (*(boot_info as *mut BootInfo)).memmap_len = region_count as u64 };
 
+	// MASK INTERRUPTS, FIRST THING AFTER THE LAST FIRMWARE CALL.
+	//
+	// UEFI runs boot services with interrupts ENABLED, and this sequence never changed DAIF: the EL2
+	// branch below sets masks in `SPSR_EL2`, which is the state after `eret` and says nothing about
+	// the instructions still executing at EL2, and the direct EL1 branch set nothing at all. So from
+	// `ExitBootServices` returning until the kernel installs `VBAR_EL1` - which it does only after
+	// its MMU transition and a good deal of code - a delivered interrupt vectored through firmware
+	// vectors whose code and mappings had just stopped being valid. The result is an arbitrary old
+	// handler, exception recursion, or a silent reset in the handoff window.
+	//
+	// `daifset` sets all four masks (D, A, I, F). Nothing between here and the kernel's own vectors
+	// wants an interrupt.
+	unsafe { core::arch::asm!("msr daifset, #0xf", options(nomem, nostack, preserves_flags)) };
+
+	// AND PUBLISH THE HANDOFF, while the data cache is still on to publish it FROM. Everything below
+	// clears `SCTLR.C`, and a dirty line in a disabled cache is a byte the kernel never sees.
+	unsafe { publish_handoff(boot_info, dtb) };
+
 	// Mirror the QEMU `-kernel` entry state and enter the kernel's boot stub: turn
 	// the MMU + caches off (the stub sets translation up from scratch), synchronise,
 	// then branch to the entry with the BootInfo pointer in x0. The loader ran under
@@ -372,6 +390,82 @@ fn load_kernel(kernel: &[u8], reserved: &crate::ReservedKernel) -> u64 {
 		}
 	}
 	image.entry
+}
+
+// Clean `len` bytes at `addr` out of the data cache to the POINT OF COHERENCY, so a reader with the
+// data cache OFF sees them.
+//
+// This is the maintenance the handoff needs and did not have. The loader writes `BootInfo`, the
+// region array, the module descriptors and the module payloads in ordinary cached memory, then
+// clears `SCTLR.C` and branches into a kernel that reads all of it with the data cache disabled.
+// `dsb` orders cache maintenance and memory accesses; it does NOT write dirty lines back. So a
+// freshly written `BootInfo` - or, worst of all, the final `memmap_len` store, which happens after
+// everything else - can exist only in a dirty line of a cache that is about to be turned off, and
+// the kernel reads the old bytes underneath it. It would see a zero memory-map length, stale region
+// kinds, or module descriptors pointing at nothing, and would either refuse the boot or seed the
+// frame allocator from the wrong physical memory.
+//
+// `cvac` rather than `cvau`: the point of unification is where the instruction and data streams
+// agree, which is what newly loaded CODE needs. Data read with the cache off has to reach the point
+// of coherency, which is further out. The kernel's segments still go through `clean_to_pou` below,
+// because that is a different requirement about the same bytes.
+//
+// Coherent emulator memory does not reproduce any of this, so nothing here has been observed
+// failing - it is written from the architecture manual, like the EL2 sequence above.
+unsafe fn clean_to_poc(addr: u64, len: u64) {
+	if len == 0 {
+		return;
+	}
+	unsafe {
+		let ctr: u64;
+		core::arch::asm!("mrs {0}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+		// DminLine is log2 of the number of WORDS in the smallest data cache line, so the stride is
+		// `4 << DminLine`.
+		let dline: u64 = 4 << ((ctr >> 16) & 0xf);
+		let end = addr.saturating_add(len);
+		let mut at = addr & !(dline - 1);
+		while at < end {
+			core::arch::asm!("dc cvac, {0}", in(reg) at, options(nostack, preserves_flags));
+			at += dline;
+		}
+		core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+	}
+}
+
+// Publish everything the kernel is about to read with its caches off.
+//
+// Walked from the `BootInfo` itself rather than from a list kept in parallel with it: the structure
+// names the region array, the module descriptors and every module's payload, so whatever the
+// handoff actually contains is what gets cleaned - a list written out by hand here would be a second
+// statement of the same thing, and the one that goes stale.
+unsafe fn publish_handoff(boot_info: u64, dtb: u64) {
+	unsafe {
+		let info = boot_info as *const BootInfo;
+		clean_to_poc(boot_info, core::mem::size_of::<BootInfo>() as u64);
+		let (memmap, memmap_len) = (core::ptr::read_volatile(&raw const (*info).memmap), core::ptr::read_volatile(&raw const (*info).memmap_len));
+		if memmap != 0 && memmap_len != 0 {
+			clean_to_poc(memmap, memmap_len.saturating_mul(core::mem::size_of::<bootproto::MemRegion>() as u64));
+		}
+		let (modules, modules_len) = (core::ptr::read_volatile(&raw const (*info).modules), core::ptr::read_volatile(&raw const (*info).modules_len));
+		if modules != 0 && modules_len != 0 {
+			clean_to_poc(modules, modules_len.saturating_mul(core::mem::size_of::<bootproto::Module>() as u64));
+			let list = modules as *const bootproto::Module;
+			for index in 0..modules_len {
+				let module = &*list.add(index as usize);
+				clean_to_poc(module.addr, module.size);
+			}
+		}
+		// The device tree, when there is one. Its length is in its own header - a big-endian
+		// `totalsize` at offset 4 - so this cleans exactly the blob and not a guessed span. The
+		// firmware wrote it, and the firmware's writes are in the same cache this is about to
+		// disable.
+		if dtb != 0 {
+			let header = dtb as *const u32;
+			if u32::from_be(core::ptr::read_volatile(header)) == 0xd00d_feed {
+				clean_to_poc(dtb, u32::from_be(core::ptr::read_volatile(header.add(1))) as u64);
+			}
+		}
+	}
 }
 
 // Clean `len` bytes at `addr` out of the data cache to the point of unification and invalidate the
