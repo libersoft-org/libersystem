@@ -30,8 +30,18 @@ pub unsafe fn free_file(bs: *mut BootServices, bytes: &[u8]) {
 	unsafe { ((*bs).free_pages)(bytes.as_ptr() as u64, pages) };
 }
 
+// The longest path this can open, in UTF-16 code units INCLUDING the terminator - which is the unit
+// the firmware's `Open` takes and therefore the only one that describes the real boundary.
+//
+// It is stated here because two paths disagreed about it. The block-I/O bootstrap reader accepts any
+// UTF-8 path shorter than 128 BYTES and this encodes into 64 units, so the same bootstrap list could
+// work through Block I/O and fail through Simple File System - on a machine that has both, silently,
+// with the file simply absent. And a non-ASCII path makes bytes and units differ, so neither number
+// described the boundary even for its own reader. `MAX_PATH_UNITS` is the one both check against.
+pub const MAX_PATH_UNITS: usize = 64;
+
 pub fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> Option<&'static [u8]> {
-	let mut wname = [0u16; 64];
+	let mut wname = [0u16; MAX_PATH_UNITS];
 	// A name that does not fit is not this name: opening a truncated path would open a different
 	// file, which is worse than not opening one.
 	if !to_utf16(name, &mut wname) {

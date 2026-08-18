@@ -31,6 +31,19 @@ pub fn init() {
 	}
 }
 
+// How many times the fallback transmit polls the line-status register before giving the byte up.
+//
+// THE WAIT WAS UNBOUNDED. `while inb(COM1 + 5) & 0x20 == 0 {}` on a machine with no UART at 0x3F8 -
+// which is every machine UEFI actually promises anything about, since this address is QEMU's and
+// nothing else's - reads a floating bus forever. And this runs after the firmware console has been
+// released, so the symptom is a machine that stops with no output at all, in the one place where
+// the loader's whole job is to be able to say what happened. A bounded spin drops the byte instead,
+// which loses a diagnostic; the alternative loses the machine.
+//
+// Large enough that a real UART draining at 115200 - about 87 us per byte - is never cut off: this
+// is several milliseconds of polling on any plausible core.
+const TRANSMIT_SPINS: u32 = 1_000_000;
+
 // Transmit one byte, waiting for the holding register to drain.
 //
 // THE FIRMWARE'S CONSOLE FIRST. The address below is QEMU's, and UEFI promises nothing about a
@@ -40,7 +53,14 @@ pub fn write_byte(byte: u8) {
 		return;
 	}
 	unsafe {
-		while inb(COM1 + 5) & 0x20 == 0 {}
+		let mut spins = TRANSMIT_SPINS;
+		while inb(COM1 + 5) & 0x20 == 0 {
+			spins -= 1;
+			if spins == 0 {
+				return;
+			}
+			core::hint::spin_loop();
+		}
 		outb(COM1, byte);
 	}
 }

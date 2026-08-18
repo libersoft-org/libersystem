@@ -310,21 +310,49 @@ pub fn memory_top(bs: *mut BootServices) -> u64 {
 //
 // So the kernel is staged somewhere else and copied into place after the last firmware call, and
 // this is the part that has to find "somewhere else": ask, check, and ask again while HOLDING ON TO
-// THE REJECTS, because freeing one invites the next request to return the same block. The rejects
-// are firmware pages and `ExitBootServices` reclaims the lot.
+// THE REJECTS, because freeing one invites the next request to return the same block.
+//
+// AND THEN GIVES THEM BACK, on every path out. The comment used to say `ExitBootServices` reclaims
+// them, and that is not true of the map this loader hands over: `LOADER_DATA` translates to
+// `MEM_BOOTLOADER`, which the kernel's frame allocator never seeds - so every rejected candidate was
+// a kernel-sized block of memory lost for the life of the system, and the exhausted path also
+// allocated a seventeenth candidate it then dropped on the floor without even recording it.
 //
 // `None` when every attempt landed on the destination - a machine whose free memory is exactly where
 // the kernel goes, which is a refusal rather than a placement to force.
 pub fn staging_clear_of(bs: *mut BootServices, pages: usize, dest_low: u64, dest_high: u64) -> Option<u64> {
 	let mut rejects: [u64; 16] = [0; 16];
 	let mut reject_count = 0usize;
+	// Give every rejected candidate back once a decision has been made, whatever the decision is.
+	// Until then they stay allocated on purpose, so the next request cannot return the same block.
+	let release = |rejects: &[u64], count: usize| {
+		for &address in rejects.iter().take(count) {
+			unsafe { ((*bs).free_pages)(address, pages) };
+		}
+	};
 	loop {
-		let candidate = alloc_pages(bs, pages)?;
-		let span = (pages as u64).checked_mul(PAGE_SIZE).and_then(|bytes| candidate.checked_add(bytes))?;
+		let Some(candidate) = alloc_pages(bs, pages) else {
+			release(&rejects, reject_count);
+			return None;
+		};
+		let span = (pages as u64).checked_mul(PAGE_SIZE).and_then(|bytes| candidate.checked_add(bytes));
+		let Some(span) = span else {
+			// Arithmetic that cannot be represented is a candidate this cannot reason about, and it
+			// was previously returned to nobody: the `?` left the function with the candidate still
+			// allocated and every reject with it.
+			unsafe { ((*bs).free_pages)(candidate, pages) };
+			release(&rejects, reject_count);
+			return None;
+		};
 		if span <= dest_low || candidate >= dest_high {
+			release(&rejects, reject_count);
 			return Some(candidate);
 		}
 		if reject_count == rejects.len() {
+			// This candidate too - it is the one the old code allocated after the array was full
+			// and then lost without recording.
+			unsafe { ((*bs).free_pages)(candidate, pages) };
+			release(&rejects, reject_count);
 			return None;
 		}
 		rejects[reject_count] = candidate;

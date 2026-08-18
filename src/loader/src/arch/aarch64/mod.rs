@@ -60,7 +60,13 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	};
 	// The factory archive too, when the medium carries one: the kernel test suite uses it as its
 	// fixture, and a shipping medium simply has none.
-	let volume_pkg = root.and_then(|root| crate::read_file(bs, root, crate::VOLUME_PKG_FILE));
+	// THROUGH THE SAME FALLBACK AS EVERYTHING ELSE. This read the factory archive ONLY through the
+	// firmware's file protocol, while the kernel, the live volume and the bootstrap files all go
+	// through `read_boot_file` - which falls back to reading the medium as FAT when the firmware
+	// declines to mount it. On exactly that firmware, and only there, the module was silently
+	// absent: a boot that looks identical and a test fixture that is not delivered, on the machines
+	// this loader has a fallback for in the first place.
+	let volume_pkg = crate::read_boot_file(bs, root, crate::VOLUME_PKG_FILE);
 	let boot_info = build_boot_info(bs, dtb, init_pkg, volume_pkg);
 
 	// ExitBootServices is the last firmware call; after it no service may be used.
@@ -536,7 +542,15 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle, regions: *mut
 	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
 		panic!("loader: the firmware did not describe its memory map");
 	}
-	let cap = map_size + desc_size * 16;
+	// CHECKED, and kept as the buffer's real capacity. This was `map_size + desc_size * 16` with
+	// unchecked multiplication and addition, on values the FIRMWARE reports - so a hostile or simply
+	// broken `desc_size` wraps the capacity to a small number and the allocation that follows is
+	// too small for the map that is about to be written into it. The margin exists because the map
+	// can grow between the sizing call and the real one; it is sixteen descriptors and it is now
+	// arithmetic that cannot wrap.
+	let Some(cap) = desc_size.checked_mul(16).and_then(|margin| map_size.checked_add(margin)) else {
+		panic!("loader: the firmware's memory-map dimensions do not fit an allocation");
+	};
 	let buf = crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
@@ -560,8 +574,22 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle, regions: *mut
 	loop {
 		let mut size = cap;
 		let status = unsafe { ((*bs).get_memory_map)(&mut size, buf, &mut key, &mut desc_size, &mut desc_ver) };
+		// BUFFER_TOO_SMALL IS A CAPACITY STATE, not a generic failure. The map can grow between the
+		// sizing call and this one - that is why there is a margin at all - and on the retry after a
+		// stale key it can grow again. Reported as "get_memory_map failed", the one thing the reader
+		// could act on was the one thing the message did not say.
+		if status == uefi::STATUS_BUFFER_TOO_SMALL {
+			panic!("loader: the firmware's memory map outgrew the buffer sized for it; this loader cannot resize after the last allocation");
+		}
 		if uefi::is_error(status) {
 			panic!("get_memory_map failed");
+		}
+		// AND A SUCCESSFUL CALL THAT REPORTS MORE THAN THE BUFFER HOLDS IS REFUSED BEFORE IT IS
+		// WALKED. `translate_map` reads `size` bytes out of a buffer of `cap`; nothing compared the
+		// two, so firmware answering with a size past its own buffer would have been read straight
+		// past the end of the allocation.
+		if size > cap {
+			panic!("loader: the firmware reports a memory map larger than the buffer it was given");
 		}
 		// The heap lives on firmware pages, so it stops being usable exactly here. Retiring it
 		// makes a later allocation fail loudly instead of handing out memory the loader no

@@ -56,6 +56,22 @@ const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 // (the conventional higher-half direct map base), so no kernel constant changes.
 pub const HHDM_OFFSET: u64 = 0xffff_8000_0000_0000;
 
+// THE HIGHEST PHYSICAL ADDRESS THE DIRECT MAP MAY COVER, and the reason there has to be one.
+//
+// `virt = phys + HHDM_OFFSET` is a fixed offset with nothing bounding the physical side. The kernel
+// is linked at 0xffff_ffff_8000_0000, so a physical top of 0x7fff_8000_0000 - 128 TiB, which is
+// representable and which a single high reserved descriptor in a sparse firmware map is enough to
+// produce, because `memory_top` is a scalar over ALL descriptor kinds - puts the last HHDM page
+// exactly on the kernel's own text. Higher than that and the addition leaves the four-level
+// canonical window entirely and aliases page-table indices.
+//
+// Nothing checked it. The map was simply built, and the collision would appear as the kernel being
+// overwritten by a direct-map write, or as a table walk into a huge leaf where a 4 kB mapping was
+// expected. So: a stated ceiling, checked before any table is built, with a message naming the
+// number - a machine this loader cannot map is a refusal, not a map that silently overlaps.
+pub const KERNEL_VA_BASE: u64 = 0xffff_ffff_8000_0000;
+pub const HHDM_MAX_PHYS: u64 = KERNEL_VA_BASE - HHDM_OFFSET;
+
 // Builds and owns the page hierarchy under construction.
 pub struct PageTables {
 	bs: *mut BootServices,

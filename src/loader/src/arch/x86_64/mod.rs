@@ -26,9 +26,15 @@ use crate::VOLUME_PKG_FILE;
 // LiveCD needs no disk and never writes to the medium it booted from. Passed straight through as
 // a module; the kernel hands it to the storage service, which is where it becomes a volume.
 
-// Round `v` up to a multiple of `align` (a power of two).
+// Round `v` up to a multiple of `align` (a power of two), saturating rather than wrapping.
+//
+// It was `(v + align - 1) & !(align - 1)`, which WRAPS to a small number for a `v` near the top of
+// the address space - and both callers feed it a firmware-reported address plus a firmware-reported
+// size. A wrapped ceiling is a map built over the wrong interval, which is the worst answer of the
+// three available; saturating gives the largest representable one, and every caller then compares
+// it against the direct map's ceiling.
 fn align_up(v: u64, align: u64) -> u64 {
-	(v + align - 1) & !(align - 1)
+	v.checked_add(align - 1).map_or(u64::MAX & !(align - 1), |sum| sum & !(align - 1))
 }
 
 // The kernel stack the loader hands over (in pages of 4 KiB): 128 KiB.
@@ -70,7 +76,13 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// boot (P02M0108), so a shipping image carries no `volume.pkg` at all - it survives only as the
 	// kernel test suite's fixture. A machine without one boots exactly as before; the module is
 	// simply absent, which is what the kernel's lookup already expects.
-	let volume_pkg = root.and_then(|root| read_file(bs, root, VOLUME_PKG_FILE));
+	// THROUGH THE SAME FALLBACK AS EVERYTHING ELSE. This read the factory archive ONLY through the
+	// firmware's file protocol, while the kernel, the live volume and the bootstrap files all go
+	// through `read_boot_file` - which falls back to reading the medium as FAT when the firmware
+	// declines to mount it. On exactly that firmware, and only there, the module was silently
+	// absent: a boot that looks identical and a test fixture that is not delivered, on the machines
+	// this loader has a fallback for in the first place.
+	let volume_pkg = crate::read_boot_file(bs, root, VOLUME_PKG_FILE);
 	serial::write_str("loader: packages loaded\n");
 
 	// Load the kernel ELF: allocate + copy each PT_LOAD segment, record its
@@ -127,7 +139,19 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	if top == 0 {
 		panic!("loader: the firmware would not give a memory map, so there is no RAM ceiling to build the direct map over");
 	}
-	let ram_top = align_up(top, PAGE_2MB);
+	// AND IT HAS TO FIT UNDER THE KERNEL. `HHDM_MAX_PHYS` states where the fixed-offset direct map
+	// runs into the kernel's own virtual range; a physical top above it is a machine this loader
+	// cannot map with this offset, and saying so is the only honest answer. Checked BEFORE the
+	// rounding, because the rounding is itself an addition that can wrap.
+	if top > paging::HHDM_MAX_PHYS {
+		panic!("loader: the firmware reports memory above the direct map's ceiling, which this loader cannot map at a fixed offset");
+	}
+	let Some(ram_top) = top.checked_add(PAGE_2MB - 1).map(|v| v & !(PAGE_2MB - 1)) else {
+		panic!("loader: the memory ceiling cannot be rounded to a 2 MiB boundary without wrapping");
+	};
+	if ram_top > paging::HHDM_MAX_PHYS {
+		panic!("loader: rounding the memory ceiling puts it above the direct map's ceiling");
+	}
 
 	// Build the page hierarchy: HHDM over all RAM, the framebuffer uncacheable,
 	// a low identity map for the CR3 switch, and the kernel's segments.
@@ -151,7 +175,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	map_mmio_uncacheable(bs, &mut tables, ram_top);
 	if fb.present {
 		let fb_base = align_down(fb.phys, PAGE_2MB);
-		let fb_end = align_up(fb.phys + fb.size, PAGE_2MB);
+		let fb_end = align_up(fb.phys.saturating_add(fb.size), PAGE_2MB);
 		tables.map_hhdm(fb_base, fb_end - fb_base, true).expect("loader: framebuffer map failed");
 	}
 	for seg in &segments[..seg_count] {
@@ -409,7 +433,15 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
 		panic!("loader: the firmware did not describe its memory map");
 	}
-	let cap = map_size + desc_size * 16;
+	// CHECKED, and kept as the buffer's real capacity. This was `map_size + desc_size * 16` with
+	// unchecked multiplication and addition, on values the FIRMWARE reports - so a hostile or simply
+	// broken `desc_size` wraps the capacity to a small number and the allocation that follows is
+	// too small for the map that is about to be written into it. The margin exists because the map
+	// can grow between the sizing call and the real one; it is sixteen descriptors and it is now
+	// arithmetic that cannot wrap.
+	let Some(cap) = desc_size.checked_mul(16).and_then(|margin| map_size.checked_add(margin)) else {
+		panic!("loader: the firmware's memory-map dimensions do not fit an allocation");
+	};
 	let buf = alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
@@ -433,8 +465,22 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 	loop {
 		let mut size = cap;
 		let status = unsafe { ((*bs).get_memory_map)(&mut size, buf, &mut key, &mut desc_size, &mut desc_ver) };
+		// BUFFER_TOO_SMALL IS A CAPACITY STATE, not a generic failure. The map can grow between the
+		// sizing call and this one - that is why there is a margin at all - and on the retry after a
+		// stale key it can grow again. Reported as "get_memory_map failed", the one thing the reader
+		// could act on was the one thing the message did not say.
+		if status == uefi::STATUS_BUFFER_TOO_SMALL {
+			panic!("loader: the firmware's memory map outgrew the buffer sized for it; this loader cannot resize after the last allocation");
+		}
 		if uefi::is_error(status) {
 			panic!("get_memory_map failed");
+		}
+		// AND A SUCCESSFUL CALL THAT REPORTS MORE THAN THE BUFFER HOLDS IS REFUSED BEFORE IT IS
+		// WALKED. `translate_map` reads `size` bytes out of a buffer of `cap`; nothing compared the
+		// two, so firmware answering with a size past its own buffer would have been read straight
+		// past the end of the allocation.
+		if size > cap {
+			panic!("loader: the firmware reports a memory map larger than the buffer it was given");
 		}
 		// FATAL, not silent, and said HERE because this is where there is a serial port to say it
 		// on: `translate_map` refuses a map with more regions than the boot protocol carries rather

@@ -179,6 +179,16 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// reservation costs it nothing, while the backends that DO write there refuse to place into a
 	// span this loader does not own. What is no longer possible is proceeding on the strength of a
 	// status nobody looked at.
+	// NOT ON x86_64, which never writes to `p_paddr` at all: it places every segment in frames the
+	// firmware chose and ignores this value entirely (`hand_off` takes it as `_reserved`). The pass
+	// still ran there, and every reservation it managed to take was a kernel-sized block of
+	// `LOADER_DATA` nobody would ever use - which the kernel's map calls `MEM_BOOTLOADER` and never
+	// seeds, so it is lost for the life of the system. Today's artifact has high `p_paddr` values so
+	// the fixed requests fail and the leak is zero; a valid low-physical layout would strand the
+	// whole image.
+	#[cfg(target_arch = "x86_64")]
+	let reserved = ReservedKernel::EMPTY;
+	#[cfg(not(target_arch = "x86_64"))]
 	let reserved = reserve_kernel(bs, kernel);
 	// And the source may not sit in the destination.
 	let kernel = stage_kernel_clear_of_destination(bs, kernel, &reserved);
@@ -213,6 +223,16 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 			let mut name = [0u8; 128];
 			if path.len() >= name.len() {
+				return None;
+			}
+			// AND THE LIMIT THE FIRMWARE READER ACTUALLY HAS. This accepted any path under 128 bytes
+			// while `read_file` encodes into `MAX_PATH_UNITS` UTF-16 units, so the same bootstrap
+			// list could work through Block I/O and fail through Simple File System - on a machine
+			// with both, with the file simply absent and nothing said. Counted in UTF-16 units, not
+			// bytes, because a non-ASCII path makes the two differ and it is units the firmware
+			// counts. One unit is reserved for the terminator, as in the encoder.
+			let units = core::str::from_utf8(path).ok()?.chars().map(char::len_utf16).sum::<usize>();
+			if units + 1 > uefi::file::MAX_PATH_UNITS {
 				return None;
 			}
 			for (i, &b) in path.iter().enumerate() {
@@ -346,7 +366,28 @@ fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) ->
 	// firmware read (page-backed, freeable) and the FAT fallback (its own buffer, not), and the
 	// return type does not say which. Handing the wrong one to `free_pages` is worse than the leak.
 	// Closing this needs the ownership expressed in the type; see LDR-012.
-	uefi::disk::parse_pairing(read_boot_file(bs, root, "etc/system-volume.uuid")?)
+	// A FILE THAT IS THERE AND UNREADABLE IS NOT A MEDIUM WITH NO PAIRING.
+	//
+	// Every outcome used to collapse through `Option`: no file, an unreadable file, and 36 bytes of
+	// something that is not a UUID all became `None`, and the caller reads `None` as "this medium
+	// names no system volume" and takes the FIRST LiberFS volume the firmware enumerates. That is
+	// the exact behaviour the pairing exists to prevent - two LiberSystem disks in one machine,
+	// enumeration order deciding which one boots - reinstated by a typo in the file that was meant
+	// to stop it.
+	//
+	// So the two are distinguished. A medium with no pairing file is the rescue stick the fallback
+	// is for. A medium whose pairing file cannot be parsed is a medium that says which volume it
+	// wants and cannot be understood, and this refuses rather than guessing at it.
+	let Some(bytes) = read_boot_file(bs, root, "etc/system-volume.uuid") else {
+		return None;
+	};
+	match uefi::disk::parse_pairing(bytes) {
+		Some(uuid) => Some(uuid),
+		None => {
+			arch::serial::write_str("loader: FATAL - the boot medium carries a pairing file that is not a uuid, so which volume it wants cannot be established\n");
+			arch::halt();
+		}
+	}
 }
 
 // The live medium's system volume, read once. It is needed twice - to assemble the bootstrap set

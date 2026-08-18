@@ -90,7 +90,13 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		Some(archive) => Some(archive),
 		None => crate::read_boot_file(bs, root, crate::INIT_PKG_FILE),
 	};
-	let volume_pkg = root.and_then(|root| crate::read_file(bs, root, crate::VOLUME_PKG_FILE));
+	// THROUGH THE SAME FALLBACK AS EVERYTHING ELSE. This read the factory archive ONLY through the
+	// firmware's file protocol, while the kernel, the live volume and the bootstrap files all go
+	// through `read_boot_file` - which falls back to reading the medium as FAT when the firmware
+	// declines to mount it. On exactly that firmware, and only there, the module was silently
+	// absent: a boot that looks identical and a test fixture that is not delivered, on the machines
+	// this loader has a fallback for in the first place.
+	let volume_pkg = crate::read_boot_file(bs, root, crate::VOLUME_PKG_FILE);
 	let boot_info = build_boot_info(bs, dtb, init_pkg, volume_pkg);
 
 	// Everything the placement will overwrite has to be somewhere else FIRST - checked while
@@ -578,18 +584,38 @@ fn dtb_total_size(dtb: u64) -> u64 {
 	u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as u64
 }
 
-// Ask the RISCV_EFI_BOOT_PROTOCOL for the boot hart id; fall back to 0 if the firmware
-// does not expose it (the kernel then treats hart 0 as the boot hart).
+// Ask the RISCV_EFI_BOOT_PROTOCOL for the boot hart id.
+//
+// EVERY FAILURE USED TO BE HART ZERO, silently. A missing protocol, a null interface and a failing
+// call all returned 0, and the kernel records that as THE boot hart and excludes it when starting
+// secondaries - so on a machine that booted on any other hart, the kernel would exclude a hart that
+// is idle and try to start the one it is already running on. Nothing anywhere said which of "the
+// firmware told us zero" and "we could not ask" had happened.
+//
+// UEFI on RISC-V requires platform firmware to implement this protocol and requires an OS loader to
+// take the boot hart from it. So each failure is named, and the fallback is announced as the guess
+// it is rather than returned as a value. The revision is checked too: it is in the structure
+// precisely so a consumer can tell whether the function pointer after it means what it thinks.
 fn boot_hartid(bs: *mut BootServices) -> u64 {
 	let mut iface: *mut core::ffi::c_void = core::ptr::null_mut();
 	let status = unsafe { ((*bs).locate_protocol)(&RISCV_EFI_BOOT_PROTOCOL_GUID, core::ptr::null_mut(), &mut iface) };
 	if uefi::is_error(status) || iface.is_null() {
+		serial::write_str("loader: WARNING - the firmware exposes no RISCV_EFI_BOOT_PROTOCOL, which UEFI requires it to; assuming hart 0 is the boot hart\n");
 		return 0;
 	}
 	let proto = iface as *mut RiscvEfiBootProtocol;
+	let revision = unsafe { (*proto).revision };
+	if revision == 0 {
+		serial::write_str("loader: WARNING - RISCV_EFI_BOOT_PROTOCOL reports revision 0, so its boot-hart entry cannot be trusted; assuming hart 0\n");
+		return 0;
+	}
 	let mut hartid: usize = 0;
 	let status = unsafe { ((*proto).get_boot_hartid)(proto, &mut hartid) };
-	if uefi::is_error(status) { 0 } else { hartid as u64 }
+	if uefi::is_error(status) {
+		serial::write_str("loader: WARNING - RISCV_EFI_BOOT_PROTOCOL refused to report the boot hart; assuming hart 0\n");
+		return 0;
+	}
+	hartid as u64
 }
 
 // Scan the firmware configuration table for the flattened device tree, returning its
@@ -630,7 +656,15 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle, regions: *mut
 	if status != uefi::STATUS_BUFFER_TOO_SMALL || desc_size == 0 || desc_size < core::mem::size_of::<uefi::MemoryDescriptor>() {
 		panic!("loader: the firmware did not describe its memory map");
 	}
-	let cap = map_size + desc_size * 16;
+	// CHECKED, and kept as the buffer's real capacity. This was `map_size + desc_size * 16` with
+	// unchecked multiplication and addition, on values the FIRMWARE reports - so a hostile or simply
+	// broken `desc_size` wraps the capacity to a small number and the allocation that follows is
+	// too small for the map that is about to be written into it. The margin exists because the map
+	// can grow between the sizing call and the real one; it is sixteen descriptors and it is now
+	// arithmetic that cannot wrap.
+	let Some(cap) = desc_size.checked_mul(16).and_then(|margin| map_size.checked_add(margin)) else {
+		panic!("loader: the firmware's memory-map dimensions do not fit an allocation");
+	};
 	let buf = crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
@@ -653,8 +687,22 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle, regions: *mut
 	loop {
 		let mut size = cap;
 		let status = unsafe { ((*bs).get_memory_map)(&mut size, buf, &mut key, &mut desc_size, &mut desc_ver) };
+		// BUFFER_TOO_SMALL IS A CAPACITY STATE, not a generic failure. The map can grow between the
+		// sizing call and this one - that is why there is a margin at all - and on the retry after a
+		// stale key it can grow again. Reported as "get_memory_map failed", the one thing the reader
+		// could act on was the one thing the message did not say.
+		if status == uefi::STATUS_BUFFER_TOO_SMALL {
+			panic!("loader: the firmware's memory map outgrew the buffer sized for it; this loader cannot resize after the last allocation");
+		}
 		if uefi::is_error(status) {
 			panic!("get_memory_map failed");
+		}
+		// AND A SUCCESSFUL CALL THAT REPORTS MORE THAN THE BUFFER HOLDS IS REFUSED BEFORE IT IS
+		// WALKED. `translate_map` reads `size` bytes out of a buffer of `cap`; nothing compared the
+		// two, so firmware answering with a size past its own buffer would have been read straight
+		// past the end of the allocation.
+		if size > cap {
+			panic!("loader: the firmware reports a memory map larger than the buffer it was given");
 		}
 		// The heap lives on firmware pages, so it stops being usable exactly here. Retiring it
 		// makes a later allocation fail loudly instead of handing out memory the loader no
