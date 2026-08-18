@@ -800,6 +800,7 @@ def cmd_dev_up(args):
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
 	timing_event('qemu', 'build-start')
 	guest = subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
+	record_lab_guest(guest)
 	# The build and the boot are different waits and want different budgets. `just run` builds
 	# before it starts QEMU, and a tree needing a full rebuild - anything that touched the build
 	# tooling invalidates every artifact's cache key - can spend longer building than any
@@ -2279,6 +2280,7 @@ def cmd_scenario_cold(args):
 	guest_env = dict(env, DEV_PROFILE='1', SERIAL=f'file:{log}')
 	print(f'lab: booting {target}; serial log {os.path.relpath(log, SRC)}')
 	guest = subprocess.Popen(['bash', 'boot/qemu-run.sh', target, kernel], cwd=SRC, env=guest_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+	record_lab_guest(guest)
 	failures = 0
 	try:
 		CHANNEL_OVERRIDE = socket_path
@@ -2363,31 +2365,38 @@ def cmd_scenario_cold(args):
 # owns: a developer with an unrelated QEMU open - another project, a VM they were mid-way through -
 # lost it to `lab boot`, `lab test` or `lab down`. The pattern cannot tell whose guest it is.
 #
-# A pid file can. QEMU writes one with `-pidfile`, and this kills that pid and only that pid, after
-# checking the process is actually a QEMU: a stale pid file whose number has been reused by something
-# unrelated is the other half of the same mistake.
-LAB_PIDFILE = os.path.join(BUILD, 'lab-qemu.pid')
+# The lab starts its guest with `start_new_session=True`, so it has a process group of its own.
+# Recording that group at launch and killing it - after checking the group still holds a QEMU - is
+# precise, needs no QEMU flag, and cannot reach a process the lab did not start.
+LAB_PGIDFILE = os.path.join(BUILD, 'lab-guest.pgid')
+
+
+def record_lab_guest(process):
+	"""Remember the process group the lab just started, so it can kill that and nothing else."""
+	try:
+		os.makedirs(BUILD, exist_ok=True)
+		with open(LAB_PGIDFILE, 'w') as handle:
+			handle.write(str(os.getpgid(process.pid)))
+	except OSError:
+		pass
 
 
 def kill_lab_guest():
 	try:
-		with open(LAB_PIDFILE) as handle:
-			pid = int(handle.read().strip())
+		with open(LAB_PGIDFILE) as handle:
+			pgid = int(handle.read().strip())
 	except (OSError, ValueError):
 		return
-	try:
-		with open(f'/proc/{pid}/cmdline', 'rb') as handle:
-			cmdline = handle.read().decode('utf-8', 'replace')
-	except OSError:
-		# Already gone; the file is stale.
-		cmdline = ''
-	if 'qemu-system-' in cmdline:
+	# Only if that group still holds a QEMU. A recorded group whose number has been reused by
+	# something unrelated is the same mistake one step along, and `pgrep -g` answers it directly.
+	held = subprocess.run(['pgrep', '-g', str(pgid), '-f', 'qemu-system'], capture_output=True)
+	if held.returncode == 0:
 		try:
-			os.kill(pid, signal.SIGKILL)
+			os.killpg(pgid, signal.SIGKILL)
 		except OSError:
 			pass
 	try:
-		os.unlink(LAB_PIDFILE)
+		os.unlink(LAB_PGIDFILE)
 	except OSError:
 		pass
 
@@ -2408,7 +2417,7 @@ def cmd_boot(args):
 	# boot output is ever lost between startup and the connect below.
 	env = dict(os.environ, SERIAL=f'unix:{SERIAL_SOCK},server')
 	qemu_log = open(QEMU_LOG, 'wb')
-	subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
+	record_lab_guest(subprocess.Popen(['just', 'run'] + displays, cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True))
 	started = time.time()
 	serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	while True:

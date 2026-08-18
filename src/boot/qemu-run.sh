@@ -52,12 +52,18 @@ qemu_parse_displays() {
 
 	DISPLAY_ARGS=()
 	if [[ "$want_vnc" == "1" ]]; then
-		DISPLAY_ARGS+=(-vnc "${VNC_ADDR:-0.0.0.0:0}")
+		# LOOPBACK BY DEFAULT. This bound 0.0.0.0 with no password, so enabling VNC for a moment put
+		# an unauthenticated console of the whole machine on every interface the host has - a
+		# development convenience that is a remote console to anyone who can reach the port. Binding
+		# elsewhere is now an explicit act: set VNC_ADDR.
+		DISPLAY_ARGS+=(-vnc "${VNC_ADDR:-127.0.0.1:0}")
 	else
 		DISPLAY_ARGS+=(-display none)
 	fi
 	if [[ "$want_spice" == "1" ]]; then
-		DISPLAY_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=0.0.0.0,disable-ticketing=on")
+		# Same rule as VNC above, and `disable-ticketing=on` means there is no password either, so
+		# the address is the only thing standing between the guest's console and the network.
+		DISPLAY_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=${SPICE_ADDR:-127.0.0.1},disable-ticketing=on")
 	fi
 }
 
