@@ -181,6 +181,14 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// last firmware call before ExitBootServices, so the region translation (no
 	// allocation) happens inline and the whole thing retries if the map changed.
 	let region_count = finalize_and_exit(bs, image_handle, regions_phys as *mut MemRegion);
+	// INTERRUPTS OFF THE MOMENT BOOT SERVICES ARE GONE, not later.
+	//
+	// UEFI runs with interrupts ENABLED, and the `cli` below sat inside the handoff asm - after this
+	// store and after everything between. From `ExitBootServices` returning until then, the
+	// firmware's handlers no longer exist and the kernel's IDT does not exist yet, so an interrupt
+	// arriving in that window vectors through a table nobody owns. Nothing here needs interrupts;
+	// closing the window costs one instruction.
+	unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) };
 	unsafe { (*boot_info).memmap_len = region_count as u64 };
 
 	// Boot services are gone. Switch to the kernel's page tables and jump to its
@@ -188,9 +196,9 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let boot_info_virt = HHDM_OFFSET + boot_info_phys;
 	unsafe {
 		asm!(
-			// INTERRUPTS OFF ACROSS THE HANDOFF. After `ExitBootServices` the firmware's handlers
-			// are gone and the kernel installs its IDT some way into `kmain`, so an interrupt in
-			// this window vectors through a table nobody owns. The window is small and real.
+			// Already masked immediately after `ExitBootServices` - see above. Kept here because
+			// this block must be reachable only with interrupts off and saying so twice is cheaper
+			// than depending on the caller.
 			"cli",
 			"mov cr3, {cr3}",
 			"mov rsp, {stack}",

@@ -411,8 +411,15 @@ fi
 # the unsuffixed name it has always had, so nothing that owns one has to learn a new path; the
 # other targets get their own so a one-shot run on one of them cannot be mistaken for it, or
 # collide with it while it is up.
+#
+# A COLD RUN NEVER TAKES THE UNSUFFIXED NAME, whatever the target. `scenario-cold` on x86 selected
+# exactly this path, unlinked it without checking whether the persistent instance was up, and then
+# bound it - so a cold run and the persistent instance this milestone exists to provide destroyed
+# each other. The suffix is what keeps them apart, and x86 was the one target that did not get one.
 dev_channel_socket() {
-	if [[ "$TARGET_ARCH" == "x86_64" ]]; then
+	if [[ "${COLD:-0}" == "1" ]]; then
+		printf '%s/dev-channel-cold-%s.sock' "$QEMU_BUILD_DIR" "$TARGET_ARCH"
+	elif [[ "$TARGET_ARCH" == "x86_64" ]]; then
 		printf '%s/dev-channel.sock' "$QEMU_BUILD_DIR"
 	else
 		printf '%s/dev-channel-%s.sock' "$QEMU_BUILD_DIR" "$TARGET_ARCH"
@@ -687,8 +694,14 @@ qemu_run_x86_64() {
 	fi
 
 	# Interactive control sockets used by screenshot.sh and lab.py.
+	# Same rule as `dev_channel_socket`: a cold run gets its own monitor and QMP names, so it cannot
+	# remove or bind the persistent instance's.
 	local monitor_socket="$QEMU_BUILD_DIR/qemu-monitor.sock"
 	local qmp_socket="$QEMU_BUILD_DIR/qemu-qmp.sock"
+	if [[ "${COLD:-0}" == "1" ]]; then
+		monitor_socket="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
+		qmp_socket="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+	fi
 	rm -f "$monitor_socket" "$qmp_socket"
 	qemu_args+=(-monitor "unix:$monitor_socket,server,nowait")
 	qemu_args+=(-qmp "unix:$qmp_socket,server,nowait")

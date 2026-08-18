@@ -2262,7 +2262,11 @@ def cmd_scenario_cold(args):
 	if subprocess.run(['cargo', 'build', '--target', triple], cwd=os.path.join(SRC, 'kernel'), env=env).returncode != 0:
 		die(f'the {target} kernel did not build')
 
-	socket_path = DEV_CHANNEL_SOCK if target == 'x86_64' else os.path.join(BUILD, f'dev-channel-{target}.sock')
+	# A NAMESPACE OF ITS OWN, on every target. This took the persistent instance's unsuffixed x86
+	# path and unlinked it below without checking whether that instance was up - so a cold run and
+	# the persistent instance destroyed each other. `COLD=1` in the guest environment makes the
+	# runner bind the matching names.
+	socket_path = os.path.join(BUILD, f'dev-channel-cold-{target}.sock')
 	kernel = os.path.join(BUILD_ROOT, 'cargo', 'kernel', triple, 'debug', 'kernel')
 	log = os.path.join(BUILD, f'cold-{target}.log')
 	with contextlib.suppress(OSError):
@@ -2277,7 +2281,7 @@ def cmd_scenario_cold(args):
 	# boot, and this is a new one.
 	with contextlib.suppress(OSError):
 		os.remove(os.path.join(BUILD, 'dev-scenarios-seen'))
-	guest_env = dict(env, DEV_PROFILE='1', SERIAL=f'file:{log}')
+	guest_env = dict(env, DEV_PROFILE='1', COLD='1', SERIAL=f'file:{log}')
 	print(f'lab: booting {target}; serial log {os.path.relpath(log, SRC)}')
 	guest = subprocess.Popen(['bash', 'boot/qemu-run.sh', target, kernel], cwd=SRC, env=guest_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 	record_lab_guest(guest)
@@ -2288,9 +2292,8 @@ def cmd_scenario_cold(args):
 		# An emulated guest is slower than the native one every scenario deadline was written
 		# against, by roughly an order of magnitude on the interactive steps.
 		scenario.TIME_SCALE = 1.0 if target == 'x86_64' else 10.0
-		if target != 'x86_64':
-			MON_OVERRIDE = os.path.join(BUILD, f'qemu-monitor-{target}.sock')
-			QMP_OVERRIDE = os.path.join(BUILD, f'qemu-qmp-{target}.sock')
+		MON_OVERRIDE = os.path.join(BUILD, f'qemu-monitor-cold-{target}.sock')
+		QMP_OVERRIDE = os.path.join(BUILD, f'qemu-qmp-cold-{target}.sock')
 		# The guest is answering when it answers, not when a timer says so: poll the handshake
 		# rather than sleeping for a number that would be wrong on both a fast and a slow target.
 		# Generous on purpose. An emulated aarch64 or riscv64 guest takes minutes to bring its
