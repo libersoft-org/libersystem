@@ -179,7 +179,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0112 - Gates that stopped checking](P02M0112.md)
 - [x] [P02M0113 - LiberFS: what a mount may not do, and what a checksum does not prove](P02M0113.md)
 - [x] [P02M0114 - LiberFS: what a mount may still lose, and what a parser may not quietly repair](P02M0114.md)
-- [ ] [P02M0115 - The kernel's lowest layers do not yet keep the promises the upper ones make](P02M0115.md)
+- [x] [P02M0115 - The kernel's lowest layers do not yet keep the promises the upper ones make](P02M0115.md)
 - [x] [P02M0116 - What P02M0114 left in the disk probe, and three gaps it opened itself](P02M0116.md)
 - [x] [P02M0117 - A wait set the kernel keeps](P02M0117.md)
 - [x] [P02M0118 - Testing that scales with the change, not with the tree](P02M0118.md)

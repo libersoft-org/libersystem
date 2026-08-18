@@ -191,7 +191,10 @@ impl<const N: usize> MsiRegistry<N> {
 	// the CONTROLLER rather than at the device, or one acquired and never programmed. Anything
 	// behind a device's own MSI-X table wants `retire`.
 	pub fn free(&self, slot: usize) {
-		*self.bound[slot].lock() = None;
+		// Under the slot's own lock, for the reason spelled out on `retire`: the binding and the
+		// lifecycle flags are one state and have to change together.
+		let mut bound = self.bound[slot].lock();
+		*bound = None;
 		self.pending[slot].store(false, Ordering::Release);
 		self.owner[slot].store(u32::MAX, Ordering::Release);
 		self.used[slot].store(false, Ordering::Release);
@@ -202,7 +205,15 @@ impl<const N: usize> MsiRegistry<N> {
 	// The vector stays out of circulation until `release_for_device` is told the device stopped.
 	// A slot with no owner has no device to wait for and is freed outright.
 	pub fn retire(&self, slot: usize) {
-		*self.bound[slot].lock() = None;
+		// CLEARING THE BINDING AND PUBLISHING `pending` ARE ONE TRANSITION, under the slot's lock.
+		//
+		// They were two, and `release_for_device` scanned `pending` without that lock. A device
+		// quiesce landing between them saw `pending == false`, released nothing, and returned zero;
+		// `retire` then marked the slot pending - with the one lifecycle event that could ever
+		// release it already past. That vector was out of circulation for the life of the boot, and
+		// repeating the race exhausts the MSI space a slot at a time.
+		let mut bound = self.bound[slot].lock();
+		*bound = None;
 		if self.owner[slot].load(Ordering::Acquire) == u32::MAX {
 			self.used[slot].store(false, Ordering::Release);
 			return;
@@ -216,6 +227,10 @@ impl<const N: usize> MsiRegistry<N> {
 	pub fn release_for_device(&self, device: u32) -> usize {
 		let mut released = 0;
 		for slot in 0..N {
+			// The same lock `retire` publishes under, so this either sees a slot before its
+			// retirement began or after it completed - never in between, which is the window that
+			// stranded a vector permanently.
+			let _bound = self.bound[slot].lock();
 			if self.pending[slot].load(Ordering::Acquire) && self.owner[slot].load(Ordering::Acquire) == device {
 				self.pending[slot].store(false, Ordering::Release);
 				self.owner[slot].store(u32::MAX, Ordering::Release);

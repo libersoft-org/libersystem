@@ -102,6 +102,27 @@ Must NOT be able to:
   its DMA access, and only the supervisor decides whether to restart it.
 ```
 
+**The first of those is enforced for the CPU and not for the device, and that is a
+stated limit rather than an oversight.** There is no IOMMU. A DMA capability hands
+the driver the buffer's raw physical addresses so it can program the device's
+descriptor rings, and nothing between the device and RAM checks what those rings
+contain. A driver that programs its device to read or write outside its own buffer
+succeeds. The kernel's own mappings bound where the DRIVER may reach; they do not
+bound where its DEVICE may reach.
+
+So a driver holding a DMA-capable device is, for memory-safety purposes, inside the
+TCB, and the properties above hold against a driver that is buggy or hostile in
+software but not against one that turns its device into an arbitrary read/write
+primitive. Three things narrow the window and none of them closes it: bus mastering
+stays disabled until ownership is established, reclaim requires a quiescence claim
+from the holder of the device's own DeviceMemory capability, and a faulted driver's
+DMA frames are quarantined rather than reused immediately.
+
+Closing it means per-device IOMMU domains with only live DMA capabilities mapped in.
+That is tracked as a non-goal below, with the same standing as the others: known,
+priced, and not yet done. `AI/audit/drivers.md` reports this boundary from the driver
+side as DRV-015 and it is the same boundary.
+
 ## 3. Enforced boundaries
 
 The boundaries below are mechanisms in the kernel (TCB) plus one policy layer in
@@ -213,5 +234,9 @@ The following are out of scope here and are tracked in the Concept's
 - physical attacks (cold boot, bus probing) and encrypted user volumes;
 - denial of service via resource exhaustion beyond the Domain limits already
   enforced (a full ResourceManager policy is deferred);
-- a formally verified kernel (the TCB is trusted, not proven).
+- a formally verified kernel (the TCB is trusted, not proven);
+- IOMMU isolation of DMA-capable devices. Until per-device IOMMU domains exist,
+  a driver holding such a device can reach any physical memory through it, so
+  DMA-capable drivers count as TCB members for memory safety - see 2.2, which
+  states this rather than implying it.
 ```

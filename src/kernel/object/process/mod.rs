@@ -647,7 +647,21 @@ impl Process {
 			let _extending = self.extending.lock();
 			self.terminating.store(true, Ordering::Release);
 		}
+		// AND IT ANSWERS WHILE IT WAITS - the same rule `tlb::request` had to learn, for the same
+		// reason and with the same failure.
+		//
+		// A user fault enters termination from trap context with interrupts masked, and this spins
+		// until every `ExtendGuard` leaves. A concurrent core can hold one of those guards while
+		// rolling back mapped frames, and that rollback asks for a TLB shootdown whose
+		// acknowledgement must come from THIS core - which is spinning here, with interrupts off, not
+		// looking at its flag. The holder then waits out the two-hundred-million-spin timeout before
+		// it can release the guard, so a fault teardown deterministically stalls the kernel and
+		// pushes reusable frames into quarantine.
+		//
+		// The interrupt path cannot cover it: interrupts are masked precisely because this is a trap.
+		// Answering in the wait needs no interrupt at all.
 		while *self.extending.lock() != 0 {
+			crate::mem::tlb::service_pending();
 			core::hint::spin_loop();
 		}
 	}
