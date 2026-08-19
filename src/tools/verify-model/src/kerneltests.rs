@@ -604,7 +604,13 @@ pub fn audit_permission_cohort(map_text: &str, consumer_text: &str) -> Vec<Strin
 
 	// One consumer of the fixture that classified itself nowhere. Counting is enough: any specific
 	// name this could report would be the helper-name oracle this check exists to avoid.
-	let consumers = consumer_text.matches("run_permission_scenario(").count();
+	//
+	// The accessor is `permission_scenario_result` since P02M0139 split the cache from the scenario.
+	// The fixture's own regressions call `permission_result_for_regression` instead - a different
+	// name because they are a different thing: they drive the state machine on cells of their own
+	// and assert nothing about PermissionManager, so they are not cohort members and must not be
+	// counted as unclassified ones.
+	let consumers = consumer_text.matches("permission_scenario_result(").count();
 	if consumers > declarations.len() {
 		problems.push(format!("{consumers} tests drive the permission fixture and {} declare a cohort", declarations.len()));
 	}

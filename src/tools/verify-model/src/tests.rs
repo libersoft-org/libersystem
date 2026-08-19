@@ -1741,15 +1741,15 @@ pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 3] = [
 const COHORT_CONSUMERS: &str = r#"
 fn one() {
 	declare_permission_cohort("kernel.applications.one", PermissionCohort::Base);
-	let result = run_permission_scenario(PermissionScenario::Probes).expect("x");
+	let result = permission_scenario_result(PermissionCohort::Base).expect("x");
 }
 fn two() {
 	declare_permission_cohort("kernel.applications.two", PermissionCohort::Base);
-	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("x");
+	let result = permission_scenario_result(PermissionCohort::Base).expect("x");
 }
 fn three() {
 	declare_permission_cohort("kernel.applications.three", PermissionCohort::Scoped);
-	let result = run_permission_scenario(PermissionScenario::ScopedGrants).expect("x");
+	let result = permission_scenario_result(PermissionCohort::Scoped).expect("x");
 }
 "#;
 
@@ -1762,7 +1762,7 @@ fn a_matching_cohort_map_and_declaration_set_is_clean() {
 fn an_unclassified_fixture_consumer_is_a_failure() {
 	// A thirteenth consumer arrives and nobody classifies it. The count is the only thing that can
 	// see this, which is exactly why it is read.
-	let consumers = format!("{COHORT_CONSUMERS}\nfn four() {{\n\tlet result = run_permission_scenario(PermissionScenario::Probes).expect(\"x\");\n}}\n");
+	let consumers = format!("{COHORT_CONSUMERS}\nfn four() {{\n\tlet result = permission_scenario_result(PermissionCohort::Base).expect(\"x\");\n}}\n");
 	let problems = crate::kerneltests::audit_permission_cohort(COHORT_MAP, &consumers);
 	assert_eq!(problems.len(), 1, "{problems:?}");
 	assert!(problems[0].contains("4 tests drive the permission fixture and 3 declare a cohort"), "{problems:?}");
@@ -1800,4 +1800,172 @@ fn a_declaration_the_map_does_not_know_is_a_failure() {
 	let problems = crate::kerneltests::audit_permission_cohort(COHORT_MAP, &consumers);
 	assert!(problems.iter().any(|problem| problem.contains("kernel.applications.invented") && problem.contains("does not list it")), "{problems:?}");
 	assert!(problems.iter().any(|problem| problem.contains("kernel.applications.two") && problem.contains("outlived its test")), "{problems:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// P02M0138: a PermissionManager change selects the tests that can detect a regression in it.
+//
+// HERMETIC IN THE DIMENSION THAT MATTERS. `kerneltests::discover` reads the compiled test binaries
+// out of `.build` to learn which tests exist per target, so a regression built on the discovered
+// suite passes or fails according to what the caller happened to build last. These substitute a
+// written-down suite and rebuild the catalog over it, so the assertion is about the PLANNER and the
+// `covers` declarations - not about anyone's `.build`.
+
+// The evidence-backed set, from the watched-fail matrix in `.build/benchmarks/permission-coverage`.
+// Written out rather than derived: deriving it from "tests that declare bin.permission_manager"
+// would make this regression agree with the declarations by construction, which is the one thing it
+// must not do.
+const PERMISSION_COVERAGE: [&str; 12] = [
+	"kernel.applications.a_command_word_on_its_own_runs_the_command",
+	"kernel.applications.a_consumer_that_stops_early_ends_the_pipeline_instead_of_hanging_it",
+	"kernel.applications.a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream",
+	"kernel.applications.a_governed_pipeline_starts_as_one_transaction_and_carries_data",
+	"kernel.applications.a_migrated_stream_tool_reads_a_pipeline_the_way_it_reads_a_path",
+	"kernel.applications.a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage",
+	"kernel.applications.a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline",
+	"kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge",
+	"kernel.applications.permission_manager_enforces_static_and_dynamic_probe_policy",
+	"kernel.applications.permission_manager_mints_scoped_application_grants",
+	"kernel.applications.permission_manager_runs_tools_with_minimal_grants",
+	"kernel.applications.the_command_tools_run_governed_and_read_in_windows",
+];
+
+const PERMISSION_MANAGER_PATH: &str = "src/user/services/core/src/permission_manager.rs";
+
+fn permission_kernel_test(id: &str, covers: &[&str]) -> KernelTest {
+	KernelTest { name: id.rsplit('.').next().expect("an id has a last segment").to_string(), id: id.to_string(), covers: covers.iter().map(|item| (*item).to_string()).collect(), architectures: crate::registry::ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()).collect() }
+}
+
+// A model whose kernel suite is exactly what this test writes down.
+fn model_with_suite(tests: Vec<KernelTest>) -> Model {
+	let mut model = model();
+	model.kernel_tests.tests = tests;
+	model.kernel_tests.missing_targets.clear();
+	model.kernel_tests.unannotated = 0;
+	let staged = crate::staged_components(&model.manifest, &model.crates, &model.graph);
+	model.catalog = crate::catalog::Catalog::build(&model.crates, &model.registry, &model.graph, &staged, &model.kernel_tests.tests);
+	model
+}
+
+// The suite as the evidence says it is: the twelve, a decoy that reaches the same kernel helper and
+// claims nothing about PermissionManager, and enough unrelated tests to make the suite the size the
+// real one is.
+//
+// THE SIZE IS PART OF THE FIXTURE. The planner widens a selection back to the whole suite when the
+// scoped run would cost within a tenth of running everything, which is correct and is why a
+// thirteen-test fixture selected all thirteen: twelve of thirteen IS everything. A regression built
+// on that would have asserted the widening rather than the selection.
+fn permission_suite() -> Vec<KernelTest> {
+	let mut tests: Vec<KernelTest> = PERMISSION_COVERAGE.iter().map(|id| permission_kernel_test(id, &["bin.permission_manager", "kernel", "services"])).collect();
+	tests.push(permission_kernel_test("kernel.applications.a_neighbour_that_claims_nothing_about_permissions", &["kernel", "services"]));
+	for index in 0..255 {
+		tests.push(permission_kernel_test(&format!("kernel.unrelated.case_{index:03}"), &["bin.nothing-this-change-reaches"]));
+	}
+	tests
+}
+
+fn selected_kernel_tests(model: &Model, plan: &crate::plan::Plan) -> BTreeSet<String> {
+	plan.items.iter().filter(|item| model.catalog.get(&item.key.check).is_some_and(|check| check.kind == crate::catalog::CheckKind::KernelTest)).map(|item| item.key.check.clone()).collect()
+}
+
+#[test]
+fn a_permission_manager_change_selects_exactly_the_evidence_backed_tests() {
+	let model = model_with_suite(permission_suite());
+	let plan = plan_for(&model, &[PERMISSION_MANAGER_PATH]);
+
+	assert!(!plan.full, "a PermissionManager change is scoped, not a full run: {:?}", plan.full_reasons);
+	assert_eq!(plan.changed_components, vec![String::from("bin.permission_manager")]);
+	// The target policy this milestone inherited and must not change: three targets built, one
+	// booted.
+	assert_eq!(plan.architectures_built, vec![String::from("aarch64"), String::from("riscv64"), String::from("x86_64")]);
+	assert_eq!(plan.architectures_booted, vec![String::from("x86_64")]);
+
+	let selected = selected_kernel_tests(&model, &plan);
+	// THE DEFECT THIS MILESTONE EXISTS FOR. Before the coverage declarations this was empty, and the
+	// command layer added an unenumerated full-suite boot whose result attributed to nothing.
+	assert!(!selected.is_empty(), "a PermissionManager change selected no kernel test at all");
+	// Reaching the same kernel helper is not a coverage claim.
+	assert!(!selected.contains("kernel.applications.a_neighbour_that_claims_nothing_about_permissions"), "affected={:?} reason={:?}", plan.affected_components, plan.items.iter().find(|item| item.key.check.contains("neighbour")).map(|item| item.reason.clone()));
+	let expected: BTreeSet<String> = PERMISSION_COVERAGE.iter().map(|id| (*id).to_string()).collect();
+	assert_eq!(selected, expected, "the selected set is not the evidence-backed set");
+}
+
+#[test]
+fn the_permission_manager_selection_lowers_to_one_enumerated_guest_step() {
+	let model = model_with_suite(permission_suite());
+	let plan = plan_for(&model, &[PERMISSION_MANAGER_PATH]);
+	let mut per_target: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+	for test in &model.kernel_tests.tests {
+		for architecture in &test.architectures {
+			*per_target.entry(architecture.clone()).or_default() += 1;
+		}
+	}
+	let steps = crate::commands::steps(&plan, &per_target, &model.registry);
+	let guest: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.command.contains("./test.sh")).collect();
+	assert_eq!(guest.len(), 1, "one guest step, not one per test and not one per target: {:?}", guest.iter().map(|step| &step.command).collect::<Vec<_>>());
+	let command = &guest[0].command;
+	assert!(command.starts_with("TEST_SELECTION="), "the guest step hands over ids rather than falling back to the whole suite: {command}");
+	assert!(command.ends_with("./test.sh --arch x86_64"), "{command}");
+	for id in PERMISSION_COVERAGE {
+		assert!(command.contains(id), "the lowered command omits {id}");
+	}
+	assert!(!command.contains("a_neighbour_that_claims_nothing_about_permissions"), "{command}");
+}
+
+#[test]
+fn an_omitted_coverage_declaration_is_a_selection_failure() {
+	// The regression has to fail on the OLD behaviour, so here is the old behaviour: one of the
+	// twelve stops declaring what it covers.
+	let mut suite = permission_suite();
+	let dropped = "kernel.applications.permission_manager_mints_scoped_application_grants";
+	for test in &mut suite {
+		if test.id == dropped {
+			test.covers.retain(|component| component != "bin.permission_manager");
+		}
+	}
+	let model = model_with_suite(suite);
+	let plan = plan_for(&model, &[PERMISSION_MANAGER_PATH]);
+	let selected = selected_kernel_tests(&model, &plan);
+	assert!(!selected.contains(dropped), "the fixture did not actually drop the declaration");
+	let expected: BTreeSet<String> = PERMISSION_COVERAGE.iter().map(|id| (*id).to_string()).collect();
+	assert_ne!(selected, expected, "an omitted declaration must change the selected set");
+}
+
+#[test]
+fn a_declaration_without_evidence_is_a_selection_failure() {
+	// The other direction: a test that never caught a focused mutation claims the component anyway.
+	// Nothing mechanical stops that, which is why the decision record is written down and why this
+	// regression names the set rather than deriving it.
+	let mut suite = permission_suite();
+	for test in &mut suite {
+		if test.id == "kernel.applications.a_neighbour_that_claims_nothing_about_permissions" {
+			test.covers.push(String::from("bin.permission_manager"));
+		}
+	}
+	let model = model_with_suite(suite);
+	let plan = plan_for(&model, &[PERMISSION_MANAGER_PATH]);
+	let selected = selected_kernel_tests(&model, &plan);
+	let expected: BTreeSet<String> = PERMISSION_COVERAGE.iter().map(|id| (*id).to_string()).collect();
+	assert_ne!(selected, expected, "an unearned declaration must show up as a different selected set");
+}
+
+#[test]
+fn an_unrelated_component_does_not_acquire_the_permission_manager_test_set() {
+	let model = model_with_suite(permission_suite());
+	let plan = plan_for(&model, &["src/user/libs/audio/flac/src/lib.rs"]);
+	let selected = selected_kernel_tests(&model, &plan);
+	let expected: BTreeSet<String> = PERMISSION_COVERAGE.iter().map(|id| (*id).to_string()).collect();
+	assert_ne!(selected, expected, "an unrelated change acquired the whole PermissionManager set");
+}
+
+#[test]
+fn every_selected_id_is_one_the_guest_runner_can_match() {
+	// An unknown id is a hard failure in the guest, so a selection naming one runs nothing and says
+	// so - the exact false green the id mechanism exists against.
+	let model = model_with_suite(permission_suite());
+	let plan = plan_for(&model, &[PERMISSION_MANAGER_PATH]);
+	let known: BTreeSet<&str> = model.kernel_tests.tests.iter().map(|test| test.id.as_str()).collect();
+	for id in selected_kernel_tests(&model, &plan) {
+		assert!(known.contains(id.as_str()), "the plan selected '{id}', which no test in the suite carries");
+	}
 }

@@ -393,6 +393,33 @@ pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 12] = [
 // The marker each consumer puts in its own body. It fails IN THE GUEST on a class that disagrees
 // with the map or on an ID the map does not know, so the classification cannot be wrong at runtime
 // while looking right to a source scan.
+// HOW MANY TIMES THE EXPENSIVE FIXTURE ACTUALLY RAN, per guest run and per class (P02M0139).
+//
+// Twelve tests drive one scenario and nothing counts how often it is built, so "eleven base setups
+// and one scoped setup" is a claim about the fixture that nobody could check. The count is the
+// measurement this milestone's before and after are read from, and afterwards it is the regression:
+// setup reuse is a claim about a NUMBER, not about elapsed time, and timing alone cannot tell a
+// cached result from a fast one.
+//
+// Test-only, and it is a counter and a serial line - not a telemetry protocol, not a production
+// signal and not something a test may branch on.
+pub(crate) static PERMISSION_BASE_SETUPS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub(crate) static PERMISSION_SCOPED_SETUPS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn record_permission_setup(cohort: PermissionCohort) {
+	use core::sync::atomic::Ordering;
+	let counter = match cohort {
+		PermissionCohort::Base => &PERMISSION_BASE_SETUPS,
+		PermissionCohort::Scoped => &PERMISSION_SCOPED_SETUPS,
+	};
+	let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+	let label = match cohort {
+		PermissionCohort::Base => "base",
+		PermissionCohort::Scoped => "scoped",
+	};
+	crate::serial_println!("permission-fixture: {label} setup completed, {count} so far this run");
+}
+
 pub(crate) fn declare_permission_cohort(id: &str, cohort: PermissionCohort) {
 	let mut found = false;
 	let mut index = 0;
@@ -472,7 +499,225 @@ struct PermissionScenarioResult {
 // stand-ins, proving its acquire -> present -> focus -> key-quit -> release sequence, then
 // launches `play` through a playback-only audio grant. The kernel only brokers the initial
 // capabilities.
-fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionScenarioResult, &'static str> {
+// THE FIXTURE CACHE (P02M0139).
+//
+// Twelve tests drive one expensive scenario. Eleven of them take the same path - package parsing,
+// four services, the channel topology, the governed launches, the pipelines and a real shell session
+// - and the twelfth continues into scoped graphics and audio grants. Building that eleven times to
+// ask eleven different questions about it is the whole cost.
+//
+// WHAT IS SHARED IS AN ANSWER, NOT A SYSTEM. A cached result holds bytes, booleans and a duration
+// and nothing else: no channel, no process, no memory object, no capability, no scheduler domain. By
+// the time it is published every process the scenario started has been terminated and reaped and the
+// fixture's domain has been checked back to its pre-run resource counts, so a later consumer cannot
+// observe - or disturb - anything the earlier one left running. That is the difference between
+// reusing setup and sharing test state, and it is why this is a cache of observations rather than a
+// long-lived topology with twelve tenants.
+enum PermissionFixture {
+	Empty,
+	// Some consumer is running the scenario right now. It is not a result and it is not an error;
+	// it is a state a second consumer must not wait inside, because waiting here means spinning in
+	// a test while the builder needs the scheduler.
+	Building,
+	Ready(alloc::sync::Arc<PermissionScenarioResult>),
+	// The ORIGINAL diagnostic, kept verbatim and returned to every later consumer of this class. A
+	// failed setup must not look like an empty observation, and it must not invite the next test to
+	// try again: a second attempt after a failure is retry-shopping, and the answer it might get is
+	// not evidence about anything.
+	Failed(&'static str),
+}
+
+static PERMISSION_BASE_FIXTURE: sync::SpinLock<PermissionFixture> = sync::SpinLock::new(PermissionFixture::Empty);
+static PERMISSION_SCOPED_FIXTURE: sync::SpinLock<PermissionFixture> = sync::SpinLock::new(PermissionFixture::Empty);
+
+fn permission_fixture_cell(cohort: PermissionCohort) -> &'static sync::SpinLock<PermissionFixture> {
+	match cohort {
+		PermissionCohort::Base => &PERMISSION_BASE_FIXTURE,
+		PermissionCohort::Scoped => &PERMISSION_SCOPED_FIXTURE,
+	}
+}
+
+// What a consumer asks for. `Empty -> Building -> Ready|Failed`, and the expensive part happens with
+// no lock held at all.
+//
+// `try_lock` throughout, never `lock`. `SpinLock::lock` disables interrupts and spins, and the thing
+// this would be spinning for is a scenario that needs the scheduler to make progress - so a consumer
+// that blocked here would deadlock the run rather than wait for it. `try_lock` restores the
+// interrupt state on every failed attempt, which is what makes a retry loop safe to write.
+fn permission_scenario_result(cohort: PermissionCohort) -> Result<alloc::sync::Arc<PermissionScenarioResult>, &'static str> {
+	let scenario = match cohort {
+		PermissionCohort::Base => PermissionScenario::GovernedTools,
+		PermissionCohort::Scoped => PermissionScenario::ScopedGrants,
+	};
+	permission_result_from(permission_fixture_cell(cohort), || build_permission_scenario(scenario))
+}
+
+// The state machine itself, over a cell and a builder.
+//
+// Separated so the failure and collision regressions can drive the REAL machine on a cell of their
+// own. Pointing them at the production cells instead would have them poison a class for the rest of
+// the guest run - which is the documented behaviour and exactly why a test must not do it: run the
+// whole suite with the injection test first and all twelve consumers would fail on an injected
+// diagnostic. A regression that can only be run in isolation is one nobody runs.
+fn permission_result_from(cell: &'static sync::SpinLock<PermissionFixture>, build: impl FnOnce() -> Result<PermissionScenarioResult, &'static str>) -> Result<alloc::sync::Arc<PermissionScenarioResult>, &'static str> {
+	{
+		let Some(mut state) = cell.try_lock() else {
+			return Err("the permission fixture is locked by another consumer");
+		};
+		match &*state {
+			PermissionFixture::Ready(result) => return Ok(result.clone()),
+			PermissionFixture::Failed(diagnostic) => return Err(diagnostic),
+			PermissionFixture::Building => return Err("the permission fixture is being built by another consumer"),
+			PermissionFixture::Empty => *state = PermissionFixture::Building,
+		}
+	}
+
+	// This consumer is the sole builder now, and it OWNS the obligation to leave `Building`: both
+	// paths below publish exactly one terminal state.
+	match build() {
+		Ok(result) => {
+			let shared = alloc::sync::Arc::new(result);
+			publish_permission_fixture(cell, PermissionFixture::Ready(shared.clone()));
+			Ok(shared)
+		}
+		Err(diagnostic) => {
+			publish_permission_fixture(cell, PermissionFixture::Failed(diagnostic));
+			Err(diagnostic)
+		}
+	}
+}
+
+// Cells the regressions own, so they never touch a class a real consumer will ask for.
+static PERMISSION_INJECTED_FAILURE_FIXTURE: sync::SpinLock<PermissionFixture> = sync::SpinLock::new(PermissionFixture::Empty);
+static PERMISSION_INJECTED_SCOPED_FIXTURE: sync::SpinLock<PermissionFixture> = sync::SpinLock::new(PermissionFixture::Empty);
+static PERMISSION_COLLISION_FIXTURE: sync::SpinLock<PermissionFixture> = sync::SpinLock::new(PermissionFixture::Empty);
+
+pub(crate) fn permission_fixture_injection_cell(cohort: PermissionCohort) -> &'static sync::SpinLock<PermissionFixture> {
+	match cohort {
+		PermissionCohort::Base => &PERMISSION_INJECTED_FAILURE_FIXTURE,
+		PermissionCohort::Scoped => &PERMISSION_INJECTED_SCOPED_FIXTURE,
+	}
+}
+
+pub(crate) fn permission_fixture_collision_cell() -> &'static sync::SpinLock<PermissionFixture> {
+	&PERMISSION_COLLISION_FIXTURE
+}
+
+// What a regression asks for: the real machine, a cell of its own, and a builder it dictates.
+pub(crate) fn permission_result_for_regression(cell: &'static sync::SpinLock<PermissionFixture>, build: impl FnOnce() -> Result<PermissionScenarioResult, &'static str>) -> Result<alloc::sync::Arc<PermissionScenarioResult>, &'static str> {
+	permission_result_from(cell, build)
+}
+
+// A result carrying nothing, for a regression that is about the machine rather than the scenario.
+pub(crate) fn empty_permission_result() -> PermissionScenarioResult {
+	PermissionScenarioResult { pipeline_read: alloc::vec::Vec::new(), pipeline_started: false, diagnostic_read: alloc::vec::Vec::new(), redirect_read: alloc::vec::Vec::new(), merged_read: alloc::vec::Vec::new(), stream_reads: alloc::vec::Vec::new(), shell_read: alloc::vec::Vec::new(), expected: alloc::vec::Vec::new(), probe_read: alloc::vec::Vec::new(), probe_summary: alloc::vec::Vec::new(), date_read: alloc::vec::Vec::new(), date_summary: alloc::vec::Vec::new(), command_read: alloc::vec::Vec::new(), request_read: alloc::vec::Vec::new(), request_summary: alloc::vec::Vec::new(), cat_read: alloc::vec::Vec::new(), ip_read: alloc::vec::Vec::new(), ip_summary: alloc::vec::Vec::new(), graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 }
+}
+
+// Leave `Building`, whatever it takes. A state machine whose builder can strand it has no terminal
+// state, so this retries rather than gives up - yielding between attempts so the core it needs is
+// available to whoever holds the lock, and never spinning with interrupts off, because `try_lock`
+// has already restored them by the time it returns `None`.
+fn publish_permission_fixture(cell: &'static sync::SpinLock<PermissionFixture>, terminal: PermissionFixture) {
+	let mut terminal = Some(terminal);
+	loop {
+		if let Some(mut state) = cell.try_lock() {
+			*state = terminal.take().expect("the terminal state is published once");
+			return;
+		}
+		sched::yield_now();
+	}
+}
+
+// The limits the fixture's own domain runs under. Generous rather than tight: this is a container to
+// take down, not a resource test, and a limit hit here would be a fixture failure masquerading as a
+// PermissionManager decision - the exact confusion P02M0138 spent four probe rounds untangling.
+const PERMISSION_FIXTURE_MEMORY: u64 = 512 * 1024 * 1024;
+
+// One scenario, from an empty domain to a reaped one.
+fn build_permission_scenario(scenario: PermissionScenario) -> Result<PermissionScenarioResult, &'static str> {
+	let domain = object::domain::Domain::new(PERMISSION_FIXTURE_MEMORY, object::domain::UNLIMITED, object::domain::UNLIMITED);
+	// The counts to come back to. Taken before anything is started, so what they compare against is
+	// this domain's own empty state rather than a number read off somewhere else.
+	let before = (domain.account().memory().used(), domain.account().handles().used(), domain.account().threads().used());
+	let outcome = build_permission_scenario_in(scenario, &domain);
+	let reaped = reap_permission_fixture(&domain, before);
+	// A SETUP FAILURE KEEPS ITS OWN DIAGNOSTIC. The teardown result only decides a run that
+	// otherwise succeeded: if the scenario failed, that is what the consumer needs to be told, and
+	// "and the cleanup was also unhappy" would bury it.
+	match (outcome, reaped) {
+		(Err(diagnostic), _) => Err(diagnostic),
+		(Ok(_), Err(diagnostic)) => Err(diagnostic),
+		(Ok(result), Ok(())) => Ok(result),
+	}
+}
+
+// Kill the domain, pump until nothing of it is left running, and require its resource counts back.
+//
+// The check is the point. "The result holds no live objects" is easy to believe and easy to get
+// wrong - a retained handle inside a cached observation would be invisible until some later test
+// behaved strangely - so the fixture is required to prove it against counters the kernel keeps
+// itself.
+fn reap_permission_fixture(domain: &alloc::sync::Arc<object::domain::Domain>, before: (u64, u64, u64)) -> Result<(), &'static str> {
+	domain.kill();
+	// PUMP UNTIL NOTHING OF IT IS STILL RUNNING.
+	//
+	// The condition is every process terminated with no live thread - NOT `live_processes()` going
+	// empty, which is what this first asked for and which does not happen. That list holds `Weak`s
+	// and returns everything they still upgrade to, so it answers "is the Process object still
+	// allocated", not "is anything still running": measured here, all four services sit at
+	// `killed=true live_threads=0` forever, because a terminated process's `Arc` is still referenced
+	// from outside this domain. Waiting for the list to empty is waiting for an unrelated refcount.
+	//
+	// Bounded, because an unbounded pump in a test is a hang with a friendly name.
+	let mut rounds = 0;
+	loop {
+		let running: usize = domain.live_processes().iter().filter(|process| !process.is_killed() || process.live_thread_count() > 0).count();
+		if running == 0 {
+			break;
+		}
+		sched::run_until_idle();
+		rounds += 1;
+		if rounds > 256 {
+			for process in domain.live_processes() {
+				if !process.is_killed() || process.live_thread_count() > 0 {
+					crate::serial_println!("permission-fixture: still running koid={} killed={} live_threads={}", object::KernelObject::header(&*process).koid(), process.is_killed(), process.live_thread_count());
+				}
+			}
+			return Err("the permission fixture's domain still has a running process after its kill");
+		}
+	}
+	let after = (domain.account().memory().used(), domain.account().handles().used(), domain.account().threads().used());
+	// WHAT THE DOMAIN OWES BACK, AND WHAT IT CANNOT.
+	//
+	// Handles come back exactly, and that is the check with no excuse attached: every endpoint,
+	// memory object and capability this fixture opened is closed by the time its result is
+	// published, so a later consumer cannot be handed one.
+	//
+	// Memory and thread slots do NOT come back to zero, and the milestone's "counters against their
+	// captured pre-run values" cannot be met as written. A terminated process refunds its charges in
+	// `Drop`, and the four services linger as `killed=true live_threads=0` because their `Arc`s are
+	// still referenced from outside this domain - so the residue is owned by a refcount this fixture
+	// does not hold. Measured on this tree: 237568 bytes and 4 thread slots for 4 lingering
+	// processes, handles exactly 0.
+	//
+	// So the bound is PER LINGERING PROCESS rather than a constant somebody once observed, which
+	// keeps it a real check: a fixture that leaked a megabyte, or that left a fifth process behind,
+	// still fails it.
+	let lingering = domain.live_processes().len() as u64;
+	const RESIDUE_BYTES_PER_PROCESS: u64 = 128 * 1024;
+	if after.1 != before.1 {
+		return Err("the permission fixture's domain did not give back its handles");
+	}
+	if after.0 > before.0 + lingering * RESIDUE_BYTES_PER_PROCESS {
+		return Err("the permission fixture's domain kept more memory than its terminated processes account for");
+	}
+	if after.2 > before.2 + lingering {
+		return Err("the permission fixture's domain kept more thread slots than its terminated processes account for");
+	}
+	Ok(())
+}
+
+fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &alloc::sync::Arc<object::domain::Domain>) -> Result<PermissionScenarioResult, &'static str> {
 	use object::channel::{Channel, Message};
 	use object::memory_object::MemoryObject;
 	use object::process::Process;
@@ -560,7 +805,15 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	let (_input_scope_server, input_scope_client) = Channel::create();
 	let (_audio_scope_server, audio_scope_client) = Channel::create();
 
-	let domain = sched::root_domain();
+	// EVERY PROCESS THIS SCENARIO STARTS LANDS IN ONE DOMAIN OF ITS OWN (P02M0139), which is what
+	// makes the fixture takeable-down as a unit. It used to spawn into the root domain, where its
+	// services and governed tools were indistinguishable from everything else the guest was running
+	// and could only be left behind.
+	//
+	// Nothing has to enumerate the indirect ones: `sys_process_create` with no explicit domain uses
+	// the CALLER'S, so ProcessService - itself started here - creates the governed tools and the
+	// real shell inside this domain too, however many levels down the request came from.
+	let domain = fixture_domain.clone();
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ProcessService")?;
 	let _time = spawn_dynamic_test_process(domain.clone(), time_elf, time_boot_user);
@@ -1074,6 +1327,7 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	};
 
 	if scenario != PermissionScenario::ScopedGrants {
+		record_permission_setup(PermissionCohort::Base);
 		return Ok(PermissionScenarioResult { pipeline_read: pipeline_read.clone(), pipeline_started, diagnostic_read: diagnostic_read.clone(), redirect_read: redirect_read.clone(), merged_read: merged_read.clone(), stream_reads: stream_reads.clone(), shell_read: shell_read.clone(), expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: alloc::vec::Vec::new(), graphics_start_ns: 0 });
 	}
 
@@ -1105,10 +1359,25 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	send_cap(&perm_client, &run, graphics_stdout, Rights::ALL)?;
 	sched::run_until_idle();
 	let run_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer graphics_probe run")?;
-	if run_reply.bytes.len() < 5 || run_reply.bytes[4] == 0 {
-		return Err("PermissionManager refused graphics_probe");
+	// A REFUSAL IS ALSO AN OBSERVATION (P02M0138). Whether the manager starts `graphics_probe` at
+	// all is one of the decisions `permission_manager_mints_scoped_application_grants` exists to
+	// assert, and this used to return Err - so every focused mutation of the scoped mint made the
+	// SCENARIO fail and the test's own assertions were never reached. A mint that comes back empty
+	// makes the manager refuse the launch, which is precisely the case the test must be able to
+	// see. A malformed reply is still a fixture failure: that is the transport, not a decision.
+	if run_reply.bytes.len() < 5 {
+		return Err("PermissionManager's graphics_probe run reply is malformed");
 	}
-	let graphics_read = graphics_output.recv().map_err(|_| "graphics_probe received incomplete grants")?;
+	let graphics_started = run_reply.bytes[4] != 0;
+	// AN EMPTY READ IS AN OBSERVATION, NOT A FIXTURE FAILURE (P02M0138).
+	//
+	// This was `?` with `map_err`, so a `graphics_probe` whose scoped grants were incomplete failed
+	// the SCENARIO - and `permission_manager_mints_scoped_application_grants`, whose entire job is
+	// to assert what those grants are, never reached its own assertion. A focused mutation that
+	// narrowed the display grant was therefore invisible to the one test that exists to catch it:
+	// the helper judged first and reported a broken fixture. The bytes the probe did or did not
+	// send are what the test is entitled to judge, so they are carried out rather than ruled on.
+	let graphics_read = if graphics_started { graphics_output.recv().map(|message| message.bytes).unwrap_or_default() } else { alloc::vec::Vec::new() };
 	let graphics_start_ns = arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(graphics_start));
 	crate::serial_println!("app-start-perf: graphics_probe={}ns", graphics_start_ns);
 
@@ -1310,7 +1579,8 @@ fn run_permission_scenario(scenario: PermissionScenario) -> Result<PermissionSce
 	if !mp3_process.is_terminated() {
 		return Err("MP3 play did not exit");
 	}
-	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, merged_read, stream_reads, shell_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read: graphics_read.bytes, graphics_start_ns })
+	record_permission_setup(PermissionCohort::Scoped);
+	Ok(PermissionScenarioResult { pipeline_read, pipeline_started, diagnostic_read, redirect_read, merged_read, stream_reads, shell_read, expected, probe_read: probe_read.bytes, probe_summary: probe_summary.bytes, date_read: date_read.bytes, date_summary: date_summary.bytes, command_read: command_read.clone(), request_read: request_read.bytes, request_summary: request_summary.bytes, cat_read: cat_read.bytes, ip_read: ip_read.bytes, ip_summary: ip_summary.bytes, graphics_read, graphics_start_ns })
 }
 
 // Build the component topology and run it to completion. A StorageService serves
