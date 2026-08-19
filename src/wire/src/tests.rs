@@ -200,7 +200,28 @@ fn a_vec_writer_that_records_a_handle_cannot_be_read_as_bytes_alone() {
 	assert_eq!(w.set_handle(42), Some(()));
 	assert_eq!(w.handles(), &[42], "the handle is recorded");
 	assert_eq!(w.handle(), 42);
-	assert_eq!(w.into_inner(), alloc::vec![7, 0, 0, 0], "and `into_inner` gives the bytes only");
+	// THIS TEST USED TO ASSERT THE OPPOSITE OF ITS NAME: `into_inner` handed over the bytes and
+	// dropped the record, and the assertion below said so approvingly (WIRE-001).
+	let (bytes, handles) = {
+		let copy = {
+			let mut c = VecWriter::new();
+			c.u32(7).unwrap();
+			c.set_handle(42).unwrap();
+			c
+		};
+		copy.into_message()
+	};
+	assert_eq!(bytes, alloc::vec![7, 0, 0, 0], "`into_message` gives the bytes");
+	assert_eq!(handles.as_slice(), &[42], "and the capabilities with them");
+	assert_eq!(w.into_inner(), None, "and `into_inner` refuses rather than dropping the handle");
+}
+
+#[test]
+fn a_vec_writer_with_no_handle_still_gives_its_bytes() {
+	// The other half: the refusal above must be about the handle and not about `into_inner`.
+	let mut w = VecWriter::new();
+	assert_eq!(w.u32(7), Some(()));
+	assert_eq!(w.into_inner(), Some(alloc::vec![7, 0, 0, 0]));
 }
 
 #[test]

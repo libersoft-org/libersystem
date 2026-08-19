@@ -131,7 +131,7 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// when asked for.
 	//
 	// Staging whatever happens to be at `.build/boot/kernel` made the volume's contents depend on
-	// which recipe ran last: a test run after `just img` booted the shipping kernel from the
+	// which recipe ran last: a test run after `./image.sh` booted the shipping kernel from the
 	// volume instead of the test binary the harness had just built, and sat at a shell prompt
 	// until the watchdog fired. A shipping image wants its kernel on the volume; a test medium
 	// wants the harness's kernel, which is built elsewhere and staged on the ESP.
@@ -139,7 +139,7 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	//
 	// It used to read `.build/boot/kernel`, a slot every image builder writes to and nobody owns.
 	// The volume is built before that slot is written, so it took whatever the previous recipe had
-	// left there - and a `just img` after a test run put the TEST kernel on the shipping volume,
+	// left there - and a `./image.sh` after a test run put the TEST kernel on the shipping volume,
 	// which then booted into the test suite off a disk image. This is the second time that shared
 	// slot has done exactly this; naming the file removes the slot from the path entirely.
 	if let Some(arg) = env::args().find(|arg| arg.starts_with("--with-kernel=")) {

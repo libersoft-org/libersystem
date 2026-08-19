@@ -239,7 +239,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 				name[i] = if b == b'/' { b'\\' } else { b };
 			}
 			let name = core::str::from_utf8(&name[..path.len()]).ok()?;
-			let bytes = read_file(self.bs, self.root, name)?;
+			let bytes = unsafe { read_file(self.bs, self.root, name) }?;
 			let mut owned = alloc::vec::Vec::new();
 			let copied = owned.try_reserve_exact(bytes.len()).is_ok();
 			if copied {
@@ -427,10 +427,12 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 	// A LiberFS volume that is not the one this medium is paired with is somebody else's system.
 	// Keep looking; on a machine with one volume there is nothing to skip.
 	let want = unsafe { PAIRED_UUID };
-	let Some(mut fs) = uefi::disk::choose_volume(bs, want, |disk| {
-		let fs = liberfs::LiberFs::mount(disk).ok()?;
-		let uuid = fs.uuid();
-		Some((uuid, fs))
+	let Some(mut fs) = (unsafe {
+		uefi::disk::choose_volume(bs, want, |disk| {
+			let fs = liberfs::LiberFs::mount(disk).ok()?;
+			let uuid = fs.uuid();
+			Some((uuid, fs))
+		})
 	}) else {
 		return VolumeRead::NoVolume;
 	};
@@ -459,7 +461,7 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 // the FAT backend over the block protocol when it did not.
 pub(crate) fn read_boot_file(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, name: &str) -> Option<&'static [u8]> {
 	if let Some(root) = root
-		&& let Some(bytes) = read_file(bs, root, name)
+		&& let Some(bytes) = unsafe { read_file(bs, root, name) }
 	{
 		return Some(bytes);
 	}
@@ -482,14 +484,16 @@ fn with_boot_medium(bs: *mut BootServices, mut visit: impl FnMut(blockio::Firmwa
 		visit(disk);
 		return;
 	}
-	blockio::each_disk(bs, |disk| {
-		if visit(disk) {
-			unsafe { BOOT_MEDIUM = Some(disk) };
-			true
-		} else {
-			false
-		}
-	});
+	unsafe {
+		blockio::each_disk(bs, |disk| {
+			if visit(disk) {
+				BOOT_MEDIUM = Some(disk);
+				true
+			} else {
+				false
+			}
+		});
+	}
 }
 
 // Read a file from a FAT medium the firmware did not mount for us.
@@ -554,7 +558,7 @@ pub(crate) fn make_module(bytes: &[u8], name: &str, bias: u64) -> bootproto::Mod
 // Copy `bytes` into fresh LOADER_DATA pages, which the firmware retains across the hand-off.
 fn retain(bs: *mut BootServices, bytes: &[u8]) -> Option<&'static [u8]> {
 	let pages = bytes.len().div_ceil(PAGE_SIZE as usize).max(1);
-	let phys = alloc_pages(bs, pages)?;
+	let phys = unsafe { alloc_pages(bs, pages) }?;
 	unsafe {
 		core::ptr::copy_nonoverlapping(bytes.as_ptr(), phys as *mut u8, bytes.len());
 		Some(core::slice::from_raw_parts(phys as *const u8, bytes.len()))
@@ -726,7 +730,7 @@ fn stage_kernel_clear_of_destination(bs: *mut uefi::BootServices, kernel: &'stat
 ",
 	);
 	let pages = (kernel.len() as u64).div_ceil(PAGE_SIZE);
-	let staged = alloc_pages(bs, pages as usize).expect("loader: cannot stage the kernel clear of its destination");
+	let staged = unsafe { alloc_pages(bs, pages as usize) }.expect("loader: cannot stage the kernel clear of its destination");
 	unsafe {
 		let moved = core::slice::from_raw_parts(staged as *const u8, kernel.len());
 		core::ptr::copy_nonoverlapping(kernel.as_ptr(), staged as *mut u8, kernel.len());

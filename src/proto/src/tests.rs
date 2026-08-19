@@ -369,7 +369,7 @@ fn tail_stream_round_trip() {
 	w.u16(log::OP_TAIL).unwrap();
 	w.u32(7).unwrap();
 	q.write(w).unwrap();
-	let request = writer.into_inner();
+	let request = writer.into_inner().unwrap();
 
 	let mut request_handles = crate::codec::Handles::new();
 	let (corr, items) = log::tail_open(&mut service, &request, &mut request_handles).unwrap();
@@ -589,7 +589,7 @@ fn partial_reply_encode_returns_the_unsent_handle_to_the_host() {
 	request.u16(volume::OP_OPEN).unwrap();
 	request.u32(9).unwrap();
 	opts.write(&mut request).unwrap();
-	let request = request.into_inner();
+	let request = request.into_inner().unwrap();
 	let mut request_handles = crate::codec::Handles::new();
 	let mut reply_handles = crate::codec::Handles::new();
 	let mut out = [0u8; 9]; // corr + ok tag + handle placeholder fits; size does not

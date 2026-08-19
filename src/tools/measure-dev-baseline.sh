@@ -31,10 +31,17 @@ mkdir -p "$sample_dir"
 
 run_started_ns="$(date +%s%N)"
 set +e
+# `./build.sh` FROM THE REPOSITORY ROOT, which is not where `$root` points.
+#
+# These two lines ran `just shared-libs`, and there has been no such recipe: `just --dry-run
+# shared-libs` answers "justfile does not contain recipe". Nothing reported it because nothing runs
+# this script on a schedule - it is the baseline measurement, taken by hand. `--rebuild` is what
+# `LIBER_IMAGE_REBUILD=1` was: build.sh exports exactly that variable for it. The cold/warm
+# distinction is the point of the measurement and is kept: cold discards every cache, warm does not.
 if [[ "$scenario" == cold ]]; then
-	(cd "$root" && LIBER_IMAGE_REBUILD=1 just shared-libs) >"$build_log" 2>&1
+	(cd "$repo_root" && ./build.sh --part libs --rebuild) >"$build_log" 2>&1
 else
-	(cd "$root" && just shared-libs) >"$build_log" 2>&1
+	(cd "$repo_root" && ./build.sh --part libs) >"$build_log" 2>&1
 fi
 build_status=$?
 set -e

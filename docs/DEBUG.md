@@ -4,7 +4,7 @@ The tools for poking at a live system, tracing where time goes, and reading what
 the machine did. Everything here runs from the `src` directory; the build and run
 basics are in [INSTALL.md](../INSTALL.md).
 
-## The lab harness (`just lab`)
+## The lab harness (`./lab.sh`)
 
 `boot/lab.py` drives a live instance end to end: it boots QEMU with the serial
 console on a unix socket, keeps a broker attached to it (so no output is ever
@@ -12,21 +12,21 @@ lost), and turns the debug loop into single commands with real request/response
 semantics - no `sendkey` pacing, no sleep-and-grep of a log file.
 
 ```sh
-just lab boot --fresh     # boot; --fresh recreates the data volume first
-just lab sh time ls       # run a shell command in the guest, print its output
-just lab sh lsvol
-just lab int              # Ctrl+C the foreground job (a stuck ping, a cat)
-just lab log -f           # follow the serial log (or: lab log <pattern>)
-just lab pcap on          # start capturing guest network traffic
-just lab pcap dump        # decoded packet list (ARP/ICMP/UDP/TCP with seq/ack/win)
-just lab monitor info usernet   # any QEMU monitor command
-just lab key date         # type through the emulated keyboard (the HID path)
-just lab shot shot.png    # screenshot the framebuffer
-just lab test             # one kernel suite pass: prints RC and the [ok] count
-just lab quit             # shut the instance down and clean up
+./lab.sh boot --fresh     # boot; --fresh recreates the data volume first
+./lab.sh sh time ls       # run a shell command in the guest, print its output
+./lab.sh sh lsvol
+./lab.sh int              # Ctrl+C the foreground job (a stuck ping, a cat)
+./lab.sh log -f           # follow the serial log (or: lab log <pattern>)
+./lab.sh pcap on          # start capturing guest network traffic
+./lab.sh pcap dump        # decoded packet list (ARP/ICMP/UDP/TCP with seq/ack/win)
+./lab.sh monitor info usernet   # any QEMU monitor command
+./lab.sh key date         # type through the emulated keyboard (the HID path)
+./lab.sh shot shot.png    # screenshot the framebuffer
+./lab.sh test             # one kernel suite pass: prints RC and the [ok] count
+./lab.sh quit             # shut the instance down and clean up
 ```
 
-How it works: `lab boot` starts `just run` with `SERIAL=unix:...,server` (QEMU
+How it works: `lab boot` starts `./run.sh` with `SERIAL=unix:...,server` (QEMU
 waits for the connection, so even the first boot line is captured) and forks a
 broker that owns the serial connection, tees everything to
 `boot/.build/lab-serial.log`, and serves a small control socket. `lab sh` sends
@@ -36,7 +36,7 @@ returns when the prompt does, so timing a command from the host is meaningful.
 
 Notes:
 
-- `sh` joins its arguments - `just lab sh time cat motd.txt` needs no quoting.
+- `sh` joins its arguments - `./lab.sh sh time cat motd.txt` needs no quoting.
   A long-running command takes `--timeout <secs>` (default 30).
 - `key` goes through QEMU `sendkey`, i.e. the virtio-input/USB HID path - use it
   when the keyboard pipeline itself is what you are testing; `sh` is the fast
@@ -50,17 +50,17 @@ Notes:
 
 ## The development instance and the fast loop
 
-`just lab boot` above is the ad-hoc harness: it boots a guest for as long as you are looking at
+`./lab.sh boot` above is the ad-hoc harness: it boots a guest for as long as you are looking at
 it. The development instance is the other shape - one guest that stays up across many edits,
 taking new builds of a tool without rebooting. Use it for ordinary work on a leaf tool or a
 provider; use `lab` for one-off poking and for anything the persistent profile does not cover.
 
 ```sh
-just dev-up                                            # boot once and keep it
-just dev-loop uname boot/scenarios/shell-basics.toml   # build -> publish -> run
-just dev-status                                        # what is running, and is it current
-just dev-console                                       # attach a terminal (--read-only to watch)
-just dev-down                                          # stop it
+./dev.sh up                                            # boot once and keep it
+./dev.sh loop uname boot/scenarios/shell-basics.toml   # build -> publish -> run
+./dev.sh status                                        # what is running, and is it current
+./dev.sh console                                       # attach a terminal (--read-only to watch)
+./dev.sh down                                          # stop it
 ```
 
 `dev-loop` is the whole iteration in one command: it builds the artifact, publishes it into the
@@ -131,7 +131,7 @@ reserved.
 
 The registry is memory the development agent holds. It never touches the system volume, so a
 publication cannot damage a cold boot and a reboot returns the guest to its built state. It also
-does not survive the agent, which is what `just dev-restart` is for when the smaller `dev-reset`
+does not survive the agent, which is what `./dev.sh restart` is for when the smaller `dev-reset`
 is not enough.
 
 A published `.lslib` may resolve before the installed provider only when it is compatible, and
@@ -152,7 +152,7 @@ type at the terminal when you want to see a shadowed executable run.
 
 ### Scenarios
 
-Application scenarios are versioned TOML under `boot/scenarios/`, run by `just dev-test`. The
+Application scenarios are versioned TOML under `boot/scenarios/`, run by `./dev.sh test`. The
 interpreter is `boot/scenario.py` on the host, so nothing is staged in the guest and changing a
 scenario or the runner costs no build at all.
 
@@ -174,14 +174,14 @@ prompt. Anything left is the run's failure even if every step passed.
 ### Self-tests
 
 ```sh
-just dev-selftest   # three generations, one refusal, one rollback, one boot
-just proto-test     # the control protocol's conformance suite
-just perf-gate      # the loop's timing budgets, and that the work stayed proportional
+./dev.sh selftest   # three generations, one refusal, one rollback, one boot
+./lab.sh proto-test     # the control protocol's conformance suite
+./lab.sh perf-gate      # the loop's timing budgets, and that the work stayed proportional
 ```
 
 ### Where the logs are
 
-- Guest serial: `.build/boot/dev-serial.log`, or `just dev-log` to follow it.
+- Guest serial: `.build/boot/dev-serial.log`, or `./dev.sh log` to follow it.
 - QEMU's own output, including the build that produced the image: `.build/boot/dev-qemu.log`.
 - Build and guest transcripts from test runs: `.build/logs/test`.
 - One stderr file per artifact from the shared build: `.build/image/<target>/logs/<name>.stderr`.
@@ -194,11 +194,11 @@ just perf-gate      # the loop's timing budgets, and that the work stayed propor
 `dev-status` reports exactly one state and exits zero only when the instance is both ready and
 running current inputs:
 
-- `down` - nothing running. `just dev-up`.
+- `down` - nothing running. `./dev.sh up`.
 - `starting` - booting.
 - `ready` - usable.
-- `stale` - sockets left by an instance that is gone. `just dev-down` clears them.
-- `detached` - the guest outlived its broker. `just dev-up` reconnects a new broker to the same
+- `stale` - sockets left by an instance that is gone. `./dev.sh down` clears them.
+- `detached` - the guest outlived its broker. `./dev.sh up` reconnects a new broker to the same
   guest rather than rebooting it.
 - `foreign` - another worktree owns the profile; it names the owner and where to release it.
 
@@ -221,7 +221,7 @@ Other things that have bitten, and what they look like:
   rebuilds it, which is the same work it would have done on a cache miss. This used to be fatal
   and unrepairable from outside; if you meet an older message about it, that is what changed.
   Deleting the artifact cache directory itself is still wrong - the builder writes into it
-  without creating it and dies on the missing path. `just clean` is the supported way to discard
+  without creating it and dies on the missing path. `./clean.sh` is the supported way to discard
   build inputs.
 - An interactive program left running wedges the scenario runner, because the guest reads as
   "starting" while an alternate screen is up. Quit it before the next run.
@@ -243,15 +243,15 @@ is rebuilt.
 
 One generation is kept per artifact: the one the reference names. The build drops the others as
 it replaces them, so undoing a change recompiles rather than restoring an older cached object.
-`just dev-clean` sweeps up any backlog left by artifacts that have not been rebuilt since.
+`./dev.sh clean` sweeps up any backlog left by artifacts that have not been rebuilt since.
 
 ### Cleaning up
 
-`just dev-clean [--dry-run]` prunes what the host accumulates: test logs, baseline samples,
+`./dev.sh clean [--dry-run]` prunes what the host accumulates: test logs, baseline samples,
 scratch directories from builds whose process is gone, and sockets no instance owns. It keeps
 the twenty newest runs and samples, reports what it removed, and leaves anything a running
 instance still refers to. It deliberately does not touch the artifact caches or the staged
-images: those are inputs to the next build, and `just clean` is what discards them.
+images: those are inputs to the next build, and `./clean.sh` is what discards them.
 
 ## Timing inside the guest
 
@@ -268,8 +268,8 @@ images: those are inputs to the next build, and `just clean` is what discards th
 ## Kernel-level debugging (GDB)
 
 ```sh
-just debug     # boot QEMU stopped, with a GDB stub on :1234 (KVM off)
-just gdb       # in a second terminal: attach, symbols loaded automatically
+./run.sh --debug     # boot QEMU stopped, with a GDB stub on :1234 (KVM off)
+./run.sh --gdb       # in a second terminal: attach, symbols loaded automatically
 ```
 
 A wedged live instance can also be inspected without a restart: attach with
@@ -280,27 +280,27 @@ name it).
 
 ## The test suite
 
-`just test` (or `just lab test`, which also cleans up a stale volume first) runs
+`./test.sh` (or `./lab.sh test`, which also cleans up a stale volume first) runs
 the in-kernel harness under QEMU; each test prints `[ok]` and the run exits zero
 on success. One pass takes a few minutes. When a driver or service changed,
 delete `boot/.build/virtio-blk.img` before the run - services are seeded onto
 the volume only when the image is created, so a stale image runs stale binaries.
-That stale-volume trap also applies to live boots; `just lab boot --fresh` is
+That stale-volume trap also applies to live boots; `./lab.sh boot --fresh` is
 the shortcut that avoids it.
 
 The focused dynamic-link gate exercises a real provider DAG plus hostile provider
 and canonical-order inputs without the full service integration workload:
 
 ```sh
-just test-tags dynamic
-just test-tags-aarch64 dynamic
-just test-tags-riscv64 dynamic
+./test.sh --tags dynamic
+./test.sh --arch aarch64 --tags dynamic
+./test.sh --arch riscv64 --tags dynamic
 ```
 
 ## The gates, and what each one costs
 
-The Justfile has 118 recipes, 65 of them checks or tests, and nothing says which to run before
-releasing or how long any of them takes. Measured on the documented host:
+`./check.sh --list` names every gate and conformance suite, and nothing there says which to run
+before releasing or how long any of them takes. Measured on the documented host:
 
 | gate                      |   time | what it settles                                       |
 | ------------------------- | -----: | ----------------------------------------------------- |
@@ -322,8 +322,8 @@ releasing or how long any of them takes. Measured on the documented host:
 
 What overlaps, so a release does not pay twice:
 
-- `test-all` runs the kernel suite for all three architectures, so it contains `just test`,
-  `just test-aarch64` and `just test-riscv64`.
+- `test-all` runs the kernel suite for all three architectures, so it contains `./test.sh`,
+  `./test.sh --arch aarch64` and `./test.sh --arch riscv64`.
 - `test-tags-check` is a dependency of every preflight, and it in turn pulls
   `artifact-metadata-check` and `services-host-test`. Any test run has already paid for those.
 - The six static-injection recipes are one script in six modes sharing four dependencies. Run

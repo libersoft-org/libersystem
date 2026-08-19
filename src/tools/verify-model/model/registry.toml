@@ -91,7 +91,7 @@ component = "harness.tools"
 path = "src/user/services/manifest.toml"
 component = "manifest"
 
-# The interface definitions every generated protocol crate is produced from. `just gen` passes
+# The interface definitions every generated protocol crate is produced from. `./gen.sh` passes
 # `idl/*.lsidl` to every one of the sixteen, so one .lsidl reaches all of them.
 [[ownership]]
 path = "src/idl"
@@ -150,7 +150,15 @@ path = "setup.sh"
 component = "harness.scripts"
 
 [[ownership]]
-path = "src/Justfile"
+path = "gen.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "lab.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "bench.sh"
 component = "harness.scripts"
 
 # The factory files the system volume ships, and the version every build stamps into itself.
@@ -411,7 +419,7 @@ evidence = "a test file reaches the tests in it; once `covers` is on every test 
 # hand-maintained table this whole model replaces.
 
 # Generation: every protocol crate is produced from the whole `idl/*.lsidl` set, so one interface
-# file reaches all sixteen. `just gen` passes the glob; this says the same thing to the planner.
+# file reaches all sixteen. `./gen.sh` passes the glob; this says the same thing to the planner.
 [[edge]]
 from = [
 	"base-proto",

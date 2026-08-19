@@ -87,14 +87,6 @@ fi
 info "Ensuring nightly toolchain + components (rust-src, llvm-tools-preview)..."
 rustup toolchain install nightly --profile minimal --component rust-src --component llvm-tools-preview
 
-# just (task runner) - via cargo, since it is not packaged in apt on Debian 12
-if ! command -v just >/dev/null 2>&1; then
-	info "Installing 'just' via cargo..."
-	cargo install just
-else
-	info "'just' is installed."
-fi
-
 # taplo (TOML formatter) - shared by CLI format gates and VS Code format-on-save
 TAPLO_VERSION="0.10.0"
 if ! command -v taplo >/dev/null 2>&1 || [[ "$(taplo --version)" != "taplo $TAPLO_VERSION" ]]; then
@@ -107,7 +99,7 @@ fi
 echo
 info "${BOLD}Done.${RESET}"
 echo "  - Rust nightly + rust-src + llvm-tools-preview"
-echo "  - QEMU (x86_64 + aarch64), gdb, lld, xorriso, gdisk, mtools, udftools, just, taplo"
+echo "  - QEMU (x86_64 + aarch64), gdb, lld, xorriso, gdisk, mtools, udftools, taplo"
 echo
 echo "Next step: cd src/kernel && cargo build"
 echo "Note: the project selects nightly via rust-toolchain.toml, no global switch needed."

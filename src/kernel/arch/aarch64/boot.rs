@@ -345,7 +345,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// Parse the device tree (QEMU leaves it in low RAM; x0 arrives as 0 for a bare
 	// ELF, so the parser scans for it) to learn the real RAM size and CPU count
 	// instead of hard-coding them.
-	let boot_info = super::dtb::parse(dtb);
+	let boot_info = unsafe { super::dtb::parse(dtb) };
 	let ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
 	let (ram_top, cpu_count, fwcfg_base) = match boot_info {
 		Some(bi) => {
@@ -414,7 +414,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// This kernel keeps reading the tree after the allocator is up, and the specification requires a
 	// client not to overwrite it or use the reservation block's regions. See
 	// `bootmem::devicetree_reservations`.
-	if let Some(tree) = super::dtb::located(dtb) {
+	if let Some(tree) = (unsafe { super::dtb::located(dtb) }) {
 		hole_count = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
 	}
 	// AND THE DIRECT BOOT'S ARCHIVE. Nothing else carves it: `loader_reservations` reads a hand-off

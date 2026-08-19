@@ -19,8 +19,15 @@ fn identity(address: u64) -> u64 {
 	address
 }
 
+// THE SAFETY ARGUMENT FOR THIS WHOLE FILE, made once (FDT-007).
+//
+// `Fdt::new` is `unsafe` because it takes a physical address it will dereference, and nothing in
+// `base: u64` says the number is a device tree. Here it always is: `blob` is a `&'static [u8]` this
+// process owns - either an `include_bytes!` fixture or a leaked `Vec` from the builder below - and
+// `identity` is the correct translation for an address that is already virtual. Forty-eight call
+// sites would have carried forty-eight `unsafe` blocks stating none of that.
 fn at(blob: &'static [u8]) -> Fdt {
-	Fdt::new(blob.as_ptr() as u64, identity)
+	unsafe { Fdt::new(blob.as_ptr() as u64, identity) }
 }
 
 const AARCH64: &[u8] = include_bytes!("../tests/qemu-virt-aarch64.dtb");
@@ -455,6 +462,110 @@ fn a_blob_that_is_not_a_device_tree_answers_none_rather_than_walking_it() {
 	assert!(!fdt.has_isa_extension(b"svpbmt"));
 }
 
+// A token stream that never closes what it opened is refused (FDT-008).
+#[test]
+fn a_tree_that_ends_with_a_node_still_open_is_not_a_tree() {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	// The root's own `end()` is missing, so `FDT_END` arrives at depth 0.
+	let blob = builder.finish();
+	let fdt = at(blob);
+	assert!(fdt.is_valid(), "the header is well formed - it is the structure that is not");
+	assert!(fdt.parse().is_none(), "a stream with a node still open is refused rather than read");
+}
+
+// And the balanced version of the same tree parses, so the refusal is about the imbalance.
+#[test]
+fn the_same_tree_parses_once_it_closes_its_root() {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.end();
+	let info = at(builder.finish()).parse().expect("balanced, so it parses");
+	assert_eq!(info.ram_base, 0x4000_0000);
+}
+
+// ---------------------------------------------------------------------------------------------
+// ISA extensions: whole names, and every hart (FDT-004).
+// ---------------------------------------------------------------------------------------------
+
+// A machine with `count` harts, each carrying the `riscv,isa` and `riscv,isa-extensions` given.
+fn harts(entries: &[(&str, &[&str])]) -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@80000000").prop("device_type", b"memory\0").prop_reg64(0x8000_0000, 0x1000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+	for (index, (isa, extensions)) in entries.iter().enumerate() {
+		builder.begin(&alloc_name(index));
+		builder.prop_u32("reg", index as u32);
+		if !isa.is_empty() {
+			builder.prop_str("riscv,isa", isa);
+		}
+		if !extensions.is_empty() {
+			let mut bytes: Vec<u8> = Vec::new();
+			for name in *extensions {
+				bytes.extend_from_slice(name.as_bytes());
+				bytes.push(0);
+			}
+			builder.prop("riscv,isa-extensions", &bytes);
+		}
+		builder.end();
+	}
+	builder.end();
+	builder.end();
+	builder.finish()
+}
+
+fn alloc_name(index: usize) -> String {
+	format!("cpu@{index}")
+}
+
+#[test]
+fn a_single_letter_extension_is_read_out_of_the_base_string_and_not_out_of_a_name() {
+	// `c` IS in `rv64imafdc`. It is NOT in `rv64ima_zicsr`, where the only `c` is inside `zicsr` -
+	// which a substring scan reported as present.
+	assert!(at(harts(&[("rv64imafdc", &[])])).has_isa_extension(b"c"));
+	assert!(!at(harts(&[("rv64ima_zicsr", &[])])).has_isa_extension(b"c"));
+}
+
+#[test]
+fn a_multi_letter_extension_is_a_whole_underscore_separated_name() {
+	assert!(at(harts(&[("rv64imafdc_svpbmt", &[])])).has_isa_extension(b"svpbmt"));
+	// `sv` is a prefix of `svpbmt` and is not itself declared.
+	assert!(!at(harts(&[("rv64imafdc_svpbmt", &[])])).has_isa_extension(b"sv"));
+	// And `pbmt` is an infix of it.
+	assert!(!at(harts(&[("rv64imafdc_svpbmt", &[])])).has_isa_extension(b"pbmt"));
+}
+
+#[test]
+fn the_extensions_stringlist_is_compared_element_by_element() {
+	assert!(at(harts(&[("", &["zicsr", "svpbmt"])])).has_isa_extension(b"svpbmt"));
+	assert!(!at(harts(&[("", &["zicsr", "svpbmt"])])).has_isa_extension(b"csr"));
+	assert!(!at(harts(&[("", &["zicsr", "svpbmt"])])).has_isa_extension(b"zic"));
+}
+
+// THE ONE THAT MATTERS ON A REAL MACHINE. This answered `true` on the first hart that had the
+// extension, and the kernel then used it on every hart - an illegal instruction on the others.
+#[test]
+fn an_extension_one_hart_lacks_is_not_this_machines_extension() {
+	assert!(at(harts(&[("rv64imafdc_svpbmt", &[]), ("rv64imafdc_svpbmt", &[])])).has_isa_extension(b"svpbmt"), "both harts have it");
+	assert!(!at(harts(&[("rv64imafdc_svpbmt", &[]), ("rv64imafdc", &[])])).has_isa_extension(b"svpbmt"), "the second does not, so the machine does not");
+}
+
+#[test]
+fn a_tree_with_no_cpu_nodes_answers_false_rather_than_vacuously_true() {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).end();
+	builder.end();
+	assert!(!at(builder.finish()).has_isa_extension(b"svpbmt"), "'every hart' over no harts is not 'yes'");
+}
+
 // ---------------------------------------------------------------------------------------------
 // PSCI: which instruction reaches the platform's implementation.
 // ---------------------------------------------------------------------------------------------
@@ -713,4 +824,118 @@ fn the_memory_reservation_block_is_read() {
 	let (base, len) = fdt.extent().expect("the blob knows how big it is");
 	assert_eq!(base, blob.as_ptr() as u64);
 	assert_eq!(len as usize, blob.len(), "the extent is the whole blob, which is what must not be overwritten");
+}
+
+// ---------------------------------------------------------------------------------------------
+// `/reserved-memory` (FDT-001), the other place a tree says "do not use this".
+// ---------------------------------------------------------------------------------------------
+
+fn reserved_memory_of(blob: &'static [u8]) -> (Vec<(u64, u64)>, bool) {
+	let mut seen: Vec<(u64, u64)> = Vec::new();
+	let complete = at(blob).for_each_reserved_memory_node(|base, size| seen.push((base, size)));
+	(seen, complete)
+}
+
+#[test]
+fn the_reserved_memory_subtree_is_read() {
+	// The shape a board actually writes: a firmware carve-out with `no-map`, a DMA pool that is
+	// `reusable`, and a dynamic child with a `size` and no `reg`.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("reserved-memory").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop("ranges", b"");
+	builder.begin("secure@40000000").prop_reg64(0x4000_0000, 0x10_0000).prop("no-map", b"").end();
+	builder.begin("dma-pool@41000000").prop_reg64(0x4100_0000, 0x40_0000).prop("reusable", b"").end();
+	builder.begin("placed-by-the-client").prop("size", &0x10_0000u64.to_be_bytes()).end();
+	builder.end();
+	builder.end();
+	let blob = builder.finish();
+	let (seen, complete) = reserved_memory_of(blob);
+	assert!(complete, "the subtree is walked to the end of the tree");
+	assert_eq!(seen, vec![(0x4000_0000u64, 0x10_0000u64), (0x4100_0000, 0x40_0000)], "both fixed regions, and nothing for the one with no reg");
+}
+
+// `reusable` IS RESERVED. The specification lets the OS use such a region until the owner claims it
+// back, and this kernel cannot give a frame back on demand - so the flag is not a licence here, and
+// this is what says so.
+#[test]
+fn a_reusable_region_is_reserved_like_any_other() {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("reserved-memory").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("pool@50000000").prop_reg64(0x5000_0000, 0x10_0000).prop("reusable", b"").end();
+	builder.end();
+	builder.end();
+	let (seen, complete) = reserved_memory_of(builder.finish());
+	assert!(complete);
+	assert_eq!(seen, vec![(0x5000_0000u64, 0x10_0000u64)]);
+}
+
+// A CHILD MAY DECLARE SEVERAL RANGES, and a trailing partial pair is not one of them.
+#[test]
+fn one_child_may_carry_several_ranges_and_a_partial_pair_is_not_a_range() {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("reserved-memory").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	let mut reg = Vec::new();
+	for (base, size) in [(0x6000_0000u64, 0x1000u64), (0x6100_0000, 0x2000)] {
+		reg.extend_from_slice(&base.to_be_bytes());
+		reg.extend_from_slice(&size.to_be_bytes());
+	}
+	// Half of a third pair: an address with no size.
+	reg.extend_from_slice(&0x6200_0000u64.to_be_bytes());
+	builder.begin("two-and-a-half@60000000").prop("reg", &reg).end();
+	builder.end();
+	builder.end();
+	let (seen, complete) = reserved_memory_of(builder.finish());
+	assert!(complete);
+	assert_eq!(seen, vec![(0x6000_0000u64, 0x1000u64), (0x6100_0000, 0x2000)], "the half pair carves nothing");
+}
+
+// The node's OWN cell counts, when it declares them, and the root's when it does not.
+#[test]
+fn the_subtrees_own_cell_counts_are_used() {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	// One cell each, which is a 32-bit machine's shape and not the root's.
+	builder.begin("reserved-memory").prop_u32("#address-cells", 1).prop_u32("#size-cells", 1);
+	let mut reg = Vec::new();
+	reg.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+	reg.extend_from_slice(&0x10_0000u32.to_be_bytes());
+	builder.begin("fb@80000000").prop("reg", &reg).end();
+	builder.end();
+	builder.end();
+	let (seen, complete) = reserved_memory_of(builder.finish());
+	assert!(complete);
+	assert_eq!(seen, vec![(0x8000_0000u64, 0x10_0000u64)], "read with one cell each, not the root's two");
+}
+
+// A NAME THAT MERELY STARTS WITH IT IS NOT IT.
+#[test]
+fn a_node_named_like_reserved_memory_is_not_reserved_memory() {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("reserved-memory-pool").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("thing@90000000").prop_reg64(0x9000_0000, 0x1000).end();
+	builder.end();
+	builder.end();
+	let (seen, complete) = reserved_memory_of(builder.finish());
+	assert!(complete);
+	assert!(seen.is_empty(), "nothing under a node that is not /reserved-memory");
+}
+
+// A tree with no such subtree answers cleanly rather than refusing.
+#[test]
+fn a_tree_without_the_subtree_reports_nothing_and_completes() {
+	let (seen, complete) = reserved_memory_of(AARCH64);
+	assert!(complete, "the real QEMU tree walks to its end");
+	assert!(seen.is_empty(), "QEMU virt declares no /reserved-memory");
+	let (seen, complete) = reserved_memory_of(RISCV64);
+	assert!(complete);
+	assert!(seen.is_empty());
 }

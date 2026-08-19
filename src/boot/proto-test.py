@@ -157,7 +157,7 @@ class Peer:
 			except OSError:
 				handle.close()
 				time.sleep(0.1)
-		raise SystemExit(f'proto-test: cannot reach {lab.DEV_CHANNEL_SOCK}; is `just lab dev-up` running?')
+		raise SystemExit(f'proto-test: cannot reach {lab.DEV_CHANNEL_SOCK}; is `./dev.sh up` running?')
 
 	# Read one frame, resynchronising on the magic. Junk before a frame is skipped rather than
 	# fatal, because the x86_64 channel really does carry a firmware preamble nobody framed.
@@ -776,7 +776,7 @@ def main(argv):
 	if unknown:
 		raise SystemExit(f'proto-test: unknown group(s) {", ".join(unknown)}; known: {", ".join(GROUPS)}')
 	if not os.path.exists(lab.DEV_CHANNEL_SOCK):
-		raise SystemExit('proto-test: no development instance (run `just lab dev-up` first)')
+		raise SystemExit('proto-test: no development instance (run `./dev.sh up` first)')
 	suite = Suite()
 	started = time.monotonic()
 	for name in wanted:

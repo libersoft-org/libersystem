@@ -214,7 +214,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// Increment 4: parse the device tree (the shared FDT parser), seed the portable
 	// frame allocator, and bring up the kernel heap in the higher half.
 	use super::paging;
-	let boot_info = super::dtb::parse(dtb);
+	let boot_info = unsafe { super::dtb::parse(dtb) };
 	let ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
 	let (ram_top, cpu_count, pcie_ecam, _plic_base, fwcfg_base) = match boot_info {
 		Some(bi) => {
@@ -259,7 +259,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// Detected rather than assumed, and the default is off: bits 62:61 are RESERVED on a hart
 	// without the extension, so setting them where it is absent faults every mapping that uses
 	// them. A device tree that does not mention it leaves this port exactly where it was.
-	let svpbmt = super::dtb::has_isa_extension(dtb, b"svpbmt");
+	let svpbmt = unsafe { super::dtb::has_isa_extension(dtb, b"svpbmt") };
 	paging::set_svpbmt(svpbmt);
 	crate::serial_println!("riscv64: Svpbmt {} - uncacheable mappings {}", if svpbmt { "present" } else { "absent" }, if svpbmt { "use PBMT=IO" } else { "fall back to platform PMAs" });
 	let _ = _plic_base;
@@ -284,7 +284,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// This kernel keeps reading the tree after the allocator is up, and the specification requires a
 	// client not to overwrite it or use the reservation block's regions. See
 	// `bootmem::devicetree_reservations`.
-	if let Some(tree) = super::dtb::located(dtb) {
+	if let Some(tree) = (unsafe { super::dtb::located(dtb) }) {
 		hole_count = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
 	}
 	// AND THE DIRECT BOOT'S ARCHIVE. Nothing else carves it: `loader_reservations` reads a hand-off

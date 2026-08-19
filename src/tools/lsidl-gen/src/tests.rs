@@ -251,11 +251,18 @@ fn the_fixed_buffer_encode_refuses_to_drop_a_capability() {
 	let file = parse_only("package liber:enc@1; resource file; record held { file: handle<file>, size: u64 } record plain { size: u64 } interface i { @op(1) m: func() -> held; }");
 	assert!(validate::validate(&file).is_empty());
 	let rust = crate::codegen::rust(&file, "enc.lsidl", &std::collections::HashMap::new()).unwrap();
-	assert!(rust.contains("// A capability recorded here would be dropped by returning the length alone."), "the fixed-buffer encode refuses too: {rust}");
-	assert!(rust.contains("if w.has_handle() { return None; }"), "and refuses by asking the writer");
+	// THE REFUSAL IS THE CODEC'S NOW, not a line this generator remembers to emit (WIRE-001). So
+	// what is asserted is that both encoders end in the CONSUMING call - `SliceWriter::finish` and
+	// `VecWriter::into_inner`, each of which returns `None` while it holds a handle - rather than in
+	// `pos()`/`self.buf`, which hand over one half of a message.
+	assert!(rust.contains("pub fn encode(&self, out: &mut [u8]) -> Option<usize> {"), "the fixed-buffer encode is generated: {rust}");
+	assert!(rust.contains("w.finish()"), "and ends in the call that refuses to drop a capability");
+	assert!(!rust.contains("Some(w.pos())"), "rather than in the one that would return a length beside a lost handle");
 	// Both halves of the pair, so neither can be corrected alone again.
-	assert!(rust.contains("if !w.handles().is_empty() { return None; }"), "encode_vec still refuses");
+	assert!(rust.contains("w.into_inner()"), "encode_vec ends in the refusing call too");
+	assert!(!rust.contains("Some(w.into_inner())"), "and not in an infallible one");
 	assert!(rust.contains("pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)>"), "and the shape that carries both halves is still generated");
+	assert!(rust.contains("Some(w.into_message())"), "which takes the bytes and the capabilities in one call");
 }
 
 #[test]

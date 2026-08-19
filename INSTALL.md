@@ -77,7 +77,7 @@ x86_64 and aarch64 only. The serial console keeps running alongside. Audio is ro
 
 ```sh
 cd src
-just screenshot shot.png     # png, jpg, webp, gif, bmp, ppm by extension
+./lab.sh screenshot shot.png     # png, jpg, webp, gif, bmp, ppm by extension
 ```
 
 Attaches to a live run and snaps the current frame; otherwise boots a throwaway instance, waits for the boot log and snaps that.
@@ -142,9 +142,9 @@ Host-side gates that inspect artifacts without booting anything are separate:
 ## Debugging
 
 ```sh
-cd src && just lab boot --fresh   # boot with a fresh data volume
-cd src && just lab sh time ls     # run a command in the guest, get its output
-cd src && just lab quit
+cd src && ./lab.sh boot --fresh   # boot with a fresh data volume
+cd src && ./lab.sh sh time ls     # run a command in the guest, get its output
+cd src && ./lab.sh quit
 ```
 
 See [docs/DEBUG.md](./docs/DEBUG.md) for the full toolbox. For a longer-lived instance you develop against - publish new binaries without rebooting, roll back, send keystrokes - use `./dev.sh <verb>` (`up`, `log`, `publish`, `rollback`, `key`, ...).
@@ -152,8 +152,8 @@ See [docs/DEBUG.md](./docs/DEBUG.md) for the full toolbox. For a longer-lived in
 For kernel-level debugging, boot with a GDB stub on `:1234` and attach from a second terminal:
 
 ```sh
-cd src && just debug
-cd src && just gdb
+cd src && ./run.sh --debug
+cd src && ./run.sh --gdb
 ```
 
 ## Command reference
@@ -171,7 +171,12 @@ Every script is at the repository root and answers `--help`.
 | `./clean.sh [--part P] [--dry-run]` | Remove build output (`cargo`, `boot`, `logs`). |
 | `./dev.sh <verb> [args]` | Drive the persistent development guest. |
 | `./format.sh [--changed]` | Format Rust and shell sources. |
+| `./gen.sh [--check] [--accept-breaking]` | Regenerate the protocol bindings and the ABI manifests from `src/idl`. |
+| `./lab.sh <subcommand> [args]` | Drive a live guest: boot it, run commands in it, screenshot it, measure it. |
+| `./bench.sh [--suite N]` | The optimized host measurement and hostile-input runs. |
+| `./verify.sh --for PATH [--plan]` | What to run after changing something, planned from the dependency graph. |
 
-A Justfile in `src/` keeps the specialist recipes: the IDL generator (`gen`, `gen-check`), host-side test crates (`fs-host-test`, `services-host-test`, `proto-test`), benchmarks (`audio-bench`, `image-bench`, `perf-gate`), the two loader builds whose bodies differ per architecture, source hygiene checks, and the debugging entry points above. `cd src && just --list` shows them.
+There is no task runner and nothing to install for one: every command above is a script in this
+directory that takes flags and answers `--help`.
 
 > `./format.sh` needs [`shfmt`](https://github.com/mvdan/sh) on your `PATH`.

@@ -44,7 +44,10 @@ impl GopFb {
 
 // Query the Graphics Output Protocol for the active mode's linear framebuffer. Returns
 // `GopFb::NONE` on a headless boot (no GOP / no active mode / an unsupported format).
-pub fn locate_framebuffer(bs: *mut BootServices) -> GopFb {
+//
+// # Safety
+// `bs` must be the live `BootServices` table, before `ExitBootServices`.
+pub unsafe fn locate_framebuffer(bs: *mut BootServices) -> GopFb {
 	let mut gop: *mut c_void = core::ptr::null_mut();
 	let status = unsafe { ((*bs).locate_protocol)(&uefi::GRAPHICS_OUTPUT_PROTOCOL_GUID, core::ptr::null_mut(), &mut gop) };
 	if uefi::is_error(status) || gop.is_null() {

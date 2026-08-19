@@ -38,7 +38,7 @@ trap cleanup EXIT
 # print one summary line instead. Ask for the detail explicitly rather than reading a
 # quiet log for markers that are not in it.
 run_graph() {
-	(cd "$root" && LIBER_IMAGE_LOCK_HELD=1 LIBER_VERBOSE=1 just shared-libs) >"$output" 2>&1
+	(cd "$root" && LIBER_IMAGE_LOCK_HELD=1 LIBER_VERBOSE=1 ./build.sh --part libs --rebuild) >"$output" 2>&1
 }
 
 summary_value() {

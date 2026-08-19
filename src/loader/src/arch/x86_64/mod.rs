@@ -101,15 +101,15 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	let trampoline = alloc_low_page(bs);
 
 	// The kernel stack.
-	let stack_phys = alloc_pages(bs, STACK_PAGES).expect("loader: cannot allocate kernel stack");
+	let stack_phys = unsafe { alloc_pages(bs, STACK_PAGES) }.expect("loader: cannot allocate kernel stack");
 	let stack_top = HHDM_OFFSET + stack_phys + (STACK_PAGES as u64 * PAGE_SIZE);
 
 	// Buffers the kernel keeps reading after hand-off: the BootInfo, the region
 	// array, and the module array all live in LOADER_DATA (retained memory).
-	let boot_info_phys = alloc_pages(bs, 1).expect("loader: cannot allocate BootInfo");
+	let boot_info_phys = unsafe { alloc_pages(bs, 1) }.expect("loader: cannot allocate BootInfo");
 	let regions_pages = (core::mem::size_of::<MemRegion>() * MAX_REGIONS).div_ceil(PAGE_SIZE as usize);
-	let regions_phys = alloc_pages(bs, regions_pages).expect("loader: cannot allocate region array");
-	let modules_phys = alloc_pages(bs, 1).expect("loader: cannot allocate module array");
+	let regions_phys = unsafe { alloc_pages(bs, regions_pages) }.expect("loader: cannot allocate region array");
+	let modules_phys = unsafe { alloc_pages(bs, 1) }.expect("loader: cannot allocate module array");
 
 	// Publish the loaded packages as modules. The volume archive is only there when the image
 	// carries one.
@@ -135,7 +135,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// so the loader handed the kernel a direct map covering nothing and carried on. That is the
 	// fail-open shape this project has removed twice elsewhere - a machine with no RAM does not
 	// exist, so 0 can only mean the map could not be taken.
-	let top = uefi::memory::memory_top(bs);
+	let top = unsafe { uefi::memory::memory_top(bs) };
 	if top == 0 {
 		panic!("loader: the firmware would not give a memory map, so there is no RAM ceiling to build the direct map over");
 	}
@@ -270,33 +270,34 @@ impl KernelSegment {
 // file bytes, zero the tail (BSS), and record the mapping. Returns (entry, count).
 fn load_kernel(bs: *mut BootServices, kernel: &[u8], out: &mut [KernelSegment; MAX_SEGMENTS]) -> (u64, usize) {
 	let image = crate::elf::Elf::parse(kernel).expect("loader: kernel is not a valid ELF64 executable");
-	// ET_EXEC ONLY. The shared parser admits `ET_DYN` too, because the kernel loads position-
-	// independent userspace binaries with it and the compatibility checker reads shared libraries -
-	// but THIS loader computes no load bias and processes no relocations, so a PIE kernel would be
-	// placed at its link addresses and jumped to unrelocated. Refused by name until a PIE kernel is
-	// wanted, which is a change here rather than to the parser.
-	assert!(image.image_type == crate::elf::ET_EXEC, "loader: the kernel image must be ET_EXEC");
-	// AND PAGE-ALIGNED, W^X LOAD SEGMENTS. Both are rules about THIS backend rather than about the
-	// format, which is why they are here and not in the parser.
+	// ONE PLAN, CHECKED BEFORE ANYTHING IS COPIED (LDR-011). This was a loop of two `assert!`s here,
+	// a different pair of rules in the aarch64 backend and none in riscv64, and no backend asked the
+	// two questions that need asking wherever an image is loaded: whether two segments claim the
+	// same page, and whether the entry point lands inside a segment that was loaded and is
+	// executable. `bootproto::elf::load_plan` is those rules in one place; `LoadRules` is which of
+	// them this backend is entitled to demand.
 	//
-	// Alignment: this backend allocates from `p_memsz`, copies to the segment's own address and
-	// maps from `align_down(..)`, all of which are wrong by the page offset if a LOAD segment does
-	// not start on a page. ELF only requires `p_vaddr = p_offset (mod p_align)`, which the parser
+	// ET_EXEC: the shared parser admits `ET_DYN` too, because the kernel loads position-independent
+	// userspace binaries with it and the compatibility checker reads shared libraries - but THIS
+	// loader computes no load bias and processes no relocations, so a PIE kernel would be placed at
+	// its link addresses and jumped to unrelocated.
+	//
+	// Alignment: this backend allocates from `p_memsz`, copies to the segment's own address and maps
+	// from `align_down(..)`, all of which are wrong by the page offset if a LOAD segment does not
+	// start on a page. ELF only requires `p_vaddr = p_offset (mod p_align)`, which the parser
 	// checks for every image.
 	//
 	// W^X: `map_kernel_segment` derives `WRITABLE` and `NX` from the flags independently, so a
 	// writable-and-executable segment would be mapped read-write-execute under a comment claiming
 	// W^X. The x86_64 kernel has no such segment - unlike the aarch64 and riscv64 kernels, whose
-	// boot stubs are one `RWE` segment by construction, which is why this assertion cannot live in
-	// the shared parser.
-	for i in 0..image.segment_count() {
-		let Some(ph) = image.segment(i) else { continue };
-		if ph.p_type != crate::elf::PT_LOAD {
-			continue;
-		}
-		assert!(ph.p_vaddr % PAGE_SIZE == 0, "loader: a kernel LOAD segment is not page-aligned");
-		assert!(ph.p_flags & crate::elf::PF_W == 0 || ph.p_flags & crate::elf::PF_X == 0, "loader: a kernel LOAD segment is both writable and executable");
-	}
+	// boot stubs are one `RWE` segment by construction, which is why this backend asks for the rule
+	// and those two do not.
+	let plan = bootproto::elf::load_plan(&image, bootproto::elf::LoadRules::kernel(PAGE_SIZE));
+	let plan = match plan {
+		Ok(plan) => plan,
+		Err(why) => panic!("loader: the kernel image is not loadable: {why:?}"),
+	};
+	assert!(plan.segments <= MAX_SEGMENTS, "loader: more kernel LOAD segments than this backend records");
 	let mut count = 0usize;
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
@@ -308,7 +309,7 @@ fn load_kernel(bs: *mut BootServices, kernel: &[u8], out: &mut [KernelSegment; M
 		// `p_vaddr` to whatever physical pages it is given and never writes to `p_paddr`, so the
 		// reservation is a claim it neither needs nor can be hurt by. The two backends that place
 		// AT the link address are the ones that must refuse a span they do not own.
-		let phys = alloc_pages(bs, pages as usize).expect("loader: cannot allocate kernel segment");
+		let phys = unsafe { alloc_pages(bs, pages as usize) }.expect("loader: cannot allocate kernel segment");
 		unsafe {
 			core::ptr::write_bytes(phys as *mut u8, 0, (pages * PAGE_SIZE) as usize);
 			if let Some(data) = image.segment_data(&ph) {
@@ -318,7 +319,7 @@ fn load_kernel(bs: *mut BootServices, kernel: &[u8], out: &mut [KernelSegment; M
 		out[count] = KernelSegment { virt: align_down(ph.p_vaddr, PAGE_SIZE), phys, pages, writable: ph.p_flags & crate::elf::PF_W != 0, executable: ph.p_flags & crate::elf::PF_X != 0 };
 		count += 1;
 	}
-	(image.entry, count)
+	(plan.entry, count)
 }
 
 // Build a boot-protocol module for a loaded package: its HHDM address, size, and
@@ -336,7 +337,7 @@ struct FbResult {
 // when a framebuffer is present, build the x86 boot-protocol Framebuffer with an HHDM
 // virtual `addr` (the loader maps the framebuffer into the HHDM below).
 fn locate_framebuffer(bs: *mut BootServices) -> FbResult {
-	let g = crate::locate_framebuffer(bs);
+	let g = unsafe { crate::locate_framebuffer(bs) };
 	if !g.present {
 		return FbResult { info: unsafe { core::mem::zeroed() }, phys: 0, size: 0, present: false };
 	}
@@ -381,7 +382,7 @@ fn alloc_low_page(bs: *mut BootServices) -> u64 {
 // is what this boot had before, so it says so and carries on rather than refusing to boot over an
 // attribute.
 fn map_mmio_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top: u64) {
-	let Some((buf, pages, map_size, desc_size)) = uefi::memory::memory_map_snapshot(bs) else {
+	let Some((buf, pages, map_size, desc_size)) = (unsafe { uefi::memory::memory_map_snapshot(bs) }) else {
 		// NO MAP AT ALL IS A REFUSAL. The loader knows it is about to hand the kernel a direct map
 		// it could not check, and "no worse than the bug" is a reason not to panic over a cosmetic
 		// attribute - MMIO mapped write-back is not cosmetic. It is a device seeing stale writes and
@@ -442,7 +443,7 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 	let Some(cap) = desc_size.checked_mul(16).and_then(|margin| map_size.checked_add(margin)) else {
 		panic!("loader: the firmware's memory-map dimensions do not fit an allocation");
 	};
-	let buf = alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
+	let buf = unsafe { alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)) }.expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
 	// The arenas are the loader's own working memory, and left alone they reach the kernel as
@@ -485,7 +486,7 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 		// FATAL, not silent, and said HERE because this is where there is a serial port to say it
 		// on: `translate_map` refuses a map with more regions than the boot protocol carries rather
 		// than truncating it.
-		let Some(count) = uefi::memory::translate_map(buf, size, desc_size, regions) else {
+		let Some(count) = (unsafe { uefi::memory::translate_map(buf, size, desc_size, regions) }) else {
 			serial::write_str("loader: FATAL - the firmware memory map has more regions than the boot protocol carries\n");
 			panic!("memory map larger than MAX_REGIONS");
 		};

@@ -10,7 +10,7 @@
 //
 //   1. loads the component from storage (vol://system/components/liber_component/app.wasm), rather than
 //      embedding it in the kernel image - StorageService serves it from the ramdisk
-//      volume that `just sdk` stages it into;
+//      volume that `./build.sh --part sdk` stages it into;
 //   2. resolves each of the component's imports by its (module, field) name into a
 //      typed operation - the `liber` world: `read` and `write` map to StorageService,
 //      `log` maps to LogService - and traps any import it does not recognize;

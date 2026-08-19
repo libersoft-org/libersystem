@@ -508,15 +508,24 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				// the operand is the table index; the immediate is the signature the call
 				// site expects. Trap on an out-of-bounds index, a null entry, or a callee
 				// whose actual signature does not match the expected one (the spec semantics).
+				//
+				// THE TRAP TEXTS ARE THE SPECIFICATION'S OWN PHRASES, here and at every other trap
+				// in this file. They used to be this engine's wording - "signature mismatch",
+				// "table index out of bounds" - and the executable specification suite asserts the
+				// text the specification states, so 141 trap assertions could not be checked at all
+				// and passed on any trap whatsoever (WASM-004). A translation table in the test
+				// would have been a second thing to keep in step with the first; saying what the
+				// specification says is one thing. The `call_indirect: ` prefix stays because it
+				// says WHERE, which the specification's phrase does not.
 				let entry: i32 = pop(stack)?.as_i32();
 				if entry < 0 || entry as usize >= table.len() {
-					return Err(Trap("call_indirect: table index out of bounds"));
+					return Err(Trap("call_indirect: undefined element"));
 				}
-				let target: u32 = table[entry as usize].ok_or(Trap("call_indirect: null table entry"))?;
+				let target: u32 = table[entry as usize].ok_or(Trap("call_indirect: uninitialized element"))?;
 				let expected = module.types.get(*type_idx as usize).ok_or(Trap("call_indirect: unknown type"))?;
 				let actual = module.func_type(target).ok_or(Trap("call_indirect: unknown target function"))?;
 				if actual != expected {
-					return Err(Trap("call_indirect: signature mismatch"));
+					return Err(Trap("call_indirect: indirect call type mismatch"));
 				}
 				let nargs: usize = expected.params.len();
 				if stack.len() < nargs {
@@ -570,7 +579,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 			Instr::Load { width, signed, wide, offset } => {
 				let addr: usize = mem_addr(stack, *offset)?;
 				let w: usize = *width as usize;
-				let bytes: &[u8] = memory.get(addr..addr + w).ok_or(Trap("memory access out of bounds"))?;
+				let bytes: &[u8] = memory.get(addr..addr + w).ok_or(Trap("out of bounds memory access"))?;
 				let mut raw: [u8; 8] = [0u8; 8];
 				raw[..w].copy_from_slice(bytes);
 				let value: Value = if *wide {
@@ -600,18 +609,18 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 					Value::F32(x) => (x.to_bits() as u64).to_le_bytes(),
 					Value::F64(x) => x.to_bits().to_le_bytes(),
 				};
-				let slot: &mut [u8] = memory.get_mut(addr..addr + w).ok_or(Trap("memory access out of bounds"))?;
+				let slot: &mut [u8] = memory.get_mut(addr..addr + w).ok_or(Trap("out of bounds memory access"))?;
 				slot.copy_from_slice(&raw[..w]);
 			}
 			Instr::FLoad { wide, offset } => {
 				let addr: usize = mem_addr(stack, *offset)?;
 				if *wide {
-					let bytes: &[u8] = memory.get(addr..addr + 8).ok_or(Trap("memory access out of bounds"))?;
+					let bytes: &[u8] = memory.get(addr..addr + 8).ok_or(Trap("out of bounds memory access"))?;
 					let mut raw: [u8; 8] = [0u8; 8];
 					raw.copy_from_slice(bytes);
 					stack.push(Value::F64(f64::from_bits(u64::from_le_bytes(raw))));
 				} else {
-					let bytes: &[u8] = memory.get(addr..addr + 4).ok_or(Trap("memory access out of bounds"))?;
+					let bytes: &[u8] = memory.get(addr..addr + 4).ok_or(Trap("out of bounds memory access"))?;
 					let mut raw: [u8; 4] = [0u8; 4];
 					raw.copy_from_slice(bytes);
 					stack.push(Value::F32(f32::from_bits(u32::from_le_bytes(raw))));
@@ -621,10 +630,10 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				let v: Value = pop(stack)?;
 				let addr: usize = mem_addr(stack, *offset)?;
 				if *wide {
-					let slot: &mut [u8] = memory.get_mut(addr..addr + 8).ok_or(Trap("memory access out of bounds"))?;
+					let slot: &mut [u8] = memory.get_mut(addr..addr + 8).ok_or(Trap("out of bounds memory access"))?;
 					slot.copy_from_slice(&v.as_f64().to_bits().to_le_bytes());
 				} else {
-					let slot: &mut [u8] = memory.get_mut(addr..addr + 4).ok_or(Trap("memory access out of bounds"))?;
+					let slot: &mut [u8] = memory.get_mut(addr..addr + 4).ok_or(Trap("out of bounds memory access"))?;
 					slot.copy_from_slice(&v.as_f32().to_bits().to_le_bytes());
 				}
 			}
@@ -697,7 +706,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				let s: usize = pop(stack)?.as_i32() as u32 as usize;
 				let d: usize = pop(stack)?.as_i32() as u32 as usize;
 				if s.saturating_add(n) > memory.len() || d.saturating_add(n) > memory.len() {
-					return Err(Trap("memory.copy out of bounds"));
+					return Err(Trap("memory.copy: out of bounds memory access"));
 				}
 				budget.charge_bulk(n)?;
 				memory.copy_within(s..s + n, d);
@@ -707,7 +716,7 @@ fn exec(module: &Module, code: &[Vec<Instr>], memory: &mut Vec<u8>, globals: &mu
 				let val: u8 = pop(stack)?.as_i32() as u8;
 				let d: usize = pop(stack)?.as_i32() as u32 as usize;
 				if d.saturating_add(n) > memory.len() {
-					return Err(Trap("memory.fill out of bounds"));
+					return Err(Trap("memory.fill: out of bounds memory access"));
 				}
 				budget.charge_bulk(n)?;
 				for byte in &mut memory[d..d + n] {

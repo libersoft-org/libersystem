@@ -40,7 +40,11 @@ pub unsafe fn free_file(bs: *mut BootServices, bytes: &[u8]) {
 // described the boundary even for its own reader. `MAX_PATH_UNITS` is the one both check against.
 pub const MAX_PATH_UNITS: usize = 64;
 
-pub fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> Option<&'static [u8]> {
+// # Safety
+// `bs` and `root` must be live firmware objects, before `ExitBootServices`. The returned slice is
+// `'static` BY ASSERTION and not by fact: it borrows pages this function allocated, and the caller
+// gives them back with `free_file`. Holding it past that read is a use-after-free (UEFI-005).
+pub unsafe fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> Option<&'static [u8]> {
 	let mut wname = [0u16; MAX_PATH_UNITS];
 	// A name that does not fit is not this name: opening a truncated path would open a different
 	// file, which is worse than not opening one.
@@ -85,7 +89,7 @@ pub fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &st
 	let file_size = unsafe { (*(info as *const uefi::FileInfo)).file_size } as usize;
 
 	let pages = file_size.div_ceil(PAGE_SIZE as usize).max(1);
-	let phys = alloc_pages(bs, pages)?;
+	let phys = unsafe { alloc_pages(bs, pages) }?;
 
 	// Read the whole file (loop until the firmware stops handing back bytes).
 	let mut read_total = 0usize;

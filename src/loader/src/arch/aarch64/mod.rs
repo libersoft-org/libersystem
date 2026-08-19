@@ -232,9 +232,9 @@ fn stack_top() -> u64 {
 // the memmap / modules / rsdp / trampoline are x86-only.
 fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u8]>, volume_pkg: Option<&'static [u8]>) -> u64 {
 	let live_volume = unsafe { crate::LIVE_VOLUME };
-	let fb = crate::locate_framebuffer(bs);
+	let fb = unsafe { crate::locate_framebuffer(bs) };
 	serial::write_str(if fb.present { "loader: GOP framebuffer found\n" } else { "loader: no GOP framebuffer (serial-only boot log)\n" });
-	let phys = crate::alloc_pages(bs, 1).expect("loader: cannot allocate BootInfo");
+	let phys = unsafe { crate::alloc_pages(bs, 1) }.expect("loader: cannot allocate BootInfo");
 	// THE FIRMWARE'S MEMORY MAP, WHICH THIS ARCHITECTURE HANDED OVER AS NOTHING.
 	//
 	// `memmap: 0, memmap_len: 0` was written here and the kernel fell back to the device tree's
@@ -249,14 +249,14 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 	// be the one immediately before `ExitBootServices` - see `exit_boot_services`. The DTB stays
 	// what it is for: CPU and device topology.
 	let regions_pages = (uefi::memory::MAX_REGIONS * core::mem::size_of::<bootproto::MemRegion>()).div_ceil(PAGE_SIZE as usize);
-	let regions_phys = crate::alloc_pages(bs, regions_pages).expect("loader: cannot allocate region array");
+	let regions_phys = unsafe { crate::alloc_pages(bs, regions_pages) }.expect("loader: cannot allocate region array");
 	let framebuffer = if fb.present { Framebuffer { addr: fb.phys, width: fb.width, height: fb.height, pitch: fb.pitch, bpp: fb.bpp, red_shift: fb.red_shift, red_size: fb.red_size, green_shift: fb.green_shift, green_size: fb.green_size, blue_shift: fb.blue_shift, blue_size: fb.blue_size, _pad: [0; 2] } } else { unsafe { core::mem::zeroed() } };
 	unsafe {
 		// The page is allocated ONLY when there is a package to describe. `match (init_pkg,
 		// alloc_pages(..))` evaluated the allocation either way, so a boot with no package leaked a
 		// page - and the `(Some, None)` arm produced a `BootInfo` with `modules_len = 0`, which is
 		// a boot that will not work reported as one that will.
-		let module_page = init_pkg.and_then(|_| crate::alloc_pages(bs, 1));
+		let module_page = init_pkg.and_then(|_| unsafe { crate::alloc_pages(bs, 1) });
 		if init_pkg.is_some() && module_page.is_none() {
 			panic!("loader: cannot allocate the module array for the bootstrap package");
 		}
@@ -312,7 +312,7 @@ fn psci_conduit(current_el: u64, dtb: u64) -> u32 {
 	let (discovered_dtb, rsdp) = crate::console::firmware_tables();
 	let tree = if dtb != 0 { dtb } else { discovered_dtb };
 	let discovered = if tree != 0 {
-		fdt::Fdt::new(tree, crate::console::identity_map).psci_conduit().map(|conduit| match conduit {
+		unsafe { fdt::Fdt::new(tree, crate::console::identity_map) }.psci_conduit().map(|conduit| match conduit {
 			fdt::PsciConduit::Hvc => bootproto::PSCI_HVC,
 			fdt::PsciConduit::Smc => bootproto::PSCI_SMC,
 		})
@@ -323,7 +323,7 @@ fn psci_conduit(current_el: u64, dtb: u64) -> u32 {
 		if rsdp == 0 {
 			return None;
 		}
-		uefi::acpi::Acpi::new(rsdp, crate::console::identity_map).psci_conduit().map(|conduit| match conduit {
+		unsafe { uefi::acpi::Acpi::new(rsdp, crate::console::identity_map) }.psci_conduit().map(|conduit| match conduit {
 			uefi::acpi::PsciConduit::Hvc => bootproto::PSCI_HVC,
 			uefi::acpi::PsciConduit::Smc => bootproto::PSCI_SMC,
 		})
@@ -354,12 +354,30 @@ fn psci_conduit(current_el: u64, dtb: u64) -> u32 {
 // which `ReservedKernel` answers without asking the firmware anything.
 fn load_kernel(kernel: &[u8], reserved: &crate::ReservedKernel) -> u64 {
 	let image = crate::elf::Elf::parse(kernel).expect("loader: kernel is not a valid aarch64 ELF64 executable");
-	// ET_EXEC ONLY. The shared parser admits `ET_DYN` too, because the kernel loads position-
-	// independent userspace binaries with it and the compatibility checker reads shared libraries -
-	// but THIS loader computes no load bias and processes no relocations, so a PIE kernel would be
-	// placed at its link addresses and jumped to unrelocated. Refused by name until a PIE kernel is
-	// wanted, which is a change here rather than to the parser.
-	assert!(image.image_type == crate::elf::ET_EXEC, "loader: the kernel image must be ET_EXEC");
+	// THE SAME PLAN THE OTHER TWO BACKENDS USE (LDR-011), minus the two rules this architecture is
+	// not entitled to.
+	//
+	// ET_EXEC: the shared parser admits `ET_DYN` too, because the kernel loads position-independent
+	// userspace binaries with it and the compatibility checker reads shared libraries - but THIS
+	// loader computes no load bias and processes no relocations, so a PIE kernel would be placed at
+	// its link addresses and jumped to unrelocated.
+	//
+	// NOT W^X: this kernel's boot stub is one `RWE` segment by construction - `.boot` runs with the
+	// MMU off and writes its own page tables - so demanding W^X here would refuse every image this
+	// backend exists to load.
+	//
+	// NOT PAGE-ALIGNED: nothing in this backend required it before and the linker script does not
+	// promise it for every output segment. Adding a rule this loader has never enforced, on an
+	// architecture whose guest suite does not currently boot for reasons that pre-date this change,
+	// would be a refusal nobody could tell from a regression.
+	//
+	// What it DOES gain is the two checks no backend had: overlapping segments and an entry point
+	// outside any loaded executable segment.
+	let rules = bootproto::elf::LoadRules { require_w_xor_x: false, require_page_aligned: false, ..bootproto::elf::LoadRules::kernel(PAGE_SIZE) };
+	let plan = match bootproto::elf::load_plan(&image, rules) {
+		Ok(plan) => plan,
+		Err(why) => panic!("loader: the kernel image is not loadable: {why:?}"),
+	};
 	for i in 0..image.segment_count() {
 		let Some(ph) = image.segment(i) else { continue };
 		if ph.p_type != crate::elf::PT_LOAD || ph.p_memsz == 0 {
@@ -395,7 +413,7 @@ fn load_kernel(kernel: &[u8], reserved: &crate::ReservedKernel) -> u64 {
 			clean_to_pou(ph.p_paddr, ph.p_memsz);
 		}
 	}
-	image.entry
+	plan.entry
 }
 
 // Clean `len` bytes at `addr` out of the data cache to the POINT OF COHERENCY, so a reader with the
@@ -551,7 +569,7 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle, regions: *mut
 	let Some(cap) = desc_size.checked_mul(16).and_then(|margin| map_size.checked_add(margin)) else {
 		panic!("loader: the firmware's memory-map dimensions do not fit an allocation");
 	};
-	let buf = crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)).expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
+	let buf = unsafe { crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)) }.expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
 	// The arenas are the loader's own working memory, and left alone they reach the kernel as
@@ -602,7 +620,7 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle, regions: *mut
 		// on: `translate_map` refuses a map with more regions than the boot protocol carries rather
 		// than truncating it, and a map that looks complete and is missing its tail is the worst
 		// available failure for the one structure that says which RAM exists.
-		let Some(count) = uefi::memory::translate_map(buf, size, desc_size, regions) else {
+		let Some(count) = (unsafe { uefi::memory::translate_map(buf, size, desc_size, regions) }) else {
 			serial::write_str("loader: FATAL - the firmware memory map has more regions than the boot protocol carries\n");
 			panic!("memory map larger than MAX_REGIONS");
 		};

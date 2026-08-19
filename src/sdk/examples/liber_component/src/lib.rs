@@ -1,6 +1,6 @@
 // The component SDK's example: a Rust guest built against the `liber:vfs@1` / `liber:log@1` world.
 //
-// `just sdk` compiles this crate for wasm32-unknown-unknown, and the package builder stages it into
+// `./build.sh --part sdk` compiles this crate for wasm32-unknown-unknown, and the package builder stages it into
 // the system volume where StorageService serves
 // vol://system/components/liber_component/app.wasm. The kernel's component_host loads it from
 // storage, wires its three imports to typed services with no ambient authority, and invokes its

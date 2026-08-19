@@ -35,6 +35,11 @@ declare -A GATES=(
 	["identity-note"]="tools/check-static-injection.sh identity-note"
 	["volume-layout"]="tools/check-volume-layout.sh ../.build/boot/volume-x86_64.pkg"
 	["milestone-index"]="tools/check-milestone-index.sh"
+	# Generated or compiled artifacts below src, in the working tree and anywhere in reachable
+	# history. Two Justfile recipes that nothing called; cheap enough to be part of "check it", and
+	# a tree that has committed a build output does not un-commit it by nobody looking.
+	["source-hygiene"]="tools/check-source-hygiene.sh --current"
+	["source-history-hygiene"]="tools/check-source-hygiene.sh --history"
 	["single-cap-receive"]="tools/check-single-cap-receive.sh"
 	# A kernel allocation ring 3 can trigger must be able to refuse. Three audits closed that class
 	# by enumeration and a fourth would have found the next member; this is the rule instead.
@@ -52,28 +57,59 @@ declare -A GATES=(
 
 FORMATS=(bmp gif ico icns jpeg pcx png ppm qoi tga webp)
 
+# A gate that can also REGENERATE what it checks, and the command that does it.
+#
+# The dynamic report is three tracked TSVs describing the staged ELF graph; the gate compares them
+# against the tree and `--write` produces them. Those were two Justfile recipes with nothing to say
+# they were two halves of one thing - and the writing half is the one that must be reached
+# deliberately, since it overwrites files under review.
+declare -A REFRESH=(
+	["dynamic-report"]="tools/check-dynamic-report.sh --write"
+)
+
+# Checks that take arguments, so they are flags rather than gate names - and, like --conformance,
+# they run only when asked. Each rebuilds or re-stages something, which is why none belongs in the
+# set `./check.sh` with no arguments runs.
+#
+#   --staged-image [T...]      are the staged images on disk the ones this tree produces
+#   --cache-check MODE         quick | provider | targeted - build-cache invalidation, end to end
+#   --fast-path [T] [A...]     the targeted build and the authoritative rebuild produce equal bytes
+
 help() {
 	usage_and_exit <<EOF
-usage: check.sh [--gate NAME[,NAME...]] [--conformance [FORMAT[,FORMAT...]]] [--list]
+usage: check.sh [--gate NAME[,NAME...]] [--conformance [FORMAT[,FORMAT...]]]
+                [--refresh NAME] [--staged-image [TARGET...]] [--cache-check MODE]
+                [--fast-path [TARGET] [ARTIFACT...]] [--list]
 
 Runs the build gates and the image conformance suites. With no arguments, runs everything.
 
   --gate NAME          run these gates only ('all' for every gate)
   --conformance [FMT]  run these conformance suites only (no value, or 'all', means every format)
+  --refresh NAME       REGENERATE what a gate checks, instead of checking it
+  --staged-image [T]   are the staged images the ones this tree produces (default: all staged)
+  --cache-check MODE   build-cache invalidation end to end: quick | provider | targeted
+  --fast-path [T] [A]  the targeted build and the authoritative rebuild produce equal bytes
   --list               print the names and exit
   -h, --help           this text
 
 gates:
   ${!GATES[*]}
 
+refreshable:
+  ${!REFRESH[*]}
+
 conformance formats:
   ${FORMATS[*]}
 
 examples:
-  ./check.sh                          # everything
-  ./check.sh --gate volume-layout     # one gate
-  ./check.sh --conformance png,webp   # two formats
-  ./check.sh --conformance            # every format, no gates
+  ./check.sh                            # everything
+  ./check.sh --gate volume-layout       # one gate
+  ./check.sh --conformance png,webp     # two formats
+  ./check.sh --conformance              # every format, no gates
+  ./check.sh --refresh dynamic-report   # rewrite the tracked reports from the built tree
+
+The four argument-taking checks rebuild or re-stage something, so they run only when named - never
+as part of a bare ./check.sh.
 
 Gates that inspect built artifacts expect a build to exist; run ./build.sh first.
 EOF
@@ -124,6 +160,13 @@ run_conformance() {
 
 gates=()
 formats=()
+refreshes=()
+# Each is "did the caller ask" plus the arguments it gave, because all three take an OPTIONAL list.
+staged_image=0
+staged_image_targets=()
+cache_check=""
+fast_path=0
+fast_path_args=()
 want_gates=1
 want_conformance=1
 
@@ -161,6 +204,43 @@ while [[ $# -gt 0 ]]; do
 		fi
 		want_gates=0
 		;;
+	--refresh)
+		[[ $# -ge 2 ]] || die "--refresh needs a name (refreshable: ${!REFRESH[*]})"
+		[[ -n "${REFRESH[$2]:-}" ]] || die "'$2' cannot be refreshed (refreshable: ${!REFRESH[*]})"
+		refreshes+=("$2")
+		want_gates=0
+		want_conformance=0
+		shift 2
+		;;
+	--staged-image)
+		staged_image=1
+		want_gates=0
+		want_conformance=0
+		shift
+		# Every following non-flag word is a target. With none, the script checks every staged image.
+		while [[ $# -gt 0 && "$1" != -* ]]; do
+			staged_image_targets+=("$1")
+			shift
+		done
+		;;
+	--cache-check)
+		[[ $# -ge 2 ]] || die "--cache-check needs a mode (quick, provider or targeted)"
+		cache_check="$2"
+		want_gates=0
+		want_conformance=0
+		shift 2
+		;;
+	--fast-path)
+		fast_path=1
+		want_gates=0
+		want_conformance=0
+		shift
+		# The target, then the artifacts to sample. With none, the script picks its own defaults.
+		while [[ $# -gt 0 && "$1" != -* ]]; do
+			fast_path_args+=("$1")
+			shift
+		done
+		;;
 	*) die "unexpected argument '$1' (try --help)" ;;
 	esac
 done
@@ -176,8 +256,26 @@ fi
 for gate in "${gates[@]:-}"; do
 	[[ -n "$gate" ]] && run_gate "$gate"
 done
-for fmt in "${formats[@]:-}"; do
-	[[ -n "$fmt" ]] && run_conformance "$fmt"
+for name in "${refreshes[@]:-}"; do
+	[[ -n "$name" ]] || continue
+	note "refresh: $name"
+	(cd "$SRC_DIR" && eval "${REFRESH[$name]}")
 done
+if ((staged_image)); then
+	note "staged-image: ${staged_image_targets[*]:-every staged target}"
+	(cd "$SRC_DIR" && tools/check-staged-image.sh "${staged_image_targets[@]}")
+fi
+if [[ -n "$cache_check" ]]; then
+	note "cache-check: $cache_check"
+	(cd "$SRC_DIR" && tools/check-shared-cache.sh "$cache_check")
+fi
+if ((fast_path)); then
+	# The script's own default target when none is named, so the flag alone means what the recipe
+	# it replaces meant.
+	set -- "${fast_path_args[@]}"
+	[[ $# -ge 1 ]] || set -- x86_64
+	note "fast-path: $*"
+	(cd "$SRC_DIR" && tools/check-fast-path-parity.sh "$@")
+fi
 
 note "all selected checks passed"

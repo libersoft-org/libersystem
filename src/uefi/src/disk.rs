@@ -104,8 +104,12 @@ impl BlockDevice for FirmwareDisk {
 //
 // `logical_partition` devices are included deliberately: on a GPT disk the firmware exposes both
 // the whole disk and each partition, and the system volume is a partition. Skipping them would
-// find nothing on exactly the layout `just img` produces.
-pub fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDisk) -> bool) {
+// find nothing on exactly the layout `./image.sh` produces.
+//
+// # Safety
+// `bs` must be the live `BootServices` table, before `ExitBootServices`. Each `FirmwareDisk` the
+// visitor is handed borrows firmware protocol pointers valid only for that call.
+pub unsafe fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDisk) -> bool) {
 	let mut count: usize = 0;
 	let mut handles: *mut Handle = core::ptr::null_mut();
 	let status = unsafe { ((*bs).locate_handle_buffer)(uefi::BY_PROTOCOL, &uefi::BLOCK_IO_PROTOCOL_GUID, core::ptr::null_mut(), &mut count, &mut handles) };
@@ -154,16 +158,22 @@ pub fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDisk) -> b
 //
 // With no pairing (`want` is None) the first volume that opens wins, which is the single-disk case
 // and the only one where "first" is a safe answer.
-pub fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mut open: impl FnMut(FirmwareDisk) -> Option<([u8; 16], T)>) -> Option<T> {
+//
+// # Safety
+// `bs` must be the live `BootServices` table, before `ExitBootServices` - the same contract
+// `each_disk` below it carries, and it was safe here while being unsafe there.
+pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mut open: impl FnMut(FirmwareDisk) -> Option<([u8; 16], T)>) -> Option<T> {
 	let mut chosen: Option<T> = None;
-	each_disk(bs, |device| {
-		let Some((uuid, value)) = open(device) else { return false };
-		if want.is_some_and(|want| want != uuid) {
-			return false;
-		}
-		chosen = Some(value);
-		true
-	});
+	unsafe {
+		each_disk(bs, |device| {
+			let Some((uuid, value)) = open(device) else { return false };
+			if want.is_some_and(|want| want != uuid) {
+				return false;
+			}
+			chosen = Some(value);
+			true
+		})
+	};
 	chosen
 }
 

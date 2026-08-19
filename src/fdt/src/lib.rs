@@ -108,7 +108,17 @@ struct Bounds {
 
 impl Fdt {
 	// An FDT at physical `base`, reachable through `phys_to_virt`.
-	pub fn new(base: u64, phys_to_virt: fn(u64) -> u64) -> Self {
+	//
+	// # Safety
+	// `base` must be the physical address a bootloader or firmware published for a device tree, and
+	// `phys_to_virt` must map every address in `[base, base + totalsize)` to a readable one. EVERY
+	// METHOD ON THIS TYPE DEREFERENCES WHAT THIS WAS HANDED: `u8_at` is a `read_volatile` through
+	// `p2v`, so `Fdt::new(1, identity).is_valid()` was safe Rust that read address 1 (FDT-007).
+	//
+	// The header checks below cannot substitute for this. They read the blob to decide whether it is
+	// a blob, which means the first four bytes are already dereferenced by the time anything has been
+	// validated - a check inside the object cannot make constructing it safe.
+	pub unsafe fn new(base: u64, phys_to_virt: fn(u64) -> u64) -> Self {
 		Self { base, p2v: phys_to_virt }
 	}
 
@@ -296,13 +306,24 @@ impl Fdt {
 
 	// Parse the device tree, returning the RAM geometry, CPU count and PCIe ECAM base,
 	// or None if it is not a valid FDT (or has no memory node).
-	// Does any CPU node advertise the ISA extension `want`?
+	// Does EVERY CPU node advertise the ISA extension `want`?
 	//
 	// Two properties carry this and both are in the wild: the old `riscv,isa` string
 	// ("rv64imafdc_svpbmt_...", underscore-separated after the single-letter base) and the
-	// newer `riscv,isa-extensions` stringlist (NUL-separated). The search is a substring scan
-	// over the property bytes, which is enough for a name that cannot occur inside another -
-	// and deliberately conservative: a name it fails to find leaves the feature off.
+	// newer `riscv,isa-extensions` stringlist (NUL-separated).
+	//
+	// EVERY CPU, NOT ANY (FDT-004). This returned `true` on the first hart that advertised the
+	// name, and the kernel then used the extension on every hart - which on a heterogeneous machine
+	// is an illegal instruction on the ones that do not have it. A tree with no CPU node at all
+	// answers `false` for the same reason it always did: an undetected extension is one this port
+	// does not use.
+	//
+	// WHOLE NAMES, NOT A SUBSTRING (FDT-004). The search was a byte scan over the property, so
+	// `want = "c"` matched inside `zicsr`, `want = "sv"` matched inside `svpbmt`, and any name that
+	// is a prefix or infix of another was reported present. Now `riscv,isa-extensions` is compared
+	// element by element against its NUL-separated entries, and `riscv,isa` is split the way the
+	// specification defines it: a base like `rv64imafdc` whose letters after the width are
+	// single-letter extensions, then `_`-separated multi-letter names.
 	//
 	// `want` must be lowercase; device trees are.
 	pub fn has_isa_extension(&self, want: &[u8]) -> bool {
@@ -315,6 +336,9 @@ impl Fdt {
 			let mut depth: i32 = -1;
 			let mut d1_cpus = false;
 			let mut in_cpu = false;
+			let mut cpus = 0usize;
+			let mut cpus_with = 0usize;
+			let mut this_cpu_has = false;
 			loop {
 				let Some(token) = self.be32_in(p, b.struct_end) else { return false };
 				p += 4;
@@ -327,42 +351,52 @@ impl Fdt {
 							d1_cpus = self.str_eq(name, "cpus");
 						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
 							in_cpu = true;
+							cpus += 1;
+							this_cpu_has = false;
 						}
 					}
 					FDT_END_NODE => {
-						if depth == 2 {
+						if depth == 2 && in_cpu {
+							// DECIDED AT THE NODE'S END. Either property may carry the name and a
+							// tree does not promise property order, so the verdict for this hart is
+							// taken once everything about it has been seen.
+							if this_cpu_has {
+								cpus_with += 1;
+							}
 							in_cpu = false;
 						}
 						if depth == 1 {
 							d1_cpus = false;
 						}
 						depth -= 1;
-						if depth < 0 {
+						// CLOSING THE ROOT LEAVES -1, WHICH IS THE END AND NOT AN ERROR. This was
+						// `depth < 0`, which was harmless while the function answered `true` the
+						// moment it found a match: nothing reached the root's own `FDT_END_NODE`.
+						// The verdict is taken at `FDT_END` now, and this returned `false` one token
+						// before it - so every positive answer became a negative one.
+						if depth < -1 {
 							return false;
 						}
 					}
 					FDT_PROP => {
 						let Some((pname, len, val, next)) = self.prop_in(p, &b) else { return false };
-						let len = len as u64;
 						p = next;
 						if !in_cpu {
 							continue;
 						}
-						if !(self.str_eq(pname, "riscv,isa") || self.str_eq(pname, "riscv,isa-extensions")) {
-							continue;
-						}
-						// Substring scan over the property's bytes, bounded by its own length.
-						if len < want.len() as u64 {
-							continue;
-						}
-						for start in 0..=(len - want.len() as u64) {
-							if (0..want.len() as u64).all(|i| self.u8_at(val + start + i) == want[i as usize]) {
-								return true;
+						if self.str_eq(pname, "riscv,isa-extensions") {
+							if self.stringlist_contains(val, len, want) {
+								this_cpu_has = true;
 							}
+						} else if self.str_eq(pname, "riscv,isa") && self.isa_string_names(val, len, want) {
+							this_cpu_has = true;
 						}
 					}
 					FDT_NOP => {}
-					FDT_END => return false,
+					// A TREE THAT ENDS IS NOT A TREE THAT ANSWERED. Reaching the terminator means no
+					// `/cpus` closed with a verdict, which is the same "found nothing" as a tree
+					// with no CPU nodes.
+					FDT_END => return cpus > 0 && cpus_with == cpus,
 					_ => return false,
 				}
 			}
@@ -660,7 +694,19 @@ impl Fdt {
 						}
 					}
 					FDT_NOP => {}
-					FDT_END => break,
+					// A TREE THAT ENDS WITH NODES STILL OPEN IS NOT A TREE (FDT-008).
+					//
+					// This was `break` at any depth, so a token stream with more `FDT_BEGIN_NODE`s
+					// than `FDT_END_NODE`s was accepted and everything read out of it - node depths,
+					// and therefore which node a `reg` belonged to - was decided by a structure the
+					// writer never closed. `-1` is the root closed; anything else is a stream this
+					// reader was following by luck.
+					FDT_END => {
+						if depth != -1 {
+							return None;
+						}
+						break;
+					}
 					_ => return None, // malformed
 				}
 			}
@@ -1056,6 +1102,79 @@ impl Fdt {
 	}
 
 	// `str_eq` against bytes rather than a `&str`, for a property name that came out of the tree.
+	// One element of a NUL-separated stringlist equals `want`, and none of them merely contains it.
+	//
+	// The property's own length bounds the walk; a final element without a terminator is compared
+	// as it stands, because a device tree writer that omits the last NUL has still said the name.
+	unsafe fn stringlist_contains(&self, value: u64, len: u32, want: &[u8]) -> bool {
+		let len = len as u64;
+		let mut start = 0u64;
+		let mut at = 0u64;
+		while at <= len {
+			let byte = if at == len { 0 } else { unsafe { self.u8_at(value + at) } };
+			if byte == 0 {
+				if at - start == want.len() as u64 && (0..want.len() as u64).all(|i| unsafe { self.u8_at(value + start + i) } == want[i as usize]) {
+					return true;
+				}
+				start = at + 1;
+			}
+			at += 1;
+		}
+		false
+	}
+
+	// `riscv,isa` names `want`, read the way the specification defines the string rather than as a
+	// bag of bytes: `rv<width><single letters>` followed by `_`-separated multi-letter names.
+	//
+	// So `c` is present in `rv64imafdc` and absent from `rv64ima_zicsr`, and `zicsr` is present in
+	// the second and absent from the first - which a substring scan got backwards in both
+	// directions.
+	unsafe fn isa_string_names(&self, value: u64, len: u32, want: &[u8]) -> bool {
+		let len = len as u64;
+		// The string ends at its NUL or at the property's end, whichever comes first.
+		let mut end = 0u64;
+		while end < len && unsafe { self.u8_at(value + end) } != 0 {
+			end += 1;
+		}
+		let mut start = 0u64;
+		let mut segment = 0usize;
+		let mut at = 0u64;
+		while at <= end {
+			let is_break = at == end || unsafe { self.u8_at(value + at) } == b'_';
+			if !is_break {
+				at += 1;
+				continue;
+			}
+			if segment == 0 {
+				// THE BASE. `rv32`/`rv64` and then one letter per extension, so a one-character
+				// `want` is looked for among those letters and a longer one cannot be there.
+				if want.len() == 1 {
+					let mut i = start;
+					// Skip `rv` and the width digits; anything else is a base this reader does not
+					// recognise, and it is scanned as letters rather than refused.
+					if i + 2 <= at && unsafe { self.u8_at(value + i) } == b'r' && unsafe { self.u8_at(value + i + 1) } == b'v' {
+						i += 2;
+						while i < at && unsafe { self.u8_at(value + i) }.is_ascii_digit() {
+							i += 1;
+						}
+					}
+					while i < at {
+						if unsafe { self.u8_at(value + i) } == want[0] {
+							return true;
+						}
+						i += 1;
+					}
+				}
+			} else if at - start == want.len() as u64 && (0..want.len() as u64).all(|i| unsafe { self.u8_at(value + start + i) } == want[i as usize]) {
+				return true;
+			}
+			segment += 1;
+			start = at + 1;
+			at += 1;
+		}
+		false
+	}
+
 	unsafe fn str_eq_bytes(&self, p: u64, s: &[u8]) -> bool {
 		unsafe {
 			for (index, &byte) in s.iter().enumerate() {
@@ -1134,6 +1253,145 @@ impl Fdt {
 			// The list did not terminate within the cap: refused, because a client that carried on
 			// would be using memory the firmware reserved.
 			false
+		}
+	}
+
+	// Every range the `/reserved-memory` subtree declares, which nothing read (FDT-001).
+	//
+	// A device tree says "do not use this" in two places and only one of them was being read. The
+	// header's reservation block above is the older one; `/reserved-memory` is the one boards
+	// actually use, for firmware runtime memory, a secure world's carve-out, DMA pools and a
+	// framebuffer an earlier stage handed over. Those ranges lie INSIDE a `/memory` bank by
+	// construction - that is what makes them worth declaring - so a client that reads `/memory` and
+	// stops is told it owns every one of them.
+	//
+	// EVERY CHILD WITH A FIXED `reg`, INCLUDING `reusable` ONES. The specification says a `reusable`
+	// region may be used by the OS until the owning device claims it back, and this kernel has no
+	// protocol for giving a frame back to firmware on demand. So the honest reading of that flag
+	// here is that the region is not ours; the alternative is handing out memory we cannot return.
+	//
+	// A child with `size` and no `reg` is asking the CLIENT to place the region. This reader does
+	// not place anything, so there is no range to carve and none is carved - which is correct and
+	// is also a gap: a client that later starts honouring those must reserve what it placed.
+	//
+	// Bounded like everything else here: `#address-cells` and `#size-cells` come from
+	// `/reserved-memory` when it declares them and from the root otherwise, both refused past
+	// `MAX_CELLS`, and the child count is capped. `false` means the walk could not be completed, and
+	// the caller must treat everything past that point as unreserved rather than as absent.
+	pub fn for_each_reserved_memory_node(&self, mut visit: impl FnMut(u64, u64)) -> bool {
+		let Some(b) = self.bounds() else {
+			return false;
+		};
+		unsafe {
+			let mut p = b.struct_start;
+			let mut depth: i32 = -1;
+			let mut root_addr_cells: u32 = 2;
+			let mut root_size_cells: u32 = 2;
+			let mut node_addr_cells: Option<u32> = None;
+			let mut node_size_cells: Option<u32> = None;
+			let mut in_reserved = false;
+			let mut children = 0usize;
+			loop {
+				let Some(token) = self.be32_in(p, b.struct_end) else {
+					return false;
+				};
+				p += 4;
+				match token {
+					FDT_BEGIN_NODE => {
+						depth += 1;
+						let Some((name, next)) = self.node_name_in(p, &b) else {
+							return false;
+						};
+						p = next;
+						if depth == 1 {
+							// EXACTLY `reserved-memory`, with no unit address: the specification
+							// gives it none, and a prefix match would take `reserved-memory-pool`
+							// with it.
+							in_reserved = self.str_eq(name, "reserved-memory");
+							node_addr_cells = None;
+							node_size_cells = None;
+						}
+						if in_reserved && depth == 2 {
+							children += 1;
+							if children > MAX_RESERVED_REGIONS {
+								return false;
+							}
+						}
+					}
+					FDT_END_NODE => {
+						if depth == 1 {
+							in_reserved = false;
+						}
+						depth -= 1;
+						if depth < -1 {
+							return false;
+						}
+					}
+					FDT_PROP => {
+						let Some((pname, len, val, next)) = self.prop_in(p, &b) else {
+							return false;
+						};
+						p = next;
+						if depth == 0 && len == 4 {
+							if self.str_eq(pname, "#address-cells") {
+								let cells = self.be32(val);
+								if cells > MAX_CELLS {
+									return false;
+								}
+								root_addr_cells = cells;
+							} else if self.str_eq(pname, "#size-cells") {
+								let cells = self.be32(val);
+								if cells > MAX_CELLS {
+									return false;
+								}
+								root_size_cells = cells;
+							}
+						} else if depth == 1 && in_reserved && len == 4 {
+							if self.str_eq(pname, "#address-cells") {
+								let cells = self.be32(val);
+								if cells > MAX_CELLS {
+									return false;
+								}
+								node_addr_cells = Some(cells);
+							} else if self.str_eq(pname, "#size-cells") {
+								let cells = self.be32(val);
+								if cells > MAX_CELLS {
+									return false;
+								}
+								node_size_cells = Some(cells);
+							}
+						} else if depth == 2 && in_reserved && self.str_eq(pname, "reg") {
+							let addr_cells = node_addr_cells.unwrap_or(root_addr_cells);
+							let size_cells = node_size_cells.unwrap_or(root_size_cells);
+							if addr_cells == 0 || size_cells == 0 || addr_cells > MAX_CELLS || size_cells > MAX_CELLS {
+								return false;
+							}
+							// A `reg` CARRIES PAIRS, and a child may declare several. Each pair is
+							// read whole or not at all: a trailing partial pair is the tree saying
+							// something this reader cannot act on, and inventing a size for it would
+							// carve a range nobody wrote down.
+							let stride = (addr_cells + size_cells) * 4;
+							let mut offset = 0u32;
+							while offset + stride <= len {
+								let mut cursor = val + offset as u64;
+								let base = self.read_cells(&mut cursor, addr_cells);
+								let size = self.read_cells(&mut cursor, size_cells);
+								offset += stride;
+								// A zero-length reservation reserves nothing; one whose end wraps is
+								// the tree contradicting itself, and carving a saturated range would
+								// take the whole address space out of the allocator.
+								if size == 0 || base.checked_add(size).is_none() {
+									continue;
+								}
+								visit(base, size);
+							}
+						}
+					}
+					FDT_NOP => {}
+					FDT_END => return depth == -1,
+					_ => return false,
+				}
+			}
 		}
 	}
 }

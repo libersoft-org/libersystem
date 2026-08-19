@@ -46,4 +46,4 @@ default_features = true
 features = []
 profile = "dev"
 build_mode = "dev-profile"
-description = "the guest `just dev-up` leaves running"
+description = "the guest `./dev.sh up` leaves running"

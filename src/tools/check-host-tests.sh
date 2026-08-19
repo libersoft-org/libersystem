@@ -91,7 +91,7 @@ done <<<"$suites"
 # `--exact` so a name is a name and not a prefix; `--ignored` rather than `--include-ignored` so
 # this run is exactly these tests and a typo is a run of nothing rather than a silent re-run of the
 # whole crate.
-# The `dev-diagnostics` half is a feature of the SDK ARTIFACT, not of this crate - `just sdk` builds
+# The `dev-diagnostics` half is a feature of the SDK ARTIFACT, not of this crate - `./build.sh --part sdk` builds
 # both wasm binaries and the test picks the one it needs - so both entries run the `wasm` crate as
 # the model enumerates it, with no `--features` of their own.
 artifact_tests=(

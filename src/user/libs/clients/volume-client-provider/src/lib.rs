@@ -22,9 +22,10 @@ pub unsafe fn write_stream_begin(chan: u64, correlation: u32, path: &str, data: 
 			close(data);
 			return false;
 		}
-		let request_handle = writer.handle();
-		let request = writer.into_inner();
-		if send_blocking(chan, &request, request_handle) {
+		// Both halves at once: this request carries the shared-memory capability, and taking the
+		// bytes without it is what `into_message` exists to make unwriteable (WIRE-001).
+		let (request, request_handles) = writer.into_message();
+		if send_blocking(chan, &request, request_handles.first()) {
 			true
 		} else {
 			close(data);

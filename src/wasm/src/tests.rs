@@ -644,7 +644,7 @@ fn call_indirect_traps_on_a_signature_mismatch() {
 	let wasm: Vec<u8> = indirect_module();
 	let m: ValidatedModule = validate(parse(&wasm).unwrap()).expect("the fixture module validates");
 	let mut inst: Instance = Instance::new(&m).expect("the validated module instantiates");
-	assert_eq!(inst.invoke("run", &[Value::I32(2)], &mut NoHost), Err(Trap("call_indirect: signature mismatch")));
+	assert_eq!(inst.invoke("run", &[Value::I32(2)], &mut NoHost), Err(Trap("call_indirect: indirect call type mismatch")));
 }
 
 #[test]
@@ -653,8 +653,8 @@ fn call_indirect_traps_on_a_null_or_out_of_range_entry() {
 	let wasm: Vec<u8> = indirect_module();
 	let m: ValidatedModule = validate(parse(&wasm).unwrap()).expect("the fixture module validates");
 	let mut inst: Instance = Instance::new(&m).expect("the validated module instantiates");
-	assert_eq!(inst.invoke("run", &[Value::I32(3)], &mut NoHost), Err(Trap("call_indirect: null table entry")));
-	assert_eq!(inst.invoke("run", &[Value::I32(4)], &mut NoHost), Err(Trap("call_indirect: table index out of bounds")));
+	assert_eq!(inst.invoke("run", &[Value::I32(3)], &mut NoHost), Err(Trap("call_indirect: uninitialized element")));
+	assert_eq!(inst.invoke("run", &[Value::I32(4)], &mut NoHost), Err(Trap("call_indirect: undefined element")));
 }
 
 #[test]
@@ -1735,7 +1735,12 @@ mod spec_run {
 		// Providing a `spectest` host would win them back and little else: those modules also import
 		// globals, tables and memories, which this engine does not support at all, so they are
 		// refused before instantiation whatever host is passed.
-		assert!(ran >= 2133, "only {ran} of {} specification assertions were executed ({skipped} skipped) - a subset got smaller and the reason belongs here", runs.len());
+		//
+		// 2026-08-19: 2160 executed, 567 skipped, out of 2727 in the fixture. The floor had been
+		// sitting at 2133 since the note above while the fixture had grown; nothing executed fewer
+		// assertions, the ratchet had simply not been raised when the number moved. It is the
+		// measured number again now, which is the only setting at which it guards anything.
+		assert!(ran >= 2160, "only {ran} of {} specification assertions were executed ({skipped} skipped) - a subset got smaller and the reason belongs here", runs.len());
 	}
 }
 

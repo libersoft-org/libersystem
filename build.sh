@@ -116,10 +116,14 @@ step_loader() {
 	local arch="$1"
 	note "loader ($arch)"
 	case "$arch" in
+	# The host triple's UEFI target, and cargo takes the configuration of the working directory -
+	# which is why both of these `cd` into the loader rather than passing `--manifest-path`.
 	x86_64) (cd "$SRC_DIR/loader" && cargo build) ;;
-	# aarch64 and riscv64 build their EFI images differently enough that a shared body would be a
-	# branch either way; the riscv64 one is assembled by hand from a linker script and objcopy.
-	*) (cd "$SRC_DIR" && just "loader-$arch") ;;
+	aarch64) (cd "$SRC_DIR/loader" && cargo build --target aarch64-unknown-uefi) ;;
+	# riscv64 has no UEFI rustc target at all: its EFI application is assembled by hand from a
+	# static PIE, a linker script and objcopy, which is a program and lives in one.
+	riscv64) (cd "$SRC_DIR" && tools/build-loader-riscv64.sh) ;;
+	*) die "no loader for '$arch'" ;;
 	esac
 }
 

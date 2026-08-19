@@ -63,7 +63,14 @@ pub struct Acpi {
 }
 
 impl Acpi {
-	pub fn new(rsdp: u64, phys_to_virt: fn(u64) -> u64) -> Self {
+	// # Safety
+	// `rsdp` must be the physical address the firmware published for a real RSDP, and `phys_to_virt`
+	// must map every physical address reachable from it - the RSDT/XSDT and every table they name -
+	// to a readable virtual address. EVERY OTHER METHOD ON THIS TYPE DEREFERENCES what this
+	// constructor was handed: `u8_at` is a `read_volatile` through `p2v`, so a wrong number here is
+	// not a wrong answer later, it is a read of arbitrary memory. That contract was carried by the
+	// callers knowing what they were doing and by nothing in the signature (UEFI-005).
+	pub unsafe fn new(rsdp: u64, phys_to_virt: fn(u64) -> u64) -> Self {
 		Self { rsdp, p2v: phys_to_virt }
 	}
 

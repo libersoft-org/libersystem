@@ -135,6 +135,24 @@ impl<'a> SliceWriter<'a> {
 		self.handle_count > 0
 	}
 
+	// The finished message's length, consuming the writer - AND ONLY WHEN THERE IS NOTHING ELSE TO
+	// CARRY.
+	//
+	// The counterpart of `VecWriter::into_inner`, and the same argument (WIRE-001): a caller that
+	// takes the LENGTH out of a writer holding a capability has taken half a message and dropped the
+	// live half. The generator emitted `if w.has_handle() { return None }` at each `encode` for
+	// exactly this, which made it a property of the generator rather than of the codec; it is here
+	// now, so a hand-written encoder inherits it too.
+	//
+	// `pos()` stays and borrows: a dispatch that goes on to hand its handles over separately - the
+	// serve loops do - is asking a live writer how far it has got, which is a different question.
+	pub fn finish(self) -> Option<usize> {
+		if self.handle_count != 0 {
+			return None;
+		}
+		Some(self.pos)
+	}
+
 	// Rewind to an empty buffer, dropping anything written and any recorded handle,
 	// so a failed encode can be replaced in place - the dispatch overflow fallback.
 	pub fn reset(&mut self) {
@@ -195,9 +213,40 @@ impl VecWriter {
 		&self.handles[..self.handle_count]
 	}
 
-	// The bytes written so far, consuming the writer.
-	pub fn into_inner(self) -> Vec<u8> {
-		self.buf
+	// The bytes written so far, consuming the writer - AND ONLY WHEN THERE IS NOTHING ELSE TO
+	// CARRY.
+	//
+	// This returned `self.buf` unconditionally, so a writer that had recorded a capability handed
+	// over the bytes and dropped the record: the caller got half a message, and the half it lost was
+	// the live one. That the generated encoders did not do this was a property of the GENERATOR -
+	// each `encode_vec` it emitted carried its own `if !w.handles().is_empty() { return None }` -
+	// and a hand-written encoder got no such line. `wire`'s own test for it was named
+	// "a vec writer that records a handle cannot be read as bytes alone" and asserted that it could.
+	// That is WIRE-001 in one function: ownership stated in prose, enforced by whoever remembered.
+	//
+	// Now the refusal is here, once, and every caller inherits it. `into_message` is the way to get
+	// both halves, and there is no way to get one.
+	pub fn into_inner(self) -> Option<Vec<u8>> {
+		if self.handle_count != 0 {
+			return None;
+		}
+		Some(self.buf)
+	}
+
+	// Both halves of the message, together. Infallible by construction: the writer's own array is
+	// `MAX_HANDLES` wide and `set_handle` refuses past it, so the list it accumulated always fits
+	// the list it becomes.
+	pub fn into_message(self) -> (Vec<u8>, Handles) {
+		let mut handles = Handles::new();
+		let mut index = 0;
+		// Element at a time rather than `try_from_slice`, to stay off `memcpy` - `ipc-client` is
+		// checked against an exact list of runtime imports and this is on its path.
+		while index < self.handle_count {
+			handles.list[index] = self.handles[index];
+			index += 1;
+		}
+		handles.count = self.handle_count;
+		(self.buf, handles)
 	}
 }
 

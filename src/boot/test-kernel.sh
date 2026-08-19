@@ -73,7 +73,7 @@ esac
 # suite (2026-07-31: 146 tests in 79 s, 138 in 1074 s, 139 in 1653 s).
 #
 # A single 15m budget was therefore not a budget at all - it was under the real runtime of two
-# of the three targets, so `just test-all` could not pass, and the failure reads as TIMEOUT,
+# of the three targets, so `./test.sh --arch all` could not pass, and the failure reads as TIMEOUT,
 # which everyone hears as "it hung" rather than "the number is wrong". Nobody could tell
 # whether aarch64 and riscv64 were green, and the way around it was to run tags instead, where
 # the same 3m budget is under an emulated tag run and fails the same way.

@@ -337,7 +337,7 @@ pub mod tsc {
 	const QEMU_VIRT_HZ: u64 = 10_000_000;
 
 	pub fn init_from_dtb(dtb: u64) {
-		match super::dtb::timebase_frequency(dtb) {
+		match unsafe { super::dtb::timebase_frequency(dtb) } {
 			Some(hz) if hz > 0 => HZ.store(hz as u64, core::sync::atomic::Ordering::Release),
 			_ => {
 				crate::serial_println!("riscv64: no /cpus/timebase-frequency in the device tree; assuming {QEMU_VIRT_HZ} Hz (QEMU virt)");

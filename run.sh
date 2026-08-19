@@ -27,6 +27,8 @@ Boots the system in QEMU, headless, with the serial console on your terminal.
   --spice-addr A  SPICE bind address (default 127.0.0.1 - loopback)
   --spice-port P  SPICE port (default 5930)
   --debug         wait for GDB on :1234, no KVM
+  --gdb           ATTACH gdb to a guest already waiting - run in a second panel after --debug,
+                  and it boots nothing itself
   -h, --help      this text
 
 three steps, not one:
@@ -52,6 +54,7 @@ EOF
 }
 
 arch=""
+attach_gdb=0
 displays=()
 debug=0
 image=""
@@ -132,6 +135,10 @@ while [[ $# -gt 0 ]]; do
 		debug=1
 		shift
 		;;
+	--gdb)
+		attach_gdb=1
+		shift
+		;;
 	*) die "unexpected argument '$1' (try --help)" ;;
 	esac
 done
@@ -154,6 +161,16 @@ fi
 
 kernel="$BUILD_DIR/cargo/kernel/$(target_triple "$arch")/debug/kernel"
 [[ -f "$kernel" ]] || die "no kernel for $arch - run: ./build.sh --arch $arch"
+
+# THE OTHER HALF OF --debug, and it boots nothing.
+#
+# `--debug` starts QEMU stopped on :1234; this attaches to it with the kernel's symbols, from a
+# second panel. Placed after the kernel-exists check and before everything that assembles or boots,
+# because attaching needs the ELF and nothing else.
+if ((attach_gdb)); then
+	[[ $debug -eq 0 ]] || die "--gdb attaches to a waiting guest; --debug starts one. Use them in two panels, not in one command"
+	exec gdb -x "$SRC_DIR/boot/gdb-init" "$kernel"
+fi
 if [[ -z "$image" && ! -f "$BUILD_DIR/boot/system-volume-$arch.img" ]]; then
 	die "no system volume for $arch - run: ./build.sh --arch $arch (or boot a medium with --image)"
 fi

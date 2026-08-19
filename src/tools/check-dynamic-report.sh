@@ -76,7 +76,7 @@ tool_count="$(wc -l <<<"$manifest_tools")"
 # the thing a build wants to know about; anything deeper is what `--check` is for.
 if [[ "$mode" == --check-inventory ]]; then
 	[[ -f "$report" ]] || {
-		echo "dynamic-report: no tracked report at $report; run (cd src && just dynamic-report-update)" >&2
+		echo "dynamic-report: no tracked report at $report; run (cd src && ./check.sh --refresh dynamic-report)" >&2
 		exit 3
 	}
 	checked_tools="$(awk -F '\t' '$1 ~ /^[0-9]+$/ && $2 == "x86_64-unknown-none" {print $3}' "$report" | sort)" || {
@@ -658,7 +658,7 @@ fi
 
 for tracked in "$report" "$wave_report" "$image_report"; do
 	[[ -f "$tracked" ]] || {
-		echo "dynamic-report: no tracked report at $tracked; run (cd src && just dynamic-report-update)" >&2
+		echo "dynamic-report: no tracked report at $tracked; run (cd src && ./check.sh --refresh dynamic-report)" >&2
 		exit 3
 	}
 done
@@ -685,7 +685,7 @@ compare_one "$image_temporary" "$image_report" "$image_report" || status=$?
 # including the status of a script that failed to start. And it mutated only the detailed report, so
 # the wave and image comparisons were never shown to refuse anything at all.
 #
-# Three probes now, one per report, against copies of the candidates that were just generated: each
+# Three probes now, one per report, against copies of the candidates that were ./gen.sherated: each
 # changes one non-key numeric value while leaving the format valid and the other two files
 # byte-identical, and each must produce exactly status 4.
 probe_report() {

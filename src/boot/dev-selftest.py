@@ -105,7 +105,7 @@ def expect(guest, marker, what):
 def main():
 	state, identity = lab.dev_state()
 	if state != 'ready':
-		fail(f'the development instance is {state}; this needs a running one, so start it with `just lab dev-up`')
+		fail(f'the development instance is {state}; this needs a running one, so start it with `./dev.sh up`')
 	# THE BOOT GENERATION, not the process group. `system_reset` gives the guest a new boot and
 	# leaves QEMU's pgid alone, so the group could not distinguish the succession this test claims
 	# to prove from a reboot in the middle of it.

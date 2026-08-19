@@ -483,7 +483,7 @@ fn both_hosts_answer_a_refused_service_the_same_way() {
 // with `--include-ignored`; a bare `cargo test` reports it as ignored, which is a line in the
 // summary rather than a captured message nobody sees.
 #[test]
-#[ignore = "needs the SDK artifact from `just sdk`; the host-tests gate runs it"]
+#[ignore = "needs the SDK artifact from `./build.sh --part sdk`; the host-tests gate runs it"]
 fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() {
 	// THE OTHER HALF of `a_guest_that_panics_...`, which hand-assembles the shape
 	// `dev-diagnostics` is assumed to produce. Nothing tied that shape to `liber_sdk::report_panic`:
@@ -494,7 +494,7 @@ fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() 
 	// for real - so what is observed is what a guest actually does.
 	//
 	// SKIPPED LOUDLY rather than failing when the artifact is not there: it is built by
-	// `just sdk` / the image build, and a unit test that requires a wasm32 toolchain run would make
+	// `./build.sh --part sdk` / the image build, and a unit test that requires a wasm32 toolchain run would make
 	// `cargo test` in this crate depend on one. Its absence is said, not passed over in silence.
 	// ANCHORED TO THE CRATE, not to whatever directory `cargo test` happened to be run from - which
 	// is how this skipped silently the first time it ran from the repository root, and a test that
@@ -537,7 +537,7 @@ fn the_sdks_own_panic_handler_reaches_the_host_as_a_trap_with_its_line_logged() 
 // with `--include-ignored`; a bare `cargo test` reports it as ignored, which is a line in the
 // summary rather than a captured message nobody sees.
 #[test]
-#[ignore = "needs the SDK artifact from `just sdk`; the host-tests gate runs it"]
+#[ignore = "needs the SDK artifact from `./build.sh --part sdk`; the host-tests gate runs it"]
 fn with_dev_diagnostics_the_real_guests_panic_reaches_the_log_it_was_granted() {
 	// THE OTHER HALF OF THE FEATURE, against its own artifact, with no condition on the assertion.
 	//
@@ -596,20 +596,20 @@ fn with_dev_diagnostics_the_real_guests_panic_reaches_the_log_it_was_granted() {
 //
 // Absent sidecar is a FAILURE and not a skip, for the reason the whole of `panic_the_real_guest`
 // exists: "the digest could not be checked" and "the digest matched" must not look alike. A tree
-// built before this existed has to rebuild, which is one `just sdk`.
+// built before this existed has to rebuild, which is one `./build.sh --part sdk`.
 fn check_artifact_is_current(artifact: &str, features: &str) {
 	let sidecar = alloc::format!("{artifact}.inputs");
-	let recorded = std::fs::read_to_string(&sidecar).unwrap_or_else(|error| panic!("{sidecar} is missing ({error}), so nothing says whether {artifact} was built from the sources in this tree - rebuild with `just sdk`"));
+	let recorded = std::fs::read_to_string(&sidecar).unwrap_or_else(|error| panic!("{sidecar} is missing ({error}), so nothing says whether {artifact} was built from the sources in this tree - rebuild with `./build.sh --part sdk`"));
 	let script = alloc::format!("{}/../tools/sdk-inputs.sh", env!("CARGO_MANIFEST_DIR"));
 	let out = std::process::Command::new(&script).arg(features).output().unwrap_or_else(|error| panic!("{script} could not be run ({error}), so the artifact's freshness could not be established either way"));
 	assert!(out.status.success(), "{script} failed: {}", String::from_utf8_lossy(&out.stderr));
 	let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
-	assert_eq!(recorded.trim(), current, "{artifact} was built from different sources than the ones in this tree ({} recorded, {current} now), so this test would be checking an implementation that no longer exists - rebuild with `just sdk`", recorded.trim());
+	assert_eq!(recorded.trim(), current, "{artifact} was built from different sources than the ones in this tree ({} recorded, {current} now), so this test would be checking an implementation that no longer exists - rebuild with `./build.sh --part sdk`", recorded.trim());
 }
 
 fn panic_the_real_guest(target_dir: &str) -> (bool, Vec<String>, Vec<u8>) {
 	let built = alloc::format!("{}/../../.build/cargo/{target_dir}/wasm32-unknown-unknown/release/liber_component.wasm", env!("CARGO_MANIFEST_DIR"));
-	let bytes = std::fs::read(&built).unwrap_or_else(|error| panic!("{built} is not built ({error}), so the SDK's own panic handler is not exercised - build it with `just sdk` or run this test with the image build"));
+	let bytes = std::fs::read(&built).unwrap_or_else(|error| panic!("{built} is not built ({error}), so the SDK's own panic handler is not exercised - build it with `./build.sh --part sdk` or run this test with the image build"));
 	// AND IT WAS BUILT FROM THESE SOURCES, which nothing checked.
 	//
 	// A missing artifact fails and a STALE one passed: build the SDK, change `report_panic()`, run

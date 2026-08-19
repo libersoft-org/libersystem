@@ -19,7 +19,7 @@ lists, tuples, options) and adds three first-class system types WIT lacks:
 
 - Status: implemented language and generator contract.
 - File extension: `.lsidl`
-- Generator: `lsidl-gen` (host tool), driven by `just gen`
+- Generator: `lsidl-gen` (host tool), driven by `./gen.sh`
 - Generated output: the `proto` crate (`no_std`) plus `docs/gen/`
 
 ---
@@ -474,7 +474,7 @@ Larger payloads belong in a `buffer`, not inline.
 
 ## 7. Code generation
 
-`just gen` runs `lsidl-gen` over every `src/idl/*.lsidl` and writes:
+`./gen.sh` runs `lsidl-gen` over every `src/idl/*.lsidl` and writes:
 
 | Output | Destination | Contents |
 | --- | --- | --- |
@@ -501,9 +501,9 @@ must not be confused.
 Generation parses, resolves, validates and renders every output in memory before
 touching disk. Destination collisions fail early; successful writes use per-file
 temporary replacements and a checked output manifest removes stale package files.
-`just gen-check` performs the whole operation without writing and fails on Rust,
+`./gen.sh --check` performs the whole operation without writing and fails on Rust,
 docs, ABI or stale-output drift. A breaking ABI-manifest delta is refused by normal
-generation; `just gen-accept-breaking` is the explicit pre-release acceptance path.
+generation; `./gen.sh --accept-breaking` is the explicit pre-release acceptance path.
 
 ---
 

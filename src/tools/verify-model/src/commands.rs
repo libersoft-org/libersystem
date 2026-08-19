@@ -170,10 +170,10 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		steps.push(Step { label: format!("kernel suite {architecture} (unenumerated)"), command: format!("./test.sh --arch {architecture}"), keys: Vec::new(), note: Some(String::from("the model could not enumerate this target's tests, so the whole suite runs and nothing is recorded against individual keys")) });
 	}
 
-	// The development guest last: it needs an instance `just dev-up` left running, and qemu-run.sh
+	// The development guest last: it needs an instance `./dev.sh up` left running, and qemu-run.sh
 	// refuses to combine DEV_PROFILE with TEST, so it can never share a boot with the suite above.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
-		steps.push(Step { label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: just dev-up")) });
+		steps.push(Step { label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")) });
 	}
 
 	steps

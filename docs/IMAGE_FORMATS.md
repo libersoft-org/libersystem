@@ -65,7 +65,7 @@ The independent static corpus covers 4-bit grayscale, indexed color with `tRNS`,
 the exact compressed stream. ImageMagick and Pillow produce exact RGBA8; every
 file passes pngcheck 3.0.3. APNG Assembler 2.91 supplies ordinary three-frame and
 `-f` separate-default-image files; APNG Disassembler 2.9 confirms full-canvas
-pixels, 60 ms delays and loop count 2. The reciprocal `just png-conformance`
+pixels, 60 ms delays and loop count 2. The reciprocal `./check.sh --conformance png`
 gate requires pngcheck-clean compression-0/100 PNG with exact ImageMagick/Pillow
 pixels and APNG output with exact apngdis frames/timing. Status: **Verified
 profile** for the listed static PNG profiles and both normative APNG layouts.
@@ -101,7 +101,7 @@ and image-data sub-blocks as short as one byte. LiberSystem and
 `gifsicle --unoptimize` produce identical displayed canvases. ImageMagick differs
 only after disposal 2 by clearing to transparent rather than the logical-screen
 background, a documented implementation divergence. The reciprocal
-`just gif-conformance` gate validates our timing/disposal/loop metadata with
+`./check.sh --conformance gif` gate validates our timing/disposal/loop metadata with
 gifsicle and all composited pixels through gifsicle plus ImageMagick. Status:
 **Verified profile** for the implemented GIF87a/GIF89a animation subset.
 
@@ -116,7 +116,7 @@ now covers ImageMagick SOF0 grayscale and three-component YCbCr plus a real SOF2
 progressive rejection fixture. ImageMagick and Pillow produce identical canonical
 RGBA; LiberSystem is exact for grayscale and stays within max 2 / mean 0.232 byte
 error for the independent YCbCr IDCT/chroma path. The reciprocal
-`just jpeg-conformance` gate requires three-component SOF0/JFIF output, exact
+`./check.sh --conformance jpeg` gate requires three-component SOF0/JFIF output, exact
 ImageMagick/Pillow agreement, deterministic quality-10/100 artifact hashes and a
 quality-100 RGB MSE floor. Status: **Verified profile** for 8-bit baseline
 grayscale/YCbCr input and baseline RGB-derived output; progressive remains a typed
@@ -144,7 +144,7 @@ ImageMagick and Pillow agree exactly on V3/V4/V5 alpha. A derived 32bpp `BI_RGB`
 file deliberately carries non-opaque high bytes: Pillow and Netpbm ignore them
 and match LiberSystem/Microsoft semantics, while ImageMagick interprets them as
 alpha, a documented implementation divergence. Complete RGBA buffers are pinned
-by FNV-1a. The reciprocal `just bmp-conformance` gate requires exact ImageMagick
+by FNV-1a. The reciprocal `./check.sh --conformance bmp` gate requires exact ImageMagick
 and Netpbm pixels for LiberSystem 24bpp and indexed 8bpp output.
 
 ### ICO
@@ -158,7 +158,7 @@ Wine convention. The independent ImageMagick corpus covers PNG-backed, ordinary 
 DIB and all-zero XOR-alpha DIB entries. ImageMagick and icoutils 0.32.3 produce exact
 RGBA for every standard fixture; a maskless derivative preserves the XOR bytes and is
 accepted by ImageMagick while strict icoutils rejects its missing AND bitmap. Complete
-decoded buffers are pinned by FNV-1a. The reciprocal `just ico-conformance` gate
+decoded buffers are pinned by FNV-1a. The reciprocal `./check.sh --conformance ico` gate
 requires exact ImageMagick/icoutils pixels for LiberSystem PNG-backed 32/256 output.
 Lower-depth DIB entries that require the AND mask, CUR hotspots and cursor output are
 intentional **Subsets**. Directory zero-as-256 dimensions, doubled DIB height and
@@ -180,7 +180,7 @@ helper requests the legacy 128 types through the public libicns API. Complete
 decoded pixel buffers are pinned by FNV-1a. Classic entries round-trip through
 `icns2png`, while the modern embedded PNG is validated directly with ImageMagick
 because this `icns2png` version drops alpha during `ic07` export. The reciprocal
-`just icns-conformance` gate externally validates LiberSystem's classic 16/32/48
+`./check.sh --conformance icns` gate externally validates LiberSystem's classic 16/32/48
 and modern 128 output, then compares independent 48 and legacy 128 decoding in
 both implementations. Status: **Verified profile** for every supported classic
 entry and modern `ic07`, under a **Source uncertain** format family. An
@@ -203,7 +203,7 @@ file with trailing 256-color palette and a 19x7 RGB three-plane file. Both use
 odd `bytes_per_line` equal to width, demonstrating that readers must honor the
 declared stride rather than impose common even-padding advice. ImageMagick and
 Netpbm `pcxtoppm` produce byte-identical RGBA results; the leaf pins complete
-buffers with FNV-1a. The reciprocal `just pcx-conformance` gate encodes both
+buffers with FNV-1a. The reciprocal `./check.sh --conformance pcx` gate encodes both
 profiles with LiberSystem and requires exact pixels from both independent
 decoders. Status: **Verified profile** for version-5 indexed and RGB RLE.
 
@@ -218,7 +218,7 @@ P6 with `Maxval=65535` two-byte big-endian samples. Complete RGBA buffers are
 pinned by FNV-1a. Netpbm nearest-rounding matches the decoder for low-Maxval P3;
 ImageMagick 7.1.1-43 truncates some converted 8-bit samples by one, a documented
 consumer quantization difference. Both agree exactly on the 16-bit P6 fixture.
-The reciprocal `just ppm-conformance` gate requires exact LiberSystem P6/255
+The reciprocal `./check.sh --conformance ppm` gate requires exact LiberSystem P6/255
 output from both implementations. Status: **Verified profile** for selected P3
 and P6 input plus conservative P6/255 output.
 
@@ -231,7 +231,7 @@ declarative hint and does not alter samples. Opaque output uses the three-channe
 profile; an image with any non-opaque pixel uses four channels. The independent
 Netpbm 11.10.2 corpus covers both channel counts and all six opcode families;
 ImageMagick 7.1.1-43 and Netpbm `qoitopam` produce byte-identical RGBA, pinned by
-whole-buffer FNV-1a. The reciprocal `just qoi-conformance` gate requires exact
+whole-buffer FNV-1a. The reciprocal `./check.sh --conformance qoi` gate requires exact
 pixels from both decoders for LiberSystem RGB and RGBA output. Status: **Verified
 profile** for QOI 1.0 RGB/RGBA input and output.
 
@@ -257,7 +257,7 @@ true-color files spanning all four top/bottom and left/right origin combinations
 An asymmetric alpha-bearing source makes every orientation observable, and one
 bottom-right raw 32-bit fixture carries a 22-byte image-ID payload. Complete
 canonical RGBA buffers are pinned by FNV-1a after independent `-auto-orient`
-decoding. The reciprocal `just tga-conformance` gate encodes raw and RLE 24/32-bit
+decoding. The reciprocal `./check.sh --conformance tga` gate encodes raw and RLE 24/32-bit
 profiles with LiberSystem and requires exact pixels from ImageMagick. Status:
 **Verified profile** for the selected true-color subset.
 
@@ -287,14 +287,14 @@ zero RIFF padding and zero reserved bits in `VP8X`/`ANMF`. libwebp `anim_dump`
 clears background-disposed rectangles to transparent black and ImageMagick keeps
 alpha-zero source RGB, while LiberSystem uses the declared ANIM background; raw
 ANMF frames and metadata agree and this viewer-policy divergence is documented.
-The reciprocal `just webp-conformance` gate validates our VP8 quality endpoints,
+The reciprocal `./check.sh --conformance webp` gate validates our VP8 quality endpoints,
 VP8L, ALPH and canonical full-canvas animation through webpinfo, dwebp, anim_dump
 and ImageMagick. Status: **Verified profile** for the implemented static and
 animation subsets.
 
 ## Interoperability gate
 
-`just image-conformance` runs the complete independent host matrix as one review/CI
+`./check.sh --conformance` runs the complete independent host matrix as one review/CI
 entry point. Its 11 reciprocal recipes cover all 12 formats: PNG and APNG intentionally
 share `png-conformance`; every other format has its own recipe. Depending on the profile,
 the external consumers/producers are ImageMagick, Pillow, Netpbm, gifsicle, icoutils,
@@ -309,7 +309,7 @@ and PNG-backed ICNS entry.
 
 ## Hostile-input gate
 
-`just image-mutate` runs 18 small corpus fixtures spanning every format above through
+`./bench.sh --suite image-mutate` runs 18 small corpus fixtures spanning every format above through
 both the owning leaf decoder and the central `imgconv` sniffer. Complete fixtures must
 decode as their expected format. Every strict prefix, every byte changed to zero, `0xff`
 and its high-bit inverse, whole-field zero/`0xff` mutations, and 128 deterministic
@@ -319,7 +319,7 @@ and 2,304 seeded mutations in an optimized host build.
 
 ## Resource governance
 
-`just test-tags image` boots the real dynamically linked `imgconv.lsexe` with real
+`./test.sh --tags image` boots the real dynamically linked `imgconv.lsexe` with real
 StorageService clients under isolated child Domains. Its whole-Domain memory high-water
 marks are 21,995,520 bytes for a 1920x1080 BMP-to-PNG resize, 84,475,904 bytes for the
 same conversion at 3840x2160, and 2,105,344 bytes for a bounded two-frame WebP-to-GIF
@@ -347,7 +347,7 @@ while decoding identically; lossy WebP keeps quality fixed while effort changes 
 
 `imgview` accepts exactly one image path. Version one displays a still image or composited
 animation frame 0 and does not play animations. `imgview --help` states this explicitly. The
-governed `just test-tags image` gate compares the complete 2x2 BGRX display buffer for an
+governed `./test.sh --tags image` gate compares the complete 2x2 BGRX display buffer for an
 opaque BMP, a PNG with partial and zero alpha, and frame 0 of an external two-frame WebP,
 then verifies focus-scoped quit input, surface release and clean process exit for every case.
 

@@ -301,7 +301,7 @@ check_dynamic_report_inventory() {
 	3)
 		inventory_state=refresh-required
 		echo "build-shared: checked dynamic reports need refresh after all target graphs are current" >&2
-		echo "build-shared: refresh with: cd $root && just dynamic-report-update" >&2
+		echo "build-shared: refresh with: cd $root && ./check.sh --refresh dynamic-report" >&2
 		if [[ "$verbose" == 1 ]]; then printf '%s\n' "$diagnostics" >&2; fi
 		return 0
 		;;

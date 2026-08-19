@@ -1,0 +1,11 @@
+# A trailing tab in the WebAssembly specification fixture is a COLUMN, not whitespace.
+#
+# `src/wasm/tests/spec-run-cases.tsv` is six tab-separated columns per row, and 223 of its 2727
+# assertion rows end with an empty last column - an `assert_return` whose function returns nothing.
+# The tab that delimits it is what makes the row six columns rather than five, so it is data and the
+# reader would notice its absence.
+#
+# `git diff --check` flags it as trailing whitespace, which was invisible while the file changed a
+# row at a time and became 223 findings the moment it was regenerated whole (P02M0134, WASM-004).
+# This says the file's whitespace is content, so the check stays useful everywhere else.
+src/wasm/tests/spec-run-cases.tsv -whitespace

@@ -282,6 +282,24 @@ pub unsafe fn devicetree_reservations(fdt: &fdt::Fdt, out: &mut [Hole], written:
 	if !complete {
 		crate::serial_println!("bootmem: the device tree's reservation block could not be read to its end - {entries} entr(ies) carved out, and anything past them is NOT reserved");
 	}
+	// AND THE OTHER PLACE THE TREE SAYS "DO NOT USE THIS" (FDT-001).
+	//
+	// The block above is the header's reservation list. `/reserved-memory` is the subtree boards
+	// actually use - firmware runtime, a secure world's carve-out, DMA pools, a framebuffer an
+	// earlier stage handed over - and nothing read it. Those ranges lie inside a `/memory` bank by
+	// construction, which is what makes them worth declaring and is exactly why reading `/memory`
+	// and stopping hands them to the allocator.
+	//
+	// UEFI boots are not exposed: they take the firmware's own map and never reach this. A direct
+	// device-tree boot is, and that is the path this covers.
+	let mut nodes = 0usize;
+	let subtree = fdt.for_each_reserved_memory_node(|base, len| {
+		nodes += 1;
+		push(base, len, &mut written);
+	});
+	if !subtree {
+		crate::serial_println!("bootmem: the device tree's /reserved-memory subtree could not be read to its end - {nodes} range(s) carved out, and anything past them is NOT reserved");
+	}
 	written
 }
 

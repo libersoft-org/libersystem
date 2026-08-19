@@ -12,7 +12,7 @@
 #   TEST=1    test mode (isa-debug-exit or semihosting, maps exit code to pass/fail)
 #   DEV_PROFILE=1 development profile: names it over fw_cfg so the guest reports it and
 #             DeviceManager starts a control agent, and attaches the channel the agent
-#             answers on. On x86_64 that is the persistent instance `just lab dev-up` owns; on
+#             answers on. On x86_64 that is the persistent instance `./dev.sh up` owns; on
 #             the other targets it is a one-shot guest a scenario runner drives cold, which
 #             is why this is not x86_64-only. Refused together with TEST.
 #   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log or stdio)
@@ -89,7 +89,7 @@ qemu_append_debug_args() {
 	local -n arr=$1
 	if [[ "${DEBUG:-0}" == "1" ]]; then
 		arr+=(-s -S)
-		echo "[qemu-run] waiting for GDB on :1234 (run 'just gdb' in another panel)"
+		echo "[qemu-run] waiting for GDB on :1234 (run './run.sh --gdb' in another panel)"
 	fi
 }
 
@@ -790,7 +790,7 @@ qemu_run_x86_64() {
 	# development instance holds it is refused, whatever profile it declares.
 	if [[ -z "$artifact_suffix" && -e "$QEMU_BUILD_DIR/dev-instance.lock" ]] && ! flock -n "$QEMU_BUILD_DIR/dev-instance.lock" true 2>/dev/null; then
 		echo "qemu-run: a development instance is running and holds the system, media and USB images" >&2
-		echo "qemu-run: release it with \`just lab dev-down\` (or \`just lab dev-status\` to see what it is)" >&2
+		echo "qemu-run: release it with \`./dev.sh down\` (or \`./dev.sh status\` to see what it is)" >&2
 		exit 1
 	fi
 
@@ -820,7 +820,7 @@ qemu_run_x86_64() {
 		listeners="$(ss -ltn "sport = :$port" 2>/dev/null || true)"
 		if grep -q LISTEN <<<"$listeners"; then
 			echo "qemu-run: host port $port is already in use, so this guest cannot forward it" >&2
-			echo "qemu-run: a persistent development instance is the usual holder - check \`just lab dev-status\`, release it with \`just lab dev-down\`" >&2
+			echo "qemu-run: a persistent development instance is the usual holder - check \`./dev.sh status\`, release it with \`./dev.sh down\`" >&2
 			echo "qemu-run: or run this guest on another port with HOSTFWD_PORT=<port>" >&2
 			exit 1
 		fi
@@ -1037,7 +1037,7 @@ qemu_run_aarch64() {
 		# Boot through the own UEFI loader under AAVMF.
 		local loader_efi="${LOADER_EFI:-$REPO_ROOT/.build/cargo/loader/aarch64-unknown-uefi/debug/libersystem-loader.efi}"
 		[[ -f "$loader_efi" ]] || {
-			echo "qemu-run: loader EFI not found: $loader_efi (run 'just loader-aarch64')" >&2
+			echo "qemu-run: loader EFI not found: $loader_efi (run './build.sh --arch aarch64 --part loader')" >&2
 			exit 1
 		}
 		[[ -f "$aavmf_code" && -f "$aavmf_vars" ]] || {
@@ -1233,7 +1233,7 @@ qemu_run_riscv64() {
 		fi
 		local loader_efi="${LOADER_EFI:-$REPO_ROOT/.build/cargo/loader/riscv64gc-unknown-none-elf/debug/libersystem-loader.efi}"
 		[[ -f "$loader_efi" ]] || {
-			echo "qemu-run: loader EFI not found: $loader_efi (run 'just loader-riscv64')" >&2
+			echo "qemu-run: loader EFI not found: $loader_efi (run './build.sh --arch riscv64 --part loader')" >&2
 			exit 1
 		}
 		[[ -f "$uboot" ]] || {

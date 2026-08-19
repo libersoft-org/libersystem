@@ -11,6 +11,50 @@ use alloc::vec::Vec;
 use crate::mock::{self, add_disk, descriptor, guard, state};
 use crate::{acpi, disk, file, gop, memory};
 
+// THE SAFETY ARGUMENT FOR THIS WHOLE FILE, made once.
+//
+// The nine entry points these tests drive take raw firmware pointers and are `unsafe fn` for it
+// (UEFI-005): nothing in `bs: *mut BootServices` says the number is a live boot-services table, and
+// a safe signature promised any number would do. In THIS module the number always comes from
+// `mock::boot_services()`, which returns a pointer to an in-process table of Rust function pointers
+// that lives for the whole test and is serialised by `guard()`; the ACPI tests pass an address
+// inside a `Vec` they own, with a `phys_to_virt` that is the identity on it.
+//
+// So the contract holds, for the same reason, at every call. Wrapping seventy call sites in
+// `unsafe { }` would say that seventy times without saying WHY once, and an `unsafe` block that
+// carries no argument is the thing that makes the next one easy to write without thinking. These
+// forwarders carry it; the tests below read as they did.
+mod firmware {
+	use super::{acpi, disk, file, gop, memory};
+	use crate::{self as uefi, BootServices};
+	use bootproto::MemRegion;
+
+	pub fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDescriptor, usize, usize, usize)> {
+		unsafe { memory::memory_map_snapshot(bs) }
+	}
+	pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_size: usize, regions: *mut MemRegion) -> Option<usize> {
+		unsafe { memory::translate_map(buf, map_size, desc_size, regions) }
+	}
+	pub fn staging_clear_of(bs: *mut BootServices, pages: usize, dest_low: u64, dest_high: u64) -> Option<u64> {
+		unsafe { memory::staging_clear_of(bs, pages, dest_low, dest_high) }
+	}
+	pub fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> Option<&'static [u8]> {
+		unsafe { file::read_file(bs, root, name) }
+	}
+	pub fn each_disk(bs: *mut BootServices, visit: impl FnMut(disk::FirmwareDisk) -> bool) {
+		unsafe { disk::each_disk(bs, visit) }
+	}
+	pub fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, open: impl FnMut(disk::FirmwareDisk) -> Option<([u8; 16], T)>) -> Option<T> {
+		unsafe { disk::choose_volume(bs, want, open) }
+	}
+	pub fn locate_framebuffer(bs: *mut BootServices) -> gop::GopFb {
+		unsafe { gop::locate_framebuffer(bs) }
+	}
+	pub fn acpi_at(rsdp: u64, phys_to_virt: fn(u64) -> u64) -> acpi::Acpi {
+		unsafe { acpi::Acpi::new(rsdp, phys_to_virt) }
+	}
+}
+
 // A device whose driver demands 4096-byte buffer alignment.
 //
 // `EFI_BLOCK_IO_MEDIA` carries `IoAlign` and the specification makes it a REQUIREMENT on the
@@ -27,7 +71,7 @@ fn a_driver_that_demands_alignment_is_given_an_aligned_buffer() {
 	add_disk(512, 4096, contents.clone());
 
 	let mut found: Option<disk::FirmwareDisk> = None;
-	disk::each_disk(mock::boot_services(), |d| {
+	firmware::each_disk(mock::boot_services(), |d| {
 		found = Some(d);
 		true
 	});
@@ -59,7 +103,7 @@ fn a_read_too_large_for_the_bounce_buffer_is_refused_rather_than_shortened() {
 	let _guard = guard();
 	add_disk(512, 4096, vec![7u8; 64 * 1024]);
 	let mut found: Option<disk::FirmwareDisk> = None;
-	disk::each_disk(mock::boot_services(), |d| {
+	firmware::each_disk(mock::boot_services(), |d| {
 		found = Some(d);
 		true
 	});
@@ -79,7 +123,7 @@ fn a_driver_with_no_alignment_requirement_reads_in_place() {
 	let contents: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
 	add_disk(512, 0, contents.clone());
 	let mut found: Option<disk::FirmwareDisk> = None;
-	disk::each_disk(mock::boot_services(), |d| {
+	firmware::each_disk(mock::boot_services(), |d| {
 		found = Some(d);
 		true
 	});
@@ -109,7 +153,7 @@ fn the_enumeration_reports_every_disk_in_the_firmware_order() {
 	add_disk(512, 0, vec![0xcc; 2048]);
 
 	let mut seen: Vec<(u32, u64)> = Vec::new();
-	disk::each_disk(mock::boot_services(), |d| {
+	firmware::each_disk(mock::boot_services(), |d| {
 		seen.push((d.block_size(), d.last_block()));
 		false
 	});
@@ -118,7 +162,7 @@ fn the_enumeration_reports_every_disk_in_the_firmware_order() {
 	// And a visitor that stops gets exactly what it asked for: the loader's volume search stops at
 	// the first volume it recognises, which is only correct if "first" means the firmware's first.
 	let mut count = 0usize;
-	disk::each_disk(mock::boot_services(), |_| {
+	firmware::each_disk(mock::boot_services(), |_| {
 		count += 1;
 		count == 2
 	});
@@ -167,7 +211,7 @@ fn the_paired_volume_is_chosen_whichever_order_the_firmware_reports_it_in() {
 		state().disks.clear();
 		add_disk(512, 0, first);
 		add_disk(512, 0, second);
-		let chosen = disk::choose_volume(mock::boot_services(), Some([0xd4; 16]), read_uuid);
+		let chosen = firmware::choose_volume(mock::boot_services(), Some([0xd4; 16]), read_uuid);
 		assert_eq!(chosen, Some([0xd4; 16]), "{label}: the paired volume is the one chosen");
 	}
 
@@ -177,12 +221,12 @@ fn the_paired_volume_is_chosen_whichever_order_the_firmware_reports_it_in() {
 	state().disks.clear();
 	add_disk(512, 0, theirs.clone());
 	add_disk(512, 0, ours.clone());
-	let chosen = disk::choose_volume(mock::boot_services(), None, read_uuid);
+	let chosen = firmware::choose_volume(mock::boot_services(), None, read_uuid);
 	assert_eq!(chosen, Some([0x77; 16]), "with no pairing the first volume that opens wins");
 
 	// And a pairing that names a volume this machine does not have finds NOTHING rather than
 	// falling back to somebody else's system.
-	let chosen = disk::choose_volume(mock::boot_services(), Some([0x5e; 16]), read_uuid);
+	let chosen = firmware::choose_volume(mock::boot_services(), Some([0x5e; 16]), read_uuid);
 	assert_eq!(chosen, None, "a volume that is not here is not substituted for");
 }
 
@@ -201,7 +245,7 @@ fn a_disk_that_does_not_open_does_not_end_the_search() {
 	add_disk(512, 0, wanted);
 
 	let mut opened = 0usize;
-	let chosen = disk::choose_volume(mock::boot_services(), Some([0x9c; 16]), |device| {
+	let chosen = firmware::choose_volume(mock::boot_services(), Some([0x9c; 16]), |device| {
 		opened += 1;
 		read_uuid(device)
 	});
@@ -239,7 +283,7 @@ fn a_drive_with_no_medium_is_not_offered() {
 	state().disks[1].media.block_size = 0;
 
 	let mut seen = 0usize;
-	disk::each_disk(mock::boot_services(), |_| {
+	firmware::each_disk(mock::boot_services(), |_| {
 		seen += 1;
 		false
 	});
@@ -262,14 +306,14 @@ fn a_memory_map_larger_than_the_boot_protocol_carries_is_refused() {
 	}
 	state().descriptors = descriptors;
 
-	let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+	let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
 	let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
-	assert!(memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).is_none(), "a map with more regions than the protocol carries is refused, not truncated");
+	assert!(firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).is_none(), "a map with more regions than the protocol carries is refused, not truncated");
 
 	// And a map that fits is translated whole.
 	state().descriptors = (0..500u64).map(|i| descriptor(crate::CONVENTIONAL_MEMORY, i * 0x4000, 1)).collect();
-	let (buf, _, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the smaller map is taken");
-	assert_eq!(memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()), Some(500), "every region survives");
+	let (buf, _, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the smaller map is taken");
+	assert_eq!(firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()), Some(500), "every region survives");
 	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
 }
 
@@ -284,9 +328,9 @@ fn the_translated_map_is_sorted_and_coalesced() {
 		descriptor(crate::CONVENTIONAL_MEMORY, 0x2000, 1),
 		descriptor(crate::ACPI_RECLAIM_MEMORY, 0x4000, 1),
 	];
-	let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+	let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
 	let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
-	let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+	let n = firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
 	assert_eq!(n, 2, "three adjacent usable pages become one region, and the ACPI page stays its own");
 	assert_eq!((regions[0].base, regions[0].length, regions[0].kind), (0x1000, 0x3000, bootproto::MEM_USABLE));
 	assert_eq!((regions[1].base, regions[1].kind), (0x4000, bootproto::MEM_ACPI_RECLAIMABLE));
@@ -306,9 +350,9 @@ fn overlapping_descriptors_are_canonicalized_with_the_restrictive_kind_winning()
 	{
 		let _guard = guard();
 		state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, 0x1000, 4), descriptor(crate::UNUSABLE_MEMORY, 0x3000, 2)];
-		let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+		let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
 		let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
-		let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+		let n = firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
 		assert_eq!(n, 2, "the overlap is resolved into two disjoint regions");
 		assert_eq!((regions[0].base, regions[0].length, regions[0].kind), (0x1000, 0x2000, bootproto::MEM_USABLE), "the usable region gives up its contested tail");
 		assert_eq!((regions[1].base, regions[1].length, regions[1].kind), (0x3000, 0x2000, bootproto::MEM_BAD), "and the restrictive one keeps all of it");
@@ -320,9 +364,9 @@ fn overlapping_descriptors_are_canonicalized_with_the_restrictive_kind_winning()
 	{
 		let _guard = guard();
 		state().descriptors = vec![descriptor(crate::ACPI_MEMORY_NVS, 0x1000, 8), descriptor(crate::CONVENTIONAL_MEMORY, 0x2000, 2)];
-		let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+		let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
 		let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
-		let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+		let n = firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
 		assert_eq!(n, 1, "a usable region inside a restricted one disappears");
 		assert_eq!((regions[0].base, regions[0].length, regions[0].kind), (0x1000, 0x8000, bootproto::MEM_ACPI_NVS));
 		assert_disjoint_and_no_restricted_byte_usable(&regions[..n], &[(0x1000, 0x9000)]);
@@ -334,9 +378,9 @@ fn overlapping_descriptors_are_canonicalized_with_the_restrictive_kind_winning()
 	{
 		let _guard = guard();
 		state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, 0x1000, 4), descriptor(crate::ACPI_RECLAIM_MEMORY, 0x1000, 1)];
-		let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+		let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
 		let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
-		let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+		let n = firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
 		assert_disjoint_and_no_restricted_byte_usable(&regions[..n], &[(0x1000, 0x2000)]);
 		unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
 	}
@@ -345,9 +389,9 @@ fn overlapping_descriptors_are_canonicalized_with_the_restrictive_kind_winning()
 	{
 		let _guard = guard();
 		state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, 0x1000, 4), descriptor(crate::CONVENTIONAL_MEMORY, 0x2000, 4)];
-		let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+		let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
 		let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
-		let n = memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+		let n = firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
 		assert_eq!(n, 1, "two overlapping usable descriptors are one region");
 		assert_eq!((regions[0].base, regions[0].length), (0x1000, 0x5000));
 		unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
@@ -390,17 +434,17 @@ fn staging_memory_is_taken_clear_of_the_kernels_destination() {
 	// The firmware offers, in order: the middle of the destination, its first page, a block ending
 	// one byte inside it, and finally somewhere clear.
 	state().forced_pages = vec![DEST_LOW + 0x8000, DEST_LOW, DEST_LOW - span + 4096, 0x9000_0000];
-	let scratch = memory::staging_clear_of(mock::boot_services(), pages, DEST_LOW, DEST_HIGH).expect("a clear block is found");
+	let scratch = firmware::staging_clear_of(mock::boot_services(), pages, DEST_LOW, DEST_HIGH).expect("a clear block is found");
 	assert_eq!(scratch, 0x9000_0000, "the first block that does not overlap the destination");
 	assert!(state().forced_pages.is_empty(), "and every offer before it was asked for and rejected");
 
 	// Immediately BELOW the destination is clear - the bound is the span's end, not its base.
 	state().forced_pages = vec![DEST_LOW - span];
-	assert_eq!(memory::staging_clear_of(mock::boot_services(), pages, DEST_LOW, DEST_HIGH), Some(DEST_LOW - span), "a block that ends exactly where the destination starts is clear of it");
+	assert_eq!(firmware::staging_clear_of(mock::boot_services(), pages, DEST_LOW, DEST_HIGH), Some(DEST_LOW - span), "a block that ends exactly where the destination starts is clear of it");
 
 	// And immediately ABOVE is clear too.
 	state().forced_pages = vec![DEST_HIGH];
-	assert_eq!(memory::staging_clear_of(mock::boot_services(), pages, DEST_LOW, DEST_HIGH), Some(DEST_HIGH), "so is one that starts exactly where it ends");
+	assert_eq!(firmware::staging_clear_of(mock::boot_services(), pages, DEST_LOW, DEST_HIGH), Some(DEST_HIGH), "so is one that starts exactly where it ends");
 }
 
 // A firmware with nothing but the destination to offer is refused rather than forced.
@@ -411,10 +455,25 @@ fn staging_gives_up_rather_than_placing_the_kernel_on_top_of_itself() {
 	const DEST_HIGH: u64 = 0x8030_0000;
 	// Seventeen offers inside the destination against sixteen reject slots.
 	state().forced_pages = (0..17u64).map(|i| DEST_LOW + i * 4096).collect();
-	assert_eq!(memory::staging_clear_of(mock::boot_services(), 4, DEST_LOW, DEST_HIGH), None, "a machine whose free memory is exactly where the kernel goes is a refusal");
-	// The rejects are deliberately NOT given back: freeing one invites the next request to return
-	// the same block, and they are firmware pages that `ExitBootServices` reclaims anyway.
-	assert!(state().frees.is_empty(), "nothing was freed on the way out");
+	assert_eq!(firmware::staging_clear_of(mock::boot_services(), 4, DEST_LOW, DEST_HIGH), None, "a machine whose free memory is exactly where the kernel goes is a refusal");
+	// EVERY CANDIDATE COMES BACK, and this assertion used to say the opposite.
+	//
+	// The rejects are held while the search runs - freeing one invites the next request to return
+	// the same block - and given back once the answer is known. The reason the old assertion gave
+	// for keeping them ("`ExitBootServices` reclaims them anyway") is not true of the map this
+	// loader hands over: `LOADER_DATA` becomes `MEM_BOOTLOADER`, which the kernel's frame allocator
+	// never seeds. `staging_clear_of` was corrected for that and this test was not, so it went on
+	// asserting the leak as the intended behaviour.
+	//
+	// Seventeen: sixteen recorded rejects plus the seventeenth candidate, which is allocated after
+	// the array is full and freed on its own line rather than lost.
+	let freed = state().frees.clone();
+	assert_eq!(freed.len(), 17, "every candidate the search took is given back: {freed:?}");
+	assert!(freed.iter().all(|&(_, pages)| pages == 4), "each freed with the size it was allocated with: {freed:?}");
+	let mut addresses: Vec<u64> = freed.iter().map(|&(address, _)| address).collect();
+	addresses.sort_unstable();
+	addresses.dedup();
+	assert_eq!(addresses.len(), 17, "and no address is given back twice: {freed:?}");
 }
 
 // A stale `MapKey` is the one status worth retrying.
@@ -483,7 +542,7 @@ fn a_file_that_short_reads_is_not_a_file() {
 	state().file_read_chunk = 512;
 	state().file_reads_before_failure = 3;
 
-	let answer = file::read_file(mock::boot_services(), mock::file_protocol(), "kernel");
+	let answer = firmware::read_file(mock::boot_services(), mock::file_protocol(), "kernel");
 	assert!(answer.is_none(), "a file that stopped arriving is not returned");
 	// And the pages went back rather than being left holding a partial image.
 	assert!(!state().frees.is_empty(), "the allocation was released");
@@ -500,7 +559,7 @@ fn a_file_that_arrives_in_pieces_is_read_whole() {
 	state().file_declared_size = bytes.len() as u64;
 	state().file_read_chunk = 512;
 
-	let answer = file::read_file(mock::boot_services(), mock::file_protocol(), "kernel").expect("the file is read");
+	let answer = firmware::read_file(mock::boot_services(), mock::file_protocol(), "kernel").expect("the file is read");
 	assert_eq!(answer.len(), bytes.len(), "the whole declared length");
 	assert_eq!(answer, &bytes[..], "and every byte of it");
 	assert_eq!(state().file_reads, 8, "in eight reads of 512 bytes");
@@ -528,7 +587,7 @@ fn a_name_that_does_not_fit_opens_nothing() {
 	state().file_bytes = vec![0u8; 16];
 	state().file_declared_size = 16;
 	let long = "a-file-name-longer-than-the-sixty-four-units-the-encoder-is-given-which-is-quite-a-lot-of-characters";
-	assert!(file::read_file(mock::boot_services(), mock::file_protocol(), long).is_none(), "refused before opening");
+	assert!(firmware::read_file(mock::boot_services(), mock::file_protocol(), long).is_none(), "refused before opening");
 	assert!(state().file_opened.is_empty(), "and the firmware was never asked to open anything");
 }
 
@@ -550,7 +609,7 @@ fn a_pixel_bitmask_mode_is_decoded_by_its_masks() {
 	assert_eq!((gop::mask_shift(0), gop::mask_size(0)), (0, 0), "an absent channel says so rather than reading as bit 0");
 
 	state().gop = Some(mock::GopConfig { width: 640, height: 480, stride: 640, format: crate::PIXEL_BIT_MASK, mask: crate::PixelBitmask { red: 0xf800, green: 0x07e0, blue: 0x001f, reserved: 0 }, base: 0x8000_0000, size: 640 * 480 * 2 });
-	let fb = gop::locate_framebuffer(mock::boot_services());
+	let fb = firmware::locate_framebuffer(mock::boot_services());
 	assert!(fb.present, "the framebuffer is reported");
 	assert_eq!((fb.width, fb.height), (640, 480));
 	assert_eq!((fb.red_shift, fb.red_size), (11, 5), "the mask decides where red is, not the format name");
@@ -569,24 +628,24 @@ fn a_gop_mode_larger_than_its_aperture_is_refused() {
 
 	// The honest mode is accepted: 640x480 at two bytes per pixel, aperture exactly that.
 	state().gop = Some(mock::GopConfig { width: 640, height: 480, stride: 640, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: 640 * 480 * 2 });
-	assert!(gop::locate_framebuffer(mock::boot_services()).present, "a mode that fits is reported");
+	assert!(firmware::locate_framebuffer(mock::boot_services()).present, "a mode that fits is reported");
 
 	// One row too many for the aperture.
 	state().gop = Some(mock::GopConfig { width: 640, height: 481, stride: 640, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: 640 * 480 * 2 });
-	assert!(!gop::locate_framebuffer(mock::boot_services()).present, "a mode one row past its aperture is refused");
+	assert!(!firmware::locate_framebuffer(mock::boot_services()).present, "a mode one row past its aperture is refused");
 
 	// A stride wider than the aperture allows, with an honest height.
 	state().gop = Some(mock::GopConfig { width: 640, height: 480, stride: 4096, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: 640 * 480 * 2 });
-	assert!(!gop::locate_framebuffer(mock::boot_services()).present, "a stride past its aperture is refused");
+	assert!(!firmware::locate_framebuffer(mock::boot_services()).present, "a stride past its aperture is refused");
 
 	// A stride narrower than the visible width describes no picture at all.
 	state().gop = Some(mock::GopConfig { width: 640, height: 480, stride: 320, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: 640 * 480 * 2 });
-	assert!(!gop::locate_framebuffer(mock::boot_services()).present, "a stride narrower than the width is refused");
+	assert!(!firmware::locate_framebuffer(mock::boot_services()).present, "a stride narrower than the width is refused");
 
 	// And a height whose product overflows rather than merely exceeding: the case where a
 	// large-but-plausible pair becomes a small number.
 	state().gop = Some(mock::GopConfig { width: 640, height: u32::MAX, stride: u32::MAX, format: crate::PIXEL_BIT_MASK, mask, base: 0x8000_0000, size: usize::MAX });
-	assert!(!gop::locate_framebuffer(mock::boot_services()).present, "a geometry whose product overflows is refused");
+	assert!(!firmware::locate_framebuffer(mock::boot_services()).present, "a geometry whose product overflows is refused");
 }
 
 // The two NAMED formats do not carry masks, and reading them as though they did would decode every
@@ -606,7 +665,7 @@ fn the_named_pixel_formats_are_decoded_by_their_names() {
 			base: 0x9000_0000,
 			size: 1024 * 768 * 4,
 		});
-		let fb = gop::locate_framebuffer(mock::boot_services());
+		let fb = firmware::locate_framebuffer(mock::boot_services());
 		assert!(fb.present, "the framebuffer is reported");
 		assert_eq!((fb.red_shift, fb.blue_shift), expected, "the named format places its channels");
 		assert_eq!(fb.red_size, 8, "eight bits each");
@@ -618,7 +677,7 @@ fn the_named_pixel_formats_are_decoded_by_their_names() {
 #[test]
 fn no_graphics_output_is_a_headless_machine() {
 	let _guard = guard();
-	let fb = gop::locate_framebuffer(mock::boot_services());
+	let fb = firmware::locate_framebuffer(mock::boot_services());
 	assert!(!fb.present, "no framebuffer is reported");
 	assert_eq!(fb.phys, 0, "and nothing is described");
 }
@@ -629,7 +688,7 @@ fn no_graphics_output_is_a_headless_machine() {
 fn a_blt_only_mode_has_no_framebuffer_to_hand_over() {
 	let _guard = guard();
 	state().gop = Some(mock::GopConfig { width: 800, height: 600, stride: 800, format: crate::PIXEL_BLT_ONLY, mask: crate::PixelBitmask { red: 0, green: 0, blue: 0, reserved: 0 }, base: 0, size: 0 });
-	let fb = gop::locate_framebuffer(mock::boot_services());
+	let fb = firmware::locate_framebuffer(mock::boot_services());
 	assert!(!fb.present, "a blt-only mode is not a linear framebuffer");
 }
 
@@ -760,7 +819,7 @@ fn spcr_names_the_console_of_an_acpi_machine() {
 	// address the loader used to store to after `ExitBootServices` was a literal from QEMU's virt
 	// machine. SPCR is where such a machine says it.
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x0e, 0, 1, 0xffff_0000_0000_9000))], 2);
-	let acpi = acpi::Acpi::new(rsdp, here);
+	let acpi = firmware::acpi_at(rsdp, here);
 	assert!(acpi.is_valid(), "a well-formed RSDP is accepted");
 	assert_eq!(acpi.console(), Some(acpi::Console { uart: acpi::Uart::Pl011, base: 0xffff_0000_0000_9000, reg_shift: 0, access_width: 4 }), "an SBSA generic UART is a PL011 for the two registers this drives");
 }
@@ -771,18 +830,18 @@ fn a_sixteen_five_fifty_with_dword_access_is_four_bytes_between_registers() {
 	// describing registers four bytes apart. Writing the character at +5 instead of +20 puts it in
 	// the modem-control register.
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 0, 3, 0x1000_0000))], 2);
-	assert_eq!(acpi::Acpi::new(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 2, access_width: 4 }));
+	assert_eq!(firmware::acpi_at(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 2, access_width: 4 }));
 
 	// ACCESS SIZE 4 IS QWORD, and it fell into the default zero-shift branch - the one value in the
 	// enumeration that was silently MISTRANSLATED rather than merely unused, so a table declaring
 	// eight-byte spacing got registers one byte apart and every write landed in the wrong register.
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 0, 4, 0x1000_0000))], 2);
-	assert_eq!(acpi::Acpi::new(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 3, access_width: 8 }));
+	assert_eq!(firmware::acpi_at(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 3, access_width: 8 }));
 
 	// And the access width is KEPT, not only converted: byte access is what an unspecified table
 	// means and what every 16550 answers.
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 0, 1, 0x1000_0000))], 2);
-	assert_eq!(acpi::Acpi::new(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 0, access_width: 1 }));
+	assert_eq!(firmware::acpi_at(rsdp, here).console(), Some(acpi::Console { uart: acpi::Uart::Ns16550, base: 0x1000_0000, reg_shift: 0, access_width: 1 }));
 }
 
 #[test]
@@ -790,19 +849,19 @@ fn a_console_that_is_not_in_memory_or_not_a_uart_we_drive_is_refused() {
 	// Three ways SPCR describes something this loader must not store to, each of which a reader
 	// that only looked at the address would accept.
 	let ports = machine(&[table(b"SPCR", 2, &spcr_body(0x00, 1, 1, 0x3f8))], 2);
-	assert_eq!(acpi::Acpi::new(ports, here).console(), None, "an I/O-port console is not a store away");
+	assert_eq!(firmware::acpi_at(ports, here).console(), None, "an I/O-port console is not a store away");
 
 	let unknown = machine(&[table(b"SPCR", 2, &spcr_body(0x05, 0, 1, 0x1000_0000))], 2);
-	assert_eq!(acpi::Acpi::new(unknown, here).console(), None, "a UART family with no driver here is not guessed at");
+	assert_eq!(firmware::acpi_at(unknown, here).console(), None, "a UART family with no driver here is not guessed at");
 
 	let nowhere = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0))], 2);
-	assert_eq!(acpi::Acpi::new(nowhere, here).console(), None, "and address zero is not an address");
+	assert_eq!(firmware::acpi_at(nowhere, here).console(), None, "and address zero is not an address");
 }
 
 #[test]
 fn a_machine_with_no_spcr_answers_none_rather_than_the_first_table_it_finds() {
 	let rsdp = machine(&[table(b"FACP", 2, &[0u8; 200]), table(b"APIC", 2, &[0u8; 100])], 2);
-	let acpi = acpi::Acpi::new(rsdp, here);
+	let acpi = firmware::acpi_at(rsdp, here);
 	assert!(acpi.table(b"APIC").is_some(), "the walk finds the tables that are there");
 	assert_eq!(acpi.table(b"SPCR"), None);
 	assert_eq!(acpi.console(), None);
@@ -814,7 +873,7 @@ fn a_configuration_table_entry_that_is_not_an_rsdp_is_not_walked() {
 	// An entry that points at something else is a pointer into arbitrary memory, and the checksum
 	// is what tells the difference - a signature alone can occur by accident in a data table.
 	let rubbish: &'static [u8] = Vec::leak(vec![0x41u8; 4096]);
-	let acpi = acpi::Acpi::new(publish(rubbish), here);
+	let acpi = firmware::acpi_at(publish(rubbish), here);
 	assert!(!acpi.is_valid());
 	assert_eq!(acpi.console(), None);
 
@@ -824,7 +883,7 @@ fn a_configuration_table_entry_that_is_not_an_rsdp_is_not_walked() {
 	bytes[0..8].copy_from_slice(b"RSD PTR ");
 	bytes[15] = 2;
 	let leaked: &'static [u8] = Vec::leak(bytes);
-	assert!(!acpi::Acpi::new(publish(leaked), here).is_valid(), "the signature is right and the checksum is not");
+	assert!(!firmware::acpi_at(publish(leaked), here).is_valid(), "the signature is right and the checksum is not");
 }
 
 #[test]
@@ -849,7 +908,7 @@ fn an_acpi_one_point_zero_machine_is_read_through_its_rsdt() {
 	leaked[16..20].copy_from_slice(&((origin + rsdt_at as u64) as u32).to_le_bytes());
 	checksum_at(leaked, 0, 20, 9);
 
-	let console = acpi::Acpi::new(origin, here).console().expect("revision 0 is read through the RSDT");
+	let console = firmware::acpi_at(origin, here).console().expect("revision 0 is read through the RSDT");
 	assert_eq!(console.base, 0x9000_0000);
 }
 
@@ -863,11 +922,11 @@ fn a_table_that_fails_its_checksum_is_not_read() {
 	// structure, and the XSDT pointer lives in the part the first twenty bytes do not cover - so
 	// the pointer this parser follows first was taken from bytes nothing had summed.
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
-	assert!(acpi::Acpi::new(rsdp, here).is_valid(), "the well-formed one is accepted");
+	assert!(firmware::acpi_at(rsdp, here).is_valid(), "the well-formed one is accepted");
 	let bytes = unsafe { core::slice::from_raw_parts_mut(here(rsdp) as *mut u8, 36) };
 	bytes[32] = bytes[32].wrapping_add(1);
-	assert!(!acpi::Acpi::new(rsdp, here).is_valid(), "an RSDP whose extended checksum is off by one is not an RSDP");
-	assert_eq!(acpi::Acpi::new(rsdp, here).console(), None, "and nothing is read through it");
+	assert!(!firmware::acpi_at(rsdp, here).is_valid(), "an RSDP whose extended checksum is off by one is not an RSDP");
+	assert_eq!(firmware::acpi_at(rsdp, here).console(), None, "and nothing is read through it");
 	bytes[32] = bytes[32].wrapping_sub(1);
 
 	// 2. The root table's signature. It was taken on trust: a length in range was the whole test,
@@ -875,22 +934,22 @@ fn a_table_that_fails_its_checksum_is_not_read() {
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
 	let root = unsafe { core::slice::from_raw_parts_mut(here(rsdp + 36) as *mut u8, 4) };
 	root.copy_from_slice(b"XSDX");
-	assert_eq!(acpi::Acpi::new(rsdp, here).table(b"SPCR"), None, "a root table whose signature is neither XSDT nor RSDT is not walked");
+	assert_eq!(firmware::acpi_at(rsdp, here).table(b"SPCR"), None, "a root table whose signature is neither XSDT nor RSDT is not walked");
 
 	// 3. The root table's own checksum.
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
 	let root = unsafe { core::slice::from_raw_parts_mut(here(rsdp + 36) as *mut u8, 45) };
 	root[9] = root[9].wrapping_add(1);
-	assert_eq!(acpi::Acpi::new(rsdp, here).table(b"SPCR"), None, "a root table that does not sum to zero is not walked");
+	assert_eq!(firmware::acpi_at(rsdp, here).table(b"SPCR"), None, "a root table that does not sum to zero is not walked");
 
 	// 4. And the table the entry names. An SPCR whose checksum is off by one gives no console
 	// rather than a wrong one, which is the address the loader would have stored to.
 	let rsdp = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
-	let spcr = acpi::Acpi::new(rsdp, here).table(b"SPCR").expect("the good one is found");
+	let spcr = firmware::acpi_at(rsdp, here).table(b"SPCR").expect("the good one is found");
 	let body = unsafe { core::slice::from_raw_parts_mut(here(spcr) as *mut u8, 80) };
 	body[9] = body[9].wrapping_add(1);
-	assert_eq!(acpi::Acpi::new(rsdp, here).table(b"SPCR"), None, "an SPCR that does not sum to zero is not a table");
-	assert_eq!(acpi::Acpi::new(rsdp, here).console(), None, "and the loader gets no console rather than a wrong one");
+	assert_eq!(firmware::acpi_at(rsdp, here).table(b"SPCR"), None, "an SPCR that does not sum to zero is not a table");
+	assert_eq!(firmware::acpi_at(rsdp, here).console(), None, "and the loader gets no console rather than a wrong one");
 }
 
 // An FADT body with ARM Boot Architecture Flags at offset 129 (revision 5 and later). The header is
@@ -907,23 +966,23 @@ fn the_fadt_says_which_instruction_reaches_psci() {
 	// A machine that hands firmware EL1 has something below it, and what that something answers is
 	// stated by the platform - here, in the FADT's ARM Boot Architecture Flags.
 	let hvc = machine(&[table(b"FACP", 5, &fadt_body(0x0003))], 2);
-	assert_eq!(acpi::Acpi::new(hvc, here).psci_conduit(), Some(acpi::PsciConduit::Hvc), "PSCI_COMPLIANT and PSCI_USE_HVC");
+	assert_eq!(firmware::acpi_at(hvc, here).psci_conduit(), Some(acpi::PsciConduit::Hvc), "PSCI_COMPLIANT and PSCI_USE_HVC");
 
 	let smc = machine(&[table(b"FACP", 5, &fadt_body(0x0001))], 2);
-	assert_eq!(acpi::Acpi::new(smc, here).psci_conduit(), Some(acpi::PsciConduit::Smc), "PSCI_COMPLIANT without PSCI_USE_HVC is SMC - which is most server-class AArch64");
+	assert_eq!(firmware::acpi_at(smc, here).psci_conduit(), Some(acpi::PsciConduit::Smc), "PSCI_COMPLIANT without PSCI_USE_HVC is SMC - which is most server-class AArch64");
 
 	// NOT COMPLIANT IS NOT "SMC BY DEFAULT". A firmware that says it has no PSCI has none, and the
 	// caller must treat that as no secondaries rather than as a reason to try an instruction.
 	let none = machine(&[table(b"FACP", 5, &fadt_body(0x0002))], 2);
-	assert_eq!(acpi::Acpi::new(none, here).psci_conduit(), None, "PSCI_USE_HVC without PSCI_COMPLIANT describes nothing");
+	assert_eq!(firmware::acpi_at(none, here).psci_conduit(), None, "PSCI_USE_HVC without PSCI_COMPLIANT describes nothing");
 
 	let no_fadt = machine(&[table(b"SPCR", 2, &spcr_body(0x03, 0, 1, 0x9000_0000))], 2);
-	assert_eq!(acpi::Acpi::new(no_fadt, here).psci_conduit(), None, "a machine with no FADT states nothing");
+	assert_eq!(firmware::acpi_at(no_fadt, here).psci_conduit(), None, "a machine with no FADT states nothing");
 
 	// A table too short to hold the field has no answer either - the flags arrived in FADT
 	// revision 5, and reading them out of a shorter table reads whatever follows it.
 	let short = machine(&[table(b"FACP", 1, &vec![0u8; 116 - 36])], 2);
-	assert_eq!(acpi::Acpi::new(short, here).psci_conduit(), None, "an ACPI 1.0 FADT has no ARM boot flags");
+	assert_eq!(firmware::acpi_at(short, here).psci_conduit(), None, "an ACPI 1.0 FADT has no ARM boot flags");
 }
 
 // P02M0129, sixth round: the stride, the whole-number rule and the second `GetMemoryMap`.
@@ -931,22 +990,22 @@ fn the_fadt_says_which_instruction_reaches_psci() {
 fn a_descriptor_stride_that_cannot_be_one_is_refused() {
 	let _guard = guard();
 	state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, 0x1000, 1), descriptor(crate::CONVENTIONAL_MEMORY, 0x3000, 1)];
-	let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+	let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
 	let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
 
 	// A stride SMALLER than a descriptor reads each entry past its own end into the next - or, at
 	// the last, past the buffer. `desc_size == 0` was refused and this was not; the specification
 	// allows the firmware's stride to be larger than the structure, never smaller.
-	assert!(memory::translate_map(buf, map_size, core::mem::size_of::<crate::MemoryDescriptor>() - 1, regions.as_mut_ptr()).is_none(), "a stride shorter than a descriptor is not a stride");
+	assert!(firmware::translate_map(buf, map_size, core::mem::size_of::<crate::MemoryDescriptor>() - 1, regions.as_mut_ptr()).is_none(), "a stride shorter than a descriptor is not a stride");
 
 	// A map that is not a whole number of descriptors had its partial tail silently discarded, which
 	// for the one structure that says which RAM exists is the same looks-complete-and-is-not failure
 	// the `MAX_REGIONS` refusal exists for.
-	assert!(memory::translate_map(buf, map_size - 1, desc_size, regions.as_mut_ptr()).is_none(), "a map that is not a whole number of descriptors is refused rather than truncated");
+	assert!(firmware::translate_map(buf, map_size - 1, desc_size, regions.as_mut_ptr()).is_none(), "a map that is not a whole number of descriptors is refused rather than truncated");
 
 	// And the honest pair still translates, so these are rules about the arguments and not a
 	// refusal of the ordinary case.
-	assert_eq!(memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()), Some(2), "the map itself is fine");
+	assert_eq!(firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()), Some(2), "the map itself is fine");
 	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
 }
 
@@ -957,8 +1016,8 @@ fn a_region_whose_end_leaves_the_address_space_is_refused() {
 	// machine has - which the kernel would then carve, seed or map.
 	let _guard = guard();
 	state().descriptors = vec![descriptor(crate::CONVENTIONAL_MEMORY, u64::MAX - 0x1000, 4)];
-	let (buf, pages, map_size, desc_size) = memory::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+	let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
 	let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
-	assert!(memory::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).is_none(), "a region that leaves the address space is refused");
+	assert!(firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).is_none(), "a region that leaves the address space is refused");
 	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
 }

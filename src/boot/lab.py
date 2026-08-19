@@ -33,7 +33,7 @@
 #   boot/lab.py dev-log [-f|<pat>]   show / follow / grep its serial log
 #   boot/lab.py dev-down             stop it gracefully and release the lock
 #
-# `sh` joins its arguments, so quoting is optional: `just lab sh time ls`.
+# `sh` joins its arguments, so quoting is optional: `./lab.sh sh time ls`.
 
 import contextlib
 import fcntl
@@ -53,7 +53,7 @@ import time
 
 USAGE = """lab - drive a live LiberSystem instance for debugging.
 
-Usage (via `just lab ...` from src/, or boot/lab.py directly):
+Usage (via `./lab.sh ...` from src/, or boot/lab.py directly):
   boot [--fresh] [--vnc] [--spice] [--timeout N]
   sh <command...>       run a shell command in the guest, print its output
   int                   interrupt the foreground job (Ctrl+C over serial)
@@ -642,7 +642,7 @@ def active_ctl_sock():
 
 def ctl_request(request, timeout, ctl_path=CTL_SOCK):
 	if not os.path.exists(ctl_path):
-		die('no live instance (run `just lab boot` first)')
+		die('no live instance (run `./lab.sh boot` first)')
 	conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	conn.connect(ctl_path)
 	conn.settimeout(timeout + 10)
@@ -665,12 +665,12 @@ def ctl_request(request, timeout, ctl_path=CTL_SOCK):
 # A broker that answers without a frame is one from before this protocol existed - a persistent
 # instance that was already running when the tree changed under it. That is reported rather than
 # guessed at: reading its bytes as a successful reply is exactly the false green the frame was added
-# to remove, and the fix (`just lab dev-down && just lab dev-up`) is one line to state.
+# to remove, and the fix (`./dev.sh down && ./dev.sh up`) is one line to state.
 def parse_reply(reply):
 	header, newline, body = reply.partition(b'\n')
 	parts = header.split(b' ')
 	if not newline or len(parts) != 3 or parts[0] != REPLY_MAGIC:
-		die('the instance answered without a reply frame - it predates this protocol; restart it with `just lab dev-down && just lab dev-up`')
+		die('the instance answered without a reply frame - it predates this protocol; restart it with `./dev.sh down && ./dev.sh up`')
 	outcome = parts[1].decode(errors='replace')
 	if outcome not in REPLY_OUTCOMES:
 		die(f'the instance answered with an unknown outcome {outcome!r}')
@@ -715,7 +715,7 @@ INSTANCE_INPUTS = (
 	# any source root above, so a changed build recipe was invisible to every class.
 	# `manifest`: the single statement of what the system contains and where each part goes.
 	('payload', ['src/volume'], ['product.conf']),
-	('build', ['src/tools'], ['build.sh', 'image.sh', 'run.sh', 'lib.sh', 'src/Justfile']),
+	('build', ['src/tools'], ['build.sh', 'image.sh', 'run.sh', 'lib.sh', 'gen.sh']),
 	('manifest', [], ['src/user/services/manifest.toml']),
 )
 
@@ -817,7 +817,7 @@ def warn_stale_inputs(identity):
 	print(f'lab: WARNING: this instance predates the tree: {", ".join(stale)} changed since it booted', file=sys.stderr)
 	for name in stale:
 		print(f'     {name:9}{INPUT_ACTIONS[name]}', file=sys.stderr)
-	print('     a cold restart (`just lab dev-down && just lab dev-up`) is what picks it up; hot publication cannot', file=sys.stderr)
+	print('     a cold restart (`./dev.sh down && ./dev.sh up`) is what picks it up; hot publication cannot', file=sys.stderr)
 
 
 def dev_identity_read():
@@ -995,10 +995,10 @@ def dev_owner_conflict(identity):
 	# A bring-up that has taken the lock but recorded nothing yet is not an ownership dispute,
 	# and saying so would send the reader looking for a worktree to release it from.
 	if not identity:
-		print('lab: a development instance is starting; wait for it, or `just lab dev-down` to abandon it', file=sys.stderr)
+		print('lab: a development instance is starting; wait for it, or `./dev.sh down` to abandon it', file=sys.stderr)
 		sys.exit(1)
 	print(f'lab: development profile is owned by {dev_describe(identity)}', file=sys.stderr)
-	print(f'lab: release it with `just lab dev-down` in {identity.get("repo", "that worktree")}', file=sys.stderr)
+	print(f'lab: release it with `./dev.sh down` in {identity.get("repo", "that worktree")}', file=sys.stderr)
 	sys.exit(1)
 
 
@@ -1082,7 +1082,7 @@ def cmd_dev_up(args):
 	if state in ('starting', 'foreign'):
 		dev_owner_conflict(identity)
 	if state == 'stale':
-		die('stale development instance state; run `just lab dev-down` to clear it')
+		die('stale development instance state; run `./dev.sh down` to clear it')
 
 	lock_fd = os.open(DEV_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
 	try:
@@ -1202,7 +1202,7 @@ def cmd_dev_up(args):
 		pass
 	profile = 'development' if b'boot profile: development' in strip_ansi(reply.data) or dev_profile_logged() else 'not reported'
 	print(f'lab: development instance ready in {time.time() - started:.1f} s (guest profile: {profile})')
-	print(f'lab: serial log {os.path.relpath(DEV_SERIAL_LOG, SRC)}; `just lab dev-status`, `just lab dev-down`')
+	print(f'lab: serial log {os.path.relpath(DEV_SERIAL_LOG, SRC)}; `./dev.sh status`, `./dev.sh down`')
 
 
 def dev_profile_logged():
@@ -1217,16 +1217,16 @@ def cmd_dev_status(args):
 	state, identity = dev_state()
 	print(f'lab: development instance {state}')
 	if state == 'down':
-		print('     start it with `just lab dev-up`')
+		print('     start it with `./dev.sh up`')
 		sys.exit(1)
 	if state == 'stale':
 		print('     the broker is gone but its sockets remain')
-		print('     clear it with `just lab dev-down`')
+		print('     clear it with `./dev.sh down`')
 		sys.exit(1)
 	if state == 'detached':
 		print(f'     owner    {dev_describe(identity)}')
 		print('     the guest is running but no broker is draining its console')
-		print('     reattach without rebooting: `just lab dev-up`')
+		print('     reattach without rebooting: `./dev.sh up`')
 		sys.exit(1)
 	console = dev_console_stat()
 	print(f'     owner    {dev_describe(identity)}')
@@ -1239,7 +1239,7 @@ def cmd_dev_status(args):
 		print('     another worktree owns it; this one cannot use or stop it')
 		sys.exit(1)
 	if state == 'starting':
-		print('     no shell prompt yet; rerun `just lab dev-status` or watch `just lab dev-log -f`')
+		print('     no shell prompt yet; rerun `./dev.sh status` or watch `./dev.sh log -f`')
 		sys.exit(1)
 	shadowed = dev_shadowed()
 	if shadowed is None:
@@ -1250,7 +1250,7 @@ def cmd_dev_status(args):
 		print(f'     registry {len(shadowed)} artifact(s) shadowing the system volume:')
 		for name, generation, when in shadowed:
 			print(f'              {name} generation {generation}, published {when}')
-		print('              these override the built image until `just lab dev-rollback` or a restart')
+		print('              these override the built image until `./dev.sh rollback` or a restart')
 	stale = instance_stale_inputs(identity)
 	if stale is None:
 		print('     inputs   not recorded by this instance; restart it to compare')
@@ -1264,7 +1264,7 @@ def cmd_dev_status(args):
 	print(f'     inputs   stale: {", ".join(stale)}')
 	for name in stale:
 		print(f'              {name:9}{INPUT_ACTIONS[name]}')
-	print('     action   cold restart: `just lab dev-down && just lab dev-up`')
+	print('     action   cold restart: `./dev.sh down && ./dev.sh up`')
 	print('              this is a cold invalidation, not a hot-publishable application change')
 	sys.exit(1)
 
@@ -1285,7 +1285,7 @@ def dev_check_socket(path):
 	except OSError as error:
 		die(f'cannot check {os.path.relpath(path, SRC)}: {error}')
 	if mode & 0o077:
-		die(f'{os.path.relpath(path, SRC)} is mode {mode:03o}, reachable beyond its owner; stop the instance with `just lab dev-down`')
+		die(f'{os.path.relpath(path, SRC)} is mode {mode:03o}, reachable beyond its owner; stop the instance with `./dev.sh down`')
 
 
 # Ask the guest which boot it is and record it on the instance lock.
@@ -1388,9 +1388,9 @@ def cmd_dev_console(args):
 	if state == 'foreign':
 		dev_owner_conflict(identity)
 	if state in ('down', 'stale'):
-		die('no development instance (run `just lab dev-up` first)')
+		die('no development instance (run `./dev.sh up` first)')
 	if not os.path.exists(DEV_CONSOLE_SOCK):
-		die('this instance has no console socket; restart it with `just lab dev-down && just lab dev-up`')
+		die('this instance has no console socket; restart it with `./dev.sh down && ./dev.sh up`')
 	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 	try:
 		sock.connect(DEV_CONSOLE_SOCK)
@@ -1457,7 +1457,7 @@ def console_pump(sock, interactive):
 
 def cmd_dev_log(args):
 	if not os.path.exists(DEV_SERIAL_LOG):
-		die('no development serial log yet (run `just lab dev-up` first)')
+		die('no development serial log yet (run `./dev.sh up` first)')
 	if '-f' in args:
 		os.execvp('tail', ['tail', '-f', DEV_SERIAL_LOG])
 	if args:
@@ -1752,7 +1752,7 @@ def channel_path():
 
 def proto_connect(timeout):
 	if not os.path.exists(channel_path()):
-		die('this instance has no development channel; restart it with `just lab dev-down && just lab dev-up`')
+		die('this instance has no development channel; restart it with `./dev.sh down && ./dev.sh up`')
 	if CHANNEL_OVERRIDE is None:
 		dev_check_socket(DEV_CHANNEL_SOCK)
 	sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1833,9 +1833,9 @@ def proto_session(timeout, announce=True):
 	if state == 'foreign':
 		dev_owner_conflict(identity)
 	if state in ('down', 'stale'):
-		die('no development instance (run `just lab dev-up` first)')
+		die('no development instance (run `./dev.sh up` first)')
 	if state == 'detached':
-		die('the guest is running but no broker owns it; reattach with `just lab dev-up`')
+		die('the guest is running but no broker owns it; reattach with `./dev.sh up`')
 	sock = proto_connect(timeout)
 	buffer = bytearray()
 	bounds = proto_hello(sock, buffer, timeout)
@@ -1850,9 +1850,9 @@ def proto_session(timeout, announce=True):
 	# with nothing saying so.
 	recorded = dev_boot_record_read()
 	if recorded is None:
-		die('this instance has no recorded boot generation, so nothing can tell this guest from one that restarted under it; rerun `just lab dev-up`')
+		die('this instance has no recorded boot generation, so nothing can tell this guest from one that restarted under it; rerun `./dev.sh up`')
 	if recorded != bounds['boot']:
-		die(f'the guest has restarted since this instance was recorded (boot {recorded[:16]} -> {bounds["boot"][:16]}); rerun `just lab dev-up`')
+		die(f'the guest has restarted since this instance was recorded (boot {recorded[:16]} -> {bounds["boot"][:16]}); rerun `./dev.sh up`')
 	warn_stale_inputs(identity)
 	if announce:
 		registry = f'registry {bounds["max_registry"] // (1024 * 1024)} MB, {bounds["max_generations"]} generations per artifact' if bounds['registry'] else 'no registry on this boot'
@@ -2042,7 +2042,7 @@ def cmd_dev_reboot(args):
 	# boot value is not optional bookkeeping: without it every session refuses this guest for
 	# having restarted, and the recovery it names is the rebuild this command exists to avoid.
 	if not dev_record_boot():
-		die('the guest rebooted but its development agent never answered, so the instance is now unusable; `just lab dev-up` will rebuild it')
+		die('the guest rebooted but its development agent never answered, so the instance is now unusable; `./dev.sh up` will rebuild it')
 	print(f'lab: guest rebooted to a prompt in {time.time() - started:.1f} s; the registry is empty and the volume is unchanged')
 
 
@@ -2755,7 +2755,7 @@ def cmd_dev_test(args):
 	if state == 'foreign':
 		dev_owner_conflict(identity)
 	if state != 'ready':
-		die(f'development instance is {state}; scenarios need a ready one (`just lab dev-up`)')
+		die(f'development instance is {state}; scenarios need a ready one (`./dev.sh up`)')
 	# The fixtures are checked against the tree they were made from BEFORE anything is published.
 	# Validation used to check only that the files existed, so a fixture whose staged source had
 	# been rebuilt was published as though it were current and the run's verdict was about bytes
@@ -3045,7 +3045,7 @@ def cmd_boot(args):
 	if not reply.prompted:
 		die(f'no shell prompt within {timeout} s (see {SERIAL_LOG})')
 	print(f'lab: booted in {time.time() - started:.1f} s' + (' (fresh volume)' if fresh else ''))
-	print(f'lab: serial log {os.path.relpath(SERIAL_LOG, SRC)}; try `just lab sh uname`')
+	print(f'lab: serial log {os.path.relpath(SERIAL_LOG, SRC)}; try `./lab.sh sh uname`')
 
 
 def cmd_sh(args):

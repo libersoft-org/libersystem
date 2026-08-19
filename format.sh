@@ -56,7 +56,6 @@ mapfile -d '' -t changed_files < <(
 rust_files=()
 shell_files=()
 toml_files=()
-format_justfile=0
 
 for file in "${changed_files[@]}"; do
 	[[ -f "$file" ]] || continue
@@ -64,7 +63,6 @@ for file in "${changed_files[@]}"; do
 	*.rs) rust_files+=("$file") ;;
 	*.sh) shell_files+=("$file") ;;
 	*.toml) toml_files+=("$file") ;;
-	src/Justfile) format_justfile=1 ;;
 	esac
 done
 
@@ -76,7 +74,4 @@ if ((${#shell_files[@]} > 0)); then
 fi
 if ((${#toml_files[@]} > 0)); then
 	taplo fmt "${toml_files[@]}"
-fi
-if ((format_justfile)); then
-	(cd "$ROOT/src" && just --fmt)
 fi

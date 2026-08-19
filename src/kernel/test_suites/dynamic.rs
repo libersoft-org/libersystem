@@ -986,7 +986,7 @@ fn dynamic_wave_launch_metrics_are_structurally_sound() {
 	// `measure_dynamic_wave_launch` for why an absolute count cannot distinguish a page boundary
 	// landing one over from sharing having broken. The measured counts still reach the log through
 	// the `dynamic-wave-perf` lines below, and the checked `docs/DYNAMIC_*.tsv` reports (which
-	// `just dynamic-report-update` regenerates) remain the place where exact figures are reviewed.
+	// `./check.sh --refresh dynamic-report` regenerates) remain the place where exact figures are reviewed.
 	let representatives = [(1u8, b"echo" as &[u8], 100u32), (2, b"cat" as &[u8], 102), (3, b"date" as &[u8], 104), (4, b"ip" as &[u8], 106), (5, b"imgconv" as &[u8], 108)];
 	for (wave, name, correlation) in representatives {
 		measure_dynamic_wave_launch(&process_client, wave, name, correlation);

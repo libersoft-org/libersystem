@@ -18,7 +18,12 @@ pub const PAGE_SIZE: u64 = 4096;
 
 // Allocate `pages` 4 KiB pages of retained LOADER_DATA and return the physical base (0-checked None
 // on failure).
-pub fn alloc_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
+//
+// # Safety
+// `bs` must be the live `BootServices` table this firmware handed the loader, before
+// `ExitBootServices`. Nothing in this signature says so - a raw pointer is a number, and a safe
+// function taking one promises any number will do (UEFI-005).
+pub unsafe fn alloc_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
 	// UNDER THE CEILING, when one has been declared.
 	//
 	// `ALLOCATE_ANY_PAGES` lets firmware place a retained allocation anywhere in physical memory,
@@ -64,7 +69,11 @@ pub fn exit_retryable(status: uefi::Status) -> bool {
 // Factored out because two callers need the same six-step dance - size, pad, allocate, fetch,
 // check, stride - and the first of them had a divide-by-zero in it until the sizing call's status
 // was checked. One copy, one set of checks.
-pub fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDescriptor, usize, usize, usize)> {
+//
+// # Safety
+// `bs` must be the live `BootServices` table, before `ExitBootServices`. The returned buffer is a
+// raw pointer into pages the caller must give back with `free_pages` using the returned count.
+pub unsafe fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDescriptor, usize, usize, usize)> {
 	let mut map_size = 0usize;
 	let mut key = 0usize;
 	let mut desc_size = 0usize;
@@ -81,7 +90,7 @@ pub fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDe
 	let Some(sized) = map_size.checked_add(headroom) else { return None };
 	map_size = sized;
 	let pages = map_size.div_ceil(PAGE_SIZE as usize);
-	let buf = alloc_pages(bs, pages)? as *mut uefi::MemoryDescriptor;
+	let buf = unsafe { alloc_pages(bs, pages) }? as *mut uefi::MemoryDescriptor;
 	let status = unsafe { ((*bs).get_memory_map)(&mut map_size, buf, &mut key, &mut desc_size, &mut desc_ver) };
 	if uefi::is_error(status) {
 		unsafe { ((*bs).free_pages)(buf as u64, pages) };
@@ -117,7 +126,12 @@ pub fn memory_map_snapshot(bs: *mut BootServices) -> Option<(*mut uefi::MemoryDe
 
 // Translate the EFI memory map into the boot protocol's region array (sorted
 // ascending by base and coalesced). Returns the region count.
-pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_size: usize, regions: *mut MemRegion) -> Option<usize> {
+//
+// # Safety
+// `buf` must point at `map_size` readable bytes of `MemoryDescriptor`s laid out at `desc_size`
+// stride - the shape `memory_map_snapshot` returns - and `regions` at `MAX_REGIONS` writable
+// entries. None of that is checkable from the arguments, which are three numbers and two addresses.
+pub unsafe fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_size: usize, regions: *mut MemRegion) -> Option<usize> {
 	// ITS OWN INVARIANT, not its caller's. The only caller today validates `desc_size` before
 	// getting here, so the division was safe - by a fact about somewhere else. A shared helper that
 	// divides by an argument holds the argument's precondition itself, or the day a second caller
@@ -270,8 +284,11 @@ fn region_kind(ty: u32) -> u32 {
 }
 
 // The highest physical address any memory-map descriptor reaches.
-pub fn memory_top(bs: *mut BootServices) -> u64 {
-	let Some((buf, pages, map_size, desc_size)) = memory_map_snapshot(bs) else {
+//
+// # Safety
+// `bs` must be the live `BootServices` table, before `ExitBootServices`.
+pub unsafe fn memory_top(bs: *mut BootServices) -> u64 {
+	let Some((buf, pages, map_size, desc_size)) = (unsafe { memory_map_snapshot(bs) }) else {
 		return 0;
 	};
 	// RAM ONLY. This took the maximum over EVERY descriptor, so a firmware that describes a PCI
@@ -320,7 +337,10 @@ pub fn memory_top(bs: *mut BootServices) -> u64 {
 //
 // `None` when every attempt landed on the destination - a machine whose free memory is exactly where
 // the kernel goes, which is a refusal rather than a placement to force.
-pub fn staging_clear_of(bs: *mut BootServices, pages: usize, dest_low: u64, dest_high: u64) -> Option<u64> {
+//
+// # Safety
+// `bs` must be the live `BootServices` table, before `ExitBootServices`.
+pub unsafe fn staging_clear_of(bs: *mut BootServices, pages: usize, dest_low: u64, dest_high: u64) -> Option<u64> {
 	let mut rejects: [u64; 16] = [0; 16];
 	let mut reject_count = 0usize;
 	// Give every rejected candidate back once a decision has been made, whatever the decision is.
@@ -331,7 +351,7 @@ pub fn staging_clear_of(bs: *mut BootServices, pages: usize, dest_low: u64, dest
 		}
 	};
 	loop {
-		let Some(candidate) = alloc_pages(bs, pages) else {
+		let Some(candidate) = (unsafe { alloc_pages(bs, pages) }) else {
 			release(&rejects, reject_count);
 			return None;
 		};

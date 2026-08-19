@@ -176,7 +176,7 @@ def verdict(name, measured, budget, unit='s'):
 def main():
 	state, identity = lab.dev_state()
 	if state != 'ready':
-		fail(f'the development instance is {state}; the gate measures a warm loop, so bring one up with `just lab dev-up`')
+		fail(f'the development instance is {state}; the gate measures a warm loop, so bring one up with `./dev.sh up`')
 
 	source_path = os.path.join(lab.REPO, 'src', SOURCE)
 	dirty = run(['git', 'status', '--porcelain', '--', os.path.relpath(source_path, lab.REPO)], cwd=lab.REPO)

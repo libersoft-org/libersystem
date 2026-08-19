@@ -216,7 +216,10 @@ pub(crate) fn conduit(arg: u64) -> u32 {
 		// loader calls, so the two boot paths cannot answer differently about one platform. A tree
 		// that states nothing gets `PSCI_NONE`, which boots single-core with a reason rather than
 		// faulting on the first secondary.
-		return match fdt::Fdt::new(arg, super::paging::phys_to_virt).psci_conduit() {
+		// `arg` is the register the boot path was entered with, and this branch has already
+		// established it is not a `BootInfo`: what is left is the raw device-tree pointer the
+		// firmware passed, which is what `Fdt::new` is for (FDT-007).
+		return match unsafe { fdt::Fdt::new(arg, super::paging::phys_to_virt) }.psci_conduit() {
 			Some(fdt::PsciConduit::Smc) => bootproto::PSCI_SMC,
 			Some(fdt::PsciConduit::Hvc) => bootproto::PSCI_HVC,
 			None => bootproto::PSCI_NONE,

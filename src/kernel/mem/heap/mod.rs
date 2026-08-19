@@ -126,6 +126,8 @@ fn grow(heap: &mut Heap, at_least: usize) -> bool {
 		// retirement, which is for frames a page table pointed at.
 		if paging::try_map_page(virt, phys, paging::WRITABLE | paging::NO_EXECUTE).is_err() {
 			// SAFETY: allocated by this iteration and never written into any page table.
+			// NEVER-MAPPED: `try_map_page` is what just failed, so no page table on any core ever
+			// pointed at this frame and no TLB on any core can hold a translation for it.
 			unsafe { frame::deallocate(phys) };
 			unwind(base, virt, base + bytes);
 			return false;

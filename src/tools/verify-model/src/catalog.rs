@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 21] = [
+const GATES: [(&str, &str); 23] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -149,6 +149,16 @@ const GATES: [(&str, &str); 21] = [
 	// time - the two gates before it both arrived on one side first and were reported as
 	// unselectable on the next run, which is the drift these lists exist to catch.
 	("frame-retirement", "kernel"),
+	// P02M0140's two: generated or compiled artifacts below `src`, in the working tree and anywhere
+	// in reachable history. They were Justfile recipes that nothing called and nothing selected;
+	// moving them into `check.sh` is what makes a change to the tree able to select them, and this
+	// is the other half of that - registered in the same change, not on the next run.
+	//
+	// Their subject is the SOURCE TREE rather than any built thing, so they belong to the harness,
+	// which every run depends on. The history half reads reachable Git history and does not vary by
+	// target either.
+	("source-hygiene", "harness.tools"),
+	("source-history-hygiene", "harness.tools"),
 ];
 
 // check.sh's gate names, read from the script. Parsing a shell array is crude and correct here:

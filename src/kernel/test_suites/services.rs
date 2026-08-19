@@ -813,19 +813,51 @@ fn process_service_lists_every_started_program() {
 	// `process_service_drops_a_terminated_process_from_the_list` requires a finished one to go. The
 	// second was watched failing with the new branch widened to keep everything (`left: 1, right:
 	// 0`), which is the direction this fix could plausibly have been wrong in.
-	// TWO PROGRAMS THAT CANNOT EXIT ON THEIR OWN, which is what makes this an assertion rather than
-	// a hope. It used to start `log_service` and `device_manager`, and a program whose bootstrap
-	// channel is finished with is entitled to exit: one of the two was reaped before the list request
-	// was drained twice - riscv64 2026-08-10, x86_64 2026-08-13, both in runs of two hundred - which
-	// reads exactly like a ProcessService bookkeeping defect and is not one. `holdopen` blocks on its
-	// bootstrap channel forever, so it is alive for precisely as long as this test keeps it.
-	let (replies, list) = run_process_service_requests(&[(11, b"holdopen"), (12, b"holdopen")], Some(13));
-	assert_process_start_reply(&replies[0], 11, b"holdopen.lsexe");
-	assert_process_start_reply(&replies[1], 12, b"holdopen.lsexe");
-	let list = list.expect("list reply");
-	assert_eq!(le_u32(&list, 0), 13, "list reply echoes the correlation id");
-	assert_eq!(list[4], 1, "list succeeded");
-	assert_eq!(le_u16(&list, 5), 2, "both started processes are listed");
+	// TWO PROGRAMS THAT CANNOT EXIT ON THEIR OWN, and LAUNCH is what makes that true.
+	//
+	// **The fourth sighting, x86_64 2026-08-19, and this time with the reason.** `holdopen` blocks on
+	// its bootstrap channel forever - which is a fact about a channel it HAS. `ProcessService::start`
+	// spawns with no bootstrap capability at all ("phase 1: started processes run unattended", and
+	// the handle is literally `0`), so `recv_into(0, ..)` failed, `holdopen`'s `Failed` arm broke out
+	// of the loop, and the program that "cannot exit on its own" exited as fast as the scheduler
+	// could run it. Whether it was still alive when the list request drained was then exactly the
+	// race the fixture was introduced to remove. The comment above `holdopen`'s own loop said "the
+	// test holds the other end"; with START, nobody did.
+	//
+	// So the requests are LAUNCHes. Launch hands the caller a bootstrap channel end and a live
+	// process handle, which is what the fixture always assumed: the two children block on channels
+	// this test holds, they are alive for precisely as long as it keeps them, and dropping the ends
+	// at the end of the test is what lets them finish rather than leaving two blocked processes
+	// behind for the rest of the suite.
+	use object::channel::Channel;
+	use object::rights::Rights;
+
+	let (_boot_kernel, service_client) = spawn_service_with_package(b"process_service");
+	let mut held: alloc::vec::Vec<alloc::sync::Arc<Channel>> = alloc::vec::Vec::new();
+	for correlation in [11u32, 12u32] {
+		let (bootstrap_kernel, bootstrap_user) = Channel::create();
+		let name: &[u8] = b"holdopen";
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&3u16.to_le_bytes());
+		request.extend_from_slice(&correlation.to_le_bytes());
+		request.extend_from_slice(&(name.len() as u16).to_le_bytes());
+		request.extend_from_slice(name);
+		request.extend_from_slice(&0u32.to_le_bytes());
+		send_cap(&service_client, &request, bootstrap_user, Rights::ALL).expect("launch request");
+		sched::run_until_idle();
+		let reply = service_client.recv().expect("launch reply");
+		assert_eq!(le_u32(&reply.bytes, 0), correlation, "the reply echoes the correlation id");
+		assert_eq!(reply.bytes[4], 1, "the launch succeeded");
+		// The end this test keeps. While it lives, the child's blocking receive cannot return.
+		held.push(bootstrap_kernel);
+	}
+	assert_eq!(process_service_list_len(&service_client, 13), 2, "both launched processes are listed");
+	// AND THEY GO WHEN LET GO OF, which is the other half: without this the assertion above would
+	// hold just as well for a service that never removes anything, and two blocked processes would
+	// outlive the test.
+	drop(held);
+	sched::run_until_idle();
+	assert_eq!(process_service_list_len(&service_client, 14), 0, "letting go of both ends lets both finish");
 }
 
 tagged_test!(process_service_drops_a_terminated_process_from_the_list, [Service, Process, ProcessService], id = "kernel.services.process_service_drops_a_terminated_process_from_the_list", covers = ["kernel"]);

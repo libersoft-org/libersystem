@@ -709,6 +709,187 @@ impl<'a> Iterator for Symbols<'a> {
 	}
 }
 
+// THE ONE PLACE THAT SAYS WHAT A LOADABLE IMAGE MUST SATISFY (P02M0129, LDR-011).
+//
+// Three backends load the kernel and each checked a different subset. x86_64 asserted page
+// alignment and W^X in a loop of its own; aarch64 asserted `ET_EXEC` and nothing about the segments
+// beyond what the parser had already refused; riscv64 walked the headers to find the destination
+// span and checked neither. NOTHING anywhere asked whether two segments overlap, or whether the
+// entry point lands inside a segment that was loaded and is executable - so an image whose entry is
+// a number in the middle of `.bss`, or one whose two `PT_LOAD`s are written over each other, was
+// loaded and jumped to.
+//
+// The checks are the same checks on all three; what differs is which of them each backend is
+// entitled to demand, which is what `LoadRules` carries. A boot stub is one `RWE` segment by
+// construction, so W^X is a rule about a KERNEL image and not about the format - that is why this
+// takes rules instead of applying all of them always, and why the reason lives here rather than in a
+// comment beside one backend's `assert!`.
+//
+// Bounded and allocation-free: `MAX_LOAD_SEGMENTS` is the array the loader already sizes its own
+// segment table to, and the pairwise overlap check is quadratic in a number this caps. An image
+// declaring more is refused rather than half-checked.
+pub const MAX_LOAD_SEGMENTS: usize = 16;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoadPlanError {
+	// The image is `ET_DYN` where the caller places at link addresses and computes no bias.
+	NotExecutable,
+	// Nothing to load: every header is non-`PT_LOAD` or has `p_memsz == 0`.
+	NoLoadableSegment,
+	// More `PT_LOAD` segments than this can reason about.
+	TooManyLoadableSegments,
+	// A segment's virtual or physical base is not on a page boundary.
+	NotPageAligned(usize),
+	// A segment is both writable and executable.
+	WritableAndExecutable(usize),
+	// Rounding a segment's end up to a page boundary does not fit in 64 bits. The raw end is the
+	// PARSER's business and it refuses one that wraps; this is the rounding on top of it.
+	SpanWraps(usize),
+	// Two segments claim the same page, virtually or physically.
+	Overlap(usize, usize),
+	// The entry point is not inside a loaded, executable segment.
+	EntryNotInAnExecutableSegment,
+}
+
+// What a caller is entitled to demand of the image it is about to load.
+#[derive(Clone, Copy)]
+pub struct LoadRules {
+	pub page_size: u64,
+	// `ET_EXEC` only. A caller that computes a load bias and applies relocations sets this false.
+	pub require_executable_type: bool,
+	// Page-aligned segment bases. A caller that places segments wherever it is given memory - the
+	// x86_64 backend maps `p_vaddr` to firmware-chosen physical pages - still wants this, because
+	// the mapping is by page.
+	pub require_page_aligned: bool,
+	// No segment both writable and executable.
+	pub require_w_xor_x: bool,
+	// The entry point lands inside a loaded segment that is executable.
+	pub require_entry_in_executable_segment: bool,
+}
+
+impl LoadRules {
+	// What a kernel image must satisfy. Every backend loads one of those, so this is the shape they
+	// share; a caller wanting less says which rule it is dropping and why, at the call.
+	pub const fn kernel(page_size: u64) -> LoadRules {
+		LoadRules { page_size, require_executable_type: true, require_page_aligned: true, require_w_xor_x: true, require_entry_in_executable_segment: true }
+	}
+}
+
+// The answer, and the numbers a backend would otherwise recompute from the same walk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LoadPlan {
+	pub entry: u64,
+	pub segments: usize,
+	// Page-aligned bounds over every loadable segment, virtual and physical. The two backends that
+	// place AT the link address size their staging from the physical pair.
+	pub virt_low: u64,
+	pub virt_high: u64,
+	pub phys_low: u64,
+	pub phys_high: u64,
+}
+
+const fn align_down_to(value: u64, page: u64) -> u64 {
+	value & !(page - 1)
+}
+
+// `None` when the rounding wraps, which is a refusal and not a clamp.
+const fn align_up_to(value: u64, page: u64) -> Option<u64> {
+	match value.checked_add(page - 1) {
+		Some(sum) => Some(sum & !(page - 1)),
+		None => None,
+	}
+}
+
+pub fn load_plan(image: &Elf<'_>, rules: LoadRules) -> Result<LoadPlan, LoadPlanError> {
+	if rules.require_executable_type && image.image_type != ET_EXEC {
+		return Err(LoadPlanError::NotExecutable);
+	}
+	// (index as the image numbers it, virtual span, physical span, flags) per loadable segment.
+	let mut spans: [(usize, u64, u64, u64, u64, u32); MAX_LOAD_SEGMENTS] = [(0, 0, 0, 0, 0, 0); MAX_LOAD_SEGMENTS];
+	let mut count = 0usize;
+	let page = rules.page_size;
+	for index in 0..image.segment_count() {
+		let Some(ph) = image.segment(index) else { continue };
+		if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+			continue;
+		}
+		if count == MAX_LOAD_SEGMENTS {
+			return Err(LoadPlanError::TooManyLoadableSegments);
+		}
+		// NOT RE-CHECKED HERE, and named so the division of labour is readable: `Elf::parse`
+		// already refuses `p_filesz > p_memsz`, a `p_vaddr + p_memsz` or `p_paddr + p_memsz` that
+		// wraps, a `p_offset .. p_offset + p_filesz` outside the file, and the `p_vaddr = p_offset
+		// (mod p_align)` congruence. This function takes a PARSED image, so restating those would
+		// be two places to change and one of them silently right.
+		if rules.require_page_aligned && (ph.p_vaddr % page != 0 || ph.p_paddr % page != 0) {
+			return Err(LoadPlanError::NotPageAligned(index));
+		}
+		if rules.require_w_xor_x && ph.p_flags & PF_W != 0 && ph.p_flags & PF_X != 0 {
+			return Err(LoadPlanError::WritableAndExecutable(index));
+		}
+		let (Some(vend), Some(pend)) = (ph.p_vaddr.checked_add(ph.p_memsz), ph.p_paddr.checked_add(ph.p_memsz)) else {
+			return Err(LoadPlanError::SpanWraps(index));
+		};
+		let (Some(vtop), Some(ptop)) = (align_up_to(vend, page), align_up_to(pend, page)) else {
+			return Err(LoadPlanError::SpanWraps(index));
+		};
+		spans[count] = (index, align_down_to(ph.p_vaddr, page), vtop, align_down_to(ph.p_paddr, page), ptop, ph.p_flags);
+		count += 1;
+	}
+	if count == 0 {
+		return Err(LoadPlanError::NoLoadableSegment);
+	}
+	// PAGE SPANS, not byte spans. Two segments that do not overlap by a byte but share a page still
+	// collide: the loader zeroes and copies by the page, so the second write erases the first's tail.
+	let mut i = 0;
+	while i < count {
+		let mut j = i + 1;
+		while j < count {
+			let (a, alow, ahigh, aplow, aphigh, _) = spans[i];
+			let (b, blow, bhigh, bplow, bphigh, _) = spans[j];
+			if (alow < bhigh && blow < ahigh) || (aplow < bphigh && bplow < aphigh) {
+				return Err(LoadPlanError::Overlap(a, b));
+			}
+			j += 1;
+		}
+		i += 1;
+	}
+	if rules.require_entry_in_executable_segment {
+		let mut inside = false;
+		let mut index = 0;
+		while index < count {
+			let (_, low, high, _, _, flags) = spans[index];
+			if flags & PF_X != 0 && image.entry >= low && image.entry < high {
+				inside = true;
+				break;
+			}
+			index += 1;
+		}
+		if !inside {
+			return Err(LoadPlanError::EntryNotInAnExecutableSegment);
+		}
+	}
+	let mut plan = LoadPlan { entry: image.entry, segments: count, virt_low: u64::MAX, virt_high: 0, phys_low: u64::MAX, phys_high: 0 };
+	let mut index = 0;
+	while index < count {
+		let (_, vlow, vhigh, plow, phigh, _) = spans[index];
+		if vlow < plan.virt_low {
+			plan.virt_low = vlow;
+		}
+		if vhigh > plan.virt_high {
+			plan.virt_high = vhigh;
+		}
+		if plow < plan.phys_low {
+			plan.phys_low = plow;
+		}
+		if phigh > plan.phys_high {
+			plan.phys_high = phigh;
+		}
+		index += 1;
+	}
+	Ok(plan)
+}
+
 #[cfg(test)]
 #[path = "elf/tests.rs"]
 mod tests;

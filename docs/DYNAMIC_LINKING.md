@@ -294,7 +294,7 @@ regenerates the three target graphs from the BUILT artifacts - it reads them, it
 them - and requires the report to reproduce byte for byte. It also fails
 if the six wave lists do not partition the manifest's tool inventory exactly, a direct
 provider differs from `DT_NEEDED`, reversed-root derivation differs, or an
-artifact/provider is missing. `just dynamic-report-update` is the explicit regeneration
+artifact/provider is missing. `./check.sh --refresh dynamic-report` is the explicit regeneration
 command.
 
 ET_REL attribution never selects the newest or only object matching a filename pattern.

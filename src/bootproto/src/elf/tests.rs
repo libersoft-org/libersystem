@@ -24,6 +24,137 @@ fn image(image_type: u16, segments: &[ProgramHeader], payload: &[u8]) -> Vec<u8>
 	bytes
 }
 
+// The same fixture with a chosen entry point, which is what the load plan is about.
+fn image_entering_at(image_type: u16, entry: u64, segments: &[ProgramHeader]) -> Vec<u8> {
+	let mut bytes = image(image_type, segments, &[]);
+	bytes[24..32].copy_from_slice(&entry.to_le_bytes());
+	bytes
+}
+
+// A loadable segment, stated positionally so the cases below read as their differences.
+fn load(vaddr: u64, paddr: u64, memsz: u64, flags: u32) -> ProgramHeader {
+	ProgramHeader { p_type: PT_LOAD, p_flags: flags, p_offset: 0, p_vaddr: vaddr, p_paddr: paddr, p_filesz: 0, p_memsz: memsz, p_align: 4096 }
+}
+
+const PAGE: u64 = 4096;
+
+fn plan_of(bytes: &[u8]) -> Result<LoadPlan, LoadPlanError> {
+	let image = Elf::parse(bytes).expect("the fixture parses");
+	load_plan(&image, LoadRules::kernel(PAGE))
+}
+
+#[test]
+fn a_two_segment_kernel_with_its_entry_in_the_text_is_a_plan() {
+	// text at 0x1000 (RX), data at 0x2000 (RW), entry in the text.
+	let bytes = image_entering_at(ET_EXEC, 0x1000, &[load(0x1000, 0x1000, PAGE, PF_R | PF_X), load(0x2000, 0x2000, PAGE, PF_R | PF_W)]);
+	let plan = plan_of(&bytes).expect("this is what a kernel looks like");
+	assert_eq!(plan.entry, 0x1000);
+	assert_eq!(plan.segments, 2);
+	assert_eq!((plan.virt_low, plan.virt_high), (0x1000, 0x3000));
+	assert_eq!((plan.phys_low, plan.phys_high), (0x1000, 0x3000));
+}
+
+#[test]
+fn an_entry_that_is_not_in_any_loaded_segment_is_refused() {
+	// The number is plausible and lands nowhere: past the end of both segments.
+	let bytes = image_entering_at(ET_EXEC, 0x9000, &[load(0x1000, 0x1000, PAGE, PF_R | PF_X), load(0x2000, 0x2000, PAGE, PF_R | PF_W)]);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::EntryNotInAnExecutableSegment));
+}
+
+#[test]
+fn an_entry_inside_a_non_executable_segment_is_refused() {
+	// Inside the DATA segment, which is loaded - so "is it mapped" is the wrong question and was
+	// the only one anything asked.
+	let bytes = image_entering_at(ET_EXEC, 0x2010, &[load(0x1000, 0x1000, PAGE, PF_R | PF_X), load(0x2000, 0x2000, PAGE, PF_R | PF_W)]);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::EntryNotInAnExecutableSegment));
+}
+
+#[test]
+fn two_segments_sharing_a_page_are_an_overlap_even_when_their_bytes_do_not() {
+	// 0x1000..0x1010 and 0x1800..0x1810 do not overlap by a byte and are the same page, which the
+	// loader zeroes and copies whole.
+	let mut text = load(0x1000, 0x1000, 0x10, PF_R | PF_X);
+	let mut data = load(0x1800, 0x1800, 0x10, PF_R | PF_W);
+	text.p_align = 1;
+	data.p_align = 1;
+	let bytes = image_entering_at(ET_EXEC, 0x1000, &[text, data]);
+	let rules = LoadRules { require_page_aligned: false, ..LoadRules::kernel(PAGE) };
+	let image = Elf::parse(&bytes).expect("the fixture parses");
+	assert_eq!(load_plan(&image, rules), Err(LoadPlanError::Overlap(0, 1)));
+}
+
+#[test]
+fn segments_that_agree_virtually_and_collide_physically_are_refused() {
+	// The two backends that place AT the link address write to `p_paddr`, so a physical collision
+	// is the one that destroys the image, and nothing looked at it.
+	let bytes = image_entering_at(ET_EXEC, 0x1000, &[load(0x1000, 0x8000, PAGE, PF_R | PF_X), load(0x2000, 0x8000, PAGE, PF_R | PF_W)]);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::Overlap(0, 1)));
+}
+
+#[test]
+fn a_writable_executable_segment_is_refused_and_only_when_the_caller_asks() {
+	let bytes = image_entering_at(ET_EXEC, 0x1000, &[load(0x1000, 0x1000, PAGE, PF_R | PF_W | PF_X)]);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::WritableAndExecutable(0)));
+	// A boot stub is one RWE segment by construction, which is why this is a rule the caller
+	// chooses rather than a property of the format.
+	let rules = LoadRules { require_w_xor_x: false, ..LoadRules::kernel(PAGE) };
+	let image = Elf::parse(&bytes).expect("the fixture parses");
+	assert_eq!(load_plan(&image, rules).expect("the same image, without that rule").segments, 1);
+}
+
+// WHERE THE LINE IS between the parser and the plan, asserted rather than described: an image whose
+// file half is bigger than its memory half never reaches `load_plan`, so `load_plan` does not check
+// it and this is what says so.
+#[test]
+fn more_bytes_in_the_file_than_the_segment_reserves_is_the_parsers_refusal() {
+	let mut ph = load(0x1000, 0x1000, PAGE, PF_R | PF_X);
+	ph.p_filesz = PAGE + 1;
+	let bytes = image_entering_at(ET_EXEC, 0x1000, &[ph]);
+	assert!(Elf::parse(&bytes).is_none(), "the parser refuses it, so the plan never sees it");
+}
+
+#[test]
+fn an_unaligned_segment_is_refused() {
+	// `p_align = 1` so the parser's `p_vaddr = p_offset (mod p_align)` rule does not refuse the
+	// fixture first: the question here is what the PLAN does with a base off a page boundary.
+	let mut ph = load(0x1010, 0x1010, PAGE, PF_R | PF_X);
+	ph.p_align = 1;
+	let bytes = image_entering_at(ET_EXEC, 0x1010, &[ph]);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::NotPageAligned(0)));
+}
+
+// The rounding on top of the parser's own overflow check: the raw end fits and the page-rounded end
+// does not.
+#[test]
+fn a_segment_whose_page_rounded_end_wraps_is_refused() {
+	let mut ph = load(0xffff_ffff_ffff_f000, 0xffff_ffff_ffff_f000, 0xfff, PF_R | PF_X);
+	ph.p_align = 1;
+	let bytes = image_entering_at(ET_EXEC, 0xffff_ffff_ffff_f000, &[ph]);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::SpanWraps(0)));
+}
+
+#[test]
+fn an_image_with_nothing_to_load_is_refused_rather_than_planned_as_empty() {
+	let bytes = image_entering_at(ET_EXEC, 0x1000, &[ProgramHeader { p_type: PT_DYNAMIC, p_flags: PF_R, p_offset: 0, p_vaddr: 0x1000, p_paddr: 0x1000, p_filesz: 0, p_memsz: 16, p_align: 8 }]);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::NoLoadableSegment));
+}
+
+#[test]
+fn a_position_independent_image_is_refused_where_no_bias_is_computed() {
+	let bytes = image_entering_at(ET_DYN, 0x1000, &[load(0x1000, 0x1000, PAGE, PF_R | PF_X)]);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::NotExecutable));
+}
+
+#[test]
+fn more_loadable_segments_than_the_plan_can_hold_is_a_refusal_not_a_truncation() {
+	let mut segments: Vec<ProgramHeader> = Vec::new();
+	for i in 0..(MAX_LOAD_SEGMENTS as u64 + 1) {
+		segments.push(load(0x1000 + i * PAGE, 0x1000 + i * PAGE, PAGE, PF_R | PF_X));
+	}
+	let bytes = image_entering_at(ET_EXEC, 0x1000, &segments);
+	assert_eq!(plan_of(&bytes), Err(LoadPlanError::TooManyLoadableSegments));
+}
+
 fn identity_note_image(record: &[u8]) -> (Vec<u8>, usize, usize) {
 	let header_len = core::mem::size_of::<Elf64Header>();
 	let strings = b"\0.shstrtab\0.note.liber.identity\0";

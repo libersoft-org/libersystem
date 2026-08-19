@@ -1,7 +1,7 @@
 //! Generated LSIDL bindings for LiberSystem.
 //!
 //! Versioned package modules under `generated` come from `src/idl/*.lsidl` via
-//! `just gen`. `system` is a hand-written compatibility facade preserving the
+//! `./gen.sh`. `system` is a hand-written compatibility facade preserving the
 //! original public paths while declarations migrate into domain packages.
 //!
 //! The crate is `no_std` for the kernel and userspace builds, and pulls in `std`

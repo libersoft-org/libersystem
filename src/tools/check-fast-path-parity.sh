@@ -27,18 +27,23 @@ build="$root/../.build"
 
 target="${1:-x86_64}"
 shift || true
+# THE ARCHITECTURE, NOT A RECIPE NAME. These three were `recipe=shared-libs`,
+# `recipe=shared-libs-aarch64` and `recipe=shared-libs-riscv64`, and none of those recipes exists -
+# `just --dry-run shared-libs` answers "justfile does not contain recipe". The only caller of this
+# script was a recipe nothing called, so a script whose first real step could not run had never been
+# reported by anything.
 case "$target" in
 x86_64 | x86_64-unknown-none)
 	target=x86_64-unknown-none
-	recipe=shared-libs
+	arch=x86_64
 	;;
 aarch64 | aarch64-unknown-none)
 	target=aarch64-unknown-none
-	recipe=shared-libs-aarch64
+	arch=aarch64
 	;;
 riscv64 | riscv64gc-unknown-none-elf)
 	target=riscv64gc-unknown-none-elf
-	recipe=shared-libs-riscv64
+	arch=riscv64
 	;;
 *)
 	echo "fast-path-parity: unsupported target '$target'" >&2
@@ -78,7 +83,7 @@ identity_record() {
 
 echo "fast-path-parity: authoritative rebuild of $target (every cache discarded)"
 authoritative_started=$SECONDS
-(cd "$root" && LIBER_IMAGE_REBUILD=1 just "$recipe" >/dev/null)
+(cd "$root/.." && ./build.sh --arch "$arch" --part libs --rebuild >/dev/null)
 authoritative_seconds=$((SECONDS - authoritative_started))
 
 # Keep the authoritative bytes: the targeted rebuild below overwrites the staged file.

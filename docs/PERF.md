@@ -6,7 +6,7 @@ orders, not precision instruments.
 
 ## Development loop baseline (2026-07-26)
 
-`cd src && just dev-baseline <cold|warm|leaf|provider> [test-tags]` records one
+`./dev.sh baseline <cold|warm|leaf|provider> [test-tags]` records one
 x86_64 sample under `.build/dev-baseline/<timestamp>-<scenario>/` and appends its
 machine-readable row to `.build/dev-baseline/samples.tsv`. Each sample retains the
 shared-image and kernel-test transcripts, raw host-nanosecond timing events and a
@@ -46,11 +46,11 @@ event `<kind>:<hit|miss>:<name>` for every provider, object and executable the b
 about. A unit event marks the decision, not the work, so a miss appears before the compile it
 causes; the surrounding boundaries are what time the work.
 
-`cd src && just perf-gate` measures the two loop budgets against a running development instance
+`cd src && ./lab.sh perf-gate` measures the two loop budgets against a running development instance
 and asserts the shape of the work beside its cost, so a loop cannot look fast by skipping the
 test or by publishing something other than what it built.
 
-Sample rows recorded by `just dev-baseline` now carry a `schema` column. Rows from the
+Sample rows recorded by `./dev.sh baseline` now carry a `schema` column. Rows from the
 2026-07-26 baseline predate it and measured a different set of phases, so the recorder refuses
 to append to that file rather than let the two be read as one series.
 
@@ -143,9 +143,9 @@ went stale the first time a tool was added, which is why they now name the file 
 
 ### The cold invalidation classes, measured
 
-`just dev-baseline <kernel|loader|topology>` labels a sample after the operator has edited the
+`./dev.sh baseline <kernel|loader|topology>` labels a sample after the operator has edited the
 class it names, the way `leaf` and `provider` already did. Each probe below was a comment
-appended to one file, measured, then restored, with a settling `just build` between samples: a
+appended to one file, measured, then restored, with a settling `./build.sh` between samples: a
 restore is itself a source change, and without settling the next sample pays for the previous
 one's, which is how the first attempt at this produced a `loader` row that recompiled the kernel.
 
@@ -170,8 +170,8 @@ for the persistent instance rather than against the classes.
 
 A `loader` sample is not recorded, and the reason is worth more than the number would have been:
 the kernel test path never rebuilds the loader. `boot/test-kernel.sh` compiles the kernel and
-runs it; `mkimage.sh` consumes an already-built `libersystem-loader.efi`; only `just build`
-compiles one. So a loader edit is invisible to `just test`, which boots whatever loader was last
+runs it; `mkimage.sh` consumes an already-built `libersystem-loader.efi`; only `./build.sh`
+compiles one. So a loader edit is invisible to `./test.sh`, which boots whatever loader was last
 built, and a loader-only sample has to be taken through a path that assembles the image from a
 fresh loader instead.
 
@@ -205,8 +205,8 @@ because the kernel's build script regenerates the packages; a loader change pays
 same reason, through the same path.
 
 The loader row had to be taken by hand, and the reason is worth keeping: a loader edit is
-invisible to `just test`, which boots whatever loader was built last, so the recorder's path
-measures everything except the thing being changed. Taken through `just build`, which does
+invisible to `./test.sh`, which boots whatever loader was built last, so the recorder's path
+measures everything except the thing being changed. Taken through `./build.sh`, which does
 compile it, the loader costs 7.26 s to rebuild - the largest single build cost of the three.
 The first attempt at this sample also read 2.19 s rather than 7.26 s, because the probe comment
 was the same text as the previous attempt's and cargo served the earlier compilation: a probe
@@ -215,7 +215,7 @@ the performance gate does for the same reason.
 
 ## Image conversion (2026-07-16)
 
-`just image-bench` builds the same no_std leaves used by `imgconv` in an optimized
+`./bench.sh --suite image` builds the same no_std leaves used by `imgconv` in an optimized
 host profile and converts a deterministic 512x512 true-color RGBA fixture. Each row
 measures full container encode and independent content-sniff/decode. A tracking global
 allocator reports incremental peak heap above the live input/output baseline. The
@@ -337,7 +337,7 @@ the previous destination without requiring a temporary filename in the tool.
 
 ## Audio decoding and governed playback (2026-07-15)
 
-`just audio-bench` is the standing optimized-host MP3 throughput gate. The host-only
+`./bench.sh --suite audio` is the standing optimized-host MP3 throughput gate. The host-only
 benchmark uses the same atomized decoder leaf as `play`, reparses the staged
 `volume/audio/test.mp3` on every iteration, drains signed-i16 output in bounded
 1,024-frame chunks and decodes at least 60 seconds of logical audio. It fails below
@@ -403,14 +403,14 @@ and exits; AudioService drains 11 already accepted periods (bounded below the as
 
 Live output remains reproducibly inspectable with QEMU's WAV backend rather than a
 listener and a particular SPICE client. Boot with
-`AUDIO_WAV=/tmp/libersystem-audio.wav just lab boot --fresh`, run
-`just lab sh play audio/test.mp3`, then `just lab quit`; the captured WAV traverses the live
+`AUDIO_WAV=/tmp/libersystem-audio.wav ./lab.sh boot --fresh`, run
+`./lab.sh sh play audio/test.mp3`, then `./lab.sh quit`; the captured WAV traverses the live
 shell -> governed player -> StorageService -> MP3 -> AudioService -> virtio-sound
 -> host-audio path and remains inspectable in CI or headless development.
 
 ## Application surface presentation (2026-07-14)
 
-Measured by the tagged x86 KVM display test (`cd src && just test-tags display`).
+Measured by the tagged x86 KVM display test (`cd src && ./test.sh --tags display`).
 The real userspace DisplayService drives a stand-in virtio-gpu channel with the same
 synchronous `PRESENT` / `OK` protocol as the driver. Its private typed counters read
 `SYS_CLOCK_MONO_NS` around (a) the CPU blit/scale and (b) the driver transfer+flush
@@ -455,7 +455,7 @@ consumers: `pix` (pixel vocabulary and bounded blitters, used by DisplayService)
 ConsoleService), `keys` (canonical HID usages and held-key edge state, used by
 InputService), and `pcm` (format/frame validation, little-endian sample decoding,
 mono expansion and rate phase, used by AudioService). Pure helpers run nine host tests
-through `just app-libs-test`; surface lifecycle is exercised by the live console and
+through `./check.sh --gate host-tests`; surface lifecycle is exercised by the live console and
 display tagged tests.
 
 Cold start is measured in the permission integration scenario with the guest monotonic
@@ -468,7 +468,7 @@ parsing and terminal presentation.
 
 Representative ELF sizes compare the ordinary debug staged profile (debug information,
 mostly opt-level 0) with Cargo release builds. This is a build-profile decision aid, not
-an on-disk package measurement; release binaries are not yet what `just user` stages.
+an on-disk package measurement; release binaries are not yet what `./build.sh --part user` stages.
 
 | binary | debug ELF | release ELF | reduction |
 | --- | ---: | ---: | ---: |
@@ -648,8 +648,8 @@ Measured on the 52-core development host after the graph was warm:
 | one provider implementation edit | 75 s | `volume-client` rebuild; six consumer relinks, six object hits |
 
 Warm AArch64 and RISC-V graphs retain 46/46 provider and 67/67 executable hits at
-73-74 s. `just shared-cache-check quick` pins no-change, one-tool and restored-variant
-reuse; `just shared-cache-check provider` derives the direct `volume-client` consumers
+73-74 s. `./check.sh --cache-check quick` pins no-change, one-tool and restored-variant
+reuse; `./check.sh --cache-check provider` derives the direct `volume-client` consumers
 from the manifest and requires every relink to reuse its ET_REL object. Consumer Cargo
 jobs remain sequential for cold misses. Parallel Cargo writers against one target
 directory are deferred until a cold-build measurement justifies their locking and memory

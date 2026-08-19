@@ -58,7 +58,7 @@ done
 # Host-only tooling. None of these crates is staged into the system image, linked
 # into a guest artifact or read while one is built, so changing them cannot alter
 # what the test image boots. Generated bindings under src/idl reach an artifact
-# only through their checked-in output, which `just gen-check` owns. Each entry
+# only through their checked-in output, which `./gen.sh --check` owns. Each entry
 # narrows what invalidates the fast path, so keep the list short and explicit; it
 # is recorded in the stamp, and editing it invalidates every existing stamp.
 NARROW_EXCLUDES=(
