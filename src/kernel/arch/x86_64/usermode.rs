@@ -17,6 +17,13 @@
 // the kernel's GS base, which is safe because the per-CPU block lives in
 // supervisor-only pages, so a ring-3 `gs:`-relative access would fault. That lets
 // the syscall entry stub reach the kernel stack pointer through GS without swapgs.
+//
+// AND IT DEPENDS ON RING 3 NOT BEING ABLE TO CHANGE THE GS BASE, which is a second fact and was
+// not stated here (KERN-ARCH-024). `WRGSBASE` is a ring-3 instruction whenever CR4.FSGSBASE is set,
+// and the kernel never touched that bit - so on a machine whose firmware left it on, user code
+// could point GS at memory of its own choosing and the next syscall would take its kernel stack
+// pointer from there. `paging::establish_cr4_policy` clears it on every core, and
+// `kernel.arch.ring_three_cannot_write_the_gs_base` is what keeps it cleared.
 
 #![allow(dead_code)]
 

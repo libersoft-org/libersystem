@@ -66,6 +66,21 @@ pub fn shootdown() -> bool {
 		// Single core: the local invalidation the mapper already did is the whole job.
 		return true;
 	}
+	// A MACHINE WITH MORE CORES THAN THIS TRACKS IS REFUSED, NOT TRUNCATED (KERN-ARCH-012).
+	//
+	// Every loop below said `cpus.min(MAX_CPUS)` and `service_pending` returns early for a core id
+	// past the arrays. On a machine with more than `MAX_CPUS` cores that is not a smaller job - it
+	// is this function answering `true` while cores 64 and up were never asked to flush and never
+	// could have been. The caller's next move is to hand the frames back to the allocator, so the
+	// answer would be a physical use-after-free on precisely the cores the mechanism forgot.
+	//
+	// `false` is the honest answer and the callers already know what to do with it: `frame::retire`
+	// quarantines the span and tries again later. Said once per shootdown rather than counted,
+	// because a machine does not grow cores while it runs - the first line is the whole story.
+	if !covers_every_core(cpus) {
+		crate::serial_println!("tlb: {cpus} cores are online and this tracks {MAX_CPUS} - a shootdown cannot reach them all, so it reports incomplete");
+		return false;
+	}
 	// One at a time. A second requester waits for the first rather than sharing its
 	// counter, which is cheaper to reason about than making the counter per-request.
 	//
@@ -143,6 +158,25 @@ pub fn shootdown() -> bool {
 // Test hooks. The generation scheme is the answer to a race that cannot be produced on demand - a
 // core that answers AFTER its requester gave up - so the test publishes exactly what such a core
 // would publish instead of trying to lose the race on purpose.
+// THE PREDICATE ITSELF, not a copy of it. `shootdown` above asks this, and so does the test hook
+// below - a helper that re-stated the comparison would be testing itself, which is how the
+// generation rule in this module was once "covered" by a test that passed with the rule deleted.
+fn covers_every_core(cpus: usize) -> bool {
+	cpus <= MAX_CPUS
+}
+
+// A machine with more than 64 cores cannot be produced here - QEMU is given eight - and the
+// boundary is what matters: 64 is covered, 65 is not.
+#[cfg(test)]
+pub fn covers_every_core_for_test(cpus: usize) -> bool {
+	covers_every_core(cpus)
+}
+
+#[cfg(test)]
+pub fn max_cpus_for_test() -> usize {
+	MAX_CPUS
+}
+
 #[cfg(test)]
 pub fn request_generation() -> u64 {
 	REQUEST.load(Ordering::Acquire)
@@ -178,6 +212,9 @@ fn acknowledged(cpus: usize, me: usize, generation: u64) -> usize {
 // already about to look at its run queue.
 pub fn service_pending() {
 	let me = arch::percpu::this_cpu().cpu_id() as usize;
+	// Unreachable on a machine `shootdown` will act on: it refuses outright past `MAX_CPUS`, so no
+	// request is ever published for a core this array cannot hold. Kept because this runs from an
+	// interrupt handler and returning is the only safe thing to do with an index that would panic.
 	if me >= MAX_CPUS {
 		return;
 	}

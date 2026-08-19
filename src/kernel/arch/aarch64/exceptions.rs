@@ -74,9 +74,19 @@ __exception_vectors:
 	mov     x0, sp
 	sub     x0, x0, x1
 	cmp     x0, x2
-	mov     x4, #\id                   // which slot this is, for the report; harmless otherwise
-	b.hi    __trap_bad_stack           // SP is not on the stack this thread was given
-	b       9f
+	b.ls    9f                         // SP is on the stack this thread was given: ordinary path
+	// ONLY ON THE WAY TO THE REPORT (KERN-ARCH-002). This was `mov x4, #\id` before the branch,
+	// with "harmless otherwise" beside it - and it was not harmless. The `mov` ran on EVERY
+	// exception, the ordinary path fell through to `__trap_common`, and `__trap_common` saves x4
+	// into the frame it later restores from. So every trap - every timer interrupt, every
+	// preemption, every syscall - returned to EL0 with x4 replaced by the vector index.
+	//
+	// That is both halves of the finding: a kernel value handed to ring 3 for free, and a
+	// caller-saved register silently overwritten in code that had every right to keep it across an
+	// asynchronous interrupt. Setting it here costs one instruction on the path that is about to
+	// print a report and stop, and nothing at all on the path that returns.
+	mov     x4, #\id                   // which slot this is, for the report
+	b       __trap_bad_stack           // SP is not on the stack this thread was given
 7:
 	// UNCHECKED, AND COUNTED. An exception taken on a context with no recorded bounds is exactly
 	// where the runaway must have started - it is caught hundreds of frames later, on a core whose

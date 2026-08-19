@@ -202,3 +202,26 @@ fn a_shootdown_makes_another_core_stop_using_the_old_translation() {
 		frame::deallocate(second);
 	}
 }
+
+crate::tagged_test!(ring_three_cannot_write_the_gs_base, [Paging, Memory, Kernel], id = "kernel.arch.ring_three_cannot_write_the_gs_base", covers = ["kernel"]);
+fn ring_three_cannot_write_the_gs_base() {
+	// KERN-ARCH-024. The x86_64 syscall entry stub reaches the kernel stack pointer through `gs:`
+	// WITHOUT `swapgs`, and the argument for that - in `usermode.rs` - is that "the user thread
+	// keeps the kernel's GS base". That is true only while ring 3 cannot CHANGE the GS base, and
+	// `WRGSBASE` is a ring-3 instruction whenever CR4.FSGSBASE is set.
+	//
+	// The kernel never touched the bit, so whether user code could redirect GS was the firmware's
+	// decision. On a machine whose firmware left it on, user code could point GS at memory of its
+	// own choosing and the next syscall would take its kernel stack pointer from there: a ring-0
+	// stack pivot, on a path with no other check.
+	//
+	// It is cleared on every core now, and this is what says so. Asserted on the CONTROL REGISTER
+	// rather than by executing `wrgsbase` from ring 3, because the failure being prevented is the
+	// kernel following a user-chosen pointer - a test that reproduced it would not report anything.
+	#[cfg(target_arch = "x86_64")]
+	{
+		assert!(!crate::arch::paging::user_can_write_gs_base(), "CR4.FSGSBASE is set, so ring 3 can redirect the GS base the syscall stub trusts");
+	}
+	// The other two backends reach per-CPU state through TPIDR_EL1 and the `sscratch`/`tp` pair,
+	// neither of which ring 3 can write, so there is no equivalent bit to establish.
+}

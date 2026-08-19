@@ -365,6 +365,24 @@ fn a_late_acknowledgement_does_not_count_for_the_next_request() {
 	assert!(crate::mem::tlb::acknowledged_for_test(other, stale + 1), "a later flush covers an earlier request");
 }
 
+crate::tagged_test!(a_machine_with_more_cores_than_the_shootdown_tracks_is_refused, [Frame, Memory, Smp], id = "kernel.mem.frame.a_machine_with_more_cores_than_the_shootdown_tracks_is_refused", covers = ["kernel"]);
+fn a_machine_with_more_cores_than_the_shootdown_tracks_is_refused() {
+	// KERN-ARCH-012, at its boundary. Every loop in the shootdown said `cpus.min(MAX_CPUS)` and the
+	// per-core service routine returns early past the arrays, so on a machine with more cores than
+	// this module tracks the shootdown answered `true` while the cores above the bound were never
+	// asked to flush. The caller's next move is to hand the frames back to the allocator, which
+	// makes that answer a physical use-after-free on exactly the cores the mechanism forgot.
+	//
+	// The machine cannot be produced here - QEMU is given eight cores - so what is pinned is the
+	// DECISION the shootdown makes from a core count, at the two values that matter.
+	let max = crate::mem::tlb::max_cpus_for_test();
+	assert!(crate::mem::tlb::covers_every_core_for_test(1), "one core is covered");
+	assert!(crate::mem::tlb::covers_every_core_for_test(max), "the last core this tracks is covered");
+	assert!(!crate::mem::tlb::covers_every_core_for_test(max + 1), "one core past the bound is NOT covered, and must not be reported as flushed");
+	// And this machine is inside it, so the ordinary path is the one being taken today.
+	assert!(crate::smp::cpu_count() <= max, "this machine has {} cores and the shootdown tracks {max}", crate::smp::cpu_count());
+}
+
 crate::tagged_test!(a_shared_page_goes_through_the_quarantine_rather_than_the_allocator, [Frame, Memory], id = "kernel.mem.frame.a_shared_page_goes_through_the_quarantine_rather_than_the_allocator", covers = ["kernel"]);
 fn a_shared_page_goes_through_the_quarantine_rather_than_the_allocator() {
 	// A shared ELF page was the ONE frame in this system that went straight back to the allocator

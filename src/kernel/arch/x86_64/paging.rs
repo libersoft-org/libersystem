@@ -72,6 +72,40 @@ pub fn enable_nx() {
 // every AP in its own bring-up. From here on, a kernel dereference of a user
 // pointer outside a `user_access` window page-faults instead of silently reading
 // or writing user memory, and a ring-0 jump into user memory always faults.
+// CR4.FSGSBASE IS ESTABLISHED, NOT INHERITED (KERN-ARCH-024).
+//
+// The syscall entry stub reaches the kernel stack pointer through `gs:` WITHOUT `swapgs`, and
+// `usermode.rs` states the safety argument for that: "the user thread keeps the kernel's GS base,
+// which is safe because the per-CPU block lives in supervisor-only pages". That holds only while
+// ring 3 cannot CHANGE the GS base - and `WRGSBASE` is a ring-3 instruction whenever CR4.FSGSBASE
+// is set. The kernel never touched the bit, so whether it was set was the firmware's decision: on a
+// machine whose firmware left it on, user code could point GS at memory of its own choosing and the
+// next syscall would take its kernel stack pointer from there. That is a ring-0 stack pivot.
+//
+// This kernel uses none of `RDFSBASE`, `WRFSBASE`, `RDGSBASE` or `WRGSBASE` - per-CPU state is
+// written through the `IA32_GS_BASE` MSR, which is ring 0 only - so the bit is cleared on every
+// core, unconditionally and before any USER-flagged mapping exists. Cleared rather than left alone
+// because "whatever the firmware did" is not a security property.
+//
+// Separate from `enable_smap_smep` deliberately: that one returns early on a CPU with neither
+// feature, and this must happen on every machine.
+pub fn establish_cr4_policy() {
+	const CR4_FSGSBASE: u64 = 1 << 16;
+	let mut cr4: u64;
+	unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+	cr4 &= !CR4_FSGSBASE;
+	unsafe { asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags)) };
+}
+
+// Whether ring 3 can write the GS base on this core. Always false after
+// `establish_cr4_policy`, and read by the test that pins it.
+pub fn user_can_write_gs_base() -> bool {
+	const CR4_FSGSBASE: u64 = 1 << 16;
+	let cr4: u64;
+	unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+	cr4 & CR4_FSGSBASE != 0
+}
+
 pub fn enable_smap_smep() {
 	const CR4_SMEP: u64 = 1 << 20;
 	const CR4_SMAP: u64 = 1 << 21;

@@ -32,7 +32,10 @@ const TIMER_INTID: u32 = 30;
 // 100 Hz tick (the shared scheduler-tick policy).
 use crate::arch::common::time::TICK_HZ;
 
-static TICKS: AtomicU64 = AtomicU64::new(0);
+// COUNTER-GATED, NOT ONE-PER-CORE (KERN-ARCH-007). Every core takes its own CNTP interrupt, and
+// this was `TICKS.fetch_add(1)` in the handler - so the monotonic clock advanced once per core per
+// period and time ran at the core count times `TICK_HZ`. See `arch::common::time::TickClock`.
+static CLOCK: crate::arch::common::time::TickClock = crate::arch::common::time::TickClock::new();
 static INTERVAL: AtomicU64 = AtomicU64::new(0); // timer down-count per tick
 
 #[inline]
@@ -111,9 +114,11 @@ pub fn handle_irq(from_user: bool) {
 		crate::mem::tlb::service_pending();
 	}
 	if intid == TIMER_INTID {
-		// Re-arm for the next tick (clears the timer's level-asserted condition).
+		// Re-arm for the next tick (clears the timer's level-asserted condition). EVERY core does
+		// this - it is what drives preemption on that core - and only the shared clock below is
+		// gated, so the rate is the machine's and not the core count's.
 		arm_timer(INTERVAL.load(Ordering::Relaxed));
-		TICKS.fetch_add(1, Ordering::Relaxed);
+		CLOCK.advance(super::tsc::now(), super::tsc::hz());
 	} else {
 		// A device MSI (GICv2m SPI): wake the bound userspace driver, if any.
 		super::interrupts::dispatch_msi(intid);
@@ -166,7 +171,7 @@ pub fn enable_msi_spi(spi: u32) {
 
 // Ticks counted since the timer started (the monotonic tick, 100 Hz).
 pub fn ticks() -> u64 {
-	TICKS.load(Ordering::Relaxed)
+	CLOCK.ticks()
 }
 
 // The generic-timer frequency (Hz), for the boot log.

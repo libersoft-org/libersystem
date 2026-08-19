@@ -44,3 +44,55 @@ fn a_firmware_pointer_outside_the_direct_map_is_refused_before_it_is_dereference
 	assert!(mem::within_direct_map(limit - 4096, 36), "the last page of the map is inside it");
 	assert!(!mem::within_direct_map(limit - 4096, 8192), "a table that starts inside and ends outside is not");
 }
+
+crate::tagged_test!(the_global_clock_advances_once_per_period_however_many_cores_tick, [Smp, Kernel], id = "kernel.smp.the_global_clock_advances_once_per_period_however_many_cores_tick", covers = ["kernel"]);
+fn the_global_clock_advances_once_per_period_however_many_cores_tick() {
+	// KERN-ARCH-007. The scheduler tick is a PER-CORE timer on all three architectures, and aarch64
+	// and riscv64 answered each core's interrupt with `TICKS.fetch_add(1)` - so the monotonic clock
+	// advanced once per core per period. On the machine this suite runs on that is eight cores, so
+	// time ran eight times fast and every deadline in the system - a sleep, a timeout, the caret
+	// blink - was wrong by that factor.
+	//
+	// Asserted on the MECHANISM rather than by timing a window, because a rate measured against a
+	// wall clock on an emulated guest under load is a flaky test and this is a fact about
+	// arithmetic: the same instant, seen by any number of cores, is one tick.
+	use crate::arch::common::time::{TICK_HZ, TickClock};
+
+	// A thousand cycles per tick, so the numbers below are readable.
+	let hz = 1_000 * TICK_HZ as u64;
+	let clock = TickClock::new();
+
+	// Eight cores take their first interrupt at the same instant. The first one anchors the clock
+	// and counts; the other seven find nothing due.
+	for _ in 0..8 {
+		clock.advance(1_000_000, hz);
+	}
+	assert_eq!(clock.ticks(), 1, "the instant that starts the clock is one tick, not eight");
+
+	// One full period later, all eight again.
+	for _ in 0..8 {
+		clock.advance(1_001_000, hz);
+	}
+	assert_eq!(clock.ticks(), 2, "one period is one tick, whatever the core count");
+
+	// A stall: ten periods have passed by the time anyone looks. The backlog is claimed ONCE, in
+	// one step - replaying it a tick per interrupt would run time fast in bursts, at the interrupt
+	// rate times the core count, and fire every pending deadline in a rush.
+	for _ in 0..8 {
+		clock.advance(1_011_000, hz);
+	}
+	assert_eq!(clock.ticks(), 12, "a ten-period backlog is ten ticks, claimed by one core");
+
+	// Less than a period is not a tick, however many cores ask.
+	for _ in 0..8 {
+		clock.advance(1_011_999, hz);
+	}
+	assert_eq!(clock.ticks(), 12, "part of a period is not a tick");
+
+	// AND AN UNCALIBRATED COUNTER COUNTS NOTHING, rather than guessing a period: a frequency of
+	// zero is a machine whose cycle clock is not up yet, and inventing a rate there is how a clock
+	// ends up wrong in a way nobody can see.
+	let cold = TickClock::new();
+	cold.advance(1_000_000, 0);
+	assert_eq!(cold.ticks(), 0, "no frequency, no ticks");
+}

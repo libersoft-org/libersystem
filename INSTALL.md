@@ -167,16 +167,17 @@ Every script is at the repository root and answers `--help`.
 | `./verify.sh [--for PATH] [--for-range A..B] [--plan] [--explain] [--sweep] [--release]` | Work out what a change needs verified, and run it. |
 | `./test.sh [--arch A] [--tags T] [--fast] [--build-only] [--smp N] [--timeout S]` | Run the in-kernel test suites. |
 | `./image.sh [--format F] [--size S] [--strip L]` | Build bootable images (`iso`, `img`, `qcow2`). |
-| `./check.sh [--gate N] [--conformance F]` | Build gates and image conformance suites; no arguments means all. |
+| `./check.sh [--gate N] [--conformance F] [--refresh N] [--staged-image T] [--cache-check M] [--fast-path T]` | Build gates and image conformance suites; no arguments means all. `--refresh` regenerates what a gate checks instead of checking it. |
 | `./clean.sh [--part P] [--dry-run]` | Remove build output (`cargo`, `boot`, `logs`). |
 | `./dev.sh <verb> [args]` | Drive the persistent development guest. |
 | `./format.sh [--changed]` | Format Rust and shell sources. |
 | `./gen.sh [--check] [--accept-breaking]` | Regenerate the protocol bindings and the ABI manifests from `src/idl`. |
 | `./lab.sh <subcommand> [args]` | Drive a live guest: boot it, run commands in it, screenshot it, measure it. |
-| `./bench.sh [--suite N]` | The optimized host measurement and hostile-input runs. |
-| `./verify.sh --for PATH [--plan]` | What to run after changing something, planned from the dependency graph. |
+| `./bench.sh [--suite N]` | Optimized host measurement (`audio`, `image`) and hostile-input runs (`image-mutate`). |
 
 There is no task runner and nothing to install for one: every command above is a script in this
-directory that takes flags and answers `--help`.
+directory that takes flags and answers `--help`. There used to be a Justfile in `src/` holding the
+specialist recipes; it is gone, and `docs/todo/P02M0140.md` records where each of its thirty recipes
+went and how each replacement was shown to run the same command.
 
 > `./format.sh` needs [`shfmt`](https://github.com/mvdan/sh) on your `PATH`.

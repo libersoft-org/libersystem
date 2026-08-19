@@ -234,7 +234,11 @@ pub mod apic {
 	use core::sync::atomic::{AtomicU64, Ordering};
 
 	// Monotonic scheduler-tick counter (advanced by the timer interrupt).
-	static TICKS: AtomicU64 = AtomicU64::new(0);
+	// COUNTER-GATED, NOT ONE-PER-CORE (KERN-ARCH-007). Every hart takes its own CLINT timer
+	// interrupt, and this was `TICKS.fetch_add(1)` in the handler - so the monotonic clock advanced
+	// once per hart per period and time ran at the hart count times `TICK_HZ`. See
+	// `arch::common::time::TickClock`.
+	static CLOCK: crate::arch::common::time::TickClock = crate::arch::common::time::TickClock::new();
 	// The boot hart id, captured at init (the local "apic" id).
 	static BOOT_HART: AtomicU64 = AtomicU64::new(0);
 
@@ -283,7 +287,7 @@ pub mod apic {
 
 	// See the x86_64 note: a test build adds a harness-controlled skew so a deadline is reachable.
 	pub fn ticks() -> u64 {
-		let base = TICKS.load(Ordering::Relaxed);
+		let base = CLOCK.ticks();
 		#[cfg(test)]
 		{
 			base + crate::tests::clock_skew()
@@ -297,7 +301,9 @@ pub mod apic {
 	// Advance the tick counter and re-arm the timer. Called from the S-mode timer
 	// interrupt (traps.rs).
 	pub fn on_timer_tick() {
-		TICKS.fetch_add(1, Ordering::Relaxed);
+		// EVERY hart re-arms - that is what drives preemption on it - and only the shared clock is
+		// gated, so the rate is the machine's and not the hart count's.
+		CLOCK.advance(super::tsc::now(), super::tsc::hz());
 		arm_timer();
 	}
 

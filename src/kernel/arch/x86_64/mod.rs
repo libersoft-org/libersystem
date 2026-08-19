@@ -35,6 +35,7 @@ pub fn init() {
 	idt::init();
 	paging::enable_nx();
 	paging::enable_smap_smep();
+	paging::establish_cr4_policy();
 }
 
 // Bring up interrupt delivery and the periodic timer. Requires the memory
@@ -72,6 +73,7 @@ pub fn init_ap(cpu_id: usize, lapic_id: u32) {
 	context::enable_fpu();
 	paging::enable_nx();
 	paging::enable_smap_smep();
+	paging::establish_cr4_policy();
 	gdt::load_ap(cpu_id);
 	idt::load();
 	percpu::init(cpu_id, lapic_id);
